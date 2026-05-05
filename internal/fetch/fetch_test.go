@@ -199,6 +199,13 @@ func TestFetch_404NoRetry(t *testing.T) {
 	if !errors.Is(err, ErrUpstreamStatus) {
 		t.Errorf("want ErrUpstreamStatus, got %v", err)
 	}
+	var se *StatusError
+	if !errors.As(err, &se) {
+		t.Fatalf("want *StatusError, got %T: %v", err, err)
+	}
+	if se.Code != http.StatusNotFound {
+		t.Errorf("StatusError.Code = %d, want %d", se.Code, http.StatusNotFound)
+	}
 	if got := attempts.Load(); got != 1 {
 		t.Errorf("attempts: got %d, want 1 (4xx is non-retryable)", got)
 	}
@@ -620,6 +627,8 @@ func TestIsRetryable(t *testing.T) {
 		{fmt.Errorf("%w: example.com", ErrHostNotAllowed), false},
 		{fmt.Errorf("%w: 1.2.3.4", ErrTargetDenied), false},
 		{fmt.Errorf("%w: status=404", ErrUpstreamStatus), false},
+		{&StatusError{Code: 404}, false},
+		{&StatusError{Code: 451}, false},
 		{fmt.Errorf("%w: status=500", ErrUpstreamServerError), true},
 		{fmt.Errorf("%w: bad", ErrInvalidContentRange), true},
 		{fmt.Errorf("%w: short", ErrSizeMismatch), true},

@@ -126,6 +126,26 @@ func (w *BlobWriter) Write(p []byte) (int, error) {
 // resumable Range fetches that need to report progress.
 func (w *BlobWriter) Written() int64 { return w.written }
 
+// Truncate resets the BlobWriter to its zero state: temp file emptied,
+// hasher reset, written counter back to 0. The fetch layer calls this
+// when a resume retry's If-Range validator no longer matches and the
+// partial bytes must be discarded before restarting from byte 0
+// (SPEC §6.3). Truncating after Finalize/Abort is an error.
+func (w *BlobWriter) Truncate() error {
+	if w.finished {
+		return errors.New("cache: BlobWriter already closed")
+	}
+	if err := w.file.Truncate(0); err != nil {
+		return fmt.Errorf("cache: truncate tmp blob: %w", err)
+	}
+	if _, err := w.file.Seek(0, 0); err != nil {
+		return fmt.Errorf("cache: seek tmp blob: %w", err)
+	}
+	w.hasher = sha256.New()
+	w.written = 0
+	return nil
+}
+
 // Finalize fsyncs the temp file, verifies the byte count against
 // expectedSize (when nonzero), and atomically moves the file into pool/
 // under its content-addressed path. If a blob with the same hash is

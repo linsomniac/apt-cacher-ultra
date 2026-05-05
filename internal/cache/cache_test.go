@@ -169,6 +169,73 @@ func TestBlobFinalize_SizeMismatchDiscards(t *testing.T) {
 	}
 }
 
+func TestBlobTruncate_ResetsToZero(t *testing.T) {
+	c := openCache(t)
+	w, err := c.NewTempBlob()
+	if err != nil {
+		t.Fatalf("NewTempBlob: %v", err)
+	}
+
+	// Write some bytes that would have hashed to a specific value.
+	if _, err := w.Write([]byte("partial fetched bytes that should be discarded")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if w.Written() == 0 {
+		t.Fatalf("expected non-zero Written before Truncate")
+	}
+
+	if err := w.Truncate(); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	if w.Written() != 0 {
+		t.Errorf("Written after Truncate = %d, want 0", w.Written())
+	}
+
+	// Now write the actual content and Finalize. The hash must match
+	// hashing only the final bytes (proving the hasher was reset).
+	body := []byte("the real bytes")
+	if _, err := w.Write(body); err != nil {
+		t.Fatalf("post-Truncate Write: %v", err)
+	}
+	hash, err := w.Finalize(int64(len(body)))
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+
+	// Compare against an independently hashed "the real bytes" — if
+	// the truncate left the hasher dirty, hashes would diverge.
+	want := sha256.Sum256(body)
+	if hash != hex.EncodeToString(want[:]) {
+		t.Errorf("hash mismatch: got %s, hash should match sha256(%q)", hash, body)
+	}
+
+	// On-disk file should hold exactly len(body).
+	st, err := os.Stat(c.BlobPath(hash))
+	if err != nil {
+		t.Fatalf("Stat blob: %v", err)
+	}
+	if st.Size() != int64(len(body)) {
+		t.Errorf("blob size=%d, want %d", st.Size(), len(body))
+	}
+}
+
+func TestBlobTruncate_AfterFinalizeRejects(t *testing.T) {
+	c := openCache(t)
+	w, err := c.NewTempBlob()
+	if err != nil {
+		t.Fatalf("NewTempBlob: %v", err)
+	}
+	if _, err := w.Write([]byte("done")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := w.Finalize(4); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if err := w.Truncate(); err == nil {
+		t.Error("Truncate after Finalize should error")
+	}
+}
+
 func TestBlobAbort_RemovesTempFile(t *testing.T) {
 	c := openCache(t)
 	w, err := c.NewTempBlob()

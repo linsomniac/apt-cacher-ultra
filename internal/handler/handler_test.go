@@ -1,0 +1,593 @@
+package handler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/config"
+	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+)
+
+// silentLogger discards all log output so test failures do not get drowned
+// in per-request log lines.
+func silentLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// newTestHandler wires a fresh cache + fetch.Client + proxy.Parser into
+// a Handler. mirror is optional and applied only when non-nil. The
+// fetch.Client allows 127.0.0.1 (the httptest bind address) and skips
+// deny-CIDR enforcement, so loopback fetches reach the test server.
+func newTestHandler(t *testing.T, allow []string, mirror []config.MirrorRule) *Handler {
+	t.Helper()
+
+	parser, err := proxy.New(nil, mirror)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+
+	c, err := cache.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	if allow == nil {
+		allow = []string{`^127\.0\.0\.1$`}
+	}
+	fc, err := fetch.New(fetch.Options{
+		ConnectTimeout:   2 * time.Second,
+		TotalTimeout:     5 * time.Second,
+		MaxRetries:       2,
+		AllowedHostRegex: allow,
+		DenyTargetRanges: nil,
+	})
+	if err != nil {
+		t.Fatalf("fetch.New: %v", err)
+	}
+
+	h, err := New(Config{
+		Parser:               parser,
+		Cache:                c,
+		Fetch:                fc,
+		MaxConcurrentPerHost: 4,
+		Logger:               silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return h
+}
+
+// proxyReq builds an apt proxy-mode request: absolute-URI request line.
+func proxyReq(method, srvURL, path string) *http.Request {
+	return httptest.NewRequest(method, srvURL+path, nil)
+}
+
+// mirrorReq builds an apt mirror-mode request: abs_path request line.
+func mirrorReq(method, path string) *http.Request {
+	return httptest.NewRequest(method, path, nil)
+}
+
+func TestNew_NilDeps(t *testing.T) {
+	c, err := cache.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	defer c.Close()
+	parser, _ := proxy.New(nil, nil)
+	fc, _ := fetch.New(fetch.Options{AllowedHostRegex: []string{`.`}, DenyTargetRanges: nil})
+
+	cases := []struct {
+		name string
+		cfg  Config
+	}{
+		{"nil parser", Config{Cache: c, Fetch: fc}},
+		{"nil cache", Config{Parser: parser, Fetch: fc}},
+		{"nil fetch", Config{Parser: parser, Cache: c}},
+	}
+	for _, tc := range cases {
+		if _, err := New(tc.cfg); err == nil {
+			t.Errorf("%s: expected error, got nil", tc.name)
+		}
+	}
+}
+
+func TestServeHTTP_GetMissThenHit(t *testing.T) {
+	body := []byte("hello world")
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+
+	// First request: miss.
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, proxyReq("GET", srv.URL, "/foo"))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("miss: status=%d body=%q", rec1.Code, rec1.Body.String())
+	}
+	if got := rec1.Header().Get("X-Cache"); got != "MISS" {
+		t.Errorf("X-Cache miss: %q, want MISS", got)
+	}
+	if rec1.Body.String() != string(body) {
+		t.Errorf("miss body=%q, want %q", rec1.Body.String(), body)
+	}
+
+	// Second request: hit.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, proxyReq("GET", srv.URL, "/foo"))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("hit: status=%d body=%q", rec2.Code, rec2.Body.String())
+	}
+	if got := rec2.Header().Get("X-Cache"); got != "HIT" {
+		t.Errorf("X-Cache hit: %q, want HIT", got)
+	}
+	if rec2.Body.String() != string(body) {
+		t.Errorf("hit body=%q, want %q", rec2.Body.String(), body)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("upstream hits=%d, want 1 (second request must hit cache)", got)
+	}
+}
+
+func TestServeHTTP_HEAD_HitNoBody(t *testing.T) {
+	body := []byte("payload bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+
+	// Prime cache with GET.
+	primer := httptest.NewRecorder()
+	h.ServeHTTP(primer, proxyReq("GET", srv.URL, "/x"))
+	if primer.Code != http.StatusOK {
+		t.Fatalf("prime: %d %q", primer.Code, primer.Body.String())
+	}
+
+	// HEAD: same headers, empty body.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("HEAD", srv.URL, "/x"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HEAD: %d", rec.Code)
+	}
+	if got := rec.Header().Get("X-Cache"); got != "HIT" {
+		t.Errorf("X-Cache: %q, want HIT", got)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("HEAD body should be empty, got %d bytes", rec.Body.Len())
+	}
+	if got := rec.Header().Get("Content-Length"); got != fmt.Sprint(len(body)) {
+		t.Errorf("Content-Length: %q, want %d", got, len(body))
+	}
+}
+
+func TestServeHTTP_PostNotAllowed(t *testing.T) {
+	h := newTestHandler(t, nil, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "http://127.0.0.1/x", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status=%d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+	if got := rec.Header().Get("Allow"); !strings.Contains(got, "GET") || !strings.Contains(got, "HEAD") {
+		t.Errorf("Allow: %q, want GET, HEAD", got)
+	}
+}
+
+func TestServeHTTP_BadURI(t *testing.T) {
+	h := newTestHandler(t, nil, nil)
+	rec := httptest.NewRecorder()
+	// Construct a request the parser will reject (relative path that
+	// matches no mirror, and no [[mirror]] is configured).
+	r := httptest.NewRequest("GET", "/no-mirror/x", nil)
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status=%d body=%q, want 400", rec.Code, rec.Body.String())
+	}
+}
+
+func TestServeHTTP_HostNotAllowed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("never reached"))
+	}))
+	defer srv.Close()
+
+	// Allow list deliberately excludes 127.0.0.1.
+	h := newTestHandler(t, []string{`^example\.com$`}, nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/x"))
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status=%d body=%q, want 403", rec.Code, rec.Body.String())
+	}
+}
+
+func TestServeHTTP_Upstream404Passthrough(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "nope", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/missing"))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status=%d body=%q, want 404", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Upstream-Status"); got != "404" {
+		t.Errorf("X-Upstream-Status: %q, want 404", got)
+	}
+}
+
+func TestServeHTTP_Upstream5xxThen502(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "kaboom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/boom"))
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status=%d body=%q, want 502", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Errorf("Retry-After should be set on 502")
+	}
+}
+
+func TestServeHTTP_RangeOnHit(t *testing.T) {
+	body := []byte("ABCDEFGHIJKL") // 12 bytes
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+
+	// Prime cache.
+	primer := httptest.NewRecorder()
+	h.ServeHTTP(primer, proxyReq("GET", srv.URL, "/blob"))
+	if primer.Code != http.StatusOK {
+		t.Fatalf("prime: %d", primer.Code)
+	}
+
+	// Range request — bytes 2-5 inclusive ("CDEF").
+	r := proxyReq("GET", srv.URL, "/blob")
+	r.Header.Set("Range", "bytes=2-5")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("Range: status=%d, want 206", rec.Code)
+	}
+	if rec.Body.String() != "CDEF" {
+		t.Errorf("Range body=%q, want %q", rec.Body.String(), "CDEF")
+	}
+	if got := rec.Header().Get("Content-Range"); !strings.HasPrefix(got, "bytes 2-5/") {
+		t.Errorf("Content-Range: %q, want prefix %q", got, "bytes 2-5/")
+	}
+}
+
+func TestServeHTTP_MirrorMode(t *testing.T) {
+	body := []byte("mirror payload")
+	var seenPath atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath.Store(r.URL.Path)
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, []config.MirrorRule{
+		{Prefix: "/repo", Upstream: srv.URL},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, mirrorReq("GET", "/repo/dists/stable/Release"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mirror: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != string(body) {
+		t.Errorf("body=%q, want %q", rec.Body.String(), body)
+	}
+	if got := seenPath.Load(); got != "/dists/stable/Release" {
+		t.Errorf("upstream path=%v, want %q (prefix /repo must be stripped)", got, "/dists/stable/Release")
+	}
+}
+
+func TestServeHTTP_Coalesced(t *testing.T) {
+	body := []byte("only-one-fetch")
+	var hits atomic.Int32
+	upstreamEntered := make(chan struct{})
+	gate := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) == 1 {
+			close(upstreamEntered)
+		}
+		<-gate
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+
+	results := make(chan *httptest.ResponseRecorder, 2)
+	var wg sync.WaitGroup
+
+	// Leader.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/coalesce"))
+		results <- rec
+	}()
+
+	// Wait for the leader's fetch to actually be in flight against the
+	// upstream. At this point the leader is parked in fetch.Fetch and
+	// the singleflight call is registered.
+	select {
+	case <-upstreamEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream never received the leader's request")
+	}
+
+	// Waiter.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/coalesce"))
+		results <- rec
+	}()
+
+	// AIDEV-NOTE: timing-sensitive sleep so the waiter has time to enter
+	// sf.Do (cache lookup is sub-millisecond on every reasonable host).
+	// If this becomes flaky on CI, raise to 200ms — there is no clean
+	// "park-on-condition" hook without exposing handler internals.
+	time.Sleep(100 * time.Millisecond)
+
+	close(gate)
+	wg.Wait()
+	close(results)
+
+	if got := hits.Load(); got != 1 {
+		t.Errorf("upstream hits=%d, want 1 (singleflight should coalesce)", got)
+	}
+
+	var miss, coalesced int
+	for r := range results {
+		if r.Code != http.StatusOK {
+			t.Errorf("status=%d body=%q", r.Code, r.Body.String())
+			continue
+		}
+		if r.Body.String() != string(body) {
+			t.Errorf("body=%q, want %q", r.Body.String(), body)
+		}
+		switch r.Header().Get("X-Cache") {
+		case "MISS":
+			miss++
+		case "HIT-COALESCED":
+			coalesced++
+		default:
+			t.Errorf("unexpected X-Cache=%q", r.Header().Get("X-Cache"))
+		}
+	}
+	if miss != 1 || coalesced != 1 {
+		t.Errorf("X-Cache distribution: miss=%d coalesced=%d, want 1/1", miss, coalesced)
+	}
+}
+
+func TestServeHTTP_LookupErrorFallsThroughToFetch(t *testing.T) {
+	// The tryCacheHit path treats an unexpected lookup error as
+	// "drop into miss." This is hard to provoke with a real cache,
+	// so we just confirm a normal-flow miss after a fresh open works
+	// (regression check in case the fall-through logic regresses to
+	// returning early).
+	body := []byte("ok")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/x"))
+	if rec.Code != http.StatusOK {
+		t.Errorf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestServeHTTP_RequestCountIncrementsOnHit(t *testing.T) {
+	body := []byte("counted")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+
+	// Prime.
+	primer := httptest.NewRecorder()
+	h.ServeHTTP(primer, proxyReq("GET", srv.URL, "/c"))
+
+	// Two more reads — count increments are async, so wait briefly
+	// for the writer goroutine to flush.
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/c"))
+	}
+
+	// Poll for the row to reflect the increments. The TouchURLPath
+	// goroutine submits to the cache writer asynchronously, so we
+	// can't read the count immediately after ServeHTTP returns.
+	deadline := time.Now().Add(2 * time.Second)
+	var got int64
+	for time.Now().Before(deadline) {
+		row, err := h.cache.LookupURL(context.Background(), "http", "127.0.0.1", "/c")
+		if err != nil {
+			t.Fatalf("LookupURL: %v", err)
+		}
+		got = row.RequestCount
+		if got >= 4 { // 1 from miss-write, +3 from hits
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("RequestCount=%d, want >=4", got)
+}
+
+func TestSFGroup_CoalescesAndCleansUp(t *testing.T) {
+	g := newSFGroup()
+
+	var calls atomic.Int32
+	gate := make(chan struct{})
+
+	leader := make(chan sfResult, 1)
+	go func() {
+		res, _ := g.Do("k", func() sfResult {
+			calls.Add(1)
+			<-gate
+			return sfResult{blobHash: "hash", size: 10}
+		})
+		leader <- res
+	}()
+
+	// Wait for leader to start.
+	for calls.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	waiter := make(chan struct {
+		res    sfResult
+		shared bool
+	}, 1)
+	go func() {
+		res, shared := g.Do("k", func() sfResult {
+			calls.Add(1)
+			return sfResult{}
+		})
+		waiter <- struct {
+			res    sfResult
+			shared bool
+		}{res, shared}
+	}()
+
+	// Give waiter a moment to register.
+	time.Sleep(20 * time.Millisecond)
+
+	close(gate)
+
+	leaderRes := <-leader
+	w := <-waiter
+
+	if calls.Load() != 1 {
+		t.Errorf("calls=%d, want 1 (waiter should not run fn)", calls.Load())
+	}
+	if !w.shared {
+		t.Errorf("waiter shared=false, want true")
+	}
+	if w.res.blobHash != "hash" || w.res.size != 10 {
+		t.Errorf("waiter got %+v, want hash=%q size=%d", w.res, "hash", 10)
+	}
+	if leaderRes.blobHash != "hash" {
+		t.Errorf("leader got %+v, want hash=%q", leaderRes, "hash")
+	}
+
+	// After the call drains, the next caller for "k" leads (calls map
+	// emptied).
+	res, shared := g.Do("k", func() sfResult { return sfResult{blobHash: "next"} })
+	if shared {
+		t.Errorf("shared=true after first call drained, want false")
+	}
+	if res.blobHash != "next" {
+		t.Errorf("blobHash=%q, want next", res.blobHash)
+	}
+}
+
+func TestHostSem_LimitsConcurrency(t *testing.T) {
+	s := newHostSem(2)
+
+	rel1, err := s.acquire(context.Background(), "h")
+	if err != nil {
+		t.Fatalf("acquire 1: %v", err)
+	}
+	rel2, err := s.acquire(context.Background(), "h")
+	if err != nil {
+		t.Fatalf("acquire 2: %v", err)
+	}
+
+	// Third acquire must block until release.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = s.acquire(ctx, "h")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("third acquire err=%v, want DeadlineExceeded", err)
+	}
+
+	rel1()
+	// Now a fourth acquire should succeed promptly.
+	rel3, err := s.acquire(context.Background(), "h")
+	if err != nil {
+		t.Fatalf("post-release acquire: %v", err)
+	}
+	rel2()
+	rel3()
+}
+
+func TestHostSem_PerHostIsolated(t *testing.T) {
+	s := newHostSem(1)
+	rA, err := s.acquire(context.Background(), "a")
+	if err != nil {
+		t.Fatalf("acquire a: %v", err)
+	}
+	defer rA()
+
+	// Different host has its own slot, so this must succeed without
+	// blocking even though a's slot is held.
+	rB, err := s.acquire(context.Background(), "b")
+	if err != nil {
+		t.Fatalf("acquire b: %v", err)
+	}
+	defer rB()
+}
+
+// confirmFetchStatusError keeps the public-API contract front-and-center
+// for handler maintainers: passthrough of upstream 4xx depends on the
+// fetch package returning a *fetch.StatusError matchable via errors.Is.
+func TestServeHTTP_FetchStatusErrorMatchable(t *testing.T) {
+	se := &fetch.StatusError{Code: 451}
+	if !errors.Is(se, fetch.ErrUpstreamStatus) {
+		t.Errorf("fetch.StatusError must match ErrUpstreamStatus via errors.Is")
+	}
+	var got *fetch.StatusError
+	if !errors.As(se, &got) {
+		t.Errorf("fetch.StatusError must be reachable via errors.As")
+	}
+	if got != nil && got.Code != 451 {
+		t.Errorf("StatusError.Code=%d, want 451", got.Code)
+	}
+}

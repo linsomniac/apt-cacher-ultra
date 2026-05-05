@@ -39,6 +39,27 @@ var (
 	ErrRedirectBlocked     = errors.New("fetch: upstream redirect blocked")
 )
 
+// StatusError carries the upstream HTTP status code from a non-success,
+// non-retryable response. The handler layer needs the actual status so
+// it can passthrough an upstream 404 (apt frequently probes for index
+// variants that don't exist) instead of collapsing every non-success
+// into a generic 502.
+//
+// errors.Is(err, ErrUpstreamStatus) returns true on a StatusError so
+// existing callers that classify errors via the sentinel keep working;
+// new callers reach the integer with errors.As.
+type StatusError struct {
+	Code int
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("fetch: upstream status=%d", e.Code)
+}
+
+func (e *StatusError) Is(target error) bool {
+	return target == ErrUpstreamStatus
+}
+
 const defaultUserAgent = "apt-cacher-ultra/0.1"
 
 // Options carries the configurable knobs read from config.UpstreamConfig.
@@ -385,7 +406,7 @@ func (c *Client) doAttempt(
 		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
 			return out, fmt.Errorf("%w: status=%d", ErrUpstreamServerError, resp.StatusCode)
 		}
-		return out, fmt.Errorf("%w: status=%d", ErrUpstreamStatus, resp.StatusCode)
+		return out, &StatusError{Code: resp.StatusCode}
 	}
 }
 
