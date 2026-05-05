@@ -1,0 +1,40 @@
+# Keep the docker build context lean and free of files that should
+# never reach the daemon. The cache image's Dockerfile uses `COPY . .`
+# from the repo root, so anything here is excluded from the tarball
+# sent to the daemon (and thus from the build).
+#
+# Excludes mirror .gitignore where appropriate, plus a few CI/local
+# artifacts that .gitignore does not cover (e.g. .codex/ holds review
+# tempfiles, .github/ is repo metadata, prompt is a local session
+# scratchpad).
+
+# Version control + repo metadata.
+.git/
+.gitignore
+.github/
+
+# Local CI/tooling state.
+.codex/
+.idea/
+.vscode/
+.DS_Store
+
+# Build artifacts (host-side; the in-image build produces fresh ones).
+build/
+dist/
+*.test
+*.out
+*.deb
+
+# Documentation does not affect the binary.
+README.md
+SPEC.md
+NOTES.md
+
+# Local scratchpad — not part of any image.
+prompt
+
+# Note: e2e/ is intentionally NOT excluded. The cache image's runtime
+# stage does `COPY e2e/cache.toml`, and .dockerignore filtering applies
+# to the build-context tarball itself — excluding e2e/ here would make
+# that COPY fail.

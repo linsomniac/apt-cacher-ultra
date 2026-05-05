@@ -41,6 +41,10 @@ jobs:
   # GitHub runners ship with docker + docker compose preinstalled.
   e2e:
     runs-on: ubuntu-latest
+    # Cap the job so a docker hang or apt-get retry storm does not
+    # consume the full Actions per-job limit. Local runs complete in
+    # ~30s; 10 min gives generous headroom for cold caches.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: bash e2e/run.sh

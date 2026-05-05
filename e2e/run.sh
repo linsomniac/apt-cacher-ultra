@@ -53,7 +53,12 @@ fi
 # produced at least one cache HIT. Without this assert a regression
 # that turned every request into a MISS would still pass — apt would
 # happily re-fetch everything every time.
-hits="$(docker compose logs cache 2>/dev/null | grep -c 'outcome=hit' || true)"
+#
+# The regex matches `outcome=hit` followed by a word boundary so it
+# does not also match `outcome=hit_stale` or `outcome=hit_coalesced`
+# (both legal SPEC §10 outcomes the cache emits in other paths and
+# neither of which proves a fresh cache hit).
+hits="$(docker compose logs cache 2>/dev/null | grep -cE 'outcome=hit($|[^a-z_])' || true)"
 if [[ "$hits" -lt 1 ]]; then
     echo "[e2e] FAIL: expected at least one cache HIT in cache logs; got $hits"
     exit 1
