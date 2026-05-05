@@ -1,0 +1,55 @@
+# Docker compose for the SPEC §12.4 end-to-end test.
+#
+# Three services on a private bridge network:
+#   - upstream: nginx serving a baked-in apt repo (hello-acu_1.0).
+#   - cache:    apt-cacher-ultra built from the current source tree,
+#               configured to allow only `^upstream$`.
+#   - client:   ubuntu:noble running `apt-get update && apt-get install
+#               hello-acu` through the cache (HTTP proxy mode).
+#
+# Healthcheck on upstream gates cache start. cache has no health
+# endpoint, so client just depends on `service_started` — apt-get
+# tolerates the brief startup window via its own retries.
+
+services:
+  upstream:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile.upstream
+    networks:
+      - aculan
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/dists/noble/Release > /dev/null"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  cache:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile.cache
+    networks:
+      - aculan
+    expose:
+      - "3142"
+    depends_on:
+      upstream:
+        condition: service_healthy
+
+  client:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile.client
+    networks:
+      - aculan
+    depends_on:
+      upstream:
+        condition: service_healthy
+      cache:
+        condition: service_started
+
+networks:
+  aculan:
+    driver: bridge

@@ -1,0 +1,16 @@
+# Mock upstream for the SPEC §12.4 e2e test. A two-stage build:
+#   1. debian:stable-slim assembles a minimal but valid apt repo via
+#      dpkg-deb + apt-ftparchive (see e2e/upstream/build-repo.sh).
+#   2. nginx:alpine serves the resulting tree over HTTP on :80.
+FROM debian:stable-slim AS build
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        apt-utils dpkg-dev gzip && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+COPY e2e/upstream/build-repo.sh /work/build-repo.sh
+RUN chmod +x /work/build-repo.sh && /work/build-repo.sh /out
+
+FROM nginx:alpine
+COPY --from=build /out /usr/share/nginx/html

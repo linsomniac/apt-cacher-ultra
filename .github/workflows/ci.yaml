@@ -34,3 +34,13 @@ jobs:
           # Pin so CI is reproducible; bump deliberately rather than letting
           # `latest` drift behind your back.
           version: v1.62.2
+
+  # SPEC §12.4 docker-compose end-to-end test. Slower lane (~2 min for
+  # the docker build + apt-get update inside ubuntu:noble), but it's
+  # the only thing that exercises real apt against the cache. ubuntu
+  # GitHub runners ship with docker + docker compose preinstalled.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash e2e/run.sh

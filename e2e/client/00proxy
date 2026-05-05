@@ -1,0 +1,3 @@
+// All apt traffic through the cache. The cache enforces the
+// upstream allowlist; the client only knows "use the proxy".
+Acquire::http::Proxy "http://cache:3142";

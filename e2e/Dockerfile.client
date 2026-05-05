@@ -1,0 +1,19 @@
+# Test client for the SPEC §12.4 e2e harness. ubuntu:noble with the
+# default sources scrubbed (so the test cannot accidentally reach
+# archive.ubuntu.com) and apt configured to talk only to the mock
+# upstream — through the cache as an HTTP proxy.
+FROM ubuntu:noble
+
+# Drop the distro's default sources so apt only knows about the test
+# upstream. Both the deb822 and the legacy file are removed for safety
+# across base-image revisions.
+RUN rm -f /etc/apt/sources.list.d/*.sources \
+          /etc/apt/sources.list.d/*.list \
+          /etc/apt/sources.list
+
+COPY e2e/client/upstream.list /etc/apt/sources.list.d/upstream.list
+COPY e2e/client/00proxy /etc/apt/apt.conf.d/00proxy
+COPY e2e/client/run-test.sh /usr/local/bin/run-test.sh
+RUN chmod +x /usr/local/bin/run-test.sh
+
+ENTRYPOINT ["/usr/local/bin/run-test.sh"]

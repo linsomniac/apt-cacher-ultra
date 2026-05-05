@@ -1,0 +1,21 @@
+# apt-cacher-ultra config for the SPEC §12.4 e2e harness.
+#
+# Differences from production defaults:
+#   - allowed_host_regex: only the docker-compose service name `upstream`
+#     is permitted, so the test cannot reach out of its sandbox.
+#   - deny_target_ranges: empty. The default deny list covers RFC1918
+#     and 127.0.0.0/8, which is exactly where docker bridge networks
+#     live — leaving the default in place would block every dial.
+#     The test sandbox has no real upstream to protect against.
+
+[cache]
+dir = "/var/cache/apt-cacher-ultra"
+listen = "0.0.0.0:3142"
+
+[upstream]
+allowed_host_regex = ["^upstream$"]
+deny_target_ranges = []
+
+[log]
+level = "info"
+format = "text"

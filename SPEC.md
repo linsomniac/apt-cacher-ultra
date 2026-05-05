@@ -616,6 +616,8 @@ This test fails today on apt-cacher-ng (clients hang waiting for upstream). It m
 
 A docker-compose with: a mock-upstream serving a small but valid Debian repository tree, the cache, and an `apt`-running test container. Asserts a clean `apt update && apt install`. This catches integration bugs the in-process tests can't.
 
+Implemented under `e2e/`. The `upstream` service bakes a `hello-acu_1.0_amd64.deb` and `apt-ftparchive`'d Release/Packages tree at image-build time and serves it via nginx. The `client` service is `ubuntu:noble` with default sources scrubbed and `Acquire::http::Proxy` pointing at the cache. The `cache` service is built from the current source tree with a config that allows only `^upstream$` and clears the default deny list (which would otherwise block the docker bridge IP). The driver script (`e2e/run.sh`) returns the client's exit code and asserts at least one cache HIT in the cache logs (so a regression that turned every request into a MISS would still fail the test). Run locally with `make e2e`; CI runs it via the `e2e` job in `.github/workflows/ci.yaml`.
+
 ### 12.5 Soak (manual / nightly)
 
 24h soak with synthetic traffic: assert RSS stable, no FD leak, no goroutine leak, SQLite size growth bounded by content.
