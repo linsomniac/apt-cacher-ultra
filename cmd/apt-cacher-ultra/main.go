@@ -2,16 +2,43 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
+	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/handler"
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 )
 
 // Version is set at build time via -ldflags.
 var Version = "dev"
+
+// Tunables for HTTP timeouts and shutdown. Exported as vars so tests can
+// shorten them; production runs at the defaults.
+var (
+	// readHeaderTimeout caps how long we wait on a slow client's headers.
+	// Go's default is unlimited, which is a slowloris vulnerability.
+	readHeaderTimeout = 10 * time.Second
+
+	// shutdownTimeout is the SPEC §9.5 drain budget on SIGTERM.
+	shutdownTimeout = 30 * time.Second
+
+	// tmpSweepMaxAge is the SPEC §4.2 staleness threshold for orphaned
+	// partial downloads from previous crashes.
+	tmpSweepMaxAge = 5 * time.Minute
+)
 
 func main() {
 	configPath := flag.String("config", "/etc/apt-cacher-ultra/config.toml", "path to TOML config file")
@@ -29,27 +56,223 @@ func main() {
 	}
 }
 
+// run loads config, configures the default logger, installs SIGINT/SIGTERM
+// handling, and hands off to serve. Factored thin so tests can drive serve
+// directly without sending real signals.
 func run(configPath string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	cfg.Defaults()
 
 	logger := newLogger(cfg.Log)
 	slog.SetDefault(logger)
 
-	slog.Info("apt-cacher-ultra starting",
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	return serve(ctx, cfg, logger)
+}
+
+// serve wires every internal package into a running http.Server (plus an
+// optional TLS server) and blocks until ctx is cancelled or a listener
+// fails. On exit, SPEC §9.5 graceful shutdown is performed.
+//
+// The actual listening sockets are bound here (per cfg.Cache.Listen and
+// cfg.Cache.ListenTLS) before being handed to serveListeners. Tests bypass
+// this and call serveListeners directly with their own listeners — that is
+// the only practical way to learn a `:0`-bound port without racing.
+func serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+	plainLn, err := net.Listen("tcp", cfg.Cache.Listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", cfg.Cache.Listen, err)
+	}
+
+	var tlsLn net.Listener
+	if cfg.Cache.ListenTLS != "" {
+		tlsLn, err = net.Listen("tcp", cfg.Cache.ListenTLS)
+		if err != nil {
+			_ = plainLn.Close()
+			return fmt.Errorf("listen %s: %w", cfg.Cache.ListenTLS, err)
+		}
+	}
+
+	return serveListeners(ctx, cfg, logger, plainLn, tlsLn)
+}
+
+// serveListeners is the inner serve loop. It owns its listeners (closing
+// them on shutdown) and runs until ctx is cancelled or a listener errors
+// out. Both production (via serve) and tests construct listeners and hand
+// them in.
+//
+// The wiring order matters: cache.Open before SweepTmp (SweepTmp reads
+// cache.Dir from the open handle); fetch.New before handler.New (handler
+// holds the fetch client). On any wiring failure, listeners passed in are
+// closed before returning so the caller does not have to track them.
+func serveListeners(
+	ctx context.Context,
+	cfg *config.Config,
+	logger *slog.Logger,
+	plainLn net.Listener,
+	tlsLn net.Listener,
+) (retErr error) {
+	defer func() {
+		// Defensive: if we error out before the goroutines start serving,
+		// the listeners would otherwise leak — Serve() never runs to
+		// observe the listener and close it. Closing twice is OK; net's
+		// listeners no-op on a second close.
+		if retErr != nil {
+			_ = plainLn.Close()
+			if tlsLn != nil {
+				_ = tlsLn.Close()
+			}
+		}
+	}()
+
+	logger.Info("apt-cacher-ultra starting",
 		"version", Version,
-		"config_path", configPath,
-		"listen", cfg.Cache.Listen,
+		"listen", plainLn.Addr().String(),
+		"listen_tls", tlsAddrString(tlsLn),
 		"cache_dir", cfg.Cache.Dir,
 	)
 
-	// Server wiring lands in subsequent commits. This scaffolding stage
-	// validates config-load + logging and exits cleanly.
-	slog.Info("scaffolding stage; server not yet implemented")
-	return nil
+	c, err := cache.Open(ctx, cfg.Cache.Dir)
+	if err != nil {
+		return fmt.Errorf("open cache: %w", err)
+	}
+	defer func() {
+		if err := c.Close(); err != nil {
+			logger.Error("cache close failed", "err", err)
+		}
+	}()
+
+	// SPEC §4.2: reap orphan partials from a prior crash. Best-effort —
+	// a failure here means the disk is unhappy in some way, but the
+	// cache itself opened fine, so let the operator see the warning and
+	// continue serving cache hits.
+	if err := c.SweepTmp(tmpSweepMaxAge); err != nil {
+		logger.Warn("startup tmp sweep failed", "err", err)
+	}
+
+	parser, err := proxy.New(cfg.Remap, cfg.Mirror)
+	if err != nil {
+		return fmt.Errorf("build proxy parser: %w", err)
+	}
+
+	fetchClient, err := fetch.New(fetch.Options{
+		ConnectTimeout:   cfg.Upstream.ConnectTimeout.Duration,
+		TotalTimeout:     cfg.Upstream.TotalTimeout.Duration,
+		IdleReadTimeout:  cfg.Upstream.IdleReadTimeout.Duration,
+		MaxRetries:       cfg.Upstream.MaxRetries,
+		AllowedHostRegex: cfg.Upstream.AllowedHostRegex,
+		DenyTargetRanges: cfg.Upstream.DenyTargetRanges,
+		UserAgent:        "apt-cacher-ultra/" + Version,
+	})
+	if err != nil {
+		return fmt.Errorf("build fetch client: %w", err)
+	}
+
+	h, err := handler.New(handler.Config{
+		Parser:               parser,
+		Cache:                c,
+		Fetch:                fetchClient,
+		MaxConcurrentPerHost: cfg.Upstream.MaxConcurrentPerHost,
+		Logger:               logger,
+	})
+	if err != nil {
+		return fmt.Errorf("build handler: %w", err)
+	}
+
+	plainSrv := newHTTPServer(h, logger)
+	var tlsSrv *http.Server
+	if tlsLn != nil {
+		tlsSrv = newHTTPServer(h, logger)
+	}
+
+	// AIDEV-NOTE: errCh is buffered to (number of servers) so a goroutine
+	// can always deliver its terminal error without blocking even if the
+	// main goroutine has already moved on to shutdown.
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		logger.Info("http listener accepting", "addr", plainLn.Addr().String())
+		err := plainSrv.Serve(plainLn)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("http: %w", err)
+			return
+		}
+		errCh <- nil
+	}()
+
+	if tlsSrv != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			logger.Info("https listener accepting", "addr", tlsLn.Addr().String())
+			err := tlsSrv.ServeTLS(tlsLn, cfg.Cache.TLSCert, cfg.Cache.TLSKey)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("https: %w", err)
+				return
+			}
+			errCh <- nil
+		}()
+	}
+
+	// Block until either ctx is cancelled (signal received in production,
+	// test-driven cancel in tests) or a listener fails before we asked it
+	// to stop.
+	var listenerErr error
+	select {
+	case <-ctx.Done():
+		logger.Info("shutdown signal received")
+	case err := <-errCh:
+		if err != nil {
+			listenerErr = err
+			logger.Error("listener exited unexpectedly", "err", err)
+		}
+	}
+
+	// SPEC §9.5: stop accepting, then drain up to shutdownTimeout. Use a
+	// fresh ctx (not derived from the signal ctx, which is already
+	// cancelled) so Shutdown's deadline is real.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	if err := plainSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("http shutdown returned error", "err", err)
+	}
+	if tlsSrv != nil {
+		if err := tlsSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("https shutdown returned error", "err", err)
+		}
+	}
+
+	wg.Wait()
+	logger.Info("apt-cacher-ultra stopped")
+	return listenerErr
+}
+
+func tlsAddrString(ln net.Listener) string {
+	if ln == nil {
+		return ""
+	}
+	return ln.Addr().String()
+}
+
+// newHTTPServer builds a *http.Server with the timeouts SPEC §9 implies.
+// Notably there is no WriteTimeout: a large .deb stream is allowed to take
+// arbitrarily long; the per-fetch budget belongs to fetch.TotalTimeout. A
+// ReadHeaderTimeout *is* set because slowloris-style header dribbling is
+// not part of any legitimate apt workload.
+func newHTTPServer(h http.Handler, logger *slog.Logger) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+	}
 }
 
 func newLogger(c config.LogConfig) *slog.Logger {
