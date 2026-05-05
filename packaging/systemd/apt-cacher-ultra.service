@@ -1,0 +1,30 @@
+[Unit]
+Description=apt-cacher-ultra robust apt repository cache
+Documentation=https://github.com/linsomniac/apt-cacher-ultra
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=apt-cacher-ultra
+Group=apt-cacher-ultra
+ExecStart=/usr/sbin/apt-cacher-ultra --config /etc/apt-cacher-ultra/config.toml
+Restart=always
+RestartSec=5
+TimeoutStopSec=35
+
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/cache/apt-cacher-ultra
+ProtectHome=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

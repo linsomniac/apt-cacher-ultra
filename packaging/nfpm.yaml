@@ -1,0 +1,28 @@
+name: apt-cacher-ultra
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: Sean Reifschneider <jafo00@gmail.com>
+description: |
+  A robust apt repository cache focused on availability under upstream
+  failure. Designed as a replacement for apt-cacher-ng that keeps cache
+  hits fast and successful even when upstream mirrors are unreachable.
+homepage: https://github.com/linsomniac/apt-cacher-ultra
+license: MIT
+depends:
+  - adduser
+contents:
+  - src: ./build/apt-cacher-ultra
+    dst: /usr/sbin/apt-cacher-ultra
+  - src: ./packaging/systemd/apt-cacher-ultra.service
+    dst: /lib/systemd/system/apt-cacher-ultra.service
+  - src: ./packaging/config/config.toml.default
+    dst: /etc/apt-cacher-ultra/config.toml
+    type: config|noreplace
+scripts:
+  preinstall:  ./packaging/scripts/preinstall.sh
+  postinstall: ./packaging/scripts/postinstall.sh
+  preremove:   ./packaging/scripts/preremove.sh
+  postremove:  ./packaging/scripts/postremove.sh

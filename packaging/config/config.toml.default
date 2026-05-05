@@ -1,0 +1,58 @@
+# apt-cacher-ultra default configuration. See SPEC.md for full reference.
+
+[cache]
+dir         = "/var/cache/apt-cacher-ultra"
+listen      = "0.0.0.0:3142"
+listen_tls  = ""                          # empty disables TLS listener
+tls_cert    = ""
+tls_key     = ""
+
+[upstream]
+connect_timeout         = "30s"
+total_timeout           = "5m"
+idle_read_timeout       = "60s"
+max_retries             = 3
+max_concurrent_per_host = 8
+
+# Open-proxy hardening (SPEC §6.6). Only upstream hosts matching one of
+# these regexes will be fetched. Empty list = deny-all (cache becomes
+# read-only on miss).
+allowed_host_regex = [
+  '^([a-z0-9-]+\.)*ubuntu\.com$',
+  '^([a-z0-9-]+\.)*debian\.org$',
+  '^ppa\.launchpadcontent\.net$',
+  '^apt\.corretto\.aws$',
+  '^repo\.charm\.sh$',
+  '^pkg\.haproxy\.com$',
+  '^download\.docker\.com$',
+]
+# After DNS resolution, every resolved IP is checked against these CIDRs
+# and the request is refused if any match.
+deny_target_ranges = [
+  "127.0.0.0/8", "::1/128",
+  "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+  "169.254.0.0/16", "fe80::/10",
+  "::ffff:127.0.0.0/104",
+]
+
+[freshness]
+cooldown          = "60s"
+periodic_refresh  = "15m"
+
+[serve]
+serve_stale_when_upstream_down = true
+log_stale_serves               = true
+
+[log]
+level  = "info"
+format = "json"
+
+# Custom Remap rules. User rules apply before built-ins (SPEC §3.2).
+# [[remap]]
+# match_host_regex = '^my-internal-mirror\.example\.com$'
+# canonical_host   = "archive.ubuntu.com"
+
+# Optional secondary mirror-mode prefixes:
+# [[mirror]]
+# prefix   = "/corretto"
+# upstream = "https://apt.corretto.aws/"
