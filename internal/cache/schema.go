@@ -20,9 +20,18 @@ const CurrentSchemaVersion = 1
 // initial schema including the schema_version row.
 var migrations = []string{
 	// v0 → v1: initial schema per SPEC §4.3.
+	//
+	// AIDEV-NOTE: blob.hash carries a CHECK that pins it to lowercase
+	// sha256 hex (length 64, [0-9a-f] only). url_path.blob_hash inherits
+	// this validity through the foreign key — a malformed hash there
+	// would fail FK before it could be used to construct a pool/ path,
+	// guarding against path-traversal attacks via a corrupt or buggy
+	// row. The Go API also calls validBlobHash() on every entry; both
+	// layers must hold to defend the on-disk pool.
 	`
 CREATE TABLE blob (
-  hash         TEXT PRIMARY KEY,
+  hash         TEXT PRIMARY KEY
+                 CHECK (length(hash) = 64 AND hash NOT GLOB '*[^0-9a-f]*'),
   size         INTEGER NOT NULL,
   created_at   INTEGER NOT NULL,
   refcount     INTEGER NOT NULL DEFAULT 0
@@ -85,24 +94,37 @@ func migrate(ctx context.Context, db *sql.DB) error {
 }
 
 // readSchemaVersion returns 0 when the schema_version table is absent
-// (a fresh database).
+// (a fresh database). Distinguishes "table missing" from real errors —
+// corruption, I/O failure, or a cancelled context must NOT be silently
+// treated as a fresh DB, because that would set off a doomed migration
+// against an already-broken store.
 func readSchemaVersion(ctx context.Context, db *sql.DB) (int, error) {
-	var v int
-	err := db.QueryRowContext(ctx, `SELECT version FROM schema_version`).Scan(&v)
+	// AIDEV-NOTE: probe sqlite_master rather than catching the
+	// "no such table" error string. Driver-level error messages are not
+	// part of the API contract; sqlite_master is.
+	var name string
+	err := db.QueryRowContext(ctx,
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'`,
+	).Scan(&name)
 	switch {
-	case err == nil:
-		return v, nil
 	case errors.Is(err, sql.ErrNoRows):
-		// Table exists but is empty; treat as v0 and let migration repopulate.
-		return 0, nil
-	default:
-		// SQLite reports "no such table" via a generic error message; assume
-		// any error other than ErrNoRows means the schema is uninitialized.
-		// AIDEV-NOTE: a real I/O or corruption error would also land here and
-		// be misread as "fresh DB", but the migration runner re-issues SQL
-		// against the same handle and any persistent fault will resurface.
-		return 0, nil
+		return 0, nil // fresh DB — migration[0] will create the table
+	case err != nil:
+		return 0, fmt.Errorf("probe schema_version table: %w", err)
 	}
+
+	var v int
+	err = db.QueryRowContext(ctx, `SELECT version FROM schema_version`).Scan(&v)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// Table exists but no row — interrupted migration. Treat as v0
+		// and let migration[0] repopulate. The INSERT in migration[0]
+		// is the only writer of this row in v1.
+		return 0, nil
+	case err != nil:
+		return 0, fmt.Errorf("read schema_version row: %w", err)
+	}
+	return v, nil
 }
 
 // applyMigration runs migrations[from] inside a single transaction.

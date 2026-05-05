@@ -17,23 +17,49 @@ import (
 // byte-count differs from the upstream's declared Content-Length.
 var ErrSizeMismatch = errors.New("cache: blob size mismatch")
 
+// ErrInvalidHash is returned when a caller hands the cache something that
+// is not a valid sha256 hex digest.
+var ErrInvalidHash = errors.New("cache: invalid blob hash")
+
+// validBlobHash reports whether s is exactly 64 lowercase hex characters
+// (a sha256 hex digest). This is the canonical form the schema CHECK
+// constraint enforces; callers must pass it through here before any path
+// computation or SQL interpolation, as a defense-in-depth against path
+// traversal if a malformed value ever reaches the API.
+func validBlobHash(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // BlobPath returns the absolute on-disk path the cache will store the blob
-// at when finalized. The file may not yet exist.
+// at when finalized. Panics on a malformed hash; that should never reach
+// this function because every entry point validates first.
 func (c *Cache) BlobPath(hash string) string {
-	if len(hash) < 2 {
-		// Defensive: callers should never pass non-sha256 hashes; the
-		// schema enforces 64-char lowercase hex. Return something
-		// obviously broken rather than indexing into a too-short string.
-		return filepath.Join(c.dir, "pool", "INVALID", hash)
+	if !validBlobHash(hash) {
+		// AIDEV-NOTE: panicking here turns "bad hash leaked into BlobPath"
+		// from a quiet path-traversal bug into a visible test/CI failure.
+		// Callers must validate at their boundary; nothing inside the
+		// cache package should produce a non-hex hash.
+		panic(fmt.Errorf("%w: %q", ErrInvalidHash, hash))
 	}
 	return filepath.Join(c.dir, "pool", hash[:2], hash)
 }
 
 // BlobExists reports whether a finalized blob with this hash is on disk.
-// Useful for callers that have a row in url_path but want to confirm the
-// file is still present (e.g. after an out-of-band tmp/ sweep or a manual
-// pool/ wipe).
+// Returns ErrInvalidHash if the hash is not 64 hex chars, so callers can
+// distinguish "not in the cache" from "you passed garbage".
 func (c *Cache) BlobExists(hash string) (bool, error) {
+	if !validBlobHash(hash) {
+		return false, fmt.Errorf("%w: %q", ErrInvalidHash, hash)
+	}
 	st, err := os.Stat(c.BlobPath(hash))
 	switch {
 	case err == nil:

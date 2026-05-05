@@ -91,7 +91,13 @@ func openDB(path string) (*sql.DB, error) {
 	// already serialize writes — but a 5s grace prevents transient races
 	// (e.g. mtime queries on the WAL) from surfacing as SQLITE_BUSY.
 	q.Add("_pragma", "busy_timeout(5000)")
-	dsn := "file:" + path + "?" + q.Encode()
+	// AIDEV-NOTE: build the URI through net/url so a path containing
+	// metacharacters (`?`, `#`, spaces) is percent-encoded. Concatenating
+	// strings here would let those bytes hijack DSN parsing — e.g. a path
+	// with `?` would be treated as the start of the query, swallowing
+	// our pragmas.
+	u := url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}
+	dsn := u.String()
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
@@ -116,6 +122,13 @@ type writeReq struct {
 
 // submitWrite enqueues op on the writer goroutine and waits for its
 // result. Returns ErrClosed if the cache is closing.
+//
+// AIDEV-NOTE: Both selects must watch closeCh. The race is: a sender that
+// passes the closed.Load() check can still race the writer's exit. If the
+// channel has buffer space and Close fires concurrently, the request can
+// land in a now-orphaned buffer after the writer's drain has completed.
+// Watching closeCh in the result-wait select guarantees the caller
+// unblocks (ErrClosed) instead of hanging forever on req.res.
 func (c *Cache) submitWrite(ctx context.Context, op writeOp) error {
 	if c.closed.Load() {
 		return ErrClosed
@@ -131,6 +144,8 @@ func (c *Cache) submitWrite(ctx context.Context, op writeOp) error {
 	select {
 	case err := <-req.res:
 		return err
+	case <-c.closeCh:
+		return ErrClosed
 	case <-ctx.Done():
 		// The writer will still run the op and write to req.res; res is
 		// buffered (cap 1) so no goroutine blocks.

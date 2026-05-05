@@ -422,6 +422,116 @@ func TestClose_RejectsFurtherWrites(t *testing.T) {
 	}
 }
 
+// TestClose_DoesNotStrandSubmitWriters runs many concurrent submitters
+// against a cache that gets closed mid-flight. Every submitter must
+// return within a short bounded time — none may hang on req.res after
+// the writer goroutine has exited. Regression for codex review #1.
+func TestClose_DoesNotStrandSubmitWriters(t *testing.T) {
+	c := openCache(t)
+	const submitters = 64
+
+	var wg sync.WaitGroup
+	wg.Add(submitters)
+	hash := strings.Repeat("0", 64)
+	for i := 0; i < submitters; i++ {
+		go func(i int) {
+			defer wg.Done()
+			// Every error here is acceptable — we only care that the
+			// goroutine returns.
+			_ = c.PutBlob(context.Background(), hash, int64(i+1))
+		}(i)
+	}
+
+	// Give the submitters a moment to crowd in, then yank the cache out.
+	time.Sleep(2 * time.Millisecond)
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// All submitters returned. Pass.
+	case <-time.After(5 * time.Second):
+		t.Fatal("submitters did not return within 5s after Close — at least one is stranded")
+	}
+}
+
+func TestPutBlob_RejectsMalformedHash(t *testing.T) {
+	c := openCache(t)
+	cases := []string{
+		"",                   // empty
+		strings.Repeat("a", 63), // too short
+		strings.Repeat("a", 65), // too long
+		strings.Repeat("g", 64), // non-hex
+		strings.Repeat("A", 64), // uppercase forbidden
+		"../../../etc/passwd",
+	}
+	for _, h := range cases {
+		err := c.PutBlob(context.Background(), h, 1)
+		if !errors.Is(err, ErrInvalidHash) {
+			t.Errorf("PutBlob(%q): got %v, want ErrInvalidHash", h, err)
+		}
+	}
+}
+
+func TestSchema_RejectsMalformedHashAtDBLayer(t *testing.T) {
+	c := openCache(t)
+	// Bypass the Go API and try to stuff a malformed hash directly. The
+	// SQLite CHECK constraint must reject it.
+	_, err := c.db.Exec(`INSERT INTO blob (hash, size, created_at) VALUES (?, 1, 0)`,
+		strings.Repeat("z", 64))
+	if err == nil {
+		t.Fatal("CHECK constraint missing: malformed hex hash was accepted")
+	}
+	if !strings.Contains(err.Error(), "CHECK") && !strings.Contains(err.Error(), "constraint") {
+		t.Errorf("error %q does not mention CHECK constraint", err)
+	}
+}
+
+func TestBlobPath_PanicsOnMalformedHash(t *testing.T) {
+	c := openCache(t)
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on malformed hash; got nothing")
+		}
+	}()
+	_ = c.BlobPath("..")
+}
+
+func TestBlobExists_RejectsMalformedHash(t *testing.T) {
+	c := openCache(t)
+	_, err := c.BlobExists("not-a-hash")
+	if !errors.Is(err, ErrInvalidHash) {
+		t.Errorf("BlobExists: got %v, want ErrInvalidHash", err)
+	}
+}
+
+func TestOpen_PathWithMetacharsInDir(t *testing.T) {
+	// A directory whose name contains `?` would corrupt a string-built
+	// SQLite DSN. With url.URL escaping, the path must round-trip
+	// cleanly. Regression for codex review #4.
+	parent := t.TempDir()
+	weird := filepath.Join(parent, "tricky?name#test")
+	if err := os.MkdirAll(weird, 0o750); err != nil {
+		t.Fatalf("mkdir %q: %v", weird, err)
+	}
+	c, err := Open(context.Background(), weird)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", weird, err)
+	}
+	defer c.Close()
+	if _, err := c.db.Exec(`INSERT INTO blob (hash, size, created_at) VALUES (?, 1, 0)`,
+		strings.Repeat("a", 64)); err != nil {
+		t.Errorf("simple insert into DB at weird path: %v", err)
+	}
+}
+
 func TestHashReader(t *testing.T) {
 	body := []byte("hello world")
 	want := sha256.Sum256(body)

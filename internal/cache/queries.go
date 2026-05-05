@@ -94,8 +94,12 @@ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ?`
 	})
 }
 
-// GetBlob returns the blob row for hash, or ErrNotFound.
+// GetBlob returns the blob row for hash, or ErrNotFound. Returns
+// ErrInvalidHash without touching the DB if the hash is malformed.
 func (c *Cache) GetBlob(ctx context.Context, hash string) (*Blob, error) {
+	if !validBlobHash(hash) {
+		return nil, fmt.Errorf("%w: %q", ErrInvalidHash, hash)
+	}
 	const q = `SELECT hash, size, created_at, refcount FROM blob WHERE hash = ?`
 	var b Blob
 	err := c.db.QueryRowContext(ctx, q, hash).Scan(&b.Hash, &b.Size, &b.CreatedAt, &b.RefCount)
@@ -111,7 +115,14 @@ func (c *Cache) GetBlob(ctx context.Context, hash string) (*Blob, error) {
 // PutBlob inserts a blob row. If a row with this hash already exists, it
 // is left untouched (created_at and refcount must stay stable). Use this
 // after a successful BlobWriter.Finalize.
+//
+// The schema also CHECKs that hash matches sha256-hex shape, so this Go
+// validation is defense-in-depth. We surface ErrInvalidHash before
+// submitting to the writer goroutine so a buggy caller fails immediately.
 func (c *Cache) PutBlob(ctx context.Context, hash string, size int64) error {
+	if !validBlobHash(hash) {
+		return fmt.Errorf("%w: %q", ErrInvalidHash, hash)
+	}
 	const q = `
 INSERT INTO blob (hash, size, created_at, refcount)
 VALUES (?, ?, ?, 0)
