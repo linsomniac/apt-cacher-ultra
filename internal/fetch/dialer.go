@@ -31,10 +31,25 @@ func parseDenyCIDRs(cidrs []string) ([]netip.Prefix, error) {
 
 // addrInDeny reports whether addr falls in any deny prefix and returns
 // the matching prefix for diagnostic logging.
+//
+// IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) are checked against IPv4
+// prefixes after Unmap() so an attacker can't dodge an IPv4 deny entry
+// by reaching us over a dual-stack socket. Without this, a target like
+// ::ffff:169.254.169.254 (cloud metadata via IPv6) would slip past a
+// 169.254.0.0/16 deny rule. Addresses that are not 4-in-6 fall through
+// the original loop unchanged.
 func addrInDeny(addr netip.Addr, deny []netip.Prefix) (bool, netip.Prefix) {
 	for _, p := range deny {
 		if p.Contains(addr) {
 			return true, p
+		}
+	}
+	if addr.Is4In6() {
+		unmapped := addr.Unmap()
+		for _, p := range deny {
+			if p.Contains(unmapped) {
+				return true, p
+			}
 		}
 	}
 	return false, netip.Prefix{}

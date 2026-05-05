@@ -17,6 +17,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -34,6 +35,8 @@ var (
 	ErrSizeMismatch        = errors.New("fetch: response body length disagrees with declared length")
 	ErrInvalidContentRange = errors.New("fetch: upstream Content-Range header invalid or unexpected")
 	ErrTotalSizeMismatch   = errors.New("fetch: 206 total size differs from initial 200 length")
+	ErrInvalidURL          = errors.New("fetch: invalid target URL")
+	ErrRedirectBlocked     = errors.New("fetch: upstream redirect blocked")
 )
 
 const defaultUserAgent = "apt-cacher-ultra/0.1"
@@ -134,6 +137,20 @@ func New(opts Options) (*Client, error) {
 			// from the ctx we wrap with TotalTimeout in Fetch. Setting
 			// Client.Timeout in addition would fire even after our own
 			// ctx cancel, double-cancelling for no benefit.
+			//
+			// Reject *all* upstream redirects in Phase 1. Without this
+			// hook the http.Client would follow 3xx silently, which
+			// bypasses the allowlist (the post-redirect host is never
+			// regex-checked) and breaks the cache-key contract (the URL
+			// the cache stores is the request URL, not the redirect
+			// target). Operators whose archive uses redirects should
+			// configure a Remap rule pointing at the redirect target.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) == 0 {
+					return fmt.Errorf("%w: redirected to %s", ErrRedirectBlocked, req.URL)
+				}
+				return fmt.Errorf("%w: %s -> %s", ErrRedirectBlocked, via[len(via)-1].URL, req.URL)
+			},
 		},
 		allow:        allow,
 		maxRetries:   opts.MaxRetries,
@@ -160,7 +177,28 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (*Fetc
 	if dst == nil {
 		return nil, errors.New("fetch: nil dst")
 	}
-	if err := c.checkAllowed(target.CanonicalHost); err != nil {
+	// Defense-in-depth: parse target.URL and require URL.Hostname() to
+	// match target.CanonicalHost. The proxy package always keeps these
+	// aligned, but the fetch package is security-sensitive and should
+	// not rely on a caller invariant for SSRF posture.
+	u, err := url.Parse(target.URL)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidURL, err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return nil, fmt.Errorf("%w: scheme %q (only http/https supported)", ErrInvalidURL, scheme)
+	}
+	urlHost := normalizeHost(u.Hostname())
+	if urlHost == "" {
+		return nil, fmt.Errorf("%w: empty host in %q", ErrInvalidURL, target.URL)
+	}
+	canonHost := normalizeHost(target.CanonicalHost)
+	if urlHost != canonHost {
+		return nil, fmt.Errorf("%w: URL host %q != canonical host %q",
+			ErrInvalidURL, urlHost, canonHost)
+	}
+	if err := c.checkAllowed(canonHost); err != nil {
 		return nil, err
 	}
 	if c.totalTimeout > 0 {
@@ -301,7 +339,7 @@ func (c *Client) doAttempt(
 		if !sendRange {
 			return out, fmt.Errorf("%w: 206 to non-Range request", ErrInvalidContentRange)
 		}
-		first, _, total, err := parseContentRange(resp.Header.Get("Content-Range"))
+		first, last, total, err := parseContentRange(resp.Header.Get("Content-Range"))
 		if err != nil {
 			return out, err
 		}
@@ -309,13 +347,34 @@ func (c *Client) doAttempt(
 			return out, fmt.Errorf("%w: 206 first=%d, expected %d",
 				ErrInvalidContentRange, first, rangeStart)
 		}
-		if expectedTotal > 0 && total > 0 && total != expectedTotal {
-			return out, fmt.Errorf("%w: 206 total=%d, expected %d",
-				ErrTotalSizeMismatch, total, expectedTotal)
+		// SPEC §6.3 requires the 206 total to match the initial 200's
+		// Content-Length. A "*" total (unknown) cannot satisfy that, so
+		// reject it whenever we have something to compare against.
+		if expectedTotal > 0 {
+			if total < 0 {
+				return out, fmt.Errorf("%w: 206 total=* but expected %d",
+					ErrInvalidContentRange, expectedTotal)
+			}
+			if total != expectedTotal {
+				return out, fmt.Errorf("%w: 206 total=%d, expected %d",
+					ErrTotalSizeMismatch, total, expectedTotal)
+			}
+		}
+		if total > 0 && last >= total {
+			return out, fmt.Errorf("%w: 206 last=%d >= total=%d",
+				ErrInvalidContentRange, last, total)
 		}
 		out.ContentLength = total
 		if err := streamBody(resp, dst); err != nil {
 			return out, err
+		}
+		// The response covered [first, last] inclusive. Combined with
+		// dst's pre-attempt cursor of `first`, dst.Written() must be
+		// exactly last+1 — otherwise the body was short or long for
+		// the declared range.
+		if dst.Written() != last+1 {
+			return out, fmt.Errorf("%w: 206 wrote up to %d, declared last=%d",
+				ErrSizeMismatch, dst.Written()-1, last)
 		}
 		if total > 0 && dst.Written() != total {
 			return out, fmt.Errorf("%w: wrote %d, declared total %d",
@@ -334,6 +393,19 @@ func (c *Client) doAttempt(
 func streamBody(resp *http.Response, dst io.Writer) error {
 	_, err := io.Copy(dst, resp.Body)
 	return err
+}
+
+// normalizeHost canonicalizes a hostname for equality comparison: lowercase
+// + strip trailing FQDN dot + strip IPv6 brackets. The result is suitable
+// for comparing url.URL.Hostname() (already bracket-stripped) with the
+// canonical host carried in Target (which may keep brackets after passing
+// through proxy.canonicalize for IPv6 literals).
+func normalizeHost(h string) string {
+	h = strings.ToLower(strings.TrimSuffix(h, "."))
+	if len(h) >= 2 && h[0] == '[' && h[len(h)-1] == ']' {
+		h = h[1 : len(h)-1]
+	}
+	return h
 }
 
 // parseContentRange parses "bytes <first>-<last>/<total>" or
@@ -394,6 +466,9 @@ func isRetryable(err error) bool {
 		return false
 	}
 	if errors.Is(err, ErrUpstreamStatus) {
+		return false
+	}
+	if errors.Is(err, ErrRedirectBlocked) || errors.Is(err, ErrInvalidURL) {
 		return false
 	}
 	return true

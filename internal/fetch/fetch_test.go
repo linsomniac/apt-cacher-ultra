@@ -623,6 +623,8 @@ func TestIsRetryable(t *testing.T) {
 		{fmt.Errorf("%w: status=500", ErrUpstreamServerError), true},
 		{fmt.Errorf("%w: bad", ErrInvalidContentRange), true},
 		{fmt.Errorf("%w: short", ErrSizeMismatch), true},
+		{fmt.Errorf("%w: redir", ErrRedirectBlocked), false},
+		{fmt.Errorf("%w: scheme \"ftp\"", ErrInvalidURL), false},
 		{errors.New("some IO error"), true},
 	}
 	for _, tc := range cases {
@@ -659,6 +661,260 @@ func TestAddrInDeny(t *testing.T) {
 		got, _ := addrInDeny(ip, deny)
 		if got != tc.want {
 			t.Errorf("addrInDeny(%s): got %v, want %v", tc.ip, got, tc.want)
+		}
+	}
+}
+
+// TestAddrInDeny_IPv4MappedIPv6 covers the SSRF defense for dual-stack
+// sockets that present an IPv4 destination as ::ffff:a.b.c.d. Without the
+// Unmap fallback, a deny entry for 169.254.0.0/16 would let through the
+// mapped form ::ffff:169.254.169.254 (cloud metadata over IPv6).
+func TestAddrInDeny_IPv4MappedIPv6(t *testing.T) {
+	deny, err := parseDenyCIDRs([]string{
+		"169.254.0.0/16",
+		"10.0.0.0/8",
+		"127.0.0.0/8",
+	})
+	if err != nil {
+		t.Fatalf("parseDenyCIDRs: %v", err)
+	}
+	cases := []struct {
+		ip   string
+		want bool
+	}{
+		{"::ffff:169.254.169.254", true}, // metadata, mapped form
+		{"::ffff:10.0.0.1", true},        // RFC1918, mapped
+		{"::ffff:127.0.0.1", true},       // loopback, mapped
+		{"::ffff:8.8.8.8", false},        // public, mapped — pass
+	}
+	for _, tc := range cases {
+		ip, err := netip.ParseAddr(tc.ip)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.ip, err)
+		}
+		got, _ := addrInDeny(ip, deny)
+		if got != tc.want {
+			t.Errorf("addrInDeny(%s): got %v, want %v", tc.ip, got, tc.want)
+		}
+	}
+}
+
+// TestFetch_RedirectBlocked verifies that 3xx responses are not followed.
+// Without CheckRedirect, http.Client would silently fetch the redirect
+// target — bypassing the allowlist and breaking the cache-key contract.
+func TestFetch_RedirectBlocked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Redirect(w, &http.Request{}, "http://other.example.com/", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	_, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, &bufDst{})
+	if !errors.Is(err, ErrRedirectBlocked) {
+		t.Errorf("want ErrRedirectBlocked, got %v", err)
+	}
+}
+
+// TestFetch_URLHostMismatch is the defense-in-depth check: if a buggy
+// caller passes CanonicalHost="archive.ubuntu.com" but URL="http://evil/",
+// fetch must refuse before any network I/O.
+func TestFetch_URLHostMismatch(t *testing.T) {
+	client, err := New(Options{
+		AllowedHostRegex: []string{`^archive\.ubuntu\.com$`, `^evil\.example\.com$`},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = client.Fetch(context.Background(), &Target{
+		CanonicalHost: "archive.ubuntu.com",
+		URL:           "http://evil.example.com/x",
+	}, &bufDst{})
+	if !errors.Is(err, ErrInvalidURL) {
+		t.Errorf("want ErrInvalidURL, got %v", err)
+	}
+}
+
+func TestFetch_RejectsNonHTTPScheme(t *testing.T) {
+	client, err := New(Options{AllowedHostRegex: []string{`.*`}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = client.Fetch(context.Background(), &Target{
+		CanonicalHost: "example.com",
+		URL:           "ftp://example.com/foo",
+	}, &bufDst{})
+	if !errors.Is(err, ErrInvalidURL) {
+		t.Errorf("want ErrInvalidURL, got %v", err)
+	}
+}
+
+func TestFetch_HostMatchAcrossCaseAndDot(t *testing.T) {
+	body := []byte("ok")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	// Caller passed mixed-case CanonicalHost with trailing dot; URL.Hostname()
+	// is bare lowercase. normalizeHost should reconcile both to "127.0.0.1".
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	_, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1.",
+		URL:           srv.URL,
+	}, dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if dst.String() != string(body) {
+		t.Errorf("body: %q", dst.String())
+	}
+}
+
+// TestFetch_206RejectsUnknownTotal verifies that a 206 with "*" total is
+// rejected when we have a known expected total from the initial 200.
+// Without this check, a server could respond with bytes 6-10/* and the
+// "total matches" rule from SPEC §6.3 could not be enforced.
+func TestFetch_206RejectsUnknownTotal(t *testing.T) {
+	full := []byte("hello world")
+	const half = 6
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := attempts.Add(1)
+		if n == 1 {
+			hj, _ := w.(http.Hijacker)
+			conn, bw, _ := hj.Hijack()
+			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
+			bw.Write(full[:half])
+			bw.Flush()
+			conn.Close()
+			return
+		}
+		w.Header().Set("Content-Range", "bytes 6-10/*")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(full[half:])
+	}))
+	defer srv.Close()
+
+	client, err := New(Options{
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		MaxRetries:       1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, &bufDst{})
+	if !errors.Is(err, ErrUpstreamUnavailable) {
+		t.Errorf("want ErrUpstreamUnavailable wrapping ErrInvalidContentRange, got %v", err)
+	}
+}
+
+// TestFetch_206RejectsLastBeyondTotal: server claims bytes 6-99/11 — the
+// last byte index is past the stated total. Reject as malformed.
+func TestFetch_206RejectsLastBeyondTotal(t *testing.T) {
+	full := []byte("hello world")
+	const half = 6
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := attempts.Add(1)
+		if n == 1 {
+			hj, _ := w.(http.Hijacker)
+			conn, bw, _ := hj.Hijack()
+			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
+			bw.Write(full[:half])
+			bw.Flush()
+			conn.Close()
+			return
+		}
+		w.Header().Set("Content-Range", "bytes 6-99/11")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("x"))
+	}))
+	defer srv.Close()
+
+	client, err := New(Options{
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		MaxRetries:       1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, &bufDst{})
+	if !errors.Is(err, ErrUpstreamUnavailable) {
+		t.Errorf("want ErrUpstreamUnavailable wrapping ErrInvalidContentRange, got %v", err)
+	}
+}
+
+// TestFetch_206BodyShorterThanRange: server declares bytes 6-10 but
+// delivers fewer bytes than that. The dst.Written != last+1 check
+// must catch the mismatch.
+func TestFetch_206BodyShorterThanRange(t *testing.T) {
+	full := []byte("hello world")
+	const half = 6
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := attempts.Add(1)
+		if n == 1 {
+			hj, _ := w.(http.Hijacker)
+			conn, bw, _ := hj.Hijack()
+			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
+			bw.Write(full[:half])
+			bw.Flush()
+			conn.Close()
+			return
+		}
+		// 206 announces 5 bytes (6-10) but delivers 2.
+		w.Header().Set("Content-Range", "bytes 6-10/11")
+		w.Header().Set("Content-Length", "2")
+		w.WriteHeader(http.StatusPartialContent)
+		hj, _ := w.(http.Hijacker)
+		conn, bw, _ := hj.Hijack()
+		bw.Write([]byte("xx"))
+		bw.Flush()
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	client, err := New(Options{
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		MaxRetries:       1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, &bufDst{})
+	if !errors.Is(err, ErrUpstreamUnavailable) {
+		t.Errorf("want ErrUpstreamUnavailable, got %v", err)
+	}
+}
+
+func TestNormalizeHost(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"archive.ubuntu.com", "archive.ubuntu.com"},
+		{"ARCHIVE.UBUNTU.COM", "archive.ubuntu.com"},
+		{"archive.ubuntu.com.", "archive.ubuntu.com"},
+		{"ARCHIVE.UBUNTU.COM.", "archive.ubuntu.com"},
+		{"[::1]", "::1"},
+		{"[::FFFF:127.0.0.1]", "::ffff:127.0.0.1"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := normalizeHost(tc.in); got != tc.want {
+			t.Errorf("normalizeHost(%q): got %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }
