@@ -37,6 +37,7 @@ var (
 	ErrTotalSizeMismatch   = errors.New("fetch: 206 total size differs from initial 200 length")
 	ErrInvalidURL          = errors.New("fetch: invalid target URL")
 	ErrRedirectBlocked     = errors.New("fetch: upstream redirect blocked")
+	ErrCacheWriteFailed    = errors.New("fetch: cache write failed")
 )
 
 // StatusError carries the upstream HTTP status code from a non-success,
@@ -410,10 +411,31 @@ func (c *Client) doAttempt(
 	}
 }
 
-// streamBody copies resp.Body into dst.
+// streamBody copies resp.Body into dst, tagging dst-side write failures
+// with ErrCacheWriteFailed so callers can distinguish a cache-side fault
+// (e.g. disk full) from an upstream-side fault. Without this distinction
+// io.Copy returns the first error from either side; the outer retry loop
+// would then re-attempt on a cache write failure that won't recover by
+// re-asking the upstream.
 func streamBody(resp *http.Response, dst io.Writer) error {
-	_, err := io.Copy(dst, resp.Body)
+	_, err := io.Copy(&writeErrTagger{w: dst}, resp.Body)
 	return err
+}
+
+// writeErrTagger wraps an io.Writer so any Write error is wrapped with
+// ErrCacheWriteFailed. Read-side errors from io.Copy still bubble up
+// unwrapped, so the outer Fetch loop retries those (network blips) and
+// stops on cache write errors (no point re-fetching when our disk is full).
+type writeErrTagger struct {
+	w io.Writer
+}
+
+func (t *writeErrTagger) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if err != nil {
+		return n, fmt.Errorf("%w: %v", ErrCacheWriteFailed, err)
+	}
+	return n, nil
 }
 
 // normalizeHost canonicalizes a hostname for equality comparison: lowercase
@@ -490,6 +512,12 @@ func isRetryable(err error) bool {
 		return false
 	}
 	if errors.Is(err, ErrRedirectBlocked) || errors.Is(err, ErrInvalidURL) {
+		return false
+	}
+	if errors.Is(err, ErrCacheWriteFailed) {
+		// SPEC §11 row 14: a cache-side write failure (disk full, I/O
+		// error) won't get better by re-asking upstream. Surface it
+		// fast so the handler can log loudly and 502.
 		return false
 	}
 	return true

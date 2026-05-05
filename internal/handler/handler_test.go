@@ -1664,3 +1664,51 @@ func TestServeHTTP_UpstreamTimeout_BlobRetryAfter60(t *testing.T) {
 		t.Errorf("Retry-After=%q, want %q (blob + true timeout)", got, "60")
 	}
 }
+
+// TestRespondError_CacheWriteFailedLogsAndReturns502 covers SPEC §11 row 14
+// at the handler boundary: when fetch surfaces ErrCacheWriteFailed, the
+// handler emits 502 + Retry-After AND a slog.Error log line so the
+// operator-visible signal distinguishes a cache-side fault from an
+// upstream outage. Driven by a synthetic sfResult rather than ServeHTTP
+// because runFetch's NewTempBlob is concrete; routing a real disk-full
+// through the public path would require fault-injection plumbing that
+// belongs to a future test-helper slice. The unit test pins the response
+// shape and the slog.Error so the end-to-end behavior is unambiguous.
+func TestRespondError_CacheWriteFailedLogsAndReturns502(t *testing.T) {
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&safeWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	h := newTestHandlerWithServe(t, config.ServeConfig{}, logger)
+	defer h.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer srv.Close()
+
+	req, err := h.parser.Parse(srv.URL+"/ubuntu/dists/noble/InRelease", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parser.Parse: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
+	res := sfResult{err: fmt.Errorf("test wrap: %w", fetch.ErrCacheWriteFailed)}
+
+	h.respondError(rec, r, req, res, time.Now())
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "30" {
+		t.Errorf("Retry-After=%q, want %q (metadata + cache write failure)", got, "30")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=ERROR") {
+		t.Errorf("slog.Error not emitted for cache write failure:\n%s", out)
+	}
+	if !strings.Contains(out, "cache write failed") {
+		t.Errorf("expected 'cache write failed' in log:\n%s", out)
+	}
+	if !strings.Contains(out, "outcome=cache_write_failed") {
+		t.Errorf("per-request log outcome must be cache_write_failed:\n%s", out)
+	}
+}

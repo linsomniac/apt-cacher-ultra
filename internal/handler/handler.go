@@ -522,6 +522,23 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		errors.Is(err, context.DeadlineExceeded):
 		h.respondUpstreamUnreachable(w, r, req, start)
 		return
+	case errors.Is(err, fetch.ErrCacheWriteFailed):
+		// SPEC §11 row 14: a cache-side write failure (disk full, I/O
+		// error) is operationally distinct from an upstream outage —
+		// re-fetch will fail identically until the disk is healed. Log
+		// loudly so the operator sees the actual condition rather than
+		// chasing a phantom upstream issue, and emit the same 502 +
+		// Retry-After the upstream-down path uses (the client behavior
+		// is the same; only the server-side signal differs).
+		h.logger.Error("cache write failed",
+			"err", err,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+		)
+		w.Header().Set("Retry-After", retryAfterForRequest(req))
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		h.logRequest(r, req.CanonicalHost, req.Path, "cache_write_failed", http.StatusBadGateway, 0, start)
+		return
 	case errors.Is(err, fetch.ErrInvalidURL),
 		errors.Is(err, fetch.ErrRedirectBlocked):
 		// Cache could not even attempt the upstream. HIT-STALE here
