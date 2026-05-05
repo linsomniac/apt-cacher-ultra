@@ -32,6 +32,13 @@ var (
 	// Go's default is unlimited, which is a slowloris vulnerability.
 	readHeaderTimeout = 10 * time.Second
 
+	// idleTimeout caps how long an inbound keep-alive connection can sit
+	// idle between requests. With a public listener (default 0.0.0.0:3142)
+	// this prevents an unauthenticated client from holding sockets — and
+	// thus file descriptors — open indefinitely. Apt re-establishes
+	// connections cheaply, so 60s is generous without being abusable.
+	idleTimeout = 60 * time.Second
+
 	// shutdownTimeout is the SPEC §9.5 drain budget on SIGTERM.
 	shutdownTimeout = 30 * time.Second
 
@@ -235,18 +242,53 @@ func serveListeners(
 		}
 	}
 
-	// SPEC §9.5: stop accepting, then drain up to shutdownTimeout. Use a
-	// fresh ctx (not derived from the signal ctx, which is already
-	// cancelled) so Shutdown's deadline is real.
+	// SPEC §9.5 step 2: stop accepting (Shutdown closes the listener
+	// before draining), then wait up to shutdownTimeout for in-flight
+	// handlers to drain. Both listeners shut down concurrently under
+	// the same deadline — sequential Shutdown would let the second
+	// listener keep accepting while the first drained.
+	//
+	// Use a fresh ctx (not derived from the signal ctx, which is
+	// already cancelled) so the deadline is real.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	if err := plainSrv.Shutdown(shutdownCtx); err != nil {
-		logger.Warn("http shutdown returned error", "err", err)
+	var sg sync.WaitGroup
+	sg.Add(1)
+	go func() {
+		defer sg.Done()
+		if err := plainSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("http shutdown returned error", "err", err)
+		}
+	}()
+	if tlsSrv != nil {
+		sg.Add(1)
+		go func() {
+			defer sg.Done()
+			if err := tlsSrv.Shutdown(shutdownCtx); err != nil {
+				logger.Warn("https shutdown returned error", "err", err)
+			}
+		}()
+	}
+	sg.Wait()
+
+	// SPEC §9.5 step 3: cancel any in-flight upstream fetches (which
+	// outlive the request ctx by design — see handler.serveCacheMiss)
+	// and wait for the goroutines to exit. After this returns, no
+	// goroutine is using the cache, so the deferred c.Close() can run
+	// without racing live writes.
+	h.Close()
+
+	// Belt-and-suspenders: force-close any connection that did not
+	// drain (e.g. a cache-hit ServeContent whose client is no longer
+	// reading). After Close(), the Serve goroutines unblock and
+	// wg.Wait below returns.
+	if err := plainSrv.Close(); err != nil {
+		logger.Warn("http force-close returned error", "err", err)
 	}
 	if tlsSrv != nil {
-		if err := tlsSrv.Shutdown(shutdownCtx); err != nil {
-			logger.Warn("https shutdown returned error", "err", err)
+		if err := tlsSrv.Close(); err != nil {
+			logger.Warn("https force-close returned error", "err", err)
 		}
 	}
 
@@ -266,11 +308,15 @@ func tlsAddrString(ln net.Listener) string {
 // Notably there is no WriteTimeout: a large .deb stream is allowed to take
 // arbitrarily long; the per-fetch budget belongs to fetch.TotalTimeout. A
 // ReadHeaderTimeout *is* set because slowloris-style header dribbling is
-// not part of any legitimate apt workload.
+// not part of any legitimate apt workload, and an IdleTimeout caps the
+// lifetime of a keep-alive socket that an inbound client leaves idle —
+// without it, an unauthenticated peer can hold file descriptors open
+// indefinitely.
 func newHTTPServer(h http.Handler, logger *slog.Logger) *http.Server {
 	return &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}
 }

@@ -835,3 +835,71 @@ func TestServeHTTP_FetchStatusErrorMatchable(t *testing.T) {
 		t.Errorf("StatusError.Code=%d, want 451", got.Code)
 	}
 }
+
+// TestHandler_Close_AbortsInFlightFetch proves the SPEC §9.5 step 3 fix:
+// Close() cancels the lifecycle ctx, which propagates into the in-flight
+// upstream fetch and lets it return promptly. Without the fix, the fetch
+// would ride out fetch.TotalTimeout (5s in newTestHandler) regardless of
+// shutdown — and in production, the default 5m, which violates the SPEC
+// drain-budget contract.
+func TestHandler_Close_AbortsInFlightFetch(t *testing.T) {
+	entered := make(chan struct{})
+	var once sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(entered) })
+		// Block until the request ctx is cancelled. If the fix is in
+		// place, the handler's lifecycle ctx cancellation propagates
+		// through fetch.Fetch into our request ctx via http.Transport.
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(t, nil, nil)
+
+	rr := httptest.NewRecorder()
+	req := proxyReq(http.MethodGet, upstream.URL, "/path/to/file")
+
+	served := make(chan struct{})
+	go func() {
+		h.ServeHTTP(rr, req)
+		close(served)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("upstream never observed the request")
+	}
+
+	closeStart := time.Now()
+	h.Close()
+	closeDur := time.Since(closeStart)
+
+	// fetch.TotalTimeout is 5s in newTestHandler. If lifecycle
+	// cancellation does not actually reach fetch, the fetch waits out
+	// its full deadline and Close blocks for the same duration via
+	// activeWG.Wait. A 2s ceiling proves the cancel path works.
+	if closeDur > 2*time.Second {
+		t.Errorf("Close took %v; expected <2s with lifecycle cancel reaching fetch", closeDur)
+	}
+
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("ServeHTTP did not return after Close")
+	}
+
+	// Cancelled fetch maps to 503 in respondError (ctx.Canceled branch).
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("status=%d, want 503 after lifecycle cancel", rr.Code)
+	}
+}
+
+// TestHandler_Close_Idempotent verifies that calling Close twice is
+// safe — lifecycleCancel is idempotent and activeWG.Wait returns
+// immediately when the counter is already zero.
+func TestHandler_Close_Idempotent(t *testing.T) {
+	h := newTestHandler(t, nil, nil)
+	h.Close()
+	h.Close() // must not panic or hang
+}

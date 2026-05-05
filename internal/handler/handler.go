@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -38,6 +39,13 @@ type Config struct {
 }
 
 // Handler is the apt-cacher-ultra http.Handler. Construct via New.
+//
+// Close drains in-flight fetches at shutdown — see SPEC §9.5 step 3. The
+// handler keeps a lifecycle ctx (lifecycleCtx) that miss fetches are
+// rooted at instead of the request ctx, so a leader's client disconnect
+// does not abort an in-flight fetch that other waiters are still
+// blocked on. Close cancels that lifecycle ctx and waits on activeWG
+// for currently-running ServeHTTP invocations to complete.
 type Handler struct {
 	parser *proxy.Parser
 	cache  *cache.Cache
@@ -45,6 +53,10 @@ type Handler struct {
 	sf     *sfGroup
 	sem    *hostSem
 	logger *slog.Logger
+
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	activeWG        sync.WaitGroup
 }
 
 // New constructs a Handler from validated dependencies. Returns an error
@@ -67,14 +79,31 @@ func New(cfg Config) (*Handler, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	return &Handler{
-		parser: cfg.Parser,
-		cache:  cfg.Cache,
-		fetch:  cfg.Fetch,
-		sf:     newSFGroup(),
-		sem:    newHostSem(limit),
-		logger: logger,
+		parser:          cfg.Parser,
+		cache:           cfg.Cache,
+		fetch:           cfg.Fetch,
+		sf:              newSFGroup(),
+		sem:             newHostSem(limit),
+		logger:          logger,
+		lifecycleCtx:    lifecycleCtx,
+		lifecycleCancel: lifecycleCancel,
 	}, nil
+}
+
+// Close implements SPEC §9.5 step 3: cancel any in-flight upstream
+// fetches and wait for active ServeHTTP invocations to return. Safe to
+// call multiple times; lifecycleCancel is idempotent and Wait is too.
+//
+// Contract: Close MUST be called only after the embedding *http.Server
+// has been Shutdown (or otherwise stopped accepting new requests).
+// Otherwise activeWG.Add(1) at the top of ServeHTTP can race
+// activeWG.Wait() here, which is undefined behavior. Calling Close
+// after Server.Shutdown returns guarantees no new ServeHTTP starts.
+func (h *Handler) Close() {
+	h.lifecycleCancel()
+	h.activeWG.Wait()
 }
 
 // X-Cache outcome strings written to the response. SPEC §2.7.
@@ -90,6 +119,13 @@ const (
 
 // ServeHTTP routes one apt request through the cache.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// SPEC §9.5: track this invocation so Close() can wait for the
+	// drain before main returns and the cache is torn down. Add
+	// happens at entry so by the time Server.Shutdown returns there
+	// is no goroutine that could still call Add later.
+	h.activeWG.Add(1)
+	defer h.activeWG.Done()
+
 	start := time.Now()
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -213,11 +249,15 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	key := req.CanonicalScheme + "|" + req.CanonicalHost + "|" + req.Path
 
 	res, shared := h.sf.Do(key, func() sfResult {
-		// Detach the leader's request ctx: a leader who disconnects must
-		// not kill the fetch for the still-connected waiters. fetch
-		// applies its own TotalTimeout so the work stays bounded.
-		ctx := context.WithoutCancel(r.Context())
-		return h.runFetch(ctx, req)
+		// Use the handler's lifecycle ctx, not the request ctx. Two
+		// goals: (1) a leader who disconnects must not kill the fetch
+		// for waiters that are still connected, and (2) on graceful
+		// shutdown (SPEC §9.5 step 3) the lifecycle ctx is cancelled,
+		// which lets fetch return promptly instead of riding out
+		// fetch.TotalTimeout. Without this, a hung upstream would
+		// keep the cache from closing for several minutes after the
+		// drain budget elapses.
+		return h.runFetch(h.lifecycleCtx, req)
 	})
 
 	if res.err != nil {

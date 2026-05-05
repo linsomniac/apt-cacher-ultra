@@ -379,3 +379,98 @@ func firstLine(s string) string {
 	}
 	return s
 }
+
+// TestServe_GracefulShutdown_KillsHungFetchAfterDrainBudget proves the
+// SPEC §9.5 step 3 contract: when the drain budget elapses with a fetch
+// still in flight, serveListeners cancels the fetch and returns instead
+// of riding out fetch.TotalTimeout (5min default).
+//
+// We override shutdownTimeout to 200ms; without the lifecycle-ctx fix
+// the hung fetch would block serveListeners for the full TotalTimeout
+// (5min in production, 5s in tests via the default fetch.New). With
+// the fix, serveListeners returns within ~1s of cancel.
+func TestServe_GracefulShutdown_KillsHungFetchAfterDrainBudget(t *testing.T) {
+	t.Parallel()
+
+	oldTimeout := shutdownTimeout
+	shutdownTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { shutdownTimeout = oldTimeout })
+
+	entered := make(chan struct{})
+	var once sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(entered) })
+		// Block until the upstream's request ctx is cancelled, which
+		// happens when the cache cancels its fetch (lifecycle ctx
+		// cancel propagates through fetch.Fetch into the http
+		// transport, which closes the conn, which fires the request
+		// ctx). If the lifecycle fix is missing, this never fires
+		// during the drain window and the test times out.
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	cfg := minimalCfg(t.TempDir(), []config.MirrorRule{
+		{Prefix: "/ubuntu", Upstream: upstream.URL + "/"},
+	})
+
+	cacheLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	cacheAddr := cacheLn.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil)
+	}()
+
+	// Kick off the request. We do not care about its body — only that
+	// it reaches the upstream so we know the fetch is in flight.
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, _ := client.Get("http://" + cacheAddr + "/ubuntu/dists/noble/InRelease")
+		if resp != nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("upstream never observed the in-flight request")
+	}
+
+	// Trigger shutdown. The fetch is hung; the 200ms drain budget will
+	// expire; serveListeners must then cancel the fetch and return.
+	shutdownStart := time.Now()
+	cancel()
+
+	select {
+	case err := <-serveDone:
+		dur := time.Since(shutdownStart)
+		if err != nil {
+			t.Errorf("serveListeners: %v", err)
+		}
+		// 5s ceiling is generous: drain budget 200ms + lifecycle
+		// cancel propagation should be sub-second. fetch.TotalTimeout
+		// is 5m by default config; if lifecycle cancel did not work,
+		// we would block ~5m. 5s catches a regression cleanly.
+		if dur > 5*time.Second {
+			t.Errorf("serveListeners returned in %v; expected sub-second after drain timeout", dur)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("serveListeners did not return after drain timeout (lifecycle cancel broken?)")
+	}
+
+	// The client request returns with whatever response the cache
+	// generated (5xx). Wait for cleanup so the t.Parallel goroutine
+	// budget is honored.
+	<-clientDone
+}
