@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 )
@@ -166,12 +167,12 @@ func (p *Parser) Parse(requestURI, hostHeader string) (*Request, error) {
 		return nil, fmt.Errorf("%w: %q", ErrInvalidPath, path)
 	}
 
-	canonScheme, canonHost := p.canonicalize(scheme, host)
-	upstream := canonScheme + "://" + canonHost + path
+	canonHost, upstreamAuthority := p.canonicalize(host)
+	upstream := scheme + "://" + upstreamAuthority + path
 
 	return &Request{
 		Mode:            mode,
-		CanonicalScheme: canonScheme,
+		CanonicalScheme: scheme,
 		CanonicalHost:   canonHost,
 		Path:            path,
 		UpstreamURL:     upstream,
@@ -181,16 +182,30 @@ func (p *Parser) Parse(requestURI, hostHeader string) (*Request, error) {
 }
 
 // canonicalize applies the first-matching remap rule (user rules first,
-// built-ins after) and strips any port from the host. Scheme passes
-// through unchanged — Remap rewrites host only, never scheme.
-func (p *Parser) canonicalize(scheme, host string) (string, string) {
-	host = stripPort(host)
+// built-ins after). Returns the canonical host (cache-key form, no port,
+// per SPEC §3.2) and the upstream authority (host:port for the fetcher).
+//
+// Hostnames are case-folded to lowercase and stripped of any trailing
+// FQDN dot before remap matching, so "US.ARCHIVE.UBUNTU.COM." and
+// "us.archive.ubuntu.com" hit the same cache key.
+//
+// When a remap rule matches, the upstream authority equals the canonical
+// host with no port — remap targets are public archive names per SPEC
+// §3.3, and the user expects to talk to them on the scheme's default
+// port. When no rule matches, the upstream authority preserves the
+// caller's port (so "http://127.0.0.1:8080/repo/" still hits :8080).
+func (p *Parser) canonicalize(host string) (canonHost, upstreamAuthority string) {
+	bare, port := splitHostPort(strings.ToLower(host))
+	bare = strings.TrimSuffix(bare, ".") // FQDN trailing dot
 	for _, r := range p.remap {
-		if r.regex.MatchString(host) {
-			return scheme, r.canonicalHost
+		if r.regex.MatchString(bare) {
+			return r.canonicalHost, r.canonicalHost
 		}
 	}
-	return scheme, host
+	if port == "" {
+		return bare, bare
+	}
+	return bare, bare + ":" + port
 }
 
 // remapRule is a compiled SPEC §3 rule.

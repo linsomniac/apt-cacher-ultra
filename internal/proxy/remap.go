@@ -83,7 +83,10 @@ type mirrorRoute struct {
 	basePath string // upstream path prefix; "/" if upstream URL has no path
 }
 
-// compileMirrorRoutes resolves and validates each [[mirror]] entry.
+// compileMirrorRoutes resolves and validates each [[mirror]] entry. Mirror
+// upstreams must be plain http(s) origins plus an optional base path —
+// userinfo, query strings, and fragments are rejected because the cache
+// would silently strip them when constructing per-request fetch URLs.
 func compileMirrorRoutes(rules []config.MirrorRule) ([]mirrorRoute, error) {
 	out := make([]mirrorRoute, 0, len(rules))
 	for i, r := range rules {
@@ -104,6 +107,15 @@ func compileMirrorRoutes(rules []config.MirrorRule) ([]mirrorRoute, error) {
 		if u.Host == "" {
 			return nil, fmt.Errorf("%w: mirror[%d].upstream missing host", ErrInvalidMirror, i)
 		}
+		if u.User != nil {
+			return nil, fmt.Errorf("%w: mirror[%d].upstream must not include userinfo", ErrInvalidMirror, i)
+		}
+		if u.RawQuery != "" {
+			return nil, fmt.Errorf("%w: mirror[%d].upstream must not include a query string", ErrInvalidMirror, i)
+		}
+		if u.Fragment != "" {
+			return nil, fmt.Errorf("%w: mirror[%d].upstream must not include a fragment", ErrInvalidMirror, i)
+		}
 		basePath := u.Path
 		if basePath == "" {
 			basePath = "/"
@@ -120,7 +132,7 @@ func compileMirrorRoutes(rules []config.MirrorRule) ([]mirrorRoute, error) {
 		out = append(out, mirrorRoute{
 			prefix:   prefix,
 			scheme:   scheme,
-			host:     u.Host,
+			host:     strings.ToLower(u.Host),
 			basePath: basePath,
 		})
 	}

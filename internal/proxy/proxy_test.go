@@ -153,8 +153,9 @@ func TestParse_HTTPSMagic_OnlyHost(t *testing.T) {
 
 func TestParse_NotMagic_HTTPSHostOnly(t *testing.T) {
 	// host=HTTPS but path doesn't start with `///` — not the magic form.
-	// The literal host "HTTPS" is treated as-is. Cache lookup will then
-	// fail the upstream allowlist, which is the correct behavior.
+	// The literal host "HTTPS" is treated as-is and case-folded. Cache
+	// lookup will then fail the upstream allowlist, which is the correct
+	// behavior.
 	p := newTestParser(t)
 	r, err := p.Parse("http://HTTPS/foo/bar", "HTTPS")
 	if err != nil {
@@ -163,8 +164,8 @@ func TestParse_NotMagic_HTTPSHostOnly(t *testing.T) {
 	if r.CanonicalScheme != "http" {
 		t.Errorf("CanonicalScheme: got %q, want http (not magic)", r.CanonicalScheme)
 	}
-	if r.CanonicalHost != "HTTPS" {
-		t.Errorf("CanonicalHost: got %q", r.CanonicalHost)
+	if r.CanonicalHost != "https" {
+		t.Errorf("CanonicalHost: got %q (host should be case-folded)", r.CanonicalHost)
 	}
 }
 
@@ -499,6 +500,158 @@ func TestModeString(t *testing.T) {
 	}
 	if got := Mode(99).String(); got != "Mode(99)" {
 		t.Errorf("Mode(99).String() = %q", got)
+	}
+}
+
+func TestParse_PreservesUpstreamPort_NoRemapMatch(t *testing.T) {
+	// Codex HIGH finding: a non-default port like :8080 must reach the
+	// upstream URL even though it's stripped from the canonical cache key.
+	// 127.0.0.1 doesn't match any built-in remap rule.
+	p := newTestParser(t)
+	r, err := p.Parse("http://127.0.0.1:8080/repo/dists/noble/InRelease", "")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if r.CanonicalHost != "127.0.0.1" {
+		t.Errorf("CanonicalHost: got %q, want 127.0.0.1 (port stripped from cache key)", r.CanonicalHost)
+	}
+	if r.UpstreamURL != "http://127.0.0.1:8080/repo/dists/noble/InRelease" {
+		t.Errorf("UpstreamURL: got %q, want :8080 preserved", r.UpstreamURL)
+	}
+}
+
+func TestParse_PreservesUpstreamPort_MirrorMode(t *testing.T) {
+	// Same fix in mirror mode: an upstream URL with explicit port must
+	// keep the port through to UpstreamURL.
+	p, err := New(nil, []config.MirrorRule{
+		{Prefix: "/local", Upstream: "http://127.0.0.1:9999/repo/"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	r, err := p.Parse("/local/dists/noble/InRelease", "")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if r.CanonicalHost != "127.0.0.1" {
+		t.Errorf("CanonicalHost: got %q", r.CanonicalHost)
+	}
+	if r.UpstreamURL != "http://127.0.0.1:9999/repo/dists/noble/InRelease" {
+		t.Errorf("UpstreamURL: got %q, want :9999 preserved", r.UpstreamURL)
+	}
+}
+
+func TestParse_DropsPortWhenRemapFires(t *testing.T) {
+	// When a remap rule matches, the user has signaled "treat this as
+	// the canonical archive name", which is a public hostname on the
+	// scheme's default port. Port from the original request is dropped.
+	p := newTestParser(t)
+	r, err := p.Parse("http://us.archive.ubuntu.com:8080/ubuntu/foo", "")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if r.CanonicalHost != "archive.ubuntu.com" {
+		t.Errorf("CanonicalHost: got %q", r.CanonicalHost)
+	}
+	if strings.Contains(r.UpstreamURL, ":8080") {
+		t.Errorf("UpstreamURL %q must drop port through remap", r.UpstreamURL)
+	}
+}
+
+func TestParse_RejectsQueryString_ProxyMode(t *testing.T) {
+	p := newTestParser(t)
+	_, err := p.Parse("http://archive.ubuntu.com/ubuntu/Packages?x=1", "")
+	if !errors.Is(err, ErrInvalidURI) {
+		t.Fatalf("want ErrInvalidURI for query string, got %v", err)
+	}
+}
+
+func TestParse_RejectsQueryString_MirrorMode(t *testing.T) {
+	p, err := New(nil, []config.MirrorRule{
+		{Prefix: "/ubuntu", Upstream: "http://archive.ubuntu.com/ubuntu/"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := p.Parse("/ubuntu/Packages?x=1", ""); !errors.Is(err, ErrInvalidURI) {
+		t.Fatalf("want ErrInvalidURI for mirror-mode query string, got %v", err)
+	}
+}
+
+func TestParse_RejectsFragment_ProxyMode(t *testing.T) {
+	p := newTestParser(t)
+	_, err := p.Parse("http://archive.ubuntu.com/ubuntu/Packages#frag", "")
+	if !errors.Is(err, ErrInvalidURI) {
+		t.Fatalf("want ErrInvalidURI for fragment, got %v", err)
+	}
+}
+
+func TestParse_HostCaseInsensitive(t *testing.T) {
+	// A mixed-case hostname must match built-in remap rules and produce
+	// the same canonical form as the lowercase variant.
+	p := newTestParser(t)
+	r, err := p.Parse("http://US.ARCHIVE.UBUNTU.COM/ubuntu/foo", "")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if r.CanonicalHost != "archive.ubuntu.com" {
+		t.Errorf("CanonicalHost: got %q (should match remap regardless of case)", r.CanonicalHost)
+	}
+}
+
+func TestParse_TrailingDotStripped(t *testing.T) {
+	// FQDN form ("archive.ubuntu.com.") must canonicalize identically.
+	p := newTestParser(t)
+	r, err := p.Parse("http://archive.ubuntu.com./ubuntu/foo", "")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if r.CanonicalHost != "archive.ubuntu.com" {
+		t.Errorf("CanonicalHost: got %q (trailing FQDN dot must be stripped)", r.CanonicalHost)
+	}
+}
+
+func TestNew_RejectsMirrorWithUserinfo(t *testing.T) {
+	_, err := New(nil, []config.MirrorRule{
+		{Prefix: "/u", Upstream: "http://user:pass@archive.ubuntu.com/ubuntu/"},
+	})
+	if !errors.Is(err, ErrInvalidMirror) {
+		t.Fatalf("want ErrInvalidMirror for userinfo, got %v", err)
+	}
+}
+
+func TestNew_RejectsMirrorWithQuery(t *testing.T) {
+	_, err := New(nil, []config.MirrorRule{
+		{Prefix: "/u", Upstream: "http://archive.ubuntu.com/ubuntu/?token=abc"},
+	})
+	if !errors.Is(err, ErrInvalidMirror) {
+		t.Fatalf("want ErrInvalidMirror for query, got %v", err)
+	}
+}
+
+func TestNew_RejectsMirrorWithFragment(t *testing.T) {
+	_, err := New(nil, []config.MirrorRule{
+		{Prefix: "/u", Upstream: "http://archive.ubuntu.com/ubuntu/#frag"},
+	})
+	if !errors.Is(err, ErrInvalidMirror) {
+		t.Fatalf("want ErrInvalidMirror for fragment, got %v", err)
+	}
+}
+
+func TestSplitHostPort(t *testing.T) {
+	cases := []struct{ in, host, port string }{
+		{"archive.ubuntu.com", "archive.ubuntu.com", ""},
+		{"archive.ubuntu.com:80", "archive.ubuntu.com", "80"},
+		{"[::1]", "[::1]", ""},
+		{"[::1]:80", "[::1]", "80"},
+		{"[2001:db8::1]:443", "[2001:db8::1]", "443"},
+		{"", "", ""},
+	}
+	for _, c := range cases {
+		gotHost, gotPort := splitHostPort(c.in)
+		if gotHost != c.host || gotPort != c.port {
+			t.Errorf("splitHostPort(%q) = (%q, %q), want (%q, %q)", c.in, gotHost, gotPort, c.host, c.port)
+		}
 	}
 }
 

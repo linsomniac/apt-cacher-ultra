@@ -24,6 +24,10 @@ type parsedURI struct {
 // Any other shape (relative reference like "foo/bar", "*", etc.) is
 // rejected. We deliberately accept only http/https schemes here; the
 // HTTPS/// magic is detected later and mutates the canonical form.
+//
+// Query strings and fragments are rejected: apt repository URLs never
+// carry them, and silently dropping a query like "/Packages?x=1" would
+// alias it to "/Packages" in the cache.
 func parseRequestURI(raw string) (*parsedURI, error) {
 	if strings.HasPrefix(raw, "/") {
 		// Mirror mode. Validate and percent-decode the path the same way
@@ -33,11 +37,17 @@ func parseRequestURI(raw string) (*parsedURI, error) {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidURI, err)
 		}
 		// AIDEV-NOTE: a parsed mirror-mode URI must have empty scheme and
-		// authority. If url.Parse produced anything else (e.g. fragment),
-		// reject — apt does not send fragments and we don't want them
-		// silently affecting cache key derivation.
+		// authority. If url.Parse produced anything else, reject — apt
+		// does not send fragments and we don't want them silently
+		// affecting cache key derivation.
 		if u.Scheme != "" || u.Host != "" {
 			return nil, fmt.Errorf("%w: unexpected scheme/host in relative URI %q", ErrInvalidURI, raw)
+		}
+		if u.RawQuery != "" {
+			return nil, fmt.Errorf("%w: query string not supported: %q", ErrInvalidURI, raw)
+		}
+		if u.Fragment != "" {
+			return nil, fmt.Errorf("%w: fragment not supported: %q", ErrInvalidURI, raw)
 		}
 		return &parsedURI{absolute: false, path: u.Path}, nil
 	}
@@ -54,6 +64,12 @@ func parseRequestURI(raw string) (*parsedURI, error) {
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "http" && scheme != "https" {
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedScheme, scheme)
+	}
+	if u.RawQuery != "" {
+		return nil, fmt.Errorf("%w: query string not supported: %q", ErrInvalidURI, raw)
+	}
+	if u.Fragment != "" {
+		return nil, fmt.Errorf("%w: fragment not supported: %q", ErrInvalidURI, raw)
 	}
 	path := u.Path
 	if path == "" {
@@ -101,26 +117,36 @@ func splitHTTPSMagic(path string) (string, string, error) {
 	return host, rest[slash:], nil
 }
 
-// stripPort drops a trailing :port from a host. The canonical cache key
-// does not carry port (SPEC §3.2). Bracketed IPv6 hosts ("[::1]:80") are
-// handled correctly by net/url-style parsing — but we don't import
-// net.SplitHostPort to avoid coupling Parse to net's DNS semantics, and
-// we prefer the lighter manual split.
-func stripPort(host string) string {
+// splitHostPort separates a host[:port] string into its bare host and
+// (optional) port pieces. Bracketed IPv6 hosts ("[::1]:80") are handled
+// correctly. We don't reach for net.SplitHostPort because we'd rather
+// not couple Parse to net's DNS semantics, and the canonical-host logic
+// needs to handle malformed input gracefully (leave it alone) rather
+// than erroring out.
+func splitHostPort(host string) (bare, port string) {
 	if host == "" {
-		return host
+		return "", ""
 	}
 	if host[0] == '[' {
-		// IPv6: "[::1]:80" → "[::1]"; "[::1]" stays.
 		end := strings.IndexByte(host, ']')
 		if end < 0 {
-			return host // malformed, leave alone
+			return host, "" // malformed, treat whole string as host
 		}
-		return host[:end+1]
+		bare = host[:end+1]
+		if end+1 < len(host) && host[end+1] == ':' {
+			port = host[end+2:]
+		}
+		return bare, port
 	}
 	if i := strings.LastIndexByte(host, ':'); i >= 0 {
-		// Plain "host:port".
-		return host[:i]
+		return host[:i], host[i+1:]
 	}
-	return host
+	return host, ""
+}
+
+// stripPort drops a trailing :port from a host. Kept for any caller that
+// wants only the bare host; new code should reach for splitHostPort.
+func stripPort(host string) string {
+	bare, _ := splitHostPort(host)
+	return bare
 }
