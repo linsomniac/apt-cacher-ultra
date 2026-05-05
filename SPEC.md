@@ -113,11 +113,13 @@ Different geo mirror DNS names (`de.archive.ubuntu.com`, `us.archive.ubuntu.com`
 
 Input: `(scheme, host, port, path)` from the request URL.
 
-1. Apply built-in Remap rules in order. First match wins.
-2. If no built-in rule matches, apply user `[[remap]]` rules from config in order.
+1. Apply user `[[remap]]` rules from config in order. First match wins.
+2. If no user rule matches, apply built-in Remap rules in order. First match wins.
 3. If no rule matches, the canonical host is the input host.
 
-Output: `(canonical_scheme, canonical_host, path)`. Port is dropped from the canonical form (assumed default for the scheme). The canonical tuple is the cache key.
+User rules run first so a user can override a built-in (e.g. point all `*.archive.ubuntu.com` at an internal mirror without disabling the built-in set).
+
+Output: `(canonical_scheme, canonical_host, path)`. Port is dropped from the canonical form (assumed default for the scheme). **The canonical tuple including scheme is the cache key everywhere** — SQLite primary keys, singleflight keys, and freshness keys all include `canonical_scheme`. Different schemes for the same host/path may resolve to different upstream content (notably the `HTTPS///` convention) and must not collide.
 
 ### 3.3 Built-in default rules
 
@@ -175,6 +177,7 @@ CREATE TABLE blob (
 );
 
 CREATE TABLE url_path (
+  canonical_scheme  TEXT NOT NULL,           -- "http" or "https"
   canonical_host    TEXT NOT NULL,
   path              TEXT NOT NULL,
   blob_hash         TEXT REFERENCES blob(hash),
@@ -183,20 +186,24 @@ CREATE TABLE url_path (
   last_requested_at INTEGER,
   request_count     INTEGER NOT NULL DEFAULT 0,
   last_fetched_at   INTEGER,                 -- last time we hit upstream for this path
-  PRIMARY KEY (canonical_host, path)
+  upstream_etag     TEXT,                    -- validator for resumable-fetch If-Range (§6.3)
+  upstream_lastmod  TEXT,                    -- validator fallback when ETag absent
+  PRIMARY KEY (canonical_scheme, canonical_host, path)
 );
 
 CREATE INDEX idx_url_path_metadata     ON url_path(is_metadata);
 CREATE INDEX idx_url_path_last_req     ON url_path(last_requested_at);
 
 CREATE TABLE suite_freshness (
-  canonical_host    TEXT NOT NULL,
-  suite_path        TEXT NOT NULL,           -- e.g. "/ubuntu/dists/noble"
-  last_check_at     INTEGER,
-  last_success_at   INTEGER,
-  inrelease_etag    TEXT,                    -- for conditional GET
-  inrelease_lastmod TEXT,                    -- for conditional GET
-  PRIMARY KEY (canonical_host, suite_path)
+  canonical_scheme         TEXT NOT NULL,
+  canonical_host           TEXT NOT NULL,
+  suite_path               TEXT NOT NULL,    -- e.g. "/ubuntu/dists/noble"
+  last_check_at            INTEGER,
+  last_success_at          INTEGER,
+  inrelease_etag           TEXT,             -- for conditional GET
+  inrelease_lastmod        TEXT,             -- for conditional GET
+  inrelease_change_seen_at INTEGER,          -- diagnostic: upstream has a newer InRelease we have not adopted (Phase 1; Phase 2 atomic flip will adopt)
+  PRIMARY KEY (canonical_scheme, canonical_host, suite_path)
 );
 
 CREATE TABLE schema_version (
@@ -207,7 +214,7 @@ INSERT INTO schema_version VALUES (1);
 
 ### 4.4 Suite identification
 
-A request path matching `/(.+)/dists/([^/]+)/.*` identifies `(repo_path = $1, suite_codename = $2)`. The cache derives `suite_path = "<repo_path>/dists/<suite_codename>"` and stores per-suite freshness state under `(canonical_host, suite_path)`.
+A request path matching `^/(?:(.+)/)?dists/([^/]+)(?:/.*)?$` identifies `(repo_path = $1, suite_codename = $2)`. `repo_path` may be empty — some upstreams (`apt.corretto.aws`, `repo.charm.sh`) serve `/dists/...` directly off the host root. The cache derives `suite_path = "<repo_path>/dists/<suite_codename>"` (or `"/dists/<suite_codename>"` when `repo_path` is empty) and stores per-suite freshness state under `(canonical_scheme, canonical_host, suite_path)`.
 
 A request that does not match this pattern (e.g. a `.deb` in `pool/`) is not associated with any specific suite for freshness purposes — it's just a blob.
 
@@ -246,6 +253,28 @@ idle_read_timeout       = "60s"
 max_retries             = 3               # for resumable Range retries
 max_concurrent_per_host = 8
 
+# Open-proxy hardening (§6.6). Only upstream hosts matching one of these
+# regexes will be fetched. Empty list = deny-all (cache becomes read-only on
+# miss). The defaults cover the apt repos we know about; users add their own.
+allowed_host_regex = [
+  '^([a-z0-9-]+\.)*ubuntu\.com$',
+  '^([a-z0-9-]+\.)*debian\.org$',
+  '^ppa\.launchpadcontent\.net$',
+  '^apt\.corretto\.aws$',
+  '^repo\.charm\.sh$',
+  '^pkg\.haproxy\.com$',
+  '^download\.docker\.com$',
+]
+# After DNS resolution, every resolved IP is checked against these CIDRs and
+# the request is refused if any match. Defense-in-depth against DNS rebinding
+# and against an attacker-registered hostname that resolves into private space.
+deny_target_ranges = [
+  "127.0.0.0/8", "::1/128",
+  "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+  "169.254.0.0/16", "fe80::/10",
+  "::ffff:127.0.0.0/104",                 # IPv4-mapped loopback
+]
+
 [freshness]
 cooldown          = "60s"                 # min interval between freshness checks per suite
 periodic_refresh  = "15m"                 # background refresh cadence per known suite
@@ -276,6 +305,8 @@ On startup the cache validates:
 - `cache.listen` parses as a valid `host:port`.
 - TLS fields are all-set or all-empty.
 - Remap regex compiles.
+- `upstream.allowed_host_regex` entries compile.
+- `upstream.deny_target_ranges` entries parse as valid CIDRs.
 - Mirror prefixes start with `/` and don't overlap.
 - All durations parse.
 
@@ -305,7 +336,7 @@ This path **never makes a network call** before sending response headers. Every 
 ### 6.2 Cache miss: singleflight fetch
 
 ```
-key := canonical_host + "|" + path
+key := canonical_scheme + "|" + canonical_host + "|" + path
 result := singleflight.Do(key, func() (*FetchResult, error) {
     // Fetch upstream with deadline = upstream.total_timeout
     // Stream to tmp/<uuid> while computing sha256
@@ -323,7 +354,20 @@ Phase 1 chooses **coalesce-and-serialize**: the second-through-Nth concurrent cl
 
 ### 6.3 Resumable upstream fetch
 
-The upstream client retries on transient failure (connection reset, EOF mid-stream, 5xx) up to `max_retries` times. Each retry sends `Range: bytes=<written>-` to resume from where the previous attempt left off. Hash is computed incrementally over the whole stream so a complete-then-verified blob is always consistent.
+The upstream client retries on transient failure (connection reset, EOF mid-stream, 5xx) up to `max_retries` times. On the *initial* fetch we capture the upstream's `ETag` and/or `Last-Modified` headers as validators. Each retry sends:
+
+- `Range: bytes=<written>-` to resume from where the previous attempt left off.
+- `If-Range: <validator>` (preferring `ETag`, falling back to `Last-Modified`) so the server only honors the resume if the underlying object hasn't changed.
+
+A retry is accepted only if **all** of the following hold:
+
+1. Response status is `206 Partial Content`.
+2. `Content-Range` parses as `bytes <start>-<end>/<total>` and `<start>` equals our written cursor.
+3. `<total>` matches the total length recorded on the initial fetch.
+
+If the server returns `200 OK` instead (which happens when the `If-Range` validator no longer matches), the partial file is discarded and the fetch restarts from byte 0. Without these checks, an upstream object swap mid-fetch could splice bytes from two different versions into one cached blob.
+
+Hash is computed incrementally over the whole stream so a complete-then-verified blob is always consistent. The temp file is renamed into `pool/` only after the full blob is hash-finalized; failed resumes leave nothing in `pool/`.
 
 If all retries fail and we have a stale cached copy: serve stale (metadata only). If no cached copy: 502.
 
@@ -341,6 +385,19 @@ In Phase 1, the cache:
 - **Does** reject mismatched `Content-Length` (declared vs. received). Treats as a fetch failure.
 
 The cache trusts upstream byte-for-byte in Phase 1. Phase 2 closes this hole.
+
+### 6.6 Upstream allowlist (open-proxy hardening)
+
+Listening on `0.0.0.0:3142` and willing to fetch arbitrary absolute proxy URLs is by definition an open-proxy posture. Even on a trusted internal network the blast radius is meaningful: anyone who can reach the cache port can use it to probe internal services or cloud metadata endpoints (`169.254.169.254`, `fd00:ec2::254`, …).
+
+Phase 1 enforces two layered defenses, both configured in `[upstream]` (§5.1):
+
+1. **Host allowlist (`allowed_host_regex`):** before any upstream connection, the canonical host must match at least one regex in the list. Default ships with the well-known apt repository hosts; users add their own. Empty list = deny-all (cache becomes read-only on miss).
+2. **Target range deny-list (`deny_target_ranges`):** *after* DNS resolution, every resolved IP is checked against these CIDRs. RFC1918, loopback, link-local, IPv4-mapped loopback, and IPv6 link-local are denied by default. This is defense-in-depth against DNS rebinding and against an attacker registering a real-looking hostname that resolves into private space.
+
+If either check fails the cache returns `403 Forbidden` to the client, logs the attempt with the offending URL and resolved IP, and makes no upstream connection.
+
+These checks are belt-and-suspenders, not a substitute for network-level isolation: operators are expected to bind the cache to an internal interface or firewall the listener port at the OS level.
 
 ---
 
@@ -391,16 +448,21 @@ attempt_freshness_check(S):
       // bytes unchanged despite no 304 (upstream didn't honor conditional GET)
       S.last_check_at = now
       S.last_success_at = now
+      S.inrelease_etag = resp.ETag
+      S.inrelease_lastmod = resp.LastModified
       release lock; return
 
-    // New InRelease. Phase 1 just stores it.
-    write new blob, update url_path for InRelease
+    // New InRelease detected at upstream. Phase 1 deliberately does NOT
+    // replace the cached InRelease here. Adopting it without also refreshing
+    // every index it references would create a hash-mismatch window for any
+    // client mid-update — exactly the failure mode this project exists to
+    // eliminate. Until Phase 2's atomic-flip transaction lands, the cache
+    // continues serving the *current* (matching) InRelease + indices set;
+    // clients see consistent metadata even if it is hours older than upstream.
     S.last_check_at = now
     S.last_success_at = now
-    S.inrelease_etag = resp.ETag
-    S.inrelease_lastmod = resp.LastModified
-    log("InRelease changed", S)
-    // Phase 2 will trigger an atomic refresh of all referenced indices here.
+    S.inrelease_change_seen_at = now           // diagnostic; surfaces in logs
+    log("InRelease changed at upstream; awaiting Phase 2 atomic flip", S)
     release lock; return
 ```
 
@@ -421,6 +483,8 @@ Phase 1 does not parse `InRelease` to read `Valid-Until` itself; that's the clie
 - If upstream is reachable: serve fresh (or recently-refreshed-from-cache) content.
 - If upstream is unreachable AND we have a cached file: serve cached, mark `X-Cache: HIT-STALE`.
 - If the cached file is past its `Valid-Until`, apt will reject it client-side. Document `Acquire::Check-Valid-Until=false` for clients that need to keep working through extended outages.
+
+**Phase 1 may also serve metadata that is *known* to be older than upstream.** When the freshness check (§7.2) detects a new `InRelease` at upstream, Phase 1 records the observation but does *not* adopt it (because adopting without refreshing referenced indices would create a hash-mismatch window). The cache keeps serving the consistent older set until Phase 2's atomic-flip lands. Logs and (Phase 5) the status page expose `inrelease_change_seen_at` so operators can tell when the cache is intentionally lagging upstream.
 
 Phase 1 logs every stale serve (gated by `serve.log_stale_serves`).
 
@@ -489,6 +553,9 @@ Metrics are deferred to Phase 5.
 | Cached `.deb`, upstream irrelevant | Serve `HIT`. |
 | Two clients, same uncached file | Singleflight: one fetch, both served. |
 | Two clients, two different uncached files | Independent fetches (subject to per-host semaphore). |
+| Upstream host not in `allowed_host_regex` | `403 Forbidden`; no upstream connection made. Logged. |
+| Upstream resolves to a `deny_target_ranges` IP | `403 Forbidden`; connection aborted before TCP. Logged. |
+| Resumable Range refused (validator changed → `200`) | Discard partial; restart from byte 0 (still under `max_retries`). |
 | Cache disk full | New writes fail; existing reads succeed. Loud error log. Health endpoint (Phase 5) reports degraded. |
 | SQLite locked or corrupt at startup | Fail to start with clear error. |
 | SQLite write error at runtime | Log; continue serving from disk; refuse to record new entries until recoverable. |
@@ -596,7 +663,7 @@ These are decisions I've made provisionally but want pushback on:
 
 1. **Singleflight: serialize-and-then-serve vs. stream-while-fetching.** Phase 1 specs serialize (§6.2). Easier to get right; trades a bit of first-byte latency on the second client of a big `.deb` first-fetch. Acceptable, or want streaming from day one?
 2. **Pure-Go SQLite (`modernc.org/sqlite`) vs. cgo (`mattn/go-sqlite3`).** Spec picks pure-Go for static-binary simplicity. mattn is faster but cgo. At our scale I doubt the perf gap matters. OK?
-3. **Cache key includes `canonical_host`.** Confirming: same `path` on different canonical hosts = different cached entries. (`/dists/noble/InRelease` on `archive.ubuntu.com` vs. `ppa.launchpadcontent.net/.../ubuntu` is genuinely different content.)
+3. **Cache key is `(canonical_scheme, canonical_host, path)`.** Same path on different canonical hosts = different cached entries (`/dists/noble/InRelease` on `archive.ubuntu.com` vs. `ppa.launchpadcontent.net/.../ubuntu` is genuinely different). Same path on the same host but different scheme also = different entries (notably for the `HTTPS///` convention, where the cache may legitimately hold separate HTTP and HTTPS variants of the same path).
 4. **Default Remap rules baked in.** I've listed Ubuntu/Debian common ones (§3.3). Want me to add anything specific to your fleet? (Internal mirrors, etc. — even if commented out in the default config so you can uncomment.)
 5. **Per-host upstream concurrency = 8.** Reasonable for our scale (~7-20 clients per cache, 10-20 upstreams). Higher? Lower? Per-upstream override?
 6. **Stale-cache header naming.** I picked `X-Cache`/`X-Cache-Age`/`X-Upstream-Status`. apt ignores these but your monitoring/grep workflow might prefer different names.
