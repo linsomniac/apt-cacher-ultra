@@ -501,38 +501,33 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 	}
 
 	switch {
-	case errors.Is(err, fetch.ErrHostNotAllowed), errors.Is(err, fetch.ErrTargetDenied):
+	case errors.Is(err, fetch.ErrHostNotAllowed):
+		// Pre-flight allowlist rejection — no dial happened. Match
+		// the convention used by the handler-level pre-flight host
+		// check at line 192 (fetchAttempted=false): operators reading
+		// audit logs see "no upstream attempt" presence-of-field for
+		// every host-rejected request, regardless of which layer
+		// fired the rejection.
 		http.Error(w, "forbidden", http.StatusForbidden)
-		// ErrHostNotAllowed fires from fetch.Fetch's pre-flight check
-		// (no dial happened) — but ErrTargetDenied fires *during* the
-		// dial. Both reach this branch; mark fetchAttempted=true so an
-		// operator can still distinguish "rejected upstream attempt"
-		// from "rejected before the request layer". upstream_status
-		// stays 0 in both cases (no HTTP response was received).
+		h.logRequest(r, req.CanonicalHost, req.Path, "forbidden", http.StatusForbidden, 0, false, 0, start)
+		return
+	case errors.Is(err, fetch.ErrTargetDenied):
+		// Deny-CIDR rejection fires *during* the dial — DNS resolved,
+		// connect attempted, dialer rejected the post-resolution IP.
+		// fetchAttempted=true so operators can distinguish this from
+		// the pre-flight host rejection above.
+		http.Error(w, "forbidden", http.StatusForbidden)
 		h.logRequest(r, req.CanonicalHost, req.Path, "forbidden", http.StatusForbidden, 0, true, res.status, start)
 		return
 	case errors.Is(err, fetch.ErrUpstreamStatus):
-		// SPEC §6.4 / failure-mode catalog: only upstream 4xx is a
-		// "client said no" we can pass through (e.g. apt probing for
-		// an index variant the archive does not publish — 404 must
-		// reach the client so apt moves on). Anything else is treated
-		// as cache-side unhealthy: a 3xx that escaped the redirect
-		// guard, an unexpected 2xx classified as non-success by fetch,
-		// or status==0 if classification raced with a parse failure.
-		// All become 502 (HIT-STALE eligible — a non-success non-4xx
-		// upstream is functionally equivalent to "upstream down" for
-		// this cache's purposes).
-		if res.status >= 400 && res.status < 500 {
-			http.Error(w, fmt.Sprintf("upstream status %d", res.status), res.status)
-			h.logRequest(r, req.CanonicalHost, req.Path, "upstream_status", res.status, 0, true, res.status, start)
-			return
-		}
-		h.logger.Warn("non-4xx upstream status mapped to 502",
-			"upstream_status", res.status,
-			"canonical_host", req.CanonicalHost,
-			"path", req.Path,
-		)
-		h.respondUpstreamUnreachable(w, r, req, res.status, start)
+		// SPEC §6.4: upstream 4xx is a "client said no" passthrough
+		// (apt probes for index variants the archive does not
+		// publish — 404 must reach the client so apt moves on).
+		// StatusError.Is(ErrUpstreamStatus) is now narrowed to 4xx,
+		// so 5xx exhaustion routes to ErrUpstreamServerError below
+		// instead of falling through this case.
+		http.Error(w, fmt.Sprintf("upstream status %d", res.status), res.status)
+		h.logRequest(r, req.CanonicalHost, req.Path, "upstream_status", res.status, 0, true, res.status, start)
 		return
 	case errors.Is(err, fetch.ErrUpstreamUnavailable),
 		errors.Is(err, fetch.ErrUpstreamServerError),
@@ -556,12 +551,21 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		h.logRequest(r, req.CanonicalHost, req.Path, "cache_write_failed", http.StatusBadGateway, 0, true, res.status, start)
 		return
-	case errors.Is(err, fetch.ErrInvalidURL),
-		errors.Is(err, fetch.ErrRedirectBlocked):
-		// Cache could not even attempt the upstream. HIT-STALE here
-		// would mask a real config/security problem (an upstream that
-		// moved and now redirects every request, a malformed URL the
-		// operator should fix) — fail loud instead.
+	case errors.Is(err, fetch.ErrInvalidURL):
+		// URL parse / scheme / host-mismatch failure — fired before
+		// any network I/O. fetchAttempted=false (no upstream dial
+		// occurred). HIT-STALE would mask the real config bug; fail
+		// loud with 502 so the operator sees the malformed URL.
+		w.Header().Set("Retry-After", retryAfterForRequest(req))
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, false, 0, start)
+		return
+	case errors.Is(err, fetch.ErrRedirectBlocked):
+		// Upstream emitted a 3xx that we refuse to follow. A response
+		// *was* received (the 3xx) — fetchAttempted=true with the
+		// upstream's redirect status preserved by fetch.doAttempt's
+		// StatusError-wrap. HIT-STALE would mask an upstream that
+		// moved; fail loud so the operator configures a Remap rule.
 		w.Header().Set("Retry-After", retryAfterForRequest(req))
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, true, res.status, start)

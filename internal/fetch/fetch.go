@@ -42,18 +42,21 @@ var (
 )
 
 // StatusError carries the upstream HTTP status code from any non-success
-// response (4xx or 5xx). The handler layer needs the actual status so it
-// can passthrough an upstream 404 (apt frequently probes for index
-// variants that don't exist), AND so the SPEC §10 upstream_status log
-// field carries the real upstream code on 502-after-retries paths.
+// response. The handler layer needs the actual status so it can
+// passthrough an upstream 404 (apt frequently probes for index variants
+// that don't exist), AND so the SPEC §10 upstream_status log field
+// carries the real upstream code on 502-after-retries paths.
 //
-// errors.Is dispatches by code range so callers can keep using the
-// sentinels they already classify against:
+// errors.Is dispatches by code range:
 //   - 4xx: matches ErrUpstreamStatus (passthrough path).
 //   - 5xx: matches ErrUpstreamServerError (treat as upstream-down).
+//   - 3xx (only seen wrapped with ErrRedirectBlocked): matches neither
+//     status sentinel; the redirect sentinel routes the dispatch.
 //
-// All non-success responses match ErrUpstreamStatus too so the lookup
-// "any HTTP status carrier" stays single-sentinel.
+// "Any HTTP status carrier" lookups use errors.As(*StatusError) — that
+// recovers the code regardless of which range it falls in (e.g. the
+// handler's runFetch needs the status for X-Upstream-Status whether the
+// upstream returned 5xx or a blocked-3xx).
 type StatusError struct {
 	Code int
 }
@@ -65,7 +68,7 @@ func (e *StatusError) Error() string {
 func (e *StatusError) Is(target error) bool {
 	switch target {
 	case ErrUpstreamStatus:
-		return true
+		return e.Code >= 400 && e.Code < 500
 	case ErrUpstreamServerError:
 		return e.Code >= 500 && e.Code < 600
 	}
@@ -362,6 +365,17 @@ func (c *Client) doAttempt(
 	if err != nil {
 		if errors.Is(err, errDialDenied) {
 			return nil, fmt.Errorf("%w: %v", ErrTargetDenied, err)
+		}
+		// On a CheckRedirect rejection, http.Client returns both the
+		// 3xx response and the wrapped error (with the body already
+		// closed). Preserve the upstream status code as a StatusError
+		// in the chain so SPEC §10 upstream_status reflects the real
+		// 3xx the upstream emitted instead of 0. The narrowed
+		// StatusError.Is keeps 3xx out of the ErrUpstreamStatus /
+		// ErrUpstreamServerError dispatch — handler routing keys off
+		// ErrRedirectBlocked, status carrier is errors.As-only.
+		if errors.Is(err, ErrRedirectBlocked) && resp != nil {
+			return nil, fmt.Errorf("%w: %w", err, &StatusError{Code: resp.StatusCode})
 		}
 		return nil, err
 	}

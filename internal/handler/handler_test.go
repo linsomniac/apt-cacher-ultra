@@ -1954,3 +1954,113 @@ func TestLogRequest_UpstreamStatusZeroOnTimeout(t *testing.T) {
 		t.Errorf("upstream_status=0 must be emitted when fetch attempted but no response arrived:\n%s", out)
 	}
 }
+
+// TestLogRequest_RedirectBlocked_Preserves3xxStatus pins the contract that
+// when CheckRedirect refuses an upstream 3xx, the actual upstream status
+// flows through into both X-Upstream-Status and the SPEC §10
+// upstream_status log field. Pre-fix, doAttempt dropped the 3xx response
+// on the redirect-error path so upstream_status read 0 even though a
+// response was received — codex flagged this as violating the SPEC §10
+// "0 means no response arrived" contract.
+func TestLogRequest_RedirectBlocked_Preserves3xxStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Redirect(w, &http.Request{}, "http://other.example/path", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&safeWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	h := newTestHandlerWithServe(t, config.ServeConfig{}, logger)
+	defer h.Close()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease"))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get("X-Upstream-Status"); got != "302" {
+		t.Errorf("X-Upstream-Status=%q, want %q (redirect-blocked must preserve 3xx)", got, "302")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "outcome=bad_gateway") {
+		t.Fatalf("expected outcome=bad_gateway:\n%s", out)
+	}
+	if !strings.Contains(out, "upstream_status=302") {
+		t.Errorf("upstream_status=302 must appear (codex finding: redirect-blocked logged 0):\n%s", out)
+	}
+}
+
+// TestRespondError_HostNotAllowed_NoFetchAttempted pins that a fetch-layer
+// ErrHostNotAllowed dispatch logs without an upstream_status field. The
+// sentinel fires from fetch.Fetch's pre-flight allowlist check (defense
+// in depth — the handler-level pre-flight at line 192 normally catches
+// these first), so no network I/O occurred. Codex flagged the previous
+// fetchAttempted=true convention as making audit logs falsely imply an
+// upstream attempt.
+func TestRespondError_HostNotAllowed_NoFetchAttempted(t *testing.T) {
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&safeWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	h := newTestHandlerWithServe(t, config.ServeConfig{}, logger)
+	defer h.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer srv.Close()
+
+	req, err := h.parser.Parse(srv.URL+"/ubuntu/dists/noble/InRelease", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parser.Parse: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
+	res := sfResult{err: fmt.Errorf("test wrap: %w", fetch.ErrHostNotAllowed)}
+
+	h.respondError(rec, r, req, res, time.Now())
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status=%d, want 403", rec.Code)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "outcome=forbidden") {
+		t.Fatalf("expected outcome=forbidden:\n%s", out)
+	}
+	if strings.Contains(out, "upstream_status=") {
+		t.Errorf("upstream_status must not appear for ErrHostNotAllowed (no network I/O occurred):\n%s", out)
+	}
+}
+
+// TestRespondError_InvalidURL_NoFetchAttempted pins that a fetch-layer
+// ErrInvalidURL dispatch logs without an upstream_status field. URL
+// parse failures fire before any dial, so the field's presence (which
+// would imply "we tried upstream") is misleading.
+func TestRespondError_InvalidURL_NoFetchAttempted(t *testing.T) {
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&safeWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	h := newTestHandlerWithServe(t, config.ServeConfig{}, logger)
+	defer h.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer srv.Close()
+
+	req, err := h.parser.Parse(srv.URL+"/ubuntu/dists/noble/InRelease", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parser.Parse: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
+	res := sfResult{err: fmt.Errorf("test wrap: %w", fetch.ErrInvalidURL)}
+
+	h.respondError(rec, r, req, res, time.Now())
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "outcome=bad_gateway") {
+		t.Fatalf("expected outcome=bad_gateway:\n%s", out)
+	}
+	if strings.Contains(out, "upstream_status=") {
+		t.Errorf("upstream_status must not appear for ErrInvalidURL (no network I/O occurred):\n%s", out)
+	}
+}
