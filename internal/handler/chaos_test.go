@@ -139,7 +139,23 @@ func TestChaos_HungUpstreamGated(t *testing.T) {
 			}
 		}()
 	}
-	wg.Wait()
+	// Wait with a bounded timeout. The exact regression this test
+	// catches — cache HITs blocking on a hung upstream — would manifest
+	// as wg.Wait blocking indefinitely. An unbounded wg.Wait would let
+	// that fail as a `go test` timeout (60s+) with no targeted message;
+	// a bounded select gives the operator a clear "hits are blocking"
+	// signal and unwinds the freshness goroutines via h.Close so the
+	// test process exits cleanly.
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	const clientWaitBudget = 10 * time.Second
+	select {
+	case <-done:
+	case <-time.After(clientWaitBudget):
+		h.Close()
+		t.Fatalf("client requests did not complete within %v — cache HITs are likely blocking on the hung upstream",
+			clientWaitBudget)
+	}
 	close(results)
 
 	durations := make([]time.Duration, 0, clients*len(chaosPaths))
@@ -179,12 +195,26 @@ func TestChaos_HungUpstreamGated(t *testing.T) {
 		t.Errorf("p99 latency=%v, want <%v", p99, threshold)
 	}
 
-	// Defensive: the chaos clients must not have triggered any new
-	// upstream calls beyond the (at most one) freshness conditional GET
-	// that the TryLock + cooldown gate may have allowed through. If we
-	// see many post-prime upstream hits, cache HITs are leaking through
-	// to upstream, which is the exact bug this test guards against.
+	// Two-sided assertion on the chaos-phase upstream hits:
+	//
+	//  - Lower bound (>=1): with Cooldown=0 the TryLock-winning
+	//    freshness goroutine MUST attempt the conditional GET against
+	//    the hung upstream. If the count is zero, the test isn't
+	//    actually exercising the hung-upstream code path (e.g. someone
+	//    raised the cooldown back up, or the seed regressed) and the
+	//    p99 / goroutine assertions become coverage theater.
+	//
+	//  - Upper bound (<=5): TryLock + the lifecycle ctx hold the count
+	//    near 1 in practice. A larger number means cache HITs are
+	//    triggering synchronous upstream calls — the exact regression
+	//    this test guards against. The 5 is slack for legitimate
+	//    sequential T1 attempts (the lock is short-lived in non-hung
+	//    upstreams, so several rapid-fire wins can stack up).
 	postPrimeHits := upstreamHits.Load() - primeHits
+	if postPrimeHits < 1 {
+		t.Errorf("upstream hits during chaos phase=%d, want >=1 (Cooldown=0 should let one freshness check fire — test is not exercising the hung path)",
+			postPrimeHits)
+	}
 	if postPrimeHits > 5 {
 		t.Errorf("upstream hits during chaos phase=%d, want <=5 (cache HITs must not call upstream)",
 			postPrimeHits)
@@ -223,10 +253,14 @@ func newChaosHandler(t *testing.T) *Handler {
 	t.Cleanup(func() { _ = c.Close() })
 
 	fc, err := fetch.New(fetch.Options{
-		ConnectTimeout:   2 * time.Second,
-		TotalTimeout:     5 * time.Second,
-		MaxRetries:       0,
-		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		ConnectTimeout: 2 * time.Second,
+		TotalTimeout:   5 * time.Second,
+		MaxRetries:     0,
+		// Allow IPv4 + IPv6 loopback. httptest.NewServer's bind family
+		// is platform-dependent (Linux: 127.0.0.1, some BSDs: ::1); a
+		// 127.0.0.1-only allowlist would 403 the IPv6 case before the
+		// fetch even runs.
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`, `^::1$`},
 		DenyTargetRanges: nil,
 	})
 	if err != nil {
@@ -239,9 +273,19 @@ func newChaosHandler(t *testing.T) *Handler {
 		Cache:       c,
 		Fetcher:     fc,
 		HostLimiter: limiter,
-		Cooldown:    1 * time.Minute,
-		Refresh:     10 * time.Minute,
-		Logger:      silentLogger(),
+		// Cooldown=0 so the chaos test actually exercises a hung
+		// freshness check. With a non-zero cooldown the priming-phase
+		// seed (LastCheckAt=now) gates every chaos-phase Check before
+		// it can contact upstream, which leaves the SPEC §12.3
+		// invariant ("hits don't block on hung upstream") unproven —
+		// none of the freshness goroutines ever actually try to talk
+		// to upstream. With Cooldown=0 the TryLock-winner contacts
+		// upstream and hangs; the other 49+ goroutines TryLock-miss
+		// and return immediately. The test then asserts at least one
+		// post-prime hit (proving the freshness path was exercised).
+		Cooldown: 0,
+		Refresh:  10 * time.Minute,
+		Logger:   silentLogger(),
 	})
 	if err != nil {
 		t.Fatalf("freshness.New: %v", err)
