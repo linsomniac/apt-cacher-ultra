@@ -1,8 +1,11 @@
 package config
 
 import (
+	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -22,14 +25,61 @@ func TestLoad_Minimal(t *testing.T) {
 	path := writeTOML(t, dir, "config.toml", `
 [cache]
 dir = "`+dir+`"
-listen = "0.0.0.0:3142"
 `)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.Cache.Listen != "0.0.0.0:3142" {
-		t.Errorf("listen = %q", cfg.Cache.Listen)
+		t.Errorf("listen default not applied: %q", cfg.Cache.Listen)
+	}
+	// Security defaults must be populated even from a minimal config (§6.6).
+	if len(cfg.Upstream.AllowedHostRegex) == 0 {
+		t.Errorf("AllowedHostRegex was not populated by Defaults")
+	}
+	if len(cfg.Upstream.DenyTargetRanges) == 0 {
+		t.Errorf("DenyTargetRanges was not populated by Defaults")
+	}
+}
+
+// An explicit empty list MUST be preserved — §6.6 defines [] as "deny
+// everything" / "no IP-range filter", not "use defaults".
+func TestLoad_ExplicitEmptyListsArePreserved(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[upstream]
+allowed_host_regex = []
+deny_target_ranges = []
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Upstream.AllowedHostRegex == nil {
+		t.Errorf("explicit [] should produce non-nil empty slice, got nil")
+	}
+	if len(cfg.Upstream.AllowedHostRegex) != 0 {
+		t.Errorf("explicit [] should not be replaced by defaults: %v", cfg.Upstream.AllowedHostRegex)
+	}
+	if len(cfg.Upstream.DenyTargetRanges) != 0 {
+		t.Errorf("explicit [] should not be replaced by defaults: %v", cfg.Upstream.DenyTargetRanges)
+	}
+}
+
+// Sanity-check that the package-level defaults themselves are valid: every
+// entry should compile / parse. This catches typos in the constants above.
+func TestPackageDefaultsAreValid(t *testing.T) {
+	for i, re := range DefaultAllowedHostRegex {
+		if _, err := regexp.Compile(re); err != nil {
+			t.Errorf("DefaultAllowedHostRegex[%d] %q does not compile: %v", i, re, err)
+		}
+	}
+	for i, cidr := range DefaultDenyTargetRanges {
+		if _, err := netip.ParsePrefix(cidr); err != nil {
+			t.Errorf("DefaultDenyTargetRanges[%d] %q does not parse: %v", i, cidr, err)
+		}
 	}
 }
 
@@ -96,9 +146,20 @@ func TestLoad_InvalidConfigs(t *testing.T) {
 			wantErr: "cache.dir",
 		},
 		{
-			name:    "missing cache.listen",
-			body:    `[cache]` + "\n" + `dir = "DIR"`,
+			name: "cache.listen invalid host:port",
+			body: `[cache]
+dir = "DIR"
+listen = "not-a-host-port"
+`,
 			wantErr: "cache.listen",
+		},
+		{
+			name: "cache.listen port out of range",
+			body: `[cache]
+dir = "DIR"
+listen = "0.0.0.0:99999"
+`,
+			wantErr: "out of range",
 		},
 		{
 			name: "tls half-set",
@@ -163,7 +224,52 @@ upstream = "http://a/"
 prefix = "/x"
 upstream = "http://b/"
 `,
-			wantErr: "duplicates",
+			wantErr: "overlaps",
+		},
+		{
+			name: "overlapping mirror prefixes",
+			body: `[cache]
+dir = "DIR"
+listen = "0.0.0.0:3142"
+[[mirror]]
+prefix = "/ubuntu"
+upstream = "http://archive.ubuntu.com/"
+[[mirror]]
+prefix = "/ubuntu/dists"
+upstream = "http://other/"
+`,
+			wantErr: "overlaps",
+		},
+		{
+			name: "negative duration",
+			body: `[cache]
+dir = "DIR"
+listen = "0.0.0.0:3142"
+[upstream]
+connect_timeout = "-30s"
+`,
+			wantErr: "connect_timeout",
+		},
+		{
+			name: "negative max_concurrent_per_host",
+			body: `[cache]
+dir = "DIR"
+listen = "0.0.0.0:3142"
+[upstream]
+max_concurrent_per_host = -1
+`,
+			wantErr: "max_concurrent_per_host",
+		},
+		{
+			name: "tls cert path missing",
+			body: `[cache]
+dir = "DIR"
+listen = "0.0.0.0:3142"
+listen_tls = "0.0.0.0:3443"
+tls_cert = "/nonexistent/cert.pem"
+tls_key = "/nonexistent/key.pem"
+`,
+			wantErr: "tls_cert",
 		},
 		{
 			name: "log level invalid",
@@ -216,6 +322,12 @@ func TestDefaults(t *testing.T) {
 	}
 	if cfg.Log.Format != "json" {
 		t.Errorf("default log.format = %q", cfg.Log.Format)
+	}
+	if !reflect.DeepEqual(cfg.Upstream.AllowedHostRegex, DefaultAllowedHostRegex) {
+		t.Errorf("default allowed_host_regex not applied")
+	}
+	if !reflect.DeepEqual(cfg.Upstream.DenyTargetRanges, DefaultDenyTargetRanges) {
+		t.Errorf("default deny_target_ranges not applied")
 	}
 }
 

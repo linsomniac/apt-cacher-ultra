@@ -7,6 +7,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo de
 LDFLAGS   := -s -w -X main.Version=$(VERSION)
 
 build:
+	@mkdir -p $(BUILD_DIR)
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BUILD_DIR)/$(BIN) ./cmd/apt-cacher-ultra
 
 test:
