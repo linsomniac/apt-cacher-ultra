@@ -48,3 +48,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash e2e/run.sh
+
+  # SPEC §14 step 3 .deb package install validation. For each
+  # supported Ubuntu LTS target, a docker harness builds the .deb,
+  # installs it on the target image, validates the package contract
+  # (file layout, user, perms, unit syntax) and starts the daemon
+  # under the packaged user. This is the gating check that the
+  # release artifact actually works on supported targets.
+  deb-test:
+    runs-on: ubuntu-latest
+    # Each target build is ~1-2 min cold; two targets + matrix
+    # overhead fits comfortably in 15 min.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash e2e/deb/run.sh

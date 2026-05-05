@@ -1,4 +1,4 @@
-.PHONY: build test test-race lint fmt deb e2e clean
+.PHONY: build test test-race lint fmt deb e2e deb-test clean
 
 GO        ?= go
 BIN       := apt-cacher-ultra
@@ -31,6 +31,13 @@ deb: build
 # `docker` + `docker compose`.
 e2e:
 	bash e2e/run.sh
+
+# SPEC §14 step 3 .deb install validation: build the .deb in a
+# golang stage, then install on each Ubuntu LTS target and verify
+# the package contract. Default matrix is 24.04 + 26.04; override
+# with UBUNTU_VERSIONS for development.
+deb-test:
+	bash e2e/deb/run.sh
 
 clean:
 	rm -rf $(BUILD_DIR)
