@@ -909,6 +909,71 @@ func TestFetch_206BodyShorterThanRange(t *testing.T) {
 	}
 }
 
+// writeErrorDst is a FetchDst whose Write always fails. Used by
+// TestFetch_DstWriteErrorExhaustsAsUnavailable to simulate the cache-disk-
+// full failure mode (SPEC §11 row 14) without provoking real ENOSPC.
+type writeErrorDst struct {
+	err     error
+	written int64
+}
+
+func (w *writeErrorDst) Write(p []byte) (int, error) { return 0, w.err }
+func (w *writeErrorDst) Written() int64              { return w.written }
+func (w *writeErrorDst) Truncate() error             { w.written = 0; return nil }
+
+// TestFetch_DstWriteErrorExhaustsAsUnavailable pins the current behavior
+// when the cache's blob writer cannot accept bytes (e.g. disk full): the
+// fetch retry loop classifies the write error as retryable, runs up to
+// MaxRetries+1 attempts, then wraps the last error as ErrUpstreamUnavailable.
+//
+// AIDEV-TODO: SPEC §11 row 14 requires a "loud error log" for cache-disk-
+// full. This wrap obscures the cache-side fault as an upstream-unavailable
+// condition, so the handler emits the same quiet 502 it would for a hung
+// upstream. A future slice should:
+//  1. Tag dst.Write errors with a distinct sentinel (ErrCacheWriteFailed)
+//     by wrapping dst before passing to streamBody.
+//  2. Treat that sentinel as non-retryable in isRetryable (each retry
+//     hits the same disk and will fail identically).
+//  3. Map the sentinel to slog.Error + 502 + Retry-After in the handler so
+//     the operator-visible signal distinguishes "we ran out of disk" from
+//     "upstream is unreachable."
+//
+// This test is the canary: when the fix lands, this assertion will need
+// to flip to errors.Is(err, ErrCacheWriteFailed) and the hit count drop
+// to 1 (no retry).
+func TestFetch_DstWriteErrorExhaustsAsUnavailable(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), 256)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &writeErrorDst{err: errors.New("simulated disk full")}
+	_, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL + "/foo",
+	}, dst)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrUpstreamUnavailable) {
+		t.Errorf("want ErrUpstreamUnavailable wrap (current behavior), got %v", err)
+	}
+	if !strings.Contains(err.Error(), "simulated disk full") {
+		t.Errorf("expected wrapped error to surface underlying cause, got %v", err)
+	}
+	// newTestClient sets MaxRetries=3 → 4 attempts. Assert >=2 so the
+	// test stays robust against retry-count tweaks while still proving
+	// that retries did fire (rather than failing fast).
+	if got := hits.Load(); got < 2 {
+		t.Errorf("upstream hits=%d, want >=2 (initial + at least one retry)", got)
+	}
+}
+
 func TestNormalizeHost(t *testing.T) {
 	cases := []struct {
 		in, want string

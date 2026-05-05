@@ -1570,3 +1570,97 @@ func TestServeHTTP_OrphanRowUpstreamDownReturns502(t *testing.T) {
 		t.Errorf("upstream hits=%d, want >=2 (prime + at least one retry attempt)", got)
 	}
 }
+
+// newTestHandlerWithFetchOpts builds a handler around a fetch client whose
+// timeouts and retry budget the caller supplies. Used by the SPEC §11 row 4
+// timeout tests, which need a TotalTimeout shorter than the default 5s so
+// the test does not pay 5s of real wall time per case.
+func newTestHandlerWithFetchOpts(t *testing.T, fopts fetch.Options) *Handler {
+	t.Helper()
+	parser, err := proxy.New(nil, nil)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	c, err := cache.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	if fopts.AllowedHostRegex == nil {
+		fopts.AllowedHostRegex = []string{`^127\.0\.0\.1$`}
+	}
+	fc, err := fetch.New(fopts)
+	if err != nil {
+		t.Fatalf("fetch.New: %v", err)
+	}
+	h, err := New(Config{
+		Parser:      parser,
+		Cache:       c,
+		Fetch:       fc,
+		HostLimiter: hostsem.New(4),
+		Logger:      silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return h
+}
+
+// TestServeHTTP_UpstreamTimeout_MetadataRetryAfter30 covers SPEC §11 row 4
+// for metadata: a fetch that hits ctx.DeadlineExceeded (vs. 5xx, vs.
+// connect-refused) maps to 502 + Retry-After: 30. The existing UpstreamDown
+// + UpstreamUnavailable tests cover 5xx and transport failures respectively;
+// this one closes the gap on the canonical "upstream is up but never
+// responds" failure mode that motivated the §6.4 differentiation.
+func TestServeHTTP_UpstreamTimeout_MetadataRetryAfter30(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Block until the request context is cancelled (which happens
+		// when fetch's TotalTimeout expires). Sleeping a fixed long
+		// duration would leak goroutines on test failure; binding to
+		// the request ctx makes the upstream stop the moment fetch
+		// gives up.
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	h := newTestHandlerWithFetchOpts(t, fetch.Options{
+		ConnectTimeout: 2 * time.Second,
+		TotalTimeout:   150 * time.Millisecond,
+		MaxRetries:     0,
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "30" {
+		t.Errorf("Retry-After=%q, want %q (metadata + true timeout)", got, "30")
+	}
+}
+
+// TestServeHTTP_UpstreamTimeout_BlobRetryAfter60 covers the .deb half of
+// the SPEC §6.4 differentiation when the failure is a true timeout.
+func TestServeHTTP_UpstreamTimeout_BlobRetryAfter60(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	h := newTestHandlerWithFetchOpts(t, fetch.Options{
+		ConnectTimeout: 2 * time.Second,
+		TotalTimeout:   150 * time.Millisecond,
+		MaxRetries:     0,
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/ubuntu/pool/main/p/pkg/file_1.0_amd64.deb"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "60" {
+		t.Errorf("Retry-After=%q, want %q (blob + true timeout)", got, "60")
+	}
+}
