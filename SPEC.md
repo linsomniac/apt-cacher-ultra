@@ -1,6 +1,6 @@
 # apt-cacher-ultra — Phase 1 Specification
 
-Status: **draft for review**. Last updated 2026-05-05.
+Status: **locked for Phase 1 implementation**. Last updated 2026-05-05.
 
 This document specifies the contract for Phase 1, the MVP cache. Phases 2–6 are referenced at the high level captured in the design discussion but not specified in detail here — separate specs will follow as those phases are scoped.
 
@@ -207,7 +207,7 @@ CREATE TABLE suite_freshness (
 );
 
 CREATE TABLE schema_version (
-  version INTEGER PRIMARY KEY
+  version INTEGER PRIMARY KEY                 -- forward-only; downgrades not supported
 );
 INSERT INTO schema_version VALUES (1);
 ```
@@ -655,19 +655,3 @@ Phase 1 is done when:
 4. The cache is deployed to one production environment for at least one week with monitoring showing zero cache-hit failures and bounded RSS / FD count.
 5. SPEC.md reflects the as-built reality (this document is updated as we go, not just before).
 
----
-
-## 15. Open questions for review
-
-These are decisions I've made provisionally but want pushback on:
-
-1. **Singleflight: serialize-and-then-serve vs. stream-while-fetching.** Phase 1 specs serialize (§6.2). Easier to get right; trades a bit of first-byte latency on the second client of a big `.deb` first-fetch. Acceptable, or want streaming from day one?
-2. **Pure-Go SQLite (`modernc.org/sqlite`) vs. cgo (`mattn/go-sqlite3`).** Spec picks pure-Go for static-binary simplicity. mattn is faster but cgo. At our scale I doubt the perf gap matters. OK?
-3. **Cache key is `(canonical_scheme, canonical_host, path)`.** Same path on different canonical hosts = different cached entries (`/dists/noble/InRelease` on `archive.ubuntu.com` vs. `ppa.launchpadcontent.net/.../ubuntu` is genuinely different). Same path on the same host but different scheme also = different entries (notably for the `HTTPS///` convention, where the cache may legitimately hold separate HTTP and HTTPS variants of the same path).
-4. **Default Remap rules baked in.** I've listed Ubuntu/Debian common ones (§3.3). Want me to add anything specific to your fleet? (Internal mirrors, etc. — even if commented out in the default config so you can uncomment.)
-5. **Per-host upstream concurrency = 8.** Reasonable for our scale (~7-20 clients per cache, 10-20 upstreams). Higher? Lower? Per-upstream override?
-6. **Stale-cache header naming.** I picked `X-Cache`/`X-Cache-Age`/`X-Upstream-Status`. apt ignores these but your monitoring/grep workflow might prefer different names.
-7. **Schema_version table starts at 1.** Phase 2 will migrate to 2, etc. Migration path is forward-only. Acceptable, or want some kind of downgrade story?
-8. **Graceful-shutdown drain timeout = 30s.** Long enough that an in-flight `.deb` download usually finishes; short enough that systemd doesn't kill us with SIGKILL. OK?
-
-Once these are resolved, I'll lock the SPEC and start Phase 1 scaffolding.
