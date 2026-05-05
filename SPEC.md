@@ -664,7 +664,7 @@ Phase 1 is done when:
 
 1. The chaos test (§12.3) passes reliably (10 consecutive runs, no flakes).
 2. The end-to-end test (§12.4) passes against real `apt`.
-3. The `.deb` package installs cleanly on Ubuntu 24.04 and 26.04 and serves traffic via the systemd unit. (Implemented as `e2e/deb/`: per-version docker harness builds the `.deb`, installs on `ubuntu:<ver>`, validates files/user/perms/unit syntax, and starts the daemon under the packaged user. systemd-as-PID-1 is not exercised in the harness — that is left to step 4 — but the unit is checked statically with `systemd-analyze verify`. Run via `make deb-test`.)
+3. The `.deb` package installs cleanly on Ubuntu 24.04 and 26.04 and serves traffic via the systemd unit. (Implemented as `e2e/deb/`: per-version docker harness builds the `.deb`, installs on `ubuntu:<ver>`, validates the package contract (file layout, ownership and modes, user/group, cache-dir perms, systemd unit syntax via `systemd-analyze verify`) and runs an ExecStart smoke (binary launches under the packaged user with the packaged config, binds `:3142`, answers HTTP). systemd-as-PID-1 — i.e. the runtime sandbox (`ProtectSystem=strict`, `ReadWritePaths`, `RestrictNamespaces`, etc.) and the service-manager lifecycle — is not exercised by this harness; that coverage is the job of step 4. Run via `make deb-test`.)
 4. The cache is deployed to one production environment for at least one week with monitoring showing zero cache-hit failures and bounded RSS / FD count.
 5. SPEC.md reflects the as-built reality (this document is updated as we go, not just before).
 

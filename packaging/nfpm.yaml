@@ -16,11 +16,25 @@ depends:
 contents:
   - src: ./build/apt-cacher-ultra
     dst: /usr/sbin/apt-cacher-ultra
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
   - src: ./packaging/systemd/apt-cacher-ultra.service
     dst: /lib/systemd/system/apt-cacher-ultra.service
+    # 0644 is the Debian convention for /lib/systemd/system; nfpm
+    # otherwise inherits 0664 from the source tree (umask 002).
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
   - src: ./packaging/config/config.toml.default
     dst: /etc/apt-cacher-ultra/config.toml
     type: config|noreplace
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
 scripts:
   preinstall:  ./packaging/scripts/preinstall.sh
   postinstall: ./packaging/scripts/postinstall.sh

@@ -5,17 +5,27 @@
 # (same ExecStart as the systemd unit) and verifies it binds the
 # listener and answers HTTP.
 #
-# We do NOT spin up systemd-as-PID-1 here — that requires either a
-# third-party systemd-enabled base image or --privileged + cgroup
-# gymnastics that vary across host kernels and CI runners. The
-# systemd unit's correctness is checked statically via
-# `systemd-analyze verify`. End-to-end "serves traffic via systemd"
-# coverage comes from step 4 (production deployment) per §14.
+# Scope: this is package-contract validation + an ExecStart smoke
+# test, NOT a "serves traffic via systemd unit" test. Spinning up
+# systemd-as-PID-1 here would require either a third-party
+# systemd-enabled base image or --privileged + cgroup gymnastics
+# that vary across host kernels and CI runners. Consequence: we
+# verify the unit file is syntactically correct (`systemd-analyze
+# verify`) and that the binary launches under the packaged user
+# with the packaged config — but the runtime sandbox directives in
+# the unit (ProtectSystem=strict, ReadWritePaths, RestrictNamespaces,
+# NoNewPrivileges, etc.) are NOT exercised. That coverage is the
+# job of step 4 (production deployment) per SPEC §14.
 
 set -euo pipefail
 
 echo "[deb-test] sanity: exactly one .deb in /tmp"
+# nullglob — without it, an unmatched glob expands to the literal
+# pattern, which silently passes the "exactly one" check and turns
+# the missing-deb case into a `dpkg` error one step later.
+shopt -s nullglob
 debs=(/tmp/apt-cacher-ultra_*.deb)
+shopt -u nullglob
 if [[ ${#debs[@]} -ne 1 ]]; then
     echo "FAIL: expected 1 .deb in /tmp, got ${#debs[@]}: ${debs[*]:-<none>}"
     exit 1
@@ -33,6 +43,31 @@ test -x /usr/sbin/apt-cacher-ultra        || { echo "FAIL: /usr/sbin/apt-cacher-
 test -f /etc/apt-cacher-ultra/config.toml || { echo "FAIL: /etc/apt-cacher-ultra/config.toml missing"; exit 1; }
 test -f /lib/systemd/system/apt-cacher-ultra.service \
     || { echo "FAIL: /lib/systemd/system/apt-cacher-ultra.service missing"; exit 1; }
+
+echo "[deb-test] verify ownership and that nothing is group/world-writable"
+# All packaged files belong to root:root and must not have group or
+# world write bits set. A regression to 0664 (umask 002 leaking into
+# nfpm output) or accidental ownership change would slip past
+# functional tests but is exactly the kind of packaging bug that
+# trips lintian / production audits.
+for path in \
+    /usr/sbin/apt-cacher-ultra \
+    /etc/apt-cacher-ultra/config.toml \
+    /lib/systemd/system/apt-cacher-ultra.service ; do
+    info="$(stat -c '%U:%G %a' "$path")"
+    owner="${info% *}"
+    mode="${info##* }"
+    if [[ "$owner" != "root:root" ]]; then
+        echo "FAIL: $path owned by $owner, expected root:root"
+        exit 1
+    fi
+    # Bits 022 = group-write (020) | world-write (002). Any of those
+    # set on a packaged file is a packaging defect.
+    if (( 8#$mode & 8#022 )); then
+        echo "FAIL: $path is group/world writable: mode=$mode"
+        exit 1
+    fi
+done
 
 echo "[deb-test] verify user/group created by preinstall"
 id apt-cacher-ultra >/dev/null              || { echo "FAIL: user not created"; exit 1; }
