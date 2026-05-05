@@ -100,6 +100,36 @@ func TestParse_ProxyMode_RejectsUnsupportedScheme(t *testing.T) {
 	}
 }
 
+// TestParse_ProxyMode_RejectsUserinfo is a security check: apt does not
+// authenticate to its proxy via URL userinfo, and accepting such a URL
+// would route credentials through structured logs and through Remap
+// regex matchers. Reject upfront.
+func TestParse_ProxyMode_RejectsUserinfo(t *testing.T) {
+	p := newTestParser(t)
+	cases := []struct {
+		raw   string
+		leaks []string // byte strings that must not appear in the error
+	}{
+		{"http://abc123@archive.ubuntu.com/foo", []string{"abc123"}},
+		{"http://abc123:hunter2@archive.ubuntu.com/foo", []string{"abc123", "hunter2"}},
+		{"https://svc%40acme:s3cret@deb.debian.org/dists/stable/InRelease",
+			[]string{"svc%40acme", "s3cret"}},
+	}
+	for _, tc := range cases {
+		_, err := p.Parse(tc.raw, "")
+		if !errors.Is(err, ErrInvalidURI) {
+			t.Errorf("Parse(%q): err=%v, want ErrInvalidURI", tc.raw, err)
+			continue
+		}
+		for _, leak := range tc.leaks {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("Parse(%q): error message leaks credential bytes %q: %q",
+					tc.raw, leak, err.Error())
+			}
+		}
+	}
+}
+
 func TestParse_HTTPSMagic(t *testing.T) {
 	p := newTestParser(t)
 	r, err := p.Parse("http://HTTPS///apt.corretto.aws/dists/stable/Release", "HTTPS")

@@ -40,11 +40,26 @@ func newSFGroup() *sfGroup {
 	return &sfGroup{calls: make(map[string]*sfCall)}
 }
 
+// sfTestHookAfterDone, if non-nil, is invoked between the leader's
+// wg.Done and the map-entry deletion. Tests use this to deterministically
+// exercise the cleanup window: a caller arriving during this hook proves
+// that delete-before-Done would cause a duplicate fetch. Production code
+// pays one nil check per leader call.
+var sfTestHookAfterDone func()
+
 // Do runs fn under key. If another call is already in flight for the
 // same key, it blocks for the in-flight result and returns it with
 // shared=true. Otherwise it runs fn, returns its result with
 // shared=false, and removes the call from the in-flight map so the
 // next caller can lead.
+//
+// AIDEV-NOTE: ordering matters. We must signal wg.Done before deleting
+// the map entry, not after. The previous order (delete first, Done
+// second) had a race: a caller arriving between delete and Done would
+// see no in-flight call and run fn a second time — defeating the
+// coalescing guarantee. With Done first, that same caller still finds
+// the (just-finished) call in the map, joins it via wg.Wait (which
+// returns immediately), and reads the same result.
 func (g *sfGroup) Do(key string, fn func() sfResult) (res sfResult, shared bool) {
 	g.mu.Lock()
 	if c, ok := g.calls[key]; ok {
@@ -58,10 +73,13 @@ func (g *sfGroup) Do(key string, fn func() sfResult) (res sfResult, shared bool)
 	g.mu.Unlock()
 
 	c.res = fn()
+	c.wg.Done()
+	if hook := sfTestHookAfterDone; hook != nil {
+		hook()
+	}
 
 	g.mu.Lock()
 	delete(g.calls, key)
 	g.mu.Unlock()
-	c.wg.Done()
 	return c.res, false
 }

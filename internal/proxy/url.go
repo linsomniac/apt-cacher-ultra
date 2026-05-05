@@ -65,6 +65,15 @@ func parseRequestURI(raw string) (*parsedURI, error) {
 	if scheme != "http" && scheme != "https" {
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedScheme, scheme)
 	}
+	// AIDEV-NOTE: userinfo in proxy-form requests is rejected here for two
+	// reasons: (1) apt does not authenticate to its proxy via URL userinfo,
+	// so any request that carries it is anomalous, and (2) the raw request
+	// URI gets passed through structured logs and error messages where a
+	// `user:pass@host` credential would otherwise leak. Reject upfront so
+	// the credential never reaches a log line, a remap regex, or a fetch.
+	if u.User != nil {
+		return nil, fmt.Errorf("%w: userinfo not supported in absolute URI", ErrInvalidURI)
+	}
 	if u.RawQuery != "" {
 		return nil, fmt.Errorf("%w: query string not supported: %q", ErrInvalidURI, raw)
 	}

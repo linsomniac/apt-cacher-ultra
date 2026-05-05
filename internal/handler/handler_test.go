@@ -240,6 +240,33 @@ func TestServeHTTP_Upstream404Passthrough(t *testing.T) {
 	}
 }
 
+// TestServeHTTP_UpstreamNon4xxIs502 covers the codex-finding restriction:
+// only upstream 4xx is "client said no, pass it through." Anything else
+// classified as ErrUpstreamStatus (e.g. a 304 in response to a request
+// that did not carry If-None-Match) is treated as cache-side unhealthy
+// and surfaced as 502.
+func TestServeHTTP_UpstreamNon4xxIs502(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotModified) // 304 — non-2xx, non-4xx, non-5xx
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/x"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status=%d, want 502 (304 must not pass through)", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Errorf("Retry-After missing on 502")
+	}
+	// Diagnostic header still records the upstream's response.
+	if got := rec.Header().Get("X-Upstream-Status"); got != "304" {
+		t.Errorf("X-Upstream-Status=%q, want 304", got)
+	}
+}
+
 func TestServeHTTP_Upstream5xxThen502(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "kaboom", http.StatusInternalServerError)
@@ -528,6 +555,76 @@ func TestSFGroup_CoalescesAndCleansUp(t *testing.T) {
 	}
 }
 
+// TestSFGroup_ArrivalDuringCleanupWindow proves that a caller arriving
+// after the leader's wg.Done but before the map cleanup still coalesces
+// onto the leader's result. Without the Done-before-delete ordering,
+// such a caller would lead a duplicate fn execution.
+func TestSFGroup_ArrivalDuringCleanupWindow(t *testing.T) {
+	g := newSFGroup()
+
+	var fnCalls atomic.Int32
+	leaderInCleanup := make(chan struct{}, 1)
+	proceed := make(chan struct{})
+	sfTestHookAfterDone = func() {
+		select {
+		case leaderInCleanup <- struct{}{}:
+		default:
+		}
+		<-proceed
+	}
+	t.Cleanup(func() { sfTestHookAfterDone = nil })
+
+	leaderResult := make(chan sfResult, 1)
+	go func() {
+		res, _ := g.Do("k", func() sfResult {
+			fnCalls.Add(1)
+			return sfResult{blobHash: "leader"}
+		})
+		leaderResult <- res
+	}()
+
+	select {
+	case <-leaderInCleanup:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader never reached the cleanup hook")
+	}
+
+	type waiterRet struct {
+		res    sfResult
+		shared bool
+	}
+	waiterResult := make(chan waiterRet, 1)
+	go func() {
+		res, shared := g.Do("k", func() sfResult {
+			fnCalls.Add(1) // must NOT happen with the fix in place
+			return sfResult{blobHash: "duplicate"}
+		})
+		waiterResult <- waiterRet{res, shared}
+	}()
+
+	// Give the waiter time to actually enter Do. With Done-before-delete,
+	// it finds the still-mapped call and joins via wg.Wait.
+	time.Sleep(50 * time.Millisecond)
+
+	close(proceed)
+
+	leader := <-leaderResult
+	waiter := <-waiterResult
+
+	if got := fnCalls.Load(); got != 1 {
+		t.Errorf("fn calls=%d, want 1 (waiter must coalesce, not lead a duplicate)", got)
+	}
+	if !waiter.shared {
+		t.Errorf("waiter shared=false, want true")
+	}
+	if waiter.res.blobHash != "leader" {
+		t.Errorf("waiter blobHash=%q, want %q", waiter.res.blobHash, "leader")
+	}
+	if leader.blobHash != "leader" {
+		t.Errorf("leader blobHash=%q, want %q", leader.blobHash, "leader")
+	}
+}
+
 func TestHostSem_LimitsConcurrency(t *testing.T) {
 	s := newHostSem(2)
 
@@ -573,6 +670,153 @@ func TestHostSem_PerHostIsolated(t *testing.T) {
 		t.Fatalf("acquire b: %v", err)
 	}
 	defer rB()
+}
+
+// TestHostSem_RefcountReleasesSlot proves the per-host map shrinks when
+// the last holder of a slot releases. Without refcounting, every distinct
+// host the cache ever sees creates a permanent map entry and an attacker
+// can grow the map without bound by sending requests for many made-up
+// hostnames.
+func TestHostSem_RefcountReleasesSlot(t *testing.T) {
+	s := newHostSem(2)
+
+	rel, err := s.acquire(context.Background(), "transient-host")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if got := s.hostCount(); got != 1 {
+		t.Errorf("hostCount during use = %d, want 1", got)
+	}
+	rel()
+	if got := s.hostCount(); got != 0 {
+		t.Errorf("hostCount after last release = %d, want 0", got)
+	}
+
+	// Many transient hosts — each should clean up after itself.
+	for i := 0; i < 100; i++ {
+		host := fmt.Sprintf("h-%d", i)
+		rel, err := s.acquire(context.Background(), host)
+		if err != nil {
+			t.Fatalf("acquire %q: %v", host, err)
+		}
+		rel()
+	}
+	if got := s.hostCount(); got != 0 {
+		t.Errorf("hostCount after churn = %d, want 0", got)
+	}
+}
+
+// TestHostSem_RefcountSurvivesCtxCancel proves a ctx-cancelled acquire
+// (which never took a channel token) still drops its refcount.
+func TestHostSem_RefcountSurvivesCtxCancel(t *testing.T) {
+	s := newHostSem(1)
+
+	// Hold the only slot.
+	hold, err := s.acquire(context.Background(), "h")
+	if err != nil {
+		t.Fatalf("acquire hold: %v", err)
+	}
+
+	// Try to acquire a second slot with a ctx that fires fast.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = s.acquire(ctx, "h")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("acquire-2 err=%v, want DeadlineExceeded", err)
+	}
+	// Refcount: hold has 1 ref, the failed acquire decremented its own.
+	// Both ops on host "h" → slot still alive (refs = 1).
+	if got := s.hostCount(); got != 1 {
+		t.Errorf("hostCount with one holder = %d, want 1", got)
+	}
+
+	hold()
+	if got := s.hostCount(); got != 0 {
+		t.Errorf("hostCount after final release = %d, want 0", got)
+	}
+}
+
+// TestServeHTTP_DisallowedHostShortCircuits asserts the handler's
+// pre-fetch allowlist check rejects unknown hosts before allocating any
+// per-host bookkeeping. This is the open-proxy DoS hardening from
+// codex finding #2 — without it, an attacker could grow handler-side
+// maps by sending requests for many distinct disallowed hostnames.
+func TestServeHTTP_DisallowedHostShortCircuits(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("never reached"))
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, []string{`^example\.com$`}, nil)
+
+	// 50 distinct made-up hosts the allowlist will reject.
+	for i := 0; i < 50; i++ {
+		r := httptest.NewRequest("GET",
+			fmt.Sprintf("http://attacker-%d.invalid/x", i), nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("attacker-%d: status=%d, want 403", i, rec.Code)
+		}
+	}
+
+	if got := h.sem.hostCount(); got != 0 {
+		t.Errorf("hostCount after 50 disallowed hosts = %d, want 0", got)
+	}
+}
+
+// TestURLForLog_StripsUserinfo guards against credentials reaching log
+// output via the request-URL field. The parser rejects userinfo for
+// successful requests, but 400/405 log lines fire before the parser
+// runs, so the sanitizer must do the right thing on its own.
+func TestURLForLog_StripsUserinfo(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+		// substrings that MUST NOT appear in the sanitized output
+		mustNotContain []string
+		// optional: substring that MUST appear (path survives)
+		mustContain string
+	}{
+		{
+			name:           "username only",
+			url:            "http://abc123@archive.ubuntu.com/foo",
+			mustNotContain: []string{"abc123", "@"},
+			mustContain:    "/foo",
+		},
+		{
+			name:           "username and password",
+			url:            "http://abc123:hunter2@archive.ubuntu.com/foo",
+			mustNotContain: []string{"abc123", "hunter2", "@"},
+			mustContain:    "/foo",
+		},
+		{
+			name:           "no userinfo passes through",
+			url:            "http://archive.ubuntu.com/foo",
+			mustNotContain: nil,
+			mustContain:    "archive.ubuntu.com",
+		},
+		{
+			name:           "mirror form",
+			url:            "/ubuntu/foo",
+			mustNotContain: nil,
+			mustContain:    "/ubuntu/foo",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest("GET", tc.url, nil)
+			got := urlForLog(r)
+			for _, leak := range tc.mustNotContain {
+				if strings.Contains(got, leak) {
+					t.Errorf("urlForLog(%q) = %q, must not contain %q", tc.url, got, leak)
+				}
+			}
+			if tc.mustContain != "" && !strings.Contains(got, tc.mustContain) {
+				t.Errorf("urlForLog(%q) = %q, must contain %q", tc.url, got, tc.mustContain)
+			}
+		})
+	}
 }
 
 // confirmFetchStatusError keeps the public-API contract front-and-center

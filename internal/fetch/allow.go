@@ -30,3 +30,16 @@ func (c *Client) checkAllowed(host string) error {
 	}
 	return fmt.Errorf("%w: %s", ErrHostNotAllowed, host)
 }
+
+// HostAllowed reports whether host (the canonical hostname with no port)
+// is permitted by the allowlist. Exported so the handler layer can reject
+// disallowed hosts before allocating per-host bookkeeping (singleflight
+// entries, semaphore slots) — without this pre-check, an unauthenticated
+// client could grow handler-side maps indefinitely by sending requests
+// for many distinct disallowed hostnames.
+//
+// The empty-allowlist semantic from SPEC §6.6 (deny everything) is
+// preserved.
+func (c *Client) HostAllowed(host string) bool {
+	return c.checkAllowed(host) == nil
+}

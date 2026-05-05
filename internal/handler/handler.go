@@ -112,6 +112,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SPEC §6.6 short-circuit: reject disallowed hosts before allocating
+	// per-host bookkeeping (singleflight entry, semaphore slot). The
+	// fetch layer would also reject this host once we got there, but
+	// without this pre-check an attacker could send requests for many
+	// distinct disallowed hostnames and grow handler-side maps before
+	// the fetch path's allowlist fires.
+	if !h.fetch.HostAllowed(req.CanonicalHost) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		h.logRequest(r, req.CanonicalHost, req.Path, "forbidden", http.StatusForbidden, 0, start)
+		return
+	}
+
 	// Miss: SPEC §6.2.
 	h.serveCacheMiss(w, r, req, start)
 }
@@ -343,10 +355,27 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		h.logRequest(r, req.CanonicalHost, req.Path, "forbidden", http.StatusForbidden, 0, start)
 		return
 	case errors.Is(err, fetch.ErrUpstreamStatus):
-		// Use Errorf to inject a body; the upstream's body is not
-		// proxied through (Phase 1 simplification).
-		http.Error(w, fmt.Sprintf("upstream status %d", res.status), res.status)
-		h.logRequest(r, req.CanonicalHost, req.Path, "upstream_status", res.status, 0, start)
+		// SPEC §6.4 / failure-mode catalog: only upstream 4xx is a
+		// "client said no" we can pass through (e.g. apt probing for
+		// an index variant the archive does not publish — 404 must
+		// reach the client so apt moves on). Anything else is treated
+		// as cache-side unhealthy: a 3xx that escaped the redirect
+		// guard, an unexpected 2xx classified as non-success by fetch,
+		// or status==0 if classification raced with a parse failure.
+		// All become 502.
+		if res.status >= 400 && res.status < 500 {
+			http.Error(w, fmt.Sprintf("upstream status %d", res.status), res.status)
+			h.logRequest(r, req.CanonicalHost, req.Path, "upstream_status", res.status, 0, start)
+			return
+		}
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		h.logger.Warn("non-4xx upstream status mapped to 502",
+			"upstream_status", res.status,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+		)
+		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, start)
 		return
 	case errors.Is(err, fetch.ErrUpstreamUnavailable),
 		errors.Is(err, fetch.ErrInvalidURL),
@@ -377,10 +406,16 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 }
 
 // logRequest emits the per-request slog line. SPEC §10.
+//
+// AIDEV-NOTE: never log r.RequestURI directly — proxy-form requests can
+// (in principle) carry userinfo like http://user:pass@host/path. The
+// parser rejects userinfo before it reaches the success path, but the
+// 400/405 log calls fire before the parser has run, so we route the
+// URL through urlForLog which strips userinfo unconditionally.
 func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, status int, bytesWritten int64, start time.Time) {
 	h.logger.Info("request",
 		"method", r.Method,
-		"url", r.RequestURI,
+		"url", urlForLog(r),
 		"canonical_host", canonHost,
 		"path", path,
 		"outcome", outcome,
@@ -389,6 +424,26 @@ func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, s
 		"duration_ms", time.Since(start).Milliseconds(),
 		"client_addr", r.RemoteAddr,
 	)
+}
+
+// urlForLog returns a sanitized representation of the request URL
+// suitable for inclusion in a log line. Userinfo (which Go's
+// http.Server faithfully parses out of an absolute-form request line)
+// is stripped — never leak credentials into operator-readable output.
+func urlForLog(r *http.Request) string {
+	if r.URL == nil {
+		// Defensive: net/http always populates r.URL, but if a future
+		// caller hands us a hand-built request without one, fall back
+		// to the literal request line. This path is also reached only
+		// when r.URL is nil, so userinfo cannot be present here.
+		return r.RequestURI
+	}
+	if r.URL.User == nil {
+		return r.URL.String()
+	}
+	cp := *r.URL
+	cp.User = nil
+	return cp.String()
 }
 
 // countingWriter wraps an http.ResponseWriter to track the response
