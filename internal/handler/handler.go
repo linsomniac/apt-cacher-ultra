@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
@@ -55,6 +56,13 @@ type Config struct {
 	// triggers are disabled (tests, or operators who explicitly
 	// disabled freshness in config).
 	Freshness FreshnessChecker
+
+	// Serve is the SPEC §6.4 / §8 stale-serve policy. Zero value is
+	// safe (both flags off): the handler will always 502 on a metadata
+	// miss with upstream down rather than serving a stale cached copy.
+	// Production sets ServeStaleWhenUpstreamDown=true (the SPEC default
+	// behavior) so brief upstream outages don't propagate to apt clients.
+	Serve config.ServeConfig
 }
 
 // Handler is the apt-cacher-ultra http.Handler. Construct via New.
@@ -72,6 +80,7 @@ type Handler struct {
 	sf        *sfGroup
 	sem       *hostsem.Sem
 	freshness FreshnessChecker
+	serve     config.ServeConfig
 	logger    *slog.Logger
 
 	lifecycleCtx    context.Context
@@ -106,6 +115,7 @@ func New(cfg Config) (*Handler, error) {
 		sf:              newSFGroup(),
 		sem:             cfg.HostLimiter,
 		freshness:       cfg.Freshness,
+		serve:           cfg.Serve,
 		logger:          logger,
 		lifecycleCtx:    lifecycleCtx,
 		lifecycleCancel: lifecycleCancel,
@@ -466,7 +476,8 @@ const inReleaseSuffix = "/InRelease"
 // respondError maps a fetch error to an HTTP response.
 //
 // SPEC §6.6: allowlist + deny CIDR rejections → 403.
-// SPEC §6.4: upstream unreachable on a miss → 502 + Retry-After.
+// SPEC §6.4: upstream unreachable on a miss → HIT-STALE if eligible,
+// otherwise 502 + Retry-After (30s for metadata, 60s for blobs).
 // Upstream 4xx (e.g. apt probing for an index variant that does not
 // exist) → passthrough. Any other failure → 502.
 func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *proxy.Request, res sfResult, start time.Time) {
@@ -488,26 +499,33 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		// as cache-side unhealthy: a 3xx that escaped the redirect
 		// guard, an unexpected 2xx classified as non-success by fetch,
 		// or status==0 if classification raced with a parse failure.
-		// All become 502.
+		// All become 502 (HIT-STALE eligible — a non-success non-4xx
+		// upstream is functionally equivalent to "upstream down" for
+		// this cache's purposes).
 		if res.status >= 400 && res.status < 500 {
 			http.Error(w, fmt.Sprintf("upstream status %d", res.status), res.status)
 			h.logRequest(r, req.CanonicalHost, req.Path, "upstream_status", res.status, 0, start)
 			return
 		}
-		w.Header().Set("Retry-After", "60")
-		http.Error(w, "bad gateway", http.StatusBadGateway)
 		h.logger.Warn("non-4xx upstream status mapped to 502",
 			"upstream_status", res.status,
 			"canonical_host", req.CanonicalHost,
 			"path", req.Path,
 		)
-		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, start)
+		h.respondUpstreamUnreachable(w, r, req, start)
 		return
 	case errors.Is(err, fetch.ErrUpstreamUnavailable),
-		errors.Is(err, fetch.ErrInvalidURL),
-		errors.Is(err, fetch.ErrRedirectBlocked),
+		errors.Is(err, fetch.ErrUpstreamServerError),
 		errors.Is(err, context.DeadlineExceeded):
-		w.Header().Set("Retry-After", "60")
+		h.respondUpstreamUnreachable(w, r, req, start)
+		return
+	case errors.Is(err, fetch.ErrInvalidURL),
+		errors.Is(err, fetch.ErrRedirectBlocked):
+		// Cache could not even attempt the upstream. HIT-STALE here
+		// would mask a real config/security problem (an upstream that
+		// moved and now redirects every request, a malformed URL the
+		// operator should fix) — fail loud instead.
+		w.Header().Set("Retry-After", retryAfterForRequest(req))
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, start)
 		return
@@ -519,7 +537,7 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, start)
 		return
 	default:
-		w.Header().Set("Retry-After", "60")
+		w.Header().Set("Retry-After", retryAfterForRequest(req))
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		h.logger.Error("unclassified fetch error",
 			"err", err,
@@ -529,6 +547,102 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, start)
 		return
 	}
+}
+
+// respondUpstreamUnreachable resolves a "couldn't talk to upstream" error.
+// SPEC §6.4: when policy allows AND the request is for metadata, serve a
+// stale cached copy with X-Cache: HIT-STALE; otherwise 502 with the
+// SPEC-mandated Retry-After (30s for metadata, 60s for blobs — apt
+// retries metadata aggressively, so a longer cool-off on blobs spreads
+// the load when upstream comes back).
+func (h *Handler) respondUpstreamUnreachable(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) {
+	if h.tryServeStale(w, r, req, start) {
+		return
+	}
+	w.Header().Set("Retry-After", retryAfterForRequest(req))
+	http.Error(w, "bad gateway", http.StatusBadGateway)
+	h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, start)
+}
+
+// tryServeStale serves the cached blob for req with X-Cache: HIT-STALE
+// when one is available, returning true if it wrote the response.
+//
+// SPEC §6.4 + §8: only metadata is stale-eligible. .deb fetches are not
+// (apt verifies index hashes against InRelease, so a hash-mismatched .deb
+// would reach the client and fail loudly — better to 502 and let apt
+// retry). Returns false on any error or missing prerequisite (no row, no
+// blob, blob open/stat fails) so the caller falls through to 502.
+//
+// Note: tryServeStale runs after the singleflight fetch returned an
+// error, which means tryCacheHit was already consulted at request entry
+// and either (a) returned false because the row was missing, or (b)
+// returned false because the row pointed at a blob no longer on disk.
+// Case (b) cannot recover here — the blob is still missing — so the
+// only way this method actually serves is if a row+blob materialized
+// between the two lookups (a benign race with a concurrent successful
+// fetch under a different singleflight key, or an operator-restored
+// blob). In Phase 2 this method becomes the centerpiece of "served from
+// frozen consistent set during freshness divergence."
+func (h *Handler) tryServeStale(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) bool {
+	if !req.IsMetadata {
+		return false
+	}
+	if !h.serve.ServeStaleWhenUpstreamDown {
+		return false
+	}
+	row, err := h.cache.LookupURL(r.Context(), req.CanonicalScheme, req.CanonicalHost, req.Path)
+	if err != nil || row.BlobHash == nil || *row.BlobHash == "" {
+		return false
+	}
+	hash := *row.BlobHash
+	exists, err := h.cache.BlobExists(hash)
+	if err != nil || !exists {
+		return false
+	}
+	f, err := os.Open(h.cache.BlobPath(hash))
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return false
+	}
+
+	w.Header().Set(hdrXCache, cacheHitStale)
+	if row.LastFetchedAt != nil {
+		age := time.Now().Unix() - *row.LastFetchedAt
+		if age < 0 {
+			age = 0
+		}
+		w.Header().Set(hdrXCacheAge, strconv.FormatInt(age, 10))
+	}
+
+	cw := &countingWriter{ResponseWriter: w}
+	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
+
+	if h.serve.LogStaleServes {
+		h.logger.Info("stale_serve",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"blob_hash", hash,
+		)
+	}
+	h.logRequest(r, req.CanonicalHost, req.Path, "hit_stale", cw.statusCode(), cw.bytes, start)
+	return true
+}
+
+// retryAfterForRequest returns the SPEC §6.4 Retry-After value: 30s for
+// metadata, 60s for everything else. The differentiation matters because
+// apt retries metadata fetches with much shorter delays than blob
+// fetches, so a single Retry-After value either hammers the cache during
+// metadata recovery or wastes minutes of clock time on a transient blob
+// failure.
+func retryAfterForRequest(req *proxy.Request) string {
+	if req.IsMetadata {
+		return "30"
+	}
+	return "60"
 }
 
 // logRequest emits the per-request slog line. SPEC §10.

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1099,4 +1100,391 @@ func (b blockingFreshness) Check(_ context.Context, _, _, _ string) {
 	case b.released <- struct{}{}:
 	default:
 	}
+}
+
+// newTestHandlerWithServe wires the same dependencies as newTestHandler
+// but with a custom config.ServeConfig and an optional custom logger.
+// Pass logger=nil to keep silent test output.
+func newTestHandlerWithServe(t *testing.T, serve config.ServeConfig, logger *slog.Logger) *Handler {
+	t.Helper()
+	parser, err := proxy.New(nil, nil)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	c, err := cache.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	fc, err := fetch.New(fetch.Options{
+		ConnectTimeout:   2 * time.Second,
+		TotalTimeout:     5 * time.Second,
+		MaxRetries:       2,
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		DenyTargetRanges: nil,
+	})
+	if err != nil {
+		t.Fatalf("fetch.New: %v", err)
+	}
+	if logger == nil {
+		logger = silentLogger()
+	}
+	h, err := New(Config{
+		Parser:      parser,
+		Cache:       c,
+		Fetch:       fc,
+		HostLimiter: hostsem.New(4),
+		Logger:      logger,
+		Serve:       serve,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return h
+}
+
+// TestServeHTTP_UpstreamDown_MetadataRetryAfter30 covers SPEC §6.4: when
+// the cache cannot reach upstream and there is no cached metadata to
+// serve stale, the 502 carries Retry-After: 30. apt's metadata fetches
+// retry on a much shorter cadence than blob fetches, so the differentiated
+// Retry-After matters — a uniform 60s would either delay metadata recovery
+// or hammer the cache during blob recovery.
+func TestServeHTTP_UpstreamDown_MetadataRetryAfter30(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "kaboom", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil) // ServeStaleWhenUpstreamDown=false (zero value)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "30" {
+		t.Errorf("Retry-After=%q, want %q (metadata)", got, "30")
+	}
+}
+
+// TestServeHTTP_UpstreamDown_BlobRetryAfter60 covers the .deb half of
+// the SPEC §6.4 differentiation. .debs are immutable bytes and a longer
+// retry cool-off gives apt's per-package backoff room to spread load
+// when upstream comes back.
+func TestServeHTTP_UpstreamDown_BlobRetryAfter60(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "kaboom", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/ubuntu/pool/main/p/pkg/file_1.0_amd64.deb"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "60" {
+		t.Errorf("Retry-After=%q, want %q (blob)", got, "60")
+	}
+}
+
+// TestServeHTTP_UpstreamUnavailable_MetadataRetryAfter30 verifies the
+// Retry-After differentiation also fires for ErrUpstreamUnavailable
+// (transport/connect failures), not just 5xx.
+func TestServeHTTP_UpstreamUnavailable_MetadataRetryAfter30(t *testing.T) {
+	// Bind a local listener and immediately close it so the subsequent
+	// connect fails with "connection refused" — drives ErrUpstreamUnavailable.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", url, "/ubuntu/dists/noble/InRelease"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "30" {
+		t.Errorf("Retry-After=%q, want %q (metadata + transport failure)", got, "30")
+	}
+}
+
+// stalePrime drives a successful first ServeHTTP that populates url_path
+// + a real blob on disk for path. Returns the body bytes the upstream
+// served so the caller can compare them against tryServeStale's output.
+func stalePrime(t *testing.T, h *Handler, srvURL, path string) []byte {
+	t.Helper()
+	body := []byte("staled-bytes-" + path)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srvURL, path)) // server already started by caller
+	if rec.Code != http.StatusOK {
+		t.Fatalf("prime ServeHTTP status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != string(body) {
+		// Server returned different bytes — caller mis-wired the upstream.
+		t.Fatalf("prime body mismatch: got=%q want=%q", rec.Body.String(), body)
+	}
+	return body
+}
+
+// staleUpstream returns a server whose body for any GET is the same
+// canonical bytes stalePrime expects. Used to seed cached entries with
+// known-good blobs.
+func staleUpstream(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := []byte("staled-bytes-" + r.URL.Path)
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestTryServeStale_ServesCachedRowAndBlob is the positive path for
+// HIT-STALE: a row + blob exist in the cache and policy permits stale
+// serves, so tryServeStale writes the cached bytes with X-Cache: HIT-STALE.
+//
+// Driven by a direct method call rather than ServeHTTP because the
+// successful HIT path catches the request first and serves "HIT" — the
+// only way to reach the stale path through ServeHTTP would be a race
+// where the row materializes between tryCacheHit and respondError. Direct
+// invocation isolates the SPEC §6.4 behavior under test.
+func TestTryServeStale_ServesCachedRowAndBlob(t *testing.T) {
+	srv := staleUpstream(t)
+
+	h := newTestHandlerWithServe(t, config.ServeConfig{ServeStaleWhenUpstreamDown: true}, nil)
+	defer h.Close()
+
+	body := stalePrime(t, h, srv.URL, "/ubuntu/dists/noble/InRelease")
+
+	// Build the proxy.Request the handler internals operate on.
+	req, err := h.parser.Parse(srv.URL+"/ubuntu/dists/noble/InRelease", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parser.Parse: %v", err)
+	}
+	if !req.IsMetadata {
+		t.Fatalf("test premise: InRelease must be metadata")
+	}
+
+	rec := httptest.NewRecorder()
+	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
+	served := h.tryServeStale(rec, r, req, time.Now())
+	if !served {
+		t.Fatalf("tryServeStale=false, want true (row+blob present)")
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status=%d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("X-Cache"); got != "HIT-STALE" {
+		t.Errorf("X-Cache=%q, want HIT-STALE", got)
+	}
+	if rec.Body.String() != string(body) {
+		t.Errorf("body=%q, want %q", rec.Body.String(), body)
+	}
+	if rec.Header().Get("X-Cache-Age") == "" {
+		t.Errorf("X-Cache-Age must be set on HIT-STALE")
+	}
+}
+
+// TestTryServeStale_DisabledByConfig: even if a cached entry exists,
+// the stale-serve must not fire when policy is off. Operators can
+// disable for environments where serving any potentially-stale bytes
+// is unacceptable.
+func TestTryServeStale_DisabledByConfig(t *testing.T) {
+	srv := staleUpstream(t)
+
+	h := newTestHandlerWithServe(t, config.ServeConfig{ServeStaleWhenUpstreamDown: false}, nil)
+	defer h.Close()
+
+	_ = stalePrime(t, h, srv.URL, "/ubuntu/dists/noble/InRelease")
+
+	req, err := h.parser.Parse(srv.URL+"/ubuntu/dists/noble/InRelease", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parser.Parse: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
+	if served := h.tryServeStale(rec, r, req, time.Now()); served {
+		t.Errorf("tryServeStale=true with policy off, want false")
+	}
+}
+
+// TestTryServeStale_NotMetadata: a .deb is never stale-eligible. apt
+// verifies index hashes against InRelease, so a hash-mismatched .deb
+// would reach the client and fail — better to 502 and let apt retry.
+func TestTryServeStale_NotMetadata(t *testing.T) {
+	srv := staleUpstream(t)
+
+	h := newTestHandlerWithServe(t, config.ServeConfig{ServeStaleWhenUpstreamDown: true}, nil)
+	defer h.Close()
+
+	_ = stalePrime(t, h, srv.URL, "/ubuntu/pool/main/p/pkg/file_1.0_amd64.deb")
+
+	req, err := h.parser.Parse(srv.URL+"/ubuntu/pool/main/p/pkg/file_1.0_amd64.deb", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parser.Parse: %v", err)
+	}
+	if req.IsMetadata {
+		t.Fatalf("test premise: .deb must not be metadata")
+	}
+
+	rec := httptest.NewRecorder()
+	r := proxyReq("GET", srv.URL, "/ubuntu/pool/main/p/pkg/file_1.0_amd64.deb")
+	if served := h.tryServeStale(rec, r, req, time.Now()); served {
+		t.Errorf("tryServeStale=true on .deb, want false (blobs never stale-serve)")
+	}
+}
+
+// TestTryServeStale_NoRow: empty cache → returns false, never writes to
+// the response. The respondError caller falls through to 502.
+func TestTryServeStale_NoRow(t *testing.T) {
+	h := newTestHandlerWithServe(t, config.ServeConfig{ServeStaleWhenUpstreamDown: true}, nil)
+	defer h.Close()
+
+	req, err := h.parser.Parse("http://127.0.0.1/ubuntu/dists/noble/InRelease", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parser.Parse: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := proxyReq("GET", "http://127.0.0.1", "/ubuntu/dists/noble/InRelease")
+	if served := h.tryServeStale(rec, r, req, time.Now()); served {
+		t.Errorf("tryServeStale=true with empty cache, want false")
+	}
+}
+
+// TestTryServeStale_BlobMissing: row points at a blob that's no longer
+// on disk (orphan row from manual delete or pruning). tryServeStale
+// must report false and skip the response write — not 500 with an
+// open-file error.
+func TestTryServeStale_BlobMissing(t *testing.T) {
+	srv := staleUpstream(t)
+
+	h := newTestHandlerWithServe(t, config.ServeConfig{ServeStaleWhenUpstreamDown: true}, nil)
+	defer h.Close()
+
+	_ = stalePrime(t, h, srv.URL, "/ubuntu/dists/noble/InRelease")
+
+	// Find the row the prime created, then nuke its blob from disk.
+	row, err := h.cache.LookupURL(context.Background(), "http", "127.0.0.1", "/ubuntu/dists/noble/InRelease")
+	if err != nil {
+		t.Fatalf("LookupURL after prime: %v", err)
+	}
+	if row.BlobHash == nil {
+		t.Fatalf("row missing blob hash after prime")
+	}
+	if err := os.Remove(h.cache.BlobPath(*row.BlobHash)); err != nil {
+		t.Fatalf("remove blob: %v", err)
+	}
+
+	req, err := h.parser.Parse(srv.URL+"/ubuntu/dists/noble/InRelease", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parser.Parse: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
+	if served := h.tryServeStale(rec, r, req, time.Now()); served {
+		t.Errorf("tryServeStale=true with row but missing blob, want false")
+	}
+}
+
+// TestTryServeStale_LogsWhenEnabled: serve.log_stale_serves controls
+// whether each stale serve emits an info-level log line. SPEC §8 calls
+// this out explicitly so operators can correlate cache behavior with
+// upstream outages.
+func TestTryServeStale_LogsWhenEnabled(t *testing.T) {
+	srv := staleUpstream(t)
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&safeWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	h := newTestHandlerWithServe(t, config.ServeConfig{
+		ServeStaleWhenUpstreamDown: true,
+		LogStaleServes:             true,
+	}, logger)
+	defer h.Close()
+
+	_ = stalePrime(t, h, srv.URL, "/ubuntu/dists/noble/InRelease")
+
+	req, err := h.parser.Parse(srv.URL+"/ubuntu/dists/noble/InRelease", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parser.Parse: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
+	if !h.tryServeStale(rec, r, req, time.Now()) {
+		t.Fatalf("tryServeStale=false, want true (positive path)")
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "stale_serve") {
+		t.Errorf("logger output missing stale_serve line:\n%s", out)
+	}
+	if !strings.Contains(out, "/ubuntu/dists/noble/InRelease") {
+		t.Errorf("logger output missing path:\n%s", out)
+	}
+}
+
+// TestTryServeStale_LogsSuppressedByConfig: with LogStaleServes=false
+// (and ServeStaleWhenUpstreamDown=true), the stale serve still happens
+// but no "stale_serve" line is emitted. The per-request line still
+// fires, but with outcome=hit_stale.
+func TestTryServeStale_LogsSuppressedByConfig(t *testing.T) {
+	srv := staleUpstream(t)
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&safeWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	h := newTestHandlerWithServe(t, config.ServeConfig{
+		ServeStaleWhenUpstreamDown: true,
+		LogStaleServes:             false,
+	}, logger)
+	defer h.Close()
+
+	_ = stalePrime(t, h, srv.URL, "/ubuntu/dists/noble/InRelease")
+
+	// Reset buf so the prime's miss-path log doesn't pollute the assert.
+	buf.Reset()
+
+	req, err := h.parser.Parse(srv.URL+"/ubuntu/dists/noble/InRelease", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parser.Parse: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
+	if !h.tryServeStale(rec, r, req, time.Now()) {
+		t.Fatalf("tryServeStale=false, want true")
+	}
+
+	out := buf.String()
+	if strings.Contains(out, "stale_serve") {
+		t.Errorf("LogStaleServes=false but \"stale_serve\" emitted:\n%s", out)
+	}
+	if !strings.Contains(out, "hit_stale") {
+		t.Errorf("per-request outcome line missing \"hit_stale\":\n%s", out)
+	}
+}
+
+// safeWriter serializes writes to a strings.Builder. slog.NewTextHandler
+// can write from multiple goroutines (handler.logRequest is called in
+// a fresh goroutine for touchAsync), and a bare strings.Builder isn't
+// safe under that.
+type safeWriter struct {
+	mu sync.Mutex
+	w  *strings.Builder
+}
+
+func (s *safeWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }

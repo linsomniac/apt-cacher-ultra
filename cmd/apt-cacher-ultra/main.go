@@ -205,6 +205,7 @@ func serveListeners(
 		HostLimiter: hostLimiter,
 		Logger:      logger,
 		Freshness:   freshChecker,
+		Serve:       cfg.Serve,
 	})
 	if err != nil {
 		return fmt.Errorf("build handler: %w", err)
