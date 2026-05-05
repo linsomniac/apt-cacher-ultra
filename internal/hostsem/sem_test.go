@@ -89,6 +89,51 @@ func TestSem_RefcountReleasesSlot(t *testing.T) {
 	}
 }
 
+// TestSem_DoubleReleaseIsNoop proves the release closure is safe to
+// invoke more than once. Without sync.Once guarding, a second call
+// would block indefinitely on the channel receive (the token was
+// already returned by the first call and no one will put another in).
+// Acquire's contract is "exactly once," but a defensive no-op on
+// double-call prevents an accidental bug from deadlocking.
+func TestSem_DoubleReleaseIsNoop(t *testing.T) {
+	s := New(2)
+	rel, err := s.Acquire(context.Background(), "h")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	// First release: returns the token, drops the refcount.
+	rel()
+
+	// Second release must NOT block. Run with a deadline so a
+	// regression manifests as a deadline rather than an indefinite
+	// hang of the test process.
+	done := make(chan struct{})
+	go func() {
+		rel()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("second release blocked; sync.Once guard missing?")
+	}
+
+	// Slot must still be cleaned up — the second release does not
+	// fire dropRef, so the count should remain whatever the first
+	// release left it (zero).
+	if got := s.HostCount(); got != 0 {
+		t.Errorf("HostCount after double-release = %d, want 0", got)
+	}
+
+	// Acquire must still work after a double-release.
+	rel2, err := s.Acquire(context.Background(), "h")
+	if err != nil {
+		t.Fatalf("post-double-release acquire: %v", err)
+	}
+	rel2()
+}
+
 // TestSem_RefcountSurvivesCtxCancel proves a ctx-cancelled Acquire
 // (which never took a channel token) still drops its refcount.
 func TestSem_RefcountSurvivesCtxCancel(t *testing.T) {

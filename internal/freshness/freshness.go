@@ -68,11 +68,14 @@ type Config struct {
 	// HostLimiter bounds concurrent upstream conditional GETs to a
 	// single canonical host. SPEC §9.3. Production wires this to the
 	// same *hostsem.Sem the handler uses for cache-miss fetches so
-	// the per-host budget is honored across both paths. Optional —
-	// when nil, freshness checks have no per-host bound (acceptable
-	// in tests; risky in production because each 200 response is
-	// read into memory up to MaxInReleaseBytes, so unbounded
-	// concurrency is a memory-exhaustion path).
+	// the per-host budget is honored across both paths.
+	//
+	// Required: New rejects a nil HostLimiter. The previous
+	// "optional" treatment let a caller silently bypass the
+	// security invariant — each 200 response is read into memory
+	// up to MaxInReleaseBytes, so unbounded concurrency is a
+	// memory-exhaustion path. Tests that don't care about the
+	// limiter pass hostsem.New(<some-large-number>).
 	HostLimiter *hostsem.Sem
 
 	// MaxInReleaseBytes caps the body read on a 200 response. Defaults
@@ -120,6 +123,9 @@ func New(cfg Config) (*Checker, error) {
 	}
 	if cfg.Fetcher == nil {
 		return nil, errors.New("freshness: nil Fetcher")
+	}
+	if cfg.HostLimiter == nil {
+		return nil, errors.New("freshness: nil HostLimiter")
 	}
 	if cfg.Cooldown < 0 {
 		return nil, fmt.Errorf("freshness: cooldown must not be negative, got %v", cfg.Cooldown)
@@ -269,18 +275,16 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 	// an adversarial allowlisted upstream. Sharing the limiter with
 	// the handler's miss path means cache-miss fetches and
 	// freshness checks contend for the same per-host budget.
-	if c.hostSem != nil {
-		release, err := c.hostSem.Acquire(ctx, host)
-		if err != nil {
-			c.logger.Debug("freshness: host limiter acquire aborted",
-				"err", err,
-				"canonical_host", host,
-				"suite_path", suitePath,
-			)
-			return
-		}
-		defer release()
+	release, err := c.hostSem.Acquire(ctx, host)
+	if err != nil {
+		c.logger.Debug("freshness: host limiter acquire aborted",
+			"err", err,
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+		return
 	}
+	defer release()
 
 	res, err := c.fetcher.Conditional(ctx, target, etag, lastmod, c.maxBody)
 	if err != nil {

@@ -46,9 +46,9 @@ type Config struct {
 	Logger *slog.Logger
 
 	// HostLimiter bounds concurrent upstream connections to a single
-	// canonical host. SPEC §9.3. Required; the handler panics on a
-	// nil value at New-time. Sharing one limiter with the freshness
-	// checker keeps both code paths under the same per-host budget.
+	// canonical host. SPEC §9.3. Required; New returns an error on a
+	// nil value. Sharing one limiter with the freshness checker
+	// keeps both code paths under the same per-host budget.
 	HostLimiter *hostsem.Sem
 
 	// Freshness is the SPEC §7 checker. Optional: when nil, T1

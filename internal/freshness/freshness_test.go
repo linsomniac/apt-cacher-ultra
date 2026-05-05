@@ -154,10 +154,11 @@ func TestCheck_NoCachedInRelease_Skips(t *testing.T) {
 	defer srv.Close()
 
 	c, err := New(Config{
-		Cache:    fc,
-		Fetcher:  newTestFetcher(t),
-		Cooldown: 0,
-		Logger:   discardLogger(),
+		Cache:       fc,
+		Fetcher:     newTestFetcher(t),
+		HostLimiter: hostsem.New(8),
+		Cooldown:    0,
+		Logger:      discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -208,11 +209,12 @@ func TestCheck_NotModified_BumpsTimestamps(t *testing.T) {
 
 	now := time.Unix(2000, 0)
 	c, err := New(Config{
-		Cache:    fc,
-		Fetcher:  newTestFetcher(t),
-		Cooldown: 60 * time.Second,
-		Logger:   discardLogger(),
-		now:      func() time.Time { return now },
+		Cache:       fc,
+		Fetcher:     newTestFetcher(t),
+		HostLimiter: hostsem.New(8),
+		Cooldown:    60 * time.Second,
+		Logger:      discardLogger(),
+		now:         func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -254,11 +256,12 @@ func TestCheck_Cooldown_Skips(t *testing.T) {
 
 	now := time.Unix(2000, 0) // 10s later, well inside 60s cooldown
 	c, err := New(Config{
-		Cache:    fc,
-		Fetcher:  newTestFetcher(t),
-		Cooldown: 60 * time.Second,
-		Logger:   discardLogger(),
-		now:      func() time.Time { return now },
+		Cache:       fc,
+		Fetcher:     newTestFetcher(t),
+		HostLimiter: hostsem.New(8),
+		Cooldown:    60 * time.Second,
+		Logger:      discardLogger(),
+		now:         func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -293,11 +296,12 @@ func TestCheck_OK_ContentMatches_RefreshesValidators(t *testing.T) {
 
 	now := time.Unix(3000, 0)
 	c, _ := New(Config{
-		Cache:    fc,
-		Fetcher:  newTestFetcher(t),
-		Cooldown: 0,
-		Logger:   discardLogger(),
-		now:      func() time.Time { return now },
+		Cache:       fc,
+		Fetcher:     newTestFetcher(t),
+		HostLimiter: hostsem.New(8),
+		Cooldown:    0,
+		Logger:      discardLogger(),
+		now:         func() time.Time { return now },
 	})
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
 
@@ -332,7 +336,7 @@ func TestCheck_OK_ContentChanged_RecordsObservation(t *testing.T) {
 
 	now := time.Unix(4000, 0)
 	c, _ := New(Config{
-		Cache: fc, Fetcher: newTestFetcher(t),
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
 		Cooldown: 0, Logger: discardLogger(),
 		now: func() time.Time { return now },
 	})
@@ -377,7 +381,7 @@ func TestCheck_ChangeSeenClearedOn304(t *testing.T) {
 	})
 
 	c, _ := New(Config{
-		Cache: fc, Fetcher: newTestFetcher(t),
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
 		Logger: discardLogger(),
 	})
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
@@ -414,7 +418,7 @@ func TestCheck_ChangeSeenClearedOn200Match(t *testing.T) {
 	})
 
 	c, _ := New(Config{
-		Cache: fc, Fetcher: newTestFetcher(t),
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
 		Logger: discardLogger(),
 	})
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
@@ -445,7 +449,7 @@ func TestCheck_UpstreamError_BumpsCheckOnly(t *testing.T) {
 
 	now := time.Unix(5000, 0)
 	c, _ := New(Config{
-		Cache: fc, Fetcher: newTestFetcher(t),
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
 		Cooldown: 0, Logger: discardLogger(),
 		now: func() time.Time { return now },
 	})
@@ -482,7 +486,7 @@ func TestCheck_TryLock_SecondCallSkips(t *testing.T) {
 	})
 
 	c, _ := New(Config{
-		Cache: fc, Fetcher: newTestFetcher(t),
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
 		Cooldown: 0, Logger: discardLogger(),
 	})
 
@@ -566,7 +570,7 @@ func TestTick_FilersByLastSuccessAt(t *testing.T) {
 	})
 
 	c, _ := New(Config{
-		Cache: fc, Fetcher: newTestFetcher(t),
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
 		Cooldown: 0,
 		Refresh:  15 * time.Minute,
 		Logger:   discardLogger(),
@@ -582,7 +586,7 @@ func TestTick_FilersByLastSuccessAt(t *testing.T) {
 func TestRun_StopsOnContextCancel(t *testing.T) {
 	fc := newFakeCache()
 	c, _ := New(Config{
-		Cache: fc, Fetcher: newTestFetcher(t),
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
 		Refresh: 100 * time.Millisecond, // forces minFastTickInterval
 		Logger:  discardLogger(),
 	})
@@ -693,7 +697,7 @@ func TestCheck_HostLimiterBoundsConcurrency(t *testing.T) {
 func TestRun_RefreshZeroReturnsImmediately(t *testing.T) {
 	fc := newFakeCache()
 	c, _ := New(Config{
-		Cache: fc, Fetcher: newTestFetcher(t),
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
 		Refresh: 0,
 		Logger:  discardLogger(),
 	})
@@ -718,11 +722,16 @@ func TestNew_RejectsNilDeps(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "Fetcher") {
 		t.Errorf("expected nil Fetcher error, got %v", err)
 	}
-	_, err = New(Config{Cache: newFakeCache(), Fetcher: newTestFetcher(t), Cooldown: -1})
+	_, err = New(Config{Cache: newFakeCache(), Fetcher: newTestFetcher(t)})
+	if err == nil || !strings.Contains(err.Error(), "HostLimiter") {
+		t.Errorf("expected nil HostLimiter error, got %v", err)
+	}
+	limiter := hostsem.New(8)
+	_, err = New(Config{Cache: newFakeCache(), Fetcher: newTestFetcher(t), HostLimiter: limiter, Cooldown: -1})
 	if err == nil {
 		t.Errorf("expected negative cooldown error")
 	}
-	_, err = New(Config{Cache: newFakeCache(), Fetcher: newTestFetcher(t), Refresh: -1})
+	_, err = New(Config{Cache: newFakeCache(), Fetcher: newTestFetcher(t), HostLimiter: limiter, Refresh: -1})
 	if err == nil {
 		t.Errorf("expected negative refresh error")
 	}
@@ -733,7 +742,7 @@ func TestCheck_DBReadFailure_LogsAndReturns(t *testing.T) {
 	fc.getErr = fmt.Errorf("simulated DB read failure")
 
 	c, _ := New(Config{
-		Cache: fc, Fetcher: newTestFetcher(t),
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
 		Logger: discardLogger(),
 	})
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
@@ -758,7 +767,7 @@ func TestCheck_4xxFromUpstream_BumpsCheckOnly(t *testing.T) {
 
 	now := time.Unix(7777, 0)
 	c, _ := New(Config{
-		Cache: fc, Fetcher: newTestFetcher(t),
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
 		Logger: discardLogger(),
 		now:    func() time.Time { return now },
 	})

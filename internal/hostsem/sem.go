@@ -58,8 +58,11 @@ func New(limit int) *Sem {
 
 // Acquire blocks until a slot is free for host or ctx is cancelled. The
 // returned release closure must be called exactly once when the work is
-// done — including on error. A no-op release is returned on ctx
-// cancellation so callers can defer it unconditionally.
+// done — including on error. The closure is wrapped in sync.Once so an
+// accidental second call is a no-op rather than a deadlock (a second
+// `<-slot.ch` would block forever waiting for a token that wasn't
+// returned). A no-op release is returned on ctx cancellation so callers
+// can defer it unconditionally.
 func (s *Sem) Acquire(ctx context.Context, host string) (release func(), err error) {
 	s.mu.Lock()
 	slot, ok := s.slots[host]
@@ -82,13 +85,18 @@ func (s *Sem) Acquire(ctx context.Context, host string) (release func(), err err
 }
 
 // releaserFor returns the closure that drops one refcount and, if
-// holdsToken is true, returns the token to the channel.
+// holdsToken is true, returns the token to the channel. The body is
+// guarded by sync.Once so a double-call is a no-op rather than a
+// deadlock; see the Acquire doc comment for the rationale.
 func (s *Sem) releaserFor(host string, slot *hostSlot, holdsToken bool) func() {
+	var once sync.Once
 	return func() {
-		if holdsToken {
-			<-slot.ch
-		}
-		s.dropRef(host, slot)
+		once.Do(func() {
+			if holdsToken {
+				<-slot.ch
+			}
+			s.dropRef(host, slot)
+		})
 	}
 }
 
