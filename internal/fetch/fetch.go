@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -294,6 +295,16 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (*Fetc
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
+		// SPEC §10: emit one structured log per retry attempt so an
+		// operator watching upstream flap can quantify it. The default
+		// slog.Logger is used because main configures it before the
+		// fetch client runs.
+		slog.Info("fetch retry",
+			"attempt", attempts+1,
+			"max_retries", c.maxRetries,
+			"canonical_host", target.CanonicalHost,
+			"err", err,
+		)
 		lastErr = err
 		attempts++
 	}

@@ -304,6 +304,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 			"err", err,
 			"canonical_host", host,
 			"suite_path", suitePath,
+			"result", "failed",
 		)
 		return
 	}
@@ -311,6 +312,10 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 	cur.LastCheckAt = &nowUnix
 	cur.LastSuccessAt = &nowUnix
 
+	// SPEC §10: every freshness attempt emits a structured log line. The
+	// `result` enum is what operators pivot on — success-with-no-change
+	// (the steady state) vs. success-with-change (the interesting one).
+	var result string
 	switch res.Status {
 	case 304:
 		// Validators by definition unchanged. If a previous check had
@@ -320,6 +325,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 		// some other path). Leaving it set would permanently flag
 		// "upstream has newer" even after recovery.
 		cur.InReleaseChangeSeenAt = nil
+		result = "not_modified"
 	case 200:
 		sum := sha256.Sum256(res.Body)
 		newHash := hex.EncodeToString(sum[:])
@@ -338,6 +344,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 			}
 			// Recovery: see the 304 branch comment.
 			cur.InReleaseChangeSeenAt = nil
+			result = "unchanged"
 		} else {
 			// Upstream has a new InRelease. Phase 1 does NOT adopt.
 			// Record observation; cache keeps serving the consistent
@@ -349,6 +356,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 				"cached_hash", *urlRow.BlobHash,
 				"upstream_hash", newHash,
 			)
+			result = "changed"
 		}
 	default:
 		// fetch.Conditional should only ever return 200 or 304 in the
@@ -375,6 +383,13 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 			"suite_path", suitePath,
 		)
 	}
+
+	c.logger.Info("freshness_check",
+		"canonical_host", host,
+		"suite_path", suitePath,
+		"result", result,
+		"upstream_status", res.Status,
+	)
 }
 
 // suiteKey is the in-memory lock map key. The pipe separator matches the

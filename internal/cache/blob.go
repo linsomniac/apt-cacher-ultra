@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -187,12 +188,17 @@ func (w *BlobWriter) Finalize(expectedSize int64) (string, error) {
 	// descriptors stay valid.
 	if _, err := os.Stat(dstPath); err == nil {
 		_ = os.Remove(w.tmpPath)
+		// SPEC §10: blob write event still emitted on dedup path so log
+		// consumers see one line per successful Finalize regardless of
+		// whether bytes actually landed in pool/.
+		slog.Debug("blob written", "hash", hashHex, "size_bytes", w.written, "deduped", true)
 		return hashHex, nil
 	}
 	if err := os.Rename(w.tmpPath, dstPath); err != nil {
 		_ = os.Remove(w.tmpPath)
 		return "", fmt.Errorf("cache: rename into pool: %w", err)
 	}
+	slog.Debug("blob written", "hash", hashHex, "size_bytes", w.written, "deduped", false)
 	return hashHex, nil
 }
 

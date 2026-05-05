@@ -138,11 +138,28 @@ func serveListeners(
 		}
 	}()
 
+	// SPEC §10: startup config dump. Capture every operationally-
+	// relevant tunable so a single boot log line tells the operator what
+	// policy they're running under (timeouts, concurrency caps, allowlist,
+	// freshness cadence). Secrets do not appear in cfg, so the dump is
+	// safe to emit at Info.
 	logger.Info("apt-cacher-ultra starting",
 		"version", Version,
 		"listen", plainLn.Addr().String(),
 		"listen_tls", tlsAddrString(tlsLn),
 		"cache_dir", cfg.Cache.Dir,
+		"upstream_connect_timeout", cfg.Upstream.ConnectTimeout.Duration,
+		"upstream_total_timeout", cfg.Upstream.TotalTimeout.Duration,
+		"upstream_idle_read_timeout", cfg.Upstream.IdleReadTimeout.Duration,
+		"upstream_max_retries", cfg.Upstream.MaxRetries,
+		"upstream_max_concurrent_per_host", cfg.Upstream.MaxConcurrentPerHost,
+		"upstream_allowed_host_regex", cfg.Upstream.AllowedHostRegex,
+		"upstream_deny_target_ranges", cfg.Upstream.DenyTargetRanges,
+		"freshness_cooldown", cfg.Freshness.Cooldown.Duration,
+		"freshness_periodic_refresh", cfg.Freshness.PeriodicRefresh.Duration,
+		"serve_stale_when_upstream_down", cfg.Serve.ServeStaleWhenUpstreamDown,
+		"log_format", cfg.Log.Format,
+		"log_level", cfg.Log.Level,
 	)
 
 	c, err := cache.Open(ctx, cfg.Cache.Dir)

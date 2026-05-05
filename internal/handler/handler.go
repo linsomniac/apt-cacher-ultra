@@ -164,20 +164,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		h.logRequest(r, "", "", "method_not_allowed", http.StatusMethodNotAllowed, 0, start)
+		h.logRequest(r, "", "", "method_not_allowed", http.StatusMethodNotAllowed, 0, 0, start)
 		return
 	}
 
 	req, err := h.parser.Parse(r.RequestURI, r.Host)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		h.logRequest(r, "", "", "bad_request", http.StatusBadRequest, 0, start)
+		h.logRequest(r, "", "", "bad_request", http.StatusBadRequest, 0, 0, start)
 		return
 	}
 
 	// Fast path: SPEC §6.1.
 	if served, status, body := h.tryCacheHit(w, r, req); served {
-		h.logRequest(r, req.CanonicalHost, req.Path, "hit", status, body, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "hit", status, body, 0, start)
 		return
 	}
 
@@ -189,7 +189,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// the fetch path's allowlist fires.
 	if !h.fetch.HostAllowed(req.CanonicalHost) {
 		http.Error(w, "forbidden", http.StatusForbidden)
-		h.logRequest(r, req.CanonicalHost, req.Path, "forbidden", http.StatusForbidden, 0, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "forbidden", http.StatusForbidden, 0, 0, start)
 		return
 	}
 
@@ -306,7 +306,7 @@ func (h *Handler) touchAsync(req *proxy.Request) {
 func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) {
 	key := req.CanonicalScheme + "|" + req.CanonicalHost + "|" + req.Path
 
-	res, shared := h.sf.Do(key, func() sfResult {
+	res, shared, waiters := h.sf.Do(key, func() sfResult {
 		// Use the handler's lifecycle ctx, not the request ctx. Two
 		// goals: (1) a leader who disconnects must not kill the fetch
 		// for waiters that are still connected, and (2) on graceful
@@ -318,6 +318,17 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 		return h.runFetch(h.lifecycleCtx, req)
 	})
 
+	// SPEC §10: leader emits a structured log line whenever waiters
+	// joined the call (i.e. coalescing actually occurred). A leader
+	// running solo gets no log line — the per-request line is enough.
+	if !shared && waiters > 0 {
+		h.logger.Info("singleflight coalesced",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"waiters", waiters,
+		)
+	}
+
 	if res.err != nil {
 		h.respondError(w, r, req, res, start)
 		return
@@ -328,7 +339,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	f, err := os.Open(path)
 	if err != nil {
 		http.Error(w, "cache read failed", http.StatusInternalServerError)
-		h.logRequest(r, req.CanonicalHost, req.Path, "error", http.StatusInternalServerError, 0, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "error", http.StatusInternalServerError, 0, res.status, start)
 		return
 	}
 	defer f.Close()
@@ -336,7 +347,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	st, err := f.Stat()
 	if err != nil {
 		http.Error(w, "cache stat failed", http.StatusInternalServerError)
-		h.logRequest(r, req.CanonicalHost, req.Path, "error", http.StatusInternalServerError, 0, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "error", http.StatusInternalServerError, 0, res.status, start)
 		return
 	}
 
@@ -354,7 +365,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 
 	cw := &countingWriter{ResponseWriter: w}
 	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
-	h.logRequest(r, req.CanonicalHost, req.Path, logOutcome, cw.statusCode(), cw.bytes, start)
+	h.logRequest(r, req.CanonicalHost, req.Path, logOutcome, cw.statusCode(), cw.bytes, res.status, start)
 }
 
 // runFetch is the body of the singleflight call. Acquires the per-host
@@ -492,7 +503,7 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 	switch {
 	case errors.Is(err, fetch.ErrHostNotAllowed), errors.Is(err, fetch.ErrTargetDenied):
 		http.Error(w, "forbidden", http.StatusForbidden)
-		h.logRequest(r, req.CanonicalHost, req.Path, "forbidden", http.StatusForbidden, 0, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "forbidden", http.StatusForbidden, 0, res.status, start)
 		return
 	case errors.Is(err, fetch.ErrUpstreamStatus):
 		// SPEC §6.4 / failure-mode catalog: only upstream 4xx is a
@@ -507,7 +518,7 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		// this cache's purposes).
 		if res.status >= 400 && res.status < 500 {
 			http.Error(w, fmt.Sprintf("upstream status %d", res.status), res.status)
-			h.logRequest(r, req.CanonicalHost, req.Path, "upstream_status", res.status, 0, start)
+			h.logRequest(r, req.CanonicalHost, req.Path, "upstream_status", res.status, 0, res.status, start)
 			return
 		}
 		h.logger.Warn("non-4xx upstream status mapped to 502",
@@ -515,12 +526,12 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 			"canonical_host", req.CanonicalHost,
 			"path", req.Path,
 		)
-		h.respondUpstreamUnreachable(w, r, req, start)
+		h.respondUpstreamUnreachable(w, r, req, res.status, start)
 		return
 	case errors.Is(err, fetch.ErrUpstreamUnavailable),
 		errors.Is(err, fetch.ErrUpstreamServerError),
 		errors.Is(err, context.DeadlineExceeded):
-		h.respondUpstreamUnreachable(w, r, req, start)
+		h.respondUpstreamUnreachable(w, r, req, res.status, start)
 		return
 	case errors.Is(err, fetch.ErrCacheWriteFailed):
 		// SPEC §11 row 14: a cache-side write failure (disk full, I/O
@@ -537,7 +548,7 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		)
 		w.Header().Set("Retry-After", retryAfterForRequest(req))
 		http.Error(w, "bad gateway", http.StatusBadGateway)
-		h.logRequest(r, req.CanonicalHost, req.Path, "cache_write_failed", http.StatusBadGateway, 0, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "cache_write_failed", http.StatusBadGateway, 0, res.status, start)
 		return
 	case errors.Is(err, fetch.ErrInvalidURL),
 		errors.Is(err, fetch.ErrRedirectBlocked):
@@ -547,14 +558,14 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		// operator should fix) — fail loud instead.
 		w.Header().Set("Retry-After", retryAfterForRequest(req))
 		http.Error(w, "bad gateway", http.StatusBadGateway)
-		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, res.status, start)
 		return
 	case errors.Is(err, context.Canceled):
 		// Client almost certainly disconnected. 499 is non-standard;
 		// 503 with Retry-After is the closest sensible response.
 		w.Header().Set("Retry-After", "5")
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-		h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, res.status, start)
 		return
 	default:
 		w.Header().Set("Retry-After", retryAfterForRequest(req))
@@ -564,7 +575,7 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 			"canonical_host", req.CanonicalHost,
 			"path", req.Path,
 		)
-		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, res.status, start)
 		return
 	}
 }
@@ -575,13 +586,13 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 // SPEC-mandated Retry-After (30s for metadata, 60s for blobs — apt
 // retries metadata aggressively, so a longer cool-off on blobs spreads
 // the load when upstream comes back).
-func (h *Handler) respondUpstreamUnreachable(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) {
-	if h.tryServeStale(w, r, req, start) {
+func (h *Handler) respondUpstreamUnreachable(w http.ResponseWriter, r *http.Request, req *proxy.Request, upstreamStatus int, start time.Time) {
+	if h.tryServeStale(w, r, req, upstreamStatus, start) {
 		return
 	}
 	w.Header().Set("Retry-After", retryAfterForRequest(req))
 	http.Error(w, "bad gateway", http.StatusBadGateway)
-	h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, start)
+	h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, upstreamStatus, start)
 }
 
 // tryServeStale serves the cached blob for req with X-Cache: HIT-STALE
@@ -603,7 +614,7 @@ func (h *Handler) respondUpstreamUnreachable(w http.ResponseWriter, r *http.Requ
 // fetch under a different singleflight key, or an operator-restored
 // blob). In Phase 2 this method becomes the centerpiece of "served from
 // frozen consistent set during freshness divergence."
-func (h *Handler) tryServeStale(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) bool {
+func (h *Handler) tryServeStale(w http.ResponseWriter, r *http.Request, req *proxy.Request, upstreamStatus int, start time.Time) bool {
 	if !req.IsMetadata {
 		return false
 	}
@@ -648,7 +659,7 @@ func (h *Handler) tryServeStale(w http.ResponseWriter, r *http.Request, req *pro
 			"blob_hash", hash,
 		)
 	}
-	h.logRequest(r, req.CanonicalHost, req.Path, "hit_stale", cw.statusCode(), cw.bytes, start)
+	h.logRequest(r, req.CanonicalHost, req.Path, "hit_stale", cw.statusCode(), cw.bytes, upstreamStatus, start)
 	return true
 }
 
@@ -672,8 +683,14 @@ func retryAfterForRequest(req *proxy.Request) string {
 // parser rejects userinfo before it reaches the success path, but the
 // 400/405 log calls fire before the parser has run, so we route the
 // URL through urlForLog which strips userinfo unconditionally.
-func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, status int, bytesWritten int64, start time.Time) {
-	h.logger.Info("request",
+//
+// upstreamStatus is the upstream HTTP code observed during the fetch (0
+// when no fetch was attempted or no response was received before failure).
+// SPEC §10 says it is logged "when a fetch was attempted" — we emit it
+// only when non-zero so log consumers can use field-presence as the
+// fetch-attempted signal.
+func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, status int, bytesWritten int64, upstreamStatus int, start time.Time) {
+	attrs := []any{
 		"method", r.Method,
 		"url", urlForLog(r),
 		"canonical_host", canonHost,
@@ -683,7 +700,11 @@ func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, s
 		"bytes_sent", bytesWritten,
 		"duration_ms", time.Since(start).Milliseconds(),
 		"client_addr", r.RemoteAddr,
-	)
+	}
+	if upstreamStatus > 0 {
+		attrs = append(attrs, "upstream_status", upstreamStatus)
+	}
+	h.logger.Info("request", attrs...)
 }
 
 // urlForLog returns a sanitized representation of the request URL
@@ -736,4 +757,3 @@ func (c *countingWriter) statusCode() int {
 	}
 	return c.status
 }
-

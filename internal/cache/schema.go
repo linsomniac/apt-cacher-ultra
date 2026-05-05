@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 )
 
 // CurrentSchemaVersion is the schema this build of the binary creates and
@@ -76,6 +77,11 @@ INSERT INTO schema_version VALUES (1);
 
 // migrate brings the database forward to CurrentSchemaVersion. It is safe
 // to call on a fresh, partially-migrated, or already-current database.
+//
+// SPEC §10: emits a structured log line per applied migration so an
+// operator watching the journal during a deploy sees exactly what
+// happened on first contact with an old DB. The default slog.Logger is
+// used because main configures it before cache.Open runs.
 func migrate(ctx context.Context, db *sql.DB) error {
 	current, err := readSchemaVersion(ctx, db)
 	if err != nil {
@@ -85,10 +91,15 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("database schema version %d is newer than this binary supports (%d); refusing to downgrade",
 			current, CurrentSchemaVersion)
 	}
+	if current == CurrentSchemaVersion {
+		slog.Debug("schema current", "version", current)
+		return nil
+	}
 	for v := current; v < CurrentSchemaVersion; v++ {
 		if err := applyMigration(ctx, db, v); err != nil {
 			return fmt.Errorf("migration %d→%d: %w", v, v+1, err)
 		}
+		slog.Info("schema migrated", "from", v, "to", v+1)
 	}
 	return nil
 }

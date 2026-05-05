@@ -17,9 +17,14 @@ type sfResult struct {
 
 // sfCall is a single in-flight singleflight call. The leader populates
 // res and signals wg; waiters block on wg.Wait then read res.
+//
+// waiters counts the number of joiners (shared==true returns) — read by
+// the leader after fn returns to emit the SPEC §10 coalescing log line
+// without a second mutex acquisition.
 type sfCall struct {
-	wg  sync.WaitGroup
-	res sfResult
+	wg      sync.WaitGroup
+	res     sfResult
+	waiters int
 }
 
 // sfGroup coalesces concurrent calls for the same key into one execution
@@ -50,8 +55,8 @@ var sfTestHookAfterDone func()
 // Do runs fn under key. If another call is already in flight for the
 // same key, it blocks for the in-flight result and returns it with
 // shared=true. Otherwise it runs fn, returns its result with
-// shared=false, and removes the call from the in-flight map so the
-// next caller can lead.
+// shared=false (and waiters set to the number of joiners), and removes
+// the call from the in-flight map so the next caller can lead.
 //
 // AIDEV-NOTE: ordering matters. We must signal wg.Done before deleting
 // the map entry, not after. The previous order (delete first, Done
@@ -60,12 +65,13 @@ var sfTestHookAfterDone func()
 // coalescing guarantee. With Done first, that same caller still finds
 // the (just-finished) call in the map, joins it via wg.Wait (which
 // returns immediately), and reads the same result.
-func (g *sfGroup) Do(key string, fn func() sfResult) (res sfResult, shared bool) {
+func (g *sfGroup) Do(key string, fn func() sfResult) (res sfResult, shared bool, waiters int) {
 	g.mu.Lock()
 	if c, ok := g.calls[key]; ok {
+		c.waiters++
 		g.mu.Unlock()
 		c.wg.Wait()
-		return c.res, true
+		return c.res, true, 0
 	}
 	c := &sfCall{}
 	c.wg.Add(1)
@@ -80,6 +86,7 @@ func (g *sfGroup) Do(key string, fn func() sfResult) (res sfResult, shared bool)
 
 	g.mu.Lock()
 	delete(g.calls, key)
+	leaderWaiters := c.waiters
 	g.mu.Unlock()
-	return c.res, false
+	return c.res, false, leaderWaiters
 }

@@ -498,7 +498,7 @@ func TestSFGroup_CoalescesAndCleansUp(t *testing.T) {
 
 	leader := make(chan sfResult, 1)
 	go func() {
-		res, _ := g.Do("k", func() sfResult {
+		res, _, _ := g.Do("k", func() sfResult {
 			calls.Add(1)
 			<-gate
 			return sfResult{blobHash: "hash", size: 10}
@@ -516,7 +516,7 @@ func TestSFGroup_CoalescesAndCleansUp(t *testing.T) {
 		shared bool
 	}, 1)
 	go func() {
-		res, shared := g.Do("k", func() sfResult {
+		res, shared, _ := g.Do("k", func() sfResult {
 			calls.Add(1)
 			return sfResult{}
 		})
@@ -549,7 +549,7 @@ func TestSFGroup_CoalescesAndCleansUp(t *testing.T) {
 
 	// After the call drains, the next caller for "k" leads (calls map
 	// emptied).
-	res, shared := g.Do("k", func() sfResult { return sfResult{blobHash: "next"} })
+	res, shared, _ := g.Do("k", func() sfResult { return sfResult{blobHash: "next"} })
 	if shared {
 		t.Errorf("shared=true after first call drained, want false")
 	}
@@ -579,7 +579,7 @@ func TestSFGroup_ArrivalDuringCleanupWindow(t *testing.T) {
 
 	leaderResult := make(chan sfResult, 1)
 	go func() {
-		res, _ := g.Do("k", func() sfResult {
+		res, _, _ := g.Do("k", func() sfResult {
 			fnCalls.Add(1)
 			return sfResult{blobHash: "leader"}
 		})
@@ -598,7 +598,7 @@ func TestSFGroup_ArrivalDuringCleanupWindow(t *testing.T) {
 	}
 	waiterResult := make(chan waiterRet, 1)
 	go func() {
-		res, shared := g.Do("k", func() sfResult {
+		res, shared, _ := g.Do("k", func() sfResult {
 			fnCalls.Add(1) // must NOT happen with the fix in place
 			return sfResult{blobHash: "duplicate"}
 		})
@@ -1274,7 +1274,7 @@ func TestTryServeStale_ServesCachedRowAndBlob(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
-	served := h.tryServeStale(rec, r, req, time.Now())
+	served := h.tryServeStale(rec, r, req, 0, time.Now())
 	if !served {
 		t.Fatalf("tryServeStale=false, want true (row+blob present)")
 	}
@@ -1311,7 +1311,7 @@ func TestTryServeStale_DisabledByConfig(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
-	if served := h.tryServeStale(rec, r, req, time.Now()); served {
+	if served := h.tryServeStale(rec, r, req, 0, time.Now()); served {
 		t.Errorf("tryServeStale=true with policy off, want false")
 	}
 }
@@ -1337,7 +1337,7 @@ func TestTryServeStale_NotMetadata(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	r := proxyReq("GET", srv.URL, "/ubuntu/pool/main/p/pkg/file_1.0_amd64.deb")
-	if served := h.tryServeStale(rec, r, req, time.Now()); served {
+	if served := h.tryServeStale(rec, r, req, 0, time.Now()); served {
 		t.Errorf("tryServeStale=true on .deb, want false (blobs never stale-serve)")
 	}
 }
@@ -1355,7 +1355,7 @@ func TestTryServeStale_NoRow(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	r := proxyReq("GET", "http://127.0.0.1", "/ubuntu/dists/noble/InRelease")
-	if served := h.tryServeStale(rec, r, req, time.Now()); served {
+	if served := h.tryServeStale(rec, r, req, 0, time.Now()); served {
 		t.Errorf("tryServeStale=true with empty cache, want false")
 	}
 }
@@ -1391,7 +1391,7 @@ func TestTryServeStale_BlobMissing(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
-	if served := h.tryServeStale(rec, r, req, time.Now()); served {
+	if served := h.tryServeStale(rec, r, req, 0, time.Now()); served {
 		t.Errorf("tryServeStale=true with row but missing blob, want false")
 	}
 }
@@ -1421,7 +1421,7 @@ func TestTryServeStale_LogsWhenEnabled(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
-	if !h.tryServeStale(rec, r, req, time.Now()) {
+	if !h.tryServeStale(rec, r, req, 0, time.Now()) {
 		t.Fatalf("tryServeStale=false, want true (positive path)")
 	}
 
@@ -1461,7 +1461,7 @@ func TestTryServeStale_LogsSuppressedByConfig(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	r := proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease")
-	if !h.tryServeStale(rec, r, req, time.Now()) {
+	if !h.tryServeStale(rec, r, req, 0, time.Now()) {
 		t.Fatalf("tryServeStale=false, want true")
 	}
 
@@ -1710,5 +1710,178 @@ func TestRespondError_CacheWriteFailedLogsAndReturns502(t *testing.T) {
 	}
 	if !strings.Contains(out, "outcome=cache_write_failed") {
 		t.Errorf("per-request log outcome must be cache_write_failed:\n%s", out)
+	}
+}
+
+// TestLogRequest_UpstreamStatusFieldShape pins the SPEC §10 contract that
+// upstream_status is logged when (and only when) a fetch was attempted.
+// The field's presence is the operator's filter for "did this request go
+// to upstream"; emitting upstream_status=0 on hits would defeat that.
+func TestLogRequest_UpstreamStatusFieldShape(t *testing.T) {
+	t.Run("hit_omits_upstream_status", func(t *testing.T) {
+		// Drive a true cache HIT: prime once, then expect the second
+		// request to log without upstream_status (no fetch occurred).
+		var hits atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits.Add(1)
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("primed"))
+		}))
+		defer srv.Close()
+
+		var buf strings.Builder
+		logger := slog.New(slog.NewTextHandler(&safeWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		h := newTestHandlerWithServe(t, config.ServeConfig{}, logger)
+		defer h.Close()
+
+		// Prime.
+		rec1 := httptest.NewRecorder()
+		h.ServeHTTP(rec1, proxyReq("GET", srv.URL, "/ubuntu/pool/p/pkg/x.deb"))
+		if rec1.Code != 200 {
+			t.Fatalf("prime status=%d, want 200", rec1.Code)
+		}
+		// Cache hit.
+		buf.Reset()
+		rec2 := httptest.NewRecorder()
+		h.ServeHTTP(rec2, proxyReq("GET", srv.URL, "/ubuntu/pool/p/pkg/x.deb"))
+		if rec2.Code != 200 {
+			t.Fatalf("hit status=%d, want 200", rec2.Code)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "outcome=hit") {
+			t.Fatalf("second request was not a hit:\n%s", out)
+		}
+		if strings.Contains(out, "upstream_status=") {
+			t.Errorf("hit log must NOT carry upstream_status:\n%s", out)
+		}
+	})
+
+	t.Run("miss_emits_upstream_status_200", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("hello"))
+		}))
+		defer srv.Close()
+
+		var buf strings.Builder
+		logger := slog.New(slog.NewTextHandler(&safeWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		h := newTestHandlerWithServe(t, config.ServeConfig{}, logger)
+		defer h.Close()
+
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/ubuntu/pool/p/pkg/y.deb"))
+		if rec.Code != 200 {
+			t.Fatalf("status=%d, want 200", rec.Code)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "outcome=miss") {
+			t.Fatalf("expected outcome=miss:\n%s", out)
+		}
+		if !strings.Contains(out, "upstream_status=200") {
+			t.Errorf("miss log must carry upstream_status=200:\n%s", out)
+		}
+	})
+
+	t.Run("method_not_allowed_omits_upstream_status", func(t *testing.T) {
+		var buf strings.Builder
+		logger := slog.New(slog.NewTextHandler(&safeWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		h := newTestHandlerWithServe(t, config.ServeConfig{}, logger)
+		defer h.Close()
+
+		rec := httptest.NewRecorder()
+		r := proxyReq("POST", "http://127.0.0.1:80", "/ubuntu/anything")
+		h.ServeHTTP(rec, r)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("status=%d, want 405", rec.Code)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "outcome=method_not_allowed") {
+			t.Errorf("expected outcome=method_not_allowed:\n%s", out)
+		}
+		if strings.Contains(out, "upstream_status=") {
+			t.Errorf("pre-fetch rejection must NOT carry upstream_status:\n%s", out)
+		}
+	})
+}
+
+// TestSingleflight_LeaderLogsCoalescing pins SPEC §10's "singleflight
+// coalescing" structured log: when waiters joined the leader's call, the
+// leader emits a `singleflight coalesced` Info line with the waiter
+// count.
+func TestSingleflight_LeaderLogsCoalescing(t *testing.T) {
+	g := newSFGroup()
+
+	gate := make(chan struct{})
+	leaderDone := make(chan sfResult, 1)
+
+	go func() {
+		res, _, _ := g.Do("k", func() sfResult {
+			<-gate
+			return sfResult{blobHash: "h"}
+		})
+		leaderDone <- res
+	}()
+
+	// Three waiters join while the leader holds the gate.
+	const numWaiters = 3
+	waiterDone := make(chan struct{}, numWaiters)
+	// Wait briefly for leader to register.
+	time.Sleep(10 * time.Millisecond)
+	for i := 0; i < numWaiters; i++ {
+		go func() {
+			_, _, _ = g.Do("k", func() sfResult { return sfResult{} })
+			waiterDone <- struct{}{}
+		}()
+	}
+	// Give the waiters a moment to register on the leader's call.
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
+	<-leaderDone
+	for i := 0; i < numWaiters; i++ {
+		<-waiterDone
+	}
+
+	// Re-run via the handler.serveCacheMiss path to verify the log line
+	// fires at the correct call site. We do this by replaying through a
+	// real handler with a captured logger.
+	//
+	// AIDEV-NOTE: this proves the count is plumbed; the assertion below
+	// reads the captured logger output, not the sfGroup directly.
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&safeWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	h := newTestHandlerWithServe(t, config.ServeConfig{}, logger)
+	defer h.Close()
+
+	upstreamGate := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-upstreamGate
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("body"))
+	}))
+	defer srv.Close()
+
+	const N = 4
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/ubuntu/pool/p/pkg/sf.deb"))
+		}()
+	}
+	// Give the requests time to enter the singleflight together. They
+	// should all coalesce because the upstream gate is closed.
+	time.Sleep(80 * time.Millisecond)
+	close(upstreamGate)
+	wg.Wait()
+
+	out := buf.String()
+	if !strings.Contains(out, "msg=\"singleflight coalesced\"") {
+		t.Errorf("expected 'singleflight coalesced' log:\n%s", out)
+	}
+	// At least one waiter should have joined.
+	if !strings.Contains(out, "waiters=") {
+		t.Errorf("expected waiters= field in coalescing log:\n%s", out)
 	}
 }

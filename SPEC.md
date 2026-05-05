@@ -525,15 +525,26 @@ In-progress downloads in `tmp/` are NOT preserved across restarts — they're cl
 
 ## 10. Logging
 
-Phase 1 ships `log/slog` JSON output (config `log.format = "json"`). Per-request log line includes:
+Phase 1 ships `log/slog` JSON output (config `log.format = "json"`, message `request`). Per-request log line includes:
 - `method`, `url`, `canonical_host`, `path`
-- `outcome`: `hit` | `miss` | `hit_stale` | `hit_coalesced` | `502` | `error`
+- `outcome` (one of):
+  - **Cache outcomes:** `hit` | `miss` | `hit_stale` | `hit_coalesced`
+  - **Pre-upstream rejections:** `method_not_allowed` (non-GET) | `bad_request` (unparseable URL) | `forbidden` (allowlist or deny-range hit)
+  - **Upstream outcomes:** `upstream_status` (4xx passed through verbatim) | `bad_gateway` (5xx, timeout, retries exhausted) | `cache_write_failed` (disk write failure mid-fetch)
+  - **Other:** `client_canceled` (client disconnected mid-fetch) | `error` (unexpected internal failure)
+- `status` (HTTP status sent to client)
 - `bytes_sent`
 - `duration_ms`
-- `upstream_status` (when a fetch was attempted)
+- `upstream_status` (when a fetch was attempted; the upstream HTTP code, or `0` if no response was received before failure)
 - `client_addr`
 
-Plus structured logs for: freshness attempts (success, 304, change-detected, failure), singleflight coalescing, retry-on-transient-failure, blob writes, schema migrations, startup config dump.
+Plus structured logs for:
+- **Freshness attempts:** `freshness_check` Info on success (304, no-change 200, change-detected), `freshness check failed` Info on failure. Each carries `canonical_host`, `suite_path`, and `result` ∈ `{not_modified, unchanged, changed, failed}`.
+- **Singleflight coalescing:** `singleflight coalesced` Info from the leader's perspective when waiters joined the call.
+- **Retry-on-transient-failure:** `fetch retry` Info per retry attempt with `attempt`, `err`, `host`.
+- **Blob writes:** `blob written` Debug on successful blob finalize with `hash`, `size_bytes`.
+- **Schema migrations:** `schema migrated` Info per applied migration with `from`, `to`. `schema current` Debug when DB is already at head.
+- **Startup config dump:** `apt-cacher-ultra starting` Info with `version`, `listen`, `listen_tls`, `cache_dir`, `upstream_*` (timeouts, max_retries, max_concurrent_per_host), `freshness_*` (cooldown, periodic_refresh), `allowed_host_regex`, `deny_target_ranges`.
 
 Metrics are deferred to Phase 5.
 
