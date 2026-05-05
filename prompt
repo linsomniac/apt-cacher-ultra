@@ -1,0 +1,60 @@
+I would like to implement a new program like apt-cacher-ng, but with some specific
+features.  In particular, it needs to focus on robustness, the current apt cacher will
+often hang up if there are any network issues, it tends to hang the clients until the
+network fetches finish.  Right now, there is a massive DDoS going against the Ubuntu
+infrastructure and it is largely unreachable, but apt-cacher-ng is basically useless
+in the face of this.  This project focus on ensuring availability as much as possible,
+and performance of operations against the cache, not blocking when the upstream cache
+refreshes or cleanup jobs are running.  I'm thinking that it will need to account for each
+distro that it caches for (26.04, 24.04) and likely architecure, there will be a
+"contents" and "release" file that describe the release and the packages within that
+release.  I imagine that we would need to periodically check those for freshness and see
+if the upstream server has newer versions of those files.  If the files are unchanged,
+nothing needs to be refreshed (including these metadata files).
+
+We are going to have to deal with two situations: cached files and uncached files.  If the
+file is already in the cache, we can just serve it up directly to the client.  If the file
+is uncached, obviously the client will need to wait as data is collected from the upstream
+apt repo.   There may be multiple clients all requesting the same file at the same time,
+so there will need to be some coordination between the clients and the download job in
+that case, though it would be acceptable to just pause the clients until the upstream
+download completes, if that is simpler than streaming the download to the clients as part
+of the file becomes available.  It would be ideal if a download fails for the download to
+be able to pick up where it left off (like using http range requests?).
+
+It would be nice to have it keep track of when packages have last been requested by
+clients, and then proactively downloading those packages when new metadata becomes
+availble, and only flipping the new metadata into place after those "hot" packages have
+been refreshed.  I'm imagining that "hot" will be on the order of a day, maybe it should
+be configurable.
+
+We will be given the name of the upstream server (ppa.launchpadcontent.net,
+apt.corretto.aws, repo.charm.sh, etc), a path, a distro name, and I believe it's called a
+"suite" (like stable, unstable, etc), and a package name.  I may be missing something
+there, you should probably do some research on apt-cacher-ng to see if I'm missing
+anything.  Those are the things that uniquely get us to a set of metadata about the
+packages that make up that particular repo.  Multiple repos may share the same package
+(like in the case of architecture-independent packages).
+
+When a package is no longer referenced by any (including active and "in progress of
+updating") metadata, the package can be removed from disc.  It would be acceptable, for
+simplicity sake, to schedule clean-up jobs when no refresh jobs are running, and block
+refreshes when the clean-up is running, if that makes it simpler.  I'll leave that up to
+you.
+
+It might make sense to have a sqlite database that tracks repos, distros, packages and
+when packages were last downloaded.  It would also be cool to have a HTTP status page that
+can show details about the cache and operations going on against it.
+
+For language, I'd typically lean towards Python, but with the potential threading or
+multi-processing perhaps go would be a better choice?  Do some research and thinking on
+this and present me with options.
+
+Please ask any clarifying questions before beginning work.
+
+Right now, lets focus on a multi-phase project plan for implementing this, with each phase
+identifying a feature set, and then additional phases adding new features.  We should
+focus on software that has good tests to ensure that the software is reliable.
+
+IMPORTANT: this is a core piece of infrastructure and problems with this cause cascading
+problems to all of our machines.
