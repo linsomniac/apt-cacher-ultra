@@ -272,17 +272,13 @@ func serveListeners(
 	}
 	sg.Wait()
 
-	// SPEC §9.5 step 3: cancel any in-flight upstream fetches (which
-	// outlive the request ctx by design — see handler.serveCacheMiss)
-	// and wait for the goroutines to exit. After this returns, no
-	// goroutine is using the cache, so the deferred c.Close() can run
-	// without racing live writes.
-	h.Close()
-
-	// Belt-and-suspenders: force-close any connection that did not
-	// drain (e.g. a cache-hit ServeContent whose client is no longer
-	// reading). After Close(), the Serve goroutines unblock and
-	// wg.Wait below returns.
+	// Force-close any connection that did not drain within the budget
+	// (e.g. a cache-hit ServeContent whose client is no longer reading,
+	// wedging the handler write). This MUST happen before h.Close():
+	// activeWG.Wait inside h.Close cannot finish while a handler is
+	// stuck writing to a wedged client, and lifecycleCancel does not
+	// help — only closing the conn does. Running this first turns a
+	// slow-client shutdown DoS into a sub-second exit.
 	if err := plainSrv.Close(); err != nil {
 		logger.Warn("http force-close returned error", "err", err)
 	}
@@ -291,6 +287,13 @@ func serveListeners(
 			logger.Warn("https force-close returned error", "err", err)
 		}
 	}
+
+	// SPEC §9.5 step 3: cancel any in-flight upstream fetches (which
+	// outlive the request ctx by design — see handler.serveCacheMiss)
+	// and wait for the goroutines to exit. After this returns, no
+	// goroutine is using the cache, so the deferred c.Close() can run
+	// without racing live writes.
+	h.Close()
 
 	wg.Wait()
 	logger.Info("apt-cacher-ultra stopped")

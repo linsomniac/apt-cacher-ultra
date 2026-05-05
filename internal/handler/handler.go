@@ -336,10 +336,13 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 		return sfResult{err: fmt.Errorf("handler: finalize blob: %w", err), status: fres.Status}
 	}
 
-	// Persist blob + url_path. Use a detached ctx with a small budget so
-	// these survive the leader's request lifecycle (e.g. client hung up
-	// after fetch completed).
-	dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	// Persist blob + url_path with a small budget. ctx here is the
+	// handler lifecycle ctx (see serveCacheMiss), so a leader's client
+	// disconnect does not propagate — but a shutdown cancel does, which
+	// is intentional: if the cache is closing we'd rather abandon the
+	// row (leaving an orphan blob in pool/, recoverable on the next
+	// fetch) than ride out the 30s budget past the SPEC §9.5 drain.
+	dbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	if err := h.cache.PutBlob(dbCtx, hash, fres.ContentLength); err != nil {

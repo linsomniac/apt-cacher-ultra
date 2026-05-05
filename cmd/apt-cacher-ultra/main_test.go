@@ -390,7 +390,9 @@ func firstLine(s string) string {
 // (5min in production, 5s in tests via the default fetch.New). With
 // the fix, serveListeners returns within ~1s of cancel.
 func TestServe_GracefulShutdown_KillsHungFetchAfterDrainBudget(t *testing.T) {
-	t.Parallel()
+	// Intentionally NOT t.Parallel: this test mutates the package-level
+	// shutdownTimeout var, which other tests in this package read while
+	// they run their own shutdown path. Running in parallel would race.
 
 	oldTimeout := shutdownTimeout
 	shutdownTimeout = 200 * time.Millisecond
