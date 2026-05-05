@@ -40,6 +40,70 @@ dir = "`+dir+`"
 	if len(cfg.Upstream.DenyTargetRanges) == 0 {
 		t.Errorf("DenyTargetRanges was not populated by Defaults")
 	}
+	// SPEC §5.1 [serve] defaults — bools default to true when [serve]
+	// is absent. Without pre-populating before decode, omitted bool keys
+	// silently land on the zero value (false), and the SPEC §6.4
+	// HIT-STALE behavior would never fire in production unless an
+	// operator explicitly enabled it.
+	if !cfg.Serve.ServeStaleWhenUpstreamDown {
+		t.Errorf("serve_stale_when_upstream_down default not applied")
+	}
+	if !cfg.Serve.LogStaleServes {
+		t.Errorf("log_stale_serves default not applied")
+	}
+}
+
+// TestLoad_ServeFlagsExplicitFalseRespected proves that an explicit
+// `false` in TOML survives the pre-population. The pre-decode seed sets
+// the SPEC default to true, but the decoder must overwrite that for any
+// key actually present in the file — otherwise operators have no way to
+// disable the feature.
+func TestLoad_ServeFlagsExplicitFalseRespected(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[serve]
+serve_stale_when_upstream_down = false
+log_stale_serves               = false
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Serve.ServeStaleWhenUpstreamDown {
+		t.Errorf("explicit serve_stale_when_upstream_down=false was clobbered to true")
+	}
+	if cfg.Serve.LogStaleServes {
+		t.Errorf("explicit log_stale_serves=false was clobbered to true")
+	}
+}
+
+// TestLoad_ServeFlagsExplicitTrueRespected covers the trivial third
+// case: a TOML that explicitly sets the flags to true is unchanged.
+// This guards against a future Load refactor that flipped the seed
+// value to false (which would silently break the omitted-key path
+// covered by TestLoad_Minimal but pass any test that explicitly set
+// true).
+func TestLoad_ServeFlagsExplicitTrueRespected(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[serve]
+serve_stale_when_upstream_down = true
+log_stale_serves               = true
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Serve.ServeStaleWhenUpstreamDown {
+		t.Errorf("explicit serve_stale_when_upstream_down=true not preserved")
+	}
+	if !cfg.Serve.LogStaleServes {
+		t.Errorf("explicit log_stale_serves=true not preserved")
+	}
 }
 
 // An explicit empty list MUST be preserved — §6.6 defines [] as "deny

@@ -60,8 +60,11 @@ type Config struct {
 	// Serve is the SPEC §6.4 / §8 stale-serve policy. Zero value is
 	// safe (both flags off): the handler will always 502 on a metadata
 	// miss with upstream down rather than serving a stale cached copy.
-	// Production sets ServeStaleWhenUpstreamDown=true (the SPEC default
-	// behavior) so brief upstream outages don't propagate to apt clients.
+	// Production goes through config.Load, which pre-seeds both flags
+	// to the SPEC §5.1 defaults (true) before the TOML decode — see
+	// config.defaultConfig — so an operator's omitted [serve] section
+	// keeps the documented SPEC behavior. Callers building a Config
+	// programmatically (e.g. tests) must seed the bools by hand.
 	Serve config.ServeConfig
 }
 

@@ -117,8 +117,16 @@ func (d *Duration) UnmarshalText(text []byte) error {
 // configs that omit those keys entirely. To preserve the "deny everything"
 // semantics of an explicit empty list, slice defaults only fill in nil
 // (key absent), never empty (key set to []).
+//
+// Bool defaults are pre-populated *before* the TOML decode rather than
+// in Defaults(): bools have no zero-value sentinel that can distinguish
+// "key absent" from "key explicitly set to false," so a post-decode
+// Defaults() call would either clobber an operator's explicit `false`
+// or never fire. Pre-population gives the right semantics — the decoder
+// only writes fields the TOML actually contains, leaving the seeded
+// default in place when the key is absent.
 func Load(path string) (*Config, error) {
-	cfg := &Config{}
+	cfg := defaultConfig()
 	if _, err := toml.DecodeFile(path, cfg); err != nil {
 		return nil, fmt.Errorf("decode %q: %w", path, err)
 	}
@@ -127,6 +135,19 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// defaultConfig returns a Config seeded with the SPEC §5.1 defaults that
+// cannot be applied after decode (bool fields, where the zero value is
+// indistinguishable from "explicitly set to false"). Callers other than
+// Load (mostly tests) that bypass the file path must seed bools by hand.
+func defaultConfig() *Config {
+	return &Config{
+		Serve: ServeConfig{
+			ServeStaleWhenUpstreamDown: true,
+			LogStaleServes:             true,
+		},
+	}
 }
 
 // Validate enforces the rules in SPEC.md §5.2.

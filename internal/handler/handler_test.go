@@ -1488,3 +1488,85 @@ func (s *safeWriter) Write(p []byte) (int, error) {
 	defer s.mu.Unlock()
 	return s.w.Write(p)
 }
+
+// TestServeHTTP_OrphanRowUpstreamDownReturns502 exercises the Phase 1
+// public path most likely to hit respondUpstreamUnreachable in
+// production: a row in url_path whose blob is no longer on disk
+// (manual delete, prune script, fsck). tryCacheHit's BlobExists check
+// fires false → fall-through to miss path → upstream returns an error
+// → tryServeStale runs but BlobExists is *still* false → falls through
+// to 502 with the SPEC §6.4 metadata Retry-After.
+//
+// This is a negative-path public test: the response is 502, not
+// HIT-STALE. The positive HIT-STALE response through ServeHTTP requires
+// a row+blob to materialize between tryCacheHit and tryServeStale (a
+// benign concurrency race), which is what the direct-call
+// TestTryServeStale_* unit tests cover. Phase 2 will introduce a
+// "frozen consistent set" path where tryCacheHit explicitly defers to
+// the stale machinery, at which point the positive ServeHTTP path
+// becomes constructible end-to-end.
+func TestServeHTTP_OrphanRowUpstreamDownReturns502(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// First request: 200 with body so the cache primes. Subsequent
+		// requests: 503 to drive the miss-path through respondError.
+		if hits.Add(1) == 1 {
+			body := []byte("staled-bytes-" + r.URL.Path)
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			_, _ = w.Write(body)
+			return
+		}
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	h := newTestHandlerWithServe(t, config.ServeConfig{
+		ServeStaleWhenUpstreamDown: true,
+		LogStaleServes:             false,
+	}, nil)
+	defer h.Close()
+
+	// Prime: row + blob in cache.
+	primer := httptest.NewRecorder()
+	h.ServeHTTP(primer, proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease"))
+	if primer.Code != http.StatusOK {
+		t.Fatalf("prime status=%d body=%q", primer.Code, primer.Body.String())
+	}
+
+	// Orphan the row by removing the blob from disk.
+	row, err := h.cache.LookupURL(context.Background(), "http", "127.0.0.1", "/ubuntu/dists/noble/InRelease")
+	if err != nil {
+		t.Fatalf("LookupURL: %v", err)
+	}
+	if row.BlobHash == nil {
+		t.Fatalf("primed row has no blob hash")
+	}
+	if err := os.Remove(h.cache.BlobPath(*row.BlobHash)); err != nil {
+		t.Fatalf("remove blob to create orphan: %v", err)
+	}
+
+	// Request the same URL again. Expected path:
+	//   tryCacheHit: row found, BlobExists=false → fall through.
+	//   serveCacheMiss → fetch → 503 → ErrUpstreamServerError.
+	//   respondError → respondUpstreamUnreachable → tryServeStale:
+	//     row found, BlobExists=*still* false → returns false.
+	//   Final: 502 + Retry-After: 30 (metadata).
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "30" {
+		t.Errorf("Retry-After=%q, want %q (orphan metadata 502)", got, "30")
+	}
+	if got := rec.Header().Get("X-Cache"); got == "HIT-STALE" {
+		t.Errorf("X-Cache=HIT-STALE on orphan with no blob — must not serve")
+	}
+	// Upstream hits: 1 (prime) + N (fetch with retries on 503). N is
+	// MaxRetries-dependent, so assert the qualitative invariant: prime
+	// happened AND the second request actually reached upstream.
+	if got := hits.Load(); got < 2 {
+		t.Errorf("upstream hits=%d, want >=2 (prime + at least one retry attempt)", got)
+	}
+}
