@@ -277,8 +277,9 @@ func serveListeners(
 	// wedging the handler write). This MUST happen before h.Close():
 	// activeWG.Wait inside h.Close cannot finish while a handler is
 	// stuck writing to a wedged client, and lifecycleCancel does not
-	// help — only closing the conn does. Running this first turns a
-	// slow-client shutdown DoS into a sub-second exit.
+	// help — only closing the conn does. Running this first bounds
+	// slow-client shutdown by the drain budget instead of blocking
+	// h.Close() indefinitely.
 	if err := plainSrv.Close(); err != nil {
 		logger.Warn("http force-close returned error", "err", err)
 	}

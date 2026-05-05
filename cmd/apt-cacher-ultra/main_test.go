@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -475,4 +476,102 @@ func TestServe_GracefulShutdown_KillsHungFetchAfterDrainBudget(t *testing.T) {
 	// generated (5xx). Wait for cleanup so the t.Parallel goroutine
 	// budget is honored.
 	<-clientDone
+}
+
+// TestServe_GracefulShutdown_KillsSlowClientAfterDrainBudget proves the
+// shutdown ordering: when a handler is wedged writing to a slow/non-
+// reading client (cache-hit ServeContent), force-closing the http.Server
+// before h.Close() is what unsticks the handler. lifecycleCancel does
+// nothing for a write-blocked goroutine. If a future refactor moves
+// h.Close() back ahead of Server.Close(), this test deadlocks instead
+// of returning — the existing hung-upstream test would not catch that.
+func TestServe_GracefulShutdown_KillsSlowClientAfterDrainBudget(t *testing.T) {
+	// Intentionally NOT t.Parallel: mutates package-global shutdownTimeout.
+
+	oldTimeout := shutdownTimeout
+	shutdownTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { shutdownTimeout = oldTimeout })
+
+	// Body sized to overflow a small TCP receive window with margin to
+	// spare. We pin the slow client's SO_RCVBUF below to make this
+	// reliable across kernel auto-tuning.
+	const bodySize = 4 * 1024 * 1024
+	bigBody := make([]byte, bodySize)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(bodySize))
+		_, _ = w.Write(bigBody)
+	}))
+	defer upstream.Close()
+
+	cfg := minimalCfg(t.TempDir(), []config.MirrorRule{
+		{Prefix: "/ubuntu", Upstream: upstream.URL + "/"},
+	})
+
+	cacheLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	cacheAddr := cacheLn.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil)
+	}()
+
+	// Warm the cache so the slow-client request below is a cache HIT,
+	// exercising the ServeContent path codex called out specifically.
+	warm := &http.Client{Transport: &http.Transport{}, Timeout: 30 * time.Second}
+	warmResp, err := warm.Get("http://" + cacheAddr + "/ubuntu/big.bin")
+	if err != nil {
+		t.Fatalf("warm get: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, warmResp.Body); err != nil {
+		t.Fatalf("warm read: %v", err)
+	}
+	warmResp.Body.Close()
+	warm.CloseIdleConnections()
+
+	// Slow-reader: dial raw, pin a tiny receive buffer so the kernel
+	// cannot absorb the whole body via auto-tuning, send the request,
+	// and never read the response. The server's write into the conn
+	// will block once the receive window collapses to zero.
+	slow, err := net.Dial("tcp", cacheAddr)
+	if err != nil {
+		t.Fatalf("slow dial: %v", err)
+	}
+	defer slow.Close()
+	if tc, ok := slow.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(8192)
+	}
+
+	if _, err := slow.Write([]byte("GET /ubuntu/big.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")); err != nil {
+		t.Fatalf("slow write: %v", err)
+	}
+
+	// Brief delay for the handler to start serving and wedge on the
+	// conn. We have no clean signal for "now blocked"; 300ms is
+	// generous against scheduler jitter without slowing the test.
+	time.Sleep(300 * time.Millisecond)
+
+	shutdownStart := time.Now()
+	cancel()
+
+	select {
+	case err := <-serveDone:
+		dur := time.Since(shutdownStart)
+		if err != nil {
+			t.Errorf("serveListeners: %v", err)
+		}
+		// Drain budget is 200ms; force-close adds only ms. Anything
+		// above ~5s indicates the slow-client path is no longer
+		// being unstuck — i.e. a regression of the ordering fix.
+		if dur > 5*time.Second {
+			t.Errorf("serveListeners took %v after shutdown; ordering regression?", dur)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("serveListeners did not return after shutdown — slow-client deadlock")
+	}
 }
