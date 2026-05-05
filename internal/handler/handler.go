@@ -19,6 +19,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 )
 
@@ -39,11 +40,16 @@ type FreshnessChecker interface {
 // Config carries handler dependencies. All non-pointer fields are
 // optional and defaulted in New.
 type Config struct {
-	Parser               *proxy.Parser
-	Cache                *cache.Cache
-	Fetch                *fetch.Client
-	MaxConcurrentPerHost int
-	Logger               *slog.Logger
+	Parser *proxy.Parser
+	Cache  *cache.Cache
+	Fetch  *fetch.Client
+	Logger *slog.Logger
+
+	// HostLimiter bounds concurrent upstream connections to a single
+	// canonical host. SPEC §9.3. Required; the handler panics on a
+	// nil value at New-time. Sharing one limiter with the freshness
+	// checker keeps both code paths under the same per-host budget.
+	HostLimiter *hostsem.Sem
 
 	// Freshness is the SPEC §7 checker. Optional: when nil, T1
 	// triggers are disabled (tests, or operators who explicitly
@@ -64,7 +70,7 @@ type Handler struct {
 	cache     *cache.Cache
 	fetch     *fetch.Client
 	sf        *sfGroup
-	sem       *hostSem
+	sem       *hostsem.Sem
 	freshness FreshnessChecker
 	logger    *slog.Logger
 
@@ -85,9 +91,8 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.Fetch == nil {
 		return nil, errors.New("handler: nil Fetch")
 	}
-	limit := cfg.MaxConcurrentPerHost
-	if limit <= 0 {
-		limit = 8
+	if cfg.HostLimiter == nil {
+		return nil, errors.New("handler: nil HostLimiter")
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -99,7 +104,7 @@ func New(cfg Config) (*Handler, error) {
 		cache:           cfg.Cache,
 		fetch:           cfg.Fetch,
 		sf:              newSFGroup(),
-		sem:             newHostSem(limit),
+		sem:             cfg.HostLimiter,
 		freshness:       cfg.Freshness,
 		logger:          logger,
 		lifecycleCtx:    lifecycleCtx,
@@ -344,7 +349,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 // and inserts the url_path/blob rows. Returns sfResult with the cached
 // blob hash on success.
 func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
-	release, err := h.sem.acquire(ctx, req.CanonicalHost)
+	release, err := h.sem.Acquire(ctx, req.CanonicalHost)
 	if err != nil {
 		return sfResult{err: fmt.Errorf("handler: acquire host slot: %w", err)}
 	}
@@ -413,12 +418,50 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 		return sfResult{err: fmt.Errorf("handler: put url row: %w", err), status: fres.Status}
 	}
 
+	// Seed suite_freshness on a successful InRelease miss. Without
+	// this, a freshly-cached suite is invisible to the periodic
+	// scheduler (which scans suite_freshness, not url_path) until the
+	// first cache-hit T1 fires — and that first T1 has no validators,
+	// so it does an unconditional GET when a 304 was achievable.
+	// Seed failures are non-fatal (the file IS cached); we just lose
+	// the periodic-scheduler benefit until the next miss/T1.
+	if req.IsMetadata && req.SuitePath != "" && req.Path == req.SuitePath+inReleaseSuffix {
+		seed := cache.SuiteFreshness{
+			CanonicalScheme: req.CanonicalScheme,
+			CanonicalHost:   req.CanonicalHost,
+			SuitePath:       req.SuitePath,
+			LastCheckAt:     &now,
+			LastSuccessAt:   &now,
+		}
+		if fres.ETag != "" {
+			etag := fres.ETag
+			seed.InReleaseETag = &etag
+		}
+		if fres.LastModified != "" {
+			lm := fres.LastModified
+			seed.InReleaseLastMod = &lm
+		}
+		if err := h.cache.PutSuiteFreshness(dbCtx, seed); err != nil {
+			h.logger.Warn("seed suite_freshness failed",
+				"err", err,
+				"canonical_host", req.CanonicalHost,
+				"suite_path", req.SuitePath,
+			)
+		}
+	}
+
 	return sfResult{
 		blobHash: hash,
 		size:     fres.ContentLength,
 		status:   fres.Status,
 	}
 }
+
+// inReleaseSuffix is the path suffix that identifies the InRelease
+// file under a suite path. Kept as a package constant so the same
+// literal is used for the seed-detection check above and (in the
+// freshness package) the check itself.
+const inReleaseSuffix = "/InRelease"
 
 // respondError maps a fetch error to an HTTP response.
 //

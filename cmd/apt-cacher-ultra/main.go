@@ -20,6 +20,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 	"github.com/linsomniac/apt-cacher-ultra/internal/handler"
+	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 )
 
@@ -180,24 +181,30 @@ func serveListeners(
 		return fmt.Errorf("build fetch client: %w", err)
 	}
 
+	// Single per-host limiter shared between the handler's miss path
+	// and the freshness checker. SPEC §9.3 budget covers all upstream
+	// pressure to a host, regardless of which code path generates it.
+	hostLimiter := hostsem.New(cfg.Upstream.MaxConcurrentPerHost)
+
 	freshChecker, err := freshness.New(freshness.Config{
-		Cache:    c,
-		Fetcher:  fetchClient,
-		Cooldown: cfg.Freshness.Cooldown.Duration,
-		Refresh:  cfg.Freshness.PeriodicRefresh.Duration,
-		Logger:   logger,
+		Cache:       c,
+		Fetcher:     fetchClient,
+		HostLimiter: hostLimiter,
+		Cooldown:    cfg.Freshness.Cooldown.Duration,
+		Refresh:     cfg.Freshness.PeriodicRefresh.Duration,
+		Logger:      logger,
 	})
 	if err != nil {
 		return fmt.Errorf("build freshness checker: %w", err)
 	}
 
 	h, err := handler.New(handler.Config{
-		Parser:               parser,
-		Cache:                c,
-		Fetch:                fetchClient,
-		MaxConcurrentPerHost: cfg.Upstream.MaxConcurrentPerHost,
-		Logger:               logger,
-		Freshness:            freshChecker,
+		Parser:      parser,
+		Cache:       c,
+		Fetch:       fetchClient,
+		HostLimiter: hostLimiter,
+		Logger:      logger,
+		Freshness:   freshChecker,
 	})
 	if err != nil {
 		return fmt.Errorf("build handler: %w", err)

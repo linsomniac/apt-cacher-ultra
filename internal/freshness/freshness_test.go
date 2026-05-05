@@ -17,6 +17,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 )
 
 // fakeCache is the in-memory Cache used by these tests. The real cache
@@ -352,6 +353,78 @@ func TestCheck_OK_ContentChanged_RecordsObservation(t *testing.T) {
 	}
 }
 
+// TestCheck_ChangeSeenClearedOn304 covers the upstream-recovery path:
+// a previous check observed an upstream-ahead InRelease (change_seen_at
+// set), the next check returns 304 (upstream is back to matching the
+// cached version, e.g. after a rollback). The diagnostic must clear so
+// it accurately reflects current state.
+func TestCheck_ChangeSeenClearedOn304(t *testing.T) {
+	fc := newFakeCache()
+	bh := hashOf([]byte("cached body"))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1", Path: "/dists/noble/InRelease",
+		BlobHash: &bh, UpstreamURL: srv.URL + "/dists/noble/InRelease", IsMetadata: true,
+	})
+	stale := int64(1234)
+	fc.putSuite(cache.SuiteFreshness{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble",
+		InReleaseChangeSeenAt: &stale,
+	})
+
+	c, _ := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t),
+		Logger: discardLogger(),
+	})
+	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
+
+	got, _ := fc.suite("http", "127.0.0.1", "/dists/noble")
+	if got.InReleaseChangeSeenAt != nil {
+		t.Errorf("change_seen_at = %v, want cleared", got.InReleaseChangeSeenAt)
+	}
+}
+
+// TestCheck_ChangeSeenClearedOn200Match covers the same recovery via
+// the 200-bytes-match branch: upstream returned 200 (didn't honor
+// conditional GET) but the body hashes to the same bytes the cache
+// already holds. This too proves recovery from a prior change-seen
+// observation, so the diagnostic must clear.
+func TestCheck_ChangeSeenClearedOn200Match(t *testing.T) {
+	fc := newFakeCache()
+	body := []byte("steady state body")
+	bh := hashOf(body)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1", Path: "/dists/noble/InRelease",
+		BlobHash: &bh, UpstreamURL: srv.URL + "/dists/noble/InRelease", IsMetadata: true,
+	})
+	stale := int64(1234)
+	fc.putSuite(cache.SuiteFreshness{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble",
+		InReleaseChangeSeenAt: &stale,
+	})
+
+	c, _ := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t),
+		Logger: discardLogger(),
+	})
+	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
+
+	got, _ := fc.suite("http", "127.0.0.1", "/dists/noble")
+	if got.InReleaseChangeSeenAt != nil {
+		t.Errorf("change_seen_at = %v, want cleared", got.InReleaseChangeSeenAt)
+	}
+}
+
 func TestCheck_UpstreamError_BumpsCheckOnly(t *testing.T) {
 	fc := newFakeCache()
 	bh := hashOf([]byte("x"))
@@ -524,6 +597,96 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("Run did not return after ctx cancel")
+	}
+}
+
+// TestCheck_HostLimiterBoundsConcurrency proves that two concurrent
+// freshness checks for distinct suites on the same canonical host
+// serialize through the shared per-host limiter — addresses the
+// codex finding that conditional GETs otherwise bypass
+// MaxConcurrentPerHost and create a memory-exhaustion path.
+func TestCheck_HostLimiterBoundsConcurrency(t *testing.T) {
+	fc := newFakeCache()
+	bh := hashOf([]byte("x"))
+
+	// Two suites on the same canonical host. Both have a cached
+	// InRelease and matching url_path rows.
+	for _, sp := range []string{"/a", "/b"} {
+		fc.putURL(cache.URLPath{
+			CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+			Path: sp + "/InRelease", BlobHash: &bh, IsMetadata: true,
+		})
+	}
+
+	// Upstream blocks until released by the test, so we can observe
+	// concurrency. inFlight tracks the peak number of simultaneous
+	// handlers; with limit=1 it must stay at 1.
+	var inFlight, peak atomic.Int64
+	gate := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := inFlight.Add(1)
+		for {
+			p := peak.Load()
+			if cur <= p || peak.CompareAndSwap(p, cur) {
+				break
+			}
+		}
+		<-gate
+		inFlight.Add(-1)
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+
+	// Patch the URLs now that we know the test server's address.
+	for _, sp := range []string{"/a", "/b"} {
+		fc.putURL(cache.URLPath{
+			CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+			Path: sp + "/InRelease", BlobHash: &bh,
+			UpstreamURL: srv.URL + sp + "/InRelease", IsMetadata: true,
+		})
+	}
+
+	limit := hostsem.New(1)
+	c, err := New(Config{
+		Cache:       fc,
+		Fetcher:     newTestFetcher(t),
+		HostLimiter: limit,
+		Logger:      discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for _, sp := range []string{"/a", "/b"} {
+		wg.Add(1)
+		go func(sp string) {
+			defer wg.Done()
+			c.Check(context.Background(), "http", "127.0.0.1", sp)
+		}(sp)
+	}
+
+	// Both Checks try to acquire the limiter; the second blocks on
+	// the upstream gate (via Acquire). Wait for at least one handler
+	// to be in flight, then verify the second hasn't snuck in.
+	deadline := time.Now().Add(2 * time.Second)
+	for inFlight.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if inFlight.Load() == 0 {
+		t.Fatalf("first conditional GET never reached upstream")
+	}
+	// Give the second goroutine ample time to bypass the limiter
+	// (it must NOT) before we release the gate.
+	time.Sleep(100 * time.Millisecond)
+	if got := peak.Load(); got != 1 {
+		t.Errorf("peak in-flight = %d, want 1 (limiter must serialize)", got)
+	}
+	close(gate)
+	wg.Wait()
+
+	if got := peak.Load(); got != 1 {
+		t.Errorf("post-run peak = %d, want 1", got)
 	}
 }
 

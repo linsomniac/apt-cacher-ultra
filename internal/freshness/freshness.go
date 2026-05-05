@@ -28,6 +28,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 )
 
 // inReleaseFilename is the file that anchors a suite. Every freshness
@@ -64,6 +65,16 @@ type Config struct {
 	Refresh  time.Duration // SPEC §7.4 periodic_refresh interval
 	Logger   *slog.Logger
 
+	// HostLimiter bounds concurrent upstream conditional GETs to a
+	// single canonical host. SPEC §9.3. Production wires this to the
+	// same *hostsem.Sem the handler uses for cache-miss fetches so
+	// the per-host budget is honored across both paths. Optional —
+	// when nil, freshness checks have no per-host bound (acceptable
+	// in tests; risky in production because each 200 response is
+	// read into memory up to MaxInReleaseBytes, so unbounded
+	// concurrency is a memory-exhaustion path).
+	HostLimiter *hostsem.Sem
+
 	// MaxInReleaseBytes caps the body read on a 200 response. Defaults
 	// to defaultMaxInReleaseBytes when zero.
 	MaxInReleaseBytes int64
@@ -76,6 +87,7 @@ type Config struct {
 type Checker struct {
 	cache    Cache
 	fetcher  Fetcher
+	hostSem  *hostsem.Sem
 	cooldown time.Duration
 	refresh  time.Duration
 	maxBody  int64
@@ -84,11 +96,20 @@ type Checker struct {
 
 	// locks holds *sync.Mutex per suite key. SPEC §7.3 specifies the
 	// lock is in-memory and held only for the duration of the upstream
-	// call. Memory is bounded by the count of cached suites — same
-	// upper bound as the suite_freshness table itself — so unbounded
-	// growth from request volume is not a concern (an attacker can't
-	// create a suite_freshness row without first causing a successful
-	// upstream fetch on an allowlisted host).
+	// call. Memory upper bound is the number of distinct
+	// (canonical_scheme, canonical_host, suite_path) values that have
+	// ever been the subject of a Check call — i.e. metadata-bearing
+	// suite paths the cache has either cached (T1 spawn) or written
+	// to suite_freshness (T2 scan). An unauthenticated attacker
+	// cannot grow this map without first producing successful upstream
+	// metadata fetches on an allowlisted host, so the practical bound
+	// is the cache's actual data set, not request volume.
+	//
+	// AIDEV-NOTE: entries are not actively reaped. A suite that was
+	// once cached but later evicted (Phase 4 GC) will leave its
+	// mutex in this map for the lifetime of the process. Per-entry
+	// memory is small (one *sync.Mutex pointer plus map overhead),
+	// so the long-tail growth is acceptable for Phase 1.
 	locks sync.Map
 }
 
@@ -121,6 +142,7 @@ func New(cfg Config) (*Checker, error) {
 	return &Checker{
 		cache:    cfg.Cache,
 		fetcher:  cfg.Fetcher,
+		hostSem:  cfg.HostLimiter,
 		cooldown: cfg.Cooldown,
 		refresh:  cfg.Refresh,
 		maxBody:  maxBody,
@@ -240,6 +262,26 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 		lastmod = *cur.InReleaseLastMod
 	}
 
+	// SPEC §9.3: bound concurrent upstream calls to host. Without
+	// this, distinct suites on the same host all run Conditional in
+	// parallel, each capable of pulling MaxInReleaseBytes into
+	// memory — a resource-exhaustion path under a refresh storm or
+	// an adversarial allowlisted upstream. Sharing the limiter with
+	// the handler's miss path means cache-miss fetches and
+	// freshness checks contend for the same per-host budget.
+	if c.hostSem != nil {
+		release, err := c.hostSem.Acquire(ctx, host)
+		if err != nil {
+			c.logger.Debug("freshness: host limiter acquire aborted",
+				"err", err,
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return
+		}
+		defer release()
+	}
+
 	res, err := c.fetcher.Conditional(ctx, target, etag, lastmod, c.maxBody)
 	if err != nil {
 		// SPEC §7.2: bump last_check_at on failure to space out the
@@ -267,7 +309,13 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 
 	switch res.Status {
 	case 304:
-		// Validators by definition unchanged — nothing else to record.
+		// Validators by definition unchanged. If a previous check had
+		// observed an upstream-ahead InRelease, clear the diagnostic
+		// — upstream is once again serving the cached version (e.g.
+		// after a rollback, or after the cached file caught up via
+		// some other path). Leaving it set would permanently flag
+		// "upstream has newer" even after recovery.
+		cur.InReleaseChangeSeenAt = nil
 	case 200:
 		sum := sha256.Sum256(res.Body)
 		newHash := hex.EncodeToString(sum[:])
@@ -284,6 +332,8 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 				v := res.LastModified
 				cur.InReleaseLastMod = &v
 			}
+			// Recovery: see the 304 branch comment.
+			cur.InReleaseChangeSeenAt = nil
 		} else {
 			// Upstream has a new InRelease. Phase 1 does NOT adopt.
 			// Record observation; cache keeps serving the consistent

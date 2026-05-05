@@ -17,6 +17,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 )
 
@@ -59,11 +60,11 @@ func newTestHandler(t *testing.T, allow []string, mirror []config.MirrorRule) *H
 	}
 
 	h, err := New(Config{
-		Parser:               parser,
-		Cache:                c,
-		Fetch:                fc,
-		MaxConcurrentPerHost: 4,
-		Logger:               silentLogger(),
+		Parser:      parser,
+		Cache:       c,
+		Fetch:       fc,
+		HostLimiter: hostsem.New(4),
+		Logger:      silentLogger(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -94,9 +95,10 @@ func TestNew_NilDeps(t *testing.T) {
 		name string
 		cfg  Config
 	}{
-		{"nil parser", Config{Cache: c, Fetch: fc}},
-		{"nil cache", Config{Parser: parser, Fetch: fc}},
-		{"nil fetch", Config{Parser: parser, Cache: c}},
+		{"nil parser", Config{Cache: c, Fetch: fc, HostLimiter: hostsem.New(4)}},
+		{"nil cache", Config{Parser: parser, Fetch: fc, HostLimiter: hostsem.New(4)}},
+		{"nil fetch", Config{Parser: parser, Cache: c, HostLimiter: hostsem.New(4)}},
+		{"nil limiter", Config{Parser: parser, Cache: c, Fetch: fc}},
 	}
 	for _, tc := range cases {
 		if _, err := New(tc.cfg); err == nil {
@@ -625,117 +627,6 @@ func TestSFGroup_ArrivalDuringCleanupWindow(t *testing.T) {
 	}
 }
 
-func TestHostSem_LimitsConcurrency(t *testing.T) {
-	s := newHostSem(2)
-
-	rel1, err := s.acquire(context.Background(), "h")
-	if err != nil {
-		t.Fatalf("acquire 1: %v", err)
-	}
-	rel2, err := s.acquire(context.Background(), "h")
-	if err != nil {
-		t.Fatalf("acquire 2: %v", err)
-	}
-
-	// Third acquire must block until release.
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	_, err = s.acquire(ctx, "h")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("third acquire err=%v, want DeadlineExceeded", err)
-	}
-
-	rel1()
-	// Now a fourth acquire should succeed promptly.
-	rel3, err := s.acquire(context.Background(), "h")
-	if err != nil {
-		t.Fatalf("post-release acquire: %v", err)
-	}
-	rel2()
-	rel3()
-}
-
-func TestHostSem_PerHostIsolated(t *testing.T) {
-	s := newHostSem(1)
-	rA, err := s.acquire(context.Background(), "a")
-	if err != nil {
-		t.Fatalf("acquire a: %v", err)
-	}
-	defer rA()
-
-	// Different host has its own slot, so this must succeed without
-	// blocking even though a's slot is held.
-	rB, err := s.acquire(context.Background(), "b")
-	if err != nil {
-		t.Fatalf("acquire b: %v", err)
-	}
-	defer rB()
-}
-
-// TestHostSem_RefcountReleasesSlot proves the per-host map shrinks when
-// the last holder of a slot releases. Without refcounting, every distinct
-// host the cache ever sees creates a permanent map entry and an attacker
-// can grow the map without bound by sending requests for many made-up
-// hostnames.
-func TestHostSem_RefcountReleasesSlot(t *testing.T) {
-	s := newHostSem(2)
-
-	rel, err := s.acquire(context.Background(), "transient-host")
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	if got := s.hostCount(); got != 1 {
-		t.Errorf("hostCount during use = %d, want 1", got)
-	}
-	rel()
-	if got := s.hostCount(); got != 0 {
-		t.Errorf("hostCount after last release = %d, want 0", got)
-	}
-
-	// Many transient hosts — each should clean up after itself.
-	for i := 0; i < 100; i++ {
-		host := fmt.Sprintf("h-%d", i)
-		rel, err := s.acquire(context.Background(), host)
-		if err != nil {
-			t.Fatalf("acquire %q: %v", host, err)
-		}
-		rel()
-	}
-	if got := s.hostCount(); got != 0 {
-		t.Errorf("hostCount after churn = %d, want 0", got)
-	}
-}
-
-// TestHostSem_RefcountSurvivesCtxCancel proves a ctx-cancelled acquire
-// (which never took a channel token) still drops its refcount.
-func TestHostSem_RefcountSurvivesCtxCancel(t *testing.T) {
-	s := newHostSem(1)
-
-	// Hold the only slot.
-	hold, err := s.acquire(context.Background(), "h")
-	if err != nil {
-		t.Fatalf("acquire hold: %v", err)
-	}
-
-	// Try to acquire a second slot with a ctx that fires fast.
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	_, err = s.acquire(ctx, "h")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("acquire-2 err=%v, want DeadlineExceeded", err)
-	}
-	// Refcount: hold has 1 ref, the failed acquire decremented its own.
-	// Both ops on host "h" → slot still alive (refs = 1).
-	if got := s.hostCount(); got != 1 {
-		t.Errorf("hostCount with one holder = %d, want 1", got)
-	}
-
-	hold()
-	if got := s.hostCount(); got != 0 {
-		t.Errorf("hostCount after final release = %d, want 0", got)
-	}
-}
-
 // TestServeHTTP_DisallowedHostShortCircuits asserts the handler's
 // pre-fetch allowlist check rejects unknown hosts before allocating any
 // per-host bookkeeping. This is the open-proxy DoS hardening from
@@ -760,8 +651,8 @@ func TestServeHTTP_DisallowedHostShortCircuits(t *testing.T) {
 		}
 	}
 
-	if got := h.sem.hostCount(); got != 0 {
-		t.Errorf("hostCount after 50 disallowed hosts = %d, want 0", got)
+	if got := h.sem.HostCount(); got != 0 {
+		t.Errorf("HostCount after 50 disallowed hosts = %d, want 0", got)
 	}
 }
 
@@ -963,17 +854,81 @@ func newTestHandlerWithFreshness(t *testing.T, fc FreshnessChecker) *Handler {
 		t.Fatalf("fetch.New: %v", err)
 	}
 	h, err := New(Config{
-		Parser:               parser,
-		Cache:                c,
-		Fetch:                fetchClient,
-		MaxConcurrentPerHost: 4,
-		Logger:               silentLogger(),
-		Freshness:            fc,
+		Parser:      parser,
+		Cache:       c,
+		Fetch:       fetchClient,
+		HostLimiter: hostsem.New(4),
+		Logger:      silentLogger(),
+		Freshness:   fc,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	return h
+}
+
+// TestServeHTTP_MissOnInReleaseSeedsFreshness asserts the codex fix:
+// after a successful miss-fetch of a suite's InRelease, the cache
+// upserts a suite_freshness row carrying the upstream validators —
+// so the periodic scheduler picks the suite up immediately and the
+// first follow-up freshness check can issue a real conditional GET
+// (instead of an unconditional one because validators are nil).
+func TestServeHTTP_MissOnInReleaseSeedsFreshness(t *testing.T) {
+	body := []byte("Origin: Ubuntu\nSuite: noble\n")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Last-Modified", "Mon, 01 Jan 2024 00:00:00 GMT")
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	defer h.Close()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+
+	got, err := h.cache.GetSuiteFreshness(context.Background(), "http", "127.0.0.1", "/ubuntu/dists/noble")
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness after miss: %v", err)
+	}
+	if got.LastSuccessAt == nil {
+		t.Errorf("seed missing last_success_at")
+	}
+	if got.InReleaseETag == nil || *got.InReleaseETag != `"v1"` {
+		t.Errorf("seed etag = %v, want \"v1\"", got.InReleaseETag)
+	}
+	if got.InReleaseLastMod == nil || *got.InReleaseLastMod != "Mon, 01 Jan 2024 00:00:00 GMT" {
+		t.Errorf("seed lastmod = %v", got.InReleaseLastMod)
+	}
+}
+
+// TestServeHTTP_MissOnPackagesDoesNotSeedFreshness asserts the seed
+// fires only for the InRelease anchor file, not for every metadata
+// path under a suite.
+func TestServeHTTP_MissOnPackagesDoesNotSeedFreshness(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("Packages content"))
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	defer h.Close()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/ubuntu/dists/noble/main/binary-amd64/Packages"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+
+	_, err := h.cache.GetSuiteFreshness(context.Background(), "http", "127.0.0.1", "/ubuntu/dists/noble")
+	if !errors.Is(err, cache.ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound (Packages must not seed)", err)
+	}
 }
 
 // TestServeHTTP_FreshnessTriggeredOnMetadataHit asserts that a cache
