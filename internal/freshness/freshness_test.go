@@ -135,6 +135,7 @@ func newTestFetcher(t *testing.T) *fetch.Client {
 		MaxRetries:       0,
 		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
 		DenyTargetRanges: nil,
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("fetch.New: %v", err)

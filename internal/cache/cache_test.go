@@ -21,7 +21,7 @@ import (
 func openCache(t *testing.T) *Cache {
 	t.Helper()
 	dir := t.TempDir()
-	c, err := Open(context.Background(), dir)
+	c, err := Open(context.Background(), dir, nil)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestOpen_AppliesInitialMigration(t *testing.T) {
 
 func TestOpen_RejectsFutureSchemaVersion(t *testing.T) {
 	dir := t.TempDir()
-	c, err := Open(context.Background(), dir)
+	c, err := Open(context.Background(), dir, nil)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestOpen_RejectsFutureSchemaVersion(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	_, err = Open(context.Background(), dir)
+	_, err = Open(context.Background(), dir, nil)
 	if err == nil {
 		t.Fatal("Open(future schema): expected error, got nil")
 	}
@@ -90,14 +90,14 @@ func TestOpen_RejectsFutureSchemaVersion(t *testing.T) {
 
 func TestOpen_ReopenIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	c1, err := Open(context.Background(), dir)
+	c1, err := Open(context.Background(), dir, nil)
 	if err != nil {
 		t.Fatalf("Open #1: %v", err)
 	}
 	if err := c1.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	c2, err := Open(context.Background(), dir)
+	c2, err := Open(context.Background(), dir, nil)
 	if err != nil {
 		t.Fatalf("Open #2: %v", err)
 	}
@@ -513,7 +513,7 @@ func TestConcurrentWrites(t *testing.T) {
 // closed cache returns ErrClosed rather than blocking or panicking.
 func TestClose_RejectsFurtherWrites(t *testing.T) {
 	dir := t.TempDir()
-	c, err := Open(context.Background(), dir)
+	c, err := Open(context.Background(), dir, nil)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -629,7 +629,7 @@ func TestOpen_PathWithMetacharsInDir(t *testing.T) {
 	if err := os.MkdirAll(weird, 0o750); err != nil {
 		t.Fatalf("mkdir %q: %v", weird, err)
 	}
-	c, err := Open(context.Background(), weird)
+	c, err := Open(context.Background(), weird, nil)
 	if err != nil {
 		t.Fatalf("Open(%q): %v", weird, err)
 	}

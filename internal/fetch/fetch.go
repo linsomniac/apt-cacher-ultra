@@ -41,15 +41,19 @@ var (
 	ErrCacheWriteFailed    = errors.New("fetch: cache write failed")
 )
 
-// StatusError carries the upstream HTTP status code from a non-success,
-// non-retryable response. The handler layer needs the actual status so
-// it can passthrough an upstream 404 (apt frequently probes for index
-// variants that don't exist) instead of collapsing every non-success
-// into a generic 502.
+// StatusError carries the upstream HTTP status code from any non-success
+// response (4xx or 5xx). The handler layer needs the actual status so it
+// can passthrough an upstream 404 (apt frequently probes for index
+// variants that don't exist), AND so the SPEC §10 upstream_status log
+// field carries the real upstream code on 502-after-retries paths.
 //
-// errors.Is(err, ErrUpstreamStatus) returns true on a StatusError so
-// existing callers that classify errors via the sentinel keep working;
-// new callers reach the integer with errors.As.
+// errors.Is dispatches by code range so callers can keep using the
+// sentinels they already classify against:
+//   - 4xx: matches ErrUpstreamStatus (passthrough path).
+//   - 5xx: matches ErrUpstreamServerError (treat as upstream-down).
+//
+// All non-success responses match ErrUpstreamStatus too so the lookup
+// "any HTTP status carrier" stays single-sentinel.
 type StatusError struct {
 	Code int
 }
@@ -59,7 +63,13 @@ func (e *StatusError) Error() string {
 }
 
 func (e *StatusError) Is(target error) bool {
-	return target == ErrUpstreamStatus
+	switch target {
+	case ErrUpstreamStatus:
+		return true
+	case ErrUpstreamServerError:
+		return e.Code >= 500 && e.Code < 600
+	}
+	return false
 }
 
 const defaultUserAgent = "apt-cacher-ultra/0.1"
@@ -77,6 +87,11 @@ type Options struct {
 	DenyTargetRanges []string
 	UserAgent        string
 
+	// Logger sinks the per-retry "fetch retry" Info line (SPEC §10).
+	// nil falls back to slog.Default() — production main.run sets the
+	// default before fetch.New is called.
+	Logger *slog.Logger
+
 	// dialContext, when non-nil, replaces the deny-CIDR-protected dialer.
 	// Test seam: httptest binds 127.0.0.1, which is in the default deny
 	// list, so tests pass an empty list (or set this) to bypass.
@@ -91,6 +106,7 @@ type Client struct {
 	maxRetries   int
 	totalTimeout time.Duration
 	userAgent    string
+	logger       *slog.Logger
 }
 
 // Target identifies what to fetch. CanonicalHost is the cache-key host
@@ -153,6 +169,10 @@ func New(opts Options) (*Client, error) {
 	if ua == "" {
 		ua = defaultUserAgent
 	}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Client{
 		httpClient: &http.Client{
 			Transport: transport,
@@ -179,6 +199,7 @@ func New(opts Options) (*Client, error) {
 		maxRetries:   opts.MaxRetries,
 		totalTimeout: opts.TotalTimeout,
 		userAgent:    ua,
+		logger:       logger,
 	}, nil
 }
 
@@ -242,7 +263,13 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (*Fetc
 			if lastErr == nil {
 				lastErr = errors.New("retries exhausted with no error captured")
 			}
-			return nil, fmt.Errorf("%w: %v", ErrUpstreamUnavailable, lastErr)
+			// Multi-%w preserves lastErr's chain (in particular a
+			// *StatusError carrying the upstream 5xx code) so the
+			// handler's errors.As lookup in runFetch still surfaces the
+			// real upstream status for the X-Upstream-Status header and
+			// the SPEC §10 upstream_status log field. Single-%w-with-%v
+			// would drop the StatusError on retry exhaustion.
+			return nil, fmt.Errorf("%w: %w", ErrUpstreamUnavailable, lastErr)
 		}
 
 		sendRange := haveInitial && dst.Written() > 0
@@ -296,10 +323,8 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (*Fetc
 			return nil, ctxErr
 		}
 		// SPEC §10: emit one structured log per retry attempt so an
-		// operator watching upstream flap can quantify it. The default
-		// slog.Logger is used because main configures it before the
-		// fetch client runs.
-		slog.Info("fetch retry",
+		// operator watching upstream flap can quantify it.
+		c.logger.Info("fetch retry",
 			"attempt", attempts+1,
 			"max_retries", c.maxRetries,
 			"canonical_host", target.CanonicalHost,
@@ -415,9 +440,12 @@ func (c *Client) doAttempt(
 		}
 		return out, nil
 	default:
-		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
-			return out, fmt.Errorf("%w: status=%d", ErrUpstreamServerError, resp.StatusCode)
-		}
+		// Both 4xx and 5xx return a *StatusError so the upstream code
+		// is recoverable via errors.As anywhere up the chain (handler
+		// runFetch needs this for X-Upstream-Status and SPEC §10
+		// upstream_status). The Is method satisfies the
+		// ErrUpstreamServerError sentinel for 5xx, which the handler
+		// uses to route into respondUpstreamUnreachable.
 		return out, &StatusError{Code: resp.StatusCode}
 	}
 }
@@ -518,6 +546,17 @@ func isRetryable(err error) bool {
 	}
 	if errors.Is(err, ErrHostNotAllowed) || errors.Is(err, ErrTargetDenied) {
 		return false
+	}
+	// HTTP-status carriers: 4xx is not retryable (apt-style probing of
+	// non-existent index variants must surface to the caller); 5xx is
+	// retryable (transient upstream error). Production code emits
+	// *StatusError values for both; check that path first so we recover
+	// the code via errors.As. Fall through to the bare-sentinel check
+	// for any error wrapping ErrUpstreamStatus without a StatusError in
+	// its chain (e.g. external callers, fmt.Errorf-style wraps).
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code >= 500 && se.Code < 600
 	}
 	if errors.Is(err, ErrUpstreamStatus) {
 		return false

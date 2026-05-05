@@ -80,9 +80,8 @@ INSERT INTO schema_version VALUES (1);
 //
 // SPEC §10: emits a structured log line per applied migration so an
 // operator watching the journal during a deploy sees exactly what
-// happened on first contact with an old DB. The default slog.Logger is
-// used because main configures it before cache.Open runs.
-func migrate(ctx context.Context, db *sql.DB) error {
+// happened on first contact with an old DB.
+func migrate(ctx context.Context, db *sql.DB, logger *slog.Logger) error {
 	current, err := readSchemaVersion(ctx, db)
 	if err != nil {
 		return fmt.Errorf("read schema_version: %w", err)
@@ -92,14 +91,14 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			current, CurrentSchemaVersion)
 	}
 	if current == CurrentSchemaVersion {
-		slog.Debug("schema current", "version", current)
+		logger.Debug("schema current", "version", current)
 		return nil
 	}
 	for v := current; v < CurrentSchemaVersion; v++ {
 		if err := applyMigration(ctx, db, v); err != nil {
 			return fmt.Errorf("migration %d→%d: %w", v, v+1, err)
 		}
-		slog.Info("schema migrated", "from", v, "to", v+1)
+		logger.Info("schema migrated", "from", v, "to", v+1)
 	}
 	return nil
 }

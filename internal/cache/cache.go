@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -27,8 +28,9 @@ const writeBufferSize = 256
 // goroutine that serializes all write transactions. Reads share the
 // connection pool freely. SPEC §9.4.
 type Cache struct {
-	dir string
-	db  *sql.DB
+	dir    string
+	db     *sql.DB
+	logger *slog.Logger
 
 	writes  chan writeReq
 	closeCh chan struct{}
@@ -40,7 +42,13 @@ type Cache struct {
 // pool/, tmp/, and staging/ subdirectories, opens cache.db with WAL and
 // foreign keys enabled, and migrates the schema forward to
 // CurrentSchemaVersion. Caller must Close.
-func Open(ctx context.Context, dir string) (*Cache, error) {
+//
+// logger sinks the SPEC §10 schema-migration and blob-write structured
+// logs. Pass nil to fall back to slog.Default().
+func Open(ctx context.Context, dir string, logger *slog.Logger) (*Cache, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	for _, sub := range []string{"pool", "tmp", "staging"} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o750); err != nil {
 			return nil, fmt.Errorf("create %s: %w", sub, err)
@@ -51,7 +59,7 @@ func Open(ctx context.Context, dir string) (*Cache, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := migrate(ctx, db); err != nil {
+	if err := migrate(ctx, db, logger); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -59,6 +67,7 @@ func Open(ctx context.Context, dir string) (*Cache, error) {
 	c := &Cache{
 		dir:     dir,
 		db:      db,
+		logger:  logger,
 		writes:  make(chan writeReq, writeBufferSize),
 		closeCh: make(chan struct{}),
 	}

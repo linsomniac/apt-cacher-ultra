@@ -162,7 +162,7 @@ func serveListeners(
 		"log_level", cfg.Log.Level,
 	)
 
-	c, err := cache.Open(ctx, cfg.Cache.Dir)
+	c, err := cache.Open(ctx, cfg.Cache.Dir, logger)
 	if err != nil {
 		return fmt.Errorf("open cache: %w", err)
 	}
@@ -193,6 +193,7 @@ func serveListeners(
 		AllowedHostRegex: cfg.Upstream.AllowedHostRegex,
 		DenyTargetRanges: cfg.Upstream.DenyTargetRanges,
 		UserAgent:        "apt-cacher-ultra/" + Version,
+		Logger:           logger,
 	})
 	if err != nil {
 		return fmt.Errorf("build fetch client: %w", err)

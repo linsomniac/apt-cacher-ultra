@@ -246,7 +246,7 @@ func newChaosHandler(t *testing.T) *Handler {
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
-	c, err := cache.Open(context.Background(), t.TempDir())
+	c, err := cache.Open(context.Background(), t.TempDir(), silentLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -262,6 +262,7 @@ func newChaosHandler(t *testing.T) *Handler {
 		// fetch even runs.
 		AllowedHostRegex: []string{`^127\.0\.0\.1$`, `^::1$`},
 		DenyTargetRanges: nil,
+		Logger:           silentLogger(),
 	})
 	if err != nil {
 		t.Fatalf("fetch.New: %v", err)

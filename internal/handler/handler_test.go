@@ -40,7 +40,7 @@ func newTestHandler(t *testing.T, allow []string, mirror []config.MirrorRule) *H
 		t.Fatalf("proxy.New: %v", err)
 	}
 
-	c, err := cache.Open(context.Background(), t.TempDir())
+	c, err := cache.Open(context.Background(), t.TempDir(), silentLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -55,6 +55,7 @@ func newTestHandler(t *testing.T, allow []string, mirror []config.MirrorRule) *H
 		MaxRetries:       2,
 		AllowedHostRegex: allow,
 		DenyTargetRanges: nil,
+		Logger:           silentLogger(),
 	})
 	if err != nil {
 		t.Fatalf("fetch.New: %v", err)
@@ -84,13 +85,13 @@ func mirrorReq(method, path string) *http.Request {
 }
 
 func TestNew_NilDeps(t *testing.T) {
-	c, err := cache.Open(context.Background(), t.TempDir())
+	c, err := cache.Open(context.Background(), t.TempDir(), silentLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
 	defer c.Close()
 	parser, _ := proxy.New(nil, nil)
-	fc, _ := fetch.New(fetch.Options{AllowedHostRegex: []string{`.`}, DenyTargetRanges: nil})
+	fc, _ := fetch.New(fetch.Options{AllowedHostRegex: []string{`.`}, DenyTargetRanges: nil, Logger: silentLogger()})
 
 	cases := []struct {
 		name string
@@ -839,7 +840,7 @@ func newTestHandlerWithFreshness(t *testing.T, fc FreshnessChecker) *Handler {
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
-	c, err := cache.Open(context.Background(), t.TempDir())
+	c, err := cache.Open(context.Background(), t.TempDir(), silentLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -850,6 +851,7 @@ func newTestHandlerWithFreshness(t *testing.T, fc FreshnessChecker) *Handler {
 		MaxRetries:       2,
 		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
 		DenyTargetRanges: nil,
+		Logger:           silentLogger(),
 	})
 	if err != nil {
 		t.Fatalf("fetch.New: %v", err)
@@ -1111,7 +1113,7 @@ func newTestHandlerWithServe(t *testing.T, serve config.ServeConfig, logger *slo
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
-	c, err := cache.Open(context.Background(), t.TempDir())
+	c, err := cache.Open(context.Background(), t.TempDir(), silentLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -1122,6 +1124,7 @@ func newTestHandlerWithServe(t *testing.T, serve config.ServeConfig, logger *slo
 		MaxRetries:       2,
 		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
 		DenyTargetRanges: nil,
+		Logger:           silentLogger(),
 	})
 	if err != nil {
 		t.Fatalf("fetch.New: %v", err)
@@ -1581,7 +1584,7 @@ func newTestHandlerWithFetchOpts(t *testing.T, fopts fetch.Options) *Handler {
 	if err != nil {
 		t.Fatalf("proxy.New: %v", err)
 	}
-	c, err := cache.Open(context.Background(), t.TempDir())
+	c, err := cache.Open(context.Background(), t.TempDir(), silentLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -1883,5 +1886,71 @@ func TestSingleflight_LeaderLogsCoalescing(t *testing.T) {
 	// At least one waiter should have joined.
 	if !strings.Contains(out, "waiters=") {
 		t.Errorf("expected waiters= field in coalescing log:\n%s", out)
+	}
+}
+
+// TestLogRequest_UpstreamStatus5xxExhaustion pins codex finding #2: when
+// fetch retries an upstream 5xx until exhaustion, the wrapped
+// ErrUpstreamUnavailable must still carry the *StatusError chain so the
+// handler's errors.As lookup surfaces the real upstream code into both
+// the X-Upstream-Status header and the SPEC §10 upstream_status log
+// field. Pre-fix this test fails: status=0 leaks through and the field
+// reads "upstream_status=0" instead of "upstream_status=503".
+func TestLogRequest_UpstreamStatus5xxExhaustion(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "kaboom", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&safeWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	h := newTestHandlerWithServe(t, config.ServeConfig{}, logger)
+	defer h.Close()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/ubuntu/pool/p/pkg/x.deb"))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get("X-Upstream-Status"); got != "503" {
+		t.Errorf("X-Upstream-Status=%q, want %q (5xx must propagate through retry exhaustion)", got, "503")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "outcome=bad_gateway") {
+		t.Fatalf("expected outcome=bad_gateway:\n%s", out)
+	}
+	if !strings.Contains(out, "upstream_status=503") {
+		t.Errorf("upstream_status=503 must appear in request log (codex finding):\n%s", out)
+	}
+}
+
+// TestLogRequest_UpstreamStatusZeroOnTimeout pins the SPEC §10 contract
+// that fetch-attempted-but-no-response emits upstream_status=0 (rather
+// than omitting the field). The presence of the field — not its value —
+// is the operator's signal for "did this request reach upstream".
+func TestLogRequest_UpstreamStatusZeroOnTimeout(t *testing.T) {
+	// Bind a listener and immediately close it so the next connect
+	// fails with "connection refused" — drives ErrUpstreamUnavailable
+	// with no HTTP response received.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&safeWriter{w: &buf}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	h := newTestHandlerWithServe(t, config.ServeConfig{}, logger)
+	defer h.Close()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", url, "/ubuntu/pool/p/pkg/y.deb"))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "outcome=bad_gateway") {
+		t.Fatalf("expected outcome=bad_gateway:\n%s", out)
+	}
+	if !strings.Contains(out, "upstream_status=0") {
+		t.Errorf("upstream_status=0 must be emitted when fetch attempted but no response arrived:\n%s", out)
 	}
 }

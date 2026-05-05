@@ -164,20 +164,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		h.logRequest(r, "", "", "method_not_allowed", http.StatusMethodNotAllowed, 0, 0, start)
+		h.logRequest(r, "", "", "method_not_allowed", http.StatusMethodNotAllowed, 0, false, 0, start)
 		return
 	}
 
 	req, err := h.parser.Parse(r.RequestURI, r.Host)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		h.logRequest(r, "", "", "bad_request", http.StatusBadRequest, 0, 0, start)
+		h.logRequest(r, "", "", "bad_request", http.StatusBadRequest, 0, false, 0, start)
 		return
 	}
 
 	// Fast path: SPEC §6.1.
 	if served, status, body := h.tryCacheHit(w, r, req); served {
-		h.logRequest(r, req.CanonicalHost, req.Path, "hit", status, body, 0, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "hit", status, body, false, 0, start)
 		return
 	}
 
@@ -189,7 +189,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// the fetch path's allowlist fires.
 	if !h.fetch.HostAllowed(req.CanonicalHost) {
 		http.Error(w, "forbidden", http.StatusForbidden)
-		h.logRequest(r, req.CanonicalHost, req.Path, "forbidden", http.StatusForbidden, 0, 0, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "forbidden", http.StatusForbidden, 0, false, 0, start)
 		return
 	}
 
@@ -339,7 +339,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	f, err := os.Open(path)
 	if err != nil {
 		http.Error(w, "cache read failed", http.StatusInternalServerError)
-		h.logRequest(r, req.CanonicalHost, req.Path, "error", http.StatusInternalServerError, 0, res.status, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "error", http.StatusInternalServerError, 0, true, res.status, start)
 		return
 	}
 	defer f.Close()
@@ -347,7 +347,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	st, err := f.Stat()
 	if err != nil {
 		http.Error(w, "cache stat failed", http.StatusInternalServerError)
-		h.logRequest(r, req.CanonicalHost, req.Path, "error", http.StatusInternalServerError, 0, res.status, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "error", http.StatusInternalServerError, 0, true, res.status, start)
 		return
 	}
 
@@ -365,7 +365,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 
 	cw := &countingWriter{ResponseWriter: w}
 	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
-	h.logRequest(r, req.CanonicalHost, req.Path, logOutcome, cw.statusCode(), cw.bytes, res.status, start)
+	h.logRequest(r, req.CanonicalHost, req.Path, logOutcome, cw.statusCode(), cw.bytes, true, res.status, start)
 }
 
 // runFetch is the body of the singleflight call. Acquires the per-host
@@ -503,7 +503,13 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 	switch {
 	case errors.Is(err, fetch.ErrHostNotAllowed), errors.Is(err, fetch.ErrTargetDenied):
 		http.Error(w, "forbidden", http.StatusForbidden)
-		h.logRequest(r, req.CanonicalHost, req.Path, "forbidden", http.StatusForbidden, 0, res.status, start)
+		// ErrHostNotAllowed fires from fetch.Fetch's pre-flight check
+		// (no dial happened) — but ErrTargetDenied fires *during* the
+		// dial. Both reach this branch; mark fetchAttempted=true so an
+		// operator can still distinguish "rejected upstream attempt"
+		// from "rejected before the request layer". upstream_status
+		// stays 0 in both cases (no HTTP response was received).
+		h.logRequest(r, req.CanonicalHost, req.Path, "forbidden", http.StatusForbidden, 0, true, res.status, start)
 		return
 	case errors.Is(err, fetch.ErrUpstreamStatus):
 		// SPEC §6.4 / failure-mode catalog: only upstream 4xx is a
@@ -518,7 +524,7 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		// this cache's purposes).
 		if res.status >= 400 && res.status < 500 {
 			http.Error(w, fmt.Sprintf("upstream status %d", res.status), res.status)
-			h.logRequest(r, req.CanonicalHost, req.Path, "upstream_status", res.status, 0, res.status, start)
+			h.logRequest(r, req.CanonicalHost, req.Path, "upstream_status", res.status, 0, true, res.status, start)
 			return
 		}
 		h.logger.Warn("non-4xx upstream status mapped to 502",
@@ -548,7 +554,7 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		)
 		w.Header().Set("Retry-After", retryAfterForRequest(req))
 		http.Error(w, "bad gateway", http.StatusBadGateway)
-		h.logRequest(r, req.CanonicalHost, req.Path, "cache_write_failed", http.StatusBadGateway, 0, res.status, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "cache_write_failed", http.StatusBadGateway, 0, true, res.status, start)
 		return
 	case errors.Is(err, fetch.ErrInvalidURL),
 		errors.Is(err, fetch.ErrRedirectBlocked):
@@ -558,14 +564,14 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		// operator should fix) — fail loud instead.
 		w.Header().Set("Retry-After", retryAfterForRequest(req))
 		http.Error(w, "bad gateway", http.StatusBadGateway)
-		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, res.status, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, true, res.status, start)
 		return
 	case errors.Is(err, context.Canceled):
 		// Client almost certainly disconnected. 499 is non-standard;
 		// 503 with Retry-After is the closest sensible response.
 		w.Header().Set("Retry-After", "5")
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-		h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, res.status, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, true, res.status, start)
 		return
 	default:
 		w.Header().Set("Retry-After", retryAfterForRequest(req))
@@ -575,7 +581,7 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 			"canonical_host", req.CanonicalHost,
 			"path", req.Path,
 		)
-		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, res.status, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, true, res.status, start)
 		return
 	}
 }
@@ -592,7 +598,7 @@ func (h *Handler) respondUpstreamUnreachable(w http.ResponseWriter, r *http.Requ
 	}
 	w.Header().Set("Retry-After", retryAfterForRequest(req))
 	http.Error(w, "bad gateway", http.StatusBadGateway)
-	h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, upstreamStatus, start)
+	h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, true, upstreamStatus, start)
 }
 
 // tryServeStale serves the cached blob for req with X-Cache: HIT-STALE
@@ -659,7 +665,7 @@ func (h *Handler) tryServeStale(w http.ResponseWriter, r *http.Request, req *pro
 			"blob_hash", hash,
 		)
 	}
-	h.logRequest(r, req.CanonicalHost, req.Path, "hit_stale", cw.statusCode(), cw.bytes, upstreamStatus, start)
+	h.logRequest(r, req.CanonicalHost, req.Path, "hit_stale", cw.statusCode(), cw.bytes, true, upstreamStatus, start)
 	return true
 }
 
@@ -684,12 +690,15 @@ func retryAfterForRequest(req *proxy.Request) string {
 // 400/405 log calls fire before the parser has run, so we route the
 // URL through urlForLog which strips userinfo unconditionally.
 //
-// upstreamStatus is the upstream HTTP code observed during the fetch (0
-// when no fetch was attempted or no response was received before failure).
-// SPEC §10 says it is logged "when a fetch was attempted" — we emit it
-// only when non-zero so log consumers can use field-presence as the
-// fetch-attempted signal.
-func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, status int, bytesWritten int64, upstreamStatus int, start time.Time) {
+// SPEC §10: upstream_status is logged "when a fetch was attempted",
+// including 0 when no upstream response arrived (timeout, connection
+// refused, dial denied). Field presence is the operator's signal for
+// "did this request reach upstream"; the value distinguishes "got a
+// response" (status code) from "fetch attempted but no response" (0).
+// Use fetchAttempted=false only on pre-fetch outcomes (hit, 400, 405,
+// pre-fetch allowlist 403); use true for every miss-path outcome,
+// including HIT-STALE (which fired after a fetch failed).
+func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, status int, bytesWritten int64, fetchAttempted bool, upstreamStatus int, start time.Time) {
 	attrs := []any{
 		"method", r.Method,
 		"url", urlForLog(r),
@@ -701,7 +710,7 @@ func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, s
 		"duration_ms", time.Since(start).Milliseconds(),
 		"client_addr", r.RemoteAddr,
 	}
-	if upstreamStatus > 0 {
+	if fetchAttempted {
 		attrs = append(attrs, "upstream_status", upstreamStatus)
 	}
 	h.logger.Info("request", attrs...)
