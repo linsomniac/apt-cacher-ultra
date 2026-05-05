@@ -19,6 +19,24 @@
 .vscode/
 .DS_Store
 
+# Local secrets and credentials. The cache image's build stage does
+# `COPY . .`, so anything in the repo root that holds secrets would
+# end up baked into a build layer (and into the daemon's layer cache)
+# even though the runtime stage only copies the compiled binary. Belt
+# and braces — these patterns are unlikely to exist in this repo, but
+# excluding them is free insurance against future accidents.
+.env
+.env.*
+.netrc
+.npmrc
+.pypirc
+.aws/
+.ssh/
+*.pem
+*.key
+*.p12
+*.pfx
+
 # Build artifacts (host-side; the in-image build produces fresh ones).
 build/
 dist/

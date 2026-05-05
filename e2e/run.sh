@@ -54,11 +54,14 @@ fi
 # that turned every request into a MISS would still pass — apt would
 # happily re-fetch everything every time.
 #
-# The regex matches `outcome=hit` followed by a word boundary so it
-# does not also match `outcome=hit_stale` or `outcome=hit_coalesced`
-# (both legal SPEC §10 outcomes the cache emits in other paths and
-# neither of which proves a fresh cache hit).
-hits="$(docker compose logs cache 2>/dev/null | grep -cE 'outcome=hit($|[^a-z_])' || true)"
+# The regex anchors `outcome=hit` against the slog key=value field
+# boundary — the value must end at whitespace or end-of-line. This
+# rejects `outcome=hit_stale` / `outcome=hit_coalesced` (legal SPEC
+# §10 outcomes the cache emits in other paths, neither of which
+# proves a fresh cache hit) and is also tighter than `[^a-z_]`,
+# which would have allowed hypothetical future values like `hit2`
+# or `hit-status` to slip through.
+hits="$(docker compose logs cache 2>/dev/null | grep -cE '(^|[[:space:]])outcome=hit([[:space:]]|$)' || true)"
 if [[ "$hits" -lt 1 ]]; then
     echo "[e2e] FAIL: expected at least one cache HIT in cache logs; got $hits"
     exit 1
