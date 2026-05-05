@@ -16,22 +16,32 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-versions="${UBUNTU_VERSIONS:-24.04 26.04}"
+# Parse into an array up front. Word-splitting on a bare string
+# (`for ver in $versions`) would silently iterate zero times for
+# whitespace-only input — both the validation loop and the test
+# loop would no-op, and the script would happily report
+# "OVERALL PASS" with nothing actually run.
+read -r -a versions <<< "${UBUNTU_VERSIONS:-24.04 26.04}"
 failures=()
+
+if (( ${#versions[@]} == 0 )); then
+    echo "[deb-test] UBUNTU_VERSIONS is empty after splitting; nothing to test"
+    exit 2
+fi
 
 # Validate up front before letting any value reach `docker build`
 # or the image tag. Args are quoted everywhere, so this is mostly
 # a footgun guard rather than an injection fix — but a stray
 # `latest` or `:`-bearing token would produce confusing errors
 # downstream, so reject early.
-for ver in $versions; do
+for ver in "${versions[@]}"; do
     if ! [[ "$ver" =~ ^[0-9]{2}\.[0-9]{2}$ ]]; then
         echo "[deb-test] invalid Ubuntu version: '$ver' (expected NN.NN, got '$ver')"
         exit 2
     fi
 done
 
-for ver in $versions; do
+for ver in "${versions[@]}"; do
     echo
     echo "==============================="
     echo "[deb-test] ubuntu:${ver}"
@@ -63,4 +73,4 @@ if (( ${#failures[@]} > 0 )); then
     exit 1
 fi
 
-echo "[deb-test] OVERALL PASS (${versions})"
+echo "[deb-test] OVERALL PASS (${versions[*]})"

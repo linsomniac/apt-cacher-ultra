@@ -44,27 +44,31 @@ test -f /etc/apt-cacher-ultra/config.toml || { echo "FAIL: /etc/apt-cacher-ultra
 test -f /lib/systemd/system/apt-cacher-ultra.service \
     || { echo "FAIL: /lib/systemd/system/apt-cacher-ultra.service missing"; exit 1; }
 
-echo "[deb-test] verify ownership and that nothing is group/world-writable"
-# All packaged files belong to root:root and must not have group or
-# world write bits set. A regression to 0664 (umask 002 leaking into
-# nfpm output) or accidental ownership change would slip past
-# functional tests but is exactly the kind of packaging bug that
-# trips lintian / production audits.
-for path in \
-    /usr/sbin/apt-cacher-ultra \
-    /etc/apt-cacher-ultra/config.toml \
-    /lib/systemd/system/apt-cacher-ultra.service ; do
+echo "[deb-test] verify ownership and exact mode match the package contract"
+# Exact-mode assertion (not a bit-mask check). nfpm.yaml now declares
+# each shipped path's mode explicitly, so the test asserts equality.
+# This catches both 0664 regressions (umask 002 leaking into nfpm
+# output) AND special-bit slip-ups like a 4755 setuid binary, neither
+# of which a `mode & 0022` mask would flag. The /etc/apt-cacher-ultra
+# directory is included — a 0775 or world-writable config dir lets a
+# local user swap config.toml despite the file itself being 0644.
+declare -A expected_mode=(
+    [/usr/sbin/apt-cacher-ultra]="755"
+    [/etc/apt-cacher-ultra]="755"
+    [/etc/apt-cacher-ultra/config.toml]="644"
+    [/lib/systemd/system/apt-cacher-ultra.service]="644"
+)
+for path in "${!expected_mode[@]}"; do
     info="$(stat -c '%U:%G %a' "$path")"
     owner="${info% *}"
     mode="${info##* }"
+    want="${expected_mode[$path]}"
     if [[ "$owner" != "root:root" ]]; then
         echo "FAIL: $path owned by $owner, expected root:root"
         exit 1
     fi
-    # Bits 022 = group-write (020) | world-write (002). Any of those
-    # set on a packaged file is a packaging defect.
-    if (( 8#$mode & 8#022 )); then
-        echo "FAIL: $path is group/world writable: mode=$mode"
+    if [[ "$mode" != "$want" ]]; then
+        echo "FAIL: $path mode is $mode, expected $want"
         exit 1
     fi
 done

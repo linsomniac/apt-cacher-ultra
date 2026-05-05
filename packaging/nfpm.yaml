@@ -20,6 +20,18 @@ contents:
       mode: 0755
       owner: root
       group: root
+  # Explicit directory entry. nfpm creates parent directories
+  # implicitly with a default mode that isn't part of the locked
+  # package contract; pinning this to 0755 root:root prevents a
+  # writable /etc/apt-cacher-ultra from sneaking in, which would
+  # let a local non-root user swap config.toml even though the
+  # file itself is 0644 root:root.
+  - dst: /etc/apt-cacher-ultra
+    type: dir
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
   - src: ./packaging/systemd/apt-cacher-ultra.service
     dst: /lib/systemd/system/apt-cacher-ultra.service
     # 0644 is the Debian convention for /lib/systemd/system; nfpm
