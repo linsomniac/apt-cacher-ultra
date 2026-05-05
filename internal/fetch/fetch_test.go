@@ -1,0 +1,664 @@
+package fetch
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// bufDst is the in-memory FetchDst used by tests. It tracks Written
+// independently of the buffer to mirror the BlobWriter contract (Written
+// reports the cumulative bytes accepted, and Truncate resets to zero).
+type bufDst struct {
+	buf     bytes.Buffer
+	written int64
+}
+
+func (b *bufDst) Write(p []byte) (int, error) {
+	n, err := b.buf.Write(p)
+	b.written += int64(n)
+	return n, err
+}
+
+func (b *bufDst) Written() int64 { return b.written }
+
+func (b *bufDst) Truncate() error {
+	b.buf.Reset()
+	b.written = 0
+	return nil
+}
+
+func (b *bufDst) String() string { return b.buf.String() }
+
+// newTestClient builds a permissive Client suitable for httptest. The
+// caller passes the allow regexes (typically `^127\.0\.0\.1$`); the
+// deny-CIDR list is empty so 127.0.0.1 (where httptest binds) is
+// reachable.
+func newTestClient(t *testing.T, allow []string) *Client {
+	t.Helper()
+	c, err := New(Options{
+		ConnectTimeout:   2 * time.Second,
+		TotalTimeout:     5 * time.Second,
+		MaxRetries:       3,
+		AllowedHostRegex: allow,
+		DenyTargetRanges: nil, // explicit empty: skip post-resolution check
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return c
+}
+
+func TestNew_BadAllowRegex(t *testing.T) {
+	_, err := New(Options{AllowedHostRegex: []string{"["}})
+	if err == nil {
+		t.Fatalf("expected compile error")
+	}
+	if !strings.Contains(err.Error(), "allowed_host_regex") {
+		t.Errorf("want allowed_host_regex in error, got %v", err)
+	}
+}
+
+func TestNew_BadCIDR(t *testing.T) {
+	_, err := New(Options{DenyTargetRanges: []string{"not-a-cidr"}})
+	if err == nil {
+		t.Fatalf("expected CIDR error")
+	}
+	if !strings.Contains(err.Error(), "deny_target_ranges") {
+		t.Errorf("want deny_target_ranges in error, got %v", err)
+	}
+}
+
+func TestNew_NegativeMaxRetries(t *testing.T) {
+	_, err := New(Options{MaxRetries: -1})
+	if err == nil {
+		t.Fatalf("expected error for negative max_retries")
+	}
+}
+
+func TestNew_NegativeTotalTimeout(t *testing.T) {
+	_, err := New(Options{TotalTimeout: -1})
+	if err == nil {
+		t.Fatalf("expected error for negative total_timeout")
+	}
+}
+
+func TestFetch_BasicSuccess(t *testing.T) {
+	body := []byte("hello world")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Last-Modified", "Mon, 01 Jan 2024 00:00:00 GMT")
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	res, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL + "/foo",
+	}, dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if res.Status != http.StatusOK {
+		t.Errorf("Status: got %d, want 200", res.Status)
+	}
+	if res.ETag != `"v1"` {
+		t.Errorf("ETag: got %q", res.ETag)
+	}
+	if res.LastModified == "" {
+		t.Errorf("LastModified missing")
+	}
+	if res.ContentLength != int64(len(body)) {
+		t.Errorf("ContentLength: got %d, want %d", res.ContentLength, len(body))
+	}
+	if dst.String() != string(body) {
+		t.Errorf("body: got %q, want %q", dst.String(), body)
+	}
+	if dst.Written() != int64(len(body)) {
+		t.Errorf("Written: got %d, want %d", dst.Written(), len(body))
+	}
+}
+
+func TestFetch_HostNotAllowed(t *testing.T) {
+	client, err := New(Options{
+		AllowedHostRegex: []string{`^archive\.ubuntu\.com$`},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = client.Fetch(context.Background(), &Target{
+		CanonicalHost: "evil.example.com",
+		URL:           "http://evil.example.com/",
+	}, &bufDst{})
+	if !errors.Is(err, ErrHostNotAllowed) {
+		t.Errorf("want ErrHostNotAllowed, got %v", err)
+	}
+}
+
+func TestFetch_EmptyAllowDeniesAll(t *testing.T) {
+	client, err := New(Options{AllowedHostRegex: []string{}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = client.Fetch(context.Background(), &Target{
+		CanonicalHost: "archive.ubuntu.com",
+		URL:           "http://archive.ubuntu.com/",
+	}, &bufDst{})
+	if !errors.Is(err, ErrHostNotAllowed) {
+		t.Errorf("want ErrHostNotAllowed, got %v", err)
+	}
+}
+
+func TestFetch_DenyTargetRange(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("hi"))
+	}))
+	defer srv.Close()
+
+	client, err := New(Options{
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		DenyTargetRanges: []string{"127.0.0.0/8"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, &bufDst{})
+	if !errors.Is(err, ErrTargetDenied) {
+		t.Errorf("want ErrTargetDenied, got %v", err)
+	}
+}
+
+func TestFetch_404NoRetry(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		http.Error(w, "nope", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	_, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, &bufDst{})
+	if !errors.Is(err, ErrUpstreamStatus) {
+		t.Errorf("want ErrUpstreamStatus, got %v", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("attempts: got %d, want 1 (4xx is non-retryable)", got)
+	}
+}
+
+func TestFetch_500ThenSuccess(t *testing.T) {
+	body := []byte("recovered")
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := attempts.Add(1)
+		if n < 3 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	res, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if res.Status != http.StatusOK {
+		t.Errorf("Status: got %d, want 200", res.Status)
+	}
+	if dst.String() != string(body) {
+		t.Errorf("body: got %q, want %q", dst.String(), body)
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Errorf("attempts: got %d, want 3", got)
+	}
+}
+
+func TestFetch_500RetriesExhausted(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		http.Error(w, "boom", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	client, err := New(Options{
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		MaxRetries:       2,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, &bufDst{})
+	if !errors.Is(err, ErrUpstreamUnavailable) {
+		t.Errorf("want ErrUpstreamUnavailable, got %v", err)
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Errorf("attempts: got %d, want 3 (1 initial + 2 retries)", got)
+	}
+}
+
+// TestFetch_ResumeWithRange verifies SPEC §6.3 resumable Range retries:
+// initial fetch sends 6 bytes of an 11-byte body then drops the conn;
+// the retry sends `Range: bytes=6-` with the captured ETag, and the
+// server returns 206 Partial Content with the remaining bytes.
+func TestFetch_ResumeWithRange(t *testing.T) {
+	full := []byte("hello world") // 11 bytes
+	const half = 6                // "hello "
+	var (
+		attempts    atomic.Int32
+		lastRange   atomic.Value // string
+		lastIfRange atomic.Value
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		lastRange.Store(r.Header.Get("Range"))
+		lastIfRange.Store(r.Header.Get("If-Range"))
+		if n == 1 {
+			// First attempt: write half the body and drop the conn.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("not Hijacker")
+			}
+			conn, bw, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("Hijack: %v", err)
+			}
+			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\nLast-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\nContent-Type: text/plain\r\n\r\n", len(full))
+			bw.Write(full[:half])
+			bw.Flush()
+			conn.Close()
+			return
+		}
+		// Subsequent attempts: serve as a 206 from the byte the client requested.
+		if r.Header.Get("Range") == "" {
+			t.Errorf("expected Range header on retry, got none")
+		}
+		if r.Header.Get("If-Range") != `"v1"` {
+			t.Errorf("expected If-Range \"v1\", got %q", r.Header.Get("If-Range"))
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", half, len(full)-1, len(full)))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(full)-half))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(full[half:])
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	res, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if res.Status != http.StatusOK {
+		t.Errorf("Status: got %d, want 200 (206 is hidden)", res.Status)
+	}
+	if dst.String() != string(full) {
+		t.Errorf("body: got %q, want %q", dst.String(), full)
+	}
+	if dst.Written() != int64(len(full)) {
+		t.Errorf("Written: got %d, want %d", dst.Written(), len(full))
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("attempts: got %d, want 2", got)
+	}
+	if lr, _ := lastRange.Load().(string); lr != fmt.Sprintf("bytes=%d-", half) {
+		t.Errorf("last Range: got %q, want bytes=%d-", lr, half)
+	}
+	if lir, _ := lastIfRange.Load().(string); lir != `"v1"` {
+		t.Errorf("last If-Range: got %q", lir)
+	}
+}
+
+// TestFetch_RestartOnValidatorChange verifies SPEC §6.3 fallback: when a
+// retry's Range request returns 200 instead of 206 (the server says the
+// validator no longer matches), the partial bytes are discarded and the
+// fetch restarts from byte 0.
+func TestFetch_RestartOnValidatorChange(t *testing.T) {
+	first := []byte("oldoldoldol")  // 11 bytes; first attempt sends partial
+	second := []byte("brandnewBC!") // 11 bytes; new full body after validator change
+	const half = 5
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		switch n {
+		case 1:
+			hj, _ := w.(http.Hijacker)
+			conn, bw, _ := hj.Hijack()
+			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\nContent-Type: application/octet-stream\r\n\r\n", len(first))
+			bw.Write(first[:half])
+			bw.Flush()
+			conn.Close()
+		case 2:
+			// Retry sent Range. Server returns 200 (validator changed).
+			if r.Header.Get("Range") == "" {
+				t.Errorf("expected Range on retry")
+			}
+			w.Header().Set("ETag", `"v2"`)
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(second)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(second)
+		default:
+			t.Errorf("unexpected attempt %d", n)
+		}
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	res, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if dst.String() != string(second) {
+		t.Errorf("body: got %q, want %q (post-restart)", dst.String(), second)
+	}
+	if res.ETag != `"v2"` {
+		t.Errorf("ETag: got %q, want \"v2\" (refreshed validator)", res.ETag)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("attempts: got %d, want 2", got)
+	}
+}
+
+func TestFetch_ContentLengthMismatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Declare 100 bytes, send 5 by hijacking and closing.
+		hj, _ := w.(http.Hijacker)
+		conn, bw, _ := hj.Hijack()
+		fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+		bw.Write([]byte("short"))
+		bw.Flush()
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	client, err := New(Options{
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		MaxRetries:       0, // exhaust on first attempt so we see the error
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, &bufDst{})
+	// With max_retries=0, a transient mid-body EOF (or size mismatch on
+	// retry) wraps as ErrUpstreamUnavailable.
+	if !errors.Is(err, ErrUpstreamUnavailable) {
+		t.Errorf("want ErrUpstreamUnavailable, got %v", err)
+	}
+}
+
+func TestFetch_ContextCanceled(t *testing.T) {
+	// Server holds the request open until the client disconnects, then
+	// returns. Listening on r.Context().Done() lets srv.Close() drain
+	// immediately once the test cancels its ctx.
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	_, err := client.Fetch(ctx, &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, &bufDst{})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("want context.Canceled, got %v", err)
+	}
+}
+
+func TestFetch_BadContentRange(t *testing.T) {
+	full := []byte("hello world") // 11 bytes
+	const half = 6
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := attempts.Add(1)
+		if n == 1 {
+			// First attempt: half-body then drop.
+			hj, _ := w.(http.Hijacker)
+			conn, bw, _ := hj.Hijack()
+			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
+			bw.Write(full[:half])
+			bw.Flush()
+			conn.Close()
+			return
+		}
+		// Retry: 206 with bogus Content-Range (wrong start offset).
+		w.Header().Set("Content-Range", "bytes 0-4/11")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("WORLD"))
+	}))
+	defer srv.Close()
+
+	client, err := New(Options{
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		MaxRetries:       1, // one retry budget — second attempt's bad range exhausts it
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, &bufDst{})
+	// Bad Content-Range is retryable, but we've used our budget. The
+	// outer error is ErrUpstreamUnavailable.
+	if !errors.Is(err, ErrUpstreamUnavailable) {
+		t.Errorf("want ErrUpstreamUnavailable, got %v", err)
+	}
+}
+
+func TestFetch_TotalSizeChangeOn206(t *testing.T) {
+	// First attempt: declare total=11, send 6 bytes, drop.
+	// Retry sends Range; server returns 206 but with /99 — total mismatch.
+	const half = 6
+	full := []byte("hello world")
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := attempts.Add(1)
+		if n == 1 {
+			hj, _ := w.(http.Hijacker)
+			conn, bw, _ := hj.Hijack()
+			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
+			bw.Write(full[:half])
+			bw.Flush()
+			conn.Close()
+			return
+		}
+		w.Header().Set("Content-Range", "bytes 6-98/99")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, 99-6))
+	}))
+	defer srv.Close()
+
+	client, err := New(Options{
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		MaxRetries:       1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, &bufDst{})
+	if !errors.Is(err, ErrUpstreamUnavailable) {
+		t.Errorf("want ErrUpstreamUnavailable wrapping ErrTotalSizeMismatch, got %v", err)
+	}
+}
+
+func TestFetch_RestartWhenNoValidator(t *testing.T) {
+	// First attempt: 200 with no ETag, no Last-Modified; mid-body drop.
+	// Outer loop should refuse to send Range without a validator,
+	// truncate, and restart. Second attempt succeeds.
+	body := []byte("complete!!!") // 11 bytes
+	const half = 4
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		if r.Header.Get("Range") != "" {
+			t.Errorf("attempt %d: should not send Range without validator", n)
+		}
+		if n == 1 {
+			hj, _ := w.(http.Hijacker)
+			conn, bw, _ := hj.Hijack()
+			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", len(body))
+			bw.Write(body[:half])
+			bw.Flush()
+			conn.Close()
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	res, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL,
+	}, dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if dst.String() != string(body) {
+		t.Errorf("body: got %q, want %q", dst.String(), body)
+	}
+	if res.ContentLength != int64(len(body)) {
+		t.Errorf("ContentLength: got %d, want %d", res.ContentLength, len(body))
+	}
+}
+
+func TestParseContentRange(t *testing.T) {
+	cases := []struct {
+		in          string
+		first, last int64
+		total       int64
+		wantErr     bool
+	}{
+		{"bytes 0-9/10", 0, 9, 10, false},
+		{"bytes 5-9/10", 5, 9, 10, false},
+		{"bytes 0-99/*", 0, 99, -1, false},
+		{"  bytes 0-9/10  ", 0, 9, 10, false},
+		{"items 0-9/10", 0, 0, 0, true},
+		{"bytes 0-9", 0, 0, 0, true},
+		{"bytes /10", 0, 0, 0, true},
+		{"bytes a-9/10", 0, 0, 0, true},
+		{"bytes 0-b/10", 0, 0, 0, true},
+		{"bytes 9-0/10", 0, 0, 0, true},
+		{"bytes 0-9/x", 0, 0, 0, true},
+	}
+	for _, tc := range cases {
+		first, last, total, err := parseContentRange(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("parseContentRange(%q): want error, got (%d, %d, %d)", tc.in, first, last, total)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseContentRange(%q): got %v", tc.in, err)
+			continue
+		}
+		if first != tc.first || last != tc.last || total != tc.total {
+			t.Errorf("parseContentRange(%q): got (%d, %d, %d), want (%d, %d, %d)",
+				tc.in, first, last, total, tc.first, tc.last, tc.total)
+		}
+	}
+}
+
+func TestIsRetryable(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{context.Canceled, false},
+		{context.DeadlineExceeded, false},
+		{fmt.Errorf("%w: example.com", ErrHostNotAllowed), false},
+		{fmt.Errorf("%w: 1.2.3.4", ErrTargetDenied), false},
+		{fmt.Errorf("%w: status=404", ErrUpstreamStatus), false},
+		{fmt.Errorf("%w: status=500", ErrUpstreamServerError), true},
+		{fmt.Errorf("%w: bad", ErrInvalidContentRange), true},
+		{fmt.Errorf("%w: short", ErrSizeMismatch), true},
+		{errors.New("some IO error"), true},
+	}
+	for _, tc := range cases {
+		got := isRetryable(tc.err)
+		if got != tc.want {
+			t.Errorf("isRetryable(%v): got %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestAddrInDeny(t *testing.T) {
+	deny, err := parseDenyCIDRs([]string{
+		"127.0.0.0/8", "10.0.0.0/8", "::1/128",
+	})
+	if err != nil {
+		t.Fatalf("parseDenyCIDRs: %v", err)
+	}
+	cases := []struct {
+		ip   string
+		want bool
+	}{
+		{"127.0.0.1", true},
+		{"127.255.255.255", true},
+		{"10.0.0.1", true},
+		{"::1", true},
+		{"8.8.8.8", false},
+		{"2606:4700:4700::1111", false},
+	}
+	for _, tc := range cases {
+		ip, err := netip.ParseAddr(tc.ip)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.ip, err)
+		}
+		got, _ := addrInDeny(ip, deny)
+		if got != tc.want {
+			t.Errorf("addrInDeny(%s): got %v, want %v", tc.ip, got, tc.want)
+		}
+	}
+}
