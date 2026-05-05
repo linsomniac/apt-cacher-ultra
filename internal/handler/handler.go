@@ -28,6 +28,14 @@ import (
 // package surfaces here at build time rather than as a runtime panic.
 var _ fetch.FetchDst = (*cache.BlobWriter)(nil)
 
+// FreshnessChecker is the subset of *freshness.Checker the handler uses
+// to fire SPEC §7.1 T1 triggers. Defined as an interface so handler
+// tests can supply a recorder without spinning up the real freshness
+// package.
+type FreshnessChecker interface {
+	Check(ctx context.Context, scheme, host, suitePath string)
+}
+
 // Config carries handler dependencies. All non-pointer fields are
 // optional and defaulted in New.
 type Config struct {
@@ -36,6 +44,11 @@ type Config struct {
 	Fetch                *fetch.Client
 	MaxConcurrentPerHost int
 	Logger               *slog.Logger
+
+	// Freshness is the SPEC §7 checker. Optional: when nil, T1
+	// triggers are disabled (tests, or operators who explicitly
+	// disabled freshness in config).
+	Freshness FreshnessChecker
 }
 
 // Handler is the apt-cacher-ultra http.Handler. Construct via New.
@@ -47,12 +60,13 @@ type Config struct {
 // blocked on. Close cancels that lifecycle ctx and waits on activeWG
 // for currently-running ServeHTTP invocations to complete.
 type Handler struct {
-	parser *proxy.Parser
-	cache  *cache.Cache
-	fetch  *fetch.Client
-	sf     *sfGroup
-	sem    *hostSem
-	logger *slog.Logger
+	parser    *proxy.Parser
+	cache     *cache.Cache
+	fetch     *fetch.Client
+	sf        *sfGroup
+	sem       *hostSem
+	freshness FreshnessChecker
+	logger    *slog.Logger
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -86,6 +100,7 @@ func New(cfg Config) (*Handler, error) {
 		fetch:           cfg.Fetch,
 		sf:              newSFGroup(),
 		sem:             newHostSem(limit),
+		freshness:       cfg.Freshness,
 		logger:          logger,
 		lifecycleCtx:    lifecycleCtx,
 		lifecycleCancel: lifecycleCancel,
@@ -225,7 +240,32 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
 
 	go h.touchAsync(req)
+	h.maybeFireFreshness(req)
 	return true, cw.statusCode(), cw.bytes
+}
+
+// maybeFireFreshness fires the SPEC §7.1 T1 trigger after a metadata
+// cache hit. Runs the check off the request goroutine — it has its own
+// in-memory TryLock + cooldown gate, so spawning unconditionally is
+// safe, but the request has already been served and there is no value
+// in blocking the response goroutine on a slow upstream conditional GET.
+//
+// The goroutine registers with activeWG so Handler.Close drains it on
+// shutdown; lifecycleCtx is what the goroutine carries, so cancel
+// propagates through fetch.Conditional.
+func (h *Handler) maybeFireFreshness(req *proxy.Request) {
+	if h.freshness == nil || !req.IsMetadata || req.SuitePath == "" {
+		return
+	}
+	// Increment must happen here (synchronously, before the goroutine
+	// is spawned) so Handler.Close — which is contracted to run after
+	// Server.Shutdown stops new ServeHTTP — never observes a counter
+	// of zero while a freshness check is still in flight.
+	h.activeWG.Add(1)
+	go func() {
+		defer h.activeWG.Done()
+		h.freshness.Check(h.lifecycleCtx, req.CanonicalScheme, req.CanonicalHost, req.SuitePath)
+	}()
 }
 
 // touchAsync updates last_requested_at + request_count without blocking

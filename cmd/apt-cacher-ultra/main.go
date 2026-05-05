@@ -18,6 +18,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 	"github.com/linsomniac/apt-cacher-ultra/internal/handler"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 )
@@ -179,16 +180,42 @@ func serveListeners(
 		return fmt.Errorf("build fetch client: %w", err)
 	}
 
+	freshChecker, err := freshness.New(freshness.Config{
+		Cache:    c,
+		Fetcher:  fetchClient,
+		Cooldown: cfg.Freshness.Cooldown.Duration,
+		Refresh:  cfg.Freshness.PeriodicRefresh.Duration,
+		Logger:   logger,
+	})
+	if err != nil {
+		return fmt.Errorf("build freshness checker: %w", err)
+	}
+
 	h, err := handler.New(handler.Config{
 		Parser:               parser,
 		Cache:                c,
 		Fetch:                fetchClient,
 		MaxConcurrentPerHost: cfg.Upstream.MaxConcurrentPerHost,
 		Logger:               logger,
+		Freshness:            freshChecker,
 	})
 	if err != nil {
 		return fmt.Errorf("build handler: %w", err)
 	}
+
+	// SPEC §7.4: start the periodic refresh scheduler. Scoped to a
+	// dedicated ctx so we can stop it deterministically before
+	// h.Close() — the scheduler dispatches into Checker.Check, which
+	// uses the cache + fetch client, so it must not outlive the
+	// handler-side drain.
+	freshCtx, freshCancel := context.WithCancel(context.Background())
+	defer freshCancel()
+	var freshWG sync.WaitGroup
+	freshWG.Add(1)
+	go func() {
+		defer freshWG.Done()
+		freshChecker.Run(freshCtx)
+	}()
 
 	plainSrv := newHTTPServer(h, logger)
 	var tlsSrv *http.Server
@@ -288,6 +315,14 @@ func serveListeners(
 			logger.Warn("https force-close returned error", "err", err)
 		}
 	}
+
+	// Stop the periodic freshness scheduler before h.Close so it does
+	// not dispatch new Check() calls (which would Add to activeWG)
+	// against a handler that's about to drain. Scheduler goroutines
+	// already in flight in Check() are tracked by activeWG via the
+	// handler's T1 wiring path, so they'll be drained by h.Close.
+	freshCancel()
+	freshWG.Wait()
 
 	// SPEC §9.5 step 3: cancel any in-flight upstream fetches (which
 	// outlive the request ctx by design — see handler.serveCacheMiss)

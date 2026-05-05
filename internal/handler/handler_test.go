@@ -903,3 +903,245 @@ func TestHandler_Close_Idempotent(t *testing.T) {
 	h.Close()
 	h.Close() // must not panic or hang
 }
+
+// recordingFreshness is a FreshnessChecker test double that records
+// every Check() call and signals when a call has been observed.
+type recordingFreshness struct {
+	mu     sync.Mutex
+	calls  []freshCall
+	signal chan struct{}
+}
+
+type freshCall struct {
+	scheme, host, suitePath string
+}
+
+func newRecordingFreshness() *recordingFreshness {
+	return &recordingFreshness{signal: make(chan struct{}, 16)}
+}
+
+func (r *recordingFreshness) Check(_ context.Context, scheme, host, suitePath string) {
+	r.mu.Lock()
+	r.calls = append(r.calls, freshCall{scheme, host, suitePath})
+	r.mu.Unlock()
+	select {
+	case r.signal <- struct{}{}:
+	default:
+	}
+}
+
+func (r *recordingFreshness) snapshot() []freshCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]freshCall, len(r.calls))
+	copy(out, r.calls)
+	return out
+}
+
+// newTestHandlerWithFreshness wires the same dependencies as
+// newTestHandler but plugs in a FreshnessChecker so T1 triggers can be
+// observed.
+func newTestHandlerWithFreshness(t *testing.T, fc FreshnessChecker) *Handler {
+	t.Helper()
+	parser, err := proxy.New(nil, nil)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	c, err := cache.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	fetchClient, err := fetch.New(fetch.Options{
+		ConnectTimeout:   2 * time.Second,
+		TotalTimeout:     5 * time.Second,
+		MaxRetries:       2,
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		DenyTargetRanges: nil,
+	})
+	if err != nil {
+		t.Fatalf("fetch.New: %v", err)
+	}
+	h, err := New(Config{
+		Parser:               parser,
+		Cache:                c,
+		Fetch:                fetchClient,
+		MaxConcurrentPerHost: 4,
+		Logger:               silentLogger(),
+		Freshness:            fc,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return h
+}
+
+// TestServeHTTP_FreshnessTriggeredOnMetadataHit asserts that a cache
+// hit on an InRelease (metadata under a suite) fires the SPEC §7.1 T1
+// trigger with the right (scheme, host, suite_path).
+func TestServeHTTP_FreshnessTriggeredOnMetadataHit(t *testing.T) {
+	body := []byte("Origin: Ubuntu\nSuite: noble\n")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	rec := newRecordingFreshness()
+	h := newTestHandlerWithFreshness(t, rec)
+	defer h.Close()
+
+	// First request caches the file (miss path; touchAsync runs but
+	// freshness must not fire on miss).
+	miss := httptest.NewRecorder()
+	h.ServeHTTP(miss, proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease"))
+	if miss.Code != http.StatusOK {
+		t.Fatalf("miss status=%d", miss.Code)
+	}
+
+	// Second request: cache hit on metadata → T1 should fire.
+	hit := httptest.NewRecorder()
+	h.ServeHTTP(hit, proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease"))
+	if hit.Code != http.StatusOK || hit.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("hit status=%d X-Cache=%q", hit.Code, hit.Header().Get("X-Cache"))
+	}
+
+	select {
+	case <-rec.signal:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("freshness Check never fired after metadata hit")
+	}
+
+	calls := rec.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("got %d calls, want 1: %+v", len(calls), calls)
+	}
+	got := calls[0]
+	if got.scheme != "http" || got.host != "127.0.0.1" || got.suitePath != "/ubuntu/dists/noble" {
+		t.Errorf("call = %+v, want {http, 127.0.0.1, /ubuntu/dists/noble}", got)
+	}
+}
+
+// TestServeHTTP_FreshnessNotTriggeredOnBlobHit asserts that a hit on a
+// non-metadata path (a .deb) does not fire the T1 trigger.
+func TestServeHTTP_FreshnessNotTriggeredOnBlobHit(t *testing.T) {
+	body := []byte("fake .deb body")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	rec := newRecordingFreshness()
+	h := newTestHandlerWithFreshness(t, rec)
+	defer h.Close()
+
+	for i := 0; i < 2; i++ {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, proxyReq("GET", srv.URL, "/ubuntu/pool/main/p/pkg/file_1.0_amd64.deb"))
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d: status=%d", i, w.Code)
+		}
+	}
+	// Give any spurious goroutine a chance to run.
+	time.Sleep(50 * time.Millisecond)
+	if calls := rec.snapshot(); len(calls) != 0 {
+		t.Errorf("freshness fired on blob hit: %+v", calls)
+	}
+}
+
+// TestServeHTTP_FreshnessNotTriggeredOnMiss asserts that the miss path
+// does not fire the T1 trigger — the spec says "cached metadata file
+// is requested", which presupposes the file is already cached.
+func TestServeHTTP_FreshnessNotTriggeredOnMiss(t *testing.T) {
+	body := []byte("InRelease bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	rec := newRecordingFreshness()
+	h := newTestHandlerWithFreshness(t, rec)
+	defer h.Close()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d", w.Code)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if calls := rec.snapshot(); len(calls) != 0 {
+		t.Errorf("freshness fired on miss: %+v", calls)
+	}
+}
+
+// TestHandler_Close_DrainsFreshnessGoroutine verifies that
+// Handler.Close waits for an in-flight freshness Check call. Without
+// the activeWG.Add in maybeFireFreshness, Close could return while a
+// goroutine is still using the cache — leading to a write to a closed
+// DB at process shutdown.
+func TestHandler_Close_DrainsFreshnessGoroutine(t *testing.T) {
+	body := []byte("InRelease body")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	gate := make(chan struct{})
+	// released is buffered so the goroutine's signal does not race with
+	// the test's receive — without the buffer, a context switch between
+	// the send (with default fallthrough) and the receive could lose
+	// the event entirely.
+	released := make(chan struct{}, 1)
+	bf := blockingFreshness{gate: gate, released: released}
+
+	h := newTestHandlerWithFreshness(t, bf)
+
+	// Cache the InRelease so the next request hits.
+	w1 := httptest.NewRecorder()
+	h.ServeHTTP(w1, proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease"))
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, proxyReq("GET", srv.URL, "/ubuntu/dists/noble/InRelease"))
+
+	// At this point a freshness goroutine is blocked on bf.gate.
+	closeDone := make(chan struct{})
+	go func() {
+		h.Close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+		t.Fatalf("Close returned while freshness goroutine still blocked")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(gate)
+	select {
+	case <-released:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("freshness goroutine never observed release")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Close did not return after freshness goroutine released")
+	}
+}
+
+type blockingFreshness struct {
+	gate     chan struct{}
+	released chan struct{}
+}
+
+// Check intentionally ignores ctx so the test can prove that
+// Handler.Close drains the goroutine via activeWG.Wait — not by
+// piggybacking on lifecycleCancel waking a well-behaved Checker. If
+// the activeWG.Add in maybeFireFreshness were missing, Close would
+// return before close(gate) and the test would fail.
+func (b blockingFreshness) Check(_ context.Context, _, _, _ string) {
+	<-b.gate
+	select {
+	case b.released <- struct{}{}:
+	default:
+	}
+}

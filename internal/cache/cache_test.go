@@ -424,6 +424,47 @@ func TestSuiteFreshness_Roundtrip(t *testing.T) {
 	}
 }
 
+func TestListSuites(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	got, err := c.ListSuites(ctx)
+	if err != nil {
+		t.Fatalf("empty ListSuites: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("empty ListSuites returned %d rows", len(got))
+	}
+
+	now := nowUnix()
+	rows := []SuiteFreshness{
+		{CanonicalScheme: "http", CanonicalHost: "archive.ubuntu.com", SuitePath: "/ubuntu/dists/noble", LastSuccessAt: &now},
+		{CanonicalScheme: "http", CanonicalHost: "archive.ubuntu.com", SuitePath: "/ubuntu/dists/jammy", LastSuccessAt: &now},
+		{CanonicalScheme: "https", CanonicalHost: "deb.debian.org", SuitePath: "/debian/dists/bookworm", LastSuccessAt: &now},
+	}
+	for _, r := range rows {
+		if err := c.PutSuiteFreshness(ctx, r); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	got, err = c.ListSuites(ctx)
+	if err != nil {
+		t.Fatalf("ListSuites: %v", err)
+	}
+	if len(got) != len(rows) {
+		t.Errorf("got %d rows, want %d", len(got), len(rows))
+	}
+	seen := make(map[string]bool)
+	for _, r := range got {
+		seen[r.CanonicalScheme+"|"+r.CanonicalHost+"|"+r.SuitePath] = true
+	}
+	for _, r := range rows {
+		key := r.CanonicalScheme + "|" + r.CanonicalHost + "|" + r.SuitePath
+		if !seen[key] {
+			t.Errorf("missing row %q in ListSuites", key)
+		}
+	}
+}
+
 // TestConcurrentWrites verifies that the single-writer goroutine
 // serializes writes from many goroutines without SQLITE_BUSY errors.
 // This is the gating concurrency invariant for SPEC §9.4.

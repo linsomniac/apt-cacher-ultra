@@ -161,6 +161,44 @@ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
 	return &s, nil
 }
 
+// ListSuites returns every suite_freshness row, in no guaranteed order.
+// Used by the periodic freshness scheduler (SPEC §7.4) to pick suites
+// whose last_success_at is older than periodic_refresh.
+//
+// AIDEV-NOTE: this is a full-table scan with no LIMIT. Phase 1 deployments
+// are expected to track tens — at worst low hundreds — of suites
+// (canonical_host × suite_codename), so the scan is cheap. If a future
+// phase pushes this number into the thousands, the caller should switch
+// to a chunked scan keyed on (canonical_scheme, canonical_host, suite_path).
+func (c *Cache) ListSuites(ctx context.Context) ([]SuiteFreshness, error) {
+	const q = `
+SELECT canonical_scheme, canonical_host, suite_path,
+       last_check_at, last_success_at,
+       inrelease_etag, inrelease_lastmod, inrelease_change_seen_at
+FROM suite_freshness`
+	rows, err := c.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("ListSuites: %w", err)
+	}
+	defer rows.Close()
+	var out []SuiteFreshness
+	for rows.Next() {
+		var s SuiteFreshness
+		if err := rows.Scan(
+			&s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
+			&s.LastCheckAt, &s.LastSuccessAt,
+			&s.InReleaseETag, &s.InReleaseLastMod, &s.InReleaseChangeSeenAt,
+		); err != nil {
+			return nil, fmt.Errorf("ListSuites scan: %w", err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListSuites iter: %w", err)
+	}
+	return out, nil
+}
+
 // PutSuiteFreshness upserts the per-suite freshness state.
 func (c *Cache) PutSuiteFreshness(ctx context.Context, s SuiteFreshness) error {
 	const q = `
