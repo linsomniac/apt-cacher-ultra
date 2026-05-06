@@ -197,6 +197,15 @@ func isMetadataSelfPath(p string) bool {
 // signal that an upstream tried to smuggle a separator or dot
 // segment past the literal-string checks above (e.g. "%2e/Release"
 // or "Release%2egpg").
+//
+// Reject "?" and "#" outright. buildMemberURL composes the upstream
+// URL textually (suite + "/" + relPath), so a member path of
+// "Release?x" or "Release#y" fetches the literal "Release" file with
+// a query/fragment delimiter — aliasing past the exact-string
+// metadata-self filter and triggering a content-length mismatch
+// against the stub size apt-ftparchive declares for the self-
+// reference entry. Real Release files never contain these characters
+// in member paths.
 func validateMemberPath(p string) error {
 	if p == "" {
 		return errors.New("empty")
@@ -212,6 +221,9 @@ func validateMemberPath(p string) error {
 	}
 	if strings.ContainsRune(p, '%') {
 		return errors.New("contains percent-encoded byte")
+	}
+	if strings.ContainsAny(p, "?#") {
+		return errors.New("contains URL delimiter")
 	}
 	for _, seg := range strings.Split(p, "/") {
 		switch seg {

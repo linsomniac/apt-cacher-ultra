@@ -163,6 +163,14 @@ func TestParseRelease_BadPaths(t *testing.T) {
 		{"percent-encoded gpg dot", "Release%2egpg"},
 		{"percent-encoded slash", "main%2fPackages"},
 		{"bare percent", "main/Pack%ages"},
+		// buildMemberURL composes upstream URLs textually, so "?" or
+		// "#" at any position aliases the on-disk path away from the
+		// fetched URL — the URL fetches "/Release" but the cache stores
+		// the row under "Release?x", bypassing isMetadataSelfPath.
+		{"query delimiter on root", "Release?x"},
+		{"fragment delimiter on root", "Release#gpg"},
+		{"query delimiter in member", "main/Packages?x"},
+		{"fragment delimiter in member", "main/Packages#x"},
 	}
 	h := sha(1)
 	for _, tc := range cases {
