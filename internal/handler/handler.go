@@ -157,6 +157,23 @@ const (
 	hdrXCacheSnapshot = "X-Cache-Snapshot"
 )
 
+// SPEC2 §6.2 .deb miss-path validation sentinels. The handler maps
+// these onto the same fail-closed shape (502 + Retry-After: 60) the
+// hit-path uses, but with separate identities so respondError can log
+// the right outcome string and operators can grep for either category.
+var (
+	// ErrPackageHashMismatch fires when a successful fetch's bytes
+	// disagree with the *single* declared hash recorded by some current
+	// snapshot's package_hash. Mirrors the "hash_validation_failure"
+	// log keyword from SPEC2 §6.2.
+	ErrPackageHashMismatch = errors.New("handler: fetched .deb hash disagrees with package_hash declaration")
+	// ErrPackageHashConflict fires when two or more current snapshots
+	// disagree on the declared hash for the same .deb path. Cache cannot
+	// safely pick one; surfaces as 502 with the SPEC2 §6.1 step 6 log
+	// keyword "package_hash_conflict".
+	ErrPackageHashConflict = errors.New("handler: snapshots disagree on .deb declared hash")
+)
+
 // ServeHTTP routes one apt request through the cache.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// SPEC §9.5: track this invocation so Close() can wait for the
@@ -235,23 +252,30 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 }
 
 // trySnapshotHit is the SPEC2 §6.1 metadata fast path. Returns
-// handled=true when the request was either served from a snapshot or
-// definitively rejected as not-in-snapshot (404). Returns handled=false
-// only when the suite has no current_snapshot_id, in which case the
-// caller should fall through to the Phase 1 url_path lookup.
+// handled=true when the request was satisfied (served from a snapshot,
+// 404 not-in-snapshot, or 502 fail-closed). Returns handled=false only
+// when the suite has not been adopted (no suite_freshness row, or
+// current_snapshot_id IS NULL), in which case the caller falls through
+// to the Phase 1 url_path lookup.
 //
-// AIDEV-NOTE: a DB lookup error on suite_freshness is treated as
-// "fall through to url_path" — the Phase 1 path is the conservative
-// default. A DB error on snapshot_member after the suite is confirmed
-// adopted is also fall-through (handled=true, served=false), because
-// the request is contractually snapshot-scoped and a Phase 1 fallback
-// would violate the §6.1 invariant. The miss path will then re-attempt
-// the lookup or fetch with hash validation.
+// AIDEV-NOTE: every failure mode after a suite has been confirmed
+// adopted (DB error on snapshot_member, missing pool blob, etc.) must
+// fail closed with a 502 — never drop into serveCacheMiss. The miss
+// path does not validate metadata against snapshot_member, so any
+// fall-through would let unverified upstream bytes masquerade as the
+// adopted snapshot's content. SPEC2 §6.1 / §6.2: "the snapshot is the
+// contract." A SuiteFreshness DB error is the one ambiguous case —
+// we don't know whether the suite is adopted, so we fail closed too;
+// the realistic failure mode is "DB is broken everywhere", and a 502
+// across the board is the right operator signal.
 func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, status int, bytesWritten int64, handled bool) {
 	suite, err := h.cache.GetSuiteFreshness(r.Context(),
 		req.CanonicalScheme, req.CanonicalHost, req.SuitePath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
+		// Suite has never been seen — pre-Phase-2 regime. Falling through
+		// to url_path is safe because no §6.1 contract has been
+		// established for this (host, suite).
 		return false, 0, 0, false
 	case err != nil:
 		h.logger.Warn("suite_freshness lookup failed",
@@ -259,7 +283,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 			"canonical_host", req.CanonicalHost,
 			"suite_path", req.SuitePath,
 		)
-		return false, 0, 0, false
+		return h.writeFailClosed(w, "suite lookup failed"), http.StatusBadGateway, 0, true
 	}
 	if suite.CurrentSnapshotID == nil {
 		// Suite known but never adopted — pre-Phase-2 regime.
@@ -283,10 +307,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 			"path", req.Path,
 			"snapshot_id", snapshotID,
 		)
-		// Don't fall through to url_path — the suite is adopted, so
-		// only the snapshot is allowed to satisfy the request. Return
-		// handled=true with served=false to push to the miss path.
-		return false, 0, 0, true
+		return h.writeFailClosed(w, "snapshot lookup failed"), http.StatusBadGateway, 0, true
 	}
 
 	served, status, bytesWritten = h.serveBlobWithHeaders(w, r, req, mem.BlobHash, snapshotMeta{
@@ -294,13 +315,35 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		lastFetchedAt: nil, // snapshot rows don't carry per-blob last-fetched
 	})
 	if !served {
-		// Blob open / stat error — drop into the miss path, but keep
-		// handled=true so url_path is not consulted.
-		return false, 0, 0, true
+		// Pool blob is missing for a known snapshot member (operator
+		// deletion, disk corruption discovered by the integrity scan).
+		// SPEC2 §6.2 contemplates a hash-validated re-fetch here, but
+		// without the §6.2 metadata-validation plumbing in place a
+		// re-fetch via serveCacheMiss would serve unverified bytes as
+		// adopted-snapshot content. Fail closed; the integrity scanner
+		// (SPEC2 §6.5 at-rest) is the correct recovery path.
+		h.logger.Error("snapshot_member_blob_missing",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"snapshot_id", snapshotID,
+			"blob_hash", mem.BlobHash,
+		)
+		return h.writeFailClosed(w, "snapshot blob missing"), http.StatusBadGateway, 0, true
 	}
 	go h.touchAsync(req)
 	h.maybeFireFreshness(req)
 	return true, status, bytesWritten, true
+}
+
+// writeFailClosed writes a 502 + Retry-After: 30 response for an
+// adopted-suite metadata request that cannot be served safely. Always
+// returns true so the caller can fold it into the served-bool of
+// trySnapshotHit's return tuple. SPEC2 §6.1 invariant: never drop into
+// the unverified miss path on adopted suites.
+func (h *Handler) writeFailClosed(w http.ResponseWriter, reason string) bool {
+	w.Header().Set("Retry-After", "30")
+	http.Error(w, reason, http.StatusBadGateway)
+	return true
 }
 
 // tryURLPathHit is the Phase 1 / non-metadata url_path lookup. It also
@@ -666,6 +709,30 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 		return sfResult{err: fmt.Errorf("handler: finalize blob: %w", err), status: fres.Status}
 	}
 
+	// SPEC2 §6.2 .deb hash validation. For non-metadata paths covered by
+	// any current snapshot's package_hash, the fetched bytes must match
+	// the declared hash before they can enter pool/ or url_path. The
+	// query is the same shape as §6.1 step 2; conflicting declarations
+	// (≥ 2 distinct hashes) fail closed exactly like the hit-path.
+	//
+	// Skipped for metadata: §6.2 metadata validation under an adopted
+	// suite needs a different trust anchor (snapshot_member.declared_sha256
+	// keyed by suite-relative path), and trySnapshotHit fails closed before
+	// metadata can reach this code path on an adopted suite. Metadata under
+	// non-adopted suites is the Phase 1 trust-upstream path with no
+	// snapshot to validate against.
+	if !req.IsMetadata {
+		if verr := h.validateDebAgainstPackageHash(ctx, req, hash); verr != nil {
+			if rerr := h.cache.DiscardFinalizedBlob(hash); rerr != nil {
+				h.logger.Warn("discard mismatched blob failed",
+					"err", rerr,
+					"hash", hash,
+				)
+			}
+			return sfResult{err: verr, status: fres.Status}
+		}
+	}
+
 	// Persist blob + url_path with a small budget. ctx here is the
 	// handler lifecycle ctx (see serveCacheMiss), so a leader's client
 	// disconnect does not propagate — but a shutdown cancel does, which
@@ -742,6 +809,72 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 	}
 }
 
+// validateDebAgainstPackageHash runs the SPEC2 §6.2 .deb miss-path
+// validation: after a fetched non-metadata blob is finalized into pool/,
+// query DeclaredHashesForPath and compare against the fetched hash.
+//
+//   - 0 declared rows  → no current snapshot covers this path; trust-
+//     upstream (returns nil).
+//   - 1 declared row, hash matches → OK.
+//   - 1 declared row, hash mismatches → return ErrPackageHashMismatch
+//     with the declared/observed pair logged. SPEC2 §6.2 keyword
+//     hash_validation_failure.
+//   - 2+ distinct declared rows → return ErrPackageHashConflict with
+//     all (declared_sha256, snapshot_id) pairs logged. SPEC2 §6.2 +
+//     §6.1 step 6 share the keyword package_hash_conflict.
+//
+// The caller (runFetch) is responsible for discarding the on-disk pool
+// blob and returning a sfResult with this error, which respondError
+// surfaces as 502 + Retry-After: 60.
+func (h *Handler) validateDebAgainstPackageHash(ctx context.Context, req *proxy.Request, fetchedHash string) error {
+	rows, err := h.cache.DeclaredHashesForPath(ctx,
+		req.CanonicalScheme, req.CanonicalHost, req.Path)
+	if err != nil {
+		// DB error during validation — fail open, like the hit-path
+		// helper. A blanket fail-closed would turn a transient SQLite
+		// hiccup into a global .deb 502 storm.
+		h.logger.Warn("package_hash validate lookup failed",
+			"err", err,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+		)
+		return nil
+	}
+	distinct := distinctDeclared(rows)
+	switch len(distinct) {
+	case 0:
+		// SPEC2 §6.2 keyword package_hash_miss is Debug-level diagnostic
+		// for monitoring coverage gaps; emitted only when a request
+		// reaches the miss path with no covering snapshot.
+		h.logger.Debug("package_hash_miss",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+		)
+		return nil
+	case 1:
+		if distinct[0] == fetchedHash {
+			return nil
+		}
+		h.logger.Error("hash_validation_failure",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"declared_sha256", distinct[0],
+			"observed_sha256", fetchedHash,
+			"snapshot_id", rows[0].SnapshotID,
+		)
+		return fmt.Errorf("%w: declared %s, observed %s",
+			ErrPackageHashMismatch, distinct[0], fetchedHash)
+	default:
+		h.logger.Error("package_hash_conflict",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"observed_sha256", fetchedHash,
+			"declared", declaredAttrs(rows),
+		)
+		return ErrPackageHashConflict
+	}
+}
+
 // inReleaseSuffix is the path suffix that identifies the InRelease
 // file under a suite path. Kept as a package constant so the same
 // literal is used for the seed-detection check above and (in the
@@ -811,6 +944,20 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		w.Header().Set("Retry-After", retryAfterForRequest(req))
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		h.logRequest(r, req.CanonicalHost, req.Path, "cache_write_failed", http.StatusBadGateway, 0, true, res.status, start)
+		return
+	case errors.Is(err, ErrPackageHashMismatch):
+		// SPEC2 §6.2: fetched .deb bytes disagree with the snapshot's
+		// declared hash. Discard + 502 + Retry-After: 60. The detailed
+		// log line was already emitted in validateDebAgainstPackageHash.
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "package hash mismatch", http.StatusBadGateway)
+		h.logRequest(r, req.CanonicalHost, req.Path, "package_hash_mismatch", http.StatusBadGateway, 0, true, res.status, start)
+		return
+	case errors.Is(err, ErrPackageHashConflict):
+		// SPEC2 §6.1 step 6 / §6.2: snapshots disagree. 502 + Retry-After: 60.
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "package hash conflict", http.StatusBadGateway)
+		h.logRequest(r, req.CanonicalHost, req.Path, "package_hash_conflict", http.StatusBadGateway, 0, true, res.status, start)
 		return
 	case errors.Is(err, fetch.ErrInvalidURL):
 		// URL parse / scheme / host-mismatch failure — fired before

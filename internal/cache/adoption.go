@@ -327,13 +327,16 @@ type DeclaredHash struct {
 // Returns rows in no defined order. Empty slice + nil error means "no
 // snapshot covers this path" — Phase 1 trust-upstream regime.
 //
-// AIDEV-NOTE: this is the share helper between §6.1 (hit-path validation)
+// AIDEV-NOTE: this is the shared helper between §6.1 (hit-path validation)
 // and §6.2 (miss-path validation). Both call sites need declared+snapshot
 // pairs (the snapshot id is required for fail-closed conflict logging).
-// One distinct declared_sha256 with the same value across multiple
-// snapshots collapses to a single row via DISTINCT — but we keep the
-// snapshot id alongside it because the operator log line must name *a*
-// snapshot when the hash matches.
+// The DISTINCT clause is over (declared_sha256, snapshot_id), so two
+// snapshots that *agree* on a hash still produce two rows — one per
+// snapshot. The handler-side helper distinctDeclared collapses those
+// duplicate hashes when classifying "0 / 1 / 2+ distinct hashes" for
+// the §6.1 hit-path dispatch; the conflict log surface shows every row
+// (snapshot id included) so an operator can trace which adoptions
+// disagreed.
 func (c *Cache) DeclaredHashesForPath(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
 	const q = `
 SELECT DISTINCT p.declared_sha256, p.snapshot_id

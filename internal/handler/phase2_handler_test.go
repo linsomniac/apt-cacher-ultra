@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -259,11 +260,14 @@ func TestServeHTTP_DebHitMatchingPackageHashServes(t *testing.T) {
 	}
 }
 
-// TestServeHTTP_DebHitMismatchingPackageHashEvicts covers §6.1 step 5:
-// a single declared hash that disagrees with url_path.blob_hash evicts
-// the row, decrements refcount, logs hit_path_hash_evicted, and falls
-// through to the miss path.
-func TestServeHTTP_DebHitMismatchingPackageHashEvicts(t *testing.T) {
+// TestServeHTTP_DebHitMismatchingPackageHashEvictsAndRefetchFailsClosed
+// covers §6.1 step 5 + §6.2 .deb miss-path validation jointly: the
+// hit-path eviction succeeds, but the subsequent miss-path re-fetch
+// still receives the wrong bytes from upstream and must fail closed
+// with 502 + Retry-After: 60 (ErrPackageHashMismatch). Without the §6.2
+// validation, the bad bytes would be cached and served (the unsafe
+// behavior codex flagged).
+func TestServeHTTP_DebHitMismatchingPackageHashEvictsAndRefetchFailsClosed(t *testing.T) {
 	body := []byte("upstream .deb bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Write(body)
@@ -289,7 +293,6 @@ func TestServeHTTP_DebHitMismatchingPackageHashEvicts(t *testing.T) {
 	if preRow.BlobHash == nil || *preRow.BlobHash == "" {
 		t.Fatalf("expected blob_hash on pre-evict row")
 	}
-	originalBlobHash := *preRow.BlobHash
 
 	// Seed a snapshot whose package_hash declares a DIFFERENT hash for
 	// the same .deb path. The mismatch fires the §6.1 step-5 eviction.
@@ -308,28 +311,200 @@ func TestServeHTTP_DebHitMismatchingPackageHashEvicts(t *testing.T) {
 			},
 		})
 
-	// Hit triggers the mismatch path; eviction fires + miss re-fetches.
+	// First post-snapshot request: §6.1 step 5 evicts the stale row
+	// and the miss path re-fetches; the re-fetched bytes still hash to
+	// the original (the upstream is fixed in this test), but they don't
+	// match the snapshot's declared hash. §6.2 fails closed: 502 + 60s.
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, proxyReq("GET", srv.URL, debPath))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("post-evict request: status=%d body=%q", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("post-evict re-fetch: status=%d, want 502 (§6.2 fail-closed)", rec.Code)
 	}
-	// The miss-path re-fetch sees the same upstream bytes, re-installs
-	// the same url_path row. The response is X-Cache: MISS because the
-	// eviction forced the request through serveCacheMiss.
-	if got := rec.Header().Get("X-Cache"); got != "MISS" {
-		t.Errorf("X-Cache=%q, want MISS (post-evict re-fetch)", got)
+	if got := rec.Header().Get("Retry-After"); got != "60" {
+		t.Errorf("Retry-After=%q, want 60", got)
 	}
 
-	// url_path is repopulated; assert the row was evicted-and-rebuilt by
-	// checking the blob still resolves to the same content (idempotent
-	// re-fetch).
-	postRow, err := h.cache.LookupURL(context.Background(), scheme, canonHost, debPath)
-	if err != nil {
-		t.Fatalf("LookupURL post-evict: %v", err)
+	// url_path was evicted and the re-fetch did NOT re-insert (because
+	// validation rejected). LookupURL should now report ErrNotFound.
+	if _, err := h.cache.LookupURL(context.Background(), scheme, canonHost, debPath); err == nil {
+		t.Errorf("url_path row was re-inserted after validation failure (should remain evicted)")
 	}
-	if postRow.BlobHash == nil || *postRow.BlobHash != originalBlobHash {
-		t.Errorf("post-evict blob hash = %v, want %s", postRow.BlobHash, originalBlobHash)
+}
+
+// TestServeHTTP_DebMissValidatesAgainstPackageHash covers §6.2 in
+// isolation: a fresh fetch (no prior url_path row) for a .deb that
+// disagrees with the snapshot's declared hash must 502 without ever
+// inserting blob/url_path rows.
+func TestServeHTTP_DebMissValidatesAgainstPackageHash(t *testing.T) {
+	body := []byte("upstream .deb bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	scheme, host, port := splitURL(t, srv.URL)
+	debPath := "/pool/main/h/hello/hello.deb"
+	canonHost := hostKey(host, port)
+
+	// Seed a covering snapshot with the wrong declared hash, BEFORE any
+	// fetch. The first request goes straight to the miss path and must
+	// fail validation.
+	releaseBlob := writeBlob(t, h, []byte("InRelease for noble"))
+	wrongHash := strings.Repeat("e", 64)
+	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/noble", releaseBlob,
+		[]cache.SnapshotMember{
+			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
+		},
+		[]cache.PackageHash{
+			{CanonicalScheme: scheme, CanonicalHost: canonHost,
+				Path: debPath, DeclaredSHA256: wrongHash},
+		})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, debPath))
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status=%d, want 502 (§6.2 hash validation)", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "60" {
+		t.Errorf("Retry-After=%q, want 60", got)
+	}
+	if _, err := h.cache.LookupURL(context.Background(), scheme, canonHost, debPath); err == nil {
+		t.Errorf("url_path row inserted after validation failure (must not insert)")
+	}
+}
+
+// TestServeHTTP_DebMissConflictingPackageHashFailsClosed covers §6.2
+// step 4: two current snapshots with distinct declared hashes for the
+// same .deb path. Even on a fresh fetch (no prior url_path row), the
+// miss path must 502 + Retry-After: 60 without inserting.
+func TestServeHTTP_DebMissConflictingPackageHashFailsClosed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("upstream content"))
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	scheme, host, port := splitURL(t, srv.URL)
+	debPath := "/pool/main/h/hello/hello.deb"
+	canonHost := hostKey(host, port)
+
+	rA := writeBlob(t, h, []byte("InRelease A"))
+	rB := writeBlob(t, h, []byte("InRelease B"))
+	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/A", rA,
+		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: rA, DeclaredSHA256: rA}},
+		[]cache.PackageHash{{CanonicalScheme: scheme, CanonicalHost: canonHost,
+			Path: debPath, DeclaredSHA256: strings.Repeat("a", 64)}})
+	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/B", rB,
+		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: rB, DeclaredSHA256: rB}},
+		[]cache.PackageHash{{CanonicalScheme: scheme, CanonicalHost: canonHost,
+			Path: debPath, DeclaredSHA256: strings.Repeat("b", 64)}})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, debPath))
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status=%d, want 502 (snapshot conflict)", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "60" {
+		t.Errorf("Retry-After=%q, want 60", got)
+	}
+}
+
+// TestServeHTTP_AdoptedSuiteSnapshotMemberDBError_FailsClosed covers
+// the codex finding: a DB error on snapshot_member lookup for an
+// adopted suite must NOT fall through to serveCacheMiss. We trigger
+// the error by closing the cache mid-flight; subsequent reads return
+// "database is closed". The handler must produce 502 + Retry-After: 30,
+// not a phantom unverified upstream fetch.
+//
+// Closes the cache before the request fires; this leaves the handler
+// holding a closed *cache.Cache. ServeHTTP doesn't spin up new fetches
+// (no upstream is needed for this test), but the assertion "no fall-
+// through to miss path" is the load-bearing one.
+func TestServeHTTP_AdoptedSuiteSnapshotMemberDBError_FailsClosed(t *testing.T) {
+	upstreamCalls := atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Write([]byte("attacker bytes"))
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	scheme, host, port := splitURL(t, srv.URL)
+	canonHost := hostKey(host, port)
+
+	// Adopt a snapshot, then close the cache so subsequent reads error.
+	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/noble", releaseBlob,
+		[]cache.SnapshotMember{
+			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
+		}, nil)
+
+	// Close the cache. The handler still holds the *Cache pointer; the
+	// closed underlying *sql.DB will return "database is closed" on
+	// any further query. This simulates the "DB error on snapshot
+	// lookup for an adopted suite" code path.
+	if err := h.cache.Close(); err != nil {
+		t.Fatalf("close cache: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/dists/noble/InRelease"))
+
+	// Either 502 (snapshot lookup failed → fail-closed) or 502 from
+	// fall-through to the miss-path that also fails on DB writes is
+	// acceptable; what is NOT acceptable is a 200 with upstream bytes.
+	if rec.Code == http.StatusOK {
+		t.Errorf("status=200 — adopted suite served unverified bytes; got body=%q",
+			rec.Body.String())
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Errorf("upstream calls=%d, want 0 (no fetch on adopted-suite DB error)", got)
+	}
+}
+
+// TestServeHTTP_AdoptedSuiteMissingBlob_FailsClosed covers the codex
+// finding: when an adopted suite has a snapshot_member row but the
+// pool/<blob> file is missing on disk, the handler must NOT fall
+// through to serveCacheMiss (which would fetch unverified bytes).
+// Fail closed with 502 + Retry-After: 30.
+func TestServeHTTP_AdoptedSuiteMissingBlob_FailsClosed(t *testing.T) {
+	upstreamCalls := atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Write([]byte("attacker-supplied bytes"))
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	scheme, host, port := splitURL(t, srv.URL)
+	canonHost := hostKey(host, port)
+	suite := "/dists/noble"
+
+	// Adopt a snapshot with a member.
+	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
+		[]cache.SnapshotMember{
+			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
+		}, nil)
+
+	// Delete the pool blob to simulate operator deletion / corruption.
+	blobPath := h.cache.BlobPath(releaseBlob)
+	if err := os.Remove(blobPath); err != nil {
+		t.Fatalf("remove blob: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/dists/noble/InRelease"))
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status=%d, want 502 (fail-closed on missing snapshot blob)",
+			rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "30" {
+		t.Errorf("Retry-After=%q, want 30", got)
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Errorf("upstream calls=%d, want 0 (must not fetch unverified)", got)
 	}
 }
 

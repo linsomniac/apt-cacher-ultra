@@ -218,6 +218,28 @@ func (w *BlobWriter) Abort() error {
 	return nil
 }
 
+// DiscardFinalizedBlob removes the on-disk pool/<hash> file without
+// touching the blob table — a no-op if the file isn't there. Used by
+// SPEC2 §6.2 .deb miss-path validation: the bytes have been Finalize'd
+// (so they live in pool/) but the hash doesn't match the snapshot's
+// declared value, so we drop them before any DB row references them.
+//
+// Idempotent and safe under concurrency: a parallel fetch that just
+// re-finalized the same hash will simply re-create the file. Safe to
+// call without holding any singleflight lock.
+//
+// AIDEV-NOTE: validBlobHash is enforced before the os.Remove so a
+// caller mistake cannot turn this into a path-traversal primitive.
+func (c *Cache) DiscardFinalizedBlob(hash string) error {
+	if !validBlobHash(hash) {
+		return fmt.Errorf("%w: %q", ErrInvalidHash, hash)
+	}
+	if err := os.Remove(c.BlobPath(hash)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("cache: remove blob: %w", err)
+	}
+	return nil
+}
+
 // SweepTmp deletes any file under tmp/ whose mtime is older than maxAge.
 // Run at startup to reap orphans from a previous crash (SPEC §4.2).
 func (c *Cache) SweepTmp(maxAge time.Duration) error {
