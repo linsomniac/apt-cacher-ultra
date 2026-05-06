@@ -698,3 +698,146 @@ func TestPhase2_GPGFingerprintCaseSensitivity(t *testing.T) {
 		}
 	}
 }
+
+// TestLoad_HotPackagesWindowDefaultApplied: omitted hot_packages.window
+// gets the SPEC3 §5.2 default of 24h.
+func TestLoad_HotPackagesWindowDefaultApplied(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.HotPackages.Window.Duration != 24*time.Hour {
+		t.Errorf("hot_packages.window default = %s, want 24h", cfg.HotPackages.Window.Duration)
+	}
+}
+
+// TestLoad_HotPackagesWindowExplicitZeroRespected: SPEC3 §5.2 — an
+// operator-written 0s must survive Defaults() (it disables proactive
+// refresh). Same IsDefined pattern as Phase 2's
+// freshness.max_concurrent_adoptions.
+func TestLoad_HotPackagesWindowExplicitZeroRespected(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[hot_packages]
+window = "0s"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.HotPackages.Window.Duration != 0 {
+		t.Errorf("explicit hot_packages.window=0s was clobbered to %s", cfg.HotPackages.Window.Duration)
+	}
+}
+
+// TestLoad_HotPrefetchBudgetDefaultApplied: omitted
+// adoption.hot_prefetch_budget gets the SPEC3 §5.2 default of 5m.
+func TestLoad_HotPrefetchBudgetDefaultApplied(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Adoption.HotPrefetchBudget.Duration != 5*time.Minute {
+		t.Errorf("hot_prefetch_budget default = %s, want 5m", cfg.Adoption.HotPrefetchBudget.Duration)
+	}
+}
+
+// TestLoad_HotPrefetchBudgetExplicitZeroRespected: an operator-written
+// 0s for the budget disables the wall-clock guard. SPEC3 §5.2.
+func TestLoad_HotPrefetchBudgetExplicitZeroRespected(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[adoption]
+hot_prefetch_budget = "0s"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Adoption.HotPrefetchBudget.Duration != 0 {
+		t.Errorf("explicit hot_prefetch_budget=0s was clobbered to %s", cfg.Adoption.HotPrefetchBudget.Duration)
+	}
+}
+
+// TestLoad_RefuseUnvouchedDebsDefault: omitted
+// integrity.refuse_unvouched_debs defaults to false (SPEC3 §1.3 —
+// the default-flip to true is gated on production data).
+func TestLoad_RefuseUnvouchedDebsDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Integrity.RefuseUnvouchedDebs {
+		t.Errorf("refuse_unvouched_debs = true by default; want false")
+	}
+}
+
+// TestLoad_RefuseUnvouchedDebsExplicitTrue: operator opt-in is
+// observed (otherwise the strict-mode predicate is unreachable).
+func TestLoad_RefuseUnvouchedDebsExplicitTrue(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[integrity]
+refuse_unvouched_debs = true
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Integrity.RefuseUnvouchedDebs {
+		t.Errorf("explicit refuse_unvouched_debs=true was not applied")
+	}
+}
+
+// TestValidate_RejectsNegativeHotPackagesWindow: SPEC3 §5.2 — window
+// must be ≥ 0.
+func TestValidate_RejectsNegativeHotPackagesWindow(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[hot_packages]
+window = "-1s"
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "hot_packages.window") {
+		t.Errorf("got %v, want hot_packages.window error", err)
+	}
+}
+
+// TestValidate_RejectsNegativeHotPrefetchBudget: SPEC3 §5.2 —
+// hot_prefetch_budget must be ≥ 0.
+func TestValidate_RejectsNegativeHotPrefetchBudget(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[adoption]
+hot_prefetch_budget = "-1s"
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "hot_prefetch_budget") {
+		t.Errorf("got %v, want hot_prefetch_budget error", err)
+	}
+}

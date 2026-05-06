@@ -25,8 +25,22 @@ func TestParsePackages_HappyPath(t *testing.T) {
 		t.Fatalf("ParsePackages: %v", err)
 	}
 	want := []PackageRef{
-		{Filename: "pool/main/f/foo/foo_1.2-3_amd64.deb", SHA256: h1, Size: 12345},
-		{Filename: "pool/main/b/bar/bar_2.0_amd64.deb", SHA256: h2, Size: 67890},
+		{
+			Filename:     "pool/main/f/foo/foo_1.2-3_amd64.deb",
+			SHA256:       h1,
+			Size:         12345,
+			Package:      "foo",
+			Architecture: "amd64",
+		},
+		{
+			Filename: "pool/main/b/bar/bar_2.0_amd64.deb",
+			SHA256:   h2,
+			Size:     67890,
+			Package:  "bar",
+			// Architecture absent from this stanza — Phase 3 leaves
+			// it as "" rather than rejecting; the SPEC3 §7.5.3
+			// hot-set query filters empty values explicitly.
+		},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d, want %d", len(got), len(want))
@@ -268,6 +282,58 @@ func TestParsePackages_LargeRealistic(t *testing.T) {
 	}
 	if len(got) != n {
 		t.Errorf("got %d, want %d", len(got), n)
+	}
+}
+
+// TestParsePackages_ExtractsPackageAndArchitecture covers the SPEC3
+// §7.5.2 parser additions. The hot-set query keys on (Package, Arch),
+// so a stanza missing either must surface as an empty string (not
+// dropped, since hash validation still wants the row).
+func TestParsePackages_ExtractsPackageAndArchitecture(t *testing.T) {
+	h := sha(1)
+	body := "Package: nginx\n" +
+		"Architecture: amd64\n" +
+		"Filename: pool/main/n/nginx/nginx_1.2_amd64.deb\n" +
+		"SHA256: " + h + "\n" +
+		"\n" +
+		// Stanza missing Architecture — Phase 3 leaves it empty.
+		"Package: lonely\n" +
+		"Filename: pool/main/l/lonely/lonely.deb\n" +
+		"SHA256: " + h + "\n"
+	got, err := ParsePackages([]byte(body))
+	if err != nil {
+		t.Fatalf("ParsePackages: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d, want 2: %+v", len(got), got)
+	}
+	if got[0].Package != "nginx" || got[0].Architecture != "amd64" {
+		t.Errorf("first: pkg=%q arch=%q, want nginx/amd64", got[0].Package, got[0].Architecture)
+	}
+	if got[1].Package != "lonely" || got[1].Architecture != "" {
+		t.Errorf("second: pkg=%q arch=%q, want lonely/\"\"", got[1].Package, got[1].Architecture)
+	}
+}
+
+// TestParsePackages_CaseInsensitivePackageArchitecture: the field-name
+// match should be case-insensitive (RFC822/Debian policy). A
+// lowercased "package:" stanza must populate Package the same as
+// "Package:".
+func TestParsePackages_CaseInsensitivePackageArchitecture(t *testing.T) {
+	h := sha(1)
+	body := "package: nginx\n" +
+		"architecture: amd64\n" +
+		"filename: pool/main/n/nginx.deb\n" +
+		"sha256: " + h + "\n"
+	got, err := ParsePackages([]byte(body))
+	if err != nil {
+		t.Fatalf("ParsePackages: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d, want 1", len(got))
+	}
+	if got[0].Package != "nginx" || got[0].Architecture != "amd64" {
+		t.Errorf("lowercased fields not parsed: %+v", got[0])
 	}
 }
 

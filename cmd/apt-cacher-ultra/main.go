@@ -174,8 +174,11 @@ func serveListeners(
 		"adoption_enabled", cfg.Adoption.Enabled,
 		"adoption_require_signature", cfg.Adoption.RequireSignature,
 		"adoption_require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
+		"adoption_hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
+		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"integrity_validate_at_rest_interval", cfg.Integrity.ValidateAtRestInterval.Duration,
 		"integrity_validate_at_rest_workers", cfg.Integrity.ValidateAtRestWorkers,
+		"integrity_refuse_unvouched_debs", cfg.Integrity.RefuseUnvouchedDebs,
 		"trusted_signer_blocks", len(cfg.TrustedSigners),
 		"serve_stale_when_upstream_down", cfg.Serve.ServeStaleWhenUpstreamDown,
 		"log_format", cfg.Log.Format,
@@ -187,6 +190,18 @@ func serveListeners(
 	// in the journal even before adoption is actually wired.
 	if !cfg.Adoption.RequireSignature {
 		logger.Warn("adoption.require_signature = false: unsigned upstream metadata would be adopted (auditable per SPEC2 §5.1)")
+	}
+
+	// SPEC3 §5.2 loud configurations. Both fire once at startup so an
+	// operator scanning the journal sees the configuration's actual
+	// behavior — not just the defaults the spec mentions.
+	if cfg.Adoption.HotPrefetchBudget.Duration == 0 {
+		logger.Warn("hot_prefetch_budget_unbounded",
+			"detail", "adoption.hot_prefetch_budget = 0: hot prefetch loop runs until every hot deb terminates; worst-case wait is N × upstream.total_timeout × upstream.max_retries")
+	}
+	if cfg.Integrity.RefuseUnvouchedDebs && !cfg.Adoption.Enabled {
+		logger.Warn("refuse_unvouched_debs_inert",
+			"detail", "integrity.refuse_unvouched_debs = true with adoption.enabled = false: strict mode predicate explicitly checks adoption.enabled and is therefore inert (SPEC3 §6.1, §10.2)")
 	}
 
 	c, err := cache.Open(ctx, cfg.Cache.Dir, logger)
@@ -268,13 +283,15 @@ func serveListeners(
 	}
 
 	h, err := handler.New(handler.Config{
-		Parser:      parser,
-		Cache:       c,
-		Fetch:       fetchClient,
-		HostLimiter: hostLimiter,
-		Logger:      logger,
-		Freshness:   freshChecker,
-		Serve:       cfg.Serve,
+		Parser:              parser,
+		Cache:               c,
+		Fetch:               fetchClient,
+		HostLimiter:         hostLimiter,
+		Logger:              logger,
+		Freshness:           freshChecker,
+		Serve:               cfg.Serve,
+		RefuseUnvouchedDebs: cfg.Integrity.RefuseUnvouchedDebs,
+		AdoptionEnabled:     cfg.Adoption.Enabled,
 	})
 	if err != nil {
 		return fmt.Errorf("build handler: %w", err)
@@ -482,12 +499,14 @@ func buildAdopter(
 	}
 
 	adopter, err := freshness.NewAdopter(freshness.AdoptionConfig{
-		Cache:         c,
-		Fetcher:       fetchClient,
-		Verifier:      verifier,
-		HostLimiter:   hostLimiter,
-		MaxConcurrent: cfg.Freshness.MaxConcurrentAdoptions,
-		Logger:        logger,
+		Cache:             c,
+		Fetcher:           fetchClient,
+		Verifier:          verifier,
+		HostLimiter:       hostLimiter,
+		MaxConcurrent:     cfg.Freshness.MaxConcurrentAdoptions,
+		HotPackagesWindow: cfg.HotPackages.Window.Duration,
+		HotPrefetchBudget: cfg.Adoption.HotPrefetchBudget.Duration,
+		Logger:            logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("new adopter: %w", err)
@@ -498,6 +517,8 @@ func buildAdopter(
 		"trusted_signer_blocks", len(pins),
 		"require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
 		"max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
+		"hot_packages_window", cfg.HotPackages.Window.Duration,
+		"hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
 	)
 	return adopter, nil
 }

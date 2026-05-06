@@ -70,18 +70,23 @@ func (c *Cache) InsertCandidateSnapshot(ctx context.Context, sc SnapshotCandidat
 INSERT INTO suite_snapshot
   (canonical_scheme, canonical_host, suite_path,
    inrelease_hash, inrelease_etag, inrelease_lastmod,
-   release_hash, release_gpg_hash, created_at, adopted_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+   release_hash, release_gpg_hash, created_at, adopted_at,
+   package_coverage_complete)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
 	const lookupQ = `
 SELECT snapshot_id, adopted_at FROM suite_snapshot
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?
    AND COALESCE(inrelease_hash, release_hash) = ?`
 	now := nowUnix()
+	coverage := int64(0)
+	if sc.PackageCoverageComplete {
+		coverage = 1
+	}
 	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		res, execErr := conn.ExecContext(ctx, insertQ,
 			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath,
 			sc.InReleaseHash, sc.InReleaseETag, sc.InReleaseLastMod,
-			sc.ReleaseHash, sc.ReleaseGPGHash, now)
+			sc.ReleaseHash, sc.ReleaseGPGHash, now, coverage)
 		if execErr == nil {
 			id, execErr = res.LastInsertId()
 			if execErr != nil {
@@ -153,11 +158,34 @@ UPDATE suite_snapshot
 	return id, reused, nil
 }
 
+// PrefetchedURLPath carries one Phase 3 hot-deb prefetch outcome into
+// CommitAdoption. The atomic flip transaction inserts (or upserts) a
+// url_path row pointing at the warmed pool blob *inside the same
+// transaction* that flips current_snapshot_id, so readers never observe
+// a warmed deb whose blob_hash is visible while the prior snapshot is
+// still current. SPEC3 §7.5.1.
+type PrefetchedURLPath struct {
+	CanonicalScheme string
+	CanonicalHost   string
+	Path            string // canonical .deb path
+	BlobHash        string // sha256 hex of the warmed pool blob
+	UpstreamURL     string
+}
+
 // CommitAdoption performs the SPEC2 §7.5.1 atomic flip transaction:
 //
 //  1. Verify the snapshot is still a candidate (adopted_at IS NULL).
 //  2. Insert all snapshot_member rows for snapshotID.
 //  3. Insert all package_hash rows.
+//  3a. (Phase 3, SPEC3 §7.5.1) Insert/upsert url_path rows for the
+//      hot debs warmed during prefetch. Hotness signal preservation:
+//      DO UPDATE intentionally omits last_requested_at and
+//      request_count, diverging from PutURLPath, so the next
+//      adoption's hot-set query still sees the path as hot.
+//  3b. (Phase 3) Stamp suite_snapshot.package_coverage_complete from
+//      the caller's coverageComplete bit — set under the same
+//      transaction as the flip so readers see coverage atomically
+//      with the snapshot becoming current.
 //  4. Bump blob.refcount for each distinct blob_hash referenced by the
 //     new snapshot's members. Each blob is counted once even if many
 //     member rows point at it.
@@ -184,12 +212,23 @@ UPDATE suite_snapshot
 // PackageHashes is the per-.deb declared-hash assertion set. Pass an
 // empty slice for suites with no .debs (e.g. metadata-only suites).
 //
-// AIDEV-NOTE: this is the load-bearing transaction of Phase 2. Any
-// SQL error inside the body causes a Rollback — no partial flip can
-// be observed by any reader. The prior_id lookup happens *inside* the
-// transaction so a concurrent flip cannot race the bookkeeping.
+// PrefetchedURLPaths is the SPEC3 §7.5.1 hot-prefetch outcome list.
+// Pass nil (Phase 2 callers, or Phase 3 callers whose hot-prefetch
+// loop produced no successfully warmed debs) for the unchanged Phase 2
+// flip behavior.
+//
+// CoverageComplete is the SPEC3 §7.5.4 per-snapshot coverage proof for
+// the strict-mode predicate (§6.1) to key on. Phase 2 callers and
+// pre-/dists/-layout adoptions pass false.
+//
+// AIDEV-NOTE: this is the load-bearing transaction of Phase 2 (and
+// Phase 3). Any SQL error inside the body causes a Rollback — no
+// partial flip can be observed by any reader. The prior_id lookup
+// happens *inside* the transaction so a concurrent flip cannot race
+// the bookkeeping.
 func (c *Cache) CommitAdoption(ctx context.Context, snapshotID int64,
-	members []SnapshotMember, packageHashes []PackageHash) error {
+	members []SnapshotMember, packageHashes []PackageHash,
+	prefetchedURLPaths []PrefetchedURLPath, coverageComplete bool) error {
 	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
@@ -238,19 +277,73 @@ VALUES (?, ?, ?, ?)`,
 			}
 		}
 
-		// Step 3: insert package_hash rows.
+		// Step 3: insert package_hash rows. Phase 3 (SPEC3 §4.3.1)
+		// added package_name and architecture columns; rows whose
+		// stanza didn't declare both end up with empty strings, which
+		// the SPEC3 §7.5.3 hot-set query filters out.
 		for _, p := range packageHashes {
 			if !validBlobHash(p.DeclaredSHA256) {
 				return fmt.Errorf("CommitAdoption: package_hash %q declared_sha256 %w", p.Path, ErrInvalidHash)
 			}
 			if _, err := tx.ExecContext(ctx, `
 INSERT INTO package_hash (canonical_scheme, canonical_host, path,
-                          declared_sha256, snapshot_id)
-VALUES (?, ?, ?, ?, ?)`,
+                          declared_sha256, snapshot_id,
+                          package_name, architecture)
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
 				p.CanonicalScheme, p.CanonicalHost, p.Path,
-				p.DeclaredSHA256, snapshotID); err != nil {
+				p.DeclaredSHA256, snapshotID,
+				p.PackageName, p.Architecture); err != nil {
 				return fmt.Errorf("CommitAdoption: insert package_hash %q: %w", p.Path, err)
 			}
+		}
+
+		// Step 3a (Phase 3, SPEC3 §7.5.1): insert/upsert url_path rows
+		// for the hot debs warmed during the SPEC3 §7.5 prefetch loop.
+		// This **deliberately diverges** from PutURLPath
+		// (queries.go:45-75): the DO UPDATE omits last_requested_at
+		// and request_count so the existing row's hotness signal
+		// survives the upsert. Hot prefetch is a cache-warming write,
+		// not a client-served write; overwriting the hotness columns
+		// here would erase the very evidence that made this path hot
+		// in the first place, dropping it from the next adoption's
+		// hot-set computation.
+		now := nowUnix()
+		for _, up := range prefetchedURLPaths {
+			if !validBlobHash(up.BlobHash) {
+				return fmt.Errorf("CommitAdoption: prefetched %q blob_hash %w", up.Path, ErrInvalidHash)
+			}
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO url_path
+  (canonical_scheme, canonical_host, path, blob_hash, upstream_url,
+   is_metadata, last_requested_at, request_count, last_fetched_at,
+   upstream_etag, upstream_lastmod)
+VALUES (?, ?, ?, ?, ?, 0, NULL, 0, ?, NULL, NULL)
+ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
+  blob_hash       = excluded.blob_hash,
+  upstream_url    = excluded.upstream_url,
+  last_fetched_at = excluded.last_fetched_at`,
+				up.CanonicalScheme, up.CanonicalHost, up.Path,
+				up.BlobHash, up.UpstreamURL, now); err != nil {
+				return fmt.Errorf("CommitAdoption: prefetched url_path %q: %w", up.Path, err)
+			}
+		}
+
+		// Step 3b (Phase 3, SPEC3 §7.5.4): stamp coverage on the
+		// candidate row before the flip. Atomic with the suite_freshness
+		// pointer flip below — strict mode (§6.1) reads
+		// package_coverage_complete via the current snapshot, so making
+		// this write part of the same transaction prevents a brief
+		// "current snapshot exists but coverage column not yet set"
+		// window from leaking into the strict-mode predicate.
+		coverageInt := int64(0)
+		if coverageComplete {
+			coverageInt = 1
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE suite_snapshot SET package_coverage_complete = ?
+ WHERE snapshot_id = ?`,
+			coverageInt, snapshotID); err != nil {
+			return fmt.Errorf("CommitAdoption: stamp coverage: %w", err)
 		}
 
 		// Step 4: bump refcount for blobs referenced by the new
@@ -290,8 +383,11 @@ ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
 			return fmt.Errorf("CommitAdoption: flip pointer: %w", err)
 		}
 
-		// Step 7: mark the new snapshot adopted.
-		now := nowUnix()
+		// Step 7: mark the new snapshot adopted. Reuses `now` captured
+		// at the top of the transaction for step 3a's last_fetched_at
+		// — both writes belong to the same logical commit moment, so a
+		// shared timestamp is more honest than two separate
+		// nowUnix() calls.
 		if _, err := tx.ExecContext(ctx, `
 UPDATE suite_snapshot SET adopted_at = ? WHERE snapshot_id = ?`,
 			now, snapshotID); err != nil {
@@ -323,14 +419,19 @@ func (c *Cache) GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*SuiteS
 	const q = `
 SELECT snapshot_id, canonical_scheme, canonical_host, suite_path,
        inrelease_hash, inrelease_etag, inrelease_lastmod,
-       release_hash, release_gpg_hash, created_at, adopted_at
+       release_hash, release_gpg_hash, created_at, adopted_at,
+       package_coverage_complete
 FROM suite_snapshot
 WHERE snapshot_id = ?`
-	var s SuiteSnapshot
+	var (
+		s        SuiteSnapshot
+		coverage int64
+	)
 	err := c.db.QueryRowContext(ctx, q, snapshotID).Scan(
 		&s.SnapshotID, &s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
 		&s.InReleaseHash, &s.InReleaseETag, &s.InReleaseLastMod,
 		&s.ReleaseHash, &s.ReleaseGPGHash, &s.CreatedAt, &s.AdoptedAt,
+		&coverage,
 	)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -338,6 +439,7 @@ WHERE snapshot_id = ?`
 	case err != nil:
 		return nil, fmt.Errorf("GetSuiteSnapshot: %w", err)
 	}
+	s.PackageCoverageComplete = coverage != 0
 	return &s, nil
 }
 

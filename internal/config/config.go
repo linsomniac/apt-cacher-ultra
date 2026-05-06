@@ -44,16 +44,17 @@ var DefaultDenyTargetRanges = []string{
 
 // Config is the top-level structure of config.toml.
 type Config struct {
-	Cache          CacheConfig     `toml:"cache"`
-	Upstream       UpstreamConfig  `toml:"upstream"`
-	Freshness      FreshnessConfig `toml:"freshness"`
-	Adoption       AdoptionConfig  `toml:"adoption"`
-	Integrity      IntegrityConfig `toml:"integrity"`
-	Serve          ServeConfig     `toml:"serve"`
-	Log            LogConfig       `toml:"log"`
-	Remap          []RemapRule     `toml:"remap"`
-	Mirror         []MirrorRule    `toml:"mirror"`
-	TrustedSigners []TrustedSigner `toml:"trusted_signer"`
+	Cache          CacheConfig        `toml:"cache"`
+	Upstream       UpstreamConfig     `toml:"upstream"`
+	Freshness      FreshnessConfig    `toml:"freshness"`
+	Adoption       AdoptionConfig     `toml:"adoption"`
+	HotPackages    HotPackagesConfig  `toml:"hot_packages"`
+	Integrity      IntegrityConfig    `toml:"integrity"`
+	Serve          ServeConfig        `toml:"serve"`
+	Log            LogConfig          `toml:"log"`
+	Remap          []RemapRule        `toml:"remap"`
+	Mirror         []MirrorRule       `toml:"mirror"`
+	TrustedSigners []TrustedSigner    `toml:"trusted_signer"`
 }
 
 type CacheConfig struct {
@@ -112,6 +113,26 @@ type AdoptionConfig struct {
 	// apt's broad-trust default); flip true once every active suite
 	// has an explicit pin (recommended for production — SPEC2 §7.6.5).
 	RequirePinnedSigner bool `toml:"require_pinned_signer"`
+
+	// HotPrefetchBudget caps the wall-clock spent in the SPEC3 §7.5
+	// hot-deb prefetch loop. 0 = no wall-clock guard (loop runs until
+	// every hot deb has terminated; per-deb fetches still respect
+	// upstream.total_timeout × upstream.max_retries). Default 5m.
+	// Presence-sensitive: explicit 0 means "operator opted out of the
+	// wall-clock guard" and is preserved through Load.
+	HotPrefetchBudget Duration `toml:"hot_prefetch_budget"`
+}
+
+// HotPackagesConfig holds the SPEC3 §5.1 [hot_packages] block. The hot
+// set drives proactive prefetch: a .deb path is "hot" if a client has
+// requested it within the configured window.
+type HotPackagesConfig struct {
+	// Window is the look-back the hot-set query uses against
+	// url_path.last_requested_at. 0 = disable hot-package proactive
+	// refresh entirely (adoption falls back to Phase 2 behavior).
+	// Default 24h. Presence-sensitive: an operator-written 0 must
+	// survive Defaults().
+	Window Duration `toml:"window"`
 }
 
 // IntegrityConfig holds the SPEC2 §5.1 [integrity] block. The at-rest
@@ -126,6 +147,17 @@ type IntegrityConfig struct {
 	// large pool/ doesn't starve request handling. Default 4. Must
 	// be >= 1 when interval > 0.
 	ValidateAtRestWorkers int `toml:"validate_at_rest_workers"`
+
+	// RefuseUnvouchedDebs is the SPEC3 §6.1 strict-mode flag. When
+	// true, .deb GETs whose canonical (host, path) lacks a package_hash
+	// row under any current snapshot are refused with 502 + Retry-After
+	// — but only when the host's current snapshots have proven complete
+	// coverage (every snapshot has package_coverage_complete = 1) and
+	// adoption.enabled is true. Default false; the default-flip to
+	// true is gated on production observational data (SPEC3 §1.3).
+	// Inert when adoption.enabled = false (startup warning emitted in
+	// that combination).
+	RefuseUnvouchedDebs bool `toml:"refuse_unvouched_debs"`
 }
 
 // TrustedSigner is one entry of the SPEC2 §5.1 [[trusted_signer]] array.
@@ -218,6 +250,16 @@ func Load(path string) (*Config, error) {
 	}
 	if !md.IsDefined("upstream", "unreachable_probe_timeout") {
 		cfg.Upstream.UnreachableProbeTimeout.Duration = 1 * time.Second
+	}
+	// SPEC3 §5.2 presence-sensitive defaults: hot_packages.window = 0
+	// disables proactive refresh, adoption.hot_prefetch_budget = 0
+	// disables the wall-clock guard. Both are documented meaningful
+	// values that must survive Defaults().
+	if !md.IsDefined("hot_packages", "window") {
+		cfg.HotPackages.Window.Duration = 24 * time.Hour
+	}
+	if !md.IsDefined("adoption", "hot_prefetch_budget") {
+		cfg.Adoption.HotPrefetchBudget.Duration = 5 * time.Minute
 	}
 	cfg.Defaults()
 	if err := cfg.Validate(); err != nil {
@@ -323,6 +365,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Integrity.ValidateAtRestWorkers < 0 {
 		errs = append(errs, errors.New("integrity.validate_at_rest_workers must not be negative"))
+	}
+	if c.HotPackages.Window.Duration < 0 {
+		errs = append(errs, errors.New("hot_packages.window must not be negative"))
+	}
+	if c.Adoption.HotPrefetchBudget.Duration < 0 {
+		errs = append(errs, errors.New("adoption.hot_prefetch_budget must not be negative"))
 	}
 
 	for i, ts := range c.TrustedSigners {
@@ -515,7 +563,9 @@ func (c *Config) Defaults() {
 	// SPEC2 §9.3.1: max_concurrent_adoptions defaults 2, 0 = unlimited.
 	// SPEC2 §5.1:   validate_at_rest_interval defaults 24h, 0 = disabled.
 	//               validate_at_rest_workers defaults 4.
-	// All three are presence-sensitive — explicit 0 has documented
+	// SPEC3 §5.2:   hot_packages.window defaults 24h, 0 = hot prefetch off.
+	//               adoption.hot_prefetch_budget defaults 5m, 0 = unbounded.
+	// All five are presence-sensitive — explicit 0 has documented
 	// meaning that differs from the default. Defaults are applied in
 	// Load() via TOML's MetaData.IsDefined; this method (called by
 	// non-Load callers without a TOML source) cannot distinguish

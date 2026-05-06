@@ -1179,6 +1179,198 @@ func TestMigration_V1ToV2_AtomicRollback(t *testing.T) {
 	}
 }
 
+// openV2Cache opens a cache directory and runs migrations 0→1→2,
+// leaving the database at schema_version = 2. Used to exercise the
+// v2→v3 migration in isolation.
+func openV2Cache(t *testing.T) (*sql.DB, string) {
+	t.Helper()
+	dir := t.TempDir()
+	for _, sub := range []string{"pool", "tmp", "staging"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o750); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	db, err := openDB(filepath.Join(dir, "cache.db"))
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	for v := 0; v < 2; v++ {
+		if err := applyMigration(context.Background(), db, v); err != nil {
+			_ = db.Close()
+			t.Fatalf("applyMigration v%d→v%d: %v", v, v+1, err)
+		}
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db, dir
+}
+
+// TestMigration_V2ToV3_AddsColumnsAndIndex verifies migrations[2]
+// adds package_name + architecture to package_hash, the
+// idx_package_hash_pkg_arch index, and package_coverage_complete on
+// suite_snapshot. SPEC3 §4.3.1.
+func TestMigration_V2ToV3_AddsColumnsAndIndex(t *testing.T) {
+	db, _ := openV2Cache(t)
+	ctx := context.Background()
+
+	// At v2, the new columns / index do not exist.
+	for _, tc := range []struct{ table, col string }{
+		{"package_hash", "package_name"},
+		{"package_hash", "architecture"},
+		{"suite_snapshot", "package_coverage_complete"},
+	} {
+		if hasColumn(t, db, tc.table, tc.col) {
+			t.Errorf("v2 db already has %s.%s; expected pristine v2", tc.table, tc.col)
+		}
+	}
+	if hasIndex(t, db, "idx_package_hash_pkg_arch") {
+		t.Error("v2 db already has idx_package_hash_pkg_arch; expected pristine v2")
+	}
+
+	if err := applyMigration(ctx, db, 2); err != nil {
+		t.Fatalf("applyMigration v2→v3: %v", err)
+	}
+
+	for _, tc := range []struct{ table, col string }{
+		{"package_hash", "package_name"},
+		{"package_hash", "architecture"},
+		{"suite_snapshot", "package_coverage_complete"},
+	} {
+		if !hasColumn(t, db, tc.table, tc.col) {
+			t.Errorf("after migration, %s.%s missing", tc.table, tc.col)
+		}
+	}
+	if !hasIndex(t, db, "idx_package_hash_pkg_arch") {
+		t.Error("after migration, idx_package_hash_pkg_arch missing")
+	}
+
+	v, err := readSchemaVersion(ctx, db)
+	if err != nil {
+		t.Fatalf("readSchemaVersion: %v", err)
+	}
+	if v != 3 {
+		t.Errorf("schema_version = %d, want 3", v)
+	}
+}
+
+// TestMigration_V2ToV3_PreservesV2Data: pre-existing package_hash and
+// suite_snapshot rows survive intact. The new columns default — empty
+// string for the package_hash text columns, 0 for
+// package_coverage_complete. SPEC3 §4.3.2.
+func TestMigration_V2ToV3_PreservesV2Data(t *testing.T) {
+	db, _ := openV2Cache(t)
+	ctx := context.Background()
+
+	hashA := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+
+	if _, err := db.Exec(`INSERT INTO blob (hash, size, created_at) VALUES (?, 1, 0)`, hashA); err != nil {
+		t.Fatalf("seed blob A: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO blob (hash, size, created_at) VALUES (?, 1, 0)`, hashB); err != nil {
+		t.Fatalf("seed blob B: %v", err)
+	}
+	res, err := db.Exec(`INSERT INTO suite_snapshot
+	    (canonical_scheme, canonical_host, suite_path, inrelease_hash, created_at)
+	    VALUES ('http', 'x.example', '/p', ?, 100)`, hashA)
+	if err != nil {
+		t.Fatalf("seed v2 suite_snapshot: %v", err)
+	}
+	snapID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("LastInsertId: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO package_hash
+	    (canonical_scheme, canonical_host, path, declared_sha256, snapshot_id)
+	    VALUES ('http', 'x.example', '/pool/foo.deb', ?, ?)`, hashB, snapID); err != nil {
+		t.Fatalf("seed v2 package_hash: %v", err)
+	}
+
+	if err := applyMigration(ctx, db, 2); err != nil {
+		t.Fatalf("applyMigration v2→v3: %v", err)
+	}
+
+	// Pre-v3 package_hash row: package_name + architecture default to
+	// empty strings.
+	var pkg, arch string
+	if err := db.QueryRow(`SELECT package_name, architecture FROM package_hash`).Scan(&pkg, &arch); err != nil {
+		t.Fatalf("read post-migration package_hash: %v", err)
+	}
+	if pkg != "" {
+		t.Errorf("pre-v3 package_hash.package_name = %q, want empty string", pkg)
+	}
+	if arch != "" {
+		t.Errorf("pre-v3 package_hash.architecture = %q, want empty string", arch)
+	}
+
+	// Pre-v3 suite_snapshot row: package_coverage_complete defaults to 0.
+	var coverage int
+	if err := db.QueryRow(`SELECT package_coverage_complete FROM suite_snapshot WHERE snapshot_id = ?`, snapID).Scan(&coverage); err != nil {
+		t.Fatalf("read post-migration coverage: %v", err)
+	}
+	if coverage != 0 {
+		t.Errorf("pre-v3 suite_snapshot.package_coverage_complete = %d, want 0 (conservative default)", coverage)
+	}
+}
+
+// TestMigration_V2ToV3_RejectsBadCoverageValue confirms the CHECK on
+// package_coverage_complete actually fires. A future caller that
+// tries to write a sentinel like -1 must fail closed.
+func TestMigration_V2ToV3_RejectsBadCoverageValue(t *testing.T) {
+	db, _ := openV2Cache(t)
+	ctx := context.Background()
+	if err := applyMigration(ctx, db, 2); err != nil {
+		t.Fatalf("applyMigration v2→v3: %v", err)
+	}
+
+	hash := strings.Repeat("a", 64)
+	if _, err := db.Exec(`INSERT INTO blob (hash, size, created_at) VALUES (?, 1, 0)`, hash); err != nil {
+		t.Fatalf("seed blob: %v", err)
+	}
+	_, err := db.Exec(`INSERT INTO suite_snapshot
+	    (canonical_scheme, canonical_host, suite_path, inrelease_hash, created_at, package_coverage_complete)
+	    VALUES ('http', 'x.example', '/p', ?, 100, 2)`, hash)
+	if err == nil {
+		t.Fatal("expected CHECK violation for package_coverage_complete = 2; got nil")
+	}
+}
+
+// hasColumn / hasIndex are tiny PRAGMA / sqlite_master probes for the
+// migration assertions above.
+func hasColumn(t *testing.T, db *sql.DB, table, column string) bool {
+	t.Helper()
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		t.Fatalf("PRAGMA table_info(%s): %v", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid           int
+			name, ctype   string
+			notnull, pk   int
+			dfltValueRaw  sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValueRaw, &pk); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if name == column {
+			return true
+		}
+	}
+	return false
+}
+
+func hasIndex(t *testing.T, db *sql.DB, name string) bool {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?`, name,
+	).Scan(&n); err != nil {
+		t.Fatalf("probe index %s: %v", name, err)
+	}
+	return n > 0
+}
+
 // itoa avoids pulling strconv into the test file just for goroutine IDs.
 func itoa(n int) string {
 	if n == 0 {
@@ -1403,7 +1595,7 @@ func TestInsertCandidateSnapshot_NaturalKeyAdoptedConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
-	if err := c.CommitAdoption(ctx, id, nil, nil); err != nil {
+	if err := c.CommitAdoption(ctx, id, nil, nil, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 	id2, reused, err := c.InsertCandidateSnapshot(ctx, cand)
@@ -1543,7 +1735,7 @@ func TestCommitAdoption_FirstAdoption(t *testing.T) {
 			SnapshotID:      id,
 		},
 	}
-	if err := c.CommitAdoption(ctx, id, members, pkgs); err != nil {
+	if err := c.CommitAdoption(ctx, id, members, pkgs, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 
@@ -1613,7 +1805,7 @@ func TestCommitAdoption_DisplacesPrior(t *testing.T) {
 		{SnapshotID: id1, Path: "InRelease", BlobHash: r1, DeclaredSHA256: r1},
 		{SnapshotID: id1, Path: "M1", BlobHash: m1, DeclaredSHA256: m1},
 		{SnapshotID: id1, Path: "M2", BlobHash: m2, DeclaredSHA256: m2},
-	}, nil); err != nil {
+	}, nil, nil, false); err != nil {
 		t.Fatalf("commit #1: %v", err)
 	}
 
@@ -1633,7 +1825,7 @@ func TestCommitAdoption_DisplacesPrior(t *testing.T) {
 		{SnapshotID: id2, Path: "InRelease", BlobHash: r2, DeclaredSHA256: r2},
 		{SnapshotID: id2, Path: "M1", BlobHash: m1, DeclaredSHA256: m1},
 		{SnapshotID: id2, Path: "M2", BlobHash: m2v2, DeclaredSHA256: m2v2},
-	}, nil); err != nil {
+	}, nil, nil, false); err != nil {
 		t.Fatalf("commit #2: %v", err)
 	}
 
@@ -1682,13 +1874,13 @@ func TestCommitAdoption_RejectsAlreadyAdopted(t *testing.T) {
 	members := []SnapshotMember{
 		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
 	}
-	if err := c.CommitAdoption(ctx, id, members, nil); err != nil {
+	if err := c.CommitAdoption(ctx, id, members, nil, nil, false); err != nil {
 		t.Fatalf("first commit: %v", err)
 	}
 	// Capture pre-state to confirm a second commit changes nothing.
 	pre := blobRefcount(t, c, r)
 
-	err = c.CommitAdoption(ctx, id, members, nil)
+	err = c.CommitAdoption(ctx, id, members, nil, nil, false)
 	if !errors.Is(err, ErrSnapshotAlreadyAdopted) {
 		t.Fatalf("second commit: got %v, want ErrSnapshotAlreadyAdopted", err)
 	}
@@ -1699,7 +1891,7 @@ func TestCommitAdoption_RejectsAlreadyAdopted(t *testing.T) {
 
 func TestCommitAdoption_NonexistentSnapshot(t *testing.T) {
 	c := openCache(t)
-	err := c.CommitAdoption(context.Background(), 99999, nil, nil)
+	err := c.CommitAdoption(context.Background(), 99999, nil, nil, nil, false)
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("got %v, want not-found error", err)
 	}
@@ -1717,7 +1909,7 @@ func TestCommitAdoption_RejectsMalformedMemberHash(t *testing.T) {
 		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
 		{SnapshotID: id, Path: "M1", BlobHash: "not-a-hex", DeclaredSHA256: r},
 	}
-	err := c.CommitAdoption(ctx, id, bad, nil)
+	err := c.CommitAdoption(ctx, id, bad, nil, nil, false)
 	if err == nil || !errors.Is(err, ErrInvalidHash) {
 		t.Fatalf("got %v, want ErrInvalidHash", err)
 	}
@@ -1743,7 +1935,7 @@ func TestCommitAdoption_RejectsDanglingBlobFK(t *testing.T) {
 		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
 		{SnapshotID: id, Path: "M1", BlobHash: dangling, DeclaredSHA256: dangling},
 	}
-	err := c.CommitAdoption(ctx, id, bad, nil)
+	err := c.CommitAdoption(ctx, id, bad, nil, nil, false)
 	if err == nil {
 		t.Fatal("expected FK error, got nil")
 	}
@@ -1766,7 +1958,7 @@ func TestCommitAdoption_RejectsDuplicatePath(t *testing.T) {
 		{SnapshotID: id, Path: "Path", BlobHash: r, DeclaredSHA256: r},
 		{SnapshotID: id, Path: "Path", BlobHash: m, DeclaredSHA256: m},
 	}
-	err := c.CommitAdoption(ctx, id, dupe, nil)
+	err := c.CommitAdoption(ctx, id, dupe, nil, nil, false)
 	if err == nil {
 		t.Fatal("expected unique violation, got nil")
 	}
@@ -1783,7 +1975,7 @@ func TestCommitAdoption_EmptyMembersStillFlips(t *testing.T) {
 		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
 		InReleaseHash: &r,
 	})
-	if err := c.CommitAdoption(ctx, id, nil, nil); err != nil {
+	if err := c.CommitAdoption(ctx, id, nil, nil, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 	sf, err := c.GetSuiteFreshness(ctx, "http", "x.example", "/p")
@@ -1824,7 +2016,7 @@ func TestCommitAdoption_PreservesExistingSuiteFreshnessColumns(t *testing.T) {
 	})
 	if err := c.CommitAdoption(ctx, id,
 		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
-		nil); err != nil {
+		nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	sf, err := c.GetSuiteFreshness(ctx, "http", "x.example", "/p")
@@ -1855,7 +2047,7 @@ func TestPutSuiteFreshness_PreservesCurrentSnapshotID(t *testing.T) {
 	})
 	if err := c.CommitAdoption(ctx, id,
 		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
-		nil); err != nil {
+		nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	// Now do a Phase-1-style freshness write on the same suite.
@@ -1948,7 +2140,7 @@ func TestDeclaredHashesForPath_ReturnsCurrentSnapshotRowsOnly(t *testing.T) {
 			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
 			DeclaredSHA256: debHash, SnapshotID: id1,
 		}},
-	); err != nil {
+		nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1968,7 +2160,7 @@ func TestDeclaredHashesForPath_ReturnsCurrentSnapshotRowsOnly(t *testing.T) {
 			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
 			DeclaredSHA256: debHash, SnapshotID: id2,
 		}},
-	); err != nil {
+		nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2021,7 +2213,7 @@ func TestDeclaredHashesForPath_TwoSuitesDistinctHashes(t *testing.T) {
 			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
 			DeclaredSHA256: hashA, SnapshotID: idA,
 		}},
-	); err != nil {
+		nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.CommitAdoption(ctx, idB,
@@ -2030,7 +2222,7 @@ func TestDeclaredHashesForPath_TwoSuitesDistinctHashes(t *testing.T) {
 			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
 			DeclaredSHA256: hashB, SnapshotID: idB,
 		}},
-	); err != nil {
+		nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2070,7 +2262,7 @@ func TestLookupSnapshotMember_ReturnsBlobOfCurrentSnapshot(t *testing.T) {
 	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
 		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
 		{SnapshotID: id, Path: "main/binary-amd64/Packages", BlobHash: pkg, DeclaredSHA256: pkg},
-	}, nil); err != nil {
+	}, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2119,7 +2311,7 @@ func TestLookupSnapshotMember_NotFoundWhenPathMissing(t *testing.T) {
 	}
 	if err := c.CommitAdoption(ctx, id,
 		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
-		nil); err != nil {
+		nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2154,7 +2346,7 @@ func TestEvictURLPath_DeletesRowAndDecrementsRefcount(t *testing.T) {
 	}
 	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
 		{SnapshotID: id, Path: "InRelease", BlobHash: hash, DeclaredSHA256: hash},
-	}, nil); err != nil {
+	}, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if got := blobRefcount(t, c, hash); got != 1 {
@@ -2210,3 +2402,429 @@ func TestEvictURLPath_NoBlobHashSkipsDecrement(t *testing.T) {
 		t.Errorf("post-evict LookupURL = %v, want ErrNotFound", err)
 	}
 }
+
+// TestHostCurrentSnapshotsCoverage_ReturnsRowsPerCurrentSnapshot covers
+// the SPEC3 §6.1 strict-mode lookup: per (scheme, host), one row per
+// snapshot whose suite_freshness.current_snapshot_id matches, with the
+// snapshot's package_coverage_complete bit. Rows whose snapshot is no
+// longer current (displaced by adoption) are excluded.
+func TestHostCurrentSnapshotsCoverage_ReturnsRowsPerCurrentSnapshot(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	scheme, host := "http", "archive.example"
+
+	// Suite A: covered (coverage_complete = true). Suite B:
+	// uncovered. Suite C: same host but never adopted (no row in
+	// the result).
+	rA := seedBlob(t, c, "InRelease A")
+	rB := seedBlob(t, c, "InRelease B")
+	rC := seedBlob(t, c, "InRelease C")
+	idA, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/A", InReleaseHash: &rA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idB, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/B", InReleaseHash: &rB,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Build C as a candidate but never CommitAdoption it.
+	if _, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/C", InReleaseHash: &rC,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, idA,
+		[]SnapshotMember{{SnapshotID: idA, Path: "InRelease", BlobHash: rA, DeclaredSHA256: rA}},
+		nil, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, idB,
+		[]SnapshotMember{{SnapshotID: idB, Path: "InRelease", BlobHash: rB, DeclaredSHA256: rB}},
+		nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.HostCurrentSnapshotsCoverage(ctx, scheme, host)
+	if err != nil {
+		t.Fatalf("HostCurrentSnapshotsCoverage: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d rows, want 2 (A current + B current; C never adopted)", len(got))
+	}
+	gotMap := make(map[int64]bool, len(got))
+	for _, sc := range got {
+		gotMap[sc.SnapshotID] = sc.PackageCoverageComplete
+	}
+	if !gotMap[idA] {
+		t.Errorf("A coverage = false, want true")
+	}
+	if gotMap[idB] {
+		t.Errorf("B coverage = true, want false")
+	}
+}
+
+// TestHostCurrentSnapshotsCoverage_EmptyHost: a host with zero adopted
+// suites returns an empty slice + nil error. The strict-mode predicate
+// reads this as "no contract on this host" and falls through to
+// trust-upstream.
+func TestHostCurrentSnapshotsCoverage_EmptyHost(t *testing.T) {
+	c := openCache(t)
+	got, err := c.HostCurrentSnapshotsCoverage(context.Background(), "http", "nonexistent.example")
+	if err != nil {
+		t.Fatalf("HostCurrentSnapshotsCoverage: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d rows, want 0", len(got))
+	}
+}
+
+// TestComputeHotSet_TwoStageMatch covers the SPEC3 §7.5.3 happy path: a
+// prior snapshot's hot package_hash row JOINs against a fresh
+// url_path.last_requested_at, Stage 1 yields a (Package, Arch) pair,
+// Stage 2 looks it up in the candidate snapshot and returns the new
+// path + declared sha256.
+func TestComputeHotSet_TwoStageMatch(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	scheme, host := "http", "archive.example"
+
+	rOld := seedBlob(t, c, "InRelease v1")
+	rNew := seedBlob(t, c, "InRelease v2")
+	idPrior, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &rOld,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idNew, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &rNew,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	debHashOld := seedBlob(t, c, "nginx 1.0 deb bytes")
+	debHashNew := seedBlob(t, c, "nginx 2.0 deb bytes")
+	pathOld := "/pool/main/n/nginx/nginx_1.0_amd64.deb"
+	pathNew := "/pool/main/n/nginx/nginx_2.0_amd64.deb"
+
+	// Adopt prior snapshot with package_hash row covering the old deb.
+	if err := c.CommitAdoption(ctx, idPrior,
+		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}},
+		[]PackageHash{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
+			DeclaredSHA256: debHashOld, SnapshotID: idPrior,
+			PackageName: "nginx", Architecture: "amd64",
+		}},
+		nil, true); err != nil {
+		t.Fatalf("commit prior: %v", err)
+	}
+	// A url_path row at pathOld with a fresh last_requested_at: the
+	// hotness signal Stage 1 keys on.
+	now := nowUnix()
+	if err := c.PutURLPath(ctx, URLPath{
+		CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
+		BlobHash:        ptrStr(debHashOld),
+		UpstreamURL:     "http://archive.example" + pathOld,
+		LastRequestedAt: &now, RequestCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Adopt the new snapshot. It carries the NEW path with the SAME
+	// (Package, Arch). The hot-set query should resolve the old hot
+	// pair to the new path.
+	if err := c.CommitAdoption(ctx, idNew,
+		[]SnapshotMember{{SnapshotID: idNew, Path: "InRelease", BlobHash: rNew, DeclaredSHA256: rNew}},
+		[]PackageHash{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: pathNew,
+			DeclaredSHA256: debHashNew, SnapshotID: idNew,
+			PackageName: "nginx", Architecture: "amd64",
+		}},
+		nil, true); err != nil {
+		t.Fatalf("commit new: %v", err)
+	}
+
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, 86400, now)
+	if err != nil {
+		t.Fatalf("ComputeHotSet: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d entries, want 1: %+v", len(got), got)
+	}
+	if got[0].Path != pathNew {
+		t.Errorf("Path = %q, want %q", got[0].Path, pathNew)
+	}
+	if got[0].DeclaredSHA256 != debHashNew {
+		t.Errorf("DeclaredSHA256 = %q, want %q", got[0].DeclaredSHA256, debHashNew)
+	}
+}
+
+// TestComputeHotSet_ExcludesPreV3Rows: package_hash rows with empty
+// package_name/architecture (post-migration, pre-Phase-3 adoptions)
+// are filtered out by Stage 1's <> '' predicate. SPEC3 §4.3.2.
+func TestComputeHotSet_ExcludesPreV3Rows(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	scheme, host := "http", "archive.example"
+
+	rOld := seedBlob(t, c, "InRelease pre-v3")
+	rNew := seedBlob(t, c, "InRelease v3")
+	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &rOld,
+	})
+	idNew, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &rNew,
+	})
+	debHash := seedBlob(t, c, "qemu deb bytes")
+	pathOld := "/pool/main/q/qemu/qemu_1.0_amd64.deb"
+
+	// Prior commits a package_hash row with empty package_name/arch
+	// (the pre-v3 default).
+	if err := c.CommitAdoption(ctx, idPrior,
+		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}},
+		[]PackageHash{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
+			DeclaredSHA256: debHash, SnapshotID: idPrior,
+			// PackageName: "" Architecture: "" — pre-v3 defaults
+		}},
+		nil, false); err != nil {
+		t.Fatal(err)
+	}
+	now := nowUnix()
+	_ = c.PutURLPath(ctx, URLPath{
+		CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
+		BlobHash: ptrStr(debHash), UpstreamURL: "u",
+		LastRequestedAt: &now, RequestCount: 1,
+	})
+	_ = c.CommitAdoption(ctx, idNew,
+		[]SnapshotMember{{SnapshotID: idNew, Path: "InRelease", BlobHash: rNew, DeclaredSHA256: rNew}},
+		nil, nil, false)
+
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, 86400, now)
+	if err != nil {
+		t.Fatalf("ComputeHotSet: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d entries; want 0 (pre-v3 rows must be excluded)", len(got))
+	}
+}
+
+// TestComputeHotSet_DroppedPackageNotInCandidate: a hot pair whose
+// (Package, Arch) is no longer in the candidate snapshot does not
+// graduate to the prefetch list — there is no new path to fetch.
+func TestComputeHotSet_DroppedPackageNotInCandidate(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	scheme, host := "http", "archive.example"
+
+	rOld := seedBlob(t, c, "InRelease v1 dropping")
+	rNew := seedBlob(t, c, "InRelease v2 dropped")
+	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &rOld,
+	})
+	idNew, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &rNew,
+	})
+	debHash := seedBlob(t, c, "gone deb bytes")
+	pathOld := "/pool/main/g/gone/gone_1.0_amd64.deb"
+	if err := c.CommitAdoption(ctx, idPrior,
+		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}},
+		[]PackageHash{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
+			DeclaredSHA256: debHash, SnapshotID: idPrior,
+			PackageName: "gone", Architecture: "amd64",
+		}},
+		nil, true); err != nil {
+		t.Fatal(err)
+	}
+	now := nowUnix()
+	_ = c.PutURLPath(ctx, URLPath{
+		CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
+		BlobHash: ptrStr(debHash), UpstreamURL: "u",
+		LastRequestedAt: &now, RequestCount: 1,
+	})
+	// New snapshot has no package_hash for "gone" — upstream removed it.
+	if err := c.CommitAdoption(ctx, idNew,
+		[]SnapshotMember{{SnapshotID: idNew, Path: "InRelease", BlobHash: rNew, DeclaredSHA256: rNew}},
+		nil, nil, true); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, 86400, now)
+	if err != nil {
+		t.Fatalf("ComputeHotSet: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d entries; want 0 (package was removed in candidate)", len(got))
+	}
+}
+
+// TestComputeHotSet_WindowZeroReturnsEmpty: hot_packages.window = 0
+// disables prefetch entirely (SPEC3 §5.1).
+func TestComputeHotSet_WindowZeroReturnsEmpty(t *testing.T) {
+	c := openCache(t)
+	got, err := c.ComputeHotSet(context.Background(), "http", "x", 1, 2, 0, 100)
+	if err != nil {
+		t.Fatalf("ComputeHotSet: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d entries with window=0, want 0", len(got))
+	}
+}
+
+// TestComputeHotSet_PriorIDZeroReturnsEmpty: a fresh suite with no
+// prior current_snapshot_id has nothing to mine. SPEC3 §7.5 step 9
+// "no prior current_snapshot_id for this suite" → empty hot set.
+func TestComputeHotSet_PriorIDZeroReturnsEmpty(t *testing.T) {
+	c := openCache(t)
+	got, err := c.ComputeHotSet(context.Background(), "http", "x", 0, 1, 86400, 100)
+	if err != nil {
+		t.Fatalf("ComputeHotSet: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d entries with priorID=0, want 0", len(got))
+	}
+}
+
+// TestCommitAdoption_PrefetchedURLPath_PreservesHotness: the SPEC3
+// §7.5.1 "deliberately diverges from PutURLPath" semantics —
+// last_requested_at + request_count must survive the upsert when the
+// hot-prefetch loop warms a path that already had a prior url_path
+// row (e.g. the unversioned alias was stable across the version bump).
+func TestCommitAdoption_PrefetchedURLPath_PreservesHotness(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	scheme, host := "http", "archive.example"
+	const debP = "/pool/main/h/hot/hot.deb"
+
+	// Pre-existing url_path row with a hotness signal.
+	priorBlob := seedBlob(t, c, "old hot deb")
+	hotTime := int64(1234567890)
+	if err := c.PutURLPath(ctx, URLPath{
+		CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
+		BlobHash: ptrStr(priorBlob), UpstreamURL: "http://archive.example" + debP,
+		LastRequestedAt: &hotTime, RequestCount: 42,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := seedBlob(t, c, "InRelease for hot test")
+	id, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &r,
+	})
+
+	// Hot prefetch warmed a NEW blob for the same path.
+	newBlob := seedBlob(t, c, "new hot deb v2")
+	if err := c.CommitAdoption(ctx, id,
+		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
+		nil,
+		[]PrefetchedURLPath{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
+			BlobHash: newBlob, UpstreamURL: "http://archive.example" + debP,
+		}},
+		false); err != nil {
+		t.Fatalf("CommitAdoption: %v", err)
+	}
+
+	row, err := c.LookupURL(ctx, scheme, host, debP)
+	if err != nil {
+		t.Fatalf("LookupURL: %v", err)
+	}
+	// blob_hash flipped to new.
+	if row.BlobHash == nil || *row.BlobHash != newBlob {
+		t.Errorf("blob_hash = %v, want %s (new)", row.BlobHash, newBlob)
+	}
+	// last_requested_at + request_count preserved.
+	if row.LastRequestedAt == nil || *row.LastRequestedAt != hotTime {
+		t.Errorf("last_requested_at = %v, want %d (hotness must survive upsert per SPEC3 §7.5.1)", row.LastRequestedAt, hotTime)
+	}
+	if row.RequestCount != 42 {
+		t.Errorf("request_count = %d, want 42 (hotness must survive upsert)", row.RequestCount)
+	}
+}
+
+// TestCommitAdoption_PrefetchedURLPath_FreshInsert: a path with no prior
+// url_path row gets inserted with last_requested_at = NULL and
+// request_count = 0 — this is a brand-new path; there is no hotness
+// signal to preserve.
+func TestCommitAdoption_PrefetchedURLPath_FreshInsert(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	scheme, host := "http", "archive.example"
+	const debP = "/pool/main/n/new/new_1.0_amd64.deb"
+
+	r := seedBlob(t, c, "InRelease fresh")
+	id, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &r,
+	})
+	newBlob := seedBlob(t, c, "fresh deb")
+	if err := c.CommitAdoption(ctx, id,
+		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
+		nil,
+		[]PrefetchedURLPath{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
+			BlobHash: newBlob, UpstreamURL: "http://archive.example" + debP,
+		}},
+		false); err != nil {
+		t.Fatalf("CommitAdoption: %v", err)
+	}
+
+	row, err := c.LookupURL(ctx, scheme, host, debP)
+	if err != nil {
+		t.Fatalf("LookupURL: %v", err)
+	}
+	if row.BlobHash == nil || *row.BlobHash != newBlob {
+		t.Errorf("blob_hash = %v, want %s", row.BlobHash, newBlob)
+	}
+	if row.LastRequestedAt != nil {
+		t.Errorf("last_requested_at = %v, want nil (fresh insert)", row.LastRequestedAt)
+	}
+	if row.RequestCount != 0 {
+		t.Errorf("request_count = %d, want 0 (fresh insert)", row.RequestCount)
+	}
+}
+
+// TestCommitAdoption_StampsCoverage: SPEC3 §7.5.4 — the
+// coverageComplete arg lands on the suite_snapshot row atomically
+// with the flip, readable post-commit via GetSuiteSnapshot.
+func TestCommitAdoption_StampsCoverage(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	scheme, host := "http", "archive.example"
+	r := seedBlob(t, c, "InRelease coverage test")
+	id, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &r,
+	})
+	if err := c.CommitAdoption(ctx, id,
+		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
+		nil, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := c.GetSuiteSnapshot(ctx, id)
+	if err != nil {
+		t.Fatalf("GetSuiteSnapshot: %v", err)
+	}
+	if !snap.PackageCoverageComplete {
+		t.Errorf("package_coverage_complete = false, want true (CommitAdoption did not stamp coverageComplete=true)")
+	}
+}
+
+// ptrStr is a one-line *string helper for the test fixtures above.
+func ptrStr(s string) *string { return &s }

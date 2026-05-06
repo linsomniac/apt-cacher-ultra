@@ -68,6 +68,18 @@ type Config struct {
 	// keeps the documented SPEC behavior. Callers building a Config
 	// programmatically (e.g. tests) must seed the bools by hand.
 	Serve config.ServeConfig
+
+	// RefuseUnvouchedDebs is the SPEC3 §6.1 strict-mode flag. See
+	// integrity.refuse_unvouched_debs in SPEC3 §5.1.
+	RefuseUnvouchedDebs bool
+
+	// AdoptionEnabled is read from config.Adoption.Enabled. The
+	// strict-mode predicate explicitly checks this — flipping the
+	// master switch off is a deliberate operator return to
+	// trust-upstream posture, and strict mode honors that even when
+	// stale current_snapshot_id rows persist from prior runs (SPEC3
+	// §6.1 / Q17).
+	AdoptionEnabled bool
 }
 
 // Handler is the apt-cacher-ultra http.Handler. Construct via New.
@@ -87,6 +99,23 @@ type Handler struct {
 	freshness FreshnessChecker
 	serve     config.ServeConfig
 	logger    *slog.Logger
+
+	// SPEC3 §6.1 strict-mode flags. refuseUnvouchedDebs gates the
+	// 502-on-unvouched-deb behavior; adoptionEnabled is checked
+	// explicitly so flipping the master adoption switch off
+	// deactivates strict mode regardless of stale current_snapshot_id
+	// rows.
+	refuseUnvouchedDebs bool
+	adoptionEnabled     bool
+
+	// unvouchedPassthroughLog rate-limits the
+	// unvouched_deb_passthrough_no_coverage event to once per (host,
+	// path, hour) so steady incomplete-coverage traffic doesn't flood
+	// the journal. Map keys are "host|path|hourBucket"; values are
+	// the unix timestamp of the bucket's first hit (used only for
+	// debugging — presence in the map is what gates emission).
+	unvouchedPassthroughLog   map[string]int64
+	unvouchedPassthroughLogMu sync.Mutex
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -114,16 +143,19 @@ func New(cfg Config) (*Handler, error) {
 	}
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	return &Handler{
-		parser:          cfg.Parser,
-		cache:           cfg.Cache,
-		fetch:           cfg.Fetch,
-		sf:              newSFGroup(),
-		sem:             cfg.HostLimiter,
-		freshness:       cfg.Freshness,
-		serve:           cfg.Serve,
-		logger:          logger,
-		lifecycleCtx:    lifecycleCtx,
-		lifecycleCancel: lifecycleCancel,
+		parser:                  cfg.Parser,
+		cache:                   cfg.Cache,
+		fetch:                   cfg.Fetch,
+		sf:                      newSFGroup(),
+		sem:                     cfg.HostLimiter,
+		freshness:               cfg.Freshness,
+		serve:                   cfg.Serve,
+		logger:                  logger,
+		refuseUnvouchedDebs:     cfg.RefuseUnvouchedDebs,
+		adoptionEnabled:         cfg.AdoptionEnabled,
+		unvouchedPassthroughLog: make(map[string]int64),
+		lifecycleCtx:            lifecycleCtx,
+		lifecycleCancel:         lifecycleCancel,
 	}, nil
 }
 
@@ -183,6 +215,14 @@ var (
 	// again. respondError emits 502 + Retry-After: 30 (the same shape
 	// writeFailClosed would have used had recovery not been attempted).
 	ErrSnapshotMemberMismatch = errors.New("handler: re-fetched snapshot metadata hash disagrees with declared hash")
+
+	// ErrUnvouchedDebRefused fires when the SPEC3 §6.1/§6.2 strict-mode
+	// predicate refuses an unvouched .deb on the miss path. respondError
+	// maps this to 502 + Retry-After: 60 with outcome
+	// "unvouched_deb_refused" — distinct from package_hash_mismatch
+	// (Phase 2 declared-hash failure) and bad_gateway (Phase 1 fetch
+	// failure) so operators can grep for the strict-mode contribution.
+	ErrUnvouchedDebRefused = errors.New("handler: unvouched .deb refused (strict mode)")
 )
 
 // ServeHTTP routes one apt request through the cache.
@@ -578,8 +618,26 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 	switch len(distinct) {
 	case 0:
 		// No snapshot covers this .deb (Phase 1 trust-upstream regime,
-		// or this .deb's Packages member did not list it).
-		return false, 0, 0, false
+		// or this .deb's Packages member did not list it). SPEC3 §6.1
+		// strict-mode predicate fires here: refuse the row outright
+		// when every current snapshot on the host has full coverage.
+		// Predicate is .deb-only — udebs, source tarballs, and other
+		// non-.deb non-metadata fetches are not in package_hash by
+		// design and must fall through.
+		if !isDebPath(req.Path) {
+			return false, 0, 0, false
+		}
+		switch outcome, snapID := h.classifyStrictMode(r.Context(),
+			req.CanonicalScheme, req.CanonicalHost); outcome {
+		case strictRefuse:
+			st, body := h.refuseUnvouchedDeb(w, req.CanonicalHost, req.Path, 0)
+			return true, st, body, false
+		case strictPassthrough:
+			h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)
+			fallthrough
+		default:
+			return false, 0, 0, false
+		}
 	case 1:
 		if distinct[0] == blobHash {
 			return false, 0, 0, false
@@ -1101,11 +1159,17 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 	// post-fetch dispatch would fail closed anyway. The single-
 	// declared and zero-declared cases fall through; the post-fetch
 	// re-query below is what drives their Finalize variant.
+	//
+	// SPEC3 §6.2: zero-declared in strict mode also refuses upfront
+	// (the predicate is checked here so an unvouched .deb miss never
+	// consumes upstream bandwidth). The §6.1 hit-path predicate is in
+	// checkPackageHash; this is its miss-path twin.
 	if !req.IsMetadata {
 		rows, derr := h.cache.DeclaredHashesForPath(ctx,
 			req.CanonicalScheme, req.CanonicalHost, req.Path)
 		if derr == nil {
-			if distinct := distinctDeclared(rows); len(distinct) >= 2 {
+			distinct := distinctDeclared(rows)
+			if len(distinct) >= 2 {
 				h.logger.Error("package_hash_conflict",
 					"canonical_host", req.CanonicalHost,
 					"path", req.Path,
@@ -1113,6 +1177,23 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 					"declared", declaredAttrs(rows),
 				)
 				return sfResult{err: ErrPackageHashConflict}
+			}
+			// SPEC3 §6.1 strict mode fires only on .deb paths; the
+			// predicate must not refuse source tarballs, udebs, etc.
+			// that legitimately have no package_hash row.
+			if len(distinct) == 0 && isDebPath(req.Path) {
+				switch outcome, snapID := h.classifyStrictMode(ctx,
+					req.CanonicalScheme, req.CanonicalHost); outcome {
+				case strictRefuse:
+					h.logger.Info("unvouched_deb_refused",
+						"canonical_host", req.CanonicalHost,
+						"path", req.Path,
+						"current_snapshot_count", 0,
+					)
+					return sfResult{err: ErrUnvouchedDebRefused}
+				case strictPassthrough:
+					h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)
+				}
 			}
 		}
 		// derr != nil → fall through; the post-fetch lookup will
@@ -1413,6 +1494,16 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		http.Error(w, "snapshot member hash mismatch", http.StatusBadGateway)
 		h.logRequest(r, req.CanonicalHost, req.Path, "snapshot_member_refetch_mismatch", http.StatusBadGateway, 0, true, res.status, start)
 		return
+	case errors.Is(err, ErrUnvouchedDebRefused):
+		// SPEC3 §6.1 / §6.2 strict mode: refuse-with-Retry-After:60
+		// matches the conflict-case shape; outcome
+		// "unvouched_deb_refused" pivots in the per-request line. The
+		// detailed log was already emitted in runFetch where the
+		// strict-mode predicate fired.
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "unvouched .deb refused (strict mode)", http.StatusBadGateway)
+		h.logRequest(r, req.CanonicalHost, req.Path, "unvouched_deb_refused", http.StatusBadGateway, 0, false, 0, start)
+		return
 	case errors.Is(err, fetch.ErrInvalidURL):
 		// URL parse / scheme / host-mismatch failure — fired before
 		// any network I/O. fetchAttempted=false (no upstream dial
@@ -1600,6 +1691,139 @@ func urlForLog(r *http.Request) string {
 	cp := *r.URL
 	cp.User = nil
 	return cp.String()
+}
+
+// isDebPath reports whether req.Path looks like a binary `.deb`
+// request (extension match on the basename). SPEC3 §6.1 is explicitly
+// .deb-only — strict mode must not refuse .udeb, .dsc, .tar.xz source
+// tarballs, or any other non-.deb non-metadata fetches the proxy
+// happens to handle. Refusing those would be a regression: source
+// fetches and udebs are legitimate apt traffic that fall outside
+// package_hash by design.
+func isDebPath(p string) bool {
+	return strings.HasSuffix(p, ".deb")
+}
+
+// strictModeRefusal classifies an unvouched .deb GET against the SPEC3
+// §6.1 predicate. The three return modes correspond directly to the
+// three branches in the spec:
+//
+//   - strictRefuse: refuseUnvouchedDebs is on AND adoption.enabled is
+//     true AND every current snapshot on the host has
+//     package_coverage_complete = 1. The handler 502s with
+//     Retry-After: 60 and emits unvouched_deb_refused.
+//   - strictPassthrough: refuseUnvouchedDebs is on AND adoption.enabled
+//     is true AND at least one current snapshot has
+//     package_coverage_complete = 0. The handler falls through to the
+//     usual trust-upstream serve and emits
+//     unvouched_deb_passthrough_no_coverage at most once per (host,
+//     path, hour).
+//   - strictInactive: any of (refuseUnvouchedDebs is off, adoption.enabled
+//     is false, host has no current snapshots, or a DB error). The
+//     handler proceeds with Phase 1 / Phase 2 behavior unchanged.
+//
+// classifyStrictMode is the test seam — it returns the category and
+// the identifying snapshot id (for the passthrough log line) without
+// performing IO beyond the cache lookup. The caller emits the
+// associated log lines and writes the response.
+type strictModeOutcome int
+
+const (
+	strictInactive strictModeOutcome = iota
+	strictRefuse
+	strictPassthrough
+)
+
+// classifyStrictMode runs the SPEC3 §6.1 predicate against a .deb
+// request whose canonical (scheme, host, path) is currently unvouched
+// (no row in package_hash for any current snapshot). Returns the
+// outcome and, on strictPassthrough, the id of the first incomplete-
+// coverage snapshot encountered (used in the once-per-hour log line).
+func (h *Handler) classifyStrictMode(ctx context.Context, scheme, host string) (strictModeOutcome, int64) {
+	if !h.refuseUnvouchedDebs || !h.adoptionEnabled {
+		return strictInactive, 0
+	}
+	rows, err := h.cache.HostCurrentSnapshotsCoverage(ctx, scheme, host)
+	if err != nil {
+		// SPEC3 §6.1 is silent on DB failures of this lookup. The
+		// least-disruptive behavior is "fail open" — strict mode is
+		// an opt-in tightening; a transient SQLite hiccup must not
+		// turn into a global .deb refusal storm. Log at Warn so the
+		// signal is visible.
+		h.logger.Warn("strict-mode coverage lookup failed",
+			"err", err,
+			"canonical_host", host,
+		)
+		return strictInactive, 0
+	}
+	if len(rows) == 0 {
+		// Host has no adopted suites — strict mode has no contract to
+		// uphold. Phase 1 trust-upstream regime.
+		return strictInactive, 0
+	}
+	// Walk all current snapshots; refuse only when every one has
+	// coverage_complete = 1. Surface the first incomplete-coverage
+	// snapshot id for the passthrough log so an operator can pivot
+	// to that snapshot's package_coverage_incomplete line.
+	for _, sc := range rows {
+		if !sc.PackageCoverageComplete {
+			return strictPassthrough, sc.SnapshotID
+		}
+	}
+	return strictRefuse, 0
+}
+
+// logUnvouchedPassthrough emits unvouched_deb_passthrough_no_coverage
+// at most once per (host, path, hour) so steady incomplete-coverage
+// traffic doesn't flood the journal. Operator-facing surface is
+// "which host's coverage is incomplete?" not "every individual
+// request."
+func (h *Handler) logUnvouchedPassthrough(host, path string, snapshotID int64) {
+	hourBucket := time.Now().Unix() / 3600
+	key := host + "|" + path + "|" + strconv.FormatInt(hourBucket, 10)
+
+	h.unvouchedPassthroughLogMu.Lock()
+	_, seen := h.unvouchedPassthroughLog[key]
+	if !seen {
+		h.unvouchedPassthroughLog[key] = time.Now().Unix()
+	}
+	// Cheap eviction policy: if the map grows past 4096 entries, drop
+	// any whose hour bucket is older than the current one. The cap is
+	// huge for normal traffic — only a host with thousands of distinct
+	// incomplete-coverage paths in one hour ever hits it — but
+	// preserves the once-per-(host, path, hour) contract while
+	// bounding memory.
+	if len(h.unvouchedPassthroughLog) > 4096 {
+		for k, v := range h.unvouchedPassthroughLog {
+			if v/3600 < hourBucket {
+				delete(h.unvouchedPassthroughLog, k)
+			}
+		}
+	}
+	h.unvouchedPassthroughLogMu.Unlock()
+
+	if seen {
+		return
+	}
+	h.logger.Info("unvouched_deb_passthrough_no_coverage",
+		"canonical_host", host,
+		"path", path,
+		"incomplete_snapshot_id", snapshotID,
+	)
+}
+
+// refuseUnvouchedDeb writes the SPEC3 §6.1 strict-mode 502 + Retry-After
+// response and emits the per-request log line. Returns the
+// (status, body) tuple the caller uses for ServeHTTP's logRequest.
+func (h *Handler) refuseUnvouchedDeb(w http.ResponseWriter, host, path string, currentSnapshotCount int) (int, int64) {
+	w.Header().Set("Retry-After", "60")
+	http.Error(w, "unvouched .deb refused (strict mode)", http.StatusBadGateway)
+	h.logger.Info("unvouched_deb_refused",
+		"canonical_host", host,
+		"path", path,
+		"current_snapshot_count", currentSnapshotCount,
+	)
+	return http.StatusBadGateway, 0
 }
 
 // countingWriter wraps an http.ResponseWriter to track the response

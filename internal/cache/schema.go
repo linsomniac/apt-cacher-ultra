@@ -14,8 +14,8 @@ import (
 // CurrentSchemaVersion is the schema this build of the binary creates and
 // expects. Forward-only: a database tagged with a higher version is treated
 // as written by a newer binary and the cache refuses to open it. SPEC §4.3,
-// SPEC2 §4.3.
-const CurrentSchemaVersion = 2
+// SPEC2 §4.3, SPEC3 §4.3.
+const CurrentSchemaVersion = 3
 
 // migrations is indexed such that migrations[N] migrates the database from
 // schema version N to N+1. migrations[0] (v0 → v1) creates the entire
@@ -154,6 +154,44 @@ CREATE INDEX idx_package_hash_snapshot
 ALTER TABLE suite_freshness
   ADD COLUMN current_snapshot_id INTEGER REFERENCES suite_snapshot(snapshot_id);
 `,
+	// v2 → v3: Phase 3 hot-package proactive refresh + opt-in strict-mode
+	// proof column. SPEC3 §4.3.2.
+	//
+	// Pure additive DDL:
+	//   - package_hash gains binary (Package, Architecture) so Phase 3
+	//     hot-set matching can JOIN across snapshots by package identity
+	//     (SPEC3 §7.5.3 Stage 1/2). Pre-v3 rows default to empty strings;
+	//     the hot-set query filters them out explicitly.
+	//   - idx_package_hash_pkg_arch covers Stage 2: the (scheme, host,
+	//     snapshot_id, package_name, architecture) tuple used to resolve
+	//     hot pairs to candidate-snapshot paths in O(log N). snapshot_id
+	//     leads name+arch in the trailing tuple because the same
+	//     (Package, Arch) pair appears across many snapshots over time.
+	//   - suite_snapshot.package_coverage_complete is the per-snapshot
+	//     proof strict mode (§6.1) keys on. Pre-v3 rows default to 0
+	//     (unverified); strict mode for those hosts falls through to
+	//     trust-upstream until a v3-populated snapshot adopts.
+	//
+	// AIDEV-NOTE: this migration is forward-only and pure DDL. ALTER ADD
+	// COLUMN is O(1) — SQLite stores the new defaults implicitly. The
+	// CREATE INDEX scans existing package_hash rows: sub-second for typical
+	// caches, tens of seconds for very large ones. Operators with
+	// long-running deployments should expect the v2→v3 startup to block
+	// until the index build finishes; the schema_migrating Info line at
+	// migrate() entry tells journal-driven deploy scripting which
+	// from→to is in flight.
+	`
+ALTER TABLE package_hash ADD COLUMN package_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE package_hash ADD COLUMN architecture TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX idx_package_hash_pkg_arch
+  ON package_hash(canonical_scheme, canonical_host,
+                  snapshot_id, package_name, architecture);
+
+ALTER TABLE suite_snapshot
+  ADD COLUMN package_coverage_complete INTEGER NOT NULL DEFAULT 0
+    CHECK (package_coverage_complete IN (0, 1));
+`,
 }
 
 // migrate brings the database forward to CurrentSchemaVersion. It is safe
@@ -176,6 +214,13 @@ func migrate(ctx context.Context, db *sql.DB, logger *slog.Logger) error {
 		return nil
 	}
 	for v := current; v < CurrentSchemaVersion; v++ {
+		// schema_migrating Info pairs with the existing "schema migrated"
+		// line on success, giving operators a journal pair (start/end) to
+		// wait on during a deploy. SPEC3 §4.3.2: the v2→v3 index build
+		// scans existing package_hash rows and may take tens of seconds
+		// on large caches; the start line is what an `until` loop waits
+		// for before timing the maintenance window.
+		logger.Info("schema_migrating", "from", v, "to", v+1)
 		if err := applyMigration(ctx, db, v); err != nil {
 			return fmt.Errorf("migration %d→%d: %w", v, v+1, err)
 		}

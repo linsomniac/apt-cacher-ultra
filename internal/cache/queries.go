@@ -230,6 +230,163 @@ FROM suite_freshness`
 	return out, nil
 }
 
+// ComputeHotSet runs the SPEC3 §7.5.3 two-stage hot-set query. Stage 1
+// finds (package_name, architecture) tuples that the *prior* snapshot
+// covered AND that have a hot url_path row (last_requested_at within
+// the hot window). Stage 2 resolves those tuples to (.deb path,
+// declared_sha256) tuples in the *candidate* snapshot. Returns the
+// hot set in no defined order.
+//
+// Empty inputs are handled gracefully:
+//   - priorSnapshotID == 0: returns an empty slice (a fresh suite with
+//     no prior adoption has nothing to mine).
+//   - hotWindow == 0: returns an empty slice (operator disabled hot
+//     prefetch).
+//   - Stage-1 produced no hot pairs: returns an empty slice without
+//     issuing Stage 2.
+//
+// Pre-v3 package_hash rows are excluded automatically — they have empty
+// package_name / architecture columns; Stage 1's predicate filters
+// them out. The first post-upgrade adoption populates name+arch on
+// its candidate's rows; hot prefetch first kicks in on the *second*
+// snapshot transition after the v2→v3 migration.
+//
+// AIDEV-NOTE: the (canonical_scheme, canonical_host, snapshot_id,
+// package_name, architecture) index from migrations[2] makes Stage 2
+// index-only. Without snapshot_id leading the trailing tuple, the
+// query would degenerate into a row scan over every (Package, Arch)
+// the cache has ever seen across all snapshots — quadratic in
+// snapshot count.
+func (c *Cache) ComputeHotSet(ctx context.Context,
+	scheme, host string,
+	priorSnapshotID, candidateSnapshotID int64,
+	hotWindowSeconds int64,
+	now int64) ([]HotSetEntry, error) {
+	if priorSnapshotID == 0 || hotWindowSeconds == 0 {
+		return nil, nil
+	}
+	const stage1Q = `
+SELECT DISTINCT ph.package_name, ph.architecture
+  FROM package_hash ph
+  JOIN url_path up
+    ON up.canonical_scheme = ph.canonical_scheme
+   AND up.canonical_host   = ph.canonical_host
+   AND up.path             = ph.path
+ WHERE ph.snapshot_id        = ?
+   AND ph.package_name      <> ''
+   AND ph.architecture      <> ''
+   AND up.last_requested_at IS NOT NULL
+   AND up.last_requested_at >= ?`
+	hotSince := now - hotWindowSeconds
+	rows, err := c.db.QueryContext(ctx, stage1Q, priorSnapshotID, hotSince)
+	if err != nil {
+		return nil, fmt.Errorf("ComputeHotSet stage 1: %w", err)
+	}
+	defer rows.Close()
+
+	type pkgArch struct {
+		pkg, arch string
+	}
+	var pairs []pkgArch
+	for rows.Next() {
+		var pa pkgArch
+		if err := rows.Scan(&pa.pkg, &pa.arch); err != nil {
+			return nil, fmt.Errorf("ComputeHotSet stage 1 scan: %w", err)
+		}
+		pairs = append(pairs, pa)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ComputeHotSet stage 1 iter: %w", err)
+	}
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+
+	// Stage 2: for each (Package, Arch) pair, look up the candidate
+	// snapshot's path. The IN-list approach would build a single SQL
+	// with N placeholders; loop-and-query is simpler and the index
+	// makes per-pair lookup O(log N). Each stage-2 hit is unique on
+	// (canonical_scheme, canonical_host, snapshot_id, package_name,
+	// architecture) — the index covers those columns and a single row
+	// per pair is the expected result. (Multiple .debs with the same
+	// (Package, Arch) in a snapshot would be a Release pathology;
+	// adoption already rejects that via buildPackageHashes dedup.)
+	const stage2Q = `
+SELECT path, declared_sha256
+  FROM package_hash
+ WHERE canonical_scheme = ?
+   AND canonical_host   = ?
+   AND snapshot_id      = ?
+   AND package_name     = ?
+   AND architecture     = ?`
+	out := make([]HotSetEntry, 0, len(pairs))
+	for _, pa := range pairs {
+		var entry HotSetEntry
+		err := c.db.QueryRowContext(ctx, stage2Q,
+			scheme, host, candidateSnapshotID, pa.pkg, pa.arch).
+			Scan(&entry.Path, &entry.DeclaredSHA256)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			// Hot pair (Package, Arch) is no longer in the candidate
+			// snapshot — upstream removed the package between
+			// snapshots. Cannot prefetch a path that doesn't exist;
+			// drop from the hot set.
+			continue
+		case err != nil:
+			return nil, fmt.Errorf("ComputeHotSet stage 2 (%s/%s): %w", pa.pkg, pa.arch, err)
+		}
+		out = append(out, entry)
+	}
+	return out, nil
+}
+
+// HostCurrentSnapshotsCoverage returns one row per (scheme, host)
+// suite whose suite_freshness.current_snapshot_id is non-NULL — the
+// snapshots presently in force on this host. Each row carries the
+// snapshot id and its package_coverage_complete bit (SPEC3 §4.3.1,
+// §7.5.4). The handler's SPEC3 §6.1 strict-mode predicate uses this
+// to decide whether to refuse unvouched .deb requests (every current
+// snapshot must be coverage_complete = 1) or fall through to
+// trust-upstream and log unvouched_deb_passthrough_no_coverage.
+//
+// Returns an empty slice + nil error when (scheme, host) has no
+// adopted suites (every suite_freshness row's current_snapshot_id is
+// NULL). The strict-mode predicate treats that case as "no snapshot
+// is the contract on this host" — falls through to trust-upstream.
+func (c *Cache) HostCurrentSnapshotsCoverage(ctx context.Context, scheme, host string) ([]SnapshotCoverage, error) {
+	const q = `
+SELECT ss.snapshot_id, ss.package_coverage_complete
+  FROM suite_snapshot ss
+  JOIN suite_freshness sf
+    ON sf.canonical_scheme   = ss.canonical_scheme
+   AND sf.canonical_host     = ss.canonical_host
+   AND sf.suite_path         = ss.suite_path
+   AND sf.current_snapshot_id = ss.snapshot_id
+ WHERE ss.canonical_scheme = ?
+   AND ss.canonical_host   = ?`
+	rows, err := c.db.QueryContext(ctx, q, scheme, host)
+	if err != nil {
+		return nil, fmt.Errorf("HostCurrentSnapshotsCoverage: %w", err)
+	}
+	defer rows.Close()
+	var out []SnapshotCoverage
+	for rows.Next() {
+		var (
+			sc       SnapshotCoverage
+			coverage int64
+		)
+		if err := rows.Scan(&sc.SnapshotID, &coverage); err != nil {
+			return nil, fmt.Errorf("HostCurrentSnapshotsCoverage scan: %w", err)
+		}
+		sc.PackageCoverageComplete = coverage != 0
+		out = append(out, sc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("HostCurrentSnapshotsCoverage iter: %w", err)
+	}
+	return out, nil
+}
+
 // PutSuiteFreshness upserts the per-suite freshness state.
 func (c *Cache) PutSuiteFreshness(ctx context.Context, s SuiteFreshness) error {
 	const q = `

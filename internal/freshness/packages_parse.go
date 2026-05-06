@@ -9,13 +9,19 @@ import (
 	"strings"
 )
 
-// PackageRef is one .deb entry from a Packages file. Phase 2 only
-// extracts what the request-path hash validator needs: Filename and
-// SHA256 (Size is captured for sanity checks but not load-bearing).
+// PackageRef is one .deb entry from a Packages file. Phase 2 fields:
+// Filename and SHA256 (Size for sanity). Phase 3 adds Package and
+// Architecture so the SPEC3 §7.5.3 hot-set match — which keys on
+// (binary package name, architecture) across snapshot transitions —
+// has the identity tuple it needs. A stanza missing Package or
+// Architecture still contributes a row to package_hash for hash
+// validation; the hot-set query excludes empty values explicitly.
 type PackageRef struct {
-	Filename string // archive-relative, e.g. "pool/main/f/foo/foo_1.2-3_amd64.deb"
-	SHA256   string // 64 lowercase hex
-	Size     int64  // declared bytes; 0 when the stanza omitted Size:
+	Filename     string // archive-relative, e.g. "pool/main/f/foo/foo_1.2-3_amd64.deb"
+	SHA256       string // 64 lowercase hex
+	Size         int64  // declared bytes; 0 when the stanza omitted Size:
+	Package      string // binary package name (apt's `Package:` stanza), "" when missing
+	Architecture string // e.g. "amd64", "arm64", "all"; "" when missing
 }
 
 // MaxPackageStanzas caps how many entries ParsePackages will return.
@@ -51,6 +57,8 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 		sha256   string
 		size     int64
 		sizeSet  bool
+		pkg      string
+		arch     string
 		lineNo   int
 	)
 
@@ -63,6 +71,8 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 			sha256 = ""
 			size = 0
 			sizeSet = false
+			pkg = ""
+			arch = ""
 			return nil
 		}
 		if !validHexSHA256(sha256) {
@@ -78,11 +88,19 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 		if sizeSet {
 			s = size
 		}
-		out = append(out, PackageRef{Filename: filename, SHA256: sha256, Size: s})
+		out = append(out, PackageRef{
+			Filename:     filename,
+			SHA256:       sha256,
+			Size:         s,
+			Package:      pkg,
+			Architecture: arch,
+		})
 		filename = ""
 		sha256 = ""
 		size = 0
 		sizeSet = false
+		pkg = ""
+		arch = ""
 		return nil
 	}
 
@@ -122,6 +140,14 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 			}
 			size = n
 			sizeSet = true
+		case "package":
+			// SPEC3 §7.5.2: the binary package name. apt URL routing
+			// keys on the binary package's filename, so the binary
+			// `Package:` (not the optional `Source:`) is the correct
+			// identity for hot-set matching across snapshots.
+			pkg = value
+		case "architecture":
+			arch = value
 		}
 	}
 	if err := scanner.Err(); err != nil {

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ulikunitz/xz"
+
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
@@ -90,6 +92,17 @@ type AdoptionConfig struct {
 	// across the whole cache (SPEC2 §9.3.1). Zero means unlimited.
 	MaxConcurrent int
 
+	// HotPackagesWindow is the SPEC3 §5.2 hot_packages.window. 0
+	// disables hot-package proactive refresh entirely.
+	HotPackagesWindow time.Duration
+
+	// HotPrefetchBudget is the SPEC3 §5.2 adoption.hot_prefetch_budget
+	// wall-clock cap on the entire hot-prefetch loop. 0 disables the
+	// wall-clock guard (per-deb upstream.total_timeout × max_retries
+	// still applies). Per SPEC3 §10.2 a startup warning is emitted
+	// when 0; the loud-config check lives at the cmd/main level.
+	HotPrefetchBudget time.Duration
+
 	Logger *slog.Logger
 
 	// now is a test seam; production uses time.Now.
@@ -110,6 +123,15 @@ type Adopter struct {
 	// suites. nil channel means "no cap" (MaxConcurrent = 0). Acquired
 	// once at the top of Run, released after success or error.
 	concurrencySem chan struct{}
+
+	// hotPackagesWindow + hotPrefetchBudget are the SPEC3 §5.2 keys
+	// the hot-prefetch loop reads. Stored on the Adopter so each
+	// adoption invocation observes a stable snapshot of the policy at
+	// startup — operators flipping config mid-run only see the new
+	// values on the next process restart, the same way Phase 2
+	// require_signature is captured.
+	hotPackagesWindow time.Duration
+	hotPrefetchBudget time.Duration
 
 	logger *slog.Logger
 	now    func() time.Time
@@ -133,6 +155,12 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 	if cfg.MaxConcurrent < 0 {
 		return nil, fmt.Errorf("freshness: max_concurrent_adoptions must be >= 0, got %d", cfg.MaxConcurrent)
 	}
+	if cfg.HotPackagesWindow < 0 {
+		return nil, fmt.Errorf("freshness: hot_packages.window must be >= 0, got %s", cfg.HotPackagesWindow)
+	}
+	if cfg.HotPrefetchBudget < 0 {
+		return nil, fmt.Errorf("freshness: adoption.hot_prefetch_budget must be >= 0, got %s", cfg.HotPrefetchBudget)
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -146,13 +174,15 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		sem = make(chan struct{}, cfg.MaxConcurrent)
 	}
 	return &Adopter{
-		cache:          cfg.Cache,
-		fetcher:        cfg.Fetcher,
-		verifier:       cfg.Verifier,
-		hostSem:        cfg.HostLimiter,
-		concurrencySem: sem,
-		logger:         logger,
-		now:            now,
+		cache:             cfg.Cache,
+		fetcher:           cfg.Fetcher,
+		verifier:          cfg.Verifier,
+		hostSem:           cfg.HostLimiter,
+		concurrencySem:    sem,
+		hotPackagesWindow: cfg.HotPackagesWindow,
+		hotPrefetchBudget: cfg.HotPrefetchBudget,
+		logger:            logger,
+		now:               now,
 	}, nil
 }
 
@@ -443,16 +473,37 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 
 	// Step 8: parse every Packages member to populate package_hash
 	// rows. Deduped by .deb url-path within the adoption — multiple
-	// Packages variants (Packages, Packages.gz) declare the same
-	// content, and the resulting rows would otherwise collide on the
-	// package_hash primary key.
-	packageHashes, err := a.buildPackageHashes(suite, snapshotID, members)
+	// Packages variants (Packages, Packages.gz, Packages.xz) declare
+	// the same content, and the resulting rows would otherwise collide
+	// on the package_hash primary key.
+	//
+	// SPEC3 §7.5.4: buildPackageHashes also returns the per-snapshot
+	// package_coverage_complete bit for the strict-mode predicate
+	// (§6.1) to key on. The bit is folded into CommitAdoption so it
+	// becomes visible to readers atomically with the suite_freshness
+	// flip — strict mode only reads current snapshots, but pinning
+	// the timing prevents any "candidate has coverage = 1 but is not
+	// yet current" mid-state from leaking into the §7.5 flow.
+	pkgHashRes, err := a.buildPackageHashes(suite, snapshotID, members)
 	if err != nil {
 		return err // already wrapped with category
 	}
+	packageHashes := pkgHashRes.rows
 
-	// Step 9: atomic flip transaction.
-	if err := a.cache.CommitAdoption(ctx, snapshotID, memberRows, packageHashes); err != nil {
+	// Steps 9 + 10 (SPEC3 §7.5): hot-set computation + hot-deb prefetch
+	// loop. The result list (prefetchedURLPaths) feeds CommitAdoption
+	// so its url_path inserts happen inside the same transaction that
+	// flips current_snapshot_id — readers never observe a warmed deb's
+	// url_path while the prior snapshot is still current.
+	prefetchedURLPaths, hotStats := a.runHotPrefetch(ctx, suite, snapshotID)
+
+	// Step 11: atomic flip transaction. Pass adoptionCtx as ctx so the
+	// budget-cancelled prefetch loop above never causes CommitAdoption
+	// to fail — the contract is "cancel hot fetches, then flip", not
+	// "cancel hot fetches, then also cancel the flip". coverageComplete
+	// is the SPEC3 §7.5.4 per-snapshot proof for strict mode.
+	if err := a.cache.CommitAdoption(ctx, snapshotID, memberRows, packageHashes,
+		prefetchedURLPaths, pkgHashRes.coverageComplete); err != nil {
 		a.logger.Warn("adoption: commit failed",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
@@ -461,6 +512,22 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		)
 		return fmt.Errorf("%w: commit: %v", ErrAdoptionDBFailed, err)
 	}
+
+	// Step 12 (SPEC3 §10.2): aggregate adoption_hot_prefetch_complete.
+	// Always emitted — even when hot_count = 0 — so an operator
+	// scanning the journal can confirm the loop ran. The four
+	// sum-bucket fields plus zero must equal hot_count by construction
+	// (every entry lands in exactly one bucket).
+	a.logger.Info("adoption_hot_prefetch_complete",
+		"canonical_host", suite.CanonicalHost,
+		"suite_path", suite.SuitePath,
+		"snapshot_id", snapshotID,
+		"hot_count", hotStats.hotCount,
+		"fetched", hotStats.fetched,
+		"failed", hotStats.failed,
+		"mismatched", hotStats.mismatched,
+		"unattempted", hotStats.unattempted,
+	)
 
 	// Step 10: success log + form-drift signal.
 	//
@@ -744,72 +811,212 @@ func byHashAliasPath(declaredPath, sha256hex string) string {
 	return dir + "/by-hash/SHA256/" + sha256hex
 }
 
+// packageHashBuildResult bundles buildPackageHashes' outputs. SPEC3
+// §7.5.4: coverage_complete is *only* true when the suite layout is
+// /dists/-shaped, the Release lists at least one Packages* member, and
+// every directory containing such a member contributed at least one
+// parseable variant.
+type packageHashBuildResult struct {
+	rows             []cache.PackageHash
+	coverageComplete bool
+}
+
+// debPathDecl is the per-(deb path) running record buildPackageHashes
+// keeps so it can detect conflicts across Packages variants. SHA256 is
+// the SPEC2 conflict key; SPEC3 (§7.5.2) extends conflict detection to
+// (Package, Architecture) so a Packages.xz that disagrees with
+// Packages.gz on identity surfaces as adoption_parse_failed rather
+// than silently overwriting in the dedup map.
+type debPathDecl struct {
+	sha256       string
+	packageName  string
+	architecture string
+}
+
 // buildPackageHashes walks every Packages-shaped Release member, parses
-// it, and returns deduplicated cache.PackageHash rows for the snapshot.
-// Returns (nil, nil) for suites whose layout doesn't follow apt's
-// "/dists/<codename>" convention — those still adopt successfully but
-// with empty package_hash coverage, falling back to trust-upstream for
-// .deb hash validation.
+// it, and returns the dedup'd cache.PackageHash rows + the SPEC3 §7.5.4
+// coverage_complete bit for the snapshot. Returns coverage = false for
+// non-/dists/ layouts (with rows = nil); strict mode (§6.1) treats
+// such hosts as fail-through, never fail-closed.
 func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
-	members []ReleaseMember) ([]cache.PackageHash, error) {
+	members []ReleaseMember) (packageHashBuildResult, error) {
 	repoRoot, ok := repoRootFromSuitePath(suite.SuitePath)
 	if !ok {
-		a.logger.Info("adoption: skipping package_hash population (non-/dists/ suite layout)",
+		a.logger.Info("package_coverage_incomplete",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID,
+			"reason", "non_dists_layout",
 		)
-		return nil, nil
+		return packageHashBuildResult{rows: nil, coverageComplete: false}, nil
 	}
 
-	// debPath -> declared SHA256. Multiple Packages variants in the
+	// SPEC3 §7.5.4: walk the Release's listed paths once to identify
+	// the directories that contain at least one Packages* member by
+	// basename match (regardless of whether it's a variant we can
+	// parse). Each such directory needs at least one parseable variant
+	// for coverage_complete to hold.
+	pkgDirs := make(map[string]bool)
+	hasParseable := make(map[string]bool)
+	for _, m := range members {
+		if !isPackagesBasename(path.Base(m.Path)) {
+			continue
+		}
+		dir := path.Dir(m.Path)
+		pkgDirs[dir] = true
+		if isPackagesMember(m.Path) {
+			// Existence in the index alone — the actual parse below
+			// will populate hasParseable iff the body decodes cleanly.
+			_ = dir
+		}
+	}
+
+	// debPath -> running decl. Multiple Packages variants in the
 	// same Release declare identical content, so deduplication is
 	// load-bearing for the package_hash primary key.
-	dedup := make(map[string]string)
+	dedup := make(map[string]debPathDecl)
+	// (Package, Architecture) → first debPath. SPEC3 §7.5.3 hot-set
+	// matching is per (Package, Arch); a Release that lists two
+	// distinct .deb paths with the same (Package, Arch) is a real
+	// pathology — the Stage 2 lookup would pick one arbitrarily, and
+	// hot prefetch would warm only that one. apt itself routes by
+	// filename, so this would also confuse package selection. Fail
+	// adoption closed.
+	pkgArchSeen := make(map[string]string) // "pkg|arch" -> debPath
 	for _, m := range members {
 		if !isPackagesMember(m.Path) {
 			continue
 		}
 		body, err := a.readPackagesBlob(m.Path, m.SHA256)
 		if err != nil {
-			return nil, fmt.Errorf("%w: read %q: %v", ErrAdoptionParseFailed, m.Path, err)
+			return packageHashBuildResult{}, fmt.Errorf("%w: read %q: %v", ErrAdoptionParseFailed, m.Path, err)
 		}
 		refs, err := ParsePackages(body)
 		if err != nil {
-			return nil, fmt.Errorf("%w: parse %q: %v", ErrAdoptionParseFailed, m.Path, err)
+			return packageHashBuildResult{}, fmt.Errorf("%w: parse %q: %v", ErrAdoptionParseFailed, m.Path, err)
 		}
+		hasParseable[path.Dir(m.Path)] = true
 		for _, ref := range refs {
 			debPath := repoRoot + ref.Filename
-			if existing, dup := dedup[debPath]; dup && existing != ref.SHA256 {
-				// Self-inconsistent Release: two variants declare
-				// different SHA256 for the same .deb. Adoption
-				// fails closed — apt would also reject this.
-				return nil, fmt.Errorf("%w: %q declared %s vs %s across Packages variants",
-					ErrAdoptionParseFailed, debPath, existing, ref.SHA256)
+			if existing, dup := dedup[debPath]; dup {
+				if existing.sha256 != ref.SHA256 {
+					return packageHashBuildResult{}, fmt.Errorf("%w: %q declared %s vs %s across Packages variants",
+						ErrAdoptionParseFailed, debPath, existing.sha256, ref.SHA256)
+				}
+				// SPEC3 §7.5.2: detect identity conflicts
+				// (e.g. Packages.gz says Architecture: amd64 but
+				// Packages.xz says arm64 for the same Filename).
+				// "" on either side is the absence-of-stanza
+				// case from SPEC3 §7.5.2 — non-conflicting,
+				// fill the gap.
+				if existing.packageName != "" && ref.Package != "" && existing.packageName != ref.Package {
+					return packageHashBuildResult{}, fmt.Errorf("%w: %q declared Package %q vs %q across Packages variants",
+						ErrAdoptionParseFailed, debPath, existing.packageName, ref.Package)
+				}
+				if existing.architecture != "" && ref.Architecture != "" && existing.architecture != ref.Architecture {
+					return packageHashBuildResult{}, fmt.Errorf("%w: %q declared Architecture %q vs %q across Packages variants",
+						ErrAdoptionParseFailed, debPath, existing.architecture, ref.Architecture)
+				}
+				if existing.packageName == "" {
+					existing.packageName = ref.Package
+				}
+				if existing.architecture == "" {
+					existing.architecture = ref.Architecture
+				}
+				dedup[debPath] = existing
+			} else {
+				dedup[debPath] = debPathDecl{
+					sha256:       ref.SHA256,
+					packageName:  ref.Package,
+					architecture: ref.Architecture,
+				}
 			}
-			dedup[debPath] = ref.SHA256
+			// Cross-debPath (Package, Arch) collision check — only
+			// when both fields are populated. Empty values are
+			// pre-v3-style stanzas (parser's missing-field shape);
+			// they don't enter the hot-set Stage 2 query and so
+			// can't trigger arbitrary-path-selection there.
+			if ref.Package != "" && ref.Architecture != "" {
+				key := ref.Package + "|" + ref.Architecture
+				if priorPath, dup := pkgArchSeen[key]; dup && priorPath != debPath {
+					return packageHashBuildResult{}, fmt.Errorf("%w: (Package=%q, Architecture=%q) covers both %q and %q — Release lists two distinct paths for the same identity tuple, which the SPEC3 §7.5.3 hot-set Stage 2 lookup cannot disambiguate",
+						ErrAdoptionParseFailed, ref.Package, ref.Architecture, priorPath, debPath)
+				}
+				pkgArchSeen[key] = debPath
+			}
 		}
 	}
 
 	rows := make([]cache.PackageHash, 0, len(dedup))
-	for debPath, declared := range dedup {
+	for debPath, decl := range dedup {
 		rows = append(rows, cache.PackageHash{
 			CanonicalScheme: suite.CanonicalScheme,
 			CanonicalHost:   suite.CanonicalHost,
 			Path:            debPath,
-			DeclaredSHA256:  declared,
+			DeclaredSHA256:  decl.sha256,
 			SnapshotID:      snapshotID,
+			PackageName:     decl.packageName,
+			Architecture:    decl.architecture,
 		})
 	}
-	return rows, nil
+
+	// SPEC3 §7.5.4: coverage_complete classification.
+	if len(pkgDirs) == 0 {
+		// Release lists no Packages-basename members at all — a
+		// source-only suite or other corner case. Set 0 rather than
+		// vacuously 1.
+		a.logger.Info("package_coverage_incomplete",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID,
+			"reason", "no_packages_members",
+		)
+		return packageHashBuildResult{rows: rows, coverageComplete: false}, nil
+	}
+	missingDirs := make([]string, 0)
+	for dir := range pkgDirs {
+		if !hasParseable[dir] {
+			missingDirs = append(missingDirs, dir)
+		}
+	}
+	if len(missingDirs) > 0 {
+		a.logger.Info("package_coverage_incomplete",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID,
+			"reason", "unsupported_variants",
+			"directories", missingDirs,
+		)
+		return packageHashBuildResult{rows: rows, coverageComplete: false}, nil
+	}
+	return packageHashBuildResult{rows: rows, coverageComplete: true}, nil
+}
+
+// isPackagesBasename reports whether base is *any* `Packages` variant
+// (including unsupported compressions). Used by SPEC3 §7.5.4 coverage
+// detection to identify which directories are *expected* to contribute
+// a parseable variant; isPackagesMember would miss a Packages.bz2
+// directory and let coverage_complete vacuously stay true.
+func isPackagesBasename(base string) bool {
+	if base == "Packages" {
+		return true
+	}
+	const prefix = "Packages."
+	return strings.HasPrefix(base, prefix) && len(base) > len(prefix)
 }
 
 // isPackagesMember reports whether m's relative path is a Packages
-// file we can parse. Phase 2 step 2 supports plain Packages and
-// Packages.gz; Packages.xz is intentionally skipped (would require an
-// xz dependency — defer until needed).
+// file we can parse. Phase 3 adds Packages.xz alongside Phase 2's
+// plain Packages and Packages.gz; Packages.bz2 / .lz4 / .zst remain
+// unsupported and surface as `package_coverage_incomplete` (SPEC3
+// §7.5.4) when they're the only variant in a directory.
 func isPackagesMember(p string) bool {
 	base := path.Base(p)
-	return base == "Packages" || base == "Packages.gz"
+	switch base {
+	case "Packages", "Packages.gz", "Packages.xz":
+		return true
+	}
+	return false
 }
 
 // repoRootFromSuitePath returns the apt repository root path for a
@@ -858,6 +1065,25 @@ func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) 
 		}
 		if int64(len(body)) > maxDecompressedPackagesBytes {
 			return nil, fmt.Errorf("Packages.gz decompresses past %d-byte cap (bomb defense)",
+				maxDecompressedPackagesBytes)
+		}
+		return body, nil
+	}
+	if strings.HasSuffix(memberPath, ".xz") {
+		// Phase 3: ulikunitz/xz pure-Go reader. Same size-cap posture
+		// as the gzip path — a hostile signed-but-huge upstream cannot
+		// inflate past maxDecompressedPackagesBytes.
+		xr, err := xz.NewReader(f)
+		if err != nil {
+			return nil, fmt.Errorf("xz: %w", err)
+		}
+		limited := io.LimitReader(xr, maxDecompressedPackagesBytes+1)
+		body, err := io.ReadAll(limited)
+		if err != nil {
+			return nil, fmt.Errorf("decompress: %w", err)
+		}
+		if int64(len(body)) > maxDecompressedPackagesBytes {
+			return nil, fmt.Errorf("Packages.xz decompresses past %d-byte cap (bomb defense)",
 				maxDecompressedPackagesBytes)
 		}
 		return body, nil

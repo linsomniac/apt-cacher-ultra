@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/ProtonMail/go-crypto v1.4.1
+	github.com/ulikunitz/xz v0.5.15
 	modernc.org/sqlite v1.50.0
 )
 

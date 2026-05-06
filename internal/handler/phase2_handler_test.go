@@ -1176,7 +1176,7 @@ func commitInlineSnapshot(t *testing.T, h *Handler,
 	for i := range pkgHashes {
 		pkgHashes[i].SnapshotID = id
 	}
-	if err := h.cache.CommitAdoption(context.Background(), id, members, pkgHashes); err != nil {
+	if err := h.cache.CommitAdoption(context.Background(), id, members, pkgHashes, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 	return id

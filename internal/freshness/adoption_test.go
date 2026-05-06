@@ -1098,7 +1098,8 @@ func TestIsPackagesMember(t *testing.T) {
 	}{
 		{"main/binary-amd64/Packages", true},
 		{"main/binary-amd64/Packages.gz", true},
-		{"main/binary-amd64/Packages.xz", false}, // .xz unsupported in step 2
+		{"main/binary-amd64/Packages.xz", true}, // SPEC3 §7.5.2: xz now supported
+		{"main/binary-amd64/Packages.bz2", false}, // bz2 still unsupported
 		{"main/binary-amd64/Sources", false},
 		{"main/source/Sources", false},
 		{"main/i18n/Translation-en", false},
@@ -1110,6 +1111,39 @@ func TestIsPackagesMember(t *testing.T) {
 		got := isPackagesMember(tc.path)
 		if got != tc.want {
 			t.Errorf("isPackagesMember(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestIsPackagesBasename covers the SPEC3 §7.5.4 coverage detection
+// helper. A Packages-prefixed basename — including unsupported
+// compressions — must return true so a directory whose only variant
+// is e.g. Packages.bz2 still flips coverage_complete to false instead
+// of silently slipping through.
+func TestIsPackagesBasename(t *testing.T) {
+	cases := []struct {
+		base string
+		want bool
+	}{
+		{"Packages", true},
+		{"Packages.gz", true},
+		{"Packages.xz", true},
+		{"Packages.bz2", true},
+		{"Packages.zst", true},
+		{"Packages.lz4", true},
+		// Common false positives that must not match:
+		{"Packages.", false}, // trailing dot but no extension
+		{"PackagesFoo", false},
+		{"Sources", false},
+		{"NotPackages", false},
+		{"", false},
+		{"Release", false},
+		{"InRelease", false},
+	}
+	for _, tc := range cases {
+		got := isPackagesBasename(tc.base)
+		if got != tc.want {
+			t.Errorf("isPackagesBasename(%q) = %v, want %v", tc.base, got, tc.want)
 		}
 	}
 }
