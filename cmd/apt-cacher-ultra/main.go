@@ -138,11 +138,13 @@ func serveListeners(
 		}
 	}()
 
-	// SPEC §10: startup config dump. Capture every operationally-
-	// relevant tunable so a single boot log line tells the operator what
-	// policy they're running under (timeouts, concurrency caps, allowlist,
-	// freshness cadence). Secrets do not appear in cfg, so the dump is
-	// safe to emit at Info.
+	// SPEC §10 / SPEC2 §10.3: startup config dump. Capture every
+	// operationally-relevant tunable so a single boot log line tells
+	// the operator what policy they're running under (timeouts,
+	// concurrency caps, allowlist, freshness cadence, Phase 2
+	// adoption + integrity policy + trusted-signer block count).
+	// Secrets do not appear in cfg, so the dump is safe to emit at
+	// Info.
 	logger.Info("apt-cacher-ultra starting",
 		"version", Version,
 		"listen", plainLn.Addr().String(),
@@ -157,10 +159,32 @@ func serveListeners(
 		"upstream_deny_target_ranges", cfg.Upstream.DenyTargetRanges,
 		"freshness_cooldown", cfg.Freshness.Cooldown.Duration,
 		"freshness_periodic_refresh", cfg.Freshness.PeriodicRefresh.Duration,
+		"freshness_max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
+		"adoption_enabled", cfg.Adoption.Enabled,
+		"adoption_require_signature", cfg.Adoption.RequireSignature,
+		"adoption_require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
+		"integrity_validate_at_rest_interval", cfg.Integrity.ValidateAtRestInterval.Duration,
+		"integrity_validate_at_rest_workers", cfg.Integrity.ValidateAtRestWorkers,
+		"trusted_signer_blocks", len(cfg.TrustedSigners),
 		"serve_stale_when_upstream_down", cfg.Serve.ServeStaleWhenUpstreamDown,
 		"log_format", cfg.Log.Format,
 		"log_level", cfg.Log.Level,
 	)
+
+	// Phase 2 adoption is gated on the Verifier wiring that lands in
+	// step 3. An operator who turns adoption.enabled = true today
+	// will not see adoption fire — Phase 1 fallback continues. Make
+	// the gap visible in the deploy journal rather than silently
+	// ignoring the request.
+	if cfg.Adoption.Enabled {
+		logger.Warn("adoption.enabled = true requested but Phase 2 step 3 (GPG verifier) wiring not yet present; freshness will continue Phase 1 behavior")
+	}
+	// SPEC2 §5.1 documents require_signature = false as a loud
+	// configuration: emit at WARN so the operator's choice is visible
+	// in the journal even before adoption is actually wired.
+	if !cfg.Adoption.RequireSignature {
+		logger.Warn("adoption.require_signature = false: unsigned upstream metadata would be adopted (auditable per SPEC2 §5.1)")
+	}
 
 	c, err := cache.Open(ctx, cfg.Cache.Dir, logger)
 	if err != nil {

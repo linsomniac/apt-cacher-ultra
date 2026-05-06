@@ -513,17 +513,17 @@ func TestPhase2_RejectsBadValues(t *testing.T) {
 			"[cache]\ndir=\"%DIR%\"\n[integrity]\nvalidate_at_rest_interval = \"-1h\"\n",
 			"validate_at_rest_interval",
 		},
-		// AIDEV-NOTE: SPEC2 §5.2 requires
-		// `validate_at_rest_workers >= 1 when interval > 0`, but
-		// TOML's int type cannot distinguish "key absent" from
-		// "key explicitly set to 0", and Defaults() rewrites 0 to
-		// 4. So the rule is satisfied by construction for any
-		// explicit-zero config, and we don't have an exercisable
-		// rejection for it. The negative-workers case still trips
-		// the validation:
 		{
 			"negative validate_at_rest_workers",
 			"[cache]\ndir=\"%DIR%\"\n[integrity]\nvalidate_at_rest_workers = -1\n",
+			"validate_at_rest_workers",
+		},
+		{
+			// SPEC2 §5.2: workers >= 1 when interval > 0. Load uses
+			// MetaData.IsDefined to preserve explicit 0, so this
+			// rejection actually fires.
+			"validate_at_rest_workers must be >= 1 when interval > 0",
+			"[cache]\ndir=\"%DIR%\"\n[integrity]\nvalidate_at_rest_interval = \"1h\"\nvalidate_at_rest_workers = 0\n",
 			"validate_at_rest_workers",
 		},
 		{
@@ -570,7 +570,8 @@ func TestPhase2_RejectsBadValues(t *testing.T) {
 
 // TestPhase2_MaxConcurrentZeroIsValid — operators who explicitly
 // want unlimited concurrency set 0; this must NOT be a validation
-// error (the SPEC2 §9.3.1 documented meaning is "no cap").
+// error (the SPEC2 §9.3.1 documented meaning is "no cap"), and
+// the explicit value must survive Defaults() unchanged.
 func TestPhase2_MaxConcurrentZeroIsValid(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, "config.toml", `[cache]
@@ -585,6 +586,48 @@ max_concurrent_adoptions = 0
 	}
 	if cfg.Freshness.MaxConcurrentAdoptions != 0 {
 		t.Errorf("explicit 0 not preserved: got %d", cfg.Freshness.MaxConcurrentAdoptions)
+	}
+}
+
+// TestPhase2_MaxConcurrentAbsentDefaultsToTwo — SPEC2 §9.3.1 documents
+// "default 2, 0 = unlimited." A config with no explicit value must
+// inherit the default-2, distinguishing it from an operator-chosen 0.
+// Driven by TOML's MetaData.IsDefined in Load().
+func TestPhase2_MaxConcurrentAbsentDefaultsToTwo(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `[cache]
+dir = "`+dir+`"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Freshness.MaxConcurrentAdoptions != 2 {
+		t.Errorf("absent max_concurrent_adoptions = %d, want 2 (SPEC2 §9.3.1 default)",
+			cfg.Freshness.MaxConcurrentAdoptions)
+	}
+}
+
+// TestPhase2_IntegrityIntervalZeroDisablesScan — SPEC2 §5.1 documents
+// "0 = disabled" for validate_at_rest_interval. An explicit 0 must
+// survive Defaults() unchanged so the operator can actually disable
+// the scan; previously Defaults() rewrote any 0 to 24h, making
+// "disabled" unreachable.
+func TestPhase2_IntegrityIntervalZeroDisablesScan(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `[cache]
+dir = "`+dir+`"
+
+[integrity]
+validate_at_rest_interval = "0s"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Integrity.ValidateAtRestInterval.Duration != 0 {
+		t.Errorf("explicit 0 interval not preserved: got %v",
+			cfg.Integrity.ValidateAtRestInterval.Duration)
 	}
 }
 

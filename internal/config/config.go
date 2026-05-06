@@ -179,8 +179,27 @@ func (d *Duration) UnmarshalText(text []byte) error {
 // default in place when the key is absent.
 func Load(path string) (*Config, error) {
 	cfg := defaultConfig()
-	if _, err := toml.DecodeFile(path, cfg); err != nil {
+	md, err := toml.DecodeFile(path, cfg)
+	if err != nil {
 		return nil, fmt.Errorf("decode %q: %w", path, err)
+	}
+	// Phase 2 presence-sensitive defaults: int/duration fields where 0
+	// is a documented meaningful value (max_concurrent_adoptions=0 →
+	// unlimited per SPEC2 §9.3.1; validate_at_rest_interval=0 → scan
+	// disabled per SPEC2 §5.1) need to be distinguished from "key
+	// absent." TOML's MetaData.IsDefined gives us that signal — the
+	// post-decode Defaults() call cannot, because the Go zero value
+	// has no nil sentinel for ints/durations. Apply these BEFORE
+	// Defaults() runs, so Defaults() sees a non-zero value and
+	// leaves it alone.
+	if !md.IsDefined("freshness", "max_concurrent_adoptions") {
+		cfg.Freshness.MaxConcurrentAdoptions = 2
+	}
+	if !md.IsDefined("integrity", "validate_at_rest_interval") {
+		cfg.Integrity.ValidateAtRestInterval.Duration = 24 * time.Hour
+	}
+	if !md.IsDefined("integrity", "validate_at_rest_workers") {
+		cfg.Integrity.ValidateAtRestWorkers = 4
 	}
 	cfg.Defaults()
 	if err := cfg.Validate(); err != nil {
@@ -469,30 +488,16 @@ func (c *Config) Defaults() {
 	if c.Freshness.PeriodicRefresh.Duration == 0 {
 		c.Freshness.PeriodicRefresh.Duration = 15 * time.Minute
 	}
-	// SPEC2 §9.3.1: default 2 concurrent adoptions, 0 = unlimited.
-	// We don't fill 0 here because 0 is a legitimate "unlimited"
-	// signal — instead, leave the zero value untouched so an
-	// explicit `max_concurrent_adoptions = 0` is honored. The
-	// default-2 case is detectable by the absence of the key from
-	// TOML; since int has no nil sentinel, the operator who wants
-	// unlimited writes `0` explicitly. We use `if absent assume 2`
-	// via post-decode replacement only when the value is the zero
-	// AND the key wasn't present — but BurntSushi/toml doesn't
-	// expose presence. Pragmatic: treat 0 as "operator's choice of
-	// unlimited" and document the recommended default in SPEC2 §5.1.
-	// AIDEV-NOTE: this means a fresh config with no
-	// max_concurrent_adoptions key gets unlimited adoption
-	// concurrency. The Adopter wrapper (NewAdopter) treats 0 as
-	// unlimited correctly, so this is safe — but operators reading
-	// the structured config dump (SPEC §10.3) will see "0" not "2".
-	// Worth revisiting if rollout shows operators expect "default"
-	// to be 2.
-	if c.Integrity.ValidateAtRestInterval.Duration == 0 {
-		c.Integrity.ValidateAtRestInterval.Duration = 24 * time.Hour
-	}
-	if c.Integrity.ValidateAtRestWorkers == 0 {
-		c.Integrity.ValidateAtRestWorkers = 4
-	}
+	// SPEC2 §9.3.1: max_concurrent_adoptions defaults 2, 0 = unlimited.
+	// SPEC2 §5.1:   validate_at_rest_interval defaults 24h, 0 = disabled.
+	//               validate_at_rest_workers defaults 4.
+	// All three are presence-sensitive — explicit 0 has documented
+	// meaning that differs from the default. Defaults are applied in
+	// Load() via TOML's MetaData.IsDefined; this method (called by
+	// non-Load callers without a TOML source) cannot distinguish
+	// "explicit 0" from "absent" so it deliberately leaves the zero
+	// value alone. Tests that bypass Load and want the SPEC defaults
+	// must set these fields by hand.
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
 	}
