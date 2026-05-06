@@ -39,6 +39,41 @@ deny_target_ranges = [
 cooldown          = "60s"
 periodic_refresh  = "15m"
 
+# Phase 2 atomic-snapshot adoption (SPEC2 §7.5).
+#
+# When enabled, the cache observes upstream's signed InRelease for each
+# known suite (on T1 cache hits and on the periodic scheduler). When
+# the bytes change, the cache GPG-verifies the new InRelease, hash-
+# validates every declared member, and atomically flips that suite's
+# "current snapshot" pointer. After the flip, all clients see metadata
+# and .debs from the same point-in-time view of upstream — no torn
+# updates, no silently-cached bytes that disagree with the declared
+# hash. A failure at any step (GPG, member fetch, hash mismatch) keeps
+# the prior snapshot in place.
+#
+# Off by default. Turn on once /etc/apt/trusted.gpg.d/ +
+# /etc/apt/keyrings/ contain the signing keys for every upstream you
+# adopt from. With require_signature=true (the secure default), an
+# upstream with no matching key in the host keyring will simply fail
+# to adopt and fall back to the prior snapshot — never silent.
+[adoption]
+enabled               = false
+require_signature     = true
+require_pinned_signer = false
+
+# Optional: narrow the trust set for a suite to specific keys
+# (SPEC2 §7.6.2). Without any [[trusted_signer]] blocks, the entire
+# host keyring is trusted (matching apt's broad-trust default). Set
+# adoption.require_pinned_signer=true above to require an explicit
+# pin for every suite — recommended for production.
+#
+# [[trusted_signer]]
+# match_canonical_host = "archive.ubuntu.com"
+# fingerprints         = [
+#   # 40-char uppercase hex; long-form fingerprints only.
+#   # "F6ECB3762474EDA9D21B7022871920D1991BC93C",
+# ]
+
 [serve]
 serve_stale_when_upstream_down = true
 log_stale_serves               = true
