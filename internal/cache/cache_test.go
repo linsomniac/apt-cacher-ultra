@@ -906,6 +906,26 @@ func TestMigration_V1ToV2_NewTablesEnforceFKs(t *testing.T) {
 		t.Error("snapshot_member accepted duplicate (snapshot_id, path)")
 	}
 
+	// snapshot_member: dangling snapshot_id is rejected (FK to suite_snapshot).
+	_, err = db.Exec(
+		`INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256)
+		   VALUES (?, ?, ?, ?)`,
+		snapID+99999, "main/i-do-not-exist", hash, hash,
+	)
+	if err == nil {
+		t.Error("snapshot_member accepted dangling snapshot_id; FK not enforced")
+	}
+
+	// snapshot_member: dangling blob_hash is rejected (FK to blob).
+	_, err = db.Exec(
+		`INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256)
+		   VALUES (?, ?, ?, ?)`,
+		snapID, "main/dangle-blob", strings.Repeat("c", 64), hash,
+	)
+	if err == nil {
+		t.Error("snapshot_member accepted dangling blob_hash; FK not enforced")
+	}
+
 	// package_hash: CHECK on declared_sha256 + FK on snapshot_id.
 	_, err = db.Exec(
 		`INSERT INTO package_hash
@@ -916,6 +936,18 @@ func TestMigration_V1ToV2_NewTablesEnforceFKs(t *testing.T) {
 	if err == nil {
 		t.Error("package_hash accepted malformed declared_sha256")
 	}
+
+	// package_hash: dangling snapshot_id is rejected.
+	_, err = db.Exec(
+		`INSERT INTO package_hash
+		   (canonical_scheme, canonical_host, path, declared_sha256, snapshot_id)
+		   VALUES ('http', 'x', '/pool/foo.deb', ?, ?)`,
+		hash, snapID+99999,
+	)
+	if err == nil {
+		t.Error("package_hash accepted dangling snapshot_id; FK not enforced")
+	}
+
 	if _, err := db.Exec(
 		`INSERT INTO package_hash
 		   (canonical_scheme, canonical_host, path, declared_sha256, snapshot_id)
@@ -923,6 +955,111 @@ func TestMigration_V1ToV2_NewTablesEnforceFKs(t *testing.T) {
 		hash, snapID,
 	); err != nil {
 		t.Errorf("valid package_hash rejected: %v", err)
+	}
+
+	// suite_freshness.current_snapshot_id is FK-checked too: pointing it at
+	// a non-existent snapshot must fail.
+	if _, err := db.Exec(
+		`INSERT INTO suite_freshness
+		   (canonical_scheme, canonical_host, suite_path, current_snapshot_id)
+		   VALUES ('http', 'x', '/dangling-suite', ?)`,
+		snapID+99999,
+	); err == nil {
+		t.Error("suite_freshness accepted dangling current_snapshot_id; FK not enforced")
+	}
+	// And pointing it at a real snapshot succeeds.
+	if _, err := db.Exec(
+		`INSERT INTO suite_freshness
+		   (canonical_scheme, canonical_host, suite_path, current_snapshot_id)
+		   VALUES ('http', 'x', '/real-suite', ?)`,
+		snapID,
+	); err != nil {
+		t.Errorf("valid suite_freshness with current_snapshot_id rejected: %v", err)
+	}
+}
+
+// TestMigration_V1ToV2_HashModeCheck verifies the suite_snapshot CHECK
+// constraint enforcing exactly-one-of (inrelease_hash) or (release_hash
+// AND release_gpg_hash). Without this CHECK an all-NULL row would slip
+// through and bypass the COALESCE-based UNIQUE index entirely.
+func TestMigration_V1ToV2_HashModeCheck(t *testing.T) {
+	db, _ := openV1Cache(t)
+	ctx := context.Background()
+	if err := applyMigration(ctx, db, 1); err != nil {
+		t.Fatalf("applyMigration v1→v2: %v", err)
+	}
+
+	hash := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+	if _, err := db.Exec(`INSERT INTO blob (hash, size, created_at) VALUES (?, 1, 0)`, hash); err != nil {
+		t.Fatalf("seed blob hash: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO blob (hash, size, created_at) VALUES (?, 1, 0)`, hashB); err != nil {
+		t.Fatalf("seed blob hashB: %v", err)
+	}
+
+	// All-NULL: no inrelease_hash, no release_hash. Must be rejected.
+	_, err := db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path, created_at)
+		   VALUES ('http', 'x', '/s', 0)`,
+	)
+	if err == nil {
+		t.Error("suite_snapshot accepted all-null hashes; CHECK constraint missing")
+	}
+
+	// Both modes set: inrelease_hash AND release_hash both populated. Must be rejected.
+	_, err = db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path,
+		    inrelease_hash, release_hash, release_gpg_hash, created_at)
+		   VALUES ('http', 'x', '/s', ?, ?, ?, 0)`,
+		hash, hash, hash,
+	)
+	if err == nil {
+		t.Error("suite_snapshot accepted both inline+detached fields populated; CHECK constraint missing")
+	}
+
+	// Detached form with release_hash but missing release_gpg_hash. Must be rejected.
+	_, err = db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path, release_hash, created_at)
+		   VALUES ('http', 'x', '/s', ?, 0)`,
+		hash,
+	)
+	if err == nil {
+		t.Error("suite_snapshot accepted release_hash without release_gpg_hash; CHECK constraint missing")
+	}
+
+	// Detached form with release_gpg_hash but missing release_hash. Must be rejected.
+	_, err = db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path, release_gpg_hash, created_at)
+		   VALUES ('http', 'x', '/s', ?, 0)`,
+		hash,
+	)
+	if err == nil {
+		t.Error("suite_snapshot accepted release_gpg_hash without release_hash; CHECK constraint missing")
+	}
+
+	// Inline form (only inrelease_hash) is accepted.
+	if _, err := db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path, inrelease_hash, created_at)
+		   VALUES ('http', 'x', '/inline', ?, 0)`,
+		hash,
+	); err != nil {
+		t.Errorf("valid inline suite_snapshot rejected: %v", err)
+	}
+
+	// Detached form (release_hash + release_gpg_hash) is accepted.
+	if _, err := db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path, release_hash, release_gpg_hash, created_at)
+		   VALUES ('http', 'x', '/detached', ?, ?, 0)`,
+		hash, hashB,
+	); err != nil {
+		t.Errorf("valid detached suite_snapshot rejected: %v", err)
 	}
 }
 

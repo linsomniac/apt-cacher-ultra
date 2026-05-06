@@ -171,11 +171,19 @@ CREATE TABLE suite_snapshot (
   created_at         INTEGER NOT NULL,
   adopted_at         INTEGER,                      -- NULL while candidate; set on flip.
   -- Exactly one of (inrelease_hash) or (release_hash AND release_gpg_hash)
-  -- must be populated. Enforced by the adoption code; not expressed as a
-  -- CHECK constraint because SQLite CHECKs on multi-column predicates
-  -- across NULL trip on subtle three-valued-logic edges that the docs
-  -- recommend against. The adoption transaction rejects malformed rows
-  -- before INSERT.
+  -- must be populated. Enforced at the DB layer with a CHECK using IS
+  -- NULL / IS NOT NULL exclusively — those predicates are not subject to
+  -- the three-valued-logic pitfalls that bite equality comparisons
+  -- across NULLs. Without this CHECK, an all-NULL row would slip through
+  -- AND would bypass the COALESCE-based UNIQUE index (since
+  -- COALESCE(NULL, NULL) = NULL and SQLite treats NULLs as distinct for
+  -- UNIQUE purposes). The adoption code is the first line of defense;
+  -- the CHECK is the backstop.
+  CHECK (
+    (inrelease_hash IS NOT NULL AND release_hash IS NULL AND release_gpg_hash IS NULL)
+    OR
+    (inrelease_hash IS NULL AND release_hash IS NOT NULL AND release_gpg_hash IS NOT NULL)
+  )
 );
 
 -- Natural-key UNIQUE: same (suite, verified text) cannot be adopted twice.

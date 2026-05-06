@@ -103,7 +103,18 @@ CREATE TABLE suite_snapshot (
   release_hash       TEXT REFERENCES blob(hash),
   release_gpg_hash   TEXT REFERENCES blob(hash),
   created_at         INTEGER NOT NULL,
-  adopted_at         INTEGER
+  adopted_at         INTEGER,
+  -- Exactly one of (inrelease_hash) or (release_hash AND release_gpg_hash)
+  -- must be populated. Uses IS NULL / IS NOT NULL exclusively, which are
+  -- not subject to the 3VL pitfalls of equality across NULLs. Without
+  -- this CHECK, an all-NULL row would slip through (and even bypass the
+  -- COALESCE-based UNIQUE index, since COALESCE(NULL, NULL) = NULL and
+  -- SQLite treats NULLs as distinct for UNIQUE purposes).
+  CHECK (
+    (inrelease_hash IS NOT NULL AND release_hash IS NULL AND release_gpg_hash IS NULL)
+    OR
+    (inrelease_hash IS NULL AND release_hash IS NOT NULL AND release_gpg_hash IS NOT NULL)
+  )
 );
 
 CREATE INDEX idx_suite_snapshot_suite
