@@ -1,6 +1,6 @@
 # apt-cacher-ultra — Phase 2 Scoping
 
-Status: **scoping draft — not locked**. Last updated 2026-05-05 (Q1/Q2/Q3/Q4/Q5/Q10 resolved; Q6/Q7/Q8/Q9 open).
+Status: **scoping closed — Q1–Q10 all resolved**. Last updated 2026-05-05. Next artifact: `SPEC2.md` modeled on `SPEC.md`'s structure.
 
 This document gathers what Phase 2 is, what hooks Phase 1 left for it, and the
 open design questions that must be settled before this becomes a locked SPEC2.md
@@ -286,9 +286,16 @@ keyring corpora.
 
 **Failure semantics:** signature invalid → reject the InRelease (no candidate
 snapshot created); signature missing → reject (treat unsigned upstream as
-hostile in Phase 2); upstream returned a `Release.gpg` detached signature
-instead of `InRelease` → support both forms (apt does), verify accordingly.
-*Open Q6.*
+hostile in Phase 2).
+
+**Resolved (Q6): support both inline `InRelease` and detached `Release.gpg`.**
+Apt itself supports both forms; rejecting `Release.gpg`-only upstreams would
+silently exclude legitimate repositories. Verification path differs slightly
+— for inline, the file is its own clearsigned envelope; for detached, the
+cache fetches `Release` + `Release.gpg` and verifies the detached signature
+over `Release` — but the GPG library handles both, so the marginal cost is a
+small branch in the verification function. The adoption flow normalizes both
+to "verified Release-equivalent text" before parsing the SHA256 → path index.
 
 ### 3.4 by-hash dedup
 
@@ -305,11 +312,15 @@ Phase 2's dedup move:
   by-hash fetches from different suites hit the same blob.
 - Snapshot members reference the same blob across suites for free.
 
-**Open Q7 — index discovery.** Apt fetches by-hash *only* when the
-upstream's `Release` advertises `Acquire-By-Hash: yes`. Should the cache
-proactively prefetch by-hash variants during adoption (cheap: same blob if
-already cached), or fetch only on demand? Recommend on-demand for Phase 2;
-proactive prefetch is a Phase 3 hot-package candidate.
+**Resolved (Q7): on-demand only.** The cache does not prefetch by-hash
+variants during adoption. Apt fetches by-hash only when the upstream's
+`Release` advertises `Acquire-By-Hash: yes`, and clients drive the URL
+shape from there; proactively pulling variants we may never serve burns
+upstream bandwidth for hypothetical traffic. Adoption fetches the canonical
+member paths (`Packages`, `Translation-*`, etc.) listed in `InRelease`; the
+by-hash URL for the same blob is satisfied by the existing pool entry the
+moment a client asks. Phase 3's hot-package proactive refresh is the right
+home for prefetching.
 
 ### 3.5 Hash validation enforcement
 
@@ -325,15 +336,25 @@ Two enforcement boundaries:
    `snapshot_member.declared_sha256`. Catches corruption-at-rest. Frequency
    tunable; default daily.
 
-**Open Q8 — read-path validation cadence.** Daily is cheap (sha256 on disk is
-fast) but operators on small VMs might want it off. Configurable knob:
-`integrity.validate_at_rest_interval` with `0 = off`?
+**Resolved (Q8): daily, configurable, `0 = off`.** Default cadence is once
+per day. SHA256 over a moderately sized pool is cheap on modern disks and
+catches bit-rot before a client ever notices a hash mismatch. Operators on
+small VMs (where even a brief I/O storm matters) set
+`integrity.validate_at_rest_interval = 0` to disable. The scan runs in a
+dedicated goroutine with a small worker pool so it cannot starve request
+handling; tunables for pool-size and per-blob delay are operator-facing
+polish that can be added if real deployments need them.
 
-**Open Q9 — what about pre-Phase-2 blobs?** Existing pool/ entries from a
-Phase 1 deployment have no declared hash recorded. After upgrade, are they
-"trusted" until a freshness check produces a new snapshot, or is the cache
-re-fetched cold? Recommend trusted-until-replaced; the v1→v2 migration
-does not touch existing rows beyond schema additions.
+**Resolved (Q9): pre-Phase-2 blobs are trusted-until-replaced.** Existing
+`pool/` entries from a Phase 1 deployment have no declared hash recorded.
+On upgrade the v1→v2 migration is purely additive (new tables, no row
+rewrites); existing url_path → blob mappings continue to serve via the
+Phase 1 path until a freshness check adopts a snapshot covering that
+suite. Cold re-fetching every blob would mean re-pulling potentially
+gigabytes from the same upstream that vouched for them in Phase 1, for
+zero security gain. The at-rest scan (Q8) covers corruption from the
+Phase-2 side; pre-Phase-2 blobs implicitly join the validated set the
+first time a snapshot adopts an index that references them.
 
 ---
 
@@ -429,9 +450,7 @@ Each step is independently shippable and independently chaos-testable.
 
 ---
 
-## 7. Questions
-
-### 7.1 Resolved
+## 7. Questions — all resolved
 
 | ID | Question | Resolution |
 |---|---|---|
@@ -440,23 +459,30 @@ Each step is independently shippable and independently chaos-testable.
 | Q3 | Adoption concurrency policy | **Shared `hostsem` + global adoption cap.** Sequential member fetches inside an adoption + cache-wide `freshness.max_concurrent_adoptions` (default 2). One semaphore acquisition site, no nested ordering, robust to restart storms. (§3.2) |
 | Q4 | GPG keyring source | **Hybrid**: host apt keyring as default trust set, optional per-suite pinning via `[[trusted_signer]]` blocks. (§3.3) |
 | Q5 | OpenPGP library | **`github.com/ProtonMail/go-crypto/openpgp`** (the maintained replacement for the deprecated `x/crypto/openpgp`). (§3.3) |
+| Q6 | Detached `Release.gpg` support | **Both inline `InRelease` and detached `Release` + `Release.gpg`.** Adoption normalizes both forms to verified Release-equivalent text before parsing. (§3.3) |
+| Q7 | Proactive by-hash prefetch | **On-demand only.** Adoption fetches the canonical member paths; by-hash URLs are satisfied by the existing pool entry on first client request. Proactive prefetch is Phase 3. (§3.4) |
+| Q8 | At-rest integrity scan cadence | **Daily, configurable, `0 = off`.** Dedicated worker pool to keep the scan off the request path; tunables operator-facing if real deployments demand them. (§3.5) |
+| Q9 | Pre-Phase-2 pool blobs after upgrade | **Trusted-until-replaced.** Migration is purely additive; existing blobs serve via the Phase 1 path until a snapshot adopts an index referencing them, at which point they join the validated set. (§3.5) |
 | Q10 | `.deb` declared-hash storage | **Materialize during adoption** into `package_hash` table; lookup joins through `suite_freshness.current_snapshot_id`. Empty result falls back to Phase 1 trust-upstream behavior. (§3.1) |
-
-### 7.2 Open
-
-| ID | Question |
-|---|---|
-| Q6 | Detached `Release.gpg` support — required for Phase 2 or only `InRelease` inline? |
-| Q7 | Proactive by-hash prefetch during adoption, or on-demand? |
-| Q8 | Default cadence for read-path integrity scan, and is it disable-able? |
-| Q9 | Pre-Phase-2 pool/ blobs: trusted-until-replaced, or cold re-fetch on upgrade? |
 
 ---
 
-## 8. What this document is *not*
+## 8. What this document is, and what comes next
 
-It is not the locked Phase 2 SPEC. It is the agenda for the conversation that
-produces that SPEC. Every architectural sketch above is a recommendation, not
-a commitment. The next step after the open questions are answered is to roll
-this and the answers into a SPEC2.md modeled on SPEC.md's structure (numbered
-sections, wire contracts, schema, definition of done).
+This document captured the architectural decisions for Phase 2. With the
+question table in §7 fully closed, scoping is **done**. It is *still not*
+the locked Phase 2 SPEC — every section here is design intent at the
+sketch level, not a wire contract.
+
+The natural next artifact is **`SPEC2.md`**, modeled on `SPEC.md`'s
+structure: numbered sections for goals/non-goals, schema (formal), wire
+contract additions, request handling deltas, freshness-and-adoption state
+machine, hash validation rules, GPG verification flow, concurrency
+budgets, logging, failure-mode catalog, test strategy (chaos test for
+mid-adoption divergence + GPG forgery rejection), project layout deltas,
+and a definition of done.
+
+When that document lands, this scoping doc becomes a historical artifact —
+the record of *why* the SPEC2 decisions came out the way they did — and
+can either stay in-tree as `docs/history/` reading or be deleted, at the
+operator's preference.
