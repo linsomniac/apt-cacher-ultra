@@ -144,4 +144,212 @@ if [[ "$status" -lt 200 || "$status" -gt 599 ]]; then
     exit 1
 fi
 
-echo "[deb-test] PASS"
+echo "[deb-test] phase 1 (package contract + listener) PASS"
+
+# ============================================================
+# SPEC2 §14 step 6: adoption smoke
+#
+# Restart the daemon under an adoption-mode config and verify the
+# cache adopts a snapshot when upstream's signed InRelease changes.
+# Adoption only fires on changed InRelease bytes (freshness.go:455);
+# the fixture provides V1 + V2 trees signed with the same key, and
+# we drive a swap between two metadata GETs.
+# ============================================================
+
+echo
+echo "[deb-test] phase 2: stop phase-1 daemon"
+kill "$DAEMON_PID" 2>/dev/null || true
+wait "$DAEMON_PID" 2>/dev/null || true
+
+# Sanity: the repo-build stage produced both fixtures and a key.
+test -d /fixture-v1 || { echo "FAIL: /fixture-v1 missing (repo-build stage broken?)"; exit 1; }
+test -d /fixture-v2 || { echo "FAIL: /fixture-v2 missing"; exit 1; }
+test -f /fixture-v1/aculan-test.gpg || { echo "FAIL: /fixture-v1/aculan-test.gpg missing"; exit 1; }
+test -f /fixture-v1/aculan-test.fingerprint || { echo "FAIL: /fixture-v1/aculan-test.fingerprint missing"; exit 1; }
+FP="$(cat /fixture-v1/aculan-test.fingerprint)"
+echo "[deb-test] adoption fixture key fingerprint: $FP"
+
+echo "[deb-test] phase 2: install signing pubkey into /etc/apt/trusted.gpg.d/"
+install -o root -g root -m 0644 /fixture-v1/aculan-test.gpg /etc/apt/trusted.gpg.d/aculan-test.gpg
+
+echo "[deb-test] phase 2: stage V1 fixture as nginx webroot"
+# nginx-light defaults to /var/www/html. Replace its contents with
+# V1's apt repo so the cache sees a fresh upstream on first GET.
+mkdir -p /var/www/html
+rm -rf /var/www/html/*
+cp -r /fixture-v1/dists /var/www/html/
+cp -r /fixture-v1/pool /var/www/html/
+
+echo "[deb-test] phase 2: start nginx serving fixture"
+nginx
+ngx_ready=0
+for i in $(seq 1 10); do
+    if (echo > /dev/tcp/127.0.0.1/80) 2>/dev/null; then
+        ngx_ready=1
+        echo "[deb-test] nginx :80 reachable after ${i}s"
+        break
+    fi
+    sleep 1
+done
+if [[ $ngx_ready -eq 0 ]]; then
+    echo "FAIL: nginx did not bind :80 within 10s"
+    exit 1
+fi
+
+echo "[deb-test] phase 2: write adoption-mode config"
+# Cooldown=1s so the second InRelease GET is not gated by the
+# default-60s cooldown. allowed_host_regex must permit 127.0.0.1
+# (the only upstream the test reaches); deny_target_ranges must be
+# empty because the cache's default blocks loopback (127.0.0.0/8)
+# and would refuse to dial nginx.
+#
+# Backslashes are doubled inside the heredoc — a single `\.` would
+# be eaten by bash's heredoc expansion, leaving the regex with a
+# literal-but-unintended dot. Doubling produces `^127\.0\.0\.1$` in
+# the file, which is what the canonicalizer matches against.
+cat > /etc/apt-cacher-ultra/config.toml <<EOF
+[cache]
+dir = "/var/cache/apt-cacher-ultra"
+listen = "0.0.0.0:3142"
+
+[upstream]
+allowed_host_regex = ["^127\\\\.0\\\\.0\\\\.1\$"]
+deny_target_ranges = []
+
+[freshness]
+cooldown = "1s"
+periodic_refresh = "1h"
+
+[adoption]
+enabled = true
+require_signature = true
+
+[[trusted_signer]]
+match_canonical_host = "127.0.0.1"
+fingerprints = ["$FP"]
+
+[log]
+level = "info"
+format = "text"
+EOF
+chmod 0644 /etc/apt-cacher-ultra/config.toml
+
+echo "[deb-test] phase 2: restart daemon under adoption-mode config"
+runuser -u apt-cacher-ultra -- \
+    /usr/sbin/apt-cacher-ultra --config /etc/apt-cacher-ultra/config.toml \
+    >>"$daemon_log" 2>&1 &
+DAEMON_PID=$!
+# trap was already installed in phase 1; it reads $DAEMON_PID at exit
+# time, so updating the variable is sufficient.
+
+ready=0
+for i in $(seq 1 30); do
+    if (echo > /dev/tcp/127.0.0.1/3142) 2>/dev/null; then
+        ready=1
+        echo "[deb-test] phase-2 :3142 reachable after ${i}s"
+        break
+    fi
+    sleep 1
+done
+if [[ $ready -eq 0 ]]; then
+    echo "FAIL: phase-2 daemon did not bind :3142 within 30s"
+    exit 1
+fi
+
+# 2a: prime the cache with V1's InRelease (cache miss → upstream).
+# This populates url_path so the freshness check has a baseline to
+# compare against.
+echo "[deb-test] phase 2: GET InRelease via proxy (V1, primes cache)"
+status=$(curl -sS -x http://127.0.0.1:3142 \
+    -o /tmp/inrelease.v1 \
+    -w '%{http_code}' \
+    --max-time 10 \
+    http://127.0.0.1/dists/noble/InRelease || echo "000")
+if [[ "$status" != "200" ]]; then
+    echo "FAIL: V1 InRelease via proxy returned $status; expected 200"
+    head -c 4096 /tmp/inrelease.v1 || true
+    exit 1
+fi
+echo "[deb-test] V1 InRelease: $(wc -c < /tmp/inrelease.v1) bytes"
+
+# 2b: swap upstream to V2 (different .deb version → different
+# Packages SHA256 → different Release content → different InRelease
+# bytes). Sleep > cooldown (1s) so the next request's freshness
+# check is not gated.
+echo "[deb-test] phase 2: swap nginx webroot to V2"
+sleep 2
+rm -rf /var/www/html/*
+cp -r /fixture-v2/dists /var/www/html/
+cp -r /fixture-v2/pool /var/www/html/
+
+# 2c: drive a second InRelease GET. The cache hits its url_path row
+# from 2a, fires maybeFireFreshness, the freshness check sees changed
+# bytes, and spawns the adoption goroutine.
+echo "[deb-test] phase 2: GET InRelease via proxy (cache hit → fires freshness check → adoption)"
+status=$(curl -sS -x http://127.0.0.1:3142 \
+    -o /tmp/inrelease.trigger \
+    -w '%{http_code}' \
+    --max-time 10 \
+    http://127.0.0.1/dists/noble/InRelease || echo "000")
+if [[ "$status" != "200" ]]; then
+    echo "FAIL: trigger InRelease returned $status; expected 200"
+    exit 1
+fi
+
+# 2d: poll suite_freshness for current_snapshot_id. Adoption is
+# async; the response in 2c was served from the V1 cache (it doesn't
+# wait for adoption to commit).
+echo "[deb-test] phase 2: poll suite_freshness for current_snapshot_id"
+adopted=0
+adopted_id=""
+for i in $(seq 1 30); do
+    val=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT IFNULL(current_snapshot_id, '') FROM suite_freshness WHERE suite_path='/dists/noble' LIMIT 1;" \
+        2>/dev/null || echo "")
+    if [[ -n "$val" ]]; then
+        adopted=1
+        adopted_id="$val"
+        echo "[deb-test] adopted snapshot id=$val (after ${i}s)"
+        break
+    fi
+    sleep 1
+done
+if [[ $adopted -eq 0 ]]; then
+    echo "FAIL: no snapshot adopted within 60s"
+    echo "=== suite_freshness ==="
+    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT canonical_scheme, canonical_host, suite_path, current_snapshot_id, inrelease_change_seen_at FROM suite_freshness;" || true
+    echo "=== suite_snapshot ==="
+    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT snapshot_id, canonical_host, suite_path, adopted_at FROM suite_snapshot;" || true
+    echo "=== daemon log tail ==="
+    tail -100 "$daemon_log" || true
+    exit 1
+fi
+
+# 2e: a follow-up GET should now serve via snapshot_member resolution
+# and set the X-Cache-Snapshot response header (SPEC2 §6.1 / §10.1).
+echo "[deb-test] phase 2: follow-up GET should expose X-Cache-Snapshot"
+hdrs_file=/tmp/inrelease.headers
+status=$(curl -sS -x http://127.0.0.1:3142 \
+    -D "$hdrs_file" \
+    -o /tmp/inrelease.followup \
+    -w '%{http_code}' \
+    --max-time 10 \
+    http://127.0.0.1/dists/noble/InRelease)
+if [[ "$status" != "200" ]]; then
+    echo "FAIL: follow-up InRelease returned $status"
+    cat "$hdrs_file" || true
+    exit 1
+fi
+if ! grep -qi '^x-cache-snapshot:' "$hdrs_file"; then
+    echo "FAIL: follow-up response is missing X-Cache-Snapshot header"
+    echo "=== response headers ==="
+    cat "$hdrs_file"
+    exit 1
+fi
+xcs="$(grep -i '^x-cache-snapshot:' "$hdrs_file" | tr -d '\r')"
+echo "[deb-test] follow-up: $xcs"
+
+echo "[deb-test] phase 2 (adoption smoke) PASS"
+echo "[deb-test] OVERALL PASS"
