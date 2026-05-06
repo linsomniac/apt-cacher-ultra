@@ -119,6 +119,30 @@ func writeArmoredPubKeyBundle(t *testing.T, path string, entities ...*openpgp.En
 	}
 }
 
+// detachSignWith produces a detached signature (Release.gpg
+// equivalent) over message. When armored is true the result is
+// ASCII-armored ("-----BEGIN PGP SIGNATURE-----..."), matching
+// apt-ftparchive's `gpg --detach-sign --armor` output. When false
+// the result is the binary signature packet bytes.
+func detachSignWith(t *testing.T, e *openpgp.Entity, message []byte, armored bool) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	cfg := &packet.Config{
+		DefaultHash: crypto.SHA256,
+		Time:        time.Now,
+	}
+	var err error
+	if armored {
+		err = openpgp.ArmoredDetachSign(&buf, e, bytes.NewReader(message), cfg)
+	} else {
+		err = openpgp.DetachSign(&buf, e, bytes.NewReader(message), cfg)
+	}
+	if err != nil {
+		t.Fatalf("detach sign: %v", err)
+	}
+	return buf.Bytes()
+}
+
 // clearsignWith produces a clearsigned message body equivalent to what
 // apt's repo-signing tooling emits for InRelease. The signature is
 // over the canonicalized cleartext.

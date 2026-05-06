@@ -10,6 +10,7 @@ import (
 	"regexp"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 
@@ -173,6 +174,117 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 	}
 
 	return block.Plaintext, nil
+}
+
+// VerifyDetached verifies a detached signature (Release.gpg bytes)
+// against the given Release bytes. Returns releaseBytes verbatim on
+// success — there is no "extracted plaintext" the way clearsign has;
+// the Release file IS the verified plaintext.
+//
+// sigBytes may be either binary or ASCII-armored. apt-ftparchive's
+// recommended workflow emits ASCII-armored Release.gpg
+// (`gpg --detach-sign --armor`), but binary Release.gpg also exists in
+// the wild; both forms are accepted.
+//
+// Order of checks (each fails closed):
+//  1. Empty inputs are a programming error in the caller (the
+//     freshness checker only routes here when both Release and
+//     Release.gpg fetched non-empty bodies).
+//  2. Resolve per-suite trust set; if RequirePinned and no match, abort.
+//  3. De-armor sigBytes if it looks armored; otherwise treat as binary.
+//  4. Iterate signature packets, accepting on the first packet that
+//     BOTH passes the long-form-fingerprint trust check AND verifies
+//     cryptographically against trustSet — same per-packet coupling
+//     as VerifyInline (SPEC2 §7.6.3).
+//
+// Unlike VerifyInline there is no "no signature, !RequireSignature
+// passes through" branch: a detached path that arrived without
+// Release.gpg never reaches this function (the freshness checker
+// only switches to detached mode after fetching both bodies).
+//
+// AIDEV-NOTE: we deliberately do NOT enforce a "bare armor" guard
+// equivalent to requireBareClearsigned. clearsign.Decode silently
+// strips prefix bytes around its envelope, which can alias verified-
+// bytes vs stored-bytes when the InRelease blob lands in the pool.
+// armor.Decode also strips, but for Release.gpg the stored bytes
+// (whatever they are) are served verbatim to apt clients on every
+// subsequent fetch, which re-verify against the same key. So
+// "verified bytes == stored bytes" holds trivially: whatever bytes
+// we accept here are the bytes apt will also accept downstream.
+func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error) {
+	_ = ctx
+
+	if len(releaseBytes) == 0 {
+		return nil, errors.New("empty Release body")
+	}
+	if len(sigBytes) == 0 {
+		return nil, errors.New("empty Release.gpg body")
+	}
+
+	trustSet, trustFPs, _, err := v.resolveTrustSet(suite)
+	if err != nil {
+		return nil, err
+	}
+	if len(trustSet) == 0 {
+		return nil, fmt.Errorf("%w: pin matched but no key in host keyring satisfies it", ErrNoUsableSignature)
+	}
+
+	binarySig, err := decodeMaybeArmoredSignature(sigBytes)
+	if err != nil {
+		return nil, fmt.Errorf("decode signature: %w", err)
+	}
+
+	if err := v.verifyAnyTrusted(trustSet, trustFPs, releaseBytes, binarySig); err != nil {
+		return nil, err
+	}
+	return releaseBytes, nil
+}
+
+// decodeMaybeArmoredSignature returns the binary signature packet
+// bytes for a Release.gpg blob. If the input begins with an armor
+// frame ("-----BEGIN PGP SIGNATURE-----" after optional whitespace),
+// it is de-armored; otherwise the bytes are returned as-is.
+//
+// Caps the binary output at 64 KiB — real Release.gpg signatures are
+// well under 1 KiB; the cap bounds memory if a hostile upstream feeds
+// a giant fake signature.
+func decodeMaybeArmoredSignature(b []byte) ([]byte, error) {
+	const maxBinary = 64 << 10
+	if isArmoredSignature(b) {
+		block, err := armor.Decode(bytes.NewReader(b))
+		if err != nil {
+			return nil, fmt.Errorf("armor decode: %w", err)
+		}
+		if block.Type != "PGP SIGNATURE" {
+			return nil, fmt.Errorf("unexpected armor type %q (want \"PGP SIGNATURE\")", block.Type)
+		}
+		out, err := io.ReadAll(io.LimitReader(block.Body, int64(maxBinary)+1))
+		if err != nil {
+			return nil, err
+		}
+		if len(out) > maxBinary {
+			return nil, fmt.Errorf("signature too large (>%d bytes after de-armor)", maxBinary)
+		}
+		return out, nil
+	}
+	if len(b) > maxBinary {
+		return nil, fmt.Errorf("signature too large (>%d bytes)", maxBinary)
+	}
+	return b, nil
+}
+
+// isArmoredSignature returns true iff b (after skipping leading
+// whitespace) begins with the standard "PGP SIGNATURE" armor header.
+func isArmoredSignature(b []byte) bool {
+	for len(b) > 0 {
+		c := b[0]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+			b = b[1:]
+			continue
+		}
+		break
+	}
+	return bytes.HasPrefix(b, []byte("-----BEGIN PGP SIGNATURE-----"))
 }
 
 // requireBareClearsigned returns an error if b contains anything
