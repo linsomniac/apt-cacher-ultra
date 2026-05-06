@@ -24,6 +24,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/gpg"
 	"github.com/linsomniac/apt-cacher-ultra/internal/handler"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 )
 
@@ -286,6 +287,27 @@ func serveListeners(
 		freshChecker.Run(freshCtx)
 	}()
 
+	// SPEC2 §6.5 at-rest integrity scanner. Shares the freshCtx so the
+	// shutdown sequence below cancels and drains it the same way as
+	// the freshness scheduler — neither must outlive the cache. A zero
+	// interval disables the scan; Scanner.Run returns immediately and
+	// the WaitGroup completes without doing anything.
+	scanner, err := integrity.New(integrity.Config{
+		Cache:    c,
+		Interval: cfg.Integrity.ValidateAtRestInterval.Duration,
+		Workers:  cfg.Integrity.ValidateAtRestWorkers,
+		Logger:   logger,
+	})
+	if err != nil {
+		return fmt.Errorf("build integrity scanner: %w", err)
+	}
+	var scannerWG sync.WaitGroup
+	scannerWG.Add(1)
+	go func() {
+		defer scannerWG.Done()
+		scanner.Run(freshCtx)
+	}()
+
 	plainSrv := newHTTPServer(h, logger)
 	var tlsSrv *http.Server
 	if tlsLn != nil {
@@ -392,6 +414,7 @@ func serveListeners(
 	// handler's T1 wiring path, so they'll be drained by h.Close.
 	freshCancel()
 	freshWG.Wait()
+	scannerWG.Wait()
 
 	// SPEC §9.5 step 3: cancel any in-flight upstream fetches (which
 	// outlive the request ctx by design — see handler.serveCacheMiss)

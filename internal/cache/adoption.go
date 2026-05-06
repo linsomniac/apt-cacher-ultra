@@ -420,6 +420,87 @@ SELECT sf.current_snapshot_id, sm.blob_hash
 	return &SnapshotMemberLookup{SnapshotID: snapID, BlobHash: blobHash}, nil
 }
 
+// IntegrityCandidate is a single (blob_hash, declared_sha256, snapshot_id,
+// source) tuple emitted by ListIntegrityCandidates for the SPEC2 §6.5
+// at-rest scan. The scanner reads pool/<BlobHash>, hashes it, and
+// compares the result against BlobHash itself. SourceTable is one of
+// "snapshot_member" or "package_hash" — surfaced in the
+// at_rest_corruption log line per SPEC2 §10.2 ("first-found is
+// reported"). For snapshot_member rows DeclaredSHA256 == BlobHash;
+// for package_hash rows blob_hash is not stored on the row, so the
+// query reuses declared_sha256 as the expected pool filename.
+type IntegrityCandidate struct {
+	BlobHash       string
+	DeclaredSHA256 string
+	SnapshotID     int64
+	SourceTable    string
+}
+
+// ListIntegrityCandidates returns one row per distinct blob hash pinned
+// by any current snapshot, drawn from snapshot_member and package_hash.
+// Rows whose snapshot is no longer current (displaced by a later
+// adoption) are excluded — the §6.5 scanner only verifies blobs the
+// current contract still relies on. SPEC §10.2's "first-found is
+// reported" semantic governs duplicates: when the same blob is pinned
+// by both a snapshot_member and a package_hash, snapshot_member wins
+// (it appears first in the UNION).
+//
+// Returns rows in no defined order. Empty slice + nil error means no
+// snapshot covers any blob — a fresh deploy with no adoptions has
+// nothing to scan, which is correct.
+//
+// AIDEV-NOTE: the integrity scanner is the only caller. The query
+// excludes blob.refcount-0 rows transitively via the suite_freshness
+// join: only blobs reachable from a current snapshot show up. Phase 4
+// GC will reap orphans separately; the scanner does not race it.
+func (c *Cache) ListIntegrityCandidates(ctx context.Context) ([]IntegrityCandidate, error) {
+	const q = `
+SELECT blob_hash, declared_sha256, snapshot_id, source FROM (
+  SELECT sm.blob_hash       AS blob_hash,
+         sm.declared_sha256 AS declared_sha256,
+         sm.snapshot_id     AS snapshot_id,
+         'snapshot_member'  AS source
+    FROM snapshot_member sm
+    JOIN suite_freshness sf ON sf.current_snapshot_id = sm.snapshot_id
+  UNION ALL
+  SELECT p.declared_sha256 AS blob_hash,
+         p.declared_sha256 AS declared_sha256,
+         p.snapshot_id     AS snapshot_id,
+         'package_hash'    AS source
+    FROM package_hash p
+    JOIN suite_freshness sf ON sf.current_snapshot_id = p.snapshot_id
+)`
+	rows, err := c.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("ListIntegrityCandidates: %w", err)
+	}
+	defer rows.Close()
+	// AIDEV-NOTE: dedup by blob_hash in Go rather than SQL DISTINCT to
+	// preserve "first-found wins" — snapshot_member rows precede
+	// package_hash rows in the UNION ALL, so the first occurrence of
+	// each hash is the snapshot_member tuple when both apply. SQL
+	// DISTINCT over (blob_hash, source, ...) would emit two rows;
+	// DISTINCT on blob_hash alone is undefined under SQLite when other
+	// columns differ.
+	seen := make(map[string]struct{})
+	var out []IntegrityCandidate
+	for rows.Next() {
+		var ic IntegrityCandidate
+		if err := rows.Scan(&ic.BlobHash, &ic.DeclaredSHA256, &ic.SnapshotID, &ic.SourceTable); err != nil {
+			return nil, fmt.Errorf("ListIntegrityCandidates scan: %w", err)
+		}
+		if _, dup := seen[ic.BlobHash]; dup {
+			continue
+		}
+		seen[ic.BlobHash] = struct{}{}
+		out = append(out, ic)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListIntegrityCandidates iter: %w", err)
+	}
+	return out, nil
+}
+
 // EvictURLPath deletes the url_path row for (scheme, host, path) and
 // decrements the prior blob's refcount in a single transaction. SPEC2
 // §6.1 step 5: stale Phase 1 row covered by a Phase 2 snapshot has
