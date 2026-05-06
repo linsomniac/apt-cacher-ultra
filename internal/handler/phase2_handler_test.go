@@ -463,12 +463,70 @@ func TestServeHTTP_AdoptedSuiteSnapshotMemberDBError_FailsClosed(t *testing.T) {
 	}
 }
 
-// TestServeHTTP_AdoptedSuiteMissingBlob_FailsClosed covers the codex
-// finding: when an adopted suite has a snapshot_member row but the
-// pool/<blob> file is missing on disk, the handler must NOT fall
-// through to serveCacheMiss (which would fetch unverified bytes).
-// Fail closed with 502 + Retry-After: 30.
-func TestServeHTTP_AdoptedSuiteMissingBlob_FailsClosed(t *testing.T) {
+// TestServeHTTP_AdoptedSuiteMissingBlob_RefetchMatchServes covers the
+// SPEC2 §6.2 metadata recovery happy path: snapshot_member row points
+// at a blob whose pool/<blob> file has been removed (operator
+// deletion, integrity-scanner corruption removal). A re-fetch from
+// upstream returns the bytes that hash to declared_sha256, the cache
+// validates the match, persists the file back into pool/, and serves
+// it with X-Cache: MISS + X-Cache-Snapshot.
+func TestServeHTTP_AdoptedSuiteMissingBlob_RefetchMatchServes(t *testing.T) {
+	body := []byte("real InRelease")
+	upstreamCalls := atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	scheme, host, port := splitURL(t, srv.URL)
+	canonHost := hostKey(host, port)
+	suite := "/dists/noble"
+
+	// Adopt a snapshot whose declared_sha256 matches body's hash.
+	releaseBlob := writeBlob(t, h, body)
+	snapID := commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
+		[]cache.SnapshotMember{
+			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
+		}, nil)
+
+	// Remove the pool file (simulating at-rest scanner removal).
+	if err := os.Remove(h.cache.BlobPath(releaseBlob)); err != nil {
+		t.Fatalf("remove blob: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/dists/noble/InRelease"))
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status=%d, want 200 (recovery served); body=%q",
+			rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != string(body) {
+		t.Errorf("body=%q, want %q", got, body)
+	}
+	if got := rec.Header().Get("X-Cache"); got != "MISS" {
+		t.Errorf("X-Cache=%q, want MISS (post-recovery fetch)", got)
+	}
+	if got := rec.Header().Get("X-Cache-Snapshot"); got != itoa(snapID) {
+		t.Errorf("X-Cache-Snapshot=%q, want %d", got, snapID)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Errorf("upstream calls=%d, want 1 (one recovery fetch)", got)
+	}
+	if _, err := os.Stat(h.cache.BlobPath(releaseBlob)); err != nil {
+		t.Errorf("expected pool blob to be re-created post-recovery: %v", err)
+	}
+}
+
+// TestServeHTTP_AdoptedSuiteMissingBlob_RefetchMismatchFailsClosed
+// covers the recovery-mismatch surface: the pool blob is gone, the
+// upstream is now serving content whose sha256 does not match the
+// snapshot's declared hash (upstream rolled forward). The handler
+// must not insert the bogus bytes; it returns 502 + Retry-After: 30
+// and the next adoption flips us forward.
+func TestServeHTTP_AdoptedSuiteMissingBlob_RefetchMismatchFailsClosed(t *testing.T) {
 	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
@@ -481,31 +539,56 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_FailsClosed(t *testing.T) {
 	canonHost := hostKey(host, port)
 	suite := "/dists/noble"
 
-	// Adopt a snapshot with a member.
+	// declared_sha256 is the hash of "real InRelease"; upstream returns
+	// different bytes.
 	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
 	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
 		}, nil)
 
-	// Delete the pool blob to simulate operator deletion / corruption.
-	blobPath := h.cache.BlobPath(releaseBlob)
-	if err := os.Remove(blobPath); err != nil {
+	if err := os.Remove(h.cache.BlobPath(releaseBlob)); err != nil {
 		t.Fatalf("remove blob: %v", err)
 	}
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/dists/noble/InRelease"))
 	if rec.Code != http.StatusBadGateway {
-		t.Errorf("status=%d, want 502 (fail-closed on missing snapshot blob)",
-			rec.Code)
+		t.Errorf("status=%d, want 502 (recovery hash mismatch)", rec.Code)
 	}
 	if got := rec.Header().Get("Retry-After"); got != "30" {
 		t.Errorf("Retry-After=%q, want 30", got)
 	}
-	if got := upstreamCalls.Load(); got != 0 {
-		t.Errorf("upstream calls=%d, want 0 (must not fetch unverified)", got)
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Errorf("upstream calls=%d, want 1 (one recovery attempt)", got)
 	}
+	if _, err := os.Stat(h.cache.BlobPath(releaseBlob)); err == nil {
+		t.Errorf("expected mismatched pool blob to be discarded; file remains")
+	}
+}
+
+// itoa is a small helper for X-Cache-Snapshot assertions, mirroring
+// the integrity_test.go variant.
+func itoa(n int64) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	pos := len(b)
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	for n > 0 {
+		pos--
+		b[pos] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		pos--
+		b[pos] = '-'
+	}
+	return string(b[pos:])
 }
 
 // TestServeHTTP_DebHitConflictingPackageHash502s covers §6.1 step 6: two

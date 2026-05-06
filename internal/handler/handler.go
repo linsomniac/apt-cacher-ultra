@@ -172,6 +172,16 @@ var (
 	// safely pick one; surfaces as 502 with the SPEC2 §6.1 step 6 log
 	// keyword "package_hash_conflict".
 	ErrPackageHashConflict = errors.New("handler: snapshots disagree on .deb declared hash")
+
+	// ErrSnapshotMemberMismatch fires when SPEC2 §6.2 metadata recovery
+	// (re-fetch of an adopted-suite metadata path whose pool blob is
+	// missing) returns bytes whose sha256 disagrees with the
+	// snapshot_member.declared_sha256. Indicates upstream has rolled
+	// forward and the snapshot is stale; the next adoption flips
+	// forward to the new InRelease and the path becomes serveable
+	// again. respondError emits 502 + Retry-After: 30 (the same shape
+	// writeFailClosed would have used had recovery not been attempted).
+	ErrSnapshotMemberMismatch = errors.New("handler: re-fetched snapshot metadata hash disagrees with declared hash")
 )
 
 // ServeHTTP routes one apt request through the cache.
@@ -200,7 +210,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fast path: SPEC §6.1.
-	if served, status, body := h.tryCacheHit(w, r, req); served {
+	if served, status, body := h.tryCacheHit(w, r, req, start); served {
 		h.logRequest(r, req.CanonicalHost, req.Path, "hit", status, body, false, 0, start)
 		return
 	}
@@ -242,9 +252,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // The fast path on every successful return is one DB read, one stat, one
 // open(2), and one ServeContent — order-of-microseconds.
-func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, status int, bytesWritten int64) {
+func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, status int, bytesWritten int64) {
 	if req.IsMetadata && req.SuitePath != "" {
-		if served, status, body, handled := h.trySnapshotHit(w, r, req); handled {
+		if served, status, body, handled := h.trySnapshotHit(w, r, req, start); handled {
 			return served, status, body
 		}
 	}
@@ -259,16 +269,22 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 // to the Phase 1 url_path lookup.
 //
 // AIDEV-NOTE: every failure mode after a suite has been confirmed
-// adopted (DB error on snapshot_member, missing pool blob, etc.) must
-// fail closed with a 502 — never drop into serveCacheMiss. The miss
-// path does not validate metadata against snapshot_member, so any
-// fall-through would let unverified upstream bytes masquerade as the
-// adopted snapshot's content. SPEC2 §6.1 / §6.2: "the snapshot is the
+// adopted (DB error on snapshot_member, etc.) must fail closed with a
+// 502 — never drop into serveCacheMiss. The miss path does not
+// validate metadata against snapshot_member, so any fall-through
+// would let unverified upstream bytes masquerade as the adopted
+// snapshot's content. SPEC2 §6.1 / §6.2: "the snapshot is the
 // contract." A SuiteFreshness DB error is the one ambiguous case —
 // we don't know whether the suite is adopted, so we fail closed too;
 // the realistic failure mode is "DB is broken everywhere", and a 502
 // across the board is the right operator signal.
-func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, status int, bytesWritten int64, handled bool) {
+//
+// The "blob missing" case is the one place we *can* recover safely:
+// snapshot_member.declared_sha256 is itself a trust anchor, so a
+// re-fetch validated against that hash is as safe as the original
+// adoption fetch. SPEC2 §6.2 names this as the local-fault recovery
+// path. serveSnapshotMemberMiss owns it.
+func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, status int, bytesWritten int64, handled bool) {
 	suite, err := h.cache.GetSuiteFreshness(r.Context(),
 		req.CanonicalScheme, req.CanonicalHost, req.SuitePath)
 	switch {
@@ -316,19 +332,19 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 	})
 	if !served {
 		// Pool blob is missing for a known snapshot member (operator
-		// deletion, disk corruption discovered by the integrity scan).
-		// SPEC2 §6.2 contemplates a hash-validated re-fetch here, but
-		// without the §6.2 metadata-validation plumbing in place a
-		// re-fetch via serveCacheMiss would serve unverified bytes as
-		// adopted-snapshot content. Fail closed; the integrity scanner
-		// (SPEC2 §6.5 at-rest) is the correct recovery path.
-		h.logger.Error("snapshot_member_blob_missing",
+		// deletion, disk corruption removed by the integrity scanner).
+		// SPEC2 §6.2 metadata recovery: hash-validated re-fetch against
+		// snapshot_member.declared_sha256. Bytes whose sha256 disagrees
+		// with the declaration are 502'd (upstream rolled forward; next
+		// adoption flips us to the new InRelease).
+		h.logger.Warn("snapshot_member_blob_missing",
 			"canonical_host", req.CanonicalHost,
 			"path", req.Path,
 			"snapshot_id", snapshotID,
 			"blob_hash", mem.BlobHash,
 		)
-		return h.writeFailClosed(w, "snapshot blob missing"), http.StatusBadGateway, 0, true
+		served, status, bytesWritten = h.serveSnapshotMemberMiss(w, r, req, mem, snapshotID, start)
+		return served, status, bytesWritten, true
 	}
 	go h.touchAsync(req)
 	h.maybeFireFreshness(req)
@@ -672,6 +688,161 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	h.logRequest(r, req.CanonicalHost, req.Path, logOutcome, cw.statusCode(), cw.bytes, true, res.status, start)
 }
 
+// serveSnapshotMemberMiss runs the SPEC2 §6.2 metadata recovery: an
+// adopted-suite snapshot_member exists, but the pool blob it references
+// has gone missing (operator deletion, integrity-scanner removal of
+// at-rest corruption). Fetch from upstream, validate the bytes against
+// snapshot_member.declared_sha256, and on match serve from pool/. No
+// url_path row is inserted — snapshot_member is the trust anchor for
+// adopted metadata, and a Phase 1 row would reintroduce the unverified
+// path.
+//
+// On hash mismatch (upstream rolled forward, our snapshot is stale)
+// the response is 502 + Retry-After: 30. The next adoption flip
+// updates snapshot_member to the new declared hash; that is the
+// recovery, not this miss path.
+//
+// Singleflight-coalesced under a separate key namespace so it cannot
+// collide with the regular miss path. Use the handler lifecycle ctx
+// for the inner fetch — same rationale as serveCacheMiss: a leader's
+// client disconnect must not kill the fetch for waiters.
+//
+// Returns (served, status, bytesWritten) so the trySnapshotHit caller
+// can fold the result into its own return tuple. The access-log line
+// is emitted upstream by ServeHTTP under the existing tryCacheHit
+// path.
+func (h *Handler) serveSnapshotMemberMiss(
+	w http.ResponseWriter, r *http.Request, req *proxy.Request,
+	mem *cache.SnapshotMember, snapshotID int64, start time.Time,
+) (served bool, status int, bytesWritten int64) {
+	cw := &countingWriter{ResponseWriter: w}
+
+	key := "snapshot:" + req.CanonicalScheme + "|" + req.CanonicalHost + "|" + req.Path
+	res, shared, waiters := h.sf.Do(key, func() sfResult {
+		return h.runSnapshotMemberFetch(h.lifecycleCtx, req, mem, snapshotID)
+	})
+	if !shared && waiters > 0 {
+		h.logger.Info("singleflight coalesced",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"waiters", waiters,
+		)
+	}
+
+	if res.err != nil {
+		h.respondError(cw, r, req, res, start)
+		return true, cw.statusCode(), cw.bytes
+	}
+
+	// Open the freshly-finalized blob and stream it via ServeContent
+	// directly, with X-Cache: MISS (recovery just fetched the bytes)
+	// and X-Cache-Snapshot identifying the trust anchor. Avoids
+	// serveBlobWithHeaders, which always emits X-Cache: HIT and is
+	// the wrong surface here.
+	path := h.cache.BlobPath(res.blobHash)
+	f, err := os.Open(path)
+	if err != nil {
+		// Vanishingly unlikely: blob just finalized and now the file is
+		// gone. The at-rest scanner running mid-request between
+		// Finalize and Open is the only realistic cause. Treat as a
+		// local fault and 502.
+		h.logger.Warn("post-recovery blob open failed",
+			"err", err, "hash", res.blobHash, "path", req.Path)
+		cw.Header().Set("Retry-After", "30")
+		http.Error(cw, "post-fetch blob missing", http.StatusBadGateway)
+		return true, http.StatusBadGateway, 0
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		h.logger.Warn("post-recovery blob stat failed",
+			"err", err, "hash", res.blobHash)
+		cw.Header().Set("Retry-After", "30")
+		http.Error(cw, "post-fetch blob stat failed", http.StatusBadGateway)
+		return true, http.StatusBadGateway, 0
+	}
+
+	cw.Header().Set(hdrXCache, cacheMiss)
+	cw.Header().Set(hdrXCacheSnapshot, strconv.FormatInt(snapshotID, 10))
+	cw.Header().Set(hdrXCacheAge, "0")
+	if res.status > 0 {
+		cw.Header().Set(hdrXUpstreamStat, strconv.Itoa(res.status))
+	}
+	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
+	return true, cw.statusCode(), cw.bytes
+}
+
+// runSnapshotMemberFetch is the singleflight body for SPEC2 §6.2
+// metadata recovery. Fetches the upstream URL into a temp blob,
+// finalizes into pool/, and verifies the resulting hash against
+// mem.DeclaredSHA256. On mismatch the file is discarded and
+// ErrSnapshotMemberMismatch is returned; respondError converts it to
+// 502 + Retry-After: 30.
+//
+// No url_path row is written — snapshot_member already references the
+// blob, and a Phase 1 url_path row would let an unverified Phase 1
+// hit-path serve this metadata for non-adopted suites that share the
+// same canonical (host, path) (rare but legal).
+//
+// blob row is upserted (PutBlob is INSERT OR IGNORE) so that a missing
+// blob row from any earlier abnormal teardown becomes consistent
+// again. The ContentLength comes from the fetch result so the row's
+// size column is accurate even if the original adoption row predates
+// any size schema change.
+func (h *Handler) runSnapshotMemberFetch(ctx context.Context, req *proxy.Request, mem *cache.SnapshotMember, snapshotID int64) sfResult {
+	release, err := h.sem.Acquire(ctx, req.CanonicalHost)
+	if err != nil {
+		return sfResult{err: fmt.Errorf("handler: acquire host slot: %w", err)}
+	}
+	defer release()
+
+	bw, err := h.cache.NewTempBlob()
+	if err != nil {
+		return sfResult{err: fmt.Errorf("handler: open temp blob: %w", err)}
+	}
+
+	target := &fetch.Target{CanonicalHost: req.CanonicalHost, URL: req.UpstreamURL}
+	fres, ferr := h.fetch.Fetch(ctx, target, bw)
+	if ferr != nil {
+		_ = bw.Abort()
+		status := 0
+		var se *fetch.StatusError
+		if errors.As(ferr, &se) {
+			status = se.Code
+		}
+		return sfResult{err: ferr, status: status}
+	}
+
+	hash, err := bw.Finalize(fres.ContentLength)
+	if err != nil {
+		return sfResult{err: fmt.Errorf("handler: finalize blob: %w", err), status: fres.Status}
+	}
+	if hash != mem.DeclaredSHA256 {
+		// SPEC2 §10.2 names adoption_member_mismatch as the keyword for
+		// adoption-time mismatches; for the post-adoption recovery
+		// surface we use a sibling keyword so operators can distinguish
+		// the two.
+		h.logger.Error("snapshot_member_refetch_mismatch",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"declared_sha256", mem.DeclaredSHA256,
+			"observed_sha256", hash,
+			"snapshot_id", snapshotID,
+		)
+		if rerr := h.cache.DiscardFinalizedBlob(hash); rerr != nil {
+			h.logger.Warn("discard mismatched snapshot blob failed", "err", rerr, "hash", hash)
+		}
+		return sfResult{err: ErrSnapshotMemberMismatch, status: fres.Status}
+	}
+
+	dbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := h.cache.PutBlob(dbCtx, hash, fres.ContentLength); err != nil {
+		return sfResult{err: fmt.Errorf("handler: put blob row: %w", err), status: fres.Status}
+	}
+	return sfResult{blobHash: hash, size: fres.ContentLength, status: fres.Status}
+}
+
 // runFetch is the body of the singleflight call. Acquires the per-host
 // semaphore, opens a temp blob, fetches into it, finalizes into pool/,
 // and inserts the url_path/blob rows. Returns sfResult with the cached
@@ -958,6 +1129,15 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, "package hash conflict", http.StatusBadGateway)
 		h.logRequest(r, req.CanonicalHost, req.Path, "package_hash_conflict", http.StatusBadGateway, 0, true, res.status, start)
+		return
+	case errors.Is(err, ErrSnapshotMemberMismatch):
+		// SPEC2 §6.2 metadata recovery hash mismatch: re-fetched bytes
+		// don't match the snapshot's declared hash. Upstream rolled
+		// forward; the next adoption flips us forward. 502 + Retry-After: 30
+		// (local-fault category, same shape as writeFailClosed).
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, "snapshot member hash mismatch", http.StatusBadGateway)
+		h.logRequest(r, req.CanonicalHost, req.Path, "snapshot_member_refetch_mismatch", http.StatusBadGateway, 0, true, res.status, start)
 		return
 	case errors.Is(err, fetch.ErrInvalidURL):
 		// URL parse / scheme / host-mismatch failure — fired before
