@@ -807,8 +807,14 @@ The verifier accepts both forms (Q6):
   text used to extract the SHA256 → path map).
 - **Detached `Release` + `Release.gpg`.** When the cache receives a 404
   on `<suite>/InRelease` (or the upstream's `Release` advertises no
-  inline form), fetch `<suite>/Release` and `<suite>/Release.gpg` in
-  parallel. Verify the detached signature over the `Release` bytes.
+  inline form), the freshness checker conditional-GETs `<suite>/Release`,
+  and only on observed change does it then fetch `<suite>/Release.gpg`.
+  The two fetches are sequential rather than parallel: both files
+  together are tens of KB on real archives, so parallelism wouldn't
+  measurably reduce wall-clock time, while the conditional-first
+  ordering eliminates a wasted Release.gpg GET on the steady-state
+  "Release unchanged" path (the dominant case once a suite is
+  adopted). Verify the detached signature over the `Release` bytes.
   Output: the `Release` bytes verbatim.
 
 Both paths converge on "verified Release-equivalent text" before §7.5
