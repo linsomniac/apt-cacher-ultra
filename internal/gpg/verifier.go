@@ -101,27 +101,46 @@ var (
 // markers) on success.
 //
 // Order of checks (each fails closed):
-//  1. Resolve per-suite trust set; if RequirePinned and no match, abort.
-//  2. Decode clearsigned block; if absent and RequireSignature, abort.
+//  1. Reject extraneous bytes around the clearsigned block.
+//     clearsign.Decode silently discards prefix data, so we enforce
+//     "exactly one clearsigned message, with at most whitespace
+//     before/after" before invoking the decoder. Without this, an
+//     adversary could prepend forged content to a real InRelease;
+//     the verifier would happily verify the embedded message while
+//     §7.5 step 2 stored the original (prefix-bearing) bytes as the
+//     pool blob — a cache-pollution path.
+//  2. Resolve per-suite trust set; if RequirePinned and no match, abort.
+//  3. Decode clearsigned block; if absent and RequireSignature, abort.
 //     If absent and !RequireSignature, return body verbatim.
-//  3. Inspect signature packet(s); reject any without IssuerFingerprint.
-//  4. Confirm IssuerFingerprint is in the trust set fingerprints.
-//  5. Cryptographic verification against the trust-set EntityList.
-//     This step also catches expired/revoked signing keys (the
-//     openpgp library skips keys that fail the validity gate).
+//  4. Iterate signature packets, attempting cryptographic verification
+//     of each candidate (one with a trusted IssuerFingerprint)
+//     against the trust-set EntityList. Accept only on a packet that
+//     BOTH passes the long-form-fingerprint trust check AND verifies
+//     cryptographically. Without this coupling, a multi-sig block
+//     could satisfy the policy with one packet (decoy) and verify
+//     a different packet (the actual cryptographic anchor).
 //
 // ctx is accepted for interface compatibility but VerifyInline does
 // no I/O — verification is CPU-bound and short.
 func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, inRelease []byte) ([]byte, error) {
 	_ = ctx
 
-	// Step 1: per-suite trust-set resolution.
-	trustSet, trustFPs, pinned, err := v.resolveTrustSet(suite)
+	// Step 1: structural input guard — no prefix or suffix data
+	// around the clearsigned block. requireBareClearsigned returns
+	// nil when no BEGIN marker is present, so plain-text bodies
+	// (which the require_signature=false path returns verbatim
+	// later) reach the no-clearsign branch unobstructed.
+	if err := requireBareClearsigned(inRelease); err != nil {
+		return nil, err
+	}
+
+	// Step 2: per-suite trust-set resolution.
+	trustSet, trustFPs, _, err := v.resolveTrustSet(suite)
 	if err != nil {
 		return nil, err
 	}
 
-	// Step 2: clearsign decode.
+	// Step 3: clearsign decode.
 	block, _ := clearsign.Decode(inRelease)
 	if block == nil {
 		if v.requireSignature {
@@ -142,37 +161,62 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 		return nil, fmt.Errorf("%w: pin matched but no key in host keyring satisfies it", ErrNoUsableSignature)
 	}
 
-	// Step 3: read armored signature once into a buffer so we can
-	// both inspect its packets and re-verify cryptographically.
+	// Step 4: per-packet verify-and-trust loop. A signature packet is
+	// accepted iff it carries a long-form IssuerFingerprint that is
+	// in trustFPs AND verifies cryptographically against trustSet.
 	sigBytes, err := readArmoredSignature(block.ArmoredSignature.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read signature: %w", err)
 	}
-
-	// Step 3+4: enforce IssuerFingerprint and trust-set membership.
-	matched, err := v.findUsableSignature(sigBytes, trustFPs, pinned)
-	if err != nil {
+	if err := v.verifyAnyTrusted(trustSet, trustFPs, block.Bytes, sigBytes); err != nil {
 		return nil, err
 	}
-	_ = matched
-
-	// Step 5: cryptographic verification. The trust-set EntityList
-	// is constructed so only entities holding a trusted fingerprint
-	// participate; the openpgp library returns ErrUnknownIssuer if
-	// the signature's keyid resolves to an entity outside the set,
-	// and rejects expired/revoked signing keys at the same gate.
-	signer, verr := openpgp.CheckDetachedSignature(
-		trustSet,
-		bytes.NewReader(block.Bytes),
-		bytes.NewReader(sigBytes),
-		nil,
-	)
-	if verr != nil {
-		return nil, fmt.Errorf("signature verification failed: %w", verr)
-	}
-	_ = signer
 
 	return block.Plaintext, nil
+}
+
+// requireBareClearsigned returns an error if b contains anything
+// other than (optional whitespace) + clearsigned message + (optional
+// whitespace). clearsign.Decode silently strips prefix bytes; we
+// reject them here to preserve the invariant that "verified bytes ==
+// stored bytes (modulo trailing newlines)" — see SPEC2 §7.5 step 2.
+//
+// If b doesn't contain a clearsigned marker at all, this returns nil
+// — let the downstream "no clearsign" path handle the !RequireSignature
+// case.
+func requireBareClearsigned(b []byte) error {
+	const beginMarker = "-----BEGIN PGP SIGNED MESSAGE-----"
+	const endSig = "-----END PGP SIGNATURE-----"
+	idx := bytes.Index(b, []byte(beginMarker))
+	if idx < 0 {
+		return nil
+	}
+	if !isWhitespaceOnly(b[:idx]) {
+		return errors.New("clearsigned message has extraneous bytes before BEGIN marker")
+	}
+	endIdx := bytes.Index(b, []byte(endSig))
+	if endIdx < 0 {
+		// Missing END marker — let clearsign.Decode produce the real
+		// error. Don't fabricate one here.
+		return nil
+	}
+	tail := b[endIdx+len(endSig):]
+	if !isWhitespaceOnly(tail) {
+		return errors.New("clearsigned message has extraneous bytes after END marker")
+	}
+	return nil
+}
+
+func isWhitespaceOnly(b []byte) bool {
+	for _, c := range b {
+		switch c {
+		case ' ', '\t', '\r', '\n':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // resolveTrustSet implements SPEC2 §7.6.2. Returns:
@@ -231,26 +275,37 @@ func readArmoredSignature(r io.Reader) ([]byte, error) {
 	return out, nil
 }
 
-// findUsableSignature walks the signature packets in sigBytes and
-// returns the first one whose IssuerFingerprint is in trustFPs. If
-// any packet lacks IssuerFingerprint, the function returns ErrShortKeyID
-// — this is a per-signature policy check, NOT "any signature without
-// IssuerFingerprint is rejected": if the block contains multiple
-// signatures we accept the first that satisfies long-form + trust.
+// verifyAnyTrusted enumerates every signature packet in sigBytes and
+// accepts on the FIRST one that passes BOTH (a) the long-form
+// IssuerFingerprint trust check and (b) cryptographic verification
+// against trustSet. Coupling these checks to the same packet is the
+// SPEC2 §7.6.3 invariant: a multi-signature block must not satisfy
+// the policy with one packet while the library's verifier accepts a
+// different packet.
 //
-// SPEC2 §7.6.3 says short-keyid matches are insufficient and rejected.
-// We interpret this as: the long-form fingerprint MUST be present on
-// every signature we'd consider. A signature lacking IssuerFingerprint
-// cannot be considered, so if it's the only signature and the others
-// also lack IssuerFingerprint, we return ErrShortKeyID; if at least one
-// signature has IssuerFingerprint but it's outside trustFPs, we return
-// ErrUntrustedSigner; if all signatures fail one of those filters, we
-// return ErrNoUsableSignature.
-func (v *Verifier) findUsableSignature(sigBytes []byte, trustFPs map[string]struct{}, pinned bool) (*packet.Signature, error) {
+// Error precedence when no packet is accepted:
+//   - If at least one packet's IssuerFingerprint was trusted but
+//     none verified, return the last underlying verification error.
+//   - Else if at least one trusted-fingerprint packet existed but a
+//     candidate failed cryptographically with no usable alternative,
+//     return that verification error.
+//   - Else if all packets had IssuerFingerprint outside trustFPs,
+//     return ErrUntrustedSigner.
+//   - Else if all packets lacked IssuerFingerprint, return ErrShortKeyID.
+//   - Else (no signature packets at all), ErrNoUsableSignature.
+func (v *Verifier) verifyAnyTrusted(
+	trustSet openpgp.EntityList,
+	trustFPs map[string]struct{},
+	signed []byte,
+	sigBytes []byte,
+) error {
 	reader := packet.NewReader(bytes.NewReader(sigBytes))
 	var (
-		anyShortKeyID bool
-		anyUntrusted  bool
+		anyShortKeyID  bool
+		anyUntrusted   bool
+		sawSignature   bool
+		lastVerifyErr  error
+		anyTrustedSeen bool
 	)
 	for {
 		pkt, err := reader.Next()
@@ -258,12 +313,13 @@ func (v *Verifier) findUsableSignature(sigBytes []byte, trustFPs map[string]stru
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("read signature packet: %w", err)
+			return fmt.Errorf("read signature packet: %w", err)
 		}
 		sig, ok := pkt.(*packet.Signature)
 		if !ok {
 			continue
 		}
+		sawSignature = true
 		if len(sig.IssuerFingerprint) == 0 {
 			anyShortKeyID = true
 			continue
@@ -273,15 +329,37 @@ func (v *Verifier) findUsableSignature(sigBytes []byte, trustFPs map[string]stru
 			anyUntrusted = true
 			continue
 		}
-		return sig, nil
+		anyTrustedSeen = true
+		// Re-serialize this single packet and verify it in
+		// isolation. This guarantees the packet that satisfied the
+		// IssuerFingerprint policy is the same packet whose hash is
+		// cryptographically validated.
+		var sb bytes.Buffer
+		if err := sig.Serialize(&sb); err != nil {
+			lastVerifyErr = fmt.Errorf("re-serialize signature packet: %w", err)
+			continue
+		}
+		_, _, verr := openpgp.VerifyDetachedSignature(
+			trustSet,
+			bytes.NewReader(signed),
+			&sb,
+			nil,
+		)
+		if verr == nil {
+			return nil
+		}
+		lastVerifyErr = verr
 	}
 	switch {
-	case anyShortKeyID && !anyUntrusted:
-		return nil, ErrShortKeyID
+	case !sawSignature:
+		return ErrNoUsableSignature
+	case anyTrustedSeen && lastVerifyErr != nil:
+		return fmt.Errorf("signature verification failed: %w", lastVerifyErr)
 	case anyUntrusted:
-		_ = pinned // explanatory: the error semantics are the same with or without pinning
-		return nil, fmt.Errorf("%w: IssuerFingerprint not in trust set", ErrUntrustedSigner)
+		return fmt.Errorf("%w: IssuerFingerprint not in trust set", ErrUntrustedSigner)
+	case anyShortKeyID:
+		return ErrShortKeyID
 	default:
-		return nil, ErrNoUsableSignature
+		return ErrNoUsableSignature
 	}
 }

@@ -387,3 +387,154 @@ func TestNewVerifier_RejectsNilHostRegex(t *testing.T) {
 		t.Fatal("expected error for nil HostRegex")
 	}
 }
+
+func TestVerifier_RejectsPrefixGarbage(t *testing.T) {
+	// SPEC2 §7.5 step 2 stores the original inRelease bytes; if we
+	// silently accept prefix-garbage clearsigned blocks, those bytes
+	// would land in the pool blob without ever being verified —
+	// cache-pollution path.
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+	v, _ := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		Logger:           silentLogger(),
+	})
+	body := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
+	withPrefix := append([]byte("ATTACKER PREFIX BYTES\n"), body...)
+
+	_, err := v.VerifyInline(context.Background(), newSuite(), withPrefix)
+	if err == nil {
+		t.Fatal("expected rejection for prefix-bearing clearsigned message")
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("BEGIN marker")) {
+		t.Fatalf("error doesn't mention BEGIN marker: %v", err)
+	}
+}
+
+func TestVerifier_RejectsSuffixGarbage(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+	v, _ := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		Logger:           silentLogger(),
+	})
+	body := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
+	withSuffix := append(append([]byte{}, body...), []byte("\nATTACKER SUFFIX\n")...)
+
+	_, err := v.VerifyInline(context.Background(), newSuite(), withSuffix)
+	if err == nil {
+		t.Fatal("expected rejection for suffix-bearing clearsigned message")
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("END marker")) {
+		t.Fatalf("error doesn't mention END marker: %v", err)
+	}
+}
+
+func TestVerifier_AcceptsTrailingNewlines(t *testing.T) {
+	// Whitespace-only trailing bytes are conventional (apt's own
+	// InRelease frequently ends with a final newline after the END
+	// marker). The strict guard must allow this.
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+	v, _ := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		Logger:           silentLogger(),
+	})
+	body := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
+	withWS := append(append([]byte{}, body...), []byte("\n\n  \r\n")...)
+	if _, err := v.VerifyInline(context.Background(), newSuite(), withWS); err != nil {
+		t.Fatalf("trailing whitespace should be accepted: %v", err)
+	}
+}
+
+func TestVerifier_AllowsUnsignedBodyWithMarkerlessJunk(t *testing.T) {
+	// require_signature=false + body without any clearsign marker:
+	// return the body verbatim. The structural guard must not
+	// inadvertently reject plaintext bodies just because they
+	// happen to contain non-whitespace bytes.
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+	v, _ := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: false,
+		Logger:           silentLogger(),
+	})
+	plain := []byte("Origin: Plain\nSuite: noble\nSHA256:\n abc 12 main/Sources\n")
+	got, err := v.VerifyInline(context.Background(), newSuite(), plain)
+	if err != nil {
+		t.Fatalf("expected verbatim return for plain body: %v", err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("verbatim mismatch")
+	}
+}
+
+func TestVerifier_MultiSig_StaleAndCurrent(t *testing.T) {
+	// SPEC2 §7.6.3: per-packet verify-and-trust binding. Construct
+	// a clearsigned block with TWO signature packets — both by the
+	// same trusted key, but the FIRST is over different content
+	// (so its hash mismatches when verified against the block's
+	// cleartext). The second is the real one.
+	//
+	// This exercises the verifyAnyTrusted loop: a "stale" signature
+	// fails crypto, the loop must move on to the "current" one.
+	// Without per-packet iteration the verifier would fail at the
+	// stale packet rather than discovering the current one.
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+	v, _ := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		Logger:           silentLogger(),
+	})
+
+	// Build the real block over fakeReleasePlaintext.
+	realBlock := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
+	// Build a "stale" sig over different cleartext.
+	staleBlock := clearsignWith(t, signer, []byte("Origin: STALE\n"))
+
+	combined, err := buildMultiSigBlock(realBlock, staleBlock)
+	if err != nil {
+		t.Fatalf("buildMultiSigBlock: %v", err)
+	}
+
+	plain, err := v.VerifyInline(context.Background(), newSuite(), combined)
+	if err != nil {
+		t.Fatalf("multi-sig verify failed: %v", err)
+	}
+	if !bytes.Equal(plain, []byte(fakeReleasePlaintext)) {
+		t.Fatalf("plaintext mismatch")
+	}
+}
+
+func TestVerifier_MultiSig_AllStaleRejects(t *testing.T) {
+	// Inverse of the above: every signature in the block is over
+	// stale cleartext, so none verify against the block's actual
+	// cleartext. The verifier must reject — the loop must NOT
+	// accept on the basis of a packet's IssuerFingerprint alone.
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+	v, _ := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		Logger:           silentLogger(),
+	})
+
+	stale1 := clearsignWith(t, signer, []byte("Origin: ONE\n"))
+	stale2 := clearsignWith(t, signer, []byte("Origin: TWO\n"))
+
+	// Take stale1's cleartext but stale2's signature(s). The block's
+	// cleartext is from stale1; signatures (the policy says trusted
+	// fp) all verify only against stale2's cleartext, not stale1's.
+	combined, err := substituteSignatures(stale1, stale2)
+	if err != nil {
+		t.Fatalf("substituteSignatures: %v", err)
+	}
+
+	if _, err := v.VerifyInline(context.Background(), newSuite(), combined); err == nil {
+		t.Fatal("expected rejection when all signatures are over stale cleartext")
+	}
+}

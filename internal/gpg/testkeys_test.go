@@ -3,6 +3,8 @@ package gpg
 import (
 	"bytes"
 	"crypto"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -156,3 +158,91 @@ func writeFile(t *testing.T, path string, body []byte) {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }
+
+// buildMultiSigBlock returns a clearsigned message whose cleartext
+// is taken from `current` and whose armored-signature body is the
+// concatenation of `stale`'s signature packets followed by
+// `current`'s. The result simulates an InRelease that carries an
+// extra (stale) signature alongside the live one — a structure the
+// per-packet verify-and-trust loop must traverse.
+func buildMultiSigBlock(current, stale []byte) ([]byte, error) {
+	cur, _ := clearsign.Decode(current)
+	stl, _ := clearsign.Decode(stale)
+	if cur == nil || stl == nil {
+		return nil, errInvalidFixture
+	}
+	curSig, err := readArmoredBlockBody(cur)
+	if err != nil {
+		return nil, fmt.Errorf("decode current armor: %w", err)
+	}
+	stlSig, err := readArmoredBlockBody(stl)
+	if err != nil {
+		return nil, fmt.Errorf("decode stale armor: %w", err)
+	}
+	combined := append([]byte{}, stlSig...)
+	combined = append(combined, curSig...)
+	return assembleClearsignedBlock(cur.Plaintext, combined)
+}
+
+// substituteSignatures returns a clearsigned message whose cleartext
+// is `base`'s but whose signature(s) come from `from`. The result
+// is structurally a valid clearsigned message, but the signatures
+// are "wrong" because they were made over different cleartext —
+// useful to confirm the verifier rejects when no packet verifies.
+func substituteSignatures(base, from []byte) ([]byte, error) {
+	b, _ := clearsign.Decode(base)
+	f, _ := clearsign.Decode(from)
+	if b == nil || f == nil {
+		return nil, errInvalidFixture
+	}
+	fromSig, err := readArmoredBlockBody(f)
+	if err != nil {
+		return nil, fmt.Errorf("decode from armor: %w", err)
+	}
+	return assembleClearsignedBlock(b.Plaintext, fromSig)
+}
+
+// readArmoredBlockBody pulls the binary signature bytes out of a
+// clearsign.Block's already-de-armored signature reader.
+func readArmoredBlockBody(b *clearsign.Block) ([]byte, error) {
+	out, err := io.ReadAll(b.ArmoredSignature.Body)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// assembleClearsignedBlock builds a "clearsigned message" envelope
+// around plaintext + binary signature packet bytes. Mirrors
+// clearsign.Encode's framing: the LF immediately preceding the
+// "-----BEGIN PGP SIGNATURE-----" line is treated as a structural
+// separator (stripped from the signed content), so the assembler
+// must write an extra LF after plaintext to preserve plaintext's
+// own trailing newline.
+func assembleClearsignedBlock(plaintext, sigPackets []byte) ([]byte, error) {
+	var out bytes.Buffer
+	out.WriteString("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n")
+	out.Write(plaintext)
+	// Ensure plaintext is followed by an extra LF before BEGIN
+	// SIGNATURE. clearsign.Decode strips the LF immediately
+	// preceding the marker as framing, so two LFs in succession
+	// preserve plaintext's own LF terminator.
+	if len(plaintext) > 0 && plaintext[len(plaintext)-1] != '\n' {
+		out.WriteByte('\n')
+	}
+	out.WriteByte('\n')
+	armorWriter, err := armor.Encode(&out, "PGP SIGNATURE", nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := armorWriter.Write(sigPackets); err != nil {
+		return nil, err
+	}
+	if err := armorWriter.Close(); err != nil {
+		return nil, err
+	}
+	out.WriteByte('\n')
+	return out.Bytes(), nil
+}
+
+var errInvalidFixture = fmt.Errorf("test fixture: clearsign.Decode returned nil")
