@@ -708,8 +708,16 @@ type phase2ChaosStack struct {
 	adopter *freshness.Adopter
 }
 
-// newPhase2ChaosStackGated wires a full Phase 2 stack: cache,
-// fetch.Client (loopback-allow), pass-through GPG verifier,
+// newPhase2ChaosStackGated wires a full Phase 2 stack with the
+// pass-through verifier and an optional member-fetch gate. See
+// newPhase2ChaosStackWithVerifier for the shared body.
+func newPhase2ChaosStackGated(t *testing.T, upstream *url.URL, gate *chaos2Gate) *phase2ChaosStack {
+	t.Helper()
+	return newPhase2ChaosStackWithVerifier(t, upstream, gate, chaos2PassVerifier{})
+}
+
+// newPhase2ChaosStackWithVerifier wires a full Phase 2 stack: cache,
+// fetch.Client (loopback-allow), caller-supplied GPG verifier,
 // port-rewriting adoption fetcher (delegating into the same
 // production fetch.Client so URL validation and transport hardening
 // run end-to-end), freshness checker with adopter wired in, and a
@@ -718,9 +726,9 @@ type phase2ChaosStack struct {
 // coalesces the burst into a single in-flight conditional GET.
 //
 // gate, when non-nil, blocks the Adopter's member fetches until
-// Open()ed — the test uses this to park adoption at member-prefetch
-// while the chaos burst runs.
-func newPhase2ChaosStackGated(t *testing.T, upstream *url.URL, gate *chaos2Gate) *phase2ChaosStack {
+// Open()ed — the chaos test uses this to park adoption at
+// member-prefetch while the burst runs.
+func newPhase2ChaosStackWithVerifier(t *testing.T, upstream *url.URL, gate *chaos2Gate, verifier freshness.Verifier) *phase2ChaosStack {
 	t.Helper()
 
 	parser, err := proxy.New(nil, nil)
@@ -751,7 +759,7 @@ func newPhase2ChaosStackGated(t *testing.T, upstream *url.URL, gate *chaos2Gate)
 	adopter, err := freshness.NewAdopter(freshness.AdoptionConfig{
 		Cache:       c,
 		Fetcher:     &chaos2RewritingFetcher{upstream: upstream, inner: fc, gate: gate},
-		Verifier:    chaos2PassVerifier{},
+		Verifier:    verifier,
 		HostLimiter: limiter,
 		Logger:      silentLogger(),
 	})
