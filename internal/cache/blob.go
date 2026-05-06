@@ -17,6 +17,16 @@ import (
 // byte-count differs from the upstream's declared Content-Length.
 var ErrSizeMismatch = errors.New("cache: blob size mismatch")
 
+// ErrHashMismatch is returned by BlobWriter.FinalizeExpectingHash when
+// the temp's computed sha256 disagrees with the caller's expected
+// value. The temp is removed before this returns; pool/ is not
+// touched. Callers must use this in preference to Finalize +
+// post-hoc DiscardFinalizedBlob whenever they have an authoritative
+// expected hash to compare against — calling DiscardFinalizedBlob on
+// a hash that already had a legitimate pool blob (preserved by
+// Finalize's dedup branch) would remove the unrelated blob.
+var ErrHashMismatch = errors.New("cache: blob hash mismatch")
+
 // ErrInvalidHash is returned when a caller hands the cache something that
 // is not a valid sha256 hex digest.
 var ErrInvalidHash = errors.New("cache: invalid blob hash")
@@ -190,6 +200,81 @@ func (w *BlobWriter) Finalize(expectedSize int64) (string, error) {
 		// SPEC §10: blob write event still emitted on dedup path so log
 		// consumers see one line per successful Finalize regardless of
 		// whether bytes actually landed in pool/.
+		w.cache.logger.Debug("blob written", "hash", hashHex, "size_bytes", w.written, "deduped", true)
+		return hashHex, nil
+	}
+	if err := os.Rename(w.tmpPath, dstPath); err != nil {
+		_ = os.Remove(w.tmpPath)
+		return "", fmt.Errorf("cache: rename into pool: %w", err)
+	}
+	w.cache.logger.Debug("blob written", "hash", hashHex, "size_bytes", w.written, "deduped", false)
+	return hashHex, nil
+}
+
+// FinalizeExpectingHash is the safe finalize for callers that know
+// what hash the temp must have to be admissible. It runs the same
+// fsync/close sequence as Finalize, but if the computed hash differs
+// from expected the temp is removed and ErrHashMismatch is returned —
+// pool/ is never touched, regardless of whether a blob already exists
+// at the destination path.
+//
+// Use this in preference to Finalize + post-hoc DiscardFinalizedBlob
+// for any hash-validated path (SPEC2 §6.2 .deb miss validation, §6.2
+// metadata recovery). Finalize's dedup branch preserves an existing
+// pool/<hash> when the rename target already has the same content,
+// so a post-hoc DiscardFinalizedBlob on a mismatched fetch could
+// remove an unrelated valid blob whose content happens to share the
+// fetched hash (real-world: an upstream that serves the literal
+// bytes of a different cached object, e.g. via misrouted Remap
+// rules). FinalizeExpectingHash sidesteps that by gating on the
+// hash before any rename or dedup happens.
+//
+// expected must be a 64-char lowercase sha256 hex; an empty string is
+// rejected with ErrInvalidHash. expectedSize is treated identically to
+// Finalize: 0 disables the check, otherwise mismatch returns
+// ErrSizeMismatch and the temp is removed.
+func (w *BlobWriter) FinalizeExpectingHash(expected string, expectedSize int64) (string, error) {
+	if w.finished {
+		return "", errors.New("cache: BlobWriter already closed")
+	}
+	if !validBlobHash(expected) {
+		// Don't move the temp; the caller misused us.
+		return "", fmt.Errorf("%w: %q", ErrInvalidHash, expected)
+	}
+	w.finished = true
+
+	if expectedSize > 0 && w.written != expectedSize {
+		_ = w.file.Close()
+		_ = os.Remove(w.tmpPath)
+		return "", fmt.Errorf("%w: wrote %d bytes, expected %d",
+			ErrSizeMismatch, w.written, expectedSize)
+	}
+	if err := w.file.Sync(); err != nil {
+		_ = w.file.Close()
+		_ = os.Remove(w.tmpPath)
+		return "", fmt.Errorf("cache: fsync tmp blob: %w", err)
+	}
+	if err := w.file.Close(); err != nil {
+		_ = os.Remove(w.tmpPath)
+		return "", fmt.Errorf("cache: close tmp blob: %w", err)
+	}
+
+	hashHex := hex.EncodeToString(w.hasher.Sum(nil))
+	if hashHex != expected {
+		// Remove the temp and surface the mismatch. Crucially, no
+		// rename happened, so any pre-existing pool/<expected> or
+		// pool/<hashHex> file is left untouched.
+		_ = os.Remove(w.tmpPath)
+		return hashHex, fmt.Errorf("%w: got %s, want %s", ErrHashMismatch, hashHex, expected)
+	}
+
+	dstPath := w.cache.BlobPath(hashHex)
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o750); err != nil {
+		_ = os.Remove(w.tmpPath)
+		return "", fmt.Errorf("cache: mkdir bucket: %w", err)
+	}
+	if _, err := os.Stat(dstPath); err == nil {
+		_ = os.Remove(w.tmpPath)
 		w.cache.logger.Debug("blob written", "hash", hashHex, "size_bytes", w.written, "deduped", true)
 		return hashHex, nil
 	}

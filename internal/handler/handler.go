@@ -717,7 +717,19 @@ func (h *Handler) serveSnapshotMemberMiss(
 ) (served bool, status int, bytesWritten int64) {
 	cw := &countingWriter{ResponseWriter: w}
 
-	key := "snapshot:" + req.CanonicalScheme + "|" + req.CanonicalHost + "|" + req.Path
+	// AIDEV-NOTE: the key embeds mem.DeclaredSHA256 so two requests
+	// arriving for the same path under different snapshots — e.g. an
+	// adoption flip occurred between the two GetSnapshotMember reads
+	// and the new snapshot declares a different hash for the same
+	// path — cannot coalesce. Without this, the leader's fetch would
+	// validate against one declared_sha256 while the waiter expected
+	// the other; the waiter would receive bytes that pass the
+	// leader's hash check but not its own, with X-Cache-Snapshot
+	// reflecting the waiter's snapshot id (read separately by
+	// trySnapshotHit). Including snapshotID would also work; the
+	// declared hash is more conservative — two snapshots that *agree*
+	// on a path's hash safely coalesce.
+	key := "snapshot:" + req.CanonicalScheme + "|" + req.CanonicalHost + "|" + req.Path + "|" + mem.DeclaredSHA256
 	res, shared, waiters := h.sf.Do(key, func() sfResult {
 		return h.runSnapshotMemberFetch(h.lifecycleCtx, req, mem, snapshotID)
 	})
@@ -730,7 +742,7 @@ func (h *Handler) serveSnapshotMemberMiss(
 	}
 
 	if res.err != nil {
-		h.respondError(cw, r, req, res, start)
+		h.respondRecoveryError(cw, r, req, res, start)
 		return true, cw.statusCode(), cw.bytes
 	}
 
@@ -813,11 +825,13 @@ func (h *Handler) runSnapshotMemberFetch(ctx context.Context, req *proxy.Request
 		return sfResult{err: ferr, status: status}
 	}
 
-	hash, err := bw.Finalize(fres.ContentLength)
-	if err != nil {
-		return sfResult{err: fmt.Errorf("handler: finalize blob: %w", err), status: fres.Status}
-	}
-	if hash != mem.DeclaredSHA256 {
+	// FinalizeExpectingHash gates on declared_sha256 *before* the
+	// rename into pool/. A mismatch removes the temp without touching
+	// pool/, so an upstream serving bytes whose hash collides with an
+	// unrelated cached blob (real-world: misrouted Remap, mirror
+	// confusion) cannot cause the unrelated blob to be deleted.
+	hash, err := bw.FinalizeExpectingHash(mem.DeclaredSHA256, fres.ContentLength)
+	if errors.Is(err, cache.ErrHashMismatch) {
 		// SPEC2 §10.2 names adoption_member_mismatch as the keyword for
 		// adoption-time mismatches; for the post-adoption recovery
 		// surface we use a sibling keyword so operators can distinguish
@@ -829,10 +843,10 @@ func (h *Handler) runSnapshotMemberFetch(ctx context.Context, req *proxy.Request
 			"observed_sha256", hash,
 			"snapshot_id", snapshotID,
 		)
-		if rerr := h.cache.DiscardFinalizedBlob(hash); rerr != nil {
-			h.logger.Warn("discard mismatched snapshot blob failed", "err", rerr, "hash", hash)
-		}
 		return sfResult{err: ErrSnapshotMemberMismatch, status: fres.Status}
+	}
+	if err != nil {
+		return sfResult{err: fmt.Errorf("handler: finalize blob: %w", err), status: fres.Status}
 	}
 
 	dbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -841,6 +855,52 @@ func (h *Handler) runSnapshotMemberFetch(ctx context.Context, req *proxy.Request
 		return sfResult{err: fmt.Errorf("handler: put blob row: %w", err), status: fres.Status}
 	}
 	return sfResult{blobHash: hash, size: fres.ContentLength, status: fres.Status}
+}
+
+// respondRecoveryError handles fetch errors from a SPEC2 §6.2 metadata
+// recovery (serveSnapshotMemberMiss). Unlike respondError, every error
+// flow lands at 502 + Retry-After: 30 — never as 4xx-passthrough,
+// never with a stale URL-path fallback. The §6.1 invariant
+// "snapshot is the contract" forbids satisfying an adopted-suite
+// metadata request with anything other than bytes validated against
+// snapshot_member.declared_sha256, so:
+//
+//   - upstream 4xx during recovery would otherwise pass through as
+//     404/410 etc., letting the client see a stale "not found" for a
+//     path the snapshot still vouches for. Surface as 502.
+//   - upstream-unreachable would otherwise route through
+//     respondUpstreamUnreachable, which can serve HIT-STALE from
+//     url_path. The url_path row may not even exist for adopted-suite
+//     metadata (snapshot_member is the trust anchor); even if it did
+//     exist, serving it would substitute Phase 1 trust-upstream bytes
+//     for Phase 2 verified bytes. Surface as 502.
+//
+// The outcome string distinguishes the failure category for ops
+// dashboards while the wire response is uniform.
+func (h *Handler) respondRecoveryError(w http.ResponseWriter, r *http.Request, req *proxy.Request, res sfResult, start time.Time) {
+	if res.status > 0 {
+		w.Header().Set(hdrXUpstreamStat, strconv.Itoa(res.status))
+	}
+	err := res.err
+	outcome := "snapshot_recovery_failed"
+	switch {
+	case errors.Is(err, ErrSnapshotMemberMismatch):
+		outcome = "snapshot_member_refetch_mismatch"
+	case errors.Is(err, fetch.ErrUpstreamStatus):
+		outcome = "snapshot_recovery_upstream_status"
+	case errors.Is(err, fetch.ErrUpstreamUnavailable),
+		errors.Is(err, fetch.ErrUpstreamServerError),
+		errors.Is(err, context.DeadlineExceeded):
+		outcome = "snapshot_recovery_upstream_unreachable"
+	case errors.Is(err, fetch.ErrCacheWriteFailed):
+		outcome = "snapshot_recovery_cache_write_failed"
+	case errors.Is(err, fetch.ErrHostNotAllowed),
+		errors.Is(err, fetch.ErrTargetDenied):
+		outcome = "snapshot_recovery_target_denied"
+	}
+	w.Header().Set("Retry-After", "30")
+	http.Error(w, "snapshot member recovery failed", http.StatusBadGateway)
+	h.logRequest(r, req.CanonicalHost, req.Path, outcome, http.StatusBadGateway, 0, true, res.status, start)
 }
 
 // runFetch is the body of the singleflight call. Acquires the per-host
@@ -893,6 +953,19 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 	// non-adopted suites is the Phase 1 trust-upstream path with no
 	// snapshot to validate against.
 	if !req.IsMetadata {
+		// AIDEV-TODO: this Finalize-then-validate-then-DiscardFinalizedBlob
+		// pattern has the same blob-collision risk runSnapshotMemberFetch
+		// fixed via FinalizeExpectingHash: a fetched .deb whose hash
+		// happens to match an unrelated cached blob (mirror confusion,
+		// misrouted Remap rule, content-identical .deb under a different
+		// path) would have its file preserved by Finalize's dedup branch
+		// and then removed by DiscardFinalizedBlob, evicting the
+		// unrelated valid blob. The single-declared-row case can be
+		// migrated to FinalizeExpectingHash; the conflict case
+		// (≥ 2 distinct declared hashes) needs a more general
+		// "FinalizeIfHashIn" because there is no single expected hash
+		// to gate on. Tracking as a follow-up to the codex review of
+		// commit a1162c5.
 		if verr := h.validateDebAgainstPackageHash(ctx, req, hash); verr != nil {
 			if rerr := h.cache.DiscardFinalizedBlob(hash); rerr != nil {
 				h.logger.Warn("discard mismatched blob failed",

@@ -567,6 +567,159 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_RefetchMismatchFailsClosed(t *testing
 	}
 }
 
+// TestServeHTTP_AdoptedSuiteMissingBlob_RefetchUpstream404FailsClosed
+// covers codex finding 1: respondError would have routed an upstream
+// 4xx as a passthrough status, which for an adopted snapshot member
+// would let upstream "absence" override the snapshot's vouched
+// "presence". The recovery responder maps every fetch error to
+// 502 + Retry-After: 30; the upstream's 4xx is captured in
+// X-Upstream-Status for diagnostics but does not become the wire
+// status.
+func TestServeHTTP_AdoptedSuiteMissingBlob_RefetchUpstream404FailsClosed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, nil)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	scheme, host, port := splitURL(t, srv.URL)
+	canonHost := hostKey(host, port)
+	suite := "/dists/noble"
+	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
+		[]cache.SnapshotMember{
+			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
+		}, nil)
+	if err := os.Remove(h.cache.BlobPath(releaseBlob)); err != nil {
+		t.Fatalf("remove blob: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/dists/noble/InRelease"))
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status=%d, want 502 (upstream 404 must not pass through during recovery)", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "30" {
+		t.Errorf("Retry-After=%q, want 30", got)
+	}
+	if got := rec.Header().Get("X-Upstream-Status"); got != "404" {
+		t.Errorf("X-Upstream-Status=%q, want 404 (diagnostic preserved)", got)
+	}
+}
+
+// TestServeHTTP_AdoptedSuiteMissingBlob_StaleNotServed covers codex
+// finding 1, second leg: respondError's upstream-unreachable path
+// can serve HIT-STALE from url_path. For adopted-suite metadata
+// recovery, the snapshot is the contract — a Phase 1 url_path row
+// (even one that exists) must not satisfy the request when the snapshot
+// pointer is set. Recovery responder always 502s on upstream-down,
+// regardless of url_path state.
+func TestServeHTTP_AdoptedSuiteMissingBlob_StaleNotServed(t *testing.T) {
+	// Upstream is just closed; any fetch fails with connection-refused.
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	scheme, host, port := splitURL(t, srv.URL)
+	canonHost := hostKey(host, port)
+	suite := "/dists/noble"
+	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
+		[]cache.SnapshotMember{
+			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
+		}, nil)
+
+	// Seed a stale url_path row for the same path. respondError's
+	// upstream-unreachable path would otherwise serve this; the
+	// recovery responder must not.
+	stale := writeBlob(t, h, []byte("stale Phase 1 InRelease"))
+	now := nowUnixForTest()
+	if err := h.cache.PutURLPath(context.Background(), cache.URLPath{
+		CanonicalScheme: scheme, CanonicalHost: canonHost,
+		Path:        "/dists/noble/InRelease",
+		BlobHash:    &stale,
+		UpstreamURL: srv.URL + "/dists/noble/InRelease",
+		IsMetadata:  true, LastFetchedAt: &now, RequestCount: 1,
+	}); err != nil {
+		t.Fatalf("PutURLPath stale: %v", err)
+	}
+
+	if err := os.Remove(h.cache.BlobPath(releaseBlob)); err != nil {
+		t.Fatalf("remove snapshot blob: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/dists/noble/InRelease"))
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status=%d, want 502 (must not stale-serve url_path during recovery)", rec.Code)
+	}
+	if rec.Body.String() == "stale Phase 1 InRelease" {
+		t.Errorf("body returned stale Phase 1 bytes: %q", rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Cache"); got == "HIT-STALE" {
+		t.Errorf("X-Cache=%q (HIT-STALE), recovery must not stale-serve", got)
+	}
+}
+
+// TestServeHTTP_AdoptedSuiteMissingBlob_MismatchPreservesUnrelatedBlob
+// covers codex finding 3: when recovery's upstream returns bytes
+// whose sha256 happens to equal an existing pool blob's hash (real
+// world: misrouted Remap, mirror confusion), the post-Finalize
+// DiscardFinalizedBlob would have removed the unrelated valid blob.
+// FinalizeExpectingHash now gates on the declared hash before
+// rename-or-dedup, so the unrelated blob's pool file is preserved.
+func TestServeHTTP_AdoptedSuiteMissingBlob_MismatchPreservesUnrelatedBlob(t *testing.T) {
+	collidingContent := []byte("collision-bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(collidingContent)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	scheme, host, port := splitURL(t, srv.URL)
+	canonHost := hostKey(host, port)
+	suite := "/dists/noble"
+
+	// (a) Seed an unrelated, legitimate pool blob whose hash equals the
+	// upstream's collision response. In the real-world bug scenario
+	// this blob backs some other path's url_path or snapshot_member;
+	// we just need it on disk.
+	collidingBlob := writeBlob(t, h, collidingContent)
+	collidingPath := h.cache.BlobPath(collidingBlob)
+	if _, err := os.Stat(collidingPath); err != nil {
+		t.Fatalf("expected colliding pool blob to exist: %v", err)
+	}
+
+	// (b) Set up the adopted snapshot whose declared_sha256 differs
+	// from collidingBlob. Recovery will try to validate the upstream's
+	// collision bytes against this declared hash — they don't match,
+	// so the recovery 502s WITHOUT touching the colliding blob.
+	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
+		[]cache.SnapshotMember{
+			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
+		}, nil)
+	// Remove the snapshot's pool blob to force recovery.
+	if err := os.Remove(h.cache.BlobPath(releaseBlob)); err != nil {
+		t.Fatalf("remove snapshot blob: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/dists/noble/InRelease"))
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status=%d, want 502 (recovery hash mismatch)", rec.Code)
+	}
+	// The unrelated blob whose hash equals collidingContent's sha256
+	// must still be present on disk.
+	if _, err := os.Stat(collidingPath); err != nil {
+		t.Errorf("collision blob removed by mismatched recovery: %v", err)
+	}
+}
+
+// nowUnixForTest is a tiny helper to take a *int64 from a literal, used
+// for seeding url_path rows that need LastFetchedAt set.
+func nowUnixForTest() int64 { return 1735689600 } // 2025-01-01
+
 // itoa is a small helper for X-Cache-Snapshot assertions, mirroring
 // the integrity_test.go variant.
 func itoa(n int64) string {
