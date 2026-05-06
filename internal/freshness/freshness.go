@@ -31,16 +31,30 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 )
 
-// inReleaseFilename is the file that anchors a suite. Every freshness
-// check is a conditional GET on <suite_path>/InRelease.
-const inReleaseFilename = "/InRelease"
+// Suite-anchor filenames. Inline mode checks one file (InRelease,
+// clearsigned). Detached mode checks two (Release for change
+// detection + Release.gpg for the signature). SPEC2 §7.6.3.
+const (
+	inReleaseFilename  = "/InRelease"
+	releaseFilename    = "/Release"
+	releaseGPGFilename = "/Release.gpg"
+)
 
 // defaultMaxInReleaseBytes caps the body we read on a 200 response to
 // the conditional GET. Real-world InRelease files are tens of KB; 4 MiB
 // is comfortable headroom and still small enough that a hostile (but
 // allowlisted) upstream cannot exhaust memory through the freshness
-// path. Operators can override via Config.MaxInReleaseBytes.
+// path. Operators can override via Config.MaxInReleaseBytes. The same
+// cap applies to detached Release fetches (Release files are smaller
+// than InRelease — no inline signature — so the bound is conservative).
 const defaultMaxInReleaseBytes int64 = 4 << 20
+
+// defaultMaxReleaseGPGBytes caps the Release.gpg body read after a
+// detached Release change is observed. Real Release.gpg files are
+// 1–2 KiB; 64 KiB matches the ceiling decodeMaybeArmoredSignature
+// uses post-armor and bounds the cost of a hostile upstream that
+// pads the file.
+const defaultMaxReleaseGPGBytes int64 = 64 << 10
 
 // Cache is the subset of *cache.Cache the freshness checker uses.
 // Defined as an interface so tests can supply a fake without standing
@@ -189,10 +203,26 @@ func New(cfg Config) (*Checker, error) {
 }
 
 // adoptionRequest is what checkLocked emits when a Phase 2 atomic
-// flip should be triggered for the observed-changed InRelease.
+// flip should be triggered. The freshness checker has already fetched
+// the form-appropriate body (or pair of bodies) by the time it
+// constructs an adoptionRequest; the goroutine in Check just routes
+// to Run vs RunDetached based on form.
 type adoptionRequest struct {
-	suite   SuiteRef
-	bytes   []byte // verified-input candidate (clearsigned InRelease)
+	suite SuiteRef
+	form  adoptionForm
+
+	// Inline form (form == adoptionFormInline): bytes is the
+	// freshness-fetched clearsigned InRelease body.
+	bytes []byte
+
+	// Detached form (form == adoptionFormDetached):
+	releaseBytes []byte
+	sigBytes     []byte
+
+	// Validators captured from whichever metadata file the freshness
+	// checker conditional-GETs next time (Release in detached mode,
+	// InRelease in inline mode). The Adopter persists these to
+	// suite_snapshot's inrelease_etag / inrelease_lastmod columns.
 	etag    string
 	lastmod string
 }
@@ -233,21 +263,27 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 	go func() {
 		defer mu.Unlock()
 		defer c.adoptionWg.Done()
-		if err := c.adopter.Run(c.lifetimeCtx, req.suite, req.bytes, req.etag, req.lastmod); err != nil {
-			// Several Adopter.Run paths emit categorized log lines
-			// before returning (adoption_gpg_failed,
-			// adoption_parse_failed, adoption_member_mismatch,
-			// pool_corruption_during_adoption). Others — content-
-			// length mismatch, fetch transport errors, DB failures
-			// the categorized line didn't already cover — propagate
-			// only as the wrapped sentinel. Without a backstop log,
-			// those drop on the floor and the operator sees the
-			// "InRelease changed at upstream" line followed by
-			// silence. Always surface a single line so any failure
-			// is grep-able.
+		var err error
+		switch req.form {
+		case adoptionFormInline:
+			err = c.adopter.Run(c.lifetimeCtx, req.suite, req.bytes, req.etag, req.lastmod)
+		case adoptionFormDetached:
+			err = c.adopter.RunDetached(c.lifetimeCtx, req.suite, req.releaseBytes, req.sigBytes, req.etag, req.lastmod)
+		}
+		if err != nil {
+			// Several Adopter paths emit categorized log lines before
+			// returning (adoption_gpg_failed, adoption_parse_failed,
+			// adoption_member_mismatch, pool_corruption_during_adoption).
+			// Others — content-length mismatch, fetch transport errors,
+			// DB failures the categorized line didn't already cover —
+			// propagate only as the wrapped sentinel. Without a backstop
+			// log, those drop on the floor and the operator sees the
+			// "metadata changed at upstream" line followed by silence.
+			// Always surface a single line so any failure is grep-able.
 			c.logger.Warn("adoption_run_failed",
 				"canonical_host", req.suite.CanonicalHost,
 				"suite_path", req.suite.SuitePath,
+				"form", formName(req.form),
 				"err", err,
 			)
 		}
@@ -265,11 +301,22 @@ func (c *Checker) WaitForAdoptions() { c.adoptionWg.Wait() }
 // AND the caller has an Adopter wired in (Phase 2 path); the caller
 // uses this signal to spawn the adoption goroutine.
 //
+// Form dispatch (SPEC2 §7.6.3):
+//   - If the suite has a current snapshot, the form is read from the
+//     snapshot row: snapshot.release_hash != nil → detached, otherwise
+//     inline. The check then issues a conditional GET against
+//     InRelease (inline) or Release (detached).
+//   - For first-ever checks (no current snapshot), inline is tried
+//     first. If the inline conditional GET 404s AND a Release url_path
+//     row exists, we fall back to the detached path. This is what
+//     bootstraps detached-mode adoption for upstreams that ship only
+//     Release + Release.gpg.
+//
 // Outcomes (all paths must update suite_freshness so cooldown applies
 // to the next attempt):
 //
 //   - Cooldown gate fails: no DB write, return nil.
-//   - InRelease url_path row absent: no DB write (we have nothing to
+//   - Metadata url_path row absent: no DB write (we have nothing to
 //     check against), return nil — first request for this suite will
 //     land in url_path through the normal miss path.
 //   - 304: last_check_at = last_success_at = now.
@@ -281,11 +328,12 @@ func (c *Checker) WaitForAdoptions() { c.adoptionWg.Wait() }
 //   - Error (network, 4xx, 5xx, ctx cancel): bump last_check_at only —
 //     don't hammer a broken upstream — and log.
 //
-// SPEC2 wiring: the body-hash comparison uses suite_snapshot.inrelease_hash
-// when the suite has an adopted snapshot (CurrentSnapshotID set). Without
-// this, every freshness check after a successful adoption would observe
-// "changed" against the stale url_path.blob_hash and thrash the
-// adoption candidate-uniqueness constraint forever.
+// SPEC2 wiring: the body-hash comparison uses
+// suite_snapshot.inrelease_hash (inline) or .release_hash (detached)
+// when the suite has an adopted snapshot. Without this, every
+// freshness check after a successful adoption would observe "changed"
+// against the stale url_path.blob_hash and thrash the adoption
+// candidate-uniqueness constraint forever.
 func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath string) *adoptionRequest {
 	now := c.now()
 	nowUnix := now.Unix()
@@ -315,6 +363,61 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 		}
 	}
 
+	suite := SuiteRef{
+		CanonicalScheme: scheme,
+		CanonicalHost:   host,
+		SuitePath:       suitePath,
+	}
+
+	// Form preference: if there's a current snapshot, the form is
+	// determined by which hash columns it has set. Otherwise default
+	// to inline; the inline path triggers a detached fallback on 404.
+	form := c.detectForm(ctx, cur)
+
+	if form == adoptionFormDetached {
+		return c.checkLockedDetached(ctx, cur, suite, now, nowUnix)
+	}
+	req, fellBack := c.checkLockedInline(ctx, cur, suite, now, nowUnix)
+	if !fellBack {
+		return req
+	}
+	return c.checkLockedDetached(ctx, cur, suite, now, nowUnix)
+}
+
+// detectForm reads the suite's current snapshot (if any) and returns
+// the form whose hash columns are populated. First-ever suites
+// (cur.CurrentSnapshotID == nil) and snapshots that fail to load
+// default to inline; the inline-path fallback handles the boot-strap
+// case for detached-only upstreams.
+func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) adoptionForm {
+	if cur.CurrentSnapshotID == nil {
+		return adoptionFormInline
+	}
+	snap, err := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
+	if err != nil || snap == nil {
+		return adoptionFormInline
+	}
+	if snap.ReleaseHash != nil {
+		return adoptionFormDetached
+	}
+	return adoptionFormInline
+}
+
+// checkLockedInline runs the conditional GET against InRelease and
+// processes the result. Returns:
+//   - (req, false) on success (req may be nil for unchanged/304).
+//   - (nil, true) when the inline path got 404 AND the suite has no
+//     current snapshot AND a Release url_path row exists — the
+//     dispatcher then retries via checkLockedDetached. We return
+//     without persisting in the fallback case so the detached
+//     attempt's persist is the only one that runs.
+//
+// The body of this function is the SPEC §7.2 inline algorithm; it has
+// been factored out of checkLocked to give detached mode (SPEC2 §7.6.3)
+// a parallel implementation. Mutates *cur in the non-fallback paths.
+func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, bool) {
+	scheme, host, suitePath := suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath
+
 	// Locate the InRelease url_path row to get the upstream URL plus
 	// (Phase 1 fallback) the cached blob hash for byte-equality
 	// comparison on 200.
@@ -322,23 +425,26 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 	urlRow, err := c.cache.LookupURL(ctx, scheme, host, inReleasePath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
-		// Suite has freshness state but no cached InRelease. Either we
-		// hit T1 from a non-InRelease metadata file before InRelease
-		// was ever fetched, or the row was administratively cleared.
-		// Either way, nothing to validate against — skip without
-		// writing.
+		// Suite has freshness state but no cached InRelease. The
+		// detached fallback path triggers on 404 from the upstream's
+		// /InRelease, which requires us to actually issue the GET. If
+		// we don't even have a url_path row to attempt the GET, try
+		// the symmetric detached lookup directly.
+		if cur.CurrentSnapshotID == nil && c.hasReleaseURLRow(ctx, scheme, host, suitePath) {
+			return nil, true
+		}
 		c.logger.Debug("freshness: no cached InRelease url_path, skipping",
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return nil
+		return nil, false
 	case err != nil:
 		c.logger.Warn("freshness: lookup InRelease url_path failed",
 			"err", err,
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return nil
+		return nil, false
 	}
 
 	// Determine the cached InRelease hash for the body comparison.
@@ -367,7 +473,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 				"canonical_host", host,
 				"suite_path", suitePath,
 			)
-			return nil
+			return nil, false
 		}
 		cachedHash = *urlRow.BlobHash
 	}
@@ -398,12 +504,24 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return nil
+		return nil, false
 	}
 	defer release()
 
 	res, err := c.fetcher.Conditional(ctx, target, etag, lastmod, c.maxBody)
 	if err != nil {
+		// 404 with no current snapshot AND a Release url_path row →
+		// fall back to detached without persisting. The detached
+		// attempt becomes the authoritative result for this Check.
+		if cur.CurrentSnapshotID == nil && isStatusNotFound(err) &&
+			c.hasReleaseURLRow(ctx, scheme, host, suitePath) {
+			c.logger.Debug("freshness: InRelease 404 on first-ever check, falling back to detached",
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return nil, true
+		}
+
 		// SPEC §7.2: bump last_check_at on failure to space out the
 		// next attempt. Don't bump last_success_at — it carries the
 		// "we know upstream is fine" signal that periodic_refresh
@@ -422,7 +540,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 			"suite_path", suitePath,
 			"result", "failed",
 		)
-		return nil
+		return nil, false
 	}
 
 	cur.LastCheckAt = &nowUnix
@@ -483,11 +601,8 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 			// InRelease's worth of bytes through the goroutine
 			// handoff is acceptable.
 			req = &adoptionRequest{
-				suite: SuiteRef{
-					CanonicalScheme: scheme,
-					CanonicalHost:   host,
-					SuitePath:       suitePath,
-				},
+				suite:   suite,
+				form:    adoptionFormInline,
 				bytes:   res.Body,
 				etag:    res.ETag,
 				lastmod: res.LastModified,
@@ -508,6 +623,234 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 				"err", perr,
 			)
 		}
+		return nil, false
+	}
+
+	if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
+		c.logger.Warn("freshness: persist success failed",
+			"err", perr,
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+	}
+
+	c.logger.Info("freshness_check",
+		"canonical_host", host,
+		"suite_path", suitePath,
+		"form", "inline",
+		"result", result,
+		"upstream_status", res.Status,
+	)
+	return req, false
+}
+
+// checkLockedDetached runs the SPEC2 §7.6.3 detached-form freshness
+// check: a conditional GET on Release for change detection, plus a
+// fresh GET on Release.gpg when Release has changed. Mutates *cur.
+//
+// Logically symmetric to checkLockedInline. The differences:
+//   - Two url_path rows are required (Release AND Release.gpg).
+//     Either missing → skip.
+//   - On observed change, fetch Release.gpg in a second call so the
+//     Adopter can verify the detached signature.
+//   - The adoptionRequest carries form=detached + both bodies.
+func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) *adoptionRequest {
+	scheme, host, suitePath := suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath
+
+	releasePath := suitePath + releaseFilename
+	releaseGPGPath := suitePath + releaseGPGFilename
+
+	releaseURL, err := c.cache.LookupURL(ctx, scheme, host, releasePath)
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		c.logger.Debug("freshness: no cached Release url_path, skipping detached",
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+		return nil
+	case err != nil:
+		c.logger.Warn("freshness: lookup Release url_path failed",
+			"err", err,
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+		return nil
+	}
+	releaseGPGURL, err := c.cache.LookupURL(ctx, scheme, host, releaseGPGPath)
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		c.logger.Debug("freshness: no cached Release.gpg url_path, skipping detached",
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+		return nil
+	case err != nil:
+		c.logger.Warn("freshness: lookup Release.gpg url_path failed",
+			"err", err,
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+		return nil
+	}
+
+	// Determine the cached Release hash for body comparison.
+	// snapshot.release_hash is authoritative once an adoption has
+	// landed; pre-adoption (or post-eviction) we fall back to
+	// url_path.blob_hash.
+	var cachedHash string
+	if cur.CurrentSnapshotID != nil {
+		snap, serr := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
+		switch {
+		case serr == nil && snap.ReleaseHash != nil:
+			cachedHash = *snap.ReleaseHash
+		case serr != nil:
+			c.logger.Warn("freshness: snapshot lookup failed; falling back to url_path",
+				"err", serr,
+				"snapshot_id", *cur.CurrentSnapshotID,
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+		}
+	}
+	if cachedHash == "" {
+		if releaseURL.BlobHash == nil || *releaseURL.BlobHash == "" {
+			c.logger.Debug("freshness: no baseline Release blob hash, skipping",
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return nil
+		}
+		cachedHash = *releaseURL.BlobHash
+	}
+
+	target := &fetch.Target{
+		CanonicalHost: host,
+		URL:           releaseURL.UpstreamURL,
+	}
+	var etag, lastmod string
+	if cur.InReleaseETag != nil {
+		etag = *cur.InReleaseETag
+	}
+	if cur.InReleaseLastMod != nil {
+		lastmod = *cur.InReleaseLastMod
+	}
+
+	releaseSlot, err := c.hostSem.Acquire(ctx, host)
+	if err != nil {
+		c.logger.Debug("freshness: host limiter acquire aborted",
+			"err", err,
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+		return nil
+	}
+	defer releaseSlot()
+
+	res, err := c.fetcher.Conditional(ctx, target, etag, lastmod, c.maxBody)
+	if err != nil {
+		cur.LastCheckAt = &nowUnix
+		if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
+			c.logger.Warn("freshness: persist failure-bump failed",
+				"err", perr,
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+		}
+		c.logger.Info("freshness check failed",
+			"err", err,
+			"canonical_host", host,
+			"suite_path", suitePath,
+			"form", "detached",
+			"result", "failed",
+		)
+		return nil
+	}
+
+	cur.LastCheckAt = &nowUnix
+	cur.LastSuccessAt = &nowUnix
+
+	var (
+		result string
+		req    *adoptionRequest
+	)
+	switch res.Status {
+	case 304:
+		cur.InReleaseChangeSeenAt = nil
+		result = "not_modified"
+	case 200:
+		sum := sha256.Sum256(res.Body)
+		newHash := hex.EncodeToString(sum[:])
+		if newHash == cachedHash {
+			if res.ETag != "" {
+				v := res.ETag
+				cur.InReleaseETag = &v
+			}
+			if res.LastModified != "" {
+				v := res.LastModified
+				cur.InReleaseLastMod = &v
+			}
+			cur.InReleaseChangeSeenAt = nil
+			result = "unchanged"
+		} else {
+			cur.InReleaseChangeSeenAt = &nowUnix
+			c.logger.Info("Release changed at upstream",
+				"canonical_host", host,
+				"suite_path", suitePath,
+				"cached_hash", cachedHash,
+				"upstream_hash", newHash,
+			)
+			result = "changed"
+
+			// Fetch Release.gpg fresh — no validators, since the
+			// signature is bound to the (now-changed) Release content.
+			gpgTarget := &fetch.Target{
+				CanonicalHost: host,
+				URL:           releaseGPGURL.UpstreamURL,
+			}
+			gpgRes, gerr := c.fetcher.Conditional(ctx, gpgTarget, "", "", defaultMaxReleaseGPGBytes)
+			if gerr != nil || gpgRes.Status != 200 {
+				// Release.gpg fetch failed. Don't return an
+				// adoptionRequest; record the change, persist, and
+				// rely on the next periodic tick to retry. We
+				// already bumped LastSuccessAt because the Release
+				// fetch succeeded — keep that.
+				if gerr != nil {
+					c.logger.Warn("freshness: Release.gpg fetch failed; deferring adoption",
+						"err", gerr,
+						"canonical_host", host,
+						"suite_path", suitePath,
+					)
+				} else {
+					c.logger.Warn("freshness: Release.gpg fetch returned non-200; deferring adoption",
+						"status", gpgRes.Status,
+						"canonical_host", host,
+						"suite_path", suitePath,
+					)
+				}
+			} else {
+				req = &adoptionRequest{
+					suite:        suite,
+					form:         adoptionFormDetached,
+					releaseBytes: res.Body,
+					sigBytes:     gpgRes.Body,
+					etag:         res.ETag,
+					lastmod:      res.LastModified,
+				}
+			}
+		}
+	default:
+		c.logger.Error("freshness: unexpected success status",
+			"status", res.Status,
+			"canonical_host", host,
+			"suite_path", suitePath,
+			"form", "detached",
+		)
+		cur.LastSuccessAt = nil
+		if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
+			c.logger.Warn("freshness: persist anomaly failed",
+				"err", perr,
+			)
+		}
 		return nil
 	}
 
@@ -522,10 +865,37 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 	c.logger.Info("freshness_check",
 		"canonical_host", host,
 		"suite_path", suitePath,
+		"form", "detached",
 		"result", result,
 		"upstream_status", res.Status,
 	)
 	return req
+}
+
+// hasReleaseURLRow reports whether url_path has rows for both Release
+// and Release.gpg under (scheme, host, suitePath). Used by the inline
+// path's 404 fallback to decide whether a detached retry is even
+// possible — without both rows, the detached fetch would skip with a
+// "no cached Release url_path" debug log anyway.
+func (c *Checker) hasReleaseURLRow(ctx context.Context, scheme, host, suitePath string) bool {
+	if _, err := c.cache.LookupURL(ctx, scheme, host, suitePath+releaseFilename); err != nil {
+		return false
+	}
+	if _, err := c.cache.LookupURL(ctx, scheme, host, suitePath+releaseGPGFilename); err != nil {
+		return false
+	}
+	return true
+}
+
+// isStatusNotFound reports whether err is a fetch.StatusError carrying
+// HTTP 404. Used by checkLockedInline to decide whether to fall back
+// to detached mode on a missing /InRelease.
+func isStatusNotFound(err error) bool {
+	var se *fetch.StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	return se.Code == 404
 }
 
 // suiteKey is the in-memory lock map key. The pipe separator matches the

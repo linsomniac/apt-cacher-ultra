@@ -983,3 +983,428 @@ func TestCheck_AdopterInvokedOnChange(t *testing.T) {
 	}
 }
 
+// --- SPEC2 §7.6.3 detached-mode freshness checks ---
+
+// TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange covers the
+// "form is detected from current snapshot" path: an existing suite
+// whose snapshot has release_hash set conditional-GETs Release (NOT
+// InRelease), and on observed change, fetches Release.gpg + spawns
+// RunDetached.
+func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
+	fc := newFakeCache()
+
+	memberBody := []byte("detached member content")
+	memberHash := hashOf(memberBody)
+	releaseText := []byte(fmt.Sprintf(
+		"Origin: Test\nSuite: noble\nSHA256:\n %s %d main/Sources\n",
+		memberHash, len(memberBody),
+	))
+	sigBody := []byte("placeholder Release.gpg bytes")
+
+	staleHash := strings.Repeat("0", 64)
+
+	var releaseHits, gpgHits atomic.Int32
+	var gotInReleaseFetch atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/noble/Release":
+			releaseHits.Add(1)
+			w.WriteHeader(200)
+			_, _ = w.Write(releaseText)
+		case "/dists/noble/Release.gpg":
+			gpgHits.Add(1)
+			w.WriteHeader(200)
+			_, _ = w.Write(sigBody)
+		case "/dists/noble/InRelease":
+			// Detached path must NOT hit InRelease for a known-detached
+			// suite — the form is dispatched up front.
+			gotInReleaseFetch.Store(true)
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Errorf("unexpected fetch: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	// Seed url_path rows for Release and Release.gpg (both required
+	// before the detached check runs).
+	staleRH := staleHash
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/dists/noble/Release", BlobHash: &staleRH,
+		UpstreamURL: srv.URL + "/dists/noble/Release", IsMetadata: true,
+	})
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/dists/noble/Release.gpg",
+		UpstreamURL: srv.URL + "/dists/noble/Release.gpg",
+		IsMetadata: true,
+	})
+
+	// Snapshot row that flags the suite as detached: release_hash
+	// non-nil, inrelease_hash nil.
+	rh := staleHash
+	rgh := hashOf([]byte("any old gpg hash"))
+	fc.putSnapshot(cache.SuiteSnapshot{
+		SnapshotID:      42,
+		CanonicalScheme: "http",
+		CanonicalHost:   "127.0.0.1",
+		SuitePath:       "/dists/noble",
+		ReleaseHash:     &rh,
+		ReleaseGPGHash:  &rgh,
+	})
+	id := int64(42)
+	fc.putSuite(cache.SuiteFreshness{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		SuitePath:         "/dists/noble",
+		CurrentSnapshotID: &id,
+	})
+
+	// Adopter side: a real cache.Cache so RunDetached can write the
+	// snapshot row, plus a fake AdoptionFetcher serving the declared
+	// member.
+	dir := t.TempDir()
+	realCache, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = realCache.Close() })
+
+	memberURL := "http://127.0.0.1/dists/noble/main/Sources"
+	memberFetcher := newFakeFetcher()
+	memberFetcher.put(memberURL, memberBody)
+
+	adopter, err := NewAdopter(AdoptionConfig{
+		Cache:       realCache,
+		Fetcher:     memberFetcher,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Logger:  discardLogger(),
+		now:     func() time.Time { return time.Unix(11000, 0) },
+		Adopter: adopter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
+	c.WaitForAdoptions()
+
+	if gotInReleaseFetch.Load() {
+		t.Error("known-detached suite unexpectedly fetched InRelease")
+	}
+	if releaseHits.Load() != 1 {
+		t.Errorf("Release hits = %d, want 1", releaseHits.Load())
+	}
+	if gpgHits.Load() != 1 {
+		t.Errorf("Release.gpg hits = %d, want 1", gpgHits.Load())
+	}
+
+	snap, err := realCache.GetSuiteSnapshot(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("expected adopter to have created snapshot 1: %v", err)
+	}
+	if snap.AdoptedAt == nil {
+		t.Errorf("snapshot adopted_at not stamped — adoption goroutine didn't reach commit")
+	}
+	if snap.ReleaseHash == nil || *snap.ReleaseHash != hashOf(releaseText) {
+		t.Errorf("snapshot.release_hash mismatch: got %v, want %s",
+			snap.ReleaseHash, hashOf(releaseText))
+	}
+	if snap.ReleaseGPGHash == nil || *snap.ReleaseGPGHash != hashOf(sigBody) {
+		t.Errorf("snapshot.release_gpg_hash mismatch: got %v, want %s",
+			snap.ReleaseGPGHash, hashOf(sigBody))
+	}
+	if snap.InReleaseHash != nil {
+		t.Errorf("snapshot.inrelease_hash should be nil in detached mode, got %s", *snap.InReleaseHash)
+	}
+}
+
+// TestCheck_DetachedFallback_OnInRelease404 covers the bootstrap
+// case: a fresh suite whose upstream returns 404 on InRelease must
+// fall back to detached mode and adopt via Release + Release.gpg.
+func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
+	fc := newFakeCache()
+
+	memberBody := []byte("fallback member content")
+	memberHash := hashOf(memberBody)
+	releaseText := []byte(fmt.Sprintf(
+		"Origin: Test\nSuite: noble\nSHA256:\n %s %d main/Sources\n",
+		memberHash, len(memberBody),
+	))
+	sigBody := []byte("placeholder Release.gpg bytes for fallback")
+
+	var inReleaseHits, releaseHits, gpgHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/noble/InRelease":
+			inReleaseHits.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		case "/dists/noble/Release":
+			releaseHits.Add(1)
+			w.WriteHeader(200)
+			_, _ = w.Write(releaseText)
+		case "/dists/noble/Release.gpg":
+			gpgHits.Add(1)
+			w.WriteHeader(200)
+			_, _ = w.Write(sigBody)
+		default:
+			t.Errorf("unexpected fetch: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	// Seed url_path rows for all three. The InRelease row carries a
+	// stale BlobHash so the conditional GET actually fires (without
+	// it the "no baseline blob hash" guard would skip before the GET
+	// happens, and the 404 → detached fallback trigger never runs).
+	// This models a suite whose upstream USED to serve InRelease and
+	// has since switched to detached-only.
+	staleHash := strings.Repeat("0", 64)
+	staleIR := staleHash
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/dists/noble/InRelease", BlobHash: &staleIR,
+		UpstreamURL: srv.URL + "/dists/noble/InRelease", IsMetadata: true,
+	})
+	staleRH := staleHash
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/dists/noble/Release", BlobHash: &staleRH,
+		UpstreamURL: srv.URL + "/dists/noble/Release", IsMetadata: true,
+	})
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/dists/noble/Release.gpg",
+		UpstreamURL: srv.URL + "/dists/noble/Release.gpg", IsMetadata: true,
+	})
+
+	dir := t.TempDir()
+	realCache, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = realCache.Close() })
+
+	memberURL := "http://127.0.0.1/dists/noble/main/Sources"
+	memberFetcher := newFakeFetcher()
+	memberFetcher.put(memberURL, memberBody)
+
+	adopter, err := NewAdopter(AdoptionConfig{
+		Cache:       realCache,
+		Fetcher:     memberFetcher,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Logger:  discardLogger(),
+		now:     func() time.Time { return time.Unix(12000, 0) },
+		Adopter: adopter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
+	c.WaitForAdoptions()
+
+	if inReleaseHits.Load() != 1 {
+		t.Errorf("InRelease hits = %d, want 1 (the 404 that triggers fallback)", inReleaseHits.Load())
+	}
+	if releaseHits.Load() != 1 {
+		t.Errorf("Release hits = %d, want 1", releaseHits.Load())
+	}
+	if gpgHits.Load() != 1 {
+		t.Errorf("Release.gpg hits = %d, want 1", gpgHits.Load())
+	}
+
+	snap, err := realCache.GetSuiteSnapshot(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("expected adopter to have created snapshot 1: %v", err)
+	}
+	if snap.ReleaseHash == nil || *snap.ReleaseHash != hashOf(releaseText) {
+		t.Errorf("snapshot.release_hash mismatch: got %v, want %s",
+			snap.ReleaseHash, hashOf(releaseText))
+	}
+	if snap.InReleaseHash != nil {
+		t.Errorf("fallback adoption set inrelease_hash; want detached form (nil)")
+	}
+}
+
+// TestCheck_DetachedFallback_OnMissingInReleaseURLRow covers the
+// other detached-fallback bootstrap path: the suite has Release +
+// Release.gpg url_path rows but no InRelease row at all (real-world:
+// upstream never served InRelease, so apt's first request 404'd and
+// the handler created no row). The inline path's LookupURL returns
+// ErrNotFound; the fallback fires without ever issuing a wasted
+// InRelease GET.
+func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
+	fc := newFakeCache()
+
+	memberBody := []byte("missing-row member content")
+	memberHash := hashOf(memberBody)
+	releaseText := []byte(fmt.Sprintf(
+		"Origin: Test\nSuite: noble\nSHA256:\n %s %d main/Sources\n",
+		memberHash, len(memberBody),
+	))
+	sigBody := []byte("placeholder Release.gpg")
+
+	var inReleaseHits, releaseHits, gpgHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/noble/InRelease":
+			inReleaseHits.Add(1)
+			t.Errorf("InRelease fetched despite missing url_path row — fallback should not issue a GET")
+		case "/dists/noble/Release":
+			releaseHits.Add(1)
+			w.WriteHeader(200)
+			_, _ = w.Write(releaseText)
+		case "/dists/noble/Release.gpg":
+			gpgHits.Add(1)
+			w.WriteHeader(200)
+			_, _ = w.Write(sigBody)
+		default:
+			t.Errorf("unexpected fetch: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	// Only Release + Release.gpg url_path rows (the InRelease row is
+	// deliberately absent, modelling an upstream that never served
+	// InRelease).
+	staleRH := strings.Repeat("0", 64)
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/dists/noble/Release", BlobHash: &staleRH,
+		UpstreamURL: srv.URL + "/dists/noble/Release", IsMetadata: true,
+	})
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/dists/noble/Release.gpg",
+		UpstreamURL: srv.URL + "/dists/noble/Release.gpg", IsMetadata: true,
+	})
+
+	dir := t.TempDir()
+	realCache, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = realCache.Close() })
+
+	memberURL := "http://127.0.0.1/dists/noble/main/Sources"
+	memberFetcher := newFakeFetcher()
+	memberFetcher.put(memberURL, memberBody)
+
+	adopter, err := NewAdopter(AdoptionConfig{
+		Cache:       realCache,
+		Fetcher:     memberFetcher,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Logger:  discardLogger(),
+		now:     func() time.Time { return time.Unix(14000, 0) },
+		Adopter: adopter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
+	c.WaitForAdoptions()
+
+	if inReleaseHits.Load() != 0 {
+		t.Errorf("InRelease hits = %d, want 0", inReleaseHits.Load())
+	}
+	if releaseHits.Load() != 1 {
+		t.Errorf("Release hits = %d, want 1", releaseHits.Load())
+	}
+	if gpgHits.Load() != 1 {
+		t.Errorf("Release.gpg hits = %d, want 1", gpgHits.Load())
+	}
+
+	snap, err := realCache.GetSuiteSnapshot(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("expected adopter to have created snapshot 1: %v", err)
+	}
+	if snap.ReleaseHash == nil {
+		t.Errorf("snapshot.release_hash unset after detached fallback")
+	}
+	if snap.InReleaseHash != nil {
+		t.Errorf("snapshot.inrelease_hash unexpectedly set in detached fallback")
+	}
+}
+
+// TestCheck_404OnInRelease_NoFallback_WhenReleaseRowsMissing covers
+// the negative case: a fresh suite that 404s on InRelease and lacks
+// Release / Release.gpg url_path rows must record the failure rather
+// than retry as detached. Without this, a transient InRelease 404 on
+// an inline-only suite would log a misleading detached-mode fetch.
+func TestCheck_404OnInRelease_NoFallback_WhenReleaseRowsMissing(t *testing.T) {
+	fc := newFakeCache()
+
+	var releaseHits, gpgHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/noble/InRelease":
+			w.WriteHeader(http.StatusNotFound)
+		case "/dists/noble/Release":
+			releaseHits.Add(1)
+			t.Errorf("Release fetched despite missing url_path row")
+		case "/dists/noble/Release.gpg":
+			gpgHits.Add(1)
+			t.Errorf("Release.gpg fetched despite missing url_path row")
+		default:
+			t.Errorf("unexpected fetch: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	// Only the InRelease url_path row exists.
+	bh := hashOf([]byte("baseline"))
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/dists/noble/InRelease", BlobHash: &bh,
+		UpstreamURL: srv.URL + "/dists/noble/InRelease", IsMetadata: true,
+	})
+
+	c, _ := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Logger: discardLogger(),
+		now:    func() time.Time { return time.Unix(13000, 0) },
+	})
+	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
+
+	got, ok := fc.suite("http", "127.0.0.1", "/dists/noble")
+	if !ok {
+		t.Fatalf("suite missing")
+	}
+	if got.LastCheckAt == nil || *got.LastCheckAt != 13000 {
+		t.Errorf("last_check_at = %v, want 13000", got.LastCheckAt)
+	}
+	if got.LastSuccessAt != nil {
+		t.Errorf("last_success_at = %v, want nil (4xx is failure)", got.LastSuccessAt)
+	}
+	if releaseHits.Load() != 0 || gpgHits.Load() != 0 {
+		t.Errorf("Release/Release.gpg fetched despite missing url_path rows: r=%d g=%d",
+			releaseHits.Load(), gpgHits.Load())
+	}
+}
+
