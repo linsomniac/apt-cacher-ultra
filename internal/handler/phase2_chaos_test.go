@@ -457,9 +457,16 @@ func chaos2AllPaths() []string {
 // snapshot. label distinguishes A vs B in the response payloads so a
 // torn-write bug surfaces as a body-mismatch rather than a
 // coincidentally-equal byte stream.
+//
+// Inline-mode snapshots (makeChaos2Snapshot) populate inRelease.
+// Detached-mode snapshots (makeChaos2DetachedSnapshot) populate
+// release + releaseGPG. The two forms are not mixed in any single
+// test because a real upstream serves one form at a time.
 type chaos2Snapshot struct {
 	label      string
-	inRelease  []byte            // /<suite>/InRelease
+	inRelease  []byte            // /<suite>/InRelease  (inline form)
+	release    []byte            // /<suite>/Release    (detached form)
+	releaseGPG []byte            // /<suite>/Release.gpg(detached form)
 	packagesGz []byte            // /<suite>/main/binary-amd64/Packages.gz
 	debBodies  map[string][]byte // suite-rel path -> body
 }
@@ -542,11 +549,18 @@ func chaos2Sha256Hex(b []byte) string {
 // current snapshot. ETag carries the snapshot label so a freshness
 // conditional GET can short-circuit with 304 when the snapshot
 // hasn't changed.
+//
+// Suffix order is load-bearing: "/Release.gpg" must be checked before
+// "/Release" because both share the latter as a suffix.
 func chaos2BodyAndETagFor(s *chaos2Snapshot, urlPath string) ([]byte, string) {
 	etag := `"` + s.label + `"`
 	switch {
 	case strings.HasSuffix(urlPath, "/InRelease"):
 		return s.inRelease, etag
+	case strings.HasSuffix(urlPath, "/Release.gpg"):
+		return s.releaseGPG, etag
+	case strings.HasSuffix(urlPath, "/Release"):
+		return s.release, etag
 	case strings.HasSuffix(urlPath, "/Packages.gz"):
 		return s.packagesGz, etag
 	}

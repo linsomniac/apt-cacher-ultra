@@ -196,11 +196,17 @@ func (v *chaos2GateVerifier) VerifyInline(ctx context.Context, suite freshness.S
 	return nil, errChaos2UntrustedSigner
 }
 
-// VerifyDetached is unused by this inline-mode forgery test. The stub
-// rejects unconditionally — if a future caller routes a detached
-// adoption through this gate, they should write a dedicated detached
-// forgery test rather than reuse this one.
+// VerifyDetached mirrors VerifyInline but ignores sigBytes — the gate
+// keys on the Release plaintext, not the signature. Used by the
+// detached forgery test (TestPhase2DetachedGPGForgery_*) where
+// `accept` is set to snapA.release; snapB.release lands in the
+// rejected counter.
 func (v *chaos2GateVerifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error) {
+	if bytesEqualForTest(releaseBytes, v.accept) {
+		v.accepted.Add(1)
+		return releaseBytes, nil
+	}
+	atomic.AddInt32(&v.rejected, 1)
 	return nil, errChaos2UntrustedSigner
 }
 
