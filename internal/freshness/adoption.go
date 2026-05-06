@@ -235,6 +235,12 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		}
 	}
 
+	// Step 0a: capture the prior adoption form. After CommitAdoption
+	// the prior snapshot is no longer current, so the lookup must
+	// happen before any mutation. Step 10 compares this against p.form
+	// and emits adoption_form_drift on a transition.
+	priorForm, hadPrior := a.priorAdoptionForm(ctx, suite)
+
 	// Step 1: GPG verify. The Verifier returns the verified Release-
 	// style plaintext (the cleartext between BEGIN/END markers in a
 	// clearsigned InRelease, or releaseBytes verbatim in detached
@@ -435,7 +441,27 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		return fmt.Errorf("%w: commit: %v", ErrAdoptionDBFailed, err)
 	}
 
-	// Step 10: success log.
+	// Step 10: success log + form-drift signal.
+	//
+	// adoption_form_drift fires when a suite's signature form has
+	// changed between the prior current snapshot and the one just
+	// committed (inline → detached or vice versa). Operators monitoring
+	// fleet-wide signing-policy changes use this as a one-time signal:
+	// in steady state the form is stable, so a drift line in the log
+	// surfaces an upstream archive switching its publication form
+	// (e.g. dropping clearsigned InRelease in favor of detached
+	// Release.gpg). Suites that have just gone from no-prior-snapshot
+	// to first adoption don't drift.
+	if hadPrior && priorForm != p.form {
+		a.logger.Warn("adoption_form_drift",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"prior_form", formName(priorForm),
+			"new_form", formName(p.form),
+			"snapshot_id", snapshotID,
+		)
+	}
+
 	a.logger.Info("adoption_success",
 		"canonical_host", suite.CanonicalHost,
 		"suite_path", suite.SuitePath,
@@ -446,6 +472,33 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		"package_hash_count", len(packageHashes),
 	)
 	return nil
+}
+
+// priorAdoptionForm returns the adoption form of the suite's current
+// snapshot, derived from its hash columns. Returns (form, true) when
+// a current snapshot exists with one of the known fingerprints; (0,
+// false) when there is no current snapshot, the lookup fails, or the
+// snapshot has neither hash set (the latter shouldn't happen given
+// the suite_snapshot CHECK constraint, but treat defensively).
+//
+// First-ever adoption produces (0, false), which the caller treats as
+// "no prior" — first adoption is not drift.
+func (a *Adopter) priorAdoptionForm(ctx context.Context, suite SuiteRef) (adoptionForm, bool) {
+	fresh, err := a.cache.GetSuiteFreshness(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
+	if err != nil || fresh == nil || fresh.CurrentSnapshotID == nil {
+		return 0, false
+	}
+	snap, err := a.cache.GetSuiteSnapshot(ctx, *fresh.CurrentSnapshotID)
+	if err != nil || snap == nil {
+		return 0, false
+	}
+	switch {
+	case snap.InReleaseHash != nil:
+		return adoptionFormInline, true
+	case snap.ReleaseHash != nil:
+		return adoptionFormDetached, true
+	}
+	return 0, false
 }
 
 // formName renders an adoptionForm as a stable string suitable for

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -419,6 +420,99 @@ func TestAdopter_DetachedHappyPath(t *testing.T) {
 	}
 	if !sawPkgs {
 		t.Error("declared member Packages missing from snapshot_member rows")
+	}
+}
+
+// TestAdopter_FormDriftWARN_OnFormTransition verifies that
+// adoption_form_drift fires when a suite's adoption form changes
+// between the prior current snapshot and the one just committed, and
+// that first-ever adoptions (no prior snapshot) don't false-positive.
+func TestAdopter_FormDriftWARN_OnFormTransition(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ff := newFakeFetcher()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:       c,
+		Fetcher:     ff,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+		Logger:      logger,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+
+	suite := SuiteRef{
+		CanonicalScheme: "http",
+		CanonicalHost:   "archive.ubuntu.com",
+		SuitePath:       "/ubuntu/dists/noble",
+	}
+
+	debHash := strings.Repeat("a", 64)
+	pkgs := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.deb": debHash,
+	})
+	inlineRelease, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+	})
+	// Detached form uses a distinct Release body. The natural-key
+	// UNIQUE index on suite_snapshot is over
+	// (scheme, host, suite_path, COALESCE(inrelease_hash, release_hash))
+	// — reusing the same bytes between an inline and a detached
+	// adoption would hash-collide across forms. Real-world upstreams
+	// that switch form produce distinct bytes anyway (an InRelease
+	// wraps Release in a PGP envelope; the detached form drops the
+	// envelope), so a modest header tweak is realistic.
+	detachedRelease := append([]byte("Description: detached form\n"), inlineRelease...)
+
+	ff.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages", pkgs)
+
+	// First adoption: inline. With no prior current snapshot,
+	// adoption_form_drift must NOT fire — first adoption is not drift.
+	if err := ad.Run(context.Background(), suite, inlineRelease, "etag-1", ""); err != nil {
+		t.Fatalf("Run inline: %v", err)
+	}
+	if got := logBuf.String(); strings.Contains(got, "adoption_form_drift") {
+		t.Fatalf("first-ever adoption should not emit adoption_form_drift, got log:\n%s", got)
+	}
+
+	// Second adoption: detached. Prior snapshot was inline; new is
+	// detached — adoption_form_drift WARN must fire with prior=inline,
+	// new=detached.
+	logBuf.Reset()
+	sigBytes := []byte("placeholder-sig")
+	if err := ad.RunDetached(context.Background(), suite, detachedRelease, sigBytes, "etag-2", ""); err != nil {
+		t.Fatalf("RunDetached: %v", err)
+	}
+	out := logBuf.String()
+	if !strings.Contains(out, "adoption_form_drift") {
+		t.Fatalf("expected adoption_form_drift WARN, got log:\n%s", out)
+	}
+	if !strings.Contains(out, `"prior_form":"inline"`) {
+		t.Errorf("expected prior_form=inline, got log:\n%s", out)
+	}
+	if !strings.Contains(out, `"new_form":"detached"`) {
+		t.Errorf("expected new_form=detached, got log:\n%s", out)
+	}
+
+	// Third adoption: detached again with yet-another distinct Release
+	// (same UNIQUE-index reasoning). Prior is now detached; new is
+	// detached — no drift, no WARN.
+	logBuf.Reset()
+	detachedRelease2 := append([]byte("Description: detached form v2\n"), inlineRelease...)
+	if err := ad.RunDetached(context.Background(), suite, detachedRelease2, sigBytes, "etag-3", ""); err != nil {
+		t.Fatalf("RunDetached repeat: %v", err)
+	}
+	if got := logBuf.String(); strings.Contains(got, "adoption_form_drift") {
+		t.Fatalf("repeat detached adoption should not emit adoption_form_drift, got log:\n%s", got)
 	}
 }
 
