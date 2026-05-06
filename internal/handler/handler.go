@@ -907,12 +907,78 @@ func (h *Handler) respondRecoveryError(w http.ResponseWriter, r *http.Request, r
 // semaphore, opens a temp blob, fetches into it, finalizes into pool/,
 // and inserts the url_path/blob rows. Returns sfResult with the cached
 // blob hash on success.
+//
+// SPEC2 §6.2 .deb hash validation is resolved before the fetch: the
+// declared hashes for the path determine which Finalize variant the
+// fetched bytes must satisfy.
+//
+//   - 0 declared rows  → no current snapshot covers this path; trust-
+//     upstream regime, plain Finalize accepts any hash.
+//   - 1 declared row   → FinalizeExpectingHash gates the rename on the
+//     declared hash; an upstream serving the wrong bytes is rejected
+//     before pool/ is touched.
+//   - ≥ 2 distinct rows → snapshots disagree among themselves; reject
+//     without contacting upstream. No observed bytes can resolve a
+//     snapshot-level conflict, and fetching first wastes bandwidth and
+//     still has to fail closed afterwards.
+//
+// Metadata paths skip this entirely — §6.2 metadata validation uses
+// snapshot_member.declared_sha256 keyed by suite-relative path, and
+// trySnapshotHit fails closed before metadata can reach runFetch on an
+// adopted suite. Metadata on non-adopted suites is the Phase 1 trust-
+// upstream path with no snapshot to validate against.
 func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 	release, err := h.sem.Acquire(ctx, req.CanonicalHost)
 	if err != nil {
 		return sfResult{err: fmt.Errorf("handler: acquire host slot: %w", err)}
 	}
 	defer release()
+
+	// Pre-fetch §6.2 dispatch. declaredHash stays empty when the path is
+	// either metadata or unconstrained (case 0); set to the single
+	// declared value in case 1; conflict (case 2+) returns early.
+	var declaredHash string
+	if !req.IsMetadata {
+		rows, derr := h.cache.DeclaredHashesForPath(ctx,
+			req.CanonicalScheme, req.CanonicalHost, req.Path)
+		if derr != nil {
+			// Fail open on transient SQLite errors, same posture as the
+			// hit-path checkPackageHash helper. A blanket fail-closed
+			// would turn a SQLite hiccup into a global .deb 502 storm.
+			h.logger.Warn("package_hash validate lookup failed",
+				"err", derr,
+				"canonical_host", req.CanonicalHost,
+				"path", req.Path,
+			)
+		} else {
+			distinct := distinctDeclared(rows)
+			switch len(distinct) {
+			case 0:
+				// SPEC2 §6.2 keyword package_hash_miss is Debug-level
+				// diagnostic for monitoring coverage gaps; emitted only
+				// when a request reaches the miss path with no covering
+				// snapshot.
+				h.logger.Debug("package_hash_miss",
+					"canonical_host", req.CanonicalHost,
+					"path", req.Path,
+				)
+			case 1:
+				declaredHash = distinct[0]
+			default:
+				// SPEC2 §6.2 / §6.1 step 6: snapshots disagree on this
+				// .deb's hash. Refuse without fetching — the conflict
+				// is at the snapshot layer, no observed bytes can
+				// resolve it. Saves bandwidth vs. fetch-then-discard.
+				h.logger.Error("package_hash_conflict",
+					"canonical_host", req.CanonicalHost,
+					"path", req.Path,
+					"fetched", false,
+					"declared", declaredAttrs(rows),
+				)
+				return sfResult{err: ErrPackageHashConflict}
+			}
+		}
+	}
 
 	bw, err := h.cache.NewTempBlob()
 	if err != nil {
@@ -935,45 +1001,37 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 		return sfResult{err: ferr, status: status}
 	}
 
-	hash, err := bw.Finalize(fres.ContentLength)
-	if err != nil {
-		return sfResult{err: fmt.Errorf("handler: finalize blob: %w", err), status: fres.Status}
-	}
-
-	// SPEC2 §6.2 .deb hash validation. For non-metadata paths covered by
-	// any current snapshot's package_hash, the fetched bytes must match
-	// the declared hash before they can enter pool/ or url_path. The
-	// query is the same shape as §6.1 step 2; conflicting declarations
-	// (≥ 2 distinct hashes) fail closed exactly like the hit-path.
-	//
-	// Skipped for metadata: §6.2 metadata validation under an adopted
-	// suite needs a different trust anchor (snapshot_member.declared_sha256
-	// keyed by suite-relative path), and trySnapshotHit fails closed before
-	// metadata can reach this code path on an adopted suite. Metadata under
-	// non-adopted suites is the Phase 1 trust-upstream path with no
-	// snapshot to validate against.
-	if !req.IsMetadata {
-		// AIDEV-TODO: this Finalize-then-validate-then-DiscardFinalizedBlob
-		// pattern has the same blob-collision risk runSnapshotMemberFetch
-		// fixed via FinalizeExpectingHash: a fetched .deb whose hash
-		// happens to match an unrelated cached blob (mirror confusion,
-		// misrouted Remap rule, content-identical .deb under a different
-		// path) would have its file preserved by Finalize's dedup branch
-		// and then removed by DiscardFinalizedBlob, evicting the
-		// unrelated valid blob. The single-declared-row case can be
-		// migrated to FinalizeExpectingHash; the conflict case
-		// (≥ 2 distinct declared hashes) needs a more general
-		// "FinalizeIfHashIn" because there is no single expected hash
-		// to gate on. Tracking as a follow-up to the codex review of
-		// commit a1162c5.
-		if verr := h.validateDebAgainstPackageHash(ctx, req, hash); verr != nil {
-			if rerr := h.cache.DiscardFinalizedBlob(hash); rerr != nil {
-				h.logger.Warn("discard mismatched blob failed",
-					"err", rerr,
-					"hash", hash,
-				)
+	var hash string
+	if declaredHash != "" {
+		// Hash-validated promotion. FinalizeExpectingHash computes the
+		// hash and gates the rename on declaredHash; on mismatch the
+		// temp is removed without touching pool/<observed>, so an
+		// unrelated valid pool blob whose content happens to share the
+		// observed hash (mirror confusion, misrouted Remap) is
+		// preserved. observed is the second return value even on
+		// ErrHashMismatch, populated for the structured log line.
+		var feErr error
+		hash, feErr = bw.FinalizeExpectingHash(declaredHash, fres.ContentLength)
+		if errors.Is(feErr, cache.ErrHashMismatch) {
+			h.logger.Error("hash_validation_failure",
+				"canonical_host", req.CanonicalHost,
+				"path", req.Path,
+				"declared_sha256", declaredHash,
+				"observed_sha256", hash,
+			)
+			return sfResult{
+				err: fmt.Errorf("%w: declared %s, observed %s",
+					ErrPackageHashMismatch, declaredHash, hash),
+				status: fres.Status,
 			}
-			return sfResult{err: verr, status: fres.Status}
+		}
+		if feErr != nil {
+			return sfResult{err: fmt.Errorf("handler: finalize blob: %w", feErr), status: fres.Status}
+		}
+	} else {
+		hash, err = bw.Finalize(fres.ContentLength)
+		if err != nil {
+			return sfResult{err: fmt.Errorf("handler: finalize blob: %w", err), status: fres.Status}
 		}
 	}
 
@@ -1053,72 +1111,6 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 	}
 }
 
-// validateDebAgainstPackageHash runs the SPEC2 §6.2 .deb miss-path
-// validation: after a fetched non-metadata blob is finalized into pool/,
-// query DeclaredHashesForPath and compare against the fetched hash.
-//
-//   - 0 declared rows  → no current snapshot covers this path; trust-
-//     upstream (returns nil).
-//   - 1 declared row, hash matches → OK.
-//   - 1 declared row, hash mismatches → return ErrPackageHashMismatch
-//     with the declared/observed pair logged. SPEC2 §6.2 keyword
-//     hash_validation_failure.
-//   - 2+ distinct declared rows → return ErrPackageHashConflict with
-//     all (declared_sha256, snapshot_id) pairs logged. SPEC2 §6.2 +
-//     §6.1 step 6 share the keyword package_hash_conflict.
-//
-// The caller (runFetch) is responsible for discarding the on-disk pool
-// blob and returning a sfResult with this error, which respondError
-// surfaces as 502 + Retry-After: 60.
-func (h *Handler) validateDebAgainstPackageHash(ctx context.Context, req *proxy.Request, fetchedHash string) error {
-	rows, err := h.cache.DeclaredHashesForPath(ctx,
-		req.CanonicalScheme, req.CanonicalHost, req.Path)
-	if err != nil {
-		// DB error during validation — fail open, like the hit-path
-		// helper. A blanket fail-closed would turn a transient SQLite
-		// hiccup into a global .deb 502 storm.
-		h.logger.Warn("package_hash validate lookup failed",
-			"err", err,
-			"canonical_host", req.CanonicalHost,
-			"path", req.Path,
-		)
-		return nil
-	}
-	distinct := distinctDeclared(rows)
-	switch len(distinct) {
-	case 0:
-		// SPEC2 §6.2 keyword package_hash_miss is Debug-level diagnostic
-		// for monitoring coverage gaps; emitted only when a request
-		// reaches the miss path with no covering snapshot.
-		h.logger.Debug("package_hash_miss",
-			"canonical_host", req.CanonicalHost,
-			"path", req.Path,
-		)
-		return nil
-	case 1:
-		if distinct[0] == fetchedHash {
-			return nil
-		}
-		h.logger.Error("hash_validation_failure",
-			"canonical_host", req.CanonicalHost,
-			"path", req.Path,
-			"declared_sha256", distinct[0],
-			"observed_sha256", fetchedHash,
-			"snapshot_id", rows[0].SnapshotID,
-		)
-		return fmt.Errorf("%w: declared %s, observed %s",
-			ErrPackageHashMismatch, distinct[0], fetchedHash)
-	default:
-		h.logger.Error("package_hash_conflict",
-			"canonical_host", req.CanonicalHost,
-			"path", req.Path,
-			"observed_sha256", fetchedHash,
-			"declared", declaredAttrs(rows),
-		)
-		return ErrPackageHashConflict
-	}
-}
-
 // inReleaseSuffix is the path suffix that identifies the InRelease
 // file under a suite path. Kept as a package constant so the same
 // literal is used for the seed-detection check above and (in the
@@ -1191,8 +1183,9 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		return
 	case errors.Is(err, ErrPackageHashMismatch):
 		// SPEC2 §6.2: fetched .deb bytes disagree with the snapshot's
-		// declared hash. Discard + 502 + Retry-After: 60. The detailed
-		// log line was already emitted in validateDebAgainstPackageHash.
+		// declared hash. 502 + Retry-After: 60. The detailed
+		// hash_validation_failure log line was already emitted in
+		// runFetch where the declared/observed pair is in scope.
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, "package hash mismatch", http.StatusBadGateway)
 		h.logRequest(r, req.CanonicalHost, req.Path, "package_hash_mismatch", http.StatusBadGateway, 0, true, res.status, start)

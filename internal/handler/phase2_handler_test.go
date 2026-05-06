@@ -378,8 +378,15 @@ func TestServeHTTP_DebMissValidatesAgainstPackageHash(t *testing.T) {
 // step 4: two current snapshots with distinct declared hashes for the
 // same .deb path. Even on a fresh fetch (no prior url_path row), the
 // miss path must 502 + Retry-After: 60 without inserting.
+//
+// Pre-fetch reject: the handler refuses without contacting upstream —
+// the conflict is at the snapshot layer and no observed bytes can
+// resolve it, so dialing upstream just wastes bandwidth before the
+// same fail-closed conclusion. upstreamCalls=0 locks that contract.
 func TestServeHTTP_DebMissConflictingPackageHashFailsClosed(t *testing.T) {
+	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
 		w.Write([]byte("upstream content"))
 	}))
 	defer srv.Close()
@@ -407,6 +414,98 @@ func TestServeHTTP_DebMissConflictingPackageHashFailsClosed(t *testing.T) {
 	}
 	if got := rec.Header().Get("Retry-After"); got != "60" {
 		t.Errorf("Retry-After=%q, want 60", got)
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Errorf("upstream calls=%d, want 0 (snapshot-level conflict rejects pre-fetch)", got)
+	}
+}
+
+// TestServeHTTP_DebMissHashCollisionPreservesUnrelatedBlob covers the
+// codex-flagged blob-collision risk in the .deb miss path: a fetched
+// .deb whose hash happens to match an unrelated cached blob (mirror
+// confusion, misrouted Remap rule, content-identical .deb at a
+// different path) must not evict the unrelated blob.
+//
+// The pre-codex flow Finalize'd into pool/<observed>, then on hash
+// mismatch called DiscardFinalizedBlob(observed) — but Finalize's
+// dedup branch had already preserved the existing pool/<observed>
+// rather than overwriting it, so DiscardFinalizedBlob removed the
+// unrelated valid blob. FinalizeExpectingHash sidesteps the race by
+// gating the rename on the declared hash before pool/ is touched.
+//
+// Setup: pre-existing pool blob X with content B (an unrelated valid
+// blob). Snapshot declares Y (≠ X) for path P. Upstream serves B
+// (hash collision). Expectation: 502 + Retry-After: 60, pool/X is
+// preserved with content B.
+func TestServeHTTP_DebMissHashCollisionPreservesUnrelatedBlob(t *testing.T) {
+	body := []byte("colliding bytes that match an unrelated cached blob")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	scheme, host, port := splitURL(t, srv.URL)
+	debPath := "/pool/main/h/hello/hello.deb"
+	canonHost := hostKey(host, port)
+
+	// Pre-existing pool blob: an unrelated valid blob with the same
+	// content the upstream will serve, simulating a collision.
+	collidingHash := writeBlob(t, h, body)
+	collidingPath := h.cache.BlobPath(collidingHash)
+	collidingStat0, err := os.Stat(collidingPath)
+	if err != nil {
+		t.Fatalf("stat pre-existing blob: %v", err)
+	}
+
+	// Snapshot declares a different hash for debPath. Upstream's
+	// response will hash to collidingHash, not the declared value.
+	declaredHash := strings.Repeat("e", 64)
+	if declaredHash == collidingHash {
+		t.Fatalf("test hash collision: declared %q matches collidingHash", declaredHash)
+	}
+	releaseBlob := writeBlob(t, h, []byte("InRelease for noble"))
+	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/noble", releaseBlob,
+		[]cache.SnapshotMember{
+			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
+		},
+		[]cache.PackageHash{
+			{CanonicalScheme: scheme, CanonicalHost: canonHost,
+				Path: debPath, DeclaredSHA256: declaredHash},
+		})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, debPath))
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status=%d, want 502 (hash mismatch)", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "60" {
+		t.Errorf("Retry-After=%q, want 60", got)
+	}
+
+	// The unrelated valid pool blob must still be intact: same path,
+	// same size, same content.
+	collidingStat1, err := os.Stat(collidingPath)
+	if err != nil {
+		t.Fatalf("pool blob removed by mismatch handling: %v "+
+			"(this is the pre-codex bug — DiscardFinalizedBlob "+
+			"evicted the unrelated valid blob)", err)
+	}
+	if collidingStat0.Size() != collidingStat1.Size() {
+		t.Errorf("pool blob size changed: was %d, now %d",
+			collidingStat0.Size(), collidingStat1.Size())
+	}
+	gotContent, err := os.ReadFile(collidingPath)
+	if err != nil {
+		t.Fatalf("read pool blob: %v", err)
+	}
+	if string(gotContent) != string(body) {
+		t.Errorf("pool blob content corrupted: got %q, want %q",
+			gotContent, body)
+	}
+	// And no url_path row was inserted for the rejected fetch.
+	if _, err := h.cache.LookupURL(context.Background(), scheme, canonHost, debPath); err == nil {
+		t.Errorf("url_path row inserted after collision rejection (must not insert)")
 	}
 }
 
