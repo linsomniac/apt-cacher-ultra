@@ -1,6 +1,7 @@
 package freshness
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,6 +18,14 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 )
+
+// maxDecompressedPackagesBytes caps how much we'll inflate a single
+// Packages.gz blob. Real-world Packages files for Ubuntu noble main
+// amd64 are ~50 MiB uncompressed; 256 MiB is comfortable headroom and
+// bounds the memory cost of a gzip-bomb signed by an otherwise-valid
+// adoption (the bytes were signed and hash-verified, but a hostile
+// upstream could still ship pathological content).
+const maxDecompressedPackagesBytes = 256 << 20
 
 // SuiteRef identifies a suite for adoption — the canonical scheme/host
 // (post-Remap) plus the suite path. The freshness checker passes this
@@ -275,12 +284,15 @@ func (a *Adopter) Run(ctx context.Context, suite SuiteRef, inRelease []byte, eta
 		})
 	}
 
-	// AIDEV-TODO: Step 8 — parse Packages members and populate
-	// package_hash rows. Deferred to Phase 2 step 2d-ii. Without it,
-	// the §6.5 .deb hash validation degrades to "no current snapshot"
-	// = "trust upstream" (Phase 1 behavior) until a follow-up commit
-	// wires the Packages parser into adoption.
-	var packageHashes []cache.PackageHash
+	// Step 8: parse every Packages member to populate package_hash
+	// rows. Deduped by .deb url-path within the adoption — multiple
+	// Packages variants (Packages, Packages.gz) declare the same
+	// content, and the resulting rows would otherwise collide on the
+	// package_hash primary key.
+	packageHashes, err := a.buildPackageHashes(suite, snapshotID, members)
+	if err != nil {
+		return err // already wrapped with category
+	}
 
 	// Step 9: atomic flip transaction.
 	if err := a.cache.CommitAdoption(ctx, snapshotID, memberRows, packageHashes); err != nil {
@@ -511,6 +523,137 @@ func byHashAliasPath(declaredPath, sha256hex string) string {
 		return ""
 	}
 	return dir + "/by-hash/SHA256/" + sha256hex
+}
+
+// buildPackageHashes walks every Packages-shaped Release member, parses
+// it, and returns deduplicated cache.PackageHash rows for the snapshot.
+// Returns (nil, nil) for suites whose layout doesn't follow apt's
+// "/dists/<codename>" convention — those still adopt successfully but
+// with empty package_hash coverage, falling back to trust-upstream for
+// .deb hash validation.
+func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
+	members []ReleaseMember) ([]cache.PackageHash, error) {
+	repoRoot, ok := repoRootFromSuitePath(suite.SuitePath)
+	if !ok {
+		a.logger.Info("adoption: skipping package_hash population (non-/dists/ suite layout)",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+		)
+		return nil, nil
+	}
+
+	// debPath -> declared SHA256. Multiple Packages variants in the
+	// same Release declare identical content, so deduplication is
+	// load-bearing for the package_hash primary key.
+	dedup := make(map[string]string)
+	for _, m := range members {
+		if !isPackagesMember(m.Path) {
+			continue
+		}
+		body, err := a.readPackagesBlob(m.Path, m.SHA256)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read %q: %v", ErrAdoptionParseFailed, m.Path, err)
+		}
+		refs, err := ParsePackages(body)
+		if err != nil {
+			return nil, fmt.Errorf("%w: parse %q: %v", ErrAdoptionParseFailed, m.Path, err)
+		}
+		for _, ref := range refs {
+			debPath := repoRoot + ref.Filename
+			if existing, dup := dedup[debPath]; dup && existing != ref.SHA256 {
+				// Self-inconsistent Release: two variants declare
+				// different SHA256 for the same .deb. Adoption
+				// fails closed — apt would also reject this.
+				return nil, fmt.Errorf("%w: %q declared %s vs %s across Packages variants",
+					ErrAdoptionParseFailed, debPath, existing, ref.SHA256)
+			}
+			dedup[debPath] = ref.SHA256
+		}
+	}
+
+	rows := make([]cache.PackageHash, 0, len(dedup))
+	for debPath, declared := range dedup {
+		rows = append(rows, cache.PackageHash{
+			CanonicalScheme: suite.CanonicalScheme,
+			CanonicalHost:   suite.CanonicalHost,
+			Path:            debPath,
+			DeclaredSHA256:  declared,
+			SnapshotID:      snapshotID,
+		})
+	}
+	return rows, nil
+}
+
+// isPackagesMember reports whether m's relative path is a Packages
+// file we can parse. Phase 2 step 2 supports plain Packages and
+// Packages.gz; Packages.xz is intentionally skipped (would require an
+// xz dependency — defer until needed).
+func isPackagesMember(p string) bool {
+	base := path.Base(p)
+	return base == "Packages" || base == "Packages.gz"
+}
+
+// repoRootFromSuitePath returns the apt repository root path for a
+// "<repo>/dists/<codename>" suite path — that is, everything up to
+// and including the last "/" before "dists/". Returns (path, true) on
+// success, ("", false) for non-conforming layouts.
+//
+// Examples:
+//
+//	"/ubuntu/dists/noble"           -> "/ubuntu/", true
+//	"/debian/dists/bookworm-updates" -> "/debian/", true
+//	"/dists/foo"                    -> "/", true
+//	"/some/non/standard"            -> "", false
+func repoRootFromSuitePath(suitePath string) (string, bool) {
+	idx := strings.Index(suitePath, "/dists/")
+	if idx < 0 {
+		return "", false
+	}
+	return suitePath[:idx+1], true
+}
+
+// readPackagesBlob opens the pool blob for a Packages member and
+// returns its decompressed bytes (or raw bytes for plain Packages).
+// Reads are size-capped against gzip-bomb amplification.
+func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) {
+	f, err := os.Open(a.cache.BlobPath(blobHash))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	if strings.HasSuffix(memberPath, ".gz") {
+		gr, err := gzip.NewReader(f)
+		if err != nil {
+			return nil, fmt.Errorf("gzip: %w", err)
+		}
+		defer gr.Close()
+		// io.LimitReader caps at exactly the limit; if the actual
+		// content reaches the cap, treat that as a bomb and abort.
+		// Add 1 byte of slack so we can distinguish "exactly cap"
+		// from "would have exceeded cap".
+		limited := io.LimitReader(gr, maxDecompressedPackagesBytes+1)
+		body, err := io.ReadAll(limited)
+		if err != nil {
+			return nil, fmt.Errorf("decompress: %w", err)
+		}
+		if int64(len(body)) > maxDecompressedPackagesBytes {
+			return nil, fmt.Errorf("Packages.gz decompresses past %d-byte cap (bomb defense)",
+				maxDecompressedPackagesBytes)
+		}
+		return body, nil
+	}
+	// Plain Packages — also size-cap the read to bound a hostile-
+	// upstream signed-but-huge file (matches the gzip path's posture).
+	limited := io.LimitReader(f, maxDecompressedPackagesBytes+1)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > maxDecompressedPackagesBytes {
+		return nil, fmt.Errorf("Packages exceeds %d-byte cap", maxDecompressedPackagesBytes)
+	}
+	return body, nil
 }
 
 // buildMemberURL constructs the upstream URL for a suite-relative
