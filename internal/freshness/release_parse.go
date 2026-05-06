@@ -47,10 +47,10 @@ const scanBufCap = 1 << 20
 // these entries would dead-end at a content-length mismatch. apt
 // itself never refetches Release/Release.gpg/InRelease via the SHA256
 // block — it has those bytes already from the freshness fetch — so
-// dropping them is faithful to apt semantics. Inline-mode adoption
-// already handles InRelease via the metadata-self branch in
-// adoption.Run step 6; detached mode (when added) will handle Release
-// and Release.gpg the same way.
+// dropping them is faithful to apt semantics. Adoption inserts the
+// metadata-self snapshot_member row(s) explicitly in step 6 of
+// runShared — InRelease for inline mode, Release + Release.gpg for
+// detached mode.
 //
 // AIDEV-NOTE: callers have already cryptographically verified the input
 // (§7.6 verify step). This function is a pure text parser — it consults

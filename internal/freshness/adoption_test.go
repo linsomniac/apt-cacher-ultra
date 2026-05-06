@@ -51,11 +51,17 @@ func gzipBytes(b []byte) []byte {
 
 // passThroughVerifier returns the input verbatim. It exists only for
 // step-2 tests; production wiring will use the real GPG verifier from
-// step 3.
+// step 3. The detached form returns releaseBytes verbatim too,
+// matching the real verifier's "Release file IS the verified
+// plaintext" contract.
 type passThroughVerifier struct{}
 
 func (passThroughVerifier) VerifyInline(ctx context.Context, suite SuiteRef, inRelease []byte) ([]byte, error) {
 	return inRelease, nil
+}
+
+func (passThroughVerifier) VerifyDetached(ctx context.Context, suite SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error) {
+	return releaseBytes, nil
 }
 
 // failingVerifier always returns an error; used to exercise the
@@ -63,6 +69,10 @@ func (passThroughVerifier) VerifyInline(ctx context.Context, suite SuiteRef, inR
 type failingVerifier struct{ err error }
 
 func (v failingVerifier) VerifyInline(ctx context.Context, suite SuiteRef, inRelease []byte) ([]byte, error) {
+	return nil, v.err
+}
+
+func (v failingVerifier) VerifyDetached(ctx context.Context, suite SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error) {
 	return nil, v.err
 }
 
@@ -304,6 +314,130 @@ func TestAdopter_HappyPath(t *testing.T) {
 			t.Errorf("package_hash %s declared = %s, want %s",
 				expected.path, ph.DeclaredSHA256, expected.hash)
 		}
+	}
+}
+
+func TestAdopter_DetachedHappyPath(t *testing.T) {
+	// Mirror of TestAdopter_HappyPath but exercising RunDetached. The
+	// passThroughVerifier returns releaseBytes verbatim regardless of
+	// form, so the same Release-style text drives both paths; the
+	// detached-specific assertions are around the suite_snapshot row
+	// (release_hash + release_gpg_hash, NOT inrelease_hash) and the
+	// step-6 metadata-self rows ("Release" and "Release.gpg" instead
+	// of "InRelease").
+	env := newAdoptionTestEnv(t)
+
+	debHash := strings.Repeat("a", 64)
+	pkgs := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.deb": debHash,
+	})
+	releaseText, declared := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+	})
+	env.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages", pkgs)
+
+	// passThroughVerifier returns releaseBytes verbatim, so the
+	// "signature" can be any non-empty placeholder — the adopter only
+	// hashes it for the pool blob and the snapshot_member row.
+	sigBytes := []byte("placeholder-Release-gpg-bytes")
+	if err := env.adopter.RunDetached(
+		context.Background(), env.suite, releaseText, sigBytes, "etag-Z", "lastmod-Z",
+	); err != nil {
+		t.Fatalf("RunDetached: %v", err)
+	}
+
+	sf, err := env.cache.GetSuiteFreshness(context.Background(),
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil {
+		t.Fatal("current_snapshot_id not set after detached adoption")
+	}
+	snapshotID := *sf.CurrentSnapshotID
+
+	// The snapshot row carries release_hash + release_gpg_hash, not
+	// inrelease_hash. The schema CHECK constraint enforces XOR.
+	snap, err := env.cache.GetSuiteSnapshot(context.Background(), snapshotID)
+	if err != nil {
+		t.Fatalf("GetSuiteSnapshot: %v", err)
+	}
+	if snap.InReleaseHash != nil {
+		t.Errorf("detached snapshot has unexpected inrelease_hash=%s", *snap.InReleaseHash)
+	}
+	if snap.ReleaseHash == nil || *snap.ReleaseHash != shaOf(releaseText) {
+		t.Errorf("release_hash = %v, want %s", snap.ReleaseHash, shaOf(releaseText))
+	}
+	if snap.ReleaseGPGHash == nil || *snap.ReleaseGPGHash != shaOf(sigBytes) {
+		t.Errorf("release_gpg_hash = %v, want %s", snap.ReleaseGPGHash, shaOf(sigBytes))
+	}
+
+	got, err := env.cache.ListSnapshotMembers(context.Background(), snapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Step 6 in detached mode contributes TWO metadata-self rows.
+	var sawRelease, sawReleaseGPG, sawInRelease bool
+	for _, m := range got {
+		switch m.Path {
+		case "Release":
+			sawRelease = true
+			if m.BlobHash != shaOf(releaseText) {
+				t.Errorf("Release self row blob_hash = %s, want %s", m.BlobHash, shaOf(releaseText))
+			}
+		case "Release.gpg":
+			sawReleaseGPG = true
+			if m.BlobHash != shaOf(sigBytes) {
+				t.Errorf("Release.gpg self row blob_hash = %s, want %s", m.BlobHash, shaOf(sigBytes))
+			}
+		case "InRelease":
+			sawInRelease = true
+		}
+	}
+	if !sawRelease {
+		t.Error("metadata-self Release row missing")
+	}
+	if !sawReleaseGPG {
+		t.Error("metadata-self Release.gpg row missing")
+	}
+	if sawInRelease {
+		t.Error("metadata-self InRelease row unexpectedly present in detached snapshot")
+	}
+
+	// Declared members still flow through unchanged. (We declared
+	// only Packages here; spot-check it.)
+	pkgsDeclared := declared["main/binary-amd64/Packages"]
+	var sawPkgs bool
+	for _, m := range got {
+		if m.Path == "main/binary-amd64/Packages" {
+			sawPkgs = true
+			if m.BlobHash != pkgsDeclared {
+				t.Errorf("Packages blob_hash = %s, want %s", m.BlobHash, pkgsDeclared)
+			}
+		}
+	}
+	if !sawPkgs {
+		t.Error("declared member Packages missing from snapshot_member rows")
+	}
+}
+
+func TestAdopter_DetachedVerifyError(t *testing.T) {
+	// Same as TestAdopter_VerifyError but routes through RunDetached
+	// to confirm the error category propagates via the detached
+	// codepath too.
+	env := newAdoptionTestEnv(t)
+	bad := errors.New("bad detached sig")
+	env.adopter.verifier = failingVerifier{err: bad}
+	err := env.adopter.RunDetached(
+		context.Background(), env.suite,
+		[]byte("release-bytes"), []byte("sig-bytes"), "", "",
+	)
+	if !errors.Is(err, ErrAdoptionGPGFailed) {
+		t.Errorf("got %v, want ErrAdoptionGPGFailed", err)
+	}
+	if got := blobsInPool(t, env.cache); got != 0 {
+		t.Errorf("pool/ has %d files after gpg failure, want 0", got)
 	}
 }
 

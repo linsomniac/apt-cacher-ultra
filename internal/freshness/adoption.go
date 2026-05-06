@@ -36,18 +36,23 @@ type SuiteRef struct {
 	SuitePath       string // e.g. "/ubuntu/dists/noble"
 }
 
-// Verifier returns the verified Release-style plaintext for an inline
-// InRelease (clearsigned) blob. The production implementation lives in
-// internal/gpg and uses github.com/ProtonMail/go-crypto/openpgp; tests
-// inject a pass-through stub.
+// Verifier returns the verified Release-style plaintext for one of
+// the two SPEC2 §7.6.3 signature forms:
 //
-// AIDEV-NOTE: VerifyInline ONLY validates a clearsigned InRelease.
-// Detached (Release + Release.gpg) verification — §7.6.3's "both
-// forms" — is not yet implemented because the freshness checker only
-// fetches InRelease (§7). When upstreams that lack inline InRelease
-// are added, extend this interface and the gpg verifier accordingly.
+//   - VerifyInline accepts a clearsigned InRelease blob (the body
+//     between BEGIN PGP SIGNED MESSAGE / END PGP SIGNATURE markers).
+//     Returns the cleartext between the markers.
+//   - VerifyDetached accepts a Release file plus its detached
+//     Release.gpg signature. Returns releaseBytes verbatim — the
+//     Release file IS the verified plaintext, so there is nothing to
+//     "extract."
+//
+// The production implementation lives in internal/gpg and uses
+// github.com/ProtonMail/go-crypto/openpgp; tests inject a
+// pass-through stub.
 type Verifier interface {
 	VerifyInline(ctx context.Context, suite SuiteRef, inRelease []byte) ([]byte, error)
+	VerifyDetached(ctx context.Context, suite SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error)
 }
 
 // AdoptionFetcher is the subset of *fetch.Client the Adopter uses to
@@ -151,16 +156,75 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 	}, nil
 }
 
-// Run executes the §7.5 adoption flow for a single suite. inRelease is
-// the freshness-fetched body; etag/lastmod are validators from the
-// same response. Returns nil on a successful flip, or one of the
-// Err* sentinels (wrapped with context) for each failure category.
+// adoptionForm distinguishes the two SPEC2 §7.6.3 signature forms.
+type adoptionForm int
+
+const (
+	adoptionFormInline   adoptionForm = iota // clearsigned InRelease
+	adoptionFormDetached                     // Release + Release.gpg
+)
+
+// adoptionPayload carries the form-specific inputs to runShared.
+// Exactly one of (inlineBytes) or (releaseBytes + sigBytes) is set on
+// entry; runShared populates the *Hash fields once step 2 has stored
+// the verified blobs in pool/.
+type adoptionPayload struct {
+	form adoptionForm
+
+	// Inline mode (form == adoptionFormInline).
+	inlineBytes []byte // clearsigned InRelease
+	inlineHash  string // sha256 of inlineBytes (set in step 2)
+
+	// Detached mode (form == adoptionFormDetached).
+	releaseBytes    []byte
+	sigBytes        []byte
+	releaseHash     string // sha256 of releaseBytes (set in step 2)
+	releaseGPGHash  string // sha256 of sigBytes (set in step 2)
+}
+
+// Run executes the §7.5 adoption flow for an inline (clearsigned
+// InRelease) suite. inRelease is the freshness-fetched body;
+// etag/lastmod are validators from the same response. Returns nil on
+// a successful flip, or one of the Err* sentinels (wrapped with
+// context) for each failure category.
 //
 // Run is synchronous: callers (typically the freshness Checker)
 // invoke it from a goroutine. The per-suite mutex held by the caller
 // serializes overlapping adoptions on the same suite; the global
 // concurrency cap held inside Run bounds total parallel adoptions.
 func (a *Adopter) Run(ctx context.Context, suite SuiteRef, inRelease []byte, etag, lastmod string) error {
+	return a.runShared(ctx, suite, &adoptionPayload{
+		form:        adoptionFormInline,
+		inlineBytes: inRelease,
+	}, etag, lastmod)
+}
+
+// RunDetached executes the §7.5 adoption flow for a detached-form
+// suite. releaseBytes is the Release file body, sigBytes is the
+// Release.gpg body (armored or binary). etag/lastmod are validators
+// from the Release fetch response; subsequent freshness checks
+// conditional-GET Release with these.
+//
+// SPEC2 §7.6.3 calls for both forms; this is the "Release +
+// Release.gpg" branch invoked when an upstream returns 404 on
+// InRelease (or never serves an inline InRelease).
+func (a *Adopter) RunDetached(ctx context.Context, suite SuiteRef, releaseBytes, sigBytes []byte, etag, lastmod string) error {
+	return a.runShared(ctx, suite, &adoptionPayload{
+		form:         adoptionFormDetached,
+		releaseBytes: releaseBytes,
+		sigBytes:     sigBytes,
+	}, etag, lastmod)
+}
+
+// runShared is the SPEC2 §7.5 adoption pipeline shared across both
+// signature forms. Form-specific dispatch happens at three points:
+//   - Step 1: VerifyInline vs VerifyDetached.
+//   - Step 2: persist 1 blob (InRelease) vs 2 blobs (Release, Release.gpg).
+//   - Step 6: metadata-self rows — 1 (InRelease) vs 2 (Release, Release.gpg).
+//
+// Steps 3–5 and 7–10 are identical: parse, candidate insert, member
+// prefetch, by-hash, package_hash, atomic flip, success log.
+func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayload, etag, lastmod string) error {
 	// Step 0: global concurrency cap. nil channel skips the gate.
 	if a.concurrencySem != nil {
 		select {
@@ -173,30 +237,67 @@ func (a *Adopter) Run(ctx context.Context, suite SuiteRef, inRelease []byte, eta
 
 	// Step 1: GPG verify. The Verifier returns the verified Release-
 	// style plaintext (the cleartext between BEGIN/END markers in a
-	// clearsigned InRelease, or the body verbatim when the operator
-	// has explicitly opted into unsigned-OK mode).
-	releaseText, err := a.verifier.VerifyInline(ctx, suite, inRelease)
-	if err != nil {
+	// clearsigned InRelease, or releaseBytes verbatim in detached
+	// mode). Both paths converge on "verified Release-equivalent text"
+	// for the §7.5 step 3 parse.
+	var (
+		releaseText []byte
+		verifyErr   error
+	)
+	switch p.form {
+	case adoptionFormInline:
+		releaseText, verifyErr = a.verifier.VerifyInline(ctx, suite, p.inlineBytes)
+	case adoptionFormDetached:
+		releaseText, verifyErr = a.verifier.VerifyDetached(ctx, suite, p.releaseBytes, p.sigBytes)
+	}
+	if verifyErr != nil {
 		a.logger.Info("adoption_gpg_failed",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
-			"err", err,
+			"err", verifyErr,
 		)
-		return fmt.Errorf("%w: %v", ErrAdoptionGPGFailed, err)
+		return fmt.Errorf("%w: %v", ErrAdoptionGPGFailed, verifyErr)
 	}
 
-	// Step 2: persist the verified InRelease blob into pool/ BEFORE
-	// the candidate row references it. writeBlobBytes is idempotent
+	// Step 2: persist the verified metadata blob(s) into pool/ BEFORE
+	// the candidate row references them. writeBlobBytes is idempotent
 	// and rehashes-on-reuse — a pre-existing pool blob with the same
-	// hash is re-verified before adoption claims it.
-	inReleaseHash, err := a.writeBlobBytes(ctx, inRelease)
-	if err != nil {
-		a.logger.Warn("adoption: persist InRelease failed",
-			"canonical_host", suite.CanonicalHost,
-			"suite_path", suite.SuitePath,
-			"err", err,
-		)
-		return fmt.Errorf("%w: persist InRelease: %v", ErrAdoptionDBFailed, err)
+	// hash is re-verified before adoption claims it. Detached mode
+	// stores both the Release body and the Release.gpg signature so
+	// snapshot_member rows can FK-reference them later.
+	switch p.form {
+	case adoptionFormInline:
+		h, err := a.writeBlobBytes(ctx, p.inlineBytes)
+		if err != nil {
+			a.logger.Warn("adoption: persist InRelease failed",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"err", err,
+			)
+			return fmt.Errorf("%w: persist InRelease: %v", ErrAdoptionDBFailed, err)
+		}
+		p.inlineHash = h
+	case adoptionFormDetached:
+		rh, err := a.writeBlobBytes(ctx, p.releaseBytes)
+		if err != nil {
+			a.logger.Warn("adoption: persist Release failed",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"err", err,
+			)
+			return fmt.Errorf("%w: persist Release: %v", ErrAdoptionDBFailed, err)
+		}
+		gh, err := a.writeBlobBytes(ctx, p.sigBytes)
+		if err != nil {
+			a.logger.Warn("adoption: persist Release.gpg failed",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"err", err,
+			)
+			return fmt.Errorf("%w: persist Release.gpg: %v", ErrAdoptionDBFailed, err)
+		}
+		p.releaseHash = rh
+		p.releaseGPGHash = gh
 	}
 
 	// Step 3: parse the verified Release-style plaintext.
@@ -210,13 +311,25 @@ func (a *Adopter) Run(ctx context.Context, suite SuiteRef, inRelease []byte, eta
 		return fmt.Errorf("%w: %v", ErrAdoptionParseFailed, err)
 	}
 
-	// Step 4: insert the candidate suite_snapshot row. FK constraints
-	// resolve because step 2 stored inReleaseHash.
+	// Step 4: insert the candidate suite_snapshot row. The schema
+	// CHECK constraint enforces XOR between inrelease_hash and
+	// (release_hash + release_gpg_hash); we set whichever pair this
+	// adoption form uses. The validators (etag/lastmod) are stored
+	// alongside whichever metadata file the freshness checker
+	// conditional-GETs next time, so the inrelease_etag /
+	// inrelease_lastmod columns end up holding Release's validators
+	// in detached mode despite their column names.
 	cand := cache.SnapshotCandidate{
 		CanonicalScheme: suite.CanonicalScheme,
 		CanonicalHost:   suite.CanonicalHost,
 		SuitePath:       suite.SuitePath,
-		InReleaseHash:   &inReleaseHash,
+	}
+	switch p.form {
+	case adoptionFormInline:
+		cand.InReleaseHash = &p.inlineHash
+	case adoptionFormDetached:
+		cand.ReleaseHash = &p.releaseHash
+		cand.ReleaseGPGHash = &p.releaseGPGHash
 	}
 	if etag != "" {
 		v := etag
@@ -253,16 +366,32 @@ func (a *Adopter) Run(ctx context.Context, suite SuiteRef, inRelease []byte, eta
 		})
 	}
 
-	// Step 6: metadata-self snapshot_member row for InRelease itself.
-	// Without this the §6.1 snapshot-scoped lookup would 404 on the
-	// very URL apt fetches first. Detached mode (when added) inserts
-	// metadata-self rows for both Release and Release.gpg here.
-	memberRows = append(memberRows, cache.SnapshotMember{
-		SnapshotID:     snapshotID,
-		Path:           "InRelease",
-		BlobHash:       inReleaseHash,
-		DeclaredSHA256: inReleaseHash,
-	})
+	// Step 6: metadata-self snapshot_member row(s). Without these
+	// the §6.1 snapshot-scoped lookup would 404 on the very URLs
+	// apt fetches first. Inline mode contributes one row (InRelease);
+	// detached mode contributes two (Release, Release.gpg).
+	switch p.form {
+	case adoptionFormInline:
+		memberRows = append(memberRows, cache.SnapshotMember{
+			SnapshotID:     snapshotID,
+			Path:           "InRelease",
+			BlobHash:       p.inlineHash,
+			DeclaredSHA256: p.inlineHash,
+		})
+	case adoptionFormDetached:
+		memberRows = append(memberRows, cache.SnapshotMember{
+			SnapshotID:     snapshotID,
+			Path:           "Release",
+			BlobHash:       p.releaseHash,
+			DeclaredSHA256: p.releaseHash,
+		})
+		memberRows = append(memberRows, cache.SnapshotMember{
+			SnapshotID:     snapshotID,
+			Path:           "Release.gpg",
+			BlobHash:       p.releaseGPGHash,
+			DeclaredSHA256: p.releaseGPGHash,
+		})
+	}
 
 	// Step 7: by-hash alias rows. apt's Acquire-By-Hash clients fetch
 	// from <suite>/<component>/by-hash/SHA256/<declared_sha256>; a
@@ -311,11 +440,26 @@ func (a *Adopter) Run(ctx context.Context, suite SuiteRef, inRelease []byte, eta
 		"canonical_host", suite.CanonicalHost,
 		"suite_path", suite.SuitePath,
 		"snapshot_id", snapshotID,
+		"form", formName(p.form),
 		"member_count", len(members),
 		"alias_count", len(aliasSeen),
 		"package_hash_count", len(packageHashes),
 	)
 	return nil
+}
+
+// formName renders an adoptionForm as a stable string suitable for
+// structured logs. Operators pivot adoption_success on this to track
+// per-suite form drift over time.
+func formName(f adoptionForm) string {
+	switch f {
+	case adoptionFormInline:
+		return "inline"
+	case adoptionFormDetached:
+		return "detached"
+	default:
+		return "unknown"
+	}
 }
 
 // adoptMember handles step 5 for one declared member: try pool reuse

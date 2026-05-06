@@ -196,6 +196,14 @@ func (v *chaos2GateVerifier) VerifyInline(ctx context.Context, suite freshness.S
 	return nil, errChaos2UntrustedSigner
 }
 
+// VerifyDetached is unused by this inline-mode forgery test. The stub
+// rejects unconditionally — if a future caller routes a detached
+// adoption through this gate, they should write a dedicated detached
+// forgery test rather than reuse this one.
+func (v *chaos2GateVerifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error) {
+	return nil, errChaos2UntrustedSigner
+}
+
 func bytesEqualForTest(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false

@@ -587,6 +587,10 @@ func (chaos2PassVerifier) VerifyInline(ctx context.Context, suite freshness.Suit
 	return in, nil
 }
 
+func (chaos2PassVerifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error) {
+	return releaseBytes, nil
+}
+
 // chaos2RewritingFetcher is the AdoptionFetcher seam. The Adopter's
 // buildMemberURL produces port-less URLs ("http://127.0.0.1/...")
 // because canonicalize strips the port from the cache-key host —
