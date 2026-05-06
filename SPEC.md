@@ -86,7 +86,7 @@ Each `[[mirror]]` config entry maps a `prefix` (e.g. `/ubuntu`) to an `upstream`
 
 ### 2.5 Range requests
 
-- **Inbound:** the cache honors `Range` requests against any cached blob. Spec: RFC 7233 single-range only (no multipart) for Phase 1.
+- **Inbound:** the cache honors `Range` requests against any cached blob via `net/http`'s `http.ServeContent`, which handles single ranges and multipart `byte-ranges` per RFC 7233. apt itself never sends multi-range requests, so the multipart path is a free side-effect of the standard library rather than a deliberate Phase 1 feature.
 - **Outbound:** upstream fetches use Range to resume after transient failures. See §6.3.
 
 ### 2.6 HTTP methods
@@ -170,7 +170,12 @@ PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE blob (
-  hash         TEXT PRIMARY KEY,             -- sha256 hex (lowercase, 64 chars)
+  hash         TEXT PRIMARY KEY
+                 CHECK (length(hash) = 64 AND hash NOT GLOB '*[^0-9a-f]*'),
+                                             -- sha256 hex (lowercase, 64 chars). The CHECK constraint
+                                             -- is defense-in-depth: a malformed hash that ever reached
+                                             -- BlobPath() could traverse out of pool/, so the SQL layer
+                                             -- enforces the same predicate the Go API does.
   size         INTEGER NOT NULL,
   created_at   INTEGER NOT NULL,             -- unix epoch seconds
   refcount     INTEGER NOT NULL DEFAULT 0    -- populated for Phase 4 GC
@@ -472,7 +477,7 @@ Triggers from T1 spawn a goroutine to run the algorithm; the request that trigge
 
 ### 7.4 Periodic scheduler
 
-A single goroutine ticks every `freshness.periodic_refresh / 4` (a "fast" tick) and inspects all known suites; any suite whose `last_success_at` is older than `freshness.periodic_refresh` gets an `attempt_freshness_check`. Cooldown logic deduplicates against any T1 check that fired recently.
+A single goroutine ticks every `freshness.periodic_refresh / 4` (a "fast" tick), with a hard floor of 5s so a misconfigured tiny `periodic_refresh` cannot make the scheduler hot-loop. On each tick it inspects all known suites; any suite whose `last_success_at` is older than `freshness.periodic_refresh` gets an `attempt_freshness_check`. Cooldown logic deduplicates against any T1 check that fired recently. `periodic_refresh = 0` disables the scheduler entirely.
 
 ---
 
@@ -513,11 +518,13 @@ SQLite is opened in WAL mode with a single writer goroutine fed by a buffered ch
 ### 9.5 Graceful shutdown
 
 On SIGTERM/SIGINT:
-1. Stop accepting new connections.
-2. Wait up to 30s for in-flight requests to drain.
-3. Cancel any in-flight upstream fetches (their writes to `tmp/` will be discarded).
-4. Flush SQLite.
-5. Exit.
+1. Stop accepting new connections (`http.Server.Shutdown` on the plain and TLS listeners concurrently — sequential shutdowns would let the second listener keep accepting while the first drained).
+2. Wait up to 30s for in-flight requests to drain under the same deadline.
+3. Force-close any connection that did not drain within the budget. A slow client wedged inside `http.ServeContent` would otherwise hold the response goroutine open and block step 4 indefinitely; this step bounds slow-client shutdown by the drain budget.
+4. Stop the periodic freshness scheduler so it does not dispatch new checks against a handler that is about to drain its in-flight goroutines.
+5. Cancel any in-flight upstream fetches (their writes to `tmp/` will be discarded) and wait for the handler's tracked goroutines to exit.
+6. Flush SQLite (the cache writer goroutine drains its queue, then the DB handle closes).
+7. Exit.
 
 In-progress downloads in `tmp/` are NOT preserved across restarts — they're cleaned up on next start (§4.2).
 
@@ -544,7 +551,7 @@ Plus structured logs for:
 - **Retry-on-transient-failure:** `fetch retry` Info per retry attempt with `attempt`, `err`, `host`.
 - **Blob writes:** `blob written` Debug on successful blob finalize with `hash`, `size_bytes`.
 - **Schema migrations:** `schema migrated` Info per applied migration with `from`, `to`. `schema current` Debug when DB is already at head.
-- **Startup config dump:** `apt-cacher-ultra starting` Info with `version`, `listen`, `listen_tls`, `cache_dir`, `upstream_*` (timeouts, max_retries, max_concurrent_per_host), `freshness_*` (cooldown, periodic_refresh), `allowed_host_regex`, `deny_target_ranges`.
+- **Startup config dump:** `apt-cacher-ultra starting` Info with `version`, `listen`, `listen_tls`, `cache_dir`, `upstream_connect_timeout`, `upstream_total_timeout`, `upstream_idle_read_timeout`, `upstream_max_retries`, `upstream_max_concurrent_per_host`, `upstream_allowed_host_regex`, `upstream_deny_target_ranges`, `freshness_cooldown`, `freshness_periodic_refresh`, `serve_stale_when_upstream_down`, `log_format`, `log_level`. A single boot log line tells the operator exactly which policy this process is running under.
 
 Metrics are deferred to Phase 5.
 
@@ -628,33 +635,39 @@ Implemented under `e2e/`. The `upstream` service bakes a `hello-acu_1.0_amd64.de
 
 ```
 apt-cacher-ultra/
-  cmd/apt-cacher-ultra/main.go
+  cmd/apt-cacher-ultra/main.go    # entry: config load, signal handling, listener wiring, graceful shutdown
   internal/
-    cache/        # disk + SQLite cache
-    config/       # TOML loader + validation
-    fetch/        # upstream HTTP client (deadlines, Range, retries)
-    freshness/    # per-suite freshness scheduler
-    proxy/        # HTTP server, URL parsing, Remap
-    server/       # wiring & lifecycle
-  testutil/       # FakeUpstream, chaos harness, fixtures
+    cache/        # disk pool + SQLite (single writer goroutine, WAL mode)
+    config/       # TOML loader, defaults, validation
+    fetch/        # upstream HTTP client: allowlist, deny CIDRs, Range retries, conditional GET
+    freshness/    # per-suite freshness checker + periodic scheduler
+    handler/      # http.Handler tying parser+cache+fetch together (cache-hit fast path, singleflight miss)
+    hostsem/      # per-canonical-host semaphore shared between handler and freshness
+    proxy/        # URL parsing, Remap canonicalization, mirror-mode dispatch, metadata classification
+  e2e/
+    run.sh                          # SPEC §12.4 driver
+    docker-compose.yml              # mock upstream + cache + ubuntu apt client
+    Dockerfile.{cache,client,upstream}
+    cache.toml                      # cache config used inside the e2e container
+    deb/                            # SPEC §14 step 3 .deb install validation per Ubuntu LTS
   packaging/
     nfpm.yaml
     systemd/apt-cacher-ultra.service
     config/config.toml.default
+    scripts/{preinstall,postinstall,preremove,postremove}.sh
   Makefile
-  .golangci.yaml
   go.mod
   README.md
   SPEC.md         # this file
-  NOTES.md        # Phase 0 lessons-learned (separate doc)
 ```
 
 - Go module path: `github.com/linsomniac/apt-cacher-ultra`.
 - SQLite: `modernc.org/sqlite` (pure Go) so the `.deb` ships a single static binary, no cgo, no system libsqlite dependency.
 - Logging: `log/slog`.
-- Linting: `golangci-lint` with a strict config including `errcheck`, `staticcheck`, `gosimple`, `gocritic`, `revive`.
-- Packaging: `nfpm` for `.deb` build.
-- CI: GitHub Actions running `go test ./...`, `golangci-lint`, the chaos test, and the docker-compose end-to-end test.
+- Linting: `golangci-lint` is wired through `make lint` and a CI job (pinned version); the repo currently runs the tool's default rule set rather than a checked-in `.golangci.yaml`. Tightening to a strict config is a Phase 1 polish item, not a blocker.
+- Packaging: `nfpm` for `.deb` build via `make deb`.
+- CI: GitHub Actions runs four jobs — `go vet` + `go test -race ./...` (which includes the chaos test §12.3), `golangci-lint`, the docker-compose end-to-end test (§12.4), and the `.deb` install validation matrix (§14 step 3).
+- Test scaffolding lives next to its consumers (in-package `*_test.go` helpers and the `e2e/` tree). There is no top-level `testutil/` package; an earlier draft of this section anticipated one but the chaos harness and `FakeUpstream` ended up colocated with `internal/handler/` instead.
 
 ---
 
