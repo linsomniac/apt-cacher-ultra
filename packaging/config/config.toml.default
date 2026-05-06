@@ -38,6 +38,11 @@ deny_target_ranges = [
 [freshness]
 cooldown          = "60s"
 periodic_refresh  = "15m"
+# Cap on adoption goroutines running concurrently across the whole
+# cache (SPEC2 §9.3.1). Each adoption pre-fetches every member of a
+# suite's InRelease before flipping the snapshot pointer, so this
+# bounds total upstream pressure during a refresh storm. 0 = unlimited.
+max_concurrent_adoptions = 2
 
 # Phase 2 atomic-snapshot adoption (SPEC2 §7.5).
 #
@@ -73,6 +78,23 @@ require_pinned_signer = false
 #   # 40-char uppercase hex; long-form fingerprints only.
 #   # "F6ECB3762474EDA9D21B7022871920D1991BC93C",
 # ]
+
+# Phase 2 at-rest integrity scanner (SPEC2 §6.5 / §12.5).
+#
+# Re-hashes pool blobs on a slow ticker and evicts any whose on-disk
+# bytes no longer match their filename hash — the bytes the cache
+# wrote and verified at fetch time may rot later (bit flip, fs bug,
+# manual tampering, partial restore). On mismatch the blob is removed
+# and an at_rest_corruption Error is logged with the snapshot it
+# belonged to; the next request re-fetches and re-validates.
+#
+# The scan only walks blobs reachable from a current snapshot — it
+# never races a future Phase 4 GC that reaps refcount=0 orphans.
+# Workers cap parallelism so a multi-GiB pool/ doesn't starve
+# request handling.
+[integrity]
+validate_at_rest_interval = "24h"  # 0 disables the scanner entirely
+validate_at_rest_workers  = 4      # must be >= 1 when interval > 0
 
 [serve]
 serve_stale_when_upstream_down = true
