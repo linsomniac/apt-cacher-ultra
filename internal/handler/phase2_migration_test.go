@@ -157,6 +157,20 @@ func TestPhase2Migration_V1ToV2EndToEnd(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("trigger adoption: status=%d body=%q", rec.Code, rec.Body.String())
 	}
+	// The trigger request itself must still return A's bytes — the
+	// migrated v1 url_path row is the trust anchor until adoption
+	// commits, and adoption fires asynchronously after the response
+	// is sent. A regression that promoted unverified upstream bytes
+	// into the response body during the trigger request would surface
+	// here as a "got B's bytes for the trigger" failure.
+	if got := rec.Body.Bytes(); !bytesEqualForTest(got, snapA.inRelease) {
+		t.Errorf("trigger adoption: body=%d bytes, want A's InRelease (%d bytes) — adoption appears to have leaked unverified B bytes",
+			len(got), len(snapA.inRelease))
+	}
+	if got := rec.Header().Get("X-Cache-Snapshot"); got != "" {
+		t.Errorf("trigger adoption: X-Cache-Snapshot=%q, want empty (adoption fires async after response is sent)",
+			got)
+	}
 	if err := waitForMigrationFlip(t, stack, upstreamURL, srv.URL, 15*time.Second); err != nil {
 		t.Fatalf("adoption flip never happened: %v", err)
 	}
@@ -196,6 +210,46 @@ func TestPhase2Migration_V1ToV2EndToEnd(t *testing.T) {
 				p, got, wantSnapshotID)
 		}
 	}
+
+	// Post-adoption .deb defense: the migrated v1 url_path row for
+	// pkg1 still points at A's blob, but B's snapshot's package_hash
+	// now declares B's SHA256 for the same path. SPEC2 §6.1 step 5
+	// says tryURLPathHit must detect the divergence and evict the
+	// stale row, then the §6.2 miss path refetches B's bytes from
+	// upstream, validates them against B's declared hash, and stores
+	// the new url_path -> B mapping. First request: X-Cache=MISS,
+	// body=B's. Follow-up: X-Cache=HIT, body=B's, url_path now
+	// pointing at B's blob.
+	debPath := "/ubuntu/" + chaos2DebRels[0]
+	wantDeb := snapB.debBodies[chaos2DebRels[0]]
+
+	rec = httptest.NewRecorder()
+	stack.handler.ServeHTTP(rec, proxyReq("GET", srv.URL, debPath))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("post-adoption deb refetch: status=%d body=%q",
+			rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.Bytes(); !bytesEqualForTest(got, wantDeb) {
+		t.Errorf("post-adoption deb refetch: body=%d bytes, want B's %d bytes — package_hash defense did not refetch B",
+			len(got), len(wantDeb))
+	}
+	if got := rec.Header().Get("X-Cache"); got != "MISS" {
+		t.Errorf("post-adoption deb refetch: X-Cache=%q, want MISS (stale A-rooted url_path row should have been evicted, forcing miss-path refetch)", got)
+	}
+
+	rec = httptest.NewRecorder()
+	stack.handler.ServeHTTP(rec, proxyReq("GET", srv.URL, debPath))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("post-adoption deb second hit: status=%d body=%q",
+			rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.Bytes(); !bytesEqualForTest(got, wantDeb) {
+		t.Errorf("post-adoption deb second hit: body=%d bytes, want B's %d bytes",
+			len(got), len(wantDeb))
+	}
+	if got := rec.Header().Get("X-Cache"); got != "HIT" {
+		t.Errorf("post-adoption deb second hit: X-Cache=%q, want HIT (refetched url_path row should now satisfy package_hash and serve from cache)", got)
+	}
 }
 
 // buildV1MigrationFixture creates a cache_dir at v1 schema with
@@ -217,7 +271,7 @@ func buildV1MigrationFixture(t *testing.T, upstream *url.URL, snap *chaos2Snapsh
 	// and do the v1 setup manually. The DDL is duplicated from
 	// cache.migrations[0] (frozen Phase 1 schema; SPEC §4.3).
 	dbPath := filepath.Join(dir, "cache.db")
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(ON)")
+	db, err := sql.Open("sqlite", buildSQLiteDSNForTest(dbPath, false))
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
@@ -306,7 +360,7 @@ func buildV1MigrationFixture(t *testing.T, upstream *url.URL, snap *chaos2Snapsh
 func readSchemaVersionForTest(t *testing.T, dir string) int {
 	t.Helper()
 	dbPath := filepath.Join(dir, "cache.db")
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(ON)")
+	db, err := sql.Open("sqlite", buildSQLiteDSNForTest(dbPath, true))
 	if err != nil {
 		t.Fatalf("readSchemaVersionForTest: open: %v", err)
 	}
@@ -316,6 +370,26 @@ func readSchemaVersionForTest(t *testing.T, dir string) int {
 		t.Fatalf("readSchemaVersionForTest: query: %v", err)
 	}
 	return v
+}
+
+// buildSQLiteDSNForTest assembles a sqlite file: DSN through net/url
+// so a path containing metacharacters (`?`, `#`, spaces) is
+// percent-encoded rather than hijacking DSN parsing. Mirrors
+// cache.openDB's pragma-via-RawQuery construction. readOnly attaches
+// mode=ro for DSNs that only read.
+//
+// AIDEV-NOTE: keep the pragma surface narrow — these test helpers do
+// not need WAL/synchronous tuning; foreign_keys(ON) matches the
+// production behavior, and mode=ro is a defense for the
+// readSchemaVersionForTest helper which only reads.
+func buildSQLiteDSNForTest(path string, readOnly bool) string {
+	q := url.Values{}
+	q.Add("_pragma", "foreign_keys(ON)")
+	if readOnly {
+		q.Add("mode", "ro")
+	}
+	u := url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}
+	return u.String()
 }
 
 // newPhase2MigrationStack wires the handler stack against an
