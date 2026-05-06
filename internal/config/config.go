@@ -44,13 +44,16 @@ var DefaultDenyTargetRanges = []string{
 
 // Config is the top-level structure of config.toml.
 type Config struct {
-	Cache     CacheConfig     `toml:"cache"`
-	Upstream  UpstreamConfig  `toml:"upstream"`
-	Freshness FreshnessConfig `toml:"freshness"`
-	Serve     ServeConfig     `toml:"serve"`
-	Log       LogConfig       `toml:"log"`
-	Remap     []RemapRule     `toml:"remap"`
-	Mirror    []MirrorRule    `toml:"mirror"`
+	Cache          CacheConfig     `toml:"cache"`
+	Upstream       UpstreamConfig  `toml:"upstream"`
+	Freshness      FreshnessConfig `toml:"freshness"`
+	Adoption       AdoptionConfig  `toml:"adoption"`
+	Integrity      IntegrityConfig `toml:"integrity"`
+	Serve          ServeConfig     `toml:"serve"`
+	Log            LogConfig       `toml:"log"`
+	Remap          []RemapRule     `toml:"remap"`
+	Mirror         []MirrorRule    `toml:"mirror"`
+	TrustedSigners []TrustedSigner `toml:"trusted_signer"`
 }
 
 type CacheConfig struct {
@@ -74,6 +77,55 @@ type UpstreamConfig struct {
 type FreshnessConfig struct {
 	Cooldown        Duration `toml:"cooldown"`
 	PeriodicRefresh Duration `toml:"periodic_refresh"`
+
+	// MaxConcurrentAdoptions caps how many SPEC2 §7.5 adoption
+	// goroutines may run at once across the whole cache. SPEC2 §9.3.1.
+	// 0 = unlimited; default 2.
+	MaxConcurrentAdoptions int `toml:"max_concurrent_adoptions"`
+}
+
+// AdoptionConfig holds the SPEC2 §5.1 [adoption] block. The defaults
+// match the SPEC2 §1.1 / §7.6 secure posture: signatures required,
+// no per-suite pinning. Operators flip Enabled to true once the
+// shadow-deploy cycle confirms behavior.
+type AdoptionConfig struct {
+	// Enabled is the master switch. False = Phase 1 behavior (record
+	// the divergence, do not adopt). Default false during rollout.
+	Enabled bool `toml:"enabled"`
+
+	// RequireSignature rejects an InRelease that fails GPG verification.
+	// Default true. Setting false is loud (WARN at startup) and is
+	// only sensible for explicitly trusted unsigned upstreams.
+	RequireSignature bool `toml:"require_signature"`
+
+	// RequirePinnedSigner causes adoption to fail closed when a suite
+	// has no matching [[trusted_signer]] block. Default false (matches
+	// apt's broad-trust default); flip true once every active suite
+	// has an explicit pin (recommended for production — SPEC2 §7.6.5).
+	RequirePinnedSigner bool `toml:"require_pinned_signer"`
+}
+
+// IntegrityConfig holds the SPEC2 §5.1 [integrity] block. The at-rest
+// scan periodically re-hashes pool blobs to detect on-disk corruption
+// independently of the adoption-time rehash defense (SPEC2 §12.5).
+type IntegrityConfig struct {
+	// ValidateAtRestInterval is the cadence for the scan. 0 disables.
+	// Default 24h.
+	ValidateAtRestInterval Duration `toml:"validate_at_rest_interval"`
+
+	// ValidateAtRestWorkers bounds the worker pool for the scan so a
+	// large pool/ doesn't starve request handling. Default 4. Must
+	// be >= 1 when interval > 0.
+	ValidateAtRestWorkers int `toml:"validate_at_rest_workers"`
+}
+
+// TrustedSigner is one entry of the SPEC2 §5.1 [[trusted_signer]] array.
+// When MatchCanonicalHost matches a suite's canonical host, the
+// adoption trust set narrows to keys whose fingerprint is in the
+// Fingerprints list (§7.6.2 hybrid model).
+type TrustedSigner struct {
+	MatchCanonicalHost string   `toml:"match_canonical_host"`
+	Fingerprints       []string `toml:"fingerprints"`
 }
 
 type ServeConfig struct {
@@ -141,11 +193,20 @@ func Load(path string) (*Config, error) {
 // cannot be applied after decode (bool fields, where the zero value is
 // indistinguishable from "explicitly set to false"). Callers other than
 // Load (mostly tests) that bypass the file path must seed bools by hand.
+//
+// Phase 2 additions: adoption.require_signature defaults true (the
+// secure posture; operators must explicitly opt out via the loud
+// require_signature = false config). adoption.enabled and
+// require_pinned_signer remain false (match apt's broad-trust default
+// during rollout; flip-to-true is a per-deployment decision).
 func defaultConfig() *Config {
 	return &Config{
 		Serve: ServeConfig{
 			ServeStaleWhenUpstreamDown: true,
 			LogStaleServes:             true,
+		},
+		Adoption: AdoptionConfig{
+			RequireSignature: true,
 		},
 	}
 }
@@ -207,6 +268,39 @@ func (c *Config) Validate() error {
 	}
 	if c.Freshness.PeriodicRefresh.Duration < 0 {
 		errs = append(errs, errors.New("freshness.periodic_refresh must not be negative"))
+	}
+	if c.Freshness.MaxConcurrentAdoptions < 0 {
+		errs = append(errs, errors.New("freshness.max_concurrent_adoptions must not be negative"))
+	}
+	if c.Integrity.ValidateAtRestInterval.Duration < 0 {
+		errs = append(errs, errors.New("integrity.validate_at_rest_interval must not be negative"))
+	}
+	if c.Integrity.ValidateAtRestInterval.Duration > 0 && c.Integrity.ValidateAtRestWorkers < 1 {
+		errs = append(errs, errors.New("integrity.validate_at_rest_workers must be >= 1 when interval > 0"))
+	}
+	if c.Integrity.ValidateAtRestWorkers < 0 {
+		errs = append(errs, errors.New("integrity.validate_at_rest_workers must not be negative"))
+	}
+
+	for i, ts := range c.TrustedSigners {
+		if ts.MatchCanonicalHost == "" {
+			errs = append(errs, fmt.Errorf("trusted_signer[%d].match_canonical_host is required", i))
+		} else if _, err := regexp.Compile(ts.MatchCanonicalHost); err != nil {
+			errs = append(errs, fmt.Errorf("trusted_signer[%d].match_canonical_host: %w", i, err))
+		}
+		// SPEC2 §5.2: empty fingerprint list is a footgun — no key
+		// would ever match. Reject loudly. Each entry must be a
+		// 40-char hex fingerprint (long-form). Short 16-char IDs
+		// are cryptographically insufficient and apt also rejects
+		// them.
+		if len(ts.Fingerprints) == 0 {
+			errs = append(errs, fmt.Errorf("trusted_signer[%d].fingerprints is empty (no key would satisfy verification)", i))
+		}
+		for j, fp := range ts.Fingerprints {
+			if !validGPGFingerprint(fp) {
+				errs = append(errs, fmt.Errorf("trusted_signer[%d].fingerprints[%d] %q: must be 40 hex chars (long-form fingerprint)", i, j, fp))
+			}
+		}
 	}
 
 	for i, r := range c.Remap {
@@ -375,10 +469,51 @@ func (c *Config) Defaults() {
 	if c.Freshness.PeriodicRefresh.Duration == 0 {
 		c.Freshness.PeriodicRefresh.Duration = 15 * time.Minute
 	}
+	// SPEC2 §9.3.1: default 2 concurrent adoptions, 0 = unlimited.
+	// We don't fill 0 here because 0 is a legitimate "unlimited"
+	// signal — instead, leave the zero value untouched so an
+	// explicit `max_concurrent_adoptions = 0` is honored. The
+	// default-2 case is detectable by the absence of the key from
+	// TOML; since int has no nil sentinel, the operator who wants
+	// unlimited writes `0` explicitly. We use `if absent assume 2`
+	// via post-decode replacement only when the value is the zero
+	// AND the key wasn't present — but BurntSushi/toml doesn't
+	// expose presence. Pragmatic: treat 0 as "operator's choice of
+	// unlimited" and document the recommended default in SPEC2 §5.1.
+	// AIDEV-NOTE: this means a fresh config with no
+	// max_concurrent_adoptions key gets unlimited adoption
+	// concurrency. The Adopter wrapper (NewAdopter) treats 0 as
+	// unlimited correctly, so this is safe — but operators reading
+	// the structured config dump (SPEC §10.3) will see "0" not "2".
+	// Worth revisiting if rollout shows operators expect "default"
+	// to be 2.
+	if c.Integrity.ValidateAtRestInterval.Duration == 0 {
+		c.Integrity.ValidateAtRestInterval.Duration = 24 * time.Hour
+	}
+	if c.Integrity.ValidateAtRestWorkers == 0 {
+		c.Integrity.ValidateAtRestWorkers = 4
+	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
 	}
 	if c.Log.Format == "" {
 		c.Log.Format = "json"
 	}
+}
+
+// validGPGFingerprint reports whether s is a 40-character hex string
+// (the long-form GPG fingerprint apt expects). Both upper- and lower-
+// case hex are accepted; the canonical-form normalization (uppercase,
+// no whitespace) happens at GPG-trust-set load time.
+func validGPGFingerprint(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
 }

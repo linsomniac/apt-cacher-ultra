@@ -407,3 +407,210 @@ func TestDefaults_DoNotOverrideSet(t *testing.T) {
 		t.Errorf("max_concurrent_per_host overridden: %d", cfg.Upstream.MaxConcurrentPerHost)
 	}
 }
+
+// TestPhase2_AdoptionDefaults — defaults match SPEC2 §5.1's secure
+// posture: require_signature defaults true; enabled and
+// require_pinned_signer default false during rollout.
+func TestPhase2_AdoptionDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `[cache]
+dir = "`+dir+`"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Adoption.Enabled {
+		t.Errorf("adoption.enabled default should be false")
+	}
+	if !cfg.Adoption.RequireSignature {
+		t.Errorf("adoption.require_signature default should be true")
+	}
+	if cfg.Adoption.RequirePinnedSigner {
+		t.Errorf("adoption.require_pinned_signer default should be false")
+	}
+	if cfg.Integrity.ValidateAtRestInterval.Duration != 24*time.Hour {
+		t.Errorf("integrity.validate_at_rest_interval default = %v, want 24h",
+			cfg.Integrity.ValidateAtRestInterval.Duration)
+	}
+	if cfg.Integrity.ValidateAtRestWorkers != 4 {
+		t.Errorf("integrity.validate_at_rest_workers default = %d, want 4",
+			cfg.Integrity.ValidateAtRestWorkers)
+	}
+}
+
+// TestPhase2_AdoptionLoadsTOML — every Phase 2 key parses correctly,
+// including the [[trusted_signer]] array.
+func TestPhase2_AdoptionLoadsTOML(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `[cache]
+dir = "`+dir+`"
+
+[freshness]
+max_concurrent_adoptions = 8
+
+[adoption]
+enabled = true
+require_signature = false
+require_pinned_signer = true
+
+[integrity]
+validate_at_rest_interval = "12h"
+validate_at_rest_workers = 2
+
+[[trusted_signer]]
+match_canonical_host = '^archive\.ubuntu\.com$'
+fingerprints = ['F6ECB3762474EDA9D21B7022871920D1991BC93C']
+
+[[trusted_signer]]
+match_canonical_host = '^deb\.debian\.org$'
+fingerprints = ['648ACFD622F3D138B83D49C7DDF4D7C5C5E3A7B6', '0123456789abcdef0123456789ABCDEF01234567']
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.Freshness.MaxConcurrentAdoptions != 8 {
+		t.Errorf("max_concurrent_adoptions = %d, want 8", cfg.Freshness.MaxConcurrentAdoptions)
+	}
+	if !cfg.Adoption.Enabled || cfg.Adoption.RequireSignature || !cfg.Adoption.RequirePinnedSigner {
+		t.Errorf("adoption: %+v not parsed correctly", cfg.Adoption)
+	}
+	if cfg.Integrity.ValidateAtRestInterval.Duration != 12*time.Hour {
+		t.Errorf("interval = %v, want 12h", cfg.Integrity.ValidateAtRestInterval.Duration)
+	}
+	if cfg.Integrity.ValidateAtRestWorkers != 2 {
+		t.Errorf("workers = %d, want 2", cfg.Integrity.ValidateAtRestWorkers)
+	}
+	if len(cfg.TrustedSigners) != 2 {
+		t.Fatalf("trusted_signer count = %d, want 2", len(cfg.TrustedSigners))
+	}
+	if cfg.TrustedSigners[0].MatchCanonicalHost != `^archive\.ubuntu\.com$` {
+		t.Errorf("ts[0] regex = %q", cfg.TrustedSigners[0].MatchCanonicalHost)
+	}
+	if len(cfg.TrustedSigners[0].Fingerprints) != 1 {
+		t.Errorf("ts[0] fp count = %d", len(cfg.TrustedSigners[0].Fingerprints))
+	}
+	if len(cfg.TrustedSigners[1].Fingerprints) != 2 {
+		t.Errorf("ts[1] fp count = %d", len(cfg.TrustedSigners[1].Fingerprints))
+	}
+}
+
+func TestPhase2_RejectsBadValues(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"negative max_concurrent_adoptions",
+			"[cache]\ndir=\"%DIR%\"\n[freshness]\nmax_concurrent_adoptions = -1\n",
+			"max_concurrent_adoptions",
+		},
+		{
+			"negative validate_at_rest_interval",
+			"[cache]\ndir=\"%DIR%\"\n[integrity]\nvalidate_at_rest_interval = \"-1h\"\n",
+			"validate_at_rest_interval",
+		},
+		// AIDEV-NOTE: SPEC2 §5.2 requires
+		// `validate_at_rest_workers >= 1 when interval > 0`, but
+		// TOML's int type cannot distinguish "key absent" from
+		// "key explicitly set to 0", and Defaults() rewrites 0 to
+		// 4. So the rule is satisfied by construction for any
+		// explicit-zero config, and we don't have an exercisable
+		// rejection for it. The negative-workers case still trips
+		// the validation:
+		{
+			"negative validate_at_rest_workers",
+			"[cache]\ndir=\"%DIR%\"\n[integrity]\nvalidate_at_rest_workers = -1\n",
+			"validate_at_rest_workers",
+		},
+		{
+			"trusted_signer empty fingerprints",
+			"[cache]\ndir=\"%DIR%\"\n[[trusted_signer]]\nmatch_canonical_host = \".*\"\nfingerprints = []\n",
+			"fingerprints is empty",
+		},
+		{
+			"trusted_signer short-form fingerprint",
+			"[cache]\ndir=\"%DIR%\"\n[[trusted_signer]]\nmatch_canonical_host = \".*\"\nfingerprints = [\"DEADBEEF\"]\n",
+			"40 hex chars",
+		},
+		{
+			"trusted_signer non-hex fingerprint",
+			"[cache]\ndir=\"%DIR%\"\n[[trusted_signer]]\nmatch_canonical_host = \".*\"\nfingerprints = [\"" + strings.Repeat("Z", 40) + "\"]\n",
+			"40 hex chars",
+		},
+		{
+			"trusted_signer bad regex",
+			"[cache]\ndir=\"%DIR%\"\n[[trusted_signer]]\nmatch_canonical_host = \"(\"\nfingerprints = [\"" + strings.Repeat("a", 40) + "\"]\n",
+			"trusted_signer",
+		},
+		{
+			"trusted_signer empty match",
+			"[cache]\ndir=\"%DIR%\"\n[[trusted_signer]]\nmatch_canonical_host = \"\"\nfingerprints = [\"" + strings.Repeat("a", 40) + "\"]\n",
+			"match_canonical_host is required",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			body := strings.ReplaceAll(tc.body, "%DIR%", dir)
+			path := writeTOML(t, dir, "c.toml", body)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err %q does not contain %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// TestPhase2_MaxConcurrentZeroIsValid — operators who explicitly
+// want unlimited concurrency set 0; this must NOT be a validation
+// error (the SPEC2 §9.3.1 documented meaning is "no cap").
+func TestPhase2_MaxConcurrentZeroIsValid(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `[cache]
+dir = "`+dir+`"
+
+[freshness]
+max_concurrent_adoptions = 0
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Freshness.MaxConcurrentAdoptions != 0 {
+		t.Errorf("explicit 0 not preserved: got %d", cfg.Freshness.MaxConcurrentAdoptions)
+	}
+}
+
+// TestPhase2_GPGFingerprintCaseSensitivity — TOML accepts both upper
+// and lower hex case; canonicalization happens at trust-set load time.
+func TestPhase2_GPGFingerprintCaseSensitivity(t *testing.T) {
+	for _, fp := range []string{
+		strings.Repeat("a", 40),
+		strings.Repeat("A", 40),
+		"F6ECB3762474EDA9D21B7022871920D1991BC93C",
+		"f6ecb3762474eda9d21b7022871920d1991bc93c",
+	} {
+		if !validGPGFingerprint(fp) {
+			t.Errorf("validGPGFingerprint(%q) = false, want true", fp)
+		}
+	}
+	for _, bad := range []string{
+		"",
+		"abc",
+		strings.Repeat("a", 39),
+		strings.Repeat("a", 41),
+		strings.Repeat("g", 40),
+		"  " + strings.Repeat("a", 38),
+	} {
+		if validGPGFingerprint(bad) {
+			t.Errorf("validGPGFingerprint(%q) = true, want false", bad)
+		}
+	}
+}
