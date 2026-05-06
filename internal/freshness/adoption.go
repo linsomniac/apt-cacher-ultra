@@ -345,14 +345,35 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		v := lastmod
 		cand.InReleaseLastMod = &v
 	}
-	snapshotID, err := a.cache.InsertCandidateSnapshot(ctx, cand)
+	// AIDEV-NOTE: Steps 5-9 are content-only against snapshot_id;
+	// CommitAdoption is its own transaction guarded by adopted_at IS NULL,
+	// so retrying a reused candidate snapshot_id is safe. reused == true
+	// surfaces the "we recovered an orphaned candidate from a prior
+	// failed adoption attempt" case as a one-shot INFO so operators can
+	// see the fix is active without having to grep for absence of WARNs.
+	snapshotID, reused, err := a.cache.InsertCandidateSnapshot(ctx, cand)
 	if err != nil {
-		a.logger.Warn("adoption: insert candidate failed",
+		if errors.Is(err, cache.ErrSnapshotNaturalKeyAdopted) {
+			a.logger.Warn("adoption: natural key already adopted",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"err", err,
+			)
+		} else {
+			a.logger.Warn("adoption: insert candidate failed",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"err", err,
+			)
+		}
+		return fmt.Errorf("%w: insert candidate: %v", ErrAdoptionDBFailed, err)
+	}
+	if reused {
+		a.logger.Info("adoption: reusing orphaned candidate",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
-			"err", err,
+			"snapshot_id", snapshotID,
 		)
-		return fmt.Errorf("%w: insert candidate: %v", ErrAdoptionDBFailed, err)
 	}
 
 	// Step 5: prefetch declared members sequentially. Each member's

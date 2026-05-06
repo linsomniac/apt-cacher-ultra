@@ -1160,7 +1160,7 @@ func commitInlineSnapshot(t *testing.T, h *Handler,
 	}); err != nil {
 		t.Fatalf("PutSuiteFreshness: %v", err)
 	}
-	id, err := h.cache.InsertCandidateSnapshot(context.Background(),
+	id, _, err := h.cache.InsertCandidateSnapshot(context.Background(),
 		cache.SnapshotCandidate{
 			CanonicalScheme: scheme,
 			CanonicalHost:   canonHost,

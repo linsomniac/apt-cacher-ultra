@@ -5,12 +5,39 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	sqlite "modernc.org/sqlite"
 )
 
 // ErrSnapshotAlreadyAdopted is returned by CommitAdoption when invoked
 // on a snapshot whose adopted_at column is already set. Re-committing
 // would double-bump refcounts for every member, so the writer refuses.
 var ErrSnapshotAlreadyAdopted = errors.New("cache: snapshot already adopted")
+
+// ErrSnapshotNaturalKeyAdopted is returned by InsertCandidateSnapshot
+// when a row matching the natural key (scheme, host, suite_path,
+// COALESCE(inrelease_hash, release_hash)) already exists *and* is
+// already adopted (adopted_at IS NOT NULL). The adoption pipeline
+// surfaces this as a distinct WARN; auto-reusing an adopted row is
+// out of scope (would bypass the lifecycle and refcount accounting
+// in CommitAdoption).
+var ErrSnapshotNaturalKeyAdopted = errors.New("cache: snapshot natural key already adopted")
+
+// sqliteConstraintUnique is the extended result code SQLITE_CONSTRAINT_UNIQUE.
+// We use the literal here rather than depending on modernc.org/sqlite/lib
+// for one constant — the value is fixed by SQLite's public ABI.
+const sqliteConstraintUnique = 2067
+
+// isUniqueViolation reports whether err is a SQLite UNIQUE-constraint
+// failure. Used by InsertCandidateSnapshot to recover an existing
+// candidate id on natural-key collision instead of bailing.
+func isUniqueViolation(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	return sqliteErr.Code() == sqliteConstraintUnique
+}
 
 // InsertCandidateSnapshot inserts a fresh suite_snapshot row with
 // adopted_at = NULL and returns the auto-assigned snapshot_id. SPEC2
@@ -23,33 +50,85 @@ var ErrSnapshotAlreadyAdopted = errors.New("cache: snapshot already adopted")
 // otherwise. The schema CHECK on suite_snapshot enforces the
 // "exactly one of inline-or-detached" invariant; passing both modes
 // or all-NULL produces a constraint-violation error.
-func (c *Cache) InsertCandidateSnapshot(ctx context.Context, sc SnapshotCandidate) (int64, error) {
-	const q = `
+//
+// AIDEV-NOTE: idempotent on natural-key collision — reuses an existing
+// unadopted candidate row so a Step-5/6/7/8 failure in runShared does
+// not poison subsequent adoption attempts. The natural key
+// (scheme, host, suite_path, COALESCE(inrelease_hash, release_hash))
+// already requires "one row per (suite, content)"; this method makes
+// the API surface that fact instead of choking with a UNIQUE error.
+// reused == true on the second-and-later attempts at the same content;
+// callers can log it once for diagnostics. CommitAdoption is its own
+// transaction guarded by adopted_at IS NULL, so retrying with a reused
+// snapshot_id is safe — there can be no leftover snapshot_member rows
+// from a partial CommitAdoption (it rolls back on any internal error).
+// If a row matching the natural key is already adopted, we return
+// ErrSnapshotNaturalKeyAdopted instead — reusing an adopted row would
+// bypass the snapshot lifecycle and refcount bookkeeping.
+func (c *Cache) InsertCandidateSnapshot(ctx context.Context, sc SnapshotCandidate) (id int64, reused bool, err error) {
+	const insertQ = `
 INSERT INTO suite_snapshot
   (canonical_scheme, canonical_host, suite_path,
    inrelease_hash, inrelease_etag, inrelease_lastmod,
    release_hash, release_gpg_hash, created_at, adopted_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+	const lookupQ = `
+SELECT snapshot_id, adopted_at FROM suite_snapshot
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?
+   AND COALESCE(inrelease_hash, release_hash) = ?`
 	now := nowUnix()
-	var id int64
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		res, err := conn.ExecContext(ctx, q,
+	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		res, execErr := conn.ExecContext(ctx, insertQ,
 			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath,
 			sc.InReleaseHash, sc.InReleaseETag, sc.InReleaseLastMod,
 			sc.ReleaseHash, sc.ReleaseGPGHash, now)
-		if err != nil {
-			return fmt.Errorf("InsertCandidateSnapshot: %w", err)
+		if execErr == nil {
+			id, execErr = res.LastInsertId()
+			if execErr != nil {
+				return fmt.Errorf("InsertCandidateSnapshot: last id: %w", execErr)
+			}
+			return nil
 		}
-		id, err = res.LastInsertId()
-		if err != nil {
-			return fmt.Errorf("InsertCandidateSnapshot: last id: %w", err)
+		if !isUniqueViolation(execErr) {
+			return fmt.Errorf("InsertCandidateSnapshot: %w", execErr)
 		}
+		// Natural-key collision: the schema CHECK guarantees exactly one
+		// of inrelease_hash or release_hash is non-nil. Use the populated
+		// one to look up the existing row.
+		var coalesceHash string
+		switch {
+		case sc.InReleaseHash != nil:
+			coalesceHash = *sc.InReleaseHash
+		case sc.ReleaseHash != nil:
+			coalesceHash = *sc.ReleaseHash
+		default:
+			// No hash supplied — collision came from somewhere else (or
+			// the caller violated the inline-xor-detached invariant).
+			// Surface the original error untouched.
+			return fmt.Errorf("InsertCandidateSnapshot: %w", execErr)
+		}
+		var (
+			existingID int64
+			adoptedAt  sql.NullInt64
+		)
+		lookupErr := conn.QueryRowContext(ctx, lookupQ,
+			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath, coalesceHash).
+			Scan(&existingID, &adoptedAt)
+		if lookupErr != nil {
+			return fmt.Errorf("InsertCandidateSnapshot: lookup colliding row: %w (orig: %v)",
+				lookupErr, execErr)
+		}
+		if adoptedAt.Valid {
+			return fmt.Errorf("%w: snapshot_id=%d", ErrSnapshotNaturalKeyAdopted, existingID)
+		}
+		id = existingID
+		reused = true
 		return nil
 	})
-	if err != nil {
-		return 0, err
+	if werr != nil {
+		return 0, false, werr
 	}
-	return id, nil
+	return id, reused, nil
 }
 
 // CommitAdoption performs the SPEC2 §7.5.1 atomic flip transaction:

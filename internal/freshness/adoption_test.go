@@ -573,6 +573,71 @@ func TestAdopter_MemberFetchFailure(t *testing.T) {
 	}
 }
 
+// TestAdopter_OrphanedCandidateReused exercises the
+// idx_suite_snapshot_natural fix end-to-end through runShared:
+//
+//  1. First Run: member fetch fails. Step 4 leaves an orphaned
+//     candidate row (adopted_at IS NULL) and Step 5 returns
+//     ErrAdoptionMemberFetchFailed.
+//  2. Second Run with the SAME release text (same content hash, so
+//     same natural key): Step 4 must reuse the orphaned candidate
+//     instead of failing with a UNIQUE constraint error. With the
+//     member fetch now seeded, the run proceeds through
+//     CommitAdoption and the suite ends up adopted.
+//
+// Without the fix, the second Run would fail with the
+// "UNIQUE constraint failed: index 'idx_suite_snapshot_natural'"
+// error from production logs.
+func TestAdopter_OrphanedCandidateReused(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	debHash := strings.Repeat("a", 64)
+	pkgs := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.deb": debHash,
+	})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+	})
+
+	// Step 1: first attempt fails in member prefetch (no canned response).
+	err := env.adopter.Run(ctx, env.suite, releaseText, "", "")
+	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
+		t.Fatalf("first Run: want ErrAdoptionMemberFetchFailed, got %v", err)
+	}
+	// suite_freshness has no current_snapshot_id yet — only the orphan.
+	if sf, err := env.cache.GetSuiteFreshness(ctx,
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath,
+	); err == nil && sf.CurrentSnapshotID != nil {
+		t.Fatalf("after first Run: current_snapshot_id should be NULL, got %d",
+			*sf.CurrentSnapshotID)
+	}
+
+	// Step 2: seed the fetcher and re-run with the same release text.
+	// Without the fix this fails with ErrAdoptionDBFailed wrapping a
+	// UNIQUE-constraint error from idx_suite_snapshot_natural.
+	env.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages", pkgs)
+	if err := env.adopter.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("second Run: want success (orphan reuse), got %v", err)
+	}
+
+	sf, err := env.cache.GetSuiteFreshness(ctx,
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil {
+		t.Fatalf("after second Run: current_snapshot_id is NULL — adoption did not commit")
+	}
+	snap, err := env.cache.GetSuiteSnapshot(ctx, *sf.CurrentSnapshotID)
+	if err != nil {
+		t.Fatalf("GetSuiteSnapshot: %v", err)
+	}
+	if snap.AdoptedAt == nil {
+		t.Errorf("snapshot %d adopted_at IS NULL after successful second Run",
+			snap.SnapshotID)
+	}
+}
+
 func TestAdopter_MemberHashMismatch(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	// Same length, different bytes — guarantees the hash check (not

@@ -79,7 +79,7 @@ func commitSnapshot(
 ) int64 {
 	t.Helper()
 	ctx := context.Background()
-	id, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	id, _, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
 		CanonicalScheme: scheme,
 		CanonicalHost:   host,
 		SuitePath:       suitePath,
@@ -279,7 +279,7 @@ func TestScanOnce_DisplacedSnapshotNotScanned(t *testing.T) {
 	// Adopt a new snapshot (CommitAdoption flips current_snapshot_id).
 	relNew := seedBlob(t, c, []byte("noble InRelease v2"))
 	pkgNew := seedBlob(t, c, []byte("noble Packages v2"))
-	idNew, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	idNew, _, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite,
 		InReleaseHash: &relNew,
 	})
