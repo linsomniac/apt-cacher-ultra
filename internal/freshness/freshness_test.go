@@ -28,6 +28,7 @@ type fakeCache struct {
 	mu        sync.Mutex
 	suites    map[string]cache.SuiteFreshness // key: scheme|host|path
 	urls      map[string]cache.URLPath        // key: scheme|host|path
+	snapshots map[int64]cache.SuiteSnapshot   // key: snapshot_id
 	listErr   error
 	getErr    error
 	putErr    error
@@ -38,8 +39,9 @@ type fakeCache struct {
 
 func newFakeCache() *fakeCache {
 	return &fakeCache{
-		suites: make(map[string]cache.SuiteFreshness),
-		urls:   make(map[string]cache.URLPath),
+		suites:    make(map[string]cache.SuiteFreshness),
+		urls:      make(map[string]cache.URLPath),
+		snapshots: make(map[int64]cache.SuiteSnapshot),
 	}
 }
 
@@ -97,6 +99,23 @@ func (f *fakeCache) LookupURL(ctx context.Context, scheme, host, path string) (*
 	}
 	cp := u
 	return &cp, nil
+}
+
+func (f *fakeCache) GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*cache.SuiteSnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.snapshots[snapshotID]
+	if !ok {
+		return nil, cache.ErrNotFound
+	}
+	cp := s
+	return &cp, nil
+}
+
+func (f *fakeCache) putSnapshot(s cache.SuiteSnapshot) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snapshots[s.SnapshotID] = s
 }
 
 func (f *fakeCache) putURL(u cache.URLPath) {
@@ -783,6 +802,184 @@ func TestCheck_4xxFromUpstream_BumpsCheckOnly(t *testing.T) {
 	}
 	if got.LastSuccessAt != nil {
 		t.Errorf("last_success_at = %v, want nil", got.LastSuccessAt)
+	}
+}
+
+// TestCheck_UsesSnapshotHashForComparison verifies the SPEC2 wiring:
+// when a suite has CurrentSnapshotID set, the body comparison uses
+// suite_snapshot.inrelease_hash, not url_path.blob_hash. Without this
+// branch, the freshness check after a successful adoption would see
+// stale url_path data and re-trigger adoption forever.
+func TestCheck_UsesSnapshotHashForComparison(t *testing.T) {
+	fc := newFakeCache()
+	body := []byte("post-adoption InRelease body")
+	bodyHash := hashOf(body)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	now := time.Unix(8888, 0)
+	then := now.Add(-1 * time.Hour).Unix()
+
+	// Pre-seed: url_path.blob_hash points at a STALE pre-adoption blob.
+	stale := strings.Repeat("0", 64)
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/dists/noble/InRelease", BlobHash: &stale,
+		UpstreamURL: srv.URL + "/dists/noble/InRelease", IsMetadata: true,
+	})
+	// Pre-seed suite_freshness with CurrentSnapshotID pointing at the
+	// snapshot whose inrelease_hash IS bodyHash (post-adoption shape).
+	snapID := int64(42)
+	fc.putSuite(cache.SuiteFreshness{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		SuitePath:         "/dists/noble",
+		LastSuccessAt:     &then,
+		CurrentSnapshotID: &snapID,
+	})
+	fc.putSnapshot(cache.SuiteSnapshot{
+		SnapshotID:    snapID,
+		InReleaseHash: &bodyHash,
+	})
+
+	c, err := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Logger: discardLogger(),
+		now:    func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
+
+	got, ok := fc.suite("http", "127.0.0.1", "/dists/noble")
+	if !ok {
+		t.Fatal("suite_freshness was not persisted; check did not run to success")
+	}
+	// Body matched snapshot's inrelease_hash → "unchanged" branch →
+	// inrelease_change_seen_at must remain nil.
+	if got.InReleaseChangeSeenAt != nil {
+		t.Errorf("expected unchanged with snapshot match; change_seen_at=%v",
+			got.InReleaseChangeSeenAt)
+	}
+}
+
+// TestCheck_NoAdopter_ChangeOnlyLogged verifies Phase 1 behavior is
+// unchanged when no Adopter is wired in.
+func TestCheck_NoAdopter_ChangeOnlyLogged(t *testing.T) {
+	fc := newFakeCache()
+	body := []byte("new InRelease bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	stale := strings.Repeat("0", 64)
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/dists/noble/InRelease", BlobHash: &stale,
+		UpstreamURL: srv.URL + "/dists/noble/InRelease", IsMetadata: true,
+	})
+	now := time.Unix(9000, 0)
+	c, _ := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Logger: discardLogger(),
+		now:    func() time.Time { return now },
+	})
+	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
+	c.WaitForAdoptions() // no-op without Adopter, but exercises the API
+
+	got, ok := fc.suite("http", "127.0.0.1", "/dists/noble")
+	if !ok {
+		t.Fatal("suite_freshness was not persisted")
+	}
+	if got.InReleaseChangeSeenAt == nil {
+		t.Error("expected change_seen_at to be set on observed change")
+	}
+}
+
+// TestCheck_AdopterInvokedOnChange verifies the wire-in: when the
+// freshness check observes an upstream change, Check hands off to
+// the Adopter via the goroutine + mutex handoff.
+func TestCheck_AdopterInvokedOnChange(t *testing.T) {
+	fc := newFakeCache()
+	memberBody := []byte("member content")
+	memberHash := hashOf(memberBody)
+	releaseText := fmt.Sprintf(
+		"Origin: Test\nSuite: noble\nSHA256:\n %s %d main/Sources\n",
+		memberHash, len(memberBody))
+	body := []byte(releaseText)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	stale := strings.Repeat("0", 64)
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/dists/noble/InRelease", BlobHash: &stale,
+		UpstreamURL: srv.URL + "/dists/noble/InRelease", IsMetadata: true,
+	})
+
+	// Real *cache.Cache for the Adopter side-effect; fakeCache for
+	// the Checker. They don't share state.
+	dir := t.TempDir()
+	realCache, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = realCache.Close() })
+
+	// Adopter's fetcher serves member content at the URL the Adopter
+	// will construct from the suite. The Adopter builds URLs from
+	// suite.CanonicalScheme + suite.CanonicalHost + suite.SuitePath
+	// + memberPath — so no port (the Checker passes "127.0.0.1" as
+	// the canonical host, port-less per Phase 1's host allowlist).
+	// httptest's actual port is irrelevant here because the
+	// AdoptionFetcher is a fake that matches URL strings, not a real
+	// network client.
+	memberURL := "http://127.0.0.1/dists/noble/main/Sources"
+	memberFetcher := newFakeFetcher()
+	memberFetcher.put(memberURL, memberBody)
+
+	adopter, err := NewAdopter(AdoptionConfig{
+		Cache:       realCache,
+		Fetcher:     memberFetcher,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Logger:  discardLogger(),
+		now:     func() time.Time { return time.Unix(11000, 0) },
+		Adopter: adopter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
+	c.WaitForAdoptions()
+
+	// The Adopter wrote a suite_snapshot row to the real cache.
+	snap, err := realCache.GetSuiteSnapshot(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("expected adopter to have created snapshot 1: %v", err)
+	}
+	if snap.AdoptedAt == nil {
+		t.Errorf("snapshot adopted_at not stamped — adoption goroutine didn't reach commit")
+	}
+	if snap.InReleaseHash == nil || *snap.InReleaseHash != hashOf(body) {
+		t.Errorf("snapshot.inrelease_hash mismatch: got %v, want %s",
+			snap.InReleaseHash, hashOf(body))
 	}
 }
 

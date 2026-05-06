@@ -50,6 +50,7 @@ type Cache interface {
 	PutSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error
 	ListSuites(ctx context.Context) ([]cache.SuiteFreshness, error)
 	LookupURL(ctx context.Context, scheme, host, path string) (*cache.URLPath, error)
+	GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*cache.SuiteSnapshot, error)
 }
 
 // Fetcher is the subset of *fetch.Client the freshness checker uses.
@@ -82,20 +83,44 @@ type Config struct {
 	// to defaultMaxInReleaseBytes when zero.
 	MaxInReleaseBytes int64
 
+	// Adopter is optional. When non-nil, the freshness checker hands
+	// off observed-changed InRelease bodies to it and the §7.5
+	// adoption flow runs to completion. When nil, behavior is
+	// unchanged from Phase 1: log the divergence, persist the
+	// diagnostic, and let the next periodic tick retry.
+	Adopter *Adopter
+
+	// LifetimeCtx is the ctx adoption goroutines use. SPEC2 §9.5
+	// step 5 says shutdown cancels the lifecycle ctx, propagating
+	// into the verifier and member fetcher; in-flight adoptions
+	// abandon staging files for the start-up sweep. Defaults to
+	// context.Background() when zero — production must pass the
+	// real lifecycle ctx so adoption goroutines tear down on
+	// shutdown.
+	LifetimeCtx context.Context
+
 	// now is a test seam; production uses time.Now.
 	now func() time.Time
 }
 
 // Checker is the SPEC §7 freshness state machine.
 type Checker struct {
-	cache    Cache
-	fetcher  Fetcher
-	hostSem  *hostsem.Sem
-	cooldown time.Duration
-	refresh  time.Duration
-	maxBody  int64
-	logger   *slog.Logger
-	now      func() time.Time
+	cache       Cache
+	fetcher     Fetcher
+	hostSem     *hostsem.Sem
+	cooldown    time.Duration
+	refresh     time.Duration
+	maxBody     int64
+	logger      *slog.Logger
+	now         func() time.Time
+	adopter     *Adopter
+	lifetimeCtx context.Context
+
+	// adoptionWg tracks in-flight adoption goroutines spawned via
+	// Check. Production graceful shutdown (SPEC2 §9.5 step 5) calls
+	// WaitForAdoptions after cancelling lifetimeCtx; tests use it to
+	// synchronize against the asynchronous adoption flow.
+	adoptionWg sync.WaitGroup
 
 	// locks holds *sync.Mutex per suite key. SPEC §7.3 specifies the
 	// lock is in-memory and held only for the duration of the upstream
@@ -145,21 +170,42 @@ func New(cfg Config) (*Checker, error) {
 	if now == nil {
 		now = time.Now
 	}
+	lifeCtx := cfg.LifetimeCtx
+	if lifeCtx == nil {
+		lifeCtx = context.Background()
+	}
 	return &Checker{
-		cache:    cfg.Cache,
-		fetcher:  cfg.Fetcher,
-		hostSem:  cfg.HostLimiter,
-		cooldown: cfg.Cooldown,
-		refresh:  cfg.Refresh,
-		maxBody:  maxBody,
-		logger:   logger,
-		now:      now,
+		cache:       cfg.Cache,
+		fetcher:     cfg.Fetcher,
+		hostSem:     cfg.HostLimiter,
+		cooldown:    cfg.Cooldown,
+		refresh:     cfg.Refresh,
+		maxBody:     maxBody,
+		logger:      logger,
+		now:         now,
+		adopter:     cfg.Adopter,
+		lifetimeCtx: lifeCtx,
 	}, nil
+}
+
+// adoptionRequest is what checkLocked emits when a Phase 2 atomic
+// flip should be triggered for the observed-changed InRelease.
+type adoptionRequest struct {
+	suite   SuiteRef
+	bytes   []byte // verified-input candidate (clearsigned InRelease)
+	etag    string
+	lastmod string
 }
 
 // Check runs the SPEC §7.2 algorithm for one suite, synchronously. It
 // returns immediately (without contacting upstream) if another goroutine
 // holds the in-memory check lock or if the suite is still in cooldown.
+//
+// On observed change with an Adopter wired in, Check spawns a goroutine
+// to run the §7.5 adoption flow. The per-suite mutex is HANDED OFF to
+// that goroutine: it serializes the entire adoption against any
+// subsequent Check on the same suite, matching SPEC2 §7.5's "the same
+// per-suite Mutex from §7.3 guards the entire adoption."
 //
 // Callers on the request path (T1) should typically invoke Check from a
 // goroutine: the request has already been served by the time T1 fires,
@@ -172,30 +218,63 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		// Another goroutine is on it; SPEC §7.3 says skip.
 		return
 	}
-	defer mu.Unlock()
 
-	c.checkLocked(ctx, scheme, host, suitePath)
+	req := c.checkLocked(ctx, scheme, host, suitePath)
+	if req == nil || c.adopter == nil {
+		mu.Unlock()
+		return
+	}
+
+	// Hand off mutex to the adoption goroutine. The goroutine runs
+	// against c.lifetimeCtx (the lifecycle ctx — possibly different
+	// from the request ctx that triggered T1) so a request closing
+	// before adoption finishes does not abort the adoption.
+	c.adoptionWg.Add(1)
+	go func() {
+		defer mu.Unlock()
+		defer c.adoptionWg.Done()
+		if err := c.adopter.Run(c.lifetimeCtx, req.suite, req.bytes, req.etag, req.lastmod); err != nil {
+			// Adopter.Run already emitted the categorized failure
+			// log. Nothing else to do here — the next periodic tick
+			// retries.
+			_ = err
+		}
+	}()
 }
 
+// WaitForAdoptions blocks until every in-flight adoption goroutine
+// spawned via Check has returned. Used by tests for deterministic
+// assertions and by graceful shutdown to drain SPEC2 §9.5 step 5
+// after cancelling the lifecycle ctx.
+func (c *Checker) WaitForAdoptions() { c.adoptionWg.Wait() }
+
 // checkLocked is the body of Check, run with the per-suite mutex held.
+// Returns a non-nil *adoptionRequest iff the observed result is "changed"
+// AND the caller has an Adopter wired in (Phase 2 path); the caller
+// uses this signal to spawn the adoption goroutine.
 //
 // Outcomes (all paths must update suite_freshness so cooldown applies
 // to the next attempt):
 //
-//   - Cooldown gate fails: no DB write, return.
+//   - Cooldown gate fails: no DB write, return nil.
 //   - InRelease url_path row absent: no DB write (we have nothing to
-//     check against), return — first request for this suite will land
-//     in url_path through the normal miss path.
+//     check against), return nil — first request for this suite will
+//     land in url_path through the normal miss path.
 //   - 304: last_check_at = last_success_at = now.
 //   - 200, body hash matches cached: bump last_check_at, last_success_at,
 //     and refresh validators (upstream may have rotated etag/lastmod
 //     while bytes are unchanged).
 //   - 200, body hash differs: bump last_check_at, last_success_at,
-//     record inrelease_change_seen_at = now. Phase 1 does NOT adopt;
-//     Phase 2 atomic-flip transaction will.
+//     record inrelease_change_seen_at = now, return *adoptionRequest.
 //   - Error (network, 4xx, 5xx, ctx cancel): bump last_check_at only —
 //     don't hammer a broken upstream — and log.
-func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath string) {
+//
+// SPEC2 wiring: the body-hash comparison uses suite_snapshot.inrelease_hash
+// when the suite has an adopted snapshot (CurrentSnapshotID set). Without
+// this, every freshness check after a successful adoption would observe
+// "changed" against the stale url_path.blob_hash and thrash the
+// adoption candidate-uniqueness constraint forever.
+func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath string) *adoptionRequest {
 	now := c.now()
 	nowUnix := now.Unix()
 
@@ -213,19 +292,20 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return
+		return nil
 	}
 
 	// Cooldown gate.
 	if cur.LastCheckAt != nil && c.cooldown > 0 {
 		elapsed := now.Sub(time.Unix(*cur.LastCheckAt, 0))
 		if elapsed < c.cooldown {
-			return
+			return nil
 		}
 	}
 
 	// Locate the InRelease url_path row to get the upstream URL plus
-	// the cached blob hash for byte-equality comparison on 200.
+	// (Phase 1 fallback) the cached blob hash for byte-equality
+	// comparison on 200.
 	inReleasePath := suitePath + inReleaseFilename
 	urlRow, err := c.cache.LookupURL(ctx, scheme, host, inReleasePath)
 	switch {
@@ -235,25 +315,49 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 		// was ever fetched, or the row was administratively cleared.
 		// Either way, nothing to validate against — skip without
 		// writing.
-		c.logger.Debug("freshness: no cached InRelease, skipping",
+		c.logger.Debug("freshness: no cached InRelease url_path, skipping",
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return
+		return nil
 	case err != nil:
 		c.logger.Warn("freshness: lookup InRelease url_path failed",
 			"err", err,
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return
+		return nil
 	}
-	if urlRow.BlobHash == nil || *urlRow.BlobHash == "" {
-		c.logger.Debug("freshness: InRelease url_path has no blob, skipping",
-			"canonical_host", host,
-			"suite_path", suitePath,
-		)
-		return
+
+	// Determine the cached InRelease hash for the body comparison.
+	// Phase 2: snapshot is authoritative (suite_snapshot.inrelease_hash).
+	// Phase 1 fallback: url_path.blob_hash. Without the Phase 2
+	// branch, every freshness check after a successful adoption sees
+	// the stale url_path hash and reports "changed" forever.
+	var cachedHash string
+	if cur.CurrentSnapshotID != nil {
+		snap, serr := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
+		switch {
+		case serr == nil && snap.InReleaseHash != nil:
+			cachedHash = *snap.InReleaseHash
+		case serr != nil:
+			c.logger.Warn("freshness: snapshot lookup failed; falling back to url_path",
+				"err", serr,
+				"snapshot_id", *cur.CurrentSnapshotID,
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+		}
+	}
+	if cachedHash == "" {
+		if urlRow.BlobHash == nil || *urlRow.BlobHash == "" {
+			c.logger.Debug("freshness: no baseline blob hash, skipping",
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return nil
+		}
+		cachedHash = *urlRow.BlobHash
 	}
 
 	target := &fetch.Target{
@@ -282,7 +386,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return
+		return nil
 	}
 	defer release()
 
@@ -306,7 +410,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 			"suite_path", suitePath,
 			"result", "failed",
 		)
-		return
+		return nil
 	}
 
 	cur.LastCheckAt = &nowUnix
@@ -315,7 +419,10 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 	// SPEC §10: every freshness attempt emits a structured log line. The
 	// `result` enum is what operators pivot on — success-with-no-change
 	// (the steady state) vs. success-with-change (the interesting one).
-	var result string
+	var (
+		result string
+		req    *adoptionRequest
+	)
 	switch res.Status {
 	case 304:
 		// Validators by definition unchanged. If a previous check had
@@ -329,7 +436,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 	case 200:
 		sum := sha256.Sum256(res.Body)
 		newHash := hex.EncodeToString(sum[:])
-		if newHash == *urlRow.BlobHash {
+		if newHash == cachedHash {
 			// Bytes unchanged despite no 304 (upstream didn't honor
 			// the conditional GET). SPEC §7.2 says refresh validators
 			// — upstream might have rotated an etag while bytes
@@ -346,17 +453,33 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 			cur.InReleaseChangeSeenAt = nil
 			result = "unchanged"
 		} else {
-			// Upstream has a new InRelease. Phase 1 does NOT adopt.
-			// Record observation; cache keeps serving the consistent
-			// older set.
+			// Upstream has a new InRelease. Record the diagnostic
+			// regardless of whether an Adopter is wired — operators
+			// monitoring a Phase 1 deployment still see the
+			// divergence.
 			cur.InReleaseChangeSeenAt = &nowUnix
-			c.logger.Info("InRelease changed at upstream; awaiting Phase 2 atomic flip",
+			c.logger.Info("InRelease changed at upstream",
 				"canonical_host", host,
 				"suite_path", suitePath,
-				"cached_hash", *urlRow.BlobHash,
+				"cached_hash", cachedHash,
 				"upstream_hash", newHash,
 			)
 			result = "changed"
+			// Stash the body bytes for the caller to hand off to the
+			// adoption goroutine. The body is bounded by maxBody
+			// (§7.2 cap, default 4 MiB), so retaining one
+			// InRelease's worth of bytes through the goroutine
+			// handoff is acceptable.
+			req = &adoptionRequest{
+				suite: SuiteRef{
+					CanonicalScheme: scheme,
+					CanonicalHost:   host,
+					SuitePath:       suitePath,
+				},
+				bytes:   res.Body,
+				etag:    res.ETag,
+				lastmod: res.LastModified,
+			}
 		}
 	default:
 		// fetch.Conditional should only ever return 200 or 304 in the
@@ -373,7 +496,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 				"err", perr,
 			)
 		}
-		return
+		return nil
 	}
 
 	if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
@@ -390,6 +513,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 		"result", result,
 		"upstream_status", res.Status,
 	)
+	return req
 }
 
 // suiteKey is the in-memory lock map key. The pipe separator matches the
