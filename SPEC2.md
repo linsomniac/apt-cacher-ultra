@@ -159,16 +159,25 @@ CREATE TABLE suite_snapshot (
   canonical_scheme   TEXT NOT NULL,
   canonical_host     TEXT NOT NULL,
   suite_path         TEXT NOT NULL,
-  inrelease_hash     TEXT NOT NULL REFERENCES blob(hash),
+  inrelease_hash     TEXT REFERENCES blob(hash),   -- non-null when adopted from inline
+                                                   -- InRelease (clearsigned). Null when
+                                                   -- adopted from detached Release pair.
   inrelease_etag     TEXT,
   inrelease_lastmod  TEXT,
-  release_hash       TEXT REFERENCES blob(hash),  -- non-null when this snapshot was
-                                                   -- adopted from a detached Release+Release.gpg
-                                                   -- pair (Q6); null when adopted from inline
-                                                   -- InRelease.
+  release_hash       TEXT REFERENCES blob(hash),   -- non-null when adopted from a detached
+                                                   -- Release+Release.gpg pair (Q6).
+  release_gpg_hash   TEXT REFERENCES blob(hash),   -- non-null when adopted from detached
+                                                   -- pair; pairs with release_hash.
   created_at         INTEGER NOT NULL,
   adopted_at         INTEGER,                      -- NULL while candidate; set on flip.
-  UNIQUE (canonical_scheme, canonical_host, suite_path, inrelease_hash)
+  -- Exactly one of (inrelease_hash) or (release_hash AND release_gpg_hash)
+  -- must be populated. Enforced by the adoption code; not expressed as a
+  -- CHECK constraint because SQLite CHECKs on multi-column predicates
+  -- across NULL trip on subtle three-valued-logic edges that the docs
+  -- recommend against. The adoption transaction rejects malformed rows
+  -- before INSERT.
+  UNIQUE (canonical_scheme, canonical_host, suite_path,
+          COALESCE(inrelease_hash, release_hash))
 );
 
 CREATE INDEX idx_suite_snapshot_suite
@@ -277,17 +286,24 @@ max_concurrent_adoptions = 2              # cache-wide cap on simultaneous
                                           # adoptions; 0 = unlimited (Q3).
 
 [adoption]
-enabled            = false                 # master switch. False = Phase 1
+enabled               = false              # master switch. False = Phase 1
                                            # behavior (record change, do not
                                            # adopt). Default false during
                                            # rollout; flip to true after the
                                            # shadow-deploy cycle.
-require_signature  = true                  # reject InRelease that fails GPG
+require_signature     = true               # reject InRelease that fails GPG
                                            # verification. Operators who
                                            # explicitly trust an unsigned
                                            # upstream can set false; warning
                                            # logged at startup so the choice
                                            # is auditable.
+require_pinned_signer = false              # fail-closed when a suite has no
+                                           # matching [[trusted_signer]]
+                                           # block. Default false to match
+                                           # apt's broad-trust default; flip
+                                           # to true once every active suite
+                                           # has an explicit pin (recommended
+                                           # for production — see §7.6.5).
 
 [integrity]
 validate_at_rest_interval = "24h"          # cadence for the at-rest sha256
@@ -309,7 +325,8 @@ fingerprints         = ['F6ECB3762474EDA9D21B7022871920D1991BC93C']
 Phase 1 validation (SPEC §5.2) carries forward. Phase 2 adds:
 
 - `freshness.max_concurrent_adoptions` is integer, ≥ 0.
-- `adoption.enabled` and `adoption.require_signature` are bool.
+- `adoption.enabled`, `adoption.require_signature`, and
+  `adoption.require_pinned_signer` are bool.
 - `integrity.validate_at_rest_interval` parses as duration, ≥ 0.
 - `integrity.validate_at_rest_workers` is integer, ≥ 1 (when interval > 0).
 - Each `[[trusted_signer]]` entry:
@@ -340,21 +357,53 @@ For metadata paths (per SPEC §4.5 classifier), the lookup order is:
      row := SELECT current_snapshot_id FROM suite_freshness
               WHERE canonical_scheme=? AND canonical_host=? AND suite_path=?
      If row.current_snapshot_id IS NOT NULL:
+       -- Snapshot-scoped lookup (the suite has been adopted).
        blob := SELECT blob_hash FROM snapshot_member
                  WHERE snapshot_id=? AND path=?
        If found: serve from pool/<blob>; X-Cache: HIT; X-Cache-Snapshot: <id>.
-       If not found: this metadata path isn't a snapshot member (e.g. a
-         classifier match on a path the snapshot doesn't include).
-         Fall through to step 3 — Phase 1 url_path lookup.
-3. (Fallback / non-suite / pre-Phase-2-suite path)
-   Look up url_path as in SPEC §6.1; if found, serve.
+       If not found: 404. The snapshot is the contract; if the path is
+         not in it, no Phase 1 url_path is allowed to satisfy a
+         metadata request under an adopted suite. Falling back to
+         url_path here would let stale, unverified Phase 1 metadata
+         masquerade as part of the verified snapshot.
+3. (Non-suite path, or a suite whose current_snapshot_id IS NULL — i.e.
+   pre-Phase-2 row, or a suite whose first adoption has not yet
+   succeeded.) Look up url_path as in SPEC §6.1; if found, serve.
 ```
 
-For blob paths (`.deb` etc.), lookup is unchanged from SPEC §6.1: hit on
-`url_path` → serve from pool. Hash validation for blobs happens on the
-*write* path (next miss; §6.5), not the hit path. A blob that's already
-in pool with a matching `url_path` row continues to serve at Phase 1
-speed.
+The `current_snapshot_id IS NOT NULL` predicate is the gate that
+separates "Phase 1 trust-upstream" suites from "Phase 2 verified" ones.
+Once a suite has been adopted at least once, every subsequent metadata
+hit on it is served from the snapshot or refused; the `url_path` table
+is not consulted for that suite again until/unless the snapshot pointer
+is cleared (which Phase 2 never does — only Phase 4 GC after the
+suite's last snapshot is reaped).
+
+For blob paths (`.deb` etc.), lookup extends Phase 1 with a
+defense-in-depth check against the snapshot's declared hash:
+
+```
+1. row := SELECT blob_hash FROM url_path WHERE ...
+   If not found: cache miss (§6.2).
+2. declared := query as in §6.2 (DISTINCT declared_sha256 from
+                package_hash for any current snapshot covering this
+                (host, path)).
+3. Zero declared rows: serve from pool/<row.blob_hash>.
+                       (Phase 1 trust-upstream — no snapshot covers it.)
+4. One declared row that matches row.blob_hash: serve from pool.
+5. One declared row that does NOT match row.blob_hash: stale Phase 1
+   data covered by a Phase 2 snapshot has diverged. Evict the
+   url_path row, decrement the prior blob's refcount, log
+   `hit_path_hash_evicted`, fall through to §6.2 to re-fetch.
+6. Two or more conflicting declared rows: same fail-closed behavior as
+   §6.2 (502 + Retry-After: 60, log `package_hash_conflict`).
+```
+
+The query in step 2 is the same shape as §6.2's miss-path validation —
+share one helper, one log call site. The lookup is O(1) on the
+`package_hash` PK index plus a covering join to `suite_freshness`; the
+extra latency on a hit is sub-millisecond and only paid for paths that
+have a `package_hash` row covering them.
 
 ### 6.2 Cache miss: singleflight fetch (deltas)
 
@@ -375,25 +424,36 @@ check on this suite then transitions it into the snapshot model.
 
 **For `.deb` paths:** Phase 1 singleflight fetch carries forward. After
 the fetch, before promoting the temp blob into the pool, the handler
-queries `package_hash` for any current snapshot covering
-`(canonical_scheme, canonical_host, path)`:
+queries `package_hash` for every current snapshot covering
+`(canonical_scheme, canonical_host, path)`. The query returns
+*distinct* declared hashes — the same .deb path can legitimately appear
+in multiple suites' snapshots (e.g. `noble` and `noble-updates` both
+indexing the same package version), and we must not pick an arbitrary
+row when those hashes diverge:
 
 ```sql
-SELECT declared_sha256
+SELECT DISTINCT declared_sha256
   FROM package_hash p
   JOIN suite_freshness sf ON sf.current_snapshot_id = p.snapshot_id
-  WHERE p.canonical_scheme = ? AND p.canonical_host = ? AND p.path = ?
-  LIMIT 1;
+  WHERE p.canonical_scheme = ? AND p.canonical_host = ? AND p.path = ?;
 ```
 
-- **Row found, hash matches:** continue to pool insert.
-- **Row found, hash mismatch:** discard the temp blob, log a
+- **Zero rows:** Phase 1 trust-upstream fallback. Insert as in SPEC §6.2.
+  Log a `package_hash_miss` Debug event with the canonical host and
+  path so operators can monitor coverage gaps.
+- **Exactly one row, hash matches the fetched bytes:** continue to pool
+  insert.
+- **Exactly one row, hash mismatch:** discard the temp blob, log a
   `hash_validation_failure` event with declared/observed/snapshot_id,
   return `502` + `Retry-After: 60`. Do *not* insert the `url_path` row;
   the next request retries.
-- **No row found:** Phase 1 trust-upstream fallback. Insert as in SPEC
-  §6.2. Log a `package_hash_miss` Debug event with the canonical host
-  and path so operators can monitor coverage gaps.
+- **Two or more distinct hashes:** snapshots disagree on what this path
+  should contain. Fail closed: discard the temp blob, log
+  `package_hash_conflict` with all declared hashes and their
+  snapshot_ids, return `502` + `Retry-After: 60`. This is an upstream
+  signal (mirror divergence, partial sync) the operator must
+  investigate; serving an arbitrary one of the conflicting hashes is
+  worse than refusing.
 
 ### 6.3 Resumable upstream fetch
 Unchanged — see SPEC.md §6.3.
@@ -480,46 +540,126 @@ new bytes. The same per-suite `sync.Mutex` from SPEC §7.3 guards the
 entire adoption to prevent two overlapping adoptions on the same suite.
 
 ```
-runAdoption(suite, new_InRelease, etag, lastmod):
+runAdoption(suite, new_bytes, etag, lastmod, mode):
+  // mode ∈ { "inline", "detached" }; the freshness check that triggered
+  // adoption knows which of InRelease or Release+Release.gpg it
+  // observed.
+
   // Step 0: global concurrency cap (§9.3.1).
   acquire freshness.max_concurrent_adoptions slot (or skip if cap=0)
   defer release
 
-  // Step 1: GPG verify (§7.6). Skipped iff adoption.require_signature is false.
-  release_text := verify(new_InRelease, suite)  // returns the verified text
-                                                 // for both InRelease and detached forms
+  // Step 1: GPG verify (§7.6).
+  release_text := verify(new_bytes, suite)         // verified plaintext
   if verification failed:
     log "adoption_gpg_failed"; persist InReleaseChangeSeenAt; return.
 
-  // Step 2: Parse Release/InRelease, build the declared SHA256 → relative path map.
+  // Step 2: persist the verified Release-equivalent blob(s) into pool/
+  // BEFORE any suite_snapshot row references them. Required by the
+  // suite_snapshot.inrelease_hash / release_hash / release_gpg_hash FK
+  // constraints — the candidate row in step 4 cannot insert until the
+  // referenced blob row is durable.
+  if mode == "inline":
+    inrelease_hash := writeBlob(new_bytes)         // sha256 of clearsigned bytes
+  else: // mode == "detached"
+    release_hash      := writeBlob(release_bytes)
+    release_gpg_hash  := writeBlob(release_gpg_bytes)
+  // writeBlob is idempotent: if pool/<hash> already exists it rehashes
+  // the file (M3 defense; see "rehash on reuse" below) and either
+  // confirms or evicts-and-rewrites.
+
+  // Step 3: parse Release/InRelease, build the declared SHA256 → relative path map.
   members := parse_sha256_block(release_text)
   if no members or parse error:
     log "adoption_parse_failed"; persist InReleaseChangeSeenAt; return.
 
-  // Step 3: insert candidate suite_snapshot row (adopted_at = NULL).
+  // Step 4: insert candidate suite_snapshot row (adopted_at = NULL).
+  // FK to inrelease_hash / release_hash / release_gpg_hash all resolve
+  // because step 2 stored them.
   snapshot_id := INSERT INTO suite_snapshot ...;
 
-  // Step 4: prefetch members sequentially.
+  // Step 5: prefetch declared members sequentially.
   for path, declared_sha256 in members:
-    if blob_hash(declared_sha256) already in pool/:
-      // Free dedup — content addressing.
-      record snapshot_member row in candidate set.
-      continue.
+    if pool/<declared_sha256> already exists:
+      actual := sha256(pool/<declared_sha256>)
+      if actual == declared_sha256:
+        // Content addressing held — free dedup.
+        record snapshot_member row in candidate set; continue.
+      // Pool blob has been corrupted at rest. Remove the corrupted
+      // file, log "pool_corruption_during_adoption" with path/blob,
+      // proceed to fetch fresh.
+      remove pool/<declared_sha256>
+      decrement blob.refcount, drop blob row if 0
     fetch member into staging/<snapshot_id>/<declared_sha256>
-    hash-verify; mismatch → abort whole adoption (§7.5.2 below).
-    rename into pool/.
-    record snapshot_member row in candidate set.
+    hash-verify against declared_sha256; mismatch → abort (§7.5.2).
+    rename into pool/<declared_sha256>.
+    record snapshot_member row in candidate set, keyed on the suite-
+    relative `path` from the Release file.
 
-  // Step 5: parse every Packages member to populate package_hash rows.
+  // Step 6: insert "metadata-self" snapshot_member rows so request-
+  // path lookups for the verified InRelease / Release / Release.gpg
+  // hit the snapshot directly. Without these the §6.1 snapshot-scoped
+  // lookup would 404 on the very paths apt fetches first.
+  if mode == "inline":
+    record snapshot_member row { path: "InRelease",
+                                 blob_hash: inrelease_hash,
+                                 declared_sha256: inrelease_hash }
+  else:
+    record snapshot_member row { path: "Release",
+                                 blob_hash: release_hash,
+                                 declared_sha256: release_hash }
+    record snapshot_member row { path: "Release.gpg",
+                                 blob_hash: release_gpg_hash,
+                                 declared_sha256: release_gpg_hash }
+  // For metadata-self rows the declared_sha256 is the verified blob's
+  // own hash — the verification step is GPG, not a Release-listed
+  // SHA256 (the Release file cannot list itself). The CHECK on
+  // declared_sha256's shape (64 hex chars) is satisfied because every
+  // pool hash is sha256.
+
+  // Step 7: insert by-hash alias snapshot_member rows. apt's
+  // Acquire-By-Hash clients fetch from <suite>/<component>/by-hash/
+  // SHA256/<declared_sha256>; without an alias row those requests
+  // would 404 under the §6.1 snapshot-scoped lookup. The alias path
+  // is constructed by stripping the filename component from the
+  // declared path and appending `by-hash/SHA256/<declared_sha256>`.
+  for path, declared_sha256 in members:
+    alias := byHashAliasPath(path, declared_sha256)
+    record snapshot_member row { path: alias,
+                                 blob_hash: declared_sha256,
+                                 declared_sha256: declared_sha256 }
+
+  // Step 8: parse every Packages member to populate package_hash rows.
   for each member whose path matches Packages*:
     parse the Packages text:
       for each pkg with Filename and SHA256:
         record package_hash row in candidate set.
 
-  // Step 6: atomic flip (§7.5.1).
+  // Step 9: atomic flip (§7.5.1).
 
-  // Step 7: log "adoption_success" with snapshot_id, prior_snapshot_id, member_count.
+  // Step 10: log "adoption_success" with snapshot_id, prior_snapshot_id,
+  //          member_count, alias_count, package_hash_count.
 ```
+
+The `writeBlob` helper used in step 2 is the same primitive used by the
+request path's miss handler (SPEC §9.4 cache writer). It serializes
+through the writer goroutine, performs the temp-file → rename promotion,
+and inserts the `blob` row as part of the same SQLite transaction that
+publishes it. Calling it during adoption ensures one rule: every
+`blob.hash` value referenced by a `suite_snapshot` column or
+`snapshot_member.blob_hash` row is durable on disk *before* the row that
+references it is committed.
+
+Step 5's "rehash on reuse" defense matters because pool blobs predating
+Phase 2 were inserted under the trust-upstream model — their on-disk
+content was not verified against a declared hash at the time. If a
+prior fetch wrote corrupt bytes (ENOSPC race, kernel bug, exotic FS
+behavior) and the blob's filename happens to match a declared hash now,
+recording it as a `snapshot_member` would promote the corruption into
+the verified set. Re-hashing on reuse pays an O(filesize) cost per
+adoption-time reuse but bounds the trust-set to bytes we have *just*
+verified. Members re-fetched from upstream don't pay this cost; the
+fetch path's stream-side hashing is sufficient.
 
 #### 7.5.1 Atomic flip transaction
 
@@ -609,7 +749,11 @@ For a suite identified by `(canonical_scheme, canonical_host, suite_path)`:
 ```
 matching_blocks := every [[trusted_signer]] whose regex matches canonical_host
 if matching_blocks is empty:
-  trust_set := the entire host keyring
+  if adoption.require_pinned_signer == true:
+    // Fail closed: no pin, no adoption.
+    log "adoption_unpinned_suite" with canonical_host, suite_path; abort.
+  else:
+    trust_set := the entire host keyring
 else:
   union := UNION of matching_blocks[*].fingerprints
   trust_set := host_keyring keys whose fingerprint is in union
@@ -656,6 +800,54 @@ All other outcomes — including missing signatures when
 module, drop-in API equivalent to the deprecated
 `golang.org/x/crypto/openpgp`. Used by ProtonMail and HashiCorp Vault
 against real-world keyring corpora.
+
+#### 7.6.5 Threat model and recommended posture
+
+The default trust set (the whole host apt keyring) is convenient but
+broad: any key in `trusted.gpg.d` or `/etc/apt/keyrings/` can sign any
+suite the cache is asked to adopt. This matches apt's own historical
+default — apt itself only narrowed it with the `Signed-By:` source
+option in recent releases. The risk:
+
+- A compromised third-party PPA key could in theory be used to sign a
+  forged Ubuntu archive `Release` and adopt it as the canonical view of
+  `archive.ubuntu.com`. The adoption would succeed because the signing
+  key's fingerprint is in the keyring even though apt clients on the
+  fleet would never honor that key for that origin.
+- The blast radius is bounded — the fleet's apt clients enforce their
+  own per-source `Signed-By:` rules and would reject the forged
+  metadata when the cache served it on. But the cache would still have
+  spent disk and bandwidth on a bogus snapshot, and concurrent clients
+  could see the forged set transiently before any one of them rejected
+  the signature. Not a quiet exposure, but not zero either.
+
+**Recommended production posture:**
+
+1. Add a `[[trusted_signer]]` block for every active suite. Most fleets
+   only adopt a small set of canonical hosts (`archive.ubuntu.com`,
+   `security.ubuntu.com`, one or two PPAs), so the configuration cost
+   is bounded.
+2. Set `adoption.require_pinned_signer = true`. With this enabled, an
+   unpinned suite fails closed and the failure is logged with the
+   suite identity, making it impossible to accidentally adopt a suite
+   whose trust hasn't been explicitly scoped.
+3. Treat the host apt keyring as a *superset bound* on trust, never as
+   the trust set itself in production.
+
+The default for `require_pinned_signer` is `false` only because flipping
+the default would break first-time deployments where no
+`[[trusted_signer]]` blocks have been written yet. The intended
+operational lifecycle is:
+
+- Deploy with `enabled = false` (Phase 1 behavior).
+- Add `[[trusted_signer]]` blocks for every suite the deployment adopts.
+- Flip `enabled = true` and `require_pinned_signer = true` together.
+
+A future Phase could parse `Signed-By:` from
+`/etc/apt/sources.list.d/*.list` and `*.sources` to derive pins
+automatically. That is out of scope for Phase 2 — the parser would
+need to handle apt's full sources-list syntax, including options
+quoting and the deb822 format, which is its own correctness surface.
 
 ---
 
@@ -779,9 +971,27 @@ Phase 1 logging (SPEC §10) carries forward exactly. Phase 2 adds:
   - `package_hash_mismatch` Error during a `.deb` miss:
     `canonical_host`, `path`, `declared_sha256`, `observed_sha256`,
     `snapshot_id` (the snapshot whose `package_hash` row vouched).
+  - `package_hash_conflict` Error when two or more current snapshots
+    declare different sha256s for the same `(canonical_host, path)`:
+    `canonical_host`, `path`, plus a JSON array of
+    `{snapshot_id, declared_sha256}` pairs.
+  - `hit_path_hash_evicted` Warn when §6.1's blob-hit validator finds
+    a `url_path` row whose `blob_hash` disagrees with the snapshot's
+    `package_hash.declared_sha256`: `canonical_host`, `path`,
+    `evicted_blob_hash`, `declared_sha256`, `snapshot_id`. The eviction
+    is the corrective action; the next request re-fetches.
   - `at_rest_corruption` Error from the integrity scanner: `blob_hash`,
     `declared_sha256` (whichever `snapshot_member` or `package_hash` row
     surfaced the mismatch — first-found is reported), `snapshot_id`.
+  - `pool_corruption_during_adoption` Warn when the §7.5 step-5 reuse
+    rehash finds an existing pool blob whose content no longer matches
+    its filename: `path`, `expected_sha256`, `observed_sha256`. Adoption
+    re-fetches the member from upstream after the eviction.
+- **Trust-set events:** `adoption_unpinned_suite` Warn when
+  `adoption.require_pinned_signer = true` and a triggering suite has no
+  matching `[[trusted_signer]]` block: `canonical_host`, `suite_path`.
+  Adoption aborts before the verify step. Operator surface: a deployed
+  cache rejecting adoptions for a suite the operator hadn't pinned.
 - **At-rest scan:** `at_rest_scan_started` and `at_rest_scan_finished`
   Info with `blob_count`, `mismatch_count`, `duration_ms`.
 - **Coverage gaps:** `package_hash_miss` Debug per `.deb` cache miss
@@ -792,11 +1002,11 @@ Phase 1 logging (SPEC §10) carries forward exactly. Phase 2 adds:
 ### 10.3 Startup config dump (additions)
 
 Append: `adoption_enabled`, `adoption_require_signature`,
-`integrity_validate_at_rest_interval`, `integrity_validate_at_rest_workers`,
-`max_concurrent_adoptions`, `trusted_signer_blocks` (count of compiled
-blocks; details would explode the line and aren't useful in the journal),
-`apt_keyring_keys` (count of trusted keys loaded at startup — proves the
-keyring path resolved).
+`adoption_require_pinned_signer`, `integrity_validate_at_rest_interval`,
+`integrity_validate_at_rest_workers`, `max_concurrent_adoptions`,
+`trusted_signer_blocks` (count of compiled blocks; details would explode
+the line and aren't useful in the journal), `apt_keyring_keys` (count of
+trusted keys loaded at startup — proves the keyring path resolved).
 
 ---
 
@@ -816,6 +1026,11 @@ Phase 1 rows (SPEC §11) carry forward unchanged. Phase 2 adds:
 | `v1 → v2` migration interrupted | Tx rolls back; next start retries from `schema_version = 1`. |
 | Operator flips `adoption.enabled = false` mid-run | New observations of changed `InRelease` log "adoption disabled" and persist `inrelease_change_seen_at`; existing `current_snapshot_id`s keep serving normally. |
 | `[[trusted_signer]]` block has a regex matching a suite, but the fingerprint list doesn't intersect the host keyring | Trust set for that suite is empty → every adoption attempt fails `gpg_verify_failed` `reason=untrusted_key`. Detectable at startup config validation if the host keyring is also empty; not detectable otherwise (we cannot know which fingerprints are *expected* to be present at startup). |
+| `adoption.require_pinned_signer=true` and a freshness check observes a new `InRelease` for a suite with no matching `[[trusted_signer]]` block | Adoption aborts before the verify step; `adoption_unpinned_suite` Warn logs the canonical host and suite path; prior snapshot continues to serve. Operators expect this surface and use it to drive their pinning rollout. |
+| Two distinct current snapshots reference the same `(canonical_host, .deb path)` with different declared sha256s | Both the §6.1 hit path and the §6.2 miss path fail closed with `502 + Retry-After: 60` and a `package_hash_conflict` log. This blocks .deb traffic for the affected path until the upstream divergence is resolved or one of the snapshots is re-adopted; the operator surface is unmistakable. |
+| §6.1 blob hit finds `url_path.blob_hash` disagreeing with `package_hash.declared_sha256` (stale Phase 1 row covered by a Phase 2 snapshot) | Evict the `url_path` row, decrement the prior blob's refcount, log `hit_path_hash_evicted`, fall through to §6.2 to re-fetch. The corrective re-fetch then runs the §6.2 validation; either it lands on the correct hash (steady state) or it produces a `package_hash_mismatch` if upstream is also wrong. |
+| §7.5 step 5 finds an existing `pool/<hash>` whose content no longer matches its filename | Remove the corrupted file and `blob` row, log `pool_corruption_during_adoption`, fall through to fetch the member fresh from upstream. The member's hash is then validated against the declared sha256 as in any new fetch. |
+| Adoption sees a path mentioned in `Release` whose `by-hash` alias collides with a snapshot member at a different declared sha256 | The candidate snapshot's `snapshot_member` PK is `(snapshot_id, path)`, so the second INSERT fails inside the candidate transaction; adoption aborts with `adoption_db_failed`. This is a malformed `Release` (apt's own validators would reject it); the failure mode is loud rather than silent. |
 
 ---
 
