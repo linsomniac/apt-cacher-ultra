@@ -306,3 +306,189 @@ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id =
 	}
 	return &p, nil
 }
+
+// DeclaredHash is the (snapshot_id, declared_sha256) result of the §6.1 /
+// §6.2 declared-hash query: every distinct hash that any current snapshot
+// asserts for the .deb at (scheme, host, path), with one snapshot id per
+// row. The same .deb path can legitimately appear in multiple suites'
+// snapshots (e.g. noble + noble-updates referencing the same package), so
+// callers must surface the conflict — fail closed rather than picking one
+// — when more than one *distinct* declared_sha256 is returned.
+type DeclaredHash struct {
+	DeclaredSHA256 string
+	SnapshotID     int64
+}
+
+// DeclaredHashesForPath returns every package_hash row covering this .deb
+// path under any current snapshot. Joins package_hash → suite_freshness
+// on current_snapshot_id so a row whose snapshot was displaced (orphaned
+// rows from a prior adoption) does not count. SPEC2 §6.1 step 2 / §6.2.
+//
+// Returns rows in no defined order. Empty slice + nil error means "no
+// snapshot covers this path" — Phase 1 trust-upstream regime.
+//
+// AIDEV-NOTE: this is the share helper between §6.1 (hit-path validation)
+// and §6.2 (miss-path validation). Both call sites need declared+snapshot
+// pairs (the snapshot id is required for fail-closed conflict logging).
+// One distinct declared_sha256 with the same value across multiple
+// snapshots collapses to a single row via DISTINCT — but we keep the
+// snapshot id alongside it because the operator log line must name *a*
+// snapshot when the hash matches.
+func (c *Cache) DeclaredHashesForPath(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
+	const q = `
+SELECT DISTINCT p.declared_sha256, p.snapshot_id
+  FROM package_hash p
+  JOIN suite_freshness sf ON sf.current_snapshot_id = p.snapshot_id
+ WHERE p.canonical_scheme = ?
+   AND p.canonical_host   = ?
+   AND p.path             = ?`
+	rows, err := c.db.QueryContext(ctx, q, scheme, host, path)
+	if err != nil {
+		return nil, fmt.Errorf("DeclaredHashesForPath: %w", err)
+	}
+	defer rows.Close()
+	var out []DeclaredHash
+	for rows.Next() {
+		var d DeclaredHash
+		if err := rows.Scan(&d.DeclaredSHA256, &d.SnapshotID); err != nil {
+			return nil, fmt.Errorf("DeclaredHashesForPath scan: %w", err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("DeclaredHashesForPath iter: %w", err)
+	}
+	return out, nil
+}
+
+// SnapshotMemberLookup is the result of the §6.1 metadata hit-path query:
+// the snapshot id under which the path was found and the blob_hash the
+// snapshot vouches for. The snapshot id is surfaced so the handler can
+// emit the X-Cache-Snapshot diagnostic header SPEC2 §3 mandates.
+type SnapshotMemberLookup struct {
+	SnapshotID int64
+	BlobHash   string
+}
+
+// LookupSnapshotMember resolves the §6.1 metadata hit path: given the
+// suite's (scheme, host, suitePath) and a member path (suite-relative,
+// e.g. "main/binary-amd64/Packages"), it joins suite_freshness to
+// snapshot_member via current_snapshot_id and returns the matching blob.
+//
+// Returns ErrNotFound when:
+//   - the suite has no suite_freshness row, OR
+//   - the suite has a row but current_snapshot_id IS NULL (pre-Phase-2
+//     regime — the caller should fall back to LookupURL), OR
+//   - the snapshot exists but contains no member at this path.
+//
+// The caller is responsible for distinguishing "no snapshot in place" from
+// "snapshot in place but path not in it"; this method collapses both into
+// ErrNotFound. SPEC2 §6.1 mandates a snapshot-in-place + missing-member
+// to 404 (no Phase 1 fallback), so the handler must check
+// CurrentSnapshotID separately before classifying the miss.
+//
+// AIDEV-NOTE: the callers want both "is there a snapshot here?" (drives
+// the §6.1 step-3 fallthrough decision) and "is this path a member of the
+// snapshot?" (drives serve-vs-404). Returning the joined row in one query
+// would conflate the two when CurrentSnapshotID is NULL. Use
+// GetSuiteFreshness + GetSnapshotMember directly from the handler — see
+// handler.tryCacheHit for the full §6.1 control flow. This helper is kept
+// as a single-shot convenience for tests and is documented as such.
+func (c *Cache) LookupSnapshotMember(ctx context.Context, scheme, host, suitePath, memberPath string) (*SnapshotMemberLookup, error) {
+	const q = `
+SELECT sf.current_snapshot_id, sm.blob_hash
+  FROM suite_freshness sf
+  JOIN snapshot_member sm ON sm.snapshot_id = sf.current_snapshot_id
+ WHERE sf.canonical_scheme = ?
+   AND sf.canonical_host   = ?
+   AND sf.suite_path       = ?
+   AND sm.path             = ?`
+	var (
+		snapID   int64
+		blobHash string
+	)
+	err := c.db.QueryRowContext(ctx, q, scheme, host, suitePath, memberPath).Scan(&snapID, &blobHash)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, ErrNotFound
+	case err != nil:
+		return nil, fmt.Errorf("LookupSnapshotMember: %w", err)
+	}
+	return &SnapshotMemberLookup{SnapshotID: snapID, BlobHash: blobHash}, nil
+}
+
+// EvictURLPath deletes the url_path row for (scheme, host, path) and
+// decrements the prior blob's refcount in a single transaction. SPEC2
+// §6.1 step 5: stale Phase 1 row covered by a Phase 2 snapshot has
+// diverged from the snapshot's declared hash; the row must drop and the
+// blob's refcount must fall by one for Phase 4 GC to reclaim the bytes.
+//
+// Idempotent: if the row is already gone (concurrent eviction, manual
+// delete) the call is a no-op and returns nil — exactly one decrement
+// must fire per refcount-bump, and racing the row delete is the only
+// boundary at which the bookkeeping could double-count.
+//
+// Returns nil on success even when no row was deleted; callers that need
+// to know whether they were the eviction winner should check before-and-
+// after with LookupURL. Returns an error only on a real DB fault.
+//
+// AIDEV-NOTE: SPEC2 §4.3.1 names adoption as the only writer that bumps
+// blob.refcount, while §6.1 step 5 (and §11) explicitly says eviction
+// decrements. Taken together a Phase 1 blob whose url_path row is
+// evicted via this path can land with a negative refcount, because
+// PutURLPath does not currently bump on insert. Phase 4 GC checks
+// `refcount <= 0` for sweep eligibility, so a transient -1 still reaps
+// correctly; the literal decrement here matches what the SPEC text
+// asks for. If a future phase tightens GC to an `= 0` predicate, this
+// helper and PutURLPath will need to be adjusted in lockstep.
+func (c *Cache) EvictURLPath(ctx context.Context, scheme, host, path string) error {
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("EvictURLPath: begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		// Read the row's current blob_hash inside the tx so a concurrent
+		// re-fetch that completes between read and delete does not race.
+		var blobHash sql.NullString
+		err = tx.QueryRowContext(ctx, `
+SELECT blob_hash FROM url_path
+ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ?`,
+			scheme, host, path).Scan(&blobHash)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil
+		case err != nil:
+			return fmt.Errorf("EvictURLPath: read row: %w", err)
+		}
+
+		res, err := tx.ExecContext(ctx, `
+DELETE FROM url_path
+ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ?`,
+			scheme, host, path)
+		if err != nil {
+			return fmt.Errorf("EvictURLPath: delete: %w", err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("EvictURLPath: rows affected: %w", err)
+		}
+		if affected == 0 {
+			// Row vanished between SELECT and DELETE — concurrent eviction
+			// won. Skip the refcount decrement: the winner already did it.
+			return nil
+		}
+		if blobHash.Valid && blobHash.String != "" {
+			if _, err := tx.ExecContext(ctx, `
+UPDATE blob SET refcount = refcount - 1 WHERE hash = ?`,
+				blobHash.String); err != nil {
+				return fmt.Errorf("EvictURLPath: decrement refcount: %w", err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("EvictURLPath: commit: %w", err)
+		}
+		return nil
+	})
+}

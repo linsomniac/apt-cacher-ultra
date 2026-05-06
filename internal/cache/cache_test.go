@@ -1760,3 +1760,310 @@ func TestGetSuiteSnapshot_NotFound(t *testing.T) {
 		t.Errorf("got %v, want ErrNotFound", err)
 	}
 }
+
+// TestDeclaredHashesForPath_EmptyWhenNoSnapshotCovers covers SPEC2 §6.1
+// step 3: a path with no package_hash row under any current snapshot
+// returns nil — the Phase 1 trust-upstream regime.
+func TestDeclaredHashesForPath_EmptyWhenNoSnapshotCovers(t *testing.T) {
+	c := openCache(t)
+	got, err := c.DeclaredHashesForPath(context.Background(),
+		"http", "archive.example", "/pool/main/x/x_1.deb")
+	if err != nil {
+		t.Fatalf("DeclaredHashesForPath: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected nil, got %v", got)
+	}
+}
+
+// TestDeclaredHashesForPath_ReturnsCurrentSnapshotRowsOnly covers the
+// join: only rows whose snapshot_id appears as suite_freshness.current_snapshot_id
+// count. An orphaned snapshot's package_hash row must NOT surface.
+func TestDeclaredHashesForPath_ReturnsCurrentSnapshotRowsOnly(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+
+	const (
+		scheme = "http"
+		host   = "archive.example"
+		debP   = "/pool/main/h/hello/hello.deb"
+	)
+	debHash := strings.Repeat("a", 64)
+
+	// First snapshot: covers the .deb. Will be displaced.
+	r1 := seedBlob(t, c, "InRelease v1")
+	id1, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &r1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id1,
+		[]SnapshotMember{{SnapshotID: id1, Path: "InRelease", BlobHash: r1, DeclaredSHA256: r1}},
+		[]PackageHash{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
+			DeclaredSHA256: debHash, SnapshotID: id1,
+		}},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second snapshot: same suite, replaces id1 as current. Carries the
+	// .deb forward with the same declared hash.
+	r2 := seedBlob(t, c, "InRelease v2")
+	id2, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &r2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id2,
+		[]SnapshotMember{{SnapshotID: id2, Path: "InRelease", BlobHash: r2, DeclaredSHA256: r2}},
+		[]PackageHash{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
+			DeclaredSHA256: debHash, SnapshotID: id2,
+		}},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.DeclaredHashesForPath(ctx, scheme, host, debP)
+	if err != nil {
+		t.Fatalf("DeclaredHashesForPath: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("len=%d, want 1 (only current snapshot's row): %v", len(got), got)
+	}
+	if len(got) > 0 && got[0].SnapshotID != id2 {
+		t.Errorf("snapshot_id=%d, want %d (current)", got[0].SnapshotID, id2)
+	}
+}
+
+// TestDeclaredHashesForPath_TwoSuitesDistinctHashes covers the §6.1
+// conflict surface: same .deb path, two suites currently adopted, two
+// different declared hashes. Both rows return.
+func TestDeclaredHashesForPath_TwoSuitesDistinctHashes(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+
+	const (
+		scheme = "http"
+		host   = "archive.example"
+		debP   = "/pool/main/h/hello/hello.deb"
+	)
+	hashA := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+
+	rA := seedBlob(t, c, "InRelease A")
+	rB := seedBlob(t, c, "InRelease B")
+	idA, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/A", InReleaseHash: &rA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idB, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/B", InReleaseHash: &rB,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, idA,
+		[]SnapshotMember{{SnapshotID: idA, Path: "InRelease", BlobHash: rA, DeclaredSHA256: rA}},
+		[]PackageHash{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
+			DeclaredSHA256: hashA, SnapshotID: idA,
+		}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, idB,
+		[]SnapshotMember{{SnapshotID: idB, Path: "InRelease", BlobHash: rB, DeclaredSHA256: rB}},
+		[]PackageHash{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
+			DeclaredSHA256: hashB, SnapshotID: idB,
+		}},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.DeclaredHashesForPath(ctx, scheme, host, debP)
+	if err != nil {
+		t.Fatalf("DeclaredHashesForPath: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("len=%d, want 2: %v", len(got), got)
+	}
+	hashes := map[string]bool{}
+	for _, d := range got {
+		hashes[d.DeclaredSHA256] = true
+	}
+	if !hashes[hashA] || !hashes[hashB] {
+		t.Errorf("got hashes %v, want both %s and %s", hashes, hashA, hashB)
+	}
+}
+
+// TestLookupSnapshotMember_ReturnsBlobOfCurrentSnapshot is the §6.1
+// metadata fast-path query: hides the suite_freshness join behind a
+// single read.
+func TestLookupSnapshotMember_ReturnsBlobOfCurrentSnapshot(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+
+	scheme, host, suite := "http", "archive.example", "/dists/noble"
+	r := seedBlob(t, c, "InRelease bytes")
+	pkg := seedBlob(t, c, "Packages bytes")
+	id, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: suite, InReleaseHash: &r,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
+		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
+		{SnapshotID: id, Path: "main/binary-amd64/Packages", BlobHash: pkg, DeclaredSHA256: pkg},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.LookupSnapshotMember(ctx, scheme, host, suite, "main/binary-amd64/Packages")
+	if err != nil {
+		t.Fatalf("LookupSnapshotMember: %v", err)
+	}
+	if got.SnapshotID != id {
+		t.Errorf("SnapshotID=%d, want %d", got.SnapshotID, id)
+	}
+	if got.BlobHash != pkg {
+		t.Errorf("BlobHash=%s, want %s", got.BlobHash, pkg)
+	}
+}
+
+// TestLookupSnapshotMember_NotFoundWhenSuiteHasNoSnapshot exercises the
+// suite-row-exists-but-current_snapshot_id-IS-NULL case.
+func TestLookupSnapshotMember_NotFoundWhenSuiteHasNoSnapshot(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+		CanonicalScheme: "http", CanonicalHost: "x.example",
+		SuitePath: "/dists/noble",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.LookupSnapshotMember(ctx, "http", "x.example", "/dists/noble", "InRelease")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("got %v, want ErrNotFound", err)
+	}
+}
+
+// TestLookupSnapshotMember_NotFoundWhenPathMissing covers the §6.1
+// step-2-then-404 case: snapshot adopted but the path isn't a member.
+func TestLookupSnapshotMember_NotFoundWhenPathMissing(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	scheme, host, suite := "http", "archive.example", "/dists/noble"
+	r := seedBlob(t, c, "InRelease bytes")
+	id, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: suite, InReleaseHash: &r,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id,
+		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
+		nil); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.LookupSnapshotMember(ctx, scheme, host, suite, "main/binary-amd64/Packages")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("got %v, want ErrNotFound (path not in snapshot)", err)
+	}
+}
+
+// TestEvictURLPath_DeletesRowAndDecrementsRefcount verifies the §6.1
+// step-5 bookkeeping. Pre-condition: a url_path row pointing at a blob
+// whose refcount is positive (e.g. because the blob is also a snapshot
+// member). After eviction: row gone + refcount decremented.
+func TestEvictURLPath_DeletesRowAndDecrementsRefcount(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+
+	const (
+		scheme = "http"
+		host   = "archive.example"
+		debP   = "/pool/main/h/hello/hello.deb"
+	)
+	hash := seedBlob(t, c, "blob bytes")
+
+	// Snapshot adoption bumps refcount to 1 via the snapshot_member.
+	id, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &hash,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
+		{SnapshotID: id, Path: "InRelease", BlobHash: hash, DeclaredSHA256: hash},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := blobRefcount(t, c, hash); got != 1 {
+		t.Fatalf("pre-evict refcount=%d, want 1", got)
+	}
+
+	if err := c.PutURLPath(ctx, URLPath{
+		CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
+		BlobHash: &hash, UpstreamURL: "http://up/" + debP, IsMetadata: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.EvictURLPath(ctx, scheme, host, debP); err != nil {
+		t.Fatalf("EvictURLPath: %v", err)
+	}
+
+	if _, err := c.LookupURL(ctx, scheme, host, debP); !errors.Is(err, ErrNotFound) {
+		t.Errorf("post-evict LookupURL = %v, want ErrNotFound", err)
+	}
+	if got := blobRefcount(t, c, hash); got != 0 {
+		t.Errorf("post-evict refcount=%d, want 0", got)
+	}
+}
+
+// TestEvictURLPath_IdempotentOnMissingRow covers the concurrent-eviction
+// race: a second EvictURLPath after the row is gone is a clean no-op.
+func TestEvictURLPath_IdempotentOnMissingRow(t *testing.T) {
+	c := openCache(t)
+	if err := c.EvictURLPath(context.Background(),
+		"http", "x.example", "/no/such/path"); err != nil {
+		t.Errorf("EvictURLPath on missing row: %v", err)
+	}
+}
+
+// TestEvictURLPath_NoBlobHashSkipsDecrement covers a defensive
+// edge case: a url_path row whose blob_hash is NULL (a freshness check
+// that recorded validators but never finalized a body) evicts cleanly
+// without attempting a phantom refcount decrement on a NULL hash.
+func TestEvictURLPath_NoBlobHashSkipsDecrement(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	if err := c.PutURLPath(ctx, URLPath{
+		CanonicalScheme: "http", CanonicalHost: "x.example", Path: "/p",
+		BlobHash: nil, UpstreamURL: "http://x/p", IsMetadata: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EvictURLPath(ctx, "http", "x.example", "/p"); err != nil {
+		t.Errorf("EvictURLPath with NULL blob_hash: %v", err)
+	}
+	if _, err := c.LookupURL(ctx, "http", "x.example", "/p"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("post-evict LookupURL = %v, want ErrNotFound", err)
+	}
+}

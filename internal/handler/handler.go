@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -148,6 +149,12 @@ const (
 	hdrXCache        = "X-Cache"
 	hdrXCacheAge     = "X-Cache-Age"
 	hdrXUpstreamStat = "X-Upstream-Status"
+	// hdrXCacheSnapshot identifies the suite_snapshot.snapshot_id under
+	// which a metadata response was resolved. SPEC2 §3 mandates this
+	// diagnostic header on every Phase 2 snapshot-scoped hit so operators
+	// (and the e2e test harness) can confirm that the response came from
+	// the verified set rather than the trust-upstream Phase 1 path.
+	hdrXCacheSnapshot = "X-Cache-Snapshot"
 )
 
 // ServeHTTP routes one apt request through the cache.
@@ -198,10 +205,115 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // tryCacheHit attempts to serve from disk. Returns served=true if the
-// response was sent (success or 5xx during streaming). status and
-// bytesWritten are best-effort for logging — http.ServeContent does the
-// real header writes.
+// response was sent (success, snapshot 404, package_hash conflict 502, or
+// a 5xx during streaming). status and bytesWritten are best-effort for
+// logging — http.ServeContent does the real header writes.
+//
+// SPEC2 §6.1 splits the lookup based on whether the request is metadata
+// under a Phase-2-adopted suite. Three regimes flow out of this method:
+//
+//  1. Metadata under a suite with current_snapshot_id != NULL: lookup
+//     goes through suite_freshness → snapshot_member, with NO Phase 1
+//     url_path fallback. A miss in snapshot_member returns 404 — once
+//     a suite is adopted, the snapshot is the contract.
+//  2. Metadata without a snapshot pointer (pre-Phase-2 / never-adopted):
+//     Phase 1 url_path lookup, identical to SPEC §6.1.
+//  3. Non-metadata (.deb, etc.): Phase 1 url_path lookup, then
+//     defense-in-depth check against package_hash. SPEC2 §6.1 step 5
+//     evicts a stale row whose hash disagrees with the snapshot's
+//     declared hash.
+//
+// The fast path on every successful return is one DB read, one stat, one
+// open(2), and one ServeContent — order-of-microseconds.
 func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, status int, bytesWritten int64) {
+	if req.IsMetadata && req.SuitePath != "" {
+		if served, status, body, handled := h.trySnapshotHit(w, r, req); handled {
+			return served, status, body
+		}
+	}
+	return h.tryURLPathHit(w, r, req)
+}
+
+// trySnapshotHit is the SPEC2 §6.1 metadata fast path. Returns
+// handled=true when the request was either served from a snapshot or
+// definitively rejected as not-in-snapshot (404). Returns handled=false
+// only when the suite has no current_snapshot_id, in which case the
+// caller should fall through to the Phase 1 url_path lookup.
+//
+// AIDEV-NOTE: a DB lookup error on suite_freshness is treated as
+// "fall through to url_path" — the Phase 1 path is the conservative
+// default. A DB error on snapshot_member after the suite is confirmed
+// adopted is also fall-through (handled=true, served=false), because
+// the request is contractually snapshot-scoped and a Phase 1 fallback
+// would violate the §6.1 invariant. The miss path will then re-attempt
+// the lookup or fetch with hash validation.
+func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, status int, bytesWritten int64, handled bool) {
+	suite, err := h.cache.GetSuiteFreshness(r.Context(),
+		req.CanonicalScheme, req.CanonicalHost, req.SuitePath)
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		return false, 0, 0, false
+	case err != nil:
+		h.logger.Warn("suite_freshness lookup failed",
+			"err", err,
+			"canonical_host", req.CanonicalHost,
+			"suite_path", req.SuitePath,
+		)
+		return false, 0, 0, false
+	}
+	if suite.CurrentSnapshotID == nil {
+		// Suite known but never adopted — pre-Phase-2 regime.
+		return false, 0, 0, false
+	}
+	snapshotID := *suite.CurrentSnapshotID
+
+	memberPath := suiteRelativePath(req.SuitePath, req.Path)
+	mem, err := h.cache.GetSnapshotMember(r.Context(), snapshotID, memberPath)
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		// SPEC2 §6.1: snapshot is the contract. Path not in the snapshot
+		// → 404. No Phase 1 fallback would be allowed to satisfy this
+		// request, regardless of whether url_path has a row for it.
+		http.Error(w, "not in snapshot", http.StatusNotFound)
+		return true, http.StatusNotFound, 0, true
+	case err != nil:
+		h.logger.Warn("snapshot_member lookup failed",
+			"err", err,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"snapshot_id", snapshotID,
+		)
+		// Don't fall through to url_path — the suite is adopted, so
+		// only the snapshot is allowed to satisfy the request. Return
+		// handled=true with served=false to push to the miss path.
+		return false, 0, 0, true
+	}
+
+	served, status, bytesWritten = h.serveBlobWithHeaders(w, r, req, mem.BlobHash, snapshotMeta{
+		snapshotID:    snapshotID,
+		lastFetchedAt: nil, // snapshot rows don't carry per-blob last-fetched
+	})
+	if !served {
+		// Blob open / stat error — drop into the miss path, but keep
+		// handled=true so url_path is not consulted.
+		return false, 0, 0, true
+	}
+	go h.touchAsync(req)
+	h.maybeFireFreshness(req)
+	return true, status, bytesWritten, true
+}
+
+// tryURLPathHit is the Phase 1 / non-metadata url_path lookup. It also
+// runs the SPEC2 §6.1 defense-in-depth package_hash check for .deb hits:
+//
+//   - 0 declared rows  → trust-upstream serve.
+//   - 1 declared row matching url_path.blob_hash → serve.
+//   - 1 declared row mismatching → evict url_path + decrement refcount,
+//     log hit_path_hash_evicted, return false (caller falls through to
+//     §6.2 miss path).
+//   - 2+ distinct declared hashes → 502 + Retry-After 60, log
+//     package_hash_conflict.
+func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, status int, bytesWritten int64) {
 	row, err := h.cache.LookupURL(r.Context(), req.CanonicalScheme, req.CanonicalHost, req.Path)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
@@ -217,37 +329,136 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 	if row.BlobHash == nil || *row.BlobHash == "" {
 		return false, 0, 0
 	}
-	exists, err := h.cache.BlobExists(*row.BlobHash)
+
+	if !req.IsMetadata {
+		if served, status, body, fellThrough := h.checkPackageHash(w, r, req, *row.BlobHash); fellThrough {
+			return false, 0, 0
+		} else if served {
+			return true, status, body
+		}
+	}
+
+	served, status, bytesWritten = h.serveBlobWithHeaders(w, r, req, *row.BlobHash, snapshotMeta{
+		lastFetchedAt: row.LastFetchedAt,
+	})
+	if !served {
+		return false, 0, 0
+	}
+	go h.touchAsync(req)
+	h.maybeFireFreshness(req)
+	return true, status, bytesWritten
+}
+
+// checkPackageHash runs the SPEC2 §6.1 defense-in-depth on a .deb hit.
+//
+// Returns served=true when the function wrote a 502 (conflict) directly.
+// Returns fellThrough=true when the row was evicted and the caller
+// should drop to the miss path. Returns both false when the hash check
+// passed (or no rows exist) and the caller should serve normally.
+func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string) (served bool, status int, bytesWritten int64, fellThrough bool) {
+	rows, err := h.cache.DeclaredHashesForPath(r.Context(),
+		req.CanonicalScheme, req.CanonicalHost, req.Path)
+	if err != nil {
+		h.logger.Warn("package_hash lookup failed",
+			"err", err,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+		)
+		// Fall through to a normal serve — the on-disk url_path row is
+		// our best Phase-1-grade answer. A hard fail-closed here would
+		// turn a transient SQLite hiccup into a global .deb 502 storm.
+		return false, 0, 0, false
+	}
+	distinct := distinctDeclared(rows)
+	switch len(distinct) {
+	case 0:
+		// No snapshot covers this .deb (Phase 1 trust-upstream regime,
+		// or this .deb's Packages member did not list it).
+		return false, 0, 0, false
+	case 1:
+		if distinct[0] == blobHash {
+			return false, 0, 0, false
+		}
+		// One row mismatches: stale Phase 1 row covered by a Phase 2
+		// snapshot has diverged. Evict + drop into miss path.
+		evictCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if eerr := h.cache.EvictURLPath(evictCtx,
+			req.CanonicalScheme, req.CanonicalHost, req.Path); eerr != nil {
+			h.logger.Warn("evict url_path failed",
+				"err", eerr,
+				"canonical_host", req.CanonicalHost,
+				"path", req.Path,
+			)
+		}
+		h.logger.Info("hit_path_hash_evicted",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"row_blob_hash", blobHash,
+			"declared_sha256", distinct[0],
+			"snapshot_id", rows[0].SnapshotID,
+		)
+		return false, 0, 0, true
+	default:
+		// Two or more distinct hashes: snapshots disagree. SPEC2 §6.1
+		// step 6 / §6.2 share fail-closed behavior — 502 + Retry-After
+		// 60 + log package_hash_conflict. Serving an arbitrary one of
+		// the conflicting hashes is worse than refusing.
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "package hash conflict", http.StatusBadGateway)
+		h.logger.Error("package_hash_conflict",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"row_blob_hash", blobHash,
+			"declared", declaredAttrs(rows),
+		)
+		return true, http.StatusBadGateway, 0, false
+	}
+}
+
+// snapshotMeta carries the metadata used by serveBlobWithHeaders to set
+// the response headers. snapshotID = 0 marks a Phase 1 / non-snapshot
+// serve (X-Cache-Snapshot suppressed); a positive value emits the
+// header. lastFetchedAt is the source for X-Cache-Age and may be nil.
+type snapshotMeta struct {
+	snapshotID    int64
+	lastFetchedAt *int64
+}
+
+// serveBlobWithHeaders opens pool/<blobHash>, sets the SPEC2 §3 headers,
+// and streams the file via http.ServeContent. Returns served=false on
+// any prerequisite failure (blob missing on disk, open or stat error)
+// so the caller can drop into the miss path.
+func (h *Handler) serveBlobWithHeaders(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, meta snapshotMeta) (served bool, status int, bytesWritten int64) {
+	exists, err := h.cache.BlobExists(blobHash)
 	if err != nil || !exists {
-		// Row points at a blob that's no longer on disk (manual delete,
-		// staging mishap). Drop into the miss path so we re-fetch.
 		if err != nil {
 			h.logger.Warn("blob existence check failed",
 				"err", err,
-				"hash", *row.BlobHash,
+				"hash", blobHash,
 			)
 		}
 		return false, 0, 0
 	}
-
-	hash := *row.BlobHash
-	path := h.cache.BlobPath(hash)
+	path := h.cache.BlobPath(blobHash)
 	f, err := os.Open(path)
 	if err != nil {
-		h.logger.Warn("blob open failed", "err", err, "hash", hash)
+		h.logger.Warn("blob open failed", "err", err, "hash", blobHash)
 		return false, 0, 0
 	}
 	defer f.Close()
-
 	st, err := f.Stat()
 	if err != nil {
-		h.logger.Warn("blob stat failed", "err", err, "hash", hash)
+		h.logger.Warn("blob stat failed", "err", err, "hash", blobHash)
 		return false, 0, 0
 	}
 
 	w.Header().Set(hdrXCache, cacheHit)
-	if row.LastFetchedAt != nil {
-		age := time.Now().Unix() - *row.LastFetchedAt
+	if meta.snapshotID > 0 {
+		w.Header().Set(hdrXCacheSnapshot, strconv.FormatInt(meta.snapshotID, 10))
+	}
+	if meta.lastFetchedAt != nil {
+		age := time.Now().Unix() - *meta.lastFetchedAt
 		if age < 0 {
 			age = 0
 		}
@@ -256,10 +467,60 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 
 	cw := &countingWriter{ResponseWriter: w}
 	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
-
-	go h.touchAsync(req)
-	h.maybeFireFreshness(req)
 	return true, cw.statusCode(), cw.bytes
+}
+
+// suiteRelativePath strips a suitePath prefix from a request path,
+// returning the suite-relative form snapshot_member.path uses
+// (e.g. "/ubuntu/dists/noble" + "/ubuntu/dists/noble/InRelease" →
+// "InRelease"). Defensive against the no-trailing-slash case where the
+// request matches the suite path itself; that path is not metadata
+// anyway and would not reach this function via tryCacheHit's gate.
+func suiteRelativePath(suitePath, fullPath string) string {
+	prefix := suitePath + "/"
+	if strings.HasPrefix(fullPath, prefix) {
+		return strings.TrimPrefix(fullPath, prefix)
+	}
+	// Path doesn't share the suite prefix — return as-is so the caller
+	// sees a well-defined "not in snapshot" miss rather than a partial
+	// match.
+	return fullPath
+}
+
+// distinctDeclared collapses a DeclaredHash slice down to its unique
+// declared_sha256 values, in stable insertion order. Used by the §6.1
+// step 4/5/6 dispatch — the *count* of unique hashes is what drives the
+// outcome, regardless of how many snapshots independently agreed on a
+// hash.
+func distinctDeclared(rows []cache.DeclaredHash) []string {
+	if len(rows) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(rows))
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if _, dup := seen[r.DeclaredSHA256]; dup {
+			continue
+		}
+		seen[r.DeclaredSHA256] = struct{}{}
+		out = append(out, r.DeclaredSHA256)
+	}
+	return out
+}
+
+// declaredAttrs renders a DeclaredHash slice as a structured
+// log-attribute value for the package_hash_conflict log line. The
+// repeated (declared_sha256, snapshot_id) tuples let an operator trace
+// which specific snapshots disagreed.
+func declaredAttrs(rows []cache.DeclaredHash) []map[string]any {
+	out := make([]map[string]any, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, map[string]any{
+			"declared_sha256": r.DeclaredSHA256,
+			"snapshot_id":     r.SnapshotID,
+		})
+	}
+	return out
 }
 
 // maybeFireFreshness fires the SPEC §7.1 T1 trigger after a metadata
