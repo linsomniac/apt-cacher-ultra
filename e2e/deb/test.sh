@@ -19,6 +19,10 @@
 
 set -euo pipefail
 
+# Pre-init so the EXIT trap (and any pre-launch failure) can safely
+# read DAEMON_PID under set -u via ${DAEMON_PID:-}.
+DAEMON_PID=""
+
 echo "[deb-test] sanity: exactly one .deb in /tmp"
 # nullglob — without it, an unmatched glob expands to the literal
 # pattern, which silently passes the "exactly one" check and turns
@@ -97,6 +101,29 @@ systemd-analyze verify --no-pager /lib/systemd/system/apt-cacher-ultra.service
 # /dev/tcp wait loop will time out and we want the stderr trail
 # in the failure output.
 daemon_log=/tmp/daemon.log
+
+# stop_daemon: graceful kill + wait + clear DAEMON_PID + confirm
+# :3142 is fully released. Used between phases so the next phase
+# can wipe cache and start a fresh daemon without racing the
+# previous process. Clearing DAEMON_PID also keeps the EXIT trap
+# from re-killing a PID that has already been reaped (which after
+# enough fork churn could collide with a different process).
+stop_daemon() {
+    if [[ -z "${DAEMON_PID:-}" ]]; then
+        return 0
+    fi
+    kill "$DAEMON_PID" 2>/dev/null || true
+    wait "$DAEMON_PID" 2>/dev/null || true
+    DAEMON_PID=""
+    for _ in $(seq 1 5); do
+        if ! (echo > /dev/tcp/127.0.0.1/3142) 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "WARN: :3142 still reachable 5s after stop_daemon"
+}
+
 echo "[deb-test] launching daemon (same ExecStart as systemd unit)"
 runuser -u apt-cacher-ultra -- \
     /usr/sbin/apt-cacher-ultra --config /etc/apt-cacher-ultra/config.toml \
@@ -104,8 +131,10 @@ runuser -u apt-cacher-ultra -- \
 DAEMON_PID=$!
 cleanup() {
     local ec=$?
-    kill "$DAEMON_PID" 2>/dev/null || true
-    wait "$DAEMON_PID" 2>/dev/null || true
+    if [[ -n "${DAEMON_PID:-}" ]]; then
+        kill "$DAEMON_PID" 2>/dev/null || true
+        wait "$DAEMON_PID" 2>/dev/null || true
+    fi
     if [[ $ec -ne 0 && -s "$daemon_log" ]]; then
         echo "=== daemon log ==="
         cat "$daemon_log"
@@ -158,8 +187,7 @@ echo "[deb-test] phase 1 (package contract + listener) PASS"
 
 echo
 echo "[deb-test] phase 2: stop phase-1 daemon"
-kill "$DAEMON_PID" 2>/dev/null || true
-wait "$DAEMON_PID" 2>/dev/null || true
+stop_daemon
 
 # Sanity: the repo-build stage produced both fixtures and a key.
 test -d /fixture-v1 || { echo "FAIL: /fixture-v1 missing (repo-build stage broken?)"; exit 1; }
@@ -363,14 +391,20 @@ echo "[deb-test] phase 2 (inline adoption smoke) PASS"
 # release_hash is set and inrelease_hash is nil.
 #
 # A clean cache directory is required: phase 2 already adopted an
-# inline snapshot, and the 404→detached fallback only fires for
-# suites with no current_snapshot_id.
+# inline snapshot. After the wipe there is no InRelease url_path
+# row alongside the seeded Release rows, so the inline checker
+# takes the missing-InRelease-url_path branch (freshness.go
+# checkLockedInline → fallback=true) and the freshness goroutine
+# runs RunDetached. The companion 404 fallback branch (cached
+# InRelease url_path row + 404 from upstream + nil current
+# snapshot) is covered by unit tests in freshness_test.go; the
+# e2e harness only needs to confirm one fallback flavor end-to-end
+# because both branches converge on the same RunDetached call.
 # ============================================================
 
 echo
 echo "[deb-test] phase 3: stop phase-2 daemon and wipe cache"
-kill "$DAEMON_PID" 2>/dev/null || true
-wait "$DAEMON_PID" 2>/dev/null || true
+stop_daemon
 # Wipe cache so the suite starts fresh (no current_snapshot_id, no
 # url_path rows). Daemon recreates cache.db on next start.
 rm -rf /var/cache/apt-cacher-ultra/* 2>/dev/null || true
