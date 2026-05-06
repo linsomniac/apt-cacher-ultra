@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -32,15 +31,19 @@ import (
 // never a torn mix) must hold throughout, the flip must complete, and
 // the cache's final state must point at B.
 //
-// AIDEV-NOTE: the cross-request "no client receives A's InRelease with
-// B's Packages" claim in SPEC2 §12.3 is a per-snapshot guarantee — each
-// individual response is coherent against its own X-Cache-Snapshot, but
-// a client batch that straddles the atomic flip can legitimately see A
-// for early requests and B for later ones (current_snapshot_id is
-// re-read per request). The cache's contract is per-request snapshot
-// resolution; clients that need strict per-batch pinning are out of
-// scope for Phase 2. We assert per-response coherence and final flip
-// success, which is what this layer can guarantee.
+// AIDEV-NOTE: SPEC2 §12.3 calls for "no client receives A's InRelease
+// with B's Packages or vice versa." The cache architecture does not
+// implement per-client snapshot pinning — every request reads
+// current_snapshot_id independently — so a client batch whose request
+// timing straddles the atomic flip can see A for some requests and B
+// for others. Per-request coherence (each individual body matches the
+// snapshot id it resolved against) IS strictly enforced; per-client
+// straddle is not. The test logs straddle counts so a regression that
+// inflates the rate (e.g. a flip that's no longer atomic, or a torn
+// member fetch) surfaces as a quantitative shift. This is documented
+// as a deliberate gap in the §12.3 invariant set; SPEC2 should be
+// revised to clarify the per-snapshot vs. per-client boundary, but
+// that is outside the scope of this test.
 func TestPhase2Chaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("phase 2 chaos test skipped in -short mode")
@@ -51,6 +54,13 @@ func TestPhase2Chaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 
 	var current atomic.Pointer[chaos2Snapshot]
 	current.Store(&snapA)
+
+	// memberFetchGate blocks the Adopter's member fetches when set.
+	// The pre-flip burst runs while the gate is closed — guaranteeing
+	// the §12.3 "during prefetch" precondition. The test releases the
+	// gate after the burst so adoption can complete and we can run a
+	// post-flip burst.
+	memberFetchGate := newChaos2Gate()
 
 	var upstreamCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -84,7 +94,7 @@ func TestPhase2Chaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 		t.Fatalf("parse upstream URL: %v", err)
 	}
 
-	stack := newPhase2ChaosStack(t, upstreamURL)
+	stack := newPhase2ChaosStackGated(t, upstreamURL, memberFetchGate)
 	defer stack.handler.Close()
 
 	allPaths := chaos2AllPaths()
@@ -148,35 +158,41 @@ func TestPhase2Chaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	}
 	stack.checker.WaitForAdoptions()
 
-	// Phase 2: swap upstream to serve B. The next freshness conditional
-	// GET will observe the change (ETag rotates from "A" to "B"),
-	// spawning a Phase 2 adoption.
+	// Phase 2: close the member-fetch gate, swap upstream to serve B,
+	// and drive ONE InRelease GET to start adoption. The freshness
+	// conditional GET completes (returning B's bytes), Check spawns
+	// the adoption goroutine, the goroutine VerifyInline-s and reaches
+	// the member-fetch step — at which point it blocks on the gate.
+	// We wait for the gate to record at least one waiter so the
+	// chaos burst is guaranteed to run with adoption stuck mid-prefetch.
+	memberFetchGate.Close()
 	current.Store(&snapB)
 
-	// Phase 3a: pre-flip chaos burst. The 100 client goroutines start
-	// while the cache is still pinned to snapshot A; the first
-	// metadata GET to fire freshness wins the per-suite TryLock and
-	// spawns the conditional GET (~ms-scale on loopback) which in
-	// turn hands off to the adoption goroutine. While that's in
-	// flight the rest of the burst sees A everywhere.
+	rec := httptest.NewRecorder()
+	stack.handler.ServeHTTP(rec, proxyReq("GET", srv.URL, chaos2Suite+"/InRelease"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("trigger adoption: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if err := memberFetchGate.WaitForWaiter(5 * time.Second); err != nil {
+		t.Fatalf("adoption never reached member-fetch gate: %v", err)
+	}
+
+	// Phase 3a: pre-flip chaos burst — runs WHILE adoption is blocked
+	// at the member-fetch step (gate is closed). All requests should
+	// resolve against snapshot A: the flip transaction has not yet
+	// run because the Adopter cannot complete prefetch.
 	pre := runChaos2Burst(t, stack.handler, srv.URL, allPaths, 100, &snapA, &snapB)
 
-	// Drive the flip to completion. The pre-flip burst may have
-	// triggered a Check goroutine that has not yet handed off to the
-	// adoption goroutine (Check returns synchronously after spawning
-	// the adoption goroutine, so adoptionWg will become non-zero a
-	// short time after the last burst request returns). Poll
-	// suite_freshness for the flip; if it doesn't happen on its own
-	// (Cooldown is 0 and the pre-flip burst already drove a Check —
-	// but the per-suite TryLock could have eaten every Check by
-	// returning before the underlying conditional GET resolved), nudge
-	// it by issuing one more InRelease GET against a settled lock.
+	// Phase 3b: release the gate. Adoption resumes prefetch, fetches
+	// B's Packages.gz, and runs the atomic flip transaction. Wait for
+	// suite_freshness.current_snapshot_id to update.
+	memberFetchGate.Open()
 	if err := waitForFlip(t, stack, upstreamURL, snapAID, srv.URL, 15*time.Second); err != nil {
-		t.Fatalf("flip never happened: %v", err)
+		t.Fatalf("flip never happened after gate release: %v", err)
 	}
 	stack.checker.WaitForAdoptions()
 
-	// Phase 3b: post-flip chaos burst. With B adopted, every client
+	// Phase 3c: post-flip chaos burst. With B adopted, every client
 	// should now see B's bytes for every path (modulo .deb miss-path
 	// refetch, which validates against snapshot B's package_hash and
 	// returns B's bytes).
@@ -190,13 +206,27 @@ func TestPhase2Chaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	assertChaos2Coherence(t, "pre-flip", pre, allPaths)
 	assertChaos2Coherence(t, "post-flip", post, allPaths)
 
-	// Post-flip: every response must be B's bytes. By the time
-	// runChaos2Burst returns the second time, the cache has flipped
-	// to snapshot B (waitForFlip blocked until current_snapshot_id
-	// changed) and trySnapshotHit serves B's metadata directly. The
-	// .deb hit path's package_hash check evicts the stale A-rooted
-	// url_path row on first request and the §6.2 miss path refetches
-	// B's bytes from upstream.
+	// Pre-flip strict assertion: with the member-fetch gate held closed
+	// for the duration of the pre-flip burst, current_snapshot_id is
+	// still A. Every response must be A's bytes. This catches a flip
+	// transaction that committed before its underlying member fetch
+	// (which would be a serious adoption ordering bug — flip-before-
+	// prefetch leaves the snapshot pointing at blobs we haven't
+	// actually verified hash-against-declared yet).
+	for _, s := range pre {
+		if !s.ok || s.snapLabel != "A" {
+			t.Errorf("pre-flip (gate closed): client=%d path=%s snap=%s status=%d (want A/200) — adoption flipped before member prefetch?",
+				s.clientID, s.path, s.snapLabel, s.status)
+		}
+	}
+
+	// Post-flip strict assertion: every response must be B's bytes.
+	// By the time runChaos2Burst returns, the cache has flipped to
+	// snapshot B (waitForFlip blocked on current_snapshot_id change)
+	// and trySnapshotHit serves B's metadata directly. The .deb hit
+	// path's package_hash check evicts the stale A-rooted url_path
+	// row on first request and the §6.2 miss path refetches B's
+	// bytes from upstream.
 	for _, s := range post {
 		if !s.ok || s.snapLabel != "B" {
 			t.Errorf("post-flip: client=%d path=%s snap=%s status=%d (want B/200)",
@@ -204,8 +234,19 @@ func TestPhase2Chaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 		}
 	}
 
+	// Per-client metadata coherence: log the count of clients whose
+	// InRelease and Packages.gz responses came from different
+	// snapshots. Architecturally this can be non-zero (see the
+	// AIDEV-NOTE on the test function), but inflating it is a
+	// regression signal.
+	preStraddles := chaos2CountMetadataStraddles(pre)
+	postStraddles := chaos2CountMetadataStraddles(post)
+	t.Logf("metadata straddle counts: pre-flip=%d post-flip=%d (architecturally allowed; inflation = regression)",
+		preStraddles, postStraddles)
+
 	// Final state: current_snapshot_id should point at a snapshot
-	// other than A's.
+	// whose inrelease_hash matches snapB.inRelease — not just
+	// "anything that isn't A."
 	suite, err = stack.handler.cache.GetSuiteFreshness(context.Background(),
 		"http", upstreamURL.Hostname(), chaos2Suite)
 	if err != nil || suite == nil || suite.CurrentSnapshotID == nil {
@@ -215,6 +256,51 @@ func TestPhase2Chaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 		t.Errorf("post-chaos: current_snapshot_id=%d (still A's) — adoption never flipped",
 			snapAID)
 	}
+	finalSnap, err := stack.handler.cache.GetSuiteSnapshot(context.Background(), *suite.CurrentSnapshotID)
+	if err != nil {
+		t.Fatalf("post-chaos: GetSuiteSnapshot(%d): %v", *suite.CurrentSnapshotID, err)
+	}
+	wantBHash := chaos2Sha256Hex(snapB.inRelease)
+	if finalSnap.InReleaseHash == nil || *finalSnap.InReleaseHash != wantBHash {
+		gotHash := "<nil>"
+		if finalSnap.InReleaseHash != nil {
+			gotHash = *finalSnap.InReleaseHash
+		}
+		t.Errorf("post-chaos: final inrelease_hash=%s, want B's hash %s",
+			gotHash, wantBHash)
+	}
+}
+
+// chaos2CountMetadataStraddles tallies clients whose InRelease and
+// Packages.gz responses came from different snapshots. Used as a
+// quantitative regression signal for the SPEC2 §12.3 per-client
+// claim — see the AIDEV-NOTE on TestPhase2Chaos_AdoptionFlipUnderConcurrency.
+func chaos2CountMetadataStraddles(samples []chaos2Sample) int {
+	type clientMeta struct{ inRelease, packages string }
+	per := make(map[int]*clientMeta)
+	for _, s := range samples {
+		if !s.ok {
+			continue
+		}
+		cm := per[s.clientID]
+		if cm == nil {
+			cm = &clientMeta{}
+			per[s.clientID] = cm
+		}
+		switch {
+		case strings.HasSuffix(s.path, "/InRelease"):
+			cm.inRelease = s.snapLabel
+		case strings.HasSuffix(s.path, "/Packages.gz"):
+			cm.packages = s.snapLabel
+		}
+	}
+	straddles := 0
+	for _, cm := range per {
+		if cm.inRelease != "" && cm.packages != "" && cm.inRelease != cm.packages {
+			straddles++
+		}
+	}
+	return straddles
 }
 
 // chaos2Sample captures one client request's outcome.
@@ -506,43 +592,109 @@ func (chaos2PassVerifier) VerifyInline(ctx context.Context, suite freshness.Suit
 // because canonicalize strips the port from the cache-key host —
 // which never matches the random port httptest binds to. This
 // wrapper rewrites the target URL's authority to the test server's
-// host:port and then issues the request via a plain net/http client,
-// bypassing fetch.Client's deny-CIDR + AllowedHostRegex (the test
-// upstream is loopback by construction; SSRF posture is irrelevant).
+// host:port, optionally blocks on a gate (so the chaos burst can run
+// while adoption's member fetch is in flight), and then delegates to
+// the production fetch.Client so URL/canonical-host validation,
+// redirect blocking, deny-CIDR posture, and connection hardening all
+// run end-to-end.
 type chaos2RewritingFetcher struct {
 	upstream *url.URL
-	client   *http.Client
+	inner    *fetch.Client
+	gate     *chaos2Gate // optional; when non-nil, blocks before delegating
 }
 
 func (f *chaos2RewritingFetcher) Fetch(ctx context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
+	if f.gate != nil {
+		if err := f.gate.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("chaos2RewritingFetcher: gate: %w", err)
+		}
+	}
 	u, err := url.Parse(target.URL)
 	if err != nil {
 		return nil, fmt.Errorf("chaos2RewritingFetcher: parse %q: %w", target.URL, err)
 	}
 	u.Host = f.upstream.Host
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("chaos2RewritingFetcher: NewRequest: %w", err)
+	rewritten := &fetch.Target{
+		CanonicalHost: target.CanonicalHost,
+		URL:           u.String(),
 	}
-	resp, err := f.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("chaos2RewritingFetcher: Do %s: %w", u, err)
+	return f.inner.Fetch(ctx, rewritten, dst)
+}
+
+// chaos2Gate is a one-shot test gate. While Closed, Wait blocks the
+// caller; Open releases all callers. The gate also tracks the count
+// of waiters so the test can synchronize with "adoption is parked at
+// member-fetch" without relying on sleeps.
+type chaos2Gate struct {
+	mu       sync.Mutex
+	closed   bool
+	release  chan struct{}
+	waiters  int32 // accessed via atomic
+	waiterCh chan struct{}
+}
+
+func newChaos2Gate() *chaos2Gate {
+	return &chaos2Gate{
+		release:  make(chan struct{}),
+		waiterCh: make(chan struct{}, 64),
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("chaos2RewritingFetcher: upstream %s: %d", u, resp.StatusCode)
+}
+
+func (g *chaos2Gate) Close() {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
+}
+
+func (g *chaos2Gate) Open() {
+	g.mu.Lock()
+	if !g.closed {
+		g.mu.Unlock()
+		return
 	}
-	n, err := io.Copy(dst, resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("chaos2RewritingFetcher: copy %s: %w", u, err)
+	g.closed = false
+	close(g.release)
+	g.release = make(chan struct{})
+	g.mu.Unlock()
+}
+
+// Wait blocks until the gate is open or ctx cancels. Records the
+// caller in the waiter channel so WaitForWaiter can synchronize.
+func (g *chaos2Gate) Wait(ctx context.Context) error {
+	g.mu.Lock()
+	if !g.closed {
+		g.mu.Unlock()
+		return nil
 	}
-	return &fetch.FetchResult{
-		Status:        http.StatusOK,
-		ContentLength: n,
-		ContentType:   resp.Header.Get("Content-Type"),
-		ETag:          resp.Header.Get("ETag"),
-		LastModified:  resp.Header.Get("Last-Modified"),
-	}, nil
+	release := g.release
+	g.mu.Unlock()
+	atomic.AddInt32(&g.waiters, 1)
+	defer atomic.AddInt32(&g.waiters, -1)
+	// Non-blocking send so even with the channel full we don't deadlock.
+	select {
+	case g.waiterCh <- struct{}{}:
+	default:
+	}
+	select {
+	case <-release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// WaitForWaiter blocks until at least one goroutine has entered Wait
+// (i.e. the gate has parked someone), or until timeout elapses.
+func (g *chaos2Gate) WaitForWaiter(timeout time.Duration) error {
+	if atomic.LoadInt32(&g.waiters) > 0 {
+		return nil
+	}
+	select {
+	case <-g.waiterCh:
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("no waiter arrived within %v", timeout)
+	}
 }
 
 // phase2ChaosStack bundles the wired-up handler stack the chaos test
@@ -556,13 +708,19 @@ type phase2ChaosStack struct {
 	adopter *freshness.Adopter
 }
 
-// newPhase2ChaosStack wires a full Phase 2 stack: cache, fetch.Client
-// (loopback-allow), pass-through GPG verifier, port-rewriting adoption
-// fetcher, freshness checker with adopter wired in, and a Handler
-// pointing at all of the above. Cooldown=0 so every metadata hit can
-// fire a freshness check; the per-suite mutex inside Check coalesces
-// the burst into a single in-flight conditional GET.
-func newPhase2ChaosStack(t *testing.T, upstream *url.URL) *phase2ChaosStack {
+// newPhase2ChaosStackGated wires a full Phase 2 stack: cache,
+// fetch.Client (loopback-allow), pass-through GPG verifier,
+// port-rewriting adoption fetcher (delegating into the same
+// production fetch.Client so URL validation and transport hardening
+// run end-to-end), freshness checker with adopter wired in, and a
+// Handler pointing at all of the above. Cooldown=0 so every metadata
+// hit can fire a freshness check; the per-suite mutex inside Check
+// coalesces the burst into a single in-flight conditional GET.
+//
+// gate, when non-nil, blocks the Adopter's member fetches until
+// Open()ed — the test uses this to park adoption at member-prefetch
+// while the chaos burst runs.
+func newPhase2ChaosStackGated(t *testing.T, upstream *url.URL, gate *chaos2Gate) *phase2ChaosStack {
 	t.Helper()
 
 	parser, err := proxy.New(nil, nil)
@@ -578,7 +736,7 @@ func newPhase2ChaosStack(t *testing.T, upstream *url.URL) *phase2ChaosStack {
 
 	fc, err := fetch.New(fetch.Options{
 		ConnectTimeout:   2 * time.Second,
-		TotalTimeout:     5 * time.Second,
+		TotalTimeout:     30 * time.Second, // gated member fetches park here; budget must exceed test wall-clock
 		MaxRetries:       0,
 		AllowedHostRegex: []string{`^127\.0\.0\.1$`, `^::1$`},
 		DenyTargetRanges: nil,
@@ -592,7 +750,7 @@ func newPhase2ChaosStack(t *testing.T, upstream *url.URL) *phase2ChaosStack {
 
 	adopter, err := freshness.NewAdopter(freshness.AdoptionConfig{
 		Cache:       c,
-		Fetcher:     &chaos2RewritingFetcher{upstream: upstream, client: &http.Client{Timeout: 5 * time.Second}},
+		Fetcher:     &chaos2RewritingFetcher{upstream: upstream, inner: fc, gate: gate},
 		Verifier:    chaos2PassVerifier{},
 		HostLimiter: limiter,
 		Logger:      silentLogger(),
