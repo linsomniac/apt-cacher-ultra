@@ -4,7 +4,7 @@ A robust apt repository cache focused on availability under upstream failure.
 
 Designed as a replacement for `apt-cacher-ng` that keeps cache hits fast and
 successful even when upstream Ubuntu/Debian/PPA mirrors are slow, broken, or
-under DDoS. See [SPEC.md](SPEC.md) for the Phase 1 specification.
+under DDoS.
 
 ## Status
 
