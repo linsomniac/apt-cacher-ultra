@@ -1,6 +1,6 @@
 # apt-cacher-ultra — Phase 2 Scoping
 
-Status: **scoping draft — not locked**. Last updated 2026-05-05 (Q2/Q4/Q5 resolved).
+Status: **scoping draft — not locked**. Last updated 2026-05-05 (Q1/Q2/Q3/Q4/Q5/Q10 resolved; Q6/Q7/Q8/Q9 open).
 
 This document gathers what Phase 2 is, what hooks Phase 1 left for it, and the
 open design questions that must be settled before this becomes a locked SPEC2.md
@@ -42,11 +42,14 @@ validation is the runtime enforcement that proves the flip held.
   the snapshot model in §3 produces orphans by design and waits for GC).
 - Status page / `/metrics` endpoint (Phase 5).
 - TLS MITM listener (Phase 6).
-- Streaming-while-fetching as a singleflight optimization. SPEC §6.2 lists
-  this as a Phase 2 candidate "if measurement shows it matters." Recommend
-  deferring unless production traffic argues for it — *Open Q1*.
+- Streaming-while-fetching as a singleflight optimization (SPEC §6.2 Phase 2
+  candidate). **Resolved (Q1): deferred** — revisit only if production
+  measurement on the cache-miss singleflight path shows the coalesce-and-
+  serialize policy hurts a real workload.
 - Per-byte read timeouts on upstream (currently `idle_read_timeout` is
-  informational). Probably also Phase 2 polish if it lands at all — *Open Q1*.
+  informational). **Resolved (Q1): deferred** alongside the streaming
+  question; both are Phase 3+ polish unless a specific incident motivates
+  one sooner.
 
 ---
 
@@ -102,9 +105,39 @@ CREATE TABLE snapshot_member (
   PRIMARY KEY (snapshot_id, path)
 );
 
+-- Per-snapshot .deb declared-hash index. Populated during adoption by
+-- parsing every Packages member; the .deb fetch path looks up its
+-- declared SHA256 here instead of re-parsing 30 MB of Packages on each
+-- miss. (See Q10.)
+CREATE TABLE package_hash (
+  canonical_scheme TEXT NOT NULL,
+  canonical_host   TEXT NOT NULL,
+  path             TEXT NOT NULL,         -- the .deb path: /ubuntu/pool/main/...
+  declared_sha256  TEXT NOT NULL,
+  snapshot_id      INTEGER NOT NULL REFERENCES suite_snapshot(snapshot_id),
+  PRIMARY KEY (canonical_scheme, canonical_host, path, snapshot_id)
+);
+CREATE INDEX idx_package_hash_snapshot ON package_hash(snapshot_id);
+
 ALTER TABLE suite_freshness
   ADD COLUMN current_snapshot_id INTEGER REFERENCES suite_snapshot(snapshot_id);
 ```
+
+`.deb` declared-hash lookup at fetch time:
+
+```sql
+SELECT declared_sha256
+FROM package_hash p
+JOIN suite_freshness sf ON sf.current_snapshot_id = p.snapshot_id
+WHERE p.canonical_scheme = ? AND p.canonical_host = ? AND p.path = ?
+LIMIT 1;
+```
+
+Empty result = no current snapshot vouches for this `.deb`. Phase 2 falls
+back to Phase 1 trust-upstream behavior in that case (covers pre-Phase-2
+deployments and `.deb` paths under suites that haven't adopted yet — see
+Q9). Phase 3 may tighten this to "refuse" once every actively-used suite
+on a host has at least one snapshot.
 
 **Atomic flip = single SQLite transaction:**
 
@@ -165,12 +198,57 @@ the prior snapshot. inrelease_change_seen_at remains set so the next
 periodic_refresh tries again.
 ```
 
-**Open Q3 — adoption concurrency.** This work happens off the request path
-(extending the existing freshness goroutine pattern) but member fetches consume
-the per-host semaphore. A burst of adoptions (operator restarts cache, every
-suite re-checks) could starve the request-path miss handler. Options:
-(a) keep the same `hostsem` and accept brief contention, (b) reserve a fraction
-of the budget for request-path traffic, (c) cap concurrent adoptions globally.
+**Resolved (Q3): shared `hostsem` + global adoption cap.**
+
+Hybrid of options (a) and (c). Concretely:
+
+- Adoption keeps using the same per-host semaphore the request-path miss
+  handler and Phase 1's freshness checker already share. Per-host fan-out
+  is bounded by the existing `upstream.max_concurrent_per_host` (default 8).
+- Add a *cache-wide* `freshness.max_concurrent_adoptions` semaphore that
+  caps how many adoptions can run simultaneously across the whole cache.
+  Acquired once at adoption start, released after the atomic flip (or
+  abort). Default 2; `0` disables the cap.
+- Members within an adoption are fetched **sequentially**. One adoption
+  in flight = at most one `hostsem` slot consumed by adoption traffic at
+  any moment per host. With `max_concurrent_adoptions = 2`, request-path
+  loses at most 2 of N host slots even during a restart storm.
+
+**Why this combination over the alternatives:**
+
+- **Option (b) — reserved fraction for request-path** — would mean nested
+  semaphore acquisition (small adoption-budget sem inside the larger
+  hostsem). That introduces ordering rules and a deadlock surface for a
+  benefit that the global cap already provides without those hazards.
+  Robustness loses to complexity; not worth it.
+- **Option (a) alone** — the Phase 1 status quo — is fine in the steady
+  state but degrades badly under the realistic worst case: a cache
+  restart causes every suite to re-check, every check that finds new
+  metadata starts an adoption, and 10+ simultaneous adoptions to the
+  same host can saturate `hostsem` for minutes while request-path
+  callers wait or 502. The global cap eliminates that scenario.
+- **Option (c) alone** — global cap without sequential members — could
+  still let one adoption parallelize member fetches and consume every
+  hostsem slot for a host. Sequencing members inside an adoption is the
+  cheap fix that keeps reasoning trivial: in-flight adoption load on any
+  single host is bounded by the cap, full stop.
+
+**Robustness properties this gives us:**
+
+- Cache-hit path is untouched (Phase 1's bulletproofing carries forward).
+- Cache-miss path on host H sees adoption consume at most
+  `max_concurrent_adoptions` of H's slots, so a host with `N` slots and
+  cap `2` always has `N-2` slots available for request-path traffic.
+- Adoption itself is bounded: the cap prevents pathological queue depth;
+  a 100-suite restart storm processes adoptions `cap` at a time but each
+  adoption still completes in normal time.
+- One semaphore, one acquisition site (top of the adoption goroutine),
+  no nested ordering — the testable surface is small.
+
+A future Phase 2 polish (under measurement) might parallelize member
+fetches within an adoption for faster end-to-end adoption time. That's a
+separate change with its own concurrency bound to design; sequential is
+the conservative starting point.
 
 ### 3.3 GPG verification
 
@@ -265,6 +343,7 @@ does not touch existing rows beyond schema additions.
 ALTER TABLE blob (no column change; refcount semantics activated)
 ADD TABLE suite_snapshot
 ADD TABLE snapshot_member
+ADD TABLE package_hash               -- materialized .deb declared-hash index (Q10)
 ALTER TABLE suite_freshness ADD COLUMN current_snapshot_id INTEGER
 INSERT INTO schema_version VALUES (2)
 ```
@@ -278,6 +357,30 @@ Migration is forward-only (Phase 1 already enforces this). Existing
 successful freshness check post-upgrade. Pre-Phase-2 metadata blobs
 continue to serve via the Phase 1 `url_path` lookup until a snapshot is
 adopted (see Q9).
+
+### 4.1 New configuration keys
+
+```toml
+[freshness]
+# Phase 2: cap simultaneous adoptions cache-wide. 0 = unlimited (matches
+# the Phase 1 status quo). Default 2 keeps adoption load bounded under a
+# restart storm; per-host fan-out is still bounded by
+# upstream.max_concurrent_per_host. (See Q3.)
+max_concurrent_adoptions = 2
+
+[adoption]
+# Phase 2: master switch. When false, the cache continues Phase 1 behavior
+# (record inrelease_change_seen_at, do not adopt). Behind a flag for the
+# shadow-deploy phase of rollout per §6 sequencing.
+enabled            = false
+require_signature  = true        # GPG verify before adopting; false at operator's risk
+
+[[trusted_signer]]
+# Optional per-suite GPG fingerprint pinning (Q4 hybrid). Empty list of
+# fingerprints is rejected at startup as an obvious operator footgun.
+match_canonical_host = '^archive\.ubuntu\.com$'
+fingerprints         = ['F6ECB3762474EDA9D21B7022871920D1991BC93C']
+```
 
 ---
 
@@ -332,21 +435,21 @@ Each step is independently shippable and independently chaos-testable.
 
 | ID | Question | Resolution |
 |---|---|---|
+| Q1 | Streaming-while-fetching + per-byte read timeouts | **Deferred.** Revisit if production measurement on the cache-miss path argues for it. (§1.1) |
 | Q2 | Request-path lookup model | **Snapshot-scoped** via `suite_freshness.current_snapshot_id` → `snapshot_member`. `url_path` retains stats but is no longer source-of-truth for which blob a metadata path resolves to. (§3.1) |
+| Q3 | Adoption concurrency policy | **Shared `hostsem` + global adoption cap.** Sequential member fetches inside an adoption + cache-wide `freshness.max_concurrent_adoptions` (default 2). One semaphore acquisition site, no nested ordering, robust to restart storms. (§3.2) |
 | Q4 | GPG keyring source | **Hybrid**: host apt keyring as default trust set, optional per-suite pinning via `[[trusted_signer]]` blocks. (§3.3) |
 | Q5 | OpenPGP library | **`github.com/ProtonMail/go-crypto/openpgp`** (the maintained replacement for the deprecated `x/crypto/openpgp`). (§3.3) |
+| Q10 | `.deb` declared-hash storage | **Materialize during adoption** into `package_hash` table; lookup joins through `suite_freshness.current_snapshot_id`. Empty result falls back to Phase 1 trust-upstream behavior. (§3.1) |
 
 ### 7.2 Open
 
 | ID | Question |
 |---|---|
-| Q1 | Is streaming-while-fetching and per-byte read timeouts in scope for Phase 2, or punted? |
-| Q3 | Adoption concurrency: shared `hostsem`, fraction-reserved, or global cap? |
 | Q6 | Detached `Release.gpg` support — required for Phase 2 or only `InRelease` inline? |
 | Q7 | Proactive by-hash prefetch during adoption, or on-demand? |
 | Q8 | Default cadence for read-path integrity scan, and is it disable-able? |
 | Q9 | Pre-Phase-2 pool/ blobs: trusted-until-replaced, or cold re-fetch on upgrade? |
-| Q10 | `.deb` declared-hash storage — derive at fetch time from the `Packages` blob, or materialize a `package_hash` table during adoption? Performance/complexity tradeoff (§3.1). |
 
 ---
 
