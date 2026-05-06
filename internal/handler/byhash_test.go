@@ -31,7 +31,23 @@ func TestServeHTTP_ByHashContentAddressed_PoolHit(t *testing.T) {
 	body := []byte("by-hash Packages bytes")
 	hash := writeBlob(t, h, body)
 
-	// No url_path row. No snapshot. Request the by-hash URL directly.
+	// Provenance: stage a url_path row under the SAME host pointing
+	// at this blob — represents a prior fetch via some other URL
+	// (e.g. /dists/noble/main/binary-amd64/Packages.gz). The fallback
+	// is gated on this same-host association so a cross-host SHA256
+	// probe can't promiscuously serve pool blobs.
+	priorPath := "/dists/noble/main/binary-amd64/Packages.gz"
+	if err := h.cache.PutURLPath(context.Background(), cache.URLPath{
+		CanonicalScheme: scheme,
+		CanonicalHost:   hostKey(host, port),
+		Path:            priorPath,
+		BlobHash:        &hash,
+		IsMetadata:      true,
+	}); err != nil {
+		t.Fatalf("PutURLPath: %v", err)
+	}
+
+	// No url_path row for the by-hash URL itself. No snapshot.
 	path := "/dists/noble/main/binary-amd64/by-hash/SHA256/" + hash
 	rec := httptest.NewRecorder()
 	r := newProxyReqHostPort("GET", scheme, host+port, path)
@@ -217,5 +233,115 @@ func TestServeHTTP_ByHashContentAddressed_LookupURLNotFoundShape(t *testing.T) {
 	_, err := h.cache.LookupURL(context.Background(), "http", "no.such.host", "/x")
 	if !errors.Is(err, cache.ErrNotFound) {
 		t.Errorf("LookupURL on absent row: want ErrNotFound, got %v", err)
+	}
+}
+
+// Security gate: a request under a host the allowlist does not cover
+// must NOT serve from pool/<hex> via the by-hash fallback, even if the
+// blob exists. Without this gate, a caller who learns a SHA256 from
+// one cached host could request it under any unrelated host (passing
+// the apt URL syntax check) and receive bytes — bypassing SPEC §6.6
+// allowlist. Expected outcome: 403, identical to the existing
+// allowlist rejection path for any other URL.
+func TestServeHTTP_ByHashContentAddressed_DisallowedHostRejected(t *testing.T) {
+	// Allow only 127.0.0.1; the by-hash request will use a different
+	// hostname that does not match the regex.
+	h := newTestHandler(t, []string{`^127\.0\.0\.1$`}, nil)
+	body := []byte("private content")
+	hash := writeBlob(t, h, body)
+
+	// Stage a url_path row under the allowed host so HostHasBlob would
+	// otherwise pass — proves the gate that fires is HostAllowed, not
+	// the provenance check.
+	if err := h.cache.PutURLPath(context.Background(), cache.URLPath{
+		CanonicalScheme: "http",
+		CanonicalHost:   "127.0.0.1",
+		Path:            "/dists/foo/main/binary-amd64/Packages.gz",
+		BlobHash:        &hash,
+		IsMetadata:      true,
+	}); err != nil {
+		t.Fatalf("PutURLPath: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := newProxyReqHostPort("GET", "http", "evil.example.com",
+		"/dists/foo/main/binary-amd64/by-hash/SHA256/"+hash)
+	h.ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status=%d body=%q, want 403 (disallowed host must not bypass §6.6 via by-hash fallback)",
+			rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() == string(body) {
+		t.Errorf("disallowed-host request leaked the cached bytes")
+	}
+}
+
+// Security gate: same-host provenance. A blob in pool/<hex> that has
+// NEVER been fetched under the requested host must not be served via
+// the by-hash fallback. The dedup feature is for legitimate cross-
+// SUITE / cross-URL hits within a single allowed host, not for
+// promiscuous cross-HOST serving.
+func TestServeHTTP_ByHashContentAddressed_RejectsCrossHostBlob(t *testing.T) {
+	// Allow both hosts (so HostAllowed passes); the gate that fires is
+	// HostHasBlob, not the allowlist.
+	h := newTestHandler(t, []string{`^(host-a|host-b)\.example$`}, nil)
+
+	body := []byte("blob fetched under host-a")
+	hash := writeBlob(t, h, body)
+
+	// Provenance: blob is associated with host-a only.
+	if err := h.cache.PutURLPath(context.Background(), cache.URLPath{
+		CanonicalScheme: "http",
+		CanonicalHost:   "host-a.example",
+		Path:            "/dists/foo/main/binary-amd64/Packages.gz",
+		BlobHash:        &hash,
+		IsMetadata:      true,
+	}); err != nil {
+		t.Fatalf("PutURLPath: %v", err)
+	}
+
+	// Serve attempt under host-b — same blob, different host. The
+	// fallback must refuse and the request goes to the miss path.
+	upstreamCalls := atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		http.Error(w, "miss path probably can't reach here", http.StatusNotFound)
+	}))
+	defer srv.Close()
+	_ = srv.URL
+
+	rec := httptest.NewRecorder()
+	r := newProxyReqHostPort("GET", "http", "host-b.example",
+		"/dists/foo/main/binary-amd64/by-hash/SHA256/"+hash)
+	h.ServeHTTP(rec, r)
+
+	// Either upstream-attempt 502 (host-b.example is not resolvable)
+	// or some other failure mode — the assertion is just that we did
+	// NOT serve the cached body.
+	if rec.Body.String() == string(body) {
+		t.Errorf("cross-host by-hash request leaked the cached bytes (status=%d)", rec.Code)
+	}
+}
+
+// Security gate: SuitePath is required. A by-hash-shaped path that
+// doesn't sit under /dists/<suite>/ is not a legitimate apt request;
+// the fallback must refuse before consulting the pool.
+func TestServeHTTP_ByHashContentAddressed_RequiresSuitePath(t *testing.T) {
+	h := newTestHandler(t, nil, nil)
+	body := []byte("contents")
+	hash := writeBlob(t, h, body)
+
+	// Path uses by-hash form but lives outside any /dists/<suite>/.
+	// proxy.SuitePath returns "" → req.SuitePath == "" → fallback must
+	// not fire. Without an upstream the request will fail with 502;
+	// what we care about is that the cached body is not served.
+	rec := httptest.NewRecorder()
+	r := newProxyReqHostPort("GET", "http", "127.0.0.1",
+		"/oddly-shaped/by-hash/SHA256/"+hash)
+	h.ServeHTTP(rec, r)
+
+	if rec.Body.String() == string(body) {
+		t.Errorf("non-suite by-hash path served cached bytes (status=%d)", rec.Code)
 	}
 }

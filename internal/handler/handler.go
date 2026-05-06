@@ -451,12 +451,39 @@ var byHashSuffixRegex = regexp.MustCompile(`/by-hash/SHA256/([0-9a-f]{64})$`)
 // "snapshot is the contract" invariant must not be bypassed; gating on
 // non-adoption upholds it.
 //
+// Three security gates apply *before* a serve:
+//
+//  1. SuitePath != "" — by-hash URLs are only meaningful under
+//     /dists/<suite>/. A request without a suite path is not a legitimate
+//     apt by-hash request; reject without consulting the pool.
+//  2. HostAllowed — ServeHTTP delays the §6.6 allowlist check until after
+//     tryCacheHit (lines 213/225). For Phase 1/2 hits that's safe because
+//     url_path rows are host-scoped — only previously-allowed hosts have
+//     them. The pool is *not* host-scoped, so the fallback explicitly
+//     re-runs the allowlist check; otherwise a client could request a
+//     known SHA256 under a disallowed host and bypass §6.6.
+//  3. Same-host provenance (HostHasBlob) — the blob must have been
+//     fetched under this host before. Without this, a caller who learns
+//     a SHA256 from one cached host could request it under any other
+//     allowlisted host and receive content that host has never vouched
+//     for. The dedup benefit is preserved (same-host cross-suite by-hash
+//     paths still hit), only cross-host promiscuous serving is denied.
+//
 // On success, materializes a url_path row pointing at the existing pool
 // blob so subsequent requests skip the regex+stat dance and reuse the
 // faster tryURLPathHit path. Failure to insert the row is non-fatal —
 // the response was already served; the next request will repeat the
 // fallback.
 func (h *Handler) tryByHashContentAddressed(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, status int, bytesWritten int64) {
+	if req.SuitePath == "" {
+		return false, 0, 0
+	}
+	if !h.fetch.HostAllowed(req.CanonicalHost) {
+		// Let ServeHTTP's existing post-tryCacheHit allowlist branch
+		// emit the 403 + log line (line 224). Returning false here
+		// keeps the rejection on its single canonical code path.
+		return false, 0, 0
+	}
 	m := byHashSuffixRegex.FindStringSubmatch(req.Path)
 	if m == nil {
 		return false, 0, 0
@@ -464,6 +491,22 @@ func (h *Handler) tryByHashContentAddressed(w http.ResponseWriter, r *http.Reque
 	hash := m[1]
 	exists, err := h.cache.BlobExists(hash)
 	if err != nil || !exists {
+		return false, 0, 0
+	}
+	// Same-host provenance: the blob must already be associated with
+	// this host via some prior fetch. Defense-in-depth against the
+	// cross-host SHA256-probe attack. A DB error fails closed (no
+	// serve) because we can't establish provenance.
+	hasIt, err := h.cache.HostHasBlob(r.Context(), req.CanonicalScheme, req.CanonicalHost, hash)
+	if err != nil {
+		h.logger.Debug("by-hash provenance lookup failed",
+			"err", err,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+		)
+		return false, 0, 0
+	}
+	if !hasIt {
 		return false, 0, 0
 	}
 	served, status, bytesWritten = h.serveBlobWithHeaders(w, r, req, hash, snapshotMeta{

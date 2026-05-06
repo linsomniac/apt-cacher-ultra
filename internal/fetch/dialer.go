@@ -115,6 +115,18 @@ func newTransport(opts Options, deny []netip.Prefix, tracker *unreachableTracker
 // instead of the original timeout error so the outer Fetch loop bails
 // fast. Successful dials clear the marker; deny-CIDR rejections do not
 // touch it (the failure mode is config, not network).
+//
+// AIDEV-NOTE: Per-Fetch retry interaction. Because markFailed runs
+// inside the dialer (one layer below the Fetch retry loop), the FIRST
+// failed dial in a single Fetch puts the host in cooldown immediately,
+// so the SECOND attempt of that same Fetch already hits the probe
+// path and bails. Effectively MaxRetries collapses to 1 probe-retry on
+// dial failures (it remains in full effect for non-dial retryable
+// errors like 5xx or partial reads). This is intentional — SPEC §1
+// "never hang" prefers fast aggregate failure over a single Fetch
+// burning the full ConnectTimeout × MaxRetries budget on a host that
+// already proved unreachable. Operators who want the legacy budget
+// can set upstream.unreachable_cooldown = "0s".
 func wrapDialWithTracker(
 	inner func(ctx context.Context, network, addr string) (net.Conn, error),
 	tracker *unreachableTracker,

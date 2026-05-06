@@ -94,6 +94,33 @@ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ?`
 	})
 }
 
+// HostHasBlob reports whether (scheme, host) has any url_path row
+// pointing at blobHash. Used by the by-hash content-addressed fallback
+// to verify that the blob was previously fetched through this host's
+// allowlist before serving it under a new URL — without this gate, a
+// caller who learns a SHA256 from one host's content could request it
+// under any other allowlisted host and receive bytes that were never
+// vouched for by that host. ErrInvalidHash on a malformed hash; nil
+// (false, no error) when the row simply does not exist.
+func (c *Cache) HostHasBlob(ctx context.Context, scheme, host, blobHash string) (bool, error) {
+	if !validBlobHash(blobHash) {
+		return false, fmt.Errorf("%w: %q", ErrInvalidHash, blobHash)
+	}
+	const q = `
+SELECT 1 FROM url_path
+WHERE canonical_scheme = ? AND canonical_host = ? AND blob_hash = ?
+LIMIT 1`
+	var one int
+	err := c.db.QueryRowContext(ctx, q, scheme, host, blobHash).Scan(&one)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("HostHasBlob: %w", err)
+	}
+	return true, nil
+}
+
 // GetBlob returns the blob row for hash, or ErrNotFound. Returns
 // ErrInvalidHash without touching the DB if the hash is malformed.
 func (c *Cache) GetBlob(ctx context.Context, hash string) (*Blob, error) {

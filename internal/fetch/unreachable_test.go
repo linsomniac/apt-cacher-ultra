@@ -3,6 +3,7 @@ package fetch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -96,11 +97,14 @@ func stubDialFails(stubDuration time.Duration, calls *atomic.Int32) func(context
 }
 
 // Integration-level: Fetch against a stub dialer that always times out.
-// First call burns the simulated dial duration × retry budget; second
-// call within cooldown completes within the probe budget and returns
-// ErrHostUnreachable wrapped under ErrUpstreamUnavailable, with no
-// retries (max_retries=3 but ErrHostUnreachable is non-retryable per
-// isRetryable).
+// First call: one full-budget dial attempt (which marks the host
+// failed) plus exactly one probe-retry that fast-fails — markFailed
+// fires inside the dialer, so the second attempt already hits the
+// cooldown path. This is the documented design (see AIDEV-NOTE in
+// dialer.go wrapDialWithTracker): MaxRetries collapses to one probe
+// for dial failures because retrying with the full ConnectTimeout
+// against a host that already timed out is a hang. Subsequent Fetch
+// calls within cooldown skip straight to the probe and bail.
 func TestFetch_FastFailAfterDialTimeout(t *testing.T) {
 	var dialCalls atomic.Int32
 	const stubDuration = 60 * time.Millisecond
@@ -128,13 +132,17 @@ func TestFetch_FastFailAfterDialTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatalf("first Fetch: expected error")
 	}
-	// First call burns through retries: ~stubDuration × (1 + MaxRetries).
-	// Generous upper bound to keep CI reliable.
+	// First call: one full-budget dial + one probe retry. The full-
+	// budget attempt is bounded by stubDuration (60ms here), the probe
+	// by probe_timeout (20ms). Generous upper bound to keep CI reliable.
 	if firstElapsed > 2*time.Second {
-		t.Errorf("first Fetch: elapsed %v too long; expected ~stubDuration × retries", firstElapsed)
+		t.Errorf("first Fetch: elapsed %v too long; expected ~stubDuration + probe", firstElapsed)
 	}
-	if got := dialCalls.Load(); got < 2 {
-		t.Errorf("first Fetch: want full retry budget (≥2 dials), got %d", got)
+	// Exactly 2 dials: initial attempt (records the cooldown) + one
+	// probe retry that fast-fails. Not (1 + MaxRetries) because
+	// markFailed fires before the second attempt's isRetryable check.
+	if got := dialCalls.Load(); got != 2 {
+		t.Errorf("first Fetch: want exactly 2 dials (initial + probe-retry), got %d", got)
 	}
 
 	// Second call within cooldown must be fast (single probe attempt
@@ -242,5 +250,35 @@ func TestNew_NegativeUnreachable(t *testing.T) {
 	}
 	if _, err := New(Options{UnreachableProbeTimeout: -1}); err == nil {
 		t.Errorf("negative UnreachableProbeTimeout: expected error")
+	}
+}
+
+// markFailed opportunistically prunes expired entries so the map size
+// is bounded by "hosts that failed within the last cooldown window."
+// Without this, an upstream-down event with a broad allowlist could
+// grow the map indefinitely over the life of the process.
+func TestUnreachableTracker_PruneExpired(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	clock := func() time.Time { return now }
+	u := newUnreachableTracker(30*time.Second, time.Second, clock)
+
+	// Mark 100 hosts failed at time t0.
+	for i := 0; i < 100; i++ {
+		u.markFailed(fmt.Sprintf("h-%d.example", i))
+	}
+	if got := len(u.last); got != 100 {
+		t.Fatalf("after 100 markFailed: map size = %d, want 100", got)
+	}
+
+	// Advance past the cooldown and mark one fresh host failed. The
+	// pruning sweep must drop all 100 stale entries; only the fresh
+	// one remains.
+	now = now.Add(60 * time.Second)
+	u.markFailed("fresh.example")
+	if got := len(u.last); got != 1 {
+		t.Errorf("after advance + 1 markFailed: map size = %d, want 1 (sweep should have pruned the rest)", got)
+	}
+	if _, ok := u.last["fresh.example"]; !ok {
+		t.Errorf("fresh entry missing after sweep")
 	}
 }

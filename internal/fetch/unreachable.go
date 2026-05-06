@@ -75,13 +75,31 @@ func (u *unreachableTracker) inCooldown(host string) (bool, time.Duration) {
 
 // markFailed records that host's most recent dial attempt failed. The
 // next dial within cooldown becomes a probe.
+//
+// Opportunistically sweeps expired entries on every call so the map
+// size is bounded by "hosts that failed within the last cooldown
+// window" — without this, an upstream-down event at a deployment with
+// a broad allowed_host_regex (or an attacker pointing the cache at
+// many distinct allowlisted-but-currently-broken hostnames) would let
+// the map accumulate entries for the life of the process. The sweep is
+// O(N) under the mutex, but markFailed only fires after a connect-
+// timeout-scale wait, so the amortized cost is negligible.
 func (u *unreachableTracker) markFailed(host string) {
 	if u == nil || host == "" {
 		return
 	}
 	u.mu.Lock()
-	u.last[host] = u.now()
-	u.mu.Unlock()
+	defer u.mu.Unlock()
+	now := u.now()
+	u.last[host] = now
+	for k, t := range u.last {
+		if k == host {
+			continue
+		}
+		if now.Sub(t) >= u.cooldown {
+			delete(u.last, k)
+		}
+	}
 }
 
 // markOK clears any cooldown for host. Called on a successful dial so the
