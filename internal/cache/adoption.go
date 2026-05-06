@@ -121,6 +121,28 @@ SELECT snapshot_id, adopted_at FROM suite_snapshot
 		if adoptedAt.Valid {
 			return fmt.Errorf("%w: snapshot_id=%d", ErrSnapshotNaturalKeyAdopted, existingID)
 		}
+		// Refresh mutable, non-natural-key columns so a retry that
+		// supplies (e.g.) a re-signed Release.gpg or fresher validators
+		// is reflected on the reused row. Without this, in detached
+		// mode the same Release bytes paired with a different fresh
+		// Release.gpg on retry would commit a snapshot_member row at
+		// "Release.gpg" pointing at the new sig hash, while the
+		// suite_snapshot.release_gpg_hash column still recorded the
+		// old (failed-attempt) signature — an internal inconsistency.
+		// inrelease_hash / release_hash are part of the natural key
+		// and cannot have changed (we only got here because they
+		// matched); leave them.
+		const refreshQ = `
+UPDATE suite_snapshot
+   SET release_gpg_hash   = ?,
+       inrelease_etag     = ?,
+       inrelease_lastmod  = ?
+ WHERE snapshot_id = ?`
+		if _, err := conn.ExecContext(ctx, refreshQ,
+			sc.ReleaseGPGHash, sc.InReleaseETag, sc.InReleaseLastMod,
+			existingID); err != nil {
+			return fmt.Errorf("InsertCandidateSnapshot: refresh mutable cols on reuse: %w", err)
+		}
 		id = existingID
 		reused = true
 		return nil

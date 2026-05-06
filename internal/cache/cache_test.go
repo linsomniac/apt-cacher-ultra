@@ -1421,6 +1421,91 @@ func TestInsertCandidateSnapshot_NaturalKeyAdoptedConflict(t *testing.T) {
 	}
 }
 
+// TestInsertCandidateSnapshot_ReuseRefreshesMutableCols covers the
+// detached-mode case where the same Release bytes are paired with a
+// different Release.gpg signature on retry. The natural key only
+// considers COALESCE(inrelease_hash, release_hash), so the orphan is
+// reusable; but its release_gpg_hash column must be refreshed to the
+// retry's signature so it stays consistent with the snapshot_member
+// row CommitAdoption will write at path "Release.gpg". Validators are
+// also refreshed for the same reason. Regression guard for codex
+// review finding on commit f5bf699.
+func TestInsertCandidateSnapshot_ReuseRefreshesMutableCols(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	releaseHash := seedBlob(t, c, "Release bytes (stable)")
+	sigHash1 := seedBlob(t, c, "Release.gpg sig v1")
+	sigHash2 := seedBlob(t, c, "Release.gpg sig v2")
+	etag1, lm1 := "etag-v1", "lastmod-v1"
+	etag2, lm2 := "etag-v2", "lastmod-v2"
+
+	// First attempt: detached candidate with sig v1.
+	id1, reused1, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme:  "http",
+		CanonicalHost:    "archive.ubuntu.com",
+		SuitePath:        "/ubuntu/dists/noble",
+		ReleaseHash:      &releaseHash,
+		ReleaseGPGHash:   &sigHash1,
+		InReleaseETag:    &etag1,
+		InReleaseLastMod: &lm1,
+	})
+	if err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	if reused1 {
+		t.Errorf("first insert: reused=true, want false")
+	}
+
+	// Second attempt: same Release bytes, fresh signature + validators.
+	id2, reused2, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme:  "http",
+		CanonicalHost:    "archive.ubuntu.com",
+		SuitePath:        "/ubuntu/dists/noble",
+		ReleaseHash:      &releaseHash,
+		ReleaseGPGHash:   &sigHash2,
+		InReleaseETag:    &etag2,
+		InReleaseLastMod: &lm2,
+	})
+	if err != nil {
+		t.Fatalf("second insert: %v", err)
+	}
+	if !reused2 {
+		t.Errorf("second insert: reused=false, want true")
+	}
+	if id2 != id1 {
+		t.Fatalf("second insert: id=%d, want %d (reused)", id2, id1)
+	}
+
+	// The reused row must now report the v2 signature and validators —
+	// without this refresh, suite_snapshot.release_gpg_hash would lie
+	// about which signature blob is paired with this Release.
+	snap, err := c.GetSuiteSnapshot(ctx, id2)
+	if err != nil {
+		t.Fatalf("GetSuiteSnapshot: %v", err)
+	}
+	if snap.ReleaseGPGHash == nil || *snap.ReleaseGPGHash != sigHash2 {
+		got := "<nil>"
+		if snap.ReleaseGPGHash != nil {
+			got = *snap.ReleaseGPGHash
+		}
+		t.Errorf("release_gpg_hash = %s, want %s", got, sigHash2)
+	}
+	if snap.InReleaseETag == nil || *snap.InReleaseETag != etag2 {
+		got := "<nil>"
+		if snap.InReleaseETag != nil {
+			got = *snap.InReleaseETag
+		}
+		t.Errorf("inrelease_etag = %q, want %q", got, etag2)
+	}
+	if snap.InReleaseLastMod == nil || *snap.InReleaseLastMod != lm2 {
+		got := "<nil>"
+		if snap.InReleaseLastMod != nil {
+			got = *snap.InReleaseLastMod
+		}
+		t.Errorf("inrelease_lastmod = %q, want %q", got, lm2)
+	}
+}
+
 func TestCommitAdoption_FirstAdoption(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
