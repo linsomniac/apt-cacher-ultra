@@ -16,12 +16,18 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-# Parse into an array up front. Word-splitting on a bare string
-# (`for ver in $versions`) would silently iterate zero times for
-# whitespace-only input — both the validation loop and the test
-# loop would no-op, and the script would happily report
-# "OVERALL PASS" with nothing actually run.
-read -r -a versions <<< "${UBUNTU_VERSIONS:-24.04 26.04}"
+# Parse into an array up front, splitting on all shell whitespace
+# (space/tab/newline) so a multiline value — e.g. a CI YAML block
+# scalar like `UBUNTU_VERSIONS: |\n  24.04\n  26.04\n` — parses
+# correctly. The naive `read -r -a <<< "$x"` stops at the first
+# newline and silently drops later lines; `printf '%s\0'` plus
+# `read -d ''` reads the whole value, then the explicit
+# IFS=$' \t\n' splits across all whitespace. Word-splitting on a
+# bare string would also iterate zero times for whitespace-only
+# input — the empty-array check below still catches that case.
+IFS=$' \t\n' read -r -d '' -a versions < <(
+    printf '%s\0' "${UBUNTU_VERSIONS:-24.04 26.04}"
+)
 failures=()
 
 if (( ${#versions[@]} == 0 )); then
