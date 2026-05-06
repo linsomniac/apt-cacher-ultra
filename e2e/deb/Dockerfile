@@ -59,12 +59,20 @@ RUN mkdir -p /out && VERSION=${VERSION} nfpm pkg \
 # it pulls a different toolchain (apt-utils, dpkg-dev, gpg) that the
 # Go build stage does not need.
 #
-# Adoption fires on a CHANGED InRelease (freshness.go: result=changed).
-# A static fixture would never trigger adoption — the freshness check
-# just records "unchanged" forever. So this stage builds two fixture
-# trees, V1 (hello-acu_1.0) and V2 (hello-acu_1.1), signed with the
-# SAME ephemeral key. test.sh stages V1, primes the cache, swaps to
-# V2, and the second InRelease GET drives the adoption flip.
+# Adoption fires on a CHANGED upstream metadata file
+# (freshness.go: result=changed). A static fixture would never trigger
+# adoption — the freshness check just records "unchanged" forever.
+# So this stage builds two pairs of fixture trees:
+#
+#   /repo-v1, /repo-v2                   — inline form (InRelease)
+#   /repo-v1-detached, /repo-v2-detached — detached form (Release +
+#                                          Release.gpg, no InRelease)
+#
+# Each pair shares the SAME ephemeral key (GNUPGHOME persists across
+# the four invocations). V1 is hello-acu_1.0; V2 is hello-acu_1.1.
+# test.sh stages V1, primes the cache, swaps to V2, and the second
+# metadata GET drives the adoption flip — once for inline form
+# (phase 2) and once for detached form (phase 3).
 FROM debian:stable-slim AS repo-build
 # `gnupg` (the metapackage) is required rather than just `gpg`,
 # because the slim image doesn't ship gpg-agent and gpg --quick-
@@ -76,15 +84,16 @@ RUN apt-get update && \
 WORKDIR /work
 COPY e2e/upstream/build-repo.sh /work/build-repo.sh
 RUN chmod +x /work/build-repo.sh
-# GNUPGHOME persists across the two invocations; build-repo.sh's
-# reuse branch picks up the key planted on the first call. The first
-# call also populates aculan-test.{gpg,fingerprint} in /repo-v1; the
-# second call regenerates them in /repo-v2 — same content because the
-# key is unchanged.
+# GNUPGHOME persists across all four invocations; build-repo.sh's
+# reuse branch picks up the key planted on the first call. Each
+# /repo-vN gets its own copy of aculan-test.{gpg,fingerprint},
+# always with the same content because the key is unchanged.
 ENV GNUPGHOME=/keyring
 RUN mkdir -p /keyring && chmod 700 /keyring && \
-    SIGNED=1 VER=1.0 /work/build-repo.sh /repo-v1 && \
-    SIGNED=1 VER=1.1 /work/build-repo.sh /repo-v2
+    SIGNED=1 SIGN_FORM=inline   VER=1.0 /work/build-repo.sh /repo-v1 && \
+    SIGNED=1 SIGN_FORM=inline   VER=1.1 /work/build-repo.sh /repo-v2 && \
+    SIGNED=1 SIGN_FORM=detached VER=1.0 /work/build-repo.sh /repo-v1-detached && \
+    SIGNED=1 SIGN_FORM=detached VER=1.1 /work/build-repo.sh /repo-v2-detached
 
 FROM ubuntu:${UBUNTU_VERSION} AS test
 ENV DEBIAN_FRONTEND=noninteractive
@@ -115,6 +124,8 @@ COPY --from=build /out/*.deb /tmp/
 # test.sh reads them from /fixture-v1.
 COPY --from=repo-build /repo-v1 /fixture-v1
 COPY --from=repo-build /repo-v2 /fixture-v2
+COPY --from=repo-build /repo-v1-detached /fixture-v1-detached
+COPY --from=repo-build /repo-v2-detached /fixture-v2-detached
 COPY e2e/deb/test.sh /test.sh
 RUN chmod +x /test.sh
 CMD ["/test.sh"]

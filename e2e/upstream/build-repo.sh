@@ -11,12 +11,23 @@
 #   dists/noble/Release
 #
 # When SIGNED=1 (opt-in, default off so existing callers stay
-# unchanged): also produce dists/noble/InRelease (clearsigned), and
-# emit the ephemeral signing key as $OUT/aculan-test.gpg (binary
-# pubkey, droppable into /etc/apt/trusted.gpg.d/) and
+# unchanged): emit the ephemeral signing key as $OUT/aculan-test.gpg
+# (binary pubkey, droppable into /etc/apt/trusted.gpg.d/) and
 # $OUT/aculan-test.fingerprint (40-char hex, suitable for a
-# [[trusted_signer]] block). Used by the e2e/deb/ harness to drive
-# Phase 2 adoption.
+# [[trusted_signer]] block) — and produce signed metadata in the
+# form indicated by $SIGN_FORM:
+#
+#   SIGN_FORM=inline (default)   → dists/noble/InRelease (clearsigned)
+#   SIGN_FORM=detached           → dists/noble/Release.gpg (detached
+#                                  ASCII-armored sig over Release).
+#                                  Release stays plain (no clearsign).
+#   SIGN_FORM=both               → both forms (rare; useful for tests
+#                                  that exercise the freshness
+#                                  checker's form-detection logic).
+#
+# The detached form is used by the SPEC2 §7.6.3 fallback path: an
+# upstream that ships only Release + Release.gpg (no InRelease) is
+# bootstrapped via the inline checker's 404 → detached fallback.
 #
 # Without SIGNED=1, no GPG signature is generated and the e2e apt
 # client uses `[trusted=yes]` in sources.list — the standard apt
@@ -140,15 +151,39 @@ if [ "${SIGNED:-0}" = "1" ]; then
         exit 1
     fi
 
-    # Clearsigned InRelease (the modern apt format: payload + signature
-    # in one file). The cache reads InRelease first; Release.gpg
-    # detached signing is supported but unused here to keep the
-    # fixture minimal.
-    gpg --batch --yes --pinentry-mode loopback --passphrase '' \
-        --default-key "$FINGERPRINT" \
-        --clearsign \
-        --output "$OUT/dists/$SUITE/InRelease" \
-        "$OUT/dists/$SUITE/Release"
+    SIGN_FORM="${SIGN_FORM:-inline}"
+    case "$SIGN_FORM" in
+        inline|detached|both) ;;
+        *)
+            echo "build-repo.sh: SIGN_FORM=$SIGN_FORM not in {inline,detached,both}" >&2
+            exit 2
+            ;;
+    esac
+
+    # Inline form: clearsigned InRelease (payload + signature in one
+    # file). apt-cacher-ultra reads InRelease first when this file
+    # exists; this is the most common signing form for modern apt
+    # archives.
+    if [ "$SIGN_FORM" = "inline" ] || [ "$SIGN_FORM" = "both" ]; then
+        gpg --batch --yes --pinentry-mode loopback --passphrase '' \
+            --default-key "$FINGERPRINT" \
+            --clearsign \
+            --output "$OUT/dists/$SUITE/InRelease" \
+            "$OUT/dists/$SUITE/Release"
+    fi
+
+    # Detached form: a separate Release.gpg signature over the plain
+    # Release file. apt-ftparchive's recommended workflow uses
+    # `--detach-sign --armor`; the resulting file begins with
+    # "-----BEGIN PGP SIGNATURE-----" and apt clients verify it
+    # against the Release bytes.
+    if [ "$SIGN_FORM" = "detached" ] || [ "$SIGN_FORM" = "both" ]; then
+        gpg --batch --yes --pinentry-mode loopback --passphrase '' \
+            --default-key "$FINGERPRINT" \
+            --detach-sign --armor \
+            --output "$OUT/dists/$SUITE/Release.gpg" \
+            "$OUT/dists/$SUITE/Release"
+    fi
 
     # Binary pubkey (drop-in for /etc/apt/trusted.gpg.d/), plus the
     # raw fingerprint so the caller can templatize a [[trusted_signer]]

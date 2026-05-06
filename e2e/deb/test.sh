@@ -351,5 +351,194 @@ fi
 xcs="$(grep -i '^x-cache-snapshot:' "$hdrs_file" | tr -d '\r')"
 echo "[deb-test] follow-up: $xcs"
 
-echo "[deb-test] phase 2 (adoption smoke) PASS"
+echo "[deb-test] phase 2 (inline adoption smoke) PASS"
+
+# ============================================================
+# SPEC2 §7.6.3 phase 3: detached-mode adoption smoke
+#
+# Re-runs the phase-2 flow with detached fixtures (Release +
+# Release.gpg, no InRelease). Validates that the freshness checker
+# falls back from the inline path to detached when no InRelease
+# url_path row exists, and that adoption produces a snapshot whose
+# release_hash is set and inrelease_hash is nil.
+#
+# A clean cache directory is required: phase 2 already adopted an
+# inline snapshot, and the 404→detached fallback only fires for
+# suites with no current_snapshot_id.
+# ============================================================
+
+echo
+echo "[deb-test] phase 3: stop phase-2 daemon and wipe cache"
+kill "$DAEMON_PID" 2>/dev/null || true
+wait "$DAEMON_PID" 2>/dev/null || true
+# Wipe cache so the suite starts fresh (no current_snapshot_id, no
+# url_path rows). Daemon recreates cache.db on next start.
+rm -rf /var/cache/apt-cacher-ultra/* 2>/dev/null || true
+chown apt-cacher-ultra:apt-cacher-ultra /var/cache/apt-cacher-ultra
+
+# Sanity: the detached fixture exists and uses the same signing key
+# as the inline fixture (same FINGERPRINT — repo-build shares the
+# keyring across all four invocations).
+test -d /fixture-v1-detached || { echo "FAIL: /fixture-v1-detached missing"; exit 1; }
+test -d /fixture-v2-detached || { echo "FAIL: /fixture-v2-detached missing"; exit 1; }
+test -f /fixture-v1-detached/dists/noble/Release.gpg \
+    || { echo "FAIL: /fixture-v1-detached missing Release.gpg"; exit 1; }
+if [ -f /fixture-v1-detached/dists/noble/InRelease ]; then
+    echo "FAIL: detached fixture unexpectedly contains InRelease"
+    exit 1
+fi
+FP_DETACHED="$(cat /fixture-v1-detached/aculan-test.fingerprint)"
+if [[ "$FP_DETACHED" != "$FP" ]]; then
+    echo "FAIL: detached fingerprint $FP_DETACHED != inline fingerprint $FP"
+    exit 1
+fi
+
+echo "[deb-test] phase 3: stage V1-detached fixture as nginx webroot"
+rm -rf /var/www/html/*
+cp -r /fixture-v1-detached/dists /var/www/html/
+cp -r /fixture-v1-detached/pool /var/www/html/
+
+echo "[deb-test] phase 3: restart daemon (config reused from phase 2)"
+runuser -u apt-cacher-ultra -- \
+    /usr/sbin/apt-cacher-ultra --config /etc/apt-cacher-ultra/config.toml \
+    >>"$daemon_log" 2>&1 &
+DAEMON_PID=$!
+
+ready=0
+for i in $(seq 1 30); do
+    if (echo > /dev/tcp/127.0.0.1/3142) 2>/dev/null; then
+        ready=1
+        echo "[deb-test] phase-3 :3142 reachable after ${i}s"
+        break
+    fi
+    sleep 1
+done
+if [[ $ready -eq 0 ]]; then
+    echo "FAIL: phase-3 daemon did not bind :3142 within 30s"
+    exit 1
+fi
+
+# 3a: prime the cache with V1-detached's Release + Release.gpg. We do
+# NOT request InRelease — the upstream doesn't serve it and the cache
+# would 404. Both Release and Release.gpg url_path rows are required
+# for the detached fallback path; without them, the freshness checker
+# skips with a "no cached Release url_path" debug log.
+echo "[deb-test] phase 3: GET Release + Release.gpg via proxy (V1-detached, primes cache)"
+for path in /dists/noble/Release /dists/noble/Release.gpg; do
+    status=$(curl -sS -x http://127.0.0.1:3142 \
+        -o "/tmp/$(basename "$path").v1d" \
+        -w '%{http_code}' \
+        --max-time 10 \
+        "http://127.0.0.1${path}" || echo "000")
+    if [[ "$status" != "200" ]]; then
+        echo "FAIL: V1-detached $path via proxy returned $status; expected 200"
+        exit 1
+    fi
+done
+echo "[deb-test] V1 Release: $(wc -c < /tmp/Release.v1d) bytes; Release.gpg: $(wc -c < /tmp/Release.gpg.v1d) bytes"
+
+# 3b: swap to V2-detached.
+echo "[deb-test] phase 3: swap nginx webroot to V2-detached"
+sleep 2
+rm -rf /var/www/html/*
+cp -r /fixture-v2-detached/dists /var/www/html/
+cp -r /fixture-v2-detached/pool /var/www/html/
+
+# 3c: drive a Release GET. Cache hits its url_path row, fires the
+# freshness check. detectForm sees no current_snapshot_id, defaults
+# to inline. checkLockedInline tries to look up InRelease url_path,
+# finds none, sees Release rows exist → returns (nil, true) /
+# fallback. checkLockedDetached fetches Release (200, changed),
+# fetches Release.gpg, builds an adoptionRequest with
+# form=detached. The Check goroutine routes to RunDetached, which
+# verifies the detached signature and commits a snapshot with
+# release_hash + release_gpg_hash set.
+echo "[deb-test] phase 3: GET Release via proxy (cache hit → fires freshness → detached fallback → adoption)"
+status=$(curl -sS -x http://127.0.0.1:3142 \
+    -o /tmp/Release.trigger \
+    -w '%{http_code}' \
+    --max-time 10 \
+    http://127.0.0.1/dists/noble/Release || echo "000")
+if [[ "$status" != "200" ]]; then
+    echo "FAIL: trigger Release returned $status; expected 200"
+    exit 1
+fi
+
+# 3d: poll for adoption. Same poll window as phase 2.
+echo "[deb-test] phase 3: poll suite_freshness for current_snapshot_id"
+adopted=0
+adopted_id=""
+for i in $(seq 1 30); do
+    val=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT IFNULL(current_snapshot_id, '') FROM suite_freshness WHERE suite_path='/dists/noble' LIMIT 1;" \
+        2>/dev/null || echo "")
+    if [[ -n "$val" ]]; then
+        adopted=1
+        adopted_id="$val"
+        echo "[deb-test] adopted detached snapshot id=$val (after ${i}s)"
+        break
+    fi
+    sleep 1
+done
+if [[ $adopted -eq 0 ]]; then
+    echo "FAIL: no detached snapshot adopted within 30s"
+    echo "=== suite_freshness ==="
+    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT canonical_scheme, canonical_host, suite_path, current_snapshot_id, inrelease_change_seen_at FROM suite_freshness;" || true
+    echo "=== suite_snapshot ==="
+    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT snapshot_id, suite_path, inrelease_hash, release_hash, release_gpg_hash, adopted_at FROM suite_snapshot;" || true
+    echo "=== daemon log tail ==="
+    tail -100 "$daemon_log" || true
+    exit 1
+fi
+
+# 3e: assert the snapshot is in detached form — release_hash is set,
+# release_gpg_hash is set, inrelease_hash is NULL. This is the
+# difference between a successful detached adoption and a confused
+# inline-mode adoption that somehow ran against detached fixtures.
+echo "[deb-test] phase 3: verify snapshot $adopted_id is detached form"
+form_columns=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+    "SELECT IFNULL(inrelease_hash, '<null>') || '|' || IFNULL(release_hash, '<null>') || '|' || IFNULL(release_gpg_hash, '<null>') FROM suite_snapshot WHERE snapshot_id=$adopted_id;")
+ir_hash="${form_columns%%|*}"
+rest="${form_columns#*|}"
+r_hash="${rest%%|*}"
+rg_hash="${rest#*|}"
+if [[ "$ir_hash" != "<null>" ]]; then
+    echo "FAIL: detached snapshot has unexpected inrelease_hash=$ir_hash"
+    exit 1
+fi
+if [[ "$r_hash" == "<null>" ]]; then
+    echo "FAIL: detached snapshot is missing release_hash"
+    exit 1
+fi
+if [[ "$rg_hash" == "<null>" ]]; then
+    echo "FAIL: detached snapshot is missing release_gpg_hash"
+    exit 1
+fi
+echo "[deb-test] phase 3: detached form confirmed (release_hash=${r_hash:0:12}.., release_gpg_hash=${rg_hash:0:12}..)"
+
+# 3f: a follow-up GET should expose X-Cache-Snapshot just like phase 2.
+echo "[deb-test] phase 3: follow-up GET should expose X-Cache-Snapshot"
+hdrs_file=/tmp/release.headers
+status=$(curl -sS -x http://127.0.0.1:3142 \
+    -D "$hdrs_file" \
+    -o /tmp/release.followup \
+    -w '%{http_code}' \
+    --max-time 10 \
+    http://127.0.0.1/dists/noble/Release)
+if [[ "$status" != "200" ]]; then
+    echo "FAIL: follow-up Release returned $status"
+    cat "$hdrs_file" || true
+    exit 1
+fi
+if ! grep -qi '^x-cache-snapshot:' "$hdrs_file"; then
+    echo "FAIL: follow-up response is missing X-Cache-Snapshot header"
+    cat "$hdrs_file"
+    exit 1
+fi
+xcs="$(grep -i '^x-cache-snapshot:' "$hdrs_file" | tr -d '\r')"
+echo "[deb-test] phase 3 follow-up: $xcs"
+
+echo "[deb-test] phase 3 (detached adoption smoke) PASS"
 echo "[deb-test] OVERALL PASS"
