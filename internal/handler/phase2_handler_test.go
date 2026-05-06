@@ -509,6 +509,130 @@ func TestServeHTTP_DebMissHashCollisionPreservesUnrelatedBlob(t *testing.T) {
 	}
 }
 
+// TestServeHTTP_DebMissAdoptionFlipMidFetchUsesPostFetchContract covers
+// the codex finding from review of 24d002f: the §6.2 .deb hash check
+// must use the post-fetch DeclaredHashesForPath result, not a pre-
+// fetch snapshot. If adoption flips current_snapshot_id while the
+// fetch is in flight, validating against the stale pre-fetch
+// declaration would let bytes that match the OLD contract land in
+// pool/ even though they no longer match any current snapshot's
+// contract.
+//
+// Setup: the upstream HTTP handler commits a NEW snapshot for the
+// suite (replacing the current_snapshot_id pointer) before returning
+// the body. Pre-fetch declared = bodyHash (matches the bytes upstream
+// will serve). Post-fetch declared = a different hash (the new
+// snapshot's declaration).
+//
+//   - With pre-fetch validation: bytes match pre-fetch declared,
+//     promote → BUG.
+//   - With post-fetch validation (this commit): bytes don't match the
+//     post-fetch declared, fail closed → correct.
+func TestServeHTTP_DebMissAdoptionFlipMidFetchUsesPostFetchContract(t *testing.T) {
+	body := []byte("v1 .deb bytes — match the pre-fetch declared hash")
+	bodyHash := sha256Hex(body)
+	newDeclared := strings.Repeat("b", 64)
+	if newDeclared == bodyHash {
+		t.Fatalf("test setup: newDeclared %q collides with bodyHash", newDeclared)
+	}
+
+	const (
+		suite   = "/dists/noble"
+		debPath = "/pool/main/h/hello/hello.deb"
+	)
+
+	var (
+		hCapture            *Handler
+		schemeC, canonHostC string
+		flipDone            atomic.Bool
+		upstreamCalls       atomic.Int32
+		flipFailed          atomic.Bool
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Mid-fetch adoption flip: install a new snapshot whose
+		// package_hash row for debPath declares newDeclared. After
+		// CommitAdoption, suite_freshness.current_snapshot_id points
+		// at the new candidate, so DeclaredHashesForPath now returns
+		// newDeclared (and only newDeclared) for this path.
+		if !flipDone.Load() && hCapture != nil {
+			defer flipDone.Store(true)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						flipFailed.Store(true)
+					}
+				}()
+				newReleaseBlob := writeBlob(t, hCapture, []byte("InRelease v2"))
+				_ = commitInlineSnapshot(t, hCapture, schemeC, canonHostC, suite, newReleaseBlob,
+					[]cache.SnapshotMember{
+						{Path: "InRelease", BlobHash: newReleaseBlob, DeclaredSHA256: newReleaseBlob},
+					},
+					[]cache.PackageHash{
+						{CanonicalScheme: schemeC, CanonicalHost: canonHostC,
+							Path: debPath, DeclaredSHA256: newDeclared},
+					})
+			}()
+		}
+		upstreamCalls.Add(1)
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	h := newTestHandler(t, nil, nil)
+	hCapture = h
+	scheme, host, port := splitURL(t, srv.URL)
+	canonHost := hostKey(host, port)
+	schemeC, canonHostC = scheme, canonHost
+
+	// Pre-fetch state: snapshot S1 declares bodyHash for debPath.
+	// If pre-fetch validation were authoritative, the request would
+	// succeed (bytes hash to bodyHash, declaration is bodyHash).
+	releaseBlob := writeBlob(t, h, []byte("InRelease v1"))
+	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
+		[]cache.SnapshotMember{
+			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
+		},
+		[]cache.PackageHash{
+			{CanonicalScheme: scheme, CanonicalHost: canonHost,
+				Path: debPath, DeclaredSHA256: bodyHash},
+		})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, debPath))
+
+	if flipFailed.Load() {
+		t.Fatalf("mid-fetch adoption flip raised a fatal in commitInlineSnapshot")
+	}
+	if !flipDone.Load() {
+		t.Fatalf("mid-fetch flip did not run (upstream not called)")
+	}
+
+	// Post-fetch authoritative re-query sees newDeclared. Body hashes
+	// to bodyHash ≠ newDeclared → fail closed.
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status=%d, want 502 (post-fetch declared changed mid-fetch)", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "60" {
+		t.Errorf("Retry-After=%q, want 60", got)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Errorf("upstream calls=%d, want 1 (single fetch, post-fetch fail-closed)", got)
+	}
+	if _, err := h.cache.LookupURL(context.Background(), scheme, canonHost, debPath); err == nil {
+		t.Errorf("url_path row inserted after post-fetch validation failure (must not insert)")
+	}
+
+	// Post-fetch declaration is newDeclared. Subsequent fetch (with
+	// upstream still serving body=bodyHash) keeps failing closed —
+	// no bug-window in which the wrong bytes survive.
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, proxyReq("GET", srv.URL, debPath))
+	if rec2.Code != http.StatusBadGateway {
+		t.Errorf("retry status=%d, want 502 (still mismatching newDeclared)", rec2.Code)
+	}
+}
+
 // TestServeHTTP_AdoptedSuiteSnapshotMemberDBError_FailsClosed covers
 // the codex finding: a DB error on snapshot_member lookup for an
 // adopted suite must NOT fall through to serveCacheMiss. We trigger

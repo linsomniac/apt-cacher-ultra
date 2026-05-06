@@ -136,6 +136,25 @@ func (w *BlobWriter) Write(p []byte) (int, error) {
 // resumable Range fetches that need to report progress.
 func (w *BlobWriter) Written() int64 { return w.written }
 
+// HashSum returns the running sha256 of bytes written so far, as a
+// 64-char lowercase hex string. Non-mutating: hash.Hash.Sum copies its
+// internal state rather than consuming it, so HashSum is safe to call
+// multiple times (and a subsequent Finalize/FinalizeExpectingHash will
+// see the same hash).
+//
+// Intended for callers that need to peek the hash before deciding
+// between Finalize variants or Abort — e.g. SPEC2 §6.2 .deb miss-path
+// post-fetch dispatch, where an authoritative DeclaredHashesForPath
+// re-query may show a snapshot conflict (≥ 2 distinct rows) and we
+// want the observed hash for the package_hash_conflict log line
+// before Abort drops the temp.
+//
+// Calling HashSum after a successful Finalize variant returns the
+// same hash, but the caller already has it as the return value.
+func (w *BlobWriter) HashSum() string {
+	return hex.EncodeToString(w.hasher.Sum(nil))
+}
+
 // Truncate resets the BlobWriter to its zero state: temp file emptied,
 // hasher reset, written counter back to 0. The fetch layer calls this
 // when a resume retry's If-Range validator no longer matches and the
