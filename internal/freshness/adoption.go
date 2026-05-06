@@ -37,14 +37,15 @@ type SuiteRef struct {
 }
 
 // Verifier returns the verified Release-style plaintext for an inline
-// InRelease (clearsigned) blob. Phase 2 step 3 implements this with
-// `github.com/ProtonMail/go-crypto/openpgp`; step 2's tests inject a
-// stub that returns the input verbatim.
+// InRelease (clearsigned) blob. The production implementation lives in
+// internal/gpg and uses github.com/ProtonMail/go-crypto/openpgp; tests
+// inject a pass-through stub.
 //
 // AIDEV-NOTE: VerifyInline ONLY validates a clearsigned InRelease.
-// Detached (Release + Release.gpg) verification is added when needed.
-// Phase 2 step 2 only exercises the inline path because that is what
-// the freshness checker fetches (§7).
+// Detached (Release + Release.gpg) verification — §7.6.3's "both
+// forms" — is not yet implemented because the freshness checker only
+// fetches InRelease (§7). When upstreams that lack inline InRelease
+// are added, extend this interface and the gpg verifier accordingly.
 type Verifier interface {
 	VerifyInline(ctx context.Context, suite SuiteRef, inRelease []byte) ([]byte, error)
 }
@@ -171,9 +172,9 @@ func (a *Adopter) Run(ctx context.Context, suite SuiteRef, inRelease []byte, eta
 	}
 
 	// Step 1: GPG verify. The Verifier returns the verified Release-
-	// style plaintext; for step 2 the production wiring is not yet in
-	// place (a real Verifier comes in step 3) — tests inject a
-	// pass-through.
+	// style plaintext (the cleartext between BEGIN/END markers in a
+	// clearsigned InRelease, or the body verbatim when the operator
+	// has explicitly opted into unsigned-OK mode).
 	releaseText, err := a.verifier.VerifyInline(ctx, suite, inRelease)
 	if err != nil {
 		a.logger.Info("adoption_gpg_failed",

@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
+	"github.com/linsomniac/apt-cacher-ultra/internal/gpg"
 	"github.com/linsomniac/apt-cacher-ultra/internal/handler"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
@@ -47,6 +50,11 @@ var (
 	// tmpSweepMaxAge is the SPEC §4.2 staleness threshold for orphaned
 	// partial downloads from previous crashes.
 	tmpSweepMaxAge = 5 * time.Minute
+
+	// keyringDirs is the SPEC2 §7.6.1 trusted-keyring search path.
+	// Variable rather than const so tests can point it at a tempdir
+	// without requiring root.
+	keyringDirs = []string{gpg.DefaultTrustedGPGDir, gpg.DefaultKeyringsDir}
 )
 
 func main() {
@@ -171,14 +179,6 @@ func serveListeners(
 		"log_level", cfg.Log.Level,
 	)
 
-	// Phase 2 adoption is gated on the Verifier wiring that lands in
-	// step 3. An operator who turns adoption.enabled = true today
-	// will not see adoption fire — Phase 1 fallback continues. Make
-	// the gap visible in the deploy journal rather than silently
-	// ignoring the request.
-	if cfg.Adoption.Enabled {
-		logger.Warn("adoption.enabled = true requested but Phase 2 step 3 (GPG verifier) wiring not yet present; freshness will continue Phase 1 behavior")
-	}
 	// SPEC2 §5.1 documents require_signature = false as a loud
 	// configuration: emit at WARN so the operator's choice is visible
 	// in the journal even before adoption is actually wired.
@@ -228,12 +228,34 @@ func serveListeners(
 	// pressure to a host, regardless of which code path generates it.
 	hostLimiter := hostsem.New(cfg.Upstream.MaxConcurrentPerHost)
 
+	// SPEC §7.4: the periodic freshness scheduler ctx — also the
+	// LifetimeCtx for SPEC2 §7.5 adoption goroutines. Cancelling it
+	// during shutdown propagates into in-flight verifier and member
+	// fetches; SPEC2 §9.5 step 5 says staging dirs are then abandoned
+	// for the next start-up sweep.
+	freshCtx, freshCancel := context.WithCancel(context.Background())
+	defer freshCancel()
+
+	// SPEC2 §7.6 Phase 2 adoption wiring. When adoption.enabled = true,
+	// build the keyring + verifier + adopter here; nil adopter means
+	// freshness continues Phase 1 behavior (record divergence, do not
+	// flip).
+	var adopter *freshness.Adopter
+	if cfg.Adoption.Enabled {
+		adopter, err = buildAdopter(cfg, c, fetchClient, hostLimiter, logger)
+		if err != nil {
+			return fmt.Errorf("build adopter: %w", err)
+		}
+	}
+
 	freshChecker, err := freshness.New(freshness.Config{
 		Cache:       c,
 		Fetcher:     fetchClient,
 		HostLimiter: hostLimiter,
 		Cooldown:    cfg.Freshness.Cooldown.Duration,
 		Refresh:     cfg.Freshness.PeriodicRefresh.Duration,
+		Adopter:     adopter,
+		LifetimeCtx: freshCtx,
 		Logger:      logger,
 	})
 	if err != nil {
@@ -253,13 +275,10 @@ func serveListeners(
 		return fmt.Errorf("build handler: %w", err)
 	}
 
-	// SPEC §7.4: start the periodic refresh scheduler. Scoped to a
-	// dedicated ctx so we can stop it deterministically before
-	// h.Close() — the scheduler dispatches into Checker.Check, which
-	// uses the cache + fetch client, so it must not outlive the
-	// handler-side drain.
-	freshCtx, freshCancel := context.WithCancel(context.Background())
-	defer freshCancel()
+	// SPEC §7.4: start the periodic refresh scheduler. The scheduler
+	// dispatches into Checker.Check, which uses the cache + fetch
+	// client, so it must not outlive the handler-side drain — see
+	// the freshCancel() / freshWG.Wait() ordering near shutdown.
 	var freshWG sync.WaitGroup
 	freshWG.Add(1)
 	go func() {
@@ -381,9 +400,106 @@ func serveListeners(
 	// without racing live writes.
 	h.Close()
 
+	// SPEC2 §9.5 step 5: drain in-flight adoption goroutines spawned
+	// by the freshness Checker. freshCancel above already cancelled
+	// the LifetimeCtx those goroutines run under, so they should be
+	// returning shortly; this Wait makes the shutdown deterministic
+	// before the cache is closed by the deferred c.Close().
+	freshChecker.WaitForAdoptions()
+
 	wg.Wait()
 	logger.Info("apt-cacher-ultra stopped")
 	return listenerErr
+}
+
+// buildAdopter constructs the Phase 2 §7.5 adopter: load the host apt
+// keyring, compile [[trusted_signer]] regexes, and wire a Verifier into
+// a freshness.Adopter. Called only when adoption.enabled = true.
+//
+// SPEC2 §7.6.1: an empty resulting keyring is a startup error iff
+// require_signature = true (no key would satisfy any verification —
+// the cache would never adopt and the operator would never see why
+// without this gate). With require_signature = false the empty
+// keyring is allowed; signature checks fall through to "trust the
+// body verbatim" mode for InRelease bodies that lack a clearsign
+// block, and any clearsign-bearing body would simply fail to verify.
+func buildAdopter(
+	cfg *config.Config,
+	c *cache.Cache,
+	fetchClient *fetch.Client,
+	hostLimiter *hostsem.Sem,
+	logger *slog.Logger,
+) (*freshness.Adopter, error) {
+	keyring, err := gpg.LoadKeyring(keyringDirs, logger)
+	if err != nil {
+		return nil, fmt.Errorf("load apt keyring: %w", err)
+	}
+	if keyring.Empty() && cfg.Adoption.RequireSignature {
+		return nil, errors.New("apt keyring is empty and adoption.require_signature = true; refusing to start (no key would satisfy any verification — populate /etc/apt/trusted.gpg.d/ or /etc/apt/keyrings/)")
+	}
+
+	pins, err := compilePins(cfg.TrustedSigners)
+	if err != nil {
+		return nil, fmt.Errorf("compile [[trusted_signer]] blocks: %w", err)
+	}
+
+	verifier, err := gpg.NewVerifier(gpg.VerifierConfig{
+		Keyring:          keyring,
+		Pins:             pins,
+		RequireSignature: cfg.Adoption.RequireSignature,
+		RequirePinned:    cfg.Adoption.RequirePinnedSigner,
+		Logger:           logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build verifier: %w", err)
+	}
+
+	adopter, err := freshness.NewAdopter(freshness.AdoptionConfig{
+		Cache:         c,
+		Fetcher:       fetchClient,
+		Verifier:      verifier,
+		HostLimiter:   hostLimiter,
+		MaxConcurrent: cfg.Freshness.MaxConcurrentAdoptions,
+		Logger:        logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("new adopter: %w", err)
+	}
+
+	logger.Info("phase2 adoption enabled",
+		"keyring_keys", keyring.Size(),
+		"trusted_signer_blocks", len(pins),
+		"require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
+		"max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
+	)
+	return adopter, nil
+}
+
+// compilePins translates the validated config.TrustedSigner blocks
+// into runtime gpg.SignerPin values: regex compiled once, fingerprints
+// canonicalized to uppercase. config.Validate has already enforced
+// regex syntax and 40-char-hex fingerprints, so unexpected errors
+// here are surface-level and worth bubbling up.
+func compilePins(in []config.TrustedSigner) ([]gpg.SignerPin, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make([]gpg.SignerPin, 0, len(in))
+	for i, ts := range in {
+		re, err := regexp.Compile(ts.MatchCanonicalHost)
+		if err != nil {
+			return nil, fmt.Errorf("trusted_signer[%d].match_canonical_host: %w", i, err)
+		}
+		fps := make(map[string]struct{}, len(ts.Fingerprints))
+		for _, fp := range ts.Fingerprints {
+			fps[strings.ToUpper(fp)] = struct{}{}
+		}
+		out = append(out, gpg.SignerPin{
+			HostRegex:    re,
+			Fingerprints: fps,
+		})
+	}
+	return out, nil
 }
 
 func tlsAddrString(ln net.Listener) string {
