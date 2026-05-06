@@ -595,6 +595,17 @@ runAdoption(suite, new_bytes, etag, lastmod, mode):
   snapshot_id := INSERT INTO suite_snapshot ...;
 
   // Step 5: prefetch declared members sequentially.
+  //
+  // Note: parse_sha256_block (step 3) drops "Release", "InRelease",
+  // and "Release.gpg" entries. apt-ftparchive's `release` subcommand
+  // emits the generated Release as a member of itself at "stub size"
+  // (~188 bytes — headers only, before the hash blocks were appended);
+  // the on-disk file we'd refetch is the FULL output (~1.5 KiB) with
+  // a different hash, so iterating those entries would dead-end at a
+  // content-length mismatch. apt itself never refetches these via the
+  // SHA256 block — it has those bytes already from the freshness fetch.
+  // Step 6 below records the corresponding metadata-self snapshot_member
+  // rows.
   for path, declared_sha256 in members:
     if pool/<declared_sha256> already exists:
       actual := sha256(pool/<declared_sha256>)
@@ -629,9 +640,11 @@ runAdoption(suite, new_bytes, etag, lastmod, mode):
                                  declared_sha256: release_gpg_hash }
   // For metadata-self rows the declared_sha256 is the verified blob's
   // own hash — the verification step is GPG, not a Release-listed
-  // SHA256 (the Release file cannot list itself). The CHECK on
-  // declared_sha256's shape (64 hex chars) is satisfied because every
-  // pool hash is sha256.
+  // SHA256. apt-ftparchive output sometimes lists the Release file in
+  // its own SHA256 block (a directory-walk artifact), but parse_sha256_
+  // block in step 3 drops those entries; we never fetch the metadata
+  // file as if it were a member. The CHECK on declared_sha256's shape
+  // (64 hex chars) is satisfied because every pool hash is sha256.
 
   // Step 7: insert by-hash alias snapshot_member rows. apt's
   // Acquire-By-Hash clients fetch from <suite>/<component>/by-hash/
@@ -736,10 +749,13 @@ member hash mismatch, candidate row insert):
   prior `last_success_at` continues to drive the periodic scheduler).
 - `suite_freshness.inrelease_change_seen_at` is bumped so an operator
   reading the diagnostic sees the divergence is still pending adoption.
-- A structured log event names the failure category
-  (`adoption_gpg_failed`, `adoption_member_fetch_failed`,
-  `adoption_member_mismatch`, `adoption_parse_failed`,
-  `adoption_db_failed`).
+- A structured log event names the failure category. Several paths
+  have their own categorized event (`adoption_gpg_failed`,
+  `adoption_parse_failed`, `adoption_member_mismatch`,
+  `pool_corruption_during_adoption`); the rest — wrapped
+  `adoption_member_fetch_failed` and `adoption_db_failed` sentinels —
+  surface through the `adoption_run_failed` Warn backstop. See §10.2
+  for the full catalog.
 
 The next periodic tick retries; the cooldown gate prevents thrash.
 
@@ -970,27 +986,45 @@ Phase 1 logging (SPEC §10) carries forward exactly. Phase 2 adds:
 
 ### 10.2 New structured events
 
-- **Adoption attempts:** `adoption_started` and `adoption_finished` Info
-  with `canonical_host`, `suite_path`, `snapshot_id`, `prior_snapshot_id`
-  (or 0 on first adoption), and `result` ∈ {`success`, `gpg_failed`,
-  `parse_failed`, `member_fetch_failed`, `member_mismatch`, `db_failed`,
-  `aborted`}. `member_count` and `duration_ms` on `adoption_finished`.
-- **GPG verification failures:** `gpg_verify_failed` Info with
-  `canonical_host`, `suite_path`, `signing_key_fingerprint` (when the
-  signature parsed at all; empty otherwise), and `reason` ∈
-  {`untrusted_key`, `expired_key`, `revoked_key`, `invalid_signature`,
-  `missing_signature`, `parse_error`}.
+- **Adoption outcomes:**
+  - `adoption_success` Info on a completed flip: `canonical_host`,
+    `suite_path`, `snapshot_id`, `member_count`, `alias_count`,
+    `package_hash_count`. `prior_snapshot_id` is implicit in the
+    suite_freshness write path and not duplicated here.
+  - `adoption_gpg_failed` Info when the GPG verifier rejects the
+    InRelease: `canonical_host`, `suite_path`, `err` (the wrapped
+    sentinel — `untrusted_signer`, `missing_signature`, `short_keyid`,
+    or `no_usable_signature`).
+  - `adoption_parse_failed` Info when `ParseRelease` rejects the
+    verified plaintext (e.g. no SHA256 block, malformed line):
+    `canonical_host`, `suite_path`, `err`.
+  - `adoption_run_failed` Warn as a backstop when `Adopter.Run`
+    returns an error not already named by the categorized lines above
+    (member-fetch transport errors, content-length mismatches, DB
+    failures): `canonical_host`, `suite_path`, `err`. Without this
+    line, those failure paths drop on the floor and the operator
+    sees the "InRelease changed at upstream" line followed by silence.
 - **Hash validation failures:**
-  - `adoption_member_mismatch` Error during adoption: `canonical_host`,
-    `suite_path`, `path`, `declared_sha256`, `observed_sha256`,
-    `snapshot_id`.
-  - `package_hash_mismatch` Error during a `.deb` miss:
-    `canonical_host`, `path`, `declared_sha256`, `observed_sha256`,
-    `snapshot_id` (the snapshot whose `package_hash` row vouched).
+  - `adoption_member_mismatch` Warn during adoption: `canonical_host`,
+    `suite_path`, `path`, `declared_sha256`, `actual_sha256`. The
+    candidate snapshot has not yet been flipped, so no `snapshot_id`
+    is meaningful — the row has `adopted_at = NULL` and is reaped by
+    Phase 4 GC.
+  - `hash_validation_failure` Error during a `.deb` miss when the
+    fetched body's sha256 disagrees with the hash any current
+    snapshot's `package_hash` row vouched for: `canonical_host`,
+    `path`, `declared_sha256`, `observed_sha256`, `declared` (a JSON
+    array of `{snapshot_id, declared_sha256}` pairs — load-bearing
+    when multiple current snapshots vouched for the same `.deb`,
+    redundant when only one). The corresponding request line carries
+    `outcome=package_hash_mismatch` for log pivots.
   - `package_hash_conflict` Error when two or more current snapshots
-    declare different sha256s for the same `(canonical_host, path)`:
-    `canonical_host`, `path`, plus a JSON array of
-    `{snapshot_id, declared_sha256}` pairs.
+    declare different sha256s for the same `(canonical_host, path)`
+    BEFORE the fetch even runs: `canonical_host`, `path`, plus a
+    JSON array of `{snapshot_id, declared_sha256}` pairs. Distinct
+    from `hash_validation_failure`: the conflict surface fires from
+    static state, the validation-failure surface fires from a
+    completed fetch.
   - `hit_path_hash_evicted` Warn when §6.1's blob-hit validator finds
     a `url_path` row whose `blob_hash` disagrees with the snapshot's
     `package_hash.declared_sha256`: `canonical_host`, `path`,
@@ -1003,6 +1037,23 @@ Phase 1 logging (SPEC §10) carries forward exactly. Phase 2 adds:
     rehash finds an existing pool blob whose content no longer matches
     its filename: `path`, `expected_sha256`, `observed_sha256`. Adoption
     re-fetches the member from upstream after the eviction.
+- **§6.2 metadata recovery surface:** post-adoption metadata requests
+  resolve via `snapshot_member`; on miss the handler refetches from
+  upstream and validates against the declared sha256.
+  - `snapshot_member_blob_missing` Warn when a `snapshot_member` row
+    points at a `pool/<hash>` that is no longer present locally
+    (operator deletion, integrity-scan eviction, disk fault):
+    `canonical_host`, `path`, `snapshot_id`, `blob_hash`. The
+    request falls through to a recovery refetch (next event below).
+  - `snapshot_member_refetch_mismatch` Error when the recovery
+    refetch's body sha256 disagrees with `snapshot_member.declared_sha256`
+    (upstream rolled forward to bytes that match a future snapshot but
+    not this one): `canonical_host`, `path`, `snapshot_id`,
+    `declared_sha256`, `observed_sha256`. Returns `502`; adoption on
+    the next periodic tick flips to the new bytes if upstream is
+    consistent. Distinct from `adoption_member_mismatch` (which fires
+    pre-flip) and `hash_validation_failure` (which fires for `.deb`
+    miss-path hashes).
 - **Trust-set events:** `adoption_unpinned_suite` Warn when
   `adoption.require_pinned_signer = true` and a triggering suite has no
   matching `[[trusted_signer]]` block: `canonical_host`, `suite_path`.
@@ -1032,21 +1083,21 @@ Phase 1 rows (SPEC §11) carry forward unchanged. Phase 2 adds:
 
 | Scenario | Phase 2 behavior |
 |---|---|
-| Upstream serves valid signed `InRelease`, but a referenced index fails to fetch after retries | Adoption aborts; prior snapshot stays current; periodic_refresh retries on next tick; `adoption_member_fetch_failed` logged. |
-| Upstream serves valid signed `InRelease`, member fetched but its sha256 mismatches the declared hash | Adoption aborts; staging member discarded; `adoption_member_mismatch` logged loudly; prior snapshot stays current. |
-| Upstream serves a forged `InRelease` (valid bytes but bad signature, or signing key not in trust set) | Adoption aborts; cache keeps serving prior snapshot; `gpg_verify_failed` Info; `adoption_finished` `result=gpg_failed`. The defining Phase 2 test scenario. |
-| Upstream serves an unsigned `InRelease` (or `Release` without `Release.gpg`) and `require_signature=true` | Adoption aborts (`reason=missing_signature`); same operator surface as forgery. |
-| `.deb` cache miss whose declared sha256 (in `package_hash`) mismatches the body upstream returned | `502` + `Retry-After: 60`; blob discarded; `package_hash_mismatch` logged; row not inserted; next request retries. |
+| Upstream serves valid signed `InRelease`, but a referenced index fails to fetch after retries | Adoption aborts; prior snapshot stays current; periodic_refresh retries on next tick; `adoption_run_failed` Warn carries the wrapped `adoption_member_fetch_failed` sentinel. |
+| Upstream serves valid signed `InRelease`, member fetched but its sha256 mismatches the declared hash | Adoption aborts; staging member discarded; `adoption_member_mismatch` Warn logged with declared/actual; prior snapshot stays current. |
+| Upstream serves a forged `InRelease` (valid bytes but bad signature, or signing key not in trust set) | Adoption aborts; cache keeps serving prior snapshot; `adoption_gpg_failed` Info names the wrapped sentinel (`untrusted_signer`, `no_usable_signature`, etc.). The defining Phase 2 test scenario. |
+| Upstream serves an unsigned `InRelease` (or `Release` without `Release.gpg`) and `require_signature=true` | Adoption aborts; `adoption_gpg_failed` Info with the wrapped `missing_signature` sentinel; same operator surface as forgery. |
+| `.deb` cache miss whose declared sha256 (in `package_hash`) mismatches the body upstream returned | `502` + `Retry-After: 60`; blob discarded; `hash_validation_failure` Error logged with declared/observed; the request line carries `outcome=package_hash_mismatch`; row not inserted; next request retries. |
 | `.deb` cache miss with no matching `package_hash` row (suite hasn't adopted, or .deb is in a suite the cache hasn't seen) | Phase 1 fallback: trust upstream, insert as in SPEC §6.2; `package_hash_miss` Debug. |
 | At-rest scan finds blob whose on-disk content disagrees with the declared sha256 | Blob removed from `pool/`; `at_rest_corruption` Error; next request misses, re-fetches, re-validates. |
 | `v1 → v2` migration interrupted | Tx rolls back; next start retries from `schema_version = 1`. |
 | Operator flips `adoption.enabled = false` mid-run | New observations of changed `InRelease` log "adoption disabled" and persist `inrelease_change_seen_at`; existing `current_snapshot_id`s keep serving normally. |
-| `[[trusted_signer]]` block has a regex matching a suite, but the fingerprint list doesn't intersect the host keyring | Trust set for that suite is empty → every adoption attempt fails `gpg_verify_failed` `reason=untrusted_key`. Detectable at startup config validation if the host keyring is also empty; not detectable otherwise (we cannot know which fingerprints are *expected* to be present at startup). |
+| `[[trusted_signer]]` block has a regex matching a suite, but the fingerprint list doesn't intersect the host keyring | Trust set for that suite is empty → every adoption attempt fails with `adoption_gpg_failed` Info carrying the wrapped `no_usable_signature` sentinel. Detectable at startup config validation if the host keyring is also empty; not detectable otherwise (we cannot know which fingerprints are *expected* to be present at startup). |
 | `adoption.require_pinned_signer=true` and a freshness check observes a new `InRelease` for a suite with no matching `[[trusted_signer]]` block | Adoption aborts before the verify step; `adoption_unpinned_suite` Warn logs the canonical host and suite path; prior snapshot continues to serve. Operators expect this surface and use it to drive their pinning rollout. |
 | Two distinct current snapshots reference the same `(canonical_host, .deb path)` with different declared sha256s | Both the §6.1 hit path and the §6.2 miss path fail closed with `502 + Retry-After: 60` and a `package_hash_conflict` log. This blocks .deb traffic for the affected path until the upstream divergence is resolved or one of the snapshots is re-adopted; the operator surface is unmistakable. |
-| §6.1 blob hit finds `url_path.blob_hash` disagreeing with `package_hash.declared_sha256` (stale Phase 1 row covered by a Phase 2 snapshot) | Evict the `url_path` row, decrement the prior blob's refcount, log `hit_path_hash_evicted`, fall through to §6.2 to re-fetch. The corrective re-fetch then runs the §6.2 validation; either it lands on the correct hash (steady state) or it produces a `package_hash_mismatch` if upstream is also wrong. |
+| §6.1 blob hit finds `url_path.blob_hash` disagreeing with `package_hash.declared_sha256` (stale Phase 1 row covered by a Phase 2 snapshot) | Evict the `url_path` row, decrement the prior blob's refcount, log `hit_path_hash_evicted`, fall through to §6.2 to re-fetch. The corrective re-fetch then runs the §6.2 validation; either it lands on the correct hash (steady state) or it produces a `hash_validation_failure` Error if upstream is also wrong. |
 | §7.5 step 5 finds an existing `pool/<hash>` whose content no longer matches its filename | Remove the corrupted file and `blob` row, log `pool_corruption_during_adoption`, fall through to fetch the member fresh from upstream. The member's hash is then validated against the declared sha256 as in any new fetch. |
-| Adoption sees a path mentioned in `Release` whose `by-hash` alias collides with a snapshot member at a different declared sha256 | The candidate snapshot's `snapshot_member` PK is `(snapshot_id, path)`, so the second INSERT fails inside the candidate transaction; adoption aborts with `adoption_db_failed`. This is a malformed `Release` (apt's own validators would reject it); the failure mode is loud rather than silent. |
+| Adoption sees a path mentioned in `Release` whose `by-hash` alias collides with a snapshot member at a different declared sha256 | The candidate snapshot's `snapshot_member` PK is `(snapshot_id, path)`, so the second INSERT fails inside the candidate transaction; adoption aborts. The `adoption_run_failed` Warn carries the wrapped `adoption_db_failed` sentinel. This is a malformed `Release` (apt's own validators would reject it); the failure mode is loud rather than silent. |
 
 ---
 
