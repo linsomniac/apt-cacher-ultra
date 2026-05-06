@@ -143,7 +143,8 @@ func (c *Cache) GetSuiteFreshness(ctx context.Context, scheme, host, suitePath s
 	const q = `
 SELECT canonical_scheme, canonical_host, suite_path,
        last_check_at, last_success_at,
-       inrelease_etag, inrelease_lastmod, inrelease_change_seen_at
+       inrelease_etag, inrelease_lastmod, inrelease_change_seen_at,
+       current_snapshot_id
 FROM suite_freshness
 WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
 	var s SuiteFreshness
@@ -151,6 +152,7 @@ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
 		&s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
 		&s.LastCheckAt, &s.LastSuccessAt,
 		&s.InReleaseETag, &s.InReleaseLastMod, &s.InReleaseChangeSeenAt,
+		&s.CurrentSnapshotID,
 	)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -174,7 +176,8 @@ func (c *Cache) ListSuites(ctx context.Context) ([]SuiteFreshness, error) {
 	const q = `
 SELECT canonical_scheme, canonical_host, suite_path,
        last_check_at, last_success_at,
-       inrelease_etag, inrelease_lastmod, inrelease_change_seen_at
+       inrelease_etag, inrelease_lastmod, inrelease_change_seen_at,
+       current_snapshot_id
 FROM suite_freshness`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
@@ -188,6 +191,7 @@ FROM suite_freshness`
 			&s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
 			&s.LastCheckAt, &s.LastSuccessAt,
 			&s.InReleaseETag, &s.InReleaseLastMod, &s.InReleaseChangeSeenAt,
+			&s.CurrentSnapshotID,
 		); err != nil {
 			return nil, fmt.Errorf("ListSuites scan: %w", err)
 		}

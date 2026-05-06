@@ -1193,3 +1193,570 @@ func itoa(n int) string {
 	}
 	return string(b[i:])
 }
+
+// seedBlob persists a blob row + on-disk file with the given content
+// via the cache's normal write path, returning the sha256 hex hash.
+// Used by adoption tests as a substitute for the real fetch+writeBlob
+// flow that lives in the freshness package.
+func seedBlob(t *testing.T, c *Cache, content string) string {
+	t.Helper()
+	w, err := c.NewTempBlob()
+	if err != nil {
+		t.Fatalf("NewTempBlob: %v", err)
+	}
+	if _, err := w.Write([]byte(content)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	hash, err := w.Finalize(int64(len(content)))
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if err := c.PutBlob(context.Background(), hash, int64(len(content))); err != nil {
+		t.Fatalf("PutBlob: %v", err)
+	}
+	return hash
+}
+
+// blobRefcount reads blob.refcount for a hash. Tests use this to
+// assert the SPEC2 §7.5.1 refcount bookkeeping.
+func blobRefcount(t *testing.T, c *Cache, hash string) int64 {
+	t.Helper()
+	var n int64
+	err := c.db.QueryRow(`SELECT refcount FROM blob WHERE hash = ?`, hash).Scan(&n)
+	if err != nil {
+		t.Fatalf("read refcount of %s: %v", hash, err)
+	}
+	return n
+}
+
+func TestInsertCandidateSnapshot_InlineMode(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	h := seedBlob(t, c, "fake InRelease bytes")
+
+	etag := `"etag-1"`
+	lastmod := "Thu, 25 Apr 2024 15:08:24 UTC"
+	id, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme:  "http",
+		CanonicalHost:    "archive.ubuntu.com",
+		SuitePath:        "/ubuntu/dists/noble",
+		InReleaseHash:    &h,
+		InReleaseETag:    &etag,
+		InReleaseLastMod: &lastmod,
+	})
+	if err != nil {
+		t.Fatalf("InsertCandidateSnapshot: %v", err)
+	}
+	if id <= 0 {
+		t.Fatalf("snapshot_id = %d, want positive", id)
+	}
+
+	got, err := c.GetSuiteSnapshot(ctx, id)
+	if err != nil {
+		t.Fatalf("GetSuiteSnapshot: %v", err)
+	}
+	if got.AdoptedAt != nil {
+		t.Errorf("candidate adopted_at = %v, want NULL", *got.AdoptedAt)
+	}
+	if got.InReleaseHash == nil || *got.InReleaseHash != h {
+		t.Errorf("InReleaseHash mismatch: %v", got.InReleaseHash)
+	}
+	if got.ReleaseHash != nil || got.ReleaseGPGHash != nil {
+		t.Errorf("detached fields should be NULL: %+v", got)
+	}
+}
+
+func TestInsertCandidateSnapshot_DetachedMode(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	rh := seedBlob(t, c, "fake Release bytes")
+	gh := seedBlob(t, c, "fake Release.gpg bytes")
+
+	id, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "deb.debian.org",
+		SuitePath:       "/debian/dists/bookworm",
+		ReleaseHash:     &rh,
+		ReleaseGPGHash:  &gh,
+	})
+	if err != nil {
+		t.Fatalf("InsertCandidateSnapshot detached: %v", err)
+	}
+	got, err := c.GetSuiteSnapshot(ctx, id)
+	if err != nil {
+		t.Fatalf("GetSuiteSnapshot: %v", err)
+	}
+	if got.InReleaseHash != nil {
+		t.Errorf("inline field should be NULL in detached mode: %v", got.InReleaseHash)
+	}
+	if got.ReleaseHash == nil || *got.ReleaseHash != rh {
+		t.Errorf("ReleaseHash mismatch: %v", got.ReleaseHash)
+	}
+	if got.ReleaseGPGHash == nil || *got.ReleaseGPGHash != gh {
+		t.Errorf("ReleaseGPGHash mismatch: %v", got.ReleaseGPGHash)
+	}
+}
+
+func TestInsertCandidateSnapshot_RejectsDanglingBlobFK(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	dangling := strings.Repeat("0", 64) // valid hex shape but no blob row
+	_, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "archive.ubuntu.com",
+		SuitePath:       "/ubuntu/dists/noble",
+		InReleaseHash:   &dangling,
+	})
+	if err == nil {
+		t.Fatal("expected FK violation, got nil")
+	}
+}
+
+func TestInsertCandidateSnapshot_RejectsBothModes(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	ih := seedBlob(t, c, "inline")
+	rh := seedBlob(t, c, "release")
+	gh := seedBlob(t, c, "release-gpg")
+
+	_, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "x.example",
+		SuitePath:       "/p",
+		InReleaseHash:   &ih,
+		ReleaseHash:     &rh,
+		ReleaseGPGHash:  &gh,
+	})
+	if err == nil {
+		t.Fatal("expected CHECK violation for both-modes, got nil")
+	}
+}
+
+func TestInsertCandidateSnapshot_RejectsAllNull(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	_, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "x.example",
+		SuitePath:       "/p",
+	})
+	if err == nil {
+		t.Fatal("expected CHECK violation for all-NULL, got nil")
+	}
+}
+
+func TestInsertCandidateSnapshot_NaturalKeyUnique(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	h := seedBlob(t, c, "same InRelease")
+	cand := SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "archive.ubuntu.com",
+		SuitePath:       "/ubuntu/dists/noble",
+		InReleaseHash:   &h,
+	}
+	if _, err := c.InsertCandidateSnapshot(ctx, cand); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	if _, err := c.InsertCandidateSnapshot(ctx, cand); err == nil {
+		t.Fatal("second insert with same (suite, hash): expected unique violation, got nil")
+	}
+}
+
+func TestCommitAdoption_FirstAdoption(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+
+	// Verified Release blob.
+	releaseBlob := seedBlob(t, c, "fake InRelease")
+	// Three member blobs.
+	pkgsBlob := seedBlob(t, c, "Packages content")
+	pkgsGzBlob := seedBlob(t, c, "Packages.gz content")
+	srcBlob := seedBlob(t, c, "Sources content")
+
+	id, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "archive.ubuntu.com",
+		SuitePath:       "/ubuntu/dists/noble",
+		InReleaseHash:   &releaseBlob,
+	})
+	if err != nil {
+		t.Fatalf("InsertCandidateSnapshot: %v", err)
+	}
+
+	members := []SnapshotMember{
+		{SnapshotID: id, Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
+		{SnapshotID: id, Path: "main/binary-amd64/Packages", BlobHash: pkgsBlob, DeclaredSHA256: pkgsBlob},
+		{SnapshotID: id, Path: "main/binary-amd64/Packages.gz", BlobHash: pkgsGzBlob, DeclaredSHA256: pkgsGzBlob},
+		{SnapshotID: id, Path: "main/source/Sources", BlobHash: srcBlob, DeclaredSHA256: srcBlob},
+	}
+	debHash := strings.Repeat("a", 64)
+	pkgs := []PackageHash{
+		{
+			CanonicalScheme: "http",
+			CanonicalHost:   "archive.ubuntu.com",
+			Path:            "/ubuntu/pool/main/f/foo/foo_1.deb",
+			DeclaredSHA256:  debHash,
+			SnapshotID:      id,
+		},
+	}
+	if err := c.CommitAdoption(ctx, id, members, pkgs); err != nil {
+		t.Fatalf("CommitAdoption: %v", err)
+	}
+
+	// adopted_at stamped.
+	got, err := c.GetSuiteSnapshot(ctx, id)
+	if err != nil {
+		t.Fatalf("GetSuiteSnapshot post-commit: %v", err)
+	}
+	if got.AdoptedAt == nil {
+		t.Errorf("adopted_at not set after commit")
+	}
+
+	// suite_freshness pointer flipped.
+	sf, err := c.GetSuiteFreshness(ctx, "http", "archive.ubuntu.com", "/ubuntu/dists/noble")
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness post-commit: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != id {
+		t.Errorf("current_snapshot_id = %v, want %d", sf.CurrentSnapshotID, id)
+	}
+
+	// All four member blobs have refcount = 1.
+	for _, h := range []string{releaseBlob, pkgsBlob, pkgsGzBlob, srcBlob} {
+		if got := blobRefcount(t, c, h); got != 1 {
+			t.Errorf("refcount %s = %d, want 1", h, got)
+		}
+	}
+
+	// snapshot_member rows exist.
+	gotMembers, err := c.ListSnapshotMembers(ctx, id)
+	if err != nil {
+		t.Fatalf("ListSnapshotMembers: %v", err)
+	}
+	if len(gotMembers) != len(members) {
+		t.Errorf("got %d snapshot_member rows, want %d", len(gotMembers), len(members))
+	}
+
+	// package_hash row exists and is queryable.
+	ph, err := c.GetPackageHash(ctx,
+		"http", "archive.ubuntu.com", "/ubuntu/pool/main/f/foo/foo_1.deb", id)
+	if err != nil {
+		t.Fatalf("GetPackageHash: %v", err)
+	}
+	if ph.DeclaredSHA256 != debHash {
+		t.Errorf("package_hash.declared_sha256 = %s, want %s", ph.DeclaredSHA256, debHash)
+	}
+}
+
+func TestCommitAdoption_DisplacesPrior(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+
+	// First snapshot with two members.
+	r1 := seedBlob(t, c, "Release v1")
+	m1 := seedBlob(t, c, "Member1 v1")
+	m2 := seedBlob(t, c, "Member2 v1")
+	id1, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "x.example",
+		SuitePath:       "/p",
+		InReleaseHash:   &r1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id1, []SnapshotMember{
+		{SnapshotID: id1, Path: "InRelease", BlobHash: r1, DeclaredSHA256: r1},
+		{SnapshotID: id1, Path: "M1", BlobHash: m1, DeclaredSHA256: m1},
+		{SnapshotID: id1, Path: "M2", BlobHash: m2, DeclaredSHA256: m2},
+	}, nil); err != nil {
+		t.Fatalf("commit #1: %v", err)
+	}
+
+	// Second snapshot: replaces M2 with M2v2; carries r1 and m1 forward.
+	r2 := seedBlob(t, c, "Release v2")
+	m2v2 := seedBlob(t, c, "Member2 v2")
+	id2, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "x.example",
+		SuitePath:       "/p",
+		InReleaseHash:   &r2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id2, []SnapshotMember{
+		{SnapshotID: id2, Path: "InRelease", BlobHash: r2, DeclaredSHA256: r2},
+		{SnapshotID: id2, Path: "M1", BlobHash: m1, DeclaredSHA256: m1},
+		{SnapshotID: id2, Path: "M2", BlobHash: m2v2, DeclaredSHA256: m2v2},
+	}, nil); err != nil {
+		t.Fatalf("commit #2: %v", err)
+	}
+
+	// suite_freshness now points to id2.
+	sf, _ := c.GetSuiteFreshness(ctx, "http", "x.example", "/p")
+	if sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != id2 {
+		t.Errorf("current_snapshot_id = %v, want %d", sf.CurrentSnapshotID, id2)
+	}
+
+	// Refcount expectations:
+	//  - r1: was in snap1 only → +1 then -1 → 0.
+	//  - r2: in snap2 only → +1.
+	//  - m1: carried (in both) → +1 (snap1 commit) +1 -1 (snap2 commit) → 1.
+	//  - m2: in snap1 only → +1 then -1 → 0.
+	//  - m2v2: in snap2 only → +1.
+	cases := []struct {
+		hash string
+		want int64
+	}{
+		{r1, 0},
+		{r2, 1},
+		{m1, 1},
+		{m2, 0},
+		{m2v2, 1},
+	}
+	for _, tc := range cases {
+		if got := blobRefcount(t, c, tc.hash); got != tc.want {
+			t.Errorf("refcount %s = %d, want %d", tc.hash, got, tc.want)
+		}
+	}
+}
+
+func TestCommitAdoption_RejectsAlreadyAdopted(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	r := seedBlob(t, c, "InRelease")
+	id, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "x.example",
+		SuitePath:       "/p",
+		InReleaseHash:   &r,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := []SnapshotMember{
+		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
+	}
+	if err := c.CommitAdoption(ctx, id, members, nil); err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	// Capture pre-state to confirm a second commit changes nothing.
+	pre := blobRefcount(t, c, r)
+
+	err = c.CommitAdoption(ctx, id, members, nil)
+	if !errors.Is(err, ErrSnapshotAlreadyAdopted) {
+		t.Fatalf("second commit: got %v, want ErrSnapshotAlreadyAdopted", err)
+	}
+	if got := blobRefcount(t, c, r); got != pre {
+		t.Errorf("refcount changed on rejected re-commit: was %d, now %d", pre, got)
+	}
+}
+
+func TestCommitAdoption_NonexistentSnapshot(t *testing.T) {
+	c := openCache(t)
+	err := c.CommitAdoption(context.Background(), 99999, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("got %v, want not-found error", err)
+	}
+}
+
+func TestCommitAdoption_RejectsMalformedMemberHash(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	r := seedBlob(t, c, "InRelease")
+	id, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
+		InReleaseHash: &r,
+	})
+	bad := []SnapshotMember{
+		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
+		{SnapshotID: id, Path: "M1", BlobHash: "not-a-hex", DeclaredSHA256: r},
+	}
+	err := c.CommitAdoption(ctx, id, bad, nil)
+	if err == nil || !errors.Is(err, ErrInvalidHash) {
+		t.Fatalf("got %v, want ErrInvalidHash", err)
+	}
+	// Atomicity: the first member must not have been committed.
+	if got, err := c.ListSnapshotMembers(ctx, id); err != nil || len(got) != 0 {
+		t.Errorf("expected zero members after rollback, got %d, err=%v", len(got), err)
+	}
+	if got := blobRefcount(t, c, r); got != 0 {
+		t.Errorf("refcount changed despite rollback: %d", got)
+	}
+}
+
+func TestCommitAdoption_RejectsDanglingBlobFK(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	r := seedBlob(t, c, "InRelease")
+	id, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
+		InReleaseHash: &r,
+	})
+	dangling := strings.Repeat("b", 64) // valid shape, no blob row
+	bad := []SnapshotMember{
+		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
+		{SnapshotID: id, Path: "M1", BlobHash: dangling, DeclaredSHA256: dangling},
+	}
+	err := c.CommitAdoption(ctx, id, bad, nil)
+	if err == nil {
+		t.Fatal("expected FK error, got nil")
+	}
+	// First member must not have survived rollback.
+	if got, _ := c.ListSnapshotMembers(ctx, id); len(got) != 0 {
+		t.Errorf("expected zero members after FK rollback, got %d", len(got))
+	}
+}
+
+func TestCommitAdoption_RejectsDuplicatePath(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	r := seedBlob(t, c, "InRelease")
+	m := seedBlob(t, c, "M1")
+	id, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
+		InReleaseHash: &r,
+	})
+	dupe := []SnapshotMember{
+		{SnapshotID: id, Path: "Path", BlobHash: r, DeclaredSHA256: r},
+		{SnapshotID: id, Path: "Path", BlobHash: m, DeclaredSHA256: m},
+	}
+	err := c.CommitAdoption(ctx, id, dupe, nil)
+	if err == nil {
+		t.Fatal("expected unique violation, got nil")
+	}
+	if got, _ := c.ListSnapshotMembers(ctx, id); len(got) != 0 {
+		t.Errorf("expected zero members after rollback, got %d", len(got))
+	}
+}
+
+func TestCommitAdoption_EmptyMembersStillFlips(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	r := seedBlob(t, c, "InRelease")
+	id, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
+		InReleaseHash: &r,
+	})
+	if err := c.CommitAdoption(ctx, id, nil, nil); err != nil {
+		t.Fatalf("CommitAdoption: %v", err)
+	}
+	sf, err := c.GetSuiteFreshness(ctx, "http", "x.example", "/p")
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != id {
+		t.Errorf("current_snapshot_id = %v, want %d", sf.CurrentSnapshotID, id)
+	}
+	got, _ := c.GetSuiteSnapshot(ctx, id)
+	if got.AdoptedAt == nil {
+		t.Errorf("adopted_at not stamped on empty-members commit")
+	}
+}
+
+func TestCommitAdoption_PreservesExistingSuiteFreshnessColumns(t *testing.T) {
+	// The freshness checker writes last_check_at, validators, etc. before
+	// adoption fires. CommitAdoption must flip current_snapshot_id without
+	// clobbering those columns.
+	c := openCache(t)
+	ctx := context.Background()
+	now := nowUnix()
+	etag := `"upstream-etag"`
+	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+		CanonicalScheme: "http",
+		CanonicalHost:   "x.example",
+		SuitePath:       "/p",
+		LastCheckAt:     &now,
+		LastSuccessAt:   &now,
+		InReleaseETag:   &etag,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r := seedBlob(t, c, "InRelease")
+	id, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
+		InReleaseHash: &r,
+	})
+	if err := c.CommitAdoption(ctx, id,
+		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
+		nil); err != nil {
+		t.Fatal(err)
+	}
+	sf, err := c.GetSuiteFreshness(ctx, "http", "x.example", "/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sf.LastCheckAt == nil || *sf.LastCheckAt != now {
+		t.Errorf("last_check_at clobbered: %v", sf.LastCheckAt)
+	}
+	if sf.InReleaseETag == nil || *sf.InReleaseETag != etag {
+		t.Errorf("inrelease_etag clobbered: %v", sf.InReleaseETag)
+	}
+	if sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != id {
+		t.Errorf("current_snapshot_id not flipped: %v", sf.CurrentSnapshotID)
+	}
+}
+
+func TestPutSuiteFreshness_PreservesCurrentSnapshotID(t *testing.T) {
+	// Phase 1 freshness checks call PutSuiteFreshness on every probe.
+	// The Phase 2 adoption pointer must survive those writes — otherwise
+	// every freshness tick would silently un-adopt the suite.
+	c := openCache(t)
+	ctx := context.Background()
+	r := seedBlob(t, c, "InRelease")
+	id, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
+		InReleaseHash: &r,
+	})
+	if err := c.CommitAdoption(ctx, id,
+		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
+		nil); err != nil {
+		t.Fatal(err)
+	}
+	// Now do a Phase-1-style freshness write on the same suite.
+	now := nowUnix()
+	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+		CanonicalScheme: "http",
+		CanonicalHost:   "x.example",
+		SuitePath:       "/p",
+		LastCheckAt:     &now,
+		LastSuccessAt:   &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sf, err := c.GetSuiteFreshness(ctx, "http", "x.example", "/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != id {
+		t.Errorf("PutSuiteFreshness clobbered current_snapshot_id: got %v, want %d",
+			sf.CurrentSnapshotID, id)
+	}
+}
+
+func TestGetSnapshotMember_NotFound(t *testing.T) {
+	c := openCache(t)
+	_, err := c.GetSnapshotMember(context.Background(), 9999, "no/such/path")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("got %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetPackageHash_NotFound(t *testing.T) {
+	c := openCache(t)
+	_, err := c.GetPackageHash(context.Background(),
+		"http", "x.example", "/no", 9999)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("got %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetSuiteSnapshot_NotFound(t *testing.T) {
+	c := openCache(t)
+	_, err := c.GetSuiteSnapshot(context.Background(), 9999)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("got %v, want ErrNotFound", err)
+	}
+}

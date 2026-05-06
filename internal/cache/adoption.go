@@ -1,0 +1,308 @@
+package cache
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+)
+
+// ErrSnapshotAlreadyAdopted is returned by CommitAdoption when invoked
+// on a snapshot whose adopted_at column is already set. Re-committing
+// would double-bump refcounts for every member, so the writer refuses.
+var ErrSnapshotAlreadyAdopted = errors.New("cache: snapshot already adopted")
+
+// InsertCandidateSnapshot inserts a fresh suite_snapshot row with
+// adopted_at = NULL and returns the auto-assigned snapshot_id. SPEC2
+// §7.5 step 4. Caller uses the returned id to key the snapshot_member
+// and package_hash rows it builds during prefetch (steps 5-8), then
+// finalizes via CommitAdoption (step 9 / §7.5.1).
+//
+// All non-nil *Hash fields must point at blob.hash values the caller
+// has already persisted via PutBlob; the FK constraints fail closed
+// otherwise. The schema CHECK on suite_snapshot enforces the
+// "exactly one of inline-or-detached" invariant; passing both modes
+// or all-NULL produces a constraint-violation error.
+func (c *Cache) InsertCandidateSnapshot(ctx context.Context, sc SnapshotCandidate) (int64, error) {
+	const q = `
+INSERT INTO suite_snapshot
+  (canonical_scheme, canonical_host, suite_path,
+   inrelease_hash, inrelease_etag, inrelease_lastmod,
+   release_hash, release_gpg_hash, created_at, adopted_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+	now := nowUnix()
+	var id int64
+	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx, q,
+			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath,
+			sc.InReleaseHash, sc.InReleaseETag, sc.InReleaseLastMod,
+			sc.ReleaseHash, sc.ReleaseGPGHash, now)
+		if err != nil {
+			return fmt.Errorf("InsertCandidateSnapshot: %w", err)
+		}
+		id, err = res.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("InsertCandidateSnapshot: last id: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// CommitAdoption performs the SPEC2 §7.5.1 atomic flip transaction:
+//
+//  1. Verify the snapshot is still a candidate (adopted_at IS NULL).
+//  2. Insert all snapshot_member rows for snapshotID.
+//  3. Insert all package_hash rows.
+//  4. Bump blob.refcount for each distinct blob_hash referenced by the
+//     new snapshot's members. Each blob is counted once even if many
+//     member rows point at it.
+//  5. Read the prior current_snapshot_id from suite_freshness (NULL if
+//     this is the first adoption for the suite).
+//  6. Upsert suite_freshness.current_snapshot_id to snapshotID. The
+//     other suite_freshness columns are left untouched.
+//  7. Stamp suite_snapshot.adopted_at = now.
+//  8. If prior_id was non-NULL, decrement refcount for each distinct
+//     blob_hash referenced by the prior snapshot's members. A blob
+//     shared between old and new nets to zero (+1 then -1) so the
+//     bookkeeping is correct under stable membership.
+//
+// All steps run in a single SQLite transaction on the writer
+// connection. Either every reader after COMMIT sees the new snapshot
+// (and every member it implies), or every reader sees the prior — no
+// half-flipped state is observable.
+//
+// Members list each (path, blob_hash, declared_sha256) triple to
+// insert. Caller is responsible for ensuring unique paths within the
+// list; the snapshot_member primary key (snapshot_id, path) will
+// surface duplicates as a constraint error and abort the transaction.
+//
+// PackageHashes is the per-.deb declared-hash assertion set. Pass an
+// empty slice for suites with no .debs (e.g. metadata-only suites).
+//
+// AIDEV-NOTE: this is the load-bearing transaction of Phase 2. Any
+// SQL error inside the body causes a Rollback — no partial flip can
+// be observed by any reader. The prior_id lookup happens *inside* the
+// transaction so a concurrent flip cannot race the bookkeeping.
+func (c *Cache) CommitAdoption(ctx context.Context, snapshotID int64,
+	members []SnapshotMember, packageHashes []PackageHash) error {
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("CommitAdoption: begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		// Step 1: candidate state guard. Read suite identification too —
+		// CommitAdoption needs canonical_scheme/host/suite_path to flip
+		// the suite_freshness pointer, and reading them from the row is
+		// strictly safer than trusting them from a separate caller
+		// argument.
+		var (
+			scheme, host, suite string
+			adoptedAt           sql.NullInt64
+		)
+		err = tx.QueryRowContext(ctx, `
+SELECT canonical_scheme, canonical_host, suite_path, adopted_at
+FROM suite_snapshot
+WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &adoptedAt)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("CommitAdoption: snapshot %d not found", snapshotID)
+		case err != nil:
+			return fmt.Errorf("CommitAdoption: read candidate: %w", err)
+		}
+		if adoptedAt.Valid {
+			return ErrSnapshotAlreadyAdopted
+		}
+
+		// Step 2: insert snapshot_member rows. Each member is validated
+		// against its declared invariants before we touch SQLite — a bad
+		// row should fail loud, not be smuggled past hash validation.
+		for _, m := range members {
+			if !validBlobHash(m.BlobHash) {
+				return fmt.Errorf("CommitAdoption: member %q blob_hash %w", m.Path, ErrInvalidHash)
+			}
+			if !validBlobHash(m.DeclaredSHA256) {
+				return fmt.Errorf("CommitAdoption: member %q declared_sha256 %w", m.Path, ErrInvalidHash)
+			}
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256)
+VALUES (?, ?, ?, ?)`,
+				snapshotID, m.Path, m.BlobHash, m.DeclaredSHA256); err != nil {
+				return fmt.Errorf("CommitAdoption: insert member %q: %w", m.Path, err)
+			}
+		}
+
+		// Step 3: insert package_hash rows.
+		for _, p := range packageHashes {
+			if !validBlobHash(p.DeclaredSHA256) {
+				return fmt.Errorf("CommitAdoption: package_hash %q declared_sha256 %w", p.Path, ErrInvalidHash)
+			}
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO package_hash (canonical_scheme, canonical_host, path,
+                          declared_sha256, snapshot_id)
+VALUES (?, ?, ?, ?, ?)`,
+				p.CanonicalScheme, p.CanonicalHost, p.Path,
+				p.DeclaredSHA256, snapshotID); err != nil {
+				return fmt.Errorf("CommitAdoption: insert package_hash %q: %w", p.Path, err)
+			}
+		}
+
+		// Step 4: bump refcount for blobs referenced by the new
+		// snapshot. The IN-subquery dedupes blob_hash values
+		// automatically: each blob row matches once regardless of how
+		// many member rows point at it.
+		if _, err := tx.ExecContext(ctx, `
+UPDATE blob SET refcount = refcount + 1
+ WHERE hash IN (SELECT blob_hash FROM snapshot_member WHERE snapshot_id = ?)`,
+			snapshotID); err != nil {
+			return fmt.Errorf("CommitAdoption: bump new refcounts: %w", err)
+		}
+
+		// Step 5: read prior current_snapshot_id from suite_freshness.
+		// A missing row means the suite has never had a freshness
+		// check (highly unusual since adoption is downstream of one,
+		// but the upsert in step 6 handles it).
+		var prior sql.NullInt64
+		err = tx.QueryRowContext(ctx, `
+SELECT current_snapshot_id FROM suite_freshness
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+			scheme, host, suite).Scan(&prior)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("CommitAdoption: read prior: %w", err)
+		}
+
+		// Step 6: upsert the pointer. Other suite_freshness columns are
+		// preserved on conflict — adoption flips the snapshot pointer
+		// only, not the freshness state.
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO suite_freshness
+  (canonical_scheme, canonical_host, suite_path, current_snapshot_id)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
+  current_snapshot_id = excluded.current_snapshot_id`,
+			scheme, host, suite, snapshotID); err != nil {
+			return fmt.Errorf("CommitAdoption: flip pointer: %w", err)
+		}
+
+		// Step 7: mark the new snapshot adopted.
+		now := nowUnix()
+		if _, err := tx.ExecContext(ctx, `
+UPDATE suite_snapshot SET adopted_at = ? WHERE snapshot_id = ?`,
+			now, snapshotID); err != nil {
+			return fmt.Errorf("CommitAdoption: stamp adopted_at: %w", err)
+		}
+
+		// Step 8: decrement refcounts for blobs the prior snapshot
+		// pinned. A blob shared between old and new gets +1 then -1
+		// (net 0) — exactly the bookkeeping a Phase 4 GC will rely on.
+		if prior.Valid {
+			if _, err := tx.ExecContext(ctx, `
+UPDATE blob SET refcount = refcount - 1
+ WHERE hash IN (SELECT blob_hash FROM snapshot_member WHERE snapshot_id = ?)`,
+				prior.Int64); err != nil {
+				return fmt.Errorf("CommitAdoption: decrement prior refcounts: %w", err)
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("CommitAdoption: commit: %w", err)
+		}
+		return nil
+	})
+}
+
+// GetSuiteSnapshot returns the suite_snapshot row by id, or ErrNotFound.
+// Read path; reads use the connection pool freely.
+func (c *Cache) GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*SuiteSnapshot, error) {
+	const q = `
+SELECT snapshot_id, canonical_scheme, canonical_host, suite_path,
+       inrelease_hash, inrelease_etag, inrelease_lastmod,
+       release_hash, release_gpg_hash, created_at, adopted_at
+FROM suite_snapshot
+WHERE snapshot_id = ?`
+	var s SuiteSnapshot
+	err := c.db.QueryRowContext(ctx, q, snapshotID).Scan(
+		&s.SnapshotID, &s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
+		&s.InReleaseHash, &s.InReleaseETag, &s.InReleaseLastMod,
+		&s.ReleaseHash, &s.ReleaseGPGHash, &s.CreatedAt, &s.AdoptedAt,
+	)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, ErrNotFound
+	case err != nil:
+		return nil, fmt.Errorf("GetSuiteSnapshot: %w", err)
+	}
+	return &s, nil
+}
+
+// GetSnapshotMember returns the snapshot_member row for (snapshot_id, path),
+// or ErrNotFound. Hot path: §6.1 metadata hit-path validation looks up
+// every served byte through this query.
+func (c *Cache) GetSnapshotMember(ctx context.Context, snapshotID int64, path string) (*SnapshotMember, error) {
+	const q = `
+SELECT snapshot_id, path, blob_hash, declared_sha256
+FROM snapshot_member
+WHERE snapshot_id = ? AND path = ?`
+	var m SnapshotMember
+	err := c.db.QueryRowContext(ctx, q, snapshotID, path).Scan(
+		&m.SnapshotID, &m.Path, &m.BlobHash, &m.DeclaredSHA256,
+	)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, ErrNotFound
+	case err != nil:
+		return nil, fmt.Errorf("GetSnapshotMember: %w", err)
+	}
+	return &m, nil
+}
+
+// ListSnapshotMembers returns every snapshot_member row for the snapshot,
+// in no guaranteed order. Used by tests and adoption diagnostics.
+func (c *Cache) ListSnapshotMembers(ctx context.Context, snapshotID int64) ([]SnapshotMember, error) {
+	const q = `
+SELECT snapshot_id, path, blob_hash, declared_sha256
+FROM snapshot_member
+WHERE snapshot_id = ?`
+	rows, err := c.db.QueryContext(ctx, q, snapshotID)
+	if err != nil {
+		return nil, fmt.Errorf("ListSnapshotMembers: %w", err)
+	}
+	defer rows.Close()
+	var out []SnapshotMember
+	for rows.Next() {
+		var m SnapshotMember
+		if err := rows.Scan(&m.SnapshotID, &m.Path, &m.BlobHash, &m.DeclaredSHA256); err != nil {
+			return nil, fmt.Errorf("ListSnapshotMembers scan: %w", err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListSnapshotMembers iter: %w", err)
+	}
+	return out, nil
+}
+
+// GetPackageHash returns the package_hash row for (scheme, host, path,
+// snapshot_id), or ErrNotFound. Hot path: §6.5 .deb hash validation.
+func (c *Cache) GetPackageHash(ctx context.Context, scheme, host, path string, snapshotID int64) (*PackageHash, error) {
+	const q = `
+SELECT canonical_scheme, canonical_host, path, declared_sha256, snapshot_id
+FROM package_hash
+WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`
+	var p PackageHash
+	err := c.db.QueryRowContext(ctx, q, scheme, host, path, snapshotID).Scan(
+		&p.CanonicalScheme, &p.CanonicalHost, &p.Path, &p.DeclaredSHA256, &p.SnapshotID,
+	)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, ErrNotFound
+	case err != nil:
+		return nil, fmt.Errorf("GetPackageHash: %w", err)
+	}
+	return &p, nil
+}
