@@ -234,10 +234,22 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		defer mu.Unlock()
 		defer c.adoptionWg.Done()
 		if err := c.adopter.Run(c.lifetimeCtx, req.suite, req.bytes, req.etag, req.lastmod); err != nil {
-			// Adopter.Run already emitted the categorized failure
-			// log. Nothing else to do here — the next periodic tick
-			// retries.
-			_ = err
+			// Several Adopter.Run paths emit categorized log lines
+			// before returning (adoption_gpg_failed,
+			// adoption_parse_failed, adoption_member_mismatch,
+			// pool_corruption_during_adoption). Others — content-
+			// length mismatch, fetch transport errors, DB failures
+			// the categorized line didn't already cover — propagate
+			// only as the wrapped sentinel. Without a backstop log,
+			// those drop on the floor and the operator sees the
+			// "InRelease changed at upstream" line followed by
+			// silence. Always surface a single line so any failure
+			// is grep-able.
+			c.logger.Warn("adoption_run_failed",
+				"canonical_host", req.suite.CanonicalHost,
+				"suite_path", req.suite.SuitePath,
+				"err", err,
+			)
 		}
 	}()
 }

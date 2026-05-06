@@ -38,6 +38,20 @@ const scanBufCap = 1 << 20
 // MD5Sum: and SHA1: blocks are ignored on purpose; Phase 2 trusts SHA256
 // only. A Release that lists no SHA256 block at all is an error.
 //
+// Metadata-self entries — "Release", "InRelease", "Release.gpg" — are
+// silently dropped. apt-ftparchive's `release` subcommand emits the
+// generated Release into its OWN SHA256 block as a directory-walk
+// artifact, listing it at "stub size" (headers only, ~188 bytes) with
+// the corresponding stub hash; the on-disk file we'd refetch is the
+// FULL output (~1.5 KiB) with a different hash, so naively iterating
+// these entries would dead-end at a content-length mismatch. apt
+// itself never refetches Release/Release.gpg/InRelease via the SHA256
+// block — it has those bytes already from the freshness fetch — so
+// dropping them is faithful to apt semantics. Inline-mode adoption
+// already handles InRelease via the metadata-self branch in
+// adoption.Run step 6; detached mode (when added) will handle Release
+// and Release.gpg the same way.
+//
 // AIDEV-NOTE: callers have already cryptographically verified the input
 // (§7.6 verify step). This function is a pure text parser — it consults
 // no trust store and performs no signature operation. Path validation
@@ -66,6 +80,9 @@ func ParseRelease(text []byte) ([]ReleaseMember, error) {
 			m, err := parseReleaseHashLine(line)
 			if err != nil {
 				return nil, fmt.Errorf("release: line %d: %w", lineNo, err)
+			}
+			if isMetadataSelfPath(m.Path) {
+				continue
 			}
 			if len(out) >= MaxReleaseMembers {
 				return nil, fmt.Errorf("release: exceeds %d members", MaxReleaseMembers)
@@ -137,6 +154,14 @@ func validHexSHA256(s string) bool {
 		}
 	}
 	return true
+}
+
+// isMetadataSelfPath reports whether p names a metadata file the
+// upstream emitted as a self-reference inside its own SHA256 block.
+// These are not member files apt ever refetches via the block — see
+// the doc comment on ParseRelease.
+func isMetadataSelfPath(p string) bool {
+	return p == "Release" || p == "Release.gpg" || p == "InRelease"
 }
 
 // validateMemberPath rejects suite-relative paths that could traverse

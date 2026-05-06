@@ -268,3 +268,78 @@ func TestParseRelease_EmptyInput(t *testing.T) {
 		t.Errorf("err shape: %v", err)
 	}
 }
+
+// TestParseRelease_DropsMetadataSelfReferences confirms that Release,
+// InRelease, and Release.gpg entries inside the SHA256 block are
+// silently dropped. apt-ftparchive's `release` subcommand walks the
+// suite directory and includes the generated Release as a member of
+// itself (at "stub size" — headers only, before the hash blocks were
+// appended). The on-disk file we'd refetch is the FULL output with a
+// different size and hash, so naively iterating these entries dead-ends
+// at a content-length mismatch and silently aborts adoption. apt itself
+// never refetches Release/Release.gpg/InRelease via the SHA256 block,
+// so dropping these is faithful to apt semantics.
+//
+// Real-world fixture: this test mirrors what `apt-ftparchive release`
+// actually emits — the Release line lists 188 bytes (the stub) while
+// the on-disk Release would be ~1.5 KiB.
+func TestParseRelease_DropsMetadataSelfReferences(t *testing.T) {
+	hRelease := sha(1)
+	hInRelease := sha(2)
+	hReleaseGPG := sha(3)
+	hPackages := sha(4)
+	hPackagesGz := sha(5)
+	body := "Origin: ChaosTest\n" +
+		"Suite: noble\n" +
+		"SHA256:\n" +
+		" " + hRelease + " 188 Release\n" +
+		" " + hInRelease + " 200 InRelease\n" +
+		" " + hReleaseGPG + " 100 Release.gpg\n" +
+		" " + hPackages + " 4533 main/binary-amd64/Packages\n" +
+		" " + hPackagesGz + " 1234 main/binary-amd64/Packages.gz\n"
+	got, err := ParseRelease([]byte(body))
+	if err != nil {
+		t.Fatalf("ParseRelease: %v", err)
+	}
+	want := []ReleaseMember{
+		{Path: "main/binary-amd64/Packages", SHA256: hPackages, Size: 4533},
+		{Path: "main/binary-amd64/Packages.gz", SHA256: hPackagesGz, Size: 1234},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d members, want %d (metadata-self refs should be dropped); got=%+v",
+			len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("member[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	// Belt-and-suspenders: explicitly assert none of the three
+	// metadata-self paths leaked through.
+	for _, m := range got {
+		switch m.Path {
+		case "Release", "InRelease", "Release.gpg":
+			t.Errorf("metadata-self path leaked through: %+v", m)
+		}
+	}
+}
+
+// TestParseRelease_PreservesNonRootRelease confirms the filter is
+// scoped to the bare metadata names. A path like
+// "main/source/Release" is component-content (some archives ship a
+// per-component Release, distinct from the suite Release), and the
+// filter must not strip it.
+func TestParseRelease_PreservesNonRootRelease(t *testing.T) {
+	h1 := sha(1)
+	h2 := sha(2)
+	body := "SHA256:\n" +
+		" " + h1 + " 188 Release\n" +
+		" " + h2 + " 444 main/source/Release\n"
+	got, err := ParseRelease([]byte(body))
+	if err != nil {
+		t.Fatalf("ParseRelease: %v", err)
+	}
+	if len(got) != 1 || got[0].Path != "main/source/Release" || got[0].SHA256 != h2 {
+		t.Errorf("expected only main/source/Release, got %+v", got)
+	}
+}
