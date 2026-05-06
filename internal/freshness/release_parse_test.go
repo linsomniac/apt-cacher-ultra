@@ -147,6 +147,22 @@ func TestParseRelease_BadPaths(t *testing.T) {
 		{"absolute", "/etc/shadow"},
 		{"dotdot in middle", "main/../../etc/shadow"},
 		{"dotdot at start", "../etc/shadow"},
+		// Defense-in-depth around isMetadataSelfPath: paths that
+		// downstream URL/path normalization would resolve to one of
+		// the filtered names ("Release", "InRelease", "Release.gpg")
+		// must be rejected by the parser, not the filter. Otherwise
+		// an upstream could ship "./Release" with a stub-size hash,
+		// the filter would miss it (exact-string compare), and the
+		// member fetcher would deadend at a content-length mismatch
+		// the same way the original bug did.
+		{"dot segment at start", "./Release"},
+		{"dot segment in middle", "main/./Packages"},
+		{"empty segment", "main//Packages"},
+		{"backslash separator", "main\\Packages"},
+		{"percent-encoded dot", "%2e/Release"},
+		{"percent-encoded gpg dot", "Release%2egpg"},
+		{"percent-encoded slash", "main%2fPackages"},
+		{"bare percent", "main/Pack%ages"},
 	}
 	h := sha(1)
 	for _, tc := range cases {
@@ -157,6 +173,32 @@ func TestParseRelease_BadPaths(t *testing.T) {
 				t.Fatalf("want invalid-path error, got %v", err)
 			}
 		})
+	}
+}
+
+// TestParseRelease_CapsParsedRowsNotJustRetained confirms the
+// MaxReleaseMembers cap counts EVERY parsed SHA256 row, including
+// metadata-self entries that get filtered. Without this an adversary
+// could pad a (signed) Release with millions of "Release" lines —
+// each one filtered, none counted toward the cap — and force the
+// parser to walk the entire payload before the freshness check's
+// per-body byte limit caught it. The body limit is the primary
+// gate; this is the row-level secondary bound.
+func TestParseRelease_CapsParsedRowsNotJustRetained(t *testing.T) {
+	hSelf := sha(1)
+	hReal := sha(2)
+	var sb strings.Builder
+	sb.WriteString("SHA256:\n")
+	// MaxReleaseMembers self-references — all filtered, but each
+	// must count. Adding even one more row past the cap should
+	// trip the error.
+	for i := 0; i < MaxReleaseMembers; i++ {
+		sb.WriteString(" " + hSelf + " 188 Release\n")
+	}
+	sb.WriteString(" " + hReal + " 4533 main/binary-amd64/Packages\n")
+	_, err := ParseRelease([]byte(sb.String()))
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("want exceeds-cap error after MaxReleaseMembers self-references, got %v", err)
 	}
 }
 

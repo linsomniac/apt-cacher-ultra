@@ -61,6 +61,7 @@ func ParseRelease(text []byte) ([]ReleaseMember, error) {
 	scanner.Buffer(make([]byte, 0, scanBufCap), scanBufCap)
 
 	var out []ReleaseMember
+	parsedRows := 0 // distinct from len(out) — counts filtered entries too
 	inSHA256 := false
 	sawSHA256Block := false
 	lineNo := 0
@@ -81,11 +82,20 @@ func ParseRelease(text []byte) ([]ReleaseMember, error) {
 			if err != nil {
 				return nil, fmt.Errorf("release: line %d: %w", lineNo, err)
 			}
+			// Cap on parsed rows, NOT on retained rows: an upstream
+			// that pads a Release with a million metadata-self
+			// entries would otherwise never trip the cap (they all
+			// get filtered) yet still pay the per-line parse cost.
+			// The caller-side body bound (~4 MiB for inline
+			// InRelease) is the primary DoS gate; this is a
+			// secondary bound that holds even if a future detached-
+			// mode path streams a larger Release file.
+			parsedRows++
+			if parsedRows > MaxReleaseMembers {
+				return nil, fmt.Errorf("release: exceeds %d members", MaxReleaseMembers)
+			}
 			if isMetadataSelfPath(m.Path) {
 				continue
-			}
-			if len(out) >= MaxReleaseMembers {
-				return nil, fmt.Errorf("release: exceeds %d members", MaxReleaseMembers)
 			}
 			out = append(out, m)
 			continue
@@ -166,10 +176,27 @@ func isMetadataSelfPath(p string) bool {
 
 // validateMemberPath rejects suite-relative paths that could traverse
 // out of the suite directory or are otherwise unsafe to use as on-disk
-// or URL components. Reject ".." even though filepath.Clean would
-// resolve it: a Release listing "a/../etc/shadow" is malformed by
-// definition, and silently rewriting it would mask the bug from the
-// adoption_parse_failed log.
+// or URL components. Reject ".." and "." even though filepath.Clean
+// would resolve them: a Release listing "a/../etc/shadow" or
+// "./Release" is malformed by definition, and silently rewriting it
+// would mask the bug from the adoption_parse_failed log AND open an
+// aliasing path past isMetadataSelfPath (e.g. "./Release" canonicalizes
+// to "Release" downstream but won't match the exact-string filter).
+//
+// Reject empty path segments ("main//Packages") for the same reason —
+// Go's path package and most HTTP servers normalize repeated slashes,
+// so the on-disk fetch would alias to a different declared entry.
+//
+// Reject backslashes outright. Real apt repositories use forward
+// slashes only; a backslash here can only be either a Windows-path
+// confusion vector or an attempt to encode a separator the parser
+// won't honor but a downstream component might.
+//
+// Reject percent-encoding entirely. Release files quote nothing —
+// every byte is literal — so a percent sign in a path field is a
+// signal that an upstream tried to smuggle a separator or dot
+// segment past the literal-string checks above (e.g. "%2e/Release"
+// or "Release%2egpg").
 func validateMemberPath(p string) error {
 	if p == "" {
 		return errors.New("empty")
@@ -180,9 +207,20 @@ func validateMemberPath(p string) error {
 	if strings.ContainsRune(p, 0) {
 		return errors.New("contains NUL")
 	}
+	if strings.ContainsRune(p, '\\') {
+		return errors.New("contains backslash")
+	}
+	if strings.ContainsRune(p, '%') {
+		return errors.New("contains percent-encoded byte")
+	}
 	for _, seg := range strings.Split(p, "/") {
-		if seg == ".." {
+		switch seg {
+		case "..":
 			return errors.New("contains .. segment")
+		case ".":
+			return errors.New("contains . segment")
+		case "":
+			return errors.New("contains empty segment")
 		}
 	}
 	return nil
