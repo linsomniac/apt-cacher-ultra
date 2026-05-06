@@ -176,9 +176,17 @@ CREATE TABLE suite_snapshot (
   -- across NULL trip on subtle three-valued-logic edges that the docs
   -- recommend against. The adoption transaction rejects malformed rows
   -- before INSERT.
-  UNIQUE (canonical_scheme, canonical_host, suite_path,
-          COALESCE(inrelease_hash, release_hash))
 );
+
+-- Natural-key UNIQUE: same (suite, verified text) cannot be adopted twice.
+-- Expressed as a UNIQUE INDEX rather than a table-level UNIQUE so the
+-- COALESCE expression is permitted (SQLite allows expressions in indexes
+-- but not in inline UNIQUE constraints). The COALESCE picks whichever of
+-- inrelease_hash or release_hash is populated for this snapshot — exactly
+-- one is, by construction.
+CREATE UNIQUE INDEX idx_suite_snapshot_natural
+  ON suite_snapshot(canonical_scheme, canonical_host, suite_path,
+                    COALESCE(inrelease_hash, release_hash));
 
 CREATE INDEX idx_suite_snapshot_suite
   ON suite_snapshot(canonical_scheme, canonical_host, suite_path);

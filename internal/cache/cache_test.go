@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -572,7 +573,7 @@ func TestClose_DoesNotStrandSubmitWriters(t *testing.T) {
 func TestPutBlob_RejectsMalformedHash(t *testing.T) {
 	c := openCache(t)
 	cases := []string{
-		"",                   // empty
+		"",                      // empty
 		strings.Repeat("a", 63), // too short
 		strings.Repeat("a", 65), // too long
 		strings.Repeat("g", 64), // non-hex
@@ -649,6 +650,395 @@ func TestHashReader(t *testing.T) {
 	}
 	if got != hex.EncodeToString(want[:]) {
 		t.Errorf("hash mismatch: got %s, want %s", got, hex.EncodeToString(want[:]))
+	}
+}
+
+// openV1Cache opens a cache directory and runs ONLY the v0→v1 migration,
+// leaving the database at schema_version = 1. Used to exercise the v1→v2
+// migration in isolation — calling Open() jumps straight to v2.
+//
+// Returns the bare *sql.DB and the directory; caller closes both. We
+// deliberately don't construct a *Cache, because Cache.Close drives the
+// writer goroutine through cache.db at v2-shape; using the same handle
+// for migration tests keeps the surface narrow.
+func openV1Cache(t *testing.T) (*sql.DB, string) {
+	t.Helper()
+	dir := t.TempDir()
+	for _, sub := range []string{"pool", "tmp", "staging"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o750); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	db, err := openDB(filepath.Join(dir, "cache.db"))
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	if err := applyMigration(context.Background(), db, 0); err != nil {
+		_ = db.Close()
+		t.Fatalf("applyMigration v0→v1: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db, dir
+}
+
+// TestMigration_V1ToV2_AddsTablesAndColumn verifies the new tables and
+// the suite_freshness.current_snapshot_id column appear with the
+// expected shape after applying migrations[1].
+func TestMigration_V1ToV2_AddsTablesAndColumn(t *testing.T) {
+	db, _ := openV1Cache(t)
+	ctx := context.Background()
+
+	// Sanity check: at v1 the new tables don't exist.
+	for _, tbl := range []string{"suite_snapshot", "snapshot_member", "package_hash"} {
+		var n int
+		err := db.QueryRow(
+			`SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, tbl,
+		).Scan(&n)
+		if err != nil {
+			t.Fatalf("probe %s: %v", tbl, err)
+		}
+		if n != 0 {
+			t.Errorf("v1 db already has %s table; expected pristine v1", tbl)
+		}
+	}
+
+	// Run v1 → v2.
+	if err := applyMigration(ctx, db, 1); err != nil {
+		t.Fatalf("applyMigration v1→v2: %v", err)
+	}
+
+	// All three new tables exist and accept count(*).
+	for _, q := range []string{
+		`SELECT count(*) FROM suite_snapshot`,
+		`SELECT count(*) FROM snapshot_member`,
+		`SELECT count(*) FROM package_hash`,
+	} {
+		var n int
+		if err := db.QueryRow(q).Scan(&n); err != nil {
+			t.Errorf("%q: %v", q, err)
+		}
+	}
+
+	// suite_freshness gained current_snapshot_id and accepts NULL on
+	// pre-existing rows. Probe via PRAGMA table_info.
+	rows, err := db.Query(`PRAGMA table_info(suite_freshness)`)
+	if err != nil {
+		t.Fatalf("PRAGMA table_info: %v", err)
+	}
+	defer rows.Close()
+	saw := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if name == "current_snapshot_id" {
+			saw = true
+			if ctype != "INTEGER" {
+				t.Errorf("current_snapshot_id type=%q, want INTEGER", ctype)
+			}
+			if notnull != 0 {
+				t.Errorf("current_snapshot_id should be nullable; notnull=%d", notnull)
+			}
+		}
+	}
+	if !saw {
+		t.Error("current_snapshot_id column not added to suite_freshness")
+	}
+
+	// schema_version row reports 2 after the migration.
+	v, err := readSchemaVersion(ctx, db)
+	if err != nil {
+		t.Fatalf("readSchemaVersion: %v", err)
+	}
+	if v != 2 {
+		t.Errorf("schema_version = %d, want 2", v)
+	}
+}
+
+// TestMigration_V1ToV2_PreservesV1Data verifies that pre-existing
+// blob/url_path/suite_freshness rows survive the migration intact.
+// The "trusted-until-replaced" rule (SPEC2 §4.3.2) requires this.
+func TestMigration_V1ToV2_PreservesV1Data(t *testing.T) {
+	db, _ := openV1Cache(t)
+	ctx := context.Background()
+
+	// Seed v1-shaped rows.
+	hash := strings.Repeat("a", 64)
+	if _, err := db.Exec(`INSERT INTO blob (hash, size, created_at, refcount) VALUES (?, 42, 100, 1)`, hash); err != nil {
+		t.Fatalf("seed blob: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO url_path
+		   (canonical_scheme, canonical_host, path, blob_hash,
+		    upstream_url, is_metadata, request_count)
+		   VALUES ('http', 'archive.ubuntu.com', '/p', ?, 'http://x', 0, 5)`,
+		hash,
+	); err != nil {
+		t.Fatalf("seed url_path: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO suite_freshness
+		   (canonical_scheme, canonical_host, suite_path)
+		   VALUES ('http', 'archive.ubuntu.com', '/ubuntu/dists/noble')`,
+	); err != nil {
+		t.Fatalf("seed suite_freshness: %v", err)
+	}
+
+	// Apply v1 → v2.
+	if err := applyMigration(ctx, db, 1); err != nil {
+		t.Fatalf("applyMigration v1→v2: %v", err)
+	}
+
+	// Verify rows survive unchanged.
+	var size int64
+	var refcount int
+	if err := db.QueryRow(`SELECT size, refcount FROM blob WHERE hash=?`, hash).Scan(&size, &refcount); err != nil {
+		t.Fatalf("query blob: %v", err)
+	}
+	if size != 42 || refcount != 1 {
+		t.Errorf("blob row mutated: size=%d refcount=%d", size, refcount)
+	}
+
+	var rc int
+	if err := db.QueryRow(
+		`SELECT request_count FROM url_path
+		   WHERE canonical_scheme='http' AND canonical_host='archive.ubuntu.com' AND path='/p'`,
+	).Scan(&rc); err != nil {
+		t.Fatalf("query url_path: %v", err)
+	}
+	if rc != 5 {
+		t.Errorf("url_path.request_count mutated: got %d, want 5", rc)
+	}
+
+	// suite_freshness row survives and current_snapshot_id is NULL.
+	var snap sql.NullInt64
+	if err := db.QueryRow(
+		`SELECT current_snapshot_id FROM suite_freshness
+		   WHERE canonical_scheme='http' AND canonical_host='archive.ubuntu.com'
+		     AND suite_path='/ubuntu/dists/noble'`,
+	).Scan(&snap); err != nil {
+		t.Fatalf("query suite_freshness: %v", err)
+	}
+	if snap.Valid {
+		t.Errorf("current_snapshot_id should be NULL on migrated v1 row; got %d", snap.Int64)
+	}
+}
+
+// TestMigration_V1ToV2_NewTablesEnforceFKs verifies the FK and CHECK
+// constraints on the v2 tables are wired up correctly. A snapshot_member
+// row pointing at a non-existent snapshot or non-existent blob must be
+// rejected.
+func TestMigration_V1ToV2_NewTablesEnforceFKs(t *testing.T) {
+	db, _ := openV1Cache(t)
+	ctx := context.Background()
+	if err := applyMigration(ctx, db, 1); err != nil {
+		t.Fatalf("applyMigration v1→v2: %v", err)
+	}
+
+	// Insert a real blob for the positive cases.
+	hash := strings.Repeat("a", 64)
+	if _, err := db.Exec(`INSERT INTO blob (hash, size, created_at) VALUES (?, 1, 0)`, hash); err != nil {
+		t.Fatalf("seed blob: %v", err)
+	}
+
+	// suite_snapshot: inrelease_hash FK must resolve to blob.hash.
+	bogus := strings.Repeat("b", 64)
+	_, err := db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path,
+		    inrelease_hash, created_at)
+		   VALUES ('http', 'x', '/s', ?, 0)`,
+		bogus,
+	)
+	if err == nil {
+		t.Error("suite_snapshot accepted dangling inrelease_hash; FK not enforced")
+	}
+
+	// Real snapshot insert succeeds.
+	res, err := db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path,
+		    inrelease_hash, created_at)
+		   VALUES ('http', 'x', '/s', ?, 0)`,
+		hash,
+	)
+	if err != nil {
+		t.Fatalf("real suite_snapshot: %v", err)
+	}
+	snapID, _ := res.LastInsertId()
+
+	// snapshot_member: declared_sha256 CHECK rejects malformed.
+	for _, bad := range []string{
+		strings.Repeat("g", 64), // non-hex
+		strings.Repeat("a", 63), // too short
+		strings.Repeat("A", 64), // uppercase
+	} {
+		_, err := db.Exec(
+			`INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256)
+			   VALUES (?, ?, ?, ?)`,
+			snapID, "p"+bad[:8], hash, bad,
+		)
+		if err == nil {
+			t.Errorf("snapshot_member accepted malformed declared_sha256 %q", bad)
+		}
+	}
+
+	// snapshot_member: well-formed insert is accepted.
+	if _, err := db.Exec(
+		`INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256)
+		   VALUES (?, ?, ?, ?)`,
+		snapID, "main/Packages", hash, hash,
+	); err != nil {
+		t.Errorf("valid snapshot_member rejected: %v", err)
+	}
+
+	// snapshot_member: PK (snapshot_id, path) prevents duplicate paths.
+	_, err = db.Exec(
+		`INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256)
+		   VALUES (?, ?, ?, ?)`,
+		snapID, "main/Packages", hash, hash,
+	)
+	if err == nil {
+		t.Error("snapshot_member accepted duplicate (snapshot_id, path)")
+	}
+
+	// package_hash: CHECK on declared_sha256 + FK on snapshot_id.
+	_, err = db.Exec(
+		`INSERT INTO package_hash
+		   (canonical_scheme, canonical_host, path, declared_sha256, snapshot_id)
+		   VALUES ('http', 'x', '/pool/foo.deb', ?, ?)`,
+		strings.Repeat("z", 64), snapID,
+	)
+	if err == nil {
+		t.Error("package_hash accepted malformed declared_sha256")
+	}
+	if _, err := db.Exec(
+		`INSERT INTO package_hash
+		   (canonical_scheme, canonical_host, path, declared_sha256, snapshot_id)
+		   VALUES ('http', 'x', '/pool/foo.deb', ?, ?)`,
+		hash, snapID,
+	); err != nil {
+		t.Errorf("valid package_hash rejected: %v", err)
+	}
+}
+
+// TestMigration_V1ToV2_NaturalKeyUniqueIndex verifies the COALESCE-based
+// UNIQUE INDEX on suite_snapshot rejects re-adopting the same content,
+// across both the inline (inrelease_hash set) and detached (release_hash
+// set) forms.
+func TestMigration_V1ToV2_NaturalKeyUniqueIndex(t *testing.T) {
+	db, _ := openV1Cache(t)
+	ctx := context.Background()
+	if err := applyMigration(ctx, db, 1); err != nil {
+		t.Fatalf("applyMigration v1→v2: %v", err)
+	}
+	hashA := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+	for _, h := range []string{hashA, hashB} {
+		if _, err := db.Exec(`INSERT INTO blob (hash, size, created_at) VALUES (?, 1, 0)`, h); err != nil {
+			t.Fatalf("seed blob: %v", err)
+		}
+	}
+
+	// Inline form: insert succeeds once, second identical insert fails.
+	if _, err := db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path, inrelease_hash, created_at)
+		   VALUES ('http', 'x', '/s', ?, 0)`,
+		hashA,
+	); err != nil {
+		t.Fatalf("first inline insert: %v", err)
+	}
+	_, err := db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path, inrelease_hash, created_at)
+		   VALUES ('http', 'x', '/s', ?, 0)`,
+		hashA,
+	)
+	if err == nil {
+		t.Error("duplicate inline (inrelease_hash) snapshot accepted; UNIQUE index missing")
+	}
+
+	// A different inrelease_hash for the same suite is allowed (a real
+	// upstream change advances inrelease_hash).
+	if _, err := db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path, inrelease_hash, created_at)
+		   VALUES ('http', 'x', '/s', ?, 0)`,
+		hashB,
+	); err != nil {
+		t.Errorf("distinct inrelease_hash for same suite rejected: %v", err)
+	}
+
+	// Detached form on a different suite: same uniqueness on release_hash.
+	if _, err := db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path, release_hash, release_gpg_hash, created_at)
+		   VALUES ('http', 'x', '/det', ?, ?, 0)`,
+		hashA, hashB,
+	); err != nil {
+		t.Fatalf("first detached insert: %v", err)
+	}
+	_, err = db.Exec(
+		`INSERT INTO suite_snapshot
+		   (canonical_scheme, canonical_host, suite_path, release_hash, release_gpg_hash, created_at)
+		   VALUES ('http', 'x', '/det', ?, ?, 0)`,
+		hashA, hashB,
+	)
+	if err == nil {
+		t.Error("duplicate detached (release_hash) snapshot accepted; UNIQUE index missing")
+	}
+}
+
+// TestMigration_V1ToV2_AtomicRollback verifies an interrupted v1→v2
+// migration leaves the database at v1, not partially applied. Simulated
+// by injecting a pre-existing object that collides with one of the
+// CREATE statements (here: an existing index name) so the migration
+// transaction must roll back.
+func TestMigration_V1ToV2_AtomicRollback(t *testing.T) {
+	db, _ := openV1Cache(t)
+	ctx := context.Background()
+
+	// Plant a pre-existing object with a name the migration tries to
+	// create. The CREATE UNIQUE INDEX in the migration will hit this
+	// and the whole transaction aborts.
+	if _, err := db.Exec(
+		`CREATE TABLE idx_suite_snapshot_natural (x INTEGER PRIMARY KEY)`,
+	); err != nil {
+		t.Fatalf("plant collision: %v", err)
+	}
+
+	err := applyMigration(ctx, db, 1)
+	if err == nil {
+		t.Fatal("expected migration error on name collision; got nil")
+	}
+
+	// Schema version is still 1.
+	v, err := readSchemaVersion(ctx, db)
+	if err != nil {
+		t.Fatalf("readSchemaVersion: %v", err)
+	}
+	if v != 1 {
+		t.Errorf("after rollback, schema_version = %d, want 1", v)
+	}
+
+	// Tables that the migration was creating must NOT exist (the tx
+	// rolled back).
+	for _, tbl := range []string{"suite_snapshot", "snapshot_member", "package_hash"} {
+		var n int
+		err := db.QueryRow(
+			`SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, tbl,
+		).Scan(&n)
+		if err != nil {
+			t.Fatalf("probe %s: %v", tbl, err)
+		}
+		if n != 0 {
+			t.Errorf("after rollback, %s table exists; tx was not atomic", tbl)
+		}
 	}
 }
 

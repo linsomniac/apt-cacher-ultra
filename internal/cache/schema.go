@@ -13,8 +13,9 @@ import (
 
 // CurrentSchemaVersion is the schema this build of the binary creates and
 // expects. Forward-only: a database tagged with a higher version is treated
-// as written by a newer binary and the cache refuses to open it. SPEC §4.3.
-const CurrentSchemaVersion = 1
+// as written by a newer binary and the cache refuses to open it. SPEC §4.3,
+// SPEC2 §4.3.
+const CurrentSchemaVersion = 2
 
 // migrations is indexed such that migrations[N] migrates the database from
 // schema version N to N+1. migrations[0] (v0 → v1) creates the entire
@@ -72,6 +73,75 @@ CREATE TABLE schema_version (
   version INTEGER PRIMARY KEY
 );
 INSERT INTO schema_version VALUES (1);
+`,
+	// v1 → v2: Phase 2 snapshot model. Pure additive DDL (SPEC2 §4.3.2):
+	//   - suite_snapshot: per-adoption header row (verified Release-text
+	//     blob, etag/lastmod, optional release_gpg_hash for detached
+	//     adoptions).
+	//   - snapshot_member: (snapshot_id, path) → blob_hash + declared
+	//     sha256. The "atomic flip" target.
+	//   - package_hash: (host, .deb path, snapshot_id) → declared sha256,
+	//     materialized at adoption to validate request-path .deb fetches.
+	//   - suite_freshness gains current_snapshot_id pointing at the
+	//     suite's adopted snapshot (NULL = pre-Phase-2 / not yet adopted).
+	//
+	// AIDEV-NOTE: this migration is forward-only and pure DDL — no row
+	// rewrites, no behavior change. Pre-existing url_path/blob/
+	// suite_freshness rows survive untouched. SPEC2 §4.3.2 "trusted-
+	// until-replaced" carries the implication: existing pool blobs keep
+	// serving via Phase 1 url_path lookup until/unless a §6.1 hit-path
+	// or §7.5 adoption rehash promotes or rejects them.
+	`
+CREATE TABLE suite_snapshot (
+  snapshot_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  canonical_scheme   TEXT NOT NULL,
+  canonical_host     TEXT NOT NULL,
+  suite_path         TEXT NOT NULL,
+  inrelease_hash     TEXT REFERENCES blob(hash),
+  inrelease_etag     TEXT,
+  inrelease_lastmod  TEXT,
+  release_hash       TEXT REFERENCES blob(hash),
+  release_gpg_hash   TEXT REFERENCES blob(hash),
+  created_at         INTEGER NOT NULL,
+  adopted_at         INTEGER
+);
+
+CREATE INDEX idx_suite_snapshot_suite
+  ON suite_snapshot(canonical_scheme, canonical_host, suite_path);
+
+CREATE UNIQUE INDEX idx_suite_snapshot_natural
+  ON suite_snapshot(canonical_scheme, canonical_host, suite_path,
+                    COALESCE(inrelease_hash, release_hash));
+
+CREATE TABLE snapshot_member (
+  snapshot_id      INTEGER NOT NULL REFERENCES suite_snapshot(snapshot_id),
+  path             TEXT NOT NULL,
+  blob_hash        TEXT NOT NULL REFERENCES blob(hash),
+  declared_sha256  TEXT NOT NULL
+                     CHECK (length(declared_sha256) = 64
+                            AND declared_sha256 NOT GLOB '*[^0-9a-f]*'),
+  PRIMARY KEY (snapshot_id, path)
+);
+
+CREATE INDEX idx_snapshot_member_blob
+  ON snapshot_member(blob_hash);
+
+CREATE TABLE package_hash (
+  canonical_scheme TEXT NOT NULL,
+  canonical_host   TEXT NOT NULL,
+  path             TEXT NOT NULL,
+  declared_sha256  TEXT NOT NULL
+                     CHECK (length(declared_sha256) = 64
+                            AND declared_sha256 NOT GLOB '*[^0-9a-f]*'),
+  snapshot_id      INTEGER NOT NULL REFERENCES suite_snapshot(snapshot_id),
+  PRIMARY KEY (canonical_scheme, canonical_host, path, snapshot_id)
+);
+
+CREATE INDEX idx_package_hash_snapshot
+  ON package_hash(snapshot_id);
+
+ALTER TABLE suite_freshness
+  ADD COLUMN current_snapshot_id INTEGER REFERENCES suite_snapshot(snapshot_id);
 `,
 }
 
