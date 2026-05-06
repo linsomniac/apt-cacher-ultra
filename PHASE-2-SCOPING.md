@@ -1,6 +1,6 @@
 # apt-cacher-ultra — Phase 2 Scoping
 
-Status: **scoping draft — not locked**. Last updated 2026-05-05.
+Status: **scoping draft — not locked**. Last updated 2026-05-05 (Q2/Q4/Q5 resolved).
 
 This document gathers what Phase 2 is, what hooks Phase 1 left for it, and the
 open design questions that must be settled before this becomes a locked SPEC2.md
@@ -119,12 +119,27 @@ ALTER TABLE suite_freshness
 The flip is one tx; either every client sees the new snapshot or every client
 keeps seeing the old. No window.
 
-**Open Q2 — request-path lookup:** does a metadata cache hit consult
-`current_snapshot_id` first (snapshot-scoped lookup), or does the existing
-`url_path` table stay authoritative with snapshot membership as a parallel
-index? The first is more correct under "frozen consistent set" semantics; the
-second preserves Phase 1's hot path unchanged. Recommend the first; it's the
-whole point.
+**Resolved (Q2): snapshot-scoped lookup.** Metadata cache hits consult
+`suite_freshness.current_snapshot_id` → `snapshot_member.path = ?` →
+`blob_hash`. Two consequences:
+
+- The Phase 1 `url_path` table stays authoritative for `.deb` (and any
+  non-suite path), and continues to track `last_requested_at` /
+  `request_count` for *all* paths including metadata. It is no longer the
+  source of truth for which blob a metadata path resolves to.
+- Adoption + read sit on the same key (`current_snapshot_id`). A request
+  arriving mid-flip sees either the prior `current_snapshot_id` or the new
+  one — never a partial mix — because the flip is one SQLite transaction.
+
+**.deb hash validation derived from this model.** Snapshot members include
+the `Packages` index, which lists every `.deb` filename with a declared
+`SHA256`. At `.deb` cache-miss, the fetch path consults the current
+snapshots covering the canonical host to recover the declared hash for the
+target path; mismatch on the downloaded blob → 502 + discard. The lookup is
+"join `snapshot_member` rows whose blob is a `Packages` file, parse the
+`Packages` text, find this `.deb`'s line." Materializing that into a
+queryable form (a `package_hash` table populated during adoption) is a
+performance question — see Open Q10.
 
 ### 3.2 Adoption flow
 
@@ -159,36 +174,43 @@ of the budget for request-path traffic, (c) cap concurrent adoptions globally.
 
 ### 3.3 GPG verification
 
-**Open Q4 — keyring source.** Three viable options, in order of effort:
+**Resolved (Q4): hybrid keyring.**
 
-(a) **System apt keyring.** Read `/etc/apt/trusted.gpg.d/*.gpg` and
-   `/etc/apt/keyrings/*` at startup. Mirrors what apt itself trusts on the
-   host. Easy to configure (apt admins already manage these). Risk: drift
-   between host keyring and what cache verifies.
+- **Default trust set:** the host's apt keyring — `/etc/apt/trusted.gpg.d/*.gpg`
+  plus `/etc/apt/keyrings/*` — loaded at startup. Mirrors what apt on the same
+  host would accept, so an operator already curating apt's trust on that
+  machine doesn't have to maintain a parallel set for the cache.
+- **Optional per-suite pinning:** a new `[[trusted_signer]]` config block
+  binds a `match_canonical_host` regex to a list of allowed GPG fingerprints
+  (long form, no whitespace). When such a block matches a suite's host,
+  *only* those fingerprints will satisfy verification, narrowing the trust
+  set below the host keyring's default. Operators who want strict pinning
+  configure it; everyone else gets sane apt-equivalent behavior for free.
 
-(b) **Bundled keyring + config-list.** Ship a default `apt-cacher-ultra`
-   keyring with the well-known ubuntu/debian keys; let operators add
-   per-upstream keys via a `[[keyring]]` config block pointing at a file path.
-   Decoupled from host apt; explicit list per upstream.
+```toml
+# Strict pinning example.
+[[trusted_signer]]
+match_canonical_host = '^archive\.ubuntu\.com$'
+fingerprints         = ['F6ECB3762474EDA9D21B7022871920D1991BC93C']
+```
 
-(c) **Per-suite fingerprint pinning.** In `[[remap]]` or a new
-   `[[trusted_signer]]` block, pin specific GPG fingerprints expected for a
-   canonical host. Strictest; matches the way `signed-by=` is used in modern
-   sources.list entries.
+Implementation note: the cache's trust set per suite is the intersection of
+"keys present in the host keyring" with "fingerprints whitelisted by a
+matching `[[trusted_signer]]` block, if any." Empty pinning list = "no key
+acceptable" = always reject; an explicit operator footgun the validator
+should warn on at startup.
 
-Recommend a hybrid: (a) by default for operational simplicity, with (c)
-optional for operators who want belt-and-suspenders. (b) is more cache-side
-state to maintain than it's worth.
-
-**GPG library:** Go has `golang.org/x/crypto/openpgp` (deprecated) and the
-maintained `github.com/ProtonMail/go-crypto/openpgp`. Recommend the latter.
-*Open Q5*.
+**Resolved (Q5): GPG library = `github.com/ProtonMail/go-crypto/openpgp`.**
+The maintained successor to `x/crypto/openpgp` (which is deprecated).
+Distributed as a tagged module, no cgo, used by the broader Go ecosystem
+including ProtonMail and Hashicorp Vault — proven against real-world
+keyring corpora.
 
 **Failure semantics:** signature invalid → reject the InRelease (no candidate
 snapshot created); signature missing → reject (treat unsigned upstream as
 hostile in Phase 2); upstream returned a `Release.gpg` detached signature
 instead of `InRelease` → support both forms (apt does), verify accordingly.
-*Open Q6*.
+*Open Q6.*
 
 ### 3.4 by-hash dedup
 
@@ -240,17 +262,22 @@ does not touch existing rows beyond schema additions.
 ## 4. Schema migration v1 → v2
 
 ```
-ALTER TABLE blob (no change to columns; refcount semantics activated)
+ALTER TABLE blob (no column change; refcount semantics activated)
 ADD TABLE suite_snapshot
 ADD TABLE snapshot_member
 ALTER TABLE suite_freshness ADD COLUMN current_snapshot_id INTEGER
-ALTER TABLE url_path ADD COLUMN snapshot_id INTEGER  -- optional, see Open Q2
 INSERT INTO schema_version VALUES (2)
 ```
 
-Migration is forward-only (Phase 1 already enforces this). Existing url_path
-rows survive untouched; new snapshot rows accrete on the first successful
-freshness check post-upgrade.
+(Q2 resolved as snapshot-scoped lookup, so `url_path` does not gain a
+`snapshot_id` column — the snapshot pointer lives on `suite_freshness` and
+metadata reads route through it.)
+
+Migration is forward-only (Phase 1 already enforces this). Existing
+`url_path` rows survive untouched; new snapshot rows accrete on the first
+successful freshness check post-upgrade. Pre-Phase-2 metadata blobs
+continue to serve via the Phase 1 `url_path` lookup until a snapshot is
+adopted (see Q9).
 
 ---
 
@@ -299,19 +326,27 @@ Each step is independently shippable and independently chaos-testable.
 
 ---
 
-## 7. Open questions — quick list
+## 7. Questions
+
+### 7.1 Resolved
+
+| ID | Question | Resolution |
+|---|---|---|
+| Q2 | Request-path lookup model | **Snapshot-scoped** via `suite_freshness.current_snapshot_id` → `snapshot_member`. `url_path` retains stats but is no longer source-of-truth for which blob a metadata path resolves to. (§3.1) |
+| Q4 | GPG keyring source | **Hybrid**: host apt keyring as default trust set, optional per-suite pinning via `[[trusted_signer]]` blocks. (§3.3) |
+| Q5 | OpenPGP library | **`github.com/ProtonMail/go-crypto/openpgp`** (the maintained replacement for the deprecated `x/crypto/openpgp`). (§3.3) |
+
+### 7.2 Open
 
 | ID | Question |
 |---|---|
 | Q1 | Is streaming-while-fetching and per-byte read timeouts in scope for Phase 2, or punted? |
-| Q2 | Does request-path lookup go via `current_snapshot_id` (snapshot-scoped) or stay on `url_path` with snapshot data as a side-index? |
 | Q3 | Adoption concurrency: shared `hostsem`, fraction-reserved, or global cap? |
-| Q4 | GPG keyring source: system apt keyring, bundled+config, per-suite pinning, or hybrid? |
-| Q5 | OpenPGP library: confirm `github.com/ProtonMail/go-crypto/openpgp`? |
 | Q6 | Detached `Release.gpg` support — required for Phase 2 or only `InRelease` inline? |
 | Q7 | Proactive by-hash prefetch during adoption, or on-demand? |
 | Q8 | Default cadence for read-path integrity scan, and is it disable-able? |
 | Q9 | Pre-Phase-2 pool/ blobs: trusted-until-replaced, or cold re-fetch on upgrade? |
+| Q10 | `.deb` declared-hash storage — derive at fetch time from the `Packages` blob, or materialize a `package_hash` table during adoption? Performance/complexity tradeoff (§3.1). |
 
 ---
 
