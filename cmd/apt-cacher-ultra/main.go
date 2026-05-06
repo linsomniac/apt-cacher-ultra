@@ -164,6 +164,8 @@ func serveListeners(
 		"upstream_idle_read_timeout", cfg.Upstream.IdleReadTimeout.Duration,
 		"upstream_max_retries", cfg.Upstream.MaxRetries,
 		"upstream_max_concurrent_per_host", cfg.Upstream.MaxConcurrentPerHost,
+		"upstream_unreachable_cooldown", cfg.Upstream.UnreachableCooldown.Duration,
+		"upstream_unreachable_probe_timeout", cfg.Upstream.UnreachableProbeTimeout.Duration,
 		"upstream_allowed_host_regex", cfg.Upstream.AllowedHostRegex,
 		"upstream_deny_target_ranges", cfg.Upstream.DenyTargetRanges,
 		"freshness_cooldown", cfg.Freshness.Cooldown.Duration,
@@ -211,14 +213,16 @@ func serveListeners(
 	}
 
 	fetchClient, err := fetch.New(fetch.Options{
-		ConnectTimeout:   cfg.Upstream.ConnectTimeout.Duration,
-		TotalTimeout:     cfg.Upstream.TotalTimeout.Duration,
-		IdleReadTimeout:  cfg.Upstream.IdleReadTimeout.Duration,
-		MaxRetries:       cfg.Upstream.MaxRetries,
-		AllowedHostRegex: cfg.Upstream.AllowedHostRegex,
-		DenyTargetRanges: cfg.Upstream.DenyTargetRanges,
-		UserAgent:        "apt-cacher-ultra/" + Version,
-		Logger:           logger,
+		ConnectTimeout:          cfg.Upstream.ConnectTimeout.Duration,
+		TotalTimeout:            cfg.Upstream.TotalTimeout.Duration,
+		IdleReadTimeout:         cfg.Upstream.IdleReadTimeout.Duration,
+		MaxRetries:              cfg.Upstream.MaxRetries,
+		UnreachableCooldown:     cfg.Upstream.UnreachableCooldown.Duration,
+		UnreachableProbeTimeout: cfg.Upstream.UnreachableProbeTimeout.Duration,
+		AllowedHostRegex:        cfg.Upstream.AllowedHostRegex,
+		DenyTargetRanges:        cfg.Upstream.DenyTargetRanges,
+		UserAgent:               "apt-cacher-ultra/" + Version,
+		Logger:                  logger,
 	})
 	if err != nil {
 		return fmt.Errorf("build fetch client: %w", err)

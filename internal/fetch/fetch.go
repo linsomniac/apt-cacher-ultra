@@ -90,6 +90,15 @@ type Options struct {
 	DenyTargetRanges []string
 	UserAgent        string
 
+	// UnreachableCooldown gates the per-host fast-fail mechanism. When
+	// > 0, a host whose dial just failed has subsequent dials within
+	// this window collapsed to a single probe attempt of
+	// UnreachableProbeTimeout, with retries suppressed on probe failure.
+	// Zero disables the feature (legacy behavior — full ConnectTimeout
+	// × MaxRetries budget on every miss). SPEC §1 "never hang."
+	UnreachableCooldown     time.Duration
+	UnreachableProbeTimeout time.Duration
+
 	// Logger sinks the per-retry "fetch retry" Info line (SPEC §10).
 	// nil falls back to slog.Default() — production main.run sets the
 	// default before fetch.New is called.
@@ -99,6 +108,10 @@ type Options struct {
 	// Test seam: httptest binds 127.0.0.1, which is in the default deny
 	// list, so tests pass an empty list (or set this) to bypass.
 	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// now, when non-nil, replaces time.Now in the unreachableTracker.
+	// Test seam for deterministic cooldown-window assertions.
+	now func() time.Time
 }
 
 // Client is a configured upstream fetcher: one *http.Client, a compiled
@@ -110,6 +123,7 @@ type Client struct {
 	totalTimeout time.Duration
 	userAgent    string
 	logger       *slog.Logger
+	unreachable  *unreachableTracker // nil when UnreachableCooldown <= 0
 }
 
 // Target identifies what to fetch. CanonicalHost is the cache-key host
@@ -159,6 +173,12 @@ func New(opts Options) (*Client, error) {
 	if opts.ConnectTimeout < 0 {
 		return nil, fmt.Errorf("fetch: connect_timeout must be >= 0, got %v", opts.ConnectTimeout)
 	}
+	if opts.UnreachableCooldown < 0 {
+		return nil, fmt.Errorf("fetch: unreachable_cooldown must be >= 0, got %v", opts.UnreachableCooldown)
+	}
+	if opts.UnreachableProbeTimeout < 0 {
+		return nil, fmt.Errorf("fetch: unreachable_probe_timeout must be >= 0, got %v", opts.UnreachableProbeTimeout)
+	}
 	allow, err := compileAllow(opts.AllowedHostRegex)
 	if err != nil {
 		return nil, err
@@ -167,7 +187,8 @@ func New(opts Options) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	transport := newTransport(opts, deny)
+	tracker := newUnreachableTracker(opts.UnreachableCooldown, opts.UnreachableProbeTimeout, opts.now)
+	transport := newTransport(opts, deny, tracker)
 	ua := opts.UserAgent
 	if ua == "" {
 		ua = defaultUserAgent
@@ -203,6 +224,7 @@ func New(opts Options) (*Client, error) {
 		totalTimeout: opts.TotalTimeout,
 		userAgent:    ua,
 		logger:       logger,
+		unreachable:  tracker,
 	}, nil
 }
 
@@ -576,6 +598,14 @@ func isRetryable(err error) bool {
 		return false
 	}
 	if errors.Is(err, ErrRedirectBlocked) || errors.Is(err, ErrInvalidURL) {
+		return false
+	}
+	if errors.Is(err, ErrHostUnreachable) {
+		// Probe-attempt failure under an active cooldown. Retrying buys
+		// nothing — we just consumed our short probe budget; the outer
+		// loop should fail fast (SPEC §1 "never hang"). Without this,
+		// the connect_timeout × max_retries hang returns whenever the
+		// probe path also times out, defeating the cooldown's purpose.
 		return false
 	}
 	if errors.Is(err, ErrCacheWriteFailed) {

@@ -62,12 +62,17 @@ func addrInDeny(addr netip.Addr, deny []netip.Prefix) (bool, netip.Prefix) {
 // `address` carries here) and against direct-IP requests like
 // http://10.0.0.1/.
 //
+// When tracker is non-nil, the dialContext is wrapped so per-host dial
+// failures register a cooldown (next dial within UnreachableCooldown
+// runs as a single short-deadline probe and surfaces ErrHostUnreachable
+// instead of consuming the full retry budget).
+//
 // AIDEV-NOTE: Proxy is set to nil. We never want to honor HTTP_PROXY for
 // upstream fetches because that would route requests through whatever the
 // host environment claims is a proxy — including, in some hosting
 // environments, an attacker-controlled HTTP_PROXY value. apt-cacher-ultra
 // is itself the proxy.
-func newTransport(opts Options, deny []netip.Prefix) http.RoundTripper {
+func newTransport(opts Options, deny []netip.Prefix, tracker *unreachableTracker) http.RoundTripper {
 	dialer := &net.Dialer{
 		Timeout:   opts.ConnectTimeout,
 		KeepAlive: 30 * time.Second,
@@ -90,6 +95,9 @@ func newTransport(opts Options, deny []netip.Prefix) http.RoundTripper {
 	if opts.dialContext != nil {
 		dialContext = opts.dialContext
 	}
+	if tracker != nil {
+		dialContext = wrapDialWithTracker(dialContext, tracker)
+	}
 	return &http.Transport{
 		Proxy:                 nil,
 		DialContext:           dialContext,
@@ -98,5 +106,55 @@ func newTransport(opts Options, deny []netip.Prefix) http.RoundTripper {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   opts.ConnectTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
+
+// wrapDialWithTracker returns a DialContext that consults tracker before
+// each dial: a host within cooldown gets a single probe with a short
+// deadline; a probe failure surfaces ErrHostUnreachable (non-retryable)
+// instead of the original timeout error so the outer Fetch loop bails
+// fast. Successful dials clear the marker; deny-CIDR rejections do not
+// touch it (the failure mode is config, not network).
+func wrapDialWithTracker(
+	inner func(ctx context.Context, network, addr string) (net.Conn, error),
+	tracker *unreachableTracker,
+) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, splitErr := net.SplitHostPort(addr)
+		// If we can't extract the host, fall through unmodified — the
+		// inner dialer's own error will surface and the request fails as
+		// it would today. The tracker is best-effort, never load-bearing.
+		if splitErr != nil {
+			return inner(ctx, network, addr)
+		}
+		inCooldown, probeT := tracker.inCooldown(host)
+		if inCooldown && probeT > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, probeT)
+			defer cancel()
+		}
+		conn, err := inner(ctx, network, addr)
+		if err != nil {
+			// Don't penalize the host for a deny-CIDR rejection — that's
+			// configuration, not unreachability. Every other dial-layer
+			// error counts as a network failure.
+			if !errors.Is(err, errDialDenied) {
+				tracker.markFailed(host)
+				if inCooldown {
+					// Wrap with both sentinels so errors.Is handles two
+					// dispatches: ErrHostUnreachable surfaces the
+					// fast-fail diagnosis to anyone who cares, and
+					// ErrUpstreamUnavailable routes the response
+					// through the same handler path as a normal
+					// upstream-down miss (502 + Retry-After, with
+					// tryServeStale eligibility on metadata).
+					return nil, fmt.Errorf("%w: %w: %v",
+						ErrUpstreamUnavailable, ErrHostUnreachable, err)
+				}
+			}
+			return nil, err
+		}
+		tracker.markOK(host)
+		return conn, nil
 	}
 }

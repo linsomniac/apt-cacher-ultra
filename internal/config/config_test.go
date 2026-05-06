@@ -631,6 +631,47 @@ validate_at_rest_interval = "0s"
 	}
 }
 
+// TestUpstream_UnreachableDefaultsApplied — SPEC §1 fast-fail. An
+// absent [upstream] block must inherit the default 30s cooldown / 1s
+// probe timeout. Documented "0 = disable"; tested separately below.
+func TestUpstream_UnreachableDefaultsApplied(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `[cache]
+dir = "`+dir+`"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Upstream.UnreachableCooldown.Duration; got != 30*time.Second {
+		t.Errorf("absent unreachable_cooldown = %v, want 30s default", got)
+	}
+	if got := cfg.Upstream.UnreachableProbeTimeout.Duration; got != time.Second {
+		t.Errorf("absent unreachable_probe_timeout = %v, want 1s default", got)
+	}
+}
+
+// TestUpstream_UnreachableExplicitZeroDisables — explicit 0 must NOT
+// be rewritten to the default. 0 is the documented disable signal so
+// operators can opt out of fast-fail and recover the legacy
+// connect_timeout × max_retries budget.
+func TestUpstream_UnreachableExplicitZeroDisables(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `[cache]
+dir = "`+dir+`"
+
+[upstream]
+unreachable_cooldown = "0s"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Upstream.UnreachableCooldown.Duration; got != 0 {
+		t.Errorf("explicit 0 cooldown not preserved: got %v", got)
+	}
+}
+
 // TestPhase2_GPGFingerprintCaseSensitivity — TOML accepts both upper
 // and lower hex case; canonicalization happens at trust-set load time.
 func TestPhase2_GPGFingerprintCaseSensitivity(t *testing.T) {

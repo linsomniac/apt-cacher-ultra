@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -237,7 +238,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // logging — http.ServeContent does the real header writes.
 //
 // SPEC2 §6.1 splits the lookup based on whether the request is metadata
-// under a Phase-2-adopted suite. Three regimes flow out of this method:
+// under a Phase-2-adopted suite. Four regimes flow out of this method:
 //
 //  1. Metadata under a suite with current_snapshot_id != NULL: lookup
 //     goes through suite_freshness → snapshot_member, with NO Phase 1
@@ -249,6 +250,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //     defense-in-depth check against package_hash. SPEC2 §6.1 step 5
 //     evicts a stale row whose hash disagrees with the snapshot's
 //     declared hash.
+//  4. SPEC2 §0 #4 by-hash content-addressed fallback (last-resort):
+//     when the path is `…/by-hash/SHA256/<hex>` AND the standard
+//     lookups all missed AND the suite is *not* adopted, serve from
+//     pool/<hex> directly when it exists. The URL's hash IS the content
+//     hash, so this is safe by construction — see tryByHashContentAddressed.
 //
 // The fast path on every successful return is one DB read, one stat, one
 // open(2), and one ServeContent — order-of-microseconds.
@@ -258,7 +264,20 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 			return served, status, body
 		}
 	}
-	return h.tryURLPathHit(w, r, req)
+	if served, status, body := h.tryURLPathHit(w, r, req); served {
+		return served, status, body
+	}
+	// SPEC2 §0 #4: when both lookups missed for a non-adopted metadata
+	// path of the form .../by-hash/SHA256/<hex>, the existing pool/
+	// content-addressed store may already hold the right bytes (cross-
+	// suite dedup, or a prior fetch under a different URL). Serve them
+	// directly — pool's content addressing makes this safe without a
+	// snapshot_member row, but the gate above ensures we never bypass
+	// an adopted suite's §6.1 contract.
+	if req.IsMetadata {
+		return h.tryByHashContentAddressed(w, r, req)
+	}
+	return false, 0, 0
 }
 
 // trySnapshotHit is the SPEC2 §6.1 metadata fast path. Returns
@@ -406,6 +425,90 @@ func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *pro
 	go h.touchAsync(req)
 	h.maybeFireFreshness(req)
 	return true, status, bytesWritten
+}
+
+// byHashSuffixRegex matches the trailing "/by-hash/SHA256/<64hex>" of a
+// request path. apt's Acquire-By-Hash mode appends this suffix under each
+// component directory; the trailing 64-char hex segment IS the SHA256 of
+// the file. Compiled once at package init.
+//
+// AIDEV-NOTE: SPEC2 §0 #4 by-hash content-addressed serve — pool's
+// content addressing makes this safe without a snapshot_member row, but
+// ONLY for non-adopted suites; adopted suites must keep going through
+// trySnapshotHit per SPEC2 §6.1.
+var byHashSuffixRegex = regexp.MustCompile(`/by-hash/SHA256/([0-9a-f]{64})$`)
+
+// tryByHashContentAddressed is the SPEC2 §0 #4 last-resort fast path: a
+// metadata request of the form .../by-hash/SHA256/<hex> served from
+// pool/<hex> when the blob exists, even with no url_path or
+// snapshot_member row. The URL is content-addressed by definition — its
+// hash IS the file's SHA256 — so a pool blob whose filename matches is,
+// by content addressing, the bytes any honest upstream would deliver.
+//
+// Caller contract: only invoke for metadata requests AND only after
+// trySnapshotHit returned handled=false (i.e. the suite is *not*
+// Phase-2-adopted) AND tryURLPathHit returned served=false. The §6.1
+// "snapshot is the contract" invariant must not be bypassed; gating on
+// non-adoption upholds it.
+//
+// On success, materializes a url_path row pointing at the existing pool
+// blob so subsequent requests skip the regex+stat dance and reuse the
+// faster tryURLPathHit path. Failure to insert the row is non-fatal —
+// the response was already served; the next request will repeat the
+// fallback.
+func (h *Handler) tryByHashContentAddressed(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, status int, bytesWritten int64) {
+	m := byHashSuffixRegex.FindStringSubmatch(req.Path)
+	if m == nil {
+		return false, 0, 0
+	}
+	hash := m[1]
+	exists, err := h.cache.BlobExists(hash)
+	if err != nil || !exists {
+		return false, 0, 0
+	}
+	served, status, bytesWritten = h.serveBlobWithHeaders(w, r, req, hash, snapshotMeta{
+		// snapshotID = 0 suppresses X-Cache-Snapshot — accurate signaling
+		// that this came from content-addressed dedup, not a snapshot.
+	})
+	if !served {
+		return false, 0, 0
+	}
+	// Best-effort: persist a url_path row so the next request hits
+	// tryURLPathHit instead of repeating the regex match. Use a fresh
+	// short-deadline ctx — the response is already on the wire and the
+	// client doesn't care if this write slips.
+	go h.recordByHashURLPath(req, hash)
+	h.maybeFireFreshness(req)
+	return true, status, bytesWritten
+}
+
+// recordByHashURLPath inserts the url_path row for a successful by-hash
+// content-addressed serve. Best-effort: a write failure here just means
+// the next request repeats the fallback path. Mirrors the row shape
+// runFetch produces for the analogous miss-path success.
+func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	now := time.Now().Unix()
+	row := cache.URLPath{
+		CanonicalScheme: req.CanonicalScheme,
+		CanonicalHost:   req.CanonicalHost,
+		Path:            req.Path,
+		BlobHash:        &hash,
+		UpstreamURL:     req.UpstreamURL,
+		IsMetadata:      req.IsMetadata,
+		LastRequestedAt: &now,
+		RequestCount:    1,
+		LastFetchedAt:   &now,
+	}
+	if err := h.cache.PutURLPath(ctx, row); err != nil {
+		h.logger.Debug("by-hash url_path insert failed",
+			"err", err,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"blob_hash", hash,
+		)
+	}
 }
 
 // checkPackageHash runs the SPEC2 §6.1 defense-in-depth on a .deb hit.

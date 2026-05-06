@@ -72,6 +72,15 @@ type UpstreamConfig struct {
 	MaxConcurrentPerHost int      `toml:"max_concurrent_per_host"`
 	AllowedHostRegex     []string `toml:"allowed_host_regex"`
 	DenyTargetRanges     []string `toml:"deny_target_ranges"`
+
+	// UnreachableCooldown gates the per-host fast-fail path: a host
+	// whose dial just failed has subsequent dials within this window
+	// collapsed to a single short-deadline probe (UnreachableProbeTimeout)
+	// with retries suppressed on probe failure. Default 30s. Set to 0
+	// to disable (legacy behavior — full ConnectTimeout × MaxRetries
+	// budget on every miss). SPEC §1 "never hang."
+	UnreachableCooldown     Duration `toml:"unreachable_cooldown"`
+	UnreachableProbeTimeout Duration `toml:"unreachable_probe_timeout"`
 }
 
 type FreshnessConfig struct {
@@ -201,6 +210,15 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("integrity", "validate_at_rest_workers") {
 		cfg.Integrity.ValidateAtRestWorkers = 4
 	}
+	// upstream.unreachable_cooldown / unreachable_probe_timeout: 0 means
+	// "disable" (legacy behavior), so apply defaults only when the key
+	// is absent. SPEC §1 fast-fail.
+	if !md.IsDefined("upstream", "unreachable_cooldown") {
+		cfg.Upstream.UnreachableCooldown.Duration = 30 * time.Second
+	}
+	if !md.IsDefined("upstream", "unreachable_probe_timeout") {
+		cfg.Upstream.UnreachableProbeTimeout.Duration = 1 * time.Second
+	}
 	cfg.Defaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -281,6 +299,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Upstream.MaxConcurrentPerHost < 0 {
 		errs = append(errs, errors.New("upstream.max_concurrent_per_host must not be negative"))
+	}
+	if c.Upstream.UnreachableCooldown.Duration < 0 {
+		errs = append(errs, errors.New("upstream.unreachable_cooldown must not be negative"))
+	}
+	if c.Upstream.UnreachableProbeTimeout.Duration < 0 {
+		errs = append(errs, errors.New("upstream.unreachable_probe_timeout must not be negative"))
 	}
 	if c.Freshness.Cooldown.Duration < 0 {
 		errs = append(errs, errors.New("freshness.cooldown must not be negative"))
