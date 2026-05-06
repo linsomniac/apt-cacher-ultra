@@ -1,4 +1,4 @@
-# apt-cacher-ultra default configuration. See SPEC.md for full reference.
+# apt-cacher-ultra default configuration. See SPEC.md and SPEC2.md for full reference.
 
 [cache]
 dir         = "/var/cache/apt-cacher-ultra"
@@ -88,12 +88,13 @@ require_pinned_signer = false
 # and an at_rest_corruption Error is logged with the snapshot it
 # belonged to; the next request re-fetches and re-validates.
 #
-# The scan only walks blobs reachable from a current snapshot — it
-# never races a future Phase 4 GC that reaps refcount=0 orphans.
-# Workers cap parallelism so a multi-GiB pool/ doesn't starve
-# request handling.
+# The candidate query starts from blobs reachable from a current
+# snapshot; orphan cleanup remains Phase 4 GC's job. If a snapshot
+# flips mid-scan, member files that have since become unreachable
+# are non-actionable and skipped. Workers cap parallelism so a
+# multi-GiB pool/ doesn't starve request handling.
 [integrity]
-validate_at_rest_interval = "24h"  # 0 disables the scanner entirely
+validate_at_rest_interval = "24h"  # "0s" disables the scanner entirely
 validate_at_rest_workers  = 4      # must be >= 1 when interval > 0
 
 [serve]
