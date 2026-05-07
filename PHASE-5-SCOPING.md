@@ -212,12 +212,15 @@ during scoping. Each resolution is normative for SPEC5.
   omit from `/metrics`. Rejected because cumulative bytes-on-disk
   is the most operationally-relevant gauge for a cache.
 
-- **Build info source.** `runtime/debug.ReadBuildInfo()` (Go
-  1.18+) for `acu_build_info{version,go_version,vcs_revision}`.
-  No `-ldflags` injection, no Makefile changes — the Go toolchain
-  embeds `vcs.revision`, `vcs.time`, and `vcs.modified` in the
-  binary automatically when built from a git checkout. The
-  Makefile's existing version handling carries forward unchanged.
+- **Build info source.** Hybrid: `version` comes from
+  `main.Version` (the existing `Makefile` already injects this via
+  `-ldflags '-X main.Version=$(VERSION)'` — see Makefile:6).
+  `vcs_revision` and `go_version` come from
+  `runtime/debug.ReadBuildInfo()` (Go 1.18+), which the toolchain
+  populates automatically. The Makefile's existing version
+  handling carries forward unchanged; Phase 5 reads `main.Version`
+  alongside `debug.ReadBuildInfo()` to produce
+  `acu_build_info{version,go_version,vcs_revision}` = 1.
 
 ---
 
@@ -231,24 +234,29 @@ hooks that Phase 5 builds on:
 | Per-request log line via `handler.logRequest(...)` (`internal/handler/handler.go:242`+) with structured fields including `outcome`, `status`, `bytes_sent`, `duration_ms` | The single per-request counter + histogram pair derives directly from this call site. Adding metrics here wires every request type with no missed branches. |
 | `Logger.Info("freshness_check", ..., "result", ...)` (`internal/freshness/*`) with `result` ∈ `{not_modified, unchanged, changed, failed}` | A 4-bucket counter `acu_freshness_check_total{result}`. |
 | `adoption_success` / `adoption_run_failed` / `adoption_gpg_failed` / `adoption_member_mismatch` / `adoption_parse_failed` / `adoption_unpinned_suite` family (`internal/freshness/adoption.go` etc.) | `acu_adoption_total{outcome}` with the outcome label drawn from the existing event names. |
-| `gc_run_complete` (Phase 4 SPEC4 §10.2) carrying `blobs_reaped`, `bytes_reclaimed`, `snapshots_orphan_reaped`, `snapshots_displaced_reaped`, `pool_orphans_repaired`, `pool_unlink_errors`, `duration_ms`, `phase` | Each numeric field becomes a `*_total` counter (cumulative-since-process-start) updated at run completion, plus `acu_gc_last_run_duration_seconds` and `acu_gc_last_run_unixtime` gauges. |
+| `gc_run_complete` (Phase 4 SPEC4 §10.2) carrying `blobs_reaped`, `bytes_reclaimed`, `orphan_candidates_reaped`, `displaced_reaped`, `pool_orphans_repaired`, `pool_unlink_errors`, `duration_ms`, `phase` | Each numeric field becomes a `*_total` counter (cumulative-since-process-start) updated at run completion. Counter names mirror the source field names: `acu_gc_orphan_candidates_reaped_total` and `acu_gc_displaced_reaped_total`. Plus `acu_gc_last_run_duration_seconds` and `acu_gc_last_run_unixtime` gauges. |
 | `cache.GetSuiteFreshness(...)` returning `InReleaseChangeSeenAt` (`internal/cache/queries.go:193`) | Status page renders the per-suite "lagging since" view. SPEC.md:492 explicitly bookmarks this column as a Phase 5 status-page item. |
 | `cache.ListSuites(ctx)` (`internal/cache/queries.go:226`) | Status page's "all tracked suites" table — one row per (host, suite_path) tuple. |
-| `hostsem.HostCount()` (`internal/hostsem/sem.go:121`) | Gauge `acu_active_hosts` — point-in-time count of hosts with in-flight upstream requests. Cheap to read. |
 | Single-listener architecture (`cmd/apt-cacher-ultra/main.go:105`+) with explicit listener-bind / Accept-defer separation (Phase 4 SPEC4 §4.2) | Phase 5 adds a *third* listener (alongside plain + TLS) following the same bind-early / Accept-late pattern. Same lifecycle, same graceful shutdown, no new wiring patterns. |
 | `lifecycleCtx` (SPEC §9.5) | Admin listener honors graceful shutdown: a long-running scrape mid-shutdown returns 503 with `Connection: close`. |
-| `runtime/debug.ReadBuildInfo()` (Go 1.18+) usable from main | Populates `acu_build_info{version,go_version,vcs_revision}` gauge=1 at startup. No `-ldflags` injection required — the Go toolchain already embeds VCS info in the binary. |
+| `main.Version` injected by Makefile `-ldflags '-X main.Version=$(VERSION)'` (Makefile:6) plus `runtime/debug.ReadBuildInfo()` for VCS revision and Go version | Populates `acu_build_info{version,go_version,vcs_revision}` gauge=1 at startup. The Makefile already drives `main.Version`; Phase 5 reads that string and merges it with `debug.BuildInfo` for the other fields. |
+| `hostsem.HostCount()` (`internal/hostsem/sem.go:121`) — host-set size only, no occupancy detail | A new `Snapshot()` method on `*Sem` is required for per-host inflight gauges + status-page table. Returns `map[string]struct{Inflight, Capacity int}`. Phase 5 deliverable: extend `internal/hostsem` with `Snapshot()`. |
 | Existing `[log]` config block conventions (`internal/config/config.go`) | Phase 5's new `[admin]` block follows the same parsing / validation conventions. Listen-address validation reuses the existing `validateListenAddr()` helper used by `[cache].listen` / `[cache].listen_tls`. |
 
-Phase 5 is **purely additive** at the schema level (no DB changes,
-no migration), at the request-path level (no changes to proxy
-listener semantics, no changes to handler.go's dispatch, no
-changes to fetch/cache/adoption/GC code other than one-line metric
-increments alongside existing log calls), and at the operational
-level (a new optional listener, off-by-default for non-loopback
-exposure but on-by-default on loopback). The wire contracts (SPEC
-§2), URL canonicalization (SPEC §3), per-host concurrency (SPEC
-§9.3), graceful shutdown semantics (SPEC §9.5), the snapshot model
+Phase 5 is **additive** at the schema level (no DB changes, no
+migration) and at the operational level (a new optional listener
+on loopback by default). The request path is unchanged: proxy
+listener semantics, handler dispatch, fetch / cache / adoption /
+GC code paths all carry forward identically; the only changes are
+metric-emit lines added alongside (not in place of) existing log
+emits, plus explicit instrumentation around fetch outcomes (the
+fetch package today logs only retries — outcome
+classification is added per §3.3.1). The single non-additive
+internal change is `internal/hostsem`: a new `Snapshot()` method
+is added to expose per-host inflight + capacity for the
+`acu_per_host_inflight{host}` gauge and the status-page table.
+The wire contracts (SPEC §2), URL canonicalization (SPEC §3),
+graceful shutdown semantics (SPEC §9.5), the snapshot model
 (SPEC2 §4), the hot-package model (SPEC3 §7.5), and the GC model
 (SPEC4 §9.6) all carry forward unchanged.
 
@@ -267,10 +275,15 @@ the cache.Open call. Bind order:
 2.  net.Listen TLS   (cache.ListenTLS, optional)
 3.  net.Listen admin (admin.Listen, optional, default 127.0.0.1:6789)
 4.  cache.Open
-5.  startup-time tmp/ + staging/ sweeps
-6.  GC startup pass (Phase 4)
+5.  cache.SweepTmp (startup-time tmp/ sweep; SPEC §4.2)
+6.  GC startup pass (Phase 4 §9.6)
 7.  Accept() goroutines start in parallel
 ```
+
+(Note: there is no startup `staging/` sweep — SPEC4 §4.2 documents
+that staging directories from cancelled adoptions are reaped by
+the §9.6 orphan-candidate-snapshot GC pass, not by a startup
+sweep.)
 
 Why bind early but Accept late (parallel to SPEC4 §4.2):
 
@@ -297,83 +310,151 @@ No POST, no PUT — the admin listener is read-only in Phase 5
 
 ### 3.2 The `internal/metrics` package
 
-A small package, ~200 LoC, providing:
+A small package, ~400 LoC, exposing **typed metric handles**
+(Counter, Histogram, Gauge) declared once at package init and
+called by short, label-positional methods at the emit site. This
+is what `internal/metrics/metrics.go` already implements; SPEC5
+contracts the existing API.
 
 ```go
 package metrics
 
-// Counter increments. Cumulative since process start.
-func Inc(name string, labels ...string)
+// Registry holds all registered metrics. The package-level Default
+// is what production code uses; tests construct private registries
+// via NewRegistry() to isolate state.
+type Registry struct { ... }
 
-// Histogram observations. Bucket boundaries are picked per-metric
-// at registration time (see §3.4).
-func Observe(name string, value float64, labels ...string)
+func NewRegistry() *Registry
+var Default *Registry
 
-// Gauge sets. Point-in-time values. Setters update an in-memory
-// cell read by /metrics renders.
-func SetGauge(name string, value float64, labels ...string)
+// Typed handles. Each is declared once at package init time on a
+// registry; subsequent .Inc / .Observe / .Set calls are
+// label-positional.
+type Counter struct { ... }
+type Histogram struct { ... }
+type Gauge struct { ... }
 
-// Render writes the current registry to w in Prometheus text
-// exposition format.
+func NewCounter(name, help string, labelNames ...string) *Counter
+func NewHistogram(name, help string, buckets []float64, labelNames ...string) *Histogram
+func NewGauge(name, help string, labelNames ...string) *Gauge
+
+// Hot-path methods. labelValues must match the declared labelNames
+// arity (mismatch panics — caught by tests, not at runtime).
+func (c *Counter) Inc(labelValues ...string)
+func (c *Counter) Add(delta float64, labelValues ...string)
+
+func (h *Histogram) Observe(value float64, labelValues ...string)
+
+func (g *Gauge) Set(value float64, labelValues ...string)
+func (g *Gauge) Inc(labelValues ...string)
+func (g *Gauge) Dec(labelValues ...string)
+func (g *Gauge) Add(delta float64, labelValues ...string)
+func (g *Gauge) Reset()  // refresher-driven gauges only
+
+// Render writes the registry to w in Prometheus text exposition
+// format. Stable series order across renders.
 func Render(w io.Writer)
+func (r *Registry) Render(w io.Writer)
 ```
 
-The package is goroutine-safe (sync.Mutex around the registry
-map). Render holds the lock for the duration of the write — that's
-fine because /metrics scrapes complete in low milliseconds even for
-hundreds of metrics.
+Why typed handles instead of string-keyed `metrics.Inc(name,
+labels...)`: a typo in the metric name silently creates a new
+metric that the test suite cannot easily catch. Typed handles
+fail at compile time. Label-arity mismatches panic at the call
+site, which a unit test exercises once per metric.
 
-The package does **not** depend on any third-party Prometheus
-client library. The exposition format is simple text; reimplementing
-the renderer is ~50 LoC and avoids dragging in the
-`prometheus/client_golang` dependency tree (which has its own
-collectors and conventions that often clash with hand-rolled
-metrics). Naming follows Prometheus conventions — `*_total` for
-counters, `*_seconds`/`*_bytes` for typed gauges/histograms, `_count`
+The package is goroutine-safe (per-metric sync.Mutex; one acquire
+per Inc/Observe/Set/Render call). Hot path: one lock + one map
+lookup. The package does **not** depend on any third-party
+Prometheus client library. The exposition-format renderer is ~50
+LoC and avoids dragging in the `prometheus/client_golang`
+dependency tree.
+
+Naming follows Prometheus conventions — `*_total` for counters,
+`*_seconds`/`*_bytes` for typed gauges/histograms, `_count`
 suffix for histogram observation count.
 
 ### 3.3 Counter-wiring sites
 
-The 30 unique event names cataloged in §2 cover the bulk of the
-metric surface. Wiring is mechanical: alongside each event emit,
-a one-line `metrics.Inc(...)` or `metrics.Observe(...)` is added.
-Examples:
+Each emit site adds one line next to the existing log call,
+calling a typed handle declared at package init. Examples:
 
 ```go
-// internal/handler/handler.go:logRequest — the per-request line.
+// internal/handler/handler.go top-level package vars
+var (
+    requestsTotal = metrics.NewCounter("acu_requests_total",
+        "Per-request outcomes",
+        "outcome", "host")
+    requestDuration = metrics.NewHistogram("acu_request_duration_seconds",
+        "Per-request wallclock",
+        []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60},
+        "outcome", "host")
+    responseBytes = metrics.NewHistogram("acu_response_bytes",
+        "Response body bytes",
+        []float64{1024, 4096, 65536, 262144, 1048576, 10485760, 104857600, 1073741824},
+        "outcome", "host")
+)
+
+// In logRequest:
 h.logRequest(r, host, path, outcome, status, bytes, false, 0, start)
-metrics.Inc("acu_requests_total", "outcome="+outcome)
-metrics.Observe("acu_request_duration_seconds",
-    time.Since(start).Seconds(), "outcome="+outcome)
-metrics.Observe("acu_response_bytes", float64(bytes), "outcome="+outcome)
+requestsTotal.Inc(outcome, host)
+requestDuration.Observe(time.Since(start).Seconds(), outcome, host)
+responseBytes.Observe(float64(bytes), outcome, host)
 ```
 
 ```go
-// internal/freshness — adoption_success
-g.cfg.Logger.Info("adoption_success", ...)
-metrics.Inc("acu_adoption_total", "outcome=success")
-metrics.Observe("acu_adoption_duration_seconds", duration.Seconds(),
-    "outcome=success")
+// internal/freshness — adoption_success / adoption_run_failed
+adoptionTotal.Inc("success", host)
+adoptionDuration.Observe(duration.Seconds(), "success", host)
 ```
 
 ```go
 // internal/gc/gc.go — gc_run_complete
-g.cfg.Logger.Info("gc_run_complete", ...,
-    "blobs_reaped", res.blobsReaped, ...)
-metrics.Inc("acu_gc_runs_total", "phase="+phase)
-metrics.IncBy("acu_gc_blobs_reaped_total", float64(res.blobsReaped))
-metrics.IncBy("acu_gc_bytes_reclaimed_total", float64(res.bytesReclaimed))
-metrics.SetGauge("acu_gc_last_run_unixtime", float64(time.Now().Unix()))
-metrics.Observe("acu_gc_run_duration_seconds", duration.Seconds(),
-    "phase="+phase)
+g.cfg.Logger.Info("gc_run_complete", ...)
+gcRunsTotal.Inc(phase)
+gcBlobsReaped.Add(float64(tick.blobsReaped))
+gcBytesReclaimed.Add(float64(tick.bytesReclaimed))
+gcOrphanCandidatesReaped.Add(float64(tick.orphanCandidatesReaped))
+gcDisplacedReaped.Add(float64(tick.displacedReaped))
+gcLastRunUnixtime.Set(float64(time.Now().Unix()), phase)
+gcRunDuration.Observe(duration.Seconds(), phase)
 ```
 
 The convention is: one metric line per log emit, placed
 immediately after the log call. Code-review rule (added to a
 project-level guide): a new `Logger.Info("foo_xxx", ...)` call
-without a corresponding `metrics.*("acu_foo_xxx_total", ...)` is
+without a corresponding `acuFooXxx.Inc(...)` is
 a review-failing omission unless the event is genuinely
 unmeasurable (e.g. one-time startup banners).
+
+#### 3.3.1 Sites that need explicit instrumentation (not log-mirroring)
+
+Most events have a 1:1 log emit + metric pair. **Two emit sites
+need fresh instrumentation** because the source package does not
+emit the events Phase 5 wants to count:
+
+1. **Fetch outcomes (`internal/fetch`).** The fetch package today
+   emits a single log line — `fetch retry` — when a transient
+   failure provokes a retry (`fetch.go:352`). It does **not** log
+   the terminal outcome of a fetch (success, status error,
+   timeout, redirect blocked, etc.). Phase 5 adds explicit
+   instrumentation around `Fetch()` and `ConditionalGet()` (and
+   `Probe()` if exposed): on terminal return, classify the
+   outcome from the returned `*StatusError` / `error.Is(...)` /
+   `nil` and call `fetchTotal.Inc(outcome, host)` +
+   `fetchDuration.Observe(...)`. This is the only Phase 5 surface
+   that adds non-cosmetic logic to a non-handler package.
+
+2. **Adoption duration.** `adoption_success` / `adoption_run_failed`
+   logs do not currently carry a `duration_ms` field; the freshness
+   loop measures and logs only the start/end markers. Phase 5
+   captures `time.Since(start)` at the same emit site as the log
+   line and feeds it to `adoptionDuration.Observe(...)`. No new
+   log fields, just a metric observation alongside.
+
+Both changes are localized — three call sites total — and do not
+alter any existing return shape, retry policy, or transaction
+ordering.
 
 ### 3.4 Metric inventory
 
@@ -383,9 +464,16 @@ sketch of the surface area, by source:
 Metrics are tagged `{host}` (the upstream `canonical_host`) when
 the host is known at the emit site. The `{host}` label set is
 bounded by `upstream.allowed_host_regex` (SPEC §6.6) — typical
-deployments allow ≤20 distinct hosts. Pre-host-resolution emits
-(method-not-allowed, bad-request before parse) carry no `{host}`
-label.
+deployments allow ≤20 distinct hosts.
+
+**Stable label sets.** Prometheus expects every series of a given
+metric to carry the same label keys. Outcomes that fire before
+host resolution (`method_not_allowed`, `bad_request`) emit with
+`host=""` (empty string), **not** with the `{host}` label
+omitted. The label set is invariant for the metric; only label
+values vary. Operators querying `acu_requests_total` see
+`host=""` series alongside `host="archive.ubuntu.com"` series and
+can filter / aggregate accordingly.
 
 #### 3.4.1 Request path (handler.go)
 
@@ -413,9 +501,15 @@ label.
 - `acu_fetch_retries_total{host}` — counter, one per retry attempt.
 - `acu_active_hosts` — gauge from `hostsem.HostCount()`. No host
   label (the metric *is* the host count).
-- `acu_per_host_inflight{host}` — gauge per host from `hostsem`,
-  the per-host slot occupancy. Useful for diagnosing one slow
-  upstream blocking others.
+- `acu_per_host_inflight{host}` — gauge per host from
+  `hostsem.Snapshot()` (new method — see §3.9), the per-host
+  slot occupancy. Useful for diagnosing one slow upstream
+  blocking others. Refreshed by the §3.7 refresher goroutine
+  rather than per-Acquire/Release to avoid hot-path overhead.
+- `acu_per_host_capacity{host}` — gauge per host from
+  `hostsem.Snapshot()`. The configured slot capacity
+  (`upstream.max_concurrent_per_host`) per host, exposed for
+  saturation alerting (`acu_per_host_inflight / acu_per_host_capacity`).
 
 #### 3.4.3 Freshness / adoption (internal/freshness)
 
@@ -440,12 +534,17 @@ label.
 
 #### 3.4.5 GC (internal/gc) — Phase 4 sourced
 
+Metric names mirror the source `gc_run_complete` log field names
+(SPEC4 §10.2: `orphan_candidates_reaped`, `displaced_reaped`,
+etc.) so an operator grepping logs and Prometheus together
+recognizes the same identifier.
+
 - `acu_gc_runs_total{phase}` — counter, phase ∈ {`startup`,
   `periodic`}.
 - `acu_gc_blobs_reaped_total` — counter.
 - `acu_gc_bytes_reclaimed_total` — counter.
-- `acu_gc_snapshots_orphan_reaped_total` — counter.
-- `acu_gc_snapshots_displaced_reaped_total` — counter.
+- `acu_gc_orphan_candidates_reaped_total` — counter.
+- `acu_gc_displaced_reaped_total` — counter.
 - `acu_gc_pool_orphans_repaired_total` — counter.
 - `acu_gc_pool_unlink_errors_total` — counter.
 - `acu_gc_run_duration_seconds{phase}` — histogram.
@@ -533,11 +632,15 @@ displaced snapshots retained per suite: 3
 [list of hot package set, top 20 by request count, with last_requested_at]
 
 == Recent adoptions ==
-[table of last 20 adoptions across all suites]
+[table of last N adoptions across all suites — successes and
+failures, sourced from an in-memory ring buffer (see §3.10);
+the ring is empty after a process restart]
 
 == Active hosts ==
 host                 inflight   slot_capacity
 archive.ubuntu.com   2          8
+
+[sourced from hostsem.Snapshot() — see §3.9]
 ```
 
 Tables use plain `<table>`. CSS is inlined in a `<style>` block;
@@ -598,7 +701,7 @@ in SPEC5; backwards-compatible additions only thereafter):
     {"host": "archive.ubuntu.com",
      "suite_path": "ubuntu/dists/jammy",
      "outcome": "success",
-     "adopted_at_unixtime": 1746668400,
+     "completed_unixtime": 1746668400,
      "duration_seconds": 4.21}
   ],
   "active_hosts": [
@@ -613,16 +716,31 @@ Top-level keys are stable; new keys may be added (consumers
 should ignore unknown keys per JSON convention). Field types are
 fixed.
 
+`recent_adoptions[].completed_unixtime` is the timestamp the
+adoption *finished* (success or failure), not `adopted_at`. For a
+successful adoption this is approximately equal to the DB's
+`adopted_at`; for a failure there is no DB record (see §3.10).
+`recent_adoptions` is sourced from the §3.10 in-memory ring and
+returns an empty array after a process restart.
+
 ### 3.6 Healthz design
 
-Three stateless checks, each ≤5ms:
+Three stateless checks, typical wallclock <5ms with a hard 1.5s
+ceiling (the DB-ping timeout dominates the worst-case path):
 
-1. **Cache directory writable**: `os.OpenFile(cache_dir +
-   "/.healthz", O_CREATE|O_WRONLY|O_TRUNC, 0644)`, write 1 byte,
-   close, unlink. Exercises the actual filesystem under the cache.
-2. **DB pingable**: `db.PingContext(ctx)` with 1s timeout.
+1. **Cache directory writable**: `os.CreateTemp(cache_dir,
+   ".acu-healthz-*")`, write 1 byte, close, `os.Remove`.
+   `CreateTemp` returns a unique-suffix filename so concurrent
+   probes do not race on a fixed filename. Failure to create or
+   write is the failure signal. Typical wallclock <2ms on a
+   healthy local filesystem.
+2. **DB pingable**: `db.PingContext(ctx)` with a 1s deadline.
+   This is the single check whose worst case can dominate the
+   request — a hung sqlite writer pushes it to ~1s. Typical
+   wallclock <1ms.
 3. **Process not in graceful shutdown**: read a flag set by the
-   shutdown handler before `Server.Shutdown` is called.
+   shutdown handler before `Server.Shutdown` is called. Microsecond
+   cost (one atomic load).
 
 If all three pass: `200 ok\n`. If any fails: `503 degraded\n`,
 with the failing check name in a header (`X-Acu-Check-Failed:
@@ -647,6 +765,10 @@ Started after the admin listener binds. Runs a loop with
 - `acu_suites_tracked`, `acu_url_paths_tracked`,
   `acu_snapshots_current`, `acu_snapshots_displaced` — each a
   single COUNT query.
+- `acu_per_host_inflight{host}`, `acu_per_host_capacity{host}` —
+  populated from `hostsem.Snapshot()` (§3.9). Before populating,
+  the per-host gauges call `.Reset()` so a host that no longer
+  has in-flight requests stops reporting stale values.
 
 The 30s cadence balances scrape freshness (Prometheus default
 scrape every 15s) against query cost. An operator running
@@ -758,6 +880,100 @@ Warn** is emitted at startup. Parallel to `gc_disabled` and
 choice to expose admin endpoints without auth, and the warning is
 the operational signal.
 
+### 3.9 hostsem.Snapshot — new API
+
+`internal/hostsem.Sem` today exposes only `HostCount() int`. The
+per-host inflight gauge (§3.4.2) and the status-page active-hosts
+table (§3.5.2) need per-host occupancy and capacity. Phase 5 adds
+one method:
+
+```go
+// Snapshot returns a point-in-time copy of every active host's
+// (inflight, capacity) tuple. inflight is the count of currently
+// held tokens (waiting acquirers do not count); capacity is the
+// configured per-host slot count (the same value passed to New()).
+//
+// AIDEV-NOTE: callers should treat the returned map as read-only
+// and not modify it. The map allocation is the cost of one Lock /
+// for-range / Unlock; expected to be called by the §3.7 refresher
+// at 30s cadence and by the status-page handler at request time.
+func (s *Sem) Snapshot() map[string]HostStat
+
+type HostStat struct {
+    Inflight int
+    Capacity int
+}
+```
+
+Implementation: hold the existing `sem.mu` Lock, walk
+`sem.slots`, and for each `*hostSlot` record `Inflight = limit -
+len(slot.ch)` and `Capacity = limit`. (The buffered channel's
+length is the count of *available* tokens; in-flight is the
+complement.)
+
+The new method does not change any existing semaphore behavior —
+it is purely a read view onto the existing fields under the
+existing lock.
+
+### 3.10 In-memory adoption ring (`internal/observability`)
+
+The status page's `recent_adoptions` section (§3.5.2 / §3.5.3)
+shows a tail of recent adoption attempts including outcome and
+duration. The DB has `suite_snapshot.adopted_at` for *successful*
+adoptions only — failed adoption attempts (parse_failed,
+gpg_failed, member_mismatch, etc.) leave no DB record. Without
+schema changes (§1 commits to none), the only place to keep
+failure history is process memory.
+
+Phase 5 introduces a small `internal/observability` package with
+a thread-safe ring buffer:
+
+```go
+package observability
+
+type AdoptionEvent struct {
+    Host             string
+    SuitePath        string
+    Outcome          string  // success, parse_failed, gpg_failed, ...
+    CompletedUnixSec int64
+    DurationSeconds  float64
+}
+
+type Ring struct {
+    mu     sync.Mutex
+    buf    []AdoptionEvent
+    head   int
+    full   bool
+    cap    int
+}
+
+func NewRing(capacity int) *Ring
+func (r *Ring) Record(e AdoptionEvent)        // O(1) under lock
+func (r *Ring) Snapshot() []AdoptionEvent     // newest-first copy
+```
+
+Capacity: 50 events (locked default; not tunable in Phase 5 since
+the value affects neither correctness nor operator workflow).
+
+Producers: every adoption-completion site in `internal/freshness`
+calls `Ring.Record(...)` alongside the `adoption_*` log emit and
+the `adoptionTotal.Inc(...)` counter increment.
+
+Consumer: the status-page handler calls `Ring.Snapshot()` at
+request time. The Snapshot copy is owned by the caller and not
+mutated by the ring.
+
+The ring is process-local: empty after every restart. The HTML
+page renders an explanatory "(empty since last process start)"
+note when the snapshot is empty *and* the process has been up
+for less than 5 minutes — a usability cue for operators who
+restarted recently.
+
+This is the only piece of mutable in-memory state Phase 5 adds
+beyond the metrics registry and the htpasswd cache. It does not
+participate in graceful-shutdown ordering: dropping the ring on
+shutdown is correct (the data is non-authoritative).
+
 ---
 
 ## 4. Schema migration
@@ -863,12 +1079,44 @@ Three test layers, parallel to Phase 4:
 
 - Issue a request that produces a known outcome (`hit`, `miss`,
   `forbidden`, `bad_gateway`), then scrape `/metrics` and verify
-  the corresponding `acu_requests_total{outcome=...}` counter
-  incremented by exactly 1.
+  the corresponding `acu_requests_total{outcome=...,host=...}`
+  counter incremented by exactly 1.
+- A request that fails before host parsing (`method_not_allowed`)
+  produces `acu_requests_total{outcome="method_not_allowed",host=""}`
+  — verifying the empty-host stable-label-set posture from §3.4.
 - Run a synthetic GC pass with known reaped count, then scrape
-  `/metrics` and verify `acu_gc_blobs_reaped_total` incremented.
+  `/metrics` and verify `acu_gc_blobs_reaped_total`,
+  `acu_gc_orphan_candidates_reaped_total`, and
+  `acu_gc_displaced_reaped_total` incremented.
 - Trigger a freshness check that returns 304, scrape, verify
-  `acu_freshness_check_total{result=not_modified}` incremented.
+  `acu_freshness_check_total{result=not_modified,host=...}`
+  incremented.
+- Issue a fetch that returns 200, then a fetch that returns 502,
+  then a fetch that times out — verify
+  `acu_fetch_total{outcome="2xx",host=...}`,
+  `acu_fetch_total{outcome="5xx",host=...}`,
+  `acu_fetch_total{outcome="timeout",host=...}` each incremented
+  exactly once (validates the §3.3.1 explicit fetch
+  instrumentation).
+
+### 6.4 hostsem.Snapshot tests
+
+- `Snapshot()` on an empty Sem returns an empty map.
+- After two Acquires on host A and one on host B, `Snapshot()`
+  returns `{"A": {Inflight:2, Capacity:N}, "B": {Inflight:1, Capacity:N}}`.
+- A waiter blocked on Acquire (capacity exhausted) does **not**
+  count toward Inflight.
+- Concurrent Snapshot + Acquire/Release under `-race` — no
+  data race, returned values are internally consistent.
+
+### 6.5 Adoption ring tests
+
+- `NewRing(50)`, record 50 events, `Snapshot()` returns all 50
+  newest-first.
+- Record 51 events, `Snapshot()` returns 50 (oldest dropped).
+- Concurrent Record + Snapshot under `-race` — no data race; the
+  Snapshot copy is independent of subsequent Record calls.
+- Empty ring, `Snapshot()` returns `[]AdoptionEvent{}` (not nil).
 
 No new chaos tests. Phase 5 is observability of existing chaos,
 not new chaos.
@@ -880,21 +1128,27 @@ not new chaos.
 1. All Phase 1/2/3/4 tests still pass.
 2. `internal/metrics` package implemented with unit tests under
    `-race`.
-3. Admin listener bound, all three endpoints reachable on default
+3. `internal/hostsem.Sem.Snapshot()` added per §3.9, with unit
+   tests under `-race`.
+4. `internal/observability` ring buffer implemented per §3.10,
+   with unit tests under `-race`.
+5. Admin listener bound, all three endpoints reachable on default
    loopback config.
-4. Counter wiring at all ~30 emit sites, verified by §6.3 tests.
-5. htpasswd auth implemented per §3.8; auth tests pass per §6.2.1.
-6. Status page renders correctly (HTML and JSON) for an empty
+6. Counter wiring at all ~30 emit sites, verified by §6.3 tests,
+   plus the §3.3.1 explicit fetch + adoption duration
+   instrumentation.
+7. htpasswd auth implemented per §3.8; auth tests pass per §6.2.1.
+8. Status page renders correctly (HTML and JSON) for an empty
    cache, a populated cache, and a cache with a lagging-upstream
    suite.
-7. `/healthz` flips to 503 within one check cycle when cache_dir
-   becomes unwritable; recovers within one check cycle when
-   restored.
-8. SPEC5.md as-built, mirroring SPEC4.md structure.
-9. One-week production deployment with default `admin.*` showing
-   stable scrape latency (<10ms p99), no admin-listener
-   resource leaks, and the status page renders correctly under
-   real traffic.
+9. `/healthz` uses `os.CreateTemp` (not a fixed filename), flips
+   to 503 within one check cycle when cache_dir becomes
+   unwritable, and recovers within one check cycle when restored.
+10. SPEC5.md as-built, mirroring SPEC4.md structure.
+11. One-week production deployment with default `admin.*` showing
+    stable scrape latency (<10ms p99), no admin-listener
+    resource leaks, and the status page renders correctly under
+    real traffic.
 
 ---
 
