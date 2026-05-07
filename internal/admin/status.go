@@ -426,7 +426,7 @@ code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
 {{if .Suites}}
 <table>
 <tr><th>Host</th><th>Suite path</th><th>Last check</th><th>Last success</th>
-    <th>Current snapshot</th><th>Adopted at</th><th>Lagging</th></tr>
+    <th>Current snapshot</th><th>Adopted at</th><th>InRelease changed</th></tr>
 {{range .Suites}}<tr>
   <td><code>{{.Host}}</code></td>
   <td><code>{{.SuitePath}}</code></td>

@@ -406,6 +406,20 @@ func resolveHostPort(addr string) (host string, port int, err error) {
 	return h, pn, nil
 }
 
+// UserCount returns the number of htpasswd users the auth
+// middleware currently authenticates against, or 0 when auth is
+// disabled. cmd uses this to populate user_count on the
+// admin_authenticated Info line AFTER admin.New has succeeded —
+// emitting before admin.New could log "authenticated" against a
+// file that subsequently fails to parse (a sub-second TOCTOU
+// window between the startup config-dump count and admin.New).
+func (s *Server) UserCount() int {
+	if s.auth == nil {
+		return 0
+	}
+	return s.auth.userCount()
+}
+
 // IsNonLoopback reports whether addr binds to anything other than
 // 127.0.0.1, ::1, or localhost. Used by cmd to decide whether to
 // fire the SPEC5 §5.2 admin_unauthenticated_non_loopback warning.

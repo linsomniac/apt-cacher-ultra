@@ -279,15 +279,13 @@ func serveListeners(
 				"listen", cfg.Admin.Listen,
 				"detail", "admin.listen binds non-loopback AND admin.htpasswd_file is empty: the admin port is reachable from the network without authentication")
 		}
-		// SPEC5 §10.2: admin_authenticated Info names the htpasswd
-		// file and the parsed user_count. The parse already ran
-		// up-front (htpasswdUsers above); a non-empty htpasswd_file
-		// here is guaranteed to have been validated.
-		if cfg.Admin.HtpasswdFile != "" {
-			logger.Info("admin_authenticated",
-				"htpasswd_file", cfg.Admin.HtpasswdFile,
-				"user_count", htpasswdUsers)
-		}
+		// SPEC5 §10.2: admin_authenticated Info is emitted AFTER
+		// admin.New (below) so the user_count comes from the parse
+		// that the live authenticator will actually use, not the
+		// pre-parse for the config dump. Closes the sub-second
+		// TOCTOU window where a mid-startup htpasswd swap could
+		// otherwise produce a "authenticated" log line against a
+		// file that admin.New fails to parse moments later.
 	}
 
 	c, err := cache.Open(ctx, cfg.Cache.Dir, logger)
@@ -485,6 +483,14 @@ func serveListeners(
 		})
 		if err != nil {
 			return fmt.Errorf("build admin: %w", err)
+		}
+		// SPEC5 §10.2: admin_authenticated emits the live user_count
+		// from the post-admin.New authenticator. Skipped when
+		// htpasswd_file is empty (admin is unauthenticated).
+		if cfg.Admin.HtpasswdFile != "" {
+			logger.Info("admin_authenticated",
+				"htpasswd_file", cfg.Admin.HtpasswdFile,
+				"user_count", adminSrv.UserCount())
 		}
 	}
 

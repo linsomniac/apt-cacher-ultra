@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -105,6 +107,33 @@ func withHtpasswd(path string) adminOpt {
 	return func(cfg *Config) {
 		cfg.Admin.HtpasswdFile = path
 	}
+}
+
+func withLogger(logger *slog.Logger) adminOpt {
+	return func(cfg *Config) {
+		cfg.Logger = logger
+	}
+}
+
+// lockedBuffer is a sync.Mutex-guarded bytes.Buffer for use as a
+// slog handler's io.Writer. The text handler can serialize concurrent
+// records, so the underlying writer must accept concurrent Writes;
+// bytes.Buffer alone does not.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // makeBcryptHtpasswd writes a temp htpasswd file with one user
@@ -518,6 +547,190 @@ func TestParseHtpasswd_RejectsEmptyFile(t *testing.T) {
 	_, err := parseHtpasswd([]byte("# only comments\n\n"))
 	if err == nil {
 		t.Error("empty htpasswd should be rejected")
+	}
+}
+
+// TestStatusHTML_SuiteTable pins the suite-table column header
+// rename (Lagging → InRelease changed) AND the SPEC5 §12.2.4
+// lagging annotation rendering. Seeds a suite with
+// inrelease_change_seen_at well past last_success_at so the
+// "(lagging …)" muted suffix renders in the InRelease-changed cell.
+func TestStatusHTML_SuiteTable(t *testing.T) {
+	s, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	// Seed a lagging suite: last successful re-adoption was 2 hours
+	// ago, but upstream's InRelease has been seen changing 30 minutes
+	// ago — gap = 1h 30m.
+	now := time.Now().Unix()
+	lastSuccess := now - 2*3600
+	seenAt := now - 30*60
+	if err := s.cfg.Cache.PutSuiteFreshness(context.Background(),
+		cache.SuiteFreshness{
+			CanonicalScheme:       "http",
+			CanonicalHost:         "archive.ubuntu.com",
+			SuitePath:             "/ubuntu/dists/noble",
+			LastSuccessAt:         &lastSuccess,
+			InReleaseChangeSeenAt: &seenAt,
+		}); err != nil {
+		t.Fatalf("PutSuiteFreshness: %v", err)
+	}
+
+	resp := mustGet(t, base+"/")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	html := string(body)
+
+	if !strings.Contains(html, "<th>InRelease changed</th>") {
+		t.Errorf("HTML missing <th>InRelease changed</th>; suite table header drifted")
+	}
+	if strings.Contains(html, "<th>Lagging</th>") {
+		t.Errorf("HTML still has <th>Lagging</th> — header rename did not stick")
+	}
+	if !strings.Contains(html, "(lagging 1h 30m)") {
+		t.Errorf("HTML missing lagging annotation '(lagging 1h 30m)'; body:\n%s", html)
+	}
+}
+
+// TestLaggingAnnotation pins SPEC5 §12.2.4 lagging-render rules:
+// nil inputs and seenAt<=successAt produce empty; the gap is
+// formatted as "Xh Ym" or just "Xm" when zero hours.
+func TestLaggingAnnotation(t *testing.T) {
+	mk := func(unix int64) *int64 { return &unix }
+	cases := []struct {
+		name    string
+		seen    *int64
+		success *int64
+		want    string
+	}{
+		{"both_nil", nil, nil, ""},
+		{"seen_nil", nil, mk(100), ""},
+		{"success_nil", mk(100), nil, ""},
+		{"in_sync", mk(100), mk(100), ""},
+		{"adopted_after_seen", mk(100), mk(200), ""},
+		{"lag_30m", mk(2000), mk(200), "(lagging 30m)"},
+		{"lag_1h_5m", mk(3900), mk(0), "(lagging 1h 5m)"},
+		{"lag_25h", mk(90000), mk(0), "(lagging 25h 0m)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := laggingAnnotation(tc.seen, tc.success); got != tc.want {
+				t.Errorf("laggingAnnotation(%v, %v) = %q, want %q",
+					tc.seen, tc.success, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAdminRequest_AuthUserAndScrapeID pins the SPEC5 §10.1
+// admin_request log fields:
+//   - auth_user is empty when auth is disabled.
+//   - auth_user carries the authenticated username on success.
+//   - scrape_id is present on every request (random uint64).
+//
+// Exercises the per-request *reqState pointer plumbing the auth
+// middleware uses to surface the username to the outer logger.
+func TestAdminRequest_AuthUserAndScrapeID(t *testing.T) {
+	t.Run("disabled_auth_empty_user", func(t *testing.T) {
+		var buf lockedBuffer
+		logger := slog.New(slog.NewTextHandler(&buf, nil))
+		_, base, cleanup := startAdminServer(t, withLogger(logger))
+		defer cleanup()
+
+		resp := mustGet(t, base+"/healthz")
+		resp.Body.Close()
+
+		out := buf.String()
+		if !strings.Contains(out, "msg=admin_request") {
+			t.Fatalf("admin_request log line missing; got:\n%s", out)
+		}
+		if !strings.Contains(out, `auth_user=""`) {
+			t.Errorf("auth_user should be empty when auth disabled; log:\n%s", out)
+		}
+		if !strings.Contains(out, "scrape_id=") {
+			t.Errorf("scrape_id missing from admin_request line; log:\n%s", out)
+		}
+	})
+
+	t.Run("authenticated_user_propagated", func(t *testing.T) {
+		var buf lockedBuffer
+		logger := slog.New(slog.NewTextHandler(&buf, nil))
+		htp := makeBcryptHtpasswd(t, "alice", "secret")
+		_, base, cleanup := startAdminServer(t,
+			withHtpasswd(htp), withLogger(logger))
+		defer cleanup()
+
+		resp := getWithBasic(t, base+"/healthz", "alice", "secret")
+		resp.Body.Close()
+
+		out := buf.String()
+		if !strings.Contains(out, "auth_user=alice") {
+			t.Errorf("auth_user=alice should appear after successful auth; log:\n%s", out)
+		}
+	})
+
+	t.Run("auth_failure_leaves_user_empty", func(t *testing.T) {
+		var buf lockedBuffer
+		logger := slog.New(slog.NewTextHandler(&buf, nil))
+		htp := makeBcryptHtpasswd(t, "alice", "secret")
+		_, base, cleanup := startAdminServer(t,
+			withHtpasswd(htp), withLogger(logger))
+		defer cleanup()
+
+		resp := mustGet(t, base+"/healthz") // no creds
+		resp.Body.Close()
+
+		out := buf.String()
+		if !strings.Contains(out, "msg=admin_request") {
+			t.Fatalf("admin_request log line missing; got:\n%s", out)
+		}
+		if !strings.Contains(out, `auth_user=""`) {
+			t.Errorf("auth_user should be empty when auth fails; log:\n%s", out)
+		}
+	})
+}
+
+// TestEndpoint_Options_AuthEnabled pins SPEC5 §9.7.1 + §9.7.5: the
+// auth middleware wraps the dispatcher, so OPTIONS without
+// credentials returns 401 and OPTIONS with valid credentials
+// returns 204 + Allow. Without this pinning, an order swap (auth
+// inside dispatcher instead of around it) would silently allow
+// unauthenticated probes to fingerprint the listener.
+func TestEndpoint_Options_AuthEnabled(t *testing.T) {
+	htp := makeBcryptHtpasswd(t, "alice", "secret")
+	_, base, cleanup := startAdminServer(t, withHtpasswd(htp))
+	defer cleanup()
+
+	// OPTIONS without creds → 401.
+	for _, path := range []string{"/metrics", "/healthz", "/", "/nonexistent"} {
+		req, _ := http.NewRequest(http.MethodOptions, base+path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("OPTIONS %s no-creds: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 401 {
+			t.Errorf("OPTIONS %s no-creds = %d, want 401", path, resp.StatusCode)
+		}
+	}
+
+	// OPTIONS with valid creds → 204 + Allow.
+	for _, path := range []string{"/metrics", "/healthz", "/", "/nonexistent"} {
+		req, _ := http.NewRequest(http.MethodOptions, base+path, nil)
+		req.Header.Set("Authorization",
+			"Basic "+base64.StdEncoding.EncodeToString([]byte("alice:secret")))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("OPTIONS %s authed: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 204 {
+			t.Errorf("OPTIONS %s authed = %d, want 204", path, resp.StatusCode)
+		}
+		if got := resp.Header.Get("Allow"); got != "GET, HEAD, OPTIONS" {
+			t.Errorf("OPTIONS %s authed Allow = %q, want %q",
+				path, got, "GET, HEAD, OPTIONS")
+		}
 	}
 }
 

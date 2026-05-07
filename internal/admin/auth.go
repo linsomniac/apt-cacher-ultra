@@ -197,12 +197,14 @@ func (a *htpasswdAuthenticator) unauthorized(w http.ResponseWriter) {
 }
 
 // CountHtpasswdUsers reads path and returns the number of bcrypt
-// users defined. Used by cmd at startup so the admin_authenticated
-// Info line and the startup config-dump can both report
-// user_count BEFORE admin.New parses the file for actual auth.
-// Validation is identical to the request-time parse — Apache MD5,
-// SHA-1, and crypt(3) hashes return an error, naming the offending
-// line.
+// users defined. Used by cmd at startup so the startup config-dump
+// can report admin_htpasswd_users BEFORE admin.New parses the file
+// for actual auth. Validation is identical to the request-time
+// parse — Apache MD5, SHA-1, and crypt(3) hashes return an error,
+// naming the offending line. The admin_authenticated Info line
+// uses Server.UserCount() (post-admin.New parse) instead so a
+// hypothetical mid-startup htpasswd swap surfaces as an admin.New
+// failure rather than a stale "authenticated" log line.
 func CountHtpasswdUsers(path string) (int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -213,6 +215,15 @@ func CountHtpasswdUsers(path string) (int, error) {
 		return 0, err
 	}
 	return len(users), nil
+}
+
+// userCount returns the number of users currently in the parsed
+// authenticator map. Read under the same RLock that authenticate()
+// uses so a concurrent reload sees a consistent count.
+func (a *htpasswdAuthenticator) userCount() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return len(a.users)
 }
 
 // parseHtpasswd parses the bytes of an Apache htpasswd file into a
