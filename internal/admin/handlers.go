@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -92,9 +93,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // wantsJSON implements SPEC5 §9.7.3 content negotiation:
-//   1. ?format=json query → JSON.
-//   2. Accept: application/json AND not text/html → JSON.
-//   3. Otherwise → HTML.
+//  1. ?format=json query → JSON.
+//  2. Accept: application/json AND not text/html → JSON.
+//  3. Otherwise → HTML.
 func wantsJSON(r *http.Request) bool {
 	if r.URL.Query().Get("format") == "json" {
 		return true
@@ -121,14 +122,13 @@ func wantsJSON(r *http.Request) bool {
 }
 
 // startRefresher launches the SPEC5 §9.7.6 refresher goroutine.
-// Immediate first recompute, then loops at admin.gauge_refresh
+// Immediate first recompute (so the first /metrics scrape after
+// startup sees populated values), then loops at admin.gauge_refresh
 // cadence until refresherStop is closed.
 //
-// AIDEV-NOTE: the refresher is wired to the metrics registry and
-// performs the actual gauge updates via runRefreshOnce. The current
-// commit installs a no-op recompute; counter-wiring (next commit)
-// fills in the gauge-update logic. Keeps this file stable while
-// the surrounding wiring lands.
+// The goroutine inherits a per-server context.Context that
+// Shutdown cancels via refresherCancel; in-flight queries unblock
+// promptly when the process is shutting down.
 func (s *Server) startRefresher() {
 	s.mu.Lock()
 	if s.refresherStop != nil {
@@ -137,15 +137,16 @@ func (s *Server) startRefresher() {
 	}
 	stop := make(chan struct{})
 	done := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
 	s.refresherStop = stop
 	s.refresherDone = done
+	s.refresherCancel = cancel
 	s.mu.Unlock()
 
 	period := s.cfg.Admin.GaugeRefresh.Duration
 	go func() {
 		defer close(done)
-		// Immediate first recompute (SPEC5 §9.7.6).
-		s.runRefreshOnce()
+		s.runRefreshOnce(ctx)
 		t := time.NewTicker(period)
 		defer t.Stop()
 		for {
@@ -153,23 +154,175 @@ func (s *Server) startRefresher() {
 			case <-stop:
 				return
 			case <-t.C:
-				s.runRefreshOnce()
+				s.runRefreshOnce(ctx)
 			}
 		}
 	}()
 }
 
 // runRefreshOnce is the single recompute pass. Each gauge query
-// runs under a 10s context.WithTimeout (SPEC5 §9.7.6 per-query
-// timeout) — added in the counter-wiring commit. The pool-scan
-// "in progress" guard is wired here.
-func (s *Server) runRefreshOnce() {
-	// SPEC5 §9.7.6 pool-scan in-progress guard. Skip the pool walk
-	// if the prior invocation has not finished; other gauges still
-	// recompute.
-	if s.poolScanInProgress.CompareAndSwap(false, true) {
-		defer s.poolScanInProgress.Store(false)
-		// Pool walk — placeholder; counter wiring fills in.
+// runs under its own 10s context.WithTimeout (SPEC5 §9.7.6 per-query
+// timeout) parented on lifecycleCtx, so a hung query cannot block
+// subsequent gauges from refreshing AND a shutdown unblocks every
+// query promptly.
+//
+// On query error: the gauge keeps its prior value, and a
+// refresher_query_failed Warn fires with metric_name, err, and
+// duration_ms. The next loop iteration retries.
+//
+// AIDEV-NOTE: the §9.7.6 "refresh in progress" guard wraps ONLY the
+// pool walk; other queries proceed even when the prior pool walk is
+// still running. This bounds parallelism on the slow filesystem path
+// without serializing the cheap DB queries behind it.
+func (s *Server) runRefreshOnce(lifecycleCtx context.Context) {
+	s.refreshCacheStats(lifecycleCtx)
+	s.refreshSuiteStats(lifecycleCtx)
+	s.refreshHostsemGauges()
+	s.refreshPoolDiskBytes(lifecycleCtx)
+	s.refreshProcessMetrics()
+}
+
+// refreshProcessMetrics reads /proc/self/* and updates the SPEC5
+// §10.4.7 process collector gauges + cpu seconds counter. The
+// counter Add reflects delta since the prior reading because our
+// metrics.Counter primitive only supports monotonic Add — the
+// /proc CPU value is monotonic, so the delta is always >= 0
+// modulo a clock_gettime regression we don't expect under Linux.
+//
+// Read errors set the affected fields to zero (per SPEC5 §13:
+// process metrics zeroed on non-Linux / missing /proc), no Warn
+// fires.
+func (s *Server) refreshProcessMetrics() {
+	stats, err := readProcStats()
+	if err != nil {
+		// Best-effort: keep the prior gauge values, no log spam.
+		return
 	}
-	// Other gauges — placeholder.
+	if delta := stats.cpuSeconds - s.proc.loadPriorCPU(); delta > 0 {
+		s.proc.cpuSecondsTotal.Add(delta)
+	}
+	s.proc.storePriorCPU(stats.cpuSeconds)
+	s.proc.residentMemoryBytes.Set(float64(stats.residentMemoryBytes))
+	s.proc.virtualMemoryBytes.Set(float64(stats.virtualMemoryBytes))
+	s.proc.openFDs.Set(float64(stats.openFDs))
+	s.proc.maxFDs.Set(float64(stats.maxFDs))
+}
+
+// refreshCacheStats updates the four cache.GetCacheStats-derived
+// gauges. One DB transaction, three queries — all inside a single
+// 10s deadline because they share the helper.
+func (s *Server) refreshCacheStats(parent context.Context) {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	stats, err := s.cfg.Cache.GetCacheStats(ctx)
+	if err != nil {
+		s.logRefresherFailure("acu_blobs_db_count", err, time.Since(start))
+		return
+	}
+	s.gauges.blobsDBCount.Set(float64(stats.BlobCount))
+	s.gauges.blobsDBTotalBytes.Set(float64(stats.TotalBytes))
+	s.gauges.blobsZeroRefcountBacklog.Set(float64(stats.ZeroRefcountBacklog))
+	s.gauges.urlPathsTracked.Set(float64(stats.URLPathCount))
+}
+
+// refreshSuiteStats updates acu_suites_tracked, acu_snapshots_current,
+// and acu_snapshots_displaced from cache.GetSuiteStats. Displaced is
+// AdoptedTotal - WithCurrentSnapshot per SPEC5 §9.7.6.
+func (s *Server) refreshSuiteStats(parent context.Context) {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	st, err := s.cfg.Cache.GetSuiteStats(ctx)
+	if err != nil {
+		s.logRefresherFailure("acu_suites_tracked", err, time.Since(start))
+		return
+	}
+	displaced := st.AdoptedTotal - st.WithCurrentSnapshot
+	if displaced < 0 {
+		displaced = 0
+	}
+	s.gauges.suitesTracked.Set(float64(st.Tracked))
+	s.gauges.snapshotsCurrent.Set(float64(st.WithCurrentSnapshot))
+	s.gauges.snapshotsDisplaced.Set(float64(displaced))
+}
+
+// refreshHostsemGauges populates acu_active_hosts plus the labeled
+// per-host gauges. Reset is called on the labeled gauges first so a
+// host that no longer has hostsem state stops reporting stale values
+// (SPEC5 §9.7.6).
+//
+// hostsem.Snapshot returns a copy under its own lock; no DB or
+// network IO involved, so no deadline.
+func (s *Server) refreshHostsemGauges() {
+	snap := s.cfg.HostLimiter.Snapshot()
+	s.gauges.activeHosts.Set(float64(s.cfg.HostLimiter.HostCount()))
+	s.gauges.perHostInflight.Reset()
+	s.gauges.perHostCapacity.Reset()
+	for host, st := range snap {
+		s.gauges.perHostInflight.Set(float64(st.Inflight), host)
+		s.gauges.perHostCapacity.Set(float64(st.Capacity), host)
+	}
+}
+
+// refreshPoolDiskBytes walks pool/ summing info.Size() and updates
+// acu_pool_disk_bytes. Single-threaded — the parallel path is the
+// SPEC4 §9.6.4 startup scan, not a metrics scrape.
+//
+// SPEC5 §9.7.6 "refresh in progress" guard: if the prior walk has
+// not finished by the time the next interval fires, this iteration
+// is skipped (other gauges still update). CompareAndSwap returns
+// false when another walk is in progress.
+func (s *Server) refreshPoolDiskBytes(parent context.Context) {
+	if !s.poolScanInProgress.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.poolScanInProgress.Store(false)
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+
+	poolDir := filepath.Join(s.cfg.Cache.Dir(), "pool")
+	var total int64
+	err := filepath.Walk(poolDir, func(path string, info os.FileInfo, walkErr error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if walkErr != nil {
+			// Tolerate transient races (e.g. a blob unlinked
+			// between walk and stat); the next pass picks up the
+			// new state.
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		// Missing pool/ pre-Open is the normal case during the
+		// startup window between admin Serve and cache.Open. Don't
+		// log noisily.
+		if os.IsNotExist(err) {
+			return
+		}
+		s.logRefresherFailure("acu_pool_disk_bytes", err, time.Since(start))
+		return
+	}
+	s.gauges.poolDiskBytes.Set(float64(total))
+}
+
+// logRefresherFailure emits the SPEC5 §9.7.6 refresher_query_failed
+// Warn. Centralized here so every gauge-recompute call site logs in
+// the same shape.
+func (s *Server) logRefresherFailure(metricName string, err error, dur time.Duration) {
+	s.logger.Warn("refresher_query_failed",
+		"metric_name", metricName,
+		"err", err.Error(),
+		"duration_ms", dur.Milliseconds(),
+	)
 }

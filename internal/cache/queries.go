@@ -308,6 +308,37 @@ func (c *Cache) GetCacheStats(ctx context.Context) (CacheStats, error) {
 	return s, nil
 }
 
+// GetSuiteStats returns the suite/snapshot count triple the SPEC5
+// §9.7.6 refresher feeds into the acu_suites_tracked /
+// acu_snapshots_current / acu_snapshots_displaced gauges. Three
+// cheap COUNT(*) queries against suite_freshness and suite_snapshot.
+//
+// AIDEV-NOTE: AdoptedTotal counts every suite_snapshot row whose
+// adopted_at IS NOT NULL — including snapshots no longer current
+// (i.e. displaced). The displaced gauge is computed in the caller as
+// AdoptedTotal - WithCurrentSnapshot, which equals the number of
+// snapshots still on disk that are no longer the current adoption
+// for their suite.
+func (c *Cache) GetSuiteStats(ctx context.Context) (SuiteStats, error) {
+	var s SuiteStats
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM suite_freshness`,
+	).Scan(&s.Tracked); err != nil {
+		return SuiteStats{}, fmt.Errorf("GetSuiteStats tracked: %w", err)
+	}
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM suite_freshness WHERE current_snapshot_id IS NOT NULL`,
+	).Scan(&s.WithCurrentSnapshot); err != nil {
+		return SuiteStats{}, fmt.Errorf("GetSuiteStats current: %w", err)
+	}
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM suite_snapshot WHERE adopted_at IS NOT NULL`,
+	).Scan(&s.AdoptedTotal); err != nil {
+		return SuiteStats{}, fmt.Errorf("GetSuiteStats adopted: %w", err)
+	}
+	return s, nil
+}
+
 // ListHotURLPaths returns up to `limit` url_path rows ordered by
 // request_count DESC then last_requested_at DESC. Used by the
 // SPEC5 §10.5 status-page hot_url_paths section. Rows whose

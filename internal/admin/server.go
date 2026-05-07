@@ -90,18 +90,36 @@ type Server struct {
 	auth *htpasswdAuthenticator
 
 	// refresher coordinates the §9.7.6 refresher goroutine. Closed
-	// on Shutdown.
-	refresherStop chan struct{}
-	refresherDone chan struct{}
+	// on Shutdown. refresherCancel cancels the context that
+	// in-flight queries inside runRefreshOnce inherit, so a slow
+	// query unblocks promptly when shutdown begins.
+	refresherStop   chan struct{}
+	refresherDone   chan struct{}
+	refresherCancel context.CancelFunc
 
 	// poolScanInProgress is the §9.7.6 "refresh in progress" guard
 	// for the du-style pool/ walk. Skipped if the prior walk has
 	// not finished by the time the next interval fires.
 	poolScanInProgress atomic.Bool
 
-	// mu guards refresherStop / refresherDone — Shutdown must be
-	// idempotent, and the refresher goroutine must not be started
-	// twice.
+	// gauges owns every refresher-recomputed metric. Set once in
+	// New(); the refresher goroutine reads/writes these without
+	// holding s.mu (the metrics package handles its own locking).
+	gauges *refresherGauges
+
+	// startup holds the §10.4.7 build_info / process_start gauges.
+	// Set once in New() and never mutated thereafter.
+	startup *startupGauges
+
+	// proc holds the §10.4.7 Prometheus-standard process collector
+	// metrics (process_cpu_seconds_total etc.). Refreshed on the
+	// same cadence as the refresher gauges; values stale by at
+	// most admin.gauge_refresh.
+	proc *processGauges
+
+	// mu guards refresherStop / refresherDone / refresherCancel —
+	// Shutdown must be idempotent, and the refresher goroutine
+	// must not be started twice.
 	mu sync.Mutex
 }
 
@@ -138,6 +156,11 @@ func New(cfg Config) (*Server, error) {
 		cfg:    cfg,
 		logger: logger,
 	}
+	s.gauges = newRefresherGauges(cfg.Registry, cfg.Admin.MetricSeriesCap)
+	s.startup = newStartupGauges(cfg.Registry, cfg.Admin.MetricSeriesCap,
+		cfg.BuildInfo, cfg.StartTime)
+	s.proc = newProcessGauges(cfg.Registry)
+
 	if cfg.Admin.HtpasswdFile != "" {
 		auth, err := newHtpasswdAuthenticator(cfg.Admin.HtpasswdFile, logger)
 		if err != nil {
@@ -203,6 +226,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.shuttingDown.Store(true)
 
 	s.mu.Lock()
+	if s.refresherCancel != nil {
+		s.refresherCancel()
+	}
 	if s.refresherStop != nil {
 		select {
 		case <-s.refresherStop:

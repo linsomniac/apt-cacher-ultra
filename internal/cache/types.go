@@ -32,8 +32,8 @@ type Blob struct {
 type SuiteFreshness struct {
 	CanonicalScheme       string
 	CanonicalHost         string
-	SuitePath             string  // e.g. "/ubuntu/dists/noble"
-	LastCheckAt           *int64  // unix epoch seconds
+	SuitePath             string // e.g. "/ubuntu/dists/noble"
+	LastCheckAt           *int64 // unix epoch seconds
 	LastSuccessAt         *int64
 	InReleaseETag         *string
 	InReleaseLastMod      *string
@@ -141,6 +141,18 @@ type CacheStats struct {
 	TotalBytes          int64
 	URLPathCount        int64
 	ZeroRefcountBacklog int64
+}
+
+// SuiteStats is the SPEC5 §9.7.6 suite/snapshot count block: the
+// three counters the refresher goroutine derives the
+// acu_suites_tracked / acu_snapshots_current / acu_snapshots_displaced
+// gauges from. AdoptedTotal is "suite_snapshot rows whose
+// adopted_at IS NOT NULL"; the displaced gauge is then
+// AdoptedTotal - WithCurrentSnapshot. Sourced via GetSuiteStats.
+type SuiteStats struct {
+	Tracked             int64 // suite_freshness rows
+	WithCurrentSnapshot int64 // suite_freshness rows with current_snapshot_id IS NOT NULL
+	AdoptedTotal        int64 // suite_snapshot rows with adopted_at IS NOT NULL
 }
 
 // HotURLPath is one row of the SPEC5 §10.5 hot_url_paths status-page
