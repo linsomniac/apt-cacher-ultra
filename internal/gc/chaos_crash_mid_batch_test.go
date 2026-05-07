@@ -20,15 +20,24 @@ import (
 // unlinks any file whose row is gone.
 //
 // Driver: seed N reapable blobs (refcount=0, refcount_zeroed_at=1)
-// plus M referenced blobs (refcount=0 fresh, zeroed_at=now within
+// plus M grace-kept blobs (refcount=0 fresh, zeroed_at=now within
 // grace), call c.RunBlobGCBatch directly so the DB COMMIT lands, and
 // DO NOT call the post-COMMIT unlink loop in runBlobPass — that
 // omission is the simulated crash boundary. Then run StartupPass,
 // whose first step is the §9.6.4 pool scan.
 //
+// The grace-kept blobs are not pinned by FK references (no
+// snapshot_member or url_path) — they survive only because the §9.6.2
+// reap predicate's `refcount_zeroed_at < now - grace_seconds` clause
+// is false for them. This is sufficient to verify the §9.6.4 scan's
+// "row exists → leave alone" branch (HashKnown returns true), which
+// is the property §12.6 cares about: the scan distinguishes orphan
+// files (no row) from non-orphan files (row exists, regardless of
+// whether the row is FK-reachable).
+//
 // Asserts after StartupPass:
 //   - reaped pool files unlinked
-//   - referenced pool files survive
+//   - grace-kept pool files survive
 //   - gc_run_complete startup line names pool_orphans_repaired == N
 //     and pool_orphan_bytes_repaired == sum(reaped sizes)
 //   - on-disk pool file count equals blob row count (the spec text's
@@ -47,7 +56,7 @@ func TestChaos_CrashMidBatch_PoolOrphans_RepairedOnRestart(t *testing.T) {
 			db := dbOf(t, c)
 
 			// Seed 3 reapable blobs (refcount=0/zeroed_at=1, well past
-			// any positive grace) and 2 referenced blobs (refcount=0/
+			// any positive grace) and 2 grace-kept blobs (refcount=0/
 			// zeroed_at=now, kept by BlobGrace=1h). Bodies vary by run
 			// and slot so each blob has a distinct hash.
 			const (
@@ -59,13 +68,15 @@ func TestChaos_CrashMidBatch_PoolOrphans_RepairedOnRestart(t *testing.T) {
 				reaped = append(reaped,
 					seedReapableBlob(t, c, fmt.Sprintf("V6 reap run-%02d slot-%d", run, i)))
 			}
-			kept := make([]string, 0, nKeep)
+			graceKept := make([]string, 0, nKeep)
 			for i := 0; i < nKeep; i++ {
 				// putPoolBlob → NewTempBlob/Finalize/PutBlob lands at
 				// refcount=0, zeroed_at=now via §7.5.1 Rule 1. With
 				// BlobGrace=1h on the StartupPass tick, the predicate
-				// `zeroed_at < now - 3600` is false; these survive.
-				kept = append(kept,
+				// `zeroed_at < now - 3600` is false; these survive
+				// the §9.6.2 reap (and the §9.6.4 scan, since their
+				// blob row is still in the table for HashKnown).
+				graceKept = append(graceKept,
 					putPoolBlob(t, c, fmt.Sprintf("V6 keep run-%02d slot-%d AAAAA", run, i)))
 			}
 
@@ -97,13 +108,13 @@ func TestChaos_CrashMidBatch_PoolOrphans_RepairedOnRestart(t *testing.T) {
 					t.Fatalf("post-COMMIT split: pool file %s missing: %v", h, err)
 				}
 			}
-			// Referenced rows + files unchanged.
-			for _, h := range kept {
+			// Grace-kept rows + files unchanged.
+			for _, h := range graceKept {
 				if !blobRowExists(t, db, h) {
-					t.Fatalf("kept blob row %s missing pre-restart", h)
+					t.Fatalf("grace-kept blob row %s missing pre-restart", h)
 				}
 				if _, err := os.Stat(filepath.Join(c.Dir(), "pool", h[:2], h)); err != nil {
-					t.Fatalf("kept pool file missing pre-restart: %v", err)
+					t.Fatalf("grace-kept pool file missing pre-restart: %v", err)
 				}
 			}
 
@@ -140,10 +151,10 @@ func TestChaos_CrashMidBatch_PoolOrphans_RepairedOnRestart(t *testing.T) {
 					t.Errorf("orphan %s not repaired (stat err=%v)", h, err)
 				}
 			}
-			// 4b — referenced files survive.
-			for _, h := range kept {
+			// 4b — grace-kept files survive.
+			for _, h := range graceKept {
 				if _, err := os.Stat(filepath.Join(c.Dir(), "pool", h[:2], h)); err != nil {
-					t.Errorf("referenced %s gone after StartupPass: %v", h, err)
+					t.Errorf("grace-kept %s gone after StartupPass: %v", h, err)
 				}
 			}
 
@@ -180,7 +191,7 @@ func TestChaos_CrashMidBatch_PoolOrphans_RepairedOnRestart(t *testing.T) {
 					poolCount, rowCount)
 			}
 			if rowCount != nKeep {
-				t.Errorf("post-restart blob row count = %d, want %d (only kept blobs)",
+				t.Errorf("post-restart blob row count = %d, want %d (only grace-kept blobs)",
 					rowCount, nKeep)
 			}
 		})
