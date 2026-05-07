@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ulikunitz/xz"
@@ -103,6 +104,15 @@ type AdoptionConfig struct {
 	// when 0; the loud-config check lives at the cmd/main level.
 	HotPrefetchBudget time.Duration
 
+	// HeartbeatInterval is the period of the SPEC4 §7.5.2 site 6
+	// per-adoption heartbeat ticker. The ticker runs as a sidecar
+	// goroutine for the lifetime of runShared and bounds the gap
+	// between heartbeats during phases the five event-driven sites
+	// don't cover (Packages-parse, hot-set computation, writer-queue
+	// waits). 0 disables the ticker entirely; callers (cmd/main)
+	// pass gc.heartbeat_interval, validated to > 0 by config.
+	HeartbeatInterval time.Duration
+
 	Logger *slog.Logger
 
 	// now is a test seam; production uses time.Now.
@@ -133,6 +143,11 @@ type Adopter struct {
 	hotPackagesWindow time.Duration
 	hotPrefetchBudget time.Duration
 
+	// heartbeatInterval drives the SPEC4 §7.5.2 site 6 ticker. 0
+	// disables the ticker (used by tests; production main always
+	// passes a positive value validated by the [gc] config block).
+	heartbeatInterval time.Duration
+
 	logger *slog.Logger
 	now    func() time.Time
 }
@@ -161,6 +176,9 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 	if cfg.HotPrefetchBudget < 0 {
 		return nil, fmt.Errorf("freshness: adoption.hot_prefetch_budget must be >= 0, got %s", cfg.HotPrefetchBudget)
 	}
+	if cfg.HeartbeatInterval < 0 {
+		return nil, fmt.Errorf("freshness: heartbeat_interval must be >= 0, got %s", cfg.HeartbeatInterval)
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -181,9 +199,66 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		concurrencySem:    sem,
 		hotPackagesWindow: cfg.HotPackagesWindow,
 		hotPrefetchBudget: cfg.HotPrefetchBudget,
+		heartbeatInterval: cfg.HeartbeatInterval,
 		logger:            logger,
 		now:               now,
 	}, nil
+}
+
+// heartbeat is the shared site-2/3/5 + ticker call. SPEC4 §7.5.2: the
+// orphan-candidate reap predicate keys on suite_snapshot.heartbeat_at,
+// not on created_at. Each event-driven site refreshes the row's clock
+// after a phase that could otherwise leave the gap unbounded under
+// adversarial conditions (slow members, large Packages parse, deep
+// writer queue).
+//
+// Heartbeat-write failures are non-fatal: log at adoption_heartbeat_failed
+// Warn and continue. The next heartbeat (or the successful
+// CommitAdoption that flips adopted_at) restores liveness; an adoption
+// whose every heartbeat silently fails is what the periodic ticker
+// (site 6) defends against, and even that defence has the §9.6.3 grace
+// floor as the safety bound.
+//
+// Context cancellation (parent shutdown) is suppressed — that's the
+// expected exit path during graceful shutdown, not an operator-visible
+// failure mode.
+func (a *Adopter) heartbeat(ctx context.Context, snapshotID int64) {
+	if err := a.cache.HeartbeatSnapshot(ctx, snapshotID); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		a.logger.Warn("adoption_heartbeat_failed",
+			"snapshot_id", snapshotID,
+			"err", err,
+		)
+	}
+}
+
+// runHeartbeatTicker is SPEC4 §7.5.2 site 6: a per-adoption sidecar
+// goroutine that wakes every heartbeatInterval and submits a
+// HeartbeatSnapshot write. Cancels via ctx — the caller (runShared)
+// derives a child ctx and cancels it at function exit, then waits on
+// the WaitGroup so no goroutine outlives runShared.
+//
+// This site bounds the heartbeat-gap independently of which phase
+// runShared is in (Packages-parse, hot-set computation, between-fetch
+// gaps, the gap from runHotPrefetch returning to CommitAdoption
+// running). Sites 1–5 are latency-fresh event-driven heartbeats; the
+// ticker is the floor under them, not a replacement.
+func (a *Adopter) runHeartbeatTicker(ctx context.Context, snapshotID int64) {
+	if a.heartbeatInterval <= 0 {
+		return
+	}
+	t := time.NewTicker(a.heartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			a.heartbeat(ctx, snapshotID)
+		}
+	}
 }
 
 // adoptionForm distinguishes the two SPEC2 §7.6.3 signature forms.
@@ -406,9 +481,36 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		)
 	}
 
+	// SPEC4 §7.5.2 site 6: launch the periodic heartbeat ticker.
+	// The ticker runs until tickerCancel fires at runShared exit;
+	// the deferred close-then-wait ensures the cancel happens
+	// before the wait (a single deferred func avoids the LIFO
+	// ordering trap of two separate defers, which would Wait first
+	// and deadlock waiting on a goroutine whose ctx hasn't been
+	// cancelled yet).
+	tickerCtx, tickerCancel := context.WithCancel(ctx)
+	var tickerWG sync.WaitGroup
+	if a.heartbeatInterval > 0 {
+		tickerWG.Add(1)
+		go func() {
+			defer tickerWG.Done()
+			a.runHeartbeatTicker(tickerCtx, snapshotID)
+		}()
+	}
+	defer func() {
+		tickerCancel()
+		tickerWG.Wait()
+	}()
+
 	// Step 5: prefetch declared members sequentially. Each member's
 	// declared_sha256 is the trust anchor — bytes that arrive from
 	// upstream are accepted only if their fresh hash matches.
+	//
+	// SPEC4 §7.5.2 site 2: heartbeat after each adoptMember return.
+	// Member fetches against degraded upstreams can take minutes;
+	// without this site the gap from row creation to the next
+	// in-runShared heartbeat (site 3 after Packages parsing)
+	// could exceed grace under a slow-member cascade.
 	memberRows := make([]cache.SnapshotMember, 0, len(members)+3)
 	for _, m := range members {
 		blobHash, err := a.adoptMember(ctx, suite, m)
@@ -421,6 +523,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			BlobHash:       blobHash,
 			DeclaredSHA256: m.SHA256,
 		})
+		a.heartbeat(ctx, snapshotID)
 	}
 
 	// Step 6: metadata-self snapshot_member row(s). Without these
@@ -490,6 +593,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	}
 	packageHashes := pkgHashRes.rows
 
+	// SPEC4 §7.5.2 site 3: heartbeat after Packages parsing returns.
+	// debian-main at multiple architectures can be tens of MiB of
+	// compressed input; on degraded CPU/storage the parse takes
+	// minutes. Without this site the gap from the last member-fetch
+	// heartbeat through Packages parsing to the next heartbeat
+	// would be unbounded by any fetch timeout.
+	a.heartbeat(ctx, snapshotID)
+
 	// Steps 9 + 10 (SPEC3 §7.5): hot-set computation + hot-deb prefetch
 	// loop. The result list (prefetchedURLPaths) feeds CommitAdoption
 	// so its url_path inserts happen inside the same transaction that
@@ -499,6 +610,13 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// flip transaction below is what inserts them — Stage 2 of the
 	// hot-set computation cannot rely on them being DB-visible yet.
 	prefetchedURLPaths, hotStats := a.runHotPrefetch(ctx, suite, snapshotID, packageHashes)
+
+	// SPEC4 §7.5.2 site 5: heartbeat right before CommitAdoption.
+	// Resets the grace clock at the latest possible moment before
+	// the adopted_at flip becomes the source of truth, defending
+	// against writer-queue depth between runHotPrefetch returning
+	// and CommitAdoption actually committing.
+	a.heartbeat(ctx, snapshotID)
 
 	// Step 11: atomic flip transaction. Pass adoptionCtx as ctx so the
 	// budget-cancelled prefetch loop above never causes CommitAdoption

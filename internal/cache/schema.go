@@ -14,8 +14,8 @@ import (
 // CurrentSchemaVersion is the schema this build of the binary creates and
 // expects. Forward-only: a database tagged with a higher version is treated
 // as written by a newer binary and the cache refuses to open it. SPEC §4.3,
-// SPEC2 §4.3, SPEC3 §4.3.
-const CurrentSchemaVersion = 3
+// SPEC2 §4.3, SPEC3 §4.3, SPEC4 §4.3.
+const CurrentSchemaVersion = 4
 
 // migrations is indexed such that migrations[N] migrates the database from
 // schema version N to N+1. migrations[0] (v0 → v1) creates the entire
@@ -191,6 +191,54 @@ CREATE INDEX idx_package_hash_pkg_arch
 ALTER TABLE suite_snapshot
   ADD COLUMN package_coverage_complete INTEGER NOT NULL DEFAULT 0
     CHECK (package_coverage_complete IN (0, 1));
+`,
+	// v3 → v4: Phase 4 GC subsystem schema delta. SPEC4 §4.3.2.
+	//
+	// Pure additive DDL plus two backfill UPDATEs:
+	//   - blob.refcount_zeroed_at: the "since refcount reached 0" grace
+	//     clock for blob GC (§9.6.2 reap predicate). Backfilled to
+	//     created_at on rows already at refcount <= 0 — conservative
+	//     (might reap one grace too soon, never one too late).
+	//   - suite_snapshot.heartbeat_at: adoption-candidate liveness clock
+	//     for snapshot GC (§9.6.3 sub-job A). Backfilled to created_at
+	//     on every row; pre-v4 candidate rows are by definition orphans
+	//     (the previous process is gone), so the next tick reaps them
+	//     after the heartbeat-stale grace.
+	//   - idx_blob_gc: partial covering index for the blob GC SELECT.
+	//     The (refcount_zeroed_at, hash, size) column list serves the
+	//     ORDER BY refcount_zeroed_at + lets SQLite emit hash and size
+	//     directly from the index. The partial WHERE refcount <= 0
+	//     keeps the index small (steady-state candidate set is tiny).
+	//   - idx_url_path_blob: partial index on url_path(blob_hash)
+	//     required by the blob GC NOT EXISTS subquery — without it,
+	//     each candidate triggers a full url_path scan.
+	//
+	// AIDEV-NOTE: forward-only and atomic per the framework. Index
+	// builds scan the underlying tables once each — sub-minute on
+	// healthy fs even for million-row caches; minutes on long-running
+	// caches with accumulated GC backlog. The migration is startup-
+	// blocking. The schema_migrating Info line at migrate() entry
+	// pairs with the schema migrated success line, giving operators
+	// a journal pair to script the maintenance window against.
+	`
+ALTER TABLE blob           ADD COLUMN refcount_zeroed_at INTEGER;
+ALTER TABLE suite_snapshot ADD COLUMN heartbeat_at       INTEGER;
+
+UPDATE blob
+   SET refcount_zeroed_at = created_at
+ WHERE refcount <= 0;
+
+UPDATE suite_snapshot
+   SET heartbeat_at = created_at
+ WHERE heartbeat_at IS NULL;
+
+CREATE INDEX idx_blob_gc
+  ON blob(refcount_zeroed_at, hash, size)
+ WHERE refcount <= 0;
+
+CREATE INDEX idx_url_path_blob
+  ON url_path(blob_hash)
+ WHERE blob_hash IS NOT NULL;
 `,
 }
 

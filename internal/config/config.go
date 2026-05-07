@@ -44,17 +44,18 @@ var DefaultDenyTargetRanges = []string{
 
 // Config is the top-level structure of config.toml.
 type Config struct {
-	Cache          CacheConfig        `toml:"cache"`
-	Upstream       UpstreamConfig     `toml:"upstream"`
-	Freshness      FreshnessConfig    `toml:"freshness"`
-	Adoption       AdoptionConfig     `toml:"adoption"`
-	HotPackages    HotPackagesConfig  `toml:"hot_packages"`
-	Integrity      IntegrityConfig    `toml:"integrity"`
-	Serve          ServeConfig        `toml:"serve"`
-	Log            LogConfig          `toml:"log"`
-	Remap          []RemapRule        `toml:"remap"`
-	Mirror         []MirrorRule       `toml:"mirror"`
-	TrustedSigners []TrustedSigner    `toml:"trusted_signer"`
+	Cache          CacheConfig       `toml:"cache"`
+	Upstream       UpstreamConfig    `toml:"upstream"`
+	Freshness      FreshnessConfig   `toml:"freshness"`
+	Adoption       AdoptionConfig    `toml:"adoption"`
+	HotPackages    HotPackagesConfig `toml:"hot_packages"`
+	Integrity      IntegrityConfig   `toml:"integrity"`
+	GC             GCConfig          `toml:"gc"`
+	Serve          ServeConfig       `toml:"serve"`
+	Log            LogConfig         `toml:"log"`
+	Remap          []RemapRule       `toml:"remap"`
+	Mirror         []MirrorRule      `toml:"mirror"`
+	TrustedSigners []TrustedSigner   `toml:"trusted_signer"`
 }
 
 type CacheConfig struct {
@@ -160,6 +161,75 @@ type IntegrityConfig struct {
 	RefuseUnvouchedDebs bool `toml:"refuse_unvouched_debs"`
 }
 
+// GCConfig holds the SPEC4 §5.1 [gc] block. Drives the Phase 4 garbage
+// collection subsystem: the periodic goroutine, blob/snapshot reap
+// passes, the startup pool/ orphan scan, and the per-adoption heartbeat
+// ticker.
+type GCConfig struct {
+	// Enabled is the master switch. False = goroutine not started,
+	// startup pool scan skipped, startup GC pass skipped. A
+	// gc_disabled Warn fires at startup when false.
+	Enabled bool `toml:"enabled"`
+
+	// Interval is the cadence of the periodic GC tick. Default 1h.
+	// 0 is rejected at load (use enabled = false to disable).
+	Interval Duration `toml:"interval"`
+
+	// BatchSize bounds the per-batch DELETE in the blob GC pass.
+	// Default 100. Must be >= 1.
+	BatchSize int `toml:"batch_size"`
+
+	// SnapshotBatchSize bounds the per-batch cascade DELETE in the
+	// snapshot GC pass. Smaller than BatchSize because each
+	// snapshot's cascade can touch tens of thousands of
+	// snapshot_member + package_hash rows. Default 10. Must be >= 1.
+	SnapshotBatchSize int `toml:"snapshot_batch_size"`
+
+	// MaxTickDuration is the hard upper bound on a single GC tick
+	// (periodic OR startup). Default 5m. 0 is rejected at load.
+	MaxTickDuration Duration `toml:"max_tick_duration"`
+
+	// BlobGrace is the "since refcount reached 0" grace before a
+	// blob becomes reapable. Default 5m. 0 is rejected at load — a
+	// 0s grace makes refcount=0 blobs immediately reapable, which
+	// is unsafe under the FK-INSERT race.
+	BlobGrace Duration `toml:"blob_grace"`
+
+	// KeepDisplaced is the per-suite forensic retention count for
+	// displaced snapshots. Default 3. 0 is permitted (no retention,
+	// every displaced snapshot is reapable on the next tick).
+	KeepDisplaced int `toml:"keep_displaced"`
+
+	// PoolScanWorkers is the worker pool size for the startup
+	// pool/ orphan-file scan. Default 4. Must be >= 1.
+	PoolScanWorkers int `toml:"pool_scan_workers"`
+
+	// HeartbeatInterval is the period of the in-process per-adoption
+	// heartbeat ticker (SPEC4 §7.5.2 site 6). Default 60s. Must be
+	// > 0 AND strictly less than the runtime-derived
+	// heartbeat_stale_grace_effective (= max(upstream.total_timeout
+	// × upstream.max_retries, 30m)). A heartbeat_interval >= grace
+	// can't bound the heartbeat-gap and would let GC reap live
+	// adoptions; rejected at load with gc_heartbeat_interval_unsafe
+	// Error.
+	HeartbeatInterval Duration `toml:"heartbeat_interval"`
+}
+
+// HeartbeatStaleGraceEffective returns the runtime-derived grace
+// max(upstream.total_timeout × upstream.max_retries, 30m) the snapshot
+// GC pass uses for sub-job A's stale-heartbeat reap predicate. Surfaced
+// here so the cross-key validation in Validate() and the §10.3 startup
+// dump can consult one source of truth.
+func (c *Config) HeartbeatStaleGraceEffective() time.Duration {
+	derived := c.Upstream.TotalTimeout.Duration *
+		time.Duration(c.Upstream.MaxRetries)
+	const floor = 30 * time.Minute
+	if derived < floor {
+		return floor
+	}
+	return derived
+}
+
 // TrustedSigner is one entry of the SPEC2 §5.1 [[trusted_signer]] array.
 // When MatchCanonicalHost matches a suite's canonical host, the
 // adoption trust set narrows to keys whose fingerprint is in the
@@ -261,6 +331,36 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("adoption", "hot_prefetch_budget") {
 		cfg.Adoption.HotPrefetchBudget.Duration = 5 * time.Minute
 	}
+	// SPEC4 §5.2 presence-sensitive defaults: gc.enabled is bool
+	// (pre-populated in defaultConfig); the rest of the [gc] keys
+	// default to non-zero values that don't collide with documented
+	// 0 semantics, but we still apply them via IsDefined so an
+	// operator who writes `interval = "0s"` (rejected by Validate)
+	// is not silently rescued by Defaults() to "1h".
+	if !md.IsDefined("gc", "interval") {
+		cfg.GC.Interval.Duration = 1 * time.Hour
+	}
+	if !md.IsDefined("gc", "batch_size") {
+		cfg.GC.BatchSize = 100
+	}
+	if !md.IsDefined("gc", "snapshot_batch_size") {
+		cfg.GC.SnapshotBatchSize = 10
+	}
+	if !md.IsDefined("gc", "max_tick_duration") {
+		cfg.GC.MaxTickDuration.Duration = 5 * time.Minute
+	}
+	if !md.IsDefined("gc", "blob_grace") {
+		cfg.GC.BlobGrace.Duration = 5 * time.Minute
+	}
+	if !md.IsDefined("gc", "keep_displaced") {
+		cfg.GC.KeepDisplaced = 3
+	}
+	if !md.IsDefined("gc", "pool_scan_workers") {
+		cfg.GC.PoolScanWorkers = 4
+	}
+	if !md.IsDefined("gc", "heartbeat_interval") {
+		cfg.GC.HeartbeatInterval.Duration = 60 * time.Second
+	}
 	cfg.Defaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -286,6 +386,14 @@ func defaultConfig() *Config {
 		},
 		Adoption: AdoptionConfig{
 			RequireSignature: true,
+		},
+		GC: GCConfig{
+			// SPEC4 §5.1: gc.enabled defaults true. Bool fields must
+			// be pre-populated in defaultConfig (no zero-value
+			// sentinel can distinguish "absent" from "explicit
+			// false"). Operators opt out with explicit
+			// `enabled = false`, which fires gc_disabled Warn.
+			Enabled: true,
 		},
 	}
 }
@@ -371,6 +479,43 @@ func (c *Config) Validate() error {
 	}
 	if c.Adoption.HotPrefetchBudget.Duration < 0 {
 		errs = append(errs, errors.New("adoption.hot_prefetch_budget must not be negative"))
+	}
+
+	// SPEC4 §5.2: [gc] block validation.
+	if c.GC.Interval.Duration <= 0 {
+		errs = append(errs, errors.New("gc.interval must be > 0 (use gc.enabled = false to disable)"))
+	}
+	if c.GC.BatchSize < 1 {
+		errs = append(errs, errors.New("gc.batch_size must be >= 1"))
+	}
+	if c.GC.SnapshotBatchSize < 1 {
+		errs = append(errs, errors.New("gc.snapshot_batch_size must be >= 1"))
+	}
+	if c.GC.MaxTickDuration.Duration <= 0 {
+		errs = append(errs, errors.New("gc.max_tick_duration must be > 0"))
+	}
+	if c.GC.BlobGrace.Duration <= 0 {
+		errs = append(errs, errors.New("gc.blob_grace must be > 0"))
+	}
+	if c.GC.KeepDisplaced < 0 {
+		errs = append(errs, errors.New("gc.keep_displaced must not be negative"))
+	}
+	if c.GC.PoolScanWorkers < 1 {
+		errs = append(errs, errors.New("gc.pool_scan_workers must be >= 1"))
+	}
+	if c.GC.HeartbeatInterval.Duration <= 0 {
+		errs = append(errs, errors.New("gc.heartbeat_interval must be > 0"))
+	} else if grace := c.HeartbeatStaleGraceEffective(); c.GC.HeartbeatInterval.Duration >= grace {
+		// AIDEV-NOTE: SPEC4 §10.2 names this Error
+		// gc_heartbeat_interval_unsafe — refusing to start is safer
+		// than starting with a configuration that can silently reap
+		// live adoptions. The heartbeat-gap upper bound is
+		// heartbeat_interval + writer-queue depth; if heartbeat_interval
+		// alone meets-or-exceeds the grace, the safety argument for
+		// the §9.6.3 reap predicate collapses.
+		errs = append(errs, fmt.Errorf(
+			"gc.heartbeat_interval (%s) must be strictly less than heartbeat_stale_grace_effective (%s = max(upstream.total_timeout × upstream.max_retries, 30m))",
+			c.GC.HeartbeatInterval.Duration, grace))
 	}
 
 	for i, ts := range c.TrustedSigners {

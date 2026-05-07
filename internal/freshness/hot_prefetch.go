@@ -127,6 +127,17 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 			break
 		}
 		blobHash, outcome := a.fetchHotDeb(prefetchCtx, suite, entry, snapshotID)
+		// SPEC4 §7.5.2 site 4: heartbeat after every per-deb fetch
+		// terminates (success, failure, mismatch, or cancel). Uses
+		// adoptionCtx, not prefetchCtx, so a budget-elapsed
+		// prefetchCtx doesn't suppress the heartbeat — adoption is
+		// still alive even if the budget tripped. fetchHotDeb's
+		// per-deb fetches can each consume upstream.total_timeout ×
+		// max_retries; without this site the gap between the last
+		// member-fetch heartbeat (post-runHotPrefetch entry) and
+		// the next heartbeat (site 5 pre-CommitAdoption) could be
+		// hot_count × that budget under pathological upstreams.
+		a.heartbeat(adoptionCtx, snapshotID)
 		switch outcome {
 		case hotFetchOK:
 			prefetched = append(prefetched, cache.PrefetchedURLPath{

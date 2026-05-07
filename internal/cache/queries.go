@@ -149,9 +149,21 @@ func (c *Cache) GetBlob(ctx context.Context, hash string) (*Blob, error) {
 	return &b, nil
 }
 
-// PutBlob inserts a blob row. If a row with this hash already exists, it
-// is left untouched (created_at and refcount must stay stable). Use this
-// after a successful BlobWriter.Finalize.
+// PutBlob inserts a blob row. New rows are born at refcount=0 with
+// refcount_zeroed_at = created_at — the grace clock starts at birth so a
+// fetch that completes the blob write but whose FK-bearing INSERT never
+// commits is reaped one grace later, never on the very next tick.
+//
+// On hash conflict the existing row's refcount, size, and created_at are
+// preserved; only refcount_zeroed_at is refreshed, and only when the
+// existing row is at refcount <= 0. This closes the "reuse an orphan
+// blob" race (SPEC4 §7.5.1 Rule 1): an existing blob row sitting at
+// refcount <= 0 with a stale refcount_zeroed_at could otherwise be reaped
+// between the PutBlob ExecContext returning and the caller's FK-bearing
+// INSERT committing. Restarting the grace clock to "now" gives the caller
+// a full gc.blob_grace window. The conflict's WHERE blob.refcount <= 0
+// predicate skips the UPDATE entirely on the positive-refcount path — no
+// journal write, no row mutation.
 //
 // The schema also CHECKs that hash matches sha256-hex shape, so this Go
 // validation is defense-in-depth. We surface ErrInvalidHash before
@@ -161,12 +173,14 @@ func (c *Cache) PutBlob(ctx context.Context, hash string, size int64) error {
 		return fmt.Errorf("%w: %q", ErrInvalidHash, hash)
 	}
 	const q = `
-INSERT INTO blob (hash, size, created_at, refcount)
-VALUES (?, ?, ?, 0)
-ON CONFLICT(hash) DO NOTHING`
+INSERT INTO blob (hash, size, created_at, refcount, refcount_zeroed_at)
+VALUES (?, ?, ?, 0, ?)
+ON CONFLICT(hash) DO UPDATE
+   SET refcount_zeroed_at = excluded.refcount_zeroed_at
+ WHERE blob.refcount <= 0`
 	now := nowUnix()
 	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		_, err := conn.ExecContext(ctx, q, hash, size, now)
+		_, err := conn.ExecContext(ctx, q, hash, size, now, now)
 		if err != nil {
 			return fmt.Errorf("PutBlob: %w", err)
 		}

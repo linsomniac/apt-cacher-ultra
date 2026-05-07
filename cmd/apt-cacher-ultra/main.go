@@ -21,6 +21,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
+	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
 	"github.com/linsomniac/apt-cacher-ultra/internal/gpg"
 	"github.com/linsomniac/apt-cacher-ultra/internal/handler"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
@@ -179,6 +180,16 @@ func serveListeners(
 		"integrity_validate_at_rest_interval", cfg.Integrity.ValidateAtRestInterval.Duration,
 		"integrity_validate_at_rest_workers", cfg.Integrity.ValidateAtRestWorkers,
 		"integrity_refuse_unvouched_debs", cfg.Integrity.RefuseUnvouchedDebs,
+		"gc_enabled", cfg.GC.Enabled,
+		"gc_interval", cfg.GC.Interval.Duration,
+		"gc_batch_size", cfg.GC.BatchSize,
+		"gc_snapshot_batch_size", cfg.GC.SnapshotBatchSize,
+		"gc_max_tick_duration", cfg.GC.MaxTickDuration.Duration,
+		"gc_blob_grace", cfg.GC.BlobGrace.Duration,
+		"gc_keep_displaced", cfg.GC.KeepDisplaced,
+		"gc_pool_scan_workers", cfg.GC.PoolScanWorkers,
+		"gc_heartbeat_interval", cfg.GC.HeartbeatInterval.Duration,
+		"gc_heartbeat_stale_grace_effective", cfg.HeartbeatStaleGraceEffective(),
 		"trusted_signer_blocks", len(cfg.TrustedSigners),
 		"serve_stale_when_upstream_down", cfg.Serve.ServeStaleWhenUpstreamDown,
 		"log_format", cfg.Log.Format,
@@ -204,6 +215,14 @@ func serveListeners(
 			"detail", "integrity.refuse_unvouched_debs = true with adoption.enabled = false: strict mode predicate explicitly checks adoption.enabled and is therefore inert (SPEC3 §6.1, §10.2)")
 	}
 
+	// SPEC4 §10.2: gc_disabled Warn names the operator's choice when
+	// the master switch is off. The cache still works, but disk usage
+	// will grow unbounded as adoptions roll.
+	if !cfg.GC.Enabled {
+		logger.Warn("gc_disabled",
+			"detail", "gc.enabled = false: orphan blobs and displaced snapshots will not be reaped; pool/ size grows unboundedly with rolling adoptions")
+	}
+
 	c, err := cache.Open(ctx, cfg.Cache.Dir, logger)
 	if err != nil {
 		return fmt.Errorf("open cache: %w", err)
@@ -220,6 +239,35 @@ func serveListeners(
 	// continue serving cache hits.
 	if err := c.SweepTmp(tmpSweepMaxAge); err != nil {
 		logger.Warn("startup tmp sweep failed", "err", err)
+	}
+
+	// SPEC4 §4.2 steps 5 + 6: pool/ orphan scan + one-shot GC pass.
+	// Both are blocking — the cache does not begin answering requests
+	// until they complete (we have not yet called Serve on any
+	// listener). When gc.enabled = false, gcsvc.StartupPass returns
+	// immediately and the periodic goroutine below is never started.
+	gcsvc, err := gc.New(gc.Config{
+		Cache:               c,
+		Logger:              logger,
+		Enabled:             cfg.GC.Enabled,
+		Interval:            cfg.GC.Interval.Duration,
+		BatchSize:           cfg.GC.BatchSize,
+		SnapshotBatchSize:   cfg.GC.SnapshotBatchSize,
+		MaxTickDuration:     cfg.GC.MaxTickDuration.Duration,
+		BlobGrace:           cfg.GC.BlobGrace.Duration,
+		KeepDisplaced:       cfg.GC.KeepDisplaced,
+		PoolScanWorkers:     cfg.GC.PoolScanWorkers,
+		HeartbeatStaleGrace: cfg.HeartbeatStaleGraceEffective(),
+	})
+	if err != nil {
+		return fmt.Errorf("build gc: %w", err)
+	}
+	if err := gcsvc.StartupPass(ctx); err != nil {
+		// A startup-pass failure (DB error, fs error reading pool/)
+		// is loud but not fatal — the daemon can still serve. Log
+		// and continue; the next periodic tick retries the GC pass,
+		// and the next process restart re-runs the pool scan.
+		logger.Warn("gc startup pass failed", "err", err)
 	}
 
 	parser, err := proxy.New(cfg.Remap, cfg.Mirror)
@@ -329,6 +377,17 @@ func serveListeners(
 		scanner.Run(freshCtx)
 	}()
 
+	// SPEC4 §9.6 periodic GC goroutine. Shares freshCtx so the
+	// shutdown sequence below cancels and drains it the same way as
+	// the freshness scheduler and integrity scanner. When
+	// gc.enabled = false, gcsvc.Run returns immediately.
+	var gcWG sync.WaitGroup
+	gcWG.Add(1)
+	go func() {
+		defer gcWG.Done()
+		gcsvc.Run(freshCtx)
+	}()
+
 	plainSrv := newHTTPServer(h, logger)
 	var tlsSrv *http.Server
 	if tlsLn != nil {
@@ -436,6 +495,11 @@ func serveListeners(
 	freshCancel()
 	freshWG.Wait()
 	scannerWG.Wait()
+	// SPEC4 §9.5 step 6a: GC goroutine is drained on the same
+	// freshCtx cancellation. Wait for it to exit before c.Close()
+	// so the writer goroutine isn't asked to run a GC batch
+	// against a closing cache.
+	gcWG.Wait()
 
 	// SPEC §9.5 step 3: cancel any in-flight upstream fetches (which
 	// outlive the request ctx by design — see handler.serveCacheMiss)
@@ -506,6 +570,7 @@ func buildAdopter(
 		MaxConcurrent:     cfg.Freshness.MaxConcurrentAdoptions,
 		HotPackagesWindow: cfg.HotPackages.Window.Duration,
 		HotPrefetchBudget: cfg.Adoption.HotPrefetchBudget.Duration,
+		HeartbeatInterval: cfg.GC.HeartbeatInterval.Duration,
 		Logger:            logger,
 	})
 	if err != nil {

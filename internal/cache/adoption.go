@@ -39,11 +39,45 @@ func isUniqueViolation(err error) bool {
 	return sqliteErr.Code() == sqliteConstraintUnique
 }
 
+// HeartbeatSnapshot updates suite_snapshot.heartbeat_at to "now" for the
+// given candidate snapshot id. SPEC4 §7.5.2 sites 2–5: the adoption
+// goroutine calls this after each member fetch, after Packages parsing,
+// after each hot-prefetch deb fetch, and immediately before
+// CommitAdoption. A periodic ticker (site 6) runs in parallel.
+//
+// The UPDATE matches zero rows when the candidate has been reaped (or its
+// id never existed); that is benign — the next heartbeat or the
+// successful CommitAdoption restores liveness, or the row stays gone.
+// Heartbeat-write failures are logged at adoption_heartbeat_failed Warn
+// by the caller; they never abort the adoption.
+//
+// Runs as a small standalone write outside any larger transaction; it
+// does not block on or serialize with CommitAdoption's atomic flip.
+func (c *Cache) HeartbeatSnapshot(ctx context.Context, snapshotID int64) error {
+	const q = `UPDATE suite_snapshot SET heartbeat_at = ? WHERE snapshot_id = ?`
+	now := nowUnix()
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, q, now, snapshotID)
+		if err != nil {
+			return fmt.Errorf("HeartbeatSnapshot: %w", err)
+		}
+		return nil
+	})
+}
+
 // InsertCandidateSnapshot inserts a fresh suite_snapshot row with
 // adopted_at = NULL and returns the auto-assigned snapshot_id. SPEC2
 // §7.5 step 4. Caller uses the returned id to key the snapshot_member
 // and package_hash rows it builds during prefetch (steps 5-8), then
 // finalizes via CommitAdoption (step 9 / §7.5.1).
+//
+// Phase 4 (SPEC4 §7.5.2 site 1): heartbeat_at is set to created_at on
+// insert and refreshed on the reused-orphan path. The orphan-candidate
+// reap predicate keys on heartbeat_at, so a candidate row that exists
+// from this INSERT through the eventual CommitAdoption flip remains
+// "alive" only as long as the adoption goroutine keeps writing
+// heartbeats — the row's age alone cannot keep it alive (which is the
+// whole point: a stalled adoption with no heartbeats ages out).
 //
 // All non-nil *Hash fields must point at blob.hash values the caller
 // has already persisted via PutBlob; the FK constraints fail closed
@@ -71,8 +105,8 @@ INSERT INTO suite_snapshot
   (canonical_scheme, canonical_host, suite_path,
    inrelease_hash, inrelease_etag, inrelease_lastmod,
    release_hash, release_gpg_hash, created_at, adopted_at,
-   package_coverage_complete)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
+   package_coverage_complete, heartbeat_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
 	const lookupQ = `
 SELECT snapshot_id, adopted_at FROM suite_snapshot
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?
@@ -86,7 +120,7 @@ SELECT snapshot_id, adopted_at FROM suite_snapshot
 		res, execErr := conn.ExecContext(ctx, insertQ,
 			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath,
 			sc.InReleaseHash, sc.InReleaseETag, sc.InReleaseLastMod,
-			sc.ReleaseHash, sc.ReleaseGPGHash, now, coverage)
+			sc.ReleaseHash, sc.ReleaseGPGHash, now, coverage, now)
 		if execErr == nil {
 			id, execErr = res.LastInsertId()
 			if execErr != nil {
@@ -137,14 +171,20 @@ SELECT snapshot_id, adopted_at FROM suite_snapshot
 		// inrelease_hash / release_hash are part of the natural key
 		// and cannot have changed (we only got here because they
 		// matched); leave them.
+		// SPEC4 §7.5.2 site 1 (reused-orphan path): refresh heartbeat_at
+		// alongside the other mutable columns. Without this, a reused
+		// candidate inherits its prior incarnation's heartbeat_at; if
+		// that value is past grace, the very next snapshot-GC tick can
+		// reap the freshly-restarted adoption.
 		const refreshQ = `
 UPDATE suite_snapshot
    SET release_gpg_hash   = ?,
        inrelease_etag     = ?,
-       inrelease_lastmod  = ?
+       inrelease_lastmod  = ?,
+       heartbeat_at       = ?
  WHERE snapshot_id = ?`
 		if _, err := conn.ExecContext(ctx, refreshQ,
-			sc.ReleaseGPGHash, sc.InReleaseETag, sc.InReleaseLastMod,
+			sc.ReleaseGPGHash, sc.InReleaseETag, sc.InReleaseLastMod, now,
 			existingID); err != nil {
 			return fmt.Errorf("InsertCandidateSnapshot: refresh mutable cols on reuse: %w", err)
 		}
@@ -346,12 +386,23 @@ UPDATE suite_snapshot SET package_coverage_complete = ?
 			return fmt.Errorf("CommitAdoption: stamp coverage: %w", err)
 		}
 
-		// Step 4: bump refcount for blobs referenced by the new
-		// snapshot. The IN-subquery dedupes blob_hash values
-		// automatically: each blob row matches once regardless of how
-		// many member rows point at it.
+		// Step 4 (SPEC4 §7.5.1 Rule 2): bump refcount for blobs
+		// referenced by the new snapshot. The IN-subquery dedupes
+		// blob_hash values automatically: each blob row matches once
+		// regardless of how many member rows point at it.
+		//
+		// IIF clears refcount_zeroed_at only on the strictly-positive
+		// crossing — a -1 → 0 bump leaves the existing
+		// refcount_zeroed_at intact so the grace clock continues from
+		// where it was, while a 0 → 1 (or -1 → 0 followed by 0 → 1
+		// — but each UPDATE sees the post-update value) bump clears
+		// the column. The check is on `refcount + 1` (the post-update
+		// value) so SQLite evaluates it against the row's pre-update
+		// refcount and decides correctly which side of zero we land on.
 		if _, err := tx.ExecContext(ctx, `
-UPDATE blob SET refcount = refcount + 1
+UPDATE blob
+   SET refcount = refcount + 1,
+       refcount_zeroed_at = IIF(refcount + 1 > 0, NULL, refcount_zeroed_at)
  WHERE hash IN (SELECT blob_hash FROM snapshot_member WHERE snapshot_id = ?)`,
 			snapshotID); err != nil {
 			return fmt.Errorf("CommitAdoption: bump new refcounts: %w", err)
@@ -394,14 +445,26 @@ UPDATE suite_snapshot SET adopted_at = ? WHERE snapshot_id = ?`,
 			return fmt.Errorf("CommitAdoption: stamp adopted_at: %w", err)
 		}
 
-		// Step 8: decrement refcounts for blobs the prior snapshot
-		// pinned. A blob shared between old and new gets +1 then -1
-		// (net 0) — exactly the bookkeeping a Phase 4 GC will rely on.
+		// Step 8 (SPEC4 §7.5.1 Rule 3): decrement refcounts for blobs
+		// the prior snapshot pinned. A blob shared between old and new
+		// gets +1 then -1 (net 0) — exactly the bookkeeping Phase 4 GC
+		// relies on.
+		//
+		// COALESCE preserves an existing refcount_zeroed_at on a 0 → -1
+		// transition (the grace clock should continue, not restart).
+		// The inner IIF only writes a fresh `now` when refcount - 1 is
+		// the *first* ≤ 0 crossing (i.e. refcount was strictly positive
+		// before this UPDATE).
 		if prior.Valid {
 			if _, err := tx.ExecContext(ctx, `
-UPDATE blob SET refcount = refcount - 1
+UPDATE blob
+   SET refcount = refcount - 1,
+       refcount_zeroed_at = COALESCE(
+         refcount_zeroed_at,
+         IIF(refcount - 1 <= 0, ?, NULL)
+       )
  WHERE hash IN (SELECT blob_hash FROM snapshot_member WHERE snapshot_id = ?)`,
-				prior.Int64); err != nil {
+				now, prior.Int64); err != nil {
 				return fmt.Errorf("CommitAdoption: decrement prior refcounts: %w", err)
 			}
 		}
@@ -767,9 +830,20 @@ DELETE FROM url_path
 			return nil
 		}
 		if blobHash.Valid && blobHash.String != "" {
+			// SPEC4 §7.5.1 Rule 3: same COALESCE/IIF pattern as
+			// CommitAdoption Step 8 — preserve existing
+			// refcount_zeroed_at on 0 → -1, set to now on the first
+			// ≤ 0 crossing.
+			now := nowUnix()
 			if _, err := tx.ExecContext(ctx, `
-UPDATE blob SET refcount = refcount - 1 WHERE hash = ?`,
-				blobHash.String); err != nil {
+UPDATE blob
+   SET refcount = refcount - 1,
+       refcount_zeroed_at = COALESCE(
+         refcount_zeroed_at,
+         IIF(refcount - 1 <= 0, ?, NULL)
+       )
+ WHERE hash = ?`,
+				now, blobHash.String); err != nil {
 				return fmt.Errorf("EvictURLPath: decrement refcount: %w", err)
 			}
 		}
