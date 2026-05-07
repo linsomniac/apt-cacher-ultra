@@ -95,31 +95,40 @@ type activeHostInfo struct {
 }
 
 // buildStatusModel composes the renderModel from the data sources.
-// Each DB query runs under a 5s context.WithTimeout (SPEC5 §9.7.3
-// per-query timeout). On any DB error, the handler returns 503;
-// in-memory accessors (hostsem.Snapshot, gc.LastRunSummary, ring
+// Each DB query runs under its OWN 5s context.WithTimeout (SPEC5
+// §9.7.3 per-query timeout — not a shared 5s for the whole render).
+// On any DB error, buildStatusModel returns the failing query name
+// alongside the error so the §9.7.3 admin_status_render_failed Warn
+// can name the specific call that timed out.
+//
+// In-memory accessors (hostsem.Snapshot, gc.LastRunSummary, ring
 // Snapshot) cannot fail and are not deadlined.
 //
-// AIDEV-NOTE: Cache-state numeric fields (bytes_used, blob_count,
-// etc.) are NOT recomputed inline. They live on the metrics package
-// gauges that the §9.7.6 refresher updates every
-// admin.gauge_refresh seconds. The status page reads cached values
-// — same number scrape-time consumers see. For Phase 5 they are
-// zeroed on a fresh process; counter wiring (next commit) populates
-// them via Gauge.Set in the refresher and the status renderer
-// reads via the same metric handles.
-func (s *Server) buildStatusModel(r *http.Request) (statusModel, error) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	suitesRaw, err := s.cfg.Cache.ListSuitesWithAdoption(ctx)
+// SPEC5 §10.5: the cache.* block (blob_count, total_bytes, etc.) is
+// sourced from cache.GetCacheStats — three cheap DB queries running
+// under their own deadline. The §9.7.6 refresher uses the same
+// helper to populate the corresponding metric gauges; the two views
+// always agree on the same row counts.
+func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) {
+	suitesRaw, err := s.runDBQuery(r, "ListSuitesWithAdoption", func(ctx context.Context) (any, error) {
+		return s.cfg.Cache.ListSuitesWithAdoption(ctx)
+	})
 	if err != nil {
-		return statusModel{}, fmt.Errorf("ListSuitesWithAdoption: %w", err)
+		return statusModel{}, "ListSuitesWithAdoption", err
 	}
-	hotPaths, err := s.cfg.Cache.ListHotURLPaths(ctx, 20)
+	hotPaths, err := s.runDBQuery(r, "ListHotURLPaths", func(ctx context.Context) (any, error) {
+		return s.cfg.Cache.ListHotURLPaths(ctx, 20)
+	})
 	if err != nil {
-		return statusModel{}, fmt.Errorf("ListHotURLPaths: %w", err)
+		return statusModel{}, "ListHotURLPaths", err
 	}
+	stats, err := s.runDBQuery(r, "GetCacheStats", func(ctx context.Context) (any, error) {
+		return s.cfg.Cache.GetCacheStats(ctx)
+	})
+	if err != nil {
+		return statusModel{}, "GetCacheStats", err
+	}
+	st := stats.(cache.CacheStats)
 
 	uptime := time.Since(s.cfg.StartTime)
 	model := statusModel{
@@ -130,10 +139,16 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, error) {
 			VCSRevision:     s.cfg.BuildInfo.VCSRevision,
 			GoVersion:       s.cfg.BuildInfo.GoVersion,
 		},
-		Cache:           cacheInfo{Dir: s.cfg.Cache.Dir()},
+		Cache: cacheInfo{
+			Dir:                 s.cfg.Cache.Dir(),
+			BytesUsed:           st.TotalBytes,
+			BlobCount:           st.BlobCount,
+			URLPathCount:        st.URLPathCount,
+			ZeroRefcountBacklog: st.ZeroRefcountBacklog,
+		},
 		Listeners:       buildListenerInfo(s.cfg),
-		Suites:          buildSuiteEntries(suitesRaw),
-		HotURLPaths:     buildHotURLEntries(hotPaths),
+		Suites:          buildSuiteEntries(suitesRaw.([]cache.SuiteWithAdoption)),
+		HotURLPaths:     buildHotURLEntries(hotPaths.([]cache.HotURLPath)),
 		RecentAdoptions: buildAdoptionEntries(s.cfg.Ring.Snapshot()),
 		ActiveHosts:     buildActiveHostEntries(s.cfg.HostLimiter.Snapshot()),
 	}
@@ -154,7 +169,17 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, error) {
 		}
 	}
 
-	return model, nil
+	return model, "", nil
+}
+
+// runDBQuery wraps a DB call in its own 5s context.WithTimeout
+// derived from the request context. SPEC5 §9.7.3 per-query timeout.
+// The label is for diagnostic logging only; runDBQuery itself does
+// not log.
+func (s *Server) runDBQuery(r *http.Request, _ string, fn func(context.Context) (any, error)) (any, error) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	return fn(ctx)
 }
 
 func buildListenerInfo(cfg Config) []listenerInfo {
@@ -229,15 +254,14 @@ func buildActiveHostEntries(stats map[string]hostsem.HostStat) []activeHostInfo 
 }
 
 // renderStatus renders the SPEC5 §10.5 status page in either JSON
-// or HTML per content negotiation (§9.7.3). Replaces the
-// placeholder stub from the prior commit.
+// or HTML per content negotiation (§9.7.3).
 func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
-	model, err := s.buildStatusModel(r)
+	model, failingQuery, err := s.buildStatusModel(r)
 	if err != nil {
 		s.logger.Warn("admin_status_render_failed",
 			"err", err.Error(),
 			"format", chooseFormat(r),
-			"query", "buildStatusModel")
+			"query", failingQuery)
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}

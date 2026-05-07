@@ -126,6 +126,23 @@ type SnapshotCoverage struct {
 	PackageCoverageComplete bool
 }
 
+// CacheStats is the SPEC5 §10.5 cache.* numeric block: blob count
+// + total bytes + url_path count + zero-refcount backlog. Sourced
+// by both the §9.7.3 status page and the §9.7.6 refresher
+// goroutine (which uses the same numbers to populate the
+// acu_blobs_db_count / acu_blobs_db_total_bytes /
+// acu_url_paths_tracked / acu_blobs_zero_refcount_backlog gauges).
+//
+// The two numeric fields that source from /proc-style filesystem
+// data — pool_disk_bytes — live elsewhere; this struct is purely
+// the database-derivable fields.
+type CacheStats struct {
+	BlobCount           int64
+	TotalBytes          int64
+	URLPathCount        int64
+	ZeroRefcountBacklog int64
+}
+
 // HotURLPath is one row of the SPEC5 §10.5 hot_url_paths status-page
 // section: a url_path row that has been recently requested. Sorted
 // by (request_count DESC, last_requested_at DESC).

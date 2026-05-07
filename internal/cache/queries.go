@@ -270,6 +270,44 @@ LEFT JOIN suite_snapshot ss
 	return out, nil
 }
 
+// GetCacheStats returns the four DB-derived numeric fields the
+// SPEC5 §10.5 status-page cache.* block needs: blob_count,
+// total_bytes, url_path_count, and zero_refcount_backlog. Called by
+// both the status-page handler (per-render) and the §9.7.6
+// refresher goroutine (every admin.gauge_refresh).
+//
+// AIDEV-NOTE: COUNT(*) on blob and url_path is sub-millisecond at
+// the row-counts a typical deployment carries (tens of
+// thousands), and SUM(size) FROM blob runs from the b-tree leaf
+// scan SQLite already maintains for the table. The
+// zero-refcount-backlog query uses idx_blob_gc (SPEC4 §4.3) which
+// is built exactly for this reachability filter.
+//
+// Returns (CacheStats, nil) on success. Per-query errors bubble up
+// individually so callers can decide on partial-data behavior;
+// the §9.7.6 refresher logs and keeps the prior gauge value, the
+// status page returns 503 (SPEC5 §9.7.3).
+func (c *Cache) GetCacheStats(ctx context.Context) (CacheStats, error) {
+	var s CacheStats
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT count(*), COALESCE(sum(size), 0) FROM blob`,
+	).Scan(&s.BlobCount, &s.TotalBytes); err != nil {
+		return CacheStats{}, fmt.Errorf("GetCacheStats blob: %w", err)
+	}
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM url_path`,
+	).Scan(&s.URLPathCount); err != nil {
+		return CacheStats{}, fmt.Errorf("GetCacheStats url_path: %w", err)
+	}
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM blob
+		   WHERE refcount <= 0 AND refcount_zeroed_at IS NOT NULL`,
+	).Scan(&s.ZeroRefcountBacklog); err != nil {
+		return CacheStats{}, fmt.Errorf("GetCacheStats zero_refcount: %w", err)
+	}
+	return s, nil
+}
+
 // ListHotURLPaths returns up to `limit` url_path rows ordered by
 // request_count DESC then last_requested_at DESC. Used by the
 // SPEC5 §10.5 status-page hot_url_paths section. Rows whose
@@ -280,6 +318,19 @@ LEFT JOIN suite_snapshot ss
 // is bounded regardless of url_path table size. Phase 5 status
 // page caps at 20 (SPEC5 §10.5); a future endpoint may want a
 // bigger limit, hence the parameter rather than a hard-coded 20.
+//
+// AIDEV-NOTE: the schema indexes url_path(last_requested_at) but
+// not the compound (request_count DESC, last_requested_at DESC)
+// this query orders by — SQLite picks idx_url_path_last_req for
+// the WHERE filter and sorts the matching rows in-memory. At
+// typical url_path table sizes (tens of thousands) this is a
+// sub-millisecond sort. SPEC5 §4.3 commits to no schema changes
+// in Phase 5; a Phase 6 partial covering index
+// (idx_url_path_hot ON url_path(request_count DESC,
+// last_requested_at DESC) WHERE last_requested_at IS NOT NULL)
+// would eliminate the sort if profiling at multi-million-row scale
+// shows it matters. The §9.7.3 5s per-query timeout caps the worst
+// case in any event.
 func (c *Cache) ListHotURLPaths(ctx context.Context, limit int) ([]HotURLPath, error) {
 	if limit <= 0 {
 		return nil, nil

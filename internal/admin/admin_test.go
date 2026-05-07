@@ -229,6 +229,60 @@ func TestStatusJSON_HasLockedSchemaKeys(t *testing.T) {
 	}
 }
 
+// TestStatusJSON_CachePopulatesAfterSeed verifies the cache.* block
+// reflects real DB row counts, not the Go zero-value (codex review
+// finding 1: status page would otherwise mislead operators with
+// blob_count=0 etc.).
+func TestStatusJSON_CachePopulatesAfterSeed(t *testing.T) {
+	s, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	// Seed two blobs by writing pool/ files + PutBlob row.
+	for i, body := range []string{"first blob body", "second"} {
+		w, err := s.cfg.Cache.NewTempBlob()
+		if err != nil {
+			t.Fatalf("NewTempBlob[%d]: %v", i, err)
+		}
+		if _, err := w.Write([]byte(body)); err != nil {
+			t.Fatalf("Write[%d]: %v", i, err)
+		}
+		hash, err := w.Finalize(int64(len(body)))
+		if err != nil {
+			t.Fatalf("Finalize[%d]: %v", i, err)
+		}
+		if err := s.cfg.Cache.PutBlob(context.Background(), hash, int64(len(body))); err != nil {
+			t.Fatalf("PutBlob[%d]: %v", i, err)
+		}
+	}
+
+	resp := mustGet(t, base+"/?format=json")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var got struct {
+		Cache struct {
+			BlobCount           int64 `json:"blob_count"`
+			BytesUsed           int64 `json:"bytes_used"`
+			URLPathCount        int64 `json:"url_path_count"`
+			ZeroRefcountBacklog int64 `json:"zero_refcount_backlog"`
+		} `json:"cache"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v\nbody: %s", err, body)
+	}
+	if got.Cache.BlobCount != 2 {
+		t.Errorf("blob_count = %d, want 2", got.Cache.BlobCount)
+	}
+	if got.Cache.BytesUsed != int64(len("first blob body")+len("second")) {
+		t.Errorf("bytes_used = %d, want %d", got.Cache.BytesUsed,
+			len("first blob body")+len("second"))
+	}
+	// Both blobs are at refcount=0 with refcount_zeroed_at set
+	// (PutBlob's default), so they are in the zero-refcount backlog.
+	if got.Cache.ZeroRefcountBacklog != 2 {
+		t.Errorf("zero_refcount_backlog = %d, want 2", got.Cache.ZeroRefcountBacklog)
+	}
+}
+
 func TestStatusHTML_RendersWithoutPanic(t *testing.T) {
 	_, base, cleanup := startAdminServer(t)
 	defer cleanup()
