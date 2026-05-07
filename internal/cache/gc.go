@@ -18,19 +18,41 @@ type ReapedBlob struct {
 	Size int64
 }
 
+// blobGCInterTxHook is a test-only seam fired between RunBlobGCBatch's
+// SELECT (candidate identification) and DELETE (predicate-guarded
+// reap). Production keeps it nil.
+//
+// SPEC4 §12.3 chaos tests stub this hook to inject inline mutations on
+// the same writer-tx connection (refcount bumps, FK-bearing INSERTs,
+// no-ops simulating an aborted adoption) and verify the DELETE's
+// reachability predicate filters appropriately. Mutations performed
+// here run via the same tx handle, so they are visible to the DELETE
+// in the same transaction — exactly mirroring the on-disk semantic of
+// "another writer's commit landed between SELECT and DELETE" without
+// needing a second SQLite connection.
+//
+// The hook receives the live tx so it can EXEC inline; returning a
+// non-nil error aborts the batch with that error.
+var blobGCInterTxHook func(ctx context.Context, tx *sql.Tx) error
+
 // RunBlobGCBatch executes one writer-tx blob-GC batch per SPEC4 §9.6.2:
 //
 //  1. BEGIN
-//  2. DELETE FROM blob WHERE <full reachability predicate> RETURNING hash, size
-//     — the DELETE is bounded by `batchSize` ORDER BY refcount_zeroed_at
-//     so the oldest candidates are reaped first; the WHERE clause
-//     re-applies the SELECT predicate atomically with the DELETE so a
-//     row that became reachable between SELECT and DELETE is filtered
-//     out.
-//  3. iterate rows.Next(), accumulating (hash, size) into a Go slice
-//  4. rows.Close() — required by SQLite before COMMIT (the RETURNING
+//  2. SELECT candidate hashes (predicate: refcount<=0, eligible clock,
+//     three NOT EXISTS reachability clauses). The single-writer model
+//     means no other writer can land between SELECT and DELETE inside
+//     this tx. Test seam blobGCInterTxHook fires here for §12.3 chaos
+//     coverage.
+//  3. DELETE FROM blob WHERE hash IN (...) AND <full reachability
+//     predicate> RETURNING hash, size — the WHERE clause re-applies
+//     the SELECT predicate atomically with the DELETE so a row whose
+//     reachability changed since SELECT (in production: never, by the
+//     single-writer ordering; in chaos tests: via the inter-tx hook)
+//     is filtered out.
+//  4. iterate rows.Next(), accumulating (hash, size) into a Go slice
+//  5. rows.Close() — required by SQLite before COMMIT (the RETURNING
 //     cursor pins the tx)
-//  5. COMMIT
+//  6. COMMIT
 //
 // The on-disk os.Remove calls happen *after* COMMIT, outside this
 // helper. Crash-safety derives from the ordering: a process killed
@@ -101,6 +123,18 @@ SELECT hash FROM blob
 
 		if len(hashes) == 0 {
 			return tx.Commit()
+		}
+
+		// SPEC4 §12.3 test seam: chaos drivers inject inline mutations
+		// here (refcount bumps, url_path INSERTs, no-ops) to exercise
+		// the DELETE's predicate re-application. Production sets the
+		// hook to nil. The mutations land on the same tx so the DELETE
+		// sees them — semantically equivalent to a parallel writer's
+		// commit landing between SELECT and DELETE.
+		if hook := blobGCInterTxHook; hook != nil {
+			if err := hook(ctx, tx); err != nil {
+				return fmt.Errorf("RunBlobGCBatch: inter-tx hook: %w", err)
+			}
 		}
 
 		// Step 2: DELETE...RETURNING with the same reachability
