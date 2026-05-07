@@ -575,4 +575,291 @@ xcs="$(grep -i '^x-cache-snapshot:' "$hdrs_file" | tr -d '\r')"
 echo "[deb-test] phase 3 follow-up: $xcs"
 
 echo "[deb-test] phase 3 (detached adoption smoke) PASS"
+
+# ============================================================
+# SPEC3 §14.5 phase 4: Phase 3 hot-package prefetch end-to-end.
+#
+# SPEC3 definition-of-done #5 requires the .deb-install harness to
+# exercise at least one second-cycle adoption that successfully
+# prefetches a hot deb. The unit/chaos suite already covers the
+# wiring; this section proves the same wiring works from the
+# packaged binary running under the packaged config schema.
+#
+# Flow (V1 → V2 → V1 chain so two adoptions actually fire):
+#   1. Stop, wipe cache, stage V1 fixture, restart with Phase 3
+#      config (hot_packages.window, adoption.hot_prefetch_budget).
+#   2. Prime cache by GETting V1 InRelease (cold-cache miss). No
+#      adoption fires here — there's no current_snapshot_id yet
+#      and no upstream divergence to drive freshness.
+#   3. Swap nginx webroot to V2. Drive a second InRelease GET. The
+#      cached V1 bytes diverge from upstream V2 → freshness fires
+#      → V2 adoption commits. This is the FIRST adoption
+#      (prior_snapshot_id was NULL → hot_count=0).
+#   4. GET the V2 .deb so url_path.last_requested_at on
+#      hello-acu_2.0_amd64.deb is recorded — that's the (Package,
+#      Arch) signal SPEC3 §7.5.3 Stage 1 mines on the next
+#      adoption.
+#   5. Swap nginx webroot back to V1. Drive a third InRelease GET.
+#      Cached V2 bytes diverge from upstream V1 → V1 adoption
+#      fires. prior_snapshot_id = V2's id → hot pair (hello-acu,
+#      amd64) is hot → Stage 2 maps it to V1's
+#      hello-acu_1.0_amd64.deb → hot prefetch warms it.
+#   6. Assert:
+#        - adoption_hot_prefetch_complete fires for the V1 snapshot
+#          with hot_count >= 1, fetched >= 1, failed=0,
+#          mismatched=0;
+#        - url_path row for hello-acu_1.0_amd64.deb exists with a
+#          non-null blob_hash AND last_fetched_at (proves
+#          CommitAdoption wrote the prefetched row in the flip
+#          transaction per SPEC3 §7.5.1).
+# ============================================================
+
+echo
+echo "[deb-test] phase 4: stop phase-3 daemon and wipe cache"
+stop_daemon
+rm -rf /var/cache/apt-cacher-ultra/* 2>/dev/null || true
+chown apt-cacher-ultra:apt-cacher-ultra /var/cache/apt-cacher-ultra
+
+echo "[deb-test] phase 4: stage V1 (inline) fixture as nginx webroot"
+rm -rf /var/www/html/*
+cp -r /fixture-v1/dists /var/www/html/
+cp -r /fixture-v1/pool /var/www/html/
+
+echo "[deb-test] phase 4: write Phase 3 adoption config (hot_packages + hot_prefetch_budget)"
+cat > /etc/apt-cacher-ultra/config.toml <<EOF
+[cache]
+dir = "/var/cache/apt-cacher-ultra"
+listen = "0.0.0.0:3142"
+
+[upstream]
+allowed_host_regex = ["^127\\\\.0\\\\.0\\\\.1\$"]
+deny_target_ranges = []
+
+[freshness]
+cooldown = "1s"
+periodic_refresh = "1h"
+
+[adoption]
+enabled = true
+require_signature = true
+hot_prefetch_budget = "60s"
+
+[[trusted_signer]]
+match_canonical_host = "127.0.0.1"
+fingerprints = ["$FP"]
+
+[hot_packages]
+window = "24h"
+
+[log]
+level = "info"
+format = "text"
+EOF
+chmod 0644 /etc/apt-cacher-ultra/config.toml
+
+echo "[deb-test] phase 4: restart daemon under Phase 3 config"
+runuser -u apt-cacher-ultra -- \
+    /usr/sbin/apt-cacher-ultra --config /etc/apt-cacher-ultra/config.toml \
+    >>"$daemon_log" 2>&1 &
+DAEMON_PID=$!
+
+ready=0
+for i in $(seq 1 30); do
+    if (echo > /dev/tcp/127.0.0.1/3142) 2>/dev/null; then
+        ready=1
+        echo "[deb-test] phase-4 :3142 reachable after ${i}s"
+        break
+    fi
+    sleep 1
+done
+if [[ $ready -eq 0 ]]; then
+    echo "FAIL: phase-4 daemon did not bind :3142 within 30s"
+    exit 1
+fi
+
+# 4a: cold-cache prime with V1 InRelease. The freshness check fires
+# only on subsequent hits, so this MISS just establishes a url_path
+# row pointing at the V1 bytes; no adoption fires yet.
+echo "[deb-test] phase 4: cold prime — GET V1 InRelease via proxy"
+status=$(curl -sS -x http://127.0.0.1:3142 \
+    -o /tmp/p4.inrelease.v1 \
+    -w '%{http_code}' \
+    --max-time 10 \
+    http://127.0.0.1/dists/noble/InRelease || echo "000")
+if [[ "$status" != "200" ]]; then
+    echo "FAIL: phase-4 V1 InRelease via proxy returned $status"
+    exit 1
+fi
+
+# 4b: swap upstream to V2 so the next freshness check sees changed
+# bytes (cached=V1, upstream=V2). Sleep > cooldown.
+echo "[deb-test] phase 4: swap nginx webroot to V2 (drives V2 adoption)"
+sleep 2
+rm -rf /var/www/html/*
+cp -r /fixture-v2/dists /var/www/html/
+cp -r /fixture-v2/pool /var/www/html/
+
+echo "[deb-test] phase 4: GET InRelease to trigger V2 adoption (1st adoption)"
+status=$(curl -sS -x http://127.0.0.1:3142 \
+    -o /tmp/p4.inrelease.trigger.v2 \
+    -w '%{http_code}' \
+    --max-time 10 \
+    http://127.0.0.1/dists/noble/InRelease || echo "000")
+if [[ "$status" != "200" ]]; then
+    echo "FAIL: phase-4 V2 trigger InRelease returned $status"
+    exit 1
+fi
+
+echo "[deb-test] phase 4: poll for V2 adoption (1st)"
+v2_id=""
+for i in $(seq 1 30); do
+    val=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT IFNULL(current_snapshot_id, '') FROM suite_freshness WHERE suite_path='/dists/noble' LIMIT 1;" \
+        2>/dev/null || echo "")
+    if [[ -n "$val" ]]; then
+        v2_id="$val"
+        echo "[deb-test] phase 4 V2 adopted snapshot id=$v2_id (after ${i}s)"
+        break
+    fi
+    sleep 1
+done
+if [[ -z "$v2_id" ]]; then
+    echo "FAIL: phase-4 V2 adoption did not flip current_snapshot_id within 30s"
+    tail -100 "$daemon_log" || true
+    exit 1
+fi
+
+# 4c: hit the V2 .deb so SPEC3 §7.5.3 Stage 1 has a hot pair to
+# mine on the next adoption. The (Package=hello-acu, Arch=amd64)
+# tuple is recorded with last_requested_at via the Phase 1 fetch
+# path (no snapshot prefetch happened in 4b — this was the first
+# adoption with prior_snapshot_id=NULL, hot_count=0).
+# V2 fixture is version 1.1 (V1 is 1.0); see e2e/deb/Dockerfile
+# repo-build args (VER=1.1).
+V2_DEB_PATH="/pool/main/h/hello-acu/hello-acu_1.1_amd64.deb"
+echo "[deb-test] phase 4: GET V2 .deb to record url_path.last_requested_at"
+status=$(curl -sS -x http://127.0.0.1:3142 \
+    -o /tmp/p4.deb.v2 \
+    -w '%{http_code}' \
+    --max-time 10 \
+    "http://127.0.0.1${V2_DEB_PATH}" || echo "000")
+if [[ "$status" != "200" ]]; then
+    echo "FAIL: phase-4 V2 deb GET returned $status"
+    exit 1
+fi
+v2_lr=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+    "SELECT IFNULL(last_requested_at, '') FROM url_path WHERE path='${V2_DEB_PATH}';" \
+    2>/dev/null || echo "")
+if [[ -z "$v2_lr" ]]; then
+    echo "FAIL: phase-4 V2 .deb url_path.last_requested_at not recorded"
+    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT path, last_requested_at, request_count FROM url_path;" || true
+    exit 1
+fi
+
+# 4d: swap upstream BACK to V1 so the next freshness check fires
+# again (cached InRelease bytes are V2's after 4b adoption; upstream
+# is V1's again). This drives the SECOND adoption — the one whose
+# hot-set Stage 1 query finds the (hello-acu, amd64) hot pair from
+# the V2 snapshot.
+echo "[deb-test] phase 4: swap nginx webroot back to V1 (drives V1 adoption + hot prefetch)"
+sleep 2
+rm -rf /var/www/html/*
+cp -r /fixture-v1/dists /var/www/html/
+cp -r /fixture-v1/pool /var/www/html/
+
+echo "[deb-test] phase 4: GET InRelease to trigger V1 adoption (2nd adoption + hot prefetch)"
+status=$(curl -sS -x http://127.0.0.1:3142 \
+    -o /tmp/p4.inrelease.trigger.v1 \
+    -w '%{http_code}' \
+    --max-time 10 \
+    http://127.0.0.1/dists/noble/InRelease || echo "000")
+if [[ "$status" != "200" ]]; then
+    echo "FAIL: phase-4 V1 trigger InRelease returned $status"
+    exit 1
+fi
+
+echo "[deb-test] phase 4: poll for V1 adoption (2nd)"
+v1_id=""
+for i in $(seq 1 30); do
+    val=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT IFNULL(current_snapshot_id, '') FROM suite_freshness WHERE suite_path='/dists/noble' LIMIT 1;" \
+        2>/dev/null || echo "")
+    if [[ -n "$val" && "$val" != "$v2_id" ]]; then
+        v1_id="$val"
+        echo "[deb-test] phase 4 V1 adopted snapshot id=$v1_id (after ${i}s; prior was $v2_id)"
+        break
+    fi
+    sleep 1
+done
+if [[ -z "$v1_id" ]]; then
+    echo "FAIL: phase-4 V1 adoption did not flip current_snapshot_id within 30s (still v2_id=$v2_id)"
+    tail -100 "$daemon_log" || true
+    exit 1
+fi
+
+# 4e: assert SPEC3 §10.2 adoption_hot_prefetch_complete event fired
+# for the V1 snapshot with hot_count >= 1, fetched >= 1, failed=0,
+# mismatched=0. This is the "hot pair was warmed" oracle.
+echo "[deb-test] phase 4: assert adoption_hot_prefetch_complete fired for snapshot $v1_id"
+hot_line=$(grep "msg=adoption_hot_prefetch_complete" "$daemon_log" \
+    | grep "snapshot_id=$v1_id" | tail -1)
+if [[ -z "$hot_line" ]]; then
+    echo "FAIL: no adoption_hot_prefetch_complete log line for snapshot $v1_id"
+    echo "=== relevant log tail ==="
+    grep -E "hot_prefetch|adoption_" "$daemon_log" | tail -30 || true
+    exit 1
+fi
+echo "[deb-test] phase 4 hot-prefetch line: $hot_line"
+# Extract numeric fields. slog text format emits `key=value` tokens
+# separated by spaces. Anchor on the bare key= so a longer suffix
+# (e.g. `unattempted=`) doesn't match `attempted=`.
+hot_count=$(printf '%s\n' "$hot_line" | grep -oE '(^| )hot_count=[0-9]+' | tr -dc '0-9')
+fetched=$(printf '%s\n' "$hot_line" | grep -oE '(^| )fetched=[0-9]+' | tr -dc '0-9')
+failed=$(printf '%s\n' "$hot_line" | grep -oE '(^| )failed=[0-9]+' | tr -dc '0-9')
+mismatched=$(printf '%s\n' "$hot_line" | grep -oE '(^| )mismatched=[0-9]+' | tr -dc '0-9')
+if [[ "${hot_count:-0}" -lt 1 ]]; then
+    echo "FAIL: phase-4 hot_count=$hot_count, want >= 1 (Stage 1 should mine the V2 hot pair)"
+    exit 1
+fi
+if [[ "${fetched:-0}" -lt 1 ]]; then
+    echo "FAIL: phase-4 fetched=$fetched, want >= 1 (the V1 path should warm)"
+    exit 1
+fi
+if [[ "${failed:-0}" -ne 0 ]]; then
+    echo "FAIL: phase-4 failed=$failed, want 0"
+    exit 1
+fi
+if [[ "${mismatched:-0}" -ne 0 ]]; then
+    echo "FAIL: phase-4 mismatched=$mismatched, want 0"
+    exit 1
+fi
+
+# 4f: assert the V1 .deb's url_path row exists with a non-null
+# blob_hash and last_fetched_at — proof CommitAdoption inserted the
+# prefetched row. SPEC3 §7.5.1: the row is inserted in the same
+# transaction as the snapshot flip.
+V1_DEB_PATH="/pool/main/h/hello-acu/hello-acu_1.0_amd64.deb"
+v1_row=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+    "SELECT IFNULL(blob_hash, '') || '|' || IFNULL(last_fetched_at, '') FROM url_path WHERE path='${V1_DEB_PATH}';" \
+    2>/dev/null || echo "")
+if [[ -z "$v1_row" || "$v1_row" == "|" ]]; then
+    echo "FAIL: phase-4 V1 .deb url_path row missing or has null blob_hash"
+    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT path, blob_hash, last_fetched_at, last_requested_at FROM url_path;" || true
+    exit 1
+fi
+v1_blob="${v1_row%%|*}"
+v1_lf="${v1_row#*|}"
+if [[ -z "$v1_blob" ]]; then
+    echo "FAIL: phase-4 V1 .deb url_path.blob_hash is null"
+    exit 1
+fi
+if [[ -z "$v1_lf" ]]; then
+    echo "FAIL: phase-4 V1 .deb url_path.last_fetched_at is null (prefetch should set this)"
+    exit 1
+fi
+echo "[deb-test] phase 4 V1 .deb url_path: blob_hash=${v1_blob:0:12}.. last_fetched_at=$v1_lf"
+
+echo "[deb-test] phase 4 (Phase 3 hot-prefetch) PASS"
 echo "[deb-test] OVERALL PASS"

@@ -1,4 +1,4 @@
-# apt-cacher-ultra default configuration. See SPEC.md and SPEC2.md for full reference.
+# apt-cacher-ultra default configuration. See SPEC.md, SPEC2.md, and SPEC3.md for full reference.
 
 [cache]
 dir         = "/var/cache/apt-cacher-ultra"
@@ -66,6 +66,17 @@ enabled               = false
 require_signature     = true
 require_pinned_signer = false
 
+# SPEC3 §7.5 hot-deb prefetch wall-clock guard. After a snapshot flip,
+# adoption proactively warms the (Package, Architecture) tuples that
+# clients hit in the prior `hot_packages.window` (next block) so the
+# first post-flip request for each is a HIT instead of a fetch.
+# 0s = no wall-clock guard; the loop runs until every hot deb has
+# terminated (success or full-retry failure). Per-deb fetches still
+# respect upstream.total_timeout × upstream.max_retries regardless of
+# this setting; budget=0s does NOT mean "retry one deb forever."
+# A startup warning fires when set to 0s.
+hot_prefetch_budget   = "5m"
+
 # Optional: narrow the trust set for a suite to specific keys
 # (SPEC2 §7.6.2). Without any [[trusted_signer]] blocks, the entire
 # host keyring is trusted (matching apt's broad-trust default). Set
@@ -96,6 +107,28 @@ require_pinned_signer = false
 [integrity]
 validate_at_rest_interval = "24h"  # "0s" disables the scanner entirely
 validate_at_rest_workers  = 4      # must be >= 1 when interval > 0
+
+# SPEC3 §6.1 strict mode for .deb requests. When true, refuse .deb GETs
+# under a host whose current snapshots have proven complete coverage
+# (every snapshot has package_coverage_complete = 1) but where the
+# requested path is not vouched for. Hosts whose snapshots have
+# package_coverage_complete = 0 fall back to trust-upstream regardless
+# of this flag. Default false during Phase 3 — a default-flip to true
+# is a future-phase decision after production observational data
+# (SPEC3 §1.3). Inert when adoption.enabled = false (a startup warning
+# fires in that combination).
+refuse_unvouched_debs     = false
+
+# SPEC3 §7.5 hot-package proactive refresh. A .deb path is "hot" if a
+# client has requested it within `window`. After every snapshot flip,
+# adoption pre-fetches the new versions of those debs so the first
+# post-flip request for each is a HIT instead of a fetch. The window
+# also bounds how stale the hot signal can be — paths last requested
+# longer ago than `window` are not warmed.
+# "0s" disables hot-package proactive refresh entirely; adoption falls
+# back to Phase 2 behavior (no .deb prefetch).
+[hot_packages]
+window = "24h"
 
 [serve]
 serve_stale_when_upstream_down = true
