@@ -79,6 +79,15 @@ func Open(ctx context.Context, dir string, logger *slog.Logger) (*Cache, error) 
 // Dir is the on-disk root of the cache.
 func (c *Cache) Dir() string { return c.dir }
 
+// Ping checks the SQLite handle responds to a round-trip query
+// within ctx. Used by the admin /healthz endpoint (SPEC5 §9.7.4
+// check 3) to flag "DB writer hung" cases. Returns nil on a
+// successful ping, ctx.Err() on deadline, or the underlying SQL
+// error otherwise.
+func (c *Cache) Ping(ctx context.Context) error {
+	return c.db.PingContext(ctx)
+}
+
 // Close drains and rejects any further writes, joins the writer goroutine,
 // and closes the SQLite handle. Safe to call multiple times.
 func (c *Cache) Close() error {

@@ -51,6 +51,7 @@ type Config struct {
 	HotPackages    HotPackagesConfig `toml:"hot_packages"`
 	Integrity      IntegrityConfig   `toml:"integrity"`
 	GC             GCConfig          `toml:"gc"`
+	Admin          AdminConfig       `toml:"admin"`
 	Serve          ServeConfig       `toml:"serve"`
 	Log            LogConfig         `toml:"log"`
 	Remap          []RemapRule       `toml:"remap"`
@@ -215,6 +216,59 @@ type GCConfig struct {
 	HeartbeatInterval Duration `toml:"heartbeat_interval"`
 }
 
+// AdminConfig holds the SPEC5 §5.1 [admin] block. Drives the Phase 5
+// admin listener: /metrics, /, /healthz endpoints; htpasswd Basic
+// auth; refresher goroutine; per-metric series cap.
+type AdminConfig struct {
+	// Enabled is the master switch. When false, the admin listener
+	// is not bound; /metrics, /, and /healthz are unreachable. The
+	// cache continues to serve proxy traffic normally — the
+	// operator has implicitly opted out of all observability. A
+	// startup admin_disabled Warn fires when false (parallel to
+	// gc_disabled SPEC4 §10.2). Default true.
+	Enabled bool `toml:"enabled"`
+
+	// Listen is the bind address for the admin HTTP listener.
+	// Default 127.0.0.1:6789 — loopback by default, port chosen to
+	// avoid colliding with the proxy (3142). Reuses
+	// validateListenAddr().
+	Listen string `toml:"listen"`
+
+	// HtpasswdFile is the optional Apache htpasswd file (bcrypt-only)
+	// for HTTP Basic auth on every admin request. Empty (default)
+	// means "no auth — operator relies on bind-address as the trust
+	// boundary." Non-empty path must exist, be readable, and parse
+	// as bcrypt-only htpasswd ($2a$, $2b$, $2y$). Older formats
+	// ($apr1$ Apache MD5, {SHA} SHA-1, crypt(3) DES) rejected at
+	// startup with a config error naming the offending line.
+	HtpasswdFile string `toml:"htpasswd_file"`
+
+	// GaugeRefresh is the period of the in-process refresher
+	// goroutine that recomputes expensive gauges (acu_blobs_db_count,
+	// acu_pool_disk_bytes, acu_per_host_inflight, etc.). Default
+	// 30s. A scrape can read a cell up to GaugeRefresh seconds
+	// stale; the refresher does an immediate first recompute at
+	// startup so the first /metrics scrape is not zeros. Must be
+	// > 0 and ≤ 1h.
+	GaugeRefresh Duration `toml:"gauge_refresh"`
+
+	// ReadTimeout bounds how long the admin server waits for a
+	// request line + headers (HTTP ReadHeaderTimeout). Default 5s.
+	// Must be > 0 and ≤ 1m.
+	ReadTimeout Duration `toml:"read_timeout"`
+
+	// IdleTimeout bounds keep-alive idle wait on the admin
+	// listener. Default 30s. Must be > 0 and ≤ 10m.
+	IdleTimeout Duration `toml:"idle_timeout"`
+
+	// MetricSeriesCap is the per-metric series cap applied to
+	// labeled metrics. When a new label-value tuple would push the
+	// metric's series count past this, the increment is silently
+	// dropped and a one-shot metrics_series_cap_reached Warn fires.
+	// Default 1024. Must be ≥ 1.
+	MetricSeriesCap int `toml:"metric_series_cap"`
+}
+
 // HeartbeatStaleGraceEffective returns the runtime-derived grace
 // max(upstream.total_timeout × upstream.max_retries, 30m) the snapshot
 // GC pass uses for sub-job A's stale-heartbeat reap predicate. Surfaced
@@ -361,6 +415,25 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("gc", "heartbeat_interval") {
 		cfg.GC.HeartbeatInterval.Duration = 60 * time.Second
 	}
+	// SPEC5 §5.2 presence-sensitive defaults for [admin]. Non-bool
+	// ints/durations need IsDefined-gated defaults so an operator's
+	// explicit value (or explicit zero — though zero is invalid for
+	// most of these) survives Defaults().
+	if !md.IsDefined("admin", "listen") {
+		cfg.Admin.Listen = "127.0.0.1:6789"
+	}
+	if !md.IsDefined("admin", "gauge_refresh") {
+		cfg.Admin.GaugeRefresh.Duration = 30 * time.Second
+	}
+	if !md.IsDefined("admin", "read_timeout") {
+		cfg.Admin.ReadTimeout.Duration = 5 * time.Second
+	}
+	if !md.IsDefined("admin", "idle_timeout") {
+		cfg.Admin.IdleTimeout.Duration = 30 * time.Second
+	}
+	if !md.IsDefined("admin", "metric_series_cap") {
+		cfg.Admin.MetricSeriesCap = 1024
+	}
 	cfg.Defaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -393,6 +466,14 @@ func defaultConfig() *Config {
 			// sentinel can distinguish "absent" from "explicit
 			// false"). Operators opt out with explicit
 			// `enabled = false`, which fires gc_disabled Warn.
+			Enabled: true,
+		},
+		Admin: AdminConfig{
+			// SPEC5 §5.1: admin.enabled defaults true. Same
+			// bool-pre-populate rationale as gc.enabled — no zero-
+			// value sentinel can distinguish "absent" from "explicit
+			// false." Operators opt out with explicit
+			// `enabled = false`, which fires admin_disabled Warn.
 			Enabled: true,
 		},
 	}
@@ -550,6 +631,40 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// SPEC5 §5.2: [admin] block validation. Only when admin.enabled
+	// is true — when disabled, the listener is not bound, htpasswd
+	// is not parsed, the refresher does not run, so per-key
+	// constraints are inert. Validating only-when-enabled mirrors
+	// gc.enabled gating in §5.2 (see SPEC4 §5.2).
+	if c.Admin.Enabled {
+		if err := validateListenAddr(c.Admin.Listen); err != nil {
+			errs = append(errs, fmt.Errorf("admin.listen: %w", err))
+		}
+		if c.Admin.HtpasswdFile != "" {
+			if err := validateHtpasswdFile(c.Admin.HtpasswdFile); err != nil {
+				errs = append(errs, fmt.Errorf("admin.htpasswd_file: %w", err))
+			}
+		}
+		if c.Admin.GaugeRefresh.Duration <= 0 {
+			errs = append(errs, errors.New("admin.gauge_refresh must be > 0"))
+		} else if c.Admin.GaugeRefresh.Duration > time.Hour {
+			errs = append(errs, errors.New("admin.gauge_refresh must be <= 1h"))
+		}
+		if c.Admin.ReadTimeout.Duration <= 0 {
+			errs = append(errs, errors.New("admin.read_timeout must be > 0"))
+		} else if c.Admin.ReadTimeout.Duration > time.Minute {
+			errs = append(errs, errors.New("admin.read_timeout must be <= 1m"))
+		}
+		if c.Admin.IdleTimeout.Duration <= 0 {
+			errs = append(errs, errors.New("admin.idle_timeout must be > 0"))
+		} else if c.Admin.IdleTimeout.Duration > 10*time.Minute {
+			errs = append(errs, errors.New("admin.idle_timeout must be <= 10m"))
+		}
+		if c.Admin.MetricSeriesCap < 1 {
+			errs = append(errs, errors.New("admin.metric_series_cap must be >= 1"))
+		}
+	}
+
 	for i, ts := range c.TrustedSigners {
 		if ts.MatchCanonicalHost == "" {
 			errs = append(errs, fmt.Errorf("trusted_signer[%d].match_canonical_host is required", i))
@@ -661,6 +776,73 @@ func checkWritable(dir string) error {
 	name := probe.Name()
 	probe.Close()
 	return os.Remove(name)
+}
+
+// validateHtpasswdFile parses the given path's contents as Apache
+// htpasswd format with bcrypt-only entries. SPEC5 §9.7.5 / §5.2:
+// each line is either empty, comment-only (`#...`), or
+// `user:hash` where hash starts with $2a$, $2b$, or $2y$. Any other
+// hash prefix ($apr1$ Apache MD5, {SHA} SHA-1, crypt(3) DES) is
+// rejected at startup so a weak credential scheme cannot be used
+// silently.
+//
+// AIDEV-NOTE: this is the startup-time validation; the runtime
+// reload in internal/admin uses the same parser shape so a
+// successful startup parse implies subsequent reload-of-same-content
+// works. Returns an error naming the first offending line so
+// operators can fix it without scanning the whole file.
+func validateHtpasswdFile(path string) error {
+	st, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	users := 0
+	for i, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		colon := strings.IndexByte(line, ':')
+		if colon <= 0 {
+			return fmt.Errorf("line %d: missing user:hash separator", i+1)
+		}
+		user := line[:colon]
+		hash := line[colon+1:]
+		if user == "" {
+			return fmt.Errorf("line %d: empty username", i+1)
+		}
+		// User must not contain whitespace. Apache's htpasswd does
+		// not allow it, and our middleware splits on the first
+		// colon — embedded whitespace would silently authenticate
+		// nobody.
+		if strings.ContainsAny(user, " \t") {
+			return fmt.Errorf("line %d: username %q contains whitespace", i+1, user)
+		}
+		switch {
+		case strings.HasPrefix(hash, "$2a$"),
+			strings.HasPrefix(hash, "$2b$"),
+			strings.HasPrefix(hash, "$2y$"):
+			// Acceptable bcrypt prefixes.
+		case strings.HasPrefix(hash, "$apr1$"):
+			return fmt.Errorf("line %d: Apache MD5 ($apr1$) hash rejected — use bcrypt (`htpasswd -B`)", i+1)
+		case strings.HasPrefix(hash, "{SHA}"):
+			return fmt.Errorf("line %d: SHA-1 ({SHA}) hash rejected — use bcrypt (`htpasswd -B`)", i+1)
+		default:
+			return fmt.Errorf("line %d: unrecognized hash format %q — only bcrypt ($2a$/$2b$/$2y$) is accepted", i+1, hash)
+		}
+		users++
+	}
+	if users == 0 {
+		return fmt.Errorf("no users defined")
+	}
+	return nil
 }
 
 // checkReadableFile verifies the path exists, is a regular file, and is
