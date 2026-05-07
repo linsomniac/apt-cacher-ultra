@@ -233,9 +233,15 @@ FROM suite_freshness`
 // ComputeHotSet runs the SPEC3 §7.5.3 two-stage hot-set query. Stage 1
 // finds (package_name, architecture) tuples that the *prior* snapshot
 // covered AND that have a hot url_path row (last_requested_at within
-// the hot window). Stage 2 resolves those tuples to (.deb path,
-// declared_sha256) tuples in the *candidate* snapshot. Returns the
-// hot set in no defined order.
+// the hot window). Stage 2 resolves those tuples against the
+// candidate's in-memory `[]PackageHash` rows — they are not yet in
+// the DB (CommitAdoption inserts them transactionally with the
+// current_snapshot_id flip), so the freshness adopter passes them
+// here directly. Returns the hot set ordered deterministically by
+// (package_name, architecture) so the SPEC3 §7.5 step-10 prefetch
+// loop visits entries in a predictable sequence — needed by the
+// §12.3 chaos tests to pin which deb is FIRST vs LAST in iteration
+// when budget elapses mid-loop.
 //
 // Empty inputs are handled gracefully:
 //   - priorSnapshotID == 0: returns an empty slice (a fresh suite with
@@ -243,23 +249,21 @@ FROM suite_freshness`
 //   - hotWindow == 0: returns an empty slice (operator disabled hot
 //     prefetch).
 //   - Stage-1 produced no hot pairs: returns an empty slice without
-//     issuing Stage 2.
+//     building the Stage-2 map.
+//   - candidatePackageHashes empty / no (Package, Arch) match: drops
+//     the unmatchable pair from the hot set.
 //
-// Pre-v3 package_hash rows are excluded automatically — they have empty
-// package_name / architecture columns; Stage 1's predicate filters
-// them out. The first post-upgrade adoption populates name+arch on
-// its candidate's rows; hot prefetch first kicks in on the *second*
+// Pre-v3 package_hash rows in the DB are excluded automatically —
+// they have empty package_name / architecture columns; Stage 1's
+// predicate filters them out. Pre-v3 entries in the candidate slice
+// are also skipped (Stage 2 only indexes non-empty (Package, Arch)
+// keys). The first post-upgrade adoption populates name+arch on its
+// candidate's rows; hot prefetch first kicks in on the *second*
 // snapshot transition after the v2→v3 migration.
-//
-// AIDEV-NOTE: the (canonical_scheme, canonical_host, snapshot_id,
-// package_name, architecture) index from migrations[2] makes Stage 2
-// index-only. Without snapshot_id leading the trailing tuple, the
-// query would degenerate into a row scan over every (Package, Arch)
-// the cache has ever seen across all snapshots — quadratic in
-// snapshot count.
 func (c *Cache) ComputeHotSet(ctx context.Context,
 	scheme, host string,
-	priorSnapshotID, candidateSnapshotID int64,
+	priorSnapshotID int64,
+	candidatePackageHashes []PackageHash,
 	hotWindowSeconds int64,
 	now int64) ([]HotSetEntry, error) {
 	if priorSnapshotID == 0 || hotWindowSeconds == 0 {
@@ -276,7 +280,8 @@ SELECT DISTINCT ph.package_name, ph.architecture
    AND ph.package_name      <> ''
    AND ph.architecture      <> ''
    AND up.last_requested_at IS NOT NULL
-   AND up.last_requested_at >= ?`
+   AND up.last_requested_at >= ?
+ ORDER BY ph.package_name, ph.architecture`
 	hotSince := now - hotWindowSeconds
 	rows, err := c.db.QueryContext(ctx, stage1Q, priorSnapshotID, hotSince)
 	if err != nil {
@@ -302,40 +307,31 @@ SELECT DISTINCT ph.package_name, ph.architecture
 		return nil, nil
 	}
 
-	// Stage 2: for each (Package, Arch) pair, look up the candidate
-	// snapshot's path. The IN-list approach would build a single SQL
-	// with N placeholders; loop-and-query is simpler and the index
-	// makes per-pair lookup O(log N). Each stage-2 hit is unique on
-	// (canonical_scheme, canonical_host, snapshot_id, package_name,
-	// architecture) — the index covers those columns and a single row
-	// per pair is the expected result. (Multiple .debs with the same
-	// (Package, Arch) in a snapshot would be a Release pathology;
-	// adoption already rejects that via buildPackageHashes dedup.)
-	const stage2Q = `
-SELECT path, declared_sha256
-  FROM package_hash
- WHERE canonical_scheme = ?
-   AND canonical_host   = ?
-   AND snapshot_id      = ?
-   AND package_name     = ?
-   AND architecture     = ?`
+	// Stage 2: build an index of the candidate's in-memory rows by
+	// (Package, Arch) and resolve each Stage-1 hot pair. SPEC3 §7.5.3
+	// expects a single (path, declared_sha256) per (Package, Arch) in
+	// any one snapshot; buildPackageHashes already rejects Release
+	// files that violate that constraint, so a single-row mapping is
+	// safe.
+	type key struct{ pkg, arch string }
+	candIdx := make(map[key]PackageHash, len(candidatePackageHashes))
+	for _, ph := range candidatePackageHashes {
+		if ph.PackageName == "" || ph.Architecture == "" {
+			continue
+		}
+		candIdx[key{ph.PackageName, ph.Architecture}] = ph
+	}
 	out := make([]HotSetEntry, 0, len(pairs))
 	for _, pa := range pairs {
-		var entry HotSetEntry
-		err := c.db.QueryRowContext(ctx, stage2Q,
-			scheme, host, candidateSnapshotID, pa.pkg, pa.arch).
-			Scan(&entry.Path, &entry.DeclaredSHA256)
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
+		ph, ok := candIdx[key{pa.pkg, pa.arch}]
+		if !ok {
 			// Hot pair (Package, Arch) is no longer in the candidate
 			// snapshot — upstream removed the package between
 			// snapshots. Cannot prefetch a path that doesn't exist;
 			// drop from the hot set.
 			continue
-		case err != nil:
-			return nil, fmt.Errorf("ComputeHotSet stage 2 (%s/%s): %w", pa.pkg, pa.arch, err)
 		}
-		out = append(out, entry)
+		out = append(out, HotSetEntry{Path: ph.Path, DeclaredSHA256: ph.DeclaredSHA256})
 	}
 	return out, nil
 }

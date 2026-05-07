@@ -19,17 +19,23 @@ type hotSetEntry struct {
 }
 
 // computeHotSet wraps cache.ComputeHotSet with the freshness-side
-// upstream URL composition. Returns nil for the cases SPEC3 §7.5
-// step 9 enumerates as "empty hot set":
+// upstream URL composition. The candidate snapshot's package_hash
+// rows are passed in memory because CommitAdoption hasn't yet
+// inserted them when this runs (SPEC3 §7.5 steps 9–11 are deliberately
+// ordered: build candidate rows → hot prefetch → flip transaction).
+//
+// Returns nil for the cases SPEC3 §7.5 step 9 enumerates as "empty
+// hot set":
 //   - no prior current_snapshot_id for this suite,
 //   - hotWindowSeconds == 0,
-//   - no eligible prior-snapshot rows have a fresh url_path.last_requested_at.
+//   - no eligible prior-snapshot rows have a fresh url_path.last_requested_at,
+//   - no Stage-1 (Package, Arch) tuple matches a candidate row.
 //
 // nil hot set falls through naturally — the §7.5 loop iterates over an
 // empty slice and the flip proceeds via Phase 2 path with
 // prefetchedURLPaths = nil.
 func (a *Adopter) computeHotSet(ctx context.Context, suite SuiteRef,
-	candidateSnapshotID int64, hotWindowSeconds int64) ([]hotSetEntry, error) {
+	candidatePackageHashes []cache.PackageHash, hotWindowSeconds int64) ([]hotSetEntry, error) {
 	if hotWindowSeconds == 0 {
 		return nil, nil
 	}
@@ -39,7 +45,7 @@ func (a *Adopter) computeHotSet(ctx context.Context, suite SuiteRef,
 	}
 	rows, err := a.cache.ComputeHotSet(ctx,
 		suite.CanonicalScheme, suite.CanonicalHost,
-		priorID, candidateSnapshotID, hotWindowSeconds, a.now().Unix())
+		priorID, candidatePackageHashes, hotWindowSeconds, a.now().Unix())
 	if err != nil {
 		return nil, fmt.Errorf("freshness: hot-set: %w", err)
 	}

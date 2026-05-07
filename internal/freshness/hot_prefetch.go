@@ -37,12 +37,14 @@ type hotPrefetchStats struct {
 // once with the unattempted-paths list) and parent context shutdown
 // (handled by checking ctx.Err() at the top of every iteration).
 func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
-	snapshotID int64) ([]cache.PrefetchedURLPath, hotPrefetchStats) {
+	snapshotID int64, candidatePackageHashes []cache.PackageHash) ([]cache.PrefetchedURLPath, hotPrefetchStats) {
 	var stats hotPrefetchStats
 
-	// SPEC3 §7.5 step 9: build the hot set.
+	// SPEC3 §7.5 step 9: build the hot set. Pass the candidate's
+	// in-memory package_hash rows — Stage 2 of ComputeHotSet looks
+	// them up there, since CommitAdoption hasn't inserted them yet.
 	hotWindowSeconds := int64(a.hotPackagesWindow.Seconds())
-	hotSet, err := a.computeHotSet(adoptionCtx, suite, snapshotID, hotWindowSeconds)
+	hotSet, err := a.computeHotSet(adoptionCtx, suite, candidatePackageHashes, hotWindowSeconds)
 	if err != nil {
 		// Hot-set computation failure is non-fatal: log and skip the
 		// loop. The flip still proceeds — operators see a warning,
@@ -93,15 +95,21 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 	prefetched := make([]cache.PrefetchedURLPath, 0, stats.hotCount)
 
 	for i, entry := range hotSet {
-		// Distinguish budget elapse from parent shutdown. Budget elapse
-		// emits adoption_hot_prefetch_partial once and breaks the loop;
-		// parent shutdown is Phase 2 §9.5 semantics — abandon the
-		// candidate by returning what we have so far, but the caller's
-		// CommitAdoption (running under adoptionCtx, which is also
-		// cancelled) will fail naturally and the flip won't happen.
+		// Top-of-iteration cancellation check. SPEC3 §7.5 step 10 routes
+		// "deb in flight when budget fires" through fetchHotDeb's failed
+		// bucket (it emits hot_prefetch_deb_failed for that path), so the
+		// only case that lands here is "budget already elapsed and we
+		// haven't even started entry i yet" — entry i and everything
+		// after it are unattempted. That's the §10.2 partial contract:
+		// missing = paths NOT YET ATTEMPTED at cancellation.
+		//
+		// Parent adoptionCtx cancellation (Canceled, not DeadlineExceeded)
+		// is Phase 2 §9.5 shutdown semantics — abandon silently so the
+		// caller's CommitAdoption fails naturally under the same cancelled
+		// adoptionCtx.
 		if err := prefetchCtx.Err(); err != nil {
+			stats.unattempted = stats.hotCount - i
 			if errors.Is(err, context.DeadlineExceeded) {
-				stats.unattempted = stats.hotCount - i
 				missing := make([]string, 0, stats.unattempted)
 				for _, e := range hotSet[i:] {
 					missing = append(missing, e.path)
@@ -127,18 +135,24 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 			})
 			stats.fetched++
 		case hotFetchFailed:
+			// Includes both retry-exhaustion AND in-flight-at-budget
+			// cancellation per SPEC3 §12.3 variant 1/3 contract: "the
+			// hung fetch was attempted but cancelled when prefetchCtx
+			// hit the budget" maps to failed (deb_failed log already
+			// emitted by fetchHotDeb).
 			stats.failed++
 		case hotFetchMismatch:
 			stats.mismatched++
 		case hotFetchCancelled:
-			// fetchHotDeb returns hotFetchCancelled when prefetchCtx
-			// itself is done. Distinguish budget elapse (DeadlineExceeded
-			// on the prefetch context) from parent adoptionCtx
-			// cancellation (SIGTERM / scheduler LifetimeCtx propagating
-			// through). SPEC3 §10.2: adoption_hot_prefetch_partial fires
-			// ONLY on budget elapse; on parent cancellation we abandon
-			// silently and the caller's CommitAdoption will fail
-			// naturally under the same cancelled adoptionCtx.
+			// fetchHotDeb returns hotFetchCancelled in two narrow
+			// cases: parent adoptionCtx cancelled (Canceled) or
+			// hostSem.Acquire raced with the budget firing
+			// (DeadlineExceeded before any fetch was initiated).
+			// SPEC3 §10.2: adoption_hot_prefetch_partial fires ONLY on
+			// budget elapse — but here entry i was never actually
+			// fetched, so partial includes it (hotSet[i:]). Parent
+			// shutdown abandons silently; the caller's CommitAdoption
+			// will fail naturally under the same cancelled adoptionCtx.
 			stats.unattempted = stats.hotCount - i
 			if errors.Is(prefetchCtx.Err(), context.DeadlineExceeded) {
 				missing := make([]string, 0, stats.unattempted)
@@ -218,15 +232,32 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 
 	res, err := a.fetcher.Fetch(ctx, target, w)
 	if err != nil {
-		// Disambiguate prefetch-context cancellation from upstream
-		// failure. SPEC3 §7.5: budget elapse cancels prefetchCtx, and
-		// only that case should be reported as "cancelled" (which the
-		// caller then maps onto adoption_hot_prefetch_partial). The
-		// fetch.Client also surfaces its internal total_timeout as
-		// context.DeadlineExceeded under some flag combinations, but
-		// without the prefetchCtx itself being done — those are
-		// genuine per-deb retry-exhaustion failures, not budget-elapse.
-		// Predicate: the outer ctx must be the one that's done.
+		// Three-way disambiguation:
+		//   - ctx.Err() == DeadlineExceeded: budget elapse with this
+		//     deb in flight. SPEC3 §12.3 variant 1: "the hung fetch
+		//     was attempted but cancelled when prefetchCtx hit the
+		//     budget" → log hot_prefetch_deb_failed (with the wrapped
+		//     context-cancellation error) and bucket as failed. The
+		//     subsequent loop iteration's top check sees prefetchCtx
+		//     done and emits the once-fires partial event with paths
+		//     strictly AFTER this one.
+		//   - ctx.Err() == Canceled (non-deadline): parent adoptionCtx
+		//     was cancelled (SIGTERM / scheduler shutdown). Phase 2
+		//     §9.5 semantics: abandon silently with no per-deb log.
+		//   - ctx.Err() == nil: genuine upstream failure (retries
+		//     exhausted, transport error, etc.). The fetch.Client's
+		//     internal total_timeout surfaces here too — the outer
+		//     prefetchCtx is still alive, so this is bucketed as a
+		//     real per-deb retry-exhaustion failure.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			a.logger.Warn("hot_prefetch_deb_failed",
+				"canonical_host", suite.CanonicalHost,
+				"path", entry.path,
+				"snapshot_id", snapshotID,
+				"err", err,
+			)
+			return "", hotFetchFailed
+		}
 		if ctx.Err() != nil {
 			return "", hotFetchCancelled
 		}

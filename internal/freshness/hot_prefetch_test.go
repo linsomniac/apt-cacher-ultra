@@ -29,16 +29,17 @@ func sha256OfBytes(b []byte) string {
 // warm. The Adopter's fakeFetcher is exposed so each test can shape
 // its per-deb success / failure / hash-mismatch / hang behavior.
 type hotPrefetchFixture struct {
-	t              *testing.T
-	cache          *cache.Cache
-	adopter        *Adopter
-	fetcher        *hotFakeFetcher
-	suite          SuiteRef
-	priorSnapshot  int64
-	candidate      int64
-	debDeclared    string // sha256 of the deb the candidate vouches for
-	debUpstreamURL string
-	debPath        string
+	t                       *testing.T
+	cache                   *cache.Cache
+	adopter                 *Adopter
+	fetcher                 *hotFakeFetcher
+	suite                   SuiteRef
+	priorSnapshot           int64
+	candidate               int64
+	debDeclared             string // sha256 of the deb the candidate vouches for
+	debUpstreamURL          string
+	debPath                 string
+	candidatePackageHashes  []cache.PackageHash // passed to runHotPrefetch (Stage 2 in-memory)
 }
 
 func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixture {
@@ -153,32 +154,33 @@ func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixtu
 	// time. The candidate's snapshot_id is what runHotPrefetch
 	// uses for the Stage 2 lookup; the actual flip is irrelevant
 	// to the prefetch loop's behavior.
+	candPHs := []cache.PackageHash{{
+		CanonicalScheme: suite.CanonicalScheme,
+		CanonicalHost:   suite.CanonicalHost,
+		Path:            debP,
+		DeclaredSHA256:  newDebHash,
+		SnapshotID:      candidateID,
+		PackageName:     "hello",
+		Architecture:    "amd64",
+	}}
 	if err := c.CommitAdoption(context.Background(), candidateID,
 		[]cache.SnapshotMember{{SnapshotID: candidateID, Path: "InRelease", BlobHash: candidateRelease, DeclaredSHA256: candidateRelease}},
-		[]cache.PackageHash{{
-			CanonicalScheme: suite.CanonicalScheme,
-			CanonicalHost:   suite.CanonicalHost,
-			Path:            debP,
-			DeclaredSHA256:  newDebHash,
-			SnapshotID:      candidateID,
-			PackageName:     "hello",
-			Architecture:    "amd64",
-		}},
-		nil, true); err != nil {
+		candPHs, nil, true); err != nil {
 		t.Fatalf("commit candidate (test fixture): %v", err)
 	}
 
 	return &hotPrefetchFixture{
-		t:              t,
-		cache:          c,
-		adopter:        ad,
-		fetcher:        ff,
-		suite:          suite,
-		priorSnapshot:  priorID,
-		candidate:      candidateID,
-		debDeclared:    newDebHash,
-		debUpstreamURL: "http://archive.example" + debP,
-		debPath:        debP,
+		t:                      t,
+		cache:                  c,
+		adopter:                ad,
+		fetcher:                ff,
+		suite:                  suite,
+		priorSnapshot:          priorID,
+		candidate:              candidateID,
+		debDeclared:            newDebHash,
+		debUpstreamURL:         "http://archive.example" + debP,
+		debPath:                debP,
+		candidatePackageHashes: candPHs,
 	}
 }
 
@@ -189,7 +191,7 @@ func TestRunHotPrefetch_Success(t *testing.T) {
 	newDebBytes := []byte("new deb bytes v2")
 	f.fetcher.setBody(f.debUpstreamURL, newDebBytes)
 
-	rows, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate)
+	rows, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes)
 	if stats.hotCount != 1 {
 		t.Fatalf("hotCount=%d, want 1", stats.hotCount)
 	}
@@ -213,7 +215,7 @@ func TestRunHotPrefetch_RetryExhausted(t *testing.T) {
 	f := newHotPrefetchFixture(t, 5*time.Second)
 	f.fetcher.setError(f.debUpstreamURL, errors.New("simulated upstream 502"))
 
-	_, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate)
+	_, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes)
 	if stats.failed != 1 || stats.fetched != 0 || stats.mismatched != 0 || stats.unattempted != 0 {
 		t.Errorf("buckets fetched=%d failed=%d mismatched=%d unattempted=%d, want 0/1/0/0",
 			stats.fetched, stats.failed, stats.mismatched, stats.unattempted)
@@ -229,7 +231,7 @@ func TestRunHotPrefetch_HashMismatch(t *testing.T) {
 	wrongBytes := []byte("hostile upstream sent these bytes instead")
 	f.fetcher.setBody(f.debUpstreamURL, wrongBytes)
 
-	rows, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate)
+	rows, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes)
 	if stats.mismatched != 1 || stats.fetched != 0 || stats.failed != 0 {
 		t.Errorf("buckets fetched=%d failed=%d mismatched=%d unattempted=%d, want 0/0/1/0",
 			stats.fetched, stats.failed, stats.mismatched, stats.unattempted)
@@ -246,24 +248,24 @@ func TestRunHotPrefetch_HashMismatch(t *testing.T) {
 }
 
 // TestRunHotPrefetch_BudgetElapsed: the prefetch wall-clock budget
-// elapses while a fetch is in flight. SPEC3 §7.5.5: emits
-// adoption_hot_prefetch_partial with the unattempted-paths list;
-// stats.unattempted = remaining count. Verified via budget=10ms with
-// a fetcher that blocks past the budget.
+// elapses while a fetch is in flight. SPEC3 §12.3 variant 1 contract:
+// "the hung fetch was attempted but cancelled when prefetchCtx hit
+// the budget" — bucket as failed (with hot_prefetch_deb_failed log),
+// NOT unattempted. With N=1 hot deb and the only entry hung, the
+// loop logs deb_failed for that path, increments stats.failed, and
+// the loop ends naturally (no further iterations) so partial does
+// NOT fire (queue empty at next top-of-iteration check, same shape
+// as the §12.3 hung-LAST variant 3 contract).
 func TestRunHotPrefetch_BudgetElapsed(t *testing.T) {
 	f := newHotPrefetchFixture(t, 50*time.Millisecond)
 	// Block the fetch past the budget. The fetch returns when ctx
 	// cancellation propagates (real fetch.Client does the same).
 	f.fetcher.setBlocking(f.debUpstreamURL, 5*time.Second)
 
-	_, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate)
-	// When the in-flight fetch is cancelled, runHotPrefetch reports
-	// unattempted = remaining hot_count, which is 1 (the budget
-	// caught us mid-fetch on the only entry). The fetcher's hang
-	// means ctx.Err() == DeadlineExceeded and the partial path runs.
-	if stats.unattempted != 1 {
-		t.Errorf("unattempted=%d, want 1 (budget elapse must reclaim the in-flight entry)",
-			stats.unattempted)
+	_, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes)
+	if stats.failed != 1 || stats.fetched != 0 || stats.mismatched != 0 || stats.unattempted != 0 {
+		t.Errorf("buckets fetched=%d failed=%d mismatched=%d unattempted=%d, want 0/1/0/0",
+			stats.fetched, stats.failed, stats.mismatched, stats.unattempted)
 	}
 }
 
@@ -283,7 +285,7 @@ func TestRunHotPrefetch_ParentCancelled(t *testing.T) {
 		cancel()
 	}()
 	defer cancel()
-	rows, stats := f.adopter.runHotPrefetch(parentCtx, f.suite, f.candidate)
+	rows, stats := f.adopter.runHotPrefetch(parentCtx, f.suite, f.candidate, f.candidatePackageHashes)
 	// We don't assert on log emission directly here (no log
 	// recorder hooked up in this fixture); we assert the contract
 	// shape: a parent-cancelled run still bucket-counts the
@@ -314,7 +316,7 @@ func TestRunHotPrefetch_EmptyHotSet(t *testing.T) {
 			CanonicalHost:   "archive.example",
 			SuitePath:       "/dists/cold",
 		},
-		f.candidate)
+		f.candidate, f.candidatePackageHashes)
 	if stats.hotCount != 0 {
 		t.Errorf("hotCount=%d, want 0", stats.hotCount)
 	}

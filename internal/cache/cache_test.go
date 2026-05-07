@@ -2542,19 +2542,22 @@ func TestComputeHotSet_TwoStageMatch(t *testing.T) {
 
 	// Adopt the new snapshot. It carries the NEW path with the SAME
 	// (Package, Arch). The hot-set query should resolve the old hot
-	// pair to the new path.
+	// pair to the new path. Build the candidate's PackageHash rows
+	// once and reuse for both CommitAdoption and ComputeHotSet —
+	// since SPEC3's runHotPrefetch precedes CommitAdoption, the
+	// candidate's rows are passed in memory rather than queried.
+	candPHs := []PackageHash{{
+		CanonicalScheme: scheme, CanonicalHost: host, Path: pathNew,
+		DeclaredSHA256: debHashNew, SnapshotID: idNew,
+		PackageName: "nginx", Architecture: "amd64",
+	}}
 	if err := c.CommitAdoption(ctx, idNew,
 		[]SnapshotMember{{SnapshotID: idNew, Path: "InRelease", BlobHash: rNew, DeclaredSHA256: rNew}},
-		[]PackageHash{{
-			CanonicalScheme: scheme, CanonicalHost: host, Path: pathNew,
-			DeclaredSHA256: debHashNew, SnapshotID: idNew,
-			PackageName: "nginx", Architecture: "amd64",
-		}},
-		nil, true); err != nil {
+		candPHs, nil, true); err != nil {
 		t.Fatalf("commit new: %v", err)
 	}
 
-	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, 86400, now)
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, candPHs, 86400, now)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
@@ -2612,13 +2615,19 @@ func TestComputeHotSet_ExcludesPreV3Rows(t *testing.T) {
 		[]SnapshotMember{{SnapshotID: idNew, Path: "InRelease", BlobHash: rNew, DeclaredSHA256: rNew}},
 		nil, nil, false)
 
-	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, 86400, now)
+	// Candidate is empty (idNew committed with nil package hashes —
+	// upstream removed the pre-v3 entry too). Even if the candidate
+	// somehow had a v3 row for the same path, Stage 1's <> ''
+	// predicate filters out the prior's pre-v3 rows so no Stage 2
+	// lookup ever runs.
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, nil, 86400, now)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
 	if len(got) != 0 {
 		t.Errorf("got %d entries; want 0 (pre-v3 rows must be excluded)", len(got))
 	}
+	_ = idNew // referenced earlier; idNew is now used only for the candidate commit
 }
 
 // TestComputeHotSet_DroppedPackageNotInCandidate: a hot pair whose
@@ -2664,20 +2673,23 @@ func TestComputeHotSet_DroppedPackageNotInCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, 86400, now)
+	// Candidate's in-memory PackageHash slice is empty (upstream
+	// dropped the package). Stage 2 lookup misses → drop from hot set.
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, nil, 86400, now)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
 	if len(got) != 0 {
 		t.Errorf("got %d entries; want 0 (package was removed in candidate)", len(got))
 	}
+	_ = idNew
 }
 
 // TestComputeHotSet_WindowZeroReturnsEmpty: hot_packages.window = 0
 // disables prefetch entirely (SPEC3 §5.1).
 func TestComputeHotSet_WindowZeroReturnsEmpty(t *testing.T) {
 	c := openCache(t)
-	got, err := c.ComputeHotSet(context.Background(), "http", "x", 1, 2, 0, 100)
+	got, err := c.ComputeHotSet(context.Background(), "http", "x", 1, nil, 0, 100)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
@@ -2691,7 +2703,7 @@ func TestComputeHotSet_WindowZeroReturnsEmpty(t *testing.T) {
 // "no prior current_snapshot_id for this suite" → empty hot set.
 func TestComputeHotSet_PriorIDZeroReturnsEmpty(t *testing.T) {
 	c := openCache(t)
-	got, err := c.ComputeHotSet(context.Background(), "http", "x", 0, 1, 86400, 100)
+	got, err := c.ComputeHotSet(context.Background(), "http", "x", 0, nil, 86400, 100)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}

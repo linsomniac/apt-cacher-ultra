@@ -494,8 +494,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// loop. The result list (prefetchedURLPaths) feeds CommitAdoption
 	// so its url_path inserts happen inside the same transaction that
 	// flips current_snapshot_id — readers never observe a warmed deb's
-	// url_path while the prior snapshot is still current.
-	prefetchedURLPaths, hotStats := a.runHotPrefetch(ctx, suite, snapshotID)
+	// url_path while the prior snapshot is still current. The
+	// candidate's package_hash rows are passed in memory because the
+	// flip transaction below is what inserts them — Stage 2 of the
+	// hot-set computation cannot rely on them being DB-visible yet.
+	prefetchedURLPaths, hotStats := a.runHotPrefetch(ctx, suite, snapshotID, packageHashes)
 
 	// Step 11: atomic flip transaction. Pass adoptionCtx as ctx so the
 	// budget-cancelled prefetch loop above never causes CommitAdoption
