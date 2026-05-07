@@ -22,10 +22,10 @@ import (
 //
 // Clock manipulation:
 //   - Tests do not stub cache.nowUnix (it's package-private).
-//   - Instead they fast-forward refcount_zeroed_at and heartbeat_at
-//     by direct UPDATE on the cache file, which is safe between
-//     submitWrite-bracketed operations because the writer is idle
-//     after the prior op returns.
+//   - Instead they fast-forward refcount_zeroed_at by direct UPDATE
+//     on the cache file, which is safe between submitWrite-bracketed
+//     operations because the writer is idle after the prior op
+//     returns.
 
 // putPoolBlob writes content into the cache's pool/, returns its
 // hash, and registers it via PutBlob so the row exists at refcount=0
@@ -83,8 +83,9 @@ func adoptSnapshot(t *testing.T, c *cache.Cache, scheme, host, suite, inreleaseH
 	return id
 }
 
-// blobRefcount returns refcount and refcount_zeroed_at (-1 sentinel
-// for NULL) for a blob row. Helper for end-to-end assertions.
+// blobRefcount returns (refcount, refcount_zeroed_at) for a blob row.
+// The sql.NullInt64 carries the NULL distinction directly. Helper for
+// end-to-end assertions.
 func blobRefcount(t *testing.T, db *sql.DB, hash string) (int64, sql.NullInt64) {
 	t.Helper()
 	var refcount int64
@@ -223,12 +224,15 @@ func TestGCEndToEnd_DisplacedSnapshot_DeadBlobReaped(t *testing.T) {
 		t.Fatalf("runTick: %v", err)
 	}
 
-	// Step 6 assertions.
-	if res.displacedReaped < 1 {
-		t.Errorf("displacedReaped = %d, want >= 1 (S1 should reap)", res.displacedReaped)
+	// Step 6 assertions. Exact counts: only S1 should reap (S2 is
+	// current); only B2 and inrel1 should reap. B1 is hot (refcount=1),
+	// B3 is current (refcount=1), inrel2 is anchored by S2's
+	// suite_snapshot.inrelease_hash AND fresh zeroed_at.
+	if res.displacedReaped != 1 {
+		t.Errorf("displacedReaped = %d, want 1 (only S1 should reap)", res.displacedReaped)
 	}
-	if res.blobsReaped < 1 {
-		t.Errorf("blobsReaped = %d, want >= 1 (B2 should reap)", res.blobsReaped)
+	if res.blobsReaped != 2 {
+		t.Errorf("blobsReaped = %d, want 2 (B2 + inrel1 should reap)", res.blobsReaped)
 	}
 	if snapshotRowExists(t, db, s1) {
 		t.Errorf("S1 snapshot row %d still present after GC tick", s1)
