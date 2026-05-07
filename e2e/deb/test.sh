@@ -596,7 +596,8 @@ echo "[deb-test] phase 3 (detached adoption smoke) PASS"
 #      → V2 adoption commits. This is the FIRST adoption
 #      (prior_snapshot_id was NULL → hot_count=0).
 #   4. GET the V2 .deb so url_path.last_requested_at on
-#      hello-acu_2.0_amd64.deb is recorded — that's the (Package,
+#      hello-acu_1.1_amd64.deb is recorded (V1=1.0, V2=1.1 per the
+#      Dockerfile's repo-build VER args) — that's the (Package,
 #      Arch) signal SPEC3 §7.5.3 Stage 1 mines on the next
 #      adoption.
 #   5. Swap nginx webroot back to V1. Drive a third InRelease GET.

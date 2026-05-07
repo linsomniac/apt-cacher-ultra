@@ -1156,6 +1156,12 @@ func (h *Handler) respondRecoveryError(w http.ResponseWriter, r *http.Request, r
 // adopted suite. Metadata on non-adopted suites is the Phase 1 trust-
 // upstream path with no snapshot to validate against.
 func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
+	release, err := h.sem.Acquire(ctx, req.CanonicalHost)
+	if err != nil {
+		return sfResult{err: fmt.Errorf("handler: acquire host slot: %w", err)}
+	}
+	defer release()
+
 	// Pre-fetch bandwidth optimization: refuse the conflict case
 	// (≥ 2 distinct declared hashes) without contacting upstream — no
 	// observed bytes can resolve a snapshot-level conflict, and the
@@ -1168,13 +1174,14 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 	// consumes upstream bandwidth). The §6.1 hit-path predicate is in
 	// checkPackageHash; this is its miss-path twin.
 	//
-	// AIDEV-NOTE: this gate runs BEFORE h.sem.Acquire on purpose. SPEC3
-	// §6.1/§6.2 promise an "upfront" decision before fetch initiation.
-	// Running under the per-host semaphore would let an unvouched-deb
-	// refusal block behind unrelated upstream work when the host is
-	// saturated, even though the decision is a pair of indexed SQLite
-	// reads. Singleflight coalesce semantics are preserved — waiters
-	// get the same sfResult{err} the leader returns here.
+	// AIDEV-NOTE: this gate runs AFTER h.sem.Acquire and BEFORE the
+	// h.fetch.Fetch call below. SPEC3 §6.1/§6.2's "upfront" / "before
+	// fetch initiation" contract is about the upstream HTTP fetch, not
+	// about all concurrency control — placing the gate here keeps the
+	// per-host semaphore as the DoS boundary on concurrent SQLite
+	// reads from many distinct .deb misses on one allowed host. A
+	// strict-mode refusal that has to wait for a host slot is fine:
+	// strict mode is opt-in and the 502 carries Retry-After: 60.
 	if !req.IsMetadata {
 		rows, derr := h.cache.DeclaredHashesForPath(ctx,
 			req.CanonicalScheme, req.CanonicalHost, req.Path)
@@ -1213,12 +1220,6 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 		// log instead, with one line per failed validation rather
 		// than two.
 	}
-
-	release, err := h.sem.Acquire(ctx, req.CanonicalHost)
-	if err != nil {
-		return sfResult{err: fmt.Errorf("handler: acquire host slot: %w", err)}
-	}
-	defer release()
 
 	bw, err := h.cache.NewTempBlob()
 	if err != nil {
