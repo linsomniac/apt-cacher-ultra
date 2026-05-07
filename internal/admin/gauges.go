@@ -172,8 +172,15 @@ func (p *processGauges) storePriorCPU(v float64) {
 // newProcessGauges declares the §10.4.7 process metrics on the
 // given registry. Caps are unbounded: each metric has exactly one
 // series (the process itself).
+//
+// AIDEV-NOTE: the cpu counter is primed with Add(0) so its single
+// series is materialized BEFORE the first refreshProcessMetrics
+// runs. Without this, a scrape that happens between New() and the
+// first refresh — or on non-Linux where readProcStats returns 0
+// and the delta>0 guard skips Add — would render HELP/TYPE without
+// a sample, which some Prometheus client tooling rejects.
 func newProcessGauges(r *metrics.Registry) *processGauges {
-	return &processGauges{
+	pg := &processGauges{
 		cpuSecondsTotal: metrics.NewCounterWithCapIn(r,
 			"process_cpu_seconds_total",
 			"Total CPU time (user+system) consumed by the process.",
@@ -195,4 +202,6 @@ func newProcessGauges(r *metrics.Registry) *processGauges {
 			"Soft limit on open file descriptors (RLIMIT_NOFILE).",
 			0),
 	}
+	pg.cpuSecondsTotal.Add(0)
+	return pg
 }

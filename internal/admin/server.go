@@ -98,9 +98,13 @@ type Server struct {
 	refresherCancel context.CancelFunc
 
 	// poolScanInProgress is the §9.7.6 "refresh in progress" guard
-	// for the du-style pool/ walk. Skipped if the prior walk has
-	// not finished by the time the next interval fires.
+	// for the du-style pool/ walk. The walk runs in its own
+	// goroutine (so a slow filesystem does not block the cheap
+	// gauges from updating); CAS=false means a walk goroutine is
+	// already running and this tick skips spawning a new one.
+	// Tracked by walkWg so Shutdown waits for the walk to drain.
 	poolScanInProgress atomic.Bool
+	walkWg             sync.WaitGroup
 
 	// gauges owns every refresher-recomputed metric. Set once in
 	// New(); the refresher goroutine reads/writes these without
@@ -207,7 +211,15 @@ func (s *Server) buildHandler() http.Handler {
 // Returns nil on graceful shutdown (http.ErrServerClosed); any
 // other listener error is returned. cmd is responsible for bind
 // (net.Listen); Serve owns the Accept loop.
+//
+// SPEC5 §3.2 / §9.7.6: the first gauge refresh runs synchronously
+// BEFORE the HTTP server begins accepting requests, so the very
+// first /metrics scrape sees populated values rather than the
+// zero-state of every gauge. The pool walk is exempt: it spawns a
+// goroutine even on the first call (a multi-GiB cache can take
+// seconds, and SPEC5 §9.7.6 explicitly handles overrun async).
 func (s *Server) Serve(ln net.Listener) error {
+	s.runRefreshOnce(context.Background())
 	s.startRefresher()
 	if err := s.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -249,6 +261,20 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	// Wait for any in-flight pool walk goroutine to drain. The walk
+	// inherits lifecycleCtx (cancelled above) so filepath.Walk
+	// returns early; this just synchronizes the goroutine's exit
+	// with Shutdown's return.
+	walkDone := make(chan struct{})
+	go func() {
+		s.walkWg.Wait()
+		close(walkDone)
+	}()
+	select {
+	case <-walkDone:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	return nil
 }

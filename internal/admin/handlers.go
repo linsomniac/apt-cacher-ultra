@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -122,9 +123,9 @@ func wantsJSON(r *http.Request) bool {
 }
 
 // startRefresher launches the SPEC5 §9.7.6 refresher goroutine.
-// Immediate first recompute (so the first /metrics scrape after
-// startup sees populated values), then loops at admin.gauge_refresh
-// cadence until refresherStop is closed.
+// The caller (Serve) is responsible for running the FIRST refresh
+// synchronously before this returns — startRefresher only handles
+// the periodic-tick loop.
 //
 // The goroutine inherits a per-server context.Context that
 // Shutdown cancels via refresherCancel; in-flight queries unblock
@@ -146,7 +147,6 @@ func (s *Server) startRefresher() {
 	period := s.cfg.Admin.GaugeRefresh.Duration
 	go func() {
 		defer close(done)
-		s.runRefreshOnce(ctx)
 		t := time.NewTicker(period)
 		defer t.Stop()
 		for {
@@ -265,27 +265,42 @@ func (s *Server) refreshHostsemGauges() {
 	}
 }
 
-// refreshPoolDiskBytes walks pool/ summing info.Size() and updates
-// acu_pool_disk_bytes. Single-threaded — the parallel path is the
-// SPEC4 §9.6.4 startup scan, not a metrics scrape.
+// refreshPoolDiskBytes spawns the SPEC5 §9.7.6 pool walk goroutine
+// (or skips, if a prior walk is still running). The walk runs OFF
+// the refresher loop's goroutine — a multi-GiB cache can take
+// seconds to walk, and the SPEC's "other queries proceed normally"
+// guarantee requires the cheap DB queries not to block on it.
 //
-// SPEC5 §9.7.6 "refresh in progress" guard: if the prior walk has
-// not finished by the time the next interval fires, this iteration
-// is skipped (other gauges still update). CompareAndSwap returns
-// false when another walk is in progress.
-func (s *Server) refreshPoolDiskBytes(parent context.Context) {
+// The walk uses CompareAndSwap as the single-walk guard (SPEC's
+// "skip the next interval rather than starting a parallel walk")
+// and is tracked by walkWg so Shutdown waits for it to drain.
+//
+// AIDEV-NOTE: do NOT pass parent's context.WithTimeout-wrapped ctx
+// here — the walk needs the lifecycleCtx that Shutdown cancels.
+// The 10s per-query deadline is irrelevant for the walk: a
+// multi-GiB filesystem walk can legitimately exceed 10s, and
+// SPEC5 §9.7.6 explicitly handles overrun via the in-progress
+// guard, not a deadline.
+func (s *Server) refreshPoolDiskBytes(lifecycleCtx context.Context) {
 	if !s.poolScanInProgress.CompareAndSwap(false, true) {
 		return
 	}
-	defer s.poolScanInProgress.Store(false)
+	s.walkWg.Add(1)
+	go func() {
+		defer s.walkWg.Done()
+		defer s.poolScanInProgress.Store(false)
+		s.runPoolWalk(lifecycleCtx)
+	}()
+}
 
+// runPoolWalk performs the actual filepath.Walk and sets the gauge.
+// Separated from refreshPoolDiskBytes for testability and to keep
+// the spawn site small.
+func (s *Server) runPoolWalk(ctx context.Context) {
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-	defer cancel()
-
 	poolDir := filepath.Join(s.cfg.Cache.Dir(), "pool")
 	var total int64
-	err := filepath.Walk(poolDir, func(path string, info os.FileInfo, walkErr error) error {
+	err := filepath.Walk(poolDir, func(_ string, info os.FileInfo, walkErr error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -306,8 +321,8 @@ func (s *Server) refreshPoolDiskBytes(parent context.Context) {
 	if err != nil {
 		// Missing pool/ pre-Open is the normal case during the
 		// startup window between admin Serve and cache.Open. Don't
-		// log noisily.
-		if os.IsNotExist(err) {
+		// log noisily. Same for ctx.Canceled during shutdown.
+		if os.IsNotExist(err) || errors.Is(err, context.Canceled) {
 			return
 		}
 		s.logRefresherFailure("acu_pool_disk_bytes", err, time.Since(start))

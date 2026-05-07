@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"bytes"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -288,7 +289,7 @@ func TestGauge_SeriesCap(t *testing.T) {
 
 	g.Set(1, "a")
 	g.Set(2, "b")
-	g.Set(3, "c") // dropped
+	g.Set(3, "c")  // dropped
 	g.Set(99, "a") // existing series keeps updating
 
 	var buf bytes.Buffer
@@ -309,20 +310,20 @@ func TestGauge_SeriesCap(t *testing.T) {
 // TestGauge_ResetClearsCapLog verifies that Reset re-enables the
 // one-shot cap-reached log so a refresher-driven gauge can flag a
 // fresh cap event after the refresher dropped its old series.
-func TestGauge_ResetClearsCapLog(t *testing.T) {
+// TestGauge_ResetSwapsSeriesAndKeepsCap verifies that Reset clears
+// the prior series map and that the cap is still enforced against
+// the new series set. (The cap-warning's once-per-process semantic
+// is locked in by TestGauge_CapWarningStaysOneShotAcrossResets.)
+func TestGauge_ResetSwapsSeriesAndKeepsCap(t *testing.T) {
 	r := freshReg(t)
 	g := NewGaugeWithCapIn(r, "test_value", "h", 1, "host")
 
 	g.Set(1, "a")
-	g.Set(2, "b") // dropped, capLogged set
+	g.Set(2, "b") // dropped, cap reached
 	g.Reset()
 
 	g.Set(3, "c")
-	g.Set(4, "d") // dropped — but if Reset cleared capLogged, this
-	              // should re-fire the cap-log path internally.
-	// We can't easily assert the slog output here; what we CAN
-	// assert is that Reset cleared the series map, capLogged
-	// permits a fresh dropped-tuple, and only one series remains.
+	g.Set(4, "d") // dropped — cap still enforced after Reset
 	var buf bytes.Buffer
 	r.Render(&buf)
 	got := buf.String()
@@ -333,6 +334,34 @@ func TestGauge_ResetClearsCapLog(t *testing.T) {
 		strings.Contains(got, `test_value{host="b"}`) ||
 		strings.Contains(got, `test_value{host="d"}`) {
 		t.Errorf("only c should remain, got:\n%s", got)
+	}
+}
+
+// TestGauge_CapWarningStaysOneShotAcrossResets confirms that
+// Reset preserves the cap-logged guard so an upstream that
+// continuously exceeds the cap does not spam metrics_series_cap_reached
+// every refresh tick. SPEC5 §10.2: the warn is once-per-process.
+func TestGauge_CapWarningStaysOneShotAcrossResets(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	r := freshReg(t)
+	g := NewGaugeWithCapIn(r, "test_value", "h", 1, "host")
+
+	g.Set(1, "a")
+	g.Set(2, "b") // dropped → first cap-warn fires
+	g.Reset()
+
+	g.Set(3, "c")
+	g.Set(4, "d") // dropped → second cap-warn must NOT fire after Reset
+
+	got := buf.String()
+	count := strings.Count(got, "metrics_series_cap_reached")
+	if count != 1 {
+		t.Errorf("metrics_series_cap_reached fired %d times, want exactly 1; log:\n%s",
+			count, got)
 	}
 }
 

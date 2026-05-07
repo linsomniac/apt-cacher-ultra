@@ -3,9 +3,18 @@ package admin
 import (
 	"context"
 	"io"
+	"log/slog"
+	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/config"
+	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
+	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 )
 
 // TestRefresher_PopulatesCacheGaugesOnStartup confirms the §9.7.6
@@ -151,6 +160,40 @@ func TestRefresher_ProcessCPUCounterAppears(t *testing.T) {
 	t.Errorf("process_cpu_seconds_total counter not visible within deadline")
 }
 
+// TestRefresher_ProcessCPUCounterRendersSample asserts the
+// process_cpu_seconds_total counter renders an actual sample
+// line, not just HELP/TYPE. Codex finding: when CPU consumed is
+// 0 (boot, non-Linux), Counter.Add(0) is needed to materialize
+// the series. Without that primer, the metric appears as bare
+// HELP/TYPE which some Prometheus tooling rejects.
+func TestRefresher_ProcessCPUCounterRendersSample(t *testing.T) {
+	_, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	resp := mustGet(t, base+"/metrics")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	got := string(body)
+
+	if !strings.Contains(got, "# TYPE process_cpu_seconds_total counter") {
+		t.Errorf("missing TYPE line; body:\n%s", got)
+	}
+	// The series sample line begins with the metric name followed
+	// by a space (no labels). Match either "process_cpu_seconds_total 0"
+	// or any non-zero rendering.
+	lines := strings.Split(got, "\n")
+	sampleSeen := false
+	for _, ln := range lines {
+		if strings.HasPrefix(ln, "process_cpu_seconds_total ") {
+			sampleSeen = true
+			break
+		}
+	}
+	if !sampleSeen {
+		t.Errorf("process_cpu_seconds_total HELP/TYPE rendered with NO sample line — primer Add(0) missing?\nbody:\n%s", got)
+	}
+}
+
 // TestRefresher_HostsemGaugesAppearAfterAcquire validates the
 // §10.4.2 invariant: per-host gauges are populated from
 // hostsem.Snapshot, and a host that holds a slot has its inflight
@@ -178,6 +221,107 @@ func TestRefresher_HostsemGaugesAppearAfterAcquire(t *testing.T) {
 		time.Sleep(60 * time.Millisecond)
 	}
 	t.Errorf("per-host inflight=1 / capacity=8 not visible within deadline")
+}
+
+// TestRefresher_FirstScrapeSeesPopulatedGauges asserts the SPEC5
+// §3.2 invariant that the first /metrics scrape sees populated
+// values rather than the zero-state. Codex review found that the
+// prior implementation ran the first refresh in the goroutine,
+// racing with the HTTP server starting; the fix runs the first
+// refresh synchronously in Serve before listener accept.
+//
+// We seed two blobs BEFORE startAdminServer's Serve goroutine
+// runs, then immediately scrape. Because Serve runs runRefreshOnce
+// synchronously before server.Serve, the very first scrape must
+// observe acu_blobs_db_count=2 — no polling, no sleep.
+func TestRefresher_FirstScrapeSeesPopulatedGauges(t *testing.T) {
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	defer c.Close()
+	for _, body := range []string{"first", "second"} {
+		w, err := c.NewTempBlob()
+		if err != nil {
+			t.Fatalf("NewTempBlob: %v", err)
+		}
+		if _, err := w.Write([]byte(body)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		hash, err := w.Finalize(int64(len(body)))
+		if err != nil {
+			t.Fatalf("Finalize: %v", err)
+		}
+		if err := c.PutBlob(context.Background(), hash, int64(len(body))); err != nil {
+			t.Fatalf("PutBlob: %v", err)
+		}
+	}
+
+	g, err := gc.New(gc.Config{
+		Cache:               c,
+		Logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Enabled:             true,
+		Interval:            time.Hour,
+		BatchSize:           100,
+		SnapshotBatchSize:   10,
+		MaxTickDuration:     time.Minute,
+		BlobGrace:           time.Hour,
+		KeepDisplaced:       3,
+		PoolScanWorkers:     2,
+		HeartbeatStaleGrace: 30 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("gc.New: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	cfg := Config{
+		Cache:       c,
+		GC:          g,
+		HostLimiter: hostsem.New(8),
+		Ring:        observability.NewRing(50),
+		Registry:    metrics.NewRegistry(),
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Admin: config.AdminConfig{
+			Enabled:         true,
+			GaugeRefresh:    config.Duration{Duration: time.Hour}, // ensure only the synchronous first refresh fires
+			ReadTimeout:     config.Duration{Duration: 5 * time.Second},
+			IdleTimeout:     config.Duration{Duration: 30 * time.Second},
+			MetricSeriesCap: 1024,
+		},
+		StartTime: time.Now(),
+		AdminAddr: ln.Addr().String(),
+	}
+	s, err := New(cfg)
+	if err != nil {
+		_ = ln.Close()
+		t.Fatalf("admin.New: %v", err)
+	}
+	serveDone := make(chan struct{})
+	go func() {
+		_ = s.Serve(ln)
+		close(serveDone)
+	}()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+		<-serveDone
+	}()
+
+	// First scrape — no polling. With GaugeRefresh=1h, only the
+	// synchronous first refresh in Serve has run. If that refresh
+	// did NOT happen synchronously, this fails.
+	resp := mustGet(t, "http://"+cfg.AdminAddr+"/metrics")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "acu_blobs_db_count 2") {
+		t.Errorf("first scrape did not see acu_blobs_db_count=2 (synchronous first refresh broken);\nbody:\n%s", body)
+	}
 }
 
 // TestRefresher_RunRefreshOnceDirect drives runRefreshOnce

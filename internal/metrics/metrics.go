@@ -109,7 +109,7 @@ type Counter struct {
 	name      string
 	help      string
 	labels    []string
-	maxSeries int  // 0 = unbounded
+	maxSeries int // 0 = unbounded
 	mu        sync.Mutex
 	series    map[string]*counterSeries
 	capLogged bool // one-shot guard for metrics_series_cap_reached Warn
@@ -500,14 +500,19 @@ func (g *Gauge) Add(delta float64, labelValues ...string) {
 // AIDEV-NOTE: Reset is for refresher-driven gauges only. Do not call
 // from hot paths — race window between Reset and the next Set.
 //
-// Reset also clears the cap-logged guard so a future cap-reached
-// event can fire after the refresher has dropped stale series — the
-// previous cap-hit was relative to the prior series set, not the
-// new one.
+// Reset preserves the cap-logged guard so the
+// metrics_series_cap_reached Warn stays a per-process one-shot. An
+// earlier design cleared the guard on every Reset to allow re-firing
+// after the refresher dropped stale series, but that turned a one-shot
+// warning into one-per-refresh-cycle whenever an upstream consistently
+// exceeded the cap (e.g. malicious or buggy clients producing many
+// distinct hosts) — operator alerting on the warn would page every
+// gauge_refresh interval. Forcing the warning to fire-once accepts
+// that a transient cap-hit-then-cleared-then-exceeded-again is silent;
+// the cap-bounded behavior is unchanged in either case.
 func (g *Gauge) Reset() {
 	g.mu.Lock()
 	g.series = map[string]*gaugeSeries{}
-	g.capLogged = false
 	g.mu.Unlock()
 }
 
