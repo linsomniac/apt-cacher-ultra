@@ -841,3 +841,158 @@ hot_prefetch_budget = "-1s"
 		t.Errorf("got %v, want hot_prefetch_budget error", err)
 	}
 }
+
+// SPEC4 §12.1: gc.heartbeat_interval cross-key validation.
+
+func TestValidate_RejectsZeroHeartbeatInterval(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[gc]
+heartbeat_interval = "0s"
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "gc.heartbeat_interval must be > 0") {
+		t.Errorf("got %v, want gc.heartbeat_interval > 0 error", err)
+	}
+}
+
+// heartbeat_interval = 30m with upstream.total_timeout × max_retries = 5m
+// (so grace_effective = 30m floor) → rejected. The Validate cross-key
+// predicate compares with strict-less-than against grace_effective; the
+// 30m floor and the 30m heartbeat_interval are equal, so this triggers.
+func TestValidate_RejectsHeartbeatIntervalAtGraceFloor(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[upstream]
+total_timeout = "1m"
+max_retries = 5
+[gc]
+heartbeat_interval = "30m"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "gc.heartbeat_interval") ||
+		!strings.Contains(err.Error(), "strictly less than") {
+		t.Errorf("error %q does not name the cross-key violation", err)
+	}
+}
+
+// heartbeat_interval = 60s with default upstream config (total_timeout=5m,
+// max_retries=3 → derived 15m; grace_effective = max(15m, 30m) = 30m) →
+// 60s < 30m, accepted.
+func TestValidate_AcceptsHeartbeatIntervalUnderDefaultGrace(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[gc]
+heartbeat_interval = "60s"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.GC.HeartbeatInterval.Duration != 60*time.Second {
+		t.Errorf("heartbeat_interval = %s, want 60s", cfg.GC.HeartbeatInterval.Duration)
+	}
+}
+
+// SPEC4 §12.1: gc.blob_grace must reject sub-second values, not just
+// zero/negative — int64(d.Seconds()) silently truncates "500ms" to 0,
+// which would make refcount=0 blobs immediately reapable.
+func TestValidate_RejectsSubSecondBlobGrace(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[gc]
+blob_grace = "500ms"
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "gc.blob_grace must be >= 1s") {
+		t.Errorf("got %v, want gc.blob_grace >= 1s error", err)
+	}
+}
+
+func TestValidate_RejectsZeroBlobGrace(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[gc]
+blob_grace = "0s"
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "gc.blob_grace must be >= 1s") {
+		t.Errorf("got %v, want gc.blob_grace >= 1s error", err)
+	}
+}
+
+func TestValidate_RejectsZeroInterval(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[gc]
+interval = "0s"
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "gc.interval must be > 0") {
+		t.Errorf("got %v, want gc.interval > 0 error", err)
+	}
+}
+
+func TestValidate_RejectsZeroBatchSize(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[gc]
+batch_size = 0
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "gc.batch_size") {
+		t.Errorf("got %v, want gc.batch_size error", err)
+	}
+}
+
+func TestValidate_RejectsNegativeKeepDisplaced(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[gc]
+keep_displaced = -1
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "gc.keep_displaced") {
+		t.Errorf("got %v, want gc.keep_displaced error", err)
+	}
+}
+
+func TestHeartbeatStaleGraceEffective_FloorsAt30m(t *testing.T) {
+	// derived = 1s × 1 = 1s; grace_effective = max(1s, 30m) = 30m floor.
+	cfg := defaultConfig()
+	cfg.Upstream.TotalTimeout.Duration = 1 * time.Second
+	cfg.Upstream.MaxRetries = 1
+	if got := cfg.HeartbeatStaleGraceEffective(); got != 30*time.Minute {
+		t.Errorf("HeartbeatStaleGraceEffective = %s, want 30m floor", got)
+	}
+}
+
+func TestHeartbeatStaleGraceEffective_DerivedAboveFloor(t *testing.T) {
+	// derived = 30m × 5 = 150m; grace_effective = max(150m, 30m) = 150m.
+	cfg := defaultConfig()
+	cfg.Upstream.TotalTimeout.Duration = 30 * time.Minute
+	cfg.Upstream.MaxRetries = 5
+	want := 150 * time.Minute
+	if got := cfg.HeartbeatStaleGraceEffective(); got != want {
+		t.Errorf("HeartbeatStaleGraceEffective = %s, want %s", got, want)
+	}
+}

@@ -5,17 +5,21 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
@@ -1069,10 +1073,10 @@ func TestAdopter_PackageHash_GzipDecompressionWorks(t *testing.T) {
 
 func TestRepoRootFromSuitePath(t *testing.T) {
 	cases := []struct {
-		in       string
-		want     string
-		wantOk   bool
-		descrip  string
+		in      string
+		want    string
+		wantOk  bool
+		descrip string
 	}{
 		{"/ubuntu/dists/noble", "/ubuntu/", true, "ubuntu standard"},
 		{"/debian/dists/bookworm-updates", "/debian/", true, "debian-updates"},
@@ -1098,7 +1102,7 @@ func TestIsPackagesMember(t *testing.T) {
 	}{
 		{"main/binary-amd64/Packages", true},
 		{"main/binary-amd64/Packages.gz", true},
-		{"main/binary-amd64/Packages.xz", true}, // SPEC3 §7.5.2: xz now supported
+		{"main/binary-amd64/Packages.xz", true},   // SPEC3 §7.5.2: xz now supported
 		{"main/binary-amd64/Packages.bz2", false}, // bz2 still unsupported
 		{"main/binary-amd64/Sources", false},
 		{"main/source/Sources", false},
@@ -1191,3 +1195,215 @@ func TestBuildMemberURL(t *testing.T) {
 	}
 }
 
+// SPEC4 §12.1: blobHeartbeatTracker is a small mutex-guarded slice; its
+// Add/Snapshot semantics are critical to the §7.5.2 heartbeat correctness.
+
+func TestBlobHeartbeatTracker_AddAndSnapshot(t *testing.T) {
+	tr := &blobHeartbeatTracker{}
+	if got := tr.Snapshot(); got != nil {
+		t.Errorf("empty tracker Snapshot = %v, want nil", got)
+	}
+	tr.Add("aa")
+	tr.Add("bb")
+	tr.Add("") // empty hashes are ignored — Add no-ops
+	tr.Add("cc")
+	got := tr.Snapshot()
+	if len(got) != 3 {
+		t.Errorf("len = %d, want 3 (empty add must not be tracked)", len(got))
+	}
+	want := []string{"aa", "bb", "cc"}
+	for i, h := range want {
+		if got[i] != h {
+			t.Errorf("got[%d] = %q, want %q", i, got[i], h)
+		}
+	}
+
+	// Snapshot must be a copy: mutating it must not affect subsequent
+	// Snapshots.
+	got[0] = "MUTATED"
+	got2 := tr.Snapshot()
+	if got2[0] != "aa" {
+		t.Errorf("Snapshot returned an aliased slice; mutating one slot affected the next Snapshot")
+	}
+}
+
+func TestBlobHeartbeatTracker_ConcurrentAddSnapshot(t *testing.T) {
+	tr := &blobHeartbeatTracker{}
+	var wg sync.WaitGroup
+	const N = 100
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < N; i++ {
+			tr.Add(fmt.Sprintf("hash-%04d", i))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < N; i++ {
+			_ = tr.Snapshot() // -race verifies no data race against Add
+		}
+	}()
+	wg.Wait()
+	got := tr.Snapshot()
+	if len(got) != N {
+		t.Errorf("post-concurrent len = %d, want %d", len(got), N)
+	}
+}
+
+// SPEC4 §12.1: §7.5.2 site-6 ticker. We construct an Adopter with a
+// short heartbeat_interval and call runHeartbeatTicker on it as a
+// goroutine; assert at least N writes land on suite_snapshot.heartbeat_at
+// within the test budget.
+
+func TestRunHeartbeatTicker_AdvancesHeartbeatAt(t *testing.T) {
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	// Plant a candidate snapshot row directly. Use a non-FK inrelease
+	// hash by inserting a blob row first.
+	ctx := context.Background()
+	hash := strings.Repeat("a", 64)
+	if err := c.PutBlob(ctx, hash, 1); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "tick.example",
+		SuitePath:       "/p",
+		InReleaseHash:   &hash,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Backdate heartbeat_at to epoch=1 so any ticker write produces a
+	// large jump that's unambiguous at the suite_snapshot's
+	// unix-seconds resolution. Without this, a 150ms test window can
+	// fall entirely inside one second and hb1 == hb2 even though the
+	// ticker fired.
+	dbPath := filepath.Join(c.Dir(), "cache.db")
+	{
+		db, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE suite_snapshot SET heartbeat_at = 1 WHERE snapshot_id = ?`, id); err != nil {
+			t.Fatal(err)
+		}
+		_ = db.Close()
+	}
+
+	logBuf := &bytes.Buffer{}
+	logger := slog.New(slog.NewTextHandler(logBuf, nil))
+	a := &Adopter{
+		cache:             c,
+		logger:            logger,
+		heartbeatInterval: 50 * time.Millisecond,
+	}
+
+	preGoroutines := runtime.NumGoroutine()
+	tickerCtx, tickerCancel := context.WithCancel(ctx)
+	tickerDone := make(chan struct{})
+	go func() {
+		defer close(tickerDone)
+		a.runHeartbeatTicker(tickerCtx, id, nil)
+	}()
+
+	// Allow at least one tick to fire — 200ms covers ~3 intervals plus
+	// the writer-queue submit.
+	time.Sleep(200 * time.Millisecond)
+	tickerCancel()
+	<-tickerDone
+
+	hb := readHeartbeatAtDirect(t, dbPath, id)
+	if hb < time.Now().Unix()-10 {
+		t.Errorf("heartbeat_at = %d, expected close to now=%d (ticker did not fire or write was lost)", hb, time.Now().Unix())
+	}
+
+	// Goroutine cleanup: the ticker goroutine must have exited.
+	// Allow +1 for the rare scheduler noise of a not-yet-reaped finalizer.
+	if post := runtime.NumGoroutine(); post > preGoroutines+1 {
+		t.Errorf("goroutine leak: pre=%d post=%d", preGoroutines, post)
+	}
+}
+
+func TestRunHeartbeatTicker_DisabledWhenIntervalZero(t *testing.T) {
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	a := &Adopter{
+		cache:             c,
+		logger:            slog.Default(),
+		heartbeatInterval: 0,
+	}
+	// Should return immediately. Run with cancelled ctx to be safe.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		a.runHeartbeatTicker(ctx, 1, nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Errorf("runHeartbeatTicker with zero interval did not return immediately")
+	}
+}
+
+func TestRunHeartbeatTicker_ExitsOnCancelWithoutTickingMoreThanOnce(t *testing.T) {
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	a := &Adopter{
+		cache:             c,
+		logger:            slog.Default(),
+		heartbeatInterval: 50 * time.Millisecond,
+	}
+
+	// Cancel the ctx immediately after spawning. The ticker should exit
+	// having ticked zero or one times (the cancellation race window).
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		a.runHeartbeatTicker(ctx, 99999 /*nonexistent snapshot id; HeartbeatSnapshot is a no-op*/, nil)
+		close(done)
+	}()
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Errorf("ticker did not exit within 200ms of cancel")
+	}
+}
+
+// readHeartbeatAtDirect reads suite_snapshot.heartbeat_at via a
+// short-lived sql.DB on the cache file path. The cache package's
+// internal *sql.DB is unexported so tests use this side door.
+func readHeartbeatAtDirect(t *testing.T, dbPath string, id int64) int64 {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	var hb int64
+	if err := db.QueryRow(`SELECT heartbeat_at FROM suite_snapshot WHERE snapshot_id = ?`, id).Scan(&hb); err != nil {
+		t.Fatalf("read heartbeat_at: %v", err)
+	}
+	return hb
+}
