@@ -126,6 +126,17 @@ type SnapshotCoverage struct {
 	PackageCoverageComplete bool
 }
 
+// HotURLPath is one row of the SPEC5 §10.5 hot_url_paths status-page
+// section: a url_path row that has been recently requested. Sorted
+// by (request_count DESC, last_requested_at DESC).
+type HotURLPath struct {
+	Host                string
+	Path                string
+	IsMetadata          bool
+	RequestCount        int64
+	LastRequestedAtUnix int64 // last_requested_at; never NULL in this slice
+}
+
 // SuiteWithAdoption embeds SuiteFreshness and adds the
 // suite_snapshot.adopted_at corresponding to current_snapshot_id.
 // CurrentAdoptedAt is non-nil exactly when the LEFT JOIN found a

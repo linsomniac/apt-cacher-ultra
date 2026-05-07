@@ -2,7 +2,6 @@ package admin
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -83,31 +82,13 @@ func writeHealthzFail(w http.ResponseWriter, check string) {
 	_, _ = w.Write([]byte("degraded\n"))
 }
 
-// handleStatus is a placeholder for the SPEC5 §9.7.3 status page.
-// The full HTML/JSON content-negotiated render lands in a follow-up
-// commit; this stub keeps the route alive end-to-end so the listener
-// + auth + healthz + /metrics surface can be tested independently.
-//
-// AIDEV-TODO: render HTML via html/template + JSON via encoding/json,
-// per SPEC5 §10.5 schema. Sourced from cache.ListSuitesWithAdoption,
-// gc.GC.LastRunSummary, hostsem.Snapshot, observability.Ring.Snapshot.
-// Apply the §9.7.3 5s per-DB-query timeout.
+// handleStatus serves the SPEC5 §9.7.3 status page. Content
+// negotiation (?format=json or Accept: application/json) routes to
+// the JSON form; everything else renders HTML. Both forms share
+// the §10.5 schema. The actual render lives in renderStatus
+// (status.go); this handler is the route entry-point.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if wantsJSON(r) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_, _ = fmt.Fprintf(w, `{"todo":"status page handler not yet implemented","uptime_seconds":%d}`+"\n",
-			int64(time.Since(s.cfg.StartTime).Seconds()))
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(`<!DOCTYPE html>
-<html><head><title>apt-cacher-ultra status</title></head>
-<body><h1>apt-cacher-ultra</h1>
-<p>Status page handler not yet implemented (SPEC5 §9.7.3 placeholder).</p>
-<p><a href="/?format=json">View as JSON →</a></p>
-<p><a href="/metrics">/metrics</a> &middot; <a href="/healthz">/healthz</a></p>
-</body></html>
-`))
+	s.renderStatus(w, r)
 }
 
 // wantsJSON implements SPEC5 §9.7.3 content negotiation:

@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -175,6 +176,77 @@ func TestEndpoint_Status_JSONViaQuery(t *testing.T) {
 	defer resp.Body.Close()
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 		t.Errorf("Content-Type = %q, want application/json...", ct)
+	}
+}
+
+func TestStatusJSON_HasLockedSchemaKeys(t *testing.T) {
+	_, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	resp := mustGet(t, base+"/?format=json")
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode JSON: %v\nbody: %s", err, body)
+	}
+	// SPEC5 §10.5: top-level keys are stable.
+	required := []string{
+		"process", "cache", "listeners", "suites",
+		"hot_url_paths", "recent_adoptions", "active_hosts",
+	}
+	for _, k := range required {
+		if _, ok := got[k]; !ok {
+			t.Errorf("JSON missing required top-level key %q", k)
+		}
+	}
+	// gc is omitempty — present only when GC has run; an
+	// empty-cache test means gc has not run yet, so absence is
+	// expected. Don't assert presence.
+
+	// Nested process keys.
+	proc, ok := got["process"].(map[string]any)
+	if !ok {
+		t.Fatalf("process is not an object: %T", got["process"])
+	}
+	for _, k := range []string{"version", "started_unixtime",
+		"uptime_seconds", "vcs_revision", "go_version"} {
+		if _, ok := proc[k]; !ok {
+			t.Errorf("process missing %q", k)
+		}
+	}
+
+	// Empty arrays render as [] not null.
+	for _, k := range []string{"suites", "hot_url_paths",
+		"recent_adoptions", "active_hosts", "listeners"} {
+		v := got[k]
+		if v == nil {
+			t.Errorf("%q is null; want [] (encoding/json renders empty slices as []) — schema says arrays are always arrays", k)
+		}
+	}
+}
+
+func TestStatusHTML_RendersWithoutPanic(t *testing.T) {
+	_, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	resp := mustGet(t, base+"/")
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "<title>apt-cacher-ultra status</title>") {
+		t.Errorf("HTML missing title; body:\n%s", body)
+	}
+	if !strings.Contains(string(body), "View as JSON") {
+		t.Errorf("HTML missing JSON link")
+	}
+	if !strings.Contains(string(body), "/metrics") {
+		t.Errorf("HTML missing /metrics link")
 	}
 }
 

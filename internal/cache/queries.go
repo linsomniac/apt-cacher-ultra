@@ -270,6 +270,46 @@ LEFT JOIN suite_snapshot ss
 	return out, nil
 }
 
+// ListHotURLPaths returns up to `limit` url_path rows ordered by
+// request_count DESC then last_requested_at DESC. Used by the
+// SPEC5 §10.5 status-page hot_url_paths section. Rows whose
+// last_requested_at IS NULL are excluded — they have not been
+// requested since the row was seeded.
+//
+// AIDEV-NOTE: limit is enforced by SQL LIMIT, so the result set
+// is bounded regardless of url_path table size. Phase 5 status
+// page caps at 20 (SPEC5 §10.5); a future endpoint may want a
+// bigger limit, hence the parameter rather than a hard-coded 20.
+func (c *Cache) ListHotURLPaths(ctx context.Context, limit int) ([]HotURLPath, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	const q = `
+SELECT canonical_host, path, is_metadata, request_count, last_requested_at
+  FROM url_path
+ WHERE last_requested_at IS NOT NULL
+ ORDER BY request_count DESC, last_requested_at DESC
+ LIMIT ?`
+	rows, err := c.db.QueryContext(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("ListHotURLPaths: %w", err)
+	}
+	defer rows.Close()
+	var out []HotURLPath
+	for rows.Next() {
+		var h HotURLPath
+		if err := rows.Scan(&h.Host, &h.Path, &h.IsMetadata,
+			&h.RequestCount, &h.LastRequestedAtUnix); err != nil {
+			return nil, fmt.Errorf("ListHotURLPaths scan: %w", err)
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListHotURLPaths iter: %w", err)
+	}
+	return out, nil
+}
+
 // ListSuites returns every suite_freshness row, in no guaranteed order.
 // Used by the periodic freshness scheduler (SPEC §7.4) to pick suites
 // whose last_success_at is older than periodic_refresh.
