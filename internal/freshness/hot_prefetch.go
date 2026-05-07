@@ -80,6 +80,7 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 		"hot_count", stats.hotCount,
 		"budget_seconds", budgetSeconds,
 	)
+	hotPrefetchTotal.Inc("started", suite.CanonicalHost)
 	if stats.hotCount == 0 {
 		return nil, stats
 	}
@@ -124,6 +125,7 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 					"snapshot_id", snapshotID,
 					"missing", missing,
 				)
+				hotPrefetchTotal.Inc("partial", suite.CanonicalHost)
 			}
 			break
 		}
@@ -149,7 +151,7 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 		// member-fetch heartbeat (post-runHotPrefetch entry) and
 		// the next heartbeat (site 5 pre-CommitAdoption) could be
 		// hot_count × that budget under pathological upstreams.
-		a.heartbeat(adoptionCtx, snapshotID, tracker)
+		a.heartbeat(adoptionCtx, suite.CanonicalHost, snapshotID, tracker)
 		switch outcome {
 		case hotFetchOK:
 			prefetched = append(prefetched, cache.PrefetchedURLPath{
@@ -167,8 +169,10 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 			// hit the budget" maps to failed (deb_failed log already
 			// emitted by fetchHotDeb).
 			stats.failed++
+			hotPrefetchTotal.Inc("deb_failed", suite.CanonicalHost)
 		case hotFetchMismatch:
 			stats.mismatched++
+			hotPrefetchTotal.Inc("hash_mismatch", suite.CanonicalHost)
 		case hotFetchCancelled:
 			// fetchHotDeb returns hotFetchCancelled in two narrow
 			// cases: parent adoptionCtx cancelled (Canceled) or
@@ -191,6 +195,7 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 					"snapshot_id", snapshotID,
 					"missing", missing,
 				)
+				hotPrefetchTotal.Inc("partial", suite.CanonicalHost)
 			}
 			return prefetched, stats
 		}

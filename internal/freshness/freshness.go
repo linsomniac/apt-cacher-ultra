@@ -29,6 +29,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 )
 
 // Suite-anchor filenames. Inline mode checks one file (InRelease,
@@ -113,22 +114,31 @@ type Config struct {
 	// shutdown.
 	LifetimeCtx context.Context
 
+	// AdoptionRing is the SPEC5 §9.7.7 process-local ring buffer.
+	// When non-nil, every adoption attempt (success or failure)
+	// emits one AdoptionEvent on completion so the admin status
+	// page can display recent activity. Production passes the
+	// shared ring constructed in main; tests may pass nil to
+	// disable recording.
+	AdoptionRing *observability.Ring
+
 	// now is a test seam; production uses time.Now.
 	now func() time.Time
 }
 
 // Checker is the SPEC §7 freshness state machine.
 type Checker struct {
-	cache       Cache
-	fetcher     Fetcher
-	hostSem     *hostsem.Sem
-	cooldown    time.Duration
-	refresh     time.Duration
-	maxBody     int64
-	logger      *slog.Logger
-	now         func() time.Time
-	adopter     *Adopter
-	lifetimeCtx context.Context
+	cache        Cache
+	fetcher      Fetcher
+	hostSem      *hostsem.Sem
+	cooldown     time.Duration
+	refresh      time.Duration
+	maxBody      int64
+	logger       *slog.Logger
+	now          func() time.Time
+	adopter      *Adopter
+	lifetimeCtx  context.Context
+	adoptionRing *observability.Ring
 
 	// adoptionWg tracks in-flight adoption goroutines spawned via
 	// Check. Production graceful shutdown (SPEC2 §9.5 step 5) calls
@@ -189,16 +199,17 @@ func New(cfg Config) (*Checker, error) {
 		lifeCtx = context.Background()
 	}
 	return &Checker{
-		cache:       cfg.Cache,
-		fetcher:     cfg.Fetcher,
-		hostSem:     cfg.HostLimiter,
-		cooldown:    cfg.Cooldown,
-		refresh:     cfg.Refresh,
-		maxBody:     maxBody,
-		logger:      logger,
-		now:         now,
-		adopter:     cfg.Adopter,
-		lifetimeCtx: lifeCtx,
+		cache:        cfg.Cache,
+		fetcher:      cfg.Fetcher,
+		hostSem:      cfg.HostLimiter,
+		cooldown:     cfg.Cooldown,
+		refresh:      cfg.Refresh,
+		maxBody:      maxBody,
+		logger:       logger,
+		now:          now,
+		adopter:      cfg.Adopter,
+		lifetimeCtx:  lifeCtx,
+		adoptionRing: cfg.AdoptionRing,
 	}, nil
 }
 
@@ -263,12 +274,29 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 	go func() {
 		defer mu.Unlock()
 		defer c.adoptionWg.Done()
+		// SPEC5 §10.4.3 / §9.7.7: time the adoption from goroutine
+		// entry, not from inside Run/RunDetached, so the duration
+		// reflects what the operator observes (queueing + run).
+		start := c.now()
 		var err error
 		switch req.form {
 		case adoptionFormInline:
 			err = c.adopter.Run(c.lifetimeCtx, req.suite, req.bytes, req.etag, req.lastmod)
 		case adoptionFormDetached:
 			err = c.adopter.RunDetached(c.lifetimeCtx, req.suite, req.releaseBytes, req.sigBytes, req.etag, req.lastmod)
+		}
+		duration := c.now().Sub(start)
+		outcome := classifyAdoptionOutcome(err)
+		adoptionTotal.Inc(outcome, req.suite.CanonicalHost)
+		adoptionDurationSeconds.Observe(duration.Seconds(), outcome, req.suite.CanonicalHost)
+		if c.adoptionRing != nil {
+			c.adoptionRing.Record(observability.AdoptionEvent{
+				Host:             req.suite.CanonicalHost,
+				SuitePath:        req.suite.SuitePath,
+				Outcome:          outcome,
+				CompletedUnixSec: c.now().Unix(),
+				DurationSeconds:  duration.Seconds(),
+			})
 		}
 		if err != nil {
 			// Several Adopter paths emit categorized log lines before
@@ -540,6 +568,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 			"suite_path", suitePath,
 			"result", "failed",
 		)
+		freshnessCheckTotal.Inc("failed", host)
 		return nil, false
 	}
 
@@ -641,6 +670,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 		"result", result,
 		"upstream_status", res.Status,
 	)
+	freshnessCheckTotal.Inc(result, host)
 	return req, false
 }
 
@@ -763,6 +793,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 			"form", "detached",
 			"result", "failed",
 		)
+		freshnessCheckTotal.Inc("failed", host)
 		return nil
 	}
 
@@ -869,6 +900,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 		"result", result,
 		"upstream_status", res.Status,
 	)
+	freshnessCheckTotal.Inc(result, host)
 	return req
 }
 

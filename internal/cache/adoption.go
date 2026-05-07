@@ -217,15 +217,15 @@ type PrefetchedURLPath struct {
 //  1. Verify the snapshot is still a candidate (adopted_at IS NULL).
 //  2. Insert all snapshot_member rows for snapshotID.
 //  3. Insert all package_hash rows.
-//  3a. (Phase 3, SPEC3 §7.5.1) Insert/upsert url_path rows for the
-//      hot debs warmed during prefetch. Hotness signal preservation:
-//      DO UPDATE intentionally omits last_requested_at and
-//      request_count, diverging from PutURLPath, so the next
-//      adoption's hot-set query still sees the path as hot.
-//  3b. (Phase 3) Stamp suite_snapshot.package_coverage_complete from
-//      the caller's coverageComplete bit — set under the same
-//      transaction as the flip so readers see coverage atomically
-//      with the snapshot becoming current.
+//     3a. (Phase 3, SPEC3 §7.5.1) Insert/upsert url_path rows for the
+//     hot debs warmed during prefetch. Hotness signal preservation:
+//     DO UPDATE intentionally omits last_requested_at and
+//     request_count, diverging from PutURLPath, so the next
+//     adoption's hot-set query still sees the path as hot.
+//     3b. (Phase 3) Stamp suite_snapshot.package_coverage_complete from
+//     the caller's coverageComplete bit — set under the same
+//     transaction as the flip so readers see coverage atomically
+//     with the snapshot becoming current.
 //  4. Bump blob.refcount for each distinct blob_hash referenced by the
 //     new snapshot's members. Each blob is counted once even if many
 //     member rows point at it.

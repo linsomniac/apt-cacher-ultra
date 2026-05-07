@@ -464,11 +464,11 @@ func TestSuitePath(t *testing.T) {
 		{"/ubuntu/dists/noble/InRelease", "/ubuntu/dists/noble"},
 		{"/ubuntu/dists/noble", "/ubuntu/dists/noble"},
 		{"/ubuntu/dists/noble/main/binary-amd64/Packages.gz", "/ubuntu/dists/noble"},
-		{"/dists/stable/Release", "/dists/stable"},      // no repo prefix
-		{"/dists/stable", "/dists/stable"},              // bare suite path
-		{"/ubuntu/pool/main/h/hello/hello.deb", ""},     // not under /dists/
-		{"/", ""},                                       // root
-		{"", ""},                                        // empty
+		{"/dists/stable/Release", "/dists/stable"},  // no repo prefix
+		{"/dists/stable", "/dists/stable"},          // bare suite path
+		{"/ubuntu/pool/main/h/hello/hello.deb", ""}, // not under /dists/
+		{"/", ""}, // root
+		{"", ""},  // empty
 		{"/debian/dists/bookworm-updates/InRelease", "/debian/dists/bookworm-updates"},
 		// nested repo paths
 		{"/some/deep/repo/dists/sid/InRelease", "/some/deep/repo/dists/sid"},

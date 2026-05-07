@@ -100,10 +100,10 @@ func TestClassifyFetchOutcome_StatusErrorBeatsBareSentinel(t *testing.T) {
 // path's status-code branches.
 func TestClassifyConditionalOutcome_StatusBranches(t *testing.T) {
 	cases := []struct {
-		name   string
-		res    *ConditionalResult
-		err    error
-		want   string
+		name string
+		res  *ConditionalResult
+		err  error
+		want string
 	}{
 		{"nil err, 200", &ConditionalResult{Status: 200}, nil, "cond_changed"},
 		{"nil err, 304", &ConditionalResult{Status: 304}, nil, "cond_unchanged"},

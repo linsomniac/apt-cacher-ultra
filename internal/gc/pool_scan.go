@@ -47,10 +47,10 @@ func (g *GC) runPoolScan(ctx context.Context) (scanResult, error) {
 	jobs := make(chan job, 64)
 
 	var (
-		orphans       atomic.Int64
-		orphanBytes   atomic.Int64
-		unlinkErrors  atomic.Int64
-		wg            sync.WaitGroup
+		orphans      atomic.Int64
+		orphanBytes  atomic.Int64
+		unlinkErrors atomic.Int64
+		wg           sync.WaitGroup
 	)
 
 	worker := func() {

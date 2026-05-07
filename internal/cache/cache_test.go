@@ -1486,10 +1486,10 @@ func hasColumn(t *testing.T, db *sql.DB, table, column string) bool {
 	defer rows.Close()
 	for rows.Next() {
 		var (
-			cid           int
-			name, ctype   string
-			notnull, pk   int
-			dfltValueRaw  sql.NullString
+			cid          int
+			name, ctype  string
+			notnull, pk  int
+			dfltValueRaw sql.NullString
 		)
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValueRaw, &pk); err != nil {
 			t.Fatalf("scan: %v", err)
@@ -2715,7 +2715,7 @@ func TestComputeHotSet_TwoStageMatch(t *testing.T) {
 
 // TestComputeHotSet_ExcludesPreV3Rows: package_hash rows with empty
 // package_name/architecture (post-migration, pre-Phase-3 adoptions)
-// are filtered out by Stage 1's <> '' predicate. SPEC3 §4.3.2.
+// are filtered out by Stage 1's <> ” predicate. SPEC3 §4.3.2.
 func TestComputeHotSet_ExcludesPreV3Rows(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
@@ -2894,8 +2894,8 @@ func TestComputeHotSet_RejectsCandidateMismatch(t *testing.T) {
 	mismatched := []PackageHash{{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		// SnapshotID intentionally != idNew — caller error.
-		SnapshotID:   idPrior,
-		Path:         pathOld,
+		SnapshotID:     idPrior,
+		Path:           pathOld,
 		DeclaredSHA256: debHash,
 		PackageName:    "match",
 		Architecture:   "amd64",
@@ -2956,17 +2956,17 @@ func TestComputeHotSet_DuplicatePackageArchEmitsAllPaths(t *testing.T) {
 	cand := []PackageHash{
 		{
 			CanonicalScheme: scheme, CanonicalHost: host,
-			SnapshotID: idCandidate,
-			Path:       "/pool/main/d/dup/dup_3.0_amd64.deb",
+			SnapshotID:     idCandidate,
+			Path:           "/pool/main/d/dup/dup_3.0_amd64.deb",
 			DeclaredSHA256: hash3,
-			PackageName: "dup", Architecture: "amd64",
+			PackageName:    "dup", Architecture: "amd64",
 		},
 		{
 			CanonicalScheme: scheme, CanonicalHost: host,
-			SnapshotID: idCandidate,
-			Path:       "/pool/main/d/dup/dup_2.0_amd64.deb",
+			SnapshotID:     idCandidate,
+			Path:           "/pool/main/d/dup/dup_2.0_amd64.deb",
 			DeclaredSHA256: hash2,
-			PackageName: "dup", Architecture: "amd64",
+			PackageName:    "dup", Architecture: "amd64",
 		},
 	}
 	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idCandidate, cand, 86400, now)

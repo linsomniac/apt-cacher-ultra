@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // ErrConditionalBodyTooLarge is returned when a 200 response body exceeds
@@ -51,7 +52,19 @@ func (c *Client) Conditional(
 	target *Target,
 	etag, lastmod string,
 	maxBody int64,
-) (*ConditionalResult, error) {
+) (result *ConditionalResult, retErr error) {
+	// SPEC5 §10.4.2: every Conditional terminal return drives one
+	// fetch-counter increment and one duration observation, with
+	// outcome derived from the classifier (cond_changed /
+	// cond_unchanged on success, sentinel match on failure).
+	start := time.Now()
+	host := hostLabel(target)
+	defer func() {
+		outcome := ClassifyConditionalOutcome(result, retErr)
+		fetchTotal.Inc(outcome, host)
+		fetchDurationSeconds.Observe(time.Since(start).Seconds(), outcome, host)
+	}()
+
 	if target == nil {
 		return nil, errors.New("fetch: nil target")
 	}

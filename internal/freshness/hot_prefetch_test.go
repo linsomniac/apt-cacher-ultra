@@ -29,17 +29,17 @@ func sha256OfBytes(b []byte) string {
 // warm. The Adopter's fakeFetcher is exposed so each test can shape
 // its per-deb success / failure / hash-mismatch / hang behavior.
 type hotPrefetchFixture struct {
-	t                       *testing.T
-	cache                   *cache.Cache
-	adopter                 *Adopter
-	fetcher                 *hotFakeFetcher
-	suite                   SuiteRef
-	priorSnapshot           int64
-	candidate               int64
-	debDeclared             string // sha256 of the deb the candidate vouches for
-	debUpstreamURL          string
-	debPath                 string
-	candidatePackageHashes  []cache.PackageHash // passed to runHotPrefetch (Stage 2 in-memory)
+	t                      *testing.T
+	cache                  *cache.Cache
+	adopter                *Adopter
+	fetcher                *hotFakeFetcher
+	suite                  SuiteRef
+	priorSnapshot          int64
+	candidate              int64
+	debDeclared            string // sha256 of the deb the candidate vouches for
+	debUpstreamURL         string
+	debPath                string
+	candidatePackageHashes []cache.PackageHash // passed to runHotPrefetch (Stage 2 in-memory)
 }
 
 func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixture {

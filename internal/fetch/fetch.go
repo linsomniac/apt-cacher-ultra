@@ -239,7 +239,19 @@ func New(opts Options) (*Client, error) {
 //   - ErrUpstreamUnavailable: ran out of retries on transient failures.
 //     Caller may serve stale (metadata) or 502 (blob).
 //   - context.Canceled / context.DeadlineExceeded: the ctx fired.
-func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (*FetchResult, error) {
+func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (result *FetchResult, retErr error) {
+	// SPEC5 §10.4.2: every Fetch terminal return drives one
+	// fetch-counter increment and one duration observation. The
+	// classifier is a total function, so the sum across outcome
+	// values equals the number of Fetch calls completed.
+	start := time.Now()
+	host := hostLabel(target)
+	defer func() {
+		outcome := ClassifyFetchOutcome(retErr)
+		fetchTotal.Inc(outcome, host)
+		fetchDurationSeconds.Observe(time.Since(start).Seconds(), outcome, host)
+	}()
+
 	if target == nil {
 		return nil, errors.New("fetch: nil target")
 	}
@@ -355,6 +367,11 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (*Fetc
 			"canonical_host", target.CanonicalHost,
 			"err", err,
 		)
+		// SPEC5 §10.4.2: one increment per retry-log emit, NOT per
+		// failed attempt. Operators correlate this counter with the
+		// "fetch retry" structured log and the per-host fetch_total
+		// outcomes to bucket transient flap.
+		fetchRetriesTotal.Inc(target.CanonicalHost)
 		lastErr = err
 		attempts++
 	}

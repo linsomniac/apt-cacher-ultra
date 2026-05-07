@@ -23,6 +23,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 )
 
@@ -233,6 +234,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// is no goroutine that could still call Add later.
 	h.activeWG.Add(1)
 	defer h.activeWG.Done()
+
+	// SPEC5 §10.4.1 inflight gauge — pair with the WaitGroup so the
+	// metric matches what the §9.5 drain is actually waiting on.
+	inflightRequests.Inc()
+	defer inflightRequests.Dec()
 
 	start := time.Now()
 
@@ -1306,6 +1312,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 						"observed_sha256", observed,
 						"declared", declaredAttrs(rows),
 					)
+					integrity.IncHashValidationFailureFetch()
 					return sfResult{
 						err: fmt.Errorf("%w: declared %s, observed %s",
 							ErrPackageHashMismatch, distinct[0], observed),
@@ -1674,6 +1681,7 @@ func retryAfterForRequest(req *proxy.Request) string {
 // pre-fetch allowlist 403); use true for every miss-path outcome,
 // including HIT-STALE (which fired after a fetch failed).
 func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, status int, bytesWritten int64, fetchAttempted bool, upstreamStatus int, start time.Time) {
+	duration := time.Since(start)
 	attrs := []any{
 		"method", r.Method,
 		"url", urlForLog(r),
@@ -1682,13 +1690,21 @@ func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, s
 		"outcome", outcome,
 		"status", status,
 		"bytes_sent", bytesWritten,
-		"duration_ms", time.Since(start).Milliseconds(),
+		"duration_ms", duration.Milliseconds(),
 		"client_addr", r.RemoteAddr,
 	}
 	if fetchAttempted {
 		attrs = append(attrs, "upstream_status", upstreamStatus)
 	}
 	h.logger.Info("request", attrs...)
+
+	// SPEC5 §10.4.1: every logRequest emit drives one observation
+	// of each request-path metric. Pre-host outcomes
+	// (method_not_allowed, bad_request) carry host="" — the empty
+	// string is a stable label value, NOT a missing label.
+	requestsTotal.Inc(outcome, canonHost)
+	requestDurationSeconds.Observe(duration.Seconds(), outcome, canonHost)
+	responseBytes.Observe(float64(bytesWritten), outcome, canonHost)
 }
 
 // urlForLog returns a sanitized representation of the request URL
@@ -1833,6 +1849,12 @@ func (h *Handler) logUnvouchedPassthrough(host, path string, snapshotID int64) {
 		"path", path,
 		"incomplete_snapshot_id", snapshotID,
 	)
+	// SPEC5 §10.4.1: passthrough_no_coverage is a request-path outcome,
+	// but unlike the others it isn't passed to logRequest — the request
+	// continues through the trust-upstream serve path and gets its
+	// final outcome (miss/hit) logged separately. The counter mirrors
+	// the rate-limited Info: one increment per (host, path, hour).
+	requestsTotal.Inc("unvouched_deb_passthrough_no_coverage", host)
 }
 
 // refuseUnvouchedDeb writes the SPEC3 §6.1 strict-mode 502 + Retry-After

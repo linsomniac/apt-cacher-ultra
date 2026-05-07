@@ -256,11 +256,17 @@ func buildActiveHostEntries(stats map[string]hostsem.HostStat) []activeHostInfo 
 // renderStatus renders the SPEC5 §10.5 status page in either JSON
 // or HTML per content negotiation (§9.7.3).
 func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	format := chooseFormat(r)
+	defer func() {
+		s.self.statusTotal.Inc()
+		s.self.statusDurationSeconds.Observe(time.Since(start).Seconds(), format)
+	}()
 	model, failingQuery, err := s.buildStatusModel(r)
 	if err != nil {
 		s.logger.Warn("admin_status_render_failed",
 			"err", err.Error(),
-			"format", chooseFormat(r),
+			"format", format,
 			"query", failingQuery)
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return

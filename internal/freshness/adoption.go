@@ -20,6 +20,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
 )
 
 // maxDecompressedPackagesBytes caps how much we'll inflate a single
@@ -271,13 +272,17 @@ func (t *blobHeartbeatTracker) Snapshot() []string {
 // Context cancellation (parent shutdown) is suppressed — that's the
 // expected exit path during graceful shutdown, not an operator-visible
 // failure mode.
-func (a *Adopter) heartbeat(ctx context.Context, snapshotID int64, tracker *blobHeartbeatTracker) {
+func (a *Adopter) heartbeat(ctx context.Context, host string, snapshotID int64, tracker *blobHeartbeatTracker) {
 	if err := a.cache.HeartbeatSnapshot(ctx, snapshotID); err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			a.logger.Warn("adoption_heartbeat_failed",
 				"snapshot_id", snapshotID,
 				"err", err,
 			)
+			// SPEC5 §10.4.3: count only operator-actionable failures
+			// — ctx cancel/deadline are the expected shutdown path
+			// and stay suppressed (consistent with the Warn gate).
+			adoptionHeartbeatFailuresTotal.Inc(host)
 		}
 	}
 	if tracker == nil {
@@ -294,6 +299,7 @@ func (a *Adopter) heartbeat(ctx context.Context, snapshotID int64, tracker *blob
 				"hash_count", len(hashes),
 				"err", err,
 			)
+			adoptionHeartbeatFailuresTotal.Inc(host)
 		}
 	}
 }
@@ -311,7 +317,7 @@ func (a *Adopter) heartbeat(ctx context.Context, snapshotID int64, tracker *blob
 // gaps, the gap from runHotPrefetch returning to CommitAdoption
 // running). Sites 1–5 are latency-fresh event-driven heartbeats; the
 // ticker is the floor under them, not a replacement.
-func (a *Adopter) runHeartbeatTicker(ctx context.Context, snapshotID int64, tracker *blobHeartbeatTracker) {
+func (a *Adopter) runHeartbeatTicker(ctx context.Context, host string, snapshotID int64, tracker *blobHeartbeatTracker) {
 	if a.heartbeatInterval <= 0 {
 		return
 	}
@@ -322,7 +328,7 @@ func (a *Adopter) runHeartbeatTicker(ctx context.Context, snapshotID int64, trac
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			a.heartbeat(ctx, snapshotID, tracker)
+			a.heartbeat(ctx, host, snapshotID, tracker)
 		}
 	}
 }
@@ -347,10 +353,10 @@ type adoptionPayload struct {
 	inlineHash  string // sha256 of inlineBytes (set in step 2)
 
 	// Detached mode (form == adoptionFormDetached).
-	releaseBytes    []byte
-	sigBytes        []byte
-	releaseHash     string // sha256 of releaseBytes (set in step 2)
-	releaseGPGHash  string // sha256 of sigBytes (set in step 2)
+	releaseBytes   []byte
+	sigBytes       []byte
+	releaseHash    string // sha256 of releaseBytes (set in step 2)
+	releaseGPGHash string // sha256 of sigBytes (set in step 2)
 }
 
 // Run executes the §7.5 adoption flow for an inline (clearsigned
@@ -582,7 +588,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		tickerWG.Add(1)
 		go func() {
 			defer tickerWG.Done()
-			a.runHeartbeatTicker(tickerCtx, snapshotID, tracker)
+			a.runHeartbeatTicker(tickerCtx, suite.CanonicalHost, snapshotID, tracker)
 		}()
 	}
 	defer func() {
@@ -614,7 +620,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			DeclaredSHA256: m.SHA256,
 		})
 		tracker.Add(blobHash)
-		a.heartbeat(ctx, snapshotID, tracker)
+		a.heartbeat(ctx, suite.CanonicalHost, snapshotID, tracker)
 	}
 
 	// Step 6: metadata-self snapshot_member row(s). Without these
@@ -690,7 +696,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// minutes. Without this site the gap from the last member-fetch
 	// heartbeat through Packages parsing to the next heartbeat
 	// would be unbounded by any fetch timeout.
-	a.heartbeat(ctx, snapshotID, tracker)
+	a.heartbeat(ctx, suite.CanonicalHost, snapshotID, tracker)
 
 	// Steps 9 + 10 (SPEC3 §7.5): hot-set computation + hot-deb prefetch
 	// loop. The result list (prefetchedURLPaths) feeds CommitAdoption
@@ -707,7 +713,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// the adopted_at flip becomes the source of truth, defending
 	// against writer-queue depth between runHotPrefetch returning
 	// and CommitAdoption actually committing.
-	a.heartbeat(ctx, snapshotID, tracker)
+	a.heartbeat(ctx, suite.CanonicalHost, snapshotID, tracker)
 
 	// Step 11: atomic flip transaction. Pass adoptionCtx as ctx so the
 	// budget-cancelled prefetch loop above never causes CommitAdoption
@@ -740,6 +746,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		"mismatched", hotStats.mismatched,
 		"unattempted", hotStats.unattempted,
 	)
+	hotPrefetchTotal.Inc("complete", suite.CanonicalHost)
 
 	// Step 10: success log + form-drift signal.
 	//
@@ -760,6 +767,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			"new_form", formName(p.form),
 			"snapshot_id", snapshotID,
 		)
+		// SPEC5 §10.4.3: form_drift is its own counter (NOT an
+		// outcome under acu_adoption_total). The drifting adoption
+		// also lands in adoption_total{outcome=success} — these two
+		// counters are independent.
+		adoptionFormDriftTotal.Inc(formName(priorForm), formName(p.form), suite.CanonicalHost)
 	}
 
 	a.logger.Info("adoption_success",
@@ -852,6 +864,7 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 			"declared_sha256", m.SHA256,
 			"actual_sha256", actual,
 		)
+		integrity.IncPoolCorruptionDuringAdoption()
 		if err := os.Remove(a.cache.BlobPath(m.SHA256)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return "", fmt.Errorf("%w: evict corrupted %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
 		}
@@ -955,6 +968,7 @@ func (a *Adopter) writeBlobBytes(ctx context.Context, content []byte) (string, e
 			"actual_sha256", actual,
 			"context", "writeBlobBytes",
 		)
+		integrity.IncPoolCorruptionDuringAdoption()
 		if err := os.Remove(a.cache.BlobPath(hashHex)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return "", fmt.Errorf("evict corrupted %s: %w", hashHex, err)
 		}

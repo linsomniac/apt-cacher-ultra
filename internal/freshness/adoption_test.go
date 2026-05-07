@@ -1307,7 +1307,7 @@ func TestRunHeartbeatTicker_AdvancesHeartbeatAt(t *testing.T) {
 	tickerDone := make(chan struct{})
 	go func() {
 		defer close(tickerDone)
-		a.runHeartbeatTicker(tickerCtx, id, nil)
+		a.runHeartbeatTicker(tickerCtx, "test.example", id, nil)
 	}()
 
 	// Poll for the heartbeat_at write to land. Generous timeout for
@@ -1353,7 +1353,7 @@ func TestRunHeartbeatTicker_DisabledWhenIntervalZero(t *testing.T) {
 	cancel()
 	done := make(chan struct{})
 	go func() {
-		a.runHeartbeatTicker(ctx, 1, nil)
+		a.runHeartbeatTicker(ctx, "test.example", 1, nil)
 		close(done)
 	}()
 	select {
@@ -1382,7 +1382,7 @@ func TestRunHeartbeatTicker_ExitsOnCancelWithoutTickingMoreThanOnce(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		a.runHeartbeatTicker(ctx, 99999 /*nonexistent snapshot id; HeartbeatSnapshot is a no-op*/, nil)
+		a.runHeartbeatTicker(ctx, "test.example", 99999 /*nonexistent snapshot id; HeartbeatSnapshot is a no-op*/, nil)
 		close(done)
 	}()
 	cancel()

@@ -121,6 +121,11 @@ type Server struct {
 	// most admin.gauge_refresh.
 	proc *processGauges
 
+	// self holds the §10.4.8 admin-listener self-metrics
+	// (scrape/status/healthz/auth_failures). Emitted at the
+	// corresponding handler entry points.
+	self *selfMetrics
+
 	// mu guards refresherStop / refresherDone / refresherCancel —
 	// Shutdown must be idempotent, and the refresher goroutine
 	// must not be started twice.
@@ -164,6 +169,7 @@ func New(cfg Config) (*Server, error) {
 	s.startup = newStartupGauges(cfg.Registry, cfg.Admin.MetricSeriesCap,
 		cfg.BuildInfo, cfg.StartTime)
 	s.proc = newProcessGauges(cfg.Registry)
+	s.self = newSelfMetrics(cfg.Registry, cfg.Admin.MetricSeriesCap)
 
 	if cfg.Admin.HtpasswdFile != "" {
 		auth, err := newHtpasswdAuthenticator(cfg.Admin.HtpasswdFile, logger)
@@ -202,7 +208,9 @@ func (s *Server) buildHandler() http.Handler {
 
 	var h http.Handler = mux
 	if s.auth != nil {
-		h = s.auth.middleware(h)
+		h = s.auth.middleware(h, func(reason string) {
+			s.self.authFailuresTotal.Inc(reason)
+		})
 	}
 	return s.requestLogMiddleware(h)
 }

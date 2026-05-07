@@ -105,7 +105,7 @@ type GC struct {
 // status-page handler renders this; the §9.7.6 refresher mirrors
 // fields into Phase 5 GC counters/gauges.
 type LastRunSummary struct {
-	Phase                   string  // "startup" | "periodic"
+	Phase                   string // "startup" | "periodic"
 	AtUnixTime              int64
 	DurationSeconds         float64
 	BlobsReaped             int
@@ -214,6 +214,7 @@ func (g *GC) StartupPass(ctx context.Context) error {
 	}
 
 	duration := time.Since(start)
+	endUnix := time.Now().Unix()
 	g.cfg.Logger.Info("gc_run_complete",
 		"phase", "startup",
 		"blobs_reaped", tick.blobsReaped,
@@ -226,9 +227,22 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		"deadline_reached", tick.deadlineReached,
 		"duration_ms", duration.Milliseconds(),
 	)
+	emitGCMetrics(
+		"startup",
+		duration.Seconds(),
+		endUnix,
+		tick.blobsReaped,
+		tick.bytesReclaimed,
+		tick.orphanCandidatesReaped,
+		tick.displacedReaped,
+		scan.orphansRepaired,
+		scan.orphanBytesRepaired,
+		tick.poolUnlinkErrors+scan.unlinkErrors,
+		tick.deadlineReached,
+	)
 	g.recordLastRun(LastRunSummary{
 		Phase:                   "startup",
-		AtUnixTime:              time.Now().Unix(),
+		AtUnixTime:              endUnix,
 		DurationSeconds:         duration.Seconds(),
 		BlobsReaped:             tick.blobsReaped,
 		BytesReclaimed:          tick.bytesReclaimed,
@@ -267,6 +281,7 @@ func (g *GC) Run(ctx context.Context) {
 				g.cfg.Logger.Warn("gc_tick_failed", "err", err)
 			}
 			duration := time.Since(start)
+			endUnix := time.Now().Unix()
 			g.cfg.Logger.Info("gc_run_complete",
 				"phase", "periodic",
 				"blobs_reaped", tick.blobsReaped,
@@ -279,9 +294,22 @@ func (g *GC) Run(ctx context.Context) {
 				"deadline_reached", tick.deadlineReached,
 				"duration_ms", duration.Milliseconds(),
 			)
+			emitGCMetrics(
+				"periodic",
+				duration.Seconds(),
+				endUnix,
+				tick.blobsReaped,
+				tick.bytesReclaimed,
+				tick.orphanCandidatesReaped,
+				tick.displacedReaped,
+				0,
+				0,
+				tick.poolUnlinkErrors,
+				tick.deadlineReached,
+			)
 			g.recordLastRun(LastRunSummary{
 				Phase:                   "periodic",
-				AtUnixTime:              time.Now().Unix(),
+				AtUnixTime:              endUnix,
 				DurationSeconds:         duration.Seconds(),
 				BlobsReaped:             tick.blobsReaped,
 				BytesReclaimed:          tick.bytesReclaimed,

@@ -45,7 +45,7 @@ const (
 // Packages text is rebuilt to include Package: and Architecture:
 // stanza fields so adoption can populate package_hash with the
 // (Package, Arch) tuple that the v3 hot-set Stage 1 query keys on.
-// Without those fields, Stage 1's `ph.package_name <> ''` predicate
+// Without those fields, Stage 1's `ph.package_name <> ”` predicate
 // excludes the row and the hot set is empty.
 type chaos3Snapshot struct {
 	label      string

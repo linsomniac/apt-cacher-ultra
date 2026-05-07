@@ -1036,9 +1036,9 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 	})
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
-		Path: "/dists/noble/Release.gpg",
+		Path:        "/dists/noble/Release.gpg",
 		UpstreamURL: srv.URL + "/dists/noble/Release.gpg",
-		IsMetadata: true,
+		IsMetadata:  true,
 	})
 
 	// Snapshot row that flags the suite as detached: release_hash
@@ -1182,7 +1182,7 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 	})
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
-		Path: "/dists/noble/Release.gpg",
+		Path:        "/dists/noble/Release.gpg",
 		UpstreamURL: srv.URL + "/dists/noble/Release.gpg", IsMetadata: true,
 	})
 
@@ -1292,7 +1292,7 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	})
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
-		Path: "/dists/noble/Release.gpg",
+		Path:        "/dists/noble/Release.gpg",
 		UpstreamURL: srv.URL + "/dists/noble/Release.gpg", IsMetadata: true,
 	})
 
@@ -1407,4 +1407,3 @@ func TestCheck_404OnInRelease_NoFallback_WhenReleaseRowsMissing(t *testing.T) {
 			releaseHits.Load(), gpgHits.Load())
 	}
 }
-

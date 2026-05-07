@@ -242,4 +242,3 @@ func TestKeyring_HasFingerprint_CaseInsensitive(t *testing.T) {
 		t.Fatal("mixed not found")
 	}
 }
-

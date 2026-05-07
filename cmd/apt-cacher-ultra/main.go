@@ -367,15 +367,23 @@ func serveListeners(
 		}
 	}
 
+	// SPEC5 §9.7.7 in-memory adoption ring. Process-local; dropped
+	// on restart. Capacity 50 events. The freshness package Records
+	// into this ring at every adoption-completion site (success
+	// AND failure) so the admin status page can show recent activity
+	// even for failures, which leave no DB row.
+	adoptionRing := observability.NewRing(50)
+
 	freshChecker, err := freshness.New(freshness.Config{
-		Cache:       c,
-		Fetcher:     fetchClient,
-		HostLimiter: hostLimiter,
-		Cooldown:    cfg.Freshness.Cooldown.Duration,
-		Refresh:     cfg.Freshness.PeriodicRefresh.Duration,
-		Adopter:     adopter,
-		LifetimeCtx: freshCtx,
-		Logger:      logger,
+		Cache:        c,
+		Fetcher:      fetchClient,
+		HostLimiter:  hostLimiter,
+		Cooldown:     cfg.Freshness.Cooldown.Duration,
+		Refresh:      cfg.Freshness.PeriodicRefresh.Duration,
+		Adopter:      adopter,
+		LifetimeCtx:  freshCtx,
+		Logger:       logger,
+		AdoptionRing: adoptionRing,
 	})
 	if err != nil {
 		return fmt.Errorf("build freshness checker: %w", err)
@@ -438,13 +446,6 @@ func serveListeners(
 		defer gcWG.Done()
 		gcsvc.Run(freshCtx)
 	}()
-
-	// SPEC5 §9.7.7 in-memory adoption ring. Process-local; dropped
-	// on restart. Capacity 50 events. The freshness package will
-	// Record into this ring at every adoption-completion site
-	// (counter wiring, future commit). The status-page handler
-	// reads from it via Snapshot.
-	adoptionRing := observability.NewRing(50)
 
 	// SPEC5 §9.7 admin listener. Built only when admin.enabled.
 	// BuildInfo is composed here because internal/admin cannot

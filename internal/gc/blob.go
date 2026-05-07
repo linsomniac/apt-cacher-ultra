@@ -31,11 +31,11 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 	graceSeconds := int64(g.cfg.BlobGrace.Seconds())
 
 	var (
-		res            blobResult
-		unlinkErrors   int
-		batchesRun     int
-		bytesThisTick  int64
-		deadlineHit    bool
+		res           blobResult
+		unlinkErrors  int
+		batchesRun    int
+		bytesThisTick int64
+		deadlineHit   bool
 	)
 	for {
 		if err := ctx.Err(); err != nil {

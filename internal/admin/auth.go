@@ -125,10 +125,17 @@ func (a *htpasswdAuthenticator) reloadIfChanged() {
 }
 
 // authenticate is the SPEC5 §9.7.5 step 4-5 lookup. Returns
-// (user, true) on success, ("", false) on failure. The
-// no-such-user path runs the sentinel bcrypt comparison so the
-// wallclock matches the wrong-password path.
-func (a *htpasswdAuthenticator) authenticate(user, pass string) (string, bool) {
+// (user, ok, reason). On success ok=true and reason="". On failure
+// reason is "unknown_user" or "wrong_password" — surfaced to the
+// metric path only, not the response (which is identical for both
+// to preserve timing parity).
+//
+// AIDEV-NOTE: SPEC5 §10.4.8 splits auth_failures into
+// unknown_user vs wrong_password. The reason MUST be derived from
+// the same path that runs the bcrypt comparison so the metric label
+// can never disagree with the actual code path; do not separately
+// re-check user existence at the call site.
+func (a *htpasswdAuthenticator) authenticate(user, pass string) (string, bool, string) {
 	a.mu.RLock()
 	hash, ok := a.users[user]
 	a.mu.RUnlock()
@@ -136,34 +143,44 @@ func (a *htpasswdAuthenticator) authenticate(user, pass string) (string, bool) {
 		// Fixed-time no-such-user path — sentinel comparison runs
 		// the same bcrypt cost as a real user mismatch.
 		_ = bcrypt.CompareHashAndPassword(a.sentinel, []byte(pass))
-		return "", false
+		return "", false, "unknown_user"
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)); err != nil {
-		return "", false
+		return "", false, "wrong_password"
 	}
-	return user, true
+	return user, true, ""
 }
 
 // middleware wraps next with HTTP Basic auth. SPEC5 §9.7.5: 401 on
 // missing/invalid credentials, with WWW-Authenticate; the success
 // path stuffs the authenticated username into the request context
 // for the downstream request-log middleware.
-func (a *htpasswdAuthenticator) middleware(next http.Handler) http.Handler {
+//
+// onAuthFailure is invoked with the SPEC5 §10.4.8 reason label
+// (`no_credentials`, `unknown_user`, `wrong_password`) before the
+// 401 is written, so the caller can drive
+// acu_admin_auth_failures_total without leaking the reason in the
+// response body or headers (timing-parity is preserved either way —
+// the bcrypt comparison runs in both no-such-user and
+// wrong-password paths).
+func (a *htpasswdAuthenticator) middleware(next http.Handler, onAuthFailure func(reason string)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a.reloadIfChanged()
 
 		user, pass, ok := r.BasicAuth()
 		if !ok {
-			a.unauthorized(w, "no_credentials")
+			if onAuthFailure != nil {
+				onAuthFailure("no_credentials")
+			}
+			a.unauthorized(w)
 			return
 		}
-		authedUser, ok := a.authenticate(user, pass)
+		authedUser, ok, reason := a.authenticate(user, pass)
 		if !ok {
-			// SPEC5 §10.4.8 splits failures into unknown_user vs
-			// wrong_password — but we don't expose which path
-			// fired (timing-parity guarantee). The metric
-			// distinguishes; the response does not.
-			a.unauthorized(w, "wrong_password")
+			if onAuthFailure != nil {
+				onAuthFailure(reason)
+			}
+			a.unauthorized(w)
 			return
 		}
 		ctx := context.WithValue(r.Context(), authUserKey{}, authedUser)
@@ -172,9 +189,10 @@ func (a *htpasswdAuthenticator) middleware(next http.Handler) http.Handler {
 }
 
 // unauthorized writes the SPEC5 §9.7.5 401 response with
-// WWW-Authenticate. reason flows into acu_admin_auth_failures_total
-// (wired by counter wiring in a later commit).
-func (a *htpasswdAuthenticator) unauthorized(w http.ResponseWriter, _ string) {
+// WWW-Authenticate. The response body is identical for every
+// failure reason (timing parity); the operator-visible distinction
+// flows through acu_admin_auth_failures_total instead.
+func (a *htpasswdAuthenticator) unauthorized(w http.ResponseWriter) {
 	w.Header().Set("WWW-Authenticate", `Basic realm="apt-cacher-ultra admin"`)
 	http.Error(w, "auth required", http.StatusUnauthorized)
 }

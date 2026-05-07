@@ -138,14 +138,15 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		s.logger.Info("at_rest_scan_finished",
 			"blob_count", 0, "mismatch_count", 0,
 			"duration_ms", s.now().Sub(start).Milliseconds())
+		atRestScansTotal.Inc()
 		return nil
 	}
 
 	work := make(chan cache.IntegrityCandidate)
 	var (
-		wg          sync.WaitGroup
-		mismatches  int64
-		ioErrors    int64
+		wg         sync.WaitGroup
+		mismatches int64
+		ioErrors   int64
 	)
 	workers := s.workers
 	if workers > len(candidates) {
@@ -186,6 +187,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		"mismatch_count", atomic.LoadInt64(&mismatches),
 		"io_error_count", atomic.LoadInt64(&ioErrors),
 		"duration_ms", s.now().Sub(start).Milliseconds())
+	atRestScansTotal.Inc()
 	return nil
 }
 
@@ -233,6 +235,8 @@ func (s *Scanner) verifyOne(ctx context.Context, c cache.IntegrityCandidate) err
 		"observed_sha256", got,
 		"snapshot_id", c.SnapshotID,
 		"source", c.SourceTable)
+	atRestCorruptionTotal.Inc()
+	hashValidationFailureTotal.Inc("at_rest")
 
 	if err := s.cache.DiscardFinalizedBlob(c.BlobHash); err != nil {
 		s.logger.Warn("integrity: discard blob failed", "err", err,

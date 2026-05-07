@@ -423,9 +423,9 @@ func TestPhase3StrictMode_NonDebPathsPassthrough(t *testing.T) {
 	adoptCoverageComplete(t, h, scheme, canonHost, "/dists/noble", true)
 
 	cases := []string{
-		"/pool/main/u/util/util_1.0.tar.xz",  // source tarball
-		"/pool/main/u/util/util_1.0.tar.gz",  // older source tarball
-		"/pool/main/u/util/util_1.0.dsc",     // source description
+		"/pool/main/u/util/util_1.0.tar.xz",     // source tarball
+		"/pool/main/u/util/util_1.0.tar.gz",     // older source tarball
+		"/pool/main/u/util/util_1.0.dsc",        // source description
 		"/pool/main/u/util/util_1.0_amd64.udeb", // debian-installer udeb
 	}
 	for _, p := range cases {

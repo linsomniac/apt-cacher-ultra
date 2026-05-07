@@ -19,6 +19,11 @@ import (
 // request-path Inc/Observe/Set. This handler just routes the bytes
 // to the response writer.
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	start := time.Now()
+	defer func() {
+		s.self.scrapeTotal.Inc()
+		s.self.scrapeDurationSeconds.Observe(time.Since(start).Seconds())
+	}()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	s.cfg.Registry.Render(w)
 }
@@ -36,21 +41,25 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if s.shuttingDown.Load() {
 		writeHealthzFail(w, "shutdown")
+		s.self.healthzTotal.Inc("degraded")
 		return
 	}
 	if err := s.checkCacheDirWritable(); err != nil {
 		writeHealthzFail(w, "cache_dir")
+		s.self.healthzTotal.Inc("degraded")
 		return
 	}
 	pingCtx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
 	defer cancel()
 	if err := s.cfg.Cache.Ping(pingCtx); err != nil {
 		writeHealthzFail(w, "db_ping")
+		s.self.healthzTotal.Inc("degraded")
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
+	s.self.healthzTotal.Inc("ok")
 }
 
 // checkCacheDirWritable creates a unique-suffix temp file under
