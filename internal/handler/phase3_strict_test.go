@@ -1,10 +1,15 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,6 +20,105 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 )
+
+// strictLogBuf captures slog JSON records so strict-mode tests can
+// assert per-request outcome strings and structured event fields.
+type strictLogBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *strictLogBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *strictLogBuf) records() []map[string]any {
+	b.mu.Lock()
+	s := b.buf.String()
+	b.mu.Unlock()
+	var out []map[string]any
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err == nil {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+func (b *strictLogBuf) find(msg string) []map[string]any {
+	var out []map[string]any
+	for _, r := range b.records() {
+		if v, ok := r["msg"].(string); ok && v == msg {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// newPhase3StrictHandlerCapturing is newPhase3StrictHandler with a JSON-
+// capture logger so tests can assert log fields. The Handler's logger
+// writes JSON to the returned buffer; the cache and fetch loggers are
+// kept silent to avoid coupling the assertions to lower-layer chatter.
+func newPhase3StrictHandlerCapturing(t *testing.T,
+	refuseUnvouched, adoptionEnabled bool,
+	upstreamHits *atomic.Int32) (*Handler, *httptest.Server, *strictLogBuf) {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if upstreamHits != nil {
+			upstreamHits.Add(1)
+		}
+		_, _ = w.Write([]byte("upstream bytes"))
+	}))
+	t.Cleanup(srv.Close)
+
+	parser, err := proxy.New(nil, nil)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	c, err := cache.Open(context.Background(), t.TempDir(), silentLogger())
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	fc, err := fetch.New(fetch.Options{
+		ConnectTimeout:   2 * time.Second,
+		TotalTimeout:     5 * time.Second,
+		MaxRetries:       1,
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		DenyTargetRanges: nil,
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("fetch.New: %v", err)
+	}
+
+	logBuf := &strictLogBuf{}
+	captureLogger := slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	h, err := New(Config{
+		Parser:              parser,
+		Cache:               c,
+		Fetch:               fc,
+		HostLimiter:         hostsem.New(4),
+		Logger:              captureLogger,
+		Serve:               config.ServeConfig{},
+		RefuseUnvouchedDebs: refuseUnvouched,
+		AdoptionEnabled:     adoptionEnabled,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return h, srv, logBuf
+}
 
 // newPhase3StrictHandler builds a Handler wired with the SPEC3 §6.1
 // strict-mode flags. refuseUnvouched and adoptionEnabled are explicit
@@ -336,5 +440,130 @@ func TestPhase3StrictMode_NonDebPathsPassthrough(t *testing.T) {
 				t.Errorf("non-.deb %s: did not reach upstream", p)
 			}
 		})
+	}
+}
+
+// TestPhase3StrictMode_HitPathLogsUnvouchedRefusedOutcome covers two
+// codex review findings against the SPEC3 §10 contract:
+//
+//   - SPEC3 §10.1: the per-request log line for the strict-mode 502
+//     must carry outcome=unvouched_deb_refused. The hit-path branch
+//     was previously logging the generic "hit" outcome because
+//     checkPackageHash wrote the 502 directly and ServeHTTP only saw
+//     served=true. Pivoting on this outcome is how operators
+//     distinguish the strict-mode refusal from bad_gateway and
+//     package_hash_mismatch.
+//
+//   - SPEC3 §10.2: the structured unvouched_deb_refused event carries
+//     current_snapshot_count, the size of the host's current snapshot
+//     set the strict-mode predicate inspected. The hit path was
+//     hardcoding 0; the spec describes this as an operator-facing
+//     field, so it must reflect the predicate's actual input.
+func TestPhase3StrictMode_HitPathLogsUnvouchedRefusedOutcome(t *testing.T) {
+	var upstreamHits atomic.Int32
+	h, srv, logBuf := newPhase3StrictHandlerCapturing(t, true, true, &upstreamHits)
+
+	scheme, host, port := splitURL(t, srv.URL)
+	canonHost := hostKey(host, port)
+	const debP = "/pool/main/p/phase1/phase1.deb"
+
+	// Phase 1 prime: url_path row + blob in cache.
+	primer := httptest.NewRecorder()
+	h.ServeHTTP(primer, proxyReq("GET", srv.URL, debP))
+	if primer.Code != http.StatusOK {
+		t.Fatalf("primer: %d", primer.Code)
+	}
+
+	// Adopt a full-coverage snapshot that does NOT include this .deb.
+	adoptCoverageComplete(t, h, scheme, canonHost, "/dists/noble", true)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, debP))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502 (hit-path strict refusal)", rec.Code)
+	}
+
+	// SPEC3 §10.1: the per-request "request" line for THIS path must
+	// carry outcome=unvouched_deb_refused, not the generic "hit". The
+	// primer also emitted a request log (outcome=miss), so filter by
+	// path + status to isolate the refusal record.
+	requests := logBuf.find("request")
+	var refusalLine map[string]any
+	for _, r := range requests {
+		if r["path"] != debP {
+			continue
+		}
+		statusF, _ := r["status"].(float64)
+		if int(statusF) != http.StatusBadGateway {
+			continue
+		}
+		refusalLine = r
+		break
+	}
+	if refusalLine == nil {
+		t.Fatalf("no per-request 502 log line found for %s; got %d 'request' records", debP, len(requests))
+	}
+	if got, _ := refusalLine["outcome"].(string); got != "unvouched_deb_refused" {
+		t.Errorf("per-request outcome = %q, want %q (SPEC3 §10.1)", got, "unvouched_deb_refused")
+	}
+
+	// SPEC3 §10.2: the structured event must carry the actual count
+	// of current snapshots inspected (here: 1 — adoptCoverageComplete
+	// commits exactly one snapshot for the host).
+	events := logBuf.find("unvouched_deb_refused")
+	if len(events) == 0 {
+		t.Fatalf("no unvouched_deb_refused structured event captured")
+	}
+	var ev map[string]any
+	for _, e := range events {
+		if e["path"] == debP {
+			ev = e
+			break
+		}
+	}
+	if ev == nil {
+		t.Fatalf("no unvouched_deb_refused event for path %s; got %d events", debP, len(events))
+	}
+	count, ok := ev["current_snapshot_count"].(float64)
+	if !ok {
+		t.Fatalf("current_snapshot_count missing or not numeric: %v", ev["current_snapshot_count"])
+	}
+	if int(count) != 1 {
+		t.Errorf("current_snapshot_count = %v, want 1 (one full-coverage snapshot adopted)", count)
+	}
+}
+
+// TestPhase3StrictMode_MissPathPopulatesSnapshotCount mirrors the hit-
+// path test on the miss branch (no prior url_path row). Asserts the
+// SPEC3 §10.2 current_snapshot_count field is the actual count.
+func TestPhase3StrictMode_MissPathPopulatesSnapshotCount(t *testing.T) {
+	var upstreamHits atomic.Int32
+	h, srv, logBuf := newPhase3StrictHandlerCapturing(t, true, true, &upstreamHits)
+
+	scheme, host, port := splitURL(t, srv.URL)
+	canonHost := hostKey(host, port)
+
+	// Adopt two full-coverage snapshots under different suite paths
+	// — the strict-mode predicate's count is the size of the host's
+	// current snapshot set, not the number of suites.
+	adoptCoverageComplete(t, h, scheme, canonHost, "/dists/noble", true)
+	adoptCoverageComplete(t, h, scheme, canonHost, "/dists/jammy", true)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/pool/main/u/unknown/unknown.deb"))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502 (miss-path strict refusal)", rec.Code)
+	}
+
+	events := logBuf.find("unvouched_deb_refused")
+	if len(events) == 0 {
+		t.Fatalf("no unvouched_deb_refused structured event captured")
+	}
+	count, ok := events[0]["current_snapshot_count"].(float64)
+	if !ok {
+		t.Fatalf("current_snapshot_count missing or not numeric: %v", events[0]["current_snapshot_count"])
+	}
+	if int(count) != 2 {
+		t.Errorf("current_snapshot_count = %v, want 2 (two full-coverage snapshots adopted)", count)
 	}
 }

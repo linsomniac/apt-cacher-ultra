@@ -878,14 +878,6 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 	// same Release declare identical content, so deduplication is
 	// load-bearing for the package_hash primary key.
 	dedup := make(map[string]debPathDecl)
-	// (Package, Architecture) → first debPath. SPEC3 §7.5.3 hot-set
-	// matching is per (Package, Arch); a Release that lists two
-	// distinct .deb paths with the same (Package, Arch) is a real
-	// pathology — the Stage 2 lookup would pick one arbitrarily, and
-	// hot prefetch would warm only that one. apt itself routes by
-	// filename, so this would also confuse package selection. Fail
-	// adoption closed.
-	pkgArchSeen := make(map[string]string) // "pkg|arch" -> debPath
 	for _, m := range members {
 		if !isPackagesMember(m.Path) {
 			continue
@@ -934,19 +926,10 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 					architecture: ref.Architecture,
 				}
 			}
-			// Cross-debPath (Package, Arch) collision check — only
-			// when both fields are populated. Empty values are
-			// pre-v3-style stanzas (parser's missing-field shape);
-			// they don't enter the hot-set Stage 2 query and so
-			// can't trigger arbitrary-path-selection there.
-			if ref.Package != "" && ref.Architecture != "" {
-				key := ref.Package + "|" + ref.Architecture
-				if priorPath, dup := pkgArchSeen[key]; dup && priorPath != debPath {
-					return packageHashBuildResult{}, fmt.Errorf("%w: (Package=%q, Architecture=%q) covers both %q and %q — Release lists two distinct paths for the same identity tuple, which the SPEC3 §7.5.3 hot-set Stage 2 lookup cannot disambiguate",
-						ErrAdoptionParseFailed, ref.Package, ref.Architecture, priorPath, debPath)
-				}
-				pkgArchSeen[key] = debPath
-			}
+			// SPEC3 §7.5.3 Stage 2 returns *every* matching path for a
+			// hot (Package, Arch) pair — multiple debPaths sharing one
+			// (Package, Arch) within a single snapshot is allowed.
+			// They all flow through the hot-set list and get prefetched.
 		}
 	}
 

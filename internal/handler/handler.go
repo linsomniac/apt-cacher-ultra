@@ -251,8 +251,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fast path: SPEC §6.1.
-	if served, status, body := h.tryCacheHit(w, r, req, start); served {
-		h.logRequest(r, req.CanonicalHost, req.Path, "hit", status, body, false, 0, start)
+	if served, outcome, status, body := h.tryCacheHit(w, r, req, start); served {
+		if outcome == "" {
+			outcome = "hit"
+		}
+		h.logRequest(r, req.CanonicalHost, req.Path, outcome, status, body, false, 0, start)
 		return
 	}
 
@@ -298,14 +301,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // The fast path on every successful return is one DB read, one stat, one
 // open(2), and one ServeContent — order-of-microseconds.
-func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, status int, bytesWritten int64) {
+func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, outcome string, status int, bytesWritten int64) {
 	if req.IsMetadata && req.SuitePath != "" {
 		if served, status, body, handled := h.trySnapshotHit(w, r, req, start); handled {
-			return served, status, body
+			return served, "", status, body
 		}
 	}
-	if served, status, body := h.tryURLPathHit(w, r, req); served {
-		return served, status, body
+	if served, outcome, status, body := h.tryURLPathHit(w, r, req); served {
+		return served, outcome, status, body
 	}
 	// SPEC2 §0 #4: when both lookups missed for a non-adopted metadata
 	// path of the form .../by-hash/SHA256/<hex>, the existing pool/
@@ -315,9 +318,10 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 	// snapshot_member row, but the gate above ensures we never bypass
 	// an adopted suite's §6.1 contract.
 	if req.IsMetadata {
-		return h.tryByHashContentAddressed(w, r, req)
+		served, status, body := h.tryByHashContentAddressed(w, r, req)
+		return served, "", status, body
 	}
-	return false, 0, 0
+	return false, "", 0, 0
 }
 
 // trySnapshotHit is the SPEC2 §6.1 metadata fast path. Returns
@@ -431,28 +435,28 @@ func (h *Handler) writeFailClosed(w http.ResponseWriter, reason string) bool {
 //     §6.2 miss path).
 //   - 2+ distinct declared hashes → 502 + Retry-After 60, log
 //     package_hash_conflict.
-func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, status int, bytesWritten int64) {
+func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, outcome string, status int, bytesWritten int64) {
 	row, err := h.cache.LookupURL(r.Context(), req.CanonicalScheme, req.CanonicalHost, req.Path)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
-		return false, 0, 0
+		return false, "", 0, 0
 	case err != nil:
 		h.logger.Warn("cache lookup failed",
 			"err", err,
 			"canonical_host", req.CanonicalHost,
 			"path", req.Path,
 		)
-		return false, 0, 0
+		return false, "", 0, 0
 	}
 	if row.BlobHash == nil || *row.BlobHash == "" {
-		return false, 0, 0
+		return false, "", 0, 0
 	}
 
 	if !req.IsMetadata {
-		if served, status, body, fellThrough := h.checkPackageHash(w, r, req, *row.BlobHash); fellThrough {
-			return false, 0, 0
+		if served, outcome, status, body, fellThrough := h.checkPackageHash(w, r, req, *row.BlobHash); fellThrough {
+			return false, "", 0, 0
 		} else if served {
-			return true, status, body
+			return true, outcome, status, body
 		}
 	}
 
@@ -460,11 +464,11 @@ func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *pro
 		lastFetchedAt: row.LastFetchedAt,
 	})
 	if !served {
-		return false, 0, 0
+		return false, "", 0, 0
 	}
 	go h.touchAsync(req)
 	h.maybeFireFreshness(req)
-	return true, status, bytesWritten
+	return true, "", status, bytesWritten
 }
 
 // byHashSuffixRegex matches the trailing "/by-hash/SHA256/<64hex>" of a
@@ -596,11 +600,16 @@ func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
 
 // checkPackageHash runs the SPEC2 §6.1 defense-in-depth on a .deb hit.
 //
-// Returns served=true when the function wrote a 502 (conflict) directly.
-// Returns fellThrough=true when the row was evicted and the caller
-// should drop to the miss path. Returns both false when the hash check
-// passed (or no rows exist) and the caller should serve normally.
-func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string) (served bool, status int, bytesWritten int64, fellThrough bool) {
+// Returns served=true when the function wrote a 502 (conflict or strict-
+// mode refusal) directly. The outcome string is set to a non-empty
+// per-request label whenever the response is *not* a normal "hit" —
+// SPEC3 §10.1 requires the strict-mode hit path to log
+// outcome=unvouched_deb_refused, mirroring the miss-path
+// ErrUnvouchedDebRefused branch. Returns fellThrough=true when the row
+// was evicted and the caller should drop to the miss path. Returns all
+// zero/empty when the hash check passed (or no rows exist) and the
+// caller should serve normally.
+func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool) {
 	rows, err := h.cache.DeclaredHashesForPath(r.Context(),
 		req.CanonicalScheme, req.CanonicalHost, req.Path)
 	if err != nil {
@@ -612,7 +621,7 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 		// Fall through to a normal serve — the on-disk url_path row is
 		// our best Phase-1-grade answer. A hard fail-closed here would
 		// turn a transient SQLite hiccup into a global .deb 502 storm.
-		return false, 0, 0, false
+		return false, "", 0, 0, false
 	}
 	distinct := distinctDeclared(rows)
 	switch len(distinct) {
@@ -625,22 +634,22 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 		// non-.deb non-metadata fetches are not in package_hash by
 		// design and must fall through.
 		if !isDebPath(req.Path) {
-			return false, 0, 0, false
+			return false, "", 0, 0, false
 		}
-		switch outcome, snapID := h.classifyStrictMode(r.Context(),
-			req.CanonicalScheme, req.CanonicalHost); outcome {
+		switch sm, snapID, count := h.classifyStrictMode(r.Context(),
+			req.CanonicalScheme, req.CanonicalHost); sm {
 		case strictRefuse:
-			st, body := h.refuseUnvouchedDeb(w, req.CanonicalHost, req.Path, 0)
-			return true, st, body, false
+			st, body := h.refuseUnvouchedDeb(w, req.CanonicalHost, req.Path, count)
+			return true, "unvouched_deb_refused", st, body, false
 		case strictPassthrough:
 			h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)
 			fallthrough
 		default:
-			return false, 0, 0, false
+			return false, "", 0, 0, false
 		}
 	case 1:
 		if distinct[0] == blobHash {
-			return false, 0, 0, false
+			return false, "", 0, 0, false
 		}
 		// One row mismatches: stale Phase 1 row covered by a Phase 2
 		// snapshot has diverged. Evict + drop into miss path.
@@ -661,7 +670,7 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 			"declared_sha256", distinct[0],
 			"snapshot_id", rows[0].SnapshotID,
 		)
-		return false, 0, 0, true
+		return false, "", 0, 0, true
 	default:
 		// Two or more distinct hashes: snapshots disagree. SPEC2 §6.1
 		// step 6 / §6.2 share fail-closed behavior — 502 + Retry-After
@@ -675,7 +684,7 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 			"row_blob_hash", blobHash,
 			"declared", declaredAttrs(rows),
 		)
-		return true, http.StatusBadGateway, 0, false
+		return true, "package_hash_conflict", http.StatusBadGateway, 0, false
 	}
 }
 
@@ -1182,13 +1191,13 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 			// predicate must not refuse source tarballs, udebs, etc.
 			// that legitimately have no package_hash row.
 			if len(distinct) == 0 && isDebPath(req.Path) {
-				switch outcome, snapID := h.classifyStrictMode(ctx,
-					req.CanonicalScheme, req.CanonicalHost); outcome {
+				switch sm, snapID, count := h.classifyStrictMode(ctx,
+					req.CanonicalScheme, req.CanonicalHost); sm {
 				case strictRefuse:
 					h.logger.Info("unvouched_deb_refused",
 						"canonical_host", req.CanonicalHost,
 						"path", req.Path,
-						"current_snapshot_count", 0,
+						"current_snapshot_count", count,
 					)
 					return sfResult{err: ErrUnvouchedDebRefused}
 				case strictPassthrough:
@@ -1737,11 +1746,15 @@ const (
 // classifyStrictMode runs the SPEC3 §6.1 predicate against a .deb
 // request whose canonical (scheme, host, path) is currently unvouched
 // (no row in package_hash for any current snapshot). Returns the
-// outcome and, on strictPassthrough, the id of the first incomplete-
-// coverage snapshot encountered (used in the once-per-hour log line).
-func (h *Handler) classifyStrictMode(ctx context.Context, scheme, host string) (strictModeOutcome, int64) {
+// outcome, the id of the first incomplete-coverage snapshot
+// encountered (used in the strictPassthrough once-per-hour log line —
+// 0 outside the strictPassthrough branch), and the count of current
+// snapshots inspected (the value SPEC3 §10.2 names
+// `current_snapshot_count` on the `unvouched_deb_refused` event; 0 on
+// fail-open paths where no inspection occurred).
+func (h *Handler) classifyStrictMode(ctx context.Context, scheme, host string) (strictModeOutcome, int64, int) {
 	if !h.refuseUnvouchedDebs || !h.adoptionEnabled {
-		return strictInactive, 0
+		return strictInactive, 0, 0
 	}
 	rows, err := h.cache.HostCurrentSnapshotsCoverage(ctx, scheme, host)
 	if err != nil {
@@ -1754,23 +1767,24 @@ func (h *Handler) classifyStrictMode(ctx context.Context, scheme, host string) (
 			"err", err,
 			"canonical_host", host,
 		)
-		return strictInactive, 0
+		return strictInactive, 0, 0
 	}
 	if len(rows) == 0 {
 		// Host has no adopted suites — strict mode has no contract to
 		// uphold. Phase 1 trust-upstream regime.
-		return strictInactive, 0
+		return strictInactive, 0, 0
 	}
+	count := len(rows)
 	// Walk all current snapshots; refuse only when every one has
 	// coverage_complete = 1. Surface the first incomplete-coverage
 	// snapshot id for the passthrough log so an operator can pivot
 	// to that snapshot's package_coverage_incomplete line.
 	for _, sc := range rows {
 		if !sc.PackageCoverageComplete {
-			return strictPassthrough, sc.SnapshotID
+			return strictPassthrough, sc.SnapshotID, count
 		}
 	}
-	return strictRefuse, 0
+	return strictRefuse, 0, count
 }
 
 // logUnvouchedPassthrough emits unvouched_deb_passthrough_no_coverage

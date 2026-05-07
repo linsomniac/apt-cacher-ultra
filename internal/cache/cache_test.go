@@ -2765,22 +2765,24 @@ func TestComputeHotSet_RejectsCandidateMismatch(t *testing.T) {
 	}
 }
 
-// TestComputeHotSet_RejectsCandidateDuplicate covers the second
-// in-memory contract: duplicate (Package, Architecture) keys in the
-// candidate slice are a programming error (buildPackageHashes
-// rejects them in production). The cache layer fails closed rather
-// than silently picking one row.
-func TestComputeHotSet_RejectsCandidateDuplicate(t *testing.T) {
+// TestComputeHotSet_DuplicatePackageArchEmitsAllPaths covers the
+// SPEC3 §7.5.3 Stage 2 contract: when the candidate snapshot has
+// multiple debPaths sharing one (Package, Architecture), Stage 2's
+// `SELECT path, declared_sha256 ... WHERE (package_name,
+// architecture) IN (...)` returns every match, and all of them
+// graduate to the hot-prefetch list. Empirically rare in production
+// apt repos but allowed by the spec.
+func TestComputeHotSet_DuplicatePackageArchEmitsAllPaths(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	scheme, host := "http", "archive.example"
 
-	rOld := seedBlob(t, c, "InRelease v1 dup")
+	rOld := seedBlob(t, c, "InRelease v1 dup-allowed")
 	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &rOld,
 	})
-	debHash := seedBlob(t, c, "dup deb bytes")
+	debHash := seedBlob(t, c, "dup-allowed deb bytes")
 	pathOld := "/pool/main/d/dup/dup_1.0_amd64.deb"
 	if err := c.CommitAdoption(ctx, idPrior,
 		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}},
@@ -2793,32 +2795,49 @@ func TestComputeHotSet_RejectsCandidateDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := nowUnix()
-	_ = c.PutURLPath(ctx, URLPath{
+	if err := c.PutURLPath(ctx, URLPath{
 		CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
 		BlobHash: ptrStr(debHash), UpstreamURL: "u",
 		LastRequestedAt: &now, RequestCount: 1,
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	const idCandidate = int64(999)
-	dup := []PackageHash{
+	hash2 := seedBlob(t, c, "dup-allowed v2")
+	hash3 := seedBlob(t, c, "dup-allowed v3")
+	cand := []PackageHash{
 		{
 			CanonicalScheme: scheme, CanonicalHost: host,
 			SnapshotID: idCandidate,
 			Path:       "/pool/main/d/dup/dup_2.0_amd64.deb",
-			DeclaredSHA256: debHash,
+			DeclaredSHA256: hash2,
 			PackageName: "dup", Architecture: "amd64",
 		},
 		{
 			CanonicalScheme: scheme, CanonicalHost: host,
 			SnapshotID: idCandidate,
 			Path:       "/pool/main/d/dup/dup_3.0_amd64.deb",
-			DeclaredSHA256: debHash,
+			DeclaredSHA256: hash3,
 			PackageName: "dup", Architecture: "amd64",
 		},
 	}
-	_, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idCandidate, dup, 86400, now)
-	if !errors.Is(err, ErrHotSetCandidateDuplicate) {
-		t.Errorf("err = %v, want ErrHotSetCandidateDuplicate", err)
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idCandidate, cand, 86400, now)
+	if err != nil {
+		t.Fatalf("ComputeHotSet: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d entries, want 2 (both candidate paths for the hot pair)", len(got))
+	}
+	seen := map[string]string{}
+	for _, e := range got {
+		seen[e.Path] = e.DeclaredSHA256
+	}
+	if seen["/pool/main/d/dup/dup_2.0_amd64.deb"] != hash2 {
+		t.Errorf("missing/wrong v2 entry: %v", seen)
+	}
+	if seen["/pool/main/d/dup/dup_3.0_amd64.deb"] != hash3 {
+		t.Errorf("missing/wrong v3 entry: %v", seen)
 	}
 }
 

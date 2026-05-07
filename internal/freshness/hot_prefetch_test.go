@@ -325,13 +325,14 @@ func TestRunHotPrefetch_EmptyHotSet(t *testing.T) {
 	}
 }
 
-// TestBuildPackageHashes_RejectsDuplicatePackageArch covers the
-// codex-flagged finding 4: a Release whose Packages text declares
-// two distinct .deb paths for the same (Package, Arch) tuple is a
-// pathology — the SPEC3 §7.5.3 hot-set Stage 2 lookup uses QueryRow
-// and would silently pick one. buildPackageHashes must fail closed
-// with adoption_parse_failed.
-func TestBuildPackageHashes_RejectsDuplicatePackageArch(t *testing.T) {
+// TestBuildPackageHashes_AllowsDuplicatePackageArch: SPEC3 §7.5.3
+// Stage 2 SQL is a multi-row SELECT — when the candidate snapshot
+// has two distinct debPaths sharing a single (Package, Architecture),
+// both rows survive into package_hash and both will be warmed by the
+// hot-prefetch loop. Empirically rare in production apt repos but
+// not forbidden by the spec, and rejecting it would block legitimate
+// (if unusual) Release files.
+func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 	dir := t.TempDir()
 	c, err := cache.Open(context.Background(), dir, nil)
 	if err != nil {
@@ -342,10 +343,6 @@ func TestBuildPackageHashes_RejectsDuplicatePackageArch(t *testing.T) {
 	logger := slog.Default()
 	a := &Adopter{cache: c, logger: logger}
 
-	// Two stanzas with same (Package, Architecture) but different
-	// Filenames. apt itself would not produce this normally, but
-	// a malformed signed Release could. The hot-set query MUST be
-	// kept deterministic — fail closed.
 	debHashA := strings.Repeat("a", 64)
 	debHashB := strings.Repeat("b", 64)
 	pkgs := []byte(
@@ -357,10 +354,6 @@ func TestBuildPackageHashes_RejectsDuplicatePackageArch(t *testing.T) {
 			"Size: 1\nSHA256: " + debHashB + "\n",
 	)
 	pkgsBlob := writeFixtureBlob(t, c, pkgs)
-	releaseText, _ := makeRelease(map[string][]byte{
-		"main/binary-amd64/Packages": pkgs,
-	})
-	_ = releaseText
 
 	suiteRef := SuiteRef{
 		CanonicalScheme: "http",
@@ -370,18 +363,25 @@ func TestBuildPackageHashes_RejectsDuplicatePackageArch(t *testing.T) {
 	members := []ReleaseMember{
 		{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))},
 	}
-	_, err = a.buildPackageHashes(suiteRef, 1, members)
-	if err == nil {
-		t.Fatal("expected error for duplicate (Package, Arch); got nil")
+	res, err := a.buildPackageHashes(suiteRef, 1, members)
+	if err != nil {
+		t.Fatalf("buildPackageHashes: unexpected error: %v", err)
 	}
-	if !errors.Is(err, ErrAdoptionParseFailed) {
-		t.Errorf("err = %v, want wraps ErrAdoptionParseFailed", err)
+	if len(res.rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(res.rows))
 	}
-	// The error message must name both paths — operator surface
-	// must point at exactly which two .debs collided.
-	msg := err.Error()
-	if !strings.Contains(msg, "nginx_1.0_amd64.deb") || !strings.Contains(msg, "nginx_2.0_amd64.deb") {
-		t.Errorf("err = %v, want both filenames mentioned", err)
+	seen := map[string]string{}
+	for _, r := range res.rows {
+		if r.PackageName != "nginx" || r.Architecture != "amd64" {
+			t.Errorf("row has unexpected (Package, Arch): %q/%q", r.PackageName, r.Architecture)
+		}
+		seen[r.Path] = r.DeclaredSHA256
+	}
+	if seen["/pool/main/n/nginx/nginx_1.0_amd64.deb"] != debHashA {
+		t.Errorf("missing/wrong v1 row: %v", seen)
+	}
+	if seen["/pool/main/n/nginx/nginx_2.0_amd64.deb"] != debHashB {
+		t.Errorf("missing/wrong v2 row: %v", seen)
 	}
 }
 

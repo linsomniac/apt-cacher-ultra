@@ -20,15 +20,6 @@ var ErrNotFound = errors.New("cache: not found")
 // fails loudly instead of warming the wrong rows.
 var ErrHotSetCandidateMismatch = errors.New("cache: hot-set candidate row metadata mismatch")
 
-// ErrHotSetCandidateDuplicate is returned by ComputeHotSet when the
-// caller-supplied candidate slice contains two distinct rows with
-// the same non-empty (PackageName, Architecture) tuple. SPEC3
-// §7.5.3 expects exactly one (path, declared_sha256) per
-// (Package, Arch) in any one snapshot; buildPackageHashes already
-// rejects this in production, so the cache layer fails closed on a
-// programming error rather than silently picking one row.
-var ErrHotSetCandidateDuplicate = errors.New("cache: hot-set candidate (Package, Architecture) duplicate")
-
 // LookupURL returns the url_path row for (canonicalScheme, canonicalHost,
 // path), or ErrNotFound. Reads use the connection pool directly; this is
 // the hot path on every cache hit.
@@ -337,13 +328,14 @@ SELECT DISTINCT ph.package_name, ph.architecture
 
 	// Stage 2: build an index of the candidate's in-memory rows by
 	// (Package, Arch) and resolve each Stage-1 hot pair. SPEC3 §7.5.3
-	// expects a single (path, declared_sha256) per (Package, Arch) in
-	// any one snapshot; buildPackageHashes already rejects Release
-	// files that violate that constraint, so a single-row mapping is
-	// safe — duplicate keys in the candidate slice are a contract
-	// violation we surface as an error.
+	// Stage 2 is `SELECT path, declared_sha256 ... WHERE (package_name,
+	// architecture) IN (...)` — every matching row is returned, so a
+	// single hot pair can map to multiple debPaths and all of them get
+	// prefetched. Within a single candidate the same debPath cannot
+	// appear twice (buildPackageHashes dedups by Filename), but two
+	// distinct paths sharing one (Package, Arch) is allowed.
 	type key struct{ pkg, arch string }
-	candIdx := make(map[key]PackageHash, len(candidatePackageHashes))
+	candIdx := make(map[key][]PackageHash, len(candidatePackageHashes))
 	for _, ph := range candidatePackageHashes {
 		if ph.CanonicalScheme != scheme ||
 			ph.CanonicalHost != host ||
@@ -357,16 +349,11 @@ SELECT DISTINCT ph.package_name, ph.architecture
 			continue
 		}
 		k := key{ph.PackageName, ph.Architecture}
-		if existing, dup := candIdx[k]; dup {
-			return nil, fmt.Errorf("%w: (%s, %s) maps to both %q and %q",
-				ErrHotSetCandidateDuplicate,
-				ph.PackageName, ph.Architecture, existing.Path, ph.Path)
-		}
-		candIdx[k] = ph
+		candIdx[k] = append(candIdx[k], ph)
 	}
 	out := make([]HotSetEntry, 0, len(pairs))
 	for _, pa := range pairs {
-		ph, ok := candIdx[key{pa.pkg, pa.arch}]
+		matches, ok := candIdx[key{pa.pkg, pa.arch}]
 		if !ok {
 			// Hot pair (Package, Arch) is no longer in the candidate
 			// snapshot — upstream removed the package between
@@ -374,7 +361,9 @@ SELECT DISTINCT ph.package_name, ph.architecture
 			// drop from the hot set.
 			continue
 		}
-		out = append(out, HotSetEntry{Path: ph.Path, DeclaredSHA256: ph.DeclaredSHA256})
+		for _, ph := range matches {
+			out = append(out, HotSetEntry{Path: ph.Path, DeclaredSHA256: ph.DeclaredSHA256})
+		}
 	}
 	return out, nil
 }
