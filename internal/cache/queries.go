@@ -11,6 +11,24 @@ import (
 // "miss" (caller's normal flow) from real DB errors.
 var ErrNotFound = errors.New("cache: not found")
 
+// ErrHotSetCandidateMismatch is returned by ComputeHotSet when a
+// caller-supplied candidate row's (CanonicalScheme, CanonicalHost,
+// SnapshotID) tuple does not match the (scheme, host,
+// candidateSnapshotID) inputs. The old SQL Stage 2 enforced this
+// implicitly via the WHERE clause; the in-memory form must surface
+// the contract violation explicitly so a future caller mismatch
+// fails loudly instead of warming the wrong rows.
+var ErrHotSetCandidateMismatch = errors.New("cache: hot-set candidate row metadata mismatch")
+
+// ErrHotSetCandidateDuplicate is returned by ComputeHotSet when the
+// caller-supplied candidate slice contains two distinct rows with
+// the same non-empty (PackageName, Architecture) tuple. SPEC3
+// §7.5.3 expects exactly one (path, declared_sha256) per
+// (Package, Arch) in any one snapshot; buildPackageHashes already
+// rejects this in production, so the cache layer fails closed on a
+// programming error rather than silently picking one row.
+var ErrHotSetCandidateDuplicate = errors.New("cache: hot-set candidate (Package, Architecture) duplicate")
+
 // LookupURL returns the url_path row for (canonicalScheme, canonicalHost,
 // path), or ErrNotFound. Reads use the connection pool directly; this is
 // the hot path on every cache hit.
@@ -243,6 +261,15 @@ FROM suite_freshness`
 // §12.3 chaos tests to pin which deb is FIRST vs LAST in iteration
 // when budget elapses mid-loop.
 //
+// candidateSnapshotID is required so Stage 2 can validate the
+// caller-supplied rows belong to the snapshot being adopted. The old
+// SQL form scoped Stage 2 by snapshot_id implicitly; the in-memory
+// form must enforce the same invariant explicitly. A row whose
+// (CanonicalScheme, CanonicalHost, SnapshotID) does not match the
+// (scheme, host, candidateSnapshotID) inputs is a programming error
+// — return ErrHotSetCandidateMismatch so a future misuse fails loud
+// rather than warming the wrong rows.
+//
 // Empty inputs are handled gracefully:
 //   - priorSnapshotID == 0: returns an empty slice (a fresh suite with
 //     no prior adoption has nothing to mine).
@@ -263,6 +290,7 @@ FROM suite_freshness`
 func (c *Cache) ComputeHotSet(ctx context.Context,
 	scheme, host string,
 	priorSnapshotID int64,
+	candidateSnapshotID int64,
 	candidatePackageHashes []PackageHash,
 	hotWindowSeconds int64,
 	now int64) ([]HotSetEntry, error) {
@@ -312,14 +340,29 @@ SELECT DISTINCT ph.package_name, ph.architecture
 	// expects a single (path, declared_sha256) per (Package, Arch) in
 	// any one snapshot; buildPackageHashes already rejects Release
 	// files that violate that constraint, so a single-row mapping is
-	// safe.
+	// safe — duplicate keys in the candidate slice are a contract
+	// violation we surface as an error.
 	type key struct{ pkg, arch string }
 	candIdx := make(map[key]PackageHash, len(candidatePackageHashes))
 	for _, ph := range candidatePackageHashes {
+		if ph.CanonicalScheme != scheme ||
+			ph.CanonicalHost != host ||
+			ph.SnapshotID != candidateSnapshotID {
+			return nil, fmt.Errorf("%w: row {%s/%s/%d} does not match candidate {%s/%s/%d}",
+				ErrHotSetCandidateMismatch,
+				ph.CanonicalScheme, ph.CanonicalHost, ph.SnapshotID,
+				scheme, host, candidateSnapshotID)
+		}
 		if ph.PackageName == "" || ph.Architecture == "" {
 			continue
 		}
-		candIdx[key{ph.PackageName, ph.Architecture}] = ph
+		k := key{ph.PackageName, ph.Architecture}
+		if existing, dup := candIdx[k]; dup {
+			return nil, fmt.Errorf("%w: (%s, %s) maps to both %q and %q",
+				ErrHotSetCandidateDuplicate,
+				ph.PackageName, ph.Architecture, existing.Path, ph.Path)
+		}
+		candIdx[k] = ph
 	}
 	out := make([]HotSetEntry, 0, len(pairs))
 	for _, pa := range pairs {

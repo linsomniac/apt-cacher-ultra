@@ -2557,7 +2557,7 @@ func TestComputeHotSet_TwoStageMatch(t *testing.T) {
 		t.Fatalf("commit new: %v", err)
 	}
 
-	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, candPHs, 86400, now)
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, candPHs, 86400, now)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
@@ -2620,14 +2620,13 @@ func TestComputeHotSet_ExcludesPreV3Rows(t *testing.T) {
 	// somehow had a v3 row for the same path, Stage 1's <> ''
 	// predicate filters out the prior's pre-v3 rows so no Stage 2
 	// lookup ever runs.
-	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, nil, 86400, now)
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, nil, 86400, now)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
 	if len(got) != 0 {
 		t.Errorf("got %d entries; want 0 (pre-v3 rows must be excluded)", len(got))
 	}
-	_ = idNew // referenced earlier; idNew is now used only for the candidate commit
 }
 
 // TestComputeHotSet_DroppedPackageNotInCandidate: a hot pair whose
@@ -2675,21 +2674,20 @@ func TestComputeHotSet_DroppedPackageNotInCandidate(t *testing.T) {
 
 	// Candidate's in-memory PackageHash slice is empty (upstream
 	// dropped the package). Stage 2 lookup misses → drop from hot set.
-	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, nil, 86400, now)
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, nil, 86400, now)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
 	if len(got) != 0 {
 		t.Errorf("got %d entries; want 0 (package was removed in candidate)", len(got))
 	}
-	_ = idNew
 }
 
 // TestComputeHotSet_WindowZeroReturnsEmpty: hot_packages.window = 0
 // disables prefetch entirely (SPEC3 §5.1).
 func TestComputeHotSet_WindowZeroReturnsEmpty(t *testing.T) {
 	c := openCache(t)
-	got, err := c.ComputeHotSet(context.Background(), "http", "x", 1, nil, 0, 100)
+	got, err := c.ComputeHotSet(context.Background(), "http", "x", 1, 2, nil, 0, 100)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
@@ -2703,12 +2701,124 @@ func TestComputeHotSet_WindowZeroReturnsEmpty(t *testing.T) {
 // "no prior current_snapshot_id for this suite" → empty hot set.
 func TestComputeHotSet_PriorIDZeroReturnsEmpty(t *testing.T) {
 	c := openCache(t)
-	got, err := c.ComputeHotSet(context.Background(), "http", "x", 0, nil, 86400, 100)
+	got, err := c.ComputeHotSet(context.Background(), "http", "x", 0, 1, nil, 86400, 100)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
 	if len(got) != 0 {
 		t.Errorf("got %d entries with priorID=0, want 0", len(got))
+	}
+}
+
+// TestComputeHotSet_RejectsCandidateMismatch covers the contract
+// validation Stage 2 enforces in-memory: the in-flight Stage 2 SQL
+// scoped its lookup by (scheme, host, snapshot_id), and the in-memory
+// form must reject candidate rows whose metadata disagrees so a
+// caller bug doesn't silently warm the wrong snapshot's rows. SPEC3
+// §7.5.3.
+func TestComputeHotSet_RejectsCandidateMismatch(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	scheme, host := "http", "archive.example"
+
+	rOld := seedBlob(t, c, "InRelease v1 mismatch")
+	rNew := seedBlob(t, c, "InRelease v2 mismatch")
+	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &rOld,
+	})
+	idNew, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &rNew,
+	})
+	debHash := seedBlob(t, c, "deb bytes mismatch")
+	pathOld := "/pool/main/m/match/match_1.0_amd64.deb"
+	if err := c.CommitAdoption(ctx, idPrior,
+		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}},
+		[]PackageHash{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
+			DeclaredSHA256: debHash, SnapshotID: idPrior,
+			PackageName: "match", Architecture: "amd64",
+		}},
+		nil, true); err != nil {
+		t.Fatal(err)
+	}
+	now := nowUnix()
+	_ = c.PutURLPath(ctx, URLPath{
+		CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
+		BlobHash: ptrStr(debHash), UpstreamURL: "u",
+		LastRequestedAt: &now, RequestCount: 1,
+	})
+
+	mismatched := []PackageHash{{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		// SnapshotID intentionally != idNew — caller error.
+		SnapshotID:   idPrior,
+		Path:         pathOld,
+		DeclaredSHA256: debHash,
+		PackageName:    "match",
+		Architecture:   "amd64",
+	}}
+	_, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, mismatched, 86400, now)
+	if !errors.Is(err, ErrHotSetCandidateMismatch) {
+		t.Errorf("err = %v, want ErrHotSetCandidateMismatch", err)
+	}
+}
+
+// TestComputeHotSet_RejectsCandidateDuplicate covers the second
+// in-memory contract: duplicate (Package, Architecture) keys in the
+// candidate slice are a programming error (buildPackageHashes
+// rejects them in production). The cache layer fails closed rather
+// than silently picking one row.
+func TestComputeHotSet_RejectsCandidateDuplicate(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	scheme, host := "http", "archive.example"
+
+	rOld := seedBlob(t, c, "InRelease v1 dup")
+	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/dists/noble", InReleaseHash: &rOld,
+	})
+	debHash := seedBlob(t, c, "dup deb bytes")
+	pathOld := "/pool/main/d/dup/dup_1.0_amd64.deb"
+	if err := c.CommitAdoption(ctx, idPrior,
+		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}},
+		[]PackageHash{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
+			DeclaredSHA256: debHash, SnapshotID: idPrior,
+			PackageName: "dup", Architecture: "amd64",
+		}},
+		nil, true); err != nil {
+		t.Fatal(err)
+	}
+	now := nowUnix()
+	_ = c.PutURLPath(ctx, URLPath{
+		CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
+		BlobHash: ptrStr(debHash), UpstreamURL: "u",
+		LastRequestedAt: &now, RequestCount: 1,
+	})
+
+	const idCandidate = int64(999)
+	dup := []PackageHash{
+		{
+			CanonicalScheme: scheme, CanonicalHost: host,
+			SnapshotID: idCandidate,
+			Path:       "/pool/main/d/dup/dup_2.0_amd64.deb",
+			DeclaredSHA256: debHash,
+			PackageName: "dup", Architecture: "amd64",
+		},
+		{
+			CanonicalScheme: scheme, CanonicalHost: host,
+			SnapshotID: idCandidate,
+			Path:       "/pool/main/d/dup/dup_3.0_amd64.deb",
+			DeclaredSHA256: debHash,
+			PackageName: "dup", Architecture: "amd64",
+		},
+	}
+	_, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idCandidate, dup, 86400, now)
+	if !errors.Is(err, ErrHotSetCandidateDuplicate) {
+		t.Errorf("err = %v, want ErrHotSetCandidateDuplicate", err)
 	}
 }
 

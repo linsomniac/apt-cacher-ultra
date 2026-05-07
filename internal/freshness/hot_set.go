@@ -35,7 +35,8 @@ type hotSetEntry struct {
 // empty slice and the flip proceeds via Phase 2 path with
 // prefetchedURLPaths = nil.
 func (a *Adopter) computeHotSet(ctx context.Context, suite SuiteRef,
-	candidatePackageHashes []cache.PackageHash, hotWindowSeconds int64) ([]hotSetEntry, error) {
+	candidateSnapshotID int64, candidatePackageHashes []cache.PackageHash,
+	hotWindowSeconds int64) ([]hotSetEntry, error) {
 	if hotWindowSeconds == 0 {
 		return nil, nil
 	}
@@ -45,7 +46,8 @@ func (a *Adopter) computeHotSet(ctx context.Context, suite SuiteRef,
 	}
 	rows, err := a.cache.ComputeHotSet(ctx,
 		suite.CanonicalScheme, suite.CanonicalHost,
-		priorID, candidatePackageHashes, hotWindowSeconds, a.now().Unix())
+		priorID, candidateSnapshotID, candidatePackageHashes,
+		hotWindowSeconds, a.now().Unix())
 	if err != nil {
 		return nil, fmt.Errorf("freshness: hot-set: %w", err)
 	}

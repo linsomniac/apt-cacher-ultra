@@ -43,8 +43,11 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 	// SPEC3 §7.5 step 9: build the hot set. Pass the candidate's
 	// in-memory package_hash rows — Stage 2 of ComputeHotSet looks
 	// them up there, since CommitAdoption hasn't inserted them yet.
+	// snapshotID is also passed through so Stage 2 can validate the
+	// caller-supplied rows belong to this candidate (rejects accidental
+	// cross-snapshot or cross-suite slices via ErrHotSetCandidateMismatch).
 	hotWindowSeconds := int64(a.hotPackagesWindow.Seconds())
-	hotSet, err := a.computeHotSet(adoptionCtx, suite, candidatePackageHashes, hotWindowSeconds)
+	hotSet, err := a.computeHotSet(adoptionCtx, suite, snapshotID, candidatePackageHashes, hotWindowSeconds)
 	if err != nil {
 		// Hot-set computation failure is non-fatal: log and skip the
 		// loop. The flip still proceeds — operators see a warning,
