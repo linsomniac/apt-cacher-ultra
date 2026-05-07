@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"testing"
 )
 
@@ -40,7 +41,7 @@ func TestChaos_BlobGC_EvictRace_OneZeroNegOne(t *testing.T) {
 	t3 := t1 + grace + 1 // GC fires here; predicate cutoff = t1 + 1
 
 	for run := 0; run < chaosRuns; run++ {
-		t.Run("", func(t *testing.T) {
+		t.Run(fmt.Sprintf("run-%02d", run), func(t *testing.T) {
 			c := openCache(t)
 			ctx := context.Background()
 
@@ -48,6 +49,13 @@ func TestChaos_BlobGC_EvictRace_OneZeroNegOne(t *testing.T) {
 			// see this fixed timestamp, so refcount_zeroed_at landings
 			// are deterministic.
 			restore := stubNow(t, t1)
+			// Defer-by-closure: the closure reads `restore` at fire
+			// time, not at defer-evaluation time, so any t.Fatalf
+			// between here and test end still unwinds whichever
+			// stubNow incarnation is currently active. Without this,
+			// a fatal mid-test would leak the nowUnix stub into
+			// later test files in the same package.
+			defer func() { restore() }()
 
 			// Three blobs: B (the test subject), and two distinct
 			// InRelease blobs so suite_snapshot's natural key is
@@ -154,7 +162,6 @@ func TestChaos_BlobGC_EvictRace_OneZeroNegOne(t *testing.T) {
 			// holds; B is reaped.
 			restore()
 			restore = stubNow(t, t3)
-			defer restore()
 
 			reaped, err := c.RunBlobGCBatch(ctx, 100, grace)
 			if err != nil {

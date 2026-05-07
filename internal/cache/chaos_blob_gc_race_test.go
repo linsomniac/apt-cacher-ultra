@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -125,7 +126,7 @@ func reapedHashes(reaped []ReapedBlob) map[string]bool {
 // RETURNING-buffered result.
 func TestChaos_BlobGC_AdoptionRace_VariantA_RefcountBump(t *testing.T) {
 	for run := 0; run < chaosRuns; run++ {
-		t.Run("", func(t *testing.T) {
+		t.Run(fmt.Sprintf("run-%02d", run), func(t *testing.T) {
 			c := openCache(t)
 			ctx := context.Background()
 
@@ -184,7 +185,7 @@ UPDATE blob
 // from the DELETE by the NOT EXISTS (url_path) clause.
 func TestChaos_BlobGC_AdoptionRace_VariantB_URLPathInsert(t *testing.T) {
 	for run := 0; run < chaosRuns; run++ {
-		t.Run("", func(t *testing.T) {
+		t.Run(fmt.Sprintf("run-%02d", run), func(t *testing.T) {
 			c := openCache(t)
 			ctx := context.Background()
 
@@ -246,7 +247,7 @@ VALUES ('http', 'race.example', '/race-B', ?, 'http://race.example/race-B',
 // RETURNING-buffered result; the file is unlinked.
 func TestChaos_BlobGC_AdoptionRace_VariantC_AdoptionAbort(t *testing.T) {
 	for run := 0; run < chaosRuns; run++ {
-		t.Run("", func(t *testing.T) {
+		t.Run(fmt.Sprintf("run-%02d", run), func(t *testing.T) {
 			c := openCache(t)
 			ctx := context.Background()
 
@@ -308,7 +309,7 @@ func TestChaos_BlobGC_AdoptionRace_VariantC_AdoptionAbort(t *testing.T) {
 // PutBlob conflict mechanism, not the SELECT/DELETE race.
 func TestChaos_BlobGC_AdoptionRace_VariantD_PutBlobConflict(t *testing.T) {
 	for run := 0; run < chaosRuns; run++ {
-		t.Run("", func(t *testing.T) {
+		t.Run(fmt.Sprintf("run-%02d", run), func(t *testing.T) {
 			c := openCache(t)
 			ctx := context.Background()
 
@@ -316,7 +317,10 @@ func TestChaos_BlobGC_AdoptionRace_VariantD_PutBlobConflict(t *testing.T) {
 			// boundary deterministically.
 			const t0 = int64(1_700_000_000)
 			restore := stubNow(t, t0)
-			defer restore()
+			// Defer-by-closure: reads `restore` at fire time so any
+			// mid-test t.Fatalf still unwinds the latest stubNow
+			// incarnation.
+			defer func() { restore() }()
 
 			b := chaosSeedReapableBlob(t, c, "variant D blob — PutBlob conflict")
 
@@ -371,7 +375,6 @@ UPDATE blob
 			// index excludes it. Reap result must not contain B.
 			restore() // restore real time first
 			restore = stubNow(t, t0+chaosBlobGrace*10)
-			defer restore()
 
 			reaped2, err := c.RunBlobGCBatch(ctx, 100, chaosBlobGrace)
 			if err != nil {
