@@ -193,19 +193,37 @@ func TestStatusJSON_HasLockedSchemaKeys(t *testing.T) {
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatalf("decode JSON: %v\nbody: %s", err, body)
 	}
-	// SPEC5 §10.5: top-level keys are stable.
+	// SPEC5 §10.5: top-level keys are stable. `gc` is also always
+	// present — when no GC run has completed, the abbreviated form
+	// {"last_run_unixtime": null} renders so JSON consumers see the
+	// schema key reliably (asserted further below).
 	required := []string{
 		"process", "cache", "listeners", "suites",
-		"hot_url_paths", "recent_adoptions", "active_hosts",
+		"hot_url_paths", "recent_adoptions", "active_hosts", "gc",
 	}
 	for _, k := range required {
 		if _, ok := got[k]; !ok {
 			t.Errorf("JSON missing required top-level key %q", k)
 		}
 	}
-	// gc is omitempty — present only when GC has run; an
-	// empty-cache test means gc has not run yet, so absence is
-	// expected. Don't assert presence.
+	// SPEC5 §10.5 / §11: pre-first-run gc shape is exactly
+	// {"last_run_unixtime": null} — last_run_unixtime present and
+	// JSON-null, every other gc.* field omitted. The empty-cache
+	// test exercises this branch.
+	gcMap, ok := got["gc"].(map[string]any)
+	if !ok {
+		t.Fatalf("gc is not an object: %T", got["gc"])
+	}
+	if v, present := gcMap["last_run_unixtime"]; !present {
+		t.Errorf("gc.last_run_unixtime missing; want JSON null")
+	} else if v != nil {
+		t.Errorf("gc.last_run_unixtime = %v, want JSON null (no GC run yet)", v)
+	}
+	for k := range gcMap {
+		if k != "last_run_unixtime" {
+			t.Errorf("gc has unexpected key %q before first run; spec mandates abbreviated shape", k)
+		}
+	}
 
 	// Nested process keys.
 	proc, ok := got["process"].(map[string]any)
@@ -342,6 +360,38 @@ func TestEndpoint_PostMetrics405(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != 405 {
 		t.Errorf("POST /metrics status = %d, want 405", resp.StatusCode)
+	}
+	// SPEC5 §9.7.1 / §12.2: Allow header MUST list GET, HEAD,
+	// OPTIONS — the 405 is meaningless to a client that doesn't
+	// know which methods are accepted.
+	if got := resp.Header.Get("Allow"); got != "GET, HEAD, OPTIONS" {
+		t.Errorf("Allow = %q, want %q", got, "GET, HEAD, OPTIONS")
+	}
+}
+
+func TestEndpoint_OptionsAnyPath204(t *testing.T) {
+	_, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	// SPEC5 §9.7.1: OPTIONS on any path returns 204 with the Allow
+	// header. Exercise both a known and an unknown path so the
+	// catch-all behavior is pinned.
+	for _, path := range []string{"/metrics", "/healthz", "/", "/nonexistent"} {
+		req, err := http.NewRequest(http.MethodOptions, base+path, nil)
+		if err != nil {
+			t.Fatalf("NewRequest %s: %v", path, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("OPTIONS %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 204 {
+			t.Errorf("OPTIONS %s status = %d, want 204", path, resp.StatusCode)
+		}
+		if got := resp.Header.Get("Allow"); got != "GET, HEAD, OPTIONS" {
+			t.Errorf("OPTIONS %s Allow = %q, want %q", path, got, "GET, HEAD, OPTIONS")
+		}
 	}
 }
 

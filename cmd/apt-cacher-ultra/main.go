@@ -172,6 +172,20 @@ func serveListeners(
 		}
 	}()
 
+	// SPEC5 §10.2: count htpasswd users once up-front so both the
+	// startup config dump and the admin_authenticated Info line carry
+	// user_count. A parse failure here is fatal — refusing to start
+	// matches the behavior admin.New would surface seconds later, and
+	// failing fast keeps the operator's signal at one log line.
+	htpasswdUsers := 0
+	if cfg.Admin.Enabled && cfg.Admin.HtpasswdFile != "" {
+		n, err := admin.CountHtpasswdUsers(cfg.Admin.HtpasswdFile)
+		if err != nil {
+			return fmt.Errorf("admin htpasswd %q: %w", cfg.Admin.HtpasswdFile, err)
+		}
+		htpasswdUsers = n
+	}
+
 	// SPEC §10 / SPEC2 §10.3: startup config dump. Capture every
 	// operationally-relevant tunable so a single boot log line tells
 	// the operator what policy they're running under (timeouts,
@@ -217,6 +231,7 @@ func serveListeners(
 		"admin_enabled", cfg.Admin.Enabled,
 		"admin_listen", cfg.Admin.Listen,
 		"admin_htpasswd_file", cfg.Admin.HtpasswdFile,
+		"admin_htpasswd_users", htpasswdUsers,
 		"admin_gauge_refresh", cfg.Admin.GaugeRefresh.Duration,
 		"admin_read_timeout", cfg.Admin.ReadTimeout.Duration,
 		"admin_idle_timeout", cfg.Admin.IdleTimeout.Duration,
@@ -264,13 +279,14 @@ func serveListeners(
 				"listen", cfg.Admin.Listen,
 				"detail", "admin.listen binds non-loopback AND admin.htpasswd_file is empty: the admin port is reachable from the network without authentication")
 		}
-		// admin_authenticated emitted after the htpasswd parses
-		// successfully; that happens inside admin.New (the count is
-		// not surfaced in this commit's API, so the Info line emits
-		// without user_count for now).
+		// SPEC5 §10.2: admin_authenticated Info names the htpasswd
+		// file and the parsed user_count. The parse already ran
+		// up-front (htpasswdUsers above); a non-empty htpasswd_file
+		// here is guaranteed to have been validated.
 		if cfg.Admin.HtpasswdFile != "" {
 			logger.Info("admin_authenticated",
-				"htpasswd_file", cfg.Admin.HtpasswdFile)
+				"htpasswd_file", cfg.Admin.HtpasswdFile,
+				"user_count", htpasswdUsers)
 		}
 	}
 

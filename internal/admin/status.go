@@ -16,12 +16,17 @@ import (
 // statusModel is the SPEC5 §10.5 status-page JSON shape, also used
 // as the html/template input. Field tags match the locked JSON
 // schema; new fields are additive only.
+//
+// The `gc` key is always present per SPEC5 §10.5 — when no GC run
+// has completed since process start, the JSON renders as
+// `"gc": {"last_run_unixtime": null}` with the rest of the gc.*
+// block omitted (a custom MarshalJSON on gcInfo handles this).
 type statusModel struct {
 	Process         processInfo      `json:"process"`
 	Cache           cacheInfo        `json:"cache"`
 	Listeners       []listenerInfo   `json:"listeners"`
 	Suites          []suiteEntry     `json:"suites"`
-	GC              *gcInfo          `json:"gc,omitempty"`
+	GC              *gcInfo          `json:"gc"`
 	HotURLPaths     []hotURLEntry    `json:"hot_url_paths"`
 	RecentAdoptions []adoptionEntry  `json:"recent_adoptions"`
 	ActiveHosts     []activeHostInfo `json:"active_hosts"`
@@ -56,10 +61,32 @@ type suiteEntry struct {
 	CurrentSnapshotID                *int64 `json:"current_snapshot_id"`
 	CurrentSnapshotAdoptedAtUnixTime *int64 `json:"current_snapshot_adopted_at_unixtime"`
 	InReleaseChangeSeenAtUnixTime    *int64 `json:"inrelease_change_seen_at_unixtime"`
+
+	// Lagging is the SPEC5 §12.2.4 HTML annotation rendered next
+	// to InReleaseChangeSeenAtUnixTime when the upstream advertised
+	// a newer InRelease that we haven't successfully refetched yet.
+	// Empty otherwise. Excluded from JSON — consumers compute the
+	// signal themselves from the two timestamps. Format: "(lagging
+	// Xh Ym)" / "(lagging Xm)" matching the operator-facing
+	// duration helper.
+	Lagging string `json:"-"`
 }
 
+// gcInfo carries the SPEC5 §10.5 gc.* block. The pointer-typed
+// LastRunUnixTime distinguishes "no run yet" (nil → JSON null) from
+// "ran at unix epoch" (which is operationally impossible but
+// type-distinct). When LastRunUnixTime is nil, the custom
+// MarshalJSON below emits ONLY {"last_run_unixtime": null}, omitting
+// every other field — SPEC5 §10.5 / §11 explicitly requires the
+// pre-first-run shape to be the abbreviated form.
+//
+// AIDEV-NOTE: the abbreviated-vs-full split cannot be expressed via
+// `json:",omitempty"` on the other fields because a real GC run
+// might legitimately produce zero-valued fields (e.g. blobs_reaped=0
+// on a clean cache), and omitempty would silently drop them.
+// MarshalJSON is the only correct shape-control here.
 type gcInfo struct {
-	LastRunUnixTime         int64   `json:"last_run_unixtime"`
+	LastRunUnixTime         *int64  `json:"last_run_unixtime"`
 	LastRunPhase            string  `json:"last_run_phase"`
 	LastRunBlobsReaped      int     `json:"last_run_blobs_reaped"`
 	LastRunBytesReclaimed   int64   `json:"last_run_bytes_reclaimed"`
@@ -70,6 +97,18 @@ type gcInfo struct {
 	PoolOrphansRepaired     int     `json:"pool_orphans_repaired"`
 	PoolOrphanBytesRepaired int64   `json:"pool_orphan_bytes_repaired"`
 	PoolUnlinkErrors        int     `json:"pool_unlink_errors"`
+}
+
+// MarshalJSON renders the abbreviated form when no GC run has
+// completed (LastRunUnixTime == nil) per SPEC5 §10.5 / §11; full
+// form otherwise. The type-alias trick avoids infinite recursion
+// when delegating back to encoding/json for the populated case.
+func (g *gcInfo) MarshalJSON() ([]byte, error) {
+	if g == nil || g.LastRunUnixTime == nil {
+		return []byte(`{"last_run_unixtime":null}`), nil
+	}
+	type alias gcInfo
+	return json.Marshal((*alias)(g))
 }
 
 type hotURLEntry struct {
@@ -153,21 +192,26 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 		ActiveHosts:     buildActiveHostEntries(s.cfg.HostLimiter.Snapshot()),
 	}
 
+	// SPEC5 §10.5: gc is always present at the top level. When no GC
+	// run has completed, gcInfo.MarshalJSON emits the abbreviated
+	// {"last_run_unixtime":null} form. The HTML template guards on
+	// LastRunUnixTime != nil to choose the populated-vs-empty branch.
+	gci := &gcInfo{}
 	if summary, ok := s.cfg.GC.LastRunSummary(); ok {
-		model.GC = &gcInfo{
-			LastRunUnixTime:         summary.AtUnixTime,
-			LastRunPhase:            summary.Phase,
-			LastRunBlobsReaped:      summary.BlobsReaped,
-			LastRunBytesReclaimed:   summary.BytesReclaimed,
-			LastRunDeadlineReached:  summary.DeadlineReached,
-			LastRunDurationSeconds:  summary.DurationSeconds,
-			OrphanCandidatesReaped:  summary.OrphanCandidatesReaped,
-			DisplacedReaped:         summary.DisplacedReaped,
-			PoolOrphansRepaired:     summary.PoolOrphansRepaired,
-			PoolOrphanBytesRepaired: summary.PoolOrphanBytesRepaired,
-			PoolUnlinkErrors:        summary.PoolUnlinkErrors,
-		}
+		ts := summary.AtUnixTime
+		gci.LastRunUnixTime = &ts
+		gci.LastRunPhase = summary.Phase
+		gci.LastRunBlobsReaped = summary.BlobsReaped
+		gci.LastRunBytesReclaimed = summary.BytesReclaimed
+		gci.LastRunDeadlineReached = summary.DeadlineReached
+		gci.LastRunDurationSeconds = summary.DurationSeconds
+		gci.OrphanCandidatesReaped = summary.OrphanCandidatesReaped
+		gci.DisplacedReaped = summary.DisplacedReaped
+		gci.PoolOrphansRepaired = summary.PoolOrphansRepaired
+		gci.PoolOrphanBytesRepaired = summary.PoolOrphanBytesRepaired
+		gci.PoolUnlinkErrors = summary.PoolUnlinkErrors
 	}
+	model.GC = gci
 
 	return model, "", nil
 }
@@ -204,9 +248,31 @@ func buildSuiteEntries(rows []cache.SuiteWithAdoption) []suiteEntry {
 			CurrentSnapshotID:                r.CurrentSnapshotID,
 			CurrentSnapshotAdoptedAtUnixTime: r.CurrentAdoptedAt,
 			InReleaseChangeSeenAtUnixTime:    r.InReleaseChangeSeenAt,
+			Lagging:                          laggingAnnotation(r.InReleaseChangeSeenAt, r.LastSuccessAt),
 		})
 	}
 	return out
+}
+
+// laggingAnnotation renders the SPEC5 §12.2.4 "(lagging Xh Ym)"
+// suffix when the upstream's InRelease changed after our last
+// successful re-adoption (= the cache is serving older metadata
+// than upstream advertises). Both inputs may be nil — in which
+// case we cannot determine lag and return "".
+func laggingAnnotation(seenAt, successAt *int64) string {
+	if seenAt == nil || successAt == nil {
+		return ""
+	}
+	if *seenAt <= *successAt {
+		return ""
+	}
+	gap := time.Duration(*seenAt-*successAt) * time.Second
+	h := int(gap.Hours())
+	m := int(gap.Minutes()) % 60
+	if h == 0 {
+		return fmt.Sprintf("(lagging %dm)", m)
+	}
+	return fmt.Sprintf("(lagging %dh %dm)", h, m)
 }
 
 func buildHotURLEntries(rows []cache.HotURLPath) []hotURLEntry {
@@ -368,15 +434,15 @@ code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
   <td>{{unixTimePtr .LastSuccessUnixTime}}</td>
   <td>{{i64Ptr .CurrentSnapshotID}}</td>
   <td>{{unixTimePtr .CurrentSnapshotAdoptedAtUnixTime}}</td>
-  <td>{{unixTimePtr .InReleaseChangeSeenAtUnixTime}}</td>
+  <td>{{unixTimePtr .InReleaseChangeSeenAtUnixTime}}{{if .Lagging}} <span class="muted">{{.Lagging}}</span>{{end}}</td>
 </tr>
 {{end}}</table>
 {{else}}<p class="muted">No suites tracked yet.</p>{{end}}
 
 <h2>Garbage collection</h2>
-{{if .GC}}
+{{if .GC.LastRunUnixTime}}
 <table>
-<tr><td>Last run</td><td>{{unixTime .GC.LastRunUnixTime}} UTC ({{.GC.LastRunPhase}})</td></tr>
+<tr><td>Last run</td><td>{{unixTimePtr .GC.LastRunUnixTime}} UTC ({{.GC.LastRunPhase}})</td></tr>
 <tr><td>Duration</td><td>{{.GC.LastRunDurationSeconds}}s</td></tr>
 <tr><td>Blobs reaped</td><td>{{.GC.LastRunBlobsReaped}}</td></tr>
 <tr><td>Bytes reclaimed</td><td>{{formatBytes .GC.LastRunBytesReclaimed}}</td></tr>
@@ -429,7 +495,7 @@ code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
   <td>{{.DurationSeconds}}s</td>
 </tr>
 {{end}}</table>
-{{else}}<p class="muted">(empty since last process start)</p>{{end}}
+{{else if lt .Process.UptimeSeconds 300}}<p class="muted">(empty since last process start)</p>{{end}}
 
 <p><a href="/metrics">/metrics</a> &middot; <a href="/healthz">/healthz</a></p>
 </body>

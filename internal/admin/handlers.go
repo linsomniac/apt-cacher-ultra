@@ -18,6 +18,13 @@ import (
 // writes outside the lock — so a slow scraper does not block
 // request-path Inc/Observe/Set. This handler just routes the bytes
 // to the response writer.
+//
+// Write errors (broken pipe, scraper disconnected mid-render) are
+// captured by a wrapping io.Writer and surfaced as
+// admin_scrape_error Warn after Render returns (SPEC5 §9.7.2 /
+// §10.2). The scrape counter still increments because the scrape
+// was attempted — the failure mode is observable from both the log
+// line and the latency histogram.
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	start := time.Now()
 	defer func() {
@@ -25,7 +32,40 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		s.self.scrapeDurationSeconds.Observe(time.Since(start).Seconds())
 	}()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	s.cfg.Registry.Render(w)
+	ew := &errCapturingWriter{w: w}
+	s.cfg.Registry.Render(ew)
+	if ew.err != nil {
+		s.logger.Warn("admin_scrape_error",
+			"err", ew.err.Error(),
+			"bytes_written", ew.n)
+	}
+}
+
+// errCapturingWriter wraps an io.Writer to record the first error
+// seen and the running byte count. Render's per-metric write loop
+// swallows individual io.WriteString errors (the metrics package's
+// API is non-erroring), so the wrapper is the only signal a
+// broken-pipe scrape leaves behind.
+//
+// Subsequent Writes after the first error fast-fail, so the rest of
+// the registry render is short-circuited cheaply rather than
+// repeatedly hitting the dead conn.
+type errCapturingWriter struct {
+	w   http.ResponseWriter
+	n   int64
+	err error
+}
+
+func (e *errCapturingWriter) Write(p []byte) (int, error) {
+	if e.err != nil {
+		return 0, e.err
+	}
+	n, err := e.w.Write(p)
+	e.n += int64(n)
+	if err != nil {
+		e.err = err
+	}
+	return n, err
 }
 
 // handleHealthz serves the /healthz endpoint. SPEC5 §9.7.4.

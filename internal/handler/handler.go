@@ -875,10 +875,16 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 
 	hash := res.blobHash
 	path := h.cache.BlobPath(hash)
+	// AIDEV-NOTE: SPEC5 §10.4.1 marks the request outcome enum
+	// exhaustive; an open/stat failure on a freshly-finalized blob
+	// is a local-disk fault, mapped to cache_write_failed (the
+	// same label the write-side faults emit). There is no
+	// dedicated cache_read_failed outcome and adding one would
+	// require a spec amendment.
 	f, err := os.Open(path)
 	if err != nil {
 		http.Error(w, "cache read failed", http.StatusInternalServerError)
-		h.logRequest(r, req.CanonicalHost, req.Path, "error", http.StatusInternalServerError, 0, true, res.status, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "cache_write_failed", http.StatusInternalServerError, 0, true, res.status, start)
 		return
 	}
 	defer f.Close()
@@ -886,7 +892,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	st, err := f.Stat()
 	if err != nil {
 		http.Error(w, "cache stat failed", http.StatusInternalServerError)
-		h.logRequest(r, req.CanonicalHost, req.Path, "error", http.StatusInternalServerError, 0, true, res.status, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "cache_write_failed", http.StatusInternalServerError, 0, true, res.status, start)
 		return
 	}
 

@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strconv"
@@ -188,25 +189,54 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
-// buildHandler constructs the ServeMux with the three Phase 5
-// routes. Uses Go 1.22+ enhanced patterns (`{$}` for exact-path
-// match on `/`, plus a `/` subtree fallback that 404s) per SPEC5
-// §9.7.1. The auth middleware (when configured) wraps the entire
-// mux.
+// allowMethods is the SPEC5 §9.7.1 Allow header for the read-only
+// admin endpoints. Used in 405 responses on known paths and 204
+// responses on OPTIONS. Centralized here so a typo cannot drift
+// the two sites apart.
+const allowMethods = "GET, HEAD, OPTIONS"
+
+// buildHandler constructs the route dispatcher per SPEC5 §9.7.1:
+//   - OPTIONS on any path → 204 with Allow header (no body).
+//   - GET/HEAD on /metrics, /healthz, / → the corresponding handler.
+//   - Any other method on /metrics, /healthz, / → 405 with Allow.
+//   - Any other path → 404.
+//
+// Go 1.22+ enhanced patterns auto-emit 405 only when *another*
+// method is registered for the same path, and the auto-Allow header
+// only lists explicitly-registered methods (so `GET /metrics`
+// produces `Allow: GET`, not the spec's `GET, HEAD, OPTIONS`).
+// Hand-rolling the dispatch is shorter than registering 3×3 method
+// patterns and gives one site to update if the Allow set changes.
+//
+// The auth middleware (when configured) wraps the dispatcher; the
+// request-log middleware wraps both.
 func (s *Server) buildHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /metrics", s.handleMetrics)
-	mux.HandleFunc("GET /healthz", s.handleHealthz)
-	mux.HandleFunc("GET /{$}", s.handleStatus)
-	// Subtree fallback for unmatched paths (SPEC5 §9.7.1 — `/{$}`
-	// alone would still allow `/anything` to fall through to Go's
-	// stdlib 404 path; the explicit subtree handler returns the
-	// same 404 but keeps observability consistent).
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
+	routes := map[string]http.HandlerFunc{
+		"/metrics": s.handleMetrics,
+		"/healthz": s.handleHealthz,
+		"/":        s.handleStatus,
+	}
+
+	dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Allow", allowMethods)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h, known := routes[r.URL.Path]
+		if !known {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", allowMethods)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h(w, r)
 	})
 
-	var h http.Handler = mux
+	var h http.Handler = dispatch
 	if s.auth != nil {
 		h = s.auth.middleware(h, func(reason string) {
 			s.self.authFailuresTotal.Inc(reason)
@@ -287,6 +317,24 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// reqState is the per-request mutable scratchpad the request-log
+// middleware seeds and the auth middleware (when present) updates.
+// It is stored in the request context as a pointer so a downstream
+// mutation is visible to the outer logger after ServeHTTP returns —
+// auth's `r.WithContext(ctx)` swap is invisible at the outer scope,
+// but a pointed-at struct's fields survive any context replacement.
+//
+// AIDEV-NOTE: SPEC5 §10.1 requires admin_request to carry the
+// authenticated user (when htpasswd is configured) AND a per-request
+// scrape_id for correlating with the §10.4.8 self-metrics. Both are
+// emitted from one log site — keep this struct narrow.
+type reqState struct {
+	authUser string
+	scrapeID uint64
+}
+
+type reqStateKey struct{}
+
 // requestLogMiddleware emits the SPEC5 §10.1 admin_request log line
 // per request and updates the §10.4.8 self-metrics. Wraps the auth
 // middleware so the log sees auth_user only when the request was
@@ -295,18 +343,17 @@ func (s *Server) requestLogMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		cw := &countingWriter{ResponseWriter: w}
-		next.ServeHTTP(cw, r)
-		// auth_user is captured in the request context by the auth
-		// middleware (when present). Empty when no htpasswd
-		// configured.
-		authUser, _ := r.Context().Value(authUserKey{}).(string)
+		state := &reqState{scrapeID: rand.Uint64()}
+		ctx := context.WithValue(r.Context(), reqStateKey{}, state)
+		next.ServeHTTP(cw, r.WithContext(ctx))
 		s.logger.Info("admin_request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", cw.statusCode(),
 			"bytes", cw.bytes,
 			"duration_ms", time.Since(start).Milliseconds(),
-			"auth_user", authUser,
+			"auth_user", state.authUser,
+			"scrape_id", state.scrapeID,
 		)
 	})
 }

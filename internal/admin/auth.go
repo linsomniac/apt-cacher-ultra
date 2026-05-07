@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,11 +11,6 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 )
-
-// authUserKey is the context-value key for the authenticated user
-// (empty string when no htpasswd is configured). Read by the
-// request-log middleware to populate auth_user.
-type authUserKey struct{}
 
 // htpasswdAuthenticator parses an Apache-style htpasswd file
 // (bcrypt-only) once at construction and reloads on
@@ -153,8 +147,11 @@ func (a *htpasswdAuthenticator) authenticate(user, pass string) (string, bool, s
 
 // middleware wraps next with HTTP Basic auth. SPEC5 §9.7.5: 401 on
 // missing/invalid credentials, with WWW-Authenticate; the success
-// path stuffs the authenticated username into the request context
-// for the downstream request-log middleware.
+// path mutates the per-request state (seeded by the outer
+// request-log middleware) so the outer logger can read auth_user
+// after ServeHTTP returns. A pointer-in-context is used because
+// auth's `r.WithContext(ctx)` substitution is invisible at the
+// outer scope; the pointed-at struct survives any context swap.
 //
 // onAuthFailure is invoked with the SPEC5 §10.4.8 reason label
 // (`no_credentials`, `unknown_user`, `wrong_password`) before the
@@ -183,8 +180,10 @@ func (a *htpasswdAuthenticator) middleware(next http.Handler, onAuthFailure func
 			a.unauthorized(w)
 			return
 		}
-		ctx := context.WithValue(r.Context(), authUserKey{}, authedUser)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		if state, _ := r.Context().Value(reqStateKey{}).(*reqState); state != nil {
+			state.authUser = authedUser
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -195,6 +194,25 @@ func (a *htpasswdAuthenticator) middleware(next http.Handler, onAuthFailure func
 func (a *htpasswdAuthenticator) unauthorized(w http.ResponseWriter) {
 	w.Header().Set("WWW-Authenticate", `Basic realm="apt-cacher-ultra admin"`)
 	http.Error(w, "auth required", http.StatusUnauthorized)
+}
+
+// CountHtpasswdUsers reads path and returns the number of bcrypt
+// users defined. Used by cmd at startup so the admin_authenticated
+// Info line and the startup config-dump can both report
+// user_count BEFORE admin.New parses the file for actual auth.
+// Validation is identical to the request-time parse — Apache MD5,
+// SHA-1, and crypt(3) hashes return an error, naming the offending
+// line.
+func CountHtpasswdUsers(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	users, err := parseHtpasswd(data)
+	if err != nil {
+		return 0, err
+	}
+	return len(users), nil
 }
 
 // parseHtpasswd parses the bytes of an Apache htpasswd file into a
