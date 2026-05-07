@@ -422,6 +422,77 @@ func TestRunBlobPass_DrainAcrossBatches_NoDeadline(t *testing.T) {
 	}
 }
 
+// TestRunBlobPass_UnlinkFailure_StillTalliesReap: SPEC4 §10.2 names
+// `blobs_reaped` as "blob rows DELETEd this run" — independent of the
+// post-COMMIT unlink result. A non-ENOENT unlink failure leaves a
+// pool/ file leaked, which `pool_unlink_errors` reports separately;
+// the row was DELETEd in the writer-tx COMMIT and `blobs_reaped` /
+// `bytes_reclaimed` must reflect that. Engineered failure mode:
+// replace the pool file with a non-empty directory at the same path
+// AFTER seeding so os.Remove returns ENOTEMPTY, which works for any
+// uid (root included) since ENOTEMPTY is enforced by the syscall
+// itself, not DAC.
+func TestRunBlobPass_UnlinkFailure_StillTalliesReap(t *testing.T) {
+	c := openTestCache(t)
+	logger, buf := captureLogger()
+
+	const body = "blob whose unlink will fail"
+	hash := seedReapableBlob(t, c, body)
+
+	// Replace pool/<prefix>/<hash> file with a non-empty directory at
+	// the same path. After this, os.Remove(pool/<prefix>/<hash>)
+	// returns ENOTEMPTY because the entry is a directory containing
+	// blocker.
+	poolPath := filepath.Join(c.Dir(), "pool", hash[:2], hash)
+	if err := os.Remove(poolPath); err != nil {
+		t.Fatalf("remove pool file: %v", err)
+	}
+	if err := os.Mkdir(poolPath, 0o755); err != nil {
+		t.Fatalf("mkdir at pool path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(poolPath, "blocker"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+
+	g, err := New(Config{
+		Cache:               c,
+		Logger:              logger,
+		Enabled:             true,
+		Interval:            time.Hour,
+		BatchSize:           10,
+		SnapshotBatchSize:   10,
+		MaxTickDuration:     time.Minute,
+		BlobGrace:           1 * time.Second,
+		KeepDisplaced:       3,
+		PoolScanWorkers:     2,
+		HeartbeatStaleGrace: 30 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Minute)
+	res, _, unlinkErrors, err := g.runBlobPass(context.Background(), deadline, "test")
+	if err != nil {
+		t.Fatalf("runBlobPass: %v", err)
+	}
+
+	// The row WAS deleted by the COMMIT — count and bytes reflect that.
+	if res.count != 1 {
+		t.Errorf("res.count = %d, want 1 (row was DELETEd)", res.count)
+	}
+	if res.bytes != int64(len(body)) {
+		t.Errorf("res.bytes = %d, want %d", res.bytes, len(body))
+	}
+	if unlinkErrors != 1 {
+		t.Errorf("unlinkErrors = %d, want 1", unlinkErrors)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, `"msg":"gc_pool_unlink_failed"`) {
+		t.Errorf(`logs do not contain gc_pool_unlink_failed: %s`, logs)
+	}
+}
+
 // TestRunSnapshotPass_DeadlineReached: an already-elapsed deadline
 // produces deadlineHit=true with no batches run.
 func TestRunSnapshotPass_DeadlineReached_EmitsEvent(t *testing.T) {

@@ -69,6 +69,20 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 			return res, deadlineHit, unlinkErrors, nil
 		}
 
+		// SPEC4 §10.2: blobs_reaped/bytes_reclaimed count the rows
+		// that RunBlobGCBatch's COMMIT removed from the blob table.
+		// Tally now — independent of the post-COMMIT unlink result
+		// — so that an unlink failure (which leaks a pool/ file but
+		// does NOT resurrect the row) is reported truthfully:
+		// blobs_reaped names what is gone from the DB, and
+		// pool_unlink_errors names the disk-side leak the next pool
+		// scan will repair.
+		for _, r := range reaped {
+			res.count++
+			res.bytes += r.Size
+			bytesThisTick += r.Size
+		}
+
 		// Post-COMMIT unlink loop. SPEC4 §9.6.2 buffer-close-commit-
 		// unlink ordering: the only information source for which
 		// files to remove is the DELETE's RETURNING result, which
@@ -80,7 +94,9 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 			// schema change that weakened the CHECK could let a
 			// malformed hash through to the unlink path. Skip and
 			// log rather than building a path that could escape
-			// pool/<prefix>/.
+			// pool/<prefix>/. The blob row is already gone (tallied
+			// above); the file is leaked until the next §9.6.4
+			// pool scan reaps it.
 			if !validHashLite(r.Hash) {
 				g.cfg.Logger.Warn("gc_pool_unlink_skipped_invalid_hash",
 					"hash", r.Hash,
@@ -97,14 +113,10 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 						"operation", "reap",
 					)
 					unlinkErrors++
-					continue
 				}
 				// ENOENT is benign — file already absent. The DB
 				// row is gone now; the disk catches up.
 			}
-			res.count++
-			res.bytes += r.Size
-			bytesThisTick += r.Size
 		}
 	}
 }

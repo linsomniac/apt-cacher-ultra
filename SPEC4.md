@@ -168,14 +168,28 @@ in cache.Open:
   3. writer goroutine starts                    (Phase 1)
   -- cache.Open returns --
 
-in main, post-cache.Open, pre-listeners:
+in main:
+  0a. listeners bound (net.Listen)              (Phase 1, fail-fast)
+  -- post-cache.Open, pre-Accept: --
   4. tmp/ mtime sweep                           (Phase 1, existing)
   5. pool/ orphan-file scan                     (Phase 4 NEW)
   6. one-shot GC pass                           (Phase 4 NEW)
   7. construct freshness checker, integrity scanner, handler
   8. start periodic schedulers (Phase 1/2/3/4)
-  9. listeners come up                          (Phase 1)
+  9. listeners begin Accept()                   (Phase 1)
 ```
+
+The listening sockets are *bound* (the `net.Listen` syscalls)
+ahead of `cache.Open` and steps 4–6 — this is a deliberate
+fail-fast: if the configured listen port is already in use, the
+daemon should exit before doing minutes of pool scanning. The
+distinction worth knowing is that `net.Listen` only puts the
+socket into the listening state; nothing reads from it until
+`http.Server.Serve()` runs at step 9. During the startup window
+(steps 4–8), inbound TCP connections accumulate in the kernel
+SYN/accept queue but no goroutine `Accept()`s them — clients see
+a normal TCP connect (no RST) and a delay until the daemon
+finishes startup.
 
 Steps 5 and 6 are blocking — the cache does not begin answering
 requests until step 9. Operators with very large pools should
@@ -479,19 +493,35 @@ adds:
   load (same rationale).
 - `gc.max_tick_duration` parses as duration, > 0. 0 is rejected
   at load (a tick must have a deadline; see the example block).
-- `gc.blob_grace` parses as duration, > 0. 0 is rejected at load
-  (see the example block above).
+- `gc.blob_grace` parses as duration, ≥ 1s. 0 is rejected at load
+  (see the example block above). Sub-second values are also
+  rejected: the §9.6.2 reap predicate works in unix-epoch-seconds
+  (`int64(d.Seconds())`), and a value like `500ms` would silently
+  truncate to 0, making refcount=0 blobs immediately reapable on
+  the next tick — exactly the safety failure mode 0s names. The
+  validation refuses anything below 1s for that reason.
 - `gc.keep_displaced` parses as int, ≥ 0. 0 is permitted (means
   "no forensic retention").
 - `gc.pool_scan_workers` parses as int, ≥ 1.
 - `gc.heartbeat_interval` parses as duration, > 0. 0 is rejected
   at load (a 0-interval ticker is an infinite busy-loop). Loaders
-  also reject `heartbeat_interval >= heartbeat_stale_grace_effective`
-  at startup with `gc_heartbeat_interval_unsafe` Error
-  (the runtime-derived grace is `max(upstream.total_timeout ×
-  upstream.max_retries, 30m)`); a heartbeat ticker that ticks
-  slower than the grace can't bound the heartbeat-gap and would
-  let GC reap live adoptions mid-fetch.
+  also reject two cross-key violations:
+  - `heartbeat_interval >= heartbeat_stale_grace_effective`
+    (the runtime-derived grace is `max(upstream.total_timeout ×
+    upstream.max_retries, 30m)`); a heartbeat ticker that ticks
+    slower than the grace can't bound the heartbeat-gap and would
+    let GC reap a live adoption's *candidate snapshot* mid-fetch.
+  - `heartbeat_interval >= gc.blob_grace`. The §7.5.2 site 6
+    ticker also calls `cache.HeartbeatBlobs` (see §7.5.2 below)
+    which refreshes `blob.refcount_zeroed_at` for in-flight
+    member blobs. If `heartbeat_interval >= blob_grace`, an
+    in-flight blob can age past the §9.6.2 reap predicate
+    between two consecutive heartbeats — i.e. before
+    `CommitAdoption` Step 4 lands and clears the grace clock —
+    and be reaped by GC mid-adoption, breaking the §7.5.1 Rule 1
+    race-window guarantee. The `gc_heartbeat_interval_unsafe`
+    Error class names *both* cross-key violations; the validation
+    error string identifies which bound was violated.
 
 Loud configurations (warning logs at startup):
 
@@ -735,21 +765,65 @@ and one periodic — sequenced to cover each phase of `runShared`:
 6. **Periodic in-process ticker.** A goroutine launched at the
    start of `runShared` (alongside, but logically *parallel to*,
    the main adoption flow) wakes every
-   `gc.heartbeat_interval` (default 60s) and submits a
-   `HeartbeatSnapshot` write. The ticker exits when `runShared`
-   returns (cooperative cancel via the same context that
-   propagates to the member-fetch loop). This site bounds the
-   heartbeat-gap independently of which phase `runShared` is in
-   — Packages-parse, hot-set computation, the gap from a
-   member-fetch to the next sub-call, the gap between
-   `runHotPrefetch` returning and `CommitAdoption` actually
-   running. Sites 1–5 keep their value as latency-fresh
-   event-driven heartbeats (a heartbeat written immediately
-   after a member fetch is more useful for monitoring than one
-   that drifts up to 60s later); the ticker is the *floor* under
-   them, not a replacement. A pathological case where every
-   single event-driven site silently fails is still bounded by
-   the ticker.
+   `gc.heartbeat_interval` (default 60s) and submits *two*
+   writes: a `HeartbeatSnapshot` for the candidate row's
+   `heartbeat_at`, and a `HeartbeatBlobs` for any in-flight
+   member-blob hashes the adoption goroutine has accumulated
+   in its per-adoption tracker (see "In-flight blob heartbeats"
+   below). The ticker exits when `runShared` returns
+   (cooperative cancel via the same context that propagates to
+   the member-fetch loop). This site bounds the heartbeat-gap
+   independently of which phase `runShared` is in — Packages-
+   parse, hot-set computation, the gap from a member-fetch to
+   the next sub-call, the gap between `runHotPrefetch`
+   returning and `CommitAdoption` actually running. Sites 1–5
+   keep their value as latency-fresh event-driven heartbeats
+   (a heartbeat written immediately after a member fetch is
+   more useful for monitoring than one that drifts up to 60s
+   later); the ticker is the *floor* under them, not a
+   replacement. A pathological case where every single event-
+   driven site silently fails is still bounded by the ticker.
+
+**In-flight blob heartbeats.** §7.5.1 Rule 1 sets
+`refcount_zeroed_at = now` on every `PutBlob` of a member blob,
+restarting that blob's `gc.blob_grace` clock. For an adoption
+that fetches members sequentially over minutes (large suites,
+slow upstreams, hot-prefetch loop with `hot_prefetch_budget=0`),
+the *first* member blob's grace clock is the one most at risk:
+without periodic refresh, it can age past `gc.blob_grace` before
+`CommitAdoption` Step 4 runs and bumps `refcount`, at which
+point the §9.6.2 reap predicate fires and the FK INSERT in
+CommitAdoption fails (or worse, the file is unlinked under the
+caller). `cache.HeartbeatBlobs(ctx, hashes)` runs:
+
+```sql
+UPDATE blob
+   SET refcount_zeroed_at = ?
+ WHERE hash IN (...) AND refcount <= 0;
+```
+
+The `refcount <= 0` predicate preserves Rule 2's strictly-
+positive crossing — once `CommitAdoption` Step 4 lands and
+`refcount_zeroed_at` is cleared, subsequent `HeartbeatBlobs`
+calls for the same hashes become per-row no-ops. The ticker
+site (and only the ticker site) drives `HeartbeatBlobs`;
+sites 1–5 are concerned with the candidate row's liveness and
+do not need to refresh blob clocks (the ticker's bound is
+strictly tighter than any other heartbeat site by virtue of
+running on a fixed cadence).
+
+The cross-key validation `gc.heartbeat_interval < gc.blob_grace`
+(§5.2) makes this safe: the ticker fires at least once per
+grace window, so the `refcount_zeroed_at` of any in-flight
+member blob is bounded above by `heartbeat_interval` since
+the last refresh — well within `gc.blob_grace`.
+
+A `HeartbeatBlobs` write failure is logged at Warn under
+`adoption_heartbeat_blobs_failed` and the adoption proceeds.
+The next ticker fire retries; absent a sustained writer-queue
+or DB stall (operator-visible), one missed heartbeat does not
+itself imperil any in-flight blob (the bound becomes
+`2 × heartbeat_interval`, still under `blob_grace`).
 
 **Bound on heartbeat-gap.** With the ticker running, the gap
 between consecutive heartbeats is bounded by
@@ -1445,8 +1519,16 @@ None. GC runs entirely off the request path.
 - **`gc_run_complete`** Info, emitted at the end of each periodic
   tick *and* at the end of the startup pass. Fields:
   - `phase` — `"startup"` or `"periodic"`
-  - `blobs_reaped` — count of blob rows DELETEd this run
-  - `bytes_reclaimed` — sum of `blob.size` for those rows
+  - `blobs_reaped` — count of blob rows DELETEd this run by the
+    §9.6.2 writer-tx COMMIT. This counts *DB* state and is
+    independent of whether the post-COMMIT `os.Remove` succeeded;
+    a non-`ErrNotExist` unlink failure leaks a pool/ file but does
+    NOT resurrect the row, so the row is still counted as reaped
+    (the leak is reported separately under `pool_unlink_errors`,
+    and the next §9.6.4 pool scan repairs it).
+  - `bytes_reclaimed` — sum of `blob.size` for those rows. Same
+    semantics as `blobs_reaped`: counts what the DB COMMIT removed,
+    independent of unlink result.
   - `orphan_candidates_reaped` — count of `suite_snapshot` rows
     DELETEd via §9.6.3 sub-job A
   - `displaced_reaped` — count of `suite_snapshot` rows DELETEd
@@ -1507,21 +1589,39 @@ None. GC runs entirely off the request path.
   adoption may make GC reap the candidate; this is the operator-
   visible signal of that risk.
 
+- **`adoption_heartbeat_blobs_failed`** Warn when the §7.5.2
+  site 6 ticker's `cache.HeartbeatBlobs` UPDATE fails. Fields:
+  `snapshot_id`, `hash_count`, `err`. Same operational meaning
+  as `adoption_heartbeat_failed` but for the *in-flight blob*
+  grace clocks (the candidate row's heartbeat is on a separate
+  write so the two failure modes are distinguishable). Repeated
+  failures ahead of `CommitAdoption` Step 4 risk having a
+  member blob aged past `gc.blob_grace` and reaped before its
+  FK reference lands; the loud Warn line is the early signal.
+
 - **`gc_heartbeat_interval_unsafe`** is the named error class
-  surfaced by config validation when
-  `gc.heartbeat_interval >= heartbeat_stale_grace_effective`
-  (= `max(upstream.total_timeout × upstream.max_retries, 30m)`).
+  surfaced by config validation when either of two cross-key
+  bounds is violated:
+  - `gc.heartbeat_interval >= heartbeat_stale_grace_effective`
+    (= `max(upstream.total_timeout × upstream.max_retries, 30m)`)
+    — a heartbeat ticker that ticks slower than the candidate
+    grace can't bound the heartbeat-gap, so the §9.6.3 reap
+    predicate's safety argument collapses.
+  - `gc.heartbeat_interval >= gc.blob_grace` — the §7.5.2
+    site 6 ticker's `HeartbeatBlobs` write would fire less
+    often than the §9.6.2 reap predicate, letting an in-flight
+    member blob age past grace between two consecutive
+    heartbeats and be reaped mid-adoption.
+
   The validation error string includes both the configured
-  `heartbeat_interval` and the computed `grace_effective` so the
-  operator sees exactly which two values triggered rejection.
-  Loaders reject the config; the daemon does not start (i.e. the
-  error reaches the operator via the daemon's startup-failed exit
+  `heartbeat_interval` and the violated bound, so the operator
+  sees exactly which two values triggered rejection. Loaders
+  reject the config; the daemon does not start (i.e. the error
+  reaches the operator via the daemon's startup-failed exit
   message rather than via a structured slog event — the config
-  logger is not yet installed at validation time). A heartbeat
-  ticker that ticks slower than the grace can't bound the
-  heartbeat-gap, so the §9.6.3 reap predicate's safety argument
-  collapses; refusing to start is safer than starting with a
-  configuration that can silently reap live adoptions.
+  logger is not yet installed at validation time). Refusing to
+  start is safer than starting with a configuration that can
+  silently reap live adoptions.
 
 - **`gc_pool_scan_dir_failed`** Warn when the §9.6.4 startup
   scan can't read a `pool/<prefix>/` directory (e.g. EACCES,

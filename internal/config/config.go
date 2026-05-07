@@ -513,17 +513,34 @@ func (c *Config) Validate() error {
 	}
 	if c.GC.HeartbeatInterval.Duration <= 0 {
 		errs = append(errs, errors.New("gc.heartbeat_interval must be > 0"))
-	} else if grace := c.HeartbeatStaleGraceEffective(); c.GC.HeartbeatInterval.Duration >= grace {
-		// AIDEV-NOTE: SPEC4 §10.2 names this Error
-		// gc_heartbeat_interval_unsafe — refusing to start is safer
-		// than starting with a configuration that can silently reap
-		// live adoptions. The heartbeat-gap upper bound is
-		// heartbeat_interval + writer-queue depth; if heartbeat_interval
-		// alone meets-or-exceeds the grace, the safety argument for
-		// the §9.6.3 reap predicate collapses.
-		errs = append(errs, fmt.Errorf(
-			"gc.heartbeat_interval (%s) must be strictly less than heartbeat_stale_grace_effective (%s = max(upstream.total_timeout × upstream.max_retries, 30m))",
-			c.GC.HeartbeatInterval.Duration, grace))
+	} else {
+		if grace := c.HeartbeatStaleGraceEffective(); c.GC.HeartbeatInterval.Duration >= grace {
+			// AIDEV-NOTE: SPEC4 §10.2 names this Error
+			// gc_heartbeat_interval_unsafe — refusing to start is safer
+			// than starting with a configuration that can silently reap
+			// live adoptions. The heartbeat-gap upper bound is
+			// heartbeat_interval + writer-queue depth; if heartbeat_interval
+			// alone meets-or-exceeds the grace, the safety argument for
+			// the §9.6.3 reap predicate collapses.
+			errs = append(errs, fmt.Errorf(
+				"gc.heartbeat_interval (%s) must be strictly less than heartbeat_stale_grace_effective (%s = max(upstream.total_timeout × upstream.max_retries, 30m))",
+				c.GC.HeartbeatInterval.Duration, grace))
+		}
+		// AIDEV-NOTE: parallel constraint for the §7.5.1 Rule 1 race
+		// window. Adoption's heartbeat-blobs ticker (§7.5.2 site 6,
+		// adoption.go heartbeat()→HeartbeatBlobs) refreshes
+		// blob.refcount_zeroed_at every heartbeat_interval. If
+		// heartbeat_interval >= blob_grace, an in-flight member blob
+		// can age past the §9.6.2 reap predicate's
+		// `refcount_zeroed_at < now - blob_grace` between two
+		// consecutive heartbeats — i.e. before CommitAdoption Step 4
+		// can bump refcount and clear the grace clock — and be
+		// reaped by GC mid-adoption. Refuse to start.
+		if c.GC.BlobGrace.Duration > 0 && c.GC.HeartbeatInterval.Duration >= c.GC.BlobGrace.Duration {
+			errs = append(errs, fmt.Errorf(
+				"gc.heartbeat_interval (%s) must be strictly less than gc.blob_grace (%s) — otherwise in-flight member blobs can be reaped between heartbeats before CommitAdoption lands",
+				c.GC.HeartbeatInterval.Duration, c.GC.BlobGrace.Duration))
+		}
 	}
 
 	for i, ts := range c.TrustedSigners {

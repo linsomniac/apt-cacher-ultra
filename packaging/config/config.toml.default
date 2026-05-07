@@ -130,6 +130,55 @@ refuse_unvouched_debs     = false
 [hot_packages]
 window = "24h"
 
+# Phase 4 garbage collection (SPEC4 §5).
+#
+# Reaps three classes of dead rows:
+#   - blobs whose refcount has dropped to <= 0 and aged past
+#     blob_grace (no remaining url_path or snapshot_member references)
+#   - displaced snapshots beyond keep_displaced (per suite)
+#   - orphan candidate snapshots whose heartbeat aged past
+#     max(upstream.total_timeout * upstream.max_retries, 30m)
+#
+# Plus, on every process startup, a one-shot pool/ orphan scan
+# repairs files left over from a crash between COMMIT and unlink.
+#
+# Tuning. Defaults are conservative for steady-state operation; raise
+# batch_size (or lower interval) only after gc_tick_deadline_reached
+# Info events show that the per-tick deadline is consistently tripped.
+[gc]
+enabled               = true
+interval              = "1h"
+batch_size            = 100
+snapshot_batch_size   = 10
+
+# Per-tick wall-clock budget. The pass exits cleanly between batches
+# if exceeded; the next tick (or next startup) picks up backlog.
+max_tick_duration     = "5m"
+
+# "Refcount reached 0" grace before a blob is reapable. Default 5m
+# matches the tmp/ partials cutoff (the existing "is this in flight?"
+# timescale). Sub-second values are rejected at load — the reap
+# predicate works in unix-epoch-seconds and would silently truncate.
+# heartbeat_interval (below) MUST be strictly less than blob_grace,
+# or in-flight member blobs can be reaped between heartbeats.
+blob_grace            = "5m"
+
+# Per-suite forensic retention for displaced snapshots. The most
+# recent N displaced snapshots per suite survive for operator
+# inspection. 0 disables retention entirely.
+keep_displaced        = 3
+
+# Worker pool size for the startup-only pool/ orphan scan.
+pool_scan_workers     = 4
+
+# Per-adoption heartbeat ticker (SPEC4 §7.5.2 site 6). Bounds the
+# heartbeat-gap during phases the five event-driven sites do not
+# cover (Packages-parse, hot-set computation, writer-queue waits).
+# Must be > 0s, strictly less than gc.blob_grace, and strictly less
+# than the runtime-derived heartbeat_stale_grace_effective
+# (max(upstream.total_timeout * upstream.max_retries, 30m)).
+heartbeat_interval    = "60s"
+
 [serve]
 serve_stale_when_upstream_down = true
 log_stale_serves               = true

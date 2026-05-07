@@ -883,6 +883,55 @@ heartbeat_interval = "30m"
 	}
 }
 
+// heartbeat_interval >= blob_grace is unsafe even when both are well
+// under heartbeat_stale_grace_effective: the §7.5.2 site 6 ticker
+// refreshes blob.refcount_zeroed_at every heartbeat_interval, so a
+// heartbeat that ticks slower than blob_grace lets in-flight member
+// blobs age past the §9.6.2 reap predicate between two heartbeats.
+// 30s heartbeat with 30s blob_grace is at the equality boundary —
+// the validator uses strictly-less-than.
+func TestValidate_RejectsHeartbeatIntervalAtBlobGraceBoundary(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[gc]
+heartbeat_interval = "30s"
+blob_grace = "30s"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "gc.heartbeat_interval") ||
+		!strings.Contains(err.Error(), "gc.blob_grace") ||
+		!strings.Contains(err.Error(), "strictly less than") {
+		t.Errorf("error %q does not name the heartbeat-vs-blob-grace violation", err)
+	}
+}
+
+// heartbeat_interval > blob_grace is the more obvious form of the
+// same footgun: 2m ticker with 30s grace lets the grace window
+// elapse twice between heartbeats.
+func TestValidate_RejectsHeartbeatIntervalAboveBlobGrace(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[gc]
+heartbeat_interval = "2m"
+blob_grace = "30s"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "gc.heartbeat_interval") ||
+		!strings.Contains(err.Error(), "gc.blob_grace") {
+		t.Errorf("error %q does not name the heartbeat-vs-blob-grace violation", err)
+	}
+}
+
 // heartbeat_interval = 60s with default upstream config (total_timeout=5m,
 // max_retries=3 → derived 15m; grace_effective = max(15m, 30m) = 30m) →
 // 60s < 30m, accepted.
@@ -973,6 +1022,58 @@ keep_displaced = -1
 	_, err := Load(path)
 	if err == nil || !strings.Contains(err.Error(), "gc.keep_displaced") {
 		t.Errorf("got %v, want gc.keep_displaced error", err)
+	}
+}
+
+// The packaged default config (shipped to operators via the
+// apt-cacher-ultra package) must parse cleanly and pass the same
+// validation as a hand-written config. SPEC4 §5 says all the [gc]
+// keys live in this file; this test catches drift between the
+// packaged template and the loader. We rewrite the cache.dir line
+// to point at a tempdir before validating because Validate's
+// `os.Stat(cache.dir)` would otherwise fail on the
+// /var/cache/apt-cacher-ultra path baked into the shipped template.
+func TestLoad_PackagedDefaultConfig(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoRoot := filepath.Clean(filepath.Join(wd, "..", ".."))
+	raw, err := os.ReadFile(filepath.Join(repoRoot, "packaging", "config", "config.toml.default"))
+	if err != nil {
+		t.Fatalf("read packaged default: %v", err)
+	}
+	dir := t.TempDir()
+	rewritten := strings.Replace(
+		string(raw),
+		`dir         = "/var/cache/apt-cacher-ultra"`,
+		`dir         = "`+dir+`"`,
+		1,
+	)
+	if !strings.Contains(rewritten, dir) {
+		t.Fatalf("dir = ... line not found in packaged default; refresh test fixture")
+	}
+	tmpPath := writeTOML(t, dir, "config.toml", rewritten)
+	cfg, err := Load(tmpPath)
+	if err != nil {
+		t.Fatalf("Load packaged default: %v", err)
+	}
+	// Spot-check the [gc] block — Codex finding #3 was that this
+	// block was missing entirely.
+	if !cfg.GC.Enabled {
+		t.Errorf("packaged default has gc.enabled=false; expected true")
+	}
+	if cfg.GC.Interval.Duration != time.Hour {
+		t.Errorf("packaged default gc.interval = %s, want 1h", cfg.GC.Interval.Duration)
+	}
+	if cfg.GC.BlobGrace.Duration != 5*time.Minute {
+		t.Errorf("packaged default gc.blob_grace = %s, want 5m", cfg.GC.BlobGrace.Duration)
+	}
+	if cfg.GC.HeartbeatInterval.Duration != 60*time.Second {
+		t.Errorf("packaged default gc.heartbeat_interval = %s, want 60s", cfg.GC.HeartbeatInterval.Duration)
+	}
+	if cfg.GC.PoolScanWorkers < 1 {
+		t.Errorf("packaged default gc.pool_scan_workers = %d, want >= 1", cfg.GC.PoolScanWorkers)
 	}
 }
 
