@@ -512,17 +512,22 @@ func TestRunTick_SnapshotDeadlineCascadesToBlobPass(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SPEC4 §9.6.2: SELECT-then-mutate-then-DELETE race — the DELETE's
-// reachability predicate must filter out a row whose refcount has been
-// bumped back > 0 between phases.
+// SPEC4 §9.6.2: integration-level reachability exclusion via the
+// gc.RunBlobGCBatch wrapper. This is a pure reachability test — the
+// real SELECT-then-mutate-then-DELETE race needs a writer-tx
+// interleaving seam (deferred to §12.3 chaos tests, where a controlled
+// hook between SELECT and DELETE inside a single batch can mutate
+// reachability and prove the DELETE re-application excludes the
+// survivor). Here we only verify that pre-placed FK references prevent
+// reaping — exercising the SELECT predicate.
 // ---------------------------------------------------------------------------
 
-// TestRunBlobGCBatch_SelectMutateDelete_Survivor: simulates a survivor by
-// pre-placing a row whose refcount looks reapable to the SELECT but —
-// thanks to a snapshot_member FK — is also reachability-protected. The
-// DELETE re-applies the reachability predicate atomically and excludes
-// the survivor.
-func TestRunBlobGCBatch_PredicateReapplied_ExcludesSurvivor(t *testing.T) {
+// TestRunBlobGCBatch_ExcludesUnreachableBlobs: a row that LOOKS reapable
+// on its own (refcount=0, eligible clock) but is referenced by a
+// snapshot_member or suite_snapshot FK must be excluded. Cross-cuts
+// the per-FK goldens in cache/gc_test.go to verify the gc-package
+// wrapper passes through the exclusion semantics.
+func TestRunBlobGCBatch_ExcludesUnreachableBlobs(t *testing.T) {
 	c := openTestCache(t)
 	ctx := context.Background()
 

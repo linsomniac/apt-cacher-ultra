@@ -1491,27 +1491,69 @@ func TestMigration_V3ToV4_PartialIndexHasWhereClause(t *testing.T) {
 	}
 }
 
+// TestMigration_V3ToV4_AtomicRollback forces a real mid-flight failure
+// on a v3 DB and asserts every prior step rolls back atomically. We
+// pre-create `idx_url_path_blob` — which is the LAST statement in
+// migrations[3] — so the migration successfully ADDs both columns,
+// runs both backfill UPDATEs, and CREATEs `idx_blob_gc` before
+// hitting "index idx_url_path_blob already exists". The transaction
+// must roll back: schema_version stays at 3, both new columns are
+// absent, both new indexes are absent (the pre-existing
+// `idx_url_path_blob` we planted survives because it lived outside
+// the transaction).
 func TestMigration_V3ToV4_AtomicRollback(t *testing.T) {
 	db, _ := openV3Cache(t)
 	ctx := context.Background()
 
-	// Inject a malformed row that the migration should not break on at v3
-	// load — but force a CHECK failure via a violation that the migration
-	// doesn't rewrite. The v3→v4 migration is pure ADD COLUMN + UPDATE +
-	// CREATE INDEX; none of those have an inherent failure mode on clean
-	// data, so we simulate failure by pre-creating a column that the
-	// migration tries to add (idempotent re-apply test below covers this
-	// happy path; here we verify atomicity by attempting twice without
-	// schema_version bump in between).
+	// Pre-create the last index migrations[3] tries to add. v3 already
+	// has url_path.blob_hash so the index is constructible.
+	if _, err := db.Exec(`CREATE INDEX idx_url_path_blob ON url_path(blob_hash) WHERE blob_hash IS NOT NULL`); err != nil {
+		t.Fatalf("seed pre-existing index: %v", err)
+	}
+
+	err := applyMigration(ctx, db, 3)
+	if err == nil {
+		t.Fatal("expected applyMigration v3→v4 to fail on duplicate index, got nil")
+	}
+
+	// Atomic rollback assertions: schema_version unchanged, both new
+	// columns absent, idx_blob_gc absent (it was created before the
+	// failing statement and must have been rolled back).
+	v, verr := readSchemaVersion(ctx, db)
+	if verr != nil {
+		t.Fatalf("readSchemaVersion: %v", verr)
+	}
+	if v != 3 {
+		t.Errorf("schema_version after failed migration = %d, want 3", v)
+	}
+	if hasColumn(t, db, "blob", "refcount_zeroed_at") {
+		t.Error("blob.refcount_zeroed_at survived failed migration; ADD COLUMN was not rolled back")
+	}
+	if hasColumn(t, db, "suite_snapshot", "heartbeat_at") {
+		t.Error("suite_snapshot.heartbeat_at survived failed migration; ADD COLUMN was not rolled back")
+	}
+	if hasIndex(t, db, "idx_blob_gc") {
+		t.Error("idx_blob_gc survived failed migration; CREATE INDEX was not rolled back")
+	}
+	// The pre-existing idx_url_path_blob (planted outside the
+	// migration tx) must still exist — it's not part of the rollback.
+	if !hasIndex(t, db, "idx_url_path_blob") {
+		t.Error("pre-existing idx_url_path_blob was incorrectly removed")
+	}
+}
+
+// TestMigration_V3ToV4_FailedRetryDoesNotCorruptVersion: a separate
+// idempotency test — re-running migrations[3] after a successful
+// migration produces a SQL error (duplicate column) but leaves
+// schema_version at 4, with no half-applied state.
+func TestMigration_V3ToV4_FailedRetryDoesNotCorruptVersion(t *testing.T) {
+	db, _ := openV3Cache(t)
+	ctx := context.Background()
 
 	if err := applyMigration(ctx, db, 3); err != nil {
 		t.Fatalf("first applyMigration v3→v4: %v", err)
 	}
-	// Re-running migrations[3] without bumping the version is a SQL-level
-	// ADD COLUMN duplicate failure — which must roll back atomically:
-	// schema_version stays at 4, and no new index appears.
-	err := applyMigration(ctx, db, 3)
-	if err == nil {
+	if err := applyMigration(ctx, db, 3); err == nil {
 		t.Fatal("re-applying v3→v4 unexpectedly succeeded (ADD COLUMN should duplicate)")
 	}
 	v, _ := readSchemaVersion(ctx, db)

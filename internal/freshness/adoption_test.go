@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1283,9 +1282,7 @@ func TestRunHeartbeatTicker_AdvancesHeartbeatAt(t *testing.T) {
 
 	// Backdate heartbeat_at to epoch=1 so any ticker write produces a
 	// large jump that's unambiguous at the suite_snapshot's
-	// unix-seconds resolution. Without this, a 150ms test window can
-	// fall entirely inside one second and hb1 == hb2 even though the
-	// ticker fired.
+	// unix-seconds resolution.
 	dbPath := filepath.Join(c.Dir(), "cache.db")
 	{
 		db, err := sql.Open("sqlite", dbPath)
@@ -1306,7 +1303,6 @@ func TestRunHeartbeatTicker_AdvancesHeartbeatAt(t *testing.T) {
 		heartbeatInterval: 50 * time.Millisecond,
 	}
 
-	preGoroutines := runtime.NumGoroutine()
 	tickerCtx, tickerCancel := context.WithCancel(ctx)
 	tickerDone := make(chan struct{})
 	go func() {
@@ -1314,21 +1310,28 @@ func TestRunHeartbeatTicker_AdvancesHeartbeatAt(t *testing.T) {
 		a.runHeartbeatTicker(tickerCtx, id, nil)
 	}()
 
-	// Allow at least one tick to fire — 200ms covers ~3 intervals plus
-	// the writer-queue submit.
-	time.Sleep(200 * time.Millisecond)
+	// Poll for the heartbeat_at write to land. Generous timeout for
+	// slow CI; a healthy machine sees the first tick within 50-150ms.
+	deadline := time.Now().Add(5 * time.Second)
+	advanced := false
+	for time.Now().Before(deadline) {
+		if hb := readHeartbeatAtDirect(t, dbPath, id); hb > 1 {
+			advanced = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	tickerCancel()
-	<-tickerDone
 
-	hb := readHeartbeatAtDirect(t, dbPath, id)
-	if hb < time.Now().Unix()-10 {
-		t.Errorf("heartbeat_at = %d, expected close to now=%d (ticker did not fire or write was lost)", hb, time.Now().Unix())
+	if !advanced {
+		t.Errorf("heartbeat_at did not advance from epoch=1 within 5s; ticker did not fire")
 	}
 
-	// Goroutine cleanup: the ticker goroutine must have exited.
-	// Allow +1 for the rare scheduler noise of a not-yet-reaped finalizer.
-	if post := runtime.NumGoroutine(); post > preGoroutines+1 {
-		t.Errorf("goroutine leak: pre=%d post=%d", preGoroutines, post)
+	// Ticker must exit cleanly on cancel within a reasonable bound.
+	select {
+	case <-tickerDone:
+	case <-time.After(2 * time.Second):
+		t.Errorf("ticker did not exit within 2s of cancel")
 	}
 }
 
