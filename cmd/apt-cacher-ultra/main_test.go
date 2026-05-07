@@ -89,7 +89,7 @@ func TestServe_EndToEnd_MirrorFetchAndCache(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		serveErr = serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil)
+		serveErr = serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil)
 	}()
 
 	t.Cleanup(func() {
@@ -182,7 +182,7 @@ func TestServe_GracefulShutdown_DrainsInflight(t *testing.T) {
 	var serveErr error
 	go func() {
 		defer wg.Done()
-		serveErr = serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil)
+		serveErr = serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil)
 	}()
 
 	// Kick off the slow request from another goroutine.
@@ -271,7 +271,7 @@ func TestServe_DisallowedHostReturnsForbidden(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil)
+		_ = serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -327,7 +327,7 @@ func TestServe_ReturnsListenError(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil)
+		done <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil)
 	}()
 
 	// Give the goroutine a moment to enter Serve(), then close the listener
@@ -428,7 +428,7 @@ func TestServe_GracefulShutdown_KillsHungFetchAfterDrainBudget(t *testing.T) {
 
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil)
+		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil)
 	}()
 
 	// Kick off the request. We do not care about its body — only that
@@ -518,7 +518,7 @@ func TestServe_GracefulShutdown_KillsSlowClientAfterDrainBudget(t *testing.T) {
 	defer cancel()
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil)
+		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil)
 	}()
 
 	// Warm the cache so the slow-client request below is a cache HIT,

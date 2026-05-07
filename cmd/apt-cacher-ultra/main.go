@@ -12,11 +12,13 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/admin"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
@@ -26,6 +28,8 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/handler"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
+	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 )
 
@@ -116,7 +120,23 @@ func serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		}
 	}
 
-	return serveListeners(ctx, cfg, logger, plainLn, tlsLn)
+	// SPEC5 §9.7.1: admin listener bound after the proxy/TLS
+	// listeners and before cache.Open, so a bind failure (port in
+	// use, permission denied) fails-fast before we touch the cache
+	// directory. Skipped when admin.enabled = false.
+	var adminLn net.Listener
+	if cfg.Admin.Enabled {
+		adminLn, err = net.Listen("tcp", cfg.Admin.Listen)
+		if err != nil {
+			_ = plainLn.Close()
+			if tlsLn != nil {
+				_ = tlsLn.Close()
+			}
+			return fmt.Errorf("listen %s: %w", cfg.Admin.Listen, err)
+		}
+	}
+
+	return serveListeners(ctx, cfg, logger, plainLn, tlsLn, adminLn)
 }
 
 // serveListeners is the inner serve loop. It owns its listeners (closing
@@ -134,6 +154,7 @@ func serveListeners(
 	logger *slog.Logger,
 	plainLn net.Listener,
 	tlsLn net.Listener,
+	adminLn net.Listener,
 ) (retErr error) {
 	defer func() {
 		// Defensive: if we error out before the goroutines start serving,
@@ -144,6 +165,9 @@ func serveListeners(
 			_ = plainLn.Close()
 			if tlsLn != nil {
 				_ = tlsLn.Close()
+			}
+			if adminLn != nil {
+				_ = adminLn.Close()
 			}
 		}
 	}()
@@ -190,6 +214,13 @@ func serveListeners(
 		"gc_pool_scan_workers", cfg.GC.PoolScanWorkers,
 		"gc_heartbeat_interval", cfg.GC.HeartbeatInterval.Duration,
 		"gc_heartbeat_stale_grace_effective", cfg.HeartbeatStaleGraceEffective(),
+		"admin_enabled", cfg.Admin.Enabled,
+		"admin_listen", cfg.Admin.Listen,
+		"admin_htpasswd_file", cfg.Admin.HtpasswdFile,
+		"admin_gauge_refresh", cfg.Admin.GaugeRefresh.Duration,
+		"admin_read_timeout", cfg.Admin.ReadTimeout.Duration,
+		"admin_idle_timeout", cfg.Admin.IdleTimeout.Duration,
+		"admin_metric_series_cap", cfg.Admin.MetricSeriesCap,
 		"trusted_signer_blocks", len(cfg.TrustedSigners),
 		"serve_stale_when_upstream_down", cfg.Serve.ServeStaleWhenUpstreamDown,
 		"log_format", cfg.Log.Format,
@@ -221,6 +252,26 @@ func serveListeners(
 	if !cfg.GC.Enabled {
 		logger.Warn("gc_disabled",
 			"detail", "gc.enabled = false: orphan blobs and displaced snapshots will not be reaped; pool/ size grows unboundedly with rolling adoptions")
+	}
+
+	// SPEC5 §5.2 / §10.2: admin-listener startup events.
+	if !cfg.Admin.Enabled {
+		logger.Warn("admin_disabled",
+			"detail", "admin.enabled = false: /metrics, /, /healthz unreachable; the cache still serves proxy traffic but observability is off")
+	} else {
+		if cfg.Admin.HtpasswdFile == "" && admin.IsNonLoopback(cfg.Admin.Listen) {
+			logger.Warn("admin_unauthenticated_non_loopback",
+				"listen", cfg.Admin.Listen,
+				"detail", "admin.listen binds non-loopback AND admin.htpasswd_file is empty: the admin port is reachable from the network without authentication")
+		}
+		// admin_authenticated emitted after the htpasswd parses
+		// successfully; that happens inside admin.New (the count is
+		// not surfaced in this commit's API, so the Info line emits
+		// without user_count for now).
+		if cfg.Admin.HtpasswdFile != "" {
+			logger.Info("admin_authenticated",
+				"htpasswd_file", cfg.Admin.HtpasswdFile)
+		}
 	}
 
 	c, err := cache.Open(ctx, cfg.Cache.Dir, logger)
@@ -388,6 +439,38 @@ func serveListeners(
 		gcsvc.Run(freshCtx)
 	}()
 
+	// SPEC5 §9.7.7 in-memory adoption ring. Process-local; dropped
+	// on restart. Capacity 50 events. The freshness package will
+	// Record into this ring at every adoption-completion site
+	// (counter wiring, future commit). The status-page handler
+	// reads from it via Snapshot.
+	adoptionRing := observability.NewRing(50)
+
+	// SPEC5 §9.7 admin listener. Built only when admin.enabled.
+	// BuildInfo is composed here because internal/admin cannot
+	// import main (Go's internal/ rule) — main reads main.Version
+	// + debug.ReadBuildInfo() and passes the value-type bridge.
+	var adminSrv *admin.Server
+	if cfg.Admin.Enabled {
+		adminSrv, err = admin.New(admin.Config{
+			Cache:       c,
+			GC:          gcsvc,
+			HostLimiter: hostLimiter,
+			Ring:        adoptionRing,
+			Registry:    metrics.Default,
+			Logger:      logger,
+			BuildInfo:   buildInfo(),
+			Admin:       cfg.Admin,
+			StartTime:   time.Now(),
+			ProxyAddr:   plainLn.Addr().String(),
+			TLSAddr:     tlsAddrString(tlsLn),
+			AdminAddr:   adminLn.Addr().String(),
+		})
+		if err != nil {
+			return fmt.Errorf("build admin: %w", err)
+		}
+	}
+
 	plainSrv := newHTTPServer(h, logger)
 	var tlsSrv *http.Server
 	if tlsLn != nil {
@@ -397,7 +480,7 @@ func serveListeners(
 	// AIDEV-NOTE: errCh is buffered to (number of servers) so a goroutine
 	// can always deliver its terminal error without blocking even if the
 	// main goroutine has already moved on to shutdown.
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	var wg sync.WaitGroup
 
 	wg.Add(1)
@@ -420,6 +503,20 @@ func serveListeners(
 			err := tlsSrv.ServeTLS(tlsLn, cfg.Cache.TLSCert, cfg.Cache.TLSKey)
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("https: %w", err)
+				return
+			}
+			errCh <- nil
+		}()
+	}
+
+	if adminSrv != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			logger.Info("admin listener accepting", "addr", adminLn.Addr().String())
+			err := adminSrv.Serve(adminLn)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("admin: %w", err)
 				return
 			}
 			errCh <- nil
@@ -450,6 +547,18 @@ func serveListeners(
 	// already cancelled) so the deadline is real.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+
+	// SPEC5 §9.5: admin listener shuts down FIRST. Its endpoints
+	// read DB state (status page, refresher gauges) and a partial
+	// shutdown of the proxy listener should not surface inconsistent
+	// observability data to a scraper. Once shutdown begins,
+	// /healthz starts returning 503 with X-Acu-Check-Failed:
+	// shutdown so reverse-proxy probes steer traffic away.
+	if adminSrv != nil {
+		if err := adminSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("admin shutdown returned error", "err", err)
+		}
+	}
 
 	var sg sync.WaitGroup
 	sg.Add(1)
@@ -620,6 +729,24 @@ func tlsAddrString(ln net.Listener) string {
 		return ""
 	}
 	return ln.Addr().String()
+}
+
+// buildInfo composes the SPEC5 §10.4.7 BuildInfo from main.Version
+// (Makefile-injected via -ldflags) and runtime/debug.ReadBuildInfo
+// (Go toolchain populates GoVersion + VCS revision automatically).
+// Called once at startup and passed into the admin listener.
+func buildInfo() admin.BuildInfo {
+	bi := admin.BuildInfo{Version: Version}
+	if di, ok := debug.ReadBuildInfo(); ok {
+		bi.GoVersion = di.GoVersion
+		for _, s := range di.Settings {
+			if s.Key == "vcs.revision" {
+				bi.VCSRevision = s.Value
+				break
+			}
+		}
+	}
+	return bi
 }
 
 // newHTTPServer builds a *http.Server with the timeouts SPEC §9 implies.
