@@ -1,8 +1,8 @@
 # apt-cacher-ultra — Phase 5 Scoping
 
-Status: **scoping locked** (revision 3).
-Last updated 2026-05-07. Next artifact: `SPEC5.md` modeled on
-`SPEC4.md`'s structure.
+Status: **scoping locked** (revision 4).
+Last updated 2026-05-07. Companion artifact: [SPEC5.md](SPEC5.md)
+(now created — Phase 5 implementation contract).
 
 This document gathers what Phase 5 is, the hooks Phases 1–4 left in
 place for it, and the design decisions resolved during this scoping
@@ -592,41 +592,31 @@ can filter / aggregate accordingly.
 
 #### 3.4.2 Fetch path (internal/fetch)
 
-- `acu_fetch_total{outcome,host}` — counter. The classifier
-  below is a **total function** mapping every fetch terminal
-  return to exactly one outcome label. Each row corresponds to
-  exactly one fetch sentinel (or status-code class), so an
-  operator inspecting the metric sees a complete picture of
-  upstream behavior. Outcome label values:
+- `acu_fetch_total{outcome,host}` — counter. The classifier is a
+  **total function** mapping every fetch terminal return to
+  exactly one outcome label. Because `Fetch()` returns just
+  `(*FetchResult, error)` while `Conditional()` returns
+  `(*ConditionalResult, error)` whose nil-error path can carry
+  Status 200 (changed) OR 304 (not modified), the classifier is
+  exposed as **two helpers** keyed by operation:
 
-  | Source | Outcome label |
-  |---|---|
-  | `Fetch` returned `nil` | `success` |
-  | `Conditional` returned `nil` Status 200 | `cond_changed` |
-  | `Conditional` returned `nil` Status 304 | `cond_unchanged` |
-  | `*StatusError` with code 4xx (matches `ErrUpstreamStatus`) | `4xx` |
-  | `*StatusError` with code 5xx (matches `ErrUpstreamServerError`) | `5xx` |
-  | `ErrUpstreamUnavailable` (retries exhausted on transient) | `unavailable` |
-  | `ErrRedirectBlocked` (3xx CheckRedirect rejection) | `redirect_blocked` |
-  | `ErrHostNotAllowed` | `host_not_allowed` |
-  | `ErrTargetDenied` (post-DNS deny CIDR) | `target_denied` |
-  | `ErrHostUnreachable` (cooldown-probe fast-fail; SPEC §1) | `host_unreachable` |
-  | `ErrInvalidURL` | `invalid_url` |
-  | `ErrSizeMismatch` | `size_mismatch` |
-  | `ErrInvalidContentRange` | `invalid_content_range` |
-  | `ErrTotalSizeMismatch` | `total_size_mismatch` |
-  | `ErrCacheWriteFailed` | `cache_write_failed` |
-  | `ErrConditionalBodyTooLarge` (Conditional only) | `body_too_large` |
-  | `context.DeadlineExceeded` | `timeout` |
-  | `context.Canceled` | `canceled` |
-  | net dial error (`*net.OpError`, EAI_NONAME, etc.) | `dns_failed` / `connect_failed` |
-  | any other | `error` (catch-all) |
+  ```go
+  // ClassifyFetchOutcome handles fetch.Fetch() returns.
+  func ClassifyFetchOutcome(err error) string
+  // ClassifyConditionalOutcome handles fetch.Conditional() returns.
+  func ClassifyConditionalOutcome(res *ConditionalResult, err error) string
+  ```
 
-  The classifier is implemented as a small, branchful helper in
-  `internal/fetch` (e.g. `ClassifyOutcome(err error) string`) so
-  the handler and the freshness checker share one source of
-  truth. Phase 5 instrumentation calls this helper at every fetch
-  return site (§3.3.1).
+  Precedence is **specific-cause-first** (first match in the
+  ordered list wins). The exact ordering matters because the
+  dialer's cooldown-probe path wraps a single error with both
+  `ErrUpstreamUnavailable` and `ErrHostUnreachable`
+  (`%w: %w: %v` at `internal/fetch/dialer.go:163`); checking
+  `ErrUpstreamUnavailable` first would mask the more
+  diagnostic `host_unreachable` label. Full precedence table
+  lives in SPEC5 §10.4.2; the rule of thumb is "every specific
+  sentinel comes before every generic sentinel; net dial errors
+  come last."
 
 - `acu_fetch_duration_seconds{outcome,host}` — histogram.
   Same outcome label set as `acu_fetch_total`.
@@ -798,8 +788,8 @@ deadline_reached: false
 zero_refcount_backlog: 3 blobs awaiting grace
 displaced snapshots retained per suite: 3
 
-== Hot packages ==
-[list of hot package set, top 20 by request count, with last_requested_at]
+== Hot URL paths ==
+[top 20 url_path rows by request_count DESC, host + path + is_metadata + request_count + last_requested_at — package-name+arch deferred; see §3.5.3 note]
 
 == Recent adoptions ==
 [table of last N adoptions across all suites — successes and
@@ -864,8 +854,11 @@ in SPEC5; backwards-compatible additions only thereafter):
     "last_run_deadline_reached": false,
     "displaced_per_suite_kept": 3
   },
-  "hot_packages": [
-    {"package": "linux-image-...", "request_count": 412,
+  "hot_url_paths": [
+    {"host": "archive.ubuntu.com",
+     "path": "/ubuntu/pool/main/l/linux/linux-image-foo.deb",
+     "is_metadata": false,
+     "request_count": 412,
      "last_requested_unixtime": 1746671280}
   ],
   "recent_adoptions": [
@@ -936,8 +929,12 @@ page for diagnosis; /healthz is for binary-decision automation.
 
 ### 3.7 Refresher goroutine
 
-Started after the admin listener binds. Runs a loop with
-30s sleep + recompute of expensive gauges:
+Started after the admin listener binds. The goroutine performs
+an **immediate first recompute** before sleeping (so the first
+scrape sees populated gauges rather than zeros), then loops:
+recompute → sleep `admin.gauge_refresh` → repeat. Each query
+runs under `context.WithTimeout(lifecycleCtx, 10s)` — see SPEC5
+§9.7.6 for the full timeout/error contract. Recomputed gauges:
 
 - `acu_blobs_db_count` — `SELECT COUNT(*) FROM blob`.
 - `acu_blobs_db_total_bytes` — `SELECT SUM(size) FROM blob`.
@@ -1005,13 +1002,22 @@ validated, and `(username → hash)` stored in a map. Parse errors
 fail startup with a clear error message naming the file and line
 number.
 
-At request time, the file's `os.Stat` mtime is checked against
-the cached parse timestamp. If mtime has advanced, the file is
-re-parsed and the map atomically swapped. Parse failures during
-reload **do not** swap the map — the daemon keeps serving with
-the prior credentials and emits an `htpasswd_reload_failed` Warn.
-This means a temporarily-broken htpasswd file (mid-edit) does
-not lock operators out.
+At request time, the file's `os.Stat` returns the current
+`(mtime, size)` tuple, which is compared to the cached
+parse-time tuple. If EITHER component differs, the file is
+re-parsed and the map atomically swapped. Tracking both fields
+catches same-second rewrites (where mtime is identical but
+typically size differs) and mtime moving backward (clock
+change, ansible-apply on a different host, file restored from
+backup). Parse failures during reload **do not** swap the map
+— the daemon keeps serving with the prior credentials and emits
+an `htpasswd_reload_failed` Warn. This means a
+temporarily-broken htpasswd file (mid-edit) does not lock
+operators out. Known limitation: an editor that produces an
+exact-same-size, exact-same-second rewrite with different
+content (pathological — typically requires swapping two hashes
+of identical length within one second) is not detected;
+operators can `touch` the file or restart the daemon.
 
 The stat-on-each-request cost is one syscall per admin request
 — negligible against the network round-trip and TLS handshake
@@ -1093,10 +1099,13 @@ type HostStat struct {
 ```
 
 Implementation: hold the existing `sem.mu` Lock, walk
-`sem.slots`, and for each `*hostSlot` record `Inflight = limit -
-len(slot.ch)` and `Capacity = limit`. (The buffered channel's
-length is the count of *available* tokens; in-flight is the
-complement.)
+`sem.slots`, and for each `*hostSlot` record
+`Inflight = len(slot.ch)` and `Capacity = cap(slot.ch)`. (The
+buffered channel's length is the count of currently-held
+tokens — `Acquire` *sends* into the channel when a token is
+held [sem.go:77] and Release *receives* [sem.go:96], so the
+channel fills as concurrency rises. `cap(slot.ch)` equals
+`s.limit`; either is correct.)
 
 The new method does not change any existing semaphore behavior —
 it is purely a read view onto the existing fields under the
@@ -1405,13 +1414,16 @@ Three test layers, parallel to Phase 4:
 
 ### 6.6 Fetch outcome classifier tests (internal/fetch)
 
-For each entry in the §3.4.2 classifier table, construct a
-returned-error or `nil` value and verify
-`ClassifyOutcome(err)` returns the expected outcome label. Each
-sentinel + status code pair is one test case (~20 cases). The
-test asserts the classifier is **total**: the catch-all `error`
-arm fires on a bare `errors.New("synthetic")` and on a `nil`
-ContentResult that doesn't match any specific success path.
+For each entry in the §3.4.2 / SPEC5 §10.4.2 classifier
+precedence table, construct an `(err)` or `(res, err)` pair and
+verify the appropriate helper (`ClassifyFetchOutcome` or
+`ClassifyConditionalOutcome`) returns the expected outcome
+label. The test additionally pins precedence: a wrapped
+`%w: %w: ...` chain carrying both `ErrUpstreamUnavailable` and
+`ErrHostUnreachable` (the dialer-cooldown shape from
+`internal/fetch/dialer.go:163`) classifies as
+`host_unreachable`, not `unavailable`. The catch-all `error`
+arm fires on a bare `errors.New("synthetic")`.
 
 ### 6.7 Data-source helper tests (cache + GC)
 
@@ -1446,8 +1458,11 @@ not new chaos.
 5. `cache.ListSuitesWithAdoption(ctx)` and `gc.GC.LastRunSummary()`
    data-source helpers added per §3.11, with unit tests under
    `-race`.
-6. `internal/fetch.ClassifyOutcome(err)` total classifier added
-   per §3.4.2, with unit tests for every sentinel.
+6. `internal/fetch.ClassifyFetchOutcome(err)` and
+   `ClassifyConditionalOutcome(res, err)` total classifiers
+   added per §3.4.2, with unit tests for every sentinel in
+   precedence order (including the `host_unreachable`-wins
+   test for the dialer-cooldown wrap).
 7. Admin listener bound, all three endpoints reachable on default
    loopback config.
 8. Counter wiring at all emit sites, verified by §6.3 tests

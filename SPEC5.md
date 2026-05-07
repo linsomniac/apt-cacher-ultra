@@ -11,14 +11,29 @@ document [PHASE-5-SCOPING.md](PHASE-5-SCOPING.md) records the
 design rationale and the eight-question scoping pass — plus three
 review-finding rounds — that produced this spec.
 
-Phase 5 is purely additive over Phase 4. No existing request
-path, adoption path, freshness path, GC path, or wire contract
-changes. A third HTTP listener (default `127.0.0.1:6789`) bound
-alongside the proxy and TLS listeners exposes three read-only
-endpoints. Counter / histogram / gauge increments are added
-*alongside* (not in place of) existing log emits; the metric
-inventory is enumerated in §10.4 and is the contract surface for
-operator monitoring.
+Phase 5 is **semantically** additive over Phase 4: no existing
+request path, adoption path, freshness path, GC path, or wire
+contract changes. A third HTTP listener (default
+`127.0.0.1:6789`) bound alongside the proxy and TLS listeners
+exposes three read-only endpoints. Counter / histogram / gauge
+increments are added *alongside* (not in place of) existing log
+emits; the metric inventory is enumerated in §10.4 and is the
+contract surface for operator monitoring.
+
+**Startup compatibility note.** Phase 5 is *not* purely
+operationally additive: the `[admin]` block defaults to
+`enabled = true` with `listen = "127.0.0.1:6789"` (§5.1). On a
+host where port 6789 is already bound (extremely unlikely —
+the port is assigned to no IANA-registered service and is far
+from the well-known range, but conceivable on a host running
+some unrelated service on it), the daemon's startup will fail
+with a bind error from step 3 of §9.7.1. Operators in that
+narrow case can either move their other service or set
+`admin.enabled = false` (or `admin.listen = "127.0.0.1:0"` /
+some other port). The default-on choice is the operator-
+friendly trade-off; see PHASE-5-SCOPING.md §1.2 "Default-on"
+for the rationale. Operators upgrading from Phase 4 should
+verify the chosen port is free as part of the rollout.
 
 ---
 
@@ -136,12 +151,13 @@ Wire contracts on the admin listener:
 
 | Method | Path        | Response                                        |
 |--------|-------------|-------------------------------------------------|
-| GET    | `/metrics`  | 200; `text/plain; version=0.0.4; charset=utf-8` |
-| GET    | `/`         | 200; `text/html; charset=utf-8` or `application/json; charset=utf-8` (content negotiation per §9.7.3) |
-| GET    | `/healthz`  | 200 `ok\n` or 503 `degraded\n` with `X-Acu-Check-Failed:` header |
+| GET    | `/metrics` (exact) | 200; `text/plain; version=0.0.4; charset=utf-8` |
+| GET    | `/` (exact, NOT subtree — §9.7.1 uses Go 1.22+ `{$}` pattern) | 200; `text/html; charset=utf-8` or `application/json; charset=utf-8` (content negotiation per §9.7.3) |
+| GET    | `/healthz` (exact) | 200 `ok\n` or 503 `degraded\n` with `X-Acu-Check-Failed:` header |
 | HEAD   | (any of above) | Same status code, empty body, all headers as for GET |
 | OPTIONS | (any path) | 204; `Allow: GET, HEAD, OPTIONS` |
-| Any other | (any path) | 405 if path matches one of the three known paths; 404 otherwise. 405 carries `Allow: GET, HEAD, OPTIONS` |
+| GET    | any other path (e.g. `/unknown`, `/metrics2`) | 404 |
+| Any non-GET method | `/metrics`, `/`, `/healthz` | 405 with `Allow: GET, HEAD, OPTIONS` |
 
 No POST, no PUT, no DELETE — the admin listener is read-only.
 
@@ -241,10 +257,15 @@ htpasswd_file      = ""
 # expensive gauges (acu_blobs_db_count, acu_blobs_db_total_bytes,
 # acu_pool_disk_bytes, acu_per_host_inflight, etc.). Scrapes
 # read in-memory cells; the cells are refreshed on this cadence.
-# Default 30s — comfortably faster than Prometheus's default
-# 15s scrape so a scrape never reads a cell more than 15s
-# stale, slow enough that du-style pool/ scans don't dominate
-# CPU on multi-GiB caches. Must be > 0 and ≤ 1h.
+# A scrape can read a cell up to gauge_refresh seconds stale
+# (between two refreshes); operators tolerant of fresher data
+# can lower this. Default 30s — slow enough that du-style pool/
+# scans don't dominate CPU on multi-GiB caches, fast enough
+# that gauge values are never older than 30s on a healthy
+# refresher loop. The refresher runs an immediate first refresh
+# at startup (before serving the first scrape) so the first
+# /metrics response contains populated gauges, not zeros (§9.7.6).
+# Must be > 0 and ≤ 1h.
 gauge_refresh      = "30s"
 
 # HTTP server timeouts for the admin listener. ReadHeaderTimeout
@@ -407,10 +428,14 @@ type HostStat struct {
 ```
 
 Implementation: the existing `sem.mu` Lock is held while walking
-`sem.slots`; for each `*hostSlot`, `Inflight = limit -
-len(slot.ch)` and `Capacity = limit` (the buffered channel's
-length is the count of *available* tokens; in-flight is the
-complement). The new method does not change any existing
+`sem.slots`; for each `*hostSlot`, `Inflight = len(slot.ch)` and
+`Capacity = cap(slot.ch)`. **The buffered channel's length is
+the count of currently-held tokens** — `Acquire` *sends* into
+the channel when a token is acquired (sem.go:77) and *receives*
+on Release (sem.go:96), so the channel fills as concurrency
+rises. `cap(slot.ch)` is the per-host limit configured via
+`upstream.max_concurrent_per_host`; `s.limit` is identical and
+equally usable. The new method does not change any existing
 semaphore behavior — it is purely a read view onto the existing
 fields under the existing lock.
 
@@ -528,9 +553,31 @@ The admin listener uses a smaller `ReadHeaderTimeout` (default
 admin requests are short-lived and frequent, not long-streaming.
 
 The admin handler is a `http.ServeMux` with three explicit
-routes: `GET /metrics`, `GET /`, `GET /healthz`. Any other path
-returns 404. Any non-GET method returns 405 with `Allow: GET,
-HEAD, OPTIONS`. `OPTIONS` returns 204.
+routes registered using Go 1.22+ enhanced patterns:
+
+- `GET /metrics` — exact-path match.
+- `GET /healthz` — exact-path match.
+- `GET /{$}` — exact-path match for the status page (the `{$}`
+  terminator restricts the pattern to literal `/`, otherwise
+  `/` is a subtree pattern that catches every unmatched path).
+- `GET /` (subtree fallback registered last) — handler
+  responds 404 unconditionally. This is the catch-all for
+  `/anything-not-above`. (Without this fallback, a request like
+  `GET /metrics2` would hit the standard `http.ServeMux` 404,
+  which is identical in body but unreachable here because the
+  pattern set already covers /metrics, /healthz, and `/{$}`.)
+
+Any non-GET method on `/metrics`, `/healthz`, or `/` returns 405
+with `Allow: GET, HEAD, OPTIONS`. `OPTIONS` returns 204. The
+405-vs-404 distinction is enforced inside each route's handler
+(after the mux dispatches) by checking the request method,
+because Go 1.22+ patterns reject the wrong method with 405
+automatically only when *another* method pattern is registered
+for the same path; for these read-only routes, only GET is
+declared, so the handler must handle method mismatch itself.
+
+Go version: the project targets Go 1.25 (`go.mod`); enhanced
+ServeMux patterns landed in Go 1.22.
 
 #### 9.7.2 Endpoint: `GET /metrics`
 
@@ -575,6 +622,19 @@ expressions and are escaped by spec. The JSON path uses
 
 The page is bounded — top-N lists capped at 20 rows each. Total
 page size targets <200 KiB even for a fully-stocked cache.
+
+**Per-query timeout.** Each DB query the status-page handler
+issues (`cache.ListSuitesWithAdoption(ctx)`, the `hot_url_paths`
+top-20 query) runs under `context.WithTimeout(r.Context(), 5s)`
+— a tighter bound than the refresher's 10s because the status
+page is interactive and a user looking at the browser tab
+expects a response within seconds. On any query timeout or
+error, the handler responds 503 with body `service unavailable`
+and emits `admin_status_render_failed` Warn with `err`,
+`format` (html/json), and `query` (which DB call timed out).
+`hostsem.Snapshot()` and `gc.GC.LastRunSummary()` do not need
+deadlines — they are pure in-memory reads bounded by mutex hold
+time. The §9.7.7 ring snapshot is also lock-bounded.
 
 The HTML page renders an empty-ring explanatory note —
 "(empty since last process start)" — when the §9.7.7 ring
@@ -622,9 +682,10 @@ must present a valid `Authorization: Basic <base64-user:pass>`
 header. The middleware:
 
 ```go
-1. Stat the htpasswd file. If mtime has advanced since the
-   cached parse, re-read and re-parse. On parse failure, KEEP
-   the prior credential map; emit htpasswd_reload_failed Warn.
+1. Stat the htpasswd file. Compare the (mtime, size) tuple
+   against the cached parse's tuple — if EITHER differs, re-read
+   and re-parse. On parse failure, KEEP the prior credential
+   map; emit htpasswd_reload_failed Warn.
 2. r.BasicAuth() to extract user, pass.
 3. If !ok → 401 with `WWW-Authenticate: Basic realm="apt-cacher-ultra admin"`.
 4. lookup user in map; if absent, perform a sentinel
@@ -633,6 +694,20 @@ header. The middleware:
 5. bcrypt.CompareHashAndPassword(map[user], pass). On mismatch
    → 401. On match → next handler.
 ```
+
+The `(mtime, size)` reload key catches the same-second-rewrite
+case that an mtime-only check would miss: a same-second rewrite
+that changes credentials almost always changes file size
+(adding/removing a user, or replacing a hash, alters the byte
+count). It also catches mtime moving *backward* (clock change,
+ansible apply on a different host, file restored from backup) —
+any change in the tuple triggers reload, regardless of
+direction. The known limitation: an editor that saves the file
+with the *exact same* size *and* mtime *and* different content
+(e.g. swapping two hashes of identical length within the same
+second) is not detected; operators in that pathological case
+can `touch` the file or restart the daemon. Two cheap syscalls
+remain on the request path (one Stat, one BasicAuth).
 
 The htpasswd file format is Apache's:
 
@@ -656,11 +731,13 @@ htpasswd -B    /etc/apt-cacher-ultra/htpasswd ops
 appends).
 
 Reload semantics: at startup, the file is parsed once into a
-`map[string]string` (user → bcrypt hash). At every admin
-request, `os.Stat` checks mtime; if advanced, the file is
-re-parsed. A reload that fails parsing keeps the prior map
-in place and emits `htpasswd_reload_failed` Warn — a
-mid-edit broken htpasswd does not lock operators out. The
+`map[string]string` (user → bcrypt hash) plus a cached
+`(mtime, size)` tuple. At every admin request, `os.Stat`
+returns the current `(mtime, size)`; if EITHER differs from
+the cached tuple, the file is re-parsed and the map atomically
+swapped. A reload that fails parsing keeps the prior map in
+place and emits `htpasswd_reload_failed` Warn — a mid-edit
+broken htpasswd does not lock operators out. The
 stat-on-each-request cost is one syscall per admin request,
 negligible against the bcrypt comparison and TLS-handshake
 costs of typical scrape clients.
@@ -674,9 +751,20 @@ cost), which lets an attacker enumerate valid usernames.
 
 #### 9.7.6 Refresher goroutine
 
-Started after the admin listener binds (step 7 of §9.7.1). Runs
-a loop with `admin.gauge_refresh` sleep + recompute of expensive
-gauges:
+Started after the admin listener binds (step 7 of §9.7.1). The
+goroutine performs an **immediate first recompute** before
+sleeping, so the first `/metrics` scrape (which can race the
+listener-Accept transition by milliseconds) sees populated
+gauges rather than zeros. The loop is:
+
+```
+1. recompute all gauges (each query under a per-query timeout
+   — see "Per-query timeout" below)
+2. sleep admin.gauge_refresh
+3. goto 1
+```
+
+Recomputed gauges:
 
 - `acu_blobs_db_count` — `SELECT COUNT(*) FROM blob`.
 - `acu_blobs_db_total_bytes` — `SELECT SUM(size) FROM blob`.
@@ -702,9 +790,24 @@ gauges:
   in-flight requests stops reporting stale values.
 
 The refresher goroutine is rooted at `lifecycleCtx`; on
-shutdown it exits cleanly. A query that errors mid-refresh logs
-`refresher_query_failed` Warn with the metric name and error;
-the gauge keeps its prior value (empty if never populated).
+shutdown it exits cleanly.
+
+**Per-query timeout.** Each gauge recompute runs under
+`context.WithTimeout(lifecycleCtx, 10s)`. The 10s ceiling is
+generous enough for a `du`-style `pool/` walk on a
+multi-GiB cache and a `SELECT SUM(size) FROM blob` on a
+tens-of-thousands-of-rows table, while keeping the refresher
+loop responsive — a hung query cannot block subsequent gauges
+from refreshing. On timeout (or any other error), the gauge
+keeps its prior value (or remains empty if never populated)
+and `refresher_query_failed` Warn fires with `metric_name`,
+`err`, and `duration_ms`. The next loop iteration retries.
+
+**No mid-refresh contention.** A "refresh in progress" boolean
+guards the `du pool/` walk specifically — if the prior walk has
+not finished by the time the next interval fires, the next
+interval **skips** the walk (other queries proceed normally).
+This prevents two concurrent walks of a slow filesystem.
 
 #### 9.7.7 In-memory adoption ring
 
@@ -899,8 +1002,19 @@ continue to update normally.
 
 **Naming conventions.** `*_total` for counters,
 `*_seconds`/`*_bytes` for typed gauges/histograms, `_count`
-suffix for histogram observation counts, `acu_` prefix for
-every metric this process exposes.
+suffix for histogram observation counts. Every **application**
+metric this process exposes carries the `acu_` prefix. **Two
+explicit exceptions** preserve interoperability with standard
+Prometheus dashboards and alerting rules:
+
+- `process_*` (CPU, RSS, FDs, start time) — emitted unprefixed
+  to match the names the official Prometheus client libraries
+  use, so dashboards keyed on `process_resident_memory_bytes`
+  Just Work.
+- `go_*` (goroutine count, GC stats, memstats) — same rationale.
+
+These two prefixes are exclusively reserved for the §10.4.7
+process collector; new application metrics must use `acu_`.
 
 **Render hold-time.** The renderer holds each metric's lock
 *only* long enough to build its output into a `strings.Builder`;
@@ -940,33 +1054,69 @@ cleanly).
 
 `acu_fetch_total{outcome, host}` — counter. The classifier below
 is a **total function** mapping every fetch terminal return to
-exactly one outcome label. Implemented as
-`fetch.ClassifyOutcome(err error) string` so the handler and the
-freshness checker share one source of truth.
+exactly one outcome label. The success-vs-error split needs the
+operation context (a `nil` error from `Fetch()` means HTTP 200
+streamed; a `nil` error from `Conditional()` carries either 200
+or 304 in `*ConditionalResult.Status`), so the classifier is
+exposed as **two helpers** rather than one:
 
-| Source | Outcome label |
-|---|---|
-| `Fetch` returned `nil` | `success` |
-| `Conditional` returned `nil`, Status 200 | `cond_changed` |
-| `Conditional` returned `nil`, Status 304 | `cond_unchanged` |
-| `*StatusError` code 4xx (matches `ErrUpstreamStatus`) | `4xx` |
-| `*StatusError` code 5xx (matches `ErrUpstreamServerError`) | `5xx` |
-| `ErrUpstreamUnavailable` (retries exhausted on transient) | `unavailable` |
-| `ErrRedirectBlocked` (3xx CheckRedirect rejection) | `redirect_blocked` |
-| `ErrHostNotAllowed` | `host_not_allowed` |
-| `ErrTargetDenied` (post-DNS deny CIDR) | `target_denied` |
-| `ErrHostUnreachable` (cooldown-probe fast-fail) | `host_unreachable` |
-| `ErrInvalidURL` | `invalid_url` |
-| `ErrSizeMismatch` | `size_mismatch` |
-| `ErrInvalidContentRange` | `invalid_content_range` |
-| `ErrTotalSizeMismatch` | `total_size_mismatch` |
-| `ErrCacheWriteFailed` | `cache_write_failed` |
-| `ErrConditionalBodyTooLarge` (Conditional only) | `body_too_large` |
-| `context.DeadlineExceeded` | `timeout` |
-| `context.Canceled` | `canceled` |
-| net dial error (DNS resolve failure) | `dns_failed` |
-| net dial error (other; connect refused, no route) | `connect_failed` |
-| any other | `error` (catch-all) |
+```go
+// ClassifyFetchOutcome maps a fetch.Fetch() return to an outcome
+// label. err is the second return value; nil → "success".
+func ClassifyFetchOutcome(err error) string
+
+// ClassifyConditionalOutcome maps a fetch.Conditional() return
+// to an outcome label. res is the first return value (may be
+// nil when err != nil); err is the second. A nil err with
+// res.Status == 200 → "cond_changed"; nil err with status 304
+// → "cond_unchanged".
+func ClassifyConditionalOutcome(res *ConditionalResult, err error) string
+```
+
+Both helpers walk the error chain in the **precedence order
+listed below** (first match wins). Precedence matters because
+the dialer wraps cooldown-probe failures with **both**
+`ErrUpstreamUnavailable` *and* `ErrHostUnreachable`
+(`internal/fetch/dialer.go:163`), so checking
+`ErrUpstreamUnavailable` first would mask `host_unreachable`.
+Specific causes always come before generic causes:
+
+| Order | Match | Outcome label |
+|---|---|---|
+| 1 | `nil` err and `Fetch` op | `success` |
+| 2 | `nil` err and `Conditional` op, `res.Status == 200` | `cond_changed` |
+| 3 | `nil` err and `Conditional` op, `res.Status == 304` | `cond_unchanged` |
+| 4 | `errors.Is(err, ErrHostNotAllowed)` | `host_not_allowed` |
+| 5 | `errors.Is(err, ErrTargetDenied)` | `target_denied` |
+| 6 | `errors.Is(err, ErrInvalidURL)` | `invalid_url` |
+| 7 | `errors.Is(err, ErrRedirectBlocked)` | `redirect_blocked` |
+| 8 | `errors.Is(err, ErrConditionalBodyTooLarge)` (Conditional only) | `body_too_large` |
+| 9 | `errors.Is(err, ErrCacheWriteFailed)` | `cache_write_failed` |
+| 10 | `errors.Is(err, ErrSizeMismatch)` | `size_mismatch` |
+| 11 | `errors.Is(err, ErrInvalidContentRange)` | `invalid_content_range` |
+| 12 | `errors.Is(err, ErrTotalSizeMismatch)` | `total_size_mismatch` |
+| 13 | `errors.Is(err, ErrHostUnreachable)` (cooldown-probe fast-fail) | `host_unreachable` |
+| 14 | `errors.Is(err, context.DeadlineExceeded)` | `timeout` |
+| 15 | `errors.Is(err, context.Canceled)` | `canceled` |
+| 16 | `errors.As(err, *StatusError)` and code in `[400, 500)` | `4xx` |
+| 17 | `errors.As(err, *StatusError)` and code in `[500, 600)` | `5xx` |
+| 18 | `errors.Is(err, ErrUpstreamServerError)` (5xx without StatusError) | `5xx` |
+| 19 | `errors.Is(err, ErrUpstreamStatus)` (4xx without StatusError) | `4xx` |
+| 20 | `errors.Is(err, ErrUpstreamUnavailable)` (retries exhausted; checked AFTER `host_unreachable`) | `unavailable` |
+| 21 | `*net.OpError` with `*net.DNSError` in chain | `dns_failed` |
+| 22 | other dial-layer `*net.OpError` (connect refused, no route, EHOSTUNREACH at the syscall layer) | `connect_failed` |
+| 23 | any other non-nil err | `error` (catch-all) |
+
+Operations 13 and 20 both fire on the dialer-cooldown-probe path
+because the error wraps both sentinels (`%w: %w` at
+`dialer.go:163`); the order above ensures the specific
+`host_unreachable` label wins. Operations 16/17 (StatusError)
+come before 18/19 (bare sentinel) so a wrapped
+`ErrUpstreamServerError` carrying a real HTTP code surfaces the
+code-class label, not the bare-sentinel one — Phase 1 always
+wraps with StatusError, but external callers might not. Net dial
+errors are matched after all explicit sentinels because
+`*net.OpError` can ride alongside any of them.
 
 `acu_fetch_duration_seconds{outcome, host}` — histogram. Same
 outcome label set as `acu_fetch_total`.
@@ -1110,12 +1260,26 @@ type BuildInfo struct {
 
 `acu_process_start_unixtime` — gauge=startup time, set once.
 
-Standard Go process metrics (`process_cpu_seconds_total`,
-`process_resident_memory_bytes`, `process_open_fds`,
-`process_max_fds`, `process_virtual_memory_bytes`,
-`process_start_time_seconds`) — emitted via the metrics
-package's process collector. Implementation reads `/proc/self/*`
-on Linux; Phase 5 platforms are Linux-only.
+Standard Prometheus process metrics (unprefixed by `acu_` per
+the §10.4 naming-convention exception) — emitted via the
+metrics package's process collector. Phase 5 emits:
+
+- `process_cpu_seconds_total` (counter)
+- `process_resident_memory_bytes` (gauge)
+- `process_virtual_memory_bytes` (gauge)
+- `process_open_fds` (gauge)
+- `process_max_fds` (gauge)
+- `process_start_time_seconds` (gauge; equals
+  `acu_process_start_unixtime` — both are emitted because the
+  former is the conventional name and the latter is the
+  application-namespaced name)
+
+Implementation reads `/proc/self/*` on Linux; Phase 5 platforms
+are Linux-only. The `go_*` runtime-metrics namespace
+(`go_goroutines`, `go_memstats_*`, `go_gc_duration_seconds`) is
+**reserved by convention** but not emitted in Phase 5; if a
+future phase adds a Go runtime collector, these names are
+available unprefixed.
 
 #### 10.4.8 Admin listener self-metrics
 
@@ -1181,8 +1345,11 @@ the schema below verbatim.
     "last_run_deadline_reached": false,
     "displaced_per_suite_kept": 3
   },
-  "hot_packages": [
-    {"package": "linux-image-...", "request_count": 412,
+  "hot_url_paths": [
+    {"host": "archive.ubuntu.com",
+     "path": "/ubuntu/pool/main/l/linux/linux-image-foo.deb",
+     "is_metadata": false,
+     "request_count": 412,
      "last_requested_unixtime": 1746671280}
   ],
   "recent_adoptions": [
@@ -1221,9 +1388,21 @@ Field semantics:
   null) after a process restart.
 - `active_hosts` is sourced from `hostsem.Snapshot()` (§9.3).
   Empty when no host has held a slot since process start.
-- `hot_packages` lists the top 20 url_path rows ordered by
-  `request_count` descending, then `last_requested_at`
-  descending.
+- `hot_url_paths` lists the top 20 `url_path` rows ordered by
+  `request_count` DESC, then `last_requested_at` DESC. Fields
+  map directly to columns: `host`=`canonical_host`,
+  `path`=`path`, `is_metadata`=`is_metadata`,
+  `request_count`=`request_count`,
+  `last_requested_unixtime`=`last_requested_at`. The query is
+  `SELECT canonical_host, path, is_metadata, request_count,
+  last_requested_at FROM url_path WHERE last_requested_at IS NOT
+  NULL ORDER BY request_count DESC, last_requested_at DESC LIMIT
+  20`. **Package-name + architecture are not joined in:** that
+  data lives in `package_hash` keyed by `(canonical_scheme,
+  canonical_host, path, snapshot_id)`, and surfacing it would
+  require a join with current snapshots only — deferred to a
+  Phase 6 enhancement to keep the §9.7.3 query cost bounded.
+  Operators read package identity from the path.
 
 The HTML form caps each table at 20 rows. Total page size targets
 <200 KiB.
@@ -1249,7 +1428,8 @@ adds:
 | htpasswd file rewritten with new credentials | mtime-driven reload picks up the change on the next admin request. No restart required. |
 | Status page renders against a partially-populated cache (zero suites, zero blobs) | Empty tables render with explanatory headers; no error. The "(empty since last process start)" cue shows in the recent_adoptions section when uptime <5min. |
 | Status page renders during graceful shutdown | The §9.5 ordering shuts the admin listener first, so a status-page request mid-shutdown receives a partial response with `Connection: close` rather than mid-write race against a closing DB. |
-| Refresher goroutine query timeout (long-running `du pool/`, slow DB SUM) | `refresher_query_failed` Warn; the gauge keeps its prior value. The refresher's "refresh in progress" guard prevents two concurrent walks of pool/. |
+| Refresher goroutine query timeout (long-running `du pool/`, slow DB SUM) | Each query runs under a 10s `context.WithTimeout`. On timeout: `refresher_query_failed` Warn with `metric_name`/`err`/`duration_ms`; the gauge keeps its prior value. The refresher's "refresh in progress" guard prevents two concurrent walks of `pool/`. The next loop iteration retries. |
+| Status-page DB query timeout (slow `ListSuitesWithAdoption`, slow `hot_url_paths` query) | Each query runs under a 5s `context.WithTimeout` derived from the request context. On timeout: handler responds 503 `service unavailable`; `admin_status_render_failed` Warn with `err`/`format`/`query`. Status-page `/` does not hang on a slow DB. |
 | Per-metric series cap reached (malicious client, broad regex) | One-shot `metrics_series_cap_reached` Warn; subsequent Inc on a new label tuple is dropped silently. Existing series continue to update normally. Operator narrows `upstream.allowed_host_regex` or raises `admin.metric_series_cap`. |
 | Process-collector read of `/proc/self/*` fails (non-Linux platform, container without `/proc`) | Process metrics are zeroed; no error surfaces to the scraper. Phase 5 platforms are Linux-only; this is a defense against future portability work, not a correctness path. |
 | Adoption ring snapshot called with a concurrent Record | The ring's mu protects both; the Snapshot copy is independent of subsequent Record calls. |
@@ -1346,15 +1526,33 @@ SPEC2 §12 / SPEC3 §12 / SPEC4 §12) carries forward exactly. Phase
 - Concurrent reader of `LastRunSummary()` while a tick is
   updating it — no torn read under `-race`.
 
-#### 12.1.6 internal/fetch (ClassifyOutcome)
+#### 12.1.6 internal/fetch (ClassifyFetchOutcome / ClassifyConditionalOutcome)
 
-For each entry in the §10.4.2 classifier table, construct a
-returned-error or `nil` value and verify
-`ClassifyOutcome(err)` returns the expected outcome label. Each
-sentinel + status-code class is one test case (~20 cases). The
-test asserts the classifier is **total**: the catch-all `error`
-arm fires on a bare `errors.New("synthetic")` and on a `nil`
-result that doesn't match any specific success path.
+For each entry in the §10.4.2 classifier precedence table,
+construct an `(err)` or `(res, err)` pair and verify the
+appropriate helper returns the expected outcome label. ~23 test
+cases total (one per precedence row).
+
+The test additionally asserts:
+
+- **The classifier is total.** The catch-all `error` arm fires
+  on a bare `errors.New("synthetic")` (not matching any specific
+  sentinel) for both helpers.
+- **Precedence is correct for the dialer-cooldown wrap.**
+  Construct `fmt.Errorf("%w: %w: ...", ErrUpstreamUnavailable,
+  ErrHostUnreachable, errors.New("dial timeout"))` (matching the
+  `internal/fetch/dialer.go:163` shape) and verify
+  `ClassifyFetchOutcome` returns `host_unreachable`, NOT
+  `unavailable`. This is the load-bearing precedence test —
+  inverting the order silently degrades operator visibility.
+- **StatusError takes precedence over bare sentinel.** A
+  `*StatusError{Code: 503}` returns `5xx`, even though it
+  also matches `ErrUpstreamServerError` via `Is`.
+- **Conditional success-status routing.** A nil err with
+  `&ConditionalResult{Status: 200}` → `cond_changed`; nil err
+  with `Status: 304` → `cond_unchanged`; nil err with
+  `Status: 0` (zero value, programming error) → falls through
+  to the catch-all `error`.
 
 ### 12.2 Integration tests (additions)
 
@@ -1443,7 +1641,7 @@ result that doesn't match any specific success path.
 #### 12.2.4 Status page rendering tests
 
 - Empty cache: HTML renders without error; JSON returns the
-  §10.5 schema with empty arrays for `suites`, `hot_packages`,
+  §10.5 schema with empty arrays for `suites`, `hot_url_paths`,
   `recent_adoptions`, `active_hosts`. `gc.last_run_unixtime` is
   null.
 - Populated cache: tables show suite rows with adopted_at,
@@ -1513,9 +1711,10 @@ internal/
     handler.go             # counter wiring at logRequest
                            # call sites (§10.4.1)
   fetch/
-    fetch.go               # ClassifyOutcome(err) helper +
-                           # explicit instrumentation around
-                           # Fetch() and Conditional()
+    fetch.go               # ClassifyFetchOutcome(err) and
+                           # ClassifyConditionalOutcome(res, err)
+                           # helpers + explicit instrumentation
+                           # around Fetch() and Conditional()
                            # terminal returns (§10.4.2)
     classify_test.go       # unit tests for §12.1.6
   freshness/
@@ -1575,9 +1774,12 @@ Phase 5 is done when:
    / §9.6, with unit tests under `-race` covering §12.1.4 /
    §12.1.5.
 
-6. `internal/fetch.ClassifyOutcome(err)` total classifier added
-   per §10.4.2, with unit tests covering every sentinel
-   (§12.1.6).
+6. `internal/fetch.ClassifyFetchOutcome(err)` and
+   `ClassifyConditionalOutcome(res, err)` total classifiers
+   added per §10.4.2, with unit tests covering every sentinel
+   in precedence order (§12.1.6) — including the
+   `host_unreachable`-vs-`unavailable` precedence test for the
+   dialer-cooldown wrap.
 
 7. Admin listener bound, all three endpoints reachable on the
    default loopback config (§9.7).
