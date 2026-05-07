@@ -1031,23 +1031,24 @@ THEN
   startup emitted refuse_unvouched_debs_inert Warn at process boot
 ```
 
-### 12.5 v2 → v3 migration end-to-end
+### 12.5 v2 → v3 migration end-to-end *(deliberately skipped)*
 
-Spin up the Phase 2 binary against a fresh `cache_dir`, prime it with
-a representative request set including at least one suite that has
-adopted a snapshot. Stop the binary. Start the Phase 3 binary against
-the same directory. Verify:
+This test is **not implemented and will not be implemented**. The
+Phase 2 → Phase 3 migration code path (`migrations[2]` in
+`internal/cache/schema.go`) still exists and is exercised by unit
+tests, but the end-to-end "old binary, new binary, same `cache_dir`"
+harness was scoped out: the operator population for this build is a
+single deployment running pre-release builds, and the operator has
+elected to drop and re-create the cache directory across the v2 → v3
+boundary rather than rely on in-place migration. The conservative
+defaults the migration installs (`package_coverage_complete = 0`,
+empty `package_name` / `architecture` on pre-v3 `package_hash` rows)
+remain correct on paper; we just do not gate the release on the
+integration test.
 
-- The DB migrates cleanly (`schema_version` becomes 3).
-- Pre-v3 `package_hash` rows survive untouched with empty
-  `package_name` / `architecture`.
-- Pre-v3 `suite_snapshot` rows have
-  `package_coverage_complete = 0` (the conservative default).
-- The next `InRelease` change at upstream triggers a successful
-  adoption with the parser populating `package_name`, `architecture`,
-  and the new `package_coverage_complete` value.
-- Hot prefetch first activates on the *second* post-upgrade adoption
-  (the first cycle has no v3-populated prior snapshot to mine).
+If a future deployment ever needs in-place upgrade from a v2 cache
+directory, this section is the spec for the test that should be
+written first.
 
 ### 12.6 Soak (manual / nightly)
 
@@ -1094,8 +1095,10 @@ internal/
   `readPackagesBlob` for the new `Packages.xz` variant).
 
 CI jobs from earlier phases carry forward. The `go test -race ./...`
-job now includes the §12.3 and §12.4 chaos tests; the `e2e/` job runs
-the §12.5 migration test as a new check.
+job now includes the §12.3 and §12.4 chaos tests. The `e2e/` job
+gains the deb-install harness's second-cycle adoption + hot-prefetch
+check (§14 DoD #5); the v2 → v3 migration end-to-end test described
+in §12.5 is deliberately not part of CI (see §12.5 for rationale).
 
 ---
 
@@ -1113,10 +1116,13 @@ Phase 3 is done when:
    passes 10 consecutive runs across all four cases (strict on with
    covered host, strict on with uncovered host, strict off, strict
    on with adoption disabled).
-4. The `v2 → v3` migration end-to-end test (§12.5) passes; an
-   existing Phase 2 deployment can be upgraded by replacing the
-   binary and restarting, with no data loss and continued service of
-   pre-Phase-3 snapshots and url_path rows.
+4. *(Deliberately dropped.)* The `v2 → v3` migration end-to-end test
+   (§12.5) is **not** required for Phase 3 done. The migration code
+   path itself remains in `internal/cache/schema.go` and its
+   per-step semantics are covered by unit tests; the integration
+   harness is scoped out because the only known v2 deployment is
+   the pre-release one whose operator will drop and re-create the
+   cache directory at the v2 → v3 boundary. See §12.5.
 5. The `.deb` package builds, installs, and starts on Ubuntu 24.04 +
    26.04 with `adoption.enabled = true`, `hot_packages.window = 24h`,
    and `integrity.refuse_unvouched_debs = false` (the safe defaults),
