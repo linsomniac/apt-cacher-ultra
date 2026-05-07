@@ -11,9 +11,15 @@
 // Concurrency: each metric carries its own sync.Mutex. The hot path
 // (Inc / Observe / Set on a metric whose label values were used before)
 // is one lock acquire + one map lookup. The first call with a new
-// label-value tuple allocates a series under the same lock. Render
-// holds RLocks on every metric in turn; it does not block hot-path
-// writes for long.
+// label-value tuple allocates a series under the same lock.
+//
+// Render builds the per-metric output under each metric's lock into a
+// strings.Builder, then writes the buffer to the caller's io.Writer
+// *outside* the lock. This bounds hot-path Inc/Observe/Set blocking by
+// the per-metric series count (memory operations) regardless of the
+// writer's speed — important because /metrics is served to a remote
+// scraper over HTTP, and a slow consumer must not stall request-path
+// counters. SPEC5 §3.2 invariant.
 package metrics
 
 import (
@@ -142,19 +148,21 @@ func (c *Counter) Add(delta float64, labelValues ...string) {
 }
 
 func (c *Counter) render(w io.Writer) {
+	var buf strings.Builder
 	c.mu.Lock()
 	keys := make([]string, 0, len(c.series))
 	for k := range c.series {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	fmt.Fprintf(w, "# HELP %s %s\n", c.name, escapeHelp(c.help))
-	fmt.Fprintf(w, "# TYPE %s counter\n", c.name)
+	fmt.Fprintf(&buf, "# HELP %s %s\n", c.name, escapeHelp(c.help))
+	fmt.Fprintf(&buf, "# TYPE %s counter\n", c.name)
 	for _, k := range keys {
 		s := c.series[k]
-		fmt.Fprintf(w, "%s%s %s\n", c.name, formatLabels(c.labels, s.values), formatFloat(s.val))
+		fmt.Fprintf(&buf, "%s%s %s\n", c.name, formatLabels(c.labels, s.values), formatFloat(s.val))
 	}
 	c.mu.Unlock()
+	_, _ = io.WriteString(w, buf.String())
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -247,29 +255,31 @@ func (h *Histogram) Observe(v float64, labelValues ...string) {
 }
 
 func (h *Histogram) render(w io.Writer) {
+	var buf strings.Builder
 	h.mu.Lock()
 	keys := make([]string, 0, len(h.series))
 	for k := range h.series {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	fmt.Fprintf(w, "# HELP %s %s\n", h.name, escapeHelp(h.help))
-	fmt.Fprintf(w, "# TYPE %s histogram\n", h.name)
+	fmt.Fprintf(&buf, "# HELP %s %s\n", h.name, escapeHelp(h.help))
+	fmt.Fprintf(&buf, "# TYPE %s histogram\n", h.name)
 	for _, k := range keys {
 		s := h.series[k]
 		// Buckets
 		for i, ub := range h.buckets {
 			labels := mergeLabels(h.labels, s.values, "le", formatFloat(ub))
-			fmt.Fprintf(w, "%s_bucket%s %d\n", h.name, labels, s.counts[i])
+			fmt.Fprintf(&buf, "%s_bucket%s %d\n", h.name, labels, s.counts[i])
 		}
 		// +Inf bucket
 		labels := mergeLabels(h.labels, s.values, "le", "+Inf")
-		fmt.Fprintf(w, "%s_bucket%s %d\n", h.name, labels, s.counts[len(h.buckets)])
+		fmt.Fprintf(&buf, "%s_bucket%s %d\n", h.name, labels, s.counts[len(h.buckets)])
 		// Sum + count
-		fmt.Fprintf(w, "%s_sum%s %s\n", h.name, formatLabels(h.labels, s.values), formatFloat(s.sum))
-		fmt.Fprintf(w, "%s_count%s %d\n", h.name, formatLabels(h.labels, s.values), s.obsCount)
+		fmt.Fprintf(&buf, "%s_sum%s %s\n", h.name, formatLabels(h.labels, s.values), formatFloat(s.sum))
+		fmt.Fprintf(&buf, "%s_count%s %d\n", h.name, formatLabels(h.labels, s.values), s.obsCount)
 	}
 	h.mu.Unlock()
+	_, _ = io.WriteString(w, buf.String())
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -372,19 +382,21 @@ func (g *Gauge) Reset() {
 }
 
 func (g *Gauge) render(w io.Writer) {
+	var buf strings.Builder
 	g.mu.Lock()
 	keys := make([]string, 0, len(g.series))
 	for k := range g.series {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	fmt.Fprintf(w, "# HELP %s %s\n", g.name, escapeHelp(g.help))
-	fmt.Fprintf(w, "# TYPE %s gauge\n", g.name)
+	fmt.Fprintf(&buf, "# HELP %s %s\n", g.name, escapeHelp(g.help))
+	fmt.Fprintf(&buf, "# TYPE %s gauge\n", g.name)
 	for _, k := range keys {
 		s := g.series[k]
-		fmt.Fprintf(w, "%s%s %s\n", g.name, formatLabels(g.labels, s.values), formatFloat(s.val))
+		fmt.Fprintf(&buf, "%s%s %s\n", g.name, formatLabels(g.labels, s.values), formatFloat(s.val))
 	}
 	g.mu.Unlock()
+	_, _ = io.WriteString(w, buf.String())
 }
 
 // ──────────────────────────────────────────────────────────────────

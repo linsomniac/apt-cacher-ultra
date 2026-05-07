@@ -1,6 +1,6 @@
 # apt-cacher-ultra — Phase 5 Scoping
 
-Status: **scoping locked** (revision 1).
+Status: **scoping locked** (revision 3).
 Last updated 2026-05-07. Next artifact: `SPEC5.md` modeled on
 `SPEC4.md`'s structure.
 
@@ -152,13 +152,26 @@ during scoping. Each resolution is normative for SPEC5.
 
 - **Cardinality posture.** Prometheus metrics carry `{host}`
   labels for per-host metrics where the host is known at the emit
-  site. The host set is bounded by `upstream.allowed_host_regex`
-  (SPEC §6.6) — typical deployments allow ≤20 hosts; pathological
-  ≤50. Prometheus handles this scale comfortably. `{suite_path}`
-  labels are **not** added (suite_path is unbounded across
-  deployments and changes over time as suites come and go;
-  per-suite detail lives on the status page). The metric inventory
-  in §3.4 marks each metric as `{host}`-labeled or unlabeled.
+  site. The host set is **bounded by both** (a)
+  `upstream.allowed_host_regex` (SPEC §6.6) and (b) a metrics-
+  package per-metric series cap. Important caveat on (a): the
+  default regex (config.go:25) admits arbitrary subdomains under
+  `ubuntu.com`, `debian.org`, etc. (`^([a-z0-9-]+\.)*ubuntu\.com$`),
+  so a malicious or misconfigured client can in principle generate
+  unbounded distinct host strings (`random1.ubuntu.com`,
+  `random2.ubuntu.com`, …) — each request would 502 (no such mirror)
+  but each creates a permanent series. Defense: the metrics package
+  enforces a per-metric series cap (default 1024); when the cap is
+  reached, the new label tuple is dropped from the increment with a
+  one-shot `metrics_series_cap_reached` Warn. Operators running in
+  multi-tenant or hostile-LAN environments should additionally
+  tighten `upstream.allowed_host_regex` to literal hosts (e.g.
+  `^archive\.ubuntu\.com$`). `{suite_path}` labels are **not** added
+  (suite_path is unbounded across deployments and changes over time
+  as suites come and go; per-suite detail lives on the status
+  page). The metric inventory in §3.4 marks each metric as
+  `{host}`-labeled or unlabeled. The cap design lives in §3.2; the
+  metric inventory clarifies §3.4 prelude.
 
 - **Healthz semantics.** `200 ok\n` when (a) cache directory is
   writable, (b) DB ping succeeds, (c) process is not in graceful
@@ -217,10 +230,18 @@ during scoping. Each resolution is normative for SPEC5.
   `-ldflags '-X main.Version=$(VERSION)'` — see Makefile:6).
   `vcs_revision` and `go_version` come from
   `runtime/debug.ReadBuildInfo()` (Go 1.18+), which the toolchain
-  populates automatically. The Makefile's existing version
-  handling carries forward unchanged; Phase 5 reads `main.Version`
-  alongside `debug.ReadBuildInfo()` to produce
-  `acu_build_info{version,go_version,vcs_revision}` = 1.
+  populates automatically. **Architectural constraint:** the
+  `internal/admin` and `internal/metrics` packages cannot import
+  `main` (Go's `internal/` rule prohibits it). Instead,
+  `cmd/apt-cacher-ultra/main.go` reads its own package-level
+  `Version` string and `debug.ReadBuildInfo()` once at startup,
+  then passes the resulting `BuildInfo` struct (a tiny three-field
+  value type defined in `internal/admin` or `internal/metrics`)
+  into the admin listener constructor and the metrics-registration
+  helper. The constructor sets
+  `acu_build_info{version,go_version,vcs_revision} = 1`. Tests in
+  `internal/admin` build a synthetic `BuildInfo` directly. The
+  Makefile's existing version handling carries forward unchanged.
 
 ---
 
@@ -239,7 +260,7 @@ hooks that Phase 5 builds on:
 | `cache.ListSuites(ctx)` (`internal/cache/queries.go:226`) | Status page's "all tracked suites" table — one row per (host, suite_path) tuple. |
 | Single-listener architecture (`cmd/apt-cacher-ultra/main.go:105`+) with explicit listener-bind / Accept-defer separation (Phase 4 SPEC4 §4.2) | Phase 5 adds a *third* listener (alongside plain + TLS) following the same bind-early / Accept-late pattern. Same lifecycle, same graceful shutdown, no new wiring patterns. |
 | `lifecycleCtx` (SPEC §9.5) | Admin listener honors graceful shutdown: a long-running scrape mid-shutdown returns 503 with `Connection: close`. |
-| `main.Version` injected by Makefile `-ldflags '-X main.Version=$(VERSION)'` (Makefile:6) plus `runtime/debug.ReadBuildInfo()` for VCS revision and Go version | Populates `acu_build_info{version,go_version,vcs_revision}` gauge=1 at startup. The Makefile already drives `main.Version`; Phase 5 reads that string and merges it with `debug.BuildInfo` for the other fields. |
+| `main.Version` injected by Makefile `-ldflags '-X main.Version=$(VERSION)'` (Makefile:6) plus `runtime/debug.ReadBuildInfo()` for VCS revision and Go version | Populates `acu_build_info{version,go_version,vcs_revision}` gauge=1 at startup. The Makefile already drives `main.Version`. `cmd/apt-cacher-ultra/main.go` reads it (and `debug.ReadBuildInfo()`) once at startup and passes the resulting `BuildInfo` struct into the admin listener constructor — `internal/admin` and `internal/metrics` cannot import `main` directly. |
 | `hostsem.HostCount()` (`internal/hostsem/sem.go:121`) — host-set size only, no occupancy detail | A new `Snapshot()` method on `*Sem` is required for per-host inflight gauges + status-page table. Returns `map[string]struct{Inflight, Capacity int}`. Phase 5 deliverable: extend `internal/hostsem` with `Snapshot()`. |
 | Existing `[log]` config block conventions (`internal/config/config.go`) | Phase 5's new `[admin]` block follows the same parsing / validation conventions. Listen-address validation reuses the existing `validateListenAddr()` helper used by `[cache].listen` / `[cache].listen_tls`. |
 
@@ -370,6 +391,42 @@ Prometheus client library. The exposition-format renderer is ~50
 LoC and avoids dragging in the `prometheus/client_golang`
 dependency tree.
 
+**Render hold-time.** The renderer builds the per-metric output
+into a `strings.Builder` *under* the metric's lock and then writes
+the buffer to `io.Writer` *outside* the lock. Hot-path
+Inc/Observe/Set blocking is bounded by the per-metric series count
+(memory operations) regardless of the writer's speed — important
+because `/metrics` is served to a remote scraper over HTTP, and a
+slow consumer must not stall request-path counters. (Already
+implemented in `internal/metrics/metrics.go` as of Phase 5
+revision 3.)
+
+**Per-metric series cap.** Each labeled metric carries a
+`maxSeries` cap (default 1024). When a new label-value tuple
+would push the metric's series count past the cap, the
+Inc/Observe/Set call **silently drops** the increment and a
+one-shot `metrics_series_cap_reached` Warn fires for that metric
+(one log line per metric per process lifetime, so a sustained
+flood does not log-storm). Existing series continue to update
+normally. The cap is the back-stop against the §1.2 cardinality
+risk: even when `upstream.allowed_host_regex` is wide and a
+malicious client floods distinct host strings, the metric grows
+to at most 1024 series (per metric). The cap is set at
+construction:
+
+```go
+func NewCounter(name, help string, labelNames ...string) *Counter
+// Default cap: 1024.
+
+func NewCounterWithCap(name, help string, maxSeries int, labelNames ...string) *Counter
+// Explicit cap. 0 = unbounded (use only for unlabeled or
+// known-tiny-cardinality metrics).
+```
+
+Operators who legitimately need >1024 distinct values per metric
+should narrow the regex first; raising the cap without that
+narrowing trades one alarm for another.
+
 Naming follows Prometheus conventions — `*_total` for counters,
 `*_seconds`/`*_bytes` for typed gauges/histograms, `_count`
 suffix for histogram observation count.
@@ -438,12 +495,18 @@ emit the events Phase 5 wants to count:
    failure provokes a retry (`fetch.go:352`). It does **not** log
    the terminal outcome of a fetch (success, status error,
    timeout, redirect blocked, etc.). Phase 5 adds explicit
-   instrumentation around `Fetch()` and `ConditionalGet()` (and
-   `Probe()` if exposed): on terminal return, classify the
-   outcome from the returned `*StatusError` / `error.Is(...)` /
-   `nil` and call `fetchTotal.Inc(outcome, host)` +
-   `fetchDuration.Observe(...)`. This is the only Phase 5 surface
-   that adds non-cosmetic logic to a non-handler package.
+   instrumentation around `Fetch()` and `Conditional()`: on
+   terminal return, the classifier in §3.4.2 maps the returned
+   error (or `nil`) through `errors.As(*StatusError)` /
+   `errors.Is(...)` to a single outcome label and calls
+   `fetchTotal.Inc(outcome, host)` +
+   `fetchDuration.Observe(...)`. The classifier is a **total
+   function** — every fetch return must yield exactly one outcome.
+   §3.4.2 enumerates every fetch sentinel (12+ variants across
+   `fetch.go` and `conditional.go`); the classifier covers all of
+   them plus the `error` fallback for any future error not yet
+   anticipated. This is the only Phase 5 surface that adds
+   non-cosmetic logic to a non-handler package.
 
 2. **Adoption duration.** `adoption_success` / `adoption_run_failed`
    logs do not currently carry a `duration_ms` field; the freshness
@@ -463,8 +526,13 @@ sketch of the surface area, by source:
 
 Metrics are tagged `{host}` (the upstream `canonical_host`) when
 the host is known at the emit site. The `{host}` label set is
-bounded by `upstream.allowed_host_regex` (SPEC §6.6) — typical
-deployments allow ≤20 distinct hosts.
+bounded by **two** mechanisms in concert: (a)
+`upstream.allowed_host_regex` (SPEC §6.6) caps which hosts can
+ever reach the fetch layer; (b) the metrics-package per-metric
+series cap (§3.2 — default 1024) caps how many distinct host
+values can ever materialize as series. (a) alone is insufficient
+for the default broad regex (which admits subdomain wildcards
+under `ubuntu.com`, `debian.org`, etc.); (b) is the back-stop.
 
 **Stable label sets.** Prometheus expects every series of a given
 metric to carry the same label keys. Outcomes that fire before
@@ -477,13 +545,43 @@ can filter / aggregate accordingly.
 
 #### 3.4.1 Request path (handler.go)
 
-- `acu_requests_total{outcome,host}` — counter. Outcome ∈ {`hit`,
-  `miss`, `hit_stale`, `hit_coalesced`, `method_not_allowed`,
-  `bad_request`, `forbidden`, `upstream_status`, `bad_gateway`,
-  `cache_write_failed`, `client_canceled`, `error`,
-  `unvouched_deb_refused`, `unvouched_deb_passthrough_no_coverage`}.
-  `host` is the empty string for outcomes that fail before host
-  parsing (`method_not_allowed`, `bad_request`).
+- `acu_requests_total{outcome,host}` — counter. Outcome ∈ the
+  exhaustive set below (every `outcome` string the handler passes
+  to `logRequest` corresponds to one label value):
+
+  - **Pre-host outcomes** (host=""): `method_not_allowed`,
+    `bad_request`.
+  - **Hit-path outcomes** (host populated): `hit`, `hit_stale`,
+    `hit_coalesced`.
+  - **Miss-path success** (host populated): `miss` (note: the
+    handler logs `hit_coalesced` on the singleflight follower
+    branch and `miss` on the leader; both share the same
+    request-path counter pair).
+  - **Pre-fetch refusals**: `forbidden` (host may be empty if
+    rejected before parse, populated if rejected by allowlist
+    after parse).
+  - **Upstream-driven failures**: `upstream_status` (4xx
+    passthrough), `bad_gateway` (5xx-after-retries, redirect
+    blocked, invalid URL, default-arm).
+  - **Local-fault failures**: `cache_write_failed` (disk full /
+    I/O error), `client_canceled` (client disconnected mid-fetch).
+  - **SPEC2 §6.2 .deb validation failures**:
+    `package_hash_mismatch`, `package_hash_conflict`.
+  - **SPEC2 §6.2 metadata-recovery failures**:
+    `snapshot_member_refetch_mismatch`, `snapshot_recovery_failed`,
+    `snapshot_recovery_upstream_status`,
+    `snapshot_recovery_upstream_unreachable`,
+    `snapshot_recovery_cache_write_failed`,
+    `snapshot_recovery_target_denied`.
+  - **SPEC3 §6.1 strict-mode**: `unvouched_deb_refused`,
+    `unvouched_deb_passthrough_no_coverage`.
+
+  This list is **exhaustive** for Phase 5 — counter wiring tests
+  in §6.3 verify each outcome increments. New `logRequest`
+  outcomes added later must update both this list and the test
+  table; SPEC5.md §10 will codify this as part of the §3.3
+  code-review rule.
+
 - `acu_request_duration_seconds{outcome,host}` — histogram.
   Buckets: 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60.
 - `acu_response_bytes{outcome,host}` — histogram.
@@ -494,10 +592,44 @@ can filter / aggregate accordingly.
 
 #### 3.4.2 Fetch path (internal/fetch)
 
-- `acu_fetch_total{outcome,host}` — counter. Outcome from upstream
-  status class (`2xx`, `3xx`, `4xx`, `5xx`, `timeout`,
-  `connect_failed`, `dns_failed`).
+- `acu_fetch_total{outcome,host}` — counter. The classifier
+  below is a **total function** mapping every fetch terminal
+  return to exactly one outcome label. Each row corresponds to
+  exactly one fetch sentinel (or status-code class), so an
+  operator inspecting the metric sees a complete picture of
+  upstream behavior. Outcome label values:
+
+  | Source | Outcome label |
+  |---|---|
+  | `Fetch` returned `nil` | `success` |
+  | `Conditional` returned `nil` Status 200 | `cond_changed` |
+  | `Conditional` returned `nil` Status 304 | `cond_unchanged` |
+  | `*StatusError` with code 4xx (matches `ErrUpstreamStatus`) | `4xx` |
+  | `*StatusError` with code 5xx (matches `ErrUpstreamServerError`) | `5xx` |
+  | `ErrUpstreamUnavailable` (retries exhausted on transient) | `unavailable` |
+  | `ErrRedirectBlocked` (3xx CheckRedirect rejection) | `redirect_blocked` |
+  | `ErrHostNotAllowed` | `host_not_allowed` |
+  | `ErrTargetDenied` (post-DNS deny CIDR) | `target_denied` |
+  | `ErrHostUnreachable` (cooldown-probe fast-fail; SPEC §1) | `host_unreachable` |
+  | `ErrInvalidURL` | `invalid_url` |
+  | `ErrSizeMismatch` | `size_mismatch` |
+  | `ErrInvalidContentRange` | `invalid_content_range` |
+  | `ErrTotalSizeMismatch` | `total_size_mismatch` |
+  | `ErrCacheWriteFailed` | `cache_write_failed` |
+  | `ErrConditionalBodyTooLarge` (Conditional only) | `body_too_large` |
+  | `context.DeadlineExceeded` | `timeout` |
+  | `context.Canceled` | `canceled` |
+  | net dial error (`*net.OpError`, EAI_NONAME, etc.) | `dns_failed` / `connect_failed` |
+  | any other | `error` (catch-all) |
+
+  The classifier is implemented as a small, branchful helper in
+  `internal/fetch` (e.g. `ClassifyOutcome(err error) string`) so
+  the handler and the freshness checker share one source of
+  truth. Phase 5 instrumentation calls this helper at every fetch
+  return site (§3.3.1).
+
 - `acu_fetch_duration_seconds{outcome,host}` — histogram.
+  Same outcome label set as `acu_fetch_total`.
 - `acu_fetch_retries_total{host}` — counter, one per retry attempt.
 - `acu_active_hosts` — gauge from `hostsem.HostCount()`. No host
   label (the metric *is* the host count).
@@ -517,8 +649,26 @@ can filter / aggregate accordingly.
   {`not_modified`, `unchanged`, `changed`, `failed`}.
 - `acu_adoption_total{outcome,host}` — counter, outcome ∈
   {`success`, `parse_failed`, `gpg_failed`, `member_mismatch`,
-  `unpinned_suite`, `run_failed`, `form_drift`}.
+  `unpinned_suite`, `run_failed`}. Each adoption attempt emits
+  exactly one outcome — the total of `acu_adoption_total` across
+  all outcome values equals the number of adoption attempts. (See
+  the next item for `form_drift`, which is a side-event not an
+  outcome.)
+- `acu_adoption_form_drift_total{prior_form,new_form,host}` —
+  counter (separate metric). `adoption_form_drift` is a Warn that
+  fires *during a successful adoption* when the suite's signature
+  form has switched between the prior current snapshot and the
+  one being adopted (inline → detached or vice versa; see
+  `internal/freshness/adoption.go:756`). It is **not** an
+  alternative outcome to `success`; both fire on the same code
+  path. Counting it under `acu_adoption_total{outcome=form_drift}`
+  would double-count successful adoptions, so it lives on its own
+  counter with `prior_form` and `new_form` labels (each ∈
+  {`inline`, `detached`, `unknown`}). Operators monitor for
+  unexpected form changes by alerting on rate of this counter.
 - `acu_adoption_duration_seconds{outcome,host}` — histogram.
+  Outcome label values match `acu_adoption_total` (no `form_drift`
+  here either).
 - `acu_hot_prefetch_total{outcome,host}` — counter, outcome ∈
   {`started`, `complete`, `partial`, `deb_failed`, `hash_mismatch`}.
 - `acu_adoption_heartbeat_failures_total{host}` — counter (Phase 4
@@ -537,7 +687,9 @@ can filter / aggregate accordingly.
 Metric names mirror the source `gc_run_complete` log field names
 (SPEC4 §10.2: `orphan_candidates_reaped`, `displaced_reaped`,
 etc.) so an operator grepping logs and Prometheus together
-recognizes the same identifier.
+recognizes the same identifier. The full set of `gc_run_complete`
+log fields (gc.go:163-174 / gc.go:202-213) is mirrored — every
+numeric field becomes a counter or gauge below.
 
 - `acu_gc_runs_total{phase}` — counter, phase ∈ {`startup`,
   `periodic`}.
@@ -545,8 +697,18 @@ recognizes the same identifier.
 - `acu_gc_bytes_reclaimed_total` — counter.
 - `acu_gc_orphan_candidates_reaped_total` — counter.
 - `acu_gc_displaced_reaped_total` — counter.
-- `acu_gc_pool_orphans_repaired_total` — counter.
+- `acu_gc_pool_orphans_repaired_total` — counter (mirrors log
+  field `pool_orphans_repaired`; populated only on the `startup`
+  phase — periodic ticks emit 0 for this field per gc.go:208).
+- `acu_gc_pool_orphan_bytes_repaired_total` — counter (mirrors
+  log field `pool_orphan_bytes_repaired`; same startup-only
+  contribution as above).
 - `acu_gc_pool_unlink_errors_total` — counter.
+- `acu_gc_deadline_reached_total{phase}` — counter, incremented
+  by 1 each tick whose `tick.deadlineReached` is true (mirrors
+  log field `deadline_reached`). Operators alert on rate to
+  detect a GC backlog where ticks are exiting early due to
+  `gc.max_tick_duration`.
 - `acu_gc_run_duration_seconds{phase}` — histogram.
 - `acu_gc_last_run_unixtime{phase}` — gauge.
 
@@ -566,7 +728,13 @@ recognizes the same identifier.
 #### 3.4.7 Build / process info
 
 - `acu_build_info{version,go_version,vcs_revision}` — gauge=1 at
-  startup. Sourced from `runtime/debug.ReadBuildInfo()`.
+  startup. `version` is `main.Version` (Makefile-injected via
+  `-ldflags`); `go_version` and `vcs_revision` come from
+  `runtime/debug.ReadBuildInfo()`. Read once in
+  `cmd/apt-cacher-ultra/main.go` (which is the only package that
+  can name `main.Version`) and passed into the admin / metrics
+  setup as a `BuildInfo` value type — see §1.2 build info source
+  for the architectural constraint.
 - `acu_process_start_unixtime` — gauge=startup time, set once.
 - Standard Go process metrics (`process_cpu_seconds_total`,
   `process_resident_memory_bytes`, etc.) — emitted via the
@@ -616,15 +784,17 @@ Cache:    /var/cache/apt-cacher-ultra, 47.2 GiB used,
 Listener: 0.0.0.0:3142 (proxy), 127.0.0.1:6789 (admin)
 
 == Suites ==
-[table of suite_freshness]
+[table of suite_freshness, sourced from cache.ListSuitesWithAdoption() — see §3.11]
 host        suite_path             last_check  last_success  current_snapshot  inrelease_change_seen_at
 ubuntu...   ubuntu/dists/jammy     14:30 UTC   14:30 UTC     adopted_at:13:50  -
 archive...  debian/dists/bookworm  14:31 UTC   12:15 UTC     adopted_at:08:00  10:42 UTC (lagging 4h12m)
 
 == GC ==
+[sourced from gc.GC.LastRunSummary() — see §3.11]
 last_run:        2026-05-07 14:00 UTC (10s ago, periodic)
 blobs_reaped:    72
 bytes_reclaimed: 1.2 GiB
+deadline_reached: false
 zero_refcount_backlog: 3 blobs awaiting grace
 displaced snapshots retained per suite: 3
 
@@ -691,6 +861,7 @@ in SPEC5; backwards-compatible additions only thereafter):
     "last_run_phase": "periodic",
     "last_run_blobs_reaped": 72,
     "last_run_bytes_reclaimed": 1288490188,
+    "last_run_deadline_reached": false,
     "displaced_per_suite_kept": 3
   },
   "hot_packages": [
@@ -715,6 +886,22 @@ in SPEC5; backwards-compatible additions only thereafter):
 Top-level keys are stable; new keys may be added (consumers
 should ignore unknown keys per JSON convention). Field types are
 fixed.
+
+`suites[].current_snapshot_adopted_at_unixtime` is the
+`suite_snapshot.adopted_at` of the row whose `snapshot_id` equals
+`current_snapshot_id`. SPEC §6.1 stores `adopted_at` as a unix
+timestamp in `suite_snapshot`; the existing
+`cache.ListSuites(ctx)` helper returns only `suite_freshness`
+columns, so Phase 5 adds a new query helper —
+`cache.ListSuitesWithAdoption(ctx)` — that returns enriched rows
+including `adopted_at`. See §3.11. The field is `null` for suites
+with no current snapshot (`current_snapshot_id IS NULL`).
+
+The `gc.*` block is sourced from
+`gc.GC.LastRunSummary()`-style accessor (also new in Phase 5 —
+§3.11) that captures the most recent `gc_run_complete` payload in
+memory. `gc.last_run_unixtime` is `null` when no GC run has
+completed since process start.
 
 `recent_adoptions[].completed_unixtime` is the timestamp the
 adoption *finished* (success or failure), not `adopted_at`. For a
@@ -974,6 +1161,88 @@ beyond the metrics registry and the htpasswd cache. It does not
 participate in graceful-shutdown ordering: dropping the ring on
 shutdown is correct (the data is non-authoritative).
 
+### 3.11 Data-source helpers (cache + GC)
+
+Two new accessors are needed so the §3.5 status page can render
+data that today is either un-queryable or only present in logs.
+
+#### 3.11.1 `cache.ListSuitesWithAdoption(ctx)`
+
+Today, `cache.ListSuites(ctx)` returns `[]SuiteFreshness` from a
+plain `SELECT * FROM suite_freshness` (queries.go:226). The row
+shape includes `current_snapshot_id` but not the snapshot's
+`adopted_at` — that column lives in `suite_snapshot`, keyed by
+`snapshot_id`. The status page needs both, and a per-row
+`GetSuiteSnapshot` lookup is N×1 round trips that the periodic
+scheduler doesn't do because it doesn't need adoption time.
+
+Phase 5 adds a new query helper:
+
+```go
+// SuiteWithAdoption embeds SuiteFreshness and adds the adopted_at
+// of the current_snapshot_id (nil when current_snapshot_id is
+// NULL or the join finds no matching suite_snapshot row — both
+// indicate "never adopted").
+type SuiteWithAdoption struct {
+    SuiteFreshness
+    CurrentAdoptedAt *int64  // unix seconds; nil when not adopted
+}
+
+// ListSuitesWithAdoption returns every suite_freshness row LEFT
+// JOIN suite_snapshot ON suite_freshness.current_snapshot_id =
+// suite_snapshot.snapshot_id. Used by the §3.5 status page.
+// Existing ListSuites() (used by the freshness scheduler) is
+// untouched — the scheduler does not need adopted_at.
+func (c *Cache) ListSuitesWithAdoption(ctx context.Context) ([]SuiteWithAdoption, error)
+```
+
+A single LEFT JOIN query keeps it O(1) round trips. The status
+page handler may also tolerate a small TTL cache (e.g. 5s) on
+this result if profiling shows the query is hot under load —
+deferred to implementation time.
+
+#### 3.11.2 `gc.GC.LastRunSummary()`
+
+Today, `gc.GC` retains no in-memory state across runs — every
+`gc_run_complete` is logged and forgotten (gc.go:202). The status
+page needs the most recent run's summary fields.
+
+Phase 5 extends `*gc.GC` with a small struct field that captures
+the last completed run, populated atomically (under a mutex) at
+the same emit site as the log line:
+
+```go
+type LastRunSummary struct {
+    Phase               string  // "startup" | "periodic"
+    AtUnixTime          int64
+    DurationSeconds     float64
+    BlobsReaped         int
+    BytesReclaimed      int64
+    OrphanCandidatesReaped int
+    DisplacedReaped        int
+    PoolOrphansRepaired    int
+    PoolOrphanBytesRepaired int64
+    PoolUnlinkErrors    int
+    DeadlineReached     bool
+}
+
+// LastRunSummary returns a copy of the most recently completed
+// GC run's summary, or (zero, false) when no run has completed
+// since process start.
+func (g *GC) LastRunSummary() (LastRunSummary, bool)
+```
+
+The summary is set under `gc.mu` after the log line emits and
+before the next tick begins. The status-page handler calls
+`LastRunSummary()` at request time and treats `(_, false)` as
+"GC has not run yet" — render an empty cell rather than a stale
+number.
+
+This extends `*GC` non-additively: existing callers (cmd/main.go's
+`StartupPass()` / `Run()` invocations) are unaffected. SPEC4
+§10.2 GC contracts are unchanged — `LastRunSummary()` is a pure
+accessor, not a behavioral change.
+
 ---
 
 ## 4. Schema migration
@@ -986,12 +1255,13 @@ shutdown is correct (the data is non-authoritative).
 
 ```toml
 [admin]
-enabled         = true              # master switch; default true
-listen          = "127.0.0.1:6789"  # bind address; loopback by default
-htpasswd_file   = ""                # bcrypt htpasswd; empty = no auth
-gauge_refresh   = "30s"             # expensive-gauge refresh cadence
-read_timeout    = "5s"              # HTTP ReadHeaderTimeout
-idle_timeout    = "30s"             # HTTP IdleTimeout
+enabled            = true              # master switch; default true
+listen             = "127.0.0.1:6789"  # bind address; loopback by default
+htpasswd_file      = ""                # bcrypt htpasswd; empty = no auth
+gauge_refresh      = "30s"             # expensive-gauge refresh cadence
+read_timeout       = "5s"              # HTTP ReadHeaderTimeout
+idle_timeout       = "30s"             # HTTP IdleTimeout
+metric_series_cap  = 1024              # per-metric series cap (§3.2)
 ```
 
 Validation:
@@ -1005,6 +1275,12 @@ Validation:
 - `admin.gauge_refresh > 0` and ≤ 1h.
 - `admin.read_timeout > 0` and ≤ 1m.
 - `admin.idle_timeout > 0` and ≤ 10m.
+- `admin.metric_series_cap >= 1` (0 would disable all increments
+  on labeled metrics — that is a footgun, not a feature; use the
+  unlabeled metric form if cap-bypass is genuinely wanted).
+  Recommended ≤ 100000 (per-process Prometheus cardinality
+  budget — operators who hit this are encouraged to narrow
+  `upstream.allowed_host_regex` instead).
 
 If `admin.enabled = false` the listener is not bound; `/metrics`,
 `/`, `/healthz` are unreachable (the operator is implicitly opting
@@ -1033,6 +1309,15 @@ Three test layers, parallel to Phase 4:
 - Histogram Observe, bucket boundaries, _count and _sum fields.
 - Gauge SetGauge — verify last-write-wins.
 - Concurrent Inc/Render — verify no torn reads under -race.
+- **Series cap** — declare a counter with cap=3, Inc 10 distinct
+  label tuples, verify exactly 3 series exist + a one-shot Warn
+  fires once. Existing 3 series continue to update; subsequent
+  Inc on a 4th tuple is dropped.
+- **Render hold-time** — render to a deliberately-slow Writer (a
+  pipe with a delayed reader); verify Inc calls during the slow
+  Write don't observe extended blocking. Indirect: time the Inc
+  hot path under a slow concurrent Render and confirm wallclock
+  is bounded by buffer-build cost, not by Write cost.
 
 ### 6.2 Endpoint tests (cmd/apt-cacher-ultra integration)
 
@@ -1118,6 +1403,31 @@ Three test layers, parallel to Phase 4:
   Snapshot copy is independent of subsequent Record calls.
 - Empty ring, `Snapshot()` returns `[]AdoptionEvent{}` (not nil).
 
+### 6.6 Fetch outcome classifier tests (internal/fetch)
+
+For each entry in the §3.4.2 classifier table, construct a
+returned-error or `nil` value and verify
+`ClassifyOutcome(err)` returns the expected outcome label. Each
+sentinel + status code pair is one test case (~20 cases). The
+test asserts the classifier is **total**: the catch-all `error`
+arm fires on a bare `errors.New("synthetic")` and on a `nil`
+ContentResult that doesn't match any specific success path.
+
+### 6.7 Data-source helper tests (cache + GC)
+
+- `cache.ListSuitesWithAdoption(ctx)` returns adopted_at populated
+  for suites whose current_snapshot_id has a matching
+  suite_snapshot row, and `nil` for suites with NULL
+  current_snapshot_id.
+- A suite_freshness row whose current_snapshot_id points at a
+  snapshot_id that does not exist (data-corruption case) returns
+  `nil` adopted_at without erroring.
+- `gc.GC.LastRunSummary()` returns `(_, false)` before any run
+  completes, `(_, true)` after `StartupPass()` finishes, and is
+  updated atomically after each periodic tick.
+- Concurrent reader of `LastRunSummary()` while a tick is updating
+  it — no torn read under `-race`.
+
 No new chaos tests. Phase 5 is observability of existing chaos,
 not new chaos.
 
@@ -1127,25 +1437,37 @@ not new chaos.
 
 1. All Phase 1/2/3/4 tests still pass.
 2. `internal/metrics` package implemented with unit tests under
-   `-race`.
+   `-race`, including the per-metric series cap (§3.2) and the
+   buffered-render hold-time bound (§3.2 / §6.1).
 3. `internal/hostsem.Sem.Snapshot()` added per §3.9, with unit
    tests under `-race`.
 4. `internal/observability` ring buffer implemented per §3.10,
    with unit tests under `-race`.
-5. Admin listener bound, all three endpoints reachable on default
+5. `cache.ListSuitesWithAdoption(ctx)` and `gc.GC.LastRunSummary()`
+   data-source helpers added per §3.11, with unit tests under
+   `-race`.
+6. `internal/fetch.ClassifyOutcome(err)` total classifier added
+   per §3.4.2, with unit tests for every sentinel.
+7. Admin listener bound, all three endpoints reachable on default
    loopback config.
-6. Counter wiring at all ~30 emit sites, verified by §6.3 tests,
-   plus the §3.3.1 explicit fetch + adoption duration
-   instrumentation.
-7. htpasswd auth implemented per §3.8; auth tests pass per §6.2.1.
-8. Status page renders correctly (HTML and JSON) for an empty
-   cache, a populated cache, and a cache with a lagging-upstream
-   suite.
-9. `/healthz` uses `os.CreateTemp` (not a fixed filename), flips
-   to 503 within one check cycle when cache_dir becomes
-   unwritable, and recovers within one check cycle when restored.
-10. SPEC5.md as-built, mirroring SPEC4.md structure.
-11. One-week production deployment with default `admin.*` showing
+8. Counter wiring at all emit sites, verified by §6.3 tests
+   against the **exhaustive** §3.4.1 outcome list (every
+   `logRequest` outcome string appears in the test table) plus
+   the §3.3.1 explicit fetch + adoption duration instrumentation.
+   `acu_adoption_form_drift_total` is a separate counter from
+   `acu_adoption_total` (§3.4.3). New GC counters
+   `acu_gc_pool_orphan_bytes_repaired_total` and
+   `acu_gc_deadline_reached_total{phase}` are wired (§3.4.5).
+9. htpasswd auth implemented per §3.8; auth tests pass per §6.2.1.
+10. Status page renders correctly (HTML and JSON) for an empty
+    cache, a populated cache, and a cache with a lagging-upstream
+    suite. `acu_build_info` populated from `main.Version` passed
+    in via `BuildInfo` value type (§1.2).
+11. `/healthz` uses `os.CreateTemp` (not a fixed filename), flips
+    to 503 within one check cycle when cache_dir becomes
+    unwritable, and recovers within one check cycle when restored.
+12. SPEC5.md as-built, mirroring SPEC4.md structure.
+13. One-week production deployment with default `admin.*` showing
     stable scrape latency (<10ms p99), no admin-listener
     resource leaks, and the status page renders correctly under
     real traffic.
@@ -1166,13 +1488,21 @@ The primary risk in Phase 5 is **scope creep into Phase 6 territory**:
   multi-cache deployments; deferred.
 
 A secondary risk is **counter-cardinality drift**: the §1.2
-cardinality decision adds `{host}` labels (bounded by
-`upstream.allowed_host_regex`) but explicitly excludes
-`{suite_path}` and `{client_addr}`. An operator who later adds an
-unbounded label "just for one metric" can blow up Prometheus
-storage. The §3.4 metric inventory should be treated as the
-exhaustive label set; new metrics added later should pass
-cardinality review.
+cardinality decision adds `{host}` labels but explicitly excludes
+`{suite_path}` and `{client_addr}`. The default
+`upstream.allowed_host_regex` admits subdomain wildcards under
+`ubuntu.com` / `debian.org` / etc., so a hostile or noisy client
+can in principle generate unbounded distinct host strings. Phase
+5 mitigates with a per-metric series cap (§3.2 — default 1024,
+configurable via `admin.metric_series_cap`); overflow drops the
+increment with a one-shot Warn. The cap is the back-stop, not a
+substitute for a tight regex: operators in multi-tenant or
+hostile-LAN environments should narrow the regex to literal hosts
+before exposing the admin port. An operator who later adds an
+unbounded label "just for one metric" can still consume the cap
+budget and silently drop legitimate increments — the §3.4 metric
+inventory should be treated as the exhaustive label set, and new
+metrics added later should pass cardinality review.
 
 A tertiary risk is **status-page injection**: rendered values come
 from cache state (suite paths, hostnames). All template rendering
