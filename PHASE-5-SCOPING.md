@@ -1,14 +1,13 @@
 # apt-cacher-ultra — Phase 5 Scoping
 
-Status: **scoping in progress** (revision 0 — preliminary draft).
+Status: **scoping locked** (revision 1).
 Last updated 2026-05-07. Next artifact: `SPEC5.md` modeled on
-`SPEC4.md`'s structure, once the §1.2 open items below are resolved
-with the operator.
+`SPEC4.md`'s structure.
 
 This document gathers what Phase 5 is, the hooks Phases 1–4 left in
-place for it, and a preliminary design — but unlike PHASE-4-SCOPING.md
-revision 1, several decisions in §1.2 are still **open** awaiting
-operator input. Companion documents
+place for it, and the design decisions resolved during this scoping
+pass before this becomes a locked SPEC5.md (parallel to SPEC.md /
+SPEC2.md / SPEC3.md / SPEC4.md). Companion documents
 [PHASE-2-SCOPING.md](PHASE-2-SCOPING.md),
 [PHASE-3-SCOPING.md](PHASE-3-SCOPING.md), and
 [PHASE-4-SCOPING.md](PHASE-4-SCOPING.md) record the parallel
@@ -101,18 +100,14 @@ Newly deferred in Phase 5:
   beyond what Prometheus's own histogram type provides at scrape
   time.
 
-### 1.2 Resolved during Phase 5 scoping (preliminary)
+### 1.2 Resolved during Phase 5 scoping
 
-The eight design questions below need operator confirmation before
-SPEC5.md can be locked. Each question is presented with the
-proposed resolution and the reasoning; alternatives are noted. The
-operator should react to each — accepting, rejecting, or
-modifying — and §1.2 will be rewritten to record the locked
-resolutions, parallel to how PHASE-4-SCOPING.md §1.2 reads today.
+The eight design questions below were resolved with the operator
+during scoping. Each resolution is normative for SPEC5.
 
-- **Listener model.** *Proposed:* a **separate HTTP listener** on
+- **Listener model.** A **separate HTTP listener** on
   `127.0.0.1:6789` by default, distinct from the proxy listener on
-  `:3142`. Reasoning: (a) the proxy listener accepts absolute-URL
+  `:3142`. Rationale: (a) the proxy listener accepts absolute-URL
   requests from apt clients; mixing admin paths with a request
   pipeline whose `ServeHTTP` already does scheme/host
   canonicalization is more code-surgery than benefit, (b) localhost
@@ -124,61 +119,80 @@ resolutions, parallel to how PHASE-4-SCOPING.md §1.2 reads today.
   *Alternative considered:* same listener with `/_acu/*` path
   prefix (apt-cacher-ng's choice). Rejected because operators of
   apt-cacher-ng routinely complained about unintended admin-page
-  exposure on the proxy port. (See §3.1 for full discussion.)
+  exposure on the proxy port.
 
-- **Format.** *Proposed:* Prometheus text exposition format
-  (`text/plain; version=0.0.4`) for `/metrics`. apt-cacher-ng-style
-  HTML for `/`. Plain `ok\n` 200 or `degraded\n` 503 for `/healthz`.
-  *Alternative considered:* JSON-everywhere, no HTML. Rejected
-  because HTML is what an operator opens in a browser during an
-  incident — the friction of "scrape with curl, pipe through jq" is
-  exactly what the status page eliminates.
+- **Format.** Prometheus text exposition format
+  (`text/plain; version=0.0.4`) for `/metrics`. HTML *or* JSON for
+  `/` via content negotiation: `Accept: application/json` or
+  `?format=json` returns JSON; everything else returns HTML. Plain
+  `ok\n` 200 or `degraded\n` 503 for `/healthz`. The dual HTML/JSON
+  view on `/` lets operators eyeball during an incident *and*
+  consume programmatically (custom dashboards, scripts) without a
+  second endpoint surface. (See §3.5 for content negotiation
+  details.)
 
-- **Counter-wiring strategy.** *Proposed:* a thin
-  `internal/metrics` package exposing `Inc(name, labels...)`,
-  `Observe(name, value, labels...)`, `SetGauge(name, value)`. Each
-  emit site adds one line next to the existing `Logger.Info(...)`
-  call. *Alternative considered:* slog handler interception that
-  derives counters from log events. Rejected because
-  log-event-driven metrics drift silently as event names change,
-  and the cost of "one extra line per emit site" is small (the
-  events are already centralized — they are not scattered across
-  the hot path, but rather at the ~30 named call sites identified
-  in §2 below).
+- **Counter-wiring strategy.** A thin `internal/metrics` package
+  exposing `Inc(name, labels...)`, `Observe(name, value,
+  labels...)`, `SetGauge(name, value)`. Each emit site adds one
+  line next to the existing `Logger.Info(...)` call. The 30-event
+  surface lives in ~8 helper functions (handler.logRequest,
+  freshness.run, gc.runOnce, adoption.commit, etc.); most "wiring
+  sites" collapse to one line per helper. *Alternative considered:*
+  slog handler interception. Rejected because (a) you still
+  maintain a registration table mapping event-name → metric type
+  (counter / histogram / gauge), so the apparent "wire once" is
+  illusory, (b) histograms need a numeric field with a known name,
+  enforced only by convention, (c) renaming an event silently
+  breaks the metric — Prometheus dashboards downstream go quiet
+  with no compile-time signal, (d) the explicit form is reviewable
+  and grep-friendly. The safety property — "every operationally
+  meaningful event has a metric" — is enforced by code-review
+  checklist plus a §6.3 test that scrapes /metrics after running
+  each named code path.
 
-- **Cardinality posture.** *Proposed:* **no `{host}` or
-  `{suite_path}` labels** on Prometheus metrics. Status page exposes
-  the per-host / per-suite breakdown via HTML tables (no cardinality
-  limits there). The Prometheus surface stays low-cardinality and
-  scrape-cheap. *Alternative considered:* top-N hosts by request
-  count, exposed under a `{host}` label with everything else
-  bucketed into `{host="other"}`. Rejected as premature — wait for
-  observational evidence that low-cardinality metrics hide
-  important per-host signal.
+- **Cardinality posture.** Prometheus metrics carry `{host}`
+  labels for per-host metrics where the host is known at the emit
+  site. The host set is bounded by `upstream.allowed_host_regex`
+  (SPEC §6.6) — typical deployments allow ≤20 hosts; pathological
+  ≤50. Prometheus handles this scale comfortably. `{suite_path}`
+  labels are **not** added (suite_path is unbounded across
+  deployments and changes over time as suites come and go;
+  per-suite detail lives on the status page). The metric inventory
+  in §3.4 marks each metric as `{host}`-labeled or unlabeled.
 
-- **Healthz semantics.** *Proposed:* `200 ok\n` when (a) cache
-  directory is writable, (b) DB ping succeeds, (c) listeners are
-  up, (d) process is not in graceful shutdown. `503 degraded\n`
-  on any of those failing. *Alternative considered:* always-200
-  liveness + separate `/readyz` for readiness. Rejected as
-  over-engineering for a single-process daemon — k8s-style
-  liveness/readiness split applies to clusters, not single hosts.
+- **Healthz semantics.** `200 ok\n` when (a) cache directory is
+  writable, (b) DB ping succeeds, (c) process is not in graceful
+  shutdown. `503 degraded\n` on any of those failing, with the
+  failing check name in an `X-Acu-Check-Failed:` header.
+  *Alternative considered:* always-200 liveness + separate
+  `/readyz` for readiness. Rejected as over-engineering for a
+  single-process daemon — k8s-style liveness/readiness split
+  applies to clusters, not single hosts.
 
-- **Authentication.** *Proposed:* **bind-address-only** (no Basic,
-  no Bearer, no IP allowlist). The default bind to `127.0.0.1`
-  shifts the trust boundary to the host's loopback interface. An
-  operator who exposes the admin port to a wider network is
-  expected to put a reverse proxy in front (nginx + auth_basic)
-  rather than reinvent that wheel inside this daemon. *Alternative
-  considered:* optional Basic auth via TOML. Rejected as
-  half-measure security — Basic auth without TLS is meaningless on
-  a non-loopback bind, and TLS on the admin port is a Phase 6
-  topic.
+- **Authentication.** **htpasswd-style HTTP Basic auth**, opt-in
+  via `admin.htpasswd_file`. When the path is empty (default), no
+  auth is enforced and the operator relies on bind-address as the
+  trust boundary. When a path is configured, every admin request
+  must present a valid `Authorization: Basic ...` header matching
+  a `user:bcrypt-hash` line in the file. Bcrypt only — `$2a$`,
+  `$2b$`, `$2y$` prefixes accepted; older Apache MD5 / SHA-1 /
+  crypt formats rejected at startup with a config error.
+  htpasswd-compatibility means `htpasswd -B -c file user` (the
+  Apache utility's bcrypt mode) generates files this daemon
+  consumes directly. The htpasswd file is re-read on mtime change
+  (stat-on-each-request, parse-on-change) so operators can
+  add/remove users without a restart. *Alternative considered:*
+  bind-address-only with no auth. Rejected because the operator
+  expects to expose the admin port behind a network in some
+  deployments (multi-host monitoring, Prometheus scrape from a
+  different host) and a reverse-proxy-only auth posture forces
+  every operator to deploy nginx alongside this daemon. (See §3.8
+  for the auth design.)
 
-- **Default-on.** *Proposed:* `admin.enabled = true` by default,
+- **Default-on.** `admin.enabled = true` by default,
   `admin.listen = "127.0.0.1:6789"`. The endpoint is safe-by-default
   on loopback; the cost of a default-on admin listener is one
-  extra net.Listener. Operators who genuinely want to disable it
+  extra `net.Listener`. Operators who genuinely want to disable it
   set `admin.enabled = false`. *Alternative considered:*
   default-off, opt-in. Rejected as operator-hostile — the most
   common reason to install this daemon is operations, and a
@@ -186,18 +200,24 @@ resolutions, parallel to how PHASE-4-SCOPING.md §1.2 reads today.
   experience worse for no security gain (loopback bind is the
   security boundary, not the enabled flag).
 
-- **Expensive-gauge refresh cadence.** *Proposed:* a single
-  refresher goroutine populates expensive gauges
-  (`acu_blobs_db_count`, `acu_blobs_db_total_bytes`,
-  `acu_pool_disk_bytes`) every 60s into in-memory cells; scrapes
-  read cells. *Alternative considered:* recompute on every scrape.
-  Rejected because Prometheus default scrape interval is 15s and
-  some deployments scrape every 5s — running `du pool/` or
-  `SELECT SUM(size) FROM blob` at that cadence is wasteful at
-  multi-GiB scale. *Alternative considered:* expose these only on
-  the status page, omit from `/metrics`. Rejected because
-  cumulative bytes-on-disk is the most operationally-relevant
-  gauge for a cache.
+- **Expensive-gauge refresh cadence.** A single refresher
+  goroutine populates expensive gauges (`acu_blobs_db_count`,
+  `acu_blobs_db_total_bytes`, `acu_pool_disk_bytes`) every 30s
+  into in-memory cells; scrapes read cells. *Alternative
+  considered:* recompute on every scrape. Rejected because
+  Prometheus default scrape interval is 15s and some deployments
+  scrape every 5s — running `du pool/` or `SELECT SUM(size) FROM
+  blob` at that cadence is wasteful at multi-GiB scale.
+  *Alternative considered:* expose these only on the status page,
+  omit from `/metrics`. Rejected because cumulative bytes-on-disk
+  is the most operationally-relevant gauge for a cache.
+
+- **Build info source.** `runtime/debug.ReadBuildInfo()` (Go
+  1.18+) for `acu_build_info{version,go_version,vcs_revision}`.
+  No `-ldflags` injection, no Makefile changes — the Go toolchain
+  embeds `vcs.revision`, `vcs.time`, and `vcs.modified` in the
+  binary automatically when built from a git checkout. The
+  Makefile's existing version handling carries forward unchanged.
 
 ---
 
@@ -360,40 +380,54 @@ unmeasurable (e.g. one-time startup banners).
 The full list to be enumerated in SPEC5.md §10. Preliminary
 sketch of the surface area, by source:
 
+Metrics are tagged `{host}` (the upstream `canonical_host`) when
+the host is known at the emit site. The `{host}` label set is
+bounded by `upstream.allowed_host_regex` (SPEC §6.6) — typical
+deployments allow ≤20 distinct hosts. Pre-host-resolution emits
+(method-not-allowed, bad-request before parse) carry no `{host}`
+label.
+
 #### 3.4.1 Request path (handler.go)
 
-- `acu_requests_total{outcome}` — counter. Outcome ∈ {`hit`,
+- `acu_requests_total{outcome,host}` — counter. Outcome ∈ {`hit`,
   `miss`, `hit_stale`, `hit_coalesced`, `method_not_allowed`,
   `bad_request`, `forbidden`, `upstream_status`, `bad_gateway`,
   `cache_write_failed`, `client_canceled`, `error`,
   `unvouched_deb_refused`, `unvouched_deb_passthrough_no_coverage`}.
-- `acu_request_duration_seconds{outcome}` — histogram.
+  `host` is the empty string for outcomes that fail before host
+  parsing (`method_not_allowed`, `bad_request`).
+- `acu_request_duration_seconds{outcome,host}` — histogram.
   Buckets: 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60.
-- `acu_response_bytes{outcome}` — histogram.
+- `acu_response_bytes{outcome,host}` — histogram.
   Buckets: 1024, 4096, 65536, 262144, 1048576, 10485760, 104857600,
   1073741824 (1KiB → 1GiB).
-- `acu_inflight_requests` — gauge (handler.activeWG count).
+- `acu_inflight_requests` — gauge (handler.activeWG count). No
+  host label (gauge is process-wide, not partitionable cleanly).
 
 #### 3.4.2 Fetch path (internal/fetch)
 
-- `acu_fetch_total{outcome}` — counter. Outcome from upstream
+- `acu_fetch_total{outcome,host}` — counter. Outcome from upstream
   status class (`2xx`, `3xx`, `4xx`, `5xx`, `timeout`,
   `connect_failed`, `dns_failed`).
-- `acu_fetch_duration_seconds{outcome}` — histogram.
-- `acu_fetch_retries_total` — counter, one per retry attempt.
-- `acu_active_hosts` — gauge from `hostsem.HostCount()`.
+- `acu_fetch_duration_seconds{outcome,host}` — histogram.
+- `acu_fetch_retries_total{host}` — counter, one per retry attempt.
+- `acu_active_hosts` — gauge from `hostsem.HostCount()`. No host
+  label (the metric *is* the host count).
+- `acu_per_host_inflight{host}` — gauge per host from `hostsem`,
+  the per-host slot occupancy. Useful for diagnosing one slow
+  upstream blocking others.
 
 #### 3.4.3 Freshness / adoption (internal/freshness)
 
-- `acu_freshness_check_total{result}` — counter, result ∈
+- `acu_freshness_check_total{result,host}` — counter, result ∈
   {`not_modified`, `unchanged`, `changed`, `failed`}.
-- `acu_adoption_total{outcome}` — counter, outcome ∈
+- `acu_adoption_total{outcome,host}` — counter, outcome ∈
   {`success`, `parse_failed`, `gpg_failed`, `member_mismatch`,
   `unpinned_suite`, `run_failed`, `form_drift`}.
-- `acu_adoption_duration_seconds{outcome}` — histogram.
-- `acu_hot_prefetch_total{outcome}` — counter, outcome ∈
+- `acu_adoption_duration_seconds{outcome,host}` — histogram.
+- `acu_hot_prefetch_total{outcome,host}` — counter, outcome ∈
   {`started`, `complete`, `partial`, `deb_failed`, `hash_mismatch`}.
-- `acu_adoption_heartbeat_failures_total` — counter (Phase 4
+- `acu_adoption_heartbeat_failures_total{host}` — counter (Phase 4
   heartbeat failure).
 
 #### 3.4.4 Integrity (internal/integrity)
@@ -417,7 +451,7 @@ sketch of the surface area, by source:
 - `acu_gc_run_duration_seconds{phase}` — histogram.
 - `acu_gc_last_run_unixtime{phase}` — gauge.
 
-#### 3.4.6 Cache state (gauges, refreshed every 60s)
+#### 3.4.6 Cache state (gauges, refreshed every 30s)
 
 - `acu_blobs_db_count` — gauge (SELECT COUNT(*) FROM blob).
 - `acu_blobs_db_total_bytes` — gauge (SELECT SUM(size) FROM blob).
@@ -446,11 +480,32 @@ sketch of the surface area, by source:
 - `acu_admin_scrape_total` — counter (`/metrics` scrapes served).
 - `acu_admin_scrape_duration_seconds` — histogram.
 
-### 3.5 Status page design
+### 3.5 Status page design (`GET /`)
+
+#### 3.5.1 Content negotiation
+
+The root path serves either HTML or JSON depending on the request:
+
+1. `?format=json` query parameter → JSON, regardless of Accept.
+2. Otherwise, `Accept` header: if `application/json` is acceptable
+   and `text/html` is not, → JSON.
+3. Otherwise → HTML (Content-Type `text/html; charset=utf-8`).
+
+The query parameter wins because operators bookmark URLs and curl
+scripts find query strings easier to compose than custom headers.
+JSON Content-Type is `application/json; charset=utf-8`.
+
+The HTML page renders a "View as JSON →" link at the top pointing
+to `/?format=json`, so the JSON view is discoverable from the
+browser.
+
+#### 3.5.2 HTML rendering
 
 A single HTML page rendered by Go's `html/template` at request
 time. No JavaScript, no external assets — one self-contained
-page, browser-renderable offline. Layout:
+page, browser-renderable offline. **Auto-escapes via
+`html/template`** (never `text/template`) — see §9 risk note.
+Layout:
 
 ```
 == apt-cacher-ultra status ==
@@ -485,12 +540,78 @@ host                 inflight   slot_capacity
 archive.ubuntu.com   2          8
 ```
 
-Tables use plain `<table>` with monospace `<pre>` fallback for
-operators who prefer `curl http://localhost:6789/ | less`.
-Server-side rendering only.
+Tables use plain `<table>`. CSS is inlined in a `<style>` block;
+the page targets nice-looking type/spacing without external
+fonts or JavaScript. Server-side rendering only.
 
 The page is bounded — top-N lists capped at 20 rows each. Total
 page size targets <200 KiB even for a fully-stocked cache.
+
+#### 3.5.3 JSON shape
+
+The JSON form is the same data, machine-readable. Schema (locked
+in SPEC5; backwards-compatible additions only thereafter):
+
+```json
+{
+  "process": {
+    "version": "v0.x.y",
+    "started_unixtime": 1746628320,
+    "uptime_seconds": 44040,
+    "vcs_revision": "abcdef0",
+    "go_version": "go1.22.1"
+  },
+  "cache": {
+    "dir": "/var/cache/apt-cacher-ultra",
+    "bytes_used": 50678865920,
+    "blob_count": 18743,
+    "url_path_count": 8421,
+    "zero_refcount_backlog": 3
+  },
+  "listeners": [
+    {"role": "proxy", "addr": "0.0.0.0:3142"},
+    {"role": "admin", "addr": "127.0.0.1:6789"}
+  ],
+  "suites": [
+    {
+      "host": "archive.ubuntu.com",
+      "suite_path": "ubuntu/dists/jammy",
+      "last_check_unixtime": 1746671400,
+      "last_success_unixtime": 1746671400,
+      "current_snapshot_id": 142,
+      "current_snapshot_adopted_at_unixtime": 1746668400,
+      "inrelease_change_seen_at_unixtime": null
+    }
+  ],
+  "gc": {
+    "last_run_unixtime": 1746671400,
+    "last_run_phase": "periodic",
+    "last_run_blobs_reaped": 72,
+    "last_run_bytes_reclaimed": 1288490188,
+    "displaced_per_suite_kept": 3
+  },
+  "hot_packages": [
+    {"package": "linux-image-...", "request_count": 412,
+     "last_requested_unixtime": 1746671280}
+  ],
+  "recent_adoptions": [
+    {"host": "archive.ubuntu.com",
+     "suite_path": "ubuntu/dists/jammy",
+     "outcome": "success",
+     "adopted_at_unixtime": 1746668400,
+     "duration_seconds": 4.21}
+  ],
+  "active_hosts": [
+    {"host": "archive.ubuntu.com",
+     "inflight": 2,
+     "slot_capacity": 8}
+  ]
+}
+```
+
+Top-level keys are stable; new keys may be added (consumers
+should ignore unknown keys per JSON convention). Field types are
+fixed.
 
 ### 3.6 Healthz design
 
@@ -532,6 +653,111 @@ scrape every 15s) against query cost. An operator running
 many-GiB caches can dial it lower with `admin.gauge_refresh
 = "60s"` if needed.
 
+### 3.8 htpasswd auth
+
+When `admin.htpasswd_file` is non-empty, every admin request must
+present a valid `Authorization: Basic ...` header.
+
+#### 3.8.1 File format
+
+Apache htpasswd format, bcrypt-only. One credential per line:
+
+```
+sean:$2y$10$abcdef...
+ops:$2b$12$ghijkl...
+```
+
+The hash prefix selects the algorithm. Phase 5 accepts
+`$2a$`, `$2b$`, `$2y$` (all bcrypt variants — Go's
+`golang.org/x/crypto/bcrypt` accepts all three with
+`bcrypt.CompareHashAndPassword`). Older formats (`$apr1$` Apache
+MD5, `{SHA}` SHA-1, `crypt(3)` DES) are **rejected at startup**
+with a config error naming the offending line. Reasoning: those
+formats are cryptographically broken or weak, and accepting them
+would invite operators to use them.
+
+Generating a file with the standard Apache utility:
+
+```sh
+htpasswd -B -c /etc/apt-cacher-ultra/htpasswd sean
+htpasswd -B    /etc/apt-cacher-ultra/htpasswd ops
+```
+
+`-B` selects bcrypt; `-c` creates the file (omit for subsequent
+appends). The daemon imposes no restrictions on usernames beyond
+"no colons, no whitespace, no embedded newlines" (which the
+Apache utility already enforces).
+
+#### 3.8.2 File parsing and reload
+
+At startup, the file is parsed once: each non-empty,
+non-comment line is split on the first `:`, the hash prefix
+validated, and `(username → hash)` stored in a map. Parse errors
+fail startup with a clear error message naming the file and line
+number.
+
+At request time, the file's `os.Stat` mtime is checked against
+the cached parse timestamp. If mtime has advanced, the file is
+re-parsed and the map atomically swapped. Parse failures during
+reload **do not** swap the map — the daemon keeps serving with
+the prior credentials and emits an `htpasswd_reload_failed` Warn.
+This means a temporarily-broken htpasswd file (mid-edit) does
+not lock operators out.
+
+The stat-on-each-request cost is one syscall per admin request
+— negligible against the network round-trip and TLS handshake
+costs of typical admin clients.
+
+#### 3.8.3 Auth middleware
+
+Every admin request flows through:
+
+```go
+func authMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if !authRequired() {
+            next.ServeHTTP(w, r)
+            return
+        }
+        user, pass, ok := r.BasicAuth()
+        if !ok {
+            w.Header().Set("WWW-Authenticate", `Basic realm="apt-cacher-ultra admin"`)
+            http.Error(w, "auth required", http.StatusUnauthorized)
+            return
+        }
+        if !checkPassword(user, pass) {
+            // Constant-time response delay to blunt user-enumeration
+            // timing attacks (the bcrypt cost ensures the correct-user
+            // wrong-password path is slow; ensure wrong-user path is
+            // also slow by hashing a sentinel).
+            time.Sleep(...)
+            http.Error(w, "auth failed", http.StatusUnauthorized)
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+```
+
+The auth middleware wraps the entire admin mux — `/metrics`,
+`/`, and `/healthz` all require auth when `htpasswd_file` is
+configured. Reasoning for `/healthz` requiring auth: a
+publicly-readable `/healthz` exposes service-up state to
+attackers probing for live caches; the operational concern about
+"my k8s liveness probe needs to read /healthz" is moot because
+either (a) the probe runs on the same host (loopback bind, no
+auth) or (b) the operator can configure the probe to send Basic
+auth.
+
+#### 3.8.4 Non-loopback safety
+
+When `admin.listen` resolves to a non-loopback address AND
+`admin.htpasswd_file` is empty, a **`admin_unauthenticated_non_loopback`
+Warn** is emitted at startup. Parallel to `gc_disabled` and
+`refuse_unvouched_debs_inert` — the operator made a deliberate
+choice to expose admin endpoints without auth, and the warning is
+the operational signal.
+
 ---
 
 ## 4. Schema migration
@@ -546,6 +772,7 @@ many-GiB caches can dial it lower with `admin.gauge_refresh
 [admin]
 enabled         = true              # master switch; default true
 listen          = "127.0.0.1:6789"  # bind address; loopback by default
+htpasswd_file   = ""                # bcrypt htpasswd; empty = no auth
 gauge_refresh   = "30s"             # expensive-gauge refresh cadence
 read_timeout    = "5s"              # HTTP ReadHeaderTimeout
 idle_timeout    = "30s"             # HTTP IdleTimeout
@@ -555,6 +782,10 @@ Validation:
 
 - `admin.listen` is host:port, port 1-65535, host either an IP or
   empty (means all interfaces). Reuses `validateListenAddr()`.
+- `admin.htpasswd_file` if non-empty: file must exist, be readable,
+  and parse cleanly (every line is `user:$2[aby]$...`). Parse
+  failures at startup are config errors (process exits non-zero
+  with the offending file/line in the error message).
 - `admin.gauge_refresh > 0` and ≤ 1h.
 - `admin.read_timeout > 0` and ≤ 1m.
 - `admin.idle_timeout > 0` and ≤ 10m.
@@ -563,19 +794,20 @@ If `admin.enabled = false` the listener is not bound; `/metrics`,
 `/`, `/healthz` are unreachable (the operator is implicitly opting
 out of all observability).
 
-A startup `admin_disabled` Warn is emitted when `admin.enabled =
-false`, parallel to `gc_disabled` (SPEC4 §10.2). The warning is
-the only operational signal that the operator made the deliberate
-choice.
+Startup warnings:
 
-A startup `admin_listen_non_loopback` Warn is emitted when
-`admin.listen` resolves to anything other than 127.0.0.1, ::1, or
-"localhost" — flagging the operator that they have widened the
-trust boundary and should ensure auth is provided externally.
+- **`admin_disabled`** Warn when `admin.enabled = false`, parallel
+  to `gc_disabled` (SPEC4 §10.2).
+- **`admin_unauthenticated_non_loopback`** Warn when
+  `admin.listen` resolves to anything other than 127.0.0.1, ::1,
+  or "localhost" AND `admin.htpasswd_file` is empty — the
+  operator has widened the trust boundary without providing auth.
+- **`admin_authenticated`** Info when `admin.htpasswd_file` is
+  non-empty and parses successfully, with the user count.
 
 ---
 
-## 6. Test strategy (preliminary)
+## 6. Test strategy
 
 Three test layers, parallel to Phase 4:
 
@@ -592,6 +824,12 @@ Three test layers, parallel to Phase 4:
   charset=utf-8`, body parses as Prometheus exposition.
 - `GET /` → 200, Content-Type `text/html`, body contains
   `<title>` and the suite table heading.
+- `GET /` with `Accept: application/json` → 200, Content-Type
+  `application/json; charset=utf-8`, body parses as JSON with
+  the §3.5.3 schema.
+- `GET /?format=json` → 200, JSON regardless of Accept.
+- `GET /?format=json` with `Accept: text/html` → JSON wins
+  (query param override).
 - `GET /healthz` → 200, body `"ok\n"`.
 - `GET /healthz` with cache_dir made unwritable → 503, body
   `"degraded\n"`, header `X-Acu-Check-Failed: cache_dir`.
@@ -599,6 +837,27 @@ Three test layers, parallel to Phase 4:
 - `GET /unknown` → 404.
 - Admin listener with `admin.enabled = false` → no listener bound,
   port refused.
+
+#### 6.2.1 Auth tests
+
+- `admin.htpasswd_file = ""` (default): all requests succeed
+  without `Authorization` header.
+- `admin.htpasswd_file = <valid>`: `GET /metrics` without auth →
+  401 with `WWW-Authenticate: Basic realm=...`.
+- `GET /metrics` with valid Basic credentials → 200.
+- `GET /metrics` with valid user but wrong password → 401, after a
+  bcrypt-cost delay (timing parity with the no-such-user path).
+- `GET /metrics` with no-such-user → 401, with the same delay.
+- `GET /healthz` requires auth too (no carve-out).
+- htpasswd file rewritten with new credentials → next request
+  picks up the change (mtime-driven reload).
+- htpasswd file rewritten with parse error → next request still
+  serves with the prior credentials, `htpasswd_reload_failed`
+  Warn emitted.
+- Startup with htpasswd file containing `$apr1$...` (Apache MD5)
+  → process exits non-zero with config error.
+- Startup with htpasswd file containing one valid bcrypt and one
+  malformed line → process exits non-zero with the line number.
 
 ### 6.3 Counter-wiring tests
 
@@ -616,7 +875,7 @@ not new chaos.
 
 ---
 
-## 7. Definition of done (preliminary)
+## 7. Definition of done
 
 1. All Phase 1/2/3/4 tests still pass.
 2. `internal/metrics` package implemented with unit tests under
@@ -624,64 +883,22 @@ not new chaos.
 3. Admin listener bound, all three endpoints reachable on default
    loopback config.
 4. Counter wiring at all ~30 emit sites, verified by §6.3 tests.
-5. Status page renders correctly for an empty cache, a populated
-   cache, and a cache with a lagging-upstream suite.
-6. `/healthz` flips to 503 within one check cycle when cache_dir
+5. htpasswd auth implemented per §3.8; auth tests pass per §6.2.1.
+6. Status page renders correctly (HTML and JSON) for an empty
+   cache, a populated cache, and a cache with a lagging-upstream
+   suite.
+7. `/healthz` flips to 503 within one check cycle when cache_dir
    becomes unwritable; recovers within one check cycle when
    restored.
-7. SPEC5.md as-built, mirroring SPEC4.md structure.
-8. One-week production deployment with default `admin.*` showing
+8. SPEC5.md as-built, mirroring SPEC4.md structure.
+9. One-week production deployment with default `admin.*` showing
    stable scrape latency (<10ms p99), no admin-listener
    resource leaks, and the status page renders correctly under
    real traffic.
 
 ---
 
-## 8. Open questions for operator
-
-The §1.2 list above contains preliminary resolutions. Each is
-labeled *Proposed:* — the operator should react to each and
-either accept, reject, or modify before SPEC5.md is locked. The
-items are listed below in priority order (highest-impact first):
-
-1. **Listener model** — separate localhost `:6789` (proposed) vs
-   path-prefix on proxy port `:3142`. This is the highest-impact
-   choice and shapes the entire deployment posture.
-
-2. **Authentication** — bind-address-only (proposed) vs optional
-   Basic auth in TOML. Affects what an operator does if they want
-   to expose the admin port to a wider network.
-
-3. **Default-on** — `admin.enabled = true` by default (proposed)
-   vs default-off. Affects the Day 1 experience.
-
-4. **Cardinality** — no `{host}` labels (proposed) vs top-N hosts
-   exposed under labels. Affects Prometheus resource cost and
-   per-host signal.
-
-5. **Status page format** — HTML (proposed) vs JSON-only. Affects
-   how operators interact during an incident.
-
-6. **Healthz semantics** — three checks listed in §3.6 (proposed).
-   Are there additional conditions the operator considers
-   "degraded" that should be added (e.g. recent GC failure, recent
-   adoption failure, freshness check stale > N hours)?
-
-7. **Counter-wiring strategy** — explicit one-line-per-emit
-   (proposed) vs slog handler interception. Affects code
-   maintenance overhead.
-
-8. **Build info source** — `runtime/debug.ReadBuildInfo()`
-   (proposed, requires no Makefile changes) vs `-ldflags`
-   injection of a hand-managed version string. Affects build
-   tooling.
-
-A revision-1 of this scoping doc will lock §1.2 once the operator
-has resolved each item, parallel to PHASE-4-SCOPING.md revision 1.
-
----
-
-## 9. Risks
+## 8. Risks
 
 The primary risk in Phase 5 is **scope creep into Phase 6 territory**:
 
@@ -694,14 +911,29 @@ The primary risk in Phase 5 is **scope creep into Phase 6 territory**:
 - Distributed tracing / span propagation is attractive for
   multi-cache deployments; deferred.
 
-A secondary risk is **counter-cardinality drift**: an operator who
-reads §1.2 cardinality posture and adds a `{client_addr}` or
-`{suite_path}` label "just for one metric" can blow up Prometheus
+A secondary risk is **counter-cardinality drift**: the §1.2
+cardinality decision adds `{host}` labels (bounded by
+`upstream.allowed_host_regex`) but explicitly excludes
+`{suite_path}` and `{client_addr}`. An operator who later adds an
+unbounded label "just for one metric" can blow up Prometheus
 storage. The §3.4 metric inventory should be treated as the
-exhaustive set; new metrics added later should pass cardinality
-review.
+exhaustive label set; new metrics added later should pass
+cardinality review.
 
 A tertiary risk is **status-page injection**: rendered values come
 from cache state (suite paths, hostnames). All template rendering
 must use Go's `html/template` (auto-escapes), never `text/template`
-or hand-built HTML concatenation.
+or hand-built HTML concatenation. The JSON path uses
+`encoding/json` which escapes by spec.
+
+A fourth risk is **htpasswd timing leaks**: a wrong-user 401
+response that is fast and a wrong-password 401 response that is
+slow lets an attacker enumerate valid usernames. §3.8.3
+requires the no-such-user path to perform a sentinel bcrypt
+comparison so both error paths take the same wallclock.
+
+A fifth risk is **htpasswd file mode**: a world-readable
+htpasswd file leaks bcrypt hashes to local users. The daemon
+should not enforce file mode (operators may have legitimate
+reasons for 0644), but SPEC5 should recommend 0600 ownership
+matching the daemon user.
