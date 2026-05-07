@@ -78,6 +78,18 @@ var (
 	ErrAdoptionMemberFetchFailed = errors.New("adoption_member_fetch_failed")
 	ErrAdoptionMemberMismatch    = errors.New("adoption_member_mismatch")
 	ErrAdoptionDBFailed          = errors.New("adoption_db_failed")
+
+	// ErrAdoptionUnpinnedSuite is the freshness-level sentinel for
+	// the SPEC5 §10.4.3 `unpinned_suite` outcome — emitted by the
+	// gpg verifier when integrity.require_pinned_signer is set and
+	// no [[trusted_signer]] block matches the suite's host. The
+	// gpg package wraps its own ErrUnpinnedSuite alongside this
+	// sentinel so errors.Is(err, ErrAdoptionUnpinnedSuite) at the
+	// freshness layer produces the right metric label without
+	// pulling internal/gpg into freshness's import graph (gpg
+	// already imports freshness, so a freshness->gpg edge would
+	// cycle).
+	ErrAdoptionUnpinnedSuite = errors.New("adoption_unpinned_suite")
 )
 
 // AdoptionConfig bundles Adopter dependencies. Required: Cache, Fetcher,
@@ -299,7 +311,14 @@ func (a *Adopter) heartbeat(ctx context.Context, host string, snapshotID int64, 
 				"hash_count", len(hashes),
 				"err", err,
 			)
-			adoptionHeartbeatFailuresTotal.Inc(host)
+			// AIDEV-NOTE: do NOT increment
+			// acu_adoption_heartbeat_failures_total here. SPEC5
+			// §10.4.3 specifies the counter mirrors the
+			// adoption_heartbeat_failed Warn (snapshot heartbeat
+			// only); adoption_heartbeat_blobs_failed is a
+			// distinct event. Folding both into one counter
+			// would double-count when both writes fail in the
+			// same heartbeat pass.
 		}
 	}
 }
@@ -439,7 +458,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			"suite_path", suite.SuitePath,
 			"err", verifyErr,
 		)
-		return fmt.Errorf("%w: %v", ErrAdoptionGPGFailed, verifyErr)
+		// %w: %w preserves verifyErr in the chain so
+		// classifyAdoptionOutcome can distinguish unpinned_suite
+		// (gpg.ErrUnpinnedSuite chain-wrapped via
+		// ErrAdoptionUnpinnedSuite) from generic gpg_failed.
+		return fmt.Errorf("%w: %w", ErrAdoptionGPGFailed, verifyErr)
 	}
 
 	// Step 2: persist the verified metadata blob(s) into pool/ BEFORE

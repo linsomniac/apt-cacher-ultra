@@ -79,6 +79,14 @@ func classifyAdoptionOutcome(err error) string {
 		return "success"
 	}
 	switch {
+	// unpinned_suite is checked BEFORE gpg_failed: the verifier wraps
+	// its return with both ErrAdoptionGPGFailed (the runShared
+	// category sentinel) and ErrAdoptionUnpinnedSuite (the specific
+	// SPEC5 §10.4.3 unpinned-pin reason). Without this ordering all
+	// unpinned errors collapse into gpg_failed and the rollout signal
+	// for integrity.require_pinned_signer is invisible to operators.
+	case errors.Is(err, ErrAdoptionUnpinnedSuite):
+		return "unpinned_suite"
 	case errors.Is(err, ErrAdoptionGPGFailed):
 		return "gpg_failed"
 	case errors.Is(err, ErrAdoptionParseFailed):

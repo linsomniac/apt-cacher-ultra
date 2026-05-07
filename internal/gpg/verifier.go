@@ -349,8 +349,15 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (openpgp.EntityList
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 			)
-			return nil, nil, false, fmt.Errorf("%w: no [[trusted_signer]] block matches %q",
-				ErrUnpinnedSuite, suite.CanonicalHost)
+			// Multi-wrap with freshness.ErrAdoptionUnpinnedSuite
+			// so the freshness-layer classifier can route this
+			// to acu_adoption_total{outcome=unpinned_suite}
+			// (SPEC5 §10.4.3) without depending on gpg.
+			// errors.Is(err, gpg.ErrUnpinnedSuite) still matches
+			// for any caller that prefers the gpg-package
+			// sentinel.
+			return nil, nil, false, fmt.Errorf("%w: %w: no [[trusted_signer]] block matches %q",
+				ErrUnpinnedSuite, freshness.ErrAdoptionUnpinnedSuite, suite.CanonicalHost)
 		}
 		// Broad trust: the entire host keyring. Build a copy of the
 		// host fingerprint set so the IssuerFingerprint check has

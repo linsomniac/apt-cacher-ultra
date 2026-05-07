@@ -1849,12 +1849,19 @@ func (h *Handler) logUnvouchedPassthrough(host, path string, snapshotID int64) {
 		"path", path,
 		"incomplete_snapshot_id", snapshotID,
 	)
-	// SPEC5 §10.4.1: passthrough_no_coverage is a request-path outcome,
-	// but unlike the others it isn't passed to logRequest — the request
-	// continues through the trust-upstream serve path and gets its
-	// final outcome (miss/hit) logged separately. The counter mirrors
-	// the rate-limited Info: one increment per (host, path, hour).
-	requestsTotal.Inc("unvouched_deb_passthrough_no_coverage", host)
+	// AIDEV-NOTE: deliberately NOT incrementing acu_requests_total
+	// here. The request still proceeds through the trust-upstream
+	// serve path and reaches logRequest with its final outcome
+	// (miss / hit / etc.). Emitting a passthrough_no_coverage tick
+	// here would double-count one HTTP request and break the
+	// invariant "sum across acu_requests_total outcomes = total
+	// HTTP requests served." SPEC5 §10.4.1 lists this label in the
+	// outcome enum, but the rate-limited journal Info — once per
+	// (host, path, hour) — is the operator-facing surface; a
+	// counter that mirrored it would not be 1:1 with requests
+	// either. If a separate "passthrough events" counter is
+	// desired in a future phase, add it under a distinct metric
+	// name rather than under acu_requests_total.
 }
 
 // refuseUnvouchedDeb writes the SPEC3 §6.1 strict-mode 502 + Retry-After
