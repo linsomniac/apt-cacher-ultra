@@ -37,7 +37,8 @@ type hotPrefetchStats struct {
 // once with the unattempted-paths list) and parent context shutdown
 // (handled by checking ctx.Err() at the top of every iteration).
 func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
-	snapshotID int64, candidatePackageHashes []cache.PackageHash) ([]cache.PrefetchedURLPath, hotPrefetchStats) {
+	snapshotID int64, candidatePackageHashes []cache.PackageHash,
+	tracker *blobHeartbeatTracker) ([]cache.PrefetchedURLPath, hotPrefetchStats) {
 	var stats hotPrefetchStats
 
 	// SPEC3 §7.5 step 9: build the hot set. Pass the candidate's
@@ -127,6 +128,17 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 			break
 		}
 		blobHash, outcome := a.fetchHotDeb(prefetchCtx, suite, entry, snapshotID)
+		// Track the warmed blob *before* the heartbeat so the same
+		// HeartbeatBlobs call refreshes its grace clock. SPEC4 §7.5.1
+		// Rule 1 race-window extension applies to hot-prefetched debs
+		// the same way it applies to member fetches — the
+		// CommitAdoption Step 3a url_path INSERT is what eventually
+		// pins the blob via PutURLPath-style FK, so any time before
+		// commit the blob is reachable only from this in-memory
+		// tracker.
+		if outcome == hotFetchOK && tracker != nil {
+			tracker.Add(blobHash)
+		}
 		// SPEC4 §7.5.2 site 4: heartbeat after every per-deb fetch
 		// terminates (success, failure, mismatch, or cancel). Uses
 		// adoptionCtx, not prefetchCtx, so a budget-elapsed
@@ -137,7 +149,7 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 		// member-fetch heartbeat (post-runHotPrefetch entry) and
 		// the next heartbeat (site 5 pre-CommitAdoption) could be
 		// hot_count × that budget under pathological upstreams.
-		a.heartbeat(adoptionCtx, snapshotID)
+		a.heartbeat(adoptionCtx, snapshotID, tracker)
 		switch outcome {
 		case hotFetchOK:
 			prefetched = append(prefetched, cache.PrefetchedURLPath{

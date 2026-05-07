@@ -74,6 +74,20 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 		// files to remove is the DELETE's RETURNING result, which
 		// the cache layer captured before the COMMIT.
 		for _, r := range reaped {
+			// Defense-in-depth: hashes here came from the DB
+			// blob.hash column whose CHECK constraint pins it to
+			// 64-char lowercase hex, but a corrupt DB or a future
+			// schema change that weakened the CHECK could let a
+			// malformed hash through to the unlink path. Skip and
+			// log rather than building a path that could escape
+			// pool/<prefix>/.
+			if !validHashLite(r.Hash) {
+				g.cfg.Logger.Warn("gc_pool_unlink_skipped_invalid_hash",
+					"hash", r.Hash,
+					"size", r.Size,
+				)
+				continue
+			}
 			path := g.poolPath(r.Hash)
 			if err := os.Remove(path); err != nil {
 				if !errors.Is(err, fs.ErrNotExist) {

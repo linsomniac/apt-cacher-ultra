@@ -191,7 +191,7 @@ func TestRunHotPrefetch_Success(t *testing.T) {
 	newDebBytes := []byte("new deb bytes v2")
 	f.fetcher.setBody(f.debUpstreamURL, newDebBytes)
 
-	rows, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes)
+	rows, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes, nil)
 	if stats.hotCount != 1 {
 		t.Fatalf("hotCount=%d, want 1", stats.hotCount)
 	}
@@ -215,7 +215,7 @@ func TestRunHotPrefetch_RetryExhausted(t *testing.T) {
 	f := newHotPrefetchFixture(t, 5*time.Second)
 	f.fetcher.setError(f.debUpstreamURL, errors.New("simulated upstream 502"))
 
-	_, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes)
+	_, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes, nil)
 	if stats.failed != 1 || stats.fetched != 0 || stats.mismatched != 0 || stats.unattempted != 0 {
 		t.Errorf("buckets fetched=%d failed=%d mismatched=%d unattempted=%d, want 0/1/0/0",
 			stats.fetched, stats.failed, stats.mismatched, stats.unattempted)
@@ -231,7 +231,7 @@ func TestRunHotPrefetch_HashMismatch(t *testing.T) {
 	wrongBytes := []byte("hostile upstream sent these bytes instead")
 	f.fetcher.setBody(f.debUpstreamURL, wrongBytes)
 
-	rows, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes)
+	rows, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes, nil)
 	if stats.mismatched != 1 || stats.fetched != 0 || stats.failed != 0 {
 		t.Errorf("buckets fetched=%d failed=%d mismatched=%d unattempted=%d, want 0/0/1/0",
 			stats.fetched, stats.failed, stats.mismatched, stats.unattempted)
@@ -262,7 +262,7 @@ func TestRunHotPrefetch_BudgetElapsed(t *testing.T) {
 	// cancellation propagates (real fetch.Client does the same).
 	f.fetcher.setBlocking(f.debUpstreamURL, 5*time.Second)
 
-	_, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes)
+	_, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes, nil)
 	if stats.failed != 1 || stats.fetched != 0 || stats.mismatched != 0 || stats.unattempted != 0 {
 		t.Errorf("buckets fetched=%d failed=%d mismatched=%d unattempted=%d, want 0/1/0/0",
 			stats.fetched, stats.failed, stats.mismatched, stats.unattempted)
@@ -285,7 +285,7 @@ func TestRunHotPrefetch_ParentCancelled(t *testing.T) {
 		cancel()
 	}()
 	defer cancel()
-	rows, stats := f.adopter.runHotPrefetch(parentCtx, f.suite, f.candidate, f.candidatePackageHashes)
+	rows, stats := f.adopter.runHotPrefetch(parentCtx, f.suite, f.candidate, f.candidatePackageHashes, nil)
 	// We don't assert on log emission directly here (no log
 	// recorder hooked up in this fixture); we assert the contract
 	// shape: a parent-cancelled run still bucket-counts the
@@ -316,7 +316,7 @@ func TestRunHotPrefetch_EmptyHotSet(t *testing.T) {
 			CanonicalHost:   "archive.example",
 			SuitePath:       "/dists/cold",
 		},
-		f.candidate, f.candidatePackageHashes)
+		f.candidate, f.candidatePackageHashes, nil)
 	if stats.hotCount != 0 {
 		t.Errorf("hotCount=%d, want 0", stats.hotCount)
 	}

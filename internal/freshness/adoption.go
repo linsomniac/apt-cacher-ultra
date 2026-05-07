@@ -205,47 +205,113 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 	}, nil
 }
 
-// heartbeat is the shared site-2/3/5 + ticker call. SPEC4 §7.5.2: the
-// orphan-candidate reap predicate keys on suite_snapshot.heartbeat_at,
-// not on created_at. Each event-driven site refreshes the row's clock
-// after a phase that could otherwise leave the gap unbounded under
-// adversarial conditions (slow members, large Packages parse, deep
-// writer queue).
+// blobHeartbeatTracker is the per-adoption mutable list of member-blob
+// hashes that runShared has PutBlob'd but whose snapshot_member rows
+// have not yet been inserted (CommitAdoption Step 4 is the inserter).
+// Each §7.5.2 heartbeat site reads the snapshot of this list and
+// passes it to cache.HeartbeatBlobs to refresh refcount_zeroed_at on
+// the in-flight blobs — defending against the race where adoption
+// duration > gc.blob_grace causes a still-needed member blob to be
+// reaped before CommitAdoption can claim it via Rule 2.
 //
-// Heartbeat-write failures are non-fatal: log at adoption_heartbeat_failed
-// Warn and continue. The next heartbeat (or the successful
-// CommitAdoption that flips adopted_at) restores liveness; an adoption
-// whose every heartbeat silently fails is what the periodic ticker
-// (site 6) defends against, and even that defence has the §9.6.3 grace
-// floor as the safety bound.
+// The mutex protects against the concurrent reads from the periodic
+// heartbeat ticker (site 6) racing the appends in the member-fetch
+// loop (site 2).
+type blobHeartbeatTracker struct {
+	mu     sync.Mutex
+	hashes []string
+}
+
+// Add appends hash if it is non-empty. Duplicates are accepted — the
+// HeartbeatBlobs IN-list collapses them at the SQL level and a
+// duplicate UPDATE is a no-op.
+func (t *blobHeartbeatTracker) Add(hash string) {
+	if hash == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.hashes = append(t.hashes, hash)
+}
+
+// Snapshot returns a copy of the current hash list. Returns nil on an
+// empty tracker so callers can branch cheaply on the zero case.
+func (t *blobHeartbeatTracker) Snapshot() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.hashes) == 0 {
+		return nil
+	}
+	out := make([]string, len(t.hashes))
+	copy(out, t.hashes)
+	return out
+}
+
+// heartbeat is the shared site-2/3/4/5 + ticker call. SPEC4 §7.5.2:
+// the orphan-candidate reap predicate keys on
+// suite_snapshot.heartbeat_at, not on created_at. Each event-driven
+// site refreshes the row's clock after a phase that could otherwise
+// leave the gap unbounded under adversarial conditions (slow members,
+// large Packages parse, deep writer queue).
+//
+// When tracker is non-nil and has accumulated hashes, this also
+// refreshes refcount_zeroed_at on the in-flight member blobs via
+// cache.HeartbeatBlobs — closing the SPEC4 §7.5.1 Rule 1 race window
+// where a long adoption ages PutBlob'd member blobs past
+// gc.blob_grace before CommitAdoption inserts their snapshot_member
+// rows.
+//
+// Heartbeat-write failures are non-fatal: log at
+// adoption_heartbeat_failed Warn and continue. The next heartbeat (or
+// the successful CommitAdoption that flips adopted_at) restores
+// liveness; an adoption whose every heartbeat silently fails is what
+// the periodic ticker (site 6) defends against, and even that
+// defence has the §9.6.3 grace floor as the safety bound.
 //
 // Context cancellation (parent shutdown) is suppressed — that's the
 // expected exit path during graceful shutdown, not an operator-visible
 // failure mode.
-func (a *Adopter) heartbeat(ctx context.Context, snapshotID int64) {
+func (a *Adopter) heartbeat(ctx context.Context, snapshotID int64, tracker *blobHeartbeatTracker) {
 	if err := a.cache.HeartbeatSnapshot(ctx, snapshotID); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			a.logger.Warn("adoption_heartbeat_failed",
+				"snapshot_id", snapshotID,
+				"err", err,
+			)
 		}
-		a.logger.Warn("adoption_heartbeat_failed",
-			"snapshot_id", snapshotID,
-			"err", err,
-		)
+	}
+	if tracker == nil {
+		return
+	}
+	hashes := tracker.Snapshot()
+	if len(hashes) == 0 {
+		return
+	}
+	if err := a.cache.HeartbeatBlobs(ctx, hashes); err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			a.logger.Warn("adoption_heartbeat_blobs_failed",
+				"snapshot_id", snapshotID,
+				"hash_count", len(hashes),
+				"err", err,
+			)
+		}
 	}
 }
 
 // runHeartbeatTicker is SPEC4 §7.5.2 site 6: a per-adoption sidecar
 // goroutine that wakes every heartbeatInterval and submits a
-// HeartbeatSnapshot write. Cancels via ctx — the caller (runShared)
-// derives a child ctx and cancels it at function exit, then waits on
-// the WaitGroup so no goroutine outlives runShared.
+// HeartbeatSnapshot write (and a HeartbeatBlobs write when the
+// tracker has accumulated member hashes). Cancels via ctx — the
+// caller (runShared) derives a child ctx and cancels it at function
+// exit, then waits on the WaitGroup so no goroutine outlives
+// runShared.
 //
 // This site bounds the heartbeat-gap independently of which phase
 // runShared is in (Packages-parse, hot-set computation, between-fetch
 // gaps, the gap from runHotPrefetch returning to CommitAdoption
 // running). Sites 1–5 are latency-fresh event-driven heartbeats; the
 // ticker is the floor under them, not a replacement.
-func (a *Adopter) runHeartbeatTicker(ctx context.Context, snapshotID int64) {
+func (a *Adopter) runHeartbeatTicker(ctx context.Context, snapshotID int64, tracker *blobHeartbeatTracker) {
 	if a.heartbeatInterval <= 0 {
 		return
 	}
@@ -256,7 +322,7 @@ func (a *Adopter) runHeartbeatTicker(ctx context.Context, snapshotID int64) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			a.heartbeat(ctx, snapshotID)
+			a.heartbeat(ctx, snapshotID, tracker)
 		}
 	}
 }
@@ -481,6 +547,28 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		)
 	}
 
+	// SPEC4 §7.5.1 Rule 1 race-window extension: track the in-flight
+	// member-blob hashes so each heartbeat (sites 2-6) can also
+	// refresh refcount_zeroed_at on them. Without this, a member
+	// blob fetched in the first minute of a 6-minute adoption ages
+	// past gc.blob_grace before CommitAdoption can insert its
+	// snapshot_member row, and the FK INSERT then fails. Seed with
+	// the metadata blob hashes already PutBlob'd in step 2 — those
+	// are FK-protected by the candidate suite_snapshot row's hash
+	// columns once InsertCandidateSnapshot has run, but seeding
+	// covers the brief window between writeBlobBytes and
+	// InsertCandidateSnapshot landing.
+	tracker := &blobHeartbeatTracker{}
+	if p.inlineHash != "" {
+		tracker.Add(p.inlineHash)
+	}
+	if p.releaseHash != "" {
+		tracker.Add(p.releaseHash)
+	}
+	if p.releaseGPGHash != "" {
+		tracker.Add(p.releaseGPGHash)
+	}
+
 	// SPEC4 §7.5.2 site 6: launch the periodic heartbeat ticker.
 	// The ticker runs until tickerCancel fires at runShared exit;
 	// the deferred close-then-wait ensures the cancel happens
@@ -494,7 +582,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		tickerWG.Add(1)
 		go func() {
 			defer tickerWG.Done()
-			a.runHeartbeatTicker(tickerCtx, snapshotID)
+			a.runHeartbeatTicker(tickerCtx, snapshotID, tracker)
 		}()
 	}
 	defer func() {
@@ -510,7 +598,9 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// Member fetches against degraded upstreams can take minutes;
 	// without this site the gap from row creation to the next
 	// in-runShared heartbeat (site 3 after Packages parsing)
-	// could exceed grace under a slow-member cascade.
+	// could exceed grace under a slow-member cascade. The tracker
+	// gets the freshly-fetched blob hash so the same heartbeat
+	// also refreshes refcount_zeroed_at on it via HeartbeatBlobs.
 	memberRows := make([]cache.SnapshotMember, 0, len(members)+3)
 	for _, m := range members {
 		blobHash, err := a.adoptMember(ctx, suite, m)
@@ -523,7 +613,8 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			BlobHash:       blobHash,
 			DeclaredSHA256: m.SHA256,
 		})
-		a.heartbeat(ctx, snapshotID)
+		tracker.Add(blobHash)
+		a.heartbeat(ctx, snapshotID, tracker)
 	}
 
 	// Step 6: metadata-self snapshot_member row(s). Without these
@@ -599,7 +690,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// minutes. Without this site the gap from the last member-fetch
 	// heartbeat through Packages parsing to the next heartbeat
 	// would be unbounded by any fetch timeout.
-	a.heartbeat(ctx, snapshotID)
+	a.heartbeat(ctx, snapshotID, tracker)
 
 	// Steps 9 + 10 (SPEC3 §7.5): hot-set computation + hot-deb prefetch
 	// loop. The result list (prefetchedURLPaths) feeds CommitAdoption
@@ -609,14 +700,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// candidate's package_hash rows are passed in memory because the
 	// flip transaction below is what inserts them — Stage 2 of the
 	// hot-set computation cannot rely on them being DB-visible yet.
-	prefetchedURLPaths, hotStats := a.runHotPrefetch(ctx, suite, snapshotID, packageHashes)
+	prefetchedURLPaths, hotStats := a.runHotPrefetch(ctx, suite, snapshotID, packageHashes, tracker)
 
 	// SPEC4 §7.5.2 site 5: heartbeat right before CommitAdoption.
 	// Resets the grace clock at the latest possible moment before
 	// the adopted_at flip becomes the source of truth, defending
 	// against writer-queue depth between runHotPrefetch returning
 	// and CommitAdoption actually committing.
-	a.heartbeat(ctx, snapshotID)
+	a.heartbeat(ctx, snapshotID, tracker)
 
 	// Step 11: atomic flip transaction. Pass adoptionCtx as ctx so the
 	// budget-cancelled prefetch loop above never causes CommitAdoption

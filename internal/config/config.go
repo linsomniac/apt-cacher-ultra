@@ -494,8 +494,16 @@ func (c *Config) Validate() error {
 	if c.GC.MaxTickDuration.Duration <= 0 {
 		errs = append(errs, errors.New("gc.max_tick_duration must be > 0"))
 	}
-	if c.GC.BlobGrace.Duration <= 0 {
-		errs = append(errs, errors.New("gc.blob_grace must be > 0"))
+	if c.GC.BlobGrace.Duration < time.Second {
+		// AIDEV-NOTE: the §9.6.2 reap predicate compares
+		// refcount_zeroed_at (unix epoch seconds) against now -
+		// blob_grace.Seconds(); a sub-second value silently
+		// truncates to 0, making refcount<=0 blobs immediately
+		// reapable on the very next tick — exactly the safety
+		// failure mode SPEC4 §5.1 names as "0s is rejected at
+		// load." Reject the truncate-to-zero region too. (>0 alone
+		// would let "500ms" through.)
+		errs = append(errs, errors.New("gc.blob_grace must be >= 1s"))
 	}
 	if c.GC.KeepDisplaced < 0 {
 		errs = append(errs, errors.New("gc.keep_displaced must not be negative"))

@@ -348,3 +348,69 @@ func (c *Cache) HashKnown(ctx context.Context, hash string) (bool, error) {
 	}
 	return true, nil
 }
+
+// HeartbeatBlobs refreshes refcount_zeroed_at = now on every blob row
+// in `hashes` whose refcount is still <= 0 (i.e. has not yet been
+// claimed by a CommitAdoption Step 4 increment). Returns nil
+// immediately on an empty slice.
+//
+// The intent (SPEC4 §7.5.1 Rule 1 race-window extension): an adoption
+// goroutine PutBlob's its member blobs in a sequential loop that may
+// span minutes (large suites, slow upstreams, hot-prefetch loop with
+// hot_prefetch_budget=0). Each PutBlob sets refcount_zeroed_at =
+// created_at = now-at-INSERT-time. Without periodic refresh, a member
+// blob fetched in the first minute of a 6-minute adoption ages past
+// gc.blob_grace before CommitAdoption can insert its snapshot_member
+// row — at which point the §9.6.2 reap predicate fires and the FK
+// INSERT in CommitAdoption fails with ON CASCADE NULL or constraint
+// failure.
+//
+// Calling HeartbeatBlobs from each §7.5.2 heartbeat site (including
+// the periodic ticker) keeps the in-flight member blobs' grace clocks
+// at "less than gc.heartbeat_interval old", well within
+// gc.blob_grace. The WHERE refcount <= 0 predicate ensures Rule 2's
+// strictly-positive crossing is preserved — once CommitAdoption Step
+// 4 lands and refcount_zeroed_at is set to NULL, subsequent
+// HeartbeatBlobs calls during the same writer-tick (or after) become
+// no-ops on those rows.
+//
+// Hashes that don't validate are filtered out (and a stub error is
+// returned with the count of skipped rows; callers may log or ignore).
+// A hash list that's entirely invalid still produces no DB write.
+func (c *Cache) HeartbeatBlobs(ctx context.Context, hashes []string) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+	// Filter to known-valid hashes. Defense-in-depth: hashes here
+	// come from in-memory state in the adoption goroutine, but the
+	// validBlobHash gate matches the schema CHECK and prevents any
+	// malformed value from entering the SQL IN-list.
+	valid := make([]string, 0, len(hashes))
+	for _, h := range hashes {
+		if validBlobHash(h) {
+			valid = append(valid, h)
+		}
+	}
+	if len(valid) == 0 {
+		return nil
+	}
+	// Build the IN clause. Only literal '?' placeholders are
+	// emitted — the hashes go through ExecContext as bound args.
+	args := make([]any, 0, len(valid)+1)
+	args = append(args, nowUnix())
+	ph := make([]byte, 0, 2*len(valid))
+	for i, h := range valid {
+		if i > 0 {
+			ph = append(ph, ',')
+		}
+		ph = append(ph, '?')
+		args = append(args, h)
+	}
+	q := `UPDATE blob SET refcount_zeroed_at = ? WHERE refcount <= 0 AND hash IN (` + string(ph) + `)`
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("HeartbeatBlobs: %w", err)
+		}
+		return nil
+	})
+}
