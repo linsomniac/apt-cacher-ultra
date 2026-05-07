@@ -529,16 +529,23 @@ func (c *Config) Validate() error {
 		// AIDEV-NOTE: parallel constraint for the §7.5.1 Rule 1 race
 		// window. Adoption's heartbeat-blobs ticker (§7.5.2 site 6,
 		// adoption.go heartbeat()→HeartbeatBlobs) refreshes
-		// blob.refcount_zeroed_at every heartbeat_interval. If
-		// heartbeat_interval >= blob_grace, an in-flight member blob
-		// can age past the §9.6.2 reap predicate's
-		// `refcount_zeroed_at < now - blob_grace` between two
-		// consecutive heartbeats — i.e. before CommitAdoption Step 4
-		// can bump refcount and clear the grace clock — and be
-		// reaped by GC mid-adoption. Refuse to start.
-		if c.GC.BlobGrace.Duration > 0 && c.GC.HeartbeatInterval.Duration >= c.GC.BlobGrace.Duration {
+		// blob.refcount_zeroed_at every heartbeat_interval. We need
+		// 2 × heartbeat_interval < blob_grace, not just
+		// heartbeat_interval < blob_grace: a single missed heartbeat
+		// (writer-queue stall, transient DB lock — both observable
+		// via adoption_heartbeat_blobs_failed) extends the gap to
+		// 2 × heartbeat_interval, and that worst-case gap must still
+		// fit inside the grace window. With only the weaker bound
+		// (e.g. heartbeat_interval=4m, blob_grace=5m), one missed
+		// heartbeat lets a member blob age 8m → past grace → reaped
+		// before CommitAdoption Step 4 can bump refcount. The
+		// stricter bound preserves safety across one missed
+		// heartbeat without operator action; further missed
+		// heartbeats are signalled at Warn so the operator notices
+		// before grace is at risk.
+		if c.GC.BlobGrace.Duration > 0 && 2*c.GC.HeartbeatInterval.Duration >= c.GC.BlobGrace.Duration {
 			errs = append(errs, fmt.Errorf(
-				"gc.heartbeat_interval (%s) must be strictly less than gc.blob_grace (%s) — otherwise in-flight member blobs can be reaped between heartbeats before CommitAdoption lands",
+				"gc.heartbeat_interval (%s) × 2 must be strictly less than gc.blob_grace (%s) — i.e. heartbeat_interval < blob_grace/2 — so one missed heartbeat (writer-queue stall, DB lock) does not let an in-flight member blob age past grace before the next refresh",
 				c.GC.HeartbeatInterval.Duration, c.GC.BlobGrace.Duration))
 		}
 	}

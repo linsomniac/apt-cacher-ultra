@@ -511,17 +511,22 @@ adds:
     upstream.max_retries, 30m)`); a heartbeat ticker that ticks
     slower than the grace can't bound the heartbeat-gap and would
     let GC reap a live adoption's *candidate snapshot* mid-fetch.
-  - `heartbeat_interval >= gc.blob_grace`. The §7.5.2 site 6
+  - `2 × heartbeat_interval >= gc.blob_grace`. The §7.5.2 site 6
     ticker also calls `cache.HeartbeatBlobs` (see §7.5.2 below)
     which refreshes `blob.refcount_zeroed_at` for in-flight
-    member blobs. If `heartbeat_interval >= blob_grace`, an
-    in-flight blob can age past the §9.6.2 reap predicate
-    between two consecutive heartbeats — i.e. before
-    `CommitAdoption` Step 4 lands and clears the grace clock —
-    and be reaped by GC mid-adoption, breaking the §7.5.1 Rule 1
-    race-window guarantee. The `gc_heartbeat_interval_unsafe`
-    Error class names *both* cross-key violations; the validation
-    error string identifies which bound was violated.
+    member blobs. The bound is `2×` (not `1×`): a single missed
+    heartbeat (writer-queue stall, transient DB lock — both
+    surface as `adoption_heartbeat_blobs_failed` Warn) extends
+    the worst-case heartbeat-gap to `2 × heartbeat_interval`,
+    and that gap must still fit inside `gc.blob_grace` so a
+    single failure doesn't let an in-flight blob age past the
+    §9.6.2 reap predicate before `CommitAdoption` Step 4 lands.
+    Without this margin (e.g. `heartbeat_interval = 4m,
+    blob_grace = 5m`), one missed heartbeat lets the blob age
+    8m → past grace → reaped mid-adoption. The
+    `gc_heartbeat_interval_unsafe` Error class names *both*
+    cross-key violations; the validation error string identifies
+    which bound was violated.
 
 Loud configurations (warning logs at startup):
 
@@ -812,18 +817,26 @@ do not need to refresh blob clocks (the ticker's bound is
 strictly tighter than any other heartbeat site by virtue of
 running on a fixed cadence).
 
-The cross-key validation `gc.heartbeat_interval < gc.blob_grace`
-(§5.2) makes this safe: the ticker fires at least once per
-grace window, so the `refcount_zeroed_at` of any in-flight
-member blob is bounded above by `heartbeat_interval` since
-the last refresh — well within `gc.blob_grace`.
+The cross-key validation
+`2 × gc.heartbeat_interval < gc.blob_grace` (§5.2) makes this
+safe across one transient failure: the ticker fires at least
+twice per grace window, so the `refcount_zeroed_at` of any
+in-flight member blob is bounded above by
+`heartbeat_interval` since the last refresh under healthy
+operation, and `2 × heartbeat_interval` if a single ticker
+fire's `HeartbeatBlobs` write fails — both within
+`gc.blob_grace`.
 
 A `HeartbeatBlobs` write failure is logged at Warn under
 `adoption_heartbeat_blobs_failed` and the adoption proceeds.
-The next ticker fire retries; absent a sustained writer-queue
-or DB stall (operator-visible), one missed heartbeat does not
-itself imperil any in-flight blob (the bound becomes
-`2 × heartbeat_interval`, still under `blob_grace`).
+The next ticker fire retries; the 2× margin in the
+heartbeat-vs-grace validation means one missed heartbeat does
+not itself imperil any in-flight blob. Repeated failures
+*can* let a blob age past grace (three consecutive misses
+would push the bound to `3 × heartbeat_interval`); the loud
+Warn line is the operator-visible signal to address the
+underlying stall (writer-queue saturation, DB lock contention,
+etc.) before it does.
 
 **Bound on heartbeat-gap.** With the ticker running, the gap
 between consecutive heartbeats is bounded by
@@ -1607,11 +1620,13 @@ None. GC runs entirely off the request path.
     — a heartbeat ticker that ticks slower than the candidate
     grace can't bound the heartbeat-gap, so the §9.6.3 reap
     predicate's safety argument collapses.
-  - `gc.heartbeat_interval >= gc.blob_grace` — the §7.5.2
-    site 6 ticker's `HeartbeatBlobs` write would fire less
-    often than the §9.6.2 reap predicate, letting an in-flight
-    member blob age past grace between two consecutive
-    heartbeats and be reaped mid-adoption.
+  - `2 × gc.heartbeat_interval >= gc.blob_grace` — the §7.5.2
+    site 6 ticker's `HeartbeatBlobs` write would not refresh
+    in-flight member blobs often enough to survive a single
+    missed heartbeat. The 2× factor accounts for one transient
+    failure (stall, DB lock, etc.) without the blob aging past
+    the §9.6.2 reap predicate before `CommitAdoption` Step 4
+    lands.
 
   The validation error string includes both the configured
   `heartbeat_interval` and the violated bound, so the operator

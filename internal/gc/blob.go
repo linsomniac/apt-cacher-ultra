@@ -96,12 +96,16 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 			// log rather than building a path that could escape
 			// pool/<prefix>/. The blob row is already gone (tallied
 			// above); the file is leaked until the next §9.6.4
-			// pool scan reaps it.
+			// pool scan reaps it. Count this toward
+			// pool_unlink_errors — `gc_run_complete` reports the
+			// disk-side leak count, and a skipped unlink is a leak
+			// just like an os.Remove that returned EIO.
 			if !validHashLite(r.Hash) {
 				g.cfg.Logger.Warn("gc_pool_unlink_skipped_invalid_hash",
 					"hash", r.Hash,
 					"size", r.Size,
 				)
+				unlinkErrors++
 				continue
 			}
 			path := g.poolPath(r.Hash)

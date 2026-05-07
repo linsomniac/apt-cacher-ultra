@@ -883,21 +883,25 @@ heartbeat_interval = "30m"
 	}
 }
 
-// heartbeat_interval >= blob_grace is unsafe even when both are well
-// under heartbeat_stale_grace_effective: the §7.5.2 site 6 ticker
-// refreshes blob.refcount_zeroed_at every heartbeat_interval, so a
-// heartbeat that ticks slower than blob_grace lets in-flight member
-// blobs age past the §9.6.2 reap predicate between two heartbeats.
-// 30s heartbeat with 30s blob_grace is at the equality boundary —
-// the validator uses strictly-less-than.
-func TestValidate_RejectsHeartbeatIntervalAtBlobGraceBoundary(t *testing.T) {
+// heartbeat_interval >= blob_grace/2 is unsafe even when both are
+// well under heartbeat_stale_grace_effective: the §7.5.2 site 6
+// ticker refreshes blob.refcount_zeroed_at every heartbeat_interval,
+// and a single missed write (writer-queue stall, transient DB lock)
+// extends the gap to 2 × heartbeat_interval. That worst-case gap
+// must still fit inside the grace window so one missed heartbeat
+// (loud at Warn under adoption_heartbeat_blobs_failed but otherwise
+// benign) doesn't let an in-flight blob age past grace.
+//
+// 30s heartbeat with 60s blob_grace is at the boundary —
+// 2 × 30s == 60s and the validator uses strictly-less-than.
+func TestValidate_RejectsHeartbeatIntervalAtBlobGraceHalfBoundary(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, "config.toml", `
 [cache]
 dir = "`+dir+`"
 [gc]
 heartbeat_interval = "30s"
-blob_grace = "30s"
+blob_grace = "60s"
 `)
 	_, err := Load(path)
 	if err == nil {
@@ -905,14 +909,37 @@ blob_grace = "30s"
 	}
 	if !strings.Contains(err.Error(), "gc.heartbeat_interval") ||
 		!strings.Contains(err.Error(), "gc.blob_grace") ||
-		!strings.Contains(err.Error(), "strictly less than") {
-		t.Errorf("error %q does not name the heartbeat-vs-blob-grace violation", err)
+		!strings.Contains(err.Error(), "× 2") {
+		t.Errorf("error %q does not name the 2x heartbeat-vs-blob-grace violation", err)
+	}
+}
+
+// heartbeat_interval = 4m with blob_grace = 5m is the original
+// motivating case: heartbeat_interval < blob_grace, but
+// 2 × 4m = 8m > 5m, so one missed heartbeat lets a member blob
+// age past grace.
+func TestValidate_RejectsHeartbeatIntervalNearBlobGrace(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[gc]
+heartbeat_interval = "4m"
+blob_grace = "5m"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "gc.heartbeat_interval") ||
+		!strings.Contains(err.Error(), "gc.blob_grace") {
+		t.Errorf("error %q does not name the 2x heartbeat-vs-blob-grace violation", err)
 	}
 }
 
 // heartbeat_interval > blob_grace is the more obvious form of the
 // same footgun: 2m ticker with 30s grace lets the grace window
-// elapse twice between heartbeats.
+// elapse multiple times between heartbeats.
 func TestValidate_RejectsHeartbeatIntervalAboveBlobGrace(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, "config.toml", `
