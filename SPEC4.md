@@ -39,13 +39,23 @@ maintenance edits to existing refcount-mutating SQL statements
    Same for adoptions cancelled by graceful shutdown (SPEC2 §9.5
    step 5). Phase 4 reaps candidates whose
    `suite_snapshot.heartbeat_at` (a new column written by the
-   adoption goroutine after every member fetch and every hot-
-   prefetch deb fetch — §7.5.2) is older than
+   adoption goroutine after every member fetch, every hot-
+   prefetch deb fetch, and on a periodic in-process ticker —
+   §7.5.2) is older than
    `max(upstream.total_timeout × upstream.max_retries, 30m)`.
    The bound applies to *time between heartbeats*, not total
-   adoption duration, so it strictly exceeds any single fetch's
-   worst-case wall-clock; a stale heartbeat is provably an
-   abandoned adoption.
+   adoption duration. With the periodic ticker (default
+   `gc.heartbeat_interval = 60s`) running for the adoption
+   goroutine's entire lifetime — covering Packages-parse,
+   hot-set computation, and writer-queue waits in addition to
+   the event-driven fetch sites — the heartbeat-gap is bounded
+   by `heartbeat_interval + writer-queue depth`, which under any
+   realistic deployment is two orders of magnitude under the
+   30m grace floor. A stale heartbeat is therefore *presumed
+   orphan*, not "provably orphan": the presumption fails only
+   under a sustained writer-queue stall on the order of minutes
+   (which would itself surface as elevated request latency long
+   before GC fires).
 
 3. **Reap displaced snapshots beyond a forensic retention window.**
    Once a `current_snapshot_id` flip displaces a prior snapshot,
@@ -120,9 +130,9 @@ rows are deleted in place.
 
 ### 4.2 Startup cleanup
 
-Phase 1's `tmp/` mtime sweep and Phase 2's `staging/` mtime sweep
-carry forward unchanged. Phase 4 adds two new startup-time passes,
-sequenced *after* the existing sweeps:
+Phase 1's `tmp/` mtime sweep carries forward unchanged. Phase 4
+adds two new startup-time passes, sequenced *after* the existing
+sweep and before listeners come up:
 
 1. **Pool/ orphan-file scan.** Walks `pool/<two-hex-prefix>/<hash>`
    directories; for each file, runs
@@ -143,22 +153,50 @@ Order matters: the pool scan runs first so its
 `gc_pool_orphans_repaired` count reflects only pre-existing orphan
 files (not files just created by GC's first periodic pass).
 
-Sequencing within `cache.Open`:
+**Sequencing.** The actual integration boundary is `main`, not
+`cache.Open`. `cache.Open` does (a) directory creation, (b)
+SQLite open, (c) `migrate(...)`, (d) writer-goroutine start, and
+returns. The post-open sweeps and Phase 4 passes are sequenced
+in `cmd/apt-cacher-ultra/main.go` immediately after `cache.Open`
+returns and before the freshness scheduler / integrity scanner /
+HTTP listener are constructed:
 
 ```
-1. SQLite open + migrate                      (Phase 1)
-2. tmp/ mtime sweep                           (Phase 1)
-3. staging/ mtime sweep                       (Phase 2)
-4. pool/ orphan-file scan                     (Phase 4 NEW, §4.2)
-5. one-shot GC pass                           (Phase 4 NEW, §4.2)
-6. listeners come up                          (Phase 1)
-7. periodic schedulers start                  (Phase 1, 2, 3, 4)
+in cache.Open:
+  1. mkdir pool/, tmp/, staging/                (Phase 1)
+  2. SQLite open + migrate                      (Phase 1)
+  3. writer goroutine starts                    (Phase 1)
+  -- cache.Open returns --
+
+in main, post-cache.Open, pre-listeners:
+  4. tmp/ mtime sweep                           (Phase 1, existing)
+  5. pool/ orphan-file scan                     (Phase 4 NEW)
+  6. one-shot GC pass                           (Phase 4 NEW)
+  7. construct freshness checker, integrity scanner, handler
+  8. start periodic schedulers (Phase 1/2/3/4)
+  9. listeners come up                          (Phase 1)
 ```
 
-The cache does not begin answering requests until step 6 — the
-startup GC pass is blocking, parallel to the existing migration
-step. Operators with very large pools should expect startup latency
-proportional to `pool/` size.
+Steps 5 and 6 are blocking — the cache does not begin answering
+requests until step 9. Operators with very large pools should
+expect startup latency proportional to `pool/` size; the worker
+pool and the `gc.pool_scan_workers` knob bound the I/O fanout
+but not the wall-clock floor for the pass.
+
+**`staging/` residue note.** Phase 2's adoption flow leaves
+`staging/<snapshot_id>/` directories that should be cleaned up
+as part of `runShared`'s normal exit path; they only persist as
+residue when the previous process crashed or shutdown cancelled
+mid-adoption (SPEC2 §9.5). There is no startup sweep over
+`staging/` in the current codebase; SPEC4 does not introduce
+one (out of scope for the Phase 4 contract). Residual
+`staging/` directories are a Phase 2 follow-up tracked
+separately; Phase 4 GC of `pool/` orphans does *not* cover
+`staging/` because the two layouts are content-addressed
+differently (`pool/` is `<hash[:2]>/<hash>`, `staging/` is
+`<snapshot_id>/`). An operator who restarts after a crashed
+adoption will see `staging/<snapshot_id>/` linger; manual
+cleanup (or a future Phase 4.x add-on) is the path forward.
 
 ### 4.3 SQLite schema
 
@@ -401,6 +439,26 @@ keep_displaced        = 3
 # Default 4, parallel to integrity.validate_at_rest_workers. Must
 # be >= 1.
 pool_scan_workers     = 4
+
+# Period of the in-process per-adoption heartbeat ticker (§7.5.2
+# site 6). Each adoption goroutine launches a sidecar goroutine
+# at runShared start; the sidecar wakes every heartbeat_interval
+# and submits a HeartbeatSnapshot write, exiting when runShared
+# returns. The interval bounds the heartbeat-gap during phases
+# the five event-driven sites do not cover (Packages-parse,
+# hot-set computation, writer-queue waits). Default 60s — small
+# enough that 60s + worst-case writer-queue traversal stays well
+# under the 30m grace floor; large enough that an adoption
+# burst's heartbeat-write rate stays in the noise relative to
+# the request-path write rate.
+#
+# Must be > 0s and strictly less than the runtime-derived
+# heartbeat_stale_grace_effective (max(total_timeout ×
+# max_retries, 30m)) — a heartbeat_interval >= grace is
+# pathological (the ticker can't bound the gap if the gap can
+# already exceed grace on a single missed tick). 0s is rejected
+# at load.
+heartbeat_interval    = "60s"
 ```
 
 ### 5.2 Config validation (deltas)
@@ -426,6 +484,14 @@ adds:
 - `gc.keep_displaced` parses as int, ≥ 0. 0 is permitted (means
   "no forensic retention").
 - `gc.pool_scan_workers` parses as int, ≥ 1.
+- `gc.heartbeat_interval` parses as duration, > 0. 0 is rejected
+  at load (a 0-interval ticker is an infinite busy-loop). Loaders
+  also reject `heartbeat_interval >= heartbeat_stale_grace_effective`
+  at startup with `gc_heartbeat_interval_unsafe` Error
+  (the runtime-derived grace is `max(upstream.total_timeout ×
+  upstream.max_retries, 30m)`); a heartbeat ticker that ticks
+  slower than the grace can't bound the heartbeat-gap and would
+  let GC reap live adoptions mid-fetch.
 
 Loud configurations (warning logs at startup):
 
@@ -528,9 +594,8 @@ never "reaped on the very next tick."
 INSERT INTO blob (hash, size, created_at, refcount, refcount_zeroed_at)
 VALUES (?, ?, ?, 0, ?)            -- both timestamps = now
 ON CONFLICT(hash) DO UPDATE
-   SET refcount_zeroed_at = IIF(blob.refcount <= 0,
-                                excluded.refcount_zeroed_at,
-                                blob.refcount_zeroed_at);
+   SET refcount_zeroed_at = excluded.refcount_zeroed_at
+ WHERE blob.refcount <= 0;
 ```
 
 The conflict path is **not** `DO NOTHING`. The reason is the
@@ -547,20 +612,26 @@ grace AND no FK references AND no `snapshot_member` references,
 and reap the blob. The freshly-fetched content disappears under
 the caller.
 
-`ON CONFLICT(hash) DO UPDATE SET refcount_zeroed_at = ...`
-restarts the grace clock to "now" whenever an orphaned blob
-(`refcount <= 0`) is reused, giving the caller a full
-`gc.blob_grace` window to land its FK reference. The `IIF`
-guard preserves the existing value when `refcount > 0` (the
-column is already NULL by §7.5.1 Rule 2; the IIF prevents a
-spurious write that wouldn't change anything but would still
-take the writer lock for an extra microsecond).
+`ON CONFLICT(hash) DO UPDATE SET refcount_zeroed_at =
+excluded.refcount_zeroed_at WHERE blob.refcount <= 0` restarts
+the grace clock to "now" whenever an orphaned blob (`refcount
+<= 0`) is reused, giving the caller a full `gc.blob_grace`
+window to land its FK reference. The `WHERE blob.refcount <= 0`
+predicate is on the conflict's UPDATE clause itself — when
+`blob.refcount > 0` SQLite skips the UPDATE entirely (no
+journal write, no row mutation, no writer-lock UPDATE step),
+which is materially better than an `IIF` that writes the
+column to its own existing value (the latter still takes the
+write path and bumps the page-cache dirty bit). On the hot
+path of a positive-refcount existing row colliding with a
+re-fetch, the conflict resolves with zero writes.
 
 The *other* invariants of `DO NOTHING` are preserved by the
 `ON CONFLICT DO UPDATE` body's narrow column list — `refcount`,
 `size`, and `created_at` are NOT in the SET list, so a
 freshly-arriving conflict cannot stomp on the existing row's
-refcount or rewrite its created_at. Only the GC clock moves.
+refcount or rewrite its created_at. Only the GC clock moves,
+and only when `refcount <= 0`.
 
 Once the caller's FK-bearing INSERT lands and Rule 2 increments
 `refcount` to a strictly positive value, Rule 2 sets
@@ -621,8 +692,8 @@ after failure).
 
 The heartbeat reframes the problem: instead of bounding total
 adoption duration, bound only the *time between heartbeats*.
-Adoption writes the heartbeat at five sites, sequenced to cover
-each phase of `runShared`:
+Adoption writes the heartbeat at six sites — five event-driven
+and one periodic — sequenced to cover each phase of `runShared`:
 
 1. **Row creation.** `InsertCandidateSnapshot` sets
    `heartbeat_at = created_at` on the new row's INSERT (and on
@@ -661,26 +732,52 @@ each phase of `runShared`:
    `runHotPrefetch` returning and `CommitAdoption` actually
    committing.
 
-**Bound on heartbeat-gap.** Between any two consecutive heartbeats
-the gap is exactly one of: (a) one upstream fetch's worst case
-(`upstream.total_timeout × upstream.max_retries`, ≤ 15m at default
-config — sites 2 and 4); (b) one Packages-parse worst case (sites
-2→3); or (c) one CommitAdoption submit + writer-queue depth
-(sites 4→5 plus 5→adopted_at-commit). Cases (b) and (c) are not
-themselves heartbeat-bounded — the spec relies on the §9.6.3 grace
-formula's `max(..., 30m)` floor to cover them. The 30m floor is
-generous: a 30m Packages parse implies the system is so loaded
-that adoption is unlikely to succeed at all, and a 30m writer-
-queue delay implies some other write path is monopolizing the
-queue (which would surface as elevated request latency long before
-GC fires).
+6. **Periodic in-process ticker.** A goroutine launched at the
+   start of `runShared` (alongside, but logically *parallel to*,
+   the main adoption flow) wakes every
+   `gc.heartbeat_interval` (default 60s) and submits a
+   `HeartbeatSnapshot` write. The ticker exits when `runShared`
+   returns (cooperative cancel via the same context that
+   propagates to the member-fetch loop). This site bounds the
+   heartbeat-gap independently of which phase `runShared` is in
+   — Packages-parse, hot-set computation, the gap from a
+   member-fetch to the next sub-call, the gap between
+   `runHotPrefetch` returning and `CommitAdoption` actually
+   running. Sites 1–5 keep their value as latency-fresh
+   event-driven heartbeats (a heartbeat written immediately
+   after a member fetch is more useful for monitoring than one
+   that drifts up to 60s later); the ticker is the *floor* under
+   them, not a replacement. A pathological case where every
+   single event-driven site silently fails is still bounded by
+   the ticker.
+
+**Bound on heartbeat-gap.** With the ticker running, the gap
+between consecutive heartbeats is bounded by
+`gc.heartbeat_interval + writer-queue depth`. The writer queue
+holds `writeBufferSize = 256` slots (`internal/cache/cache.go`),
+and the queue is FIFO with a single writer that runs each op to
+completion before pulling the next; under healthy load the
+through-rate is hundreds of ops/s and the queue is near-empty.
+Even under a writer-bound stall (every slot full, slowest op
+taking ~10s), queue-traversal time is bounded at low minutes.
+With a 60s ticker and ~5m worst-case queue traversal, the
+heartbeat-gap upper bound is ~6m — well under the §9.6.3 grace
+formula's 30m floor.
 
 The §9.6.3 grace bound
 `max(upstream.total_timeout × upstream.max_retries, 30m)` thus
 strictly exceeds the heartbeat-gap upper bound under any
 realistic deployment. A genuinely-stalled adoption (process
 killed mid-fetch, ctx cancel + drain, etc.) ages out within
-`grace + worst_case_fetch ≈ 2 × grace`.
+`grace + heartbeat_interval ≈ grace + 60s`.
+
+The presumption "stale heartbeat → orphan" fails only under a
+*sustained* writer-queue stall on the order of multiple minutes,
+which would itself surface as request-latency degradation
+(every Phase 1 hit-path eviction, every adoption commit, every
+freshness adoption goes through the same writer queue). This
+is an operator-visible failure mode, not a silent wrong
+adoption-reap.
 
 `HeartbeatSnapshot` runs as a small standalone write (not
 inside a larger transaction) — it does not block on or
@@ -787,14 +884,16 @@ re-picked-up next tick.
 ### 9.6 Garbage collection (NEW)
 
 The Phase 4 GC subsystem runs as a single dedicated goroutine,
-started after `cache.Open` completes its startup sequence (§4.2)
-and before listeners come up. It owns four reap classes — three
+started in `main` after the §4.2 startup sequence (steps 5–6 —
+pool scan and one-shot GC pass) completes and before listeners
+come up (§4.2 step 9). It owns four reap classes — three
 periodic, one startup-only.
 
 #### 9.6.1 Goroutine lifecycle
 
 ```
-on startup (in §4.2 step 5, blocking):
+on startup (in §4.2 step 6, blocking; §4.2 step 5 — the pool
+scan — runs first and is independent of this loop):
   deadline := now + gc.max_tick_duration
   1. Run snapshot GC pass (§9.6.3, batched, deadline-bounded)
   2. Run blob GC pass     (§9.6.2, batched, deadline-bounded)
@@ -1095,12 +1194,72 @@ for {
         // remaining backlog is picked up next tick.
         return nil
     }
-    candidateIDs := selectSnapshotGCCandidates(...)  // §9.6.3 union
-    if len(candidateIDs) == 0 { return nil }
-    if err := deleteSnapshotsBatch(ctx, candidateIDs); err != nil {
-        return err
+    // runOneSnapshotGCBatch is submitted via Cache.submitWrite; the
+    // SELECT and the three cascade DELETEs all run inside ONE writer
+    // tx (see "liveness revalidation at delete time" below).
+    reaped, err := runOneSnapshotGCBatch(ctx, ...)
+    if err != nil { return err }
+    if reaped == 0 { return nil }   // no more candidates
+}
+```
+
+**Liveness revalidation at delete time.** The candidate SELECT
+runs *inside* the same writer-locked transaction as the cascade
+DELETEs, not before. Phase 1's single-writer SQLite (§9.4) means
+no other writer goroutine can interleave between the SELECT and
+the DELETEs — `HeartbeatSnapshot` writes (§7.5.2),
+`CommitAdoption`'s atomic flip (Phase 2 §7.5), and any
+`InsertCandidateSnapshot` for an orphan-reuse race all serialize
+through `Cache.submitWrite`, the same channel that submits the
+GC batch op. Two writes never run in parallel. So if the SELECT
+includes snapshot `S`, and a heartbeat for `S` would have raced
+in, that heartbeat's submit either landed before this tx (in
+which case the SELECT inside this tx already sees the fresh
+`heartbeat_at` and excludes `S`) or after this tx (in which case
+`S` is reaped before the heartbeat can land, and the heartbeat
+UPDATE then matches zero rows — the documented benign failure).
+
+If the SELECT were submitted as a separate read and the candidate
+ID list were then passed into a *second* submit for the DELETE,
+the read connection (from the standard pool, not the writer
+goroutine) would observe a snapshot that the writer might mutate
+between submissions. That is the bug this revalidation closes.
+
+Inside the single submitWrite op, then:
+
+```go
+// runOneSnapshotGCBatch — runs as one writer-tx op:
+tx, err := conn.BeginTx(ctx, nil)
+if err != nil { return 0, err }
+defer tx.Rollback() // no-op after Commit succeeds
+
+// SELECT candidate IDs WITH the full liveness predicate, inside
+// the tx. Bind :now to a single fixed wall-clock value so the
+// arithmetic for sub-job A's heartbeat-grace check is consistent
+// across the SELECT and any follow-up assertions.
+candidateIDs, classByID, err := selectSnapshotGCCandidates(ctx, tx, ...)
+if err != nil { return 0, err }
+if len(candidateIDs) == 0 {
+    return 0, tx.Commit()         // empty tx; commit is a no-op
+}
+
+// Three cascade DELETEs by ID. The single-writer guarantee plus
+// the in-tx SELECT means the predicate held at SELECT time still
+// holds at DELETE time; we don't need to repeat the predicate in
+// each DELETE's WHERE clause. (We *could* — it would be defensive
+// and make the SQL self-documenting — but it would be redundant
+// under the single-writer model.)
+for _, stmt := range []string{
+    "DELETE FROM snapshot_member WHERE snapshot_id IN (...)",
+    "DELETE FROM package_hash    WHERE snapshot_id IN (...)",
+    "DELETE FROM suite_snapshot  WHERE snapshot_id IN (...)",
+} {
+    if _, err := tx.ExecContext(ctx, stmt, ids...); err != nil {
+        return 0, err
     }
 }
+
+return len(candidateIDs), tx.Commit()
 ```
 
 The candidate-id select is the union of the two sub-jobs below,
@@ -1143,13 +1302,22 @@ counts for the §10 `gc_run_complete.orphan_candidates_reaped` and
 derived from the runtime config, not a separate `[gc]` key. As
 detailed in §7.5.2 this bounds the *time-between-heartbeats*,
 not total adoption duration; with adoption writing `heartbeat_at`
-at the five sites in §7.5.2 the worst-case heartbeat-gap is
-strictly within the grace bound.
+at the five event-driven sites plus the periodic
+`gc.heartbeat_interval` ticker in §7.5.2, the worst-case
+heartbeat-gap is bounded by `heartbeat_interval + writer-queue
+depth` — strictly within the grace bound under any deployment
+that hasn't already failed-loud on writer-queue saturation.
 
 A candidate row with `heartbeat_at` older than the grace is
-provably orphaned: the adoption goroutine that owned it either
-crashed, was cancelled, or has stalled past any plausible
-upstream-fetch timeout. Reaping is safe.
+*presumed* orphaned: the adoption goroutine that owned it
+either crashed, was cancelled, or has stalled past any plausible
+upstream-fetch timeout *and* past the periodic ticker's
+heartbeat schedule. The §10.2
+`adoption_heartbeat_failed` Warn is the early signal that the
+presumption may not hold for a particular adoption (repeated
+heartbeat-write failures can let a live adoption's
+`heartbeat_at` age past grace); the operator can address that
+loudly-visible failure mode before GC fires.
 
 Pre-v4 candidate rows have `heartbeat_at = created_at` from the
 migration backfill (§4.3.2). On the first post-migration GC
@@ -1185,12 +1353,13 @@ The `keep_displaced` value is `gc.keep_displaced` from config
 (default 3). 0 means "no forensic retention" and reaps every
 displaced snapshot on the next tick.
 
-**Per-batch cascade DELETE** (one transaction per batch; both
-sub-jobs unioned into one candidate id list and deleted
-together):
+**Per-batch cascade DELETE** (one transaction per batch; the
+in-tx SELECT above plus the three DELETEs all run inside the same
+`submitWrite` op, holding the writer lock from BEGIN to COMMIT):
 
 ```sql
 BEGIN
+  -- (Sub-job A ∪ Sub-job B SELECT, ID list captured into Go memory)
   DELETE FROM snapshot_member WHERE snapshot_id IN (?, ?, ...);
   DELETE FROM package_hash    WHERE snapshot_id IN (?, ?, ...);
   DELETE FROM suite_snapshot  WHERE snapshot_id IN (?, ?, ...);
@@ -1232,7 +1401,7 @@ tick for blob reaping.
 
 #### 9.6.4 Pool/ orphan-file scan (startup-only)
 
-Already specified in §4.2 step 4. Walks `pool/<two-hex-prefix>/<hash>`
+Already specified in §4.2 step 5. Walks `pool/<two-hex-prefix>/<hash>`
 directories, runs `SELECT 1 FROM blob WHERE hash = ?` for each
 file, unlinks files with no matching row. Worker pool sized at
 `gc.pool_scan_workers`. Cancellable.
@@ -1243,6 +1412,22 @@ only`); a file in `pool/` whose name doesn't satisfy that shape
 is suspicious enough that it triggers a `gc_pool_malformed_name`
 Warn (§10) — the file is left alone (don't delete files we don't
 recognize), but the operator is told.
+
+Additionally, the scan validates that the file's parent
+directory matches `hash[:2]`. `Cache.BlobPath(hash)` always
+resolves to `pool/<hash[:2]>/<hash>`; a file at
+`pool/<wrong-prefix>/<hash>` is unreachable by request-path
+lookups regardless of whether a `blob` row exists for that
+hash. Such files are not reaped (the SELECT-by-hash already
+treats them as "row exists" if any blob row matches), but they
+*are* logged at Warn under `gc_pool_misplaced_file` (§10.2)
+with `path`, `expected_prefix=hash[:2]`, and
+`actual_prefix=<actual>`. Auto-repair (move the file or unlink
+it) is rejected: a misplaced file may itself be the result of
+a bug elsewhere (manual operator copy, a previous-version
+filesystem layout) that the operator should diagnose before
+the daemon mutates state. Logging-only is the conservative
+posture.
 
 ---
 
@@ -1271,9 +1456,12 @@ None. GC runs entirely off the request path.
   - `pool_orphan_bytes_repaired` — corresponding byte count
   - `pool_unlink_errors` — count of unlink errors (other than
     `ErrNotExist`) encountered this run
-  - `deadline_reached` — bool, true if the §9.6.2 per-tick
-    deadline fired before the candidate set drained (i.e. there
-    is residual backlog the next tick will pick up)
+  - `deadline_reached` — bool, true if the §9.6.1 per-tick
+    deadline fired in *either* the snapshot pass (§9.6.3) or
+    the blob pass (§9.6.2) before that pass's candidate set
+    drained (i.e. there is residual backlog the next tick will
+    pick up). The tick's `gc_tick_deadline_reached` event names
+    which sub-pass tripped via its `which` field.
   - `duration_ms` — wall-clock for the run
 
   The empty-tick case (`blobs_reaped=0 orphan_candidates_reaped=0
@@ -1319,13 +1507,40 @@ None. GC runs entirely off the request path.
   adoption may make GC reap the candidate; this is the operator-
   visible signal of that risk.
 
+- **`gc_heartbeat_interval_unsafe`** Error at config-load when
+  `gc.heartbeat_interval >= heartbeat_stale_grace_effective`
+  (= `max(upstream.total_timeout × upstream.max_retries, 30m)`).
+  Fields: `heartbeat_interval`, `grace_effective`. Loaders
+  reject the config; the daemon does not start. A heartbeat
+  ticker that ticks slower than the grace can't bound the
+  heartbeat-gap, so the §9.6.3 reap predicate's safety
+  argument collapses; refusing to start is safer than starting
+  with a configuration that can silently reap live adoptions.
+
+- **`gc_pool_scan_dir_failed`** Warn when the §9.6.4 startup
+  scan can't read a `pool/<prefix>/` directory (e.g. EACCES,
+  EIO). Fields: `prefix`, `err`. The scan continues with the
+  remaining prefixes; the operator-visible signal is the Warn
+  line plus a non-zero `pool_unlink_errors`-equivalent count
+  on the next `gc_run_complete` (or, if scan failures dominate,
+  a `pool_orphans_repaired` count smaller than the disk's true
+  orphan count — only addressable manually).
+
+- **`gc_pool_misplaced_file`** Warn when the §9.6.4 startup
+  scan finds a file at `pool/<prefix>/<hash>` where
+  `prefix != hash[:2]`. Fields: `path` (relative to `pool/`),
+  `expected_prefix`, `actual_prefix`. The file is left in
+  place — automatic repair (move-and-overwrite, or unlink) has
+  too many ways to lose a still-referenced blob to the request
+  path. Operator decides what to do.
+
 ### 10.3 Startup config dump (additions)
 
 Phase 1's startup config dump (Phase 1 §10.3 carry-forward) adds
-the `[gc]` block (all eight keys: `enabled`, `interval`,
+the `[gc]` block (all nine keys: `enabled`, `interval`,
 `batch_size`, `snapshot_batch_size`, `max_tick_duration`,
-`blob_grace`, `keep_displaced`, `pool_scan_workers`) verbatim,
-with one synthesized field:
+`blob_grace`, `keep_displaced`, `pool_scan_workers`,
+`heartbeat_interval`) verbatim, with one synthesized field:
 
 - `gc.heartbeat_stale_grace_effective` — the runtime-derived
   grace `max(upstream.total_timeout × upstream.max_retries, 30m)`
@@ -1349,9 +1564,11 @@ SPEC3 §11) carries forward exactly. Phase 4 adds:
 | `os.Remove` on reaped blob fails with EPERM / EROFS | `gc_pool_unlink_failed` Warn. DB row already DELETEd. File leaks until next startup scan. Operator-visible signal: the Warn line plus a non-zero `pool_unlink_errors` field on the next `gc_run_complete`. |
 | Orphan candidate snapshot whose adoption stops heartbeating past the grace, then resumes and tries to commit | `CommitAdoption`'s final `UPDATE suite_snapshot SET adopted_at = ?` would update zero rows on a reaped candidate; downstream FK-bearing INSERTs fail. The adoption transaction rolls back; bytes already in `pool/` keep their refcount and become reapable on a later pass once nothing references them. The adoption goroutine logs `adoption_run_failed` Warn. The heartbeat-based grace makes this race vanishingly rare: stalls must exceed `max(total_timeout × max_retries, 30m)` of *no heartbeat updates*, not total adoption duration. |
 | Repeated `adoption_heartbeat_failed` for the same in-flight adoption | The candidate's `heartbeat_at` ages; once stale-grace elapses the candidate is reapable. If the adoption resumes and writes a successful heartbeat before reap fires, the row stays. The Warn line is the operator-visible early signal; `gc.blob_grace` and `keep_displaced` decisions can be informed by its rate. |
+| Snapshot GC SELECT picks ID `S`; concurrent adoption tries to heartbeat or commit `S` between SELECT and DELETE | Cannot occur under §9.6.3's single-writer-tx ordering: the SELECT and the three cascade DELETEs run in the same `submitWrite` op, and `HeartbeatSnapshot` / `CommitAdoption` / `InsertCandidateSnapshot` all serialize through the same writer goroutine. The interleaving's heartbeat write either lands before this tx (SELECT excludes `S`) or after this tx (DELETE has already removed `S`; the heartbeat UPDATE matches zero rows — benign). |
 | Per-tick wall-clock budget (`gc.max_tick_duration`) trips during snapshot pass | Snapshot pass exits between batches. `gc_tick_deadline_reached{which="snapshot"}` Info + `gc_run_complete.deadline_reached = true`. Blob pass receives an already-expired deadline and exits immediately. Next tick re-runs both. |
 | Per-tick wall-clock budget trips during blob pass | Blob pass exits between batches. `gc_tick_deadline_reached{which="blob"}` Info + `gc_run_complete.deadline_reached = true`. Next tick picks up the residual. |
-| Pool/ scan worker fails to read a `pool/<prefix>/` directory | Per-worker error; logged at Warn under a generic `pool_scan_dir_failed` event with `prefix` and `err`. The scan continues with other prefixes. |
+| Pool/ scan worker fails to read a `pool/<prefix>/` directory | Per-worker error; logged at Warn under `gc_pool_scan_dir_failed` (§10.2) with `prefix` and `err`. The scan continues with other prefixes. |
+| Pool/ scan worker finds a file at `pool/<prefix>/<hash>` whose name is a valid sha256-hex but whose prefix does not equal `hash[:2]` | Logged at Warn under `gc_pool_misplaced_file` (§10.2) with `path`, `expected_prefix`, `actual_prefix`. File is left in place; the operator decides whether to move (to its hash[:2]-named prefix) or unlink. The mismatched file is unreachable by `Cache.BlobPath(hash)`, so it cannot satisfy a request even if a `blob` row exists for that hash. |
 | Migration v3 → v4 interrupted | Tx rolls back; next start retries from `schema_version = 3`. |
 
 ---
@@ -1376,10 +1593,13 @@ SPEC3 §12) carries forward exactly. Phase 4 adds:
     leaves `refcount`, `size`, and `created_at` untouched;
   - existing row at refcount=5 (positive) with NULL
     `refcount_zeroed_at`; a fresh `PutBlob` leaves all columns
-    untouched (the `IIF` guard suppresses the write);
+    untouched (the conflict's `WHERE blob.refcount <= 0` filter
+    skips the UPDATE entirely — verified by reading the row
+    after the call and asserting `refcount_zeroed_at IS NULL`
+    AND `created_at` unchanged);
   - existing row at refcount=-1 (transient negative) with old
     `refcount_zeroed_at`; the conflict update advances it to
-    `now` (the `<= 0` guard fires for negative).
+    `now` (the `<= 0` filter matches negative).
 - **GC reap predicate, full reachability.** The §9.6.2 SELECT
   returns the right candidate set across:
   - refcount=0, zeroed_at = now-grace+1s — excluded (grace)
@@ -1443,6 +1663,34 @@ SPEC3 §12) carries forward exactly. Phase 4 adds:
   (post-member-fetch, post-buildPackageHashes, post-deb-fetch in
   the hot loop, pre-CommitAdoption) verifies the heartbeat fires
   exactly once per site.
+- **Periodic heartbeat ticker.** Golden that the §7.5.2 site-6
+  ticker, given a synthetic adoption that runs for
+  `4 × gc.heartbeat_interval`, results in at least 3 ticker-
+  emitted `HeartbeatSnapshot` writes (allowing for one
+  start-of-run skew); the writes are observable in
+  `suite_snapshot.heartbeat_at` advancing monotonically; the
+  ticker exits cleanly when the adoption returns (no leaked
+  goroutine — verified via `runtime.NumGoroutine` delta). A
+  second golden injects a `runShared` that returns immediately
+  and asserts the ticker either never ticks or ticks at most
+  once (cancellation race window) — and exits.
+- **`gc.heartbeat_interval` cross-key validation.** Goldens
+  that `Validate` rejects:
+  - `heartbeat_interval = 0s` → `gc.heartbeat_interval must be > 0`
+  - `heartbeat_interval = 30m` with `upstream.total_timeout × max_retries = 5m`
+    (so `grace_effective = 30m`) → `gc.heartbeat_interval must
+    be strictly less than heartbeat_stale_grace_effective` (the
+    Error event `gc_heartbeat_interval_unsafe` fires at load).
+  - `heartbeat_interval = 60s` with default upstream config
+    (`grace_effective = 30m`) → accepted.
+- **Pool prefix-mismatch detection.** Golden that the §9.6.4
+  startup scan, given a file at `pool/00/abcd...` (where the
+  hash starts with `ab` and the prefix is `00`), emits exactly
+  one `gc_pool_misplaced_file` Warn with the right `path`,
+  `expected_prefix=ab`, `actual_prefix=00`; the file is NOT
+  unlinked; the corresponding `blob` row (if any) is left
+  alone; subsequent `BlobPath(hash)` resolves to the
+  `pool/ab/abcd...` location regardless.
 - **Migration v3 → v4.** Apply against a Phase 3 snapshot, verify
   schema; idempotent re-apply is a no-op; an interrupted migration
   rolls back cleanly; the backfill UPDATEs correctly populate
@@ -1568,6 +1816,16 @@ On the *next* tick, the displaced rows are eligible (assuming the
 keep-N window does not cover them). The
 `current_snapshot_id NOT IN` clause is the guarantee.
 
+A second variant covers the SELECT-DELETE liveness race: with
+snapshot `S` at `heartbeat_at < now - grace` and no current
+reference, fire a parallel `HeartbeatSnapshot(S)` and a
+parallel `CommitAdoption` flip on `S` *while* the GC batch's
+writer-tx is queued. Assert (a) the heartbeat / flip lands
+either strictly before or strictly after the GC tx (never
+mid-tx — the single-writer model precludes it), and (b) `S`
+either survives reap (heartbeat won the race) or is reaped
+(heartbeat lost) — with no observable in-between state.
+
 10-consecutive-runs gate.
 
 ### 12.6 Phase 4 chaos test: crash mid-batch
@@ -1643,15 +1901,23 @@ internal/
                          # heartbeat_at on insert and on the reuse
                          # path's refresh UPDATE (§7.5.2)
   freshness/
-    adoption.go          # heartbeats at five §7.5.2 sites:
-                         # row creation (delegated to cache),
-                         # post-adoptMember (in the member loop),
-                         # post-buildPackageHashes,
-                         # post-deb-fetch in runHotPrefetch,
-                         # pre-CommitAdoption
+    adoption.go          # heartbeats at six §7.5.2 sites:
+                         # 1) row creation (delegated to cache),
+                         # 2) post-adoptMember (in the member loop),
+                         # 3) post-buildPackageHashes,
+                         # 4) post-deb-fetch in runHotPrefetch,
+                         # 5) pre-CommitAdoption,
+                         # 6) periodic gc.heartbeat_interval
+                         #    ticker: a sidecar goroutine
+                         #    launched at runShared start,
+                         #    cancelled when runShared returns
   config/
     config.go            # [gc] block decoder + validation
-                         # (8 keys including snapshot_batch_size)
+                         # (9 keys including snapshot_batch_size
+                         # and heartbeat_interval, with a
+                         # cross-key guard that
+                         # heartbeat_interval <
+                         # heartbeat_stale_grace_effective)
 ```
 
 `go.mod` additions: none. The pure-Go `database/sql` + SQLite
@@ -1679,7 +1945,8 @@ Phase 4 is done when:
 3. The Phase 4 GC-vs-EvictURLPath chaos test (§12.4) passes 10
    consecutive runs.
 4. The Phase 4 GC-vs-displacement chaos test (§12.5) passes 10
-   consecutive runs.
+   consecutive runs for both variants (concurrent displacement
+   + the SELECT-DELETE liveness race).
 5. The Phase 4 crash-mid-batch chaos test (§12.6) passes 10
    consecutive runs.
 6. *(Deliberately dropped.)* The `v3 → v4` migration end-to-end
