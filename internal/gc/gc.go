@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -90,6 +91,58 @@ type Config struct {
 // scan + one-shot GC pass) blocking before listeners come up.
 type GC struct {
 	cfg Config
+
+	// lastRunMu guards lastRun. Writes happen at the end of each
+	// completed tick (Run goroutine and StartupPass — sequential, but
+	// the field is read concurrently by status-page handler and the
+	// metrics refresher).
+	lastRunMu sync.Mutex
+	lastRun   *LastRunSummary
+}
+
+// LastRunSummary is the SPEC5 §9.6 / §9.7.8 in-memory captured copy
+// of the most recently completed gc_run_complete payload. The
+// status-page handler renders this; the §9.7.6 refresher mirrors
+// fields into Phase 5 GC counters/gauges.
+type LastRunSummary struct {
+	Phase                   string  // "startup" | "periodic"
+	AtUnixTime              int64
+	DurationSeconds         float64
+	BlobsReaped             int
+	BytesReclaimed          int64
+	OrphanCandidatesReaped  int
+	DisplacedReaped         int
+	PoolOrphansRepaired     int
+	PoolOrphanBytesRepaired int64
+	PoolUnlinkErrors        int
+	DeadlineReached         bool
+}
+
+// LastRunSummary returns a copy of the most recently completed GC
+// run's summary, or (zero, false) when no run has completed since
+// process start. The returned struct is independent of subsequent
+// runs: the caller may retain it without locking.
+//
+// AIDEV-NOTE: SPEC5 §9.6 — this is a pure accessor, not a behavioral
+// change. Status-page handler (interactive) and metrics refresher
+// (30s cadence) both read this; the lock-hold is brief.
+func (g *GC) LastRunSummary() (LastRunSummary, bool) {
+	g.lastRunMu.Lock()
+	defer g.lastRunMu.Unlock()
+	if g.lastRun == nil {
+		return LastRunSummary{}, false
+	}
+	return *g.lastRun, true
+}
+
+// recordLastRun captures one completed tick's payload. Called at the
+// same emit site as the gc_run_complete log line. The store is a
+// pointer swap so the read path's defer-unlock copy is consistent —
+// no torn reads under -race.
+func (g *GC) recordLastRun(s LastRunSummary) {
+	g.lastRunMu.Lock()
+	g.lastRun = &s
+	g.lastRunMu.Unlock()
 }
 
 // New validates Config and returns a ready GC. Returns an error if
@@ -160,6 +213,7 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		return fmt.Errorf("gc startup: tick: %w", err)
 	}
 
+	duration := time.Since(start)
 	g.cfg.Logger.Info("gc_run_complete",
 		"phase", "startup",
 		"blobs_reaped", tick.blobsReaped,
@@ -170,8 +224,21 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		"pool_orphan_bytes_repaired", scan.orphanBytesRepaired,
 		"pool_unlink_errors", tick.poolUnlinkErrors+scan.unlinkErrors,
 		"deadline_reached", tick.deadlineReached,
-		"duration_ms", time.Since(start).Milliseconds(),
+		"duration_ms", duration.Milliseconds(),
 	)
+	g.recordLastRun(LastRunSummary{
+		Phase:                   "startup",
+		AtUnixTime:              time.Now().Unix(),
+		DurationSeconds:         duration.Seconds(),
+		BlobsReaped:             tick.blobsReaped,
+		BytesReclaimed:          tick.bytesReclaimed,
+		OrphanCandidatesReaped:  tick.orphanCandidatesReaped,
+		DisplacedReaped:         tick.displacedReaped,
+		PoolOrphansRepaired:     scan.orphansRepaired,
+		PoolOrphanBytesRepaired: scan.orphanBytesRepaired,
+		PoolUnlinkErrors:        tick.poolUnlinkErrors + scan.unlinkErrors,
+		DeadlineReached:         tick.deadlineReached,
+	})
 	return nil
 }
 
@@ -199,6 +266,7 @@ func (g *GC) Run(ctx context.Context) {
 			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				g.cfg.Logger.Warn("gc_tick_failed", "err", err)
 			}
+			duration := time.Since(start)
 			g.cfg.Logger.Info("gc_run_complete",
 				"phase", "periodic",
 				"blobs_reaped", tick.blobsReaped,
@@ -209,8 +277,21 @@ func (g *GC) Run(ctx context.Context) {
 				"pool_orphan_bytes_repaired", int64(0),
 				"pool_unlink_errors", tick.poolUnlinkErrors,
 				"deadline_reached", tick.deadlineReached,
-				"duration_ms", time.Since(start).Milliseconds(),
+				"duration_ms", duration.Milliseconds(),
 			)
+			g.recordLastRun(LastRunSummary{
+				Phase:                   "periodic",
+				AtUnixTime:              time.Now().Unix(),
+				DurationSeconds:         duration.Seconds(),
+				BlobsReaped:             tick.blobsReaped,
+				BytesReclaimed:          tick.bytesReclaimed,
+				OrphanCandidatesReaped:  tick.orphanCandidatesReaped,
+				DisplacedReaped:         tick.displacedReaped,
+				PoolOrphansRepaired:     0,
+				PoolOrphanBytesRepaired: 0,
+				PoolUnlinkErrors:        tick.poolUnlinkErrors,
+				DeadlineReached:         tick.deadlineReached,
+			})
 		}
 	}
 }

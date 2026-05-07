@@ -25,11 +25,28 @@ package metrics
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"sort"
 	"strings"
 	"sync"
 )
+
+// DefaultMaxSeries is the per-metric series cap applied to every
+// labeled metric constructed via NewCounter / NewHistogram / NewGauge.
+// SPEC5 §3.2 / §10.4 — bounds the worst-case Prometheus cardinality
+// regardless of how loose upstream.allowed_host_regex is. When a new
+// label-value tuple would push the metric's series count past this,
+// the Inc / Observe / Set call is silently dropped and a one-shot
+// metrics_series_cap_reached Warn fires for that metric. Existing
+// series continue to update normally.
+//
+// 1024 is generous enough that no realistic deployment hits it under
+// well-formed traffic, tight enough that a hostile or noisy client
+// cannot blow up Prometheus storage. Callers can override per-metric
+// via the WithCap constructor variants; cap=0 disables the bound for
+// unlabeled metrics or known-tiny-cardinality cases.
+const DefaultMaxSeries = 1024
 
 // labelKey joins label values into a stable map key. The separator
 // must be a byte that cannot appear inside a label value; \x00 fits
@@ -89,11 +106,13 @@ type metric interface {
 // Counter is a cumulative-since-process-start counter. Use Inc on
 // integer-counted events; Add for known-numeric increments.
 type Counter struct {
-	name   string
-	help   string
-	labels []string
-	mu     sync.Mutex
-	series map[string]*counterSeries
+	name      string
+	help      string
+	labels    []string
+	maxSeries int  // 0 = unbounded
+	mu        sync.Mutex
+	series    map[string]*counterSeries
+	capLogged bool // one-shot guard for metrics_series_cap_reached Warn
 }
 
 type counterSeries struct {
@@ -101,18 +120,37 @@ type counterSeries struct {
 	val    float64
 }
 
-// NewCounter declares a counter on the Default registry.
+// NewCounter declares a counter on the Default registry with the
+// DefaultMaxSeries cap.
 func NewCounter(name, help string, labelNames ...string) *Counter {
-	return NewCounterIn(Default, name, help, labelNames...)
+	return NewCounterWithCapIn(Default, name, help, DefaultMaxSeries, labelNames...)
 }
 
-// NewCounterIn declares a counter on the given registry.
+// NewCounterWithCap declares a counter on the Default registry with
+// an explicit per-metric series cap. Pass 0 to disable the cap.
+func NewCounterWithCap(name, help string, maxSeries int, labelNames ...string) *Counter {
+	return NewCounterWithCapIn(Default, name, help, maxSeries, labelNames...)
+}
+
+// NewCounterIn declares a counter on the given registry with the
+// DefaultMaxSeries cap.
 func NewCounterIn(r *Registry, name, help string, labelNames ...string) *Counter {
+	return NewCounterWithCapIn(r, name, help, DefaultMaxSeries, labelNames...)
+}
+
+// NewCounterWithCapIn is the full constructor: a registry and an
+// explicit cap. maxSeries=0 disables the cap.
+func NewCounterWithCapIn(r *Registry, name, help string, maxSeries int, labelNames ...string) *Counter {
+	if maxSeries < 0 {
+		panic(fmt.Sprintf("metrics: counter %q maxSeries=%d must be >= 0 (0 = unbounded)",
+			name, maxSeries))
+	}
 	c := &Counter{
-		name:   name,
-		help:   help,
-		labels: append([]string(nil), labelNames...),
-		series: map[string]*counterSeries{},
+		name:      name,
+		help:      help,
+		labels:    append([]string(nil), labelNames...),
+		maxSeries: maxSeries,
+		series:    map[string]*counterSeries{},
 	}
 	r.register(c)
 	return c
@@ -126,7 +164,10 @@ func (c *Counter) Inc(labelValues ...string) { c.Add(1, labelValues...) }
 
 // Add increments by delta. delta must be non-negative; negative or
 // non-finite deltas are silently dropped (counters do not move
-// backwards, and a NaN/Inf would corrupt the running sum).
+// backwards, and a NaN/Inf would corrupt the running sum). When the
+// per-metric series cap is reached, increments on a previously-seen
+// label tuple still apply; increments that would create a new series
+// are silently dropped (after a one-shot Warn).
 func (c *Counter) Add(delta float64, labelValues ...string) {
 	if delta < 0 || math.IsNaN(delta) || math.IsInf(delta, 0) {
 		return
@@ -139,6 +180,15 @@ func (c *Counter) Add(delta float64, labelValues ...string) {
 	c.mu.Lock()
 	s, ok := c.series[k]
 	if !ok {
+		if c.maxSeries > 0 && len(c.series) >= c.maxSeries {
+			firstHit := !c.capLogged
+			c.capLogged = true
+			c.mu.Unlock()
+			if firstHit {
+				logCapReached(c.name, c.maxSeries)
+			}
+			return
+		}
 		lv := append([]string(nil), labelValues...)
 		s = &counterSeries{values: lv}
 		c.series[k] = s
@@ -173,12 +223,14 @@ func (c *Counter) render(w io.Writer) {
 // schema. Bucket boundaries are upper bounds in ascending order; an
 // implicit +Inf bucket catches values above the last boundary.
 type Histogram struct {
-	name    string
-	help    string
-	labels  []string
-	buckets []float64
-	mu      sync.Mutex
-	series  map[string]*histogramSeries
+	name      string
+	help      string
+	labels    []string
+	buckets   []float64
+	maxSeries int
+	mu        sync.Mutex
+	series    map[string]*histogramSeries
+	capLogged bool
 }
 
 type histogramSeries struct {
@@ -188,14 +240,31 @@ type histogramSeries struct {
 	obsCount uint64
 }
 
-// NewHistogram declares a histogram on the Default registry. buckets
-// must be ascending and finite; an implicit +Inf bucket is appended.
+// NewHistogram declares a histogram on the Default registry with the
+// DefaultMaxSeries cap. buckets must be ascending and finite; an
+// implicit +Inf bucket is appended.
 func NewHistogram(name, help string, buckets []float64, labelNames ...string) *Histogram {
-	return NewHistogramIn(Default, name, help, buckets, labelNames...)
+	return NewHistogramWithCapIn(Default, name, help, buckets, DefaultMaxSeries, labelNames...)
 }
 
-// NewHistogramIn declares a histogram on the given registry.
+// NewHistogramWithCap declares a histogram on the Default registry
+// with an explicit per-metric series cap. Pass 0 to disable.
+func NewHistogramWithCap(name, help string, buckets []float64, maxSeries int, labelNames ...string) *Histogram {
+	return NewHistogramWithCapIn(Default, name, help, buckets, maxSeries, labelNames...)
+}
+
+// NewHistogramIn declares a histogram on the given registry with the
+// DefaultMaxSeries cap.
 func NewHistogramIn(r *Registry, name, help string, buckets []float64, labelNames ...string) *Histogram {
+	return NewHistogramWithCapIn(r, name, help, buckets, DefaultMaxSeries, labelNames...)
+}
+
+// NewHistogramWithCapIn is the full constructor.
+func NewHistogramWithCapIn(r *Registry, name, help string, buckets []float64, maxSeries int, labelNames ...string) *Histogram {
+	if maxSeries < 0 {
+		panic(fmt.Sprintf("metrics: histogram %q maxSeries=%d must be >= 0 (0 = unbounded)",
+			name, maxSeries))
+	}
 	for i, b := range buckets {
 		if math.IsNaN(b) || math.IsInf(b, 0) {
 			panic(fmt.Sprintf("metrics: histogram %q bucket[%d]=%v invalid", name, i, b))
@@ -205,11 +274,12 @@ func NewHistogramIn(r *Registry, name, help string, buckets []float64, labelName
 		}
 	}
 	h := &Histogram{
-		name:    name,
-		help:    help,
-		labels:  append([]string(nil), labelNames...),
-		buckets: append([]float64(nil), buckets...),
-		series:  map[string]*histogramSeries{},
+		name:      name,
+		help:      help,
+		labels:    append([]string(nil), labelNames...),
+		buckets:   append([]float64(nil), buckets...),
+		maxSeries: maxSeries,
+		series:    map[string]*histogramSeries{},
 	}
 	r.register(h)
 	return h
@@ -221,6 +291,9 @@ func (h *Histogram) metricName() string { return h.name }
 // NaN observations are dropped; +Inf is recorded only in the implicit
 // last bucket (everything-below-+Inf is unchanged), -Inf is dropped
 // because negative durations / sizes are nonsensical for our use.
+// When the per-metric series cap is reached, observations on a
+// previously-seen label tuple still apply; observations that would
+// create a new series are silently dropped (after a one-shot Warn).
 func (h *Histogram) Observe(v float64, labelValues ...string) {
 	if math.IsNaN(v) {
 		return
@@ -233,6 +306,15 @@ func (h *Histogram) Observe(v float64, labelValues ...string) {
 	h.mu.Lock()
 	s, ok := h.series[k]
 	if !ok {
+		if h.maxSeries > 0 && len(h.series) >= h.maxSeries {
+			firstHit := !h.capLogged
+			h.capLogged = true
+			h.mu.Unlock()
+			if firstHit {
+				logCapReached(h.name, h.maxSeries)
+			}
+			return
+		}
 		lv := append([]string(nil), labelValues...)
 		s = &histogramSeries{
 			values: lv,
@@ -290,11 +372,13 @@ func (h *Histogram) render(w io.Writer) {
 // Sample uses: in-flight request count, blob count from the last DB
 // snapshot, build_info=1.
 type Gauge struct {
-	name   string
-	help   string
-	labels []string
-	mu     sync.Mutex
-	series map[string]*gaugeSeries
+	name      string
+	help      string
+	labels    []string
+	maxSeries int
+	mu        sync.Mutex
+	series    map[string]*gaugeSeries
+	capLogged bool
 }
 
 type gaugeSeries struct {
@@ -302,18 +386,36 @@ type gaugeSeries struct {
 	val    float64
 }
 
-// NewGauge declares a gauge on the Default registry.
+// NewGauge declares a gauge on the Default registry with the
+// DefaultMaxSeries cap.
 func NewGauge(name, help string, labelNames ...string) *Gauge {
-	return NewGaugeIn(Default, name, help, labelNames...)
+	return NewGaugeWithCapIn(Default, name, help, DefaultMaxSeries, labelNames...)
 }
 
-// NewGaugeIn declares a gauge on the given registry.
+// NewGaugeWithCap declares a gauge on the Default registry with an
+// explicit per-metric series cap. Pass 0 to disable.
+func NewGaugeWithCap(name, help string, maxSeries int, labelNames ...string) *Gauge {
+	return NewGaugeWithCapIn(Default, name, help, maxSeries, labelNames...)
+}
+
+// NewGaugeIn declares a gauge on the given registry with the
+// DefaultMaxSeries cap.
 func NewGaugeIn(r *Registry, name, help string, labelNames ...string) *Gauge {
+	return NewGaugeWithCapIn(r, name, help, DefaultMaxSeries, labelNames...)
+}
+
+// NewGaugeWithCapIn is the full constructor.
+func NewGaugeWithCapIn(r *Registry, name, help string, maxSeries int, labelNames ...string) *Gauge {
+	if maxSeries < 0 {
+		panic(fmt.Sprintf("metrics: gauge %q maxSeries=%d must be >= 0 (0 = unbounded)",
+			name, maxSeries))
+	}
 	g := &Gauge{
-		name:   name,
-		help:   help,
-		labels: append([]string(nil), labelNames...),
-		series: map[string]*gaugeSeries{},
+		name:      name,
+		help:      help,
+		labels:    append([]string(nil), labelNames...),
+		maxSeries: maxSeries,
+		series:    map[string]*gaugeSeries{},
 	}
 	r.register(g)
 	return g
@@ -321,7 +423,9 @@ func NewGaugeIn(r *Registry, name, help string, labelNames ...string) *Gauge {
 
 func (g *Gauge) metricName() string { return g.name }
 
-// Set replaces the current value.
+// Set replaces the current value. When the per-metric series cap is
+// reached, Set on a previously-seen label tuple still applies; Set
+// on a new tuple is silently dropped (after a one-shot Warn).
 func (g *Gauge) Set(v float64, labelValues ...string) {
 	if math.IsNaN(v) {
 		return
@@ -334,6 +438,15 @@ func (g *Gauge) Set(v float64, labelValues ...string) {
 	g.mu.Lock()
 	s, ok := g.series[k]
 	if !ok {
+		if g.maxSeries > 0 && len(g.series) >= g.maxSeries {
+			firstHit := !g.capLogged
+			g.capLogged = true
+			g.mu.Unlock()
+			if firstHit {
+				logCapReached(g.name, g.maxSeries)
+			}
+			return
+		}
 		lv := append([]string(nil), labelValues...)
 		s = &gaugeSeries{values: lv}
 		g.series[k] = s
@@ -348,7 +461,9 @@ func (g *Gauge) Inc(labelValues ...string) { g.Add(1, labelValues...) }
 // Dec decrements by 1.
 func (g *Gauge) Dec(labelValues ...string) { g.Add(-1, labelValues...) }
 
-// Add adjusts by delta (signed).
+// Add adjusts by delta (signed). When the per-metric series cap is
+// reached, Add on a previously-seen tuple still applies; Add on a
+// new tuple is silently dropped (after a one-shot Warn).
 func (g *Gauge) Add(delta float64, labelValues ...string) {
 	if math.IsNaN(delta) {
 		return
@@ -361,6 +476,15 @@ func (g *Gauge) Add(delta float64, labelValues ...string) {
 	g.mu.Lock()
 	s, ok := g.series[k]
 	if !ok {
+		if g.maxSeries > 0 && len(g.series) >= g.maxSeries {
+			firstHit := !g.capLogged
+			g.capLogged = true
+			g.mu.Unlock()
+			if firstHit {
+				logCapReached(g.name, g.maxSeries)
+			}
+			return
+		}
 		lv := append([]string(nil), labelValues...)
 		s = &gaugeSeries{values: lv}
 		g.series[k] = s
@@ -375,9 +499,15 @@ func (g *Gauge) Add(delta float64, labelValues ...string) {
 //
 // AIDEV-NOTE: Reset is for refresher-driven gauges only. Do not call
 // from hot paths — race window between Reset and the next Set.
+//
+// Reset also clears the cap-logged guard so a future cap-reached
+// event can fire after the refresher has dropped stale series — the
+// previous cap-hit was relative to the prior series set, not the
+// new one.
 func (g *Gauge) Reset() {
 	g.mu.Lock()
 	g.series = map[string]*gaugeSeries{}
+	g.capLogged = false
 	g.mu.Unlock()
 }
 
@@ -513,6 +643,17 @@ func escapeHelp(h string) string {
 		}
 	}
 	return b.String()
+}
+
+// logCapReached emits the one-shot metrics_series_cap_reached Warn
+// fired by the per-metric cap path. SPEC5 §10.2 specifies the event
+// shape (one log line per metric per process lifetime). Centralized
+// here so the three concrete metric types share one source of
+// truth for the message format.
+func logCapReached(metricName string, cap int) {
+	slog.Default().Warn("metrics_series_cap_reached",
+		"metric_name", metricName,
+		"cap", cap)
 }
 
 // formatFloat prints f using minimal digits, matching Prometheus's

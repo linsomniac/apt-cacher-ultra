@@ -340,6 +340,77 @@ func TestGCEndToEnd_HotBlobNeverZeroed(t *testing.T) {
 // SPEC4 §12.2: pool/ orphan scan startup.
 // ---------------------------------------------------------------------------
 
+// TestLastRunSummary_BeforeAndAfter exercises the SPEC5 §9.6
+// accessor: returns (zero, false) before any run completes, and
+// (populated, true) after StartupPass.
+func TestLastRunSummary_BeforeAndAfter(t *testing.T) {
+	c := openTestCache(t)
+	logger, _ := captureLogger()
+
+	g, err := New(Config{
+		Cache:               c,
+		Logger:              logger,
+		Enabled:             true,
+		Interval:            time.Hour,
+		BatchSize:           100,
+		SnapshotBatchSize:   10,
+		MaxTickDuration:     time.Minute,
+		BlobGrace:           time.Hour,
+		KeepDisplaced:       3,
+		PoolScanWorkers:     2,
+		HeartbeatStaleGrace: 30 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Pre-run: (zero, false).
+	if summary, ok := g.LastRunSummary(); ok {
+		t.Errorf("LastRunSummary before run: ok=true, want false (summary=%+v)", summary)
+	}
+
+	if err := g.StartupPass(context.Background()); err != nil {
+		t.Fatalf("StartupPass: %v", err)
+	}
+
+	summary, ok := g.LastRunSummary()
+	if !ok {
+		t.Fatal("LastRunSummary after StartupPass: ok=false, want true")
+	}
+	if summary.Phase != "startup" {
+		t.Errorf("Phase = %q, want startup", summary.Phase)
+	}
+	if summary.AtUnixTime <= 0 {
+		t.Errorf("AtUnixTime = %d, want positive", summary.AtUnixTime)
+	}
+	if summary.DurationSeconds < 0 {
+		t.Errorf("DurationSeconds = %f, want >= 0", summary.DurationSeconds)
+	}
+	// Empty cache → zero counters.
+	if summary.BlobsReaped != 0 {
+		t.Errorf("BlobsReaped = %d, want 0 on empty cache", summary.BlobsReaped)
+	}
+}
+
+// TestLastRunSummary_IsCopy verifies the returned struct is
+// independent of subsequent runs — the caller can retain it without
+// re-locking.
+func TestLastRunSummary_IsCopy(t *testing.T) {
+	g := &GC{}
+	g.recordLastRun(LastRunSummary{Phase: "startup", BlobsReaped: 5})
+
+	s1, _ := g.LastRunSummary()
+	g.recordLastRun(LastRunSummary{Phase: "periodic", BlobsReaped: 99})
+
+	if s1.Phase != "startup" || s1.BlobsReaped != 5 {
+		t.Errorf("first snapshot mutated by second recordLastRun: %+v", s1)
+	}
+	s2, _ := g.LastRunSummary()
+	if s2.Phase != "periodic" || s2.BlobsReaped != 99 {
+		t.Errorf("second snapshot wrong: %+v", s2)
+	}
+}
+
 // TestStartupPass_PoolOrphans_ReapedAndCounted plants three orphan
 // pool files (no blob row) at correct prefixes and one referenced
 // pool file (blob row exists). StartupPass runs the pool scan + a

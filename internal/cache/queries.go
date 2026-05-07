@@ -214,6 +214,62 @@ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
 	return &s, nil
 }
 
+// ListSuitesWithAdoption returns every suite_freshness row LEFT JOINed
+// with suite_snapshot on current_snapshot_id = snapshot_id. The extra
+// adopted_at column is what the SPEC5 §9.7.3 status-page render needs
+// to show "this suite was last adopted at <timestamp>" without an
+// N+1 GetSuiteSnapshot lookup.
+//
+// AIDEV-NOTE: SPEC5 §9.7.8 — exists alongside ListSuites (which is
+// untouched and continues to back the periodic freshness scheduler);
+// the two helpers have different return shapes. Use ListSuites when
+// you only need freshness columns; use ListSuitesWithAdoption when
+// you need the snapshot's adopted_at too.
+//
+// CurrentAdoptedAt is nil when:
+//   - suite_freshness.current_snapshot_id IS NULL (suite never
+//     adopted), OR
+//   - suite_freshness.current_snapshot_id points at a snapshot_id
+//     that no longer exists (data-corruption case — should not
+//     happen under normal operation but the LEFT JOIN tolerates it
+//     so the status page renders), OR
+//   - the matching suite_snapshot row has adopted_at IS NULL (the
+//     candidate-but-not-adopted case — which would not be a
+//     "current" snapshot, but the LEFT JOIN doesn't filter on
+//     adopted_at to keep the query simple).
+func (c *Cache) ListSuitesWithAdoption(ctx context.Context) ([]SuiteWithAdoption, error) {
+	const q = `
+SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path,
+       sf.last_check_at, sf.last_success_at,
+       sf.inrelease_etag, sf.inrelease_lastmod, sf.inrelease_change_seen_at,
+       sf.current_snapshot_id, ss.adopted_at
+FROM suite_freshness sf
+LEFT JOIN suite_snapshot ss
+       ON ss.snapshot_id = sf.current_snapshot_id`
+	rows, err := c.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("ListSuitesWithAdoption: %w", err)
+	}
+	defer rows.Close()
+	var out []SuiteWithAdoption
+	for rows.Next() {
+		var s SuiteWithAdoption
+		if err := rows.Scan(
+			&s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
+			&s.LastCheckAt, &s.LastSuccessAt,
+			&s.InReleaseETag, &s.InReleaseLastMod, &s.InReleaseChangeSeenAt,
+			&s.CurrentSnapshotID, &s.CurrentAdoptedAt,
+		); err != nil {
+			return nil, fmt.Errorf("ListSuitesWithAdoption scan: %w", err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListSuitesWithAdoption iter: %w", err)
+	}
+	return out, nil
+}
+
 // ListSuites returns every suite_freshness row, in no guaranteed order.
 // Used by the periodic freshness scheduler (SPEC §7.4) to pick suites
 // whose last_success_at is older than periodic_refresh.

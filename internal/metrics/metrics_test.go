@@ -217,6 +217,154 @@ func TestRender_StableSeriesOrder(t *testing.T) {
 	}
 }
 
+// TestCounter_SeriesCap exercises SPEC5 §3.2 / §10.4 — at the cap,
+// new label tuples are silently dropped while existing series keep
+// updating.
+func TestCounter_SeriesCap(t *testing.T) {
+	r := freshReg(t)
+	c := NewCounterWithCapIn(r, "test_total", "h", 3, "outcome")
+
+	// Fill the cap with three distinct outcomes.
+	c.Inc("a")
+	c.Inc("b")
+	c.Inc("c")
+
+	// A 4th distinct outcome should be dropped.
+	c.Inc("d")
+	c.Inc("d") // and again, still dropped.
+
+	// Existing series keep working.
+	c.Inc("a")
+	c.Add(5, "b")
+
+	var buf bytes.Buffer
+	r.Render(&buf)
+	got := buf.String()
+
+	if !strings.Contains(got, `test_total{outcome="a"} 2`) {
+		t.Errorf("a-series should be 2 (one initial + one post-cap), got:\n%s", got)
+	}
+	if !strings.Contains(got, `test_total{outcome="b"} 6`) {
+		t.Errorf("b-series should be 6 (one initial + 5 post-cap), got:\n%s", got)
+	}
+	if !strings.Contains(got, `test_total{outcome="c"} 1`) {
+		t.Errorf("c-series should be 1, got:\n%s", got)
+	}
+	if strings.Contains(got, `test_total{outcome="d"}`) {
+		t.Errorf("d-series should not exist (cap reached); got:\n%s", got)
+	}
+}
+
+// TestHistogram_SeriesCap mirrors the Counter test for histograms.
+func TestHistogram_SeriesCap(t *testing.T) {
+	r := freshReg(t)
+	h := NewHistogramWithCapIn(r, "test_seconds", "h",
+		[]float64{1.0}, 2, "host")
+
+	h.Observe(0.5, "a")
+	h.Observe(0.5, "b")
+	h.Observe(0.5, "c") // dropped
+	h.Observe(0.5, "a") // existing series keeps updating
+
+	var buf bytes.Buffer
+	r.Render(&buf)
+	got := buf.String()
+
+	if !strings.Contains(got, `test_seconds_count{host="a"} 2`) {
+		t.Errorf("a should have 2 observations, got:\n%s", got)
+	}
+	if !strings.Contains(got, `test_seconds_count{host="b"} 1`) {
+		t.Errorf("b should have 1 observation, got:\n%s", got)
+	}
+	if strings.Contains(got, `test_seconds_count{host="c"}`) {
+		t.Errorf("c should not exist (cap reached); got:\n%s", got)
+	}
+}
+
+// TestGauge_SeriesCap mirrors the Counter test for gauges.
+func TestGauge_SeriesCap(t *testing.T) {
+	r := freshReg(t)
+	g := NewGaugeWithCapIn(r, "test_value", "h", 2, "host")
+
+	g.Set(1, "a")
+	g.Set(2, "b")
+	g.Set(3, "c") // dropped
+	g.Set(99, "a") // existing series keeps updating
+
+	var buf bytes.Buffer
+	r.Render(&buf)
+	got := buf.String()
+
+	if !strings.Contains(got, `test_value{host="a"} 99`) {
+		t.Errorf("a should be 99, got:\n%s", got)
+	}
+	if !strings.Contains(got, `test_value{host="b"} 2`) {
+		t.Errorf("b should be 2, got:\n%s", got)
+	}
+	if strings.Contains(got, `test_value{host="c"}`) {
+		t.Errorf("c should not exist (cap reached); got:\n%s", got)
+	}
+}
+
+// TestGauge_ResetClearsCapLog verifies that Reset re-enables the
+// one-shot cap-reached log so a refresher-driven gauge can flag a
+// fresh cap event after the refresher dropped its old series.
+func TestGauge_ResetClearsCapLog(t *testing.T) {
+	r := freshReg(t)
+	g := NewGaugeWithCapIn(r, "test_value", "h", 1, "host")
+
+	g.Set(1, "a")
+	g.Set(2, "b") // dropped, capLogged set
+	g.Reset()
+
+	g.Set(3, "c")
+	g.Set(4, "d") // dropped — but if Reset cleared capLogged, this
+	              // should re-fire the cap-log path internally.
+	// We can't easily assert the slog output here; what we CAN
+	// assert is that Reset cleared the series map, capLogged
+	// permits a fresh dropped-tuple, and only one series remains.
+	var buf bytes.Buffer
+	r.Render(&buf)
+	got := buf.String()
+	if !strings.Contains(got, `test_value{host="c"} 3`) {
+		t.Errorf("c should be 3 after Reset, got:\n%s", got)
+	}
+	if strings.Contains(got, `test_value{host="a"}`) ||
+		strings.Contains(got, `test_value{host="b"}`) ||
+		strings.Contains(got, `test_value{host="d"}`) {
+		t.Errorf("only c should remain, got:\n%s", got)
+	}
+}
+
+// TestNegativeMaxSeriesPanics verifies the guardrail: a negative cap
+// is a programming error and must not silently degrade.
+func TestNegativeMaxSeriesPanics(t *testing.T) {
+	r := freshReg(t)
+	defer func() {
+		if recover() == nil {
+			t.Error("expected panic on negative maxSeries")
+		}
+	}()
+	NewCounterWithCapIn(r, "bad", "h", -1)
+}
+
+// TestCounter_UnboundedCap (cap=0) keeps the legacy behavior — every
+// distinct tuple gets its own series.
+func TestCounter_UnboundedCap(t *testing.T) {
+	r := freshReg(t)
+	c := NewCounterWithCapIn(r, "test_total", "h", 0, "outcome")
+
+	for i := 0; i < 100; i++ {
+		c.Inc(itoa(int64(i)))
+	}
+	var buf bytes.Buffer
+	r.Render(&buf)
+	if strings.Count(buf.String(), "test_total{outcome=") != 100 {
+		t.Errorf("unbounded counter should have 100 series; output:\n%s",
+			buf.String())
+	}
+}
+
 func TestConcurrent_IncAndRender(t *testing.T) {
 	r := freshReg(t)
 	c := NewCounterIn(r, "concurrent_total", "h")

@@ -466,6 +466,147 @@ func TestListSuites(t *testing.T) {
 	}
 }
 
+// TestListSuitesWithAdoption exercises the SPEC5 §9.7.8 helper used
+// by the admin status page. It verifies the LEFT JOIN populates
+// CurrentAdoptedAt for adopted suites and leaves it nil for the
+// three "no current adoption" cases (NULL current_snapshot_id,
+// dangling current_snapshot_id, candidate-not-yet-adopted).
+func TestListSuitesWithAdoption(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+
+	// Empty cache → empty (non-nil semantics not guaranteed by Go's
+	// nil-vs-empty slice distinction; just check len).
+	got, err := c.ListSuitesWithAdoption(ctx)
+	if err != nil {
+		t.Fatalf("empty ListSuitesWithAdoption: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("empty ListSuitesWithAdoption returned %d rows", len(got))
+	}
+
+	// Build three suites covering the three reachable states:
+	//   "noble"   — adopted (current_snapshot_id → snapshot row with adopted_at)
+	//   "jammy"   — current_snapshot_id IS NULL (never adopted)
+	//   "bookworm"— current_snapshot_id pointing at a candidate row (adopted_at IS NULL)
+	// (The "dangling FK" data-corruption case the SPEC documents is
+	// not reproducible in tests because the suite_freshness FK on
+	// current_snapshot_id is enforced by the schema. The
+	// LEFT JOIN's tolerance for that case is belt-and-suspenders for
+	// a future schema change or restored-from-backup scenario, not
+	// a current normal-operation path.)
+	now := nowUnix()
+
+	// Adopt "noble".
+	hNoble := seedBlob(t, c, "noble InRelease")
+	idNoble, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "archive.ubuntu.com",
+		SuitePath:     "/ubuntu/dists/noble",
+		InReleaseHash: &hNoble,
+	})
+	if err != nil {
+		t.Fatalf("Insert noble: %v", err)
+	}
+	if err := c.CommitAdoption(ctx, idNoble, nil, nil, nil, false); err != nil {
+		t.Fatalf("CommitAdoption noble: %v", err)
+	}
+	// Seed suite_freshness for noble pointing at the adopted snapshot.
+	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+		CanonicalScheme:   "http",
+		CanonicalHost:     "archive.ubuntu.com",
+		SuitePath:         "/ubuntu/dists/noble",
+		LastSuccessAt:     &now,
+		CurrentSnapshotID: &idNoble,
+	}); err != nil {
+		t.Fatalf("Put noble: %v", err)
+	}
+
+	// "jammy" — never adopted (current_snapshot_id IS NULL).
+	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+		CanonicalScheme: "http", CanonicalHost: "archive.ubuntu.com",
+		SuitePath:     "/ubuntu/dists/jammy",
+		LastSuccessAt: &now,
+	}); err != nil {
+		t.Fatalf("Put jammy: %v", err)
+	}
+
+	// "bookworm" — candidate (adopted_at IS NULL). PutSuiteFreshness
+	// doesn't write current_snapshot_id (only CommitAdoption flips
+	// the pointer); raw UPDATE here for the candidate-pointer case.
+	hBook := seedBlob(t, c, "bookworm InRelease")
+	idBook, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "https", CanonicalHost: "deb.debian.org",
+		SuitePath:     "/debian/dists/bookworm",
+		InReleaseHash: &hBook,
+	})
+	if err != nil {
+		t.Fatalf("Insert bookworm: %v", err)
+	}
+	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+		CanonicalScheme: "https", CanonicalHost: "deb.debian.org",
+		SuitePath:     "/debian/dists/bookworm",
+		LastSuccessAt: &now,
+	}); err != nil {
+		t.Fatalf("Put bookworm: %v", err)
+	}
+	if _, err := c.db.ExecContext(ctx,
+		`UPDATE suite_freshness SET current_snapshot_id = ?
+		   WHERE canonical_host = 'deb.debian.org'
+		     AND suite_path = '/debian/dists/bookworm'`, idBook); err != nil {
+		t.Fatalf("update bookworm pointer: %v", err)
+	}
+
+	got, err = c.ListSuitesWithAdoption(ctx)
+	if err != nil {
+		t.Fatalf("ListSuitesWithAdoption: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d rows, want 3", len(got))
+	}
+	by := make(map[string]SuiteWithAdoption, len(got))
+	for _, r := range got {
+		by[r.SuitePath] = r
+	}
+
+	// Adopted suite — CurrentAdoptedAt populated.
+	if s, ok := by["/ubuntu/dists/noble"]; !ok {
+		t.Error("noble missing")
+	} else {
+		if s.CurrentAdoptedAt == nil {
+			t.Error("noble.CurrentAdoptedAt = nil, want populated")
+		}
+		if s.CurrentSnapshotID == nil || *s.CurrentSnapshotID != idNoble {
+			t.Errorf("noble.CurrentSnapshotID = %v, want %d", s.CurrentSnapshotID, idNoble)
+		}
+	}
+
+	// Never-adopted suite — CurrentAdoptedAt nil.
+	if s, ok := by["/ubuntu/dists/jammy"]; !ok {
+		t.Error("jammy missing")
+	} else {
+		if s.CurrentSnapshotID != nil {
+			t.Errorf("jammy.CurrentSnapshotID = %v, want nil", s.CurrentSnapshotID)
+		}
+		if s.CurrentAdoptedAt != nil {
+			t.Errorf("jammy.CurrentAdoptedAt = %v, want nil", *s.CurrentAdoptedAt)
+		}
+	}
+
+	// Candidate-but-not-adopted suite — CurrentAdoptedAt nil because
+	// the LEFT JOIN finds the row but its adopted_at is NULL.
+	if s, ok := by["/debian/dists/bookworm"]; !ok {
+		t.Error("bookworm missing")
+	} else {
+		if s.CurrentSnapshotID == nil || *s.CurrentSnapshotID != idBook {
+			t.Errorf("bookworm.CurrentSnapshotID mismatch: %v", s.CurrentSnapshotID)
+		}
+		if s.CurrentAdoptedAt != nil {
+			t.Errorf("bookworm.CurrentAdoptedAt = %v, want nil (candidate)", *s.CurrentAdoptedAt)
+		}
+	}
+
+}
+
 // TestConcurrentWrites verifies that the single-writer goroutine
 // serializes writes from many goroutines without SQLITE_BUSY errors.
 // This is the gating concurrency invariant for SPEC §9.4.

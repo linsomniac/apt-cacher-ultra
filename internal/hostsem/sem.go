@@ -123,3 +123,45 @@ func (s *Sem) HostCount() int {
 	defer s.mu.Unlock()
 	return len(s.slots)
 }
+
+// HostStat captures a single host's slot occupancy and capacity at
+// the moment Snapshot was called.
+type HostStat struct {
+	// Inflight is the count of currently-held tokens — i.e. callers
+	// that have a release closure they have not yet invoked.
+	Inflight int
+	// Capacity is the configured per-host slot count.
+	Capacity int
+}
+
+// Snapshot returns a point-in-time map of every active host's
+// (inflight, capacity) tuple. Hosts with zero refcount have already
+// been removed from the per-Sem map by dropRef, so the keys are
+// exactly the set of hosts with at least one acquire-or-waiter
+// outstanding. Waiters do not count toward Inflight: the channel
+// send happens only when a token is actually acquired (Acquire
+// blocks at `slot.ch <- struct{}{}`), so len(slot.ch) is the count
+// of currently-held tokens, not waiters + holders.
+//
+// AIDEV-NOTE: SPEC5 §9.3 / §10.4.2 — the formula is
+// Inflight = len(slot.ch), Capacity = cap(slot.ch). The buffered
+// channel fills as concurrency rises (Acquire SENDS on success,
+// Release RECEIVES). cap(slot.ch) equals s.limit; either is correct.
+//
+// Callers should treat the returned map as read-only. The lock is
+// held only for the duration of the for-range copy; the cost is one
+// allocation plus one memory copy per active host. Expected use:
+// the §9.7.6 refresher goroutine at admin.gauge_refresh cadence,
+// and the status-page handler at request time.
+func (s *Sem) Snapshot() map[string]HostStat {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]HostStat, len(s.slots))
+	for host, slot := range s.slots {
+		out[host] = HostStat{
+			Inflight: len(slot.ch),
+			Capacity: cap(slot.ch),
+		}
+	}
+	return out
+}

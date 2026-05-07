@@ -126,6 +126,17 @@ type SnapshotCoverage struct {
 	PackageCoverageComplete bool
 }
 
+// SuiteWithAdoption embeds SuiteFreshness and adds the
+// suite_snapshot.adopted_at corresponding to current_snapshot_id.
+// CurrentAdoptedAt is non-nil exactly when the LEFT JOIN found a
+// matching suite_snapshot row whose adopted_at is non-NULL — i.e.
+// the suite has a live current adoption. Returned by
+// ListSuitesWithAdoption (SPEC5 §9.7.8) for the status-page render.
+type SuiteWithAdoption struct {
+	SuiteFreshness
+	CurrentAdoptedAt *int64 // unix seconds; nil when current_snapshot_id is NULL or no matching suite_snapshot row exists
+}
+
 // HotSetEntry is one (.deb path, declared sha256) tuple that the SPEC3
 // §7.5.3 hot-set computation identified as worth proactively warming
 // before the candidate snapshot's atomic flip. Path is the canonical
