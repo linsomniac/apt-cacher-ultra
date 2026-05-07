@@ -1507,15 +1507,21 @@ None. GC runs entirely off the request path.
   adoption may make GC reap the candidate; this is the operator-
   visible signal of that risk.
 
-- **`gc_heartbeat_interval_unsafe`** Error at config-load when
+- **`gc_heartbeat_interval_unsafe`** is the named error class
+  surfaced by config validation when
   `gc.heartbeat_interval >= heartbeat_stale_grace_effective`
   (= `max(upstream.total_timeout × upstream.max_retries, 30m)`).
-  Fields: `heartbeat_interval`, `grace_effective`. Loaders
-  reject the config; the daemon does not start. A heartbeat
+  The validation error string includes both the configured
+  `heartbeat_interval` and the computed `grace_effective` so the
+  operator sees exactly which two values triggered rejection.
+  Loaders reject the config; the daemon does not start (i.e. the
+  error reaches the operator via the daemon's startup-failed exit
+  message rather than via a structured slog event — the config
+  logger is not yet installed at validation time). A heartbeat
   ticker that ticks slower than the grace can't bound the
-  heartbeat-gap, so the §9.6.3 reap predicate's safety
-  argument collapses; refusing to start is safer than starting
-  with a configuration that can silently reap live adoptions.
+  heartbeat-gap, so the §9.6.3 reap predicate's safety argument
+  collapses; refusing to start is safer than starting with a
+  configuration that can silently reap live adoptions.
 
 - **`gc_pool_scan_dir_failed`** Warn when the §9.6.4 startup
   scan can't read a `pool/<prefix>/` directory (e.g. EACCES,
@@ -1884,8 +1890,20 @@ internal/
     snapshot.go          # §9.6.3 snapshot GC pass
     pool_scan.go         # §9.6.4 startup pool/ orphan scan
     gc_test.go           # unit tests for §12.1
-    chaos_test.go        # chaos tests §12.3–§12.6
+    integration_test.go  # integration tests for §12.2
+    chaos_crash_mid_batch_test.go  # §12.6 chaos test
+                         # (the gc-package-level chaos test;
+                         # §12.3–§12.5 chaos tests live in
+                         # internal/cache/ — see below — because
+                         # they exercise package-private seams
+                         # like blobGCInterTxHook and stubNow)
   cache/
+    gc.go                # NEW — writer-tx handlers for the gc
+                         # package's sub-job calls:
+                         # RunBlobGCBatch (§9.6.2), inter-tx
+                         # SELECT-vs-DELETE seam blobGCInterTxHook
+                         # for §12.3 chaos tests, and
+                         # RunSnapshotGCBatch (§9.6.3)
     schema.go            # migrations[3] (v3 → v4) appended:
                          # adds refcount_zeroed_at, heartbeat_at,
                          # idx_blob_gc, idx_url_path_blob;
@@ -1900,6 +1918,11 @@ internal/
                          # InsertCandidateSnapshot extended to set
                          # heartbeat_at on insert and on the reuse
                          # path's refresh UPDATE (§7.5.2)
+    gc_test.go           # cache-side unit tests for the §9.6.2 /
+                         # §9.6.3 writer-tx handlers (subset of §12.1)
+    chaos_blob_gc_race_test.go     # §12.3 chaos test (4 variants)
+    chaos_evict_race_test.go       # §12.4 chaos test
+    chaos_snapshot_race_test.go    # §12.5 chaos test (2 variants)
   freshness/
     adoption.go          # heartbeats at six §7.5.2 sites:
                          # 1) row creation (delegated to cache),
