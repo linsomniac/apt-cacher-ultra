@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 )
 
 // ErrNotFound is returned when a row is absent. Callers should distinguish
@@ -360,6 +361,19 @@ SELECT DISTINCT ph.package_name, ph.architecture
 			// snapshots. Cannot prefetch a path that doesn't exist;
 			// drop from the hot set.
 			continue
+		}
+		// Sort within-pair matches by path so the budget-limited hot
+		// loop's chop is deterministic. The candidate slice arrives in
+		// adoption.go's `dedup` map iteration order, which Go
+		// randomizes; without this sort, two adoptions of the same
+		// Release could warm a different subset of paths under the
+		// same budget. Stage 1 already returns pairs ordered by
+		// (package_name, architecture) — pairing that with
+		// path-sorted matches makes the whole hot set deterministic.
+		if len(matches) > 1 {
+			sort.Slice(matches, func(i, j int) bool {
+				return matches[i].Path < matches[j].Path
+			})
 		}
 		for _, ph := range matches {
 			out = append(out, HotSetEntry{Path: ph.Path, DeclaredSHA256: ph.DeclaredSHA256})

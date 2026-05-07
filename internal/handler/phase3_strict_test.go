@@ -93,7 +93,7 @@ func newPhase3StrictHandlerCapturing(t *testing.T,
 		ConnectTimeout:   2 * time.Second,
 		TotalTimeout:     5 * time.Second,
 		MaxRetries:       1,
-		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`, `^::1$`},
 		DenyTargetRanges: nil,
 		Logger:           silentLogger(),
 	})

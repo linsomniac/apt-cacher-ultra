@@ -2806,19 +2806,25 @@ func TestComputeHotSet_DuplicatePackageArchEmitsAllPaths(t *testing.T) {
 	const idCandidate = int64(999)
 	hash2 := seedBlob(t, c, "dup-allowed v2")
 	hash3 := seedBlob(t, c, "dup-allowed v3")
+	// Provide the candidate slice in *reverse* path order so the
+	// determinism test below can confirm ComputeHotSet sorts within-
+	// pair matches by path (rather than preserving caller order). The
+	// production caller's slice arrives in Go map iteration order, so
+	// any reliance on input ordering would surface as flaky budget-
+	// limited prefetch sets.
 	cand := []PackageHash{
-		{
-			CanonicalScheme: scheme, CanonicalHost: host,
-			SnapshotID: idCandidate,
-			Path:       "/pool/main/d/dup/dup_2.0_amd64.deb",
-			DeclaredSHA256: hash2,
-			PackageName: "dup", Architecture: "amd64",
-		},
 		{
 			CanonicalScheme: scheme, CanonicalHost: host,
 			SnapshotID: idCandidate,
 			Path:       "/pool/main/d/dup/dup_3.0_amd64.deb",
 			DeclaredSHA256: hash3,
+			PackageName: "dup", Architecture: "amd64",
+		},
+		{
+			CanonicalScheme: scheme, CanonicalHost: host,
+			SnapshotID: idCandidate,
+			Path:       "/pool/main/d/dup/dup_2.0_amd64.deb",
+			DeclaredSHA256: hash2,
 			PackageName: "dup", Architecture: "amd64",
 		},
 	}
@@ -2829,15 +2835,13 @@ func TestComputeHotSet_DuplicatePackageArchEmitsAllPaths(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("got %d entries, want 2 (both candidate paths for the hot pair)", len(got))
 	}
-	seen := map[string]string{}
-	for _, e := range got {
-		seen[e.Path] = e.DeclaredSHA256
+	// Within-pair matches must come back sorted by path so a budget-
+	// limited prefetch loop warms the same prefix every time.
+	if got[0].Path != "/pool/main/d/dup/dup_2.0_amd64.deb" || got[0].DeclaredSHA256 != hash2 {
+		t.Errorf("got[0] = %+v, want path=dup_2.0 with hash2", got[0])
 	}
-	if seen["/pool/main/d/dup/dup_2.0_amd64.deb"] != hash2 {
-		t.Errorf("missing/wrong v2 entry: %v", seen)
-	}
-	if seen["/pool/main/d/dup/dup_3.0_amd64.deb"] != hash3 {
-		t.Errorf("missing/wrong v3 entry: %v", seen)
+	if got[1].Path != "/pool/main/d/dup/dup_3.0_amd64.deb" || got[1].DeclaredSHA256 != hash3 {
+		t.Errorf("got[1] = %+v, want path=dup_3.0 with hash3", got[1])
 	}
 }
 
