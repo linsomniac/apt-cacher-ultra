@@ -79,11 +79,16 @@ func main() {
 
 	configPath := flag.String("config", "/etc/apt-cacher-ultra/config.toml", "path to TOML config file")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	printAptConf := flag.Bool("print-apt-conf", false, "print recommended /etc/apt/apt.conf.d snippet and exit (SPEC6 §14.2)")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println(Version)
 		return
+	}
+
+	if *printAptConf {
+		os.Exit(runPrintAptConf(*configPath, os.Stdout, os.Stderr))
 	}
 
 	if err := run(*configPath); err != nil {
