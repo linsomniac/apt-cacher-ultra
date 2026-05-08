@@ -34,6 +34,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -114,8 +115,21 @@ func TestServe_HijackedHandshakeFails_EmitsTLSFailed(t *testing.T) {
 	})
 	hsCtx, hsCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer hsCancel()
-	if err := tlsClient.HandshakeContext(hsCtx); err == nil {
+	hsErr := tlsClient.HandshakeContext(hsCtx)
+	if hsErr == nil {
 		t.Fatalf("client-side handshake should have failed verification, got nil")
+	}
+	// Pin the failure mode: an empty RootCAs pool must fail with a
+	// trust-chain-rejection error. Without this, a server-side
+	// regression (no cert sent, wrong cert, premature close, alert
+	// from the server before our verification runs) could also
+	// satisfy "handshake returned non-nil" and hide a real bug. The
+	// F9 contract is specifically "client distrusts CA" — assert
+	// exactly that on the wire.
+	var unknownAuth x509.UnknownAuthorityError
+	var verifyErr *tls.CertificateVerificationError
+	if !errors.As(hsErr, &unknownAuth) && !errors.As(hsErr, &verifyErr) {
+		t.Fatalf("client handshake err = %v (%T); want x509.UnknownAuthorityError or *tls.CertificateVerificationError", hsErr, hsErr)
 	}
 
 	// Cancel the daemon to flush the handler's goroutine and
@@ -130,7 +144,14 @@ func TestServe_HijackedHandshakeFails_EmitsTLSFailed(t *testing.T) {
 		t.Fatalf("serveListeners did not return")
 	}
 
-	var found bool
+	// Walk every mitm_connect record. One CONNECT must produce
+	// exactly one. A regression that emitted, say, both tls_failed
+	// AND tunneled (or tls_failed AND inner_stream_failed) would
+	// otherwise slip past — the prior shape only checked
+	// tls_failed-ness and ignored unrelated emits, so a duplicate
+	// non-tls_failed record was silently allowed.
+	var connectRecs []map[string]any
+	var connectLines []string
 	for _, line := range strings.Split(strings.TrimSpace(sb.String()), "\n") {
 		if line == "" {
 			continue
@@ -142,29 +163,24 @@ func TestServe_HijackedHandshakeFails_EmitsTLSFailed(t *testing.T) {
 		if msg, _ := rec["msg"].(string); msg != "mitm_connect" {
 			continue
 		}
-		outcome, _ := rec["outcome"].(string)
-		if outcome != "tls_failed" {
-			// CONNECT may emit other mitm_connect lines (e.g. for the
-			// initial denied-host gate path) — only the tls_failed
-			// emit is what we're asserting reachability for.
-			continue
-		}
-		if found {
-			t.Errorf("more than one mitm_connect outcome=tls_failed; one CONNECT should produce exactly one\n%s", line)
-		}
-		found = true
-
-		if level, _ := rec["level"].(string); level != "WARN" {
-			t.Errorf("mitm_connect.level = %q, want WARN\n%s", level, line)
-		}
-		if host, _ := rec["host"].(string); host != "example.test" {
-			t.Errorf("mitm_connect.host = %q, want %q\n%s", host, "example.test", line)
-		}
-		if reason, _ := rec["reason"].(string); !strings.HasPrefix(reason, "tls:") {
-			t.Errorf("mitm_connect.reason = %q, want prefix %q\n%s", reason, "tls:", line)
-		}
+		connectRecs = append(connectRecs, rec)
+		connectLines = append(connectLines, line)
 	}
-	if !found {
-		t.Errorf("no mitm_connect outcome=tls_failed log line emitted; the failed handshake should have produced one\nlogs:\n%s", sb.String())
+	if len(connectRecs) != 1 {
+		t.Fatalf("got %d mitm_connect records, want 1; full set:\n%s", len(connectRecs), strings.Join(connectLines, "\n"))
+	}
+	rec := connectRecs[0]
+	line := connectLines[0]
+	if outcome, _ := rec["outcome"].(string); outcome != "tls_failed" {
+		t.Errorf("mitm_connect.outcome = %q, want %q\n%s", outcome, "tls_failed", line)
+	}
+	if level, _ := rec["level"].(string); level != "WARN" {
+		t.Errorf("mitm_connect.level = %q, want WARN\n%s", level, line)
+	}
+	if host, _ := rec["host"].(string); host != "example.test" {
+		t.Errorf("mitm_connect.host = %q, want %q\n%s", host, "example.test", line)
+	}
+	if reason, _ := rec["reason"].(string); !strings.HasPrefix(reason, "tls:") {
+		t.Errorf("mitm_connect.reason = %q, want prefix %q\n%s", reason, "tls:", line)
 	}
 }
