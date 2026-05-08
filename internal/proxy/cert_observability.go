@@ -70,14 +70,17 @@ func (c *CertHitRate) Note(hit bool) {
 }
 
 // Last60s returns the (hits, misses) totals across the last 60s
-// window. Buckets older than the window are excluded.
+// window. Buckets older than the window are excluded; buckets dated
+// in the future relative to the current clock are also excluded so
+// a backward clock jump (only reachable via SetClockForTest in
+// tests) cannot resurrect stale samples.
 func (c *CertHitRate) Last60s() (hits, misses int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := int64(c.nowFn().Sub(c.start) / time.Second)
 	cutoff := now - 60
 	for _, b := range c.buckets {
-		if b.second > cutoff {
+		if b.second > cutoff && b.second <= now {
 			hits += b.hits
 			misses += b.misses
 		}

@@ -38,9 +38,11 @@ type statusModel struct {
 // Enabled is false the MarshalJSON below emits exactly
 // `{"enabled": false}`; full payload otherwise.
 //
-// LastIssuedAtUnixTime is *int64 so encoding/json renders nil as
-// JSON null when no issuance has been recorded — the same
-// "absent vs present" distinction gcInfo uses for last_run_unixtime.
+// LastIssued and HitRate60sPercent are pointer-typed so encoding/json
+// renders nil as JSON null when no issuance has been recorded /
+// no lookups in the 60s window — the same "absent vs present"
+// distinction gcInfo uses for last_run_unixtime, so consumers can
+// tell "no data" apart from a real zero/empty.
 type tlsMITMInfo struct {
 	Enabled             bool            `json:"enabled"`
 	CASource            string          `json:"ca_source"`

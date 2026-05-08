@@ -62,6 +62,36 @@ func TestCertHitRate_StaleBucketsAreExcluded(t *testing.T) {
 	}
 }
 
+// TestCertHitRate_ClockRollbackExcludesFutureBuckets pins the
+// codex-review finding: when the injectable clock moves backward
+// (only reachable in tests), Last60s must NOT count buckets whose
+// recorded second is greater than the current clock — the
+// `b.second <= now` clause is the regression site. Without that
+// check, stale samples would be resurrected by a backward jump
+// because the (cutoff, now] window would slide past them.
+func TestCertHitRate_ClockRollbackExcludesFutureBuckets(t *testing.T) {
+	clk := &hitRateClock{t: time.Unix(1_700_000_000, 0)}
+	r := NewCertHitRate(clk.Now)
+
+	// Advance clock to second 100 of uptime, then record.
+	clk.Set(time.Unix(1_700_000_100, 0))
+	r.Note(true)
+	r.Note(false)
+	if hits, misses := r.Last60s(); hits != 1 || misses != 1 {
+		t.Fatalf("baseline at uptime=100s: got %d/%d, want 1/1", hits, misses)
+	}
+
+	// Roll the clock back to uptime=10s — buckets recorded at
+	// second 100 must NOT be counted as if they were inside the
+	// (-50, 10] window. Without the b.second <= now guard, the
+	// stale samples slide back into a sliding 60s window.
+	clk.Set(time.Unix(1_700_000_010, 0))
+	hits, misses := r.Last60s()
+	if hits != 0 || misses != 0 {
+		t.Errorf("clock rollback resurrected future-dated buckets: got %d/%d, want 0/0", hits, misses)
+	}
+}
+
 func TestCertHitRate_BucketRolloverClearsCounts(t *testing.T) {
 	// Bucketing is `uptime_second mod 60`. After 60s the index wraps
 	// to the same bucket; the second-of-uptime mismatch must zero
