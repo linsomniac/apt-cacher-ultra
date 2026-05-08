@@ -59,6 +59,8 @@ const (
 	OutcomeTLSFailed           ConnectOutcome = "tls_failed"
 	OutcomeTLSHandshakeTimeout ConnectOutcome = "tls_handshake_timeout"
 	OutcomeInnerMethodRejected ConnectOutcome = "inner_method_rejected"
+	OutcomeInnerHeaderTimeout  ConnectOutcome = "inner_header_timeout"
+	OutcomeInnerHeaderTooLarge ConnectOutcome = "inner_header_too_large"
 	OutcomeInnerStreamFailed   ConnectOutcome = "inner_stream_failed"
 	OutcomeTunneled            ConnectOutcome = "tunneled"
 )
@@ -499,10 +501,20 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "set inner deadline: "+err.Error(), "", true)
 		return
 	}
-	innerBR := bufio.NewReader(io.LimitReader(tlsConn, h.deps.MaxInnerHeaderBytes))
+	limited := &countingLimitReader{r: io.LimitReader(tlsConn, h.deps.MaxInnerHeaderBytes), cap: h.deps.MaxInnerHeaderBytes}
+	innerBR := bufio.NewReader(limited)
 	innerReq, err := http.ReadRequest(innerBR)
 	if err != nil {
-		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "read inner: "+err.Error(), "", true)
+		outcome := OutcomeInnerStreamFailed
+		switch {
+		case isDeadlineExceeded(err):
+			// SPEC6 §11 F11a: slowloris on the inner request.
+			outcome = OutcomeInnerHeaderTimeout
+		case limited.exhausted():
+			// SPEC6 §11 F11b: byte cap fired before \r\n\r\n.
+			outcome = OutcomeInnerHeaderTooLarge
+		}
+		h.warnConnect(outcome, target.LiteralHost, target.Port, clientAddr, start, "read inner: "+err.Error(), "", true)
 		return
 	}
 	if innerReq.Method != http.MethodGet && innerReq.Method != http.MethodHead {
@@ -556,6 +568,29 @@ func stripHopByHop(h http.Header) {
 	} {
 		h.Del(k)
 	}
+}
+
+// countingLimitReader wraps an io.LimitReader and tracks whether the
+// limit was reached. Used to distinguish SPEC6 §11 F11a (slowloris,
+// deadline-exceeded) from F11b (byte cap exhausted) when
+// http.ReadRequest fails to parse the inner request.
+type countingLimitReader struct {
+	r        io.Reader
+	cap      int64
+	consumed int64
+}
+
+func (c *countingLimitReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.consumed += int64(n)
+	return n, err
+}
+
+// exhausted reports whether the cap was reached. The wrapped
+// io.LimitReader returns EOF once the cap is consumed, so the cap
+// being reached is the F11b signal.
+func (c *countingLimitReader) exhausted() bool {
+	return c.consumed >= c.cap
 }
 
 func isDeadlineExceeded(err error) bool {

@@ -9,7 +9,8 @@
 // Outcome classification (per §5.3):
 //
 //   - **success** ("TLS handshake reached"): tunneled,
-//     inner_method_rejected, inner_stream_failed.
+//     inner_method_rejected, inner_header_timeout, inner_header_too_large,
+//     inner_stream_failed.
 //   - **failure** ("TLS-failure"): tls_failed, tls_handshake_timeout,
 //     cert_gen_failed.
 //   - **ignored**: bad_target, bad_host, ip_literal_host, bad_port,
@@ -158,8 +159,9 @@ const (
 
 func classifyOutcome(o ConnectOutcome, tlsReached bool) outcomeClass {
 	switch o {
-	case OutcomeTunneled, OutcomeInnerMethodRejected:
-		// Both fire only post-handshake. Independent of the flag.
+	case OutcomeTunneled, OutcomeInnerMethodRejected,
+		OutcomeInnerHeaderTimeout, OutcomeInnerHeaderTooLarge:
+		// All four fire only post-handshake. Independent of the flag.
 		return outcomeSuccess
 	case OutcomeInnerStreamFailed:
 		// Ambiguous: pre-handshake (hijack/write-200/etc.) or

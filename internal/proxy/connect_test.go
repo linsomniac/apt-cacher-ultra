@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -349,13 +350,16 @@ func TestServeCONNECT_InnerMethodRejected(t *testing.T) {
 }
 
 // TestServeCONNECT_OversizedInnerHeaderRejected exercises the
-// codex-finding #1 hardening: a CONNECT client cannot blow up
-// memory by sending an unbounded inner header block. The handler
-// caps the byte budget for the request line + headers; once
-// exceeded, the read returns unexpected-EOF and the handler emits
-// inner_stream_failed without invoking the dispatcher.
+// codex-finding #1 hardening AND SPEC6 §11 F11b: a CONNECT client
+// cannot blow up memory by sending an unbounded inner header
+// block. The handler caps the byte budget for the request line +
+// headers; once the cap is reached, the read returns
+// unexpected-EOF and the handler emits the
+// inner_header_too_large outcome (NOT the generic
+// inner_stream_failed) without invoking the dispatcher.
 func TestServeCONNECT_OversizedInnerHeaderRejected(t *testing.T) {
 	dispatched := false
+	logs := newLogCapture()
 	srv, ca, _ := newTestConnectServer(t, testConnectOpts{
 		signingGate: func(host string) bool { return true },
 		fetchGate:   func(host string) bool { return true },
@@ -363,6 +367,7 @@ func TestServeCONNECT_OversizedInnerHeaderRejected(t *testing.T) {
 			dispatched = true
 		},
 		maxInnerHeaderBytes: 4 * 1024, // 4 KiB cap; we send much more.
+		logFn:               logs.Append,
 	})
 	defer srv.Close()
 
@@ -399,6 +404,117 @@ func TestServeCONNECT_OversizedInnerHeaderRejected(t *testing.T) {
 	_, _ = io.Copy(io.Discard, tlsConn)
 	if dispatched {
 		t.Error("dispatcher invoked despite oversized inner header")
+	}
+	got := logs.WaitFor(t, "mitm_connect", 2*time.Second)
+	if outcome, _ := got.fields["outcome"].(string); outcome != string(OutcomeInnerHeaderTooLarge) {
+		t.Errorf("outcome = %q, want %q", outcome, OutcomeInnerHeaderTooLarge)
+	}
+}
+
+// TestServeCONNECT_TLSHandshakeTimeout pins SPEC6 §11 F10: when the
+// post-CONNECT TLS handshake exceeds the configured budget, the
+// conn closes with outcome=tls_handshake_timeout. The client writes
+// the CONNECT request, reads the 200 Connection-Established response,
+// then deliberately stalls — never sending a TLS ClientHello. The
+// handler's `conn.SetDeadline(handshakeTimeout)` fires and
+// `tlsConn.Handshake` surfaces a deadline error which the handler
+// classifies as the timeout outcome.
+func TestServeCONNECT_TLSHandshakeTimeout(t *testing.T) {
+	logs := newLogCapture()
+	srv, _, _ := newTestConnectServer(t, testConnectOpts{
+		signingGate:      func(host string) bool { return true },
+		fetchGate:        func(host string) bool { return true },
+		handshakeTimeout: 100 * time.Millisecond,
+		logFn:            logs.Append,
+	})
+	defer srv.Close()
+
+	rawConn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer rawConn.Close()
+	if _, err := rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	br := bufio.NewReader(rawConn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read CONNECT resp: %v", err)
+	}
+	resp.Body.Close()
+
+	// Stall instead of sending ClientHello. The server's handshake
+	// deadline must fire and close the conn.
+	deadline := time.Now().Add(2 * time.Second)
+	_ = rawConn.SetReadDeadline(deadline)
+	buf := make([]byte, 1)
+	if _, err := rawConn.Read(buf); err == nil {
+		t.Errorf("expected EOF / read error after handshake timeout, got nil")
+	}
+
+	got := logs.WaitFor(t, "mitm_connect", 2*time.Second)
+	if outcome, _ := got.fields["outcome"].(string); outcome != string(OutcomeTLSHandshakeTimeout) {
+		t.Errorf("outcome = %q, want %q", outcome, OutcomeTLSHandshakeTimeout)
+	}
+	if got.level != "warn" {
+		t.Errorf("level = %q, want \"warn\"", got.level)
+	}
+}
+
+// TestServeCONNECT_InnerHeaderSlowloris pins SPEC6 §11 F11a: a client
+// completes the TLS handshake then trickles the inner request bytes
+// without ever finishing \r\n\r\n. The §9.2.1 inner-read deadline
+// fires; the handler closes with outcome=inner_header_timeout (NOT
+// the generic inner_stream_failed and NOT inner_header_too_large —
+// the byte cap was never reached).
+func TestServeCONNECT_InnerHeaderSlowloris(t *testing.T) {
+	logs := newLogCapture()
+	srv, ca, _ := newTestConnectServer(t, testConnectOpts{
+		signingGate:      func(host string) bool { return true },
+		fetchGate:        func(host string) bool { return true },
+		innerReadTimeout: 200 * time.Millisecond,
+		logFn:            logs.Append,
+	})
+	defer srv.Close()
+
+	clientCAPool := x509.NewCertPool()
+	clientCAPool.AddCert(ca.Cert)
+
+	rawConn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer rawConn.Close()
+	if _, err := rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	br := bufio.NewReader(rawConn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read CONNECT resp: %v", err)
+	}
+	resp.Body.Close()
+	tlsConn := tls.Client(&prereadConn{Conn: rawConn, br: br}, &tls.Config{
+		ServerName: "example.test", RootCAs: clientCAPool, MinVersion: tls.VersionTLS12,
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+	defer tlsConn.Close()
+
+	// Trickle: write only the request line and the start of a
+	// header, no \r\n\r\n. The cap (1 MiB default) is far away.
+	if _, err := tlsConn.Write([]byte("GET /x HTTP/1.1\r\nHost: example.test\r\n")); err != nil {
+		t.Logf("partial write returned %v (acceptable)", err)
+	}
+
+	got := logs.WaitFor(t, "mitm_connect", 2*time.Second)
+	if outcome, _ := got.fields["outcome"].(string); outcome != string(OutcomeInnerHeaderTimeout) {
+		t.Errorf("outcome = %q, want %q", outcome, OutcomeInnerHeaderTimeout)
+	}
+	if got.level != "warn" {
+		t.Errorf("level = %q, want \"warn\"", got.level)
 	}
 }
 
@@ -510,6 +626,9 @@ type testConnectOpts struct {
 	fetchGate           func(string) bool
 	dispatch            func(http.ResponseWriter, *http.Request)
 	maxInnerHeaderBytes int64
+	handshakeTimeout    time.Duration
+	innerReadTimeout    time.Duration
+	logFn               func(level, event string, fields map[string]any)
 }
 
 type testConnectServer struct {
@@ -537,6 +656,14 @@ func newTestConnectServer(t *testing.T, opts testConnectOpts) (*testConnectServe
 			w.WriteHeader(200)
 		}
 	}
+	handshake := opts.handshakeTimeout
+	if handshake == 0 {
+		handshake = 5 * time.Second
+	}
+	innerRead := opts.innerReadTimeout
+	if innerRead == 0 {
+		innerRead = 5 * time.Second
+	}
 	h, err := NewConnectHandler(HandlerDeps{
 		CA:                  ca,
 		LeafCache:           cache,
@@ -544,9 +671,10 @@ func newTestConnectServer(t *testing.T, opts testConnectOpts) (*testConnectServe
 		FetchGate:           opts.fetchGate,
 		Dispatch:            opts.dispatch,
 		TLSConfig:           &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}},
-		HandshakeTimeout:    5 * time.Second,
-		InnerReadTimeout:    5 * time.Second,
+		HandshakeTimeout:    handshake,
+		InnerReadTimeout:    innerRead,
 		MaxInnerHeaderBytes: opts.maxInnerHeaderBytes,
+		LogFn:               opts.logFn,
 	})
 	if err != nil {
 		t.Fatalf("NewConnectHandler: %v", err)
@@ -597,4 +725,65 @@ func (c *prereadConn) Read(p []byte) (int, error) {
 		return c.br.Read(p)
 	}
 	return c.Conn.Read(p)
+}
+
+// capturedLog is one entry recorded by logCapture. Mirrors the
+// HandlerDeps.LogFn signature.
+type capturedLog struct {
+	level  string
+	event  string
+	fields map[string]any
+}
+
+// logCapture is a thread-safe sink for HandlerDeps.LogFn. Tests use
+// it to assert the outcome enum on emitted mitm_connect log lines
+// without depending on stderr scraping.
+type logCapture struct {
+	mu     sync.Mutex
+	events []capturedLog
+	cond   *sync.Cond
+}
+
+func newLogCapture() *logCapture {
+	c := &logCapture{}
+	c.cond = sync.NewCond(&c.mu)
+	return c
+}
+
+// Append is wired as HandlerDeps.LogFn.
+func (c *logCapture) Append(level, event string, fields map[string]any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	clone := make(map[string]any, len(fields))
+	for k, v := range fields {
+		clone[k] = v
+	}
+	c.events = append(c.events, capturedLog{level: level, event: event, fields: clone})
+	c.cond.Broadcast()
+}
+
+// WaitFor blocks until at least one event named `event` has been
+// captured, or the deadline elapses. Returns the first matching
+// event. Failing the test on timeout keeps the slowloris/handshake
+// tests from hanging on a code regression that swallowed the log.
+func (c *logCapture) WaitFor(t *testing.T, event string, timeout time.Duration) capturedLog {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for {
+		for _, e := range c.events {
+			if e.event == event {
+				return e
+			}
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("WaitFor(%q): timeout after %v; captured events = %+v", event, timeout, c.events)
+		}
+		// sync.Cond has no timed wait; poll on a short timer instead.
+		c.mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		c.mu.Lock()
+	}
 }

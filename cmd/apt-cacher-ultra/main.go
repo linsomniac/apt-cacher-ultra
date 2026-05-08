@@ -954,6 +954,14 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 		// §5.1.4), so this is the same string the operator typed
 		// (or what their client requested).
 		proxy.NoteCertIssued(host, time.Now())
+		// SPEC6 §10.2 / §11 F17: detect a system-clock jump
+		// between GenerateLeaf's `now` and this fresh read. Should
+		// be impossible given the 5m backdate at issuance, but the
+		// belt-and-suspenders Warn lets operators see a clock
+		// problem before apt does.
+		proxy.CheckLeafClockSkew(host, cert, time.Now(), func(level, event string, fields map[string]any) {
+			emitTlsMitmLog(logger, level, event, fields)
+		})
 		return cert, nil
 	})
 	if err != nil {
