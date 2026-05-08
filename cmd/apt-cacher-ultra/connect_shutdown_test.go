@@ -171,11 +171,14 @@ func TestServe_GracefulShutdown_DrainsInflightCONNECT(t *testing.T) {
 		t.Fatalf("serveListeners did not return after CONNECT shutdown — hijacked-conn drain may be wedged")
 	}
 
-	// Goroutine-leak assertion. Allow slack for net/http internal
-	// goroutines (close-notify writers, transport idle-conn reapers)
-	// that may take a tick longer to exit than activeWG.
+	// Goroutine-leak assertion. Slack tracks the chaos_test.go
+	// precedent for the same daemon stack: 4 absorbs the residue of
+	// net/http internal goroutines (close-notify writers, transport
+	// idle-conn reapers) that exit one tick later than activeWG.
+	// On failure we dump full stacks so the operator can see WHICH
+	// goroutines leaked rather than only a delta count.
 	deadline := time.Now().Add(2 * time.Second)
-	const slack = 8
+	const slack = 4
 	var nowCount int
 	for time.Now().Before(deadline) {
 		runtime.GC()
@@ -186,30 +189,68 @@ func TestServe_GracefulShutdown_DrainsInflightCONNECT(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if nowCount > baseline+slack {
-		t.Errorf("goroutine leak after CONNECT shutdown: now=%d baseline=%d (slack=%d)",
-			nowCount, baseline, slack)
+		buf := make([]byte, 1<<16)
+		n := runtime.Stack(buf, true)
+		t.Errorf("goroutine leak after CONNECT shutdown: now=%d baseline=%d (slack=%d)\n--- live goroutines ---\n%s",
+			nowCount, baseline, slack, buf[:n])
 	}
 
-	// Orphan-blob assertion. SPEC6 §15 #16 says no orphan pool/ blobs
-	// from cancelled inner GETs. In this scenario no inner GET ran
-	// (CONNECT was closed before TLS handshake completed), so the
-	// count must be zero. A non-zero count would indicate the CONNECT
-	// pipeline alone leaked a partial blob — currently impossible by
-	// code review (the blob writer is only opened by the inner-GET
-	// fetch path), so this is a regression guard for any future code
-	// path that touches pool/ during CONNECT setup.
+	// Pool-state regression guard (NOT the SPEC6 §15 #16 orphan-blob
+	// pin). The spec's "no orphan pool/ blobs from cancelled inner
+	// GETs" claim is exercised end-to-end in §15 #2's §12.2 integration
+	// test where an HTTPS upstream serves a slow body and the fetch
+	// gets cancelled mid-stream — that scenario requires
+	// fetch.SetRootCAsForTest, not yet built. Here we only assert that
+	// the CONNECT pipeline alone (cert generation, hijack accounting)
+	// did NOT touch pool/ — currently impossible by code review, the
+	// walk guards against any future code path that violates that
+	// invariant. Walk errors fail the test rather than being silently
+	// ignored, so a missing or unreadable pool/ dir cannot mask a real
+	// regression.
 	poolDir := filepath.Join(cacheDir, "pool")
 	count := 0
-	_ = filepath.Walk(poolDir, func(_ string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil || info == nil || info.IsDir() {
+	walkErr := filepath.Walk(poolDir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info == nil || info.IsDir() {
 			return nil
 		}
 		count++
 		return nil
 	})
-	if count != 0 {
-		t.Errorf("orphan pool blobs after CONNECT shutdown: count=%d, want 0", count)
+	if walkErr != nil {
+		t.Errorf("walk pool/: %v", walkErr)
 	}
+	if count != 0 {
+		t.Errorf("CONNECT pipeline left files in pool/: count=%d, want 0", count)
+	}
+}
+
+// TestServe_GracefulShutdown_StalledCONNECT_DrainBudget pins the
+// SPEC6 §9.4 / §15 #16 contract that a hijacked CONNECT whose client
+// goes silent (no ClientHello, no close) does NOT outlast the
+// shutdown drain budget. The current daemon has no §9.4 tunnel
+// manager (no conn registry, no force-close on deadline expiry), so
+// `h.Close → activeWG.Wait` blocks for the full 30s default
+// HandshakeTimeout from internal/proxy/connect.go:372 — well past
+// any reasonable drain budget. Until the tunnel manager lands this
+// test is t.Skip; un-skip it as the acceptance test for the §9.4
+// implementation.
+//
+// SPEC6 §9.4 mandates: a sync.WaitGroup of in-flight tunnels, a
+// parent ctx cancelled at shutdown step, and a registry
+// (map[net.Conn]struct{}) the manager iterates under mutex on
+// deadline expiry to force-close every still-tracked conn. The
+// daemon's shutdown sequence then waits a bounded grace (≤ 1s) for
+// the WG to drain.
+//
+// Test client: opens CONNECT, reads 200, then leaves the conn open
+// without sending any TLS bytes. Asserts serveListeners returns
+// within the drain budget plus a small slack — proves force-close
+// fired at deadline.
+func TestServe_GracefulShutdown_StalledCONNECT_DrainBudget(t *testing.T) {
+	t.Skip("SPEC6 §9.4 tunnel manager not yet implemented (no conn registry / force-close on shutdown deadline); see §15 #16 follow-up")
 }
 
 // waitForDaemonReady polls the cache listener until a fresh request
