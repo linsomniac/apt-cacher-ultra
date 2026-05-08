@@ -228,29 +228,120 @@ func TestServe_GracefulShutdown_DrainsInflightCONNECT(t *testing.T) {
 }
 
 // TestServe_GracefulShutdown_StalledCONNECT_DrainBudget pins the
-// SPEC6 §9.4 / §15 #16 contract that a hijacked CONNECT whose client
-// goes silent (no ClientHello, no close) does NOT outlast the
-// shutdown drain budget. The current daemon has no §9.4 tunnel
-// manager (no conn registry, no force-close on deadline expiry), so
-// `h.Close → activeWG.Wait` blocks for the full 30s default
-// HandshakeTimeout from internal/proxy/connect.go:372 — well past
-// any reasonable drain budget. Until the tunnel manager lands this
-// test is t.Skip; un-skip it as the acceptance test for the §9.4
-// implementation.
+// SPEC6 §9.4 / §15 #16 contract that a hijacked CONNECT whose
+// client goes silent (no ClientHello, no close) does NOT outlast
+// the shutdown drain budget.
 //
-// SPEC6 §9.4 mandates: a sync.WaitGroup of in-flight tunnels, a
-// parent ctx cancelled at shutdown step, and a registry
-// (map[net.Conn]struct{}) the manager iterates under mutex on
-// deadline expiry to force-close every still-tracked conn. The
-// daemon's shutdown sequence then waits a bounded grace (≤ 1s) for
-// the WG to drain.
+// The §9.4 tunnel manager (sync.WaitGroup of in-flight tunnels,
+// parent ctx cancelled at shutdown, and conn registry iterated
+// under mutex on deadline expiry to force-close still-tracked
+// conns) is what makes this work: without it, h.Close →
+// activeWG.Wait blocks for the full 30s default HandshakeTimeout
+// from internal/proxy/connect.go because the hijacked conn still
+// holds the activeWG token and net/http.Server.Shutdown does not
+// touch hijacked conns.
 //
-// Test client: opens CONNECT, reads 200, then leaves the conn open
-// without sending any TLS bytes. Asserts serveListeners returns
-// within the drain budget plus a small slack — proves force-close
-// fired at deadline.
+// Test client: opens CONNECT, reads 200, then leaves the conn
+// open without sending any TLS bytes (the daemon's tlsConn is now
+// blocked in Handshake reading from the hijacked conn). Asserts
+// serveListeners returns inside drainBudget + grace + slack —
+// proves the manager's force-close at deadline expiry actually
+// fires and unblocks the wedged goroutine.
+//
+// Mutates the package-level shutdownTimeout var, so NOT
+// t.Parallel.
 func TestServe_GracefulShutdown_StalledCONNECT_DrainBudget(t *testing.T) {
-	t.Skip("SPEC6 §9.4 tunnel manager not yet implemented (no conn registry / force-close on shutdown deadline); see §15 #16 follow-up")
+	oldTimeout := shutdownTimeout
+	shutdownTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { shutdownTimeout = oldTimeout })
+
+	cacheDir := t.TempDir()
+	cfg := minimalCfg(cacheDir, nil)
+	cfg.Upstream.AllowedHostRegex = append(cfg.Upstream.AllowedHostRegex, `^example\.test$`)
+	cfg.TlsMitm.Enabled = true
+	cfg.TlsMitm.AllowUnconstrainedCA = true
+	cfg.TlsMitm.CertCacheSize = 16
+	cfg.TlsMitm.LeafCertLifetime.Duration = time.Hour
+	cfg.TlsMitm.CACertLifetime.Duration = 30 * 24 * time.Hour
+	cfg.TlsMitm.LeafAlgorithm = "ecdsa-p256"
+
+	cacheLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	cacheAddr := cacheLn.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil)
+	}()
+
+	if err := waitForDaemonReady(t, cacheAddr, 10*time.Second); err != nil {
+		t.Fatalf("daemon never became ready: %v", err)
+	}
+
+	conn, err := net.Dial("tcp", cacheAddr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	// Keep the test conn alive for the whole test; only Close at the
+	// end so shutdown DOES NOT see a client-side EOF — that would
+	// unblock the daemon's tlsConn.Handshake naturally and bypass
+	// the §9.4 force-close path we want to exercise.
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
+	}
+
+	// Tunnel hijacked. ServeCONNECT is now in tls.Conn.Handshake()
+	// reading from the hijacked conn; the test client does NOT send
+	// any TLS bytes and does NOT close. Without the §9.4 manager,
+	// shutdown would block for the full 30s default
+	// HandshakeTimeout. With it, the manager force-closes the conn
+	// at drain-budget expiry (200ms here) and shutdown completes.
+	shutdownStart := time.Now()
+	cancel()
+
+	// drainBudget (200ms) + 1s grace + slack for non-CONNECT
+	// shutdown teardown (gauge refresher waits, GC drain, etc.).
+	// 5s is a generous regression ceiling — observed shutdown takes
+	// well under a second on a 200ms budget. The 15s outer fail is
+	// only reached if the §9.4 force-close path is broken.
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Errorf("serveListeners: %v", err)
+		}
+		dur := time.Since(shutdownStart)
+		if dur > 5*time.Second {
+			t.Errorf("serveListeners returned in %v; expected sub-second on a 200ms drain budget", dur)
+		}
+		if dur < 100*time.Millisecond {
+			// Sanity: if we returned WAY before the budget, the
+			// manager probably didn't actually wait — meaning
+			// either the conn was untracked too early or the
+			// budget was bypassed. A successful drain should take
+			// at least most of the budget.
+			t.Logf("note: serveListeners returned in %v (budget=%v); ensure budget is being honored",
+				dur, shutdownTimeout)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("serveListeners did not return — §9.4 force-close at drain-budget expiry may be wedged")
+	}
 }
 
 // waitForDaemonReady polls the cache listener until a fresh request

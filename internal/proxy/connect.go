@@ -342,6 +342,16 @@ type HandlerDeps struct {
 	// `tls_mitm_enabled_ca_undistributed` Warn. Optional — leaving
 	// it nil makes outcome recording a no-op.
 	Stats *ConnectStats
+
+	// Manager is the SPEC6 §9.4 hijacked-conn registry. When
+	// non-nil, ServeCONNECT registers each successful hijack with
+	// the manager (Track) and deregisters on tunnel return
+	// (Untrack), and derives the synthetic inner request ctx from
+	// the manager's parent ctx so shutdown propagates to the inner
+	// GET. When nil, the handler runs in pre-§9.4 mode (synth ctx
+	// inherits r.Context() instead) — only used by tests that don't
+	// exercise shutdown semantics.
+	Manager *TunnelManager
 }
 
 // ConnectHandler holds the SPEC6 §2.2 CONNECT pipeline. Construct
@@ -436,6 +446,20 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+
+	// SPEC6 §9.4: register the hijacked conn with the tunnel
+	// manager so the daemon's shutdown sequence can drain
+	// in-flight tunnels and force-close still-tracked conns at
+	// deadline expiry. Track MUST be paired with a deferred
+	// Untrack in the same goroutine — every error path between
+	// here and the natural tunnel-close return passes through
+	// this defer. Untrack is idempotent against the registry, so
+	// a Drain that force-closed this conn before our Untrack
+	// fires still leaves the WG accounting balanced.
+	if h.deps.Manager != nil {
+		h.deps.Manager.Track(conn)
+		defer h.deps.Manager.Untrack(conn)
+	}
 
 	if _, err := brw.WriteString("HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
 		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "write 200: "+err.Error(), "", false)
@@ -552,7 +576,21 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 		ProtoMajor: 1,
 		ProtoMinor: 1,
 	}
-	synth = synth.WithContext(WithMITMContext(r.Context()))
+	// SPEC6 §9.4: the synthetic inner request ctx derives from the
+	// tunnel manager's parent ctx (when present) so the daemon's
+	// shutdown step propagates to the inner GET and its handler
+	// pipeline. Client-disconnect propagation does NOT come from
+	// r.Context() here — once the conn is hijacked, net/http no
+	// longer fires r.Context().Done on conn close. Client
+	// disconnect surfaces instead via I/O errors when the inner
+	// handler reads/writes the encrypted stream wrapping the
+	// closed conn. When Manager is nil (pre-§9.4 / unit-test
+	// mode), fall back to r.Context() to preserve the prior shape.
+	synthParent := r.Context()
+	if h.deps.Manager != nil {
+		synthParent = h.deps.Manager.Context()
+	}
+	synth = synth.WithContext(WithMITMContext(synthParent))
 
 	// Wrap the encrypted stream as an http.ResponseWriter the
 	// handler can write to. Clear the deadline before dispatch so

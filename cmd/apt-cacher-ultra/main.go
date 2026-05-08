@@ -456,7 +456,7 @@ func serveListeners(
 	// is up would race those reads — see Handler.SetConnectHandler.
 	var mitmHandles *tlsMitmHandles
 	if cfg.TlsMitm.Enabled {
-		hs, err := wireTlsMitm(cfg, parser, fetchClient, h, logger)
+		hs, err := wireTlsMitm(ctx, cfg, parser, fetchClient, h, logger)
 		if err != nil {
 			return fmt.Errorf("build tls_mitm: %w", err)
 		}
@@ -699,6 +699,32 @@ func serveListeners(
 		}
 	}
 
+	// SPEC6 §9.4 hijacked-CONNECT tunnel drain. http.Server.Close
+	// neither waits for nor closes hijacked conns, so a stalled
+	// CONNECT (client hijacks but never sends ClientHello) would
+	// otherwise block h.Close → activeWG.Wait below for the full
+	// 30s default HandshakeTimeout — well past any reasonable
+	// drain budget. Manager.Drain cancels the manager parent ctx
+	// (propagating to live tunnels' synthetic inner request ctxs),
+	// waits up to the remaining shutdown budget for the in-flight
+	// WG to drain, and on deadline expiry force-closes every
+	// still-tracked conn so wedged tls.Handshake / bufio.Read
+	// goroutines unwind. The 1s grace covers the post-force-close
+	// unwind window. When MITM is disabled, mitmHandles is nil
+	// and this block is skipped.
+	if mitmHandles != nil && mitmHandles.Manager != nil {
+		drainBudget := time.Duration(0)
+		if dl, ok := shutdownCtx.Deadline(); ok {
+			drainBudget = time.Until(dl)
+			if drainBudget < 0 {
+				drainBudget = 0
+			}
+		}
+		if err := mitmHandles.Manager.Drain(drainBudget, time.Second); err != nil {
+			logger.Warn("tunnel manager drain returned error", "err", err)
+		}
+	}
+
 	// Stop the periodic freshness scheduler before h.Close so it does
 	// not dispatch new Check() calls (which would Add to activeWG)
 	// against a handler that's about to drain. Scheduler goroutines
@@ -913,9 +939,18 @@ type tlsMitmHandles struct {
 	CANotAfterUnixTime  int64
 	EffectiveAllowlist  string
 	CertCacheCapacity   int
+
+	// Manager is the SPEC6 §9.4 hijacked-CONNECT tunnel manager.
+	// Constructed here with a parent ctx derived from the daemon
+	// ctx so master-ctx cancellation propagates to live tunnels;
+	// the daemon's shutdown sequence calls Manager.Drain between
+	// http.Server.Close and Handler.Close to bound hijacked-conn
+	// drain by the shutdown deadline (force-closing still-tracked
+	// conns at deadline expiry).
+	Manager *proxy.TunnelManager
 }
 
-func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Client, h *handler.Handler, logger *slog.Logger) (*tlsMitmHandles, error) {
+func wireTlsMitm(ctx context.Context, cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Client, h *handler.Handler, logger *slog.Logger) (*tlsMitmHandles, error) {
 	tmCfg := cfg.TlsMitm
 
 	ca, err := tlsmitm.LoadOrGenerate(tlsmitm.LoadOptions{
@@ -993,6 +1028,12 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 		NextProtos: []string{"http/1.1"},
 	}
 	stats := proxy.NewConnectStats()
+	// SPEC6 §9.4 tunnel manager. Parent ctx is derived from the
+	// daemon ctx so SIGINT/SIGTERM-driven cancellation reaches every
+	// live tunnel via the synthetic inner request ctx; the daemon's
+	// shutdown sequence also calls Manager.Drain explicitly to bound
+	// drain by the shutdown deadline and force-close stalled conns.
+	tunnelMgr := proxy.NewTunnelManager(ctx)
 	connectHandler, err := proxy.NewConnectHandler(proxy.HandlerDeps{
 		CA:           ca,
 		LeafCache:    leafCache,
@@ -1002,6 +1043,7 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 		Dispatch:     h.ServeHTTP,
 		TLSConfig:    tlsTemplate,
 		Stats:        stats,
+		Manager:      tunnelMgr,
 		LogFn: func(level, event string, fields map[string]any) {
 			emitTlsMitmLog(logger, level, event, fields)
 		},
@@ -1051,6 +1093,7 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 		CANotAfterUnixTime:  ca.Cert.NotAfter.Unix(),
 		EffectiveAllowlist:  tmCfg.AllowedHostRegex,
 		CertCacheCapacity:   tmCfg.CertCacheSize,
+		Manager:             tunnelMgr,
 	}, nil
 }
 
