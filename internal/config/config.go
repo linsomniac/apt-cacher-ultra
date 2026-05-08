@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -54,6 +55,7 @@ type Config struct {
 	Admin          AdminConfig       `toml:"admin"`
 	Serve          ServeConfig       `toml:"serve"`
 	Log            LogConfig         `toml:"log"`
+	TlsMitm        TlsMitmConfig     `toml:"tls_mitm"`
 	Remap          []RemapRule       `toml:"remap"`
 	Mirror         []MirrorRule      `toml:"mirror"`
 	TrustedSigners []TrustedSigner   `toml:"trusted_signer"`
@@ -303,6 +305,65 @@ type LogConfig struct {
 	Format string `toml:"format"`
 }
 
+// TlsMitmConfig holds the SPEC6 §5.1 [tls_mitm] block. Default OFF;
+// when enabled, the CONNECT method is upgraded from "405 Method Not
+// Allowed" to a transparent MITM tunnel that signs leaf certs from
+// the configured CA. See SPEC6 §2.2 for the CONNECT pipeline and
+// §5.1.1 / §5.1.1.1 for the auto-generated CA's Name Constraints
+// translation contract.
+type TlsMitmConfig struct {
+	// Enabled is the master switch. False = SPEC §2.6 method
+	// dispatch (CONNECT → 405). Default false; flip-to-true is a
+	// per-deployment decision because MITM rewrites the trust
+	// posture of every cached HTTPS upstream.
+	Enabled bool `toml:"enabled"`
+
+	// CaCert / CaKey are operator-supplied paths. Both empty =
+	// auto-generate path (uses CaStorageDir). Both set = supplied
+	// path (cert/key parsed and validated at startup).
+	// One-set-one-empty is rejected at validation.
+	CaCert string `toml:"ca_cert"`
+	CaKey  string `toml:"ca_key"`
+
+	// CaStorageDir is the auto-gen materialization directory. Empty
+	// = `<cache.dir>/ca`. Holds ca.crt, ca.key, ca.ready, .ca.lock.
+	// SPEC6 §4.2.
+	CaStorageDir string `toml:"ca_storage_dir"`
+
+	// CertCacheSize bounds the in-memory leaf-cert LRU. Must be ≥ 1.
+	// Default 256.
+	CertCacheSize int `toml:"cert_cache_size"`
+
+	// LeafCertLifetime is the validity window stamped onto every
+	// signed leaf. Range [5m, 5y]. Default 720h (30 days). 5y upper
+	// bound exists because leaf revocation is "flush the in-memory
+	// cache via daemon restart" — no CRL/OCSP path.
+	LeafCertLifetime Duration `toml:"leaf_cert_lifetime"`
+
+	// CACertLifetime is the validity window of the auto-generated
+	// CA. Range [1d, 50y]. Default 87600h (10 years). Has no effect
+	// on the operator-supplied path.
+	CACertLifetime Duration `toml:"ca_cert_lifetime"`
+
+	// LeafAlgorithm selects the leaf cert key type. SPEC6 §5.1.3
+	// only blesses two values: "ecdsa-p256" (default) and "rsa2048"
+	// (legacy clients). Any other value rejected at validation.
+	LeafAlgorithm string `toml:"leaf_algorithm"`
+
+	// AllowedHostRegex is the §5.1.2 signing predicate AND, when
+	// translatable per §5.1.1.1, the source of the auto-generated
+	// CA's RFC 5280 Name Constraints. Empty = no MITM-side narrowing
+	// (the upstream fetch gate alone applies). Must compile as a
+	// Go RE2 regex if non-empty.
+	AllowedHostRegex string `toml:"allowed_host_regex"`
+
+	// AllowUnconstrainedCA opts the auto-generated CA path into
+	// running without RFC 5280 Name Constraints when the regex is
+	// empty or untranslatable. Default false (fail-closed per
+	// §5.1.1). Has no effect on operator-supplied CAs.
+	AllowUnconstrainedCA bool `toml:"allow_unconstrained_ca"`
+}
+
 type RemapRule struct {
 	MatchHostRegex string `toml:"match_host_regex"`
 	CanonicalHost  string `toml:"canonical_host"`
@@ -433,6 +494,25 @@ func Load(path string) (*Config, error) {
 	}
 	if !md.IsDefined("admin", "metric_series_cap") {
 		cfg.Admin.MetricSeriesCap = 1024
+	}
+	// SPEC6 §5.2 presence-sensitive defaults for [tls_mitm]. None of
+	// these fields document a 0 / "" semantic — the spec rejects 0
+	// outright for cert_cache_size and lifetimes, and rejects ""
+	// for leaf_algorithm. Routing through IsDefined preserves an
+	// operator's explicit (and invalid) value so Validate() can
+	// surface it as a config error rather than Defaults() silently
+	// rescuing the zero to 256 / 720h / 87600h / "ecdsa-p256".
+	if !md.IsDefined("tls_mitm", "cert_cache_size") {
+		cfg.TlsMitm.CertCacheSize = 256
+	}
+	if !md.IsDefined("tls_mitm", "leaf_cert_lifetime") {
+		cfg.TlsMitm.LeafCertLifetime.Duration = 720 * time.Hour
+	}
+	if !md.IsDefined("tls_mitm", "ca_cert_lifetime") {
+		cfg.TlsMitm.CACertLifetime.Duration = 87600 * time.Hour
+	}
+	if !md.IsDefined("tls_mitm", "leaf_algorithm") {
+		cfg.TlsMitm.LeafAlgorithm = "ecdsa-p256"
 	}
 	cfg.Defaults()
 	if err := cfg.Validate(); err != nil {
@@ -745,6 +825,76 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("log.format %q invalid (json|text)", c.Log.Format))
 	}
 
+	// SPEC6 §5.2 — [tls_mitm] block. Only checked when enabled=true;
+	// disabled keeps fields unvalidated so a future config staging
+	// upgrade path with `enabled = false` is silent (§5.2 last
+	// paragraph). Cert/key file CONTENT validation (parse, IsCA,
+	// not_after, key match, supported algorithm) lives in
+	// internal/proxy/tlsmitm/ca.go validateSuppliedCA — config-load
+	// time only checks file readability so the failure mode at
+	// startup is "config error" rather than "panic at first
+	// CONNECT".
+	if c.TlsMitm.Enabled {
+		if c.TlsMitm.CertCacheSize < 1 {
+			errs = append(errs, fmt.Errorf("tls_mitm.cert_cache_size %d must be >= 1", c.TlsMitm.CertCacheSize))
+		}
+		const (
+			minLeafLifetime = 5 * time.Minute
+			maxLeafLifetime = 5 * 365 * 24 * time.Hour
+			minCALifetime   = 24 * time.Hour
+			maxCALifetime   = 50 * 365 * 24 * time.Hour
+		)
+		if c.TlsMitm.LeafCertLifetime.Duration < minLeafLifetime || c.TlsMitm.LeafCertLifetime.Duration > maxLeafLifetime {
+			errs = append(errs, fmt.Errorf(
+				"tls_mitm.leaf_cert_lifetime %s out of range [%s, %s]",
+				c.TlsMitm.LeafCertLifetime.Duration, minLeafLifetime, maxLeafLifetime))
+		}
+		if c.TlsMitm.CACertLifetime.Duration < minCALifetime || c.TlsMitm.CACertLifetime.Duration > maxCALifetime {
+			errs = append(errs, fmt.Errorf(
+				"tls_mitm.ca_cert_lifetime %s out of range [%s, %s]",
+				c.TlsMitm.CACertLifetime.Duration, minCALifetime, maxCALifetime))
+		}
+		switch c.TlsMitm.LeafAlgorithm {
+		case "ecdsa-p256", "rsa2048":
+		default:
+			errs = append(errs, fmt.Errorf(
+				"tls_mitm.leaf_algorithm %q invalid (ecdsa-p256|rsa2048)", c.TlsMitm.LeafAlgorithm))
+		}
+		if c.TlsMitm.AllowedHostRegex != "" {
+			if _, err := regexp.Compile(c.TlsMitm.AllowedHostRegex); err != nil {
+				errs = append(errs, fmt.Errorf("tls_mitm.allowed_host_regex: %w", err))
+			}
+		}
+		// Both-set-or-both-empty rule per SPEC6 §5.2.
+		caCertSet := c.TlsMitm.CaCert != ""
+		caKeySet := c.TlsMitm.CaKey != ""
+		if caCertSet != caKeySet {
+			errs = append(errs, errors.New("tls_mitm.ca_cert and tls_mitm.ca_key must both be set or both empty"))
+		} else if caCertSet {
+			if err := checkReadableFile(c.TlsMitm.CaCert); err != nil {
+				errs = append(errs, fmt.Errorf("tls_mitm.ca_cert %q: %w", c.TlsMitm.CaCert, err))
+			}
+			if err := checkReadableFile(c.TlsMitm.CaKey); err != nil {
+				errs = append(errs, fmt.Errorf("tls_mitm.ca_key %q: %w", c.TlsMitm.CaKey, err))
+			}
+		}
+		// Auto-gen path: storage dir must be creatable. The fail-closed
+		// rule (allow_unconstrained_ca + empty/untranslatable regex)
+		// is enforced at LoadOrGenerate time, not here, because
+		// translatability depends on regexp/syntax inspection that the
+		// tlsmitm package owns. Config-time validation just guarantees
+		// the storage dir works.
+		if !caCertSet {
+			dir := c.TlsMitm.CaStorageDir
+			if dir == "" {
+				dir = filepath.Join(c.Cache.Dir, "ca")
+			}
+			if err := checkCreatableDir(dir); err != nil {
+				errs = append(errs, fmt.Errorf("tls_mitm.ca_storage_dir %q: %w", dir, err))
+			}
+		}
+	}
+
 	return errors.Join(errs...)
 }
 
@@ -763,6 +913,39 @@ func validateListenAddr(addr string) error {
 		return fmt.Errorf("port %d out of range 1-65535", p)
 	}
 	return nil
+}
+
+// checkCreatableDir reports whether `dir` is usable as a future
+// daemon-managed directory. Two cases are accepted:
+//  1. `dir` already exists, is a directory, and is writable.
+//  2. `dir` does not yet exist; its parent exists, is a directory,
+//     and is writable (so a later os.MkdirAll call will succeed).
+//
+// SPEC6 §5.2 calls for `tls_mitm.ca_storage_dir` to be "creatable" —
+// the daemon will MkdirAll on first start (under the §4.2.2 flock).
+// Config-load validation surfaces the obvious failure modes (typo'd
+// path under a read-only parent, parent doesn't exist) up-front.
+func checkCreatableDir(dir string) error {
+	if dir == "" {
+		return errors.New("empty path")
+	}
+	if info, err := os.Stat(dir); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("exists but is not a directory")
+		}
+		return checkWritable(dir)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	parent := filepath.Dir(dir)
+	info, err := os.Stat(parent)
+	if err != nil {
+		return fmt.Errorf("parent %q: %w", parent, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("parent %q is not a directory", parent)
+	}
+	return checkWritable(parent)
 }
 
 // checkWritable verifies the directory accepts writes by creating and
@@ -937,6 +1120,38 @@ func (c *Config) Defaults() {
 	if c.Log.Format == "" {
 		c.Log.Format = "json"
 	}
+
+	// SPEC6 §5.1: [tls_mitm] defaults are applied in Load() via
+	// TOML's MetaData.IsDefined so an operator's explicit 0 / ""
+	// (which Validate rejects loudly) is not silently rescued to
+	// the SPEC default. Bool fields (Enabled, AllowUnconstrainedCA)
+	// default to false at the Go zero-value level, no pre-population
+	// needed. Path fields (CaCert, CaKey, AllowedHostRegex) default
+	// to empty. CaStorageDir resolves to <cache.dir>/ca at runtime
+	// via EffectiveCaStorageDir() if empty — Defaults() leaves it
+	// alone so operators see the effective path in startup logs
+	// without it being silently expanded into the config struct.
+	//
+	// This method (called by non-Load callers without a TOML source)
+	// cannot distinguish "explicit 0" from "absent" so it
+	// deliberately leaves these fields alone — same rationale as
+	// the §5.1 max_concurrent_adoptions / validate_at_rest_interval
+	// presence-sensitive comment above.
+}
+
+// EffectiveCaStorageDir returns the SPEC6 §5.1 ca_storage_dir for
+// auto-generation: the operator-supplied path if set, otherwise
+// `<cache.dir>/ca`. Callers that need to know the on-disk location
+// (daemon main, `ca print` subcommand, status page) use this rather
+// than re-deriving the default.
+func (c *Config) EffectiveCaStorageDir() string {
+	if c.TlsMitm.CaStorageDir != "" {
+		return c.TlsMitm.CaStorageDir
+	}
+	if c.Cache.Dir == "" {
+		return ""
+	}
+	return filepath.Join(c.Cache.Dir, "ca")
 }
 
 // validGPGFingerprint reports whether s is a 40-character hex string

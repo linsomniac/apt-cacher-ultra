@@ -1124,3 +1124,203 @@ func TestHeartbeatStaleGraceEffective_DerivedAboveFloor(t *testing.T) {
 		t.Errorf("HeartbeatStaleGraceEffective = %s, want %s", got, want)
 	}
 }
+
+// ============================================================================
+// SPEC6 [tls_mitm] tests
+// ============================================================================
+
+// TestTlsMitm_Defaults verifies the SPEC6 §5.1 defaults are populated
+// when the [tls_mitm] block is absent (or partially present). Bool
+// fields default to false at the Go zero-value level; numeric and
+// string fields are only filled in when zero / empty.
+func TestTlsMitm_Defaults(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TlsMitm.Enabled {
+		t.Error("TlsMitm.Enabled defaulted to true, want false (default OFF)")
+	}
+	if cfg.TlsMitm.AllowUnconstrainedCA {
+		t.Error("TlsMitm.AllowUnconstrainedCA defaulted to true, want false")
+	}
+	if cfg.TlsMitm.CertCacheSize != 256 {
+		t.Errorf("TlsMitm.CertCacheSize = %d, want 256", cfg.TlsMitm.CertCacheSize)
+	}
+	if cfg.TlsMitm.LeafCertLifetime.Duration != 720*time.Hour {
+		t.Errorf("TlsMitm.LeafCertLifetime = %s, want 720h", cfg.TlsMitm.LeafCertLifetime.Duration)
+	}
+	if cfg.TlsMitm.CACertLifetime.Duration != 87600*time.Hour {
+		t.Errorf("TlsMitm.CACertLifetime = %s, want 87600h", cfg.TlsMitm.CACertLifetime.Duration)
+	}
+	if cfg.TlsMitm.LeafAlgorithm != "ecdsa-p256" {
+		t.Errorf("TlsMitm.LeafAlgorithm = %q, want ecdsa-p256", cfg.TlsMitm.LeafAlgorithm)
+	}
+}
+
+// TestTlsMitm_DisabledSkipsValidation proves that the §5.2 last
+// paragraph holds: a disabled [tls_mitm] block with bogus values is
+// accepted (operators may stage upgrades).
+func TestTlsMitm_DisabledSkipsValidation(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[tls_mitm]
+enabled            = false
+cert_cache_size    = -1
+leaf_cert_lifetime = "1s"
+ca_cert_lifetime   = "1s"
+leaf_algorithm     = "blowfish"
+allowed_host_regex = "([invalid"
+`)
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load with disabled block + bogus values: %v", err)
+	}
+}
+
+// TestTlsMitm_EnabledRejectsBadValues exercises every §5.2 reject
+// rule when [tls_mitm].enabled = true.
+func TestTlsMitm_EnabledRejectsBadValues(t *testing.T) {
+	cases := []struct {
+		name    string
+		extra   string
+		wantSub string
+	}{
+		{"cert_cache_size zero", "cert_cache_size = 0", "cert_cache_size"},
+		{"cert_cache_size negative", "cert_cache_size = -1", "cert_cache_size"},
+		{"leaf_cert_lifetime below floor", `leaf_cert_lifetime = "1s"`, "leaf_cert_lifetime"},
+		{"leaf_cert_lifetime above ceiling", `leaf_cert_lifetime = "200000h"`, "leaf_cert_lifetime"},
+		{"ca_cert_lifetime below floor", `ca_cert_lifetime = "1m"`, "ca_cert_lifetime"},
+		{"ca_cert_lifetime above ceiling", `ca_cert_lifetime = "500000h"`, "ca_cert_lifetime"},
+		{"leaf_algorithm unknown", `leaf_algorithm = "ed25519"`, "leaf_algorithm"},
+		{"allowed_host_regex bad", `allowed_host_regex = "([invalid"`, "allowed_host_regex"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[tls_mitm]
+enabled = true
+`+tc.extra+`
+`)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("expected validation error for %s, got none", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error %q does not mention %q", err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestTlsMitm_BothCertAndKey_OrBothEmpty verifies the §5.2
+// "both set or both empty" rule.
+func TestTlsMitm_BothCertAndKey_OrBothEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[tls_mitm]
+enabled = true
+ca_cert = "/tmp/some-ca.pem"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for ca_cert without ca_key")
+	}
+	if !strings.Contains(err.Error(), "both be set or both empty") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestTlsMitm_SuppliedCertReadability checks that a supplied path
+// is checked at config-load time for *readability*. CONTENT
+// validation (parse, IsCA, key match) lives in tlsmitm.LoadOrGenerate.
+func TestTlsMitm_SuppliedCertReadability(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[tls_mitm]
+enabled = true
+ca_cert = "/nonexistent/ca.pem"
+ca_key  = "/nonexistent/ca.key"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for unreadable supplied paths")
+	}
+	if !strings.Contains(err.Error(), "ca_cert") {
+		t.Errorf("error %q does not mention ca_cert", err.Error())
+	}
+}
+
+// TestTlsMitm_AutoGen_StorageDirCheck asserts that the auto-gen path
+// validates the storage directory is creatable. We pass a path under
+// a writable tmpdir parent — the dir itself doesn't exist yet, but
+// the parent does and is writable, so validation should pass.
+func TestTlsMitm_AutoGen_StorageDirCheck_Creatable(t *testing.T) {
+	dir := t.TempDir()
+	storage := filepath.Join(dir, "ca")
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[tls_mitm]
+enabled = true
+allow_unconstrained_ca = true
+ca_storage_dir = "`+storage+`"
+`)
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load with creatable storage dir: %v", err)
+	}
+}
+
+// TestTlsMitm_AutoGen_StorageDirCheck_BadParent rejects a storage
+// path whose parent doesn't exist.
+func TestTlsMitm_AutoGen_StorageDirCheck_BadParent(t *testing.T) {
+	dir := t.TempDir()
+	storage := "/this/path/should/not/exist/ca"
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[tls_mitm]
+enabled = true
+allow_unconstrained_ca = true
+ca_storage_dir = "`+storage+`"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for unreachable storage dir")
+	}
+	if !strings.Contains(err.Error(), "ca_storage_dir") {
+		t.Errorf("error %q does not mention ca_storage_dir", err.Error())
+	}
+}
+
+// TestTlsMitm_EffectiveCaStorageDir checks the helper's two cases
+// and the empty-cache-dir edge case.
+func TestTlsMitm_EffectiveCaStorageDir(t *testing.T) {
+	cfg := &Config{}
+	cfg.Cache.Dir = "/var/cache/x"
+	cfg.TlsMitm.CaStorageDir = ""
+	if got := cfg.EffectiveCaStorageDir(); got != "/var/cache/x/ca" {
+		t.Errorf("default form = %q, want /var/cache/x/ca", got)
+	}
+	cfg.TlsMitm.CaStorageDir = "/srv/ca"
+	if got := cfg.EffectiveCaStorageDir(); got != "/srv/ca" {
+		t.Errorf("explicit form = %q, want /srv/ca", got)
+	}
+	empty := &Config{}
+	if got := empty.EffectiveCaStorageDir(); got != "" {
+		t.Errorf("empty cache.dir + empty storage = %q, want \"\"", got)
+	}
+}
