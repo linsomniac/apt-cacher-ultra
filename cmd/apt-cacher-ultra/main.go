@@ -31,6 +31,9 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy/tlsmitm"
+
+	"crypto/tls"
 )
 
 // Version is set at build time via -ldflags.
@@ -418,6 +421,18 @@ func serveListeners(
 		return fmt.Errorf("build handler: %w", err)
 	}
 
+	// SPEC6 §2.2: when tls_mitm.enabled = true, materialize the CA
+	// (load supplied or auto-generate per §4.2), build the leaf-cert
+	// cache and the CONNECT pipeline, and install it on the handler
+	// BEFORE Server.Serve starts accepting traffic. h.connect is read
+	// concurrently from ServeHTTP and writing it after the listener
+	// is up would race those reads — see Handler.SetConnectHandler.
+	if cfg.TlsMitm.Enabled {
+		if err := wireTlsMitm(cfg, parser, fetchClient, h, logger); err != nil {
+			return fmt.Errorf("build tls_mitm: %w", err)
+		}
+	}
+
 	// SPEC §7.4: start the periodic refresh scheduler. The scheduler
 	// dispatches into Checker.Check, which uses the cache + fetch
 	// client, so it must not outlive the handler-side drain — see
@@ -786,6 +801,128 @@ func newHTTPServer(h http.Handler, logger *slog.Logger) *http.Server {
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+	}
+}
+
+// wireTlsMitm assembles the SPEC6 §2.2 CONNECT pipeline and
+// attaches it to the handler. Called from serveListeners when
+// `tls_mitm.enabled = true`. The function performs:
+//
+//  1. CA materialization via tlsmitm.LoadOrGenerate (§4.2 — supplied
+//     path or auto-generate under flock).
+//  2. Leaf-cert cache wiring with a per-host generator that signs
+//     ECDSA P-256 or RSA-2048 leaves per the configured leaf algo.
+//  3. Signing-gate construction from the configured RE2 regex
+//     (nil when the regex is empty, matching §5.1.2 vacuous-true).
+//  4. proxy.NewConnectHandler with Dispatch=h.ServeHTTP — the
+//     synthetic GET/HEAD recurses back through the existing
+//     handler pipeline (Parse → Remap → cache lookup → fetch).
+//  5. handler.SetConnectHandler under the BEFORE-Serve invariant.
+//
+// Step 5 is the wiring's load-bearing constraint: writing
+// h.connect after the listener has started accepting traffic
+// would race ServeHTTP's read of the same field.
+func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Client, h *handler.Handler, logger *slog.Logger) error {
+	tmCfg := cfg.TlsMitm
+
+	ca, err := tlsmitm.LoadOrGenerate(tlsmitm.LoadOptions{
+		SuppliedCertPath:     tmCfg.CaCert,
+		SuppliedKeyPath:      tmCfg.CaKey,
+		StorageDir:           cfg.EffectiveCaStorageDir(),
+		AllowedHostRegex:     tmCfg.AllowedHostRegex,
+		AllowUnconstrainedCA: tmCfg.AllowUnconstrainedCA,
+		CALifetime:           tmCfg.CACertLifetime.Duration,
+		LogFn: func(level, event string, fields map[string]any) {
+			emitTlsMitmLog(logger, level, event, fields)
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	leafAlg, err := tlsmitm.ParseLeafAlgorithm(tmCfg.LeafAlgorithm)
+	if err != nil {
+		return fmt.Errorf("invalid leaf_algorithm: %w", err)
+	}
+	leafLifetime := tmCfg.LeafCertLifetime.Duration
+	leafCache, err := tlsmitm.NewCache(tmCfg.CertCacheSize, func(host string) (*tls.Certificate, error) {
+		return tlsmitm.GenerateLeaf(host, ca.TLSCert, leafAlg, leafLifetime, time.Now())
+	})
+	if err != nil {
+		return err
+	}
+
+	var signingGate func(string) bool
+	if tmCfg.AllowedHostRegex != "" {
+		re, err := regexp.Compile(tmCfg.AllowedHostRegex)
+		if err != nil {
+			// Validate already compiled it; this should be unreachable.
+			return fmt.Errorf("compile tls_mitm.allowed_host_regex: %w", err)
+		}
+		signingGate = func(literalHost string) bool {
+			return re.MatchString(literalHost)
+		}
+	}
+
+	tlsTemplate := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+	}
+	connectHandler, err := proxy.NewConnectHandler(proxy.HandlerDeps{
+		CA:           ca,
+		LeafCache:    leafCache,
+		SigningGate:  signingGate,
+		FetchGate:    fetchClient.HostAllowed,
+		Canonicalize: parser.CanonicalHost,
+		Dispatch:     h.ServeHTTP,
+		TLSConfig:    tlsTemplate,
+		LogFn: func(level, event string, fields map[string]any) {
+			emitTlsMitmLog(logger, level, event, fields)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	h.SetConnectHandler(connectHandler)
+
+	// SPEC6 §5.3 tls_mitm_enabled startup loud-config Info. The
+	// match-count-against-Remap-canonical-hosts piece will land in
+	// the metrics/status commit; the basic boot signal goes here so
+	// operators see the activation outcome on every successful start.
+	logger.Info("tls_mitm_enabled",
+		"source", ca.Source.String(),
+		"fingerprint_sha256", ca.FingerprintSHA256,
+		"not_after_unixtime", ca.Cert.NotAfter.Unix(),
+		"name_constraints", len(ca.NameConstraints) > 0,
+		"allowed_host_regex_set", tmCfg.AllowedHostRegex != "",
+	)
+	if tmCfg.AllowedHostRegex != "" {
+		logger.Info("tls_mitm_narrowing_regex_set",
+			"allowed_host_regex", tmCfg.AllowedHostRegex,
+			"upstream_allowed_host_regex", cfg.Upstream.AllowedHostRegex,
+		)
+	}
+	return nil
+}
+
+// emitTlsMitmLog forwards a structured event from internal/proxy or
+// internal/proxy/tlsmitm to the daemon's slog.Logger. The event
+// names + level strings are spec-locked (§10.1, §10.2) — main.go
+// is just a transport.
+func emitTlsMitmLog(logger *slog.Logger, level, event string, fields map[string]any) {
+	attrs := make([]any, 0, len(fields)*2)
+	for k, v := range fields {
+		attrs = append(attrs, k, v)
+	}
+	switch level {
+	case "error":
+		logger.Error(event, attrs...)
+	case "warn":
+		logger.Warn(event, attrs...)
+	case "debug":
+		logger.Debug(event, attrs...)
+	default:
+		logger.Info(event, attrs...)
 	}
 }
 

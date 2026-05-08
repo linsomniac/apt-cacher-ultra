@@ -83,6 +83,20 @@ type Config struct {
 	AdoptionEnabled bool
 }
 
+// ConnectHandler is the SPEC6 §2.2 CONNECT pipeline contract.
+// internal/proxy.ConnectHandler implements it. The handler.Handler
+// invokes ServeCONNECT when a CONNECT request arrives AND a
+// non-nil connect handler is installed (`tls_mitm.enabled = true`
+// path); otherwise CONNECT falls into the existing 405 branch.
+//
+// Defined here as an interface rather than imported as a concrete
+// type to keep the handler→proxy dependency direction clean — the
+// handler already imports proxy for *proxy.Parser, and the
+// interface keeps the test seam minimal.
+type ConnectHandler interface {
+	ServeCONNECT(w http.ResponseWriter, r *http.Request)
+}
+
 // Handler is the apt-cacher-ultra http.Handler. Construct via New.
 //
 // Close drains in-flight fetches at shutdown — see SPEC §9.5 step 3. The
@@ -121,6 +135,13 @@ type Handler struct {
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
 	activeWG        sync.WaitGroup
+
+	// connect is the SPEC6 §2.2 CONNECT pipeline. nil when
+	// tls_mitm.enabled = false; ServeHTTP falls through to the
+	// existing 405-method-not-allowed branch in that case. Set
+	// once at startup before the listener accepts traffic, so no
+	// locking is required for reads from ServeHTTP.
+	connect ConnectHandler
 }
 
 // New constructs a Handler from validated dependencies. Returns an error
@@ -158,6 +179,39 @@ func New(cfg Config) (*Handler, error) {
 		lifecycleCtx:            lifecycleCtx,
 		lifecycleCancel:         lifecycleCancel,
 	}, nil
+}
+
+// allowHeader returns the SPEC6 §2.5 Allow header for a 405
+// response: "GET, HEAD, CONNECT" when MITM is enabled, "GET, HEAD"
+// otherwise. The CONNECT branch in ServeHTTP also emits this on
+// the rare in-transit-disabled case (connect handler nil despite
+// the spec-listed wire form), preserving the documented contract
+// that an inappropriate method response always names every
+// supported method.
+func (h *Handler) allowHeader() string {
+	if h.connect != nil {
+		return "GET, HEAD, CONNECT"
+	}
+	return "GET, HEAD"
+}
+
+// SetConnectHandler installs the SPEC6 §2.2 CONNECT pipeline.
+// MUST be called BEFORE the http.Server starts accepting traffic
+// — there is no internal locking on h.connect because the field
+// is read concurrently from ServeHTTP and writing it after the
+// listener is up would race those reads. Pass nil to detach
+// (only useful in tests).
+//
+// main.go's wiring sequence is:
+//
+//	h, _ := handler.New(...)        // h.connect == nil
+//	if cfg.TlsMitm.Enabled {
+//	    ch, _ := proxy.NewConnectHandler(... Dispatch: h.ServeHTTP ...)
+//	    h.SetConnectHandler(ch)     // BEFORE Server.Serve
+//	}
+//	srv.Serve(ln)
+func (h *Handler) SetConnectHandler(c ConnectHandler) {
+	h.connect = c
 }
 
 // Close implements SPEC §9.5 step 3: cancel any in-flight upstream
@@ -242,8 +296,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 
+	// SPEC6 §2.2 / §2.5: CONNECT goes to the MITM pipeline when
+	// installed; without it, the pre-Phase-6 "405 method not
+	// allowed" behavior is preserved. The CONNECT handler emits
+	// its own mitm_connect log line, so we DO NOT call logRequest
+	// here for CONNECT — that would double-log every tunneled
+	// request.
+	if r.Method == http.MethodConnect {
+		if h.connect != nil {
+			h.connect.ServeCONNECT(w, r)
+			return
+		}
+		w.Header().Set("Allow", h.allowHeader())
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		h.logRequest(r, "", "", "method_not_allowed", http.StatusMethodNotAllowed, 0, false, 0, start)
+		return
+	}
+
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
+		w.Header().Set("Allow", h.allowHeader())
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		h.logRequest(r, "", "", "method_not_allowed", http.StatusMethodNotAllowed, 0, false, 0, start)
 		return
@@ -1701,6 +1772,13 @@ func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, s
 	}
 	if fetchAttempted {
 		attrs = append(attrs, "upstream_status", upstreamStatus)
+	}
+	// SPEC6 §6.2.1 / §10.1: when the synthetic *http.Request was
+	// dispatched by the CONNECT pipeline, mark the request log line
+	// so operators can grep for MITM-tunneled requests. A plain
+	// (non-MITM) request never carries the marker.
+	if proxy.IsMITMContext(r.Context()) {
+		attrs = append(attrs, "mitm", true)
 	}
 	h.logger.Info("request", attrs...)
 

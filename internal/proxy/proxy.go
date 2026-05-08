@@ -192,6 +192,16 @@ func (p *Parser) Parse(requestURI, hostHeader string) (*Request, error) {
 // When a remap rule matches, the upstream authority equals the canonical
 // host with no port — remap targets are public archive names per SPEC
 // §3.3, and the user expects to talk to them on the scheme's default
+// CanonicalHost returns the Remap-canonical hostname for a literal
+// host (the bare host with port stripped, trailing-dot stripped, and
+// any matching Remap rule applied). The CONNECT handler's fetch-gate
+// predicate (§5.1.2) consults this so the upstream allowlist sees the
+// same canonical form a plain GET would see after parser.Parse.
+func (p *Parser) CanonicalHost(host string) string {
+	canon, _ := p.canonicalize(host)
+	return canon
+}
+
 // port. When no rule matches, the upstream authority preserves the
 // caller's port (so "http://127.0.0.1:8080/repo/" still hits :8080).
 func (p *Parser) canonicalize(host string) (canonHost, upstreamAuthority string) {
