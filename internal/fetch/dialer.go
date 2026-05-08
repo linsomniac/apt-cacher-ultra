@@ -2,14 +2,50 @@ package fetch
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
+
+// rootCAsForTest, when non-nil, is installed as the *http.Transport's
+// TLSClientConfig.RootCAs for upstream-fetch HTTPS handshakes. Tests
+// inject the test httptest.Server's CA so a real verification path
+// (not InsecureSkipVerify) succeeds against the synthetic upstream.
+//
+// Production: nil → no TLSClientConfig is set, so the stdlib falls
+// back to system roots and full peer verification, identical to
+// pre-Phase-6 behavior. Read once per Client construction inside
+// newTransport — no per-request hot-path cost.
+//
+// Concurrency: read via atomic.Pointer.Load. Test-only writers
+// (SetRootCAsForTest) overwrite atomically before booting the
+// daemon-under-test, then restore on cleanup. The unit-level smoke
+// test asserts both the fail-closed default (no seam → handshake
+// fails) and the seam-enabled positive path.
+var rootCAsForTest atomic.Pointer[x509.CertPool]
+
+// SetRootCAsForTest sets the *x509.CertPool used as TLSClientConfig
+// .RootCAs for the upstream-fetch transport. Returns a restore
+// closure the caller defers to clear the seam at test teardown.
+// Test-only entry point — production code never calls this.
+//
+// SPEC6 §15 #2 enabling primitive: lets §12.2 integration tests
+// stand up an httptest TLS upstream with a self-signed cert and
+// fetch through fetch.Client without bypassing peer verification.
+// The test's cert pool is bounded to the test's CA so a regression
+// that accidentally accepts unrelated certs would still fail
+// verification.
+func SetRootCAsForTest(p *x509.CertPool) func() {
+	prev := rootCAsForTest.Swap(p)
+	return func() { rootCAsForTest.Store(prev) }
+}
 
 // errDialDenied is the sentinel returned from Dialer.ControlContext when a
 // resolved address falls inside one of the configured deny CIDRs. Fetch
@@ -98,6 +134,10 @@ func newTransport(opts Options, deny []netip.Prefix, tracker *unreachableTracker
 	if tracker != nil {
 		dialContext = wrapDialWithTracker(dialContext, tracker)
 	}
+	var tlsCfg *tls.Config
+	if pool := rootCAsForTest.Load(); pool != nil {
+		tlsCfg = &tls.Config{RootCAs: pool}
+	}
 	return &http.Transport{
 		Proxy:                 nil,
 		DialContext:           dialContext,
@@ -106,6 +146,7 @@ func newTransport(opts Options, deny []netip.Prefix, tracker *unreachableTracker
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   opts.ConnectTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       tlsCfg,
 	}
 }
 
