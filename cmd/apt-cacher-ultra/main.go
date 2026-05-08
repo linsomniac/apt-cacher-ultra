@@ -77,6 +77,14 @@ var (
 	// tens of microseconds typically. 1s is a generous ceiling.
 	tunnelDrainGrace = time.Second
 
+	// caLockTimeoutForTest, when > 0, overrides the §4.2.2 flock
+	// acquire timeout passed to tlsmitm.LoadOrGenerate. Production
+	// leaves it at zero so LoadOrGenerate's 30s default applies;
+	// tests set a sub-second value to exercise the lock-timeout
+	// emit path (mitm_ca_lock_timeout + mitm_ca_generation_failed)
+	// without sleeping.
+	caLockTimeoutForTest time.Duration = 0
+
 	// tmpSweepMaxAge is the SPEC §4.2 staleness threshold for orphaned
 	// partial downloads from previous crashes.
 	tmpSweepMaxAge = 5 * time.Minute
@@ -992,6 +1000,7 @@ func wireTlsMitm(ctx context.Context, cfg *config.Config, parser *proxy.Parser, 
 		AllowedHostRegex:     tmCfg.AllowedHostRegex,
 		AllowUnconstrainedCA: tmCfg.AllowUnconstrainedCA,
 		CALifetime:           tmCfg.CACertLifetime.Duration,
+		LockTimeout:          caLockTimeoutForTest,
 		LogFn: func(level, event string, fields map[string]any) {
 			emitTlsMitmLog(logger, level, event, fields)
 		},
