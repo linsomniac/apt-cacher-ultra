@@ -816,13 +816,13 @@ func writeInnerStatus(c *tls.Conn, status int, allow string) {
 // post-handshake call sites pass true. The flag is irrelevant for
 // every outcome other than `inner_stream_failed`.
 func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port int, clientAddr string, start time.Time, reason, deniedGate string, tlsReached bool) {
-	dur := time.Since(start).Seconds()
+	elapsed := time.Since(start)
 	fields := map[string]any{
-		"outcome":          string(outcome),
-		"host":             host,
-		"port":             port,
-		"client_addr":      clientAddr,
-		"duration_seconds": dur,
+		"outcome":     string(outcome),
+		"host":        host,
+		"port":        port,
+		"client_addr": clientAddr,
+		"duration_ms": elapsed.Milliseconds(),
 	}
 	if reason != "" {
 		fields["reason"] = reason
@@ -833,7 +833,7 @@ func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port i
 	h.deps.LogFn("warn", "mitm_connect", fields)
 	h.recordOutcome(outcome, tlsReached)
 	mitmConnectTotal.Inc(string(outcome))
-	mitmConnectDurationSeconds.Observe(dur)
+	mitmConnectDurationSeconds.Observe(elapsed.Seconds())
 }
 
 // infoConnect is the Info counterpart of warnConnect — used only
@@ -841,13 +841,13 @@ func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port i
 // always true at the call sites; it is taken as a parameter for
 // signature symmetry with warnConnect.
 func (h *ConnectHandler) infoConnect(outcome ConnectOutcome, host string, port int, clientAddr string, start time.Time, reason string, tlsReached bool) {
-	dur := time.Since(start).Seconds()
+	elapsed := time.Since(start)
 	fields := map[string]any{
-		"outcome":          string(outcome),
-		"host":             host,
-		"port":             port,
-		"client_addr":      clientAddr,
-		"duration_seconds": dur,
+		"outcome":     string(outcome),
+		"host":        host,
+		"port":        port,
+		"client_addr": clientAddr,
+		"duration_ms": elapsed.Milliseconds(),
 	}
 	if reason != "" {
 		fields["reason"] = reason
@@ -855,7 +855,7 @@ func (h *ConnectHandler) infoConnect(outcome ConnectOutcome, host string, port i
 	h.deps.LogFn("info", "mitm_connect", fields)
 	h.recordOutcome(outcome, tlsReached)
 	mitmConnectTotal.Inc(string(outcome))
-	mitmConnectDurationSeconds.Observe(dur)
+	mitmConnectDurationSeconds.Observe(elapsed.Seconds())
 }
 
 // recordOutcome forwards `outcome` to the §9.7.6 rolling counter

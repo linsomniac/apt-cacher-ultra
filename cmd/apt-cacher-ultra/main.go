@@ -1007,15 +1007,29 @@ func wireTlsMitm(ctx context.Context, cfg *config.Config, parser *proxy.Parser, 
 	leafLifetime := tmCfg.LeafCertLifetime.Duration
 	leafAlgoLabel := leafAlg.String()
 	// Wrap the gen function so each successful issuance bumps
-	// acu_mitm_cert_issued_total{algorithm}. Errors are not
-	// counted — they're already captured by acu_mitm_connect_total
+	// acu_mitm_cert_issued_total{algorithm} AND emits the §10.2
+	// `mitm_cert_issued` Debug log. Errors are not counted or logged
+	// here — they're already captured by acu_mitm_connect_total
 	// with outcome=cert_gen_failed.
+	//
+	// The Debug log is emitted BEFORE returning to LeafCache, which
+	// then runs Cache.insert under its mutex — this satisfies §10.2's
+	// "before insertion into the cache" ordering.
+	lifetimeSeconds := int64(leafLifetime.Seconds())
 	leafCache, err := tlsmitm.NewCache(tmCfg.CertCacheSize, func(host string) (*tls.Certificate, error) {
-		cert, err := tlsmitm.GenerateLeaf(host, ca.TLSCert, leafAlg, leafLifetime, time.Now())
+		genStart := time.Now()
+		cert, err := tlsmitm.GenerateLeaf(host, ca.TLSCert, leafAlg, leafLifetime, genStart)
 		if err != nil {
 			return nil, err
 		}
+		genDur := time.Since(genStart)
 		proxy.RecordCertIssued(leafAlgoLabel)
+		emitTlsMitmLog(logger, "debug", "mitm_cert_issued", map[string]any{
+			"host":             host,
+			"algorithm":        leafAlgoLabel,
+			"lifetime_seconds": lifetimeSeconds,
+			"gen_duration_ms":  genDur.Milliseconds(),
+		})
 		// SPEC6 §10.4: status-page "Last cert issued" feed. The
 		// host literal is the CONNECT target (single-SAN per
 		// §5.1.4), so this is the same string the operator typed
