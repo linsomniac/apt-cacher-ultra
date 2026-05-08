@@ -42,12 +42,11 @@ func TestServe_StatusPage_TLSMITMSection_ReflectsLiveCertIssuance(t *testing.T) 
 	t.Cleanup(func() { shutdownTimeout = oldTimeout })
 
 	// admin.New registers gauges into metrics.Default unconditionally.
-	// Snapshot names before the daemon brings up the admin server, then
-	// undo registration in cleanup so this test is idempotent under
-	// repeated invocation (-count=N) and doesn't poison metrics.Default
-	// for subsequent tests in the same process.
+	// Snapshot names before the daemon brings up the admin server; the
+	// shutdown cleanup below cancels the daemon AND THEN unregisters,
+	// so any refresher goroutine has finished writing to those gauges
+	// before we drop them from the registry.
 	preMetrics := metrics.Default.SnapshotNamesForTest()
-	t.Cleanup(func() { metrics.Default.UnregisterAddedSinceForTest(preMetrics) })
 
 	cacheDir := t.TempDir()
 	cfg := minimalCfg(cacheDir, nil)
@@ -88,12 +87,25 @@ func TestServe_StatusPage_TLSMITMSection_ReflectsLiveCertIssuance(t *testing.T) 
 	cfg.Admin.Listen = adminAddr
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	serveDone := make(chan error, 1)
 	go func() {
 		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, adminLn)
 	}()
+	// Single shutdown cleanup that runs before the metric unregister
+	// (t.Cleanup is LIFO). cancel() → wait serveDone → unregister.
+	// Any t.Fatalf path before the explicit shutdown below still
+	// follows this same ordering, which keeps the gauge refresher
+	// from racing the registry unwind.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-serveDone:
+		case <-time.After(15 * time.Second):
+			t.Errorf("serveListeners did not return on cleanup")
+		}
+		metrics.Default.UnregisterAddedSinceForTest(preMetrics)
+	})
 
 	if err := waitForDaemonReady(t, cacheAddr, 10*time.Second); err != nil {
 		t.Fatalf("daemon never became ready: %v", err)
@@ -108,26 +120,21 @@ func TestServe_StatusPage_TLSMITMSection_ReflectsLiveCertIssuance(t *testing.T) 
 	capturedAt := time.Now()
 
 	// GET /?format=json from the admin listener while the daemon
-	// is still up — the snapshot must reflect live state.
-	resp, err := http.Get("http://" + adminAddr + "/?format=json")
+	// is still up — the snapshot must reflect live state. Bounded
+	// timeout so a stalled admin handler fails the test instead of
+	// hanging until the global -timeout deadline.
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("http://" + adminAddr + "/?format=json")
 	if err != nil {
 		t.Fatalf("GET admin /?format=json: %v", err)
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
+	if readErr != nil {
+		t.Fatalf("read admin response body: %v", readErr)
+	}
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("admin /?format=json status=%d body=%s", resp.StatusCode, body)
-	}
-
-	// Now shut down. Test assertions can use the captured body.
-	cancel()
-	select {
-	case err := <-serveDone:
-		if err != nil {
-			t.Errorf("serveListeners: %v", err)
-		}
-	case <-time.After(15 * time.Second):
-		t.Fatalf("serveListeners did not return")
 	}
 
 	var payload struct {
