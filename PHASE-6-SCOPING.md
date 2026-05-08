@@ -1,9 +1,13 @@
 # apt-cacher-ultra — Phase 6 Scoping
 
-Status: **scoping in progress** (revision 1).
-Last updated 2026-05-07. Next artifact: `SPEC6.md` modeled on
-`SPEC5.md`'s structure, once the open-question table in §7 is closed
-and any further review feedback has been incorporated.
+Status: **scoping locked** (revision 2). Last updated 2026-05-07.
+Next artifact: `SPEC6.md` modeled on `SPEC5.md`'s structure.
+
+Revision 2 closes the §7 open-question table. Seven load-bearing
+questions (Q1, Q2, Q3, Q6, Q7, Q12, Q13) were answered explicitly;
+the nine remaining smaller details (Q4, Q5, Q8–Q11, Q14–Q16)
+accepted the proposed defaults. All sixteen resolutions are
+recorded in §1.2 below.
 
 This document gathers what Phase 6 is, the hooks Phases 1–5 left in
 place for it, and the design questions that need to be resolved
@@ -128,11 +132,91 @@ Newly deferred in Phase 6:
 
 ### 1.2 Resolved during Phase 6 scoping
 
-*(populated as the §7 question table closes)*
+The sixteen design questions raised in §7 of revision 1 were
+resolved with the operator during this scoping pass. Each
+resolution is normative for SPEC6.
 
-The design questions in §7 are open as of revision 1. As they
-resolve through review iteration, the resolutions move here and
-become normative for SPEC6.
+- **Default-on or default-off (Q1).** **Default OFF.** The feature
+  ships as `tls_mitm.enabled = false`; existing deployments
+  upgrade with zero behavior change. Rationale (operator):
+  enabling MITM requires distributing the cache's CA cert to
+  every client machine — fleet-wide ansible work that should be
+  an explicit operator decision, not a side effect of upgrade.
+- **CA origin (Q2).** **Both auto-generated and operator-supplied
+  are first-class.** When `tls_mitm.ca_cert` and `tls_mitm.ca_key`
+  are unset, the daemon auto-generates a CA at first start under
+  `cache_dir/ca/` (mode 0700 dir, mode 0600 files). When the two
+  paths are set, the daemon loads them directly; this is the
+  multi-cache path (operator generates one CA out of band and
+  distributes both the cache config and the CA to every cache
+  instance via ansible).
+- **Leaf cert algorithm (Q3).** **ECDSA P-256.** Smaller cert
+  (~250B vs ~1.1KB for RSA-2048), faster handshake, modern
+  client compatibility (Debian 10+ / Ubuntu 18.04+). Operators
+  needing pre-2018 client compat can override via
+  `tls_mitm.leaf_algorithm = "rsa2048"`; not the default.
+- **Leaf cert lifetime (Q4).** **30 days, regenerated on next
+  CONNECT after expiry.** In-memory cache only; restart re-issues
+  on first CONNECT. Configurable via `tls_mitm.leaf_cert_lifetime`.
+- **Cert cache scope (Q5).** **In-memory LRU bounded at 256
+  entries.** Eviction logged via `mitm_cert_cache_evicted`.
+  Configurable via `tls_mitm.cert_cache_size`.
+- **CONNECT host allowlist (Q6).** **Inherits
+  `upstream.allowed_host_regex` by default.** An optional
+  `tls_mitm.allowed_host_regex` narrows MITM-permitted hosts
+  further than upstream-permitted (empty = inherit). One regex
+  to maintain in the common case.
+- **Hot-reload (Q7).** **Fixed at startup.** A flip of
+  `tls_mitm.enabled` requires a daemon restart. Hot-reload defers
+  to a future phase if any deployment asks for it.
+- **Inner-request shape (Q8).** **GET only.** A CONNECT tunnel
+  that sends anything other than a single GET (POST, PUT, nested
+  CONNECT, multi-request keepalive within the tunnel) returns 405
+  on that inner request and closes the tunnel. apt does not need
+  more inside HTTPS; SPEC §2.6 is GET+HEAD-only on the proxy
+  listener regardless.
+- **Inner-GET observability (Q9).** **Inner GET produces the
+  existing `request` log line with a new field `mitm=true`;
+  the outer CONNECT produces a separate `mitm_connect` line.**
+  `acu_request_total{outcome=...}` counts MITM-fetched and
+  plain-fetched requests with the same labels — operators
+  computing cache-hit-rate get one number across both paths.
+- **Status page surface (Q10).** **New top-level "TLS MITM"
+  section between "Listeners" and "Cache" on the §10.5 page.**
+  Fields: enabled, CA source (`generated`/`supplied`), CA
+  SHA-256 fingerprint, CA `not_after`, cert-cache size +
+  capacity, last cert issued (timestamp + canonical_host).
+- **Default config block (Q11).** **Yes — ship the complete
+  `[tls_mitm]` block commented in
+  `packaging/config/config.toml.default`.** Operators reading
+  the default config see the feature exists, with inline notes
+  explaining each tunable.
+- **CA distribution helper (Q12).** **Yes — ship
+  `apt-cacher-ultra ca print` subcommand.** Reads the CA cert
+  from the configured path (auto-generated or operator-supplied),
+  writes PEM to stdout, exit 1 if MITM disabled. ansible captures
+  stdout and pushes the cert to clients. Pins the convention so
+  the operator does not memorize file paths.
+- **`http://HTTPS///` deprecation (Q13).** **Not deprecated.
+  Coexists indefinitely.** The URL-prefix convention is harmless
+  alongside MITM and remains an option — operators who don't want
+  to distribute a CA keep using it.
+- **`apt.conf.d` snippet (Q14).** **Behind `--print-apt-conf`
+  flag, not at every startup.** Operator runs the flag once
+  during fleet rollout to capture the recommended snippet
+  (proxy URL, CAInfo path, etc.); a startup printout would noise
+  the journal at every restart.
+- **CA key rotation (Q15).** **Out of scope for Phase 6.**
+  Rotation requires fleet coordination; operators who need it
+  generate a new CA out of band, push to clients via ansible,
+  reconfigure the daemon. A future phase can add a rotation
+  subcommand once the operational pattern is clear.
+- **Multi-cache deployments (Q16).** **The operator-supplied CA
+  path is the documented multi-cache solution.** Phase 6 ships
+  no clustering primitive; "every cache shares one CA" reduces
+  to "ansible distributes the same `ca_cert`+`ca_key` to every
+  cache instance." Auto-generated CA continues to serve the
+  single-cache default.
 
 ---
 
@@ -391,36 +475,12 @@ Phase 6 is gated on:
 
 ---
 
-## 7. Open scoping questions
+## 7. Questions
 
-These are the design questions the operator needs to answer before
-this becomes a locked SPEC6.md. Each row carries a default
-proposal so the operator can answer with "yes, that default" or
-"no, here's why" rather than starting from zero.
-
-| # | Question | Default proposal | Rationale to confirm or override |
-|---|----------|-----------------|----------------------------------|
-| Q1 | **Phase 6 default-on or default-off?** When `tls_mitm` is configured but not explicitly enabled, does the feature run? | **Default OFF.** `tls_mitm.enabled = false` ships as default. Operator opts in. | Default-on requires fleet CA distribution before upgrade, which breaks the "minimize fleet ansible churn" preference. Default-off keeps existing deployments at zero-change-on-upgrade. |
-| Q2 | **CA origin: auto-generate or operator-supplied (or both)?** | **Both.** If `ca_cert`/`ca_key` are set, use those. Otherwise auto-generate at first start under `cache_dir/ca/`. | Single-cache deployments benefit from auto-generate (zero ceremony); multi-cache deployments require operator-supplied (one shared CA). Defaulting "both supported, auto-generate when unset" covers both populations. |
-| Q3 | **Leaf cert algorithm.** | **ECDSA P-256.** | Smaller cert (~250B vs ~1.1KB for RSA-2048), faster handshake (~3× CPU saving), modern client compatibility (Debian 10+ / Ubuntu 18.04+ all support). Operators who must support pre-2018 clients can override to RSA-2048 via `tls_mitm.leaf_algorithm`. |
-| Q4 | **Leaf cert lifetime.** | **30 days, regenerated on next CONNECT after expiry.** | Long enough to keep the cert cache useful across reasonable uptime; short enough that an exposed leaf can't be abused for long. The cache only keeps in-memory copies — restart re-issues. |
-| Q5 | **Cert cache scope.** | **In-memory only, LRU bounded at 256 entries.** | The cost of regenerating a leaf cert is ~5–20ms; the cost of persisting + reloading is more code and a synchronization concern across restarts. 256 entries covers typical fleet-of-suites distributions; bumpable via config. |
-| Q6 | **CONNECT host allowlist.** | **Inherit `upstream.allowed_host_regex` from §1 for the CONNECT target by default.** Operators can narrow further with `tls_mitm.allowed_host_regex` (empty = inherit). | One regex to maintain by default; the explicit MITM-narrower exists for operators who want HTTPS-via-MITM for a smaller set than HTTPS-via-`HTTPS///`-prefix. |
-| Q7 | **Hot-reload for CA / enabled flag.** | **Phase 6 ships fixed-at-startup.** Hot-reload defers to Phase 7. | A clean `tls_mitm.enabled` toggle on a running daemon is operationally nice but adds non-trivial code (atomic-swap CA + cert-cache flush + handler routing flip) for a feature whose operational cadence is "configure once". |
-| Q8 | **Inner request shape.** | **GET only.** A CONNECT tunnel that sends anything other than a single GET (POST, PUT, nested CONNECT, HTTP/2, multi-request HTTP/1.1 keepalive within the same tunnel) returns 405 / drops the tunnel. | apt does not use POST/PUT for repository access (SPEC §2.6 is clear on GET+HEAD). Allowing more inside the tunnel would expand the surface for no apt benefit. |
-| Q9 | **Phase 6 inner-GET observability.** Should the inner GET produce a separate `request_outcome` log line, or share the outer CONNECT line? | **Separate.** The CONNECT line says `outcome=tunneled` once; the inner GET produces the existing `request` log line with a new field `mitm=true`. | Existing parsers already key on `request` events; keeping the inner GET shape unchanged means `acu_request_total{outcome=...}` counts MITM-fetched and plain-fetched requests with the same labels (which is what an operator wants for "cache hit rate" math). |
-| Q10 | **Status-page surface.** Where in the SPEC5 §10.5 status page does the TLS MITM block render? | **New top-level section "TLS MITM" between "Listeners" and "Cache".** Fields: enabled (bool), CA source (`generated`/`supplied`), CA SHA-256 fingerprint, CA `not_after`, cert-cache size + capacity, last cert issued (timestamp + canonical_host). | Discoverable next to the listener-bind summary the operator already reads at startup. |
-| Q11 | **Default `[tls_mitm]` block.** Ship a complete commented default in `packaging/config/config.toml.default` so an operator who reads the default config sees the feature exists. | **Yes.** All keys present, all commented out, with the §3.4 inline notes explaining what each does. | Discoverability — operators who don't know the feature exists won't enable it. The conservative defaults make the commented-out form self-documenting. |
-| Q12 | **CA distribution helper.** Ship a `apt-cacher-ultra ca print` (or similar) subcommand that emits the CA cert PEM to stdout so the ansible role can capture it and push to clients? | **Yes.** Subcommand that reads the CA cert from the configured path and writes PEM to stdout. Exit 1 if MITM is disabled. | Avoids a brittle "operator types `cat cache_dir/ca/ca.crt`" — the subcommand pins the convention and survives `ca_storage_dir` changes. |
-| Q13 | **`http://HTTPS///` deprecation timeline.** Is the URL-prefix convention deprecated once MITM ships? | **Not deprecated. Coexists indefinitely.** | The convention is harmless when MITM is also available. Deprecating it would force fleet config churn — exactly what we're trying to avoid. |
-| Q14 | **`apt.conf.d` snippet generation.** Should the daemon emit a recommended apt-conf snippet at startup so the operator can copy it directly? | **Yes, behind `--print-apt-conf` flag (not at every startup).** The snippet documents the proxy URL, the CA path, and any required `Acquire::https::CAInfo` lines. | A startup printout would noise the journal; a one-time `apt-cacher-ultra --print-apt-conf` invocation is what an operator would actually use during initial fleet rollout. |
-| Q15 | **CA key rotation.** What's the rotation story? | **Out of scope for Phase 6.** Operators who need rotation generate a new CA out of band, distribute it to the fleet, then reconfigure the daemon. | Rotation requires fleet coordination; the daemon doesn't have a mechanism that beats "operator runs ansible". A future phase could add `apt-cacher-ultra ca rotate` once the operational pattern is clear. |
-| Q16 | **Multi-cache deployments.** Does Phase 6 need to formalize "all caches share one CA" beyond the operator-supplied path? | **No, the operator-supplied path is the documented multi-cache solution.** | Phase 6 doesn't ship a clustering primitive; "all caches use the same CA" reduces to "operator distributes the same `ca_cert`/`ca_key` to every cache via ansible". |
-
-Of these, **Q1, Q2, Q3, Q6, Q7, Q12, Q13** are the load-bearing
-questions — different answers materially change the SPEC. The
-others are small details that can be answered "yes default" if no
-specific concern surfaces.
+All sixteen questions raised at scoping kickoff are resolved
+(§1.2). No open questions remain. If implementation surfaces new
+tensions the answers should be added here as resolutions, then
+promoted to SPEC6.md.
 
 ---
 
