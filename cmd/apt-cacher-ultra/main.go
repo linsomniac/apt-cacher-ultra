@@ -64,6 +64,12 @@ var (
 	// Variable rather than const so tests can point it at a tempdir
 	// without requiring root.
 	keyringDirs = []string{gpg.DefaultTrustedGPGDir, gpg.DefaultKeyringsDir}
+
+	// mitmUndistributedRefreshInterval is the SPEC6 §9.7.6 cadence
+	// the `tls_mitm_enabled_ca_undistributed` Warn refresher wakes
+	// at — once per uptime hour in production. Variable so tests
+	// can shorten it.
+	mitmUndistributedRefreshInterval = 1 * time.Hour
 )
 
 func main() {
@@ -442,10 +448,13 @@ func serveListeners(
 	// BEFORE Server.Serve starts accepting traffic. h.connect is read
 	// concurrently from ServeHTTP and writing it after the listener
 	// is up would race those reads — see Handler.SetConnectHandler.
+	var connectStats *proxy.ConnectStats
 	if cfg.TlsMitm.Enabled {
-		if err := wireTlsMitm(cfg, parser, fetchClient, h, logger); err != nil {
+		s, err := wireTlsMitm(cfg, parser, fetchClient, h, logger)
+		if err != nil {
 			return fmt.Errorf("build tls_mitm: %w", err)
 		}
+		connectStats = s
 	}
 
 	// SPEC §7.4: start the periodic refresh scheduler. The scheduler
@@ -490,6 +499,28 @@ func serveListeners(
 		defer gcWG.Done()
 		gcsvc.Run(freshCtx)
 	}()
+
+	// SPEC6 §9.7.6 tls_mitm_enabled_ca_undistributed refresher.
+	// Wakes once per uptime hour, reads the rolling 30-minute
+	// CONNECT outcome counter, and emits a Warn when the predicate
+	// holds (failures >= 1 AND successes == 0) — surfacing
+	// "operator turned on MITM but no client trusts the CA" to the
+	// journal where it's actionable. Started only when MITM is
+	// enabled (connectStats nil otherwise).
+	var mitmWatchWG sync.WaitGroup
+	if connectStats != nil {
+		mitmWatchWG.Add(1)
+		go func() {
+			defer mitmWatchWG.Done()
+			proxy.RunUndistributedCAWatch(freshCtx, connectStats, mitmUndistributedRefreshInterval, func(successes, failures int) {
+				logger.Warn("tls_mitm_enabled_ca_undistributed",
+					"window_minutes", 30,
+					"tls_success_count", successes,
+					"tls_failure_count", failures,
+					"detail", "MITM is enabled and at least one TLS handshake failed in the last 30 minutes with zero successes — clients likely don't yet trust the CA; verify CA distribution to clients")
+			})
+		}()
+	}
 
 	// SPEC5 §9.7 admin listener. Built only when admin.enabled.
 	// BuildInfo is composed here because internal/admin cannot
@@ -662,6 +693,11 @@ func serveListeners(
 	// so the writer goroutine isn't asked to run a GC batch
 	// against a closing cache.
 	gcWG.Wait()
+	// SPEC6 §9.7.6 mitm refresher rides on the same freshCtx —
+	// drained alongside the rest of the periodic-goroutine cohort.
+	// When MITM is disabled, mitmWatchWG.Add was never called and
+	// Wait returns immediately.
+	mitmWatchWG.Wait()
 
 	// SPEC §9.5 step 3: cancel any in-flight upstream fetches (which
 	// outlive the request ctx by design — see handler.serveCacheMiss)
@@ -837,7 +873,7 @@ func newHTTPServer(h http.Handler, logger *slog.Logger) *http.Server {
 // Step 5 is the wiring's load-bearing constraint: writing
 // h.connect after the listener has started accepting traffic
 // would race ServeHTTP's read of the same field.
-func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Client, h *handler.Handler, logger *slog.Logger) error {
+func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Client, h *handler.Handler, logger *slog.Logger) (*proxy.ConnectStats, error) {
 	tmCfg := cfg.TlsMitm
 
 	ca, err := tlsmitm.LoadOrGenerate(tlsmitm.LoadOptions{
@@ -852,19 +888,19 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 		},
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	leafAlg, err := tlsmitm.ParseLeafAlgorithm(tmCfg.LeafAlgorithm)
 	if err != nil {
-		return fmt.Errorf("invalid leaf_algorithm: %w", err)
+		return nil, fmt.Errorf("invalid leaf_algorithm: %w", err)
 	}
 	leafLifetime := tmCfg.LeafCertLifetime.Duration
 	leafCache, err := tlsmitm.NewCache(tmCfg.CertCacheSize, func(host string) (*tls.Certificate, error) {
 		return tlsmitm.GenerateLeaf(host, ca.TLSCert, leafAlg, leafLifetime, time.Now())
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var signingGate func(string) bool
@@ -872,7 +908,7 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 		re, err := regexp.Compile(tmCfg.AllowedHostRegex)
 		if err != nil {
 			// Validate already compiled it; this should be unreachable.
-			return fmt.Errorf("compile tls_mitm.allowed_host_regex: %w", err)
+			return nil, fmt.Errorf("compile tls_mitm.allowed_host_regex: %w", err)
 		}
 		signingGate = func(literalHost string) bool {
 			return re.MatchString(literalHost)
@@ -883,6 +919,7 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"http/1.1"},
 	}
+	stats := proxy.NewConnectStats()
 	connectHandler, err := proxy.NewConnectHandler(proxy.HandlerDeps{
 		CA:           ca,
 		LeafCache:    leafCache,
@@ -891,12 +928,13 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 		Canonicalize: parser.CanonicalHost,
 		Dispatch:     h.ServeHTTP,
 		TLSConfig:    tlsTemplate,
+		Stats:        stats,
 		LogFn: func(level, event string, fields map[string]any) {
 			emitTlsMitmLog(logger, level, event, fields)
 		},
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	h.SetConnectHandler(connectHandler)
 
@@ -932,7 +970,7 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 			"upstream_allowed_host_regex", cfg.Upstream.AllowedHostRegex,
 		)
 	}
-	return nil
+	return stats, nil
 }
 
 // emitTlsMitmLog forwards a structured event from internal/proxy or

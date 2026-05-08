@@ -330,6 +330,13 @@ type HandlerDeps struct {
 	// LogFn is the structured-event sink for §10.1 mitm_connect
 	// log lines. nil = swallow.
 	LogFn func(level, event string, fields map[string]any)
+
+	// Stats, when non-nil, receives a Record(outcome) call for
+	// every CONNECT outcome the handler emits. The §9.7.6
+	// refresher reads its rolling window for the
+	// `tls_mitm_enabled_ca_undistributed` Warn. Optional — leaving
+	// it nil makes outcome recording a no-op.
+	Stats *ConnectStats
 }
 
 // ConnectHandler holds the SPEC6 §2.2 CONNECT pipeline. Construct
@@ -705,6 +712,7 @@ func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port i
 		fields["denied_gate"] = deniedGate
 	}
 	h.deps.LogFn("warn", "mitm_connect", fields)
+	h.recordOutcome(outcome)
 }
 
 func (h *ConnectHandler) infoConnect(outcome ConnectOutcome, host string, port int, clientAddr string, start time.Time, reason string) {
@@ -719,4 +727,14 @@ func (h *ConnectHandler) infoConnect(outcome ConnectOutcome, host string, port i
 		fields["reason"] = reason
 	}
 	h.deps.LogFn("info", "mitm_connect", fields)
+	h.recordOutcome(outcome)
+}
+
+// recordOutcome forwards `outcome` to the §9.7.6 rolling counter
+// when one is wired. The counter classifies internally; pre-TLS
+// rejections are silently dropped.
+func (h *ConnectHandler) recordOutcome(outcome ConnectOutcome) {
+	if h.deps.Stats != nil {
+		h.deps.Stats.Record(outcome)
+	}
 }
