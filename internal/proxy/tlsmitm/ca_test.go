@@ -812,6 +812,165 @@ func TestLoadOrGenerate_Supplied_KeyUsageAbsentIsAccepted(t *testing.T) {
 	}
 }
 
+// TestWriteCAAtomically_FaultAtEachStep walks every numbered §4.2.1
+// write step, injects a synthetic failure, and verifies that:
+//
+//  1. LoadOrGenerate returns an error and emits the
+//     mitm_ca_generation_failed log.
+//  2. The on-disk state matches the SPEC6 §4.2.1 "kill mid-write"
+//     disposition table — case 1 (clean) for failures before any
+//     real file is committed, case 3 (inconsistent) for failures
+//     after the first rename, and case 2 (committed) for the
+//     post-rename fsync that fails after the marker is on disk.
+//  3. No *.tmp residue is left behind. The deferred cleanup is the
+//     contract that lets the next start re-enter the case-1 branch
+//     when no real files were committed.
+//
+// The fault-injection seam is `writeCAStepHook`. Each test case
+// overrides it for the duration of the run, restoring the previous
+// value on defer.
+func TestWriteCAAtomically_FaultAtEachStep(t *testing.T) {
+	cases := []struct {
+		name      string
+		step      writeCAStep
+		wantState caStateKind
+		wantCert  bool
+		wantKey   bool
+		wantReady bool
+	}{
+		{"step 5 — write ca.crt.tmp", stepWriteCertTmp, caStateClean, false, false, false},
+		{"step 6 — write ca.key.tmp", stepWriteKeyTmp, caStateClean, false, false, false},
+		{"step 7a — rename ca.crt", stepRenameCert, caStateClean, false, false, false},
+		{"step 7b — rename ca.key", stepRenameKey, caStateInconsistent, true, false, false},
+		{"step 8 — fsync dir #1", stepFsyncDir1, caStateInconsistent, true, true, false},
+		{"step 9 — write ca.ready.tmp", stepWriteReadyTmp, caStateInconsistent, true, true, false},
+		{"step 10a — rename ca.ready", stepRenameReady, caStateInconsistent, true, true, false},
+		{"step 10b — fsync dir #2 (post-commit)", stepFsyncDir2, caStateCommitted, true, true, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			restore := setWriteCAStepHookForTest(func(s writeCAStep) error {
+				if s == tc.step {
+					return fmt.Errorf("synthetic fault at %s", s)
+				}
+				return nil
+			})
+			defer restore()
+
+			spy := &loggerSpy{}
+			_, err := LoadOrGenerate(LoadOptions{
+				StorageDir:           dir,
+				AllowUnconstrainedCA: true,
+				LogFn:                spy.fn(),
+			})
+			if err == nil {
+				t.Fatal("expected error from generate path; got nil")
+			}
+			if !strings.Contains(err.Error(), tc.step.String()) && !strings.Contains(err.Error(), "synthetic") {
+				t.Errorf("error %q does not mention step %s or synthetic", err.Error(), tc.step)
+			}
+			if !spy.has("mitm_ca_generation_failed") {
+				t.Error("missing mitm_ca_generation_failed log event")
+			}
+
+			// No *.tmp residue.
+			entries, derr := os.ReadDir(dir)
+			if derr != nil {
+				t.Fatalf("ReadDir: %v", derr)
+			}
+			for _, e := range entries {
+				if strings.HasSuffix(e.Name(), ".tmp") {
+					t.Errorf("post-fault tmp residue left: %s", e.Name())
+				}
+			}
+
+			// On-disk real-file presence matches the spec table.
+			gotCert := fileExists(t, dir, caCertFile)
+			gotKey := fileExists(t, dir, caKeyFile)
+			gotReady := fileExists(t, dir, caReadyFile)
+			if gotCert != tc.wantCert || gotKey != tc.wantKey || gotReady != tc.wantReady {
+				t.Errorf("real-file presence: cert=%v key=%v ready=%v; want cert=%v key=%v ready=%v",
+					gotCert, gotKey, gotReady, tc.wantCert, tc.wantKey, tc.wantReady)
+			}
+
+			// scanCAState returns the documented disposition.
+			state, serr := scanCAState(dir)
+			if serr != nil {
+				t.Fatalf("scanCAState: %v", serr)
+			}
+			if state.kind != tc.wantState {
+				t.Errorf("state.kind = %v, want %v (reason=%q)", state.kind, tc.wantState, state.reason)
+			}
+		})
+	}
+}
+
+// TestWriteCAAtomically_FaultAtFsync2_NextStartLoads exercises the
+// step-10b interesting case: the fsync of the parent dir after the
+// marker rename fails (e.g. medium error), so writeCAAtomically
+// returns an error to the caller — but the rename of ca.ready already
+// completed, so on a subsequent start (no fault), case 2 fires and
+// the CA loads cleanly. This is the deterministic load-or-refuse
+// promise SPEC6 §4.2.1 makes for the post-commit fsync class of
+// failures.
+func TestWriteCAAtomically_FaultAtFsync2_NextStartLoads(t *testing.T) {
+	dir := t.TempDir()
+	restore := setWriteCAStepHookForTest(func(s writeCAStep) error {
+		if s == stepFsyncDir2 {
+			return errors.New("synthetic fsync2 fault")
+		}
+		return nil
+	})
+
+	spy := &loggerSpy{}
+	_, err := LoadOrGenerate(LoadOptions{
+		StorageDir:           dir,
+		AllowUnconstrainedCA: true,
+		LogFn:                spy.fn(),
+	})
+	if err == nil {
+		t.Fatal("expected error from first generate")
+	}
+	restore()
+
+	// Next start, no fault — should load case 2 cleanly.
+	spy2 := &loggerSpy{}
+	ca, err := LoadOrGenerate(LoadOptions{
+		StorageDir:           dir,
+		AllowUnconstrainedCA: true,
+		LogFn:                spy2.fn(),
+	})
+	if err != nil {
+		t.Fatalf("second start should load committed CA, got error: %v", err)
+	}
+	if ca == nil || ca.Cert == nil {
+		t.Fatal("nil CA on second start")
+	}
+	if !spy2.has("mitm_ca_loaded") {
+		t.Error("second start did not emit mitm_ca_loaded")
+	}
+	// Must NOT have re-generated.
+	if spy2.has("mitm_ca_generated") {
+		t.Error("second start incorrectly re-generated instead of loading")
+	}
+}
+
+// fileExists is a small test helper that returns whether <dir>/<name>
+// exists as a regular file (not directory, not missing).
+func fileExists(t *testing.T, dir, name string) bool {
+	t.Helper()
+	info, err := os.Stat(filepath.Join(dir, name))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+		t.Fatalf("stat %s/%s: %v", dir, name, err)
+	}
+	return info.Mode().IsRegular()
+}
+
 // ----------------------------------------------------------------------------
 // Helper used internally by ca_test.go.
 // ----------------------------------------------------------------------------

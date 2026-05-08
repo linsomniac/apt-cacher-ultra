@@ -123,20 +123,26 @@ func translateAlternation(re *syntax.Regexp) ([]string, error) {
 	return out, nil
 }
 
-// translatePrefixSuffix accepts shapes 2 and 3.
+// translatePrefixSuffix accepts shapes 2 and 3 ONLY in the exact
+// syntactic forms SPEC6 §5.1.1.1 enumerates. Anything else — even
+// shapes that are semantically a single-label prefix and would
+// produce a sound over-approximation — is rejected. The fail-closed
+// contract is "translate exactly what the spec lists or fall back to
+// the unconstrained-CA refusal path"; broadening the accepted grammar
+// would be a §5.1.1.1 spec change, not an implementation detail.
 //
-// Shape 2 — `[charclass]+\.literal_suffix`:
+// Shape 2 — `[a-z0-9-]+\.suffix` or `[^.]+\.suffix`:
 //
-//	head = OpPlus(CharClass) where the class does NOT admit '.'
-//	tail = OpLiteral starting with '.'
+//	head  = OpPlus(CharClass) where the class is exactly LDH-no-dot
+//	        OR exactly the negated-dot class
+//	tail  = OpLiteral starting with '.'
 //	result = tail without the leading '.'
 //
-// Shape 3 — `(charclass{n,m}\.)?literal_suffix`:
+// Shape 3 — `([a-z]{2}\.)?suffix` (two-letter region prefix):
 //
-//	head = OpQuest(Concat(label-chunks..., OpLiteral(".")))
-//	tail = OpLiteral NOT starting with '.'  (the '.' was donated by
-//	       the optional prefix)
-//	label-chunks = CharClass / Literal-without-'.' / OpRepeat(... single-label-chunk)
+//	head  = OpQuest(Concat(CharClass[a-z], CharClass[a-z], OpLiteral(".")))
+//	tail  = OpLiteral NOT starting with '.'  (the '.' was donated by
+//	         the optional prefix)
 //	result = tail as-is
 func translatePrefixSuffix(inner *syntax.Regexp) (string, error) {
 	if inner.Op != syntax.OpConcat {
@@ -155,7 +161,7 @@ func translatePrefixSuffix(inner *syntax.Regexp) (string, error) {
 	// Shape 2.
 	if head.Op == syntax.OpPlus && len(head.Sub) == 1 {
 		body := unwrapCapture(head.Sub[0])
-		if body.Op == syntax.OpCharClass && !classAdmitsDot(body.Rune) {
+		if body.Op == syntax.OpCharClass && isShape2CharClass(body.Rune) {
 			if !strings.HasPrefix(tailHost, ".") {
 				return "", ErrNameConstraintsUnsupported
 			}
@@ -172,27 +178,63 @@ func translatePrefixSuffix(inner *syntax.Regexp) (string, error) {
 		body := unwrapCapture(head.Sub[0])
 		if body.Op == syntax.OpConcat {
 			bodySubs := flattenConcat(body)
-			if len(bodySubs) >= 2 {
-				last := unwrapCapture(bodySubs[len(bodySubs)-1])
-				if last.Op == syntax.OpLiteral && string(last.Rune) == "." {
-					allLabel := true
-					for _, b := range bodySubs[:len(bodySubs)-1] {
-						if !isSingleLabelChunk(unwrapCapture(b)) {
-							allLabel = false
-							break
-						}
+			// Exactly two [a-z] char classes followed by a literal ".".
+			if len(bodySubs) == 3 {
+				c1 := unwrapCapture(bodySubs[0])
+				c2 := unwrapCapture(bodySubs[1])
+				last := unwrapCapture(bodySubs[2])
+				if isAZCharClass(c1) && isAZCharClass(c2) &&
+					last.Op == syntax.OpLiteral && string(last.Rune) == "." {
+					if err := validateHostname(tailHost); err != nil {
+						return "", err
 					}
-					if allLabel {
-						if err := validateHostname(tailHost); err != nil {
-							return "", err
-						}
-						return tailHost, nil
-					}
+					return tailHost, nil
 				}
 			}
 		}
 	}
 	return "", ErrNameConstraintsUnsupported
+}
+
+// isShape2CharClass reports whether rs is exactly one of the two
+// shape-2 character classes SPEC6 §5.1.1.1 lists: `[a-z0-9-]` or
+// `[^.]`. Other non-dot-admitting classes (e.g. `[a-z]`, `[A-Z]`,
+// `[a-zA-Z0-9-]`) are rejected — even though they would be safe
+// over-approximations — because the spec enumerates the accepted
+// grammar exhaustively.
+func isShape2CharClass(rs []rune) bool {
+	// `[a-z0-9-]` → ['-', '-', '0', '9', 'a', 'z']
+	ldh := []rune{'-', '-', '0', '9', 'a', 'z'}
+	if runesEqual(rs, ldh) {
+		return true
+	}
+	// `[^.]` → complement of '.': [0, '.'-1] ∪ ['.'+1, MaxRune]
+	// Go's regexp/syntax encodes MaxRune as 0x10FFFF (unicode.MaxRune).
+	const maxRune rune = 0x10FFFF
+	notDot := []rune{0, '.' - 1, '.' + 1, maxRune}
+	return runesEqual(rs, notDot)
+}
+
+// isAZCharClass reports whether re is exactly the `[a-z]` char class
+// (Rune slice ['a', 'z']). Used to vet the body of a shape-3 prefix.
+func isAZCharClass(re *syntax.Regexp) bool {
+	if re.Op != syntax.OpCharClass {
+		return false
+	}
+	expected := []rune{'a', 'z'}
+	return runesEqual(re.Rune, expected)
+}
+
+func runesEqual(a, b []rune) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // asLiteralHost returns the concatenation of every OpLiteral in the
@@ -221,49 +263,6 @@ func asLiteralHost(re *syntax.Regexp) (string, bool) {
 		return sb.String(), true
 	}
 	return "", false
-}
-
-// isSingleLabelChunk reports whether a regex node represents a chunk
-// of hostname-label material that cannot contain a '.'. Used to vet
-// the body of a shape-3 optional prefix.
-func isSingleLabelChunk(re *syntax.Regexp) bool {
-	re = unwrapCapture(re)
-	switch re.Op {
-	case syntax.OpCharClass:
-		return !classAdmitsDot(re.Rune)
-	case syntax.OpLiteral:
-		for _, r := range re.Rune {
-			if r == '.' {
-				return false
-			}
-		}
-		return true
-	case syntax.OpPlus, syntax.OpStar, syntax.OpQuest, syntax.OpRepeat:
-		if len(re.Sub) != 1 {
-			return false
-		}
-		return isSingleLabelChunk(re.Sub[0])
-	case syntax.OpConcat:
-		for _, sub := range flattenConcat(re) {
-			if !isSingleLabelChunk(unwrapCapture(sub)) {
-				return false
-			}
-		}
-		return true
-	}
-	return false
-}
-
-// classAdmitsDot reports whether a CharClass.Rune-formatted slice (a
-// flat list of inclusive [lo, hi] pairs) contains the rune '.'.
-func classAdmitsDot(rs []rune) bool {
-	const dot rune = '.'
-	for i := 0; i+1 < len(rs); i += 2 {
-		if rs[i] <= dot && dot <= rs[i+1] {
-			return true
-		}
-	}
-	return false
 }
 
 // flattenConcat returns the sub-nodes of a (possibly nested) OpConcat

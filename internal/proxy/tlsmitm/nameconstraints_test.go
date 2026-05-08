@@ -78,6 +78,19 @@ func TestTranslateRegex_RejectedShapes(t *testing.T) {
 		{"hostname starts with dot", `^\.foo\.com$`},
 		{"hostname ends with dot", `^foo\.com\.$`},
 		{"alternation with non-literal alt", `^(foo\.com|.*)$`},
+
+		// SPEC6 §5.1.1.1 enumerates the accepted grammar exhaustively;
+		// other shapes that "look safe" are still rejected so the
+		// translator's accepted set tracks the spec exactly. If the spec
+		// is broadened later, these cases move to TestTranslateRegex_AcceptedShapes.
+		{"shape 2: narrower than spec — [a-z]+", `^[a-z]+\.foo\.com$`},
+		{"shape 2: narrower than spec — [A-Z]+", `^[A-Z]+\.foo\.com$`},
+		{"shape 2: broader than spec — [a-zA-Z0-9-]+", `^[a-zA-Z0-9-]+\.foo\.com$`},
+		{"shape 2: negated class other than [^.]", `^[^.x]+\.foo\.com$`},
+		{"shape 3: three-letter prefix not blessed by spec", `^([a-z]{3}\.)?archive\.ubuntu\.com$`},
+		{"shape 3: one-letter prefix not blessed by spec", `^([a-z]\.)?archive\.ubuntu\.com$`},
+		{"shape 3: unbounded prefix", `^([a-z]+\.)?archive\.ubuntu\.com$`},
+		{"shape 3: uppercase region prefix", `^([A-Z]{2}\.)?archive\.ubuntu\.com$`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

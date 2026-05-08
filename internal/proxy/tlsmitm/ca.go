@@ -625,6 +625,64 @@ func generateAndPersist(opts LoadOptions) (*CA, error) {
 	return ca, nil
 }
 
+// writeCAStep names a SPEC6 §4.2.1 numbered step that writeCAAtomically
+// performs. The values exist solely so tests can inject a synthetic
+// failure at a chosen step (via writeCAStepHook) and assert the
+// resulting on-disk state matches the §4.2.1 disposition table.
+type writeCAStep int
+
+const (
+	stepWriteCertTmp  writeCAStep = iota // §4.2.1 step 5
+	stepWriteKeyTmp                      // step 6
+	stepRenameCert                       // step 7a
+	stepRenameKey                        // step 7b
+	stepFsyncDir1                        // step 8
+	stepWriteReadyTmp                    // step 9
+	stepRenameReady                      // step 10a
+	stepFsyncDir2                        // step 10b (final)
+)
+
+func (s writeCAStep) String() string {
+	switch s {
+	case stepWriteCertTmp:
+		return "write-ca.crt.tmp"
+	case stepWriteKeyTmp:
+		return "write-ca.key.tmp"
+	case stepRenameCert:
+		return "rename-ca.crt"
+	case stepRenameKey:
+		return "rename-ca.key"
+	case stepFsyncDir1:
+		return "fsync-dir-1"
+	case stepWriteReadyTmp:
+		return "write-ca.ready.tmp"
+	case stepRenameReady:
+		return "rename-ca.ready"
+	case stepFsyncDir2:
+		return "fsync-dir-2"
+	}
+	return "unknown"
+}
+
+// writeCAStepHook is a TEST-ONLY fault-injection seam. Production code
+// leaves it nil. When non-nil, writeCAAtomically calls it BEFORE each
+// numbered §4.2.1 step; a non-nil error short-circuits that step (and
+// every subsequent step) so the cleanup-and-return path runs exactly
+// as it would for a real I/O failure.
+//
+// Tests use setWriteCAStepHookForTest, which returns a restore closure
+// for use in defer. Reads/writes of this var are not synchronized — the
+// fault-injection tests are sequential.
+var writeCAStepHook func(writeCAStep) error
+
+// setWriteCAStepHookForTest installs a step hook and returns a restore
+// closure callers should defer. Use to drive fault-injection tests.
+func setWriteCAStepHookForTest(h func(writeCAStep) error) func() {
+	prev := writeCAStepHook
+	writeCAStepHook = h
+	return func() { writeCAStepHook = prev }
+}
+
 // writeCAAtomically materializes the cert + key + marker trio per
 // SPEC6 §4.2.1 steps 4–11. Caller holds the §4.2.2 flock.
 //
@@ -651,27 +709,58 @@ func writeCAAtomically(dir string, certPEM, keyPEM []byte, markerFP string) (ret
 		return err
 	}
 
+	fail := func(s writeCAStep) error {
+		if writeCAStepHook == nil {
+			return nil
+		}
+		return writeCAStepHook(s)
+	}
+
+	if err := fail(stepWriteCertTmp); err != nil {
+		return fmt.Errorf("tlsmitm: write ca.crt.tmp: %w", err)
+	}
 	if err := writeFileSync(filepath.Join(dir, caCertFile+".tmp"), certPEM, 0o600); err != nil {
 		return fmt.Errorf("tlsmitm: write ca.crt.tmp: %w", err)
+	}
+	if err := fail(stepWriteKeyTmp); err != nil {
+		return fmt.Errorf("tlsmitm: write ca.key.tmp: %w", err)
 	}
 	if err := writeFileSync(filepath.Join(dir, caKeyFile+".tmp"), keyPEM, 0o600); err != nil {
 		return fmt.Errorf("tlsmitm: write ca.key.tmp: %w", err)
 	}
+	if err := fail(stepRenameCert); err != nil {
+		return fmt.Errorf("tlsmitm: rename ca.crt: %w", err)
+	}
 	if err := os.Rename(filepath.Join(dir, caCertFile+".tmp"), filepath.Join(dir, caCertFile)); err != nil {
 		return fmt.Errorf("tlsmitm: rename ca.crt: %w", err)
+	}
+	if err := fail(stepRenameKey); err != nil {
+		return fmt.Errorf("tlsmitm: rename ca.key: %w", err)
 	}
 	if err := os.Rename(filepath.Join(dir, caKeyFile+".tmp"), filepath.Join(dir, caKeyFile)); err != nil {
 		return fmt.Errorf("tlsmitm: rename ca.key: %w", err)
 	}
+	if err := fail(stepFsyncDir1); err != nil {
+		return fmt.Errorf("tlsmitm: fsync dir after rename: %w", err)
+	}
 	if err := fsyncDir(dir); err != nil {
 		return fmt.Errorf("tlsmitm: fsync dir after rename: %w", err)
+	}
+	if err := fail(stepWriteReadyTmp); err != nil {
+		return fmt.Errorf("tlsmitm: write ca.ready.tmp: %w", err)
 	}
 	marker := markerFP + "\n"
 	if err := writeFileSync(filepath.Join(dir, caReadyFile+".tmp"), []byte(marker), 0o600); err != nil {
 		return fmt.Errorf("tlsmitm: write ca.ready.tmp: %w", err)
 	}
+	if err := fail(stepRenameReady); err != nil {
+		return fmt.Errorf("tlsmitm: rename ca.ready: %w", err)
+	}
 	if err := os.Rename(filepath.Join(dir, caReadyFile+".tmp"), filepath.Join(dir, caReadyFile)); err != nil {
 		return fmt.Errorf("tlsmitm: rename ca.ready: %w", err)
+	}
+	if err := fail(stepFsyncDir2); err != nil {
+		return fmt.Errorf("tlsmitm: fsync dir after marker: %w", err)
 	}
 	if err := fsyncDir(dir); err != nil {
 		return fmt.Errorf("tlsmitm: fsync dir after marker: %w", err)
