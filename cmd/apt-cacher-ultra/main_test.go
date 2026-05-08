@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
@@ -25,6 +27,34 @@ import (
 // keeping them out of `go test` output makes failures legible.
 func newTestLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+}
+
+// loadAutoCAPool reads the daemon's auto-generated CA from
+// <cacheDir>/ca/ca.crt and returns a *x509.CertPool containing only
+// that cert. Used by §15 #2 integration tests that drive a real
+// tls.Client handshake against the cache's leaf cert: the client
+// must trust the CA the cache used to sign the leaf, which is only
+// the auto-CA materialized at startup by wireTlsMitm's
+// LoadOrGenerate call. By the time waitForDaemonReady returns, the
+// CA file is on disk.
+func loadAutoCAPool(t *testing.T, cacheDir string) *x509.CertPool {
+	t.Helper()
+	caPath := filepath.Join(cacheDir, "ca", "ca.crt")
+	caBytes, err := os.ReadFile(caPath)
+	if err != nil {
+		t.Fatalf("read auto-CA at %s: %v", caPath, err)
+	}
+	block, _ := pem.Decode(caBytes)
+	if block == nil {
+		t.Fatalf("no PEM block in %s", caPath)
+	}
+	caCert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse auto-CA: %v", err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
+	return pool
 }
 
 // minimalCfg builds a defaulted *config.Config pointed at cacheDir, with

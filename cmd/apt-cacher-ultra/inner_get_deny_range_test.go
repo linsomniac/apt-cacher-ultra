@@ -76,15 +76,11 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -188,24 +184,7 @@ func TestServe_InnerGET_DenyRangeFiresAtConnectTime_Returns403(t *testing.T) {
 		t.Fatalf("daemon never became ready: %v", err)
 	}
 
-	// Read the auto-generated CA cert. wireTlsMitm runs LoadOrGenerate
-	// during startup before serveListeners accepts, so by the time
-	// waitForDaemonReady returns the file is on disk.
-	caPath := filepath.Join(cacheDir, "ca", "ca.crt")
-	caBytes, err := os.ReadFile(caPath)
-	if err != nil {
-		t.Fatalf("read auto-CA at %s: %v", caPath, err)
-	}
-	block, _ := pem.Decode(caBytes)
-	if block == nil {
-		t.Fatalf("no PEM block in %s", caPath)
-	}
-	caCert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		t.Fatalf("parse auto-CA: %v", err)
-	}
-	pool := x509.NewCertPool()
-	pool.AddCert(caCert)
+	pool := loadAutoCAPool(t, cacheDir)
 
 	rawConn, err := net.Dial("tcp", cacheAddr)
 	if err != nil {
