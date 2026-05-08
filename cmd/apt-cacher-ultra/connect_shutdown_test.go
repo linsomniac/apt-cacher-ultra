@@ -330,14 +330,17 @@ func TestServe_GracefulShutdown_StalledCONNECT_DrainBudget(t *testing.T) {
 		if dur > 5*time.Second {
 			t.Errorf("serveListeners returned in %v; expected sub-second on a 200ms drain budget", dur)
 		}
-		if dur < 100*time.Millisecond {
-			// Sanity: if we returned WAY before the budget, the
-			// manager probably didn't actually wait — meaning
-			// either the conn was untracked too early or the
-			// budget was bypassed. A successful drain should take
-			// at least most of the budget.
-			t.Logf("note: serveListeners returned in %v (budget=%v); ensure budget is being honored",
-				dur, shutdownTimeout)
+		// Lower bound: shutdown must wait at LEAST most of the
+		// drain budget before force-closing. Returning earlier
+		// means Drain.wg.Wait fired with count==0 (the §9.4
+		// Begin-before-Hijack race regressed) or that the budget
+		// was bypassed somewhere. 150ms gives 50ms slack on a
+		// 200ms budget for clock-resolution noise; force-close
+		// itself takes microseconds.
+		const minDur = 150 * time.Millisecond
+		if dur < minDur {
+			t.Errorf("serveListeners returned in %v on a %v drain budget; expected ≥%v (Begin-before-Hijack race may have regressed)",
+				dur, shutdownTimeout, minDur)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatalf("serveListeners did not return — §9.4 force-close at drain-budget expiry may be wedged")

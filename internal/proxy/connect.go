@@ -404,6 +404,22 @@ func NewConnectHandler(deps HandlerDeps) (*ConnectHandler, error) {
 // outcome enum mirrors SPEC6 §10.1 and the wire-form per-outcome
 // HTTP responses below.
 func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
+	// SPEC6 §9.4: register this CONNECT goroutine with the tunnel
+	// manager BEFORE any work — and crucially, before Hijack. The
+	// race-correctness AIDEV-NOTE on tunnel_manager.go covers why:
+	// http.Server.Shutdown stops waiting on a conn at the moment
+	// it transitions to StateHijacked, so wg.Add must precede
+	// Hijack to avoid a window where Shutdown returns + Drain
+	// observes count==0 + the not-yet-tracked tunnel goroutine
+	// wedges in tls.Handshake. Begin runs even for CONNECTs that
+	// fail at parse/gates; those decrement quickly via the
+	// deferred End and the always-incremented invariant is what
+	// closes the race.
+	if h.deps.Manager != nil {
+		h.deps.Manager.Begin()
+		defer h.deps.Manager.End()
+	}
+
 	start := time.Now()
 	clientAddr := r.RemoteAddr
 
@@ -447,18 +463,15 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	// SPEC6 §9.4: register the hijacked conn with the tunnel
-	// manager so the daemon's shutdown sequence can drain
-	// in-flight tunnels and force-close still-tracked conns at
-	// deadline expiry. Track MUST be paired with a deferred
-	// Untrack in the same goroutine — every error path between
-	// here and the natural tunnel-close return passes through
-	// this defer. Untrack is idempotent against the registry, so
-	// a Drain that force-closed this conn before our Untrack
-	// fires still leaves the WG accounting balanced.
+	// SPEC6 §9.4: enroll the hijacked conn in the manager's
+	// registry so Drain's deadline-expiry force-close can iterate
+	// it. The goroutine count was already incremented by Begin()
+	// at ServeCONNECT entry; this only touches the conn registry.
+	// Pair with a deferred UnregisterConn in this goroutine so
+	// the registry stays bounded.
 	if h.deps.Manager != nil {
-		h.deps.Manager.Track(conn)
-		defer h.deps.Manager.Untrack(conn)
+		h.deps.Manager.RegisterConn(conn)
+		defer h.deps.Manager.UnregisterConn(conn)
 	}
 
 	if _, err := brw.WriteString("HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {

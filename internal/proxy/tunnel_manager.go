@@ -10,17 +10,36 @@
 // activeWG.Wait inside Handler.Close cannot finish while a
 // hijacked goroutine still holds its WaitGroup token.
 //
+// AIDEV-NOTE: Race-correctness — Begin MUST be called BEFORE
+// Hijack. http.Server.Shutdown stops waiting on a conn at the
+// moment it transitions to StateHijacked (server.go's
+// closeIdleConns sees the conn leave activeConn). If Begin's
+// wg.Add(1) ran AFTER Hijack, there would be a window where
+// Shutdown returned (saw count==0 in activeConn), the daemon
+// proceeded to Drain, Drain.wg.Wait saw count==0 and returned
+// immediately, then the not-yet-tracked tunnel goroutine wedged
+// in tls.Handshake — blocking h.Close → activeWG.Wait for the
+// 30s default HandshakeTimeout. Calling Begin at ServeCONNECT
+// entry (before parse/gates/Hijack) ensures wg.count >= 1 before
+// the conn ever leaves activeConn, so plainSrv.Shutdown returns
+// only after Begin has fired.
+//
 // The manager owns:
 //   - parentCtx: cancelled at shutdown step. Synthetic inner
-//     request ctxs derive from this so shutdown propagates to the
-//     inner GET via the standard r.Context() path.
-//   - wg: counter of in-flight tunnels, incremented on Track and
-//     decremented on Untrack.
-//   - conns: registry of hijacked conns. On Drain deadline expiry
-//     the manager iterates this under mu and Close()s every
-//     still-tracked conn — that unblocks any goroutine wedged in
-//     tls.Handshake / bufio.Read / etc., which then errors and
-//     releases the WaitGroup.
+//     request ctxs derive from this so shutdown propagates to
+//     the inner GET via the standard r.Context() path.
+//   - wg: counter of in-flight CONNECT goroutines, incremented
+//     at ServeCONNECT entry (Begin) and decremented on return
+//     (End). NOT a counter of hijacked conns specifically —
+//     Begin runs even for CONNECTs that fail at parse/gates and
+//     never hijack. That is harmless: those goroutines decrement
+//     quickly, and the always-incremented invariant is what
+//     closes the Begin-after-Hijack race.
+//   - conns: registry of hijacked conns. On Drain deadline
+//     expiry the manager iterates this and Close()s every
+//     still-tracked conn — that unblocks any goroutine wedged
+//     in tls.Handshake / bufio.Read / etc., which then errors
+//     and releases the WaitGroup.
 package proxy
 
 import (
@@ -31,8 +50,8 @@ import (
 	"time"
 )
 
-// TunnelManager bridges Go's "hijacked conns are not waited on by
-// Shutdown" gap. Construct one per ConnectHandler at startup;
+// TunnelManager bridges Go's "hijacked conns are not waited on
+// by Shutdown" gap. Construct one per ConnectHandler at startup;
 // Drain it during the daemon's shutdown sequence between
 // http.Server.Close and Handler.Close.
 type TunnelManager struct {
@@ -67,28 +86,40 @@ func (m *TunnelManager) Context() context.Context {
 	return m.parentCtx
 }
 
-// Track registers a freshly-hijacked conn and increments the
-// in-flight-tunnel counter. Caller MUST defer Untrack(conn) in
-// the same goroutine — including on every error path between
-// hijack and the natural tunnel-close return — or Drain will
-// deadlock waiting for a counter that never decrements.
-func (m *TunnelManager) Track(conn net.Conn) {
+// Begin marks the start of a new CONNECT goroutine and MUST be
+// the first manager call from ServeCONNECT, BEFORE any Hijack.
+// Pair with a deferred End() in the same goroutine. See the
+// race-correctness AIDEV-NOTE on this file: calling Begin only
+// after Hijack would let Drain return prematurely.
+func (m *TunnelManager) Begin() {
 	m.wg.Add(1)
+}
+
+// End decrements the in-flight goroutine counter. Pair 1:1 with
+// Begin (typically as a `defer m.End()` immediately after Begin).
+func (m *TunnelManager) End() {
+	m.wg.Done()
+}
+
+// RegisterConn enrolls a freshly-hijacked conn in the registry
+// so Drain can force-close it on deadline expiry. Caller MUST
+// pair with a deferred UnregisterConn in the same goroutine. The
+// goroutine count (Begin/End) is independent of the registry —
+// every CONNECT goroutine increments via Begin, but only those
+// that successfully hijack populate the registry.
+func (m *TunnelManager) RegisterConn(conn net.Conn) {
 	m.mu.Lock()
 	m.conns[conn] = struct{}{}
 	m.mu.Unlock()
 }
 
-// Untrack removes a conn from the registry and decrements the
-// in-flight counter. Idempotent against the registry: untracking
-// a conn already removed by Drain's force-close path is a no-op
-// for the map; the wg decrement still fires exactly once
-// (paired 1:1 with Track).
-func (m *TunnelManager) Untrack(conn net.Conn) {
+// UnregisterConn removes a conn from the registry. Idempotent
+// against the registry: unregistering a conn already removed by
+// Drain's force-close path is a no-op.
+func (m *TunnelManager) UnregisterConn(conn net.Conn) {
 	m.mu.Lock()
 	delete(m.conns, conn)
 	m.mu.Unlock()
-	m.wg.Done()
 }
 
 // Drain implements the SPEC6 §9.4 shutdown protocol:
@@ -96,11 +127,12 @@ func (m *TunnelManager) Untrack(conn net.Conn) {
 //  1. Cancel parentCtx. Every live tunnel's synthetic inner
 //     request ctx fires Done.
 //  2. Wait up to `budget` for the in-flight WG to drain to zero.
-//  3. If `budget` expires, iterate the registry under mu and
-//     Close() every still-tracked conn. This unblocks any
-//     goroutine wedged in a Read / Write / TLS handshake; the
-//     wedged goroutine errors out, returns from ServeCONNECT,
-//     fires its deferred Untrack, and decrements the WG.
+//  3. If `budget` expires, snapshot the conn registry under mu,
+//     release the lock, and Close() every still-tracked conn.
+//     This unblocks any goroutine wedged in a Read / Write / TLS
+//     handshake; the wedged goroutine errors out, returns from
+//     ServeCONNECT, fires its deferred End/UnregisterConn, and
+//     decrements the WG.
 //  4. Wait up to `grace` for the WG to drain after the
 //     force-close.
 //
@@ -122,13 +154,22 @@ func (m *TunnelManager) Drain(budget, grace time.Duration) error {
 		return nil
 	}
 
-	// Budget expired. Force-close every still-tracked conn so
-	// wedged goroutines can unwind.
+	// Budget expired. Snapshot the registry under mu, release the
+	// lock, then Close() each conn outside the lock so racing
+	// Begin/End/UnregisterConn calls (from goroutines unwinding
+	// after their conns are force-closed) do not have to queue
+	// behind potentially-blocking I/O. net.Conn.Close is normally
+	// fast but kernel-side teardown can vary; releasing the lock
+	// keeps the manager responsive.
 	m.mu.Lock()
+	snapshot := make([]net.Conn, 0, len(m.conns))
 	for conn := range m.conns {
-		_ = conn.Close()
+		snapshot = append(snapshot, conn)
 	}
 	m.mu.Unlock()
+	for _, conn := range snapshot {
+		_ = conn.Close()
+	}
 
 	if waitWG(&m.wg, grace) {
 		return nil

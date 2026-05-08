@@ -54,7 +54,28 @@ var (
 	idleTimeout = 60 * time.Second
 
 	// shutdownTimeout is the SPEC §9.5 drain budget on SIGTERM.
+	// SPEC6 §9.4 step 4.4 adds a bounded grace (≤ 1s — see
+	// tunnelDrainGrace below) AFTER the budget for the tunnel
+	// manager to drain post-force-close, so the worst-case wall
+	// time from cancel to serveListeners returning is
+	// shutdownTimeout + tunnelDrainGrace + a small constant for
+	// non-MITM teardown (gauge refresher waits, GC drain, cache
+	// close). A pathologically wedged tunnel goroutine could
+	// extend shutdown further via the unbounded h.Close →
+	// activeWG.Wait at the end of the sequence, but force-close
+	// of the conn is expected to unblock that within
+	// tunnelDrainGrace in practice; ErrDrainDeadline from Drain
+	// is the operator signal that a tunnel goroutine is wedged
+	// in something conn.Close cannot unblock (deadlocked channel
+	// write, etc.).
 	shutdownTimeout = 30 * time.Second
+
+	// tunnelDrainGrace is the SPEC6 §9.4 step 4.4 grace window
+	// for the tunnel-manager WG to drain AFTER force-close fires
+	// at budget expiry. Bounded because conn.Close yields
+	// immediately on any pending Read/Write — tunnels unwind in
+	// tens of microseconds typically. 1s is a generous ceiling.
+	tunnelDrainGrace = time.Second
 
 	// tmpSweepMaxAge is the SPEC §4.2 staleness threshold for orphaned
 	// partial downloads from previous crashes.
@@ -720,7 +741,18 @@ func serveListeners(
 				drainBudget = 0
 			}
 		}
-		if err := mitmHandles.Manager.Drain(drainBudget, time.Second); err != nil {
+		if err := mitmHandles.Manager.Drain(drainBudget, tunnelDrainGrace); err != nil {
+			// AIDEV-NOTE: ErrDrainDeadline here means a tunnel
+			// goroutine remained wedged AFTER force-closing its
+			// conn — i.e. blocked on something conn.Close does not
+			// unblock (deadlocked channel write, etc.). h.Close
+			// below still calls activeWG.Wait unbounded; in the
+			// pathological case the daemon will appear hung on
+			// shutdown. Surfacing this Warn is the operator's
+			// signal to investigate; the alternative — bounding
+			// h.Close — would mean dropping the cache integrity
+			// guarantee that no goroutine is using the cache when
+			// c.Close runs.
 			logger.Warn("tunnel manager drain returned error", "err", err)
 		}
 	}
