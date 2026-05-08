@@ -901,15 +901,30 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 	h.SetConnectHandler(connectHandler)
 
 	// SPEC6 §5.3 tls_mitm_enabled startup loud-config Info. The
-	// match-count-against-Remap-canonical-hosts piece will land in
-	// the metrics/status commit; the basic boot signal goes here so
-	// operators see the activation outcome on every successful start.
+	// match_count / total_canonical_hosts pair is a sanity-check, NOT
+	// a correctness primitive — a regex that matches zero of the
+	// closed canonical-host set may still legitimately match the
+	// operator's intended hostname (which need not be among the
+	// known canonicals). When the regex is empty (vacuous-true),
+	// match_count == total_canonical_hosts.
+	canonicalHosts := parser.CanonicalHosts()
+	matchCount := len(canonicalHosts)
+	if signingGate != nil {
+		matchCount = 0
+		for _, h := range canonicalHosts {
+			if signingGate(h) {
+				matchCount++
+			}
+		}
+	}
 	logger.Info("tls_mitm_enabled",
 		"source", ca.Source.String(),
 		"fingerprint_sha256", ca.FingerprintSHA256,
 		"not_after_unixtime", ca.Cert.NotAfter.Unix(),
 		"name_constraints", len(ca.NameConstraints) > 0,
 		"allowed_host_regex_set", tmCfg.AllowedHostRegex != "",
+		"match_count", matchCount,
+		"total_canonical_hosts", len(canonicalHosts),
 	)
 	if tmCfg.AllowedHostRegex != "" {
 		logger.Info("tls_mitm_narrowing_regex_set",

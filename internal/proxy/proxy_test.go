@@ -703,3 +703,81 @@ func TestJoinMirrorPath(t *testing.T) {
 		}
 	}
 }
+
+// TestCanonicalHosts_BuiltinsAlone proves that with no user rules
+// configured, the closed set returned by CanonicalHosts contains
+// the SPEC §3.3 built-in canonical-host literals, deduplicated and
+// sorted. Used by SPEC6 §5.3 `tls_mitm_enabled` to compute
+// `match_count` against the allowlist regex.
+func TestCanonicalHosts_BuiltinsAlone(t *testing.T) {
+	p, err := New(nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	hosts := p.CanonicalHosts()
+	if len(hosts) == 0 {
+		t.Fatal("expected non-empty built-in canonical-host set")
+	}
+	saw := false
+	for _, h := range hosts {
+		if h == "archive.ubuntu.com" {
+			saw = true
+			break
+		}
+	}
+	if !saw {
+		t.Errorf("expected archive.ubuntu.com in built-in set, got %v", hosts)
+	}
+	for i := 1; i < len(hosts); i++ {
+		if hosts[i-1] >= hosts[i] {
+			t.Errorf("CanonicalHosts not sorted at index %d: %q vs %q", i, hosts[i-1], hosts[i])
+		}
+	}
+}
+
+// TestCanonicalHosts_UserRulesIncluded proves a user-supplied rule
+// contributes its canonicalHost to the returned set.
+func TestCanonicalHosts_UserRulesIncluded(t *testing.T) {
+	user := []config.RemapRule{
+		{MatchHostRegex: `^foo\.example\.com$`, CanonicalHost: "internal.example.com"},
+	}
+	p, err := New(user, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	hosts := p.CanonicalHosts()
+	saw := false
+	for _, h := range hosts {
+		if h == "internal.example.com" {
+			saw = true
+			break
+		}
+	}
+	if !saw {
+		t.Errorf("expected internal.example.com in returned set, got %v", hosts)
+	}
+}
+
+// TestCanonicalHosts_DuplicatesCollapsed proves duplicates across
+// rules collapse to a single entry — important so the §5.3
+// total_canonical_hosts denominator is not inflated by aliases.
+func TestCanonicalHosts_DuplicatesCollapsed(t *testing.T) {
+	user := []config.RemapRule{
+		{MatchHostRegex: `^a\.example\.com$`, CanonicalHost: "shared.example.com"},
+		{MatchHostRegex: `^b\.example\.com$`, CanonicalHost: "shared.example.com"},
+	}
+	p, err := New(user, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	hosts := p.CanonicalHosts()
+	count := 0
+	for _, h := range hosts {
+		if h == "shared.example.com" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected shared.example.com exactly once, got %d times in %v", count, hosts)
+	}
+}

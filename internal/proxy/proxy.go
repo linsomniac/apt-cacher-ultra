@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
@@ -200,6 +201,31 @@ func (p *Parser) Parse(requestURI, hostHeader string) (*Request, error) {
 func (p *Parser) CanonicalHost(host string) string {
 	canon, _ := p.canonicalize(host)
 	return canon
+}
+
+// CanonicalHosts returns the deduplicated, sorted list of
+// canonicalHost literals registered in the Remap rule table —
+// user-supplied rules first compiled, plus the SPEC §3.3 built-in
+// rules. SPEC6 §5.3 `tls_mitm_enabled` reports the size of this
+// closed set together with how many of them match
+// `tls_mitm.allowed_host_regex`, giving operators a sanity-check
+// "regex permits N of M known canonical hosts" at startup. The
+// list excludes empty strings (defensive — a misbuilt rule with no
+// canonical host would be a compilation bug, not an operator one).
+func (p *Parser) CanonicalHosts() []string {
+	seen := make(map[string]struct{}, len(p.remap))
+	for _, r := range p.remap {
+		if r.canonicalHost == "" {
+			continue
+		}
+		seen[r.canonicalHost] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for h := range seen {
+		out = append(out, h)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // port. When no rule matches, the upstream authority preserves the
