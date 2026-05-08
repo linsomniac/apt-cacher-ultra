@@ -113,10 +113,12 @@ func TestServe_SuppliedCAExpiresMidRuntime_HandshakeFails(t *testing.T) {
 	t.Cleanup(func() { shutdownTimeout = oldTimeout })
 
 	caDir := t.TempDir()
-	// 3-second window: enough headroom for daemon boot + first
-	// CONNECT/handshake to land BEFORE expiry, but short enough
-	// that a 4-second sleep is reliably PAST expiry.
-	caNotAfter := time.Now().Add(3 * time.Second)
+	// 5-second window: enough headroom for daemon boot + readiness
+	// polling + first CONNECT/handshake to land BEFORE expiry on
+	// even a slow CI. Phase 2 doesn't pay a fixed sleep cost — it
+	// uses time.Until(caNotAfter) below to wake up exactly past
+	// expiry rather than sleeping a guessed-too-large duration.
+	caNotAfter := time.Now().Add(5 * time.Second)
 	caCertPath, caKeyPath, suppliedCert := mintSuppliedCA(t, caDir, caNotAfter)
 
 	cacheDir := t.TempDir()
@@ -163,10 +165,13 @@ func TestServe_SuppliedCAExpiresMidRuntime_HandshakeFails(t *testing.T) {
 		t.Fatalf("phase 1 (BEFORE expiry): handshake should have succeeded but failed: %v", err)
 	}
 
-	// Wait past the CA's NotAfter. 4-second sleep covers the 3s
-	// validity window plus 1s of slack for any scheduler latency
-	// since boot.
-	time.Sleep(4 * time.Second)
+	// Wait until just past the CA's NotAfter. Sleeping a fixed
+	// duration would force a flaky tradeoff: too short → Phase 2
+	// runs while CA is still valid; too long → wasted test budget.
+	// time.Until measures from "now" rather than boot, so the
+	// total wall clock budget compresses naturally regardless of
+	// how long Phase 1 took.
+	time.Sleep(time.Until(caNotAfter) + 1*time.Second)
 
 	// === Phase 2: AFTER expiry — handshake must fail ===
 	hsErr := doConnectAndHandshake(t, cacheAddr, "example.test", pool, false)
@@ -174,16 +179,20 @@ func TestServe_SuppliedCAExpiresMidRuntime_HandshakeFails(t *testing.T) {
 		t.Fatalf("phase 2 (AFTER expiry): handshake should have failed; got nil")
 	}
 	// The chain failure must be specifically the CA-expiry path.
-	// errors.As covers both the bare CertificateInvalidError (older
-	// stdlib) and *tls.CertificateVerificationError (current
-	// stdlib wraps it). Pinning the reason guards against a
-	// regression where a different chain failure (e.g.,
-	// UnknownAuthority) accidentally satisfies the "non-nil err"
-	// check.
+	// errors.As walks the wrapper chain (current stdlib wraps the
+	// CertificateInvalidError inside a *tls.CertificateVerificationError),
+	// so a single errors.As call extracts the underlying x509
+	// error regardless of how Go wrapped it. We then PIN
+	// Reason == x509.Expired — without this, a different chain
+	// failure (UnknownAuthority from a missing trust anchor,
+	// hostname mismatch, etc.) would accidentally satisfy a
+	// looser check and the F18 invariant wouldn't be pinned.
 	var invalidErr x509.CertificateInvalidError
-	var verifyErr *tls.CertificateVerificationError
-	if !errors.As(hsErr, &invalidErr) && !errors.As(hsErr, &verifyErr) {
-		t.Fatalf("phase 2 handshake err = %v (%T); want x509.CertificateInvalidError or *tls.CertificateVerificationError", hsErr, hsErr)
+	if !errors.As(hsErr, &invalidErr) {
+		t.Fatalf("phase 2 handshake err = %v (%T); want x509.CertificateInvalidError (possibly wrapped in *tls.CertificateVerificationError)", hsErr, hsErr)
+	}
+	if invalidErr.Reason != x509.Expired {
+		t.Fatalf("phase 2 chain-validity reason = %v, want x509.Expired (the CA is past NotAfter)", invalidErr.Reason)
 	}
 
 	// Cancel the daemon to flush handler goroutines so any pending
@@ -198,46 +207,61 @@ func TestServe_SuppliedCAExpiresMidRuntime_HandshakeFails(t *testing.T) {
 		t.Fatalf("serveListeners did not return")
 	}
 
-	// Walk every captured mitm_connect record. Phase 1 (before
-	// expiry) should NOT have produced an outcome=tls_failed line;
-	// Phase 2 (after expiry) MUST have produced exactly one. So
-	// we expect ≥ 1 tls_failed line in total — assert the
-	// per-record shape on the tls_failed ones.
-	var tlsFailedLines []string
-	var allLines []string
+	// Walk every captured mitm_connect record. Phase 1 emits a
+	// Warn-level inner_stream_failed (handshake succeeded, then
+	// the test client closed the conn without sending an inner
+	// GET — ReadRequest returns EOF, daemon emits at Warn). Phase
+	// 2 emits a Warn-level tls_failed. So exactly TWO records,
+	// with exactly ONE outcome=tls_failed.
+	//
+	// Asserting EXACTLY 1 tls_failed (not ≥1) is load-bearing: a
+	// regression where Phase 1 also fails the handshake — say,
+	// because something in the daemon's CA-load path leaves the
+	// signing key unusable from the start — would otherwise
+	// silently produce 2 tls_failed records and pass under a
+	// looser ≥1 check, masking a real bug. Pinning the EXACT
+	// number cleanly disambiguates "F18 fired" from "every
+	// handshake failed for an unrelated reason".
+	var connectRecs []map[string]any
+	var connectLines []string
 	for _, line := range strings.Split(strings.TrimSpace(sb.String()), "\n") {
 		if line == "" {
 			continue
 		}
 		var rec map[string]any
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			continue
+			t.Fatalf("invalid JSON log line: %v\n%s", err, line)
 		}
 		if msg, _ := rec["msg"].(string); msg != "mitm_connect" {
 			continue
 		}
-		allLines = append(allLines, line)
+		connectRecs = append(connectRecs, rec)
+		connectLines = append(connectLines, line)
+	}
+
+	tlsFailedCount := 0
+	var tlsFailedRec map[string]any
+	var tlsFailedLine string
+	for i, rec := range connectRecs {
 		if outcome, _ := rec["outcome"].(string); outcome == "tls_failed" {
-			tlsFailedLines = append(tlsFailedLines, line)
+			tlsFailedCount++
+			tlsFailedRec = rec
+			tlsFailedLine = connectLines[i]
 		}
 	}
-	if len(tlsFailedLines) < 1 {
-		t.Fatalf("phase 2 should have produced ≥1 mitm_connect with outcome=tls_failed; got %d total mitm_connect records:\n%s",
-			len(allLines), strings.Join(allLines, "\n"))
+	if tlsFailedCount != 1 {
+		t.Fatalf("got %d mitm_connect records with outcome=tls_failed, want 1; full set:\n%s",
+			tlsFailedCount, strings.Join(connectLines, "\n"))
 	}
-	// Spot-check the first tls_failed record for §10.2 field set.
-	var rec map[string]any
-	if err := json.Unmarshal([]byte(tlsFailedLines[0]), &rec); err != nil {
-		t.Fatalf("invalid JSON on tls_failed line: %v\n%s", err, tlsFailedLines[0])
+	// Spot-check the tls_failed record for §10.2 field set.
+	if level, _ := tlsFailedRec["level"].(string); level != "WARN" {
+		t.Errorf("tls_failed level = %q, want WARN\n%s", level, tlsFailedLine)
 	}
-	if level, _ := rec["level"].(string); level != "WARN" {
-		t.Errorf("tls_failed level = %q, want WARN\n%s", level, tlsFailedLines[0])
+	if host, _ := tlsFailedRec["host"].(string); host != "example.test" {
+		t.Errorf("tls_failed host = %q, want example.test\n%s", host, tlsFailedLine)
 	}
-	if host, _ := rec["host"].(string); host != "example.test" {
-		t.Errorf("tls_failed host = %q, want example.test\n%s", host, tlsFailedLines[0])
-	}
-	if reason, _ := rec["reason"].(string); !strings.HasPrefix(reason, "tls:") {
-		t.Errorf("tls_failed reason = %q, want prefix \"tls:\"\n%s", reason, tlsFailedLines[0])
+	if reason, _ := tlsFailedRec["reason"].(string); !strings.HasPrefix(reason, "tls:") {
+		t.Errorf("tls_failed reason = %q, want prefix \"tls:\"\n%s", reason, tlsFailedLine)
 	}
 }
 
