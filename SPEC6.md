@@ -712,6 +712,7 @@ leaf_cert_lifetime = "720h"                   # 30 days
 ca_cert_lifetime   = "87600h"                 # 10 years (auto-generated only)
 leaf_algorithm     = "ecdsa-p256"             # also "rsa2048" for legacy clients
 allowed_host_regex = ""                       # empty = no MITM narrowing (fetch gate alone applies)
+allow_unconstrained_ca = false                # opt-in: auto-generate a CA without RFC 5280 Name Constraints
 ```
 
 The inner-request method allowlist (`GET`, `HEAD`) is fixed by
@@ -737,13 +738,41 @@ When the CA is auto-generated:
     host regex `tls_mitm.allowed_host_regex`, NOT the
     canonical-host upstream regex; the Name Constraints
     carry the cert-issuance bound, which is the literal-host
-    bound). See §5.1.1.1 for the exact translation contract.
-    The conversion is best-effort: an input regex outside
-    the supported grammar yields a Warn at startup
-    (`mitm_ca_name_constraints_skipped`) and the CA is
-    issued without Name Constraints — the regex still gates
-    leaf signing at runtime, but the CA is unconstrained
-    cryptographically.
+    bound). See §5.1.1.1 for the exact translation contract
+    and the supported / rejected RE2 grammar.
+
+    **Fail-closed by default.** When the configured regex
+    cannot be safely translated (empty regex, untranslatable
+    grammar, etc. — see §5.1.1.1's rejected-input list),
+    auto-generation FAILS at startup unless the operator
+    has explicitly opted in via
+    `tls_mitm.allow_unconstrained_ca = true`. Rationale: the
+    auto-generated CA is distributed to every client in the
+    fleet; an unconstrained CA confers fleet-wide trust on
+    arbitrary leaf certs the cache can issue, and the
+    runtime regex gate alone does NOT bound a stolen CA
+    key's blast radius (the runtime gate runs in the cache
+    process; a stolen key is signed elsewhere). Surfacing
+    this as a startup failure forces the operator to
+    consciously accept the risk, OR to narrow the regex to
+    a translatable shape, OR to supply a CA out of band
+    with whatever constraints they want.
+
+    Behavior:
+
+    | `allowed_host_regex` | `allow_unconstrained_ca` | Result |
+    |----------------------|--------------------------|--------|
+    | translatable shape (§5.1.1.1) | (any) | CA generated WITH Name Constraints; `mitm_ca_loaded` Info names the constraints |
+    | empty | `false` (default) | Startup FAILS with `mitm_ca_unconstrained_refused` Error; daemon does not bind. Operator action: set the regex, OR opt in, OR supply a CA |
+    | empty | `true` | CA generated WITHOUT Name Constraints; `mitm_ca_name_constraints_skipped` Warn fires (`reason="empty_regex"`); operator accepted the blast-radius posture |
+    | non-empty but untranslatable | `false` (default) | Startup FAILS with `mitm_ca_unconstrained_refused` Error naming the regex and the rejection reason |
+    | non-empty but untranslatable | `true` | CA generated WITHOUT Name Constraints; `mitm_ca_name_constraints_skipped` Warn fires (`reason=<translation rejection reason>`) |
+
+    The `allow_unconstrained_ca` knob applies only to the
+    **auto-generated CA path**. Operator-supplied CAs carry
+    whatever constraints the operator put on them; Phase 6
+    does not add or modify constraints on operator-supplied
+    CAs (and does not require any opt-in for them).
 
 ##### 5.1.1.1 Regex → NameConstraints translation contract
 
@@ -1045,6 +1074,13 @@ At startup, when `tls_mitm.enabled = true`:
   any other value rejected.
 - `tls_mitm.allowed_host_regex`: must compile as a Go RE2
   regex.
+- `tls_mitm.allow_unconstrained_ca`: bool; default `false`.
+  When `true`, auto-generation produces a CA without RFC
+  5280 Name Constraints if the regex cannot be translated
+  (or is empty). When `false` (default), auto-generation
+  refuses such configurations at startup with
+  `mitm_ca_unconstrained_refused` Error per §5.1.1. Has
+  no effect on the operator-supplied-CA path.
 - `tls_mitm.ca_cert` / `tls_mitm.ca_key`: must both be set
   or both empty. Set: both files must exist, parse, and the
   cert/key must match (`x509.Certificate.PublicKey ==
@@ -1334,10 +1370,13 @@ healthy clients complete a handshake in single-digit
 milliseconds. The budget protects against a client that
 opens many CONNECTs and never finishes the handshake.
 
-### 9.2.1 Inner-request header read budget
+### 9.2.1 Inner-request header read budget and byte cap
 
 After the TLS handshake completes, the §2.2 step 6 inner
-request must have its full HTTP request line and headers
+request is read from the encrypted stream. Two independent
+bounds apply:
+
+**Time bound.** Full HTTP request line and headers must be
 delivered within `10s` (counted from `time.Now()` after
 handshake completion, NOT from the original CONNECT
 receipt). Beyond budget, the conn is closed with a
@@ -1355,11 +1394,41 @@ short headers, but tight enough to prevent a hostile
 client from indefinitely tying up a hijacked goroutine plus
 TLS state.
 
-The body of the inner request is bounded by the existing
-Phase 1 `upstream.connect_timeout` and friends (§9.3); the
-header budget is the new one Phase 6 introduces because
-Phase 5 had no path that read an HTTP request from a
-hijacked conn.
+**Byte bound — request line + headers must fit in
+`64 KiB`.** Hijacked conns bypass `http.Server`'s
+`MaxHeaderBytes` (default 1 MiB) protection because the
+hijack moves the conn out from under the server framework
+entirely. Without an explicit cap, a hostile client that
+*does* feed bytes within the 10s budget — but feeds many
+megabytes of header padding — can exhaust the goroutine's
+read buffer and the heap allocations that back it. Phase 6
+imposes a 64 KiB cap on the combined request-line + header
+section (matching the spirit of apt-cacher-ng's traditional
+limits and well above any legitimate apt request, which is
+typically < 4 KiB total). Implementation:
+`io.LimitReader(tlsConn, 64*1024)` wrapping the
+`bufio.Reader` used by `http.ReadRequest`; if the limit is
+reached before the `\r\n\r\n` separator is parsed, the
+conn is closed with a `mitm_connect` Warn
+(`outcome=inner_header_too_large`).
+
+The cap applies only to the request preamble. The request
+**body** (always `http.NoBody` per §2.2 step 7 because
+inner method is constrained to GET / HEAD) carries no
+bytes the cache reads from the encrypted stream — the
+upstream fetch consumes the response, not the request body.
+
+Both bounds together: a client has at most 10 seconds to
+deliver at most 64 KiB of well-formed HTTP request
+preamble, otherwise the conn closes with the appropriate
+outcome.
+
+The body of the inner request response (the upstream
+fetch) is bounded by the existing Phase 1
+`upstream.connect_timeout` and friends (§9.3); the
+header budget and byte cap are the new bounds Phase 6
+introduces because Phase 5 had no path that read an HTTP
+request from a hijacked conn.
 
 ### 9.3 Inner request budget
 
@@ -1370,42 +1439,101 @@ inner-request budget beyond what Phase 1 set.
 
 ### 9.4 In-flight CONNECT tunnels at shutdown
 
-The graceful-shutdown sequence (SPEC4 §9.5, SPEC5 §9.5)
-extends to CONNECT tunnels:
+**Hijacked-conn fact.** Per Go's `net/http`
+documentation, `http.Server.Shutdown` does **NOT** close
+or wait for hijacked connections — once a handler hijacks
+a conn (via `http.Hijacker`), that conn becomes the
+caller's responsibility for the rest of its lifetime.
+Phase 6 must therefore introduce an **explicit tunnel
+manager** to bridge that gap; otherwise CONNECT tunnels
+could outlive Shutdown and race the daemon's cache /
+handler teardown. Phase 5 had no hijacked conns and so
+needed nothing equivalent.
 
-1. SIGINT / SIGTERM received.
+**Tunnel manager (NEW, Phase 6).** A package-private
+struct living alongside the CONNECT handler in
+`internal/proxy/connect.go`. It owns:
+
+- A `sync.WaitGroup` whose counter is the number of
+  in-flight tunnels (incremented on successful hijack,
+  decremented from a `defer` in the tunnel goroutine).
+- A `context.Context` derived from the daemon's lifecycle
+  context (cancelled by the daemon's Shutdown step), and
+  passed into each tunnel goroutine as the parent context
+  for the synthetic inner request and any handshake
+  deadlines.
+- A registry (`map[net.Conn]struct{}` guarded by a
+  `sync.Mutex`) so that on shutdown-deadline expiry the
+  manager can forcibly `conn.Close()` every still-tracked
+  conn, unblocking any goroutine wedged in a Read / Write
+  / TLS handshake.
+
+**Graceful-shutdown sequence** (extends SPEC4 §9.5 /
+SPEC5 §9.5):
+
+1. SIGINT / SIGTERM received. The daemon constructs
+   `shutdownCtx, shutdownCancel := context.WithTimeout(
+   ctx, drainBudget)` (existing Phase 5 mechanism).
 2. Admin listener Shutdown (Phase 5 §9.5).
 3. Plain + TLS proxy listeners concurrent Shutdown.
-   `http.Server.Shutdown` will not return until all
-   connections (including hijacked CONNECT tunnels) close
-   or the shutdown context expires.
-4. CONNECT tunnels in TLS handshake or in mid inner-GET
-   abort when the shutdown context cancels. Two separate
-   propagation paths converge here:
-   - **Inner request's context** (derived from the outer
-     CONNECT) is cancelled by `http.Server.Shutdown`'s
-     standard context propagation — this short-circuits
-     the inner ResponseWriter side and any handler-internal
-     reads of `r.Context()`.
-   - **`h.lifecycleCtx`** (the leader-fetch context;
-     `internal/handler/handler.go:121, 145`) is cancelled
-     synchronously by the daemon's Shutdown step — this is
-     what propagates to in-flight upstream fetches in
-     `serveCacheMiss` (handler.go:849-857).
-   The two-path design preserves the Phase 1 invariant that
-   client disconnect does NOT kill a leader fetch (the
-   request ctx cancels but lifecycleCtx does not) AND that
-   Shutdown DOES kill leader fetches (lifecycleCtx cancels
-   independently).
-5. Refresher goroutine + GC + cache.Close — same as Phase 5.
+   `http.Server.Shutdown` stops accepting new connections
+   and waits for active **non-hijacked** handlers to
+   return. It does NOT wait for hijacked CONNECT tunnels.
+4. **Tunnel manager drain.**
+   1. The manager's parent context is cancelled. This
+      propagates to every tunnel's inner request context
+      (since each tunnel derives its synthetic request
+      ctx from this parent), short-circuiting the inner
+      ResponseWriter side and any handler-internal
+      `r.Context()` reads.
+   2. `h.lifecycleCtx` (the leader-fetch context;
+      `internal/handler/handler.go:121, 145`) is
+      cancelled synchronously by the daemon's Shutdown
+      step — this propagates to in-flight upstream
+      fetches in `serveCacheMiss` (handler.go:849-857).
+   3. The daemon waits on the manager's `WaitGroup`,
+      bounded by `shutdownCtx`. Either every tunnel
+      finishes (graceful) or the deadline fires.
+   4. On deadline expiry, the manager iterates its
+      registry under the mutex and calls `conn.Close()`
+      on every still-tracked conn. This unblocks any
+      goroutine that was wedged in `tls.Handshake()`,
+      `bufio.Read`, etc., causing them to error and
+      release the WaitGroup. The daemon then waits a
+      bounded grace period (≤ 1s) for the WG to drain to
+      zero before proceeding regardless.
+5. Refresher goroutine + GC + cache.Close — same as
+   Phase 5.
 
-**No new shutdown ordering** — Phase 6 reuses the existing
-HTTP server's connection-tracking. The hijacked-conn case
-is documented Go behavior: `http.Server.Shutdown` notes
-that hijacked conns are the caller's responsibility, but
-the cache wraps each hijacked conn in a tracking primitive
-(a `sync.WaitGroup` increment on hijack, decrement on
-close) so Shutdown waits on all of them.
+The two-context design (manager parent ctx vs
+`lifecycleCtx`) preserves the Phase 1 invariants:
+
+- **Client disconnect during a leader's cache miss does
+  NOT kill the leader fetch.** The synthetic request's
+  context cancels (because the underlying conn detected
+  client close), but `lifecycleCtx` does not. The leader
+  finishes the fetch and writes the cache; later requests
+  hit the now-populated entry. (See §12.3 chaos test.)
+- **Shutdown DOES kill leader fetches.** `lifecycleCtx`
+  cancels independently when the daemon's shutdown step
+  runs, and `serveCacheMiss` honors that.
+
+**Why two contexts, not one.** A single ctx that "cancels
+on client disconnect AND on shutdown" would conflate the
+two cases and break the leader-fetch-survives invariant.
+The tunnel manager's parent ctx is the cancellation
+fanout for shutdown only; client-disconnect propagation
+arrives via the standard `http.Conn`-detected path the
+synthetic request inherits, which does NOT cancel
+`lifecycleCtx`.
+
+This contract is implementation-binding: the §12.2
+integration suite asserts the WG drains within the
+shutdown deadline; the §12.3 chaos suite asserts a wedged
+TLS handshake is force-closed at deadline expiry; the
+§12.3 leader-fetch-survives test asserts client
+disconnect does NOT cancel the leader fetch even on a
+heavily-shut-down-adjacent path.
 
 ### 9.5 Listener startup ordering (delta over SPEC5 §9.7.1)
 
@@ -1458,7 +1586,7 @@ Emitted from the §9 CONNECT handler:
   `bad_host` / `bad_port` / `ip_literal_host` /
   `tls_handshake_timeout` / `tls_failed` /
   `cert_gen_failed` / `inner_method_rejected` /
-  `inner_header_timeout`),
+  `inner_header_timeout` / `inner_header_too_large`),
   `denied_gate` (`signing` / `fetch`; empty when
   `outcome != denied_host`; identifies which §5.1.2 gate
   rejected the host), `canonical_host` (post-Remap form,
@@ -1495,12 +1623,18 @@ Emitted from the §9 CONNECT handler:
   scanning the journal for first-boot cues see this exactly
   once per `cache_dir/ca/` lifecycle.
 
-- **`mitm_ca_load_failed`** — at startup, when the §4.2 CA
-  materialization case 3 fires (any inconsistent state of
-  `<ca_storage_dir>` per §4.2 — `ca.ready` missing or
-  fingerprint-mismatched, `ca.crt` or `ca.key` parse
-  failure, cert/key mismatch). Fields: `path`, `err`. Level
-  Error. The daemon does not bind after this event.
+- **`mitm_ca_load_failed`** — at startup, when §4.2 case 3
+  fires. Case 3 is precisely "any state where at least one
+  daemon-managed real file (`ca.crt`, `ca.key`, `ca.ready`)
+  is present but the trio is not self-consistent" — i.e.
+  one or more real files exist without their committed
+  siblings, or the marker fingerprint disagrees with
+  `sha256(ca.crt)`, or a real file fails to parse, or the
+  cert/key pair mismatches. A directory containing only
+  `*.tmp` residue (no real files committed) is NOT case 3 —
+  that is case 1 with cleanup under the lock (§4.2 case 1,
+  §4.2.1 step 3). Fields: `path`, `err`. Level Error. The
+  daemon does not bind after this event.
 
 - **`mitm_ca_generation_failed`** — at startup, when atomic
   CA write fails (mkdir, Write, Sync, rename, fsync, lock).
@@ -1521,11 +1655,23 @@ Emitted from the §9 CONNECT handler:
 
 - **`mitm_ca_name_constraints_skipped`** — at startup, when
   the regex-to-NameConstraints translation cannot safely
-  produce constraints. Fields: `regex`, `reason`. Level
-  Warn. The CA is generated without Name Constraints; runtime
-  signing is still gated by §5.1.2 but a stolen CA key is
-  cryptographically unconstrained (§ trust-anchor expansion
-  note).
+  produce constraints AND the operator has opted in via
+  `tls_mitm.allow_unconstrained_ca = true`. Fields:
+  `regex`, `reason`. Level Warn. The CA is generated without
+  Name Constraints; runtime signing is still gated by §5.1.2
+  but a stolen CA key is cryptographically unconstrained
+  (§ trust-anchor expansion note).
+
+- **`mitm_ca_unconstrained_refused`** — at startup, when the
+  regex-to-NameConstraints translation cannot safely produce
+  constraints AND the operator has NOT opted in via
+  `tls_mitm.allow_unconstrained_ca`. Fields: `regex`,
+  `reason`. Level Error. Followed immediately by a
+  `mitm_ca_generation_failed` Error so the operator sees
+  both the cause and the effect. The daemon does not bind.
+  Recovery: narrow the regex to a translatable shape (§5.1.1.1),
+  set `allow_unconstrained_ca = true` to consciously accept
+  the unconstrained-CA posture, or supply a CA out of band.
 
 - **`mitm_clock_skew`** — when a freshly-generated leaf
   cert's `not_before` is in the future relative to the
@@ -1602,13 +1748,14 @@ that top-level keys are stable.
 | F10 | TLS handshake exceeds the §9.2 budget | Conn closed with `mitm_connect` Warn (`outcome=tls_handshake_timeout`) |
 | F11 | Inner request method is not GET/HEAD | 405 written on the inner stream with `Allow: GET, HEAD`; tunnel closes; `mitm_connect` Warn (`outcome=inner_method_rejected`) |
 | F11a | Inner request headers not fully received within §9.2.1's 10s budget after TLS handshake (slowloris on the inner request) | Conn closed; `mitm_connect` Warn (`outcome=inner_header_timeout`). No 408 / 4xx is written on the inner stream — partial-header state means there is no committed protocol context to write into |
+| F11b | Inner request preamble (request line + headers) exceeds §9.2.1's 64 KiB cap before the `\r\n\r\n` separator is parsed (megabyte-headers DoS via fast bytes) | Conn closed; `mitm_connect` Warn (`outcome=inner_header_too_large`). No 4xx is written; the cap is enforced in the byte-source via `io.LimitReader`, which surfaces as a read error before any HTTP framing is parsed |
 | F12 | CONNECT to a port other than 443 | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=bad_port`) |
 | F13 | CONNECT to an IP-literal host (IPv4 or IPv6) | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=ip_literal_host`) |
 | F13a | CONNECT request-target structurally malformed (missing port, empty host, non-numeric port, port out of range, multi-colon, unbracketed IPv6, etc. — see §2.2 step 1 enumeration) | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=bad_target`) |
 | F13b | CONNECT host fails IDNA normalization or contains invalid DNS labels | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=bad_host`) |
 | F14 | CONNECT host fails the §5.1.2 effective allowlist (literal host fails signing predicate, OR canonical host fails fetch predicate) | 403 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=denied_host`, `denied_gate=signing` or `fetch`). No cert is issued, no TLS handshake |
 | F15 | Inner GET upstream fetch fails the SSRF deny-range gate at TCP-connect time | The inner GET response is whatever the existing Phase 1 fetcher returns (typically 502 with `outcome=upstream_denied` on the request log line); tunnel closes after inner response. The CONNECT itself succeeded (as designed; §1.1.3) |
-| F16 | Daemon shuts down during an in-flight CONNECT tunnel | The §9.4 sync.WaitGroup primitive holds Shutdown until the tunnel closes or the shutdown context expires. Cancellation propagates via two paths: the inner request's context (via standard `http.Server.Shutdown`) and `h.lifecycleCtx` (which cancels in-flight leader fetches in `serveCacheMiss`). On shutdown-context expiry, the conn is closed forcibly. Note: a CLIENT close mid-response cancels only the inner request's context — the leader fetch survives until lifecycleCtx cancels (Phase 1 invariant; see §12.3 chaos test) |
+| F16 | Daemon shuts down during an in-flight CONNECT tunnel | The §9.4 tunnel manager (sync.WaitGroup + conn registry + parent context) drains tunnels on shutdown. `http.Server.Shutdown` does NOT wait for hijacked conns (Go's stdlib contract); the manager fills that gap. Two cancellation paths fan out: the manager's parent ctx (cancels each tunnel's synthetic request ctx) and `h.lifecycleCtx` (cancels in-flight leader fetches in `serveCacheMiss`). On shutdown-deadline expiry, the manager iterates its conn registry and force-closes every still-tracked conn, unblocking any goroutine wedged in TLS handshake / Read / Write. Note: a CLIENT close mid-response cancels only the inner request's context — the leader fetch survives until lifecycleCtx cancels (Phase 1 invariant; see §12.3 chaos test) |
 | F17 | Clock skew: leaf cert `not_before` is in the future | Apt rejects with a `not yet valid` TLS error; cache's clock is the source of truth — operators should run NTP. No Phase 6 mitigation beyond logging on the cache side |
 | F18 | CA expires mid-lifetime | All client TLS handshakes fail; `mitm_connect` Warn `outcome=tls_failed` rate spikes; operator's `acu_mitm_ca_not_after_unixtime` alert (set to fire 30 days before expiry) catches this before the spike |
 | F19 | CA private key file ownership / mode wrong on disk (e.g. world-readable) | Phase 6 does NOT enforce mode/ownership at startup beyond the §4.2.1 atomic-write guarantees on the auto-generated path. Operator-supplied CA paths are read with whatever mode the operator chose; `apt-cacher-ultra ca print` is the audit primitive (it warns on `S_IROTH` set on `ca.key`). A future phase can add mandatory mode enforcement if any deployment asks |
@@ -1616,6 +1763,7 @@ that top-level keys are stable.
 | F21 | Upstream HTTPS server presents an invalid cert (chain failure, expired, hostname mismatch) | Inner GET fetch fails with the existing Phase 1 fetcher behavior — `outcome=bad_gateway` on the inner request log line; the cache does NOT relax verification (§5.4) |
 | F22 | Upstream sends a redirect from `https://` to `http://` (or any other 3xx) | Inner GET fails with `outcome=bad_gateway` (handler.go:1547-1556 maps `fetch.ErrRedirectBlocked` → 502). The upstream's 3xx status code is preserved on the request log line as `upstream_status`. The cache does NOT silently follow the redirect or downgrade the inner request to HTTP; apt sees a 502 from the cache rather than the 3xx from upstream. Operators whose archive uses redirects configure a Remap rule pointing at the redirect target |
 | F23 | §4.2.2 interprocess lock contention exceeds 30s | Startup logs `mitm_ca_lock_timeout` Error and `mitm_ca_generation_failed` Error; daemon does not bind. `apt-cacher-ultra ca print` exits with code 4. Caused by a concurrent `ca print` or another daemon instance racing on the same `<ca_storage_dir>`. Recovery: identify the holding process (`lsof <ca_storage_dir>/.ca.lock` or `fuser`), stop it, retry. **Do NOT delete the lockfile** — flock is FD-tied, removing the file does not release the lock and can cause split-lock if a new process opens a fresh inode at the same path. See §4.2.2 |
+| F24 | Auto-generated CA path: `tls_mitm.allowed_host_regex` is empty OR untranslatable AND `tls_mitm.allow_unconstrained_ca = false` (default) | Startup fails with `mitm_ca_unconstrained_refused` Error and `mitm_ca_generation_failed` Error; daemon does not bind. The fail-closed default exists because an unconstrained auto-generated CA confers fleet-wide trust on arbitrary leaf certs the cache can issue, and the runtime regex gate alone does not bound key-compromise blast radius. Operator either narrows the regex (§5.1.1.1), sets `allow_unconstrained_ca = true`, or supplies a CA out of band |
 
 ---
 
@@ -1658,8 +1806,15 @@ In `internal/proxy/tlsmitm/`:
   to the expected `permitted` dNSName list. A regex with a
   shape that cannot be safely translated (alternation
   spanning multiple TLDs, character-class with negated
-  ranges) yields no constraints + the
-  `mitm_ca_name_constraints_skipped` Warn.
+  ranges):
+  - With `allow_unconstrained_ca = false` (default):
+    startup FAILS with `mitm_ca_unconstrained_refused`
+    Error; daemon does not bind (F24).
+  - With `allow_unconstrained_ca = true`: CA generated
+    without constraints + `mitm_ca_name_constraints_skipped`
+    Warn fires with the reason field set.
+  Empty regex behaves the same way: refused at default,
+  permitted only with the explicit opt-in.
 - Leaf cert: literal-host single-SAN construction (no
   alias enumeration). For
   `de.archive.ubuntu.com`, the issued cert has SAN =
@@ -1724,6 +1879,12 @@ In `internal/proxy/`:
   client completes handshake then trickles the inner
   request bytes; the §9.2.1 deadline fires and the conn
   closes with `outcome=inner_header_timeout` (F11a).
+- CONNECT handler: inner-request header oversize —
+  client completes handshake then sends 128 KiB of
+  header padding within the time budget; the §9.2.1
+  byte cap fires (`io.LimitReader` exhaustion before
+  `\r\n\r\n`) and the conn closes with
+  `outcome=inner_header_too_large` (F11b).
 - CONNECT handler: hijack-conn lifecycle (sync.WaitGroup
   increments on hijack, decrements on close).
 
@@ -1736,16 +1897,36 @@ TCP client:
   (`httptest.NewTLSServer`). The system trust store does NOT
   trust httptest's auto-generated cert, so the test installs
   the test server's `Certificate()` into a custom
-  `*x509.CertPool` and supplies it via the
-  **`fetch.Options.rootCAs` test-only seam** (a private
-  field analogous to the existing `dialContext` and `now`
-  test seams in `internal/fetch/fetch.go:108-114`).
-  Production code never sets `rootCAs` — `nil` keeps the
-  Go default of system trust roots, preserving the §5.4
-  invariant that production upstream TLS uses ONLY the
-  system trust store. The test seam is package-private and
-  named in `internal/fetch/fetch.go` alongside the
-  existing seams; it is NOT exposed via config.
+  `*x509.CertPool` and supplies it to the fetch client via
+  an **exported, test-only helper in the `fetch` package**:
+
+  ```go
+  // fetch.SetRootCAsForTest sets the upstream-TLS trust pool
+  // on Options for integration tests. Calling this from
+  // non-test code is a programming error (the function panics
+  // if called outside a test context, detected via testing.Testing()).
+  func SetRootCAsForTest(opts *Options, pool *x509.CertPool)
+  ```
+
+  Why an exported helper rather than a package-private field:
+  the existing `dialContext` and `now` seams
+  (`internal/fetch/fetch.go:107-114`) are package-private and
+  ONLY usable from `internal/fetch`'s own `*_test.go` files
+  (e.g. `unreachable_test.go:120`). A Phase 6 integration test
+  for the CONNECT handler lives in `internal/proxy/` and
+  cannot legally set a private field on a different package's
+  struct. The test-only setter lives in `fetch` package, takes
+  a pointer to `Options`, and is called from any test that
+  needs to bypass the system trust store. Naming convention
+  `*ForTest` suffix signals intent; the runtime
+  `testing.Testing()` panic guard prevents accidental
+  production use.
+
+  Production code never calls `SetRootCAsForTest` — the
+  unset field keeps the Go default of system trust roots,
+  preserving the §5.4 invariant that production upstream TLS
+  uses ONLY the system trust store. The setter is NOT
+  exposed via config.
 
   First request misses, second hits, both observe
   `X-Acu-Mitm: 1` on the response.
@@ -1799,6 +1980,21 @@ Under `e2e/`:
   hostnames concurrent CONNECT, cache size 256. Verify
   256 evictions land, 1000 certs issued total, no panic
   in the LRU primitive (F8 end-to-end).
+- **Shutdown during wedged TLS handshake.** Open a
+  CONNECT, send the bytes for `CONNECT host:443 HTTP/1.1`,
+  then deliberately stall (do NOT send a TLS ClientHello).
+  Trigger SIGTERM with a 2s shutdown drain budget. Verify
+  the §9.4 tunnel manager (a) cancels the tunnel's parent
+  context, (b) waits up to the budget for the WG to
+  drain, (c) on budget expiry iterates its conn registry
+  and force-closes the wedged conn, (d) the tunnel
+  goroutine exits cleanly within ≤ 1s of the force-close,
+  (e) `cache.Close()` runs only after the WG is at zero,
+  (f) no leaked goroutines per `runtime.NumGoroutine`
+  delta. Then repeat with a tunnel that completed TLS
+  but is hung mid inner-request body — same expected
+  outcome (force-close at deadline, clean drain).
+  (F16 end-to-end.)
 - **Inner GET cancelled mid-stream — leader fetch survives.**
   Client closes the TLS tunnel mid-response while a leader
   cache-miss fetch is in progress. Verify the existing
@@ -1888,13 +2084,14 @@ by at least one test in §12.1, §12.2, or §12.3:
 | F10 | 12.1 unit (CONNECT handler handshake timeout) |
 | F11 | 12.1 unit (CONNECT handler non-GET/HEAD inner) |
 | F11a | 12.1 unit (CONNECT handler inner-header slowloris: completes handshake then trickles the inner request byte-by-byte; 10s after handshake the conn closes with `outcome=inner_header_timeout`) |
+| F11b | 12.1 unit (CONNECT handler inner-header oversize: completes handshake then sends 128 KiB of header padding within the 10s budget; conn closes with `outcome=inner_header_too_large` after the 64 KiB byte cap fires) |
 | F12 | 12.1 unit (CONNECT handler bad port) |
 | F13 | 12.1 unit (CONNECT handler IP-literal) |
 | F13a | 12.1 unit (CONNECT handler bad-target table-driven test: missing port, empty host, non-numeric port, port out of range, multi-colon, unbracketed IPv6) |
 | F13b | 12.1 unit (CONNECT handler bad-host: IDNA failure, oversized label, illegal label characters) |
 | F14 | 12.1 unit + 12.2 integration (denied host) |
 | F15 | 12.2 integration (deny-range fires on inner GET) |
-| F16 | 12.2 integration (CONNECT during shutdown) |
+| F16 | 12.2 integration (CONNECT during shutdown — graceful drain) + 12.3 chaos (wedged TLS handshake force-closed at deadline; tunnel manager registry exercises) |
 | F17 | 12.1 unit (clock-skew leaf cert; verifies the cache emits `mitm_clock_skew` Warn — apt-side rejection is observable but not unit-testable here) |
 | F18 | 12.3 chaos (CA expiry mid-runtime) |
 | F19 | 12.1 unit (`apt-cacher-ultra ca print` audit warning on 0644 ca.key) |
@@ -1902,6 +2099,7 @@ by at least one test in §12.1, §12.2, or §12.3:
 | F21 | 12.2 integration (upstream invalid cert) |
 | F22 | 12.2 integration (HTTPS→HTTP redirect not auto-followed) |
 | F23 | 12.1 unit (interprocess flock contention: spawn a goroutine that holds the lock past 30s, verify daemon-side §4.2.1 returns the lock_timeout error and `apt-cacher-ultra ca print` exits with code 4) |
+| F24 | 12.1 unit (fail-closed CA: empty regex + default `allow_unconstrained_ca`, untranslatable regex + default, untranslatable + opt-in (proceeds with Warn), translatable + default (proceeds with constraints)) |
 
 ---
 
