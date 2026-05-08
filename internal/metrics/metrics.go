@@ -93,6 +93,39 @@ func (r *Registry) register(m metric) {
 	r.metrics = append(r.metrics, m)
 }
 
+// SnapshotNamesForTest returns the set of metric names currently
+// registered. Test-only escape hatch for code paths that legitimately
+// register-once-per-process (e.g. admin.New) but need to be invoked
+// repeatedly across tests sharing a global registry.
+func (r *Registry) SnapshotNamesForTest() map[string]struct{} {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	snap := make(map[string]struct{}, len(r.byName))
+	for name := range r.byName {
+		snap[name] = struct{}{}
+	}
+	return snap
+}
+
+// UnregisterAddedSinceForTest drops every metric registered after
+// `snap` was captured. Test-only — paired with SnapshotNamesForTest
+// to undo gauge-registration side effects when a test brings up a
+// subsystem (e.g. admin server) that registers into a process-global
+// registry.
+func (r *Registry) UnregisterAddedSinceForTest(snap map[string]struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := r.metrics[:0]
+	for _, m := range r.metrics {
+		if _, present := snap[m.metricName()]; present {
+			kept = append(kept, m)
+		} else {
+			delete(r.byName, m.metricName())
+		}
+	}
+	r.metrics = kept
+}
+
 // metric is the internal interface every concrete type satisfies.
 type metric interface {
 	metricName() string
