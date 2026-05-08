@@ -28,18 +28,54 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 )
 
-// driveDisabledModeBranches drives the four ServeHTTP branches an
-// apt client can reach in disabled mode: GET miss, GET hit, HEAD,
-// POST→405, CONNECT→405. The upstream serves a fixed body so the
-// fetch path completes deterministically. Returns nothing — caller
-// asserts post-conditions on logs/metrics.
+// lockedBuilder is a thread-safe writer with a locked String()
+// accessor. It supersedes the package's safeWriter for this file
+// because the assertion reads the captured output AFTER the request
+// burst, but the GET-hit path's `touchAsync` goroutine may still
+// be live at that moment. The mutex synchronizes the read with any
+// concurrent Write — closing the data-race window the race detector
+// would otherwise flag.
+//
+// A late touchAsync Write that lands after String() returns is
+// logically permissible for this test: no `mitm_*` event is
+// reachable from any code path in disabled mode (touchAsync only
+// emits a Debug-level "touch failed" line on cache I/O error), and
+// no acu_mitm_* observation site lives there either.
+type lockedBuilder struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuilder) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuilder) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// driveDisabledModeBranches drives every ServeHTTP branch an apt
+// client can reach in disabled mode: GET miss, GET hit, HEAD miss,
+// HEAD hit, POST→405, CONNECT→405, bad_request (relative URI with
+// no mirror configured), forbidden (proxy GET to a host not in the
+// allowlist). The upstream serves a fixed body so the fetch path
+// completes deterministically. The handler's allowlist is the
+// default ^127\.0\.0\.1$ — a request to example.com therefore
+// trips the §6.6 host-allowed pre-check and returns 403.
 func driveDisabledModeBranches(t *testing.T, h *Handler, upstreamURL string) {
 	t.Helper()
+
+	// GET miss + GET hit on /foo.
 	for i := 0; i < 2; i++ {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, proxyReq(http.MethodGet, upstreamURL, "/foo"))
@@ -47,16 +83,46 @@ func driveDisabledModeBranches(t *testing.T, h *Handler, upstreamURL string) {
 			t.Fatalf("GET[%d] status = %d, want 200; body=%q", i, rec.Code, rec.Body.String())
 		}
 	}
+
+	// HEAD miss on a fresh path /head-only — exercises the HEAD-miss
+	// path distinct from HEAD-hit on the already-cached /foo.
 	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq(http.MethodHead, upstreamURL, "/head-only"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HEAD miss status = %d, want 200", rec.Code)
+	}
+
+	// HEAD hit on /foo (now cached).
+	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, proxyReq(http.MethodHead, upstreamURL, "/foo"))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("HEAD status = %d, want 200", rec.Code)
+		t.Fatalf("HEAD hit status = %d, want 200", rec.Code)
 	}
+
+	// POST → 405 (non-CONNECT method-not-allowed branch).
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, proxyReq(http.MethodPost, upstreamURL, "/foo"))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("POST status = %d, want 405", rec.Code)
 	}
+
+	// bad_request: relative URI with no [[mirror]] configured fails
+	// parsing, returns 400.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/no-mirror/x", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad_request status = %d, want 400; body=%q", rec.Code, rec.Body.String())
+	}
+
+	// forbidden: proxy GET to a host outside the ^127\.0\.0\.1$
+	// allowlist trips §6.6 → 403.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq(http.MethodGet, "http://example.com", "/x"))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("forbidden status = %d, want 403; body=%q", rec.Code, rec.Body.String())
+	}
+
+	// CONNECT → 405 (disabled-mode advertisement-only delta).
 	rec = httptest.NewRecorder()
 	connReq := httptest.NewRequest(http.MethodConnect, "http://example.com/", nil)
 	connReq.RequestURI = "example.com:443"
@@ -83,10 +149,11 @@ func TestDisabledMode_NoMITMLogsOnRequestPath(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	// safeWriter wraps a strings.Builder for goroutine-safe writes —
-	// touchAsync logs from a fresh goroutine in the GET-hit path.
-	var sb strings.Builder
-	logger := slog.New(slog.NewJSONHandler(&safeWriter{w: &sb}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// lockedBuilder serializes Writes from touchAsync goroutines and
+	// the synchronous request path, AND serializes our final read so
+	// it happens-after every captured Write.
+	var sb lockedBuilder
+	logger := slog.New(slog.NewJSONHandler(&sb, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	h := newTestHandler(t, nil, nil)
 	h.logger = logger
 
