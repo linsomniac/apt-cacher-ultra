@@ -22,6 +22,14 @@ const (
 // any lock that the gen function might also take.
 type EvictHook func(host string, reason EvictReason, ageSeconds float64)
 
+// LookupHook is fired by the cache after each Get returns. `hit` is
+// true when the cache served a non-expired entry, false on miss
+// (including expired-eviction-then-regenerate). Used by the SPEC6
+// §10.3 `acu_mitm_cert_cache_lookups_total` counter. The hook runs
+// OUTSIDE the cache mutex; implementations should not take any
+// lock that the gen function might also take.
+type LookupHook func(hit bool)
+
 // GenFunc is the cert-generation callback the cache invokes on miss.
 // It is called per literal host (the lower-cased, IDNA-normalized
 // CONNECT target — SPEC6 §5.1.3) and is expected to return a fully
@@ -51,6 +59,10 @@ type Cache struct {
 	// onEvict, when non-nil, fires after each eviction. Set via
 	// SetOnEvict; mutated under mu so reads can use the value safely.
 	onEvict EvictHook
+
+	// onLookup, when non-nil, fires after each Get with the hit/miss
+	// bit. Set via SetOnLookup; mutated under mu.
+	onLookup LookupHook
 
 	// now is the wall-clock source for expiry checks. Bound at
 	// construction; tests inject a controllable clock.
@@ -102,6 +114,15 @@ func (c *Cache) SetOnEvict(h EvictHook) {
 	c.mu.Unlock()
 }
 
+// SetOnLookup installs (or replaces) the lookup callback. Pass nil
+// to disable. The hook fires AFTER each Get with the hit/miss bit
+// and runs outside the cache mutex.
+func (c *Cache) SetOnLookup(h LookupHook) {
+	c.mu.Lock()
+	c.onLookup = h
+	c.mu.Unlock()
+}
+
 // SetClockForTest overrides the wall-clock source. Tests that need to
 // drive expiry deterministically use this; production code does not.
 func (c *Cache) SetClockForTest(now func() time.Time) {
@@ -127,6 +148,11 @@ func (c *Cache) Size() int {
 // Concurrent Get calls for the SAME host coalesce — exactly one
 // invocation of GenFunc runs across them — but two different hosts
 // generate concurrently.
+//
+// SPEC6 §10.3 `acu_mitm_cert_cache_lookups_total` is fed via
+// onLookup, fired exactly once per call with hit=true on the
+// fast-path or hit=false otherwise. Expired-then-regenerate counts
+// as a miss (the original entry was evicted).
 func (c *Cache) Get(host string) (*tls.Certificate, error) {
 	if host == "" {
 		return nil, errors.New("tlsmitm: cache Get: empty host")
@@ -138,13 +164,17 @@ func (c *Cache) Get(host string) (*tls.Certificate, error) {
 		if !c.isExpiredLocked(e) {
 			c.touchLocked(e)
 			cert := e.cert
+			lookupHook := c.onLookup
 			c.mu.Unlock()
+			if lookupHook != nil {
+				lookupHook(true)
+			}
 			return cert, nil
 		}
-		hook, host, age := c.detachLocked(e, EvictReasonExpired)
+		evictHook, evictHost, age := c.detachLocked(e, EvictReasonExpired)
 		c.mu.Unlock()
-		if hook != nil {
-			hook(host, EvictReasonExpired, age)
+		if evictHook != nil {
+			evictHook(evictHost, EvictReasonExpired, age)
 		}
 	} else {
 		c.mu.Unlock()
@@ -170,6 +200,17 @@ func (c *Cache) Get(host string) (*tls.Certificate, error) {
 		c.insert(host, cert)
 		return cert, nil
 	})
+
+	// Fire onLookup with hit=false for the miss path — covers
+	// generation success, generation error, and singleflight
+	// followers that were satisfied by the leader's generated cert.
+	c.mu.Lock()
+	lookupHook := c.onLookup
+	c.mu.Unlock()
+	if lookupHook != nil {
+		lookupHook(false)
+	}
+
 	return cert, err
 }
 

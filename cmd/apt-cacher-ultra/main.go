@@ -70,6 +70,12 @@ var (
 	// at — once per uptime hour in production. Variable so tests
 	// can shorten it.
 	mitmUndistributedRefreshInterval = 1 * time.Hour
+
+	// mitmCertCacheSizeRefreshInterval is the cadence of the §10.3
+	// acu_mitm_cert_cache_size gauge refresher. 30s in production
+	// since the gauge is observational only — no operator action
+	// depends on sub-30s freshness. Variable so tests can shorten it.
+	mitmCertCacheSizeRefreshInterval = 30 * time.Second
 )
 
 func main() {
@@ -448,13 +454,13 @@ func serveListeners(
 	// BEFORE Server.Serve starts accepting traffic. h.connect is read
 	// concurrently from ServeHTTP and writing it after the listener
 	// is up would race those reads — see Handler.SetConnectHandler.
-	var connectStats *proxy.ConnectStats
+	var mitmHandles *tlsMitmHandles
 	if cfg.TlsMitm.Enabled {
-		s, err := wireTlsMitm(cfg, parser, fetchClient, h, logger)
+		hs, err := wireTlsMitm(cfg, parser, fetchClient, h, logger)
 		if err != nil {
 			return fmt.Errorf("build tls_mitm: %w", err)
 		}
-		connectStats = s
+		mitmHandles = hs
 	}
 
 	// SPEC §7.4: start the periodic refresh scheduler. The scheduler
@@ -506,19 +512,31 @@ func serveListeners(
 	// holds (failures >= 1 AND successes == 0) — surfacing
 	// "operator turned on MITM but no client trusts the CA" to the
 	// journal where it's actionable. Started only when MITM is
-	// enabled (connectStats nil otherwise).
+	// enabled (mitmHandles nil otherwise).
 	var mitmWatchWG sync.WaitGroup
-	if connectStats != nil {
+	if mitmHandles != nil {
 		mitmWatchWG.Add(1)
 		go func() {
 			defer mitmWatchWG.Done()
-			proxy.RunUndistributedCAWatch(freshCtx, connectStats, mitmUndistributedRefreshInterval, func(successes, failures int) {
+			proxy.RunUndistributedCAWatch(freshCtx, mitmHandles.Stats, mitmUndistributedRefreshInterval, func(successes, failures int) {
 				logger.Warn("tls_mitm_enabled_ca_undistributed",
 					"window_minutes", 30,
 					"tls_success_count", successes,
 					"tls_failure_count", failures,
 					"detail", "MITM is enabled and at least one TLS handshake failed in the last 30 minutes with zero successes — clients likely don't yet trust the CA; verify CA distribution to clients")
 			})
+		}()
+
+		// SPEC6 §10.3 acu_mitm_cert_cache_size gauge refresher.
+		// Cheap periodic sample (default 30s) since the gauge is
+		// strictly observational; an off-by-30s reading is fine
+		// for /metrics and the §10.4 status page. Drives the
+		// gauge from the cache's true Size() so insert/evict
+		// callbacks don't have to maintain a parallel counter.
+		mitmWatchWG.Add(1)
+		go func() {
+			defer mitmWatchWG.Done()
+			runCertCacheSizeRefresher(freshCtx, mitmHandles.CertCacheSize, mitmCertCacheSizeRefreshInterval)
 		}()
 	}
 
@@ -873,7 +891,19 @@ func newHTTPServer(h http.Handler, logger *slog.Logger) *http.Server {
 // Step 5 is the wiring's load-bearing constraint: writing
 // h.connect after the listener has started accepting traffic
 // would race ServeHTTP's read of the same field.
-func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Client, h *handler.Handler, logger *slog.Logger) (*proxy.ConnectStats, error) {
+// tlsMitmHandles bundles what wireTlsMitm hands back to the caller
+// — the connect-outcome stats counter (for the §9.7.6 refresher)
+// and a closure that reports the current cert-cache size (for the
+// §10.3 acu_mitm_cert_cache_size gauge refresher).
+type tlsMitmHandles struct {
+	Stats *proxy.ConnectStats
+	// CertCacheSize returns the current entry count. Implemented
+	// as a closure rather than passing the *tlsmitm.Cache pointer
+	// so callers don't need to import tlsmitm just for size.
+	CertCacheSize func() int
+}
+
+func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Client, h *handler.Handler, logger *slog.Logger) (*tlsMitmHandles, error) {
 	tmCfg := cfg.TlsMitm
 
 	ca, err := tlsmitm.LoadOrGenerate(tlsmitm.LoadOptions{
@@ -896,12 +926,33 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 		return nil, fmt.Errorf("invalid leaf_algorithm: %w", err)
 	}
 	leafLifetime := tmCfg.LeafCertLifetime.Duration
+	leafAlgoLabel := leafAlg.String()
+	// Wrap the gen function so each successful issuance bumps
+	// acu_mitm_cert_issued_total{algorithm}. Errors are not
+	// counted — they're already captured by acu_mitm_connect_total
+	// with outcome=cert_gen_failed.
 	leafCache, err := tlsmitm.NewCache(tmCfg.CertCacheSize, func(host string) (*tls.Certificate, error) {
-		return tlsmitm.GenerateLeaf(host, ca.TLSCert, leafAlg, leafLifetime, time.Now())
+		cert, err := tlsmitm.GenerateLeaf(host, ca.TLSCert, leafAlg, leafLifetime, time.Now())
+		if err != nil {
+			return nil, err
+		}
+		proxy.RecordCertIssued(leafAlgoLabel)
+		return cert, nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	// SPEC6 §10.3 cache-side metric hooks. Lookup hook fires
+	// hit/miss; evict hook fires lru/expired; capacity is set
+	// once. Size is updated periodically by the gauge refresher
+	// goroutine started in serveListeners.
+	leafCache.SetOnLookup(proxy.RecordCertCacheLookup)
+	leafCache.SetOnEvict(func(host string, reason tlsmitm.EvictReason, ageSeconds float64) {
+		proxy.RecordCertEvicted(string(reason))
+	})
+	proxy.SetCertCacheCapacity(tmCfg.CertCacheSize)
+	proxy.SetCANotAfterUnixtime(ca.Cert.NotAfter.Unix())
+	proxy.SetCertCacheSize(leafCache.Size())
 
 	var signingGate func(string) bool
 	if tmCfg.AllowedHostRegex != "" {
@@ -970,7 +1021,32 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 			"upstream_allowed_host_regex", cfg.Upstream.AllowedHostRegex,
 		)
 	}
-	return stats, nil
+	return &tlsMitmHandles{
+		Stats:         stats,
+		CertCacheSize: leafCache.Size,
+	}, nil
+}
+
+// runCertCacheSizeRefresher wakes at every `interval` boundary and
+// writes the current cache size to the §10.3
+// acu_mitm_cert_cache_size gauge. Returns when ctx is cancelled.
+// One initial sample fires on entry so the gauge is populated
+// immediately rather than after the first tick.
+func runCertCacheSizeRefresher(ctx context.Context, sizer func() int, interval time.Duration) {
+	if sizer == nil || interval <= 0 {
+		return
+	}
+	proxy.SetCertCacheSize(sizer())
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			proxy.SetCertCacheSize(sizer())
+		}
+	}
 }
 
 // emitTlsMitmLog forwards a structured event from internal/proxy or

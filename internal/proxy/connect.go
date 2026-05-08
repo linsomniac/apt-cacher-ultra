@@ -468,6 +468,7 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "set deadline: "+err.Error(), "", false)
 		return
 	}
+	handshakeStart := time.Now()
 	if err := tlsConn.Handshake(); err != nil {
 		outcome := OutcomeTLSFailed
 		if isDeadlineExceeded(err) {
@@ -476,6 +477,7 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 		h.warnConnect(outcome, target.LiteralHost, target.Port, clientAddr, start, "tls: "+err.Error(), "", false)
 		return
 	}
+	mitmHandshakeDurationSeconds.Observe(time.Since(handshakeStart).Seconds())
 	defer tlsConn.Close()
 	// Past this point the TLS handshake has succeeded; record-call
 	// sites pass tlsReached=true so post-handshake
@@ -708,12 +710,13 @@ func writeInnerStatus(c *tls.Conn, status int, allow string) {
 // post-handshake call sites pass true. The flag is irrelevant for
 // every outcome other than `inner_stream_failed`.
 func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port int, clientAddr string, start time.Time, reason, deniedGate string, tlsReached bool) {
+	dur := time.Since(start).Seconds()
 	fields := map[string]any{
 		"outcome":          string(outcome),
 		"host":             host,
 		"port":             port,
 		"client_addr":      clientAddr,
-		"duration_seconds": time.Since(start).Seconds(),
+		"duration_seconds": dur,
 	}
 	if reason != "" {
 		fields["reason"] = reason
@@ -723,6 +726,8 @@ func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port i
 	}
 	h.deps.LogFn("warn", "mitm_connect", fields)
 	h.recordOutcome(outcome, tlsReached)
+	mitmConnectTotal.Inc(string(outcome))
+	mitmConnectDurationSeconds.Observe(dur)
 }
 
 // infoConnect is the Info counterpart of warnConnect — used only
@@ -730,18 +735,21 @@ func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port i
 // always true at the call sites; it is taken as a parameter for
 // signature symmetry with warnConnect.
 func (h *ConnectHandler) infoConnect(outcome ConnectOutcome, host string, port int, clientAddr string, start time.Time, reason string, tlsReached bool) {
+	dur := time.Since(start).Seconds()
 	fields := map[string]any{
 		"outcome":          string(outcome),
 		"host":             host,
 		"port":             port,
 		"client_addr":      clientAddr,
-		"duration_seconds": time.Since(start).Seconds(),
+		"duration_seconds": dur,
 	}
 	if reason != "" {
 		fields["reason"] = reason
 	}
 	h.deps.LogFn("info", "mitm_connect", fields)
 	h.recordOutcome(outcome, tlsReached)
+	mitmConnectTotal.Inc(string(outcome))
+	mitmConnectDurationSeconds.Observe(dur)
 }
 
 // recordOutcome forwards `outcome` to the §9.7.6 rolling counter

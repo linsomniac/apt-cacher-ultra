@@ -351,3 +351,69 @@ func TestCache_Singleflight_SurvivesPanicInGen(t *testing.T) {
 		t.Errorf("size = %d, want 1", c.Size())
 	}
 }
+
+// TestCache_LookupHook_FiresHitMiss verifies the SPEC6 §10.3
+// LookupHook contract: fires once per Get with the hit/miss bit.
+func TestCache_LookupHook_FiresHitMiss(t *testing.T) {
+	gen := func(host string) (*tls.Certificate, error) {
+		return fakeCert(host, time.Now().Add(time.Hour)), nil
+	}
+	c, err := NewCache(8, gen)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+
+	var hits, misses atomic.Int32
+	c.SetOnLookup(func(hit bool) {
+		if hit {
+			hits.Add(1)
+		} else {
+			misses.Add(1)
+		}
+	})
+
+	if _, err := c.Get("a.example.com"); err != nil { // miss
+		t.Fatalf("Get a: %v", err)
+	}
+	if _, err := c.Get("a.example.com"); err != nil { // hit
+		t.Fatalf("Get a (hit): %v", err)
+	}
+	if _, err := c.Get("b.example.com"); err != nil { // miss
+		t.Fatalf("Get b: %v", err)
+	}
+
+	if got := hits.Load(); got != 1 {
+		t.Errorf("hits = %d, want 1", got)
+	}
+	if got := misses.Load(); got != 2 {
+		t.Errorf("misses = %d, want 2", got)
+	}
+}
+
+// TestCache_LookupHook_FiresOnGenError: a Get that fails in the
+// gen function still fires onLookup with hit=false. Cache state
+// stays empty (failure isn't cached) but the lookup happened.
+func TestCache_LookupHook_FiresOnGenError(t *testing.T) {
+	gen := func(host string) (*tls.Certificate, error) {
+		return nil, fmt.Errorf("boom")
+	}
+	c, err := NewCache(8, gen)
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+
+	var misses atomic.Int32
+	c.SetOnLookup(func(hit bool) {
+		if !hit {
+			misses.Add(1)
+		}
+	})
+
+	if _, err := c.Get("a.example.com"); err == nil {
+		t.Fatal("expected gen error, got nil")
+	}
+
+	if got := misses.Load(); got != 1 {
+		t.Errorf("misses on gen failure = %d, want 1", got)
+	}
+}
