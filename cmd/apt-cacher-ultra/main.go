@@ -1031,13 +1031,24 @@ func wireTlsMitm(ctx context.Context, cfg *config.Config, parser *proxy.Parser, 
 	if err != nil {
 		return nil, err
 	}
-	// SPEC6 §10.3 cache-side metric hooks. Lookup hook fires
-	// hit/miss; evict hook fires lru/expired; capacity is set
-	// once. Size is updated periodically by the gauge refresher
-	// goroutine started in serveListeners.
+	// SPEC6 §10.3 cache-side metric hooks + §10.2 eviction log.
+	// Lookup hook fires hit/miss; evict hook fires lru/expired;
+	// capacity is set once. Size is updated periodically by the
+	// gauge refresher goroutine started in serveListeners.
+	//
+	// SPEC6 §10.2 mandates a `mitm_cert_cache_evicted` Info log
+	// with fields {host, reason, age_seconds} on every eviction.
+	// Both fires from this single callback so the metric counter
+	// and the log line stay 1:1 with the cache's internal evict
+	// event — no chance of one firing without the other.
 	leafCache.SetOnLookup(proxy.RecordCertCacheLookup)
 	leafCache.SetOnEvict(func(host string, reason tlsmitm.EvictReason, ageSeconds float64) {
 		proxy.RecordCertEvicted(string(reason))
+		emitTlsMitmLog(logger, "info", "mitm_cert_cache_evicted", map[string]any{
+			"host":        host,
+			"reason":      string(reason),
+			"age_seconds": ageSeconds,
+		})
 	})
 	proxy.SetCertCacheCapacity(tmCfg.CertCacheSize)
 	proxy.SetCANotAfterUnixtime(ca.Cert.NotAfter.Unix())
