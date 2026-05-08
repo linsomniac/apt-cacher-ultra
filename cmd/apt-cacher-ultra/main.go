@@ -67,6 +67,16 @@ var (
 )
 
 func main() {
+	// SPEC6 §14.3 subcommand routing. `ca print` is a positional
+	// pre-flag form (matches the established `program subcommand
+	// args` shell idiom and avoids polluting the daemon's flag set).
+	// Anything else falls through to standard flag parsing — which
+	// recognizes the daemon's own flags AND the §14.2
+	// `--print-apt-conf` toggle.
+	if len(os.Args) >= 3 && os.Args[1] == "ca" && os.Args[2] == "print" {
+		os.Exit(runCAPrint(os.Args[3:], os.Stdout, os.Stderr))
+	}
+
 	configPath := flag.String("config", "/etc/apt-cacher-ultra/config.toml", "path to TOML config file")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()

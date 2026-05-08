@@ -1324,3 +1324,38 @@ func TestTlsMitm_EffectiveCaStorageDir(t *testing.T) {
 		t.Errorf("empty cache.dir + empty storage = %q, want \"\"", got)
 	}
 }
+
+// TestValidateAdvertiseHost covers the SPEC6 §14.2 rules for the new
+// cache.advertise_host field. Empty is accepted (default); bare host
+// or host:port pass; scheme/path forms or out-of-range ports fail.
+func TestValidateAdvertiseHost(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"bare-host", "cache.example.com", false},
+		{"host-port", "cache.example.com:3142", false},
+		{"ipv4-port", "10.0.0.1:3142", false},
+		{"ipv4-bare", "10.0.0.1", false},
+		{"ipv6-bracketed-port", "[::1]:3142", false},
+		{"ipv6-bracketed-bare", "[::1]", false},
+		{"with-scheme-rejected", "http://cache.example.com", true},
+		{"with-path-rejected", "cache.example.com/path", true},
+		{"empty-port-rejected", "cache.example.com:", true},
+		{"non-numeric-port-rejected", "cache.example.com:abc", true},
+		{"out-of-range-port-rejected", "cache.example.com:99999", true},
+		{"unbalanced-bracket-rejected", "[::1:3142", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateAdvertiseHost(tc.input)
+			if tc.wantErr && err == nil {
+				t.Errorf("input %q: want error, got nil", tc.input)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("input %q: want no error, got %v", tc.input, err)
+			}
+		})
+	}
+}

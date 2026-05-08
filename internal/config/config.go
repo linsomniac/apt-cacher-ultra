@@ -67,6 +67,15 @@ type CacheConfig struct {
 	ListenTLS string `toml:"listen_tls"`
 	TLSCert   string `toml:"tls_cert"`
 	TLSKey    string `toml:"tls_key"`
+
+	// AdvertiseHost is the SPEC6 §14.2 client-facing host (or
+	// host:port) the `--print-apt-conf` snippet emits. Empty
+	// default; the daemon never reads this — listener bind, request
+	// handling, and URL canonicalization use Listen exclusively.
+	// When non-empty, must parse as a host or host:port (no scheme,
+	// no path). Useful when Listen binds 0.0.0.0/:: and the snippet
+	// would otherwise emit a non-routable target.
+	AdvertiseHost string `toml:"advertise_host"`
 }
 
 type UpstreamConfig struct {
@@ -596,6 +605,15 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// SPEC6 §14.2 cache.advertise_host: empty default; otherwise must
+	// parse as a host or host:port (no scheme, no path). Affects only
+	// `--print-apt-conf`; never read by the request-handling daemon.
+	if c.Cache.AdvertiseHost != "" {
+		if err := validateAdvertiseHost(c.Cache.AdvertiseHost); err != nil {
+			errs = append(errs, fmt.Errorf("cache.advertise_host %q: %w", c.Cache.AdvertiseHost, err))
+		}
+	}
+
 	if c.Upstream.ConnectTimeout.Duration < 0 {
 		errs = append(errs, errors.New("upstream.connect_timeout must not be negative"))
 	}
@@ -904,6 +922,65 @@ func validateListenAddr(addr string) error {
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("invalid host:port %q: %w", addr, err)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("port %q is not numeric", port)
+	}
+	if p < 1 || p > 65535 {
+		return fmt.Errorf("port %d out of range 1-65535", p)
+	}
+	return nil
+}
+
+// validateAdvertiseHost accepts "host" or "host:port" — no scheme, no
+// path. Used by SPEC6 §14.2 to validate cache.advertise_host. The host
+// portion is permissive (any non-empty token without ":" or "/"); the
+// port portion, when present, must be a numeric value in 1-65535.
+func validateAdvertiseHost(s string) error {
+	if strings.Contains(s, "://") {
+		return fmt.Errorf("must not contain a scheme")
+	}
+	if strings.Contains(s, "/") {
+		return fmt.Errorf("must not contain a path")
+	}
+	// Bracketed IPv6: "[::1]" or "[::1]:3142".
+	if strings.HasPrefix(s, "[") {
+		end := strings.Index(s, "]")
+		if end < 0 {
+			return fmt.Errorf("unbalanced bracket in IPv6 literal")
+		}
+		host := s[1:end]
+		if host == "" {
+			return fmt.Errorf("empty IPv6 literal")
+		}
+		rest := s[end+1:]
+		if rest == "" {
+			return nil
+		}
+		if !strings.HasPrefix(rest, ":") {
+			return fmt.Errorf("expected ':port' after IPv6 literal, got %q", rest)
+		}
+		return validatePortString(rest[1:])
+	}
+	// Bare host or host:port. SplitHostPort fails on a host with no
+	// port, so we test that shape first.
+	if !strings.Contains(s, ":") {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return fmt.Errorf("invalid host:port: %w", err)
+	}
+	if host == "" {
+		return fmt.Errorf("empty host")
+	}
+	return validatePortString(port)
+}
+
+func validatePortString(port string) error {
+	if port == "" {
+		return fmt.Errorf("empty port")
 	}
 	p, err := strconv.Atoi(port)
 	if err != nil {
