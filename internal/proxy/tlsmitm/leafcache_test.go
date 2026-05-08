@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -276,5 +277,77 @@ func TestCache_EmptyHostRejected(t *testing.T) {
 	c, _ := NewCache(8, gen)
 	if _, err := c.Get(""); err == nil {
 		t.Error("empty host should be rejected")
+	}
+}
+
+// TestCache_Singleflight_SurvivesPanicInGen exercises the panic-safety
+// contract on sfGroup.Do: a panicking gen must (a) surface a typed
+// error to every waiter, (b) allow the next call to lead a fresh
+// execution. Without panic recovery, every future Get for the panicked
+// host would block on wg.Wait() forever.
+func TestCache_Singleflight_SurvivesPanicInGen(t *testing.T) {
+	const N = 16
+	var (
+		shouldPanic atomic.Bool
+		called      atomic.Int32
+	)
+	shouldPanic.Store(true)
+	gen := func(host string) (*tls.Certificate, error) {
+		called.Add(1)
+		if shouldPanic.Load() {
+			panic("synthetic gen panic")
+		}
+		return fakeCert(host, time.Now().Add(time.Hour)), nil
+	}
+	c, _ := NewCache(8, gen)
+
+	// Pile up N concurrent waiters on the same host so we exercise both
+	// the leader path (which panics) and the wg.Wait waiter path (which
+	// must wake up rather than hang).
+	var wg sync.WaitGroup
+	wg.Add(N)
+	errs := make(chan error, N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			_, err := c.Get("foo.example.com")
+			errs <- err
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("singleflight wedged waiting on a panicking gen")
+	}
+	close(errs)
+
+	for err := range errs {
+		if err == nil {
+			t.Error("expected error from panicked gen, got nil")
+			continue
+		}
+		if !strings.Contains(err.Error(), "panicked") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+
+	// Subsequent Get with a non-panicking gen must succeed — the
+	// in-flight entry was deleted; failure was not cached.
+	shouldPanic.Store(false)
+	cert, err := c.Get("foo.example.com")
+	if err != nil {
+		t.Fatalf("retry after panic: %v", err)
+	}
+	if cert == nil {
+		t.Fatal("retry returned nil cert")
+	}
+	if c.Size() != 1 {
+		t.Errorf("size = %d, want 1", c.Size())
 	}
 }

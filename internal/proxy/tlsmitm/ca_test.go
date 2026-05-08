@@ -689,6 +689,130 @@ func TestLoadOrGenerate_Auto_SignsLeafCorrectly(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// ensurePrivateDir
+// ----------------------------------------------------------------------------
+
+func TestEnsurePrivateDir_CreatesMissingDir(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "nested", "ca")
+	if err := ensurePrivateDir(dir); err != nil {
+		t.Fatalf("ensurePrivateDir: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Errorf("mode = %v, want 0700", info.Mode().Perm())
+	}
+}
+
+func TestEnsurePrivateDir_TightensExistingPermissiveDir(t *testing.T) {
+	dir := t.TempDir()
+	// t.TempDir creates with 0700 already. Loosen first so the helper
+	// has something to chmod.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensurePrivateDir(dir); err != nil {
+		t.Fatalf("ensurePrivateDir: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Errorf("mode = %v, want 0700", info.Mode().Perm())
+	}
+}
+
+func TestEnsurePrivateDir_RejectsRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	notDir := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(notDir, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := ensurePrivateDir(notDir)
+	if err == nil {
+		t.Fatal("expected error for non-directory path, got nil")
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("expected 'not a directory' in error, got %q", err.Error())
+	}
+}
+
+func TestEnsurePrivateDir_EmptyPath(t *testing.T) {
+	if err := ensurePrivateDir(""); err == nil {
+		t.Error("empty path should be rejected")
+	}
+}
+
+// TestLoadOrGenerate_Auto_TightensPermissiveStorageDir is the
+// integration test for the §4.2.1 step 4 contract: a pre-existing
+// permissive storage directory is silently tightened to 0700 before
+// any key material is written into it.
+func TestLoadOrGenerate_Auto_TightensPermissiveStorageDir(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "ca")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrGenerate(LoadOptions{
+		StorageDir:       dir,
+		AllowedHostRegex: `^foo\.example\.com$`,
+	}); err != nil {
+		t.Fatalf("LoadOrGenerate: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Errorf("storage dir mode = %v, want 0700", info.Mode().Perm())
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Supplied-CA validation: KeyUsage extension without keyCertSign
+// ----------------------------------------------------------------------------
+
+func TestLoadOrGenerate_Supplied_KeyUsageWithoutCertSign(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := writeSuppliedCA(t, dir, "ecdsa-p256", func(c *x509.Certificate) {
+		// KeyUsage is present (non-zero) but lacks keyCertSign — Go's
+		// x509.CreateCertificate would reject every leaf signing.
+		c.KeyUsage = x509.KeyUsageDigitalSignature
+	})
+	_, err := LoadOrGenerate(LoadOptions{
+		SuppliedCertPath: certPath,
+		SuppliedKeyPath:  keyPath,
+	})
+	if err == nil {
+		t.Fatal("expected KeyUsage error, got nil")
+	}
+	if !strings.Contains(err.Error(), "keyCertSign") {
+		t.Errorf("expected 'keyCertSign' in error, got %q", err.Error())
+	}
+}
+
+func TestLoadOrGenerate_Supplied_KeyUsageAbsentIsAccepted(t *testing.T) {
+	// KeyUsage == 0 means "extension absent"; Go interprets that as
+	// "all usages permitted" so signing succeeds. The validator must
+	// not reject this case (it would break operator-supplied CAs that
+	// never bothered with the extension).
+	dir := t.TempDir()
+	certPath, keyPath := writeSuppliedCA(t, dir, "ecdsa-p256", func(c *x509.Certificate) {
+		c.KeyUsage = 0
+	})
+	if _, err := LoadOrGenerate(LoadOptions{
+		SuppliedCertPath: certPath,
+		SuppliedKeyPath:  keyPath,
+	}); err != nil {
+		t.Fatalf("LoadOrGenerate with absent KeyUsage: %v", err)
+	}
+}
+
+// ----------------------------------------------------------------------------
 // Helper used internally by ca_test.go.
 // ----------------------------------------------------------------------------
 

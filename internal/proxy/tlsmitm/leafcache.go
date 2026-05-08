@@ -285,7 +285,13 @@ type sfGroup struct {
 // wg.Done() and the map delete still observes the just-finished call
 // (because we publish the result before deleting), so coalescing is
 // guaranteed even at the race boundary.
-func (g *sfGroup) Do(key string, fn func() (*tls.Certificate, error)) (*tls.Certificate, error) {
+//
+// Panic-safety: a panic inside fn is recovered and surfaced as an
+// error to every waiter. Without this, a panicking gen would leave
+// wg.Done unreached and the call entry in the map, wedging every
+// future Get for `key` on wg.Wait() forever — a per-host DoS from
+// one bad generation path.
+func (g *sfGroup) Do(key string, fn func() (*tls.Certificate, error)) (cert *tls.Certificate, err error) {
 	g.mu.Lock()
 	if call, ok := g.calls[key]; ok {
 		g.mu.Unlock()
@@ -297,12 +303,23 @@ func (g *sfGroup) Do(key string, fn func() (*tls.Certificate, error)) (*tls.Cert
 	g.calls[key] = call
 	g.mu.Unlock()
 
-	call.result, call.err = fn()
-	call.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			cert = nil
+			err = fmt.Errorf("tlsmitm: cert generation panicked: %v", r)
+		}
+		// Publish the result BEFORE wg.Done so waiters that wake
+		// immediately read the just-finished values, and BEFORE
+		// the map delete so a caller arriving in the wg.Done →
+		// delete window still observes the finished call.
+		call.result, call.err = cert, err
+		call.wg.Done()
 
-	g.mu.Lock()
-	delete(g.calls, key)
-	g.mu.Unlock()
+		g.mu.Lock()
+		delete(g.calls, key)
+		g.mu.Unlock()
+	}()
 
-	return call.result, call.err
+	cert, err = fn()
+	return
 }

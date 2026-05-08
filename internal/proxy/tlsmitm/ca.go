@@ -215,9 +215,20 @@ func loadSupplied(opts LoadOptions) (*CA, error) {
 
 // validateSuppliedCA enforces SPEC6 §5.2 / §11 F4-F6/F6a checks on an
 // operator-supplied CA pair.
+//
+// The KeyUsage check guards against a CA cert that *parses* fine but
+// would have every leaf signing rejected by Go's x509.CreateCertificate
+// (which enforces the keyCertSign bit when KeyUsage is present). An
+// absent KeyUsage extension (cert.KeyUsage == 0) is treated as
+// "all usages permitted", matching Go's stdlib behavior — failing
+// closed there would reject every operator-supplied CA without a
+// KeyUsage extension, which is overly strict.
 func validateSuppliedCA(cert *x509.Certificate, key crypto.PrivateKey, now time.Time) error {
 	if !cert.IsCA || !cert.BasicConstraintsValid {
 		return errors.New("tlsmitm: supplied CA cert lacks BasicConstraints CA:TRUE")
+	}
+	if cert.KeyUsage != 0 && cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return errors.New("tlsmitm: supplied CA cert has KeyUsage extension without keyCertSign — leaf signing would fail at every CONNECT")
 	}
 	if !now.Before(cert.NotAfter) {
 		return fmt.Errorf("tlsmitm: supplied CA cert not_after %s is not in the future (now=%s)", cert.NotAfter, now)
@@ -323,10 +334,10 @@ const (
 
 func loadOrGenerateAuto(opts LoadOptions) (*CA, error) {
 	// §4.2.1 step 1: acquire interprocess flock.
-	lockPath := filepath.Join(opts.StorageDir, caLockFile)
-	if err := os.MkdirAll(opts.StorageDir, 0o700); err != nil {
-		return nil, fmt.Errorf("tlsmitm: create storage dir %q: %w", opts.StorageDir, err)
+	if err := ensurePrivateDir(opts.StorageDir); err != nil {
+		return nil, err
 	}
+	lockPath := filepath.Join(opts.StorageDir, caLockFile)
 	release, err := acquireLock(lockPath, opts.LockTimeout)
 	if err != nil {
 		opts.LogFn("error", "mitm_ca_lock_timeout", map[string]any{"path": lockPath})
@@ -633,11 +644,12 @@ func writeCAAtomically(dir string, certPEM, keyPEM []byte, markerFP string) (ret
 		}
 	}()
 
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("tlsmitm: mkdir %s: %w", dir, err)
+	// loadOrGenerateAuto already ran ensurePrivateDir before acquiring
+	// the flock; this is belt-and-suspenders for any future caller that
+	// reaches this function on a different code path.
+	if err := ensurePrivateDir(dir); err != nil {
+		return err
 	}
-	// ensure mode regardless of pre-existing dir
-	_ = os.Chmod(dir, 0o700)
 
 	if err := writeFileSync(filepath.Join(dir, caCertFile+".tmp"), certPEM, 0o600); err != nil {
 		return fmt.Errorf("tlsmitm: write ca.crt.tmp: %w", err)
@@ -705,6 +717,51 @@ func fsyncDir(dir string) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// ensurePrivateDir guarantees that `dir` exists, is a real directory,
+// and has mode 0700. SPEC6 §4.2.1 step 4 says "Create <ca_storage_dir>
+// with mode 0700 if absent. umask is irrelevant — the daemon explicitly
+// chmods." A bare os.MkdirAll honors umask AND only sets the mode on
+// directories it creates — a pre-existing 0755 dir keeps its mode.
+// This helper closes that gap: chmod after stat, re-stat to confirm
+// the chmod landed (some filesystems silently drop mode changes), and
+// fail loudly if any of those steps cannot complete. The CA's private
+// key sits inside this directory and the path-traversal mode matters.
+func ensurePrivateDir(dir string) error {
+	if dir == "" {
+		return errors.New("tlsmitm: ensurePrivateDir: empty path")
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("tlsmitm: stat %s: %w", dir, err)
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("tlsmitm: create %s: %w", dir, err)
+		}
+		info, err = os.Stat(dir)
+		if err != nil {
+			return fmt.Errorf("tlsmitm: stat %s after create: %w", dir, err)
+		}
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("tlsmitm: %s exists but is not a directory", dir)
+	}
+	if info.Mode().Perm() == 0o700 {
+		return nil
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("tlsmitm: chmod %s 0700: %w", dir, err)
+	}
+	info2, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("tlsmitm: re-stat %s: %w", dir, err)
+	}
+	if info2.Mode().Perm() != 0o700 {
+		return fmt.Errorf("tlsmitm: %s mode is %v after chmod 0700 (filesystem may not support permissions)", dir, info2.Mode().Perm())
+	}
+	return nil
 }
 
 func cleanupTmpFiles(dir string) error {
