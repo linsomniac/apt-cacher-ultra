@@ -91,13 +91,20 @@ func TestServe_BackwardClockJump_EmitsClockSkewWarn(t *testing.T) {
 	}
 
 	// One CONNECT triggers one leaf-cache miss → one GenerateLeaf
-	// → one CheckLeafClockSkew call. The 200 line confirms
-	// LeafCache.Get returned (and thus the skew check ran).
+	// → one CheckLeafClockSkew call. ServeCONNECT writes the 200
+	// line BEFORE the LeafCache.Get + skew-check step, so reading
+	// the 200 only confirms the CONNECT was hijacked and accepted.
+	// The serveDone wait below is what guarantees the handler ran
+	// to completion (post-skew-check, post-handshake-timeout) so
+	// the mitm_clock_skew line is in sb by the time we inspect it.
 	conn := openCONNECT(t, cacheAddr, "skew-pin.test:443")
 	defer conn.Close()
 
 	// Capture roughly when the skew check ran so we can sanity-
-	// check the `now` field in the emit.
+	// check the `now` field in the emit. The check fires shortly
+	// after ServeCONNECT writes 200 (LeafCache.Get is the very
+	// next step), so this is within tens of microseconds of the
+	// real emit time on the server side.
 	capturedAt := time.Now()
 
 	// Shutdown so all log writes have completed before we read.
