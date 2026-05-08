@@ -33,16 +33,24 @@ import (
 // ConnectStats is a 30-minute rolling counter of CONNECT outcomes
 // classified per SPEC6 §5.3. Safe for concurrent use; methods are
 // O(30) at most.
+//
+// Buckets are keyed by *uptime minutes since NewConnectStats* — not
+// wall-clock unix minutes — so the §9.7.6 predicate is robust to
+// NTP correction or operator-side clock skew. A backwards jump on
+// the wall clock would otherwise either prematurely expire failures
+// or hide recent buckets as "future"; uptime monotonically advances
+// even when the wall clock doesn't.
 type ConnectStats struct {
 	mu      sync.Mutex
 	buckets [30]connectBucket
 	nowFn   func() time.Time
+	start   time.Time // baseline captured at construction (or SetClockForTest)
 }
 
 // connectBucket is one minute of (success, failure) counts. The
-// `minute` field holds the unix-minute identifier so a stale bucket
-// (last touched > 30 minutes ago) is detected and zeroed on next
-// access — this is how circular reuse stays correct without a
+// `minute` field holds the uptime-minute identifier so a stale
+// bucket (last touched > 30 minutes ago) is detected and zeroed on
+// next access — this is how circular reuse stays correct without a
 // per-minute prune sweep.
 type connectBucket struct {
 	minute   int64
@@ -53,29 +61,42 @@ type connectBucket struct {
 // NewConnectStats returns an empty stats counter. nowFn defaults
 // to time.Now; tests pass a fake clock.
 func NewConnectStats() *ConnectStats {
-	return &ConnectStats{nowFn: time.Now}
+	return &ConnectStats{nowFn: time.Now, start: time.Now()}
 }
 
-// SetClockForTest overrides the time source. Test-only.
+// SetClockForTest overrides the time source AND resets the uptime
+// baseline to the new clock's current value. Tests must call this
+// before recording — without the baseline reset, bucket math would
+// mix construction-time wall-clock with the fake clock and produce
+// nonsense uptime values. Test-only.
 func (s *ConnectStats) SetClockForTest(now func() time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nowFn = now
+	s.start = now()
+	// Zero the buckets too so a fresh fake-clock test sees a clean slate.
+	for i := range s.buckets {
+		s.buckets[i] = connectBucket{}
+	}
 }
 
 // Record classifies `outcome` per §5.3 and bumps the appropriate
-// bucket. Outcomes that don't fall into success/failure (pre-TLS
-// rejections like bad_target) are silently ignored — they are not
-// part of the §9.7.6 distribution-health signal.
-func (s *ConnectStats) Record(outcome ConnectOutcome) {
-	cls := classifyOutcome(outcome)
+// bucket. `tlsReached` resolves the ambiguity around
+// `OutcomeInnerStreamFailed`: the spec class "TLS handshake reached"
+// only applies when the handshake actually completed (post-handshake
+// inner-stream errors). Pre-hijack / pre-200-write / pre-handshake
+// `inner_stream_failed` cases pass tlsReached=false and are
+// classified as ignored — those failures predate the question of CA
+// trust. Other outcomes (tunneled, tls_failed, etc.) have a fixed
+// classification and ignore the flag.
+func (s *ConnectStats) Record(outcome ConnectOutcome, tlsReached bool) {
+	cls := classifyOutcome(outcome, tlsReached)
 	if cls == outcomeIgnored {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.nowFn()
-	m := now.Unix() / 60
+	m := s.uptimeMinuteLocked()
 	idx := int(m % 30)
 	if s.buckets[idx].minute != m {
 		s.buckets[idx] = connectBucket{minute: m}
@@ -89,28 +110,41 @@ func (s *ConnectStats) Record(outcome ConnectOutcome) {
 }
 
 // Last30Min returns the (success, failure) counts over the rolling
-// 30-minute window ending at the current clock time. Buckets whose
-// `minute` field is more than 30 minutes stale are excluded — they
-// are residue from a quiet period and would otherwise pollute the
-// reading on circular reuse.
+// 30-minute window ending at the current uptime minute. Buckets
+// whose `minute` field is more than 30 minutes stale are excluded
+// — they are residue from a quiet period and would otherwise
+// pollute the reading on circular reuse.
 func (s *ConnectStats) Last30Min() (successes, failures int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.nowFn()
-	currentMin := now.Unix() / 60
+	currentMin := s.uptimeMinuteLocked()
 	cutoff := currentMin - 29 // include the current minute + the 29 before it
 	for _, b := range s.buckets {
 		if b.minute < cutoff {
 			continue
 		}
 		if b.minute > currentMin {
-			// Future-dated bucket — clock skew; skip defensively.
+			// Future-dated bucket — defensive guard; should not
+			// arise with monotonic uptime, but cheap to keep.
 			continue
 		}
 		successes += b.success
 		failures += b.failure
 	}
 	return successes, failures
+}
+
+// uptimeMinuteLocked returns the integer uptime minute since
+// `s.start`. Wall-clock-independent: an NTP jump backwards or a
+// manual `date` change does not affect this. Caller must hold s.mu.
+func (s *ConnectStats) uptimeMinuteLocked() int64 {
+	d := s.nowFn().Sub(s.start)
+	if d < 0 {
+		// Defensive: a SetClockForTest then advance-backwards
+		// would land here. Treat as minute 0.
+		return 0
+	}
+	return int64(d / time.Minute)
 }
 
 // outcomeClass is the §5.3 partition of ConnectOutcome values.
@@ -122,10 +156,19 @@ const (
 	outcomeFailure
 )
 
-func classifyOutcome(o ConnectOutcome) outcomeClass {
+func classifyOutcome(o ConnectOutcome, tlsReached bool) outcomeClass {
 	switch o {
-	case OutcomeTunneled, OutcomeInnerMethodRejected, OutcomeInnerStreamFailed:
+	case OutcomeTunneled, OutcomeInnerMethodRejected:
+		// Both fire only post-handshake. Independent of the flag.
 		return outcomeSuccess
+	case OutcomeInnerStreamFailed:
+		// Ambiguous: pre-handshake (hijack/write-200/etc.) or
+		// post-handshake (set-deadline/read-inner). Only the
+		// post-handshake case proves the CA was trusted.
+		if tlsReached {
+			return outcomeSuccess
+		}
+		return outcomeIgnored
 	case OutcomeTLSFailed, OutcomeTLSHandshakeTimeout, OutcomeCertGenFailed:
 		return outcomeFailure
 	default:

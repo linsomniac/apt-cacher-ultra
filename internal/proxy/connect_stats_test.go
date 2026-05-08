@@ -35,9 +35,9 @@ func TestConnectStats_ClassifySuccess(t *testing.T) {
 	s := NewConnectStats()
 	s.SetClockForTest(clk.Now)
 
-	s.Record(OutcomeTunneled)
-	s.Record(OutcomeInnerMethodRejected)
-	s.Record(OutcomeInnerStreamFailed)
+	s.Record(OutcomeTunneled, true)
+	s.Record(OutcomeInnerMethodRejected, true)
+	s.Record(OutcomeInnerStreamFailed, true)
 
 	successes, failures := s.Last30Min()
 	if successes != 3 {
@@ -54,9 +54,9 @@ func TestConnectStats_ClassifyFailure(t *testing.T) {
 	s := NewConnectStats()
 	s.SetClockForTest(clk.Now)
 
-	s.Record(OutcomeTLSFailed)
-	s.Record(OutcomeTLSHandshakeTimeout)
-	s.Record(OutcomeCertGenFailed)
+	s.Record(OutcomeTLSFailed, false)
+	s.Record(OutcomeTLSHandshakeTimeout, false)
+	s.Record(OutcomeCertGenFailed, false)
 
 	successes, failures := s.Last30Min()
 	if successes != 0 {
@@ -75,15 +75,51 @@ func TestConnectStats_ClassifyIgnored(t *testing.T) {
 	s := NewConnectStats()
 	s.SetClockForTest(clk.Now)
 
-	s.Record(OutcomeBadTarget)
-	s.Record(OutcomeBadHost)
-	s.Record(OutcomeIPLiteralHost)
-	s.Record(OutcomeBadPort)
-	s.Record(OutcomeDeniedHost)
+	s.Record(OutcomeBadTarget, false)
+	s.Record(OutcomeBadHost, false)
+	s.Record(OutcomeIPLiteralHost, false)
+	s.Record(OutcomeBadPort, false)
+	s.Record(OutcomeDeniedHost, false)
 
 	successes, failures := s.Last30Min()
 	if successes != 0 || failures != 0 {
 		t.Errorf("ignored outcomes leaked into stats: successes=%d failures=%d", successes, failures)
+	}
+}
+
+// TestConnectStats_InnerStreamFailedTLSReached: post-handshake
+// inner_stream_failed must classify as success (TLS handshake
+// completed; the inner stream broke afterward, which still proves
+// the CA was trusted).
+func TestConnectStats_InnerStreamFailedTLSReached(t *testing.T) {
+	clk := &fakeClock{now: time.Unix(0, 0)}
+	s := NewConnectStats()
+	s.SetClockForTest(clk.Now)
+
+	s.Record(OutcomeInnerStreamFailed, true)
+
+	successes, failures := s.Last30Min()
+	if successes != 1 {
+		t.Errorf("post-handshake inner_stream_failed should bump success: got successes=%d failures=%d", successes, failures)
+	}
+}
+
+// TestConnectStats_InnerStreamFailedNoTLS: pre-handshake
+// inner_stream_failed (hijack failure, write-200 failure, etc) must
+// NOT count as either success or failure. The codex review caught
+// that classifying those as "success" would suppress the
+// tls_mitm_enabled_ca_undistributed warning even when no client had
+// actually attempted TLS.
+func TestConnectStats_InnerStreamFailedNoTLS(t *testing.T) {
+	clk := &fakeClock{now: time.Unix(0, 0)}
+	s := NewConnectStats()
+	s.SetClockForTest(clk.Now)
+
+	s.Record(OutcomeInnerStreamFailed, false)
+
+	successes, failures := s.Last30Min()
+	if successes != 0 || failures != 0 {
+		t.Errorf("pre-handshake inner_stream_failed must be ignored: got successes=%d failures=%d", successes, failures)
 	}
 }
 
@@ -96,7 +132,7 @@ func TestConnectStats_BucketRotation_OldEntriesDecay(t *testing.T) {
 	s.SetClockForTest(clk.Now)
 
 	// Record at t=0.
-	s.Record(OutcomeTLSFailed)
+	s.Record(OutcomeTLSFailed, false)
 	if _, f := s.Last30Min(); f != 1 {
 		t.Fatalf("at t=0: failures = %d, want 1", f)
 	}
@@ -115,7 +151,7 @@ func TestConnectStats_BucketRotation_RecentEntriesKept(t *testing.T) {
 	s := NewConnectStats()
 	s.SetClockForTest(clk.Now)
 
-	s.Record(OutcomeTLSFailed)
+	s.Record(OutcomeTLSFailed, false)
 	clk.Set(clk.now.Add(29 * time.Minute))
 	if _, f := s.Last30Min(); f != 1 {
 		t.Errorf("at t=+29m: failures = %d, want 1 (still inside window)", f)
@@ -130,9 +166,9 @@ func TestConnectStats_CircularReuse(t *testing.T) {
 	s := NewConnectStats()
 	s.SetClockForTest(clk.Now)
 
-	s.Record(OutcomeTLSFailed) // bucket idx = 0 mod 30 = 0
+	s.Record(OutcomeTLSFailed, false) // bucket idx = 0 mod 30 = 0
 	clk.Set(clk.now.Add(60 * time.Minute))
-	s.Record(OutcomeTLSFailed) // 60 mod 30 = 0 again, same bucket
+	s.Record(OutcomeTLSFailed, false) // 60 mod 30 = 0 again, same bucket
 
 	successes, failures := s.Last30Min()
 	if successes != 0 {
@@ -153,7 +189,7 @@ func TestConnectStats_ConcurrentRecord(t *testing.T) {
 	for i := 0; i < N; i++ {
 		go func() {
 			defer wg.Done()
-			s.Record(OutcomeTunneled)
+			s.Record(OutcomeTunneled, true)
 		}()
 	}
 	wg.Wait()
@@ -167,7 +203,7 @@ func TestConnectStats_ConcurrentRecord(t *testing.T) {
 // the §5.3 predicate: failures >= 1 AND successes == 0 → emit.
 func TestRunUndistributedCAWatch_FiresOnFailureWithoutSuccess(t *testing.T) {
 	s := NewConnectStats()
-	s.Record(OutcomeTLSFailed)
+	s.Record(OutcomeTLSFailed, false)
 
 	var emits atomic.Int32
 	emit := func(successes, failures int) {
@@ -219,9 +255,9 @@ func TestRunUndistributedCAWatch_DoesNotFireOnQuiet(t *testing.T) {
 // many failures co-exist with it.
 func TestRunUndistributedCAWatch_DoesNotFireOnAnySuccess(t *testing.T) {
 	s := NewConnectStats()
-	s.Record(OutcomeTLSFailed)
-	s.Record(OutcomeTLSFailed)
-	s.Record(OutcomeTunneled) // one success neutralizes the predicate
+	s.Record(OutcomeTLSFailed, false)
+	s.Record(OutcomeTLSFailed, false)
+	s.Record(OutcomeTunneled, true) // one success neutralizes the predicate
 
 	var emits atomic.Int32
 	emit := func(successes, failures int) { emits.Add(1) }

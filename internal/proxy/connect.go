@@ -398,14 +398,14 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 		var ce *ErrConnectTarget
 		errors.As(err, &ce)
 		http.Error(w, "bad request", http.StatusBadRequest)
-		h.warnConnect(ce.Outcome, "", 0, clientAddr, start, ce.Reason, "")
+		h.warnConnect(ce.Outcome, "", 0, clientAddr, start, ce.Reason, "", false)
 		return
 	}
 
 	// Step 2: gates.
 	if h.deps.SigningGate != nil && !h.deps.SigningGate(target.LiteralHost) {
 		http.Error(w, "forbidden", http.StatusForbidden)
-		h.warnConnect(OutcomeDeniedHost, target.LiteralHost, target.Port, clientAddr, start, "denied by signing predicate", "signing")
+		h.warnConnect(OutcomeDeniedHost, target.LiteralHost, target.Port, clientAddr, start, "denied by signing predicate", "signing", false)
 		return
 	}
 	canonicalHost := target.LiteralHost
@@ -414,7 +414,7 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 	}
 	if !h.deps.FetchGate(canonicalHost) {
 		http.Error(w, "forbidden", http.StatusForbidden)
-		h.warnConnect(OutcomeDeniedHost, target.LiteralHost, target.Port, clientAddr, start, "denied by fetch predicate", "fetch")
+		h.warnConnect(OutcomeDeniedHost, target.LiteralHost, target.Port, clientAddr, start, "denied by fetch predicate", "fetch", false)
 		return
 	}
 
@@ -422,29 +422,29 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "internal error", http.StatusInternalServerError)
-		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "ResponseWriter is not Hijacker", "")
+		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "ResponseWriter is not Hijacker", "", false)
 		return
 	}
 	conn, brw, err := hj.Hijack()
 	if err != nil {
-		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "hijack: "+err.Error(), "")
+		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "hijack: "+err.Error(), "", false)
 		return
 	}
 	defer conn.Close()
 
 	if _, err := brw.WriteString("HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
-		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "write 200: "+err.Error(), "")
+		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "write 200: "+err.Error(), "", false)
 		return
 	}
 	if err := brw.Flush(); err != nil {
-		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "flush 200: "+err.Error(), "")
+		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "flush 200: "+err.Error(), "", false)
 		return
 	}
 
 	// Step 4: leaf cert lookup.
 	leaf, err := h.deps.LeafCache.Get(target.LiteralHost)
 	if err != nil {
-		h.warnConnect(OutcomeCertGenFailed, target.LiteralHost, target.Port, clientAddr, start, "leaf gen: "+err.Error(), "")
+		h.warnConnect(OutcomeCertGenFailed, target.LiteralHost, target.Port, clientAddr, start, "leaf gen: "+err.Error(), "", false)
 		return
 	}
 
@@ -465,7 +465,7 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 	tlsCfg.NextProtos = []string{"http/1.1"}
 	tlsConn := tls.Server(&hijackedConn{Conn: conn, br: brw.Reader}, tlsCfg)
 	if err := conn.SetDeadline(time.Now().Add(h.deps.HandshakeTimeout)); err != nil {
-		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "set deadline: "+err.Error(), "")
+		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "set deadline: "+err.Error(), "", false)
 		return
 	}
 	if err := tlsConn.Handshake(); err != nil {
@@ -473,10 +473,14 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 		if isDeadlineExceeded(err) {
 			outcome = OutcomeTLSHandshakeTimeout
 		}
-		h.warnConnect(outcome, target.LiteralHost, target.Port, clientAddr, start, "tls: "+err.Error(), "")
+		h.warnConnect(outcome, target.LiteralHost, target.Port, clientAddr, start, "tls: "+err.Error(), "", false)
 		return
 	}
 	defer tlsConn.Close()
+	// Past this point the TLS handshake has succeeded; record-call
+	// sites pass tlsReached=true so post-handshake
+	// `inner_stream_failed` correctly classifies as "TLS handshake
+	// reached" per §5.3.
 
 	// Step 6: read exactly one inner request.
 	//
@@ -490,18 +494,18 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 	// ReadRequest sees an unexpected EOF and we report
 	// inner_stream_failed.
 	if err := conn.SetDeadline(time.Now().Add(h.deps.InnerReadTimeout)); err != nil {
-		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "set inner deadline: "+err.Error(), "")
+		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "set inner deadline: "+err.Error(), "", true)
 		return
 	}
 	innerBR := bufio.NewReader(io.LimitReader(tlsConn, h.deps.MaxInnerHeaderBytes))
 	innerReq, err := http.ReadRequest(innerBR)
 	if err != nil {
-		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "read inner: "+err.Error(), "")
+		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "read inner: "+err.Error(), "", true)
 		return
 	}
 	if innerReq.Method != http.MethodGet && innerReq.Method != http.MethodHead {
 		writeInnerStatus(tlsConn, http.StatusMethodNotAllowed, "GET, HEAD")
-		h.warnConnect(OutcomeInnerMethodRejected, target.LiteralHost, target.Port, clientAddr, start, "inner method: "+innerReq.Method, "")
+		h.warnConnect(OutcomeInnerMethodRejected, target.LiteralHost, target.Port, clientAddr, start, "inner method: "+innerReq.Method, "", true)
 		return
 	}
 
@@ -536,7 +540,7 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 
 	// Tunnel close. Phase 6 does NOT support multi-request keepalive
 	// (§2.2 step 8).
-	h.infoConnect(OutcomeTunneled, target.LiteralHost, target.Port, clientAddr, start, "")
+	h.infoConnect(OutcomeTunneled, target.LiteralHost, target.Port, clientAddr, start, "", true)
 }
 
 // stripHopByHop removes hop-by-hop header fields from h. Defensive
@@ -697,7 +701,13 @@ func writeInnerStatus(c *tls.Conn, status int, allow string) {
 // Logging helpers
 // ----------------------------------------------------------------------------
 
-func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port int, clientAddr string, start time.Time, reason, deniedGate string) {
+// warnConnect emits a §10.1 mitm_connect Warn AND records the
+// outcome to the §9.7.6 rolling counter. `tlsReached` resolves the
+// `OutcomeInnerStreamFailed` ambiguity for the counter (it doesn't
+// affect the log line). Pre-handshake call sites pass false;
+// post-handshake call sites pass true. The flag is irrelevant for
+// every outcome other than `inner_stream_failed`.
+func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port int, clientAddr string, start time.Time, reason, deniedGate string, tlsReached bool) {
 	fields := map[string]any{
 		"outcome":          string(outcome),
 		"host":             host,
@@ -712,10 +722,14 @@ func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port i
 		fields["denied_gate"] = deniedGate
 	}
 	h.deps.LogFn("warn", "mitm_connect", fields)
-	h.recordOutcome(outcome)
+	h.recordOutcome(outcome, tlsReached)
 }
 
-func (h *ConnectHandler) infoConnect(outcome ConnectOutcome, host string, port int, clientAddr string, start time.Time, reason string) {
+// infoConnect is the Info counterpart of warnConnect — used only
+// for `OutcomeTunneled` (the only success outcome). tlsReached is
+// always true at the call sites; it is taken as a parameter for
+// signature symmetry with warnConnect.
+func (h *ConnectHandler) infoConnect(outcome ConnectOutcome, host string, port int, clientAddr string, start time.Time, reason string, tlsReached bool) {
 	fields := map[string]any{
 		"outcome":          string(outcome),
 		"host":             host,
@@ -727,14 +741,15 @@ func (h *ConnectHandler) infoConnect(outcome ConnectOutcome, host string, port i
 		fields["reason"] = reason
 	}
 	h.deps.LogFn("info", "mitm_connect", fields)
-	h.recordOutcome(outcome)
+	h.recordOutcome(outcome, tlsReached)
 }
 
 // recordOutcome forwards `outcome` to the §9.7.6 rolling counter
 // when one is wired. The counter classifies internally; pre-TLS
-// rejections are silently dropped.
-func (h *ConnectHandler) recordOutcome(outcome ConnectOutcome) {
+// rejections are silently dropped, and `inner_stream_failed`
+// classification is gated on tlsReached.
+func (h *ConnectHandler) recordOutcome(outcome ConnectOutcome, tlsReached bool) {
 	if h.deps.Stats != nil {
-		h.deps.Stats.Record(outcome)
+		h.deps.Stats.Record(outcome, tlsReached)
 	}
 }
