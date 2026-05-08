@@ -14,7 +14,7 @@ package main
 // handshakes until the moment of expiry, then every CONNECT
 // after fails with `outcome=tls_failed`."
 //
-// This implementation compresses the timeline (3-second NotAfter,
+// This implementation compresses the timeline (8-second NotAfter,
 // two CONNECTs spanning the expiry boundary instead of a
 // long-running poll) so the test fits a normal `go test` budget
 // while still pinning the same invariants:
@@ -28,7 +28,7 @@ package main
 //
 // Driven via the operator-supplied CA path (TlsMitm.CaCert /
 // CaKey) because the auto-gen path's CACertLifetime has a 24h
-// minimum (§5.2 validation rejects anything shorter) — a 3-second
+// minimum (§5.2 validation rejects anything shorter) — a few-second
 // lifetime would never load. The supplied path runs through
 // validateSuppliedCA at internal/proxy/tlsmitm/ca.go:240 which
 // only requires `now.Before(cert.NotAfter)`; that holds the
@@ -113,12 +113,16 @@ func TestServe_SuppliedCAExpiresMidRuntime_HandshakeFails(t *testing.T) {
 	t.Cleanup(func() { shutdownTimeout = oldTimeout })
 
 	caDir := t.TempDir()
-	// 5-second window: enough headroom for daemon boot + readiness
-	// polling + first CONNECT/handshake to land BEFORE expiry on
-	// even a slow CI. Phase 2 doesn't pay a fixed sleep cost — it
-	// uses time.Until(caNotAfter) below to wake up exactly past
-	// expiry rather than sleeping a guessed-too-large duration.
-	caNotAfter := time.Now().Add(5 * time.Second)
+	// 8-second window: must comfortably exceed the 10s readiness
+	// timeout's worst case PLUS first-handshake latency, otherwise
+	// a slow CI worker could let Phase 1 land AFTER expiry and the
+	// "successful handshake before expiry" half of F18 would
+	// silently fail to fire. The remaining-validity guard right
+	// after waitForDaemonReady fails the test loudly with a
+	// diagnostic if we somehow reached Phase 1 with too little
+	// validity left, which is preferable to a misleading regression
+	// signal.
+	caNotAfter := time.Now().Add(8 * time.Second)
 	caCertPath, caKeyPath, suppliedCert := mintSuppliedCA(t, caDir, caNotAfter)
 
 	cacheDir := t.TempDir()
@@ -153,6 +157,20 @@ func TestServe_SuppliedCAExpiresMidRuntime_HandshakeFails(t *testing.T) {
 		t.Fatalf("daemon never became ready: %v", err)
 	}
 
+	// Remaining-validity guard. waitForDaemonReady can take up to
+	// 10s on a slow CI worker; if it ate most of the validity
+	// window, Phase 1 would run past expiry and report a misleading
+	// "before-expiry handshake failed" regression. Use
+	// suppliedCert.NotAfter (not caNotAfter) since X.509 ASN.1 time
+	// encoding is second-granular and the parsed cert is what was
+	// actually written to disk and served by the daemon. Fail
+	// loudly with a tuning hint rather than running an invalid
+	// test: skip would silently never run F18.
+	const phase1ValiditySlack = 2 * time.Second
+	if remaining := time.Until(suppliedCert.NotAfter); remaining < phase1ValiditySlack {
+		t.Fatalf("test infrastructure too slow: only %v of CA validity left after daemon boot (need ≥%v); bump the caNotAfter window or speed up boot", remaining, phase1ValiditySlack)
+	}
+
 	// Trust pool: just the supplied CA. Both handshakes use this —
 	// the BEFORE handshake should succeed; the AFTER handshake
 	// should fail because the CA itself is expired by handshake
@@ -165,13 +183,20 @@ func TestServe_SuppliedCAExpiresMidRuntime_HandshakeFails(t *testing.T) {
 		t.Fatalf("phase 1 (BEFORE expiry): handshake should have succeeded but failed: %v", err)
 	}
 
-	// Wait until just past the CA's NotAfter. Sleeping a fixed
-	// duration would force a flaky tradeoff: too short → Phase 2
-	// runs while CA is still valid; too long → wasted test budget.
-	// time.Until measures from "now" rather than boot, so the
-	// total wall clock budget compresses naturally regardless of
-	// how long Phase 1 took.
-	time.Sleep(time.Until(caNotAfter) + 1*time.Second)
+	// Wait until just past the cert's actual NotAfter. Sleeping a
+	// fixed duration would force a flaky tradeoff: too short →
+	// Phase 2 runs while CA is still valid; too long → wasted test
+	// budget. time.Until measures from "now" rather than boot, so
+	// the total wall clock budget compresses naturally regardless
+	// of how long Phase 1 took.
+	//
+	// Use suppliedCert.NotAfter rather than caNotAfter: X.509
+	// ASN.1 time encoding is second-granular, so the parsed cert's
+	// NotAfter can differ from the template time by up to 1
+	// second. The parsed value is what the daemon actually serves
+	// and what the client validates against — that's the right
+	// reference for the sleep target.
+	time.Sleep(time.Until(suppliedCert.NotAfter) + 1*time.Second)
 
 	// === Phase 2: AFTER expiry — handshake must fail ===
 	hsErr := doConnectAndHandshake(t, cacheAddr, "example.test", pool, false)
