@@ -559,6 +559,7 @@ func serveListeners(
 			ProxyAddr:   plainLn.Addr().String(),
 			TLSAddr:     tlsAddrString(tlsLn),
 			AdminAddr:   adminLn.Addr().String(),
+			TLSMITM:     &tlsMitmProvider{h: mitmHandles},
 		})
 		if err != nil {
 			return fmt.Errorf("build admin: %w", err)
@@ -892,15 +893,26 @@ func newHTTPServer(h http.Handler, logger *slog.Logger) *http.Server {
 // h.connect after the listener has started accepting traffic
 // would race ServeHTTP's read of the same field.
 // tlsMitmHandles bundles what wireTlsMitm hands back to the caller
-// — the connect-outcome stats counter (for the §9.7.6 refresher)
-// and a closure that reports the current cert-cache size (for the
-// §10.3 acu_mitm_cert_cache_size gauge refresher).
+// — the connect-outcome stats counter (for the §9.7.6 refresher),
+// a closure that reports the current cert-cache size (for the §10.3
+// acu_mitm_cert_cache_size gauge refresher), and the §10.4 status
+// page snapshot inputs (CA source/fingerprint/expiry/regex,
+// capacity).
 type tlsMitmHandles struct {
 	Stats *proxy.ConnectStats
 	// CertCacheSize returns the current entry count. Implemented
 	// as a closure rather than passing the *tlsmitm.Cache pointer
 	// so callers don't need to import tlsmitm just for size.
 	CertCacheSize func() int
+
+	// SPEC6 §10.4 status-page inputs. These are stable across the
+	// daemon's lifetime (the CA does not rotate without a restart),
+	// so the snapshot copies them rather than holding the *CA.
+	CASource            string
+	CAFingerprintSHA256 string
+	CANotAfterUnixTime  int64
+	EffectiveAllowlist  string
+	CertCacheCapacity   int
 }
 
 func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Client, h *handler.Handler, logger *slog.Logger) (*tlsMitmHandles, error) {
@@ -937,6 +949,11 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 			return nil, err
 		}
 		proxy.RecordCertIssued(leafAlgoLabel)
+		// SPEC6 §10.4: status-page "Last cert issued" feed. The
+		// host literal is the CONNECT target (single-SAN per
+		// §5.1.4), so this is the same string the operator typed
+		// (or what their client requested).
+		proxy.NoteCertIssued(host, time.Now())
 		return cert, nil
 	})
 	if err != nil {
@@ -1022,9 +1039,46 @@ func wireTlsMitm(cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Cl
 		)
 	}
 	return &tlsMitmHandles{
-		Stats:         stats,
-		CertCacheSize: leafCache.Size,
+		Stats:               stats,
+		CertCacheSize:       leafCache.Size,
+		CASource:            ca.Source.String(),
+		CAFingerprintSHA256: ca.FingerprintSHA256,
+		CANotAfterUnixTime:  ca.Cert.NotAfter.Unix(),
+		EffectiveAllowlist:  tmCfg.AllowedHostRegex,
+		CertCacheCapacity:   tmCfg.CertCacheSize,
 	}, nil
+}
+
+// tlsMitmProvider adapts a *tlsMitmHandles into the
+// admin.TLSMITMProvider interface. Stable inputs (CA source,
+// fingerprint, capacity) are captured at construction; live signals
+// (cert cache size, last-issued, hit rate) are sampled per call so
+// the status page reflects current state. nil receiver returns the
+// disabled snapshot — supports the tls_mitm.enabled = false branch
+// uniformly.
+type tlsMitmProvider struct {
+	h *tlsMitmHandles
+}
+
+func (p *tlsMitmProvider) TLSMITMSnapshot() admin.TLSMITMSnapshot {
+	if p == nil || p.h == nil {
+		return admin.TLSMITMSnapshot{Enabled: false}
+	}
+	hits, misses := proxy.CertHitRate60s()
+	host, at, _ := proxy.LastCertIssued()
+	return admin.TLSMITMSnapshot{
+		Enabled:             true,
+		CASource:            p.h.CASource,
+		CAFingerprintSHA256: p.h.CAFingerprintSHA256,
+		CANotAfterUnixTime:  p.h.CANotAfterUnixTime,
+		EffectiveAllowlist:  p.h.EffectiveAllowlist,
+		CertCacheSize:       p.h.CertCacheSize(),
+		CertCacheCapacity:   p.h.CertCacheCapacity,
+		LastIssuedHost:      host,
+		LastIssuedAt:        at,
+		HitRate60sHits:      hits,
+		HitRate60sMisses:    misses,
+	}
 }
 
 // runCertCacheSizeRefresher wakes at every `interval` boundary and

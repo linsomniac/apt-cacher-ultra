@@ -114,14 +114,19 @@ var (
 )
 
 // RecordCertCacheLookup is the LookupHook target — bumps the
-// hit-or-miss counter once per Get. Exported so main.go (different
-// package) can install it as the cache callback.
+// hit-or-miss counter once per Get AND feeds the §10.4 60s rolling
+// hit-rate counter the status page reads. Exported so main.go
+// (different package) can install it as the cache callback.
 func RecordCertCacheLookup(hit bool) {
 	if hit {
 		mitmCertCacheLookupsTotal.Inc("hit")
 	} else {
 		mitmCertCacheLookupsTotal.Inc("miss")
 	}
+	certHitRateMu.RLock()
+	r := certHitRate
+	certHitRateMu.RUnlock()
+	r.Note(hit)
 }
 
 // RecordCertIssued bumps acu_mitm_cert_issued_total{algorithm}

@@ -25,11 +25,58 @@ type statusModel struct {
 	Process         processInfo      `json:"process"`
 	Cache           cacheInfo        `json:"cache"`
 	Listeners       []listenerInfo   `json:"listeners"`
+	TLSMITM         *tlsMITMInfo     `json:"tls_mitm"`
 	Suites          []suiteEntry     `json:"suites"`
 	GC              *gcInfo          `json:"gc"`
 	HotURLPaths     []hotURLEntry    `json:"hot_url_paths"`
 	RecentAdoptions []adoptionEntry  `json:"recent_adoptions"`
 	ActiveHosts     []activeHostInfo `json:"active_hosts"`
+}
+
+// tlsMITMInfo is the SPEC6 §10.4 status-page TLS MITM section.
+// JSON shape mirrors the gcInfo abbreviated/full split: when
+// Enabled is false the MarshalJSON below emits exactly
+// `{"enabled": false}`; full payload otherwise.
+//
+// LastIssuedAtUnixTime is *int64 so encoding/json renders nil as
+// JSON null when no issuance has been recorded — the same
+// "absent vs present" distinction gcInfo uses for last_run_unixtime.
+type tlsMITMInfo struct {
+	Enabled             bool            `json:"enabled"`
+	CASource            string          `json:"ca_source"`
+	CAFingerprintSHA256 string          `json:"ca_fingerprint_sha256"`
+	CANotAfterUnixTime  int64           `json:"ca_not_after_unixtime"`
+	EffectiveAllowlist  string          `json:"effective_allowlist"`
+	CertCache           certCacheInfo   `json:"cert_cache"`
+	LastIssued          *lastIssuedInfo `json:"last_cert_issued"`
+	HitRate60sPercent   *float64        `json:"cert_hit_rate_60s_percent"`
+	// HitRate60sObserved is the raw (hits+misses) sample count for
+	// the percentage. Surfaced in JSON so an operator scraping the
+	// page can tell "0% of 800 lookups" apart from "no data".
+	HitRate60sObserved int `json:"cert_hit_rate_60s_observed"`
+}
+
+type certCacheInfo struct {
+	Size     int `json:"size"`
+	Capacity int `json:"capacity"`
+}
+
+type lastIssuedInfo struct {
+	Host       string `json:"host"`
+	AtUnixTime int64  `json:"at_unixtime"`
+}
+
+// MarshalJSON renders `{"enabled": false}` when the section is
+// disabled (matching SPEC6 §10.4's contract that the JSON top-level
+// `tls_mitm` key is always present, abbreviated when MITM is off).
+// The type-alias trick avoids infinite recursion when delegating
+// to encoding/json for the populated case.
+func (t *tlsMITMInfo) MarshalJSON() ([]byte, error) {
+	if t == nil || !t.Enabled {
+		return []byte(`{"enabled":false}`), nil
+	}
+	type alias tlsMITMInfo
+	return json.Marshal((*alias)(t))
 }
 
 type processInfo struct {
@@ -186,6 +233,7 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 			ZeroRefcountBacklog: st.ZeroRefcountBacklog,
 		},
 		Listeners:       buildListenerInfo(s.cfg),
+		TLSMITM:         buildTLSMITMInfo(s.cfg.TLSMITM),
 		Suites:          buildSuiteEntries(suitesRaw.([]cache.SuiteWithAdoption)),
 		HotURLPaths:     buildHotURLEntries(hotPaths.([]cache.HotURLPath)),
 		RecentAdoptions: buildAdoptionEntries(s.cfg.Ring.Snapshot()),
@@ -224,6 +272,44 @@ func (s *Server) runDBQuery(r *http.Request, _ string, fn func(context.Context) 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	return fn(ctx)
+}
+
+// buildTLSMITMInfo translates the cmd-supplied snapshot into the
+// status-page model. nil provider → disabled section (the snapshot's
+// Enabled field also being false would produce the same shape;
+// the nil short-circuit avoids interface-method dispatch).
+func buildTLSMITMInfo(p TLSMITMProvider) *tlsMITMInfo {
+	if p == nil {
+		return &tlsMITMInfo{Enabled: false}
+	}
+	snap := p.TLSMITMSnapshot()
+	if !snap.Enabled {
+		return &tlsMITMInfo{Enabled: false}
+	}
+	out := &tlsMITMInfo{
+		Enabled:             true,
+		CASource:            snap.CASource,
+		CAFingerprintSHA256: snap.CAFingerprintSHA256,
+		CANotAfterUnixTime:  snap.CANotAfterUnixTime,
+		EffectiveAllowlist:  snap.EffectiveAllowlist,
+		CertCache: certCacheInfo{
+			Size:     snap.CertCacheSize,
+			Capacity: snap.CertCacheCapacity,
+		},
+		HitRate60sObserved: snap.HitRate60sHits + snap.HitRate60sMisses,
+	}
+	if !snap.LastIssuedAt.IsZero() {
+		ts := snap.LastIssuedAt.Unix()
+		out.LastIssued = &lastIssuedInfo{
+			Host:       snap.LastIssuedHost,
+			AtUnixTime: ts,
+		}
+	}
+	if obs := snap.HitRate60sHits + snap.HitRate60sMisses; obs > 0 {
+		pct := 100 * float64(snap.HitRate60sHits) / float64(obs)
+		out.HitRate60sPercent = &pct
+	}
+	return out
 }
 
 func buildListenerInfo(cfg Config) []listenerInfo {
@@ -369,11 +455,13 @@ func chooseFormat(r *http.Request) string {
 // html/template auto-escapes every interpolated value; never
 // switch to text/template without a full security review.
 var statusHTMLTemplate = template.Must(template.New("status").Funcs(template.FuncMap{
-	"unixTime":    formatUnixTime,
-	"unixTimePtr": formatUnixTimePtr,
-	"formatBytes": formatBytes,
-	"durationOf":  durationOf,
-	"i64Ptr":      formatInt64Ptr,
+	"unixTime":     formatUnixTime,
+	"unixTimePtr":  formatUnixTimePtr,
+	"formatBytes":  formatBytes,
+	"durationOf":   durationOf,
+	"i64Ptr":       formatInt64Ptr,
+	"hitRatePct":   formatHitRatePercent,
+	"defaultEmpty": defaultEmpty,
 }).Parse(statusHTML))
 
 const statusHTML = `<!DOCTYPE html>
@@ -412,6 +500,22 @@ code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
 {{range .Listeners}}<tr><td>{{.Role}}</td><td><code>{{.Addr}}</code></td></tr>
 {{end}}
 </table>
+
+{{if .TLSMITM.Enabled}}
+<h2>TLS MITM</h2>
+<table>
+<tr><td>CA source</td><td>{{.TLSMITM.CASource}}</td></tr>
+<tr><td>CA SHA-256 fingerprint</td><td><code>{{.TLSMITM.CAFingerprintSHA256}}</code></td></tr>
+<tr><td>CA not_after</td><td>{{unixTime .TLSMITM.CANotAfterUnixTime}} UTC</td></tr>
+<tr><td>Effective allowlist</td><td><code>{{defaultEmpty .TLSMITM.EffectiveAllowlist "(none — vacuously true)"}}</code></td></tr>
+<tr><td>Cert cache</td><td>{{.TLSMITM.CertCache.Size}} / {{.TLSMITM.CertCache.Capacity}}</td></tr>
+<tr><td>Last cert issued</td>
+{{- if .TLSMITM.LastIssued}}
+<td><code>{{.TLSMITM.LastIssued.Host}}</code> @ {{unixTime .TLSMITM.LastIssued.AtUnixTime}} UTC</td>
+{{- else}}<td class="muted">(none yet)</td>{{end}}</tr>
+<tr><td>Cert hit rate (60s)</td><td>{{hitRatePct .TLSMITM.HitRate60sPercent .TLSMITM.HitRate60sObserved}}</td></tr>
+</table>
+{{end}}
 
 <h2>Cache</h2>
 <table>
@@ -538,6 +642,27 @@ func formatBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// formatHitRatePercent renders the SPEC6 §10.4 hit-rate cell. nil
+// percent + zero observations means no lookups in the 60s window —
+// render "n/a" rather than a misleading "0%". Otherwise: "X.X%
+// (N lookups)" with one decimal place.
+func formatHitRatePercent(pct *float64, observed int) string {
+	if pct == nil {
+		return "n/a (no lookups in window)"
+	}
+	return fmt.Sprintf("%.1f%% (%d lookups)", *pct, observed)
+}
+
+// defaultEmpty returns fallback when s is the empty string.
+// Used by the SPEC6 §10.4 effective_allowlist cell so an unset
+// regex renders as "(none — vacuously true)" rather than blank.
+func defaultEmpty(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 // durationOf renders a wallclock-seconds count as "Xh Ym".

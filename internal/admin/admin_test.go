@@ -115,6 +115,20 @@ func withLogger(logger *slog.Logger) adminOpt {
 	}
 }
 
+func withTLSMITM(p TLSMITMProvider) adminOpt {
+	return func(cfg *Config) {
+		cfg.TLSMITM = p
+	}
+}
+
+// stubTLSMITMProvider is a fixed-value TLSMITMProvider for tests.
+// Returning the same snapshot on every call mirrors the production
+// path's "stable inputs / live signals" split — tests compose the
+// snapshot by hand.
+type stubTLSMITMProvider struct{ snap TLSMITMSnapshot }
+
+func (s *stubTLSMITMProvider) TLSMITMSnapshot() TLSMITMSnapshot { return s.snap }
+
 // lockedBuffer is a sync.Mutex-guarded bytes.Buffer for use as a
 // slog handler's io.Writer. The text handler can serialize concurrent
 // records, so the underlying writer must accept concurrent Writes;
@@ -229,6 +243,7 @@ func TestStatusJSON_HasLockedSchemaKeys(t *testing.T) {
 	required := []string{
 		"process", "cache", "listeners", "suites",
 		"hot_url_paths", "recent_adoptions", "active_hosts", "gc",
+		"tls_mitm",
 	}
 	for _, k := range required {
 		if _, ok := got[k]; !ok {
@@ -776,3 +791,318 @@ func getWithBasic(t *testing.T, url, user, pass string) *http.Response {
 	}
 	return resp
 }
+
+// TestStatusJSON_TLSMITM_Disabled pins SPEC6 §10.4: the JSON
+// top-level `tls_mitm` key is ALWAYS present, abbreviated to
+// `{"enabled": false}` when MITM is disabled (or no provider was
+// supplied — both paths converge on the same shape).
+func TestStatusJSON_TLSMITM_Disabled(t *testing.T) {
+	cases := []struct {
+		name string
+		opt  adminOpt
+	}{
+		{"nil_provider", nil},
+		{"explicit_disabled", withTLSMITM(&stubTLSMITMProvider{snap: TLSMITMSnapshot{Enabled: false}})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var opts []adminOpt
+			if tc.opt != nil {
+				opts = []adminOpt{tc.opt}
+			}
+			_, base, cleanup := startAdminServer(t, opts...)
+			defer cleanup()
+
+			resp := mustGet(t, base+"/?format=json")
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			var got map[string]any
+			if err := json.Unmarshal(body, &got); err != nil {
+				t.Fatalf("decode: %v\nbody: %s", err, body)
+			}
+			tm, ok := got["tls_mitm"].(map[string]any)
+			if !ok {
+				t.Fatalf("tls_mitm is not an object: %T", got["tls_mitm"])
+			}
+			if v, present := tm["enabled"]; !present {
+				t.Errorf("tls_mitm.enabled missing")
+			} else if v != false {
+				t.Errorf("tls_mitm.enabled = %v, want false", v)
+			}
+			// Abbreviated shape: ONLY the "enabled" key.
+			for k := range tm {
+				if k != "enabled" {
+					t.Errorf("tls_mitm has unexpected key %q in disabled mode; spec mandates abbreviated shape", k)
+				}
+			}
+		})
+	}
+}
+
+// TestStatusJSON_TLSMITM_Enabled_FullPayload checks the full
+// SPEC6 §10.4 JSON payload: all fields present, last_cert_issued
+// renders as a sub-object when populated, hit-rate percent is a
+// float.
+func TestStatusJSON_TLSMITM_Enabled_FullPayload(t *testing.T) {
+	issuedAt := time.Unix(1_730_000_000, 0)
+	snap := TLSMITMSnapshot{
+		Enabled:             true,
+		CASource:            "generated",
+		CAFingerprintSHA256: "abc123",
+		CANotAfterUnixTime:  1_900_000_000,
+		EffectiveAllowlist:  `^archive\.ubuntu\.com$`,
+		CertCacheSize:       4,
+		CertCacheCapacity:   256,
+		LastIssuedHost:      "archive.ubuntu.com",
+		LastIssuedAt:        issuedAt,
+		HitRate60sHits:      9,
+		HitRate60sMisses:    1,
+	}
+	_, base, cleanup := startAdminServer(t, withTLSMITM(&stubTLSMITMProvider{snap: snap}))
+	defer cleanup()
+
+	resp := mustGet(t, base+"/?format=json")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var got struct {
+		TLSMITM struct {
+			Enabled             bool   `json:"enabled"`
+			CASource            string `json:"ca_source"`
+			CAFingerprintSHA256 string `json:"ca_fingerprint_sha256"`
+			CANotAfterUnixTime  int64  `json:"ca_not_after_unixtime"`
+			EffectiveAllowlist  string `json:"effective_allowlist"`
+			CertCache           struct {
+				Size     int `json:"size"`
+				Capacity int `json:"capacity"`
+			} `json:"cert_cache"`
+			LastIssued *struct {
+				Host       string `json:"host"`
+				AtUnixTime int64  `json:"at_unixtime"`
+			} `json:"last_cert_issued"`
+			HitRate60sPercent  *float64 `json:"cert_hit_rate_60s_percent"`
+			HitRate60sObserved int      `json:"cert_hit_rate_60s_observed"`
+		} `json:"tls_mitm"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v\nbody: %s", err, body)
+	}
+	tm := got.TLSMITM
+	if !tm.Enabled {
+		t.Errorf("tls_mitm.enabled = false, want true")
+	}
+	if tm.CASource != "generated" {
+		t.Errorf("ca_source = %q, want %q", tm.CASource, "generated")
+	}
+	if tm.CAFingerprintSHA256 != "abc123" {
+		t.Errorf("ca_fingerprint_sha256 = %q", tm.CAFingerprintSHA256)
+	}
+	if tm.CANotAfterUnixTime != 1_900_000_000 {
+		t.Errorf("ca_not_after_unixtime = %d", tm.CANotAfterUnixTime)
+	}
+	if tm.EffectiveAllowlist != `^archive\.ubuntu\.com$` {
+		t.Errorf("effective_allowlist = %q", tm.EffectiveAllowlist)
+	}
+	if tm.CertCache.Size != 4 || tm.CertCache.Capacity != 256 {
+		t.Errorf("cert_cache = %+v", tm.CertCache)
+	}
+	if tm.LastIssued == nil {
+		t.Fatalf("last_cert_issued = nil; want populated")
+	}
+	if tm.LastIssued.Host != "archive.ubuntu.com" {
+		t.Errorf("last_cert_issued.host = %q", tm.LastIssued.Host)
+	}
+	if tm.LastIssued.AtUnixTime != issuedAt.Unix() {
+		t.Errorf("last_cert_issued.at_unixtime = %d, want %d", tm.LastIssued.AtUnixTime, issuedAt.Unix())
+	}
+	if tm.HitRate60sPercent == nil {
+		t.Fatalf("cert_hit_rate_60s_percent = nil; want 90.0")
+	}
+	if *tm.HitRate60sPercent != 90.0 {
+		t.Errorf("cert_hit_rate_60s_percent = %v, want 90.0", *tm.HitRate60sPercent)
+	}
+	if tm.HitRate60sObserved != 10 {
+		t.Errorf("cert_hit_rate_60s_observed = %d, want 10", tm.HitRate60sObserved)
+	}
+}
+
+// TestStatusJSON_TLSMITM_Enabled_NoIssuance pins the populated-but-empty
+// edge cases: enabled, but no cert issued yet AND no lookups in the
+// 60s window. last_cert_issued must be JSON null (consumers
+// distinguish "no issuance" from "issuance recorded"), hit-rate
+// percent must be JSON null (distinguishing "no data" from "0%").
+func TestStatusJSON_TLSMITM_Enabled_NoIssuance(t *testing.T) {
+	snap := TLSMITMSnapshot{
+		Enabled:             true,
+		CASource:            "supplied",
+		CAFingerprintSHA256: "deadbeef",
+		CANotAfterUnixTime:  1_900_000_000,
+		EffectiveAllowlist:  "",
+		CertCacheSize:       0,
+		CertCacheCapacity:   128,
+		// LastIssuedHost / LastIssuedAt zero; no lookups recorded.
+	}
+	_, base, cleanup := startAdminServer(t, withTLSMITM(&stubTLSMITMProvider{snap: snap}))
+	defer cleanup()
+
+	resp := mustGet(t, base+"/?format=json")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v\nbody: %s", err, body)
+	}
+	tm := got["tls_mitm"].(map[string]any)
+	if v, ok := tm["last_cert_issued"]; !ok {
+		t.Errorf("last_cert_issued missing; want present-but-null")
+	} else if v != nil {
+		t.Errorf("last_cert_issued = %v, want JSON null", v)
+	}
+	if v, ok := tm["cert_hit_rate_60s_percent"]; !ok {
+		t.Errorf("cert_hit_rate_60s_percent missing; want present-but-null")
+	} else if v != nil {
+		t.Errorf("cert_hit_rate_60s_percent = %v, want JSON null", v)
+	}
+	if v, ok := tm["cert_hit_rate_60s_observed"]; !ok {
+		t.Errorf("cert_hit_rate_60s_observed missing")
+	} else if vf, _ := v.(float64); int(vf) != 0 {
+		t.Errorf("cert_hit_rate_60s_observed = %v, want 0", v)
+	}
+}
+
+// TestStatusJSON_TLSMITM_TopLevelKeyAlwaysPresent extends the
+// SPEC5 §10.5 locked-keys assertion with the SPEC6 §10.4
+// invariant that `tls_mitm` is among the always-present top-level
+// keys.
+func TestStatusJSON_TLSMITM_TopLevelKeyAlwaysPresent(t *testing.T) {
+	_, base, cleanup := startAdminServer(t) // no provider
+	defer cleanup()
+
+	resp := mustGet(t, base+"/?format=json")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v\nbody: %s", err, body)
+	}
+	if _, ok := got["tls_mitm"]; !ok {
+		t.Errorf("tls_mitm top-level key missing; SPEC6 §10.4 mandates always-present")
+	}
+}
+
+// TestStatusHTML_TLSMITM_SectionRendersWhenEnabled checks the HTML
+// status page renders the SPEC6 §10.4 TLS MITM section between
+// Listeners and Cache when MITM is enabled.
+func TestStatusHTML_TLSMITM_SectionRendersWhenEnabled(t *testing.T) {
+	issuedAt := time.Unix(1_730_000_000, 0)
+	snap := TLSMITMSnapshot{
+		Enabled:             true,
+		CASource:            "generated",
+		CAFingerprintSHA256: "deadbeefcafebabe",
+		CANotAfterUnixTime:  1_900_000_000,
+		EffectiveAllowlist:  `^archive\.ubuntu\.com$`,
+		CertCacheSize:       3,
+		CertCacheCapacity:   256,
+		LastIssuedHost:      "archive.ubuntu.com",
+		LastIssuedAt:        issuedAt,
+		HitRate60sHits:      4,
+		HitRate60sMisses:    1,
+	}
+	_, base, cleanup := startAdminServer(t, withTLSMITM(&stubTLSMITMProvider{snap: snap}))
+	defer cleanup()
+
+	resp := mustGet(t, base+"/")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	html := string(body)
+
+	if !strings.Contains(html, "<h2>TLS MITM</h2>") {
+		t.Errorf("HTML missing <h2>TLS MITM</h2>")
+	}
+	// SPEC6 §10.4: section sits between Listeners and Cache.
+	listenersIdx := strings.Index(html, "<h2>Listeners</h2>")
+	mitmIdx := strings.Index(html, "<h2>TLS MITM</h2>")
+	cacheIdx := strings.Index(html, "<h2>Cache</h2>")
+	if !(listenersIdx < mitmIdx && mitmIdx < cacheIdx) {
+		t.Errorf("section ordering wrong: Listeners=%d, TLS MITM=%d, Cache=%d", listenersIdx, mitmIdx, cacheIdx)
+	}
+	for _, want := range []string{
+		"deadbeefcafebabe",   // CA fingerprint
+		"archive.ubuntu.com", // last cert issued host
+		"3 / 256",            // cert cache
+		"^archive",           // effective allowlist (escaped to ^archive in HTML)
+		"80.0% (5 lookups)",  // hit rate
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("HTML missing %q; body:\n%s", want, html)
+		}
+	}
+}
+
+// TestStatusHTML_TLSMITM_SectionOmittedWhenDisabled pins the spec
+// rule "When tls_mitm.enabled = false, the section is omitted".
+func TestStatusHTML_TLSMITM_SectionOmittedWhenDisabled(t *testing.T) {
+	_, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	resp := mustGet(t, base+"/")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	html := string(body)
+
+	if strings.Contains(html, "<h2>TLS MITM</h2>") {
+		t.Errorf("HTML rendered TLS MITM section even though disabled")
+	}
+}
+
+// TestStatusHTML_TLSMITM_NoIssuanceShowsPlaceholder checks the
+// "no cert issued yet" branch renders the muted placeholder
+// rather than panicking on a nil last-issued.
+func TestStatusHTML_TLSMITM_NoIssuanceShowsPlaceholder(t *testing.T) {
+	snap := TLSMITMSnapshot{
+		Enabled:             true,
+		CASource:            "generated",
+		CAFingerprintSHA256: "x",
+		CANotAfterUnixTime:  1_900_000_000,
+		CertCacheCapacity:   128,
+	}
+	_, base, cleanup := startAdminServer(t, withTLSMITM(&stubTLSMITMProvider{snap: snap}))
+	defer cleanup()
+
+	resp := mustGet(t, base+"/")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	html := string(body)
+
+	if !strings.Contains(html, "(none yet)") {
+		t.Errorf("HTML missing '(none yet)' placeholder; body:\n%s", html)
+	}
+	if !strings.Contains(html, "n/a (no lookups in window)") {
+		t.Errorf("HTML missing 'n/a (no lookups in window)' for hit rate; body:\n%s", html)
+	}
+	if !strings.Contains(html, "(none — vacuously true)") {
+		t.Errorf("HTML missing empty-allowlist placeholder; body:\n%s", html)
+	}
+}
+
+func TestFormatHitRatePercent(t *testing.T) {
+	cases := []struct {
+		name     string
+		pct      *float64
+		observed int
+		want     string
+	}{
+		{"nil_pct_no_lookups", nil, 0, "n/a (no lookups in window)"},
+		{"zero_pct_with_misses", float64Ptr(0), 5, "0.0% (5 lookups)"},
+		{"hundred_pct", float64Ptr(100), 7, "100.0% (7 lookups)"},
+		{"fractional", float64Ptr(87.5), 8, "87.5% (8 lookups)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatHitRatePercent(tc.pct, tc.observed); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func float64Ptr(v float64) *float64 { return &v }

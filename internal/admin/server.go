@@ -68,6 +68,37 @@ type Config struct {
 	ProxyAddr string
 	TLSAddr   string // "" if TLS not configured
 	AdminAddr string
+
+	// TLSMITM provides the SPEC6 §10.4 status-page TLS MITM
+	// snapshot. nil is treated as MITM disabled — the status page
+	// emits the abbreviated `{"enabled": false}` JSON form and
+	// skips the HTML section. Lives behind an interface so admin
+	// does not import internal/proxy or internal/proxy/tlsmitm.
+	TLSMITM TLSMITMProvider
+}
+
+// TLSMITMProvider supplies the SPEC6 §10.4 status-page TLS MITM
+// snapshot. cmd/apt-cacher-ultra constructs an implementation that
+// closes over the materialized CA + leaf cache + observability state.
+type TLSMITMProvider interface {
+	TLSMITMSnapshot() TLSMITMSnapshot
+}
+
+// TLSMITMSnapshot is the SPEC6 §10.4 status-page payload. When
+// Enabled is false, every other field is ignored and the abbreviated
+// `{"enabled": false}` form is rendered.
+type TLSMITMSnapshot struct {
+	Enabled             bool
+	CASource            string // "generated" or "supplied"
+	CAFingerprintSHA256 string
+	CANotAfterUnixTime  int64
+	EffectiveAllowlist  string // regex string, or "" for no narrowing
+	CertCacheSize       int
+	CertCacheCapacity   int
+	LastIssuedHost      string    // empty when no issuance recorded
+	LastIssuedAt        time.Time // zero when no issuance recorded
+	HitRate60sHits      int       // raw counts so the renderer can decide on n/a vs 0%
+	HitRate60sMisses    int
 }
 
 // Server is the SPEC5 §9.7 admin HTTP server. Owns the *http.Server,
