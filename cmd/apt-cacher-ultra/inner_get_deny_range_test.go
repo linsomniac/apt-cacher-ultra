@@ -62,6 +62,14 @@ package main
 //     ErrHostNotAllowed and ErrTargetDenied would surface the same
 //     "forbidden" body.
 //
+// Out-of-scope: the §11 F15 wording also says "tunnel closes after
+// inner response", but pinning that here would couple to behavior
+// that already conflicts with the as-built status-code mapping the
+// §15 #17 sweep needs to reconcile. handler.go does not explicitly
+// close the tunnel after a 403 response; HTTP/1.1 keep-alive may
+// keep it open. Leaving this unasserted until the spec sweep
+// resolves whether "tunnel closes" was prescriptive or descriptive.
+//
 // Mutates package-level shutdownTimeout so NOT t.Parallel.
 
 import (
@@ -104,6 +112,31 @@ func TestServe_InnerGET_DenyRangeFiresAtConnectTime_Returns403(t *testing.T) {
 	oldTimeout := shutdownTimeout
 	shutdownTimeout = 500 * time.Millisecond
 	t.Cleanup(func() { shutdownTimeout = oldTimeout })
+
+	// Preflight: this is an SSRF/deny-range test. The deny only
+	// fires if "localhost" resolves to a loopback IP. On any host
+	// where /etc/hosts (or the resolver) maps "localhost" to a
+	// non-loopback address, the dialer's ControlContext sees a
+	// non-deny IP, the dial would actually reach the target, and
+	// the test would silently pass for the WRONG reason (or fail
+	// in a misleading way). Fail fast and loud here so a future
+	// CI environment misconfig doesn't quietly invalidate the pin.
+	addrs, err := net.LookupHost("localhost")
+	if err != nil {
+		t.Fatalf("preflight: LookupHost(localhost): %v", err)
+	}
+	if len(addrs) == 0 {
+		t.Fatalf("preflight: LookupHost(localhost) returned no addresses")
+	}
+	for _, a := range addrs {
+		ip := net.ParseIP(a)
+		if ip == nil {
+			t.Fatalf("preflight: LookupHost(localhost) returned unparsable %q", a)
+		}
+		if !ip.IsLoopback() {
+			t.Fatalf("preflight: localhost resolves to non-loopback %q; this test relies on the dialer's deny-range catching the loopback IP — refusing to run with a misconfigured resolver", a)
+		}
+	}
 
 	cacheDir := t.TempDir()
 	cfg := minimalCfg(cacheDir, nil)
@@ -180,6 +213,15 @@ func TestServe_InnerGET_DenyRangeFiresAtConnectTime_Returns403(t *testing.T) {
 	}
 	defer rawConn.Close()
 
+	// Bound the whole interaction. Without a deadline a regression
+	// in CONNECT framing or inner-response handling could hang the
+	// test until the package timeout. 30s is plenty for the deny
+	// path (which is a few microseconds of dial logic) but well
+	// short of a default `go test -timeout`.
+	if err := rawConn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatalf("set rawConn deadline: %v", err)
+	}
+
 	if _, err := rawConn.Write([]byte("CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n")); err != nil {
 		t.Fatalf("write CONNECT: %v", err)
 	}
@@ -217,7 +259,10 @@ func TestServe_InnerGET_DenyRangeFiresAtConnectTime_Returns403(t *testing.T) {
 		t.Fatalf("read inner response: %v", err)
 	}
 	defer innerResp.Body.Close()
-	innerBody, _ := io.ReadAll(innerResp.Body)
+	innerBody, err := io.ReadAll(innerResp.Body)
+	if err != nil {
+		t.Fatalf("read inner response body: %v", err)
+	}
 
 	if innerResp.StatusCode != http.StatusForbidden {
 		t.Fatalf("inner status = %d, want %d; body=%q", innerResp.StatusCode, http.StatusForbidden, innerBody)
