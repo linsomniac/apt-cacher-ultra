@@ -518,6 +518,84 @@ func TestServeCONNECT_InnerHeaderSlowloris(t *testing.T) {
 	}
 }
 
+// TestServeCONNECT_ClockSkewFiresOnCacheServedLeaf pins the
+// codex-review §12.1 finding for F17: the clock-skew check must
+// fire on every CONNECT, not just at issuance, because a system-
+// clock jump backward AFTER a cert is cached leaves the cached
+// entry triggering apt's "not yet valid" rejection. We construct
+// a cache whose generation callback returns a leaf with
+// NotBefore in the future (by passing a future `now` to
+// GenerateLeaf), drive a CONNECT, and assert the mitm_clock_skew
+// Warn was emitted with the spec's field set.
+func TestServeCONNECT_ClockSkewFiresOnCacheServedLeaf(t *testing.T) {
+	dir := t.TempDir()
+	ca, err := tlsmitm.LoadOrGenerate(tlsmitm.LoadOptions{
+		StorageDir:           dir,
+		AllowUnconstrainedCA: true,
+	})
+	if err != nil {
+		t.Fatalf("LoadOrGenerate: %v", err)
+	}
+	// Pass a `now` 10 minutes in the future to GenerateLeaf;
+	// because GenerateLeaf backdates NotBefore by 5 minutes,
+	// the resulting NotBefore is 5 minutes in the future
+	// relative to the real wall clock — the F17 condition.
+	cache, err := tlsmitm.NewCache(8, func(host string) (*tls.Certificate, error) {
+		return tlsmitm.GenerateLeaf(host, ca.TLSCert, tlsmitm.LeafECDSAP256, time.Hour, time.Now().Add(10*time.Minute))
+	})
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	logs := newLogCapture()
+	h, err := NewConnectHandler(HandlerDeps{
+		CA:        ca,
+		LeafCache: cache,
+		FetchGate: func(string) bool { return true },
+		Dispatch:  func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) },
+		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}},
+		LogFn:     logs.Append,
+	})
+	if err != nil {
+		t.Fatalf("NewConnectHandler: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			h.ServeCONNECT(w, r)
+			return
+		}
+	}))
+	srv.Start()
+	defer srv.Close()
+
+	rawConn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer rawConn.Close()
+	if _, err := rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	br := bufio.NewReader(rawConn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read CONNECT resp: %v", err)
+	}
+	resp.Body.Close()
+
+	got := logs.WaitFor(t, "mitm_clock_skew", 2*time.Second)
+	if got.level != "warn" {
+		t.Errorf("level = %q, want \"warn\"", got.level)
+	}
+	if got.fields["host"] != "example.test" {
+		t.Errorf("fields[host] = %v, want example.test", got.fields["host"])
+	}
+	for _, k := range []string{"not_before", "now"} {
+		if _, ok := got.fields[k]; !ok {
+			t.Errorf("fields missing key %q", k)
+		}
+	}
+}
+
 // TestServeCONNECT_TLSConfigCloneDefangs proves codex-finding #3:
 // even if the operator's tls.Config template carries a
 // GetCertificate / GetConfigForClient callback that would override

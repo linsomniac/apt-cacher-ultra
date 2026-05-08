@@ -1,13 +1,13 @@
 // SPEC6 §10.2 mitm_clock_skew detector.
 //
 // Belt-and-suspenders against a system-clock jump mid-process: a
-// freshly-generated leaf cert whose NotBefore is in the future
-// relative to the cache's wall clock at the moment of issuance
-// would surface to apt as a "not yet valid" TLS error (§11 F17).
-// GenerateLeaf backdates NotBefore by 5 minutes, so this should be
-// impossible under normal NTP — but a clock that jumps backward
-// between the GenerateLeaf call and the post-issuance comparison
-// can still trigger it.
+// leaf cert whose NotBefore is in the future relative to the
+// cache's wall clock at the moment of use would surface to apt as
+// a "not yet valid" TLS error (§11 F17). GenerateLeaf backdates
+// NotBefore by 5 minutes, so this should be impossible under
+// normal NTP — but a clock that jumps backward AFTER the leaf was
+// generated, while the leaf is still in the cache, leaves the
+// cached entry triggering apt's rejection until the next eviction.
 package proxy
 
 import (
@@ -15,17 +15,19 @@ import (
 	"time"
 )
 
-// CheckLeafClockSkew detects whether a freshly-generated leaf cert's
-// NotBefore is in the future relative to `now`. When skew is found,
-// it emits a §10.2 mitm_clock_skew Warn via logFn with the
-// spec-mandated fields {host, not_before, now} and returns true.
-// Returns false (and emits nothing) on the no-skew path or when the
-// cert lacks a parsed Leaf.
+// CheckLeafClockSkew detects whether a leaf cert's NotBefore is in
+// the future relative to `now`. When skew is found, it emits a
+// §10.2 mitm_clock_skew Warn via logFn with the spec-mandated
+// fields {host, not_before, now} and returns true. Returns false
+// (and emits nothing) on the no-skew path or when the cert lacks
+// a parsed Leaf.
 //
-// Caller wires this in immediately after GenerateLeaf returns, with
-// `now` being a fresh time.Now() call (NOT the same value passed
-// into GenerateLeaf — the whole point is to detect a clock that
-// moved between the two reads).
+// Caller wires this in after every LeafCache.Get so the check
+// catches BOTH the freshly-generated path AND the cache-reuse
+// path. Cache reuse is the more practically detectable case —
+// cached certs live for the configured leaf lifetime, so a
+// backward clock jump that lands while a cert is cached produces
+// a window during which apt rejections fire.
 func CheckLeafClockSkew(
 	host string,
 	leaf *tls.Certificate,

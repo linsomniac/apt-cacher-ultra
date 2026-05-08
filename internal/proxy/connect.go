@@ -319,14 +319,17 @@ type HandlerDeps struct {
 	InnerReadTimeout time.Duration
 
 	// MaxInnerHeaderBytes caps the byte budget for the inner
-	// request line + headers. Default 1 MiB if zero — matching
-	// `net/http`'s `DefaultMaxHeaderBytes`. The TLS-protected
-	// stream is wrapped in an `io.LimitReader` of this size before
-	// `http.ReadRequest`, so a malicious-but-allowed CONNECT client
-	// cannot drive memory growth by sending an unbounded header
-	// block. If the cap is exceeded, ReadRequest fails with
-	// `unexpected EOF` and the handler emits
-	// `outcome=inner_stream_failed`.
+	// request line + headers per SPEC6 §9.2.1. Default 64 KiB if
+	// zero — well above any legitimate apt request (typically <
+	// 4 KiB) but tight enough to bound the heap a hostile-but-
+	// allowed CONNECT client can force the cache to allocate.
+	// The TLS-protected stream is wrapped in a capReader of this
+	// size before `http.ReadRequest`, so a fast-bytes
+	// megabyte-headers DoS exhausts the cap before any HTTP
+	// framing is parsed. The handler classifies the cap-exceeded
+	// path as `outcome=inner_header_too_large` (§11 F11b) via
+	// `errInnerHeaderTooLarge`, distinct from a generic
+	// `inner_stream_failed`.
 	MaxInnerHeaderBytes int64
 
 	// LogFn is the structured-event sink for §10.1 mitm_connect
@@ -373,7 +376,7 @@ func NewConnectHandler(deps HandlerDeps) (*ConnectHandler, error) {
 		deps.InnerReadTimeout = 30 * time.Second
 	}
 	if deps.MaxInnerHeaderBytes == 0 {
-		deps.MaxInnerHeaderBytes = 1 << 20 // 1 MiB, matches net/http default
+		deps.MaxInnerHeaderBytes = 64 << 10 // 64 KiB per SPEC6 §9.2.1
 	}
 	if deps.LogFn == nil {
 		deps.LogFn = func(level, event string, fields map[string]any) {}
@@ -449,6 +452,14 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 		h.warnConnect(OutcomeCertGenFailed, target.LiteralHost, target.Port, clientAddr, start, "leaf gen: "+err.Error(), "", false)
 		return
 	}
+	// SPEC6 §10.2 / §11 F17: detect a system-clock jump that has
+	// left this leaf's NotBefore in the future relative to the
+	// cache's current wall clock. The check fires for both
+	// freshly-generated leafs and cache-reused leafs — the
+	// reused-leaf path is the one apt is most likely to surface
+	// to operators because cached certs live for the configured
+	// leaf lifetime.
+	CheckLeafClockSkew(target.LiteralHost, leaf, time.Now(), h.deps.LogFn)
 
 	// Step 5: TLS handshake on the hijacked conn.
 	//
@@ -494,15 +505,15 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 	// internal request reader, NOT by ReadRequest), so an authenticated
 	// CONNECT client could otherwise drive arbitrary memory growth
 	// by sending a huge header block. The cap is enforced via
-	// io.LimitReader; when the limit is reached mid-header,
-	// ReadRequest sees an unexpected EOF and we report
-	// inner_stream_failed.
+	// capReader, which returns errInnerHeaderTooLarge on the
+	// (cap+1)th byte — distinct from a normal stream EOF so the
+	// classification of F11b can use errors.Is rather than a
+	// consumed-bytes heuristic.
 	if err := conn.SetDeadline(time.Now().Add(h.deps.InnerReadTimeout)); err != nil {
 		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "set inner deadline: "+err.Error(), "", true)
 		return
 	}
-	limited := &countingLimitReader{r: io.LimitReader(tlsConn, h.deps.MaxInnerHeaderBytes), cap: h.deps.MaxInnerHeaderBytes}
-	innerBR := bufio.NewReader(limited)
+	innerBR := bufio.NewReader(&capReader{r: tlsConn, cap: h.deps.MaxInnerHeaderBytes})
 	innerReq, err := http.ReadRequest(innerBR)
 	if err != nil {
 		outcome := OutcomeInnerStreamFailed
@@ -510,7 +521,7 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 		case isDeadlineExceeded(err):
 			// SPEC6 §11 F11a: slowloris on the inner request.
 			outcome = OutcomeInnerHeaderTimeout
-		case limited.exhausted():
+		case errors.Is(err, errInnerHeaderTooLarge):
 			// SPEC6 §11 F11b: byte cap fired before \r\n\r\n.
 			outcome = OutcomeInnerHeaderTooLarge
 		}
@@ -570,27 +581,36 @@ func stripHopByHop(h http.Header) {
 	}
 }
 
-// countingLimitReader wraps an io.LimitReader and tracks whether the
-// limit was reached. Used to distinguish SPEC6 §11 F11a (slowloris,
-// deadline-exceeded) from F11b (byte cap exhausted) when
-// http.ReadRequest fails to parse the inner request.
-type countingLimitReader struct {
+// errInnerHeaderTooLarge is the sentinel returned by capReader once
+// the §9.2.1 byte budget for the inner request preamble is crossed.
+// Distinct from a generic stream EOF so the F11b classification is
+// not a heuristic on consumed-bytes — `errors.Is` against this
+// sentinel is the only path that produces `outcome=inner_header_too_large`.
+var errInnerHeaderTooLarge = errors.New("connect: inner header exceeds cap")
+
+// capReader passes Reads through up to `cap` bytes. The (cap+1)th
+// byte read returns errInnerHeaderTooLarge instead of the underlying
+// stream's natural EOF; any other read error (deadline, TLS close,
+// genuine EOF mid-malformed-request) propagates unchanged so the
+// caller can correctly classify F11a (deadline) vs. F11b (sentinel)
+// vs. inner_stream_failed (everything else).
+type capReader struct {
 	r        io.Reader
 	cap      int64
 	consumed int64
 }
 
-func (c *countingLimitReader) Read(p []byte) (int, error) {
+func (c *capReader) Read(p []byte) (int, error) {
+	remaining := c.cap - c.consumed
+	if remaining <= 0 {
+		return 0, errInnerHeaderTooLarge
+	}
+	if int64(len(p)) > remaining {
+		p = p[:remaining]
+	}
 	n, err := c.r.Read(p)
 	c.consumed += int64(n)
 	return n, err
-}
-
-// exhausted reports whether the cap was reached. The wrapped
-// io.LimitReader returns EOF once the cap is consumed, so the cap
-// being reached is the F11b signal.
-func (c *countingLimitReader) exhausted() bool {
-	return c.consumed >= c.cap
 }
 
 func isDeadlineExceeded(err error) bool {
