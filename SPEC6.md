@@ -37,15 +37,29 @@ private key is unconstrained by the runtime regex unless the CA
 attempt to derive Name Constraints from the regex (§5.1.1); a
 regex too complex to safely translate produces a CA without
 constraints and a `mitm_ca_name_constraints_skipped` Warn at
-startup. Operator-supplied CAs carry whatever constraints the
-operator put on them — Phase 6 does not add or modify
-constraints on operator-supplied CAs. Operators in adversarial
-or multi-tenant environments who want cryptographic constraint
-on the CA itself (i.e. limiting blast radius of a key
-compromise) should either (a) narrow `tls_mitm.allowed_host_regex`
-to literal hostnames the auto-generator can translate, or
-(b) supply a CA out of band with the desired Name Constraints
-already set. See §11 for the failure-mode catalog.
+startup.
+
+**RFC 5280 dNSName Name Constraints are suffix-based, not
+exact** — see §5.1.1.1. A permitted subtree of `foo.example.com`
+also admits any subdomain such as `bar.foo.example.com`. The
+constraint is therefore an over-approximation of the runtime
+regex: it narrows the blast radius of CA-key compromise to the
+suffix tree spanned by the regex literals, NOT to the exact set
+of hostnames the regex matches. Operators evaluating residual
+risk must reason about subdomain expansion, not just literal
+match. There is no shape of dNSName constraint that bounds a CA
+to a single hostname.
+
+Operator-supplied CAs carry whatever constraints the operator
+put on them — Phase 6 does not add or modify constraints on
+operator-supplied CAs. Operators in adversarial or multi-tenant
+environments who want tighter cryptographic constraint on the
+CA itself (i.e. limiting blast radius of a key compromise)
+should either (a) narrow `tls_mitm.allowed_host_regex` to
+literal hostnames whose dNSName suffix tree they accept as the
+blast-radius bound, or (b) supply a CA out of band with the
+desired Name Constraints already set. See §11 for the
+failure-mode catalog.
 
 ---
 
@@ -178,21 +192,73 @@ HTTP `CONNECT` method on **any** path. Per RFC 7231 §4.3.6, the
 request-target is `host:port` (e.g. `apt.corretto.aws:443`). The
 handler:
 
-1. Parses the request-target into `(host, port)`. Lower-cases
-   the host and applies IDNA "to-ASCII" normalization. Reject:
-   - port other than `443` → `400 Bad Request` +
-     `mitm_connect` Warn (`outcome=bad_port`).
-   - host that parses as an IP literal (IPv4 dotted-quad,
-     IPv4-mapped, or IPv6 in `[…]` form) → `400 Bad Request` +
-     `mitm_connect` Warn (`outcome=ip_literal_host`). The
-     allowlist is hostname-based, and the auto-generated CA's
-     Name Constraints are dNSName-only; allowing an IP-literal
-     CONNECT would let it pass the regex by coincidence and
-     issue a leaf cert with no SAN that the client would
-     accept. Operators with IP-literal HTTPS upstreams configure
-     a hostname mapping in their DNS instead.
-   The simpler default of "443 only" exists because non-443
-   HTTPS upstreams are rare; a future override knob is deferred.
+1. Parses the request-target into `(host, port)`. The
+   request-target wire form is `host ":" port` per RFC 7231
+   §4.3.6. Apply the parsing rules below in order; the first
+   failure short-circuits with the documented outcome.
+   Failure outcomes ALL emit `400 Bad Request` to the client
+   and a `mitm_connect` Warn at conn close.
+
+   **Structural / syntactic failures** — `outcome=bad_target`:
+   - **Empty request-target** (no `host:port` at all).
+   - **Missing port** (no `:` in the target, e.g.
+     `apt.corretto.aws`).
+   - **Empty host** (`:443` with nothing before the colon).
+   - **Empty port** (`apt.corretto.aws:`).
+   - **Non-numeric port** (`apt.corretto.aws:https`,
+     `apt.corretto.aws:abc`).
+   - **Port out of range** (port < 1 or > 65535 after
+     numeric parse).
+   - **Multiple colons in the non-IPv6 form** (e.g.
+     `host:443:extra`).
+   - **Unbracketed IPv6 literal** (e.g. `::1:443` — IPv6
+     literals MUST be bracketed per RFC 7230 §2.7.1, e.g.
+     `[::1]:443`). The handler distinguishes "looks like
+     IPv6 but missing brackets" from a malformed two-colon
+     hostname by attempting IPv6 parse on the
+     pre-final-colon prefix; ambiguous shapes default to
+     `bad_target`.
+   - **`splitHostPort`-style parse failure** for any other
+     reason that prevents extracting a `(host, port)` pair.
+
+   **Host validation failures** (after structural parse
+   succeeds and host is extracted):
+   - **IDNA-to-ASCII failure** (e.g. invalid Unicode,
+     malformed punycode, label > 63 octets, total length >
+     253 octets, or any other condition `x/net/idna`
+     `Lookup.ToASCII` rejects) → `outcome=bad_host`.
+   - **Invalid DNS label** after IDNA normalization
+     (label contains characters not in
+     `[A-Za-z0-9-]` after ToASCII; label starts or ends
+     with `-`; empty label other than the optional final
+     root label) → `outcome=bad_host`.
+   - **IP literal** (the IDNA-normalized host parses as a
+     dotted-quad IPv4, IPv4-mapped IPv6, or, after
+     bracket-stripping, an IPv6 literal) →
+     `outcome=ip_literal_host`. Phase 6 rejects IP-literal
+     CONNECTs because the allowlist is hostname-based and
+     the auto-generated CA's Name Constraints are
+     dNSName-only; allowing an IP-literal CONNECT would
+     let it pass the regex by coincidence and issue a
+     leaf cert that does not match SNI. Operators with
+     IP-literal HTTPS upstreams configure a hostname
+     mapping in their DNS instead.
+
+   **Port validation** (after structural parse and host
+   validation succeed):
+   - Port other than `443` → `outcome=bad_port`. The
+     simpler default of "443 only" exists because non-443
+     HTTPS upstreams are rare; a future override knob is
+     deferred.
+
+   **Trailing-dot normalization.** A trailing `.` on the
+   host (e.g. `apt.corretto.aws.:443`) is a fully-qualified
+   absolute DNS name and is canonicalized by stripping the
+   trailing dot before allowlist evaluation and cert cache
+   lookup. This matches Go `net.LookupHost` behavior and
+   prevents `host` and `host.` from issuing two distinct
+   leaf certs. The trailing dot is stripped silently — no
+   Warn — since it is a legitimate FQDN form.
 2. Validates the normalized `host` against the §5.1.2 effective
    allowlist. The two predicates are evaluated in order; the
    first failure short-circuits with the appropriate
@@ -205,15 +271,19 @@ handler:
       generation; no TLS handshake. (Empty regex →
       predicate vacuously true; fall through to the fetch
       predicate.)
-   2. **Fetch predicate** — RE2 `MatchString` of
-      `upstream.allowed_host_regex` against the **canonical
-      host**, where canonical = result of running the literal
-      CONNECT host through Remap (`internal/proxy/proxy.go`
-      `canonicalize`). Remap is regex-only, so this introduces
-      no DNS or I/O at CONNECT time. Failure → `403 Forbidden`
-      + `mitm_connect` Warn (`outcome=denied_host`,
-      `denied_gate=fetch`); no cert generation, no TLS
-      handshake.
+   2. **Fetch predicate** — `fetch.Client.HostAllowed` against
+      the **canonical host**, where canonical = result of
+      running the literal CONNECT host through Remap
+      (`internal/proxy/proxy.go canonicalize`). Remap is
+      regex-only, so this introduces no DNS or I/O at CONNECT
+      time. The fetch predicate iterates the
+      `upstream.allowed_host_regex` LIST (Phase 1 schema:
+      `[]string`; see `internal/fetch/allow.go:25`
+      `Client.checkAllowed`) and succeeds on any-match; empty
+      list denies every host (Phase 1 §6.6 contract). Failure →
+      `403 Forbidden` + `mitm_connect` Warn
+      (`outcome=denied_host`, `denied_gate=fetch`); no cert
+      generation, no TLS handshake.
 
    Both must hold for the CONNECT to proceed.
    Match on a regex is unanchored RE2 substring match (Phase 1
@@ -258,17 +328,24 @@ handler:
    parses `r.RequestURI` via `parser.Parse` (handler.go:252),
    ignoring `r.URL`; the synthetic request must therefore set
    the absolute-URI form on `RequestURI`:
-   - `RequestURI`: `"https://<literal_host><inner_path>"` —
+   - `RequestURI`: `"https://<literal_host><inner_request_uri>"` —
      scheme=https, host = the literal lower-cased
-     IDNA-normalized CONNECT host, path = the inner request's
-     request-URI path. The query string and fragment from the
-     inner request are dropped; apt repository URLs never
-     carry them, and the parser
-     (`internal/proxy/url.go parseRequestURI`) rejects both
-     classes by design. An inner GET that does carry a query
-     string returns 400 on the inner stream (handler-side
-     `bad_request` outcome) — same shape as a malformed plain
-     GET would produce.
+     IDNA-normalized CONNECT host, request-URI = the inner
+     request's wire-form request-target verbatim (path plus any
+     query string or fragment, exactly as the client sent it).
+     The MITM path does NOT strip query strings or fragments
+     before dispatch; the parser
+     (`internal/proxy/url.go parseRequestURI` lines 46–51 and
+     77–82) is the single point that rejects them, returning
+     `ErrInvalidURI`. The handler then surfaces that as 400
+     `bad_request` on the inner stream — the same outcome a
+     plain proxy GET with a query string would produce. This
+     is intentional: stripping the query at MITM dispatch time
+     would silently alias `/Packages?x=1` to `/Packages` in
+     the cache, defeating the parser's `RawQuery != ""`
+     guard. Apt repository URLs never carry queries or
+     fragments in practice; a request that does is anomalous
+     and surfaces loudly.
    - `Method`: from the inner request line (already
      constrained to GET or HEAD by step 6).
    - `Host`: same literal host as in `RequestURI`. The parser
@@ -276,8 +353,38 @@ handler:
      a logging breadcrumb), so this is symmetry-only.
    - `RemoteAddr`: the outer CONNECT's client address.
    - `Body`: `http.NoBody` for both GET and HEAD.
-   - `Context`: derived from the outer CONNECT context, so
-     listener Shutdown cancels the inner upstream fetch.
+   - `Context`: derived from the outer CONNECT context (so
+     listener Shutdown cancels the synthetic request via the
+     same path that cancels any in-flight HTTP request), with
+     an unexported sentinel value attached via
+     `context.WithValue` to signal that this request was
+     dispatched by the MITM CONNECT path. The sentinel is the
+     **logger integration contract** for the §10.1 `mitm` log
+     field — see "MITM context marker" below.
+
+     **The synthetic request's context is the
+     ResponseWriter / handler-side cancellation context
+     ONLY.** It is NOT the upstream fetch context. The
+     existing `Handler.serveCacheMiss`
+     (`internal/handler/handler.go:843`) deliberately
+     fetches under `h.lifecycleCtx`, not `r.Context()`,
+     so that a leader's client disconnect does NOT kill
+     the fetch for waiters that are still connected
+     (handler.go:849-857 documents this invariant). Phase 6
+     does not change that invariant: a CONNECT client that
+     hangs up mid-cache-miss leaves the leader's upstream
+     fetch running until the body completes (or
+     `lifecycleCtx` cancels at Shutdown). The
+     `lifecycleCtx` is also what propagates Shutdown to
+     in-flight upstream fetches — Phase 6 reuses that
+     mechanism.
+
+     This means: the synthetic request's context cancellation
+     affects the inner ResponseWriter (a closed CONNECT
+     short-circuits cache-read writes back to the client) and
+     the in-handler timeout / freshness checks that already
+     read `r.Context()`, but does NOT propagate into the
+     leader fetch. The chaos test §12.3 asserts this directly.
    - `Header`: a copy of the inner request's headers minus
      hop-by-hop entries (`Connection`, `Keep-Alive`, etc.),
      with `Host` set to the literal host (defensive — apt
@@ -403,34 +510,61 @@ under interprocess lock (§4.2.2). The daemon recognizes a
 generated CA as committed only when `ca.ready` exists AND
 matches `sha256(ca.crt)`. Cases:
 
-1. **`cache_dir/ca/` is empty** (first start, or operator
-   wiped the directory): generate a new CA pair (§5.1.1),
-   write to disk atomically (§4.2.1), then load. Emit
+The case-detection rule looks at the **daemon-managed
+"real" files** (`ca.crt`, `ca.key`, `ca.ready`); presence
+of `*.tmp` files alone (no real files committed) is not a
+case-3 trigger — it is generation residue and the
+generation path cleans it up under lock (§4.2.1 step 3).
+The case-3 rule fires when a real file is present without
+its committed siblings, or when committed siblings
+disagree.
+
+1. **No real files committed** (none of `ca.crt`,
+   `ca.key`, `ca.ready` exist; any number of `*.tmp` files
+   may or may not be present): treat as first-start.
+   Generate a new CA pair (§5.1.1), write to disk
+   atomically (§4.2.1) — generation step 3 cleans any
+   stale `*.tmp` residue under the lock — then load. Emit
    `mitm_ca_generated` Info plus `mitm_ca_loaded` Info.
+   Justification: a `*.tmp`-only state is the residue of a
+   prior crashed first-start where no trust anchor was
+   ever committed; auto-recovering it does not change any
+   already-trusted CA (because there isn't one).
 2. **`ca.crt`, `ca.key`, and `ca.ready` all exist; both
    files parse; `ca.ready`'s fingerprint matches
    `sha256(ca.crt)`; the cert/key match check passes**:
-   load and use. Emit `mitm_ca_loaded` Info
-   (`source=generated`, `fingerprint_sha256=…`,
+   load and use. Best-effort cleanup of any leftover
+   `*.tmp` residue (under lock). Emit `mitm_ca_loaded`
+   Info (`source=generated`, `fingerprint_sha256=…`,
    `not_after_unixtime=…`).
-3. **Any other state of `cache_dir/ca/`** — `ca.ready`
-   missing while any of `ca.crt` / `ca.key` / `ca.crt.tmp` /
-   `ca.key.tmp` / `ca.ready.tmp` is present; `ca.ready`'s
-   fingerprint doesn't match `sha256(ca.crt)`; either file
-   fails to parse; cert/key mismatch — startup fails with
-   `mitm_ca_load_failed` Error naming the offending state.
-   The daemon does NOT silently regenerate in this state.
-   Operator recovery is **explicit removal of the entire
-   `cache_dir/ca/` directory** (or just the daemon-managed
-   files within it), forcing case 1 on the next start. The
-   marker scheme guarantees this branch never fires
-   spuriously from a §4.2.1 mid-write crash, since
-   `ca.ready` is written last and atomically: a kill -9
-   anywhere during write leaves `ca.ready` absent and the
-   on-disk state observably uninitialized to case 3.
-   Silent regeneration would change the trust anchor under
-   every client without warning; trust-root replacement is
-   an operator-explicit action.
+3. **Inconsistent committed state** — at least one of
+   `ca.crt` / `ca.key` / `ca.ready` is present but the
+   trio is not self-consistent. Specifically:
+   - `ca.ready` missing while either `ca.crt` or `ca.key`
+     exists (the trust anchor was not committed but the
+     key material is on disk — this is the "half-trusted"
+     hazard the marker scheme exists to detect).
+   - `ca.ready` present but `ca.crt` or `ca.key` missing.
+   - `ca.ready`'s fingerprint disagrees with
+     `sha256(ca.crt)`.
+   - Either real file fails to parse.
+   - Cert/key mismatch.
+
+   Startup fails with `mitm_ca_load_failed` Error naming
+   the offending state. The daemon does NOT silently
+   regenerate in this state. Operator recovery is
+   **explicit removal of the entire `cache_dir/ca/`
+   directory** (or just the daemon-managed real files —
+   `ca.crt`, `ca.key`, `ca.ready` — within it), forcing
+   case 1 on the next start. The marker scheme
+   guarantees this branch never fires spuriously from a
+   §4.2.1 mid-write crash where no real file was committed
+   yet (that state is case 1 above); it fires when at
+   least one real file landed without its committed
+   siblings. Silent regeneration in that state would
+   change the trust anchor under every client without
+   warning; trust-root replacement is an operator-explicit
+   action.
 4. `cache_dir/ca/` cannot be created or written to: startup
    fails with a config-error log line. The daemon does NOT
    downgrade to MITM-disabled silently — an operator who
@@ -504,12 +638,14 @@ return the error. Startup fails; the operator sees
 
 | State | Meaning | §4.2 disposition |
 |-------|---------|------------------|
-| Empty directory (or no daemon-managed files) | First boot, or pre-step-5 crash | Case 1 — generate |
-| `*.tmp` files only | Crashed between steps 5–6 | Case 3 — operator clears, regen on next start |
-| `ca.crt` only, no key, no marker | Crashed between rename of crt and key | Case 3 — operator clears |
-| `ca.crt` + `ca.key`, no marker | Crashed between rename of key and marker write | Case 3 — operator clears (the trust anchor is NOT yet committed; loading would change it on next start) |
-| `ca.crt` + `ca.key` + `ca.ready` (matching fp) | Clean state | Case 2 — load |
+| Empty directory | First boot | Case 1 — generate |
+| `*.tmp` files only (no real files) | Crashed between steps 5–6 | Case 1 — generation step 3 cleans tmp residue under lock and proceeds; no committed trust anchor existed |
+| `ca.crt` only, no key, no marker | Crashed between rename of crt and key | Case 3 — operator clears (real file present without committed siblings) |
+| `ca.crt` + `ca.key`, no marker | Crashed between rename of key and marker write | Case 3 — operator clears (key material on disk but trust anchor NOT yet committed; loading would adopt an uncommitted CA) |
+| `ca.crt` + `ca.key` + `ca.ready` (matching fp) | Clean state | Case 2 — load (best-effort `*.tmp` cleanup under lock) |
 | `ca.crt` + `ca.key` + `ca.ready` (mismatching fp) | Manual tampering or partial restoration | Case 3 — operator investigates |
+| `ca.ready` only (no `ca.crt`/`ca.key`) | Marker present but no trust anchor — manual tampering | Case 3 — operator clears |
+| Any of the above + extra `*.tmp` residue | A prior write attempt left tmp files; current trust anchor (if committed) is unaffected | Same as the row matching the real-file pattern; tmp files are cleaned in the next §4.2.1 invocation under lock |
 
 The marker scheme converts what was the worst case (silent
 half-renamed trust-anchor adoption) into a deterministic
@@ -534,9 +670,30 @@ uses an interprocess advisory lock on
   serialize against each other.
 - Lock acquisition timeout (30s) is loud — a `mitm_ca_lock_timeout`
   Error fires and startup / `ca print` exits with the
-  `mitm_ca_generation_failed` outcome. Operators
-  encountering this clear stale lockfiles by removing the
-  daemon and re-running.
+  `mitm_ca_generation_failed` outcome.
+
+  **Recovery advice — do NOT delete the lockfile.** flock
+  locks are tied to the file descriptor that holds them, not
+  to the file's pathname; removing `<ca_storage_dir>/.ca.lock`
+  does NOT release the lock if a process still has it open,
+  and it can create a split-lock condition where a new
+  process opens a fresh inode at the same path and acquires
+  a "lock" on a file the old holder no longer references.
+  Operator recovery is:
+  1. Identify the holding process: `lsof <ca_storage_dir>/.ca.lock`
+     or `fuser <ca_storage_dir>/.ca.lock` will name the PID
+     and command line. Typical culprits: a stuck
+     `apt-cacher-ultra ca print` invocation, a previous
+     daemon instance that did not exit cleanly, or a parallel
+     fleet-rollout script running `ca print` on the same
+     storage dir.
+  2. Stop that process (graceful preferred: SIGTERM and
+     wait; SIGKILL only if it is wedged). The kernel
+     releases the flock when the process exits regardless
+     of how it exits.
+  3. Retry the original startup or `ca print`. The lock
+     will be acquirable immediately.
+  Do NOT `rm` the lockfile: it does not help, it can hurt.
 
 ---
 
@@ -554,7 +711,7 @@ cert_cache_size    = 256                      # in-memory LRU bound, entries
 leaf_cert_lifetime = "720h"                   # 30 days
 ca_cert_lifetime   = "87600h"                 # 10 years (auto-generated only)
 leaf_algorithm     = "ecdsa-p256"             # also "rsa2048" for legacy clients
-allowed_host_regex = ""                       # empty = inherit upstream.allowed_host_regex
+allowed_host_regex = ""                       # empty = no MITM narrowing (fetch gate alone applies)
 ```
 
 The inner-request method allowlist (`GET`, `HEAD`) is fixed by
@@ -594,39 +751,73 @@ X.509 Name Constraints are not regexes; they are an
 unordered set of `permittedSubtrees` and `excludedSubtrees`
 each holding `GeneralName` entries (Phase 6 uses dNSName
 only — IP-literal CONNECTs are rejected at §2.2 step 1, so
-the iPAddress excluded-subtree subset is moot). The
-translator accepts a small fragment of RE2 and rejects
-everything else loudly:
+the iPAddress excluded-subtree subset is moot).
+
+**RFC 5280 dNSName matching is suffix-based, not exact.**
+Per RFC 5280 §4.2.1.10: "DNS name restrictions are expressed
+as host.example.com. Any DNS name that can be constructed by
+simply adding zero or more labels to the left-hand side of
+the name satisfies the name constraint." So a permitted
+subtree of `foo.example.com` admits leaf certs whose SAN is
+`foo.example.com` itself AND any deeper subdomain such as
+`bar.foo.example.com` or `a.b.foo.example.com`. The
+translator therefore produces an **over-approximation** of
+the regex's preimage: every literal hostname the regex
+admits is permitted by the constraint, but the constraint
+also admits subdomains the regex would not admit. This is
+inherent to the dNSName GeneralName shape — there is no
+per-leaf-label "anchor" in X.509 Name Constraints. Any
+"exact match" promise from earlier drafts is incorrect.
+
+The translator accepts a small fragment of RE2 and rejects
+everything else loudly. Each accepted shape is documented
+with its exact `permittedSubtrees` output AND the
+over-approximation it introduces:
 
 **Supported input shapes** (any of, anchored with `^…$`
 literal anchors only — the anchors are optional but
 recommended for operator clarity):
 
 1. **Literal hostname**: `^foo\.example\.com$` →
-   `permitted = ["foo.example.com"]`. (Trailing `$`
-   anchor is honored; without anchors the input still
-   produces a literal subtree match because RFC 5280 dNSName
-   constraint matching is suffix-based and a literal
-   matches itself only.)
+   `permitted = ["foo.example.com"]`. *Over-approximation:*
+   the constraint also admits `*.foo.example.com` (any
+   depth) since dNSName matching is suffix-based. Operators
+   wanting exact-match cryptographic narrowing must accept
+   that X.509 Name Constraints cannot express it; the
+   runtime signing gate (§5.1.2) is the only exact-match
+   bound and it depends on key custody.
 2. **Single-label wildcard prefix**: `^[a-z0-9-]+\.foo\.com$`
    or `^[^.]+\.foo\.com$` →
    `permitted = ["foo.com"]` (the constraint matches the
    literal suffix; any subdomain depth is allowed by RFC
    5280 dNSName subtree semantics, which the translator
    relies on rather than enumerating one-label preimage).
+   *Over-approximation:* the regex admits exactly one label
+   of prefix; the constraint admits zero or more.
 3. **Two-letter region prefix alternation**:
    `^([a-z]{2}\.)?archive\.ubuntu\.com$` →
    `permitted = ["archive.ubuntu.com"]` (the optional
    prefix collapses into the dNSName subtree of the
    suffix; the suffix-match contract subsumes the
-   alternation).
+   alternation). *Over-approximation:* same as shape 2 —
+   the constraint allows arbitrary subdomain depth.
 4. **Multiple anchored alternation of literals**:
    `^(foo\.example\.com|bar\.example\.com)$` →
    `permitted = ["foo.example.com", "bar.example.com"]`.
+   *Over-approximation:* each entry permits its own
+   subdomain tree per shape 1.
 5. **Literal-list syntactic sugar** (Phase 6 may pre-process
    `^(a|b|c)$` style alternations of literals into the
    set of literals before invoking the translator):
-   produces one permitted subtree per literal.
+   produces one permitted subtree per literal — same
+   over-approximation as shape 4.
+
+**The translator never produces a constraint narrower than
+the regex's literal preimage; it produces a coarser-or-equal
+constraint by design.** Operators who need exact-leaf
+narrowing must rely on the runtime signing gate and accept
+that key compromise expands blast radius to the suffix tree
+of every regex literal.
 
 **Rejected input shapes** (yield
 `mitm_ca_name_constraints_skipped` Warn; CA issued without
@@ -692,7 +883,9 @@ unconstrained CA) or supply a CA out of band.
 #### 5.1.2 Effective MITM allowlist
 
 The CONNECT pre-handshake predicate is a conjunction of a
-**signing gate** and a **fetch gate**:
+**signing gate** and a **fetch gate**. Each gate has
+different inputs and different semantics for "empty"; do not
+collapse them into one predicate:
 
 ```
 mitm_eligible(literal_host) =
@@ -700,11 +893,19 @@ mitm_eligible(literal_host) =
         AND fetch_gate(canonicalize(literal_host))
 
 signing_gate(literal_host) =
+    // tls_mitm.allowed_host_regex is at most one RE2 pattern
+    // (config-validated). It is the OPTIONAL narrowing gate.
     tls_mitm.allowed_host_regex == ""
         OR re2(tls_mitm.allowed_host_regex).MatchString(literal_host)
 
 fetch_gate(canonical_host) =
-    re2(upstream.allowed_host_regex).MatchString(canonical_host)
+    // upstream.allowed_host_regex is a LIST of RE2 patterns
+    // (config schema: []string; see internal/config/config.go:76,
+    // internal/fetch/allow.go:25 Client.checkAllowed). The list
+    // is "any-match": the gate succeeds iff at least one
+    // compiled regex in the list matches. An EMPTY list (Phase 1
+    // §6.6 contract) DENIES EVERYTHING.
+    Client.HostAllowed(canonical_host)   // any-match across c.allow
 ```
 
 - `literal_host` is the lower-cased, IDNA-normalized CONNECT
@@ -715,10 +916,37 @@ fetch_gate(canonical_host) =
   `internal/proxy/proxy.go canonicalize` — a pure regex match
   loop with no DNS or I/O. It returns `literal_host` unchanged
   when no rule matches.
-- `fetch_gate` is the Phase 1 §6.6 / handler.go:274
-  `Client.HostAllowed` predicate, used verbatim against the
-  canonical host. Empty `upstream.allowed_host_regex` means
-  "deny everything" (Phase 1 §6.6 contract).
+- `fetch_gate` calls the Phase 1 §6.6 / handler.go:274
+  `Client.HostAllowed` predicate verbatim against the
+  canonical host. Phase 6 does NOT add a different code path
+  for the fetch gate; it reuses the existing list-match
+  predicate so the literal-vs-canonical asymmetry is the only
+  Phase 6 delta.
+
+**Asymmetry: signing gate is a single optional regex; fetch
+gate is the existing upstream LIST of regexes.** This matches
+the existing config schema (Phase 1 had a list; we did not
+extend that). An empty signing regex means "no MITM
+narrowing" — the fetch gate alone applies. An empty upstream
+list means "deny everything" — the fetch gate fails for every
+host. The two emptiness semantics are intentionally different
+and tied to their config schemas:
+
+| Gate | Type | Empty meaning |
+|------|------|---------------|
+| signing (`tls_mitm.allowed_host_regex`) | single RE2 string | predicate vacuously true (no narrowing applied) |
+| fetch (`upstream.allowed_host_regex`) | list of RE2 strings | predicate denies every host (Phase 1 §6.6) |
+
+Earlier drafts of this spec included an "inherit upstream"
+shorthand for the signing gate when empty. That shorthand is
+NOT implemented: the signing-gate config is a separate single
+regex with its own validation, and "inherit" would silently
+re-narrow the literal-host predicate to whatever the canonical-
+host predicate is (which would defeat the Phase 6 design intent
+of two independent gates with different inputs). Operators who
+want signing-gate parity with the upstream list must spell out
+their literal-host narrowing in `tls_mitm.allowed_host_regex`
+explicitly.
 
 **Signing gate vs fetch gate.** The two gates have different
 inputs intentionally. The signing gate operates on the literal
@@ -732,22 +960,27 @@ canonicalizes to a denied upstream is rejected at CONNECT
 without ever issuing a cert.
 
 **No "broader than upstream" startup check.** A general
-regex-subset relation between two RE2 regexes is undecidable;
-a partial check that worked only on simple regex shapes would
-mislead operators into thinking it caught all misconfigurations.
+regex-subset relation between an RE2 regex and a list of
+RE2 regexes is undecidable in the general case; a partial
+check that worked only on simple regex shapes would mislead
+operators into thinking it caught all misconfigurations.
 Instead, when `tls_mitm.allowed_host_regex` is non-empty AND
-upstream is also non-empty, the daemon emits a one-shot Info
-at startup naming both regexes and flagging that the operator
-is responsible for the MITM regex being a subset of the
-upstream regex. A regex misconfiguration (literal host passing
-MITM gate but canonical host failing fetch gate) surfaces as
-`outcome=denied_host` `mitm_connect` Warn, NOT as an
-established tunnel followed by inner-GET 502 — the §2.2 step 2
-fetch-gate check rejects the CONNECT pre-handshake before any
-cert is issued. (Deny-range deny — `upstream.deny_target_ranges`
-matching the inner-GET's resolved IP at TCP-connect time —
-still produces `outcome=upstream_denied` on the inner request,
-since that gate is intentionally deferred per §1.1.3.)
+the `upstream.allowed_host_regex` list is non-empty, the
+daemon emits a one-shot Info at startup naming the MITM
+regex plus the full upstream list, and flagging that the
+operator is responsible for the relationship between the
+literal-host gate and the canonical-host gate (subset of
+*which* upstream pattern? — the operator decides). A regex
+misconfiguration (literal host passing MITM gate but
+canonical host failing every entry in the upstream list)
+surfaces as `outcome=denied_host` `mitm_connect` Warn, NOT
+as an established tunnel followed by inner-GET 502 — the
+§2.2 step 2 fetch-gate check rejects the CONNECT
+pre-handshake before any cert is issued. (Deny-range deny —
+`upstream.deny_target_ranges` matching the inner-GET's
+resolved IP at TCP-connect time — still produces
+`outcome=upstream_denied` on the inner request, since that
+gate is intentionally deferred per §1.1.3.)
 
 #### 5.1.3 Leaf cert parameters
 
@@ -777,9 +1010,22 @@ to a host:
 - Extensions:
   - `KeyUsage: digital_signature, key_encipherment`
   - `ExtendedKeyUsage: serverAuth`
-- Signing: ECDSA-SHA256 against the CA's key, regardless of
-  the leaf algorithm (the signing operation runs on the CA
-  key; CA is ECDSA P-256).
+- Signing: the signature algorithm is **derived from the CA
+  key type, not the leaf algorithm**. The CA key is the
+  signing key; the leaf algorithm config governs only the
+  leaf's *own* key pair.
+  - **ECDSA P-256 CA** (auto-generated default; also accepted
+    operator-supplied) → `ECDSAWithSHA256`
+    (`x509.ECDSAWithSHA256`).
+  - **ECDSA P-384 CA** (operator-supplied only) →
+    `ECDSAWithSHA384`.
+  - **RSA-2048 / 3072 / 4096 CA** (operator-supplied only) →
+    `SHA256WithRSA` (`x509.SHA256WithRSA`).
+  - **Any other key type** (Ed25519, ECDSA P-521, RSA <2048,
+    DSA, etc.) → startup fails with the §5.2 validation rule
+    below; the daemon does not bind. Phase 6 implements this
+    closed enum; future phases can add Ed25519 if any
+    deployment asks.
 
 The leaf cert cache is keyed on the literal lower-cased,
 IDNA-normalized CONNECT host. Cache size = `cert_cache_size`
@@ -804,8 +1050,15 @@ At startup, when `tls_mitm.enabled = true`:
   cert/key must match (`x509.Certificate.PublicKey ==
   PrivateKey.Public()`); the cert must have
   `BasicConstraints: CA:TRUE`; the cert's `not_after` must be
-  in the future. Empty: `tls_mitm.ca_storage_dir` (or its
-  default `<cache_dir>/ca`) must be creatable.
+  in the future; **the key type must be one of the supported
+  signing algorithms** (ECDSA P-256, ECDSA P-384, RSA-2048,
+  RSA-3072, RSA-4096) per §5.1.3 — startup rejects
+  unsupported key types (e.g. Ed25519, ECDSA P-521, RSA
+  smaller than 2048, DSA) with a config-error log line
+  naming the rejected algorithm. Empty: `tls_mitm.ca_storage_dir`
+  (or its default `<cache_dir>/ca`) must be creatable; the
+  auto-generator produces ECDSA P-256, which §5.1.3 always
+  accepts.
 
 When `tls_mitm.enabled = false`, all `tls_mitm.*` fields are
 ignored. A future config that sets `enabled = false` while
@@ -833,22 +1086,46 @@ New startup loud-config events:
   may not be among the listed canonicals) is still
   legitimate.
 - `tls_mitm_enabled_ca_undistributed` Warn when
-  `enabled = true` AND no `mitm_connect`-related successful
-  TLS handshakes have been observed in the last
-  `30 minutes` of process uptime. Fired once per uptime
-  hour from the §9.7.6 refresher goroutine. Surfaces
-  "operator turned on MITM but the CA is not yet trusted by
-  any client" as an operationally-visible signal rather
-  than apt failures buried in client logs.
+  `enabled = true` AND, in the last 30 minutes of process
+  uptime, **at least one CONNECT attempt was observed AND
+  zero of them resulted in a successful TLS handshake**.
+  Both conditions must hold; "no CONNECTs at all" does NOT
+  fire the warning. The signal is "clients are trying to
+  use MITM but failing", not "no clients have shown up
+  yet" — a quiet deployment (e.g. a freshly-deployed cache
+  before any client `apt-get update` cycle has run, or a
+  weekend with no fleet activity) must NOT false-alarm.
+  Fired once per uptime hour from the §9.7.6 refresher
+  goroutine.
+
+  Implementation: counters of `mitm_connect` outcomes
+  observed in a rolling 30-minute window, partitioned into
+  "successful TLS handshake reached" (`tunneled` plus
+  `inner_method_rejected` plus inner-stream outcomes —
+  TLS itself worked) and "TLS-failure" (`tls_failed`,
+  `tls_handshake_timeout`, `cert_gen_failed`). Pre-TLS
+  rejections (`bad_target` / `bad_host` / `bad_port` /
+  `ip_literal_host` / `denied_host`) do NOT count toward
+  either bucket — they are configuration / client errors
+  that arrive before the CA-distribution question. Warn
+  fires when `tls_failure_count >= 1 AND
+  tls_success_count == 0` over the window.
+
+  Surfaces "operator turned on MITM but the CA is not yet
+  trusted by any client" as an operationally-visible
+  signal rather than apt failures buried in client logs.
 - `tls_mitm_narrowing_regex_set` Info at startup when
-  `tls_mitm.allowed_host_regex` is non-empty. Names both
-  `upstream.allowed_host_regex` and the MITM regex, reminds
-  the operator that the §5.1.2 predicate is the conjunction
-  of a literal-host signing gate and a canonical-host fetch
-  gate (not "broader-of-the-two") and that the operator is
-  responsible for verifying the relationship — regex subset
-  is undecidable, so the daemon cannot check it. A
-  misconfigured broader-than-upstream MITM regex surfaces at
+  `tls_mitm.allowed_host_regex` is non-empty. Names the MITM
+  regex and the full `upstream.allowed_host_regex` list (one
+  item per entry — the upstream allowlist is a list, not a
+  single regex; see §5.1.2). Reminds the operator that the
+  §5.1.2 predicate is the conjunction of a literal-host
+  signing gate (single regex) and a canonical-host fetch
+  gate (any-match across the upstream list) and that the
+  operator is responsible for verifying the relationship —
+  regex-subset is undecidable, so the daemon cannot check
+  it. A misconfigured broader-than-upstream MITM regex
+  surfaces at
   runtime as `outcome=denied_host` `mitm_connect` Warn (the
   CONNECT itself rejects the host pre-handshake; no cert is
   ever issued for a host that fails the fetch gate).
@@ -922,19 +1199,78 @@ fetcher) as a plain absolute-URL GET on the same listener.
 ### 6.2 Inner GET dispatch
 
 See §2.2 step 7 for the full synthetic-request contract. In
-short: `r.RequestURI = "https://<literal_host><path>"`,
+short: `r.RequestURI = "https://<literal_host><inner_request_uri>"`,
 `r.Method = inner method`, `r.Host = literal_host`,
 `r.Body = http.NoBody`, `r.Context()` derived from the outer
 CONNECT, `r.RemoteAddr` = the outer CONNECT's client address
 (the cache does not NAT or hide the originating address).
-Query strings and fragments are dropped (the parser rejects
-both — `internal/proxy/url.go:46-51, 77-82`); a request
-whose inner GET path carries a query returns 400 on the
-inner stream as a parser-side `bad_request` outcome.
+The inner request's wire-form request-target is preserved
+verbatim — query strings and fragments are NOT stripped at
+dispatch. The parser (`internal/proxy/url.go:46-51, 77-82`)
+rejects both classes; an inner GET whose path carries a
+query string returns 400 on the inner stream with the
+handler's `bad_request` outcome — identical shape to a
+malformed plain GET. Stripping at dispatch would silently
+alias `/Packages?x=1` to `/Packages` in the cache; the
+single rejection point in the parser is load-bearing.
 
 The synthetic request enters `Handler.ServeHTTP` — Phase 6
 adds no new handler entry point. The CONNECT-side `RequestURI`
 construction is the integration seam.
+
+### 6.2.1 MITM context marker (logger integration)
+
+`Handler.logRequest` (`internal/handler/handler.go:1689`) is
+the single point that emits the per-request `request` log
+line and the per-request metric observations. Phase 5 had
+no concept of MITM, so neither `logRequest` nor any of its
+~20 call sites carry an MITM signal. Phase 6 adds the §10.1
+`mitm` log field; the integration contract is:
+
+1. **Sentinel.** A new package-private context-key
+   `mitmCtxKey` is declared in `internal/handler/handler.go`
+   alongside the existing handler internals. Its concrete
+   type is an unexported empty struct
+   (`type mitmCtxKey struct{}`) so the key cannot collide
+   with any external context value.
+2. **Setter.** The CONNECT handler (`internal/proxy/connect.go`)
+   attaches the marker on the synthetic inner request's
+   context before calling into `Handler.ServeHTTP`:
+   `ctx = context.WithValue(ctx, handler.MITMCtxKey, struct{}{})`.
+   The key is exported as `handler.MITMCtxKey` (or accessed
+   via a tiny exported helper `handler.WithMITMMarker(ctx)`)
+   so the proxy package can attach it without circular import.
+3. **Reader.** `logRequest` calls a new private helper
+   `func isMITMRequest(r *http.Request) bool` that returns
+   `r.Context().Value(mitmCtxKey{}) != nil`. The helper is
+   called once at the top of `logRequest` and the boolean
+   is appended to the slog attrs as `"mitm", b`. The 20+
+   existing call sites do NOT change — `logRequest`'s
+   signature is unchanged, and the marker is read off the
+   request context the same way `r.RemoteAddr` is.
+4. **Plain requests** (no CONNECT origin) carry no marker
+   value, so `isMITMRequest` returns false and the log
+   line emits `"mitm", false`. The default value matches
+   pre-Phase-6 behavior (effectively all-false historically;
+   the field is new in Phase 6 §10.1).
+
+Why a context value rather than a `logRequest` parameter:
+the parameter approach would require touching every call
+site (≥20 lines per the grep at `handler.go`), expanding
+the Phase 6 surface area into the §6.1 / §6.4 / §6.5
+handler-internal paths Phase 6 otherwise does NOT modify.
+A context marker localizes the change to one read site
+(`logRequest`) and one write site (`internal/proxy/connect.go`).
+
+This contract is implementation-binding: the §12.2
+integration test asserts that an inner GET dispatched from
+a CONNECT emits a `request` log line with `mitm=true`, and
+a plain proxy GET on the same listener emits the same line
+shape with `mitm=false`. Other handler-internal call paths
+are not allowed to wrap the request in a context that
+strips this value (the existing handler does not — it uses
+`r.Context()` only as a read source for cancellation, never
+re-wraps it).
 
 ### 6.3 Response writing
 
@@ -998,6 +1334,33 @@ healthy clients complete a handshake in single-digit
 milliseconds. The budget protects against a client that
 opens many CONNECTs and never finishes the handshake.
 
+### 9.2.1 Inner-request header read budget
+
+After the TLS handshake completes, the §2.2 step 6 inner
+request must have its full HTTP request line and headers
+delivered within `10s` (counted from `time.Now()` after
+handshake completion, NOT from the original CONNECT
+receipt). Beyond budget, the conn is closed with a
+`mitm_connect` Warn (`outcome=inner_header_timeout`).
+Implementation: `tls.Conn.SetReadDeadline(now + 10s)`
+before the inner request is read; clear or reset the
+deadline once the headers are parsed and dispatch begins.
+
+This budget protects against a client that completes the
+TLS handshake and then slow-loris on the inner request
+(byte-trickle the request line, never deliver the final
+`\r\n\r\n`). 10s is generous for a healthy client whose
+inner request is one line of method/path plus a handful of
+short headers, but tight enough to prevent a hostile
+client from indefinitely tying up a hijacked goroutine plus
+TLS state.
+
+The body of the inner request is bounded by the existing
+Phase 1 `upstream.connect_timeout` and friends (§9.3); the
+header budget is the new one Phase 6 introduces because
+Phase 5 had no path that read an HTTP request from a
+hijacked conn.
+
 ### 9.3 Inner request budget
 
 The inner GET inherits the existing
@@ -1017,9 +1380,23 @@ extends to CONNECT tunnels:
    connections (including hijacked CONNECT tunnels) close
    or the shutdown context expires.
 4. CONNECT tunnels in TLS handshake or in mid inner-GET
-   abort when the shutdown context cancels (the inner
-   request's context inherits, so the upstream fetcher
-   sees the cancellation and unwinds).
+   abort when the shutdown context cancels. Two separate
+   propagation paths converge here:
+   - **Inner request's context** (derived from the outer
+     CONNECT) is cancelled by `http.Server.Shutdown`'s
+     standard context propagation — this short-circuits
+     the inner ResponseWriter side and any handler-internal
+     reads of `r.Context()`.
+   - **`h.lifecycleCtx`** (the leader-fetch context;
+     `internal/handler/handler.go:121, 145`) is cancelled
+     synchronously by the daemon's Shutdown step — this is
+     what propagates to in-flight upstream fetches in
+     `serveCacheMiss` (handler.go:849-857).
+   The two-path design preserves the Phase 1 invariant that
+   client disconnect does NOT kill a leader fetch (the
+   request ctx cancels but lifecycleCtx does not) AND that
+   Shutdown DOES kill leader fetches (lifecycleCtx cancels
+   independently).
 5. Refresher goroutine + GC + cache.Close — same as Phase 5.
 
 **No new shutdown ordering** — Phase 6 reuses the existing
@@ -1061,8 +1438,11 @@ proxy bind**:
 
 The Phase 1 `request` log line carries an additional field
 `mitm` (bool, `false` for plain requests, `true` for
-inner-GETs dispatched from a CONNECT tunnel). All other
-fields unchanged.
+inner-GETs dispatched from a CONNECT tunnel). The signal
+source is the §6.2.1 context-marker contract — `logRequest`
+reads `r.Context().Value(mitmCtxKey{})` once and appends the
+boolean to the slog attrs. No `logRequest` call site is
+modified. All other fields unchanged.
 
 ### 10.2 New `mitm_*` event family
 
@@ -1070,15 +1450,23 @@ Emitted from the §9 CONNECT handler:
 
 - **`mitm_connect`** — once per CONNECT, at conn close.
   Fields: `host` (literal CONNECT host, lower-cased +
-  IDNA-normalized), `port`, `client_addr`, `outcome`
-  (`tunneled` / `denied_host` / `bad_port` /
-  `ip_literal_host` / `tls_handshake_timeout` / `tls_failed`
-  / `cert_gen_failed` / `inner_method_rejected`),
+  IDNA-normalized when parsing reached that step;
+  otherwise the raw bytes from the request line truncated
+  to a sane length), `port` (numeric when parsing reached
+  the port step; otherwise `0`), `client_addr`, `outcome`
+  (`tunneled` / `denied_host` / `bad_target` /
+  `bad_host` / `bad_port` / `ip_literal_host` /
+  `tls_handshake_timeout` / `tls_failed` /
+  `cert_gen_failed` / `inner_method_rejected` /
+  `inner_header_timeout`),
   `denied_gate` (`signing` / `fetch`; empty when
   `outcome != denied_host`; identifies which §5.1.2 gate
   rejected the host), `canonical_host` (post-Remap form,
   empty when outcome=`denied_host` and `denied_gate=signing`
-  since canonicalization runs after the signing-gate check),
+  since canonicalization runs after the signing-gate check;
+  also empty when the request never reached canonicalization,
+  e.g. `bad_target` / `bad_host` / `bad_port` /
+  `ip_literal_host`),
   `duration_ms`, `cert_cache` (`hit` / `miss` — empty when
   the cert path was not reached). Emitted at level Info on
   `tunneled`; Warn on every other outcome.
@@ -1126,8 +1514,10 @@ Emitted from the §9 CONNECT handler:
   Followed immediately by a `mitm_ca_generation_failed`
   Error so the operator sees both the cause and the effect.
   Caused by a concurrent `ca print` or daemon instance
-  racing on the same storage dir. Recovery: identify and
-  stop the racing process, then retry.
+  racing on the same storage dir. Recovery: identify the
+  holding process via `lsof <path>` or `fuser <path>`,
+  stop that process (graceful preferred), then retry. Do
+  NOT `rm` the lockfile — see §4.2.2 for why.
 
 - **`mitm_ca_name_constraints_skipped`** — at startup, when
   the regex-to-NameConstraints translation cannot safely
@@ -1200,28 +1590,32 @@ that top-level keys are stable.
 | # | Failure | Behavior |
 |---|---------|----------|
 | F1 | `tls_mitm.enabled = true` but operator-supplied CA file unreadable at startup | Startup fails with config-error log; daemon does not bind |
-| F2 | Auto-generated CA directory in any non-clean state (any of: `ca.ready` missing while other ca-managed files present; `ca.ready`'s fingerprint disagrees with `sha256(ca.crt)`; either `ca.crt` or `ca.key` fails to parse; cert/key pair mismatch) | Startup logs `mitm_ca_load_failed` Error naming the offending state; daemon does not bind. Operator recovers by removing the entire `<ca_storage_dir>` (or just the daemon-managed files within it) to force regeneration on next start. Silent regeneration would change the trust anchor under every client; trust-root replacement is operator-explicit (§4.2 case 3) |
+| F2 | Auto-generated CA directory in any non-clean state (any of: `ca.ready` missing while either `ca.crt` or `ca.key` is present; `ca.ready` present without `ca.crt`/`ca.key`; `ca.ready`'s fingerprint disagrees with `sha256(ca.crt)`; either `ca.crt` or `ca.key` fails to parse; cert/key pair mismatch). NOTE: a `*.tmp`-only state (no real files committed) is NOT case 3; it is case 1 with tmp cleanup under the §4.2.2 lock. | Startup logs `mitm_ca_load_failed` Error naming the offending state; daemon does not bind. Operator recovers by removing the daemon-managed real files (`ca.crt`, `ca.key`, `ca.ready`) within `<ca_storage_dir>` (or the entire dir) to force case 1 regeneration on next start. Silent regeneration would change the trust anchor under every client; trust-root replacement is operator-explicit (§4.2 case 3) |
 | F3 | `cache_dir/ca/` cannot be created (perms, disk full) OR §4.2.1 mid-write failure | Startup fails with `mitm_ca_generation_failed` Error; daemon does not bind. The §4.2.1 marker-file scheme guarantees that mid-write crashes leave the directory in §4.2 case 3 (uninitialized) — `ca.ready` is the commit primitive and is written last; absence of `ca.ready` means the trust anchor is NOT yet adopted regardless of which `*.tmp` or `ca.{crt,key}` files happen to be on disk |
 | F4 | CA cert / key mismatch (operator-supplied) | Startup fails with config-error log naming the mismatch. The match check is `x509.Certificate.PublicKey == PrivateKey.Public()` |
 | F5 | Operator-supplied CA cert `not_after` already in the past, OR not in the future at all | Startup fails with config-error log naming the expiry timestamp |
 | F6 | Operator-supplied CA cert lacks `BasicConstraints: CA:TRUE` | Startup fails with config-error log |
+| F6a | Operator-supplied CA key type is not in §5.1.3's accepted set (ECDSA P-256/P-384, RSA 2048/3072/4096) | Startup fails with config-error log naming the rejected algorithm; daemon does not bind |
 | F7 | Leaf cert generation fails (entropy exhaustion, key gen panics, etc.) | CONNECT closes with `mitm_connect` Warn (`outcome=cert_gen_failed`); the singleflight returns the error to all blocked waiters; the next CONNECT on the same host retries (the singleflight does NOT cache failures) |
 | F8 | Cert cache full + new host requested | LRU eviction; `mitm_cert_cache_evicted` Info on the evicted entry; new cert inserted; `acu_mitm_cert_evicted_total{reason="lru"}` increments |
 | F9 | TLS handshake on hijacked conn fails (client distrusts CA, TLS-version mismatch, cipher mismatch) | Tunnel closes with `mitm_connect` Warn (`outcome=tls_failed`); apt logs a TLS verification error; `tls_mitm_enabled_ca_undistributed` Warn fires from the refresher when this is the steady state |
 | F10 | TLS handshake exceeds the §9.2 budget | Conn closed with `mitm_connect` Warn (`outcome=tls_handshake_timeout`) |
 | F11 | Inner request method is not GET/HEAD | 405 written on the inner stream with `Allow: GET, HEAD`; tunnel closes; `mitm_connect` Warn (`outcome=inner_method_rejected`) |
+| F11a | Inner request headers not fully received within §9.2.1's 10s budget after TLS handshake (slowloris on the inner request) | Conn closed; `mitm_connect` Warn (`outcome=inner_header_timeout`). No 408 / 4xx is written on the inner stream — partial-header state means there is no committed protocol context to write into |
 | F12 | CONNECT to a port other than 443 | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=bad_port`) |
 | F13 | CONNECT to an IP-literal host (IPv4 or IPv6) | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=ip_literal_host`) |
+| F13a | CONNECT request-target structurally malformed (missing port, empty host, non-numeric port, port out of range, multi-colon, unbracketed IPv6, etc. — see §2.2 step 1 enumeration) | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=bad_target`) |
+| F13b | CONNECT host fails IDNA normalization or contains invalid DNS labels | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=bad_host`) |
 | F14 | CONNECT host fails the §5.1.2 effective allowlist (literal host fails signing predicate, OR canonical host fails fetch predicate) | 403 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=denied_host`, `denied_gate=signing` or `fetch`). No cert is issued, no TLS handshake |
 | F15 | Inner GET upstream fetch fails the SSRF deny-range gate at TCP-connect time | The inner GET response is whatever the existing Phase 1 fetcher returns (typically 502 with `outcome=upstream_denied` on the request log line); tunnel closes after inner response. The CONNECT itself succeeded (as designed; §1.1.3) |
-| F16 | Daemon shuts down during an in-flight CONNECT tunnel | The §9.4 sync.WaitGroup primitive holds Shutdown until the tunnel closes; on shutdown-context expiry, the conn is closed forcibly and the inner request's upstream fetch is cancelled |
+| F16 | Daemon shuts down during an in-flight CONNECT tunnel | The §9.4 sync.WaitGroup primitive holds Shutdown until the tunnel closes or the shutdown context expires. Cancellation propagates via two paths: the inner request's context (via standard `http.Server.Shutdown`) and `h.lifecycleCtx` (which cancels in-flight leader fetches in `serveCacheMiss`). On shutdown-context expiry, the conn is closed forcibly. Note: a CLIENT close mid-response cancels only the inner request's context — the leader fetch survives until lifecycleCtx cancels (Phase 1 invariant; see §12.3 chaos test) |
 | F17 | Clock skew: leaf cert `not_before` is in the future | Apt rejects with a `not yet valid` TLS error; cache's clock is the source of truth — operators should run NTP. No Phase 6 mitigation beyond logging on the cache side |
 | F18 | CA expires mid-lifetime | All client TLS handshakes fail; `mitm_connect` Warn `outcome=tls_failed` rate spikes; operator's `acu_mitm_ca_not_after_unixtime` alert (set to fire 30 days before expiry) catches this before the spike |
 | F19 | CA private key file ownership / mode wrong on disk (e.g. world-readable) | Phase 6 does NOT enforce mode/ownership at startup beyond the §4.2.1 atomic-write guarantees on the auto-generated path. Operator-supplied CA paths are read with whatever mode the operator chose; `apt-cacher-ultra ca print` is the audit primitive (it warns on `S_IROTH` set on `ca.key`). A future phase can add mandatory mode enforcement if any deployment asks |
 | F20 | Leaf cert algorithm config invalid at startup | Startup fails with config-error log naming the rejected value |
 | F21 | Upstream HTTPS server presents an invalid cert (chain failure, expired, hostname mismatch) | Inner GET fetch fails with the existing Phase 1 fetcher behavior — `outcome=bad_gateway` on the inner request log line; the cache does NOT relax verification (§5.4) |
 | F22 | Upstream sends a redirect from `https://` to `http://` (or any other 3xx) | Inner GET fails with `outcome=bad_gateway` (handler.go:1547-1556 maps `fetch.ErrRedirectBlocked` → 502). The upstream's 3xx status code is preserved on the request log line as `upstream_status`. The cache does NOT silently follow the redirect or downgrade the inner request to HTTP; apt sees a 502 from the cache rather than the 3xx from upstream. Operators whose archive uses redirects configure a Remap rule pointing at the redirect target |
-| F23 | §4.2.2 interprocess lock contention exceeds 30s | Startup logs `mitm_ca_lock_timeout` Error and `mitm_ca_generation_failed` Error; daemon does not bind. `apt-cacher-ultra ca print` exits with code 4. Caused by a concurrent `ca print` or another daemon instance racing on the same `<ca_storage_dir>`. Operator inspects the lockfile owner and clears stale state |
+| F23 | §4.2.2 interprocess lock contention exceeds 30s | Startup logs `mitm_ca_lock_timeout` Error and `mitm_ca_generation_failed` Error; daemon does not bind. `apt-cacher-ultra ca print` exits with code 4. Caused by a concurrent `ca print` or another daemon instance racing on the same `<ca_storage_dir>`. Recovery: identify the holding process (`lsof <ca_storage_dir>/.ca.lock` or `fuser`), stop it, retry. **Do NOT delete the lockfile** — flock is FD-tied, removing the file does not release the lock and can cause split-lock if a new process opens a fresh inode at the same path. See §4.2.2 |
 
 ---
 
@@ -1286,9 +1680,14 @@ In `internal/proxy/tlsmitm/`:
   upstream-empty / upstream-set, mitm-empty / mitm-set
   produces the documented conjunction (§5.1.2).
 - Operator-supplied CA validation: cert-key mismatch (F4),
-  past not_after (F5), missing CA:TRUE (F6), unreadable
-  file (F1) each fail at config validation with the right
-  error.
+  past not_after (F5), missing CA:TRUE (F6), unsupported
+  key type (Ed25519, ECDSA P-521, RSA-1024) (F6a),
+  unreadable file (F1) each fail at config validation with
+  the right error. Accepting branches: ECDSA P-256, ECDSA
+  P-384, RSA-2048, RSA-3072, RSA-4096 each load and the
+  daemon's signing algorithm matches the §5.1.3 mapping
+  (`ECDSAWithSHA256` for P-256, `ECDSAWithSHA384` for P-384,
+  `SHA256WithRSA` for any RSA size).
 - Leaf algorithm config: `"ecdsa-p256"` and `"rsa2048"`
   accepted; everything else rejected (F20).
 
@@ -1296,6 +1695,21 @@ In `internal/proxy/`:
 
 - CONNECT handler: bad port → 400 (F12).
 - CONNECT handler: IP-literal host → 400 (F13).
+- CONNECT handler: bad target — table-driven test
+  enumerating empty target, missing port, empty host
+  (`:443`), empty port (`host:`), non-numeric port,
+  port out of range, multi-colon (`host:443:extra`),
+  unbracketed IPv6 (`::1:443`); each produces 400 with
+  `outcome=bad_target` (F13a).
+- CONNECT handler: bad host — IDNA `Lookup.ToASCII`
+  failure (oversized label, oversized total name,
+  invalid Unicode), invalid DNS label (illegal
+  characters after IDNA, leading/trailing hyphen);
+  each produces 400 with `outcome=bad_host` (F13b).
+- CONNECT handler: trailing-dot canonicalization —
+  CONNECT to `apt.example.com.:443` and
+  `apt.example.com:443` produce a single cert cache
+  entry under the un-dotted form.
 - CONNECT handler: denied host → 403 with
   `denied_gate=signing` when literal host fails the
   signing predicate; with `denied_gate=fetch` when literal
@@ -1306,6 +1720,10 @@ In `internal/proxy/`:
 - CONNECT handler: HEAD inner request → reaches the inner
   pipeline (HEAD is allowed, matching SPEC §2.6).
 - CONNECT handler: TLS handshake timeout (F10).
+- CONNECT handler: inner-request header slowloris —
+  client completes handshake then trickles the inner
+  request bytes; the §9.2.1 deadline fires and the conn
+  closes with `outcome=inner_header_timeout` (F11a).
 - CONNECT handler: hijack-conn lifecycle (sync.WaitGroup
   increments on hijack, decrements on close).
 
@@ -1381,11 +1799,28 @@ Under `e2e/`:
   hostnames concurrent CONNECT, cache size 256. Verify
   256 evictions land, 1000 certs issued total, no panic
   in the LRU primitive (F8 end-to-end).
-- **Inner GET cancelled mid-stream.** Client closes the
-  TLS tunnel mid-response. Verify the upstream fetch
-  context cancels, the cache write finalizes (or rolls
-  back per the SPEC2 atomic-finalize contract), no orphan
-  blob in `pool/`.
+- **Inner GET cancelled mid-stream — leader fetch survives.**
+  Client closes the TLS tunnel mid-response while a leader
+  cache-miss fetch is in progress. Verify the existing
+  Phase 1 leader-fetch-survives invariant
+  (`internal/handler/handler.go:849-857` —
+  `h.serveCacheMiss` runs under `h.lifecycleCtx`, NOT
+  `r.Context()`): the upstream fetch continues, the cache
+  blob finalizes, and a SECOND CONNECT to the same host
+  immediately hits the now-populated cache. The cancelled
+  request's ResponseWriter side detects the client close
+  (Go's `http.Server` already propagates this through
+  `r.Context()`), but the leader fetch is unaffected. No
+  orphan blob in `pool/`. Asserts that Phase 6 does NOT
+  introduce a new "cancel upstream on client close"
+  semantic — the synthetic request's context governs only
+  the inner ResponseWriter side.
+
+  Separately verify: a graceful-shutdown SIGTERM during
+  the same in-flight fetch DOES cancel the leader (because
+  `h.lifecycleCtx` cancels at Shutdown), and the cache
+  rolls back per the SPEC2 atomic-finalize contract — no
+  orphan blob.
 - **CA file deleted out from under a running daemon.**
   Running daemon's CA stays in memory; cert cache stays
   valid; new CONNECTs continue to issue leafs against the
@@ -1399,18 +1834,31 @@ Under `e2e/`:
   log line, so the trust-anchor change is loud and
   observable to monitoring (F2 end-to-end).
 - **CA generation crash mid-write.** Kill -9 the daemon
-  at each numbered step of §4.2.1. Restart and verify the
-  §4.2 case-2 "load and use" branch fires only when
-  `ca.ready` is committed AND its fingerprint matches
-  `sha256(ca.crt)` AND both files parse AND cert/key match.
-  Every other on-disk state (`*.tmp` only; `ca.crt` only;
-  `ca.crt + ca.key` without `ca.ready`; `ca.ready` without
-  one of the others; mismatching fingerprint) must produce
-  `mitm_ca_load_failed` Error and the daemon must NOT bind.
-  NEVER silent regeneration of a new trust anchor under a
-  fleet that already trusts an old one — and NEVER silent
-  adoption of `ca.crt + ca.key` whose marker file was not
-  written (the trust anchor is uncommitted in that state).
+  at each numbered step of §4.2.1. Restart and verify:
+  - §4.2 case-2 "load and use" fires only when `ca.ready`
+    is committed AND its fingerprint matches `sha256(ca.crt)`
+    AND both files parse AND cert/key match.
+  - §4.2 case-1 "generate" fires for the no-real-files
+    state — including the `*.tmp`-only sub-state where a
+    prior crash left residue but committed no trust
+    anchor; the residue is cleaned by §4.2.1 step 3 under
+    the lock, then a fresh CA is generated. Verify NO
+    silent adoption of any tmp file as a trust anchor.
+  - §4.2 case-3 `mitm_ca_load_failed` fires for every
+    inconsistent committed state: `ca.crt` only;
+    `ca.crt + ca.key` without `ca.ready`; `ca.ready`
+    only; `ca.ready` with mismatching fingerprint;
+    either real file failing to parse; cert/key
+    mismatch. The daemon must NOT bind; operator must
+    explicitly clear.
+
+  Two invariants must hold across every kill point:
+  1. NEVER silent regeneration of a new trust anchor
+     under a fleet that already trusts an old one.
+  2. NEVER silent adoption of `ca.crt + ca.key` whose
+     marker file was not written — that state is
+     uncommitted and operator-explicit recovery is the
+     only path forward.
   (F3 end-to-end.)
 - **CA expiry mid-runtime.** Set the CA `not_after` to
   60 seconds out, run a CONNECT every 10 seconds, verify
@@ -1433,13 +1881,17 @@ by at least one test in §12.1, §12.2, or §12.3:
 | F4 | 12.1 unit (cert-key mismatch) |
 | F5 | 12.1 unit (past not_after) |
 | F6 | 12.1 unit (missing CA:TRUE) |
+| F6a | 12.1 unit (operator-supplied CA key type validation: rejects Ed25519, ECDSA P-521, RSA-1024, accepts ECDSA P-256/P-384 and RSA 2048/3072/4096; signing alg derived correctly per §5.1.3) |
 | F7 | 12.1 unit (singleflight failure path) |
 | F8 | 12.3 chaos (cert-cache thundering herd) |
 | F9 | 12.2 integration (TLS policy / version mismatch) |
 | F10 | 12.1 unit (CONNECT handler handshake timeout) |
 | F11 | 12.1 unit (CONNECT handler non-GET/HEAD inner) |
+| F11a | 12.1 unit (CONNECT handler inner-header slowloris: completes handshake then trickles the inner request byte-by-byte; 10s after handshake the conn closes with `outcome=inner_header_timeout`) |
 | F12 | 12.1 unit (CONNECT handler bad port) |
 | F13 | 12.1 unit (CONNECT handler IP-literal) |
+| F13a | 12.1 unit (CONNECT handler bad-target table-driven test: missing port, empty host, non-numeric port, port out of range, multi-colon, unbracketed IPv6) |
+| F13b | 12.1 unit (CONNECT handler bad-host: IDNA failure, oversized label, illegal label characters) |
 | F14 | 12.1 unit + 12.2 integration (denied host) |
 | F15 | 12.2 integration (deny-range fires on inner GET) |
 | F16 | 12.2 integration (CONNECT during shutdown) |
@@ -1558,8 +2010,8 @@ Output:
 
 ```
 # Generated by apt-cacher-ultra --print-apt-conf
-Acquire::http::Proxy "http://<configured-listen-host>:<port>";
-Acquire::https::Proxy "http://<configured-listen-host>:<port>";
+Acquire::http::Proxy "http://<advertised-host>:<port>";
+Acquire::https::Proxy "http://<advertised-host>:<port>";
 # When MITM is enabled, the following CA must be installed
 # system-wide (e.g. via update-ca-certificates) for HTTPS
 # repositories in sources.list to validate:
@@ -1567,10 +2019,50 @@ Acquire::https::Proxy "http://<configured-listen-host>:<port>";
 # CA path on the cache host: <path>
 ```
 
-The exact host/port reflect the loaded config. Exit codes:
+**Advertised host resolution.** The host and port emitted
+in the snippet are NOT a verbatim copy of `cache.listen`
+because typical configs bind to `0.0.0.0:3142` or `[::]:3142`
+to accept on every interface, and unspecified addresses are
+not usable as a client-facing target. Resolution order:
+
+1. If `cache.advertise_host` (new Phase 6 config field, see
+   below) is non-empty, use it verbatim. The operator sets
+   this to the DNS name or unicast IP that fleet clients
+   should target — `cache.example.com`,
+   `apt.internal:3142`, etc. May or may not include a
+   port; if no port is included, `cache.listen`'s port is
+   appended.
+2. Otherwise, parse `cache.listen` host:port. If the host
+   is a unicast literal (anything except `0.0.0.0`,
+   `::`, or empty), use it verbatim — operator's `listen`
+   binds to a single addressable interface and the snippet
+   is unambiguous.
+3. Otherwise (`0.0.0.0`, `::`, empty host), the unspecified
+   address is unusable in the snippet. Print a stderr
+   diagnostic naming the listen address and `exit 5`. The
+   operator must either (a) set `cache.advertise_host` in
+   the config, or (b) pin `cache.listen` to a unicast
+   address.
+
+**New config field `cache.advertise_host` (Phase 6).** A
+string under the `[cache]` block, default empty. Affects
+ONLY the `--print-apt-conf` snippet content — it is NOT
+read by the daemon's listener bind path, the request
+handler, or any URL canonicalization. Validation: if
+non-empty, must parse as a host or `host:port` (no scheme,
+no path); reject otherwise at startup with a config-error
+log line. Empty (default): the snippet falls back to the
+`cache.listen` resolution above.
+
+Exit codes:
 
 - `0`: snippet printed.
 - `1`: config file unreadable.
+- `5`: `cache.listen` is bound to an unspecified address
+  (`0.0.0.0` / `::`) and `cache.advertise_host` is unset;
+  the snippet would emit a non-routable target. Operator
+  sets `cache.advertise_host` (or pins `cache.listen` to a
+  unicast address) and retries.
 
 ### 14.3 Subcommand routing
 
