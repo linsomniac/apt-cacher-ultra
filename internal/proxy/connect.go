@@ -352,6 +352,17 @@ type HandlerDeps struct {
 	// inherits r.Context() instead) — only used by tests that don't
 	// exercise shutdown semantics.
 	Manager *TunnelManager
+
+	// ClockSkewNowFn is the wall-clock function used by the
+	// post-leaf §10.2 mitm_clock_skew check (CheckLeafClockSkew).
+	// nil = time.Now. Tests inject a stub returning a time
+	// earlier than the leaf cert's NotBefore to simulate a
+	// backward system-clock jump and trigger the skew Warn
+	// deterministically. ONLY this check uses it; the handshake
+	// deadline and other time.Now() call sites in ServeCONNECT
+	// are unaffected so the test does not also need to suppress
+	// timeouts.
+	ClockSkewNowFn func() time.Time
 }
 
 // ConnectHandler holds the SPEC6 §2.2 CONNECT pipeline. Construct
@@ -390,6 +401,9 @@ func NewConnectHandler(deps HandlerDeps) (*ConnectHandler, error) {
 	}
 	if deps.LogFn == nil {
 		deps.LogFn = func(level, event string, fields map[string]any) {}
+	}
+	if deps.ClockSkewNowFn == nil {
+		deps.ClockSkewNowFn = time.Now
 	}
 	return &ConnectHandler{deps: deps}, nil
 }
@@ -496,7 +510,7 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 	// reused-leaf path is the one apt is most likely to surface
 	// to operators because cached certs live for the configured
 	// leaf lifetime.
-	CheckLeafClockSkew(target.LiteralHost, leaf, time.Now(), h.deps.LogFn)
+	CheckLeafClockSkew(target.LiteralHost, leaf, h.deps.ClockSkewNowFn(), h.deps.LogFn)
 
 	// Step 5: TLS handshake on the hijacked conn.
 	//

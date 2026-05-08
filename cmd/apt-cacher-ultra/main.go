@@ -85,6 +85,17 @@ var (
 	// without sleeping.
 	caLockTimeoutForTest time.Duration = 0
 
+	// clockSkewNowForTest, when non-nil, overrides the wall-clock
+	// function used by the §10.2 mitm_clock_skew check in
+	// ServeCONNECT (proxy.HandlerDeps.ClockSkewNowFn). Production
+	// leaves it nil so the handler defaults to time.Now; tests
+	// inject a stub returning a time earlier than the leaf cert's
+	// NotBefore to deterministically trigger the Warn emit. Only
+	// the clock-skew check is affected — handshake deadlines and
+	// other time.Now() call sites continue to read the real wall
+	// clock.
+	clockSkewNowForTest func() time.Time = nil
+
 	// tmpSweepMaxAge is the SPEC §4.2 staleness threshold for orphaned
 	// partial downloads from previous crashes.
 	tmpSweepMaxAge = 5 * time.Minute
@@ -1101,15 +1112,16 @@ func wireTlsMitm(ctx context.Context, cfg *config.Config, parser *proxy.Parser, 
 	// drain by the shutdown deadline and force-close stalled conns.
 	tunnelMgr := proxy.NewTunnelManager(ctx)
 	connectHandler, err := proxy.NewConnectHandler(proxy.HandlerDeps{
-		CA:           ca,
-		LeafCache:    leafCache,
-		SigningGate:  signingGate,
-		FetchGate:    fetchClient.HostAllowed,
-		Canonicalize: parser.CanonicalHost,
-		Dispatch:     h.ServeHTTP,
-		TLSConfig:    tlsTemplate,
-		Stats:        stats,
-		Manager:      tunnelMgr,
+		CA:             ca,
+		LeafCache:      leafCache,
+		SigningGate:    signingGate,
+		FetchGate:      fetchClient.HostAllowed,
+		Canonicalize:   parser.CanonicalHost,
+		Dispatch:       h.ServeHTTP,
+		TLSConfig:      tlsTemplate,
+		Stats:          stats,
+		Manager:        tunnelMgr,
+		ClockSkewNowFn: clockSkewNowForTest,
 		LogFn: func(level, event string, fields map[string]any) {
 			emitTlsMitmLog(logger, level, event, fields)
 		},
