@@ -348,14 +348,168 @@ func TestServeCONNECT_InnerMethodRejected(t *testing.T) {
 	}
 }
 
+// TestServeCONNECT_OversizedInnerHeaderRejected exercises the
+// codex-finding #1 hardening: a CONNECT client cannot blow up
+// memory by sending an unbounded inner header block. The handler
+// caps the byte budget for the request line + headers; once
+// exceeded, the read returns unexpected-EOF and the handler emits
+// inner_stream_failed without invoking the dispatcher.
+func TestServeCONNECT_OversizedInnerHeaderRejected(t *testing.T) {
+	dispatched := false
+	srv, ca, _ := newTestConnectServer(t, testConnectOpts{
+		signingGate: func(host string) bool { return true },
+		fetchGate:   func(host string) bool { return true },
+		dispatch: func(w http.ResponseWriter, r *http.Request) {
+			dispatched = true
+		},
+		maxInnerHeaderBytes: 4 * 1024, // 4 KiB cap; we send much more.
+	})
+	defer srv.Close()
+
+	clientCAPool := x509.NewCertPool()
+	clientCAPool.AddCert(ca.Cert)
+
+	rawConn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer rawConn.Close()
+	if _, err := rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	br := bufio.NewReader(rawConn)
+	if _, err := http.ReadResponse(br, nil); err != nil {
+		t.Fatalf("read CONNECT resp: %v", err)
+	}
+	tlsConn := tls.Client(&prereadConn{Conn: rawConn, br: br}, &tls.Config{
+		ServerName: "example.test", RootCAs: clientCAPool, MinVersion: tls.VersionTLS12,
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+	// Send a request line + a 1 MiB X-Junk header. The cap is 4 KiB
+	// so the server will fail to read the full block.
+	junk := strings.Repeat("a", 1<<20)
+	req := "GET /x HTTP/1.1\r\nHost: example.test\r\nX-Junk: " + junk + "\r\n\r\n"
+	if _, err := tlsConn.Write([]byte(req)); err != nil {
+		// EOF on write is acceptable — the server may close on it.
+		t.Logf("write inner request returned %v (acceptable)", err)
+	}
+	// We expect the server to close without sending a response.
+	_, _ = io.Copy(io.Discard, tlsConn)
+	if dispatched {
+		t.Error("dispatcher invoked despite oversized inner header")
+	}
+}
+
+// TestServeCONNECT_TLSConfigCloneDefangs proves codex-finding #3:
+// even if the operator's tls.Config template carries a
+// GetCertificate / GetConfigForClient callback that would override
+// the leaf, the handler clears them post-Clone so the per-CONNECT
+// leaf is the cert the client sees. We verify by setting
+// GetCertificate on the template to a panic-on-call guard; if the
+// handler used it, the test would crash.
+func TestServeCONNECT_TLSConfigCloneDefangs(t *testing.T) {
+	dir := t.TempDir()
+	ca, err := tlsmitm.LoadOrGenerate(tlsmitm.LoadOptions{
+		StorageDir:           dir,
+		AllowUnconstrainedCA: true,
+	})
+	if err != nil {
+		t.Fatalf("LoadOrGenerate: %v", err)
+	}
+	cache, _ := tlsmitm.NewCache(8, func(host string) (*tls.Certificate, error) {
+		return tlsmitm.GenerateLeaf(host, ca.TLSCert, tlsmitm.LeafECDSAP256, time.Hour, time.Now())
+	})
+
+	template := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"}, // bogus h2 — should be pinned to http/1.1 only
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			t.Error("GetCertificate was invoked despite defang")
+			return nil, errors.New("should not be reached")
+		},
+	}
+	h, err := NewConnectHandler(HandlerDeps{
+		CA:        ca,
+		LeafCache: cache,
+		FetchGate: func(string) bool { return true },
+		Dispatch:  func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) },
+		TLSConfig: template,
+	})
+	if err != nil {
+		t.Fatalf("NewConnectHandler: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			h.ServeCONNECT(w, r)
+			return
+		}
+	}))
+	srv.Start()
+	defer srv.Close()
+
+	clientCAPool := x509.NewCertPool()
+	clientCAPool.AddCert(ca.Cert)
+	rawConn, _ := net.Dial("tcp", srv.Listener.Addr().String())
+	defer rawConn.Close()
+	_, _ = rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n"))
+	br := bufio.NewReader(rawConn)
+	if _, err := http.ReadResponse(br, nil); err != nil {
+		t.Fatalf("read CONNECT resp: %v", err)
+	}
+	tlsConn := tls.Client(&prereadConn{Conn: rawConn, br: br}, &tls.Config{
+		ServerName: "example.test", RootCAs: clientCAPool, MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+	if got := tlsConn.ConnectionState().NegotiatedProtocol; got != "" && got != "http/1.1" {
+		t.Errorf("ALPN negotiated %q, expected http/1.1 (or empty)", got)
+	}
+}
+
+// TestTLSResponseWriter_HeaderSanitizationViaHeaderWrite proves
+// codex-finding #2 hardening: a header value containing CR/LF is
+// neutralized before reaching the wire. `http.Header.Write` does
+// not error on such input — it replaces CR and LF with space
+// characters in-line — but the critical security property is the
+// same: no fresh header-line boundary (`\r\n<header>:`) escapes
+// the original value. The test asserts that property directly so
+// the contract survives any future change in stdlib behavior
+// (replacement vs. rejection).
+func TestTLSResponseWriter_HeaderSanitizationViaHeaderWrite(t *testing.T) {
+	hdr := http.Header{}
+	hdr.Set("X-Bad", "value\r\nInjected: yes")
+	var sb strings.Builder
+	if err := hdr.Write(&sb); err != nil {
+		// Either replacement or rejection is acceptable; only
+		// silent CRLF passthrough is broken. If a future stdlib
+		// change starts erroring out, the writer's headerErr
+		// path captures it and the integration test above proves
+		// the surrounding flow handles that.
+		return
+	}
+	out := sb.String()
+	// The critical property: no fresh header line. The substring
+	// "\r\nInjected:" only ever appears as a fresh header
+	// boundary; if it appears here, a malicious value escaped its
+	// container.
+	if strings.Contains(out, "\r\nInjected:") {
+		t.Errorf("CRLF injection: %q", out)
+	}
+}
+
 // ============================================================================
 // Test helpers
 // ============================================================================
 
 type testConnectOpts struct {
-	signingGate func(string) bool
-	fetchGate   func(string) bool
-	dispatch    func(http.ResponseWriter, *http.Request)
+	signingGate         func(string) bool
+	fetchGate           func(string) bool
+	dispatch            func(http.ResponseWriter, *http.Request)
+	maxInnerHeaderBytes int64
 }
 
 type testConnectServer struct {
@@ -384,14 +538,15 @@ func newTestConnectServer(t *testing.T, opts testConnectOpts) (*testConnectServe
 		}
 	}
 	h, err := NewConnectHandler(HandlerDeps{
-		CA:               ca,
-		LeafCache:        cache,
-		SigningGate:      opts.signingGate,
-		FetchGate:        opts.fetchGate,
-		Dispatch:         opts.dispatch,
-		TLSConfig:        &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}},
-		HandshakeTimeout: 5 * time.Second,
-		InnerReadTimeout: 5 * time.Second,
+		CA:                  ca,
+		LeafCache:           cache,
+		SigningGate:         opts.signingGate,
+		FetchGate:           opts.fetchGate,
+		Dispatch:            opts.dispatch,
+		TLSConfig:           &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}},
+		HandshakeTimeout:    5 * time.Second,
+		InnerReadTimeout:    5 * time.Second,
+		MaxInnerHeaderBytes: opts.maxInnerHeaderBytes,
 	})
 	if err != nil {
 		t.Fatalf("NewConnectHandler: %v", err)

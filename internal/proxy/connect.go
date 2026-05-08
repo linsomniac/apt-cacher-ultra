@@ -32,6 +32,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -315,6 +316,17 @@ type HandlerDeps struct {
 	// Default 30s if zero.
 	InnerReadTimeout time.Duration
 
+	// MaxInnerHeaderBytes caps the byte budget for the inner
+	// request line + headers. Default 1 MiB if zero — matching
+	// `net/http`'s `DefaultMaxHeaderBytes`. The TLS-protected
+	// stream is wrapped in an `io.LimitReader` of this size before
+	// `http.ReadRequest`, so a malicious-but-allowed CONNECT client
+	// cannot drive memory growth by sending an unbounded header
+	// block. If the cap is exceeded, ReadRequest fails with
+	// `unexpected EOF` and the handler emits
+	// `outcome=inner_stream_failed`.
+	MaxInnerHeaderBytes int64
+
 	// LogFn is the structured-event sink for §10.1 mitm_connect
 	// log lines. nil = swallow.
 	LogFn func(level, event string, fields map[string]any)
@@ -350,6 +362,9 @@ func NewConnectHandler(deps HandlerDeps) (*ConnectHandler, error) {
 	}
 	if deps.InnerReadTimeout == 0 {
 		deps.InnerReadTimeout = 30 * time.Second
+	}
+	if deps.MaxInnerHeaderBytes == 0 {
+		deps.MaxInnerHeaderBytes = 1 << 20 // 1 MiB, matches net/http default
 	}
 	if deps.LogFn == nil {
 		deps.LogFn = func(level, event string, fields map[string]any) {}
@@ -427,8 +442,20 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 5: TLS handshake on the hijacked conn.
+	//
+	// Clone the operator template, then DEFANG it: explicitly clear
+	// any cert-selection callbacks that could otherwise override the
+	// per-CONNECT leaf cert this package owns. The "leaf cert is
+	// chosen by ParseConnectTarget+LeafCache" invariant must not be
+	// silently subverted by a future caller wiring up
+	// `GetCertificate` on the template (e.g. for SNI-based fallback).
+	// NextProtos is pinned to HTTP/1.1 per §5.4 — Phase 6 does not
+	// implement HTTP/2 inside the tunnel.
 	tlsCfg := h.deps.TLSConfig.Clone()
 	tlsCfg.Certificates = []tls.Certificate{*leaf}
+	tlsCfg.GetCertificate = nil
+	tlsCfg.GetConfigForClient = nil
+	tlsCfg.NextProtos = []string{"http/1.1"}
 	tlsConn := tls.Server(&hijackedConn{Conn: conn, br: brw.Reader}, tlsCfg)
 	if err := conn.SetDeadline(time.Now().Add(h.deps.HandshakeTimeout)); err != nil {
 		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "set deadline: "+err.Error(), "")
@@ -445,11 +472,21 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 	defer tlsConn.Close()
 
 	// Step 6: read exactly one inner request.
+	//
+	// Cap the bytes ReadRequest may consume for the request line +
+	// headers. http.ReadRequest by itself has no header-byte limit
+	// (the HTTP server's MaxHeaderBytes is enforced by the server's
+	// internal request reader, NOT by ReadRequest), so an authenticated
+	// CONNECT client could otherwise drive arbitrary memory growth
+	// by sending a huge header block. The cap is enforced via
+	// io.LimitReader; when the limit is reached mid-header,
+	// ReadRequest sees an unexpected EOF and we report
+	// inner_stream_failed.
 	if err := conn.SetDeadline(time.Now().Add(h.deps.InnerReadTimeout)); err != nil {
 		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "set inner deadline: "+err.Error(), "")
 		return
 	}
-	innerBR := bufio.NewReader(tlsConn)
+	innerBR := bufio.NewReader(io.LimitReader(tlsConn, h.deps.MaxInnerHeaderBytes))
 	innerReq, err := http.ReadRequest(innerBR)
 	if err != nil {
 		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "read inner: "+err.Error(), "")
@@ -583,6 +620,7 @@ type tlsResponseWriter struct {
 	hdr         http.Header
 	wroteHeader bool
 	status      int
+	headerErr   error // sticky; surfaced on the first Write after a failed header flush
 }
 
 func newTLSResponseWriter(c *tls.Conn) *tlsResponseWriter {
@@ -591,26 +629,46 @@ func newTLSResponseWriter(c *tls.Conn) *tlsResponseWriter {
 
 func (w *tlsResponseWriter) Header() http.Header { return w.hdr }
 
+// WriteHeader flushes status + headers to the encrypted stream.
+//
+// Header field serialization goes through `http.Header.Write`,
+// which validates field names and rejects values containing CR/LF
+// — this closes a header-injection / response-splitting hole that
+// a manual `fmt.Fprintf` loop would leave open. The status line is
+// formatted by `fmt.Fprintf` against a hard-coded `HTTP/1.1` token
+// and `http.StatusText`, both of which are not attacker-influenced.
+//
+// Any I/O error encountered during the header flush is captured on
+// `headerErr` so the very next call to `Write` returns it (mirrors
+// `net/http`'s own ResponseWriter contract — a header-write failure
+// must not be silently dropped only to surface as a body-write
+// success).
 func (w *tlsResponseWriter) WriteHeader(status int) {
 	if w.wroteHeader {
 		return
 	}
 	w.wroteHeader = true
 	w.status = status
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "HTTP/1.1 %d %s\r\n", status, http.StatusText(status))
-	for k, vs := range w.hdr {
-		for _, v := range vs {
-			fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
-		}
+	if _, err := fmt.Fprintf(w.conn, "HTTP/1.1 %d %s\r\n", status, http.StatusText(status)); err != nil {
+		w.headerErr = err
+		return
 	}
-	sb.WriteString("\r\n")
-	_, _ = w.conn.Write([]byte(sb.String()))
+	if err := w.hdr.Write(w.conn); err != nil {
+		w.headerErr = err
+		return
+	}
+	if _, err := w.conn.Write([]byte("\r\n")); err != nil {
+		w.headerErr = err
+		return
+	}
 }
 
 func (w *tlsResponseWriter) Write(p []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
+	}
+	if w.headerErr != nil {
+		return 0, w.headerErr
 	}
 	return w.conn.Write(p)
 }
