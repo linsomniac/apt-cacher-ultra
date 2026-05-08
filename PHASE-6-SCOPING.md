@@ -169,12 +169,15 @@ resolution is normative for SPEC6.
 - **Hot-reload (Q7).** **Fixed at startup.** A flip of
   `tls_mitm.enabled` requires a daemon restart. Hot-reload defers
   to a future phase if any deployment asks for it.
-- **Inner-request shape (Q8).** **GET only.** A CONNECT tunnel
-  that sends anything other than a single GET (POST, PUT, nested
-  CONNECT, multi-request keepalive within the tunnel) returns 405
-  on that inner request and closes the tunnel. apt does not need
-  more inside HTTPS; SPEC §2.6 is GET+HEAD-only on the proxy
-  listener regardless.
+- **Inner-request shape (Q8).** **GET and HEAD only**, matching
+  the SPEC §2.6 method allowlist on the proxy listener. A
+  CONNECT tunnel that sends anything else (POST, PUT, nested
+  CONNECT, multi-request keepalive within the tunnel) returns
+  405 with `Allow: GET, HEAD` on the inner request and closes
+  the tunnel. (Revision 1 mistakenly proposed "GET only" — apt
+  does emit HEAD on the proxy listener and SPEC6 §2.2 step 6
+  inherits the GET+HEAD method shape from SPEC §2.6 for
+  consistency. SPEC6 review pass corrected this drift.)
 - **Inner-GET observability (Q9).** **Inner GET produces the
   existing `request` log line with a new field `mitm=true`;
   the outer CONNECT produces a separate `mitm_connect` line.**

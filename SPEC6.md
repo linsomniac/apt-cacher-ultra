@@ -27,14 +27,25 @@ SSRF gates (§5), the host concurrency limiter (Phase 1
 **Trust-anchor expansion note.** Enabling Phase 6 distributes the
 cache's CA cert to every client machine. Clients that trust the
 CA will accept any leaf cert the cache issues — making the cache
-a load-bearing trust anchor for the fleet. The CA is constrained
-by `tls_mitm.allowed_host_regex` (or its `upstream.*` parent) at
-signing time; the auto-generated CA also carries RFC 5280 Name
-Constraints (§5.1.2) limiting validity to the same hostname set.
-A compromise of the CA key cannot issue certs for hostnames
-outside the regex. Operators in adversarial multi-tenant
-environments should narrow the regex to a literal upstream list
-before enabling. See §11 for the failure-mode catalog.
+a load-bearing trust anchor for the fleet. The cache enforces
+the §5.1.2 effective allowlist at signing time, so a cache
+running in steady state never issues certs for hostnames outside
+the regex. **Key compromise is a separate concern**: a stolen CA
+private key is unconstrained by the runtime regex unless the CA
+*itself* carries cryptographic Name Constraints (RFC 5280
+§4.2.1.10). The auto-generated CA path makes a best-effort
+attempt to derive Name Constraints from the regex (§5.1.1); a
+regex too complex to safely translate produces a CA without
+constraints and a `mitm_ca_name_constraints_skipped` Warn at
+startup. Operator-supplied CAs carry whatever constraints the
+operator put on them — Phase 6 does not add or modify
+constraints on operator-supplied CAs. Operators in adversarial
+or multi-tenant environments who want cryptographic constraint
+on the CA itself (i.e. limiting blast radius of a key
+compromise) should either (a) narrow `tls_mitm.allowed_host_regex`
+to literal hostnames the auto-generator can translate, or
+(b) supply a CA out of band with the desired Name Constraints
+already set. See §11 for the failure-mode catalog.
 
 ---
 
@@ -59,19 +70,27 @@ before enabling. See §11 for the failure-mode catalog.
    same canonical `(scheme=https, host, path)` cache key —
    bytes are not double-cached.
 
-3. **Same SSRF / hostname-allowlist posture as Phase 1.**
-   `upstream.allowed_host_regex` and `upstream.deny_target_ranges`
-   gate CONNECT targets pre-handshake. Reject → 403, no cert
-   generation, no TLS handshake. The CONNECT host gate runs the
-   same predicate as the inner-GET host gate; an inbound CONNECT
-   that would be rejected as a plain GET is also rejected as a
-   CONNECT.
+3. **Same hostname-allowlist posture as Phase 1, with deny-range
+   enforcement deferred to inner-fetch TCP-connect time.** The
+   §5.1.2 effective allowlist (`upstream.allowed_host_regex`
+   intersected with the optional `tls_mitm.allowed_host_regex`)
+   gates CONNECT targets pre-handshake — reject → 403, no cert
+   generation, no TLS handshake. `upstream.deny_target_ranges`
+   does NOT run at CONNECT time (that would force a DNS
+   resolution at CONNECT, adding latency and a DNS-poisoning
+   surface); it runs at the inner GET's TCP connect time exactly
+   as it does for plain proxy GETs. The net effect is identical
+   to Phase 1: an inbound request that would be rejected as a
+   plain GET to an internal IP is also rejected here, just at
+   the TCP connect attempt rather than at CONNECT receipt.
+   **Implementers must NOT add a DNS lookup at CONNECT time** —
+   the deny-range gate is correctly placed downstream.
 
 4. **Same observability surface as Phase 1–5.** Every CONNECT
    produces a `mitm_connect` log line + `acu_mitm_connect_total`
    counter increment; the inner GET produces the existing
    `request` log line with a new `mitm=true` field and the
-   normal `acu_request_total{outcome=...}` increment. Operators
+   normal `acu_requests_total{outcome=...}` increment. Operators
    computing cache-hit rate get one number across MITM and
    plain paths.
 
@@ -145,40 +164,64 @@ HTTP `CONNECT` method on **any** path. Per RFC 7231 §4.3.6, the
 request-target is `host:port` (e.g. `apt.corretto.aws:443`). The
 handler:
 
-1. Parses the request-target into `(host, port)`. Reject any
-   port other than `443` with `400 Bad Request` and a
-   `mitm_connect` Warn (`outcome=bad_port`). HTTP-on-non-443
-   should not arrive on a CONNECT path; non-443 HTTPS is rare
-   enough that the simpler default is "443 only" with an
-   override knob deferred.
-2. Validates `host` against the §5.1 hostname allowlist (the
-   union of `upstream.allowed_host_regex` and the optional
-   `tls_mitm.allowed_host_regex` narrowing). Reject denied
-   hosts with `403 Forbidden` + `mitm_connect`
-   Warn (`outcome=denied_host`). The §5 SSRF gate
-   (`upstream.deny_target_ranges`) does not apply here — that
-   gate runs at TCP connect time inside the inner-GET fetch
-   path; rejecting at connect-target IP would force a DNS
-   resolution at CONNECT time which the cache otherwise avoids
-   doing.
+1. Parses the request-target into `(host, port)`. Lower-cases
+   the host and applies IDNA "to-ASCII" normalization. Reject:
+   - port other than `443` → `400 Bad Request` +
+     `mitm_connect` Warn (`outcome=bad_port`).
+   - host that parses as an IP literal (IPv4 dotted-quad,
+     IPv4-mapped, or IPv6 in `[…]` form) → `400 Bad Request` +
+     `mitm_connect` Warn (`outcome=ip_literal_host`). The
+     allowlist is hostname-based, and the auto-generated CA's
+     Name Constraints are dNSName-only; allowing an IP-literal
+     CONNECT would let it pass the regex by coincidence and
+     issue a leaf cert with no SAN that the client would
+     accept. Operators with IP-literal HTTPS upstreams configure
+     a hostname mapping in their DNS instead.
+   The simpler default of "443 only" exists because non-443
+   HTTPS upstreams are rare; a future override knob is deferred.
+2. Validates the normalized `host` against the §5.1.2 effective
+   allowlist (`upstream.allowed_host_regex` AND, when set, also
+   `tls_mitm.allowed_host_regex`). Match on a regex is RE2
+   `MatchString` against the lower-cased host (the regex
+   author is responsible for adding `^…$` anchors if they
+   want exact-match semantics — this matches Phase 1 §5.2
+   `allowed_host_regex` semantics, which is unanchored
+   substring match by default). Reject denied hosts with
+   `403 Forbidden` + `mitm_connect` Warn
+   (`outcome=denied_host`). The §5 SSRF gate
+   `upstream.deny_target_ranges` is NOT enforced at this point
+   — it fires at the inner GET's TCP connect time as it does
+   for plain GETs. See §1.1.3 for the rationale.
 3. Hijacks the underlying TCP connection (Go's
    `http.Hijacker`). Writes
    `HTTP/1.1 200 Connection established\r\n\r\n` to the raw
    conn before any TLS handshake.
-4. Looks up `host` (after Remap canonicalization, §3) in the
-   leaf-cert cache. Miss → generates a leaf cert (§5.1.3),
-   inserts under the canonical-host key. Cert generation is
-   singleflighted per canonical host: concurrent CONNECTs to
-   `de.archive.ubuntu.com` and `archive.ubuntu.com` (which
-   Remap collapses to one canonical host) issue one cert.
+4. Looks up the normalized literal `host` in the leaf-cert
+   cache (cache key = the literal CONNECT host, NOT the
+   Remap-canonical host — Remap rules are arbitrary RE2 regex
+   and not enumerable, so a SAN list "every host that maps to
+   this canonical" is undecidable). Miss → generates a leaf
+   cert (§5.1.3) with a single SAN equal to the literal host.
+   Cert generation is singleflighted per literal host:
+   concurrent CONNECTs to the SAME host (case-insensitive)
+   share one generation. CONNECTs to two different aliases
+   of the same canonical host (e.g. `de.archive.ubuntu.com`
+   and `archive.ubuntu.com`) get TWO cert cache entries —
+   that is intentional and correct, the inner-GET cache
+   still keys on canonical_host so the bytes are not
+   double-cached.
 5. Performs TLS handshake on the hijacked conn using the leaf
    cert. Handshake failure (client rejects cert, TLS version
    mismatch, etc.) closes the conn and emits `mitm_connect`
-   Warn (`outcome=tls_failed`).
+   Warn (`outcome=tls_failed`). The handshake is governed by
+   the §5.4 client-facing TLS policy (TLS 1.2+, no fallback,
+   no SSLv3/TLS 1.0/TLS 1.1).
 6. Reads exactly one HTTP/1.1 request from the now-encrypted
-   stream. The request method must be `GET` or `HEAD`; any
+   stream. The request method must be `GET` or `HEAD` (matching
+   the proxy-listener method allowlist of SPEC §2.6); any
    other method returns `405 Method Not Allowed` on the inner
-   stream (with `Allow: GET, HEAD`) and closes the tunnel.
+   stream (with `Allow: GET, HEAD`) and closes the tunnel
+   with `mitm_connect` Warn (`outcome=inner_method_rejected`).
 7. Constructs a synthetic `*http.Request` (method, path from
    the inner request, scheme=https, host from the CONNECT
    target) and dispatches into the existing handler pipeline
@@ -270,13 +313,26 @@ default `cache_dir/ca/` location for the auto-generated path.
 When `tls_mitm.enabled = true` and no operator-supplied CA
 path is set, daemon startup checks `cache_dir/ca/`:
 
-1. Both `ca.crt` and `ca.key` exist and parse: load and use.
+1. **Both `ca.crt` and `ca.key` are absent** (first start, or
+   operator wiped the directory): generate a new CA pair
+   (§5.1.1), write to disk atomically (§4.2.1), then load.
+   Emit `mitm_ca_generated` Info plus `mitm_ca_loaded` Info.
+2. **Both `ca.crt` and `ca.key` exist and parse**: load and use.
    Emit `mitm_ca_loaded` Info (`source=generated`,
    `fingerprint_sha256=…`, `not_after_unixtime=…`).
-2. Either file missing or fails to parse: generate a new CA
-   pair (§5.1.1), write to disk at mode 0600, then load.
-   Emit `mitm_ca_generated` Info plus `mitm_ca_loaded` Info.
-3. `cache_dir/ca/` cannot be created or written to: startup
+3. **Exactly one of the two files is present, OR either file
+   exists but fails to parse / fails the cert-key match
+   check**: startup fails with `mitm_ca_load_failed` Error
+   naming the offending file. The daemon does NOT
+   silently regenerate in this state — a half-present CA
+   pair indicates either a partial-write crash (operator
+   recovers by deleting both files to force regeneration)
+   or operator error (an `apt-cacher-ultra ca print` run
+   would have printed the now-missing cert; silent
+   regeneration would change the trust anchor under every
+   client without warning). Trust-root replacement is an
+   operator-explicit action.
+4. `cache_dir/ca/` cannot be created or written to: startup
    fails with a config-error log line. The daemon does NOT
    downgrade to MITM-disabled silently — an operator who
    asked for MITM gets the loud error.
@@ -293,6 +349,33 @@ When `tls_mitm.ca_cert` and `tls_mitm.ca_key` are set:
 The CA cert and key are read once at startup and held in
 memory for the daemon's lifetime. Hot-reload of the CA is
 out of scope (§1.2 / scoping Q7).
+
+#### 4.2.1 Atomic CA write semantics
+
+Auto-generation must be atomic w.r.t. crashes mid-write —
+a partially-written CA pair becomes the §4.2 step 3
+half-present case and refuses to start, which is recoverable
+but costs one operator intervention. The write sequence:
+
+1. Create `<ca_storage_dir>` with mode `0700` if absent.
+   `umask` is irrelevant — the daemon explicitly chmods.
+2. Write `ca.crt.tmp` with mode `0600`. Call `Sync()` on
+   the file before close.
+3. Write `ca.key.tmp` with mode `0600`. Call `Sync()` on
+   the file before close.
+4. Rename `ca.crt.tmp → ca.crt`. Rename `ca.key.tmp →
+   ca.key`. Both renames are atomic on POSIX.
+5. Open the parent directory and call `Sync()` on it so the
+   rename hits stable storage.
+
+On any failure (mkdir, Write, Sync, rename), best-effort
+clean up the tmp files and return the error. Startup fails;
+the operator sees `mitm_ca_generation_failed` Error.
+
+A clean run produces exactly two files, both fully written.
+A crashed run produces zero or two .tmp files (which the
+next startup ignores — only `ca.crt` and `ca.key` are
+considered).
 
 ---
 
@@ -311,8 +394,11 @@ leaf_cert_lifetime = "720h"                   # 30 days
 ca_cert_lifetime   = "87600h"                 # 10 years (auto-generated only)
 leaf_algorithm     = "ecdsa-p256"             # also "rsa2048" for legacy clients
 allowed_host_regex = ""                       # empty = inherit upstream.allowed_host_regex
-require_inner_get_only = true                 # 405 on POST/PUT/etc. inside the tunnel
 ```
+
+The inner-request method allowlist (`GET`, `HEAD`) is fixed by
+SPEC §2.6 and not configurable. There is no
+`require_inner_get_only` tunable.
 
 #### 5.1.1 CA auto-generation parameters
 
@@ -342,36 +428,58 @@ When the CA is auto-generated:
 
 #### 5.1.2 Effective MITM allowlist
 
-The effective allowlist for MITM is:
+The effective predicate evaluated on each CONNECT host is
+the conjunction of two RE2 `MatchString` calls (Go regexp
+semantics, lower-cased / IDNA-normalized host):
 
 ```
-(upstream.allowed_host_regex)
-   ∩ (tls_mitm.allowed_host_regex if non-empty, else everything)
+mitm_eligible(host) =
+    upstream_allowed(host)
+        AND (tls_mitm.allowed_host_regex == ""
+             OR re2(tls_mitm.allowed_host_regex).MatchString(host))
 ```
 
-i.e. a host is MITM-eligible iff it passes BOTH the
-upstream-fetch regex (Phase 1) AND the optional MITM-narrower
-(Phase 6). Empty `tls_mitm.allowed_host_regex` means
-"inherit upstream" (the common case); a non-empty value
-narrows further. Setting `tls_mitm.allowed_host_regex`
-broader than `upstream.allowed_host_regex` is a configuration
-error caught at startup (a host MITM-eligible but not
-upstream-eligible would CONNECT successfully then 502 on the
-inner GET).
+`upstream_allowed(host)` is whatever predicate Phase 1 §5.2
+defines for `upstream.allowed_host_regex` (verbatim — no
+re-implementation in Phase 6). Empty
+`tls_mitm.allowed_host_regex` means "inherit upstream" (the
+common case); a non-empty value narrows further.
+
+**No "broader than upstream" startup check.** A general
+regex-subset relation is undecidable; a partial check that
+worked only on simple regex shapes would mislead operators
+into thinking it caught all misconfigurations. Instead, when
+`tls_mitm.allowed_host_regex` is non-empty AND upstream is
+also non-empty, the daemon emits a one-shot Info at startup
+naming both regexes and flagging that the conjunction-not-
+broader semantics is the operator's responsibility to verify.
+A host that passes the MITM regex but fails the upstream
+regex causes the CONNECT to succeed but the inner GET to
+502 with `outcome=upstream_denied` — surfaceable via
+`acu_requests_total{outcome="upstream_denied"}` alerting.
 
 #### 5.1.3 Leaf cert parameters
 
-Per-host leaf certs are generated on first CONNECT to a
-canonical host:
+Per-literal-host leaf certs are generated on first CONNECT
+to a host:
 
 - Algorithm: `tls_mitm.leaf_algorithm` (default ECDSA P-256;
   alternative `rsa2048` for pre-2018 client compatibility).
-- Subject: `CN = <canonical_host>`.
-- Subject Alternative Names: every DNS name that Remap maps to
-  the canonical host. For `archive.ubuntu.com` the SAN list
-  includes `archive.ubuntu.com`, `de.archive.ubuntu.com`, etc.,
-  computed by walking the §3 Remap rules and the configured
-  built-in defaults.
+- Subject: `CN = <literal_host>` (the lower-cased,
+  IDNA-normalized CONNECT target).
+- Subject Alternative Names: a single dNSName entry equal
+  to the literal host. The cert does NOT enumerate Remap
+  aliases — Remap rules are arbitrary RE2 regex with
+  unbounded preimage; an "every alias" SAN is undecidable
+  in general and would mismatch any host the regex would
+  match in principle but that has no Remap pre-image
+  example. CONNECTs to two different aliases of the same
+  canonical underlying host (e.g. `de.archive.ubuntu.com`
+  and `archive.ubuntu.com`) produce two cache entries.
+  This is intentional: cert validation runs against the
+  client-presented SNI, which is the literal CONNECT
+  target; the inner GET cache key is the canonical host
+  per §3, so blob bytes are still not double-cached.
 - Validity: `not_before = now - 5m`,
   `not_after = now + tls_mitm.leaf_cert_lifetime` (default 30
   days).
@@ -382,9 +490,9 @@ canonical host:
   the leaf algorithm (the signing operation runs on the CA
   key; CA is ECDSA P-256).
 
-The leaf cert cache is keyed on `canonical_host` (after
-Remap), not on the literal CONNECT target. This guarantees
-one cert covers every alias of a host.
+The leaf cert cache is keyed on the literal lower-cased,
+IDNA-normalized CONNECT host. Cache size = `cert_cache_size`
+(default 256); LRU eviction.
 
 ### 5.2 Validation
 
@@ -432,10 +540,59 @@ New startup loud-config events:
   "operator turned on MITM but the CA is not yet trusted by
   any client" as an operationally-visible signal rather
   than apt failures buried in client logs.
-- `tls_mitm_allowed_host_regex_broader` Error at startup
-  when `tls_mitm.allowed_host_regex` is broader than
-  `upstream.allowed_host_regex` (config-time check).
-  Refuses to start.
+- `tls_mitm_narrowing_regex_set` Info at startup when
+  `tls_mitm.allowed_host_regex` is non-empty. Names both
+  `upstream.allowed_host_regex` and the MITM regex,
+  reminds the operator that the predicate is the conjunction
+  (not "broader-of-the-two") and that the operator is
+  responsible for the MITM regex being a subset of the
+  upstream regex (regex subset is undecidable; the daemon
+  cannot check it). A misconfigured broader-than-upstream
+  MITM regex surfaces at runtime as an inner-GET 502
+  with `outcome=upstream_denied`.
+
+### 5.4 Client-facing and upstream TLS policy
+
+**Client-facing TLS** (the cache acting as TLS server on the
+hijacked CONNECT conn):
+
+- Minimum protocol: TLS 1.2.
+- Preferred protocol: TLS 1.3 when the client offers it.
+- No TLS 1.1, TLS 1.0, or SSLv3 — clients still on those
+  protocols get a `mitm_connect` Warn
+  (`outcome=tls_failed`) and a closed conn.
+- Cipher suite preference: Go's default
+  `tls.CipherSuites()` returning suites recommended for new
+  applications. No suite override knob in Phase 6.
+- ALPN: HTTP/1.1 only. No HTTP/2 ALPN advertisement
+  (Phase 6 does not implement HTTP/2 inside the tunnel —
+  see §2.2 step 8).
+- No client-cert auth (the daemon authenticates clients via
+  the configured proxy listener's existing posture, e.g.
+  network ACL or admin-port-only htpasswd; client TLS auth
+  is a Phase 7+ topic).
+
+**Upstream TLS** (the cache acting as TLS client to the
+real HTTPS upstream during the inner GET's fetch path):
+
+- Full certificate chain verification: REQUIRED.
+  `tls.Config.InsecureSkipVerify` MUST be `false`. This is
+  the existing Phase 1 fetcher posture and is unchanged in
+  Phase 6.
+- The system trust store is the source of trust roots.
+  Phase 6 does NOT introduce per-upstream pinning, custom
+  CA bundles, or `Acquire::https::CAInfo`-equivalent
+  overrides.
+- Hostname verification: REQUIRED, against the canonical
+  upstream host (after Remap).
+- Minimum protocol: TLS 1.2.
+- HTTP-to-HTTPS or HTTPS-to-HTTP redirect handling: the
+  existing Phase 1 fetcher does NOT follow redirects by
+  default (each redirect is surfaced as a response and the
+  caller decides) — Phase 6 inherits this. A redirect from
+  `https://upstream/path` to `http://other/path` is treated
+  as a normal upstream response; the cache does NOT
+  silently downgrade the inner request to HTTP.
 
 ---
 
@@ -519,14 +676,21 @@ to MITM-fetched bytes the same as plain-fetched.
 
 ### 9.1 Cert generation singleflight
 
-Concurrent CONNECTs to the same canonical host (after Remap)
-issue one leaf cert. The singleflight key is the canonical
-host; the value is `*tls.Certificate`. Subsequent CONNECTs
-that miss the cache during a leader's generation block on
-the leader, then read the cached entry. Generation latency
-is dominated by ECDSA key generation (~5–10ms for P-256) +
+Concurrent CONNECTs to the same literal host issue one leaf
+cert. The singleflight key is the literal lower-cased
+IDNA-normalized host (matching the §5.1.3 cert cache key);
+the value is `*tls.Certificate`. Subsequent CONNECTs that
+miss the cache during a leader's generation block on the
+leader, then read the cached entry. Generation latency is
+dominated by ECDSA key generation (~5–10ms for P-256) +
 signing (~1–2ms) — well under any reasonable handshake
 timeout.
+
+The singleflight does NOT collapse across literal-host
+aliases (e.g. `de.archive.ubuntu.com` and
+`archive.ubuntu.com` are separate keys). This is intentional
+per §5.1.3: each literal host gets its own cert with the
+literal host in the SAN.
 
 ### 9.2 TLS handshake budget
 
@@ -611,22 +775,24 @@ Emitted from the §9 CONNECT handler:
 - **`mitm_connect`** — once per CONNECT, at conn close.
   Fields: `host`, `port`, `client_addr`, `outcome`
   (`tunneled` / `denied_host` / `bad_port` /
-  `tls_handshake_timeout` / `tls_failed` / `cert_gen_failed`
-  / `inner_method_rejected`), `duration_ms`,
-  `cert_cache` (`hit` / `miss`).
+  `ip_literal_host` / `tls_handshake_timeout` / `tls_failed`
+  / `cert_gen_failed` / `inner_method_rejected`),
+  `duration_ms`, `cert_cache` (`hit` / `miss`).
   Emitted at level Info on `tunneled`; Warn on every other
   outcome.
 
 - **`mitm_cert_issued`** — once per cert generation, before
-  insertion into the cache. Fields: `canonical_host`,
-  `algorithm`, `lifetime_seconds`, `san_count`,
-  `gen_duration_ms`. Level Debug (cert generation is
-  routine; only operators debugging cert issuance care).
+  insertion into the cache. Fields: `host` (the literal
+  CONNECT host — matches the cert cache key), `algorithm`,
+  `lifetime_seconds`, `gen_duration_ms`. Level Debug
+  (cert generation is routine; only operators debugging
+  cert issuance care). The cert SAN is always exactly the
+  literal host (§5.1.3), so no `san_count` field is
+  needed — implied to be 1.
 
 - **`mitm_cert_cache_evicted`** — once per eviction.
-  Fields: `canonical_host`, `reason` (`lru` / `expired` /
-  `manual` — the last is for a future flush primitive that
-  doesn't exist in Phase 6), `age_seconds`. Level Info.
+  Fields: `host`, `reason` (`lru` / `expired`),
+  `age_seconds`. Level Info.
 
 - **`mitm_ca_loaded`** — once at startup. Fields: `source`
   (`generated` / `supplied`), `fingerprint_sha256`,
@@ -638,6 +804,32 @@ Emitted from the §9 CONNECT handler:
   `algorithm`, `lifetime_seconds`. Level Info. Operators
   scanning the journal for first-boot cues see this exactly
   once per `cache_dir/ca/` lifecycle.
+
+- **`mitm_ca_load_failed`** — at startup, when the §4.2
+  CA materialization step 3 fires (half-present pair, parse
+  failure, cert/key mismatch). Fields: `path`, `err`. Level
+  Error. The daemon does not bind after this event.
+
+- **`mitm_ca_generation_failed`** — at startup, when atomic
+  CA write fails (mkdir, Write, Sync, rename, fsync).
+  Fields: `path`, `err`. Level Error. The daemon does not
+  bind after this event.
+
+- **`mitm_ca_name_constraints_skipped`** — at startup, when
+  the regex-to-NameConstraints translation cannot safely
+  produce constraints. Fields: `regex`, `reason`. Level
+  Warn. The CA is generated without Name Constraints; runtime
+  signing is still gated by §5.1.2 but a stolen CA key is
+  cryptographically unconstrained (§ trust-anchor expansion
+  note).
+
+- **`mitm_clock_skew`** — when a freshly-generated leaf
+  cert's `not_before` is in the future relative to the
+  cache's wall clock at the moment of issuance. (Should be
+  impossible given the §5.1.3 5m tolerance applied at
+  generation time, but the check exists as belt-and-
+  suspenders for a system-clock jump mid-process.) Fields:
+  `host`, `not_before`, `now`. Level Warn.
 
 ### 10.3 New `acu_mitm_*` metric family
 
@@ -656,7 +848,7 @@ existing families:
 | `acu_mitm_ca_not_after_unixtime` | gauge | (none) | Operator's expiry alarm — drives a Prometheus alert when `< now + 30d` |
 | `acu_mitm_handshake_duration_seconds` | histogram | (none) | TLS handshake duration (excluding inner GET) |
 
-The §10.4.1 request outcome enum on `acu_request_total` is
+The §10.4.1 request outcome enum on `acu_requests_total` is
 unchanged — MITM-fetched requests still emit the same
 outcomes (`hit` / `miss` / `bad_gateway` / etc.). The
 `mitm` log field is the only request-level indicator that
@@ -676,7 +868,7 @@ page when `tls_mitm.enabled = true`. Fields:
 | CA `not_after` | UTC timestamp |
 | Effective allowlist | string form of the regex |
 | Cert cache | `<size> / <capacity>` |
-| Last cert issued | `<canonical_host> @ <UTC timestamp>` (empty on no issuance yet) |
+| Last cert issued | `<host> @ <UTC timestamp>` (literal CONNECT host; empty on no issuance yet) |
 | Cert hit rate (60s window) | `<percentage>` (cheap rolling counter, recomputed by the §9.7.6 refresher) |
 
 When `tls_mitm.enabled = false`, the section is omitted.
@@ -691,22 +883,30 @@ that top-level keys are stable.
 
 ## 11. Failure-mode catalog (delta over SPEC §11 / SPEC4 §11 / SPEC5 §11)
 
-| Failure | Behavior |
-|---------|----------|
-| `tls_mitm.enabled = true` but CA file unreadable at startup | Startup fails with config-error log; daemon does not bind |
-| Auto-generated CA exists but fails to parse (e.g. corrupted by a partial write across crashes) | Startup logs `mitm_ca_load_failed` Error; daemon does not bind. Operator deletes `cache_dir/ca/*` to force regeneration |
-| `cache_dir/ca/` cannot be created (perms, disk full) | Startup fails with config-error log; daemon does not bind |
-| CA cert / key mismatch (operator-supplied) | Startup fails with config-error log naming the mismatch |
-| CA cert `not_after` already in the past | Startup fails with config-error log naming the expiry |
-| Leaf cert generation fails (entropy exhaustion, key gen panics, etc.) | CONNECT closes with `mitm_connect` Warn (`outcome=cert_gen_failed`); the singleflight retries on the next CONNECT |
-| Cert cache full + new host requested | LRU eviction; `mitm_cert_cache_evicted` Info on the evicted entry; new cert inserted |
-| TLS handshake on hijacked conn fails (client distrusts CA, TLS-version mismatch) | Tunnel closes with `mitm_connect` Warn (`outcome=tls_failed`); apt logs a TLS verification error; `tls_mitm_enabled_ca_undistributed` Warn fires from the refresher when this is the steady state |
-| Inner request method is not GET/HEAD | 405 written on the inner stream; tunnel closes; `mitm_connect` Warn (`outcome=inner_method_rejected`) |
-| CONNECT to a port other than 443 | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=bad_port`) |
-| CONNECT host fails the §5.1.2 effective allowlist | 403 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=denied_host`) |
-| Daemon shuts down during an in-flight CONNECT tunnel | The §9.4 sync.WaitGroup primitive holds Shutdown until the tunnel closes; on shutdown-context expiry, the conn is closed forcibly and the inner request's upstream fetch is cancelled |
-| Clock skew: leaf cert `not_before` is in the future | Apt rejects with a `not yet valid` TLS error; cache's clock is the source of truth — operators should run NTP. No Phase 6 mitigation beyond logging on the cache side |
-| CA expires mid-lifetime | All client TLS handshakes fail; `mitm_connect` Warn `outcome=tls_failed` rate spikes; Operator's `acu_mitm_ca_not_after_unixtime` alert (set to fire 30 days before expiry) catches this before the spike |
+| # | Failure | Behavior |
+|---|---------|----------|
+| F1 | `tls_mitm.enabled = true` but operator-supplied CA file unreadable at startup | Startup fails with config-error log; daemon does not bind |
+| F2 | Auto-generated CA exists with one of `ca.crt` / `ca.key` missing OR either fails to parse OR the cert/key pair fails the match check | Startup logs `mitm_ca_load_failed` Error naming the offending file; daemon does not bind. Operator recovers by deleting BOTH files to force regeneration (silent regeneration would change the trust anchor under every client; §4.2 step 3) |
+| F3 | `cache_dir/ca/` cannot be created (perms, disk full) | Startup fails with `mitm_ca_generation_failed` Error; daemon does not bind. The §4.2.1 atomic write semantics guarantee no partial files are left on a generation failure mid-run |
+| F4 | CA cert / key mismatch (operator-supplied) | Startup fails with config-error log naming the mismatch. The match check is `x509.Certificate.PublicKey == PrivateKey.Public()` |
+| F5 | Operator-supplied CA cert `not_after` already in the past, OR not in the future at all | Startup fails with config-error log naming the expiry timestamp |
+| F6 | Operator-supplied CA cert lacks `BasicConstraints: CA:TRUE` | Startup fails with config-error log |
+| F7 | Leaf cert generation fails (entropy exhaustion, key gen panics, etc.) | CONNECT closes with `mitm_connect` Warn (`outcome=cert_gen_failed`); the singleflight returns the error to all blocked waiters; the next CONNECT on the same host retries (the singleflight does NOT cache failures) |
+| F8 | Cert cache full + new host requested | LRU eviction; `mitm_cert_cache_evicted` Info on the evicted entry; new cert inserted; `acu_mitm_cert_evicted_total{reason="lru"}` increments |
+| F9 | TLS handshake on hijacked conn fails (client distrusts CA, TLS-version mismatch, cipher mismatch) | Tunnel closes with `mitm_connect` Warn (`outcome=tls_failed`); apt logs a TLS verification error; `tls_mitm_enabled_ca_undistributed` Warn fires from the refresher when this is the steady state |
+| F10 | TLS handshake exceeds the §9.2 budget | Conn closed with `mitm_connect` Warn (`outcome=tls_handshake_timeout`) |
+| F11 | Inner request method is not GET/HEAD | 405 written on the inner stream with `Allow: GET, HEAD`; tunnel closes; `mitm_connect` Warn (`outcome=inner_method_rejected`) |
+| F12 | CONNECT to a port other than 443 | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=bad_port`) |
+| F13 | CONNECT to an IP-literal host (IPv4 or IPv6) | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=ip_literal_host`) |
+| F14 | CONNECT host fails the §5.1.2 effective allowlist | 403 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=denied_host`) |
+| F15 | Inner GET upstream fetch fails the SSRF deny-range gate at TCP-connect time | The inner GET response is whatever the existing Phase 1 fetcher returns (typically 502 with `outcome=upstream_denied` on the request log line); tunnel closes after inner response. The CONNECT itself succeeded (as designed; §1.1.3) |
+| F16 | Daemon shuts down during an in-flight CONNECT tunnel | The §9.4 sync.WaitGroup primitive holds Shutdown until the tunnel closes; on shutdown-context expiry, the conn is closed forcibly and the inner request's upstream fetch is cancelled |
+| F17 | Clock skew: leaf cert `not_before` is in the future | Apt rejects with a `not yet valid` TLS error; cache's clock is the source of truth — operators should run NTP. No Phase 6 mitigation beyond logging on the cache side |
+| F18 | CA expires mid-lifetime | All client TLS handshakes fail; `mitm_connect` Warn `outcome=tls_failed` rate spikes; operator's `acu_mitm_ca_not_after_unixtime` alert (set to fire 30 days before expiry) catches this before the spike |
+| F19 | CA private key file ownership / mode wrong on disk (e.g. world-readable) | Phase 6 does NOT enforce mode/ownership at startup beyond the §4.2.1 atomic-write guarantees on the auto-generated path. Operator-supplied CA paths are read with whatever mode the operator chose; `apt-cacher-ultra ca print` is the audit primitive (it warns on `S_IROTH` set on `ca.key`). A future phase can add mandatory mode enforcement if any deployment asks |
+| F20 | Leaf cert algorithm config invalid at startup | Startup fails with config-error log naming the rejected value |
+| F21 | Upstream HTTPS server presents an invalid cert (chain failure, expired, hostname mismatch) | Inner GET fetch fails with the existing Phase 1 fetcher behavior — `outcome=bad_gateway` on the inner request log line; the cache does NOT relax verification (§5.4) |
+| F22 | Upstream sends a redirect from `https://` to `http://` | The redirect is surfaced as a normal upstream response (Phase 1 fetcher does not auto-follow redirects); the cache does NOT silently downgrade. Apt sees the 30x and decides what to do |
 
 ---
 
@@ -716,25 +916,55 @@ that top-level keys are stable.
 
 In `internal/proxy/tlsmitm/`:
 
-- CA generate-and-persist round trip: generate, write, reload,
-  verify cert/key match, fingerprint stable.
-- CA name-constraints translation: a regex with a known shape
-  (`^([a-z]{2}\.)?archive\.ubuntu\.com$`) translates to the
-  expected `permitted` list and excludes RFC 1918 / loopback.
-- Leaf cert SAN list construction for a host with multiple
-  Remap aliases.
+- CA generate-and-persist round trip: generate, write,
+  reload, verify cert/key match, fingerprint stable
+  (covers F1 success path).
+- CA atomic-write semantics: simulate disk-full mid-write,
+  verify zero or two .tmp files, NEVER half-renamed
+  ca.crt / ca.key (covers F3).
+- CA name-constraints translation: a regex with a known
+  shape (`^([a-z]{2}\.)?archive\.ubuntu\.com$`) translates
+  to the expected `permitted` dNSName list. A regex with a
+  shape that cannot be safely translated (alternation
+  spanning multiple TLDs, character-class with negated
+  ranges) yields no constraints + the
+  `mitm_ca_name_constraints_skipped` Warn.
+- Leaf cert: literal-host single-SAN construction (no
+  alias enumeration). For
+  `de.archive.ubuntu.com`, the issued cert has SAN =
+  `de.archive.ubuntu.com` only. For a re-CONNECT to
+  `archive.ubuntu.com`, a SECOND cert is issued with SAN =
+  `archive.ubuntu.com` only.
 - Cert cache LRU eviction order.
 - Cert cache expired-entry refresh on lookup.
 - Cert generation singleflight: 100 concurrent
-  `Get(canonical_host)` calls produce one cert.
-- Allowed-host regex: union with `upstream.allowed_host_regex`
-  produces the expected predicate.
+  `Get(literal_host)` calls produce one cert. The
+  singleflight does NOT collapse across literal-host
+  aliases.
+- Cert generation singleflight failure path: a fake
+  generator that returns an error returns the error to
+  ALL waiters; the next call retries (no failure caching)
+  (covers F7).
+- Effective allowlist predicate: each combination of
+  upstream-empty / upstream-set, mitm-empty / mitm-set
+  produces the documented conjunction (§5.1.2).
+- Operator-supplied CA validation: cert-key mismatch (F4),
+  past not_after (F5), missing CA:TRUE (F6), unreadable
+  file (F1) each fail at config validation with the right
+  error.
+- Leaf algorithm config: `"ecdsa-p256"` and `"rsa2048"`
+  accepted; everything else rejected (F20).
 
 In `internal/proxy/`:
 
-- CONNECT handler: bad port → 400.
-- CONNECT handler: denied host → 403.
-- CONNECT handler: non-GET inner request → 405 on inner stream.
+- CONNECT handler: bad port → 400 (F12).
+- CONNECT handler: IP-literal host → 400 (F13).
+- CONNECT handler: denied host → 403 (F14).
+- CONNECT handler: non-GET / non-HEAD inner request → 405
+  on inner stream (F11).
+- CONNECT handler: HEAD inner request → reaches the inner
+  pipeline (HEAD is allowed, matching SPEC §2.6).
+- CONNECT handler: TLS handshake timeout (F10).
 - CONNECT handler: hijack-conn lifecycle (sync.WaitGroup
   increments on hijack, decrements on close).
 
@@ -744,45 +974,112 @@ Under `internal/proxy/` with a real net.Listen + apt-style
 TCP client:
 
 - End-to-end CONNECT + inner GET with a synthetic upstream
-  (`httptest.NewTLSServer` configured with a cert the apt-
-  side trusts via the test's CA pool). First request misses,
-  second hits, both observe `X-Acu-Mitm: 1` on the response.
+  (`httptest.NewTLSServer` configured with a cert the
+  apt-side trusts via the test's CA pool). First request
+  misses, second hits, both observe `X-Acu-Mitm: 1` on
+  the response.
 - Concurrent CONNECTs to the same host: one cert generation,
   shared cert.
-- CONNECT to a host outside the allowlist: 403.
+- CONNECT to a host outside the allowlist: 403 (F14
+  end-to-end).
 - CONNECT during shutdown: the conn drains within the
-  shutdown deadline.
+  shutdown deadline (F16 end-to-end).
+- CONNECT with `cache.listen_tls` (apt-over-TLS-to-cache):
+  the outer TLS terminates at the proxy listener, the
+  inner CONNECT then proceeds normally — verifies the
+  CONNECT handler works on both the plain and TLS-to-cache
+  bind paths.
+- Disabled mode: `tls_mitm.enabled = false` → CONNECT
+  returns 405 with `Allow: GET, HEAD` exactly as
+  pre-Phase-6.
+- Status JSON shape: `tls_mitm.enabled = false` produces
+  `"tls_mitm": {"enabled": false}` exactly; `enabled =
+  true` produces the full §10.4 payload with all fields
+  present.
+- TLS policy: handshake with TLS 1.0 / TLS 1.1 client
+  fails (F9 specialization); upstream fetcher refuses an
+  invalid upstream cert (F21 specialization).
+- HTTPS-to-HTTP redirect from upstream: surfaces as a 30x
+  on the inner response, NOT auto-followed (F22).
+- `acu_requests_total{outcome=upstream_denied}`
+  increments when a denied-target-range deny fires inside
+  the inner GET (F15 end-to-end).
 
 Under `e2e/`:
 
-- A new `mitm_e2e_test.go` runs apt-get update against three
-  HTTPS upstreams (apt.corretto.aws, packages.microsoft.com,
-  one mirror behind real HTTPS). First pull warms the cache;
-  second pull is verified to hit the cache (X-Cache: HIT on
-  the inner response).
+- A new `mitm_e2e_test.go` runs apt-get update against
+  three HTTPS upstreams (apt.corretto.aws,
+  packages.microsoft.com, one mirror behind real HTTPS).
+  First pull warms the cache; second pull is verified to
+  hit the cache (`X-Cache: HIT` on the inner response).
 
 ### 12.3 Chaos tests
 
 - **CONNECT-during-CA-rotation.** Operator-supplied CA
-  swapped on disk while a CONNECT is in mid-handshake. The
-  daemon does NOT hot-reload the CA (Phase 6 §1.2 / Q7), so
-  the in-flight handshake completes against the cached CA;
-  any subsequent restart picks up the new CA. Verify no
-  panic, no in-flight tunnels hang.
+  swapped on disk while a CONNECT is in mid-handshake.
+  The daemon does NOT hot-reload the CA (Phase 6 §1.2 /
+  Q7), so the in-flight handshake completes against the
+  cached CA; any subsequent restart picks up the new CA.
+  Verify no panic, no in-flight tunnels hang.
 - **Cert-cache-full + thundering herd.** 1000 distinct
   hostnames concurrent CONNECT, cache size 256. Verify
   256 evictions land, 1000 certs issued total, no panic
-  in the LRU primitive.
-- **Inner GET cancelled mid-stream.** Client closes the TLS
-  tunnel mid-response. Verify the upstream fetch context
-  cancels, the cache write finalizes (or rolls back per
-  the SPEC2 atomic-finalize contract), no orphan blob in
-  `pool/`.
-- **CA file deleted out from under a running daemon.** Next
-  startup regenerates; running daemon's CA stays in memory;
-  cert cache stays valid; new CONNECTs continue to issue
-  leafs against the old CA until restart. Verify the
-  in-memory CA is decoupled from disk after load.
+  in the LRU primitive (F8 end-to-end).
+- **Inner GET cancelled mid-stream.** Client closes the
+  TLS tunnel mid-response. Verify the upstream fetch
+  context cancels, the cache write finalizes (or rolls
+  back per the SPEC2 atomic-finalize contract), no orphan
+  blob in `pool/`.
+- **CA file deleted out from under a running daemon.**
+  Running daemon's CA stays in memory; cert cache stays
+  valid; new CONNECTs continue to issue leafs against the
+  old CA until restart. The next startup hits §4.2 step 3
+  (half-present recovery / regeneration as appropriate
+  given which file was deleted) and the operator
+  intervention path is exercised (F2 end-to-end).
+- **CA generation crash mid-write.** Kill -9 the daemon
+  during the write phase (e.g. between the two `.tmp`
+  writes). Restart. Verify either zero `.tmp` files
+  (clean state) or two `.tmp` files (next gen ignores
+  them); NEVER a half-renamed `ca.crt` / `ca.key` pair
+  that would trigger §4.2 step 3 (F3 end-to-end).
+- **CA expiry mid-runtime.** Set the CA `not_after` to
+  60 seconds out, run a CONNECT every 10 seconds, verify
+  successful handshakes until the moment of expiry, then
+  every CONNECT after fails with `outcome=tls_failed`.
+  Operator's `acu_mitm_ca_not_after_unixtime` alert
+  fires on the gauge crossing the threshold (F18
+  end-to-end).
+
+### 12.4 §11 failure-mode coverage matrix
+
+Every row in the §11 failure-mode catalog must be exercised
+by at least one test in §12.1, §12.2, or §12.3:
+
+| F# | §12 location |
+|----|--------------|
+| F1 | 12.1 unit (operator-supplied CA validation, unreadable file) |
+| F2 | 12.1 unit (CA validation suite) + 12.3 chaos (CA file deletion) |
+| F3 | 12.1 unit (atomic-write disk-full sim) + 12.3 chaos (kill mid-write) |
+| F4 | 12.1 unit (cert-key mismatch) |
+| F5 | 12.1 unit (past not_after) |
+| F6 | 12.1 unit (missing CA:TRUE) |
+| F7 | 12.1 unit (singleflight failure path) |
+| F8 | 12.3 chaos (cert-cache thundering herd) |
+| F9 | 12.2 integration (TLS policy / version mismatch) |
+| F10 | 12.1 unit (CONNECT handler handshake timeout) |
+| F11 | 12.1 unit (CONNECT handler non-GET/HEAD inner) |
+| F12 | 12.1 unit (CONNECT handler bad port) |
+| F13 | 12.1 unit (CONNECT handler IP-literal) |
+| F14 | 12.1 unit + 12.2 integration (denied host) |
+| F15 | 12.2 integration (deny-range fires on inner GET) |
+| F16 | 12.2 integration (CONNECT during shutdown) |
+| F17 | 12.1 unit (clock-skew leaf cert; verifies the cache emits `mitm_clock_skew` Warn — apt-side rejection is observable but not unit-testable here) |
+| F18 | 12.3 chaos (CA expiry mid-runtime) |
+| F19 | 12.1 unit (`apt-cacher-ultra ca print` audit warning on 0644 ca.key) |
+| F20 | 12.1 unit (leaf algorithm rejection) |
+| F21 | 12.2 integration (upstream invalid cert) |
+| F22 | 12.2 integration (HTTPS→HTTP redirect not auto-followed) |
 
 ---
 
@@ -825,18 +1122,47 @@ packaging/
 
 ### 14.1 `apt-cacher-ultra ca print`
 
-Reads the CA cert (auto-generated or operator-supplied) and
-writes the PEM-encoded cert to stdout. Exit codes:
+Writes the PEM-encoded CA cert to stdout. Loads the same
+config file the daemon would (defaults to
+`/etc/apt-cacher-ultra/config.toml`, overridable with
+`-config <path>`). Behavior:
 
-- `0`: cert found and printed.
+1. **Operator-supplied CA** (`tls_mitm.ca_cert` non-empty):
+   reads from that path. Cert must exist and parse.
+2. **Auto-generated CA, daemon already started before**
+   (`<cache_dir>/ca/ca.crt` exists and parses): reads from
+   that path.
+3. **Auto-generated CA, daemon not yet started** (no
+   `<cache_dir>/ca/ca.crt`): runs the §4.2.1 atomic
+   generate+persist path EXACTLY as the daemon would,
+   then prints. After this run, the daemon's first start
+   will load the now-existing CA via §4.2 step 2 (not
+   step 1) — there is one CA, generated by `ca print`,
+   used by both subsequent ansible distribution and the
+   eventual daemon process. This makes `ca print` safe to
+   call as the FIRST step of fleet rollout, before the
+   daemon has ever started.
+
+Does NOT open the SQLite database; safe to run while the
+daemon is running. Will skip the §4.2.1 generate path if
+the daemon is concurrently running and has already
+materialized the CA — race-free because the §4.2.1
+atomic-rename guarantees the cert appears as a complete
+file or not at all.
+
+Audit warning: if `<ca_key>` exists with mode bits other
+than `0600` (e.g. `0644` world-readable), prints a stderr
+Warn naming the mode and recommending `chmod 0600` —
+non-fatal (exit code unchanged), since operators may have
+legitimate ownership-and-mode strategies.
+
+Exit codes:
+
+- `0`: cert printed.
 - `1`: MITM disabled in config (`tls_mitm.enabled = false`).
-- `2`: cert path unreadable / cert fails to parse.
+- `2`: cert path unreadable / cert fails to parse / atomic
+  generation fails.
 - `3`: config file unreadable.
-
-Reads the same config file that the daemon would (defaults
-to `/etc/apt-cacher-ultra/config.toml`, overridable with
-`-config <path>`). Does NOT touch the database; safe to run
-while the daemon is up.
 
 ### 14.2 `apt-cacher-ultra --print-apt-conf`
 
@@ -872,37 +1198,102 @@ The daemon executable's argument parsing routes:
 
 ## 15. Definition of done
 
-Phase 6 is complete when:
+Phase 6 is complete when EACH of the following holds:
+
+**Test coverage**
 
 1. Every test in §12.1 / §12.2 / §12.3 passes under
    `go test -race ./...`.
-2. Every Phase 1–5 chaos test still passes (no regression on
-   plain GET, freshness, GC, admin).
-3. apt with `Acquire::https::Proxy "http://cache:3142"` and
-   the CA installed system-wide successfully fetches the
-   following on a cold cache:
-   - `https://apt.corretto.aws/dists/stable/Release`
-   - `https://packages.microsoft.com/repos/ms-edge/dists/stable/InRelease`
-   - One large `.deb` (>10MB) from each upstream above.
-4. The same `sources.list` against an apt-cacher-ng instance
-   with its equivalent MITM config returns identical bytes
-   for the same URLs (regression baseline).
-5. Cache-hit-rate metric for HTTPS upstreams reaches ≥95% on
-   the second pull from the same `sources.list`.
-6. `apt-cacher-ultra ca print` produces a PEM that, when
-   installed via `update-ca-certificates`, allows step 3 to
-   succeed without `Acquire::https::Verify-Peer "false"` or
-   any other TLS bypass.
-7. Graceful shutdown drains in-flight CONNECT tunnels; no
-   leaked goroutines, no orphan `pool/` blobs from
-   cancelled inner GETs.
-8. SPEC6.md as-built sweep, mirroring SPEC5.md's
-   §13-style revision pass.
-9. One-week production deployment with `tls_mitm.enabled =
-   true` showing:
-   - Stable CONNECT throughput, no cert-cache leaks
-     (`acu_mitm_cert_cache_size` bounded).
-   - No SPEC §10.4.1 `outcome=cache_write_failed` regression
-     on HTTPS-fetched bytes.
-   - The fleet's apt clients fetch HTTPS upstreams without
-     manual `http://HTTPS///` rewrites.
+2. Every row in the §11 failure-mode catalog has at least
+   one passing test, per the §12.4 coverage matrix.
+3. Every Phase 1–5 chaos test still passes (no regression
+   on plain GET, freshness, GC, admin paths).
+
+**Disabled-mode parity**
+
+4. With `tls_mitm.enabled = false` (default), the daemon's
+   externally-observable behavior is byte-identical to a
+   Phase 5 daemon: CONNECT returns 405 with
+   `Allow: GET, HEAD`; status JSON has
+   `"tls_mitm": {"enabled": false}`; no `mitm_*` log lines
+   emitted; no `acu_mitm_*` metrics increment.
+
+**Config validation**
+
+5. Every §5.2 validation rule fires on the documented
+   invalid-input class and the daemon refuses to start with
+   the named log line. Tested as part of §12.1.
+
+**CA paths**
+
+6. The auto-generated CA path produces a valid CA file
+   pair under `<cache_dir>/ca/`, mode 0600, atomic on
+   disk-full or kill-mid-write (§12.3 chaos).
+7. The operator-supplied CA path validates per §5.2 and
+   loads on startup; mismatched / expired / non-CA inputs
+   fail validation (§12.1).
+8. `apt-cacher-ultra ca print` produces a PEM that, when
+   installed via `update-ca-certificates`, allows step 11
+   below to succeed without `Acquire::https::Verify-Peer
+   "false"` or any other TLS bypass.
+9. `apt-cacher-ultra ca print` is idempotent: running twice
+   produces the same fingerprint when the CA already exists,
+   and runs the §4.2.1 generate path exactly once when no
+   CA exists yet.
+
+**Observability**
+
+10. Every `mitm_*` log event in §10.2 is reachable by an
+    integration test — the test asserts the log line was
+    emitted with the documented field set (no extra fields,
+    no missing fields).
+11. Every `acu_mitm_*` metric in §10.3 increments at least
+    once during the §12.2 integration suite.
+12. Status page (HTML + JSON) renders the §10.4 TLS MITM
+    section when MITM is enabled, exact field set asserted
+    by §12.2.
+
+**Live exercise**
+
+13. apt with `Acquire::https::Proxy "http://cache:3142"`
+    and the CA installed system-wide successfully fetches
+    the following on a cold cache:
+    - `https://apt.corretto.aws/dists/stable/Release`
+    - `https://packages.microsoft.com/repos/ms-edge/dists/stable/InRelease`
+    - One large `.deb` (>10MB) from each upstream above.
+14. The same `sources.list` against an apt-cacher-ng
+    instance with its equivalent MITM config returns
+    identical bytes for the same URLs (regression baseline
+    against the upstream we're replacing).
+15. Cache-hit-rate metric for HTTPS upstreams reaches ≥95%
+    on the second pull from the same `sources.list`.
+
+**Shutdown**
+
+16. Graceful shutdown drains in-flight CONNECT tunnels; no
+    leaked goroutines, no orphan `pool/` blobs from
+    cancelled inner GETs.
+
+**Documentation**
+
+17. SPEC6.md as-built sweep, mirroring SPEC5.md's
+    §13-style revision pass — every §11 failure-mode row
+    matches the implemented behavior, every config field
+    matches the implemented validation, every metric name
+    matches the registered metric.
+
+**Production soak**
+
+18. One-week production deployment with
+    `tls_mitm.enabled = true` showing:
+    - Stable CONNECT throughput, no cert-cache leaks
+      (`acu_mitm_cert_cache_size` bounded by configured
+      cap; observed in metrics).
+    - No `outcome=cache_write_failed` regression on
+      HTTPS-fetched bytes vs. the prior `http://HTTPS///`
+      baseline.
+    - The fleet's apt clients fetch HTTPS upstreams
+      without manual `sources.list` rewrites.
+    - `acu_mitm_ca_not_after_unixtime` Prometheus alert
+      configured (fires 30 days before expiry); observed
+      at expected value, not yet firing.
