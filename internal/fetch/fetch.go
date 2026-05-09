@@ -213,15 +213,17 @@ func New(opts Options) (*Client, error) {
 			// blanket-rejecting forced operators to mirror every
 			// possible CDN target with a Remap rule.
 			//
-			// The allowlist is the security boundary: a redirect to an
-			// un-allowlisted host is still refused with
+			// The allowlist is the host-policy security boundary: a
+			// redirect to an un-allowlisted host is still refused with
 			// ErrRedirectBlocked, the dial-side deny-CIDR check still
 			// runs on the redirected dial (so SSRF protection holds),
-			// and a non-http(s) scheme is refused outright. The cache
-			// key remains (scheme, canonical host, path) of the
-			// original inbound request — the redirect chain is internal
-			// and bytes from the final hop land under the original
-			// cache key, which is exactly what we want.
+			// and a non-http(s) scheme is refused outright. We also
+			// refuse HTTPS→HTTP downgrades — the bytes from the final
+			// hop are stored under the original inbound cache key
+			// (scheme, canonical host, path), so allowing a downgrade
+			// would let an on-path attacker on the plaintext hop poison
+			// entries that downstream apt clients believe came from a
+			// verified TLS upstream.
 			//
 			// We also enforce a 10-redirect cap. net/http's default
 			// CheckRedirect (which we replace) enforces this; once we
@@ -236,14 +238,23 @@ func New(opts Options) (*Client, error) {
 					return fmt.Errorf("%w: redirect to unsupported scheme %q (%s)",
 						ErrRedirectBlocked, scheme, req.URL)
 				}
+				// Refuse HTTPS -> HTTP scheme downgrades even when the
+				// target host is allowlisted. The bytes from the HTTP hop
+				// would be cached under the original HTTPS cache key, so
+				// any on-path attacker on the plaintext hop could poison
+				// cache entries that downstream apt clients believe
+				// originated from a verified TLS upstream. CheckRedirect
+				// is invoked only on a 3xx, so via has length >= 1.
+				prevScheme := strings.ToLower(via[len(via)-1].URL.Scheme)
+				if prevScheme == "https" && scheme == "http" {
+					return fmt.Errorf("%w: scheme downgrade %s -> %s (%s -> %s)",
+						ErrRedirectBlocked, prevScheme, scheme,
+						via[len(via)-1].URL, req.URL)
+				}
 				target := normalizeHost(req.URL.Hostname())
 				if target == "" || !hostAllowed(allow, target) {
-					from := "<initial>"
-					if len(via) > 0 {
-						from = via[len(via)-1].URL.String()
-					}
 					return fmt.Errorf("%w: %s -> %s (target host not in allowed_host_regex)",
-						ErrRedirectBlocked, from, req.URL)
+						ErrRedirectBlocked, via[len(via)-1].URL, req.URL)
 				}
 				return nil
 			},

@@ -30,7 +30,11 @@ type ConditionalResult struct {
 
 // Conditional issues a single GET to target.URL with If-None-Match and/or
 // If-Modified-Since headers, applying the same SPEC §6.6 hardening as
-// Fetch (allowlist + deny-CIDR + redirect block).
+// Fetch (allowlist + deny-CIDR + redirect policy: a 3xx to an allowlisted
+// host is followed; one to an un-allowlisted host, an HTTPS→HTTP scheme
+// downgrade, or a non-http(s) scheme is refused with ErrRedirectBlocked.
+// See fetch.go's CheckRedirect for the full policy — the same *http.Client
+// is shared, so the policy is uniform with Fetch).
 //
 // Unlike Fetch, no retries: SPEC §7.2 says "log on failure, bump
 // last_check_at, move on" — the freshness layer handles the retry

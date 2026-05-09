@@ -3,6 +3,7 @@ package fetch
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net/http"
@@ -724,6 +725,53 @@ func TestFetch_RedirectBlocked(t *testing.T) {
 	}, &bufDst{})
 	if !errors.Is(err, ErrRedirectBlocked) {
 		t.Errorf("want ErrRedirectBlocked, got %v", err)
+	}
+}
+
+// TestFetch_RedirectSchemeDowngradeBlocked verifies that an HTTPS upstream
+// that 30x's to an HTTP target on an allowlisted host is still refused
+// with ErrRedirectBlocked. The cache key is the original inbound
+// (scheme, canonical host, path); allowing the downgrade would let an
+// on-path attacker on the plaintext hop poison entries that downstream
+// apt clients believe came from a verified TLS upstream.
+func TestFetch_RedirectSchemeDowngradeBlocked(t *testing.T) {
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("attacker-controlled bytes"))
+	}))
+	defer plain.Close()
+
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+"/payload", http.StatusFound)
+	}))
+	defer tlsSrv.Close()
+
+	pool := x509.NewCertPool()
+	pool.AddCert(tlsSrv.Certificate())
+	restore := SetRootCAsForTest(pool)
+	defer restore()
+
+	c, err := New(Options{
+		ConnectTimeout:   2 * time.Second,
+		TotalTimeout:     5 * time.Second,
+		MaxRetries:       0,
+		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	dst := &bufDst{}
+	_, err = c.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           tlsSrv.URL + "/start",
+	}, dst)
+	if !errors.Is(err, ErrRedirectBlocked) {
+		t.Fatalf("want ErrRedirectBlocked, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "scheme downgrade") {
+		t.Errorf("error %q should mention scheme downgrade", err)
+	}
+	if dst.Written() != 0 {
+		t.Errorf("dst.Written() = %d; downgrade-blocked fetch must not stream the redirect body", dst.Written())
 	}
 }
 
