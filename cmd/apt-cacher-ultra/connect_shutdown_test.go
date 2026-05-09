@@ -19,11 +19,20 @@ package main
 // CONNECT pipeline alone (cert generation, hijack accounting) somehow
 // landed bytes in pool/.
 //
-// The fuller F16 scenario — a real inner GET against an HTTPS upstream
-// that is then cancelled mid-fetch — needs the SPEC6 §12.2
-// `fetch.SetRootCAsForTest` integration scaffold and an HTTPS upstream
-// remap, both slated for §15 #2. When those land the orphan-blob
-// claim gets a non-vacuous pin in the §12.2 integration suite.
+// Claim (3) is pinned non-vacuously by
+// shutdown_orphan_blob_test.go's
+// TestServe_GracefulShutdown_FetchMidStream_NoOrphanBlob, which
+// triggers a real cache-miss fetch against a slow-body upstream,
+// cancels the daemon ctx mid-stream, and asserts pool/ + temp/ are
+// empty after shutdown. That test uses the HTTP fetch path (the
+// MITM-tunneled inner-GET trigger requires privileged port-443
+// binding to exercise end-to-end), but the underlying
+// atomic-finalize-on-cancel contract — h.lifecycleCtx cancels →
+// fetch.Fetch returns ctx error → temp blob's defer cleans up
+// before any rename to pool/ runs — is path-independent. The MITM
+// inner-GET case shares the same serveCacheMiss → runFetch →
+// fetch.Fetch → cache.PutBlob pipeline, so the contract pinned
+// there covers it.
 
 import (
 	"bufio"
