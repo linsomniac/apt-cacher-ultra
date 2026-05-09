@@ -1734,11 +1734,40 @@ page when `tls_mitm.enabled = true`. Fields:
 
 When `tls_mitm.enabled = false`, the section is omitted.
 
+JSON shape (see `internal/admin/status.go:46-69`), full
+payload when `tls_mitm.enabled = true`:
+
+```json
+{
+  "enabled": true,
+  "ca_source": "generated|supplied",
+  "ca_fingerprint_sha256": "<hex, 64 chars>",
+  "ca_not_after_unixtime": <int64 Unix seconds>,
+  "effective_allowlist": "<regex string>",
+  "cert_cache": {"size": <int>, "capacity": <int>},
+  "last_cert_issued": {"host": "<literal CONNECT host>", "at_unixtime": <int64>} | null,
+  "cert_hit_rate_60s_percent": <float 0-100> | null,
+  "cert_hit_rate_60s_observed": <int>
+}
+```
+
+`last_cert_issued` is JSON `null` until the first cert
+is issued. `cert_hit_rate_60s_percent` is `null` when no
+cert-cache lookups occurred in the 60s window; the
+companion `cert_hit_rate_60s_observed` field is the
+(hits + misses) sample size — surfaced in the JSON so
+consumers can distinguish "0% of 800 lookups" from "no
+data". `ca_not_after_unixtime` is an integer Unix-seconds
+value; the HTML form of the page renders this as a UTC
+timestamp.
+
 The JSON form of the status page (§10.5 schema) carries a
 top-level `tls_mitm` key — always present, abbreviated to
 `{"enabled": false}` when MITM is disabled, full payload
-otherwise. This mirrors the Phase 5 SPEC §10.5 invariant
-that top-level keys are stable.
+otherwise (see the `MarshalJSON` short-circuit at
+`internal/admin/status.go:76-79`). This mirrors the
+Phase 5 SPEC §10.5 invariant that top-level keys are
+stable.
 
 ---
 
