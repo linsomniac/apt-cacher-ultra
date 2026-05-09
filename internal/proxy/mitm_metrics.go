@@ -6,10 +6,17 @@
 // observation is gated on MITM being enabled. With
 // `tls_mitm.enabled = false` no CONNECT pipeline is wired, so the
 // observation sites in connect.go / mitm_metrics.go never fire and
-// counters/histograms remain at zero. Gauges that main.go writes
-// (cert_cache_size, cert_cache_capacity, ca_not_after_unixtime)
-// stay at zero unless main.go explicitly sets them when MITM is
-// enabled.
+// counters/histograms remain at zero.
+//
+// The three gauges main.go writes (cert_cache_size, cert_cache_capacity,
+// ca_not_after_unixtime) are SEEDED to 0 at package init so disabled-
+// mode /metrics scrapes emit `<name> 0` value lines per the SPEC6
+// §15 #4 "Gauges report zero" contract. metrics.Gauge.render only
+// emits a value line when the gauge has at least one series in its
+// map (an unset unlabeled gauge would otherwise emit only HELP/TYPE
+// comments and no value), so without the init seed Prometheus would
+// see no current sample for these metrics in disabled mode — a
+// silent contract drift.
 //
 // Outcome enum (`acu_mitm_connect_total{outcome}`) matches the
 // `mitm_connect.outcome` log field — the same string is emitted to
@@ -148,3 +155,16 @@ func RecordCertEvicted(reason string) {
 func SetCertCacheSize(n int)        { mitmCertCacheSize.Set(float64(n)) }
 func SetCertCacheCapacity(n int)    { mitmCertCacheCapacity.Set(float64(n)) }
 func SetCANotAfterUnixtime(t int64) { mitmCANotAfterUnixtime.Set(float64(t)) }
+
+// Seed the three §15 #4 gauges to 0 at package init so a process
+// that never enables MITM still emits `<name> 0` value lines on
+// /metrics, per the SPEC6 §15 #4 "Gauges report zero" contract.
+// Without this seed, the gauges' series map is empty and Gauge.render
+// in internal/metrics only emits HELP/TYPE comments — no value line.
+// main.go calls Set(...) again at startup when MITM is enabled,
+// overwriting these zero placeholders with the real values.
+func init() {
+	SetCertCacheSize(0)
+	SetCertCacheCapacity(0)
+	SetCANotAfterUnixtime(0)
+}

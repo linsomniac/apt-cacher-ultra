@@ -95,15 +95,18 @@ func TestServe_DisabledMode_AdvertisedDeltasOnly(t *testing.T) {
 	adminAddr := adminLn.Addr().String()
 	cfg.Admin.Listen = adminAddr
 
-	// Reset the three §15 #4 gauges to zero. metrics.Default is
-	// package-shared: an §15 #11 enabled-mode test running earlier in
-	// the same `go test` invocation leaves SetCertCacheCapacity /
-	// SetCANotAfterUnixtime values sticky (gauge.Set retains the last
-	// write). Reset them here so the post-daemon assertion can pin the
-	// spec invariant DIRECTLY ("Gauges report zero" — SPEC6 §15 #4)
-	// rather than the weaker delta-based shape. Prior callers (other
-	// tests) re-set their own values via wireTlsMitm at startup; the
-	// reset is local to this test's lifetime.
+	// Reset the three §15 #4 gauges to zero. The proxy package's init()
+	// seeds these to 0 at process start so production /metrics in
+	// disabled mode emits `<name> 0` value lines per the SPEC6 §15 #4
+	// "Gauges report zero" contract. But metrics.Default is package-
+	// shared across this test package: an §15 #11 enabled-mode test
+	// running earlier in the same `go test` invocation leaves
+	// SetCertCacheCapacity / SetCANotAfterUnixtime values sticky
+	// (gauge.Set retains the last write). Re-seed here so this test
+	// observes the same baseline a fresh process would, regardless of
+	// intra-package test order. The post-daemon assertion can then
+	// pin the spec invariant directly ("Gauges report zero") rather
+	// than the weaker delta-based shape.
 	proxy.SetCertCacheSize(0)
 	proxy.SetCertCacheCapacity(0)
 	proxy.SetCANotAfterUnixtime(0)
