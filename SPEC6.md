@@ -1512,10 +1512,13 @@ SPEC5 §9.5):
       ResponseWriter side and any handler-internal
       `r.Context()` reads.
    2. `h.lifecycleCtx` (the leader-fetch context;
-      `internal/handler/handler.go:121, 145`) is
-      cancelled synchronously by the daemon's Shutdown
-      step — this propagates to in-flight upstream
-      fetches in `serveCacheMiss` (handler.go:849-857).
+      `internal/handler/handler.go:135-136, 179-180` for
+      the struct field + struct init) is cancelled
+      synchronously by the daemon's Shutdown step — this
+      propagates to in-flight upstream fetches in
+      `serveCacheMiss` (handler.go:916 entry, :928
+      `runFetch(h.lifecycleCtx, req)`; the snapshot-member
+      fetch path at :1030 carries the same ctx).
    3. The daemon waits on the manager's `WaitGroup`,
       bounded by `shutdownCtx`. Either every tunnel
       finishes (graceful) or the deadline fires.
