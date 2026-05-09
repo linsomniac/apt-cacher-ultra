@@ -760,19 +760,29 @@ insert):
 
 The next periodic tick retries; the cooldown gate prevents thrash.
 
-**Member 4xx is skipped, not fatal.** A declared member whose upstream
-returns a 4xx status is logged at WARN as `adoption_member_skipped`
-(canonical_host, suite_path, path, declared_sha256, upstream_status)
-and omitted from `snapshot_member`; subsequent client requests for that
-path 404 from the cache, mirroring upstream. By-hash alias rows
-(step 7) and `package_hash` parsing (step 8) iterate only the
-successfully-fetched members so a skipped path does not produce a
-phantom alias row pointing at a non-existent blob. This matches apt's
-behavior — clients fetch from `IndexTargets`, not from every entry in
-the Release SHA256 block, and an entry the upstream advertises but
-does not serve is a publication artifact (Ubuntu's archive declaring
-uncompressed `Contents-amd64` while only shipping `Contents-amd64.gz`
-is the canonical case). The `adoption_success` log line carries
+**Member 404 / 410 is skipped, not fatal.** A declared member whose
+upstream returns 404 (Not Found) or 410 (Gone) is logged at WARN as
+`adoption_member_skipped` (canonical_host, suite_path, path,
+declared_sha256, upstream_status) and omitted from `snapshot_member`;
+subsequent client requests for that path 404 from the cache, mirroring
+upstream. Other 4xx codes (401/403 auth/policy, 408/425/429 transient
+rate-limit/timeout, anything else) stay fatal — those are not "upstream
+declared but doesn't serve" but rather conditions where committing a
+partial snapshot would mask an operator-actionable problem (or
+persist a degraded view across what should have been a transient
+upstream condition). 5xx and transport errors stay fatal for the same
+reason. By-hash alias rows (step 7) iterate only the successfully-
+fetched members so a skipped path does not produce a phantom alias
+row pointing at a non-existent blob; `package_hash` parsing (step 8)
+parses only fetched Packages members but uses the *full* declared
+member set to compute the SPEC3 §7.5.4 `package_coverage_complete`
+denominator (a 404-skipped Packages directory drops coverage to false
+rather than vanishing from the count). This matches apt's behavior —
+clients fetch from `IndexTargets`, not from every entry in the Release
+SHA256 block, and an entry the upstream advertises but does not serve
+is a publication artifact (Ubuntu's archive declaring uncompressed
+`Contents-amd64` while only shipping `Contents-amd64.gz` is the
+canonical case). The `adoption_success` log line carries
 `fetched_count` and `skipped_count` so operators can audit per-suite
 skip volume. Adoption still aborts (with `ErrAdoptionMemberFetchFailed`,
 surfacing through `adoption_run_failed`) if zero declared members

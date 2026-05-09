@@ -758,13 +758,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// flip — strict mode only reads current snapshots, but pinning
 	// the timing prevents any "candidate has coverage = 1 but is not
 	// yet current" mid-state from leaking into the §7.5 flow.
-	// Iterates fetchedMembers, not members: readPackagesBlob for a
-	// 4xx-skipped Packages member would miss in the pool. The
-	// pkgDirs/coverage_complete computation in buildPackageHashes
-	// also relies only on what we actually have on disk — a directory
-	// whose only Packages variant was skipped should not be counted
-	// as covered.
-	pkgHashRes, err := a.buildPackageHashes(suite, snapshotID, fetchedMembers)
+	// Pass both slices: allMembers drives the SPEC3 §7.5.4 coverage
+	// denominator (a 4xx-skipped Packages directory must drop
+	// coverage to false, not disappear from the count); fetchedMembers
+	// drives the parse loop (only those have blobs in the pool).
+	pkgHashRes, err := a.buildPackageHashes(suite, snapshotID, members, fetchedMembers)
 	if err != nil {
 		return err // already wrapped with category
 	}
@@ -980,17 +978,25 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 
 	res, err := a.fetcher.Fetch(ctx, target, w)
 	if err != nil {
-		// SPEC2 §7.5.2 (Phase 2 clarification): 4xx is treated as
-		// "upstream declared but does not serve" and skipped — apt
-		// itself only fetches IndexTargets, so an entry the Release
-		// advertises but the archive 404s on is a publication
-		// artifact, not a contract violation. The canonical case is
-		// Ubuntu's Release file declaring an uncompressed
-		// Contents-amd64 the archive only ships as Contents-amd64.gz.
-		// 5xx and transport errors stay fatal — those are "upstream
-		// is broken right now", not "upstream never serves this thing".
+		// SPEC2 §7.5.2 (Phase 2 clarification): only the explicit
+		// "resource not present" 4xx codes — 404 Not Found and 410
+		// Gone — are treated as "upstream declared but does not
+		// serve" and skipped. The canonical case is Ubuntu's Release
+		// file declaring an uncompressed Contents-amd64 the archive
+		// only ships as Contents-amd64.gz (404). Other 4xx codes
+		// stay fatal:
+		//   - 401/403: auth or policy. The project assumes no
+		//     upstream needs auth, but if one starts returning these
+		//     we want loud failure, not silent partial snapshots.
+		//   - 408/425/429: transient (timeout / too-early / rate
+		//     limit). Adoption should retry on the next tick rather
+		//     than persist a degraded snapshot.
+		//   - All other 4xx: unknown semantics; fail closed.
+		// 5xx and transport errors stay fatal too — those are
+		// "upstream is broken right now", not "upstream never serves
+		// this thing".
 		var se *fetch.StatusError
-		if errors.As(err, &se) && se.Code >= 400 && se.Code < 500 {
+		if errors.As(err, &se) && (se.Code == 404 || se.Code == 410) {
 			a.logger.Warn("adoption_member_skipped",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
@@ -1166,8 +1172,18 @@ type debPathDecl struct {
 // coverage_complete bit for the snapshot. Returns coverage = false for
 // non-/dists/ layouts (with rows = nil); strict mode (§6.1) treats
 // such hosts as fail-through, never fail-closed.
+//
+// allMembers is the full Release-declared set (used to compute the
+// coverage denominator — every declared Packages-basename directory
+// needs at least one parseable variant for coverage_complete). fetchedMembers
+// is the subset whose blob is actually in the pool and therefore
+// parseable; SPEC2 §7.5.2 4xx-skipped members are present in
+// allMembers but absent from fetchedMembers. Computing pkgDirs from
+// fetchedMembers would silently drop a 4xx-skipped Packages directory
+// from the denominator and let coverage_complete = true vacuously hold
+// for an incomplete snapshot.
 func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
-	members []ReleaseMember) (packageHashBuildResult, error) {
+	allMembers, fetchedMembers []ReleaseMember) (packageHashBuildResult, error) {
 	repoRoot, ok := repoRootFromSuitePath(suite.SuitePath)
 	if !ok {
 		a.logger.Info("package_coverage_incomplete",
@@ -1179,14 +1195,17 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 		return packageHashBuildResult{rows: nil, coverageComplete: false}, nil
 	}
 
-	// SPEC3 §7.5.4: walk the Release's listed paths once to identify
+	// SPEC3 §7.5.4: walk the *full* Release-declared set to identify
 	// the directories that contain at least one Packages* member by
 	// basename match (regardless of whether it's a variant we can
-	// parse). Each such directory needs at least one parseable variant
-	// for coverage_complete to hold.
+	// parse, and regardless of whether the upstream actually served
+	// it). Each such directory needs at least one parseable variant
+	// for coverage_complete to hold — a 4xx-skipped Packages
+	// directory therefore drops coverage to false rather than
+	// disappearing from the denominator.
 	pkgDirs := make(map[string]bool)
 	hasParseable := make(map[string]bool)
-	for _, m := range members {
+	for _, m := range allMembers {
 		if !isPackagesBasename(path.Base(m.Path)) {
 			continue
 		}
@@ -1202,8 +1221,11 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 	// debPath -> running decl. Multiple Packages variants in the
 	// same Release declare identical content, so deduplication is
 	// load-bearing for the package_hash primary key.
+	//
+	// Iterates fetchedMembers only: a 4xx-skipped Packages member
+	// has no blob in the pool, so readPackagesBlob would miss.
 	dedup := make(map[string]debPathDecl)
-	for _, m := range members {
+	for _, m := range fetchedMembers {
 		if !isPackagesMember(m.Path) {
 			continue
 		}

@@ -363,7 +363,7 @@ func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 	members := []ReleaseMember{
 		{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))},
 	}
-	res, err := a.buildPackageHashes(suiteRef, 1, members)
+	res, err := a.buildPackageHashes(suiteRef, 1, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: unexpected error: %v", err)
 	}

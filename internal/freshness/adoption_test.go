@@ -1602,3 +1602,82 @@ func TestAdopter_MemberSkipped_AllMembers404Fails(t *testing.T) {
 		t.Errorf("current_snapshot_id unexpectedly set after all-404 adoption: %d", *sf.CurrentSnapshotID)
 	}
 }
+
+// TestAdopter_MemberSkipped_403StaysFatal verifies that 4xx codes
+// other than 404/410 (here: 403 Forbidden) remain fatal even though
+// they are 4xx-shaped. SPEC2 §7.5.2: only 404 and 410 mean "upstream
+// declared but does not serve"; 401/403 indicate auth/policy and
+// 408/425/429 indicate transient conditions, all of which would
+// silently degrade the snapshot if treated as skip.
+func TestAdopter_MemberSkipped_403StaysFatal(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	pkgs := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64),
+	})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+	})
+	env.fetcher.failWith(
+		"http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages",
+		&fetch.StatusError{Code: 403},
+	)
+
+	err := env.adopter.Run(context.Background(), env.suite, releaseText, "", "")
+	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
+		t.Errorf("Run err = %v, want wrapped ErrAdoptionMemberFetchFailed (403 must not skip)", err)
+	}
+
+	sf, err := env.cache.GetSuiteFreshness(context.Background(),
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err == nil && sf != nil && sf.CurrentSnapshotID != nil {
+		t.Errorf("current_snapshot_id unexpectedly set after 403 fatal: %d", *sf.CurrentSnapshotID)
+	}
+}
+
+// TestAdopter_MemberSkipped_PackagesDirSkipped_CoverageIncomplete
+// verifies the SPEC3 §7.5.4 coverage-complete contract under SPEC2
+// §7.5.2 skips: when one architecture's Packages 404s and another's
+// fetches successfully, the resulting snapshot must have
+// package_coverage_complete = false (the missing arch's directory
+// belongs in the denominator). Earlier review caught a regression
+// where buildPackageHashes was passed only the fetched member set
+// and silently dropped 404'd directories from the count, letting
+// strict mode (SPEC3 §6.1) refuse only the arches with package_hash
+// rows while letting the missing arch fall through to trust-upstream.
+func TestAdopter_MemberSkipped_PackagesDirSkipped_CoverageIncomplete(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	pkgsAmd64 := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1_amd64.deb": strings.Repeat("a", 64),
+	})
+	pkgsArm64 := fakePackagesStanzas(map[string]string{
+		"pool/main/b/bar/bar_2_arm64.deb": strings.Repeat("b", 64),
+	})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgsAmd64,
+		"main/binary-arm64/Packages": pkgsArm64,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	// arm64 fetches; amd64 404s.
+	env.fetcher.put(base+"main/binary-arm64/Packages", pkgsArm64)
+	env.fetcher.fail404(base + "main/binary-amd64/Packages")
+
+	if err := env.adopter.Run(context.Background(), env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("Run: %v (one Packages directory skipped should not abort adoption)", err)
+	}
+
+	sf, err := env.cache.GetSuiteFreshness(context.Background(),
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil {
+		t.Fatal("current_snapshot_id not set after partial-skip adoption")
+	}
+	snap, err := env.cache.GetSuiteSnapshot(context.Background(), *sf.CurrentSnapshotID)
+	if err != nil {
+		t.Fatalf("GetSuiteSnapshot: %v", err)
+	}
+	if snap.PackageCoverageComplete {
+		t.Error("package_coverage_complete = true, want false (amd64/Packages was 404-skipped)")
+	}
+}
