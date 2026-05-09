@@ -32,6 +32,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -42,6 +43,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 )
 
 func TestServe_DisabledMode_AdvertisedDeltasOnly(t *testing.T) {
@@ -93,12 +95,25 @@ func TestServe_DisabledMode_AdvertisedDeltasOnly(t *testing.T) {
 	adminAddr := adminLn.Addr().String()
 	cfg.Admin.Listen = adminAddr
 
-	// Snapshot the metric values BEFORE the daemon starts. metrics.Default
-	// is shared across this test package; a prior test may have left
-	// non-zero counter/histogram values. The disabled daemon should
-	// produce zero DELTA against this snapshot — that is the §15 #4
-	// "no observation happens until enabled" claim translated into a
-	// shared-registry-safe assertion.
+	// Reset the three §15 #4 gauges to zero. metrics.Default is
+	// package-shared: an §15 #11 enabled-mode test running earlier in
+	// the same `go test` invocation leaves SetCertCacheCapacity /
+	// SetCANotAfterUnixtime values sticky (gauge.Set retains the last
+	// write). Reset them here so the post-daemon assertion can pin the
+	// spec invariant DIRECTLY ("Gauges report zero" — SPEC6 §15 #4)
+	// rather than the weaker delta-based shape. Prior callers (other
+	// tests) re-set their own values via wireTlsMitm at startup; the
+	// reset is local to this test's lifetime.
+	proxy.SetCertCacheSize(0)
+	proxy.SetCertCacheCapacity(0)
+	proxy.SetCANotAfterUnixtime(0)
+
+	// Snapshot the counter/histogram values BEFORE the daemon starts.
+	// Counters and histograms are MONOTONIC — there's no "reset to 0"
+	// API and writing 0 to a counter is a no-op. So those still need
+	// the delta shape (any prior observations remain in the absolute
+	// sum). The disabled daemon should produce zero DELTA, which is
+	// what §15 #4 "no observation happens until enabled" demands.
 	baseline := scrapeMetrics(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -110,7 +125,10 @@ func TestServe_DisabledMode_AdvertisedDeltasOnly(t *testing.T) {
 	t.Cleanup(func() {
 		cancel()
 		select {
-		case <-serveDone:
+		case err := <-serveDone:
+			if err != nil {
+				t.Errorf("serveListeners: %v", err)
+			}
 		case <-time.After(15 * time.Second):
 			t.Errorf("serveListeners did not return on cleanup")
 		}
@@ -223,31 +241,32 @@ func TestServe_DisabledMode_AdvertisedDeltasOnly(t *testing.T) {
 	}
 	metricsText := string(metricsBody)
 	for _, m := range wantMetrics {
-		if !strings.Contains(metricsText, m) {
-			t.Errorf("/metrics output missing %q in disabled mode; SPEC6 §15 #4 mandates registration even when disabled", m)
+		if !metricRegistered(metricsText, m) {
+			t.Errorf("/metrics output missing TYPE line for %q in disabled mode; SPEC6 §15 #4 mandates registration even when disabled", m)
 		}
 	}
 
-	// Delta 3b: gauges have ZERO DELTA from baseline. The spec says
-	// "Gauges report zero" — but metrics.Default is package-shared,
-	// and a §15 #11 enabled-mode test running earlier in the same
-	// `go test` invocation leaves SetCertCacheCapacity /
-	// SetCANotAfterUnixtime values non-zero (gauge.Set is sticky).
-	// The invariant we can safely pin against the shared registry is
-	// "the disabled daemon does NOT WRITE these gauges" — i.e., the
-	// value seen after the disabled-daemon's lifetime equals the
-	// pre-daemon baseline. Same delta-based shape as 3c below.
+	// Delta 3b: gauges read 0 in disabled mode. The setup block
+	// reset these gauges to 0 before the daemon started; the spec
+	// says wireTlsMitm at startup is the only writer (which doesn't
+	// run in disabled mode), so 0 should hold. A registered-but-zero
+	// gauge emits an exposition value line (`<name> 0`) — readGauge-
+	// ValuePresent disambiguates that from "metric absent entirely"
+	// (which would be a registration regression, separately caught
+	// by 3a).
 	after := scrapeMetrics(t)
 	for _, gauge := range []string{
 		"acu_mitm_cert_cache_size",
 		"acu_mitm_cert_cache_capacity",
 		"acu_mitm_ca_not_after_unixtime",
 	} {
-		before := readGaugeValue(baseline, gauge)
-		afterVal := readGaugeValue(after, gauge)
-		if afterVal != before {
-			t.Errorf("disabled-mode gauge %s changed: before=%g after=%g (delta=%g)",
-				gauge, before, afterVal, afterVal-before)
+		v, present := readGaugeValuePresent(after, gauge)
+		if !present {
+			t.Errorf("disabled-mode gauge %s value line missing from scrape (registration regression?)", gauge)
+			continue
+		}
+		if v != 0 {
+			t.Errorf("disabled-mode gauge %s = %g, want 0 (SPEC6 §15 #4 'Gauges report zero')", gauge, v)
 		}
 	}
 
@@ -280,4 +299,51 @@ func TestServe_DisabledMode_AdvertisedDeltasOnly(t *testing.T) {
 				hist, before, afterVal, afterVal-before)
 		}
 	}
+}
+
+// metricRegistered reports whether the Prometheus exposition output
+// `scrape` declares the given metric family via a `# TYPE <name> ...`
+// line. This is stricter than substring matching: a substring hit
+// could fall on a HELP/TYPE comment for a SIMILAR-named metric, or on
+// a series of a metric whose family name happens to embed `name`. The
+// TYPE line is the canonical "this metric is registered" signal in
+// the exposition format.
+func metricRegistered(scrape, name string) bool {
+	prefix := "# TYPE " + name + " "
+	for _, line := range strings.Split(scrape, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// readGaugeValuePresent returns (value, true) if a gauge value line
+// for `name` appears in `scrape`, or (0, false) if no value line is
+// present. The "registered but zero" case (a gauge the producer has
+// not Set since process start) still emits a `<name> 0` line, so
+// `present=false` is a strong signal that the metric is unregistered
+// — distinct from the readGaugeValue case where 0 is ambiguous.
+func readGaugeValuePresent(scrape, name string) (float64, bool) {
+	for _, line := range strings.Split(scrape, "\n") {
+		if strings.HasPrefix(line, "# ") {
+			continue
+		}
+		if !strings.HasPrefix(line, name) {
+			continue
+		}
+		rest := line[len(name):]
+		// Reject labeled lines and partial-name matches (e.g.
+		// `<name>_count` for a histogram). Gauge value lines are
+		// `<name> <value>` — the next byte is a space.
+		if !strings.HasPrefix(rest, " ") {
+			continue
+		}
+		var v float64
+		if _, err := fmt.Sscanf(strings.TrimSpace(rest), "%g", &v); err != nil {
+			continue
+		}
+		return v, true
+	}
+	return 0, false
 }
