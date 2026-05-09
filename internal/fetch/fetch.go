@@ -205,18 +205,47 @@ func New(opts Options) (*Client, error) {
 			// Client.Timeout in addition would fire even after our own
 			// ctx cancel, double-cancelling for no benefit.
 			//
-			// Reject *all* upstream redirects in Phase 1. Without this
-			// hook the http.Client would follow 3xx silently, which
-			// bypasses the allowlist (the post-redirect host is never
-			// regex-checked) and breaks the cache-key contract (the URL
-			// the cache stores is the request URL, not the redirect
-			// target). Operators whose archive uses redirects should
-			// configure a Remap rule pointing at the redirect target.
+			// Follow upstream redirects only when the redirect target's
+			// host is itself in allowed_host_regex. Real-world archives
+			// (packages.microsoft.com → an azureedge CDN, debian
+			// security mirrors → regional pools) routinely 30x to a
+			// sibling host the operator has already vouched for, and
+			// blanket-rejecting forced operators to mirror every
+			// possible CDN target with a Remap rule.
+			//
+			// The allowlist is the security boundary: a redirect to an
+			// un-allowlisted host is still refused with
+			// ErrRedirectBlocked, the dial-side deny-CIDR check still
+			// runs on the redirected dial (so SSRF protection holds),
+			// and a non-http(s) scheme is refused outright. The cache
+			// key remains (scheme, canonical host, path) of the
+			// original inbound request — the redirect chain is internal
+			// and bytes from the final hop land under the original
+			// cache key, which is exactly what we want.
+			//
+			// We also enforce a 10-redirect cap. net/http's default
+			// CheckRedirect (which we replace) enforces this; once we
+			// substitute our own, the cap is on us.
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) == 0 {
-					return fmt.Errorf("%w: redirected to %s", ErrRedirectBlocked, req.URL)
+				if len(via) >= 10 {
+					return fmt.Errorf("%w: stopped after 10 redirects (last: %s)",
+						ErrRedirectBlocked, req.URL)
 				}
-				return fmt.Errorf("%w: %s -> %s", ErrRedirectBlocked, via[len(via)-1].URL, req.URL)
+				scheme := strings.ToLower(req.URL.Scheme)
+				if scheme != "http" && scheme != "https" {
+					return fmt.Errorf("%w: redirect to unsupported scheme %q (%s)",
+						ErrRedirectBlocked, scheme, req.URL)
+				}
+				target := normalizeHost(req.URL.Hostname())
+				if target == "" || !hostAllowed(allow, target) {
+					from := "<initial>"
+					if len(via) > 0 {
+						from = via[len(via)-1].URL.String()
+					}
+					return fmt.Errorf("%w: %s -> %s (target host not in allowed_host_regex)",
+						ErrRedirectBlocked, from, req.URL)
+				}
+				return nil
 			},
 		},
 		allow:        allow,

@@ -708,9 +708,9 @@ func TestAddrInDeny_IPv4MappedIPv6(t *testing.T) {
 	}
 }
 
-// TestFetch_RedirectBlocked verifies that 3xx responses are not followed.
-// Without CheckRedirect, http.Client would silently fetch the redirect
-// target — bypassing the allowlist and breaking the cache-key contract.
+// TestFetch_RedirectBlocked verifies that 3xx responses to a host NOT in
+// the allowlist are refused with ErrRedirectBlocked. Without CheckRedirect,
+// http.Client would silently follow — bypassing the allowlist.
 func TestFetch_RedirectBlocked(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Redirect(w, &http.Request{}, "http://other.example.com/", http.StatusFound)
@@ -724,6 +724,52 @@ func TestFetch_RedirectBlocked(t *testing.T) {
 	}, &bufDst{})
 	if !errors.Is(err, ErrRedirectBlocked) {
 		t.Errorf("want ErrRedirectBlocked, got %v", err)
+	}
+}
+
+// TestFetch_RedirectFollowedToAllowedHost verifies that a 3xx whose target
+// host IS in the allowlist is followed transparently and the final body is
+// streamed into dst. The allow regex `^127\.0\.0\.1$` matches both
+// httptest servers (both bind 127.0.0.1, just on different ports), which
+// is the same shape as the real packages.microsoft.com → CDN handoff
+// where the operator has put both hosts in allowed_host_regex.
+func TestFetch_RedirectFollowedToAllowedHost(t *testing.T) {
+	wantBody := []byte("redirected payload")
+	var firstHits, finalHits atomic.Int32
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		finalHits.Add(1)
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(wantBody)))
+		_, _ = w.Write(wantBody)
+	}))
+	defer final.Close()
+
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstHits.Add(1)
+		http.Redirect(w, r, final.URL+"/payload", http.StatusFound)
+	}))
+	defer first.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	res, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           first.URL + "/start",
+	}, dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if res.Status != http.StatusOK {
+		t.Errorf("Status = %d, want 200", res.Status)
+	}
+	if dst.String() != string(wantBody) {
+		t.Errorf("body = %q, want %q", dst.String(), string(wantBody))
+	}
+	if got := firstHits.Load(); got != 1 {
+		t.Errorf("first server hits = %d, want 1", got)
+	}
+	if got := finalHits.Load(); got != 1 {
+		t.Errorf("final server hits = %d, want 1", got)
 	}
 }
 

@@ -20,13 +20,25 @@ func compileAllow(patterns []string) ([]*regexp.Regexp, error) {
 	return out, nil
 }
 
+// hostAllowed reports whether host matches any compiled allowlist regex.
+// Shared by the per-Fetch allowlist gate (checkAllowed) and the
+// CheckRedirect closure in New(): both need the same predicate, but
+// CheckRedirect runs on a slice captured at construction time before the
+// *Client struct is fully built.
+func hostAllowed(allow []*regexp.Regexp, host string) bool {
+	for _, re := range allow {
+		if re.MatchString(host) {
+			return true
+		}
+	}
+	return false
+}
+
 // checkAllowed reports whether host (the canonical hostname with no port)
 // matches any allowlist regex. Empty allowlist denies everything.
 func (c *Client) checkAllowed(host string) error {
-	for _, re := range c.allow {
-		if re.MatchString(host) {
-			return nil
-		}
+	if hostAllowed(c.allow, host) {
+		return nil
 	}
 	return fmt.Errorf("%w: %s", ErrHostNotAllowed, host)
 }
@@ -41,5 +53,5 @@ func (c *Client) checkAllowed(host string) error {
 // The empty-allowlist semantic from SPEC §6.6 (deny everything) is
 // preserved.
 func (c *Client) HostAllowed(host string) bool {
-	return c.checkAllowed(host) == nil
+	return hostAllowed(c.allow, host)
 }

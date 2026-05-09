@@ -1,16 +1,21 @@
 package main
 
-// SPEC6 §11 F22 + §15 #2 — HTTPS→HTTP redirect is not auto-followed.
+// SPEC6 §11 F22 + §15 #2 — redirect to a host NOT in
+// allowed_host_regex is not auto-followed.
 //
-// §11 F22: "Upstream sends a redirect from `https://` to `http://`
-// (or any other 3xx). Inner GET fails with `outcome=bad_gateway`
+// §11 F22: "Upstream sends a redirect to a host that is NOT in
+// allowed_host_regex (here a scheme-downgrading redirect to
+// example.test, deliberately outside the test allowlist
+// `^127\.0\.0\.1$`). Inner GET fails with `outcome=bad_gateway`
 // (handler.go:1547-1556 maps `fetch.ErrRedirectBlocked` → 502).
 // The upstream's 3xx status code is preserved on the request log
-// line as `upstream_status`. The cache does NOT silently follow
-// the redirect or downgrade the inner request to HTTP; apt sees a
-// 502 from the cache rather than the 3xx from upstream. Operators
-// whose archive uses redirects configure a Remap rule pointing at
-// the redirect target."
+// line as `upstream_status`. apt sees a 502 from the cache rather
+// than the 3xx from upstream."
+//
+// fetch's CheckRedirect *does* follow redirects whose target host
+// is in the allowlist (e.g. packages.microsoft.com → an azureedge
+// CDN that the operator has allowlisted alongside it); that path
+// is exercised by internal/fetch.TestFetch_RedirectFollowedToAllowedHost.
 //
 // §12.4 maps F22 to "12.2 integration (HTTPS→HTTP redirect not
 // auto-followed)".
@@ -56,11 +61,11 @@ func TestServe_HTTPSUpstream_Redirect_BadGateway(t *testing.T) {
 	var upstreamHits atomic.Int32
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits.Add(1)
-		// 301 with a Location pointing to a different scheme. fetch's
-		// CheckRedirect refuses ALL redirects regardless of target
-		// scheme, so the exact target only matters for the upstream's
-		// audit trail; what we care about is that the cache surfaces
-		// a 502 instead of following.
+		// 301 with a Location pointing at example.test, deliberately a
+		// host the test allowlist (`^127\.0\.0\.1$`) does not match.
+		// fetch's CheckRedirect refuses redirects whose target host is
+		// outside allowed_host_regex; what we care about is that the
+		// cache surfaces a 502 instead of following.
 		w.Header().Set("Location", "http://example.test/redirected"+r.URL.Path)
 		w.WriteHeader(http.StatusMovedPermanently)
 	}))
