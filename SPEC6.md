@@ -1273,32 +1273,41 @@ no concept of MITM, so neither `logRequest` nor any of its
 ~20 call sites carry an MITM signal. Phase 6 adds the §10.1
 `mitm` log field; the integration contract is:
 
-1. **Sentinel.** A new package-private context-key
-   `mitmCtxKey` is declared in `internal/handler/handler.go`
-   alongside the existing handler internals. Its concrete
-   type is an unexported empty struct
-   (`type mitmCtxKey struct{}`) so the key cannot collide
-   with any external context value.
-2. **Setter.** The CONNECT handler (`internal/proxy/connect.go`)
-   attaches the marker on the synthetic inner request's
-   context before calling into `Handler.ServeHTTP`:
-   `ctx = context.WithValue(ctx, handler.MITMCtxKey, struct{}{})`.
-   The key is exported as `handler.MITMCtxKey` (or accessed
-   via a tiny exported helper `handler.WithMITMMarker(ctx)`)
-   so the proxy package can attach it without circular import.
-3. **Reader.** `logRequest` calls a new private helper
-   `func isMITMRequest(r *http.Request) bool` that returns
-   `r.Context().Value(mitmCtxKey{}) != nil`. The helper is
-   called once at the top of `logRequest` and the boolean
-   is appended to the slog attrs as `"mitm", b`. The 20+
+1. **Sentinel.** A package-private context-key
+   `mitmCtxKey` is declared in
+   `internal/proxy/connect.go:720`. Its concrete type is
+   an unexported empty struct (`type mitmCtxKey struct{}`)
+   so the key cannot collide with any external context
+   value. Ownership lives in the proxy package — the
+   handler imports proxy (one-way), avoiding the circular
+   import that would arise if the marker API lived in
+   `internal/handler`.
+2. **Setter.** The CONNECT handler attaches the marker on
+   the synthetic inner request's context before dispatch
+   (see `internal/proxy/connect.go:620`):
+   `synth = synth.WithContext(WithMITMContext(synthParent))`.
+   `proxy.WithMITMContext` (defined at
+   `internal/proxy/connect.go:727-729`) is the exported
+   helper that wraps a parent context; the key itself
+   stays unexported.
+3. **Reader.** `logRequest` calls
+   `proxy.IsMITMContext` (defined at
+   `internal/proxy/connect.go:735-740`) once near the end
+   of the function and CONDITIONALLY appends
+   `"mitm", true` to the slog attrs only when the context
+   carries the marker (see
+   `internal/handler/handler.go:1780-1782`). The 20+
    existing call sites do NOT change — `logRequest`'s
    signature is unchanged, and the marker is read off the
    request context the same way `r.RemoteAddr` is.
 4. **Plain requests** (no CONNECT origin) carry no marker
-   value, so `isMITMRequest` returns false and the log
-   line emits `"mitm", false`. The default value matches
-   pre-Phase-6 behavior (effectively all-false historically;
-   the field is new in Phase 6 §10.1).
+   value, so `proxy.IsMITMContext` returns false and the
+   log line OMITS the `mitm` key entirely (no
+   `"mitm", false` is appended). The absence of the key
+   is the negative signal — operators
+   `grep '"mitm":true'` to select MITM-tunneled requests
+   without needing to filter false cases. See §10.1 for
+   the operator-facing description.
 
 Why a context value rather than a `logRequest` parameter:
 the parameter approach would require touching every call
@@ -1306,17 +1315,23 @@ site (≥20 lines per the grep at `handler.go`), expanding
 the Phase 6 surface area into the §6.1 / §6.4 / §6.5
 handler-internal paths Phase 6 otherwise does NOT modify.
 A context marker localizes the change to one read site
-(`logRequest`) and one write site (`internal/proxy/connect.go`).
+(`logRequest`) and one write site
+(`internal/proxy/connect.go:620`).
 
 This contract is implementation-binding: the §12.2
-integration test asserts that an inner GET dispatched from
-a CONNECT emits a `request` log line with `mitm=true`, and
-a plain proxy GET on the same listener emits the same line
-shape with `mitm=false`. Other handler-internal call paths
-are not allowed to wrap the request in a context that
-strips this value (the existing handler does not — it uses
-`r.Context()` only as a read source for cancellation, never
-re-wraps it).
+integration test
+(`TestLogRequest_MITMField_PresentForMITMContext` in
+`internal/handler/connect_integration_test.go:97`) asserts
+that an inner GET dispatched from a CONNECT emits a
+`request` log line with `mitm: true`, AND that a plain
+proxy GET on the same listener emits a line that OMITS
+the `mitm` key entirely (the test fails on
+`"mitm":false` as much as on `"mitm":true` for plain
+requests). Other handler-internal call paths are not
+allowed to wrap the request in a context that strips this
+value (the existing handler does not — it uses
+`r.Context()` only as a read source for cancellation,
+never re-wraps it).
 
 ### 6.3 Response writing
 
