@@ -2026,11 +2026,25 @@ TCP client:
 
 Under `e2e/`:
 
-- A new `mitm_e2e_test.go` runs apt-get update against
-  three HTTPS upstreams (apt.corretto.aws,
-  packages.microsoft.com, one mirror behind real HTTPS).
-  First pull warms the cache; second pull is verified to
-  hit the cache (`X-Cache: HIT` on the inner response).
+- A Docker-Compose rig (`e2e/run.sh` + `e2e/docker-compose.yml`)
+  exercises the full request path end-to-end. Three services on a
+  private bridge network: an `upstream` nginx serving a baked-in
+  apt repo (`hello-acu_1.0`) built by `e2e/upstream/build-repo.sh`,
+  a `cache` apt-cacher-ultra container built from the current source
+  tree, and a `client` ubuntu:noble container that runs `apt-get
+  update && apt-get install hello-acu` through the cache (HTTP proxy
+  mode via `/etc/apt/apt.conf.d/00proxy`). The rig is HTTP-only —
+  it does NOT exercise the MITM CONNECT path; that surface is covered
+  by §12.1 unit tests + §12.2 in-process integration tests on
+  `httptest.NewTLSServer`. First `apt-get update` warms metadata,
+  the install drives a `.deb` MISS, the second `apt-get update`
+  re-fetches metadata against the now-warm cache. The driver script
+  fails unless `docker compose logs cache` contains at least one
+  `outcome=hit` log line on a slog key=value boundary (anchored
+  regex rejects `outcome=hit_stale` / `outcome=hit_coalesced`,
+  which are legal §10 outcomes that do not prove a fresh cache hit).
+  Run via `bash e2e/run.sh`; on failure the cleanup trap dumps
+  upstream/cache/client logs before tearing down volumes.
 
 ### 12.3 Chaos tests
 
@@ -2149,6 +2163,7 @@ by at least one test in §12.1, §12.2, or §12.3:
 | F11 | 12.1 unit (CONNECT handler non-GET/HEAD inner) |
 | F11a | 12.1 unit (CONNECT handler inner-header slowloris: completes handshake then trickles the inner request byte-by-byte; 10s after handshake the conn closes with `outcome=inner_header_timeout`) |
 | F11b | 12.1 unit (CONNECT handler inner-header oversize: completes handshake then sends 128 KiB of header padding within the 10s budget; conn closes with `outcome=inner_header_too_large` after the 64 KiB byte cap fires) |
+| F11c | 12.1 unit (`internal/proxy/connect_stats_test.go` `TestConnectStats_InnerStreamFailedTLSReached` and `TestConnectStats_InnerStreamFailedNoTLS` cover the §9.7.6 pre/post-TLS classification; the per-call-site emission paths are exercised by neighboring CONNECT-handler tests) |
 | F12 | 12.1 unit (CONNECT handler bad port) |
 | F13 | 12.1 unit (CONNECT handler IP-literal) |
 | F13a | 12.1 unit (CONNECT handler bad-target table-driven test: missing port, empty host, non-numeric port, port out of range, multi-colon, unbracketed IPv6) |
