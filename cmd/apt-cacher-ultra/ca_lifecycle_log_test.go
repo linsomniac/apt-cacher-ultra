@@ -111,7 +111,7 @@ func bootDaemonCaptureStartup(t *testing.T, cacheDir string) string {
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, nil)
+		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, nil, nil)
 	}()
 
 	// sync.Once gates explicit-shutdown vs. backstop-cleanup. Each

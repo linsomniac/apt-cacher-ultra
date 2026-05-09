@@ -140,7 +140,7 @@ func TestServe_GracefulShutdown_FetchMidStream_NoOrphanBlob(t *testing.T) {
 
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil)
+		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
 	}()
 
 	if err := waitForDaemonReady(t, cacheAddr, 10*time.Second); err != nil {

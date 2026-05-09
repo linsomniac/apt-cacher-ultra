@@ -47,6 +47,38 @@ func TestTranslateRegex_AcceptedShapes(t *testing.T) {
 			`^(foo\.example\.com|foo\.example\.com|bar\.example\.com)$`,
 			[]string{"foo.example.com", "bar.example.com"},
 		},
+		// SPEC6 §5.1.1.1: anchors are optional. The unanchored
+		// variants of every accepted shape translate identically.
+		{
+			"shape 1 unanchored: literal hostname",
+			`foo\.example\.com`,
+			[]string{"foo.example.com"},
+		},
+		{
+			"shape 1 unanchored: single-label hostname",
+			`localhost`,
+			[]string{"localhost"},
+		},
+		{
+			"shape 2 unanchored: positive single-label prefix",
+			`[a-z0-9-]+\.foo\.com`,
+			[]string{"foo.com"},
+		},
+		{
+			"shape 2 unanchored: negated-dot single-label prefix",
+			`[^.]+\.foo\.com`,
+			[]string{"foo.com"},
+		},
+		{
+			"shape 3 unanchored: optional 2-letter region prefix",
+			`([a-z]{2}\.)?archive\.ubuntu\.com`,
+			[]string{"archive.ubuntu.com"},
+		},
+		{
+			"shape 4 unanchored: alternation of literals",
+			`(foo\.example\.com|bar\.example\.com)`,
+			[]string{"foo.example.com", "bar.example.com"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -68,9 +100,13 @@ func TestTranslateRegex_RejectedShapes(t *testing.T) {
 	}{
 		{"empty regex", ``},
 		{"just .*", `.*`},
-		{"unanchored literal", `foo\.example\.com`},
-		{"missing leading anchor", `foo\.example\.com$`},
-		{"missing trailing anchor", `^foo\.example\.com`},
+		// Asymmetric anchors are rejected because their semantics
+		// diverge from the bare-literal form: `^foo\.com` matches
+		// any string starting with foo.com (e.g. `foo.com.evil.org`)
+		// and `foo\.com$` matches any string ending with it. SPEC6
+		// §5.1.1.1's "anchors optional" rule is both-or-neither.
+		{"missing leading anchor (only $)", `foo\.example\.com$`},
+		{"missing trailing anchor (only ^)", `^foo\.example\.com`},
 		{"charclass admitting dot", `^[a-z0-9.-]+\.foo\.com$`},
 		{"unbounded multi-label suffix path", `^.*\.foo\.com$`},
 		{"label with non-LDH character", `^foo_bar\.com$`},

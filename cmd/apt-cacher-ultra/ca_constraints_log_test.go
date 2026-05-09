@@ -69,7 +69,7 @@ func TestServe_TlsMitmStartup_EmptyRegex_SkipsNameConstraints(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, nil)
+		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, nil, nil)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -146,7 +146,7 @@ func TestServe_TlsMitmStartup_EmptyRegex_RefusesUnconstrained(t *testing.T) {
 
 	// serveListeners is expected to return an error from
 	// wireTlsMitm. Capture it.
-	serveErr := serveListeners(ctx, cfg, logger, cacheLn, nil, nil)
+	serveErr := serveListeners(ctx, cfg, logger, cacheLn, nil, nil, nil)
 	if serveErr == nil {
 		t.Fatalf("serveListeners returned nil; expected unconstrained-CA refusal")
 	}

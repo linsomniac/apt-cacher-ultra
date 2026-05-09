@@ -90,7 +90,7 @@ func TestServe_StatusPage_TLSMITMSection_ReflectsLiveCertIssuance(t *testing.T) 
 
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, adminLn)
+		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, adminLn, nil)
 	}()
 	// Single shutdown cleanup that runs before the metric unregister
 	// (t.Cleanup is LIFO). cancel() → wait serveDone → unregister.

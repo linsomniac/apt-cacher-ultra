@@ -280,6 +280,18 @@ func TestServeCONNECT_HappyPath(t *testing.T) {
 		t.Errorf("inner body = %q, want %q", innerBody, "hello")
 	}
 
+	// SPEC6 §6.3: inner response must advertise Connection: close so
+	// HTTP/1.1 clients (apt) cannot mistakenly assume keepalive
+	// within the single-shot CONNECT tunnel and pipeline a second
+	// request.
+	if !innerResp.Close {
+		t.Errorf("§6.3 inner response Close = false; expected Connection: close")
+	}
+	// SPEC6 §6.3: inner response carries the X-Acu-Mitm: 1 marker.
+	if got := innerResp.Header.Get("X-Acu-Mitm"); got != "1" {
+		t.Errorf("inner response X-Acu-Mitm = %q, want %q", got, "1")
+	}
+
 	if dispatchedReq == nil {
 		t.Fatal("dispatcher was never called")
 	}

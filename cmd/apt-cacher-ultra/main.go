@@ -175,7 +175,23 @@ func run(configPath string) error {
 // cfg.Cache.ListenTLS) before being handed to serveListeners. Tests bypass
 // this and call serveListeners directly with their own listeners — that is
 // the only practical way to learn a `:0`-bound port without racing.
+//
+// SPEC6 §9.5 step 2 mandates CA materialization BEFORE the proxy bind.
+// The bind-then-CA-fail window would otherwise leave :3142 accepting
+// (and 503-ing CONNECT) for the duration of a 30s flock timeout or an
+// unconstrained-CA refusal, surfacing as transient connect/reset
+// behaviour to clients. Failing fast at CA load runs the bind
+// conditionally on the prerequisite working.
 func serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+	var preloadedCA *tlsmitm.CA
+	if cfg.TlsMitm.Enabled {
+		ca, err := loadMitmCA(cfg, logger)
+		if err != nil {
+			return fmt.Errorf("tls_mitm CA: %w", err)
+		}
+		preloadedCA = ca
+	}
+
 	plainLn, err := net.Listen("tcp", cfg.Cache.Listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.Cache.Listen, err)
@@ -206,7 +222,30 @@ func serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		}
 	}
 
-	return serveListeners(ctx, cfg, logger, plainLn, tlsLn, adminLn)
+	return serveListeners(ctx, cfg, logger, plainLn, tlsLn, adminLn, preloadedCA)
+}
+
+// loadMitmCA performs the SPEC6 §9.5 step 2 pre-bind CA materialization.
+// Splitting this out lets serve() fail fast on CA-load errors before any
+// listener binds. wireTlsMitm later receives the result and skips its
+// own LoadOrGenerate call. Tests that call serveListeners directly
+// pass nil, in which case wireTlsMitm performs the load itself —
+// acceptable because tests aren't subject to the bind-then-fail
+// concern.
+func loadMitmCA(cfg *config.Config, logger *slog.Logger) (*tlsmitm.CA, error) {
+	tmCfg := cfg.TlsMitm
+	return tlsmitm.LoadOrGenerate(tlsmitm.LoadOptions{
+		SuppliedCertPath:     tmCfg.CaCert,
+		SuppliedKeyPath:      tmCfg.CaKey,
+		StorageDir:           cfg.EffectiveCaStorageDir(),
+		AllowedHostRegex:     tmCfg.AllowedHostRegex,
+		AllowUnconstrainedCA: tmCfg.AllowUnconstrainedCA,
+		CALifetime:           tmCfg.CACertLifetime.Duration,
+		LockTimeout:          caLockTimeoutForTest,
+		LogFn: func(level, event string, fields map[string]any) {
+			emitTlsMitmLog(logger, level, event, fields)
+		},
+	})
 }
 
 // serveListeners is the inner serve loop. It owns its listeners (closing
@@ -225,6 +264,7 @@ func serveListeners(
 	plainLn net.Listener,
 	tlsLn net.Listener,
 	adminLn net.Listener,
+	preloadedCA *tlsmitm.CA,
 ) (retErr error) {
 	defer func() {
 		// Defensive: if we error out before the goroutines start serving,
@@ -496,7 +536,7 @@ func serveListeners(
 	// is up would race those reads — see Handler.SetConnectHandler.
 	var mitmHandles *tlsMitmHandles
 	if cfg.TlsMitm.Enabled {
-		hs, err := wireTlsMitm(ctx, cfg, parser, fetchClient, h, logger)
+		hs, err := wireTlsMitm(ctx, cfg, parser, fetchClient, h, logger, preloadedCA)
 		if err != nil {
 			return fmt.Errorf("build tls_mitm: %w", err)
 		}
@@ -743,8 +783,8 @@ func serveListeners(
 	// neither waits for nor closes hijacked conns, so a stalled
 	// CONNECT (client hijacks but never sends ClientHello) would
 	// otherwise block h.Close → activeWG.Wait below for the full
-	// 30s default HandshakeTimeout — well past any reasonable
-	// drain budget. Manager.Drain cancels the manager parent ctx
+	// 20s default HandshakeTimeout (§9.2) — well past any
+	// reasonable drain budget. Manager.Drain cancels the manager parent ctx
 	// (propagating to live tunnels' synthetic inner request ctxs),
 	// waits up to the remaining shutdown budget for the in-flight
 	// WG to drain, and on deadline expiry force-closes every
@@ -1001,23 +1041,32 @@ type tlsMitmHandles struct {
 	Manager *proxy.TunnelManager
 }
 
-func wireTlsMitm(ctx context.Context, cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Client, h *handler.Handler, logger *slog.Logger) (*tlsMitmHandles, error) {
+func wireTlsMitm(ctx context.Context, cfg *config.Config, parser *proxy.Parser, fetchClient *fetch.Client, h *handler.Handler, logger *slog.Logger, preloadedCA *tlsmitm.CA) (*tlsMitmHandles, error) {
 	tmCfg := cfg.TlsMitm
 
-	ca, err := tlsmitm.LoadOrGenerate(tlsmitm.LoadOptions{
-		SuppliedCertPath:     tmCfg.CaCert,
-		SuppliedKeyPath:      tmCfg.CaKey,
-		StorageDir:           cfg.EffectiveCaStorageDir(),
-		AllowedHostRegex:     tmCfg.AllowedHostRegex,
-		AllowUnconstrainedCA: tmCfg.AllowUnconstrainedCA,
-		CALifetime:           tmCfg.CACertLifetime.Duration,
-		LockTimeout:          caLockTimeoutForTest,
-		LogFn: func(level, event string, fields map[string]any) {
-			emitTlsMitmLog(logger, level, event, fields)
-		},
-	})
-	if err != nil {
-		return nil, err
+	// Production calls loadMitmCA before the proxy bind (SPEC6
+	// §9.5 step 2); the result is threaded down here so we don't
+	// LoadOrGenerate twice. Tests calling serveListeners directly
+	// pass nil, in which case we materialize the CA on the spot —
+	// the bind-then-fail concern doesn't apply to them.
+	ca := preloadedCA
+	if ca == nil {
+		var err error
+		ca, err = tlsmitm.LoadOrGenerate(tlsmitm.LoadOptions{
+			SuppliedCertPath:     tmCfg.CaCert,
+			SuppliedKeyPath:      tmCfg.CaKey,
+			StorageDir:           cfg.EffectiveCaStorageDir(),
+			AllowedHostRegex:     tmCfg.AllowedHostRegex,
+			AllowUnconstrainedCA: tmCfg.AllowUnconstrainedCA,
+			CALifetime:           tmCfg.CACertLifetime.Duration,
+			LockTimeout:          caLockTimeoutForTest,
+			LogFn: func(level, event string, fields map[string]any) {
+				emitTlsMitmLog(logger, level, event, fields)
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	leafAlg, err := tlsmitm.ParseLeafAlgorithm(tmCfg.LeafAlgorithm)
@@ -1131,22 +1180,34 @@ func wireTlsMitm(ctx context.Context, cfg *config.Config, parser *proxy.Parser, 
 	}
 	h.SetConnectHandler(connectHandler)
 
-	// SPEC6 §5.3 tls_mitm_enabled startup loud-config Info. The
-	// match_count / total_canonical_hosts pair is a sanity-check, NOT
-	// a correctness primitive — a regex that matches zero of the
-	// closed canonical-host set may still legitimately match the
-	// operator's intended hostname (which need not be among the
-	// known canonicals). When the regex is empty (vacuous-true),
-	// match_count == total_canonical_hosts.
+	// SPEC6 §5.3 tls_mitm_enabled startup loud-config Info.
+	// match_count is the count of Remap-canonical-host literals
+	// that pass the EFFECTIVE allowlist — i.e. the §5.1.2
+	// conjunction of the literal-host signing gate
+	// (`tls_mitm.allowed_host_regex`) AND the canonical-host
+	// fetch gate (`upstream.allowed_host_regex`). Counting only
+	// the signing gate would be misleading when a wide MITM regex
+	// is paired with a narrow upstream allowlist, since every
+	// CONNECT for a host the fetch gate rejects ends in
+	// `denied_gate=fetch` regardless of how permissive the
+	// signing gate is. When both gates are vacuous-true, all
+	// canonical hosts match.
+	//
+	// The pair is a sanity-check, NOT a correctness primitive — a
+	// gate that matches zero of the closed canonical-host set may
+	// still legitimately match the operator's intended hostname
+	// (which need not be among the known canonicals).
 	canonicalHosts := parser.CanonicalHosts()
-	matchCount := len(canonicalHosts)
-	if signingGate != nil {
-		matchCount = 0
-		for _, h := range canonicalHosts {
-			if signingGate(h) {
-				matchCount++
-			}
+	fetchGate := fetchClient.HostAllowed
+	matchCount := 0
+	for _, h := range canonicalHosts {
+		if signingGate != nil && !signingGate(h) {
+			continue
 		}
+		if !fetchGate(h) {
+			continue
+		}
+		matchCount++
 	}
 	logger.Info("tls_mitm_enabled",
 		"source", ca.Source.String(),

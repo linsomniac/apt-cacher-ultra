@@ -93,7 +93,7 @@ func TestServe_TlsMitmStartup_FlockHeld_EmitsLockTimeout(t *testing.T) {
 
 	// serveListeners is expected to return an error from
 	// wireTlsMitm because the flock acquire times out.
-	serveErr := serveListeners(ctx, cfg, logger, cacheLn, nil, nil)
+	serveErr := serveListeners(ctx, cfg, logger, cacheLn, nil, nil, nil)
 	if serveErr == nil {
 		t.Fatalf("serveListeners returned nil; expected lock-timeout error")
 	}

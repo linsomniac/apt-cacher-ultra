@@ -77,7 +77,7 @@ func TestServe_TlsMitmStartup_PartialCADir_EmitsLoadFailed(t *testing.T) {
 	// serveListeners is expected to return an error from
 	// wireTlsMitm because the partial CA dir is unrecoverable
 	// without operator intervention.
-	serveErr := serveListeners(ctx, cfg, logger, cacheLn, nil, nil)
+	serveErr := serveListeners(ctx, cfg, logger, cacheLn, nil, nil, nil)
 	if serveErr == nil {
 		t.Fatalf("serveListeners returned nil; expected partial-CA refusal")
 	}

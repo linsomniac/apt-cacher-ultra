@@ -22,16 +22,19 @@ var ErrNameConstraintsUnsupported = errors.New("tlsmitm: regex shape not support
 // signing-gate predicate, SPEC6 §5.1.2) into a list of dNSName
 // permittedSubtrees suitable for an X.509 NameConstraints extension.
 //
-// SPEC6 §5.1.1.1 fixes the accepted RE2 fragment:
-//  1. anchored literal hostname:                ^foo\.example\.com$
-//  2. anchored single-label wildcard prefix:    ^[a-z0-9-]+\.foo\.com$ or ^[^.]+\.foo\.com$
-//  3. anchored optional fixed-length region:    ^([a-z]{2}\.)?archive\.ubuntu\.com$
-//  4. anchored alternation of literal hosts:    ^(foo\.com|bar\.com)$
+// SPEC6 §5.1.1.1 fixes the accepted RE2 fragment. Anchors `^…$` are
+// OPTIONAL but must be balanced (both or neither — `^foo` and
+// `foo$` are rejected because their semantics diverge from the
+// bare-literal form):
+//  1. literal hostname:                foo\.example\.com
+//  2. single-label wildcard prefix:    [a-z0-9-]+\.foo\.com or [^.]+\.foo\.com
+//  3. optional fixed-length region:    ([a-z]{2}\.)?archive\.ubuntu\.com
+//  4. alternation of literal hosts:    (foo\.com|bar\.com)
 //
-// Anything else — including unanchored patterns, character classes
-// admitting '.', alternation spanning multiple TLDs in non-trivial
-// ways — yields ErrNameConstraintsUnsupported. The caller treats that
-// the same way it treats an empty regex: fail closed unless
+// Anything else — character classes admitting '.', alternation
+// spanning multiple TLDs in non-trivial ways, etc. — yields
+// ErrNameConstraintsUnsupported. The caller treats that the same
+// way it treats an empty regex: fail closed unless
 // `allow_unconstrained_ca = true`.
 //
 // Non-empty success is the only path that produces Name Constraints;
@@ -73,19 +76,49 @@ func TranslateRegex(pattern string) ([]string, error) {
 	return nil, fmt.Errorf("%w: regex grammar contains constructs (quantifiers, character classes spanning labels, lookaround, etc.) the translator cannot prove a safe NameConstraints superset for", ErrNameConstraintsUnsupported)
 }
 
-// stripAnchors verifies the top-level Concat starts with BeginText and
-// ends with EndText, returning the sub-expression between them. Without
-// these anchors the regex matches arbitrary substrings of any hostname
-// and cannot be safely bounded by NameConstraints.
+// stripAnchors returns the inner sub-expression with `^…$` anchors
+// peeled off when present. SPEC6 §5.1.1.1 makes the anchors optional:
+//
+//   - Both anchors present  →  strip and return the middle.
+//   - Neither anchor present →  pass the regex through unchanged
+//     (a bare literal like `foo\.example\.com` parses to OpLiteral;
+//     a bare alternation parses to OpAlternate or OpCapture[OpAlternate];
+//     a bare shape-2 prefix parses to a non-anchored OpConcat — all
+//     are valid §5.1.1.1 inputs).
+//   - One anchor present, the other absent → REJECTED. `^foo\.com`
+//     matches any string starting with `foo.com`, so a NameConstraints
+//     translation would have to admit `foo.com.evil.org`; `foo\.com$`
+//     diverges similarly. Either form is a different shape than the
+//     §5.1.1.1 bare-literal grammar and the translator declines rather
+//     than silently broaden the constraint set.
 func stripAnchors(re *syntax.Regexp) (*syntax.Regexp, error) {
-	if re.Op != syntax.OpConcat || len(re.Sub) < 2 {
-		return nil, fmt.Errorf("%w: pattern is not anchored with ^…$", ErrNameConstraintsUnsupported)
+	if re.Op != syntax.OpConcat {
+		// Non-Concat top-level — bare literal, bare alternation,
+		// bare capture group, etc. No anchors to strip; pass through.
+		return re, nil
 	}
-	if re.Sub[0].Op != syntax.OpBeginText {
-		return nil, fmt.Errorf("%w: missing leading ^ anchor", ErrNameConstraintsUnsupported)
+	if len(re.Sub) == 0 {
+		return nil, fmt.Errorf("%w: empty pattern", ErrNameConstraintsUnsupported)
 	}
-	if re.Sub[len(re.Sub)-1].Op != syntax.OpEndText {
+
+	hasBegin := re.Sub[0].Op == syntax.OpBeginText
+	hasEnd := re.Sub[len(re.Sub)-1].Op == syntax.OpEndText
+
+	if hasBegin != hasEnd {
+		if !hasBegin {
+			return nil, fmt.Errorf("%w: missing leading ^ anchor", ErrNameConstraintsUnsupported)
+		}
 		return nil, fmt.Errorf("%w: missing trailing $ anchor", ErrNameConstraintsUnsupported)
+	}
+
+	if !hasBegin {
+		// Neither anchor — return the Concat as-is.
+		return re, nil
+	}
+
+	// Both anchors — strip them.
+	if len(re.Sub) < 2 {
+		return nil, fmt.Errorf("%w: empty pattern between anchors", ErrNameConstraintsUnsupported)
 	}
 	middle := re.Sub[1 : len(re.Sub)-1]
 	if len(middle) == 0 {

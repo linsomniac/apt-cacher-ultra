@@ -310,12 +310,13 @@ type HandlerDeps struct {
 	// other policy.
 	TLSConfig *tls.Config
 
-	// HandshakeTimeout caps the TLS handshake. Default 30s if zero.
+	// HandshakeTimeout caps the TLS handshake per SPEC6 §9.2.
+	// Default 20s if zero.
 	HandshakeTimeout time.Duration
 
 	// InnerReadTimeout caps how long the handler waits for the
-	// first byte of the inner request after handshake completes.
-	// Default 30s if zero.
+	// inner request line + headers after handshake completes per
+	// SPEC6 §9.2.1. Default 10s if zero.
 	InnerReadTimeout time.Duration
 
 	// MaxInnerHeaderBytes caps the byte budget for the inner
@@ -391,10 +392,10 @@ func NewConnectHandler(deps HandlerDeps) (*ConnectHandler, error) {
 		return nil, errors.New("connect: nil TLSConfig")
 	}
 	if deps.HandshakeTimeout == 0 {
-		deps.HandshakeTimeout = 30 * time.Second
+		deps.HandshakeTimeout = 20 * time.Second // SPEC6 §9.2
 	}
 	if deps.InnerReadTimeout == 0 {
-		deps.InnerReadTimeout = 30 * time.Second
+		deps.InnerReadTimeout = 10 * time.Second // SPEC6 §9.2.1
 	}
 	if deps.MaxInnerHeaderBytes == 0 {
 		deps.MaxInnerHeaderBytes = 64 << 10 // 64 KiB per SPEC6 §9.2.1
@@ -626,6 +627,11 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 	_ = conn.SetDeadline(time.Time{})
 	rw := newTLSResponseWriter(tlsConn)
 	rw.Header().Set("X-Acu-Mitm", "1")
+	// SPEC6 §6.3: the inner response carries Connection: close so a
+	// well-behaved HTTP/1.1 client (apt) cannot mistakenly assume
+	// keepalive within the CONNECT and pipeline a second request that
+	// the §2.2 single-shot tunnel will never serve.
+	rw.Header().Set("Connection", "close")
 	h.deps.Dispatch(rw, synth)
 
 	// Tunnel close. Phase 6 does NOT support multi-request keepalive

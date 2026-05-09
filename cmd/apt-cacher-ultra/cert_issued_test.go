@@ -65,7 +65,7 @@ func TestServe_LeafCertIssuance_EmitsMITMCertIssuedLog(t *testing.T) {
 
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, nil)
+		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, nil, nil)
 	}()
 
 	if err := waitForDaemonReady(t, cacheAddr, 10*time.Second); err != nil {

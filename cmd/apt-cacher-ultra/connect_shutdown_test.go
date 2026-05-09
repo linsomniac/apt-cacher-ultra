@@ -115,7 +115,7 @@ func TestServe_GracefulShutdown_DrainsInflightCONNECT(t *testing.T) {
 
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil)
+		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
 	}()
 
 	// Wait for the daemon's serve loop to be accepting+handling — the
@@ -246,10 +246,10 @@ func TestServe_GracefulShutdown_DrainsInflightCONNECT(t *testing.T) {
 // parent ctx cancelled at shutdown, and conn registry iterated
 // under mutex on deadline expiry to force-close still-tracked
 // conns) is what makes this work: without it, h.Close →
-// activeWG.Wait blocks for the full 30s default HandshakeTimeout
-// from internal/proxy/connect.go because the hijacked conn still
-// holds the activeWG token and net/http.Server.Shutdown does not
-// touch hijacked conns.
+// activeWG.Wait blocks for the full 20s default HandshakeTimeout
+// (SPEC6 §9.2) from internal/proxy/connect.go because the
+// hijacked conn still holds the activeWG token and
+// net/http.Server.Shutdown does not touch hijacked conns.
 //
 // Test client: opens CONNECT, reads 200, then leaves the conn
 // open without sending any TLS bytes (the daemon's tlsConn is now
@@ -286,7 +286,7 @@ func TestServe_GracefulShutdown_StalledCONNECT_DrainBudget(t *testing.T) {
 
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil)
+		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
 	}()
 
 	if err := waitForDaemonReady(t, cacheAddr, 10*time.Second); err != nil {
@@ -320,9 +320,10 @@ func TestServe_GracefulShutdown_StalledCONNECT_DrainBudget(t *testing.T) {
 	// Tunnel hijacked. ServeCONNECT is now in tls.Conn.Handshake()
 	// reading from the hijacked conn; the test client does NOT send
 	// any TLS bytes and does NOT close. Without the §9.4 manager,
-	// shutdown would block for the full 30s default
-	// HandshakeTimeout. With it, the manager force-closes the conn
-	// at drain-budget expiry (200ms here) and shutdown completes.
+	// shutdown would block for the full 20s default
+	// HandshakeTimeout (§9.2). With it, the manager force-closes
+	// the conn at drain-budget expiry (200ms here) and shutdown
+	// completes.
 	shutdownStart := time.Now()
 	cancel()
 

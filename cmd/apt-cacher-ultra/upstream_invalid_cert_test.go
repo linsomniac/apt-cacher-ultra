@@ -98,7 +98,7 @@ func TestServe_HTTPSUpstream_InvalidCert_Returns502(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		serveErr = serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil)
+		serveErr = serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
 	}()
 
 	t.Cleanup(func() {
