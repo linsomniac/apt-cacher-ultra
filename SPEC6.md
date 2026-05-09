@@ -2194,7 +2194,12 @@ internal/config/
   config.go                     # +TlsMitmConfig struct + validation
 
 internal/proxy/
-  connect.go                    # NEW: CONNECT method handler, inner-GET dispatch
+  connect.go                    # NEW: CONNECT method handler, inner-GET dispatch + WithMITMContext / IsMITMContext marker
+  cert_observability.go         # NEW: §10.4 status-page rolling cert-cache hit rate + last-cert-issued tracker
+  clock_skew.go                 # NEW: §10.2 mitm_clock_skew detector (post-leaf NotBefore vs wall clock check)
+  connect_stats.go              # NEW: §5.3 / §9.7.6 rolling CONNECT-outcome counter (drives tls_mitm_enabled_ca_undistributed)
+  mitm_metrics.go               # NEW: §10.3 acu_mitm_* metric family registration + Record* hooks + §15 #4 zero-gauge seeding
+  tunnel_manager.go             # NEW: §9.4 hijacked-CONNECT registry + parent-context fanout + force-close-at-deadline
   tlsmitm/
     ca.go                       # NEW: CA load / generate / persist
     leafcache.go                # NEW: cert cache (LRU) + singleflight
@@ -2202,11 +2207,13 @@ internal/proxy/
     nameconstraints.go          # NEW: regex → x509 NameConstraints translation
 
 internal/handler/
-  handler.go                    # +CONNECT method routing when MITM enabled
+  handler.go                    # +CONNECT method routing when MITM enabled + conditional `mitm` log field via proxy.IsMITMContext
 
 internal/proxy/
   proxy.go                      # unchanged (HTTPS/// magic stays in isHTTPSMagic / splitHTTPSMagic)
   url.go                        # unchanged (request-URI parsing unchanged)
+  classify.go                   # unchanged (pre-Phase 6)
+  remap.go                      # unchanged (pre-Phase 6)
 
 internal/admin/
   status.go                     # +TLS MITM section in HTML + JSON
@@ -2216,6 +2223,17 @@ packaging/config/
 
 packaging/scripts/
   postinstall.sh                # +chmod 0700 cache_dir/ca/
+
+e2e/                            # NEW: docker-compose §12.2 / §12.4 end-to-end rig
+  Dockerfile.cache              # cache image built from current source tree
+  Dockerfile.client             # ubuntu:noble + apt config pointing at cache
+  Dockerfile.upstream           # nginx + baked apt repo (hello-acu_1.0)
+  docker-compose.yml            # three-service private bridge network
+  run.sh                        # build + compose up driver; asserts `outcome=hit` log line in cache logs
+  cache.toml                    # cache config (allow_host_regex = ^upstream$)
+  client/                       # apt config + run-test.sh entrypoint
+  upstream/                     # build-repo.sh that bakes the test apt repo
+  deb/                          # hello-acu source for the test .deb
 ```
 
 ---
