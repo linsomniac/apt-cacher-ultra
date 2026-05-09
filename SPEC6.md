@@ -1575,12 +1575,17 @@ proxy bind**:
 ### 10.1 Per-request log line — delta
 
 The Phase 1 `request` log line carries an additional field
-`mitm` (bool, `false` for plain requests, `true` for
-inner-GETs dispatched from a CONNECT tunnel). The signal
-source is the §6.2.1 context-marker contract — `logRequest`
-reads `r.Context().Value(mitmCtxKey{})` once and appends the
-boolean to the slog attrs. No `logRequest` call site is
-modified. All other fields unchanged.
+`mitm` (bool, value `true`) ONLY on inner-GETs dispatched
+from a CONNECT tunnel. Plain (non-MITM) requests do NOT
+emit the field — the absence of the key is the negative
+signal, so operators can `grep '"mitm":true'` without
+filtering `false` cases. The signal source is the §6.2.1
+context-marker contract: `logRequest` (see
+`internal/handler/handler.go:1780-1782`) calls
+`proxy.IsMITMContext(r.Context())` once and conditionally
+appends the `mitm` attr only when the context carries the
+marker. No `logRequest` call site is modified. All other
+fields unchanged.
 
 ### 10.2 New `mitm_*` event family
 
