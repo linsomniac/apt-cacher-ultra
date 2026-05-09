@@ -3,26 +3,25 @@ package main
 // SPEC6 §11 F15 + §15 #2 — deny-CIDR fires on inner GET via CONNECT
 // tunnel.
 //
-// §11 F15: "Inner GET upstream fetch fails the SSRF deny-range gate
-// at TCP-connect time. The inner GET response is whatever the existing
-// Phase 1 fetcher returns (typically 502 with `outcome=upstream_denied`
-// on the request log line); tunnel closes after inner response. The
-// CONNECT itself succeeded (as designed; §1.1.3)."
+// §11 F15 (post §15 #17 spec-sync): "Inner GET fails with 403 +
+// `outcome=forbidden` (handler.go:1535-1542 maps `fetch.ErrTargetDenied`
+// → 403); the request log line carries `fetchAttempted=true` and
+// `upstream_status=0`, distinguishing this from the pre-flight host
+// rejection (handler.go:1530-1534, `fetchAttempted=false` so
+// `upstream_status` is omitted). Tunnel closes after the inner
+// response (CONNECT handler reads exactly one inner request; no
+// Keep-Alive loop, see connect.go:545,629). The CONNECT itself
+// succeeded (as designed; §1.1.3)."
 //
 // §12.4 maps F15 to "12.2 integration (deny-range fires on inner GET)".
 //
-// AIDEV-NOTE: SPEC drift (slated for §15 #17 spec-sync). The §11 F15
-// wording above predates handler.go:1535's actual mapping. The
-// fetcher returns ErrTargetDenied when the dialer's ControlContext
-// blocks a deny-range IP; handler.respondFetchFailed dispatches
-// ErrTargetDenied → http.StatusForbidden (403) + outcome=forbidden
-// + fetchAttempted=true (distinguishes from the pre-flight host
-// rejection's fetchAttempted=false). The "typically 502 /
-// upstream_denied" wording in §11 F15 is hedged ("typically") and
-// has no file:line citation, unlike F21/F22 which cite handler.go
-// line ranges. The §15 #17 sweep should sync §11 F15 to the
-// as-built. This test pins the as-built (403 + forbidden +
-// fetchAttempted=true) — what the spec sweep will codify.
+// AIDEV-NOTE: F15's deny-range path and the host-allowlist path BOTH
+// surface as 403 + `outcome=forbidden` on the inner request log line
+// (handler.go:1530-1542). The only operator-visible differentiator is
+// the `upstream_status` field, which logRequest at handler.go:1764
+// emits ONLY when `fetchAttempted=true`. This test asserts presence
+// of that field, which is what proves the deny-CIDR path fired
+// (not the cheaper host-gate path).
 //
 // Distinct from F21 (upstream invalid cert) and F22 (HTTPS→HTTP
 // redirect): F15 fires DURING the dial step (post-DNS, pre-SYN), so
@@ -62,13 +61,14 @@ package main
 //     ErrHostNotAllowed and ErrTargetDenied would surface the same
 //     "forbidden" body.
 //
-// Out-of-scope: the §11 F15 wording also says "tunnel closes after
-// inner response", but pinning that here would couple to behavior
-// that already conflicts with the as-built status-code mapping the
-// §15 #17 sweep needs to reconcile. handler.go does not explicitly
-// close the tunnel after a 403 response; HTTP/1.1 keep-alive may
-// keep it open. Leaving this unasserted until the spec sweep
-// resolves whether "tunnel closes" was prescriptive or descriptive.
+// Out-of-scope: "tunnel closes after inner response" is descriptive
+// not prescriptive — connect.go:545 defers tlsConn.Close() and the
+// dispatch loop at connect.go:629 reads exactly one inner request
+// before returning, so close happens at function exit regardless of
+// status code. Tested elsewhere (the CONNECT handler structure is
+// covered in connect_shutdown_test.go); not re-pinned here to avoid
+// coupling F15's behavior assertion to a property of the surrounding
+// dispatch loop.
 //
 // Mutates package-level shutdownTimeout so NOT t.Parallel.
 

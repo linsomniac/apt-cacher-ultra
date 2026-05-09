@@ -1003,13 +1003,16 @@ literal-host gate and the canonical-host gate (subset of
 misconfiguration (literal host passing MITM gate but
 canonical host failing every entry in the upstream list)
 surfaces as `outcome=denied_host` `mitm_connect` Warn, NOT
-as an established tunnel followed by inner-GET 502 — the
+as an established tunnel followed by inner-GET 403 — the
 §2.2 step 2 fetch-gate check rejects the CONNECT
 pre-handshake before any cert is issued. (Deny-range deny —
 `upstream.deny_target_ranges` matching the inner-GET's
 resolved IP at TCP-connect time — still produces
-`outcome=upstream_denied` on the inner request, since that
-gate is intentionally deferred per §1.1.3.)
+`outcome=forbidden` on the inner request log line with
+`upstream_status` present (`fetchAttempted=true`
+distinguishes it from the pre-flight host rejection which
+sets `fetchAttempted=false`), since that gate is
+intentionally deferred per §1.1.3.)
 
 #### 5.1.3 Leaf cert parameters
 
@@ -1754,7 +1757,7 @@ that top-level keys are stable.
 | F13a | CONNECT request-target structurally malformed (missing port, empty host, non-numeric port, port out of range, multi-colon, unbracketed IPv6, etc. — see §2.2 step 1 enumeration) | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=bad_target`) |
 | F13b | CONNECT host fails IDNA normalization or contains invalid DNS labels | 400 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=bad_host`) |
 | F14 | CONNECT host fails the §5.1.2 effective allowlist (literal host fails signing predicate, OR canonical host fails fetch predicate) | 403 on the CONNECT response; tunnel closes; `mitm_connect` Warn (`outcome=denied_host`, `denied_gate=signing` or `fetch`). No cert is issued, no TLS handshake |
-| F15 | Inner GET upstream fetch fails the SSRF deny-range gate at TCP-connect time | The inner GET response is whatever the existing Phase 1 fetcher returns (typically 502 with `outcome=upstream_denied` on the request log line); tunnel closes after inner response. The CONNECT itself succeeded (as designed; §1.1.3) |
+| F15 | Inner GET upstream fetch fails the SSRF deny-range gate at TCP-connect time | Inner GET fails with 403 + `outcome=forbidden` (handler.go:1535-1542 maps `fetch.ErrTargetDenied` → 403); the request log line carries `fetchAttempted=true` and `upstream_status=0`, distinguishing this from the pre-flight host rejection (handler.go:1530-1534, `fetchAttempted=false` so `upstream_status` is omitted). Tunnel closes after the inner response (CONNECT handler reads exactly one inner request; no Keep-Alive loop, see connect.go:545,629). The CONNECT itself succeeded (as designed; §1.1.3) |
 | F16 | Daemon shuts down during an in-flight CONNECT tunnel | The §9.4 tunnel manager (sync.WaitGroup + conn registry + parent context) drains tunnels on shutdown. `http.Server.Shutdown` does NOT wait for hijacked conns (Go's stdlib contract); the manager fills that gap. Two cancellation paths fan out: the manager's parent ctx (cancels each tunnel's synthetic request ctx) and `h.lifecycleCtx` (cancels in-flight leader fetches in `serveCacheMiss`). On shutdown-deadline expiry, the manager iterates its conn registry and force-closes every still-tracked conn, unblocking any goroutine wedged in TLS handshake / Read / Write. Note: a CLIENT close mid-response cancels only the inner request's context — the leader fetch survives until lifecycleCtx cancels (Phase 1 invariant; see §12.3 chaos test) |
 | F17 | Clock skew: leaf cert `not_before` is in the future | Apt rejects with a `not yet valid` TLS error; cache's clock is the source of truth — operators should run NTP. No Phase 6 mitigation beyond logging on the cache side |
 | F18 | CA expires mid-lifetime | All client TLS handshakes fail; `mitm_connect` Warn `outcome=tls_failed` rate spikes; operator's `acu_mitm_ca_not_after_unixtime` alert (set to fire 30 days before expiry) catches this before the spike |
@@ -1956,9 +1959,12 @@ TCP client:
   via `CheckRedirect` → `ErrRedirectBlocked`); upstream
   redirect status preserved on the `request` log line as
   `upstream_status`; not auto-followed (F22).
-- `acu_requests_total{outcome=upstream_denied}`
-  increments when a denied-target-range deny fires inside
-  the inner GET (F15 end-to-end).
+- `acu_requests_total{outcome=forbidden}` increments when a
+  denied-target-range deny fires inside the inner GET (F15
+  end-to-end). The same outcome label fires on host-allowlist
+  rejection; the deny-range path is distinguished by
+  `upstream_status` field presence on the request log line
+  (set when `fetchAttempted=true`).
 
 Under `e2e/`:
 
