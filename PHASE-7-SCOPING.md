@@ -1,20 +1,26 @@
 # apt-cacher-ultra — Phase 7 Scoping
 
-Status: **scoping in progress, revision 1**. Last updated 2026-05-08.
-Next artifact: SPEC7.md once §7 open questions are resolved.
+Status: **scoping locked** (revision 2). Last updated 2026-05-09.
+Next artifact: `SPEC7.md` modeled on `SPEC6.md`'s structure.
 
-This document proposes Phase 7's theme — **operator control plane** —
-and surfaces the open questions that block locking SPEC7.md. The
-proposal is one of four candidate framings; the alternatives are
-listed in §7.0 and any one of them can swap in. Companion documents
-[PHASE-2-SCOPING.md](PHASE-2-SCOPING.md), [PHASE-3-SCOPING.md](PHASE-3-SCOPING.md),
-[PHASE-4-SCOPING.md](PHASE-4-SCOPING.md), [PHASE-5-SCOPING.md](PHASE-5-SCOPING.md),
-and [PHASE-6-SCOPING.md](PHASE-6-SCOPING.md) record the parallel
+Revision 2 closes the §7 open-question table. The load-bearing
+question §7.0 (theme) resolved to **Bucket A — operator control
+plane**. The fifteen remaining detail questions (§7.1–§7.15) all
+accepted the proposed defaults. All sixteen resolutions are recorded
+in §1.3 below.
+
+This document gathers what Phase 7 is, the hooks Phases 1–6 left in
+place for it, and the locked design decisions that will become
+SPEC7.md. Companion documents [PHASE-2-SCOPING.md](PHASE-2-SCOPING.md),
+[PHASE-3-SCOPING.md](PHASE-3-SCOPING.md),
+[PHASE-4-SCOPING.md](PHASE-4-SCOPING.md),
+[PHASE-5-SCOPING.md](PHASE-5-SCOPING.md), and
+[PHASE-6-SCOPING.md](PHASE-6-SCOPING.md) record the parallel
 exercises for earlier phases.
 
 ---
 
-## 1. Goals (proposed theme: operator control plane)
+## 1. Goals — operator control plane
 
 Phase 1 made the cache-hit path bulletproof. Phase 2 closed the
 integrity and freshness loops. Phase 3 closed the service-continuity
@@ -134,12 +140,78 @@ Newly deferred in Phase 7:
   flows through the admin listener; the proxy listener stays
   pure.
 
-### 1.3 Resolution outcomes (filled in revision 2)
+### 1.3 Resolved during Phase 7 scoping
 
-The fifteen design questions raised in §7 below will be resolved
-during this scoping pass. Once resolved this section will be the
-normative summary, replacing the question-form §7. Until then §7
-is the source of truth.
+The sixteen design questions raised in §7 of revision 1 were
+resolved with the operator during this scoping pass. Each
+resolution is normative for SPEC7.
+
+- **Phase 7 theme (Q0).** **Bucket A — operator control plane.**
+  Phase 5 gave operators eyes; Phase 7 gives them hands. The
+  three alternatives (B repo-feature parity, C observability
+  deepening, D advanced TLS) are not the most operationally
+  valuable next phase given the post-Phase-6 production cutover.
+- **Endpoint sync vs async (Q1).** **Async (202 + jobs store).**
+  GC and CA rotate can take seconds; blocking the request is
+  hostile to HTTP timeouts. `202 Accepted` + `Location:
+  /admin/jobs/{id}` + a JSON jobs surface is the standard shape.
+- **Cache-clear selectors (Q2).** **`canonical_host` and
+  `suite` only.** `path` is the most surgical selector but
+  the hardest to spec (path-vs-canonical-path, percent-encoding);
+  the niche use case does not justify the surface in Phase 7.
+- **Cache-clear under live traffic (Q3).** **In-flight requests
+  complete naturally; new requests miss.** No forced 503. The
+  database commits the row deletes synchronously; pool/ files
+  unlink on the next GC tick (which the operator can also force
+  via `/admin/gc/run`). An "emergency purge" mode that 503s
+  in-flight requests is deferred unless any deployment asks.
+- **CA rotation cross-fade (Q4).** **No cross-fade.** Operator
+  orders distribute-then-rotate. Two-CA cert-cache partitioning
+  + dual-fingerprint reporting + end-of-window cleanup is
+  substantial code for a goal achievable by ordering the
+  ansible step before the rotate call.
+- **Suite refresh URL parameter (Q5).** **Apt path** — the URL is
+  `POST /admin/suites/{path}/refresh` where `{path}` matches the
+  apt sources.list view (e.g. `/ubuntu/dists/jammy`). What an
+  operator types from sources.list, no internal-key translation.
+- **Bearer token auth (Q6).** **Yes — accept Bearer in addition
+  to htpasswd.** `Authorization: Bearer <token>` matches a
+  configured `id:secret` pair. Bearer is opt-in
+  (`mutating_bearer_tokens = []` by default). ansible vaults
+  distribute tokens cleanly without shelling out to `htpasswd -B`.
+- **Caller-label cardinality cap (Q7).** **No additional cap.**
+  The existing Phase 5 `metric_series_cap = 1024` is the upper
+  bound; operators with more than 1024 admin users have bigger
+  problems.
+- **Hot-reload allowlist default (Q8).** **Default-populated.**
+  `[reload].allowed_keys` ships with the §3.4 set out of the
+  box. Operators who want SIGHUP to be a no-op set
+  `allowed_keys = []`. Less ceremony to benefit; the principle-
+  of-least-surprise concern is mitigated by SIGHUP audit logging.
+- **Old-CA disk retention (Q9).** **Keep all historical CAs
+  under `ca/old/{fingerprint}/`.** Disk cost is ~5 KiB per
+  rotation; operators who care prune manually. No automatic
+  retention policy in Phase 7.
+- **Rotate when MITM disabled (Q10).** **Refuse with exit 1.**
+  Match the existing SPEC6 Q12 contract for `ca print`. Writing
+  a keypair the daemon will not load is operator confusion.
+- **SIGHUP during shutdown (Q11).** **Log
+  `reload_during_shutdown_ignored` Info.** Match the existing
+  SIGTERM-during-shutdown observability pattern.
+- **Reload audit-log shape (Q12).** **One event per reload listing
+  all changed keys.** `reload_applied changed=[upstream.allowed_host_regex,log_level]`.
+  Per-key events would explode the event log on a wholesale
+  config update.
+- **Status page caller column (Q13).** **Show `caller` in the
+  status page job table.** Operators looking at the page need
+  to see who triggered recent actions without grepping logs.
+- **Proxy-listener-misroute metric (Q14).** **No new metric.**
+  The existing 405 path on the proxy listener is sufficient. A
+  POST to `/admin/something` on `:3142` is an operator
+  configuration error, not a class of regression worth a counter.
+- **Job retention default (Q15).** **`job_retention = 100`.**
+  Operators with high admin churn raise it to 1000. Memory cost
+  is ~1KB per remembered job.
 
 ---
 
@@ -548,214 +620,10 @@ Phase 7 is gated on:
 
 ## 7. Questions
 
-This is the load-bearing decision section. Each question must be
-resolved (or accepted-with-default) before SPEC7.md locks. Defaults
-are listed; the operator's resolution may differ.
-
-### 7.0 Theme of Phase 7 (load-bearing)
-
-The whole document above proposes **operator control plane** as
-the Phase 7 theme. Three alternatives were surveyed:
-
-- **B — Repository-feature parity.** Source-package caching,
-  multi-arch beyond amd64, pdiff. SPEC §1.2 has carried these
-  across every phase. Highest "matches apt-cacher-ng feature
-  parity" payoff; lowest interaction with the work just done in
-  Phase 6.
-- **C — Observability deepening.** OpenTelemetry / OTLP exporters,
-  distributed tracing, top-package observability with snapshot
-  join (SPEC5 §10.4.1.x). Lowest fleet-config friction (no client-
-  side change). Highest "build on Phase 5" leverage.
-- **D — Advanced TLS.** Admin-listener TLS, HSM / PKCS#11 CA keys,
-  per-client CA pinning, Ed25519 leaf, client TLS auth on admin.
-  Tightest fit alongside Phase 6 work; longest list of items
-  gated on "any deployment asks."
-
-The proposed Bucket A (this document) is the closest analog to
-Phase 5's "give operators eyes" — Phase 7 gives them hands.
-Operationally most valuable for the post-Phase-6 production
-cutover scheduled this month.
-
-**Default proposal:** Bucket A (operator control plane).
-Alternatives can swap by replacing §1 and the rest of the
-document follows.
-
-### 7.1 Endpoint family — synchronous vs async
-
-The §3.1 design uses 202 Accepted + job-status polling. The
-alternative is synchronous: GC and rotate (which can take seconds)
-hold the request open until done. The async pattern is more work
-(jobs store, polling endpoint, status template surface) but keeps
-HTTP timeouts predictable and surfaces in-flight state to the
-status page.
-
-**Default proposal:** Async (202 + jobs store).
-
-### 7.2 Cache-clear selector shape
-
-§3.2 names two selectors: `canonical_host` and `suite`. Open
-question: is `path` (an exact path prefix) needed too? `?path=…`
-is the most surgical selector but the hardest to spec (path vs
-canonical-path, percent-encoding, etc.). `canonical_host` covers
-"this upstream is misbehaving"; `suite` covers "I just promoted
-a new release and want clients to re-pull." `path` covers
-"forget this one debugging-fixture file" — a niche case.
-
-**Default proposal:** Ship `canonical_host` and `suite`. Defer
-`path`.
-
-### 7.3 Cache-clear under live traffic
-
-§3.2 says cache-clear is async — DB updates commit, GC tick
-unlinks. Open question: should the clear emit a synchronous
-"in-flight requests on cleared blobs return 503" or "in-flight
-requests complete, but new requests miss"? The latter is
-operationally less surprising; the former is closer to "emergency
-purge".
-
-**Default proposal:** Latter (in-flight completes, new requests
-miss). Forced 503 is an "emergency purge" mode added if any
-deployment asks.
-
-### 7.4 CA rotation cross-fade
-
-§3.3 proposes immediate switchover with no cross-fade. The
-alternative is a `cross_fade_hours` window where the OLD CA
-remains loaded and signs leaves alongside the NEW CA. Pro:
-operators can rotate before client distribution completes. Con:
-substantial code (two-CA cert cache partitioning, dual
-fingerprint reporting, end-of-window cleanup), and the same goal
-is achieved by ordering: distribute new CA first, then rotate.
-
-**Default proposal:** No cross-fade. Operator orders distribute
-→ rotate.
-
-### 7.5 Suite refresh — by path or by suite-key
-
-§3.1 shows `POST /admin/suites/{path}/refresh`. Open question:
-is the URL parameter the apt path (`/ubuntu/dists/jammy`) or the
-suite key (the canonical name the cache uses internally,
-`ubuntu/jammy`)? Path is more aligned with apt's view; suite-key
-is more aligned with the cache's view. Either would work; the
-choice affects the API contract.
-
-**Default proposal:** Path. It's what an operator types from
-their apt sources.list.
-
-### 7.6 Bearer token auth (alongside htpasswd)
-
-§3.5 proposes htpasswd. Open question: do we also accept Bearer
-tokens? Pro: ansible vaults distribute tokens cleanly; htpasswd
-files require shell-out to `htpasswd -B`. Con: another auth path
-to spec.
-
-**Default proposal:** Yes — accept Bearer in addition to
-htpasswd. Header `Authorization: Bearer <token>` matches a
-configured token-id:secret pair. Bearer is opt-in
-(`mutating_bearer_tokens = []` by default).
-
-### 7.7 Caller-label cardinality
-
-§3.6 makes `caller` a Prometheus label. Open question: what's
-the cap on htpasswd / bearer entries? Prometheus best practice
-caps label cardinality below ~100. Phase 5's `series_cap` is
-1024, which absorbs this comfortably for any realistic htpasswd
-file. The cap doesn't need to be tighter; document it.
-
-**Default proposal:** No additional cap. The existing
-`metric_series_cap = 1024` is the upper bound; operators with
-more than 1024 admin users have bigger problems.
-
-### 7.8 Hot-reload allowlist default
-
-§3.7 ships `[reload].allowed_keys` as an explicit list. Open
-question: does the default config include the §3.4 set, or is
-the default empty (reload disabled until operator opts in)?
-Pro empty: principle of least surprise — SIGHUP doesn't change
-behavior on first install. Pro populated: less ceremony to
-benefit.
-
-**Default proposal:** Default-populated. The §3.4 set ships
-out of the box. Operators who want SIGHUP to be a no-op set
-`allowed_keys = []`.
-
-### 7.9 Where rotate writes the new keypair
-
-§3.3 proposes new files alongside old, then move-old-to-`ca/old/`.
-Open question: is there value in keeping >1 historical CA in
-`ca/old/`, or do we keep only the most recently rotated? The
-former lets operators roll back through multiple rotations; the
-latter is simpler.
-
-**Default proposal:** Keep all historical CAs under
-`ca/old/{fingerprint}/`. Disk cost is ~5 KiB per rotation;
-operators who care prune manually. No automatic retention policy
-in Phase 7.
-
-### 7.10 Rotate behavior when MITM is disabled
-
-§3.3 assumes MITM is enabled. Open question: what does
-`apt-cacher-ultra ca rotate` do when `tls_mitm.enabled = false`?
-Options: (a) refuse with exit 1 ("MITM disabled"), (b) generate
-the keypair anyway (the file is written, ready for whenever the
-operator flips the flag).
-
-**Default proposal:** (a) refuse — match the existing `ca print`
-contract per SPEC6 (Q12).
-
-### 7.11 SIGHUP semantics under shutdown
-
-A SIGHUP arriving after the daemon has begun graceful shutdown
-should be ignored. Open question: do we log it? The existing
-SIGTERM-during-shutdown path logs `shutdown_already_initiated`
-Info; SIGHUP should match.
-
-**Default proposal:** Yes, log
-`reload_during_shutdown_ignored` Info.
-
-### 7.12 Reload audit-log shape
-
-§3.6 logs every action with `admin_action_*`. Open question:
-does config-reload emit one event per changed key, or one event
-listing all changes?
-
-**Default proposal:** One event listing all changes.
-`reload_applied changed=[upstream.allowed_host_regex,log_level]`.
-Per-key would explode the event log on a wholesale config update.
-
-### 7.13 Status page surface
-
-§2 says the new "Action surface" template block shows current
-jobs (id, action, started_at, state) and last 10 completed.
-Open question: do we expose "who" (the `caller` field) on the
-status page? It's already in the audit log.
-
-**Default proposal:** Yes, show `caller` in the status page job
-table. Operators looking at the page need to see who triggered
-recent actions without grepping logs.
-
-### 7.14 Mutating endpoints on the proxy listener
-
-§1.1 explicitly excludes proxy-listener mutating endpoints. Open
-question: does that need a metric? E.g.
-`acu_unexpected_method_total` for "the proxy listener got a POST
-to `/admin/something` because someone misconfigured their script."
-The current proxy listener returns 405 for POST regardless;
-adding telemetry is a small bell.
-
-**Default proposal:** No new metric. The existing 405 path is
-sufficient.
-
-### 7.15 Job retention semantics
-
-§3.7 ships `job_retention = 100`. Open question: is 100 the right
-default? A daemon doing one operator action per day takes 100
-days to wrap; one per hour wraps in ~4 days. The status page
-last-10 view is the human-facing surface; the GET /admin/jobs
-endpoint serves the rest. Higher caps cost memory (~1KB/job).
-
-**Default proposal:** 100. Operators with high admin churn raise
-it to 1000.
+All sixteen questions raised at scoping kickoff are resolved
+(§1.3). No open questions remain. If implementation surfaces new
+tensions the answers should be added here as resolutions, then
+promoted to SPEC7.md.
 
 ---
 
