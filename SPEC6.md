@@ -1139,16 +1139,23 @@ New startup loud-config events:
 
   Implementation: counters of `mitm_connect` outcomes
   observed in a rolling 30-minute window, partitioned into
-  "successful TLS handshake reached" (`tunneled` plus
-  `inner_method_rejected` plus inner-stream outcomes —
-  TLS itself worked) and "TLS-failure" (`tls_failed`,
-  `tls_handshake_timeout`, `cert_gen_failed`). Pre-TLS
-  rejections (`bad_target` / `bad_host` / `bad_port` /
-  `ip_literal_host` / `denied_host`) do NOT count toward
-  either bucket — they are configuration / client errors
-  that arrive before the CA-distribution question. Warn
-  fires when `tls_failure_count >= 1 AND
-  tls_success_count == 0` over the window.
+  "successful TLS handshake reached" (`tunneled`,
+  `inner_method_rejected`, `inner_header_timeout`,
+  `inner_header_too_large`, plus `inner_stream_failed` only
+  when emitted post-handshake — TLS itself worked) and
+  "TLS-failure" (`tls_failed`, `tls_handshake_timeout`,
+  `cert_gen_failed`). Pre-TLS rejections (`bad_target` /
+  `bad_host` / `bad_port` / `ip_literal_host` /
+  `denied_host`, plus pre-handshake `inner_stream_failed`
+  from hijack / write-200 / flush / set-deadline failures)
+  do NOT count toward either bucket — they are configuration
+  / client / I/O errors that arrive before the
+  CA-distribution question. The pre-vs-post split for
+  `inner_stream_failed` rides on the `tlsReached` flag
+  passed at each call site; see `classifyOutcome` in
+  `internal/proxy/connect_stats.go`. Warn fires when
+  `tls_failure_count >= 1 AND tls_success_count == 0` over
+  the window.
 
   Surfaces "operator turned on MITM but the CA is not yet
   trusted by any client" as an operationally-visible
