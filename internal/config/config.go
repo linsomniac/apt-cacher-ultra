@@ -95,6 +95,24 @@ type UpstreamConfig struct {
 	// budget on every miss). SPEC §1 "never hang."
 	UnreachableCooldown     Duration `toml:"unreachable_cooldown"`
 	UnreachableProbeTimeout Duration `toml:"unreachable_probe_timeout"`
+
+	// AllowHTTPSToHTTPRedirect controls whether the upstream fetcher
+	// follows a 3xx that drops scheme from https:// to http://. The
+	// host-allowlist gate (and the dial-side deny-CIDR check) still
+	// runs regardless. Default true.
+	//
+	// Why default-allow: real-world apt mirrors (notably
+	// packages.microsoft.com) 30x to a CDN that may be reached over
+	// HTTP. The threat surface is narrow because apt's signature
+	// chain hash-pins every artifact through the GPG-signed
+	// InRelease — bytes that arrive over the plaintext hop are still
+	// rejected by the client if they don't match the pinned hash.
+	// Operators caching content that is NOT covered by an apt-secure
+	// chain (e.g. unsigned third-party tarballs) should set this to
+	// false; the cache then refuses the redirect with
+	// ErrRedirectBlocked → 502 and the operator must add a Remap
+	// rule pointing at the redirect target instead.
+	AllowHTTPSToHTTPRedirect bool `toml:"allow_https_to_http_redirect"`
 }
 
 type FreshnessConfig struct {
@@ -545,6 +563,14 @@ func defaultConfig() *Config {
 		Serve: ServeConfig{
 			ServeStaleWhenUpstreamDown: true,
 			LogStaleServes:             true,
+		},
+		Upstream: UpstreamConfig{
+			// upstream.allow_https_to_http_redirect defaults true.
+			// Same bool-pre-populate rationale as gc.enabled / admin.enabled
+			// — no zero-value sentinel can distinguish "absent" from
+			// "explicit false." Operators opt out of following downgrade
+			// redirects with `allow_https_to_http_redirect = false`.
+			AllowHTTPSToHTTPRedirect: true,
 		},
 		Adoption: AdoptionConfig{
 			RequireSignature: true,

@@ -99,6 +99,14 @@ type Options struct {
 	UnreachableCooldown     time.Duration
 	UnreachableProbeTimeout time.Duration
 
+	// AllowHTTPSToHTTPRedirect, when true, lets CheckRedirect follow a
+	// 3xx that drops scheme from https:// to http://. False refuses the
+	// redirect with ErrRedirectBlocked. The host-allowlist gate (and
+	// the dial-side deny-CIDR check) still runs regardless. See
+	// config.UpstreamConfig.AllowHTTPSToHTTPRedirect for the threat-
+	// model rationale; default at the config layer is true.
+	AllowHTTPSToHTTPRedirect bool
+
 	// Logger sinks the per-retry "fetch retry" Info line (SPEC §10).
 	// nil falls back to slog.Default() — production main.run sets the
 	// default before fetch.New is called.
@@ -187,6 +195,7 @@ func New(opts Options) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	allowDowngrade := opts.AllowHTTPSToHTTPRedirect
 	tracker := newUnreachableTracker(opts.UnreachableCooldown, opts.UnreachableProbeTimeout, opts.now)
 	transport := newTransport(opts, deny, tracker)
 	ua := opts.UserAgent
@@ -217,13 +226,17 @@ func New(opts Options) (*Client, error) {
 			// redirect to an un-allowlisted host is still refused with
 			// ErrRedirectBlocked, the dial-side deny-CIDR check still
 			// runs on the redirected dial (so SSRF protection holds),
-			// and a non-http(s) scheme is refused outright. We also
-			// refuse HTTPS→HTTP downgrades — the bytes from the final
-			// hop are stored under the original inbound cache key
-			// (scheme, canonical host, path), so allowing a downgrade
-			// would let an on-path attacker on the plaintext hop poison
-			// entries that downstream apt clients believe came from a
-			// verified TLS upstream.
+			// and a non-http(s) scheme is refused outright.
+			//
+			// HTTPS→HTTP scheme downgrades are gated by
+			// opts.AllowHTTPSToHTTPRedirect (config:
+			// upstream.allow_https_to_http_redirect, default true).
+			// When false, the cache refuses the downgrade — useful for
+			// operators caching content that is NOT covered by an
+			// apt-secure signature chain. When true (default), the
+			// cache follows the downgrade and relies on apt's GPG-
+			// signed InRelease + per-artifact hash pins to catch any
+			// poisoning on the plaintext hop.
 			//
 			// We also enforce a 10-redirect cap. net/http's default
 			// CheckRedirect (which we replace) enforces this; once we
@@ -238,16 +251,12 @@ func New(opts Options) (*Client, error) {
 					return fmt.Errorf("%w: redirect to unsupported scheme %q (%s)",
 						ErrRedirectBlocked, scheme, req.URL)
 				}
-				// Refuse HTTPS -> HTTP scheme downgrades even when the
-				// target host is allowlisted. The bytes from the HTTP hop
-				// would be cached under the original HTTPS cache key, so
-				// any on-path attacker on the plaintext hop could poison
-				// cache entries that downstream apt clients believe
-				// originated from a verified TLS upstream. CheckRedirect
-				// is invoked only on a 3xx, so via has length >= 1.
+				// CheckRedirect is invoked only on a 3xx, so via is
+				// always non-empty.
 				prevScheme := strings.ToLower(via[len(via)-1].URL.Scheme)
-				if prevScheme == "https" && scheme == "http" {
-					return fmt.Errorf("%w: scheme downgrade %s -> %s (%s -> %s)",
+				if !allowDowngrade && prevScheme == "https" && scheme == "http" {
+					return fmt.Errorf("%w: scheme downgrade %s -> %s (%s -> %s) "+
+						"(set upstream.allow_https_to_http_redirect = true to follow)",
 						ErrRedirectBlocked, prevScheme, scheme,
 						via[len(via)-1].URL, req.URL)
 				}

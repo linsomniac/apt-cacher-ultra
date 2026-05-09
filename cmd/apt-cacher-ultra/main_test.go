@@ -71,6 +71,12 @@ func minimalCfg(cacheDir string, mirrors []config.MirrorRule) *config.Config {
 		Upstream: config.UpstreamConfig{
 			AllowedHostRegex: []string{`^127\.0\.0\.1$`},
 			DenyTargetRanges: []string{},
+			// Match the production default (set by defaultConfig() in
+			// the Load() path). Defaults() leaves bools alone, so tests
+			// that bypass Load — like minimalCfg — must set this by
+			// hand or get the Go zero (false), which would diverge from
+			// what an operator deploying with no config sees.
+			AllowHTTPSToHTTPRedirect: true,
 		},
 		Mirror: mirrors,
 	}

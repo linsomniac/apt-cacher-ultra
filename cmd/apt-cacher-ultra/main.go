@@ -451,16 +451,17 @@ func serveListeners(
 	}
 
 	fetchClient, err := fetch.New(fetch.Options{
-		ConnectTimeout:          cfg.Upstream.ConnectTimeout.Duration,
-		TotalTimeout:            cfg.Upstream.TotalTimeout.Duration,
-		IdleReadTimeout:         cfg.Upstream.IdleReadTimeout.Duration,
-		MaxRetries:              cfg.Upstream.MaxRetries,
-		UnreachableCooldown:     cfg.Upstream.UnreachableCooldown.Duration,
-		UnreachableProbeTimeout: cfg.Upstream.UnreachableProbeTimeout.Duration,
-		AllowedHostRegex:        cfg.Upstream.AllowedHostRegex,
-		DenyTargetRanges:        cfg.Upstream.DenyTargetRanges,
-		UserAgent:               "apt-cacher-ultra/" + Version,
-		Logger:                  logger,
+		ConnectTimeout:           cfg.Upstream.ConnectTimeout.Duration,
+		TotalTimeout:             cfg.Upstream.TotalTimeout.Duration,
+		IdleReadTimeout:          cfg.Upstream.IdleReadTimeout.Duration,
+		MaxRetries:               cfg.Upstream.MaxRetries,
+		UnreachableCooldown:      cfg.Upstream.UnreachableCooldown.Duration,
+		UnreachableProbeTimeout:  cfg.Upstream.UnreachableProbeTimeout.Duration,
+		AllowedHostRegex:         cfg.Upstream.AllowedHostRegex,
+		DenyTargetRanges:         cfg.Upstream.DenyTargetRanges,
+		AllowHTTPSToHTTPRedirect: cfg.Upstream.AllowHTTPSToHTTPRedirect,
+		UserAgent:                "apt-cacher-ultra/" + Version,
+		Logger:                   logger,
 	})
 	if err != nil {
 		return fmt.Errorf("build fetch client: %w", err)

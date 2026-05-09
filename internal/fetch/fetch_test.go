@@ -728,12 +728,12 @@ func TestFetch_RedirectBlocked(t *testing.T) {
 	}
 }
 
-// TestFetch_RedirectSchemeDowngradeBlocked verifies that an HTTPS upstream
-// that 30x's to an HTTP target on an allowlisted host is still refused
-// with ErrRedirectBlocked. The cache key is the original inbound
-// (scheme, canonical host, path); allowing the downgrade would let an
-// on-path attacker on the plaintext hop poison entries that downstream
-// apt clients believe came from a verified TLS upstream.
+// TestFetch_RedirectSchemeDowngradeBlocked verifies that, when
+// AllowHTTPSToHTTPRedirect is false, an HTTPS upstream that 30x's to an
+// HTTP target on an allowlisted host is refused with ErrRedirectBlocked.
+// Operators deploying this option opt out of trusting their plaintext
+// hop — typical when the cached content is NOT covered by an apt-secure
+// signature chain (e.g. unsigned third-party tarballs).
 func TestFetch_RedirectSchemeDowngradeBlocked(t *testing.T) {
 	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("attacker-controlled bytes"))
@@ -751,10 +751,11 @@ func TestFetch_RedirectSchemeDowngradeBlocked(t *testing.T) {
 	defer restore()
 
 	c, err := New(Options{
-		ConnectTimeout:   2 * time.Second,
-		TotalTimeout:     5 * time.Second,
-		MaxRetries:       0,
-		AllowedHostRegex: []string{`^127\.0\.0\.1$`},
+		ConnectTimeout:           2 * time.Second,
+		TotalTimeout:             5 * time.Second,
+		MaxRetries:               0,
+		AllowedHostRegex:         []string{`^127\.0\.0\.1$`},
+		AllowHTTPSToHTTPRedirect: false,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -772,6 +773,63 @@ func TestFetch_RedirectSchemeDowngradeBlocked(t *testing.T) {
 	}
 	if dst.Written() != 0 {
 		t.Errorf("dst.Written() = %d; downgrade-blocked fetch must not stream the redirect body", dst.Written())
+	}
+}
+
+// TestFetch_RedirectSchemeDowngradeFollowedByDefault is the companion to
+// TestFetch_RedirectSchemeDowngradeBlocked: with AllowHTTPSToHTTPRedirect
+// true (the production default — see config.defaultConfig), the same
+// HTTPS→HTTP redirect to an allowlisted host is followed and the body
+// from the plaintext hop is streamed into dst. The threat model here is
+// covered by apt-secure's GPG-signed InRelease + per-artifact hash pins;
+// poisoned bytes still fail signature/hash verification client-side.
+func TestFetch_RedirectSchemeDowngradeFollowedByDefault(t *testing.T) {
+	wantBody := []byte("downgrade payload")
+	var plainHits atomic.Int32
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		plainHits.Add(1)
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(wantBody)))
+		_, _ = w.Write(wantBody)
+	}))
+	defer plain.Close()
+
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+"/payload", http.StatusFound)
+	}))
+	defer tlsSrv.Close()
+
+	pool := x509.NewCertPool()
+	pool.AddCert(tlsSrv.Certificate())
+	restore := SetRootCAsForTest(pool)
+	defer restore()
+
+	c, err := New(Options{
+		ConnectTimeout:           2 * time.Second,
+		TotalTimeout:             5 * time.Second,
+		MaxRetries:               0,
+		AllowedHostRegex:         []string{`^127\.0\.0\.1$`},
+		AllowHTTPSToHTTPRedirect: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	dst := &bufDst{}
+	res, err := c.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           tlsSrv.URL + "/start",
+	}, dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if res.Status != http.StatusOK {
+		t.Errorf("Status = %d, want 200", res.Status)
+	}
+	if dst.String() != string(wantBody) {
+		t.Errorf("body = %q, want %q", dst.String(), string(wantBody))
+	}
+	if got := plainHits.Load(); got != 1 {
+		t.Errorf("plain HTTP hits = %d, want 1 (downgrade was supposed to be followed)", got)
 	}
 }
 
