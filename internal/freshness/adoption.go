@@ -92,6 +92,25 @@ var (
 	ErrAdoptionUnpinnedSuite = errors.New("adoption_unpinned_suite")
 )
 
+// errAdoptionMemberSkipped is the in-package signal from adoptMember
+// that the upstream returned 4xx for a declared Release member. Step 5
+// of runShared catches this with errors.Is, increments skippedCount,
+// and continues — the snapshot is committed without the member.
+//
+// Unexported because it is not an outcome category: adoptions that
+// skipped members emit outcome=success (or run_failed via the
+// all-skipped guard if zero members fetched). Operators see the skip
+// via the per-member adoption_member_skipped WARN line and the
+// skipped_count field on adoption_success.
+//
+// SPEC2 §7.5.2 (Phase 2 clarification): a member 4xx is treated as
+// "upstream declared but does not serve" — apt itself only fetches
+// IndexTargets, so an entry the Release advertises but the archive
+// 404s on is a publication artifact, not a contract violation. The
+// canonical case is Ubuntu's Release file declaring an uncompressed
+// Contents-amd64 the archive only ships as Contents-amd64.gz.
+var errAdoptionMemberSkipped = errors.New("adoption_member_skipped")
+
 // AdoptionConfig bundles Adopter dependencies. Required: Cache, Fetcher,
 // Verifier, HostLimiter. Optional: MaxConcurrent (0 = unlimited),
 // MemberFetchTimeout (per-member upstream budget — adopters can run
@@ -631,9 +650,21 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// gets the freshly-fetched blob hash so the same heartbeat
 	// also refreshes refcount_zeroed_at on it via HeartbeatBlobs.
 	memberRows := make([]cache.SnapshotMember, 0, len(members)+3)
+	// fetchedMembers parallels memberRows but holds the original
+	// ReleaseMember (with Size). Step 7 (by-hash alias) and Step 8
+	// (buildPackageHashes) iterate this slice instead of `members` so
+	// that 4xx-skipped paths don't get phantom alias rows pointing at
+	// a non-existent blob (FK violation on snapshot_member.blob_hash)
+	// or a Packages-blob read against an empty pool entry.
+	fetchedMembers := make([]ReleaseMember, 0, len(members))
+	skippedCount := 0
 	for _, m := range members {
 		blobHash, err := a.adoptMember(ctx, suite, m)
 		if err != nil {
+			if errors.Is(err, errAdoptionMemberSkipped) {
+				skippedCount++
+				continue
+			}
 			return err // already wrapped with category
 		}
 		memberRows = append(memberRows, cache.SnapshotMember{
@@ -642,8 +673,23 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			BlobHash:       blobHash,
 			DeclaredSHA256: m.SHA256,
 		})
+		fetchedMembers = append(fetchedMembers, m)
 		tracker.Add(blobHash)
 		a.heartbeat(ctx, suite.CanonicalHost, snapshotID, tracker)
+	}
+	fetchedCount := len(fetchedMembers)
+
+	// SPEC2 §7.5.2 (Phase 2 clarification): an adoption where zero
+	// declared members were successfully fetched is still a failure —
+	// the resulting snapshot would have only metadata-self rows and
+	// serve nothing useful, while creating the false appearance of an
+	// adopted suite that fails strict-mode .deb requests. Realistic
+	// trigger: misconfigured suite_path that points at a directory
+	// whose Release lists members the archive serves under a different
+	// prefix.
+	if fetchedCount == 0 && len(members) > 0 {
+		return fmt.Errorf("%w: all %d declared members returned 4xx",
+			ErrAdoptionMemberFetchFailed, skippedCount)
 	}
 
 	// Step 6: metadata-self snapshot_member row(s). Without these
@@ -679,8 +725,13 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// requests through the same blob. We dedupe — multiple members
 	// with the same content (e.g. "Sources" and "Sources.bz2") would
 	// produce the same alias path and trigger a unique violation.
-	aliasSeen := make(map[string]bool, len(members))
-	for _, m := range members {
+	//
+	// Iterates fetchedMembers, not members: a 4xx-skipped member has
+	// no blob in the pool, so an alias row pointing at its declared
+	// SHA256 would violate the snapshot_member.blob_hash → blob.hash
+	// foreign key.
+	aliasSeen := make(map[string]bool, len(fetchedMembers))
+	for _, m := range fetchedMembers {
 		alias := byHashAliasPath(m.Path, m.SHA256)
 		if alias == "" || aliasSeen[alias] {
 			continue
@@ -707,7 +758,13 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// flip — strict mode only reads current snapshots, but pinning
 	// the timing prevents any "candidate has coverage = 1 but is not
 	// yet current" mid-state from leaking into the §7.5 flow.
-	pkgHashRes, err := a.buildPackageHashes(suite, snapshotID, members)
+	// Iterates fetchedMembers, not members: readPackagesBlob for a
+	// 4xx-skipped Packages member would miss in the pool. The
+	// pkgDirs/coverage_complete computation in buildPackageHashes
+	// also relies only on what we actually have on disk — a directory
+	// whose only Packages variant was skipped should not be counted
+	// as covered.
+	pkgHashRes, err := a.buildPackageHashes(suite, snapshotID, fetchedMembers)
 	if err != nil {
 		return err // already wrapped with category
 	}
@@ -803,6 +860,8 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		"snapshot_id", snapshotID,
 		"form", formName(p.form),
 		"member_count", len(members),
+		"fetched_count", fetchedCount,
+		"skipped_count", skippedCount,
 		"alias_count", len(aliasSeen),
 		"package_hash_count", len(packageHashes),
 	)
@@ -921,6 +980,26 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 
 	res, err := a.fetcher.Fetch(ctx, target, w)
 	if err != nil {
+		// SPEC2 §7.5.2 (Phase 2 clarification): 4xx is treated as
+		// "upstream declared but does not serve" and skipped — apt
+		// itself only fetches IndexTargets, so an entry the Release
+		// advertises but the archive 404s on is a publication
+		// artifact, not a contract violation. The canonical case is
+		// Ubuntu's Release file declaring an uncompressed
+		// Contents-amd64 the archive only ships as Contents-amd64.gz.
+		// 5xx and transport errors stay fatal — those are "upstream
+		// is broken right now", not "upstream never serves this thing".
+		var se *fetch.StatusError
+		if errors.As(err, &se) && se.Code >= 400 && se.Code < 500 {
+			a.logger.Warn("adoption_member_skipped",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"path", m.Path,
+				"declared_sha256", m.SHA256,
+				"upstream_status", se.Code,
+			)
+			return "", errAdoptionMemberSkipped
+		}
 		return "", fmt.Errorf("%w: fetch %s: %v",
 			ErrAdoptionMemberFetchFailed, m.Path, err)
 	}

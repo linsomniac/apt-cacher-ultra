@@ -734,8 +734,9 @@ state visible to a request goroutine.
 
 #### 7.5.2 Failure handling
 
-If any step before the COMMIT fails (GPG verify, parse, member fetch,
-member hash mismatch, candidate row insert):
+If any step before the COMMIT fails (GPG verify, parse, member 5xx
+fetch failure or transport error, member hash mismatch, candidate row
+insert):
 
 - The candidate `suite_snapshot` row's `adopted_at` is never set; it
   remains `NULL` in the database. Phase 4 GC will reap orphan candidate
@@ -758,6 +759,26 @@ member hash mismatch, candidate row insert):
   for the full catalog.
 
 The next periodic tick retries; the cooldown gate prevents thrash.
+
+**Member 4xx is skipped, not fatal.** A declared member whose upstream
+returns a 4xx status is logged at WARN as `adoption_member_skipped`
+(canonical_host, suite_path, path, declared_sha256, upstream_status)
+and omitted from `snapshot_member`; subsequent client requests for that
+path 404 from the cache, mirroring upstream. By-hash alias rows
+(step 7) and `package_hash` parsing (step 8) iterate only the
+successfully-fetched members so a skipped path does not produce a
+phantom alias row pointing at a non-existent blob. This matches apt's
+behavior — clients fetch from `IndexTargets`, not from every entry in
+the Release SHA256 block, and an entry the upstream advertises but
+does not serve is a publication artifact (Ubuntu's archive declaring
+uncompressed `Contents-amd64` while only shipping `Contents-amd64.gz`
+is the canonical case). The `adoption_success` log line carries
+`fetched_count` and `skipped_count` so operators can audit per-suite
+skip volume. Adoption still aborts (with `ErrAdoptionMemberFetchFailed`,
+surfacing through `adoption_run_failed`) if zero declared members
+fetched successfully — the realistic trigger for that case is a
+misconfigured `suite_path` pointing at a directory whose Release lists
+members the archive serves under a different prefix.
 
 ### 7.6 GPG verification (NEW)
 

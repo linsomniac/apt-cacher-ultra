@@ -109,6 +109,21 @@ func (f *fakeFetcher) failWith(url string, err error) {
 	f.errFor[url] = err
 }
 
+// fail404 / fail503 inject upstream HTTP status errors so adoption tests
+// can simulate the SPEC2 §7.5.2 "upstream declared but doesn't serve"
+// case (404 → skip) and the "upstream broken right now" case (5xx →
+// fatal). The error type matters: the 4xx-skip path in adoptMember
+// gates on errors.As(*fetch.StatusError) — a generic error from the
+// fetcher (the unknown-URL fall-through above) does not match and stays
+// fatal.
+func (f *fakeFetcher) fail404(url string) {
+	f.failWith(url, &fetch.StatusError{Code: 404})
+}
+
+func (f *fakeFetcher) fail503(url string) {
+	f.failWith(url, &fetch.StatusError{Code: 503})
+}
+
 func (f *fakeFetcher) Fetch(ctx context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
 	f.calls.Add(1)
 	f.mu.Lock()
@@ -1409,4 +1424,181 @@ func readHeartbeatAtDirect(t *testing.T, dbPath string, id int64) int64 {
 		t.Fatalf("read heartbeat_at: %v", err)
 	}
 	return hb
+}
+
+// TestAdopter_MemberSkipped_404SkipsMidList verifies the SPEC2 §7.5.2
+// (Phase 2 clarification) "4xx is skipped, not fatal" behavior: a
+// declared Release member that the upstream returns 404 for is
+// omitted from snapshot_member, the per-skip WARN line is emitted,
+// and the adoption otherwise commits cleanly with skipped_count
+// surfaced on adoption_success. Canonical real-world trigger: Ubuntu
+// declaring uncompressed Contents-amd64 in Release while only
+// shipping Contents-amd64.gz.
+func TestAdopter_MemberSkipped_404SkipsMidList(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ff := newFakeFetcher()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:       c,
+		Fetcher:     ff,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+		Logger:      logger,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	suite := SuiteRef{
+		CanonicalScheme: "http",
+		CanonicalHost:   "archive.ubuntu.com",
+		SuitePath:       "/ubuntu/dists/noble",
+	}
+
+	debHash := strings.Repeat("a", 64)
+	pkgs := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.deb": debHash,
+	})
+	contents := []byte("phantom Contents-amd64 body upstream wont serve")
+	src := []byte("Sources content")
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+		"main/Contents-amd64":        contents,
+		"main/source/Sources":        src,
+	})
+
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	ff.put(base+"main/binary-amd64/Packages", pkgs)
+	ff.fail404(base + "main/Contents-amd64")
+	ff.put(base+"main/source/Sources", src)
+
+	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
+		t.Fatalf("Run: %v (expected nil — 4xx members should skip, not abort)", err)
+	}
+
+	// Snapshot must be committed.
+	sf, err := c.GetSuiteFreshness(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil {
+		t.Fatal("current_snapshot_id not set after partial-skip adoption")
+	}
+
+	// snapshot_member must contain Packages and Sources but NOT
+	// the skipped Contents-amd64.
+	members, err := c.ListSnapshotMembers(context.Background(), *sf.CurrentSnapshotID)
+	if err != nil {
+		t.Fatalf("ListSnapshotMembers: %v", err)
+	}
+	var sawPackages, sawSources, sawContents bool
+	for _, m := range members {
+		switch m.Path {
+		case "main/binary-amd64/Packages":
+			sawPackages = true
+		case "main/source/Sources":
+			sawSources = true
+		case "main/Contents-amd64":
+			sawContents = true
+		}
+	}
+	if !sawPackages {
+		t.Error("Packages snapshot_member missing — should have been fetched and recorded")
+	}
+	if !sawSources {
+		t.Error("Sources snapshot_member missing — should have been fetched and recorded")
+	}
+	if sawContents {
+		t.Error("skipped Contents-amd64 unexpectedly recorded as snapshot_member")
+	}
+
+	// Logs: per-skip WARN with the right fields, plus the
+	// fetched/skipped counts on adoption_success.
+	out := logBuf.String()
+	if !strings.Contains(out, `"msg":"adoption_member_skipped"`) {
+		t.Errorf("expected adoption_member_skipped log, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"path":"main/Contents-amd64"`) {
+		t.Errorf("expected path=main/Contents-amd64 in skip log, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"upstream_status":404`) {
+		t.Errorf("expected upstream_status:404 in skip log, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"skipped_count":1`) {
+		t.Errorf("expected skipped_count:1 in adoption_success log, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"fetched_count":2`) {
+		t.Errorf("expected fetched_count:2 in adoption_success log, got:\n%s", out)
+	}
+}
+
+// TestAdopter_MemberSkipped_5xxStillFatal verifies that 5xx upstream
+// errors during member fetch remain fatal (the 4xx-skip path only
+// applies to client-error 4xx). 5xx means "upstream is broken right
+// now", which is exactly what the existing
+// adoption_member_fetch_failed semantics already cover.
+func TestAdopter_MemberSkipped_5xxStillFatal(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	pkgs := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64),
+	})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+	})
+	env.fetcher.fail503("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages")
+
+	err := env.adopter.Run(context.Background(), env.suite, releaseText, "", "")
+	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
+		t.Errorf("Run err = %v, want wrapped ErrAdoptionMemberFetchFailed", err)
+	}
+
+	sf, err := env.cache.GetSuiteFreshness(context.Background(),
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err == nil && sf != nil && sf.CurrentSnapshotID != nil {
+		t.Errorf("current_snapshot_id unexpectedly set after 5xx fatal: %d", *sf.CurrentSnapshotID)
+	}
+}
+
+// TestAdopter_MemberSkipped_AllMembers404Fails verifies the
+// SPEC2 §7.5.2 all-skipped guard: if every declared member 4xx's, the
+// adoption fails (still wrapped as ErrAdoptionMemberFetchFailed)
+// rather than committing a useless empty snapshot. The realistic
+// trigger is a misconfigured suite_path that points at a directory
+// whose Release lists members the archive serves under a different
+// prefix.
+func TestAdopter_MemberSkipped_AllMembers404Fails(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	pkgs := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64),
+	})
+	src := []byte("Sources content")
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+		"main/source/Sources":        src,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.fail404(base + "main/binary-amd64/Packages")
+	env.fetcher.fail404(base + "main/source/Sources")
+
+	err := env.adopter.Run(context.Background(), env.suite, releaseText, "", "")
+	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
+		t.Fatalf("Run err = %v, want wrapped ErrAdoptionMemberFetchFailed (all-skipped guard)", err)
+	}
+	if !strings.Contains(err.Error(), "all 2 declared members returned 4xx") {
+		t.Errorf("Run err = %q, want 'all 2 declared members returned 4xx' substring", err.Error())
+	}
+
+	sf, err := env.cache.GetSuiteFreshness(context.Background(),
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err == nil && sf != nil && sf.CurrentSnapshotID != nil {
+		t.Errorf("current_snapshot_id unexpectedly set after all-404 adoption: %d", *sf.CurrentSnapshotID)
+	}
 }
