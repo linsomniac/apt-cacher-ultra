@@ -36,16 +36,29 @@ package main
 //      writing to a temp blob, and is then mid-body when shutdown
 //      fires.
 //   2. Cache booted with a Mirror rule pointing at the slow upstream.
-//   3. Test client sends GET, reads the 200 status line (proves
-//      bytes are flowing through the cache → temp blob path).
-//   4. Test waits for upstream to confirm it's blocked on
-//      r.Context().Done() (mid-stream window open).
+//   3. Test client sends GET on a goroutine — its only purpose is
+//      to keep the inbound request alive so the cache's
+//      cache-miss path stays open. The cache fetches into pool/
+//      first and only serves to the client after Finalize, so the
+//      client's body read never returns during this test; we don't
+//      need to read it.
+//   4. Test waits for the upstream handler to confirm it has
+//      flushed the first chunk (mid-stream window: cache has
+//      received headers and at least one body chunk has been
+//      sent on the wire), then polls cacheDir/tmp until at least
+//      one partial blob has been written with size >= len of the
+//      first chunk. This proves the cache's fetch goroutine has
+//      actually written bytes to disk, NOT merely that the
+//      upstream flushed — eliminating the race where the cache's
+//      body-copy hasn't yet pulled the bytes off the wire when
+//      cancellation fires.
 //   5. Daemon ctx cancelled. h.lifecycleCtx fires; fetch's HTTP
 //      transport closes the outbound conn; upstream's r.Context
 //      returns from Done, handler returns, conn closes; cache's
-//      fetch unwinds with a context error; temp-blob defer cleans
-//      up the partial file before any rename to pool/ runs.
-//   6. After serveListeners returns, walk pool/ and temp/.
+//      fetch unwinds with a context error; the BlobWriter's
+//      deferred Abort (handler.go:1317) removes the partial tmp
+//      file before any rename to pool/ runs.
+//   6. After serveListeners returns, walk pool/ and tmp/.
 //      Both must be empty.
 //
 // The corresponding connect_shutdown_test.go pool/ walk asserts the
@@ -56,7 +69,6 @@ package main
 // Mutates the package-level shutdownTimeout var, so NOT t.Parallel.
 
 import (
-	"bufio"
 	"context"
 	"net"
 	"net/http"
@@ -135,11 +147,13 @@ func TestServe_GracefulShutdown_FetchMidStream_NoOrphanBlob(t *testing.T) {
 		t.Fatalf("daemon never became ready: %v", err)
 	}
 
-	// Send the GET on a goroutine; the test main path waits for
-	// the upstream to reach its blocked state, then cancels. The
-	// client's Read will error out when shutdown closes the
-	// underlying conn — we don't care about its exact body or
-	// error, only that the fetch reached the mid-stream state.
+	// Send the GET on a goroutine. Its only purpose is to keep an
+	// inbound request alive on the cache so the cache-miss path
+	// stays open. The cache fetches into pool/ first and only
+	// serves to the client after Finalize completes (SPEC §6.4
+	// fetch-then-serve), so client.Get blocks until shutdown closes
+	// the underlying conn — we never read the body and don't care
+	// about the eventual error.
 	clientDone := make(chan struct{})
 	go func() {
 		defer close(clientDone)
@@ -148,22 +162,52 @@ func TestServe_GracefulShutdown_FetchMidStream_NoOrphanBlob(t *testing.T) {
 		if err != nil {
 			return
 		}
-		// Read at least the status line + headers + a few body
-		// bytes via a bufio.Reader; do NOT call ReadAll since
-		// the body never completes. We discard everything.
-		buf := make([]byte, 4096)
-		_, _ = bufio.NewReader(resp.Body).Read(buf)
 		resp.Body.Close()
 	}()
 
-	// Wait for upstream to confirm it's blocked. Once this fires,
-	// the cache has dialed, sent the GET, received the headers,
-	// written the first chunk into its temp blob, and is now
-	// blocked waiting for more body bytes.
+	// Wait for upstream to confirm it has flushed the first chunk.
+	// This proves bytes are on the wire to the cache; it does NOT
+	// yet prove the cache's body-copy has pulled those bytes off
+	// the socket and written them to disk.
 	select {
 	case <-serverEntered:
 	case <-time.After(10 * time.Second):
 		t.Fatalf("upstream handler never observed the GET; fetch never made it across (Mirror rule? gate config?)")
+	}
+
+	// Poll cacheDir/tmp/ until a partial blob exists with
+	// size >= len(firstChunk). This is the non-vacuous mid-stream
+	// signal: the cache's fetch goroutine has gone through
+	// NewTempBlob → io.Copy → at least one buffer flush to disk.
+	// Without this poll, shutdown could race the body-copy and
+	// fire while the BlobWriter still has zero bytes — which
+	// satisfies the orphan-blob assertions trivially but doesn't
+	// exercise the partial-temp-file rollback path.
+	tmpDir := filepath.Join(cacheDir, "tmp")
+	pollDeadline := time.Now().Add(10 * time.Second)
+	mounted := false
+	for time.Now().Before(pollDeadline) {
+		entries, _ := os.ReadDir(tmpDir)
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if info.Size() >= int64(len(firstChunk)) {
+				mounted = true
+				break
+			}
+		}
+		if mounted {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !mounted {
+		t.Fatalf("no partial blob ≥ %d bytes appeared under %s within 10s; cache body-copy never started", len(firstChunk), tmpDir)
 	}
 
 	// --- Trigger graceful shutdown mid-stream ---
@@ -220,15 +264,17 @@ func TestServe_GracefulShutdown_FetchMidStream_NoOrphanBlob(t *testing.T) {
 			len(poolFiles), poolFiles)
 	}
 
-	// temp/ must also be empty: fetch's deferred cleanup removes
-	// the partial temp file when the body copy returns an error.
-	// A leaked temp/ file would not be an "orphan" in the pool/
-	// sense, but it is a related resource leak and would
-	// foreshadow a regression where the partial temp accidentally
-	// got renamed.
-	tempDir := filepath.Join(cacheDir, "temp")
+	// tmp/ must also be empty: BlobWriter.Abort (handler.go:1317
+	// deferred path) removes the partial temp file when the body
+	// copy returns an error. A leaked tmp/ file would not be an
+	// "orphan" in the pool/ sense (cache.SweepTmp reaps stale tmp
+	// at next startup per blob.go:347), but a synchronous Abort
+	// failure would foreshadow a regression where the partial temp
+	// accidentally gets renamed into pool/ on a subsequent code
+	// path. The mid-stream poll above guarantees a partial blob
+	// existed BEFORE cancellation, so this assertion is non-vacuous.
 	var tempFiles []string
-	if err := filepath.Walk(tempDir, func(path string, info os.FileInfo, walkErr error) error {
+	if err := filepath.Walk(tmpDir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			if os.IsNotExist(walkErr) {
 				return filepath.SkipDir
@@ -244,7 +290,7 @@ func TestServe_GracefulShutdown_FetchMidStream_NoOrphanBlob(t *testing.T) {
 		t.Errorf("walk temp/: %v", err)
 	}
 	if len(tempFiles) > 0 {
-		t.Errorf("temp/ has %d leaked file(s) after cancelled fetch; want 0\nfiles: %v",
+		t.Errorf("tmp/ has %d leaked file(s) after cancelled fetch; want 0\nfiles: %v",
 			len(tempFiles), tempFiles)
 	}
 }

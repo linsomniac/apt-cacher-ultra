@@ -206,16 +206,17 @@ func TestServe_GracefulShutdown_DrainsInflightCONNECT(t *testing.T) {
 
 	// Pool-state regression guard (NOT the SPEC6 §15 #16 orphan-blob
 	// pin). The spec's "no orphan pool/ blobs from cancelled inner
-	// GETs" claim is exercised end-to-end in §15 #2's §12.2 integration
-	// test where an HTTPS upstream serves a slow body and the fetch
-	// gets cancelled mid-stream — that scenario requires
-	// fetch.SetRootCAsForTest, not yet built. Here we only assert that
-	// the CONNECT pipeline alone (cert generation, hijack accounting)
-	// did NOT touch pool/ — currently impossible by code review, the
-	// walk guards against any future code path that violates that
-	// invariant. Walk errors fail the test rather than being silently
-	// ignored, so a missing or unreadable pool/ dir cannot mask a real
-	// regression.
+	// GETs" claim is pinned non-vacuously by
+	// shutdown_orphan_blob_test.go's
+	// TestServe_GracefulShutdown_FetchMidStream_NoOrphanBlob, which
+	// runs a real cache-miss fetch against a slow-body upstream,
+	// cancels mid-stream, and walks pool/ + tmp/. Here we only
+	// assert that the CONNECT pipeline alone (cert generation,
+	// hijack accounting) did NOT touch pool/ — currently impossible
+	// by code review, the walk guards against any future code path
+	// that violates that invariant. Walk errors fail the test
+	// rather than being silently ignored, so a missing or unreadable
+	// pool/ dir cannot mask a real regression.
 	poolDir := filepath.Join(cacheDir, "pool")
 	count := 0
 	walkErr := filepath.Walk(poolDir, func(_ string, info os.FileInfo, err error) error {
