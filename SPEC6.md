@@ -1589,7 +1589,8 @@ Emitted from the §9 CONNECT handler:
   `bad_host` / `bad_port` / `ip_literal_host` /
   `tls_handshake_timeout` / `tls_failed` /
   `cert_gen_failed` / `inner_method_rejected` /
-  `inner_header_timeout` / `inner_header_too_large`),
+  `inner_header_timeout` / `inner_header_too_large` /
+  `inner_stream_failed`),
   `denied_gate` (`signing` / `fetch`; empty when
   `outcome != denied_host`; identifies which §5.1.2 gate
   rejected the host), `canonical_host` (post-Remap form,
