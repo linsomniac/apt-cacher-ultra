@@ -15,14 +15,15 @@ produced this spec.
 Phase 7 is **opt-in additive** over Phase 5 / Phase 6:
 
 - All mutating endpoints are gated by
-  `admin.mutating_htpasswd_path` (and/or
+  `admin.mutating_htpasswd_file` (and/or
   `admin.mutating_bearer_tokens`). With both unset (the default),
   every `POST /admin/*` returns `503 Service Unavailable` with
   `error: "mutating endpoints disabled"`.
 - All hot-reload endpoints are gated by `[reload].allowed_keys`.
-  With the list empty, `SIGHUP` is logged-and-ignored and
-  `POST /admin/config/reload` returns `503`. The default config
-  ships the §5.4 set populated.
+  With the list empty (the **Phase 7 default**), `SIGHUP` is
+  logged-and-ignored and `POST /admin/config/reload` returns
+  `503`. Operators populate the list to enable reload of the
+  §5.4 reloadable subset.
 - The `apt-cacher-ultra ca rotate` subcommand requires
   `tls_mitm.enabled = true` per §14.2; otherwise it exits 1 with
   `mitm_disabled`.
@@ -39,13 +40,14 @@ optional `error`). The pair is the audit primitive: a control-
 plane action without these two log lines is a daemon bug.
 
 **Read/write realm separation.** Phase 5's
-`admin.htpasswd_path` is the **read-only** credential. Phase 7
-introduces `admin.mutating_htpasswd_path` (and the optional
+`admin.htpasswd_file` is the **read-only** credential. Phase 7
+introduces `admin.mutating_htpasswd_file` (and the optional
 bearer-token list) as the **write-only** credential. A read-role
 credential cannot reach any `POST /admin/*` endpoint (`401`); a
 write-role credential cannot reach `GET /metrics`, `GET /`, or
-`GET /admin/events` (`401`). The two realms must be configured
-with distinct credentials per §5.3.
+the new read-only `GET /admin/jobs[/{id}]` surface (`401`). The
+two realms must be configured with distinct credentials per
+§5.3.
 
 ---
 
@@ -88,10 +90,10 @@ with distinct credentials per §5.3.
    whole reload and the live config is unchanged.
 
 4. **Write-role auth split.** Mutating endpoints require a
-   credential matching `admin.mutating_htpasswd_path` (or one of
+   credential matching `admin.mutating_htpasswd_file` (or one of
    the bearer tokens in `admin.mutating_bearer_tokens`). The
    read-only Phase 5 surface continues to use
-   `admin.htpasswd_path`. The two realms are mutually exclusive:
+   `admin.htpasswd_file`. The two realms are mutually exclusive:
    no credential can satisfy both, and a startup-config
    validation error fires if they are configured to the same
    path (§5.3).
@@ -173,9 +175,17 @@ were resolved with the operator. Each resolution is normative:
 - **Bearer tokens (Q6).** Yes — opt-in, alongside htpasswd.
 - **Caller-label cardinality (Q7).** No additional cap; existing
   Phase 5 `metric_series_cap = 1024` absorbs it.
-- **Hot-reload allowlist default (Q8).** Default-populated.
+- **Hot-reload allowlist default (Q8).** Default-empty.
+  `[reload].allowed_keys = []` on first install — preserves the
+  §1 "zero behavior change on upgrade" contract; operators
+  populate the list explicitly to enable reload. (This
+  OVERRIDES the rev-1 scoping default-populated answer per the
+  SPEC7 review pass — the rev-1 default conflicted with the
+  zero-change claim.)
 - **Old-CA disk retention (Q9).** Keep all historical CAs under
-  `cache_dir/ca/old/{fingerprint}/`.
+  `<cache.dir>/ca/<fingerprint-hex>/` (per §4.4 — content-
+  addressed dirs are themselves the archive; no separate `old/`
+  hierarchy).
 - **Rotate when MITM disabled (Q10).** Refuse with exit 1 / 503.
 - **SIGHUP during shutdown (Q11).** Log
   `reload_during_shutdown_ignored` Info.
@@ -212,7 +222,7 @@ All five mutating endpoints share a common shape:
   `WWW-Authenticate: Basic realm="apt-cacher-ultra (write)"`
   (htpasswd) or `Bearer realm="apt-cacher-ultra (write)"` (bearer).
 - **Disabled state:** if neither
-  `admin.mutating_htpasswd_path` nor `admin.mutating_bearer_tokens`
+  `admin.mutating_htpasswd_file` nor `admin.mutating_bearer_tokens`
   is configured, the endpoint returns `503 Service Unavailable`
   with body `{"error":"mutating endpoints disabled"}` and
   `Retry-After: 0`. Authentication is not attempted.
@@ -231,9 +241,10 @@ All five mutating endpoints share a common shape:
 - **Error responses (pre-job):**
   - `400 Bad Request` — malformed selector, missing required
     parameter, or selector value validation failure.
-  - `401 Unauthorized` — missing/invalid credential.
-  - `403 Forbidden` — credential authenticates but is bound to
-    the read realm.
+  - `401 Unauthorized` — missing/invalid credential, OR a valid
+    credential bound to the read realm (cross-realm rejection
+    is `401`, not `403`, per §6.1: returning `403` would leak
+    realm membership of the credential).
   - `409 Conflict` — only emitted by `/admin/ca/rotate` and
     `/admin/config/reload` when another job of the same family
     is in `running` state (§9.2 / §9.3).
@@ -270,82 +281,162 @@ metrics: `acu_gc_runs_total{trigger="manual"|"periodic"}`.
 
 #### 2.2.2 POST /admin/cache/clear
 
-Selects cache entries by exactly one of two query parameters:
+Selects cache entries by `canonical_host` (mandatory) plus
+optional `suite_path` and `canonical_scheme` for narrower
+selection. Two valid shapes:
 
-- `?canonical_host=<host>` — drops every blob, every snapshot
-  row, and every Release/Packages metadata entry whose
-  `canonical_host` matches (case-insensitive).
-- `?suite=<suite-key>` — drops every entry whose suite-key
-  matches. The suite-key is the cache-internal canonical name
-  (e.g. `ubuntu/jammy`).
+- **Host-wide**: `?canonical_host=<host>` — clears every entry
+  for that host across all suites and schemes.
+- **Suite-scoped**:
+  `?canonical_host=<host>&suite_path=<path>[&canonical_scheme=<scheme>]`
+  — clears entries for that one suite. `canonical_scheme` is
+  optional; absent means "all schemes that match the
+  (canonical_host, suite_path) pair" (in practice typically one).
 
-Exactly one of the two MUST be present; presenting both, neither,
-or a third selector returns `400 Bad Request`. Multi-selector
-queries (`canonical_host=…&suite=…`) are deferred per §1.2.
+`canonical_host` is required; the daemon does NOT re-Remap the
+input (operators run `apt-cacher-ultra remap <literal-host>` to
+discover the canonical form first; that subcommand is unchanged
+from SPEC6 §14). Lower-cased on receipt; trailing dot stripped.
 
-Job result body (on `done`):
+`suite_path` MUST start with `/` and follow the same rules as
+§2.2.3 (no `..`; percent-decoded once at HTTP layer). Unknown
+paths are NOT rejected at HTTP-receive time — the worker may
+find no matching rows, which is reported as `rows_deleted=0` in
+the result body. (Distinct from suite-refresh §2.2.3, where
+unknown path returns 404 because refresh has nothing to do.)
 
-```json
-{
-  "selector": {"kind": "canonical_host"|"suite", "value": "<...>"},
-  "rows_deleted": <int>,
-  "blobs_marked": <int>,
-  "duration_ms": <int>
-}
-```
+`canonical_scheme`, when present, MUST be `http` or `https`;
+other values return `400 invalid_scheme`.
 
-`rows_deleted` is the number of SQLite rows removed across all
-affected tables (sum of `snapshots`, `package_hash`, and
-`current_snapshot_id` rows). `blobs_marked` is the number of
-pool/ files marked for sweep on the next GC tick.
-
-In-flight requests for the cleared entries complete naturally
-(§6.5 — the singleflight leader keeps the file open until its
-clients finish; the next request to the same canonical
-(scheme, host, path) tuple takes the cache-miss path).
-
-#### 2.2.3 POST /admin/suites/{path}/refresh
-
-Forces a fresh adoption pass for the suite identified by `{path}`.
-The path corresponds to the `sources.list` view (e.g.
-`/ubuntu/dists/jammy`); the daemon resolves it to a suite-key
-internally before dispatching to the existing
-`internal/freshness/adoption.go` entry point.
-
-Request body: ignored. Query parameters: none.
-
-Path validation:
-
-- The path MUST start with `/` and MUST be percent-decoded by
-  the HTTP server before dispatch. Path segments containing `..`
-  are rejected (`400 unsafe_path`). Trailing slashes are
-  normalized (one or zero); both forms are accepted.
-- The path MUST resolve to a known suite per the same logic
-  Phase 1 / Phase 2 use for `Release`/`InRelease` lookup. An
-  unknown path returns `404 Not Found` with body
-  `{"error":"unknown suite","path":"<path>"}`.
+Other query parameters return `400 unknown_selector`. The
+selector is exclusive to keep the audit log line unambiguous —
+no future-extension keys are silently ignored.
 
 Job result body (on `done`):
 
 ```json
 {
-  "suite": "<suite-key>",
-  "snapshot_id_before": <int>,
-  "snapshot_id_after": <int>,
-  "package_count": <int>,
+  "selector": {
+    "canonical_host": "<host>",
+    "suite_path": "<path>" or null,
+    "canonical_scheme": "<scheme>" or null
+  },
+  "deletes_by_table": {
+    "url_path":         <int>,
+    "package_hash":     <int>,
+    "snapshot_member":  <int>,
+    "suite_snapshot":   <int>,
+    "suite_freshness":  <int>
+  },
+  "blob_refcount_decrements": <int>,
   "duration_ms": <int>
 }
 ```
 
-When the upstream Release is byte-identical to the live snapshot,
-`snapshot_id_after` equals `snapshot_id_before`; this is the
-"no-op refresh" case and the job still reports `done`.
+`deletes_by_table` enumerates row-delete counts per affected
+table. `blob_refcount_decrements` is the cumulative count of
+`blob.refcount` decrements (one per deleted row that referenced
+a blob_hash). Rows in the `blob` table are NOT deleted by this
+operation; they are reclaimed by the next GC tick when their
+refcount reaches 0 and the blob_grace window has elapsed (Phase
+4 §4.2 unchanged).
+
+In-flight requests for cleared entries complete naturally per
+§6.5 (the singleflight leader keeps the open FD; readers
+serving from that FD continue; the next request to the same
+canonical (scheme, host, path) tuple takes the cache-miss
+path).
+
+Implementation contract for `internal/cache.ClearByCanonicalHost`
+and `ClearBySuite` (§13):
+
+- Operations execute in one SQLite transaction with `BEGIN
+  IMMEDIATE`; the transaction commits atomically. Concurrent
+  cache-miss writes against unrelated rows complete normally
+  (WAL mode); concurrent writes against the cleared rows
+  serialize on the row-level lock.
+- Delete order respects FK constraints (children before
+  parents):
+  1. `url_path` rows for the selector — decrements
+     `blob.refcount` for each deleted `blob_hash`.
+  2. `package_hash` rows — no blob refs (foreign keys are
+     into `suite_snapshot.snapshot_id`).
+  3. `snapshot_member` rows whose `snapshot_id` is in the
+     selector's `suite_snapshot` set — decrements
+     `blob.refcount` for each `blob_hash`.
+  4. `suite_freshness` rows for the selector: when host-wide,
+     DELETE; when suite-scoped, UPDATE
+     `current_snapshot_id = NULL`.
+  5. `suite_snapshot` rows for the selector — decrements
+     `blob.refcount` for `inrelease_hash`, `release_hash`,
+     `release_gpg_hash`.
+- Refcount decrement is per-blob and clamps at 0 (a refcount
+  decremented from 0 is a programmer bug; the cache layer logs
+  `cache_clear_refcount_underflow` Warn and proceeds).
+- The transaction emits `cache_clear_committed` Info on
+  successful commit with the deletes-by-table tally.
+
+#### 2.2.3 POST /admin/suites/refresh
+
+Forces a fresh adoption pass for one suite. The adoption identity
+in the cache is `(canonical_scheme, canonical_host, suite_path)`
+per `internal/freshness/adoption.go:34`; multiple hosts can
+share the same `suite_path` (e.g. archive.ubuntu.com and
+de.archive.ubuntu.com both expose `/dists/jammy`), so the
+selector requires `canonical_host` to disambiguate.
+
+URL: `POST /admin/suites/refresh?canonical_host=<host>&suite_path=<path>[&canonical_scheme=<scheme>]`
+
+Request body: ignored.
+
+Query parameters:
+
+- **`canonical_host`** (required) — case-insensitive, lower-
+  cased on receipt; trailing dot stripped. Failure → `400 missing_canonical_host`.
+- **`suite_path`** (required) — MUST start with `/`; percent-
+  decoded once at HTTP layer; trailing slashes normalized (one
+  or zero accepted). Path segments containing `..` are rejected
+  with `400 unsafe_path`. Failure → `400 missing_suite_path` if
+  empty.
+- **`canonical_scheme`** (optional) — `http` or `https`; absent
+  defaults to `https` (matching the §10.4 status fields and the
+  most common real-world adoption scheme). Other values →
+  `400 invalid_scheme`.
+
+The (canonical_scheme, canonical_host, suite_path) triple MUST
+resolve to a known suite per the same logic Phase 2 §6 uses for
+`Release`/`InRelease` lookup; specifically, a row in the
+`suite_freshness` table (Phase 1) keyed on the triple. An
+unknown triple returns `404 unknown_suite` with body
+`{"error":"unknown suite","canonical_scheme":"<s>","canonical_host":"<h>","suite_path":"<p>"}`.
+
+Job result body (on `done`):
+
+```json
+{
+  "canonical_scheme": "<scheme>",
+  "canonical_host":   "<host>",
+  "suite_path":       "<path>",
+  "snapshot_id_before": <int-or-null>,
+  "snapshot_id_after":  <int>,
+  "package_count":      <int>,
+  "duration_ms":        <int>
+}
+```
+
+`snapshot_id_before` is null if no snapshot was previously
+adopted for this triple. When the upstream Release is byte-
+identical to the live snapshot, `snapshot_id_after` equals
+`snapshot_id_before` and the job still reports `done` (no-op
+refresh).
 
 #### 2.2.4 POST /admin/ca/rotate
 
-Generates a new MITM CA keypair, atomically swaps it in, flushes
-the leaf-cert cache, and moves the old keypair to
-`cache_dir/ca/old/{fingerprint}/` for forensic retention.
+Generates a new MITM CA keypair into a new
+`<cache.dir>/ca/<new-fp>/` directory, atomic-swaps the
+`<cache.dir>/ca/current` symlink, and flushes the leaf-cert
+cache. The old CA's directory is left in place — it IS the
+archive (per §4.4).
 
 Preconditions:
 
@@ -373,7 +464,8 @@ Job result body (on `done`):
   "old_fingerprint_sha256": "<hex>",
   "new_fingerprint_sha256": "<hex>",
   "new_not_after_unixtime": <unix>,
-  "old_path": "ca/old/<old-fingerprint>/",
+  "active_dir": "<cache.dir>/ca/<new_fp>/",
+  "archived_dir": "<cache.dir>/ca/<old_fp>/",
   "cert_cache_evicted": <int>,
   "duration_ms": <int>
 }
@@ -427,7 +519,7 @@ changed, both arrays are empty and the job reports `done` with
 
 Read-only endpoints on the admin listener exposing job state.
 Both require the **read realm** credential
-(`admin.htpasswd_path`); a write-role credential cannot read
+(`admin.htpasswd_file`); a write-role credential cannot read
 job state (it can only `POST` mutating endpoints).
 
 #### 2.3.1 GET /admin/jobs
@@ -521,7 +613,7 @@ existing `tls_mitm` section:
     "rotation": {
       "last_rotated_at_unixtime": <unix-or-null>,
       "last_rotated_caller": "<credential-id-or-null>",
-      "old_ca_count_on_disk": <int>
+      "archived_ca_count": <int>
     }
   }
 }
@@ -534,11 +626,12 @@ ceiling of one rotate + one reload + N gc/clear/refresh).
 same surface the §10.5 status HTML shows in its "Action surface"
 section).
 
-`tls_mitm.rotation.old_ca_count_on_disk` is the number of
-fingerprint-named subdirectories under `cache_dir/ca/old/`. It
-serves as a forensic indicator: if this number grows over time
-without operator pruning, rotation history is being retained
-(per Q9 — no automatic retention policy).
+`tls_mitm.rotation.archived_ca_count` is the number of
+fingerprint-named subdirectories under `<cache.dir>/ca/`
+EXCLUDING the directory that `current` resolves to. It serves
+as a forensic indicator: if this number grows over time without
+operator pruning, rotation history is being retained per Q9 (no
+automatic retention policy).
 
 ### 2.5 Status HTML additions — delta over SPEC5 §10.5
 
@@ -661,46 +754,109 @@ duplicate after the original job has reached `failed` does NOT
 retry the action; the operator who wants to retry omits the
 idempotency key or uses a fresh one.)
 
-### 4.4 CA rotation on-disk layout — delta over SPEC6 §4.2
+### 4.4 CA storage layout — delta over SPEC6 §4.2
 
-Phase 6 wrote the auto-generated CA to `cache_dir/ca/ca.cert`
-and `cache_dir/ca/ca.key`. Phase 7 keeps this convention as the
-**live** path and adds a `cache_dir/ca/old/` directory for
-historical CAs.
+Phase 6 used a flat layout: `<cache.dir>/ca/{ca.crt, ca.key,
+ca.ready, .ca.lock}` (per `internal/proxy/tlsmitm/ca.go:336`).
+Phase 7 introduces a content-addressed directory layout because
+the flat layout is not crash-safe under rotation: the live trio
+is three separate inodes and there is no POSIX primitive that
+renames three files atomically. A mid-rotation crash with the
+flat layout would leave SPEC6's `scanCAState` in
+`caStateInconsistent` and the daemon would refuse to start.
+
+Phase 7 layout:
 
 ```
-cache_dir/
-  ca/
-    ca.cert                              # current CA cert (live)
-    ca.key                               # current CA key (live)
-    .lock                                # flock per SPEC6 §4.2.1
-    old/
-      <fingerprint-prefix-hex>/
-        ca.cert                          # rotated-out CA cert
-        ca.key                           # rotated-out CA key
-        rotated_at                       # ISO-8601 timestamp text file
-      <fingerprint-prefix-hex>/
-        ...
+<cache.dir>/ca/
+  current -> <fingerprint-hex>/         # POSIX symlink to active CA
+  <fingerprint-hex>/                    # one dir per CA, named by full SHA-256 hex
+    ca.crt
+    ca.key
+    ca.ready                            # contains <fingerprint-hex>
+  <other-fingerprint-hex>/              # rotated-out CA (archive)
+    ...
+  .ca.lock                              # flock — unchanged
 ```
 
-The fingerprint-prefix-hex is the SHA-256 of the rotated-out CA
-cert in lowercase hex, **first 16 hex chars** (8 bytes / 64 bits).
-This is enough to disambiguate any plausible rotation history
-while keeping the directory name short. Collisions on the
-prefix (statistically near-zero) are an error: the daemon
-refuses to overwrite an existing `old/<prefix>/` directory and
-the rotation job fails with `error: "fingerprint prefix
-collision"`.
+The active CA is the directory `current` symlinks to. Rotation
+swaps the symlink atomically (`rename(2)` on a symlink is POSIX-
+atomic); on crash, the symlink points either at the old dir or
+the new dir, never at half-state. Rotated-out directories are
+left in place — they ARE the archive (no separate `old/`
+hierarchy).
 
-The daemon does NOT load or read files under `old/` during
-normal operation. Operators rolling back run an out-of-band
-recovery: copy `old/<prefix>/ca.{cert,key}` back to the live
-path, restart the daemon. (A future "rotate `--from
-old/<prefix>/`" subcommand is deferred per §1.2.)
+The fingerprint is the lowercase hex of `sha256(DER(ca.crt))`,
+matching SPEC6 §4.2 / §10.4 fingerprint conventions. The FULL
+hex is the directory name (64 chars). Operators searching for a
+specific CA by fingerprint match the directory name with shell
+globbing.
 
-No automatic retention policy: `cache_dir/ca/old/` grows
-without bound. Operators who care prune manually. The
-`tls_mitm.rotation.old_ca_count_on_disk` status field surfaces
+#### 4.4.1 Migration from Phase 6 flat layout
+
+On Phase 7 daemon start, if `<cache.dir>/ca/ca.crt` exists at
+the storage-dir root AND `<cache.dir>/ca/current` does NOT
+exist, the daemon performs a one-shot migration under the
+existing `.ca.lock` flock:
+
+```
+1. Compute fingerprint = sha256_hex(DER(ca.crt)).
+2. mkdir <cache.dir>/ca/<fingerprint>/ (mode 0700).
+3. Rename ca.crt    -> <fingerprint>/ca.crt.
+4. Rename ca.key    -> <fingerprint>/ca.key.
+5. Rename ca.ready  -> <fingerprint>/ca.ready.
+6. Atomic-symlink:  current.<rand> -> <fingerprint>/, then
+                    rename(2) current.<rand> -> current.
+7. fsync the storage dir.
+8. Emit mitm_ca_layout_migrated Info with the fingerprint.
+```
+
+If the daemon crashes mid-migration:
+
+- Crash before step 3: caStateClean still detects the flat trio;
+  next start retries the migration.
+- Crash between steps 3-5: live trio split between root and
+  `<fingerprint>/`. `scanCAState` extended for Phase 7 detects
+  the partial migration (presence of the new directory) and
+  completes it under the lock on next start.
+- Crash between steps 5-6: trio fully under `<fingerprint>/`,
+  but `current` symlink missing. Detection per above; complete
+  symlink creation on next start.
+- Crash after step 6: complete; nothing to do.
+
+The migration is forward-only. A Phase 6 daemon that re-opens
+a post-migration storage dir sees no `ca.crt` at the root and
+scans as `caStateClean`, regenerating a fresh CA — that is the
+documented downgrade hazard. **Operators rolling back to Phase
+6 must move the active CA's files from `current/` back to the
+storage-dir root manually.** Forward-compat symlinks are NOT
+provided (would require Phase 6 daemons to follow them, which
+the existing code does not do).
+
+The migration is the only schema-equivalent change in Phase 7
+(noted in §15 #11).
+
+#### 4.4.2 Forward-only
+
+There is no Phase-6-compat fallback. `apt-cacher-ultra ca
+print` (SPEC6 §14) and `tlsmitm.LoadOrGenerate` follow `current`
+once Phase 7 is in place. A daemon that finds neither `current`
+nor flat-layout `ca.crt` runs the SPEC6 §4.2 generation path as
+before (`caStateClean`).
+
+#### 4.4.3 Operator-supplied CA — no Phase 7 layout change
+
+When `tls_mitm.ca_cert` and `tls_mitm.ca_key` are operator-
+supplied (SPEC6 §5.1), the storage layout is whatever the
+operator put there. Phase 7 does not touch operator-supplied
+paths during normal operation; rotation under operator-supplied
+CA requires the `--force-shared-ca` flag and follows §6.4.2.
+
+No automatic retention policy: rotated-out directories under
+`<cache.dir>/ca/` grow without bound. Operators who care prune
+manually (and at their own risk — pruning a directory that any
+client still trusts breaks chain validation for that client).
+The `tls_mitm.rotation.archived_ca_count` status field surfaces
 the count for observability.
 
 ### 4.5 SQLite schema — unchanged
@@ -722,14 +878,14 @@ Phase 5's `[admin]` block (SPEC5 §5.1) gains four new fields:
 [admin]
 # --- Phase 5 fields, unchanged ---
 listen                      = "127.0.0.1:9090"
-htpasswd_path               = ""              # read-only realm
+htpasswd_file               = ""              # read-only realm
 read_timeout                = "5s"
 idle_timeout                = "30s"
 gauge_refresh               = "5s"
 metric_series_cap           = 1024
 
 # --- Phase 7 additions ---
-mutating_htpasswd_path      = ""              # write-role realm; empty = mutating endpoints disabled
+mutating_htpasswd_file      = ""              # write-role realm; empty = mutating endpoints disabled
 mutating_bearer_tokens      = []              # opt-in; list of "<token-id>:<secret>" strings
 job_retention               = 100             # max remembered terminal jobs
 idempotency_window          = "5m"            # idempotency-key TTL after job termination
@@ -737,9 +893,9 @@ idempotency_window          = "5m"            # idempotency-key TTL after job te
 
 Field semantics:
 
-- **`mutating_htpasswd_path`** — Filesystem path to a bcrypt
-  htpasswd file (same format as `admin.htpasswd_path`). When
-  non-empty AND distinct from `htpasswd_path`, mutating endpoints
+- **`mutating_htpasswd_file`** — Filesystem path to a bcrypt
+  htpasswd file (same format as `admin.htpasswd_file`). When
+  non-empty AND distinct from `htpasswd_file`, mutating endpoints
   authenticate against this file. When empty AND
   `mutating_bearer_tokens` is empty, all mutating endpoints
   return `503` (§1.1).
@@ -768,35 +924,38 @@ Field semantics:
 
 ```toml
 [reload]
-allowed_keys = [
-  "upstream.allowed_host_regex",
-  "tls_mitm.allowed_host_regex",
-  "freshness.periodic_refresh",
-  "gc.interval",
-  "log_level",
-]
+allowed_keys = []
 ```
 
 Field semantics:
 
 - **`allowed_keys`** — List of dotted config keys that are
   applied during a hot-reload (`SIGHUP` or
-  `POST /admin/config/reload`). Empty list disables both reload
-  paths. Any key in this list MUST be from the §5.4 reloadable-
-  subset table; an entry for a non-reloadable key fails config
-  validation at startup with
-  `non_reloadable_key_in_allowed_keys` error.
+  `POST /admin/config/reload`). Empty list (the **Phase 7
+  default**) disables both reload paths: `SIGHUP` is logged
+  and ignored, `POST /admin/config/reload` returns `503`. Any
+  key in this list MUST be from the §5.4 Phase-7-reloadable
+  set; an entry for a deferred / non-reloadable key fails
+  config validation at startup with `reload_key_invalid`
+  naming the offending key.
 
-The default value (above) is the maximally-populated set per
-§5.4. Operators who want to narrow which keys reload (e.g. allow
-log-level changes but not regex changes) edit the list.
+Operators enable reload by populating the list explicitly:
+
+```toml
+[reload]
+allowed_keys = ["log.level"]
+```
+
+The Phase 7 reloadable set is `["log.level"]` only. Future
+phases broaden the set as components pick up live-config
+plumbing — see §5.4 "Future-reloadable" table.
 
 ### 5.3 Validation rules (delta over SPEC5 §5.4)
 
 New startup config-error fail-closed cases:
 
-- **`htpasswd_paths_collide`** — `admin.htpasswd_path` and
-  `admin.mutating_htpasswd_path` are non-empty AND identical.
+- **`htpasswd_files_collide`** — `admin.htpasswd_file` and
+  `admin.mutating_htpasswd_file` are non-empty AND identical.
   Configuring the same file as both realms would silently
   collapse the realm split. Daemon refuses to start.
 - **`bearer_token_invalid_id`** — Any `<id>:<secret>` entry's
@@ -811,7 +970,7 @@ New startup config-error fail-closed cases:
 - **`mutating_realm_unconfigured_but_used`** — At least one
   field in the §5.4 reloadable subset is non-empty (e.g.
   `[reload].allowed_keys` is non-default), AND
-  `mutating_htpasswd_path` and `mutating_bearer_tokens` are both
+  `mutating_htpasswd_file` and `mutating_bearer_tokens` are both
   empty. This is an inconsistency Warn (not a startup failure):
   reload is configured but unreachable via HTTP because no
   write-role credential exists. SIGHUP still works.
@@ -822,63 +981,64 @@ New startup config-error fail-closed cases:
 - **`job_retention_too_high`** — `admin.job_retention > 100000`.
   Daemon refuses to start.
 
-### 5.4 Hot-reloadable subset
+### 5.4 Hot-reloadable subset (Phase 7 minimal)
 
-The complete set of config keys that may appear in
-`[reload].allowed_keys` and that the reload pipeline (§6.3)
-will apply to the live config:
+Phase 7 ships a **deliberately small** reloadable set: only
+keys whose live consumers already observe a re-readable value
+without a component rebuild. Phase 6 components (`fetch.New`,
+`gc.New`, `internal/freshness/adoption.go`) capture their
+relevant config at construction (per `cmd/apt-cacher-ultra/main.go:425, :453`),
+so reloading values they depend on requires either rebuilding
+the component or threading new config-observation handles
+through them — work that's out of Phase 7's scope. Phase 7
+graduates that broader reload surface to a future phase as
+each component picks up live-config plumbing.
+
+**Phase 7 reloadable keys** (the only entries valid in
+`[reload].allowed_keys`):
 
 | Key | Reload apply-when | Reload validation |
 |---|---|---|
-| `upstream.allowed_host_regex` | Next request consults the new regex | RE2 compile + IDNA-validation rules per Phase 1 §6.6 |
-| `tls_mitm.allowed_host_regex` | Next CONNECT signing gate consults new regex | SPEC6 §5.1 rules: RE2 compile + §5.1.1.1 anchor symmetry; if Name Constraints derivation fails, reload aborts (live constraints unchanged) |
-| `upstream.deny_target_ranges` | Next outbound TCP connect consults new list | Per Phase 1 §5.3: parse CIDRs |
-| `freshness.periodic_refresh` | Refresher restarts on next natural tick | Duration parse; must be > `freshness.min_jitter` |
-| `freshness.max_concurrent_adoptions` | Adoption semaphore resizes on next acquire | Integer ≥ 0 |
-| `gc.interval` | GC ticker re-arms on next tick | Duration parse; must be > 0 |
-| `gc.dry_run` | Next GC tick respects new value | Boolean |
-| `log_level` | slog handler swaps level immediately | Enum: `debug|info|warn|error` |
-| `upstream.connect_timeout` | Next request uses new timeout | Duration parse; > 0 |
-| `upstream.total_timeout` | Next request uses new timeout | Duration parse; > 0; ≥ `connect_timeout` |
-| `upstream.max_retries` | Next request uses new value | Integer ≥ 0 |
+| `log.level` | slog handler `LevelVar` swaps level immediately on the live handler. The daemon holds a `*slog.LevelVar` in process state; reload calls `Set()` on it; existing log calls observe the new level on next emit. | Enum: `debug \| info \| warn \| error` |
 
-**Explicitly NOT reloadable** (changes to these in the file
-during reload are recorded as `ignored_non_reloadable` per
-§2.2.5 but not applied):
+**Future-reloadable** (NOT in Phase 7's `[reload].allowed_keys`
+allowlist; included in the file during reload is recorded as
+`ignored_non_reloadable` per §2.2.5 but not applied):
 
-- `cache.listen`, `cache.listen_tls`, `admin.listen` —
-  listener restart required.
-- `cache.tls_cert`, `cache.tls_key` — TLS cert reload would
-  require `tls.Config.GetCertificate` plumbing not yet in
-  place (deferred to a future phase).
-- `tls_mitm.enabled` — toggling on/off requires re-wiring the
-  CONNECT dispatcher.
-- `tls_mitm.ca_cert`, `tls_mitm.ca_key` — CA changes must use
-  rotate (online) or restart (offline).
-- `tls_mitm.allow_unconstrained_ca` — the SPEC6 §5.1.1.1 fail-
-  closed semantic depends on this being known at CA load time.
-- `tls_mitm.leaf_cert_lifetime`, `tls_mitm.ca_cert_lifetime`,
-  `tls_mitm.leaf_algorithm`, `tls_mitm.cert_cache_size` — these
-  affect cert generation and the cert cache; resizing the cache
-  online is doable but deferred.
-- `cache.cache_dir` — storage identity invariant.
-- `[adoption]` schema-related keys — migration concern.
-- `admin.htpasswd_path`, `admin.mutating_htpasswd_path`,
-  `admin.mutating_bearer_tokens` — credential changes during
-  reload would race in-flight authenticated requests.
-- `admin.job_retention`, `admin.idempotency_window` —
-  resizing the in-memory store mid-flight is a future
-  enhancement; not required.
-- `[reload].allowed_keys` itself — bootstrapping concern; a
-  reload that changes its own gate is meta-confusing. To
-  change the allowlist, restart.
+| Key | Why deferred |
+|---|---|
+| `upstream.allowed_host_regex` | `fetch.Client` captures this at `fetch.New()`; live reload requires a new `Client.SetAllowedRegex` API or component rebuild |
+| `tls_mitm.allowed_host_regex` | CONNECT signing gate captures the compiled regex at handler init; same rebuild concern + Name Constraints derivation runs at CA load only |
+| `upstream.deny_target_ranges` | `fetch.Client` captures CIDR list at construction |
+| `upstream.connect_timeout` / `total_timeout` / `max_retries` | `fetch.Client` captures at construction |
+| `freshness.periodic_refresh` | Refresher captures the ticker interval at start; live reload requires ticker-recreation plumbing |
+| `freshness.max_concurrent_adoptions` | Semaphore size captured at construction |
+| `gc.interval` | GC service captures interval at `gc.New()` |
+| `cache.listen`, `cache.listen_tls`, `admin.listen` | Listener bind change requires restart (no in-place re-bind) |
+| `cache.tls_cert`, `cache.tls_key` | TLS cert reload would require `tls.Config.GetCertificate` plumbing |
+| `tls_mitm.enabled` | Toggling on/off requires re-wiring the CONNECT dispatcher |
+| `tls_mitm.ca_cert`, `tls_mitm.ca_key` | CA changes use rotate (online) or restart (offline) |
+| `tls_mitm.allow_unconstrained_ca` | SPEC6 §5.1.1.1 fail-closed semantic is known at CA load only |
+| `tls_mitm.leaf_cert_lifetime`, `ca_cert_lifetime`, `leaf_algorithm`, `cert_cache_size` | Cert generation parameters captured at construction |
+| `cache.dir` | Storage identity invariant |
+| `admin.htpasswd_file`, `admin.mutating_htpasswd_file`, `admin.mutating_bearer_tokens` | Credential changes during reload would race in-flight authenticated requests |
+| `admin.job_retention`, `admin.idempotency_window` | Resizing the in-memory store mid-flight is future work |
+| `[reload].allowed_keys` itself | Bootstrapping concern; a reload that changes its own gate is meta-confusing. Restart required. |
+| `[adoption]` schema-related keys | Migration concern |
 
-A reload request whose file content changes a non-reloadable key
-DOES NOT fail. The new value is recorded in
-`ignored_non_reloadable` (§2.2.5 result body); the live value is
-unchanged. Operators who intend to apply a non-reloadable key
-must restart the daemon — the reload result body makes the
+A reload request whose file content changes a non-reloadable
+key DOES NOT fail. The new value is recorded in
+`ignored_non_reloadable` (§2.2.5 result body); the live value
+is unchanged. Operators who intend to apply a non-reloadable
+key must restart the daemon — the reload result body makes the
 divergence visible.
+
+**Phase 7 minimal contract.** Operators who want reload
+configure `[reload].allowed_keys = ["log.level"]`. The
+SIGHUP / `POST /admin/config/reload` paths verify a config
+file change, validate the file, and (if `log.level` differs)
+apply the new level. Phase 8+ broadens this set as each
+component picks up live-config plumbing.
 
 ### 5.5 Default config block additions
 
@@ -892,10 +1052,10 @@ guidance:
 
 # --- Phase 7 ---
 # Mutating-endpoints credentials: bcrypt htpasswd file (same format
-# as htpasswd_path above). Empty = mutating endpoints disabled.
-# Must NOT be the same path as htpasswd_path; the read and write
+# as htpasswd_file above). Empty = mutating endpoints disabled.
+# Must NOT be the same path as htpasswd_file; the read and write
 # realms must use distinct credentials.
-mutating_htpasswd_path = ""
+mutating_htpasswd_file = ""
 
 # Mutating-endpoints bearer tokens (opt-in alongside or instead of
 # htpasswd). Each entry is "<token-id>:<secret>"; the id is the
@@ -915,14 +1075,12 @@ idempotency_window = "5m"
 # --- NEW Phase 7 block ---
 [reload]
 # Config keys that SIGHUP / POST /admin/config/reload will apply.
-# Empty list disables reload entirely.
-allowed_keys = [
-  "upstream.allowed_host_regex",
-  "tls_mitm.allowed_host_regex",
-  "freshness.periodic_refresh",
-  "gc.interval",
-  "log_level",
-]
+# Empty list (Phase 7 default) disables reload entirely.
+# The Phase 7 reloadable set is just ["log.level"]; future
+# phases broaden as components gain live-config plumbing.
+# To enable log-level hot-reload:
+#   allowed_keys = ["log.level"]
+allowed_keys = []
 ```
 
 ---
@@ -935,12 +1093,12 @@ Every request to the admin listener (`admin.listen`) is
 classified by HTTP method into one of two realms:
 
 - **Read realm.** `GET`/`HEAD` requests for `/`, `/?format=json`,
-  `/metrics`, `/admin/events`, `/admin/jobs`, `/admin/jobs/{id}`.
-  Requires a credential matching `admin.htpasswd_path`. If
-  `htpasswd_path` is empty, read realm is unauthenticated (the
+  `/metrics`, `/healthz`, `/admin/jobs`, `/admin/jobs/{id}`.
+  Requires a credential matching `admin.htpasswd_file`. If
+  `htpasswd_file` is empty, read realm is unauthenticated (the
   Phase 5 default).
 - **Write realm.** `POST` requests for any `/admin/*` path.
-  Requires a credential matching `admin.mutating_htpasswd_path`
+  Requires a credential matching `admin.mutating_htpasswd_file`
   OR a bearer token in `admin.mutating_bearer_tokens`. If both
   are empty, the write realm is **closed** (every POST returns
   `503`).
@@ -948,7 +1106,7 @@ classified by HTTP method into one of two realms:
 Cross-realm credential rejection:
 
 - A read-realm credential that authenticates against
-  `htpasswd_path` MUST NOT satisfy a write-realm request. The
+  `htpasswd_file` MUST NOT satisfy a write-realm request. The
   middleware checks the request's HTTP method first, dispatches
   to the realm-specific authenticator, and never falls back. A
   read-only htpasswd entry on a `POST` request returns `401`
@@ -963,7 +1121,7 @@ WWW-Authenticate header:
 
 - Read realm: `Basic realm="apt-cacher-ultra (read)"`.
 - Write realm:
-  - If `mutating_htpasswd_path` is set:
+  - If `mutating_htpasswd_file` is set:
     `Basic realm="apt-cacher-ultra (write)"`.
   - If only `mutating_bearer_tokens` is set:
     `Bearer realm="apt-cacher-ultra (write)"`.
@@ -1032,13 +1190,16 @@ The worker for each action is one of:
   `current_snapshot_id`, and the §6.4 SPEC2 `metadata` table;
   WAL fsync; commit. Pool/ blob unlinking happens on the next
   GC tick.
-- **suite_refresh** — Calls
-  `freshness.RefreshSuite(ctx, suite_key, "manual")` which
-  takes the same `max_concurrent_adoptions` semaphore as the
+- **suite_refresh** — Calls `freshness.RefreshSuite(ctx,
+  SuiteRef{...}, "manual")` which takes the same
+  `freshness.max_concurrent_adoptions` semaphore as the
   periodic refresher. If the semaphore is full, the worker
-  waits up to `freshness.refresh_queue_timeout` (default 30s);
-  on timeout the job fails with
-  `error: "adoption semaphore full"`.
+  waits up to a hard-coded **30 second** ceiling; on timeout
+  the job fails with `error: "adoption semaphore full"`.
+  (The 30s ceiling is a const in code, not a config knob — a
+  manual refresh that can't acquire a semaphore slot inside
+  30s indicates ongoing adoption work; the operator retries
+  later.)
 - **ca_rotate** — §6.4. Holds the global `caRotateMutex`.
 - **config_reload** — §6.3. Holds the global `configReloadMutex`.
 
@@ -1100,7 +1261,7 @@ Found` with body `{"error":"job aged out"}`.
 6. Fire reload-side-effects:
    - Refresher: signal periodic_refresh ticker to re-arm.
    - GC: signal gc.interval ticker to re-arm.
-   - slog handler: swap log level if log_level changed.
+   - slog handler: swap log level if log.level changed.
    - Regex consumers: nothing — they Load() per request.
 7. Emit reload_applied Info with the applied list (§10.2).
 8. Release configReloadMutex.
@@ -1126,78 +1287,153 @@ per request; ticker intervals are amortized).
 ### 6.4 CA rotation flow
 
 `POST /admin/ca/rotate` and `apt-cacher-ultra ca rotate`
-(§14.2) call the same `tlsmitm.Rotate(ctx)` entry point:
+(§14.2) call `tlsmitm.Rotate(ctx, opts)` with:
 
-```
-1. Acquire caRotateMutex (non-blocking; if held, return 409 /
-   subcommand exits 1 with rotate_in_flight).
-2. Acquire the existing Phase 6 §4.2.1 flock on cache_dir/ca/.
-   (Online rotate: if flock cannot be acquired within
-   tls_mitm.ca_rotate_lock_timeout, default 30s, abort with
-   ca_lock_timeout error. Subcommand: same timeout.)
-3. Capture old CA fingerprint.
-4. Generate new CA keypair per SPEC6 §5.1.1 / §5.1.2 rules
-   (Name Constraints derivation included; same fail-closed
-   semantics: empty regex + allow_unconstrained_ca=false →
-   rotate fails with mitm_ca_unconstrained_refused).
-5. Atomic-write new keypair to a temp path under
-   cache_dir/ca/, then rename to cache_dir/ca/.tmp/ca.{cert,key}
-   (the temp pair lives alongside the live pair during the
-   atomic switchover).
-6. Atomic-swap the in-memory CA pointer (atomic.Pointer[CA])
-   to the new keypair. From this moment, all new CONNECTs
-   sign with the new CA.
-7. Flush the leaf-cert cache. Record the eviction count for
-   the result body. (Existing TLS sessions on the wire are
-   unaffected — they completed handshake under the old leaf
-   already.)
-8. Move the old live keypair to
-   cache_dir/ca/old/<old-fingerprint-prefix>/. (rename, not
-   copy — atomic on POSIX.)
-9. Move the new keypair from cache_dir/ca/.tmp/ to the live
-   path cache_dir/ca/ca.{cert,key}. (rename, atomic.)
-10. Release flock.
-11. Emit mitm_ca_rotated Info (§10.1) with old + new
-    fingerprints, eviction count, caller (HTTP path) or
-    "subcommand" (CLI path).
-12. Release caRotateMutex.
-13. HTTP path: job transitions to done with result body per
-    §2.2.4. CLI path: subcommand exits 0 and prints the new
-    fingerprint to stdout.
+```go
+type RotateOpts struct {
+    AllowOperatorSupplied bool   // §14.2 --force-shared-ca sets true; HTTP path always false
+}
 ```
 
-#### 6.4.1 Rotation failure paths
+Flow:
 
-- New keypair generation fails (entropy, system error) →
-  rollback: delete the temp path; nothing changes; live CA
-  unchanged. Job fails with `error: "keypair generation
-  failed: <detail>"`.
-- Disk full during atomic-write of new keypair → rollback as
-  above. Job fails with `error: "disk full"`.
-- Name Constraints derivation fails (regex too complex) AND
-  `allow_unconstrained_ca=false` → rollback. Job fails with
-  `error: "mitm_ca_unconstrained_refused"`.
-- Rename to old/ fails → the new keypair is live but the old
-  one is still at the live path under a different name. The
-  daemon emits `mitm_ca_rotation_old_archive_failed` Warn with
-  the disk error; rotation succeeds (live is the new CA);
-  operator must manually move the orphan file. Subsequent
-  rotates skip the archive step if the target prefix already
-  exists.
-- Daemon crashes between swap and archive → on restart the
-  daemon loads the live keypair (which is the new one); the
-  un-archived old keypair is still at the live path under the
-  daemon's previous filename for that path. The daemon does
-  not see it (the live filename is now governed by the new
-  keypair). Operator-visible artifact, no functional impact.
-  Document in §11.
+```
+ 1. Acquire caRotateMutex (non-blocking; if held, return 409 /
+    subcommand exits 1 with rotate_in_flight).
+ 2. Determine storage_dir:
+    - Auto-generated path: storage_dir = cfg.TlsMitm.CaStorageDir
+      (or <cache.dir>/ca/ default).
+    - Operator-supplied path AND opts.AllowOperatorSupplied=false:
+      return error operator_supplied_ca_no_force.
+    - Operator-supplied path AND opts.AllowOperatorSupplied=true:
+      validate filepath.Dir(CaCert) == filepath.Dir(CaKey);
+      validate the parent dir is writable; storage_dir = that
+      shared parent. Failure → return error.
+ 3. Acquire flock on <storage_dir>/.ca.lock with 30s timeout.
+    Failure → return ca_lock_timeout. (HTTP and subcommand
+    use the same lock contract; concurrent invocations
+    serialize on this lock.)
+ 4. Capture old fingerprint by following the existing
+    `current` symlink (or by reading flat-layout ca.crt if
+    pre-migration); load via SPEC6 loadCommittedCA.
+ 5. Generate new CA keypair per SPEC6 §5.1.1 / §5.1.2 rules
+    (Name Constraints derivation included; same fail-closed
+    semantics: empty regex + allow_unconstrained_ca=false →
+    rotate fails with mitm_ca_unconstrained_refused).
+ 6. Compute new_fp = sha256_hex(DER(new-cert)).
+ 7. mkdir <storage_dir>/<new_fp>/ (mode 0700; refuse if dir
+    already exists — that would be a fingerprint collision,
+    statistically near-impossible).
+ 8. Atomic-write the trio inside <new_fp>/ using SPEC6
+    §4.2.1 contract:
+    a. Write ca.crt.tmp (mode 0600), rename → ca.crt.
+    b. Write ca.key.tmp (mode 0600), rename → ca.key.
+    c. fsync <new_fp>/.
+    d. Write ca.ready.tmp containing new_fp text, rename
+       → ca.ready (the SPEC6 commit linearization point for
+       this trio).
+    e. fsync <new_fp>/.
+ 9. Atomic-symlink-swap (the rotation linearization point):
+    a. symlink current.<rand> -> <new_fp> (relative).
+    b. rename(2) current.<rand> → current.
+       POSIX-atomic; replaces existing symlink in one syscall.
+    c. fsync <storage_dir>/.
+10. Atomic-swap the in-memory CA pointer (atomic.Pointer[CA])
+    to the new keypair. From this moment, all new CONNECTs
+    sign with the new CA.
+11. Flush the leaf-cert cache. Record eviction count for the
+    result body. Existing TLS sessions on the wire are
+    unaffected — they completed handshake under old leaf
+    already.
+12. (Operator-supplied path only) Replace cfg.TlsMitm.CaCert
+    and cfg.TlsMitm.CaKey files with symlinks pointing at
+    <new_fp>/ca.{crt,key}. Atomic per file via the same
+    write-tmp-then-rename pattern. Failure → see §6.4.1.
+13. Release flock.
+14. Emit mitm_ca_rotated Info (§10.3) with old + new
+    fingerprints, eviction count, caller, duration.
+15. Release caRotateMutex.
+16. HTTP path: job done with result body per §2.2.4.
+    CLI path: print summary to stdout, exit 0.
+```
+
+#### 6.4.1 Crash-safety semantics
+
+The single linearization point is step 9b — the atomic
+`rename(2)` on the symlink. Before it: `current` resolves to
+the old directory; live = old. After it: `current` resolves
+to `<new_fp>/`; live = new.
+
+Per-step crash disposition:
+
+- **Crash in steps 1-7**: live = old; tmp files cleaned up on
+  next rotate's prelude or by `cleanupTmpFiles` (existing SPEC6
+  helper; extended for Phase 7 to also remove orphan
+  `<fingerprint>/` directories that lack a complete trio).
+- **Crash in step 8 (atomic-write of trio)**: `<new_fp>/` left
+  in inconsistent state (some files present, some not).
+  `scanCAState` extended for Phase 7 marks such directories as
+  pruneable; cleanup runs under the lock on next rotate.
+- **Crash in step 9 (symlink rename)**: `current.<rand>` may
+  be left dangling. SPEC7 startup cleanup removes any
+  `current.*` matches that aren't `current` itself.
+- **Crash AFTER step 9 succeeds, BEFORE step 10**: on next
+  start, `current` resolves to `<new_fp>/`; daemon loads new
+  CA. Cert cache is empty (in-memory; reconstructed). Net
+  effect: rotation succeeded, just observed at restart instead
+  of at the rotate call.
+- **Crash in step 11 (cert cache flush)**: rare; in-memory
+  operation. If partial, surviving entries still validate (they
+  were signed by the old CA which the operator no longer trusts
+  for new chains). Worst case: a few clients retry CONNECT and
+  receive fresh leaves under new CA.
+- **Crash in step 12 (operator-supplied symlink update)**: see
+  §6.4.2 — log Warn; operator's configured path now lags the
+  in-memory rotation; subsequent daemon restart with stale
+  symlink loads old CA, undoing the rotation silently.
+  Mitigation: the subcommand validates writability in step 2
+  before any generation work; a step-12 crash can only happen
+  after generation succeeded, so the operator can re-run
+  `apt-cacher-ultra ca rotate --force-shared-ca` to retry the
+  symlink update against the already-generated `<new_fp>/`.
+  (The retry path detects the existing `<new_fp>/` dir and
+  skips generation.)
+
+There is no "in-place crash" window where the live CA trio is
+inconsistent. Crash recovery is by-design, not by-runbook.
 
 #### 6.4.2 Rotation under operator-supplied CA
 
-If `tls_mitm.ca_cert` and `tls_mitm.ca_key` are non-empty (the
-operator-supplied path per SPEC6 §5.1), `tlsmitm.Rotate` returns
-`error: "operator-supplied CA — rotate via ansible"` immediately
-and no keypair is generated.
+When `tls_mitm.ca_cert` and `tls_mitm.ca_key` are non-empty
+(operator-supplied path per SPEC6 §5.1):
+
+- HTTP `POST /admin/ca/rotate` returns 409 with
+  `error: "operator-supplied CA — rotate via ansible (or use the CLI subcommand with --force-shared-ca on this single instance)"`.
+  Multi-cache deployments use ansible to push a new CA across
+  all instances atomically.
+- Subcommand `apt-cacher-ultra ca rotate` exits 1 unless
+  `--force-shared-ca` is passed. With the flag, rotation
+  proceeds via `RotateOpts{AllowOperatorSupplied: true}` per
+  step 2. This is a SINGLE-INSTANCE rotate; the operator is
+  responsible for distributing the new CA's cert (printed to
+  stdout via `apt-cacher-ultra ca print`) to peer caches.
+
+The validity check in step 2 requires:
+
+- `filepath.Dir(cfg.TlsMitm.CaCert) == filepath.Dir(cfg.TlsMitm.CaKey)`
+  (cert and key in the same parent directory). Failure →
+  `error: "operator-supplied paths in different directories — cannot rotate atomically"`.
+- The shared parent directory is writable by the daemon user.
+  Failure → `error: "operator-supplied parent dir not writable: <path>"`.
+- A `.ca.lock` file is created in the shared parent dir if not
+  already present (mode 0600); the same flock contract applies.
+
+When step 12 succeeds, the operator-supplied paths now point at
+`<new_fp>/ca.{crt,key}` via symlinks. The original cert/key
+files at the configured paths are replaced atomically with
+symlinks; the operator should treat the configured paths as
+symlink-aware on subsequent operations (e.g. `apt-cacher-ultra
+ca print` follows symlinks).
 
 ### 6.5 Cache-clear under live traffic
 
@@ -1323,14 +1559,18 @@ this.
 `tlsmitm.Rotate` takes:
 
 1. `caRotateMutex` (this spec, §9.1).
-2. The Phase 6 §4.2.1 flock on `cache_dir/ca/`.
+2. The flock on `<storage_dir>/.ca.lock` (extends SPEC6 §4.2.1
+   convention to the Phase 7 `<storage_dir>` resolution per
+   §6.4 step 2).
 
-Both are non-blocking with a timeout. A second concurrent
-rotate observes step 1 held and returns `409` immediately.
+Both are non-blocking with a 30s timeout (per §6.4 step 3). A
+second concurrent rotate observes step 1 held and returns
+`409` immediately.
 
-The leaf-cert cache flush (§6.4 step 7) takes the cert-cache
-mutex briefly. The atomic-pointer swap (§6.4 step 6) is lock-
-free. No other system lock is acquired.
+The leaf-cert cache flush (§6.4 step 11) takes the cert-cache
+mutex briefly. The in-memory CA pointer swap (§6.4 step 10)
+is lock-free (`atomic.Pointer[CA]`). No other system lock is
+acquired.
 
 ### 9.4 Startup ordering — delta over SPEC6 §9.5
 
@@ -1339,15 +1579,18 @@ The Phase 6 startup sequence becomes:
 ```
 1. Validate config (SPEC6 §9.5 step 1).
 2. Materialize TLS MITM CA via tlsmitm.LoadOrGenerate
-   (SPEC6 §9.5 step 2).
+   (SPEC6 §9.5 step 2). Phase 7 extension: the same call
+   performs the §4.4.1 one-shot migration when flat layout
+   is detected; the migration runs under the existing
+   `.ca.lock` flock, atomically, before the load completes.
 3. Bind cache.listen (plain proxy listener).
 4. Bind cache.listen_tls (TLS proxy listener), if configured.
 5. Bind admin.listen, if configured.
 6. Validate auth realms:
-   a. Read realm: open htpasswd_path; failure → fail-closed.
-   b. Write realm: if mutating_htpasswd_path is set, open it;
+   a. Read realm: open htpasswd_file; failure → fail-closed.
+   b. Write realm: if mutating_htpasswd_file is set, open it;
       failure → fail-closed. Validate
-      htpasswd_paths_collide (§5.3) failure → fail-closed.
+      htpasswd_files_collide (§5.3) failure → fail-closed.
       Validate bearer-token entries → fail-closed.
    c. Emit admin_realm_summary Info with read-realm-source,
       write-realm-source ("htpasswd"|"bearer"|"both"|"closed"),
@@ -1535,20 +1778,34 @@ changed").
 ```json
 {
   "event": "mitm_ca_rotate_failed",
-  "stage": "lock|generate|atomic_write|swap|archive",
+  "stage": "lock|prelude|generate|write_trio|symlink_swap|inmem_swap|cert_cache_flush|operator_symlink",
   "old_fingerprint_sha256": "<hex>",
+  "new_fingerprint_sha256": "<hex>" or omitted,
   "error": "<message>",
   "caller": "<as-above>"
 }
 ```
 
-`mitm_ca_rotation_old_archive_failed` (Warn) per §6.4.1:
+`mitm_ca_layout_migrated` (Info) per §4.4.1, emitted on first
+Phase 7 start when migrating from the SPEC6 flat layout:
 
 ```json
 {
-  "event": "mitm_ca_rotation_old_archive_failed",
-  "old_fingerprint_sha256": "<hex>",
-  "stranded_path": "<live-path>",
+  "event": "mitm_ca_layout_migrated",
+  "fingerprint_sha256": "<hex>",
+  "from": "<storage_dir>/ca.{crt,key,ready}",
+  "to": "<storage_dir>/<fingerprint>/"
+}
+```
+
+`mitm_ca_operator_symlink_failed` (Warn), emitted by §6.4.1
+step 12 failure (operator-supplied path only):
+
+```json
+{
+  "event": "mitm_ca_operator_symlink_failed",
+  "new_fingerprint_sha256": "<hex>",
+  "configured_path": "<cfg.TlsMitm.CaCert>",
   "error": "<message>"
 }
 ```
@@ -1619,7 +1876,7 @@ deletions or renames.
 
 | ID | Failure | Behavior |
 |---|---|---|
-| G1 | `mutating_htpasswd_path` set to same path as `htpasswd_path` | Startup fails with `htpasswd_paths_collide` config-error |
+| G1 | `mutating_htpasswd_file` set to same path as `htpasswd_file` | Startup fails with `htpasswd_files_collide` config-error |
 | G2 | `mutating_bearer_tokens` entry has malformed id (e.g. spaces) | Startup fails with `bearer_token_invalid_id` |
 | G3 | `mutating_bearer_tokens` entry has secret < 32 chars | Startup fails with `bearer_token_secret_too_short` |
 | G4 | `mutating_bearer_tokens` has two entries with same id | Startup fails with `bearer_token_id_collision` |
@@ -1644,18 +1901,24 @@ deletions or renames.
 | G23 | Reload IO failure (config file missing/permission denied) | reload_failed Warn, live config unchanged, job failed |
 | G24 | Reload validation failure on any field | Reload aborts; live config unchanged; job failed with the same error startup would have produced |
 | G25 | Reload pointer swap fails (programmer bug — should not happen) | reload_failed Warn stage=atomic_swap, daemon continues with old config; surfaced as a regression |
-| G26 | CA rotate keypair generation fails | Job failed; live CA unchanged; cert cache NOT flushed |
-| G27 | CA rotate atomic-write fails (disk full) | Job failed; live CA unchanged; temp files cleaned up |
-| G28 | CA rotate succeeds but old-archive rename fails | Job done; live CA is new; old keypair stranded at live-prior path; mitm_ca_rotation_old_archive_failed Warn; operator manual cleanup required |
-| G29 | Daemon crashes during CA rotate between steps 6 (swap) and 9 (rename) | Restart loads new live CA; old keypair lingers under prior name; cert cache rebuilds from scratch (in-memory, lost on restart anyway). Operator-visible disk artifact, no functional impact |
-| G30 | GC during CA rotate | GC runs against `pool/`; the CA pool is a different directory under `cache_dir/ca/` — no overlap. No interference |
-| G31 | suite_refresh adoption semaphore full | Job waits up to `freshness.refresh_queue_timeout` (30s); on timeout fails with `adoption semaphore full` |
+| G26 | CA rotate keypair generation fails | Job failed; live CA unchanged; cert cache NOT flushed; partial `<new_fp>/` removed |
+| G27 | CA rotate atomic-write fails (disk full) in step 8 | Job failed; live CA unchanged; orphan `<new_fp>/` cleaned up by next rotate's prelude |
+| G28 | CA rotate symlink-rename fails in step 9 | Job failed; live CA unchanged; `<new_fp>/` left in place (cleaned up by next rotate's prelude or by operator) |
+| G29 | Daemon crashes between step 9 (symlink swap) and step 10 (in-memory swap) | On restart, `current` symlink resolves to `<new_fp>/`; daemon loads new CA. Cert cache rebuilds in-memory under new CA. Net effect: rotation succeeded, observed at restart. |
+| G30 | GC during CA rotate | GC runs against `pool/`; the CA storage is `<cache.dir>/ca/` — no overlap. No interference |
+| G31 | suite_refresh adoption semaphore full | Job waits up to 30s (code const); on timeout fails with `adoption semaphore full` |
 | G32 | cache_clear during in-flight singleflight read | In-flight read completes (POSIX FD semantics); next request misses |
 | G33 | Job retention exceeded | Oldest terminal job dropped silently from store |
 | G34 | Operator polls GET /admin/jobs/{id} for aged-out job | 404 `job aged out` |
 | G35 | Bearer token authentication: malformed Authorization header | 401 (no log) |
 | G36 | Bearer token authentication: valid format but no matching secret | 401 (no log; constant-time compare prevents timing leak) |
 | G37 | Daemon SIGTERM mid-job | Job fails with `context canceled`; admin_job_orphaned Info; HTTP client polling sees the failure |
+| G38 | First-Phase-7-start CA layout migration: mkdir or rename fails | LoadOrGenerate returns error; daemon refuses to start; live trio still in flat layout (no partial migration). Operator fixes filesystem condition (perms, disk full) and retries |
+| G39 | First-Phase-7-start migration: daemon crashes mid-migration (between step 3 and step 6 of §4.4.1) | Next start detects the partial state (some live files moved, no `current` symlink); LoadOrGenerate completes the migration under the lock |
+| G40 | Phase 6 daemon reads post-Phase-7 storage dir | Sees no `ca.crt` at root; scans as caStateClean; generates a fresh CA. Rotation history under `<fingerprint>/` directories is left untouched but inactive. Documented downgrade hazard (§4.4.2) |
+| G41 | Operator-supplied CA: `--force-shared-ca` rotate, but cfg.TlsMitm.CaCert and CaKey are in different parent directories | `tlsmitm.Rotate` step 2 returns `error: "operator-supplied paths in different directories — cannot rotate atomically"`; live CA unchanged |
+| G42 | Operator-supplied CA: `--force-shared-ca` rotate, parent directory not writable | `tlsmitm.Rotate` step 2 returns `error: "operator-supplied parent dir not writable: <path>"`; live CA unchanged |
+| G43 | Operator-supplied CA rotate: §6.4 step 12 (symlink update) fails after step 9 succeeds | Rotation has already linearized in-memory; emit `mitm_ca_operator_symlink_failed` Warn; the cfg.TlsMitm.CaCert/CaKey paths still point at old keypair on disk; subsequent daemon restart loads OLD CA, undoing the rotation. Operator must re-run rotate (the existing `<new_fp>/` is reused) |
 
 ---
 
@@ -1676,7 +1939,7 @@ deletions or renames.
 
 **Config validation** (`internal/config/admin_realm_test.go`):
 
-- `htpasswd_paths_collide` triggers fail-closed.
+- `htpasswd_files_collide` triggers fail-closed.
 - `bearer_token_invalid_id` triggers fail-closed.
 - `bearer_token_secret_too_short` triggers fail-closed.
 - `bearer_token_id_collision` triggers fail-closed.
@@ -1711,7 +1974,9 @@ deletions or renames.
 **CA rotate** (`internal/proxy/tlsmitm/rotate_test.go`):
 
 - Generate-and-swap round trip; fingerprint changes; cert cache
-  flushed; old keypair under old/<prefix>/.
+  flushed; `current` symlink resolves to new `<new_fp>/`
+  directory; previous active dir remains under
+  `<storage_dir>/<old_fp>/` as the archive.
 - Rotate when MITM disabled returns mitm_disabled error.
 - Rotate when CA is operator-supplied returns operator-supplied
   error.
@@ -1905,19 +2170,23 @@ Semantics:
   skipped and the rotate proceeds. Exit code is 0 on success.
   Operators using this flag are responsible for distributing
   the new CA to peer caches.
-- Calls `tlsmitm.Rotate(ctx)` (§6.4) directly; the same flock
-  on `cache_dir/ca/` serializes against any running daemon. If
-  the daemon is up, both compete for the flock; whichever wins
-  proceeds, the loser exits 1 with `flock_timeout` after
-  `tls_mitm.ca_rotate_lock_timeout` (30s).
-- On success, prints to stdout (PEM-formatted-friendly, one
-  field per line):
+- Calls `tlsmitm.Rotate(ctx, RotateOpts{AllowOperatorSupplied: <flag>})`
+  (§6.4) directly; the same flock on `<storage_dir>/.ca.lock`
+  serializes against any running daemon. If the daemon is up,
+  both compete for the flock; whichever wins proceeds, the
+  loser exits 1 with `flock_timeout` after the hard-coded 30s
+  ceiling (matching the §6.4 step 3 timeout — neither side
+  configures it).
+- On success, prints to stdout (one field per line, suitable
+  for `sed`/`awk` parsing):
   ```
-  rotated_at: 2026-05-09T13:50:12Z
-  old_fingerprint_sha256: <hex>
-  new_fingerprint_sha256: <hex>
-  new_not_after: 2027-05-09T13:50:12Z
-  old_archive: cache_dir/ca/old/<prefix>/
+  rotated_at:             2026-05-09T13:50:12Z
+  old_fingerprint_sha256: <64-char-hex>
+  new_fingerprint_sha256: <64-char-hex>
+  new_not_after:          2027-05-09T13:50:12Z
+  storage_dir:            <cache.dir>/ca
+  active_dir:             <cache.dir>/ca/<new_fp>/
+  archived_dir:           <cache.dir>/ca/<old_fp>/   # left in place
   ```
 - Exit code 0 on success, 1 on any failure (flock timeout, disk
   full, validation failure).
@@ -1932,8 +2201,10 @@ Design notes:
   is reconstructed from scratch under the new CA — same as any
   cold-start.
 - Subcommand does NOT emit log events (no slog handler is wired
-  in subcommand mode). The on-disk artifacts under `ca/old/`
-  + the stdout printout are the audit trail.
+  in subcommand mode). The on-disk artifacts under
+  `<cache.dir>/ca/<fingerprint>/` (and the rotated-out
+  fingerprint directories left behind) plus the stdout printout
+  are the audit trail.
 
 ### 14.3 NEW: `apt-cacher-ultra ca list`
 
@@ -1943,18 +2214,21 @@ Synopsis:
 apt-cacher-ultra ca list [--config <path>]
 ```
 
-Lists the live CA and all archived CAs in `cache_dir/ca/old/`.
-Output (one CA per line):
+Lists the active CA (followed via `current` symlink) and every
+archived CA directory in `<cache.dir>/ca/`. Output (one CA per
+line):
 
 ```
-LIVE   <fingerprint-sha256> not_after=<rfc3339> path=<path>
-old    <fingerprint-sha256> rotated_at=<rfc3339> path=<path>
-old    <fingerprint-sha256> rotated_at=<rfc3339> path=<path>
+ACTIVE    <fingerprint-sha256> not_after=<rfc3339> path=<dir>
+archive   <fingerprint-sha256> not_after=<rfc3339> path=<dir>
+archive   <fingerprint-sha256> not_after=<rfc3339> path=<dir>
 ...
 ```
 
-Useful for operators evaluating rollback options. Exit 0 on
-success.
+The mtime of the `<fingerprint>/ca.ready` file is taken as the
+"rotated-at" timestamp for the archive entries (the linearization
+point of step 9 in §6.4). Useful for operators evaluating
+rollback options or pruning rotation history. Exit 0 on success.
 
 ---
 
@@ -1977,8 +2251,10 @@ Phase 7 is complete when all of the following hold:
 
 4. **CA rotation end-to-end.** `apt-cacher-ultra ca rotate`
    subcommand and POST /admin/ca/rotate produce identical
-   on-disk state. Cert cache flushes; old keypair archived under
-   `cache_dir/ca/old/`. Tested by §12.2 / §12.4.
+   on-disk state. Cert cache flushes; `<cache.dir>/ca/current`
+   resolves to the new `<fingerprint>/` directory; previous
+   active dir remains in place as the archive (§4.4). Tested
+   by §12.2 / §12.4.
 
 5. **Config hot-reload functional.** SIGHUP and
    POST /admin/config/reload apply the §5.4 reloadable subset.
@@ -2011,10 +2287,15 @@ Phase 7 is complete when all of the following hold:
     (live config unchanged on reload failure; live CA unchanged
     on rotate failure; etc.).
 
-11. **No schema migration.** Phase 7 adds zero SQLite tables
-    and modifies zero existing tables. `cache_dir` opened by a
-    Phase 7 daemon is interchangeable with one opened by a
-    Phase 6 daemon (forward and backward).
+11. **No SQLite schema migration; one-shot CA layout migration.**
+    Phase 7 adds zero SQLite tables and modifies zero existing
+    tables. The only on-disk format change is the CA layout
+    (§4.4): on first Phase 7 start, the flat
+    `<cache.dir>/ca/{ca.crt,ca.key,ca.ready}` trio is migrated
+    into a content-addressed `<fingerprint-hex>/` directory
+    plus a `current` symlink. The migration is forward-only;
+    a downgrade to Phase 6 requires manually moving the active
+    CA's files back to the storage-dir root (§4.4.1).
 
 12. **Documentation complete.** SPEC7.md (this document) is
     locked. PHASE-7-SCOPING.md is locked at revision 2.
@@ -2057,7 +2338,8 @@ Phase 7 is complete when all of the following hold:
     no held-mutex panic.
 
 19. **Archive directory growth observable.** A test that runs
-    50 rotates verifies `cache_dir/ca/old/` contains exactly
-    50 fingerprint-prefix subdirectories AND the
-    `tls_mitm.rotation.old_ca_count_on_disk` status field
+    50 rotates verifies `<cache.dir>/ca/` contains exactly
+    51 fingerprint-named subdirectories (50 archived + 1
+    active, identified by the `current` symlink target) AND
+    the `tls_mitm.rotation.archived_ca_count` status field
     reports 50.
