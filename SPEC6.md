@@ -1587,28 +1587,28 @@ modified. All other fields unchanged.
 Emitted from the §9 CONNECT handler:
 
 - **`mitm_connect`** — once per CONNECT, at conn close.
-  Fields: `host` (literal CONNECT host, lower-cased +
-  IDNA-normalized when parsing reached that step;
-  otherwise the raw bytes from the request line truncated
-  to a sane length), `port` (numeric when parsing reached
-  the port step; otherwise `0`), `client_addr`, `outcome`
-  (`tunneled` / `denied_host` / `bad_target` /
-  `bad_host` / `bad_port` / `ip_literal_host` /
-  `tls_handshake_timeout` / `tls_failed` /
-  `cert_gen_failed` / `inner_method_rejected` /
-  `inner_header_timeout` / `inner_header_too_large` /
-  `inner_stream_failed`),
-  `denied_gate` (`signing` / `fetch`; empty when
-  `outcome != denied_host`; identifies which §5.1.2 gate
-  rejected the host), `canonical_host` (post-Remap form,
-  empty when outcome=`denied_host` and `denied_gate=signing`
-  since canonicalization runs after the signing-gate check;
-  also empty when the request never reached canonicalization,
-  e.g. `bad_target` / `bad_host` / `bad_port` /
-  `ip_literal_host`),
-  `duration_ms`, `cert_cache` (`hit` / `miss` — empty when
-  the cert path was not reached). Emitted at level Info on
-  `tunneled`; Warn on every other outcome.
+  Fields: `host` (lower-cased + IDNA-normalized via
+  `ParseConnectTarget`; empty string when parsing failed
+  before the host step, e.g. `bad_target`), `port`
+  (numeric when parsing reached the port step; otherwise
+  `0`), `client_addr`, `outcome` (`tunneled` /
+  `denied_host` / `bad_target` / `bad_host` / `bad_port` /
+  `ip_literal_host` / `tls_handshake_timeout` /
+  `tls_failed` / `cert_gen_failed` /
+  `inner_method_rejected` / `inner_header_timeout` /
+  `inner_header_too_large` / `inner_stream_failed`),
+  `denied_gate` (`signing` / `fetch`; field is OMITTED
+  unless `outcome=denied_host` — `warnConnect` only adds
+  the key when its `deniedGate` argument is non-empty,
+  see `internal/proxy/connect.go:844-846`; identifies
+  which §5.1.2 gate rejected the host), `duration_ms`,
+  `reason` (free-form diagnostic — the underlying error
+  text or rejection cause; field is OMITTED on `tunneled`
+  and present on every other outcome, see
+  `internal/proxy/connect.go:841-843` and the
+  `warnConnect`/`infoConnect` call sites at lines
+  446-633). Emitted at level Info on `tunneled`; Warn on
+  every other outcome.
 
 - **`mitm_cert_issued`** — once per cert generation, before
   insertion into the cache. Fields: `host` (the literal
