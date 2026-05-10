@@ -226,6 +226,8 @@ func (s *Server) startRefresher() {
 func (s *Server) runRefreshOnce(lifecycleCtx context.Context) {
 	s.refreshCacheStats(lifecycleCtx)
 	s.refreshSuiteStats(lifecycleCtx)
+	s.refreshRepoCoverage(lifecycleCtx)
+	s.refreshCacheSummary(lifecycleCtx)
 	s.refreshHostsemGauges()
 	s.refreshPoolDiskBytes(lifecycleCtx)
 	s.refreshProcessMetrics()
@@ -294,6 +296,53 @@ func (s *Server) refreshSuiteStats(parent context.Context) {
 	s.gauges.suitesTracked.Set(float64(st.Tracked))
 	s.gauges.snapshotsCurrent.Set(float64(st.WithCurrentSnapshot))
 	s.gauges.snapshotsDisplaced.Set(float64(displaced))
+}
+
+// refreshRepoCoverage recomputes the SPEC6_5 §2.4 repo_coverage
+// payload and updates both the cached value (status renderer consumes
+// it without re-querying the DB) and the SPEC6_5 §10.3
+// acu_package_hash_rows_by_kind gauge.
+//
+// AIDEV-NOTE: this method runs four aggregates inside a single
+// read-only transaction; see cache.GetRepoCoverage for the SQL
+// rationale. The refresher pattern means a /?format=json scrape sees
+// values stale by up to admin.gauge_refresh — operationally fine for
+// this surface because the per-kind counts only change at adoption
+// time (snapshot lifecycle), not per-request.
+func (s *Server) refreshRepoCoverage(parent context.Context) {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	rc, err := s.cfg.Cache.GetRepoCoverage(ctx)
+	if err != nil {
+		s.logRefresherFailure("acu_package_hash_rows_by_kind", err, time.Since(start))
+		return
+	}
+	s.repoCoverage.Store(&rc)
+	s.gauges.packageHashRowsByKind.Set(float64(rc.PackageHashRowsBinary), "binary")
+	s.gauges.packageHashRowsByKind.Set(float64(rc.PackageHashRowsSource), "source")
+	s.gauges.packageHashRowsByKind.Set(float64(rc.PackageHashRowsPdiff), "pdiff")
+}
+
+// refreshCacheSummary recomputes the SPEC6_5 §2.4
+// cache_summary.by_host[*].by_architecture payload. Same refresh
+// cadence and stale-tolerance semantics as refreshRepoCoverage.
+//
+// AIDEV-NOTE: the (host, arch) cardinality is bounded by real-world
+// fleet shapes (≤ tens of hosts × ≤ tens of arches); the two-query
+// pattern in cache.GetCacheSummaryByHostArch handles this in
+// milliseconds for typical caches. A future scale-test escalation
+// would push this onto its own deadline rather than the shared 10s.
+func (s *Server) refreshCacheSummary(parent context.Context) {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	summary, err := s.cfg.Cache.GetCacheSummaryByHostArch(ctx)
+	if err != nil {
+		s.logRefresherFailure("acu_cache_summary_by_host_arch", err, time.Since(start))
+		return
+	}
+	s.cacheSummaryByHostArch.Store(&summary)
 }
 
 // refreshHostsemGauges populates acu_active_hosts plus the labeled

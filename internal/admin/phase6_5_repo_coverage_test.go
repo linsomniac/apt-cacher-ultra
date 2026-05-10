@@ -98,10 +98,19 @@ func TestStatusJSON_RepoCoverage_FilterEchoed(t *testing.T) {
 }
 
 // seedRepoCoverageSnapshot commits a single inline snapshot containing
-// the given package_hash rows and an InRelease metadata-self entry.
-// Used to drive the SPEC6_5 §2.4 / §2.5 status assertions without
-// running the full freshness adoption flow.
-func seedRepoCoverageSnapshot(t *testing.T, c *cache.Cache,
+// the given package_hash rows and an InRelease metadata-self entry,
+// then forces a refresher pass so the cached repo_coverage /
+// cache_summary atomic.Pointers reflect the seeded state before the
+// caller's HTTP probe. Used to drive the SPEC6_5 §2.4 / §2.5 status
+// assertions without running the full freshness adoption flow.
+//
+// AIDEV-NOTE: the SPEC6_5 §9.7.6 migration of repo_coverage to the
+// refresher-cached path means a /?format=json hit issued right after
+// CommitAdoption returns would otherwise see stale (pre-seed) cached
+// values. Explicitly invoking runRefreshOnce closes the test-timing
+// race without depending on the test's wall-clock vs gauge_refresh
+// tick interval.
+func seedRepoCoverageSnapshot(t *testing.T, s *Server, c *cache.Cache,
 	scheme, host, suite string,
 	memberPaths []string, pkgHashes []cache.PackageHash) int64 {
 	t.Helper()
@@ -157,6 +166,7 @@ func seedRepoCoverageSnapshot(t *testing.T, c *cache.Cache,
 	if err := c.CommitAdoption(context.Background(), id, members, pkgHashes, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
+	s.runRefreshOnce(context.Background())
 	return id
 }
 
@@ -177,31 +187,31 @@ func TestStatusJSON_RepoCoverage_PerKindCounts(t *testing.T) {
 		// 2 binary rows
 		{
 			CanonicalScheme: scheme, CanonicalHost: host,
-			Path: "/ubuntu/pool/main/f/foo/foo_1.0_amd64.deb",
+			Path:           "/ubuntu/pool/main/f/foo/foo_1.0_amd64.deb",
 			DeclaredSHA256: hash, Architecture: "amd64", PackageName: "foo",
 		},
 		{
 			CanonicalScheme: scheme, CanonicalHost: host,
-			Path: "/ubuntu/pool/main/f/foo/foo_1.0_arm64.deb",
+			Path:           "/ubuntu/pool/main/f/foo/foo_1.0_arm64.deb",
 			DeclaredSHA256: hash, Architecture: "arm64", PackageName: "foo",
 		},
 		// 1 source row
 		{
 			CanonicalScheme: scheme, CanonicalHost: host,
-			Path: "/ubuntu/pool/main/b/bash/bash_5.1-2.dsc",
+			Path:           "/ubuntu/pool/main/b/bash/bash_5.1-2.dsc",
 			DeclaredSHA256: hash, Architecture: "source", PackageName: "bash",
 		},
 		// 1 pdiff row
 		{
 			CanonicalScheme: scheme, CanonicalHost: host,
-			Path: "/ubuntu/main/binary-amd64/Packages.diff/2026-05-09-1234.56.gz",
+			Path:           "/ubuntu/main/binary-amd64/Packages.diff/2026-05-09-1234.56.gz",
 			DeclaredSHA256: hash, Architecture: "amd64",
 		},
 	}
 	memberPaths := []string{
 		"main/binary-amd64/Packages.diff/Index", // drives snapshots_with_pdiff
 	}
-	seedRepoCoverageSnapshot(t, s.cfg.Cache, scheme, host, suite, memberPaths, pkgs)
+	seedRepoCoverageSnapshot(t, s, s.cfg.Cache, scheme, host, suite, memberPaths, pkgs)
 
 	resp := mustGet(t, base+"/?format=json")
 	defer resp.Body.Close()
@@ -326,13 +336,13 @@ func TestStatusJSON_RepoCoverage_PdiffPathClassifierIsCaseSensitive(t *testing.T
 		// "other", not "pdiff". GetRepoCoverage must agree by using GLOB.
 		{
 			CanonicalScheme: scheme, CanonicalHost: host,
-			Path: "/ubuntu/main/binary-amd64/packages.diff/2026-05-09-1234.56.gz",
+			Path:           "/ubuntu/main/binary-amd64/packages.diff/2026-05-09-1234.56.gz",
 			DeclaredSHA256: hash, Architecture: "amd64",
 		},
 		// Lowercase "sources.diff" — same case, source bucket.
 		{
 			CanonicalScheme: scheme, CanonicalHost: host,
-			Path: "/ubuntu/main/source/sources.diff/2026-05-09-1234.56.gz",
+			Path:           "/ubuntu/main/source/sources.diff/2026-05-09-1234.56.gz",
 			DeclaredSHA256: hash, Architecture: "source", PackageName: "bash",
 		},
 	}
@@ -340,7 +350,7 @@ func TestStatusJSON_RepoCoverage_PdiffPathClassifierIsCaseSensitive(t *testing.T
 		// Lowercase Index path — must NOT inflate snapshots_with_pdiff.
 		"main/binary-amd64/packages.diff/Index",
 	}
-	seedRepoCoverageSnapshot(t, s.cfg.Cache, scheme, host, suite, memberPaths, pkgs)
+	seedRepoCoverageSnapshot(t, s, s.cfg.Cache, scheme, host, suite, memberPaths, pkgs)
 
 	resp := mustGet(t, base+"/?format=json")
 	defer resp.Body.Close()

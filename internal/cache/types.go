@@ -166,13 +166,13 @@ type CacheStats struct {
 // rows live under Packages.diff/ or Sources.diff/ (compressed patch
 // files); binary rows are everything else with a non-empty arch.
 type RepoCoverage struct {
-	ArchitecturesSeen        []string
-	SnapshotsWithSources     int64
-	SnapshotsWithPdiff       int64
-	PackageHashRowsBinary    int64
-	PackageHashRowsSource    int64
-	PackageHashRowsPdiff     int64
-	PackageHashRowsTotal     int64
+	ArchitecturesSeen     []string
+	SnapshotsWithSources  int64
+	SnapshotsWithPdiff    int64
+	PackageHashRowsBinary int64
+	PackageHashRowsSource int64
+	PackageHashRowsPdiff  int64
+	PackageHashRowsTotal  int64
 }
 
 // SuiteStats is the SPEC5 §9.7.6 suite/snapshot count block: the
@@ -185,6 +185,30 @@ type SuiteStats struct {
 	Tracked             int64 // suite_freshness rows
 	WithCurrentSnapshot int64 // suite_freshness rows with current_snapshot_id IS NOT NULL
 	AdoptedTotal        int64 // suite_snapshot rows with adopted_at IS NOT NULL
+}
+
+// CacheSummaryEntry is one (host, architecture) bucket in the SPEC6_5
+// §2.4 cache_summary.by_host[<host>].by_architecture[<arch>] payload.
+//
+// PackageHashCount is the number of package_hash rows for the (host,
+// arch) tuple across that host's current snapshots — includes rows
+// whose path has no url_path row yet (path declared but not fetched).
+//
+// BlobCount is the number of distinct cached blobs the (host, arch)'s
+// package_hash rows resolve to via the url_path → blob join. A
+// package_hash row whose url_path has no blob (or whose url_path row
+// does not exist yet) contributes zero.
+//
+// BlobBytes is the sum of blob.size for those distinct blobs.
+//
+// AIDEV-NOTE: a blob referenced by multiple (host, arch) tuples is
+// counted under each — this is per-tuple attribution, not a
+// partitioning of total cache bytes. Operators reading the JSON should
+// not expect sum-over-arches to equal cache.bytes_used.
+type CacheSummaryEntry struct {
+	PackageHashCount int64
+	BlobCount        int64
+	BlobBytes        int64
 }
 
 // HotURLPath is one row of the SPEC5 §10.5 hot_url_paths status-page

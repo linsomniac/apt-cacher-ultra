@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -24,6 +25,7 @@ import (
 type statusModel struct {
 	Process         processInfo      `json:"process"`
 	Cache           cacheInfo        `json:"cache"`
+	CacheSummary    cacheSummary     `json:"cache_summary"`
 	RepoCoverage    repoCoverageInfo `json:"repo_coverage"`
 	Listeners       []listenerInfo   `json:"listeners"`
 	TLSMITM         *tlsMITMInfo     `json:"tls_mitm"`
@@ -34,6 +36,76 @@ type statusModel struct {
 	ActiveHosts     []activeHostInfo `json:"active_hosts"`
 }
 
+// cacheSummary is the SPEC6_5 §2.4 cache_summary block. Keyed by
+// canonical host; each host carries its by_architecture breakdown.
+// Always present in the JSON; empty `by_host` when no adoption has
+// populated package_hash rows yet (so consumers always see the schema
+// key with at least the by_host: {} shape).
+//
+// AIDEV-NOTE: the JSON shape nests by_host under cache_summary —
+// a flat top-level keyed-by-host map would collide with future
+// summary-level fields (totals, etc.). The by_host indirection is the
+// SPEC6_5 §2.4 contract.
+type cacheSummary struct {
+	ByHost map[string]cacheSummaryHost `json:"by_host"`
+}
+
+// cacheSummaryHost is one host's cache_summary entry. Its only
+// content is the per-architecture map; the wrapper struct exists so
+// future per-host fields (e.g. total bytes, percentage of cache) can
+// be added without re-shaping the top-level map.
+type cacheSummaryHost struct {
+	ByArchitecture map[string]cacheSummaryArchEntry `json:"by_architecture"`
+}
+
+type cacheSummaryArchEntry struct {
+	PackageHashCount int64 `json:"package_hash_count"`
+	BlobCount        int64 `json:"blob_count"`
+	BlobBytes        int64 `json:"blob_bytes"`
+}
+
+// sortedHostSummary is one HTML-template row: a host plus its
+// architectures pre-sorted by (host, arch) name so the rendered page
+// is deterministic regardless of Go's randomized map iteration order.
+type sortedHostSummary struct {
+	Host          string
+	Architectures []sortedArchSummary
+}
+
+type sortedArchSummary struct {
+	Arch  string
+	Entry cacheSummaryArchEntry
+}
+
+// Sorted returns the cache_summary contents flattened into a host-then-
+// arch sorted slice for the HTML template. Used by status.html — JSON
+// consumers read the map form via ByHost directly.
+func (cs cacheSummary) Sorted() []sortedHostSummary {
+	hosts := make([]string, 0, len(cs.ByHost))
+	for h := range cs.ByHost {
+		hosts = append(hosts, h)
+	}
+	sort.Strings(hosts)
+	out := make([]sortedHostSummary, 0, len(hosts))
+	for _, h := range hosts {
+		archMap := cs.ByHost[h].ByArchitecture
+		names := make([]string, 0, len(archMap))
+		for a := range archMap {
+			names = append(names, a)
+		}
+		sort.Strings(names)
+		arches := make([]sortedArchSummary, 0, len(names))
+		for _, n := range names {
+			arches = append(arches, sortedArchSummary{
+				Arch:  n,
+				Entry: archMap[n],
+			})
+		}
+		out = append(out, sortedHostSummary{Host: h, Architectures: arches})
+	}
+	return out
+}
+
 // repoCoverageInfo is the SPEC6_5 §2.4 status-page repo_coverage
 // section. ArchitecturesSeen is sourced from current snapshots'
 // package_hash rows; ArchitecturesFilter echoes the operator's
@@ -42,11 +114,11 @@ type statusModel struct {
 // call. Always present in the JSON; populated zero-values when no
 // adoption has run yet.
 type repoCoverageInfo struct {
-	ArchitecturesSeen    []string             `json:"architectures_seen"`
-	ArchitecturesFilter  []string             `json:"architectures_filter"`
-	SnapshotsWithSources int64                `json:"snapshots_with_sources"`
-	SnapshotsWithPdiff   int64                `json:"snapshots_with_pdiff"`
-	PackageHashRows      packageHashRowsInfo  `json:"package_hash_rows"`
+	ArchitecturesSeen    []string            `json:"architectures_seen"`
+	ArchitecturesFilter  []string            `json:"architectures_filter"`
+	SnapshotsWithSources int64               `json:"snapshots_with_sources"`
+	SnapshotsWithPdiff   int64               `json:"snapshots_with_pdiff"`
+	PackageHashRows      packageHashRowsInfo `json:"package_hash_rows"`
 }
 
 type packageHashRowsInfo struct {
@@ -241,13 +313,22 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 	}
 	st := stats.(cache.CacheStats)
 
-	repoRaw, err := s.runDBQuery(r, "GetRepoCoverage", func(ctx context.Context) (any, error) {
-		return s.cfg.Cache.GetRepoCoverage(ctx)
-	})
-	if err != nil {
-		return statusModel{}, "GetRepoCoverage", err
+	// SPEC6_5 §9.7.6: repo_coverage and cache_summary read from the
+	// refresher-populated atomic.Pointers, NOT a live DB query. The
+	// renderer cannot stall a slow /metrics scraper behind these
+	// aggregates, and they only change at adoption time (snapshot
+	// flip) — operationally fine to be up to admin.gauge_refresh
+	// stale. Both pointers are nil before the first refresh
+	// completes; the render uses zero-value defaults in that window
+	// so the JSON contract (top-level keys always present) holds.
+	var repo cache.RepoCoverage
+	if rcp := s.repoCoverage.Load(); rcp != nil {
+		repo = *rcp
 	}
-	repo := repoRaw.(cache.RepoCoverage)
+	var summaryMap map[string]map[string]cache.CacheSummaryEntry
+	if smp := s.cacheSummaryByHostArch.Load(); smp != nil {
+		summaryMap = *smp
+	}
 
 	uptime := time.Since(s.cfg.StartTime)
 	model := statusModel{
@@ -265,6 +346,7 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 			URLPathCount:        st.URLPathCount,
 			ZeroRefcountBacklog: st.ZeroRefcountBacklog,
 		},
+		CacheSummary:    buildCacheSummary(summaryMap),
 		RepoCoverage:    buildRepoCoverageInfo(repo, s.cfg.AdoptionArchitectures),
 		Listeners:       buildListenerInfo(s.cfg),
 		TLSMITM:         buildTLSMITMInfo(s.cfg.TLSMITM),
@@ -342,6 +424,29 @@ func buildTLSMITMInfo(p TLSMITMProvider) *tlsMITMInfo {
 	if obs := snap.HitRate60sHits + snap.HitRate60sMisses; obs > 0 {
 		pct := 100 * float64(snap.HitRate60sHits) / float64(obs)
 		out.HitRate60sPercent = &pct
+	}
+	return out
+}
+
+// buildCacheSummary translates the refresher-cached per-(host, arch)
+// map into the SPEC6_5 §2.4 cache_summary block. by_host is always
+// non-nil so the JSON renders as `"by_host": {}` (not `null`) when no
+// adoption has populated package_hash rows yet — the schema contract
+// is "always present, possibly empty".
+func buildCacheSummary(m map[string]map[string]cache.CacheSummaryEntry) cacheSummary {
+	out := cacheSummary{ByHost: map[string]cacheSummaryHost{}}
+	for host, byArch := range m {
+		entry := cacheSummaryHost{
+			ByArchitecture: make(map[string]cacheSummaryArchEntry, len(byArch)),
+		}
+		for arch, e := range byArch {
+			entry.ByArchitecture[arch] = cacheSummaryArchEntry{
+				PackageHashCount: e.PackageHashCount,
+				BlobCount:        e.BlobCount,
+				BlobBytes:        e.BlobBytes,
+			}
+		}
+		out.ByHost[host] = entry
 	}
 	return out
 }
@@ -587,6 +692,20 @@ code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
 <tr><td>Bytes used</td><td>{{formatBytes .Cache.BytesUsed}}</td></tr>
 <tr><td>Zero-refcount backlog</td><td>{{.Cache.ZeroRefcountBacklog}}</td></tr>
 </table>
+
+{{with .CacheSummary.Sorted}}
+<h3>Per-host by architecture</h3>
+<table>
+<tr><th>Host</th><th>Architecture</th><th>package_hash rows</th><th>Blobs</th><th>Bytes</th></tr>
+{{range .}}{{$host := .Host}}{{range .Architectures}}<tr>
+  <td><code>{{$host}}</code></td>
+  <td><code>{{.Arch}}</code></td>
+  <td>{{.Entry.PackageHashCount}}</td>
+  <td>{{.Entry.BlobCount}}</td>
+  <td>{{formatBytes .Entry.BlobBytes}}</td>
+</tr>
+{{end}}{{end}}</table>
+{{end}}
 
 <h2>Repository coverage</h2>
 <table>

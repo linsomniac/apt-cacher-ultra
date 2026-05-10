@@ -42,6 +42,11 @@ type refresherGauges struct {
 	activeHosts     *metrics.Gauge
 	perHostInflight *metrics.Gauge // labels: host
 	perHostCapacity *metrics.Gauge // labels: host
+
+	// SPEC6_5 §10.3: per-kind package_hash row counts. Labeled by
+	// kind ∈ {binary, source, pdiff}; cardinality is a closed enum
+	// (3 values), well under metric_series_cap.
+	packageHashRowsByKind *metrics.Gauge // labels: kind
 }
 
 // newRefresherGauges declares every gauge the refresher owns and
@@ -93,6 +98,10 @@ func newRefresherGauges(r *metrics.Registry, capLimit int) *refresherGauges {
 			"acu_per_host_capacity",
 			"Configured hostsem slot capacity per host (refresher-driven).",
 			capLimit, "host"),
+		packageHashRowsByKind: metrics.NewGaugeWithCapIn(r,
+			"acu_package_hash_rows_by_kind",
+			"package_hash row count per kind (SPEC6_5 §10.3); kind ∈ {binary, source, pdiff}.",
+			capLimit, "kind"),
 	}
 }
 

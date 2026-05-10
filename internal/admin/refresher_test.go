@@ -88,6 +88,9 @@ func TestRefresher_ScrapeContainsAllExpectedGauges(t *testing.T) {
 		"process_open_fds",
 		"process_max_fds",
 		"process_start_time_seconds",
+		// SPEC6_5 §10.3 per-kind package_hash gauge. Always present
+		// from first refresh (metric declared even when no rows exist).
+		"acu_package_hash_rows_by_kind",
 	}
 
 	deadline := time.Now().Add(2 * time.Second)

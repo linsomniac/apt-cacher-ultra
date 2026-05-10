@@ -165,6 +165,24 @@ type Server struct {
 	// corresponding handler entry points.
 	self *selfMetrics
 
+	// repoCoverage caches the SPEC6_5 §2.4 repo_coverage payload
+	// across status-page renders. The §9.7.6 refresher recomputes the
+	// value on each tick and Store()s it here; the renderer reads via
+	// Load() without touching the DB. nil before the first refresh
+	// completes — renderer treats nil as the zero-value RepoCoverage
+	// (architectures_seen: [], counts: 0).
+	//
+	// AIDEV-NOTE: the migration from live-query to cached path means
+	// the JSON value can be stale by up to admin.gauge_refresh
+	// (default 30s). Status consumers that need real-time row counts
+	// run their own query; the JSON contract documents this latency.
+	repoCoverage atomic.Pointer[cache.RepoCoverage]
+
+	// cacheSummaryByHostArch caches the SPEC6_5 §2.4 per-(host, arch)
+	// summary the renderer surfaces under cache_summary.by_host[*].
+	// Same refresh cadence + stale tolerance as repoCoverage.
+	cacheSummaryByHostArch atomic.Pointer[map[string]map[string]cache.CacheSummaryEntry]
+
 	// mu guards refresherStop / refresherDone / refresherCancel —
 	// Shutdown must be idempotent, and the refresher goroutine
 	// must not be started twice.

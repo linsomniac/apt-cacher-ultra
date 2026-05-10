@@ -333,14 +333,15 @@ func (c *Cache) GetCacheStats(ctx context.Context) (CacheStats, error) {
 // moments. Without the transaction, callers could observe a row total
 // that is internally inconsistent with the architectures list.
 //
-// AIDEV-NOTE: this method is invoked from the admin status renderer on
-// every /?format=json hit. For typical deployments (≤ a few thousand
-// package_hash rows per snapshot), the four aggregates complete well
-// inside the §9.7.3 5s per-query budget. A future slice could move
-// these to the §9.7.6 refresher-cached path if scale tests show this
-// becoming a bottleneck — at that point the cache.RepoCoverage value
-// would be recomputed on the gauge_refresh tick and served from an
-// atomic.Pointer rather than recomputed live.
+// AIDEV-NOTE: this method runs on the SPEC5 §9.7.6 refresher
+// goroutine (admin.refreshRepoCoverage), NOT on every /?format=json
+// request. The renderer reads from an atomic.Pointer that the
+// refresher Store()s after each recompute — values can be up to
+// admin.gauge_refresh (default 30s) stale, but per-kind row counts
+// only change at adoption-time (snapshot flip), so the staleness is
+// operationally fine. The refresher also feeds the SPEC6_5 §10.3
+// acu_package_hash_rows_by_kind gauge from the same Snapshot, so the
+// JSON and the Prometheus exposition are always in sync.
 func (c *Cache) GetRepoCoverage(ctx context.Context) (RepoCoverage, error) {
 	var r RepoCoverage
 
@@ -457,6 +458,138 @@ GROUP BY kind`)
 	rowsByKind.Close()
 
 	return r, nil
+}
+
+// GetCacheSummaryByHostArch returns one CacheSummaryEntry per
+// (canonical_host, architecture) tuple observed in current snapshots'
+// package_hash rows. SPEC6_5 §2.4 cache_summary.by_host[*].by_architecture.
+//
+// Two queries run inside one read-only transaction so the
+// package_hash_count and the blob_count/blob_bytes describe the same
+// instant (a concurrent CommitAdoption between them could otherwise
+// surface internally-inconsistent (count, bytes) pairs for a given
+// (host, arch)).
+//
+// Query 1: package_hash row count per (host, arch). Counts every row,
+// including ones whose path has no url_path yet — operationally
+// "how many paths the snapshot vouches for under this arch".
+//
+// Query 2: distinct (blob_hash, blob_size) pairs reachable from the
+// (host, arch)'s package_hash rows through the url_path → blob join.
+// The DISTINCT pre-aggregate inside the subquery ensures a blob
+// referenced by multiple package_hash rows in the same (host, arch)
+// bucket is counted ONCE — without it, count(*) and sum(size) would
+// over-count by row multiplicity. A package_hash row whose path has
+// no url_path (URL never requested, no blob yet) does not appear in
+// Query 2 at all; its (host, arch) bucket still exists from Query 1
+// with zero BlobCount / BlobBytes.
+//
+// AIDEV-NOTE: pdiff path rows DO contribute to their architecture's
+// bucket here — the (host, arch) attribution is more useful to
+// operators than splitting pdiff/source out a second time (the
+// repo_coverage block already breaks rows down by kind). The SPEC6_5
+// §2.4 example shows "amd64", "arm64", "source" as the keys; pdiff
+// rows under binary-<arch>/Packages.diff/<ts>.gz fold into their
+// <arch> bucket, matching the package_hash.architecture column value.
+//
+// AIDEV-NOTE: rows with architecture="" (pre-v3 package_hash rows
+// adopted before the SPEC3 v3 schema gained the column) are excluded
+// from both queries — they cannot be attributed to any arch bucket
+// without rewinding to the adoption that produced them. These rows
+// fall off naturally as their snapshots are displaced.
+func (c *Cache) GetCacheSummaryByHostArch(ctx context.Context) (map[string]map[string]CacheSummaryEntry, error) {
+	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("GetCacheSummaryByHostArch begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	out := map[string]map[string]CacheSummaryEntry{}
+	getEntry := func(host, arch string) CacheSummaryEntry {
+		if m, ok := out[host]; ok {
+			return m[arch]
+		}
+		return CacheSummaryEntry{}
+	}
+	setEntry := func(host, arch string, e CacheSummaryEntry) {
+		m, ok := out[host]
+		if !ok {
+			m = map[string]CacheSummaryEntry{}
+			out[host] = m
+		}
+		m[arch] = e
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+SELECT p.canonical_host, p.architecture, count(*)
+FROM package_hash p
+JOIN suite_freshness sf
+  ON sf.canonical_scheme = p.canonical_scheme
+ AND sf.canonical_host   = p.canonical_host
+ AND sf.current_snapshot_id = p.snapshot_id
+WHERE p.architecture != ''
+GROUP BY p.canonical_host, p.architecture`)
+	if err != nil {
+		return nil, fmt.Errorf("GetCacheSummaryByHostArch counts: %w", err)
+	}
+	for rows.Next() {
+		var host, arch string
+		var n int64
+		if err := rows.Scan(&host, &arch, &n); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("GetCacheSummaryByHostArch counts scan: %w", err)
+		}
+		e := getEntry(host, arch)
+		e.PackageHashCount = n
+		setEntry(host, arch, e)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("GetCacheSummaryByHostArch counts iter: %w", err)
+	}
+	rows.Close()
+
+	blobRows, err := tx.QueryContext(ctx, `
+SELECT canonical_host, architecture,
+       count(*) AS blob_count,
+       COALESCE(sum(size), 0) AS blob_bytes
+FROM (
+    SELECT DISTINCT p.canonical_host, p.architecture, b.hash, b.size
+    FROM package_hash p
+    JOIN suite_freshness sf
+      ON sf.canonical_scheme = p.canonical_scheme
+     AND sf.canonical_host   = p.canonical_host
+     AND sf.current_snapshot_id = p.snapshot_id
+    JOIN url_path u
+      ON u.canonical_scheme = p.canonical_scheme
+     AND u.canonical_host   = p.canonical_host
+     AND u.path             = p.path
+    JOIN blob b ON b.hash = u.blob_hash
+    WHERE p.architecture != ''
+)
+GROUP BY canonical_host, architecture`)
+	if err != nil {
+		return nil, fmt.Errorf("GetCacheSummaryByHostArch blobs: %w", err)
+	}
+	for blobRows.Next() {
+		var host, arch string
+		var bc, bb int64
+		if err := blobRows.Scan(&host, &arch, &bc, &bb); err != nil {
+			blobRows.Close()
+			return nil, fmt.Errorf("GetCacheSummaryByHostArch blobs scan: %w", err)
+		}
+		e := getEntry(host, arch)
+		e.BlobCount = bc
+		e.BlobBytes = bb
+		setEntry(host, arch, e)
+	}
+	if err := blobRows.Err(); err != nil {
+		blobRows.Close()
+		return nil, fmt.Errorf("GetCacheSummaryByHostArch blobs iter: %w", err)
+	}
+	blobRows.Close()
+
+	return out, nil
 }
 
 // GetSuiteStats returns the suite/snapshot count triple the SPEC5
