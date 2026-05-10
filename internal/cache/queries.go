@@ -308,6 +308,128 @@ func (c *Cache) GetCacheStats(ctx context.Context) (CacheStats, error) {
 	return s, nil
 }
 
+// GetRepoCoverage returns the SPEC6_5 §2.4 repo_coverage payload
+// (architectures observed, source/pdiff snapshot counts, per-kind
+// package_hash row totals). All counts are scoped to current snapshots
+// — the join against suite_freshness.current_snapshot_id ensures
+// displaced snapshots' rows don't inflate the totals.
+//
+// AIDEV-NOTE: the per-kind row classifier mirrors handler.classifyPath:
+// architecture="source" + non-pdiff path → kind=source; path under
+// Packages.diff/ or Sources.diff/ → kind=pdiff; everything else with a
+// non-empty architecture → kind=binary. Architecture-empty rows
+// (legacy adoptions before SPEC3 v3, or future kind extensions) fall
+// into the "other" bucket and are excluded from the binary tally.
+func (c *Cache) GetRepoCoverage(ctx context.Context) (RepoCoverage, error) {
+	var r RepoCoverage
+
+	// architectures_seen: distinct arch values across current snapshots'
+	// package_hash rows, excluding empty (Phase 2 pre-v3 rows have ""
+	// arch and shouldn't surface).
+	rows, err := c.db.QueryContext(ctx, `
+SELECT DISTINCT p.architecture
+FROM package_hash p
+JOIN suite_freshness sf
+  ON sf.canonical_scheme = p.canonical_scheme
+ AND sf.canonical_host   = p.canonical_host
+ AND sf.current_snapshot_id = p.snapshot_id
+WHERE p.architecture != ''
+ORDER BY p.architecture`)
+	if err != nil {
+		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage architectures_seen: %w", err)
+	}
+	for rows.Next() {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			rows.Close()
+			return RepoCoverage{}, fmt.Errorf("GetRepoCoverage architectures_seen scan: %w", err)
+		}
+		r.ArchitecturesSeen = append(r.ArchitecturesSeen, a)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage architectures_seen iter: %w", err)
+	}
+	rows.Close()
+
+	// snapshots_with_sources: current snapshots having >=1 row with
+	// architecture=source.
+	if err := c.db.QueryRowContext(ctx, `
+SELECT count(DISTINCT sf.current_snapshot_id)
+FROM package_hash p
+JOIN suite_freshness sf
+  ON sf.canonical_scheme = p.canonical_scheme
+ AND sf.canonical_host   = p.canonical_host
+ AND sf.current_snapshot_id = p.snapshot_id
+WHERE p.architecture = 'source'`).Scan(&r.SnapshotsWithSources); err != nil {
+		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage snapshots_with_sources: %w", err)
+	}
+
+	// snapshots_with_pdiff: current snapshots having >=1 *.diff/Index
+	// in snapshot_member.
+	if err := c.db.QueryRowContext(ctx, `
+SELECT count(DISTINCT sf.current_snapshot_id)
+FROM snapshot_member m
+JOIN suite_freshness sf
+  ON sf.current_snapshot_id = m.snapshot_id
+WHERE m.path LIKE '%/Packages.diff/Index'
+   OR m.path LIKE '%/Sources.diff/Index'`).Scan(&r.SnapshotsWithPdiff); err != nil {
+		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage snapshots_with_pdiff: %w", err)
+	}
+
+	// package_hash_rows by kind: bucket on the same predicate as
+	// handler.classifyPath. The CASE order matters: pdiff paths live
+	// under /<thing>.diff/ regardless of arch label, so the pdiff
+	// branch must check the path BEFORE the arch=source branch (a
+	// hypothetical Sources.diff/<patch>.gz would otherwise be
+	// double-counted as both source and pdiff).
+	rowsByKind, err := c.db.QueryContext(ctx, `
+SELECT
+  CASE
+    WHEN p.path LIKE '%/Packages.diff/%' OR p.path LIKE '%/Sources.diff/%' THEN 'pdiff'
+    WHEN p.architecture = 'source' THEN 'source'
+    WHEN p.architecture != '' THEN 'binary'
+    ELSE 'other'
+  END AS kind,
+  count(*) AS n
+FROM package_hash p
+JOIN suite_freshness sf
+  ON sf.canonical_scheme = p.canonical_scheme
+ AND sf.canonical_host   = p.canonical_host
+ AND sf.current_snapshot_id = p.snapshot_id
+GROUP BY kind`)
+	if err != nil {
+		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage rows_by_kind: %w", err)
+	}
+	for rowsByKind.Next() {
+		var kind string
+		var n int64
+		if err := rowsByKind.Scan(&kind, &n); err != nil {
+			rowsByKind.Close()
+			return RepoCoverage{}, fmt.Errorf("GetRepoCoverage rows_by_kind scan: %w", err)
+		}
+		switch kind {
+		case "binary":
+			r.PackageHashRowsBinary = n
+		case "source":
+			r.PackageHashRowsSource = n
+		case "pdiff":
+			r.PackageHashRowsPdiff = n
+		}
+		// "other" rows (empty arch, non-pdiff path) are not surfaced
+		// to keep the §2.4 contract clean (binary/source/pdiff/total).
+		// They DO contribute to total below.
+		r.PackageHashRowsTotal += n
+	}
+	if err := rowsByKind.Err(); err != nil {
+		rowsByKind.Close()
+		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage rows_by_kind iter: %w", err)
+	}
+	rowsByKind.Close()
+
+	return r, nil
+}
+
 // GetSuiteStats returns the suite/snapshot count triple the SPEC5
 // §9.7.6 refresher feeds into the acu_suites_tracked /
 // acu_snapshots_current / acu_snapshots_displaced gauges. Three

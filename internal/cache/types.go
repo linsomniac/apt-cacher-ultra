@@ -143,6 +143,38 @@ type CacheStats struct {
 	ZeroRefcountBacklog int64
 }
 
+// RepoCoverage is the SPEC6_5 §2.4 repo_coverage status-page payload:
+// counts and architecture observations across every current snapshot's
+// package_hash + snapshot_member rows.
+//
+// ArchitecturesSeen is the union of distinct architecture column
+// values across current snapshots' package_hash rows (excluding
+// empty-string arch). Includes the pseudo-arch "source" when source
+// adoption is active.
+//
+// SnapshotsWithSources counts current snapshots having ≥ 1
+// package_hash row with architecture = "source".
+//
+// SnapshotsWithPdiff counts current snapshots whose snapshot_member
+// table contains ≥ 1 row whose path ends in "Packages.diff/Index" or
+// "Sources.diff/Index" — populated regardless of whether any individual
+// patch file was ever fetched (the Index member's adoption is the
+// proof of pdiff coverage, per SPEC6_5 §2.4).
+//
+// PackageHashRowsBy{Binary,Source,Pdiff,Total} are the per-kind row
+// counts: source rows are arch="source" with non-pdiff paths; pdiff
+// rows live under Packages.diff/ or Sources.diff/ (compressed patch
+// files); binary rows are everything else with a non-empty arch.
+type RepoCoverage struct {
+	ArchitecturesSeen        []string
+	SnapshotsWithSources     int64
+	SnapshotsWithPdiff       int64
+	PackageHashRowsBinary    int64
+	PackageHashRowsSource    int64
+	PackageHashRowsPdiff     int64
+	PackageHashRowsTotal     int64
+}
+
 // SuiteStats is the SPEC5 §9.7.6 suite/snapshot count block: the
 // three counters the refresher goroutine derives the
 // acu_suites_tracked / acu_snapshots_current / acu_snapshots_displaced

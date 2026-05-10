@@ -24,6 +24,7 @@ import (
 type statusModel struct {
 	Process         processInfo      `json:"process"`
 	Cache           cacheInfo        `json:"cache"`
+	RepoCoverage    repoCoverageInfo `json:"repo_coverage"`
 	Listeners       []listenerInfo   `json:"listeners"`
 	TLSMITM         *tlsMITMInfo     `json:"tls_mitm"`
 	Suites          []suiteEntry     `json:"suites"`
@@ -31,6 +32,28 @@ type statusModel struct {
 	HotURLPaths     []hotURLEntry    `json:"hot_url_paths"`
 	RecentAdoptions []adoptionEntry  `json:"recent_adoptions"`
 	ActiveHosts     []activeHostInfo `json:"active_hosts"`
+}
+
+// repoCoverageInfo is the SPEC6_5 §2.4 status-page repo_coverage
+// section. ArchitecturesSeen is sourced from current snapshots'
+// package_hash rows; ArchitecturesFilter echoes the operator's
+// [adoption].architectures setting (empty list when unset). The two
+// counts and the per-kind row totals come from one cache.GetRepoCoverage
+// call. Always present in the JSON; populated zero-values when no
+// adoption has run yet.
+type repoCoverageInfo struct {
+	ArchitecturesSeen    []string             `json:"architectures_seen"`
+	ArchitecturesFilter  []string             `json:"architectures_filter"`
+	SnapshotsWithSources int64                `json:"snapshots_with_sources"`
+	SnapshotsWithPdiff   int64                `json:"snapshots_with_pdiff"`
+	PackageHashRows      packageHashRowsInfo  `json:"package_hash_rows"`
+}
+
+type packageHashRowsInfo struct {
+	Binary int64 `json:"binary"`
+	Source int64 `json:"source"`
+	Pdiff  int64 `json:"pdiff"`
+	Total  int64 `json:"total"`
 }
 
 // tlsMITMInfo is the SPEC6 §10.4 status-page TLS MITM section.
@@ -218,6 +241,14 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 	}
 	st := stats.(cache.CacheStats)
 
+	repoRaw, err := s.runDBQuery(r, "GetRepoCoverage", func(ctx context.Context) (any, error) {
+		return s.cfg.Cache.GetRepoCoverage(ctx)
+	})
+	if err != nil {
+		return statusModel{}, "GetRepoCoverage", err
+	}
+	repo := repoRaw.(cache.RepoCoverage)
+
 	uptime := time.Since(s.cfg.StartTime)
 	model := statusModel{
 		Process: processInfo{
@@ -234,6 +265,7 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 			URLPathCount:        st.URLPathCount,
 			ZeroRefcountBacklog: st.ZeroRefcountBacklog,
 		},
+		RepoCoverage:    buildRepoCoverageInfo(repo, s.cfg.AdoptionArchitectures),
 		Listeners:       buildListenerInfo(s.cfg),
 		TLSMITM:         buildTLSMITMInfo(s.cfg.TLSMITM),
 		Suites:          buildSuiteEntries(suitesRaw.([]cache.SuiteWithAdoption)),
@@ -312,6 +344,34 @@ func buildTLSMITMInfo(p TLSMITMProvider) *tlsMITMInfo {
 		out.HitRate60sPercent = &pct
 	}
 	return out
+}
+
+// buildRepoCoverageInfo translates the cache.RepoCoverage query result
+// into the SPEC6_5 §2.4 status-page payload, splicing in the operator's
+// architectures filter. Both ArchitecturesSeen and ArchitecturesFilter
+// are guaranteed non-nil so the JSON renders as `[]` (not `null`)
+// when empty — the spec contract is "empty list when unset."
+func buildRepoCoverageInfo(rc cache.RepoCoverage, filter []string) repoCoverageInfo {
+	seen := rc.ArchitecturesSeen
+	if seen == nil {
+		seen = []string{}
+	}
+	filterCopy := make([]string, 0, len(filter))
+	if len(filter) > 0 {
+		filterCopy = append(filterCopy, filter...)
+	}
+	return repoCoverageInfo{
+		ArchitecturesSeen:    seen,
+		ArchitecturesFilter:  filterCopy,
+		SnapshotsWithSources: rc.SnapshotsWithSources,
+		SnapshotsWithPdiff:   rc.SnapshotsWithPdiff,
+		PackageHashRows: packageHashRowsInfo{
+			Binary: rc.PackageHashRowsBinary,
+			Source: rc.PackageHashRowsSource,
+			Pdiff:  rc.PackageHashRowsPdiff,
+			Total:  rc.PackageHashRowsTotal,
+		},
+	}
 }
 
 func buildListenerInfo(cfg Config) []listenerInfo {
@@ -526,6 +586,33 @@ code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
 <tr><td>URL paths</td><td>{{.Cache.URLPathCount}}</td></tr>
 <tr><td>Bytes used</td><td>{{formatBytes .Cache.BytesUsed}}</td></tr>
 <tr><td>Zero-refcount backlog</td><td>{{.Cache.ZeroRefcountBacklog}}</td></tr>
+</table>
+
+<h2>Repository coverage</h2>
+<table>
+<tr><td>Architectures seen</td><td>
+{{- if .RepoCoverage.ArchitecturesSeen -}}
+{{range $i, $a := .RepoCoverage.ArchitecturesSeen}}{{if $i}}, {{end}}<code>{{$a}}</code>{{end}}
+{{- else -}}
+<span class="muted">(none — no current snapshots have package_hash rows yet)</span>
+{{- end -}}
+</td></tr>
+<tr><td>Architectures filter</td><td>
+{{- if .RepoCoverage.ArchitecturesFilter -}}
+{{range $i, $a := .RepoCoverage.ArchitecturesFilter}}{{if $i}}, {{end}}<code>{{$a}}</code>{{end}}
+{{- else -}}
+<span class="muted">(unfiltered — all Release-listed indices adopted)</span>
+{{- end -}}
+</td></tr>
+<tr><td>Snapshots with Sources</td><td>{{.RepoCoverage.SnapshotsWithSources}}</td></tr>
+<tr><td>Snapshots with pdiff</td><td>{{.RepoCoverage.SnapshotsWithPdiff}}</td></tr>
+</table>
+<table>
+<tr><th>package_hash kind</th><th>rows</th></tr>
+<tr><td>Binary</td><td>{{.RepoCoverage.PackageHashRows.Binary}}</td></tr>
+<tr><td>Source</td><td>{{.RepoCoverage.PackageHashRows.Source}}</td></tr>
+<tr><td>Pdiff</td><td>{{.RepoCoverage.PackageHashRows.Pdiff}}</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>{{.RepoCoverage.PackageHashRows.Total}}</strong></td></tr>
 </table>
 
 <h2>Suites</h2>

@@ -244,6 +244,7 @@ func TestStatusJSON_HasLockedSchemaKeys(t *testing.T) {
 		"process", "cache", "listeners", "suites",
 		"hot_url_paths", "recent_adoptions", "active_hosts", "gc",
 		"tls_mitm",
+		"repo_coverage", // SPEC6_5 §2.4: top-level key always present
 	}
 	for _, k := range required {
 		if _, ok := got[k]; !ok {

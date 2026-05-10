@@ -628,19 +628,20 @@ func serveListeners(
 	var adminSrv *admin.Server
 	if cfg.Admin.Enabled {
 		adminSrv, err = admin.New(admin.Config{
-			Cache:       c,
-			GC:          gcsvc,
-			HostLimiter: hostLimiter,
-			Ring:        adoptionRing,
-			Registry:    metrics.Default,
-			Logger:      logger,
-			BuildInfo:   buildInfo(),
-			Admin:       cfg.Admin,
-			StartTime:   time.Now(),
-			ProxyAddr:   plainLn.Addr().String(),
-			TLSAddr:     tlsAddrString(tlsLn),
-			AdminAddr:   adminLn.Addr().String(),
-			TLSMITM:     &tlsMitmProvider{h: mitmHandles},
+			Cache:                 c,
+			GC:                    gcsvc,
+			HostLimiter:           hostLimiter,
+			Ring:                  adoptionRing,
+			Registry:              metrics.Default,
+			Logger:                logger,
+			BuildInfo:             buildInfo(),
+			Admin:                 cfg.Admin,
+			StartTime:             time.Now(),
+			ProxyAddr:             plainLn.Addr().String(),
+			TLSAddr:               tlsAddrString(tlsLn),
+			AdminAddr:             adminLn.Addr().String(),
+			TLSMITM:               &tlsMitmProvider{h: mitmHandles},
+			AdoptionArchitectures: cfg.Adoption.Architectures,
 		})
 		if err != nil {
 			return fmt.Errorf("build admin: %w", err)

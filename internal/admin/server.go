@@ -75,6 +75,13 @@ type Config struct {
 	// skips the HTML section. Lives behind an interface so admin
 	// does not import internal/proxy or internal/proxy/tlsmitm.
 	TLSMITM TLSMITMProvider
+
+	// AdoptionArchitectures echoes the operator's
+	// [adoption].architectures setting onto the SPEC6_5 §2.4
+	// repo_coverage.architectures_filter field. nil / empty slice
+	// renders as `[]` in JSON. cmd/main passes whatever was loaded
+	// from the config file; admin does not re-read the value.
+	AdoptionArchitectures []string
 }
 
 // TLSMITMProvider supplies the SPEC6 §10.4 status-page TLS MITM
