@@ -31,6 +31,12 @@ Always-present fields (`method`, `url`, `canonical_host`, `path`,
 `outcome`, `status`, `bytes_sent`, `duration_ms`, `client_addr`) are
 documented in SPEC §10.
 
+**Security note**: the `url` field is sanitized through `urlForLog`
+before emission — proxy-form requests' userinfo (any
+`http://user:pass@host/...` syntax) is stripped, so a malformed or
+malicious proxy request cannot smuggle credentials into the log
+stream.
+
 ## `path_class` (SPEC6_5 §2.3)
 
 Closed enum, 8 values. Emitted on every `request` log line where
@@ -45,9 +51,28 @@ Closed enum, 8 values. Emitted on every `request` log line where
 | `source_dsc` | suffix `.dsc` | `/debian/pool/main/b/bash/bash_5.1-2.dsc` |
 | `source_tarball` | suffix `.tar.gz` / `.tar.xz` / `.tar.bz2` / `.diff.gz` | `/debian/pool/main/b/bash/bash_5.1.orig.tar.xz` |
 | `pdiff_index` | suffix `/Packages.diff/Index` or `/Sources.diff/Index` | `/debian/dists/bookworm/main/binary-amd64/Packages.diff/Index` |
-| `pdiff_patch` | path matches `(?:Packages\|Sources)\.diff/[0-9.-]+\.gz$` | `/debian/dists/bookworm/main/binary-amd64/Packages.diff/2026-05-09-1234.56.gz` |
-| `metadata` | basename is one of `Release`, `Release.gpg`, `InRelease`, `Packages(.gz/xz/bz2)`, `Sources(.gz/xz/bz2)`, `Contents-<arch>(.gz/xz/bz2)`, `Translation-<locale>(.gz/xz/bz2)` | `/debian/dists/bookworm/InRelease` |
+| `pdiff_patch` | regex below | `/debian/dists/bookworm/main/binary-amd64/Packages.diff/2026-05-09-1234.56.gz` |
+| `metadata` | regex below | `/debian/dists/bookworm/InRelease` |
 | `other` | nothing above matched | (e.g. an unfamiliar repository file) |
+
+Exact regexes (`internal/handler/handler.go`):
+
+```
+pdiff_patch:  (?:Packages|Sources)\.diff/[0-9.-]+\.gz$
+metadata:     (?:^|/)(?:
+                Release(?:\.gpg)?|InRelease|
+                Packages(?:\.(?:gz|xz|bz2))?|
+                Sources(?:\.(?:gz|xz|bz2))?|
+                (?:Packages|Sources)\.diff/Index|
+                Contents-[a-z0-9]+(?:\.(?:gz|xz|bz2))?|
+                Translation-[A-Za-z0-9_]+(?:\.(?:gz|xz|bz2))?
+              )$
+```
+
+A path with an uppercase or hyphenated `Contents-<x>` segment (e.g.
+`Contents-EXTRA`, `Contents-non-free`) does NOT match the metadata
+regex and is classified as `other`. Same for any `Translation-*`
+filename that contains a character outside `[A-Za-z0-9_]`.
 
 Classification is a pure-text predicate — no DB lookup, no allocation
 beyond the regex match. Order matters in the implementation:
@@ -56,16 +81,30 @@ pdiff-patch shapes.
 
 ## `validated_hash` (SPEC6_5 §2.3)
 
-Boolean. Present as `true` iff the served bytes were SHA-256-matched
-against a `package_hash` row's declared digest in this request. Absent
-otherwise — including the trust-upstream path where no `package_hash`
-row existed for the request's canonical (scheme, host, path).
+Boolean. Present as `true` when the served bytes correspond to a
+successful SHA-256 match against a `package_hash` row's declared
+digest. Absent otherwise — including the trust-upstream path where no
+`package_hash` row existed for the request's canonical (scheme, host,
+path).
 
 Pairs with `acu_serve_hash_validated_total{outcome=match|mismatch}`
-(SPEC6_5 §10.3): every Info log line carrying `validated_hash=true`
-corresponds to a `outcome=match` counter increment; mismatch sites
-emit a `serve_hash_mismatch` Warn and increment `outcome=mismatch`
-without setting `validated_hash` on the per-request log.
+(SPEC6_5 §10.3). One **validation event** increments the counter; one
+or more **request log lines** may then carry `validated_hash=true` for
+that event:
+
+- A direct hit-path validation increments once and logs once.
+- A miss-path fetch + validation increments once (at the leader) and
+  may log multiple times: the leader's log carries `validated_hash`,
+  AND every singleflight waiter that joined on the same key receives
+  the same validated result and also logs `validated_hash=true` —
+  including `outcome=hit_coalesced` lines (`internal/handler/handler.go`
+  serveCacheMiss / singleflight waiter path).
+
+Operators alarming on validation rate should read the counter, not
+count log lines. Mismatch sites emit a `serve_hash_mismatch` Warn and
+increment `outcome=mismatch`; the corresponding request log line does
+NOT carry `validated_hash` (mismatch is a failure, not a successful
+validation).
 
 ## `architecture` (SPEC6_5 §2.3)
 
