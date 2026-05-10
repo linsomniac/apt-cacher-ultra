@@ -1,7 +1,8 @@
 # apt-cacher-ultra — Phase 7 Scoping
 
-Status: **scoping locked** (revision 2). Last updated 2026-05-09.
-Next artifact: `SPEC7.md` modeled on `SPEC6.md`'s structure.
+Status: **scoping locked** (revision 2; cross-references refreshed
+2026-05-10 for Phase 6.5 landings). Last substantive revision
+2026-05-09. SPEC7.md: drafted and locked.
 
 Revision 2 closes the §7 open-question table. The load-bearing
 question §7.0 (theme) resolved to **Bucket A — operator control
@@ -26,7 +27,9 @@ Phase 1 made the cache-hit path bulletproof. Phase 2 closed the
 integrity and freshness loops. Phase 3 closed the service-continuity
 loop. Phase 4 closed the storage-reclamation loop. Phase 5 closed
 the operator-visibility loop. Phase 6 closed the HTTPS-upstream
-caching loop.
+caching loop. Phase 6.5 closed the repo-feature-parity loop —
+source-package adoption, full multi-arch (amd64/arm64/armhf/i386/...),
+and pdiff serve-time validation.
 
 Phase 7 closes the **operator action surface**: the runtime
 controls an operator reaches for when something needs intervention.
@@ -91,10 +94,13 @@ Phase 7 deliberately does NOT add:
 
 ### 1.2 Phase 7 non-goals (deferred)
 
+Phase 6.5 delivered source-package caching, full multi-arch
+(amd64 + arm64 + armhf + i386 + ...), and pdiff serve-time
+validation — see SPEC6_5 §1.1. Those items are no longer Phase 8+
+candidates.
+
 Carried forward from earlier phases unchanged:
 
-- Source-package caching, multi-arch beyond amd64, pdiff
-  (Phase 8+).
 - Streaming-while-fetching as a singleflight optimization.
   Deferred to [FUTURE-REVIEW.md §1](FUTURE-REVIEW.md).
 - Per-byte upstream read timeouts. Deferred to
@@ -149,8 +155,10 @@ resolution is normative for SPEC7.
 - **Phase 7 theme (Q0).** **Bucket A — operator control plane.**
   Phase 5 gave operators eyes; Phase 7 gives them hands. The
   three alternatives (B repo-feature parity, C observability
-  deepening, D advanced TLS) are not the most operationally
+  deepening, D advanced TLS) were not the most operationally
   valuable next phase given the post-Phase-6 production cutover.
+  (Bucket B was subsequently delivered as Phase 6.5; see
+  SPEC6_5.md.)
 - **Endpoint sync vs async (Q1).** **Async (202 + jobs store).**
   GC and CA rotate can take seconds; blocking the request is
   hostile to HTTP timeouts. `202 Accepted` + `Location:
@@ -215,7 +223,7 @@ resolution is normative for SPEC7.
 
 ---
 
-## 2. What Phases 1–6 already left in place
+## 2. What Phases 1–6.5 already left in place
 
 Walking the existing code, prior phases deliberately seeded these
 hooks that Phase 7 builds on:
@@ -236,6 +244,8 @@ hooks that Phase 7 builds on:
 | `slog`-based shutdown sequencing (SPEC1 §9.5, SPEC6 §9.5) | In-flight admin jobs receive ctx cancel on shutdown; the lifecycle pattern from Phase 6 generalizes |
 | Phase 5 §10.4 status template | New `action_surface` block — current jobs (id, action, started_at, state) and last 10 completed |
 | AIDEV-NOTE convention | New action-surface code carries anchors for the auth realm split, the job state machine, and the rotation cross-fade window |
+| Phase 6.5 atomic.Pointer refresher pattern (`internal/admin/server.go` `repoCoverage` / `cacheSummaryByHostArch` populated by `runRefreshOnce`) | Reused for live-config swap (§3.4 hot-reload — atomic-pointer-swappable Config struct) AND for in-memory CA pointer swap on rotate (§6.4). Proven lock-free reader / single-writer primitive |
+| Phase 6.5 `docs/log-fields.md` precedent (closed-enum field documentation) | Phase 7's `admin_action_*` field surface added to the same doc when implemented, preserving the operator log-schema reference |
 
 No prior phase shipped a mutating endpoint. Phase 5 explicitly kept
 the admin listener read-only (SPEC5 §1.2). Phase 6 added one
@@ -493,8 +503,11 @@ Plus changes to:
   + `[reload].allowed_keys` + atomic-pointer-swappable Config
   struct (the live config sits behind an `atomic.Pointer[Config]`;
   request handlers `Load()` it).
-- `internal/admin/admin.go`: register the new POST handlers; split
-  the auth middleware into read/write realms.
+- `internal/admin/server.go` (route registration) and
+  `internal/admin/handlers.go` (handlers): register the new POST
+  handlers; split the auth middleware into read/write realms.
+  (Phase 6.5 did not consolidate these into a single `admin.go`;
+  SPEC7 §13 follows the same split.)
 - `internal/freshness/`: `RefreshSuite(suiteKey)` entry point exported
   for the mutating endpoint to call.
 - `internal/gc/`: `RunNow(reason)` entry point.
@@ -571,7 +584,7 @@ Chaos tests:
 
 E2E tests:
 
-- The Phase 1–6 chaos test pass adds an "operator-action" step:
+- The Phase 1–6.5 chaos test pass adds an "operator-action" step:
   mid-suite, force `/admin/gc/run`, verify in-flight apt fetches
   complete unaffected and post-GC apt fetches still serve from
   cache.
@@ -712,4 +725,6 @@ subcommand). Each sub-feature is small; the sum is moderate.
 - Phase 4 SPEC: [SPEC4.md](SPEC4.md)
 - Phase 5 SPEC: [SPEC5.md](SPEC5.md)
 - Phase 6 SPEC: [SPEC6.md](SPEC6.md)
+- Phase 6.5 SPEC: [SPEC6_5.md](SPEC6_5.md)
+- Phase 6.5 outstanding items: [SPEC-65-Outstanding.md](SPEC-65-Outstanding.md)
 - Future-review-only items: [FUTURE-REVIEW.md](FUTURE-REVIEW.md)

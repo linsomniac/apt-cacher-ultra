@@ -5,14 +5,15 @@ control plane** — mutating admin endpoints, CA rotation, limited
 config hot-reload, and a write-role auth split. It is a delta over
 [SPEC.md](SPEC.md) (Phase 1), [SPEC2.md](SPEC2.md) (Phase 2),
 [SPEC3.md](SPEC3.md) (Phase 3), [SPEC4.md](SPEC4.md) (Phase 4),
-[SPEC5.md](SPEC5.md) (Phase 5), and [SPEC6.md](SPEC6.md) (Phase 6).
+[SPEC5.md](SPEC5.md) (Phase 5), [SPEC6.md](SPEC6.md) (Phase 6), and
+[SPEC6_5.md](SPEC6_5.md) (Phase 6.5).
 Sections that carry forward unchanged say so explicitly and point at
 the prior spec; sections that change describe only the delta. The
 companion document [PHASE-7-SCOPING.md](PHASE-7-SCOPING.md) records
 the design rationale and the sixteen-question scoping pass that
 produced this spec.
 
-Phase 7 is **opt-in additive** over Phase 5 / Phase 6:
+Phase 7 is **opt-in additive** over Phase 5 / Phase 6 / Phase 6.5:
 
 - All mutating endpoints are gated by
   `admin.mutating_htpasswd_file` (and/or
@@ -28,7 +29,7 @@ Phase 7 is **opt-in additive** over Phase 5 / Phase 6:
   `tls_mitm.enabled = true` per §14.2; otherwise it exits 1 with
   `mitm_disabled`.
 
-With these gates closed, a Phase 6 daemon upgrades to Phase 7 with
+With these gates closed, a Phase 6.5 daemon upgrades to Phase 7 with
 zero behavior change. Operators turn the new surface on by
 populating one config field at a time.
 
@@ -100,10 +101,12 @@ two realms must be configured with distinct credentials per
 
 ### 1.2 Phase 7 non-goals (deferred)
 
+Phase 6.5 delivered source-package caching, full multi-arch (amd64
++ arm64 + armhf + i386 + ...), and pdiff serve-time validation —
+see SPEC6_5 §1.1. Those items are no longer Phase 8+ candidates.
+
 Carried forward from earlier phases unchanged:
 
-- Source-package caching, multi-arch beyond amd64, pdiff
-  (Phase 8+).
 - Streaming-while-fetching as a singleflight optimization.
   Deferred to [FUTURE-REVIEW.md §1](FUTURE-REVIEW.md).
 - Per-byte upstream read timeouts. Deferred to
@@ -197,7 +200,7 @@ were resolved with the operator. Each resolution is normative:
 
 ---
 
-## 2. Wire contracts (deltas over SPEC §2 / SPEC2 §2 / SPEC3 §2.7 / SPEC5 §2 / SPEC6 §2)
+## 2. Wire contracts (deltas over SPEC §2 / SPEC2 §2 / SPEC3 §2.7 / SPEC5 §2 / SPEC6 §2 / SPEC6_5 §2)
 
 ### 2.1 Listener inventory — unchanged
 
@@ -585,11 +588,13 @@ populated when `done`; populated with partial best-effort data
 when `failed` (per-action; rotate `failed` may have only the
 old fingerprint if the new keypair generation failed).
 
-### 2.4 Status JSON additions — delta over SPEC5 §10.4
+### 2.4 Status JSON additions — delta over SPEC5 §10.4 / SPEC6_5 §2.4
 
-The `GET /?format=json` payload (SPEC5 §10.4) gains one new
-top-level section `action_surface` and one extension to the
-existing `tls_mitm` section:
+The `GET /?format=json` payload (SPEC5 §10.4, extended by
+SPEC6_5 §2.4 with `repo_coverage` and `cache_summary` top-level
+sections) gains one new top-level section `action_surface` and
+one extension to the existing `tls_mitm` section. The Phase 6.5
+sections remain present at the top level unchanged:
 
 ```json
 {
@@ -633,11 +638,14 @@ as a forensic indicator: if this number grows over time without
 operator pruning, rotation history is being retained per Q9 (no
 automatic retention policy).
 
-### 2.5 Status HTML additions — delta over SPEC5 §10.5
+### 2.5 Status HTML additions — delta over SPEC5 §10.5 / SPEC6_5 §2.5
 
 The status HTML page gains a new "Action surface" section
 between "Listeners" and "TLS MITM" (when MITM is on) or between
-"Listeners" and "Cache" (when MITM is off). The section renders:
+"Listeners" and "Cache" (when MITM is off). Phase 6.5's
+"Per-host by architecture" sub-section of "Cache" and the
+"Repository coverage" section between "Cache" and "Suites"
+remain in place unchanged. The section renders:
 
 - Whether mutating endpoints are enabled (boolean).
 - Whether reload is enabled (boolean).
@@ -667,7 +675,7 @@ SPEC6 §14.)
 
 ---
 
-## 4. Storage layout (delta over SPEC §4 / SPEC2 §4 / SPEC4 §4 / SPEC6 §4)
+## 4. Storage layout (delta over SPEC §4 / SPEC2 §4 / SPEC4 §4 / SPEC6 §4 / SPEC6_5 §4)
 
 ### 4.1 Jobs store — in-memory only
 
@@ -868,7 +876,7 @@ existing tables; they do not create new ones.
 
 ---
 
-## 5. Configuration (delta over SPEC §5 / SPEC2 §5 / SPEC4 §5 / SPEC5 §5 / SPEC6 §5)
+## 5. Configuration (delta over SPEC §5 / SPEC2 §5 / SPEC4 §5 / SPEC5 §5 / SPEC6 §5 / SPEC6_5 §5)
 
 ### 5.1 `[admin]` block additions
 
@@ -1085,7 +1093,7 @@ allowed_keys = []
 
 ---
 
-## 6. Request handling (delta over SPEC §6 / SPEC2 §6 / SPEC3 §6 / SPEC4 §6 / SPEC5 §6 / SPEC6 §6)
+## 6. Request handling (delta over SPEC §6 / SPEC2 §6 / SPEC3 §6 / SPEC4 §6 / SPEC5 §6 / SPEC6 §6 / SPEC6_5 §6)
 
 ### 6.1 Auth realm split
 
@@ -1516,7 +1524,7 @@ stale-validity decision logic.
 
 ---
 
-## 9. Concurrency & deadlines (delta over SPEC §9 / SPEC2 §9 / SPEC3 §9 / SPEC4 §9 / SPEC5 §9 / SPEC6 §9)
+## 9. Concurrency & deadlines (delta over SPEC §9 / SPEC2 §9 / SPEC3 §9 / SPEC4 §9 / SPEC5 §9 / SPEC6 §9 / SPEC6_5 §9)
 
 ### 9.1 Jobs concurrency
 
@@ -1648,7 +1656,7 @@ interrupted in step 1 is treated as not-started.
 
 ---
 
-## 10. Logging (delta over SPEC §10 / SPEC2 §10 / SPEC3 §10 / SPEC4 §10 / SPEC5 §10 / SPEC6 §10)
+## 10. Logging (delta over SPEC §10 / SPEC2 §10 / SPEC3 §10 / SPEC4 §10 / SPEC5 §10 / SPEC6 §10 / SPEC6_5 §10)
 
 ### 10.1 New event family: `admin_action_*`
 
@@ -1872,7 +1880,7 @@ deletions or renames.
 
 ---
 
-## 11. Failure-mode catalog (delta over SPEC §11 / SPEC4 §11 / SPEC5 §11 / SPEC6 §11)
+## 11. Failure-mode catalog (delta over SPEC §11 / SPEC4 §11 / SPEC5 §11 / SPEC6 §11 / SPEC6_5 §11)
 
 | ID | Failure | Behavior |
 |---|---|---|
@@ -1922,7 +1930,7 @@ deletions or renames.
 
 ---
 
-## 12. Test strategy (delta over SPEC §12 / SPEC2 §12 / SPEC3 §12 / SPEC4 §12 / SPEC5 §12 / SPEC6 §12)
+## 12. Test strategy (delta over SPEC §12 / SPEC2 §12 / SPEC3 §12 / SPEC4 §12 / SPEC5 §12 / SPEC6 §12 / SPEC6_5 §12)
 
 ### 12.1 Unit tests
 
@@ -2051,7 +2059,7 @@ deletions or renames.
 
 ### 12.4 E2E tests
 
-- The Phase 1-6 chaos test pass adds an "operator-action" step:
+- The Phase 1-6.5 chaos test pass adds an "operator-action" step:
   mid-suite, POST /admin/gc/run, verify in-flight apt fetches
   complete unaffected and post-GC apt fetches still serve from
   cache.
@@ -2074,7 +2082,7 @@ runbook entry at PHASE-7-SOAK.md (created at end of soak).
 
 ---
 
-## 13. Project layout (delta over SPEC §13 / SPEC4 §13 / SPEC5 §13 / SPEC6 §13)
+## 13. Project layout (delta over SPEC §13 / SPEC4 §13 / SPEC5 §13 / SPEC6 §13 / SPEC6_5 §13)
 
 New files:
 
@@ -2119,10 +2127,14 @@ Modified files:
 - `internal/config/config.go` — `[admin]` field additions,
   `[reload]` block, atomic-pointer-swap support for live
   config, validation rules per §5.3.
-- `internal/admin/admin.go` — register POST handlers; split
-  middleware into read/write realm authentication; expose
-  jobs surface (`GET /admin/jobs[/{id}]`); status JSON / HTML
-  additions per §2.4 / §2.5.
+- `internal/admin/server.go` (route registration + middleware)
+  and `internal/admin/handlers.go` (existing GET handlers) —
+  register POST handlers; split middleware into read/write
+  realm authentication; expose jobs surface
+  (`GET /admin/jobs[/{id}]`); status JSON / HTML additions per
+  §2.4 / §2.5. NOTE: the SPEC6 scoping doc named this file
+  `admin.go`; the file as landed is split across `server.go`
+  and `handlers.go`.
 - `internal/admin/template/status.html` — "Action surface"
   section + "Last rotation" sub-row.
 - `internal/proxy/tlsmitm/ca.go` — atomic.Pointer swap on the
@@ -2327,10 +2339,17 @@ Phase 7 is complete when all of the following hold:
     exits within `shutdown_timeout`; no leaked goroutines per
     `goleak` integration test.
 
-17. **No regression in Phase 1–6 surface.** All Phase 1–6 tests
-    pass under the Phase 7 build. The Phase 6 `tls_mitm`
-    behavior, in particular, is unchanged when no rotation is
-    invoked.
+17. **No regression in Phase 1–6.5 surface.** All Phase 1–6.5
+    tests pass under the Phase 7 build. The Phase 6 `tls_mitm`
+    behavior is unchanged when no rotation is invoked, and the
+    Phase 6.5 serve-time hash-validation surface is unchanged:
+    the `path_class` / `validated_hash` / `architecture` /
+    `package_name` per-request log fields, the
+    `acu_serve_hash_validated_total` and
+    `acu_package_hash_rows_by_kind` metrics, and the
+    `repo_coverage` / `cache_summary` status JSON sections
+    must all continue to render identically when no Phase 7
+    feature is exercised.
 
 18. **`/admin/config/reload` deadlock-free.** Stress test
     (10000 reloads with no config changes) completes within
