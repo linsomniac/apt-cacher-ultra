@@ -66,6 +66,24 @@ enabled               = false
 require_signature     = true
 require_pinned_signer = false
 
+# SPEC6_5 §5.1 per-arch adoption allowlist. Empty (default) adopts every
+# Release-listed Packages / Sources index regardless of architecture —
+# the same behavior as Phase 6. Non-empty restricts adoption to the
+# listed binary-<arch>/ and source/ index members; the pseudo-arch
+# "source" controls Sources adoption. Saves disk on caches whose
+# clients only fetch a subset of the upstream's published arches.
+#
+# Use the literal Debian architecture name: "amd64", "arm64", "armhf",
+# "i386", "ppc64el", "s390x", etc. The validator rejects uppercase,
+# underscores, hyphens, and any character outside [a-z0-9].
+#
+# Examples:
+#   architectures = []                            # default — all
+#   architectures = ["amd64"]                     # x86_64-only fleet
+#   architectures = ["amd64", "arm64"]            # mixed binary, no source
+#   architectures = ["amd64", "arm64", "source"]  # binary + source
+architectures         = []
+
 # SPEC3 §7.5 hot-deb prefetch wall-clock guard. After a snapshot flip,
 # adoption proactively warms the (Package, Architecture) tuples that
 # clients hit in the prior `hot_packages.window` (next block) so the

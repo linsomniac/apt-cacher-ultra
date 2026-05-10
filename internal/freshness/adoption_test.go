@@ -1840,11 +1840,13 @@ func TestAdopter_MultiArch_NoFilter_AllArchsAdopted(t *testing.T) {
 	}
 }
 
-// SPEC6_5 §6.2.2 / §15 #6: [adoption].architectures = ["amd64"] keeps
-// only the amd64 Packages member; arm64 / i386 Packages are skipped at
-// the filter step (no upstream fetch), no package_hash rows are
-// inserted for the non-amd64 arches, and the per-skip Warn carries
-// reason="arch_not_in_allowlist".
+// SPEC6_5 §6.2.2 / §11 H10 / §15 #6: [adoption].architectures = ["amd64"]
+// keeps only the amd64 Packages member; arm64 / i386 Packages are
+// skipped at the filter step (no upstream fetch), no package_hash rows
+// are inserted for the non-amd64 arches, and the per-skip Warn carries
+// reason="arch_not_in_allowlist". The arm64-only client requesting an
+// arm64 .deb falls through to trust-upstream Phase 1 with no
+// regression vs Phase 6 default behavior (H10's exact disposition).
 func TestAdopter_MultiArch_AllowlistFiltersOutOtherArchs(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))

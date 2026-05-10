@@ -65,6 +65,39 @@ var (
 		metrics.DefaultMaxSeries,
 		"host",
 	)
+
+	// SPEC6_5 §10.3 / §7.4: adoption-member-skip / Sources-parse /
+	// pdiff-Index-parse counters. Cardinality is a closed enum per
+	// label (≤ 4 values for reason, ≤ 2 for outcome) so the totals
+	// stay well under metric_series_cap.
+	adoptionMembersSkippedTotal = metrics.NewCounterWithCap(
+		"acu_adoption_members_skipped_total",
+		"Release members skipped during adoption, by reason (SPEC6_5 §10.3).",
+		metrics.DefaultMaxSeries,
+		"reason",
+	)
+
+	adoptionSourcesParsedTotal = metrics.NewCounterWithCap(
+		"acu_adoption_sources_parsed_total",
+		"Sources index files processed during adoption, by outcome (SPEC6_5 §10.3).",
+		metrics.DefaultMaxSeries,
+		"outcome",
+	)
+
+	adoptionPdiffIndexesParsedTotal = metrics.NewCounterWithCap(
+		"acu_adoption_pdiff_indexes_parsed_total",
+		"pdiff Index files processed during adoption, by outcome (SPEC6_5 §10.3).",
+		metrics.DefaultMaxSeries,
+		"outcome",
+	)
+
+	// AIDEV-NOTE: SPEC6_5 §10.3 also lists
+	// acu_package_hash_rows_by_kind{kind} (gauge) and
+	// acu_serve_hash_validated_total{path_class,outcome} (counter).
+	// The gauge is wired by the §2.4 status-surface refresher (a
+	// separate task). The validated counter requires the validated_hash
+	// log field to flow from the handler validation sites (deferred
+	// per §2.3 follow-up).
 )
 
 // classifyAdoptionOutcome maps the err return from Adopter.Run /

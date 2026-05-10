@@ -1770,6 +1770,24 @@ func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, s
 		"duration_ms", duration.Milliseconds(),
 		"client_addr", r.RemoteAddr,
 	}
+	// SPEC6_5 §2.3: per-request path_class + architecture fields.
+	// Empty path (the pre-canonicalize bad_request / method_not_allowed
+	// outcomes) skips both — neither field is meaningful before the
+	// path is parsed. AIDEV-NOTE: validated_hash and package_name
+	// (the other two §2.3 fields) are deferred to a follow-up phase;
+	// surfacing them needs validated/package metadata to flow from the
+	// hash-validation sites (handler.go:checkPackageHash and
+	// runFetch's post-fetch dispatch) up into logRequest, which is a
+	// non-trivial signature change. Operators today derive a "validated"
+	// signal from the outcome string + path_class combination.
+	if path != "" {
+		attrs = append(attrs,
+			"path_class", classifyPath(path),
+		)
+		if arch := archFromPath(path); arch != "" {
+			attrs = append(attrs, "architecture", arch)
+		}
+	}
 	if fetchAttempted {
 		attrs = append(attrs, "upstream_status", upstreamStatus)
 	}
@@ -1809,6 +1827,82 @@ func urlForLog(r *http.Request) string {
 	cp := *r.URL
 	cp.User = nil
 	return cp.String()
+}
+
+// pathClassPdiffPatchRE matches the SPEC6_5 §6.1 pdiff-patch shape: a
+// path component containing Packages.diff/ or Sources.diff/ followed
+// by a digit/dot/dash filename ending in `.gz`. Loose by design —
+// historical apt-ftparchive variants name patches differently
+// (e.g. 2026-05-09-1234.56.gz vs older yyyy-mm-dd.gz forms).
+var pathClassPdiffPatchRE = regexp.MustCompile(`(?:Packages|Sources)\.diff/[0-9.-]+\.gz$`)
+
+// pathClassMetadataRE matches the SPEC6_5 §6.1 metadata-file shape:
+// any of Release / InRelease / Release.gpg, Packages*, Sources*, the
+// Index leaf of a pdiff directory, Contents-* (compressed or not),
+// or Translation-* under i18n. Members of /dists/<suite>/.
+var pathClassMetadataRE = regexp.MustCompile(`(?:^|/)(?:` +
+	`Release(?:\.gpg)?|InRelease|` +
+	`Packages(?:\.(?:gz|xz|bz2))?|` +
+	`Sources(?:\.(?:gz|xz|bz2))?|` +
+	`(?:Packages|Sources)\.diff/Index|` +
+	`Contents-[a-z0-9]+(?:\.(?:gz|xz|bz2))?|` +
+	`Translation-[A-Za-z0-9_]+(?:\.(?:gz|xz|bz2))?` +
+	`)$`)
+
+// pathClassBinaryArchRE extracts the binary-<arch> segment from a
+// .deb / .udeb path so the §2.3 architecture log field can be
+// populated without a package_hash lookup.
+var pathClassBinaryArchRE = regexp.MustCompile(`(?:^|/)binary-([a-z][a-z0-9]*)/`)
+
+// classifyPath maps a request path to the SPEC6_5 §6.1 / §2.3 path-
+// class enum. The enum drives the per-request log line's path_class
+// field (§2.3) and the §10.3 acu_serve_hash_validated_total{path_class}
+// metric label. Pure-text predicate — no IO, no allocation beyond the
+// regexp match.
+//
+// AIDEV-NOTE: order matters. .deb / .udeb / .dsc are checked before
+// the pdiff/metadata regexes because a path like
+// "main/binary-amd64/foo_1.deb" would otherwise be ambiguous with the
+// metadata Packages-shape (it isn't, but defensive ordering keeps the
+// hot path out of the regex engine).
+func classifyPath(p string) string {
+	switch {
+	case strings.HasSuffix(p, ".deb"):
+		return "binary_deb"
+	case strings.HasSuffix(p, ".udeb"):
+		return "binary_udeb"
+	case strings.HasSuffix(p, ".dsc"):
+		return "source_dsc"
+	case strings.HasSuffix(p, ".tar.gz"),
+		strings.HasSuffix(p, ".tar.xz"),
+		strings.HasSuffix(p, ".tar.bz2"),
+		strings.HasSuffix(p, ".diff.gz"):
+		return "source_tarball"
+	case strings.HasSuffix(p, "/Packages.diff/Index"),
+		strings.HasSuffix(p, "/Sources.diff/Index"):
+		return "pdiff_index"
+	case pathClassPdiffPatchRE.MatchString(p):
+		return "pdiff_patch"
+	case pathClassMetadataRE.MatchString(p):
+		return "metadata"
+	default:
+		return "other"
+	}
+}
+
+// archFromPath extracts the architecture tag for the SPEC6_5 §2.3
+// architecture log field. binary_*/pdiff_patch paths under
+// /binary-<arch>/ yield the arch; source_dsc/source_tarball/source-
+// pdiff paths yield "source"; everything else yields "" (omitted
+// from the log line by slog's empty-attr handling).
+func archFromPath(p string) string {
+	if m := pathClassBinaryArchRE.FindStringSubmatch(p); m != nil {
+		return m[1]
+	}
+	if strings.Contains(p, "/source/") {
+		return "source"
+	}
+	return ""
 }
 
 // isDebPath reports whether req.Path looks like a binary `.deb`

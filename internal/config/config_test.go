@@ -1403,8 +1403,9 @@ architectures = ["amd64", "arm64", "source"]
 	}
 }
 
-// SPEC6_5 §5.2 H1: architectures_invalid_value — entries failing the
-// shape predicate (lowercase letters/digits, leading letter) abort startup.
+// SPEC6_5 §5.2 / §11 H1: architectures_invalid_value — entries failing
+// the shape predicate (lowercase letters/digits, leading letter) abort
+// startup.
 func TestValidate_RejectsArchitecturesInvalidValue(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1438,7 +1439,8 @@ architectures = ["`+tc.arch+`"]
 	}
 }
 
-// SPEC6_5 §5.2 H2: architectures_too_many — > 32 entries aborts startup.
+// SPEC6_5 §5.2 / §11 H2: architectures_too_many — > 32 entries aborts
+// startup.
 func TestValidate_RejectsTooManyArchitectures(t *testing.T) {
 	dir := t.TempDir()
 	entries := make([]string, MaxArchitecturesEntries+1)

@@ -725,6 +725,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 						"reason", "arch_not_in_allowlist",
 						"architecture", arch,
 					)
+					adoptionMembersSkippedTotal.Inc("arch_not_in_allowlist")
 					skippedCount++
 					continue
 				}
@@ -1108,6 +1109,7 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 				"upstream_status", se.Code,
 				"reason", "upstream_4xx",
 			)
+			adoptionMembersSkippedTotal.Inc("upstream_4xx")
 			return "", errAdoptionMemberSkipped
 		}
 		return "", fmt.Errorf("%w: fetch %s: %v",
@@ -1488,6 +1490,7 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 				"stage", "decompress",
 				"error", err.Error(),
 			)
+			adoptionSourcesParsedTotal.Inc("parse_failed")
 			continue
 		}
 		refs, stats, err := ParseSources(body)
@@ -1498,8 +1501,10 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 				"stage", "parse",
 				"error", err.Error(),
 			)
+			adoptionSourcesParsedTotal.Inc("parse_failed")
 			continue
 		}
+		adoptionSourcesParsedTotal.Inc("ok")
 		parsedCount++
 		a.logger.Debug("source_parsed",
 			"canonical_scheme", suite.CanonicalScheme,
@@ -1613,6 +1618,7 @@ func (a *Adopter) buildPdiffHashes(suite SuiteRef, snapshotID int64,
 				"stage", "decompress",
 				"error", err.Error(),
 			)
+			adoptionPdiffIndexesParsedTotal.Inc("parse_failed")
 			continue
 		}
 		refs, err := ParsePdiffIndex(body)
@@ -1623,8 +1629,10 @@ func (a *Adopter) buildPdiffHashes(suite SuiteRef, snapshotID int64,
 				"stage", "parse",
 				"error", err.Error(),
 			)
+			adoptionPdiffIndexesParsedTotal.Inc("parse_failed")
 			continue
 		}
+		adoptionPdiffIndexesParsedTotal.Inc("ok")
 		parsedCount++
 		a.logger.Debug("pdiff_index_parsed",
 			"canonical_scheme", suite.CanonicalScheme,
