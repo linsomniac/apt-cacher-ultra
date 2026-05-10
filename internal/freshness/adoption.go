@@ -840,6 +840,37 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	}
 	packageHashes := pkgHashRes.rows
 
+	// SPEC6_5 §7.1: source-package adoption. Walks the same
+	// fetchedMembers slice for Sources-shaped index files and folds
+	// the resulting rows (Architecture="source") into the same
+	// package_hash insert that runs in CommitAdoption Step 3. Per-
+	// row dedup is keyed by the suite-relative artifact path; cross-
+	// variant disagreement (e.g. Sources.gz vs Sources.xz declaring
+	// different SHA256 for one .dsc) surfaces as ErrAdoptionParseFailed
+	// alongside the existing Packages-variant disagreement check
+	// (SPEC6_5 §11 H7).
+	sourceRows, _, err := a.buildSourceHashes(suite, snapshotID, fetchedMembers)
+	if err != nil {
+		return err
+	}
+	packageHashes = append(packageHashes, sourceRows...)
+
+	// SPEC6_5 §7.3: pdiff Index adoption. Parses each
+	// Packages.diff/Index and Sources.diff/Index, populates
+	// package_hash rows for each listed patch file (filename
+	// validated against the digit/dot/dash + .gz shape). The
+	// architecture column derives from the Index path's
+	// binary-<arch>/ or source/ segment so the §10.4 status surface
+	// can present per-arch counts uniformly across binary, source,
+	// and pdiff rows. Per-Index parse failures are tolerated; cross-
+	// Index disagreement on a patch path surfaces as
+	// ErrAdoptionParseFailed (§11 H7-equivalent).
+	pdiffRows, _, err := a.buildPdiffHashes(suite, snapshotID, fetchedMembers)
+	if err != nil {
+		return err
+	}
+	packageHashes = append(packageHashes, pdiffRows...)
+
 	// SPEC4 §7.5.2 site 3: heartbeat after Packages parsing returns.
 	// debian-main at multiple architectures can be tens of MiB of
 	// compressed input; on degraded CPU/storage the parse takes
@@ -1398,6 +1429,248 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 	return packageHashBuildResult{rows: rows, coverageComplete: true}, nil
 }
 
+// sourcePathDecl is the per-(source artifact path) running record
+// buildSourceHashes keeps so it can detect SPEC6_5 §11 H7 cross-variant
+// disagreement (Sources.gz declaring SHA256 X for pkg.dsc while
+// Sources.xz declares SHA256 Y for the same path).
+type sourcePathDecl struct {
+	sha256      string
+	packageName string
+}
+
+// buildSourceHashes walks every Sources-shaped Release member, parses
+// it via ParseSources, and returns dedup'd cache.PackageHash rows for
+// the declared source artifacts (.dsc, source tarballs, debian patches).
+// Each row carries Architecture="source" — the Debian convention for
+// source-package rows that lets the SPEC6_5 §10.4 status surface
+// surface them under their own pseudo-arch.
+//
+// The second return value is the count of Sources members successfully
+// parsed (drives the SPEC6_5 §10.3 acu_adoption_sources_parsed_total{outcome=ok}
+// counter; the parse_failed counter is incremented at the call site
+// when err is non-nil).
+//
+// Returns ErrAdoptionParseFailed on cross-variant disagreement
+// (matches the Phase 3 buildPackageHashes posture for binary Packages).
+// SPEC6_5 §11 H3/H4/H11 per-stanza skips happen inside ParseSources
+// silently — operators see the per-Sources-file granularity at the
+// source_parsed Debug log; per-stanza visibility is a future phase.
+//
+// Non-/dists/ layouts (where repoRootFromSuitePath returns false)
+// return (nil, 0, nil): source rows are simply not populated. Phase 1
+// trust-upstream still serves on hit; the cache just doesn't validate
+// the bytes.
+func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
+	fetchedMembers []ReleaseMember) ([]cache.PackageHash, int, error) {
+	repoRoot, ok := repoRootFromSuitePath(suite.SuitePath)
+	if !ok {
+		return nil, 0, nil
+	}
+
+	dedup := make(map[string]sourcePathDecl)
+	parsedCount := 0
+	for _, m := range fetchedMembers {
+		if !isSourcesMember(m.Path) {
+			continue
+		}
+		// AIDEV-NOTE: SPEC6_5 §10.2 / §11 H3 H4 treat per-Sources-
+		// file failures as non-fatal: emit source_parse_failed Warn
+		// and skip the member's rows. Adoption proceeds with binary-
+		// only hash coverage. This is intentionally LESS strict than
+		// the Phase 3 Packages-parse posture (which fails closed) —
+		// source-package coverage is opt-in / best-effort, while
+		// binary coverage is on the strict-mode predicate's path.
+		body, err := a.readPackagesBlob(m.Path, m.SHA256)
+		if err != nil {
+			a.logger.Warn("source_parse_failed",
+				"suite_path", suite.SuitePath,
+				"member_path", m.Path,
+				"stage", "decompress",
+				"error", err.Error(),
+			)
+			continue
+		}
+		refs, stats, err := ParseSources(body)
+		if err != nil {
+			a.logger.Warn("source_parse_failed",
+				"suite_path", suite.SuitePath,
+				"member_path", m.Path,
+				"stage", "parse",
+				"error", err.Error(),
+			)
+			continue
+		}
+		parsedCount++
+		a.logger.Debug("source_parsed",
+			"canonical_scheme", suite.CanonicalScheme,
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID,
+			"member_path", m.Path,
+			"stanza_count", stats.StanzaCount,
+			"package_hash_rows", len(refs),
+		)
+		for _, ref := range refs {
+			fullPath := repoRoot + ref.Path
+			if existing, dup := dedup[fullPath]; dup {
+				if existing.sha256 != ref.SHA256 {
+					return nil, parsedCount, fmt.Errorf("%w: %q declared %s vs %s across Sources variants",
+						ErrAdoptionParseFailed, fullPath, existing.sha256, ref.SHA256)
+				}
+				if existing.packageName != "" && ref.PackageName != "" && existing.packageName != ref.PackageName {
+					return nil, parsedCount, fmt.Errorf("%w: %q declared Package %q vs %q across Sources variants",
+						ErrAdoptionParseFailed, fullPath, existing.packageName, ref.PackageName)
+				}
+				if existing.packageName == "" {
+					existing.packageName = ref.PackageName
+					dedup[fullPath] = existing
+				}
+			} else {
+				dedup[fullPath] = sourcePathDecl{
+					sha256:      ref.SHA256,
+					packageName: ref.PackageName,
+				}
+			}
+		}
+	}
+
+	rows := make([]cache.PackageHash, 0, len(dedup))
+	for fullPath, decl := range dedup {
+		rows = append(rows, cache.PackageHash{
+			CanonicalScheme: suite.CanonicalScheme,
+			CanonicalHost:   suite.CanonicalHost,
+			Path:            fullPath,
+			DeclaredSHA256:  decl.sha256,
+			SnapshotID:      snapshotID,
+			PackageName:     decl.packageName,
+			Architecture:    "source",
+		})
+	}
+	return rows, parsedCount, nil
+}
+
+// pdiffPathDecl is the per-(patch-file path) running record
+// buildPdiffHashes keeps for cross-Index dedup. pdiff Index files
+// rarely overlap (each binary-<arch>/Packages.diff/Index covers its
+// own arch) but the dedup is cheap and defends against publication
+// quirks where two Indexes might list the same patch path.
+type pdiffPathDecl struct {
+	sha256       string
+	architecture string
+}
+
+// buildPdiffHashes walks every Packages.diff/Index and
+// Sources.diff/Index member, parses it via ParsePdiffIndex, and
+// returns dedup'd cache.PackageHash rows for the listed patch files.
+// Each row's Architecture is derived from the Index path's
+// `binary-<arch>/` segment (or "source" for source/Sources.diff/);
+// PackageName is empty (pdiff patches have no package identity).
+//
+// Per-Index parse failures are tolerated SPEC6_5-style (Warn + skip
+// member, adoption proceeds) — the same posture as buildSourceHashes.
+// Cross-Index disagreement on a patch path's hash surfaces as
+// ErrAdoptionParseFailed.
+//
+// Returns the rows, the count of Indexes successfully parsed (drives
+// the SPEC6_5 §10.3 acu_adoption_pdiff_indexes_parsed_total metric),
+// and an error.
+//
+// Non-/dists/ layouts return (nil, 0, nil) like buildSourceHashes.
+func (a *Adopter) buildPdiffHashes(suite SuiteRef, snapshotID int64,
+	fetchedMembers []ReleaseMember) ([]cache.PackageHash, int, error) {
+	repoRoot, ok := repoRootFromSuitePath(suite.SuitePath)
+	if !ok {
+		return nil, 0, nil
+	}
+
+	dedup := make(map[string]pdiffPathDecl)
+	parsedCount := 0
+	for _, m := range fetchedMembers {
+		if !isPdiffIndexMember(m.Path) {
+			continue
+		}
+		// archFromPdiffIndexPath returns "" for paths that don't
+		// match the binary-<arch>/ or source/ shape. Such Index
+		// files (a hypothetical archive layout outside the Phase
+		// 6.5 scope) have no arch label to assign — skip with a
+		// Warn so operators see the unhandled shape, but don't
+		// fail the adoption.
+		arch, archOK := archFromPdiffIndexPath(m.Path)
+		if !archOK {
+			a.logger.Warn("pdiff_index_parse_failed",
+				"suite_path", suite.SuitePath,
+				"member_path", m.Path,
+				"stage", "arch_extract",
+				"error", "Index path does not contain a binary-<arch>/ or source/ segment",
+			)
+			continue
+		}
+		body, err := a.readPackagesBlob(m.Path, m.SHA256)
+		if err != nil {
+			a.logger.Warn("pdiff_index_parse_failed",
+				"suite_path", suite.SuitePath,
+				"member_path", m.Path,
+				"stage", "decompress",
+				"error", err.Error(),
+			)
+			continue
+		}
+		refs, err := ParsePdiffIndex(body)
+		if err != nil {
+			a.logger.Warn("pdiff_index_parse_failed",
+				"suite_path", suite.SuitePath,
+				"member_path", m.Path,
+				"stage", "parse",
+				"error", err.Error(),
+			)
+			continue
+		}
+		parsedCount++
+		a.logger.Debug("pdiff_index_parsed",
+			"canonical_scheme", suite.CanonicalScheme,
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID,
+			"index_path", m.Path,
+			"patch_count", len(refs),
+		)
+		// dirname-of-Index ends without a trailing slash; append "/"
+		// before the patch filename. e.g. Index path
+		// "main/binary-amd64/Packages.diff/Index" → dirname
+		// "main/binary-amd64/Packages.diff" → patch path
+		// "<repoRoot>main/binary-amd64/Packages.diff/<filename>".
+		indexDir := path.Dir(m.Path)
+		for _, ref := range refs {
+			fullPath := repoRoot + indexDir + "/" + ref.Filename
+			if existing, dup := dedup[fullPath]; dup {
+				if existing.sha256 != ref.SHA256 {
+					return nil, parsedCount, fmt.Errorf("%w: %q declared %s vs %s across pdiff Indexes",
+						ErrAdoptionParseFailed, fullPath, existing.sha256, ref.SHA256)
+				}
+				continue
+			}
+			dedup[fullPath] = pdiffPathDecl{
+				sha256:       ref.SHA256,
+				architecture: arch,
+			}
+		}
+	}
+
+	rows := make([]cache.PackageHash, 0, len(dedup))
+	for fullPath, decl := range dedup {
+		rows = append(rows, cache.PackageHash{
+			CanonicalScheme: suite.CanonicalScheme,
+			CanonicalHost:   suite.CanonicalHost,
+			Path:            fullPath,
+			DeclaredSHA256:  decl.sha256,
+			SnapshotID:      snapshotID,
+			PackageName:     "",
+			Architecture:    decl.architecture,
+		})
+	}
+	return rows, parsedCount, nil
+}
+
 // isPackagesBasename reports whether base is *any* `Packages` variant
 // (including unsupported compressions). Used by SPEC3 §7.5.4 coverage
 // detection to identify which directories are *expected* to contribute
@@ -1423,6 +1696,28 @@ func isPackagesMember(p string) bool {
 		return true
 	}
 	return false
+}
+
+// isSourcesMember reports whether p is a Sources index member shape
+// SPEC6_5 §7.1 dispatches to ParseSources for. The same compression
+// matrix as isPackagesMember (plain / .gz / .xz) — Sources.bz2 etc.
+// remain unsupported (and almost never appear in real Debian repos).
+func isSourcesMember(p string) bool {
+	base := path.Base(p)
+	switch base {
+	case "Sources", "Sources.gz", "Sources.xz":
+		return true
+	}
+	return false
+}
+
+// isPdiffIndexMember reports whether p is a Packages.diff/Index or
+// Sources.diff/Index member shape SPEC6_5 §7.3 dispatches to
+// ParsePdiffIndex for. Index files are uncompressed by convention —
+// no .gz / .xz variant exists in real Debian/Ubuntu archives.
+func isPdiffIndexMember(p string) bool {
+	return strings.HasSuffix(p, "/Packages.diff/Index") ||
+		strings.HasSuffix(p, "/Sources.diff/Index")
 }
 
 // repoRootFromSuitePath returns the apt repository root path for a

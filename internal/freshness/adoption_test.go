@@ -1941,6 +1941,377 @@ func TestAdopter_MultiArch_AllowlistFiltersOutOtherArchs(t *testing.T) {
 	}
 }
 
+// fakeSourcesStanzas builds a minimal Sources-file body with one
+// stanza per (Package, Directory) pair, each declaring the given
+// (filename -> SHA256) entries in a Checksums-Sha256 block.
+func fakeSourcesStanzas(stanzas []fakeSourceStanza) []byte {
+	var sb strings.Builder
+	for _, s := range stanzas {
+		fmt.Fprintf(&sb, "Package: %s\n", s.pkg)
+		fmt.Fprintf(&sb, "Directory: %s\n", s.directory)
+		sb.WriteString("Checksums-Sha256:\n")
+		for fn, h := range s.files {
+			fmt.Fprintf(&sb, " %s 100 %s\n", h, fn)
+		}
+		sb.WriteString("\n")
+	}
+	return []byte(sb.String())
+}
+
+type fakeSourceStanza struct {
+	pkg       string
+	directory string
+	files     map[string]string // filename -> sha256
+}
+
+// SPEC6_5 §7.1: a Release-listed Sources file is fetched, parsed, and
+// its declared artifacts (.dsc + tarballs) get package_hash rows with
+// Architecture="source". The serve-time validation hook then operates
+// on those paths exactly like binary .deb paths (handler.go is path-
+// agnostic at the validation step — see AIDEV-VERIFY in §6.2).
+func TestAdopter_Sources_HappyPath(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ff := newFakeFetcher()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:       c,
+		Fetcher:     ff,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+		Logger:      logger,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	suite := SuiteRef{
+		CanonicalScheme: "http",
+		CanonicalHost:   "archive.ubuntu.com",
+		SuitePath:       "/ubuntu/dists/noble",
+	}
+
+	dscHash := strings.Repeat("a", 64)
+	tarHash := strings.Repeat("b", 64)
+	patchHash := strings.Repeat("c", 64)
+	srcBody := fakeSourcesStanzas([]fakeSourceStanza{
+		{
+			pkg:       "bash",
+			directory: "pool/main/b/bash",
+			files: map[string]string{
+				"bash_5.1-2.dsc":         dscHash,
+				"bash_5.1.orig.tar.xz":   tarHash,
+				"bash_5.1-2.debian.tar": patchHash,
+			},
+		},
+	})
+
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/source/Sources": srcBody,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	ff.put(base+"main/source/Sources", srcBody)
+
+	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	sf, err := c.GetSuiteFreshness(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil {
+		t.Fatal("current_snapshot_id not set after source adoption")
+	}
+	snapshotID := *sf.CurrentSnapshotID
+
+	// Each declared source artifact has a package_hash row with
+	// arch=source (for the .dsc + tarball + patch).
+	for _, expected := range []struct {
+		path string
+		hash string
+	}{
+		{"/ubuntu/pool/main/b/bash/bash_5.1-2.dsc", dscHash},
+		{"/ubuntu/pool/main/b/bash/bash_5.1.orig.tar.xz", tarHash},
+		{"/ubuntu/pool/main/b/bash/bash_5.1-2.debian.tar", patchHash},
+	} {
+		ph, err := c.GetPackageHash(context.Background(),
+			suite.CanonicalScheme, suite.CanonicalHost, expected.path, snapshotID)
+		if err != nil {
+			t.Errorf("missing package_hash for %s: %v", expected.path, err)
+			continue
+		}
+		if ph.DeclaredSHA256 != expected.hash {
+			t.Errorf("%s declared = %s, want %s", expected.path, ph.DeclaredSHA256, expected.hash)
+		}
+	}
+
+	// source_parsed Debug log exists with the right shape.
+	out := logBuf.String()
+	if !strings.Contains(out, `"msg":"source_parsed"`) {
+		t.Errorf("expected source_parsed log line, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"stanza_count":1`) {
+		t.Errorf("expected stanza_count:1, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"package_hash_rows":3`) {
+		t.Errorf("expected package_hash_rows:3, got:\n%s", out)
+	}
+}
+
+// SPEC6_5 §11 H7: when Sources.gz and Sources.xz declare different
+// SHA256 hashes for the same artifact path, the whole adoption fails
+// with ErrAdoptionParseFailed and the prior snapshot continues to serve.
+func TestAdopter_Sources_CrossVariantDisagreement(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ff := newFakeFetcher()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:       c,
+		Fetcher:     ff,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+		Logger:      logger,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	suite := SuiteRef{
+		CanonicalScheme: "http",
+		CanonicalHost:   "archive.ubuntu.com",
+		SuitePath:       "/ubuntu/dists/noble",
+	}
+
+	// Sources (plain) declares dsc with hashA; Sources.gz declares dsc
+	// with hashB. Adoption must surface this as adoption_parse_failed.
+	hashA := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+	srcPlain := fakeSourcesStanzas([]fakeSourceStanza{
+		{
+			pkg:       "foo",
+			directory: "pool/main/f/foo",
+			files:     map[string]string{"foo_1.dsc": hashA},
+		},
+	})
+	srcGzipped := fakeSourcesStanzas([]fakeSourceStanza{
+		{
+			pkg:       "foo",
+			directory: "pool/main/f/foo",
+			files:     map[string]string{"foo_1.dsc": hashB},
+		},
+	})
+	srcGz := gzipBytes(srcGzipped)
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/source/Sources":    srcPlain,
+		"main/source/Sources.gz": srcGz,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	ff.put(base+"main/source/Sources", srcPlain)
+	ff.put(base+"main/source/Sources.gz", srcGz)
+
+	err = ad.Run(context.Background(), suite, releaseText, "etag-1", "")
+	if err == nil {
+		t.Fatal("expected error from cross-variant Sources disagreement")
+	}
+	if !errors.Is(err, ErrAdoptionParseFailed) {
+		t.Errorf("err = %v, want ErrAdoptionParseFailed", err)
+	}
+
+	// Snapshot must NOT have been committed (suite_freshness has no
+	// current_snapshot_id). A failed adoption leaves prior snapshots
+	// intact; this is the very first adoption so there's no prior.
+	sf, _ := c.GetSuiteFreshness(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
+	if sf != nil && sf.CurrentSnapshotID != nil {
+		t.Error("current_snapshot_id was set despite cross-variant disagreement")
+	}
+}
+
+// fakePdiffIndex builds a minimal pdiff Index body with the given
+// (filename -> SHA256, size) entries in a SHA256-Download block.
+func fakePdiffIndex(entries map[string]string) []byte {
+	var sb strings.Builder
+	sb.WriteString("SHA256-Current:\n")
+	sb.WriteString(" 9d2e1d4c8f3e1234567890abcdef1234567890abcdef1234567890abcdef9d2e 12345678\n")
+	sb.WriteString("SHA256-Download:\n")
+	for fn, h := range entries {
+		fmt.Fprintf(&sb, " %s 1500 %s\n", h, fn)
+	}
+	sb.WriteString("Canonical-Path: dists/noble/main/binary-amd64/Packages\n")
+	return []byte(sb.String())
+}
+
+// SPEC6_5 §7.3: a Release-listed Packages.diff/Index gets adopted +
+// parsed; each SHA256-Download entry yields a package_hash row with
+// arch derived from the Index path's binary-<arch>/ segment.
+func TestAdopter_PdiffIndex_HappyPath(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ff := newFakeFetcher()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:       c,
+		Fetcher:     ff,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+		Logger:      logger,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	suite := SuiteRef{
+		CanonicalScheme: "http",
+		CanonicalHost:   "archive.ubuntu.com",
+		SuitePath:       "/ubuntu/dists/noble",
+	}
+
+	patch1Hash := strings.Repeat("a", 64)
+	patch2Hash := strings.Repeat("b", 64)
+	indexBody := fakePdiffIndex(map[string]string{
+		"2026-05-09-1234.56.gz": patch1Hash,
+		"2026-05-09-1800.00.gz": patch2Hash,
+	})
+
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages.diff/Index": indexBody,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	ff.put(base+"main/binary-amd64/Packages.diff/Index", indexBody)
+
+	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	sf, err := c.GetSuiteFreshness(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil {
+		t.Fatal("current_snapshot_id not set after pdiff Index adoption")
+	}
+	snapshotID := *sf.CurrentSnapshotID
+
+	// Each declared patch has a package_hash row.
+	for _, expected := range []struct {
+		path string
+		hash string
+	}{
+		{"/ubuntu/main/binary-amd64/Packages.diff/2026-05-09-1234.56.gz", patch1Hash},
+		{"/ubuntu/main/binary-amd64/Packages.diff/2026-05-09-1800.00.gz", patch2Hash},
+	} {
+		ph, err := c.GetPackageHash(context.Background(),
+			suite.CanonicalScheme, suite.CanonicalHost, expected.path, snapshotID)
+		if err != nil {
+			t.Errorf("missing package_hash for %s: %v", expected.path, err)
+			continue
+		}
+		if ph.DeclaredSHA256 != expected.hash {
+			t.Errorf("%s declared = %s, want %s", expected.path, ph.DeclaredSHA256, expected.hash)
+		}
+	}
+
+	// pdiff_index_parsed log fires with the right field shape.
+	out := logBuf.String()
+	if !strings.Contains(out, `"msg":"pdiff_index_parsed"`) {
+		t.Errorf("expected pdiff_index_parsed log, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"patch_count":2`) {
+		t.Errorf("expected patch_count:2, got:\n%s", out)
+	}
+}
+
+// SPEC6_5 §11 H6: an Index containing entries with malformed filenames
+// drops those entries; well-formed entries proceed. The whole adoption
+// stays successful.
+func TestAdopter_PdiffIndex_MalformedEntriesSkipped(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ff := newFakeFetcher()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:       c,
+		Fetcher:     ff,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+		Logger:      logger,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	suite := SuiteRef{
+		CanonicalScheme: "http",
+		CanonicalHost:   "archive.ubuntu.com",
+		SuitePath:       "/ubuntu/dists/noble",
+	}
+
+	goodHash := strings.Repeat("a", 64)
+	badHash := strings.Repeat("b", 64)
+	indexBody := fakePdiffIndex(map[string]string{
+		"2026-05-09-1234.56.gz":  goodHash,
+		"not-a-pdiff-pattern.gz": badHash,
+	})
+
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages.diff/Index": indexBody,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	ff.put(base+"main/binary-amd64/Packages.diff/Index", indexBody)
+
+	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
+		t.Fatalf("Run: %v (malformed entry should be skipped, not abort)", err)
+	}
+
+	sf, err := c.GetSuiteFreshness(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness: %v", err)
+	}
+	snapshotID := *sf.CurrentSnapshotID
+
+	// Good entry has a row.
+	if _, err := c.GetPackageHash(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost,
+		"/ubuntu/main/binary-amd64/Packages.diff/2026-05-09-1234.56.gz", snapshotID); err != nil {
+		t.Errorf("missing package_hash for well-formed patch: %v", err)
+	}
+	// Malformed entry has no row.
+	if _, err := c.GetPackageHash(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost,
+		"/ubuntu/main/binary-amd64/Packages.diff/not-a-pdiff-pattern.gz", snapshotID); !errors.Is(err, cache.ErrNotFound) {
+		t.Errorf("malformed entry should not have a package_hash row, got err=%v", err)
+	}
+}
+
 // SPEC6_5 §1.3 / §5.1: the pseudo-arch "source" gates Sources adoption.
 // architectures = ["amd64", "source"] keeps amd64 binary indices and
 // the source/Sources index; an arm64/binary-arm64 index is filtered out
