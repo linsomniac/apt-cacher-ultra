@@ -8,11 +8,19 @@ import "sync"
 // blobHash is the sha256 hex of the cached file after a successful
 // fetch; on error it is empty. status is the upstream HTTP status (or 0
 // when no response was received), used for X-Upstream-Status diagnostics.
+//
+// SPEC6_5 §2.3: when the post-fetch dispatch validated the body against
+// a package_hash row's declared SHA256, validatedHash is set true and
+// packageName carries that row's Package: column (empty for pdiff
+// patches, which have no package name). Both fields are zero when no
+// validation occurred (Phase 1 trust-upstream regime, or metadata).
 type sfResult struct {
-	blobHash string
-	size     int64
-	status   int
-	err      error
+	blobHash      string
+	size          int64
+	status        int
+	err           error
+	validatedHash bool
+	packageName   string
 }
 
 // sfCall is a single in-flight singleflight call. The leader populates

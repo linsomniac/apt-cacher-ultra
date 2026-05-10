@@ -328,11 +328,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fast path: SPEC §6.1.
-	if served, outcome, status, body := h.tryCacheHit(w, r, req, start); served {
+	if served, outcome, status, body, validation := h.tryCacheHit(w, r, req, start); served {
 		if outcome == "" {
 			outcome = "hit"
 		}
-		h.logRequest(r, req.CanonicalHost, req.Path, outcome, status, body, false, 0, start)
+		h.logRequestWithValidation(r, req.CanonicalHost, req.Path, outcome, status, body, false, 0, start, validation)
 		return
 	}
 
@@ -378,14 +378,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // The fast path on every successful return is one DB read, one stat, one
 // open(2), and one ServeContent — order-of-microseconds.
-func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, outcome string, status int, bytesWritten int64) {
+func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, outcome string, status int, bytesWritten int64, validation packageValidation) {
 	if req.IsMetadata && req.SuitePath != "" {
 		if served, status, body, handled := h.trySnapshotHit(w, r, req, start); handled {
-			return served, "", status, body
+			return served, "", status, body, packageValidation{}
 		}
 	}
-	if served, outcome, status, body := h.tryURLPathHit(w, r, req); served {
-		return served, outcome, status, body
+	if served, outcome, status, body, v := h.tryURLPathHit(w, r, req); served {
+		return served, outcome, status, body, v
 	}
 	// SPEC2 §0 #4: when both lookups missed for a non-adopted metadata
 	// path of the form .../by-hash/SHA256/<hex>, the existing pool/
@@ -396,9 +396,9 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 	// an adopted suite's §6.1 contract.
 	if req.IsMetadata {
 		served, status, body := h.tryByHashContentAddressed(w, r, req)
-		return served, "", status, body
+		return served, "", status, body, packageValidation{}
 	}
-	return false, "", 0, 0
+	return false, "", 0, 0, packageValidation{}
 }
 
 // trySnapshotHit is the SPEC2 §6.1 metadata fast path. Returns
@@ -512,28 +512,31 @@ func (h *Handler) writeFailClosed(w http.ResponseWriter, reason string) bool {
 //     §6.2 miss path).
 //   - 2+ distinct declared hashes → 502 + Retry-After 60, log
 //     package_hash_conflict.
-func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, outcome string, status int, bytesWritten int64) {
+func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, outcome string, status int, bytesWritten int64, validation packageValidation) {
 	row, err := h.cache.LookupURL(r.Context(), req.CanonicalScheme, req.CanonicalHost, req.Path)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
-		return false, "", 0, 0
+		return false, "", 0, 0, packageValidation{}
 	case err != nil:
 		h.logger.Warn("cache lookup failed",
 			"err", err,
 			"canonical_host", req.CanonicalHost,
 			"path", req.Path,
 		)
-		return false, "", 0, 0
+		return false, "", 0, 0, packageValidation{}
 	}
 	if row.BlobHash == nil || *row.BlobHash == "" {
-		return false, "", 0, 0
+		return false, "", 0, 0, packageValidation{}
 	}
 
+	var v packageValidation
 	if !req.IsMetadata {
-		if served, outcome, status, body, fellThrough := h.checkPackageHash(w, r, req, *row.BlobHash); fellThrough {
-			return false, "", 0, 0
+		if served, outcome, status, body, fellThrough, gotV := h.checkPackageHash(w, r, req, *row.BlobHash); fellThrough {
+			return false, "", 0, 0, packageValidation{}
 		} else if served {
-			return true, outcome, status, body
+			return true, outcome, status, body, gotV
+		} else {
+			v = gotV
 		}
 	}
 
@@ -541,11 +544,11 @@ func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *pro
 		lastFetchedAt: row.LastFetchedAt,
 	})
 	if !served {
-		return false, "", 0, 0
+		return false, "", 0, 0, packageValidation{}
 	}
 	go h.touchAsync(req)
 	h.maybeFireFreshness(req)
-	return true, "", status, bytesWritten
+	return true, "", status, bytesWritten, v
 }
 
 // byHashSuffixRegex matches the trailing "/by-hash/SHA256/<64hex>" of a
@@ -686,7 +689,13 @@ func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
 // was evicted and the caller should drop to the miss path. Returns all
 // zero/empty when the hash check passed (or no rows exist) and the
 // caller should serve normally.
-func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool) {
+//
+// SPEC6_5 §2.3: when the hit was validated against a package_hash row
+// (case len(distinct)==1 && distinct[0]==blobHash), validation captures
+// the matching row's Package name so logRequest can surface
+// validated_hash=true + package_name=<name>. The mismatch + conflict
+// branches also increment acu_serve_hash_validated_total{outcome=mismatch}.
+func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
 	rows, err := h.cache.DeclaredHashesForPath(r.Context(),
 		req.CanonicalScheme, req.CanonicalHost, req.Path)
 	if err != nil {
@@ -698,7 +707,7 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 		// Fall through to a normal serve — the on-disk url_path row is
 		// our best Phase-1-grade answer. A hard fail-closed here would
 		// turn a transient SQLite hiccup into a global .deb 502 storm.
-		return false, "", 0, 0, false
+		return false, "", 0, 0, false, packageValidation{}
 	}
 	distinct := distinctDeclared(rows)
 	switch len(distinct) {
@@ -711,25 +720,33 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 		// non-.deb non-metadata fetches are not in package_hash by
 		// design and must fall through.
 		if !isDebPath(req.Path) {
-			return false, "", 0, 0, false
+			return false, "", 0, 0, false, packageValidation{}
 		}
 		switch sm, snapID, count := h.classifyStrictMode(r.Context(),
 			req.CanonicalScheme, req.CanonicalHost); sm {
 		case strictRefuse:
 			st, body := h.refuseUnvouchedDeb(w, req.CanonicalHost, req.Path, count)
-			return true, "unvouched_deb_refused", st, body, false
+			return true, "unvouched_deb_refused", st, body, false, packageValidation{}
 		case strictPassthrough:
 			h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)
 			fallthrough
 		default:
-			return false, "", 0, 0, false
+			return false, "", 0, 0, false, packageValidation{}
 		}
 	case 1:
 		if distinct[0] == blobHash {
-			return false, "", 0, 0, false
+			// SPEC6_5 §10.3: serve-time validation match. Capture the
+			// matching row's package_name (Phase 3 v3) for the §2.3
+			// per-request log line.
+			serveHashValidatedTotal.Inc(classifyPath(req.Path), "match")
+			return false, "", 0, 0, false, packageValidation{
+				Validated:   true,
+				PackageName: firstPackageName(rows, distinct[0]),
+			}
 		}
 		// One row mismatches: stale Phase 1 row covered by a Phase 2
 		// snapshot has diverged. Evict + drop into miss path.
+		serveHashValidatedTotal.Inc(classifyPath(req.Path), "mismatch")
 		evictCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if eerr := h.cache.EvictURLPath(evictCtx,
@@ -747,12 +764,13 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 			"declared_sha256", distinct[0],
 			"snapshot_id", rows[0].SnapshotID,
 		)
-		return false, "", 0, 0, true
+		return false, "", 0, 0, true, packageValidation{}
 	default:
 		// Two or more distinct hashes: snapshots disagree. SPEC2 §6.1
 		// step 6 / §6.2 share fail-closed behavior — 502 + Retry-After
 		// 60 + log package_hash_conflict. Serving an arbitrary one of
 		// the conflicting hashes is worse than refusing.
+		serveHashValidatedTotal.Inc(classifyPath(req.Path), "mismatch")
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, "package hash conflict", http.StatusBadGateway)
 		h.logger.Error("package_hash_conflict",
@@ -761,8 +779,27 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 			"row_blob_hash", blobHash,
 			"declared", declaredAttrs(rows),
 		)
-		return true, "package_hash_conflict", http.StatusBadGateway, 0, false
+		return true, "package_hash_conflict", http.StatusBadGateway, 0, false, packageValidation{}
 	}
+}
+
+// firstPackageName returns the PackageName of the first DeclaredHash
+// row whose declared SHA256 equals match. Used by the SPEC6_5 §2.3
+// log-field plumbing: at the validation match site we know the hash,
+// and want the row that vouched for it. The row order from
+// DeclaredHashesForPath is undefined; if multiple snapshots agree on
+// the same hash AND disagree on package_name (rare but possible in
+// renamed-package edge cases), we pick the first match — operators can
+// follow up via the package_hash table directly. Returns "" when no
+// row matches (defensive — should not occur given the caller checks
+// distinct[0]==blobHash before calling us).
+func firstPackageName(rows []cache.DeclaredHash, match string) string {
+	for _, r := range rows {
+		if r.DeclaredSHA256 == match {
+			return r.PackageName
+		}
+	}
+	return ""
 }
 
 // snapshotMeta carries the metadata used by serveBlobWithHeaders to set
@@ -981,7 +1018,10 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 
 	cw := &countingWriter{ResponseWriter: w}
 	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
-	h.logRequest(r, req.CanonicalHost, req.Path, logOutcome, cw.statusCode(), cw.bytes, true, res.status, start)
+	h.logRequestWithValidation(r, req.CanonicalHost, req.Path, logOutcome, cw.statusCode(), cw.bytes, true, res.status, start, packageValidation{
+		Validated:   res.validatedHash,
+		PackageName: res.packageName,
+	})
 }
 
 // serveSnapshotMemberMiss runs the SPEC2 §6.2 metadata recovery: an
@@ -1245,6 +1285,16 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 	}
 	defer release()
 
+	// SPEC6_5 §2.3: surfaced via the success-path sfResult so the
+	// post-runFetch logRequest in serveCacheMiss can emit
+	// validated_hash + package_name. Set in the post-fetch case-1
+	// match branch below; remain zero on Phase 1 trust-upstream paths
+	// (no package_hash row) and on metadata paths.
+	var (
+		validatedHash bool
+		packageName   string
+	)
+
 	// Pre-fetch bandwidth optimization: refuse the conflict case
 	// (≥ 2 distinct declared hashes) without contacting upstream — no
 	// observed bytes can resolve a snapshot-level conflict, and the
@@ -1390,6 +1440,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 						"declared", declaredAttrs(rows),
 					)
 					integrity.IncHashValidationFailureFetch()
+					serveHashValidatedTotal.Inc(classifyPath(req.Path), "mismatch")
 					return sfResult{
 						err: fmt.Errorf("%w: declared %s, observed %s",
 							ErrPackageHashMismatch, distinct[0], observed),
@@ -1407,6 +1458,14 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 				if ferr2 != nil {
 					return sfResult{err: fmt.Errorf("handler: finalize blob: %w", ferr2), status: fres.Status}
 				}
+				// SPEC6_5 §10.3 / §2.3: capture the validation
+				// outcome so the post-fetch logRequest can surface
+				// validated_hash=true + package_name. firstPackageName
+				// resolves the row by hash (the row order from
+				// DeclaredHashesForPath is undefined).
+				serveHashValidatedTotal.Inc(classifyPath(req.Path), "match")
+				validatedHash = true
+				packageName = firstPackageName(rows, distinct[0])
 			default:
 				// Conflict surfaced post-fetch — most often during an
 				// adoption flip while the fetch was in flight.
@@ -1421,6 +1480,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 					"observed_sha256", observed,
 					"declared", declaredAttrs(rows),
 				)
+				serveHashValidatedTotal.Inc(classifyPath(req.Path), "mismatch")
 				return sfResult{err: ErrPackageHashConflict, status: fres.Status}
 			}
 		}
@@ -1496,9 +1556,11 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 	}
 
 	return sfResult{
-		blobHash: hash,
-		size:     fres.ContentLength,
-		status:   fres.Status,
+		blobHash:      hash,
+		size:          fres.ContentLength,
+		status:        fres.Status,
+		validatedHash: validatedHash,
+		packageName:   packageName,
 	}
 }
 
@@ -1741,7 +1803,35 @@ func retryAfterForRequest(req *proxy.Request) string {
 	return "60"
 }
 
+// packageValidation carries the SPEC6_5 §2.3 validated_hash +
+// package_name signal from a hash-validation site (hit-path
+// checkPackageHash or miss-path post-fetch dispatch) back to logRequest.
+//
+// Validated is true iff the served bytes were matched against a
+// package_hash row's declared SHA256. PackageName is the matching row's
+// Phase 3 v3 package_name column — empty when the row has no package
+// name (pdiff patches, legacy pre-v3 rows). The zero value
+// (`packageValidation{}`) means "no validation occurred for this
+// request" and emits neither field.
+type packageValidation struct {
+	Validated   bool
+	PackageName string
+}
+
 // logRequest emits the per-request slog line. SPEC §10.
+//
+// Pure delegation to logRequestWithValidation — the caller has no §2.3
+// validation signal to surface (e.g. method_not_allowed, bad_request,
+// allowlist refusals). Most call sites use this form.
+func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, status int, bytesWritten int64, fetchAttempted bool, upstreamStatus int, start time.Time) {
+	h.logRequestWithValidation(r, canonHost, path, outcome, status, bytesWritten, fetchAttempted, upstreamStatus, start, packageValidation{})
+}
+
+// logRequestWithValidation is the SPEC6_5 §2.3 variant: also emits
+// validated_hash + package_name when the caller's validation argument
+// indicates a hash-validated serve. Fields are emitted only when
+// meaningful — the false / empty cases are omitted to match the
+// existing field-presence-as-signal pattern (`mitm`, `upstream_status`).
 //
 // AIDEV-NOTE: never log r.RequestURI directly — proxy-form requests can
 // (in principle) carry userinfo like http://user:pass@host/path. The
@@ -1757,7 +1847,7 @@ func retryAfterForRequest(req *proxy.Request) string {
 // Use fetchAttempted=false only on pre-fetch outcomes (hit, 400, 405,
 // pre-fetch allowlist 403); use true for every miss-path outcome,
 // including HIT-STALE (which fired after a fetch failed).
-func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, status int, bytesWritten int64, fetchAttempted bool, upstreamStatus int, start time.Time) {
+func (h *Handler) logRequestWithValidation(r *http.Request, canonHost, path, outcome string, status int, bytesWritten int64, fetchAttempted bool, upstreamStatus int, start time.Time, validation packageValidation) {
 	duration := time.Since(start)
 	attrs := []any{
 		"method", r.Method,
@@ -1773,13 +1863,7 @@ func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, s
 	// SPEC6_5 §2.3: per-request path_class + architecture fields.
 	// Empty path (the pre-canonicalize bad_request / method_not_allowed
 	// outcomes) skips both — neither field is meaningful before the
-	// path is parsed. AIDEV-NOTE: validated_hash and package_name
-	// (the other two §2.3 fields) are deferred to a follow-up phase;
-	// surfacing them needs validated/package metadata to flow from the
-	// hash-validation sites (handler.go:checkPackageHash and
-	// runFetch's post-fetch dispatch) up into logRequest, which is a
-	// non-trivial signature change. Operators today derive a "validated"
-	// signal from the outcome string + path_class combination.
+	// path is parsed.
 	if path != "" {
 		attrs = append(attrs,
 			"path_class", classifyPath(path),
@@ -1787,6 +1871,18 @@ func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, s
 		if arch := archFromPath(path); arch != "" {
 			attrs = append(attrs, "architecture", arch)
 		}
+	}
+	// SPEC6_5 §2.3: validated_hash is a bool — true iff the served
+	// bytes matched a package_hash row's declared SHA256. Emitted only
+	// when true so absence == "not validated" (matching the mitm
+	// field's presence-as-signal style); operators alarm on
+	// acu_serve_hash_validated_total{outcome=mismatch} for the
+	// negative case rather than false-valued log lines.
+	if validation.Validated {
+		attrs = append(attrs, "validated_hash", true)
+	}
+	if validation.PackageName != "" {
+		attrs = append(attrs, "package_name", validation.PackageName)
 	}
 	if fetchAttempted {
 		attrs = append(attrs, "upstream_status", upstreamStatus)

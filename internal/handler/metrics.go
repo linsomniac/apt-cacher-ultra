@@ -56,4 +56,16 @@ var (
 		"Number of HTTP requests currently being served (SPEC5 §10.4.1).",
 		0,
 	)
+
+	// SPEC6_5 §10.3: serve-time hash validation counter, the operational
+	// counterpart to the serve_hash_mismatch Warn. Operators alarm on
+	// outcome="mismatch" rate. path_class is the §6.1 closed enum (8
+	// values); outcome is "match" or "mismatch" (2 values). Cardinality
+	// is well within metric_series_cap (1024).
+	serveHashValidatedTotal = metrics.NewCounterWithCap(
+		"acu_serve_hash_validated_total",
+		"Serve-time hash validations against package_hash, by path class and outcome (SPEC6_5 §10.3).",
+		metrics.DefaultMaxSeries,
+		"path_class", "outcome",
+	)
 )
