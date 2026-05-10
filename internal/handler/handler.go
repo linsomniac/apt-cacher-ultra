@@ -1892,12 +1892,21 @@ func classifyPath(p string) string {
 
 // archFromPath extracts the architecture tag for the SPEC6_5 §2.3
 // architecture log field. binary_*/pdiff_patch paths under
-// /binary-<arch>/ yield the arch; source_dsc/source_tarball/source-
-// pdiff paths yield "source"; everything else yields "" (omitted
-// from the log line by slog's empty-attr handling).
+// /binary-<arch>/ yield the arch; source artifact paths (.dsc,
+// source tarballs, .diff.gz) and any path containing /source/
+// yield "source"; everything else yields "" (omitted from the log
+// line by slog's empty-attr handling).
+//
+// Pool-layout source artifacts (e.g. pool/main/b/bash/bash_5.1-2.dsc)
+// do NOT pass through /source/ in the path, so the suffix-based
+// branch is load-bearing for the dominant case.
 func archFromPath(p string) string {
 	if m := pathClassBinaryArchRE.FindStringSubmatch(p); m != nil {
 		return m[1]
+	}
+	switch classifyPath(p) {
+	case "source_dsc", "source_tarball":
+		return "source"
 	}
 	if strings.Contains(p, "/source/") {
 		return "source"

@@ -1107,9 +1107,9 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 				"path", m.Path,
 				"declared_sha256", m.SHA256,
 				"upstream_status", se.Code,
-				"reason", "upstream_4xx",
+				"reason", "4xx",
 			)
-			adoptionMembersSkippedTotal.Inc("upstream_4xx")
+			adoptionMembersSkippedTotal.Inc("4xx")
 			return "", errAdoptionMemberSkipped
 		}
 		return "", fmt.Errorf("%w: fetch %s: %v",
@@ -1608,6 +1608,7 @@ func (a *Adopter) buildPdiffHashes(suite SuiteRef, snapshotID int64,
 				"stage", "arch_extract",
 				"error", "Index path does not contain a binary-<arch>/ or source/ segment",
 			)
+			adoptionPdiffIndexesParsedTotal.Inc("parse_failed")
 			continue
 		}
 		body, err := a.readPackagesBlob(m.Path, m.SHA256)
