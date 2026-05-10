@@ -1681,3 +1681,332 @@ func TestAdopter_MemberSkipped_PackagesDirSkipped_CoverageIncomplete(t *testing.
 		t.Error("package_coverage_complete = true, want false (amd64/Packages was 404-skipped)")
 	}
 }
+
+// SPEC6_5 §7.2: archFromFilteredPath classifies Release-member paths
+// for the [adoption].architectures filter. The four shape patterns
+// (Packages*, Packages.diff/Index, Sources*, Sources.diff/Index) report
+// (arch, true); paths outside the filter scope report (_, false).
+func TestArchFromFilteredPath(t *testing.T) {
+	cases := []struct {
+		name         string
+		path         string
+		wantArch     string
+		wantFiltered bool
+	}{
+		// Filter scope — binary index files.
+		{"binary-amd64-Packages", "main/binary-amd64/Packages", "amd64", true},
+		{"binary-amd64-Packages.gz", "main/binary-amd64/Packages.gz", "amd64", true},
+		{"binary-amd64-Packages.xz", "main/binary-amd64/Packages.xz", "amd64", true},
+		{"binary-amd64-Packages.bz2", "main/binary-amd64/Packages.bz2", "amd64", true},
+		{"binary-arm64-Packages.gz", "main/binary-arm64/Packages.gz", "arm64", true},
+		{"binary-armhf-Packages.xz", "non-free/binary-armhf/Packages.xz", "armhf", true},
+		{"binary-i386-pdiff-index", "contrib/binary-i386/Packages.diff/Index", "i386", true},
+		{"d-i-binary-amd64", "main/debian-installer/binary-amd64/Packages.gz", "amd64", true},
+
+		// Filter scope — source index files.
+		{"source-Sources", "main/source/Sources", "source", true},
+		{"source-Sources.gz", "main/source/Sources.gz", "source", true},
+		{"source-Sources.xz", "main/source/Sources.xz", "source", true},
+		{"source-pdiff-index", "main/source/Sources.diff/Index", "source", true},
+
+		// Out of filter scope — kept regardless of allowlist.
+		{"binary-amd64-Release", "main/binary-amd64/Release", "", false},
+		{"contents-amd64", "main/Contents-amd64.gz", "", false},
+		{"i18n-translation", "main/i18n/Translation-en.bz2", "", false},
+		{"per-component-Release", "main/Release", "", false},
+		{"InRelease", "InRelease", "", false},
+		{"empty", "", "", false},
+		{"deeply-nested-no-arch", "foo/bar/baz/qux", "", false},
+
+		// Defensive: a Packages file that's NOT under binary-<arch>/
+		// shouldn't match the binary regex (the path shape is invalid
+		// for a real apt repo, but the predicate must be precise).
+		{"packages-no-arch-prefix", "main/Packages.gz", "", false},
+		{"sources-no-source-prefix", "main/Sources.gz", "", false},
+
+		// pdiff patch files (the *.gz under Packages.diff/) are NOT
+		// the Index — they're individual patches and aren't subject
+		// to the §7.2 filter (they're listed BY the Index, which is
+		// already filtered).
+		{"pdiff-patch-not-index", "main/binary-amd64/Packages.diff/2026-05-09-1234.56.gz", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotArch, gotFiltered := archFromFilteredPath(tc.path)
+			if gotArch != tc.wantArch || gotFiltered != tc.wantFiltered {
+				t.Errorf("archFromFilteredPath(%q) = (%q, %v), want (%q, %v)",
+					tc.path, gotArch, gotFiltered, tc.wantArch, tc.wantFiltered)
+			}
+		})
+	}
+}
+
+// SPEC6_5 §6.2.2 / §15 #6: with no [adoption].architectures filter set,
+// every binary-<arch>/Packages declared in Release is adopted; the
+// per-arch .debs land in package_hash on the new snapshot. The handler
+// then validates them via the existing path-agnostic hook (§6.2 + the
+// AIDEV-VERIFY check), and arm64-only or i386-only clients reach a
+// validated-hit on the next request.
+func TestAdopter_MultiArch_NoFilter_AllArchsAdopted(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ff := newFakeFetcher()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:       c,
+		Fetcher:     ff,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+		Logger:      logger,
+		// Architectures unset = filter inert.
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	suite := SuiteRef{
+		CanonicalScheme: "http",
+		CanonicalHost:   "archive.ubuntu.com",
+		SuitePath:       "/ubuntu/dists/noble",
+	}
+
+	debHashAmd64 := strings.Repeat("a", 64)
+	debHashArm64 := strings.Repeat("b", 64)
+	debHashI386 := strings.Repeat("c", 64)
+	pkgsAmd64 := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.0_amd64.deb": debHashAmd64,
+	})
+	pkgsArm64 := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.0_arm64.deb": debHashArm64,
+	})
+	pkgsI386 := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.0_i386.deb": debHashI386,
+	})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgsAmd64,
+		"main/binary-arm64/Packages": pkgsArm64,
+		"main/binary-i386/Packages":  pkgsI386,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	ff.put(base+"main/binary-amd64/Packages", pkgsAmd64)
+	ff.put(base+"main/binary-arm64/Packages", pkgsArm64)
+	ff.put(base+"main/binary-i386/Packages", pkgsI386)
+
+	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	sf, err := c.GetSuiteFreshness(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil {
+		t.Fatal("current_snapshot_id not set")
+	}
+	snapshotID := *sf.CurrentSnapshotID
+
+	for _, expected := range []struct {
+		path string
+		hash string
+		arch string
+	}{
+		{"/ubuntu/pool/main/f/foo/foo_1.0_amd64.deb", debHashAmd64, "amd64"},
+		{"/ubuntu/pool/main/f/foo/foo_1.0_arm64.deb", debHashArm64, "arm64"},
+		{"/ubuntu/pool/main/f/foo/foo_1.0_i386.deb", debHashI386, "i386"},
+	} {
+		ph, err := c.GetPackageHash(context.Background(),
+			suite.CanonicalScheme, suite.CanonicalHost, expected.path, snapshotID)
+		if err != nil {
+			t.Errorf("missing package_hash for %s (%s): %v", expected.path, expected.arch, err)
+			continue
+		}
+		if ph.DeclaredSHA256 != expected.hash {
+			t.Errorf("package_hash %s declared = %s, want %s",
+				expected.path, ph.DeclaredSHA256, expected.hash)
+		}
+	}
+
+	// No skips with the empty-filter config.
+	out := logBuf.String()
+	if strings.Contains(out, `"reason":"arch_not_in_allowlist"`) {
+		t.Errorf("unexpected arch_not_in_allowlist log line with empty filter:\n%s", out)
+	}
+}
+
+// SPEC6_5 §6.2.2 / §15 #6: [adoption].architectures = ["amd64"] keeps
+// only the amd64 Packages member; arm64 / i386 Packages are skipped at
+// the filter step (no upstream fetch), no package_hash rows are
+// inserted for the non-amd64 arches, and the per-skip Warn carries
+// reason="arch_not_in_allowlist".
+func TestAdopter_MultiArch_AllowlistFiltersOutOtherArchs(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ff := newFakeFetcher()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:         c,
+		Fetcher:       ff,
+		Verifier:      passThroughVerifier{},
+		HostLimiter:   hostsem.New(8),
+		Logger:        logger,
+		Architectures: []string{"amd64"},
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	suite := SuiteRef{
+		CanonicalScheme: "http",
+		CanonicalHost:   "archive.ubuntu.com",
+		SuitePath:       "/ubuntu/dists/noble",
+	}
+
+	debHashAmd64 := strings.Repeat("a", 64)
+	debHashArm64 := strings.Repeat("b", 64)
+	pkgsAmd64 := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.0_amd64.deb": debHashAmd64,
+	})
+	pkgsArm64 := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.0_arm64.deb": debHashArm64,
+	})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgsAmd64,
+		"main/binary-arm64/Packages": pkgsArm64,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	ff.put(base+"main/binary-amd64/Packages", pkgsAmd64)
+	// Deliberately seed arm64 too — the filter must skip without fetching.
+	ff.put(base+"main/binary-arm64/Packages", pkgsArm64)
+
+	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Exactly one declared-member fetch (amd64). The arm64 path is
+	// filtered upfront — no upstream call.
+	if got := ff.calls.Load(); got != 1 {
+		t.Errorf("fetch calls = %d, want 1 (arm64 should be filter-skipped without upstream contact)", got)
+	}
+
+	sf, err := c.GetSuiteFreshness(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil {
+		t.Fatal("current_snapshot_id not set")
+	}
+	snapshotID := *sf.CurrentSnapshotID
+
+	// amd64 .deb has a package_hash row.
+	amd64Path := "/ubuntu/pool/main/f/foo/foo_1.0_amd64.deb"
+	if _, err := c.GetPackageHash(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost, amd64Path, snapshotID); err != nil {
+		t.Errorf("missing package_hash for amd64 .deb: %v", err)
+	}
+
+	// arm64 .deb has NO package_hash row (its Packages was never adopted).
+	arm64Path := "/ubuntu/pool/main/f/foo/foo_1.0_arm64.deb"
+	if _, err := c.GetPackageHash(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost, arm64Path, snapshotID); !errors.Is(err, cache.ErrNotFound) {
+		t.Errorf("arm64 .deb should have no package_hash row, got err=%v (wanted ErrNotFound)", err)
+	}
+
+	// adoption_member_skipped Warn with the new reason.
+	out := logBuf.String()
+	if !strings.Contains(out, `"reason":"arch_not_in_allowlist"`) {
+		t.Errorf("expected adoption_member_skipped reason=arch_not_in_allowlist, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"architecture":"arm64"`) {
+		t.Errorf("expected architecture=arm64 in skip log, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"path":"main/binary-arm64/Packages"`) {
+		t.Errorf("expected filtered arm64 Packages path in skip log, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"skipped_count":1`) {
+		t.Errorf("expected skipped_count:1 in adoption_success log, got:\n%s", out)
+	}
+}
+
+// SPEC6_5 §1.3 / §5.1: the pseudo-arch "source" gates Sources adoption.
+// architectures = ["amd64", "source"] keeps amd64 binary indices and
+// the source/Sources index; an arm64/binary-arm64 index is filtered out
+// even though the binary-amd64 index is kept.
+func TestAdopter_MultiArch_AllowlistKeepsSourcePseudoArch(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ff := newFakeFetcher()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:         c,
+		Fetcher:       ff,
+		Verifier:      passThroughVerifier{},
+		HostLimiter:   hostsem.New(8),
+		Logger:        logger,
+		Architectures: []string{"amd64", "source"},
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	suite := SuiteRef{
+		CanonicalScheme: "http",
+		CanonicalHost:   "archive.ubuntu.com",
+		SuitePath:       "/ubuntu/dists/noble",
+	}
+
+	pkgsAmd64 := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.0_amd64.deb": strings.Repeat("a", 64),
+	})
+	pkgsArm64 := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.0_arm64.deb": strings.Repeat("b", 64),
+	})
+	srcBody := []byte("Sources content")
+
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgsAmd64,
+		"main/binary-arm64/Packages": pkgsArm64,
+		"main/source/Sources":        srcBody,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	ff.put(base+"main/binary-amd64/Packages", pkgsAmd64)
+	ff.put(base+"main/binary-arm64/Packages", pkgsArm64)
+	ff.put(base+"main/source/Sources", srcBody)
+
+	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Two fetches: amd64 Packages + source Sources. arm64 was filtered.
+	if got := ff.calls.Load(); got != 2 {
+		t.Errorf("fetch calls = %d, want 2 (amd64 + source kept; arm64 filtered)", got)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, `"reason":"arch_not_in_allowlist"`) ||
+		!strings.Contains(out, `"architecture":"arm64"`) {
+		t.Errorf("expected arm64 to be filtered with arch_not_in_allowlist reason, got:\n%s", out)
+	}
+	if strings.Contains(out, `"architecture":"source"`) {
+		t.Errorf("source Sources should not be skipped (it is in the allowlist), got:\n%s", out)
+	}
+}

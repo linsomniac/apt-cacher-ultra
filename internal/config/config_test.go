@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -1357,5 +1358,128 @@ func TestValidateAdvertiseHost(t *testing.T) {
 				t.Errorf("input %q: want no error, got %v", tc.input, err)
 			}
 		})
+	}
+}
+
+// SPEC6_5 §5.1: omitted [adoption].architectures yields an empty slice.
+// The empty case is the Phase 6 backward-compatible default.
+func TestLoad_AdoptionArchitecturesDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Adoption.Architectures) != 0 {
+		t.Errorf("architectures default = %v, want empty", cfg.Adoption.Architectures)
+	}
+}
+
+// SPEC6_5 §5.1: a non-empty list is preserved verbatim through Load.
+func TestLoad_AdoptionArchitecturesRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[adoption]
+architectures = ["amd64", "arm64", "source"]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.Adoption.Architectures
+	want := []string{"amd64", "arm64", "source"}
+	if len(got) != len(want) {
+		t.Fatalf("architectures len = %d, want %d (got %v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("architectures[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// SPEC6_5 §5.2 H1: architectures_invalid_value — entries failing the
+// shape predicate (lowercase letters/digits, leading letter) abort startup.
+func TestValidate_RejectsArchitecturesInvalidValue(t *testing.T) {
+	cases := []struct {
+		name string
+		arch string
+	}{
+		{"uppercase", "AMD64"},
+		{"underscore", "x86_64"},
+		{"hyphen", "kfreebsd-amd64"},
+		{"empty", ""},
+		{"leading-digit", "64bit"},
+		{"trailing-dot", "amd64."},
+		{"space", "amd 64"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[adoption]
+architectures = ["`+tc.arch+`"]
+`)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("input %q: want error, got nil", tc.arch)
+			}
+			if !strings.Contains(err.Error(), "architectures_invalid_value") {
+				t.Errorf("input %q: error %q does not name architectures_invalid_value", tc.arch, err)
+			}
+		})
+	}
+}
+
+// SPEC6_5 §5.2 H2: architectures_too_many — > 32 entries aborts startup.
+func TestValidate_RejectsTooManyArchitectures(t *testing.T) {
+	dir := t.TempDir()
+	entries := make([]string, MaxArchitecturesEntries+1)
+	for i := range entries {
+		entries[i] = fmt.Sprintf(`"a%d"`, i)
+	}
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[adoption]
+architectures = [`+strings.Join(entries, ", ")+`]
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "architectures_too_many") {
+		t.Errorf("error %q does not name architectures_too_many", err)
+	}
+}
+
+// SPEC6_5 §5.2: well-formed Debian arch names plus the "source"
+// pseudo-arch all pass validation.
+func TestValidate_AcceptsValidArchitectures(t *testing.T) {
+	cases := []string{"amd64", "arm64", "armhf", "armel", "i386", "ppc64el", "s390x", "riscv64", "mips64el", "source"}
+	dir := t.TempDir()
+	entries := make([]string, len(cases))
+	for i, a := range cases {
+		entries[i] = fmt.Sprintf(`%q`, a)
+	}
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[adoption]
+architectures = [`+strings.Join(entries, ", ")+`]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v (architectures should validate)", err)
+	}
+	if len(cfg.Adoption.Architectures) != len(cases) {
+		t.Errorf("architectures len = %d, want %d", len(cfg.Adoption.Architectures), len(cases))
 	}
 }

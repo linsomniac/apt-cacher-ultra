@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -92,6 +93,34 @@ var (
 	ErrAdoptionUnpinnedSuite = errors.New("adoption_unpinned_suite")
 )
 
+// archFilterBinaryRE matches the binary-arch index file shapes that the
+// SPEC6_5 §7.2 architecture filter scopes to: Packages files (and their
+// compressed variants) plus the Packages.diff/Index pdiff manifest. Per-
+// component-arch Release files (binary-<arch>/Release) and Contents-*
+// files are deliberately NOT covered — they pass through the filter.
+var archFilterBinaryRE = regexp.MustCompile(`(?:^|/)binary-([a-z][a-z0-9]*)/(?:Packages(?:\.(?:gz|xz|bz2))?|Packages\.diff/Index)$`)
+
+// archFilterSourceRE matches the source-component index files (Sources
+// and Sources.diff/Index) — the §7.2 filter treats these under the
+// pseudo-arch "source".
+var archFilterSourceRE = regexp.MustCompile(`(?:^|/)source/(?:Sources(?:\.(?:gz|xz|bz2))?|Sources\.diff/Index)$`)
+
+// archFromFilteredPath inspects a Release member's suite-relative path
+// and reports the architecture tag the SPEC6_5 §7.2 filter would key on.
+// Returns ("amd64", true) for "main/binary-amd64/Packages.gz", returns
+// ("source", true) for "main/source/Sources.xz", returns ("", false) for
+// any path the filter does not scope to (Release.gpg, Contents-*, i18n
+// translations, per-component-arch Release files, etc.).
+func archFromFilteredPath(p string) (arch string, filtered bool) {
+	if m := archFilterBinaryRE.FindStringSubmatch(p); m != nil {
+		return m[1], true
+	}
+	if archFilterSourceRE.MatchString(p) {
+		return "source", true
+	}
+	return "", false
+}
+
 // errAdoptionMemberSkipped is the in-package signal from adoptMember
 // that the upstream returned 4xx for a declared Release member. Step 5
 // of runShared catches this with errors.Is, increments skippedCount,
@@ -145,6 +174,14 @@ type AdoptionConfig struct {
 	// pass gc.heartbeat_interval, validated to > 0 by config.
 	HeartbeatInterval time.Duration
 
+	// Architectures is the SPEC6_5 §5.1 [adoption].architectures
+	// allowlist. Empty preserves Phase 6 behavior (every Release-listed
+	// per-arch / per-source index is adopted). Non-empty restricts
+	// adoption to the listed binary-<arch>/ and (optionally) source/
+	// indices per §7.2. Validated by the config layer; this field
+	// receives only well-formed values.
+	Architectures []string
+
 	Logger *slog.Logger
 
 	// now is a test seam; production uses time.Now.
@@ -179,6 +216,12 @@ type Adopter struct {
 	// disables the ticker (used by tests; production main always
 	// passes a positive value validated by the [gc] config block).
 	heartbeatInterval time.Duration
+
+	// architectureAllowlist is the precomputed SPEC6_5 §7.2 lookup set.
+	// nil = filter inert (preserves Phase 6 behavior); non-nil = arch
+	// must be a key in the map for binary-<arch>/ and source/ index
+	// members to be adopted.
+	architectureAllowlist map[string]struct{}
 
 	logger *slog.Logger
 	now    func() time.Time
@@ -223,17 +266,25 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 	if cfg.MaxConcurrent > 0 {
 		sem = make(chan struct{}, cfg.MaxConcurrent)
 	}
+	var allowlist map[string]struct{}
+	if len(cfg.Architectures) > 0 {
+		allowlist = make(map[string]struct{}, len(cfg.Architectures))
+		for _, arch := range cfg.Architectures {
+			allowlist[arch] = struct{}{}
+		}
+	}
 	return &Adopter{
-		cache:             cfg.Cache,
-		fetcher:           cfg.Fetcher,
-		verifier:          cfg.Verifier,
-		hostSem:           cfg.HostLimiter,
-		concurrencySem:    sem,
-		hotPackagesWindow: cfg.HotPackagesWindow,
-		hotPrefetchBudget: cfg.HotPrefetchBudget,
-		heartbeatInterval: cfg.HeartbeatInterval,
-		logger:            logger,
-		now:               now,
+		cache:                 cfg.Cache,
+		fetcher:               cfg.Fetcher,
+		verifier:              cfg.Verifier,
+		hostSem:               cfg.HostLimiter,
+		concurrencySem:        sem,
+		hotPackagesWindow:     cfg.HotPackagesWindow,
+		hotPrefetchBudget:     cfg.HotPrefetchBudget,
+		heartbeatInterval:     cfg.HeartbeatInterval,
+		architectureAllowlist: allowlist,
+		logger:                logger,
+		now:                   now,
 	}, nil
 }
 
@@ -659,6 +710,27 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	fetchedMembers := make([]ReleaseMember, 0, len(members))
 	skippedCount := 0
 	for _, m := range members {
+		// SPEC6_5 §7.2: per-arch / per-source index filter. Inert when
+		// the allowlist is empty (Phase 6 default). Skipped members never
+		// reach upstream — saves bandwidth and pool disk on caches whose
+		// clients only fetch a subset of the upstream's published arches.
+		if a.architectureAllowlist != nil {
+			if arch, filtered := archFromFilteredPath(m.Path); filtered {
+				if _, ok := a.architectureAllowlist[arch]; !ok {
+					a.logger.Warn("adoption_member_skipped",
+						"canonical_host", suite.CanonicalHost,
+						"suite_path", suite.SuitePath,
+						"path", m.Path,
+						"declared_sha256", m.SHA256,
+						"reason", "arch_not_in_allowlist",
+						"architecture", arch,
+					)
+					skippedCount++
+					continue
+				}
+			}
+		}
+
 		blobHash, err := a.adoptMember(ctx, suite, m)
 		if err != nil {
 			if errors.Is(err, errAdoptionMemberSkipped) {
@@ -1003,6 +1075,7 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 				"path", m.Path,
 				"declared_sha256", m.SHA256,
 				"upstream_status", se.Code,
+				"reason", "upstream_4xx",
 			)
 			return "", errAdoptionMemberSkipped
 		}

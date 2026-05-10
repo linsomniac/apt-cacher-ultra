@@ -906,6 +906,7 @@ func buildAdopter(
 		HotPackagesWindow: cfg.HotPackages.Window.Duration,
 		HotPrefetchBudget: cfg.Adoption.HotPrefetchBudget.Duration,
 		HeartbeatInterval: cfg.GC.HeartbeatInterval.Duration,
+		Architectures:     cfg.Adoption.Architectures,
 		Logger:            logger,
 	})
 	if err != nil {

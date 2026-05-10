@@ -43,6 +43,19 @@ var DefaultDenyTargetRanges = []string{
 	"::ffff:127.0.0.0/104",
 }
 
+// architectureNameRE is the SPEC6_5 §5.2 shape predicate for a single
+// entry in [adoption].architectures: lowercase ASCII letters and digits,
+// must start with a letter. Matches "amd64", "arm64", "i386", "ppc64el",
+// "s390x", and the pseudo-arch "source"; rejects "AMD64", "x86_64", and
+// hyphenated alternative-OS arches like "kfreebsd-amd64". Operators
+// needing alternative-OS arches amend the spec.
+var architectureNameRE = regexp.MustCompile(`^[a-z][a-z0-9]*$`)
+
+// MaxArchitecturesEntries caps the [adoption].architectures list size
+// per SPEC6_5 §5.2 H2. Real fleets care about ≤ 5 arches; the cap is an
+// anti-foot-gun guard.
+const MaxArchitecturesEntries = 32
+
 // Config is the top-level structure of config.toml.
 type Config struct {
 	Cache          CacheConfig       `toml:"cache"`
@@ -152,6 +165,15 @@ type AdoptionConfig struct {
 	// Presence-sensitive: explicit 0 means "operator opted out of the
 	// wall-clock guard" and is preserved through Load.
 	HotPrefetchBudget Duration `toml:"hot_prefetch_budget"`
+
+	// Architectures is the SPEC6_5 §5.1 per-arch adoption allowlist.
+	// Empty (default) preserves Phase 6 behavior: every Release-listed
+	// Packages / Sources / *.diff/Index file is adopted. Non-empty:
+	// only members under binary-<arch>/ or source/ where <arch> is
+	// listed are adopted. The pseudo-arch "source" controls Sources
+	// adoption; non-arch members (Release.gpg, Contents-*, i18n) are
+	// not subject to the filter. Validated against architectureNameRE.
+	Architectures []string `toml:"architectures"`
 }
 
 // HotPackagesConfig holds the SPEC3 §5.1 [hot_packages] block. The hot
@@ -684,6 +706,17 @@ func (c *Config) Validate() error {
 	}
 	if c.Adoption.HotPrefetchBudget.Duration < 0 {
 		errs = append(errs, errors.New("adoption.hot_prefetch_budget must not be negative"))
+	}
+
+	// SPEC6_5 §5.2: [adoption].architectures shape and cardinality.
+	if len(c.Adoption.Architectures) > MaxArchitecturesEntries {
+		errs = append(errs, fmt.Errorf("adoption.architectures: architectures_too_many (%d entries; max %d)",
+			len(c.Adoption.Architectures), MaxArchitecturesEntries))
+	}
+	for _, arch := range c.Adoption.Architectures {
+		if !architectureNameRE.MatchString(arch) {
+			errs = append(errs, fmt.Errorf("adoption.architectures: architectures_invalid_value %q (expected lowercase letters/digits, must start with a letter)", arch))
+		}
 	}
 
 	// SPEC4 §5.2: [gc] block validation.
