@@ -302,3 +302,79 @@ func TestStatusHTML_RepoCoverage_UnfilteredRendersHint(t *testing.T) {
 		t.Errorf("HTML missing the (unfiltered) hint when no filter is configured; got:\n%s", html)
 	}
 }
+
+// TestStatusJSON_RepoCoverage_PdiffPathClassifierIsCaseSensitive:
+// regression for codex review on commit 898cbfe — the SQLite default
+// LIKE operator is ASCII case-insensitive, which would let a lowercase
+// "packages.diff/foo.gz" path leak into the pdiff bucket here even
+// though handler.classifyPath would not call it pdiff at serve time.
+// GetRepoCoverage uses GLOB (case-sensitive) for parity with the
+// classifier; this test pins that property by seeding lowercase
+// near-matches and asserting they are NOT counted as pdiff.
+func TestStatusJSON_RepoCoverage_PdiffPathClassifierIsCaseSensitive(t *testing.T) {
+	s, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	const (
+		scheme = "http"
+		host   = "archive.ubuntu.com"
+		suite  = "/ubuntu/dists/noble"
+	)
+	hash := strings.Repeat("b", 64)
+	pkgs := []cache.PackageHash{
+		// Lowercase "packages.diff" — handler.classifyPath calls this
+		// "other", not "pdiff". GetRepoCoverage must agree by using GLOB.
+		{
+			CanonicalScheme: scheme, CanonicalHost: host,
+			Path: "/ubuntu/main/binary-amd64/packages.diff/2026-05-09-1234.56.gz",
+			DeclaredSHA256: hash, Architecture: "amd64",
+		},
+		// Lowercase "sources.diff" — same case, source bucket.
+		{
+			CanonicalScheme: scheme, CanonicalHost: host,
+			Path: "/ubuntu/main/source/sources.diff/2026-05-09-1234.56.gz",
+			DeclaredSHA256: hash, Architecture: "source", PackageName: "bash",
+		},
+	}
+	memberPaths := []string{
+		// Lowercase Index path — must NOT inflate snapshots_with_pdiff.
+		"main/binary-amd64/packages.diff/Index",
+	}
+	seedRepoCoverageSnapshot(t, s.cfg.Cache, scheme, host, suite, memberPaths, pkgs)
+
+	resp := mustGet(t, base+"/?format=json")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var got struct {
+		RepoCoverage struct {
+			SnapshotsWithPdiff int64 `json:"snapshots_with_pdiff"`
+			PackageHashRows    struct {
+				Binary int64 `json:"binary"`
+				Source int64 `json:"source"`
+				Pdiff  int64 `json:"pdiff"`
+			} `json:"package_hash_rows"`
+		} `json:"repo_coverage"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v\nbody: %s", err, body)
+	}
+
+	rc := got.RepoCoverage
+	if rc.PackageHashRows.Pdiff != 0 {
+		t.Errorf("lowercase packages.diff/sources.diff paths leaked into pdiff bucket: got %d, want 0",
+			rc.PackageHashRows.Pdiff)
+	}
+	if rc.SnapshotsWithPdiff != 0 {
+		t.Errorf("lowercase packages.diff/Index leaked into snapshots_with_pdiff: got %d, want 0",
+			rc.SnapshotsWithPdiff)
+	}
+	// Sanity: the rows still land somewhere — the amd64 row goes to
+	// "other" (kind=other isn't surfaced in the JSON contract, but it
+	// counts toward Total via PackageHashRowsTotal). The source row
+	// goes to source.
+	if rc.PackageHashRows.Source != 1 {
+		t.Errorf("lowercase sources.diff path with arch=source did not fall to source bucket: got %d, want 1",
+			rc.PackageHashRows.Source)
+	}
+}

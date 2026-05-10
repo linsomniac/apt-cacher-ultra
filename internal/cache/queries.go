@@ -320,13 +320,40 @@ func (c *Cache) GetCacheStats(ctx context.Context) (CacheStats, error) {
 // non-empty architecture → kind=binary. Architecture-empty rows
 // (legacy adoptions before SPEC3 v3, or future kind extensions) fall
 // into the "other" bucket and are excluded from the binary tally.
+//
+// AIDEV-NOTE: pdiff path predicates use SQLite GLOB rather than LIKE so
+// they match the case-sensitive serve-time classifier in handler.go.
+// SQLite's default LIKE is ASCII case-insensitive, which would let a
+// lowercase "packages.diff/" path slip into the pdiff bucket here while
+// classifyPath would not call it pdiff at serve time.
+//
+// AIDEV-NOTE: the four reads run inside a single read-only transaction
+// so a concurrent CommitAdoption between statements cannot make the
+// architectures_seen / snapshot counts / row totals describe different
+// moments. Without the transaction, callers could observe a row total
+// that is internally inconsistent with the architectures list.
+//
+// AIDEV-NOTE: this method is invoked from the admin status renderer on
+// every /?format=json hit. For typical deployments (≤ a few thousand
+// package_hash rows per snapshot), the four aggregates complete well
+// inside the §9.7.3 5s per-query budget. A future slice could move
+// these to the §9.7.6 refresher-cached path if scale tests show this
+// becoming a bottleneck — at that point the cache.RepoCoverage value
+// would be recomputed on the gauge_refresh tick and served from an
+// atomic.Pointer rather than recomputed live.
 func (c *Cache) GetRepoCoverage(ctx context.Context) (RepoCoverage, error) {
 	var r RepoCoverage
+
+	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage begin tx: %w", err)
+	}
+	defer tx.Rollback()
 
 	// architectures_seen: distinct arch values across current snapshots'
 	// package_hash rows, excluding empty (Phase 2 pre-v3 rows have ""
 	// arch and shouldn't surface).
-	rows, err := c.db.QueryContext(ctx, `
+	rows, err := tx.QueryContext(ctx, `
 SELECT DISTINCT p.architecture
 FROM package_hash p
 JOIN suite_freshness sf
@@ -354,7 +381,7 @@ ORDER BY p.architecture`)
 
 	// snapshots_with_sources: current snapshots having >=1 row with
 	// architecture=source.
-	if err := c.db.QueryRowContext(ctx, `
+	if err := tx.QueryRowContext(ctx, `
 SELECT count(DISTINCT sf.current_snapshot_id)
 FROM package_hash p
 JOIN suite_freshness sf
@@ -366,14 +393,15 @@ WHERE p.architecture = 'source'`).Scan(&r.SnapshotsWithSources); err != nil {
 	}
 
 	// snapshots_with_pdiff: current snapshots having >=1 *.diff/Index
-	// in snapshot_member.
-	if err := c.db.QueryRowContext(ctx, `
+	// in snapshot_member. GLOB (case-sensitive) used so a lowercase
+	// "packages.diff/index" cannot inflate the count.
+	if err := tx.QueryRowContext(ctx, `
 SELECT count(DISTINCT sf.current_snapshot_id)
 FROM snapshot_member m
 JOIN suite_freshness sf
   ON sf.current_snapshot_id = m.snapshot_id
-WHERE m.path LIKE '%/Packages.diff/Index'
-   OR m.path LIKE '%/Sources.diff/Index'`).Scan(&r.SnapshotsWithPdiff); err != nil {
+WHERE m.path GLOB '*/Packages.diff/Index'
+   OR m.path GLOB '*/Sources.diff/Index'`).Scan(&r.SnapshotsWithPdiff); err != nil {
 		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage snapshots_with_pdiff: %w", err)
 	}
 
@@ -382,11 +410,12 @@ WHERE m.path LIKE '%/Packages.diff/Index'
 	// under /<thing>.diff/ regardless of arch label, so the pdiff
 	// branch must check the path BEFORE the arch=source branch (a
 	// hypothetical Sources.diff/<patch>.gz would otherwise be
-	// double-counted as both source and pdiff).
-	rowsByKind, err := c.db.QueryContext(ctx, `
+	// double-counted as both source and pdiff). GLOB is used (rather
+	// than LIKE) for case-sensitivity parity with handler.classifyPath.
+	rowsByKind, err := tx.QueryContext(ctx, `
 SELECT
   CASE
-    WHEN p.path LIKE '%/Packages.diff/%' OR p.path LIKE '%/Sources.diff/%' THEN 'pdiff'
+    WHEN p.path GLOB '*/Packages.diff/*' OR p.path GLOB '*/Sources.diff/*' THEN 'pdiff'
     WHEN p.architecture = 'source' THEN 'source'
     WHEN p.architecture != '' THEN 'binary'
     ELSE 'other'
