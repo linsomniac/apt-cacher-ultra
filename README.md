@@ -72,7 +72,7 @@ For apt repositories using https, you have these choices:
 
 - Make no changes, but apt-cacher-ultra does not cache the associated packages
 - Set up an MITM proxy (see the next section).
-- Replace "https://" with "http://HTTPS///" in the sources.list entry.
+- Replace `https://` with `http://HTTPS///` in the sources.list entry, **or** set up MITM proxy.
 
 ### Enable the MITM HTTPS proxy (optional):
 
