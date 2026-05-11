@@ -1,0 +1,96 @@
+name: Release
+
+# Fires on bare version tags (no `v` prefix), matching the 0.1.0 / 0.9.0
+# convention already in use. Patterns like 0.9.0-rc1 are accepted too,
+# which lets us cut release candidates without changing this file.
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Pin nfpm so a goreleaser release does not silently change the
+      # output .deb layout under us. Bump deliberately.
+      NFPM_VERSION: 2.43.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git archive <tag>` and any future
+          # `git describe` invocations work; shallow clones drop tags
+          # and the archive step would fail.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Derive version
+        id: vars
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Release version: ${VERSION}"
+
+      - name: Build binary
+        run: make build VERSION='${{ steps.vars.outputs.version }}'
+
+      - name: Install nfpm
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          sudo tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: Build .deb
+        run: make deb VERSION='${{ steps.vars.outputs.version }}'
+
+      - name: Stage release artifacts
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.vars.outputs.version }}'
+          mkdir -p dist
+
+          # Raw Go binary, renamed to include version + platform so it
+          # is self-identifying after download.
+          cp build/apt-cacher-ultra "dist/apt-cacher-ultra-${VERSION}-linux-amd64"
+
+          # The .deb keeps nfpm's Debian-conventional naming
+          # (apt-cacher-ultra_<version>_amd64.deb) so apt tooling
+          # downstream can recognise it without renaming.
+          cp "build/apt-cacher-ultra_${VERSION}_amd64.deb" dist/
+
+          # Source archive from the tag, prefixed so it expands into a
+          # versioned directory.
+          git archive \
+            --format=tar.gz \
+            --prefix="apt-cacher-ultra-${VERSION}/" \
+            -o "dist/apt-cacher-ultra-${VERSION}-source.tar.gz" \
+            "${GITHUB_REF_NAME}"
+
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -lh dist/
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: apt-cacher-ultra ${{ steps.vars.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(steps.vars.outputs.version, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/apt-cacher-ultra-${{ steps.vars.outputs.version }}-linux-amd64
+            dist/apt-cacher-ultra_${{ steps.vars.outputs.version }}_amd64.deb
+            dist/apt-cacher-ultra-${{ steps.vars.outputs.version }}-source.tar.gz
+            dist/SHA256SUMS
