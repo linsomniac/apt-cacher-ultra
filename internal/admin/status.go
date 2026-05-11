@@ -622,8 +622,8 @@ func chooseFormat(r *http.Request) string {
 // html/template auto-escapes every interpolated value; never
 // switch to text/template without a full security review.
 var statusHTMLTemplate = template.Must(template.New("status").Funcs(template.FuncMap{
-	"unixTime":     formatUnixTime,
-	"unixTimePtr":  formatUnixTimePtr,
+	"unixTime":     formatUnixTimeTag,
+	"unixTimePtr":  formatUnixTimePtrTag,
 	"formatBytes":  formatBytes,
 	"durationOf":   durationOf,
 	"i64Ptr":       formatInt64Ptr,
@@ -656,7 +656,7 @@ code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
 <a class="json-link" href="/?format=json">View as JSON →</a></h1>
 
 <p class="muted">
-  Started {{unixTime .Process.StartedUnixTime}} UTC,
+  Started {{unixTime .Process.StartedUnixTime}},
   uptime {{durationOf .Process.UptimeSeconds}}.
   Build {{.Process.VCSRevision}} ({{.Process.GoVersion}}).
 </p>
@@ -673,12 +673,12 @@ code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
 <table>
 <tr><td>CA source</td><td>{{.TLSMITM.CASource}}</td></tr>
 <tr><td>CA SHA-256 fingerprint</td><td><code>{{.TLSMITM.CAFingerprintSHA256}}</code></td></tr>
-<tr><td>CA not_after</td><td>{{unixTime .TLSMITM.CANotAfterUnixTime}} UTC</td></tr>
+<tr><td>CA not_after</td><td>{{unixTime .TLSMITM.CANotAfterUnixTime}}</td></tr>
 <tr><td>Effective allowlist</td><td><code>{{defaultEmpty .TLSMITM.EffectiveAllowlist "(none — vacuously true)"}}</code></td></tr>
 <tr><td>Cert cache</td><td>{{.TLSMITM.CertCache.Size}} / {{.TLSMITM.CertCache.Capacity}}</td></tr>
 <tr><td>Last cert issued</td>
 {{- if .TLSMITM.LastIssued}}
-<td><code>{{.TLSMITM.LastIssued.Host}}</code> @ {{unixTime .TLSMITM.LastIssued.AtUnixTime}} UTC</td>
+<td><code>{{.TLSMITM.LastIssued.Host}}</code> @ {{unixTime .TLSMITM.LastIssued.AtUnixTime}}</td>
 {{- else}}<td class="muted">(none yet)</td>{{end}}</tr>
 <tr><td>Cert hit rate (60s)</td><td>{{hitRatePct .TLSMITM.HitRate60sPercent .TLSMITM.HitRate60sObserved}}</td></tr>
 </table>
@@ -754,7 +754,7 @@ code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
 <h2>Garbage collection</h2>
 {{if .GC.LastRunUnixTime}}
 <table>
-<tr><td>Last run</td><td>{{unixTimePtr .GC.LastRunUnixTime}} UTC ({{.GC.LastRunPhase}})</td></tr>
+<tr><td>Last run</td><td>{{unixTimePtr .GC.LastRunUnixTime}} ({{.GC.LastRunPhase}})</td></tr>
 <tr><td>Duration</td><td>{{.GC.LastRunDurationSeconds}}s</td></tr>
 <tr><td>Blobs reaped</td><td>{{.GC.LastRunBlobsReaped}}</td></tr>
 <tr><td>Bytes reclaimed</td><td>{{formatBytes .GC.LastRunBytesReclaimed}}</td></tr>
@@ -810,6 +810,36 @@ code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
 {{else if lt .Process.UptimeSeconds 300}}<p class="muted">(empty since last process start)</p>{{end}}
 
 <p><a href="/metrics">/metrics</a> &middot; <a href="/healthz">/healthz</a></p>
+<script>
+// Rewrite every <time data-unix=N> textContent to browser-local time.
+// If the browser can't resolve a timezone (no Intl, JS disabled, etc.),
+// the server-rendered UTC string remains in place as the fallback.
+(function () {
+  var tz;
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) {}
+  if (!tz) return;
+
+  var pad = function (n) { return n < 10 ? "0" + n : "" + n; };
+  var tzShort = "";
+  try {
+    var parts = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
+      .formatToParts(new Date());
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].type === "timeZoneName") { tzShort = parts[i].value; break; }
+    }
+  } catch (e) {}
+
+  var nodes = document.querySelectorAll("time[data-unix]");
+  for (var i = 0; i < nodes.length; i++) {
+    var u = parseInt(nodes[i].getAttribute("data-unix"), 10);
+    if (!isFinite(u)) continue;
+    var d = new Date(u * 1000);
+    var s = d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+            " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    nodes[i].textContent = tzShort ? (s + " " + tzShort) : s;
+  }
+})();
+</script>
 </body>
 </html>
 `
@@ -828,6 +858,40 @@ func formatUnixTimePtr(unix *int64) string {
 		return "-"
 	}
 	return formatUnixTime(*unix)
+}
+
+// AIDEV-NOTE: formatUnixTimeTag returns template.HTML, bypassing
+// html/template auto-escaping (per the security note at the
+// statusHTMLTemplate definition). This is safe ONLY because every
+// byte of output is produced from int64 + time.Format with fixed
+// ASCII layouts — there is no path for user-controlled data to
+// reach the rendered string. Do not extend the format to include
+// any externally-sourced field without re-escaping.
+//
+// The emitted <time data-unix=…> element carries the raw unix
+// seconds; the inline script at the bottom of the status page
+// rewrites textContent to browser-local time at load. The
+// server-rendered UTC string is the fallback when JS is disabled
+// or Intl.DateTimeFormat cannot resolve a timezone.
+func formatUnixTimeTag(unix int64) template.HTML {
+	if unix == 0 {
+		return ""
+	}
+	t := time.Unix(unix, 0).UTC()
+	utc := t.Format("2006-01-02 15:04:05")
+	iso := t.Format("2006-01-02T15:04:05Z")
+	return template.HTML(fmt.Sprintf(
+		`<time datetime="%s" data-unix="%d" title="%s UTC">%s UTC</time>`,
+		iso, unix, utc, utc,
+	))
+}
+
+// formatUnixTimePtrTag renders a *int64 as a <time> tag; nil → "-".
+func formatUnixTimePtrTag(unix *int64) template.HTML {
+	if unix == nil {
+		return "-"
+	}
+	return formatUnixTimeTag(*unix)
 }
 
 // formatInt64Ptr renders a *int64; nil → "-".

@@ -365,6 +365,15 @@ func TestStatusHTML_RendersWithoutPanic(t *testing.T) {
 	if !strings.Contains(string(body), "/metrics") {
 		t.Errorf("HTML missing /metrics link")
 	}
+	// The process StartedUnixTime is always non-zero, so a <time
+	// …data-unix="…"…> element must appear at minimum for it.
+	if !strings.Contains(string(body), `data-unix="`) || !strings.Contains(string(body), `<time `) {
+		t.Errorf("HTML missing <time …data-unix=…> markup for client-side local-time rewrite")
+	}
+	// The inline script that rewrites <time> elements must be present.
+	if !strings.Contains(string(body), "Intl.DateTimeFormat") {
+		t.Errorf("HTML missing inline local-time rewrite script")
+	}
 }
 
 func TestEndpoint_Status_JSONOverridesAccept(t *testing.T) {
@@ -1107,3 +1116,39 @@ func TestFormatHitRatePercent(t *testing.T) {
 }
 
 func float64Ptr(v float64) *float64 { return &v }
+
+// TestFormatUnixTimeTag pins the <time> element shape used by the
+// inline browser-local-time rewrite. Zero → empty (no element);
+// non-zero → a closed <time> tag carrying datetime, data-unix, and
+// a title attribute, plus the UTC fallback text content.
+func TestFormatUnixTimeTag(t *testing.T) {
+	if got := formatUnixTimeTag(0); got != "" {
+		t.Errorf("formatUnixTimeTag(0) = %q, want empty", got)
+	}
+	// 1715443200 = 2024-05-11 16:00:00 UTC.
+	const unix = int64(1715443200)
+	got := string(formatUnixTimeTag(unix))
+	wants := []string{
+		`<time `,
+		`data-unix="1715443200"`,
+		`datetime="2024-05-11T16:00:00Z"`,
+		`title="2024-05-11 16:00:00 UTC"`,
+		`>2024-05-11 16:00:00 UTC</time>`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("formatUnixTimeTag(%d) missing %q; got: %s", unix, w, got)
+		}
+	}
+}
+
+func TestFormatUnixTimePtrTag(t *testing.T) {
+	if got := formatUnixTimePtrTag(nil); got != "-" {
+		t.Errorf("formatUnixTimePtrTag(nil) = %q, want %q", got, "-")
+	}
+	u := int64(1715443200)
+	got := string(formatUnixTimePtrTag(&u))
+	if !strings.Contains(got, `data-unix="1715443200"`) {
+		t.Errorf("formatUnixTimePtrTag(&u) missing data-unix attribute; got: %s", got)
+	}
+}

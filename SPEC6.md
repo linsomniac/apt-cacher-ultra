@@ -1781,8 +1781,15 @@ companion `cert_hit_rate_60s_observed` field is the
 (hits + misses) sample size — surfaced in the JSON so
 consumers can distinguish "0% of 800 lookups" from "no
 data". `ca_not_after_unixtime` is an integer Unix-seconds
-value; the HTML form of the page renders this as a UTC
-timestamp.
+value; the HTML form of the page renders it inside a
+`<time data-unix=…>` element whose server-rendered text
+content is the UTC fallback. An inline script at the
+bottom of the page rewrites every `<time data-unix>`
+element to the browser's local timezone on load; if the
+browser cannot resolve a timezone (no `Intl`, JS
+disabled, etc.) the UTC fallback remains visible. The
+same browser-local-time behavior applies to every other
+timestamp on the page.
 
 The JSON form of the status page (§10.5 schema) carries a
 top-level `tls_mitm` key — always present, abbreviated to
