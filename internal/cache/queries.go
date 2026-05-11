@@ -250,7 +250,7 @@ LEFT JOIN suite_snapshot ss
 	if err != nil {
 		return nil, fmt.Errorf("ListSuitesWithAdoption: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []SuiteWithAdoption
 	for rows.Next() {
 		var s SuiteWithAdoption
@@ -349,7 +349,7 @@ func (c *Cache) GetRepoCoverage(ctx context.Context) (RepoCoverage, error) {
 	if err != nil {
 		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage begin tx: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// architectures_seen: distinct arch values across current snapshots'
 	// package_hash rows, excluding empty (Phase 2 pre-v3 rows have ""
@@ -369,16 +369,16 @@ ORDER BY p.architecture`)
 	for rows.Next() {
 		var a string
 		if err := rows.Scan(&a); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return RepoCoverage{}, fmt.Errorf("GetRepoCoverage architectures_seen scan: %w", err)
 		}
 		r.ArchitecturesSeen = append(r.ArchitecturesSeen, a)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		_ = rows.Close()
 		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage architectures_seen iter: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	// snapshots_with_sources: current snapshots having >=1 row with
 	// architecture=source.
@@ -435,7 +435,7 @@ GROUP BY kind`)
 		var kind string
 		var n int64
 		if err := rowsByKind.Scan(&kind, &n); err != nil {
-			rowsByKind.Close()
+			_ = rowsByKind.Close()
 			return RepoCoverage{}, fmt.Errorf("GetRepoCoverage rows_by_kind scan: %w", err)
 		}
 		switch kind {
@@ -452,10 +452,10 @@ GROUP BY kind`)
 		r.PackageHashRowsTotal += n
 	}
 	if err := rowsByKind.Err(); err != nil {
-		rowsByKind.Close()
+		_ = rowsByKind.Close()
 		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage rows_by_kind iter: %w", err)
 	}
-	rowsByKind.Close()
+	_ = rowsByKind.Close()
 
 	return r, nil
 }
@@ -502,7 +502,7 @@ func (c *Cache) GetCacheSummaryByHostArch(ctx context.Context) (map[string]map[s
 	if err != nil {
 		return nil, fmt.Errorf("GetCacheSummaryByHostArch begin tx: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	out := map[string]map[string]CacheSummaryEntry{}
 	getEntry := func(host, arch string) CacheSummaryEntry {
@@ -536,7 +536,7 @@ GROUP BY p.canonical_host, p.architecture`)
 		var host, arch string
 		var n int64
 		if err := rows.Scan(&host, &arch, &n); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return nil, fmt.Errorf("GetCacheSummaryByHostArch counts scan: %w", err)
 		}
 		e := getEntry(host, arch)
@@ -544,10 +544,10 @@ GROUP BY p.canonical_host, p.architecture`)
 		setEntry(host, arch, e)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		_ = rows.Close()
 		return nil, fmt.Errorf("GetCacheSummaryByHostArch counts iter: %w", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	blobRows, err := tx.QueryContext(ctx, `
 SELECT canonical_host, architecture,
@@ -575,7 +575,7 @@ GROUP BY canonical_host, architecture`)
 		var host, arch string
 		var bc, bb int64
 		if err := blobRows.Scan(&host, &arch, &bc, &bb); err != nil {
-			blobRows.Close()
+			_ = blobRows.Close()
 			return nil, fmt.Errorf("GetCacheSummaryByHostArch blobs scan: %w", err)
 		}
 		e := getEntry(host, arch)
@@ -584,10 +584,10 @@ GROUP BY canonical_host, architecture`)
 		setEntry(host, arch, e)
 	}
 	if err := blobRows.Err(); err != nil {
-		blobRows.Close()
+		_ = blobRows.Close()
 		return nil, fmt.Errorf("GetCacheSummaryByHostArch blobs iter: %w", err)
 	}
-	blobRows.Close()
+	_ = blobRows.Close()
 
 	return out, nil
 }
@@ -660,7 +660,7 @@ SELECT canonical_host, path, is_metadata, request_count, last_requested_at
 	if err != nil {
 		return nil, fmt.Errorf("ListHotURLPaths: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []HotURLPath
 	for rows.Next() {
 		var h HotURLPath
@@ -696,7 +696,7 @@ FROM suite_freshness`
 	if err != nil {
 		return nil, fmt.Errorf("ListSuites: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []SuiteFreshness
 	for rows.Next() {
 		var s SuiteFreshness
@@ -783,7 +783,7 @@ SELECT DISTINCT ph.package_name, ph.architecture
 	if err != nil {
 		return nil, fmt.Errorf("ComputeHotSet stage 1: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type pkgArch struct {
 		pkg, arch string
@@ -830,7 +830,7 @@ SELECT DISTINCT ph.package_name, ph.architecture
 	}
 	out := make([]HotSetEntry, 0, len(pairs))
 	for _, pa := range pairs {
-		matches, ok := candIdx[key{pa.pkg, pa.arch}]
+		matches, ok := candIdx[key(pa)]
 		if !ok {
 			// Hot pair (Package, Arch) is no longer in the candidate
 			// snapshot — upstream removed the package between
@@ -886,7 +886,7 @@ SELECT ss.snapshot_id, ss.package_coverage_complete
 	if err != nil {
 		return nil, fmt.Errorf("HostCurrentSnapshotsCoverage: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []SnapshotCoverage
 	for rows.Next() {
 		var (

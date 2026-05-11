@@ -170,6 +170,10 @@ func TestMITMContextRoundTrip(t *testing.T) {
 	if !IsMITMContext(tagged) {
 		t.Error("WithMITMContext-decorated ctx not detected by IsMITMContext")
 	}
+	// Deliberately exercise the nil-context path to verify
+	// IsMITMContext is nil-safe; staticcheck SA1012 doesn't apply
+	// to a test asserting that nil-tolerance behaviour.
+	//nolint:staticcheck // SA1012: nil context is the property under test
 	if IsMITMContext(nil) {
 		t.Error("nil ctx claims to be MITM")
 	}
@@ -240,7 +244,7 @@ func TestServeCONNECT_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer rawConn.Close()
+	defer func() { _ = rawConn.Close() }()
 
 	if _, err := rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); err != nil {
 		t.Fatalf("write CONNECT: %v", err)
@@ -274,7 +278,7 @@ func TestServeCONNECT_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read inner response: %v", err)
 	}
-	defer innerResp.Body.Close()
+	defer func() { _ = innerResp.Body.Close() }()
 	innerBody, _ := io.ReadAll(innerResp.Body)
 	if string(innerBody) != "hello" {
 		t.Errorf("inner body = %q, want %q", innerBody, "hello")
@@ -328,7 +332,7 @@ func TestServeCONNECT_InnerMethodRejected(t *testing.T) {
 	clientCAPool.AddCert(ca.Cert)
 
 	rawConn, _ := net.Dial("tcp", srv.Listener.Addr().String())
-	defer rawConn.Close()
+	defer func() { _ = rawConn.Close() }()
 	_, _ = rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n"))
 	br := bufio.NewReader(rawConn)
 	if _, err := http.ReadResponse(br, nil); err != nil {
@@ -390,7 +394,7 @@ func TestServeCONNECT_OversizedInnerHeaderRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer rawConn.Close()
+	defer func() { _ = rawConn.Close() }()
 	if _, err := rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); err != nil {
 		t.Fatalf("write CONNECT: %v", err)
 	}
@@ -445,7 +449,7 @@ func TestServeCONNECT_TLSHandshakeTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer rawConn.Close()
+	defer func() { _ = rawConn.Close() }()
 	if _, err := rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); err != nil {
 		t.Fatalf("write CONNECT: %v", err)
 	}
@@ -454,7 +458,7 @@ func TestServeCONNECT_TLSHandshakeTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read CONNECT resp: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Stall instead of sending ClientHello. The server's handshake
 	// deadline must fire and close the conn.
@@ -497,7 +501,7 @@ func TestServeCONNECT_InnerHeaderSlowloris(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer rawConn.Close()
+	defer func() { _ = rawConn.Close() }()
 	if _, err := rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); err != nil {
 		t.Fatalf("write CONNECT: %v", err)
 	}
@@ -506,14 +510,14 @@ func TestServeCONNECT_InnerHeaderSlowloris(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read CONNECT resp: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	tlsConn := tls.Client(&prereadConn{Conn: rawConn, br: br}, &tls.Config{
 		ServerName: "example.test", RootCAs: clientCAPool, MinVersion: tls.VersionTLS12,
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		t.Fatalf("handshake: %v", err)
 	}
-	defer tlsConn.Close()
+	defer func() { _ = tlsConn.Close() }()
 
 	// Trickle: write only the request line and the start of a
 	// header, no \r\n\r\n. The cap (1 MiB default) is far away.
@@ -583,7 +587,7 @@ func TestServeCONNECT_ClockSkewFiresOnCacheServedLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer rawConn.Close()
+	defer func() { _ = rawConn.Close() }()
 	if _, err := rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); err != nil {
 		t.Fatalf("write CONNECT: %v", err)
 	}
@@ -592,7 +596,7 @@ func TestServeCONNECT_ClockSkewFiresOnCacheServedLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read CONNECT resp: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	got := logs.WaitFor(t, "mitm_clock_skew", 2*time.Second)
 	if got.level != "warn" {
@@ -658,7 +662,7 @@ func TestServeCONNECT_TLSConfigCloneDefangs(t *testing.T) {
 	clientCAPool := x509.NewCertPool()
 	clientCAPool.AddCert(ca.Cert)
 	rawConn, _ := net.Dial("tcp", srv.Listener.Addr().String())
-	defer rawConn.Close()
+	defer func() { _ = rawConn.Close() }()
 	_, _ = rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n"))
 	br := bufio.NewReader(rawConn)
 	if _, err := http.ReadResponse(br, nil); err != nil {
@@ -787,7 +791,7 @@ func connectExpectStatus(t *testing.T, addr, target string, _ int) (*http.Respon
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	if _, err := fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
 		t.Fatalf("write CONNECT: %v", err)
 	}
@@ -796,7 +800,7 @@ func connectExpectStatus(t *testing.T, addr, target string, _ int) (*http.Respon
 	if err != nil {
 		t.Fatalf("read CONNECT response: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	return resp, body
 }

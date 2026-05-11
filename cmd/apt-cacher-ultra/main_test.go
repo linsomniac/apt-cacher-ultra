@@ -236,7 +236,7 @@ func TestServe_GracefulShutdown_DrainsInflight(t *testing.T) {
 			}{err: err}
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		b, _ := io.ReadAll(resp.Body)
 		respCh <- struct {
 			body string
@@ -323,7 +323,7 @@ func TestServe_DisallowedHostReturnsForbidden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_, _ = conn.Write([]byte("GET http://archive.ubuntu.com/ubuntu/InRelease HTTP/1.1\r\n" +
 		"Host: archive.ubuntu.com\r\n" +
 		"Connection: close\r\n" +
@@ -402,7 +402,7 @@ func getNoFollow(t *testing.T, url string) (*http.Response, string) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("read body %s: %v", url, err)
@@ -476,7 +476,7 @@ func TestServe_GracefulShutdown_KillsHungFetchAfterDrainBudget(t *testing.T) {
 		resp, _ := client.Get("http://" + cacheAddr + "/ubuntu/dists/noble/InRelease")
 		if resp != nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 	}()
 
@@ -567,7 +567,7 @@ func TestServe_GracefulShutdown_KillsSlowClientAfterDrainBudget(t *testing.T) {
 	if _, err := io.Copy(io.Discard, warmResp.Body); err != nil {
 		t.Fatalf("warm read: %v", err)
 	}
-	warmResp.Body.Close()
+	_ = warmResp.Body.Close()
 	warm.CloseIdleConnections()
 
 	// Slow-reader: dial raw, pin a tiny receive buffer so the kernel
@@ -578,7 +578,7 @@ func TestServe_GracefulShutdown_KillsSlowClientAfterDrainBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("slow dial: %v", err)
 	}
-	defer slow.Close()
+	defer func() { _ = slow.Close() }()
 	if tc, ok := slow.(*net.TCPConn); ok {
 		_ = tc.SetReadBuffer(8192)
 	}

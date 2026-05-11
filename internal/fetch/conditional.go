@@ -123,7 +123,7 @@ func (c *Client) Conditional(
 		}
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	out := &ConditionalResult{
 		Status:       resp.StatusCode,

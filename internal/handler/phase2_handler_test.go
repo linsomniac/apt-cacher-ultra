@@ -83,7 +83,7 @@ func TestServeHTTP_SnapshotMissReturns404(t *testing.T) {
 	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
-		w.Write([]byte("upstream content"))
+		_, _ = w.Write([]byte("upstream content"))
 	}))
 	defer srv.Close()
 
@@ -132,7 +132,7 @@ func TestServeHTTP_SnapshotMissReturns404(t *testing.T) {
 func TestServeHTTP_PreSnapshotSuiteUsesURLPath(t *testing.T) {
 	body := []byte("Phase 1 InRelease bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -178,7 +178,7 @@ func TestServeHTTP_PreSnapshotSuiteUsesURLPath(t *testing.T) {
 func TestServeHTTP_DebHitNoPackageHashServesNormally(t *testing.T) {
 	body := []byte("a fake .deb")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -212,7 +212,7 @@ func TestServeHTTP_DebHitMatchingPackageHashServes(t *testing.T) {
 	body := []byte("matching .deb bytes")
 	bodyHash := sha256Hex(body)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -270,7 +270,7 @@ func TestServeHTTP_DebHitMatchingPackageHashServes(t *testing.T) {
 func TestServeHTTP_DebHitMismatchingPackageHashEvictsAndRefetchFailsClosed(t *testing.T) {
 	body := []byte("upstream .deb bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -338,7 +338,7 @@ func TestServeHTTP_DebHitMismatchingPackageHashEvictsAndRefetchFailsClosed(t *te
 func TestServeHTTP_DebMissValidatesAgainstPackageHash(t *testing.T) {
 	body := []byte("upstream .deb bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -387,7 +387,7 @@ func TestServeHTTP_DebMissConflictingPackageHashFailsClosed(t *testing.T) {
 	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
-		w.Write([]byte("upstream content"))
+		_, _ = w.Write([]byte("upstream content"))
 	}))
 	defer srv.Close()
 
@@ -440,7 +440,7 @@ func TestServeHTTP_DebMissConflictingPackageHashFailsClosed(t *testing.T) {
 func TestServeHTTP_DebMissHashCollisionPreservesUnrelatedBlob(t *testing.T) {
 	body := []byte("colliding bytes that match an unrelated cached blob")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -575,7 +575,7 @@ func TestServeHTTP_DebMissAdoptionFlipMidFetchUsesPostFetchContract(t *testing.T
 			}()
 		}
 		upstreamCalls.Add(1)
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -648,7 +648,7 @@ func TestServeHTTP_AdoptedSuiteSnapshotMemberDBError_FailsClosed(t *testing.T) {
 	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
-		w.Write([]byte("attacker bytes"))
+		_, _ = w.Write([]byte("attacker bytes"))
 	}))
 	defer srv.Close()
 
@@ -698,7 +698,7 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_RefetchMatchServes(t *testing.T) {
 	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -753,7 +753,7 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_RefetchMismatchFailsClosed(t *testing
 	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
-		w.Write([]byte("attacker-supplied bytes"))
+		_, _ = w.Write([]byte("attacker-supplied bytes"))
 	}))
 	defer srv.Close()
 
@@ -894,7 +894,7 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_StaleNotServed(t *testing.T) {
 func TestServeHTTP_AdoptedSuiteMissingBlob_MismatchPreservesUnrelatedBlob(t *testing.T) {
 	collidingContent := []byte("collision-bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write(collidingContent)
+		_, _ = w.Write(collidingContent)
 	}))
 	defer srv.Close()
 
@@ -975,7 +975,7 @@ func TestServeHTTP_DebHitConflictingPackageHash502s(t *testing.T) {
 	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -1039,7 +1039,7 @@ func TestServeHTTP_DebHitAgreeingDuplicateHashesServes(t *testing.T) {
 	body := []byte("agreed .deb bytes")
 	bodyHash := sha256Hex(body)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 

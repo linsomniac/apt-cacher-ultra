@@ -94,7 +94,7 @@ func TestServe_HijackedHandshakeFails_EmitsTLSFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer rawConn.Close()
+	defer func() { _ = rawConn.Close() }()
 
 	if _, err := rawConn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); err != nil {
 		t.Fatalf("write CONNECT: %v", err)

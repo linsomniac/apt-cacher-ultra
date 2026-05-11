@@ -101,10 +101,10 @@ func TestServe_LeafCacheEviction_EmitsMITMCertCacheEvictedLog(t *testing.T) {
 
 	// First CONNECT populates the cache.
 	connA := openCONNECT(t, cacheAddr, "host-a.test:443")
-	defer connA.Close()
+	defer func() { _ = connA.Close() }()
 	// Second CONNECT triggers LRU eviction of host-a.test.
 	connB := openCONNECT(t, cacheAddr, "host-b.test:443")
-	defer connB.Close()
+	defer func() { _ = connB.Close() }()
 
 	// Shutdown the daemon (drains hijacked tunnels via §9.4
 	// manager). After serveListeners returns, all log writes are

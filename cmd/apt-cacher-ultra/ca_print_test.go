@@ -221,7 +221,7 @@ func TestCAPrint_LockContention_Returns4(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open lockfile: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		t.Fatalf("flock: %v", err)
 	}

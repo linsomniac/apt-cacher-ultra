@@ -89,7 +89,7 @@ func TestNew_NilDeps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	parser, _ := proxy.New(nil, nil)
 	fc, _ := fetch.New(fetch.Options{AllowedHostRegex: []string{`.`}, DenyTargetRanges: nil, Logger: silentLogger()})
 
@@ -116,7 +116,7 @@ func TestServeHTTP_GetMissThenHit(t *testing.T) {
 		hits.Add(1)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -156,7 +156,7 @@ func TestServeHTTP_HEAD_HitNoBody(t *testing.T) {
 	body := []byte("payload bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -212,7 +212,7 @@ func TestServeHTTP_BadURI(t *testing.T) {
 
 func TestServeHTTP_HostNotAllowed(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("never reached"))
+		_, _ = w.Write([]byte("never reached"))
 	}))
 	defer srv.Close()
 
@@ -293,7 +293,7 @@ func TestServeHTTP_RangeOnHit(t *testing.T) {
 	body := []byte("ABCDEFGHIJKL") // 12 bytes
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -327,7 +327,7 @@ func TestServeHTTP_MirrorMode(t *testing.T) {
 	var seenPath atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenPath.Store(r.URL.Path)
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -359,7 +359,7 @@ func TestServeHTTP_Coalesced(t *testing.T) {
 		}
 		<-gate
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -440,7 +440,7 @@ func TestServeHTTP_LookupErrorFallsThroughToFetch(t *testing.T) {
 	// returning early).
 	body := []byte("ok")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -455,7 +455,7 @@ func TestServeHTTP_LookupErrorFallsThroughToFetch(t *testing.T) {
 func TestServeHTTP_RequestCountIncrementsOnHit(t *testing.T) {
 	body := []byte("counted")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -636,7 +636,7 @@ func TestSFGroup_ArrivalDuringCleanupWindow(t *testing.T) {
 // maps by sending requests for many distinct disallowed hostnames.
 func TestServeHTTP_DisallowedHostShortCircuits(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("never reached"))
+		_, _ = w.Write([]byte("never reached"))
 	}))
 	defer srv.Close()
 

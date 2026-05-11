@@ -247,17 +247,6 @@ func (b *chaos3LogBuf) findAll(msg string) []map[string]any {
 	return out
 }
 
-// findOne is a convenience for assertions expecting a single
-// occurrence; returns the first match (or nil) plus the count so
-// callers can fail clearly when count != 1.
-func (b *chaos3LogBuf) findOne(msg string) (map[string]any, int) {
-	all := b.findAll(msg)
-	if len(all) == 0 {
-		return nil, 0
-	}
-	return all[0], len(all)
-}
-
 // findForSnapshot returns the first record with msg whose snapshot_id
 // equals want, plus the total count of msg records matching that
 // snapshot. The chaos tests target a specific adoption cycle (B);

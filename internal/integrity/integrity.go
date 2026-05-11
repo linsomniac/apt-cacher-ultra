@@ -256,7 +256,7 @@ func hashFile(ctx context.Context, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := sha256.New()
 	buf := make([]byte, 64*1024)
 	for {

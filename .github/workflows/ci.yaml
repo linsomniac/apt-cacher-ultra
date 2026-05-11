@@ -29,11 +29,12 @@ jobs:
         with:
           go-version: '1.25'
           cache: true
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v8
         with:
           # Pin so CI is reproducible; bump deliberately rather than letting
-          # `latest` drift behind your back.
-          version: v1.62.2
+          # `latest` drift behind your back. v2.x is required for Go 1.25
+          # targets (v1.x was built with go1.23/1.24).
+          version: v2.12.2
 
   # SPEC §12.4 docker-compose end-to-end test. Slower lane (~2 min for
   # the docker build + apt-get update inside ubuntu:noble), but it's

@@ -113,7 +113,7 @@ func TestServe_StatusPage_TLSMITMSection_ReflectsLiveCertIssuance(t *testing.T) 
 
 	// Issue exactly one cert by driving one CONNECT.
 	conn := openCONNECT(t, cacheAddr, "status-pin.test:443")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Capture roughly when the cert was issued so we can sanity-
 	// check the LastIssued timestamp later.

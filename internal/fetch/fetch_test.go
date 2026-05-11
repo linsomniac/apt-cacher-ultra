@@ -299,10 +299,10 @@ func TestFetch_ResumeWithRange(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Hijack: %v", err)
 			}
-			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\nLast-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\nContent-Type: text/plain\r\n\r\n", len(full))
-			bw.Write(full[:half])
-			bw.Flush()
-			conn.Close()
+			_, _ = fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\nLast-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\nContent-Type: text/plain\r\n\r\n", len(full))
+			_, _ = bw.Write(full[:half])
+			_ = bw.Flush()
+			_ = conn.Close()
 			return
 		}
 		// Subsequent attempts: serve as a 206 from the byte the client requested.
@@ -363,10 +363,10 @@ func TestFetch_RestartOnValidatorChange(t *testing.T) {
 		case 1:
 			hj, _ := w.(http.Hijacker)
 			conn, bw, _ := hj.Hijack()
-			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\nContent-Type: application/octet-stream\r\n\r\n", len(first))
-			bw.Write(first[:half])
-			bw.Flush()
-			conn.Close()
+			_, _ = fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\nContent-Type: application/octet-stream\r\n\r\n", len(first))
+			_, _ = bw.Write(first[:half])
+			_ = bw.Flush()
+			_ = conn.Close()
 		case 2:
 			// Retry sent Range. Server returns 200 (validator changed).
 			if r.Header.Get("Range") == "" {
@@ -407,10 +407,10 @@ func TestFetch_ContentLengthMismatch(t *testing.T) {
 		// Declare 100 bytes, send 5 by hijacking and closing.
 		hj, _ := w.(http.Hijacker)
 		conn, bw, _ := hj.Hijack()
-		fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
-		bw.Write([]byte("short"))
-		bw.Flush()
-		conn.Close()
+		_, _ = fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+		_, _ = bw.Write([]byte("short"))
+		_ = bw.Flush()
+		_ = conn.Close()
 	}))
 	defer srv.Close()
 
@@ -466,10 +466,10 @@ func TestFetch_BadContentRange(t *testing.T) {
 			// First attempt: half-body then drop.
 			hj, _ := w.(http.Hijacker)
 			conn, bw, _ := hj.Hijack()
-			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
-			bw.Write(full[:half])
-			bw.Flush()
-			conn.Close()
+			_, _ = fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
+			_, _ = bw.Write(full[:half])
+			_ = bw.Flush()
+			_ = conn.Close()
 			return
 		}
 		// Retry: 206 with bogus Content-Range (wrong start offset).
@@ -508,10 +508,10 @@ func TestFetch_TotalSizeChangeOn206(t *testing.T) {
 		if n == 1 {
 			hj, _ := w.(http.Hijacker)
 			conn, bw, _ := hj.Hijack()
-			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
-			bw.Write(full[:half])
-			bw.Flush()
-			conn.Close()
+			_, _ = fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
+			_, _ = bw.Write(full[:half])
+			_ = bw.Flush()
+			_ = conn.Close()
 			return
 		}
 		w.Header().Set("Content-Range", "bytes 6-98/99")
@@ -551,10 +551,10 @@ func TestFetch_RestartWhenNoValidator(t *testing.T) {
 		if n == 1 {
 			hj, _ := w.(http.Hijacker)
 			conn, bw, _ := hj.Hijack()
-			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", len(body))
-			bw.Write(body[:half])
-			bw.Flush()
-			conn.Close()
+			_, _ = fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", len(body))
+			_, _ = bw.Write(body[:half])
+			_ = bw.Flush()
+			_ = conn.Close()
 			return
 		}
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
@@ -948,10 +948,10 @@ func TestFetch_206RejectsUnknownTotal(t *testing.T) {
 		if n == 1 {
 			hj, _ := w.(http.Hijacker)
 			conn, bw, _ := hj.Hijack()
-			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
-			bw.Write(full[:half])
-			bw.Flush()
-			conn.Close()
+			_, _ = fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
+			_, _ = bw.Write(full[:half])
+			_ = bw.Flush()
+			_ = conn.Close()
 			return
 		}
 		w.Header().Set("Content-Range", "bytes 6-10/*")
@@ -987,10 +987,10 @@ func TestFetch_206RejectsLastBeyondTotal(t *testing.T) {
 		if n == 1 {
 			hj, _ := w.(http.Hijacker)
 			conn, bw, _ := hj.Hijack()
-			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
-			bw.Write(full[:half])
-			bw.Flush()
-			conn.Close()
+			_, _ = fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
+			_, _ = bw.Write(full[:half])
+			_ = bw.Flush()
+			_ = conn.Close()
 			return
 		}
 		w.Header().Set("Content-Range", "bytes 6-99/11")
@@ -1027,10 +1027,10 @@ func TestFetch_206BodyShorterThanRange(t *testing.T) {
 		if n == 1 {
 			hj, _ := w.(http.Hijacker)
 			conn, bw, _ := hj.Hijack()
-			fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
-			bw.Write(full[:half])
-			bw.Flush()
-			conn.Close()
+			_, _ = fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nETag: \"v1\"\r\n\r\n", len(full))
+			_, _ = bw.Write(full[:half])
+			_ = bw.Flush()
+			_ = conn.Close()
 			return
 		}
 		// 206 announces 5 bytes (6-10) but delivers 2.
@@ -1039,9 +1039,9 @@ func TestFetch_206BodyShorterThanRange(t *testing.T) {
 		w.WriteHeader(http.StatusPartialContent)
 		hj, _ := w.(http.Hijacker)
 		conn, bw, _ := hj.Hijack()
-		bw.Write([]byte("xx"))
-		bw.Flush()
-		conn.Close()
+		_, _ = bw.Write([]byte("xx"))
+		_ = bw.Flush()
+		_ = conn.Close()
 	}))
 	defer srv.Close()
 

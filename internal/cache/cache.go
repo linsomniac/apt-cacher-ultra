@@ -186,7 +186,7 @@ func (c *Cache) writer() {
 		c.drainWrites(fmt.Errorf("cache: writer connection: %w", err))
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	for {
 		select {

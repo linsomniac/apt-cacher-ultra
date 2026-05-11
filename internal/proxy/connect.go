@@ -476,7 +476,7 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 		h.warnConnect(OutcomeInnerStreamFailed, target.LiteralHost, target.Port, clientAddr, start, "hijack: "+err.Error(), "", false)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// SPEC6 §9.4: enroll the hijacked conn in the manager's
 	// registry so Drain's deadline-expiry force-close can iterate
@@ -543,7 +543,7 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mitmHandshakeDurationSeconds.Observe(time.Since(handshakeStart).Seconds())
-	defer tlsConn.Close()
+	defer func() { _ = tlsConn.Close() }()
 	// Past this point the TLS handshake has succeeded; record-call
 	// sites pass tlsReached=true so post-handshake
 	// `inner_stream_failed` correctly classifies as "TLS handshake

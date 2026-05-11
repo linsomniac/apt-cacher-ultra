@@ -28,7 +28,7 @@ func TestStatusJSON_RepoCoverage_EmptyCache(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 
 	var got struct {
@@ -72,7 +72,7 @@ func TestStatusJSON_RepoCoverage_FilterEchoed(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 
 	var got struct {
@@ -214,7 +214,7 @@ func TestStatusJSON_RepoCoverage_PerKindCounts(t *testing.T) {
 	seedRepoCoverageSnapshot(t, s, s.cfg.Cache, scheme, host, suite, memberPaths, pkgs)
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 
 	var got struct {
@@ -275,7 +275,7 @@ func TestStatusHTML_RepoCoverage_RendersSection(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 
 	html := string(body)
@@ -305,7 +305,7 @@ func TestStatusHTML_RepoCoverage_UnfilteredRendersHint(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 	if !strings.Contains(html, "(unfiltered") {
@@ -353,7 +353,7 @@ func TestStatusJSON_RepoCoverage_PdiffPathClassifierIsCaseSensitive(t *testing.T
 	seedRepoCoverageSnapshot(t, s, s.cfg.Cache, scheme, host, suite, memberPaths, pkgs)
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 
 	var got struct {

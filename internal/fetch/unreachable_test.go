@@ -148,7 +148,7 @@ func TestFetch_FastFailAfterDialTimeout(t *testing.T) {
 	// Second call within cooldown must be fast (single probe attempt
 	// of probe_timeout, retries suppressed).
 	dialCalls.Store(0)
-	dst.Truncate()
+	_ = dst.Truncate()
 	t0 = time.Now()
 	_, err = c.Fetch(context.Background(), target, dst)
 	secondElapsed := time.Since(t0)

@@ -105,7 +105,7 @@ func TestServe_MITMConnect_IncrementsAllMetrics(t *testing.T) {
 	// cert_issued + cert_cache_lookups deltas hit ≥1 by the time
 	// shutdown runs.
 	conn := openCONNECT(t, cacheAddr, "metrics-pin.test:443")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Drive shutdown so the connect_total + connect_duration
 	// observation runs (those fire when ServeCONNECT exits).

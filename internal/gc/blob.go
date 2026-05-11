@@ -35,7 +35,6 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 		unlinkErrors  int
 		batchesRun    int
 		bytesThisTick int64
-		deadlineHit   bool
 	)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -45,7 +44,6 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 			return res, false, unlinkErrors, nil
 		}
 		if !time.Now().Before(deadline) {
-			deadlineHit = true
 			g.cfg.Logger.Info("gc_tick_deadline_reached",
 				"phase", phase,
 				"which", "blob",
@@ -61,12 +59,12 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 			// Subsequent ticks will retry. Don't try to keep going
 			// — a persistent error here is a signal the operator
 			// needs to see.
-			return res, deadlineHit, unlinkErrors, fmt.Errorf("blob gc batch: %w", err)
+			return res, false, unlinkErrors, fmt.Errorf("blob gc batch: %w", err)
 		}
 		batchesRun++
 		if len(reaped) == 0 {
 			// Candidate set is drained.
-			return res, deadlineHit, unlinkErrors, nil
+			return res, false, unlinkErrors, nil
 		}
 
 		// SPEC4 §10.2: blobs_reaped/bytes_reclaimed count the rows

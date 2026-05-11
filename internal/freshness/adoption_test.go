@@ -1418,7 +1418,7 @@ func readHeartbeatAtDirect(t *testing.T, dbPath string, id int64) int64 {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	var hb int64
 	if err := db.QueryRow(`SELECT heartbeat_at FROM suite_snapshot WHERE snapshot_id = ?`, id).Scan(&hb); err != nil {
 		t.Fatalf("read heartbeat_at: %v", err)

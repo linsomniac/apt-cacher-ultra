@@ -13,7 +13,7 @@ package freshness
 //   H3  Sources.gz exceeds maxDecompressedPackagesBytes (256 MiB)
 //       → IMPLICIT: ParseSources/ParsePackages share readPackagesBlob
 //         which size-caps every decompressed read and surfaces the
-//         "Packages.gz decompresses past 256-byte cap (bomb defense)"
+//         "decompressed Packages.gz size exceeds 256-byte cap (bomb defense)"
 //         error. buildSourceHashes catches that error in the
 //         readPackagesBlob branch, emits source_parse_failed Warn
 //         stage=decompress, and continues. The disposition is

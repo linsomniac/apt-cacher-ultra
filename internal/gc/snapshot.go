@@ -29,16 +29,14 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 	staleGraceSeconds := int64(g.cfg.HeartbeatStaleGrace.Seconds())
 
 	var (
-		acc         cache.SnapshotGCBatchResult
-		batchesRun  int
-		deadlineHit bool
+		acc        cache.SnapshotGCBatchResult
+		batchesRun int
 	)
 	for {
 		if err := ctx.Err(); err != nil {
 			return acc, false, nil
 		}
 		if !time.Now().Before(deadline) {
-			deadlineHit = true
 			g.cfg.Logger.Info("gc_tick_deadline_reached",
 				"phase", phase,
 				"which", "snapshot",
@@ -54,7 +52,7 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 			g.cfg.KeepDisplaced,
 		)
 		if err != nil {
-			return acc, deadlineHit, fmt.Errorf("snapshot gc batch: %w", err)
+			return acc, false, fmt.Errorf("snapshot gc batch: %w", err)
 		}
 		batchesRun++
 		acc.OrphanReaped += batch.OrphanReaped
@@ -62,7 +60,7 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 
 		if batch.Total() == 0 {
 			// Candidate set drained.
-			return acc, deadlineHit, nil
+			return acc, false, nil
 		}
 	}
 }

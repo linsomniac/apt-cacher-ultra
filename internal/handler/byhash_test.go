@@ -93,7 +93,7 @@ func TestServeHTTP_ByHashContentAddressed_PoolMissFetchesUpstream(t *testing.T) 
 	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 
@@ -186,7 +186,7 @@ func TestServeHTTP_ByHashContentAddressed_NonMetadataIgnored(t *testing.T) {
 	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
-		w.Write(body)
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 	scheme, host, port := splitURL(t, srv.URL)

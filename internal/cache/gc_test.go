@@ -888,10 +888,7 @@ func snapshotExists(t *testing.T, c *Cache, id int64) bool {
 	t.Helper()
 	var n int
 	err := c.db.QueryRow(`SELECT 1 FROM suite_snapshot WHERE snapshot_id = ?`, id).Scan(&n)
-	if err == nil {
-		return true
-	}
-	return false
+	return err == nil
 }
 
 func TestRunSnapshotGCBatch_FiveAdopted_KeepDisplaced3_ReapsOldest(t *testing.T) {

@@ -74,7 +74,7 @@ func TestServe_LeafCertIssuance_EmitsMITMCertIssuedLog(t *testing.T) {
 
 	// One CONNECT triggers one cache miss + one gen + one log line.
 	conn := openCONNECT(t, cacheAddr, "cert-issued.test:443")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Shutdown so all log writes have completed before we read.
 	cancel()

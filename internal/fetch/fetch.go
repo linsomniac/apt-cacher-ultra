@@ -467,7 +467,7 @@ func (c *Client) doAttempt(
 		}
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	out := &FetchResult{
 		Status:        resp.StatusCode,

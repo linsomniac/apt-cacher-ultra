@@ -67,7 +67,7 @@ func writeArmoredPubKey(t *testing.T, path string, e *openpgp.Entity) {
 	if err != nil {
 		t.Fatalf("create %s: %v", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	w, err := armor.Encode(f, openpgp.PublicKeyType, nil)
 	if err != nil {
@@ -89,7 +89,7 @@ func writeBinaryPubKey(t *testing.T, path string, e *openpgp.Entity) {
 	if err != nil {
 		t.Fatalf("create %s: %v", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if err := e.Serialize(f); err != nil {
 		t.Fatalf("Serialize: %v", err)
 	}
@@ -104,7 +104,7 @@ func writeArmoredPubKeyBundle(t *testing.T, path string, entities ...*openpgp.En
 	if err != nil {
 		t.Fatalf("create %s: %v", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	w, err := armor.Encode(f, openpgp.PublicKeyType, nil)
 	if err != nil {
 		t.Fatalf("armor.Encode: %v", err)

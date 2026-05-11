@@ -1221,7 +1221,7 @@ func hashFile(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
@@ -1756,14 +1756,14 @@ func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	if strings.HasSuffix(memberPath, ".gz") {
 		gr, err := gzip.NewReader(f)
 		if err != nil {
 			return nil, fmt.Errorf("gzip: %w", err)
 		}
-		defer gr.Close()
+		defer func() { _ = gr.Close() }()
 		// io.LimitReader caps at exactly the limit; if the actual
 		// content reaches the cap, treat that as a bomb and abort.
 		// Add 1 byte of slack so we can distinguish "exactly cap"
@@ -1774,7 +1774,7 @@ func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) 
 			return nil, fmt.Errorf("decompress: %w", err)
 		}
 		if int64(len(body)) > maxDecompressedPackagesBytes {
-			return nil, fmt.Errorf("Packages.gz decompresses past %d-byte cap (bomb defense)",
+			return nil, fmt.Errorf("decompressed Packages.gz size exceeds %d-byte cap (bomb defense)",
 				maxDecompressedPackagesBytes)
 		}
 		return body, nil
@@ -1793,7 +1793,7 @@ func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) 
 			return nil, fmt.Errorf("decompress: %w", err)
 		}
 		if int64(len(body)) > maxDecompressedPackagesBytes {
-			return nil, fmt.Errorf("Packages.xz decompresses past %d-byte cap (bomb defense)",
+			return nil, fmt.Errorf("decompressed Packages.xz size exceeds %d-byte cap (bomb defense)",
 				maxDecompressedPackagesBytes)
 		}
 		return body, nil
@@ -1806,7 +1806,7 @@ func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) 
 		return nil, err
 	}
 	if int64(len(body)) > maxDecompressedPackagesBytes {
-		return nil, fmt.Errorf("Packages exceeds %d-byte cap", maxDecompressedPackagesBytes)
+		return nil, fmt.Errorf("plain Packages exceeds %d-byte cap", maxDecompressedPackagesBytes)
 	}
 	return body, nil
 }

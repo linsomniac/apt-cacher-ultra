@@ -151,7 +151,7 @@ func TestServe_DisabledMode_AdvertisedDeltasOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial cache: %v", err)
 	}
-	defer rawConn.Close()
+	defer func() { _ = rawConn.Close() }()
 	if err := rawConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatalf("set CONNECT deadline: %v", err)
 	}

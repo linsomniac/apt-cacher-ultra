@@ -190,7 +190,7 @@ func TestServe_InnerGET_DenyRangeFiresAtConnectTime_Returns403(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial cache: %v", err)
 	}
-	defer rawConn.Close()
+	defer func() { _ = rawConn.Close() }()
 
 	// Bound the whole interaction. Without a deadline a regression
 	// in CONNECT framing or inner-response handling could hang the
@@ -237,7 +237,7 @@ func TestServe_InnerGET_DenyRangeFiresAtConnectTime_Returns403(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read inner response: %v", err)
 	}
-	defer innerResp.Body.Close()
+	defer func() { _ = innerResp.Body.Close() }()
 	innerBody, err := io.ReadAll(innerResp.Body)
 	if err != nil {
 		t.Fatalf("read inner response body: %v", err)

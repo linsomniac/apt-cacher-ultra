@@ -110,16 +110,16 @@ SELECT hash FROM blob
 		for rows.Next() {
 			var h string
 			if err := rows.Scan(&h); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return fmt.Errorf("RunBlobGCBatch: scan: %w", err)
 			}
 			hashes = append(hashes, h)
 		}
 		if err := rows.Err(); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return fmt.Errorf("RunBlobGCBatch: iter: %w", err)
 		}
-		rows.Close()
+		_ = rows.Close()
 
 		if len(hashes) == 0 {
 			return tx.Commit()
@@ -184,16 +184,16 @@ RETURNING hash, size`
 		for drows.Next() {
 			var r ReapedBlob
 			if err := drows.Scan(&r.Hash, &r.Size); err != nil {
-				drows.Close()
+				_ = drows.Close()
 				return fmt.Errorf("RunBlobGCBatch: scan returning: %w", err)
 			}
 			reaped = append(reaped, r)
 		}
 		if err := drows.Err(); err != nil {
-			drows.Close()
+			_ = drows.Close()
 			return fmt.Errorf("RunBlobGCBatch: iter returning: %w", err)
 		}
-		drows.Close()
+		_ = drows.Close()
 
 		return tx.Commit()
 	})
@@ -300,17 +300,17 @@ LIMIT ?`
 				cls string
 			)
 			if err := rows.Scan(&id, &cls); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return fmt.Errorf("RunSnapshotGCBatch: scan: %w", err)
 			}
 			ids = append(ids, id)
 			classes = append(classes, cls)
 		}
 		if err := rows.Err(); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return fmt.Errorf("RunSnapshotGCBatch: iter: %w", err)
 		}
-		rows.Close()
+		_ = rows.Close()
 
 		if len(ids) == 0 {
 			return tx.Commit()

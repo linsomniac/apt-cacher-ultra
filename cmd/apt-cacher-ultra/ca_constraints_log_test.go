@@ -191,7 +191,7 @@ func TestServe_TlsMitmStartup_EmptyRegex_RefusesUnconstrained(t *testing.T) {
 	if genFailedRec == nil {
 		t.Fatalf("mitm_ca_generation_failed not emitted; logs:\n%s", out)
 	}
-	if !(refusedIdx < genFailedIdx) {
+	if refusedIdx >= genFailedIdx {
 		t.Errorf("event ordering violated: refused at line %d, generation_failed at line %d (expected refused first per §10.2)",
 			refusedIdx, genFailedIdx)
 	}

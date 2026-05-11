@@ -832,7 +832,7 @@ func (h *Handler) serveBlobWithHeaders(w http.ResponseWriter, r *http.Request, r
 		h.logger.Warn("blob open failed", "err", err, "hash", blobHash)
 		return false, 0, 0
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	st, err := f.Stat()
 	if err != nil {
 		h.logger.Warn("blob stat failed", "err", err, "hash", blobHash)
@@ -995,7 +995,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 		h.logRequest(r, req.CanonicalHost, req.Path, "cache_write_failed", http.StatusInternalServerError, 0, true, res.status, start)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	st, err := f.Stat()
 	if err != nil {
@@ -1100,7 +1100,7 @@ func (h *Handler) serveSnapshotMemberMiss(
 		http.Error(cw, "post-fetch blob missing", http.StatusBadGateway)
 		return true, http.StatusBadGateway, 0
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	st, err := f.Stat()
 	if err != nil {
 		h.logger.Warn("post-recovery blob stat failed",
@@ -1761,7 +1761,7 @@ func (h *Handler) tryServeStale(w http.ResponseWriter, r *http.Request, req *pro
 	if err != nil {
 		return false
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	st, err := f.Stat()
 	if err != nil {
 		return false

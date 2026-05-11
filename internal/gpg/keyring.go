@@ -196,7 +196,7 @@ func parseKeyringFile(path string) (openpgp.EntityList, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Buffer enough of the file head to detect armor and rewind
 	// without seeking (works on any io.Reader if needed).

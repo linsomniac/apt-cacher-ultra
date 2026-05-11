@@ -137,7 +137,7 @@ func TestServe_TlsMitmStartup_FlockHeld_EmitsLockTimeout(t *testing.T) {
 	if genFailedRec == nil {
 		t.Fatalf("mitm_ca_generation_failed not emitted; logs:\n%s", out)
 	}
-	if !(lockIdx < genFailedIdx) {
+	if lockIdx >= genFailedIdx {
 		t.Errorf("event ordering violated: lock_timeout at line %d, generation_failed at line %d (expected lock_timeout first per §10.2)",
 			lockIdx, genFailedIdx)
 	}

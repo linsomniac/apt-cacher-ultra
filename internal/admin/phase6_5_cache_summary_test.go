@@ -19,7 +19,7 @@ func TestStatusJSON_CacheSummary_EmptyShape(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 
 	var got map[string]any
@@ -67,7 +67,7 @@ func TestStatusJSON_CacheSummary_PerHostPerArch(t *testing.T) {
 	seedRepoCoverageSnapshot(t, s, s.cfg.Cache, scheme, host1, suite1, nil, pkgs1)
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 
 	var got struct {
@@ -132,7 +132,7 @@ func TestStatusHTML_CacheSummary_RendersWhenSeeded(t *testing.T) {
 	seedRepoCoverageSnapshot(t, s, s.cfg.Cache, scheme, host, suite, nil, pkgs)
 
 	resp := mustGet(t, base+"/")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 
@@ -155,7 +155,7 @@ func TestStatusHTML_CacheSummary_OmittedOnEmptyCache(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 
@@ -172,7 +172,7 @@ func TestStatusJSON_CacheSummary_TopLevelKey(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
@@ -226,7 +226,7 @@ func TestPackageHashRowsByKind_Gauge_PopulatesAfterSeed(t *testing.T) {
 	seedRepoCoverageSnapshot(t, s, s.cfg.Cache, scheme, host, suite, nil, pkgs)
 
 	resp := mustGet(t, base+"/metrics")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	metrics := string(body)
 
@@ -278,7 +278,7 @@ func TestRepoCoverage_RefresherCached(t *testing.T) {
 	zeroCount := func(label string) {
 		t.Helper()
 		resp := mustGet(t, base+"/?format=json")
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		body, _ := io.ReadAll(resp.Body)
 		var got struct {
 			RepoCoverage struct {
@@ -348,7 +348,7 @@ func TestRepoCoverage_RefresherCached(t *testing.T) {
 	s.runRefreshOnce(context.Background())
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body2, _ := io.ReadAll(resp.Body)
 	var got struct {
 		RepoCoverage struct {

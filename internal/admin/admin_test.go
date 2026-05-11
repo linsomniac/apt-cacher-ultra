@@ -173,7 +173,7 @@ func TestEndpoint_Healthz_OK(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/healthz")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
@@ -188,7 +188,7 @@ func TestEndpoint_Metrics_TextPlain(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/metrics")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
@@ -202,7 +202,7 @@ func TestEndpoint_Status_HTMLDefault(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
@@ -216,7 +216,7 @@ func TestEndpoint_Status_JSONViaQuery(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 		t.Errorf("Content-Type = %q, want application/json...", ct)
 	}
@@ -227,7 +227,7 @@ func TestStatusJSON_HasLockedSchemaKeys(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
@@ -319,7 +319,7 @@ func TestStatusJSON_CachePopulatesAfterSeed(t *testing.T) {
 	}
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	var got struct {
 		Cache struct {
@@ -351,7 +351,7 @@ func TestStatusHTML_RendersWithoutPanic(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
@@ -377,7 +377,7 @@ func TestEndpoint_Status_JSONOverridesAccept(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 		t.Errorf("query ?format=json should win over Accept: text/html. Content-Type = %q", ct)
 	}
@@ -388,7 +388,7 @@ func TestEndpoint_UnknownPath404(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/unknown")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 404 {
 		t.Errorf("status = %d, want 404 — /unknown must NOT match the / subtree (SPEC5 §9.7.1)", resp.StatusCode)
 	}
@@ -402,7 +402,7 @@ func TestEndpoint_PostMetrics405(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 405 {
 		t.Errorf("POST /metrics status = %d, want 405", resp.StatusCode)
 	}
@@ -430,7 +430,7 @@ func TestEndpoint_OptionsAnyPath204(t *testing.T) {
 		if err != nil {
 			t.Fatalf("OPTIONS %s: %v", path, err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != 204 {
 			t.Errorf("OPTIONS %s status = %d, want 204", path, resp.StatusCode)
 		}
@@ -445,7 +445,7 @@ func TestAuth_Disabled_AllRequestsSucceed(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/metrics")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
@@ -457,7 +457,7 @@ func TestAuth_Enabled_NoCredentials401(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/metrics")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 401 {
 		t.Errorf("no-creds status = %d, want 401", resp.StatusCode)
 	}
@@ -472,7 +472,7 @@ func TestAuth_Enabled_ValidCredentials200(t *testing.T) {
 	defer cleanup()
 
 	resp := getWithBasic(t, base+"/metrics", "alice", "secret")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Errorf("valid-creds status = %d, want 200", resp.StatusCode)
 	}
@@ -484,7 +484,7 @@ func TestAuth_Enabled_WrongPassword401(t *testing.T) {
 	defer cleanup()
 
 	resp := getWithBasic(t, base+"/metrics", "alice", "wrong")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 401 {
 		t.Errorf("wrong-pass status = %d, want 401", resp.StatusCode)
 	}
@@ -496,7 +496,7 @@ func TestAuth_Enabled_UnknownUser401(t *testing.T) {
 	defer cleanup()
 
 	resp := getWithBasic(t, base+"/metrics", "bob", "anything")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 401 {
 		t.Errorf("unknown-user status = %d, want 401", resp.StatusCode)
 	}
@@ -508,7 +508,7 @@ func TestAuth_HealthzAlsoRequiresAuth(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/healthz")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 401 {
 		t.Errorf("/healthz without auth = %d, want 401 (no carve-out per SPEC5 §9.7.4)", resp.StatusCode)
 	}
@@ -593,7 +593,7 @@ func TestStatusHTML_SuiteTable(t *testing.T) {
 	}
 
 	resp := mustGet(t, base+"/")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 
@@ -654,7 +654,7 @@ func TestAdminRequest_AuthUserAndScrapeID(t *testing.T) {
 		defer cleanup()
 
 		resp := mustGet(t, base+"/healthz")
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		out := buf.String()
 		if !strings.Contains(out, "msg=admin_request") {
@@ -677,7 +677,7 @@ func TestAdminRequest_AuthUserAndScrapeID(t *testing.T) {
 		defer cleanup()
 
 		resp := getWithBasic(t, base+"/healthz", "alice", "secret")
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		out := buf.String()
 		if !strings.Contains(out, "auth_user=alice") {
@@ -694,7 +694,7 @@ func TestAdminRequest_AuthUserAndScrapeID(t *testing.T) {
 		defer cleanup()
 
 		resp := mustGet(t, base+"/healthz") // no creds
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		out := buf.String()
 		if !strings.Contains(out, "msg=admin_request") {
@@ -724,7 +724,7 @@ func TestEndpoint_Options_AuthEnabled(t *testing.T) {
 		if err != nil {
 			t.Fatalf("OPTIONS %s no-creds: %v", path, err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != 401 {
 			t.Errorf("OPTIONS %s no-creds = %d, want 401", path, resp.StatusCode)
 		}
@@ -739,7 +739,7 @@ func TestEndpoint_Options_AuthEnabled(t *testing.T) {
 		if err != nil {
 			t.Fatalf("OPTIONS %s authed: %v", path, err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != 204 {
 			t.Errorf("OPTIONS %s authed = %d, want 204", path, resp.StatusCode)
 		}
@@ -815,7 +815,7 @@ func TestStatusJSON_TLSMITM_Disabled(t *testing.T) {
 			defer cleanup()
 
 			resp := mustGet(t, base+"/?format=json")
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			body, _ := io.ReadAll(resp.Body)
 			var got map[string]any
 			if err := json.Unmarshal(body, &got); err != nil {
@@ -863,7 +863,7 @@ func TestStatusJSON_TLSMITM_Enabled_FullPayload(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	var got struct {
 		TLSMITM struct {
@@ -946,7 +946,7 @@ func TestStatusJSON_TLSMITM_Enabled_NoIssuance(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
@@ -979,7 +979,7 @@ func TestStatusJSON_TLSMITM_TopLevelKeyAlwaysPresent(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/?format=json")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
@@ -1012,7 +1012,7 @@ func TestStatusHTML_TLSMITM_SectionRendersWhenEnabled(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 
@@ -1023,7 +1023,7 @@ func TestStatusHTML_TLSMITM_SectionRendersWhenEnabled(t *testing.T) {
 	listenersIdx := strings.Index(html, "<h2>Listeners</h2>")
 	mitmIdx := strings.Index(html, "<h2>TLS MITM</h2>")
 	cacheIdx := strings.Index(html, "<h2>Cache</h2>")
-	if !(listenersIdx < mitmIdx && mitmIdx < cacheIdx) {
+	if listenersIdx >= mitmIdx || mitmIdx >= cacheIdx {
 		t.Errorf("section ordering wrong: Listeners=%d, TLS MITM=%d, Cache=%d", listenersIdx, mitmIdx, cacheIdx)
 	}
 	for _, want := range []string{
@@ -1046,7 +1046,7 @@ func TestStatusHTML_TLSMITM_SectionOmittedWhenDisabled(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 
@@ -1070,7 +1070,7 @@ func TestStatusHTML_TLSMITM_NoIssuanceShowsPlaceholder(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 

@@ -212,7 +212,7 @@ func TestRender_StableSeriesOrder(t *testing.T) {
 	iAlpha := strings.Index(got, `outcome="alpha"`)
 	iMike := strings.Index(got, `outcome="mike"`)
 	iZulu := strings.Index(got, `outcome="zulu"`)
-	if !(iAlpha < iMike && iMike < iZulu) {
+	if iAlpha >= iMike || iMike >= iZulu {
 		t.Errorf("series not in sorted order: alpha=%d mike=%d zulu=%d\n%s",
 			iAlpha, iMike, iZulu, got)
 	}

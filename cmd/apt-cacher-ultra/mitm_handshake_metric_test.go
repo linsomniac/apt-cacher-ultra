@@ -87,7 +87,7 @@ func TestServe_MITMConnect_HandshakeDurationMetricObserved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial cache: %v", err)
 	}
-	defer rawConn.Close()
+	defer func() { _ = rawConn.Close() }()
 
 	// Bound the whole interaction so a regression can't hang the
 	// test.

@@ -162,7 +162,7 @@ func TestServe_GracefulShutdown_FetchMidStream_NoOrphanBlob(t *testing.T) {
 		if err != nil {
 			return
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}()
 
 	// Wait for upstream to confirm it has flushed the first chunk.

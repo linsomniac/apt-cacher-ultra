@@ -102,7 +102,7 @@ func TestOpen_ReopenIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open #2: %v", err)
 	}
-	defer c2.Close()
+	defer func() { _ = c2.Close() }()
 	v, _ := readSchemaVersion(context.Background(), c2.db)
 	if v != CurrentSchemaVersion {
 		t.Errorf("after reopen, version = %d", v)
@@ -775,7 +775,7 @@ func TestOpen_PathWithMetacharsInDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open(%q): %v", weird, err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	if _, err := c.db.Exec(`INSERT INTO blob (hash, size, created_at) VALUES (?, 1, 0)`,
 		strings.Repeat("a", 64)); err != nil {
 		t.Errorf("simple insert into DB at weird path: %v", err)
@@ -866,7 +866,7 @@ func TestMigration_V1ToV2_AddsTablesAndColumn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PRAGMA table_info: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	saw := false
 	for rows.Next() {
 		var cid int
@@ -1483,7 +1483,7 @@ func hasColumn(t *testing.T, db *sql.DB, table, column string) bool {
 	if err != nil {
 		t.Fatalf("PRAGMA table_info(%s): %v", table, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var (
 			cid          int

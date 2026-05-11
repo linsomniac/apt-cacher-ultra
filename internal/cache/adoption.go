@@ -538,7 +538,7 @@ WHERE snapshot_id = ?`
 	if err != nil {
 		return nil, fmt.Errorf("ListSnapshotMembers: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []SnapshotMember
 	for rows.Next() {
 		var m SnapshotMember
@@ -621,7 +621,7 @@ SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name
 	if err != nil {
 		return nil, fmt.Errorf("DeclaredHashesForPath: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []DeclaredHash
 	for rows.Next() {
 		var d DeclaredHash
@@ -746,7 +746,7 @@ SELECT blob_hash, declared_sha256, snapshot_id, source FROM (
 	if err != nil {
 		return nil, fmt.Errorf("ListIntegrityCandidates: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	// AIDEV-NOTE: dedup by blob_hash in Go rather than SQL DISTINCT to
 	// preserve "first-found wins" — snapshot_member rows precede
 	// package_hash rows in the UNION ALL, so the first occurrence of

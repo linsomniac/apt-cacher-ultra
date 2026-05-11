@@ -301,7 +301,7 @@ func TestServe_GracefulShutdown_StalledCONNECT_DrainBudget(t *testing.T) {
 	// end so shutdown DOES NOT see a client-side EOF — that would
 	// unblock the daemon's tlsConn.Handshake naturally and bypass
 	// the §9.4 force-close path we want to exercise.
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); err != nil {
 		t.Fatalf("write CONNECT: %v", err)

@@ -306,7 +306,7 @@ func doConnectAndHandshake(t *testing.T, cacheAddr, host string, pool *x509.Cert
 		}
 		return err
 	}
-	defer rawConn.Close()
+	defer func() { _ = rawConn.Close() }()
 	if err := rawConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatalf("set rawConn deadline: %v", err)
 	}

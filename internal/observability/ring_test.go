@@ -179,7 +179,7 @@ func TestRing_ConcurrentRecordSnapshot(t *testing.T) {
 		for j := 0; j < reads; j++ {
 			snap := r.Snapshot()
 			// Invariant: every snapshot has length in [0, cap].
-			if len(snap) < 0 || len(snap) > 50 {
+			if len(snap) > 50 {
 				t.Errorf("snapshot len out of range: %d", len(snap))
 				return
 			}

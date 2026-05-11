@@ -80,14 +80,3 @@ func (a *Adopter) priorCurrentSnapshotID(ctx context.Context, suite SuiteRef) (i
 	}
 	return *fresh.CurrentSnapshotID, true
 }
-
-// hotSetEntries returns the cache-level rows for callers (e.g. tests)
-// that want the underlying tuples without the upstream URL prefix.
-// Phase 3 production path uses computeHotSet directly. Exposed at
-// package-private scope because the symmetry with ComputeHotSet is
-// useful when comparing test goldens.
-func cacheHotSet(rows []cache.HotSetEntry) []cache.HotSetEntry {
-	out := make([]cache.HotSetEntry, len(rows))
-	copy(out, rows)
-	return out
-}

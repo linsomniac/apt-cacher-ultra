@@ -69,12 +69,12 @@ func runCAPrint(args []string, stdout, stderr io.Writer) int {
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "ca print: load config %q: %v\n", *configPath, err)
+		_, _ = fmt.Fprintf(stderr, "ca print: load config %q: %v\n", *configPath, err)
 		return 3
 	}
 
 	if !cfg.TlsMitm.Enabled {
-		fmt.Fprintln(stderr, "ca print: tls_mitm.enabled = false in config; refusing to print a CA that would never be used")
+		_, _ = fmt.Fprintln(stderr, "ca print: tls_mitm.enabled = false in config; refusing to print a CA that would never be used")
 		return 1
 	}
 
@@ -87,11 +87,11 @@ func runCAPrint(args []string, stdout, stderr io.Writer) int {
 		// the key file's mode bits.
 		certPEM, err := os.ReadFile(suppliedCert)
 		if err != nil {
-			fmt.Fprintf(stderr, "ca print: read %q: %v\n", suppliedCert, err)
+			_, _ = fmt.Fprintf(stderr, "ca print: read %q: %v\n", suppliedCert, err)
 			return 2
 		}
 		if err := validateCAPEM(certPEM); err != nil {
-			fmt.Fprintf(stderr, "ca print: parse %q: %v\n", suppliedCert, err)
+			_, _ = fmt.Fprintf(stderr, "ca print: parse %q: %v\n", suppliedCert, err)
 			return 2
 		}
 		auditKeyMode(stderr, suppliedKey)
@@ -116,10 +116,10 @@ func runCAPrint(args []string, stdout, stderr io.Writer) int {
 		})
 		if err != nil {
 			if errors.Is(err, tlsmitm.ErrCALockTimeout) {
-				fmt.Fprintf(stderr, "ca print: lock contention on %q (concurrent daemon CA generation or another `ca print`); retry shortly\n", dir)
+				_, _ = fmt.Fprintf(stderr, "ca print: lock contention on %q (concurrent daemon CA generation or another `ca print`); retry shortly\n", dir)
 				return 4
 			}
-			fmt.Fprintf(stderr, "ca print: load/generate CA in %q: %v\n", dir, err)
+			_, _ = fmt.Fprintf(stderr, "ca print: load/generate CA in %q: %v\n", dir, err)
 			return 2
 		}
 
@@ -139,7 +139,7 @@ func runCAPrint(args []string, stdout, stderr io.Writer) int {
 		// for an operator who pipes stdout to a file and wants to
 		// confirm the fingerprint without re-parsing.
 		sum := sha256.Sum256(ca.Cert.Raw)
-		fmt.Fprintf(stderr, "ca print: fingerprint sha256=%s\n", hex.EncodeToString(sum[:]))
+		_, _ = fmt.Fprintf(stderr, "ca print: fingerprint sha256=%s\n", hex.EncodeToString(sum[:]))
 		_, _ = stdout.Write(out)
 		return 0
 	}
@@ -185,7 +185,7 @@ func auditKeyMode(stderr io.Writer, path string) {
 	}
 	mode := st.Mode().Perm()
 	if mode != 0o600 {
-		fmt.Fprintf(stderr, "ca print: WARNING: %q is mode %#o; recommend `chmod 0600 %s` to remove other-readable bits\n", path, mode, path)
+		_, _ = fmt.Fprintf(stderr, "ca print: WARNING: %q is mode %#o; recommend `chmod 0600 %s` to remove other-readable bits\n", path, mode, path)
 	}
 }
 

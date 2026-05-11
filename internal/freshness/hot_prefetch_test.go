@@ -338,7 +338,7 @@ func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	logger := slog.Default()
 	a := &Adopter{cache: c, logger: logger}

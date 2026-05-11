@@ -132,7 +132,7 @@ func TestRefresher_BuildInfoCarriesLabels(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/metrics")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	got := string(body)
 
@@ -174,7 +174,7 @@ func TestRefresher_ProcessCPUCounterRendersSample(t *testing.T) {
 	defer cleanup()
 
 	resp := mustGet(t, base+"/metrics")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	got := string(body)
 
@@ -243,7 +243,7 @@ func TestRefresher_FirstScrapeSeesPopulatedGauges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	for _, body := range []string{"first", "second"} {
 		w, err := c.NewTempBlob()
 		if err != nil {
@@ -320,7 +320,7 @@ func TestRefresher_FirstScrapeSeesPopulatedGauges(t *testing.T) {
 	// synchronous first refresh in Serve has run. If that refresh
 	// did NOT happen synchronously, this fails.
 	resp := mustGet(t, "http://"+cfg.AdminAddr+"/metrics")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "acu_blobs_db_count 2") {
 		t.Errorf("first scrape did not see acu_blobs_db_count=2 (synchronous first refresh broken);\nbody:\n%s", body)

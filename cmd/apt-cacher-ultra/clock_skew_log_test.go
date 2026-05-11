@@ -98,7 +98,7 @@ func TestServe_BackwardClockJump_EmitsClockSkewWarn(t *testing.T) {
 	// to completion (post-skew-check, post-handshake-timeout) so
 	// the mitm_clock_skew line is in sb by the time we inspect it.
 	conn := openCONNECT(t, cacheAddr, "skew-pin.test:443")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Capture roughly when the skew check ran so we can sanity-
 	// check the `now` field in the emit. The check fires shortly

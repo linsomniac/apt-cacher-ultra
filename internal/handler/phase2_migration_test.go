@@ -275,7 +275,7 @@ func buildV1MigrationFixture(t *testing.T, upstream *url.URL, snap *chaos2Snapsh
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if _, err := db.Exec(v1SchemaDDLForTest); err != nil {
 		t.Fatalf("apply v1 schema: %v", err)
 	}
@@ -364,7 +364,7 @@ func readSchemaVersionForTest(t *testing.T, dir string) int {
 	if err != nil {
 		t.Fatalf("readSchemaVersionForTest: open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	var v int
 	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil {
 		t.Fatalf("readSchemaVersionForTest: query: %v", err)
