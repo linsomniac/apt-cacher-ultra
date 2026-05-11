@@ -383,7 +383,20 @@ func (s *Server) refreshPoolDiskBytes(lifecycleCtx context.Context) {
 	if !s.poolScanInProgress.CompareAndSwap(false, true) {
 		return
 	}
+	// Gate Add(1) on shutdownStarted under s.mu so it can't race with
+	// Shutdown's walkWg.Wait. Without the lock, an Add(1) called from
+	// Serve's synchronous initial refresh can run concurrently with a
+	// Wait triggered by an early Shutdown (the test path) — that's the
+	// "Add on zero counter concurrent with Wait" race sync.WaitGroup
+	// explicitly forbids.
+	s.mu.Lock()
+	if s.shutdownStarted {
+		s.mu.Unlock()
+		s.poolScanInProgress.Store(false)
+		return
+	}
 	s.walkWg.Add(1)
+	s.mu.Unlock()
 	go func() {
 		defer s.walkWg.Done()
 		defer s.poolScanInProgress.Store(false)

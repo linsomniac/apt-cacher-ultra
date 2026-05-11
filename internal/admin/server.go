@@ -185,8 +185,12 @@ type Server struct {
 
 	// mu guards refresherStop / refresherDone / refresherCancel —
 	// Shutdown must be idempotent, and the refresher goroutine
-	// must not be started twice.
-	mu sync.Mutex
+	// must not be started twice. It also gates walkWg.Add against
+	// Shutdown's walkWg.Wait: refreshPoolDiskBytes must observe
+	// shutdownStarted under mu before calling Add(1), so Add(1) on
+	// a zero counter is properly ordered before any concurrent Wait.
+	mu              sync.Mutex
+	shutdownStarted bool
 }
 
 // New validates Config and constructs a Server. Returns an error
@@ -332,6 +336,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.shuttingDown.Store(true)
 
 	s.mu.Lock()
+	s.shutdownStarted = true
 	if s.refresherCancel != nil {
 		s.refresherCancel()
 	}
