@@ -75,26 +75,26 @@ by signing per-host leaf certs from a local CA.
    sudo apt-cacher-ultra ca print > apt-cacher-ultra-ca.crt
    ```
 
-3. Set up the CA key on every apt client:
+3. Set up the CA key on every apt client. Choose one of:
 
-  a. Install the CA and refresh the trust store:
+   a. Install the CA and refresh the system-wide trust store:
 
-   ```sh
-   sudo cp apt-cacher-ultra-ca.crt /usr/local/share/ca-certificates/
-   sudo update-ca-certificates
-   ```
+      ```sh
+      sudo cp apt-cacher-ultra-ca.crt /usr/local/share/ca-certificates/
+      sudo update-ca-certificates
+      ```
 
-  b. Place the CA cert and configure apt (and only apt) to use it:
+   b. Place the CA cert and configure apt (and only apt) to use it:
 
-   ```sh
-   sudo cp apt-cacher-ultra-ca.crt /usr/ssl/certs/ca-certificates/
-   ```
+      ```sh
+      sudo cp apt-cacher-ultra-ca.crt /etc/ssl/certs/
+      ```
 
-  Then in an `/etc/apt/apt.conf.d` file, add:
+      Then in an `/etc/apt/apt.conf.d` file, add:
 
-  ```
-  Acquire::https::CaInfo "/etc/ssl/certs/apt-cacher-ultra-ca.crt";
-  ```
+      ```
+      Acquire::https::CaInfo "/etc/ssl/certs/apt-cacher-ultra-ca.crt";
+      ```
 
 4. Generate the client apt-conf snippet (includes the CA fingerprint as
    a comment for verification):
