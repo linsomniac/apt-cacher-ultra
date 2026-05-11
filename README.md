@@ -14,6 +14,28 @@ environments.  I'm considering this ready for beta release.  I want to run
 more testing before the 1.0 release.  I have not done any multi-arch testing
 of the proxy.
 
+## Features
+
+- Drop-in apt-cacher-ng replacement — same :3142 port, proxy mode, and http://HTTPS/// URL convention, so existing
+client configs work unchanged.
+- Availability-first caching — cache hits never block on upstream; stale metadata is served when upstream is down/slow
+  rather than failing.
+- Atomic snapshot adoption — per-suite InRelease + all referenced Packages/by-hash blobs are staged, GPG-verified, and
+  flipped in a single SQLite transaction so clients always see a coherent metadata set.
+- TLS MITM (optional) — local CA signs per-host leaf certs so HTTPS repos (e.g. download.docker.com) can be cached,
+- Hash validation — every metadata file is checked against InRelease, every .deb against Packages; mismatches are
+rejected.
+- by-hash dedup — indices stored by content hash, deduplicated across suites.
+- Singleflight coalescing — N concurrent clients requesting the same uncached file produce one upstream fetch.
+- Resumable upstream fetches — HTTP Range used to resume on transient failure.
+gated by an allowed-host regex.
+- Freshness control — periodic and on-request InRelease checks with cooldown; hot-package proactive refresh.
+- Concurrency caps — per-host and global max_concurrent_adoptions semaphores keep adoption traffic from starving
+request-path callers.
+- Garbage collection — refcounted blobs are swept when no snapshot references them.
+- Observability — /metrics endpoint, status page, structured logs (see docs/log-fields.md).
+- Packaging — ships as a .deb with systemd unit, or as standalone go executable.
+
 ## Quickstart
 
 ### As Deb Package:
