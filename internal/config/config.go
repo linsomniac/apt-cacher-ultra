@@ -1093,8 +1093,14 @@ func checkWritable(dir string) error {
 		return fmt.Errorf("not writable: %w", err)
 	}
 	name := probe.Name()
-	_ = probe.Close()
-	return os.Remove(name)
+	closeErr := probe.Close()
+	// Always attempt the unlink, even if Close failed — leaving a
+	// stray probe file behind would be worse than the close error.
+	rmErr := os.Remove(name)
+	if closeErr != nil {
+		return fmt.Errorf("not writable: %w", closeErr)
+	}
+	return rmErr
 }
 
 // validateHtpasswdFile parses the given path's contents as Apache

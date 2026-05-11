@@ -95,7 +95,13 @@ func runCAPrint(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		auditKeyMode(stderr, suppliedKey)
-		_, _ = stdout.Write(certPEM)
+		// Surface short-writes / broken pipes so a `ca print > ca.crt`
+		// pipeline cannot silently materialize a truncated trust
+		// anchor and exit 0.
+		if _, err := stdout.Write(certPEM); err != nil {
+			_, _ = fmt.Fprintf(stderr, "ca print: write cert to stdout: %v\n", err)
+			return 2
+		}
 		return 0
 
 	default:
@@ -140,7 +146,11 @@ func runCAPrint(args []string, stdout, stderr io.Writer) int {
 		// confirm the fingerprint without re-parsing.
 		sum := sha256.Sum256(ca.Cert.Raw)
 		_, _ = fmt.Fprintf(stderr, "ca print: fingerprint sha256=%s\n", hex.EncodeToString(sum[:]))
-		_, _ = stdout.Write(out)
+		// Same rationale as the supplied-CA branch above.
+		if _, err := stdout.Write(out); err != nil {
+			_, _ = fmt.Fprintf(stderr, "ca print: write cert to stdout: %v\n", err)
+			return 2
+		}
 		return 0
 	}
 }
