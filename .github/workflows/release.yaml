@@ -12,14 +12,22 @@ on:
 permissions:
   contents: write
 
+# A repushed tag (delete+recreate) would otherwise race two release jobs
+# writing the same artifacts. Serialize per-ref.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
-      # Pin nfpm so a goreleaser release does not silently change the
-      # output .deb layout under us. Bump deliberately.
+      # Pin nfpm + its SHA256 so a goreleaser release does not silently
+      # change the output .deb layout under us and so we can detect tarball
+      # tampering before extracting as root. Bump both deliberately.
       NFPM_VERSION: 2.43.0
+      NFPM_SHA256: a80d5f724ed70b192ffa8a2bde469c013cef559c8afa3441eb51dd9a918beb6b
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,32 +41,71 @@ jobs:
           go-version: '1.25'
           cache: true
 
-      - name: Derive version
+      # Validate the tag name against a strict semver-ish regex BEFORE
+      # any context value is interpolated into a shell step. Git accepts
+      # refs like "1.2.3-';id;#" and the tag-filter glob is permissive
+      # about the prerelease suffix, so without this gate a maintainer
+      # who pushed a hostile tag could break out of quoted shell
+      # substitutions in steps below.
+      #
+      # Also computes a Debian-friendly version for the .deb: semver
+      # prereleases use "-" (0.9.0-rc1) but dpkg treats "-" as the
+      # upstream/revision separator, making "0.9.0-rc1" sort GREATER
+      # than "0.9.0". Translate "-" -> "~" only for the package
+      # version; the binary keeps the raw semver string.
+      - name: Derive and validate version
         id: vars
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Release version: ${VERSION}"
+          if ! [[ "${REF_NAME}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::Refusing to release from tag '${REF_NAME}'; expected MAJOR.MINOR.PATCH[-prerelease]" >&2
+            exit 1
+          fi
+          DEB_VERSION="${REF_NAME//-/\~}"
+          echo "version=${REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "deb_version=${DEB_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Release version: ${REF_NAME} (deb: ${DEB_VERSION})"
+
+      # Pre-publish sanity check. The main CI workflow gates merges to
+      # main, but a tag can be created on any commit (including a hotfix
+      # branch), so run the race-enabled suite here too rather than
+      # publish an artifact that has never been tested.
+      - name: Test
+        run: go test -race -timeout 10m ./...
 
       - name: Build binary
-        run: make build VERSION='${{ steps.vars.outputs.version }}'
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: make build VERSION="$VERSION"
 
       - name: Install nfpm
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/nfpm.tar.gz \
+          tmpdir="$(mktemp -d)"
+          curl -fsSL -o "${tmpdir}/nfpm.tar.gz" \
             "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
-          sudo tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
+          echo "${NFPM_SHA256}  ${tmpdir}/nfpm.tar.gz" | sha256sum -c -
+          tar -xzf "${tmpdir}/nfpm.tar.gz" -C "${tmpdir}" nfpm
+          sudo install -m 0755 "${tmpdir}/nfpm" /usr/local/bin/nfpm
           nfpm --version
 
       - name: Build .deb
-        run: make deb VERSION='${{ steps.vars.outputs.version }}'
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          DEB_VERSION: ${{ steps.vars.outputs.deb_version }}
+        # Override Makefile-computed DEB_VERSION (which only strips
+        # leading non-digits) so prerelease tags get tilde-translated.
+        run: make deb VERSION="$VERSION" DEB_VERSION="$DEB_VERSION"
 
       - name: Stage release artifacts
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          DEB_VERSION: ${{ steps.vars.outputs.deb_version }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          VERSION='${{ steps.vars.outputs.version }}'
           mkdir -p dist
 
           # Raw Go binary, renamed to include version + platform so it
@@ -66,9 +113,9 @@ jobs:
           cp build/apt-cacher-ultra "dist/apt-cacher-ultra-${VERSION}-linux-amd64"
 
           # The .deb keeps nfpm's Debian-conventional naming
-          # (apt-cacher-ultra_<version>_amd64.deb) so apt tooling
+          # (apt-cacher-ultra_<deb_version>_amd64.deb) so apt tooling
           # downstream can recognise it without renaming.
-          cp "build/apt-cacher-ultra_${VERSION}_amd64.deb" dist/
+          cp "build/apt-cacher-ultra_${DEB_VERSION}_amd64.deb" dist/
 
           # Source archive from the tag, prefixed so it expands into a
           # versioned directory.
@@ -76,7 +123,7 @@ jobs:
             --format=tar.gz \
             --prefix="apt-cacher-ultra-${VERSION}/" \
             -o "dist/apt-cacher-ultra-${VERSION}-source.tar.gz" \
-            "${GITHUB_REF_NAME}"
+            "${REF_NAME}"
 
           (cd dist && sha256sum * > SHA256SUMS)
           ls -lh dist/
@@ -91,6 +138,6 @@ jobs:
           generate_release_notes: true
           files: |
             dist/apt-cacher-ultra-${{ steps.vars.outputs.version }}-linux-amd64
-            dist/apt-cacher-ultra_${{ steps.vars.outputs.version }}_amd64.deb
+            dist/apt-cacher-ultra_${{ steps.vars.outputs.deb_version }}_amd64.deb
             dist/apt-cacher-ultra-${{ steps.vars.outputs.version }}-source.tar.gz
             dist/SHA256SUMS
