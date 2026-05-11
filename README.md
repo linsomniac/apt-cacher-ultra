@@ -8,11 +8,13 @@ under DDoS.
 
 ## Status
 
-Core functionality complete, currently running it in my test environment,
-works if I shut down upstream connectivity.  I expect to reach beta by mid May.
-I expect to switch my dev/stg environment by May 8, and prod by May 12.
+The bulk of the functionality is complete: caching, snapshots/adoption, MITM,
+serving cache when upstream is down.  I'm running it in my dev and staging
+environments.  I'm considering this ready for beta release.  I want to run
+more testing before the 1.0 release.  I have not done any multi-arch testing
+of the proxy.
 
-## Quickstart (when implemented)
+## Quickstart
 
 ### As Deb Package:
 
@@ -90,9 +92,11 @@ by signing per-host leaf certs from a local CA.
       sudo cp apt-cacher-ultra-ca.crt /etc/ssl/certs/
       ```
 
-      Then in an `/etc/apt/apt.conf.d` file, add:
+      Then in an `/etc/apt/apt.conf.d` file:
 
       ```
+      # /etc/apt/apt.conf.d/00aptcacher
+      Acquire::http::Proxy "http://[APT_CACHER_ULTRA_HOSTNAME:3142";
       Acquire::https::CaInfo "/etc/ssl/certs/apt-cacher-ultra-ca.crt";
       ```
 
