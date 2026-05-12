@@ -129,6 +129,22 @@ func main() {
 		os.Exit(runCAPrint(os.Args[3:], os.Stdout, os.Stderr))
 	}
 
+	// `packages list` / `packages copy` follow the same positional
+	// dispatch as `ca print`. The cache subcommands operate read-only
+	// on cache.db (SQLite WAL allows concurrent readers alongside the
+	// daemon) and do not touch the daemon's flag set.
+	if len(os.Args) >= 3 && os.Args[1] == "packages" {
+		switch os.Args[2] {
+		case "list":
+			os.Exit(runPackagesList(os.Args[3:], os.Stdout, os.Stderr))
+		case "copy":
+			os.Exit(runPackagesCopy(os.Args[3:], os.Stdout, os.Stderr))
+		default:
+			fmt.Fprintf(os.Stderr, "packages: unknown subcommand %q; want \"list\" or \"copy\"\n", os.Args[2])
+			os.Exit(1)
+		}
+	}
+
 	configPath := flag.String("config", "/etc/apt-cacher-ultra/config.toml", "path to TOML config file")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	printAptConf := flag.Bool("print-apt-conf", false, "print recommended /etc/apt/apt.conf.d snippet and exit (SPEC6 §14.2)")

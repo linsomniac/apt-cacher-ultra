@@ -130,6 +130,30 @@ by signing per-host leaf certs from a local CA.
        > /etc/apt/apt.conf.d/00aptcacher
    ```
 
+## Inspecting the cache
+
+Two read-only management subcommands let you see what's in the blob store
+and pull a specific `.deb` back out without touching the daemon. Both
+run safely while the daemon is live (SQLite WAL allows concurrent
+readers).
+
+```sh
+# List every cached .deb (NAME / SIZE / AGE / HOST(S))
+apt-cacher-ultra packages list -config /etc/apt-cacher-ultra/config.toml
+
+# Filter by substring against the .deb filename
+apt-cacher-ultra packages list -config /etc/apt-cacher-ultra/config.toml nginx
+
+# Alternate output formats
+apt-cacher-ultra packages list -format plain   # one filename per line
+apt-cacher-ultra packages list -format json    # JSON array
+
+# Copy a specific .deb out of the pool by exact filename.
+# Destination may be a directory (file is named after the .deb) or a path.
+apt-cacher-ultra packages copy -config /etc/apt-cacher-ultra/config.toml \
+    nginx_1.18.0-1_amd64.deb /tmp/
+```
+
 ## Build
 
 ```sh

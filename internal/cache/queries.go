@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path"
 	"sort"
+	"strings"
 )
 
 // ErrNotFound is returned when a row is absent. Callers should distinguish
@@ -929,4 +931,152 @@ ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
 		}
 		return nil
 	})
+}
+
+// ListCachedDebs returns every cached .deb whose filename basename
+// contains substring (empty = all). Rows are deduped by
+// (Filename, BlobHash): when the same .deb basename resolves to the
+// same blob through multiple canonical hosts (mirrors sharing content),
+// one row is returned listing every host in Hosts. Different blob
+// hashes under the same filename surface as separate rows. Output is
+// sorted by (Filename, BlobHash).
+//
+// Read-only; safe to call alongside the running daemon — the underlying
+// query is a single SELECT over url_path JOIN blob and runs against the
+// shared pool of readers (SQLite WAL).
+//
+// Only url_path rows with a non-NULL blob_hash AND a path ending in
+// ".deb" (case-sensitive GLOB) are considered, matching the
+// management-command scope decision.
+func (c *Cache) ListCachedDebs(ctx context.Context, substring string) ([]CachedDeb, error) {
+	rows, err := c.queryCachedDebRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return collapseCachedDebs(rows, func(filename string) bool {
+		return substring == "" || strings.Contains(filename, substring)
+	}), nil
+}
+
+// LookupCachedDebByName returns every cached .deb whose filename
+// basename equals filename exactly. Same dedup rules as ListCachedDebs.
+// Used by `packages copy` to resolve the user's exact-name argument:
+//
+//   - len(result) == 0 → not cached.
+//   - len(result) == 1 → unambiguous; copy the named blob.
+//   - len(result) >  1 → same filename resolved to multiple distinct
+//     blob hashes across hosts (upstream divergence); caller surfaces
+//     the ambiguity rather than guessing.
+//
+// Read-only.
+func (c *Cache) LookupCachedDebByName(ctx context.Context, filename string) ([]CachedDeb, error) {
+	rows, err := c.queryCachedDebRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return collapseCachedDebs(rows, func(f string) bool {
+		return f == filename
+	}), nil
+}
+
+// cachedDebRow is a single (host, path, blob_hash, size, created_at)
+// tuple from the SELECT below — collapsed in Go into one CachedDeb per
+// (basename, blob_hash) group.
+type cachedDebRow struct {
+	Host      string
+	Path      string
+	BlobHash  string
+	Size      int64
+	CreatedAt int64
+}
+
+// queryCachedDebRows runs the .deb-filter SELECT and returns the raw
+// per-host rows. SQLite has no convenient basename function, so the
+// extraction + dedup happens in Go. The result set is bounded by the
+// number of cached .deb files (typically thousands, occasionally tens
+// of thousands) — well within the size where an in-process group-by is
+// cheaper than a SQLite UDF.
+func (c *Cache) queryCachedDebRows(ctx context.Context) ([]cachedDebRow, error) {
+	const q = `
+SELECT u.canonical_host, u.path, u.blob_hash, b.size, b.created_at
+  FROM url_path u
+  JOIN blob b ON b.hash = u.blob_hash
+ WHERE u.blob_hash IS NOT NULL
+   AND u.path GLOB '*.deb'`
+	rows, err := c.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("queryCachedDebRows: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []cachedDebRow
+	for rows.Next() {
+		var r cachedDebRow
+		if err := rows.Scan(&r.Host, &r.Path, &r.BlobHash, &r.Size, &r.CreatedAt); err != nil {
+			return nil, fmt.Errorf("queryCachedDebRows scan: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("queryCachedDebRows iter: %w", err)
+	}
+	return out, nil
+}
+
+// collapseCachedDebs groups raw rows by (basename, blob_hash) and
+// applies the filename predicate. Hosts within a group are deduped and
+// sorted; the final slice is sorted by (Filename, BlobHash).
+func collapseCachedDebs(rows []cachedDebRow, keep func(filename string) bool) []CachedDeb {
+	type key struct{ filename, hash string }
+	groups := make(map[key]*CachedDeb)
+	for _, r := range rows {
+		name := path.Base(r.Path)
+		if !keep(name) {
+			continue
+		}
+		k := key{name, r.BlobHash}
+		g, ok := groups[k]
+		if !ok {
+			g = &CachedDeb{
+				Filename:  name,
+				BlobHash:  r.BlobHash,
+				Size:      r.Size,
+				CreatedAt: r.CreatedAt,
+			}
+			groups[k] = g
+		}
+		g.Hosts = append(g.Hosts, r.Host)
+	}
+	out := make([]CachedDeb, 0, len(groups))
+	for _, g := range groups {
+		// Dedup hosts: a single (host, path) is the url_path PK so
+		// duplicates can only arise from defensive callers, but
+		// sort+compact here keeps Hosts canonical regardless.
+		sort.Strings(g.Hosts)
+		g.Hosts = compactSortedStrings(g.Hosts)
+		out = append(out, *g)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Filename != out[j].Filename {
+			return out[i].Filename < out[j].Filename
+		}
+		return out[i].BlobHash < out[j].BlobHash
+	})
+	return out
+}
+
+// compactSortedStrings removes consecutive duplicates from a sorted
+// slice in place. Cheaper than building a set when the typical input
+// has 1–3 entries.
+func compactSortedStrings(s []string) []string {
+	if len(s) < 2 {
+		return s
+	}
+	w := 1
+	for i := 1; i < len(s); i++ {
+		if s[i] != s[w-1] {
+			s[w] = s[i]
+			w++
+		}
+	}
+	return s[:w]
 }

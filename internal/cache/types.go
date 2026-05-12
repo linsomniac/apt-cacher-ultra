@@ -244,3 +244,22 @@ type HotSetEntry struct {
 	Path           string
 	DeclaredSHA256 string
 }
+
+// CachedDeb is one .deb file cached in the pool, deduped across
+// (canonical_host) rows that resolve to the same (Filename, BlobHash)
+// tuple. Returned by ListCachedDebs / LookupCachedDebByName for the
+// `packages list` and `packages copy` management subcommands.
+//
+// Hosts is the set of canonical hosts whose url_path row points at
+// BlobHash for this Filename — typically one entry, but mirrors that
+// share content (e.g. archive.ubuntu.com and a downstream mirror)
+// collapse here. When the same .deb basename resolves to *different*
+// blob hashes across hosts (rare; usually means upstream divergence),
+// each distinct hash surfaces as its own CachedDeb row.
+type CachedDeb struct {
+	Filename  string   // basename of url_path.path, e.g. "nginx_1.18_amd64.deb"
+	BlobHash  string   // sha256 hex of the pool blob
+	Size      int64    // blob.size
+	CreatedAt int64    // blob.created_at, unix seconds
+	Hosts     []string // canonical hosts serving this (Filename, BlobHash); sorted
+}
