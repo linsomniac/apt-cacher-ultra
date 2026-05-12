@@ -700,6 +700,38 @@ func TestPhase2_GPGFingerprintCaseSensitivity(t *testing.T) {
 	}
 }
 
+// TestLoad_DurationDayUnit: Duration's TOML unmarshaler accepts a "d"
+// (days) suffix that time.ParseDuration itself does not understand.
+// Days are converted to hours (×24) before parsing, so "d" composes
+// freely with the standard units (e.g. "1d12h" → 36h).
+func TestLoad_DurationDayUnit(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"2d", 48 * time.Hour},
+		{"1d12h", 36 * time.Hour},
+		{"0.5d", 12 * time.Hour},
+		{"7d", 7 * 24 * time.Hour},
+	}
+	for _, tc := range cases {
+		dir := t.TempDir()
+		path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[hot_packages]
+window = "`+tc.in+`"
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load(%q): %v", tc.in, err)
+		}
+		if got := cfg.HotPackages.Window.Duration; got != tc.want {
+			t.Errorf("window=%q: got %s, want %s", tc.in, got, tc.want)
+		}
+	}
+}
+
 // TestLoad_HotPackagesWindowDefaultApplied: omitted hot_packages.window
 // gets the SPEC3 §5.2 default of 24h.
 func TestLoad_HotPackagesWindowDefaultApplied(t *testing.T) {

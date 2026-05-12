@@ -424,13 +424,28 @@ type MirrorRule struct {
 }
 
 // Duration wraps time.Duration with TOML text unmarshaling so durations can
-// be written as "30s", "5m", etc.
+// be written as "30s", "5m", "2d", "1d12h", etc. Go's time.ParseDuration
+// has no "d" unit; we pre-rewrite any "<number>d" segments to their hour
+// equivalent (×24) and let ParseDuration handle the rest.
 type Duration struct {
 	time.Duration
 }
 
+// durationDayRe matches a decimal number (with optional fractional part)
+// immediately followed by the "d" unit. The unit set understood by
+// time.ParseDuration (ns, us, µs, ms, s, m, h) contains no "d", so the
+// rewrite is unambiguous.
+var durationDayRe = regexp.MustCompile(`(\d+(?:\.\d+)?)d`)
+
 func (d *Duration) UnmarshalText(text []byte) error {
-	parsed, err := time.ParseDuration(string(text))
+	s := durationDayRe.ReplaceAllStringFunc(string(text), func(m string) string {
+		n, err := strconv.ParseFloat(m[:len(m)-1], 64)
+		if err != nil {
+			return m
+		}
+		return strconv.FormatFloat(n*24, 'f', -1, 64) + "h"
+	})
+	parsed, err := time.ParseDuration(s)
 	if err != nil {
 		return err
 	}
