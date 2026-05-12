@@ -732,6 +732,30 @@ window = "`+tc.in+`"
 	}
 }
 
+// TestLoad_DurationInvalidValues: malformed duration strings surface a
+// useful error that quotes the operator-supplied value, not the
+// post-day-rewrite form.
+func TestLoad_DurationInvalidValues(t *testing.T) {
+	cases := []string{"1day", "d", "1d2x", "abc", "12"}
+	for _, in := range cases {
+		dir := t.TempDir()
+		path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[hot_packages]
+window = "`+in+`"
+`)
+		_, err := Load(path)
+		if err == nil {
+			t.Errorf("window=%q: expected error, got nil", in)
+			continue
+		}
+		if !strings.Contains(err.Error(), in) {
+			t.Errorf("window=%q: error %q does not quote original input", in, err.Error())
+		}
+	}
+}
+
 // TestLoad_HotPackagesWindowDefaultApplied: omitted hot_packages.window
 // gets the SPEC3 §5.2 default of 24h.
 func TestLoad_HotPackagesWindowDefaultApplied(t *testing.T) {

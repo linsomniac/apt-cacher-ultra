@@ -438,7 +438,8 @@ type Duration struct {
 var durationDayRe = regexp.MustCompile(`(\d+(?:\.\d+)?)d`)
 
 func (d *Duration) UnmarshalText(text []byte) error {
-	s := durationDayRe.ReplaceAllStringFunc(string(text), func(m string) string {
+	orig := string(text)
+	s := durationDayRe.ReplaceAllStringFunc(orig, func(m string) string {
 		n, err := strconv.ParseFloat(m[:len(m)-1], 64)
 		if err != nil {
 			return m
@@ -447,7 +448,11 @@ func (d *Duration) UnmarshalText(text []byte) error {
 	})
 	parsed, err := time.ParseDuration(s)
 	if err != nil {
-		return err
+		// Report the operator-supplied value, not the post-rewrite form:
+		// "1day" becomes "24hay" after the day-rewrite pass and the raw
+		// time.ParseDuration error mentions the rewritten string, which
+		// is confusing in operator-facing diagnostics.
+		return fmt.Errorf("invalid duration %q: %w", orig, err)
 	}
 	d.Duration = parsed
 	return nil
