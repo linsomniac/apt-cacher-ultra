@@ -8,11 +8,11 @@ under DDoS.
 
 ## Status
 
-The bulk of the functionality is complete: caching, snapshots/adoption, MITM,
-serving cache when upstream is down.  I'm running it in my dev and staging
-environments.  I'm considering this ready for beta release.  I want to run
-more testing before the 1.0 release.  I have not done any multi-arch testing
-of the proxy.
+Functionality is complete.  I have it running in all my environments and am
+just letting it "soak" to see if there are any long-term issues.  There are some
+"stretch goals" I might consider adding, but they are largely "polishing brass".
+I have not done any multi-arch testing.  Will consider a 1.0 release in June if
+no issues crop up during my soak.
 
 ## Features
 
