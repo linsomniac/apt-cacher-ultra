@@ -1074,8 +1074,12 @@ func TestStatusJSON_TLSMITM_TopLevelKeyAlwaysPresent(t *testing.T) {
 }
 
 // TestStatusHTML_TLSMITM_SectionRendersWhenEnabled checks the HTML
-// status page renders the SPEC6 §10.4 TLS MITM section between
-// Listeners and Cache when MITM is enabled.
+// status page renders the SPEC6 §10.4 TLS MITM block when MITM is
+// enabled. The redesign (docs/admin-ui-spec.md) places the MITM
+// content inside the Plumbing panel under an <h3> rather than the
+// previous top-level <h2>; the data is still visible per its own
+// labelled rows. CA fingerprint is now chunked via chunkHex (groups
+// of 4 hex separated by space).
 func TestStatusHTML_TLSMITM_SectionRendersWhenEnabled(t *testing.T) {
 	issuedAt := time.Unix(1_730_000_000, 0)
 	snap := TLSMITMSnapshot{
@@ -1099,22 +1103,17 @@ func TestStatusHTML_TLSMITM_SectionRendersWhenEnabled(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 
-	if !strings.Contains(html, "<h2>TLS MITM</h2>") {
-		t.Errorf("HTML missing <h2>TLS MITM</h2>")
-	}
-	// SPEC6 §10.4: section sits between Listeners and Cache.
-	listenersIdx := strings.Index(html, "<h2>Listeners</h2>")
-	mitmIdx := strings.Index(html, "<h2>TLS MITM</h2>")
-	cacheIdx := strings.Index(html, "<h2>Cache</h2>")
-	if listenersIdx >= mitmIdx || mitmIdx >= cacheIdx {
-		t.Errorf("section ordering wrong: Listeners=%d, TLS MITM=%d, Cache=%d", listenersIdx, mitmIdx, cacheIdx)
+	// The redesigned layout exposes MITM under the Plumbing panel, with
+	// an <h3>TLS MITM</h3> heading, not <h2>.
+	if !strings.Contains(html, "TLS MITM") {
+		t.Errorf("HTML missing TLS MITM heading; body:\n%s", html)
 	}
 	for _, want := range []string{
-		"deadbeefcafebabe",   // CA fingerprint
-		"archive.ubuntu.com", // last cert issued host
-		"3 / 256",            // cert cache
-		"^archive",           // effective allowlist (escaped to ^archive in HTML)
-		"80.0% (5 lookups)",  // hit rate
+		"dead beef cafe babe", // CA fingerprint, now chunkHex'd into 4-hex groups
+		"archive.ubuntu.com",  // last cert issued host
+		"3 / 256",             // cert cache
+		"^archive",            // effective allowlist (escaped to ^archive in HTML)
+		"80.0% (5 lookups)",   // hit rate
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("HTML missing %q; body:\n%s", want, html)
@@ -1133,8 +1132,13 @@ func TestStatusHTML_TLSMITM_SectionOmittedWhenDisabled(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 
-	if strings.Contains(html, "<h2>TLS MITM</h2>") {
-		t.Errorf("HTML rendered TLS MITM section even though disabled")
+	// The Plumbing panel header always reads "Listeners, TLS MITM,
+	// build" per mockup, so a bare "TLS MITM" substring isn't a clean
+	// signal. The MITM detail block ships the "CA fingerprint
+	// (SHA-256)" key only when Enabled — that's the unique tripwire
+	// for whether the MITM kv table actually rendered.
+	if strings.Contains(html, "CA fingerprint (SHA-256)") {
+		t.Errorf("HTML rendered TLS MITM detail block even though disabled")
 	}
 }
 

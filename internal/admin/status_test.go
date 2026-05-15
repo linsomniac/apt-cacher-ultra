@@ -198,9 +198,9 @@ func TestVitalState(t *testing.T) {
 		kind string
 		want string
 	}{
-		{"cache_healthy", func(*htmlRenderModel) {}, "cache", "healthy"},
+		{"cache_healthy", func(*htmlRenderModel) {}, "cache", "ok"},
 		{"cache_stale_empty_bytes", func(m *htmlRenderModel) { m.Cache.BytesUsed = 0 }, "cache", "stale"},
-		{"cache_watching_backlog", func(m *htmlRenderModel) { m.Cache.ZeroRefcountBacklog = 1001 }, "cache", "watching"},
+		{"cache_watching_backlog", func(m *htmlRenderModel) { m.Cache.ZeroRefcountBacklog = 1001 }, "cache", "warn"},
 		{"cache_crit_pool_unlink", func(m *htmlRenderModel) { m.GC.PoolUnlinkErrors = 1 }, "cache", "crit"},
 
 		{"suites_stale_empty", func(*htmlRenderModel) {}, "suites", "stale"},
@@ -212,7 +212,7 @@ func TestVitalState(t *testing.T) {
 					InReleaseChangeSeenAtUnixTime: ptrI64(1_000_000_000),
 				}}
 			},
-			"suites", "healthy",
+			"suites", "ok",
 		},
 		{
 			"suites_watching_lag_under_24h",
@@ -222,7 +222,7 @@ func TestVitalState(t *testing.T) {
 					InReleaseChangeSeenAtUnixTime: ptrI64(1_000_000_000 + 3600),
 				}}
 			},
-			"suites", "watching",
+			"suites", "warn",
 		},
 		{
 			"suites_crit_lag_over_24h",
@@ -243,7 +243,7 @@ func TestVitalState(t *testing.T) {
 		{
 			"adoptions_healthy_post_warmup",
 			func(m *htmlRenderModel) {}, // uptime already 3600s, empty ring
-			"adoptions", "healthy",
+			"adoptions", "ok",
 		},
 		{
 			"adoptions_watching_at_10pct",
@@ -254,7 +254,7 @@ func TestVitalState(t *testing.T) {
 				}
 				m.RecentAdoptions[0].Outcome = "gpg_failed"
 			},
-			"adoptions", "watching",
+			"adoptions", "warn",
 		},
 		{
 			"adoptions_crit_at_50pct",
@@ -281,7 +281,7 @@ func TestVitalState(t *testing.T) {
 			func(m *htmlRenderModel) { m.GC = nil },
 			"gc", "stale",
 		},
-		{"gc_healthy_recent", func(*htmlRenderModel) {}, "gc", "healthy"},
+		{"gc_healthy_recent", func(*htmlRenderModel) {}, "gc", "ok"},
 		{
 			"gc_watching_over_2x_interval",
 			func(m *htmlRenderModel) {
@@ -290,7 +290,7 @@ func TestVitalState(t *testing.T) {
 				m.Process.StartedUnixTime = 1_000_000_000
 				m.Process.UptimeSeconds = 200 // age 200 > 2*60
 			},
-			"gc", "watching",
+			"gc", "warn",
 		},
 		{
 			"gc_watching_suppressed_when_interval_zero",
@@ -300,7 +300,7 @@ func TestVitalState(t *testing.T) {
 				m.Process.StartedUnixTime = 1_000_000_000
 				m.Process.UptimeSeconds = 999999
 			},
-			"gc", "healthy",
+			"gc", "ok",
 		},
 		{
 			"gc_crit_deadline_reached",
@@ -318,16 +318,16 @@ func TestVitalState(t *testing.T) {
 			func(m *htmlRenderModel) { m.Process.UptimeSeconds = 100 },
 			"active", "stale",
 		},
-		{"active_healthy_post_warmup_empty", func(*htmlRenderModel) {}, "active", "healthy"},
+		{"active_healthy_post_warmup_empty", func(*htmlRenderModel) {}, "active", "ok"},
 		{
 			"active_healthy_with_host",
 			func(m *htmlRenderModel) {
 				m.ActiveHosts = []activeHostInfo{{Host: "x", Inflight: 1, SlotCapacity: 4}}
 			},
-			"active", "healthy",
+			"active", "ok",
 		},
 
-		{"unknown_kind_defaults_healthy", func(*htmlRenderModel) {}, "fnord", "healthy"},
+		{"unknown_kind_defaults_healthy", func(*htmlRenderModel) {}, "fnord", "ok"},
 	}
 	for _, c := range cases {
 		c := c
@@ -498,7 +498,7 @@ func TestOutcomeBadgeClass(t *testing.T) {
 		{"fetch_failed", "b--crit"},
 		{"parse_failed", "b--crit"},
 		{"lagging", "b--warn"},
-		{"watching", "b--warn"},
+		{"warn", "b--warn"},
 		{"", "b--stale"},
 		{"future_unknown_outcome", "b--stale"},
 	}

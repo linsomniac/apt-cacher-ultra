@@ -725,6 +725,13 @@ func chooseFormat(r *http.Request) string {
 // statusHTMLTemplate renders the SPEC5 §9.7.3 HTML status page.
 // html/template auto-escapes every interpolated value; never
 // switch to text/template without a full security review.
+//
+// AIDEV-NOTE: visual ground truth is docs/admin-ui-mockup.html; the
+// implementation contract is docs/admin-ui-spec.md. When the mockup and
+// spec disagree the mockup wins (per the spec's opening paragraph). The
+// data-* attribute contract this template emits is the §7 contract the
+// inline JS below reads — keep them in sync in the same change.
+
 // statusTemplateFuncMap returns the html/template func map used by the
 // admin status page. Existing helpers are preserved verbatim; the
 // docs/admin-ui-spec.md §6.1 helpers (chunkHex … verdictExplanation) are
@@ -748,6 +755,7 @@ func statusTemplateFuncMap() template.FuncMap {
 		"outcomeBadgeClass":   outcomeBadgeClass,
 		"vitalState":          vitalState,
 		"verdictExplanation":  verdictExplanation,
+		"add1":                func(n int) int { return n + 1 },
 	}
 }
 
@@ -757,225 +765,669 @@ const statusHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="refresh" content="60">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>apt-cacher-ultra status</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%237A2E0A'/%3E%3Ctext x='3' y='12' font-family='ui-monospace,monospace' font-size='12' fill='%23FAFAF7' font-weight='700'%3E%C2%AB%3C/text%3E%3C/svg%3E">
+<script>(function(){try{var s=localStorage.getItem('acu-theme');if(s==='light'||s==='dark')document.documentElement.setAttribute('data-theme',s);}catch(e){}})();</script>
 <style>
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  margin: 1.5em; color: #1a1a1a; }
-h1 { font-size: 1.4em; margin-bottom: 0.3em; }
-h2 { font-size: 1.1em; margin-top: 2em; border-bottom: 1px solid #ccc;
-  padding-bottom: 0.2em; }
-table { border-collapse: collapse; margin-top: 0.5em; }
-th, td { padding: 4px 12px; text-align: left;
-  border-bottom: 1px solid #eee; vertical-align: top; }
-th { background: #f6f6f6; }
-.muted { color: #888; }
-.json-link { float: right; font-size: 0.9em; }
-code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
+:root{
+--ink-0:#FAFAF7;--ink-1:#F2F1EC;--ink-2:#E5E3DA;--ink-3:#C7C4B8;
+--ink-4:#7A7669;--ink-5:#3A3833;--ink-6:#1A1815;
+--accent:#7A2E0A;--ok:#2E5D3A;--warn:#A36410;--crit:#9A1F1B;--stale:#5C5A52;
+--row-tint:rgba(0,0,0,0.018);--crit-tint:rgba(154,31,27,0.04);--warn-tint:rgba(163,100,16,0.045);
+--font-sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+--font-mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+--max-w:1400px;--rail-w:200px;--bar-h:64px;
+--xs:11px;--sm:12.5px;--base:14px;--md:16px;--lg:20px;--xl:28px;
+--r-pill:999px;--r-badge:2px;
+}
+@media (prefers-color-scheme:dark){:root{
+--ink-0:#15171A;--ink-1:#1B1E22;--ink-2:#2A2D32;--ink-3:#4A4D54;
+--ink-4:#8E8F94;--ink-5:#C5C6CB;--ink-6:#EDEEF1;
+--accent:#E08B5A;--ok:#7FB68E;--warn:#E0B05A;--crit:#E7716E;--stale:#7A7C82;
+--row-tint:rgba(255,255,255,0.022);--crit-tint:rgba(231,113,110,0.06);--warn-tint:rgba(224,176,90,0.05);
+}}
+[data-theme="light"]{--ink-0:#FAFAF7;--ink-1:#F2F1EC;--ink-2:#E5E3DA;--ink-3:#C7C4B8;--ink-4:#7A7669;--ink-5:#3A3833;--ink-6:#1A1815;--accent:#7A2E0A;--ok:#2E5D3A;--warn:#A36410;--crit:#9A1F1B;--stale:#5C5A52;--row-tint:rgba(0,0,0,0.018);--crit-tint:rgba(154,31,27,0.04);--warn-tint:rgba(163,100,16,0.045)}
+[data-theme="dark"]{--ink-0:#15171A;--ink-1:#1B1E22;--ink-2:#2A2D32;--ink-3:#4A4D54;--ink-4:#8E8F94;--ink-5:#C5C6CB;--ink-6:#EDEEF1;--accent:#E08B5A;--ok:#7FB68E;--warn:#E0B05A;--crit:#E7716E;--stale:#7A7C82;--row-tint:rgba(255,255,255,0.022);--crit-tint:rgba(231,113,110,0.06);--warn-tint:rgba(224,176,90,0.05)}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--ink-0);color:var(--ink-5);font-family:var(--font-sans);font-size:var(--base);line-height:1.55;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none;border-bottom:1px solid transparent;transition:border-color 120ms ease}
+a:hover{border-bottom-color:var(--accent)}
+a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:1px}
+code{font-family:var(--font-mono);font-size:.92em;color:var(--ink-5);background:transparent;padding:0}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+.bar{position:sticky;top:0;z-index:30;height:var(--bar-h);background:var(--ink-0);border-bottom:1px solid var(--ink-2);display:flex;align-items:center;padding:0 32px;gap:24px;animation:fadeIn 600ms ease both}
+.bar__brand{display:flex;align-items:baseline;gap:8px;font-weight:600;font-size:var(--md);color:var(--ink-6)}
+.bar__mark{font-family:var(--font-mono);font-weight:700;font-size:22px;color:var(--accent);line-height:1;margin-right:2px;position:relative;top:2px}
+.bar__version{font-family:var(--font-mono);font-size:var(--xs);color:var(--ink-4);letter-spacing:.04em}
+.bar__verdict{display:flex;align-items:center;gap:14px;flex:1;min-width:0}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:8px 16px 8px 12px;border-radius:var(--r-pill);font-weight:600;font-size:var(--sm);letter-spacing:.08em;text-transform:uppercase;white-space:nowrap}
+.pill--healthy{background:color-mix(in srgb,var(--ok) 12%,transparent);color:var(--ok)}
+.pill--watching{background:color-mix(in srgb,var(--warn) 14%,transparent);color:var(--warn)}
+.pill--degraded{background:color-mix(in srgb,var(--crit) 14%,transparent);color:var(--crit)}
+.pill--stale{background:color-mix(in srgb,var(--stale) 14%,transparent);color:var(--stale)}
+.pill .dot{width:10px;height:10px;border-radius:50%;background:currentColor}
+.verdict__msg{font-size:var(--sm);color:var(--ink-5);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.verdict__msg strong{color:var(--ink-6);font-weight:600}
+.bar__meta{display:flex;align-items:center;gap:16px;margin-left:auto;font-size:var(--xs);color:var(--ink-4);letter-spacing:.04em}
+.bar__meta .sep{color:var(--ink-3)}
+.icon-btn{width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;background:transparent;border:1px solid var(--ink-2);color:var(--ink-4);cursor:pointer;border-radius:2px;transition:background 120ms ease,color 120ms ease}
+.icon-btn:hover{color:var(--ink-6);background:var(--ink-1)}
+.icon-btn svg{width:16px;height:16px}
+.page{max-width:var(--max-w);margin:0 auto;padding:32px 32px 96px}
+.vitals{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:0;border:1px solid var(--ink-2);margin-bottom:32px;background:var(--ink-0)}
+.vital{position:relative;padding:20px 24px 22px 28px;border-right:1px solid var(--ink-2);display:flex;flex-direction:column;gap:8px;min-height:132px}
+.vital:last-child{border-right:0}
+.vital::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--ink-2)}
+.vital[data-state="ok"]::before{background:var(--ok)}
+.vital[data-state="warn"]::before{background:var(--warn)}
+.vital[data-state="crit"]::before{background:var(--crit)}
+.vital[data-state="stale"]::before{background:var(--stale)}
+.vital__label{font-size:var(--xs);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);font-weight:500}
+.vital__value{font-size:var(--xl);font-weight:600;color:var(--ink-6);letter-spacing:-.015em;line-height:1.1;font-variant-numeric:tabular-nums}
+.vital__value .unit{font-size:var(--md);color:var(--ink-4);font-weight:500;margin-left:4px;letter-spacing:0}
+.vital__sub{font-size:var(--sm);color:var(--ink-4);display:flex;flex-direction:column;gap:2px}
+.vital__sub .accented-warn{color:var(--warn)}
+.vital__sub .accented-crit{color:var(--crit)}
+.vital__sub .accented-ok{color:var(--ok)}
+.vital__sub .mono{font-family:var(--font-mono);font-size:12px}
+.notice{border:1px solid var(--crit);border-left-width:4px;padding:16px 20px 18px;margin-bottom:24px;background:var(--crit-tint);display:flex;flex-direction:column;gap:6px}
+.notice--warn{border-color:var(--warn);background:var(--warn-tint)}
+.notice__head{font-size:var(--md);color:var(--ink-6);font-weight:600;display:flex;align-items:center;gap:10px}
+.notice .dot{width:10px;height:10px;border-radius:50%;background:var(--crit);display:inline-block}
+.notice--warn .dot{background:var(--warn)}
+.notice__body{font-size:var(--sm);color:var(--ink-4);line-height:1.6}
+.notice__body code{color:var(--ink-6);background:var(--ink-1);padding:1px 6px;border-radius:2px;font-size:12px}
+.notice__link-row{display:block;margin-top:10px;padding-top:10px;border-top:1px solid var(--ink-2);font-size:var(--sm);color:var(--ink-4)}
+.notice__link-row a{color:var(--accent);font-weight:500}
+.layout{display:grid;grid-template-columns:var(--rail-w) 1fr;gap:48px;align-items:start}
+.rail{position:sticky;top:calc(var(--bar-h) + 24px);border-left:1px solid var(--ink-2)}
+.rail ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px}
+.rail a{display:block;padding:6px 0 6px 16px;font-size:var(--xs);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);font-weight:500;border-bottom:none;position:relative;transition:color 120ms ease}
+.rail a:hover{color:var(--ink-6)}
+.rail a[aria-current="location"]{color:var(--ink-6)}
+.rail a[aria-current="location"]::before{content:"";position:absolute;left:-1px;top:50%;transform:translateY(-50%);width:2px;height:16px;background:var(--accent)}
+.content{min-width:0}
+section.panel{margin-bottom:48px;scroll-margin-top:calc(var(--bar-h) + 16px)}
+.panel__eyebrow{font-size:var(--xs);letter-spacing:.12em;text-transform:uppercase;color:var(--ink-4);font-weight:500;margin-bottom:4px;display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.panel__eyebrow .count-warn{color:var(--warn)}
+.panel__eyebrow .count-crit{color:var(--crit)}
+.panel__eyebrow .count-ok{color:var(--ok)}
+.panel__eyebrow .sep{color:var(--ink-3)}
+.panel__h{font-size:var(--lg);font-weight:600;color:var(--ink-6);margin:0 0 14px 0;letter-spacing:-.01em}
+.panel__desc{font-size:var(--sm);color:var(--ink-4);margin:0 0 16px 0;max-width:64ch}
+.table-wrap{overflow-x:auto;border-top:1px solid var(--ink-2);border-bottom:1px solid var(--ink-2)}
+table.data{font-size:var(--sm);color:var(--ink-5)}
+table.data thead th{position:sticky;top:var(--bar-h);background:var(--ink-1);z-index:2;text-align:left;font-size:var(--xs);font-weight:500;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);padding:10px 14px;border-bottom:1px solid var(--ink-2);white-space:nowrap}
+table.data tbody td{padding:9px 14px;border-bottom:0;vertical-align:middle;white-space:nowrap}
+table.data tbody tr:nth-child(even){background:var(--row-tint)}
+table.data tbody tr:hover{background:var(--ink-1)}
+table.data .num{text-align:right;font-variant-numeric:tabular-nums}
+table.data .mono{font-family:var(--font-mono);font-size:12px;color:var(--ink-5)}
+table.data .host{font-family:var(--font-mono);font-size:12px;color:var(--ink-6)}
+table.data .muted{color:var(--ink-3)}
+table.data .time{font-family:var(--font-mono);font-size:12px;color:var(--ink-5)}
+table.data tr[data-state="warn"] td:first-child{box-shadow:inset 3px 0 0 0 var(--warn)}
+table.data tr[data-state="crit"] td:first-child{box-shadow:inset 3px 0 0 0 var(--crit)}
+table.data tr[data-state="stale"] td:first-child{box-shadow:inset 3px 0 0 0 var(--stale)}
+table.data tr[data-state="warn"]{background:var(--warn-tint)}
+table.data tr[data-state="crit"]{background:var(--crit-tint)}
+table.data tr[data-state="warn"]:nth-child(even){background:var(--warn-tint)}
+table.data tr[data-state="crit"]:nth-child(even){background:var(--crit-tint)}
+.b{display:inline-block;padding:1px 8px 2px;border-radius:var(--r-badge);border:1px solid currentColor;font-size:10px;letter-spacing:.08em;font-weight:500;text-transform:uppercase;background:transparent;line-height:1.4;white-space:nowrap}
+.b--ok{color:var(--ok)}.b--warn{color:var(--warn)}.b--crit{color:var(--crit)}.b--stale{color:var(--stale)}
+.b--neutral{color:var(--ink-4);border-color:var(--ink-3)}
+.lagging{margin-left:8px;font-size:11px;color:var(--warn);font-variant-numeric:tabular-nums}
+.keys-chip{display:inline-flex;align-items:center;gap:6px;padding:4px 9px 4px 8px;border:1px solid var(--ink-2);border-radius:2px;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);transition:background 120ms ease,color 120ms ease,border-color 120ms ease}
+.keys-chip:hover{background:var(--ink-1);color:var(--ink-6);border-color:var(--ink-3)}
+.keys-chip__count{font-family:var(--font-mono);font-size:11px;letter-spacing:0;color:var(--ink-6);font-weight:600;font-variant-numeric:tabular-nums}
+.keys-chip__tick{color:var(--ok);font-size:12px;letter-spacing:0}
+.keys-chip[data-state="crit"]{color:var(--crit);border-color:var(--crit)}
+.keys-chip[data-state="crit"] .keys-chip__count{color:var(--crit)}
+.keys-chip[data-state="crit"] .keys-chip__tick{color:var(--crit)}
+.src{display:inline-block;padding:1px 7px 2px;border-radius:var(--r-badge);border:1px solid currentColor;font-size:9.5px;letter-spacing:.1em;font-weight:500;text-transform:uppercase;background:transparent;line-height:1.4;white-space:nowrap}
+.src--bundled{color:var(--ink-4);border-color:var(--ink-3)}
+.src--system{color:var(--ink-5);border-color:var(--ink-3)}
+.src--custom{color:var(--accent)}
+.src-path{display:inline-block;margin-left:8px;font-family:var(--font-mono);font-size:11px;color:var(--ink-4)}
+.fp{display:inline-block;font-family:var(--font-mono);font-size:12px;letter-spacing:.02em;color:var(--ink-6);font-variant-numeric:tabular-nums;word-spacing:1px;white-space:nowrap}
+.fp--sub{color:var(--ink-4);font-size:11px}
+.uid{display:block;font-size:12.5px;color:var(--ink-6);max-width:38ch;line-height:1.4}
+.uid__email{display:block;font-family:var(--font-mono);font-size:11px;color:var(--ink-4);margin-top:1px}
+.subkeys{display:flex;flex-direction:column;gap:4px}
+.subkeys--none{color:var(--ink-3);font-size:14px}
+.col-hint{display:inline-block;margin-left:4px;cursor:help;position:relative}
+.col-hint summary{list-style:none;display:inline-block;width:13px;height:13px;border-radius:50%;border:1px solid var(--ink-3);color:var(--ink-4);font-size:9px;font-weight:600;line-height:11px;text-align:center;text-transform:none;letter-spacing:0;vertical-align:middle;cursor:help;transition:color 120ms ease,border-color 120ms ease}
+.col-hint summary::-webkit-details-marker{display:none}
+.col-hint:hover summary{color:var(--ink-6);border-color:var(--ink-4)}
+.col-hint[open] summary{color:var(--accent);border-color:var(--accent)}
+.col-hint__body{position:absolute;top:22px;left:-8px;z-index:5;background:var(--ink-0);border:1px solid var(--ink-3);padding:10px 14px;width:280px;font-size:12px;letter-spacing:0;text-transform:none;color:var(--ink-5);line-height:1.55;font-weight:400;box-shadow:0 1px 0 0 var(--ink-2)}
+.col-hint__body::before{content:"";position:absolute;top:-6px;left:8px;width:10px;height:10px;background:var(--ink-0);border-top:1px solid var(--ink-3);border-left:1px solid var(--ink-3);transform:rotate(45deg)}
+.kv{display:grid;grid-template-columns:minmax(180px,30%) 1fr;gap:0 24px;border-top:1px solid var(--ink-2)}
+.kv > div{padding:10px 0;border-bottom:1px solid var(--ink-2)}
+.kv .k{font-size:var(--xs);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);font-weight:500;text-align:right}
+.kv .v{font-size:var(--sm);color:var(--ink-5);word-break:break-word}
+.kv .v code{color:var(--ink-6);font-size:12px}
+.kv .v.muted{color:var(--ink-3)}
+.empty{border:1px dashed var(--ink-2);padding:24px;text-align:center}
+.empty--crit{border-left:3px solid var(--crit)}
+.empty__head{font-size:var(--xs);letter-spacing:.12em;text-transform:uppercase;color:var(--stale);font-weight:500;margin-bottom:6px}
+.empty--crit .empty__head{color:var(--crit)}
+.empty__body{font-size:var(--sm);color:var(--ink-4)}
+.arch-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.arch{font-family:var(--font-mono);font-size:11px;padding:2px 8px;background:var(--ink-1);color:var(--ink-5);border-radius:2px;letter-spacing:.02em}
+footer{margin-top:64px;padding-top:24px;border-top:1px solid var(--ink-2);font-size:var(--xs);color:var(--ink-4);display:flex;gap:16px;align-items:center;flex-wrap:wrap;letter-spacing:.04em}
+footer .sep{color:var(--ink-3)}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+@media (prefers-reduced-motion:reduce){*{animation-duration:.01ms !important;transition-duration:.01ms !important}}
+@media (max-width:1279px){
+.vitals{grid-template-columns:repeat(3,minmax(0,1fr))}
+.vital:nth-child(3){border-right:0}
+.vital:nth-child(n+4){border-top:1px solid var(--ink-2)}
+.vital:nth-child(4){border-right:1px solid var(--ink-2)}
+.layout{grid-template-columns:1fr;gap:24px}
+.rail{position:sticky;top:var(--bar-h);border-left:0;border-bottom:1px solid var(--ink-2);background:var(--ink-0);padding:12px 0}
+.rail ul{flex-direction:row;flex-wrap:wrap;gap:0 16px}
+.rail a{padding:4px 0}
+.rail a[aria-current="location"]::before{display:none}
+.rail a[aria-current="location"]{border-bottom:2px solid var(--accent)}
+}
+@media (max-width:720px){
+.page{padding:16px}
+.bar{padding:12px 16px;gap:12px;height:auto;min-height:var(--bar-h);flex-wrap:wrap}
+.bar__meta{margin-left:0;width:100%;justify-content:flex-end}
+.vitals{grid-template-columns:1fr}
+.vital{border-right:0;border-bottom:1px solid var(--ink-2)}
+.vital:last-child{border-bottom:0}
+.kv{grid-template-columns:1fr}
+.kv > div{border-bottom:0;padding:6px 0}
+.kv .k{text-align:left}
+table.data thead{display:none}
+table.data tbody tr{display:block;border-bottom:1px solid var(--ink-2);padding:12px 16px}
+table.data tbody tr[data-state="crit"] td:first-child,
+table.data tbody tr[data-state="warn"] td:first-child{box-shadow:none}
+table.data tbody tr[data-state="crit"]{border-left:3px solid var(--crit)}
+table.data tbody tr[data-state="warn"]{border-left:3px solid var(--warn)}
+table.data tbody td{display:flex;justify-content:space-between;align-items:center;padding:4px 0;white-space:normal}
+table.data tbody td::before{content:attr(data-label);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);margin-right:12px;flex-shrink:0}
+}
 </style>
 </head>
-<body>
-<h1>apt-cacher-ultra <span class="muted">{{.Process.Version}}</span>
-<a class="json-link" href="/?format=json">View as JSON →</a></h1>
+<body data-uptime-seconds="{{.Process.UptimeSeconds}}" data-gc-runs="{{if and .GC .GC.LastRunUnixTime}}1{{else}}0{{end}}">
 
-<p class="muted">
-  Started {{unixTime .Process.StartedUnixTime}},
-  uptime {{durationOf .Process.UptimeSeconds}}.
-  Build {{.Process.VCSRevision}} ({{.Process.GoVersion}}).
-</p>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-arrow-out" viewBox="0 0 16 16"><path d="M6 4h6v6M11 5L4 12" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="square"/></symbol>
+<symbol id="i-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.4 1.4M11.6 11.6L13 13M3 13l1.4-1.4M11.6 4.4L13 3" stroke="currentColor" stroke-width="1.4"/></symbol>
+<symbol id="i-moon" viewBox="0 0 16 16"><path d="M13 9.5A5 5 0 016.5 3 5 5 0 1013 9.5z" stroke="currentColor" stroke-width="1.4" fill="none"/></symbol>
+</defs></svg>
 
-<h2>Listeners</h2>
-<table>
-<tr><th>Role</th><th>Address</th></tr>
-{{range .Listeners}}<tr><td>{{.Role}}</td><td><code>{{.Addr}}</code></td></tr>
-{{end}}
-</table>
+{{$kbundled := countBundled .Keyring}}{{$ksystem := countSystem .Keyring}}{{$kcustom := countCustom .Keyring}}{{$kcount := len .Keyring}}{{$adopting := .AdoptionEnabled}}{{$keyringCritState := and $adopting (eq $kcount 0)}}
 
-{{if .TLSMITM.Enabled}}
-<h2>TLS MITM</h2>
-<table>
-<tr><td>CA source</td><td>{{.TLSMITM.CASource}}</td></tr>
-<tr><td>CA SHA-256 fingerprint</td><td><code>{{.TLSMITM.CAFingerprintSHA256}}</code></td></tr>
-<tr><td>CA not_after</td><td>{{unixTime .TLSMITM.CANotAfterUnixTime}}</td></tr>
-<tr><td>Effective allowlist</td><td><code>{{defaultEmpty .TLSMITM.EffectiveAllowlist "(none — vacuously true)"}}</code></td></tr>
-<tr><td>Cert cache</td><td>{{.TLSMITM.CertCache.Size}} / {{.TLSMITM.CertCache.Capacity}}</td></tr>
-<tr><td>Last cert issued</td>
-{{- if .TLSMITM.LastIssued}}
-<td><code>{{.TLSMITM.LastIssued.Host}}</code> @ {{unixTime .TLSMITM.LastIssued.AtUnixTime}}</td>
-{{- else}}<td class="muted">(none yet)</td>{{end}}</tr>
-<tr><td>Cert hit rate (60s)</td><td>{{hitRatePct .TLSMITM.HitRate60sPercent .TLSMITM.HitRate60sObserved}}</td></tr>
-</table>
-{{end}}
+<header class="bar" role="banner">
+  <div class="bar__brand">
+    <span class="bar__mark">&laquo;</span>
+    <span>apt-cacher-ultra</span>
+    <span class="bar__version">{{.Process.Version}}</span>
+  </div>
+  <div class="bar__verdict" role="status" aria-live="polite">
+    <span id="verdict-pill" class="pill pill--stale" data-state="stale">
+      <span class="dot"></span>
+      <span id="verdict-label">STATUS</span>
+    </span>
+    <span class="verdict__msg" id="verdict-msg">{{verdictExplanation .}}</span>
+  </div>
+  <div class="bar__meta">
+    <span>uptime <strong style="color:var(--ink-5);font-weight:500">{{durationOf .Process.UptimeSeconds}}</strong></span>
+    <span class="sep">&middot;</span>
+    <a href="#keyring" class="keys-chip"
+       data-keyring-count="{{$kcount}}"
+       data-adoption-enabled="{{if $adopting}}true{{else}}false{{end}}"
+       {{if $keyringCritState}}data-state="crit"{{end}}
+       aria-label="GPG keys loaded; jump to Keyring section">
+      <span class="keys-chip__label">keys</span>
+      <span class="keys-chip__count">{{$kcount}}</span>
+      <span class="keys-chip__tick" aria-hidden="true">{{if $keyringCritState}}!{{else}}&#10003;{{end}}</span>
+    </a>
+    <span class="sep">&middot;</span>
+    <span>build <code>{{.Process.VCSRevision}}</code></span>
+    <span class="sep">&middot;</span>
+    <button id="theme-toggle" class="icon-btn" type="button" aria-label="Toggle theme">
+      <svg id="theme-icon"><use href="#i-sun"/></svg>
+    </button>
+    <a href="?format=json" class="icon-btn" aria-label="View as JSON">
+      <svg><use href="#i-arrow-out"/></svg>
+    </a>
+  </div>
+</header>
 
-<h2>Cache</h2>
-<table>
-<tr><td>Directory</td><td><code>{{.Cache.Dir}}</code></td></tr>
-<tr><td>Blob count</td><td>{{.Cache.BlobCount}}</td></tr>
-<tr><td>URL paths</td><td>{{.Cache.URLPathCount}}</td></tr>
-<tr><td>Bytes used</td><td>{{formatBytes .Cache.BytesUsed}}</td></tr>
-<tr><td>Zero-refcount backlog</td><td>{{.Cache.ZeroRefcountBacklog}}</td></tr>
-</table>
+<main class="page">
 
-{{with .CacheSummary.Sorted}}
-<h3>Per-host by architecture</h3>
-<table>
-<tr><th>Host</th><th>Architecture</th><th>package_hash rows</th><th>Blobs</th><th>Bytes</th></tr>
-{{range .}}{{$host := .Host}}{{range .Architectures}}<tr>
-  <td><code>{{$host}}</code></td>
-  <td><code>{{.Arch}}</code></td>
-  <td>{{.Entry.PackageHashCount}}</td>
-  <td>{{.Entry.BlobCount}}</td>
-  <td>{{formatBytes .Entry.BlobBytes}}</td>
-</tr>
-{{end}}{{end}}</table>
-{{end}}
+  {{$cacheState := vitalState "cache" .}}{{$suitesState := vitalState "suites" .}}{{$adoptionsState := vitalState "adoptions" .}}{{$gcState := vitalState "gc" .}}{{$activeState := vitalState "active" .}}
 
-<h2>Repository coverage</h2>
-<table>
-<tr><td>Architectures seen</td><td>
-{{- if .RepoCoverage.ArchitecturesSeen -}}
-{{range $i, $a := .RepoCoverage.ArchitecturesSeen}}{{if $i}}, {{end}}<code>{{$a}}</code>{{end}}
-{{- else -}}
-<span class="muted">(none — no current snapshots have package_hash rows yet)</span>
-{{- end -}}
-</td></tr>
-<tr><td>Architectures filter</td><td>
-{{- if .RepoCoverage.ArchitecturesFilter -}}
-{{range $i, $a := .RepoCoverage.ArchitecturesFilter}}{{if $i}}, {{end}}<code>{{$a}}</code>{{end}}
-{{- else -}}
-<span class="muted">(unfiltered — all Release-listed indices adopted)</span>
-{{- end -}}
-</td></tr>
-<tr><td>Snapshots with Sources</td><td>{{.RepoCoverage.SnapshotsWithSources}}</td></tr>
-<tr><td>Snapshots with pdiff</td><td>{{.RepoCoverage.SnapshotsWithPdiff}}</td></tr>
-</table>
-<table>
-<tr><th>package_hash kind</th><th>rows</th></tr>
-<tr><td>Binary</td><td>{{.RepoCoverage.PackageHashRows.Binary}}</td></tr>
-<tr><td>Source</td><td>{{.RepoCoverage.PackageHashRows.Source}}</td></tr>
-<tr><td>Pdiff</td><td>{{.RepoCoverage.PackageHashRows.Pdiff}}</td></tr>
-<tr><td><strong>Total</strong></td><td><strong>{{.RepoCoverage.PackageHashRows.Total}}</strong></td></tr>
-</table>
+  <noscript>
+    <p style="margin:0 0 16px 0;padding:10px 14px;background:var(--ink-1);font-size:var(--sm);color:var(--ink-5)">
+      JavaScript is disabled — verdict pill and aggregate-failure notice will not update.
+      Per-cell badges below carry the full state. Times stay in UTC.
+    </p>
+  </noscript>
 
-<h2>Suites</h2>
-{{if .Suites}}
-<table>
-<tr><th>Host</th><th>Suite path</th><th>Last check</th><th>Last success</th>
-    <th>Current snapshot</th>
-    <th><span title="Set when the cache successfully adopts a snapshot for this suite. Adoption is triggered only when the upstream InRelease changes during this process's lifetime — a suite whose InRelease was cached previously and has not been republished since startup stays empty here until upstream publishes again or the cache is restarted.">Adopted at &#9432;</span></th>
-    <th>InRelease changed</th></tr>
-{{range .Suites}}<tr>
-  <td><code>{{.Host}}</code></td>
-  <td><code>{{.SuitePath}}</code></td>
-  <td>{{unixTimePtr .LastCheckUnixTime}}</td>
-  <td>{{unixTimePtr .LastSuccessUnixTime}}</td>
-  <td>{{i64Ptr .CurrentSnapshotID}}</td>
-  <td>{{unixTimePtr .CurrentSnapshotAdoptedAtUnixTime}}</td>
-  <td>{{unixTimePtr .InReleaseChangeSeenAtUnixTime}}{{if .Lagging}} <span class="muted">{{.Lagging}}</span>{{end}}</td>
-</tr>
-{{end}}</table>
-{{else}}<p class="muted">No suites tracked yet.</p>{{end}}
+  <section class="vitals" aria-label="Vital signs">
+    <article class="vital" data-vital="cache" data-state="{{$cacheState}}">
+      <span class="vital__label">Cache</span>
+      <span class="vital__value">{{formatBytes .Cache.BytesUsed}}</span>
+      <span class="vital__sub">
+        <span>{{.Cache.BlobCount}} blobs across {{.Cache.URLPathCount}} URL paths</span>
+        {{if gt .Cache.ZeroRefcountBacklog 1000}}<span class="accented-warn">Zero-refcount backlog {{.Cache.ZeroRefcountBacklog}}</span>{{else}}<span>Zero-refcount backlog {{.Cache.ZeroRefcountBacklog}}</span>{{end}}
+      </span>
+    </article>
+    <article class="vital" data-vital="suites" data-state="{{$suitesState}}">
+      <span class="vital__label">Suites</span>
+      <span class="vital__value">{{len .Suites}}</span>
+      <span class="vital__sub">
+        {{$lag := 0}}{{range .Suites}}{{if .Lagging}}{{$lag = (printf "X")}}{{end}}{{end}}
+        <span class="{{if eq $suitesState "warn"}}accented-warn{{else if eq $suitesState "crit"}}accented-crit{{end}}">
+          {{$lagCount := 0}}{{range .Suites}}{{if .Lagging}}{{$lagCount = 1}}{{end}}{{end}}
+          {{if .Suites}}{{range $i, $s := .Suites}}{{if $s.Lagging}}{{end}}{{end}}{{end}}
+          {{$nL := 0}}{{range .Suites}}{{if .Lagging}}{{end}}{{end}}
+          tracked
+        </span>
+      </span>
+    </article>
+    <article class="vital" data-vital="adoptions" data-state="{{$adoptionsState}}">
+      <span class="vital__label">Adoptions (recent ring)</span>
+      {{$nA := len .RecentAdoptions}}{{$okA := 0}}{{range .RecentAdoptions}}{{if eq .Outcome "success"}}{{$okA = 1}}{{end}}{{end}}
+      <span class="vital__value">{{$nA}}<span class="unit">events</span></span>
+      <span class="vital__sub">
+        <span>{{if eq $nA 0}}empty since startup{{else}}{{$nA}} in ring{{end}}</span>
+        <span>see panel below</span>
+      </span>
+    </article>
+    <article class="vital" data-vital="gc" data-state="{{$gcState}}">
+      <span class="vital__label">Last GC</span>
+      {{if and .GC .GC.LastRunUnixTime}}
+        <span class="vital__value">{{formatShortDuration .GC.LastRunDurationSeconds}}</span>
+        <span class="vital__sub">
+          <span>{{unixTimePtr .GC.LastRunUnixTime}} &middot; {{defaultEmpty .GC.LastRunPhase "(unknown phase)"}}</span>
+          <span>reclaimed {{formatBytes .GC.LastRunBytesReclaimed}} &middot; {{.GC.LastRunBlobsReaped}} blobs</span>
+        </span>
+      {{else}}
+        <span class="vital__value muted">&mdash;</span>
+        <span class="vital__sub"><span>NO GC RUN YET</span><span>warming up</span></span>
+      {{end}}
+    </article>
+    <article class="vital" data-vital="active" data-state="{{$activeState}}">
+      <span class="vital__label">Active fetches</span>
+      <span class="vital__value">{{len .ActiveHosts}}<span class="unit">hosts</span></span>
+      <span class="vital__sub">
+        {{if .ActiveHosts}}<span>currently fetching</span>{{else}}<span>idle</span>{{end}}
+        <span class="mono">{{if .ActiveHosts}}see panel below{{else}}no fetches in flight{{end}}</span>
+      </span>
+    </article>
+  </section>
 
-<h2>Keyring</h2>
-{{if .Keyring}}
-<table>
-<tr><th>Primary fingerprint</th><th>User ID</th><th>Source</th><th>Subkey fingerprints</th></tr>
-{{range .Keyring}}<tr>
-  <td><code>{{.PrimaryFingerprint}}</code></td>
-  <td>{{.PrimaryUID}}</td>
-  <td><code>{{.SourcePath}}</code></td>
-  <td>{{range $i, $fp := .SubkeyFingerprints}}{{if $i}}<br>{{end}}<code>{{$fp}}</code>{{end}}</td>
-</tr>
-{{end}}</table>
-{{else}}<p class="muted">No GPG keys loaded.</p>{{end}}
+  <div class="layout">
+    <nav class="rail" aria-label="Section navigation">
+      <ul>
+        <li><a href="#suites">Suites</a></li>
+        <li><a href="#adoptions">Recent adoptions</a></li>
+        <li><a href="#keyring">Keyring</a></li>
+        <li><a href="#hot">Hot URL paths</a></li>
+        <li><a href="#by-host">Cache &times; host &times; arch</a></li>
+        <li><a href="#coverage">Repository coverage</a></li>
+        <li><a href="#gc">Garbage collection</a></li>
+        <li><a href="#active">Active hosts</a></li>
+        <li><a href="#plumbing">Plumbing</a></li>
+      </ul>
+    </nav>
 
-<h2>Garbage collection</h2>
-{{if .GC.LastRunUnixTime}}
-<table>
-<tr><td>Last run</td><td>{{unixTimePtr .GC.LastRunUnixTime}} ({{.GC.LastRunPhase}})</td></tr>
-<tr><td>Duration</td><td>{{.GC.LastRunDurationSeconds}}s</td></tr>
-<tr><td>Blobs reaped</td><td>{{.GC.LastRunBlobsReaped}}</td></tr>
-<tr><td>Bytes reclaimed</td><td>{{formatBytes .GC.LastRunBytesReclaimed}}</td></tr>
-<tr><td>Orphan candidates reaped</td><td>{{.GC.OrphanCandidatesReaped}}</td></tr>
-<tr><td>Displaced reaped</td><td>{{.GC.DisplacedReaped}}</td></tr>
-<tr><td>Pool orphans repaired</td><td>{{.GC.PoolOrphansRepaired}}
-  ({{formatBytes .GC.PoolOrphanBytesRepaired}})</td></tr>
-<tr><td>Pool unlink errors</td><td>{{.GC.PoolUnlinkErrors}}</td></tr>
-<tr><td>Deadline reached</td><td>{{.GC.LastRunDeadlineReached}}</td></tr>
-</table>
-{{else}}<p class="muted">GC has not run yet.</p>{{end}}
+    <div class="content">
 
-<h2>Active hosts</h2>
-{{if .ActiveHosts}}
-<table>
-<tr><th>Host</th><th>Inflight</th><th>Slot capacity</th></tr>
-{{range .ActiveHosts}}<tr>
-  <td><code>{{.Host}}</code></td>
-  <td>{{.Inflight}}</td>
-  <td>{{.SlotCapacity}}</td>
-</tr>
-{{end}}</table>
-{{else}}<p class="muted">No hosts have held a slot since process start.</p>{{end}}
+      <!-- SUITES -->
+      <section class="panel" id="suites">
+        <div class="panel__eyebrow">
+          {{$lagCount := 0}}{{range .Suites}}{{if .Lagging}}{{$lagCount = (add1 $lagCount)}}{{end}}{{end}}
+          Suites <span class="sep">&mdash;</span>
+          <span>{{len .Suites}} tracked</span>
+          {{if gt $lagCount 0}}<span class="sep">&middot;</span><span class="count-warn">{{$lagCount}} lagging</span>{{end}}
+        </div>
+        <h2 class="panel__h">Suite adoption status</h2>
+        <p class="panel__desc">One row per (host, suite). Lagging rows indicate the upstream has published a newer InRelease than the snapshot the cache is currently serving.</p>
+        {{if .Suites}}
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr>
+              <th>Host</th><th>Suite path</th><th>Last check</th><th>Last success</th>
+              <th class="num">Snapshot</th>
+              <th>Adopted<details class="col-hint"><summary aria-label="What does Adopted mean?">i</summary><div class="col-hint__body">Adoption fires only when a fresh InRelease has been observed. Suites whose upstream has not republished since process start may stay empty here without being broken.</div></details></th>
+              <th>InRelease changed</th>
+            </tr></thead>
+            <tbody>
+            {{range .Suites}}
+              <tr{{if .Lagging}} data-state="warn"{{end}}>
+                <td data-label="Host" class="host">{{.Host}}</td>
+                <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
+                <td data-label="Last check" class="time">{{unixTimePtr .LastCheckUnixTime}}</td>
+                <td data-label="Last success" class="time">{{unixTimePtr .LastSuccessUnixTime}}</td>
+                <td data-label="Snapshot" class="num mono">{{i64Ptr .CurrentSnapshotID}}</td>
+                <td data-label="Adopted" class="time">{{unixTimePtr .CurrentSnapshotAdoptedAtUnixTime}}</td>
+                <td data-label="InRelease changed" class="time">{{unixTimePtr .InReleaseChangeSeenAtUnixTime}}{{if .Lagging}} <span class="lagging">{{.Lagging}}</span>{{end}}</td>
+              </tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+        {{else}}<div class="empty"><div class="empty__head">No suites tracked yet</div><div class="empty__body">Suites populate after the first adoption cycle.</div></div>{{end}}
+      </section>
 
-<h2>Hot URL paths</h2>
-{{if .HotURLPaths}}
-<table>
-<tr><th>Host</th><th>Path</th><th>Metadata?</th><th>Requests</th>
-    <th>Last requested</th></tr>
-{{range .HotURLPaths}}<tr>
-  <td><code>{{.Host}}</code></td>
-  <td><code>{{.Path}}</code></td>
-  <td>{{.IsMetadata}}</td>
-  <td>{{.RequestCount}}</td>
-  <td>{{unixTime .LastRequestedUnixTime}}</td>
-</tr>
-{{end}}</table>
-{{else}}<p class="muted">No URL paths requested yet.</p>{{end}}
+      <!-- RECENT ADOPTIONS -->
+      <section class="panel" id="adoptions">
+        {{$na := len .RecentAdoptions}}{{$okA := 0}}{{$failA := 0}}{{range .RecentAdoptions}}{{if eq .Outcome "success"}}{{$okA = (add1 $okA)}}{{else}}{{$failA = (add1 $failA)}}{{end}}{{end}}
+        <div class="panel__eyebrow">
+          Recent adoptions <span class="sep">&mdash;</span>
+          <span>{{$na}} events in ring</span>
+          {{if gt $failA 0}}<span class="sep">&middot;</span><span class="count-crit">{{$failA}} failed</span>{{end}}
+          {{if gt $okA 0}}<span class="sep">&middot;</span><span class="count-ok">{{$okA}} success</span>{{end}}
+        </div>
+        <h2 class="panel__h">Recent adoption outcomes</h2>
 
-<h2>Recent adoptions</h2>
-{{if .RecentAdoptions}}
-<table>
-<tr><th>Host</th><th>Suite path</th><th>Outcome</th>
-    <th>Completed</th><th>Duration</th></tr>
-{{range .RecentAdoptions}}<tr>
-  <td><code>{{.Host}}</code></td>
-  <td><code>{{.SuitePath}}</code></td>
-  <td>{{.Outcome}}</td>
-  <td>{{unixTime .CompletedUnixTime}}</td>
-  <td>{{.DurationSeconds}}s</td>
-</tr>
-{{end}}</table>
-{{else if lt .Process.UptimeSeconds 300}}<p class="muted">(empty since last process start)</p>{{end}}
+        <div id="adoptions-notice" class="notice-mount" data-notice-total="{{$na}}"></div>
 
-<p><a href="/metrics">/metrics</a> &middot; <a href="/healthz">/healthz</a></p>
+        {{if .RecentAdoptions}}
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr>
+              <th>Host</th><th>Suite path</th><th>Outcome</th><th>Completed</th><th class="num">Duration</th>
+            </tr></thead>
+            <tbody>
+            {{range .RecentAdoptions}}
+              <tr{{if ne .Outcome "success"}} data-state="crit"{{end}} data-outcome="{{.Outcome}}">
+                <td data-label="Host" class="host">{{.Host}}</td>
+                <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
+                <td data-label="Outcome"><span class="b {{outcomeBadgeClass .Outcome}}">{{.Outcome}}</span></td>
+                <td data-label="Completed" class="time">{{unixTime .CompletedUnixTime}}</td>
+                <td data-label="Duration" class="num mono">{{formatShortDuration .DurationSeconds}}</td>
+              </tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+        {{else if lt .Process.UptimeSeconds 300}}<div class="empty"><div class="empty__head">No adoptions yet</div><div class="empty__body">Empty since this process started.</div></div>{{end}}
+      </section>
+
+      <!-- KEYRING -->
+      <section class="panel" id="keyring">
+        <div class="panel__eyebrow">
+          Keyring <span class="sep">&mdash;</span>
+          <span data-keyring-count="{{$kcount}}">{{$kcount}} loaded</span>
+          <span class="sep">&middot;</span>
+          <span data-keyring-bundled="{{$kbundled}}">{{$kbundled}} bundled</span>
+          <span class="sep">&middot;</span>
+          <span data-keyring-system="{{$ksystem}}">{{$ksystem}} system</span>
+          <span class="sep">&middot;</span>
+          <span data-keyring-custom="{{$kcustom}}">{{$kcustom}} custom</span>
+        </div>
+        <h2 class="panel__h">Trusted GPG keys</h2>
+        <p class="panel__desc">Keys used to verify upstream <code>InRelease</code> signatures during adoption. Bundled keys ship with the binary; custom keys come from <code>keyring_dirs</code> paths.</p>
+        {{if .Keyring}}
+        <div class="table-wrap">
+          <table class="data" id="keyring-table">
+            <thead><tr>
+              <th>Primary fingerprint</th><th>User ID</th><th>Source</th><th>Subkey fingerprints</th>
+            </tr></thead>
+            <tbody>
+            {{range .Keyring}}{{$kind := sourceKind .SourcePath}}
+              <tr data-source-kind="{{$kind}}">
+                <td data-label="Primary fingerprint"><span class="fp">{{chunkHex .PrimaryFingerprint 4}}</span></td>
+                <td data-label="User ID"><span class="uid">{{.PrimaryUID}}</span></td>
+                <td data-label="Source">
+                  <span class="src src--{{$kind}}">{{sourceKindLabel .SourcePath}}</span>
+                  <span class="src-path">{{.SourcePath}}</span>
+                </td>
+                <td data-label="Subkey fingerprints">
+                  {{if .SubkeyFingerprints}}<div class="subkeys">{{range .SubkeyFingerprints}}<span class="fp fp--sub">{{chunkHex . 4}}</span>{{end}}</div>{{else}}<span class="subkeys subkeys--none">&mdash;</span>{{end}}
+                </td>
+              </tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+        {{else if $adopting}}
+          <div class="empty empty--crit"><div class="empty__head">NO GPG KEYS LOADED</div><div class="empty__body">Adoption is enabled but the keyring is empty. All <code>InRelease</code> verifications will fail. Check <code>keyring_dirs</code> in the configuration.</div></div>
+        {{else}}
+          <div class="empty"><div class="empty__head">ADOPTION DISABLED</div><div class="empty__body">No GPG keys are loaded because adoption is disabled in the configuration.</div></div>
+        {{end}}
+      </section>
+
+      <!-- HOT URL PATHS -->
+      <section class="panel" id="hot">
+        <div class="panel__eyebrow">
+          Hot URL paths <span class="sep">&mdash;</span>
+          <span>top {{len .HotURLPaths}} by request count</span>
+        </div>
+        <h2 class="panel__h">What clients are asking for</h2>
+        {{if .HotURLPaths}}
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr>
+              <th>Host</th><th>Path</th><th>Kind</th><th class="num">Requests</th><th>Last requested</th>
+            </tr></thead>
+            <tbody>
+            {{range .HotURLPaths}}
+              <tr>
+                <td data-label="Host" class="host">{{.Host}}</td>
+                <td data-label="Path" class="mono">{{.Path}}</td>
+                <td data-label="Kind"><span class="b {{if .IsMetadata}}b--neutral{{else}}b--ok{{end}}">{{if .IsMetadata}}metadata{{else}}payload{{end}}</span></td>
+                <td data-label="Requests" class="num mono">{{.RequestCount}}</td>
+                <td data-label="Last requested" class="time">{{unixTime .LastRequestedUnixTime}}</td>
+              </tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+        {{else}}<div class="empty"><div class="empty__head">No URL paths requested yet</div><div class="empty__body">The hot-paths table populates after the first cached request.</div></div>{{end}}
+      </section>
+
+      <!-- BY-HOST -->
+      <section class="panel" id="by-host">
+        <div class="panel__eyebrow">Cache contents <span class="sep">&mdash;</span><span>by host &times; architecture</span></div>
+        <h2 class="panel__h">What's on disk, broken down</h2>
+        {{with .CacheSummary.Sorted}}
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr><th>Host</th><th>Architecture</th><th class="num">package_hash rows</th><th class="num">Blobs</th><th class="num">Bytes</th></tr></thead>
+            <tbody>
+            {{range .}}{{$host := .Host}}{{range .Architectures}}
+              <tr>
+                <td data-label="Host" class="host">{{$host}}</td>
+                <td data-label="Architecture"><span class="arch">{{.Arch}}</span></td>
+                <td data-label="package_hash rows" class="num mono">{{.Entry.PackageHashCount}}</td>
+                <td data-label="Blobs" class="num mono">{{.Entry.BlobCount}}</td>
+                <td data-label="Bytes" class="num mono">{{formatBytes .Entry.BlobBytes}}</td>
+              </tr>
+            {{end}}{{end}}
+            </tbody>
+          </table>
+        </div>
+        {{else}}<div class="empty"><div class="empty__head">No cached blobs yet</div><div class="empty__body">The by-host breakdown populates after the first adoption cycle.</div></div>{{end}}
+      </section>
+
+      <!-- COVERAGE -->
+      <section class="panel" id="coverage">
+        <div class="panel__eyebrow">Repository coverage</div>
+        <h2 class="panel__h">What the cache is covering</h2>
+        <div class="kv">
+          <div class="k">Architectures seen</div>
+          <div class="v">{{if .RepoCoverage.ArchitecturesSeen}}<div class="arch-list">{{range .RepoCoverage.ArchitecturesSeen}}<span class="arch">{{.}}</span>{{end}}</div>{{else}}<span class="muted">(none — no current snapshots have package_hash rows yet)</span>{{end}}</div>
+          <div class="k">Architectures filter</div>
+          <div class="v">{{if .RepoCoverage.ArchitecturesFilter}}<div class="arch-list">{{range .RepoCoverage.ArchitecturesFilter}}<span class="arch">{{.}}</span>{{end}}</div>{{else}}<code>(unfiltered &mdash; all Release-listed indices adopted)</code>{{end}}</div>
+          <div class="k">Snapshots with Sources</div>
+          <div class="v"><code>{{.RepoCoverage.SnapshotsWithSources}}</code></div>
+          <div class="k">Snapshots with pdiff</div>
+          <div class="v"><code>{{.RepoCoverage.SnapshotsWithPdiff}}</code></div>
+          <div class="k">package_hash rows (binary)</div>
+          <div class="v"><code>{{.RepoCoverage.PackageHashRows.Binary}}</code></div>
+          <div class="k">package_hash rows (source)</div>
+          <div class="v"><code>{{.RepoCoverage.PackageHashRows.Source}}</code></div>
+          <div class="k">package_hash rows (pdiff)</div>
+          <div class="v"><code>{{.RepoCoverage.PackageHashRows.Pdiff}}</code></div>
+          <div class="k">package_hash rows (total)</div>
+          <div class="v"><code>{{.RepoCoverage.PackageHashRows.Total}}</code></div>
+        </div>
+      </section>
+
+      <!-- GC -->
+      <section class="panel" id="gc">
+        <div class="panel__eyebrow">
+          Garbage collection
+          {{if and .GC .GC.LastRunUnixTime}}<span class="sep">&mdash;</span><span>last run {{unixTimePtr .GC.LastRunUnixTime}}</span>{{end}}
+          <span class="sep">&middot;</span><span class="count-{{$gcState}}">{{$gcState}}</span>
+        </div>
+        <h2 class="panel__h">Cache reaping</h2>
+        {{if and .GC .GC.LastRunUnixTime}}
+        <div class="kv">
+          <div class="k">Last run</div>
+          <div class="v"><span class="time mono">{{unixTimePtr .GC.LastRunUnixTime}}</span> &middot; <span class="b b--neutral">{{defaultEmpty .GC.LastRunPhase "unknown"}}</span></div>
+          <div class="k">Duration</div>
+          <div class="v"><code>{{formatShortDuration .GC.LastRunDurationSeconds}}</code></div>
+          <div class="k">Blobs reaped</div>
+          <div class="v"><code>{{.GC.LastRunBlobsReaped}}</code></div>
+          <div class="k">Bytes reclaimed</div>
+          <div class="v"><code>{{formatBytes .GC.LastRunBytesReclaimed}}</code></div>
+          <div class="k">Orphan candidates reaped</div>
+          <div class="v"><code>{{.GC.OrphanCandidatesReaped}}</code></div>
+          <div class="k">Displaced reaped</div>
+          <div class="v"><code>{{.GC.DisplacedReaped}}</code></div>
+          <div class="k">Pool orphans repaired</div>
+          <div class="v"><code>{{.GC.PoolOrphansRepaired}}</code> <span style="color:var(--ink-4)">({{formatBytes .GC.PoolOrphanBytesRepaired}})</span></div>
+          <div class="k">Pool unlink errors</div>
+          <div class="v"><code>{{.GC.PoolUnlinkErrors}}</code></div>
+          <div class="k">Deadline reached</div>
+          <div class="v"><span class="b {{if .GC.LastRunDeadlineReached}}b--crit{{else}}b--ok{{end}}">{{.GC.LastRunDeadlineReached}}</span></div>
+        </div>
+        {{else}}<div class="empty"><div class="empty__head">NO GC RUN YET</div><div class="empty__body">GC has not completed since process start.</div></div>{{end}}
+      </section>
+
+      <!-- ACTIVE HOSTS -->
+      <section class="panel" id="active">
+        <div class="panel__eyebrow">Active hosts <span class="sep">&mdash;</span><span>fetch-slot semaphore snapshot</span></div>
+        <h2 class="panel__h">Upstream fetches in flight</h2>
+        {{if .ActiveHosts}}
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr><th>Host</th><th class="num">Inflight</th><th class="num">Slot capacity</th></tr></thead>
+            <tbody>
+            {{range .ActiveHosts}}
+              <tr>
+                <td data-label="Host" class="host">{{.Host}}</td>
+                <td data-label="Inflight" class="num mono">{{.Inflight}}</td>
+                <td data-label="Slot capacity" class="num mono">{{.SlotCapacity}}</td>
+              </tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+        {{else}}<div class="empty"><div class="empty__head">No hosts have held a slot since process start</div><div class="empty__body">Slot usage is bursty — this is normal between adoption cycles.</div></div>{{end}}
+      </section>
+
+      <!-- PLUMBING -->
+      <section class="panel" id="plumbing">
+        <div class="panel__eyebrow">Plumbing</div>
+        <h2 class="panel__h">Listeners, TLS MITM, build</h2>
+        <h3 style="font-size:var(--xs);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);margin:24px 0 8px">Listeners</h3>
+        <div class="kv">
+          {{range .Listeners}}<div class="k">{{.Role}}</div><div class="v"><code>{{.Addr}}</code></div>{{end}}
+        </div>
+
+        {{if .TLSMITM.Enabled}}
+        <h3 style="font-size:var(--xs);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);margin:32px 0 8px">TLS MITM <span class="b b--ok" style="margin-left:8px">enabled</span></h3>
+        <div class="kv">
+          <div class="k">CA source</div>
+          <div class="v"><span class="b b--neutral">{{.TLSMITM.CASource}}</span></div>
+          <div class="k">CA fingerprint (SHA-256)</div>
+          <div class="v"><span class="fp">{{chunkHex .TLSMITM.CAFingerprintSHA256 4}}</span></div>
+          <div class="k">CA not_after</div>
+          <div class="v"><span class="time mono">{{unixTime .TLSMITM.CANotAfterUnixTime}}</span></div>
+          <div class="k">Effective allowlist</div>
+          <div class="v"><code>{{defaultEmpty .TLSMITM.EffectiveAllowlist "(none — vacuously true)"}}</code></div>
+          <div class="k">Cert cache</div>
+          <div class="v"><code>{{.TLSMITM.CertCache.Size}} / {{.TLSMITM.CertCache.Capacity}}</code></div>
+          <div class="k">Last cert issued</div>
+          <div class="v">{{if .TLSMITM.LastIssued}}<code>{{.TLSMITM.LastIssued.Host}}</code> @ <span class="time mono">{{unixTime .TLSMITM.LastIssued.AtUnixTime}}</span>{{else}}<span class="muted">(none yet)</span>{{end}}</div>
+          <div class="k">Cert hit rate (60s)</div>
+          <div class="v"><code>{{hitRatePct .TLSMITM.HitRate60sPercent .TLSMITM.HitRate60sObserved}}</code></div>
+        </div>
+        {{end}}
+
+        <h3 style="font-size:var(--xs);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);margin:32px 0 8px">Process</h3>
+        <div class="kv">
+          <div class="k">Version</div>
+          <div class="v"><code>{{.Process.Version}}</code></div>
+          <div class="k">Started</div>
+          <div class="v"><span class="time mono">{{unixTime .Process.StartedUnixTime}}</span> &middot; uptime {{durationOf .Process.UptimeSeconds}}</div>
+          <div class="k">Build</div>
+          <div class="v"><code>{{.Process.VCSRevision}}</code></div>
+          <div class="k">Go version</div>
+          <div class="v"><code>{{.Process.GoVersion}}</code></div>
+          <div class="k">Cache directory</div>
+          <div class="v"><code>{{.Cache.Dir}}</code></div>
+        </div>
+      </section>
+
+    </div></div>
+
+  <footer>
+    <a href="/metrics">/metrics</a>
+    <span class="sep">&middot;</span>
+    <a href="/healthz">/healthz</a>
+    <span class="sep">&middot;</span>
+    <span>Times in UTC, rewritten to browser-local on load. Page auto-refreshes every 60s.</span>
+  </footer>
+</main>
+
 <script>
-// Rewrite every <time data-unix=N> textContent to browser-local time.
-// If the browser can't resolve a timezone (no Intl, JS disabled, etc.),
-// the server-rendered UTC string remains in place as the fallback.
-(function () {
-  var tz;
-  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) {}
-  if (!tz) return;
+// Theme toggle (paint icon + click swap + localStorage persist)
+(function(){var r=document.documentElement,b=document.getElementById('theme-toggle'),i=document.getElementById('theme-icon');if(!b||!i)return;
+function paint(){var m=r.getAttribute('data-theme');if(!m||m==='auto'){m=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';}i.firstElementChild.setAttribute('href',m==='dark'?'#i-sun':'#i-moon');}
+paint();
+b.addEventListener('click',function(){var c=r.getAttribute('data-theme');if(!c||c==='auto'){c=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';}var n=c==='dark'?'light':'dark';r.setAttribute('data-theme',n);try{localStorage.setItem('acu-theme',n);}catch(e){}paint();});})();
 
-  var pad = function (n) { return n < 10 ? "0" + n : "" + n; };
-  var tzShort = "";
-  try {
-    var parts = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
-      .formatToParts(new Date());
-    for (var i = 0; i < parts.length; i++) {
-      if (parts[i].type === "timeZoneName") { tzShort = parts[i].value; break; }
-    }
-  } catch (e) {}
+// Verdict pill (computed from per-cell data-state)
+(function(){var pill=document.getElementById('verdict-pill'),lbl=document.getElementById('verdict-label');if(!pill||!lbl)return;
+var states=[].slice.call(document.querySelectorAll('[data-state]')).map(function(el){return el.getAttribute('data-state');});
+var keys=document.querySelector('.keys-chip');var keyringCrit=keys&&keys.getAttribute('data-state')==='crit';
+var verdict='ok',cls='pill--healthy',label='HEALTHY';
+if(states.indexOf('crit')!==-1||keyringCrit){verdict='crit';cls='pill--degraded';label='DEGRADED';}
+else if(states.indexOf('warn')!==-1){verdict='warn';cls='pill--watching';label='WATCHING';}
+else{var b=document.body,up=parseInt(b.getAttribute('data-uptime-seconds')||'0',10),gr=parseInt(b.getAttribute('data-gc-runs')||'0',10);if(up<300&&gr===0){verdict='stale';cls='pill--stale';label='WARMING UP';}}
+pill.classList.remove('pill--healthy','pill--watching','pill--degraded','pill--stale');pill.classList.add(cls);pill.setAttribute('data-state',verdict==='ok'?'ok':(verdict==='warn'?'warn':(verdict==='crit'?'crit':'stale')));lbl.textContent=label;})();
 
-  var nodes = document.querySelectorAll("time[data-unix]");
-  for (var i = 0; i < nodes.length; i++) {
-    var u = parseInt(nodes[i].getAttribute("data-unix"), 10);
-    if (!isFinite(u)) continue;
-    var d = new Date(u * 1000);
-    var s = d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
-            " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
-    nodes[i].textContent = tzShort ? (s + " " + tzShort) : s;
-  }
-})();
+// Aggregate-failure notice for Recent Adoptions (≥10% non-success)
+(function(){var mount=document.getElementById('adoptions-notice');if(!mount)return;
+var rows=document.querySelectorAll('#adoptions tr[data-outcome]');var total=rows.length;if(total===0)return;
+var counts={};var last=null;rows.forEach(function(tr){var o=tr.getAttribute('data-outcome');if(o==='success')return;counts[o]=(counts[o]||0)+1;if(!last)last=tr;});
+var top='',topN=0;for(var k in counts){if(counts[k]>topN){top=k;topN=counts[k];}}
+var THRESHOLD=0.10;if(top===''||(topN/total)<THRESHOLD)return;
+var hints={'gpg_failed':{text:"Likely cause: upstream repository key changed or the matching archive key isn't loaded. Cross-check the Keyring section.",link:{label:'Trusted keys',href:'#keyring',arrow:'&rarr; Keyring'}},'fetch_failed':{text:'Likely cause: upstream unreachable, TLS failure, or rate-limiting. Check the proxy logs for the upstream host.',link:null},'parse_failed':{text:'Likely cause: malformed Release / Sources / Packages payload from upstream. Capture a failing fetch and inspect.',link:null}};
+var h=hints[top]||{text:'See per-row details below.',link:null};
+var note=document.createElement('div');note.className='notice';note.setAttribute('role','alert');
+var head=document.createElement('div');head.className='notice__head';head.innerHTML='<span class="dot"></span><span>'+topN+' of '+total+' recent adoptions failed: <code style="background:transparent;padding:0;color:var(--crit)">'+top+'</code></span>';note.appendChild(head);
+var body=document.createElement('div');body.className='notice__body';body.innerHTML=h.text+(h.link?'<span class="notice__link-row">'+h.link.label+' <a href="'+h.link.href+'">'+h.link.arrow+'</a></span>':'');note.appendChild(body);
+mount.appendChild(note);})();
+
+// Sticky-rail active-section highlight
+(function(){var rail=document.querySelector('.rail');if(!rail||!('IntersectionObserver' in window))return;
+var links={};rail.querySelectorAll('a[href^="#"]').forEach(function(a){links[a.getAttribute('href').slice(1)]=a;});
+var io=new IntersectionObserver(function(es){es.forEach(function(e){var id=e.target.id;if(!links[id])return;if(e.isIntersecting){Object.keys(links).forEach(function(k){links[k].removeAttribute('aria-current');});links[id].setAttribute('aria-current','location');}});},{rootMargin:'-72px 0px -65% 0px'});
+document.querySelectorAll('section.panel').forEach(function(s){io.observe(s);});})();
+
+// Help-popover dismiss (click outside / Escape)
+(function(){document.addEventListener('click',function(e){document.querySelectorAll('details.col-hint[open]').forEach(function(d){if(!d.contains(e.target))d.open=false;});});document.addEventListener('keydown',function(e){if(e.key==='Escape')document.querySelectorAll('details.col-hint[open]').forEach(function(d){d.open=false;});});})();
+
+// Localize <time data-unix=N> textContent to browser-local time.
+(function(){var tz;try{tz=Intl.DateTimeFormat().resolvedOptions().timeZone;}catch(e){}if(!tz)return;
+var pad=function(n){return n<10?'0'+n:''+n;};var tzS='';try{var p=new Intl.DateTimeFormat(undefined,{timeZoneName:'short'}).formatToParts(new Date());for(var i=0;i<p.length;i++){if(p[i].type==='timeZoneName'){tzS=p[i].value;break;}}}catch(e){}
+var ns=document.querySelectorAll('time[data-unix]');for(var i=0;i<ns.length;i++){var u=parseInt(ns[i].getAttribute('data-unix'),10);if(!isFinite(u))continue;var d=new Date(u*1000);var s=d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());ns[i].textContent=tzS?(s+' '+tzS):s;}})();
 </script>
 </body>
 </html>
@@ -1203,13 +1655,20 @@ func formatShortDuration(seconds float64) string {
 
 // vitalState returns the data-state value for one of the five hero-strip
 // "vital" cells: "cache", "suites", "adoptions", "gc", "active". Returned
-// values are "healthy", "watching", "crit", or "stale" per the rules in
-// docs/admin-ui-spec.md §9.1. Unknown kind returns "healthy" so a typo in
-// the template never surfaces as a panic during rendering.
+// values are "ok", "warn", "crit", or "stale". Unknown kind returns "ok"
+// so a typo in the template never surfaces as a panic during rendering.
 //
-// Takes the htmlRenderModel wrapper because the GC watching threshold
-// (last run age > 2 × interval) needs GCIntervalSeconds, which is not on
-// statusModel (per the JSON-contract preservation rule §0.4).
+// AIDEV-NOTE: vocabulary mismatch — docs/admin-ui-spec.md §7.1 names the
+// data-state values `healthy` and `watching`; docs/admin-ui-mockup.html
+// CSS keys on `data-state="ok"` and `data-state="warn"`. The spec opening
+// declares "the mockup wins" on disagreement, so this helper emits the
+// mockup vocabulary and verdictExplanation/keyringCrit do likewise. See
+// .phase-loop-notes.md "Spec issues" for the followup; downstream JS
+// (per spec §8.1) must read `warn`/`ok` not `watching`/`healthy`.
+//
+// Takes the htmlRenderModel wrapper because the watching threshold for
+// GC (last run age > 2 × interval) needs GCIntervalSeconds, which is not
+// on statusModel (per the JSON-contract preservation rule §0.4).
 func vitalState(kind string, m htmlRenderModel) string {
 	switch kind {
 	case "cache":
@@ -1220,9 +1679,9 @@ func vitalState(kind string, m htmlRenderModel) string {
 			return "stale"
 		}
 		if m.Cache.ZeroRefcountBacklog > 1000 {
-			return "watching"
+			return "warn"
 		}
-		return "healthy"
+		return "ok"
 	case "suites":
 		if len(m.Suites) == 0 {
 			return "stale"
@@ -1245,16 +1704,16 @@ func vitalState(kind string, m htmlRenderModel) string {
 			return "crit"
 		}
 		if anyLag {
-			return "watching"
+			return "warn"
 		}
-		return "healthy"
+		return "ok"
 	case "adoptions":
 		n := len(m.RecentAdoptions)
 		if n == 0 {
 			if m.Process.UptimeSeconds < 300 {
 				return "stale"
 			}
-			return "healthy"
+			return "ok"
 		}
 		fail := 0
 		for _, a := range m.RecentAdoptions {
@@ -1267,9 +1726,9 @@ func vitalState(kind string, m htmlRenderModel) string {
 			return "crit"
 		}
 		if ratio >= 0.1 {
-			return "watching"
+			return "warn"
 		}
-		return "healthy"
+		return "ok"
 	case "gc":
 		if m.GC == nil || m.GC.LastRunUnixTime == nil {
 			return "stale"
@@ -1278,23 +1737,23 @@ func vitalState(kind string, m htmlRenderModel) string {
 			return "crit"
 		}
 		// AIDEV-NOTE: GCIntervalSeconds==0 means "interval unknown" —
-		// per §9.1 the watching branch is suppressed in that case and
-		// the cell goes straight from healthy to stale.
+		// per §9.1 the warn branch is suppressed in that case and the
+		// cell goes straight from ok to stale.
 		if m.GCIntervalSeconds > 0 {
 			now := m.Process.StartedUnixTime + m.Process.UptimeSeconds
 			ageSeconds := now - *m.GC.LastRunUnixTime
 			if float64(ageSeconds) > 2*m.GCIntervalSeconds {
-				return "watching"
+				return "warn"
 			}
 		}
-		return "healthy"
+		return "ok"
 	case "active":
 		if len(m.ActiveHosts) == 0 && m.Process.UptimeSeconds < 300 {
 			return "stale"
 		}
-		return "healthy"
+		return "ok"
 	default:
-		return "healthy"
+		return "ok"
 	}
 }
 
@@ -1325,7 +1784,7 @@ func verdictExplanation(m htmlRenderModel) string {
 		switch vitalState(k, m) {
 		case "crit":
 			crit++
-		case "watching":
+		case "warn":
 			watching++
 		}
 	}
@@ -1354,7 +1813,7 @@ func outcomeBadgeClass(outcome string) string {
 		return "b--ok"
 	case "gpg_failed", "fetch_failed", "parse_failed":
 		return "b--crit"
-	case "lagging", "watching":
+	case "lagging", "warn":
 		return "b--warn"
 	default:
 		return "b--stale"

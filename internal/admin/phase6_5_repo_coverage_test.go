@@ -288,12 +288,14 @@ func TestStatusHTML_RepoCoverage_RendersSection(t *testing.T) {
 	if !strings.Contains(html, "Architectures filter") {
 		t.Errorf("HTML missing 'Architectures filter' row")
 	}
-	// Architectures filter render: the seeded list is amd64 + source.
-	if !strings.Contains(html, "<code>amd64</code>") || !strings.Contains(html, "<code>source</code>") {
+	// Architectures render as <span class="arch">amd64</span> in the
+	// redesigned arch-list pill style. Architectures filter list uses
+	// the same render.
+	if !strings.Contains(html, ">amd64<") || !strings.Contains(html, ">source<") {
 		t.Errorf("HTML missing rendered filter values amd64/source")
 	}
-	if !strings.Contains(html, "package_hash kind") {
-		t.Errorf("HTML missing per-kind row count table")
+	if !strings.Contains(html, "package_hash rows") {
+		t.Errorf("HTML missing per-kind row count rows")
 	}
 }
 
