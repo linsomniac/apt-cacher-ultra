@@ -1,0 +1,150 @@
+{
+  "process": {
+    "version": "v0.test",
+    "started_unixtime": 1700000000,
+    "uptime_seconds": 7200,
+    "vcs_revision": "deadbeef",
+    "go_version": "go-test"
+  },
+  "cache": {
+    "dir": "/var/cache/apt-cacher-ultra",
+    "bytes_used": 536870912,
+    "blob_count": 4321,
+    "url_path_count": 4500,
+    "zero_refcount_backlog": 12
+  },
+  "cache_summary": {
+    "by_host": {
+      "archive.ubuntu.com": {
+        "by_architecture": {
+          "amd64": {
+            "package_hash_count": 100,
+            "blob_count": 80,
+            "blob_bytes": 100000000
+          },
+          "arm64": {
+            "package_hash_count": 50,
+            "blob_count": 40,
+            "blob_bytes": 50000000
+          }
+        }
+      }
+    }
+  },
+  "repo_coverage": {
+    "architectures_seen": [
+      "amd64",
+      "arm64"
+    ],
+    "architectures_filter": [
+      "amd64"
+    ],
+    "snapshots_with_sources": 12,
+    "snapshots_with_pdiff": 3,
+    "package_hash_rows": {
+      "binary": 150,
+      "source": 8,
+      "pdiff": 2,
+      "total": 160
+    }
+  },
+  "listeners": [
+    {
+      "role": "proxy",
+      "addr": "0.0.0.0:3142"
+    },
+    {
+      "role": "admin",
+      "addr": "127.0.0.1:6789"
+    }
+  ],
+  "tls_mitm": {
+    "enabled": true,
+    "ca_source": "generated",
+    "ca_fingerprint_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "ca_not_after_unixtime": 1900000000,
+    "effective_allowlist": ".*\\.example\\.com",
+    "cert_cache": {
+      "size": 5,
+      "capacity": 1024
+    },
+    "last_cert_issued": {
+      "host": "packages.example.com",
+      "at_unixtime": 1700006000
+    },
+    "cert_hit_rate_60s_percent": 92.5,
+    "cert_hit_rate_60s_observed": 800
+  },
+  "suites": [
+    {
+      "host": "archive.ubuntu.com",
+      "suite_path": "dists/noble",
+      "last_check_unixtime": 1700005000,
+      "last_success_unixtime": 1700004000,
+      "current_snapshot_id": 42,
+      "current_snapshot_adopted_at_unixtime": 1700003500,
+      "inrelease_change_seen_at_unixtime": 1700005500
+    }
+  ],
+  "gc": {
+    "last_run_unixtime": 1700000000,
+    "last_run_phase": "periodic",
+    "last_run_blobs_reaped": 12,
+    "last_run_bytes_reclaimed": 1048576,
+    "last_run_deadline_reached": false,
+    "last_run_duration_seconds": 1.5,
+    "orphan_candidates_reaped": 2,
+    "displaced_reaped": 1,
+    "pool_orphans_repaired": 0,
+    "pool_orphan_bytes_repaired": 0,
+    "pool_unlink_errors": 0
+  },
+  "hot_url_paths": [
+    {
+      "host": "archive.ubuntu.com",
+      "path": "/ubuntu/dists/noble/InRelease",
+      "is_metadata": true,
+      "request_count": 500,
+      "last_requested_unixtime": 1700006500
+    }
+  ],
+  "recent_adoptions": [
+    {
+      "host": "archive.ubuntu.com",
+      "suite_path": "dists/noble",
+      "outcome": "success",
+      "completed_unixtime": 1700006000,
+      "duration_seconds": 0.45
+    },
+    {
+      "host": "archive.ubuntu.com",
+      "suite_path": "dists/noble-updates",
+      "outcome": "gpg_failed",
+      "completed_unixtime": 1700006100,
+      "duration_seconds": 0.32
+    }
+  ],
+  "active_hosts": [
+    {
+      "host": "10.0.0.5",
+      "inflight": 1,
+      "slot_capacity": 4
+    }
+  ],
+  "keyring": [
+    {
+      "primary_fingerprint": "F6ECB3762474EDA9D21B7022871920D1991BC93C",
+      "primary_uid": "Ubuntu Archive Automatic Signing Key (2018) \u003cftpmaster@ubuntu.com\u003e",
+      "source_path": "embedded:ubuntu-archive-keyring.gpg",
+      "subkey_fingerprints": []
+    },
+    {
+      "primary_fingerprint": "AABBCCDDEEFF00112233445566778899AABBCCDD",
+      "primary_uid": "Custom Operator Key \u003cops@example.com\u003e",
+      "source_path": "/etc/apt/keyrings/custom.gpg",
+      "subkey_fingerprints": [
+        "1122334455667788"
+      ]
+    }
+  ]
+}
