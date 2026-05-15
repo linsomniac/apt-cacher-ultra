@@ -1880,9 +1880,12 @@ func (h *Handler) logRequestWithValidation(r *http.Request, canonHost, path, out
 	// negative case rather than false-valued log lines.
 	if validation.Validated {
 		attrs = append(attrs, "validated_hash", true)
-	}
-	if validation.PackageName != "" {
-		attrs = append(attrs, "package_name", validation.PackageName)
+		// package_name is documented (docs/log-fields.md) as gated on
+		// validated_hash=true; the Validated guard here enforces the
+		// invariant in code rather than only by call-site convention.
+		if validation.PackageName != "" {
+			attrs = append(attrs, "package_name", validation.PackageName)
+		}
 	}
 	if fetchAttempted {
 		attrs = append(attrs, "upstream_status", upstreamStatus)
