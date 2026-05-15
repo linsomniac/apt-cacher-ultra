@@ -4,6 +4,32 @@ import (
 	"testing"
 )
 
+func TestStatusTemplateFuncMapHasNewHelpers(t *testing.T) {
+	fm := statusTemplateFuncMap()
+	want := []string{
+		"chunkHex",
+		"sourceKind",
+		"sourceKindLabel",
+		"countBundled",
+		"countSystem",
+		"countCustom",
+		"formatShortDuration",
+		"outcomeBadgeClass",
+	}
+	for _, name := range want {
+		if _, ok := fm[name]; !ok {
+			t.Errorf("statusTemplateFuncMap missing helper %q (required by docs/admin-ui-spec.md §6.1)", name)
+		}
+	}
+	// Existing helpers must remain — regression guard for the JSON-path
+	// preservation rule in §0.4.
+	for _, name := range []string{"unixTime", "formatBytes", "durationOf", "hitRatePct"} {
+		if _, ok := fm[name]; !ok {
+			t.Errorf("statusTemplateFuncMap regressed: missing existing helper %q", name)
+		}
+	}
+}
+
 // AIDEV-NOTE: tests in this file are the implementation contract for the
 // helpers added in docs/admin-ui-spec.md §6.1. Cases mirror the examples
 // in §6.1 and §14.1 verbatim — keep them in sync if the spec changes.

@@ -667,15 +667,32 @@ func chooseFormat(r *http.Request) string {
 // statusHTMLTemplate renders the SPEC5 §9.7.3 HTML status page.
 // html/template auto-escapes every interpolated value; never
 // switch to text/template without a full security review.
-var statusHTMLTemplate = template.Must(template.New("status").Funcs(template.FuncMap{
-	"unixTime":     formatUnixTimeTag,
-	"unixTimePtr":  formatUnixTimePtrTag,
-	"formatBytes":  formatBytes,
-	"durationOf":   durationOf,
-	"i64Ptr":       formatInt64Ptr,
-	"hitRatePct":   formatHitRatePercent,
-	"defaultEmpty": defaultEmpty,
-}).Parse(statusHTML))
+// statusTemplateFuncMap returns the html/template func map used by the
+// admin status page. Existing helpers are preserved verbatim; the
+// docs/admin-ui-spec.md §6.1 helpers (chunkHex … outcomeBadgeClass) are
+// added here. vitalState and verdictExplanation arrive with the
+// htmlRenderModel wrapper in the next iteration.
+func statusTemplateFuncMap() template.FuncMap {
+	return template.FuncMap{
+		"unixTime":            formatUnixTimeTag,
+		"unixTimePtr":         formatUnixTimePtrTag,
+		"formatBytes":         formatBytes,
+		"durationOf":          durationOf,
+		"i64Ptr":              formatInt64Ptr,
+		"hitRatePct":          formatHitRatePercent,
+		"defaultEmpty":        defaultEmpty,
+		"chunkHex":            chunkHex,
+		"sourceKind":          sourceKind,
+		"sourceKindLabel":     sourceKindLabel,
+		"countBundled":        countBundled,
+		"countSystem":         countSystem,
+		"countCustom":         countCustom,
+		"formatShortDuration": formatShortDuration,
+		"outcomeBadgeClass":   outcomeBadgeClass,
+	}
+}
+
+var statusHTMLTemplate = template.Must(template.New("status").Funcs(statusTemplateFuncMap()).Parse(statusHTML))
 
 const statusHTML = `<!DOCTYPE html>
 <html lang="en">
@@ -1009,10 +1026,11 @@ func durationOf(seconds int64) string {
 	return fmt.Sprintf("%dh %dm", h, m)
 }
 
-// AIDEV-NOTE: helpers below (chunkHex … outcomeBadgeClass) are wired into
-// the admin status template's funcMap per docs/admin-ui-spec.md §6.1. All
-// are pure functions over their inputs — no package-level state, no I/O.
-// Tests in status_test.go are the implementation contract.
+// AIDEV-NOTE: helpers below (chunkHex … outcomeBadgeClass) are registered
+// in statusTemplateFuncMap() per docs/admin-ui-spec.md §6.1. All are pure
+// functions over their inputs — no package-level state, no I/O. Tests in
+// status_test.go are the implementation contract. vitalState and
+// verdictExplanation land with the htmlRenderModel wrapper.
 
 // chunkHex groups a hex string into n-character chunks separated by a
 // single ASCII space. Input is lowercased. Non-hex input (anything

@@ -1,0 +1,1807 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>apt-cacher-ultra status — mockup</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%237A2E0A'/%3E%3Ctext x='3' y='12' font-family='ui-monospace,monospace' font-size='12' fill='%23FAFAF7' font-weight='700'%3E%C2%AB%3C/text%3E%3C/svg%3E">
+<style>
+/* =========================================================
+   apt-cacher-ultra — admin redesign mockup
+   Zero external deps. System fonts only.
+   ========================================================= */
+
+:root {
+  --ink-0: #FAFAF7;
+  --ink-1: #F2F1EC;
+  --ink-2: #E5E3DA;
+  --ink-3: #C7C4B8;
+  --ink-4: #7A7669;
+  --ink-5: #3A3833;
+  --ink-6: #1A1815;
+
+  --accent: #7A2E0A;
+  --ok:     #2E5D3A;
+  --warn:   #A36410;
+  --crit:   #9A1F1B;
+  --stale:  #5C5A52;
+
+  --row-tint: rgba(0,0,0,0.018);
+  --crit-tint: rgba(154,31,27,0.04);
+  --warn-tint: rgba(163,100,16,0.045);
+
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "IBM Plex Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+
+  --max-w: 1400px;
+  --rail-w: 200px;
+  --bar-h: 64px;
+
+  --xs:   11px;
+  --sm:   12.5px;
+  --base: 14px;
+  --md:   16px;
+  --lg:   20px;
+  --xl:   28px;
+  --2xl:  36px;
+
+  --r-pill: 999px;
+  --r-badge: 2px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink-0: #15171A;
+    --ink-1: #1B1E22;
+    --ink-2: #2A2D32;
+    --ink-3: #4A4D54;
+    --ink-4: #8E8F94;
+    --ink-5: #C5C6CB;
+    --ink-6: #EDEEF1;
+    --accent: #E08B5A;
+    --ok:    #7FB68E;
+    --warn:  #E0B05A;
+    --crit:  #E7716E;
+    --stale: #7A7C82;
+    --row-tint: rgba(255,255,255,0.022);
+    --crit-tint: rgba(231,113,110,0.06);
+    --warn-tint: rgba(224,176,90,0.05);
+  }
+}
+
+[data-theme="light"] {
+  --ink-0: #FAFAF7; --ink-1: #F2F1EC; --ink-2: #E5E3DA; --ink-3: #C7C4B8;
+  --ink-4: #7A7669; --ink-5: #3A3833; --ink-6: #1A1815;
+  --accent: #7A2E0A; --ok: #2E5D3A; --warn: #A36410; --crit: #9A1F1B; --stale: #5C5A52;
+  --row-tint: rgba(0,0,0,0.018);
+  --crit-tint: rgba(154,31,27,0.04);
+  --warn-tint: rgba(163,100,16,0.045);
+}
+[data-theme="dark"] {
+  --ink-0: #15171A; --ink-1: #1B1E22; --ink-2: #2A2D32; --ink-3: #4A4D54;
+  --ink-4: #8E8F94; --ink-5: #C5C6CB; --ink-6: #EDEEF1;
+  --accent: #E08B5A; --ok: #7FB68E; --warn: #E0B05A; --crit: #E7716E; --stale: #7A7C82;
+  --row-tint: rgba(255,255,255,0.022);
+  --crit-tint: rgba(231,113,110,0.06);
+  --warn-tint: rgba(224,176,90,0.05);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--ink-0);
+  color: var(--ink-5);
+  font-family: var(--font-sans);
+  font-size: var(--base);
+  line-height: 1.55;
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 120ms ease;
+}
+a:hover { border-bottom-color: var(--accent); }
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 1px;
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  color: var(--ink-5);
+  background: transparent;
+  padding: 0;
+}
+
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+
+/* ------------------------------------------------------------------
+   STATUS BAR
+   ------------------------------------------------------------------ */
+.bar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  height: var(--bar-h);
+  background: var(--ink-0);
+  border-bottom: 1px solid var(--ink-2);
+  display: flex;
+  align-items: center;
+  padding: 0 32px;
+  gap: 24px;
+  animation: fadeIn 600ms ease both;
+}
+
+.bar__brand {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: var(--md);
+  color: var(--ink-6);
+  letter-spacing: -0.005em;
+}
+.bar__mark {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 22px;
+  color: var(--accent);
+  line-height: 1;
+  margin-right: 2px;
+  position: relative;
+  top: 2px;
+}
+.bar__version {
+  font-family: var(--font-mono);
+  font-size: var(--xs);
+  color: var(--ink-4);
+  letter-spacing: 0.04em;
+}
+
+.bar__verdict {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 1;
+  min-width: 0;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px 8px 12px;
+  border-radius: var(--r-pill);
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: var(--sm);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.pill--healthy {
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  color: var(--ok);
+}
+.pill--watching {
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  color: var(--warn);
+}
+.pill--degraded {
+  background: color-mix(in srgb, var(--crit) 14%, transparent);
+  color: var(--crit);
+}
+.pill--stale {
+  background: color-mix(in srgb, var(--stale) 14%, transparent);
+  color: var(--stale);
+}
+.pill .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.verdict__msg {
+  font-size: var(--sm);
+  color: var(--ink-5);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.verdict__msg strong {
+  color: var(--ink-6);
+  font-weight: 600;
+}
+
+.bar__meta {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-left: auto;
+  font-size: var(--xs);
+  color: var(--ink-4);
+  letter-spacing: 0.04em;
+}
+.bar__meta .sep { color: var(--ink-3); }
+
+.icon-btn {
+  width: 32px; height: 32px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent;
+  border: 1px solid var(--ink-2);
+  color: var(--ink-4);
+  cursor: pointer;
+  border-radius: 2px;
+  transition: background 120ms ease, color 120ms ease;
+}
+.icon-btn:hover { color: var(--ink-6); background: var(--ink-1); }
+.icon-btn svg { width: 16px; height: 16px; }
+
+.state-switcher {
+  display: inline-flex;
+  border: 1px solid var(--ink-2);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.state-switcher button {
+  background: transparent;
+  border: 0;
+  padding: 6px 10px;
+  font-family: var(--font-sans);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+  cursor: pointer;
+  border-right: 1px solid var(--ink-2);
+}
+.state-switcher button:last-child { border-right: 0; }
+.state-switcher button[aria-pressed="true"] {
+  background: var(--ink-1);
+  color: var(--ink-6);
+}
+
+/* ------------------------------------------------------------------
+   PAGE LAYOUT
+   ------------------------------------------------------------------ */
+.page {
+  max-width: var(--max-w);
+  margin: 0 auto;
+  padding: 32px 32px 96px;
+}
+
+/* ------------------------------------------------------------------
+   HERO STRIP — VITAL CELLS
+   ------------------------------------------------------------------ */
+.vitals {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0;
+  border: 1px solid var(--ink-2);
+  margin-bottom: 48px;
+  background: var(--ink-0);
+}
+
+.vital {
+  position: relative;
+  padding: 20px 24px 22px 28px;
+  border-right: 1px solid var(--ink-2);
+  display: flex; flex-direction: column; gap: 8px;
+  min-height: 132px;
+}
+.vital:last-child { border-right: 0; }
+
+.vital::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 4px;
+  background: var(--ink-2);
+}
+.vital[data-state="ok"]::before    { background: var(--ok); }
+.vital[data-state="warn"]::before  { background: var(--warn); }
+.vital[data-state="crit"]::before  { background: var(--crit); }
+.vital[data-state="stale"]::before { background: var(--stale); }
+
+.vital__label {
+  font-size: var(--xs);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+  font-weight: 500;
+}
+
+.vital__value {
+  font-family: var(--font-sans);
+  font-size: var(--xl);
+  font-weight: 600;
+  color: var(--ink-6);
+  letter-spacing: -0.015em;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.vital__value .unit {
+  font-family: var(--font-sans);
+  font-size: var(--md);
+  color: var(--ink-4);
+  font-weight: 500;
+  margin-left: 4px;
+  letter-spacing: 0;
+}
+
+.vital__sub {
+  font-size: var(--sm);
+  color: var(--ink-4);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.vital__sub .accented-warn { color: var(--warn); }
+.vital__sub .accented-crit { color: var(--crit); }
+.vital__sub .accented-ok   { color: var(--ok); }
+.vital__sub .mono { font-family: var(--font-mono); font-size: 12px; }
+
+/* ------------------------------------------------------------------
+   AGGREGATE NOTICE
+   ------------------------------------------------------------------ */
+.notice {
+  border: 1px solid var(--crit);
+  border-left-width: 4px;
+  padding: 16px 20px 18px;
+  margin-bottom: 24px;
+  background: var(--crit-tint);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.notice--warn {
+  border-color: var(--warn);
+  background: var(--warn-tint);
+}
+.notice__head {
+  font-size: var(--md);
+  color: var(--ink-6);
+  font-weight: 600;
+  display: flex; align-items: center; gap: 10px;
+}
+.notice .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--crit); display: inline-block; }
+.notice--warn .dot { background: var(--warn); }
+.notice__body {
+  font-size: var(--sm);
+  color: var(--ink-4);
+  line-height: 1.6;
+}
+.notice__body code {
+  color: var(--ink-6);
+  background: var(--ink-1);
+  padding: 1px 6px;
+  border-radius: 2px;
+  font-size: 12px;
+}
+
+/* ------------------------------------------------------------------
+   LAYOUT: rail + content
+   ------------------------------------------------------------------ */
+.layout {
+  display: grid;
+  grid-template-columns: var(--rail-w) 1fr;
+  gap: 48px;
+  align-items: start;
+}
+
+.rail {
+  position: sticky;
+  top: calc(var(--bar-h) + 24px);
+  border-left: 1px solid var(--ink-2);
+}
+.rail ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.rail a {
+  display: block;
+  padding: 6px 0 6px 16px;
+  font-family: var(--font-sans);
+  font-size: var(--xs);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+  font-weight: 500;
+  border-bottom: none;
+  position: relative;
+  transition: color 120ms ease;
+}
+.rail a:hover { color: var(--ink-6); }
+.rail a.is-active {
+  color: var(--ink-6);
+}
+.rail a.is-active::before {
+  content: "";
+  position: absolute;
+  left: -1px; top: 50%;
+  transform: translateY(-50%);
+  width: 2px; height: 16px;
+  background: var(--accent);
+}
+
+.content { min-width: 0; }
+
+/* ------------------------------------------------------------------
+   SECTION
+   ------------------------------------------------------------------ */
+section.panel {
+  margin-bottom: 56px;
+  scroll-margin-top: calc(var(--bar-h) + 16px);
+}
+
+.panel__eyebrow {
+  font-size: var(--xs);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+  font-weight: 500;
+  margin-bottom: 4px;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.panel__eyebrow .count-warn { color: var(--warn); }
+.panel__eyebrow .count-crit { color: var(--crit); }
+.panel__eyebrow .count-ok   { color: var(--ok); }
+.panel__eyebrow .sep        { color: var(--ink-3); }
+
+.panel__h {
+  font-family: var(--font-sans);
+  font-size: var(--lg);
+  font-weight: 600;
+  color: var(--ink-6);
+  margin: 0 0 18px 0;
+  letter-spacing: -0.01em;
+}
+.panel__desc {
+  font-size: var(--sm);
+  color: var(--ink-4);
+  margin: 0 0 16px 0;
+  max-width: 64ch;
+}
+
+/* ------------------------------------------------------------------
+   TABLES
+   ------------------------------------------------------------------ */
+.table-wrap {
+  overflow-x: auto;
+  border-top: 1px solid var(--ink-2);
+  border-bottom: 1px solid var(--ink-2);
+}
+
+table.data {
+  font-size: var(--sm);
+  color: var(--ink-5);
+}
+table.data thead th {
+  position: sticky;
+  top: var(--bar-h);
+  background: var(--ink-1);
+  z-index: 2;
+  text-align: left;
+  font-size: var(--xs);
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--ink-2);
+  white-space: nowrap;
+}
+table.data tbody td {
+  padding: 9px 14px;
+  border-bottom: 0;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+table.data tbody tr:nth-child(even) { background: var(--row-tint); }
+table.data tbody tr:hover { background: var(--ink-1); }
+table.data .num { text-align: right; font-variant-numeric: tabular-nums; }
+table.data .mono { font-family: var(--font-mono); font-size: 12px; color: var(--ink-5); }
+table.data .host { font-family: var(--font-mono); font-size: 12px; color: var(--ink-6); }
+table.data .muted { color: var(--ink-3); }
+table.data .time { font-family: var(--font-mono); font-size: 12px; color: var(--ink-5); }
+table.data .time-relative { color: var(--ink-4); font-size: 11px; margin-left: 6px; }
+
+/* Row state stripes via inset shadow on first cell */
+table.data tr[data-state="warn"] td:first-child {
+  box-shadow: inset 3px 0 0 0 var(--warn);
+}
+table.data tr[data-state="crit"] td:first-child {
+  box-shadow: inset 3px 0 0 0 var(--crit);
+}
+table.data tr[data-state="stale"] td:first-child {
+  box-shadow: inset 3px 0 0 0 var(--stale);
+}
+table.data tr[data-state="warn"] { background: var(--warn-tint); }
+table.data tr[data-state="crit"] { background: var(--crit-tint); }
+table.data tr[data-state="warn"]:nth-child(even) { background: var(--warn-tint); }
+table.data tr[data-state="crit"]:nth-child(even) { background: var(--crit-tint); }
+
+/* ------------------------------------------------------------------
+   BADGES
+   ------------------------------------------------------------------ */
+.b {
+  display: inline-block;
+  padding: 1px 8px 2px;
+  border-radius: var(--r-badge);
+  border: 1px solid currentColor;
+  font-family: var(--font-sans);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+  text-transform: uppercase;
+  background: transparent;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.b--ok      { color: var(--ok); }
+.b--warn    { color: var(--warn); }
+.b--crit    { color: var(--crit); }
+.b--stale   { color: var(--stale); }
+.b--neutral { color: var(--ink-4); border-color: var(--ink-3); }
+
+.lagging {
+  margin-left: 8px;
+  font-size: 11px;
+  color: var(--warn);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Keys-loaded chip in the status bar meta area */
+.keys-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px 4px 8px;
+  border: 1px solid var(--ink-2);
+  border-radius: 2px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+  border-bottom: 1px solid var(--ink-2);
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.keys-chip:hover {
+  background: var(--ink-1);
+  color: var(--ink-6);
+  border-color: var(--ink-3);
+}
+.keys-chip__count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0;
+  color: var(--ink-6);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.keys-chip__tick { color: var(--ok); font-size: 12px; letter-spacing: 0; }
+.keys-chip[data-state="crit"] { color: var(--crit); border-color: var(--crit); }
+.keys-chip[data-state="crit"] .keys-chip__count { color: var(--crit); }
+.keys-chip[data-state="crit"] .keys-chip__tick { color: var(--crit); }
+
+/* Source-attribution badges for keyring */
+.src {
+  display: inline-block;
+  padding: 1px 7px 2px;
+  border-radius: var(--r-badge);
+  border: 1px solid currentColor;
+  font-family: var(--font-sans);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  font-weight: 500;
+  text-transform: uppercase;
+  background: transparent;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.src--bundled { color: var(--ink-4); border-color: var(--ink-3); }
+.src--system  { color: var(--ink-5); border-color: var(--ink-3); }
+.src--custom  { color: var(--accent); }
+
+.src-path {
+  display: inline-block;
+  margin-left: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-4);
+}
+
+/* Fingerprint rendering — chunked groups of 4 hex */
+.fp {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: var(--ink-6);
+  font-variant-numeric: tabular-nums;
+  word-spacing: 1px;
+  white-space: nowrap;
+}
+.fp--sub {
+  color: var(--ink-4);
+  font-size: 11px;
+}
+
+.uid {
+  display: block;
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  color: var(--ink-6);
+  max-width: 38ch;
+  line-height: 1.4;
+}
+.uid__email {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-4);
+  margin-top: 1px;
+}
+
+.subkeys {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.subkeys--none {
+  color: var(--ink-3);
+  font-size: 14px;
+}
+
+/* Column-header help affordance */
+.col-hint {
+  display: inline-block;
+  margin-left: 4px;
+  cursor: help;
+  position: relative;
+}
+.col-hint summary {
+  list-style: none;
+  display: inline-block;
+  width: 13px; height: 13px;
+  border-radius: 50%;
+  border: 1px solid var(--ink-3);
+  color: var(--ink-4);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 11px;
+  text-align: center;
+  font-family: var(--font-sans);
+  text-transform: none;
+  letter-spacing: 0;
+  vertical-align: middle;
+  cursor: help;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.col-hint summary::-webkit-details-marker { display: none; }
+.col-hint:hover summary { color: var(--ink-6); border-color: var(--ink-4); }
+.col-hint[open] summary { color: var(--accent); border-color: var(--accent); }
+.col-hint__body {
+  position: absolute;
+  top: 22px;
+  left: -8px;
+  z-index: 5;
+  background: var(--ink-0);
+  border: 1px solid var(--ink-3);
+  padding: 10px 14px;
+  width: 280px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink-5);
+  line-height: 1.55;
+  font-weight: 400;
+  box-shadow: 0 1px 0 0 var(--ink-2);
+}
+.col-hint__body::before {
+  content: "";
+  position: absolute;
+  top: -6px;
+  left: 8px;
+  width: 10px; height: 10px;
+  background: var(--ink-0);
+  border-top: 1px solid var(--ink-3);
+  border-left: 1px solid var(--ink-3);
+  transform: rotate(45deg);
+}
+
+/* Trusted-keys anchor row inside the aggregate notice */
+.notice__link-row {
+  display: block;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--ink-2);
+  font-size: var(--sm);
+  color: var(--ink-4);
+  letter-spacing: 0.02em;
+}
+.notice__link-row a {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+/* ------------------------------------------------------------------
+   LABEL/VALUE BLOCK
+   ------------------------------------------------------------------ */
+.kv {
+  display: grid;
+  grid-template-columns: minmax(180px, 30%) 1fr;
+  gap: 0 24px;
+  border-top: 1px solid var(--ink-2);
+}
+.kv > div {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--ink-2);
+}
+.kv .k {
+  font-size: var(--xs);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+  font-weight: 500;
+  text-align: right;
+}
+.kv .v {
+  font-size: var(--sm);
+  color: var(--ink-5);
+  word-break: break-word;
+}
+.kv .v code { color: var(--ink-6); font-size: 12px; }
+.kv .v.muted { color: var(--ink-3); }
+
+/* ------------------------------------------------------------------
+   EMPTY STATE
+   ------------------------------------------------------------------ */
+.empty {
+  border: 1px dashed var(--ink-2);
+  padding: 32px;
+  text-align: center;
+}
+.empty__head {
+  font-size: var(--xs);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--stale);
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+.empty__body {
+  font-size: var(--sm);
+  color: var(--ink-4);
+}
+
+/* ------------------------------------------------------------------
+   COVERAGE PANEL
+   ------------------------------------------------------------------ */
+.coverage {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  gap: 32px;
+  border-top: 1px solid var(--ink-2);
+  padding-top: 16px;
+}
+.arch-list {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: 6px;
+}
+.arch {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  background: var(--ink-1);
+  color: var(--ink-5);
+  border-radius: 2px;
+  letter-spacing: 0.02em;
+}
+.bar-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 7px 0;
+  font-size: var(--sm);
+}
+.bar-row__label {
+  width: 80px;
+  font-size: var(--xs);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+}
+.bar-row__bar {
+  flex: 1;
+  height: 6px;
+  background: var(--ink-1);
+  position: relative;
+}
+.bar-row__fill { height: 100%; background: var(--ink-4); }
+.bar-row__fill--binary { background: var(--ink-6); }
+.bar-row__fill--source { background: var(--ink-4); }
+.bar-row__fill--pdiff  { background: var(--ink-3); }
+.bar-row__num {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-5);
+  font-variant-numeric: tabular-nums;
+  width: 60px;
+  text-align: right;
+}
+
+/* ------------------------------------------------------------------
+   FOOTER
+   ------------------------------------------------------------------ */
+footer {
+  margin-top: 80px;
+  padding-top: 24px;
+  border-top: 1px solid var(--ink-2);
+  font-size: var(--xs);
+  color: var(--ink-4);
+  display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+  letter-spacing: 0.04em;
+}
+footer .sep { color: var(--ink-3); }
+
+/* ------------------------------------------------------------------
+   ANIMATION
+   ------------------------------------------------------------------ */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+/* ------------------------------------------------------------------
+   RESPONSIVE
+   ------------------------------------------------------------------ */
+@media (max-width: 1279px) {
+  .vitals { grid-template-columns: repeat(3, minmax(0,1fr)); }
+  .vital:nth-child(3) { border-right: 0; }
+  .vital:nth-child(n+4) { border-top: 1px solid var(--ink-2); }
+  .vital:nth-child(4) { border-right: 1px solid var(--ink-2); }
+  .layout { grid-template-columns: 1fr; gap: 24px; }
+  .rail {
+    position: sticky; top: var(--bar-h); border-left: 0;
+    border-bottom: 1px solid var(--ink-2);
+    background: var(--ink-0); padding: 12px 0;
+  }
+  .rail ul { flex-direction: row; flex-wrap: wrap; gap: 0 16px; }
+  .rail a { padding: 4px 0; }
+  .rail a.is-active::before { display: none; }
+  .rail a.is-active { border-bottom: 2px solid var(--accent); }
+}
+
+@media (max-width: 720px) {
+  .page { padding: 16px; }
+  .bar { padding: 0 16px; gap: 12px; height: auto; min-height: var(--bar-h); flex-wrap: wrap; padding: 12px 16px; }
+  .bar__meta { margin-left: 0; width: 100%; justify-content: flex-end; }
+  .vitals { grid-template-columns: 1fr; }
+  .vital { border-right: 0; border-bottom: 1px solid var(--ink-2); }
+  .vital:last-child { border-bottom: 0; }
+  .coverage { grid-template-columns: 1fr; }
+  .kv { grid-template-columns: 1fr; }
+  .kv > div { border-bottom: 0; padding: 6px 0; }
+  .kv .k { text-align: left; }
+
+  table.data thead { display: none; }
+  table.data tbody tr {
+    display: block;
+    border-bottom: 1px solid var(--ink-2);
+    padding: 12px 16px;
+  }
+  table.data tbody tr[data-state="crit"] td:first-child,
+  table.data tbody tr[data-state="warn"] td:first-child { box-shadow: none; }
+  table.data tbody tr[data-state="crit"] { border-left: 3px solid var(--crit); }
+  table.data tbody tr[data-state="warn"] { border-left: 3px solid var(--warn); }
+  table.data tbody td {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 4px 0; white-space: normal;
+  }
+  table.data tbody td::before {
+    content: attr(data-label);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-4);
+    margin-right: 12px;
+    flex-shrink: 0;
+  }
+  table.data tbody td.num { justify-content: space-between; }
+}
+</style>
+</head>
+<body>
+
+<!-- Inline SVG sprite -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-arrow-out" viewBox="0 0 16 16">
+      <path d="M6 4h6v6M11 5L4 12" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="square"/>
+    </symbol>
+    <symbol id="i-sun" viewBox="0 0 16 16">
+      <circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.4" fill="none"/>
+      <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.4 1.4M11.6 11.6L13 13M3 13l1.4-1.4M11.6 4.4L13 3" stroke="currentColor" stroke-width="1.4"/>
+    </symbol>
+    <symbol id="i-moon" viewBox="0 0 16 16">
+      <path d="M13 9.5A5 5 0 016.5 3 5 5 0 1013 9.5z" stroke="currentColor" stroke-width="1.4" fill="none"/>
+    </symbol>
+  </defs>
+</svg>
+
+<header class="bar" role="banner">
+  <div class="bar__brand">
+    <span class="bar__mark">«</span>
+    <span>apt-cacher-ultra</span>
+    <span class="bar__version">1.4.2</span>
+  </div>
+
+  <div class="bar__verdict" role="status" aria-live="polite">
+    <span id="verdict-pill" class="pill pill--degraded" data-state="crit">
+      <span class="dot"></span>
+      <span id="verdict-label">Degraded</span>
+    </span>
+    <span class="verdict__msg" id="verdict-msg">
+      <strong>38 of 50 adoptions failed</strong> · 3 suites lagging · zero-refcount backlog rising
+    </span>
+  </div>
+
+  <div class="bar__meta">
+    <span>uptime <strong style="color:var(--ink-5);font-weight:500">7h 24m</strong></span>
+    <span class="sep">·</span>
+    <a href="#keyring" class="keys-chip" aria-label="6 GPG keys loaded; jump to Keyring section">
+      <span class="keys-chip__label">keys</span>
+      <span class="keys-chip__count">6</span>
+      <span class="keys-chip__tick" aria-hidden="true">✓</span>
+    </a>
+    <span class="sep">·</span>
+    <span>build <code>deadbeef</code></span>
+    <span class="sep">·</span>
+    <div class="state-switcher" role="group" aria-label="Demo state switcher">
+      <button type="button" data-demo="healthy">Healthy</button>
+      <button type="button" data-demo="watching">Watching</button>
+      <button type="button" data-demo="degraded" aria-pressed="true">Degraded</button>
+      <button type="button" data-demo="warming">Warming</button>
+    </div>
+    <button id="theme-toggle" class="icon-btn" type="button" aria-label="Toggle theme">
+      <svg id="theme-icon"><use href="#i-sun"/></svg>
+    </button>
+    <a href="?format=json" class="icon-btn" aria-label="View as JSON">
+      <svg><use href="#i-arrow-out"/></svg>
+    </a>
+  </div>
+</header>
+
+<main class="page">
+
+  <!-- =====================================================
+       VITALS / HERO STRIP
+       ===================================================== -->
+  <section class="vitals" aria-label="Vital signs">
+    <article class="vital" data-vital="cache" data-state="warn">
+      <span class="vital__label">Cache</span>
+      <span class="vital__value">72.4<span class="unit">GiB</span></span>
+      <span class="vital__sub">
+        <span>4,193 blobs across 11,802 URL paths</span>
+        <span class="accented-warn">Zero-refcount backlog 1,550 ↑</span>
+      </span>
+    </article>
+
+    <article class="vital" data-vital="suites" data-state="warn">
+      <span class="vital__label">Suites</span>
+      <span class="vital__value">47</span>
+      <span class="vital__sub">
+        <span class="accented-warn">3 lagging</span>
+        <span>0 failing · 0 stale</span>
+      </span>
+    </article>
+
+    <article class="vital" data-vital="adoptions" data-state="crit">
+      <span class="vital__label">Adoptions (last 50)</span>
+      <span class="vital__value">12<span class="unit">/50 OK</span></span>
+      <span class="vital__sub">
+        <span class="accented-crit">38 gpg_failed · most recent 14m ago</span>
+        <span>avg duration 0.4s</span>
+      </span>
+    </article>
+
+    <article class="vital" data-vital="gc" data-state="ok">
+      <span class="vital__label">Last GC</span>
+      <span class="vital__value">14<span class="unit">ms</span></span>
+      <span class="vital__sub">
+        <span>12 min ago · periodic</span>
+        <span>reclaimed 318 MiB · 41 blobs</span>
+      </span>
+    </article>
+
+    <article class="vital" data-vital="active" data-state="ok">
+      <span class="vital__label">Active fetches</span>
+      <span class="vital__value">0<span class="unit">hosts</span></span>
+      <span class="vital__sub">
+        <span>idle · slot capacity 6 per host</span>
+        <span class="mono">no fetches in flight</span>
+      </span>
+    </article>
+  </section>
+
+  <!-- =====================================================
+       LAYOUT: rail + content
+       ===================================================== -->
+  <div class="layout">
+
+    <nav class="rail" aria-label="Section navigation">
+      <ul>
+        <li><a href="#suites" class="is-active">Suites</a></li>
+        <li><a href="#adoptions">Recent adoptions</a></li>
+        <li><a href="#keyring">Keyring</a></li>
+        <li><a href="#hot">Hot URL paths</a></li>
+        <li><a href="#by-host">Cache × host × arch</a></li>
+        <li><a href="#coverage">Repository coverage</a></li>
+        <li><a href="#gc">Garbage collection</a></li>
+        <li><a href="#active">Active hosts</a></li>
+        <li><a href="#plumbing">Plumbing</a></li>
+      </ul>
+    </nav>
+
+    <div class="content">
+
+      <!-- =================== SUITES =================== -->
+      <section class="panel" id="suites">
+        <div class="panel__eyebrow">
+          Suites <span class="sep">—</span>
+          <span>47 tracked</span>
+          <span class="sep">·</span>
+          <span class="count-warn">3 lagging</span>
+          <span class="sep">·</span>
+          <span>0 failed</span>
+        </div>
+        <h2 class="panel__h">Suite adoption status</h2>
+        <p class="panel__desc">
+          One row per (host, suite). Lagging rows indicate the upstream has published a newer
+          InRelease than the snapshot the cache is currently serving.
+        </p>
+        <div class="table-wrap">
+          <table class="data">
+            <thead>
+              <tr>
+                <th>Host</th>
+                <th>Suite path</th>
+                <th>Last check</th>
+                <th>Last success</th>
+                <th class="num">Snapshot</th>
+                <th>Adopted<details class="col-hint"><summary aria-label="What does Adopted mean?">i</summary><div class="col-hint__body">Adoption fires only when a fresh InRelease has been observed. Suites whose upstream has not republished since process start may stay empty here without being broken.</div></details></th>
+                <th>InRelease changed</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr data-state="warn">
+                <td data-label="Host" class="host">archive.ubuntu.com</td>
+                <td data-label="Suite path" class="mono">/ubuntu/dists/noble-updates</td>
+                <td data-label="Last check" class="time">07:24:01</td>
+                <td data-label="Last success" class="time">05:08:46</td>
+                <td data-label="Snapshot" class="num mono">10832</td>
+                <td data-label="Adopted" class="time">05:08:47</td>
+                <td data-label="InRelease changed" class="time">07:23:55 <span class="lagging">(lagging 2h 15m)</span></td>
+              </tr>
+              <tr data-state="warn">
+                <td data-label="Host" class="host">archive.ubuntu.com</td>
+                <td data-label="Suite path" class="mono">/ubuntu/dists/noble-security</td>
+                <td data-label="Last check" class="time">07:24:01</td>
+                <td data-label="Last success" class="time">06:31:12</td>
+                <td data-label="Snapshot" class="num mono">10831</td>
+                <td data-label="Adopted" class="time">06:31:14</td>
+                <td data-label="InRelease changed" class="time">07:24:01 <span class="lagging">(lagging 53m)</span></td>
+              </tr>
+              <tr data-state="warn">
+                <td data-label="Host" class="host">archive.ubuntu.com</td>
+                <td data-label="Suite path" class="mono">/ubuntu/dists/noble-backports</td>
+                <td data-label="Last check" class="time">07:24:01</td>
+                <td data-label="Last success" class="time">06:55:09</td>
+                <td data-label="Snapshot" class="num mono">10828</td>
+                <td data-label="Adopted" class="time">06:55:10</td>
+                <td data-label="InRelease changed" class="time">07:23:38 <span class="lagging">(lagging 28m)</span></td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">archive.ubuntu.com</td>
+                <td data-label="Suite path" class="mono">/ubuntu/dists/noble</td>
+                <td data-label="Last check" class="time">07:24:01</td>
+                <td data-label="Last success" class="time">07:24:02</td>
+                <td data-label="Snapshot" class="num mono">10825</td>
+                <td data-label="Adopted" class="time">07:24:03</td>
+                <td data-label="InRelease changed" class="time">07:24:01</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">archive.ubuntu.com</td>
+                <td data-label="Suite path" class="mono">/ubuntu/dists/jammy</td>
+                <td data-label="Last check" class="time">07:24:00</td>
+                <td data-label="Last success" class="time">07:24:01</td>
+                <td data-label="Snapshot" class="num mono">10804</td>
+                <td data-label="Adopted" class="time">07:24:02</td>
+                <td data-label="InRelease changed" class="time">07:24:00</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">archive.ubuntu.com</td>
+                <td data-label="Suite path" class="mono">/ubuntu/dists/jammy-updates</td>
+                <td data-label="Last check" class="time">07:24:00</td>
+                <td data-label="Last success" class="time">07:24:01</td>
+                <td data-label="Snapshot" class="num mono">10805</td>
+                <td data-label="Adopted" class="time">07:24:03</td>
+                <td data-label="InRelease changed" class="time">07:24:00</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">download.docker.com</td>
+                <td data-label="Suite path" class="mono">/linux/ubuntu/dists/noble</td>
+                <td data-label="Last check" class="time">07:24:11</td>
+                <td data-label="Last success" class="time">04:09:01</td>
+                <td data-label="Snapshot" class="num mono">10792</td>
+                <td data-label="Adopted" class="time">04:09:02</td>
+                <td data-label="InRelease changed" class="time">04:09:01</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">download.docker.com</td>
+                <td data-label="Suite path" class="mono">/linux/ubuntu/dists/jammy</td>
+                <td data-label="Last check" class="time">07:24:11</td>
+                <td data-label="Last success" class="time">03:45:14</td>
+                <td data-label="Snapshot" class="num mono">10788</td>
+                <td data-label="Adopted" class="time">03:45:15</td>
+                <td data-label="InRelease changed" class="time">03:45:14</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">apt.releases.hashicorp.com</td>
+                <td data-label="Suite path" class="mono">/dists/noble</td>
+                <td data-label="Last check" class="time">07:24:08</td>
+                <td data-label="Last success" class="time">07:24:09</td>
+                <td data-label="Snapshot" class="num mono">10821</td>
+                <td data-label="Adopted" class="time">07:24:10</td>
+                <td data-label="InRelease changed" class="time">07:24:08</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">deb.nodesource.com</td>
+                <td data-label="Suite path" class="mono">/node_20.x/dists/nodistro</td>
+                <td data-label="Last check" class="time">07:24:05</td>
+                <td data-label="Last success" class="time">07:24:06</td>
+                <td data-label="Snapshot" class="num mono">10820</td>
+                <td data-label="Adopted" class="time">07:24:07</td>
+                <td data-label="InRelease changed" class="time">07:24:05</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">packages.grafana.com</td>
+                <td data-label="Suite path" class="mono">/oss/deb/stable</td>
+                <td data-label="Last check" class="time">07:24:03</td>
+                <td data-label="Last success" class="time">07:24:04</td>
+                <td data-label="Snapshot" class="num mono">10819</td>
+                <td data-label="Adopted" class="time">07:24:05</td>
+                <td data-label="InRelease changed" class="time">07:24:03</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">ppa.launchpadcontent.net</td>
+                <td data-label="Suite path" class="mono">/ondrej/php/ubuntu/dists/noble</td>
+                <td data-label="Last check" class="time">07:23:58</td>
+                <td data-label="Last success" class="time">07:23:59</td>
+                <td data-label="Snapshot" class="num mono">10817</td>
+                <td data-label="Adopted" class="time">07:24:00</td>
+                <td data-label="InRelease changed" class="time">07:23:58</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- =================== RECENT ADOPTIONS =================== -->
+      <section class="panel" id="adoptions">
+        <div class="panel__eyebrow">
+          Recent adoptions <span class="sep">—</span>
+          <span>50 events in ring</span>
+          <span class="sep">·</span>
+          <span class="count-crit">38 gpg_failed</span>
+          <span class="sep">·</span>
+          <span class="count-ok">12 success</span>
+        </div>
+        <h2 class="panel__h">Recent adoption outcomes</h2>
+
+        <div class="notice" role="alert">
+          <div class="notice__head">
+            <span class="dot"></span>
+            <span>38 of 50 recent adoptions failed: <code style="background:transparent;padding:0;color:var(--crit)">gpg_failed</code></span>
+          </div>
+          <div class="notice__body">
+            Most recent: <strong style="color:var(--ink-6)">download.docker.com/linux/ubuntu/dists/noble</strong> · 14 minutes ago.
+            Likely cause: upstream repository key changed since the last successful adoption.
+            Investigate with <code>apt-cacher-ultra packages list --outcome gpg_failed</code>.
+            <span class="notice__link-row">Trusted keys <a href="#keyring">&rarr; Keyring</a></span>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table class="data">
+            <thead>
+              <tr>
+                <th>Host</th>
+                <th>Suite path</th>
+                <th>Outcome</th>
+                <th>Completed</th>
+                <th class="num">Duration</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr data-state="crit">
+                <td data-label="Host" class="host">download.docker.com</td>
+                <td data-label="Suite path" class="mono">/linux/ubuntu/dists/noble</td>
+                <td data-label="Outcome"><span class="b b--crit">gpg_failed</span></td>
+                <td data-label="Completed" class="time">07:24:11</td>
+                <td data-label="Duration" class="num mono">412 ms</td>
+              </tr>
+              <tr data-state="crit">
+                <td data-label="Host" class="host">download.docker.com</td>
+                <td data-label="Suite path" class="mono">/linux/ubuntu/dists/noble-updates</td>
+                <td data-label="Outcome"><span class="b b--crit">gpg_failed</span></td>
+                <td data-label="Completed" class="time">07:24:08</td>
+                <td data-label="Duration" class="num mono">498 ms</td>
+              </tr>
+              <tr data-state="crit">
+                <td data-label="Host" class="host">download.docker.com</td>
+                <td data-label="Suite path" class="mono">/linux/ubuntu/dists/jammy</td>
+                <td data-label="Outcome"><span class="b b--crit">gpg_failed</span></td>
+                <td data-label="Completed" class="time">07:24:06</td>
+                <td data-label="Duration" class="num mono">387 ms</td>
+              </tr>
+              <tr data-state="crit">
+                <td data-label="Host" class="host">download.docker.com</td>
+                <td data-label="Suite path" class="mono">/linux/ubuntu/dists/jammy-updates</td>
+                <td data-label="Outcome"><span class="b b--crit">gpg_failed</span></td>
+                <td data-label="Completed" class="time">07:24:03</td>
+                <td data-label="Duration" class="num mono">421 ms</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">archive.ubuntu.com</td>
+                <td data-label="Suite path" class="mono">/ubuntu/dists/noble</td>
+                <td data-label="Outcome"><span class="b b--ok">success</span></td>
+                <td data-label="Completed" class="time">07:24:02</td>
+                <td data-label="Duration" class="num mono">1.21 s</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">archive.ubuntu.com</td>
+                <td data-label="Suite path" class="mono">/ubuntu/dists/jammy</td>
+                <td data-label="Outcome"><span class="b b--ok">success</span></td>
+                <td data-label="Completed" class="time">07:24:01</td>
+                <td data-label="Duration" class="num mono">1.18 s</td>
+              </tr>
+              <tr data-state="crit">
+                <td data-label="Host" class="host">download.docker.com</td>
+                <td data-label="Suite path" class="mono">/linux/ubuntu/dists/noble</td>
+                <td data-label="Outcome"><span class="b b--crit">gpg_failed</span></td>
+                <td data-label="Completed" class="time">07:23:58</td>
+                <td data-label="Duration" class="num mono">404 ms</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">apt.releases.hashicorp.com</td>
+                <td data-label="Suite path" class="mono">/dists/noble</td>
+                <td data-label="Outcome"><span class="b b--ok">success</span></td>
+                <td data-label="Completed" class="time">07:23:55</td>
+                <td data-label="Duration" class="num mono">892 ms</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">deb.nodesource.com</td>
+                <td data-label="Suite path" class="mono">/node_20.x/dists/nodistro</td>
+                <td data-label="Outcome"><span class="b b--ok">success</span></td>
+                <td data-label="Completed" class="time">07:23:51</td>
+                <td data-label="Duration" class="num mono">1.04 s</td>
+              </tr>
+              <tr data-state="crit">
+                <td data-label="Host" class="host">download.docker.com</td>
+                <td data-label="Suite path" class="mono">/linux/ubuntu/dists/noble-updates</td>
+                <td data-label="Outcome"><span class="b b--crit">gpg_failed</span></td>
+                <td data-label="Completed" class="time">07:23:48</td>
+                <td data-label="Duration" class="num mono">456 ms</td>
+              </tr>
+              <tr data-state="crit">
+                <td data-label="Host" class="host">download.docker.com</td>
+                <td data-label="Suite path" class="mono">/linux/ubuntu/dists/jammy</td>
+                <td data-label="Outcome"><span class="b b--crit">gpg_failed</span></td>
+                <td data-label="Completed" class="time">07:23:45</td>
+                <td data-label="Duration" class="num mono">389 ms</td>
+              </tr>
+              <tr>
+                <td data-label="Host" class="host">packages.grafana.com</td>
+                <td data-label="Suite path" class="mono">/oss/deb/stable</td>
+                <td data-label="Outcome"><span class="b b--ok">success</span></td>
+                <td data-label="Completed" class="time">07:23:42</td>
+                <td data-label="Duration" class="num mono">945 ms</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- =================== KEYRING =================== -->
+      <section class="panel" id="keyring">
+        <div class="panel__eyebrow">
+          Keyring <span class="sep">&mdash;</span>
+          <span>6 loaded</span>
+          <span class="sep">&middot;</span>
+          <span>5 bundled</span>
+          <span class="sep">&middot;</span>
+          <span>0 system</span>
+          <span class="sep">&middot;</span>
+          <span>1 custom</span>
+        </div>
+        <h2 class="panel__h">Trusted GPG keys</h2>
+        <p class="panel__desc">
+          Keys used to verify upstream <code>InRelease</code> signatures during adoption.
+          Bundled keys ship with the binary; custom keys come from <code>keyring_dirs</code> paths.
+          On-disk fingerprints take precedence over embedded ones on collision.
+        </p>
+        <div class="table-wrap">
+          <table class="data" id="keyring-table">
+            <thead>
+              <tr>
+                <th>Primary fingerprint</th>
+                <th>User ID</th>
+                <th>Source</th>
+                <th>Subkey fingerprints</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr data-source-kind="bundled">
+                <td data-label="Primary fingerprint"><span class="fp">f6ec b376 2474 eda9 d21b 7022 8719 20d1 991b c93c</span></td>
+                <td data-label="User ID">
+                  <span class="uid">Ubuntu Archive Automatic Signing Key (2018)
+                    <span class="uid__email">&lt;ftpmaster@ubuntu.com&gt;</span>
+                  </span>
+                </td>
+                <td data-label="Source">
+                  <span class="src src--bundled">bundled</span>
+                  <span class="src-path">embedded:ubuntu-archive-keyring.gpg</span>
+                </td>
+                <td data-label="Subkey fingerprints"><span class="subkeys subkeys--none">&mdash;</span></td>
+              </tr>
+              <tr data-source-kind="bundled">
+                <td data-label="Primary fingerprint"><span class="fp">790b f870 79a2 a82b 35bb 30a2 8ee4 5a1c b1bc f1a5</span></td>
+                <td data-label="User ID">
+                  <span class="uid">Ubuntu Archive Automatic Signing Key (2012)
+                    <span class="uid__email">&lt;ftpmaster@ubuntu.com&gt;</span>
+                  </span>
+                </td>
+                <td data-label="Source">
+                  <span class="src src--bundled">bundled</span>
+                  <span class="src-path">embedded:ubuntu-archive-keyring.gpg</span>
+                </td>
+                <td data-label="Subkey fingerprints"><span class="subkeys subkeys--none">&mdash;</span></td>
+              </tr>
+              <tr data-source-kind="bundled">
+                <td data-label="Primary fingerprint"><span class="fp">b8b8 0b5b 6225 6810 0e72 5b88 0ad7 4036 5be3 88ab</span></td>
+                <td data-label="User ID">
+                  <span class="uid">Debian Archive Automatic Signing Key (12/bookworm, 13/trixie)
+                    <span class="uid__email">&lt;ftpmaster@debian.org&gt;</span>
+                  </span>
+                </td>
+                <td data-label="Source">
+                  <span class="src src--bundled">bundled</span>
+                  <span class="src-path">embedded:debian-archive-keyring-2025.1.gpg</span>
+                </td>
+                <td data-label="Subkey fingerprints">
+                  <div class="subkeys">
+                    <span class="fp fp--sub">a44b 6ac1 5f8f 6e3e 9a08 d8c2 7c83 d211 e024 ff66</span>
+                  </div>
+                </td>
+              </tr>
+              <tr data-source-kind="bundled">
+                <td data-label="Primary fingerprint"><span class="fp">56f7 6504 0b67 6f63 1d92 a2c5 c5cc 5fa9 dde2 0107</span></td>
+                <td data-label="User ID">
+                  <span class="uid">Ubuntu Extended Security Maintenance (ESM) apps
+                    <span class="uid__email">&lt;esm-team@canonical.com&gt;</span>
+                  </span>
+                </td>
+                <td data-label="Source">
+                  <span class="src src--bundled">bundled</span>
+                  <span class="src-path">embedded:ubuntu-pro-esm-apps.gpg</span>
+                </td>
+                <td data-label="Subkey fingerprints">
+                  <div class="subkeys">
+                    <span class="fp fp--sub">9311 5544 0a3d 1c2c 1e0e 88a1 4a01 17a7 6f3c bb12</span>
+                    <span class="fp fp--sub">2207 8fc0 b9ac 4a01 7611 e3fa 8ab4 cc6e 84ff 0212</span>
+                  </div>
+                </td>
+              </tr>
+              <tr data-source-kind="bundled">
+                <td data-label="Primary fingerprint"><span class="fp">a012 4ba6 9bbf 0a78 4d10 3fe1 1c6e 7e63 4801 6044</span></td>
+                <td data-label="User ID">
+                  <span class="uid">Ubuntu Extended Security Maintenance (ESM) infra
+                    <span class="uid__email">&lt;esm-team@canonical.com&gt;</span>
+                  </span>
+                </td>
+                <td data-label="Source">
+                  <span class="src src--bundled">bundled</span>
+                  <span class="src-path">embedded:ubuntu-pro-esm-infra.gpg</span>
+                </td>
+                <td data-label="Subkey fingerprints"><span class="subkeys subkeys--none">&mdash;</span></td>
+              </tr>
+              <tr data-source-kind="custom">
+                <td data-label="Primary fingerprint"><span class="fp">9dc8 5822 9fc7 dd38 854a e5a2 1cdb 76e6 e0e9 a91e</span></td>
+                <td data-label="User ID">
+                  <span class="uid">Docker Release (CE deb)
+                    <span class="uid__email">&lt;docker@docker.com&gt;</span>
+                  </span>
+                </td>
+                <td data-label="Source">
+                  <span class="src src--custom">custom</span>
+                  <span class="src-path">/etc/apt/keyrings/docker.gpg</span>
+                </td>
+                <td data-label="Subkey fingerprints"><span class="subkeys subkeys--none">&mdash;</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- =================== HOT URL PATHS =================== -->
+      <section class="panel" id="hot">
+        <div class="panel__eyebrow">
+          Hot URL paths <span class="sep">—</span>
+          <span>top 20 by request count</span>
+          <span class="sep">·</span>
+          <span>last 7h 24m</span>
+        </div>
+        <h2 class="panel__h">What clients are asking for</h2>
+        <div class="table-wrap">
+          <table class="data">
+            <thead>
+              <tr>
+                <th>Host</th>
+                <th>Path</th>
+                <th>Kind</th>
+                <th class="num">Requests</th>
+                <th>Last requested</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Path" class="mono">/ubuntu/dists/noble/InRelease</td><td data-label="Kind"><span class="b b--neutral">metadata</span></td><td data-label="Requests" class="num mono">4,820</td><td data-label="Last requested" class="time">07:24:11</td></tr>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Path" class="mono">/ubuntu/dists/noble-updates/InRelease</td><td data-label="Kind"><span class="b b--neutral">metadata</span></td><td data-label="Requests" class="num mono">4,801</td><td data-label="Last requested" class="time">07:24:11</td></tr>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Path" class="mono">/ubuntu/dists/noble-security/InRelease</td><td data-label="Kind"><span class="b b--neutral">metadata</span></td><td data-label="Requests" class="num mono">4,798</td><td data-label="Last requested" class="time">07:24:11</td></tr>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Path" class="mono">/ubuntu/dists/noble-backports/InRelease</td><td data-label="Kind"><span class="b b--neutral">metadata</span></td><td data-label="Requests" class="num mono">4,794</td><td data-label="Last requested" class="time">07:24:11</td></tr>
+              <tr><td data-label="Host" class="host">download.docker.com</td><td data-label="Path" class="mono">/linux/ubuntu/dists/noble/InRelease</td><td data-label="Kind"><span class="b b--neutral">metadata</span></td><td data-label="Requests" class="num mono">2,401</td><td data-label="Last requested" class="time">07:24:11</td></tr>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Path" class="mono">/ubuntu/dists/jammy/InRelease</td><td data-label="Kind"><span class="b b--neutral">metadata</span></td><td data-label="Requests" class="num mono">1,915</td><td data-label="Last requested" class="time">07:24:00</td></tr>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Path" class="mono">/ubuntu/pool/main/g/glibc/libc6_2.39-0ubuntu8.4_amd64.deb</td><td data-label="Kind"><span class="b b--ok">payload</span></td><td data-label="Requests" class="num mono">412</td><td data-label="Last requested" class="time">07:18:33</td></tr>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Path" class="mono">/ubuntu/pool/main/o/openssl/libssl3t64_3.0.13-0ubuntu3.4_amd64.deb</td><td data-label="Kind"><span class="b b--ok">payload</span></td><td data-label="Requests" class="num mono">408</td><td data-label="Last requested" class="time">07:19:12</td></tr>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Path" class="mono">/ubuntu/pool/main/s/systemd/systemd_255.4-1ubuntu8.4_amd64.deb</td><td data-label="Kind"><span class="b b--ok">payload</span></td><td data-label="Requests" class="num mono">388</td><td data-label="Last requested" class="time">07:19:40</td></tr>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Path" class="mono">/ubuntu/pool/main/c/curl/curl_8.5.0-2ubuntu10.4_amd64.deb</td><td data-label="Kind"><span class="b b--ok">payload</span></td><td data-label="Requests" class="num mono">312</td><td data-label="Last requested" class="time">07:17:54</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- =================== CACHE × HOST × ARCH =================== -->
+      <section class="panel" id="by-host">
+        <div class="panel__eyebrow">
+          Cache contents <span class="sep">—</span>
+          <span>by host × architecture</span>
+        </div>
+        <h2 class="panel__h">What's on disk, broken down</h2>
+        <div class="table-wrap">
+          <table class="data">
+            <thead>
+              <tr>
+                <th>Host</th>
+                <th>Architecture</th>
+                <th class="num">package_hash rows</th>
+                <th class="num">Blobs</th>
+                <th class="num">Bytes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Architecture"><span class="arch">amd64</span></td><td data-label="package_hash rows" class="num mono">38,420</td><td data-label="Blobs" class="num mono">2,914</td><td data-label="Bytes" class="num mono">52.8 GiB</td></tr>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Architecture"><span class="arch">arm64</span></td><td data-label="package_hash rows" class="num mono">37,910</td><td data-label="Blobs" class="num mono">684</td><td data-label="Bytes" class="num mono">12.1 GiB</td></tr>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Architecture"><span class="arch">i386</span></td><td data-label="package_hash rows" class="num mono">12,041</td><td data-label="Blobs" class="num mono">0</td><td data-label="Bytes" class="num mono">0 B</td></tr>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Architecture"><span class="arch">all</span></td><td data-label="package_hash rows" class="num mono">8,332</td><td data-label="Blobs" class="num mono">421</td><td data-label="Bytes" class="num mono">4.2 GiB</td></tr>
+              <tr><td data-label="Host" class="host">archive.ubuntu.com</td><td data-label="Architecture"><span class="arch">source</span></td><td data-label="package_hash rows" class="num mono">2,810</td><td data-label="Blobs" class="num mono">0</td><td data-label="Bytes" class="num mono">0 B</td></tr>
+              <tr><td data-label="Host" class="host">download.docker.com</td><td data-label="Architecture"><span class="arch">amd64</span></td><td data-label="package_hash rows" class="num mono">142</td><td data-label="Blobs" class="num mono">94</td><td data-label="Bytes" class="num mono">2.8 GiB</td></tr>
+              <tr><td data-label="Host" class="host">download.docker.com</td><td data-label="Architecture"><span class="arch">arm64</span></td><td data-label="package_hash rows" class="num mono">142</td><td data-label="Blobs" class="num mono">12</td><td data-label="Bytes" class="num mono">388 MiB</td></tr>
+              <tr><td data-label="Host" class="host">apt.releases.hashicorp.com</td><td data-label="Architecture"><span class="arch">amd64</span></td><td data-label="package_hash rows" class="num mono">88</td><td data-label="Blobs" class="num mono">68</td><td data-label="Bytes" class="num mono">412 MiB</td></tr>
+              <tr><td data-label="Host" class="host">deb.nodesource.com</td><td data-label="Architecture"><span class="arch">amd64</span></td><td data-label="package_hash rows" class="num mono">62</td><td data-label="Blobs" class="num mono">0</td><td data-label="Bytes" class="num mono">0 B</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- =================== COVERAGE =================== -->
+      <section class="panel" id="coverage">
+        <div class="panel__eyebrow">Repository coverage</div>
+        <h2 class="panel__h">What the cache is covering</h2>
+        <div class="coverage">
+          <div>
+            <div class="kv">
+              <div class="k">Architectures seen</div>
+              <div class="v">
+                <div class="arch-list">
+                  <span class="arch">all</span><span class="arch">amd64</span><span class="arch">arm64</span><span class="arch">i386</span><span class="arch">source</span>
+                </div>
+              </div>
+              <div class="k">Architectures filter</div>
+              <div class="v"><code>(unfiltered — all Release-listed indices adopted)</code></div>
+              <div class="k">Snapshots with Sources</div>
+              <div class="v"><code>11</code></div>
+              <div class="k">Snapshots with pdiff</div>
+              <div class="v"><code>4</code></div>
+            </div>
+          </div>
+          <div>
+            <div class="panel__eyebrow" style="margin-bottom:8px">package_hash rows</div>
+            <div class="bar-row">
+              <span class="bar-row__label">Binary</span>
+              <span class="bar-row__bar"><span class="bar-row__fill bar-row__fill--binary" style="width:88%"></span></span>
+              <span class="bar-row__num">86,194</span>
+            </div>
+            <div class="bar-row">
+              <span class="bar-row__label">Source</span>
+              <span class="bar-row__bar"><span class="bar-row__fill bar-row__fill--source" style="width:12%"></span></span>
+              <span class="bar-row__num">11,420</span>
+            </div>
+            <div class="bar-row">
+              <span class="bar-row__label">Pdiff</span>
+              <span class="bar-row__bar"><span class="bar-row__fill bar-row__fill--pdiff" style="width:5%"></span></span>
+              <span class="bar-row__num">2,233</span>
+            </div>
+            <div class="bar-row" style="border-top:1px solid var(--ink-2);margin-top:6px;padding-top:10px">
+              <span class="bar-row__label" style="color:var(--ink-6);font-weight:600">Total</span>
+              <span class="bar-row__bar" style="background:transparent"></span>
+              <span class="bar-row__num" style="color:var(--ink-6);font-weight:600">99,847</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- =================== GC =================== -->
+      <section class="panel" id="gc">
+        <div class="panel__eyebrow">
+          Garbage collection <span class="sep">—</span>
+          <span>last run 12 min ago</span>
+          <span class="sep">·</span>
+          <span class="count-ok">healthy</span>
+        </div>
+        <h2 class="panel__h">Cache reaping</h2>
+        <div class="kv">
+          <div class="k">Last run</div>
+          <div class="v"><span class="time mono">07:12:08</span> · <span class="b b--neutral">periodic</span></div>
+          <div class="k">Duration</div>
+          <div class="v"><code>14 ms</code></div>
+          <div class="k">Blobs reaped</div>
+          <div class="v"><code>41</code></div>
+          <div class="k">Bytes reclaimed</div>
+          <div class="v"><code>318 MiB</code></div>
+          <div class="k">Orphan candidates reaped</div>
+          <div class="v"><code>7</code></div>
+          <div class="k">Displaced reaped</div>
+          <div class="v"><code>2</code></div>
+          <div class="k">Pool orphans repaired</div>
+          <div class="v"><code>0</code> <span style="color:var(--ink-4)">(0 B)</span></div>
+          <div class="k">Pool unlink errors</div>
+          <div class="v"><code>0</code></div>
+          <div class="k">Deadline reached</div>
+          <div class="v"><span class="b b--ok">false</span></div>
+        </div>
+      </section>
+
+      <!-- =================== ACTIVE HOSTS =================== -->
+      <section class="panel" id="active">
+        <div class="panel__eyebrow">
+          Active hosts <span class="sep">—</span>
+          <span>fetch-slot semaphore snapshot</span>
+        </div>
+        <h2 class="panel__h">Upstream fetches in flight</h2>
+        <div class="empty">
+          <div class="empty__head">No hosts have held a slot since process start</div>
+          <div class="empty__body">Slot usage is bursty — this is normal between adoption cycles.</div>
+        </div>
+      </section>
+
+      <!-- =================== PLUMBING =================== -->
+      <section class="panel" id="plumbing">
+        <div class="panel__eyebrow">Plumbing</div>
+        <h2 class="panel__h">Listeners, TLS MITM, build</h2>
+
+        <h3 style="font-size:var(--xs);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);margin:24px 0 8px">Listeners</h3>
+        <div class="kv">
+          <div class="k">proxy</div>
+          <div class="v"><code>[::]:3142</code></div>
+          <div class="k">tls</div>
+          <div class="v"><code>[::]:3143</code></div>
+          <div class="k">admin</div>
+          <div class="v"><code>[::]:6789</code></div>
+        </div>
+
+        <h3 style="font-size:var(--xs);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);margin:32px 0 8px">TLS MITM <span class="b b--ok" style="margin-left:8px">enabled</span></h3>
+        <div class="kv">
+          <div class="k">CA source</div>
+          <div class="v"><span class="b b--neutral">supplied</span></div>
+          <div class="k">CA fingerprint (SHA-256)</div>
+          <div class="v"><span class="fp">9da4 f1f9 7f3e 1c45 84a7 b1c5 9a7c 40e8 b2d1 908f 31e2 cc04 7fa0 1b89 2c81 4f0d</span></div>
+          <div class="k">CA not_after</div>
+          <div class="v"><span class="time mono">2036-08-14 18:00:00</span> <span style="color:var(--ink-4)">· 10y 3m from now</span></div>
+          <div class="k">Effective allowlist</div>
+          <div class="v"><code>^(archive|security)\.ubuntu\.com$</code></div>
+          <div class="k">Cert cache</div>
+          <div class="v"><code>14 / 256</code></div>
+          <div class="k">Last cert issued</div>
+          <div class="v"><code>archive.ubuntu.com</code> @ <span class="time mono">07:09:14</span></div>
+          <div class="k">Cert hit rate (60s)</div>
+          <div class="v"><code>96.4%</code> <span style="color:var(--ink-4)">(412 lookups)</span></div>
+        </div>
+
+        <h3 style="font-size:var(--xs);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);margin:32px 0 8px">Process</h3>
+        <div class="kv">
+          <div class="k">Version</div>
+          <div class="v"><code>1.4.2</code></div>
+          <div class="k">Started</div>
+          <div class="v"><span class="time mono">00:00:04</span> · uptime 7h 24m</div>
+          <div class="k">Build</div>
+          <div class="v"><code>deadbeef</code></div>
+          <div class="k">Go version</div>
+          <div class="v"><code>go1.24.0</code></div>
+          <div class="k">Cache directory</div>
+          <div class="v"><code>/var/cache/apt-cacher-ultra</code></div>
+        </div>
+      </section>
+
+    </div><!-- /.content -->
+  </div><!-- /.layout -->
+
+  <footer>
+    <a href="/metrics">/metrics <svg style="width:11px;height:11px;vertical-align:middle"><use href="#i-arrow-out"/></svg></a>
+    <span class="sep">·</span>
+    <a href="/healthz">/healthz <svg style="width:11px;height:11px;vertical-align:middle"><use href="#i-arrow-out"/></svg></a>
+    <span class="sep">·</span>
+    <span>Times in UTC, rewritten to browser-local on load. Page auto-refreshes every 60s.</span>
+  </footer>
+</main>
+
+<script>
+// =====================================================
+// Theme toggle — manual override of OS preference
+// =====================================================
+(function () {
+  var root = document.documentElement;
+  var btn  = document.getElementById('theme-toggle');
+  var icon = document.getElementById('theme-icon');
+  var stored = null;
+  try { stored = localStorage.getItem('aclu-theme'); } catch (e) {}
+  if (stored === 'light' || stored === 'dark') root.setAttribute('data-theme', stored);
+
+  function paintIcon() {
+    var mode = root.getAttribute('data-theme');
+    if (!mode || mode === 'auto') {
+      mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    icon.firstElementChild.setAttribute('href', mode === 'dark' ? '#i-sun' : '#i-moon');
+  }
+  paintIcon();
+
+  btn.addEventListener('click', function () {
+    var cur = root.getAttribute('data-theme');
+    if (!cur || cur === 'auto') {
+      cur = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    var next = cur === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try { localStorage.setItem('aclu-theme', next); } catch (e) {}
+    paintIcon();
+  });
+})();
+
+// =====================================================
+// Sticky rail active section
+// =====================================================
+(function () {
+  var rail = document.querySelector('.rail');
+  if (!rail || !('IntersectionObserver' in window)) return;
+  var links = {};
+  rail.querySelectorAll('a[href^="#"]').forEach(function (a) {
+    links[a.getAttribute('href').slice(1)] = a;
+  });
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      var id = e.target.id;
+      if (!links[id]) return;
+      if (e.isIntersecting) {
+        Object.keys(links).forEach(function (k) { links[k].classList.remove('is-active'); });
+        links[id].classList.add('is-active');
+      }
+    });
+  }, { rootMargin: '-72px 0px -65% 0px' });
+  document.querySelectorAll('section.panel').forEach(function (s) { io.observe(s); });
+})();
+
+// =====================================================
+// Demo state switcher — flips the verdict + vitals
+// In production this state is computed from server-rendered
+// data attributes on the page. Here we just stub four states.
+// =====================================================
+(function () {
+  var states = {
+    healthy: {
+      verdictClass: 'pill--healthy', verdictState: 'ok', label: 'Healthy',
+      msg: '<strong>All systems nominal</strong> · 47 suites tracked · last GC 12 min ago',
+      vitals: { cache: 'ok', suites: 'ok', adoptions: 'ok', gc: 'ok', active: 'ok' }
+    },
+    watching: {
+      verdictClass: 'pill--watching', verdictState: 'warn', label: 'Watching',
+      msg: '<strong>3 suites lagging</strong> · zero-refcount backlog rising · GC OK',
+      vitals: { cache: 'warn', suites: 'warn', adoptions: 'ok', gc: 'ok', active: 'ok' }
+    },
+    degraded: {
+      verdictClass: 'pill--degraded', verdictState: 'crit', label: 'Degraded',
+      msg: '<strong>38 of 50 adoptions failed</strong> · 3 suites lagging · zero-refcount backlog rising',
+      vitals: { cache: 'warn', suites: 'warn', adoptions: 'crit', gc: 'ok', active: 'ok' }
+    },
+    warming: {
+      verdictClass: 'pill--stale', verdictState: 'stale', label: 'Warming up',
+      msg: '<strong>Process started 2 minutes ago</strong> · waiting for first adoption cycle',
+      vitals: { cache: 'stale', suites: 'stale', adoptions: 'stale', gc: 'stale', active: 'stale' }
+    }
+  };
+
+  var pill = document.getElementById('verdict-pill');
+  var label = document.getElementById('verdict-label');
+  var msg = document.getElementById('verdict-msg');
+  var buttons = document.querySelectorAll('.state-switcher button');
+
+  function apply(key) {
+    var s = states[key];
+    if (!s) return;
+    pill.classList.remove('pill--healthy', 'pill--watching', 'pill--degraded', 'pill--stale');
+    pill.classList.add(s.verdictClass);
+    pill.setAttribute('data-state', s.verdictState);
+    label.textContent = s.label;
+    msg.innerHTML = s.msg;
+    Object.keys(s.vitals).forEach(function (v) {
+      var el = document.querySelector('.vital[data-vital="' + v + '"]');
+      if (el) el.setAttribute('data-state', s.vitals[v]);
+    });
+    buttons.forEach(function (b) {
+      b.setAttribute('aria-pressed', b.dataset.demo === key ? 'true' : 'false');
+    });
+  }
+  buttons.forEach(function (b) {
+    b.addEventListener('click', function () { apply(b.dataset.demo); });
+  });
+})();
+
+// =====================================================
+// Localize <time data-unix> elements (kept from current page)
+// Stub for mockup — production renders server-side UTC.
+// =====================================================
+(function () {
+  var nodes = document.querySelectorAll('time[data-unix]');
+  // Mockup has none; this is the production hook.
+  if (!nodes.length) return;
+  var tz; try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) {}
+  if (!tz) return;
+  var pad = function (n) { return n < 10 ? '0' + n : '' + n; };
+  for (var i = 0; i < nodes.length; i++) {
+    var u = parseInt(nodes[i].getAttribute('data-unix'), 10);
+    if (!isFinite(u)) continue;
+    var d = new Date(u * 1000);
+    nodes[i].textContent =
+      d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+})();
+</script>
+</body>
+</html>
