@@ -659,7 +659,9 @@ func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if wantsJSON(r) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		if err := writeStatusJSON(w, model); err != nil {
+		gw, closeGz := gzipIfAccepted(w, r)
+		defer func() { _ = closeGz() }()
+		if err := writeStatusJSON(gw, model); err != nil {
 			s.logger.Warn("admin_status_render_failed",
 				"err", err.Error(),
 				"format", "json",
@@ -668,7 +670,9 @@ func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := statusHTMLTemplate.Execute(w, s.buildHTMLRenderModel(model)); err != nil {
+	gw, closeGz := gzipIfAccepted(w, r)
+	defer func() { _ = closeGz() }()
+	if err := statusHTMLTemplate.Execute(gw, s.buildHTMLRenderModel(model)); err != nil {
 		s.logger.Warn("admin_status_render_failed",
 			"err", err.Error(),
 			"format", "html",

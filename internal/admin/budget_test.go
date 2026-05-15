@@ -35,20 +35,14 @@ func TestRenderSizeBudget(t *testing.T) {
 	svgBytes := svgSpriteSize(html)
 	faviconBytes := faviconSize(html)
 
-	// AIDEV-NOTE: gzip caveat. The admin server itself does NOT
-	// negotiate Content-Encoding: gzip — net/http's default handler
-	// returns identity. Operators almost always front the admin port
-	// with a reverse proxy that gzips text/html, which is how this
-	// test interprets §12's "over the wire" budget. The raw cap
-	// below is a generous regression guard so a server-side change
-	// that adds gzip middleware (or a future spec amendment that
-	// requires it) does not silently lower the headroom available
-	// for HTML body growth.
-	//
-	// .phase-loop-notes.md "Spec issues" carries the followup: the
-	// §12 budget should be re-stated to either (a) require server-
-	// side gzip middleware so the budget is enforceable per-request,
-	// or (b) name the reverse-proxy assumption explicitly.
+	// AIDEV-NOTE: gzip is now negotiated server-side by
+	// handlers.go's gzipIfAccepted helper, so the §12 "over the wire"
+	// budget is enforceable per-request without an external proxy.
+	// The gzipped size measured here matches what the operator's
+	// browser receives when it sends Accept-Encoding: gzip (which
+	// every browser does). The raw cap is a generous regression
+	// guard that catches template growth even on identity-encoded
+	// clients (curl without --compressed, programmatic scrapers).
 	var gz bytes.Buffer
 	w := gzip.NewWriter(&gz)
 	if _, err := w.Write([]byte(html)); err != nil {

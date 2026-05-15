@@ -1,8 +1,10 @@
 package admin
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -140,6 +142,51 @@ func writeHealthzFail(w http.ResponseWriter, check string) {
 // (status.go); this handler is the route entry-point.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.renderStatus(w, r)
+}
+
+// acceptsGzip reports whether the client's Accept-Encoding header
+// includes gzip. The header is a comma-separated list of codings,
+// each optionally followed by ";q=…" — we accept any explicit gzip
+// token regardless of the q-value, including q=0 which would be a
+// pathological case worth surfacing (gzip is always supported here).
+// Browsers send "gzip" unconditionally; programmatic clients that
+// want identity send no header at all.
+func acceptsGzip(r *http.Request) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		p := strings.TrimSpace(part)
+		// Strip ";q=…" parameter.
+		if i := strings.IndexByte(p, ';'); i >= 0 {
+			p = strings.TrimSpace(p[:i])
+		}
+		if strings.EqualFold(p, "gzip") {
+			return true
+		}
+	}
+	return false
+}
+
+// gzipIfAccepted returns an io.Writer that gzip-encodes into w when
+// the client's Accept-Encoding includes gzip, otherwise w itself.
+// The returned closeFn flushes and finalizes the gzip stream and
+// MUST be called before the handler returns (defer is fine). When
+// the client does not accept gzip closeFn is a no-op.
+//
+// On a gzip path the Content-Encoding and Vary headers are set
+// before any body is written; the caller must not pre-set
+// Content-Length because the encoded length is unknown until close.
+// Per docs/admin-ui-spec.md §12, gzipping the admin status response
+// is what lets the rendered HTML fit the 22KB on-the-wire budget
+// without an external reverse proxy.
+func gzipIfAccepted(w http.ResponseWriter, r *http.Request) (io.Writer, func() error) {
+	if !acceptsGzip(r) {
+		return w, func() error { return nil }
+	}
+	h := w.Header()
+	h.Set("Content-Encoding", "gzip")
+	h.Add("Vary", "Accept-Encoding")
+	h.Del("Content-Length") // length is unknown post-encode
+	gw := gzip.NewWriter(w)
+	return gw, gw.Close
 }
 
 // wantsJSON implements SPEC5 §9.7.3 content negotiation:

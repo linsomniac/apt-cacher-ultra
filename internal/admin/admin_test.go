@@ -1073,6 +1073,64 @@ func TestStatusJSON_TLSMITM_TopLevelKeyAlwaysPresent(t *testing.T) {
 	}
 }
 
+// TestStatusHTML_GzipsWhenAccepted pins the §12 "over the wire"
+// budget: the admin status response is gzip-encoded when the client
+// sends Accept-Encoding: gzip. Without server-side gzip, the
+// representative healthy render is ~41KB raw vs ~10KB gzipped — the
+// budget enforcement at TestRenderSizeBudget assumes the latter, so
+// the production server must actually emit Content-Encoding: gzip
+// for the test's gzipped-byte assertion to map to operator reality.
+func TestStatusHTML_GzipsWhenAccepted(t *testing.T) {
+	_, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	// Build a request that explicitly disables transparent
+	// decompression so we can observe the wire bytes.
+	tr := &http.Transport{DisableCompression: true}
+	client := &http.Client{Transport: tr}
+	req, err := http.NewRequest("GET", base+"/", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("Content-Encoding = %q, want %q", got, "gzip")
+	}
+	if got := resp.Header.Get("Vary"); !strings.Contains(got, "Accept-Encoding") {
+		t.Errorf("Vary = %q, want substring %q", got, "Accept-Encoding")
+	}
+	body, _ := io.ReadAll(resp.Body)
+	// gzip member starts with 0x1f 0x8b.
+	if len(body) < 2 || body[0] != 0x1f || body[1] != 0x8b {
+		t.Errorf("body does not look gzipped; first bytes: % x", body[:min(len(body), 8)])
+	}
+}
+
+// TestStatusHTML_NoGzipWhenNotAccepted is the negative of the above:
+// clients that do not advertise gzip get identity.
+func TestStatusHTML_NoGzipWhenNotAccepted(t *testing.T) {
+	_, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	tr := &http.Transport{DisableCompression: true}
+	client := &http.Client{Transport: tr}
+	req, _ := http.NewRequest("GET", base+"/", nil)
+	// No Accept-Encoding header sent.
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding = %q, want empty (no Accept-Encoding sent)", got)
+	}
+}
+
 // TestStatusHTML_TLSMITM_SectionRendersWhenEnabled checks the HTML
 // status page renders the SPEC6 §10.4 TLS MITM block when MITM is
 // enabled. The redesign (docs/admin-ui-spec.md) places the MITM

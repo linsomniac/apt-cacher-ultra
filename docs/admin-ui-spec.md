@@ -413,7 +413,7 @@ Five cells in a CSS grid: `grid-template-columns: repeat(5, minmax(0, 1fr))`.
 Each cell:
 
 ```html
-<div class="vital" data-state="{healthy|watching|crit|stale}">
+<div class="vital" data-state="{ok|warn|crit|stale}">
   <span class="vital__eyebrow">CACHE</span>
   <span class="vital__value">72.4 GiB</span>
   <span class="vital__sub">4,193 blobs</span>
@@ -425,10 +425,10 @@ The state stripe is `box-shadow: inset 4px 0 0 var(--state-color)` on
 `.vital`, driven by the `data-state` attribute via CSS attribute selector:
 
 ```css
-.vital[data-state="watching"] { box-shadow: inset 4px 0 0 var(--warn); }
-.vital[data-state="crit"]     { box-shadow: inset 4px 0 0 var(--crit); }
-.vital[data-state="stale"]    { box-shadow: inset 4px 0 0 var(--stale); }
-.vital[data-state="healthy"]  { box-shadow: inset 4px 0 0 transparent; }
+.vital[data-state="warn"]  { box-shadow: inset 4px 0 0 var(--warn); }
+.vital[data-state="crit"]  { box-shadow: inset 4px 0 0 var(--crit); }
+.vital[data-state="stale"] { box-shadow: inset 4px 0 0 var(--stale); }
+.vital[data-state="ok"]    { box-shadow: inset 4px 0 0 transparent; }
 ```
 
 The five cells (left → right):
@@ -475,9 +475,9 @@ Mandatory styling:
 - Header row 32px tall, `--ink-1` background, eyebrow type
 - Body rows 32px tall, 14px text
 - Zebra: odd `--ink-0`, even `rgba(0,0,0,0.02)` / dark
-  `rgba(255,255,255,0.02)`; suppressed on `tr[data-state]:not([data-state="healthy"])`
+  `rgba(255,255,255,0.02)`; suppressed on `tr[data-state]:not([data-state="ok"])`
 - No horizontal cell borders, no vertical separators
-- Row state stripe: `tr[data-state="warning"] > td:first-child {
+- Row state stripe: `tr[data-state="warn"] > td:first-child {
   box-shadow: inset 3px 0 0 var(--warn); }` (and `crit`, `stale`)
 - Numeric columns right-aligned; mono; bytes formatted as
   "72.4 GiB" with a non-breaking space; counts with comma separators
@@ -746,7 +746,7 @@ none touch package-level state or perform I/O.
 | `countSystem`           | `func(ks []keyringEntry) int`                      | Counts rows where `sourceKind(.SourcePath) == "system"`.                                      |
 | `countCustom`           | `func(ks []keyringEntry) int`                      | Counts rows where `sourceKind(.SourcePath) == "custom"`.                                      |
 | `formatShortDuration`   | `func(seconds float64) string`                     | `< 1` → `"%d ms"`; `< 60` → `"%.1f s"`; `< 3600` → `"%dm %ds"`; else `"%dh %dm"`.            |
-| `vitalState`            | `func(kind string, m htmlRenderModel) string`      | Returns `"healthy"`, `"watching"`, `"crit"`, `"stale"` per the §9 thresholds for the given cell kind. Takes the wrapper so it can read both `statusModel` fields and `GCIntervalSeconds`. |
+| `vitalState`            | `func(kind string, m htmlRenderModel) string`      | Returns `"ok"`, `"warn"`, `"crit"`, `"stale"` per the §9 thresholds for the given cell kind. Takes the wrapper so it can read both `statusModel` fields and `GCIntervalSeconds`. |
 | `outcomeBadgeClass`     | `func(outcome string) string`                      | Maps outcome enum to one of the `.b--*` classes.                                              |
 | `verdictExplanation`    | `func(m htmlRenderModel) string`                   | Server-side fallback used only in `<noscript>`. JS computes the live version (§8.1).         |
 
@@ -800,14 +800,24 @@ in the same PR.
 Applied to `.vital`, `tr` inside `.data`, and the document `<body>`
 (rolled-up overall verdict server-side as a fallback). Allowed values:
 
-| Value      | Semantic                                            |
-|------------|-----------------------------------------------------|
-| `healthy`  | Normal operating value                              |
-| `watching` | Lag / elevated backlog / partial failure            |
-| `crit`     | Hard failure                                        |
-| `stale`    | No data / not run yet / cold start                  |
+| Value    | Semantic                                            |
+|----------|-----------------------------------------------------|
+| `ok`     | Normal operating value                              |
+| `warn`   | Lag / elevated backlog / partial failure            |
+| `crit`   | Hard failure                                        |
+| `stale`  | No data / not run yet / cold start                  |
 
-Absence of the attribute is treated as `healthy`.
+Absence of the attribute is treated as `ok`.
+
+The attribute value vocabulary (`ok` / `warn` / `crit` / `stale`) is
+deliberately shorter than the operator-facing verdict labels (`HEALTHY`
+/ `WATCHING` / `DEGRADED` / `WARMING UP`). The former lives in markup
+and CSS selectors where short tokens compress well and keep selector
+strings readable; the latter is what the operator reads on the verdict
+pill. The two vocabularies map: `ok→HEALTHY`, `warn→WATCHING`,
+`crit→DEGRADED`. `stale` is the cell-only fourth state with no direct
+verdict-label peer (warming-up is computed from body uptime + GC
+attributes, not from a stale roll-up).
 
 ### 7.2 `data-outcome` (Recent Adoptions only)
 
@@ -867,11 +877,17 @@ function computeVerdict(doc) {
   const states = [...doc.querySelectorAll('[data-state]')]
     .map(el => el.dataset.state);
   if (states.includes('crit')) return 'degraded';
-  if (states.includes('watching')) return 'watching';
+  if (states.includes('warn')) return 'watching';
   if (isWarmingUp(doc)) return 'warming-up';
   return 'healthy';
 }
 ```
+
+The string the function returns (`degraded` / `watching` / `warming-up`
+/ `healthy`) is the verdict-pill class suffix and the operator-facing
+label source — it is intentionally distinct from the `data-state`
+attribute vocabulary the function READS (`crit` / `warn` / `stale` /
+`ok`). See §7.1 for the vocabulary mapping rationale.
 
 `isWarmingUp` reads `body[data-uptime-seconds]` and `body[data-gc-runs]`
 — uptime <300s AND gc-runs=0 → warming up.
@@ -965,22 +981,22 @@ rules; both reference this section.
 
 ### 9.1 Per-cell vital state
 
-| Cell      | `crit`                                                       | `watching`                                                       | `stale`                                |
+| Cell      | `crit`                                                       | `warn`                                                           | `stale`                                |
 |-----------|--------------------------------------------------------------|------------------------------------------------------------------|----------------------------------------|
 | CACHE     | `.GC.PoolUnlinkErrors > 0`                                   | `.Cache.ZeroRefcountBacklog > 1000`                              | `.Cache.BytesUsed == 0`                |
 | SUITES    | any suite lagging > 24h                                      | any suite lagging at all                                         | `len .Suites == 0`                     |
 | ADOPTIONS | non-success rate ≥ 50%                                       | non-success rate ≥ 10%                                           | ring buffer empty (uptime <5m)         |
 | GC        | `.GC.LastRunDeadlineReached` true on the last run            | last run older than `2 × .GCIntervalSeconds` (wrapper)           | `.GC.LastRunUnixTime == nil`           |
-| ACTIVE    | (no crit threshold defined; reserved)                        | (no watching threshold; reserved)                                | no active hosts and uptime <5m         |
+| ACTIVE    | (no crit threshold defined; reserved)                        | (no warn threshold; reserved)                                    | no active hosts and uptime <5m         |
 
 The CACHE `crit` threshold reads pool-unlink errors from the GC block
 (that's where `PoolUnlinkErrors` lives) rather than from `cacheInfo`.
-The GC `watching` threshold needs the configured run interval, which is
+The GC `warn` threshold needs the configured run interval, which is
 not exposed in `statusModel` — `htmlRenderModel.GCIntervalSeconds`
 (populated from `cfg.GC`'s interval at render time) is the single
 source. If the wrapper field is zero (interval unknown), the GC
-watching branch is suppressed and the cell goes straight from healthy
-to stale.
+warn branch is suppressed and the cell goes straight from `ok` to
+`stale`.
 
 The reserved Active cells are deliberate — current data doesn't justify
 elevated states. If the operator later wants slot-pressure signal, the
@@ -991,7 +1007,7 @@ threshold lands here.
 Computed as the max severity across all `[data-state]` carriers:
 
 1. If any element has `data-state="crit"` → **DEGRADED**
-2. Else if any has `data-state="watching"` → **WATCHING**
+2. Else if any has `data-state="warn"` → **WATCHING**
 3. Else if uptime < 300s AND no GC run yet → **WARMING UP**
 4. Else → **HEALTHY**
 
@@ -1017,15 +1033,19 @@ travels with a new SPEC bump if/when operators ask for it.
 
 ## 10. Accessibility requirements
 
-1. **Contrast.** Verified pairs (Light / Dark):
-   - Body text on page bg: 9.8:1 / 11.6:1 (AAA)
-   - Muted text on page bg: 4.8:1 / 5.1:1 (AA)
-   - `--ok` on page bg: 5.2:1 / required ≥4.5
-   - `--warn` on page bg: 4.7:1 / required ≥4.5
-   - `--crit` on page bg: 6.4:1 / required ≥4.5
-   - `--accent` on page bg: 7.0:1 / verified ≥4.5
-   New contrast verifications are added to the unit tests via a
-   table-driven `TestColorContrast` (§14.1).
+1. **Contrast.** Verified pairs (Light / Dark), measured against the
+   palette in `internal/admin/status.go`:
+   - Body text on page bg: 11.2:1 / 10.5:1 (AAA)
+   - Muted text on page bg: 5.2:1 / 5.6:1 (AA)
+   - `--ok` on page bg: 7.3:1 / 7.7:1 (AA)
+   - `--warn` on page bg: 4.6:1 / 9.0:1 (AA)
+   - `--crit` on page bg: 7.8:1 / 6.0:1 (AA)
+   - `--accent` on page bg: 9.0:1 / 6.9:1 (AA)
+   All pairs are programmatically verified by `TestColorContrast`
+   (§14.1) against WCAG 2.1 thresholds (≥4.5 for AA normal text,
+   ≥7.0 for AAA). The contrast helper extracts tokens from the
+   rendered `<style>` block so a palette change automatically
+   re-runs the verification.
 2. **State never by color alone.**
    - Verdict pill spells the state name.
    - Badges contain text.
@@ -1070,14 +1090,24 @@ The mobile list-view CSS is ~30 lines and adds no JS cost.
 | Asset    | Budget  | Means                                                       |
 |----------|---------|-------------------------------------------------------------|
 | CSS      | ≤14KB minified, inline    | Hand-written; one inline `<style>` block      |
-| JS       | ≤6KB minified, inline     | Vanilla; one inline `<script>` block at body end |
+| JS       | ≤6KB minified, inline     | Vanilla; one inline `<script>` block at body end (plus a tiny pre-paint theme hook in `<head>`) |
 | SVG sprite | ≤1KB                    | Single inline `<svg>` with `<defs>` block      |
 | Favicon  | ≤0.3KB                    | Inline data-URI SVG                            |
 | Fonts    | 0 bytes                   | System font stack only                         |
-| Total    | ≤22KB over the wire        | Verified in `TestRenderSizeBudget` (§14.1)    |
+| Total    | ≤22KB over the wire (gzipped) | Verified in `TestRenderSizeBudget` (§14.1) |
 
 The unminified template literal in `internal/admin/status.go` is allowed
 to be larger; the budget is measured against the rendered response.
+
+**Compression.** The admin handler at `internal/admin/handlers.go`
+gzips text/html responses when the client sends
+`Accept-Encoding: gzip` (which all browsers do). The 22KB total budget
+is enforced against the gzipped wire shape, since that is what the
+operator's browser actually downloads. A representative healthy
+render is ~10KB gzipped (~41KB raw). Operators bypassing the gzip
+middleware (curl without `--compressed`, programmatic JSON scrapers
+hitting `/?format=json` — which doesn't gzip — etc.) see the
+uncompressed bytes; that's an expected trade-off.
 
 **First contentful paint target:** under 100ms over WireGuard
 (RTT ~30ms, single HTML response, no blocking subrequests).
@@ -1173,7 +1203,7 @@ In `internal/admin/status_test.go`:
 | `TestChunkHex`                        | Table-driven: empty string, 40-hex SHA-1, 64-hex SHA-256, non-hex input passthrough              |
 | `TestSourceKind`                      | `embedded:` → bundled; `/usr/share/keyrings/foo.gpg` → system; `/etc/apt/keyrings/x.gpg` → custom |
 | `TestFormatShortDuration`             | 0.014 → "14 ms"; 1.2 → "1.2 s"; 90 → "1m 30s"; 5400 → "1h 30m"                                    |
-| `TestVitalState`                      | Each cell's threshold thresholds: healthy/watching/crit/stale combinations                       |
+| `TestVitalState`                      | Each cell's threshold thresholds: ok/warn/crit/stale combinations                                |
 | `TestOutcomeBadgeClass`               | success → b--ok; gpg_failed → b--crit; unknown outcome → b--stale (or chosen default)            |
 | `TestKeyringCounts`                   | Mixed-source slice returns correct bundled/system/custom counts                                  |
 | `TestColorContrast`                   | Programmatic AA contrast check on every documented pair in §3 + §10                              |
@@ -1194,9 +1224,9 @@ fixtures:
 
 | Fixture                          | Asserts on initial server-rendered HTML                                       |
 |----------------------------------|-------------------------------------------------------------------------------|
-| `golden_healthy.html`            | All `.vital[data-state]` values are `healthy`; `tr[data-state]` rows have no crit/watching; `.notice-mount` is empty; `.keys-chip[data-keyring-count]` is `>0`; verdict pill renders as `STATUS` (the no-JS fallback) |
+| `golden_healthy.html`            | All `.vital[data-state]` values are `ok`; `tr[data-state]` rows have no crit/warn; `.notice-mount` is empty; `.keys-chip[data-keyring-count]` is `>0`; verdict pill renders as `STATUS` (the no-JS fallback) |
 | `golden_warming_up.html`         | `body[data-uptime-seconds] < 300`; `.GC.LastRunUnixTime == nil` branch produces "NO GC RUN YET" empty state |
-| `golden_watching_lagging.html`   | 3 suite rows carry `data-state="watching"`; suites vital cell carries `data-state="watching"` |
+| `golden_watching_lagging.html`   | 3 suite rows carry `data-state="warn"`; suites vital cell carries `data-state="warn"` |
 | `golden_degraded_gpg.html`       | Recent-adoptions rows carry `data-outcome="gpg_failed"` at the expected ratio; the `notice-mount` placeholder is present (JS fills at runtime — markup only checked) |
 | `golden_keyring_empty_disabled.html` | Wrapper renders `.AdoptionEnabled=false`; `.empty--stale` block visible; "ADOPTION DISABLED" eyebrow present |
 | `golden_keyring_empty_enabled.html`  | Wrapper renders `.AdoptionEnabled=true`; `.empty--crit` block visible; "NO GPG KEYS LOADED" eyebrow present |
