@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"math"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -1005,4 +1007,137 @@ func durationOf(seconds int64) string {
 		return fmt.Sprintf("%dm", m)
 	}
 	return fmt.Sprintf("%dh %dm", h, m)
+}
+
+// AIDEV-NOTE: helpers below (chunkHex … outcomeBadgeClass) are wired into
+// the admin status template's funcMap per docs/admin-ui-spec.md §6.1. All
+// are pure functions over their inputs — no package-level state, no I/O.
+// Tests in status_test.go are the implementation contract.
+
+// chunkHex groups a hex string into n-character chunks separated by a
+// single ASCII space. Input is lowercased. Non-hex input (anything
+// containing a non-[0-9a-f] byte after lowercasing) is returned verbatim
+// to make the helper safe on already-formatted or non-fingerprint values.
+// n ≤ 0 returns the lowercased input unchunked.
+func chunkHex(s string, n int) string {
+	lower := strings.ToLower(s)
+	if n <= 0 || lower == "" {
+		return lower
+	}
+	for i := 0; i < len(lower); i++ {
+		c := lower[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return s
+		}
+	}
+	var b strings.Builder
+	b.Grow(len(lower) + len(lower)/n)
+	for i := 0; i < len(lower); i += n {
+		end := i + n
+		if end > len(lower) {
+			end = len(lower)
+		}
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(lower[i:end])
+	}
+	return b.String()
+}
+
+// sourceKind classifies a keyring source_path into one of three values
+// per docs/admin-ui-spec.md §1.3:
+//
+//	"embedded:…"   → "bundled"
+//	"/usr/share/…" → "system"
+//	anything else  → "custom"
+func sourceKind(p string) string {
+	switch {
+	case strings.HasPrefix(p, "embedded:"):
+		return "bundled"
+	case strings.HasPrefix(p, "/usr/share/"):
+		return "system"
+	default:
+		return "custom"
+	}
+}
+
+// sourceKindLabel returns the uppercase badge text for a source path.
+func sourceKindLabel(p string) string {
+	switch sourceKind(p) {
+	case "bundled":
+		return "BUNDLED"
+	case "system":
+		return "SYSTEM"
+	default:
+		return "CUSTOM"
+	}
+}
+
+// countBundled counts keyring entries whose source path classifies as bundled.
+func countBundled(ks []keyringEntry) int { return countSource(ks, "bundled") }
+
+// countSystem counts keyring entries whose source path classifies as system.
+func countSystem(ks []keyringEntry) int { return countSource(ks, "system") }
+
+// countCustom counts keyring entries whose source path classifies as custom.
+func countCustom(ks []keyringEntry) int { return countSource(ks, "custom") }
+
+func countSource(ks []keyringEntry, kind string) int {
+	n := 0
+	for _, k := range ks {
+		if sourceKind(k.SourcePath) == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// formatShortDuration formats a duration (in seconds, possibly fractional)
+// as the most human-friendly short form per docs/admin-ui-spec.md §6.1:
+//
+//	< 1s     → "%d ms" (rounded to nearest ms)
+//	< 60s    → "%.1f s"
+//	< 3600s  → "%dm %ds"
+//	otherwise → "%dh %dm"
+//
+// Negative inputs are clamped to zero; NaN/Inf return "—".
+func formatShortDuration(seconds float64) string {
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return "—"
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	if seconds < 1 {
+		return fmt.Sprintf("%d ms", int(math.Round(seconds*1000)))
+	}
+	if seconds < 60 {
+		return fmt.Sprintf("%.1f s", seconds)
+	}
+	if seconds < 3600 {
+		m := int(seconds) / 60
+		s := int(seconds) % 60
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	h := int(seconds) / 3600
+	m := (int(seconds) % 3600) / 60
+	return fmt.Sprintf("%dh %dm", h, m)
+}
+
+// outcomeBadgeClass maps an adoption outcome enum string to one of the
+// `.b--*` badge classes used in the admin template. Unknown outcomes map
+// to `b--stale` so the badge still renders rather than emitting an empty
+// class attribute.
+func outcomeBadgeClass(outcome string) string {
+	switch outcome {
+	case "success":
+		return "b--ok"
+	case "gpg_failed", "fetch_failed", "parse_failed":
+		return "b--crit"
+	case "lagging", "watching":
+		return "b--warn"
+	default:
+		return "b--stale"
+	}
 }

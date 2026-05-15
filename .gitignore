@@ -5,3 +5,4 @@
 *.out
 *.deb
 .codex/
+.phase-loop-notes.md
