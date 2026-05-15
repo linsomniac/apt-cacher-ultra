@@ -488,19 +488,32 @@ func TestHTMLRenderModelEmbedsStatusModel(t *testing.T) {
 	}
 }
 
+// TestOutcomeBadgeClass covers the real adoption outcome enum produced
+// by internal/freshness/metrics.go's classifier (success / gpg_failed /
+// parse_failed / member_mismatch / unpinned_suite / run_failed). The
+// enum was changed during freshness work — earlier versions of this
+// helper mapped a non-existent "fetch_failed" enum which never reached
+// the admin page.
 func TestOutcomeBadgeClass(t *testing.T) {
 	cases := []struct {
 		outcome string
 		want    string
 	}{
 		{"success", "b--ok"},
+		// All non-success classifier outcomes are crit.
 		{"gpg_failed", "b--crit"},
-		{"fetch_failed", "b--crit"},
 		{"parse_failed", "b--crit"},
+		{"member_mismatch", "b--crit"},
+		{"unpinned_suite", "b--crit"},
+		{"run_failed", "b--crit"},
+		// Soft-state values (used outside the adoption row context).
 		{"lagging", "b--warn"},
 		{"warn", "b--warn"},
+		// Empty input is the stale case (no outcome available yet).
 		{"", "b--stale"},
-		{"future_unknown_outcome", "b--stale"},
+		// Future enum values default to crit so an unknown failure
+		// never silently renders as a calm color.
+		{"future_unknown_outcome", "b--crit"},
 	}
 	for _, c := range cases {
 		if got := outcomeBadgeClass(c.outcome); got != c.want {

@@ -1402,18 +1402,32 @@ else if(states.indexOf('warn')!==-1){verdict='warn';cls='pill--watching';label='
 else{var b=document.body,up=parseInt(b.getAttribute('data-uptime-seconds')||'0',10),gr=parseInt(b.getAttribute('data-gc-runs')||'0',10);if(up<300&&gr===0){verdict='stale';cls='pill--stale';label='WARMING UP';}}
 pill.classList.remove('pill--healthy','pill--watching','pill--degraded','pill--stale');pill.classList.add(cls);pill.setAttribute('data-state',verdict==='ok'?'ok':(verdict==='warn'?'warn':(verdict==='crit'?'crit':'stale')));lbl.textContent=label;})();
 
-// Aggregate-failure notice for Recent Adoptions (≥10% non-success)
+// Aggregate-failure notice for Recent Adoptions (≥10% non-success).
+// All dynamic strings (top, topN, hint text) are inserted via
+// textContent / createElement to avoid DOM-XSS if the data-outcome
+// enum ever carries an unexpected value.
 (function(){var mount=document.getElementById('adoptions-notice');if(!mount)return;
 var rows=document.querySelectorAll('#adoptions tr[data-outcome]');var total=rows.length;if(total===0)return;
-var counts={};var last=null;rows.forEach(function(tr){var o=tr.getAttribute('data-outcome');if(o==='success')return;counts[o]=(counts[o]||0)+1;if(!last)last=tr;});
+var counts={};rows.forEach(function(tr){var o=tr.getAttribute('data-outcome');if(o==='success'||!o)return;counts[o]=(counts[o]||0)+1;});
 var top='',topN=0;for(var k in counts){if(counts[k]>topN){top=k;topN=counts[k];}}
 var THRESHOLD=0.10;if(top===''||(topN/total)<THRESHOLD)return;
-var hints={'gpg_failed':{text:"Likely cause: upstream repository key changed or the matching archive key isn't loaded. Cross-check the Keyring section.",link:{label:'Trusted keys',href:'#keyring',arrow:'&rarr; Keyring'}},'fetch_failed':{text:'Likely cause: upstream unreachable, TLS failure, or rate-limiting. Check the proxy logs for the upstream host.',link:null},'parse_failed':{text:'Likely cause: malformed Release / Sources / Packages payload from upstream. Capture a failing fetch and inspect.',link:null}};
-var h=hints[top]||{text:'See per-row details below.',link:null};
+var hints={
+'gpg_failed':{text:"Likely cause: upstream repository key changed or the matching archive key isn't loaded. Cross-check the Keyring section.",linkHref:'#keyring',linkLabel:'Trusted keys',linkArrow:'→ Keyring'},
+'parse_failed':{text:'Likely cause: malformed Release / Sources / Packages payload from upstream. Capture a failing fetch and inspect.'},
+'member_mismatch':{text:'Likely cause: a Release-listed member hash diverged from the cached blob. Inspect the failing index path in the proxy logs.'},
+'unpinned_suite':{text:"Likely cause: this suite is not allow-listed for adoption. Add it to the operator's adoption pin list to enable verification."},
+'run_failed':{text:'Likely cause: upstream unreachable, TLS failure, rate-limiting, or another transport-level error. Check the proxy logs for the upstream host.'}
+};
+var h=hints[top]||{text:'See per-row details below.'};
 var note=document.createElement('div');note.className='notice';note.setAttribute('role','alert');
-var head=document.createElement('div');head.className='notice__head';head.innerHTML='<span class="dot"></span><span>'+topN+' of '+total+' recent adoptions failed: <code style="background:transparent;padding:0;color:var(--crit)">'+top+'</code></span>';note.appendChild(head);
-var body=document.createElement('div');body.className='notice__body';body.innerHTML=h.text+(h.link?'<span class="notice__link-row">'+h.link.label+' <a href="'+h.link.href+'">'+h.link.arrow+'</a></span>':'');note.appendChild(body);
-mount.appendChild(note);})();
+var head=document.createElement('div');head.className='notice__head';
+var dot=document.createElement('span');dot.className='dot';head.appendChild(dot);
+var headText=document.createElement('span');headText.appendChild(document.createTextNode(topN+' of '+total+' recent adoptions failed: '));
+var headCode=document.createElement('code');headCode.style.cssText='background:transparent;padding:0;color:var(--crit)';headCode.textContent=top;headText.appendChild(headCode);
+head.appendChild(headText);note.appendChild(head);
+var body=document.createElement('div');body.className='notice__body';body.appendChild(document.createTextNode(h.text));
+if(h.linkHref){var row=document.createElement('span');row.className='notice__link-row';row.appendChild(document.createTextNode(h.linkLabel+' '));var a=document.createElement('a');a.href=h.linkHref;a.textContent=h.linkArrow;row.appendChild(a);body.appendChild(row);}
+note.appendChild(body);mount.appendChild(note);})();
 
 // Sticky-rail active-section highlight
 (function(){var rail=document.querySelector('.rail');if(!rail||!('IntersectionObserver' in window))return;
@@ -1804,18 +1818,28 @@ func verdictExplanation(m htmlRenderModel) string {
 }
 
 // outcomeBadgeClass maps an adoption outcome enum string to one of the
-// `.b--*` badge classes used in the admin template. Unknown outcomes map
-// to `b--stale` so the badge still renders rather than emitting an empty
-// class attribute.
+// `.b--*` badge classes used in the admin template. Enum values are
+// produced by internal/freshness/metrics.go's classifier:
+//
+//	"success", "gpg_failed", "parse_failed", "member_mismatch",
+//	"unpinned_suite", "run_failed".
+//
+// All non-success outcomes are critical for the operator (the row's
+// adoption did not land); they map to b--crit. Unknown outcomes — e.g.
+// a future enum value the classifier adds before this helper is updated
+// — map to b--crit too rather than the previous b--stale, since
+// "future failure mode we don't recognise" is closer to crit than to
+// stale. Existing soft-state values ("lagging", "warn") keep their
+// b--warn mapping for non-adoption use sites.
 func outcomeBadgeClass(outcome string) string {
 	switch outcome {
 	case "success":
 		return "b--ok"
-	case "gpg_failed", "fetch_failed", "parse_failed":
-		return "b--crit"
 	case "lagging", "warn":
 		return "b--warn"
-	default:
+	case "":
 		return "b--stale"
+	default:
+		return "b--crit"
 	}
 }
