@@ -1099,15 +1099,30 @@ The mobile list-view CSS is ~30 lines and adds no JS cost.
 The unminified template literal in `internal/admin/status.go` is allowed
 to be larger; the budget is measured against the rendered response.
 
-**Compression.** The admin handler at `internal/admin/handlers.go`
-gzips text/html responses when the client sends
-`Accept-Encoding: gzip` (which all browsers do). The 22KB total budget
-is enforced against the gzipped wire shape, since that is what the
-operator's browser actually downloads. A representative healthy
-render is ~10KB gzipped (~41KB raw). Operators bypassing the gzip
-middleware (curl without `--compressed`, programmatic JSON scrapers
-hitting `/?format=json` — which doesn't gzip — etc.) see the
-uncompressed bytes; that's an expected trade-off.
+**Compression.** The admin status handler at
+`internal/admin/handlers.go` gzips both HTML and JSON responses when
+the client's `Accept-Encoding` header includes `gzip` with a non-zero
+q-value (which all browsers send unconditionally). The `Vary:
+Accept-Encoding` header is emitted on both compressed and identity
+responses so intermediary caches store the right variant.
+
+Encoding compression is orthogonal to the §0.1 "byte-identical JSON"
+contract — that contract is about the JSON payload's decoded bytes
+(top-level keys, types, values); a gzip-encoded response decompresses
+to those same bytes. Clients that want raw JSON either send no
+`Accept-Encoding` or `Accept-Encoding: identity`, and `Vary` ensures
+they see the identity response even on a cache hit. `/healthz` and
+`/metrics` are not currently routed through the gzip wrapper — both
+have tight, small payloads where the round-trip and CPU cost of
+gzipping outweigh the byte savings.
+
+The 22KB total budget is enforced against the gzipped wire shape,
+since that is what the operator's browser actually downloads. A
+representative healthy render is ~10KB gzipped (~41KB raw).
+Operators bypassing the gzip middleware (curl without `--compressed`,
+`Accept-Encoding: identity`, or `gzip;q=0`) see the uncompressed
+bytes; that's expected and the response size budget gives them
+plenty of headroom below the network MTU pressure threshold.
 
 **First contentful paint target:** under 100ms over WireGuard
 (RTT ~30ms, single HTML response, no blocking subrequests).

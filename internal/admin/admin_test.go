@@ -1073,6 +1073,128 @@ func TestStatusJSON_TLSMITM_TopLevelKeyAlwaysPresent(t *testing.T) {
 	}
 }
 
+// TestAcceptsGzip pins RFC 9110 §12.5.3 q-value semantics: q=0
+// suppresses an otherwise-supported coding. Codex-review iter-7
+// caught the earlier naive token check that gzipped on
+// `Accept-Encoding: gzip;q=0` and broke standards-compliant
+// clients that explicitly disabled gzip.
+func TestAcceptsGzip(t *testing.T) {
+	cases := []struct {
+		header string
+		want   bool
+	}{
+		{"", false},
+		{"gzip", true},
+		{"gzip, deflate", true},
+		{"deflate, gzip", true},
+		{"GZIP", true},   // case-insensitive
+		{" gzip ", true}, // whitespace tolerated
+		{"gzip;q=1", true},
+		{"gzip;q=1.0", true},
+		{"gzip;q=0.1", true},
+		{"gzip;q=0", false},
+		{"gzip;q=0.0", false},
+		{"gzip;q=0.00", false},
+		{"gzip;q=0.000", false},
+		{"br, gzip;q=0", false},
+		{"br, gzip;q=0.5", true},
+		{"br", false},
+		{"identity", false},
+		{"identity;q=1, gzip;q=0", false}, // explicit reject
+		{"gzip; q=1", true},               // space after semicolon
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.header, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", "http://example/", nil)
+			if c.header != "" {
+				req.Header.Set("Accept-Encoding", c.header)
+			}
+			if got := acceptsGzip(req); got != c.want {
+				t.Errorf("acceptsGzip(%q) = %v, want %v", c.header, got, c.want)
+			}
+		})
+	}
+}
+
+// TestStatusHTML_VaryAlwaysEmitted: cache-correctness regression
+// guard. The response carries Vary: Accept-Encoding on BOTH the
+// identity and gzipped branches so an intermediary cache cannot
+// serve a stored identity response to a later gzip-accepting
+// client (or vice versa). Codex-review iter-7 caught the
+// gzip-only emission.
+func TestStatusHTML_VaryAlwaysEmitted(t *testing.T) {
+	_, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	tr := &http.Transport{DisableCompression: true}
+	client := &http.Client{Transport: tr}
+	for _, header := range []string{"gzip", "identity", ""} {
+		t.Run("ae="+header, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", base+"/", nil)
+			if header != "" {
+				req.Header.Set("Accept-Encoding", header)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if got := resp.Header.Get("Vary"); !strings.Contains(got, "Accept-Encoding") {
+				t.Errorf("Accept-Encoding=%q: Vary = %q, want substring 'Accept-Encoding'", header, got)
+			}
+		})
+	}
+}
+
+// TestStatusHTML_GzipSuppressedByQZero exercises the standards-
+// compliant suppression: client explicitly disables gzip even
+// though it lists the coding. Server must emit identity.
+func TestStatusHTML_GzipSuppressedByQZero(t *testing.T) {
+	_, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	tr := &http.Transport{DisableCompression: true}
+	client := &http.Client{Transport: tr}
+	req, _ := http.NewRequest("GET", base+"/", nil)
+	req.Header.Set("Accept-Encoding", "gzip;q=0")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding = %q, want empty (gzip;q=0)", got)
+	}
+}
+
+// TestStatusJSON_GzipsWhenAccepted pins that the JSON branch also
+// honours Accept-Encoding: gzip, per docs/admin-ui-spec.md §12's
+// gzip mechanism description. The encoded body decodes to the
+// same payload TestJSONContractPreserved pins — Content-Encoding
+// is orthogonal to the §0.1 byte-identical-JSON contract.
+func TestStatusJSON_GzipsWhenAccepted(t *testing.T) {
+	_, base, cleanup := startAdminServer(t)
+	defer cleanup()
+
+	tr := &http.Transport{DisableCompression: true}
+	client := &http.Client{Transport: tr}
+	req, _ := http.NewRequest("GET", base+"/?format=json", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("Content-Encoding = %q, want %q", got, "gzip")
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) < 2 || body[0] != 0x1f || body[1] != 0x8b {
+		t.Errorf("JSON body not gzipped; first bytes: % x", body[:min(len(body), 8)])
+	}
+}
+
 // TestStatusHTML_GzipsWhenAccepted pins the §12 "over the wire"
 // budget: the admin status response is gzip-encoded when the client
 // sends Accept-Encoding: gzip. Without server-side gzip, the

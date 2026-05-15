@@ -1676,17 +1676,15 @@ func formatShortDuration(seconds float64) string {
 // values are "ok", "warn", "crit", or "stale". Unknown kind returns "ok"
 // so a typo in the template never surfaces as a panic during rendering.
 //
-// AIDEV-NOTE: vocabulary mismatch — docs/admin-ui-spec.md §7.1 names the
-// data-state values `healthy` and `watching`; docs/admin-ui-mockup.html
-// CSS keys on `data-state="ok"` and `data-state="warn"`. The spec opening
-// declares "the mockup wins" on disagreement, so this helper emits the
-// mockup vocabulary and verdictExplanation/keyringCrit do likewise. See
-// .phase-loop-notes.md "Spec issues" for the followup; downstream JS
-// (per spec §8.1) must read `warn`/`ok` not `watching`/`healthy`.
+// AIDEV-NOTE: the returned values are the markup-side / CSS-selector
+// vocabulary (`ok` / `warn` / `crit` / `stale`); the operator-facing
+// verdict labels (HEALTHY / WATCHING / DEGRADED) are a separate
+// vocabulary computed in §8.1's JS from these tokens. See
+// docs/admin-ui-spec.md §7.1 for the canonical mapping.
 //
-// Takes the htmlRenderModel wrapper because the watching threshold for
-// GC (last run age > 2 × interval) needs GCIntervalSeconds, which is not
-// on statusModel (per the JSON-contract preservation rule §0.4).
+// Takes the htmlRenderModel wrapper because the warn threshold for
+// GC (last run age > 2 × interval) needs GCIntervalSeconds, which is
+// not on statusModel (per the JSON-contract preservation rule §0.4).
 func vitalState(kind string, m htmlRenderModel) string {
 	switch kind {
 	case "cache":

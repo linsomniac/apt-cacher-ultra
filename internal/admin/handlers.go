@@ -145,46 +145,81 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // acceptsGzip reports whether the client's Accept-Encoding header
-// includes gzip. The header is a comma-separated list of codings,
-// each optionally followed by ";q=…" — we accept any explicit gzip
-// token regardless of the q-value, including q=0 which would be a
-// pathological case worth surfacing (gzip is always supported here).
-// Browsers send "gzip" unconditionally; programmatic clients that
-// want identity send no header at all.
+// indicates gzip is acceptable, per RFC 9110 §12.5.3 semantics. The
+// header is a comma-separated list of codings, each optionally
+// followed by `;q=<value>`; a q-value of 0 explicitly means "not
+// acceptable", so `gzip;q=0` returns false even though the token is
+// present. Browsers send a bare `gzip` (implicit q=1); programmatic
+// clients that want identity send either nothing or a q=0 disable.
 func acceptsGzip(r *http.Request) bool {
 	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
-		p := strings.TrimSpace(part)
-		// Strip ";q=…" parameter.
-		if i := strings.IndexByte(p, ';'); i >= 0 {
-			p = strings.TrimSpace(p[:i])
+		token, qOK := parseAcceptEncodingPart(part)
+		if !qOK {
+			continue
 		}
-		if strings.EqualFold(p, "gzip") {
+		if strings.EqualFold(token, "gzip") {
 			return true
 		}
 	}
 	return false
 }
 
+// parseAcceptEncodingPart splits one comma-separated Accept-Encoding
+// element into its coding name and an "acceptable?" boolean. q=0
+// returns (token, false). A missing q parameter defaults to q=1
+// (acceptable). Unparseable q values are conservatively treated as
+// acceptable — a malformed q from a misbehaving client should not
+// suppress compression we'd otherwise emit.
+func parseAcceptEncodingPart(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	semi := strings.IndexByte(s, ';')
+	if semi < 0 {
+		return s, true
+	}
+	token := strings.TrimSpace(s[:semi])
+	for _, param := range strings.Split(s[semi+1:], ";") {
+		p := strings.TrimSpace(param)
+		const qPrefix = "q="
+		if !strings.HasPrefix(strings.ToLower(p), qPrefix) {
+			continue
+		}
+		v := strings.TrimSpace(p[len(qPrefix):])
+		// Per RFC 9110, q values are 0..1 with up to 3 decimal
+		// digits. The only value we care about specifically is "0";
+		// any non-zero string (e.g. 0.1, 1, 1.0) is acceptable.
+		if v == "0" || v == "0.0" || v == "0.00" || v == "0.000" {
+			return token, false
+		}
+	}
+	return token, true
+}
+
 // gzipIfAccepted returns an io.Writer that gzip-encodes into w when
-// the client's Accept-Encoding includes gzip, otherwise w itself.
-// The returned closeFn flushes and finalizes the gzip stream and
-// MUST be called before the handler returns (defer is fine). When
-// the client does not accept gzip closeFn is a no-op.
+// the client's Accept-Encoding includes gzip with q>0, otherwise w
+// itself. The returned closeFn flushes and finalizes the gzip stream
+// and MUST be called before the handler returns (defer is fine).
+// When the client does not accept gzip closeFn is a no-op.
 //
-// On a gzip path the Content-Encoding and Vary headers are set
-// before any body is written; the caller must not pre-set
-// Content-Length because the encoded length is unknown until close.
+// `Vary: Accept-Encoding` is appended on BOTH branches because the
+// served representation depends on the request's Accept-Encoding
+// regardless of which branch wins — an intermediary cache that saw
+// only the identity response without the Vary header would happily
+// serve it to a later browser request that asked for gzip and vice
+// versa. On the gzip branch Content-Encoding is set and any
+// pre-existing Content-Length is dropped (encoded length is unknown
+// until close).
+//
 // Per docs/admin-ui-spec.md §12, gzipping the admin status response
 // is what lets the rendered HTML fit the 22KB on-the-wire budget
 // without an external reverse proxy.
 func gzipIfAccepted(w http.ResponseWriter, r *http.Request) (io.Writer, func() error) {
+	h := w.Header()
+	h.Add("Vary", "Accept-Encoding")
 	if !acceptsGzip(r) {
 		return w, func() error { return nil }
 	}
-	h := w.Header()
 	h.Set("Content-Encoding", "gzip")
-	h.Add("Vary", "Accept-Encoding")
-	h.Del("Content-Length") // length is unknown post-encode
+	h.Del("Content-Length")
 	gw := gzip.NewWriter(w)
 	return gw, gw.Close
 }
