@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"math"
 	"net/http"
 	"sort"
@@ -658,9 +659,7 @@ func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if wantsJSON(r) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(model); err != nil {
+		if err := writeStatusJSON(w, model); err != nil {
 			s.logger.Warn("admin_status_render_failed",
 				"err", err.Error(),
 				"format", "json",
@@ -675,6 +674,19 @@ func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
 			"format", "html",
 			"query", "template.Execute")
 	}
+}
+
+// writeStatusJSON emits the SPEC5 §10.5 status payload to w using the
+// canonical wire encoding (two-space indent, default HTML escaping).
+// This is the SINGLE production JSON path — TestJSONContractPreserved
+// (DoD #2) calls the same helper so the regression gate exercises the
+// real bytes operators see, not a duplicated encoder configuration.
+// Any future change to the wire encoding (indent, escape, etc.) must
+// happen here.
+func writeStatusJSON(w io.Writer, m statusModel) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(m)
 }
 
 // buildHTMLRenderModel composes the docs/admin-ui-spec.md §0.7 wrapper

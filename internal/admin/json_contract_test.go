@@ -2,70 +2,120 @@ package admin
 
 import (
 	"bytes"
-	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 // AIDEV-NOTE: TestJSONContractPreserved is the DoD #2 regression gate
 // for docs/admin-ui-spec.md §0.1 / §0.4 — the HTML redesign must not
-// bleed into the JSON wire shape. The encoder path mirrors
-// renderStatus's JSON branch (encoding/json.Encoder with two-space
-// indent) so a divergence here is the same divergence an operator
-// would see hitting `/?format=json`. The golden lives in
-// testdata/json_contract_golden.json; regenerate with `-update`.
+// bleed into the JSON wire shape. The test calls writeStatusJSON
+// directly (the same helper renderStatus's JSON branch uses) so a
+// regression in the encoder configuration is caught here as well as in
+// /?format=json. Goldens live under testdata/; regenerate with `-update`.
 
 var jsonContractUpdate = flag.Bool("update.jsoncontract", false,
-	"regenerate testdata/json_contract_golden.json from the in-test model")
+	"regenerate testdata/json_contract_*_golden.json from the in-test models")
 
 func TestJSONContractPreserved(t *testing.T) {
-	got := encodeStatusModelLikeRenderStatus(t, jsonContractFixture())
-	goldenPath := filepath.Join("testdata", "json_contract_golden.json")
+	cases := []struct {
+		name   string
+		golden string
+		model  func() statusModel
+	}{
+		{"populated", "json_contract_golden.json", populatedJSONContractFixture},
+		{"minimal", "json_contract_minimal_golden.json", minimalJSONContractFixture},
+	}
 
-	if *jsonContractUpdate {
-		if err := os.WriteFile(goldenPath, got, 0o644); err != nil {
-			t.Fatalf("write golden: %v", err)
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := writeStatusJSON(&buf, c.model()); err != nil {
+				t.Fatalf("writeStatusJSON: %v", err)
+			}
+			got := buf.Bytes()
+
+			goldenPath := filepath.Join("testdata", c.golden)
+			if *jsonContractUpdate {
+				if err := os.WriteFile(goldenPath, got, 0o644); err != nil {
+					t.Fatalf("write golden: %v", err)
+				}
+				t.Logf("updated %s (%d bytes)", goldenPath, len(got))
+				return
+			}
+
+			want, err := os.ReadFile(goldenPath)
+			if err != nil {
+				t.Fatalf("read golden (regenerate with -update.jsoncontract): %v", err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("JSON contract drifted (DoD #2 / §0.1).\n%s\nRegenerate intentionally with: go test ./internal/admin -run TestJSONContractPreserved -update.jsoncontract",
+					unifiedLineDiff(string(want), string(got), goldenPath, "actual"))
+			}
+		})
+	}
+
+	// Belt-and-suspenders: HTML-only wrapper fields (htmlRenderModel)
+	// must NEVER appear in the JSON. If a future refactor accidentally
+	// passes htmlRenderModel to the JSON encoder, this trips.
+	t.Run("no_html_only_fields", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := writeStatusJSON(&buf, populatedJSONContractFixture()); err != nil {
+			t.Fatalf("writeStatusJSON: %v", err)
 		}
-		t.Logf("updated %s (%d bytes)", goldenPath, len(got))
-		return
-	}
-
-	want, err := os.ReadFile(goldenPath)
-	if err != nil {
-		t.Fatalf("read golden (regenerate with -update.jsoncontract): %v", err)
-	}
-	if !bytes.Equal(got, want) {
-		gotPath := filepath.Join(t.TempDir(), "actual.json")
-		_ = os.WriteFile(gotPath, got, 0o644)
-		t.Fatalf("JSON contract drifted (DoD #2 / §0.1). Diff with:\n  diff %s %s\nRegenerate intentionally with: go test ./internal/admin -run TestJSONContractPreserved -update.jsoncontract",
-			goldenPath, gotPath)
-	}
+		body := buf.String()
+		for _, leaked := range []string{"AdoptionEnabled", "GCIntervalSeconds"} {
+			if strings.Contains(body, leaked) {
+				t.Errorf("HTML-only field %q leaked into JSON wire shape", leaked)
+			}
+		}
+	})
 }
 
-// encodeStatusModelLikeRenderStatus runs the same encoder configuration
-// renderStatus's JSON branch uses (SetIndent two spaces, default
-// HTMLEscape). Kept in sync with renderStatus by code review — any
-// change to renderStatus's encoder must mirror here or the golden
-// diverges from the wire shape.
-func encodeStatusModelLikeRenderStatus(t *testing.T, m statusModel) []byte {
-	t.Helper()
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(m); err != nil {
-		t.Fatalf("json.Encode: %v", err)
+// unifiedLineDiff emits a minimal unified-style line diff so a failing
+// test is self-diagnostic without writing a temp file the harness then
+// cleans up. Lines unique to want are prefixed `-`; unique to got are
+// `+`. Order is preserved by walking want and got in lockstep.
+func unifiedLineDiff(want, got, wantLabel, gotLabel string) string {
+	wl := strings.SplitAfter(want, "\n")
+	gl := strings.SplitAfter(got, "\n")
+	var b strings.Builder
+	fmt.Fprintf(&b, "--- %s\n+++ %s\n", wantLabel, gotLabel)
+	i, j := 0, 0
+	context := 2
+	for i < len(wl) || j < len(gl) {
+		switch {
+		case i < len(wl) && j < len(gl) && wl[i] == gl[j]:
+			i++
+			j++
+		case i < len(wl) && (j >= len(gl) || wl[i] != gl[j]):
+			start := max(0, i-context)
+			for k := start; k < i; k++ {
+				fmt.Fprintf(&b, " %s", wl[k])
+			}
+			fmt.Fprintf(&b, "-%s", wl[i])
+			if j < len(gl) {
+				fmt.Fprintf(&b, "+%s", gl[j])
+				j++
+			}
+			i++
+		case j < len(gl):
+			fmt.Fprintf(&b, "+%s", gl[j])
+			j++
+		}
 	}
-	return buf.Bytes()
+	return b.String()
 }
 
-// jsonContractFixture is a representative, deterministic statusModel.
-// It exercises every top-level key, every pointer-nullable field's
-// populated branch, plus the keyring entry shape and a non-empty
-// recent-adoptions slice (including a non-success outcome) so a
-// regression in any block surfaces.
-func jsonContractFixture() statusModel {
+// populatedJSONContractFixture is the maximal representative model:
+// every top-level key, every pointer-nullable field's populated branch,
+// keyring entries from both bundled and custom sources, and a
+// recent-adoptions slice with both success and gpg_failed outcomes.
+func populatedJSONContractFixture() statusModel {
 	gcLast := int64(1_700_000_000)
 	hitRate := 92.5
 	suiteCheck := int64(1_700_005_000)
@@ -183,5 +233,41 @@ func jsonContractFixture() statusModel {
 				SubkeyFingerprints: []string{"1122334455667788"},
 			},
 		},
+	}
+}
+
+// minimalJSONContractFixture exercises the abbreviated/null wire
+// shapes: TLSMITM disabled (custom MarshalJSON emits {"enabled":false}),
+// no GC run yet (LastRunUnixTime nil → custom MarshalJSON emits the
+// abbreviated form), every list empty, repo_coverage at zero values,
+// no keyring. This is the "freshly started, MITM off" operator-day-1
+// shape and the highest-risk shape for an accidental contract drift.
+func minimalJSONContractFixture() statusModel {
+	return statusModel{
+		Process: processInfo{
+			Version:         "v0.test",
+			StartedUnixTime: 1_700_000_000,
+			UptimeSeconds:   60,
+			VCSRevision:     "deadbeef",
+			GoVersion:       "go-test",
+		},
+		Cache: cacheInfo{
+			Dir: "/var/cache/apt-cacher-ultra",
+		},
+		CacheSummary: cacheSummary{
+			ByHost: map[string]cacheSummaryHost{},
+		},
+		RepoCoverage: repoCoverageInfo{
+			ArchitecturesSeen:   []string{},
+			ArchitecturesFilter: []string{},
+		},
+		Listeners:       []listenerInfo{{Role: "admin", Addr: "127.0.0.1:6789"}},
+		TLSMITM:         &tlsMITMInfo{Enabled: false},
+		Suites:          []suiteEntry{},
+		GC:              &gcInfo{}, // LastRunUnixTime nil → abbreviated MarshalJSON
+		HotURLPaths:     []hotURLEntry{},
+		RecentAdoptions: []adoptionEntry{},
+		ActiveHosts:     []activeHostInfo{},
+		Keyring:         []keyringEntry{},
 	}
 }

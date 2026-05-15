@@ -1,0 +1,48 @@
+{
+  "process": {
+    "version": "v0.test",
+    "started_unixtime": 1700000000,
+    "uptime_seconds": 60,
+    "vcs_revision": "deadbeef",
+    "go_version": "go-test"
+  },
+  "cache": {
+    "dir": "/var/cache/apt-cacher-ultra",
+    "bytes_used": 0,
+    "blob_count": 0,
+    "url_path_count": 0,
+    "zero_refcount_backlog": 0
+  },
+  "cache_summary": {
+    "by_host": {}
+  },
+  "repo_coverage": {
+    "architectures_seen": [],
+    "architectures_filter": [],
+    "snapshots_with_sources": 0,
+    "snapshots_with_pdiff": 0,
+    "package_hash_rows": {
+      "binary": 0,
+      "source": 0,
+      "pdiff": 0,
+      "total": 0
+    }
+  },
+  "listeners": [
+    {
+      "role": "admin",
+      "addr": "127.0.0.1:6789"
+    }
+  ],
+  "tls_mitm": {
+    "enabled": false
+  },
+  "suites": [],
+  "gc": {
+    "last_run_unixtime": null
+  },
+  "hot_url_paths": [],
+  "recent_adoptions": [],
+  "active_hosts": [],
+  "keyring": []
+}
