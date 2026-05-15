@@ -19,6 +19,13 @@ import (
 // HTML branch uses. Listener-bound startAdminServer is intentionally
 // not used so these tests run in sandboxed CI environments without
 // network access.
+//
+// These tests deliberately compose htmlRenderModel directly rather
+// than exercising buildHTMLRenderModel; that wrapper's nil-vs-empty
+// keyring snapshot convention is covered separately by
+// TestBuildHTMLRenderModelAdoptionDetection in status_test.go.
+// Splitting concerns keeps the rendering assertions independent of
+// the server-config plumbing.
 
 // renderHTMLForGolden runs statusHTMLTemplate.Execute against the
 // supplied wrapper and returns the bytes. Mirrors renderStatus's HTML
@@ -153,12 +160,70 @@ func TestGoldenKeyringEmptyEnabled(t *testing.T) {
 		`data-adoption-enabled="true"`,
 		// Empty block carries the crit modifier class.
 		`empty empty--crit`,
-		// keys-chip is also tinted crit because adoption is enabled
-		// but no keys are loaded (§5.1.1).
-		`class="keys-chip"`,
 	)
-	if !strings.Contains(html, `data-state="crit"`) {
-		t.Errorf("keys-chip should carry data-state=crit when adoption enabled and no keys")
+	// The keys-chip <a> tag must itself carry data-state="crit" per
+	// §5.1.1 (adoption enabled + zero keys). Scoping to the anchor
+	// avoids matching the CSS rule selector inside the inline <style>.
+	chip := extractTag(html, "<a", `class="keys-chip"`)
+	if chip == "" {
+		t.Fatalf("could not locate <a class=\"keys-chip\"> anchor; html excerpt: %s", excerpt(html, "keys-chip", 300))
+	}
+	if !strings.Contains(chip, `data-state="crit"`) {
+		t.Errorf("keys-chip anchor missing data-state=\"crit\"; anchor: %s", chip)
+	}
+}
+
+// TestGoldenKeyringChipNotCritWhenAdoptionDisabled is the negative
+// of TestGoldenKeyringEmptyEnabled: when adoption is disabled the
+// keys-chip must NOT carry the crit state even though keys=0.
+func TestGoldenKeyringChipNotCritWhenAdoptionDisabled(t *testing.T) {
+	m := newHealthyModel()
+	m.AdoptionEnabled = false
+	m.Keyring = nil
+	html := renderHTMLForGolden(t, m)
+
+	chip := extractTag(html, "<a", `class="keys-chip"`)
+	if chip == "" {
+		t.Fatalf("could not locate <a class=\"keys-chip\"> anchor")
+	}
+	if strings.Contains(chip, `data-state="crit"`) {
+		t.Errorf("keys-chip anchor unexpectedly carries data-state=\"crit\" when adoption disabled; anchor: %s", chip)
+	}
+}
+
+// TestNoticeScriptHasNoInnerHTML guards against reintroducing the DOM
+// XSS surface that iter-4's codex-review fix removed. The aggregate
+// adoption notice mounts its head/body via createElement+textContent;
+// any future ".innerHTML=" assignment in the inline script is a
+// regression that puts data-outcome strings back on a string-concat
+// path. The render-budget check below also catches if someone replaces
+// the script wholesale.
+func TestNoticeScriptHasNoInnerHTML(t *testing.T) {
+	if strings.Contains(statusHTML, ".innerHTML") {
+		t.Errorf("statusHTML inline JS contains '.innerHTML' — adoption-notice DOM-XSS hardening (codex-review iter-4) regressed; use createElement/textContent")
+	}
+}
+
+// TestServerSideEscapesOutcomeMetacharacters ensures html/template
+// auto-escapes the data-outcome attribute when an outcome string
+// carries HTML metacharacters. Belt-and-suspenders for the notice
+// JS's textContent path: if the server-rendered attribute is already
+// escaped, even an innerHTML regression would have to first decode
+// it to reach an XSS condition.
+func TestServerSideEscapesOutcomeMetacharacters(t *testing.T) {
+	m := newHealthyModel()
+	// Deliberately malicious enum value as a regression probe.
+	m.RecentAdoptions = []adoptionEntry{
+		{Host: "x", SuitePath: "/", Outcome: `<script>alert(1)</script>`, CompletedUnixTime: 1, DurationSeconds: 1},
+	}
+	html := renderHTMLForGolden(t, m)
+	if strings.Contains(html, `<script>alert(1)</script>`) {
+		t.Errorf("html/template did not escape a malicious outcome string; raw script tag appears in output")
+	}
+	// The escaped form must show up either in the attribute or the
+	// badge text. html/template escapes < to &lt; in attribute values.
+	if !strings.Contains(html, `&lt;script&gt;`) {
+		t.Errorf("expected &lt;script&gt; escaping in rendered HTML; got excerpt: %s", excerpt(html, "alert", 200))
 	}
 }
 
@@ -313,6 +378,34 @@ func excerpt(html, marker string, n int) string {
 		end = len(html)
 	}
 	return html[i:end]
+}
+
+// extractTag returns the first occurrence of the opening tag whose
+// raw text starts with tagStart (e.g. "<a") AND contains the
+// classMarker substring (e.g. `class="keys-chip"`), up to the
+// closing `>`. Used to scope attribute assertions to a specific
+// element rather than the whole document — important because the
+// inline <style> block references the same data-state values as the
+// element attributes and a blanket strings.Contains check would
+// falsely pass on CSS-only text.
+func extractTag(html, tagStart, classMarker string) string {
+	i := 0
+	for {
+		j := strings.Index(html[i:], tagStart)
+		if j == -1 {
+			return ""
+		}
+		j += i
+		end := strings.Index(html[j:], ">")
+		if end == -1 {
+			return ""
+		}
+		tag := html[j : j+end+1]
+		if strings.Contains(tag, classMarker) {
+			return tag
+		}
+		i = j + 1
+	}
 }
 
 func excerptAround(html, needle string, n int) string {
