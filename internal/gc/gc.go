@@ -118,6 +118,15 @@ type LastRunSummary struct {
 	DeadlineReached         bool
 }
 
+// Interval returns the configured periodic-tick cadence. Pure accessor
+// over Config.Interval — exposed so the admin status page's
+// htmlRenderModel can carry the operator-configured value to the
+// presentation layer without admin importing the GC config struct.
+// See docs/admin-ui-spec.md §0.7 / §9.1 (GC watching threshold).
+func (g *GC) Interval() time.Duration {
+	return g.cfg.Interval
+}
+
 // LastRunSummary returns a copy of the most recently completed GC
 // run's summary, or (zero, false) when no run has completed since
 // process start. The returned struct is independent of subsequent

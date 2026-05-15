@@ -39,6 +39,26 @@ type statusModel struct {
 	Keyring         []keyringEntry   `json:"keyring"`
 }
 
+// htmlRenderModel is the additive presentation wrapper used by the
+// admin status HTML template path only. It embeds statusModel verbatim
+// (so every JSON-contract field remains reachable from the template
+// via Go's field promotion: `.Cache.BytesUsed`, etc.) and adds
+// operator-facing context the template needs but the JSON contract
+// does not expose. See docs/admin-ui-spec.md §0.7 — this wrapper is
+// the single allowed deviation from the "template input == statusModel"
+// rule and exists strictly so the template can answer questions like
+// "is adoption enabled?" and "what is the GC interval?" without
+// polluting the wire contract.
+//
+// The wrapper is constructed in renderStatus() immediately before
+// template.Execute. The JSON path is unchanged and never touches the
+// wrapper.
+type htmlRenderModel struct {
+	statusModel               // embedded; every JSON field reachable as before
+	AdoptionEnabled   bool    // cfg.Keyring != nil at server build time
+	GCIntervalSeconds float64 // cfg.GC.Interval() expressed in seconds; 0 when unknown
+}
+
 // keyringEntry is one loaded GPG entity surfaced on the status page.
 // SourcePath identifies the .gpg/.asc file the key came from on disk,
 // or the pseudo-path "embedded:<name>" when the key is one of the
@@ -649,12 +669,27 @@ func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := statusHTMLTemplate.Execute(w, model); err != nil {
+	if err := statusHTMLTemplate.Execute(w, s.buildHTMLRenderModel(model)); err != nil {
 		s.logger.Warn("admin_status_render_failed",
 			"err", err.Error(),
 			"format", "html",
 			"query", "template.Execute")
 	}
+}
+
+// buildHTMLRenderModel composes the docs/admin-ui-spec.md §0.7 wrapper
+// from the wire-shaped statusModel plus the bits of server config the
+// HTML template needs but the JSON contract intentionally does not
+// expose. JSON path never calls this.
+func (s *Server) buildHTMLRenderModel(m statusModel) htmlRenderModel {
+	w := htmlRenderModel{
+		statusModel:     m,
+		AdoptionEnabled: s.cfg.Keyring != nil,
+	}
+	if s.cfg.GC != nil {
+		w.GCIntervalSeconds = s.cfg.GC.Interval().Seconds()
+	}
+	return w
 }
 
 func chooseFormat(r *http.Request) string {
@@ -669,9 +704,8 @@ func chooseFormat(r *http.Request) string {
 // switch to text/template without a full security review.
 // statusTemplateFuncMap returns the html/template func map used by the
 // admin status page. Existing helpers are preserved verbatim; the
-// docs/admin-ui-spec.md §6.1 helpers (chunkHex … outcomeBadgeClass) are
-// added here. vitalState and verdictExplanation arrive with the
-// htmlRenderModel wrapper in the next iteration.
+// docs/admin-ui-spec.md §6.1 helpers (chunkHex … verdictExplanation) are
+// added here.
 func statusTemplateFuncMap() template.FuncMap {
 	return template.FuncMap{
 		"unixTime":            formatUnixTimeTag,
@@ -689,6 +723,8 @@ func statusTemplateFuncMap() template.FuncMap {
 		"countCustom":         countCustom,
 		"formatShortDuration": formatShortDuration,
 		"outcomeBadgeClass":   outcomeBadgeClass,
+		"vitalState":          vitalState,
+		"verdictExplanation":  verdictExplanation,
 	}
 }
 
@@ -1026,11 +1062,10 @@ func durationOf(seconds int64) string {
 	return fmt.Sprintf("%dh %dm", h, m)
 }
 
-// AIDEV-NOTE: helpers below (chunkHex … outcomeBadgeClass) are registered
+// AIDEV-NOTE: helpers below (chunkHex … verdictExplanation) are registered
 // in statusTemplateFuncMap() per docs/admin-ui-spec.md §6.1. All are pure
 // functions over their inputs — no package-level state, no I/O. Tests in
-// status_test.go are the implementation contract. vitalState and
-// verdictExplanation land with the htmlRenderModel wrapper.
+// status_test.go are the implementation contract.
 
 // chunkHex groups a hex string into n-character chunks separated by a
 // single ASCII space. Input is lowercased. Non-hex input (anything
@@ -1141,6 +1176,135 @@ func formatShortDuration(seconds float64) string {
 	h := int(seconds) / 3600
 	m := (int(seconds) % 3600) / 60
 	return fmt.Sprintf("%dh %dm", h, m)
+}
+
+// vitalState returns the data-state value for one of the five hero-strip
+// "vital" cells: "cache", "suites", "adoptions", "gc", "active". Returned
+// values are "healthy", "watching", "crit", or "stale" per the rules in
+// docs/admin-ui-spec.md §9.1. Unknown kind returns "healthy" so a typo in
+// the template never surfaces as a panic during rendering.
+//
+// Takes the htmlRenderModel wrapper because the GC watching threshold
+// (last run age > 2 × interval) needs GCIntervalSeconds, which is not on
+// statusModel (per the JSON-contract preservation rule §0.4).
+func vitalState(kind string, m htmlRenderModel) string {
+	switch kind {
+	case "cache":
+		if m.GC != nil && m.GC.PoolUnlinkErrors > 0 {
+			return "crit"
+		}
+		if m.Cache.BytesUsed == 0 {
+			return "stale"
+		}
+		if m.Cache.ZeroRefcountBacklog > 1000 {
+			return "watching"
+		}
+		return "healthy"
+	case "suites":
+		if len(m.Suites) == 0 {
+			return "stale"
+		}
+		worstLagSeconds := int64(0)
+		anyLag := false
+		for _, s := range m.Suites {
+			if s.LastSuccessUnixTime == nil || s.InReleaseChangeSeenAtUnixTime == nil {
+				continue
+			}
+			if *s.InReleaseChangeSeenAtUnixTime > *s.LastSuccessUnixTime {
+				anyLag = true
+				lag := *s.InReleaseChangeSeenAtUnixTime - *s.LastSuccessUnixTime
+				if lag > worstLagSeconds {
+					worstLagSeconds = lag
+				}
+			}
+		}
+		if worstLagSeconds > 24*3600 {
+			return "crit"
+		}
+		if anyLag {
+			return "watching"
+		}
+		return "healthy"
+	case "adoptions":
+		n := len(m.RecentAdoptions)
+		if n == 0 {
+			if m.Process.UptimeSeconds < 300 {
+				return "stale"
+			}
+			return "healthy"
+		}
+		fail := 0
+		for _, a := range m.RecentAdoptions {
+			if a.Outcome != "success" {
+				fail++
+			}
+		}
+		ratio := float64(fail) / float64(n)
+		if ratio >= 0.5 {
+			return "crit"
+		}
+		if ratio >= 0.1 {
+			return "watching"
+		}
+		return "healthy"
+	case "gc":
+		if m.GC == nil || m.GC.LastRunUnixTime == nil {
+			return "stale"
+		}
+		if m.GC.LastRunDeadlineReached {
+			return "crit"
+		}
+		// AIDEV-NOTE: GCIntervalSeconds==0 means "interval unknown" —
+		// per §9.1 the watching branch is suppressed in that case and
+		// the cell goes straight from healthy to stale.
+		if m.GCIntervalSeconds > 0 {
+			now := m.Process.StartedUnixTime + m.Process.UptimeSeconds
+			ageSeconds := now - *m.GC.LastRunUnixTime
+			if float64(ageSeconds) > 2*m.GCIntervalSeconds {
+				return "watching"
+			}
+		}
+		return "healthy"
+	case "active":
+		if len(m.ActiveHosts) == 0 && m.Process.UptimeSeconds < 300 {
+			return "stale"
+		}
+		return "healthy"
+	default:
+		return "healthy"
+	}
+}
+
+// verdictExplanation produces the server-side fallback verdict string
+// emitted inside <noscript> per docs/admin-ui-spec.md §8.1 — when JS is
+// off, the live JS-computed pill never runs, and this string is what the
+// operator sees. JS computes the live version from the same per-cell
+// state attributes at runtime.
+//
+// The output mirrors §9.2's verdict order (crit → watching → warming-up
+// → healthy) collapsed into one sentence; the per-cell badges below
+// carry the specific diagnostic.
+func verdictExplanation(m htmlRenderModel) string {
+	cells := []string{"cache", "suites", "adoptions", "gc", "active"}
+	crit, watching := 0, 0
+	for _, k := range cells {
+		switch vitalState(k, m) {
+		case "crit":
+			crit++
+		case "watching":
+			watching++
+		}
+	}
+	if crit > 0 {
+		return fmt.Sprintf("Degraded — %d of %d vital cells in critical state; see badges below.", crit, len(cells))
+	}
+	if watching > 0 {
+		return fmt.Sprintf("Watching — %d of %d vital cells elevated; see badges below.", watching, len(cells))
+	}
+	if m.Process.UptimeSeconds < 300 && (m.GC == nil || m.GC.LastRunUnixTime == nil) {
+		return fmt.Sprintf("Warming up — uptime %s, awaiting first GC run.", durationOf(m.Process.UptimeSeconds))
+	}
+	return fmt.Sprintf("All systems nominal — uptime %s.", durationOf(m.Process.UptimeSeconds))
 }
 
 // outcomeBadgeClass maps an adoption outcome enum string to one of the
