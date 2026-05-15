@@ -585,6 +585,57 @@ func TestVerifier_ShortKeyID_RejectedWhenDisabled(t *testing.T) {
 	}
 }
 
+// TestVerifier_ShortKeyID_AmbiguousKeyID covers the fallback's
+// fail-closed property when two distinct entities in the trust set
+// claim the same 8-byte keyid. In production this is astronomically
+// rare for high-entropy keys, but the failure mode (an adversarial
+// "Evil 32" colliding fingerprint, or an operator-staged duplicate)
+// would let the wrong entity substitute for the intended signer —
+// the whole point of the short-keyid fallback is to make a trust
+// decision on the keyid alone, so any ambiguity must abort rather
+// than guess.
+func TestVerifier_ShortKeyID_AmbiguousKeyID(t *testing.T) {
+	// Hand-build a Keyring with two distinct entities that share the
+	// same primary-key KeyId. We bypass LoadKeyring (which would
+	// dedupe by full fingerprint, not by short keyid) and stitch the
+	// internal map ourselves. Both entities are real signing keys;
+	// only the KeyId field is patched.
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	other := newTestEntity(t, "Collider", "collider@example.com")
+	// Stamp the other key's KeyId to match signer's. Fingerprints
+	// stay distinct (they're 20-byte SHA-1 of the key material) so
+	// trust-set narrowing by fingerprint still treats them as
+	// separate entries.
+	other.PrimaryKey.KeyId = signer.PrimaryKey.KeyId
+
+	keyring := &Keyring{
+		entries: []KeyringEntry{
+			{Entity: signer, PrimaryFingerprint: upperFP(signer.PrimaryKey.Fingerprint)},
+			{Entity: other, PrimaryFingerprint: upperFP(other.PrimaryKey.Fingerprint)},
+		},
+		entities: openpgp.EntityList{signer, other},
+		fingerprints: map[string]struct{}{
+			upperFP(signer.PrimaryKey.Fingerprint): {},
+			upperFP(other.PrimaryKey.Fingerprint):  {},
+		},
+	}
+	v, _ := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		AllowShortKeyID:  true,
+		Logger:           silentLogger(),
+	})
+
+	stripped := clearsignWithoutIssuerFingerprint(t, signer, []byte(fakeReleasePlaintext))
+	_, err := v.VerifyInline(context.Background(), newSuite(), stripped)
+	if err == nil {
+		t.Fatal("expected rejection on ambiguous short keyid; got success")
+	}
+	if !errors.Is(err, ErrAmbiguousKeyID) {
+		t.Fatalf("err = %v, want errors.Is ErrAmbiguousKeyID", err)
+	}
+}
+
 // TestVerifier_ShortKeyID_KeyNotInTrustSet covers the fallback's
 // safety property: even with AllowShortKeyID=true, a signature whose
 // keyid maps to no entity in trustSet is rejected (anyUntrusted →

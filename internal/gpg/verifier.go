@@ -123,6 +123,14 @@ var (
 	// clearsigned block had a valid IssuerFingerprint within the
 	// trust set.
 	ErrNoUsableSignature = errors.New("no signature with trusted IssuerFingerprint")
+
+	// ErrAmbiguousKeyID means the short-keyid fallback found more
+	// than one key in the per-suite trust set with the same 8-byte
+	// keyid. Acceptance on the first match would let a colliding
+	// key (an "Evil 32"-style adversarial fingerprint, or a
+	// legitimate but redundant operator-staged duplicate) silently
+	// substitute for the intended signer. Fail closed.
+	ErrAmbiguousKeyID = errors.New("ambiguous short issuer keyid in trust set")
 )
 
 // VerifyInline implements freshness.Verifier. Returns the verified
@@ -487,7 +495,16 @@ func (v *Verifier) verifyAnyTrusted(
 			if !v.allowShortKeyID || sig.IssuerKeyId == nil {
 				continue
 			}
-			matched := findEntityByKeyID(trustSet, *sig.IssuerKeyId)
+			matched, err := findUniqueEntityByKeyID(trustSet, *sig.IssuerKeyId)
+			if errors.Is(err, ErrAmbiguousKeyID) {
+				// More than one trust-set key claims this keyid:
+				// refuse rather than guess. Record as a verify
+				// error so the switch below surfaces it with
+				// proper precedence.
+				anyTrustedSeen = true
+				lastVerifyErr = err
+				continue
+			}
 			if matched == nil {
 				anyUntrusted = true
 				continue
@@ -542,24 +559,43 @@ func (v *Verifier) verifyAnyTrusted(
 	}
 }
 
-// findEntityByKeyID looks up a short 8-byte issuer keyid against the
-// given EntityList — checking each entity's primary key and every
-// subkey. Returns the first match (collisions in the 8-byte keyid
-// space are cryptographically negligible for high-entropy keys; if
-// an operator legitimately stages two keys with the same keyid they
-// can disable AllowShortKeyID to fall back to the strict policy).
-func findEntityByKeyID(list openpgp.EntityList, keyID uint64) *openpgp.Entity {
+// findUniqueEntityByKeyID looks up a short 8-byte issuer keyid against
+// the given EntityList — checking each entity's primary key and every
+// subkey. Returns (entity, nil) on exactly one match, (nil, nil) on no
+// match, and (nil, ErrAmbiguousKeyID) when two or more distinct
+// entities claim the same keyid.
+//
+// Uniqueness matters because the short-keyid fallback exists precisely
+// to make trust decisions on the 8-byte keyid alone — collisions
+// (whether adversarial "Evil 32"-style fingerprints or operator-
+// staged duplicates) would let the wrong entity stand in for the
+// intended signer. Failing closed on ambiguity is the only safe
+// behavior; AllowShortKeyID=false (the strict posture) can be set if
+// the ambiguity itself is intentional.
+func findUniqueEntityByKeyID(list openpgp.EntityList, keyID uint64) (*openpgp.Entity, error) {
+	var matched *openpgp.Entity
 	for _, e := range list {
+		hit := false
 		if e.PrimaryKey != nil && e.PrimaryKey.KeyId == keyID {
-			return e
+			hit = true
 		}
-		for _, sub := range e.Subkeys {
-			if sub.PublicKey != nil && sub.PublicKey.KeyId == keyID {
-				return e
+		if !hit {
+			for _, sub := range e.Subkeys {
+				if sub.PublicKey != nil && sub.PublicKey.KeyId == keyID {
+					hit = true
+					break
+				}
 			}
 		}
+		if !hit {
+			continue
+		}
+		if matched != nil && matched != e {
+			return nil, ErrAmbiguousKeyID
+		}
+		matched = e
 	}
-	return nil
+	return matched, nil
 }
 
 // verifyAgainst re-serializes one signature packet and verifies it

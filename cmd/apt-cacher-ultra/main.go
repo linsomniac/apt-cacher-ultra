@@ -102,14 +102,18 @@ var (
 
 	// keyringDirs is the SPEC2 §7.6.1 trusted-keyring search path.
 	// Variable rather than const so tests can point it at a tempdir
-	// without requiring root. Operators can append further paths via
-	// the adoption.keyring_dirs config setting; the canonical archive
+	// without requiring root. Operators append further paths via the
+	// adoption.keyring_dirs config setting; the canonical archive
 	// keys baked into the binary load alongside whatever is found on
 	// disk under these paths.
+	//
+	// /usr/share/keyrings is intentionally NOT default-scanned —
+	// that directory holds per-repository Signed-By keys whose
+	// intended scope is one apt source, not whole-archive trust.
+	// Operators who want it can opt in via keyring_dirs.
 	keyringDirs = []string{
 		gpg.DefaultTrustedGPGDir,
 		gpg.DefaultKeyringsDir,
-		gpg.DefaultSharedKeyingDir,
 	}
 
 	// keyringEmbeddedSources returns the canonical archive keys baked

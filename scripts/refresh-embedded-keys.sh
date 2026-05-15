@@ -70,10 +70,22 @@ for src in ubuntu-pro-esm-apps.gpg ubuntu-pro-esm-infra.gpg; do
 done
 
 echo
-echo "==> Done. Review the new keys with:"
-echo "    for f in $EMBED_DIR/*.gpg; do"
-echo "      echo \"\$f:\""
-echo "      gpg --no-default-keyring --keyring \"\$f\" --list-keys"
-echo "    done"
+echo "==> Fingerprints in the refreshed keyring files"
+echo "    These are the trust anchors that will be baked into the"
+echo "    binary. Compare them against the upstream-published values"
+echo "    (apt-cacher-ultra's commit log will record what they were"
+echo "    last time the script ran) BEFORE committing."
+echo "    Canonical upstream sources to cross-check against:"
+echo "      - https://wiki.ubuntu.com/SecurityTeam/GPGKeyTable"
+echo "      - https://www.debian.org/CD/verify"
+echo "      - https://canonical-ubuntu-pro-client.readthedocs-hosted.com/"
 echo
-echo "Then commit the result and rebuild."
+for f in "$EMBED_DIR"/*.gpg; do
+  echo "  $(basename "$f")"
+  gpg --no-default-keyring --keyring "$f" \
+      --list-keys --with-fingerprint --with-colons 2>/dev/null \
+    | awk -F: '$1=="pub"{kid=$5} $1=="fpr"{print "    pub  " $10} $1=="uid"{print "    uid  " $10}'
+done
+echo
+echo "==> Done. After verifying the fingerprints above match the"
+echo "    upstream-published values, commit and rebuild."

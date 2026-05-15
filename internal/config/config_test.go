@@ -566,6 +566,20 @@ func TestPhase2_RejectsBadValues(t *testing.T) {
 			"[cache]\ndir=\"%DIR%\"\n[[trusted_signer]]\nmatch_canonical_host = \"\"\nfingerprints = [\"" + strings.Repeat("a", 40) + "\"]\n",
 			"match_canonical_host is required",
 		},
+		{
+			// SPEC2 §5.2: keyring_dirs entries must be absolute
+			// paths. Relative paths quietly change behavior based
+			// on the daemon's cwd and could resolve to attacker-
+			// controlled directories under some service managers.
+			"adoption.keyring_dirs relative path",
+			"[cache]\ndir=\"%DIR%\"\n[adoption]\nkeyring_dirs = [\"relative/path\"]\n",
+			"absolute path",
+		},
+		{
+			"adoption.keyring_dirs empty entry",
+			"[cache]\ndir=\"%DIR%\"\n[adoption]\nkeyring_dirs = [\"\"]\n",
+			"is empty",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

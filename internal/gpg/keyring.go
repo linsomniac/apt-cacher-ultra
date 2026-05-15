@@ -23,14 +23,21 @@ import (
 )
 
 // Standard apt keyring directories. Modern apt installs split trust
-// between the legacy /etc/apt/trusted.gpg.d/ (whole-archive trust),
-// /etc/apt/keyrings/ (Signed-By: per-source trust), and
-// /usr/share/keyrings/ (distribution-shipped canonical keys). SPEC2
-// §7.6.1 directs us to read all three.
+// between the legacy /etc/apt/trusted.gpg.d/ (whole-archive trust)
+// and /etc/apt/keyrings/ (Signed-By: per-source trust). SPEC2 §7.6.1
+// directs us to read both.
+//
+// We deliberately do NOT default-scan /usr/share/keyrings/: that
+// directory commonly carries per-repository keys whose intended
+// scope is a single apt source (via Signed-By:), not whole-archive
+// trust. Loading those by default would broaden trust beyond what
+// the operator staged with apt itself. Canonical Ubuntu/Debian/ESM
+// archive keys ship baked into the binary instead; operators who
+// want to scan /usr/share/keyrings or any other path opt in via
+// adoption.keyring_dirs.
 const (
-	DefaultTrustedGPGDir   = "/etc/apt/trusted.gpg.d"
-	DefaultKeyringsDir     = "/etc/apt/keyrings"
-	DefaultSharedKeyingDir = "/usr/share/keyrings"
+	DefaultTrustedGPGDir = "/etc/apt/trusted.gpg.d"
+	DefaultKeyringsDir   = "/etc/apt/keyrings"
 )
 
 // KeyringEntry is one loaded entity with its source attribution.

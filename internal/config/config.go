@@ -761,6 +761,20 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// SPEC2 §5.2: [adoption].keyring_dirs entries must be non-empty
+	// absolute paths. Relative paths would make the trust set depend
+	// on the daemon's working directory at start — a quiet way for
+	// an operator's `keyring_dirs = ["keys"]` to silently load
+	// nothing (or worse, a controlled directory) instead of the
+	// intended path. Empty strings would no-op but mask a typo.
+	for i, p := range c.Adoption.KeyringDirs {
+		if p == "" {
+			errs = append(errs, fmt.Errorf("adoption.keyring_dirs[%d] is empty", i))
+		} else if !filepath.IsAbs(p) {
+			errs = append(errs, fmt.Errorf("adoption.keyring_dirs[%d] %q must be an absolute path", i, p))
+		}
+	}
+
 	// SPEC4 §5.2: [gc] block validation.
 	if c.GC.Interval.Duration <= 0 {
 		errs = append(errs, errors.New("gc.interval must be > 0 (use gc.enabled = false to disable)"))
