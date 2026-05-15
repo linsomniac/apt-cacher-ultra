@@ -538,3 +538,71 @@ func TestVerifier_MultiSig_AllStaleRejects(t *testing.T) {
 		t.Fatal("expected rejection when all signatures are over stale cleartext")
 	}
 }
+
+// TestVerifier_ShortKeyID_AcceptedWithFallback covers the SPEC2 §7.6.3
+// short-keyid fallback path: a clearsigned block whose signature(s)
+// carry only the legacy 8-byte issuer keyid (no IssuerFingerprint
+// subpacket) must verify when AllowShortKeyID is true, because the
+// keyid resolves to a single trust-set entity that signs the cleartext.
+func TestVerifier_ShortKeyID_AcceptedWithFallback(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+	v, _ := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		AllowShortKeyID:  true,
+		Logger:           silentLogger(),
+	})
+
+	stripped := clearsignWithoutIssuerFingerprint(t, signer, []byte(fakeReleasePlaintext))
+	plain, err := v.VerifyInline(context.Background(), newSuite(), stripped)
+	if err != nil {
+		t.Fatalf("short-keyid fallback rejected unexpectedly: %v", err)
+	}
+	if !bytes.Equal(plain, []byte(fakeReleasePlaintext)) {
+		t.Fatalf("plaintext mismatch")
+	}
+}
+
+// TestVerifier_ShortKeyID_RejectedWhenDisabled confirms the stricter
+// posture: with AllowShortKeyID=false a short-keyid-only signature
+// fails with ErrShortKeyID even when the keyid would map to a loaded
+// key. This preserves the original SPEC2 §7.6.3 wording as an opt-in
+// for operators who want it.
+func TestVerifier_ShortKeyID_RejectedWhenDisabled(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+	v, _ := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		AllowShortKeyID:  false,
+		Logger:           silentLogger(),
+	})
+
+	stripped := clearsignWithoutIssuerFingerprint(t, signer, []byte(fakeReleasePlaintext))
+	if _, err := v.VerifyInline(context.Background(), newSuite(), stripped); !errors.Is(err, ErrShortKeyID) {
+		t.Fatalf("err = %v, want ErrShortKeyID", err)
+	}
+}
+
+// TestVerifier_ShortKeyID_KeyNotInTrustSet covers the fallback's
+// safety property: even with AllowShortKeyID=true, a signature whose
+// keyid maps to no entity in trustSet is rejected (anyUntrusted →
+// ErrNoUsableSignature in the absence of any acceptable packet).
+func TestVerifier_ShortKeyID_KeyNotInTrustSet(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	other := newTestEntity(t, "Other", "other@example.com")
+	// Trust ONLY `other`, signature is from `signer`.
+	keyring := newKeyring(t, other)
+	v, _ := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		AllowShortKeyID:  true,
+		Logger:           silentLogger(),
+	})
+
+	stripped := clearsignWithoutIssuerFingerprint(t, signer, []byte(fakeReleasePlaintext))
+	if _, err := v.VerifyInline(context.Background(), newSuite(), stripped); err == nil {
+		t.Fatalf("expected rejection when fallback keyid maps to no trust-set entity")
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"regexp"
+	"sync"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -31,7 +32,26 @@ type VerifierConfig struct {
 	Pins             []SignerPin
 	RequireSignature bool
 	RequirePinned    bool
-	Logger           *slog.Logger
+
+	// AllowShortKeyID controls the SPEC2 §7.6.3 fallback for signatures
+	// that omit the IssuerFingerprint subpacket (subpacket 33) and
+	// carry only the legacy 8-byte issuer keyid (subpacket 16). When
+	// true (the default), the verifier looks up the keyid in the
+	// per-suite trust set and, on unique match, verifies against that
+	// entity — matching apt's own broad behavior. When false, signatures
+	// without IssuerFingerprint are rejected with ErrShortKeyID
+	// regardless of whether the keyid would match. The fallback
+	// emits one INFO log per (host, suite_path) per process the
+	// first time it accepts a signature, so operators can inventory
+	// which repos rely on the legacy form.
+	//
+	// Real-world third-party signers (notably Docker, Microsoft) still
+	// emit signatures without subpacket 33; default-true preserves
+	// snapshot adoption for those repos while operators that prefer
+	// the stricter policy set the toggle false.
+	AllowShortKeyID bool
+
+	Logger *slog.Logger
 }
 
 // Verifier implements freshness.Verifier using the host apt keyring
@@ -42,7 +62,14 @@ type Verifier struct {
 	pins             []SignerPin
 	requireSignature bool
 	requirePinned    bool
+	allowShortKeyID  bool
 	logger           *slog.Logger
+
+	// shortKeyIDLogged tracks suites for which a short-keyid-fallback
+	// acceptance has already been logged this process. Keyed by
+	// "canonical_host|suite_path"; values are unused. Concurrent-safe
+	// via sync.Map's LoadOrStore.
+	shortKeyIDLogged sync.Map
 }
 
 // Compile-time interface check: Verifier satisfies freshness.Verifier.
@@ -67,6 +94,7 @@ func NewVerifier(cfg VerifierConfig) (*Verifier, error) {
 		pins:             cfg.Pins,
 		requireSignature: cfg.RequireSignature,
 		requirePinned:    cfg.RequirePinned,
+		allowShortKeyID:  cfg.AllowShortKeyID,
 		logger:           logger,
 	}, nil
 }
@@ -169,7 +197,7 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 	if err != nil {
 		return nil, fmt.Errorf("read signature: %w", err)
 	}
-	if err := v.verifyAnyTrusted(trustSet, trustFPs, block.Bytes, sigBytes); err != nil {
+	if err := v.verifyAnyTrusted(suite, trustSet, trustFPs, block.Bytes, sigBytes); err != nil {
 		return nil, err
 	}
 
@@ -234,7 +262,7 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 		return nil, fmt.Errorf("decode signature: %w", err)
 	}
 
-	if err := v.verifyAnyTrusted(trustSet, trustFPs, releaseBytes, binarySig); err != nil {
+	if err := v.verifyAnyTrusted(suite, trustSet, trustFPs, releaseBytes, binarySig); err != nil {
 		return nil, err
 	}
 	return releaseBytes, nil
@@ -395,9 +423,11 @@ func readArmoredSignature(r io.Reader) ([]byte, error) {
 }
 
 // verifyAnyTrusted enumerates every signature packet in sigBytes and
-// accepts on the FIRST one that passes BOTH (a) the long-form
-// IssuerFingerprint trust check and (b) cryptographic verification
-// against trustSet. Coupling these checks to the same packet is the
+// accepts on the FIRST one that passes BOTH (a) a trust check —
+// long-form IssuerFingerprint in trustFPs, or (when AllowShortKeyID
+// is enabled) the legacy 8-byte issuer keyid maps to a single entity
+// in trustSet — AND (b) cryptographic verification against the
+// matched entity. Coupling these checks to the same packet is the
 // SPEC2 §7.6.3 invariant: a multi-signature block must not satisfy
 // the policy with one packet while the library's verifier accepts a
 // different packet.
@@ -410,9 +440,12 @@ func readArmoredSignature(r io.Reader) ([]byte, error) {
 //     return that verification error.
 //   - Else if all packets had IssuerFingerprint outside trustFPs,
 //     return ErrUntrustedSigner.
-//   - Else if all packets lacked IssuerFingerprint, return ErrShortKeyID.
-//   - Else (no signature packets at all), ErrNoUsableSignature.
+//   - Else if all packets lacked IssuerFingerprint AND AllowShortKeyID
+//     is disabled, return ErrShortKeyID.
+//   - Else (no signature packets at all, or short-keyid fallback ran
+//     and matched no key in trustSet), ErrNoUsableSignature.
 func (v *Verifier) verifyAnyTrusted(
+	suite freshness.SuiteRef,
 	trustSet openpgp.EntityList,
 	trustFPs map[string]struct{},
 	signed []byte,
@@ -439,10 +472,36 @@ func (v *Verifier) verifyAnyTrusted(
 			continue
 		}
 		sawSignature = true
+
+		// Short-keyid fallback (SPEC2 §7.6.3): a real-world signer
+		// (notably Docker, Microsoft) may omit the IssuerFingerprint
+		// subpacket 33 and carry only the legacy 8-byte issuer keyid.
+		// When AllowShortKeyID is enabled, attempt to resolve the
+		// keyid against trustSet; on a single match we treat that
+		// entity as the trust anchor for this packet. The narrowing
+		// from any matched [[trusted_signer]] block still applies —
+		// the fallback search runs over trustSet, not the broader
+		// keyring.
 		if len(sig.IssuerFingerprint) == 0 {
 			anyShortKeyID = true
+			if !v.allowShortKeyID || sig.IssuerKeyId == nil {
+				continue
+			}
+			matched := findEntityByKeyID(trustSet, *sig.IssuerKeyId)
+			if matched == nil {
+				anyUntrusted = true
+				continue
+			}
+			anyTrustedSeen = true
+			if verr := v.verifyAgainst(matched, signed, sig); verr == nil {
+				v.logShortKeyIDFallbackOnce(suite, matched, *sig.IssuerKeyId)
+				return nil
+			} else {
+				lastVerifyErr = verr
+			}
 			continue
 		}
+
 		issuerFP := upperFP(sig.IssuerFingerprint)
 		if _, ok := trustFPs[issuerFP]; !ok {
 			anyUntrusted = true
@@ -476,9 +535,67 @@ func (v *Verifier) verifyAnyTrusted(
 		return fmt.Errorf("signature verification failed: %w", lastVerifyErr)
 	case anyUntrusted:
 		return fmt.Errorf("%w: IssuerFingerprint not in trust set", ErrUntrustedSigner)
-	case anyShortKeyID:
+	case anyShortKeyID && !v.allowShortKeyID:
 		return ErrShortKeyID
 	default:
 		return ErrNoUsableSignature
 	}
+}
+
+// findEntityByKeyID looks up a short 8-byte issuer keyid against the
+// given EntityList — checking each entity's primary key and every
+// subkey. Returns the first match (collisions in the 8-byte keyid
+// space are cryptographically negligible for high-entropy keys; if
+// an operator legitimately stages two keys with the same keyid they
+// can disable AllowShortKeyID to fall back to the strict policy).
+func findEntityByKeyID(list openpgp.EntityList, keyID uint64) *openpgp.Entity {
+	for _, e := range list {
+		if e.PrimaryKey != nil && e.PrimaryKey.KeyId == keyID {
+			return e
+		}
+		for _, sub := range e.Subkeys {
+			if sub.PublicKey != nil && sub.PublicKey.KeyId == keyID {
+				return e
+			}
+		}
+	}
+	return nil
+}
+
+// verifyAgainst re-serializes one signature packet and verifies it
+// against an EntityList containing only the matched entity. Mirrors
+// the per-packet isolation step in the strict path so the entity
+// whose keyid resolved the trust check is the same entity whose key
+// is used for the cryptographic check.
+func (v *Verifier) verifyAgainst(e *openpgp.Entity, signed []byte, sig *packet.Signature) error {
+	var sb bytes.Buffer
+	if err := sig.Serialize(&sb); err != nil {
+		return fmt.Errorf("re-serialize signature packet: %w", err)
+	}
+	_, _, err := openpgp.VerifyDetachedSignature(
+		openpgp.EntityList{e},
+		bytes.NewReader(signed),
+		&sb,
+		nil,
+	)
+	return err
+}
+
+// logShortKeyIDFallbackOnce emits one INFO log per (canonical_host,
+// suite_path) per process the first time we accept a signature via
+// the short-keyid fallback. Subsequent acceptances for the same
+// suite stay silent — this keeps the log surface a finite inventory
+// of "which repos rely on the legacy form" rather than a per-check
+// noise stream.
+func (v *Verifier) logShortKeyIDFallbackOnce(suite freshness.SuiteRef, matched *openpgp.Entity, keyID uint64) {
+	key := suite.CanonicalHost + "|" + suite.SuitePath
+	if _, loaded := v.shortKeyIDLogged.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	v.logger.Info("adoption_short_keyid_fallback",
+		"canonical_host", suite.CanonicalHost,
+		"suite_path", suite.SuitePath,
+		"issuer_keyid", fmt.Sprintf("%016X", keyID),
+		"matched_fingerprint", upperFP(matched.PrimaryKey.Fingerprint),
+	)
 }

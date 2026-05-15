@@ -430,6 +430,12 @@ dir = "`+dir+`"
 	if cfg.Adoption.RequirePinnedSigner {
 		t.Errorf("adoption.require_pinned_signer default should be false")
 	}
+	if !cfg.Adoption.AllowShortKeyID {
+		t.Errorf("adoption.allow_short_keyid default should be true")
+	}
+	if len(cfg.Adoption.KeyringDirs) != 0 {
+		t.Errorf("adoption.keyring_dirs default should be empty, got %v", cfg.Adoption.KeyringDirs)
+	}
 	if cfg.Integrity.ValidateAtRestInterval.Duration != 24*time.Hour {
 		t.Errorf("integrity.validate_at_rest_interval default = %v, want 24h",
 			cfg.Integrity.ValidateAtRestInterval.Duration)
@@ -454,6 +460,8 @@ max_concurrent_adoptions = 8
 enabled = true
 require_signature = false
 require_pinned_signer = true
+allow_short_keyid = false
+keyring_dirs = ["/opt/extra/keys", "/etc/custom-keyrings"]
 
 [integrity]
 validate_at_rest_interval = "12h"
@@ -477,6 +485,12 @@ fingerprints = ['648ACFD622F3D138B83D49C7DDF4D7C5C5E3A7B6', '0123456789abcdef012
 	}
 	if !cfg.Adoption.Enabled || cfg.Adoption.RequireSignature || !cfg.Adoption.RequirePinnedSigner {
 		t.Errorf("adoption: %+v not parsed correctly", cfg.Adoption)
+	}
+	if cfg.Adoption.AllowShortKeyID {
+		t.Errorf("adoption.allow_short_keyid not parsed from explicit false")
+	}
+	if got := cfg.Adoption.KeyringDirs; len(got) != 2 || got[0] != "/opt/extra/keys" || got[1] != "/etc/custom-keyrings" {
+		t.Errorf("adoption.keyring_dirs = %v, want [/opt/extra/keys /etc/custom-keyrings]", got)
 	}
 	if cfg.Integrity.ValidateAtRestInterval.Duration != 12*time.Hour {
 		t.Errorf("interval = %v, want 12h", cfg.Integrity.ValidateAtRestInterval.Duration)

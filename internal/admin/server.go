@@ -82,6 +82,32 @@ type Config struct {
 	// renders as `[]` in JSON. cmd/main passes whatever was loaded
 	// from the config file; admin does not re-read the value.
 	AdoptionArchitectures []string
+
+	// Keyring supplies the loaded GPG keyring inventory for the
+	// status page's `keyring` section. nil is treated as "adoption
+	// disabled or keyring not yet wired" — the section renders as
+	// an empty list. Defined as an interface so admin does not
+	// import internal/gpg.
+	Keyring KeyringProvider
+}
+
+// KeyringProvider returns the inventory of trusted-key entities loaded
+// at startup, with source attribution (disk path or "embedded:<name>")
+// so operators can debug "which key is this and where did it come from"
+// from the admin status page alone.
+type KeyringProvider interface {
+	KeyringSnapshot() []KeyringEntrySnapshot
+}
+
+// KeyringEntrySnapshot is one loaded entity surfaced on the admin
+// status page. Mirrored from internal/gpg.KeyringEntry but redefined
+// here so admin does not import internal/gpg. cmd/apt-cacher-ultra
+// constructs an adapter that copies the gpg-package values.
+type KeyringEntrySnapshot struct {
+	PrimaryFingerprint string
+	PrimaryUID         string
+	SourcePath         string
+	SubkeyFingerprints []string
 }
 
 // TLSMITMProvider supplies the SPEC6 §10.4 status-page TLS MITM

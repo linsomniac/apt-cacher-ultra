@@ -66,6 +66,28 @@ enabled               = false
 require_signature     = true
 require_pinned_signer = false
 
+# When true (the default), signatures that lack the long-form
+# IssuerFingerprint subpacket (33) are still accepted provided their
+# 8-byte issuer keyid maps unambiguously to a key in the per-suite
+# trust set. Matches apt's broad behavior; needed for real-world
+# third-party signers (notably Docker, Microsoft) that still publish
+# InRelease bodies without subpacket 33. Set to false for the
+# stricter SPEC2 §7.6.3 posture where any short-keyid-only signature
+# fails closed regardless of whether the keyid would resolve. Each
+# (host, suite) pair logs one INFO line the first time the fallback
+# accepts a signature so operators can inventory affected repos.
+allow_short_keyid     = true
+
+# Extra directories the keyring loader scans at startup, on top of
+# the built-in defaults: /etc/apt/trusted.gpg.d, /etc/apt/keyrings,
+# and /usr/share/keyrings. Nonexistent paths are silently skipped.
+# In addition, canonical Ubuntu, Debian, and Ubuntu Pro ESM archive
+# keys are baked into the binary and load alongside whatever is
+# found on disk — apt-cacher-ultra ships with usable trust for stock
+# Debian/Ubuntu repositories out of the box, even on minimal hosts
+# where /etc/apt/* is unpopulated.
+# keyring_dirs        = ["/opt/extra-keyrings"]
+
 # SPEC6_5 §5.1 per-arch adoption allowlist. Empty (default) adopts every
 # Release-listed Packages / Sources index regardless of architecture —
 # the same behavior as Phase 6. Non-empty restricts adoption to the

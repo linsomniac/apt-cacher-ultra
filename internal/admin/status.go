@@ -34,6 +34,20 @@ type statusModel struct {
 	HotURLPaths     []hotURLEntry    `json:"hot_url_paths"`
 	RecentAdoptions []adoptionEntry  `json:"recent_adoptions"`
 	ActiveHosts     []activeHostInfo `json:"active_hosts"`
+	Keyring         []keyringEntry   `json:"keyring"`
+}
+
+// keyringEntry is one loaded GPG entity surfaced on the status page.
+// SourcePath identifies the .gpg/.asc file the key came from on disk,
+// or the pseudo-path "embedded:<name>" when the key is one of the
+// canonical archive keys baked into the binary. SubkeyFingerprints
+// is non-nil (empty slice for keys with no subkeys) so JSON consumers
+// always see the schema key.
+type keyringEntry struct {
+	PrimaryFingerprint string   `json:"primary_fingerprint"`
+	PrimaryUID         string   `json:"primary_uid"`
+	SourcePath         string   `json:"source_path"`
+	SubkeyFingerprints []string `json:"subkey_fingerprints"`
 }
 
 // cacheSummary is the SPEC6_5 §2.4 cache_summary block. Keyed by
@@ -354,6 +368,7 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 		HotURLPaths:     buildHotURLEntries(hotPaths.([]cache.HotURLPath)),
 		RecentAdoptions: buildAdoptionEntries(s.cfg.Ring.Snapshot()),
 		ActiveHosts:     buildActiveHostEntries(s.cfg.HostLimiter.Snapshot()),
+		Keyring:         buildKeyringEntries(s.cfg.Keyring),
 	}
 
 	// SPEC5 §10.5: gc is always present at the top level. When no GC
@@ -572,6 +587,35 @@ func buildActiveHostEntries(stats map[string]hostsem.HostStat) []activeHostInfo 
 	return out
 }
 
+// buildKeyringEntries renders the loaded GPG keyring inventory for
+// the status page. nil provider (e.g. adoption disabled) yields an
+// empty slice so the JSON contract — top-level `keyring` key always
+// present — holds. Entries are sorted by primary fingerprint for a
+// deterministic order regardless of load sequence.
+func buildKeyringEntries(p KeyringProvider) []keyringEntry {
+	if p == nil {
+		return []keyringEntry{}
+	}
+	snaps := p.KeyringSnapshot()
+	out := make([]keyringEntry, 0, len(snaps))
+	for _, s := range snaps {
+		subFPs := s.SubkeyFingerprints
+		if subFPs == nil {
+			subFPs = []string{}
+		}
+		out = append(out, keyringEntry{
+			PrimaryFingerprint: s.PrimaryFingerprint,
+			PrimaryUID:         s.PrimaryUID,
+			SourcePath:         s.SourcePath,
+			SubkeyFingerprints: subFPs,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].PrimaryFingerprint < out[j].PrimaryFingerprint
+	})
+	return out
+}
+
 // renderStatus renders the SPEC5 §10.5 status page in either JSON
 // or HTML per content negotiation (§9.7.3).
 func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
@@ -738,7 +782,9 @@ code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
 {{if .Suites}}
 <table>
 <tr><th>Host</th><th>Suite path</th><th>Last check</th><th>Last success</th>
-    <th>Current snapshot</th><th>Adopted at</th><th>InRelease changed</th></tr>
+    <th>Current snapshot</th>
+    <th><span title="Set when the cache successfully adopts a snapshot for this suite. Adoption is triggered only when the upstream InRelease changes during this process's lifetime — a suite whose InRelease was cached previously and has not been republished since startup stays empty here until upstream publishes again or the cache is restarted.">Adopted at &#9432;</span></th>
+    <th>InRelease changed</th></tr>
 {{range .Suites}}<tr>
   <td><code>{{.Host}}</code></td>
   <td><code>{{.SuitePath}}</code></td>
@@ -750,6 +796,19 @@ code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
 </tr>
 {{end}}</table>
 {{else}}<p class="muted">No suites tracked yet.</p>{{end}}
+
+<h2>Keyring</h2>
+{{if .Keyring}}
+<table>
+<tr><th>Primary fingerprint</th><th>User ID</th><th>Source</th><th>Subkey fingerprints</th></tr>
+{{range .Keyring}}<tr>
+  <td><code>{{.PrimaryFingerprint}}</code></td>
+  <td>{{.PrimaryUID}}</td>
+  <td><code>{{.SourcePath}}</code></td>
+  <td>{{range $i, $fp := .SubkeyFingerprints}}{{if $i}}<br>{{end}}<code>{{$fp}}</code>{{end}}</td>
+</tr>
+{{end}}</table>
+{{else}}<p class="muted">No GPG keys loaded.</p>{{end}}
 
 <h2>Garbage collection</h2>
 {{if .GC.LastRunUnixTime}}

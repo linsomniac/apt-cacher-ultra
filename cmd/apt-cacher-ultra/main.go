@@ -102,8 +102,21 @@ var (
 
 	// keyringDirs is the SPEC2 §7.6.1 trusted-keyring search path.
 	// Variable rather than const so tests can point it at a tempdir
-	// without requiring root.
-	keyringDirs = []string{gpg.DefaultTrustedGPGDir, gpg.DefaultKeyringsDir}
+	// without requiring root. Operators can append further paths via
+	// the adoption.keyring_dirs config setting; the canonical archive
+	// keys baked into the binary load alongside whatever is found on
+	// disk under these paths.
+	keyringDirs = []string{
+		gpg.DefaultTrustedGPGDir,
+		gpg.DefaultKeyringsDir,
+		gpg.DefaultSharedKeyingDir,
+	}
+
+	// keyringEmbeddedSources returns the canonical archive keys baked
+	// into the binary (Ubuntu, Debian, ESM apps, ESM infra). Function-
+	// valued rather than a slice so tests can suppress the bundled set
+	// when validating the "empty keyring rejects startup" guard.
+	keyringEmbeddedSources = gpg.BundledSources
 
 	// mitmUndistributedRefreshInterval is the SPEC6 §9.7.6 cadence
 	// the `tls_mitm_enabled_ca_undistributed` Warn refresher wakes
@@ -501,8 +514,9 @@ func serveListeners(
 	// freshness continues Phase 1 behavior (record divergence, do not
 	// flip).
 	var adopter *freshness.Adopter
+	var keyring *gpg.Keyring
 	if cfg.Adoption.Enabled {
-		adopter, err = buildAdopter(cfg, c, fetchClient, hostLimiter, logger)
+		adopter, keyring, err = buildAdopter(cfg, c, fetchClient, hostLimiter, logger)
 		if err != nil {
 			return fmt.Errorf("build adopter: %w", err)
 		}
@@ -658,6 +672,7 @@ func serveListeners(
 			AdminAddr:             adminLn.Addr().String(),
 			TLSMITM:               &tlsMitmProvider{h: mitmHandles},
 			AdoptionArchitectures: cfg.Adoption.Architectures,
+			Keyring:               &keyringProvider{k: keyring},
 		})
 		if err != nil {
 			return fmt.Errorf("build admin: %w", err)
@@ -889,18 +904,24 @@ func buildAdopter(
 	fetchClient *fetch.Client,
 	hostLimiter *hostsem.Sem,
 	logger *slog.Logger,
-) (*freshness.Adopter, error) {
-	keyring, err := gpg.LoadKeyring(keyringDirs, logger)
+) (*freshness.Adopter, *gpg.Keyring, error) {
+	dirs := append([]string{}, keyringDirs...)
+	dirs = append(dirs, cfg.Adoption.KeyringDirs...)
+	var embedded []gpg.EmbeddedSource
+	if keyringEmbeddedSources != nil {
+		embedded = keyringEmbeddedSources()
+	}
+	keyring, err := gpg.LoadKeyringWithEmbedded(dirs, embedded, logger)
 	if err != nil {
-		return nil, fmt.Errorf("load apt keyring: %w", err)
+		return nil, nil, fmt.Errorf("load apt keyring: %w", err)
 	}
 	if keyring.Empty() && cfg.Adoption.RequireSignature {
-		return nil, errors.New("apt keyring is empty and adoption.require_signature = true; refusing to start (no key would satisfy any verification — populate /etc/apt/trusted.gpg.d/ or /etc/apt/keyrings/)")
+		return nil, nil, errors.New("apt keyring is empty and adoption.require_signature = true; refusing to start (no key would satisfy any verification — populate /etc/apt/trusted.gpg.d/ or /etc/apt/keyrings/)")
 	}
 
 	pins, err := compilePins(cfg.TrustedSigners)
 	if err != nil {
-		return nil, fmt.Errorf("compile [[trusted_signer]] blocks: %w", err)
+		return nil, nil, fmt.Errorf("compile [[trusted_signer]] blocks: %w", err)
 	}
 
 	verifier, err := gpg.NewVerifier(gpg.VerifierConfig{
@@ -908,10 +929,11 @@ func buildAdopter(
 		Pins:             pins,
 		RequireSignature: cfg.Adoption.RequireSignature,
 		RequirePinned:    cfg.Adoption.RequirePinnedSigner,
+		AllowShortKeyID:  cfg.Adoption.AllowShortKeyID,
 		Logger:           logger,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("build verifier: %w", err)
+		return nil, nil, fmt.Errorf("build verifier: %w", err)
 	}
 
 	adopter, err := freshness.NewAdopter(freshness.AdoptionConfig{
@@ -927,18 +949,44 @@ func buildAdopter(
 		Logger:            logger,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("new adopter: %w", err)
+		return nil, nil, fmt.Errorf("new adopter: %w", err)
 	}
 
 	logger.Info("phase2 adoption enabled",
 		"keyring_keys", keyring.Size(),
 		"trusted_signer_blocks", len(pins),
 		"require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
+		"allow_short_keyid", cfg.Adoption.AllowShortKeyID,
 		"max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
 	)
-	return adopter, nil
+	return adopter, keyring, nil
+}
+
+// keyringProvider adapts a *gpg.Keyring to admin.KeyringProvider so
+// the admin package can render the loaded entities without importing
+// internal/gpg.
+type keyringProvider struct {
+	k *gpg.Keyring
+}
+
+func (p *keyringProvider) KeyringSnapshot() []admin.KeyringEntrySnapshot {
+	if p == nil || p.k == nil {
+		return nil
+	}
+	entries := p.k.Entries()
+	out := make([]admin.KeyringEntrySnapshot, 0, len(entries))
+	for _, e := range entries {
+		subs := append([]string(nil), e.SubkeyFingerprints...)
+		out = append(out, admin.KeyringEntrySnapshot{
+			PrimaryFingerprint: e.PrimaryFingerprint,
+			PrimaryUID:         e.PrimaryUID,
+			SourcePath:         e.SourcePath,
+			SubkeyFingerprints: subs,
+		})
+	}
+	return out
 }
 
 // compilePins translates the validated config.TrustedSigner blocks

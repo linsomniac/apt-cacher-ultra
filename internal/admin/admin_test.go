@@ -245,6 +245,7 @@ func TestStatusJSON_HasLockedSchemaKeys(t *testing.T) {
 		"hot_url_paths", "recent_adoptions", "active_hosts", "gc",
 		"tls_mitm",
 		"repo_coverage", // SPEC6_5 §2.4: top-level key always present
+		"keyring",       // loaded GPG keys; empty list when adoption is disabled or keyring is empty
 	}
 	for _, k := range required {
 		if _, ok := got[k]; !ok {
@@ -284,12 +285,85 @@ func TestStatusJSON_HasLockedSchemaKeys(t *testing.T) {
 
 	// Empty arrays render as [] not null.
 	for _, k := range []string{"suites", "hot_url_paths",
-		"recent_adoptions", "active_hosts", "listeners"} {
+		"recent_adoptions", "active_hosts", "listeners", "keyring"} {
 		v := got[k]
 		if v == nil {
 			t.Errorf("%q is null; want [] (encoding/json renders empty slices as []) — schema says arrays are always arrays", k)
 		}
 	}
+}
+
+// TestStatusJSON_KeyringPopulates confirms the keyring section
+// surfaces fingerprint + UID + source attribution when a
+// KeyringProvider is wired into admin.Config.
+func TestStatusJSON_KeyringPopulates(t *testing.T) {
+	provider := &stubKeyringProvider{
+		entries: []KeyringEntrySnapshot{
+			{
+				PrimaryFingerprint: "F6ECB3762474EDA9D21B7022871920D1991BC93C",
+				PrimaryUID:         "Ubuntu Archive Automatic Signing Key (2018) <ftpmaster@ubuntu.com>",
+				SourcePath:         "embedded:ubuntu-archive-keyring.gpg",
+				SubkeyFingerprints: nil,
+			},
+			{
+				PrimaryFingerprint: "AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555",
+				PrimaryUID:         "Test Subkey Key <t@example.com>",
+				SourcePath:         "/etc/apt/keyrings/test.gpg",
+				SubkeyFingerprints: []string{"FFFF9999AAAA8888BBBB7777CCCC6666DDDD5555"},
+			},
+		},
+	}
+	_, base, cleanup := startAdminServer(t, func(cfg *Config) { cfg.Keyring = provider })
+	defer cleanup()
+
+	resp := mustGet(t, base+"/?format=json")
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v\nbody: %s", err, body)
+	}
+	kr, ok := got["keyring"].([]any)
+	if !ok {
+		t.Fatalf("keyring is not a JSON array: %T", got["keyring"])
+	}
+	if len(kr) != 2 {
+		t.Fatalf("keyring length = %d, want 2", len(kr))
+	}
+	// Entries are sorted by primary fingerprint — AAAA… comes
+	// before F6EC….
+	first, _ := kr[0].(map[string]any)
+	if got, want := first["primary_fingerprint"], "AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555"; got != want {
+		t.Errorf("first entry primary_fingerprint = %v, want %v", got, want)
+	}
+	if got := first["source_path"]; got != "/etc/apt/keyrings/test.gpg" {
+		t.Errorf("first entry source_path = %v", got)
+	}
+	subs, _ := first["subkey_fingerprints"].([]any)
+	if len(subs) != 1 || subs[0] != "FFFF9999AAAA8888BBBB7777CCCC6666DDDD5555" {
+		t.Errorf("first entry subkey_fingerprints = %v", subs)
+	}
+	second, _ := kr[1].(map[string]any)
+	if got, want := second["source_path"], "embedded:ubuntu-archive-keyring.gpg"; got != want {
+		t.Errorf("second entry source_path = %v, want %v", got, want)
+	}
+	// Entries with no subkeys still emit an empty array (schema:
+	// subkey_fingerprints is always present).
+	secondSubs, ok := second["subkey_fingerprints"].([]any)
+	if !ok {
+		t.Errorf("second entry subkey_fingerprints not present or wrong type: %T", second["subkey_fingerprints"])
+	} else if len(secondSubs) != 0 {
+		t.Errorf("second entry subkey_fingerprints = %v, want []", secondSubs)
+	}
+}
+
+// stubKeyringProvider is a fixed-value KeyringProvider for tests.
+type stubKeyringProvider struct {
+	entries []KeyringEntrySnapshot
+}
+
+func (s *stubKeyringProvider) KeyringSnapshot() []KeyringEntrySnapshot {
+	return s.entries
 }
 
 // TestStatusJSON_CachePopulatesAfterSeed verifies the cache.* block

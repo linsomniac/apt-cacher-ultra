@@ -341,8 +341,11 @@ fingerprints         = ['F6ECB3762474EDA9D21B7022871920D1991BC93C']
 Phase 1 validation (SPEC §5.2) carries forward. Phase 2 adds:
 
 - `freshness.max_concurrent_adoptions` is integer, ≥ 0.
-- `adoption.enabled`, `adoption.require_signature`, and
-  `adoption.require_pinned_signer` are bool.
+- `adoption.enabled`, `adoption.require_signature`,
+  `adoption.require_pinned_signer`, and `adoption.allow_short_keyid`
+  are bool.
+- `adoption.keyring_dirs` is a list of absolute directory paths;
+  nonexistent paths are silently skipped at load.
 - `integrity.validate_at_rest_interval` parses as duration, ≥ 0.
 - `integrity.validate_at_rest_workers` is integer, ≥ 1 (when interval > 0).
 - Each `[[trusted_signer]]` entry:
@@ -795,11 +798,17 @@ members the archive serves under a different prefix.
 #### 7.6.1 Trust set
 
 At startup the cache constructs an in-memory keyring by reading every
-file under `/etc/apt/trusted.gpg.d/` and `/etc/apt/keyrings/` that is
-either a binary keyring (`*.gpg`) or an ASCII-armored keyring (`*.asc`).
-Files that fail to parse are logged at WARN and skipped — the cache
-proceeds with whatever subset parsed cleanly. An empty resulting keyring
-is a startup error iff `adoption.enabled = true` AND
+file under `/etc/apt/trusted.gpg.d/`, `/etc/apt/keyrings/`,
+`/usr/share/keyrings/`, and every additional directory operators list
+in `adoption.keyring_dirs`. Files that fail to parse are logged at
+WARN and skipped — the cache proceeds with whatever subset parsed
+cleanly. Canonical Ubuntu, Debian, and Ubuntu Pro ESM archive keys are
+additionally baked into the binary via `go:embed` and load alongside
+whatever is found on disk; the `embedded:<filename>` source path on
+the admin status page distinguishes them from operator-staged keys.
+On-disk keys take precedence over the bundled copy when the same
+primary fingerprint appears in both. An empty resulting keyring is a
+startup error iff `adoption.enabled = true` AND
 `adoption.require_signature = true`.
 
 For each `[[trusted_signer]]` block, the cache compiles the regex and
@@ -853,9 +862,18 @@ parsing.
 
 A signature is valid iff:
 - The signing key is in `trust_set`.
-- The signature's `Issuer Fingerprint` matches a key in `trust_set`
-  (long-form fingerprints; short key-id matches are insufficient and
-  rejected).
+- The signature's `Issuer Fingerprint` (subpacket 33) matches a key in
+  `trust_set`. When `adoption.allow_short_keyid = true` (the default,
+  matching apt's broad behavior), signatures that omit the
+  `Issuer Fingerprint` subpacket and carry only the legacy 8-byte
+  `Issuer Key ID` (subpacket 16) are accepted iff the key id maps to
+  exactly one key in `trust_set`; the matched key is used as the
+  cryptographic anchor and a single `adoption_short_keyid_fallback`
+  INFO line is emitted per (canonical_host, suite_path) per process
+  so operators can inventory affected repositories. Operators that
+  prefer the stricter posture set `allow_short_keyid = false`, which
+  reverts to the original rule that short-key-id-only signatures are
+  insufficient and rejected.
 - The signing key is not expired or revoked at the time of verification.
 - The signature is cryptographically valid.
 

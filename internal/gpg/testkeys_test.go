@@ -270,3 +270,28 @@ func assembleClearsignedBlock(plaintext, sigPackets []byte) ([]byte, error) {
 }
 
 var errInvalidFixture = fmt.Errorf("test fixture: clearsign.Decode returned nil")
+
+// clearsignWithoutIssuerFingerprint signs plaintext using e but
+// suppresses the IssuerFingerprint subpacket (33) so the resulting
+// clearsigned block carries only the legacy 8-byte issuer keyid in
+// subpacket 16. Real-world third-party signers (notably Docker,
+// Microsoft) still publish InRelease bodies in this shape; the
+// fixture lets the AllowShortKeyID tests exercise the SPEC2 §7.6.3
+// fallback path against a cryptographically valid signature.
+//
+// Implementation: openpgp.Signature.Sign reads
+// `priv.PublicKey.Fingerprint` and `priv.PublicKey.KeyId` directly
+// into `sig.IssuerFingerprint` / `sig.IssuerKeyId`. By temporarily
+// clearing PublicKey.Fingerprint before clearsign.Encode runs, the
+// signing path emits a signature whose `IssuerFingerprint` is nil
+// and whose hashed-subpackets area does not include subpacket 33 —
+// so the digest is computed over (and verified against) bytes that
+// genuinely lack the long-form fingerprint. KeyId remains the
+// already-computed 8-byte short id, preserving subpacket 16.
+func clearsignWithoutIssuerFingerprint(t *testing.T, e *openpgp.Entity, plaintext []byte) []byte {
+	t.Helper()
+	origFP := e.PrimaryKey.Fingerprint
+	e.PrimaryKey.Fingerprint = nil
+	defer func() { e.PrimaryKey.Fingerprint = origFP }()
+	return clearsignWith(t, e, plaintext)
+}

@@ -174,6 +174,27 @@ type AdoptionConfig struct {
 	// adoption; non-arch members (Release.gpg, Contents-*, i18n) are
 	// not subject to the filter. Validated against architectureNameRE.
 	Architectures []string `toml:"architectures"`
+
+	// KeyringDirs lists extra directories the keyring loader scans
+	// for *.gpg and *.asc files at startup, in addition to the
+	// built-in defaults (/etc/apt/trusted.gpg.d, /etc/apt/keyrings,
+	// /usr/share/keyrings) and the canonical archive keys baked into
+	// the binary. Nonexistent paths are silently skipped. Empty
+	// (default) keeps only the defaults; supply this when an
+	// operator stages keys outside the standard apt locations.
+	KeyringDirs []string `toml:"keyring_dirs"`
+
+	// AllowShortKeyID toggles the SPEC2 §7.6.3 fallback for signatures
+	// that omit the IssuerFingerprint subpacket and carry only the
+	// legacy 8-byte issuer keyid. Default true (matches apt's broad
+	// behavior — real-world signers like Docker and Microsoft still
+	// publish InRelease bodies without the long-form fingerprint).
+	// Set false for the stricter posture: short-keyid-only signatures
+	// are rejected with adoption_gpg_failed regardless of whether the
+	// keyid maps to a loaded key. Each (host, suite) pair logs one
+	// INFO line the first time the fallback accepts a signature, so
+	// operators can inventory which repos depend on it.
+	AllowShortKeyID bool `toml:"allow_short_keyid"`
 }
 
 // HotPackagesConfig holds the SPEC3 §5.1 [hot_packages] block. The hot
@@ -616,6 +637,7 @@ func defaultConfig() *Config {
 		},
 		Adoption: AdoptionConfig{
 			RequireSignature: true,
+			AllowShortKeyID:  true,
 		},
 		GC: GCConfig{
 			// SPEC4 §5.1: gc.enabled defaults true. Bool fields must

@@ -31,21 +31,61 @@ func withKeyringDirs(t *testing.T, dirs []string) {
 	t.Cleanup(func() { keyringDirs = prev })
 }
 
+// withoutEmbeddedKeys suppresses the canonical archive keys baked into
+// the binary for one test, so a tempdir keyringDirs override actually
+// represents the full keyring the loader will see. Tests must NOT
+// call t.Parallel().
+func withoutEmbeddedKeys(t *testing.T) {
+	t.Helper()
+	prev := keyringEmbeddedSources
+	keyringEmbeddedSources = nil
+	t.Cleanup(func() { keyringEmbeddedSources = prev })
+}
+
 func TestBuildAdopter_EmptyKeyring_RequireSignatureTrue_Errors(t *testing.T) {
 	// SPEC2 §7.6.1: empty keyring + require_signature=true is a
 	// startup error. Misconfiguration here would silently disable
 	// adoption — operators wouldn't see why their suites never
 	// adopted. This is a stealth security regression we want loud.
+	//
+	// We suppress the bundled canonical archive keys for this test:
+	// without that, the keyring is never truly empty in production
+	// builds (the embedded set always parses). The "empty disk +
+	// no embed" path remains a real configuration shape for
+	// minimal builds and stripped binaries, so the guard still
+	// matters.
 	withKeyringDirs(t, []string{t.TempDir()})
+	withoutEmbeddedKeys(t)
 
 	cfg := newAdoptionEnabledCfg(t, true /* requireSignature */)
 	c, fetcher, hosts := newAdoptionWiringDeps(t)
-	_, err := buildAdopter(cfg, c, fetcher, hosts, silentBuildLogger())
+	_, _, err := buildAdopter(cfg, c, fetcher, hosts, silentBuildLogger())
 	if err == nil {
 		t.Fatal("expected error for empty keyring + require_signature=true")
 	}
 	if !strings.Contains(err.Error(), "keyring is empty") {
 		t.Fatalf("error doesn't mention empty keyring: %v", err)
+	}
+}
+
+// TestBuildAdopter_BundledKeysSatisfyRequireSignature confirms the
+// new default behavior: even with an empty on-disk keyring, the
+// canonical Ubuntu/Debian/ESM archive keys baked into the binary
+// satisfy require_signature=true and adoption starts cleanly.
+func TestBuildAdopter_BundledKeysSatisfyRequireSignature(t *testing.T) {
+	withKeyringDirs(t, []string{t.TempDir()})
+
+	cfg := newAdoptionEnabledCfg(t, true /* requireSignature */)
+	c, fetcher, hosts := newAdoptionWiringDeps(t)
+	a, k, err := buildAdopter(cfg, c, fetcher, hosts, silentBuildLogger())
+	if err != nil {
+		t.Fatalf("buildAdopter: %v", err)
+	}
+	if a == nil {
+		t.Fatal("nil Adopter on success path")
+	}
+	if k == nil || k.Empty() {
+		t.Fatal("expected bundled keys to populate keyring")
 	}
 }
 
@@ -57,7 +97,7 @@ func TestBuildAdopter_EmptyKeyring_RequireSignatureFalse_OK(t *testing.T) {
 
 	cfg := newAdoptionEnabledCfg(t, false /* requireSignature */)
 	c, fetcher, hosts := newAdoptionWiringDeps(t)
-	a, err := buildAdopter(cfg, c, fetcher, hosts, silentBuildLogger())
+	a, _, err := buildAdopter(cfg, c, fetcher, hosts, silentBuildLogger())
 	if err != nil {
 		t.Fatalf("buildAdopter: %v", err)
 	}
@@ -73,12 +113,15 @@ func TestBuildAdopter_PopulatedKeyring_RequireSignatureTrue_OK(t *testing.T) {
 
 	cfg := newAdoptionEnabledCfg(t, true)
 	c, fetcher, hosts := newAdoptionWiringDeps(t)
-	a, err := buildAdopter(cfg, c, fetcher, hosts, silentBuildLogger())
+	a, k, err := buildAdopter(cfg, c, fetcher, hosts, silentBuildLogger())
 	if err != nil {
 		t.Fatalf("buildAdopter: %v", err)
 	}
 	if a == nil {
 		t.Fatal("nil Adopter on success path")
+	}
+	if k == nil || k.Empty() {
+		t.Fatal("expected non-empty keyring on success path")
 	}
 }
 
@@ -95,7 +138,7 @@ func TestBuildAdopter_TrustedSignerCompiled(t *testing.T) {
 		Fingerprints:       []string{"DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF"},
 	}}
 	c, fetcher, hosts := newAdoptionWiringDeps(t)
-	if _, err := buildAdopter(cfg, c, fetcher, hosts, silentBuildLogger()); err != nil {
+	if _, _, err := buildAdopter(cfg, c, fetcher, hosts, silentBuildLogger()); err != nil {
 		t.Fatalf("buildAdopter with one [[trusted_signer]]: %v", err)
 	}
 }

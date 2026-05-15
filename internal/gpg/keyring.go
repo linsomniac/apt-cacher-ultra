@@ -23,19 +23,34 @@ import (
 )
 
 // Standard apt keyring directories. Modern apt installs split trust
-// between the legacy /etc/apt/trusted.gpg.d/ (whole-archive trust) and
-// /etc/apt/keyrings/ (Signed-By: per-source trust). SPEC2 §7.6.1
-// directs us to read both.
+// between the legacy /etc/apt/trusted.gpg.d/ (whole-archive trust),
+// /etc/apt/keyrings/ (Signed-By: per-source trust), and
+// /usr/share/keyrings/ (distribution-shipped canonical keys). SPEC2
+// §7.6.1 directs us to read all three.
 const (
-	DefaultTrustedGPGDir = "/etc/apt/trusted.gpg.d"
-	DefaultKeyringsDir   = "/etc/apt/keyrings"
+	DefaultTrustedGPGDir   = "/etc/apt/trusted.gpg.d"
+	DefaultKeyringsDir     = "/etc/apt/keyrings"
+	DefaultSharedKeyingDir = "/usr/share/keyrings"
 )
+
+// KeyringEntry is one loaded entity with its source attribution.
+// SourcePath is either an absolute file path on disk, or the
+// pseudo-path "embedded:<name>" for keys baked into the binary via
+// EmbeddedSource. Exposed for the admin status page.
+type KeyringEntry struct {
+	Entity             *openpgp.Entity
+	PrimaryFingerprint string   // uppercase 40-char hex
+	PrimaryUID         string   // first user ID (may be empty)
+	SourcePath         string   // file path or "embedded:<name>"
+	SubkeyFingerprints []string // uppercase 40-char hex per subkey
+}
 
 // Keyring is the union of all trusted-key entities loaded at startup.
 // The fingerprint set covers every loaded entity's primary key plus
 // every subkey, so subset narrowing (per-suite trust set) can match on
 // either.
 type Keyring struct {
+	entries  []KeyringEntry
 	entities openpgp.EntityList
 
 	// fingerprints is the set of uppercase 40-char hex fingerprints of
@@ -63,6 +78,15 @@ func (k *Keyring) HasFingerprint(fp string) bool {
 // Caller must not mutate.
 func (k *Keyring) EntityList() openpgp.EntityList { return k.entities }
 
+// Entries returns a copy of the loaded keyring entries with source
+// attribution. Safe for the caller to mutate the returned slice
+// header; the embedded Entity pointers must not be mutated.
+func (k *Keyring) Entries() []KeyringEntry {
+	out := make([]KeyringEntry, len(k.entries))
+	copy(out, k.entries)
+	return out
+}
+
 // Subset returns the entities whose primary key OR any subkey
 // fingerprint is in fps (uppercase). This is the SPEC2 §7.6.2
 // host-keyring narrowing: a [[trusted_signer]] block declares
@@ -79,6 +103,26 @@ func (k *Keyring) Subset(fps map[string]struct{}) openpgp.EntityList {
 		}
 	}
 	return out
+}
+
+// FindByIssuerKeyID returns the first loaded entity whose primary key
+// or any subkey has the given 8-byte short keyid. Returns nil when no
+// match exists. Used by the verifier's allow_short_keyid fallback
+// path (SPEC2 §7.6.3) — a signature packet with no IssuerFingerprint
+// subpacket carries only the 8-byte short key id, which is matched
+// against the loaded keyring to recover the long-form fingerprint.
+func (k *Keyring) FindByIssuerKeyID(keyID uint64) *openpgp.Entity {
+	for _, e := range k.entities {
+		if e.PrimaryKey != nil && e.PrimaryKey.KeyId == keyID {
+			return e
+		}
+		for _, sub := range e.Subkeys {
+			if sub.PublicKey != nil && sub.PublicKey.KeyId == keyID {
+				return e
+			}
+		}
+	}
+	return nil
 }
 
 func entityHasAnyFingerprint(e *openpgp.Entity, fps map[string]struct{}) bool {
@@ -105,22 +149,67 @@ func upperFP(b []byte) string { return strings.ToUpper(hex.EncodeToString(b)) }
 // adoption.require_signature.
 //
 // dirs that do not exist are quietly skipped; this matches the
-// expectation that a fresh deployment may have only one of the two
+// expectation that a fresh deployment may have only a subset of the
 // standard paths populated.
+//
+// Equivalent to LoadKeyringWithEmbedded(dirs, nil, logger).
 func LoadKeyring(dirs []string, logger *slog.Logger) (*Keyring, error) {
+	return LoadKeyringWithEmbedded(dirs, nil, logger)
+}
+
+// LoadKeyringWithEmbedded extends LoadKeyring by also merging in
+// keys baked into the binary as EmbeddedSource entries. On-disk dirs
+// load first (in slice order); embedded sources load last. Dedup is
+// by primary-key fingerprint, first-seen wins — so a key present on
+// disk takes precedence over the bundled copy of the same key, and
+// its SourcePath in the resulting Entries reflects the disk path the
+// operator actually staged.
+func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *slog.Logger) (*Keyring, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	// AIDEV-NOTE: dedupe by primary-key fingerprint. apt's two
-	// keyring directories overlap (operators sometimes symlink
-	// keys into both), and the same key bytes parsed twice as
-	// distinct *Entity values would be picked twice by openpgp's
-	// signature verification — wasted work, not a correctness bug,
-	// but we filter at load time anyway.
+	// AIDEV-NOTE: dedupe by primary-key fingerprint. apt's keyring
+	// directories overlap (operators sometimes symlink keys into
+	// multiple paths) and the embedded set can overlap with disk
+	// copies; the same key bytes parsed twice as distinct *Entity
+	// values would be picked twice by openpgp's signature
+	// verification — wasted work, not a correctness bug, but we
+	// filter at load time anyway.
 	seen := make(map[string]struct{})
-	var entities openpgp.EntityList
+	var entries []KeyringEntry
 	fingerprints := make(map[string]struct{})
+
+	addEntities := func(parsed openpgp.EntityList, source string) {
+		for _, e := range parsed {
+			if e == nil || e.PrimaryKey == nil {
+				continue
+			}
+			fp := upperFP(e.PrimaryKey.Fingerprint)
+			if _, dup := seen[fp]; dup {
+				continue
+			}
+			seen[fp] = struct{}{}
+
+			subFPs := make([]string, 0, len(e.Subkeys))
+			fingerprints[fp] = struct{}{}
+			for _, sub := range e.Subkeys {
+				if sub.PublicKey != nil {
+					subFP := upperFP(sub.PublicKey.Fingerprint)
+					fingerprints[subFP] = struct{}{}
+					subFPs = append(subFPs, subFP)
+				}
+			}
+
+			entries = append(entries, KeyringEntry{
+				Entity:             e,
+				PrimaryFingerprint: fp,
+				PrimaryUID:         firstUID(e),
+				SourcePath:         source,
+				SubkeyFingerprints: subFPs,
+			})
+		}
+	}
 
 	for _, dir := range dirs {
 		if dir == "" {
@@ -136,7 +225,7 @@ func LoadKeyring(dirs []string, logger *slog.Logger) (*Keyring, error) {
 			continue
 		}
 
-		entries, err := os.ReadDir(dir)
+		dirEntries, err := os.ReadDir(dir)
 		if err != nil {
 			logger.Warn("keyring: read dir failed",
 				"dir", dir,
@@ -144,7 +233,7 @@ func LoadKeyring(dirs []string, logger *slog.Logger) (*Keyring, error) {
 			)
 			continue
 		}
-		for _, ent := range entries {
+		for _, ent := range dirEntries {
 			if ent.IsDir() {
 				continue
 			}
@@ -162,30 +251,45 @@ func LoadKeyring(dirs []string, logger *slog.Logger) (*Keyring, error) {
 				)
 				continue
 			}
-			for _, e := range parsed {
-				if e == nil || e.PrimaryKey == nil {
-					continue
-				}
-				fp := upperFP(e.PrimaryKey.Fingerprint)
-				if _, dup := seen[fp]; dup {
-					continue
-				}
-				seen[fp] = struct{}{}
-				entities = append(entities, e)
-				fingerprints[fp] = struct{}{}
-				for _, sub := range e.Subkeys {
-					if sub.PublicKey != nil {
-						fingerprints[upperFP(sub.PublicKey.Fingerprint)] = struct{}{}
-					}
-				}
-			}
+			addEntities(parsed, path)
 		}
 	}
 
+	for _, es := range embedded {
+		parsed, err := parseKeyringBytes(es.Data)
+		if err != nil {
+			logger.Warn("keyring: parse embedded failed; skipping",
+				"name", es.Name,
+				"err", err,
+			)
+			continue
+		}
+		addEntities(parsed, "embedded:"+es.Name)
+	}
+
+	entities := make(openpgp.EntityList, 0, len(entries))
+	for _, e := range entries {
+		entities = append(entities, e.Entity)
+	}
+
 	return &Keyring{
+		entries:      entries,
 		entities:     entities,
 		fingerprints: fingerprints,
 	}, nil
+}
+
+// firstUID returns the entity's first user-id identity string
+// ("Name <email>"), or "" when the entity carries no UIDs. UIDs
+// surface on the admin status page so operators can recognise which
+// key is loaded without having to look up a fingerprint.
+func firstUID(e *openpgp.Entity) string {
+	for _, id := range e.Identities {
+		if id != nil {
+			return id.Name
+		}
+	}
+	return ""
 }
 
 // parseKeyringFile reads one keyring file. The decoder probes the
@@ -197,28 +301,41 @@ func parseKeyringFile(path string) (openpgp.EntityList, error) {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
+	return parseKeyringReader(f)
+}
 
-	// Buffer enough of the file head to detect armor and rewind
-	// without seeking (works on any io.Reader if needed).
+// parseKeyringBytes parses an in-memory keyring blob (used for
+// embedded sources). Same armor-probe behavior as parseKeyringFile.
+func parseKeyringBytes(b []byte) (openpgp.EntityList, error) {
+	return parseKeyringReader(bytes.NewReader(b))
+}
+
+func parseKeyringReader(r io.Reader) (openpgp.EntityList, error) {
+	// Buffer enough of the head to detect armor and rewind without
+	// seeking (works on any io.Reader if needed).
 	head := make([]byte, 64)
-	n, err := io.ReadFull(f, head)
+	n, err := io.ReadFull(r, head)
 	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("read head: %w", err)
 	}
 	head = head[:n]
 
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("rewind: %w", err)
+	if seeker, ok := r.(io.Seeker); ok {
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("rewind: %w", err)
+		}
+	} else {
+		r = io.MultiReader(bytes.NewReader(head), r)
 	}
 
 	if bytes.Contains(head, []byte("-----BEGIN PGP")) {
-		entities, err := openpgp.ReadArmoredKeyRing(f)
+		entities, err := openpgp.ReadArmoredKeyRing(r)
 		if err != nil {
 			return nil, fmt.Errorf("armored: %w", err)
 		}
 		return entities, nil
 	}
-	entities, err := openpgp.ReadKeyRing(f)
+	entities, err := openpgp.ReadKeyRing(r)
 	if err != nil {
 		return nil, fmt.Errorf("binary: %w", err)
 	}
