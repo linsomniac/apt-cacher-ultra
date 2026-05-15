@@ -377,6 +377,83 @@ func TestVerdictExplanation(t *testing.T) {
 	if got := verdictExplanation(degraded); !contains(got, "Degraded") {
 		t.Errorf("verdictExplanation(degraded) = %q; want 'Degraded'", got)
 	}
+
+	// §5.1.1: adoption enabled + zero keys is a crit signal that must
+	// flip the noscript verdict away from "nominal".
+	keyringEmptyEnabled := healthy
+	keyringEmptyEnabled.AdoptionEnabled = true
+	keyringEmptyEnabled.Keyring = nil
+	if got := verdictExplanation(keyringEmptyEnabled); !contains(got, "Degraded") {
+		t.Errorf("verdictExplanation(adoption-enabled+no-keys) = %q; want 'Degraded'", got)
+	}
+
+	// Adoption disabled + empty keyring is the operator's choice and
+	// must NOT push the verdict away from nominal.
+	keyringEmptyDisabled := healthy
+	keyringEmptyDisabled.AdoptionEnabled = false
+	keyringEmptyDisabled.Keyring = nil
+	if got := verdictExplanation(keyringEmptyDisabled); !contains(got, "nominal") {
+		t.Errorf("verdictExplanation(adoption-disabled+no-keys) = %q; want 'nominal'", got)
+	}
+}
+
+func TestKeyringCrit(t *testing.T) {
+	cases := []struct {
+		name    string
+		enabled bool
+		keys    []keyringEntry
+		want    bool
+	}{
+		{"disabled_no_keys", false, nil, false},
+		{"disabled_with_keys", false, []keyringEntry{{}}, false},
+		{"enabled_no_keys", true, nil, true},
+		{"enabled_empty_slice", true, []keyringEntry{}, true},
+		{"enabled_with_keys", true, []keyringEntry{{}}, false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			m := htmlRenderModel{
+				statusModel:     statusModel{Keyring: c.keys},
+				AdoptionEnabled: c.enabled,
+			}
+			if got := keyringCrit(m); got != c.want {
+				t.Errorf("keyringCrit(enabled=%v, keys=%d) = %v; want %v", c.enabled, len(c.keys), got, c.want)
+			}
+		})
+	}
+}
+
+// fakeKeyringProvider lets the tests exercise both the
+// adoption-disabled (nil snapshot) and adoption-enabled (non-nil
+// possibly-empty snapshot) branches of buildHTMLRenderModel.
+type fakeKeyringProvider struct {
+	snap []KeyringEntrySnapshot
+}
+
+func (f *fakeKeyringProvider) KeyringSnapshot() []KeyringEntrySnapshot { return f.snap }
+
+func TestBuildHTMLRenderModelAdoptionDetection(t *testing.T) {
+	cases := []struct {
+		name     string
+		provider KeyringProvider
+		want     bool
+	}{
+		{"no_provider_disabled", nil, false},
+		{"provider_nil_snapshot_disabled", &fakeKeyringProvider{snap: nil}, false},
+		{"provider_empty_slice_enabled", &fakeKeyringProvider{snap: []KeyringEntrySnapshot{}}, true},
+		{"provider_with_entries_enabled", &fakeKeyringProvider{snap: []KeyringEntrySnapshot{{PrimaryFingerprint: "x"}}}, true},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			s := &Server{cfg: Config{Keyring: c.provider}}
+			w := s.buildHTMLRenderModel(statusModel{})
+			if w.AdoptionEnabled != c.want {
+				t.Errorf("AdoptionEnabled = %v; want %v", w.AdoptionEnabled, c.want)
+			}
+		})
+	}
 }
 
 func contains(haystack, needle string) bool {

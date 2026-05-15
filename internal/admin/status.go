@@ -681,10 +681,21 @@ func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
 // from the wire-shaped statusModel plus the bits of server config the
 // HTML template needs but the JSON contract intentionally does not
 // expose. JSON path never calls this.
+//
+// AIDEV-NOTE: AdoptionEnabled — the spec hint at §0.7 says
+// `cfg.Keyring != nil at server build time`, but in production the cmd
+// entry point always passes a non-nil KeyringProvider whose snapshot is
+// nil when adoption is disabled (see cmd/apt-cacher-ultra/main.go
+// keyringProvider adapter). §2.3 forbids editing cmd and admin/server.go
+// to add an explicit AdoptionEnabled field, so the wrapper uses the
+// snapshot-nil convention as the operator-facing signal: a nil snapshot
+// means "no keyring wired at all" → adoption disabled, while a non-nil
+// (possibly empty) slice means "adoption enabled, keys may not be loaded
+// yet". See .phase-loop-notes.md "Spec issues" for the followup.
 func (s *Server) buildHTMLRenderModel(m statusModel) htmlRenderModel {
-	w := htmlRenderModel{
-		statusModel:     m,
-		AdoptionEnabled: s.cfg.Keyring != nil,
+	w := htmlRenderModel{statusModel: m}
+	if s.cfg.Keyring != nil && s.cfg.Keyring.KeyringSnapshot() != nil {
+		w.AdoptionEnabled = true
 	}
 	if s.cfg.GC != nil {
 		w.GCIntervalSeconds = s.cfg.GC.Interval().Seconds()
@@ -1275,6 +1286,14 @@ func vitalState(kind string, m htmlRenderModel) string {
 	}
 }
 
+// keyringCrit reports whether the keyring panel is in the §5.1.1 / §8.1
+// "adoption enabled but no keys loaded" critical condition. Mirrors the
+// JS verdict's keys-chip read so the noscript fallback stays consistent
+// with the live pill.
+func keyringCrit(m htmlRenderModel) bool {
+	return m.AdoptionEnabled && len(m.Keyring) == 0
+}
+
 // verdictExplanation produces the server-side fallback verdict string
 // emitted inside <noscript> per docs/admin-ui-spec.md §8.1 — when JS is
 // off, the live JS-computed pill never runs, and this string is what the
@@ -1283,7 +1302,10 @@ func vitalState(kind string, m htmlRenderModel) string {
 //
 // The output mirrors §9.2's verdict order (crit → watching → warming-up
 // → healthy) collapsed into one sentence; the per-cell badges below
-// carry the specific diagnostic.
+// carry the specific diagnostic. Keyring crit (§5.1.1: adoption enabled
+// with no keys loaded) is folded into the crit count so the noscript
+// verdict cannot say "nominal" while the keyring chip would be tinted
+// red under JS.
 func verdictExplanation(m htmlRenderModel) string {
 	cells := []string{"cache", "suites", "adoptions", "gc", "active"}
 	crit, watching := 0, 0
@@ -1295,8 +1317,11 @@ func verdictExplanation(m htmlRenderModel) string {
 			watching++
 		}
 	}
+	if keyringCrit(m) {
+		crit++
+	}
 	if crit > 0 {
-		return fmt.Sprintf("Degraded — %d of %d vital cells in critical state; see badges below.", crit, len(cells))
+		return fmt.Sprintf("Degraded — %d signal(s) in critical state; see badges below.", crit)
 	}
 	if watching > 0 {
 		return fmt.Sprintf("Watching — %d of %d vital cells elevated; see badges below.", watching, len(cells))
