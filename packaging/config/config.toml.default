@@ -79,12 +79,12 @@ require_pinned_signer = false
 allow_short_keyid     = true
 
 # Extra directories the keyring loader scans at startup, on top of
-# the built-in defaults: /etc/apt/trusted.gpg.d and /etc/apt/keyrings.
-# Paths must be absolute; nonexistent paths are silently skipped.
-# /usr/share/keyrings is intentionally NOT scanned by default — it
-# commonly holds per-repository Signed-By keys whose scope is a
-# single apt source, not whole-archive trust. Opt in by listing it
-# here when you want those keys treated as broadly trusted.
+# the built-in defaults: /etc/apt/trusted.gpg.d, /etc/apt/keyrings,
+# and /usr/share/keyrings. Paths must be absolute; nonexistent paths
+# are silently skipped. All three default directories are scanned so
+# adoption verifies third-party repos (Microsoft, Confluent, Docker)
+# whose signing keys are conventionally installed under
+# /usr/share/keyrings via per-source Signed-By directives.
 # In addition, canonical Ubuntu, Debian, and Ubuntu Pro ESM archive
 # keys are baked into the binary and load alongside whatever is
 # found on disk — apt-cacher-ultra ships with usable trust for stock

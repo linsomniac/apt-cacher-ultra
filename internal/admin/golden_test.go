@@ -253,6 +253,66 @@ func TestGoldenKeyringFull(t *testing.T) {
 	)
 }
 
+// TestKeyringUIDDoesNotOverflowSource guards the User-ID-column
+// overflow regression observed in 0.9.2 (screenshot adm3.png). The
+// original bug combined `.uid {max-width:38ch}` with the nowrap
+// inheritance from `<td>{white-space:nowrap}`: the box was capped
+// at 38ch but its content couldn't wrap, so names/emails wider
+// than 38ch spilled horizontally into the Source column. A first
+// fix that allowed `.uid` to wrap misbehaved differently —
+// `table-layout:auto` shrunk the only wrappable column when the
+// table didn't fit, producing 12-line-tall UID cells next to
+// single-line neighbors even though `.table-wrap{overflow-x:auto}`
+// could have scrolled. The shipped fix drops max-width entirely
+// and lets `.uid` inherit nowrap, so the cell grows to fit
+// single-line content and the table-wrap scrolls horizontally
+// when needed.
+//
+// The invariant this test enforces: `.uid` must not bound its
+// width unless it ALSO opts back into wrapping. If a future
+// contributor re-adds `max-width:` without `white-space:normal`,
+// the cell-overflow bug returns immediately.
+func TestKeyringUIDDoesNotOverflowSource(t *testing.T) {
+	html := renderHTMLForGolden(t, newHealthyModel())
+
+	body := extractCSSRule(t, html, ".uid")
+	hasMaxWidth := strings.Contains(body, "max-width:")
+	hasWrap := strings.Contains(body, "white-space:normal") ||
+		strings.Contains(body, "white-space: normal")
+	if hasMaxWidth && !hasWrap {
+		t.Errorf(".uid CSS bounds width without allowing wrap; content longer than the cap will overflow into the Source column. rule body: %q", body)
+	}
+
+	// Every keyring row must surface the canonical UID via the
+	// title attribute so operators can hover-inspect the full
+	// `Name (comment) <email>` even when the cell is narrow.
+	uidSpans := strings.Count(html, `<span class="uid"`)
+	titledSpans := strings.Count(html, `<span class="uid" title=`)
+	if uidSpans == 0 {
+		t.Fatalf("healthy fixture rendered no .uid spans; keyring template regressed")
+	}
+	if titledSpans != uidSpans {
+		t.Errorf("want every .uid span to carry title=...; got %d titled of %d total", titledSpans, uidSpans)
+	}
+}
+
+// extractCSSRule returns the body of the first `<selector>{...}`
+// rule found in html. Fails the test if the rule is absent.
+func extractCSSRule(t *testing.T, html, selector string) string {
+	t.Helper()
+	needle := selector + "{"
+	i := strings.Index(html, needle)
+	if i < 0 {
+		t.Fatalf("could not find CSS rule %q in rendered HTML", selector)
+	}
+	start := i + len(needle)
+	end := strings.Index(html[start:], "}")
+	if end < 0 {
+		t.Fatalf("unterminated CSS rule %q in rendered HTML", selector)
+	}
+	return html[start : start+end]
+}
+
 // --- model fixture builders --------------------------------------------------
 
 func newHealthyModel() htmlRenderModel {

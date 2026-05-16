@@ -23,21 +23,27 @@ import (
 )
 
 // Standard apt keyring directories. Modern apt installs split trust
-// between the legacy /etc/apt/trusted.gpg.d/ (whole-archive trust)
-// and /etc/apt/keyrings/ (Signed-By: per-source trust). SPEC2 §7.6.1
-// directs us to read both.
+// across three on-disk locations:
+//   - /etc/apt/trusted.gpg.d/   (legacy whole-archive trust)
+//   - /etc/apt/keyrings/        (Signed-By: per-source trust)
+//   - /usr/share/keyrings/      (package-provided Signed-By: keys)
 //
-// We deliberately do NOT default-scan /usr/share/keyrings/: that
-// directory commonly carries per-repository keys whose intended
-// scope is a single apt source (via Signed-By:), not whole-archive
-// trust. Loading those by default would broaden trust beyond what
-// the operator staged with apt itself. Canonical Ubuntu/Debian/ESM
-// archive keys ship baked into the binary instead; operators who
-// want to scan /usr/share/keyrings or any other path opt in via
-// adoption.keyring_dirs.
+// SPEC2 §7.6.1 directs us to read all three so apt-cacher-ultra's
+// adoption-time trust set matches what apt itself effectively trusts
+// on the host. /usr/share/keyrings/ is broadly populated by distro
+// packages (e.g. microsoft-prod.gpg, signal-desktop-keyring.gpg,
+// docker, confluent) and pointed at by per-source Signed-By
+// directives; excluding it from the default scan would cause
+// adoption to fail with gpg_failed for any third-party repo whose
+// key lives there. Operators append further paths via the
+// adoption.keyring_dirs config setting. Canonical Ubuntu, Debian,
+// and Ubuntu Pro ESM archive keys are additionally baked into the
+// binary so a minimal host with unpopulated /etc/apt/ still has
+// usable trust for stock Debian/Ubuntu repositories.
 const (
-	DefaultTrustedGPGDir = "/etc/apt/trusted.gpg.d"
-	DefaultKeyringsDir   = "/etc/apt/keyrings"
+	DefaultTrustedGPGDir       = "/etc/apt/trusted.gpg.d"
+	DefaultKeyringsDir         = "/etc/apt/keyrings"
+	DefaultUsrShareKeyringsDir = "/usr/share/keyrings"
 )
 
 // KeyringEntry is one loaded entity with its source attribution.

@@ -798,22 +798,24 @@ members the archive serves under a different prefix.
 #### 7.6.1 Trust set
 
 At startup the cache constructs an in-memory keyring by reading every
-file under `/etc/apt/trusted.gpg.d/`, `/etc/apt/keyrings/`, and every
-additional directory operators list in `adoption.keyring_dirs`. Files
-that fail to parse are logged at WARN and skipped — the cache proceeds
-with whatever subset parsed cleanly. `/usr/share/keyrings/` is
-deliberately NOT default-scanned: that directory commonly carries
-per-repository `Signed-By:` keys whose intended scope is a single apt
-source rather than whole-archive trust, and default-broad-trust mode
-would let any key dropped there sign any adopted suite. Operators who
-need it can opt in via `keyring_dirs`. Canonical Ubuntu, Debian, and
-Ubuntu Pro ESM archive keys are additionally baked into the binary
-via `go:embed` and load alongside whatever is found on disk; the
-`embedded:<filename>` source path on the admin status page
-distinguishes them from operator-staged keys. On-disk keys take
-precedence over the bundled copy when the same primary fingerprint
-appears in both. An empty resulting keyring is a startup error iff
-`adoption.enabled = true` AND `adoption.require_signature = true`.
+file under `/etc/apt/trusted.gpg.d/`, `/etc/apt/keyrings/`,
+`/usr/share/keyrings/`, and every additional directory operators list
+in `adoption.keyring_dirs`. Files that fail to parse are logged at
+WARN and skipped — the cache proceeds with whatever subset parsed
+cleanly. All three apt trust directories participate in the
+broad-trust set so adoption verifies the third-party repos
+(Microsoft, Confluent, Docker on modern distros) whose signing keys
+ship in `/usr/share/keyrings/` and are referenced from sources by
+per-source `Signed-By:` directives; the security posture matches
+what apt itself effectively trusts on a typical Debian/Ubuntu host.
+Canonical Ubuntu, Debian, and Ubuntu Pro ESM archive keys are
+additionally baked into the binary via `go:embed` and load alongside
+whatever is found on disk; the `embedded:<filename>` source path on
+the admin status page distinguishes them from operator-staged keys.
+On-disk keys take precedence over the bundled copy when the same
+primary fingerprint appears in both. An empty resulting keyring is a
+startup error iff `adoption.enabled = true` AND
+`adoption.require_signature = true`.
 
 For each `[[trusted_signer]]` block, the cache compiles the regex and
 canonicalizes the fingerprint list (uppercase, no whitespace).

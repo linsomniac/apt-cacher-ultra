@@ -760,6 +760,34 @@ func statusTemplateFuncMap() template.FuncMap {
 		"vitalState":          vitalState,
 		"verdictExplanation":  verdictExplanation,
 		"add1":                func(n int) int { return n + 1 },
+		"splitUID":            splitUID,
+	}
+}
+
+// uidParts is the parsed shape of an OpenPGP user-id string, exposed
+// to the status template so the keyring panel can render the name and
+// the email on separate lines (per docs/admin-ui-mockup.html).
+type uidParts struct {
+	Name  string
+	Email string
+}
+
+// splitUID parses a UID of the form "Display Name (Comment) <local@domain>"
+// into its parts. UIDs without a trailing "<…>" segment return the whole
+// string as Name with Email = "". Leading/trailing whitespace on Name is
+// trimmed; the email is taken verbatim from inside the angle brackets.
+func splitUID(s string) uidParts {
+	s = strings.TrimSpace(s)
+	if !strings.HasSuffix(s, ">") {
+		return uidParts{Name: s}
+	}
+	i := strings.LastIndex(s, "<")
+	if i < 0 {
+		return uidParts{Name: s}
+	}
+	return uidParts{
+		Name:  strings.TrimSpace(s[:i]),
+		Email: strings.TrimSuffix(s[i+1:], ">"),
 	}
 }
 
@@ -863,7 +891,7 @@ section.panel{margin-bottom:48px;scroll-margin-top:calc(var(--bar-h) + 16px)}
 .panel__desc{font-size:var(--sm);color:var(--ink-4);margin:0 0 16px 0;max-width:64ch}
 .table-wrap{overflow-x:auto;border-top:1px solid var(--ink-2);border-bottom:1px solid var(--ink-2)}
 table.data{font-size:var(--sm);color:var(--ink-5)}
-table.data thead th{position:sticky;top:var(--bar-h);background:var(--ink-1);z-index:2;text-align:left;font-size:var(--xs);font-weight:500;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);padding:10px 14px;border-bottom:1px solid var(--ink-2);white-space:nowrap}
+table.data thead th{background:var(--ink-1);text-align:left;font-size:var(--xs);font-weight:500;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);padding:10px 14px;border-bottom:1px solid var(--ink-2);white-space:nowrap}
 table.data tbody td{padding:9px 14px;border-bottom:0;vertical-align:middle;white-space:nowrap}
 table.data tbody tr:nth-child(even){background:var(--row-tint)}
 table.data tbody tr:hover{background:var(--ink-1)}
@@ -897,7 +925,7 @@ table.data tr[data-state="crit"]:nth-child(even){background:var(--crit-tint)}
 .src-path{display:inline-block;margin-left:8px;font-family:var(--font-mono);font-size:11px;color:var(--ink-4)}
 .fp{display:inline-block;font-family:var(--font-mono);font-size:12px;letter-spacing:.02em;color:var(--ink-6);font-variant-numeric:tabular-nums;word-spacing:1px;white-space:nowrap}
 .fp--sub{color:var(--ink-4);font-size:11px}
-.uid{display:block;font-size:12.5px;color:var(--ink-6);max-width:38ch;line-height:1.4}
+.uid{display:block;font-size:12.5px;color:var(--ink-6);line-height:1.4}
 .uid__email{display:block;font-family:var(--font-mono);font-size:11px;color:var(--ink-4);margin-top:1px}
 .subkeys{display:flex;flex-direction:column;gap:4px}
 .subkeys--none{color:var(--ink-3);font-size:14px}
@@ -1180,10 +1208,10 @@ table.data tbody td::before{content:attr(data-label);font-size:10px;letter-spaci
               <th>Primary fingerprint</th><th>User ID</th><th>Source</th><th>Subkey fingerprints</th>
             </tr></thead>
             <tbody>
-            {{range .Keyring}}{{$kind := sourceKind .SourcePath}}
+            {{range .Keyring}}{{$kind := sourceKind .SourcePath}}{{$uid := splitUID .PrimaryUID}}
               <tr data-source-kind="{{$kind}}">
                 <td data-label="Primary fingerprint"><span class="fp">{{chunkHex .PrimaryFingerprint 4}}</span></td>
-                <td data-label="User ID"><span class="uid">{{.PrimaryUID}}</span></td>
+                <td data-label="User ID"><span class="uid" title="{{.PrimaryUID}}">{{$uid.Name}}{{if $uid.Email}}<span class="uid__email">&lt;{{$uid.Email}}&gt;</span>{{end}}</span></td>
                 <td data-label="Source">
                   <span class="src src--{{$kind}}">{{sourceKindLabel .SourcePath}}</span>
                   <span class="src-path">{{.SourcePath}}</span>

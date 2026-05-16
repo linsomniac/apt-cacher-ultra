@@ -107,13 +107,16 @@ var (
 	// keys baked into the binary load alongside whatever is found on
 	// disk under these paths.
 	//
-	// /usr/share/keyrings is intentionally NOT default-scanned —
-	// that directory holds per-repository Signed-By keys whose
-	// intended scope is one apt source, not whole-archive trust.
-	// Operators who want it can opt in via keyring_dirs.
+	// /usr/share/keyrings is scanned by default so the cache can
+	// verify third-party repos (Microsoft, Confluent, Docker on
+	// modern distros) whose signing keys are conventionally installed
+	// there via per-source Signed-By directives. Without this scan,
+	// adoption of those repos would fail with gpg_failed even on
+	// systems where apt itself trusts them.
 	keyringDirs = []string{
 		gpg.DefaultTrustedGPGDir,
 		gpg.DefaultKeyringsDir,
+		gpg.DefaultUsrShareKeyringsDir,
 	}
 
 	// keyringEmbeddedSources returns the canonical archive keys baked
@@ -920,7 +923,7 @@ func buildAdopter(
 		return nil, nil, fmt.Errorf("load apt keyring: %w", err)
 	}
 	if keyring.Empty() && cfg.Adoption.RequireSignature {
-		return nil, nil, errors.New("apt keyring is empty and adoption.require_signature = true; refusing to start (no key would satisfy any verification — populate /etc/apt/trusted.gpg.d/ or /etc/apt/keyrings/)")
+		return nil, nil, errors.New("apt keyring is empty and adoption.require_signature = true; refusing to start (no key would satisfy any verification — populate /etc/apt/trusted.gpg.d/, /etc/apt/keyrings/, or /usr/share/keyrings/)")
 	}
 
 	pins, err := compilePins(cfg.TrustedSigners)

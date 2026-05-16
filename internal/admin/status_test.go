@@ -17,6 +17,7 @@ func TestStatusTemplateFuncMapHasNewHelpers(t *testing.T) {
 		"outcomeBadgeClass",
 		"vitalState",
 		"verdictExplanation",
+		"splitUID",
 	}
 	for _, name := range want {
 		if _, ok := fm[name]; !ok {
@@ -124,6 +125,30 @@ func TestSourceKindLabel(t *testing.T) {
 	for _, c := range cases {
 		if got := sourceKindLabel(c.path); got != c.label {
 			t.Errorf("sourceKindLabel(%q) = %q; want %q", c.path, got, c.label)
+		}
+	}
+}
+
+func TestSplitUID(t *testing.T) {
+	cases := []struct {
+		in    string
+		name  string
+		email string
+	}{
+		{"", "", ""},
+		{"Name only", "Name only", ""},
+		{"Display Name <email@example.com>", "Display Name", "email@example.com"},
+		{"Ubuntu Archive Automatic Signing Key (2018) <ftpmaster@ubuntu.com>", "Ubuntu Archive Automatic Signing Key (2018)", "ftpmaster@ubuntu.com"},
+		{"  Trim Me  <a@b>  ", "Trim Me", "a@b"},
+		{"<email-only@x>", "", "email-only@x"},
+		{"Name with > char in it <e@x>", "Name with > char in it", "e@x"},
+		{"Bare <unterminated", "Bare <unterminated", ""},
+	}
+	for _, c := range cases {
+		got := splitUID(c.in)
+		if got.Name != c.name || got.Email != c.email {
+			t.Errorf("splitUID(%q) = {Name:%q Email:%q}; want {Name:%q Email:%q}",
+				c.in, got.Name, got.Email, c.name, c.email)
 		}
 	}
 }
