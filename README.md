@@ -2,9 +2,14 @@
 
 A robust apt repository cache focused on availability under upstream failure.
 
-Designed as a replacement for `apt-cacher-ng` that keeps cache hits fast and
-successful even when upstream Ubuntu/Debian/PPA mirrors are slow, broken, or
-under DDoS.
+Designed as a replacement for `apt-cacher-ng` that keeps cache hits
+available even when upstream Ubuntu/Debian/PPA mirrors are slow, broken,
+or under DDoS.  It snapshots repo updates, tracks "hot packages" across your
+fleet, and pre-downloads hot packages before making snapshot updates available
+for clients to request.  This provides the ability to reliably provide package
+sets to clients even if upstream servers become unavailable.  The limitation is
+that "cold" packages require upstream availability.  Typical usage should be
+available from the cache at all times.
 
 > **Contributing:** apt-cacher-ultra accepts AI-authored contributions only.
 > See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
