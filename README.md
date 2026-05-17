@@ -6,6 +6,9 @@ Designed as a replacement for `apt-cacher-ng` that keeps cache hits fast and
 successful even when upstream Ubuntu/Debian/PPA mirrors are slow, broken, or
 under DDoS.
 
+> **Contributing:** apt-cacher-ultra accepts AI-authored contributions only.
+> See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
+
 ## Status
 
 Functionality is complete.  I have it running in all my environments and am
