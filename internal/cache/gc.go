@@ -454,11 +454,29 @@ func (c *Cache) HeartbeatBlobs(ctx context.Context, hashes []string) error {
 //  1. BEGIN
 //  2. SELECT up to batchSize url_path candidates whose last_requested_at
 //     is older than now-ttlSeconds AND which are not vouched for by any
-//     current snapshot's package_hash. Rows with last_requested_at IS
-//     NULL (adoption-pre-warmed but never served) are protected
-//     unconditionally; rows whose (scheme, host, path) appears in a
-//     current snapshot's package_hash are protected so a hot-set entry
-//     the fleet hasn't yet fetched is not eagerly evicted.
+//     current snapshot via package_hash, snapshot_member, or
+//     suite_snapshot. Rows with last_requested_at IS NULL (adoption-
+//     pre-warmed but never served) are protected unconditionally.
+//
+//     "Vouched for by a current snapshot" means one of:
+//       a. There exists a package_hash row with the same (scheme, host,
+//          path) AND declared_sha256 = url_path.blob_hash on a current
+//          snapshot. Path-AND-hash equality matters here — a row whose
+//          cached bytes diverge from the snapshot's declared hash is
+//          stale and reapable; the next client request would hit-path
+//          evict it anyway (SPEC2 §6.1 step 5).
+//       b. There exists a snapshot_member row with blob_hash =
+//          url_path.blob_hash on a current snapshot. Hash-based check
+//          (no path equality) because snapshot_member's path is suite-
+//          relative; matching by hash is sufficient since the bytes are
+//          what the snapshot vouches for. Covers cached Packages.gz,
+//          Sources, pdiff Index members, etc.
+//       c. There exists a suite_snapshot row whose inrelease_hash,
+//          release_hash, or release_gpg_hash equals url_path.blob_hash
+//          on a current snapshot. Covers cached InRelease, Release,
+//          Release.gpg url_path rows — critically important because
+//          freshness checks (SPEC2 §7.4) skip silently when these
+//          url_path rows are absent.
 //  3. DELETE the rows
 //  4. For each deleted row with a non-NULL blob_hash, decrement
 //     blob.refcount and set refcount_zeroed_at when the refcount
@@ -481,6 +499,13 @@ func (c *Cache) HeartbeatBlobs(ctx context.Context, hashes []string) error {
 // any pool bytes itself — that remains the blob pass's job, which fires
 // on the next tick (or next batch within the same tick) once refcount
 // has been decremented to <= 0 and the blob_grace window elapses.
+//
+// AIDEV-NOTE: a url_path row whose blob_hash IS NULL (PutURLPath landed
+// but the fetch hasn't completed, or the upstream 404'd) cannot match
+// any of the hash-based vouching subqueries — `= NULL` evaluates to
+// NULL, so NOT EXISTS is true. Such rows are reapable on TTL elapse,
+// which is correct: a failed-to-fetch URL mapping has no reason to
+// persist forever, and the next request just re-resolves it.
 func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds int64) (int, error) {
 	if batchSize < 1 {
 		return 0, fmt.Errorf("RunURLPathGCBatch: batchSize must be >= 1, got %d", batchSize)
@@ -501,7 +526,26 @@ SELECT canonical_scheme, canonical_host, path, blob_hash
           WHERE ph.canonical_scheme = url_path.canonical_scheme
             AND ph.canonical_host   = url_path.canonical_host
             AND ph.path             = url_path.path
+            AND ph.declared_sha256  = url_path.blob_hash
             AND ph.snapshot_id IN (
+                  SELECT current_snapshot_id FROM suite_freshness
+                   WHERE current_snapshot_id IS NOT NULL
+                )
+       )
+   AND NOT EXISTS (
+         SELECT 1 FROM snapshot_member sm
+          WHERE sm.blob_hash = url_path.blob_hash
+            AND sm.snapshot_id IN (
+                  SELECT current_snapshot_id FROM suite_freshness
+                   WHERE current_snapshot_id IS NOT NULL
+                )
+       )
+   AND NOT EXISTS (
+         SELECT 1 FROM suite_snapshot ss
+          WHERE (ss.inrelease_hash   = url_path.blob_hash
+              OR ss.release_hash     = url_path.blob_hash
+              OR ss.release_gpg_hash = url_path.blob_hash)
+            AND ss.snapshot_id IN (
                   SELECT current_snapshot_id FROM suite_freshness
                    WHERE current_snapshot_id IS NOT NULL
                 )

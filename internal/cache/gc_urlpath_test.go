@@ -269,6 +269,203 @@ func TestRunURLPathGCBatch_BatchSizeLimits(t *testing.T) {
 	}
 }
 
+func TestRunURLPathGCBatch_PackageHashMismatchedHashDoesNotProtect(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	stale := seedBlob(t, c, "stale cached bytes")
+	current := seedBlob(t, c, "current declared bytes")
+	ir := seedBlob(t, c, "inrelease for the protecting snapshot")
+	const path = "/ubuntu/pool/main/z/z.deb"
+	putURLPathRow(t, c, "http", "archive.test", path, stale,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, false)
+
+	if _, err := c.db.Exec(`INSERT INTO suite_freshness
+	  (canonical_scheme, canonical_host, suite_path)
+	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
+		t.Fatalf("seed suite_freshness: %v", err)
+	}
+	res, err := c.db.Exec(`INSERT INTO suite_snapshot
+	  (canonical_scheme, canonical_host, suite_path,
+	   inrelease_hash, created_at, adopted_at, heartbeat_at,
+	   package_coverage_complete)
+	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble',
+	          ?, ?, ?, ?, 1)`, ir, now, now, now)
+	if err != nil {
+		t.Fatalf("seed suite_snapshot: %v", err)
+	}
+	snapID, _ := res.LastInsertId()
+	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = ?
+	  WHERE canonical_scheme='http' AND canonical_host='archive.test'
+	    AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
+		t.Fatalf("set current_snapshot_id: %v", err)
+	}
+	// package_hash on the current snapshot declares a DIFFERENT hash
+	// than what url_path caches. Stale row is reapable.
+	if _, err := c.db.Exec(`INSERT INTO package_hash
+	  (canonical_scheme, canonical_host, path,
+	   declared_sha256, snapshot_id, package_name, architecture)
+	  VALUES ('http', 'archive.test', ?, ?, ?, 'z', 'amd64')`,
+		path, current, snapID); err != nil {
+		t.Fatalf("seed package_hash: %v", err)
+	}
+
+	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
+	if err != nil {
+		t.Fatalf("RunURLPathGCBatch: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("reaped = %d, want 1 (cached blob_hash diverged from current package_hash.declared_sha256)", got)
+	}
+}
+
+// TestRunURLPathGCBatch_InReleaseUrlPathOnCurrentSnapshotProtected guards
+// against silent freshness skips. The freshness checker (SPEC2 §7.4)
+// calls cache.LookupURL on suite_path+"/InRelease" and silently returns
+// nil when the row is absent — so reaping an aged but still-current
+// InRelease url_path row would stop periodic refreshes for that suite.
+func TestRunURLPathGCBatch_InReleaseUrlPathOnCurrentSnapshotProtected(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	ir := seedBlob(t, c, "current inrelease bytes")
+	const path = "/ubuntu/dists/noble/InRelease"
+	putURLPathRow(t, c, "http", "archive.test", path, ir,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
+
+	if _, err := c.db.Exec(`INSERT INTO suite_freshness
+	  (canonical_scheme, canonical_host, suite_path)
+	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
+		t.Fatalf("seed suite_freshness: %v", err)
+	}
+	res, err := c.db.Exec(`INSERT INTO suite_snapshot
+	  (canonical_scheme, canonical_host, suite_path,
+	   inrelease_hash, created_at, adopted_at, heartbeat_at,
+	   package_coverage_complete)
+	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble',
+	          ?, ?, ?, ?, 1)`, ir, now, now, now)
+	if err != nil {
+		t.Fatalf("seed suite_snapshot: %v", err)
+	}
+	snapID, _ := res.LastInsertId()
+	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = ?
+	  WHERE canonical_scheme='http' AND canonical_host='archive.test'
+	    AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
+		t.Fatalf("set current_snapshot_id: %v", err)
+	}
+
+	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
+	if err != nil {
+		t.Fatalf("RunURLPathGCBatch: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("reaped = %d, want 0 (InRelease url_path on current snapshot must be protected)", got)
+	}
+}
+
+// TestRunURLPathGCBatch_DetachedReleaseAndGPGProtected verifies the
+// detached-mode metadata anchors (Release + Release.gpg) are also
+// protected. Mirror of the InRelease test for SPEC2 §7.6.3 caches.
+func TestRunURLPathGCBatch_DetachedReleaseAndGPGProtected(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	rel := seedBlob(t, c, "detached release bytes")
+	rgpg := seedBlob(t, c, "detached release.gpg bytes")
+	putURLPathRow(t, c, "http", "archive.test", "/ubuntu/dists/noble/Release", rel,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
+	putURLPathRow(t, c, "http", "archive.test", "/ubuntu/dists/noble/Release.gpg", rgpg,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
+
+	if _, err := c.db.Exec(`INSERT INTO suite_freshness
+	  (canonical_scheme, canonical_host, suite_path)
+	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
+		t.Fatalf("seed suite_freshness: %v", err)
+	}
+	res, err := c.db.Exec(`INSERT INTO suite_snapshot
+	  (canonical_scheme, canonical_host, suite_path,
+	   release_hash, release_gpg_hash,
+	   created_at, adopted_at, heartbeat_at,
+	   package_coverage_complete)
+	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble',
+	          ?, ?, ?, ?, ?, 1)`, rel, rgpg, now, now, now)
+	if err != nil {
+		t.Fatalf("seed suite_snapshot: %v", err)
+	}
+	snapID, _ := res.LastInsertId()
+	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = ?
+	  WHERE canonical_scheme='http' AND canonical_host='archive.test'
+	    AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
+		t.Fatalf("set current_snapshot_id: %v", err)
+	}
+
+	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
+	if err != nil {
+		t.Fatalf("RunURLPathGCBatch: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("reaped = %d, want 0 (Release + Release.gpg url_path on current snapshot must be protected)", got)
+	}
+}
+
+// TestRunURLPathGCBatch_SnapshotMemberHashProtects covers cached
+// Packages.gz / Sources / pdiff Index members: they are tracked in
+// snapshot_member by hash, and aged url_path rows pointing at those
+// hashes must stay so subsequent hit-path lookups continue to serve.
+func TestRunURLPathGCBatch_SnapshotMemberHashProtects(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	pkg := seedBlob(t, c, "Packages.gz bytes")
+	ir := seedBlob(t, c, "inrelease for protecting snapshot")
+	const path = "/ubuntu/dists/noble/main/binary-amd64/Packages.gz"
+	putURLPathRow(t, c, "http", "archive.test", path, pkg,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
+
+	if _, err := c.db.Exec(`INSERT INTO suite_freshness
+	  (canonical_scheme, canonical_host, suite_path)
+	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
+		t.Fatalf("seed suite_freshness: %v", err)
+	}
+	res, err := c.db.Exec(`INSERT INTO suite_snapshot
+	  (canonical_scheme, canonical_host, suite_path,
+	   inrelease_hash, created_at, adopted_at, heartbeat_at,
+	   package_coverage_complete)
+	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble',
+	          ?, ?, ?, ?, 1)`, ir, now, now, now)
+	if err != nil {
+		t.Fatalf("seed suite_snapshot: %v", err)
+	}
+	snapID, _ := res.LastInsertId()
+	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = ?
+	  WHERE canonical_scheme='http' AND canonical_host='archive.test'
+	    AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
+		t.Fatalf("set current_snapshot_id: %v", err)
+	}
+	if _, err := c.db.Exec(`INSERT INTO snapshot_member
+	  (snapshot_id, path, blob_hash, declared_sha256)
+	  VALUES (?, 'main/binary-amd64/Packages.gz', ?, ?)`,
+		snapID, pkg, pkg); err != nil {
+		t.Fatalf("seed snapshot_member: %v", err)
+	}
+
+	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
+	if err != nil {
+		t.Fatalf("RunURLPathGCBatch: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("reaped = %d, want 0 (snapshot_member blob_hash on current snapshot must protect)", got)
+	}
+}
+
 func TestRunURLPathGCBatch_DecrementPreservesPositiveRefcount(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()

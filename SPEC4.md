@@ -1567,25 +1567,46 @@ row" and therefore not reapable even when no client has actually
 hit the path in months.
 
 The Phase 4 URL-path TTL pass closes that gap. A `url_path` row
-is reapable iff:
+is reapable iff `last_requested_at IS NOT NULL` (pre-warmed-but-
+never-served rows carry NULL and are protected unconditionally),
+`last_requested_at < now - gc.url_path_ttl`, AND the row is not
+vouched for by any current snapshot. "Vouched for by a current
+snapshot" means **at least one** of:
 
-- `last_requested_at IS NOT NULL` — rows pre-warmed by adoption
-  but never served carry NULL here, and are protected
-  unconditionally so a hot-set entry the fleet has not yet
-  fetched is not eagerly evicted. The CommitAdoption Step 3a
-  upsert specifically preserves NULL when the row was inserted
-  by a pre-warm (no `last_requested_at = excluded.last_requested_at`
-  in the DO UPDATE).
-- `last_requested_at < now - gc.url_path_ttl` — outside the TTL
-  window.
-- The `(canonical_scheme, canonical_host, path)` triple does
-  **not** appear in any `package_hash` row whose `snapshot_id`
-  is in `(SELECT current_snapshot_id FROM suite_freshness WHERE
-  current_snapshot_id IS NOT NULL)`. A path declared by any
-  current snapshot's `Packages*` member is protected — it's part
-  of the live working set the cache vouches for. Displaced
-  snapshots' `package_hash` rows do **not** protect (those
-  snapshots are themselves eligible for §9.6.3 reaping).
+- **package_hash (path-AND-hash):** there exists a `package_hash`
+  row on a current snapshot with the same
+  `(canonical_scheme, canonical_host, path)` AND
+  `declared_sha256 = url_path.blob_hash`. The hash equality
+  matters — a `url_path` row whose cached bytes diverge from
+  what the current snapshot declares is stale (the next client
+  request would hit-path-evict it under SPEC2 §6.1 step 5
+  anyway), so reaping it preemptively is correct.
+- **snapshot_member (hash-only):** there exists a
+  `snapshot_member` row on a current snapshot with
+  `blob_hash = url_path.blob_hash`. Hash-only (no path equality)
+  because `snapshot_member.path` is suite-relative; matching by
+  hash is sufficient since the bytes are what the snapshot
+  actually vouches for. Covers cached `Packages.gz`, `Sources`,
+  pdiff Index members, etc. that are currently-snapshotted but
+  haven't been hit by a client in the TTL window.
+- **suite_snapshot (metadata-self hash):** there exists a
+  `suite_snapshot` row on a current snapshot whose
+  `inrelease_hash`, `release_hash`, or `release_gpg_hash` equals
+  `url_path.blob_hash`. Critically important — the SPEC2 §7.4
+  freshness checker calls `cache.LookupURL` on the suite's
+  `InRelease` (and `Release` / `Release.gpg` in detached mode),
+  and silently returns nil when the row is absent. Reaping a
+  still-current metadata anchor would stop periodic refreshes
+  for that suite until the next client `apt update`.
+
+Displaced snapshots' rows do **not** protect (those snapshots
+are themselves eligible for §9.6.3 reaping). A `url_path` row
+with `blob_hash IS NULL` (PutURLPath landed but the fetch never
+completed, or the upstream 404'd) is not protected by any of the
+three hash-based subqueries (`= NULL` evaluates to NULL → NOT
+EXISTS true); such rows are reapable on TTL elapse, which is
+correct — a failed-to-fetch URL mapping has no reason to persist
+forever, and the next request just re-resolves it.
 
 Per-batch: the writer-tx selects up to `gc.batch_size`
 candidates, then per-row issues `DELETE FROM url_path` followed
