@@ -51,6 +51,22 @@ type VerifierConfig struct {
 	// the stricter policy set the toggle false.
 	AllowShortKeyID bool
 
+	// AcceptAnySigner relaxes the trust + cryptographic checks for
+	// unpinned suites (SPEC2 §7.6.2 bypass branch). When true and no
+	// [[trusted_signer]] block matches the suite, the verifier decodes
+	// the clearsigned envelope (or Release.gpg) structurally and
+	// returns the cleartext (or Release bytes verbatim in detached
+	// mode) without consulting the host keyring. Pinned suites are
+	// unaffected — the matched fingerprints remain authoritative and
+	// the full trust + crypto path runs as before.
+	//
+	// This is the SPEC2 §5.1 adoption.accept_any_signer toggle. The
+	// security argument is that the proxy stores and serves the
+	// original signed bytes; apt clients on the fleet remain the
+	// authoritative trust anchor via their own per-source Signed-By
+	// rules.
+	AcceptAnySigner bool
+
 	Logger *slog.Logger
 }
 
@@ -63,6 +79,7 @@ type Verifier struct {
 	requireSignature bool
 	requirePinned    bool
 	allowShortKeyID  bool
+	acceptAnySigner  bool
 	logger           *slog.Logger
 
 	// shortKeyIDLogged tracks suites for which a short-keyid-fallback
@@ -77,6 +94,12 @@ type Verifier struct {
 	// is a finite inventory of "which (host, suite) pairs need new keys"
 	// rather than a per-tick noise stream.
 	untrustedSignerLogged sync.Map
+
+	// unverifiedSignerLogged tracks suites for which an
+	// adoption_unverified_signer acceptance has already been logged this
+	// process. Fires under accept_any_signer when the bypass branch
+	// runs. Same dedupe shape as the other once-loggers.
+	unverifiedSignerLogged sync.Map
 }
 
 // Compile-time interface check: Verifier satisfies freshness.Verifier.
@@ -102,6 +125,7 @@ func NewVerifier(cfg VerifierConfig) (*Verifier, error) {
 		requireSignature: cfg.RequireSignature,
 		requirePinned:    cfg.RequirePinned,
 		allowShortKeyID:  cfg.AllowShortKeyID,
+		acceptAnySigner:  cfg.AcceptAnySigner,
 		logger:           logger,
 	}, nil
 }
@@ -211,7 +235,7 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 	}
 
 	// Step 2: per-suite trust-set resolution.
-	trustSet, trustFPs, _, err := v.resolveTrustSet(suite)
+	trustSet, trustFPs, _, bypass, err := v.resolveTrustSet(suite)
 	if err != nil {
 		return nil, err
 	}
@@ -226,6 +250,16 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 		// Return the body verbatim — the parser downstream treats
 		// this as Release-style text.
 		return inRelease, nil
+	}
+
+	if bypass {
+		// SPEC2 §7.6.2 bypass: clearsign envelope decoded structurally;
+		// trust + crypto check skipped. The original signed inRelease
+		// bytes are what callers will persist and serve to apt clients,
+		// so per-source Signed-By rules on the fleet remain the
+		// authoritative trust anchor.
+		v.logUnverifiedSignerOnce(suite, block.ArmoredSignature.Body)
+		return block.Plaintext, nil
 	}
 
 	if len(trustSet) == 0 {
@@ -296,10 +330,26 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 		return nil, errors.New("empty Release.gpg body")
 	}
 
-	trustSet, trustFPs, _, err := v.resolveTrustSet(suite)
+	trustSet, trustFPs, _, bypass, err := v.resolveTrustSet(suite)
 	if err != nil {
 		return nil, err
 	}
+
+	if bypass {
+		// SPEC2 §7.6.2 bypass: Release.gpg must still parse as a PGP
+		// signature blob (cheap structural guard against garbage that
+		// would otherwise propagate untouched into the pool), but
+		// trust + crypto verification is skipped. Release bytes are
+		// returned verbatim, matching the verified-bytes-equal-stored-
+		// bytes invariant.
+		binarySig, err := decodeMaybeArmoredSignature(sigBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode signature: %w", err)
+		}
+		v.logUnverifiedSignerOnce(suite, bytes.NewReader(binarySig))
+		return releaseBytes, nil
+	}
+
 	if len(trustSet) == 0 {
 		return nil, fmt.Errorf("%w: pin matched but no key in host keyring satisfies it", ErrNoUsableSignature)
 	}
@@ -407,11 +457,19 @@ func isWhitespaceOnly(b []byte) bool {
 }
 
 // resolveTrustSet implements SPEC2 §7.6.2. Returns:
-//   - trustSet: the openpgp.EntityList to verify against
-//   - trustFPs: the uppercase-fingerprint set (for IssuerFingerprint check)
+//   - trustSet: the openpgp.EntityList to verify against (nil under bypass)
+//   - trustFPs: the uppercase-fingerprint set (for IssuerFingerprint check;
+//     nil under bypass)
 //   - pinned:   true iff at least one [[trusted_signer]] block matched
+//   - bypass:   true iff acceptAnySigner is on AND no pin matched — the
+//     caller must skip the trust + cryptographic verification entirely
+//     and accept the body after a structural decode. requirePinned is
+//     evaluated first, so a require_pinned_signer + accept_any_signer
+//     combination still fails-closed on unpinned suites (pins remain a
+//     hard requirement; the relaxation only governs verification within
+//     the broad-trust branch).
 //   - err:      ErrUnpinnedSuite when RequirePinned and no pin matched
-func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (openpgp.EntityList, map[string]struct{}, bool, error) {
+func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (openpgp.EntityList, map[string]struct{}, bool, bool, error) {
 	var matched []SignerPin
 	for _, p := range v.pins {
 		if p.HostRegex.MatchString(suite.CanonicalHost) {
@@ -431,8 +489,15 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (openpgp.EntityList
 			// errors.Is(err, gpg.ErrUnpinnedSuite) still matches
 			// for any caller that prefers the gpg-package
 			// sentinel.
-			return nil, nil, false, fmt.Errorf("%w: %w: no [[trusted_signer]] block matches %q",
+			return nil, nil, false, false, fmt.Errorf("%w: %w: no [[trusted_signer]] block matches %q",
 				ErrUnpinnedSuite, freshness.ErrAdoptionUnpinnedSuite, suite.CanonicalHost)
+		}
+		if v.acceptAnySigner {
+			// SPEC2 §7.6.2 bypass branch. Caller short-circuits the
+			// trust + crypto check; only the structural decode
+			// remains. trustSet / trustFPs are nil because they have
+			// no consumer on this path.
+			return nil, nil, false, true, nil
 		}
 		// Broad trust: the entire host keyring. Build a copy of the
 		// host fingerprint set so the IssuerFingerprint check has
@@ -441,7 +506,7 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (openpgp.EntityList
 		for fp := range v.keyring.fingerprints {
 			fps[fp] = struct{}{}
 		}
-		return v.keyring.EntityList(), fps, false, nil
+		return v.keyring.EntityList(), fps, false, false, nil
 	}
 	union := make(map[string]struct{})
 	for _, m := range matched {
@@ -450,7 +515,7 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (openpgp.EntityList
 		}
 	}
 	subset := v.keyring.Subset(union)
-	return subset, union, true, nil
+	return subset, union, true, false, nil
 }
 
 // readArmoredSignature consumes the (already-de-armored) reader from
@@ -500,12 +565,12 @@ func (v *Verifier) verifyAnyTrusted(
 ) error {
 	reader := packet.NewReader(bytes.NewReader(sigBytes))
 	var (
-		anyShortKeyID    bool
-		anyUntrusted     bool
-		sawSignature     bool
-		lastVerifyErr    error
-		anyTrustedSeen   bool
-		rejectedSigners  []string
+		anyShortKeyID   bool
+		anyUntrusted    bool
+		sawSignature    bool
+		lastVerifyErr   error
+		anyTrustedSeen  bool
+		rejectedSigners []string
 	)
 	for {
 		pkt, err := reader.Next()
@@ -701,4 +766,66 @@ func (v *Verifier) logShortKeyIDFallbackOnce(suite freshness.SuiteRef, matched *
 		"issuer_keyid", fmt.Sprintf("%016X", keyID),
 		"matched_fingerprint", upperFP(matched.PrimaryKey.Fingerprint),
 	)
+}
+
+// logUnverifiedSignerOnce emits one INFO log per (canonical_host,
+// suite_path) per process the first time accept_any_signer's bypass
+// branch accepts a suite. Subsequent acceptances for the same suite
+// stay silent. The signer-info field, when extractable from the
+// signature, names the IssuerFingerprint (preferred) or short
+// IssuerKeyId so operators have an audit trail of which signers their
+// fleet has effectively trusted under the relaxation.
+//
+// sigSource is the (already de-armored, for inline) signature byte
+// stream; for inline it's block.ArmoredSignature.Body, for detached
+// it's a Reader over the binary signature bytes. The helper is
+// tolerant of malformed input — if signer extraction fails the log
+// line still fires, with signer_info elided.
+func (v *Verifier) logUnverifiedSignerOnce(suite freshness.SuiteRef, sigSource io.Reader) {
+	key := suite.CanonicalHost + "|" + suite.SuitePath
+	if _, loaded := v.unverifiedSignerLogged.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	signerInfo := extractSignerInfo(sigSource)
+	attrs := []any{
+		"canonical_host", suite.CanonicalHost,
+		"suite_path", suite.SuitePath,
+	}
+	if signerInfo != "" {
+		attrs = append(attrs, "signer", signerInfo)
+	}
+	v.logger.Info("adoption_unverified_signer", attrs...)
+}
+
+// extractSignerInfo reads the first signature packet from r and
+// returns a human-readable signer reference: "fpr:<40-hex>" when the
+// IssuerFingerprint subpacket is present, "keyid:<16-hex>" when only
+// the legacy short keyid is present, or "" on any parse failure. The
+// reader is consumed; callers must not reuse it.
+//
+// Best-effort: this is for the audit log only, never for trust
+// decisions. A malformed signature returning "" still produces an
+// adoption_unverified_signer line, just without the signer field.
+func extractSignerInfo(r io.Reader) string {
+	reader := packet.NewReader(r)
+	for {
+		pkt, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			return ""
+		}
+		if err != nil {
+			return ""
+		}
+		sig, ok := pkt.(*packet.Signature)
+		if !ok {
+			continue
+		}
+		if len(sig.IssuerFingerprint) > 0 {
+			return "fpr:" + upperFP(sig.IssuerFingerprint)
+		}
+		if sig.IssuerKeyId != nil {
+			return fmt.Sprintf("keyid:%016X", *sig.IssuerKeyId)
+		}
+		return ""
+	}
 }

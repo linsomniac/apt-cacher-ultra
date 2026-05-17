@@ -359,6 +359,7 @@ func serveListeners(
 		"adoption_enabled", cfg.Adoption.Enabled,
 		"adoption_require_signature", cfg.Adoption.RequireSignature,
 		"adoption_require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
+		"adoption_accept_any_signer", cfg.Adoption.AcceptAnySigner,
 		"adoption_hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"integrity_validate_at_rest_interval", cfg.Integrity.ValidateAtRestInterval.Duration,
@@ -393,6 +394,14 @@ func serveListeners(
 	// in the journal even before adoption is actually wired.
 	if !cfg.Adoption.RequireSignature {
 		logger.Warn("adoption.require_signature = false: unsigned upstream metadata would be adopted (auditable per SPEC2 §5.1)")
+	}
+
+	// SPEC2 §5.1: accept_any_signer = true is a loud relaxation —
+	// signatures are decoded structurally but not cryptographically
+	// verified for unpinned suites. Apt clients on the fleet remain
+	// the authoritative trust anchor (per-source Signed-By rules).
+	if cfg.Adoption.AcceptAnySigner {
+		logger.Warn("adoption.accept_any_signer = true: signatures are decoded but not cryptographically verified for unpinned suites; apt clients on the fleet remain the authoritative trust anchor (auditable per SPEC2 §5.1)")
 	}
 
 	// SPEC3 §5.2 loud configurations. Both fire once at startup so an
@@ -666,21 +675,22 @@ func serveListeners(
 	var adminSrv *admin.Server
 	if cfg.Admin.Enabled {
 		adminSrv, err = admin.New(admin.Config{
-			Cache:                 c,
-			GC:                    gcsvc,
-			HostLimiter:           hostLimiter,
-			Ring:                  adoptionRing,
-			Registry:              metrics.Default,
-			Logger:                logger,
-			BuildInfo:             buildInfo(),
-			Admin:                 cfg.Admin,
-			StartTime:             time.Now(),
-			ProxyAddr:             plainLn.Addr().String(),
-			TLSAddr:               tlsAddrString(tlsLn),
-			AdminAddr:             adminLn.Addr().String(),
-			TLSMITM:               &tlsMitmProvider{h: mitmHandles},
-			AdoptionArchitectures: cfg.Adoption.Architectures,
-			Keyring:               &keyringProvider{k: keyring},
+			Cache:                   c,
+			GC:                      gcsvc,
+			HostLimiter:             hostLimiter,
+			Ring:                    adoptionRing,
+			Registry:                metrics.Default,
+			Logger:                  logger,
+			BuildInfo:               buildInfo(),
+			Admin:                   cfg.Admin,
+			StartTime:               time.Now(),
+			ProxyAddr:               plainLn.Addr().String(),
+			TLSAddr:                 tlsAddrString(tlsLn),
+			AdminAddr:               adminLn.Addr().String(),
+			TLSMITM:                 &tlsMitmProvider{h: mitmHandles},
+			AdoptionArchitectures:   cfg.Adoption.Architectures,
+			AdoptionAcceptAnySigner: cfg.Adoption.AcceptAnySigner,
+			Keyring:                 &keyringProvider{k: keyring},
 		})
 		if err != nil {
 			return fmt.Errorf("build admin: %w", err)
@@ -923,8 +933,15 @@ func buildAdopter(
 	if err != nil {
 		return nil, nil, fmt.Errorf("load apt keyring: %w", err)
 	}
-	if keyring.Empty() && cfg.Adoption.RequireSignature {
-		return nil, nil, errors.New("apt keyring is empty and adoption.require_signature = true; refusing to start (no key would satisfy any verification — populate /etc/apt/trusted.gpg.d/, /etc/apt/keyrings/, or /usr/share/keyrings/)")
+	// Empty-keyring guard: only fail closed when verification would
+	// actually need a key. accept_any_signer routes unpinned suites
+	// through the bypass branch (no keyring consulted), so an empty
+	// keyring is workable for the non-pinned case under that mode.
+	// Pinned suites with no resolvable key still fail at adoption time
+	// with no_usable_signature — the right surface for "you supplied a
+	// pin but no key satisfies it."
+	if keyring.Empty() && cfg.Adoption.RequireSignature && !cfg.Adoption.AcceptAnySigner {
+		return nil, nil, errors.New("apt keyring is empty and adoption.require_signature = true; refusing to start (no key would satisfy any verification — populate /etc/apt/trusted.gpg.d/, /etc/apt/keyrings/, or /usr/share/keyrings/, or set adoption.accept_any_signer = true to delegate trust to the apt clients)")
 	}
 
 	pins, err := compilePins(cfg.TrustedSigners)
@@ -938,6 +955,7 @@ func buildAdopter(
 		RequireSignature: cfg.Adoption.RequireSignature,
 		RequirePinned:    cfg.Adoption.RequirePinnedSigner,
 		AllowShortKeyID:  cfg.Adoption.AllowShortKeyID,
+		AcceptAnySigner:  cfg.Adoption.AcceptAnySigner,
 		Logger:           logger,
 	})
 	if err != nil {
@@ -965,6 +983,7 @@ func buildAdopter(
 		"trusted_signer_blocks", len(pins),
 		"require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
 		"allow_short_keyid", cfg.Adoption.AllowShortKeyID,
+		"accept_any_signer", cfg.Adoption.AcceptAnySigner,
 		"max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,

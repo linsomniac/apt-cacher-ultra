@@ -66,6 +66,22 @@ enabled               = false
 require_signature     = true
 require_pinned_signer = false
 
+# When true, unpinned suites bypass the trust + cryptographic check at
+# adoption time: the clearsign envelope (or Release.gpg) must still
+# parse structurally, but the signer need not be known to the host
+# keyring. Apt clients on the fleet remain the authoritative trust
+# anchor via per-source Signed-By rules. Off by default — the secure
+# posture is to load the upstream's signing key and verify here too.
+# Enable when you want the proxy to act as a transparent metadata
+# mirror for a long tail of third-party repos whose keys would
+# otherwise require ongoing manual keyring maintenance on the cache
+# host. Loud WARN at startup so the choice is auditable; per-suite
+# adoption_unverified_signer INFO lines fire once per (host, suite)
+# the first time each suite adopts under the bypass. [[trusted_signer]]
+# blocks remain authoritative for matched suites — pin overrides the
+# relaxation.
+accept_any_signer     = false
+
 # When true (the default), signatures that lack the long-form
 # IssuerFingerprint subpacket (33) are still accepted provided their
 # 8-byte issuer keyid maps unambiguously to a key in the per-suite

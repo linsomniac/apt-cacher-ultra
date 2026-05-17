@@ -58,6 +58,7 @@ type htmlRenderModel struct {
 	statusModel               // embedded; every JSON field reachable as before
 	AdoptionEnabled   bool    // cfg.Keyring != nil at server build time
 	GCIntervalSeconds float64 // cfg.GC.Interval() expressed in seconds; 0 when unknown
+	AcceptAnySigner   bool    // cfg.AdoptionAcceptAnySigner — drives the relaxation chip and hint
 }
 
 // keyringEntry is one loaded GPG entity surfaced on the status page.
@@ -724,6 +725,7 @@ func (s *Server) buildHTMLRenderModel(m statusModel) htmlRenderModel {
 	if s.cfg.GC != nil {
 		w.GCIntervalSeconds = s.cfg.GC.Interval().Seconds()
 	}
+	w.AcceptAnySigner = s.cfg.AdoptionAcceptAnySigner
 	return w
 }
 
@@ -1035,7 +1037,7 @@ table.data tbody td::before{content:attr(data-label);font-size:10px;letter-spaci
 <symbol id="i-moon" viewBox="0 0 16 16"><path d="M13 9.5A5 5 0 016.5 3 5 5 0 1013 9.5z" stroke="currentColor" stroke-width="1.4" fill="none"/></symbol>
 </defs></svg>
 
-{{$kbundled := countBundled .Keyring}}{{$ksystem := countSystem .Keyring}}{{$kcustom := countCustom .Keyring}}{{$kcount := len .Keyring}}{{$adopting := .AdoptionEnabled}}{{$keyringCritState := and $adopting (eq $kcount 0)}}
+{{$kbundled := countBundled .Keyring}}{{$ksystem := countSystem .Keyring}}{{$kcustom := countCustom .Keyring}}{{$kcount := len .Keyring}}{{$adopting := .AdoptionEnabled}}{{$keyringCritState := and $adopting (eq $kcount 0) (not .AcceptAnySigner)}}
 
 <header class="bar" role="banner">
   <div class="bar__brand">
@@ -1229,7 +1231,7 @@ table.data tbody td::before{content:attr(data-label);font-size:10px;letter-spaci
       </section>
 
       <!-- KEYRING -->
-      <section class="panel" id="keyring">
+      <section class="panel" id="keyring" data-accept-any-signer="{{if .AcceptAnySigner}}true{{else}}false{{end}}">
         <div class="panel__eyebrow">
           Keyring <span class="sep">&mdash;</span>
           <span data-keyring-count="{{$kcount}}">{{$kcount}} loaded</span>
@@ -1239,9 +1241,13 @@ table.data tbody td::before{content:attr(data-label);font-size:10px;letter-spaci
           <span data-keyring-system="{{$ksystem}}">{{$ksystem}} system</span>
           <span class="sep">&middot;</span>
           <span data-keyring-custom="{{$kcustom}}">{{$kcustom}} custom</span>
+          {{if .AcceptAnySigner}}
+          <span class="sep">&middot;</span>
+          <span class="b b--warn" title="adoption.accept_any_signer is true: unpinned suites bypass signature verification at adoption time. Apt clients on the fleet remain the authoritative trust anchor.">Trust: accept any signer</span>
+          {{end}}
         </div>
         <h2 class="panel__h">Trusted GPG keys</h2>
-        <p class="panel__desc">Keys used to verify upstream <code>InRelease</code> signatures during adoption. Bundled keys ship with the binary; custom keys come from <code>keyring_dirs</code> paths.</p>
+        <p class="panel__desc">Keys used to verify upstream <code>InRelease</code> signatures during adoption. Bundled keys ship with the binary; custom keys come from <code>keyring_dirs</code> paths.{{if .AcceptAnySigner}} With <code>accept_any_signer = true</code>, unpinned suites are adopted without consulting these keys; pinned suites still require a match.{{end}}</p>
         {{if .Keyring}}
         <div class="table-wrap">
           <table class="data" id="keyring-table">
@@ -1265,6 +1271,8 @@ table.data tbody td::before{content:attr(data-label);font-size:10px;letter-spaci
             </tbody>
           </table>
         </div>
+        {{else if and $adopting .AcceptAnySigner}}
+          <div class="empty"><div class="empty__head">NO GPG KEYS LOADED</div><div class="empty__body">Adoption is enabled with <code>accept_any_signer = true</code>; unpinned suites bypass signature verification, so an empty keyring is workable here. Apt clients on the fleet remain the authoritative trust anchor.</div></div>
         {{else if $adopting}}
           <div class="empty empty--crit"><div class="empty__head">NO GPG KEYS LOADED</div><div class="empty__body">Adoption is enabled but the keyring is empty. All <code>InRelease</code> verifications will fail. Check <code>keyring_dirs</code> in the configuration.</div></div>
         {{else}}
@@ -1484,8 +1492,13 @@ var rows=document.querySelectorAll('#adoptions tr[data-outcome]');var total=rows
 var counts={};rows.forEach(function(tr){var o=tr.getAttribute('data-outcome');if(o==='success'||!o)return;counts[o]=(counts[o]||0)+1;});
 var top='',topN=0;for(var k in counts){if(counts[k]>topN){top=k;topN=counts[k];}}
 var THRESHOLD=0.10;if(top===''||(topN/total)<THRESHOLD)return;
+var keyringPanel=document.getElementById('keyring');
+var acceptAnySigner=keyringPanel&&keyringPanel.getAttribute('data-accept-any-signer')==='true';
+var gpgFailedText=acceptAnySigner
+?"Likely cause: with accept_any_signer = true, gpg_failed typically indicates a structural decode failure (corrupt clearsign envelope or Release.gpg) or a pinned-suite trust mismatch. Cross-check the Keyring section."
+:"Likely cause: upstream repository key changed or the matching archive key isn't loaded. Cross-check the Keyring section.";
 var hints={
-'gpg_failed':{text:"Likely cause: upstream repository key changed or the matching archive key isn't loaded. Cross-check the Keyring section.",linkHref:'#keyring',linkLabel:'Trusted keys',linkArrow:'→ Keyring'},
+'gpg_failed':{text:gpgFailedText,linkHref:'#keyring',linkLabel:'Trusted keys',linkArrow:'→ Keyring'},
 'parse_failed':{text:'Likely cause: malformed Release / Sources / Packages payload from upstream. Capture a failing fetch and inspect.'},
 'member_mismatch':{text:'Likely cause: a Release-listed member hash diverged from the cached blob. Inspect the failing index path in the proxy logs.'},
 'unpinned_suite':{text:"Likely cause: this suite is not allow-listed for adoption. Add it to the operator's adoption pin list to enable verification."},
@@ -1846,8 +1859,15 @@ func vitalState(kind string, m htmlRenderModel) string {
 // "adoption enabled but no keys loaded" critical condition. Mirrors the
 // JS verdict's keys-chip read so the noscript fallback stays consistent
 // with the live pill.
+//
+// accept_any_signer suppresses the crit: under that mode unpinned suites
+// adopt via the bypass branch (no key consulted), so an empty keyring
+// does not block adoption. Pinned suites with no matching key still
+// fail at adoption time with no_usable_signature — but that surfaces as
+// a per-row error in the adoptions table rather than as a vital-cell
+// crit on the keyring chip.
 func keyringCrit(m htmlRenderModel) bool {
-	return m.AdoptionEnabled && len(m.Keyring) == 0
+	return m.AdoptionEnabled && len(m.Keyring) == 0 && !m.AcceptAnySigner
 }
 
 // verdictExplanation produces the server-side fallback verdict string

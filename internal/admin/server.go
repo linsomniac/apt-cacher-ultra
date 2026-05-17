@@ -83,6 +83,15 @@ type Config struct {
 	// from the config file; admin does not re-read the value.
 	AdoptionArchitectures []string
 
+	// AdoptionAcceptAnySigner echoes adoption.accept_any_signer onto
+	// the status-page HTML wrapper so the template can render the
+	// chip and the gpg_failed hint that tell operators the relaxation
+	// is active. Inert when false (the default). Wire-contract JSON
+	// does not expose this field directly — it is HTML-only — but the
+	// underlying setting is also surfaced via the structured startup
+	// log line.
+	AdoptionAcceptAnySigner bool
+
 	// Keyring supplies the loaded GPG keyring inventory for the
 	// status page's `keyring` section. nil is treated as "adoption
 	// disabled or keyring not yet wired" — the section renders as

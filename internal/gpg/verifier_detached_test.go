@@ -390,6 +390,107 @@ func contains(haystack, needle string) bool {
 	return len(needle) == 0 || (len(haystack) >= len(needle) && bytes.Contains([]byte(haystack), []byte(needle)))
 }
 
+// TestVerifyDetached_AcceptAnySigner_NoPin_PassThrough asserts that
+// under accept_any_signer = true, a Release + Release.gpg pair signed
+// by a key NOT in the host keyring is adopted: Release bytes are
+// returned verbatim and no cryptographic verification runs. The
+// signature blob must still parse structurally — that is the only
+// integrity guard left when trust is delegated to apt clients.
+func TestVerifyDetached_AcceptAnySigner_NoPin_PassThrough(t *testing.T) {
+	signer := newTestEntity(t, "Untrusted", "untrusted@example.com")
+	other := newTestEntity(t, "Other", "other@example.com")
+	keyring := newKeyring(t, other) // signer NOT in keyring
+
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		AcceptAnySigner:  true,
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	release := []byte(fakeReleasePlaintext)
+	sig := detachSignWith(t, signer, release, true /*armored*/)
+
+	got, err := v.VerifyDetached(context.Background(), newSuite(), release, sig)
+	if err != nil {
+		t.Fatalf("VerifyDetached: %v (want nil under accept_any_signer)", err)
+	}
+	if !bytes.Equal(got, release) {
+		t.Fatalf("Release passthrough mismatch:\ngot=%q\nwant=%q", got, release)
+	}
+}
+
+// TestVerifyDetached_AcceptAnySigner_GarbageSignature_StillRejected
+// asserts the structural decode guard: a Release.gpg that does not
+// parse as a PGP signature is rejected even with accept_any_signer on.
+// The bypass relaxes the trust + crypto checks; it does not silently
+// adopt arbitrary garbage as if it were a signature.
+func TestVerifyDetached_AcceptAnySigner_GarbageSignature_StillRejected(t *testing.T) {
+	other := newTestEntity(t, "Other", "other@example.com")
+	keyring := newKeyring(t, other)
+
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		AcceptAnySigner:  true,
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	release := []byte(fakeReleasePlaintext)
+	// "Garbage" that starts with an armor frame so decodeMaybeArmoredSignature
+	// tries armor.Decode first; the armor frame is malformed (no body),
+	// triggering the decode error path.
+	garbage := []byte("-----BEGIN PGP SIGNATURE-----\nthis is not a real signature\n-----END PGP SIGNATURE-----\n")
+
+	_, err = v.VerifyDetached(context.Background(), newSuite(), release, garbage)
+	if err == nil {
+		t.Fatal("expected decode error on garbage Release.gpg under accept_any_signer")
+	}
+}
+
+// TestVerifyDetached_AcceptAnySigner_WithMatchingPin_StillEnforced
+// mirrors the inline version: a [[trusted_signer]] block matching the
+// suite remains authoritative; accept_any_signer is inert for pinned
+// suites.
+func TestVerifyDetached_AcceptAnySigner_WithMatchingPin_StillEnforced(t *testing.T) {
+	pinned := newTestEntity(t, "Pinned", "pinned@example.com")
+	other := newTestEntity(t, "Other", "other@example.com")
+	keyring := newKeyring(t, pinned, other)
+
+	pin := SignerPin{
+		HostRegex: regexp.MustCompile(`^archive\.example\.com$`),
+		Fingerprints: map[string]struct{}{
+			upperFP(pinned.PrimaryKey.Fingerprint): {},
+		},
+	}
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		Pins:             []SignerPin{pin},
+		RequireSignature: true,
+		AcceptAnySigner:  true,
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	release := []byte(fakeReleasePlaintext)
+	sig := detachSignWith(t, other, release, true)
+	_, err = v.VerifyDetached(context.Background(), newSuite(), release, sig)
+	if err == nil {
+		t.Fatal("expected ErrUntrustedSigner for non-pinned signer under matching pin")
+	}
+	if !errors.Is(err, ErrUntrustedSigner) {
+		t.Fatalf("err type wrong: %v (want ErrUntrustedSigner)", err)
+	}
+}
+
 // Compile-time anchor: these tests rely on openpgp.ArmoredDetachSign,
 // detachSignWith, etc. — keep imports honest.
 var _ = openpgp.NewEntity

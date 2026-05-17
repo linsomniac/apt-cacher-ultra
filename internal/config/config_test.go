@@ -433,6 +433,9 @@ dir = "`+dir+`"
 	if !cfg.Adoption.AllowShortKeyID {
 		t.Errorf("adoption.allow_short_keyid default should be true")
 	}
+	if cfg.Adoption.AcceptAnySigner {
+		t.Errorf("adoption.accept_any_signer default should be false")
+	}
 	if len(cfg.Adoption.KeyringDirs) != 0 {
 		t.Errorf("adoption.keyring_dirs default should be empty, got %v", cfg.Adoption.KeyringDirs)
 	}
@@ -461,6 +464,7 @@ enabled = true
 require_signature = false
 require_pinned_signer = true
 allow_short_keyid = false
+accept_any_signer = true
 keyring_dirs = ["/opt/extra/keys", "/etc/custom-keyrings"]
 
 [integrity]
@@ -488,6 +492,9 @@ fingerprints = ['648ACFD622F3D138B83D49C7DDF4D7C5C5E3A7B6', '0123456789abcdef012
 	}
 	if cfg.Adoption.AllowShortKeyID {
 		t.Errorf("adoption.allow_short_keyid not parsed from explicit false")
+	}
+	if !cfg.Adoption.AcceptAnySigner {
+		t.Errorf("adoption.accept_any_signer not parsed from explicit true")
 	}
 	if got := cfg.Adoption.KeyringDirs; len(got) != 2 || got[0] != "/opt/extra/keys" || got[1] != "/etc/custom-keyrings" {
 		t.Errorf("adoption.keyring_dirs = %v, want [/opt/extra/keys /etc/custom-keyrings]", got)

@@ -125,6 +125,31 @@ func TestBuildAdopter_PopulatedKeyring_RequireSignatureTrue_OK(t *testing.T) {
 	}
 }
 
+// TestBuildAdopter_EmptyKeyring_AcceptAnySigner_OK asserts the relaxed
+// startup guard: empty disk keyring + no embedded keys + adoption
+// enabled + require_signature = true is permitted when
+// accept_any_signer = true. The bypass branch runs for unpinned
+// suites without consulting any key, so the empty keyring is not a
+// startup error.
+func TestBuildAdopter_EmptyKeyring_AcceptAnySigner_OK(t *testing.T) {
+	withKeyringDirs(t, []string{t.TempDir()})
+	withoutEmbeddedKeys(t)
+
+	cfg := newAdoptionEnabledCfg(t, true /* requireSignature */)
+	cfg.Adoption.AcceptAnySigner = true
+	c, fetcher, hosts := newAdoptionWiringDeps(t)
+	a, k, err := buildAdopter(cfg, c, fetcher, hosts, silentBuildLogger())
+	if err != nil {
+		t.Fatalf("buildAdopter: %v (want nil under accept_any_signer)", err)
+	}
+	if a == nil {
+		t.Fatal("nil Adopter on success path")
+	}
+	if k == nil || !k.Empty() {
+		t.Fatalf("expected empty keyring; got %v", k)
+	}
+}
+
 func TestBuildAdopter_TrustedSignerCompiled(t *testing.T) {
 	// A populated [[trusted_signer]] block survives compilePins and
 	// reaches the verifier without error.

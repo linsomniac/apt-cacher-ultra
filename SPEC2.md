@@ -320,6 +320,19 @@ require_pinned_signer = false              # fail-closed when a suite has no
                                            # to true once every active suite
                                            # has an explicit pin (recommended
                                            # for production — see §7.6.5).
+accept_any_signer     = false              # when true, unpinned suites bypass
+                                           # the trust + cryptographic check
+                                           # at adoption time. The clearsign
+                                           # envelope (or Release.gpg) must
+                                           # still parse structurally, but
+                                           # the signer need not be known to
+                                           # the host keyring. Apt clients on
+                                           # the fleet remain the authoritative
+                                           # trust anchor via per-source
+                                           # Signed-By rules. Loud WARN at
+                                           # startup so the choice is
+                                           # auditable; see §7.6.2 (bypass
+                                           # branch) and §7.6.5 (posture).
 
 [integrity]
 validate_at_rest_interval = "24h"          # cadence for the at-rest sha256
@@ -342,8 +355,8 @@ Phase 1 validation (SPEC §5.2) carries forward. Phase 2 adds:
 
 - `freshness.max_concurrent_adoptions` is integer, ≥ 0.
 - `adoption.enabled`, `adoption.require_signature`,
-  `adoption.require_pinned_signer`, and `adoption.allow_short_keyid`
-  are bool.
+  `adoption.require_pinned_signer`, `adoption.allow_short_keyid`, and
+  `adoption.accept_any_signer` are bool.
 - `adoption.keyring_dirs` is a list of absolute directory paths;
   nonexistent paths are silently skipped at load.
 - `integrity.validate_at_rest_interval` parses as duration, ≥ 0.
@@ -361,6 +374,18 @@ Phase 1 validation (SPEC §5.2) carries forward. Phase 2 adds:
 configuration: a `WARN`-level startup log line names every suite that
 would adopt unverified metadata, so the operator's choice is visible in
 deployment journals.
+
+`adoption.accept_any_signer = true` is the analogous loud relaxation
+for the trust check: a `WARN`-level startup log line records the
+choice, the structured `phase2 adoption enabled` Info line includes
+`accept_any_signer=true`, and per-suite `adoption_unverified_signer`
+INFO lines fire once per (canonical_host, suite_path) the first time
+each suite adopts under the bypass. The relaxation is orthogonal to
+`require_signature` (presence is still enforced when `require_signature
+= true`) and respects every matching `[[trusted_signer]]` block (pins
+remain authoritative for the suites they cover). The empty-keyring
+startup guard (§7.6.1) is suppressed under this mode because the
+bypass branch never consults the keyring for unpinned suites.
 
 ---
 
@@ -815,7 +840,13 @@ the admin status page distinguishes them from operator-staged keys.
 On-disk keys take precedence over the bundled copy when the same
 primary fingerprint appears in both. An empty resulting keyring is a
 startup error iff `adoption.enabled = true` AND
-`adoption.require_signature = true`.
+`adoption.require_signature = true` AND
+`adoption.accept_any_signer = false`. With
+`adoption.accept_any_signer = true` the empty keyring is permitted
+because the §7.6.2 bypass branch never consults the keyring for
+unpinned suites; pinned suites whose fingerprint is absent from the
+keyring still fail at adoption time with `no_usable_signature` — the
+correct surface for "operator supplied a pin but no key satisfies it."
 
 For each `[[trusted_signer]]` block, the cache compiles the regex and
 canonicalizes the fingerprint list (uppercase, no whitespace).
@@ -830,12 +861,25 @@ if matching_blocks is empty:
   if adoption.require_pinned_signer == true:
     // Fail closed: no pin, no adoption.
     log "adoption_unpinned_suite" with canonical_host, suite_path; abort.
+  else if adoption.accept_any_signer == true:
+    // Bypass branch: skip the trust + cryptographic check entirely.
+    // §7.6.3 verification still enforces structural decode of the
+    // clearsign envelope (or Release.gpg) when require_signature = true.
+    trust_set := <bypass sentinel>
   else:
     trust_set := the entire host keyring
 else:
   union := UNION of matching_blocks[*].fingerprints
   trust_set := host_keyring keys whose fingerprint is in union
 ```
+
+`require_pinned_signer` is evaluated before `accept_any_signer`, so an
+operator who sets both keeps the "every suite must be pinned"
+requirement intact: unpinned suites still fail with
+`adoption_unpinned_suite` instead of taking the bypass branch. This
+preserves the explicit-choice-wins semantics — `accept_any_signer` is
+a relaxation of *trust verification within the broad-trust branch*,
+not a relaxation of *the requirement that pins exist*.
 
 The intersection semantics are deliberate: a `[[trusted_signer]]` block
 *narrows* trust below the host keyring; it cannot grant trust to a key
@@ -897,6 +941,37 @@ silent to keep the log surface a finite inventory rather than a per-
 tick noise stream, matching the existing
 `adoption_short_keyid_fallback` cadence (§7.6.3).
 
+**Bypass branch (accept_any_signer):** when §7.6.2 resolved the
+`<bypass sentinel>` for an unpinned suite under
+`adoption.accept_any_signer = true`, the verifier:
+
+- For inline `InRelease`: runs the structural-frame check
+  (no extraneous bytes around the clearsigned envelope, §7.6.3 step 1)
+  and `clearsign.Decode`. If no envelope is present and
+  `require_signature = true`, returns `missing_signature` as in the
+  strict path. Otherwise returns the cleartext between the BEGIN/END
+  markers without consulting any key and without verifying the
+  signature cryptographically.
+- For detached `Release` + `Release.gpg`: requires both bodies to be
+  non-empty (the freshness checker's invariant) and parses
+  `Release.gpg` as a PGP signature blob (the cheap structural guard
+  against garbage that would otherwise propagate untouched into the
+  pool). Returns `releaseBytes` verbatim without verifying the
+  signature cryptographically.
+
+The cache stores and serves the **original** signed bytes in both
+forms, so apt clients on the fleet receive a body their own keyring
+can validate end-to-end. The bypass affects only what the proxy
+itself asserts during adoption.
+
+The first acceptance on each (canonical_host, suite_path) emits an
+`adoption_unverified_signer` INFO line with the signer's long
+fingerprint (`fpr:<40-hex>`) when extractable from the signature, or
+the short keyid (`keyid:<16-hex>`) when only subpacket 16 is present.
+The log dedupes per (host, suite_path) per process, matching the
+existing once-log cadence. The signer field is best-effort: a
+malformed signature emits the line without it.
+
 #### 7.6.4 Library
 
 `github.com/ProtonMail/go-crypto/openpgp` (Q5). Pure Go, no cgo, tagged
@@ -951,6 +1026,44 @@ A future Phase could parse `Signed-By:` from
 automatically. That is out of scope for Phase 2 — the parser would
 need to handle apt's full sources-list syntax, including options
 quoting and the deb822 format, which is its own correctness surface.
+
+**Posture: `accept_any_signer = true` (delegation to fleet).**
+
+The relaxation is intended for deployments where the operator has
+deliberately chosen to make the proxy a transparent metadata mirror
+and rely on apt clients on the fleet as the authoritative trust
+anchor. Apt clients on modern Debian/Ubuntu hosts already enforce
+per-source `Signed-By:` rules: a forged `InRelease` adopted by the
+proxy will be rejected by every client whose source file pins a
+different key. The proxy under `accept_any_signer = true` is no less
+secure than apt's own historical pre-`Signed-By:` posture, and the
+client-side check is the same one operators already audit.
+
+The trade-off the operator accepts:
+
+- The proxy will spend disk and bandwidth on snapshots from any
+  upstream that serves a parseable clearsigned envelope, even when no
+  key for that signer is loaded. A hostile upstream could induce one
+  bogus snapshot per adoption cycle; client rejection bounds the
+  exposure but the cache still pays the I/O.
+- A compromised third-party upstream that the operator does not pin
+  can adopt arbitrary metadata for itself (not for other suites — the
+  cache's per-suite snapshots are keyed by canonical host). Clients
+  rejecting that suite's metadata is the recovery path.
+
+This mode is **not** suitable when:
+
+- The fleet's apt clients do not enforce per-source `Signed-By:` (very
+  old deployments without per-source trust narrowing).
+- The proxy serves clients the operator does not control.
+- Operational forensics rely on the cache surfacing trust failures
+  during adoption rather than at client-fetch time.
+
+When those conditions are absent and the operator has audited the
+client-side trust posture, `accept_any_signer = true` is a legitimate
+choice — particularly when the proxy must serve a long tail of
+third-party repos whose keys would otherwise require ongoing manual
+keyring maintenance on the cache host.
 
 ---
 
@@ -1130,6 +1243,16 @@ Phase 1 logging (SPEC §10) carries forward exactly. Phase 2 adds:
   matching `[[trusted_signer]]` block: `canonical_host`, `suite_path`.
   Adoption aborts before the verify step. Operator surface: a deployed
   cache rejecting adoptions for a suite the operator hadn't pinned.
+- **Bypass acceptance:** `adoption_unverified_signer` Info when
+  `adoption.accept_any_signer = true` and the §7.6.2 bypass branch
+  accepts a clearsigned envelope (or Release.gpg) for an unpinned
+  suite: `canonical_host`, `suite_path`, optional `signer` (the
+  signer's long fingerprint `fpr:<40-hex>` or short keyid
+  `keyid:<16-hex>` when extractable). Emitted at most once per
+  (canonical_host, suite_path) per process so the log surface is a
+  finite inventory of "which suites adopted under the relaxation"
+  rather than a per-tick stream. Operator surface: an audit trail of
+  effectively trusted upstreams under the relaxation.
 - **At-rest scan:** `at_rest_scan_started` and `at_rest_scan_finished`
   Info with `blob_count`, `mismatch_count`, `duration_ms`.
 - **Coverage gaps:** `package_hash_miss` Debug per `.deb` cache miss
@@ -1140,7 +1263,8 @@ Phase 1 logging (SPEC §10) carries forward exactly. Phase 2 adds:
 ### 10.3 Startup config dump (additions)
 
 Append: `adoption_enabled`, `adoption_require_signature`,
-`adoption_require_pinned_signer`, `integrity_validate_at_rest_interval`,
+`adoption_require_pinned_signer`, `adoption_accept_any_signer`,
+`integrity_validate_at_rest_interval`,
 `integrity_validate_at_rest_workers`, `max_concurrent_adoptions`,
 `trusted_signer_blocks` (count of compiled blocks; details would explode
 the line and aren't useful in the journal), `apt_keyring_keys` (count of
@@ -1165,6 +1289,9 @@ Phase 1 rows (SPEC §11) carry forward unchanged. Phase 2 adds:
 | Operator flips `adoption.enabled = false` mid-run | New observations of changed `InRelease` log "adoption disabled" and persist `inrelease_change_seen_at`; existing `current_snapshot_id`s keep serving normally. |
 | `[[trusted_signer]]` block has a regex matching a suite, but the fingerprint list doesn't intersect the host keyring | Trust set for that suite is empty → every adoption attempt fails with `adoption_gpg_failed` Info carrying the wrapped `no_usable_signature` sentinel. Detectable at startup config validation if the host keyring is also empty; not detectable otherwise (we cannot know which fingerprints are *expected* to be present at startup). |
 | `adoption.require_pinned_signer=true` and a freshness check observes a new `InRelease` for a suite with no matching `[[trusted_signer]]` block | Adoption aborts before the verify step; `adoption_unpinned_suite` Warn logs the canonical host and suite path; prior snapshot continues to serve. Operators expect this surface and use it to drive their pinning rollout. |
+| `adoption.accept_any_signer=true` and an unpinned suite's `InRelease` carries a signer absent from the host keyring | Adoption proceeds via the §7.6.2 bypass branch; clearsign envelope decoded structurally; cleartext used for parsing; original signed bytes stored and served to apt clients. First-touch `adoption_unverified_signer` Info names the suite and (when extractable) the signer fingerprint or short keyid. Subsequent adoptions for the same (host, suite_path) stay silent. Apt clients on the fleet remain the authoritative trust anchor. |
+| `adoption.accept_any_signer=true` and an unpinned suite's `Release.gpg` contains garbage that does not parse as a PGP signature | Adoption aborts with a decode error; prior snapshot stays current. The structural guard is intentional: the bypass relaxes the trust + crypto checks, not the requirement that the signature blob be syntactically a PGP signature. |
+| `adoption.accept_any_signer=true` AND a `[[trusted_signer]]` block matches the suite, but the upstream signs with a non-pinned key | Pin remains authoritative; adoption aborts with `adoption_gpg_failed` Info wrapping `untrusted_signer`, identical to the non-relaxation behavior. The relaxation only governs suites *with no matching pin*. |
 | Two distinct current snapshots reference the same `(canonical_host, .deb path)` with different declared sha256s | Both the §6.1 hit path and the §6.2 miss path fail closed with `502 + Retry-After: 60` and a `package_hash_conflict` log. This blocks .deb traffic for the affected path until the upstream divergence is resolved or one of the snapshots is re-adopted; the operator surface is unmistakable. |
 | §6.1 blob hit finds `url_path.blob_hash` disagreeing with `package_hash.declared_sha256` (stale Phase 1 row covered by a Phase 2 snapshot) | Evict the `url_path` row, decrement the prior blob's refcount, log `hit_path_hash_evicted`, fall through to §6.2 to re-fetch. The corrective re-fetch then runs the §6.2 validation; either it lands on the correct hash (steady state) or it produces a `hash_validation_failure` Error if upstream is also wrong. |
 | §7.5 step 5 finds an existing `pool/<hash>` whose content no longer matches its filename | Remove the corrupted file and `blob` row, log `pool_corruption_during_adoption`, fall through to fetch the member fresh from upstream. The member's hash is then validated against the declared sha256 as in any new fetch. |

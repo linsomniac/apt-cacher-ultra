@@ -417,6 +417,70 @@ func newDegradedGPGModel() htmlRenderModel {
 	return m
 }
 
+// TestGoldenAcceptAnySignerChipRendered asserts the keyring section
+// surfaces the "Trust: accept any signer" chip and exposes the
+// data-accept-any-signer="true" attribute that the inline JS reads to
+// adjust the gpg_failed hint text. Inert when the flag is off (default
+// fixtures don't set it).
+func TestGoldenAcceptAnySignerChipRendered(t *testing.T) {
+	m := newHealthyModel()
+	m.AcceptAnySigner = true
+	html := renderHTMLForGolden(t, m)
+
+	mustContain(t, html,
+		`data-accept-any-signer="true"`,
+		`Trust: accept any signer`,
+		// Hint text branch in the inline JS is selected via that data
+		// attribute. The substring is present in the JS source verbatim.
+		`gpg_failed typically indicates a structural decode failure`,
+	)
+}
+
+// TestGoldenAcceptAnySignerChipAbsentByDefault asserts the chip is
+// absent when the flag is off and the JS hint takes the original
+// branch.
+func TestGoldenAcceptAnySignerChipAbsentByDefault(t *testing.T) {
+	m := newHealthyModel()
+	// AcceptAnySigner intentionally left zero.
+	html := renderHTMLForGolden(t, m)
+
+	mustContain(t, html, `data-accept-any-signer="false"`)
+	mustNotContain(t, html, `Trust: accept any signer`)
+}
+
+// TestGoldenKeyringEmptyEnabled_AcceptAnySignerSuppressesCrit asserts
+// that with accept_any_signer = true, an empty keyring under enabled
+// adoption is NOT a critical state: the keys-chip drops the crit data
+// attribute, the empty block uses the non-crit class, and the message
+// frames the empty keyring as workable rather than broken.
+func TestGoldenKeyringEmptyEnabled_AcceptAnySignerSuppressesCrit(t *testing.T) {
+	m := newHealthyModel()
+	m.AdoptionEnabled = true
+	m.Keyring = nil
+	m.AcceptAnySigner = true
+	html := renderHTMLForGolden(t, m)
+
+	mustContain(t, html,
+		`data-adoption-enabled="true"`,
+		`data-accept-any-signer="true"`,
+		// Non-crit empty block — note absence of empty--crit modifier.
+		`<div class="empty"><div class="empty__head">NO GPG KEYS LOADED`,
+		// Body text mentions the relaxation context so the operator
+		// understands the empty keyring is intentional.
+		"accept_any_signer = true",
+		"Apt clients on the fleet remain the authoritative trust anchor",
+	)
+	mustNotContain(t, html, `empty empty--crit`)
+
+	chip := extractTag(html, "<a", `class="keys-chip"`)
+	if chip == "" {
+		t.Fatalf("could not locate <a class=\"keys-chip\"> anchor")
+	}
+	if strings.Contains(chip, `data-state="crit"`) {
+		t.Errorf("keys-chip anchor should not carry data-state=\"crit\" under accept_any_signer; anchor: %s", chip)
+	}
+}
+
 // --- helpers ----------------------------------------------------------------
 
 func mustContain(t *testing.T, html string, needles ...string) {

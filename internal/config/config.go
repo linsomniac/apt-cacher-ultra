@@ -195,6 +195,32 @@ type AdoptionConfig struct {
 	// INFO line the first time the fallback accepts a signature, so
 	// operators can inventory which repos depend on it.
 	AllowShortKeyID bool `toml:"allow_short_keyid"`
+
+	// AcceptAnySigner relaxes adoption-time trust verification for
+	// suites with no matching [[trusted_signer]] block. Default false
+	// (current secure posture). When true, the verifier decodes the
+	// clearsigned envelope (or Release.gpg) structurally and uses the
+	// resulting cleartext for parsing, but skips the trust-set check
+	// and the cryptographic verification — the upstream's signer need
+	// not be known to the host keyring. The original signed bytes are
+	// still what gets stored and served to apt clients, so the fleet's
+	// own per-source Signed-By trust remains the authoritative check.
+	//
+	// Suites with a matching [[trusted_signer]] block are unaffected:
+	// the pin remains authoritative and the trust+crypto check runs as
+	// before. This lets operators opt some suites into strict pinning
+	// while keeping broad relaxation for the rest.
+	//
+	// require_signature is orthogonal: when true, a clearsign envelope
+	// (or Release.gpg) must still be structurally present even though
+	// it is not verified. Set require_signature = false to also accept
+	// upstreams that publish unsigned Release files.
+	//
+	// One adoption_unverified_signer INFO line is emitted per
+	// (canonical_host, suite_path) per process the first time a suite
+	// adopts under this relaxation. A loud startup WARN names the
+	// configuration so the choice is auditable.
+	AcceptAnySigner bool `toml:"accept_any_signer"`
 }
 
 // HotPackagesConfig holds the SPEC3 §5.1 [hot_packages] block. The hot

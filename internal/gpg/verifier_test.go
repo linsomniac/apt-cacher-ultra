@@ -770,3 +770,249 @@ func TestVerifier_UntrustedSigner_LogsOncePerSuite(t *testing.T) {
 		t.Errorf("log missing rejected fingerprint %q in: %s", wantFP, got)
 	}
 }
+
+// TestVerifier_AcceptAnySigner_NoPin_InlinePassThrough asserts that
+// under accept_any_signer = true, a clearsigned InRelease signed by a
+// key NOT present in the host keyring is adopted: the cleartext is
+// returned and no trust / crypto check runs. This is the core
+// relaxation the SPEC2 §7.6.2 bypass branch implements.
+func TestVerifier_AcceptAnySigner_NoPin_InlinePassThrough(t *testing.T) {
+	signer := newTestEntity(t, "Untrusted", "untrusted@example.com")
+	other := newTestEntity(t, "Other", "other@example.com")
+	// Keyring contains `other` but NOT `signer`.
+	keyring := newKeyring(t, other)
+
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		AcceptAnySigner:  true,
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	body := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
+	plain, err := v.VerifyInline(context.Background(), newSuite(), body)
+	if err != nil {
+		t.Fatalf("VerifyInline: %v (want nil under accept_any_signer)", err)
+	}
+	if !bytes.Equal(plain, []byte(fakeReleasePlaintext)) {
+		t.Fatalf("plaintext mismatch:\n got=%q\nwant=%q", plain, fakeReleasePlaintext)
+	}
+}
+
+// TestVerifier_AcceptAnySigner_WithMatchingPin_StillEnforced asserts
+// that a [[trusted_signer]] block matching the suite remains
+// authoritative even when accept_any_signer is true. The relaxation
+// only governs unpinned suites; explicit per-suite pins must still
+// reject signers outside the pin's fingerprint list (otherwise the
+// "respect the pin" interaction documented in the spec amendment is
+// silently broken).
+func TestVerifier_AcceptAnySigner_WithMatchingPin_StillEnforced(t *testing.T) {
+	pinned := newTestEntity(t, "Pinned", "pinned@example.com")
+	other := newTestEntity(t, "Other", "other@example.com")
+	keyring := newKeyring(t, pinned, other)
+
+	pin := SignerPin{
+		HostRegex: regexp.MustCompile(`^archive\.example\.com$`),
+		Fingerprints: map[string]struct{}{
+			upperFP(pinned.PrimaryKey.Fingerprint): {},
+		},
+	}
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		Pins:             []SignerPin{pin},
+		RequireSignature: true,
+		AcceptAnySigner:  true,
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	// `other` is loaded in the host keyring but NOT in the pin; pinned
+	// trust is the narrow set, so signatures from `other` must be
+	// rejected as untrusted even with accept_any_signer on.
+	body := clearsignWith(t, other, []byte(fakeReleasePlaintext))
+	_, err = v.VerifyInline(context.Background(), newSuite(), body)
+	if err == nil {
+		t.Fatal("expected ErrUntrustedSigner for non-pinned signer under matching pin")
+	}
+	if !errors.Is(err, ErrUntrustedSigner) {
+		t.Fatalf("err type wrong: %v (want ErrUntrustedSigner)", err)
+	}
+
+	// Sanity: the pinned signer still passes.
+	bodyOK := clearsignWith(t, pinned, []byte(fakeReleasePlaintext))
+	if _, err := v.VerifyInline(context.Background(), newSuite(), bodyOK); err != nil {
+		t.Fatalf("pinned signer should still verify: %v", err)
+	}
+}
+
+// TestVerifier_AcceptAnySigner_MissingClearsign_RequireSig_StillRejected
+// asserts that the require_signature presence check is preserved under
+// the bypass. accept_any_signer relaxes the trust/crypto step, not the
+// "signature must be present" rule.
+func TestVerifier_AcceptAnySigner_MissingClearsign_RequireSig_StillRejected(t *testing.T) {
+	other := newTestEntity(t, "Other", "other@example.com")
+	keyring := newKeyring(t, other)
+
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		AcceptAnySigner:  true,
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	// Plain Release-style bytes with no clearsign envelope.
+	_, err = v.VerifyInline(context.Background(), newSuite(), []byte(fakeReleasePlaintext))
+	if !errors.Is(err, ErrMissingSignature) {
+		t.Fatalf("err = %v, want ErrMissingSignature", err)
+	}
+}
+
+// TestVerifier_AcceptAnySigner_NotClearsigned_RequireSigFalse asserts
+// the existing "unsigned-OK" passthrough is preserved: a body without
+// a clearsign envelope is returned verbatim when require_signature is
+// false, regardless of accept_any_signer.
+func TestVerifier_AcceptAnySigner_NotClearsigned_RequireSigFalse(t *testing.T) {
+	other := newTestEntity(t, "Other", "other@example.com")
+	keyring := newKeyring(t, other)
+
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: false,
+		AcceptAnySigner:  true,
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	body := []byte(fakeReleasePlaintext)
+	plain, err := v.VerifyInline(context.Background(), newSuite(), body)
+	if err != nil {
+		t.Fatalf("VerifyInline: %v", err)
+	}
+	if !bytes.Equal(plain, body) {
+		t.Fatalf("plaintext mismatch under require_signature=false passthrough")
+	}
+}
+
+// TestVerifier_AcceptAnySigner_RequirePinned_StillFailsClosed asserts
+// that require_pinned_signer wins over accept_any_signer for unpinned
+// suites. Operators that turned on require_pinned_signer expect every
+// suite to have an explicit pin; the accept_any_signer relaxation does
+// not negate that requirement.
+func TestVerifier_AcceptAnySigner_RequirePinned_StillFailsClosed(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		RequirePinned:    true,
+		AcceptAnySigner:  true,
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	body := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
+	_, err = v.VerifyInline(context.Background(), newSuite(), body)
+	if err == nil {
+		t.Fatal("expected ErrUnpinnedSuite under require_pinned_signer + no matching pin")
+	}
+	if !errors.Is(err, ErrUnpinnedSuite) {
+		t.Fatalf("err type wrong: %v (want ErrUnpinnedSuite)", err)
+	}
+}
+
+// TestVerifier_AcceptAnySigner_LogsOncePerSuite asserts the
+// adoption_unverified_signer INFO log fires exactly once for repeated
+// bypass acceptances of the same (canonical_host, suite_path), and a
+// different suite produces its own line. The signer field carries the
+// signer's long fingerprint when present.
+func TestVerifier_AcceptAnySigner_LogsOncePerSuite(t *testing.T) {
+	signer := newTestEntity(t, "Untrusted", "untrusted@example.com")
+	other := newTestEntity(t, "Other", "other@example.com")
+	keyring := newKeyring(t, other)
+
+	var logbuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		AcceptAnySigner:  true,
+		Logger:           logger,
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	body := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
+	suiteA := freshness.SuiteRef{CanonicalHost: "third.example.com", SuitePath: "/dists/stable"}
+	suiteB := freshness.SuiteRef{CanonicalHost: "third.example.com", SuitePath: "/dists/testing"}
+
+	for i := 0; i < 3; i++ {
+		if _, err := v.VerifyInline(context.Background(), suiteA, body); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	if _, err := v.VerifyInline(context.Background(), suiteB, body); err != nil {
+		t.Fatalf("second suite: %v", err)
+	}
+
+	got := logbuf.String()
+	occA := strings.Count(got, `"suite_path":"/dists/stable"`)
+	occB := strings.Count(got, `"suite_path":"/dists/testing"`)
+	if occA != 1 {
+		t.Errorf("expected exactly 1 unverified_signer log for stable, got %d; full log: %s", occA, got)
+	}
+	if occB != 1 {
+		t.Errorf("expected exactly 1 unverified_signer log for testing, got %d; full log: %s", occB, got)
+	}
+	if !strings.Contains(got, `"adoption_unverified_signer"`) {
+		t.Errorf("log missing adoption_unverified_signer message: %s", got)
+	}
+	wantSigner := "fpr:" + upperFP(signer.PrimaryKey.Fingerprint)
+	if !strings.Contains(got, wantSigner) {
+		t.Errorf("log missing signer fingerprint %q in: %s", wantSigner, got)
+	}
+}
+
+// TestVerifier_AcceptAnySigner_EmptyKeyring asserts the bypass branch
+// works when the host keyring is empty — the deployment posture where
+// the operator has deliberately chosen "delegate all trust to apt
+// clients" and supplied no host keys.
+func TestVerifier_AcceptAnySigner_EmptyKeyring(t *testing.T) {
+	signer := newTestEntity(t, "Untrusted", "untrusted@example.com")
+	empty, err := LoadKeyring(nil, silentLogger())
+	if err != nil {
+		t.Fatalf("LoadKeyring(nil): %v", err)
+	}
+
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          empty,
+		RequireSignature: true,
+		AcceptAnySigner:  true,
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	body := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
+	plain, err := v.VerifyInline(context.Background(), newSuite(), body)
+	if err != nil {
+		t.Fatalf("VerifyInline: %v", err)
+	}
+	if !bytes.Equal(plain, []byte(fakeReleasePlaintext)) {
+		t.Fatalf("plaintext mismatch")
+	}
+}
