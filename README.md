@@ -9,6 +9,8 @@ under DDoS.
 > **Contributing:** apt-cacher-ultra accepts AI-authored contributions only.
 > See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
 
+![Admin UI](docs/admin-ui.png)
+
 ## Status
 
 Functionality is complete.  I have it running in all my environments and am
