@@ -986,6 +986,42 @@ func TestVerifier_AcceptAnySigner_LogsOncePerSuite(t *testing.T) {
 	}
 }
 
+// TestVerifier_AcceptAnySigner_MalformedSignatureBody_StillRejected
+// asserts the requireParseableSignature guard for the inline bypass.
+// clearsign.Decode validates the BEGIN/END envelope, and armor.Decode
+// validates base64 framing, but neither proves the armored body
+// contains a parseable OpenPGP signature packet. Without the strict
+// guard, a clearsigned envelope whose armored body is garbage would
+// silently adopt under the bypass.
+func TestVerifier_AcceptAnySigner_MalformedSignatureBody_StillRejected(t *testing.T) {
+	other := newTestEntity(t, "Other", "other@example.com")
+	keyring := newKeyring(t, other)
+
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		AcceptAnySigner:  true,
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	// Build a clearsigned envelope whose armored signature body is
+	// arbitrary bytes that don't form a valid OpenPGP packet header
+	// (PGP packet tag's high bit is required; ASCII text typically
+	// fails the parse at the first byte).
+	body, err := assembleClearsignedBlock([]byte(fakeReleasePlaintext), []byte("not a signature packet"))
+	if err != nil {
+		t.Fatalf("assembleClearsignedBlock: %v", err)
+	}
+
+	_, err = v.VerifyInline(context.Background(), newSuite(), body)
+	if err == nil {
+		t.Fatal("expected error on clearsigned envelope with malformed signature body under accept_any_signer")
+	}
+}
+
 // TestVerifier_AcceptAnySigner_EmptyKeyring asserts the bypass branch
 // works when the host keyring is empty — the deployment posture where
 // the operator has deliberately chosen "delegate all trust to apt

@@ -258,7 +258,21 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 		// bytes are what callers will persist and serve to apt clients,
 		// so per-source Signed-By rules on the fleet remain the
 		// authoritative trust anchor.
-		v.logUnverifiedSignerOnce(suite, block.ArmoredSignature.Body)
+		//
+		// clearsign.Decode proved a BEGIN/END PGP SIGNATURE frame is
+		// present, but armor.Decode (lazy, on Body read) and the
+		// armored body itself can still contain no parseable signature
+		// packet. Require at least one *packet.Signature before
+		// accepting so the relaxation does not silently adopt
+		// clearsigned envelopes whose armored body is garbage.
+		sigBytes, err := readArmoredSignature(block.ArmoredSignature.Body)
+		if err != nil {
+			return nil, fmt.Errorf("read signature: %w", err)
+		}
+		if err := requireParseableSignature(bytes.NewReader(sigBytes)); err != nil {
+			return nil, fmt.Errorf("clearsigned signature body: %w", err)
+		}
+		v.logUnverifiedSignerOnce(suite, bytes.NewReader(sigBytes))
 		return block.Plaintext, nil
 	}
 
@@ -342,9 +356,19 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 		// trust + crypto verification is skipped. Release bytes are
 		// returned verbatim, matching the verified-bytes-equal-stored-
 		// bytes invariant.
+		//
+		// decodeMaybeArmoredSignature only structurally validates the
+		// ASCII-armor frame when present; for non-armored input it
+		// merely size-caps the bytes. requireParseableSignature is the
+		// invariant that "the body actually decodes as at least one
+		// OpenPGP signature packet" — without it, raw non-armored
+		// garbage under 64 KiB would propagate untouched into the pool.
 		binarySig, err := decodeMaybeArmoredSignature(sigBytes)
 		if err != nil {
 			return nil, fmt.Errorf("decode signature: %w", err)
+		}
+		if err := requireParseableSignature(bytes.NewReader(binarySig)); err != nil {
+			return nil, fmt.Errorf("Release.gpg signature body: %w", err)
 		}
 		v.logUnverifiedSignerOnce(suite, bytes.NewReader(binarySig))
 		return releaseBytes, nil
@@ -795,6 +819,33 @@ func (v *Verifier) logUnverifiedSignerOnce(suite freshness.SuiteRef, sigSource i
 		attrs = append(attrs, "signer", signerInfo)
 	}
 	v.logger.Info("adoption_unverified_signer", attrs...)
+}
+
+// requireParseableSignature reads OpenPGP packets from r and returns
+// nil as soon as it sees at least one *packet.Signature. Returns an
+// error if r contains no signature packet (EOF before any signature)
+// or any packet fails to parse.
+//
+// This is the structural-integrity guard for the accept_any_signer
+// bypass branches (SPEC2 §7.6.3): the trust + cryptographic check is
+// skipped, but a clearsign envelope or Release.gpg blob that doesn't
+// contain a parseable PGP signature packet must still be rejected —
+// otherwise raw non-armored garbage (which decodeMaybeArmoredSignature
+// only size-caps) would silently pass through to the pool.
+func requireParseableSignature(r io.Reader) error {
+	reader := packet.NewReader(r)
+	for {
+		pkt, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			return errors.New("signature body contains no signature packet")
+		}
+		if err != nil {
+			return fmt.Errorf("parse signature packet: %w", err)
+		}
+		if _, ok := pkt.(*packet.Signature); ok {
+			return nil
+		}
+	}
 }
 
 // extractSignerInfo reads the first signature packet from r and

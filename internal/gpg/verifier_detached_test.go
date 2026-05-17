@@ -423,6 +423,37 @@ func TestVerifyDetached_AcceptAnySigner_NoPin_PassThrough(t *testing.T) {
 	}
 }
 
+// TestVerifyDetached_AcceptAnySigner_RawGarbage_StillRejected asserts
+// the requireParseableSignature guard catches raw non-armored garbage
+// under 64 KiB: decodeMaybeArmoredSignature only size-caps non-armored
+// input, so without the packet-parse check, arbitrary bytes would
+// propagate untouched through the bypass branch into the pool. This
+// regression case was missed by the original
+// TestVerifyDetached_AcceptAnySigner_GarbageSignature_StillRejected,
+// which only exercised the armored-frame structural rejection.
+func TestVerifyDetached_AcceptAnySigner_RawGarbage_StillRejected(t *testing.T) {
+	other := newTestEntity(t, "Other", "other@example.com")
+	keyring := newKeyring(t, other)
+
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		AcceptAnySigner:  true,
+		Logger:           silentLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	release := []byte(fakeReleasePlaintext)
+	garbage := []byte("not a valid pgp signature, just plain text bytes")
+
+	_, err = v.VerifyDetached(context.Background(), newSuite(), release, garbage)
+	if err == nil {
+		t.Fatal("expected error on raw non-armored garbage Release.gpg under accept_any_signer")
+	}
+}
+
 // TestVerifyDetached_AcceptAnySigner_GarbageSignature_StillRejected
 // asserts the structural decode guard: a Release.gpg that does not
 // parse as a PGP signature is rejected even with accept_any_signer on.
