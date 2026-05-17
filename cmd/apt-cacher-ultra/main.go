@@ -375,6 +375,7 @@ func serveListeners(
 		"gc_pool_scan_workers", cfg.GC.PoolScanWorkers,
 		"gc_heartbeat_interval", cfg.GC.HeartbeatInterval.Duration,
 		"gc_heartbeat_stale_grace_effective", cfg.HeartbeatStaleGraceEffective(),
+		"gc_url_path_ttl", cfg.GC.URLPathTTL.Duration,
 		"admin_enabled", cfg.Admin.Enabled,
 		"admin_listen", cfg.Admin.Listen,
 		"admin_htpasswd_file", cfg.Admin.HtpasswdFile,
@@ -478,6 +479,7 @@ func serveListeners(
 		KeepDisplaced:       cfg.GC.KeepDisplaced,
 		PoolScanWorkers:     cfg.GC.PoolScanWorkers,
 		HeartbeatStaleGrace: cfg.HeartbeatStaleGraceEffective(),
+		URLPathTTL:          cfg.GC.URLPathTTL.Duration,
 	})
 	if err != nil {
 		return fmt.Errorf("build gc: %w", err)

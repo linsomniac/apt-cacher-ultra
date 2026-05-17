@@ -84,6 +84,12 @@ type Config struct {
 	// snapshot pass's sub-job A reaps candidate rows whose
 	// heartbeat_at is older than this. Must be > 0 when Enabled.
 	HeartbeatStaleGrace time.Duration
+
+	// URLPathTTL bounds how long a url_path row may sit untouched
+	// (gc.url_path_ttl). 0 disables the URL-path pass entirely.
+	// Validated by the config layer; the gc package treats 0 as a
+	// short-circuit (no batches run).
+	URLPathTTL time.Duration
 }
 
 // GC is the orchestrator. Run() owns the periodic tick loop;
@@ -112,6 +118,7 @@ type LastRunSummary struct {
 	BytesReclaimed          int64
 	OrphanCandidatesReaped  int
 	DisplacedReaped         int
+	URLPathRowsReaped       int
 	PoolOrphansRepaired     int
 	PoolOrphanBytesRepaired int64
 	PoolUnlinkErrors        int
@@ -230,6 +237,7 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		"bytes_reclaimed", tick.bytesReclaimed,
 		"orphan_candidates_reaped", tick.orphanCandidatesReaped,
 		"displaced_reaped", tick.displacedReaped,
+		"url_path_rows_reaped", tick.urlPathRowsReaped,
 		"pool_orphans_repaired", scan.orphansRepaired,
 		"pool_orphan_bytes_repaired", scan.orphanBytesRepaired,
 		"pool_unlink_errors", tick.poolUnlinkErrors+scan.unlinkErrors,
@@ -244,6 +252,7 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		tick.bytesReclaimed,
 		tick.orphanCandidatesReaped,
 		tick.displacedReaped,
+		tick.urlPathRowsReaped,
 		scan.orphansRepaired,
 		scan.orphanBytesRepaired,
 		tick.poolUnlinkErrors+scan.unlinkErrors,
@@ -257,6 +266,7 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		BytesReclaimed:          tick.bytesReclaimed,
 		OrphanCandidatesReaped:  tick.orphanCandidatesReaped,
 		DisplacedReaped:         tick.displacedReaped,
+		URLPathRowsReaped:       tick.urlPathRowsReaped,
 		PoolOrphansRepaired:     scan.orphansRepaired,
 		PoolOrphanBytesRepaired: scan.orphanBytesRepaired,
 		PoolUnlinkErrors:        tick.poolUnlinkErrors + scan.unlinkErrors,
@@ -297,6 +307,7 @@ func (g *GC) Run(ctx context.Context) {
 				"bytes_reclaimed", tick.bytesReclaimed,
 				"orphan_candidates_reaped", tick.orphanCandidatesReaped,
 				"displaced_reaped", tick.displacedReaped,
+				"url_path_rows_reaped", tick.urlPathRowsReaped,
 				"pool_orphans_repaired", 0,
 				"pool_orphan_bytes_repaired", int64(0),
 				"pool_unlink_errors", tick.poolUnlinkErrors,
@@ -311,6 +322,7 @@ func (g *GC) Run(ctx context.Context) {
 				tick.bytesReclaimed,
 				tick.orphanCandidatesReaped,
 				tick.displacedReaped,
+				tick.urlPathRowsReaped,
 				0,
 				0,
 				tick.poolUnlinkErrors,
@@ -324,6 +336,7 @@ func (g *GC) Run(ctx context.Context) {
 				BytesReclaimed:          tick.bytesReclaimed,
 				OrphanCandidatesReaped:  tick.orphanCandidatesReaped,
 				DisplacedReaped:         tick.displacedReaped,
+				URLPathRowsReaped:       tick.urlPathRowsReaped,
 				PoolOrphansRepaired:     0,
 				PoolOrphanBytesRepaired: 0,
 				PoolUnlinkErrors:        tick.poolUnlinkErrors,
@@ -340,6 +353,7 @@ type tickResult struct {
 	bytesReclaimed         int64
 	orphanCandidatesReaped int
 	displacedReaped        int
+	urlPathRowsReaped      int
 	poolUnlinkErrors       int
 	deadlineReached        bool
 }
@@ -354,6 +368,21 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	deadline := time.Now().Add(g.cfg.MaxTickDuration)
 
 	var res tickResult
+
+	// URL-path TTL pass — runs first so any refcount decrements
+	// land before the same-tick blob pass evaluates reachability.
+	// Short-circuits when URLPathTTL is 0 (operator disabled the
+	// pass).
+	if ttl := int64(g.cfg.URLPathTTL.Seconds()); ttl > 0 {
+		n, urlPathDeadline, err := g.runURLPathPass(ctx, deadline, phase, ttl)
+		res.urlPathRowsReaped += n
+		if urlPathDeadline {
+			res.deadlineReached = true
+		}
+		if err != nil {
+			return res, err
+		}
+	}
 
 	// Snapshot pass.
 	snap, snapDeadline, err := g.runSnapshotPass(ctx, deadline, phase)

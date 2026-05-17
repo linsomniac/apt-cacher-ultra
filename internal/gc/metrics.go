@@ -50,6 +50,12 @@ var (
 		0,
 	)
 
+	gcURLPathRowsReapedTotal = metrics.NewCounterWithCap(
+		"acu_gc_url_path_rows_reaped_total",
+		"Total url_path rows reaped by the URL-path TTL pass (SPEC4 §5 fourth class).",
+		0,
+	)
+
 	gcPoolOrphansRepairedTotal = metrics.NewCounterWithCap(
 		"acu_gc_pool_orphans_repaired_total",
 		"Pool/ orphans repaired (startup-only contribution; periodic ticks emit 0) (SPEC5 §10.4.5).",
@@ -111,6 +117,7 @@ func emitGCMetrics(
 	bytesReclaimed int64,
 	orphanCandidatesReaped int,
 	displacedReaped int,
+	urlPathRowsReaped int,
 	poolOrphansRepaired int,
 	poolOrphanBytesRepaired int64,
 	poolUnlinkErrors int,
@@ -130,6 +137,9 @@ func emitGCMetrics(
 	}
 	if displacedReaped > 0 {
 		gcDisplacedReapedTotal.Add(float64(displacedReaped))
+	}
+	if urlPathRowsReaped > 0 {
+		gcURLPathRowsReapedTotal.Add(float64(urlPathRowsReaped))
 	}
 	if poolOrphansRepaired > 0 {
 		gcPoolOrphansRepairedTotal.Add(float64(poolOrphansRepaired))

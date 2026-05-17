@@ -239,6 +239,29 @@ pool_scan_workers     = 4
 # (max(upstream.total_timeout * upstream.max_retries, 30m)).
 heartbeat_interval    = "60s"
 
+# URL-path TTL — the fourth GC reap class. A url_path row whose
+# last_requested_at is older than this AND whose (scheme, host, path)
+# is NOT vouched for by any current snapshot's package_hash is
+# deleted. The deletion decrements the row's blob refcount; once the
+# refcount reaches 0 and gc.blob_grace elapses, the existing blob GC
+# reaps the on-disk bytes. Rows with last_requested_at IS NULL (rows
+# pre-warmed by adoption but never served) are protected
+# unconditionally.
+#
+# The primary use case is to cache a *current* working set: an "apt
+# update" before "apt install" is a reasonable precondition, so paths
+# the fleet hasn't asked for in this window are unlikely to be hit
+# again before upstream rolls them off anyway. Tune up for caches
+# that serve archival workloads (CI pinning ancient versions,
+# security backports across years), tune down for tight-disk
+# deployments. Set to "0s" to disable URL-path expiration entirely
+# (the Phase 1-4 default: only hash-mismatch eviction at serve time
+# touches url_path).
+#
+# Values >0 must be >= 1m to avoid thrashing under request bursts;
+# rejected at load below that bound.
+url_path_ttl          = "168h"
+
 [serve]
 serve_stale_when_upstream_down = true
 log_stale_serves               = true

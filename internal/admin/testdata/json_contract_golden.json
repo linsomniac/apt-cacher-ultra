@@ -11,7 +11,8 @@
     "bytes_used": 536870912,
     "blob_count": 4321,
     "url_path_count": 4500,
-    "zero_refcount_backlog": 12
+    "zero_refcount_backlog": 12,
+    "actually_reapable_blobs": 0
   },
   "cache_summary": {
     "by_host": {
@@ -95,6 +96,7 @@
     "last_run_duration_seconds": 1.5,
     "orphan_candidates_reaped": 2,
     "displaced_reaped": 1,
+    "url_path_rows_reaped": 0,
     "pool_orphans_repaired": 0,
     "pool_orphan_bytes_repaired": 0,
     "pool_unlink_errors": 0

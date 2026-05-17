@@ -448,3 +448,143 @@ func (c *Cache) HeartbeatBlobs(ctx context.Context, hashes []string) error {
 		return nil
 	})
 }
+
+// RunURLPathGCBatch executes one writer-tx URL-path-TTL batch:
+//
+//  1. BEGIN
+//  2. SELECT up to batchSize url_path candidates whose last_requested_at
+//     is older than now-ttlSeconds AND which are not vouched for by any
+//     current snapshot's package_hash. Rows with last_requested_at IS
+//     NULL (adoption-pre-warmed but never served) are protected
+//     unconditionally; rows whose (scheme, host, path) appears in a
+//     current snapshot's package_hash are protected so a hot-set entry
+//     the fleet hasn't yet fetched is not eagerly evicted.
+//  3. DELETE the rows
+//  4. For each deleted row with a non-NULL blob_hash, decrement
+//     blob.refcount and set refcount_zeroed_at when the refcount
+//     crosses to <= 0 — mirrors EvictURLPath's bookkeeping exactly so
+//     the next blob-GC pass can reap the bytes once gc.blob_grace
+//     elapses.
+//  5. COMMIT
+//
+// ttlSeconds is `gc.url_path_ttl.Seconds()`. The caller MUST verify
+// ttlSeconds > 0 before invoking; a 0 value means the TTL pass is
+// disabled and RunURLPathGCBatch should not be called.
+//
+// Returns the number of url_path rows deleted. The returned count is
+// the row count, not the blob count — multiple url_path rows can point
+// at the same blob, so the resulting blob.refcount decrement count
+// equals the row count, not distinct blob count.
+//
+// AIDEV-NOTE: this is the SPEC4 §5 fourth reap class (after blobs,
+// orphan candidate snapshots, displaced snapshots). It does not unlink
+// any pool bytes itself — that remains the blob pass's job, which fires
+// on the next tick (or next batch within the same tick) once refcount
+// has been decremented to <= 0 and the blob_grace window elapses.
+func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds int64) (int, error) {
+	if batchSize < 1 {
+		return 0, fmt.Errorf("RunURLPathGCBatch: batchSize must be >= 1, got %d", batchSize)
+	}
+	if ttlSeconds <= 0 {
+		return 0, fmt.Errorf("RunURLPathGCBatch: ttlSeconds must be > 0, got %d", ttlSeconds)
+	}
+	now := nowUnix()
+	cutoff := now - ttlSeconds
+
+	const selectSQL = `
+SELECT canonical_scheme, canonical_host, path, blob_hash
+  FROM url_path
+ WHERE last_requested_at IS NOT NULL
+   AND last_requested_at < ?
+   AND NOT EXISTS (
+         SELECT 1 FROM package_hash ph
+          WHERE ph.canonical_scheme = url_path.canonical_scheme
+            AND ph.canonical_host   = url_path.canonical_host
+            AND ph.path             = url_path.path
+            AND ph.snapshot_id IN (
+                  SELECT current_snapshot_id FROM suite_freshness
+                   WHERE current_snapshot_id IS NOT NULL
+                )
+       )
+ ORDER BY last_requested_at
+ LIMIT ?`
+
+	type row struct {
+		scheme, host, path string
+		blobHash           sql.NullString
+	}
+
+	var reaped int
+	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("RunURLPathGCBatch: begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		rows, err := tx.QueryContext(ctx, selectSQL, cutoff, batchSize)
+		if err != nil {
+			return fmt.Errorf("RunURLPathGCBatch: select: %w", err)
+		}
+		var batch []row
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.scheme, &r.host, &r.path, &r.blobHash); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("RunURLPathGCBatch: scan: %w", err)
+			}
+			batch = append(batch, r)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("RunURLPathGCBatch: iter: %w", err)
+		}
+		_ = rows.Close()
+
+		if len(batch) == 0 {
+			return tx.Commit()
+		}
+
+		// AIDEV-NOTE: per-row DELETE + UPDATE rather than a bulk DELETE
+		// because we need to decrement the matching blob.refcount only
+		// when the url_path row actually went away (an idempotent
+		// guard: if a concurrent EvictURLPath wins the row between
+		// SELECT and DELETE, we must NOT double-decrement). Idempotency
+		// here is the same property EvictURLPath relies on.
+		for _, r := range batch {
+			res, err := tx.ExecContext(ctx, `
+DELETE FROM url_path
+ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ?`,
+				r.scheme, r.host, r.path)
+			if err != nil {
+				return fmt.Errorf("RunURLPathGCBatch: delete: %w", err)
+			}
+			affected, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("RunURLPathGCBatch: rows affected: %w", err)
+			}
+			if affected == 0 {
+				continue
+			}
+			reaped++
+			if r.blobHash.Valid && r.blobHash.String != "" {
+				if _, err := tx.ExecContext(ctx, `
+UPDATE blob
+   SET refcount = refcount - 1,
+       refcount_zeroed_at = COALESCE(
+         refcount_zeroed_at,
+         IIF(refcount - 1 <= 0, ?, NULL)
+       )
+ WHERE hash = ?`,
+					now, r.blobHash.String); err != nil {
+					return fmt.Errorf("RunURLPathGCBatch: decrement refcount: %w", err)
+				}
+			}
+		}
+		return tx.Commit()
+	})
+	if werr != nil {
+		return 0, werr
+	}
+	return reaped, nil
+}

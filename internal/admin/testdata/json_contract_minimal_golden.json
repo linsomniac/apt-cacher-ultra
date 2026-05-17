@@ -11,7 +11,8 @@
     "bytes_used": 0,
     "blob_count": 0,
     "url_path_count": 0,
-    "zero_refcount_backlog": 0
+    "zero_refcount_backlog": 0,
+    "actually_reapable_blobs": 0
   },
   "cache_summary": {
     "by_host": {}

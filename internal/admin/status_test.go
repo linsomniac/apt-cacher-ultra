@@ -225,7 +225,7 @@ func TestVitalState(t *testing.T) {
 	}{
 		{"cache_healthy", func(*htmlRenderModel) {}, "cache", "ok"},
 		{"cache_stale_empty_bytes", func(m *htmlRenderModel) { m.Cache.BytesUsed = 0 }, "cache", "stale"},
-		{"cache_watching_backlog", func(m *htmlRenderModel) { m.Cache.ZeroRefcountBacklog = 1001 }, "cache", "warn"},
+		{"cache_watching_backlog", func(m *htmlRenderModel) { m.Cache.ActuallyReapableBlobs = 1001 }, "cache", "warn"},
 		{"cache_crit_pool_unlink", func(m *htmlRenderModel) { m.GC.PoolUnlinkErrors = 1 }, "cache", "crit"},
 
 		{"suites_stale_empty", func(*htmlRenderModel) {}, "suites", "stale"},
@@ -389,7 +389,7 @@ func TestVerdictExplanation(t *testing.T) {
 	}
 
 	watching := healthy
-	watching.Cache.ZeroRefcountBacklog = 5000 // cache watching
+	watching.Cache.ActuallyReapableBlobs = 5000 // cache watching
 	if got := verdictExplanation(watching); !contains(got, "Watching") {
 		t.Errorf("verdictExplanation(watching) = %q; want 'Watching'", got)
 	}

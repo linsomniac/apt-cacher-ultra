@@ -473,6 +473,26 @@ pool_scan_workers     = 4
 # already exceed grace on a single missed tick). 0s is rejected
 # at load.
 heartbeat_interval    = "60s"
+
+# URL-path TTL — the fourth reap class (§9.6.5). A url_path row
+# whose last_requested_at is older than this AND whose
+# (canonical_scheme, canonical_host, path) is not vouched for by
+# any current snapshot's package_hash is deleted; the row's
+# blob.refcount is decremented in the same writer-tx, after which
+# the existing blob pass (§9.6.2) reaps the bytes once
+# `blob_grace` elapses. Rows with `last_requested_at IS NULL`
+# (rows pre-warmed by adoption but never served) are protected
+# unconditionally so a hot-set entry the fleet has not yet
+# fetched is not eagerly evicted. Default 168h (7 days) — the
+# proxy's primary use case is to cache a *current* working set,
+# and an "apt update" before "apt install" is a reasonable
+# precondition for installing packages the cache may have aged
+# out. Set to 0s to disable the URL-path pass entirely (the Phase
+# 1-3 behavior — only hash-mismatch eviction at serve time and
+# adoption-time refcount decrement reach url_path); 0s is the
+# only permitted sub-1m value (values >0 but <1m are rejected at
+# load to avoid request-burst thrashing).
+url_path_ttl          = "168h"
 ```
 
 ### 5.2 Config validation (deltas)
@@ -503,6 +523,12 @@ adds:
 - `gc.keep_displaced` parses as int, ≥ 0. 0 is permitted (means
   "no forensic retention").
 - `gc.pool_scan_workers` parses as int, ≥ 1.
+- `gc.url_path_ttl` parses as duration, ≥ 0. `0s` disables the
+  URL-path pass entirely (the Phase 1-3 behavior — see §9.6.5).
+  Values >0 are rejected if below 1m: a sub-minute TTL would let
+  a transient request burst followed by a quiet minute reap rows
+  that are still operationally hot, producing thrash with no
+  bound on the resulting upstream re-fetch storm.
 - `gc.heartbeat_interval` parses as duration, > 0. 0 is rejected
   at load (a 0-interval ticker is an infinite busy-loop). Loaders
   also reject two cross-key violations:
@@ -973,7 +999,7 @@ re-picked-up next tick.
 The Phase 4 GC subsystem runs as a single dedicated goroutine,
 started in `main` after the §4.2 startup sequence (steps 5–6 —
 pool scan and one-shot GC pass) completes and before listeners
-come up (§4.2 step 9). It owns four reap classes — three
+come up (§4.2 step 9). It owns five reap classes — four
 periodic, one startup-only.
 
 #### 9.6.1 Goroutine lifecycle
@@ -982,41 +1008,49 @@ periodic, one startup-only.
 on startup (in §4.2 step 6, blocking; §4.2 step 5 — the pool
 scan — runs first and is independent of this loop):
   deadline := now + gc.max_tick_duration
-  1. Run snapshot GC pass (§9.6.3, batched, deadline-bounded)
-  2. Run blob GC pass     (§9.6.2, batched, deadline-bounded)
+  1. Run url_path TTL pass (§9.6.5, batched, deadline-bounded;
+                            short-circuit if gc.url_path_ttl = 0s)
+  2. Run snapshot GC pass  (§9.6.3, batched, deadline-bounded)
+  3. Run blob GC pass      (§9.6.2, batched, deadline-bounded)
 
 then, every gc.interval:
   deadline := now + gc.max_tick_duration
-  3. Run snapshot GC pass
-  4. Run blob GC pass
+  4. Run url_path TTL pass
+  5. Run snapshot GC pass
+  6. Run blob GC pass
 
 on lifecycleCtx cancel:
   exit at next per-batch boundary
 ```
 
-**One per-tick deadline shared across both passes.** The
-deadline is computed once at tick start, before the snapshot
-pass begins; both passes see the same `time.Now().After(deadline)`
-clock. If the snapshot pass exhausts the deadline (large startup
-backlog of orphan candidates / displaced snapshots), the blob
-pass receives an already-expired deadline and exits immediately
-with `gc_tick_deadline_reached`. The next tick re-runs both
-passes; under sustained backlog, the snapshot pass drains over
-several ticks before the blob pass starts reaping. This is
+**One per-tick deadline shared across all three passes.** The
+deadline is computed once at tick start, before the URL-path
+pass begins; all three passes see the same
+`time.Now().After(deadline)` clock. If an earlier pass exhausts
+the deadline (large startup backlog of url_path rows, orphan
+candidates, or displaced snapshots), later passes receive an
+already-expired deadline and exit immediately with
+`gc_tick_deadline_reached`. The next tick re-runs all three
+passes; under sustained backlog, earlier passes drain over
+several ticks before later passes start reaping. This is
 correct: the operator sees `gc_tick_deadline_reached` and can
-raise `gc.max_tick_duration` or `gc.snapshot_batch_size` if
+raise `gc.max_tick_duration` or the relevant batch_size if
 needed, and the steady state is unaffected (no realistic steady
-state has a large enough snapshot backlog to monopolize a tick).
+state has a large enough backlog to monopolize a tick).
 
-**Order matters within a tick.** Snapshot GC runs *before* blob
-GC because deleting `snapshot_member` and `suite_snapshot` rows
-(§9.6.3) removes FK references that the blob GC's NOT EXISTS
-predicate (§9.6.2) consults. With this order, a tick that
-displaces snapshot `S` and reaps blob `B` (referenced only by
-`S`'s `snapshot_member` row) drains both in one tick: snapshot
-GC deletes the `snapshot_member` row, and blob GC then sees the
-FK reference is gone. The reverse order would leave `B`
-ineligible for one full tick.
+**Order matters within a tick.** URL-path TTL runs *first* so
+its blob-refcount decrements land before the same-tick blob pass
+evaluates reachability — a url_path row reaped at 00:00:01 can
+produce a blob reap at 00:00:02 in the same tick rather than
+waiting a full `gc.interval` for the next round. Snapshot GC
+runs *between* url_path and blob because deleting
+`snapshot_member` and `suite_snapshot` rows (§9.6.3) removes FK
+references that the blob GC's NOT EXISTS predicate (§9.6.2)
+consults. With this order, a tick that ages out a url_path row,
+displaces snapshot `S`, and reaps blob `B` (referenced only by
+the url_path row and by `S`'s `snapshot_member` row) drains all
+three in one tick. Reversing any pair would leave intermediate
+work pending for an extra tick.
 
 Within each pass, every per-batch transaction completes
 atomically; a `lifecycleCtx` cancel between batches is benign
@@ -1515,6 +1549,76 @@ a bug elsewhere (manual operator copy, a previous-version
 filesystem layout) that the operator should diagnose before
 the daemon mutates state. Logging-only is the conservative
 posture.
+
+#### 9.6.5 URL-path TTL pass
+
+Phase 1-3 caches accumulate `url_path` rows monotonically: every
+distinct (canonical_scheme, canonical_host, path) the proxy
+serves (or that adoption pre-warms) writes a row, and the only
+removal site is the SPEC2 §6.1 step 5 hash-mismatch eviction —
+which fires only when a Phase 2 snapshot's `package_hash` row
+disagrees with the cached `url_path.blob_hash`. For caches that
+proxy a long tail of third-party repos with high path churn (CI
+artifacts, rotating builds, packaging mistakes, paths upstream
+404s but apt still requests), the table grows unbounded and
+pins the referenced blobs indefinitely via the §9.6.2 NOT EXISTS
+predicate — making them "still reachable from a `url_path`
+row" and therefore not reapable even when no client has actually
+hit the path in months.
+
+The Phase 4 URL-path TTL pass closes that gap. A `url_path` row
+is reapable iff:
+
+- `last_requested_at IS NOT NULL` — rows pre-warmed by adoption
+  but never served carry NULL here, and are protected
+  unconditionally so a hot-set entry the fleet has not yet
+  fetched is not eagerly evicted. The CommitAdoption Step 3a
+  upsert specifically preserves NULL when the row was inserted
+  by a pre-warm (no `last_requested_at = excluded.last_requested_at`
+  in the DO UPDATE).
+- `last_requested_at < now - gc.url_path_ttl` — outside the TTL
+  window.
+- The `(canonical_scheme, canonical_host, path)` triple does
+  **not** appear in any `package_hash` row whose `snapshot_id`
+  is in `(SELECT current_snapshot_id FROM suite_freshness WHERE
+  current_snapshot_id IS NOT NULL)`. A path declared by any
+  current snapshot's `Packages*` member is protected — it's part
+  of the live working set the cache vouches for. Displaced
+  snapshots' `package_hash` rows do **not** protect (those
+  snapshots are themselves eligible for §9.6.3 reaping).
+
+Per-batch: the writer-tx selects up to `gc.batch_size`
+candidates, then per-row issues `DELETE FROM url_path` followed
+by the same `UPDATE blob SET refcount = refcount - 1,
+refcount_zeroed_at = COALESCE(refcount_zeroed_at, IIF(refcount -
+1 <= 0, ?, NULL)) WHERE hash = ?` that EvictURLPath uses (Rule
+3, SPEC4 §7.5.1) — preserving the existing grace-clock semantic
+across both eviction paths. Per-row rather than bulk DELETE
+because we need to skip refcount decrement when a concurrent
+EvictURLPath wins the row between SELECT and DELETE (idempotency
+guard inherited from EvictURLPath).
+
+`gc.url_path_ttl = 0s` short-circuits the pass entirely
+(`runURLPathPass` returns immediately); the per-tick deadline
+is unaffected by the pass when disabled. This is the only
+operationally-meaningful 0 value for any `gc.*` duration —
+unlike `blob_grace = 0s` (unsafe; rejected at load), a 0 TTL
+restores the Phase 1-3 behavior where url_path rows are
+permanent unless serve-time hash-mismatch evicts them.
+
+Telemetry: per-tick `url_path_rows_reaped` in `gc_run_complete`
+(both startup and periodic phases); per-process
+`acu_gc_url_path_rows_reaped_total` counter. The status page's
+gc block carries the most-recent tick's count under
+`gc.url_path_rows_reaped`.
+
+Migration: no schema change. The Phase 1 schema's
+`idx_url_path_last_req` (`CREATE INDEX idx_url_path_last_req ON
+url_path(last_requested_at)`) already provides the b-tree the
+SELECT predicate orders by; the additional NOT EXISTS subquery
+runs against `package_hash`'s `(canonical_scheme,
+canonical_host, path, snapshot_id)` primary key. Both indexes
+pre-date Phase 4.
 
 ---
 

@@ -223,11 +223,12 @@ type processInfo struct {
 }
 
 type cacheInfo struct {
-	Dir                 string `json:"dir"`
-	BytesUsed           int64  `json:"bytes_used"`
-	BlobCount           int64  `json:"blob_count"`
-	URLPathCount        int64  `json:"url_path_count"`
-	ZeroRefcountBacklog int64  `json:"zero_refcount_backlog"`
+	Dir                   string `json:"dir"`
+	BytesUsed             int64  `json:"bytes_used"`
+	BlobCount             int64  `json:"blob_count"`
+	URLPathCount          int64  `json:"url_path_count"`
+	ZeroRefcountBacklog   int64  `json:"zero_refcount_backlog"`
+	ActuallyReapableBlobs int64  `json:"actually_reapable_blobs"`
 }
 
 type listenerInfo struct {
@@ -276,6 +277,7 @@ type gcInfo struct {
 	LastRunDurationSeconds  float64 `json:"last_run_duration_seconds"`
 	OrphanCandidatesReaped  int     `json:"orphan_candidates_reaped"`
 	DisplacedReaped         int     `json:"displaced_reaped"`
+	URLPathRowsReaped       int     `json:"url_path_rows_reaped"`
 	PoolOrphansRepaired     int     `json:"pool_orphans_repaired"`
 	PoolOrphanBytesRepaired int64   `json:"pool_orphan_bytes_repaired"`
 	PoolUnlinkErrors        int     `json:"pool_unlink_errors"`
@@ -385,11 +387,12 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 			GoVersion:       s.cfg.BuildInfo.GoVersion,
 		},
 		Cache: cacheInfo{
-			Dir:                 s.cfg.Cache.Dir(),
-			BytesUsed:           st.TotalBytes,
-			BlobCount:           st.BlobCount,
-			URLPathCount:        st.URLPathCount,
-			ZeroRefcountBacklog: st.ZeroRefcountBacklog,
+			Dir:                   s.cfg.Cache.Dir(),
+			BytesUsed:             st.TotalBytes,
+			BlobCount:             st.BlobCount,
+			URLPathCount:          st.URLPathCount,
+			ZeroRefcountBacklog:   st.ZeroRefcountBacklog,
+			ActuallyReapableBlobs: st.ActuallyReapableBlobs,
 		},
 		CacheSummary:    buildCacheSummary(summaryMap),
 		RepoCoverage:    buildRepoCoverageInfo(repo, s.cfg.AdoptionArchitectures),
@@ -417,6 +420,7 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 		gci.LastRunDurationSeconds = summary.DurationSeconds
 		gci.OrphanCandidatesReaped = summary.OrphanCandidatesReaped
 		gci.DisplacedReaped = summary.DisplacedReaped
+		gci.URLPathRowsReaped = summary.URLPathRowsReaped
 		gci.PoolOrphansRepaired = summary.PoolOrphansRepaired
 		gci.PoolOrphanBytesRepaired = summary.PoolOrphanBytesRepaired
 		gci.PoolUnlinkErrors = summary.PoolUnlinkErrors
@@ -1093,7 +1097,8 @@ table.data tbody td::before{content:attr(data-label);font-size:10px;letter-spaci
       <span class="vital__value">{{formatBytes .Cache.BytesUsed}}</span>
       <span class="vital__sub">
         <span>{{.Cache.BlobCount}} blobs across {{.Cache.URLPathCount}} URL paths</span>
-        {{if gt .Cache.ZeroRefcountBacklog 1000}}<span class="accented-warn">Zero-refcount backlog {{.Cache.ZeroRefcountBacklog}}</span>{{else}}<span>Zero-refcount backlog {{.Cache.ZeroRefcountBacklog}}</span>{{end}}
+        <span title="Blobs whose refcount column has reached 0 — the GC candidate-set filter. Most are still reachable via cached URL paths or snapshots and are NOT slack; see 'Reapable' for the strict subset the GC will actually delete.">Zero-refcount backlog: {{.Cache.ZeroRefcountBacklog}}</span>
+        {{if gt .Cache.ActuallyReapableBlobs 1000}}<span class="accented-warn" title="Blobs satisfying the full GC reap predicate (refcount<=0 AND no url_path / snapshot_member / suite_snapshot references). This is the meaningful 'GC behind' signal — if it keeps growing, the GC tick budget or batch size is undersized.">Reapable: {{.Cache.ActuallyReapableBlobs}}</span>{{else}}<span title="Blobs satisfying the full GC reap predicate (refcount<=0 AND no url_path / snapshot_member / suite_snapshot references). This is the meaningful 'GC behind' signal — if it keeps growing, the GC tick budget or batch size is undersized.">Reapable: {{.Cache.ActuallyReapableBlobs}}</span>{{end}}
       </span>
     </article>
     <article class="vital" data-vital="suites" data-state="{{$suitesState}}">
@@ -1776,7 +1781,7 @@ func vitalState(kind string, m htmlRenderModel) string {
 		if m.Cache.BytesUsed == 0 {
 			return "stale"
 		}
-		if m.Cache.ZeroRefcountBacklog > 1000 {
+		if m.Cache.ActuallyReapableBlobs > 1000 {
 			return "warn"
 		}
 		return "ok"

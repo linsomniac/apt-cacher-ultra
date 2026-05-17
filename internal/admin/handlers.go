@@ -356,6 +356,7 @@ func (s *Server) refreshCacheStats(parent context.Context) {
 	s.gauges.blobsDBCount.Set(float64(stats.BlobCount))
 	s.gauges.blobsDBTotalBytes.Set(float64(stats.TotalBytes))
 	s.gauges.blobsZeroRefcountBacklog.Set(float64(stats.ZeroRefcountBacklog))
+	s.gauges.blobsActuallyReapable.Set(float64(stats.ActuallyReapableBlobs))
 	s.gauges.urlPathsTracked.Set(float64(stats.URLPathCount))
 }
 

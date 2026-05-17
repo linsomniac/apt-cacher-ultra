@@ -312,6 +312,27 @@ type GCConfig struct {
 	// adoptions; rejected at load with gc_heartbeat_interval_unsafe
 	// Error.
 	HeartbeatInterval Duration `toml:"heartbeat_interval"`
+
+	// URLPathTTL bounds how long a url_path row may sit untouched
+	// (last_requested_at older than now-ttl) before the GC pass
+	// deletes it. Deletion decrements the row's blob's refcount,
+	// and once that refcount reaches 0 and the blob_grace clock
+	// elapses, the existing blob GC reaps the bytes. Rows with
+	// last_requested_at IS NULL (adoption-pre-warmed but never
+	// served) are protected unconditionally. Rows whose
+	// (scheme, host, path) is vouched for by any current snapshot's
+	// package_hash are protected so a hot-set entry the fleet
+	// hasn't hit yet is not eagerly evicted.
+	//
+	// Default 168h (7 days) — the proxy's primary use case is to
+	// cache a *current* working set, and an "apt update" is a
+	// reasonable precondition for installing packages the cache may
+	// have aged out. 0s disables the URL-path TTL pass entirely
+	// (Phase 1-4 behavior: only hash-mismatch eviction at serve
+	// time and adoption-time refcount decrement reach url_path).
+	// Values >0 must be >= 1m to avoid thrashing under request
+	// bursts; rejected at load below that bound.
+	URLPathTTL Duration `toml:"url_path_ttl"`
 }
 
 // AdminConfig holds the SPEC5 §5.1 [admin] block. Drives the Phase 5
@@ -592,6 +613,9 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("gc", "heartbeat_interval") {
 		cfg.GC.HeartbeatInterval.Duration = 60 * time.Second
 	}
+	if !md.IsDefined("gc", "url_path_ttl") {
+		cfg.GC.URLPathTTL.Duration = 168 * time.Hour
+	}
 	// SPEC5 §5.2 presence-sensitive defaults for [admin]. Non-bool
 	// ints/durations need IsDefined-gated defaults so an operator's
 	// explicit value (or explicit zero — though zero is invalid for
@@ -868,6 +892,13 @@ func (c *Config) Validate() error {
 				"gc.heartbeat_interval (%s) × 2 must be strictly less than gc.blob_grace (%s) — i.e. heartbeat_interval < blob_grace/2 — so one missed heartbeat (writer-queue stall, DB lock) does not let an in-flight member blob age past grace before the next refresh",
 				c.GC.HeartbeatInterval.Duration, c.GC.BlobGrace.Duration))
 		}
+	}
+	if c.GC.URLPathTTL.Duration < 0 {
+		errs = append(errs, errors.New("gc.url_path_ttl must not be negative (0s disables the URL-path TTL pass)"))
+	} else if c.GC.URLPathTTL.Duration > 0 && c.GC.URLPathTTL.Duration < time.Minute {
+		errs = append(errs, fmt.Errorf(
+			"gc.url_path_ttl (%s) must be 0s (disabled) or >= 1m to avoid thrashing under request bursts",
+			c.GC.URLPathTTL.Duration))
 	}
 
 	// SPEC5 §5.2: [admin] block validation. Only when admin.enabled

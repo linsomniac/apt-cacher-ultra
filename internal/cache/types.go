@@ -127,20 +127,34 @@ type SnapshotCoverage struct {
 }
 
 // CacheStats is the SPEC5 §10.5 cache.* numeric block: blob count
-// + total bytes + url_path count + zero-refcount backlog. Sourced
-// by both the §9.7.3 status page and the §9.7.6 refresher
-// goroutine (which uses the same numbers to populate the
-// acu_blobs_db_count / acu_blobs_db_total_bytes /
-// acu_url_paths_tracked / acu_blobs_zero_refcount_backlog gauges).
+// + total bytes + url_path count + zero-refcount backlog + the
+// actually-reapable subset. Sourced by both the §9.7.3 status page
+// and the §9.7.6 refresher goroutine (which uses the same numbers
+// to populate the acu_blobs_db_count / acu_blobs_db_total_bytes /
+// acu_url_paths_tracked / acu_blobs_zero_refcount_backlog /
+// acu_blobs_actually_reapable gauges).
+//
+// ZeroRefcountBacklog counts blobs whose refcount column has
+// reached <=0 (the cheap candidate-set filter the GC starts from).
+// ActuallyReapableBlobs is a strict subset that also satisfies the
+// three NOT EXISTS reachability clauses RunBlobGCBatch's reap
+// predicate applies (no url_path, snapshot_member, or
+// suite_snapshot row references the hash). The two values diverge
+// because the blob.refcount column is denormalized — only adopted
+// snapshots bump it, but the GC also protects blobs reachable via
+// the request-path url_path table. ActuallyReapableBlobs is the
+// meaningful "how far behind is GC" signal; ZeroRefcountBacklog is
+// retained for backwards compatibility with the prior gauge name.
 //
 // The two numeric fields that source from /proc-style filesystem
 // data — pool_disk_bytes — live elsewhere; this struct is purely
 // the database-derivable fields.
 type CacheStats struct {
-	BlobCount           int64
-	TotalBytes          int64
-	URLPathCount        int64
-	ZeroRefcountBacklog int64
+	BlobCount             int64
+	TotalBytes            int64
+	URLPathCount          int64
+	ZeroRefcountBacklog   int64
+	ActuallyReapableBlobs int64
 }
 
 // RepoCoverage is the SPEC6_5 §2.4 repo_coverage status-page payload:

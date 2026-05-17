@@ -272,11 +272,12 @@ LEFT JOIN suite_snapshot ss
 	return out, nil
 }
 
-// GetCacheStats returns the four DB-derived numeric fields the
+// GetCacheStats returns the five DB-derived numeric fields the
 // SPEC5 §10.5 status-page cache.* block needs: blob_count,
-// total_bytes, url_path_count, and zero_refcount_backlog. Called by
-// both the status-page handler (per-render) and the §9.7.6
-// refresher goroutine (every admin.gauge_refresh).
+// total_bytes, url_path_count, zero_refcount_backlog, and
+// actually_reapable_blobs. Called by both the status-page handler
+// (per-render) and the §9.7.6 refresher goroutine (every
+// admin.gauge_refresh).
 //
 // AIDEV-NOTE: COUNT(*) on blob and url_path is sub-millisecond at
 // the row-counts a typical deployment carries (tens of
@@ -284,6 +285,22 @@ LEFT JOIN suite_snapshot ss
 // scan SQLite already maintains for the table. The
 // zero-refcount-backlog query uses idx_blob_gc (SPEC4 §4.3) which
 // is built exactly for this reachability filter.
+//
+// AIDEV-NOTE: actually_reapable_blobs applies the full GC reap
+// predicate (refcount<=0 + refcount_zeroed_at IS NOT NULL + three
+// NOT EXISTS reachability clauses against url_path/snapshot_member/
+// suite_snapshot — see RunBlobGCBatch). It does NOT apply the
+// grace-period cutoff (gc.blob_grace) so the gauge surfaces the
+// operationally-meaningful "GC would consider these on its next
+// tick" set, not "GC will definitely reap on its next tick" (which
+// also depends on heartbeat-stale grace, batch size, and the
+// per-tick deadline). The difference between zero_refcount_backlog
+// and actually_reapable_blobs is the count of blobs whose refcount
+// column drifted to 0 (a denormalized hint that gets out-of-sync
+// because url_path INSERTs on cache-miss do not bump refcount) but
+// which remain reachable via url_path / snapshot_member /
+// suite_snapshot — those bytes are NOT slack, they are still
+// servable from the cache.
 //
 // Returns (CacheStats, nil) on success. Per-query errors bubble up
 // individually so callers can decide on partial-data behavior;
@@ -306,6 +323,21 @@ func (c *Cache) GetCacheStats(ctx context.Context) (CacheStats, error) {
 		   WHERE refcount <= 0 AND refcount_zeroed_at IS NOT NULL`,
 	).Scan(&s.ZeroRefcountBacklog); err != nil {
 		return CacheStats{}, fmt.Errorf("GetCacheStats zero_refcount: %w", err)
+	}
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM blob
+		   WHERE refcount <= 0
+		     AND refcount_zeroed_at IS NOT NULL
+		     AND NOT EXISTS (SELECT 1 FROM url_path
+		                      WHERE blob_hash = blob.hash)
+		     AND NOT EXISTS (SELECT 1 FROM snapshot_member
+		                      WHERE blob_hash = blob.hash)
+		     AND NOT EXISTS (SELECT 1 FROM suite_snapshot
+		                      WHERE inrelease_hash   = blob.hash
+		                         OR release_hash     = blob.hash
+		                         OR release_gpg_hash = blob.hash)`,
+	).Scan(&s.ActuallyReapableBlobs); err != nil {
+		return CacheStats{}, fmt.Errorf("GetCacheStats actually_reapable: %w", err)
 	}
 	return s, nil
 }

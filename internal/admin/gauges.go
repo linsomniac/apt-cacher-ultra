@@ -28,6 +28,7 @@ type refresherGauges struct {
 	blobsDBCount             *metrics.Gauge
 	blobsDBTotalBytes        *metrics.Gauge
 	blobsZeroRefcountBacklog *metrics.Gauge
+	blobsActuallyReapable    *metrics.Gauge
 	urlPathsTracked          *metrics.Gauge
 
 	// Suite/snapshot counts (cache.GetSuiteStats).
@@ -64,7 +65,11 @@ func newRefresherGauges(r *metrics.Registry, capLimit int) *refresherGauges {
 			0),
 		blobsZeroRefcountBacklog: metrics.NewGaugeWithCapIn(r,
 			"acu_blobs_zero_refcount_backlog",
-			"Blobs with refcount<=0 awaiting GC reaping (refresher-driven).",
+			"Blobs with refcount<=0 — the GC candidate-set filter (refresher-driven). NOTE: most of these are still reachable via url_path / snapshot_member / suite_snapshot; see acu_blobs_actually_reapable for the strict subset GC will actually reap.",
+			0),
+		blobsActuallyReapable: metrics.NewGaugeWithCapIn(r,
+			"acu_blobs_actually_reapable",
+			"Blobs satisfying the full GC reap predicate (refcount<=0 AND no url_path/snapshot_member/suite_snapshot reference); the strict subset of acu_blobs_zero_refcount_backlog. This is the meaningful 'GC backlog' signal (refresher-driven).",
 			0),
 		urlPathsTracked: metrics.NewGaugeWithCapIn(r,
 			"acu_url_paths_tracked",
