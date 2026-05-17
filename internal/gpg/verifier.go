@@ -70,6 +70,13 @@ type Verifier struct {
 	// "canonical_host|suite_path"; values are unused. Concurrent-safe
 	// via sync.Map's LoadOrStore.
 	shortKeyIDLogged sync.Map
+
+	// untrustedSignerLogged tracks suites for which an
+	// adoption_untrusted_signer rejection has already been logged this
+	// process. Same dedupe shape as shortKeyIDLogged so the log surface
+	// is a finite inventory of "which (host, suite) pairs need new keys"
+	// rather than a per-tick noise stream.
+	untrustedSignerLogged sync.Map
 }
 
 // Compile-time interface check: Verifier satisfies freshness.Verifier.
@@ -97,6 +104,38 @@ func NewVerifier(cfg VerifierConfig) (*Verifier, error) {
 		allowShortKeyID:  cfg.AllowShortKeyID,
 		logger:           logger,
 	}, nil
+}
+
+// ClassifyVerifyErr maps an error returned from VerifyInline /
+// VerifyDetached (possibly wrapped by the adopter) to the SPEC5 §10.5
+// `recent_adoptions[].reason` short tag. Returns "" when err is nil.
+// Unknown errors that chain through ErrAdoptionGPGFailed without a
+// recognized gpg sentinel return "crypto_verify_failed" — the only
+// remaining route after the trust check is the cryptographic verify
+// inside verifyAnyTrusted.
+//
+// freshness imports observability and depends on this function through
+// an injected classifier so this gpg package remains the single owner
+// of the gpg-sentinel → reason mapping.
+func ClassifyVerifyErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, ErrUnpinnedSuite):
+		return "unpinned_suite"
+	case errors.Is(err, ErrMissingSignature):
+		return "missing_signature"
+	case errors.Is(err, ErrShortKeyID):
+		return "short_keyid"
+	case errors.Is(err, ErrUntrustedSigner):
+		return "untrusted_signer"
+	case errors.Is(err, ErrAmbiguousKeyID):
+		return "ambiguous_keyid"
+	case errors.Is(err, ErrNoUsableSignature):
+		return "no_usable_signature"
+	}
+	return "crypto_verify_failed"
 }
 
 // Sentinel errors returned by VerifyInline. Callers (the Adopter) wrap
@@ -461,11 +500,12 @@ func (v *Verifier) verifyAnyTrusted(
 ) error {
 	reader := packet.NewReader(bytes.NewReader(sigBytes))
 	var (
-		anyShortKeyID  bool
-		anyUntrusted   bool
-		sawSignature   bool
-		lastVerifyErr  error
-		anyTrustedSeen bool
+		anyShortKeyID    bool
+		anyUntrusted     bool
+		sawSignature     bool
+		lastVerifyErr    error
+		anyTrustedSeen   bool
+		rejectedSigners  []string
 	)
 	for {
 		pkt, err := reader.Next()
@@ -493,6 +533,9 @@ func (v *Verifier) verifyAnyTrusted(
 		if len(sig.IssuerFingerprint) == 0 {
 			anyShortKeyID = true
 			if !v.allowShortKeyID || sig.IssuerKeyId == nil {
+				if sig.IssuerKeyId != nil {
+					rejectedSigners = append(rejectedSigners, fmt.Sprintf("keyid:%016X", *sig.IssuerKeyId))
+				}
 				continue
 			}
 			matched, err := findUniqueEntityByKeyID(trustSet, *sig.IssuerKeyId)
@@ -507,6 +550,7 @@ func (v *Verifier) verifyAnyTrusted(
 			}
 			if matched == nil {
 				anyUntrusted = true
+				rejectedSigners = append(rejectedSigners, fmt.Sprintf("keyid:%016X", *sig.IssuerKeyId))
 				continue
 			}
 			anyTrustedSeen = true
@@ -522,6 +566,7 @@ func (v *Verifier) verifyAnyTrusted(
 		issuerFP := upperFP(sig.IssuerFingerprint)
 		if _, ok := trustFPs[issuerFP]; !ok {
 			anyUntrusted = true
+			rejectedSigners = append(rejectedSigners, "fpr:"+issuerFP)
 			continue
 		}
 		anyTrustedSeen = true
@@ -551,6 +596,7 @@ func (v *Verifier) verifyAnyTrusted(
 	case anyTrustedSeen && lastVerifyErr != nil:
 		return fmt.Errorf("signature verification failed: %w", lastVerifyErr)
 	case anyUntrusted:
+		v.logUntrustedSignerOnce(suite, rejectedSigners)
 		return fmt.Errorf("%w: IssuerFingerprint not in trust set", ErrUntrustedSigner)
 	case anyShortKeyID && !v.allowShortKeyID:
 		return ErrShortKeyID
@@ -615,6 +661,27 @@ func (v *Verifier) verifyAgainst(e *openpgp.Entity, signed []byte, sig *packet.S
 		nil,
 	)
 	return err
+}
+
+// logUntrustedSignerOnce emits one INFO log per (canonical_host,
+// suite_path) per process the first time we reject every signature on
+// a suite for "issuer not in trust set." Subsequent rejections for the
+// same suite stay silent — the goal is a one-line breadcrumb the
+// operator can grep for to learn WHICH key fingerprint they need to
+// install, not a per-tick log flood. rejected carries the rejected
+// signers as "fpr:<40-hex>" (long fingerprint form) or "keyid:<16-hex>"
+// (short-keyid form, when subpacket 33 was absent and the keyid did
+// not resolve in the trust set).
+func (v *Verifier) logUntrustedSignerOnce(suite freshness.SuiteRef, rejected []string) {
+	key := suite.CanonicalHost + "|" + suite.SuitePath
+	if _, loaded := v.untrustedSignerLogged.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	v.logger.Info("adoption_untrusted_signer",
+		"canonical_host", suite.CanonicalHost,
+		"suite_path", suite.SuitePath,
+		"rejected_signers", rejected,
+	)
 }
 
 // logShortKeyIDFallbackOnce emits one INFO log per (canonical_host,

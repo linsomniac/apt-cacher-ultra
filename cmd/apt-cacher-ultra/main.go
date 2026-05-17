@@ -537,15 +537,16 @@ func serveListeners(
 	adoptionRing := observability.NewRing(50)
 
 	freshChecker, err := freshness.New(freshness.Config{
-		Cache:        c,
-		Fetcher:      fetchClient,
-		HostLimiter:  hostLimiter,
-		Cooldown:     cfg.Freshness.Cooldown.Duration,
-		Refresh:      cfg.Freshness.PeriodicRefresh.Duration,
-		Adopter:      adopter,
-		LifetimeCtx:  freshCtx,
-		Logger:       logger,
-		AdoptionRing: adoptionRing,
+		Cache:               c,
+		Fetcher:             fetchClient,
+		HostLimiter:         hostLimiter,
+		Cooldown:            cfg.Freshness.Cooldown.Duration,
+		Refresh:             cfg.Freshness.PeriodicRefresh.Duration,
+		Adopter:             adopter,
+		LifetimeCtx:         freshCtx,
+		Logger:              logger,
+		AdoptionRing:        adoptionRing,
+		GPGReasonClassifier: gpg.ClassifyVerifyErr,
 	})
 	if err != nil {
 		return fmt.Errorf("build freshness checker: %w", err)

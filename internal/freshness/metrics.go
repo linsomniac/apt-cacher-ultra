@@ -129,3 +129,30 @@ func classifyAdoptionOutcome(err error) string {
 	}
 	return "run_failed"
 }
+
+// classifyAdoptionReason produces the SPEC5 §10.5
+// `recent_adoptions[].reason` short tag for one completed adoption.
+// Returns "" on success.
+//
+// The outcome bucket determines the dominant tag for every category
+// except gpg_failed; that bucket is broken out into the specific
+// verifier sentinel via the injected gpgClassifier (production wires
+// gpg.ClassifyVerifyErr). When gpgClassifier is nil or returns "",
+// the reason falls back to the bucket label so callers always get a
+// usable string for non-success rows.
+//
+// AIDEV-NOTE: keep the gpg-bucket reasons in lockstep with
+// gpg.ClassifyVerifyErr. Adding a new gpg sentinel without extending
+// that function would surface as crypto_verify_failed on the UI even
+// when the underlying error is more specific.
+func classifyAdoptionReason(err error, outcome string, gpgClassifier func(error) string) string {
+	if err == nil {
+		return ""
+	}
+	if outcome == "gpg_failed" && gpgClassifier != nil {
+		if r := gpgClassifier(err); r != "" {
+			return r
+		}
+	}
+	return outcome
+}

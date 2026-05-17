@@ -120,6 +120,7 @@
       "host": "archive.ubuntu.com",
       "suite_path": "dists/noble-updates",
       "outcome": "gpg_failed",
+      "reason": "untrusted_signer",
       "completed_unixtime": 1700006100,
       "duration_seconds": 0.32
     }

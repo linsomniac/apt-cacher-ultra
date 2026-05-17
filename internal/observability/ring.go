@@ -32,6 +32,15 @@ type AdoptionEvent struct {
 	// labels: success, parse_failed, gpg_failed, member_mismatch,
 	// unpinned_suite, run_failed.
 	Outcome string
+	// Reason is a short snake_case tag describing why a non-success
+	// outcome occurred. Empty on success. For gpg_failed it breaks
+	// the bucket out into the specific verifier sentinel
+	// (untrusted_signer, short_keyid, no_usable_signature,
+	// missing_signature, ambiguous_keyid, crypto_verify_failed); for
+	// other failure outcomes it mirrors Outcome. Surfaced via the
+	// SPEC5 §10.5 status-page JSON additively as
+	// `recent_adoptions[].reason`.
+	Reason string
 	// CompletedUnixSec is the unix-seconds timestamp the adoption
 	// finished (success OR failure). For successful adoptions this
 	// approximately equals suite_snapshot.adopted_at; for failures

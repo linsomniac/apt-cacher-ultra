@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
@@ -655,5 +657,116 @@ func TestVerifier_ShortKeyID_KeyNotInTrustSet(t *testing.T) {
 	stripped := clearsignWithoutIssuerFingerprint(t, signer, []byte(fakeReleasePlaintext))
 	if _, err := v.VerifyInline(context.Background(), newSuite(), stripped); err == nil {
 		t.Fatalf("expected rejection when fallback keyid maps to no trust-set entity")
+	}
+}
+
+// TestClassifyVerifyErr pins the SPEC5 §10.5 recent_adoptions[].reason
+// short-tag mapping for every error sentinel the verifier can return.
+// The set is closed (any new sentinel must extend this test and
+// status.go reasonTooltip()); the default branch returns
+// crypto_verify_failed for raw verify failures that bubble up via
+// `fmt.Errorf("signature verification failed: %w", lastVerifyErr)`.
+func TestClassifyVerifyErr(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil_returns_empty", nil, ""},
+		{"unpinned_suite", ErrUnpinnedSuite, "unpinned_suite"},
+		{"missing_signature", ErrMissingSignature, "missing_signature"},
+		{"short_keyid", ErrShortKeyID, "short_keyid"},
+		{"untrusted_signer", ErrUntrustedSigner, "untrusted_signer"},
+		{"ambiguous_keyid", ErrAmbiguousKeyID, "ambiguous_keyid"},
+		{"no_usable_signature", ErrNoUsableSignature, "no_usable_signature"},
+		{
+			"wrapped_untrusted_signer_walks_chain",
+			errors.New("adoption_gpg_failed: " + ErrUntrustedSigner.Error()),
+			"crypto_verify_failed",
+		},
+		{
+			"wrapped_untrusted_signer_via_fmt_w",
+			// What the verifier actually returns from verifyAnyTrusted.
+			// errors.Is walks the chain so the sentinel is recovered.
+			fmtErr(ErrUntrustedSigner),
+			"untrusted_signer",
+		},
+		{
+			"unknown_falls_through_to_crypto_verify_failed",
+			errors.New("openpgp: hash mismatch"),
+			"crypto_verify_failed",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ClassifyVerifyErr(tc.err)
+			if got != tc.want {
+				t.Errorf("ClassifyVerifyErr(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// fmtErr wraps a sentinel the way verifyAnyTrusted does, so the test
+// for "wrapped via %w" exercises the realistic shape.
+func fmtErr(sentinel error) error {
+	return errorsIsWrap{inner: sentinel}
+}
+
+type errorsIsWrap struct{ inner error }
+
+func (e errorsIsWrap) Error() string { return "wrapped: " + e.inner.Error() }
+func (e errorsIsWrap) Unwrap() error { return e.inner }
+
+// TestVerifier_UntrustedSigner_LogsOncePerSuite asserts the
+// adoption_untrusted_signer Info log fires exactly once for repeated
+// rejections of the same (canonical_host, suite_path) within a
+// process, but a different suite still gets its own log line. The
+// log carries the rejected signer fingerprint(s) so operators can
+// install the missing key without grepping the binary.
+func TestVerifier_UntrustedSigner_LogsOncePerSuite(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	other := newTestEntity(t, "Other", "other@example.com")
+	keyring := newKeyring(t, other)
+
+	var logbuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logbuf, nil))
+	v, err := NewVerifier(VerifierConfig{
+		Keyring:          keyring,
+		RequireSignature: true,
+		Logger:           logger,
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	body := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
+	suiteA := freshness.SuiteRef{CanonicalHost: "packages.example.com", SuitePath: "/dists/stable"}
+	suiteB := freshness.SuiteRef{CanonicalHost: "packages.example.com", SuitePath: "/dists/testing"}
+
+	for i := 0; i < 3; i++ {
+		if _, err := v.VerifyInline(context.Background(), suiteA, body); err == nil {
+			t.Fatalf("call %d: expected ErrUntrustedSigner", i)
+		}
+	}
+	if _, err := v.VerifyInline(context.Background(), suiteB, body); err == nil {
+		t.Fatal("expected ErrUntrustedSigner on second suite")
+	}
+
+	got := logbuf.String()
+	occA := strings.Count(got, `"suite_path":"/dists/stable"`)
+	occB := strings.Count(got, `"suite_path":"/dists/testing"`)
+	if occA != 1 {
+		t.Errorf("expected exactly 1 untrusted_signer log for stable, got %d; full log: %s", occA, got)
+	}
+	if occB != 1 {
+		t.Errorf("expected exactly 1 untrusted_signer log for testing, got %d; full log: %s", occB, got)
+	}
+	if !strings.Contains(got, `"adoption_untrusted_signer"`) {
+		t.Errorf("log missing adoption_untrusted_signer message: %s", got)
+	}
+	wantFP := "fpr:" + upperFP(signer.PrimaryKey.Fingerprint)
+	if !strings.Contains(got, wantFP) {
+		t.Errorf("log missing rejected fingerprint %q in: %s", wantFP, got)
 	}
 }

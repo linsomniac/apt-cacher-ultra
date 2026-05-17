@@ -1357,7 +1357,13 @@ the schema below verbatim.
      "suite_path": "ubuntu/dists/jammy",
      "outcome": "success",
      "completed_unixtime": 1746668400,
-     "duration_seconds": 4.21}
+     "duration_seconds": 4.21},
+    {"host": "packages.microsoft.com",
+     "suite_path": "/ubuntu/22.04/prod/dists/jammy",
+     "outcome": "gpg_failed",
+     "reason": "untrusted_signer",
+     "completed_unixtime": 1746668412,
+     "duration_seconds": 0.001}
   ],
   "active_hosts": [
     {"host": "archive.ubuntu.com",
@@ -1386,6 +1392,17 @@ Field semantics:
   adoption *finished* (success or failure), not `adopted_at`.
   Sourced from the §9.7.7 in-memory ring; returns `[]` (not
   null) after a process restart.
+- `recent_adoptions[].reason` is an additive sub-classification
+  that breaks the `gpg_failed` bucket out into the specific
+  verifier sentinel — one of `untrusted_signer`, `short_keyid`,
+  `no_usable_signature`, `missing_signature`, `ambiguous_keyid`,
+  or `crypto_verify_failed`. For non-gpg failure outcomes the
+  field mirrors `outcome` (`parse_failed`, `member_mismatch`,
+  `unpinned_suite`, `run_failed`). Omitted on success rows so
+  the wire shape stays unchanged on the happy path. Operators
+  use this field to discriminate between "key not installed"
+  (`untrusted_signer`) and "signature itself bogus"
+  (`crypto_verify_failed`) without grepping logs.
 - `active_hosts` is sourced from `hostsem.Snapshot()` (§9.3).
   Empty when no host has held a slot since process start.
 - `hot_url_paths` lists the top 20 `url_path` rows ordered by

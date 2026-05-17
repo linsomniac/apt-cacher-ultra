@@ -74,6 +74,28 @@ func TestJSONContractPreserved(t *testing.T) {
 			}
 		}
 	})
+
+	// SPEC5 §10.5 additive: recent_adoptions[].reason is omitempty.
+	// Success rows must not carry the key (so consumers built before
+	// the additive field still see the unchanged shape on the happy
+	// path). gpg_failed rows must carry the specific reason tag.
+	t.Run("reason_field_is_omitempty_for_success", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := writeStatusJSON(&buf, populatedJSONContractFixture()); err != nil {
+			t.Fatalf("writeStatusJSON: %v", err)
+		}
+		body := buf.String()
+		successBlock := `"outcome": "success",
+      "completed_unixtime"`
+		if !strings.Contains(body, successBlock) {
+			t.Errorf("success row carried a reason key; expected omitempty to drop it. body excerpt:\n%s",
+				excerpt(body, "outcome", 200))
+		}
+		if !strings.Contains(body, `"reason": "untrusted_signer"`) {
+			t.Errorf("gpg_failed row missing reason=untrusted_signer; got:\n%s",
+				excerpt(body, "gpg_failed", 200))
+		}
+	})
 }
 
 // unifiedLineDiff emits a minimal unified-style line diff so a failing
@@ -214,7 +236,7 @@ func populatedJSONContractFixture() statusModel {
 		},
 		RecentAdoptions: []adoptionEntry{
 			{Host: "archive.ubuntu.com", SuitePath: "dists/noble", Outcome: "success", CompletedUnixTime: 1_700_006_000, DurationSeconds: 0.45},
-			{Host: "archive.ubuntu.com", SuitePath: "dists/noble-updates", Outcome: "gpg_failed", CompletedUnixTime: 1_700_006_100, DurationSeconds: 0.32},
+			{Host: "archive.ubuntu.com", SuitePath: "dists/noble-updates", Outcome: "gpg_failed", Reason: "untrusted_signer", CompletedUnixTime: 1_700_006_100, DurationSeconds: 0.32},
 		},
 		ActiveHosts: []activeHostInfo{
 			{Host: "10.0.0.5", Inflight: 1, SlotCapacity: 4},

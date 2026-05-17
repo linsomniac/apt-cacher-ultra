@@ -887,6 +887,16 @@ All other outcomes — including missing signatures when
 `require_signature = true`, and signatures from keys outside `trust_set`
 — produce a verification failure that aborts adoption (§7.5.2).
 
+When every signature on a suite is rejected with "issuer not in trust
+set" the verifier emits one `adoption_untrusted_signer` INFO line per
+(canonical_host, suite_path) per process, carrying the rejected signer
+fingerprints (`fpr:<40-hex>`) or short key ids (`keyid:<16-hex>`) so
+operators can install the missing key without grepping `gpg
+--list-packets` output. Subsequent rejections for the same suite stay
+silent to keep the log surface a finite inventory rather than a per-
+tick noise stream, matching the existing
+`adoption_short_keyid_fallback` cadence (§7.6.3).
+
 #### 7.6.4 Library
 
 `github.com/ProtonMail/go-crypto/openpgp` (Q5). Pure Go, no cgo, tagged

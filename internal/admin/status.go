@@ -301,9 +301,16 @@ type hotURLEntry struct {
 }
 
 type adoptionEntry struct {
-	Host              string  `json:"host"`
-	SuitePath         string  `json:"suite_path"`
-	Outcome           string  `json:"outcome"`
+	Host      string `json:"host"`
+	SuitePath string `json:"suite_path"`
+	Outcome   string `json:"outcome"`
+	// Reason is the SPEC5 §10.5 additive sub-classification. Empty on
+	// success; for gpg_failed it carries the specific verifier
+	// sentinel (untrusted_signer, short_keyid, crypto_verify_failed,
+	// missing_signature, ambiguous_keyid, no_usable_signature); for
+	// other failures it mirrors Outcome. JSON-omitted when empty so
+	// the wire shape is unchanged for success rows.
+	Reason            string  `json:"reason,omitempty"`
 	CompletedUnixTime int64   `json:"completed_unixtime"`
 	DurationSeconds   float64 `json:"duration_seconds"`
 }
@@ -587,6 +594,7 @@ func buildAdoptionEntries(events []observability.AdoptionEvent) []adoptionEntry 
 			Host:              e.Host,
 			SuitePath:         e.SuitePath,
 			Outcome:           e.Outcome,
+			Reason:            e.Reason,
 			CompletedUnixTime: e.CompletedUnixSec,
 			DurationSeconds:   e.DurationSeconds,
 		})
@@ -757,11 +765,43 @@ func statusTemplateFuncMap() template.FuncMap {
 		"countCustom":         countCustom,
 		"formatShortDuration": formatShortDuration,
 		"outcomeBadgeClass":   outcomeBadgeClass,
+		"reasonTooltip":       reasonTooltip,
 		"vitalState":          vitalState,
 		"verdictExplanation":  verdictExplanation,
 		"add1":                func(n int) int { return n + 1 },
 		"splitUID":            splitUID,
 	}
+}
+
+// reasonTooltip maps a SPEC5 §10.5 recent_adoptions[].reason short tag
+// to a one-line human explanation for the title= attribute on the
+// reason chip. Unknown tags pass through verbatim so future reasons
+// surface without a code change (just less helpful hover text until
+// the table is extended).
+func reasonTooltip(reason string) string {
+	switch reason {
+	case "untrusted_signer":
+		return "The InRelease signature's issuer key is not in the host keyring. Install the upstream's signing key under /usr/share/keyrings/ or /etc/apt/keyrings/."
+	case "short_keyid":
+		return "Signature lacks the long-form IssuerFingerprint subpacket and adoption.allow_short_keyid is false."
+	case "no_usable_signature":
+		return "No signature packet in the clearsigned block carried a trusted IssuerFingerprint."
+	case "missing_signature":
+		return "InRelease body is not clearsigned and adoption.require_signature is true."
+	case "ambiguous_keyid":
+		return "Two or more keys in the trust set share the same 8-byte keyid; the short-keyid fallback refuses to guess."
+	case "crypto_verify_failed":
+		return "The signature's issuer was trusted but the cryptographic verification itself failed."
+	case "unpinned_suite":
+		return "adoption.require_pinned_signer is true and no [[trusted_signer]] block matches this canonical host."
+	case "parse_failed":
+		return "Verified Release-style body did not parse (malformed Release file)."
+	case "member_mismatch":
+		return "A Release-listed member's fetched hash did not match the declared hash."
+	case "run_failed":
+		return "Adoption failed for an uncategorized reason; consult the adoption_run_failed log line."
+	}
+	return reason
 }
 
 // uidParts is the parsed shape of an OpenPGP user-id string, exposed
@@ -910,6 +950,7 @@ table.data tr[data-state="crit"]:nth-child(even){background:var(--crit-tint)}
 .b{display:inline-block;padding:1px 8px 2px;border-radius:var(--r-badge);border:1px solid currentColor;font-size:10px;letter-spacing:.08em;font-weight:500;text-transform:uppercase;background:transparent;line-height:1.4;white-space:nowrap}
 .b--ok{color:var(--ok)}.b--warn{color:var(--warn)}.b--crit{color:var(--crit)}.b--stale{color:var(--stale)}
 .b--neutral{color:var(--ink-4);border-color:var(--ink-3)}
+.b.reason{margin-left:6px;letter-spacing:.06em}
 .lagging{margin-left:8px;font-size:11px;color:var(--warn);font-variant-numeric:tabular-nums}
 .keys-chip{display:inline-flex;align-items:center;gap:6px;padding:4px 9px 4px 8px;border:1px solid var(--ink-2);border-radius:2px;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-4);transition:background 120ms ease,color 120ms ease,border-color 120ms ease}
 .keys-chip:hover{background:var(--ink-1);color:var(--ink-6);border-color:var(--ink-3)}
@@ -1173,10 +1214,10 @@ table.data tbody td::before{content:attr(data-label);font-size:10px;letter-spaci
             </tr></thead>
             <tbody>
             {{range .RecentAdoptions}}
-              <tr{{if ne .Outcome "success"}} data-state="crit"{{end}} data-outcome="{{.Outcome}}">
+              <tr{{if ne .Outcome "success"}} data-state="crit"{{end}} data-outcome="{{.Outcome}}"{{if .Reason}} data-reason="{{.Reason}}"{{end}}>
                 <td data-label="Host" class="host">{{.Host}}</td>
                 <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
-                <td data-label="Outcome"><span class="b {{outcomeBadgeClass .Outcome}}">{{.Outcome}}</span></td>
+                <td data-label="Outcome"><span class="b {{outcomeBadgeClass .Outcome}}">{{.Outcome}}</span>{{if and .Reason (ne .Reason .Outcome)}} <span class="b b--neutral reason" title="{{reasonTooltip .Reason}}">{{.Reason}}</span>{{end}}</td>
                 <td data-label="Completed" class="time">{{unixTime .CompletedUnixTime}}</td>
                 <td data-label="Duration" class="num mono">{{formatShortDuration .DurationSeconds}}</td>
               </tr>

@@ -122,23 +122,33 @@ type Config struct {
 	// disable recording.
 	AdoptionRing *observability.Ring
 
+	// GPGReasonClassifier breaks the `gpg_failed` outcome bucket into
+	// SPEC5 §10.5 `recent_adoptions[].reason` tags (untrusted_signer,
+	// short_keyid, crypto_verify_failed, …). Production injects
+	// gpg.ClassifyVerifyErr; tests may leave nil, in which case the
+	// reason for any gpg_failed event is the bare "gpg_failed" bucket.
+	// Decoupled from a direct gpg import to keep freshness above the
+	// verifier in the dependency graph.
+	GPGReasonClassifier func(error) string
+
 	// now is a test seam; production uses time.Now.
 	now func() time.Time
 }
 
 // Checker is the SPEC §7 freshness state machine.
 type Checker struct {
-	cache        Cache
-	fetcher      Fetcher
-	hostSem      *hostsem.Sem
-	cooldown     time.Duration
-	refresh      time.Duration
-	maxBody      int64
-	logger       *slog.Logger
-	now          func() time.Time
-	adopter      *Adopter
-	lifetimeCtx  context.Context
-	adoptionRing *observability.Ring
+	cache               Cache
+	fetcher             Fetcher
+	hostSem             *hostsem.Sem
+	cooldown            time.Duration
+	refresh             time.Duration
+	maxBody             int64
+	logger              *slog.Logger
+	now                 func() time.Time
+	adopter             *Adopter
+	lifetimeCtx         context.Context
+	adoptionRing        *observability.Ring
+	gpgReasonClassifier func(error) string
 
 	// adoptionWg tracks in-flight adoption goroutines spawned via
 	// Check. Production graceful shutdown (SPEC2 §9.5 step 5) calls
@@ -199,17 +209,18 @@ func New(cfg Config) (*Checker, error) {
 		lifeCtx = context.Background()
 	}
 	return &Checker{
-		cache:        cfg.Cache,
-		fetcher:      cfg.Fetcher,
-		hostSem:      cfg.HostLimiter,
-		cooldown:     cfg.Cooldown,
-		refresh:      cfg.Refresh,
-		maxBody:      maxBody,
-		logger:       logger,
-		now:          now,
-		adopter:      cfg.Adopter,
-		lifetimeCtx:  lifeCtx,
-		adoptionRing: cfg.AdoptionRing,
+		cache:               cfg.Cache,
+		fetcher:             cfg.Fetcher,
+		hostSem:             cfg.HostLimiter,
+		cooldown:            cfg.Cooldown,
+		refresh:             cfg.Refresh,
+		maxBody:             maxBody,
+		logger:              logger,
+		now:                 now,
+		adopter:             cfg.Adopter,
+		lifetimeCtx:         lifeCtx,
+		adoptionRing:        cfg.AdoptionRing,
+		gpgReasonClassifier: cfg.GPGReasonClassifier,
 	}, nil
 }
 
@@ -287,6 +298,7 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		}
 		duration := c.now().Sub(start)
 		outcome := classifyAdoptionOutcome(err)
+		reason := classifyAdoptionReason(err, outcome, c.gpgReasonClassifier)
 		adoptionTotal.Inc(outcome, req.suite.CanonicalHost)
 		adoptionDurationSeconds.Observe(duration.Seconds(), outcome, req.suite.CanonicalHost)
 		if c.adoptionRing != nil {
@@ -294,6 +306,7 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 				Host:             req.suite.CanonicalHost,
 				SuitePath:        req.suite.SuitePath,
 				Outcome:          outcome,
+				Reason:           reason,
 				CompletedUnixSec: c.now().Unix(),
 				DurationSeconds:  duration.Seconds(),
 			})

@@ -130,6 +130,15 @@ func TestGoldenDegradedGPG(t *testing.T) {
 	mustContain(t, html, `id="adoptions-notice" class="notice-mount"`)
 	// Outcome badge must render with crit class for non-success.
 	mustContain(t, html, `<span class="b b--crit">gpg_failed</span>`)
+	// SPEC5 §10.5 recent_adoptions[].reason chip renders next to the
+	// outcome badge, with the row carrying data-reason for CSS/JS hooks
+	// and the chip itself carrying the human-readable tooltip.
+	mustContain(t, html,
+		`data-reason="untrusted_signer"`,
+		`<span class="b b--neutral reason"`,
+		`>untrusted_signer</span>`,
+		"not in the host keyring", // verbatim substring of reasonTooltip("untrusted_signer")
+	)
 }
 
 func TestGoldenKeyringEmptyDisabled(t *testing.T) {
@@ -400,7 +409,7 @@ func newDegradedGPGModel() htmlRenderModel {
 	// 6 fail / 4 success = 60% non-success → crit
 	m.RecentAdoptions = make([]adoptionEntry, 10)
 	for i := 0; i < 6; i++ {
-		m.RecentAdoptions[i] = adoptionEntry{Host: "download.docker.com", SuitePath: "dists/noble", Outcome: "gpg_failed", CompletedUnixTime: 1_700_006_000 + int64(i)*10, DurationSeconds: 0.4}
+		m.RecentAdoptions[i] = adoptionEntry{Host: "download.docker.com", SuitePath: "dists/noble", Outcome: "gpg_failed", Reason: "untrusted_signer", CompletedUnixTime: 1_700_006_000 + int64(i)*10, DurationSeconds: 0.4}
 	}
 	for i := 6; i < 10; i++ {
 		m.RecentAdoptions[i] = adoptionEntry{Host: "archive.ubuntu.com", SuitePath: "dists/noble", Outcome: "success", CompletedUnixTime: 1_700_005_500 + int64(i)*10, DurationSeconds: 1.1}
