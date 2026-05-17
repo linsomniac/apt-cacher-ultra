@@ -172,3 +172,8 @@ make lint            # golangci-lint (must be installed)
 make deb             # .deb package (nfpm must be installed)
 make clean
 ```
+
+## License
+
+Released into the public domain under [CC0 1.0 Universal](LICENSE).
+
