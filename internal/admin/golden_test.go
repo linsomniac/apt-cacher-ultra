@@ -58,7 +58,7 @@ func TestGoldenHealthy(t *testing.T) {
 		`id="verdict-label">STATUS<`,
 		// Aggregate notice mount is present but empty.
 		`id="adoptions-notice" class="notice-mount"`,
-		// keys-chip carries the count attribute the JS reads.
+		// chip carries the count attribute the JS reads.
 		`data-keyring-count="`,
 	)
 	// No vital cell should carry crit or warn in the healthy fixture.
@@ -76,7 +76,7 @@ func TestGoldenHealthy(t *testing.T) {
 	// Healthy fixture seeds 5 keys (4 bundled + 1 custom). Eyebrow
 	// counts come from countBundled/Custom helpers via the template.
 	if !strings.Contains(html, `data-keyring-count="5"`) {
-		t.Errorf("expected keys-chip count of 5 in healthy fixture; excerpt: %s", excerpt(html, "data-keyring-count=", 64))
+		t.Errorf("expected chip count of 5 in healthy fixture; excerpt: %s", excerpt(html, "data-keyring-count=", 64))
 	}
 }
 
@@ -149,7 +149,7 @@ func TestGoldenKeyringEmptyDisabled(t *testing.T) {
 
 	mustContain(t, html,
 		"ADOPTION DISABLED",
-		// keys-chip carries adoption-enabled=false.
+		// chip carries adoption-enabled=false.
 		`data-adoption-enabled="false"`,
 		// Empty block (non-crit) — class="empty" without empty--crit.
 		`<div class="empty"><div class="empty__head">ADOPTION DISABLED`,
@@ -170,33 +170,33 @@ func TestGoldenKeyringEmptyEnabled(t *testing.T) {
 		// Empty block carries the crit modifier class.
 		`empty empty--crit`,
 	)
-	// The keys-chip <a> tag must itself carry data-state="crit" per
+	// The keyring chip <a> tag must itself carry data-state="crit" per
 	// §5.1.1 (adoption enabled + zero keys). Scoping to the anchor
 	// avoids matching the CSS rule selector inside the inline <style>.
-	chip := extractTag(html, "<a", `class="keys-chip"`)
+	chip := extractTag(html, "<a", `class="chip"`)
 	if chip == "" {
-		t.Fatalf("could not locate <a class=\"keys-chip\"> anchor; html excerpt: %s", excerpt(html, "keys-chip", 300))
+		t.Fatalf("could not locate <a class=\"chip\"> anchor; html excerpt: %s", excerpt(html, `class="chip"`, 300))
 	}
 	if !strings.Contains(chip, `data-state="crit"`) {
-		t.Errorf("keys-chip anchor missing data-state=\"crit\"; anchor: %s", chip)
+		t.Errorf("chip anchor missing data-state=\"crit\"; anchor: %s", chip)
 	}
 }
 
 // TestGoldenKeyringChipNotCritWhenAdoptionDisabled is the negative
 // of TestGoldenKeyringEmptyEnabled: when adoption is disabled the
-// keys-chip must NOT carry the crit state even though keys=0.
+// keyring chip must NOT carry the crit state even though keys=0.
 func TestGoldenKeyringChipNotCritWhenAdoptionDisabled(t *testing.T) {
 	m := newHealthyModel()
 	m.AdoptionEnabled = false
 	m.Keyring = nil
 	html := renderHTMLForGolden(t, m)
 
-	chip := extractTag(html, "<a", `class="keys-chip"`)
+	chip := extractTag(html, "<a", `class="chip"`)
 	if chip == "" {
-		t.Fatalf("could not locate <a class=\"keys-chip\"> anchor")
+		t.Fatalf("could not locate <a class=\"chip\"> anchor")
 	}
 	if strings.Contains(chip, `data-state="crit"`) {
-		t.Errorf("keys-chip anchor unexpectedly carries data-state=\"crit\" when adoption disabled; anchor: %s", chip)
+		t.Errorf("chip anchor unexpectedly carries data-state=\"crit\" when adoption disabled; anchor: %s", chip)
 	}
 }
 
@@ -208,8 +208,8 @@ func TestGoldenKeyringChipNotCritWhenAdoptionDisabled(t *testing.T) {
 // path. The render-budget check below also catches if someone replaces
 // the script wholesale.
 func TestNoticeScriptHasNoInnerHTML(t *testing.T) {
-	if strings.Contains(statusHTML, ".innerHTML") {
-		t.Errorf("statusHTML inline JS contains '.innerHTML' — adoption-notice DOM-XSS hardening (codex-review iter-4) regressed; use createElement/textContent")
+	if strings.Contains(statusHTMLRaw, ".innerHTML") {
+		t.Errorf("statusHTMLRaw inline JS contains '.innerHTML' — adoption-notice DOM-XSS hardening (codex-review iter-4) regressed; use createElement/textContent")
 	}
 }
 
@@ -450,7 +450,7 @@ func TestGoldenAcceptAnySignerChipAbsentByDefault(t *testing.T) {
 
 // TestGoldenKeyringEmptyEnabled_AcceptAnySignerSuppressesCrit asserts
 // that with accept_any_signer = true, an empty keyring under enabled
-// adoption is NOT a critical state: the keys-chip drops the crit data
+// adoption is NOT a critical state: the chip drops the crit data
 // attribute, the empty block uses the non-crit class, and the message
 // frames the empty keyring as workable rather than broken.
 func TestGoldenKeyringEmptyEnabled_AcceptAnySignerSuppressesCrit(t *testing.T) {
@@ -472,12 +472,12 @@ func TestGoldenKeyringEmptyEnabled_AcceptAnySignerSuppressesCrit(t *testing.T) {
 	)
 	mustNotContain(t, html, `empty empty--crit`)
 
-	chip := extractTag(html, "<a", `class="keys-chip"`)
+	chip := extractTag(html, "<a", `class="chip"`)
 	if chip == "" {
-		t.Fatalf("could not locate <a class=\"keys-chip\"> anchor")
+		t.Fatalf("could not locate <a class=\"chip\"> anchor")
 	}
 	if strings.Contains(chip, `data-state="crit"`) {
-		t.Errorf("keys-chip anchor should not carry data-state=\"crit\" under accept_any_signer; anchor: %s", chip)
+		t.Errorf("chip anchor should not carry data-state=\"crit\" under accept_any_signer; anchor: %s", chip)
 	}
 }
 
@@ -515,7 +515,7 @@ func excerpt(html, marker string, n int) string {
 
 // extractTag returns the first occurrence of the opening tag whose
 // raw text starts with tagStart (e.g. "<a") AND contains the
-// classMarker substring (e.g. `class="keys-chip"`), up to the
+// classMarker substring (e.g. `class="chip"`), up to the
 // closing `>`. Used to scope attribute assertions to a specific
 // element rather than the whole document — important because the
 // inline <style> block references the same data-state values as the

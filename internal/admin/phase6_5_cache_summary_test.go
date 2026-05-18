@@ -140,8 +140,8 @@ func TestStatusHTML_CacheSummary_RendersWhenSeeded(t *testing.T) {
 	// titled "Cache contents — by host × architecture". The host name
 	// and architecture appear in the table body via <td class="host">
 	// and <span class="arch">.
-	if !strings.Contains(html, "by host") {
-		t.Errorf("HTML missing 'by host' panel eyebrow")
+	if !strings.Contains(html, "BY HOST") {
+		t.Errorf("HTML missing 'BY HOST' panel eyebrow")
 	}
 	if !strings.Contains(html, ">"+host+"<") {
 		t.Errorf("HTML missing host cell %q", host)
@@ -166,7 +166,7 @@ func TestStatusHTML_CacheSummary_OmittedOnEmptyCache(t *testing.T) {
 	// Redesigned layout puts the by-host breakdown in a "Cache
 	// contents" panel. On empty cache the panel renders the empty
 	// state instead of the table; the by-host content is suppressed.
-	if strings.Contains(html, "<table class=\"data\"") && strings.Contains(html, "by host") &&
+	if strings.Contains(html, "<table class=\"data\"") && strings.Contains(html, "BY HOST") &&
 		strings.Contains(html, "<th>Architecture</th>") {
 		t.Errorf("HTML rendered by-host breakdown table on empty cache")
 	}

@@ -53,18 +53,20 @@ func TestRenderSizeBudget(t *testing.T) {
 	}
 	totalGz := gz.Len()
 
-	// Spec §12 budgets are "minified" — we don't minify, but the
-	// hand-written CSS is essentially one-rule-per-line and gzips
-	// extremely well. The raw caps below are generous regression
-	// guards (≈2× the minified spec budget); the gzipped cap is
-	// the §12 spec budget itself.
+	// Budget caps post-INSTRUMENT redesign — the CSS block now carries
+	// two inline base64 woff2 fonts (Geist Sans + Geist Mono variable,
+	// subset to Latin-1 + the glyphs the template uses, ~52KB binary
+	// → ~70KB base64). Already-compressed font binary doesn't gzip
+	// further, so the gzipped budget had to expand from the original
+	// §12 22KB target. Raw caps grow proportionally. Without fonts the
+	// pure-design CSS is ~17KB raw (still inside the original budget).
 	const (
-		cssRawMax       = 18 * 1024 // §12 spec: 14 KB minified; raw cap is ≈30% headroom
-		jsRawMax        = 8 * 1024  // §12 spec: 6 KB minified
-		svgRawMax       = 1024      // §12 spec: 1 KB
-		faviconRawMax   = 512       // §12 spec: 0.3 KB; allow 0.5 KB for SVG declarations
-		totalRawMax     = 60 * 1024 // soft cap on raw HTML; the spec total is gzipped
-		totalGzippedMax = 22 * 1024 // §12 spec: 22 KB total over the wire
+		cssRawMax       = 110 * 1024 // ~17KB CSS + ~70KB inline fonts (base64) + headroom
+		jsRawMax        = 8 * 1024   // §12 spec: 6 KB minified
+		svgRawMax       = 1024       // §12 spec: 1 KB
+		faviconRawMax   = 768        // INSTRUMENT favicon is a small inline SVG nameplate
+		totalRawMax     = 200 * 1024 // raw HTML with inline fonts
+		totalGzippedMax = 90 * 1024  // base64 woff2 compresses poorly (already gzipped binary)
 	)
 
 	type b struct {
@@ -340,12 +342,12 @@ func TestColorContrast(t *testing.T) {
 			bg   string
 			min  float64 // required contrast ratio
 		}{
-			{"body text (--ink-5) on page bg (--ink-0)", tokens["--ink-5"], tokens["--ink-0"], 7.0},
-			{"muted text (--ink-4) on page bg (--ink-0)", tokens["--ink-4"], tokens["--ink-0"], 4.5},
-			{"--ok on page bg", tokens["--ok"], tokens["--ink-0"], 4.5},
-			{"--warn on page bg", tokens["--warn"], tokens["--ink-0"], 4.5},
-			{"--crit on page bg", tokens["--crit"], tokens["--ink-0"], 4.5},
-			{"--accent on page bg", tokens["--accent"], tokens["--ink-0"], 4.5},
+			{"body text (--ink-mid) on page bg (--bg)", tokens["--ink-mid"], tokens["--bg"], 7.0},
+			{"muted text (--ink-low) on page bg (--bg)", tokens["--ink-low"], tokens["--bg"], 4.5},
+			{"--ok on page bg", tokens["--ok"], tokens["--bg"], 4.5},
+			{"--warn on page bg", tokens["--warn"], tokens["--bg"], 4.5},
+			{"--crit on page bg", tokens["--crit"], tokens["--bg"], 4.5},
+			{"--signal on page bg", tokens["--signal"], tokens["--bg"], 4.5},
 		}
 		for _, p := range pairs {
 			if p.fg == "" || p.bg == "" {
