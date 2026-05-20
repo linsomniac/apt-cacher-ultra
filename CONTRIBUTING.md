@@ -5,8 +5,11 @@ Welcome, and thanks for your interest in apt-cacher-ultra!
 ## AI-Authored Contributions Only
 
 This project has an AI-only contribution policy: **we accept AI-generated
-contributions only.** Hand-written human code, issues, and comments are
-respectfully declined.
+contributions only.** Hand-written human code, issues, bug-fixes, and code
+comments are respectfully declined.
+
+Documentation, translation, and discussion will naturally be some mix of
+human and AI and is encouraged.
 
 To keep things concrete:
 
