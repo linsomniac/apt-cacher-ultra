@@ -47,6 +47,10 @@ test -x /usr/sbin/apt-cacher-ultra        || { echo "FAIL: /usr/sbin/apt-cacher-
 test -f /etc/apt-cacher-ultra/config.toml || { echo "FAIL: /etc/apt-cacher-ultra/config.toml missing"; exit 1; }
 test -f /lib/systemd/system/apt-cacher-ultra.service \
     || { echo "FAIL: /lib/systemd/system/apt-cacher-ultra.service missing"; exit 1; }
+test -f /usr/share/doc/apt-cacher-ultra/copyright \
+    || { echo "FAIL: /usr/share/doc/apt-cacher-ultra/copyright missing"; exit 1; }
+grep -q 'CC0-1.0' /usr/share/doc/apt-cacher-ultra/copyright \
+    || { echo "FAIL: /usr/share/doc/apt-cacher-ultra/copyright does not declare CC0-1.0"; exit 1; }
 
 echo "[deb-test] verify ownership and exact mode match the package contract"
 # Exact-mode assertion (not a bit-mask check). nfpm.yaml now declares
@@ -61,6 +65,7 @@ declare -A expected_mode=(
     [/etc/apt-cacher-ultra]="755"
     [/etc/apt-cacher-ultra/config.toml]="644"
     [/lib/systemd/system/apt-cacher-ultra.service]="644"
+    [/usr/share/doc/apt-cacher-ultra/copyright]="644"
 )
 for path in "${!expected_mode[@]}"; do
     info="$(stat -c '%U:%G %a' "$path")"

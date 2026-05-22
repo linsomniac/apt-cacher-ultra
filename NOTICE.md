@@ -1,6 +1,7 @@
 # NOTICE
 
-apt-cacher-ultra is distributed under the MIT license.
+apt-cacher-ultra is released into the public domain under the
+[CC0 1.0 Universal](LICENSE) dedication.
 
 The compiled binary additionally bundles third-party public-key
 keyring files via `go:embed`. They live in

@@ -10,7 +10,7 @@ description: |
   failure. Designed as a replacement for apt-cacher-ng that keeps cache
   hits fast and successful even when upstream mirrors are unreachable.
 homepage: https://github.com/linsomniac/apt-cacher-ultra
-license: MIT
+license: CC0-1.0
 depends:
   - adduser
 contents:
@@ -43,6 +43,12 @@ contents:
   - src: ./packaging/config/config.toml.default
     dst: /etc/apt-cacher-ultra/config.toml
     type: config|noreplace
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: ./packaging/copyright
+    dst: /usr/share/doc/apt-cacher-ultra/copyright
     file_info:
       mode: 0644
       owner: root
