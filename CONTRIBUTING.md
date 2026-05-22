@@ -65,6 +65,11 @@ A few reasons, in no particular order:
   apt-cacher-ultra was written by an AI assistant working with a human
   director. Keeping the contribution model consistent with how the project
   was built feels reasonable.
+- **Barrier Removal.** The primary contribution will be the prompt, which
+  is a human langauge description of the issue/feature.  Feel free to run
+  an AI tooling to create a PR, in part because it may generate further
+  discussion before the PR lands ("please ask any clarifying questions").
+  No knowledge of golang is necessary to contribute.
 - **Counterweight.** A growing number of projects are banning AI
   contributions outright. Reasonable people can land in different places on
   that question, and we think it's healthy for the ecosystem to have
