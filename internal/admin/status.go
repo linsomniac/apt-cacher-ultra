@@ -837,23 +837,6 @@ func splitUID(s string) uidParts {
 	}
 }
 
-
-// formatUnixTime renders a unix-seconds timestamp as YYYY-MM-DD HH:MM:SS.
-func formatUnixTime(unix int64) string {
-	if unix == 0 {
-		return ""
-	}
-	return time.Unix(unix, 0).UTC().Format("2006-01-02 15:04:05")
-}
-
-// formatUnixTimePtr renders a *int64 timestamp; nil → "-".
-func formatUnixTimePtr(unix *int64) string {
-	if unix == nil {
-		return "-"
-	}
-	return formatUnixTime(*unix)
-}
-
 // AIDEV-NOTE: formatUnixTimeTag returns template.HTML, bypassing
 // html/template auto-escaping (per the security note at the
 // statusHTMLTemplate definition). This is safe ONLY because every
@@ -959,7 +942,7 @@ func chunkHex(s string, n int) string {
 	}
 	for i := 0; i < len(lower); i++ {
 		c := lower[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return s
 		}
 	}

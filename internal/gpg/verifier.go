@@ -368,7 +368,7 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 			return nil, fmt.Errorf("decode signature: %w", err)
 		}
 		if err := requireParseableSignature(bytes.NewReader(binarySig)); err != nil {
-			return nil, fmt.Errorf("Release.gpg signature body: %w", err)
+			return nil, fmt.Errorf("parse Release.gpg signature body: %w", err)
 		}
 		v.logUnverifiedSignerOnce(suite, bytes.NewReader(binarySig))
 		return releaseBytes, nil
