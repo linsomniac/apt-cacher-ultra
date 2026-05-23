@@ -61,12 +61,14 @@ func TestServe_DisabledMode_AdvertisedDeltasOnly(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	cfg := minimalCfg(cacheDir, nil)
-	// Sanity guard: this test's whole point is exercising the
-	// `tls_mitm.enabled = false` branch, which is the default after
-	// minimalCfg + Defaults(). If a future config refactor flips the
-	// default the test would silently exercise the wrong branch.
+	// This test exercises the `tls_mitm.enabled = false` branch. The
+	// production Load() default is now true (drop-in posture), so pin
+	// disabled mode explicitly rather than relying on a default —
+	// minimalCfg struct-builds and Defaults() leaves bools alone, so
+	// it currently yields false, but make the intent loud.
+	cfg.TlsMitm.Enabled = false
 	if cfg.TlsMitm.Enabled {
-		t.Fatalf("test infrastructure broken: minimalCfg yields TlsMitm.Enabled=true; this test requires the disabled default")
+		t.Fatalf("test infrastructure broken: TlsMitm.Enabled=true; this test requires disabled mode")
 	}
 	// Admin block — minimalCfg + Defaults() does not populate the
 	// presence-sensitive admin defaults that Load() applies via

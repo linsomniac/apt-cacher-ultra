@@ -79,14 +79,23 @@ by creating the following file with these contents:
 
 ```
 # /etc/apt/apt.conf.d/00aptcacher
-Acquire::http::Proxy "http://[APT_CACHER_ULTRA_HOSTNAME:3142";
+Acquire::http::Proxy "http://APT_CACHER_ULTRA_HOSTNAME:3142";
 ```
 
-For apt repositories using https, you have these choices:
+For apt repositories using **https**, pick one of these (the cache allows all
+upstream hosts by default, so no allowlist editing is needed):
 
-- Make no changes, but apt-cacher-ultra does not cache the associated packages
-- Set up an MITM proxy (see the next section).
-- Replace `https://` with `http://HTTPS///` in the sources.list entry, **or** set up MITM proxy.
+- **https, not cached** — leave the sources as `https://` and set **only**
+  `Acquire::http::Proxy` (do *not* set `Acquire::https::Proxy`). apt connects
+  directly to the upstream over TLS; those packages are simply not cached.
+  (If you point `Acquire::https::Proxy` at the cache while MITM is off, the
+  cache returns `405` to the `CONNECT` and apt fails — so leave it unset.)
+- **https, cached, no MITM** — rewrite each source from `https://HOST/path`
+  to `http://HTTPS///HOST/path` (the apt-cacher-ng convention). The
+  client↔cache hop is plain http through the proxy above; the cache fetches
+  the upstream over https and caches the result. No CA setup required.
+- **https, cached, with MITM** — keep the sources as `https://`, enable the
+  MITM proxy, and install its CA on each client (see the next section).
 
 ### Enable the MITM HTTPS proxy (optional):
 
@@ -100,10 +109,35 @@ by signing per-host leaf certs from a local CA.
    ```toml
    [tls_mitm]
    enabled            = true
-   # allowed_host_regex narrows which upstream hosts MITM will sign for.
-   # If left empty, set allow_unconstrained_ca = true (not recommended).
-   allowed_host_regex = '^([a-z0-9-]+\.)*(ubuntu\.com|debian\.org)$|^download\.docker\.com$'
+   # allowed_host_regex lists the hosts MITM may sign certs for. It is
+   # translated into the CA's X.509 NameConstraints, so it accepts only a
+   # restricted grammar (see the table below). This example covers the
+   # Debian repos plus Docker:
+   allowed_host_regex = '^(deb\.debian\.org|security\.debian\.org|download\.docker\.com)$'
    # ca_cert / ca_key empty = auto-generate under <cache.dir>/ca on first start.
+   ```
+
+   **Supported `allowed_host_regex` shapes** (anchors `^…$` optional but must
+   be balanced). Anything else is refused at startup with
+   `mitm_ca_unconstrained_refused` unless you set `allow_unconstrained_ca = true`:
+
+   | Shape | Example |
+   |-------|---------|
+   | literal host | `^deb\.debian\.org$` |
+   | single-label prefix (note `+`, not `*`) | `^[a-z0-9-]+\.debian\.org$` |
+   | optional 2-letter region | `^([a-z]{2}\.)?archive\.ubuntu\.com$` |
+   | alternation of **literal** hosts | `^(deb\.debian\.org\|security\.debian\.org)$` |
+
+   `*` quantifiers and alternations with non-literal branches (e.g. the
+   `^([a-z0-9-]+\.)*(ubuntu\.com|debian\.org)$` form) are **not** supported.
+   To MITM-sign for **all** hosts instead (no name constraints — convenient,
+   but the CA can then mint a cert for any name), use:
+
+   ```toml
+   [tls_mitm]
+   enabled                = true
+   allowed_host_regex     = ''
+   allow_unconstrained_ca = true
    ```
 
 2. Start the daemon once so the CA is materialized, then export it:
@@ -132,7 +166,7 @@ by signing per-host leaf certs from a local CA.
 
       ```
       # /etc/apt/apt.conf.d/00aptcacher
-      Acquire::http::Proxy "http://[APT_CACHER_ULTRA_HOSTNAME:3142";
+      Acquire::http::Proxy "http://APT_CACHER_ULTRA_HOSTNAME:3142";
       Acquire::https::CaInfo "/etc/ssl/certs/apt-cacher-ultra-ca.crt";
       ```
 

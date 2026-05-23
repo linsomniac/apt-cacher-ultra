@@ -259,26 +259,23 @@ max_retries             = 3               # for resumable Range retries
 max_concurrent_per_host = 8
 
 # Open-proxy hardening (§6.6). Only upstream hosts matching one of these
-# regexes will be fetched. Empty list = deny-all (cache becomes read-only on
-# miss). The defaults cover the apt repos we know about; users add their own.
-allowed_host_regex = [
-  '^([a-z0-9-]+\.)*ubuntu\.com$',
-  '^([a-z0-9-]+\.)*debian\.org$',
-  '^ppa\.launchpadcontent\.net$',
-  '^apt\.corretto\.aws$',
-  '^repo\.charm\.sh$',
-  '^pkg\.haproxy\.com$',
-  '^download\.docker\.com$',
-]
+# regexes will be fetched. Default '^.*$' = allow all (apt-cacher-ng-style
+# drop-in); empty list ([]) = deny-all (cache becomes read-only on miss).
+# Tighten to the repos you use to harden.
+allowed_host_regex = ['^.*$']
+# Hardened example (uncomment & edit):
+# allowed_host_regex = [
+#   '^([a-z0-9-]+\.)*debian\.org$', '^([a-z0-9-]+\.)*ubuntu\.com$',
+#   '^download\.docker\.com$',
+# ]
 # After DNS resolution, every resolved IP is checked against these CIDRs and
-# the request is refused if any match. Defense-in-depth against DNS rebinding
-# and against an attacker-registered hostname that resolves into private space.
-deny_target_ranges = [
-  "127.0.0.0/8", "::1/128",
-  "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-  "169.254.0.0/16", "fe80::/10",
-  "::ffff:127.0.0.0/104",                 # IPv4-mapped loopback
-]
+# the request is refused if any match. Default empty = no IP filter so
+# private/LAN mirrors work; uncomment to guard against DNS rebinding / SSRF.
+deny_target_ranges = []
+# deny_target_ranges = [
+#   "127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12",
+#   "192.168.0.0/16", "169.254.0.0/16", "fe80::/10", "::ffff:127.0.0.0/104",
+# ]
 
 [freshness]
 cooldown          = "60s"                 # min interval between freshness checks per suite
@@ -395,10 +392,10 @@ The cache trusts upstream byte-for-byte in Phase 1. Phase 2 closes this hole.
 
 Listening on `0.0.0.0:3142` and willing to fetch arbitrary absolute proxy URLs is by definition an open-proxy posture. Even on a trusted internal network the blast radius is meaningful: anyone who can reach the cache port can use it to probe internal services or cloud metadata endpoints (`169.254.169.254`, `fd00:ec2::254`, …).
 
-Phase 1 enforces two layered defenses, both configured in `[upstream]` (§5.1):
+Phase 1 provides two layered defenses, both configured in `[upstream]` (§5.1). To keep the drop-in experience friction-free (apt-cacher-ng parity), they default to permissive — allow-all hosts and no IP filter — and are meant to be hardened when the cache port is reachable by untrusted clients:
 
-1. **Host allowlist (`allowed_host_regex`):** before any upstream connection, the canonical host must match at least one regex in the list. Default ships with the well-known apt repository hosts; users add their own. Empty list = deny-all (cache becomes read-only on miss).
-2. **Target range deny-list (`deny_target_ranges`):** *after* DNS resolution, every resolved IP is checked against these CIDRs. RFC1918, loopback, link-local, IPv4-mapped loopback, and IPv6 link-local are denied by default. This is defense-in-depth against DNS rebinding and against an attacker registering a real-looking hostname that resolves into private space.
+1. **Host allowlist (`allowed_host_regex`):** before any upstream connection, the canonical host must match at least one regex in the list. The default is allow-all (`^.*$`) so the cache is a drop-in for any apt repository; operators tighten it to the repos they use. Empty list = deny-all (cache becomes read-only on miss).
+2. **Target range deny-list (`deny_target_ranges`):** *after* DNS resolution, every resolved IP is checked against these CIDRs. The default is empty (no IP filter) so private/LAN mirrors work out of the box; operators opt into blocking RFC1918, loopback, link-local, IPv4-mapped loopback, and IPv6 link-local. This is defense-in-depth against DNS rebinding and against an attacker registering a real-looking hostname that resolves into private space.
 
 If either check fails the cache returns `403 Forbidden` to the client, logs the attempt with the offending URL and resolved IP, and makes no upstream connection.
 

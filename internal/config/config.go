@@ -21,27 +21,20 @@ import (
 const DefaultCacheDir = "/var/cache/apt-cacher-ultra"
 
 // DefaultAllowedHostRegex is the SPEC §6.6 allow-list applied when
-// upstream.allowed_host_regex is unset (nil). An explicit empty list in
-// config means "deny everything"; that is preserved.
+// upstream.allowed_host_regex is unset (nil). The default is allow-all so the
+// cache works as a drop-in for any apt repository (apt-cacher-ng parity);
+// operators tighten it in config (see packaging/config/config.toml.default).
+// An explicit empty list in config means "deny everything"; that is preserved.
 var DefaultAllowedHostRegex = []string{
-	`^([a-z0-9-]+\.)*ubuntu\.com$`,
-	`^([a-z0-9-]+\.)*debian\.org$`,
-	`^ppa\.launchpadcontent\.net$`,
-	`^apt\.corretto\.aws$`,
-	`^repo\.charm\.sh$`,
-	`^pkg\.haproxy\.com$`,
-	`^download\.docker\.com$`,
+	`^.*$`,
 }
 
 // DefaultDenyTargetRanges is the post-DNS deny list applied when
-// upstream.deny_target_ranges is unset. Covers loopback, RFC1918,
-// link-local, and IPv4-mapped loopback.
-var DefaultDenyTargetRanges = []string{
-	"127.0.0.0/8", "::1/128",
-	"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-	"169.254.0.0/16", "fe80::/10",
-	"::ffff:127.0.0.0/104",
-}
+// upstream.deny_target_ranges is unset. The default is empty (no IP filter)
+// so private/LAN mirrors work with zero config; operators opt into the
+// loopback/RFC1918/link-local SSRF guard in config. An explicit empty list is
+// equivalent to this default.
+var DefaultDenyTargetRanges []string
 
 // architectureNameRE is the SPEC6_5 §5.2 shape predicate for a single
 // entry in [adoption].architectures: lowercase ASCII letters and digits,
@@ -422,17 +415,21 @@ type LogConfig struct {
 	Format string `toml:"format"`
 }
 
-// TlsMitmConfig holds the SPEC6 §5.1 [tls_mitm] block. Default OFF;
-// when enabled, the CONNECT method is upgraded from "405 Method Not
+// TlsMitmConfig holds the SPEC6 §5.1 [tls_mitm] block. Default ON
+// (drop-in/just-works posture; operators harden via config). When
+// enabled, the CONNECT method is upgraded from "405 Method Not
 // Allowed" to a transparent MITM tunnel that signs leaf certs from
 // the configured CA. See SPEC6 §2.2 for the CONNECT pipeline and
 // §5.1.1 / §5.1.1.1 for the auto-generated CA's Name Constraints
 // translation contract.
 type TlsMitmConfig struct {
 	// Enabled is the master switch. False = SPEC §2.6 method
-	// dispatch (CONNECT → 405). Default false; flip-to-true is a
-	// per-deployment decision because MITM rewrites the trust
-	// posture of every cached HTTPS upstream.
+	// dispatch (CONNECT → 405). Default true (seeded in
+	// defaultConfig): the cache MITM-signs and caches HTTPS repos
+	// out of the box. Operators opt out with explicit
+	// `enabled = false`. Note MITM is not truly "drop-in" — every
+	// apt client must trust the cache's CA or HTTPS fetches fail
+	// with certificate errors.
 	Enabled bool `toml:"enabled"`
 
 	// CaCert / CaKey are operator-supplied paths. Both empty =
@@ -469,15 +466,19 @@ type TlsMitmConfig struct {
 
 	// AllowedHostRegex is the §5.1.2 signing predicate AND, when
 	// translatable per §5.1.1.1, the source of the auto-generated
-	// CA's RFC 5280 Name Constraints. Empty = no MITM-side narrowing
-	// (the upstream fetch gate alone applies). Must compile as a
-	// Go RE2 regex if non-empty.
+	// CA's RFC 5280 Name Constraints. Default empty = no MITM-side
+	// narrowing (sign for all hosts; the upstream fetch gate alone
+	// applies), paired with AllowUnconstrainedCA = true. Must compile
+	// as a Go RE2 regex if non-empty.
 	AllowedHostRegex string `toml:"allowed_host_regex"`
 
 	// AllowUnconstrainedCA opts the auto-generated CA path into
 	// running without RFC 5280 Name Constraints when the regex is
-	// empty or untranslatable. Default false (fail-closed per
-	// §5.1.1). Has no effect on operator-supplied CAs.
+	// empty or untranslatable. Default true (seeded in
+	// defaultConfig): with the default empty AllowedHostRegex this is
+	// what lets MITM sign for all hosts out of the box. Set false to
+	// fail closed (refuse an unconstrained CA) per §5.1.1. Has no
+	// effect on operator-supplied CAs.
 	AllowUnconstrainedCA bool `toml:"allow_unconstrained_ca"`
 }
 
@@ -671,6 +672,12 @@ func Load(path string) (*Config, error) {
 // require_signature = false config). adoption.enabled and
 // require_pinned_signer remain false (match apt's broad-trust default
 // during rollout; flip-to-true is a per-deployment decision).
+//
+// SPEC6 [tls_mitm]: enabled and allow_unconstrained_ca default true
+// (drop-in/just-works posture — HTTPS repos are cached out of the box
+// via an unconstrained auto-gen CA). Operators harden with explicit
+// `enabled = false` and/or `allow_unconstrained_ca = false` (the
+// latter pairs with a translatable allowed_host_regex).
 func defaultConfig() *Config {
 	return &Config{
 		Serve: ServeConfig{
@@ -704,6 +711,21 @@ func defaultConfig() *Config {
 			// false." Operators opt out with explicit
 			// `enabled = false`, which fires admin_disabled Warn.
 			Enabled: true,
+		},
+		TlsMitm: TlsMitmConfig{
+			// tls_mitm.enabled / allow_unconstrained_ca default true:
+			// the cache MITM-signs and caches HTTPS repos out of the
+			// box (drop-in/just-works posture; hardening is opt-in).
+			// Same bool-pre-populate rationale as gc.enabled — no
+			// zero-value sentinel distinguishes "absent" from
+			// "explicit false," so these must be seeded here, before
+			// the TOML decode, so an operator's explicit `false`
+			// survives and an absent key keeps the default. With the
+			// default empty AllowedHostRegex, AllowUnconstrainedCA =
+			// true is what lets the auto-gen CA sign for all hosts;
+			// set either to false to opt out / harden.
+			Enabled:              true,
+			AllowUnconstrainedCA: true,
 		},
 	}
 }

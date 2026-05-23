@@ -14,26 +14,41 @@ idle_read_timeout       = "60s"
 max_retries             = 3
 max_concurrent_per_host = 8
 
-# Open-proxy hardening (SPEC §6.6). Only upstream hosts matching one of
-# these regexes will be fetched. Empty list = deny-all (cache becomes
-# read-only on miss).
-allowed_host_regex = [
-  '^([a-z0-9-]+\.)*ubuntu\.com$',
-  '^([a-z0-9-]+\.)*debian\.org$',
-  '^ppa\.launchpadcontent\.net$',
-  '^apt\.corretto\.aws$',
-  '^repo\.charm\.sh$',
-  '^pkg\.haproxy\.com$',
-  '^download\.docker\.com$',
-]
-# After DNS resolution, every resolved IP is checked against these CIDRs
-# and the request is refused if any match.
-deny_target_ranges = [
-  "127.0.0.0/8", "::1/128",
-  "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-  "169.254.0.0/16", "fe80::/10",
-  "::ffff:127.0.0.0/104",
-]
+# --- Upstream access policy ------------------------------------------------
+# Default: ALLOW EVERYTHING. apt-cacher-ultra works as a drop-in cache for any
+# apt repository with no editing required (like apt-cacher-ng). Tighten the two
+# settings below if the cache port is reachable by untrusted clients.
+#
+# allowed_host_regex: only upstream hosts matching one of these Go regexes are
+# fetched. '^.*$' = allow all. An empty list ([]) = deny-all (the cache becomes
+# read-only on miss). (SPEC §6.6 open-proxy hardening.)
+allowed_host_regex = ['^.*$']
+#
+# Hardened alternative — restrict to specific upstreams. Uncomment & edit:
+# allowed_host_regex = [
+#   '^([a-z0-9-]+\.)*debian\.org$',   # deb.debian.org, security.debian.org, ftp.<cc>.debian.org
+#   '^([a-z0-9-]+\.)*ubuntu\.com$',   # archive/security/ports.ubuntu.com, <cc>.archive...
+#   '^download\.docker\.com$',
+#   '^ppa\.launchpadcontent\.net$',
+#   '^apt\.corretto\.aws$',
+#   '^repo\.charm\.sh$',
+#   '^pkg\.haproxy\.com$',
+#   # ...add your own repositories here...
+# ]
+
+# deny_target_ranges: after DNS resolution, every resolved IP is checked
+# against these CIDRs and the request is refused if any match.
+# Default: EMPTY (no IP filter) so private/LAN mirrors work with zero config.
+deny_target_ranges = []
+#
+# Hardened alternative — block internal ranges (SSRF / DNS-rebinding guard).
+# Recommended if the cache is reachable by untrusted clients. Uncomment:
+# deny_target_ranges = [
+#   "127.0.0.0/8", "::1/128",
+#   "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+#   "169.254.0.0/16", "fe80::/10",
+#   "::ffff:127.0.0.0/104",
+# ]
 
 [freshness]
 cooldown          = "60s"
@@ -269,6 +284,37 @@ log_stale_serves               = true
 [log]
 level  = "info"
 format = "json"
+
+# --- HTTPS caching via MITM (ON by default) --------------------------------
+# By default the cache MITM-signs https:// repos so they are CACHED: it signs
+# per-host leaf certs from a local CA, then decrypts, caches, and re-serves
+# https sources. The default CA has NO name constraints (signs for all hosts) —
+# the just-works posture. IMPORTANT: every apt client must trust the cache's CA
+# or https fetches fail with certificate errors (see the README "Enable the
+# MITM HTTPS proxy" section). To turn MITM OFF — CONNECT then returns 405 and
+# apt talks straight to the upstream (those repos work but are NOT cached) —
+# set enabled = false.
+#
+# ca_cert / ca_key empty = auto-generate the CA under <cache.dir>/ca on first
+# start. allowed_host_regex defaults to '' (empty) = sign for ALL hosts.
+[tls_mitm]
+enabled                = true
+allow_unconstrained_ca = true
+#
+# Hardened alternative — restrict which hosts MITM will sign for, and fail
+# closed. allowed_host_regex is translated into the CA's X.509 NameConstraints,
+# so allow_unconstrained_ca = false refuses to start if it can't be translated.
+# SUPPORTED grammar (anchors ^...$ are optional but must be balanced):
+#   literal host:             '^deb\.debian\.org$'
+#   single-label prefix:      '^[a-z0-9-]+\.debian\.org$'   (note: + not *)
+#   optional 2-letter region: '^([a-z]{2}\.)?archive\.ubuntu\.com$'
+#   alternation of LITERALS:  '^(deb\.debian\.org|security\.debian\.org)$'
+# NOT supported: '*' quantifiers, or alternations with non-literal branches.
+# Replace the [tls_mitm] block above with:
+# [tls_mitm]
+# enabled                = true
+# allowed_host_regex     = '^(deb\.debian\.org|security\.debian\.org|download\.docker\.com)$'
+# allow_unconstrained_ca = false
 
 # Custom Remap rules. User rules apply before built-ins (SPEC §3.2).
 # [[remap]]

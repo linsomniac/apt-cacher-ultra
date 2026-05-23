@@ -34,12 +34,13 @@ dir = "`+dir+`"
 	if cfg.Cache.Listen != "0.0.0.0:3142" {
 		t.Errorf("listen default not applied: %q", cfg.Cache.Listen)
 	}
-	// Security defaults must be populated even from a minimal config (§6.6).
-	if len(cfg.Upstream.AllowedHostRegex) == 0 {
-		t.Errorf("AllowedHostRegex was not populated by Defaults")
+	// §6.6: a minimal config defaults to permissive (allow-all hosts, no IP
+	// filter) for apt-cacher-ng-style drop-in; hardening is opt-in.
+	if !reflect.DeepEqual(cfg.Upstream.AllowedHostRegex, []string{`^.*$`}) {
+		t.Errorf("AllowedHostRegex default = %v, want [^.*$] (allow-all)", cfg.Upstream.AllowedHostRegex)
 	}
-	if len(cfg.Upstream.DenyTargetRanges) == 0 {
-		t.Errorf("DenyTargetRanges was not populated by Defaults")
+	if len(cfg.Upstream.DenyTargetRanges) != 0 {
+		t.Errorf("DenyTargetRanges default = %v, want empty (no IP filter)", cfg.Upstream.DenyTargetRanges)
 	}
 	// SPEC §5.1 [serve] defaults — bools default to true when [serve]
 	// is absent. Without pre-populating before decode, omitted bool keys
@@ -1222,9 +1223,11 @@ func TestHeartbeatStaleGraceEffective_DerivedAboveFloor(t *testing.T) {
 // ============================================================================
 
 // TestTlsMitm_Defaults verifies the SPEC6 §5.1 defaults are populated
-// when the [tls_mitm] block is absent (or partially present). Bool
-// fields default to false at the Go zero-value level; numeric and
-// string fields are only filled in when zero / empty.
+// when the [tls_mitm] block is absent (or partially present). The
+// drop-in posture seeds enabled = true and allow_unconstrained_ca =
+// true (with an empty allowed_host_regex → sign for all hosts) in
+// defaultConfig; numeric and string fields are only filled in when
+// zero / empty.
 func TestTlsMitm_Defaults(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, "config.toml", `
@@ -1235,11 +1238,14 @@ dir = "`+dir+`"
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.TlsMitm.Enabled {
-		t.Error("TlsMitm.Enabled defaulted to true, want false (default OFF)")
+	if !cfg.TlsMitm.Enabled {
+		t.Error("TlsMitm.Enabled defaulted to false, want true (default ON / drop-in)")
 	}
-	if cfg.TlsMitm.AllowUnconstrainedCA {
-		t.Error("TlsMitm.AllowUnconstrainedCA defaulted to true, want false")
+	if !cfg.TlsMitm.AllowUnconstrainedCA {
+		t.Error("TlsMitm.AllowUnconstrainedCA defaulted to false, want true (allow-all)")
+	}
+	if cfg.TlsMitm.AllowedHostRegex != "" {
+		t.Errorf("TlsMitm.AllowedHostRegex = %q, want empty (sign for all hosts)", cfg.TlsMitm.AllowedHostRegex)
 	}
 	if cfg.TlsMitm.CertCacheSize != 256 {
 		t.Errorf("TlsMitm.CertCacheSize = %d, want 256", cfg.TlsMitm.CertCacheSize)
