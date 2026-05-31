@@ -122,6 +122,36 @@ func ParseRelease(text []byte) ([]ReleaseMember, error) {
 	return out, nil
 }
 
+// parseAcquireByHash reports whether the Release/InRelease header
+// advertises "Acquire-By-Hash: yes" — apt's signal that the archive
+// serves every listed member under <dir>/by-hash/SHA256/<sha256>.
+// Adoption uses this (REC 2) to fetch members from their content-
+// addressed URL, which is immune to the publication race where the
+// mutable path serves a newer revision than the InRelease declared.
+//
+// Only top-level header lines are consulted; indented lines (the
+// SHA256/MD5Sum hash blocks) are skipped so a member literally named
+// "Acquire-By-Hash: yes" can't spoof the flag. The value comparison is
+// case-insensitive against "yes" (apt accepts yes/no).
+func parseAcquireByHash(text []byte) bool {
+	scanner := bufio.NewScanner(bytes.NewReader(text))
+	scanner.Buffer(make([]byte, 0, scanBufCap), scanBufCap)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" || line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
+		key, val, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(key), "Acquire-By-Hash") {
+			return strings.EqualFold(strings.TrimSpace(val), "yes")
+		}
+	}
+	return false
+}
+
 func parseReleaseHashLine(line string) (ReleaseMember, error) {
 	// strings.Fields collapses runs of whitespace and strips the
 	// leading indent. Real Release files pad the size column with

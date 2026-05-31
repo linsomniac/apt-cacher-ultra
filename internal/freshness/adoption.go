@@ -93,6 +93,52 @@ var (
 	ErrAdoptionUnpinnedSuite = errors.New("adoption_unpinned_suite")
 )
 
+// AdoptionMemberError carries the failing Release member's suite-
+// relative path and a short human detail alongside one of the
+// category sentinels above. It is the carrier that lets the admin
+// status surface answer "which member failed and why" (SPEC5 §10.5
+// recent_adoptions[].member_path / .detail) without string-parsing
+// the error text.
+//
+// The wrapped err is built with fmt.Errorf("%w: ...", sentinel, ...),
+// so errors.Is(err, ErrAdoptionMemberFetchFailed) (and
+// ErrAdoptionMemberMismatch) still see the category through Unwrap —
+// classifyAdoptionOutcome keeps working unchanged. errors.As(err,
+// &*AdoptionMemberError) recovers Path/Detail at the freshness layer.
+type AdoptionMemberError struct {
+	Path   string // suite-relative member path, e.g. "Contents-amd64"
+	Detail string // short reason, e.g. "served 114572 vs declared 1664594"
+	err    error  // wraps the category sentinel via %w
+}
+
+func (e *AdoptionMemberError) Error() string { return e.err.Error() }
+
+func (e *AdoptionMemberError) Unwrap() error { return e.err }
+
+// newMemberErr wraps a category sentinel with the failing member's
+// path + detail. The resulting error satisfies both errors.Is(…,
+// sentinel) and errors.As(…, **AdoptionMemberError).
+func newMemberErr(sentinel error, path, detail string) error {
+	return &AdoptionMemberError{
+		Path:   path,
+		Detail: detail,
+		err:    fmt.Errorf("%w: %s: %s", sentinel, path, detail),
+	}
+}
+
+// memberErrorFields recovers the failing member path + detail from an
+// adoption error, seeing through arbitrary wrapping via errors.As.
+// Returns ("","") for nil or any error not carrying an
+// *AdoptionMemberError — the freshness ring writes those as empty so
+// success rows and non-member failures keep the pre-existing shape.
+func memberErrorFields(err error) (path, detail string) {
+	var me *AdoptionMemberError
+	if errors.As(err, &me) {
+		return me.Path, me.Detail
+	}
+	return "", ""
+}
+
 // archFilterBinaryRE matches the binary-arch index file shapes that the
 // SPEC6_5 §7.2 architecture filter scopes to: Packages files (and their
 // compressed variants) plus the Packages.diff/Index pdiff manifest. Per-
@@ -119,6 +165,28 @@ func archFromFilteredPath(p string) (arch string, filtered bool) {
 		return "source", true
 	}
 	return "", false
+}
+
+// isIndexTarget reports whether a Release member's suite-relative path
+// is an apt "IndexTarget" — a per-arch Packages* / pdiff Index or a
+// per-component Sources* / pdiff Index, i.e. the files apt actually
+// fetches for `apt update` + `apt install`. Everything else
+// (Contents-*, dep11 Components/icons, i18n Translations, …) is an
+// optional member apt does not require.
+//
+// REC 1 keys on this: when [adoption].tolerate_optional_member_failures
+// is set, an integrity/availability failure on a non-IndexTarget member
+// is skipped instead of aborting the whole suite. The IndexTarget set is
+// defined by the same two regexes the SPEC6_5 §7.2 arch filter uses, so
+// the two views can never drift.
+//
+// AIDEV-NOTE: keep this in lockstep with archFilterBinaryRE /
+// archFilterSourceRE and the SPEC6_5 §7.2 IndexTarget definition. A
+// path that adoption treats as an IndexTarget here MUST stay fatal-on-
+// mismatch — never relax this set without a security review, since it
+// is the surface apt installs packages from.
+func isIndexTarget(p string) bool {
+	return archFilterBinaryRE.MatchString(p) || archFilterSourceRE.MatchString(p)
 }
 
 // errAdoptionMemberSkipped is the in-package signal from adoptMember
@@ -182,6 +250,19 @@ type AdoptionConfig struct {
 	// receives only well-formed values.
 	Architectures []string
 
+	// TolerateOptionalMemberFailures is the REC 1
+	// [adoption].tolerate_optional_member_failures switch (default true).
+	// When true, an integrity/availability failure (size/content-length
+	// mismatch, hash mismatch, transport error, non-404 status) on a
+	// non-IndexTarget member (Contents-*, dep11 Components/icons, i18n
+	// Translations) is logged as adoption_member_skipped and skipped,
+	// instead of aborting the whole suite adoption. IndexTarget members
+	// (per-arch Packages*, per-component Sources*, their pdiff Indexes)
+	// remain fatal-on-failure regardless — the surface apt installs from
+	// is never weakened. When false, every member failure is fatal
+	// (Phase-6 strict all-or-nothing).
+	TolerateOptionalMemberFailures bool
+
 	Logger *slog.Logger
 
 	// now is a test seam; production uses time.Now.
@@ -222,6 +303,11 @@ type Adopter struct {
 	// must be a key in the map for binary-<arch>/ and source/ index
 	// members to be adopted.
 	architectureAllowlist map[string]struct{}
+
+	// tolerateOptionalMembers is the REC 1 switch (see AdoptionConfig.
+	// TolerateOptionalMemberFailures). When true, non-IndexTarget member
+	// failures are skipped rather than fatal.
+	tolerateOptionalMembers bool
 
 	logger *slog.Logger
 	now    func() time.Time
@@ -274,17 +360,18 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		}
 	}
 	return &Adopter{
-		cache:                 cfg.Cache,
-		fetcher:               cfg.Fetcher,
-		verifier:              cfg.Verifier,
-		hostSem:               cfg.HostLimiter,
-		concurrencySem:        sem,
-		hotPackagesWindow:     cfg.HotPackagesWindow,
-		hotPrefetchBudget:     cfg.HotPrefetchBudget,
-		heartbeatInterval:     cfg.HeartbeatInterval,
-		architectureAllowlist: allowlist,
-		logger:                logger,
-		now:                   now,
+		cache:                   cfg.Cache,
+		fetcher:                 cfg.Fetcher,
+		verifier:                cfg.Verifier,
+		hostSem:                 cfg.HostLimiter,
+		concurrencySem:          sem,
+		hotPackagesWindow:       cfg.HotPackagesWindow,
+		hotPrefetchBudget:       cfg.HotPrefetchBudget,
+		heartbeatInterval:       cfg.HeartbeatInterval,
+		architectureAllowlist:   allowlist,
+		tolerateOptionalMembers: cfg.TolerateOptionalMemberFailures,
+		logger:                  logger,
+		now:                     now,
 	}, nil
 }
 
@@ -577,6 +664,9 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	}
 
 	// Step 3: parse the verified Release-style plaintext.
+	// REC 2: detect Acquire-By-Hash once for the whole suite; adoptMember
+	// uses it to prefer the content-addressed by-hash URL per member.
+	acquireByHash := parseAcquireByHash(releaseText)
 	members, err := ParseRelease(releaseText)
 	if err != nil {
 		a.logger.Info("adoption_parse_failed",
@@ -732,9 +822,42 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			}
 		}
 
-		blobHash, err := a.adoptMember(ctx, suite, m)
+		blobHash, err := a.adoptMember(ctx, suite, m, acquireByHash)
 		if err != nil {
 			if errors.Is(err, errAdoptionMemberSkipped) {
+				skippedCount++
+				continue
+			}
+			// REC 1: a non-IndexTarget member (Contents-*, dep11
+			// Components/icons, i18n Translations) whose fetch or
+			// integrity check failed must not abort the whole suite when
+			// tolerance is enabled. These are files apt does not fetch
+			// for `apt update`/`apt install`; failing the suite on them
+			// is what causes the bulk of observed adoption_run_failed
+			// events (e.g. an index republished mid-fetch, or a mirror
+			// that serves the .gz at the uncompressed URL). The member
+			// is skipped: no snapshot_member / by-hash / package_hash row
+			// is created for it, so a tampered optional file can never be
+			// served — apt 404s it, exactly as on the 404-skip path.
+			// IndexTarget members stay fatal regardless (isIndexTarget),
+			// and a local DB fault (ErrAdoptionDBFailed) is never
+			// tolerated — only upstream member fetch/mismatch failures.
+			if a.tolerateOptionalMembers && !isIndexTarget(m.Path) &&
+				(errors.Is(err, ErrAdoptionMemberFetchFailed) || errors.Is(err, ErrAdoptionMemberMismatch)) {
+				detail := ""
+				var me *AdoptionMemberError
+				if errors.As(err, &me) {
+					detail = me.Detail
+				}
+				a.logger.Warn("adoption_member_skipped",
+					"canonical_host", suite.CanonicalHost,
+					"suite_path", suite.SuitePath,
+					"path", m.Path,
+					"declared_sha256", m.SHA256,
+					"reason", "optional_member_integrity",
+					"detail", detail,
+				)
+				adoptionMembersSkippedTotal.Inc("optional_member_integrity")
 				skippedCount++
 				continue
 			}
@@ -1015,7 +1138,7 @@ func formName(f adoptionForm) string {
 // (with rehash defense), else fetch from upstream. Returns the blob
 // hash on success — guaranteed to equal m.SHA256, since adoption
 // rejects any byte stream whose hash differs from the declaration.
-func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMember) (string, error) {
+func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMember, acquireByHash bool) (string, error) {
 	exists, err := a.cache.BlobExists(m.SHA256)
 	if err != nil {
 		return "", fmt.Errorf("%w: BlobExists %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
@@ -1067,8 +1190,50 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 	}
 	defer release()
 
-	// Build the upstream URL: suite_path + "/" + relative path.
-	upstreamURL := buildMemberURL(suite, m.Path)
+	// REC 2: prefer Acquire-By-Hash when the upstream advertises it and
+	// the member lives under a directory. A by-hash URL embeds the
+	// declared sha256 in its path, so it is immune to the publication
+	// race where the mutable path serves a newer-but-valid revision than
+	// our InRelease declared (the dominant intermittent failure on the
+	// Ubuntu archives). Best-effort: on ANY by-hash failure — a pruned
+	// by-hash blob 404s, transport error, even a hash surprise — fall
+	// back to the plain-path fetch, which preserves today's exact
+	// semantics (404/410 → skip; size/hash mismatch → typed-fatal). The
+	// declared-hash check in fetchMemberURL runs for both URLs, so a
+	// by-hash response that somehow served the wrong bytes is still
+	// rejected before adoption.
+	if acquireByHash {
+		if bh := byHashAliasPath(m.Path, m.SHA256); bh != "" {
+			if hash, ferr := a.fetchMemberURL(ctx, suite, m, bh); ferr == nil {
+				return hash, nil
+			} else {
+				a.logger.Debug("adoption_byhash_fallback",
+					"canonical_host", suite.CanonicalHost,
+					"suite_path", suite.SuitePath,
+					"path", m.Path,
+					"err", ferr,
+				)
+			}
+		}
+	}
+	return a.fetchMemberURL(ctx, suite, m, m.Path)
+}
+
+// fetchMemberURL fetches one Release member from a specific suite-
+// relative URL (either the plain declared path or its by-hash alias),
+// verifies the bytes against the member's declared Size + SHA256, and
+// PutBlobs them. The host slot is held by the caller (adoptMember).
+//
+// Error semantics are the authoritative member-fetch rules: a 404/410
+// returns errAdoptionMemberSkipped (SPEC2 §7.5.2 "declared but does not
+// serve"); a size/content-length mismatch, finalize error, transport
+// error, or other status returns a typed *AdoptionMemberError wrapping
+// ErrAdoptionMemberFetchFailed; a hash mismatch wraps
+// ErrAdoptionMemberMismatch. Verification always uses m.Size / m.SHA256
+// (the signed-Release declarations), independent of which URL served
+// the bytes.
+func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseMember, relPath string) (string, error) {
+	upstreamURL := buildMemberURL(suite, relPath)
 	target := &fetch.Target{
 		CanonicalHost: suite.CanonicalHost,
 		URL:           upstreamURL,
@@ -1112,8 +1277,8 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 			adoptionMembersSkippedTotal.Inc("4xx")
 			return "", errAdoptionMemberSkipped
 		}
-		return "", fmt.Errorf("%w: fetch %s: %v",
-			ErrAdoptionMemberFetchFailed, m.Path, err)
+		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,
+			fmt.Sprintf("fetch: %v", err))
 	}
 	// Size sanity: declared Size in the Release file should match
 	// what the fetch actually wrote. fetch.Client already honors
@@ -1122,14 +1287,14 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 	// than a hash mismatch (the bytes might still hash correctly,
 	// but a length mismatch is its own integrity violation).
 	if m.Size > 0 && res.ContentLength > 0 && res.ContentLength != m.Size {
-		return "", fmt.Errorf("%w: %s: content-length %d vs declared %d",
-			ErrAdoptionMemberFetchFailed, m.Path, res.ContentLength, m.Size)
+		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,
+			fmt.Sprintf("served %d vs declared %d", res.ContentLength, m.Size))
 	}
 
 	hashHex, err := w.Finalize(res.ContentLength)
 	if err != nil {
-		return "", fmt.Errorf("%w: finalize %s: %v",
-			ErrAdoptionMemberFetchFailed, m.Path, err)
+		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,
+			fmt.Sprintf("finalize: %v", err))
 	}
 	if hashHex != m.SHA256 {
 		// Mismatch. The blob is now in pool/ under hashHex (its
@@ -1144,8 +1309,8 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 			"declared_sha256", m.SHA256,
 			"actual_sha256", hashHex,
 		)
-		return "", fmt.Errorf("%w: %s: declared %s, got %s",
-			ErrAdoptionMemberMismatch, m.Path, m.SHA256, hashHex)
+		return "", newMemberErr(ErrAdoptionMemberMismatch, m.Path,
+			fmt.Sprintf("declared %s, got %s", shortHash(m.SHA256), shortHash(hashHex)))
 	}
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {
 		return "", fmt.Errorf("%w: PutBlob %s: %v", ErrAdoptionDBFailed, hashHex, err)
@@ -1216,6 +1381,17 @@ func (a *Adopter) writeBlobBytes(ctx context.Context, content []byte) (string, e
 // digest. Used by writeBlobBytes and adoptMember for the "rehash on
 // reuse" defense — content sitting in pool/ from a prior fetch is
 // re-verified before being trusted as a snapshot member.
+// shortHash truncates a hex digest to its first 12 characters for
+// compact display in the admin reason chip. The full digests stay in
+// the adoption_member_mismatch Warn log (declared_sha256 /
+// actual_sha256), so operators can still recover the complete values.
+func shortHash(h string) string {
+	if len(h) <= 12 {
+		return h
+	}
+	return h[:12]
+}
+
 func hashFile(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {

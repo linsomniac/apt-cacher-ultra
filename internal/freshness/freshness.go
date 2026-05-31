@@ -302,6 +302,10 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		adoptionTotal.Inc(outcome, req.suite.CanonicalHost)
 		adoptionDurationSeconds.Observe(duration.Seconds(), outcome, req.suite.CanonicalHost)
 		if c.adoptionRing != nil {
+			// SPEC5 §10.5: surface the failing member + detail when the
+			// error chain carries an *AdoptionMemberError (member_fetch_failed
+			// / member_mismatch). Empty for success and non-member failures.
+			memberPath, detail := memberErrorFields(err)
 			c.adoptionRing.Record(observability.AdoptionEvent{
 				Host:             req.suite.CanonicalHost,
 				SuitePath:        req.suite.SuitePath,
@@ -309,6 +313,8 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 				Reason:           reason,
 				CompletedUnixSec: c.now().Unix(),
 				DurationSeconds:  duration.Seconds(),
+				MemberPath:       memberPath,
+				Detail:           detail,
 			})
 		}
 		if err != nil {

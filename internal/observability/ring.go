@@ -49,6 +49,16 @@ type AdoptionEvent struct {
 	// DurationSeconds is the wallclock from the start of the
 	// adoption goroutine to the completion log emit.
 	DurationSeconds float64
+	// MemberPath is the suite-relative path of the declared Release
+	// member that caused a member-scoped failure (member_fetch_failed
+	// / member_mismatch), e.g. "Contents-amd64". Empty on success and
+	// on failures that are not tied to a specific member. Surfaced via
+	// the SPEC5 §10.5 status-page JSON as recent_adoptions[].member_path.
+	MemberPath string
+	// Detail is a short human description of a member-scoped failure,
+	// e.g. "served 114572 vs declared 1664594". Empty when MemberPath
+	// is empty. Surfaced as recent_adoptions[].detail.
+	Detail string
 }
 
 // Ring is a thread-safe, fixed-capacity ring buffer of

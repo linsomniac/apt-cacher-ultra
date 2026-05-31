@@ -2,6 +2,8 @@ package admin
 
 import (
 	"testing"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 )
 
 func TestStatusTemplateFuncMapHasNewHelpers(t *testing.T) {
@@ -531,6 +533,9 @@ func TestOutcomeBadgeClass(t *testing.T) {
 		{"member_mismatch", "b--crit"},
 		{"unpinned_suite", "b--crit"},
 		{"run_failed", "b--crit"},
+		// SPEC5 §10.4.3 outcomes broken out of the run_failed catch-all.
+		{"member_fetch_failed", "b--crit"},
+		{"db_failed", "b--crit"},
 		// Soft-state values (used outside the adoption row context).
 		{"lagging", "b--warn"},
 		{"warn", "b--warn"},
@@ -544,5 +549,50 @@ func TestOutcomeBadgeClass(t *testing.T) {
 		if got := outcomeBadgeClass(c.outcome); got != c.want {
 			t.Errorf("outcomeBadgeClass(%q) = %q; want %q", c.outcome, got, c.want)
 		}
+	}
+}
+
+// TestReasonTooltip pins the human-readable hover text for the adoption
+// reason chips. The two outcomes broken out of run_failed
+// (member_fetch_failed, db_failed) must each return a specific,
+// non-passthrough explanation; unknown tags pass through verbatim.
+func TestReasonTooltip(t *testing.T) {
+	for _, tag := range []string{"member_fetch_failed", "db_failed"} {
+		got := reasonTooltip(tag)
+		if got == "" || got == tag {
+			t.Errorf("reasonTooltip(%q) = %q; want a specific explanation, not passthrough", tag, got)
+		}
+	}
+	// Unknown tags pass through verbatim (forward-compat contract).
+	if got := reasonTooltip("some_future_tag"); got != "some_future_tag" {
+		t.Errorf("reasonTooltip(unknown) = %q; want passthrough", got)
+	}
+}
+
+// TestBuildAdoptionEntries verifies the failing-member path + detail
+// copy through from the observability ring into the status-page row,
+// and that success rows leave both empty.
+func TestBuildAdoptionEntries(t *testing.T) {
+	events := []observability.AdoptionEvent{
+		{
+			Host: "packages.icinga.com", SuitePath: "/ubuntu/dists/icinga-jammy",
+			Outcome: "member_fetch_failed", Reason: "member_fetch_failed",
+			MemberPath: "Contents-amd64", Detail: "served 114572 vs declared 1664594",
+			CompletedUnixSec: 1700, DurationSeconds: 0.2,
+		},
+		{
+			Host: "archive.ubuntu.com", SuitePath: "/ubuntu/dists/noble",
+			Outcome: "success", CompletedUnixSec: 1800, DurationSeconds: 0.5,
+		},
+	}
+	got := buildAdoptionEntries(events)
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2", len(got))
+	}
+	if got[0].MemberPath != "Contents-amd64" || got[0].Detail != "served 114572 vs declared 1664594" {
+		t.Errorf("failure row member fields not copied: %+v", got[0])
+	}
+	if got[1].MemberPath != "" || got[1].Detail != "" {
+		t.Errorf("success row should have empty member fields, got %+v", got[1])
 	}
 }

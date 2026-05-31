@@ -484,10 +484,10 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
             </tr></thead>
             <tbody>
             {{range .RecentAdoptions}}
-              <tr{{if ne .Outcome "success"}} data-state="crit"{{end}} data-outcome="{{.Outcome}}"{{if .Reason}} data-reason="{{.Reason}}"{{end}}>
+              <tr{{if ne .Outcome "success"}} data-state="crit"{{end}} data-outcome="{{.Outcome}}"{{if .Reason}} data-reason="{{.Reason}}"{{end}}{{if .MemberPath}} data-member="{{.MemberPath}}"{{end}}>
                 <td data-label="Host" class="host">{{.Host}}</td>
                 <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
-                <td data-label="Outcome"><span class="b {{outcomeBadgeClass .Outcome}}">{{.Outcome}}</span>{{if and .Reason (ne .Reason .Outcome)}} <span class="b b--neutral reason" title="{{reasonTooltip .Reason}}">{{.Reason}}</span>{{end}}</td>
+                <td data-label="Outcome">{{$ott := reasonTooltip .Outcome}}<span class="b {{outcomeBadgeClass .Outcome}}"{{if ne $ott .Outcome}} title="{{$ott}}"{{end}}>{{.Outcome}}</span>{{if and .Reason (ne .Reason .Outcome)}} <span class="b b--neutral reason" title="{{reasonTooltip .Reason}}">{{.Reason}}</span>{{end}}{{if .MemberPath}} <span class="b b--neutral mono member" title="{{.Detail}}">{{.MemberPath}}</span>{{if .Detail}} <span class="muted member-detail">{{.Detail}}</span>{{end}}{{end}}</td>
                 <td data-label="Completed" class="time">{{unixTime .CompletedUnixTime}}</td>
                 <td data-label="Duration" class="num mono">{{formatShortDuration .DurationSeconds}}</td>
               </tr>

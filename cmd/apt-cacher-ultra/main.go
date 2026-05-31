@@ -360,6 +360,7 @@ func serveListeners(
 		"adoption_require_signature", cfg.Adoption.RequireSignature,
 		"adoption_require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
 		"adoption_accept_any_signer", cfg.Adoption.AcceptAnySigner,
+		"adoption_tolerate_optional_member_failures", cfg.Adoption.TolerateOptionalMemberFailures,
 		"adoption_hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"integrity_validate_at_rest_interval", cfg.Integrity.ValidateAtRestInterval.Duration,
@@ -965,16 +966,17 @@ func buildAdopter(
 	}
 
 	adopter, err := freshness.NewAdopter(freshness.AdoptionConfig{
-		Cache:             c,
-		Fetcher:           fetchClient,
-		Verifier:          verifier,
-		HostLimiter:       hostLimiter,
-		MaxConcurrent:     cfg.Freshness.MaxConcurrentAdoptions,
-		HotPackagesWindow: cfg.HotPackages.Window.Duration,
-		HotPrefetchBudget: cfg.Adoption.HotPrefetchBudget.Duration,
-		HeartbeatInterval: cfg.GC.HeartbeatInterval.Duration,
-		Architectures:     cfg.Adoption.Architectures,
-		Logger:            logger,
+		Cache:                          c,
+		Fetcher:                        fetchClient,
+		Verifier:                       verifier,
+		HostLimiter:                    hostLimiter,
+		MaxConcurrent:                  cfg.Freshness.MaxConcurrentAdoptions,
+		HotPackagesWindow:              cfg.HotPackages.Window.Duration,
+		HotPrefetchBudget:              cfg.Adoption.HotPrefetchBudget.Duration,
+		HeartbeatInterval:              cfg.GC.HeartbeatInterval.Duration,
+		Architectures:                  cfg.Adoption.Architectures,
+		TolerateOptionalMemberFailures: cfg.Adoption.TolerateOptionalMemberFailures,
+		Logger:                         logger,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("new adopter: %w", err)
@@ -986,6 +988,7 @@ func buildAdopter(
 		"require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
 		"allow_short_keyid", cfg.Adoption.AllowShortKeyID,
 		"accept_any_signer", cfg.Adoption.AcceptAnySigner,
+		"tolerate_optional_member_failures", cfg.Adoption.TolerateOptionalMemberFailures,
 		"max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,

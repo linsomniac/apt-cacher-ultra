@@ -141,6 +141,32 @@ func TestGoldenDegradedGPG(t *testing.T) {
 	)
 }
 
+// TestGoldenMemberFetchFailedShowsMember verifies the redesigned
+// adoptions row surfaces the failing member path + detail for a
+// member_fetch_failed outcome — the operator-facing "why did adoption
+// fail" signal (SPEC5 §10.5 recent_adoptions[].member_path / .detail).
+func TestGoldenMemberFetchFailedShowsMember(t *testing.T) {
+	m := newHealthyModel()
+	m.RecentAdoptions = []adoptionEntry{
+		{
+			Host: "packages.icinga.com", SuitePath: "/ubuntu/dists/icinga-jammy",
+			Outcome: "member_fetch_failed", Reason: "member_fetch_failed",
+			MemberPath: "Contents-amd64", Detail: "served 114572 vs declared 1664594",
+			CompletedUnixTime: 1_700_006_000, DurationSeconds: 0.2,
+		},
+	}
+	html := renderHTMLForGolden(t, m)
+	mustContain(t, html,
+		`data-outcome="member_fetch_failed"`,
+		`data-member="Contents-amd64"`,
+		`>Contents-amd64</span>`,
+		"served 114572 vs declared 1664594",
+		// Outcome badge is crit and carries the explanatory tooltip.
+		`<span class="b b--crit" title=`,
+		`>member_fetch_failed</span>`,
+	)
+}
+
 func TestGoldenKeyringEmptyDisabled(t *testing.T) {
 	m := newHealthyModel()
 	m.AdoptionEnabled = false

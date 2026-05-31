@@ -333,6 +333,24 @@ accept_any_signer     = false              # when true, unpinned suites bypass
                                            # startup so the choice is
                                            # auditable; see §7.6.2 (bypass
                                            # branch) and §7.6.5 (posture).
+tolerate_optional_member_failures = true   # when true, an integrity/availability
+                                           # failure (size/content-length or hash
+                                           # mismatch, transport error, non-404
+                                           # status) on a non-IndexTarget member
+                                           # (Contents-*, dep11 Components/icons,
+                                           # i18n Translations — files apt does
+                                           # not fetch for apt update/install) is
+                                           # logged as adoption_member_skipped
+                                           # (reason=optional_member_integrity)
+                                           # and skipped, instead of aborting the
+                                           # whole suite. IndexTarget members
+                                           # (per-arch Packages*, per-component
+                                           # Sources*, their pdiff Indexes) stay
+                                           # fatal-on-failure, and a skipped
+                                           # member is never adopted/served (apt
+                                           # 404s it). Set false for Phase-6
+                                           # strict all-or-nothing adoption.
+                                           # See §7.5.2.
 
 [integrity]
 validate_at_rest_interval = "24h"          # cadence for the at-rest sha256
@@ -355,8 +373,9 @@ Phase 1 validation (SPEC §5.2) carries forward. Phase 2 adds:
 
 - `freshness.max_concurrent_adoptions` is integer, ≥ 0.
 - `adoption.enabled`, `adoption.require_signature`,
-  `adoption.require_pinned_signer`, `adoption.allow_short_keyid`, and
-  `adoption.accept_any_signer` are bool.
+  `adoption.require_pinned_signer`, `adoption.allow_short_keyid`,
+  `adoption.accept_any_signer`, and
+  `adoption.tolerate_optional_member_failures` are bool.
 - `adoption.keyring_dirs` is a list of absolute directory paths;
   nonexistent paths are silently skipped at load.
 - `integrity.validate_at_rest_interval` parses as duration, ≥ 0.
@@ -817,6 +836,52 @@ surfacing through `adoption_run_failed`) if zero declared members
 fetched successfully — the realistic trigger for that case is a
 misconfigured `suite_path` pointing at a directory whose Release lists
 members the archive serves under a different prefix.
+
+**Optional (non-IndexTarget) member integrity failures are skipped
+when `adoption.tolerate_optional_member_failures` is true (default).**
+The 404/410 skip above handles "upstream does not serve this," but a
+mirror can also serve a *wrong* body with HTTP 200 — most commonly an
+Apache `mod_negotiation` mirror answering the uncompressed
+`Contents-amd64` URL with the `.gz` bytes (`TCN: choice`,
+`Content-Type: application/x-gzip`), or an index republished between
+the InRelease fetch and the member fetch. Such a member fails its
+size/content-length or hash check rather than 404-ing. When the member
+is **not** an apt IndexTarget — i.e. not a per-arch `Packages*` /
+per-component `Sources*` (or their `*.diff/Index` pdiff manifests),
+which covers `Contents-*`, `dep11` Components/icons, and `i18n`
+Translations — adoption logs `adoption_member_skipped`
+(reason=`optional_member_integrity`, with a `detail` field) and skips
+it exactly like the 404 case, instead of aborting the suite. This is
+the single largest reduction in spurious `adoption_run_failed`: those
+files are huge and volatile, apt does not fetch them for
+`apt update`/`apt install`, and failing an entire suite on them
+(potentially forever, for a persistently mis-serving mirror) blocks
+the package indices that *do* matter. IndexTarget members remain
+fatal-on-mismatch regardless of this flag — the surface apt installs
+from is never weakened — and a skipped member produces no
+`snapshot_member`, by-hash alias, or `package_hash` row, so a tampered
+optional file can never be served (apt 404s it). Set
+`tolerate_optional_member_failures = false` to restore strict
+all-or-nothing adoption. The classified metric outcome for a fatal
+member-fetch failure is `member_fetch_failed` (see SPEC5 §10.4.3); the
+log backstop remains `adoption_run_failed`.
+
+**Members are fetched via Acquire-By-Hash when the upstream advertises
+it.** When the verified Release/InRelease header carries
+`Acquire-By-Hash: yes`, each member is fetched from its content-
+addressed `…/by-hash/SHA256/<declared_sha256>` URL instead of the
+mutable declared path. The by-hash URL pins the exact bytes the signed
+Release declared, so it is immune to the publication race where the
+mutable path serves a newer-but-valid revision than our InRelease
+(the dominant intermittent member-fetch failure on the Ubuntu
+archives). The declared Size/SHA256 checks still run against the
+fetched bytes (defense in depth). The by-hash attempt is best-effort:
+on any failure — a pruned by-hash blob 404, transport error, etc. —
+adoption falls back to a fresh plain-path fetch (it does **not** treat
+a by-hash 404 as a member skip), preserving the exact path-fetch
+semantics above. Suite-root members (no directory component, e.g.
+`Contents-amd64`) have no by-hash form and are always fetched by path,
+as apt does.
 
 ### 7.6 GPG verification (NEW)
 

@@ -36,14 +36,22 @@ func TestClassifyAdoptionOutcome_TotalFunction(t *testing.T) {
 			want: "unpinned_suite",
 		},
 		{
-			"db_failed_falls_through_to_run_failed",
+			"db_failed_is_its_own_outcome",
 			fmt.Errorf("%w: write transaction", ErrAdoptionDBFailed),
-			"run_failed",
+			"db_failed",
 		},
 		{
-			"member_fetch_falls_through_to_run_failed",
+			"member_fetch_is_its_own_outcome",
 			fmt.Errorf("%w: upstream timeout", ErrAdoptionMemberFetchFailed),
-			"run_failed",
+			"member_fetch_failed",
+		},
+		{
+			// A typed AdoptionMemberError wrapping the fetch sentinel
+			// must still classify by the sentinel chain (errors.Is sees
+			// through Unwrap), not collapse to run_failed.
+			"member_fetch_typed_error_classifies_by_sentinel",
+			newMemberErr(ErrAdoptionMemberFetchFailed, "Contents-amd64", "served 114572 vs declared 1664594"),
+			"member_fetch_failed",
 		},
 		{"unknown_error_falls_through", errors.New("something else"), "run_failed"},
 	}

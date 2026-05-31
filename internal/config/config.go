@@ -214,6 +214,22 @@ type AdoptionConfig struct {
 	// adopts under this relaxation. A loud startup WARN names the
 	// configuration so the choice is auditable.
 	AcceptAnySigner bool `toml:"accept_any_signer"`
+
+	// TolerateOptionalMemberFailures controls whether an
+	// integrity/availability failure on a non-IndexTarget Release member
+	// (Contents-*, dep11 Components/icons, i18n Translations — files apt
+	// does not fetch for `apt update`/`apt install`) is skipped rather
+	// than aborting the whole suite adoption. Default true (the drop-in/
+	// just-works posture: a single volatile or mis-served optional index
+	// no longer fails an otherwise-good suite — the dominant cause of
+	// adoption_run_failed in the field). IndexTarget members (per-arch
+	// Packages*, per-component Sources*, their pdiff Indexes) remain
+	// fatal-on-failure regardless, so the surface apt installs from is
+	// never weakened, and a skipped member is never adopted/served (apt
+	// 404s it). Set false to restore Phase-6 strict all-or-nothing
+	// adoption. Pre-populated true in defaultConfig (bool zero-value
+	// cannot distinguish "absent" from "explicit false").
+	TolerateOptionalMemberFailures bool `toml:"tolerate_optional_member_failures"`
 }
 
 // HotPackagesConfig holds the SPEC3 §5.1 [hot_packages] block. The hot
@@ -695,6 +711,10 @@ func defaultConfig() *Config {
 		Adoption: AdoptionConfig{
 			RequireSignature: true,
 			AllowShortKeyID:  true,
+			// REC 1 drop-in/just-works default: optional (non-IndexTarget)
+			// member failures are skipped, not fatal. Operators harden
+			// with explicit `tolerate_optional_member_failures = false`.
+			TolerateOptionalMemberFailures: true,
 		},
 		GC: GCConfig{
 			// SPEC4 §5.1: gc.enabled defaults true. Bool fields must

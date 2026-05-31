@@ -87,7 +87,18 @@ type fakeFetcher struct {
 	mu        sync.Mutex
 	responses map[string][]byte
 	errFor    map[string]error // optional per-URL error injection
+	seen      []string         // every URL Fetch was called with, in order
 	calls     atomic.Int32
+}
+
+// requested returns the URLs Fetch saw, newest-last. Used by REC 2
+// tests to assert by-hash vs plain-path URL selection.
+func (f *fakeFetcher) requested() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.seen))
+	copy(out, f.seen)
+	return out
 }
 
 func newFakeFetcher() *fakeFetcher {
@@ -127,6 +138,7 @@ func (f *fakeFetcher) fail503(url string) {
 func (f *fakeFetcher) Fetch(ctx context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
 	f.calls.Add(1)
 	f.mu.Lock()
+	f.seen = append(f.seen, target.URL)
 	body, ok := f.responses[target.URL]
 	if errInj, has := f.errFor[target.URL]; has {
 		f.mu.Unlock()
@@ -577,6 +589,77 @@ func TestAdopter_ParseError(t *testing.T) {
 	}
 }
 
+// TestAdoptionMemberError_PreservesChainAndFields proves the typed
+// member error keeps the category sentinel reachable via errors.Is
+// (so classifyAdoptionOutcome still routes it) while exposing the
+// failing member Path + Detail via errors.As (so the admin ring can
+// surface WHICH member failed and WHY without string-parsing).
+func TestAdoptionMemberError_PreservesChainAndFields(t *testing.T) {
+	cases := []struct {
+		name     string
+		sentinel error
+		path     string
+		detail   string
+	}{
+		{"fetch", ErrAdoptionMemberFetchFailed, "Contents-amd64", "served 114572 vs declared 1664594"},
+		{"mismatch", ErrAdoptionMemberMismatch, "main/binary-amd64/Packages.gz", "declared 2db8530df4cf, got 45b3a1c2e0f9"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := newMemberErr(tc.sentinel, tc.path, tc.detail)
+			if !errors.Is(err, tc.sentinel) {
+				t.Errorf("errors.Is(%v, sentinel) = false; sentinel chain broken", err)
+			}
+			var me *AdoptionMemberError
+			if !errors.As(err, &me) {
+				t.Fatalf("errors.As(*AdoptionMemberError) = false; %v", err)
+			}
+			if me.Path != tc.path {
+				t.Errorf("Path = %q, want %q", me.Path, tc.path)
+			}
+			if me.Detail != tc.detail {
+				t.Errorf("Detail = %q, want %q", me.Detail, tc.detail)
+			}
+			// The error string must still carry the path + detail so the
+			// backstop adoption_run_failed log line stays self-describing.
+			if !strings.Contains(err.Error(), tc.path) || !strings.Contains(err.Error(), tc.detail) {
+				t.Errorf("Error() = %q, want it to contain path %q and detail %q", err.Error(), tc.path, tc.detail)
+			}
+		})
+	}
+}
+
+// TestMemberErrorFields covers the freshness-layer extractor that
+// pulls the failing member path + detail out of an adoption error for
+// the observability ring. It must see through additional wrapping and
+// return empty strings for non-member errors and nil.
+func TestMemberErrorFields(t *testing.T) {
+	t.Run("typed_error", func(t *testing.T) {
+		p, d := memberErrorFields(newMemberErr(ErrAdoptionMemberFetchFailed, "Contents-amd64", "served 1 vs declared 2"))
+		if p != "Contents-amd64" || d != "served 1 vs declared 2" {
+			t.Errorf("got (%q,%q)", p, d)
+		}
+	})
+	t.Run("further_wrapped", func(t *testing.T) {
+		wrapped := fmt.Errorf("runShared: %w", newMemberErr(ErrAdoptionMemberMismatch, "main/binary-amd64/Packages.gz", "declared ab, got cd"))
+		p, d := memberErrorFields(wrapped)
+		if p != "main/binary-amd64/Packages.gz" || d != "declared ab, got cd" {
+			t.Errorf("got (%q,%q)", p, d)
+		}
+	})
+	t.Run("non_member_error", func(t *testing.T) {
+		p, d := memberErrorFields(fmt.Errorf("%w: write txn", ErrAdoptionDBFailed))
+		if p != "" || d != "" {
+			t.Errorf("got (%q,%q), want empty", p, d)
+		}
+	})
+	t.Run("nil", func(t *testing.T) {
+		if p, d := memberErrorFields(nil); p != "" || d != "" {
+			t.Errorf("got (%q,%q), want empty", p, d)
+		}
+	})
+}
+
 func TestAdopter_MemberFetchFailure(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	body := []byte("body")
@@ -673,6 +756,246 @@ func TestAdopter_MemberHashMismatch(t *testing.T) {
 	err := env.adopter.Run(context.Background(), env.suite, releaseText, "", "")
 	if !errors.Is(err, ErrAdoptionMemberMismatch) {
 		t.Errorf("got %v, want ErrAdoptionMemberMismatch", err)
+	}
+}
+
+// TestIsIndexTarget pins the apt-IndexTarget classification that REC 1
+// keys on: only per-arch Packages* and per-component Sources* (and
+// their pdiff Index manifests) are members apt fetches for core
+// `apt update`/`apt install`. Everything else (Contents, dep11, i18n,
+// icons) is optional and its failure must not abort the suite.
+func TestIsIndexTarget(t *testing.T) {
+	indexTargets := []string{
+		"main/binary-amd64/Packages",
+		"main/binary-amd64/Packages.gz",
+		"main/binary-amd64/Packages.xz",
+		"universe/binary-arm64/Packages.bz2",
+		"main/binary-amd64/Packages.diff/Index",
+		"main/source/Sources",
+		"main/source/Sources.gz",
+		"main/source/Sources.diff/Index",
+	}
+	optional := []string{
+		"Contents-amd64",
+		"Contents-amd64.gz",
+		"main/dep11/Components-amd64.yml.gz",
+		"main/dep11/icons-128x128.tar.gz",
+		"main/i18n/Translation-en.gz",
+		"Release",
+		"InRelease",
+	}
+	for _, p := range indexTargets {
+		if !isIndexTarget(p) {
+			t.Errorf("isIndexTarget(%q) = false, want true", p)
+		}
+	}
+	for _, p := range optional {
+		if isIndexTarget(p) {
+			t.Errorf("isIndexTarget(%q) = true, want false", p)
+		}
+	}
+}
+
+// newTolerantAdopter rebuilds an Adopter over the test env's cache +
+// fetcher with TolerateOptionalMemberFailures enabled (the production
+// default), so REC 1 behavior can be exercised in isolation.
+func newTolerantAdopter(t *testing.T, env *adoptionTestEnv) *Adopter {
+	t.Helper()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:                          env.cache,
+		Fetcher:                        env.fetcher,
+		Verifier:                       passThroughVerifier{},
+		HostLimiter:                    hostsem.New(8),
+		TolerateOptionalMemberFailures: true,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	return ad
+}
+
+// TestAdopter_OptionalMemberFailureTolerated is the REC 1 core: a
+// non-IndexTarget member that fails its integrity check (here a
+// content-length mismatch, mirroring packages.icinga.com's
+// Contents-amd64) is skipped, and the suite still adopts on the
+// strength of its good Packages IndexTarget. The bad member must NOT
+// land a snapshot_member row (apt 404s it; a tampered optional file
+// can never be served).
+func TestAdopter_OptionalMemberFailureTolerated(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newTolerantAdopter(t, env)
+
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	declaredContents := []byte(strings.Repeat("X", 1000)) // declared size 1000
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+		"Contents-amd64":             declaredContents,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.put(base+"main/binary-amd64/Packages", pkgs)
+	env.fetcher.put(base+"Contents-amd64", []byte("short")) // served 5 != declared 1000
+
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("expected adoption to succeed despite optional member failure, got %v", err)
+	}
+	sf, err := env.cache.GetSuiteFreshness(ctx, env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err != nil || sf.CurrentSnapshotID == nil {
+		t.Fatalf("suite not adopted: sf=%+v err=%v", sf, err)
+	}
+	members, err := env.cache.ListSnapshotMembers(ctx, *sf.CurrentSnapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawPackages, sawContents bool
+	for _, m := range members {
+		if m.Path == "main/binary-amd64/Packages" {
+			sawPackages = true
+		}
+		if m.Path == "Contents-amd64" {
+			sawContents = true
+		}
+	}
+	if !sawPackages {
+		t.Error("good IndexTarget Packages member missing from adopted snapshot")
+	}
+	if sawContents {
+		t.Error("skipped optional member Contents-amd64 must NOT have a snapshot_member row")
+	}
+}
+
+// TestAdopter_OptionalMemberFailureFatalWhenStrict confirms the REC 1
+// behavior is gated: with TolerateOptionalMemberFailures off (the
+// default Adopter built by newAdoptionTestEnv), the same optional
+// member failure still aborts the whole suite — preserving the
+// Phase-6 strict all-or-nothing posture for operators who opt out.
+func TestAdopter_OptionalMemberFailureFatalWhenStrict(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t) // tolerate defaults OFF
+
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+		"Contents-amd64":             []byte(strings.Repeat("X", 1000)),
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.put(base+"main/binary-amd64/Packages", pkgs)
+	env.fetcher.put(base+"Contents-amd64", []byte("short"))
+
+	err := env.adopter.Run(ctx, env.suite, releaseText, "", "")
+	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
+		t.Errorf("strict mode: want ErrAdoptionMemberFetchFailed, got %v", err)
+	}
+}
+
+// TestAdopter_IndexTargetFailureAlwaysFatal proves REC 1 never weakens
+// the surface apt installs from: even with tolerance ON, a failing
+// IndexTarget member (Packages) aborts the suite.
+func TestAdopter_IndexTargetFailureAlwaysFatal(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newTolerantAdopter(t, env)
+
+	good := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": good,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.put(base+"main/binary-amd64/Packages", []byte("short, wrong length")) // size mismatch on an IndexTarget
+
+	err := ad.Run(ctx, env.suite, releaseText, "", "")
+	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
+		t.Errorf("IndexTarget failure must stay fatal even when tolerant; got %v", err)
+	}
+}
+
+// makeReleaseByHash builds Release-style text declaring one Packages
+// member and advertising Acquire-By-Hash: yes. Returns the text plus
+// the member's declared sha256.
+func makeReleaseByHash(member string, body []byte) ([]byte, string) {
+	h := shaOf(body)
+	var sb strings.Builder
+	sb.WriteString("Origin: Ubuntu\nSuite: noble\nAcquire-By-Hash: yes\nSHA256:\n")
+	fmt.Fprintf(&sb, " %s %d %s\n", h, len(body), member)
+	return []byte(sb.String()), h
+}
+
+func TestParseAcquireByHash(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"yes", "Origin: X\nAcquire-By-Hash: yes\nSHA256:\n a 1 p\n", true},
+		{"yes_case_insensitive", "Acquire-By-Hash: Yes\n", true},
+		{"no", "Acquire-By-Hash: no\nSHA256:\n a 1 p\n", false},
+		{"absent", "Origin: X\nSHA256:\n a 1 p\n", false},
+		{"indented_does_not_count", "SHA256:\n Acquire-By-Hash: yes\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseAcquireByHash([]byte(tc.body)); got != tc.want {
+				t.Errorf("parseAcquireByHash(%q) = %v, want %v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAdopter_ByHashFetchPreferred proves REC 2: when the Release
+// advertises Acquire-By-Hash: yes, the member is fetched from its
+// content-addressed by-hash URL (immune to the publication race), not
+// the mutable path. Only the by-hash URL is seeded; success therefore
+// proves it was the URL used.
+func TestAdopter_ByHashFetchPreferred(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	member := "main/binary-amd64/Packages"
+	releaseText, h := makeReleaseByHash(member, pkgs)
+
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	byHashURL := base + "main/binary-amd64/by-hash/SHA256/" + h
+	env.fetcher.put(byHashURL, pkgs) // ONLY the by-hash URL is served
+
+	if err := env.adopter.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("adoption should fetch via by-hash and succeed, got %v", err)
+	}
+	reqs := env.fetcher.requested()
+	sawByHash := false
+	for _, u := range reqs {
+		if u == byHashURL {
+			sawByHash = true
+		}
+		if u == base+member {
+			t.Errorf("plain path %q was fetched; by-hash should have been preferred", base+member)
+		}
+	}
+	if !sawByHash {
+		t.Errorf("by-hash URL %q was never requested; got %v", byHashURL, reqs)
+	}
+}
+
+// TestAdopter_ByHashFallbackToPath proves the safety fallback: if the
+// by-hash URL is unavailable (e.g. upstream pruned the prior by-hash
+// blob on republish → 404), adoption falls back to a fresh plain-path
+// fetch rather than (mis)treating the by-hash 404 as a member skip.
+func TestAdopter_ByHashFallbackToPath(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	member := "main/binary-amd64/Packages"
+	releaseText, h := makeReleaseByHash(member, pkgs)
+
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.fail404(base + "main/binary-amd64/by-hash/SHA256/" + h) // by-hash pruned
+	env.fetcher.put(base+member, pkgs)                                  // path still serves it
+
+	if err := env.adopter.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("by-hash 404 must fall back to path fetch, not skip; got %v", err)
+	}
+	sf, err := env.cache.GetSuiteFreshness(ctx, env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err != nil || sf.CurrentSnapshotID == nil {
+		t.Fatalf("suite not adopted after path fallback: sf=%+v err=%v", sf, err)
 	}
 }
 
@@ -2007,8 +2330,8 @@ func TestAdopter_Sources_HappyPath(t *testing.T) {
 			pkg:       "bash",
 			directory: "pool/main/b/bash",
 			files: map[string]string{
-				"bash_5.1-2.dsc":         dscHash,
-				"bash_5.1.orig.tar.xz":   tarHash,
+				"bash_5.1-2.dsc":        dscHash,
+				"bash_5.1.orig.tar.xz":  tarHash,
 				"bash_5.1-2.debian.tar": patchHash,
 			},
 		},

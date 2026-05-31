@@ -1144,10 +1144,17 @@ acu_per_host_capacity`.
 
 `acu_adoption_total{outcome, host}` — counter. outcome ∈
 {`success`, `parse_failed`, `gpg_failed`, `member_mismatch`,
-`unpinned_suite`, `run_failed`}. Each adoption attempt emits
-exactly one outcome — the total of `acu_adoption_total` across
-all outcome values equals the number of adoption attempts.
-**`form_drift` is not an outcome here**; see the next item.
+`member_fetch_failed`, `db_failed`, `unpinned_suite`,
+`run_failed`}. Each adoption attempt emits exactly one outcome —
+the total of `acu_adoption_total` across all outcome values
+equals the number of adoption attempts. `member_fetch_failed`
+(a declared member the upstream would not serve intact — size/
+content-length mismatch, transport error, or non-404 status) and
+`db_failed` (a local cache/DB fault) were broken out of the
+`run_failed` catch-all so the dominant real-world failure is
+operator-distinguishable; `run_failed` now means "no other
+category matched." **`form_drift` is not an outcome here**; see
+the next item.
 
 `acu_adoption_form_drift_total{prior_form, new_form, host}` —
 counter (separate metric). Each label ∈ {`inline`, `detached`,
@@ -1363,7 +1370,15 @@ the schema below verbatim.
      "outcome": "gpg_failed",
      "reason": "untrusted_signer",
      "completed_unixtime": 1746668412,
-     "duration_seconds": 0.001}
+     "duration_seconds": 0.001},
+    {"host": "packages.icinga.com",
+     "suite_path": "ubuntu/dists/icinga-jammy",
+     "outcome": "member_fetch_failed",
+     "reason": "member_fetch_failed",
+     "member_path": "Contents-amd64",
+     "detail": "served 114572 vs declared 1664594",
+     "completed_unixtime": 1746668420,
+     "duration_seconds": 0.18}
   ],
   "active_hosts": [
     {"host": "archive.ubuntu.com",
@@ -1398,11 +1413,23 @@ Field semantics:
   `no_usable_signature`, `missing_signature`, `ambiguous_keyid`,
   or `crypto_verify_failed`. For non-gpg failure outcomes the
   field mirrors `outcome` (`parse_failed`, `member_mismatch`,
-  `unpinned_suite`, `run_failed`). Omitted on success rows so
-  the wire shape stays unchanged on the happy path. Operators
-  use this field to discriminate between "key not installed"
-  (`untrusted_signer`) and "signature itself bogus"
-  (`crypto_verify_failed`) without grepping logs.
+  `member_fetch_failed`, `db_failed`, `unpinned_suite`,
+  `run_failed`). Omitted on success rows so the wire shape stays
+  unchanged on the happy path. Operators use this field to
+  discriminate between "key not installed" (`untrusted_signer`)
+  and "signature itself bogus" (`crypto_verify_failed`) without
+  grepping logs.
+- `recent_adoptions[].member_path` / `.detail` are additive
+  fields naming the specific Release member that caused a
+  member-scoped failure (`member_fetch_failed` or
+  `member_mismatch`) and a short human description, e.g.
+  `Contents-amd64` and `served 114572 vs declared 1664594`.
+  Sourced from the `*freshness.AdoptionMemberError` carried in
+  the adoption error chain. Both are omitted when empty (success
+  rows and non-member failures), so the wire shape is unchanged
+  on the happy path. The admin HTML surfaces them on the
+  adoption row so the operator sees *which* member failed and
+  *why* without grepping the `adoption_run_failed` log line.
 - `active_hosts` is sourced from `hostsem.Snapshot()` (§9.3).
   Empty when no host has held a slot since process start.
 - `hot_url_paths` lists the top 20 `url_path` rows ordered by

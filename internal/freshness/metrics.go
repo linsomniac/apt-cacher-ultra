@@ -126,6 +126,18 @@ func classifyAdoptionOutcome(err error) string {
 		return "parse_failed"
 	case errors.Is(err, ErrAdoptionMemberMismatch):
 		return "member_mismatch"
+	case errors.Is(err, ErrAdoptionMemberFetchFailed):
+		// SPEC5 §10.4.3: broken out of the run_failed catch-all so the
+		// dominant real-world failure (a declared member the upstream
+		// won't serve intact — size/content-length mismatch, transport
+		// error, or 5xx) is operator-distinguishable. The reason chip
+		// carries the specific member via AdoptionMemberError.
+		return "member_fetch_failed"
+	case errors.Is(err, ErrAdoptionDBFailed):
+		// SPEC5 §10.4.3: a local cache/DB fault (blob write, rehash,
+		// snapshot insert) is operationally distinct from an upstream
+		// member problem — surface it separately, not as run_failed.
+		return "db_failed"
 	}
 	return "run_failed"
 }

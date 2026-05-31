@@ -96,6 +96,28 @@ func TestJSONContractPreserved(t *testing.T) {
 				excerpt(body, "gpg_failed", 200))
 		}
 	})
+
+	// SPEC5 §10.5 additive: recent_adoptions[].member_path / .detail are
+	// omitempty — present on member-scoped failures, absent on success.
+	t.Run("member_path_detail_additive_and_omitempty", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := writeStatusJSON(&buf, populatedJSONContractFixture()); err != nil {
+			t.Fatalf("writeStatusJSON: %v", err)
+		}
+		body := buf.String()
+		if !strings.Contains(body, `"member_path": "Contents-amd64"`) {
+			t.Errorf("member_fetch_failed row missing member_path; got:\n%s", excerpt(body, "member_fetch_failed", 240))
+		}
+		if !strings.Contains(body, `"detail": "served 114572 vs declared 1664594"`) {
+			t.Errorf("member_fetch_failed row missing detail; got:\n%s", excerpt(body, "member_fetch_failed", 240))
+		}
+		// The success row (first entry) must not carry member_path/detail.
+		successRow := `"outcome": "success",
+      "completed_unixtime"`
+		if !strings.Contains(body, successRow) {
+			t.Errorf("success row leaked member_path/detail (omitempty failed); got:\n%s", excerpt(body, "outcome", 200))
+		}
+	})
 }
 
 // unifiedLineDiff emits a minimal unified-style line diff so a failing
@@ -237,6 +259,7 @@ func populatedJSONContractFixture() statusModel {
 		RecentAdoptions: []adoptionEntry{
 			{Host: "archive.ubuntu.com", SuitePath: "dists/noble", Outcome: "success", CompletedUnixTime: 1_700_006_000, DurationSeconds: 0.45},
 			{Host: "archive.ubuntu.com", SuitePath: "dists/noble-updates", Outcome: "gpg_failed", Reason: "untrusted_signer", CompletedUnixTime: 1_700_006_100, DurationSeconds: 0.32},
+			{Host: "packages.icinga.com", SuitePath: "dists/icinga-jammy", Outcome: "member_fetch_failed", Reason: "member_fetch_failed", MemberPath: "Contents-amd64", Detail: "served 114572 vs declared 1664594", CompletedUnixTime: 1_700_006_200, DurationSeconds: 0.18},
 		},
 		ActiveHosts: []activeHostInfo{
 			{Host: "10.0.0.5", Inflight: 1, SlotCapacity: 4},

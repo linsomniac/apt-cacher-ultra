@@ -781,7 +781,7 @@ The Phase 5 `acu_adoption_*` metric family (SPEC5 §10.4.6) gains
 new labels and counters:
 
 ```
-acu_adoption_members_skipped_total{reason}     counter   # reason: 4xx | arch_not_in_allowlist | hash_mismatch | parse_failed
+acu_adoption_members_skipped_total{reason}     counter   # reason: 4xx | arch_not_in_allowlist | optional_member_integrity | hash_mismatch | parse_failed
 acu_adoption_sources_parsed_total{outcome}      counter   # outcome: ok | parse_failed
 acu_adoption_pdiff_indexes_parsed_total{outcome} counter
 acu_package_hash_rows_by_kind{kind}             gauge     # kind: binary | source | pdiff
@@ -868,6 +868,12 @@ The Phase 2 `adoption_*` event family gains a new
 
 - `arch_not_in_allowlist` — the member's path was filtered by
   `[adoption].architectures` (§7.2).
+- `optional_member_integrity` — a non-IndexTarget member
+  (`Contents-*`, `dep11`, `i18n`, icons) failed its
+  fetch/size/hash check and was skipped under
+  `[adoption].tolerate_optional_member_failures` (default true)
+  rather than aborting the suite (SPEC2 §7.5.2). The Warn carries
+  a `detail` field. IndexTarget members are never skipped this way.
 
 The Phase 1 per-request log line gains the four new fields per
 §2.3.

@@ -125,6 +125,16 @@
       "reason": "untrusted_signer",
       "completed_unixtime": 1700006100,
       "duration_seconds": 0.32
+    },
+    {
+      "host": "packages.icinga.com",
+      "suite_path": "dists/icinga-jammy",
+      "outcome": "member_fetch_failed",
+      "reason": "member_fetch_failed",
+      "member_path": "Contents-amd64",
+      "detail": "served 114572 vs declared 1664594",
+      "completed_unixtime": 1700006200,
+      "duration_seconds": 0.18
     }
   ],
   "active_hosts": [

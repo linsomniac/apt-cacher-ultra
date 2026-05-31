@@ -313,7 +313,16 @@ type adoptionEntry struct {
 	// missing_signature, ambiguous_keyid, no_usable_signature); for
 	// other failures it mirrors Outcome. JSON-omitted when empty so
 	// the wire shape is unchanged for success rows.
-	Reason            string  `json:"reason,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	// MemberPath is the SPEC5 §10.5 additive field naming the declared
+	// Release member that failed (member_fetch_failed / member_mismatch),
+	// e.g. "Contents-amd64". JSON-omitted when empty so success rows keep
+	// the unchanged wire shape.
+	MemberPath string `json:"member_path,omitempty"`
+	// Detail is the SPEC5 §10.5 additive short description of a member
+	// failure, e.g. "served 114572 vs declared 1664594". JSON-omitted
+	// when empty.
+	Detail            string  `json:"detail,omitempty"`
 	CompletedUnixTime int64   `json:"completed_unixtime"`
 	DurationSeconds   float64 `json:"duration_seconds"`
 }
@@ -600,6 +609,8 @@ func buildAdoptionEntries(events []observability.AdoptionEvent) []adoptionEntry 
 			SuitePath:         e.SuitePath,
 			Outcome:           e.Outcome,
 			Reason:            e.Reason,
+			MemberPath:        e.MemberPath,
+			Detail:            e.Detail,
 			CompletedUnixTime: e.CompletedUnixSec,
 			DurationSeconds:   e.DurationSeconds,
 		})
@@ -803,9 +814,13 @@ func reasonTooltip(reason string) string {
 	case "parse_failed":
 		return "Verified Release-style body did not parse (malformed Release file)."
 	case "member_mismatch":
-		return "A Release-listed member's fetched hash did not match the declared hash."
+		return "A Release-listed member's fetched hash did not match the declared hash. The failing member and digests are shown in the row detail."
+	case "member_fetch_failed":
+		return "A Release-listed member could not be fetched intact — size/content-length mismatch (often an index republished mid-fetch, or a non-essential member the upstream serves with the wrong body), a transport error, or a 5xx. The failing member and detail are shown in the row."
+	case "db_failed":
+		return "Adoption hit a local cache/DB error (blob write, rehash, or snapshot insert), not an upstream problem. It is retried on the next freshness tick."
 	case "run_failed":
-		return "Adoption failed for an uncategorized reason; consult the adoption_run_failed log line."
+		return "Adoption failed for a reason not otherwise categorized; consult the adoption_run_failed log line."
 	}
 	return reason
 }
