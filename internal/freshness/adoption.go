@@ -167,26 +167,36 @@ func archFromFilteredPath(p string) (arch string, filtered bool) {
 	return "", false
 }
 
+// indexTargetRE matches any apt "IndexTarget" member: a per-arch
+// Packages or per-component Sources file, with ANY compression suffix
+// (.gz/.xz/.bz2/.zst/.lzma/.lz4/…) or none, plus the Packages.diff /
+// Sources.diff pdiff Index manifests.
+//
+// AIDEV-NOTE: this is deliberately BROADER than the SPEC6_5 §7.2
+// arch-filter regexes (archFilterBinaryRE/archFilterSourceRE), which
+// only list the codecs adoption can currently parse. isIndexTarget is
+// the REC 1 fatality boundary, not a parse-capability gate: a
+// Packages.zst we cannot yet parse must still be FATAL-on-failure, not
+// silently skipped as "optional," or a fetch failure on the only codec
+// a suite publishes would adopt an empty index. The `[a-z0-9]+` suffix
+// class matches future/unknown codecs by construction. Never narrow
+// this without a security review — it is the surface apt installs from.
+var indexTargetRE = regexp.MustCompile(
+	`(?:^|/)(?:binary-[a-z][a-z0-9]*/Packages|source/Sources)(?:\.diff/Index|\.[a-z0-9]+)?$`)
+
 // isIndexTarget reports whether a Release member's suite-relative path
-// is an apt "IndexTarget" — a per-arch Packages* / pdiff Index or a
-// per-component Sources* / pdiff Index, i.e. the files apt actually
-// fetches for `apt update` + `apt install`. Everything else
-// (Contents-*, dep11 Components/icons, i18n Translations, …) is an
-// optional member apt does not require.
+// is an apt IndexTarget — a per-arch Packages* / per-component Sources*
+// (any codec) or their pdiff Index, i.e. the files apt actually fetches
+// for `apt update` + `apt install`. Everything else (Contents-*, dep11
+// Components/icons, i18n Translations, …) is an optional member apt does
+// not require.
 //
 // REC 1 keys on this: when [adoption].tolerate_optional_member_failures
 // is set, an integrity/availability failure on a non-IndexTarget member
-// is skipped instead of aborting the whole suite. The IndexTarget set is
-// defined by the same two regexes the SPEC6_5 §7.2 arch filter uses, so
-// the two views can never drift.
-//
-// AIDEV-NOTE: keep this in lockstep with archFilterBinaryRE /
-// archFilterSourceRE and the SPEC6_5 §7.2 IndexTarget definition. A
-// path that adoption treats as an IndexTarget here MUST stay fatal-on-
-// mismatch — never relax this set without a security review, since it
-// is the surface apt installs packages from.
+// is skipped instead of aborting the whole suite; IndexTargets stay
+// fatal regardless.
 func isIndexTarget(p string) bool {
-	return archFilterBinaryRE.MatchString(p) || archFilterSourceRE.MatchString(p)
+	return indexTargetRE.MatchString(p)
 }
 
 // errAdoptionMemberSkipped is the in-package signal from adoptMember
@@ -1195,16 +1205,15 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 	// declared sha256 in its path, so it is immune to the publication
 	// race where the mutable path serves a newer-but-valid revision than
 	// our InRelease declared (the dominant intermittent failure on the
-	// Ubuntu archives). Best-effort: on ANY by-hash failure — a pruned
-	// by-hash blob 404s, transport error, even a hash surprise — fall
-	// back to the plain-path fetch, which preserves today's exact
-	// semantics (404/410 → skip; size/hash mismatch → typed-fatal). The
-	// declared-hash check in fetchMemberURL runs for both URLs, so a
-	// by-hash response that somehow served the wrong bytes is still
-	// rejected before adoption.
+	// Ubuntu archives). The probe is best-effort and side-effect-free:
+	// tryByHashFetch never logs adoption_member_skipped / increments the
+	// skip metric and never lets mismatched bytes reach pool/ (it uses
+	// FinalizeExpectingHash). On ANY by-hash failure we fall back to the
+	// authoritative plain-path fetch below, which keeps today's exact
+	// semantics (404/410 → skip; size/hash mismatch → typed-fatal).
 	if acquireByHash {
 		if bh := byHashAliasPath(m.Path, m.SHA256); bh != "" {
-			if hash, ferr := a.fetchMemberURL(ctx, suite, m, bh); ferr == nil {
+			if hash, ferr := a.tryByHashFetch(ctx, suite, m, bh); ferr == nil {
 				return hash, nil
 			} else {
 				a.logger.Debug("adoption_byhash_fallback",
@@ -1217,6 +1226,40 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 		}
 	}
 	return a.fetchMemberURL(ctx, suite, m, m.Path)
+}
+
+// tryByHashFetch attempts to fetch a member from its content-addressed
+// by-hash URL (byHashRelPath). It is a SIDE-EFFECT-FREE probe: unlike
+// fetchMemberURL it emits no adoption_member_skipped WARN, increments no
+// skip metric, and — by finalizing through FinalizeExpectingHash — never
+// promotes bytes whose hash differs from the declaration into pool/ (a
+// by-hash URL that serves wrong bytes is rejected with the temp removed,
+// leaving no orphan). On success the verified blob is PutBlob'd and its
+// hash (== m.SHA256) returned. Any error means "by-hash unavailable or
+// wrong"; the caller falls back to the authoritative plain-path fetch.
+func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseMember, byHashRelPath string) (string, error) {
+	target := &fetch.Target{
+		CanonicalHost: suite.CanonicalHost,
+		URL:           buildMemberURL(suite, byHashRelPath),
+	}
+	w, err := a.cache.NewTempBlob()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = w.Abort() }() // no-op once a Finalize* wins
+	if _, err := a.fetcher.Fetch(ctx, target, w); err != nil {
+		return "", err // by-hash 404 (pruned), transport, etc. — silent fallback
+	}
+	// FinalizeExpectingHash gates on the declared sha256 (and size): on
+	// any mismatch the temp is removed and pool/ is never touched.
+	hashHex, err := w.FinalizeExpectingHash(m.SHA256, m.Size)
+	if err != nil {
+		return "", err
+	}
+	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {
+		return "", err
+	}
+	return hashHex, nil
 }
 
 // fetchMemberURL fetches one Release member from a specific suite-

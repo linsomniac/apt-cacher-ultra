@@ -746,7 +746,9 @@ var gpgFailedText=acceptAnySigner
 var hints={
 'gpg_failed':{text:gpgFailedText,linkHref:'#keyring',linkLabel:'Trusted keys',linkArrow:String.fromCharCode(8594)+' Keyring'},
 'parse_failed':{text:'Likely cause: malformed Release / Sources / Packages payload from upstream. Capture a failing fetch and inspect.'},
-'member_mismatch':{text:'Likely cause: a Release-listed member hash diverged from the cached blob. Inspect the failing index path in the proxy logs.'},
+'member_mismatch':{text:'Likely cause: a Release-listed member hash diverged from the cached blob. The failing member is shown per-row; inspect it in the proxy logs.'},
+'member_fetch_failed':{text:'Likely cause: a Release-listed member could not be fetched intact — an index republished mid-fetch, a size/content-length mismatch, or a mirror serving the wrong body (e.g. the .gz at the uncompressed URL). The failing member is shown per-row.'},
+'db_failed':{text:'Likely cause: a local cache/DB error (blob write, rehash, or snapshot insert), not an upstream problem. Check disk space and the proxy logs; adoption retries on the next freshness tick.'},
 'unpinned_suite':{text:"Likely cause: this suite is not allow-listed for adoption. Add it to the operator's adoption pin list to enable verification."},
 'run_failed':{text:'Likely cause: upstream unreachable, TLS failure, rate-limiting, or another transport-level error. Check the proxy logs for the upstream host.'}
 };

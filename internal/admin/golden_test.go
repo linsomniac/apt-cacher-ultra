@@ -167,6 +167,19 @@ func TestGoldenMemberFetchFailedShowsMember(t *testing.T) {
 	)
 }
 
+// TestGoldenNoticeHintsCoverNewOutcomes verifies the aggregate-notice
+// JS hint map carries explicit guidance for the outcomes broken out of
+// run_failed (member_fetch_failed, db_failed), rather than falling back
+// to the generic "See per-row details below." The hint map is a static
+// literal in the inline <script>, so it renders into every page.
+func TestGoldenNoticeHintsCoverNewOutcomes(t *testing.T) {
+	html := renderHTMLForGolden(t, newHealthyModel())
+	mustContain(t, html,
+		`'member_fetch_failed':{text:`,
+		`'db_failed':{text:`,
+	)
+}
+
 func TestGoldenKeyringEmptyDisabled(t *testing.T) {
 	m := newHealthyModel()
 	m.AdoptionEnabled = false

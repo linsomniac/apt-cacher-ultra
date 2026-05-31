@@ -770,9 +770,16 @@ func TestIsIndexTarget(t *testing.T) {
 		"main/binary-amd64/Packages.gz",
 		"main/binary-amd64/Packages.xz",
 		"universe/binary-arm64/Packages.bz2",
+		// Compression variants the arch-filter regex does not list must
+		// STILL be IndexTargets — a failure on them stays fatal, never
+		// silently skipped (Packages*/Sources* stay fatal, any codec).
+		"main/binary-amd64/Packages.zst",
+		"main/binary-amd64/Packages.lzma",
+		"main/binary-amd64/Packages.lz4",
 		"main/binary-amd64/Packages.diff/Index",
 		"main/source/Sources",
 		"main/source/Sources.gz",
+		"main/source/Sources.zst",
 		"main/source/Sources.diff/Index",
 	}
 	optional := []string{
@@ -996,6 +1003,72 @@ func TestAdopter_ByHashFallbackToPath(t *testing.T) {
 	sf, err := env.cache.GetSuiteFreshness(ctx, env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
 	if err != nil || sf.CurrentSnapshotID == nil {
 		t.Fatalf("suite not adopted after path fallback: sf=%+v err=%v", sf, err)
+	}
+}
+
+// TestAdopter_ByHash404DoesNotEmitSkip locks in that the by-hash probe
+// is side-effect-free: a by-hash 404 that successfully falls back to
+// the plain path must NOT emit a misleading adoption_member_skipped
+// WARN (which would inflate the skip metric and confuse operators).
+func TestAdopter_ByHash404DoesNotEmitSkip(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	var logbuf bytes.Buffer
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache: env.cache, Fetcher: env.fetcher, Verifier: passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+		Logger:      slog.New(slog.NewTextHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	member := "main/binary-amd64/Packages"
+	releaseText, h := makeReleaseByHash(member, pkgs)
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.fail404(base + "main/binary-amd64/by-hash/SHA256/" + h)
+	env.fetcher.put(base+member, pkgs)
+
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("by-hash 404 fallback should succeed; got %v", err)
+	}
+	if strings.Contains(logbuf.String(), "adoption_member_skipped") {
+		t.Errorf("by-hash 404 fallback wrongly emitted adoption_member_skipped:\n%s", logbuf.String())
+	}
+}
+
+// TestAdopter_ByHashWrongBytesNoPoolPollution proves the by-hash probe
+// uses the safe finalize: when the by-hash URL serves bytes whose hash
+// differs from the declared sha256, those bytes must NEVER land in
+// pool/, and adoption falls back to the (correct) plain-path fetch.
+func TestAdopter_ByHashWrongBytesNoPoolPollution(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	member := "main/binary-amd64/Packages"
+	releaseText, h := makeReleaseByHash(member, pkgs)
+
+	// Wrong bytes of the SAME length as the declared body, so the hash
+	// check (not the size check) is what rejects the by-hash response.
+	wrong := bytes.Repeat([]byte("Z"), len(pkgs))
+	wrongHash := shaOf(wrong)
+	if wrongHash == h {
+		t.Fatal("test setup bug: wrong bytes collide with declared hash")
+	}
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.put(base+"main/binary-amd64/by-hash/SHA256/"+h, wrong) // by-hash serves wrong content
+	env.fetcher.put(base+member, pkgs)                                 // path serves the real content
+
+	if err := env.adopter.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("should adopt via path after by-hash mismatch; got %v", err)
+	}
+	if ok, err := env.cache.BlobExists(wrongHash); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Errorf("wrong by-hash bytes (%s) leaked into pool/ — FinalizeExpectingHash should have prevented this", wrongHash)
+	}
+	if ok, err := env.cache.BlobExists(h); err != nil || !ok {
+		t.Errorf("declared Packages blob %s missing from pool after path fallback (ok=%v err=%v)", h, ok, err)
 	}
 }
 
