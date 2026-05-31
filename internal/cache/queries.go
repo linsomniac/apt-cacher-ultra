@@ -583,23 +583,39 @@ GROUP BY p.canonical_host, p.architecture`)
 	}
 	_ = rows.Close()
 
+	// AIDEV-NOTE: drive this join from url_path, NOT package_hash.
+	// package_hash holds one row per .deb per snapshot (≈1M rows on a
+	// full Ubuntu mirror), while url_path holds only the artifacts
+	// actually cached (low thousands), and the inner join to url_path is
+	// what gates the result. Left to its own row-count estimates SQLite
+	// drives from package_hash and SCANs all ~1M rows, probing url_path
+	// per row — ~1.5s in C sqlite and >10s under the pure-Go modernc
+	// driver, blowing the §9.7.6 gauge-refresh deadline (the
+	// cache_summary panel then stays perpetually empty). The CROSS JOIN
+	// pins url_path as the outer table so SQLite probes package_hash by
+	// its PK prefix (canonical_scheme, canonical_host, path) instead —
+	// ~40× faster with byte-identical results. The `blob_hash IS NOT
+	// NULL` predicate lets the partial index idx_url_path_blob drive the
+	// scan; it is also semantically a no-op (the JOIN to blob already
+	// drops NULL-blob rows). Do not reorder these joins without
+	// re-checking EXPLAIN QUERY PLAN against a large cache.
 	blobRows, err := tx.QueryContext(ctx, `
 SELECT canonical_host, architecture,
        count(*) AS blob_count,
        COALESCE(sum(size), 0) AS blob_bytes
 FROM (
     SELECT DISTINCT p.canonical_host, p.architecture, b.hash, b.size
-    FROM package_hash p
+    FROM url_path u
+    JOIN blob b ON b.hash = u.blob_hash
+    CROSS JOIN package_hash p
+      ON p.canonical_scheme = u.canonical_scheme
+     AND p.canonical_host   = u.canonical_host
+     AND p.path             = u.path
     JOIN suite_freshness sf
       ON sf.canonical_scheme = p.canonical_scheme
      AND sf.canonical_host   = p.canonical_host
      AND sf.current_snapshot_id = p.snapshot_id
-    JOIN url_path u
-      ON u.canonical_scheme = p.canonical_scheme
-     AND u.canonical_host   = p.canonical_host
-     AND u.path             = p.path
-    JOIN blob b ON b.hash = u.blob_hash
-    WHERE p.architecture != ''
+    WHERE u.blob_hash IS NOT NULL AND p.architecture != ''
 )
 GROUP BY canonical_host, architecture`)
 	if err != nil {

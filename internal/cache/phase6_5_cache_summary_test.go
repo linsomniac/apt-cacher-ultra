@@ -240,6 +240,86 @@ func TestGetCacheSummaryByHostArch_NoBlobForUrlPath(t *testing.T) {
 	}
 }
 
+// TestGetCacheSummaryByHostArch_SharedBlobDedup: two distinct .deb
+// paths in the same (host, arch) current snapshot that resolve to the
+// SAME blob must count that blob ONCE (the blob subquery is DISTINCT on
+// hash), while PackageHashCount counts both package_hash rows. This pins
+// the DISTINCT semantics that the blob-subquery rewrite must preserve.
+func TestGetCacheSummaryByHostArch_SharedBlobDedup(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+
+	body := []byte("shared deb payload counted once")
+	w, err := c.NewTempBlob()
+	if err != nil {
+		t.Fatalf("NewTempBlob: %v", err)
+	}
+	if _, err := w.Write(body); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	h, err := w.Finalize(int64(len(body)))
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if err := c.PutBlob(ctx, h, int64(len(body))); err != nil {
+		t.Fatalf("PutBlob: %v", err)
+	}
+
+	const host, suite = "archive.ubuntu.com", "/ubuntu/dists/noble"
+	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
+	}); err != nil {
+		t.Fatalf("PutSuiteFreshness: %v", err)
+	}
+	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite, InReleaseHash: &h,
+	})
+	if err != nil {
+		t.Fatalf("InsertCandidateSnapshot: %v", err)
+	}
+
+	// Two distinct deb paths (e.g. a binNMU rebuild) sharing one blob.
+	paths := []string{
+		"/ubuntu/pool/main/f/foo/foo_1.0_amd64.deb",
+		"/ubuntu/pool/main/f/foo/foo_1.0+b1_amd64.deb",
+	}
+	var phs []PackageHash
+	for _, p := range paths {
+		bh := h
+		phs = append(phs, PackageHash{
+			CanonicalScheme: "http", CanonicalHost: host, Path: p,
+			DeclaredSHA256: h, SnapshotID: id, PackageName: "foo", Architecture: "amd64",
+		})
+		if err := c.PutURLPath(ctx, URLPath{
+			CanonicalScheme: "http", CanonicalHost: host, Path: p,
+			BlobHash: &bh, UpstreamURL: "http://" + host + p,
+		}); err != nil {
+			t.Fatalf("PutURLPath[%s]: %v", p, err)
+		}
+	}
+	if err := c.CommitAdoption(ctx, id, nil, phs, nil, false); err != nil {
+		t.Fatalf("CommitAdoption: %v", err)
+	}
+
+	got, err := c.GetCacheSummaryByHostArch(ctx)
+	if err != nil {
+		t.Fatalf("GetCacheSummaryByHostArch: %v", err)
+	}
+	e, ok := got[host]["amd64"]
+	if !ok {
+		t.Fatalf("(%s, amd64) missing: %v", host, got)
+	}
+	if e.PackageHashCount != 2 {
+		t.Errorf("PackageHashCount = %d, want 2 (both paths)", e.PackageHashCount)
+	}
+	if e.BlobCount != 1 {
+		t.Errorf("BlobCount = %d, want 1 (shared blob deduped)", e.BlobCount)
+	}
+	if e.BlobBytes != int64(len(body)) {
+		t.Errorf("BlobBytes = %d, want %d (counted once)", e.BlobBytes, len(body))
+	}
+}
+
 // TestGetCacheSummaryByHostArch_ExcludesEmptyArchRows: pre-v3 rows
 // with empty architecture cannot be attributed to any bucket — they
 // must not surface (would otherwise appear under an empty-string arch
