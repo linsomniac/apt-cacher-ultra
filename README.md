@@ -18,11 +18,11 @@ available from the cache at all times.
 
 ## Status
 
-Functionality is complete.  I have it running in all my environments and am
-just letting it "soak" to see if there are any long-term issues.  There are some
-"stretch goals" I might consider adding, but they are largely "polishing brass".
-I have not done any multi-arch testing.  Will consider a 1.0 release in June if
-no issues crop up during my soak.
+I'm currently running this in my dev, stg, and prod environments, and it has been
+working flawlessly for 2 weeks.  I'm making some small changes, but so far it has
+been working flawlessly, with 200 client machiens going through it, around 120 of
+which either do full re-installs or apt updates every day.  It is still looking
+on-target for a mid-June 1.0 release.
 
 ## Features
 
