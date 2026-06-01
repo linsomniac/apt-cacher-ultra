@@ -2495,8 +2495,15 @@ func TestAdopter_Sources_CrossVariantDisagreement(t *testing.T) {
 		SuitePath:       "/ubuntu/dists/noble",
 	}
 
-	// Sources (plain) declares dsc with hashA; Sources.gz declares dsc
-	// with hashB. Adoption must surface this as adoption_parse_failed.
+	// Sources (plain) declares dsc with hashA; Sources.gz declares the
+	// same dsc with hashB — a cross-declaration disagreement (also the
+	// shape of an upstream that publishes two different orig tarballs
+	// under one filename, e.g. packages.icinga.com's duplicate
+	// icinga-director_1.11.1.orig.tar.gz). Source-package coverage is
+	// best-effort (SPEC6_5 §10.2 / §11), so adoption must NOT fail the
+	// whole suite: it logs source_hash_conflict, DROPS the conflicting
+	// artifact (no package_hash row — never guesses a hash), and commits
+	// the snapshot. Binary Packages disagreement stays fatal elsewhere.
 	hashA := strings.Repeat("a", 64)
 	hashB := strings.Repeat("b", 64)
 	srcPlain := fakeSourcesStanzas([]fakeSourceStanza{
@@ -2522,21 +2529,98 @@ func TestAdopter_Sources_CrossVariantDisagreement(t *testing.T) {
 	ff.put(base+"main/source/Sources", srcPlain)
 	ff.put(base+"main/source/Sources.gz", srcGz)
 
-	err = ad.Run(context.Background(), suite, releaseText, "etag-1", "")
-	if err == nil {
-		t.Fatal("expected error from cross-variant Sources disagreement")
-	}
-	if !errors.Is(err, ErrAdoptionParseFailed) {
-		t.Errorf("err = %v, want ErrAdoptionParseFailed", err)
+	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
+		t.Fatalf("cross-declaration Sources disagreement must be tolerated, got %v", err)
 	}
 
-	// Snapshot must NOT have been committed (suite_freshness has no
-	// current_snapshot_id). A failed adoption leaves prior snapshots
-	// intact; this is the very first adoption so there's no prior.
-	sf, _ := c.GetSuiteFreshness(context.Background(),
+	// Suite adopted — the snapshot is committed despite the source
+	// conflict (binary coverage, if any, is preserved).
+	sf, err := c.GetSuiteFreshness(context.Background(),
 		suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
-	if sf != nil && sf.CurrentSnapshotID != nil {
-		t.Error("current_snapshot_id was set despite cross-variant disagreement")
+	if err != nil || sf == nil || sf.CurrentSnapshotID == nil {
+		t.Fatalf("suite not adopted despite tolerable source conflict: sf=%+v err=%v", sf, err)
+	}
+
+	// A source_hash_conflict WARN names the conflicting artifact.
+	if !strings.Contains(logBuf.String(), "source_hash_conflict") {
+		t.Errorf("expected a source_hash_conflict log line; got:\n%s", logBuf.String())
+	}
+
+	// The conflicting artifact has NO package_hash row — adoption drops
+	// it rather than guessing which hash is right (falls back to
+	// trust-on-fetch serving).
+	if _, err := c.GetPackageHash(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost,
+		"/ubuntu/pool/main/f/foo/foo_1.dsc", *sf.CurrentSnapshotID); !errors.Is(err, cache.ErrNotFound) {
+		t.Errorf("conflicting dsc should have no package_hash row; GetPackageHash err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestAdopter_Sources_IntraFileOrigTarballConflict reproduces the exact
+// packages.icinga.com defect: ONE Sources file with two source stanzas
+// that both declare the same .orig.tar.gz path but with different
+// SHA256 (two different orig tarballs published under one filename — a
+// Debian Policy violation). The suite must still adopt: the conflicting
+// orig artifact is dropped, but the good binary Packages coverage is
+// preserved. This is the case REC #1 unmasked for icinga-jammy.
+func TestAdopter_Sources_IntraFileOrigTarballConflict(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ff := newFakeFetcher()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache: c, Fetcher: ff, Verifier: passThroughVerifier{}, HostLimiter: hostsem.New(8), Logger: logger,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	suite := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.ubuntu.com", SuitePath: "/ubuntu/dists/noble"}
+
+	// One Sources file, two stanzas, same orig path, different hashes.
+	hashA := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+	orig := "icinga-director_1.11.1.orig.tar.gz"
+	src := fakeSourcesStanzas([]fakeSourceStanza{
+		{pkg: "icinga-director", directory: "pool/main/i/icinga-director", files: map[string]string{orig: hashA}},
+		{pkg: "icinga-director", directory: "pool/main/i/icinga-director", files: map[string]string{orig: hashB}},
+	})
+	// A healthy binary Packages member whose coverage must survive.
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("c", 64)})
+
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+		"main/source/Sources":        src,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	ff.put(base+"main/binary-amd64/Packages", pkgs)
+	ff.put(base+"main/source/Sources", src)
+
+	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
+		t.Fatalf("intra-file orig conflict must be tolerated, got %v", err)
+	}
+	sf, err := c.GetSuiteFreshness(context.Background(), suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
+	if err != nil || sf == nil || sf.CurrentSnapshotID == nil {
+		t.Fatalf("suite not adopted: sf=%+v err=%v", sf, err)
+	}
+	if !strings.Contains(logBuf.String(), "source_hash_conflict") {
+		t.Errorf("expected source_hash_conflict log; got:\n%s", logBuf.String())
+	}
+	// Conflicting orig dropped...
+	if _, err := c.GetPackageHash(context.Background(), suite.CanonicalScheme, suite.CanonicalHost,
+		"/ubuntu/pool/main/i/icinga-director/"+orig, *sf.CurrentSnapshotID); !errors.Is(err, cache.ErrNotFound) {
+		t.Errorf("conflicting orig tarball should have no package_hash row; err = %v, want ErrNotFound", err)
+	}
+	// ...but the binary .deb coverage is intact.
+	if _, err := c.GetPackageHash(context.Background(), suite.CanonicalScheme, suite.CanonicalHost,
+		"/ubuntu/pool/main/f/foo/foo_1.deb", *sf.CurrentSnapshotID); err != nil {
+		t.Errorf("binary .deb coverage lost after source conflict: %v", err)
 	}
 }
 

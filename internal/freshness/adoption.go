@@ -1671,8 +1671,13 @@ type sourcePathDecl struct {
 // counter; the parse_failed counter is incremented at the call site
 // when err is non-nil).
 //
-// Returns ErrAdoptionParseFailed on cross-variant disagreement
-// (matches the Phase 3 buildPackageHashes posture for binary Packages).
+// Cross-declaration disagreement (two stanzas/variants claiming
+// different SHA256 for one source path) is NOT fatal here — unlike the
+// Phase 3 buildPackageHashes posture for binary Packages. Source
+// coverage is best-effort, so a conflict logs source_hash_conflict and
+// DROPS the conflicting artifact (never guesses a hash; it falls back
+// to trust-on-fetch serving) while the suite still adopts. The error
+// return is retained for the signature but is always nil today.
 // SPEC6_5 §11 H3/H4/H11 per-stanza skips happen inside ParseSources
 // silently — operators see the per-Sources-file granularity at the
 // source_parsed Debug log; per-stanza visibility is a future phase.
@@ -1689,6 +1694,11 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 	}
 
 	dedup := make(map[string]sourcePathDecl)
+	// conflicted holds source paths whose declarations disagreed on
+	// SHA256 across stanzas/variants. Such artifacts are dropped from
+	// the output rows (we never guess which hash is right), but the
+	// suite still adopts — see the disagreement handling below.
+	conflicted := make(map[string]bool)
 	parsedCount := 0
 	for _, m := range fetchedMembers {
 		if !isSourcesMember(m.Path) {
@@ -1700,7 +1710,9 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 		// only hash coverage. This is intentionally LESS strict than
 		// the Phase 3 Packages-parse posture (which fails closed) —
 		// source-package coverage is opt-in / best-effort, while
-		// binary coverage is on the strict-mode predicate's path.
+		// binary coverage is on the strict-mode predicate's path. The
+		// same best-effort posture extends to cross-declaration hash
+		// disagreement below (log + drop, never fail the suite).
 		body, err := a.readPackagesBlob(m.Path, m.SHA256)
 		if err != nil {
 			a.logger.Warn("source_parse_failed",
@@ -1738,12 +1750,41 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 			fullPath := repoRoot + ref.Path
 			if existing, dup := dedup[fullPath]; dup {
 				if existing.sha256 != ref.SHA256 {
-					return nil, parsedCount, fmt.Errorf("%w: %q declared %s vs %s across Sources variants",
-						ErrAdoptionParseFailed, fullPath, existing.sha256, ref.SHA256)
+					// Two declarations claim different bytes for one
+					// source path — a corrupt/inconsistent index (e.g.
+					// an upstream that published two different orig
+					// tarballs under one filename, as packages.icinga.com
+					// does for icinga-director_1.11.1.orig.tar.gz). Source
+					// coverage is best-effort: log it, mark the path
+					// conflicted so it is dropped from the output (we
+					// never guess which hash is right), and keep adopting
+					// — do NOT fail the whole suite. Binary Packages
+					// disagreement stays fatal (buildPackageHashes), since
+					// that feeds the strict .deb serving path.
+					a.logger.Warn("source_hash_conflict",
+						"canonical_host", suite.CanonicalHost,
+						"suite_path", suite.SuitePath,
+						"path", fullPath,
+						"declared_a", existing.sha256,
+						"declared_b", ref.SHA256,
+					)
+					conflicted[fullPath] = true
+					continue
 				}
 				if existing.packageName != "" && ref.PackageName != "" && existing.packageName != ref.PackageName {
-					return nil, parsedCount, fmt.Errorf("%w: %q declared Package %q vs %q across Sources variants",
-						ErrAdoptionParseFailed, fullPath, existing.packageName, ref.PackageName)
+					// Same bytes (SHA256 agreed) but two package names
+					// claim the path. Benign for serving (keyed on
+					// path + hash), so keep the first-seen declaration;
+					// just log the inconsistency for operators.
+					a.logger.Warn("source_hash_conflict",
+						"canonical_host", suite.CanonicalHost,
+						"suite_path", suite.SuitePath,
+						"path", fullPath,
+						"package_a", existing.packageName,
+						"package_b", ref.PackageName,
+						"note", "package_name_only",
+					)
+					continue
 				}
 				if existing.packageName == "" {
 					existing.packageName = ref.PackageName
@@ -1760,6 +1801,10 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 
 	rows := make([]cache.PackageHash, 0, len(dedup))
 	for fullPath, decl := range dedup {
+		if conflicted[fullPath] {
+			// SHA256 disagreement: dropped, not served with a guessed hash.
+			continue
+		}
 		rows = append(rows, cache.PackageHash{
 			CanonicalScheme: suite.CanonicalScheme,
 			CanonicalHost:   suite.CanonicalHost,

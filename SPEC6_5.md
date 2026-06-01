@@ -128,9 +128,16 @@ Newly deferred in Phase 6.5:
 - **`Packages.xz` mid-snapshot disagreement recovery.** Phase 3
   already detects and rejects the case where `Packages.gz` and
   `Packages.xz` disagree on `Architecture:` for the same path
-  (`adoption.go:1258` `ErrAdoptionParseFailed`). Phase 6.5 inherits
-  this; the same disagreement check applies to Sources files
-  cross-variant.
+  (`adoption.go:1258` `ErrAdoptionParseFailed`). Binary Packages
+  disagreement stays fatal — it feeds the strict `.deb` serving path.
+  Sources disagreement is handled the same way structurally but is NOT
+  fatal: source-package coverage is best-effort, so a cross-declaration
+  SHA256 conflict (whether across compression variants or across two
+  stanzas in one Sources file — e.g. an upstream that publishes two
+  different `*.orig.tar.gz` under one filename) logs `source_hash_conflict`
+  and DROPS the conflicting artifact (no `package_hash` row; it falls
+  back to trust-on-fetch serving) while the suite still adopts. See §11
+  H7.
 - **Per-component (main/contrib/non-free) filtering.** Operators
   who want to skip non-free entirely run a derived Release
   upstream or use a per-suite mirror that strips non-free.
@@ -639,9 +646,11 @@ Implementation notes:
   rather than introducing a Sources-specific one.
 - Stanza parsing reuses the existing `internal/parser` deb822
   helpers (Phase 3). Same memory bounds, same line caps.
-- Cross-variant disagreement detection (`Sources.gz` says SHA256
-  X, `Sources.xz` says SHA256 Y for the same file) reuses the
-  existing Phase 3 `ErrAdoptionParseFailed` predicate.
+- Cross-declaration disagreement detection (two declarations —
+  across compression variants or across two stanzas in one Sources
+  file — give different SHA256 for the same source path) logs
+  `source_hash_conflict` and drops the conflicting artifact; it does
+  NOT fail the suite (source coverage is best-effort). See §11 H7.
 
 `parseSources` is ALWAYS called when a Sources member is adopted,
 even when `[adoption].architectures` excludes `"source"`. The
@@ -969,7 +978,7 @@ All comfortably under `metric_series_cap = 1024`.
 | H4 | `Sources` stanza has no SHA256 in `Files:` block (only MD5/SHA1) | `source_parse_failed` Warn `stage=hash_extract`; that stanza's rows skipped; other stanzas in the same Sources file proceed |
 | H5 | `Packages.diff/Index` has no `SHA256-Download:` block | `pdiff_index_parsed` Debug with `patch_count=0`; no `package_hash` rows inserted for diffs; Index member itself adopted normally |
 | H6 | `Packages.diff/Index` contains entries that don't match `<digits>.gz` filename pattern | The malformed entries are skipped; well-formed entries inserted; `pdiff_index_parsed` Debug carries the count of well-formed entries only |
-| H7 | Cross-variant Sources disagreement (e.g. `Sources.gz` says SHA256 X for `pkg.dsc`, `Sources.xz` says SHA256 Y for the same path) | `ErrAdoptionParseFailed` (existing Phase 3 predicate); whole adoption fails as `adoption_parse_failed`; prior snapshot continues to serve |
+| H7 | Cross-declaration Sources disagreement: two declarations (across `Sources.gz`/`Sources.xz` variants OR two stanzas in one Sources file — e.g. an upstream publishing two different `*.orig.tar.gz` under one filename) give different SHA256 for the same source path | NON-fatal (source coverage is best-effort): `source_hash_conflict` Warn names the path + both hashes; the conflicting artifact is DROPPED (no `package_hash` row → trust-on-fetch serving); the suite still adopts with its binary coverage intact. Binary `Packages` disagreement remains fatal (`ErrAdoptionParseFailed`) — that is the strict `.deb` serving path |
 | H8 | A `.dsc` request's path has a `package_hash` row but the served bytes' SHA-256 mismatches | `serve_hash_mismatch` Warn `path_class=source_dsc`; serve fails with 502; existing Phase 3 mismatch path |
 | H9 | A pdiff patch request's path has a `package_hash` row but the served bytes' SHA-256 mismatches | Same as H8 with `path_class=pdiff_patch` |
 | H10 | An `arm64`-only client requests `pkg_*.deb` against a cache with `architectures = ["amd64"]` (so no arm64 Packages adopted, no package_hash row exists for arm64 paths) | Falls through to trust-upstream Phase 1 path — request fetched + cached without hash validation. No regression vs Phase 6 default behavior |
