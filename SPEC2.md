@@ -594,7 +594,37 @@ error) are unchanged.
 Unchanged.
 
 ### 7.4 Periodic scheduler
-Unchanged (5s floor on the fast tick interval, etc.).
+5s floor on the fast tick interval, etc. (unchanged from SPEC §7.4).
+
+**Reaped-anchor recovery (freshness-freeze fix).** The freshness check
+locates a suite's metadata anchor (`InRelease`, or `Release` +
+`Release.gpg` in detached mode) via `cache.LookupURL`. Phase 1–3
+behavior was to **silently skip** when the anchor `url_path` row was
+absent. For an *adopted* suite (`current_snapshot_id` set) that is a
+permanent freeze: the SPEC4 §9.6.5 URL-path TTL pass can reap the anchor
+during a low-traffic request lull (its hash-equality guard does not
+protect anchors — see SPEC4 §9.6.5 guard (d)), after which the suite
+keeps serving the stale snapshot from `snapshot_member` and never
+re-checks upstream. Restarting the process does **not** help (the
+anchor stays gone; serving from the snapshot never re-creates it).
+
+When the anchor row is absent **and** the suite has a current snapshot,
+the checker now **recovers** instead of skipping: it reconstructs the
+upstream URL (`scheme://canonical_host + path`; port-less per SPEC §3.2,
+acceptable for an already-reaped row), re-seeds the `url_path` row with
+`blob_hash` pinned to the snapshot's adopted hash (so SPEC4 §9.6.5
+guards re-protect it), logs at WARN, increments
+`acu_freshness_anchor_reconstructed_total{host}`, and proceeds with the
+conditional GET. First-ever suites (no current snapshot) still skip —
+there is nothing to recover. Adoption (SPEC3 §7.5.1 Step 3c) keeps the
+anchor `blob_hash` synced in steady state so recovery is the exception,
+not the rule.
+
+The scheduler also exports `acu_freshness_stale_suites{adopted}` each
+tick — the count of suites whose `last_success_at` has aged past
+`staleSuiteFactor × periodic_refresh` (4×) — and logs a WARN when any
+*adopted* suite is stale. The field freeze went undetected for a week
+because no such signal existed; alert on `adopted="true" > 0`.
 
 ### 7.5 Adoption flow (NEW)
 

@@ -66,6 +66,10 @@ type Cache interface {
 	ListSuites(ctx context.Context) ([]cache.SuiteFreshness, error)
 	LookupURL(ctx context.Context, scheme, host, path string) (*cache.URLPath, error)
 	GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*cache.SuiteSnapshot, error)
+	// PutURLPath re-seeds a reaped metadata anchor url_path row during
+	// freshness recovery (SPEC2 §7.4). See checkLockedInline's
+	// missing-anchor recovery branch.
+	PutURLPath(ctx context.Context, u cache.URLPath) error
 }
 
 // Fetcher is the subset of *fetch.Client the freshness checker uses.
@@ -133,6 +137,17 @@ type Config struct {
 
 	// now is a test seam; production uses time.Now.
 	now func() time.Time
+
+	// urlReconstruct rebuilds the upstream URL for a metadata anchor
+	// (InRelease/Release/Release.gpg) when its url_path row has been
+	// reaped but the suite still has a current snapshot (SPEC2 §7.4
+	// freshness recovery). Test seam; production defaults to
+	// scheme://host + path. AIDEV-NOTE: canonical host is port-less
+	// (SPEC §3.2), so reconstruction drops a non-default upstream port;
+	// the GC identity guard (SPEC4 §5 guard (d)) preserves the original
+	// row's port-correct upstream_url whenever it still exists, so
+	// reconstruction only fires for an already-reaped anchor.
+	urlReconstruct func(scheme, host, path string) string
 }
 
 // Checker is the SPEC §7 freshness state machine.
@@ -145,6 +160,7 @@ type Checker struct {
 	maxBody             int64
 	logger              *slog.Logger
 	now                 func() time.Time
+	urlReconstruct      func(scheme, host, path string) string
 	adopter             *Adopter
 	lifetimeCtx         context.Context
 	adoptionRing        *observability.Ring
@@ -208,6 +224,12 @@ func New(cfg Config) (*Checker, error) {
 	if lifeCtx == nil {
 		lifeCtx = context.Background()
 	}
+	reconstruct := cfg.urlReconstruct
+	if reconstruct == nil {
+		reconstruct = func(scheme, host, path string) string {
+			return scheme + "://" + host + path
+		}
+	}
 	return &Checker{
 		cache:               cfg.Cache,
 		fetcher:             cfg.Fetcher,
@@ -217,6 +239,7 @@ func New(cfg Config) (*Checker, error) {
 		maxBody:             maxBody,
 		logger:              logger,
 		now:                 now,
+		urlReconstruct:      reconstruct,
 		adopter:             cfg.Adopter,
 		lifetimeCtx:         lifeCtx,
 		adoptionRing:        cfg.AdoptionRing,
@@ -472,19 +495,34 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 	urlRow, err := c.cache.LookupURL(ctx, scheme, host, inReleasePath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
-		// Suite has freshness state but no cached InRelease. The
-		// detached fallback path triggers on 404 from the upstream's
-		// /InRelease, which requires us to actually issue the GET. If
-		// we don't even have a url_path row to attempt the GET, try
-		// the symmetric detached lookup directly.
-		if cur.CurrentSnapshotID == nil && c.hasReleaseURLRow(ctx, scheme, host, suitePath) {
-			return nil, true
+		// Suite has freshness state but no cached InRelease url_path row.
+		if cur.CurrentSnapshotID == nil {
+			// First-ever / never-adopted suite. The detached fallback
+			// path triggers on 404 from the upstream's /InRelease, which
+			// requires us to actually issue the GET. If we don't even
+			// have a url_path row to attempt the GET, try the symmetric
+			// detached lookup directly.
+			if c.hasReleaseURLRow(ctx, scheme, host, suitePath) {
+				return nil, true
+			}
+			c.logger.Debug("freshness: no cached InRelease url_path, skipping",
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return nil, false
 		}
-		c.logger.Debug("freshness: no cached InRelease url_path, skipping",
-			"canonical_host", host,
-			"suite_path", suitePath,
-		)
-		return nil, false
+		// SPEC2 §7.4 freshness recovery. The suite HAS a current
+		// snapshot but its InRelease anchor row was reaped (SPEC4 §5 GC
+		// TTL during a low-traffic request lull). Without this branch
+		// the check dead-ends here and the suite freezes forever: it
+		// keeps serving the stale snapshot from snapshot_member and
+		// never observes upstream rolling forward — the production
+		// freeze trap. Reconstruct the upstream URL from the suite
+		// identity, re-seed the anchor (pinned to the snapshot's adopted
+		// hash so the SPEC4 §5 guards re-protect it), and fall through
+		// to the conditional GET with the synthesized row.
+		anchorHash := c.snapshotAnchorHash(ctx, *cur.CurrentSnapshotID, inReleaseFilename)
+		urlRow = c.reconstructAnchor(ctx, scheme, host, suitePath, inReleasePath, *cur.CurrentSnapshotID, anchorHash, nowUnix)
 	case err != nil:
 		c.logger.Warn("freshness: lookup InRelease url_path failed",
 			"err", err,
@@ -712,11 +750,19 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 	releaseURL, err := c.cache.LookupURL(ctx, scheme, host, releasePath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
-		c.logger.Debug("freshness: no cached Release url_path, skipping detached",
-			"canonical_host", host,
-			"suite_path", suitePath,
-		)
-		return nil
+		// SPEC2 §7.4 freshness recovery (detached): an adopted suite
+		// whose Release anchor was reaped must recover, not freeze —
+		// symmetric to the inline path. First-ever suites (no snapshot)
+		// still skip.
+		if cur.CurrentSnapshotID == nil {
+			c.logger.Debug("freshness: no cached Release url_path, skipping detached",
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return nil
+		}
+		relHash := c.snapshotAnchorHash(ctx, *cur.CurrentSnapshotID, releaseFilename)
+		releaseURL = c.reconstructAnchor(ctx, scheme, host, suitePath, releasePath, *cur.CurrentSnapshotID, relHash, nowUnix)
 	case err != nil:
 		c.logger.Warn("freshness: lookup Release url_path failed",
 			"err", err,
@@ -728,11 +774,15 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 	releaseGPGURL, err := c.cache.LookupURL(ctx, scheme, host, releaseGPGPath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
-		c.logger.Debug("freshness: no cached Release.gpg url_path, skipping detached",
-			"canonical_host", host,
-			"suite_path", suitePath,
-		)
-		return nil
+		if cur.CurrentSnapshotID == nil {
+			c.logger.Debug("freshness: no cached Release.gpg url_path, skipping detached",
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return nil
+		}
+		gpgHash := c.snapshotAnchorHash(ctx, *cur.CurrentSnapshotID, releaseGPGFilename)
+		releaseGPGURL = c.reconstructAnchor(ctx, scheme, host, suitePath, releaseGPGPath, *cur.CurrentSnapshotID, gpgHash, nowUnix)
 	case err != nil:
 		c.logger.Warn("freshness: lookup Release.gpg url_path failed",
 			"err", err,
@@ -921,6 +971,97 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 	)
 	freshnessCheckTotal.Inc(result, host)
 	return req
+}
+
+// reconstructAnchor synthesizes — and best-effort re-seeds — a reaped
+// metadata anchor url_path row (InRelease, or Release/Release.gpg for
+// detached) for an adopted suite. SPEC2 §7.4 freshness recovery; used by
+// both checkLockedInline and checkLockedDetached.
+//
+// The returned in-memory row is what the checker uses for the conditional
+// GET this tick; the DB re-seed restores the row so the next tick takes
+// the normal path and the SPEC4 §5 GC identity guard (guard (d)) protects
+// it going forward. blobHash is the current snapshot's adopted hash so
+// the hash-based guards (b)/(c) also match.
+//
+// AIDEV-TODO(port-correctness): upstream_url is reconstructed via the
+// (test-seam) policy scheme://host + path. Canonical host is port-less
+// (SPEC §3.2), so a non-default upstream port (e.g. http://host:8080/...)
+// is lost here. A reaped anchor on a non-default-port upstream therefore
+// recovers to the wrong authority — the conditional GET fails (logged,
+// last_check bumped, last_success NOT bumped → retry loop, no silent
+// freeze) and GPG/parse verification blocks any wrong-port content from
+// being adopted, so this degrades safely rather than corrupting. It only
+// bites a non-default-port suite whose anchor was already reaped (the
+// port-correct row is gone). The durable fix is to persist the anchor's
+// upstream URL on suite_snapshot (schema v5) and read it here; deferred.
+// In steady state this path does not run: CommitAdoption Step 3c keeps
+// the anchor present with its real upstream_url and the GC identity guard
+// (SPEC4 §5 guard (d)) stops it being reaped.
+//
+// AIDEV-NOTE: the LookupURL-miss → PutURLPath re-seed is not a clobber
+// race. All writers of an ADOPTED suite's anchor serialize on the
+// per-suite mutex (this Check plus the adoption goroutine it hands the
+// mutex to); the handler miss-path never writes an adopted suite's anchor
+// because that request is served from the snapshot (trySnapshotHit),
+// never a miss. So no concurrent writer can interleave a fresher,
+// port-correct row between the miss read and this re-seed.
+func (c *Checker) reconstructAnchor(ctx context.Context, scheme, host, suitePath, anchorPath string, snapshotID int64, blobHash *string, nowUnix int64) *cache.URLPath {
+	upstreamURL := c.urlReconstruct(scheme, host, anchorPath)
+	row := cache.URLPath{
+		CanonicalScheme: scheme,
+		CanonicalHost:   host,
+		Path:            anchorPath,
+		BlobHash:        blobHash,
+		UpstreamURL:     upstreamURL,
+		IsMetadata:      true,
+		LastRequestedAt: &nowUnix,
+		LastFetchedAt:   &nowUnix,
+	}
+	// Warn (not Debug): the silent skip this replaces hid a week-long
+	// freeze of ~20 suites in the field. SPEC §10.
+	c.logger.Warn("freshness: metadata anchor missing for adopted suite; reconstructing",
+		"canonical_host", host,
+		"suite_path", suitePath,
+		"anchor", anchorPath,
+		"snapshot_id", snapshotID,
+		"upstream_url", upstreamURL,
+	)
+	freshnessAnchorReconstructedTotal.Inc(host)
+	if perr := c.cache.PutURLPath(ctx, row); perr != nil {
+		c.logger.Warn("freshness: re-seed metadata anchor failed",
+			"err", perr,
+			"canonical_host", host,
+			"suite_path", suitePath,
+			"anchor", anchorPath,
+		)
+	}
+	return &row
+}
+
+// snapshotAnchorHash returns the adopted hash for the given anchor
+// filename from the suite's current snapshot, or nil if unavailable. Used
+// by the recovery paths to pin a reconstructed anchor's blob_hash to the
+// snapshot so the SPEC4 §5 hash guards re-protect the re-seeded row.
+func (c *Checker) snapshotAnchorHash(ctx context.Context, snapshotID int64, filename string) *string {
+	snap, err := c.cache.GetSuiteSnapshot(ctx, snapshotID)
+	if err != nil || snap == nil {
+		return nil
+	}
+	var h *string
+	switch filename {
+	case inReleaseFilename:
+		h = snap.InReleaseHash
+	case releaseFilename:
+		h = snap.ReleaseHash
+	case releaseGPGFilename:
+		h = snap.ReleaseGPGHash
+	}
+	if h == nil {
+		return nil
+	}
+	v := *h
+	return &v
 }
 
 // hasReleaseURLRow reports whether url_path has rows for both Release

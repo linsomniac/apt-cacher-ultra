@@ -101,6 +101,16 @@ func (f *fakeCache) LookupURL(ctx context.Context, scheme, host, path string) (*
 	return &cp, nil
 }
 
+func (f *fakeCache) PutURLPath(ctx context.Context, u cache.URLPath) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.putErr != nil {
+		return f.putErr
+	}
+	f.urls[keyOf(u.CanonicalScheme, u.CanonicalHost, u.Path)] = u
+	return nil
+}
+
 func (f *fakeCache) GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*cache.SuiteSnapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -603,6 +613,32 @@ func TestTick_FilersByLastSuccessAt(t *testing.T) {
 	}
 }
 
+// TestStaleSuiteCounts covers the SPEC §7.4 observability helper that
+// powers the freshness_stale_suites gauge: partition suites whose
+// last_success_at aged past the stale threshold into adopted vs
+// unadopted, so a frozen ADOPTED suite (the silent freeze) is alertable.
+func TestStaleSuiteCounts(t *testing.T) {
+	const staleBefore = int64(1000)
+	i := func(v int64) *int64 { return &v }
+	mk := func(lastSuccess, snap *int64) cache.SuiteFreshness {
+		return cache.SuiteFreshness{LastSuccessAt: lastSuccess, CurrentSnapshotID: snap}
+	}
+	suites := []cache.SuiteFreshness{
+		mk(i(2000), i(7)), // fresh adopted        -> not stale
+		mk(i(500), i(7)),  // stale adopted        -> count adopted
+		mk(i(999), i(7)),  // just-stale adopted   -> count adopted
+		mk(i(400), nil),   // stale unadopted      -> count unadopted
+		mk(nil, i(7)),     // never-succeeded      -> not "went stale", skip
+	}
+	adopted, unadopted := staleSuiteCounts(suites, staleBefore)
+	if adopted != 2 {
+		t.Errorf("adopted stale = %d, want 2", adopted)
+	}
+	if unadopted != 1 {
+		t.Errorf("unadopted stale = %d, want 1", unadopted)
+	}
+}
+
 func TestRun_StopsOnContextCancel(t *testing.T) {
 	fc := newFakeCache()
 	c, _ := New(Config{
@@ -864,6 +900,151 @@ func TestCheck_UsesSnapshotHashForComparison(t *testing.T) {
 	if got.InReleaseChangeSeenAt != nil {
 		t.Errorf("expected unchanged with snapshot match; change_seen_at=%v",
 			got.InReleaseChangeSeenAt)
+	}
+}
+
+// TestCheck_RecoversWhenAnchorMissingButSnapshotPresent is the regression
+// test for the freshness-freeze trap. When GC has reaped the InRelease
+// url_path anchor row but the suite still has a current snapshot, the
+// checker must reconstruct the upstream URL, re-seed the anchor, and run
+// the conditional GET — NOT silently dead-end at "no cached InRelease
+// url_path" and freeze the suite forever. SPEC2 §7.4.
+func TestCheck_RecoversWhenAnchorMissingButSnapshotPresent(t *testing.T) {
+	fc := newFakeCache()
+	newBody := []byte("rolled-forward InRelease body")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/dists/noble-updates/InRelease") {
+			t.Errorf("unexpected upstream path: %s", r.URL.Path)
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write(newBody)
+	}))
+	defer srv.Close()
+
+	now := time.Unix(1_780_000_000, 0)
+	then := now.Add(-8 * 24 * time.Hour).Unix() // frozen ~8 days ago
+
+	// Adopted suite: current snapshot's inrelease_hash is the OLD bytes,
+	// so the rolled-forward upstream body reads as "changed".
+	staleHash := strings.Repeat("a", 64)
+	snapID := int64(1481)
+	fc.putSnapshot(cache.SuiteSnapshot{SnapshotID: snapID, InReleaseHash: &staleHash})
+	fc.putSuite(cache.SuiteFreshness{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		SuitePath:         "/dists/noble-updates",
+		LastCheckAt:       &then,
+		LastSuccessAt:     &then,
+		CurrentSnapshotID: &snapID,
+	})
+	// NOTE: deliberately NO url_path row for .../InRelease — GC reaped it.
+	// This is the exact freeze scenario.
+
+	c, err := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Cooldown: 0, Logger: discardLogger(),
+		now:            func() time.Time { return now },
+		urlReconstruct: func(scheme, host, path string) string { return srv.URL + path },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble-updates")
+
+	// 1. No longer frozen: last_check_at / last_success_at advanced to now.
+	got, ok := fc.suite("http", "127.0.0.1", "/dists/noble-updates")
+	if !ok {
+		t.Fatal("suite_freshness missing")
+	}
+	if got.LastCheckAt == nil || *got.LastCheckAt != now.Unix() {
+		t.Fatalf("last_check_at not advanced: got %v want %d (suite still frozen)", got.LastCheckAt, now.Unix())
+	}
+	if got.LastSuccessAt == nil || *got.LastSuccessAt != now.Unix() {
+		t.Errorf("last_success_at not advanced: got %v want %d", got.LastSuccessAt, now.Unix())
+	}
+	// 2. The change was observed (upstream rolled forward).
+	if got.InReleaseChangeSeenAt == nil {
+		t.Error("expected change_seen_at to be set on observed upstream change")
+	}
+	// 3. The anchor url_path row was re-seeded so normal operation resumes.
+	u, err := fc.LookupURL(context.Background(), "http", "127.0.0.1", "/dists/noble-updates/InRelease")
+	if err != nil {
+		t.Fatalf("anchor url_path not re-seeded: %v", err)
+	}
+	if !u.IsMetadata {
+		t.Error("re-seeded anchor should be is_metadata=1")
+	}
+	if u.BlobHash == nil || *u.BlobHash != staleHash {
+		t.Errorf("re-seeded anchor blob_hash = %v, want snapshot inrelease_hash %s", u.BlobHash, staleHash)
+	}
+}
+
+// TestCheck_DetachedRecoversWhenAnchorsMissing is the detached-mode
+// counterpart to TestCheck_RecoversWhenAnchorMissingButSnapshotPresent:
+// a suite with a detached current snapshot whose Release / Release.gpg
+// anchors were reaped must reconstruct + re-seed them and run the check,
+// not freeze. SPEC2 §7.4 / §7.6.3.
+func TestCheck_DetachedRecoversWhenAnchorsMissing(t *testing.T) {
+	fc := newFakeCache()
+	releaseText := []byte("rolled-forward Release body")
+	sigBody := []byte("Release.gpg bytes")
+	var relHits, gpgHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/noble/Release":
+			relHits.Add(1)
+			w.WriteHeader(200)
+			_, _ = w.Write(releaseText)
+		case "/dists/noble/Release.gpg":
+			gpgHits.Add(1)
+			w.WriteHeader(200)
+			_, _ = w.Write(sigBody)
+		default:
+			t.Errorf("unexpected fetch: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	now := time.Unix(1_780_000_000, 0)
+	then := now.Add(-8 * 24 * time.Hour).Unix()
+	staleRH := strings.Repeat("b", 64)
+	rgh := hashOf([]byte("adopted gpg"))
+	snapID := int64(1482)
+	fc.putSnapshot(cache.SuiteSnapshot{
+		SnapshotID: snapID, CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		SuitePath: "/dists/noble", ReleaseHash: &staleRH, ReleaseGPGHash: &rgh,
+	})
+	fc.putSuite(cache.SuiteFreshness{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble",
+		LastCheckAt: &then, LastSuccessAt: &then, CurrentSnapshotID: &snapID,
+	})
+	// NOTE: no Release / Release.gpg url_path rows — both reaped.
+
+	c, err := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Cooldown: 0, Logger: discardLogger(),
+		now:            func() time.Time { return now },
+		urlReconstruct: func(scheme, host, path string) string { return srv.URL + path },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
+
+	got, ok := fc.suite("http", "127.0.0.1", "/dists/noble")
+	if !ok {
+		t.Fatal("suite_freshness missing")
+	}
+	if got.LastCheckAt == nil || *got.LastCheckAt != now.Unix() {
+		t.Fatalf("last_check_at not advanced (detached suite still frozen): got %v", got.LastCheckAt)
+	}
+	if relHits.Load() != 1 {
+		t.Errorf("Release hits = %d, want 1 (recovery should issue the GET)", relHits.Load())
+	}
+	if _, err := fc.LookupURL(context.Background(), "http", "127.0.0.1", "/dists/noble/Release"); err != nil {
+		t.Errorf("Release anchor not re-seeded: %v", err)
+	}
+	if _, err := fc.LookupURL(context.Background(), "http", "127.0.0.1", "/dists/noble/Release.gpg"); err != nil {
+		t.Errorf("Release.gpg anchor not re-seeded: %v", err)
 	}
 }
 

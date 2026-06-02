@@ -452,6 +452,7 @@ func (c *Cache) HeartbeatBlobs(ctx context.Context, hashes []string) error {
 // RunURLPathGCBatch executes one writer-tx URL-path-TTL batch:
 //
 //  1. BEGIN
+//
 //  2. SELECT up to batchSize url_path candidates whose last_requested_at
 //     is older than now-ttlSeconds AND which are not vouched for by any
 //     current snapshot via package_hash, snapshot_member, or
@@ -459,30 +460,46 @@ func (c *Cache) HeartbeatBlobs(ctx context.Context, hashes []string) error {
 //     pre-warmed but never served) are protected unconditionally.
 //
 //     "Vouched for by a current snapshot" means one of:
-//       a. There exists a package_hash row with the same (scheme, host,
-//          path) AND declared_sha256 = url_path.blob_hash on a current
-//          snapshot. Path-AND-hash equality matters here — a row whose
-//          cached bytes diverge from the snapshot's declared hash is
-//          stale and reapable; the next client request would hit-path
-//          evict it anyway (SPEC2 §6.1 step 5).
-//       b. There exists a snapshot_member row with blob_hash =
-//          url_path.blob_hash on a current snapshot. Hash-based check
-//          (no path equality) because snapshot_member's path is suite-
-//          relative; matching by hash is sufficient since the bytes are
-//          what the snapshot vouches for. Covers cached Packages.gz,
-//          Sources, pdiff Index members, etc.
-//       c. There exists a suite_snapshot row whose inrelease_hash,
-//          release_hash, or release_gpg_hash equals url_path.blob_hash
-//          on a current snapshot. Covers cached InRelease, Release,
-//          Release.gpg url_path rows — critically important because
-//          freshness checks (SPEC2 §7.4) skip silently when these
-//          url_path rows are absent.
+//     a. There exists a package_hash row with the same (scheme, host,
+//     path) AND declared_sha256 = url_path.blob_hash on a current
+//     snapshot. Path-AND-hash equality matters here — a row whose
+//     cached bytes diverge from the snapshot's declared hash is
+//     stale and reapable; the next client request would hit-path
+//     evict it anyway (SPEC2 §6.1 step 5).
+//     b. There exists a snapshot_member row with blob_hash =
+//     url_path.blob_hash on a current snapshot. Hash-based check
+//     (no path equality) because snapshot_member's path is suite-
+//     relative; matching by hash is sufficient since the bytes are
+//     what the snapshot vouches for. Covers cached Packages.gz,
+//     Sources, pdiff Index members, etc.
+//     c. There exists a suite_snapshot row whose inrelease_hash,
+//     release_hash, or release_gpg_hash equals url_path.blob_hash
+//     on a current snapshot. Covers cached InRelease, Release,
+//     Release.gpg url_path rows — critically important because
+//     freshness checks (SPEC2 §7.4) skip silently when these
+//     url_path rows are absent.
+//     d. The row's path is exactly <suite_path>/InRelease for an
+//     inline current snapshot (inrelease_hash set), or
+//     <suite_path>/{Release,Release.gpg} for a detached current
+//     snapshot (release_hash set). Identity-based (NO blob_hash), but
+//     scoped to the snapshot's ACTIVE form so opposite-form anchors
+//     (a stale Release under an inline suite, etc.) still age out via
+//     the TTL. The metadata anchor MUST survive for freshness to keep
+//     running, but guard (c) is structurally unsatisfiable in steady
+//     state — adoption writes the snapshot's inrelease_hash while the
+//     anchor's blob_hash keeps pointing at the last client-fetched
+//     bytes, so the two diverge and (c) never matches. Without (d)
+//     the anchor is reaped on a low-traffic lull and the suite
+//     freezes forever (the production freeze trap). SPEC4 §5.
+//
 //  3. DELETE the rows
+//
 //  4. For each deleted row with a non-NULL blob_hash, decrement
 //     blob.refcount and set refcount_zeroed_at when the refcount
 //     crosses to <= 0 — mirrors EvictURLPath's bookkeeping exactly so
 //     the next blob-GC pass can reap the bytes once gc.blob_grace
 //     elapses.
+//
 //  5. COMMIT
 //
 // ttlSeconds is `gc.url_path_ttl.Seconds()`. The caller MUST verify
@@ -548,6 +565,20 @@ SELECT canonical_scheme, canonical_host, path, blob_hash
             AND ss.snapshot_id IN (
                   SELECT current_snapshot_id FROM suite_freshness
                    WHERE current_snapshot_id IS NOT NULL
+                )
+       )
+   AND NOT EXISTS (
+         SELECT 1 FROM suite_freshness sf
+           JOIN suite_snapshot ss ON ss.snapshot_id = sf.current_snapshot_id
+          WHERE sf.canonical_scheme = url_path.canonical_scheme
+            AND sf.canonical_host   = url_path.canonical_host
+            AND (
+                  (ss.inrelease_hash IS NOT NULL
+                     AND url_path.path = sf.suite_path || '/InRelease')
+               OR (ss.release_hash IS NOT NULL
+                     AND url_path.path IN (
+                           sf.suite_path || '/Release',
+                           sf.suite_path || '/Release.gpg'))
                 )
        )
  ORDER BY last_requested_at

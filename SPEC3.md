@@ -551,6 +551,42 @@ insert (the asymmetry documented in
 asymmetry — the prefetched url_path rows do not bump refcount; Phase 4
 GC's `refcount <= 0` predicate continues to reap correctly.
 
+##### Step 3c: metadata anchor sync (freshness-freeze fix)
+
+After Step 3b, the flip transaction also (re)seeds the suite's
+**metadata anchor** `url_path` row(s) — `InRelease` (inline) or
+`Release` + `Release.gpg` (detached) — to point at the blob *this
+snapshot adopted*:
+
+```sql
+-- read the adopted hashes back from the candidate snapshot row, then
+-- per present anchor (suite_path + "/InRelease" | "/Release" | "/Release.gpg"):
+INSERT INTO url_path
+  (canonical_scheme, canonical_host, path, blob_hash, upstream_url,
+   is_metadata, last_requested_at, request_count, last_fetched_at,
+   upstream_etag, upstream_lastmod)
+VALUES (?, ?, ?, ?, ?, 1, NULL, 0, ?, NULL, NULL)
+ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
+  blob_hash       = excluded.blob_hash,
+  is_metadata     = 1,
+  last_fetched_at = excluded.last_fetched_at;
+  -- upstream_url, last_requested_at, request_count are NOT overwritten on
+  -- conflict: preserve the existing row's port-correct upstream_url and
+  -- its hotness/recency signal.
+```
+
+Rationale: historically adoption left the anchor's `blob_hash` pointing
+at whatever bytes a *client* miss last stored, so it diverged from the
+snapshot's `inrelease_hash` and the SPEC4 §9.6.5 metadata-self-hash
+guard (c) could never vouch for it. The anchor was then reaped on a
+low-traffic lull and the suite froze (SPEC2 §7.4). Syncing `blob_hash`
+here keeps guards (b)/(c) matching; the SPEC4 §9.6.5 identity guard (d)
+is the belt to this suspenders. The INSERT branch (anchor already
+reaped) reconstructs `upstream_url` as `scheme://host + path`
+(port-less, SPEC §3.2) — acceptable because it only fires when the
+port-correct row is already gone. Phase 2 callers reach this step too
+(it reads the snapshot's own hashes, needs no new argument).
+
 #### 7.5.2 Packages parser additions
 
 Phase 2's `ParsePackages` (`internal/freshness/packages_parse.go`)

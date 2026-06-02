@@ -414,6 +414,223 @@ func TestRunURLPathGCBatch_DetachedReleaseAndGPGProtected(t *testing.T) {
 	}
 }
 
+// TestCommitAdoption_SyncsInReleaseAnchorBlobHash is the regression test
+// for the freeze trap's root cause (SPEC3 §7.5.1 Step 3c). Adoption must
+// sync the InRelease url_path anchor's blob_hash to the newly-adopted
+// snapshot hash so the SPEC4 §5 GC guards (b)/(c) can vouch for it — while
+// PRESERVING the existing row's (port-correct) upstream_url rather than
+// clobbering it with portless reconstruction.
+func TestCommitAdoption_SyncsInReleaseAnchorBlobHash(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, 1_700_000_000)()
+
+	stale := seedBlob(t, c, "stale client-fetched inrelease")
+	adopted := seedBlob(t, c, "adopted inrelease bytes")
+
+	const host = "archive.test"
+	const suite = "/ubuntu/dists/noble"
+	const anchorPath = suite + "/InRelease"
+	const customURL = "http://archive.test:8080/ubuntu/dists/noble/InRelease"
+
+	// Pre-existing anchor row from a prior client miss: blob_hash points
+	// at the STALE bytes and carries a port-bearing upstream_url adoption
+	// must PRESERVE.
+	if _, err := c.db.Exec(`INSERT INTO url_path
+	  (canonical_scheme, canonical_host, path, blob_hash, upstream_url,
+	   is_metadata, last_requested_at, request_count)
+	  VALUES ('http', ?, ?, ?, ?, 1, ?, 5)`,
+		host, anchorPath, stale, customURL, int64(1_699_000_000)); err != nil {
+		t.Fatalf("seed anchor: %v", err)
+	}
+
+	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
+		InReleaseHash: &adopted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
+		{SnapshotID: id, Path: "InRelease", BlobHash: adopted, DeclaredSHA256: adopted},
+	}, nil, nil, false); err != nil {
+		t.Fatalf("CommitAdoption: %v", err)
+	}
+
+	u, err := c.LookupURL(ctx, "http", host, anchorPath)
+	if err != nil {
+		t.Fatalf("anchor LookupURL: %v", err)
+	}
+	if u.BlobHash == nil || *u.BlobHash != adopted {
+		t.Errorf("anchor blob_hash = %v, want adopted snapshot inrelease_hash %s", u.BlobHash, adopted)
+	}
+	if u.UpstreamURL != customURL {
+		t.Errorf("anchor upstream_url = %q, want preserved %q", u.UpstreamURL, customURL)
+	}
+	if !u.IsMetadata {
+		t.Error("anchor is_metadata must remain 1")
+	}
+}
+
+// TestCommitAdoption_CreatesInReleaseAnchorWhenMissing covers the case
+// where the anchor was already reaped before adoption (e.g. Layer A
+// recovery is racing): adoption creates it with the reconstructed URL.
+func TestCommitAdoption_CreatesInReleaseAnchorWhenMissing(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, 1_700_000_000)()
+
+	adopted := seedBlob(t, c, "adopted inrelease bytes (no prior anchor)")
+	const host = "archive.test"
+	const suite = "/ubuntu/dists/noble"
+	const anchorPath = suite + "/InRelease"
+
+	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
+		InReleaseHash: &adopted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
+		{SnapshotID: id, Path: "InRelease", BlobHash: adopted, DeclaredSHA256: adopted},
+	}, nil, nil, false); err != nil {
+		t.Fatalf("CommitAdoption: %v", err)
+	}
+
+	u, err := c.LookupURL(ctx, "http", host, anchorPath)
+	if err != nil {
+		t.Fatalf("anchor not created by adoption: %v", err)
+	}
+	if u.BlobHash == nil || *u.BlobHash != adopted {
+		t.Errorf("created anchor blob_hash = %v, want %s", u.BlobHash, adopted)
+	}
+	if u.UpstreamURL != "http://"+host+anchorPath {
+		t.Errorf("created anchor upstream_url = %q, want reconstructed %q", u.UpstreamURL, "http://"+host+anchorPath)
+	}
+	if !u.IsMetadata {
+		t.Error("created anchor is_metadata must be 1")
+	}
+}
+
+// TestRunURLPathGCBatch_InReleaseAnchorProtectedWhenBlobHashDiverges is
+// the regression test for the freshness-freeze trap (SPEC4 §5 guard (d)).
+//
+// In production the InRelease anchor's url_path.blob_hash points at the
+// last CLIENT-fetched bytes, while the adopted snapshot's inrelease_hash
+// is a DIFFERENT (re-adopted) blob — CommitAdoption historically never
+// synced the anchor. The hash-equality guard (c) therefore can NOT
+// protect the anchor, so an aged anchor is reaped and the suite freezes
+// (the checker silently skips when the row is absent — SPEC2 §7.4). The
+// identity guard (d) must protect the anchor by path for any suite with
+// a current snapshot, regardless of blob_hash.
+//
+// NOTE: the sibling _OnCurrentSnapshotProtected test masks this defect —
+// it seeds url_path.blob_hash == snapshot.inrelease_hash, the exact
+// equality production never satisfies.
+func TestRunURLPathGCBatch_InReleaseAnchorProtectedWhenBlobHashDiverges(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	stale := seedBlob(t, c, "stale client-fetched inrelease")
+	adopted := seedBlob(t, c, "adopted (newer) inrelease bytes")
+	const path = "/ubuntu/dists/noble/InRelease"
+	// Anchor aged past the 7-day TTL, blob_hash = the STALE client blob.
+	putURLPathRow(t, c, "http", "archive.test", path, stale,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
+
+	if _, err := c.db.Exec(`INSERT INTO suite_freshness
+	  (canonical_scheme, canonical_host, suite_path)
+	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
+		t.Fatalf("seed suite_freshness: %v", err)
+	}
+	// Current snapshot's inrelease_hash = the ADOPTED blob (≠ stale).
+	res, err := c.db.Exec(`INSERT INTO suite_snapshot
+	  (canonical_scheme, canonical_host, suite_path,
+	   inrelease_hash, created_at, adopted_at, heartbeat_at,
+	   package_coverage_complete)
+	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble', ?, ?, ?, ?, 1)`,
+		adopted, now, now, now)
+	if err != nil {
+		t.Fatalf("seed suite_snapshot: %v", err)
+	}
+	snapID, _ := res.LastInsertId()
+	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = ?
+	  WHERE canonical_scheme='http' AND canonical_host='archive.test'
+	    AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
+		t.Fatalf("set current_snapshot_id: %v", err)
+	}
+
+	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
+	if err != nil {
+		t.Fatalf("RunURLPathGCBatch: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("reaped = %d, want 0 (InRelease anchor of a current snapshot must be protected by identity even when blob_hash diverged)", got)
+	}
+}
+
+// TestRunURLPathGCBatch_OppositeFormAnchorNotProtected verifies the
+// identity guard (d) protects only the suite's ACTIVE metadata form: an
+// inline current snapshot must NOT keep a stale /Release (or
+// /Release.gpg) row alive past the TTL, and a detached snapshot must NOT
+// keep a stale /InRelease row. Otherwise opposite-form anchors (and the
+// blobs they pin) leak forever.
+func TestRunURLPathGCBatch_OppositeFormAnchorNotProtected(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	ir := seedBlob(t, c, "inline inrelease")
+	staleRel := seedBlob(t, c, "stale opposite-form release")
+	// Inline suite: snapshot carries inrelease_hash only.
+	putURLPathRow(t, c, "http", "archive.test", "/ubuntu/dists/noble/InRelease", ir,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
+	// Opposite-form (Release) anchor, aged, NOT vouched by any guard but
+	// (the over-broad) identity guard.
+	putURLPathRow(t, c, "http", "archive.test", "/ubuntu/dists/noble/Release", staleRel,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
+
+	if _, err := c.db.Exec(`INSERT INTO suite_freshness
+	  (canonical_scheme, canonical_host, suite_path)
+	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
+		t.Fatalf("seed suite_freshness: %v", err)
+	}
+	res, err := c.db.Exec(`INSERT INTO suite_snapshot
+	  (canonical_scheme, canonical_host, suite_path, inrelease_hash,
+	   created_at, adopted_at, heartbeat_at, package_coverage_complete)
+	  VALUES ('http','archive.test','/ubuntu/dists/noble', ?, ?, ?, ?, 1)`,
+		ir, now, now, now)
+	if err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+	snapID, _ := res.LastInsertId()
+	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id=?
+	  WHERE canonical_host='archive.test' AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
+		t.Fatalf("set current_snapshot_id: %v", err)
+	}
+
+	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
+	if err != nil {
+		t.Fatalf("RunURLPathGCBatch: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("reaped = %d, want 1 (stale opposite-form /Release reaped; active /InRelease kept)", got)
+	}
+	var n int
+	_ = c.db.QueryRow(`SELECT count(*) FROM url_path WHERE path='/ubuntu/dists/noble/InRelease'`).Scan(&n)
+	if n != 1 {
+		t.Errorf("active /InRelease anchor should survive: count=%d", n)
+	}
+	_ = c.db.QueryRow(`SELECT count(*) FROM url_path WHERE path='/ubuntu/dists/noble/Release'`).Scan(&n)
+	if n != 0 {
+		t.Errorf("opposite-form /Release anchor should be reaped: count=%d", n)
+	}
+}
+
 // TestRunURLPathGCBatch_SnapshotMemberHashProtects covers cached
 // Packages.gz / Sources / pdiff Index members: they are tracked in
 // snapshot_member by hash, and aged url_path rows pointing at those

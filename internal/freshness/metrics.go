@@ -26,6 +26,31 @@ var (
 		"result", "host",
 	)
 
+	// freshnessAnchorReconstructedTotal counts SPEC2 §7.4 recoveries:
+	// an adopted suite whose InRelease url_path anchor was reaped
+	// (SPEC4 §5 GC TTL) and which the checker reconstructed in-place
+	// instead of freezing. A non-zero value means anchors are being
+	// reaped out from under live suites — the GC identity guard
+	// (SPEC4 §5 guard (d)) should drive this back to zero over time.
+	freshnessAnchorReconstructedTotal = metrics.NewCounterWithCap(
+		"acu_freshness_anchor_reconstructed_total",
+		"Metadata anchor url_path rows reconstructed during freshness recovery, by host (SPEC2 §7.4).",
+		metrics.DefaultMaxSeries,
+		"host",
+	)
+
+	// freshnessStaleSuites is the per-tick gauge of suites whose
+	// last_success_at has aged past staleSuiteFactor*refresh (SPEC §7.4
+	// observability). Labeled adopted=true|false so a frozen ADOPTED
+	// suite — the case that silently served stale metadata for a week in
+	// the field — is directly alertable.
+	freshnessStaleSuites = metrics.NewGaugeWithCap(
+		"acu_freshness_stale_suites",
+		"Suites whose last_success_at is older than staleSuiteFactor*refresh, by adopted state (SPEC §7.4).",
+		metrics.DefaultMaxSeries,
+		"adopted",
+	)
+
 	adoptionTotal = metrics.NewCounterWithCap(
 		"acu_adoption_total",
 		"Total adoption attempts, labeled by outcome and host (SPEC5 §10.4.3).",

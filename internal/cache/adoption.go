@@ -386,6 +386,62 @@ UPDATE suite_snapshot SET package_coverage_complete = ?
 			return fmt.Errorf("CommitAdoption: stamp coverage: %w", err)
 		}
 
+		// Step 3c (freshness-freeze fix, SPEC3 §7.5.1 / SPEC2 §7.4):
+		// seed/sync the metadata anchor url_path row(s) — InRelease
+		// (inline) or Release + Release.gpg (detached) — to point at the
+		// blob this snapshot adopted. Historically adoption left the
+		// anchor's blob_hash pointing at whatever bytes a client
+		// cache-miss last stored, so it diverged from the snapshot's
+		// inrelease_hash and the SPEC4 §5 GC guards (b)/(c) could never
+		// vouch for it; the anchor was then reaped on a low-traffic lull
+		// and the suite froze (the checker silently skips when the anchor
+		// is absent, SPEC2 §7.4). Syncing it here keeps the hash-based
+		// guards matching — the SPEC4 §5 identity guard (d) is the belt
+		// to this suspenders.
+		//
+		// AIDEV-NOTE: ON CONFLICT preserves the existing (port-correct)
+		// upstream_url, last_requested_at, and request_count — only
+		// blob_hash / is_metadata / last_fetched_at are (re)written.
+		// Mirrors Step 3a's hotness-preservation rationale. The INSERT
+		// branch (anchor was already reaped) reconstructs upstream_url as
+		// scheme://host+path, which is port-less (SPEC §3.2) — acceptable
+		// because it only fires when the original row is already gone.
+		var anchorInRel, anchorRel, anchorRelGPG sql.NullString
+		if err := tx.QueryRowContext(ctx, `
+SELECT inrelease_hash, release_hash, release_gpg_hash
+  FROM suite_snapshot WHERE snapshot_id = ?`, snapshotID).
+			Scan(&anchorInRel, &anchorRel, &anchorRelGPG); err != nil {
+			return fmt.Errorf("CommitAdoption: read anchor hashes: %w", err)
+		}
+		seedAnchor := func(filename string, h sql.NullString) error {
+			if !h.Valid || h.String == "" {
+				return nil
+			}
+			anchorPath := suite + filename
+			_, err := tx.ExecContext(ctx, `
+INSERT INTO url_path
+  (canonical_scheme, canonical_host, path, blob_hash, upstream_url,
+   is_metadata, last_requested_at, request_count, last_fetched_at,
+   upstream_etag, upstream_lastmod)
+VALUES (?, ?, ?, ?, ?, 1, NULL, 0, ?, NULL, NULL)
+ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
+  blob_hash       = excluded.blob_hash,
+  is_metadata     = 1,
+  last_fetched_at = excluded.last_fetched_at`,
+				scheme, host, anchorPath, h.String,
+				scheme+"://"+host+anchorPath, now)
+			return err
+		}
+		if err := seedAnchor("/InRelease", anchorInRel); err != nil {
+			return fmt.Errorf("CommitAdoption: seed InRelease anchor: %w", err)
+		}
+		if err := seedAnchor("/Release", anchorRel); err != nil {
+			return fmt.Errorf("CommitAdoption: seed Release anchor: %w", err)
+		}
+		if err := seedAnchor("/Release.gpg", anchorRelGPG); err != nil {
+			return fmt.Errorf("CommitAdoption: seed Release.gpg anchor: %w", err)
+		}
+
 		// Step 4 (SPEC4 §7.5.1 Rule 2): bump refcount for blobs
 		// referenced by the new snapshot. The IN-subquery dedupes
 		// blob_hash values automatically: each blob row matches once

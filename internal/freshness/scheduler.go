@@ -3,6 +3,8 @@ package freshness
 import (
 	"context"
 	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
 // minFastTickInterval is the floor for the periodic scheduler's tick
@@ -10,6 +12,33 @@ import (
 // this floor keeps a misconfigured periodic_refresh of, say, 1 minute
 // from spinning on the cache every 15s.
 const minFastTickInterval = 5 * time.Second
+
+// staleSuiteFactor multiplies periodic_refresh to set the "this suite has
+// gone silently stale" threshold for the SPEC §7.4 freshness_stale_suites
+// gauge. A healthy suite refreshes every periodic_refresh; 4× gives ample
+// slack for transient upstream trouble before a suite is flagged. The
+// production freeze went undetected for a week precisely because no such
+// signal existed.
+const staleSuiteFactor = 4
+
+// staleSuiteCounts partitions suites whose last_success_at has aged past
+// staleBefore into adopted (current_snapshot_id set — the dangerous case
+// that serves stale metadata) and unadopted. A nil last_success_at is
+// treated as "never succeeded" rather than "went stale" and is not
+// counted, so brand-new suites don't trip the gauge. SPEC §7.4.
+func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore int64) (adopted, unadopted int) {
+	for _, s := range suites {
+		if s.LastSuccessAt == nil || *s.LastSuccessAt >= staleBefore {
+			continue
+		}
+		if s.CurrentSnapshotID != nil {
+			adopted++
+		} else {
+			unadopted++
+		}
+	}
+	return adopted, unadopted
+}
 
 // Run starts the SPEC §7.4 periodic refresh loop. It returns when ctx
 // is cancelled. Refresh = 0 disables periodic refresh (Run returns
@@ -50,6 +79,22 @@ func (c *Checker) tick(ctx context.Context) {
 		c.logger.Warn("freshness: list suites failed", "err", err)
 		return
 	}
+	// SPEC §7.4 observability: surface suites that have gone silently
+	// stale (last_success_at past staleSuiteFactor*refresh). An adopted
+	// stale suite is the freeze signature — it keeps serving its snapshot
+	// while never re-checking upstream. The gauge is absolute per tick.
+	staleBefore := c.now().Add(-staleSuiteFactor * c.refresh).Unix()
+	adoptedStale, unadoptedStale := staleSuiteCounts(suites, staleBefore)
+	freshnessStaleSuites.Set(float64(adoptedStale), "true")
+	freshnessStaleSuites.Set(float64(unadoptedStale), "false")
+	if adoptedStale > 0 {
+		c.logger.Warn("freshness: adopted suites stale beyond threshold",
+			"adopted_stale", adoptedStale,
+			"stale_factor", staleSuiteFactor,
+			"refresh", c.refresh.String(),
+		)
+	}
+
 	threshold := c.now().Add(-c.refresh).Unix()
 	for _, s := range suites {
 		// Already-fresh suites (last_success_at within refresh window)

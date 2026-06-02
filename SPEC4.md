@@ -1592,12 +1592,33 @@ snapshot" means **at least one** of:
 - **suite_snapshot (metadata-self hash):** there exists a
   `suite_snapshot` row on a current snapshot whose
   `inrelease_hash`, `release_hash`, or `release_gpg_hash` equals
-  `url_path.blob_hash`. Critically important — the SPEC2 §7.4
-  freshness checker calls `cache.LookupURL` on the suite's
-  `InRelease` (and `Release` / `Release.gpg` in detached mode),
-  and silently returns nil when the row is absent. Reaping a
-  still-current metadata anchor would stop periodic refreshes
-  for that suite until the next client `apt update`.
+  `url_path.blob_hash`. Covers cached `InRelease` / `Release` /
+  `Release.gpg` anchors **when the anchor row's `blob_hash`
+  matches the adopted hash.**
+- **metadata anchor (identity, no hash):** the row's `path` is
+  `<suite_path>/InRelease` for an **inline** current snapshot
+  (`inrelease_hash` set), or `<suite_path>/Release` /
+  `<suite_path>/Release.gpg` for a **detached** current snapshot
+  (`release_hash` set). Identity-based, independent of `blob_hash`,
+  but scoped to the snapshot's *active form* so opposite-form
+  anchors (e.g. a stale `Release` under an inline suite) still age
+  out via the TTL rather than being pinned forever. This guard
+  exists because the hash-equality
+  guard above is **structurally insufficient** for anchors: the
+  anchor's `url_path.blob_hash` is set by the SPEC2 §6 miss path
+  to whatever bytes a *client* fetched, while the snapshot's
+  `inrelease_hash` is the *adopted* blob; after the first
+  re-adoption the two diverge and the metadata-self-hash guard
+  can never match (observed 0/N in the field). Without this
+  guard the anchor is reaped on a low-traffic request lull, and
+  the SPEC2 §7.4 checker — which calls `cache.LookupURL` on the
+  anchor and historically returned nil when absent — froze the
+  suite permanently: it kept serving the stale snapshot and
+  never observed upstream rolling forward. SPEC2 §7.4 now
+  *recovers* from a reaped anchor, and adoption (SPEC3 §7.5.1
+  Step 3c) re-syncs the anchor `blob_hash`, but this identity
+  guard is the durable belt-and-suspenders that keeps the anchor
+  present in the first place.
 
 Displaced snapshots' rows do **not** protect (those snapshots
 are themselves eligible for §9.6.3 reaping). A `url_path` row
