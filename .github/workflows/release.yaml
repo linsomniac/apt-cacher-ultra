@@ -29,14 +29,14 @@ jobs:
       NFPM_VERSION: 2.43.0
       NFPM_SHA256: a80d5f724ed70b192ffa8a2bde469c013cef559c8afa3441eb51dd9a918beb6b
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # Full history + tags so `git archive <tag>` and any future
           # `git describe` invocations work; shallow clones drop tags
           # and the archive step would fail.
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
           cache: true
@@ -129,7 +129,7 @@ jobs:
           ls -lh dist/
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: apt-cacher-ultra ${{ steps.vars.outputs.version }}
           tag_name: ${{ github.ref_name }}

@@ -13,8 +13,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
           cache: true
@@ -24,8 +24,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
           cache: true
@@ -47,7 +47,7 @@ jobs:
     # ~30s; 10 min gives generous headroom for cold caches.
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: bash e2e/run.sh
 
   # SPEC §14 step 3 .deb package install validation. For each
@@ -62,5 +62,5 @@ jobs:
     # overhead fits comfortably in 15 min.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: bash e2e/deb/run.sh
