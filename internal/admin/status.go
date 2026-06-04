@@ -929,11 +929,16 @@ func defaultEmpty(s, fallback string) string {
 	return s
 }
 
-// durationOf renders a wallclock-seconds count as "Xh Ym".
+// durationOf renders a wallclock-seconds count as the two most
+// significant units: "Xm" under an hour, "Xh Ym" under a day, and
+// "Xd Yh" once it reaches a day (minutes dropped at that scale).
 func durationOf(seconds int64) string {
 	d := time.Duration(seconds) * time.Second
 	h := int(d.Hours())
 	m := int(d.Minutes()) % 60
+	if h >= 24 {
+		return fmt.Sprintf("%dd %dh", h/24, h%24)
+	}
 	if h == 0 {
 		return fmt.Sprintf("%dm", m)
 	}

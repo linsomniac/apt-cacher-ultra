@@ -181,6 +181,31 @@ func TestFormatShortDuration(t *testing.T) {
 	}
 }
 
+func TestDurationOf(t *testing.T) {
+	cases := []struct {
+		in   int64
+		want string
+	}{
+		{-5, "0m"},
+		{0, "0m"},
+		{59, "0m"},
+		{60, "1m"},
+		{300, "5m"},
+		{3540, "59m"},
+		{3600, "1h 0m"},
+		{3900, "1h 5m"},
+		{86340, "23h 59m"}, // just under a day stays in hours
+		{86400, "1d 0h"},   // exactly one day rolls over to days
+		{90000, "1d 1h"},
+		{223500, "2d 14h"}, // 62h 5m collapses to days + hours (minutes dropped)
+	}
+	for _, c := range cases {
+		if got := durationOf(c.in); got != c.want {
+			t.Errorf("durationOf(%d) = %q; want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestKeyringCounts(t *testing.T) {
 	entries := []keyringEntry{
 		{SourcePath: "embedded:ubuntu-archive-keyring.gpg"},
