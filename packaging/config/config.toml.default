@@ -283,7 +283,11 @@ log_stale_serves               = true
 
 [log]
 level  = "info"
-format = "json"
+# Log output format: "text" (the default) emits human-readable logfmt-style
+# key=value lines; "json" emits structured single-line JSON objects for
+# machine ingestion (log shippers, SIEMs). Both carry identical fields — set
+# this to "json" if you forward logs to a structured pipeline.
+format = "text"
 
 # --- HTTPS caching via MITM (ON by default) --------------------------------
 # By default the cache MITM-signs https:// repos so they are CACHED: it signs

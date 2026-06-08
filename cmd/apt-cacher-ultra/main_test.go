@@ -29,6 +29,29 @@ func newTestLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
+// TestNewLoggerOmitsTimeField asserts neither format emits slog's built-in
+// top-level "time" attribute: the logging daemon (journald/syslog) already
+// timestamps every line it ingests, so a second timestamp is pure noise.
+func TestNewLoggerOmitsTimeField(t *testing.T) {
+	for _, format := range []string{"text", "json"} {
+		var buf strings.Builder
+		logger := newLogger(config.LogConfig{Format: format, Level: "info"}, &buf)
+		logger.Info("hello", "k", "v")
+		out := buf.String()
+
+		if !strings.Contains(out, "hello") {
+			t.Errorf("%s: log missing message: %q", format, out)
+		}
+		needle := "time="
+		if format == "json" {
+			needle = `"time"`
+		}
+		if strings.Contains(out, needle) {
+			t.Errorf("%s: log unexpectedly contains time field (%s): %q", format, needle, out)
+		}
+	}
+}
+
 // loadAutoCAPool reads the daemon's auto-generated CA from
 // <cacheDir>/ca/ca.crt and returns a *x509.CertPool containing only
 // that cert. Used by §15 #2 integration tests that drive a real

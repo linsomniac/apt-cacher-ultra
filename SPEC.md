@@ -287,7 +287,7 @@ log_stale_serves               = true
 
 [log]
 level  = "info"                           # debug | info | warn | error
-format = "json"                           # json | text
+format = "text"                           # text (default) | json
 
 # Custom Remap rules. Built-in rules (§3.3) are applied first; these extend them.
 [[remap]]
@@ -529,7 +529,7 @@ In-progress downloads in `tmp/` are NOT preserved across restarts — they're cl
 
 ## 10. Logging
 
-Phase 1 ships `log/slog` JSON output (config `log.format = "json"`, message `request`). Per-request log line includes:
+Phase 1 ships `log/slog` structured logging (config `log.format`: `text` default, `json` available; message `request`). Lines are written to stderr with no `time` attribute — the logging daemon (systemd-journald / syslog) timestamps each message on ingest, so an slog-emitted timestamp would only duplicate it. Per-request log line includes:
 - `method`, `url`, `canonical_host`, `path`
 - `outcome` (one of):
   - **Cache outcomes:** `hit` | `miss` | `hit_stale` | `hit_coalesced`

@@ -1415,7 +1415,7 @@ func (c *Config) Defaults() {
 		c.Log.Level = "info"
 	}
 	if c.Log.Format == "" {
-		c.Log.Format = "json"
+		c.Log.Format = "text"
 	}
 
 	// SPEC6 §5.1: [tls_mitm] defaults are applied in Load() via

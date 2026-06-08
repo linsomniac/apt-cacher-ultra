@@ -386,7 +386,7 @@ func TestDefaults(t *testing.T) {
 	if cfg.Log.Level != "info" {
 		t.Errorf("default log.level = %q", cfg.Log.Level)
 	}
-	if cfg.Log.Format != "json" {
+	if cfg.Log.Format != "text" {
 		t.Errorf("default log.format = %q", cfg.Log.Format)
 	}
 	if !reflect.DeepEqual(cfg.Upstream.AllowedHostRegex, DefaultAllowedHostRegex) {

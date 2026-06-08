@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -194,7 +195,7 @@ func run(configPath string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	logger := newLogger(cfg.Log)
+	logger := newLogger(cfg.Log, os.Stderr)
 	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -1410,7 +1411,7 @@ func emitTlsMitmLog(logger *slog.Logger, level, event string, fields map[string]
 	}
 }
 
-func newLogger(c config.LogConfig) *slog.Logger {
+func newLogger(c config.LogConfig, w io.Writer) *slog.Logger {
 	var level slog.Level
 	switch c.Level {
 	case "debug":
@@ -1422,9 +1423,25 @@ func newLogger(c config.LogConfig) *slog.Logger {
 	default:
 		level = slog.LevelInfo
 	}
-	opts := &slog.HandlerOptions{Level: level}
-	if c.Format == "text" {
-		return slog.New(slog.NewTextHandler(os.Stderr, opts))
+	opts := &slog.HandlerOptions{
+		Level: level,
+		// Drop slog's built-in top-level "time" attribute: we log to
+		// stderr, which the logging daemon (systemd-journald / syslog)
+		// already timestamps on ingest, so emitting our own would double
+		// the timestamp on every line. groups check keeps any nested
+		// user attr literally named "time" intact.
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if len(groups) == 0 && a.Key == slog.TimeKey {
+				return slog.Attr{}
+			}
+			return a
+		},
 	}
-	return slog.New(slog.NewJSONHandler(os.Stderr, opts))
+	// "text" is the default (see config.Defaults); "json" is opt-in for
+	// structured/machine ingestion. An empty/unset Format yields text so a
+	// zero-value LogConfig matches the documented default.
+	if c.Format == "json" {
+		return slog.New(slog.NewJSONHandler(w, opts))
+	}
+	return slog.New(slog.NewTextHandler(w, opts))
 }
