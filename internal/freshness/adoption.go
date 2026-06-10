@@ -287,6 +287,16 @@ type AdoptionConfig struct {
 	MemberRetryCount int
 	MemberRetryDelay time.Duration
 
+	// RepairSkippedMembers is the SPEC6_7 §3
+	// [adoption].repair_skipped_members switch (default true in config;
+	// zero-value false here so direct constructions opt in explicitly).
+	// When true, a freshness check that finds an adopted suite
+	// unchanged at upstream re-attempts the snapshot's recorded
+	// integrity-class skips (RepairSkippedMembers method) — bounding
+	// recovery from a stale-mirror adoption to mirror-sync time instead
+	// of the next InRelease publication (up to ~17h on devel suites).
+	RepairSkippedMembers bool
+
 	Logger *slog.Logger
 
 	// now is a test seam; production uses time.Now.
@@ -339,6 +349,11 @@ type Adopter struct {
 	memberRetryCount int
 	memberRetryDelay time.Duration
 	retrySleep       func(ctx context.Context, d time.Duration) error
+
+	// repairSkippedMembers gates the SPEC6_7 §3 freshness-tick repair
+	// pass (see AdoptionConfig.RepairSkippedMembers). The Checker reads
+	// this before spawning a repair goroutine.
+	repairSkippedMembers bool
 
 	logger *slog.Logger
 	now    func() time.Time
@@ -410,6 +425,7 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		memberRetryCount:        cfg.MemberRetryCount,
 		memberRetryDelay:        cfg.MemberRetryDelay,
 		retrySleep:              ctxSleep,
+		repairSkippedMembers:    cfg.RepairSkippedMembers,
 		logger:                  logger,
 		now:                     now,
 	}, nil

@@ -979,6 +979,7 @@ func buildAdopter(
 		TolerateOptionalMemberFailures: cfg.Adoption.TolerateOptionalMemberFailures,
 		MemberRetryCount:               cfg.Adoption.MemberRetryCount,
 		MemberRetryDelay:               cfg.Adoption.MemberRetryDelay.Duration,
+		RepairSkippedMembers:           cfg.Adoption.RepairSkippedMembers,
 		Logger:                         logger,
 	})
 	if err != nil {
@@ -994,6 +995,7 @@ func buildAdopter(
 		"tolerate_optional_member_failures", cfg.Adoption.TolerateOptionalMemberFailures,
 		"member_retry_count", cfg.Adoption.MemberRetryCount,
 		"member_retry_delay", cfg.Adoption.MemberRetryDelay.Duration,
+		"repair_skipped_members", cfg.Adoption.RepairSkippedMembers,
 		"max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,

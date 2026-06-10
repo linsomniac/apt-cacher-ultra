@@ -245,6 +245,19 @@ type AdoptionConfig struct {
 	// behavior. Presence-sensitive: explicit zeros survive Load.
 	MemberRetryCount int      `toml:"member_retry_count"`
 	MemberRetryDelay Duration `toml:"member_retry_delay"`
+
+	// RepairSkippedMembers is the SPEC6_7 §3 freshness-tick repair
+	// switch. When true (default), a freshness check that finds an
+	// adopted suite unchanged at upstream re-attempts the snapshot's
+	// integrity-class skipped members (recorded with their signed
+	// declarations at adoption), promoting each into the snapshot once
+	// the mirror serves the declared bytes. Bounds recovery from a
+	// stale-mirror adoption to mirror-sync time instead of the next
+	// InRelease publication. 4xx-skipped members (permanent publication
+	// artifacts) are never re-attempted. Pre-populated true in
+	// defaultConfig (bool zero-value cannot distinguish "absent" from
+	// "explicit false").
+	RepairSkippedMembers bool `toml:"repair_skipped_members"`
 }
 
 // HotPackagesConfig holds the SPEC3 §5.1 [hot_packages] block. The hot
@@ -739,6 +752,11 @@ func defaultConfig() *Config {
 			// member failures are skipped, not fatal. Operators harden
 			// with explicit `tolerate_optional_member_failures = false`.
 			TolerateOptionalMemberFailures: true,
+			// SPEC6_7 §3: skipped-member repair on by default — the
+			// counterweight to the tolerance above (a tolerated skip
+			// self-heals instead of persisting for the snapshot's
+			// lifetime). Opt out with `repair_skipped_members = false`.
+			RepairSkippedMembers: true,
 		},
 		GC: GCConfig{
 			// SPEC4 §5.1: gc.enabled defaults true. Bool fields must

@@ -114,6 +114,18 @@ var (
 		"outcome",
 	)
 
+	// adoptionMemberRepairsTotal counts SPEC6_7 §3 freshness-tick
+	// repair attempts on integrity-skipped members, by outcome
+	// ("success" = member promoted into the snapshot, "failure" =
+	// fetch/validation/DB failure; retried next tick). Closed 2-value
+	// enum.
+	adoptionMemberRepairsTotal = metrics.NewCounterWithCap(
+		"acu_adoption_member_repairs_total",
+		"Freshness-tick repairs of integrity-skipped members, by outcome (SPEC6_7 §10).",
+		metrics.DefaultMaxSeries,
+		"outcome",
+	)
+
 	adoptionSourcesParsedTotal = metrics.NewCounterWithCap(
 		"acu_adoption_sources_parsed_total",
 		"Sources index files processed during adoption, by outcome (SPEC6_5 §10.3).",

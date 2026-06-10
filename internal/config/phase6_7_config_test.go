@@ -53,6 +53,38 @@ member_retry_delay = "0s"
 	}
 }
 
+// TestLoad_RepairSkippedMembersDefaultTrue: the SPEC6_7 §3 repair pass
+// is on by default (just-works posture); an explicit false survives
+// Load (bool pre-populate pattern).
+func TestLoad_RepairSkippedMembersDefaultTrue(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Adoption.RepairSkippedMembers {
+		t.Error("repair_skipped_members default = false, want true")
+	}
+
+	path2 := writeTOML(t, dir, "config2.toml", `
+[cache]
+dir = "`+dir+`"
+[adoption]
+repair_skipped_members = false
+`)
+	cfg2, err := Load(path2)
+	if err != nil {
+		t.Fatalf("Load explicit-false: %v", err)
+	}
+	if cfg2.Adoption.RepairSkippedMembers {
+		t.Error("explicit repair_skipped_members=false was clobbered to true")
+	}
+}
+
 // TestLoad_MemberRetryNegativeRejected: negative values fail
 // validation with a key-named error.
 func TestLoad_MemberRetryNegativeRejected(t *testing.T) {

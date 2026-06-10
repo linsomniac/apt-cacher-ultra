@@ -13,6 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -415,6 +417,232 @@ func TestAdopter_IndexTargetRetriedThenFatal(t *testing.T) {
 	}
 	if attempts != 2 {
 		t.Errorf("IndexTarget attempts = %d, want 2 (1 + 1 retry)", attempts)
+	}
+}
+
+// adoptWithIntegritySkip drives one tolerant adoption whose
+// Contents-amd64.gz member fails the size gate (stale mirror), leaving
+// a current snapshot with one repairable skip row. Returns the adopter
+// (repair-enabled), the good bytes the member should eventually carry,
+// and the snapshot id.
+func adoptWithIntegritySkip(t *testing.T, env *adoptionTestEnv) (*Adopter, []byte, int64) {
+	t.Helper()
+	ctx := context.Background()
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	goodContents := []byte(strings.Repeat("C", 100))
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+		"Contents-amd64.gz":          goodContents,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.put(base+"main/binary-amd64/Packages", pkgs)
+	env.fetcher.put(base+"Contents-amd64.gz", []byte(strings.Repeat("c", 90))) // stale generation
+
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:                          env.cache,
+		Fetcher:                        env.fetcher,
+		Verifier:                       passThroughVerifier{},
+		HostLimiter:                    hostsem.New(8),
+		TolerateOptionalMemberFailures: true,
+		RepairSkippedMembers:           true,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	snapID := currentSnapshotID(t, env)
+	rows, err := env.cache.ListRepairableSkippedMembers(ctx, snapID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("fixture: repairable rows = %d (err=%v), want 1", len(rows), err)
+	}
+	return ad, goodContents, snapID
+}
+
+// TestRepairSkippedMembers_PromotesMember: once the mirror finishes
+// syncing (the canonical path now serves the declared bytes), the
+// repair pass promotes the member — canonical AND by-hash alias —
+// into the still-current snapshot and consumes the skip row.
+func TestRepairSkippedMembers_PromotesMember(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad, goodContents, snapID := adoptWithIntegritySkip(t, env)
+
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.put(base+"Contents-amd64.gz", goodContents) // mirror synced
+
+	ad.RepairSkippedMembers(ctx, env.suite, snapID)
+
+	if _, err := env.cache.GetSnapshotMember(ctx, snapID, "Contents-amd64.gz"); err != nil {
+		t.Errorf("canonical member missing after repair: %v", err)
+	}
+	alias := "by-hash/SHA256/" + shaOf(goodContents)
+	if _, err := env.cache.GetSnapshotMember(ctx, snapID, alias); err != nil {
+		t.Errorf("by-hash alias missing after repair: %v", err)
+	}
+	rows, err := env.cache.ListRepairableSkippedMembers(ctx, snapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("skip row not consumed: %+v", rows)
+	}
+}
+
+// TestRepairSkippedMembers_FailureBumpsRetryCount: while the mirror is
+// still stale the pass must leave the snapshot untouched and record
+// the attempt.
+func TestRepairSkippedMembers_FailureBumpsRetryCount(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad, _, snapID := adoptWithIntegritySkip(t, env)
+
+	// Mirror still serves the stale generation — no fetcher change.
+	ad.RepairSkippedMembers(ctx, env.suite, snapID)
+
+	if _, err := env.cache.GetSnapshotMember(ctx, snapID, "Contents-amd64.gz"); !errors.Is(err, cache.ErrNotFound) {
+		t.Errorf("member must not be promoted from stale bytes (err=%v)", err)
+	}
+	rows, err := env.cache.ListRepairableSkippedMembers(ctx, snapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("repairable rows = %d, want 1", len(rows))
+	}
+	if rows[0].RetryCount != 1 {
+		t.Errorf("retry_count = %d, want 1", rows[0].RetryCount)
+	}
+}
+
+// TestRepairSkippedMembers_DisabledByConfig: the kill switch must stop
+// the pass before any upstream traffic.
+func TestRepairSkippedMembers_DisabledByConfig(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	_, goodContents, snapID := adoptWithIntegritySkip(t, env)
+
+	off, err := NewAdopter(AdoptionConfig{
+		Cache:                          env.cache,
+		Fetcher:                        env.fetcher,
+		Verifier:                       passThroughVerifier{},
+		HostLimiter:                    hostsem.New(8),
+		TolerateOptionalMemberFailures: true,
+		RepairSkippedMembers:           false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.put(base+"Contents-amd64.gz", goodContents)
+	before := len(env.fetcher.requested())
+
+	off.RepairSkippedMembers(ctx, env.suite, snapID)
+
+	if got := len(env.fetcher.requested()); got != before {
+		t.Errorf("disabled repair pass contacted upstream (%d new fetches)", got-before)
+	}
+	rows, err := env.cache.ListRepairableSkippedMembers(ctx, snapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("skip row count = %d, want 1 (untouched)", len(rows))
+	}
+}
+
+// TestChecker_FreshTickRepairsSkippedMembers is the end-to-end SPEC6_7
+// §3 path: a freshness check that finds the suite unchanged (the
+// steady state for slow-publishing suites) hands the per-suite mutex
+// to a repair goroutine, which heals the degraded snapshot — the
+// recovery the 2026-06-09 incident lacked (it had to wait ~17h for the
+// next InRelease publication).
+func TestChecker_FreshTickRepairsSkippedMembers(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+
+	// The Checker validates upstream against a real HTTP server; the
+	// suite host must be the loopback the test fetcher allowlists.
+	env.suite = SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"}
+
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	goodContents := []byte(strings.Repeat("C", 100))
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+		"Contents-amd64.gz":          goodContents,
+	})
+	base := "http://127.0.0.1/dists/noble/"
+	env.fetcher.put(base+"main/binary-amd64/Packages", pkgs)
+	env.fetcher.put(base+"Contents-amd64.gz", []byte(strings.Repeat("c", 90))) // stale at adoption time
+
+	// Upstream serves the SAME InRelease bytes — freshness sees
+	// "unchanged", the no-adoption steady state.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/dists/noble/InRelease" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(releaseText)
+	}))
+	defer srv.Close()
+
+	// Anchor url_path row with the port-correct upstream URL; the
+	// CommitAdoption anchor sync preserves it on conflict.
+	if err := env.cache.PutURLPath(ctx, cache.URLPath{
+		CanonicalScheme: "http",
+		CanonicalHost:   "127.0.0.1",
+		Path:            "/dists/noble/InRelease",
+		UpstreamURL:     srv.URL + "/dists/noble/InRelease",
+		IsMetadata:      true,
+	}); err != nil {
+		t.Fatalf("PutURLPath: %v", err)
+	}
+
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:                          env.cache,
+		Fetcher:                        env.fetcher,
+		Verifier:                       passThroughVerifier{},
+		HostLimiter:                    hostsem.New(8),
+		TolerateOptionalMemberFailures: true,
+		RepairSkippedMembers:           true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("adoption: %v", err)
+	}
+	snapID := currentSnapshotID(t, env)
+	if rows, _ := env.cache.ListRepairableSkippedMembers(ctx, snapID); len(rows) != 1 {
+		t.Fatalf("fixture: want 1 repairable row, got %d", len(rows))
+	}
+
+	// Mirror syncs; the next freshness tick should repair.
+	env.fetcher.put(base+"Contents-amd64.gz", goodContents)
+
+	checker, err := New(Config{
+		Cache:       env.cache,
+		Fetcher:     newTestFetcher(t),
+		HostLimiter: hostsem.New(8),
+		Adopter:     ad,
+		Logger:      discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New checker: %v", err)
+	}
+	checker.Check(ctx, "http", "127.0.0.1", "/dists/noble")
+	checker.WaitForAdoptions()
+
+	if _, err := env.cache.GetSnapshotMember(ctx, snapID, "Contents-amd64.gz"); err != nil {
+		t.Errorf("member not repaired by fresh tick: %v", err)
+	}
+	rows, err := env.cache.ListRepairableSkippedMembers(ctx, snapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("skip rows remain after tick repair: %+v", rows)
 	}
 }
 

@@ -272,6 +272,18 @@ type adoptionRequest struct {
 	lastmod string
 }
 
+// repairRequest is what checkLocked emits when the suite is CONFIRMED
+// unchanged at upstream (304 or byte-identical 200) and has a current
+// snapshot — the SPEC6_7 §3 repair window. Re-adoption only fires on
+// "changed", so this is the only signal that can heal a snapshot whose
+// adoption skipped integrity-class members; the goroutine in Check
+// routes it to Adopter.RepairSkippedMembers, which no-ops cheaply when
+// the snapshot has no repairable rows (every healthy suite).
+type repairRequest struct {
+	suite      SuiteRef
+	snapshotID int64
+}
+
 // Check runs the SPEC §7.2 algorithm for one suite, synchronously. It
 // returns immediately (without contacting upstream) if another goroutine
 // holds the in-memory check lock or if the suite is still in cooldown.
@@ -294,8 +306,21 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		return
 	}
 
-	req := c.checkLocked(ctx, scheme, host, suitePath)
+	req, repair := c.checkLocked(ctx, scheme, host, suitePath)
 	if req == nil || c.adopter == nil {
+		// SPEC6_7 §3: an unchanged suite with a current snapshot gets a
+		// repair pass instead. Mutex handoff mirrors the adoption
+		// goroutine below; adoptionWg keeps graceful shutdown draining
+		// both kinds of work.
+		if repair != nil && c.adopter != nil && c.adopter.repairSkippedMembers {
+			c.adoptionWg.Add(1)
+			go func() {
+				defer mu.Unlock()
+				defer c.adoptionWg.Done()
+				c.adopter.RepairSkippedMembers(c.lifetimeCtx, repair.suite, repair.snapshotID)
+			}()
+			return
+		}
 		mu.Unlock()
 		return
 	}
@@ -404,7 +429,7 @@ func (c *Checker) WaitForAdoptions() { c.adoptionWg.Wait() }
 // freshness check after a successful adoption would observe "changed"
 // against the stale url_path.blob_hash and thrash the adoption
 // candidate-uniqueness constraint forever.
-func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath string) *adoptionRequest {
+func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath string) (*adoptionRequest, *repairRequest) {
 	now := c.now()
 	nowUnix := now.Unix()
 
@@ -422,14 +447,14 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return nil
+		return nil, nil
 	}
 
 	// Cooldown gate.
 	if cur.LastCheckAt != nil && c.cooldown > 0 {
 		elapsed := now.Sub(time.Unix(*cur.LastCheckAt, 0))
 		if elapsed < c.cooldown {
-			return nil
+			return nil, nil
 		}
 	}
 
@@ -447,9 +472,9 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 	if form == adoptionFormDetached {
 		return c.checkLockedDetached(ctx, cur, suite, now, nowUnix)
 	}
-	req, fellBack := c.checkLockedInline(ctx, cur, suite, now, nowUnix)
+	req, repair, fellBack := c.checkLockedInline(ctx, cur, suite, now, nowUnix)
 	if !fellBack {
-		return req
+		return req, repair
 	}
 	return c.checkLockedDetached(ctx, cur, suite, now, nowUnix)
 }
@@ -485,7 +510,7 @@ func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) ado
 // The body of this function is the SPEC §7.2 inline algorithm; it has
 // been factored out of checkLocked to give detached mode (SPEC2 §7.6.3)
 // a parallel implementation. Mutates *cur in the non-fallback paths.
-func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, bool) {
+func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest, bool) {
 	scheme, host, suitePath := suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath
 
 	// Locate the InRelease url_path row to get the upstream URL plus
@@ -503,13 +528,13 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 			// have a url_path row to attempt the GET, try the symmetric
 			// detached lookup directly.
 			if c.hasReleaseURLRow(ctx, scheme, host, suitePath) {
-				return nil, true
+				return nil, nil, true
 			}
 			c.logger.Debug("freshness: no cached InRelease url_path, skipping",
 				"canonical_host", host,
 				"suite_path", suitePath,
 			)
-			return nil, false
+			return nil, nil, false
 		}
 		// SPEC2 §7.4 freshness recovery. The suite HAS a current
 		// snapshot but its InRelease anchor row was reaped (SPEC4 §5 GC
@@ -529,7 +554,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return nil, false
+		return nil, nil, false
 	}
 
 	// Determine the cached InRelease hash for the body comparison.
@@ -558,7 +583,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 				"canonical_host", host,
 				"suite_path", suitePath,
 			)
-			return nil, false
+			return nil, nil, false
 		}
 		cachedHash = *urlRow.BlobHash
 	}
@@ -589,7 +614,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return nil, false
+		return nil, nil, false
 	}
 	defer release()
 
@@ -604,7 +629,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 				"canonical_host", host,
 				"suite_path", suitePath,
 			)
-			return nil, true
+			return nil, nil, true
 		}
 
 		// SPEC §7.2: bump last_check_at on failure to space out the
@@ -626,7 +651,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 			"result", "failed",
 		)
 		freshnessCheckTotal.Inc("failed", host)
-		return nil, false
+		return nil, nil, false
 	}
 
 	cur.LastCheckAt = &nowUnix
@@ -709,7 +734,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 				"err", perr,
 			)
 		}
-		return nil, false
+		return nil, nil, false
 	}
 
 	if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
@@ -728,7 +753,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 		"upstream_status", res.Status,
 	)
 	freshnessCheckTotal.Inc(result, host)
-	return req, false
+	return req, repairIfUnchanged(result, suite, cur), false
 }
 
 // checkLockedDetached runs the SPEC2 §7.6.3 detached-form freshness
@@ -741,7 +766,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 //   - On observed change, fetch Release.gpg in a second call so the
 //     Adopter can verify the detached signature.
 //   - The adoptionRequest carries form=detached + both bodies.
-func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) *adoptionRequest {
+func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest) {
 	scheme, host, suitePath := suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath
 
 	releasePath := suitePath + releaseFilename
@@ -759,7 +784,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 				"canonical_host", host,
 				"suite_path", suitePath,
 			)
-			return nil
+			return nil, nil
 		}
 		relHash := c.snapshotAnchorHash(ctx, *cur.CurrentSnapshotID, releaseFilename)
 		releaseURL = c.reconstructAnchor(ctx, scheme, host, suitePath, releasePath, *cur.CurrentSnapshotID, relHash, nowUnix)
@@ -769,7 +794,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return nil
+		return nil, nil
 	}
 	releaseGPGURL, err := c.cache.LookupURL(ctx, scheme, host, releaseGPGPath)
 	switch {
@@ -779,7 +804,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 				"canonical_host", host,
 				"suite_path", suitePath,
 			)
-			return nil
+			return nil, nil
 		}
 		gpgHash := c.snapshotAnchorHash(ctx, *cur.CurrentSnapshotID, releaseGPGFilename)
 		releaseGPGURL = c.reconstructAnchor(ctx, scheme, host, suitePath, releaseGPGPath, *cur.CurrentSnapshotID, gpgHash, nowUnix)
@@ -789,7 +814,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return nil
+		return nil, nil
 	}
 
 	// Determine the cached Release hash for body comparison.
@@ -817,7 +842,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 				"canonical_host", host,
 				"suite_path", suitePath,
 			)
-			return nil
+			return nil, nil
 		}
 		cachedHash = *releaseURL.BlobHash
 	}
@@ -841,7 +866,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return nil
+		return nil, nil
 	}
 	defer releaseSlot()
 
@@ -863,7 +888,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 			"result", "failed",
 		)
 		freshnessCheckTotal.Inc("failed", host)
-		return nil
+		return nil, nil
 	}
 
 	cur.LastCheckAt = &nowUnix
@@ -951,7 +976,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 				"err", perr,
 			)
 		}
-		return nil
+		return nil, nil
 	}
 
 	if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
@@ -970,7 +995,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 		"upstream_status", res.Status,
 	)
 	freshnessCheckTotal.Inc(result, host)
-	return req
+	return req, repairIfUnchanged(result, suite, cur)
 }
 
 // reconstructAnchor synthesizes — and best-effort re-seeds — a reaped
@@ -1088,6 +1113,22 @@ func isStatusNotFound(err error) bool {
 		return false
 	}
 	return se.Code == 404
+}
+
+// repairIfUnchanged builds the SPEC6_7 §3 repair signal: the check
+// CONFIRMED upstream is unchanged ("not_modified" 304 or byte-identical
+// "unchanged" 200) and the suite has a current snapshot. Any other
+// result returns nil — "changed" routes to adoption (whose snapshot
+// supersedes the old skip records), and failures prove nothing about
+// upstream having synced.
+func repairIfUnchanged(result string, suite SuiteRef, cur *cache.SuiteFreshness) *repairRequest {
+	if result != "not_modified" && result != "unchanged" {
+		return nil
+	}
+	if cur.CurrentSnapshotID == nil {
+		return nil
+	}
+	return &repairRequest{suite: suite, snapshotID: *cur.CurrentSnapshotID}
 }
 
 // suiteKey is the in-memory lock map key. The pipe separator matches the
