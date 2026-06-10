@@ -123,12 +123,17 @@ allow_short_keyid     = true
 # where /etc/apt/* is unpopulated.
 # keyring_dirs        = ["/opt/extra-keyrings"]
 
-# SPEC6_5 §5.1 per-arch adoption allowlist. Empty (default) adopts every
-# Release-listed Packages / Sources index regardless of architecture —
-# the same behavior as Phase 6. Non-empty restricts adoption to the
-# listed binary-<arch>/ and source/ index members; the pseudo-arch
-# "source" controls Sources adoption. Saves disk on caches whose
-# clients only fetch a subset of the upstream's published arches.
+# SPEC6_5 §5.1 / SPEC6_7 §7 per-arch adoption allowlist. Empty
+# (default) adopts every Release-listed per-arch index regardless of
+# architecture. Non-empty restricts adoption to the listed
+# architectures' members: binary-<arch>/Packages*, source/Sources*
+# (the pseudo-arch "source" controls Sources adoption), and the
+# per-arch optional members Contents-<arch>*, cnf/Commands-<arch>*,
+# and dep11/Components-<arch>.yml*. Saves disk and removes the bulk of
+# the guaranteed-404 fetch attempts on Ubuntu suites (the main archive
+# declares foreign-arch members only ports.ubuntu.com serves). The
+# pseudo-arch "all" (arch-independent content, e.g. Debian's
+# Contents-all) is never filtered.
 #
 # Use the literal Debian architecture name: "amd64", "arm64", "armhf",
 # "i386", "ppc64el", "s390x", etc. The validator rejects uppercase,
@@ -140,6 +145,49 @@ allow_short_keyid     = true
 #   architectures = ["amd64", "arm64"]            # mixed binary, no source
 #   architectures = ["amd64", "arm64", "source"]  # binary + source
 architectures         = []
+
+# SPEC6_7 §6 served-index guard. Architectures (or "source") whose
+# index groups MUST be served for a snapshot to commit: if every
+# declared variant of a required arch's Packages*/Sources* group is
+# missing upstream (e.g. a transient mirror 404), the adoption fails
+# and the previous coherent snapshot keeps serving — instead of
+# committing a snapshot that would hard-fail `apt update` for that
+# arch until the next InRelease publication. One served variant
+# satisfies a group, so upstream's uncompressed decoy declarations
+# stay harmless. Empty (default) disables the guard. Must be a subset
+# of `architectures` when that allowlist is set. Recommended:
+# the arches your clients actually run, e.g. ["amd64"].
+required_architectures = []
+
+# REC 1 (SPEC6_5): when true (the default), an integrity/availability
+# failure on a non-IndexTarget member (Contents-*, dep11, i18n — files
+# apt does not need for `apt update`/`apt install`) skips that member
+# instead of failing the whole suite adoption. IndexTarget members
+# (Packages*/Sources*) are always fatal-on-failure. A skipped member
+# is never served — clients get 404 until it is repaired (below) or
+# the next InRelease adoption. false = strict all-or-nothing adoption.
+tolerate_optional_member_failures = true
+
+# SPEC6_7 §1 in-adoption member retry. A member fetch that fails its
+# integrity check (the signature of a round-robin mirror serving the
+# previous publication generation mid-sync) is re-attempted after
+# member_retry_delay, up to member_retry_count extra attempts. Each
+# attempt re-probes the content-addressed by-hash URL first, which
+# heals as soon as the lagging mirror backend syncs. 404/410-skipped
+# members (publication artifacts) are never retried.
+# member_retry_count = 0 restores single-attempt adoption.
+member_retry_count    = 2
+member_retry_delay    = "30s"
+
+# SPEC6_7 §3 skipped-member repair. When true (the default), a
+# freshness check that finds an adopted suite unchanged at upstream
+# re-attempts the snapshot's integrity-skipped members (recorded with
+# their signed declarations at adoption) and promotes each into the
+# snapshot once the mirror serves the declared bytes — bounding
+# recovery from a degraded adoption to mirror-sync time instead of
+# the next InRelease publication (up to ~17h on slow-publishing
+# suites). 4xx-skipped members are never re-attempted.
+repair_skipped_members = true
 
 # SPEC3 §7.5 hot-deb prefetch wall-clock guard. After a snapshot flip,
 # adoption proactively warms the (Package, Architecture) tuples that
