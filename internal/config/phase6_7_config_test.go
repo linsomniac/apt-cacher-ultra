@@ -85,6 +85,64 @@ repair_skipped_members = false
 	}
 }
 
+// TestLoad_RequiredArchitectures: SPEC6_7 §6 validation — shape rules
+// match [adoption].architectures; when the architectures allowlist is
+// set, required_architectures must be a subset of it (a required arch
+// the filter pre-skips would fail EVERY adoption).
+func TestLoad_RequiredArchitectures(t *testing.T) {
+	load := func(t *testing.T, adoption string) (*Config, error) {
+		t.Helper()
+		dir := t.TempDir()
+		path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[adoption]
+`+adoption+`
+`)
+		return Load(path)
+	}
+
+	t.Run("default_empty", func(t *testing.T) {
+		cfg, err := load(t, "")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(cfg.Adoption.RequiredArchitectures) != 0 {
+			t.Errorf("required_architectures default = %v, want empty", cfg.Adoption.RequiredArchitectures)
+		}
+	})
+	t.Run("valid_standalone", func(t *testing.T) {
+		cfg, err := load(t, `required_architectures = ["amd64", "source"]`)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(cfg.Adoption.RequiredArchitectures) != 2 {
+			t.Errorf("got %v", cfg.Adoption.RequiredArchitectures)
+		}
+	})
+	t.Run("valid_subset_of_allowlist", func(t *testing.T) {
+		if _, err := load(t, `architectures = ["amd64", "i386"]
+required_architectures = ["amd64"]`); err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+	})
+	t.Run("rejects_non_subset_of_allowlist", func(t *testing.T) {
+		_, err := load(t, `architectures = ["amd64"]
+required_architectures = ["arm64"]`)
+		if err == nil {
+			t.Fatal("required arch outside allowlist accepted; want error")
+		}
+		if !strings.Contains(err.Error(), "required_architectures") {
+			t.Errorf("error %q does not name the key", err)
+		}
+	})
+	t.Run("rejects_invalid_shape", func(t *testing.T) {
+		if _, err := load(t, `required_architectures = ["AMD64"]`); err == nil {
+			t.Fatal("uppercase arch accepted; want error")
+		}
+	})
+}
+
 // TestLoad_MemberRetryNegativeRejected: negative values fail
 // validation with a key-named error.
 func TestLoad_MemberRetryNegativeRejected(t *testing.T) {

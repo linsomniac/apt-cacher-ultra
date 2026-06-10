@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -199,6 +200,42 @@ func isIndexTarget(p string) bool {
 	return indexTargetRE.MatchString(p)
 }
 
+// indexTargetGroupRE matches the BASE IndexTarget shapes — a per-arch
+// Packages or per-component Sources file with any (or no) compression
+// codec — but NOT the .diff/Index pdiff manifests. Capture 1 is the
+// path tail through the basename ("binary-<arch>/Packages" or
+// "source/Sources"); capture 2 is the arch (empty for source).
+var indexTargetGroupRE = regexp.MustCompile(
+	`(?:^|/)(binary-([a-z][a-z0-9]*)/Packages|source/Sources)(?:\.[a-z0-9]+)?$`)
+
+// indexTargetGroup classifies a Release member path into its SPEC6_7
+// §6 index-target GROUP: all compression variants of one logical index
+// collapse to a single key (the path minus codec suffix), because an
+// archive that serves Packages.xz but declares an uncompressed
+// Packages it never publishes is healthy — the group is "served" iff
+// at least one variant fetched. pdiff Index manifests deliberately
+// return ok=false: a present patch manifest with no actual index must
+// not count as the index being served.
+//
+// Returns (group key, arch, true) for base IndexTarget shapes — arch
+// is the pseudo-arch "source" for Sources groups — and ("", "", false)
+// for everything else.
+func indexTargetGroup(p string) (group, arch string, ok bool) {
+	m := indexTargetGroupRE.FindStringSubmatchIndex(p)
+	if m == nil {
+		return "", "", false
+	}
+	// m[2]:m[3] bounds capture 1; the group key runs from the path
+	// start through capture 1's end (i.e. the codec suffix stripped).
+	group = p[:m[3]]
+	if m[4] >= 0 {
+		arch = p[m[4]:m[5]]
+	} else {
+		arch = "source"
+	}
+	return group, arch, true
+}
+
 // errAdoptionMemberSkipped is the in-package signal from adoptMember
 // that the upstream returned 4xx for a declared Release member. Step 5
 // of runShared catches this with errors.Is, increments skippedCount,
@@ -297,6 +334,22 @@ type AdoptionConfig struct {
 	// of the next InRelease publication (up to ~17h on devel suites).
 	RepairSkippedMembers bool
 
+	// RequiredArchitectures is the SPEC6_7 §6
+	// [adoption].required_architectures guard: arches (or the
+	// pseudo-arch "source") whose IndexTarget groups MUST be served for
+	// a snapshot to commit. When a required arch's group has declared
+	// variants but ZERO fetched (e.g. a transient mirror 404 across all
+	// its Packages* variants), the adoption FAILS — deferring to the
+	// next freshness tick while the previous coherent snapshot keeps
+	// serving — instead of committing a snapshot that would hard-fail
+	// `apt update` for that arch until the next InRelease publication.
+	// Empty (default) preserves prior behavior: upstreams legitimately
+	// declare arches they never serve (Ubuntu's main archive declares
+	// armhf/ppc64el/… served only by ports.ubuntu.com), so only the
+	// operator can say which arches their fleet needs. Config validates
+	// it is a subset of Architectures when that allowlist is set.
+	RequiredArchitectures []string
+
 	Logger *slog.Logger
 
 	// now is a test seam; production uses time.Now.
@@ -355,6 +408,10 @@ type Adopter struct {
 	// this before spawning a repair goroutine.
 	repairSkippedMembers bool
 
+	// requiredArchitectures is the precomputed SPEC6_7 §6 lookup set
+	// (see AdoptionConfig.RequiredArchitectures). nil = guard inert.
+	requiredArchitectures map[string]struct{}
+
 	logger *slog.Logger
 	now    func() time.Time
 }
@@ -411,6 +468,13 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 			allowlist[arch] = struct{}{}
 		}
 	}
+	var required map[string]struct{}
+	if len(cfg.RequiredArchitectures) > 0 {
+		required = make(map[string]struct{}, len(cfg.RequiredArchitectures))
+		for _, arch := range cfg.RequiredArchitectures {
+			required[arch] = struct{}{}
+		}
+	}
 	return &Adopter{
 		cache:                   cfg.Cache,
 		fetcher:                 cfg.Fetcher,
@@ -426,6 +490,7 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		memberRetryDelay:        cfg.MemberRetryDelay,
 		retrySleep:              ctxSleep,
 		repairSkippedMembers:    cfg.RepairSkippedMembers,
+		requiredArchitectures:   required,
 		logger:                  logger,
 		now:                     now,
 	}, nil
@@ -880,6 +945,17 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// publication artifacts (declared but never served) and re-fetching
 	// them every tick would be guaranteed-failure upstream traffic.
 	var integritySkipped []cache.SkippedMember
+	// SPEC6_7 §6: per-group declared/fetched bookkeeping for the
+	// required-architectures guard. Tracked only for required arches;
+	// nil maps when the guard is inert.
+	var (
+		requiredGroupDeclared map[string]int
+		requiredGroupFetched  map[string]bool
+	)
+	if len(a.requiredArchitectures) > 0 {
+		requiredGroupDeclared = make(map[string]int)
+		requiredGroupFetched = make(map[string]bool)
+	}
 	for _, m := range members {
 		// SPEC6_5 §7.2: per-arch / per-source index filter. Inert when
 		// the allowlist is empty (Phase 6 default). Skipped members never
@@ -899,6 +975,20 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 					adoptionMembersSkippedTotal.Inc("arch_not_in_allowlist")
 					skippedCount++
 					continue
+				}
+			}
+		}
+
+		// SPEC6_7 §6: count declared variants per required-arch index
+		// group. Placed after the allowlist filter — config validation
+		// guarantees required ⊆ allowlist when both are set, so a
+		// required arch's members are never filtered out above.
+		var requiredGroup string
+		if requiredGroupDeclared != nil {
+			if group, arch, ok := indexTargetGroup(m.Path); ok {
+				if _, want := a.requiredArchitectures[arch]; want {
+					requiredGroup = group
+					requiredGroupDeclared[group]++
 				}
 			}
 		}
@@ -959,10 +1049,43 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			DeclaredSHA256: m.SHA256,
 		})
 		fetchedMembers = append(fetchedMembers, m)
+		if requiredGroup != "" {
+			requiredGroupFetched[requiredGroup] = true
+		}
 		tracker.Add(blobHash)
 		a.heartbeat(ctx, suite.CanonicalHost, snapshotID, tracker)
 	}
 	fetchedCount := len(fetchedMembers)
+
+	// SPEC6_7 §6: a required arch's index group with declared variants
+	// but ZERO fetched would commit a snapshot that hard-fails
+	// `apt update` for that arch until the next InRelease publication.
+	// Fail the adoption instead — the previous coherent snapshot keeps
+	// serving and the next freshness tick re-attempts (upstream still
+	// differs, so the check observes "changed" again). Groups are
+	// checked in sorted order so the error is deterministic when more
+	// than one is missing.
+	if len(requiredGroupDeclared) > 0 {
+		groups := make([]string, 0, len(requiredGroupDeclared))
+		for g := range requiredGroupDeclared {
+			groups = append(groups, g)
+		}
+		sort.Strings(groups)
+		for _, g := range groups {
+			if requiredGroupFetched[g] {
+				continue
+			}
+			a.logger.Warn("adoption_required_index_target_missing",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"group", g,
+				"declared_variants", requiredGroupDeclared[g],
+			)
+			return newMemberErr(ErrAdoptionMemberFetchFailed, g,
+				fmt.Sprintf("required-architecture index target: all %d declared variants missing",
+					requiredGroupDeclared[g]))
+		}
+	}
 
 	// SPEC2 §7.5.2 (Phase 2 clarification): an adoption where zero
 	// declared members were successfully fetched is still a failure —
@@ -1447,15 +1570,27 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 		// this thing".
 		var se *fetch.StatusError
 		if errors.As(err, &se) && (se.Code == 404 || se.Code == 410) {
+			// SPEC6_7 §6: a 404-skipped IndexTarget gets its own reason
+			// value. Skipping it is unchanged (Ubuntu's main archive
+			// declares foreign-arch Packages* that only ports.ubuntu.com
+			// serves), but the signal is categorically worse than an
+			// optional-member artifact — for an arch clients actually
+			// use it means `apt update` hard-fails for the snapshot's
+			// lifetime — so operators need to alert on it separately
+			// (and opt into the required_architectures guard).
+			reason := "4xx"
+			if isIndexTarget(m.Path) {
+				reason = "4xx_index_target"
+			}
 			a.logger.Warn("adoption_member_skipped",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"path", m.Path,
 				"declared_sha256", m.SHA256,
 				"upstream_status", se.Code,
-				"reason", "4xx",
+				"reason", reason,
 			)
-			adoptionMembersSkippedTotal.Inc("4xx")
+			adoptionMembersSkippedTotal.Inc(reason)
 			return "", errAdoptionMemberSkipped
 		}
 		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,

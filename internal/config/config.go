@@ -258,6 +258,23 @@ type AdoptionConfig struct {
 	// defaultConfig (bool zero-value cannot distinguish "absent" from
 	// "explicit false").
 	RepairSkippedMembers bool `toml:"repair_skipped_members"`
+
+	// RequiredArchitectures is the SPEC6_7 §6 served-index guard:
+	// arches (or the pseudo-arch "source") whose per-arch index groups
+	// (Packages*/Sources*, any codec) MUST have at least one variant
+	// fetched for an adoption to commit. A required arch whose group is
+	// declared but entirely missing — e.g. a transient mirror 404 —
+	// fails the adoption, so the previous coherent snapshot keeps
+	// serving instead of a snapshot that would hard-fail `apt update`
+	// for that arch until the next InRelease publication. Empty
+	// (default) disables the guard: upstreams legitimately declare
+	// arches they never serve (Ubuntu's main archive declares armhf/
+	// ppc64el/… served only by ports.ubuntu.com), so requiring is a
+	// per-deployment decision. Same per-entry shape rules as
+	// architectures; must be a subset of architectures when that
+	// allowlist is set (a required-but-filtered arch would fail every
+	// adoption by construction).
+	RequiredArchitectures []string `toml:"required_architectures"`
 }
 
 // HotPackagesConfig holds the SPEC3 §5.1 [hot_packages] block. The hot
@@ -901,6 +918,31 @@ func (c *Config) Validate() error {
 	}
 	if c.Adoption.MemberRetryDelay.Duration < 0 {
 		errs = append(errs, errors.New("adoption.member_retry_delay must not be negative"))
+	}
+
+	// SPEC6_7 §6: required_architectures — same shape rules as
+	// architectures, plus the subset rule: a required arch the §7.2
+	// filter pre-skips would make every adoption of every suite that
+	// declares it fail by construction, so reject the contradiction at
+	// load time.
+	if len(c.Adoption.RequiredArchitectures) > MaxArchitecturesEntries {
+		errs = append(errs, fmt.Errorf("adoption.required_architectures: architectures_too_many (%d entries; max %d)",
+			len(c.Adoption.RequiredArchitectures), MaxArchitecturesEntries))
+	}
+	allowedArches := make(map[string]struct{}, len(c.Adoption.Architectures))
+	for _, arch := range c.Adoption.Architectures {
+		allowedArches[arch] = struct{}{}
+	}
+	for _, arch := range c.Adoption.RequiredArchitectures {
+		if !architectureNameRE.MatchString(arch) {
+			errs = append(errs, fmt.Errorf("adoption.required_architectures: architectures_invalid_value %q (expected lowercase letters/digits, must start with a letter)", arch))
+			continue
+		}
+		if len(c.Adoption.Architectures) > 0 {
+			if _, ok := allowedArches[arch]; !ok {
+				errs = append(errs, fmt.Errorf("adoption.required_architectures: %q is not in adoption.architectures — a required arch the filter skips would fail every adoption", arch))
+			}
+		}
 	}
 
 	// SPEC2 §5.2: [adoption].keyring_dirs entries must be non-empty

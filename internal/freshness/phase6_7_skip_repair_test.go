@@ -646,6 +646,219 @@ func TestChecker_FreshTickRepairsSkippedMembers(t *testing.T) {
 	}
 }
 
+// TestIndexTargetGroup pins the SPEC6_7 §6 group classifier: an
+// IndexTarget's compression variants collapse to one group key (the
+// path minus codec suffix); pdiff Index manifests and non-IndexTargets
+// are not group members (a present pdiff with no actual index must not
+// count as "the index is served").
+func TestIndexTargetGroup(t *testing.T) {
+	cases := []struct {
+		path, group, arch string
+		ok                bool
+	}{
+		{"main/binary-amd64/Packages", "main/binary-amd64/Packages", "amd64", true},
+		{"main/binary-amd64/Packages.gz", "main/binary-amd64/Packages", "amd64", true},
+		{"main/binary-amd64/Packages.xz", "main/binary-amd64/Packages", "amd64", true},
+		{"universe/binary-armhf/Packages.zst", "universe/binary-armhf/Packages", "armhf", true},
+		{"main/source/Sources.gz", "main/source/Sources", "source", true},
+		{"main/binary-amd64/Packages.diff/Index", "", "", false},
+		{"main/source/Sources.diff/Index", "", "", false},
+		{"Contents-amd64.gz", "", "", false},
+		{"main/dep11/Components-amd64.yml.gz", "", "", false},
+		{"InRelease", "", "", false},
+	}
+	for _, tc := range cases {
+		group, arch, ok := indexTargetGroup(tc.path)
+		if group != tc.group || arch != tc.arch || ok != tc.ok {
+			t.Errorf("indexTargetGroup(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				tc.path, group, arch, ok, tc.group, tc.arch, tc.ok)
+		}
+	}
+}
+
+// newRequiredArchAdopter builds a tolerant adopter requiring the given
+// architectures' IndexTarget groups to be served.
+func newRequiredArchAdopter(t *testing.T, env *adoptionTestEnv, required []string) *Adopter {
+	t.Helper()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:                          env.cache,
+		Fetcher:                        env.fetcher,
+		Verifier:                       passThroughVerifier{},
+		HostLimiter:                    hostsem.New(8),
+		TolerateOptionalMemberFailures: true,
+		RequiredArchitectures:          required,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	return ad
+}
+
+// TestAdopter_RequiredArchGroupAllMissingDefersAdoption: when EVERY
+// declared variant of a required arch's index group is missing, the
+// adoption must fail (defer) — committing would hard-fail `apt update`
+// for every client of that arch until the next InRelease publication.
+// This closes the prod-observed hole where the 4xx-skip path applied
+// to IndexTargets too.
+func TestAdopter_RequiredArchGroupAllMissingDefersAdoption(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newRequiredArchAdopter(t, env, []string{"amd64"})
+
+	contents := []byte("contents bytes")
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages":    []byte("decoy"),
+		"main/binary-amd64/Packages.gz": []byte("decoy gz"),
+		"Contents-amd64.gz":             contents,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.fail404(base + "main/binary-amd64/Packages")
+	env.fetcher.fail404(base + "main/binary-amd64/Packages.gz")
+	env.fetcher.put(base+"Contents-amd64.gz", contents)
+
+	err := ad.Run(ctx, env.suite, releaseText, "", "")
+	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
+		t.Fatalf("want ErrAdoptionMemberFetchFailed (deferred), got %v", err)
+	}
+	memberPath, detail := memberErrorFields(err)
+	if memberPath != "main/binary-amd64/Packages" {
+		t.Errorf("failing member path = %q, want the group key", memberPath)
+	}
+	if !strings.Contains(detail, "required") {
+		t.Errorf("detail %q should name the required-arch rule", detail)
+	}
+	// No snapshot adopted — the previous (here: none) keeps serving.
+	sf, err := env.cache.GetSuiteFreshness(ctx,
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err == nil && sf.CurrentSnapshotID != nil {
+		t.Errorf("degraded snapshot was adopted (id=%d)", *sf.CurrentSnapshotID)
+	}
+}
+
+// TestAdopter_RequiredArchGroupOneVariantSuffices: Ubuntu declares
+// uncompressed Packages it never serves; one served variant proves the
+// group and the sibling 404s stay harmless skips.
+func TestAdopter_RequiredArchGroupOneVariantSuffices(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newRequiredArchAdopter(t, env, []string{"amd64"})
+
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages":    pkgs, // declared, 404s (decoy)
+		"main/binary-amd64/Packages.gz": gzipBytes(pkgs),
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.fail404(base + "main/binary-amd64/Packages")
+	env.fetcher.put(base+"main/binary-amd64/Packages.gz", gzipBytes(pkgs))
+
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("one served variant must satisfy the group: %v", err)
+	}
+}
+
+// TestAdopter_RequiredArchIgnoresForeignGroups: a foreign arch the
+// operator did NOT require may be entirely absent (the ports-only
+// publication artifact) without failing adoption.
+func TestAdopter_RequiredArchIgnoresForeignGroups(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newRequiredArchAdopter(t, env, []string{"amd64"})
+
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+		"main/binary-armhf/Packages": []byte("ports-only"),
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.put(base+"main/binary-amd64/Packages", pkgs)
+	env.fetcher.fail404(base + "main/binary-armhf/Packages")
+
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("foreign-arch absence must not defer adoption: %v", err)
+	}
+}
+
+// TestAdopter_RequiredArchGuardIsOptIn: with no required_architectures
+// the pre-SPEC6_7 behavior holds — even a fully-missing amd64 group
+// adopts (with package coverage dropped). The guard is opt-in because
+// upstreams legitimately declare arches they never serve, and the
+// operator is the only party who knows which arches their fleet needs.
+func TestAdopter_RequiredArchGuardIsOptIn(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newTolerantAdopter(t, env)
+
+	contents := []byte("contents bytes")
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": []byte("never served"),
+		"Contents-amd64.gz":          contents,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.fail404(base + "main/binary-amd64/Packages")
+	env.fetcher.put(base+"Contents-amd64.gz", contents)
+
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("without required_architectures the guard must not fire: %v", err)
+	}
+}
+
+// TestAdopter_4xxIndexTargetSkipReason: a 404-skipped IndexTarget is a
+// categorically worse signal than a 404-skipped optional member — it
+// gets its own reason value so operators can alert on it without
+// drowning in Ubuntu's ~160 ordinary publication-artifact skips.
+func TestAdopter_4xxIndexTargetSkipReason(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+
+	var logBuf bytes.Buffer
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:                          env.cache,
+		Fetcher:                        env.fetcher,
+		Verifier:                       passThroughVerifier{},
+		HostLimiter:                    hostsem.New(8),
+		TolerateOptionalMemberFailures: true,
+		Logger:                         slog.New(slog.NewTextHandler(&logBuf, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+		"main/binary-armhf/Packages": []byte("ports-only"),
+		"Contents-amd64":             []byte("uncompressed decoy"),
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.put(base+"main/binary-amd64/Packages", pkgs)
+	env.fetcher.fail404(base + "main/binary-armhf/Packages")
+	env.fetcher.fail404(base + "Contents-amd64")
+
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := logBuf.String()
+	var armhfLine, contentsLine string
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "msg=adoption_member_skipped") {
+			continue
+		}
+		if strings.Contains(line, "path=main/binary-armhf/Packages") {
+			armhfLine = line
+		}
+		if strings.Contains(line, "path=Contents-amd64 ") {
+			contentsLine = line
+		}
+	}
+	if !strings.Contains(armhfLine, "reason=4xx_index_target") {
+		t.Errorf("IndexTarget 404 skip should carry reason=4xx_index_target: %s", armhfLine)
+	}
+	if !strings.Contains(contentsLine, "reason=4xx") || strings.Contains(contentsLine, "index_target") {
+		t.Errorf("optional 404 skip should keep reason=4xx: %s", contentsLine)
+	}
+}
+
 func TestNewAdopter_RejectsNegativeRetryConfig(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	if _, err := NewAdopter(AdoptionConfig{
