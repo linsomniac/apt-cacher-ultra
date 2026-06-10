@@ -58,7 +58,7 @@ func TestChaos_SnapshotGC_DisplacementDuringTick_VariantOne(t *testing.T) {
 			if err != nil {
 				t.Fatalf("InsertCandidateSnapshot S1: %v", err)
 			}
-			if err := c.CommitAdoption(ctx, s1, nil, nil, nil, false); err != nil {
+			if err := c.CommitAdoption(ctx, s1, nil, nil, nil, nil, false); err != nil {
 				t.Fatalf("CommitAdoption S1: %v", err)
 			}
 			s2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
@@ -86,7 +86,7 @@ func TestChaos_SnapshotGC_DisplacementDuringTick_VariantOne(t *testing.T) {
 			}()
 			go func() {
 				defer wg.Done()
-				commitErr = c.CommitAdoption(ctx, s2, nil, nil, nil, false)
+				commitErr = c.CommitAdoption(ctx, s2, nil, nil, nil, nil, false)
 			}()
 			wg.Wait()
 
@@ -175,7 +175,7 @@ func TestChaos_SnapshotGC_HeartbeatLivenessRace_VariantTwo(t *testing.T) {
 			}()
 			go func() {
 				defer wg.Done()
-				commitErr = c.CommitAdoption(ctx, s, nil, nil, nil, false)
+				commitErr = c.CommitAdoption(ctx, s, nil, nil, nil, nil, false)
 			}()
 			go func() {
 				defer wg.Done()

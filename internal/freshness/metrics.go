@@ -102,6 +102,18 @@ var (
 		"reason",
 	)
 
+	// adoptionMemberRetriesTotal counts SPEC6_7 §1 in-adoption member
+	// retries by outcome: "success" = a retry attempt recovered the
+	// member (the stale-mirror window closed in time), "exhausted" =
+	// every retry failed and the member proceeded down the pre-retry
+	// path (tolerant skip or fatal). Closed 2-value enum.
+	adoptionMemberRetriesTotal = metrics.NewCounterWithCap(
+		"acu_adoption_member_retries_total",
+		"In-adoption member fetch retries, by outcome (SPEC6_7 §10).",
+		metrics.DefaultMaxSeries,
+		"outcome",
+	)
+
 	adoptionSourcesParsedTotal = metrics.NewCounterWithCap(
 		"acu_adoption_sources_parsed_total",
 		"Sources index files processed during adoption, by outcome (SPEC6_5 §10.3).",

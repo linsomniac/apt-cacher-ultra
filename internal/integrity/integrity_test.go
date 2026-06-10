@@ -88,7 +88,7 @@ func commitSnapshot(
 	if err != nil {
 		t.Fatalf("InsertCandidateSnapshot: %v", err)
 	}
-	if err := c.CommitAdoption(ctx, id, members, pkgs, nil, false); err != nil {
+	if err := c.CommitAdoption(ctx, id, members, nil, pkgs, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 	return id
@@ -290,8 +290,9 @@ func TestScanOnce_DisplacedSnapshotNotScanned(t *testing.T) {
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: relNew, DeclaredSHA256: relNew},
 			{Path: "main/binary-amd64/Packages", BlobHash: pkgNew, DeclaredSHA256: pkgNew},
-		}, nil, nil, false,
-	); err != nil {
+		}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatalf("CommitAdoption v2: %v", err)
 	}
 

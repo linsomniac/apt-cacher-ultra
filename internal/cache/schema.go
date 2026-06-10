@@ -15,7 +15,7 @@ import (
 // expects. Forward-only: a database tagged with a higher version is treated
 // as written by a newer binary and the cache refuses to open it. SPEC §4.3,
 // SPEC2 §4.3, SPEC3 §4.3, SPEC4 §4.3.
-const CurrentSchemaVersion = 4
+const CurrentSchemaVersion = 5
 
 // migrations is indexed such that migrations[N] migrates the database from
 // schema version N to N+1. migrations[0] (v0 → v1) creates the entire
@@ -239,6 +239,34 @@ CREATE INDEX idx_blob_gc
 CREATE INDEX idx_url_path_blob
   ON url_path(blob_hash)
  WHERE blob_hash IS NOT NULL;
+`,
+	// v4 → v5: snapshot_skipped_member — the SPEC6_7 record of Release
+	// members an adoption declared but did not fetch (4xx publication
+	// artifacts, optional-member integrity skips). Pure additive DDL.
+	//
+	// The repair pass (SPEC6_7 §3) re-attempts rows whose reason is
+	// 'optional_member_integrity' on freshness ticks; on success the
+	// member is promoted into snapshot_member and its row here is
+	// deleted. Rows die with their snapshot (snapshot-GC cascade).
+	//
+	// AIDEV-NOTE: declared_sha256 carries the same lowercase-hex CHECK
+	// as blob.hash / snapshot_member.declared_sha256 — it is the trust
+	// anchor a later repair fetch validates against, so a malformed
+	// value must fail at the DB layer too, not just in Go.
+	`
+CREATE TABLE snapshot_skipped_member (
+  snapshot_id      INTEGER NOT NULL REFERENCES suite_snapshot(snapshot_id),
+  path             TEXT NOT NULL,
+  declared_sha256  TEXT NOT NULL
+                     CHECK (length(declared_sha256) = 64
+                            AND declared_sha256 NOT GLOB '*[^0-9a-f]*'),
+  size             INTEGER NOT NULL,
+  reason           TEXT NOT NULL,
+  detail           TEXT,
+  skipped_at       INTEGER NOT NULL,
+  retry_count      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (snapshot_id, path)
+);
 `,
 }
 

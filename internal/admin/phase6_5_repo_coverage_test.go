@@ -163,7 +163,7 @@ func seedRepoCoverageSnapshot(t *testing.T, s *Server, c *cache.Cache,
 	for i := range pkgHashes {
 		pkgHashes[i].SnapshotID = id
 	}
-	if err := c.CommitAdoption(context.Background(), id, members, pkgHashes, nil, false); err != nil {
+	if err := c.CommitAdoption(context.Background(), id, members, nil, pkgHashes, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 	s.runRefreshOnce(context.Background())

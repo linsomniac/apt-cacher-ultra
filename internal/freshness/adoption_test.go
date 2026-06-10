@@ -1568,8 +1568,13 @@ func TestByHashAliasPath(t *testing.T) {
 	}{
 		{"main/binary-amd64/Packages", "abc", "main/binary-amd64/by-hash/SHA256/abc"},
 		{"main/source/Sources", "def", "main/source/by-hash/SHA256/def"},
-		{"toplevel-file", "ghi", ""}, // no dir → skip
-		{"", "x", ""},                // empty → skip
+		// Suite-root members alias under the suite root's own by-hash
+		// dir — apt requests dists/<suite>/by-hash/SHA256/<h> for
+		// root-level Contents-* (SPEC6_7 §4; proven by the 2026-06-09
+		// incident request logs). The old "" special case denied root
+		// members both the adoption-time by-hash probe and the alias.
+		{"Contents-amd64.gz", "ghi", "by-hash/SHA256/ghi"},
+		{"", "x", ""}, // empty → skip
 	}
 	for _, tc := range cases {
 		got := byHashAliasPath(tc.path, tc.sha)

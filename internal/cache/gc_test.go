@@ -96,7 +96,9 @@ func TestCommitAdoption_Rule2_ClearsZeroedAtOnPositiveCrossing(t *testing.T) {
 	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
 		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
 		{SnapshotID: id, Path: "M", BlobHash: m, DeclaredSHA256: m},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 
@@ -129,7 +131,9 @@ func TestCommitAdoption_Rule2_PreservesZeroedAtOnNegativeToZero(t *testing.T) {
 	if err := c.CommitAdoption(ctx, id1, []SnapshotMember{
 		{SnapshotID: id1, Path: "InRelease", BlobHash: r1, DeclaredSHA256: r1},
 		{SnapshotID: id1, Path: "M", BlobHash: m, DeclaredSHA256: m},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatalf("commit #1: %v", err)
 	}
 	restore()
@@ -150,7 +154,9 @@ func TestCommitAdoption_Rule2_PreservesZeroedAtOnNegativeToZero(t *testing.T) {
 	}
 	if err := c.CommitAdoption(ctx, id2, []SnapshotMember{
 		{SnapshotID: id2, Path: "InRelease", BlobHash: r2, DeclaredSHA256: r2},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatalf("commit #2: %v", err)
 	}
 	restore()
@@ -205,7 +211,9 @@ func TestCommitAdoption_Rule2_PreservesZeroedAtOnNegativeToZero(t *testing.T) {
 	if err := c.CommitAdoption(ctx, id3, []SnapshotMember{
 		{SnapshotID: id3, Path: "InRelease", BlobHash: r3, DeclaredSHA256: r3},
 		{SnapshotID: id3, Path: "M", BlobHash: m, DeclaredSHA256: m},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatalf("commit #3: %v", err)
 	}
 	restore()
@@ -243,7 +251,9 @@ func TestCommitAdoption_Rule3_SetsZeroedAtOnFirstZeroCrossing(t *testing.T) {
 	if err := c.CommitAdoption(ctx, id1, []SnapshotMember{
 		{SnapshotID: id1, Path: "InRelease", BlobHash: r1, DeclaredSHA256: r1},
 		{SnapshotID: id1, Path: "M", BlobHash: m, DeclaredSHA256: m},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatalf("commit #1: %v", err)
 	}
 	restore()
@@ -267,7 +277,9 @@ func TestCommitAdoption_Rule3_SetsZeroedAtOnFirstZeroCrossing(t *testing.T) {
 	}
 	if err := c.CommitAdoption(ctx, id2, []SnapshotMember{
 		{SnapshotID: id2, Path: "InRelease", BlobHash: r2, DeclaredSHA256: r2},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatalf("commit #2: %v", err)
 	}
 	restore()
@@ -341,7 +353,9 @@ func TestEvictURLPath_Rule3_SetsZeroedAtOnFirstZeroCrossing(t *testing.T) {
 	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
 		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
 		{SnapshotID: id, Path: "M", BlobHash: m, DeclaredSHA256: m},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	restore()
@@ -663,7 +677,9 @@ func TestRunBlobGCBatch_SnapshotMemberReference_Excluded(t *testing.T) {
 	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
 		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
 		{SnapshotID: id, Path: "M", BlobHash: m, DeclaredSHA256: m},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 

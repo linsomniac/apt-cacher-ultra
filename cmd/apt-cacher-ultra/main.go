@@ -977,6 +977,8 @@ func buildAdopter(
 		HeartbeatInterval:              cfg.GC.HeartbeatInterval.Duration,
 		Architectures:                  cfg.Adoption.Architectures,
 		TolerateOptionalMemberFailures: cfg.Adoption.TolerateOptionalMemberFailures,
+		MemberRetryCount:               cfg.Adoption.MemberRetryCount,
+		MemberRetryDelay:               cfg.Adoption.MemberRetryDelay.Duration,
 		Logger:                         logger,
 	})
 	if err != nil {
@@ -990,6 +992,8 @@ func buildAdopter(
 		"allow_short_keyid", cfg.Adoption.AllowShortKeyID,
 		"accept_any_signer", cfg.Adoption.AcceptAnySigner,
 		"tolerate_optional_member_failures", cfg.Adoption.TolerateOptionalMemberFailures,
+		"member_retry_count", cfg.Adoption.MemberRetryCount,
+		"member_retry_delay", cfg.Adoption.MemberRetryDelay.Duration,
 		"max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,

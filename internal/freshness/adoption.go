@@ -273,6 +273,20 @@ type AdoptionConfig struct {
 	// (Phase-6 strict all-or-nothing).
 	TolerateOptionalMemberFailures bool
 
+	// MemberRetryCount / MemberRetryDelay are the SPEC6_7 §1
+	// [adoption].member_retry_count / member_retry_delay knobs: how many
+	// EXTRA attempts a failing member fetch gets, and the wait between
+	// attempts. Retries fire only on integrity/availability failures
+	// (ErrAdoptionMemberFetchFailed / ErrAdoptionMemberMismatch) — the
+	// stale-mirror class where a round-robin pool serves the previous
+	// publication generation mid-sync; each attempt re-probes the
+	// by-hash URL first, which is immune to the revision race and heals
+	// as soon as the backend syncs. 404/410 skips (permanent publication
+	// artifacts) and DB faults are never retried. 0 retries = single
+	// attempt (the pre-SPEC6_7 behavior; the zero value).
+	MemberRetryCount int
+	MemberRetryDelay time.Duration
+
 	Logger *slog.Logger
 
 	// now is a test seam; production uses time.Now.
@@ -319,6 +333,13 @@ type Adopter struct {
 	// failures are skipped rather than fatal.
 	tolerateOptionalMembers bool
 
+	// memberRetryCount / memberRetryDelay: SPEC6_7 §1 in-adoption retry
+	// policy (see AdoptionConfig). retrySleep is the ctx-aware wait
+	// between attempts — a test seam; production uses ctxSleep.
+	memberRetryCount int
+	memberRetryDelay time.Duration
+	retrySleep       func(ctx context.Context, d time.Duration) error
+
 	logger *slog.Logger
 	now    func() time.Time
 }
@@ -350,6 +371,12 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 	if cfg.HeartbeatInterval < 0 {
 		return nil, fmt.Errorf("freshness: heartbeat_interval must be >= 0, got %s", cfg.HeartbeatInterval)
 	}
+	if cfg.MemberRetryCount < 0 {
+		return nil, fmt.Errorf("freshness: member_retry_count must be >= 0, got %d", cfg.MemberRetryCount)
+	}
+	if cfg.MemberRetryDelay < 0 {
+		return nil, fmt.Errorf("freshness: member_retry_delay must be >= 0, got %s", cfg.MemberRetryDelay)
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -380,9 +407,29 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		heartbeatInterval:       cfg.HeartbeatInterval,
 		architectureAllowlist:   allowlist,
 		tolerateOptionalMembers: cfg.TolerateOptionalMemberFailures,
+		memberRetryCount:        cfg.MemberRetryCount,
+		memberRetryDelay:        cfg.MemberRetryDelay,
+		retrySleep:              ctxSleep,
 		logger:                  logger,
 		now:                     now,
 	}, nil
+}
+
+// ctxSleep waits d, returning early with ctx.Err() on cancellation.
+// The production retrySleep — shutdown must never block on a member
+// retry backoff.
+func ctxSleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // blobHeartbeatTracker is the per-adoption mutable list of member-blob
@@ -809,6 +856,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// or a Packages-blob read against an empty pool entry.
 	fetchedMembers := make([]ReleaseMember, 0, len(members))
 	skippedCount := 0
+	// integritySkipped collects the SPEC6_7 §2 repair records: members
+	// skipped over an integrity failure keep their signed declaration
+	// (sha256 + size) in snapshot_skipped_member so the freshness-tick
+	// repair pass can re-fetch them once the mirror finishes syncing.
+	// 4xx skips are NOT recorded for repair — those are near-always
+	// publication artifacts (declared but never served) and re-fetching
+	// them every tick would be guaranteed-failure upstream traffic.
+	var integritySkipped []cache.SkippedMember
 	for _, m := range members {
 		// SPEC6_5 §7.2: per-arch / per-source index filter. Inert when
 		// the allowlist is empty (Phase 6 default). Skipped members never
@@ -832,7 +887,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			}
 		}
 
-		blobHash, err := a.adoptMember(ctx, suite, m, acquireByHash)
+		blobHash, err := a.adoptMemberWithRetry(ctx, suite, m, acquireByHash)
 		if err != nil {
 			if errors.Is(err, errAdoptionMemberSkipped) {
 				skippedCount++
@@ -868,6 +923,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 					"detail", detail,
 				)
 				adoptionMembersSkippedTotal.Inc("optional_member_integrity")
+				integritySkipped = append(integritySkipped, cache.SkippedMember{
+					SnapshotID:     snapshotID,
+					Path:           m.Path,
+					DeclaredSHA256: m.SHA256,
+					Size:           m.Size,
+					Reason:         cache.SkipReasonOptionalMemberIntegrity,
+					Detail:         detail,
+				})
 				skippedCount++
 				continue
 			}
@@ -1035,7 +1098,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// to fail — the contract is "cancel hot fetches, then flip", not
 	// "cancel hot fetches, then also cancel the flip". coverageComplete
 	// is the SPEC3 §7.5.4 per-snapshot proof for strict mode.
-	if err := a.cache.CommitAdoption(ctx, snapshotID, memberRows, packageHashes,
+	if err := a.cache.CommitAdoption(ctx, snapshotID, memberRows, integritySkipped, packageHashes,
 		prefetchedURLPaths, pkgHashRes.coverageComplete); err != nil {
 		a.logger.Warn("adoption: commit failed",
 			"canonical_host", suite.CanonicalHost,
@@ -1097,6 +1160,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		"member_count", len(members),
 		"fetched_count", fetchedCount,
 		"skipped_count", skippedCount,
+		"skipped_integrity_count", len(integritySkipped),
 		"alias_count", len(aliasSeen),
 		"package_hash_count", len(packageHashes),
 	)
@@ -1142,6 +1206,64 @@ func formName(f adoptionForm) string {
 	default:
 		return "unknown"
 	}
+}
+
+// adoptMemberWithRetry wraps adoptMember in the SPEC6_7 §1 retry loop.
+// Only integrity/availability failures (ErrAdoptionMemberFetchFailed /
+// ErrAdoptionMemberMismatch) are retried — the signature of a
+// round-robin mirror serving the previous publication generation
+// mid-sync, which heals within the retry window. Each fresh attempt
+// re-runs the full adoptMember sequence: pool-reuse check, by-hash
+// probe (the URL immune to the revision race — this is the expected
+// heal path), then the canonical fetch.
+//
+// Never retried:
+//   - errAdoptionMemberSkipped (404/410): "declared but does not
+//     serve" is a permanent publication artifact; retrying would burn
+//     the delay budget on guaranteed failures (~160 such members per
+//     Ubuntu suite).
+//   - ErrAdoptionDBFailed: local fault, not an upstream race.
+//   - any error once ctx is cancelled: shutdown path.
+//
+// The sleep happens with NO host-semaphore slot held — adoptMember
+// acquires and releases per attempt — so a member in backoff never
+// starves other fetches to the same host.
+func (a *Adopter) adoptMemberWithRetry(ctx context.Context, suite SuiteRef, m ReleaseMember, acquireByHash bool) (string, error) {
+	blobHash, err := a.adoptMember(ctx, suite, m, acquireByHash)
+	if err == nil || a.memberRetryCount == 0 {
+		return blobHash, err
+	}
+	retried := false
+	for attempt := 1; attempt <= a.memberRetryCount; attempt++ {
+		if ctx.Err() != nil {
+			break
+		}
+		if !errors.Is(err, ErrAdoptionMemberFetchFailed) && !errors.Is(err, ErrAdoptionMemberMismatch) {
+			break
+		}
+		a.logger.Info("adoption_member_retry",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"path", m.Path,
+			"attempt", attempt,
+			"max_retries", a.memberRetryCount,
+			"delay", a.memberRetryDelay.String(),
+			"err", err,
+		)
+		if serr := a.retrySleep(ctx, a.memberRetryDelay); serr != nil {
+			break
+		}
+		retried = true
+		blobHash, err = a.adoptMember(ctx, suite, m, acquireByHash)
+		if err == nil {
+			adoptionMemberRetriesTotal.Inc("success")
+			return blobHash, nil
+		}
+	}
+	if retried {
+		adoptionMemberRetriesTotal.Inc("exhausted")
+	}
+	return blobHash, err
 }
 
 // adoptMember handles step 5 for one declared member: try pool reuse
@@ -1449,23 +1571,30 @@ func hashFile(path string) (string, error) {
 }
 
 // byHashAliasPath returns the by-hash alias path for a member, or ""
-// if the member's declared path lacks a directory component the
-// alias would be relative to. The alias is constructed by stripping
+// for an empty declared path. The alias is constructed by stripping
 // the filename component from the declared path and appending
 // "by-hash/SHA256/<sha256>".
 //
 // For "main/binary-amd64/Packages.gz" + sha "abc...": returns
 // "main/binary-amd64/by-hash/SHA256/abc...".
 //
-// For a member at the suite root (no slash in path), the alias would
-// degenerate to "by-hash/SHA256/<hash>", which is technically valid
-// but apt clients don't fetch suite-root files via by-hash. Return
-// "" to skip those entries — they wouldn't be requested through the
-// alias anyway.
+// For a member at the suite root (no slash in path) the alias is
+// "by-hash/SHA256/<hash>" — the suite root's own by-hash directory.
+// AIDEV-NOTE: an earlier revision returned "" here on the assumption
+// that apt never fetches suite-root files via by-hash. The 2026-06-09
+// incident logs disproved that: apt requests
+// dists/<suite>/by-hash/SHA256/<h> for root-level Contents-* (and
+// Ubuntu serves it). The "" special case denied root members both the
+// adoption-time by-hash probe (the URL immune to the mirror-sync
+// revision race) and the served alias row — do not reintroduce it.
+// SPEC6_7 §4.
 func byHashAliasPath(declaredPath, sha256hex string) string {
+	if declaredPath == "" {
+		return ""
+	}
 	dir := path.Dir(declaredPath)
 	if dir == "." || dir == "" {
-		return ""
+		return "by-hash/SHA256/" + sha256hex
 	}
 	return dir + "/by-hash/SHA256/" + sha256hex
 }

@@ -77,7 +77,7 @@ func adoptSnapshot(t *testing.T, c *cache.Cache, scheme, host, suite, inreleaseH
 			DeclaredSHA256: h,
 		}
 	}
-	if err := c.CommitAdoption(ctx, id, members, nil, nil, true); err != nil {
+	if err := c.CommitAdoption(ctx, id, members, nil, nil, nil, true); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 	return id

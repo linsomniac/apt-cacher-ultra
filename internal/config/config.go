@@ -230,6 +230,21 @@ type AdoptionConfig struct {
 	// adoption. Pre-populated true in defaultConfig (bool zero-value
 	// cannot distinguish "absent" from "explicit false").
 	TolerateOptionalMemberFailures bool `toml:"tolerate_optional_member_failures"`
+
+	// MemberRetryCount / MemberRetryDelay are the SPEC6_7 §1 in-adoption
+	// member-fetch retry policy: how many EXTRA attempts a member fetch
+	// gets after an integrity/availability failure (size/content-length
+	// mismatch, hash mismatch, transport error, non-404 status), and the
+	// wait between attempts. The dominant trigger is a round-robin
+	// mirror pool serving the previous publication generation mid-sync
+	// (the 2026-06-09 Contents-amd64.gz incident); each fresh attempt
+	// re-probes the content-addressed by-hash URL, which heals as soon
+	// as the lagging backend syncs. 404/410 member skips are never
+	// retried (permanent publication artifacts). Defaults: 2 retries,
+	// 30s delay. member_retry_count = 0 restores single-attempt
+	// behavior. Presence-sensitive: explicit zeros survive Load.
+	MemberRetryCount int      `toml:"member_retry_count"`
+	MemberRetryDelay Duration `toml:"member_retry_delay"`
 }
 
 // HotPackagesConfig holds the SPEC3 §5.1 [hot_packages] block. The hot
@@ -600,6 +615,15 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("adoption", "hot_prefetch_budget") {
 		cfg.Adoption.HotPrefetchBudget.Duration = 5 * time.Minute
 	}
+	// SPEC6_7 §5 presence-sensitive defaults: member_retry_count = 0
+	// (single attempt) and member_retry_delay = 0s are documented
+	// meaningful values that must survive Load.
+	if !md.IsDefined("adoption", "member_retry_count") {
+		cfg.Adoption.MemberRetryCount = 2
+	}
+	if !md.IsDefined("adoption", "member_retry_delay") {
+		cfg.Adoption.MemberRetryDelay.Duration = 30 * time.Second
+	}
 	// SPEC4 §5.2 presence-sensitive defaults: gc.enabled is bool
 	// (pre-populated in defaultConfig); the rest of the [gc] keys
 	// default to non-zero values that don't collide with documented
@@ -851,6 +875,14 @@ func (c *Config) Validate() error {
 		if !architectureNameRE.MatchString(arch) {
 			errs = append(errs, fmt.Errorf("adoption.architectures: architectures_invalid_value %q (expected lowercase letters/digits, must start with a letter)", arch))
 		}
+	}
+
+	// SPEC6_7 §5: in-adoption member retry knobs must be non-negative.
+	if c.Adoption.MemberRetryCount < 0 {
+		errs = append(errs, errors.New("adoption.member_retry_count must be >= 0"))
+	}
+	if c.Adoption.MemberRetryDelay.Duration < 0 {
+		errs = append(errs, errors.New("adoption.member_retry_delay must not be negative"))
 	}
 
 	// SPEC2 §5.2: [adoption].keyring_dirs entries must be non-empty

@@ -93,7 +93,8 @@ func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixtu
 		t.Fatalf("PutSuiteFreshness: %v", err)
 	}
 	if err := c.CommitAdoption(context.Background(), priorID,
-		[]cache.SnapshotMember{{SnapshotID: priorID, Path: "InRelease", BlobHash: priorRelease, DeclaredSHA256: priorRelease}},
+		[]cache.SnapshotMember{{SnapshotID: priorID, Path: "InRelease", BlobHash: priorRelease, DeclaredSHA256: priorRelease}}, nil,
+
 		[]cache.PackageHash{{
 			CanonicalScheme: suite.CanonicalScheme,
 			CanonicalHost:   suite.CanonicalHost,
@@ -164,7 +165,8 @@ func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixtu
 		Architecture:    "amd64",
 	}}
 	if err := c.CommitAdoption(context.Background(), candidateID,
-		[]cache.SnapshotMember{{SnapshotID: candidateID, Path: "InRelease", BlobHash: candidateRelease, DeclaredSHA256: candidateRelease}},
+		[]cache.SnapshotMember{{SnapshotID: candidateID, Path: "InRelease", BlobHash: candidateRelease, DeclaredSHA256: candidateRelease}}, nil,
+
 		candPHs, nil, true); err != nil {
 		t.Fatalf("commit candidate (test fixture): %v", err)
 	}

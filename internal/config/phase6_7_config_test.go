@@ -1,0 +1,89 @@
+package config
+
+// SPEC6_7 config-surface coverage: the [adoption] member-retry and
+// skip-repair knobs born from the 2026-06-09 stale-mirror incident.
+
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestLoad_MemberRetryDefaultsApplied: omitted member_retry_count /
+// member_retry_delay get the SPEC6_7 §5 defaults (2 retries, 30s).
+func TestLoad_MemberRetryDefaultsApplied(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Adoption.MemberRetryCount != 2 {
+		t.Errorf("member_retry_count default = %d, want 2", cfg.Adoption.MemberRetryCount)
+	}
+	if cfg.Adoption.MemberRetryDelay.Duration != 30*time.Second {
+		t.Errorf("member_retry_delay default = %s, want 30s", cfg.Adoption.MemberRetryDelay.Duration)
+	}
+}
+
+// TestLoad_MemberRetryExplicitZeroRespected: an operator-written 0
+// disables in-adoption retries (the pre-SPEC6_7 single-attempt
+// behavior) and must survive Load's defaulting.
+func TestLoad_MemberRetryExplicitZeroRespected(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[adoption]
+member_retry_count = 0
+member_retry_delay = "0s"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Adoption.MemberRetryCount != 0 {
+		t.Errorf("explicit member_retry_count=0 was clobbered to %d", cfg.Adoption.MemberRetryCount)
+	}
+	if cfg.Adoption.MemberRetryDelay.Duration != 0 {
+		t.Errorf("explicit member_retry_delay=0s was clobbered to %s", cfg.Adoption.MemberRetryDelay.Duration)
+	}
+}
+
+// TestLoad_MemberRetryNegativeRejected: negative values fail
+// validation with a key-named error.
+func TestLoad_MemberRetryNegativeRejected(t *testing.T) {
+	cases := []struct{ name, body, wantSubstr string }{
+		{
+			"negative_count",
+			"member_retry_count = -1",
+			"member_retry_count",
+		},
+		{
+			"negative_delay",
+			`member_retry_delay = "-5s"`,
+			"member_retry_delay",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := writeTOML(t, dir, "config.toml", `
+[cache]
+dir = "`+dir+`"
+[adoption]
+`+tc.body+`
+`)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("Load accepted %s; want validation error", tc.body)
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("error %q does not name %q", err, tc.wantSubstr)
+			}
+		})
+	}
+}

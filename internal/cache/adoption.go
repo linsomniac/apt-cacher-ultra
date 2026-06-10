@@ -249,6 +249,14 @@ type PrefetchedURLPath struct {
 // list; the snapshot_member primary key (snapshot_id, path) will
 // surface duplicates as a constraint error and abort the transaction.
 //
+// Skipped lists the SPEC6_7 §2 skipped-member records — declared
+// Release members the adoption did NOT fetch — inserted into
+// snapshot_skipped_member atomically with the flip (same rationale as
+// coverage in Step 3b: no "snapshot is current but its skip record is
+// not yet visible" mid-state for the repair pass to mis-read). Pass
+// nil when the adoption skipped nothing or the caller does not record
+// skips.
+//
 // PackageHashes is the per-.deb declared-hash assertion set. Pass an
 // empty slice for suites with no .debs (e.g. metadata-only suites).
 //
@@ -267,7 +275,7 @@ type PrefetchedURLPath struct {
 // happens *inside* the transaction so a concurrent flip cannot race
 // the bookkeeping.
 func (c *Cache) CommitAdoption(ctx context.Context, snapshotID int64,
-	members []SnapshotMember, packageHashes []PackageHash,
+	members []SnapshotMember, skipped []SkippedMember, packageHashes []PackageHash,
 	prefetchedURLPaths []PrefetchedURLPath, coverageComplete bool) error {
 	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
@@ -314,6 +322,24 @@ INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256)
 VALUES (?, ?, ?, ?)`,
 				snapshotID, m.Path, m.BlobHash, m.DeclaredSHA256); err != nil {
 				return fmt.Errorf("CommitAdoption: insert member %q: %w", m.Path, err)
+			}
+		}
+
+		// Step 2a (SPEC6_7 §2): record skipped members. The declared
+		// sha256 is validated for shape here too — it is the trust
+		// anchor a later repair fetch verifies bytes against, so a
+		// malformed value must abort the flip, not ride along.
+		skipNow := nowUnix()
+		for _, s := range skipped {
+			if !validBlobHash(s.DeclaredSHA256) {
+				return fmt.Errorf("CommitAdoption: skipped member %q declared_sha256 %w", s.Path, ErrInvalidHash)
+			}
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO snapshot_skipped_member
+  (snapshot_id, path, declared_sha256, size, reason, detail, skipped_at, retry_count)
+VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+				snapshotID, s.Path, s.DeclaredSHA256, s.Size, s.Reason, s.Detail, skipNow); err != nil {
+				return fmt.Errorf("CommitAdoption: insert skipped member %q: %w", s.Path, err)
 			}
 		}
 

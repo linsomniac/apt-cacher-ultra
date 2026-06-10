@@ -72,6 +72,26 @@ type SnapshotMember struct {
 	DeclaredSHA256 string // the sha256 the Release file declared for this path
 }
 
+// SkippedMember mirrors the snapshot_skipped_member table — one
+// (snapshot_id, path) row recording a Release member the adoption
+// declared but did not fetch, with the reason taxonomy from the
+// adoption_member_skipped log line ("4xx", "optional_member_integrity",
+// "arch_not_in_allowlist"). DeclaredSHA256/Size are the signed-Release
+// declarations — the trust anchor a later repair fetch (SPEC6_7 §3)
+// validates against. SkippedAt and RetryCount are written by the cache
+// layer (CommitAdoption / BumpSkippedMemberRetry); callers populate
+// only the declaration fields.
+type SkippedMember struct {
+	SnapshotID     int64
+	Path           string // suite-relative, e.g. "main/Contents-amd64.gz"
+	DeclaredSHA256 string // the sha256 the Release file declared for this path
+	Size           int64  // the size the Release file declared
+	Reason         string // skip taxonomy (see above)
+	Detail         string // short human detail, e.g. "served 4360619 vs declared 4406247"
+	SkippedAt      int64
+	RetryCount     int64
+}
+
 // PackageHash mirrors the package_hash table — one (host, .deb path,
 // snapshot_id) row asserting that the .deb at the URL must hash to
 // DeclaredSHA256 under this snapshot. SPEC2 §4.3.1, §7.5 step 8.

@@ -453,7 +453,9 @@ func TestCommitAdoption_SyncsInReleaseAnchorBlobHash(t *testing.T) {
 	}
 	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
 		{SnapshotID: id, Path: "InRelease", BlobHash: adopted, DeclaredSHA256: adopted},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 
@@ -494,7 +496,9 @@ func TestCommitAdoption_CreatesInReleaseAnchorWhenMissing(t *testing.T) {
 	}
 	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
 		{SnapshotID: id, Path: "InRelease", BlobHash: adopted, DeclaredSHA256: adopted},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 

@@ -123,7 +123,7 @@ func TestGetCacheSummaryByHostArch_MultiArchAndHost(t *testing.T) {
 		bySnap[p.SnapshotID] = append(bySnap[p.SnapshotID], p)
 	}
 	for id, phs := range bySnap {
-		if err := c.CommitAdoption(ctx, id, nil, phs, nil, false); err != nil {
+		if err := c.CommitAdoption(ctx, id, nil, nil, phs, nil, false); err != nil {
 			t.Fatalf("CommitAdoption[%d]: %v", id, err)
 		}
 	}
@@ -209,7 +209,7 @@ func TestGetCacheSummaryByHostArch_NoBlobForUrlPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertCandidateSnapshot: %v", err)
 	}
-	if err := c.CommitAdoption(ctx, id, nil, []PackageHash{{
+	if err := c.CommitAdoption(ctx, id, nil, nil, []PackageHash{{
 		CanonicalScheme: "http",
 		CanonicalHost:   "deb.debian.org",
 		Path:            "/debian/pool/main/a/aaa/aaa_1.0_amd64.deb",
@@ -297,7 +297,7 @@ func TestGetCacheSummaryByHostArch_SharedBlobDedup(t *testing.T) {
 			t.Fatalf("PutURLPath[%s]: %v", p, err)
 		}
 	}
-	if err := c.CommitAdoption(ctx, id, nil, phs, nil, false); err != nil {
+	if err := c.CommitAdoption(ctx, id, nil, nil, phs, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 
@@ -356,12 +356,11 @@ func TestGetCacheSummaryByHostArch_ExcludesEmptyArchRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertCandidateSnapshot: %v", err)
 	}
-	if err := c.CommitAdoption(ctx, id, nil, []PackageHash{{
+	if err := c.CommitAdoption(ctx, id, nil, nil, []PackageHash{{
 		CanonicalScheme: "http", CanonicalHost: "legacy.example",
 		Path:           "/legacy/pool/anything.deb",
 		DeclaredSHA256: releaseHash,
 		SnapshotID:     id,
-		// PackageName & Architecture: zero (legacy v2 row)
 	}}, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}

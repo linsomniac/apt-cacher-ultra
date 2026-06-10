@@ -77,7 +77,9 @@ func TestChaos_BlobGC_EvictRace_OneZeroNegOne(t *testing.T) {
 			}
 			if err := c.CommitAdoption(ctx, s1, []SnapshotMember{
 				{SnapshotID: s1, Path: "M", BlobHash: b, DeclaredSHA256: b},
-			}, nil, nil, false); err != nil {
+			}, nil,
+
+				nil, nil, false); err != nil {
 				t.Fatalf("CommitAdoption S1: %v", err)
 			}
 			if rc := blobRefcount(t, c, b); rc != 1 {
@@ -100,7 +102,7 @@ func TestChaos_BlobGC_EvictRace_OneZeroNegOne(t *testing.T) {
 			if err != nil {
 				t.Fatalf("InsertCandidateSnapshot S2: %v", err)
 			}
-			if err := c.CommitAdoption(ctx, s2, nil, nil, nil, false); err != nil {
+			if err := c.CommitAdoption(ctx, s2, nil, nil, nil, nil, false); err != nil {
 				t.Fatalf("CommitAdoption S2: %v", err)
 			}
 			if rc := blobRefcount(t, c, b); rc != 0 {

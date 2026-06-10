@@ -330,9 +330,10 @@ LIMIT ?`
 		}
 		idList := string(ph)
 		for _, stmt := range []string{
-			`DELETE FROM snapshot_member WHERE snapshot_id IN (` + idList + `)`,
-			`DELETE FROM package_hash    WHERE snapshot_id IN (` + idList + `)`,
-			`DELETE FROM suite_snapshot  WHERE snapshot_id IN (` + idList + `)`,
+			`DELETE FROM snapshot_member         WHERE snapshot_id IN (` + idList + `)`,
+			`DELETE FROM snapshot_skipped_member WHERE snapshot_id IN (` + idList + `)`,
+			`DELETE FROM package_hash            WHERE snapshot_id IN (` + idList + `)`,
+			`DELETE FROM suite_snapshot          WHERE snapshot_id IN (` + idList + `)`,
 		} {
 			if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
 				return fmt.Errorf("RunSnapshotGCBatch: cascade delete: %w", err)

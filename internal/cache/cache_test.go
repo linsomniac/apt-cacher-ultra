@@ -507,7 +507,7 @@ func TestListSuitesWithAdoption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Insert noble: %v", err)
 	}
-	if err := c.CommitAdoption(ctx, idNoble, nil, nil, nil, false); err != nil {
+	if err := c.CommitAdoption(ctx, idNoble, nil, nil, nil, nil, false); err != nil {
 		t.Fatalf("CommitAdoption noble: %v", err)
 	}
 	// Seed suite_freshness for noble pointing at the adopted snapshot.
@@ -1736,7 +1736,7 @@ func TestInsertCandidateSnapshot_NaturalKeyAdoptedConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
-	if err := c.CommitAdoption(ctx, id, nil, nil, nil, false); err != nil {
+	if err := c.CommitAdoption(ctx, id, nil, nil, nil, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 	id2, reused, err := c.InsertCandidateSnapshot(ctx, cand)
@@ -1876,7 +1876,7 @@ func TestCommitAdoption_FirstAdoption(t *testing.T) {
 			SnapshotID:      id,
 		},
 	}
-	if err := c.CommitAdoption(ctx, id, members, pkgs, nil, false); err != nil {
+	if err := c.CommitAdoption(ctx, id, members, nil, pkgs, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 
@@ -1946,7 +1946,9 @@ func TestCommitAdoption_DisplacesPrior(t *testing.T) {
 		{SnapshotID: id1, Path: "InRelease", BlobHash: r1, DeclaredSHA256: r1},
 		{SnapshotID: id1, Path: "M1", BlobHash: m1, DeclaredSHA256: m1},
 		{SnapshotID: id1, Path: "M2", BlobHash: m2, DeclaredSHA256: m2},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatalf("commit #1: %v", err)
 	}
 
@@ -1966,7 +1968,9 @@ func TestCommitAdoption_DisplacesPrior(t *testing.T) {
 		{SnapshotID: id2, Path: "InRelease", BlobHash: r2, DeclaredSHA256: r2},
 		{SnapshotID: id2, Path: "M1", BlobHash: m1, DeclaredSHA256: m1},
 		{SnapshotID: id2, Path: "M2", BlobHash: m2v2, DeclaredSHA256: m2v2},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatalf("commit #2: %v", err)
 	}
 
@@ -2015,13 +2019,13 @@ func TestCommitAdoption_RejectsAlreadyAdopted(t *testing.T) {
 	members := []SnapshotMember{
 		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
 	}
-	if err := c.CommitAdoption(ctx, id, members, nil, nil, false); err != nil {
+	if err := c.CommitAdoption(ctx, id, members, nil, nil, nil, false); err != nil {
 		t.Fatalf("first commit: %v", err)
 	}
 	// Capture pre-state to confirm a second commit changes nothing.
 	pre := blobRefcount(t, c, r)
 
-	err = c.CommitAdoption(ctx, id, members, nil, nil, false)
+	err = c.CommitAdoption(ctx, id, members, nil, nil, nil, false)
 	if !errors.Is(err, ErrSnapshotAlreadyAdopted) {
 		t.Fatalf("second commit: got %v, want ErrSnapshotAlreadyAdopted", err)
 	}
@@ -2032,7 +2036,7 @@ func TestCommitAdoption_RejectsAlreadyAdopted(t *testing.T) {
 
 func TestCommitAdoption_NonexistentSnapshot(t *testing.T) {
 	c := openCache(t)
-	err := c.CommitAdoption(context.Background(), 99999, nil, nil, nil, false)
+	err := c.CommitAdoption(context.Background(), 99999, nil, nil, nil, nil, false)
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("got %v, want not-found error", err)
 	}
@@ -2050,7 +2054,7 @@ func TestCommitAdoption_RejectsMalformedMemberHash(t *testing.T) {
 		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
 		{SnapshotID: id, Path: "M1", BlobHash: "not-a-hex", DeclaredSHA256: r},
 	}
-	err := c.CommitAdoption(ctx, id, bad, nil, nil, false)
+	err := c.CommitAdoption(ctx, id, bad, nil, nil, nil, false)
 	if err == nil || !errors.Is(err, ErrInvalidHash) {
 		t.Fatalf("got %v, want ErrInvalidHash", err)
 	}
@@ -2076,7 +2080,7 @@ func TestCommitAdoption_RejectsDanglingBlobFK(t *testing.T) {
 		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
 		{SnapshotID: id, Path: "M1", BlobHash: dangling, DeclaredSHA256: dangling},
 	}
-	err := c.CommitAdoption(ctx, id, bad, nil, nil, false)
+	err := c.CommitAdoption(ctx, id, bad, nil, nil, nil, false)
 	if err == nil {
 		t.Fatal("expected FK error, got nil")
 	}
@@ -2099,7 +2103,7 @@ func TestCommitAdoption_RejectsDuplicatePath(t *testing.T) {
 		{SnapshotID: id, Path: "Path", BlobHash: r, DeclaredSHA256: r},
 		{SnapshotID: id, Path: "Path", BlobHash: m, DeclaredSHA256: m},
 	}
-	err := c.CommitAdoption(ctx, id, dupe, nil, nil, false)
+	err := c.CommitAdoption(ctx, id, dupe, nil, nil, nil, false)
 	if err == nil {
 		t.Fatal("expected unique violation, got nil")
 	}
@@ -2116,7 +2120,7 @@ func TestCommitAdoption_EmptyMembersStillFlips(t *testing.T) {
 		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
 		InReleaseHash: &r,
 	})
-	if err := c.CommitAdoption(ctx, id, nil, nil, nil, false); err != nil {
+	if err := c.CommitAdoption(ctx, id, nil, nil, nil, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
 	sf, err := c.GetSuiteFreshness(ctx, "http", "x.example", "/p")
@@ -2156,7 +2160,8 @@ func TestCommitAdoption_PreservesExistingSuiteFreshnessColumns(t *testing.T) {
 		InReleaseHash: &r,
 	})
 	if err := c.CommitAdoption(ctx, id,
-		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
+		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}}, nil,
+
 		nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
@@ -2187,7 +2192,8 @@ func TestPutSuiteFreshness_PreservesCurrentSnapshotID(t *testing.T) {
 		InReleaseHash: &r,
 	})
 	if err := c.CommitAdoption(ctx, id,
-		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
+		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}}, nil,
+
 		nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
@@ -2276,7 +2282,8 @@ func TestDeclaredHashesForPath_ReturnsCurrentSnapshotRowsOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := c.CommitAdoption(ctx, id1,
-		[]SnapshotMember{{SnapshotID: id1, Path: "InRelease", BlobHash: r1, DeclaredSHA256: r1}},
+		[]SnapshotMember{{SnapshotID: id1, Path: "InRelease", BlobHash: r1, DeclaredSHA256: r1}}, nil,
+
 		[]PackageHash{{
 			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
 			DeclaredSHA256: debHash, SnapshotID: id1,
@@ -2296,7 +2303,8 @@ func TestDeclaredHashesForPath_ReturnsCurrentSnapshotRowsOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := c.CommitAdoption(ctx, id2,
-		[]SnapshotMember{{SnapshotID: id2, Path: "InRelease", BlobHash: r2, DeclaredSHA256: r2}},
+		[]SnapshotMember{{SnapshotID: id2, Path: "InRelease", BlobHash: r2, DeclaredSHA256: r2}}, nil,
+
 		[]PackageHash{{
 			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
 			DeclaredSHA256: debHash, SnapshotID: id2,
@@ -2349,7 +2357,8 @@ func TestDeclaredHashesForPath_TwoSuitesDistinctHashes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := c.CommitAdoption(ctx, idA,
-		[]SnapshotMember{{SnapshotID: idA, Path: "InRelease", BlobHash: rA, DeclaredSHA256: rA}},
+		[]SnapshotMember{{SnapshotID: idA, Path: "InRelease", BlobHash: rA, DeclaredSHA256: rA}}, nil,
+
 		[]PackageHash{{
 			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
 			DeclaredSHA256: hashA, SnapshotID: idA,
@@ -2358,7 +2367,8 @@ func TestDeclaredHashesForPath_TwoSuitesDistinctHashes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := c.CommitAdoption(ctx, idB,
-		[]SnapshotMember{{SnapshotID: idB, Path: "InRelease", BlobHash: rB, DeclaredSHA256: rB}},
+		[]SnapshotMember{{SnapshotID: idB, Path: "InRelease", BlobHash: rB, DeclaredSHA256: rB}}, nil,
+
 		[]PackageHash{{
 			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
 			DeclaredSHA256: hashB, SnapshotID: idB,
@@ -2403,7 +2413,9 @@ func TestLookupSnapshotMember_ReturnsBlobOfCurrentSnapshot(t *testing.T) {
 	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
 		{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r},
 		{SnapshotID: id, Path: "main/binary-amd64/Packages", BlobHash: pkg, DeclaredSHA256: pkg},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2451,7 +2463,8 @@ func TestLookupSnapshotMember_NotFoundWhenPathMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := c.CommitAdoption(ctx, id,
-		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
+		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}}, nil,
+
 		nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
@@ -2487,7 +2500,9 @@ func TestEvictURLPath_DeletesRowAndDecrementsRefcount(t *testing.T) {
 	}
 	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
 		{SnapshotID: id, Path: "InRelease", BlobHash: hash, DeclaredSHA256: hash},
-	}, nil, nil, false); err != nil {
+	}, nil,
+
+		nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if got := blobRefcount(t, c, hash); got != 1 {
@@ -2582,12 +2597,14 @@ func TestHostCurrentSnapshotsCoverage_ReturnsRowsPerCurrentSnapshot(t *testing.T
 		t.Fatal(err)
 	}
 	if err := c.CommitAdoption(ctx, idA,
-		[]SnapshotMember{{SnapshotID: idA, Path: "InRelease", BlobHash: rA, DeclaredSHA256: rA}},
+		[]SnapshotMember{{SnapshotID: idA, Path: "InRelease", BlobHash: rA, DeclaredSHA256: rA}}, nil,
+
 		nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.CommitAdoption(ctx, idB,
-		[]SnapshotMember{{SnapshotID: idB, Path: "InRelease", BlobHash: rB, DeclaredSHA256: rB}},
+		[]SnapshotMember{{SnapshotID: idB, Path: "InRelease", BlobHash: rB, DeclaredSHA256: rB}}, nil,
+
 		nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
@@ -2660,7 +2677,8 @@ func TestComputeHotSet_TwoStageMatch(t *testing.T) {
 
 	// Adopt prior snapshot with package_hash row covering the old deb.
 	if err := c.CommitAdoption(ctx, idPrior,
-		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}},
+		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}}, nil,
+
 		[]PackageHash{{
 			CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
 			DeclaredSHA256: debHashOld, SnapshotID: idPrior,
@@ -2693,7 +2711,8 @@ func TestComputeHotSet_TwoStageMatch(t *testing.T) {
 		PackageName: "nginx", Architecture: "amd64",
 	}}
 	if err := c.CommitAdoption(ctx, idNew,
-		[]SnapshotMember{{SnapshotID: idNew, Path: "InRelease", BlobHash: rNew, DeclaredSHA256: rNew}},
+		[]SnapshotMember{{SnapshotID: idNew, Path: "InRelease", BlobHash: rNew, DeclaredSHA256: rNew}}, nil,
+
 		candPHs, nil, true); err != nil {
 		t.Fatalf("commit new: %v", err)
 	}
@@ -2737,11 +2756,11 @@ func TestComputeHotSet_ExcludesPreV3Rows(t *testing.T) {
 	// Prior commits a package_hash row with empty package_name/arch
 	// (the pre-v3 default).
 	if err := c.CommitAdoption(ctx, idPrior,
-		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}},
+		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}}, nil,
+
 		[]PackageHash{{
 			CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
 			DeclaredSHA256: debHash, SnapshotID: idPrior,
-			// PackageName: "" Architecture: "" — pre-v3 defaults
 		}},
 		nil, false); err != nil {
 		t.Fatal(err)
@@ -2753,7 +2772,8 @@ func TestComputeHotSet_ExcludesPreV3Rows(t *testing.T) {
 		LastRequestedAt: &now, RequestCount: 1,
 	})
 	_ = c.CommitAdoption(ctx, idNew,
-		[]SnapshotMember{{SnapshotID: idNew, Path: "InRelease", BlobHash: rNew, DeclaredSHA256: rNew}},
+		[]SnapshotMember{{SnapshotID: idNew, Path: "InRelease", BlobHash: rNew, DeclaredSHA256: rNew}}, nil,
+
 		nil, nil, false)
 
 	// Candidate is empty (idNew committed with nil package hashes —
@@ -2791,7 +2811,8 @@ func TestComputeHotSet_DroppedPackageNotInCandidate(t *testing.T) {
 	debHash := seedBlob(t, c, "gone deb bytes")
 	pathOld := "/pool/main/g/gone/gone_1.0_amd64.deb"
 	if err := c.CommitAdoption(ctx, idPrior,
-		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}},
+		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}}, nil,
+
 		[]PackageHash{{
 			CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
 			DeclaredSHA256: debHash, SnapshotID: idPrior,
@@ -2808,7 +2829,8 @@ func TestComputeHotSet_DroppedPackageNotInCandidate(t *testing.T) {
 	})
 	// New snapshot has no package_hash for "gone" — upstream removed it.
 	if err := c.CommitAdoption(ctx, idNew,
-		[]SnapshotMember{{SnapshotID: idNew, Path: "InRelease", BlobHash: rNew, DeclaredSHA256: rNew}},
+		[]SnapshotMember{{SnapshotID: idNew, Path: "InRelease", BlobHash: rNew, DeclaredSHA256: rNew}}, nil,
+
 		nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
@@ -2875,7 +2897,8 @@ func TestComputeHotSet_RejectsCandidateMismatch(t *testing.T) {
 	debHash := seedBlob(t, c, "deb bytes mismatch")
 	pathOld := "/pool/main/m/match/match_1.0_amd64.deb"
 	if err := c.CommitAdoption(ctx, idPrior,
-		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}},
+		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}}, nil,
+
 		[]PackageHash{{
 			CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
 			DeclaredSHA256: debHash, SnapshotID: idPrior,
@@ -2926,7 +2949,8 @@ func TestComputeHotSet_DuplicatePackageArchEmitsAllPaths(t *testing.T) {
 	debHash := seedBlob(t, c, "dup-allowed deb bytes")
 	pathOld := "/pool/main/d/dup/dup_1.0_amd64.deb"
 	if err := c.CommitAdoption(ctx, idPrior,
-		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}},
+		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}}, nil,
+
 		[]PackageHash{{
 			CanonicalScheme: scheme, CanonicalHost: host, Path: pathOld,
 			DeclaredSHA256: debHash, SnapshotID: idPrior,
@@ -3017,7 +3041,8 @@ func TestCommitAdoption_PrefetchedURLPath_PreservesHotness(t *testing.T) {
 	// Hot prefetch warmed a NEW blob for the same path.
 	newBlob := seedBlob(t, c, "new hot deb v2")
 	if err := c.CommitAdoption(ctx, id,
-		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
+		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}}, nil,
+
 		nil,
 		[]PrefetchedURLPath{{
 			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
@@ -3061,7 +3086,8 @@ func TestCommitAdoption_PrefetchedURLPath_FreshInsert(t *testing.T) {
 	})
 	newBlob := seedBlob(t, c, "fresh deb")
 	if err := c.CommitAdoption(ctx, id,
-		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
+		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}}, nil,
+
 		nil,
 		[]PrefetchedURLPath{{
 			CanonicalScheme: scheme, CanonicalHost: host, Path: debP,
@@ -3099,7 +3125,8 @@ func TestCommitAdoption_StampsCoverage(t *testing.T) {
 		SuitePath: "/dists/noble", InReleaseHash: &r,
 	})
 	if err := c.CommitAdoption(ctx, id,
-		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}},
+		[]SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: r, DeclaredSHA256: r}}, nil,
+
 		nil, nil, true); err != nil {
 		t.Fatal(err)
 	}

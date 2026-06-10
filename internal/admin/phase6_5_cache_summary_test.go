@@ -342,7 +342,7 @@ func TestRepoCoverage_RefresherCached(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertCandidateSnapshot: %v", err)
 	}
-	if err := c.CommitAdoption(ctx, id, nil, []cache.PackageHash{{
+	if err := c.CommitAdoption(ctx, id, nil, nil, []cache.PackageHash{{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		Path: "/cached/pool/x.deb", DeclaredSHA256: releaseHash,
 		SnapshotID: id, Architecture: "amd64", PackageName: "x",

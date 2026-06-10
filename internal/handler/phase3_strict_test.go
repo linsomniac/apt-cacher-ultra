@@ -207,7 +207,8 @@ func adoptCoverageComplete(t *testing.T, h *Handler,
 	if err := h.cache.CommitAdoption(context.Background(), id,
 		[]cache.SnapshotMember{
 			{SnapshotID: id, Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
-		},
+		}, nil,
+
 		nil, nil, coverageComplete); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
