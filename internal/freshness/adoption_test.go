@@ -2110,9 +2110,27 @@ func TestArchFromFilteredPath(t *testing.T) {
 		{"source-Sources.xz", "main/source/Sources.xz", "source", true},
 		{"source-pdiff-index", "main/source/Sources.diff/Index", "source", true},
 
+		// SPEC6_7 §7 filter extension — per-arch optional members.
+		// Foreign-arch Contents/cnf/dep11 are the bulk of the ~160
+		// guaranteed-404 fetch attempts per Ubuntu suite when the
+		// allowlist is set; filtering them makes the skip log/metric
+		// high-signal.
+		{"contents-amd64", "main/Contents-amd64.gz", "amd64", true},
+		{"contents-root-level", "Contents-amd64.gz", "amd64", true},
+		{"contents-uncompressed", "Contents-armhf", "armhf", true},
+		{"contents-udeb", "main/Contents-udeb-ppc64el.gz", "ppc64el", true},
+		{"cnf-commands", "main/cnf/Commands-amd64.xz", "amd64", true},
+		{"dep11-components", "main/dep11/Components-arm64.yml.gz", "arm64", true},
+		{"dep11-components-xz", "main/dep11/Components-amd64.yml.xz", "amd64", true},
+
+		// arch "all" is exempt — arch:all content serves every client
+		// arch, so an allowlist must never filter it.
+		{"contents-all", "main/Contents-all.gz", "", false},
+		{"dep11-components-all", "main/dep11/Components-all.yml.gz", "", false},
+
 		// Out of filter scope — kept regardless of allowlist.
 		{"binary-amd64-Release", "main/binary-amd64/Release", "", false},
-		{"contents-amd64", "main/Contents-amd64.gz", "", false},
+		{"dep11-icons-archless", "main/dep11/icons-64x64.tar.gz", "", false},
 		{"i18n-translation", "main/i18n/Translation-en.bz2", "", false},
 		{"per-component-Release", "main/Release", "", false},
 		{"InRelease", "InRelease", "", false},

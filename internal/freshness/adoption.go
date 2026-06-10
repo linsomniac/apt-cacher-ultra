@@ -143,8 +143,8 @@ func memberErrorFields(err error) (path, detail string) {
 // archFilterBinaryRE matches the binary-arch index file shapes that the
 // SPEC6_5 §7.2 architecture filter scopes to: Packages files (and their
 // compressed variants) plus the Packages.diff/Index pdiff manifest. Per-
-// component-arch Release files (binary-<arch>/Release) and Contents-*
-// files are deliberately NOT covered — they pass through the filter.
+// component-arch Release files (binary-<arch>/Release) are deliberately
+// NOT covered — they pass through the filter.
 var archFilterBinaryRE = regexp.MustCompile(`(?:^|/)binary-([a-z][a-z0-9]*)/(?:Packages(?:\.(?:gz|xz|bz2))?|Packages\.diff/Index)$`)
 
 // archFilterSourceRE matches the source-component index files (Sources
@@ -152,18 +152,47 @@ var archFilterBinaryRE = regexp.MustCompile(`(?:^|/)binary-([a-z][a-z0-9]*)/(?:P
 // pseudo-arch "source".
 var archFilterSourceRE = regexp.MustCompile(`(?:^|/)source/(?:Sources(?:\.(?:gz|xz|bz2))?|Sources\.diff/Index)$`)
 
+// archFilterOptionalRES are the SPEC6_7 §7 filter extension: per-arch
+// OPTIONAL member shapes — Contents (plain and udeb flavor, component
+// or suite-root level), cnf Commands, and dep11 Components. Capture 1
+// is the arch in each. Foreign-arch instances of these are the bulk of
+// the ~160 guaranteed-404 fetch attempts per Ubuntu suite (the main
+// archive declares them but only ports.ubuntu.com serves them);
+// pre-skipping them under the allowlist saves the traffic and makes
+// the adoption_member_skipped log/metric high-signal. Arch-independent
+// optional members (dep11 icons, i18n Translations) stay unfiltered.
+var archFilterOptionalRES = []*regexp.Regexp{
+	regexp.MustCompile(`(?:^|/)Contents-(?:udeb-)?([a-z][a-z0-9]*)(?:\.(?:gz|xz|bz2))?$`),
+	regexp.MustCompile(`(?:^|/)cnf/Commands-([a-z][a-z0-9]*)(?:\.(?:gz|xz|bz2))?$`),
+	regexp.MustCompile(`(?:^|/)dep11/Components-([a-z][a-z0-9]*)\.yml(?:\.(?:gz|xz|bz2))?$`),
+}
+
 // archFromFilteredPath inspects a Release member's suite-relative path
-// and reports the architecture tag the SPEC6_5 §7.2 filter would key on.
-// Returns ("amd64", true) for "main/binary-amd64/Packages.gz", returns
-// ("source", true) for "main/source/Sources.xz", returns ("", false) for
-// any path the filter does not scope to (Release.gpg, Contents-*, i18n
-// translations, per-component-arch Release files, etc.).
+// and reports the architecture tag the SPEC6_5 §7.2 / SPEC6_7 §7
+// filter would key on. Returns ("amd64", true) for
+// "main/binary-amd64/Packages.gz" or "Contents-amd64.gz", ("source",
+// true) for "main/source/Sources.xz", and ("", false) for any path the
+// filter does not scope to (Release.gpg, i18n translations, dep11
+// icons, per-component-arch Release files, etc.).
+//
+// The pseudo-arch "all" is exempt by construction: arch:all content
+// (e.g. Debian's Contents-all) serves clients of EVERY architecture,
+// so no allowlist may filter it — it reports ("", false) like an
+// unfiltered path.
 func archFromFilteredPath(p string) (arch string, filtered bool) {
 	if m := archFilterBinaryRE.FindStringSubmatch(p); m != nil {
 		return m[1], true
 	}
 	if archFilterSourceRE.MatchString(p) {
 		return "source", true
+	}
+	for _, re := range archFilterOptionalRES {
+		if m := re.FindStringSubmatch(p); m != nil {
+			if m[1] == "all" {
+				return "", false
+			}
+			return m[1], true
+		}
 	}
 	return "", false
 }

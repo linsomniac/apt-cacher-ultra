@@ -859,6 +859,58 @@ func TestAdopter_4xxIndexTargetSkipReason(t *testing.T) {
 	}
 }
 
+// TestAdopter_ArchFilterCoversOptionalMembers: with the allowlist set,
+// foreign-arch Contents/cnf/dep11 members are pre-skipped without any
+// upstream fetch (SPEC6_7 §7), while same-arch and arch-independent
+// optional members still adopt.
+func TestAdopter_ArchFilterCoversOptionalMembers(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:         env.cache,
+		Fetcher:       env.fetcher,
+		Verifier:      passThroughVerifier{},
+		HostLimiter:   hostsem.New(8),
+		Architectures: []string{"amd64"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	amdContents := []byte("amd64 contents")
+	icons := []byte("icon tar bytes")
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages":    pkgs,
+		"Contents-amd64.gz":             amdContents,
+		"Contents-armhf.gz":             []byte("ports-only contents"),
+		"main/cnf/Commands-s390x.xz":    []byte("ports-only cnf"),
+		"main/dep11/icons-64x64.tar.gz": icons,
+	})
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.put(base+"main/binary-amd64/Packages", pkgs)
+	env.fetcher.put(base+"Contents-amd64.gz", amdContents)
+	env.fetcher.put(base+"main/dep11/icons-64x64.tar.gz", icons)
+	// Deliberately NO canned responses for the foreign-arch members: a
+	// fetch attempt against them would fail the adoption, proving the
+	// filter pre-skipped them.
+
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, u := range env.fetcher.requested() {
+		if strings.Contains(u, "armhf") || strings.Contains(u, "s390x") {
+			t.Errorf("foreign-arch member fetched despite allowlist: %s", u)
+		}
+	}
+	snapID := currentSnapshotID(t, env)
+	for _, p := range []string{"Contents-amd64.gz", "main/dep11/icons-64x64.tar.gz"} {
+		if _, err := env.cache.GetSnapshotMember(ctx, snapID, p); err != nil {
+			t.Errorf("member %q missing: %v", p, err)
+		}
+	}
+}
+
 func TestNewAdopter_RejectsNegativeRetryConfig(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	if _, err := NewAdopter(AdoptionConfig{
