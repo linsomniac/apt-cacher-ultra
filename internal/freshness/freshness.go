@@ -1019,7 +1019,8 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 // being adopted, so this degrades safely rather than corrupting. It only
 // bites a non-default-port suite whose anchor was already reaped (the
 // port-correct row is gone). The durable fix is to persist the anchor's
-// upstream URL on suite_snapshot (schema v5) and read it here; deferred.
+// upstream URL on suite_snapshot in a future schema migration and read
+// it here; deferred (v5 shipped snapshot_skipped_member instead).
 // In steady state this path does not run: CommitAdoption Step 3c keeps
 // the anchor present with its real upstream_url and the GC identity guard
 // (SPEC4 §5 guard (d)) stops it being reaped.

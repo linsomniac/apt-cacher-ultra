@@ -10,11 +10,13 @@ package freshness
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -924,5 +926,186 @@ func TestNewAdopter_RejectsNegativeRetryConfig(t *testing.T) {
 		HostLimiter: hostsem.New(1), MemberRetryDelay: -time.Second,
 	}); err == nil {
 		t.Error("MemberRetryDelay=-1s accepted, want error")
+	}
+}
+
+// Codex-review finding: a repair attempt that fetches fine but fails
+// PROMOTION must bump retry_count exactly like a fetch failure does —
+// otherwise a permanently stuck repair reads as forever on attempt
+// one in the skip row's bookkeeping.
+func TestRepairSkippedMembers_PromotionFailureBumpsRetryCount(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad, goodContents, snapID := adoptWithIntegritySkip(t, env)
+
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	env.fetcher.put(base+"Contents-amd64.gz", goodContents) // mirror synced
+
+	// Force promotion failure: plant a member row at the canonical
+	// path bound to a DIFFERENT blob (corruption-class state the
+	// repair transaction rejects).
+	other := strings.Repeat("e", 64)
+	db, err := sql.Open("sqlite", filepath.Join(env.cache.Dir(), "cache.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO blob (hash, size, created_at, refcount) VALUES (?, 1, 1, 1)`,
+		other); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256)
+		 VALUES (?, 'Contents-amd64.gz', ?, ?)`, snapID, other, other); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	ad.RepairSkippedMembers(ctx, env.suite, snapID)
+
+	rows, err := env.cache.ListRepairableSkippedMembers(ctx, snapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("repairable rows = %d, want 1 (promotion must have failed)", len(rows))
+	}
+	if rows[0].RetryCount != 1 {
+		t.Errorf("retry_count = %d, want 1 after failed promotion", rows[0].RetryCount)
+	}
+}
+
+// Codex-review finding: the repair pass must count against the same
+// global [adoption].max_concurrent gate as adoptions. The per-suite
+// mutex and per-host hostsem bound neither the cross-suite total of
+// concurrent repair fetches nor their temp-file/cache-write pressure;
+// a wave of fresh ticks over many degraded suites would otherwise fan
+// out unbounded. Mirrors TestAdopter_ConcurrencyCap.
+func TestRepairSkippedMembers_RespectsConcurrencyCap(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	c, err := cache.Open(ctx, dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	setupFF := newFakeFetcher()
+	setupAd, err := NewAdopter(AdoptionConfig{
+		Cache:                          c,
+		Fetcher:                        setupFF,
+		Verifier:                       passThroughVerifier{},
+		HostLimiter:                    hostsem.New(8),
+		TolerateOptionalMemberFailures: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two suites, each adopted with one integrity-skipped root member.
+	var (
+		suites  [2]SuiteRef
+		snapIDs [2]int64
+		goods   [2][]byte
+	)
+	for i, name := range []string{"n1", "n2"} {
+		suites[i] = SuiteRef{
+			CanonicalScheme: "http",
+			CanonicalHost:   "archive.ubuntu.com",
+			SuitePath:       "/ubuntu/dists/" + name,
+		}
+		goods[i] = []byte(strings.Repeat(string(rune('A'+i)), 100))
+		pkgs := fakePackagesStanzas(map[string]string{
+			"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64),
+		})
+		releaseText, _ := makeRelease(map[string][]byte{
+			"main/binary-amd64/Packages": pkgs,
+			"Contents-amd64.gz":          goods[i],
+		})
+		base := "http://archive.ubuntu.com/ubuntu/dists/" + name + "/"
+		setupFF.put(base+"main/binary-amd64/Packages", pkgs)
+		setupFF.put(base+"Contents-amd64.gz", []byte(strings.Repeat("z", 90))) // stale generation
+		if err := setupAd.Run(ctx, suites[i], releaseText, "", ""); err != nil {
+			t.Fatalf("setup Run(%s): %v", name, err)
+		}
+		sf, err := c.GetSuiteFreshness(ctx, "http", "archive.ubuntu.com", suites[i].SuitePath)
+		if err != nil || sf.CurrentSnapshotID == nil {
+			t.Fatalf("setup freshness(%s): %v", name, err)
+		}
+		snapIDs[i] = *sf.CurrentSnapshotID
+		rows, err := c.ListRepairableSkippedMembers(ctx, snapIDs[i])
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("setup repairable(%s) = %d (err=%v), want 1", name, len(rows), err)
+		}
+	}
+
+	// Repair adopter: cap 1, fetches gated through blockReqs. Only the
+	// by-hash URLs are canned — the repair probes by-hash first and the
+	// verified bytes make the canonical fetch unnecessary.
+	pending := make(chan blockReq, 8)
+	bf := &blockingFetcher{pending: pending}
+	for i := range suites {
+		bf.put("http://archive.ubuntu.com"+suites[i].SuitePath+"/by-hash/SHA256/"+shaOf(goods[i]), goods[i])
+	}
+	repAd, err := NewAdopter(AdoptionConfig{
+		Cache:                c,
+		Fetcher:              bf,
+		Verifier:             passThroughVerifier{},
+		HostLimiter:          hostsem.New(8),
+		MaxConcurrent:        1,
+		RepairSkippedMembers: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A starts; blocks in its by-hash fetch while holding the cap.
+	done := make(chan int, 2)
+	go func() { repAd.RepairSkippedMembers(ctx, suites[0], snapIDs[0]); done <- 0 }()
+	var aReq blockReq
+	select {
+	case aReq = <-pending:
+	case <-time.After(2 * time.Second):
+		t.Fatal("repair A never reached fetch")
+	}
+
+	// B starts while A holds the cap. Must NOT enter Fetch.
+	go func() { repAd.RepairSkippedMembers(ctx, suites[1], snapIDs[1]); done <- 1 }()
+	select {
+	case <-pending:
+		t.Fatal("repair B reached fetch while concurrency cap was held")
+	case <-time.After(150 * time.Millisecond):
+		// expected
+	}
+
+	// Release A; its pass completes, B takes the slot and completes.
+	close(aReq.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("repair A never finished after release")
+	}
+	var bReq blockReq
+	select {
+	case bReq = <-pending:
+	case <-time.After(2 * time.Second):
+		t.Fatal("repair B never reached fetch after A released the cap")
+	}
+	close(bReq.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("repair B never finished")
+	}
+
+	// Both members actually repaired through the gate.
+	for i := range suites {
+		rows, err := c.ListRepairableSkippedMembers(ctx, snapIDs[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 0 {
+			t.Errorf("suite %d: %d skip rows remain after repair", i, len(rows))
+		}
 	}
 }

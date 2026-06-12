@@ -113,21 +113,37 @@ runs `Adopter.RepairSkippedMembers`:
 
 1. List the snapshot's `reason = 'optional_member_integrity'` rows
    (no-op for every healthy suite — the steady state).
-2. Per row, run the full `adoptMember` sequence (by-hash probe first)
+2. With work to do, acquire the same global
+   `[adoption].max_concurrent` gate as adoptions — the per-suite
+   mutex and per-host limiter bound neither the cross-suite fan-out
+   of repair fetches nor their cache-write pressure.
+3. Per row, run the full `adoptMember` sequence (by-hash probe first)
    against the recorded declaration.
-3. On success, promote the member via `cache.RepairSkippedMember`: one
+4. On success, promote the member via `cache.RepairSkippedMember`: one
    writer transaction that (a) re-verifies the snapshot is **still
    current** (repairing a displaced snapshot would leak refcounts —
-   `ErrSnapshotNotCurrent` otherwise), (b) consumes the skip row,
-   (c) bumps `blob.refcount` once per distinct blob the snapshot does
-   not already pin (preserving the "one bump per distinct blob per
-   snapshot" invariant the displacement decrement relies on), and
-   (d) inserts the canonical member row plus its by-hash alias.
-4. On failure, bump `retry_count` and leave the row for the next tick.
-   Attempts are bounded by the snapshot's lifetime and cost 1–2
-   upstream requests per degraded member per tick; "changed" ticks
-   route to adoption instead, whose new snapshot supersedes the old
-   skip records.
+   `ErrSnapshotNotCurrent` otherwise), (b) loads the skip row and
+   **binds** every inserted row to its persisted signed declaration —
+   blob hash and declared hash must both equal the recorded
+   `declared_sha256`, rows must reference this snapshot, and the
+   canonical path must be present — then consumes it, (c) bumps
+   `blob.refcount` once iff the snapshot does not already pin the
+   blob (preserving the "one bump per distinct blob per snapshot"
+   invariant the displacement decrement relies on), and (d) inserts
+   the canonical member row plus its by-hash alias, idempotently
+   accepting an already-present **byte-identical** row (identical
+   same-directory members share one alias path, which the original
+   adoption or an earlier repair may have committed) and failing the
+   whole transaction on any same-path mismatch.
+5. On failure — fetch or promotion — bump `retry_count` and leave the
+   row for the next tick. Attempts recur for as long as the snapshot
+   stays current (indefinitely, for a suite whose upstream never
+   republishes) at 1–2 upstream requests per degraded member per
+   fresh tick, with tick cadence already cooldown-limited; there is
+   deliberately no cap or backoff, and a persistently climbing
+   `retry_count` is the operator signal that a member needs
+   investigation. "changed" ticks route to adoption instead, whose
+   new snapshot supersedes the old skip records.
 
 Net effect: recovery from a stale-mirror adoption is bounded by
 mirror-sync time (minutes) instead of the next InRelease publication
@@ -229,7 +245,10 @@ metric high-signal.
   up to ~60s to an adoption whose members are failing — bounded per
   member, with heartbeats covering candidate liveness — and the
   repair pass adds one cheap indexed SELECT per fresh tick per
-  adopted suite. Both have config kill switches.
+  adopted suite in the steady state (no repairable rows). A degraded
+  suite additionally re-fetches its repairable members each fresh
+  tick, gated by the same `[adoption].max_concurrent` cap as
+  adoptions. Both features have config kill switches.
 - **Metric/label deltas:** new counters
   `acu_adoption_member_retries_total{outcome ∈ success|exhausted}`
   and `acu_adoption_member_repairs_total{outcome ∈ success|failure}`;
@@ -246,14 +265,18 @@ metric high-signal.
 skip rows; ListRepairableSkippedMembers filters by reason;
 RepairSkippedMember (promotion + alias, single refcount bump,
 shared-blob no-double-bump with displacement-to-zero proof,
-not-current refusal); BumpSkippedMemberRetry; snapshot-GC cascade.
+not-current refusal, shared-alias idempotence with
+displacement-to-zero proof, conflicting-row rejection,
+declaration-binding refusals); BumpSkippedMemberRetry; snapshot-GC
+cascade.
 
 `internal/freshness`: integrity skip recorded with declaration +
 detail; `skipped_integrity_count` in adoption_success; the incident
 replay (by-hash 404 → canonical stale → retry heals via by-hash);
 retry exhaustion still skips + records; 404 never retried; IndexTarget
 retried then fatal; repair promotes member + alias and consumes the
-row; repair failure bumps retry_count; repair kill switch; end-to-end
+row; repair fetch AND promotion failures bump retry_count; repair
+respects the global max_concurrent gate; repair kill switch; end-to-end
 Checker tick → repair (httptest upstream, unchanged 200);
 indexTargetGroup classification; required-arch guard (all-missing
 defers, one-variant suffices, foreign groups ignored, opt-in);

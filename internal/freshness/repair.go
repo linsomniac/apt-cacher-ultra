@@ -23,7 +23,10 @@ import (
 // skipped member of the suite's snapshot. Invoked by the freshness
 // Checker with the per-suite mutex held (handed off exactly like an
 // adoption goroutine), so it never overlaps an adoption or another
-// repair of the same suite.
+// repair of the same suite. Across suites, a pass with work to do
+// counts against the same global [adoption].max_concurrent gate as
+// adoptions — per-suite mutexes and per-host limits bound neither the
+// total fan-out of repair fetches nor their cache-write pressure.
 //
 // Per member: the full adoptMember sequence runs — pool reuse, by-hash
 // probe (the content-addressed URL immune to the revision race; the
@@ -32,10 +35,14 @@ import (
 // would. On success the member is promoted into snapshot_member
 // (canonical path + by-hash alias) via cache.RepairSkippedMember,
 // which re-checks inside its transaction that the snapshot is still
-// current. On failure the row's retry_count is bumped and the next
-// fresh tick tries again; the bookkeeping is for operator visibility,
-// not a cap — attempts are bounded by the snapshot's lifetime and cost
-// 1-2 upstream requests per degraded member per tick.
+// current. On failure (fetch or promotion) the row's retry_count is
+// bumped and the next fresh tick tries again; the bookkeeping is for
+// operator visibility, not a cap. Attempts recur for as long as the
+// snapshot stays current — which can be indefinitely for a suite
+// whose upstream never republishes — at a cost of 1-2 upstream
+// requests per degraded member per fresh tick, with the tick cadence
+// already cooldown-limited. A persistent non-zero retry_count is the
+// operator signal that a member needs investigation.
 //
 // No-ops (cheaply) when the repair switch is off or the snapshot has
 // no repairable rows — the steady state for every healthy suite.
@@ -55,6 +62,18 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 	}
 	if len(rows) == 0 {
 		return
+	}
+
+	// Global concurrency cap, mirroring runShared Step 0. Acquired
+	// only past the no-op checks so healthy suites' ticks never touch
+	// the gate.
+	if a.concurrencySem != nil {
+		select {
+		case a.concurrencySem <- struct{}{}:
+			defer func() { <-a.concurrencySem }()
+		case <-ctx.Done():
+			return
+		}
 	}
 
 	repaired := 0
@@ -125,6 +144,13 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 				"attempts", row.RetryCount+1,
 				"err", rerr,
 			)
+			// Promotion failures count as attempts too — without the
+			// bump a permanently stuck repair reads as forever on
+			// attempt one. ErrNotFound rows make this a benign no-op.
+			if berr := a.cache.BumpSkippedMemberRetry(ctx, snapshotID, row.Path); berr != nil {
+				a.logger.Warn("adoption_repair_bump_failed",
+					"snapshot_id", snapshotID, "path", row.Path, "err", berr)
+			}
 			continue
 		}
 		adoptionMemberRepairsTotal.Inc("success")

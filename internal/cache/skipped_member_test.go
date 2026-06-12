@@ -419,3 +419,214 @@ func TestSnapshotGC_ReapsSkippedMemberRows(t *testing.T) {
 		t.Errorf("snapshot_skipped_member rows for reaped snapshot = %d, want 0", n)
 	}
 }
+
+// Codex-review finding: two members can legitimately share one blob —
+// identical content in the same directory yields the same by-hash
+// alias path. The original adoption dedups alias rows (aliasSeen in
+// runShared Step 7); a repair whose alias row already exists must be
+// idempotent for byte-identical rows, or the PK violation rolls back
+// the whole transaction and the member is unrepairable for the
+// snapshot's entire lifetime.
+func TestRepairSkippedMember_SharedAliasAlreadyInSnapshot(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+
+	shared := seedBlob(t, c, "identical contents bytes")
+	rel := seedBlob(t, c, "InRelease body")
+	alias := "main/by-hash/SHA256/" + shared
+	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "x.example",
+		SuitePath:       "/dists/s",
+		InReleaseHash:   &rel,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Adoption fetched main/A.gz fine (canonical + alias rows) and
+	// skipped main/B.gz, whose declared hash is the SAME blob.
+	err = c.CommitAdoption(ctx, id,
+		[]SnapshotMember{
+			{SnapshotID: id, Path: "InRelease", BlobHash: rel, DeclaredSHA256: rel},
+			{SnapshotID: id, Path: "main/A.gz", BlobHash: shared, DeclaredSHA256: shared},
+			{SnapshotID: id, Path: alias, BlobHash: shared, DeclaredSHA256: shared},
+		},
+		[]SkippedMember{{
+			SnapshotID:     id,
+			Path:           "main/B.gz",
+			DeclaredSHA256: shared,
+			Size:           24,
+			Reason:         SkipReasonOptionalMemberIntegrity,
+		}},
+		nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = c.RepairSkippedMember(ctx, id, "main/B.gz", []SnapshotMember{
+		{SnapshotID: id, Path: "main/B.gz", BlobHash: shared, DeclaredSHA256: shared},
+		{SnapshotID: id, Path: alias, BlobHash: shared, DeclaredSHA256: shared},
+	})
+	if err != nil {
+		t.Fatalf("RepairSkippedMember with pre-existing identical alias: %v", err)
+	}
+
+	// Canonical row landed; alias still resolves; skip row consumed.
+	for _, p := range []string{"main/B.gz", alias} {
+		if _, err := c.GetSnapshotMember(ctx, id, p); err != nil {
+			t.Errorf("GetSnapshotMember(%q): %v", p, err)
+		}
+	}
+	rows, err := c.ListRepairableSkippedMembers(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("skip row still present after repair: %v", rows)
+	}
+	// Blob already pinned by the snapshot: no extra bump, and the
+	// displacement decrement must land it at exactly zero.
+	if got := blobRefcount(t, c, shared); got != 1 {
+		t.Errorf("post-repair refcount = %d, want 1", got)
+	}
+	rel2 := seedBlob(t, c, "InRelease v2")
+	id2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "x.example",
+		SuitePath:       "/dists/s",
+		InReleaseHash:   &rel2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id2, []SnapshotMember{
+		{SnapshotID: id2, Path: "InRelease", BlobHash: rel2, DeclaredSHA256: rel2},
+	}, nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := blobRefcount(t, c, shared); got != 0 {
+		t.Errorf("post-displacement refcount = %d, want 0 (leak)", got)
+	}
+}
+
+// Idempotence is for byte-identical rows ONLY: an existing row at the
+// same path with a different blob is corruption, and the repair must
+// fail loudly (rolling back the skip-row consume) instead of silently
+// keeping either version.
+func TestRepairSkippedMember_RejectsConflictingExistingRow(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+
+	good := seedBlob(t, c, "good bytes")
+	stale := seedBlob(t, c, "stale bytes")
+	rel := seedBlob(t, c, "InRelease body")
+	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http",
+		CanonicalHost:   "x.example",
+		SuitePath:       "/dists/s",
+		InReleaseHash:   &rel,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.CommitAdoption(ctx, id,
+		[]SnapshotMember{
+			{SnapshotID: id, Path: "InRelease", BlobHash: rel, DeclaredSHA256: rel},
+			{SnapshotID: id, Path: "main/C.gz", BlobHash: stale, DeclaredSHA256: stale},
+		},
+		[]SkippedMember{{
+			SnapshotID:     id,
+			Path:           "main/C.gz",
+			DeclaredSHA256: good,
+			Size:           10,
+			Reason:         SkipReasonOptionalMemberIntegrity,
+		}},
+		nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = c.RepairSkippedMember(ctx, id, "main/C.gz", []SnapshotMember{
+		{SnapshotID: id, Path: "main/C.gz", BlobHash: good, DeclaredSHA256: good},
+	})
+	if err == nil {
+		t.Fatal("expected error for conflicting existing member row; got nil")
+	}
+	// Rolled back: the skip row survives for the next attempt.
+	rows, err := c.ListRepairableSkippedMembers(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("skip row count = %d, want 1 (rollback)", len(rows))
+	}
+	if got := blobRefcount(t, c, good); got != 0 {
+		t.Errorf("refcount(good) = %d, want 0 (rollback)", got)
+	}
+}
+
+// Codex-review hardening: the transaction is the integrity boundary,
+// so the inserted rows must be bound to the persisted signed
+// declaration being consumed — not just shape-checked. Every member
+// must carry the skip row's declared hash as both declared_sha256 and
+// blob_hash (repairable members' bytes verified equal to the signed
+// declaration), reference this snapshot, and include the canonical
+// path.
+func TestRepairSkippedMember_BindsToPersistedDeclaration(t *testing.T) {
+	other := strings.Repeat("d", 64)
+
+	cases := []struct {
+		name   string
+		mutate func(id int64, declared string) []SnapshotMember
+	}{
+		{"declared hash differs from skip row", func(id int64, declared string) []SnapshotMember {
+			return []SnapshotMember{
+				{SnapshotID: id, Path: "main/Contents-amd64.gz", BlobHash: declared, DeclaredSHA256: other},
+			}
+		}},
+		{"blob hash differs from declaration", func(id int64, declared string) []SnapshotMember {
+			return []SnapshotMember{
+				{SnapshotID: id, Path: "main/Contents-amd64.gz", BlobHash: other, DeclaredSHA256: declared},
+			}
+		}},
+		{"foreign snapshot id", func(id int64, declared string) []SnapshotMember {
+			return []SnapshotMember{
+				{SnapshotID: id + 1, Path: "main/Contents-amd64.gz", BlobHash: declared, DeclaredSHA256: declared},
+			}
+		}},
+		{"canonical path missing", func(id int64, declared string) []SnapshotMember {
+			return []SnapshotMember{
+				{SnapshotID: id, Path: "main/by-hash/SHA256/" + declared, BlobHash: declared, DeclaredSHA256: declared},
+			}
+		}},
+		{"no members", func(id int64, declared string) []SnapshotMember {
+			return nil
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			contents := seedBlob(t, c, "Contents bytes")
+			id := commitSnapshotWithSkips(t, c, []SkippedMember{{
+				Path:           "main/Contents-amd64.gz",
+				DeclaredSHA256: contents,
+				Size:           14,
+				Reason:         SkipReasonOptionalMemberIntegrity,
+			}})
+
+			err := c.RepairSkippedMember(ctx, id, "main/Contents-amd64.gz", tc.mutate(id, contents))
+			if err == nil {
+				t.Fatal("expected binding-validation error; got nil")
+			}
+			// The skip row must survive the refused repair.
+			rows, lerr := c.ListRepairableSkippedMembers(ctx, id)
+			if lerr != nil {
+				t.Fatal(lerr)
+			}
+			if len(rows) != 1 {
+				t.Errorf("skip row count = %d, want 1", len(rows))
+			}
+		})
+	}
+}

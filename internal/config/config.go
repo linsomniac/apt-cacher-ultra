@@ -217,18 +217,22 @@ type AdoptionConfig struct {
 
 	// TolerateOptionalMemberFailures controls whether an
 	// integrity/availability failure on a non-IndexTarget Release member
-	// (Contents-*, dep11 Components/icons, i18n Translations — files apt
-	// does not fetch for `apt update`/`apt install`) is skipped rather
-	// than aborting the whole suite adoption. Default true (the drop-in/
+	// (Contents-*, dep11 Components/icons, i18n Translations) is skipped
+	// rather than aborting the whole suite adoption. Clients DO fetch
+	// some of these — Contents-* via apt-file and Acquire-IndexTargets
+	// was exactly the 2026-06-09 incident surface — so a skipped member
+	// 404s until healed: integrity-class skips are recorded with their
+	// signed declarations and re-attempted by the SPEC6_7 §1 in-adoption
+	// retry and §3 fresh-tick repair pass. Default true (the drop-in/
 	// just-works posture: a single volatile or mis-served optional index
 	// no longer fails an otherwise-good suite — the dominant cause of
 	// adoption_run_failed in the field). IndexTarget members (per-arch
 	// Packages*, per-component Sources*, their pdiff Indexes) remain
 	// fatal-on-failure regardless, so the surface apt installs from is
-	// never weakened, and a skipped member is never adopted/served (apt
-	// 404s it). Set false to restore Phase-6 strict all-or-nothing
-	// adoption. Pre-populated true in defaultConfig (bool zero-value
-	// cannot distinguish "absent" from "explicit false").
+	// never weakened. Set false to restore Phase-6 strict
+	// all-or-nothing adoption. Pre-populated true in defaultConfig
+	// (bool zero-value cannot distinguish "absent" from "explicit
+	// false").
 	TolerateOptionalMemberFailures bool `toml:"tolerate_optional_member_failures"`
 
 	// MemberRetryCount / MemberRetryDelay are the SPEC6_7 §1 in-adoption

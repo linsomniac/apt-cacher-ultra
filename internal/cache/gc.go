@@ -224,9 +224,9 @@ func (r SnapshotGCBatchResult) Total() int {
 //  1. BEGIN
 //  2. SELECT (sub-job A ∪ sub-job B) candidate ids inside the tx — the
 //     SELECT-DELETE liveness race is closed by single-writer ordering.
-//  3. cascade DELETE: snapshot_member, package_hash, suite_snapshot
-//     (children before parent for FK ordering with PRAGMA
-//     foreign_keys = ON).
+//  3. cascade DELETE: snapshot_member, snapshot_skipped_member,
+//     package_hash, suite_snapshot (children before parent for FK
+//     ordering with PRAGMA foreign_keys = ON).
 //  4. COMMIT
 //
 // staleGraceSeconds is the runtime-derived `max(total_timeout ×
