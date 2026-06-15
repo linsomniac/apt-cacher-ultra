@@ -126,6 +126,20 @@ var (
 		"outcome",
 	)
 
+	// adoptionServeTargetMissingTotal counts SPEC6_8 serve-contract guard
+	// blocks: an adoption deferred because a requestable IndexTarget group
+	// (an allowlisted arch, or the always-required "all" pseudo-arch) the
+	// signed Release declared was absent from the snapshot. Steady state is
+	// ZERO — any nonzero value means the prior snapshot is being held back
+	// because committing would 404 `apt update`. Labeled by arch; closed
+	// low-cardinality enum (allowlist arches ∪ {all, source}). Alert on it.
+	adoptionServeTargetMissingTotal = metrics.NewCounterWithCap(
+		"acu_adoption_serve_target_missing_total",
+		"Adoptions deferred because a requestable IndexTarget group the Release declared was absent from the snapshot, by arch (SPEC6_8).",
+		metrics.DefaultMaxSeries,
+		"arch",
+	)
+
 	adoptionSourcesParsedTotal = metrics.NewCounterWithCap(
 		"acu_adoption_sources_parsed_total",
 		"Sources index files processed during adoption, by outcome (SPEC6_5 §10.3).",

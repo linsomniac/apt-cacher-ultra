@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 )
 
 // TestSuiteRelativePath_TrimsPrefix verifies the helper that converts
@@ -123,6 +126,55 @@ func TestServeHTTP_SnapshotMissReturns404(t *testing.T) {
 	}
 	if got := upstreamCalls.Load(); got != 0 {
 		t.Errorf("upstream calls=%d, want 0 (snapshot 404 must not trigger upstream fetch)", got)
+	}
+}
+
+// TestServeHTTP_SnapshotMissIndexTargetRaisesAlert covers the SPEC6_8
+// served-404 symptom signal: an authoritative not-in-snapshot 404 for an
+// apt IndexTarget (binary-<arch>/Packages*) emits an alertable WARN
+// (snapshot_index_target_404) carrying the architecture, because it means
+// `apt update` is broken against the current snapshot — whatever dropped
+// the index. A non-IndexTarget metadata 404 (Contents-*, which apt has no
+// hard dependency on) must NOT raise it, to keep the signal high.
+func TestServeHTTP_SnapshotMissIndexTargetRaisesAlert(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	h := newTestHandlerWithServe(t, config.ServeConfig{}, logger)
+
+	// Upstream host for the suite ref; the snapshot-404 path never calls it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("upstream"))
+	}))
+	defer srv.Close()
+	scheme, host, port := splitURL(t, srv.URL)
+	suite := "/dists/noble"
+
+	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	commitInlineSnapshot(t, h, scheme, host, suite, releaseBlob, []cache.SnapshotMember{
+		{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
+	}, nil)
+
+	// IndexTarget absent from snapshot → 404 + alert with architecture.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newProxyReqHostPort("GET", scheme, host+port, "/dists/noble/main/binary-all/Packages"))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", rec.Code)
+	}
+	out := logBuf.String()
+	if !strings.Contains(out, "snapshot_index_target_404") ||
+		!strings.Contains(out, `"architecture":"all"`) {
+		t.Errorf("expected snapshot_index_target_404 WARN with architecture=all, got:\n%s", out)
+	}
+
+	// Optional metadata (Contents-all) absent → 404 but NO alert.
+	logBuf.Reset()
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, newProxyReqHostPort("GET", scheme, host+port, "/dists/noble/main/Contents-all.gz"))
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("Contents status=%d, want 404", rec2.Code)
+	}
+	if strings.Contains(logBuf.String(), "snapshot_index_target_404") {
+		t.Errorf("Contents-all (no apt hard dep) must NOT raise the IndexTarget alert:\n%s", logBuf.String())
 	}
 }
 

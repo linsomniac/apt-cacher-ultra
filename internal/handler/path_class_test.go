@@ -84,3 +84,55 @@ func TestArchFromPath(t *testing.T) {
 		})
 	}
 }
+
+// TestIsIndexTargetPath covers the SPEC6_8 served-404 alert predicate:
+// only the per-arch Packages* / per-component Sources* files apt installs
+// from (a 404 on them = broken `apt update`); NOT by-hash, pdiff Index,
+// Release, .debs, or optional members (those have apt-side fallbacks).
+func TestIsIndexTargetPath(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"binary-all-Packages", "dists/noble/main/binary-all/Packages", true},
+		{"binary-all-Packages.gz", "dists/noble/main/binary-all/Packages.gz", true},
+		{"binary-amd64-Packages", "dists/noble/main/binary-amd64/Packages", true},
+		{"binary-amd64-Packages.xz", "dists/noble/main/binary-amd64/Packages.xz", true},
+		{"source-Sources", "dists/noble/main/source/Sources", true},
+		{"source-Sources.gz", "dists/noble/main/source/Sources.gz", true},
+		{"d-i-binary-all", "dists/noble/main/debian-installer/binary-all/Packages", true},
+		// Excluded: apt has fallbacks / not the index itself.
+		{"by-hash-not-flagged", "dists/noble/main/binary-all/by-hash/SHA512/abc123", false},
+		{"pdiff-index-not-flagged", "dists/noble/main/binary-amd64/Packages.diff/Index", false},
+		{"pdiff-patch-not-flagged", "dists/noble/main/binary-amd64/Packages.diff/2026-01-01-0000.00.gz", false},
+		{"release-not-flagged", "dists/noble/Release", false},
+		{"inrelease-not-flagged", "dists/noble/InRelease", false},
+		{"deb-not-flagged", "pool/main/f/foo/foo_1.0_all.deb", false},
+		{"contents-not-flagged", "dists/noble/main/Contents-all.gz", false},
+		{"empty", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isIndexTargetPath(tc.path); got != tc.want {
+				t.Errorf("isIndexTargetPath(%q) = %v, want %v", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBoundedArchLabel: the served-404 metric label is bucketed to a known
+// arch set so a client-forged binary-<random>/Packages path can't mint
+// unbounded label cardinality.
+func TestBoundedArchLabel(t *testing.T) {
+	for _, arch := range []string{"all", "amd64", "arm64", "source", "riscv64"} {
+		if got := boundedArchLabel(arch); got != arch {
+			t.Errorf("boundedArchLabel(%q) = %q, want %q (known arch preserved)", arch, got, arch)
+		}
+	}
+	for _, arch := range []string{"EVIL", "notanarch", "amd64; rm -rf", "", "ALL"} {
+		if got := boundedArchLabel(arch); got != "other" {
+			t.Errorf("boundedArchLabel(%q) = %q, want \"other\" (unknown bucketed)", arch, got)
+		}
+	}
+}

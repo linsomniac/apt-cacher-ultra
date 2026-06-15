@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2124,7 +2125,17 @@ func TestArchFromFilteredPath(t *testing.T) {
 		{"dep11-components-xz", "main/dep11/Components-amd64.yml.xz", "amd64", true},
 
 		// arch "all" is exempt — arch:all content serves every client
-		// arch, so an allowlist must never filter it.
+		// arch, so an allowlist must never filter it. This holds for the
+		// REQUIRED binary-all IndexTarget (arch-independent packages that
+		// apt fetches alongside binary-<host-arch>) just as much as for
+		// the optional Contents-all / Components-all members: skipping
+		// binary-all/Packages publishes a snapshot that 404s `apt update`
+		// for every client regardless of host arch.
+		{"binary-all-Packages", "main/binary-all/Packages", "", false},
+		{"binary-all-Packages.gz", "main/binary-all/Packages.gz", "", false},
+		{"binary-all-Packages.xz", "main/binary-all/Packages.xz", "", false},
+		{"binary-all-pdiff-index", "main/binary-all/Packages.diff/Index", "", false},
+		{"d-i-binary-all", "main/debian-installer/binary-all/Packages.gz", "", false},
 		{"contents-all", "main/Contents-all.gz", "", false},
 		{"dep11-components-all", "main/dep11/Components-all.yml.gz", "", false},
 
@@ -2266,6 +2277,119 @@ func TestAdopter_MultiArch_NoFilter_AllArchsAdopted(t *testing.T) {
 // reason="arch_not_in_allowlist". The arm64-only client requesting an
 // arm64 .deb falls through to trust-upstream Phase 1 with no
 // regression vs Phase 6 default behavior (H10's exact disposition).
+// SPEC6_8 serve-contract guard: missingRequestableIndexGroups flags
+// declared IndexTarget groups that a configured client would request
+// (allowlist arches + the always-required "all") but the snapshot didn't
+// fetch — the condition that makes a committed snapshot 404 `apt update`.
+func TestMissingRequestableIndexGroups(t *testing.T) {
+	rm := func(path string) ReleaseMember { return ReleaseMember{Path: path} }
+	amd64 := map[string]struct{}{"amd64": {}}
+	amd64src := map[string]struct{}{"amd64": {}, "source": {}}
+	cases := []struct {
+		name      string
+		declared  []ReleaseMember
+		fetched   []ReleaseMember
+		allowlist map[string]struct{}
+		want      []string
+	}{
+		{
+			// "all" is required even with NO allowlist — every client needs
+			// arch-independent packages. binary-amd64 is tolerated here
+			// (no filter scoping the cache to it).
+			name:      "binary-all required even when allowlist unset",
+			declared:  []ReleaseMember{rm("main/binary-amd64/Packages"), rm("main/binary-all/Packages")},
+			fetched:   []ReleaseMember{rm("main/binary-amd64/Packages")},
+			allowlist: nil,
+			want:      []string{"main/binary-all/Packages"},
+		},
+		{
+			// Without an allowlist, a declared-but-unfetched FOREIGN arch
+			// (Ubuntu's binary-armhf 404s on the main archive) stays a
+			// tolerated skip — the guard must not regress that.
+			name:      "foreign arch tolerated when allowlist unset",
+			declared:  []ReleaseMember{rm("main/binary-amd64/Packages"), rm("main/binary-armhf/Packages")},
+			fetched:   []ReleaseMember{rm("main/binary-amd64/Packages")},
+			allowlist: nil,
+			want:      nil,
+		},
+		{
+			name:      "binary-all declared but not fetched is flagged",
+			declared:  []ReleaseMember{rm("main/binary-amd64/Packages"), rm("main/binary-all/Packages")},
+			fetched:   []ReleaseMember{rm("main/binary-amd64/Packages")},
+			allowlist: amd64,
+			want:      []string{"main/binary-all/Packages"},
+		},
+		{
+			name:      "binary-all fetched is fine",
+			declared:  []ReleaseMember{rm("main/binary-amd64/Packages"), rm("main/binary-all/Packages")},
+			fetched:   []ReleaseMember{rm("main/binary-amd64/Packages"), rm("main/binary-all/Packages")},
+			allowlist: amd64,
+			want:      nil,
+		},
+		{
+			name:      "binary-all served by a compressed variant is fine",
+			declared:  []ReleaseMember{rm("main/binary-all/Packages"), rm("main/binary-all/Packages.gz")},
+			fetched:   []ReleaseMember{rm("main/binary-all/Packages.gz")},
+			allowlist: amd64,
+			want:      nil,
+		},
+		{
+			name:      "allowlisted arch wholly absent is flagged",
+			declared:  []ReleaseMember{rm("main/binary-amd64/Packages")},
+			fetched:   nil,
+			allowlist: amd64,
+			want:      []string{"main/binary-amd64/Packages"},
+		},
+		{
+			name:      "foreign arch absent is NOT flagged",
+			declared:  []ReleaseMember{rm("main/binary-arm64/Packages")},
+			fetched:   nil,
+			allowlist: amd64,
+			want:      nil,
+		},
+		{
+			name:      "source absent is NOT flagged when source not allowlisted",
+			declared:  []ReleaseMember{rm("main/source/Sources")},
+			fetched:   nil,
+			allowlist: amd64,
+			want:      nil,
+		},
+		{
+			name:      "source absent IS flagged when source allowlisted",
+			declared:  []ReleaseMember{rm("main/source/Sources")},
+			fetched:   nil,
+			allowlist: amd64src,
+			want:      []string{"main/source/Sources"},
+		},
+		{
+			name:      "non-IndexTarget members are ignored",
+			declared:  []ReleaseMember{rm("main/Contents-all.gz"), rm("InRelease")},
+			fetched:   nil,
+			allowlist: amd64,
+			want:      nil,
+		},
+		{
+			name: "multiple missing groups returned sorted",
+			declared: []ReleaseMember{
+				rm("universe/binary-all/Packages"),
+				rm("main/binary-all/Packages"),
+				rm("main/binary-amd64/Packages"),
+			},
+			fetched:   []ReleaseMember{rm("main/binary-amd64/Packages")},
+			allowlist: amd64,
+			want:      []string{"main/binary-all/Packages", "universe/binary-all/Packages"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := missingRequestableIndexGroups(tc.declared, tc.fetched, tc.allowlist)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("missingRequestableIndexGroups() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAdopter_MultiArch_AllowlistFiltersOutOtherArchs(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -2359,6 +2483,183 @@ func TestAdopter_MultiArch_AllowlistFiltersOutOtherArchs(t *testing.T) {
 	}
 	if !strings.Contains(out, `"skipped_count":1`) {
 		t.Errorf("expected skipped_count:1 in adoption_success log, got:\n%s", out)
+	}
+}
+
+// Incident 2026-06-14 regression guard: a Debian-style third-party repo
+// (packages.microsoft.com) publishes a SEPARATE binary-all IndexTarget
+// for its arch-independent packages, which apt fetches on every host
+// alongside binary-<host-arch>. With [adoption].architectures=["amd64"]
+// the arch filter MUST keep binary-all (pseudo-arch "all" is exempt) —
+// filtering it publishes a snapshot that serves an authoritative 404 on
+// dists/<suite>/main/binary-all/Packages and hard-fails `apt update` for
+// the snapshot's whole lifetime. (Ubuntu's own archive never hit this:
+// it folds arch:all into each binary-<arch> and publishes no binary-all.)
+func TestAdopter_Allowlist_KeepsBinaryAllIndexTarget(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ff := newFakeFetcher()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:         c,
+		Fetcher:       ff,
+		Verifier:      passThroughVerifier{},
+		HostLimiter:   hostsem.New(8),
+		Logger:        logger,
+		Architectures: []string{"amd64"},
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	suite := SuiteRef{
+		CanonicalScheme: "https",
+		CanonicalHost:   "packages.microsoft.com",
+		SuitePath:       "/ubuntu/24.04/prod/dists/noble",
+	}
+
+	debHashAmd64 := strings.Repeat("a", 64)
+	debHashAll := strings.Repeat("c", 64)
+	pkgsAmd64 := fakePackagesStanzas(map[string]string{
+		"pool/main/m/msopenjdk/msopenjdk-21_21.0.0_amd64.deb": debHashAmd64,
+	})
+	// The arch-independent package lives ONLY in binary-all/Packages.
+	pkgsAll := fakePackagesStanzas(map[string]string{
+		"pool/main/p/packages-microsoft-prod/packages-microsoft-prod_1.1_all.deb": debHashAll,
+	})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgsAmd64,
+		"main/binary-all/Packages":   pkgsAll,
+	})
+	base := "https://packages.microsoft.com/ubuntu/24.04/prod/dists/noble/"
+	ff.put(base+"main/binary-amd64/Packages", pkgsAmd64)
+	ff.put(base+"main/binary-all/Packages", pkgsAll)
+
+	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// BOTH IndexTargets fetched — binary-all is NOT filtered.
+	if got := ff.calls.Load(); got != 2 {
+		t.Errorf("fetch calls = %d, want 2 (binary-amd64 + binary-all, neither filtered)", got)
+	}
+
+	sf, err := c.GetSuiteFreshness(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil {
+		t.Fatal("current_snapshot_id not set")
+	}
+	snapshotID := *sf.CurrentSnapshotID
+
+	// The binary-all/Packages member is present in the snapshot — apt's
+	// request for it resolves to a real blob, not a "not in snapshot" 404.
+	if _, err := c.GetSnapshotMember(context.Background(), snapshotID, "main/binary-all/Packages"); err != nil {
+		t.Errorf("binary-all/Packages missing from snapshot (would 404 apt update): %v", err)
+	}
+
+	// The arch:all .deb has a package_hash row (its index WAS adopted).
+	allDebPath := "/ubuntu/24.04/prod/pool/main/p/packages-microsoft-prod/packages-microsoft-prod_1.1_all.deb"
+	if _, err := c.GetPackageHash(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost, allDebPath, snapshotID); err != nil {
+		t.Errorf("missing package_hash for arch:all .deb: %v", err)
+	}
+
+	// binary-all must NOT appear as an arch-filter skip.
+	out := logBuf.String()
+	if strings.Contains(out, `"path":"main/binary-all/Packages"`) &&
+		strings.Contains(out, `"reason":"arch_not_in_allowlist"`) {
+		t.Errorf("binary-all wrongly filtered by allowlist, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"skipped_count":0`) {
+		t.Errorf("expected skipped_count:0 (nothing skipped), got:\n%s", out)
+	}
+	// adoption_success records the effective allowlist so an operator can
+	// see WHICH filter was applied without inferring it from skip lines.
+	if !strings.Contains(out, `"architectures":["amd64"]`) {
+		t.Errorf("expected adoption_success to record architectures:[amd64], got:\n%s", out)
+	}
+}
+
+// SPEC6_8 serve-contract guard, end to end: under [adoption].architectures
+// =["amd64"], if upstream transiently 404s the REQUIRED binary-all
+// IndexTarget (a round-robin mirror mid-sync — the exact shape of the
+// 2026-06-14 incident, but reached via the 4xx_index_target skip rather
+// than the arch filter), adoption must DEFER rather than commit a snapshot
+// that 404s `apt update`. The prior coherent snapshot keeps serving and
+// the next freshness tick re-attempts.
+func TestAdopter_Allowlist_BlocksPublishWhenBinaryAllUnavailable(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ff := newFakeFetcher()
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:                          c,
+		Fetcher:                        ff,
+		Verifier:                       passThroughVerifier{},
+		HostLimiter:                    hostsem.New(8),
+		Logger:                         logger,
+		Architectures:                  []string{"amd64"},
+		TolerateOptionalMemberFailures: true,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	suite := SuiteRef{
+		CanonicalScheme: "https",
+		CanonicalHost:   "packages.microsoft.com",
+		SuitePath:       "/ubuntu/24.04/prod/dists/noble",
+	}
+
+	pkgsAmd64 := fakePackagesStanzas(map[string]string{
+		"pool/main/m/msopenjdk/msopenjdk-21_21.0.0_amd64.deb": strings.Repeat("a", 64),
+	})
+	pkgsAll := fakePackagesStanzas(map[string]string{
+		"pool/main/p/packages-microsoft-prod/packages-microsoft-prod_1.1_all.deb": strings.Repeat("c", 64),
+	})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgsAmd64,
+		"main/binary-all/Packages":   pkgsAll,
+	})
+	base := "https://packages.microsoft.com/ubuntu/24.04/prod/dists/noble/"
+	ff.put(base+"main/binary-amd64/Packages", pkgsAmd64)
+	// binary-all unavailable from the mirror this tick (mid-sync 404).
+	ff.fail404(base + "main/binary-all/Packages")
+
+	err = ad.Run(context.Background(), suite, releaseText, "etag-1", "")
+	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
+		t.Fatalf("want ErrAdoptionMemberFetchFailed (deferred), got %v", err)
+	}
+
+	// No degraded snapshot adopted — the (here: nonexistent) prior keeps serving.
+	sf, ferr := c.GetSuiteFreshness(context.Background(),
+		suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
+	if ferr == nil && sf.CurrentSnapshotID != nil {
+		t.Errorf("degraded snapshot was committed (id=%d) — apt would 404 binary-all", *sf.CurrentSnapshotID)
+	}
+
+	// The block is logged at ERROR with the offending group, so it is
+	// alertable and diagnosable.
+	out := logBuf.String()
+	if !strings.Contains(out, `"level":"ERROR"`) ||
+		!strings.Contains(out, "adoption_blocked_serve_target_missing") ||
+		!strings.Contains(out, `"group":"main/binary-all/Packages"`) {
+		t.Errorf("expected ERROR adoption_blocked_serve_target_missing for binary-all group, got:\n%s", out)
 	}
 }
 

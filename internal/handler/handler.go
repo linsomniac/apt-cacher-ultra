@@ -454,6 +454,26 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		// SPEC2 §6.1: snapshot is the contract. Path not in the snapshot
 		// → 404. No Phase 1 fallback would be allowed to satisfy this
 		// request, regardless of whether url_path has a row for it.
+		//
+		// SPEC6_8: if the missing path is an apt IndexTarget (a per-arch
+		// Packages* / per-component Sources*), this 404 breaks the client's
+		// `apt update` against the current snapshot — raise the dedicated,
+		// cause-agnostic alert (the 2026-06-14 binary-all incident surfaced
+		// ONLY through this kind of 404; we want a first-class signal, not a
+		// request-log archaeology dig). by-hash / pdiff / optional members
+		// are excluded — apt has fallbacks, so they are not on their own a
+		// broken update.
+		if isIndexTargetPath(memberPath) {
+			arch := archFromPath(memberPath)
+			h.logger.Warn("snapshot_index_target_404",
+				"canonical_host", req.CanonicalHost,
+				"suite_path", req.SuitePath,
+				"path", req.Path,
+				"architecture", arch,
+				"snapshot_id", snapshotID,
+			)
+			serveSnapshotIndexTarget404Total.Inc(boundedArchLabel(arch))
+		}
 		http.Error(w, "not in snapshot", http.StatusNotFound)
 		return true, http.StatusNotFound, 0, true
 	case err != nil:
@@ -2011,6 +2031,55 @@ func archFromPath(p string) string {
 		return "source"
 	}
 	return ""
+}
+
+// indexTargetPathRE matches the apt IndexTarget shapes whose absence
+// from an adopted snapshot hard-fails `apt update`: a per-arch Packages
+// or per-component Sources file, with any (or no) compression codec. It
+// deliberately EXCLUDES by-hash, the Packages.diff/Index pdiff manifest,
+// and Release files — those have apt-side fallbacks, so a 404 on them is
+// not on its own "apt update is broken."
+//
+// AIDEV-NOTE: keep in lockstep with internal/freshness indexTargetGroupRE
+// (the adoption-side group key). The two live in different packages on
+// purpose (no import edge), but they describe the SAME surface — the
+// files apt installs from. Widen/narrow them together.
+var indexTargetPathRE = regexp.MustCompile(
+	`(?:^|/)(?:binary-[a-z][a-z0-9]*/Packages|source/Sources)(?:\.[a-z0-9]+)?$`)
+
+// isIndexTargetPath reports whether a request path is an apt IndexTarget
+// (see indexTargetPathRE). The handler increments a dedicated counter and
+// emits an alertable WARN when it serves an authoritative "not in
+// snapshot" 404 for one of these — the direct, cause-agnostic signal that
+// a client's `apt update` is broken against the current snapshot (the
+// 2026-06-14 binary-all incident's symptom).
+func isIndexTargetPath(p string) bool {
+	return indexTargetPathRE.MatchString(p)
+}
+
+// knownArchLabels bounds the cardinality of the
+// acu_serve_snapshot_index_target_404_total{architecture} series. The
+// 404-path architecture is derived from a CLIENT-controlled path, so an
+// adversary could request binary-<random>/Packages under an adopted suite
+// to mint unbounded label values and crowd out legitimate ones against the
+// metric's series cap. Real dpkg architectures are a small, slowly-changing
+// set; anything outside it buckets to "other" (see boundedArchLabel). The
+// WARN log keeps the raw path for diagnosis — only the metric label is
+// bucketed.
+var knownArchLabels = map[string]struct{}{
+	"all": {}, "source": {}, "amd64": {}, "i386": {}, "arm64": {},
+	"armhf": {}, "armel": {}, "ppc64el": {}, "s390x": {}, "riscv64": {},
+	"mips64el": {}, "mipsel": {}, "powerpc": {}, "x32": {},
+}
+
+// boundedArchLabel returns arch if it is a recognized dpkg architecture,
+// else "other" — keeping the served-404 metric's label cardinality bounded
+// regardless of client-forged paths.
+func boundedArchLabel(arch string) string {
+	if _, ok := knownArchLabels[arch]; ok {
+		return arch
+	}
+	return "other"
 }
 
 // isDebPath reports whether req.Path looks like a binary `.deb`

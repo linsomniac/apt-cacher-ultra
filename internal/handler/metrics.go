@@ -68,4 +68,18 @@ var (
 		metrics.DefaultMaxSeries,
 		"path_class", "outcome",
 	)
+
+	// SPEC6_8: authoritative "not in snapshot" 404s served for an apt
+	// IndexTarget (per-arch Packages* / per-component Sources*). This is
+	// the cause-agnostic SYMPTOM signal — a client's `apt update` is broken
+	// against the current snapshot, whatever dropped the index (arch-filter
+	// bug, 4xx_index_target skip, GC of an anchor, …). Steady state ZERO;
+	// alert on ANY increase. Labeled by architecture ("all", "amd64",
+	// "source", …) — a closed, low-cardinality enum.
+	serveSnapshotIndexTarget404Total = metrics.NewCounterWithCap(
+		"acu_serve_snapshot_index_target_404_total",
+		"Authoritative not-in-snapshot 404s served for an apt IndexTarget (broken apt update), by architecture (SPEC6_8).",
+		metrics.DefaultMaxSeries,
+		"architecture",
+	)
 )

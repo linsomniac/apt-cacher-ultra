@@ -181,6 +181,16 @@ var archFilterOptionalRES = []*regexp.Regexp{
 // unfiltered path.
 func archFromFilteredPath(p string) (arch string, filtered bool) {
 	if m := archFilterBinaryRE.FindStringSubmatch(p); m != nil {
+		// The pseudo-arch "all" is the arch-independent IndexTarget
+		// (binary-all/Packages): apt fetches it on EVERY host alongside
+		// binary-<host-arch>, so no allowlist may filter it. Skipping it
+		// publishes a snapshot that serves an authoritative 404 for
+		// `apt update` regardless of the client's architecture. This
+		// mirrors the same exemption in the optional-member loop below;
+		// keeping both honors archFromFilteredPath's documented contract.
+		if m[1] == "all" {
+			return "", false
+		}
 		return m[1], true
 	}
 	if archFilterSourceRE.MatchString(p) {
@@ -263,6 +273,67 @@ func indexTargetGroup(p string) (group, arch string, ok bool) {
 		arch = "source"
 	}
 	return group, arch, true
+}
+
+// missingRequestableIndexGroups is the SPEC6_8 pre-publish serve-contract
+// guard. It returns the sorted set of IndexTarget group keys the signed
+// Release DECLARED for an architecture a configured client would actually
+// request — every arch in the allowlist, plus the always-required "all"
+// pseudo-arch (arch-independent packages apt fetches on every host) — but
+// which the adopted snapshot does NOT serve (zero compression variants
+// fetched). A non-empty result means committing this snapshot would make
+// the cache answer an authoritative "not in snapshot" 404 for a file apt
+// requires, hard-failing `apt update` for the snapshot's whole lifetime;
+// the caller fails the adoption so the prior coherent snapshot keeps
+// serving and the next freshness tick re-attempts.
+//
+// The "all" pseudo-arch is requestable by EVERY client regardless of host
+// architecture, so binary-all is required whenever the Release declares it
+// — INDEPENDENT of the allowlist. The arch filter does not even have to be
+// enabled for the binary-all trap to bite: a transient upstream 404 on
+// binary-all/Packages is a 4xx_index_target skip that would otherwise
+// publish a degraded snapshot. Other arches are required only when an
+// allowlist scopes the cache to them; without a filter, an upstream's
+// declared-but-unserved foreign-arch IndexTargets (e.g. Ubuntu's
+// binary-armhf, which 404s on the main archive) are legitimately tolerated
+// as 4xx_index_target skips, so they are NOT required here.
+func missingRequestableIndexGroups(declared, fetched []ReleaseMember, allowlist map[string]struct{}) []string {
+	// Declared IndexTarget groups whose arch a configured client requests.
+	required := make(map[string]struct{})
+	for _, m := range declared {
+		group, arch, ok := indexTargetGroup(m.Path)
+		if !ok {
+			continue
+		}
+		if arch == "all" {
+			required[group] = struct{}{}
+			continue
+		}
+		if allowlist != nil {
+			if _, want := allowlist[arch]; want {
+				required[group] = struct{}{}
+			}
+		}
+	}
+	if len(required) == 0 {
+		return nil
+	}
+	// A group is served iff at least one of its compression variants was
+	// fetched, so drop every required group the snapshot actually has.
+	for _, m := range fetched {
+		if group, _, ok := indexTargetGroup(m.Path); ok {
+			delete(required, group)
+		}
+	}
+	if len(required) == 0 {
+		return nil
+	}
+	missing := make([]string, 0, len(required))
+	for g := range required {
+		missing = append(missing, g)
+	}
+	sort.Strings(missing)
+	return missing
 }
 
 // errAdoptionMemberSkipped is the in-package signal from adoptMember
@@ -420,6 +491,13 @@ type Adopter struct {
 	// members to be adopted.
 	architectureAllowlist map[string]struct{}
 
+	// architectureList is the sorted slice form of architectureAllowlist,
+	// kept for deterministic structured logging (adoption_success and the
+	// SPEC6_8 serve-contract guard surface the effective filter so an
+	// operator sees WHICH allowlist filtered a member without inferring it
+	// from the pattern of skips). Empty when the filter is inert.
+	architectureList []string
+
 	// tolerateOptionalMembers is the REC 1 switch (see AdoptionConfig.
 	// TolerateOptionalMemberFailures). When true, non-IndexTarget member
 	// failures are skipped rather than fatal.
@@ -491,11 +569,14 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		sem = make(chan struct{}, cfg.MaxConcurrent)
 	}
 	var allowlist map[string]struct{}
+	var archList []string
 	if len(cfg.Architectures) > 0 {
 		allowlist = make(map[string]struct{}, len(cfg.Architectures))
 		for _, arch := range cfg.Architectures {
 			allowlist[arch] = struct{}{}
 		}
+		archList = append([]string(nil), cfg.Architectures...)
+		sort.Strings(archList)
 	}
 	var required map[string]struct{}
 	if len(cfg.RequiredArchitectures) > 0 {
@@ -514,6 +595,7 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		hotPrefetchBudget:       cfg.HotPrefetchBudget,
 		heartbeatInterval:       cfg.HeartbeatInterval,
 		architectureAllowlist:   allowlist,
+		architectureList:        archList,
 		tolerateOptionalMembers: cfg.TolerateOptionalMemberFailures,
 		memberRetryCount:        cfg.MemberRetryCount,
 		memberRetryDelay:        cfg.MemberRetryDelay,
@@ -1129,6 +1211,39 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			ErrAdoptionMemberFetchFailed, skippedCount)
 	}
 
+	// SPEC6_8 serve-contract guard: before committing, refuse to publish a
+	// snapshot that omits an IndexTarget a configured client would request
+	// — every allowlisted arch plus the always-required "all" pseudo-arch.
+	// This is the backstop the 2026-06-14 binary-all incident proved we
+	// needed: the arch filter (now fixed) AND the 4xx_index_target skip can
+	// both drop binary-all, and either way committing 404s `apt update` for
+	// the snapshot's whole lifetime. Failing here keeps the prior coherent
+	// snapshot serving; the next freshness tick re-attempts (upstream still
+	// differs, so the check observes "changed" again). binary-all is always
+	// checked, allowlist or not — a 404-skipped binary-all is the trap
+	// regardless of config — while foreign arches are only required when an
+	// allowlist scopes the cache to them.
+	if missing := missingRequestableIndexGroups(members, fetchedMembers, a.architectureAllowlist); len(missing) > 0 {
+		for _, g := range missing {
+			arch := "all"
+			if _, a2, ok := indexTargetGroup(g); ok {
+				arch = a2
+			}
+			a.logger.Error("adoption_blocked_serve_target_missing",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"group", g,
+				"architecture", arch,
+				"architectures", a.architectureList,
+			)
+			adoptionServeTargetMissingTotal.Inc(arch)
+		}
+		return newMemberErr(ErrAdoptionMemberFetchFailed, missing[0],
+			fmt.Sprintf("requestable index target absent from snapshot: %s "+
+				"(committing would 404 apt update; deferring to keep prior snapshot)",
+				strings.Join(missing, ", ")))
+	}
+
 	// Step 6: metadata-self snapshot_member row(s). Without these
 	// the §6.1 snapshot-scoped lookup would 404 on the very URLs
 	// apt fetches first. Inline mode contributes one row (InRelease);
@@ -1331,6 +1446,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		"skipped_integrity_count", len(integritySkipped),
 		"alias_count", len(aliasSeen),
 		"package_hash_count", len(packageHashes),
+		// Effective SPEC6_5 §7.2 arch filter (empty/absent = inert). With
+		// the filter active a nonzero skipped_count is expected (foreign
+		// arches); recording the allowlist lets an operator confirm a skip
+		// was intended without reconstructing it from per-member WARN lines.
+		"architectures", a.architectureList,
 	)
 	return nil
 }
