@@ -1588,3 +1588,147 @@ func TestCheck_404OnInRelease_NoFallback_WhenReleaseRowsMissing(t *testing.T) {
 			releaseHits.Load(), gpgHits.Load())
 	}
 }
+
+// TestCheck_UnchangedTick_ReconcilesDegraded is the SPEC6_8 end-to-end
+// auto-heal test: an unchanged freshness tick (the suite is confirmed
+// stable at upstream) triggers ReconcileSnapshot on the current degraded
+// snapshot, healing a declared-but-absent requestable IndexTarget
+// (binary-all/Packages) in place — no new snapshot, just the missing
+// member added to the existing one.
+//
+// Setup mirrors TestChecker_FreshTickRepairsSkippedMembers in
+// phase6_7_skip_repair_test.go: real *cache.Cache via newAdoptionTestEnv,
+// the Checker's freshness conditional GET uses a real *fetch.Client
+// against a loopback httptest.Server that serves the byte-identical
+// InRelease (unchanged), while the Adopter uses env.fetcher (fakeFetcher)
+// to serve binary-all once we enable it.
+func TestCheck_UnchangedTick_ReconcilesDegraded(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+
+	// Override the suite to use loopback so newTestFetcher's allowlist
+	// (^127\.0\.0\.1$) permits the conditional GET.
+	env.suite = SuiteRef{
+		CanonicalScheme: "http",
+		CanonicalHost:   "127.0.0.1",
+		SuitePath:       "/ubuntu/dists/noble",
+	}
+
+	// Build an adopter with RepairSkippedMembers=true (gates reconcile too)
+	// and Architectures=["amd64"] so binary-all is a requestable target.
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:                          env.cache,
+		Fetcher:                        env.fetcher,
+		Verifier:                       passThroughVerifier{},
+		HostLimiter:                    hostsem.New(8),
+		Architectures:                  []string{"amd64"},
+		TolerateOptionalMemberFailures: true,
+		RepairSkippedMembers:           true,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+
+	// 1. Adopt a complete snapshot (binary-amd64 + binary-all).
+	pkgsAmd64 := fakePackagesStanzas(map[string]string{
+		"pool/main/a/a/a_1_amd64.deb": strings.Repeat("a", 64),
+	})
+	pkgsAll := fakePackagesStanzas(map[string]string{
+		"pool/main/c/c/c_1_all.deb": strings.Repeat("c", 64),
+	})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgsAmd64,
+		"main/binary-all/Packages":   pkgsAll,
+	})
+	base := "http://127.0.0.1/ubuntu/dists/noble/"
+	env.fetcher.put(base+"main/binary-amd64/Packages", pkgsAmd64)
+	env.fetcher.put(base+"main/binary-all/Packages", pkgsAll)
+
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("adoption setup: %v", err)
+	}
+
+	sf, err := env.cache.GetSuiteFreshness(ctx,
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness after adoption: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil {
+		t.Fatal("no current snapshot after adoption")
+	}
+	snapID := *sf.CurrentSnapshotID
+
+	// 2. Degrade the snapshot: delete binary-all member rows.
+	binaryAllMember, err := env.cache.GetSnapshotMember(ctx, snapID, "main/binary-all/Packages")
+	if err != nil {
+		t.Fatalf("setup: GetSnapshotMember binary-all: %v", err)
+	}
+	aliasPath := "main/binary-all/by-hash/SHA256/" + binaryAllMember.DeclaredSHA256
+	if err := env.cache.DeleteSnapshotMembersForTest(ctx, snapID,
+		"main/binary-all/Packages", aliasPath); err != nil {
+		t.Fatalf("setup: DeleteSnapshotMembersForTest: %v", err)
+	}
+	// Confirm degraded.
+	if _, err := env.cache.GetSnapshotMember(ctx, snapID, "main/binary-all/Packages"); err == nil {
+		t.Fatal("setup: binary-all should be absent after delete")
+	}
+
+	// 3. Build an HTTP server that serves the byte-identical InRelease
+	// (unchanged). The conditional GET will see "unchanged" and trigger
+	// the repair/reconcile goroutine.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ubuntu/dists/noble/InRelease" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(releaseText)
+	}))
+	defer srv.Close()
+
+	// Seed the url_path anchor row so checkLockedInline finds it and uses
+	// the test server. The BlobHash must match sha256(releaseText) so the
+	// body-equality comparison classifies the result as "unchanged".
+	inReleaseHash := hashOf(releaseText)
+	if err := env.cache.PutURLPath(ctx, cache.URLPath{
+		CanonicalScheme: "http",
+		CanonicalHost:   "127.0.0.1",
+		Path:            "/ubuntu/dists/noble/InRelease",
+		BlobHash:        &inReleaseHash,
+		UpstreamURL:     srv.URL + "/ubuntu/dists/noble/InRelease",
+		IsMetadata:      true,
+	}); err != nil {
+		t.Fatalf("PutURLPath: %v", err)
+	}
+
+	// 4. Build the Checker. env.cache satisfies the Cache interface.
+	checker, err := New(Config{
+		Cache:       env.cache,
+		Fetcher:     newTestFetcher(t),
+		HostLimiter: hostsem.New(8),
+		Adopter:     ad,
+		Logger:      discardLogger(),
+		now:         func() time.Time { return time.Unix(11000, 0) },
+	})
+	if err != nil {
+		t.Fatalf("New checker: %v", err)
+	}
+
+	// 5. The unchanged tick should trigger reconcile which heals binary-all.
+	checker.Check(ctx, "http", "127.0.0.1", "/ubuntu/dists/noble")
+	checker.WaitForAdoptions()
+
+	// 6. Assert binary-all is now present in the snapshot.
+	if _, err := env.cache.GetSnapshotMember(ctx, snapID, "main/binary-all/Packages"); err != nil {
+		t.Errorf("unchanged tick did not reconcile binary-all: %v", err)
+	}
+
+	// 7. current_snapshot_id must be unchanged (in-place reconcile).
+	sf2, err := env.cache.GetSuiteFreshness(ctx,
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness after reconcile: %v", err)
+	}
+	if sf2.CurrentSnapshotID == nil || *sf2.CurrentSnapshotID != snapID {
+		t.Errorf("snapshot id changed after reconcile: want %d, got %v", snapID, sf2.CurrentSnapshotID)
+	}
+}
