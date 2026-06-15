@@ -695,6 +695,7 @@ func serveListeners(
 			AdoptionArchitectures:   cfg.Adoption.Architectures,
 			AdoptionAcceptAnySigner: cfg.Adoption.AcceptAnySigner,
 			Keyring:                 &keyringProvider{k: keyring},
+			Reconciler:              freshChecker,
 		})
 		if err != nil {
 			return fmt.Errorf("build admin: %w", err)

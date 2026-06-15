@@ -80,41 +80,54 @@ skip, which would otherwise publish a degraded snapshot. Test:
   an operator can confirm a skip was intended without reverse-engineering it
   from per-member WARN lines.
 
-## 6. Recovery of the live degraded snapshots — DEFERRED (follow-up)
+## 6. Recovery of degraded snapshots — implemented (SPEC6_8 in-place reconcile)
 
-A degraded snapshot published under the old binary does NOT self-heal until
-upstream republishes InRelease (freshness 304s never re-attempt skipped
-members; the next freshness tick re-adopts only on an InRelease *change*).
+Recovery is fully implemented. Two paths heal a snapshot that was published
+missing a required IndexTarget:
 
-A `POST /readopt` "force re-adopt" endpoint was prototyped and **pulled**: it
-cannot work as a refetch-and-readopt. Snapshots are content-addressed —
+**(a) Automatic in-place heal on unchanged freshness ticks** (`repair_skipped_members`
+flag). When the freshness checker fetches an upstream InRelease that is
+byte-identical to the current snapshot's (unchanged tick), it triggers
+`Adopter.ReconcileSnapshot` on the current snapshot. The reconciler re-parses
+the snapshot's GPG-verified Release (the trust anchor — the original blob,
+unchanged in the pool), diffs declared-vs-present requestable IndexTarget
+groups, fetches each missing member from upstream, validates it against the
+re-parsed declared hash, and inserts it into the **same** snapshot via a
+transaction that re-checks the snapshot is still current. A once-complete
+snapshot is memoized so the per-tick cost is a single DB read.
+
+Why "in place" rather than re-adopt: snapshots are content-addressed —
 `idx_suite_snapshot_natural` is UNIQUE on
-`(scheme, host, suite, COALESCE(inrelease_hash, release_hash))`, and
-`InsertCandidateSnapshot` returns `ErrSnapshotNaturalKeyAdopted` when an
-adopted snapshot already occupies that key. Re-fetching the SAME (unchanged)
-InRelease therefore collides with the degraded snapshot and the adoption
-fails — exactly the recovery case. Forcing the freshness "changed" decision
-is necessary but NOT sufficient; recovery must also REPLACE the adopted
-snapshot for that natural key (delete-then-rebuild, with a brief
-Phase-1-fallback serving window and failure-atomicity to handle), or heal it
-IN PLACE by extending the SPEC6_7 §3 repair pass to fetch declared-but-absent
-requestable IndexTargets into the existing snapshot. Either is a real design
-and is tracked as the SPEC6_8 follow-up; not shipped here.
+`(scheme, host, suite, COALESCE(inrelease_hash, release_hash))`. Re-fetching
+the same unchanged InRelease collides with the already-adopted snapshot and
+fails with `ErrSnapshotNaturalKeyAdopted`. Healing in place sidesteps the
+collision, requires no serving flip, and cannot degrade serving (inserts are
+additive; the transaction re-validates the snapshot is current before commit).
 
-Interim recovery for dev/stg (pick one):
+**(b) On-demand via `POST /reconcile`** (SPEC6_8 recovery tool). Forces an
+immediate in-place reconcile of one suite's current snapshot without waiting
+for the next tick. Auth + method enforcement is handled by the admin
+dispatcher. Params (form-encoded):
 
-1. **Wait for upstream.** Microsoft republishes the `prod` InRelease
-   periodically; the fixed binary adopts binary-all correctly on the next
-   change. Lowest effort; unbounded latency.
-2. **Force a content change to retrigger adoption.** Remove the degraded
-   snapshot's natural-key occupancy so the next tick re-adopts: unset
-   `suite_freshness.current_snapshot_id`, delete the `suite_snapshot` row for
-   the affected Microsoft suites, AND clear the InRelease `url_path` baseline
-   (otherwise the unchanged-hash check still short-circuits). DB surgery — do
-   it with care, or wait for the follow-up tool.
+| param  | required | notes |
+|--------|----------|-------|
+| `host` | yes | canonical upstream host, e.g. `packages.microsoft.com` |
+| `suite` | yes | suite path, e.g. `/ubuntu/24.04/prod/dists/noble` |
+| `scheme` | no | default `https` |
 
-The Layer-2 guard means that whenever re-adoption DOES happen (naturally or
-via the follow-up), it can no longer publish a binary-all-less snapshot.
+Status codes: `202 Accepted` (reconcile triggered async) / `409 Conflict`
+(busy, unknown suite, or no current snapshot) / `400` (missing params) /
+`413` (oversized body) / `501` (not wired).
+
+```bash
+curl -s -X POST http://admin-host:9143/reconcile \
+  -d 'host=packages.microsoft.com' \
+  -d 'suite=/ubuntu/24.04/prod/dists/noble'
+```
+
+**Observability.** `acu_adoption_reconciled_total{architecture}` counts healed
+members. It pairs inversely with `acu_serve_snapshot_index_target_404_total` —
+once reconcile runs successfully, the 404 counter stops climbing.
 
 ## 7. Alert on
 

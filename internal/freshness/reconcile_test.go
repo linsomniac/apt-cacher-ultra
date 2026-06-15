@@ -1,6 +1,7 @@
 package freshness
 
 import (
+	"bytes"
 	"context"
 	"reflect"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 )
 
 func TestMissingRequestableMembers(t *testing.T) {
@@ -194,5 +196,61 @@ func TestReconcileSnapshot_GateAndForce(t *testing.T) {
 	// The snapshot is still complete, so it should return (0, nil) without panic.
 	if n, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, true); err != nil || n != 0 {
 		t.Errorf("forced reconcile = (%d,%v), want (0,nil)", n, err)
+	}
+}
+
+// adoptDegradedBinaryAll_ID creates a degraded snapshot — one where binary-all
+// is declared in the Release but missing from snapshot_member rows — and returns
+// the snapshot id. It does so by adopting a complete snapshot then deleting the
+// binary-all member rows, exactly as TestReconcileSnapshot_HealsBinaryAllInPlace
+// does in its setup phase. The env fetcher already has binary-all seeded from
+// adoptCompleteSnapshot, so callers can reconcile immediately.
+func adoptDegradedBinaryAll_ID(t *testing.T, env *adoptionTestEnv, ad *Adopter) int64 {
+	t.Helper()
+	ctx := context.Background()
+
+	// Adopt a complete snapshot first.
+	snapID := adoptCompleteSnapshot(t, env, ad)
+
+	// Get the binary-all member to derive the by-hash alias path.
+	binaryAllMember, err := env.cache.GetSnapshotMember(ctx, snapID, "main/binary-all/Packages")
+	if err != nil {
+		t.Fatalf("adoptDegradedBinaryAll_ID: GetSnapshotMember binary-all: %v", err)
+	}
+	aliasPath := "main/binary-all/by-hash/SHA256/" + binaryAllMember.DeclaredSHA256
+
+	// Delete binary-all rows to simulate degraded state.
+	if err := env.cache.DeleteSnapshotMembersForTest(ctx, snapID,
+		"main/binary-all/Packages", aliasPath); err != nil {
+		t.Fatalf("adoptDegradedBinaryAll_ID: DeleteSnapshotMembersForTest: %v", err)
+	}
+
+	// Also delete the package_hash row for the arch:all .deb.
+	allDeb := "/ubuntu/pool/main/c/c/c_1_all.deb"
+	if err := env.cache.DeletePackageHashForTest(ctx,
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, allDeb, snapID); err != nil {
+		t.Fatalf("adoptDegradedBinaryAll_ID: DeletePackageHashForTest: %v", err)
+	}
+
+	return snapID
+}
+
+// TestReconcileMetric_Increments verifies that acu_adoption_reconciled_total is
+// registered in metrics.Default and incremented after a successful heal.
+// Counter is process-global, so we assert presence + nonzero rather than an
+// exact value.
+func TestReconcileMetric_Increments(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newReconcileAdopter(t, env, []string{"amd64"})
+	snapID := adoptDegradedBinaryAll_ID(t, env, ad) // Task-3 helper (id only)
+	// env.fetcher already has binary-all seeded from adoptCompleteSnapshot.
+	if _, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, false); err != nil {
+		t.Fatalf("ReconcileSnapshot: %v", err)
+	}
+	var buf bytes.Buffer
+	metrics.Default.Render(&buf)
+	if !strings.Contains(buf.String(), "acu_adoption_reconciled_total") {
+		t.Errorf("acu_adoption_reconciled_total not present after a heal:\n%s", buf.String())
 	}
 }

@@ -140,6 +140,19 @@ var (
 		"arch",
 	)
 
+	// adoptionReconciledTotal counts SPEC6_8 in-place reconcile heals — a
+	// requestable IndexTarget fetched into an existing degraded snapshot —
+	// by architecture (bounded enum). Pairs inversely with
+	// acu_serve_snapshot_index_target_404_total, which falls to zero as a
+	// suite heals. The arch label comes from the GPG-verified Release
+	// declaration (not client-controlled), so no bounding helper is needed.
+	adoptionReconciledTotal = metrics.NewCounterWithCap(
+		"acu_adoption_reconciled_total",
+		"Requestable IndexTargets healed into an existing snapshot by in-place reconcile, by architecture (SPEC6_8).",
+		metrics.DefaultMaxSeries,
+		"architecture",
+	)
+
 	adoptionSourcesParsedTotal = metrics.NewCounterWithCap(
 		"acu_adoption_sources_parsed_total",
 		"Sources index files processed during adoption, by outcome (SPEC6_5 §10.3).",

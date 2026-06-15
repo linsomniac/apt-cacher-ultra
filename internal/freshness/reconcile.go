@@ -108,6 +108,13 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	a.logger.Info("adoption_snapshot_reconciled",
 		"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath,
 		"snapshot_id", snapshotID, "healed", len(healedDecl))
+	// Increment per healed member, keyed by the arch declared in the Release
+	// (trust anchor, GPG-verified — not client-controlled, so no label bound needed).
+	for _, m := range healedDecl {
+		if _, arch, ok := indexTargetGroup(m.Path); ok {
+			adoptionReconciledTotal.Inc(arch)
+		}
+	}
 	return len(healedDecl), nil
 }
 
