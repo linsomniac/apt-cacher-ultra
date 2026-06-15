@@ -85,7 +85,14 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	if len(rows) == 0 {
 		return 0, nil
 	}
-	if err := a.cache.InsertReconciledMembers(ctx, snapshotID, rows, nil); err != nil {
+	// Build package_hash rows for the healed indexes (declared set = full
+	// re-parsed Release so coverage math matches adoption; fetched set =
+	// the indexes we just healed).
+	phRes, err := a.buildPackageHashes(suite, snapshotID, declared, healedDecl)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile: build package hashes: %w", err)
+	}
+	if err := a.cache.InsertReconciledMembers(ctx, snapshotID, rows, phRes.rows); err != nil {
 		if errors.Is(err, cache.ErrSnapshotNotCurrent) {
 			// AIDEV-NOTE: displacement during reconcile is benign — a newer
 			// adoption has taken over and will carry the correct member set.

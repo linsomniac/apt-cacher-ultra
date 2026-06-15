@@ -119,6 +119,16 @@ func TestReconcileSnapshot_HealsBinaryAllInPlace(t *testing.T) {
 		t.Fatalf("setup: DeleteSnapshotMembersForTest: %v", err)
 	}
 
+	// Also delete the package_hash row for the arch:all .deb so the test
+	// proves reconcile builds it from scratch (not inherits it from the
+	// initial complete adoption). Without this, the assertion below would
+	// pass trivially even with nil package hashes.
+	allDeb := "/ubuntu/pool/main/c/c/c_1_all.deb"
+	if err := env.cache.DeletePackageHashForTest(ctx,
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, allDeb, snapID); err != nil {
+		t.Fatalf("setup: DeletePackageHashForTest: %v", err)
+	}
+
 	// Verify the degraded state: binary-all must be absent now.
 	if _, err := env.cache.GetSnapshotMember(ctx, snapID, "main/binary-all/Packages"); err == nil {
 		t.Fatal("setup: expected binary-all ABSENT after delete, but GetSnapshotMember succeeded")
@@ -148,5 +158,12 @@ func TestReconcileSnapshot_HealsBinaryAllInPlace(t *testing.T) {
 	}
 	if *sf2.CurrentSnapshotID != snapID {
 		t.Errorf("snapshot id changed %d -> %d (reconcile must be IN PLACE)", snapID, *sf2.CurrentSnapshotID)
+	}
+
+	// The healed arch:all index also yields package_hash rows, so arch:all
+	// .debs are snapshot-hash-validated, not just served trust-upstream.
+	// (allDeb was declared above in the setup section)
+	if _, err := env.cache.GetPackageHash(ctx, env.suite.CanonicalScheme, env.suite.CanonicalHost, allDeb, snapID); err != nil {
+		t.Errorf("arch:all .deb has no package_hash after reconcile: %v", err)
 	}
 }

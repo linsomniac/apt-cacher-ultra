@@ -43,3 +43,23 @@ func (c *Cache) DeleteSnapshotMembersForTest(ctx context.Context, snapshotID int
 		return nil
 	})
 }
+
+// DeletePackageHashForTest removes the package_hash row identified by
+// (scheme, host, debPath, snapshotID). This is a TEST-ONLY helper used by
+// reconcile tests to simulate a snapshot whose index member AND its derived
+// package_hash rows have been stripped — i.e. a truly clean degraded state
+// where reconcile must produce both. Refcount accuracy is NOT maintained.
+//
+// AIDEV-NOTE: paired with DeleteSnapshotMembersForTest; both are needed when
+// a test must prove that reconcile builds package_hash rows from scratch, not
+// just that they survive from the initial adoption.
+func (c *Cache) DeletePackageHashForTest(ctx context.Context, scheme, host, debPath string, snapshotID int64) error {
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx,
+			`DELETE FROM package_hash WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`,
+			scheme, host, debPath, snapshotID); err != nil {
+			return fmt.Errorf("DeletePackageHashForTest: %w", err)
+		}
+		return nil
+	})
+}
