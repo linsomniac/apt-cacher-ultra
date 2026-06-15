@@ -167,3 +167,32 @@ func TestReconcileSnapshot_HealsBinaryAllInPlace(t *testing.T) {
 		t.Errorf("arch:all .deb has no package_hash after reconcile: %v", err)
 	}
 }
+
+// TestReconcileSnapshot_GateAndForce locks the reconciledSnapshots memoization
+// and force-bypass behavior introduced in Task 3:
+//  1. Reconciling a COMPLETE snapshot (nothing missing) stores the id in the
+//     memo and returns (0, nil).
+//  2. A second call with force=true still runs the full check (returns (0, nil)
+//     here because nothing is missing) — it does NOT short-circuit on the memo.
+func TestReconcileSnapshot_GateAndForce(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newReconcileAdopter(t, env, []string{"amd64"})
+
+	// Adopt a COMPLETE snapshot (binary-amd64 + binary-all both served).
+	snapID := adoptCompleteSnapshot(t, env, ad)
+
+	// First reconcile (force=false): nothing missing → memoizes and returns 0.
+	if n, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, false); err != nil || n != 0 {
+		t.Fatalf("first reconcile = (%d,%v), want (0,nil)", n, err)
+	}
+	if _, done := ad.reconciledSnapshots.Load(snapID); !done {
+		t.Error("complete snapshot not memoized after first reconcile")
+	}
+
+	// Second call with force=true: must bypass the memo and re-check.
+	// The snapshot is still complete, so it should return (0, nil) without panic.
+	if n, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, true); err != nil || n != 0 {
+		t.Errorf("forced reconcile = (%d,%v), want (0,nil)", n, err)
+	}
+}
