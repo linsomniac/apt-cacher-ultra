@@ -526,6 +526,9 @@ type Adopter struct {
 	// reparseSnapshotRelease (GPG-verified Release re-parse) and found zero
 	// missing requestable members. Clearing this map forces a full re-check,
 	// which is the right behavior for the on-demand /reconcile endpoint.
+	// Entries are never reaped; growth is bounded by distinct AUTOINCREMENT
+	// snapshot IDs over the process lifetime — the same long-tail profile the
+	// per-suite `locks` map (freshness.go) already accepts.
 	reconciledSnapshots sync.Map // map[int64]struct{}
 
 	logger *slog.Logger
