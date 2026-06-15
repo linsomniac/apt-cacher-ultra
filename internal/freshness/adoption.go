@@ -519,6 +519,15 @@ type Adopter struct {
 	// (see AdoptionConfig.RequiredArchitectures). nil = guard inert.
 	requiredArchitectures map[string]struct{}
 
+	// reconciledSnapshots memoizes snapshot IDs confirmed to serve every
+	// requestable IndexTarget, so the per-tick reconcile parses a healthy
+	// snapshot's Release at most once per process. force=true bypasses it.
+	// AIDEV-NOTE: trust anchor — the memo only records snapshots that passed
+	// reparseSnapshotRelease (GPG-verified Release re-parse) and found zero
+	// missing requestable members. Clearing this map forces a full re-check,
+	// which is the right behavior for the on-demand /reconcile endpoint.
+	reconciledSnapshots sync.Map // map[int64]struct{}
+
 	logger *slog.Logger
 	now    func() time.Time
 }
