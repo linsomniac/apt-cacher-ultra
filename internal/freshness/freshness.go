@@ -317,31 +317,32 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		// (its own memo short-circuits on a healthy snapshot cheaply).
 		//
 		// AIDEV-NOTE: this goroutine heals two classes of degradation on
-		// the same unchanged-tick signal:
+		// the same CONFIRMED-unchanged-tick signal (repair != nil, built by
+		// repairIfUnchanged only on a 304 / byte-identical-200 result with a
+		// current snapshot — NOT on a cooldown skip or upstream failure):
 		//   1. RepairSkippedMembers: integrity-class skip rows left by
 		//      a stale-mirror adoption (SPEC6_7 §3).
 		//   2. ReconcileSnapshot: requestable IndexTargets declared in the
 		//      snapshot's InRelease but absent from snapshot_member rows —
 		//      e.g. binary-all that was 4xx-skipped during adoption and
 		//      was later served by the mirror (SPEC6_8 §6).
-		// Mutex handoff (mu.Unlock via defer) and adoptionWg mirror the
-		// adoption goroutine above; WaitForAdoptions drains both.
-		if c.adopter != nil && c.adopter.repairSkippedMembers {
-			snapID, suite, hasSnap := c.currentSnapshotRef(ctx, scheme, host, suitePath)
-			if repair != nil || hasSnap {
-				c.adoptionWg.Add(1)
-				go func() {
-					defer mu.Unlock()
-					defer c.adoptionWg.Done()
-					if repair != nil {
-						c.adopter.RepairSkippedMembers(c.lifetimeCtx, repair.suite, repair.snapshotID)
-					}
-					if hasSnap {
-						_, _ = c.adopter.ReconcileSnapshot(c.lifetimeCtx, suite, snapID, false)
-					}
-				}()
-				return
-			}
+		// Gating reconcile on repair != nil (rather than "has a current
+		// snapshot") keeps it inside the freshness cooldown: a
+		// persistently-degraded suite whose member can't be healed must not
+		// re-parse + re-fetch on every client metadata request. repair's
+		// suite/snapshotID ARE the current snapshot (repairIfUnchanged
+		// requires CurrentSnapshotID != nil). Mutex handoff (mu.Unlock via
+		// defer) and adoptionWg mirror the adoption goroutine above;
+		// WaitForAdoptions drains both.
+		if repair != nil && c.adopter != nil && c.adopter.repairSkippedMembers {
+			c.adoptionWg.Add(1)
+			go func() {
+				defer mu.Unlock()
+				defer c.adoptionWg.Done()
+				c.adopter.RepairSkippedMembers(c.lifetimeCtx, repair.suite, repair.snapshotID)
+				_, _ = c.adopter.ReconcileSnapshot(c.lifetimeCtx, repair.suite, repair.snapshotID, false)
+			}()
+			return
 		}
 		mu.Unlock()
 		return
@@ -1152,24 +1153,6 @@ func repairIfUnchanged(result string, suite SuiteRef, cur *cache.SuiteFreshness)
 		return nil
 	}
 	return &repairRequest{suite: suite, snapshotID: *cur.CurrentSnapshotID}
-}
-
-// currentSnapshotRef returns the current snapshot id and SuiteRef for the
-// given suite, performing one GetSuiteFreshness lookup. Returns ok=false
-// when the suite has no current snapshot (unadopted, or DB error). Used by
-// the unchanged-tick goroutine to gate the SPEC6_8 §6 ReconcileSnapshot
-// call without re-fetching the freshness row that checkLocked already read
-// (that row is already committed; we just need the id for the reconcile).
-func (c *Checker) currentSnapshotRef(ctx context.Context, scheme, host, suitePath string) (snapshotID int64, suite SuiteRef, ok bool) {
-	sf, err := c.cache.GetSuiteFreshness(ctx, scheme, host, suitePath)
-	if err != nil || sf == nil || sf.CurrentSnapshotID == nil {
-		return 0, SuiteRef{}, false
-	}
-	return *sf.CurrentSnapshotID, SuiteRef{
-		CanonicalScheme: scheme,
-		CanonicalHost:   host,
-		SuitePath:       suitePath,
-	}, true
 }
 
 // Reconcile forces an in-place reconcile of one suite's current snapshot

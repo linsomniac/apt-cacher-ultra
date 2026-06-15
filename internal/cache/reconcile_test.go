@@ -130,6 +130,49 @@ func TestInsertReconciledMembers_InPlace(t *testing.T) {
 	}
 }
 
+// TestInsertReconciledMembers_RejectsConflictingPackageHash: a healed index
+// that declares a DIFFERENT hash for a .deb path an already-present index
+// already declared is a real cross-index disagreement — adoption fails on it
+// (ErrAdoptionParseFailed, SPEC6_5 §11 H7), so reconcile must too, not
+// silently keep the stale row (which would fail-closed every fetch of that
+// .deb via the healed index). A byte-identical declaration stays idempotent.
+func TestInsertReconciledMembers_RejectsConflictingPackageHash(t *testing.T) {
+	ctx := context.Background()
+	c := openCache(t)
+	snapID := commitTestSnapshotInRelease(t, c)
+
+	ph := func(path, sha string) PackageHash {
+		return PackageHash{
+			CanonicalScheme: "http", CanonicalHost: "h", Path: path,
+			DeclaredSHA256: sha, SnapshotID: snapID, PackageName: "pkg", Architecture: "all",
+		}
+	}
+	const debPath = "/ubuntu/pool/main/p/pkg/pkg_1_all.deb"
+	hashA := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+
+	// First reconcile declares debPath = hashA.
+	if err := c.InsertReconciledMembers(ctx, snapID, nil, []PackageHash{ph(debPath, hashA)}); err != nil {
+		t.Fatalf("initial package_hash insert: %v", err)
+	}
+	// Byte-identical re-insert is an idempotent no-op.
+	if err := c.InsertReconciledMembers(ctx, snapID, nil, []PackageHash{ph(debPath, hashA)}); err != nil {
+		t.Errorf("byte-identical package_hash re-insert should be a no-op, got %v", err)
+	}
+	// A conflicting hash for the same path is a loud error.
+	if err := c.InsertReconciledMembers(ctx, snapID, nil, []PackageHash{ph(debPath, hashB)}); err == nil {
+		t.Fatal("conflicting package_hash declaration was silently accepted — must be a loud error")
+	}
+	// The stored row still reads hashA — no silent overwrite.
+	got, gerr := c.GetPackageHash(ctx, "http", "h", debPath, snapID)
+	if gerr != nil {
+		t.Fatalf("GetPackageHash: %v", gerr)
+	}
+	if got.DeclaredSHA256 != hashA {
+		t.Errorf("stored hash = %s, want %s (conflict must not overwrite)", got.DeclaredSHA256, hashA)
+	}
+}
+
 // TestInsertReconciledMembers_RejectsConflictingBlob locks the
 // security-critical loud-error branch: a member whose path already exists with
 // a DIFFERENT blob must be rejected (no silent overwrite of the serving blob).

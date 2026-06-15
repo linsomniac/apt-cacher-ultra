@@ -24,16 +24,38 @@ func insertPackageHashTx(ctx context.Context, tx *sql.Tx, ph PackageHash) error 
 	if !validBlobHash(ph.DeclaredSHA256) {
 		return fmt.Errorf("insertPackageHashTx: %q declared_sha256 %w", ph.Path, ErrInvalidHash)
 	}
-	_, err := tx.ExecContext(ctx, `
+	// Idempotent on retry, loud on disagreement — mirroring the snapshot_member
+	// path below and adoption's own same-path/different-hash rule (which fails
+	// with ErrAdoptionParseFailed, SPEC6_5 §11 H7). A byte-identical existing
+	// row is a no-op; a DIFFERENT declared_sha256 for the same .deb path in
+	// this snapshot is a real cross-index disagreement (an already-present
+	// index vs the healed one) and must NOT silently keep the stale row — that
+	// would fail-closed every strict-mode fetch of that .deb via the healed
+	// index. (The previous ON CONFLICT DO NOTHING silently kept the stale row.)
+	var existing string
+	switch err := tx.QueryRowContext(ctx, `
+SELECT declared_sha256 FROM package_hash
+ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`,
+		ph.CanonicalScheme, ph.CanonicalHost, ph.Path, ph.SnapshotID).Scan(&existing); {
+	case err == nil:
+		if existing != ph.DeclaredSHA256 {
+			return fmt.Errorf("insertPackageHashTx: %q already declares %s, reconcile has %s",
+				ph.Path, existing, ph.DeclaredSHA256)
+		}
+		return nil // byte-identical — idempotent no-op
+	case errors.Is(err, sql.ErrNoRows):
+		// not present — insert below
+	default:
+		return fmt.Errorf("insertPackageHashTx: probe %q: %w", ph.Path, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO package_hash (canonical_scheme, canonical_host, path,
                           declared_sha256, snapshot_id,
                           package_name, architecture)
-VALUES (?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT (canonical_scheme, canonical_host, path, snapshot_id) DO NOTHING`,
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		ph.CanonicalScheme, ph.CanonicalHost, ph.Path,
 		ph.DeclaredSHA256, ph.SnapshotID,
-		ph.PackageName, ph.Architecture)
-	if err != nil {
+		ph.PackageName, ph.Architecture); err != nil {
 		return fmt.Errorf("insertPackageHashTx: insert %q: %w", ph.Path, err)
 	}
 	return nil
@@ -56,10 +78,11 @@ ON CONFLICT (canonical_scheme, canonical_host, path, snapshot_id) DO NOTHING`,
 //     authority that this snapshot is still serving clients; if it misses
 //     (ErrSnapshotNotCurrent), the whole function returns without touching any
 //     rows. Do not remove or weaken this check.
-//  2. IDEMPOTENCY: the probe-before-insert on snapshot_member and the
-//     ON CONFLICT DO NOTHING on package_hash mean the entire function is safe
-//     to retry. A conflicting blob_hash on the same path is an explicit error,
-//     not a silent no-op, because it would mean the caller is trying to
+//  2. IDEMPOTENCY: the probe-before-insert on BOTH snapshot_member and
+//     package_hash (insertPackageHashTx) means the entire function is safe to
+//     retry — a byte-identical row is a no-op. A conflicting blob_hash (or
+//     conflicting package_hash declared_sha256) on the same path is an explicit
+//     error, not a silent no-op, because it would mean the caller is trying to
 //     substitute a different blob than what already serves — that is corruption.
 func (c *Cache) InsertReconciledMembers(ctx context.Context, snapshotID int64, members []SnapshotMember, packageHashes []PackageHash) error {
 	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {

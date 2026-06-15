@@ -1733,6 +1733,87 @@ func TestCheck_UnchangedTick_ReconcilesDegraded(t *testing.T) {
 	}
 }
 
+// TestCheck_FailedTick_DoesNotReconcile: auto-reconcile must run ONLY on a
+// tick that positively confirmed the upstream metadata is unchanged (repair
+// != nil). On a tick that did NOT confirm unchanged — an upstream failure
+// here, equivalently a cooldown skip — reconcile must NOT fire, so a
+// persistently-degraded suite cannot drive uncooled-down upstream fetches on
+// every client metadata request.
+func TestCheck_FailedTick_DoesNotReconcile(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	env.suite = SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/ubuntu/dists/noble"}
+
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:                          env.cache,
+		Fetcher:                        env.fetcher,
+		Verifier:                       passThroughVerifier{},
+		HostLimiter:                    hostsem.New(8),
+		Architectures:                  []string{"amd64"},
+		TolerateOptionalMemberFailures: true,
+		RepairSkippedMembers:           true,
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+
+	pkgsAmd64 := fakePackagesStanzas(map[string]string{"pool/main/a/a/a_1_amd64.deb": strings.Repeat("a", 64)})
+	pkgsAll := fakePackagesStanzas(map[string]string{"pool/main/c/c/c_1_all.deb": strings.Repeat("c", 64)})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgsAmd64,
+		"main/binary-all/Packages":   pkgsAll,
+	})
+	base := "http://127.0.0.1/ubuntu/dists/noble/"
+	env.fetcher.put(base+"main/binary-amd64/Packages", pkgsAmd64)
+	env.fetcher.put(base+"main/binary-all/Packages", pkgsAll) // member fetcher CAN serve it
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("adoption setup: %v", err)
+	}
+	sf, _ := env.cache.GetSuiteFreshness(ctx, env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	snapID := *sf.CurrentSnapshotID
+
+	// Degrade: delete binary-all member + alias.
+	bam, err := env.cache.GetSnapshotMember(ctx, snapID, "main/binary-all/Packages")
+	if err != nil {
+		t.Fatalf("setup GetSnapshotMember: %v", err)
+	}
+	if err := env.cache.DeleteSnapshotMembersForTest(ctx, snapID,
+		"main/binary-all/Packages", "main/binary-all/by-hash/SHA256/"+bam.DeclaredSHA256); err != nil {
+		t.Fatalf("setup delete: %v", err)
+	}
+
+	// InRelease conditional GET FAILS (500) → result "failed" → repair == nil.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	inReleaseHash := hashOf(releaseText)
+	if err := env.cache.PutURLPath(ctx, cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/ubuntu/dists/noble/InRelease", BlobHash: &inReleaseHash,
+		UpstreamURL: srv.URL + "/ubuntu/dists/noble/InRelease", IsMetadata: true,
+	}); err != nil {
+		t.Fatalf("PutURLPath: %v", err)
+	}
+
+	checker, err := New(Config{
+		Cache: env.cache, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Adopter: ad, Logger: discardLogger(), now: func() time.Time { return time.Unix(11000, 0) },
+	})
+	if err != nil {
+		t.Fatalf("New checker: %v", err)
+	}
+
+	checker.Check(ctx, "http", "127.0.0.1", "/ubuntu/dists/noble")
+	checker.WaitForAdoptions()
+
+	// binary-all must STILL be absent — the failed tick did not confirm
+	// unchanged, so reconcile must not have run.
+	if _, err := env.cache.GetSnapshotMember(ctx, snapID, "main/binary-all/Packages"); err == nil {
+		t.Error("reconcile ran on a non-confirmed (failed) tick — must only run when repair != nil")
+	}
+}
+
 // newCheckerForReconcile builds a Checker backed by an empty fakeCache (no
 // known suites). Used by TestCheckerReconcile_UnknownSuiteAllocatesNoLock to
 // verify that Reconcile returns false and does NOT allocate a per-suite lock

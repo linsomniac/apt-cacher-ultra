@@ -2,6 +2,8 @@ package freshness
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -135,11 +137,23 @@ func (a *Adopter) reparseSnapshotRelease(ctx context.Context, snapshotID int64) 
 		if err != nil {
 			return nil, fmt.Errorf("reconcile: get %s member: %w", name, err)
 		}
-		bytes, rerr := os.ReadFile(a.cache.BlobPath(mem.BlobHash))
+		blob, rerr := os.ReadFile(a.cache.BlobPath(mem.BlobHash))
 		if rerr != nil {
 			return nil, fmt.Errorf("reconcile: read %s blob: %w", name, rerr)
 		}
-		return ParseRelease(bytes)
+		// Trust-anchor integrity: the pool file must still hash to the pinned
+		// content address. Refcounting prevents GC, not at-rest corruption or
+		// local tampering — an anchor whose bytes no longer match its hash
+		// could define FORGED member declarations, so refuse to parse it.
+		// mem.BlobHash is the InRelease/Release member's recorded content
+		// address, == the GPG-verified suite_snapshot anchor hash by adoption's
+		// construction, so this binds the parse to the verified anchor.
+		sum := sha256.Sum256(blob)
+		if got := hex.EncodeToString(sum[:]); got != mem.BlobHash {
+			return nil, fmt.Errorf("reconcile: %s anchor blob hash mismatch (file=%s pinned=%s) — corrupt at rest",
+				name, got, mem.BlobHash)
+		}
+		return ParseRelease(blob)
 	}
 	return nil, fmt.Errorf("reconcile: snapshot %d has no InRelease/Release member", snapshotID)
 }

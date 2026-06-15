@@ -3,6 +3,7 @@ package freshness
 import (
 	"bytes"
 	"context"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -205,6 +206,38 @@ func TestReconcileSnapshot_GateAndForce(t *testing.T) {
 // binary-all member rows, exactly as TestReconcileSnapshot_HealsBinaryAllInPlace
 // does in its setup phase. The env fetcher already has binary-all seeded from
 // adoptCompleteSnapshot, so callers can reconcile immediately.
+// TestReconcileSnapshot_RejectsCorruptedAnchor: the re-parsed Release is the
+// reconcile trust anchor. Refcounting prevents GC, not at-rest corruption or
+// tampering — so reconcile must verify the anchor pool file still hashes to
+// the pinned (GPG-verified) blob hash before trusting its declarations.
+func TestReconcileSnapshot_RejectsCorruptedAnchor(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newReconcileAdopter(t, env, []string{"amd64"})
+	snapID := adoptDegradedBinaryAll_ID(t, env, ad) // degraded + healable (fetcher serves binary-all)
+
+	// Corrupt the pinned InRelease anchor at rest: overwrite its pool file with
+	// DIFFERENT but still-parseable Release bytes (so the unfixed path would
+	// parse them and act on forged declarations). They no longer hash to the
+	// recorded blob hash.
+	inRel, err := env.cache.GetSnapshotMember(ctx, snapID, "InRelease")
+	if err != nil {
+		t.Fatalf("get InRelease member: %v", err)
+	}
+	corrupt, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": fakePackagesStanzas(map[string]string{
+			"pool/main/x/x/x_9_amd64.deb": strings.Repeat("9", 64),
+		}),
+	})
+	if err := os.WriteFile(env.cache.BlobPath(inRel.BlobHash), corrupt, 0o644); err != nil {
+		t.Fatalf("corrupt anchor: %v", err)
+	}
+
+	if _, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, false); err == nil {
+		t.Error("ReconcileSnapshot accepted a corrupted (hash-mismatched) anchor blob — must reject")
+	}
+}
+
 func adoptDegradedBinaryAll_ID(t *testing.T, env *adoptionTestEnv, ad *Adopter) int64 {
 	t.Helper()
 	ctx := context.Background()
