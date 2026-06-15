@@ -535,3 +535,56 @@ func (s *Server) logRefresherFailure(metricName string, err error, dur time.Dura
 		"duration_ms", dur.Milliseconds(),
 	)
 }
+
+// handleReconcile serves POST /reconcile — the SPEC6_8 on-demand recovery tool.
+// Forces an in-place reconcile of one suite's current snapshot: fetches declared-
+// but-absent requestable IndexTargets into the existing snapshot. Strictly
+// additive: it can only ADD hash-validated declared members to a current
+// snapshot, never degrade serving. The admin listener must be network-protected
+// (htpasswd or firewall) — this endpoint triggers async network I/O on the
+// upstream mirror.
+//
+// Params (form body): host (required), suite (required suite_path), scheme
+// (optional, defaults to "https"). Returns:
+//   - 202 Accepted: reconcile triggered asynchronously.
+//   - 409 Conflict: not triggered (busy, suite unknown, or no current snapshot).
+//   - 400 Bad Request: host or suite missing.
+//   - 413 Request Entity Too Large: body exceeds 8 KiB.
+//   - 501 Not Implemented: Reconciler not wired in Config.
+//
+// Auth + method enforcement handled by the dispatcher (auth middleware wraps
+// the whole handler chain; /reconcile POST branch checked before route table).
+//
+// AIDEV-NOTE: handleReconcile is ADDITIVE ONLY — it can only add hash-validated
+// declared members to the current snapshot, never remove or replace them.
+// A reconcile that races a re-adoption is a safe no-op (ErrSnapshotNotCurrent).
+// The admin listener MUST be network-protected; this endpoint triggers upstream
+// mirror fetches.
+func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.Reconciler == nil {
+		http.Error(w, "reconcile not available\n", http.StatusNotImplemented)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "request body too large\n", http.StatusRequestEntityTooLarge)
+		return
+	}
+	host := strings.TrimSpace(r.FormValue("host"))
+	suite := strings.TrimSpace(r.FormValue("suite"))
+	scheme := strings.TrimSpace(r.FormValue("scheme"))
+	if scheme == "" {
+		scheme = "https"
+	}
+	if host == "" || suite == "" {
+		http.Error(w, "host and suite are required\n", http.StatusBadRequest)
+		return
+	}
+	s.logger.Info("admin_reconcile_requested", "scheme", scheme, "canonical_host", host, "suite_path", suite)
+	if !s.cfg.Reconciler.Reconcile(r.Context(), scheme, host, suite) {
+		http.Error(w, "reconcile not triggered (busy, unknown, or no current snapshot)\n", http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = io.WriteString(w, "reconcile triggered\n")
+}

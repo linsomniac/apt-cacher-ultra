@@ -92,12 +92,28 @@ type Config struct {
 	// log line.
 	AdoptionAcceptAnySigner bool
 
+	// Reconciler is OPTIONAL. When non-nil, POST /reconcile is enabled
+	// and delegates to Reconciler.Reconcile. When nil, the endpoint
+	// returns 501 Not Implemented. cmd wires the freshness Checker;
+	// New does NOT reject a nil Reconciler.
+	Reconciler Reconciler
+
 	// Keyring supplies the loaded GPG keyring inventory for the
 	// status page's `keyring` section. nil is treated as "adoption
 	// disabled or keyring not yet wired" — the section renders as
 	// an empty list. Defined as an interface so admin does not
 	// import internal/gpg.
 	Keyring KeyringProvider
+}
+
+// Reconciler forces an in-place reconcile of one suite's current snapshot
+// (SPEC6_8 on-demand recovery). nil → POST /reconcile returns 501. cmd
+// wires the freshness Checker; the interface keeps admin from importing
+// internal/freshness. Returns true when a reconcile was triggered;
+// false when the suite is unknown / has no current snapshot, or another
+// reconcile holds the suite lock (caller sees 409 Conflict).
+type Reconciler interface {
+	Reconcile(ctx context.Context, scheme, host, suitePath string) bool
 }
 
 // KeyringProvider returns the inventory of trusted-key entities loaded
@@ -316,6 +332,18 @@ func (s *Server) buildHandler() http.Handler {
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Allow", allowMethods)
 			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		// POST /reconcile is a mutating endpoint — handled before the
+		// read-only route table so it gets its own method enforcement
+		// (the table only allows GET/HEAD).
+		if r.URL.Path == "/reconcile" {
+			if r.Method != http.MethodPost {
+				w.Header().Set("Allow", "POST, OPTIONS")
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			s.handleReconcile(w, r)
 			return
 		}
 		h, known := routes[r.URL.Path]

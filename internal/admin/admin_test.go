@@ -1410,3 +1410,86 @@ func TestFormatUnixTimePtrTag(t *testing.T) {
 		t.Errorf("formatUnixTimePtrTag(&u) missing data-unix attribute; got: %s", got)
 	}
 }
+
+// stubReconciler is a test double for the Reconciler interface.
+// It records every call and returns a fixed result so subtests can
+// assert both the HTTP status and the exact params forwarded.
+type stubReconciler struct {
+	result bool
+	calls  int
+	scheme string
+	host   string
+	suite  string
+}
+
+func (s *stubReconciler) Reconcile(_ context.Context, scheme, host, suitePath string) bool {
+	s.calls++
+	s.scheme, s.host, s.suite = scheme, host, suitePath
+	return s.result
+}
+
+// withReconciler returns an adminOpt that wires r into Config.Reconciler.
+func withReconciler(r Reconciler) adminOpt { return func(cfg *Config) { cfg.Reconciler = r } }
+
+func TestEndpoint_Reconcile(t *testing.T) {
+	const form = "application/x-www-form-urlencoded"
+	t.Run("triggered 202 + params", func(t *testing.T) {
+		stub := &stubReconciler{result: true}
+		_, base, cleanup := startAdminServer(t, withReconciler(stub))
+		defer cleanup()
+		resp, err := http.Post(base+"/reconcile", form,
+			strings.NewReader("scheme=https&host=packages.microsoft.com&suite=/ubuntu/24.04/prod/dists/noble"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusAccepted {
+			t.Errorf("status=%d want 202", resp.StatusCode)
+		}
+		if stub.host != "packages.microsoft.com" || stub.suite != "/ubuntu/24.04/prod/dists/noble" || stub.scheme != "https" {
+			t.Errorf("params scheme=%q host=%q suite=%q", stub.scheme, stub.host, stub.suite)
+		}
+	})
+	t.Run("not triggered 409", func(t *testing.T) {
+		stub := &stubReconciler{result: false}
+		_, base, cleanup := startAdminServer(t, withReconciler(stub))
+		defer cleanup()
+		resp, _ := http.Post(base+"/reconcile", form, strings.NewReader("host=h&suite=/s"))
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusConflict {
+			t.Errorf("status=%d want 409", resp.StatusCode)
+		}
+	})
+	t.Run("missing suite 400, no call", func(t *testing.T) {
+		stub := &stubReconciler{result: true}
+		_, base, cleanup := startAdminServer(t, withReconciler(stub))
+		defer cleanup()
+		resp, _ := http.Post(base+"/reconcile", form, strings.NewReader("host=h"))
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("status=%d want 400", resp.StatusCode)
+		}
+		if stub.calls != 0 {
+			t.Errorf("called %d want 0", stub.calls)
+		}
+	})
+	t.Run("no reconciler 501", func(t *testing.T) {
+		_, base, cleanup := startAdminServer(t)
+		defer cleanup()
+		resp, _ := http.Post(base+"/reconcile", form, strings.NewReader("host=h&suite=/s"))
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusNotImplemented {
+			t.Errorf("status=%d want 501", resp.StatusCode)
+		}
+	})
+	t.Run("GET 405", func(t *testing.T) {
+		stub := &stubReconciler{result: true}
+		_, base, cleanup := startAdminServer(t, withReconciler(stub))
+		defer cleanup()
+		resp, _ := http.Get(base + "/reconcile")
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("status=%d want 405", resp.StatusCode)
+		}
+	})
+}
