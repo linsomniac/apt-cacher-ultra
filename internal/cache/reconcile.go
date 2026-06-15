@@ -8,16 +8,18 @@ import (
 )
 
 // insertPackageHashTx inserts a single package_hash row inside an open
-// transaction. Used by both CommitAdoption (via the loop in adoption.go) and
-// InsertReconciledMembers so the two paths stay in lockstep on column set and
-// hash validation.
+// transaction, for the InsertReconciledMembers path only.
 //
-// AIDEV-NOTE: ON CONFLICT DO NOTHING here (vs CommitAdoption's plain INSERT)
-// is intentional for the reconcile path: a retry of InsertReconciledMembers
-// may hit rows already written by the first (partial) attempt. The PK
-// (canonical_scheme, canonical_host, path, snapshot_id) is a natural uniqueness
-// boundary — DO NOTHING is strictly additive and safe. CommitAdoption retains
-// its plain INSERT because candidate snapshots are never partially committed.
+// AIDEV-NOTE: CommitAdoption keeps its OWN inline copy of this INSERT
+// (adoption.go Step 3); this is an independent copy that matches its column
+// set + hash validation today, not a shared dependency. They are deliberately
+// not refactored into one: CommitAdoption uses a plain INSERT (candidate
+// snapshots are never partially committed, so a conflict there is a bug),
+// while reconcile adds ON CONFLICT DO NOTHING because a retry of
+// InsertReconciledMembers may legitimately re-hit rows the first (partial)
+// attempt wrote. The PK (canonical_scheme, canonical_host, path, snapshot_id)
+// is the natural uniqueness boundary — DO NOTHING is strictly additive and
+// safe. If the package_hash column set ever changes, update BOTH copies.
 func insertPackageHashTx(ctx context.Context, tx *sql.Tx, ph PackageHash) error {
 	if !validBlobHash(ph.DeclaredSHA256) {
 		return fmt.Errorf("insertPackageHashTx: %q declared_sha256 %w", ph.Path, ErrInvalidHash)
@@ -87,11 +89,22 @@ func (c *Cache) InsertReconciledMembers(ctx context.Context, snapshotID int64, m
 				return fmt.Errorf("InsertReconciledMembers: member %q references snapshot %d, reconciling %d",
 					m.Path, m.SnapshotID, snapshotID)
 			}
+			// Shape-check the hashes before any SQL — mirrors CommitAdoption
+			// Step 4 (adoption.go). Defense-in-depth: a malformed hash should
+			// fail loud here, not be smuggled past the schema CHECK or into a
+			// BlobPath computation.
+			if !validBlobHash(m.BlobHash) {
+				return fmt.Errorf("InsertReconciledMembers: member %q blob_hash %w", m.Path, ErrInvalidHash)
+			}
+			if !validBlobHash(m.DeclaredSHA256) {
+				return fmt.Errorf("InsertReconciledMembers: member %q declared_sha256 %w", m.Path, ErrInvalidHash)
+			}
 			// AIDEV-NOTE: idempotency probe — check for an existing row before
 			// inserting. A byte-identical row (same blob_hash) is silently
-			// skipped (safe retry). A different blob_hash on the same path is
-			// corruption and fails loud (the caller tried to substitute a
-			// different blob than the one already serving under this path).
+			// skipped (safe retry) and must NOT bump refcount. A different
+			// blob_hash on the same path is corruption and fails loud (the
+			// caller tried to substitute a different blob than the one already
+			// serving under this path).
 			var existing string
 			switch err := tx.QueryRowContext(ctx,
 				`SELECT blob_hash FROM snapshot_member WHERE snapshot_id = ? AND path = ?`,
@@ -101,11 +114,35 @@ func (c *Cache) InsertReconciledMembers(ctx context.Context, snapshotID int64, m
 					return fmt.Errorf("InsertReconciledMembers: path %q exists with blob %s, reconcile has %s",
 						m.Path, existing, m.BlobHash)
 				}
-				continue // byte-identical: idempotent skip
+				continue // byte-identical: idempotent skip, no refcount bump
 			case errors.Is(err, sql.ErrNoRows):
 				// fall through to insert
 			default:
 				return fmt.Errorf("InsertReconciledMembers: probe %q: %w", m.Path, err)
+			}
+
+			// AIDEV-NOTE: refcount bump — mirrors RepairSkippedMember Step 3
+			// (skipped_member.go ~174) and CommitAdoption Step 4 (adoption.go
+			// ~484). Each new snapshot_member is a fresh pin on its blob, so
+			// blob.refcount MUST rise to match, or the displacement decrement
+			// (CommitAdoption Step 8, ~541) over-decrements this snapshot's
+			// blobs to below their true count when it is later displaced —
+			// corrupting the GC ledger. The NOT EXISTS guard bumps at most
+			// ONCE per distinct blob within this snapshot: it runs BEFORE this
+			// iteration's own INSERT, so "already pins" means a row from the
+			// original adoption, an earlier reconcile, or an earlier member in
+			// THIS loop that shares the blob (e.g. a path + its by-hash alias).
+			// The IIF clears refcount_zeroed_at only on the strictly-positive
+			// crossing, identical to the mirrored functions.
+			if _, err := tx.ExecContext(ctx, `
+UPDATE blob
+   SET refcount = refcount + 1,
+       refcount_zeroed_at = IIF(refcount + 1 > 0, NULL, refcount_zeroed_at)
+ WHERE hash = ?
+   AND NOT EXISTS (SELECT 1 FROM snapshot_member
+                    WHERE snapshot_id = ? AND blob_hash = ?)`,
+				m.BlobHash, snapshotID, m.BlobHash); err != nil {
+				return fmt.Errorf("InsertReconciledMembers: bump refcount %s: %w", m.BlobHash, err)
 			}
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256) VALUES (?,?,?,?)`,

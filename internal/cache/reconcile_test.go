@@ -94,18 +94,85 @@ func TestInsertReconciledMembers_InPlace(t *testing.T) {
 
 	blob := strings.Repeat("e", 64)
 	writeTestBlob(t, c, blob, []byte("binary-all Packages bytes"))
+	// A path plus its by-hash alias share ONE blob — exercises the
+	// once-per-distinct-blob refcount guard.
+	alias := "main/by-hash/SHA256/" + blob
 	members := []SnapshotMember{
 		{SnapshotID: snapID, Path: "main/binary-all/Packages", BlobHash: blob, DeclaredSHA256: blob},
+		{SnapshotID: snapID, Path: alias, BlobHash: blob, DeclaredSHA256: blob},
 	}
 	if err := c.InsertReconciledMembers(ctx, snapID, members, nil); err != nil {
 		t.Fatalf("InsertReconciledMembers: %v", err)
 	}
-	if _, err := c.GetSnapshotMember(ctx, snapID, "main/binary-all/Packages"); err != nil {
-		t.Errorf("member not inserted: %v", err)
+	for _, p := range []string{"main/binary-all/Packages", alias} {
+		if _, err := c.GetSnapshotMember(ctx, snapID, p); err != nil {
+			t.Errorf("member %q not inserted: %v", p, err)
+		}
 	}
-	// Idempotent re-insert is a no-op.
+	// Two member rows over one distinct blob → exactly one refcount bump.
+	if got := blobRefcount(t, c, blob); got != 1 {
+		t.Errorf("refcount after insert = %d, want 1 (one bump for two members sharing a blob)", got)
+	}
+	// Idempotent re-insert is a no-op — and must NOT bump refcount again.
 	if err := c.InsertReconciledMembers(ctx, snapID, members, nil); err != nil {
 		t.Errorf("re-insert should be idempotent, got %v", err)
+	}
+	if got := blobRefcount(t, c, blob); got != 1 {
+		t.Errorf("refcount after idempotent re-insert = %d, want 1 (no double bump)", got)
+	}
+
+	// The refcount must net to zero when the snapshot is later displaced:
+	// CommitAdoption Step 8 decrements once per blob the prior snapshot
+	// pinned. If the reconcile bump were missing, this would underflow to -1.
+	displaceCurrentSnapshot(t, c, snapID)
+	if got := blobRefcount(t, c, blob); got != 0 {
+		t.Errorf("refcount after displacement = %d, want 0 (reconcile bump must net the displacement decrement)", got)
+	}
+}
+
+// TestInsertReconciledMembers_RejectsConflictingBlob locks the
+// security-critical loud-error branch: a member whose path already exists with
+// a DIFFERENT blob must be rejected (no silent overwrite of the serving blob).
+func TestInsertReconciledMembers_RejectsConflictingBlob(t *testing.T) {
+	ctx := context.Background()
+	c := openCache(t)
+	snapID := commitTestSnapshotInRelease(t, c)
+
+	blobA := strings.Repeat("a", 64)
+	blobB := strings.Repeat("b", 64)
+	writeTestBlob(t, c, blobA, []byte("the bytes that are actually serving"))
+	writeTestBlob(t, c, blobB, []byte("a different blob the caller must not be able to substitute"))
+
+	path := "main/binary-all/Packages"
+	// First insert lands blob A under the path.
+	if err := c.InsertReconciledMembers(ctx, snapID, []SnapshotMember{
+		{SnapshotID: snapID, Path: path, BlobHash: blobA, DeclaredSHA256: blobA},
+	}, nil); err != nil {
+		t.Fatalf("seed insert (blob A): %v", err)
+	}
+	if got := blobRefcount(t, c, blobA); got != 1 {
+		t.Fatalf("blobA refcount after seed = %d, want 1", got)
+	}
+
+	// Now reconcile tries to put a DIFFERENT blob B at the same path.
+	err := c.InsertReconciledMembers(ctx, snapID, []SnapshotMember{
+		{SnapshotID: snapID, Path: path, BlobHash: blobB, DeclaredSHA256: blobB},
+	}, nil)
+	if err == nil {
+		t.Fatal("expected error for conflicting blob on existing path; got nil")
+	}
+
+	// The stored row must still read blob A — no silent overwrite.
+	got, err := c.GetSnapshotMember(ctx, snapID, path)
+	if err != nil {
+		t.Fatalf("GetSnapshotMember after rejected conflict: %v", err)
+	}
+	if got.BlobHash != blobA {
+		t.Errorf("stored blob_hash = %s, want %s (the conflicting insert must not overwrite)", got.BlobHash, blobA)
+	}
+	// And blob B must not have gained a pin from the rolled-back transaction.
+	if rc := blobRefcount(t, c, blobB); rc != 0 {
+		t.Errorf("blobB refcount = %d, want 0 (rejected/rolled-back insert must not bump)", rc)
 	}
 }
 
