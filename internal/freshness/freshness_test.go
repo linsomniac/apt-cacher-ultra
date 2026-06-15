@@ -1732,3 +1732,41 @@ func TestCheck_UnchangedTick_ReconcilesDegraded(t *testing.T) {
 		t.Errorf("snapshot id changed after reconcile: want %d, got %v", snapID, sf2.CurrentSnapshotID)
 	}
 }
+
+// newCheckerForReconcile builds a Checker backed by an empty fakeCache (no
+// known suites). Used by TestCheckerReconcile_UnknownSuiteAllocatesNoLock to
+// verify that Reconcile returns false and does NOT allocate a per-suite lock
+// entry for a forged/unknown (host, suite) — the codex lock-growth mitigation.
+func newCheckerForReconcile(t *testing.T) *Checker {
+	t.Helper()
+	c, err := New(Config{
+		Cache:       newFakeCache(),
+		Fetcher:     newTestFetcher(t),
+		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(),
+		now:         func() time.Time { return time.Unix(11000, 0) },
+	})
+	if err != nil {
+		t.Fatalf("newCheckerForReconcile: %v", err)
+	}
+	return c
+}
+
+// TestCheckerReconcile_UnknownSuiteAllocatesNoLock verifies the critical
+// SPEC6_8 lock-growth mitigation: Reconcile validates that the suite is known
+// (has a current snapshot) BEFORE calling c.locks.LoadOrStore. A forged or
+// unknown (host, suite) must return false without allocating a per-suite mutex
+// entry — otherwise an unauthenticated caller could grow the lock map without
+// bound.
+func TestCheckerReconcile_UnknownSuiteAllocatesNoLock(t *testing.T) {
+	c := newCheckerForReconcile(t) // real Cache interface (fakeCache), no suites
+	if c.Reconcile(context.Background(), "https", "nope.example", "/dists/x") {
+		t.Error("Reconcile on unknown suite returned true")
+	}
+	// The per-suite lock map must not have grown — LoadOrStore was never called.
+	count := 0
+	c.locks.Range(func(_, _ any) bool { count++; return true })
+	if count != 0 {
+		t.Errorf("lock map grew to %d for an unknown suite", count)
+	}
+}

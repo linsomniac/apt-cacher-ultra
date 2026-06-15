@@ -1172,6 +1172,53 @@ func (c *Checker) currentSnapshotRef(ctx context.Context, scheme, host, suitePat
 	}, true
 }
 
+// Reconcile forces an in-place reconcile of one suite's current snapshot
+// (SPEC6_8 on-demand recovery). Returns true if a reconcile was triggered;
+// false if the suite is unknown / has no current snapshot (no lock allocated)
+// or another check holds the suite lock. The reconcile runs the full
+// trust-validated heal asynchronously — callers watch adoption_snapshot_reconciled.
+//
+// AIDEV-NOTE: validate-before-LoadOrStore ordering is the SPEC6_8 lock-growth
+// mitigation. GetSuiteFreshness is called FIRST; if the suite is unknown or
+// has no CurrentSnapshotID we return false WITHOUT calling c.locks.LoadOrStore.
+// This bounds the lock map to real adopted suites: an unauthenticated caller
+// who forges (host, suite) pairs cannot grow c.locks unless the suite is
+// already in the cache's suite_freshness table (which requires a successful
+// upstream adoption). Compare Check, which does LoadOrStore unconditionally
+// because T1 callers have already verified the host via the handler's
+// allowlist and the suite path via a cache hit.
+func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string) bool {
+	if c.adopter == nil {
+		return false
+	}
+	// Validate-before-LoadOrStore: confirm the suite has a current snapshot
+	// before touching the lock map. Unknown / unadopted suites are rejected
+	// here without allocating a per-suite mutex.
+	sf, err := c.cache.GetSuiteFreshness(ctx, scheme, host, suitePath)
+	if err != nil || sf == nil || sf.CurrentSnapshotID == nil {
+		return false
+	}
+	snapID := *sf.CurrentSnapshotID
+	suite := SuiteRef{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}
+
+	muVal, _ := c.locks.LoadOrStore(suiteKey(scheme, host, suitePath), &sync.Mutex{})
+	mu := muVal.(*sync.Mutex)
+	if !mu.TryLock() {
+		return false
+	}
+	c.adoptionWg.Add(1)
+	go func() {
+		defer mu.Unlock()
+		defer c.adoptionWg.Done()
+		if _, err := c.adopter.ReconcileSnapshot(c.lifetimeCtx, suite, snapID, true); err != nil {
+			c.logger.Warn("adoption_reconcile_failed",
+				"canonical_host", host, "suite_path", suitePath,
+				"snapshot_id", snapID, "err", err)
+		}
+	}()
+	return true
+}
+
 // suiteKey is the in-memory lock map key. The pipe separator matches the
 // singleflight convention in handler.serveCacheMiss; canonical scheme,
 // host, and suite_path never contain a literal pipe (canonicalization
