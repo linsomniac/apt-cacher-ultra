@@ -18,7 +18,7 @@ available from the cache at all times.
 
 ## Status
 
-I've released 0.10.2, which I'm thinking of as the first Release Candidate of 1.0.0.
+I've released 0.10.3, which I'm thinking of as the first Release Candidate of 1.0.0.
 This service has been running in my 4 environments and has served tens of thousands
 of "apt update", "apt upgrade" and "apt install" sessions.
 
