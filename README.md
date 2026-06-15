@@ -18,7 +18,7 @@ available from the cache at all times.
 
 ## Status
 
-I've released 0.10.1, which I'm thinking of as the first Release Candidate of 1.0.0.
+I've released 0.10.2, which I'm thinking of as the first Release Candidate of 1.0.0.
 This service has been running in my 4 environments and has served tens of thousands
 of "apt update", "apt upgrade" and "apt install" sessions.
 
@@ -45,6 +45,9 @@ gated by an allowed-host regex.
 - Concurrency caps — per-host and global max_concurrent_adoptions semaphores keep adoption traffic from starving
 request-path callers.
 - Garbage collection — refcounted blobs are swept when no snapshot references them.
+- Self-healing snapshots — a snapshot adopted while a required index was briefly unavailable is repaired in place,
+  automatically on the next unchanged freshness check or on demand via `POST /reconcile` (see "Recovering a degraded
+  repository").
 - Observability — /metrics endpoint, status page, structured logs (see docs/log-fields.md).
 - Packaging — ships as a .deb with systemd unit, or as standalone go executable.
 
@@ -199,6 +202,38 @@ apt-cacher-ultra packages list -format json    # JSON array
 apt-cacher-ultra packages copy -config /etc/apt-cacher-ultra/config.toml \
     nginx_1.18.0-1_amd64.deb /tmp/
 ```
+
+## Recovering a degraded repository
+
+If a suite was adopted while a required index was briefly unavailable upstream,
+its snapshot can end up missing that index (for example
+`dists/<suite>/main/binary-all/Packages`) and serve an authoritative `404` for
+it — which shows up client-side as `apt update` failing to fetch that file.
+apt-cacher-ultra heals such snapshots **in place** (no re-adoption, no serving
+gap), two ways:
+
+- **Automatically** — on every freshness check where the upstream `InRelease`
+  is unchanged, the daemon re-parses the snapshot's signed `Release`, fetches
+  any declared-but-missing index, validates it, and inserts it into the live
+  snapshot. Nothing to do; this is on by default (`[adoption].repair_skipped_members`).
+- **On demand** — force an immediate reconcile of one suite through the admin
+  listener (default `127.0.0.1:6789`; protect it with `admin.htpasswd_file`
+  and/or the bind address). `host` and `suite` are the canonical host and suite
+  path as they appear in the daemon's `adoption_success` / freshness logs;
+  `scheme` is optional (default `https`):
+
+```sh
+curl -fsS -X POST http://127.0.0.1:6789/reconcile \
+    --data-urlencode 'host=packages.microsoft.com' \
+    --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
+# 202 Accepted = reconcile triggered (runs asynchronously)
+# 409 = busy, unknown suite, or no current snapshot
+```
+
+The metric `acu_serve_snapshot_index_target_404_total` (and the
+`snapshot_index_target_404` WARN log) is the signal that a client's `apt update`
+is being denied a required index; `acu_adoption_reconciled_total` rises as the
+suite heals.
 
 ## Build
 

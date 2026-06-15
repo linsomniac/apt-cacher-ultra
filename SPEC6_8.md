@@ -120,7 +120,7 @@ Status codes: `202 Accepted` (reconcile triggered async) / `409 Conflict`
 `413` (oversized body) / `501` (not wired).
 
 ```bash
-curl -s -X POST http://admin-host:9143/reconcile \
+curl -s -X POST http://127.0.0.1:6789/reconcile \
   -d 'host=packages.microsoft.com' \
   -d 'suite=/ubuntu/24.04/prod/dists/noble'
 ```
