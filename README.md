@@ -26,15 +26,11 @@ of "apt update", "apt upgrade" and "apt install" sessions.
 
 - Drop-in apt-cacher-ng replacement — same :3142 port, proxy mode, and http://HTTPS/// URL convention, so existing
 client configs work unchanged.
-- Availability-first caching — cache hits never block on upstream; stale metadata is served when upstream is down/slow
+- TLS MITM (optional) — local CA signs per-host leaf certs so HTTPS repos (e.g. download.docker.com) can be cached,
+- Availability-first caching — cache hits never block on upstream; snapshot is served when upstream is down/slow
   rather than failing.
 - Atomic snapshot adoption — per-suite InRelease + all referenced Packages/by-hash blobs are staged, GPG-verified, and
   flipped in a single SQLite transaction so clients always see a coherent metadata set.
-- Bundled trust anchors — canonical Ubuntu, Debian, and Ubuntu Pro ESM archive keys ship inside the binary, so stock
-  repositories verify out of the box even on minimal hosts. The host keyring (`/etc/apt/trusted.gpg.d`,
-  `/etc/apt/keyrings`, plus any `adoption.keyring_dirs`) layers on top and takes precedence on fingerprint collision;
-  the admin status page lists every loaded key with its source.
-- TLS MITM (optional) — local CA signs per-host leaf certs so HTTPS repos (e.g. download.docker.com) can be cached,
 - Hash validation — every metadata file is checked against InRelease, every .deb against Packages; mismatches are
 rejected.
 - by-hash dedup — indices stored by content hash, deduplicated across suites.
