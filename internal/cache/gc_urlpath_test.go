@@ -7,13 +7,19 @@ import (
 	"testing"
 )
 
-// AIDEV-NOTE: tests for RunURLPathGCBatch — the SPEC4 §5 fourth GC
-// reap class. Mirrors the gc_test.go style: stubNow + seedBlob +
-// seedURLPath, assert reaped counts and refcount bookkeeping.
+// AIDEV-NOTE: tests for RunURLPathGCBatch — the version-aware retention
+// url_path pass. The batch is cursor-paged and applies the three-rule
+// union (recency OR newest-N mirror OR hold-grace) plus the unchanged
+// metadata-anchor / snapshot_member guards. Most tests pass holdSeconds=0
+// (no grace) so a non-retained row is deleted in the same scan, which maps
+// cleanly onto the old "reaped count" assertions; the dropped_at lifecycle
+// has its own dedicated tests.
+
+const testMaxVersions = 3
 
 // putURLPathRow inserts a url_path row with a chosen last_requested_at,
-// bypassing the cache helpers so tests can plant aged or NULL-stamped
-// rows directly.
+// bypassing the cache helpers so tests can plant aged or NULL-stamped rows
+// directly.
 func putURLPathRow(t *testing.T, c *Cache, scheme, host, path, blobHash string, lastRequestedAt sql.NullInt64, isMetadata bool) {
 	t.Helper()
 	meta := 0
@@ -32,12 +38,30 @@ func putURLPathRow(t *testing.T, c *Cache, scheme, host, path, blobHash string, 
 	}
 }
 
+// urlPathDroppedAt reads back the dropped_at column (-1 == NULL).
+func urlPathDroppedAt(t *testing.T, c *Cache, path string) int64 {
+	t.Helper()
+	var v sql.NullInt64
+	if err := c.db.QueryRow(`SELECT dropped_at FROM url_path WHERE path=?`, path).Scan(&v); err != nil {
+		t.Fatalf("read dropped_at(%s): %v", path, err)
+	}
+	if !v.Valid {
+		return -1
+	}
+	return v.Int64
+}
+
+func urlPathExists(t *testing.T, c *Cache, path string) bool {
+	t.Helper()
+	var n int
+	if err := c.db.QueryRow(`SELECT count(*) FROM url_path WHERE path=?`, path).Scan(&n); err != nil {
+		t.Fatalf("count url_path(%s): %v", path, err)
+	}
+	return n > 0
+}
+
 // makeBlobPositiveRefcount sets blob.refcount to n and clears
-// refcount_zeroed_at, matching the bookkeeping CommitAdoption Step 4
-// applies on a strictly-positive refcount crossing (Rule 2). Tests use
-// this to set up rows whose pre-decrement refcount is > 0 so the
-// URL-path pass's COALESCE + IIF logic can be exercised at the "still
-// > 0 after decrement" boundary.
+// refcount_zeroed_at, matching CommitAdoption Step 4's positive crossing.
 func makeBlobPositiveRefcount(t *testing.T, c *Cache, hash string, n int64) {
 	t.Helper()
 	if _, err := c.db.Exec(
@@ -48,43 +72,85 @@ func makeBlobPositiveRefcount(t *testing.T, c *Cache, hash string, n int64) {
 	}
 }
 
+// drainURLPathGC runs cursor-paged batches until the table is exhausted
+// and returns the aggregate counts.
+func drainURLPathGC(t *testing.T, c *Cache, batchSize int, ttl, hold int64, maxV int) URLPathGCBatchResult {
+	t.Helper()
+	var agg URLPathGCBatchResult
+	var s, h, p string
+	for {
+		res, err := c.RunURLPathGCBatch(context.Background(), batchSize, ttl, hold, maxV, s, h, p)
+		if err != nil {
+			t.Fatalf("RunURLPathGCBatch: %v", err)
+		}
+		agg.Scanned += res.Scanned
+		agg.Stamped += res.Stamped
+		agg.Cleared += res.Cleared
+		agg.Deleted += res.Deleted
+		if res.Scanned == 0 {
+			return agg
+		}
+		s, h, p = res.LastScheme, res.LastHost, res.LastPath
+	}
+}
+
+// seedCurrentSnapshot inserts a suite_freshness + suite_snapshot row and
+// points current_snapshot_id at it. Returns the snapshot id.
+func seedCurrentSnapshot(t *testing.T, c *Cache, scheme, host, suite, inrelease string, now int64) int64 {
+	t.Helper()
+	if _, err := c.db.Exec(`INSERT INTO suite_freshness
+	  (canonical_scheme, canonical_host, suite_path)
+	  VALUES (?, ?, ?)`, scheme, host, suite); err != nil {
+		t.Fatalf("seed suite_freshness: %v", err)
+	}
+	res, err := c.db.Exec(`INSERT INTO suite_snapshot
+	  (canonical_scheme, canonical_host, suite_path,
+	   inrelease_hash, created_at, adopted_at, heartbeat_at, package_coverage_complete)
+	  VALUES (?, ?, ?, ?, ?, ?, ?, 1)`, scheme, host, suite, inrelease, now, now, now)
+	if err != nil {
+		t.Fatalf("seed suite_snapshot: %v", err)
+	}
+	id, _ := res.LastInsertId()
+	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = ?
+	  WHERE canonical_scheme=? AND canonical_host=? AND suite_path=?`, id, scheme, host, suite); err != nil {
+		t.Fatalf("set current_snapshot_id: %v", err)
+	}
+	return id
+}
+
+func seedPackageHash(t *testing.T, c *Cache, scheme, host, path, declared string, snapID int64, name, arch, version string) {
+	t.Helper()
+	if _, err := c.db.Exec(`INSERT INTO package_hash
+	  (canonical_scheme, canonical_host, path, declared_sha256, snapshot_id, package_name, architecture, version)
+	  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, scheme, host, path, declared, snapID, name, arch, version); err != nil {
+		t.Fatalf("seed package_hash(%s): %v", path, err)
+	}
+}
+
 func TestRunURLPathGCBatch_DisabledWhenTTLZero(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
-	if _, err := c.RunURLPathGCBatch(ctx, 100, 0); err == nil {
+	if _, err := c.RunURLPathGCBatch(ctx, 100, 0, 0, testMaxVersions, "", "", ""); err == nil {
 		t.Fatal("RunURLPathGCBatch(ttlSeconds=0): want error, got nil")
 	}
 }
 
 func TestRunURLPathGCBatch_ReapsAgedRow(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 
 	h := seedBlob(t, c, "aged blob")
-	// last_requested_at = 10 days ago; ttl = 7 days → reapable.
 	putURLPathRow(t, c, "http", "ex.test", "/p/aged.deb", h,
 		sql.NullInt64{Int64: now - 10*86400, Valid: true}, false)
 
-	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch: %v", err)
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 1 {
+		t.Errorf("deleted = %d, want 1", agg.Deleted)
 	}
-	if got != 1 {
-		t.Errorf("reaped = %d, want 1", got)
+	if urlPathExists(t, c, "/p/aged.deb") {
+		t.Error("url_path row survived")
 	}
-
-	// Row should be gone.
-	var n int
-	if err := c.db.QueryRow(`SELECT count(*) FROM url_path WHERE path='/p/aged.deb'`).Scan(&n); err != nil {
-		t.Fatalf("count url_path: %v", err)
-	}
-	if n != 0 {
-		t.Errorf("url_path row survived: count=%d", n)
-	}
-
-	// Refcount decremented; refcount_zeroed_at set on 0→-1 crossing.
 	if rc := blobRefcount(t, c, h); rc != -1 {
 		t.Errorf("blob.refcount = %d, want -1 after decrement", rc)
 	}
@@ -95,145 +161,139 @@ func TestRunURLPathGCBatch_ReapsAgedRow(t *testing.T) {
 
 func TestRunURLPathGCBatch_FreshRowProtected(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 
 	h := seedBlob(t, c, "fresh blob")
-	// last_requested_at = 1 day ago; ttl = 7 days → protected.
 	putURLPathRow(t, c, "http", "ex.test", "/p/fresh.deb", h,
 		sql.NullInt64{Int64: now - 86400, Valid: true}, false)
 
-	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch: %v", err)
-	}
-	if got != 0 {
-		t.Errorf("reaped = %d, want 0 (row inside TTL)", got)
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (row inside TTL)", agg.Deleted)
 	}
 }
 
-func TestRunURLPathGCBatch_NullLastRequestedProtected(t *testing.T) {
+// TestRunURLPathGCBatch_NullLastRequestedNoLongerProtected is the core
+// leak-fix regression: a prefetched-but-never-served row (last_requested_at
+// IS NULL) that is not vouched by any snapshot is now reapable, where it
+// used to be immortal.
+func TestRunURLPathGCBatch_NullLastRequestedNoLongerProtected(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 
 	h := seedBlob(t, c, "prewarm blob")
-	// last_requested_at = NULL (adoption pre-warmed, never served).
-	putURLPathRow(t, c, "http", "ex.test", "/p/prewarm.deb", h,
-		sql.NullInt64{}, false)
+	putURLPathRow(t, c, "http", "ex.test", "/p/prewarm.deb", h, sql.NullInt64{}, false)
 
-	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch: %v", err)
-	}
-	if got != 0 {
-		t.Errorf("reaped = %d, want 0 (last_requested_at IS NULL is unconditionally protected)", got)
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 1 {
+		t.Errorf("deleted = %d, want 1 (never-served prefetched row must be reapable)", agg.Deleted)
 	}
 }
 
-func TestRunURLPathGCBatch_PackageHashOnCurrentSnapshotProtects(t *testing.T) {
+// TestRunURLPathGCBatch_MirrorKeepsNewestNReapsOlder is the heart of the
+// fix: in a fat-index suite that lists many versions of one package, the
+// newest N are retained (even prefetched/never-served) and older versions
+// are reaped.
+func TestRunURLPathGCBatch_MirrorKeepsNewestNReapsOlder(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 
+	scheme, host, suite := "http", "download.docker.test", "/linux/ubuntu/dists/jammy"
+	ir := seedBlob(t, c, "docker inrelease")
+	snapID := seedCurrentSnapshot(t, c, scheme, host, suite, ir, now)
+
+	// Five versions of docker-ce, all listed in the current snapshot, all
+	// prefetched (NULL last_requested). Newest 2 (3.0, 2.0) must survive.
+	versions := []string{"1.0", "2.0", "1.10", "1.2", "3.0"}
+	pathFor := map[string]string{}
+	for _, v := range versions {
+		p := "/pool/d/docker-ce/docker-ce_" + v + "_amd64.deb"
+		pathFor[v] = p
+		blob := seedBlob(t, c, "docker-ce "+v)
+		putURLPathRow(t, c, scheme, host, p, blob, sql.NullInt64{}, false)
+		seedPackageHash(t, c, scheme, host, p, blob, snapID, "docker-ce", "amd64", v)
+	}
+
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, 2)
+	if agg.Deleted != 3 {
+		t.Fatalf("deleted = %d, want 3 (older versions 1.10,1.2,1.0)", agg.Deleted)
+	}
+	for _, v := range []string{"3.0", "2.0"} {
+		if !urlPathExists(t, c, pathFor[v]) {
+			t.Errorf("newest version %s was reaped but must be kept", v)
+		}
+	}
+	for _, v := range []string{"1.10", "1.2", "1.0"} {
+		if urlPathExists(t, c, pathFor[v]) {
+			t.Errorf("old version %s survived but must be reaped", v)
+		}
+	}
+}
+
+// TestRunURLPathGCBatch_MirrorOnCurrentSnapshotProtects: a single-version
+// package listed in the current snapshot is top-N and kept (path+hash).
+func TestRunURLPathGCBatch_MirrorOnCurrentSnapshotProtects(t *testing.T) {
+	c := openCache(t)
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	scheme, host, suite := "http", "archive.test", "/ubuntu/dists/noble"
 	h := seedBlob(t, c, "vouched aged blob")
 	ir := seedBlob(t, c, "current inrelease")
 	const path = "/ubuntu/pool/main/x/x.deb"
-	putURLPathRow(t, c, "http", "archive.test", path, h,
+	putURLPathRow(t, c, scheme, host, path, h,
 		sql.NullInt64{Int64: now - 30*86400, Valid: true}, false)
+	snapID := seedCurrentSnapshot(t, c, scheme, host, suite, ir, now)
+	seedPackageHash(t, c, scheme, host, path, h, snapID, "x", "amd64", "1.0")
 
-	// Plant a suite_freshness + suite_snapshot + package_hash row that
-	// vouches for the same (scheme, host, path) on a current snapshot.
-	// suite_freshness must come first (snapshot row references suite via
-	// scheme/host/suite_path tuple; suite_freshness column carries the
-	// current_snapshot_id pointer we set after the snapshot insert).
-	if _, err := c.db.Exec(`INSERT INTO suite_freshness
-	  (canonical_scheme, canonical_host, suite_path)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
-		t.Fatalf("seed suite_freshness: %v", err)
-	}
-	res, err := c.db.Exec(`INSERT INTO suite_snapshot
-	  (canonical_scheme, canonical_host, suite_path,
-	   inrelease_hash, created_at, adopted_at, heartbeat_at,
-	   package_coverage_complete)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble',
-	          ?, ?, ?, ?, 1)`, ir, now, now, now)
-	if err != nil {
-		t.Fatalf("seed suite_snapshot: %v", err)
-	}
-	snapID, _ := res.LastInsertId()
-	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = ?
-	  WHERE canonical_scheme='http' AND canonical_host='archive.test'
-	    AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
-		t.Fatalf("set current_snapshot_id: %v", err)
-	}
-	if _, err := c.db.Exec(`INSERT INTO package_hash
-	  (canonical_scheme, canonical_host, path,
-	   declared_sha256, snapshot_id, package_name, architecture)
-	  VALUES ('http', 'archive.test', ?, ?, ?, 'x', 'amd64')`,
-		path, h, snapID); err != nil {
-		t.Fatalf("seed package_hash: %v", err)
-	}
-
-	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch: %v", err)
-	}
-	if got != 0 {
-		t.Errorf("reaped = %d, want 0 (vouched by current snapshot's package_hash)", got)
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (newest version vouched by current snapshot)", agg.Deleted)
 	}
 }
 
-func TestRunURLPathGCBatch_PackageHashOnDisplacedSnapshotDoesNotProtect(t *testing.T) {
+// TestRunURLPathGCBatch_DisplacedSnapshotMirrorProtects: under version-aware
+// retention "held snapshots" include displaced ones, so a version present
+// only in a displaced (but still-held) snapshot is retained if it ranks in
+// the newest N. (This intentionally changes the pre-version behavior where
+// displaced snapshots never vouched.)
+func TestRunURLPathGCBatch_DisplacedSnapshotMirrorProtects(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 
+	scheme, host, suite := "http", "archive.test", "/ubuntu/dists/noble"
 	h := seedBlob(t, c, "displaced-vouched aged blob")
 	ir := seedBlob(t, c, "displaced inrelease")
 	const path = "/ubuntu/pool/main/y/y.deb"
-	putURLPathRow(t, c, "http", "archive.test", path, h,
+	putURLPathRow(t, c, scheme, host, path, h,
 		sql.NullInt64{Int64: now - 30*86400, Valid: true}, false)
 
-	// Seed a snapshot that is adopted but NOT current (displaced).
-	// current_snapshot_id stays NULL.
+	// Adopted but NOT current (displaced); current_snapshot_id stays NULL.
 	if _, err := c.db.Exec(`INSERT INTO suite_freshness
-	  (canonical_scheme, canonical_host, suite_path)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
+	  (canonical_scheme, canonical_host, suite_path) VALUES (?, ?, ?)`, scheme, host, suite); err != nil {
 		t.Fatalf("seed suite_freshness: %v", err)
 	}
 	res, err := c.db.Exec(`INSERT INTO suite_snapshot
-	  (canonical_scheme, canonical_host, suite_path,
-	   inrelease_hash, created_at, adopted_at, heartbeat_at,
-	   package_coverage_complete)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble',
-	          ?, ?, ?, ?, 1)`, ir, now, now, now)
+	  (canonical_scheme, canonical_host, suite_path, inrelease_hash,
+	   created_at, adopted_at, heartbeat_at, package_coverage_complete)
+	  VALUES (?, ?, ?, ?, ?, ?, ?, 1)`, scheme, host, suite, ir, now, now, now)
 	if err != nil {
 		t.Fatalf("seed suite_snapshot: %v", err)
 	}
 	snapID, _ := res.LastInsertId()
-	if _, err := c.db.Exec(`INSERT INTO package_hash
-	  (canonical_scheme, canonical_host, path,
-	   declared_sha256, snapshot_id, package_name, architecture)
-	  VALUES ('http', 'archive.test', ?, ?, ?, 'y', 'amd64')`,
-		path, h, snapID); err != nil {
-		t.Fatalf("seed package_hash: %v", err)
-	}
+	seedPackageHash(t, c, scheme, host, path, h, snapID, "y", "amd64", "1.0")
 
-	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch: %v", err)
-	}
-	if got != 1 {
-		t.Errorf("reaped = %d, want 1 (displaced snapshot's package_hash does NOT protect)", got)
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (held displaced snapshot vouches via mirror)", agg.Deleted)
 	}
 }
 
-func TestRunURLPathGCBatch_BatchSizeLimits(t *testing.T) {
+func TestRunURLPathGCBatch_BatchSizeAndCursor(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	const now = int64(2_000_000_000)
@@ -246,474 +306,301 @@ func TestRunURLPathGCBatch_BatchSizeLimits(t *testing.T) {
 			sql.NullInt64{Int64: now - 30*86400, Valid: true}, false)
 	}
 
-	first, err := c.RunURLPathGCBatch(ctx, 3, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch first: %v", err)
+	var s, h, p string
+	scans := []int{}
+	deletes := 0
+	for {
+		res, err := c.RunURLPathGCBatch(ctx, 3, 7*86400, 0, testMaxVersions, s, h, p)
+		if err != nil {
+			t.Fatalf("RunURLPathGCBatch: %v", err)
+		}
+		if res.Scanned == 0 {
+			break
+		}
+		scans = append(scans, res.Scanned)
+		deletes += res.Deleted
+		s, h, p = res.LastScheme, res.LastHost, res.LastPath
 	}
-	if first != 3 {
-		t.Errorf("first batch reaped = %d, want 3", first)
+	want := []int{3, 3, 1}
+	if len(scans) != len(want) {
+		t.Fatalf("batch scan counts = %v, want %v", scans, want)
 	}
-	second, err := c.RunURLPathGCBatch(ctx, 3, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch second: %v", err)
+	for i := range want {
+		if scans[i] != want[i] {
+			t.Errorf("batch %d scanned = %d, want %d", i, scans[i], want[i])
+		}
 	}
-	if second != 3 {
-		t.Errorf("second batch reaped = %d, want 3", second)
-	}
-	third, err := c.RunURLPathGCBatch(ctx, 3, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch third: %v", err)
-	}
-	if third != 1 {
-		t.Errorf("third batch reaped = %d, want 1 (drain)", third)
+	if deletes != 7 {
+		t.Errorf("total deleted = %d, want 7", deletes)
 	}
 }
 
-func TestRunURLPathGCBatch_PackageHashMismatchedHashDoesNotProtect(t *testing.T) {
+func TestRunURLPathGCBatch_MirrorMismatchedHashDoesNotProtect(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 
+	scheme, host, suite := "http", "archive.test", "/ubuntu/dists/noble"
 	stale := seedBlob(t, c, "stale cached bytes")
 	current := seedBlob(t, c, "current declared bytes")
 	ir := seedBlob(t, c, "inrelease for the protecting snapshot")
 	const path = "/ubuntu/pool/main/z/z.deb"
-	putURLPathRow(t, c, "http", "archive.test", path, stale,
+	putURLPathRow(t, c, scheme, host, path, stale,
 		sql.NullInt64{Int64: now - 30*86400, Valid: true}, false)
+	snapID := seedCurrentSnapshot(t, c, scheme, host, suite, ir, now)
+	// Current snapshot declares a DIFFERENT hash for this path.
+	seedPackageHash(t, c, scheme, host, path, current, snapID, "z", "amd64", "1.0")
 
-	if _, err := c.db.Exec(`INSERT INTO suite_freshness
-	  (canonical_scheme, canonical_host, suite_path)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
-		t.Fatalf("seed suite_freshness: %v", err)
-	}
-	res, err := c.db.Exec(`INSERT INTO suite_snapshot
-	  (canonical_scheme, canonical_host, suite_path,
-	   inrelease_hash, created_at, adopted_at, heartbeat_at,
-	   package_coverage_complete)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble',
-	          ?, ?, ?, ?, 1)`, ir, now, now, now)
-	if err != nil {
-		t.Fatalf("seed suite_snapshot: %v", err)
-	}
-	snapID, _ := res.LastInsertId()
-	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = ?
-	  WHERE canonical_scheme='http' AND canonical_host='archive.test'
-	    AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
-		t.Fatalf("set current_snapshot_id: %v", err)
-	}
-	// package_hash on the current snapshot declares a DIFFERENT hash
-	// than what url_path caches. Stale row is reapable.
-	if _, err := c.db.Exec(`INSERT INTO package_hash
-	  (canonical_scheme, canonical_host, path,
-	   declared_sha256, snapshot_id, package_name, architecture)
-	  VALUES ('http', 'archive.test', ?, ?, ?, 'z', 'amd64')`,
-		path, current, snapID); err != nil {
-		t.Fatalf("seed package_hash: %v", err)
-	}
-
-	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch: %v", err)
-	}
-	if got != 1 {
-		t.Errorf("reaped = %d, want 1 (cached blob_hash diverged from current package_hash.declared_sha256)", got)
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 1 {
+		t.Errorf("deleted = %d, want 1 (cached blob_hash diverged from declared_sha256)", agg.Deleted)
 	}
 }
 
-// TestRunURLPathGCBatch_InReleaseUrlPathOnCurrentSnapshotProtected guards
-// against silent freshness skips. The freshness checker (SPEC2 §7.4)
-// calls cache.LookupURL on suite_path+"/InRelease" and silently returns
-// nil when the row is absent — so reaping an aged but still-current
-// InRelease url_path row would stop periodic refreshes for that suite.
+// TestRunURLPathGCBatch_EmptyVersionFallbackProtects: a Sources/pdiff-style
+// package_hash row (version=”) keeps the legacy snapshot-reference guard.
+func TestRunURLPathGCBatch_EmptyVersionFallbackProtects(t *testing.T) {
+	c := openCache(t)
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	scheme, host, suite := "http", "archive.test", "/ubuntu/dists/noble"
+	h := seedBlob(t, c, "source artifact bytes")
+	ir := seedBlob(t, c, "current inrelease")
+	const path = "/ubuntu/pool/main/s/src_1.0.dsc"
+	putURLPathRow(t, c, scheme, host, path, h,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, false)
+	snapID := seedCurrentSnapshot(t, c, scheme, host, suite, ir, now)
+	seedPackageHash(t, c, scheme, host, path, h, snapID, "src", "source", "") // empty version
+
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (empty-version row keeps snapshot-reference guard)", agg.Deleted)
+	}
+}
+
 func TestRunURLPathGCBatch_InReleaseUrlPathOnCurrentSnapshotProtected(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 
+	scheme, host, suite := "http", "archive.test", "/ubuntu/dists/noble"
 	ir := seedBlob(t, c, "current inrelease bytes")
-	const path = "/ubuntu/dists/noble/InRelease"
-	putURLPathRow(t, c, "http", "archive.test", path, ir,
+	path := suite + "/InRelease"
+	putURLPathRow(t, c, scheme, host, path, ir,
 		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
+	seedCurrentSnapshot(t, c, scheme, host, suite, ir, now)
 
-	if _, err := c.db.Exec(`INSERT INTO suite_freshness
-	  (canonical_scheme, canonical_host, suite_path)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
-		t.Fatalf("seed suite_freshness: %v", err)
-	}
-	res, err := c.db.Exec(`INSERT INTO suite_snapshot
-	  (canonical_scheme, canonical_host, suite_path,
-	   inrelease_hash, created_at, adopted_at, heartbeat_at,
-	   package_coverage_complete)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble',
-	          ?, ?, ?, ?, 1)`, ir, now, now, now)
-	if err != nil {
-		t.Fatalf("seed suite_snapshot: %v", err)
-	}
-	snapID, _ := res.LastInsertId()
-	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = ?
-	  WHERE canonical_scheme='http' AND canonical_host='archive.test'
-	    AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
-		t.Fatalf("set current_snapshot_id: %v", err)
-	}
-
-	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch: %v", err)
-	}
-	if got != 0 {
-		t.Errorf("reaped = %d, want 0 (InRelease url_path on current snapshot must be protected)", got)
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (InRelease anchor on current snapshot protected)", agg.Deleted)
 	}
 }
 
-// TestRunURLPathGCBatch_DetachedReleaseAndGPGProtected verifies the
-// detached-mode metadata anchors (Release + Release.gpg) are also
-// protected. Mirror of the InRelease test for SPEC2 §7.6.3 caches.
 func TestRunURLPathGCBatch_DetachedReleaseAndGPGProtected(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 
+	scheme, host, suite := "http", "archive.test", "/ubuntu/dists/noble"
 	rel := seedBlob(t, c, "detached release bytes")
 	rgpg := seedBlob(t, c, "detached release.gpg bytes")
-	putURLPathRow(t, c, "http", "archive.test", "/ubuntu/dists/noble/Release", rel,
+	putURLPathRow(t, c, scheme, host, suite+"/Release", rel,
 		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
-	putURLPathRow(t, c, "http", "archive.test", "/ubuntu/dists/noble/Release.gpg", rgpg,
+	putURLPathRow(t, c, scheme, host, suite+"/Release.gpg", rgpg,
 		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
 
 	if _, err := c.db.Exec(`INSERT INTO suite_freshness
-	  (canonical_scheme, canonical_host, suite_path)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
+	  (canonical_scheme, canonical_host, suite_path) VALUES (?, ?, ?)`, scheme, host, suite); err != nil {
 		t.Fatalf("seed suite_freshness: %v", err)
 	}
 	res, err := c.db.Exec(`INSERT INTO suite_snapshot
-	  (canonical_scheme, canonical_host, suite_path,
-	   release_hash, release_gpg_hash,
-	   created_at, adopted_at, heartbeat_at,
-	   package_coverage_complete)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble',
-	          ?, ?, ?, ?, ?, 1)`, rel, rgpg, now, now, now)
+	  (canonical_scheme, canonical_host, suite_path, release_hash, release_gpg_hash,
+	   created_at, adopted_at, heartbeat_at, package_coverage_complete)
+	  VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`, scheme, host, suite, rel, rgpg, now, now, now)
 	if err != nil {
 		t.Fatalf("seed suite_snapshot: %v", err)
 	}
 	snapID, _ := res.LastInsertId()
 	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = ?
-	  WHERE canonical_scheme='http' AND canonical_host='archive.test'
-	    AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
+	  WHERE canonical_scheme=? AND canonical_host=? AND suite_path=?`, snapID, scheme, host, suite); err != nil {
 		t.Fatalf("set current_snapshot_id: %v", err)
 	}
 
-	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch: %v", err)
-	}
-	if got != 0 {
-		t.Errorf("reaped = %d, want 0 (Release + Release.gpg url_path on current snapshot must be protected)", got)
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (Release + Release.gpg anchors protected)", agg.Deleted)
 	}
 }
 
-// TestCommitAdoption_SyncsInReleaseAnchorBlobHash is the regression test
-// for the freeze trap's root cause (SPEC3 §7.5.1 Step 3c). Adoption must
-// sync the InRelease url_path anchor's blob_hash to the newly-adopted
-// snapshot hash so the SPEC4 §5 GC guards (b)/(c) can vouch for it — while
-// PRESERVING the existing row's (port-correct) upstream_url rather than
-// clobbering it with portless reconstruction.
-func TestCommitAdoption_SyncsInReleaseAnchorBlobHash(t *testing.T) {
-	c := openCache(t)
-	ctx := context.Background()
-	defer stubNow(t, 1_700_000_000)()
-
-	stale := seedBlob(t, c, "stale client-fetched inrelease")
-	adopted := seedBlob(t, c, "adopted inrelease bytes")
-
-	const host = "archive.test"
-	const suite = "/ubuntu/dists/noble"
-	const anchorPath = suite + "/InRelease"
-	const customURL = "http://archive.test:8080/ubuntu/dists/noble/InRelease"
-
-	// Pre-existing anchor row from a prior client miss: blob_hash points
-	// at the STALE bytes and carries a port-bearing upstream_url adoption
-	// must PRESERVE.
-	if _, err := c.db.Exec(`INSERT INTO url_path
-	  (canonical_scheme, canonical_host, path, blob_hash, upstream_url,
-	   is_metadata, last_requested_at, request_count)
-	  VALUES ('http', ?, ?, ?, ?, 1, ?, 5)`,
-		host, anchorPath, stale, customURL, int64(1_699_000_000)); err != nil {
-		t.Fatalf("seed anchor: %v", err)
-	}
-
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
-		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
-		InReleaseHash: &adopted,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
-		{SnapshotID: id, Path: "InRelease", BlobHash: adopted, DeclaredSHA256: adopted},
-	}, nil,
-
-		nil, nil, false); err != nil {
-		t.Fatalf("CommitAdoption: %v", err)
-	}
-
-	u, err := c.LookupURL(ctx, "http", host, anchorPath)
-	if err != nil {
-		t.Fatalf("anchor LookupURL: %v", err)
-	}
-	if u.BlobHash == nil || *u.BlobHash != adopted {
-		t.Errorf("anchor blob_hash = %v, want adopted snapshot inrelease_hash %s", u.BlobHash, adopted)
-	}
-	if u.UpstreamURL != customURL {
-		t.Errorf("anchor upstream_url = %q, want preserved %q", u.UpstreamURL, customURL)
-	}
-	if !u.IsMetadata {
-		t.Error("anchor is_metadata must remain 1")
-	}
-}
-
-// TestCommitAdoption_CreatesInReleaseAnchorWhenMissing covers the case
-// where the anchor was already reaped before adoption (e.g. Layer A
-// recovery is racing): adoption creates it with the reconstructed URL.
-func TestCommitAdoption_CreatesInReleaseAnchorWhenMissing(t *testing.T) {
-	c := openCache(t)
-	ctx := context.Background()
-	defer stubNow(t, 1_700_000_000)()
-
-	adopted := seedBlob(t, c, "adopted inrelease bytes (no prior anchor)")
-	const host = "archive.test"
-	const suite = "/ubuntu/dists/noble"
-	const anchorPath = suite + "/InRelease"
-
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
-		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
-		InReleaseHash: &adopted,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
-		{SnapshotID: id, Path: "InRelease", BlobHash: adopted, DeclaredSHA256: adopted},
-	}, nil,
-
-		nil, nil, false); err != nil {
-		t.Fatalf("CommitAdoption: %v", err)
-	}
-
-	u, err := c.LookupURL(ctx, "http", host, anchorPath)
-	if err != nil {
-		t.Fatalf("anchor not created by adoption: %v", err)
-	}
-	if u.BlobHash == nil || *u.BlobHash != adopted {
-		t.Errorf("created anchor blob_hash = %v, want %s", u.BlobHash, adopted)
-	}
-	if u.UpstreamURL != "http://"+host+anchorPath {
-		t.Errorf("created anchor upstream_url = %q, want reconstructed %q", u.UpstreamURL, "http://"+host+anchorPath)
-	}
-	if !u.IsMetadata {
-		t.Error("created anchor is_metadata must be 1")
-	}
-}
-
-// TestRunURLPathGCBatch_InReleaseAnchorProtectedWhenBlobHashDiverges is
-// the regression test for the freshness-freeze trap (SPEC4 §5 guard (d)).
-//
-// In production the InRelease anchor's url_path.blob_hash points at the
-// last CLIENT-fetched bytes, while the adopted snapshot's inrelease_hash
-// is a DIFFERENT (re-adopted) blob — CommitAdoption historically never
-// synced the anchor. The hash-equality guard (c) therefore can NOT
-// protect the anchor, so an aged anchor is reaped and the suite freezes
-// (the checker silently skips when the row is absent — SPEC2 §7.4). The
-// identity guard (d) must protect the anchor by path for any suite with
-// a current snapshot, regardless of blob_hash.
-//
-// NOTE: the sibling _OnCurrentSnapshotProtected test masks this defect —
-// it seeds url_path.blob_hash == snapshot.inrelease_hash, the exact
-// equality production never satisfies.
+// TestRunURLPathGCBatch_InReleaseAnchorProtectedWhenBlobHashDiverges is the
+// freshness-freeze regression (identity guard d): an aged InRelease anchor
+// whose blob_hash diverged from the current snapshot's inrelease_hash must
+// still be protected by path identity.
 func TestRunURLPathGCBatch_InReleaseAnchorProtectedWhenBlobHashDiverges(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 
+	scheme, host, suite := "http", "archive.test", "/ubuntu/dists/noble"
 	stale := seedBlob(t, c, "stale client-fetched inrelease")
 	adopted := seedBlob(t, c, "adopted (newer) inrelease bytes")
-	const path = "/ubuntu/dists/noble/InRelease"
-	// Anchor aged past the 7-day TTL, blob_hash = the STALE client blob.
-	putURLPathRow(t, c, "http", "archive.test", path, stale,
+	path := suite + "/InRelease"
+	putURLPathRow(t, c, scheme, host, path, stale,
 		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
+	seedCurrentSnapshot(t, c, scheme, host, suite, adopted, now) // inrelease_hash = adopted ≠ stale
 
-	if _, err := c.db.Exec(`INSERT INTO suite_freshness
-	  (canonical_scheme, canonical_host, suite_path)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
-		t.Fatalf("seed suite_freshness: %v", err)
-	}
-	// Current snapshot's inrelease_hash = the ADOPTED blob (≠ stale).
-	res, err := c.db.Exec(`INSERT INTO suite_snapshot
-	  (canonical_scheme, canonical_host, suite_path,
-	   inrelease_hash, created_at, adopted_at, heartbeat_at,
-	   package_coverage_complete)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble', ?, ?, ?, ?, 1)`,
-		adopted, now, now, now)
-	if err != nil {
-		t.Fatalf("seed suite_snapshot: %v", err)
-	}
-	snapID, _ := res.LastInsertId()
-	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = ?
-	  WHERE canonical_scheme='http' AND canonical_host='archive.test'
-	    AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
-		t.Fatalf("set current_snapshot_id: %v", err)
-	}
-
-	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch: %v", err)
-	}
-	if got != 0 {
-		t.Errorf("reaped = %d, want 0 (InRelease anchor of a current snapshot must be protected by identity even when blob_hash diverged)", got)
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (InRelease anchor protected by identity despite diverged blob_hash)", agg.Deleted)
 	}
 }
 
-// TestRunURLPathGCBatch_OppositeFormAnchorNotProtected verifies the
-// identity guard (d) protects only the suite's ACTIVE metadata form: an
-// inline current snapshot must NOT keep a stale /Release (or
-// /Release.gpg) row alive past the TTL, and a detached snapshot must NOT
-// keep a stale /InRelease row. Otherwise opposite-form anchors (and the
-// blobs they pin) leak forever.
 func TestRunURLPathGCBatch_OppositeFormAnchorNotProtected(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 
+	scheme, host, suite := "http", "archive.test", "/ubuntu/dists/noble"
 	ir := seedBlob(t, c, "inline inrelease")
 	staleRel := seedBlob(t, c, "stale opposite-form release")
-	// Inline suite: snapshot carries inrelease_hash only.
-	putURLPathRow(t, c, "http", "archive.test", "/ubuntu/dists/noble/InRelease", ir,
+	putURLPathRow(t, c, scheme, host, suite+"/InRelease", ir,
 		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
-	// Opposite-form (Release) anchor, aged, NOT vouched by any guard but
-	// (the over-broad) identity guard.
-	putURLPathRow(t, c, "http", "archive.test", "/ubuntu/dists/noble/Release", staleRel,
+	putURLPathRow(t, c, scheme, host, suite+"/Release", staleRel,
 		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
+	seedCurrentSnapshot(t, c, scheme, host, suite, ir, now) // inline (inrelease only)
 
-	if _, err := c.db.Exec(`INSERT INTO suite_freshness
-	  (canonical_scheme, canonical_host, suite_path)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
-		t.Fatalf("seed suite_freshness: %v", err)
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 1 {
+		t.Errorf("deleted = %d, want 1 (stale opposite-form /Release reaped)", agg.Deleted)
 	}
-	res, err := c.db.Exec(`INSERT INTO suite_snapshot
-	  (canonical_scheme, canonical_host, suite_path, inrelease_hash,
-	   created_at, adopted_at, heartbeat_at, package_coverage_complete)
-	  VALUES ('http','archive.test','/ubuntu/dists/noble', ?, ?, ?, ?, 1)`,
-		ir, now, now, now)
-	if err != nil {
-		t.Fatalf("seed snapshot: %v", err)
+	if !urlPathExists(t, c, suite+"/InRelease") {
+		t.Error("active /InRelease anchor should survive")
 	}
-	snapID, _ := res.LastInsertId()
-	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id=?
-	  WHERE canonical_host='archive.test' AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
-		t.Fatalf("set current_snapshot_id: %v", err)
-	}
-
-	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch: %v", err)
-	}
-	if got != 1 {
-		t.Errorf("reaped = %d, want 1 (stale opposite-form /Release reaped; active /InRelease kept)", got)
-	}
-	var n int
-	_ = c.db.QueryRow(`SELECT count(*) FROM url_path WHERE path='/ubuntu/dists/noble/InRelease'`).Scan(&n)
-	if n != 1 {
-		t.Errorf("active /InRelease anchor should survive: count=%d", n)
-	}
-	_ = c.db.QueryRow(`SELECT count(*) FROM url_path WHERE path='/ubuntu/dists/noble/Release'`).Scan(&n)
-	if n != 0 {
-		t.Errorf("opposite-form /Release anchor should be reaped: count=%d", n)
+	if urlPathExists(t, c, suite+"/Release") {
+		t.Error("opposite-form /Release anchor should be reaped")
 	}
 }
 
-// TestRunURLPathGCBatch_SnapshotMemberHashProtects covers cached
-// Packages.gz / Sources / pdiff Index members: they are tracked in
-// snapshot_member by hash, and aged url_path rows pointing at those
-// hashes must stay so subsequent hit-path lookups continue to serve.
 func TestRunURLPathGCBatch_SnapshotMemberHashProtects(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 
+	scheme, host, suite := "http", "archive.test", "/ubuntu/dists/noble"
 	pkg := seedBlob(t, c, "Packages.gz bytes")
 	ir := seedBlob(t, c, "inrelease for protecting snapshot")
-	const path = "/ubuntu/dists/noble/main/binary-amd64/Packages.gz"
-	putURLPathRow(t, c, "http", "archive.test", path, pkg,
+	path := suite + "/main/binary-amd64/Packages.gz"
+	putURLPathRow(t, c, scheme, host, path, pkg,
 		sql.NullInt64{Int64: now - 30*86400, Valid: true}, true)
-
-	if _, err := c.db.Exec(`INSERT INTO suite_freshness
-	  (canonical_scheme, canonical_host, suite_path)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble')`); err != nil {
-		t.Fatalf("seed suite_freshness: %v", err)
-	}
-	res, err := c.db.Exec(`INSERT INTO suite_snapshot
-	  (canonical_scheme, canonical_host, suite_path,
-	   inrelease_hash, created_at, adopted_at, heartbeat_at,
-	   package_coverage_complete)
-	  VALUES ('http', 'archive.test', '/ubuntu/dists/noble',
-	          ?, ?, ?, ?, 1)`, ir, now, now, now)
-	if err != nil {
-		t.Fatalf("seed suite_snapshot: %v", err)
-	}
-	snapID, _ := res.LastInsertId()
-	if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = ?
-	  WHERE canonical_scheme='http' AND canonical_host='archive.test'
-	    AND suite_path='/ubuntu/dists/noble'`, snapID); err != nil {
-		t.Fatalf("set current_snapshot_id: %v", err)
-	}
+	snapID := seedCurrentSnapshot(t, c, scheme, host, suite, ir, now)
 	if _, err := c.db.Exec(`INSERT INTO snapshot_member
 	  (snapshot_id, path, blob_hash, declared_sha256)
-	  VALUES (?, 'main/binary-amd64/Packages.gz', ?, ?)`,
-		snapID, pkg, pkg); err != nil {
+	  VALUES (?, 'main/binary-amd64/Packages.gz', ?, ?)`, snapID, pkg, pkg); err != nil {
 		t.Fatalf("seed snapshot_member: %v", err)
 	}
 
-	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch: %v", err)
-	}
-	if got != 0 {
-		t.Errorf("reaped = %d, want 0 (snapshot_member blob_hash on current snapshot must protect)", got)
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (snapshot_member blob_hash on current snapshot protects)", agg.Deleted)
 	}
 }
 
 func TestRunURLPathGCBatch_DecrementPreservesPositiveRefcount(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 
 	h := seedBlob(t, c, "multi-ref aged blob")
-	// Set refcount to 2 and clear refcount_zeroed_at, simulating Rule 2
-	// (CommitAdoption Step 4 positive crossing). A single url_path
-	// eviction drops refcount to 1 — not <= 0, so refcount_zeroed_at
-	// must remain NULL.
 	makeBlobPositiveRefcount(t, c, h, 2)
-
 	putURLPathRow(t, c, "http", "ex.test", "/p/multi.deb", h,
 		sql.NullInt64{Int64: now - 30*86400, Valid: true}, false)
 
-	got, err := c.RunURLPathGCBatch(ctx, 100, 7*86400)
-	if err != nil {
-		t.Fatalf("RunURLPathGCBatch: %v", err)
-	}
-	if got != 1 {
-		t.Errorf("reaped = %d, want 1", got)
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 1 {
+		t.Errorf("deleted = %d, want 1", agg.Deleted)
 	}
 	if rc := blobRefcount(t, c, h); rc != 1 {
 		t.Errorf("blob.refcount = %d, want 1 (decremented from 2)", rc)
 	}
 	if z := blobZeroedAt(t, c, h); z != -1 {
 		t.Errorf("refcount_zeroed_at = %d, want -1/NULL (refcount still > 0)", z)
+	}
+}
+
+// --- dropped_at hold-grace lifecycle ---
+
+// TestRunURLPathGCBatch_HoldGraceStampsThenDeletes: with a hold window, an
+// unretained row is first stamped (dropped_at = now), survives while in
+// grace, and is deleted only once the grace elapses.
+func TestRunURLPathGCBatch_HoldGraceStampsThenDeletes(t *testing.T) {
+	c := openCache(t)
+	const now = int64(2_000_000_000)
+	const hold = int64(86400) // 24h grace
+	restore := stubNow(t, now)
+
+	h := seedBlob(t, c, "grace blob")
+	putURLPathRow(t, c, "http", "ex.test", "/p/grace.deb", h,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, false)
+
+	// Pass 1: stamp, do not delete.
+	agg := drainURLPathGC(t, c, 100, 7*86400, hold, testMaxVersions)
+	if agg.Stamped != 1 || agg.Deleted != 0 {
+		t.Fatalf("pass1: stamped=%d deleted=%d, want stamped=1 deleted=0", agg.Stamped, agg.Deleted)
+	}
+	if urlPathDroppedAt(t, c, "/p/grace.deb") != now {
+		t.Fatalf("dropped_at not stamped to now")
+	}
+	restore()
+
+	// Still inside grace: no delete.
+	restore2 := stubNow(t, now+hold-1)
+	agg = drainURLPathGC(t, c, 100, 7*86400, hold, testMaxVersions)
+	if agg.Deleted != 0 {
+		t.Errorf("in-grace: deleted=%d, want 0", agg.Deleted)
+	}
+	restore2()
+
+	// Grace elapsed: delete.
+	defer stubNow(t, now+hold)()
+	agg = drainURLPathGC(t, c, 100, 7*86400, hold, testMaxVersions)
+	if agg.Deleted != 1 {
+		t.Errorf("post-grace: deleted=%d, want 1", agg.Deleted)
+	}
+	if urlPathExists(t, c, "/p/grace.deb") {
+		t.Error("row should be deleted after grace elapsed")
+	}
+}
+
+// TestRunURLPathGCBatch_HoldGraceClearedOnRequalify: a stamped row that
+// becomes retained again (recency) has its dropped_at cleared.
+func TestRunURLPathGCBatch_HoldGraceClearedOnRequalify(t *testing.T) {
+	c := openCache(t)
+	const now = int64(2_000_000_000)
+	const hold = int64(86400)
+	restore := stubNow(t, now)
+
+	h := seedBlob(t, c, "requalify blob")
+	putURLPathRow(t, c, "http", "ex.test", "/p/requalify.deb", h,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, false)
+
+	// Stamp it.
+	_ = drainURLPathGC(t, c, 100, 7*86400, hold, testMaxVersions)
+	if urlPathDroppedAt(t, c, "/p/requalify.deb") != now {
+		t.Fatalf("expected stamped")
+	}
+	// A fresh client request makes it recency-retained again.
+	if _, err := c.db.Exec(`UPDATE url_path SET last_requested_at=? WHERE path='/p/requalify.deb'`, now); err != nil {
+		t.Fatal(err)
+	}
+	restore()
+
+	defer stubNow(t, now+1)()
+	agg := drainURLPathGC(t, c, 100, 7*86400, hold, testMaxVersions)
+	if agg.Cleared != 1 {
+		t.Errorf("cleared = %d, want 1 (re-qualified by recency)", agg.Cleared)
+	}
+	if urlPathDroppedAt(t, c, "/p/requalify.deb") != -1 {
+		t.Error("dropped_at should be cleared to NULL after re-qualification")
 	}
 }

@@ -354,11 +354,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
 			if _, err := tx.ExecContext(ctx, `
 INSERT INTO package_hash (canonical_scheme, canonical_host, path,
                           declared_sha256, snapshot_id,
-                          package_name, architecture)
-VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                          package_name, architecture, version)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 				p.CanonicalScheme, p.CanonicalHost, p.Path,
 				p.DeclaredSHA256, snapshotID,
-				p.PackageName, p.Architecture); err != nil {
+				p.PackageName, p.Architecture, p.Version); err != nil {
 				return fmt.Errorf("CommitAdoption: insert package_hash %q: %w", p.Path, err)
 			}
 		}

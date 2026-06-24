@@ -2717,7 +2717,7 @@ func TestComputeHotSet_TwoStageMatch(t *testing.T) {
 		t.Fatalf("commit new: %v", err)
 	}
 
-	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, candPHs, 86400, now)
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, candPHs, 86400, now, 1000)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
@@ -2729,6 +2729,86 @@ func TestComputeHotSet_TwoStageMatch(t *testing.T) {
 	}
 	if got[0].DeclaredSHA256 != debHashNew {
 		t.Errorf("DeclaredSHA256 = %q, want %q", got[0].DeclaredSHA256, debHashNew)
+	}
+}
+
+// TestComputeHotSet_BoundsToNewestNVersions: when a fat-index candidate
+// snapshot lists many versions of one hot (Package, Arch), the hot set is
+// bounded to the newest maxVersionsPerPackage distinct Debian versions
+// (version-aware retention §4) — the fix for the prefetch fan-out leak.
+func TestComputeHotSet_BoundsToNewestNVersions(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	scheme, host := "http", "download.docker.example"
+
+	rOld := seedBlob(t, c, "InRelease old")
+	rNew := seedBlob(t, c, "InRelease new")
+	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/linux/ubuntu/dists/jammy", InReleaseHash: &rOld,
+	})
+	idNew, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/linux/ubuntu/dists/jammy", InReleaseHash: &rNew,
+	})
+
+	// Prior snapshot: one hot (docker-ce, amd64) row + a fresh url_path so
+	// Stage 1 marks the pair hot.
+	priorPath := "/pool/d/docker-ce/docker-ce_1.0_amd64.deb"
+	priorDeb := seedBlob(t, c, "docker-ce 1.0")
+	if err := c.CommitAdoption(ctx, idPrior,
+		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}}, nil,
+		[]PackageHash{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: priorPath,
+			DeclaredSHA256: priorDeb, SnapshotID: idPrior,
+			PackageName: "docker-ce", Architecture: "amd64", Version: "1.0",
+		}}, nil, true); err != nil {
+		t.Fatalf("commit prior: %v", err)
+	}
+	now := nowUnix()
+	if err := c.PutURLPath(ctx, URLPath{
+		CanonicalScheme: scheme, CanonicalHost: host, Path: priorPath,
+		BlobHash: ptrStr(priorDeb), UpstreamURL: "u",
+		LastRequestedAt: &now, RequestCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Candidate lists FIVE versions of docker-ce (the fat-index case).
+	versions := []string{"1.0", "2.0", "1.10", "1.2", "3.0"}
+	pathFor := map[string]string{}
+	var cand []PackageHash
+	for _, v := range versions {
+		p := "/pool/d/docker-ce/docker-ce_" + v + "_amd64.deb"
+		pathFor[v] = p
+		cand = append(cand, PackageHash{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: p,
+			DeclaredSHA256: seedBlob(t, c, "deb "+v), SnapshotID: idNew,
+			PackageName: "docker-ce", Architecture: "amd64", Version: v,
+		})
+	}
+
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, cand, 86400, now, 2)
+	if err != nil {
+		t.Fatalf("ComputeHotSet: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d entries, want 2 (newest-2 of 5): %+v", len(got), got)
+	}
+	gotPaths := map[string]bool{}
+	for _, e := range got {
+		gotPaths[e.Path] = true
+	}
+	// Newest two by Debian version are 3.0 and 2.0 (1.10 > 1.2 > 1.0).
+	for _, v := range []string{"3.0", "2.0"} {
+		if !gotPaths[pathFor[v]] {
+			t.Errorf("newest version %s missing from hot set; got %+v", v, got)
+		}
+	}
+	for _, v := range []string{"1.10", "1.2", "1.0"} {
+		if gotPaths[pathFor[v]] {
+			t.Errorf("version %s should be excluded by the newest-2 cap", v)
+		}
 	}
 }
 
@@ -2781,7 +2861,7 @@ func TestComputeHotSet_ExcludesPreV3Rows(t *testing.T) {
 	// somehow had a v3 row for the same path, Stage 1's <> ''
 	// predicate filters out the prior's pre-v3 rows so no Stage 2
 	// lookup ever runs.
-	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, nil, 86400, now)
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, nil, 86400, now, 1000)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
@@ -2837,7 +2917,7 @@ func TestComputeHotSet_DroppedPackageNotInCandidate(t *testing.T) {
 
 	// Candidate's in-memory PackageHash slice is empty (upstream
 	// dropped the package). Stage 2 lookup misses → drop from hot set.
-	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, nil, 86400, now)
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, nil, 86400, now, 1000)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
@@ -2850,7 +2930,7 @@ func TestComputeHotSet_DroppedPackageNotInCandidate(t *testing.T) {
 // disables prefetch entirely (SPEC3 §5.1).
 func TestComputeHotSet_WindowZeroReturnsEmpty(t *testing.T) {
 	c := openCache(t)
-	got, err := c.ComputeHotSet(context.Background(), "http", "x", 1, 2, nil, 0, 100)
+	got, err := c.ComputeHotSet(context.Background(), "http", "x", 1, 2, nil, 0, 100, 1000)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
@@ -2864,7 +2944,7 @@ func TestComputeHotSet_WindowZeroReturnsEmpty(t *testing.T) {
 // "no prior current_snapshot_id for this suite" → empty hot set.
 func TestComputeHotSet_PriorIDZeroReturnsEmpty(t *testing.T) {
 	c := openCache(t)
-	got, err := c.ComputeHotSet(context.Background(), "http", "x", 0, 1, nil, 86400, 100)
+	got, err := c.ComputeHotSet(context.Background(), "http", "x", 0, 1, nil, 86400, 100, 1000)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}
@@ -2923,7 +3003,7 @@ func TestComputeHotSet_RejectsCandidateMismatch(t *testing.T) {
 		PackageName:    "match",
 		Architecture:   "amd64",
 	}}
-	_, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, mismatched, 86400, now)
+	_, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, mismatched, 86400, now, 1000)
 	if !errors.Is(err, ErrHotSetCandidateMismatch) {
 		t.Errorf("err = %v, want ErrHotSetCandidateMismatch", err)
 	}
@@ -2993,7 +3073,7 @@ func TestComputeHotSet_DuplicatePackageArchEmitsAllPaths(t *testing.T) {
 			PackageName:    "dup", Architecture: "amd64",
 		},
 	}
-	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idCandidate, cand, 86400, now)
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idCandidate, cand, 86400, now, 1000)
 	if err != nil {
 		t.Fatalf("ComputeHotSet: %v", err)
 	}

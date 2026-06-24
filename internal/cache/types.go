@@ -110,6 +110,11 @@ type PackageHash struct {
 	SnapshotID      int64
 	PackageName     string
 	Architecture    string
+	// Version is the Debian Version: string for binary packages, used by
+	// the version-aware retention mirror rule to rank distinct versions per
+	// (PackageName, Architecture). Empty for source/pdiff/Contents rows and
+	// for pre-v6 rows; the mirror rule only applies to non-empty versions.
+	Version string
 }
 
 // SuiteSnapshot mirrors the suite_snapshot table. Read-only model used

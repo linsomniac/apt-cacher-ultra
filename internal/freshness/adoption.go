@@ -380,6 +380,14 @@ type AdoptionConfig struct {
 	// when 0; the loud-config check lives at the cmd/main level.
 	HotPrefetchBudget time.Duration
 
+	// MaxVersionsPerPackage is retention.max_versions_per_package: the
+	// hot-prefetch loop warms only the newest N distinct versions of each
+	// hot (package_name, architecture) instead of every version a fat
+	// upstream index lists (version-aware retention §4). Values < 1 are
+	// treated as the default of 3 (so direct/test constructions that
+	// leave it zero still bound the fan-out rather than disabling it).
+	MaxVersionsPerPackage int
+
 	// HeartbeatInterval is the period of the SPEC4 §7.5.2 site 6
 	// per-adoption heartbeat ticker. The ticker runs as a sidecar
 	// goroutine for the lifetime of runShared and bounds the gap
@@ -479,6 +487,11 @@ type Adopter struct {
 	// require_signature is captured.
 	hotPackagesWindow time.Duration
 	hotPrefetchBudget time.Duration
+
+	// maxVersionsPerPackage bounds hot-prefetch (and mirrors the GC
+	// retention rule) to the newest N distinct versions per hot package.
+	// Always >= 1 (NewAdopter defaults a zero/negative config to 3).
+	maxVersionsPerPackage int
 
 	// heartbeatInterval drives the SPEC4 §7.5.2 site 6 ticker. 0
 	// disables the ticker (used by tests; production main always
@@ -580,6 +593,10 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 	if cfg.MaxConcurrent > 0 {
 		sem = make(chan struct{}, cfg.MaxConcurrent)
 	}
+	maxVersions := cfg.MaxVersionsPerPackage
+	if maxVersions < 1 {
+		maxVersions = 3
+	}
 	var allowlist map[string]struct{}
 	var archList []string
 	if len(cfg.Architectures) > 0 {
@@ -605,6 +622,7 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		concurrencySem:          sem,
 		hotPackagesWindow:       cfg.HotPackagesWindow,
 		hotPrefetchBudget:       cfg.HotPrefetchBudget,
+		maxVersionsPerPackage:   maxVersions,
 		heartbeatInterval:       cfg.HeartbeatInterval,
 		architectureAllowlist:   allowlist,
 		architectureList:        archList,
@@ -1931,6 +1949,7 @@ type debPathDecl struct {
 	sha256       string
 	packageName  string
 	architecture string
+	version      string
 }
 
 // buildPackageHashes walks every Packages-shaped Release member, parses
@@ -2025,11 +2044,18 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 					return packageHashBuildResult{}, fmt.Errorf("%w: %q declared Architecture %q vs %q across Packages variants",
 						ErrAdoptionParseFailed, debPath, existing.architecture, ref.Architecture)
 				}
+				if existing.version != "" && ref.Version != "" && existing.version != ref.Version {
+					return packageHashBuildResult{}, fmt.Errorf("%w: %q declared Version %q vs %q across Packages variants",
+						ErrAdoptionParseFailed, debPath, existing.version, ref.Version)
+				}
 				if existing.packageName == "" {
 					existing.packageName = ref.Package
 				}
 				if existing.architecture == "" {
 					existing.architecture = ref.Architecture
+				}
+				if existing.version == "" {
+					existing.version = ref.Version
 				}
 				dedup[debPath] = existing
 			} else {
@@ -2037,6 +2063,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 					sha256:       ref.SHA256,
 					packageName:  ref.Package,
 					architecture: ref.Architecture,
+					version:      ref.Version,
 				}
 			}
 			// SPEC3 §7.5.3 Stage 2 returns *every* matching path for a
@@ -2047,7 +2074,20 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 	}
 
 	rows := make([]cache.PackageHash, 0, len(dedup))
+	emptyVersion := 0
 	for debPath, decl := range dedup {
+		// Binary invariant (version-aware retention design §1): every
+		// post-v6 binary package_hash row must carry a non-empty Version,
+		// because the §3 retention mirror rule treats version='' as the
+		// "non-binary / pre-migration" marker that falls through to the
+		// snapshot-reference guard. A binary stanza with no Version: is a
+		// malformed index — skip the row and drop coverage to incomplete
+		// rather than insert a row that would silently re-open the
+		// fat-index leak for new data.
+		if decl.version == "" {
+			emptyVersion++
+			continue
+		}
 		rows = append(rows, cache.PackageHash{
 			CanonicalScheme: suite.CanonicalScheme,
 			CanonicalHost:   suite.CanonicalHost,
@@ -2056,7 +2096,18 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 			SnapshotID:      snapshotID,
 			PackageName:     decl.packageName,
 			Architecture:    decl.architecture,
+			Version:         decl.version,
 		})
+	}
+	if emptyVersion > 0 {
+		a.logger.Info("package_coverage_incomplete",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID,
+			"reason", "missing_version",
+			"skipped_rows", emptyVersion,
+		)
+		return packageHashBuildResult{rows: rows, coverageComplete: false}, nil
 	}
 
 	// SPEC3 §7.5.4: coverage_complete classification.

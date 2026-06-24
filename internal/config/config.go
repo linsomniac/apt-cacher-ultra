@@ -51,20 +51,22 @@ const MaxArchitecturesEntries = 32
 
 // Config is the top-level structure of config.toml.
 type Config struct {
-	Cache          CacheConfig       `toml:"cache"`
-	Upstream       UpstreamConfig    `toml:"upstream"`
-	Freshness      FreshnessConfig   `toml:"freshness"`
-	Adoption       AdoptionConfig    `toml:"adoption"`
-	HotPackages    HotPackagesConfig `toml:"hot_packages"`
-	Integrity      IntegrityConfig   `toml:"integrity"`
-	GC             GCConfig          `toml:"gc"`
-	Admin          AdminConfig       `toml:"admin"`
-	Serve          ServeConfig       `toml:"serve"`
-	Log            LogConfig         `toml:"log"`
-	TlsMitm        TlsMitmConfig     `toml:"tls_mitm"`
-	Remap          []RemapRule       `toml:"remap"`
-	Mirror         []MirrorRule      `toml:"mirror"`
-	TrustedSigners []TrustedSigner   `toml:"trusted_signer"`
+	Cache          CacheConfig        `toml:"cache"`
+	Upstream       UpstreamConfig     `toml:"upstream"`
+	Freshness      FreshnessConfig    `toml:"freshness"`
+	Adoption       AdoptionConfig     `toml:"adoption"`
+	HotPackages    HotPackagesConfig  `toml:"hot_packages"`
+	HoldPackages   HoldPackagesConfig `toml:"hold_packages"`
+	Retention      RetentionConfig    `toml:"retention"`
+	Integrity      IntegrityConfig    `toml:"integrity"`
+	GC             GCConfig           `toml:"gc"`
+	Admin          AdminConfig        `toml:"admin"`
+	Serve          ServeConfig        `toml:"serve"`
+	Log            LogConfig          `toml:"log"`
+	TlsMitm        TlsMitmConfig      `toml:"tls_mitm"`
+	Remap          []RemapRule        `toml:"remap"`
+	Mirror         []MirrorRule       `toml:"mirror"`
+	TrustedSigners []TrustedSigner    `toml:"trusted_signer"`
 }
 
 type CacheConfig struct {
@@ -291,6 +293,28 @@ type HotPackagesConfig struct {
 	// Default 24h. Presence-sensitive: an operator-written 0 must
 	// survive Defaults().
 	Window Duration `toml:"window"`
+}
+
+// HoldPackagesConfig holds the [hold_packages] block (version-aware
+// retention design §3 rule 3). When a cached .deb leaves the kept set
+// (no longer in the newest-N mirror set and not recently requested), the
+// url_path GC stamps url_path.dropped_at and keeps the row for this grace
+// window before reaping it — so a client with a stale apt index can still
+// resolve a just-superseded version. Default 24h. 0 = no grace
+// (same-batch delete once the row fails the recency and mirror guards).
+type HoldPackagesConfig struct {
+	Window Duration `toml:"window"`
+}
+
+// RetentionConfig holds the [retention] block (version-aware retention
+// design §3 rule 2). Bounds how many versions of a package the cache
+// keeps so fat-index repos (Docker, Elastic) cannot accumulate their
+// entire back-catalog.
+type RetentionConfig struct {
+	// MaxVersionsPerPackage is the number of newest distinct Debian
+	// versions kept (and prefetched) per (package_name, architecture)
+	// per suite. Default 3. Must be >= 1.
+	MaxVersionsPerPackage int `toml:"max_versions_per_package"`
 }
 
 // IntegrityConfig holds the SPEC2 §5.1 [integrity] block. The at-rest
@@ -649,6 +673,16 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("adoption", "hot_prefetch_budget") {
 		cfg.Adoption.HotPrefetchBudget.Duration = 5 * time.Minute
 	}
+	// Version-aware retention presence-sensitive defaults:
+	// hold_packages.window = 0 (no grace) is a documented meaningful value
+	// that must survive Defaults(); retention.max_versions_per_package
+	// defaults to 3 (must be >= 1, enforced by Validate).
+	if !md.IsDefined("hold_packages", "window") {
+		cfg.HoldPackages.Window.Duration = 24 * time.Hour
+	}
+	if !md.IsDefined("retention", "max_versions_per_package") {
+		cfg.Retention.MaxVersionsPerPackage = 3
+	}
 	// SPEC6_7 §5 presence-sensitive defaults: member_retry_count = 0
 	// (single attempt) and member_retry_delay = 0s are documented
 	// meaningful values that must survive Load.
@@ -900,6 +934,12 @@ func (c *Config) Validate() error {
 	}
 	if c.HotPackages.Window.Duration < 0 {
 		errs = append(errs, errors.New("hot_packages.window must not be negative"))
+	}
+	if c.HoldPackages.Window.Duration < 0 {
+		errs = append(errs, errors.New("hold_packages.window must not be negative"))
+	}
+	if c.Retention.MaxVersionsPerPackage < 1 {
+		errs = append(errs, errors.New("retention.max_versions_per_package must be >= 1"))
 	}
 	if c.Adoption.HotPrefetchBudget.Duration < 0 {
 		errs = append(errs, errors.New("adoption.hot_prefetch_budget must not be negative"))

@@ -8,6 +8,8 @@ import (
 	"path"
 	"sort"
 	"strings"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/debversion"
 )
 
 // ErrNotFound is returned when a row is absent. Callers should distinguish
@@ -811,7 +813,8 @@ func (c *Cache) ComputeHotSet(ctx context.Context,
 	candidateSnapshotID int64,
 	candidatePackageHashes []PackageHash,
 	hotWindowSeconds int64,
-	now int64) ([]HotSetEntry, error) {
+	now int64,
+	maxVersionsPerPackage int) ([]HotSetEntry, error) {
 	if priorSnapshotID == 0 || hotWindowSeconds == 0 {
 		return nil, nil
 	}
@@ -901,11 +904,47 @@ SELECT DISTINCT ph.package_name, ph.architecture
 				return matches[i].Path < matches[j].Path
 			})
 		}
+		// Version-aware retention §4: warm only the newest N distinct
+		// versions of this hot (Package, Arch). A fat-index repo lists
+		// hundreds of versions of one package in a single snapshot;
+		// warming them all is the leak. The kept-version set matches the
+		// §3 retention mirror rule so prefetch and GC agree on "kept".
+		keep := topNVersions(matches, maxVersionsPerPackage)
 		for _, ph := range matches {
+			if _, ok := keep[ph.Version]; !ok {
+				continue
+			}
 			out = append(out, HotSetEntry{Path: ph.Path, DeclaredSHA256: ph.DeclaredSHA256})
 		}
 	}
 	return out, nil
+}
+
+// topNVersions returns the set of the newest n distinct Debian versions
+// among rows, ranked by debversion.Compare. n < 1 is clamped to 1 so the
+// caller never accidentally warms/keeps nothing (which would defeat the
+// warm-mirror goal); the config layer already enforces >= 1.
+func topNVersions(rows []PackageHash, n int) map[string]struct{} {
+	if n < 1 {
+		n = 1
+	}
+	seen := make(map[string]struct{}, len(rows))
+	versions := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if _, ok := seen[r.Version]; ok {
+			continue
+		}
+		seen[r.Version] = struct{}{}
+		versions = append(versions, r.Version)
+	}
+	sort.Slice(versions, func(i, j int) bool {
+		return debversion.Compare(versions[i], versions[j]) > 0 // newest first
+	})
+	keep := make(map[string]struct{}, n)
+	for i := 0; i < len(versions) && i < n; i++ {
+		keep[versions[i]] = struct{}{}
+	}
+	return keep
 }
 
 // HostCurrentSnapshotsCoverage returns one row per (scheme, host)

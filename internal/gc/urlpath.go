@@ -28,38 +28,52 @@ import (
 // snapshot DELETEs remove FK references the blob pass's NOT EXISTS
 // reachability predicate consults — preserving the SPEC4 §9.6
 // rationale for snapshot-before-blob.
-func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase string, ttlSeconds int64) (int, bool, error) {
+func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase string, ttlSeconds, holdSeconds int64, maxVersions int) (int, bool, error) {
 	if ttlSeconds <= 0 {
 		return 0, false, nil
 	}
 
 	var (
-		acc        int
+		deleted    int // url_path rows actually reaped (feeds url_path_rows_reaped)
+		stamped    int
+		cleared    int
 		batchesRun int
+		// Cursor over the url_path primary key (scheme, host, path). Each
+		// batch scans rows strictly after this; advancing it guarantees
+		// the pass terminates (every row visited once) even though most
+		// rows are no-ops. Reset to empty each tick.
+		curScheme, curHost, curPath string
 	)
 	for {
 		if err := ctx.Err(); err != nil {
-			return acc, false, nil
+			return deleted, false, nil
 		}
 		if !time.Now().Before(deadline) {
 			g.cfg.Logger.Info("gc_tick_deadline_reached",
 				"phase", phase,
 				"which", "url_path",
 				"batches_completed", batchesRun,
-				"rows_reaped_this_tick", acc,
+				"rows_reaped_this_tick", deleted,
+				"rows_stamped_this_tick", stamped,
+				"rows_cleared_this_tick", cleared,
 			)
-			return acc, true, nil
+			return deleted, true, nil
 		}
 
-		n, err := g.cfg.Cache.RunURLPathGCBatch(ctx, g.cfg.BatchSize, ttlSeconds)
+		res, err := g.cfg.Cache.RunURLPathGCBatch(ctx, g.cfg.BatchSize, ttlSeconds, holdSeconds, maxVersions, curScheme, curHost, curPath)
 		if err != nil {
-			return acc, false, fmt.Errorf("url_path gc batch: %w", err)
+			return deleted, false, fmt.Errorf("url_path gc batch: %w", err)
 		}
 		batchesRun++
-		acc += n
+		deleted += res.Deleted
+		stamped += res.Stamped
+		cleared += res.Cleared
 
-		if n == 0 {
-			return acc, false, nil
+		// Scanned == 0 means the cursor reached the end of url_path for
+		// this tick — the pass is drained.
+		if res.Scanned == 0 {
+			return deleted, false, nil
 		}
+		curScheme, curHost, curPath = res.LastScheme, res.LastHost, res.LastPath
 	}
 }

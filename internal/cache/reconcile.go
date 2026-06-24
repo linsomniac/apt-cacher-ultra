@@ -32,15 +32,26 @@ func insertPackageHashTx(ctx context.Context, tx *sql.Tx, ph PackageHash) error 
 	// index vs the healed one) and must NOT silently keep the stale row — that
 	// would fail-closed every strict-mode fetch of that .deb via the healed
 	// index. (The previous ON CONFLICT DO NOTHING silently kept the stale row.)
-	var existing string
+	var existing struct {
+		sha256  string
+		version string
+	}
 	switch err := tx.QueryRowContext(ctx, `
-SELECT declared_sha256 FROM package_hash
+SELECT declared_sha256, version FROM package_hash
  WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`,
-		ph.CanonicalScheme, ph.CanonicalHost, ph.Path, ph.SnapshotID).Scan(&existing); {
+		ph.CanonicalScheme, ph.CanonicalHost, ph.Path, ph.SnapshotID).Scan(&existing.sha256, &existing.version); {
 	case err == nil:
-		if existing != ph.DeclaredSHA256 {
+		if existing.sha256 != ph.DeclaredSHA256 {
 			return fmt.Errorf("insertPackageHashTx: %q already declares %s, reconcile has %s",
-				ph.Path, existing, ph.DeclaredSHA256)
+				ph.Path, existing.sha256, ph.DeclaredSHA256)
+		}
+		// Version-aware retention: a same-path/same-hash row whose version
+		// disagrees is still a real cross-index disagreement (the mirror
+		// rule ranks on version), so it is loud like the hash case — not a
+		// silent no-op.
+		if existing.version != ph.Version {
+			return fmt.Errorf("insertPackageHashTx: %q already declares version %q, reconcile has %q",
+				ph.Path, existing.version, ph.Version)
 		}
 		return nil // byte-identical — idempotent no-op
 	case errors.Is(err, sql.ErrNoRows):
@@ -51,11 +62,11 @@ SELECT declared_sha256 FROM package_hash
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO package_hash (canonical_scheme, canonical_host, path,
                           declared_sha256, snapshot_id,
-                          package_name, architecture)
-VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                          package_name, architecture, version)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		ph.CanonicalScheme, ph.CanonicalHost, ph.Path,
 		ph.DeclaredSHA256, ph.SnapshotID,
-		ph.PackageName, ph.Architecture); err != nil {
+		ph.PackageName, ph.Architecture, ph.Version); err != nil {
 		return fmt.Errorf("insertPackageHashTx: insert %q: %w", ph.Path, err)
 	}
 	return nil

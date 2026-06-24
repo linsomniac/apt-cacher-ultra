@@ -33,6 +33,7 @@ func fakePackagesStanzas(entries map[string]string) []byte {
 	var sb strings.Builder
 	for fn, h := range entries {
 		fmt.Fprintf(&sb, "Package: %s\n", filepath.Base(fn))
+		fmt.Fprintf(&sb, "Version: 1.0\n")
 		fmt.Fprintf(&sb, "Filename: %s\n", fn)
 		fmt.Fprintf(&sb, "Size: 1234\n")
 		fmt.Fprintf(&sb, "SHA256: %s\n\n", h)

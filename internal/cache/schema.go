@@ -15,7 +15,7 @@ import (
 // expects. Forward-only: a database tagged with a higher version is treated
 // as written by a newer binary and the cache refuses to open it. SPEC §4.3,
 // SPEC2 §4.3, SPEC3 §4.3, SPEC4 §4.3.
-const CurrentSchemaVersion = 5
+const CurrentSchemaVersion = 6
 
 // migrations is indexed such that migrations[N] migrates the database from
 // schema version N to N+1. migrations[0] (v0 → v1) creates the entire
@@ -267,6 +267,30 @@ CREATE TABLE snapshot_skipped_member (
   retry_count      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (snapshot_id, path)
 );
+`,
+	// v5 → v6: version-aware retention (SPEC: version-aware-retention design).
+	// Pure additive DDL, forward-only.
+	//
+	//   - package_hash.version: the Debian Version: string parsed from the
+	//     binary Packages stanza. The retention mirror rule ranks the
+	//     distinct versions of a (package_name, architecture) per suite and
+	//     keeps the newest N (retention.max_versions_per_package). Existing
+	//     rows default to '' — the "non-binary or pre-migration" marker; the
+	//     mirror rule only applies to non-empty versions, so empty-version
+	//     rows fall through to the existing snapshot-reference guard. Post-v6
+	//     binary rows are guaranteed non-empty by the adoption builder.
+	//   - url_path.dropped_at: the hold-grace clock. The url_path GC pass
+	//     lazily stamps it when a row first fails both the recency and mirror
+	//     guards, clears it when the row re-qualifies, and reaps the row once
+	//     now - dropped_at >= hold_packages.window. NULL means "currently
+	//     retained / not yet observed failing".
+	//
+	// AIDEV-NOTE: no backfill — the existing leak is reclaimed operationally
+	// (wipe+rebuild or gradual re-adoption), not by ranging empty-version
+	// rows. See the design doc §6.
+	`
+ALTER TABLE package_hash ADD COLUMN version    TEXT NOT NULL DEFAULT '';
+ALTER TABLE url_path     ADD COLUMN dropped_at INTEGER;
 `,
 }
 

@@ -47,7 +47,7 @@ func (a *Adopter) computeHotSet(ctx context.Context, suite SuiteRef,
 	rows, err := a.cache.ComputeHotSet(ctx,
 		suite.CanonicalScheme, suite.CanonicalHost,
 		priorID, candidateSnapshotID, candidatePackageHashes,
-		hotWindowSeconds, a.now().Unix())
+		hotWindowSeconds, a.now().Unix(), a.maxVersionsPerPackage)
 	if err != nil {
 		return nil, fmt.Errorf("freshness: hot-set: %w", err)
 	}

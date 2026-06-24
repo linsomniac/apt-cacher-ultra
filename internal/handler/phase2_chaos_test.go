@@ -507,6 +507,7 @@ func chaos2BuildPackagesText(entries map[string]string) []byte {
 	var sb strings.Builder
 	for rel, h := range entries {
 		fmt.Fprintf(&sb, "Package: %s\n", rel)
+		fmt.Fprintf(&sb, "Version: 1.0\n")
 		fmt.Fprintf(&sb, "Filename: %s\n", rel)
 		fmt.Fprintf(&sb, "Size: 0\n")
 		fmt.Fprintf(&sb, "SHA256: %s\n\n", h)

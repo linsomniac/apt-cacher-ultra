@@ -90,6 +90,17 @@ type Config struct {
 	// Validated by the config layer; the gc package treats 0 as a
 	// short-circuit (no batches run).
 	URLPathTTL time.Duration
+
+	// HoldWindow is hold_packages.window: the grace a url_path row gets
+	// (via url_path.dropped_at) after it leaves the kept set before it is
+	// reaped (version-aware retention §3 rule 3). 0 = no grace (a row
+	// failing the recency + mirror guards is deleted in the same scan).
+	HoldWindow time.Duration
+
+	// MaxVersionsPerPackage is retention.max_versions_per_package: the
+	// url_path mirror guard keeps the newest N distinct versions per
+	// (suite, package_name, architecture). Clamped to >= 1.
+	MaxVersionsPerPackage int
 }
 
 // GC is the orchestrator. Run() owns the periodic tick loop;
@@ -374,7 +385,12 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	// Short-circuits when URLPathTTL is 0 (operator disabled the
 	// pass).
 	if ttl := int64(g.cfg.URLPathTTL.Seconds()); ttl > 0 {
-		n, urlPathDeadline, err := g.runURLPathPass(ctx, deadline, phase, ttl)
+		hold := int64(g.cfg.HoldWindow.Seconds())
+		maxV := g.cfg.MaxVersionsPerPackage
+		if maxV < 1 {
+			maxV = 1
+		}
+		n, urlPathDeadline, err := g.runURLPathPass(ctx, deadline, phase, ttl, hold, maxV)
 		res.urlPathRowsReaped += n
 		if urlPathDeadline {
 			res.deadlineReached = true

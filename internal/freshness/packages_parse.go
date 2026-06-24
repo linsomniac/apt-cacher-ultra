@@ -22,6 +22,7 @@ type PackageRef struct {
 	Size         int64  // declared bytes; 0 when the stanza omitted Size:
 	Package      string // binary package name (apt's `Package:` stanza), "" when missing
 	Architecture string // e.g. "amd64", "arm64", "all"; "" when missing
+	Version      string // Debian Version: string; "" when missing (malformed binary stanza)
 }
 
 // MaxPackageStanzas caps how many entries ParsePackages will return.
@@ -59,6 +60,7 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 		sizeSet  bool
 		pkg      string
 		arch     string
+		version  string
 		lineNo   int
 	)
 
@@ -73,6 +75,7 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 			sizeSet = false
 			pkg = ""
 			arch = ""
+			version = ""
 			return nil
 		}
 		if !validHexSHA256(sha256) {
@@ -94,6 +97,7 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 			Size:         s,
 			Package:      pkg,
 			Architecture: arch,
+			Version:      version,
 		})
 		filename = ""
 		sha256 = ""
@@ -101,6 +105,7 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 		sizeSet = false
 		pkg = ""
 		arch = ""
+		version = ""
 		return nil
 	}
 
@@ -148,6 +153,10 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 			pkg = value
 		case "architecture":
 			arch = value
+		case "version":
+			// Version-aware retention: the Debian version the mirror rule
+			// ranks distinct versions on. Carried into package_hash.version.
+			version = value
 		}
 	}
 	if err := scanner.Err(); err != nil {

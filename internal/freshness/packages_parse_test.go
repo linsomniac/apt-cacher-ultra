@@ -31,12 +31,14 @@ func TestParsePackages_HappyPath(t *testing.T) {
 			Size:         12345,
 			Package:      "foo",
 			Architecture: "amd64",
+			Version:      "1.2-3",
 		},
 		{
 			Filename: "pool/main/b/bar/bar_2.0_amd64.deb",
 			SHA256:   h2,
 			Size:     67890,
 			Package:  "bar",
+			// Version absent from this stanza — parsed as "".
 			// Architecture absent from this stanza — Phase 3 leaves
 			// it as "" rather than rejecting; the SPEC3 §7.5.3
 			// hot-set query filters empty values explicitly.

@@ -75,7 +75,7 @@ func makeChaos3Snapshot(label string, specs []chaos3DebSpec) chaos3Snapshot {
 		body := []byte(fmt.Sprintf("snapshot-%s|deb|%s", label, d.rel))
 		bodies[d.rel] = body
 		h := chaos2Sha256Hex(body)
-		fmt.Fprintf(&sb, "Package: %s\nArchitecture: %s\nFilename: %s\nSize: %d\nSHA256: %s\n\n",
+		fmt.Fprintf(&sb, "Package: %s\nArchitecture: %s\nVersion: 1.0\nFilename: %s\nSize: %d\nSHA256: %s\n\n",
 			d.packageName, d.architecture, d.rel, len(body), h)
 	}
 	pkgsTxt := []byte(sb.String())

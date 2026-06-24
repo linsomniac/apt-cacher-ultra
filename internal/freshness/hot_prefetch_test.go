@@ -348,10 +348,10 @@ func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 	debHashA := strings.Repeat("a", 64)
 	debHashB := strings.Repeat("b", 64)
 	pkgs := []byte(
-		"Package: nginx\nArchitecture: amd64\n" +
+		"Package: nginx\nArchitecture: amd64\nVersion: 1.0\n" +
 			"Filename: pool/main/n/nginx/nginx_1.0_amd64.deb\n" +
 			"Size: 1\nSHA256: " + debHashA + "\n\n" +
-			"Package: nginx\nArchitecture: amd64\n" +
+			"Package: nginx\nArchitecture: amd64\nVersion: 2.0\n" +
 			"Filename: pool/main/n/nginx/nginx_2.0_amd64.deb\n" +
 			"Size: 1\nSHA256: " + debHashB + "\n",
 	)
@@ -384,6 +384,49 @@ func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 	}
 	if seen["/pool/main/n/nginx/nginx_2.0_amd64.deb"] != debHashB {
 		t.Errorf("missing/wrong v2 row: %v", seen)
+	}
+}
+
+// TestBuildPackageHashes_SkipsBinaryStanzaMissingVersion locks the
+// version-aware-retention binary invariant: a binary Packages stanza with
+// no Version: is malformed; it must be omitted from package_hash (never
+// inserted with version=”) and drop the snapshot to coverage-incomplete,
+// so the §3 empty-version fallback can never re-open the fat-index leak.
+func TestBuildPackageHashes_SkipsBinaryStanzaMissingVersion(t *testing.T) {
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	a := &Adopter{cache: c, logger: slog.Default()}
+
+	withVer := strings.Repeat("a", 64)
+	noVer := strings.Repeat("b", 64)
+	pkgs := []byte(
+		"Package: nginx\nArchitecture: amd64\nVersion: 1.0\n" +
+			"Filename: pool/main/n/nginx/nginx_1.0_amd64.deb\n" +
+			"Size: 1\nSHA256: " + withVer + "\n\n" +
+			"Package: nginx\nArchitecture: amd64\n" + // no Version:
+			"Filename: pool/main/n/nginx/nginx_2.0_amd64.deb\n" +
+			"Size: 1\nSHA256: " + noVer + "\n",
+	)
+	pkgsBlob := writeFixtureBlob(t, c, pkgs)
+	suiteRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example", SuitePath: "/dists/noble"}
+	members := []ReleaseMember{{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))}}
+
+	res, err := a.buildPackageHashes(suiteRef, 1, members, members)
+	if err != nil {
+		t.Fatalf("buildPackageHashes: %v", err)
+	}
+	if len(res.rows) != 1 {
+		t.Fatalf("got %d rows, want 1 (versionless stanza skipped)", len(res.rows))
+	}
+	if res.rows[0].Version != "1.0" {
+		t.Errorf("kept row version = %q, want 1.0", res.rows[0].Version)
+	}
+	if res.coverageComplete {
+		t.Error("coverageComplete = true, want false (a binary stanza was skipped for missing Version)")
 	}
 }
 
