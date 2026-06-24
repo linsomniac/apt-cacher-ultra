@@ -2708,7 +2708,7 @@ func TestComputeHotSet_TwoStageMatch(t *testing.T) {
 	candPHs := []PackageHash{{
 		CanonicalScheme: scheme, CanonicalHost: host, Path: pathNew,
 		DeclaredSHA256: debHashNew, SnapshotID: idNew,
-		PackageName: "nginx", Architecture: "amd64",
+		PackageName: "nginx", Architecture: "amd64", Version: "2.0",
 	}}
 	if err := c.CommitAdoption(ctx, idNew,
 		[]SnapshotMember{{SnapshotID: idNew, Path: "InRelease", BlobHash: rNew, DeclaredSHA256: rNew}}, nil,
@@ -3063,14 +3063,14 @@ func TestComputeHotSet_DuplicatePackageArchEmitsAllPaths(t *testing.T) {
 			SnapshotID:     idCandidate,
 			Path:           "/pool/main/d/dup/dup_3.0_amd64.deb",
 			DeclaredSHA256: hash3,
-			PackageName:    "dup", Architecture: "amd64",
+			PackageName:    "dup", Architecture: "amd64", Version: "3.0",
 		},
 		{
 			CanonicalScheme: scheme, CanonicalHost: host,
 			SnapshotID:     idCandidate,
 			Path:           "/pool/main/d/dup/dup_2.0_amd64.deb",
 			DeclaredSHA256: hash2,
-			PackageName:    "dup", Architecture: "amd64",
+			PackageName:    "dup", Architecture: "amd64", Version: "2.0",
 		},
 	}
 	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idCandidate, cand, 86400, now, 1000)

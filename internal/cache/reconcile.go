@@ -15,11 +15,14 @@ import (
 // set + hash validation today, not a shared dependency. They are deliberately
 // not refactored into one: CommitAdoption uses a plain INSERT (candidate
 // snapshots are never partially committed, so a conflict there is a bug),
-// while reconcile adds ON CONFLICT DO NOTHING because a retry of
-// InsertReconciledMembers may legitimately re-hit rows the first (partial)
-// attempt wrote. The PK (canonical_scheme, canonical_host, path, snapshot_id)
-// is the natural uniqueness boundary — DO NOTHING is strictly additive and
-// safe. If the package_hash column set ever changes, update BOTH copies.
+// while reconcile probes the PK (canonical_scheme, canonical_host, path,
+// snapshot_id) first and is retry-safe: a byte-identical existing row is an
+// idempotent no-op, an existing row with EMPTY identity columns (pre-v3/pre-v6,
+// un-backfilled) is HEALED in place, and a same-path row whose declared_sha256
+// OR a non-empty identity field (package_name/architecture/version) DISAGREES
+// is a real cross-index conflict and fails loud (SPEC6_5 §11 H7). It is NOT a
+// silent ON CONFLICT DO NOTHING. If the package_hash column set ever changes,
+// update BOTH copies (and the heal UPDATE below).
 func insertPackageHashTx(ctx context.Context, tx *sql.Tx, ph PackageHash) error {
 	if !validBlobHash(ph.DeclaredSHA256) {
 		return fmt.Errorf("insertPackageHashTx: %q declared_sha256 %w", ph.Path, ErrInvalidHash)
@@ -34,38 +37,55 @@ func insertPackageHashTx(ctx context.Context, tx *sql.Tx, ph PackageHash) error 
 	// index. (The previous ON CONFLICT DO NOTHING silently kept the stale row.)
 	var existing struct {
 		sha256  string
+		name    string
+		arch    string
 		version string
 	}
 	switch err := tx.QueryRowContext(ctx, `
-SELECT declared_sha256, version FROM package_hash
+SELECT declared_sha256, package_name, architecture, version FROM package_hash
  WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`,
-		ph.CanonicalScheme, ph.CanonicalHost, ph.Path, ph.SnapshotID).Scan(&existing.sha256, &existing.version); {
+		ph.CanonicalScheme, ph.CanonicalHost, ph.Path, ph.SnapshotID).
+		Scan(&existing.sha256, &existing.name, &existing.arch, &existing.version); {
 	case err == nil:
 		if existing.sha256 != ph.DeclaredSHA256 {
 			return fmt.Errorf("insertPackageHashTx: %q already declares %s, reconcile has %s",
 				ph.Path, existing.sha256, ph.DeclaredSHA256)
 		}
-		// Version-aware retention: an existing row with version='' is a pre-v6
-		// (un-backfilled) row OR a non-binary artifact — NOT a conflict. Heal
-		// it in place when reconcile carries a real version, so the documented
-		// POST /reconcile recovery still works on v6-upgraded caches (where
-		// every pre-existing row defaults to version=''). Only a same-hash row
-		// whose BOTH versions are non-empty and differ is a real cross-index
-		// disagreement and stays loud (mirrors the H7 hash rule).
-		if existing.version == "" && ph.Version != "" {
-			if _, err := tx.ExecContext(ctx, `
-UPDATE package_hash SET version = ?
- WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`,
-				ph.Version, ph.CanonicalScheme, ph.CanonicalHost, ph.Path, ph.SnapshotID); err != nil {
-				return fmt.Errorf("insertPackageHashTx: heal version %q: %w", ph.Path, err)
+		// Identity columns (package_name, architecture, version): an existing
+		// EMPTY column is a pre-v3/pre-v6 (un-backfilled) row, NOT a conflict —
+		// heal it in place from the reconcile's parsed value so the documented
+		// POST /reconcile recovery works on upgraded caches and the GC mirror
+		// can rank the healed row correctly. Healing all three together avoids
+		// leaving a (name='', arch='', version='X') row that would group under
+		// the empty identity in newest-N ranking. A column that is non-empty on
+		// BOTH sides and differs is a real cross-index disagreement and stays
+		// loud (mirrors the H7 hash rule).
+		for _, f := range []struct{ what, have, want string }{
+			{"package_name", existing.name, ph.PackageName},
+			{"architecture", existing.arch, ph.Architecture},
+			{"version", existing.version, ph.Version},
+		} {
+			if f.have != "" && f.want != "" && f.have != f.want {
+				return fmt.Errorf("insertPackageHashTx: %q already declares %s %q, reconcile has %q",
+					ph.Path, f.what, f.have, f.want)
 			}
-			return nil
 		}
-		if existing.version != "" && ph.Version != "" && existing.version != ph.Version {
-			return fmt.Errorf("insertPackageHashTx: %q already declares version %q, reconcile has %q",
-				ph.Path, existing.version, ph.Version)
+		needHeal := (existing.name == "" && ph.PackageName != "") ||
+			(existing.arch == "" && ph.Architecture != "") ||
+			(existing.version == "" && ph.Version != "")
+		if needHeal {
+			if _, err := tx.ExecContext(ctx, `
+UPDATE package_hash
+   SET package_name = CASE WHEN package_name = '' THEN ? ELSE package_name END,
+       architecture = CASE WHEN architecture = '' THEN ? ELSE architecture END,
+       version      = CASE WHEN version      = '' THEN ? ELSE version      END
+ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`,
+				ph.PackageName, ph.Architecture, ph.Version,
+				ph.CanonicalScheme, ph.CanonicalHost, ph.Path, ph.SnapshotID); err != nil {
+				return fmt.Errorf("insertPackageHashTx: heal identity %q: %w", ph.Path, err)
+			}
 		}
-		return nil // byte-identical (or incoming version unknown) — idempotent no-op
+		return nil // identical, or healed — idempotent
 	case errors.Is(err, sql.ErrNoRows):
 		// not present — insert below
 	default:
@@ -197,8 +217,9 @@ UPDATE blob
 			}
 		}
 
-		// package_hash upserts — uses the shared helper which carries
-		// ON CONFLICT DO NOTHING for retry-safety (see insertPackageHashTx).
+		// package_hash upserts — the shared helper is retry-safe via a
+		// probe-then-insert/heal that fails loud on a real conflict (see
+		// insertPackageHashTx), not a silent ON CONFLICT DO NOTHING.
 		for _, ph := range packageHashes {
 			if err := insertPackageHashTx(ctx, tx, ph); err != nil {
 				return fmt.Errorf("InsertReconciledMembers: package_hash %q: %w", ph.Path, err)

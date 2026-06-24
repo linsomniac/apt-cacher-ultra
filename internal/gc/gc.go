@@ -398,7 +398,12 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 		hold := int64(g.cfg.HoldWindow.Seconds())
 		maxV := g.cfg.MaxVersionsPerPackage
 		if maxV < 1 {
-			maxV = 1
+			// Match the prefetch-side fallback (freshness NewAdopter) so the
+			// two consumers of keepNewestNVersionSet never disagree on N when
+			// the value reaches a consumer unset. Production always passes the
+			// config default (3, Validate()-enforced >= 1); this is the
+			// defense-in-depth floor for direct/test construction.
+			maxV = 3
 		}
 		n, urlPathDeadline, err := g.runURLPathPass(ctx, deadline, phase, ttl, hold, maxV)
 		res.urlPathRowsReaped += n

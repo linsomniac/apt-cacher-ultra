@@ -909,12 +909,21 @@ SELECT DISTINCT ph.package_name, ph.architecture
 		// hundreds of versions of one package in a single snapshot;
 		// warming them all is the leak. The kept-version set matches the
 		// §3 retention mirror rule so prefetch and GC agree on "kept".
+		// Version-less rows (malformed binary stanza) are NOT prefetched —
+		// they have no rankable version and warming many of them would
+		// reopen the leak; the GC mirror rule likewise won't retain them.
 		versions := make([]string, 0, len(matches))
 		for _, ph := range matches {
+			if ph.Version == "" {
+				continue
+			}
 			versions = append(versions, ph.Version)
 		}
 		keep := keepNewestNVersionSet(versions, maxVersionsPerPackage)
 		for _, ph := range matches {
+			if ph.Version == "" {
+				continue
+			}
 			if _, ok := keep[ph.Version]; !ok {
 				continue
 			}

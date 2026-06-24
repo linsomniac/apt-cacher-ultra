@@ -163,6 +163,7 @@ func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixtu
 		SnapshotID:      candidateID,
 		PackageName:     "hello",
 		Architecture:    "amd64",
+		Version:         "2.0",
 	}}
 	if err := c.CommitAdoption(context.Background(), candidateID,
 		[]cache.SnapshotMember{{SnapshotID: candidateID, Path: "InRelease", BlobHash: candidateRelease, DeclaredSHA256: candidateRelease}}, nil,

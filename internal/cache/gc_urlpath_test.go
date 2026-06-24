@@ -379,6 +379,31 @@ func TestRunURLPathGCBatch_EmptyVersionFallbackProtects(t *testing.T) {
 	}
 }
 
+// TestRunURLPathGCBatch_EmptyVersionBinaryIsReaped: the empty-version
+// fallback is NARROW — only architecture="source" artifacts get it. A
+// version-less BINARY .deb (malformed/odd stanza, arch=amd64) must NOT be
+// unconditionally kept, or a fat version-less index would reopen the leak.
+// It falls through the mirror loop (no rankable version) and is reaped.
+func TestRunURLPathGCBatch_EmptyVersionBinaryIsReaped(t *testing.T) {
+	c := openCache(t)
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	scheme, host, suite := "http", "archive.test", "/ubuntu/dists/noble"
+	h := seedBlob(t, c, "versionless binary deb bytes")
+	ir := seedBlob(t, c, "current inrelease")
+	const path = "/ubuntu/pool/main/b/bad/bad_amd64.deb"
+	putURLPathRow(t, c, scheme, host, path, h,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, false)
+	snapID := seedCurrentSnapshot(t, c, scheme, host, suite, ir, now)
+	seedPackageHash(t, c, scheme, host, path, h, snapID, "bad", "amd64", "") // binary, empty version
+
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 1 {
+		t.Errorf("deleted = %d, want 1 (version-less binary row is not fallback-kept)", agg.Deleted)
+	}
+}
+
 func TestRunURLPathGCBatch_InReleaseUrlPathOnCurrentSnapshotProtected(t *testing.T) {
 	c := openCache(t)
 	const now = int64(2_000_000_000)

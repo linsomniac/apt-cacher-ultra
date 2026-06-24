@@ -47,16 +47,17 @@ type URLPathGCBatchResult struct {
 // when 0). holdSeconds is hold_packages.window (>= 0; 0 = no grace).
 // maxVersions is retention.max_versions_per_package (clamped to >= 1).
 //
-// Mirror rule (rule 2) detail: for the row's blob, find the held-snapshot
+// Mirror rule (rule 2) detail: for the row's blob, find the CURRENT-snapshot
 // package_hash rows whose (path, declared_sha256) match the url_path's
-// (path, blob_hash). If any such row carries an empty version it is a
-// non-binary artifact (Sources/pdiff/Contents) and keeps the legacy
-// snapshot-reference guard (retained). Otherwise the row is retained iff
-// its version ranks within the newest maxVersions distinct Debian versions
-// of its (scheme, host, suite_path, package_name, architecture) across the
-// held snapshots — evaluated per group and memoized for the batch. Ranking
-// is done in Go (SQLite cannot order by Debian version) over only the
-// groups the batch actually touches, so the cost is candidate-bounded.
+// (path, blob_hash). A matching architecture="source" row with empty version
+// is a source artifact and keeps the legacy snapshot-reference guard
+// (retained); a version-less BINARY match is NOT (it falls through and is
+// reaped). Otherwise the row is retained iff its version ranks within the
+// newest maxVersions distinct Debian-version equivalence classes of its
+// (scheme, host, suite_path, package_name, architecture) within the CURRENT
+// snapshots — evaluated per group and memoized for the batch. Ranking is done
+// in Go (SQLite cannot order by Debian version) over only the groups the
+// batch actually touches, so the cost is candidate-bounded.
 func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int, afterScheme, afterHost, afterPath string) (URLPathGCBatchResult, error) {
 	if batchSize < 1 {
 		return URLPathGCBatchResult{}, fmt.Errorf("RunURLPathGCBatch: batchSize must be >= 1, got %d", batchSize)
@@ -116,6 +117,19 @@ SELECT canonical_scheme, canonical_host, path, blob_hash, last_requested_at, dro
 			res.Scanned++
 			res.LastScheme, res.LastHost, res.LastPath = r.scheme, r.host, r.path
 
+			// Fast path: a row already stamped and still within the hold grace
+			// is a settled no-op — skip the expensive retention evaluation
+			// (guard EXISTS + mirror-match queries + version ranking) unless it
+			// has re-qualified by recency (then it must be scanned so its
+			// dropped_at is cleared). Mirror re-qualification of an in-grace
+			// row is rare and self-corrects at grace expiry (the row is then
+			// re-evaluated and cleared rather than deleted). This keeps a large
+			// in-grace backlog from burning the per-tick deadline.
+			if holdSeconds > 0 && r.droppedAt.Valid && now-r.droppedAt.Int64 < holdSeconds &&
+				!(r.lastReq.Valid && r.lastReq.Int64 >= ttlCutoff) {
+				continue
+			}
+
 			retained, err := c.urlPathRetainedTx(ctx, tx, r.scheme, r.host, r.path, r.blobHash, r.lastReq, ttlCutoff, maxVersions, topNCache)
 			if err != nil {
 				return err
@@ -173,6 +187,22 @@ type topNKey struct {
 // guards. It runs inside the writer tx so its verdict is consistent with
 // the DELETE that may follow in the same tx (closes the SELECT→DELETE
 // liveness race the same way the legacy pass did).
+//
+// AIDEV-NOTE: this is the trust-/leak-sensitive heart of version-aware
+// retention (design §3). Order matters and each clause is load-bearing:
+//  1. recency (last_requested within TTL) — keeps actively-pulled versions;
+//  2. metadata guards b/c/d (current-snapshot scoped) — MUST stay to avoid
+//     the freshness-freeze trap; never reap an InRelease/Release anchor;
+//  3. source-artifact fallback (arch=="source", version=”) — narrow on
+//     purpose: a version-less BINARY row must fall through and be reaped or
+//     a fat version-less index reopens the leak;
+//  4. mirror: newest-N distinct versions per (suite,name,arch) in the
+//     CURRENT snapshot only — displaced snapshots must not vouch a .deb.
+//
+// Anything failing all of these is reapable (subject to the dropped_at
+// hold-grace in the caller). Changing any clause risks either re-opening the
+// fat-index leak or refreezing a suite — keep the gc_urlpath_test.go cases
+// in lockstep.
 func (c *Cache) urlPathRetainedTx(ctx context.Context, tx *sql.Tx,
 	scheme, host, path string, blobHash sql.NullString, lastReq sql.NullInt64,
 	ttlCutoff int64, maxVersions int, topNCache map[topNKey]map[string]struct{}) (bool, error) {
@@ -251,15 +281,27 @@ SELECT ss.suite_path, ph.package_name, ph.architecture, ph.version
 	_ = mrows.Close()
 
 	for _, m := range matches {
-		// Empty-version fallback: a matching current-snapshot package_hash row
-		// with no version is a non-binary artifact (Sources/pdiff/Contents) or
-		// a pre-v6 row — keep it via the legacy snapshot-reference guard (the
-		// proven-safe pre-version behavior).
-		if m.version == "" {
+		// Source-artifact fallback: source packages (.dsc/tarballs) live in
+		// package_hash with architecture="source" and no Debian binary
+		// version to rank, so they keep the legacy current-snapshot guard
+		// (a). This is deliberately NARROW (arch=="source" only): a
+		// version-less BINARY row (malformed stanza, or a pre-v6 row) must
+		// NOT get an unconditional keep, or a fat version-less index would
+		// reopen the leak — it falls through to the mirror loop below, where
+		// its empty version matches no top-N set and it is reaped (re-fetched
+		// on demand; still vouched by package_hash under strict mode).
+		if m.version == "" && m.arch == "source" {
 			return true, nil
 		}
 	}
 	for _, m := range matches {
+		// Only rank rows with a complete (name, arch, version) identity.
+		// Empty identity columns (odd/old rows) cannot be meaningfully
+		// ranked and must not group together under ("", "") — that would
+		// let unrelated packages evict each other from newest-N.
+		if m.name == "" || m.arch == "" || m.version == "" {
+			continue
+		}
 		set, err := c.topNVersionSetTx(ctx, tx, scheme, host, m.suite, m.name, m.arch, maxVersions, topNCache)
 		if err != nil {
 			return false, err
