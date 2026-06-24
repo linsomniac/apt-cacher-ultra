@@ -94,25 +94,26 @@ func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds
 		// Skip recency-retained, un-stamped rows in SQL so an active cache
 		// (where most rows are recently requested) doesn't fetch + evaluate
 		// the whole table each tick — only rows that might need an action are
-		// returned. Stamped rows are still returned (so a re-qualified one is
-		// cleared and an expired one is reaped); the in-grace fast-path below
-		// handles stamped-but-in-grace rows cheaply.
+		// returned. Stamped rows are still returned so each is re-evaluated:
+		// a re-qualified one is cleared, an expired one is reaped, and an
+		// in-grace one stays (its dropped_at re-stamped if it re-dropped).
 		//
 		// AIDEV-NOTE: mirror-retained rows (kept-version .debs not recently
-		// requested, e.g. prefetched fat-index versions) are NOT excluded by
-		// this prefilter, so each is re-evaluated every pass even though its
-		// verdict is stable. This is a deliberate, bounded cost: the heavy part
-		// (newest-N ranking) is memoized per batch and runs an index-backed
-		// query (idx_package_hash_pkg_arch via topNVersionSetTx), and the
-		// cursor + per-tick deadline cap the work per tick and resume next
-		// tick. A cross-pass ranking memo was tried (be2debd) and reverted —
-		// reusing a set across batch txs let a concurrent mid-pass adoption
-		// make it stale and, with the in-grace fast-path skipping
-		// re-evaluation, spuriously stamp a current version and truncate its
-		// hold grace. Widening the prefilter to drop provably-kept rows in SQL
-		// was also rejected — it would have to reproduce the rule-2/3/4
-		// retention logic (the NULL-last_requested and current-snapshot edge
-		// cases are exactly where past regressions hid).
+		// requested, e.g. prefetched fat-index versions) and stamped in-grace
+		// rows are NOT excluded by this prefilter, so each is re-evaluated
+		// every pass. This is a deliberate, bounded cost that buys correct hold
+		// semantics: the heavy part (newest-N ranking) is memoized per batch
+		// and runs an index-backed query (idx_package_hash_pkg_arch via
+		// topNVersionSetTx), and the cursor + per-tick deadline cap the work
+		// per tick and resume next tick. Two speedups that skipped this
+		// re-evaluation were tried and removed because both broke the hold
+		// guarantee: a cross-pass ranking memo (be2debd) went stale under a
+		// concurrent mid-pass adoption, and an in-grace fast-path skipped
+		// re-checking stamped rows so a mirror re-qualification never cleared
+		// the stamp (round-7/8). Widening the prefilter to drop provably-kept
+		// rows in SQL was also rejected — it would have to reproduce the
+		// rule-2/3/4 retention logic (the NULL-last_requested and
+		// current-snapshot edge cases are exactly where past regressions hid).
 		rows, err := tx.QueryContext(ctx, `
 SELECT canonical_scheme, canonical_host, path, blob_hash, last_requested_at, dropped_at
   FROM url_path
@@ -152,19 +153,20 @@ SELECT canonical_scheme, canonical_host, path, blob_hash, last_requested_at, dro
 			res.Scanned++
 			res.LastScheme, res.LastHost, res.LastPath = r.scheme, r.host, r.path
 
-			// Fast path: a row already stamped and still within the hold grace
-			// is a settled no-op — skip the expensive retention evaluation
-			// (guard EXISTS + mirror-match queries + version ranking) unless it
-			// has re-qualified by recency (then it must be scanned so its
-			// dropped_at is cleared). Mirror re-qualification of an in-grace
-			// row is rare and self-corrects at grace expiry (the row is then
-			// re-evaluated and cleared rather than deleted). This keeps a large
-			// in-grace backlog from burning the per-tick deadline.
-			if holdSeconds > 0 && r.droppedAt.Valid && now-r.droppedAt.Int64 < holdSeconds &&
-				!(r.lastReq.Valid && r.lastReq.Int64 >= ttlCutoff) {
-				continue
-			}
-
+			// Every candidate is re-evaluated (no in-grace fast-path skip).
+			// A stamped in-grace row MUST be re-checked so dropped_at tracks
+			// the LATEST time the row left the kept set: if it re-qualifies by
+			// the mirror rule (its version re-enters the current snapshot's
+			// newest-N via a non-prefetched adoption — nothing clears the stamp
+			// at the source) the stamp is cleared here, and a later drop
+			// re-stamps with a fresh deadline, preserving the full
+			// hold_packages.window grace from the latest removal. An earlier
+			// fast-path skipped in-grace stamped rows for speed but left a
+			// stale stamp on mirror re-qualification, reaping a still-current
+			// version early and breaking the hold guarantee (round-8 finding).
+			// The re-evaluation is cheap: the ranking query is index-backed
+			// (idx_package_hash_pkg_arch) and the recency prefilter already
+			// excludes recency-fresh un-stamped rows.
 			retained, err := c.urlPathRetainedTx(ctx, tx, r.scheme, r.host, r.path, r.blobHash, r.lastReq, ttlCutoff, maxVersions, topNCache)
 			if err != nil {
 				return err

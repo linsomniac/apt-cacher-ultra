@@ -811,3 +811,41 @@ func TestRunURLPathGCBatch_HoldGraceClearedOnRequalify(t *testing.T) {
 		t.Error("dropped_at should be cleared to NULL after re-qualification")
 	}
 }
+
+// TestRunURLPathGCBatch_HoldGraceClearedOnMirrorRequalify: a stamped in-grace
+// row that re-qualifies by the MIRROR rule (its version re-enters the current
+// snapshot's newest-N via a NON-prefetched adoption — nothing calls
+// PutURLPath/Touch/Step-3a to clear the stamp at the source) must have its
+// dropped_at cleared on the next GC pass. Otherwise the stale stamp persists
+// and the row is reaped at the ORIGINAL drop deadline, giving less than
+// hold_packages.window grace from its LATEST removal under version oscillation
+// (round-8 finding). last_requested_at is NULL so only the mirror rule (not
+// recency) can re-qualify — the exact gap the old in-grace fast-path left.
+func TestRunURLPathGCBatch_HoldGraceClearedOnMirrorRequalify(t *testing.T) {
+	c := openCache(t)
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	scheme, host, suite := "http", "archive.test", "/ubuntu/dists/noble"
+	h := seedBlob(t, c, "oscillating deb")
+	ir := seedBlob(t, c, "current inrelease")
+	const path = "/ubuntu/pool/main/x/x_1.0_amd64.deb"
+	// Prefetched, never served (NULL last_requested), carrying a drop stamp
+	// from a prior pass when it had left newest-N.
+	putURLPathRow(t, c, scheme, host, path, h, sql.NullInt64{}, false)
+	if _, err := c.db.Exec(`UPDATE url_path SET dropped_at = ? WHERE path = ?`,
+		now-3600, path); err != nil { // stamped 1h ago, still in 24h grace
+		t.Fatalf("seed dropped_at: %v", err)
+	}
+	// It re-qualifies: a current snapshot now vouches it in newest-N.
+	snapID := seedCurrentSnapshot(t, c, scheme, host, suite, ir, now)
+	seedPackageHash(t, c, scheme, host, path, h, snapID, "x", "amd64", "1.0")
+
+	agg := drainURLPathGC(t, c, 100, 7*86400, 24*3600, testMaxVersions)
+	if agg.Deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (re-qualified row must not be reaped)", agg.Deleted)
+	}
+	if urlPathDroppedAt(t, c, path) != -1 {
+		t.Error("dropped_at must be cleared when an in-grace row re-qualifies by the mirror rule")
+	}
+}
