@@ -58,7 +58,7 @@ type URLPathGCBatchResult struct {
 // snapshots — evaluated per group and memoized for the batch. Ranking is done
 // in Go (SQLite cannot order by Debian version) over only the groups the
 // batch actually touches, so the cost is candidate-bounded.
-func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int, afterScheme, afterHost, afterPath string) (URLPathGCBatchResult, error) {
+func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int, afterScheme, afterHost, afterPath string, memo *URLPathGCMemo) (URLPathGCBatchResult, error) {
 	if batchSize < 1 {
 		return URLPathGCBatchResult{}, fmt.Errorf("RunURLPathGCBatch: batchSize must be >= 1, got %d", batchSize)
 	}
@@ -122,7 +122,21 @@ SELECT canonical_scheme, canonical_host, path, blob_hash, last_requested_at, dro
 		}
 		_ = rows.Close()
 
-		topNCache := make(map[topNKey]map[string]struct{})
+		// Newest-N ranking memo. When the caller threads a per-pass memo
+		// (NewURLPathGCMemo), a fat-index package whose versions span several
+		// 100-row batches is ranked once per PASS instead of once per batch;
+		// nil falls back to per-batch ranking (direct/test callers). Reusing a
+		// set computed in a prior batch's tx is safe: it is a plain map with no
+		// tx dependency once populated, and the ranking is stable within a pass
+		// absent a concurrent adoption (a mid-pass flip only makes a kept
+		// version look stale-kept for the rest of one tick, which hold-grace
+		// already tolerates).
+		var topNCache map[topNKey]map[string]struct{}
+		if memo != nil {
+			topNCache = memo.topN
+		} else {
+			topNCache = make(map[topNKey]map[string]struct{})
+		}
 
 		for _, r := range batch {
 			res.Scanned++
@@ -191,6 +205,24 @@ UPDATE url_path SET dropped_at = ?
 // ranking group, memoized within a single batch.
 type topNKey struct {
 	scheme, host, suite, name, arch string
+}
+
+// URLPathGCMemo carries the per-(suite,name,arch) newest-N ranking cache
+// across the cursor-paged RunURLPathGCBatch calls of ONE url_path GC pass, so
+// a fat-index package whose many cached versions span several batches (default
+// 100 rows/batch) is ranked once per pass instead of once per batch — the
+// redundant ranking otherwise burns the shared per-tick deadline and delays
+// the blob-reclamation pass that runs after it. Construct one per pass with
+// NewURLPathGCMemo and pass the SAME pointer to every batch call in that pass;
+// pass nil to rank per-batch (direct/test callers).
+type URLPathGCMemo struct {
+	topN map[topNKey]map[string]struct{}
+}
+
+// NewURLPathGCMemo allocates a per-pass newest-N ranking memo for
+// RunURLPathGCBatch. See URLPathGCMemo.
+func NewURLPathGCMemo() *URLPathGCMemo {
+	return &URLPathGCMemo{topN: make(map[topNKey]map[string]struct{})}
 }
 
 // urlPathRetainedTx reports whether a url_path row is retained by the

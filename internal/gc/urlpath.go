@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
 // runURLPathPass implements the URL-path TTL reap (SPEC4 §5 fourth
@@ -45,6 +47,12 @@ func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase strin
 	// It resumes from g.urlPathCursor (where a prior deadline-truncated tick
 	// left off) and is reset to empty only once a pass fully drains.
 	curScheme, curHost, curPath := g.urlPathCursor.scheme, g.urlPathCursor.host, g.urlPathCursor.path
+	// One newest-N ranking memo for the whole pass so a fat-index package whose
+	// versions span several batches is ranked once per tick, not once per
+	// batch (keeps the url_path pass from burning the shared deadline and
+	// starving the later blob pass). Fresh per pass: snapshots can change
+	// between ticks, so rankings are not carried across runURLPathPass calls.
+	memo := cache.NewURLPathGCMemo()
 	for {
 		if err := ctx.Err(); err != nil {
 			return deleted, false, nil
@@ -64,7 +72,7 @@ func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase strin
 			return deleted, true, nil
 		}
 
-		res, err := g.cfg.Cache.RunURLPathGCBatch(ctx, g.cfg.BatchSize, ttlSeconds, holdSeconds, maxVersions, curScheme, curHost, curPath)
+		res, err := g.cfg.Cache.RunURLPathGCBatch(ctx, g.cfg.BatchSize, ttlSeconds, holdSeconds, maxVersions, curScheme, curHost, curPath, memo)
 		if err != nil {
 			return deleted, false, fmt.Errorf("url_path gc batch: %w", err)
 		}

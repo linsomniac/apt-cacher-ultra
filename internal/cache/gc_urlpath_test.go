@@ -78,8 +78,11 @@ func drainURLPathGC(t *testing.T, c *Cache, batchSize int, ttl, hold int64, maxV
 	t.Helper()
 	var agg URLPathGCBatchResult
 	var s, h, p string
+	// Share one memo across the pass, exactly as the production gc driver
+	// does — this also exercises the cross-batch newest-N memo path.
+	memo := NewURLPathGCMemo()
 	for {
-		res, err := c.RunURLPathGCBatch(context.Background(), batchSize, ttl, hold, maxV, s, h, p)
+		res, err := c.RunURLPathGCBatch(context.Background(), batchSize, ttl, hold, maxV, s, h, p, memo)
 		if err != nil {
 			t.Fatalf("RunURLPathGCBatch: %v", err)
 		}
@@ -130,7 +133,7 @@ func seedPackageHash(t *testing.T, c *Cache, scheme, host, path, declared string
 func TestRunURLPathGCBatch_DisabledWhenTTLZero(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
-	if _, err := c.RunURLPathGCBatch(ctx, 100, 0, 0, testMaxVersions, "", "", ""); err == nil {
+	if _, err := c.RunURLPathGCBatch(ctx, 100, 0, 0, testMaxVersions, "", "", "", nil); err == nil {
 		t.Fatal("RunURLPathGCBatch(ttlSeconds=0): want error, got nil")
 	}
 }
@@ -233,6 +236,49 @@ func TestRunURLPathGCBatch_MirrorKeepsNewestNReapsOlder(t *testing.T) {
 	}
 }
 
+// TestRunURLPathGCBatch_MirrorCapAcrossBatchesWithMemo: a fat-index package
+// whose cached versions span SEVERAL small batches must still be capped to
+// newest-N correctly when one per-pass URLPathGCMemo is shared across the
+// batches (the production path). Locks in that the cross-batch ranking memo
+// doesn't corrupt or stale the newest-N decision. drainURLPathGC shares one
+// memo across its batch loop, so a small batchSize exercises the span.
+func TestRunURLPathGCBatch_MirrorCapAcrossBatchesWithMemo(t *testing.T) {
+	c := openCache(t)
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	scheme, host, suite := "http", "download.docker.test", "/linux/ubuntu/dists/jammy"
+	ir := seedBlob(t, c, "docker inrelease")
+	snapID := seedCurrentSnapshot(t, c, scheme, host, suite, ir, now)
+
+	// Six versions of one package, all current-snapshot-vouched, never
+	// requested. With batchSize=2 they span three batches; newest 2 survive.
+	versions := []string{"1.0", "2.0", "1.10", "1.2", "3.0", "2.5"}
+	pathFor := map[string]string{}
+	for _, v := range versions {
+		p := "/pool/d/docker-ce/docker-ce_" + v + "_amd64.deb"
+		pathFor[v] = p
+		blob := seedBlob(t, c, "docker-ce "+v)
+		putURLPathRow(t, c, scheme, host, p, blob, sql.NullInt64{}, false)
+		seedPackageHash(t, c, scheme, host, p, blob, snapID, "docker-ce", "amd64", v)
+	}
+
+	agg := drainURLPathGC(t, c, 2, 7*86400, 0, 2) // batchSize 2, cap newest 2
+	if agg.Deleted != 4 {
+		t.Fatalf("deleted = %d, want 4 (older 1.0,1.2,1.10,2.0 reaped across batches)", agg.Deleted)
+	}
+	for _, v := range []string{"3.0", "2.5"} {
+		if !urlPathExists(t, c, pathFor[v]) {
+			t.Errorf("newest version %s was reaped but must be kept", v)
+		}
+	}
+	for _, v := range []string{"1.0", "1.2", "1.10", "2.0"} {
+		if urlPathExists(t, c, pathFor[v]) {
+			t.Errorf("old version %s survived but must be reaped", v)
+		}
+	}
+}
+
 // TestRunURLPathGCBatch_MirrorOnCurrentSnapshotProtects: a single-version
 // package listed in the current snapshot is top-N and kept (path+hash).
 func TestRunURLPathGCBatch_MirrorOnCurrentSnapshotProtects(t *testing.T) {
@@ -309,8 +355,9 @@ func TestRunURLPathGCBatch_BatchSizeAndCursor(t *testing.T) {
 	var s, h, p string
 	scans := []int{}
 	deletes := 0
+	memo := NewURLPathGCMemo()
 	for {
-		res, err := c.RunURLPathGCBatch(ctx, 3, 7*86400, 0, testMaxVersions, s, h, p)
+		res, err := c.RunURLPathGCBatch(ctx, 3, 7*86400, 0, testMaxVersions, s, h, p, memo)
 		if err != nil {
 			t.Fatalf("RunURLPathGCBatch: %v", err)
 		}
