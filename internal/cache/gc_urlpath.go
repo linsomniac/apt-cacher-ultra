@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 // URLPathGCBatchResult reports one cursor-paged url_path GC batch
@@ -87,12 +88,19 @@ func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds
 		}
 		defer func() { _ = tx.Rollback() }()
 
+		// Skip recency-retained, un-stamped rows in SQL so an active cache
+		// (where most rows are recently requested) doesn't fetch + evaluate
+		// the whole table each tick — only rows that might need an action are
+		// returned. Stamped rows are still returned (so a re-qualified one is
+		// cleared and an expired one is reaped); the in-grace fast-path below
+		// handles stamped-but-in-grace rows cheaply.
 		rows, err := tx.QueryContext(ctx, `
 SELECT canonical_scheme, canonical_host, path, blob_hash, last_requested_at, dropped_at
   FROM url_path
  WHERE (canonical_scheme, canonical_host, path) > (?, ?, ?)
+   AND NOT (last_requested_at IS NOT NULL AND last_requested_at >= ? AND dropped_at IS NULL)
  ORDER BY canonical_scheme, canonical_host, path
- LIMIT ?`, afterScheme, afterHost, afterPath, batchSize)
+ LIMIT ?`, afterScheme, afterHost, afterPath, ttlCutoff, batchSize)
 		if err != nil {
 			return fmt.Errorf("RunURLPathGCBatch: select: %w", err)
 		}
@@ -182,6 +190,14 @@ type topNKey struct {
 	scheme, host, suite, name, arch string
 }
 
+// isBinaryPackagePath reports whether path is a binary package (.deb/.udeb),
+// which is subject to the newest-N version cap. Everything else recorded in
+// package_hash (source artifacts, pdiff patch files, Contents) has no Debian
+// binary version and keeps the current-snapshot reference guard.
+func isBinaryPackagePath(path string) bool {
+	return strings.HasSuffix(path, ".deb") || strings.HasSuffix(path, ".udeb")
+}
+
 // urlPathRetainedTx reports whether a url_path row is retained by the
 // three-rule union plus the unchanged metadata-anchor / snapshot_member
 // guards. It runs inside the writer tx so its verdict is consistent with
@@ -193,9 +209,10 @@ type topNKey struct {
 //  1. recency (last_requested within TTL) — keeps actively-pulled versions;
 //  2. metadata guards b/c/d (current-snapshot scoped) — MUST stay to avoid
 //     the freshness-freeze trap; never reap an InRelease/Release anchor;
-//  3. source-artifact fallback (arch=="source", version=”) — narrow on
-//     purpose: a version-less BINARY row must fall through and be reaped or
-//     a fat version-less index reopens the leak;
+//  3. non-binary-package fallback (path not .deb/.udeb — source artifacts,
+//     pdiff patch files, Contents — vouched by a current snapshot) keeps
+//     the legacy guard (a); a version-less BINARY .deb falls through and is
+//     reaped, so a fat version-less index can't reopen the leak;
 //  4. mirror: newest-N distinct versions per (suite,name,arch) in the
 //     CURRENT snapshot only — displaced snapshots must not vouch a .deb.
 //
@@ -280,19 +297,20 @@ SELECT ss.suite_path, ph.package_name, ph.architecture, ph.version
 	}
 	_ = mrows.Close()
 
-	for _, m := range matches {
-		// Source-artifact fallback: source packages (.dsc/tarballs) live in
-		// package_hash with architecture="source" and no Debian binary
-		// version to rank, so they keep the legacy current-snapshot guard
-		// (a). This is deliberately NARROW (arch=="source" only): a
-		// version-less BINARY row (malformed stanza, or a pre-v6 row) must
-		// NOT get an unconditional keep, or a fat version-less index would
-		// reopen the leak — it falls through to the mirror loop below, where
-		// its empty version matches no top-N set and it is reaped (re-fetched
-		// on demand; still vouched by package_hash under strict mode).
-		if m.version == "" && m.arch == "source" {
-			return true, nil
-		}
+	// Non-binary-package fallback: source artifacts (.dsc/tarballs, arch
+	// "source") and metadata patch files (pdiff Packages.diff/*.gz, which
+	// buildPdiffHashes records in package_hash with the Index's arch and no
+	// version) have no Debian binary version to rank. If the url_path is for
+	// such a path and a CURRENT snapshot vouches it, keep it via the legacy
+	// snapshot-reference guard (a). Gated on the PATH, not architecture, so a
+	// binary-arch pdiff patch (arch="amd64", version="") is kept the same as
+	// its source-arch twin — only real .deb/.udeb packages are subject to the
+	// version cap. A version-less BINARY .deb (malformed stanza / pre-v6 row)
+	// is NOT kept here: it falls through to the mirror loop, matches no top-N
+	// set, and is reaped (re-fetched on demand, still vouched by package_hash
+	// under strict mode) so a fat version-less index can't reopen the leak.
+	if !isBinaryPackagePath(path) && len(matches) > 0 {
+		return true, nil
 	}
 	for _, m := range matches {
 		// Only rank rows with a complete (name, arch, version) identity.

@@ -404,6 +404,56 @@ func TestRunURLPathGCBatch_EmptyVersionBinaryIsReaped(t *testing.T) {
 	}
 }
 
+// TestRunURLPathGCBatch_BinaryPdiffPatchKept: a binary-arch pdiff patch
+// file (non-.deb path, arch="amd64", version=”) referenced by the current
+// snapshot is kept via the non-binary-package fallback — same as a
+// source-arch one — because the fallback is gated on the path, not the arch.
+func TestRunURLPathGCBatch_BinaryPdiffPatchKept(t *testing.T) {
+	c := openCache(t)
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	scheme, host, suite := "http", "archive.test", "/ubuntu/dists/noble"
+	h := seedBlob(t, c, "pdiff patch bytes")
+	ir := seedBlob(t, c, "current inrelease")
+	const path = "/ubuntu/dists/noble/main/binary-amd64/Packages.diff/2026-01-01.gz"
+	putURLPathRow(t, c, scheme, host, path, h,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, false)
+	snapID := seedCurrentSnapshot(t, c, scheme, host, suite, ir, now)
+	// pdiff patch row: binary arch, empty version (buildPdiffHashes shape).
+	seedPackageHash(t, c, scheme, host, path, h, snapID, "", "amd64", "")
+
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
+	if agg.Deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (binary-arch pdiff patch kept via non-.deb fallback)", agg.Deleted)
+	}
+}
+
+// TestTouchURLPath_ClearsDroppedAt: a client request during the hold grace
+// clears the drop stamp at the source, so the row can't be reaped at the
+// original stamp's expiry even when hold_packages.window > gc.url_path_ttl.
+func TestTouchURLPath_ClearsDroppedAt(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	h := seedBlob(t, c, "touch-clears blob")
+	putURLPathRow(t, c, "http", "ex.test", "/p/touch.deb", h,
+		sql.NullInt64{Int64: now - 30*86400, Valid: true}, false)
+	// Stamp it via a hold-grace GC pass.
+	_ = drainURLPathGC(t, c, 100, 7*86400, 86400, testMaxVersions)
+	if urlPathDroppedAt(t, c, "/p/touch.deb") != now {
+		t.Fatalf("expected dropped_at stamped to now")
+	}
+	if err := c.TouchURLPath(ctx, "http", "ex.test", "/p/touch.deb"); err != nil {
+		t.Fatal(err)
+	}
+	if urlPathDroppedAt(t, c, "/p/touch.deb") != -1 {
+		t.Error("TouchURLPath must clear dropped_at to NULL on a client request")
+	}
+}
+
 func TestRunURLPathGCBatch_InReleaseUrlPathOnCurrentSnapshotProtected(t *testing.T) {
 	c := openCache(t)
 	const now = int64(2_000_000_000)

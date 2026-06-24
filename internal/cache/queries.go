@@ -71,7 +71,10 @@ ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
   request_count     = excluded.request_count,
   last_fetched_at   = excluded.last_fetched_at,
   upstream_etag     = excluded.upstream_etag,
-  upstream_lastmod  = excluded.upstream_lastmod`
+  upstream_lastmod  = excluded.upstream_lastmod,
+  -- A fresh fetch/serve re-establishes the row; clear any hold-grace stamp
+  -- so a re-fetched path isn't reaped at a stale drop deadline.
+  dropped_at        = NULL`
 	isMD := int64(0)
 	if u.IsMetadata {
 		isMD = 1
@@ -93,10 +96,16 @@ ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
 // last_requested_at. Cheap, hot-path operation; safe to fire-and-forget
 // on cache hits.
 func (c *Cache) TouchURLPath(ctx context.Context, scheme, host, path string) error {
+	// dropped_at = NULL: a fresh client request re-qualifies the row by
+	// recency, so clear any hold-grace drop stamp at the source. Without
+	// this, a row requested during the grace window could still be reaped at
+	// the original stamp's expiry when hold_packages.window > gc.url_path_ttl
+	// (the GC pass might not run while the row is still recency-fresh).
 	const q = `
 UPDATE url_path
 SET request_count = request_count + 1,
-    last_requested_at = ?
+    last_requested_at = ?,
+    dropped_at = NULL
 WHERE canonical_scheme = ? AND canonical_host = ? AND path = ?`
 	now := nowUnix()
 	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
