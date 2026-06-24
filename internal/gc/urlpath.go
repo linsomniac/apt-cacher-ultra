@@ -52,7 +52,18 @@ func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase strin
 	// batch (keeps the url_path pass from burning the shared deadline and
 	// starving the later blob pass). Fresh per pass: snapshots can change
 	// between ticks, so rankings are not carried across runURLPathPass calls.
-	memo := cache.NewURLPathGCMemo()
+	//
+	// Only share the memo when holdSeconds > 0. With a hold grace, a stale
+	// ranking (an adoption flips a new version mid-pass, after the memo cached
+	// that group) at worst STAMPS the freshly-warmed row, which the next pass
+	// re-evaluates and clears — harmless. With holdSeconds == 0 there is no
+	// grace: a "not newest-N" verdict deletes immediately, so a stale memo
+	// could reap a just-adopted version on the very tick it was warmed. Pass
+	// nil there so each batch re-queries and sees the new version.
+	var memo *cache.URLPathGCMemo
+	if holdSeconds > 0 {
+		memo = cache.NewURLPathGCMemo()
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return deleted, false, nil

@@ -139,10 +139,11 @@ SELECT canonical_scheme, canonical_host, path, blob_hash, last_requested_at, dro
 		// 100-row batches is ranked once per PASS instead of once per batch;
 		// nil falls back to per-batch ranking (direct/test callers). Reusing a
 		// set computed in a prior batch's tx is safe: it is a plain map with no
-		// tx dependency once populated, and the ranking is stable within a pass
-		// absent a concurrent adoption (a mid-pass flip only makes a kept
-		// version look stale-kept for the rest of one tick, which hold-grace
-		// already tolerates).
+		// tx dependency once populated. A concurrent mid-pass adoption can make
+		// the cached set stale (missing a just-flipped version); the GC driver
+		// therefore shares a memo only when hold > 0, where a stale verdict
+		// merely stamps (and the next pass clears) rather than deleting — see
+		// URLPathGCMemo's caller contract.
 		var topNCache map[topNKey]map[string]struct{}
 		if memo != nil {
 			topNCache = memo.topN
@@ -227,6 +228,15 @@ type topNKey struct {
 // the blob-reclamation pass that runs after it. Construct one per pass with
 // NewURLPathGCMemo and pass the SAME pointer to every batch call in that pass;
 // pass nil to rank per-batch (direct/test callers).
+//
+// Caller contract: share a memo ONLY when the pass runs with a hold grace
+// (hold_packages.window > 0). The cached set is computed in an earlier batch's
+// tx and reused in later batches' txs; if an adoption flips a new version
+// mid-pass (after the group was cached), the stale set ranks the new version
+// "not newest-N". With a grace that only STAMPS the freshly-warmed row (the
+// next pass re-evaluates and clears it — harmless); with grace == 0 it would
+// DELETE immediately, reaping a just-warmed version, so the GC driver passes
+// nil there and each batch re-queries.
 type URLPathGCMemo struct {
 	topN map[topNKey]map[string]struct{}
 }

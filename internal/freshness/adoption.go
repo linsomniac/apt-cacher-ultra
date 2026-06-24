@@ -2088,12 +2088,15 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 		// is exactly what the fallback relies on.
 		//
 		// AIDEV-NOTE: the skip is NON-PUNITIVE by deliberate decision
-		// (round-5): it does NOT flip the snapshot's coverage_complete, so
-		// one malformed stanza cannot downgrade strict mode for the whole
-		// suite (coverage=false relaxes strict mode suite-wide — the harm the
-		// round-1 review flagged). The lone malformed .deb is left unvouched:
-		// reapable by GC and fail-closed under strict mode, which is safe
-		// because it is apt-unusable anyway. Reverses the round-1 ride-along;
+		// (round-5): a lone/partial malformed stanza does NOT flip the
+		// snapshot's coverage_complete, so it cannot downgrade strict mode for
+		// the whole suite (coverage=false relaxes strict mode suite-wide — the
+		// harm the round-1 review flagged). The lone malformed .deb is left
+		// unvouched: reapable by GC and fail-closed under strict mode, which is
+		// safe because it is apt-unusable anyway. EXCEPTION (round-6): if EVERY
+		// binary stanza is version-less (zero vouchers survive), coverage IS
+		// flipped incomplete below — claiming complete with no rows would
+		// fail-close every .deb suite-wide. Reverses the round-1 ride-along;
 		// keep in lockstep with the §3 url_path GC empty-version fallback.
 		if decl.version == "" {
 			skippedVersionless++
@@ -2148,6 +2151,24 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 			"snapshot_id", snapshotID,
 			"reason", "unsupported_variants",
 			"directories", missingDirs,
+		)
+		return packageHashBuildResult{rows: rows, coverageComplete: false}, nil
+	}
+	if skippedVersionless > 0 && len(rows) == 0 {
+		// Degenerate case: the index had binary stanzas but EVERY one lacked
+		// Version:, so skipping them all leaves ZERO .deb vouchers. Claiming
+		// complete coverage here would make strict mode (refuse_unvouched_debs)
+		// fail-closed for every .deb in the suite while the status reports full
+		// coverage (round-6 finding). Treat it like an unparseable dir —
+		// coverage-incomplete. The lone/partial-malformed case (len(rows) > 0)
+		// still keeps coverage per the round-5 non-punitive decision: one bad
+		// stanza among many good ones must not downgrade the suite.
+		a.logger.Info("package_coverage_incomplete",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID,
+			"reason", "all_binary_stanzas_versionless",
+			"skipped_rows", skippedVersionless,
 		)
 		return packageHashBuildResult{rows: rows, coverageComplete: false}, nil
 	}

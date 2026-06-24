@@ -78,8 +78,10 @@ func drainURLPathGC(t *testing.T, c *Cache, batchSize int, ttl, hold int64, maxV
 	t.Helper()
 	var agg URLPathGCBatchResult
 	var s, h, p string
-	// Share one memo across the pass, exactly as the production gc driver
-	// does — this also exercises the cross-batch newest-N memo path.
+	// Share one memo across the pass to exercise the cross-batch newest-N
+	// memo path. (The production driver shares a memo only when hold > 0;
+	// these tests use no mid-pass mutation, so a shared memo is correct at
+	// any hold and gives the batches deterministic ranking coverage.)
 	memo := NewURLPathGCMemo()
 	for {
 		res, err := c.RunURLPathGCBatch(context.Background(), batchSize, ttl, hold, maxV, s, h, p, memo)

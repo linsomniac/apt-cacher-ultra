@@ -440,6 +440,50 @@ func TestBuildPackageHashes_VersionlessBinaryStanzaSkippedCoverageIntact(t *test
 	}
 }
 
+// TestBuildPackageHashes_AllVersionlessBinaryFlipsCoverage: when EVERY binary
+// stanza in the index lacks Version: (a wholly-malformed index), skipping them
+// all leaves ZERO package_hash vouchers. Claiming coverage_complete=true there
+// would make strict mode (refuse_unvouched_debs) fail-closed for every .deb in
+// the suite while the status page reports full coverage (round-6 finding). So
+// the degenerate all-version-less case IS marked coverage-incomplete —
+// distinct from the lone/partial-malformed case (which keeps coverage; see
+// TestBuildPackageHashes_VersionlessBinaryStanzaSkippedCoverageIntact) per the
+// round-5 non-punitive decision.
+func TestBuildPackageHashes_AllVersionlessBinaryFlipsCoverage(t *testing.T) {
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	a := &Adopter{cache: c, logger: slog.Default()}
+
+	a1 := strings.Repeat("a", 64)
+	b1 := strings.Repeat("b", 64)
+	pkgs := []byte(
+		"Package: nginx\nArchitecture: amd64\n" + // no Version:
+			"Filename: pool/main/n/nginx/nginx_1.0_amd64.deb\n" +
+			"Size: 1\nSHA256: " + a1 + "\n\n" +
+			"Package: curl\nArchitecture: amd64\n" + // no Version:
+			"Filename: pool/main/c/curl/curl_8.0_amd64.deb\n" +
+			"Size: 1\nSHA256: " + b1 + "\n",
+	)
+	pkgsBlob := writeFixtureBlob(t, c, pkgs)
+	suiteRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example", SuitePath: "/dists/noble"}
+	members := []ReleaseMember{{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))}}
+
+	res, err := a.buildPackageHashes(suiteRef, 1, members, members)
+	if err != nil {
+		t.Fatalf("buildPackageHashes: %v", err)
+	}
+	if len(res.rows) != 0 {
+		t.Fatalf("got %d rows, want 0 (every binary stanza version-less, all skipped)", len(res.rows))
+	}
+	if res.coverageComplete {
+		t.Error("coverageComplete = true, want false (zero vouchers from a wholly version-less binary index)")
+	}
+}
+
 // hotFakeFetcher extends the existing fakeFetcher with per-URL
 // blocking simulation so budget-elapse tests can deterministically
 // trigger ctx.Done.

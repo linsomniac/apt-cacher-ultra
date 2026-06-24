@@ -913,14 +913,21 @@ SELECT DISTINCT ph.package_name, ph.architecture
 				return matches[i].Path < matches[j].Path
 			})
 		}
-		// Version-aware retention §4: warm only the newest N distinct
-		// versions of this hot (Package, Arch). A fat-index repo lists
-		// hundreds of versions of one package in a single snapshot;
-		// warming them all is the leak. The kept-version set matches the
-		// §3 retention mirror rule so prefetch and GC agree on "kept".
-		// Version-less rows (malformed binary stanza) are NOT prefetched —
-		// they have no rankable version and warming many of them would
-		// reopen the leak; the GC mirror rule likewise won't retain them.
+		// Version-aware retention §4: cap VERSIONED binaries to the newest N
+		// distinct versions of this hot (Package, Arch). A fat-index repo
+		// lists hundreds of versions of one package in a single snapshot;
+		// warming them all is the leak. The kept-version set matches the §3
+		// retention mirror rule so prefetch and GC agree on "kept".
+		//
+		// Version-less matches are warmed unconditionally: they are legitimate
+		// source artifacts (.dsc/tarballs, arch="source") that have no Debian
+		// version to rank and are NOT the leak — exactly as they were warmed
+		// before the version-aware change. (Version-less BINARY stanzas no
+		// longer reach package_hash at all — buildPackageHashes skips them —
+		// so a version-less match here cannot be a fat binary index, and the
+		// §3 GC fallback keeps these same rows, so prefetch and GC still
+		// agree.) Skipping them silently disabled source prefetch after every
+		// snapshot flip (round-6 regression).
 		versions := make([]string, 0, len(matches))
 		for _, ph := range matches {
 			if ph.Version == "" {
@@ -931,6 +938,7 @@ SELECT DISTINCT ph.package_name, ph.architecture
 		keep := keepNewestNVersionSet(versions, maxVersionsPerPackage)
 		for _, ph := range matches {
 			if ph.Version == "" {
+				out = append(out, HotSetEntry{Path: ph.Path, DeclaredSHA256: ph.DeclaredSHA256})
 				continue
 			}
 			if _, ok := keep[ph.Version]; !ok {

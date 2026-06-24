@@ -2812,6 +2812,67 @@ func TestComputeHotSet_BoundsToNewestNVersions(t *testing.T) {
 	}
 }
 
+// TestComputeHotSet_WarmsVersionlessSourceArtifacts: a hot source package
+// (arch="source", version='') must still be warmed by bounded prefetch. Source
+// .dsc/tarball rows legitimately have no Debian version; the newest-N cap only
+// applies to versioned binaries. The first cut skipped ALL version-less
+// matches, which silently disabled source prefetch after every snapshot flip
+// (round-6 regression). Version-less BINARIES no longer reach package_hash
+// (the adopter skips them), so a version-less match here is a source artifact.
+func TestComputeHotSet_WarmsVersionlessSourceArtifacts(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	scheme, host := "http", "deb.debian.example"
+
+	rOld := seedBlob(t, c, "InRelease old")
+	rNew := seedBlob(t, c, "InRelease new")
+	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/debian/dists/sid", InReleaseHash: &rOld,
+	})
+	idNew, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host,
+		SuitePath: "/debian/dists/sid", InReleaseHash: &rNew,
+	})
+
+	// Prior snapshot: a hot (hello, source) pair + fresh url_path so Stage 1
+	// marks the source pair hot.
+	srcPath := "/debian/pool/main/h/hello/hello_2.10.dsc"
+	priorBlob := seedBlob(t, c, "hello.dsc old")
+	if err := c.CommitAdoption(ctx, idPrior,
+		[]SnapshotMember{{SnapshotID: idPrior, Path: "InRelease", BlobHash: rOld, DeclaredSHA256: rOld}}, nil,
+		[]PackageHash{{
+			CanonicalScheme: scheme, CanonicalHost: host, Path: srcPath,
+			DeclaredSHA256: priorBlob, SnapshotID: idPrior,
+			PackageName: "hello", Architecture: "source", Version: "",
+		}}, nil, true); err != nil {
+		t.Fatalf("commit prior: %v", err)
+	}
+	now := nowUnix()
+	if err := c.PutURLPath(ctx, URLPath{
+		CanonicalScheme: scheme, CanonicalHost: host, Path: srcPath,
+		BlobHash: ptrStr(priorBlob), UpstreamURL: "u",
+		LastRequestedAt: &now, RequestCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Candidate lists the same source artifact (arch="source", no version).
+	cand := []PackageHash{{
+		CanonicalScheme: scheme, CanonicalHost: host, Path: srcPath,
+		DeclaredSHA256: seedBlob(t, c, "hello.dsc new"), SnapshotID: idNew,
+		PackageName: "hello", Architecture: "source", Version: "",
+	}}
+
+	got, err := c.ComputeHotSet(ctx, scheme, host, idPrior, idNew, cand, 86400, now, 2)
+	if err != nil {
+		t.Fatalf("ComputeHotSet: %v", err)
+	}
+	if len(got) != 1 || got[0].Path != srcPath {
+		t.Fatalf("got %+v, want the source artifact %q warmed", got, srcPath)
+	}
+}
+
 // TestComputeHotSet_ExcludesPreV3Rows: package_hash rows with empty
 // package_name/architecture (post-migration, pre-Phase-3 adoptions)
 // are filtered out by Stage 1's <> ” predicate. SPEC3 §4.3.2.
