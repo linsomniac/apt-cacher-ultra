@@ -33,6 +33,10 @@ func fakePackagesStanzas(entries map[string]string) []byte {
 	var sb strings.Builder
 	for fn, h := range entries {
 		fmt.Fprintf(&sb, "Package: %s\n", filepath.Base(fn))
+		// Architecture is mandatory in a real binary Packages stanza; the
+		// adopter skips incomplete-identity stanzas (missing name/arch/version),
+		// so the fixture must supply it or no package_hash row is written.
+		fmt.Fprintf(&sb, "Architecture: amd64\n")
 		fmt.Fprintf(&sb, "Version: 1.0\n")
 		fmt.Fprintf(&sb, "Filename: %s\n", fn)
 		fmt.Fprintf(&sb, "Size: 1234\n")

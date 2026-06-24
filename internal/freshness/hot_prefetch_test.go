@@ -484,6 +484,54 @@ func TestBuildPackageHashes_AllVersionlessBinaryFlipsCoverage(t *testing.T) {
 	}
 }
 
+// TestBuildPackageHashes_IncompleteIdentityBinarySkipped: a binary stanza with
+// a real Version: but missing Architecture: (or Package:) yields an
+// INCOMPLETE-identity package_hash row (arch='' or name=''). The §3 GC
+// empty-version fallback keeps ANY incomplete-identity row (name=='' ||
+// arch=='' || version==''), so such a row would ride that fallback forever and
+// re-open the fat-index leak. The writer skip-gate must match the GC fallback's
+// FULL incomplete-identity condition, not just version=='' (round-9 finding).
+func TestBuildPackageHashes_IncompleteIdentityBinarySkipped(t *testing.T) {
+	dir := t.TempDir()
+	c, err := cache.Open(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("cache.Open: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	a := &Adopter{cache: c, logger: slog.Default()}
+
+	good := strings.Repeat("a", 64)
+	noArch := strings.Repeat("b", 64)
+	noName := strings.Repeat("c", 64)
+	pkgs := []byte(
+		"Package: nginx\nArchitecture: amd64\nVersion: 1.0\n" +
+			"Filename: pool/main/n/nginx/nginx_1.0_amd64.deb\n" +
+			"Size: 1\nSHA256: " + good + "\n\n" +
+			"Package: curl\nVersion: 8.0\n" + // missing Architecture:
+			"Filename: pool/main/c/curl/curl_8.0_amd64.deb\n" +
+			"Size: 1\nSHA256: " + noArch + "\n\n" +
+			"Architecture: amd64\nVersion: 2.0\n" + // missing Package:
+			"Filename: pool/main/w/wget/wget_2.0_amd64.deb\n" +
+			"Size: 1\nSHA256: " + noName + "\n",
+	)
+	pkgsBlob := writeFixtureBlob(t, c, pkgs)
+	suiteRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example", SuitePath: "/dists/noble"}
+	members := []ReleaseMember{{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))}}
+
+	res, err := a.buildPackageHashes(suiteRef, 1, members, members)
+	if err != nil {
+		t.Fatalf("buildPackageHashes: %v", err)
+	}
+	// Only the complete nginx row survives; the arch-less and name-less rows
+	// are skipped so they cannot ride the GC incomplete-identity fallback.
+	if len(res.rows) != 1 {
+		t.Fatalf("got %d rows, want 1 (incomplete-identity binaries skipped): %+v", len(res.rows), res.rows)
+	}
+	if res.rows[0].PackageName != "nginx" {
+		t.Errorf("surviving row = %q, want nginx", res.rows[0].PackageName)
+	}
+}
+
 // hotFakeFetcher extends the existing fakeFetcher with per-URL
 // blocking simulation so budget-elapse tests can deterministically
 // trigger ctx.Done.

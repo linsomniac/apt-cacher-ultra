@@ -2074,18 +2074,22 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 	}
 
 	rows := make([]cache.PackageHash, 0, len(dedup))
-	skippedVersionless := 0
+	skippedIncomplete := 0
 	for debPath, decl := range dedup {
-		// Binary non-empty-version invariant (design §1, load-bearing): a
-		// binary stanza with no Version: is a malformed index entry (Debian
-		// Policy makes Version mandatory; apt itself rejects such stanzas).
-		// SKIP it — never write a version='' binary package_hash row —
-		// because the §3 GC empty-version fallback KEEPS version-less rows
-		// (legitimate source/pdiff/Contents artifacts and pre-migration
-		// leftovers). Writing a FRESH version-less binary would let it ride
-		// that fallback forever and re-open the fat-index leak. Skipping
-		// guarantees "version='' => non-binary" for every post-v6 row, which
-		// is exactly what the fallback relies on.
+		// Binary complete-identity invariant (design §1, load-bearing): a
+		// binary stanza missing ANY of Package:/Architecture:/Version: is a
+		// malformed index entry (Debian Policy makes all three mandatory; apt
+		// itself rejects such stanzas). SKIP it — never write an
+		// incomplete-identity binary package_hash row — because the §3 GC
+		// fallback KEEPS any row with an empty name/arch/version (for
+		// legitimate source/pdiff/Contents artifacts and pre-migration
+		// leftovers). Writing a FRESH incomplete-identity binary would let it
+		// ride that fallback forever and re-open the fat-index leak. The skip
+		// condition MUST match the GC fallback's condition exactly
+		// (gc_urlpath.go urlPathRetainedTx rule 3) so the two stay in lockstep:
+		// every post-v6 binary row then has a complete (name, arch, version)
+		// identity, and the fallback's empty-identity case only ever covers
+		// non-binary artifacts (Sources/pdiff/Contents) and pre-migration rows.
 		//
 		// AIDEV-NOTE: the skip is NON-PUNITIVE by deliberate decision
 		// (round-5): a lone/partial malformed stanza does NOT flip the
@@ -2094,12 +2098,12 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 		// harm the round-1 review flagged). The lone malformed .deb is left
 		// unvouched: reapable by GC and fail-closed under strict mode, which is
 		// safe because it is apt-unusable anyway. EXCEPTION (round-6): if EVERY
-		// binary stanza is version-less (zero vouchers survive), coverage IS
+		// binary stanza is malformed (zero vouchers survive), coverage IS
 		// flipped incomplete below — claiming complete with no rows would
 		// fail-close every .deb suite-wide. Reverses the round-1 ride-along;
 		// keep in lockstep with the §3 url_path GC empty-version fallback.
-		if decl.version == "" {
-			skippedVersionless++
+		if decl.packageName == "" || decl.architecture == "" || decl.version == "" {
+			skippedIncomplete++
 			continue
 		}
 		rows = append(rows, cache.PackageHash{
@@ -2113,15 +2117,15 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 			Version:         decl.version,
 		})
 	}
-	if skippedVersionless > 0 {
+	if skippedIncomplete > 0 {
 		// Observability only — coverage is intentionally NOT downgraded here
 		// (see the AIDEV-NOTE above). Lets operators spot a malformed upstream
 		// index without it silently degrading the suite's strict-mode posture.
-		a.logger.Info("package_hash_versionless_binary_skipped",
+		a.logger.Info("package_hash_incomplete_binary_skipped",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
-			"skipped_rows", skippedVersionless,
+			"skipped_rows", skippedIncomplete,
 		)
 	}
 
@@ -2154,21 +2158,22 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 		)
 		return packageHashBuildResult{rows: rows, coverageComplete: false}, nil
 	}
-	if skippedVersionless > 0 && len(rows) == 0 {
-		// Degenerate case: the index had binary stanzas but EVERY one lacked
-		// Version:, so skipping them all leaves ZERO .deb vouchers. Claiming
-		// complete coverage here would make strict mode (refuse_unvouched_debs)
-		// fail-closed for every .deb in the suite while the status reports full
-		// coverage (round-6 finding). Treat it like an unparseable dir —
-		// coverage-incomplete. The lone/partial-malformed case (len(rows) > 0)
-		// still keeps coverage per the round-5 non-punitive decision: one bad
-		// stanza among many good ones must not downgrade the suite.
+	if skippedIncomplete > 0 && len(rows) == 0 {
+		// Degenerate case: the index had binary stanzas but EVERY one was
+		// malformed (missing name/arch/version), so skipping them all leaves
+		// ZERO .deb vouchers. Claiming complete coverage here would make strict
+		// mode (refuse_unvouched_debs) fail-closed for every .deb in the suite
+		// while the status reports full coverage (round-6 finding). Treat it
+		// like an unparseable dir — coverage-incomplete. The lone/partial-
+		// malformed case (len(rows) > 0) still keeps coverage per the round-5
+		// non-punitive decision: a few bad stanzas among good ones must not
+		// downgrade the suite.
 		a.logger.Info("package_coverage_incomplete",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
-			"reason", "all_binary_stanzas_versionless",
-			"skipped_rows", skippedVersionless,
+			"reason", "all_binary_stanzas_malformed",
+			"skipped_rows", skippedIncomplete,
 		)
 		return packageHashBuildResult{rows: rows, coverageComplete: false}, nil
 	}

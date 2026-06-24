@@ -507,6 +507,10 @@ func chaos2BuildPackagesText(entries map[string]string) []byte {
 	var sb strings.Builder
 	for rel, h := range entries {
 		fmt.Fprintf(&sb, "Package: %s\n", rel)
+		// Architecture is mandatory in a real Packages stanza; without it the
+		// adopter (correctly) skips the stanza as incomplete-identity, so the
+		// fixture must supply it or no package_hash row is written.
+		fmt.Fprintf(&sb, "Architecture: amd64\n")
 		fmt.Fprintf(&sb, "Version: 1.0\n")
 		fmt.Fprintf(&sb, "Filename: %s\n", rel)
 		fmt.Fprintf(&sb, "Size: 0\n")

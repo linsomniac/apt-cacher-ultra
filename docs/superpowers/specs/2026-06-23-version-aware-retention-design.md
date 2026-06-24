@@ -124,10 +124,13 @@ ALTER TABLE url_path      ADD COLUMN dropped_at INTEGER;  -- hold-grace clock (�
   disagreement for one path is rejected like the existing Package/Architecture
   conflict (adoption invariant, H7-style).
 - **Binary invariant (load-bearing):** every post-v6 binary `package_hash` row
-  has a **non-empty** `version`. A binary `Packages` stanza missing `Version`
-  (malformed index — Debian Policy makes `Version` mandatory and apt rejects
-  such stanzas) is **skipped** — never inserted with `version = ''`. This
-  guarantees `version = '' ⇒ non-binary` (Sources/pdiff/Contents, or
+  has a **complete** `(package_name, architecture, version)` identity. A binary
+  `Packages` stanza missing ANY of `Package`/`Architecture`/`Version` (malformed
+  index — Debian Policy makes all three mandatory and apt rejects such stanzas)
+  is **skipped** — never inserted with an empty identity column. The writer's
+  skip condition matches the §3 GC fallback's keep condition exactly
+  (`name='' OR arch='' OR version=''`) so the two stay in lockstep. This
+  guarantees an empty identity column `⇒ non-binary` (Sources/pdiff/Contents, or
   pre-migration), which is exactly what the §3 empty-version fallback relies on;
   without it a malformed binary row would slip into the fallback and re-open the
   fat-index leak for new data. **The skip is NON-PUNITIVE (round-5 decision):**

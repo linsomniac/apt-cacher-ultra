@@ -321,24 +321,25 @@ SELECT ss.suite_path, ph.package_name, ph.architecture, ph.version
 	}
 	_ = mrows.Close()
 
-	// Rule 3: empty-version fallback (design §"Empty-version rows" + §6).
+	// Rule 3: incomplete-identity fallback (design §"Empty-version rows" + §6).
 	// A current-snapshot match with an incomplete (name, arch, version)
-	// identity has no Debian binary version to rank: source artifacts
-	// (.dsc/tarballs, arch="source"), pdiff patch files (Packages.diff/*.gz,
-	// which buildPdiffHashes records with the Index's arch and version=""),
-	// Contents, OR a pre-v6/malformed binary stanza (a fat-index repo carries
-	// a real Version: in every stanza, so version="" on a .deb means it has
-	// not been re-adopted under v6 yet — never that the live index is fat-but-
-	// versionless). Keep it via the legacy snapshot-reference guard while a
-	// CURRENT snapshot vouches it. The gate is the VERSION, not the path
-	// suffix: a versioned .ddeb debug package still hits the cap below (so
-	// dbgsym fat indexes are bounded), and the pre-migration 25 GB of
-	// version-less binaries is reclaimed OPERATIONALLY (wipe / re-adoption
-	// that backfills version), never by GC reaping a still-published binary —
-	// doing so would mass-evict live packages during the migration window.
-	// (A single blob is one package file, so all matches share one
-	// (name, arch, version); "any incomplete" therefore means "all
-	// incomplete", and keeping on the incomplete case is the safe choice.)
+	// identity has no rankable Debian binary version: source artifacts
+	// (.dsc/tarballs, arch="source", version=""), pdiff patch files
+	// (Packages.diff/*.gz, which buildPdiffHashes records with name="" and
+	// version=""), Contents, OR a pre-v6 row not yet re-adopted (version="").
+	// A FRESH binary can NEVER land here: buildPackageHashes skips any binary
+	// stanza missing name/arch/version with this exact condition, so every
+	// post-v6 binary row has a complete identity — keep that writer skip in
+	// lockstep with this check. Keep an incomplete-identity row via the legacy
+	// snapshot-reference guard while a CURRENT snapshot vouches it. A versioned
+	// .ddeb debug package has a complete identity and still hits the cap below
+	// (so dbgsym fat indexes are bounded), and the pre-migration 25 GB of
+	// version-less binaries is reclaimed OPERATIONALLY (wipe / re-adoption that
+	// backfills version), never by GC reaping a still-published binary — doing
+	// so would mass-evict live packages during the migration window. (A single
+	// blob is one package file, so all matches share one (name, arch, version);
+	// "any incomplete" therefore means "all incomplete", and keeping on the
+	// incomplete case is the safe choice.)
 	for _, m := range matches {
 		if m.name == "" || m.arch == "" || m.version == "" {
 			return true, nil
