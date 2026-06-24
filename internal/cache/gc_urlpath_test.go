@@ -78,13 +78,8 @@ func drainURLPathGC(t *testing.T, c *Cache, batchSize int, ttl, hold int64, maxV
 	t.Helper()
 	var agg URLPathGCBatchResult
 	var s, h, p string
-	// Share one memo across the pass to exercise the cross-batch newest-N
-	// memo path. (The production driver shares a memo only when hold > 0;
-	// these tests use no mid-pass mutation, so a shared memo is correct at
-	// any hold and gives the batches deterministic ranking coverage.)
-	memo := NewURLPathGCMemo()
 	for {
-		res, err := c.RunURLPathGCBatch(context.Background(), batchSize, ttl, hold, maxV, s, h, p, memo)
+		res, err := c.RunURLPathGCBatch(context.Background(), batchSize, ttl, hold, maxV, s, h, p)
 		if err != nil {
 			t.Fatalf("RunURLPathGCBatch: %v", err)
 		}
@@ -135,7 +130,7 @@ func seedPackageHash(t *testing.T, c *Cache, scheme, host, path, declared string
 func TestRunURLPathGCBatch_DisabledWhenTTLZero(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
-	if _, err := c.RunURLPathGCBatch(ctx, 100, 0, 0, testMaxVersions, "", "", "", nil); err == nil {
+	if _, err := c.RunURLPathGCBatch(ctx, 100, 0, 0, testMaxVersions, "", "", ""); err == nil {
 		t.Fatal("RunURLPathGCBatch(ttlSeconds=0): want error, got nil")
 	}
 }
@@ -238,13 +233,12 @@ func TestRunURLPathGCBatch_MirrorKeepsNewestNReapsOlder(t *testing.T) {
 	}
 }
 
-// TestRunURLPathGCBatch_MirrorCapAcrossBatchesWithMemo: a fat-index package
-// whose cached versions span SEVERAL small batches must still be capped to
-// newest-N correctly when one per-pass URLPathGCMemo is shared across the
-// batches (the production path). Locks in that the cross-batch ranking memo
-// doesn't corrupt or stale the newest-N decision. drainURLPathGC shares one
-// memo across its batch loop, so a small batchSize exercises the span.
-func TestRunURLPathGCBatch_MirrorCapAcrossBatchesWithMemo(t *testing.T) {
+// TestRunURLPathGCBatch_MirrorCapAcrossBatches: a fat-index package whose
+// cached versions span SEVERAL small batches must still be capped to newest-N
+// correctly. Each batch ranks the group independently (per-batch memo) via the
+// cursor-paged scan; this locks in that crossing a batch boundary mid-group
+// doesn't corrupt the newest-N decision.
+func TestRunURLPathGCBatch_MirrorCapAcrossBatches(t *testing.T) {
 	c := openCache(t)
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
@@ -357,9 +351,8 @@ func TestRunURLPathGCBatch_BatchSizeAndCursor(t *testing.T) {
 	var s, h, p string
 	scans := []int{}
 	deletes := 0
-	memo := NewURLPathGCMemo()
 	for {
-		res, err := c.RunURLPathGCBatch(ctx, 3, 7*86400, 0, testMaxVersions, s, h, p, memo)
+		res, err := c.RunURLPathGCBatch(ctx, 3, 7*86400, 0, testMaxVersions, s, h, p)
 		if err != nil {
 			t.Fatalf("RunURLPathGCBatch: %v", err)
 		}

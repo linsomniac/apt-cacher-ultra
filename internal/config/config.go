@@ -399,12 +399,15 @@ type GCConfig struct {
 	// (last_requested_at older than now-ttl) before the GC pass
 	// deletes it. Deletion decrements the row's blob's refcount,
 	// and once that refcount reaches 0 and the blob_grace clock
-	// elapses, the existing blob GC reaps the bytes. Rows with
-	// last_requested_at IS NULL (adoption-pre-warmed but never
-	// served) are protected unconditionally. Rows whose
-	// (scheme, host, path) is vouched for by any current snapshot's
-	// package_hash are protected so a hot-set entry the fleet
-	// hasn't hit yet is not eagerly evicted.
+	// elapses, the existing blob GC reaps the bytes. Rows whose
+	// (scheme, host, path) is vouched for by a CURRENT snapshot's
+	// package_hash are protected by version-aware retention — but
+	// only up to the newest-N versions per package (retention.
+	// max_versions_per_package): a prefetched-but-never-served .deb
+	// (last_requested_at IS NULL) that has fallen out of the newest-N
+	// set is NO LONGER immortal and becomes reapable after the
+	// hold_packages.window grace. Source/pdiff/Contents and other
+	// version-less artifacts vouched by a current snapshot are kept.
 	//
 	// Default 168h (7 days) — the proxy's primary use case is to
 	// cache a *current* working set, and an "apt update" is a

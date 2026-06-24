@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"time"
-
-	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
 // runURLPathPass implements the URL-path TTL reap (SPEC4 §5 fourth
@@ -47,23 +45,6 @@ func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase strin
 	// It resumes from g.urlPathCursor (where a prior deadline-truncated tick
 	// left off) and is reset to empty only once a pass fully drains.
 	curScheme, curHost, curPath := g.urlPathCursor.scheme, g.urlPathCursor.host, g.urlPathCursor.path
-	// One newest-N ranking memo for the whole pass so a fat-index package whose
-	// versions span several batches is ranked once per tick, not once per
-	// batch (keeps the url_path pass from burning the shared deadline and
-	// starving the later blob pass). Fresh per pass: snapshots can change
-	// between ticks, so rankings are not carried across runURLPathPass calls.
-	//
-	// Only share the memo when holdSeconds > 0. With a hold grace, a stale
-	// ranking (an adoption flips a new version mid-pass, after the memo cached
-	// that group) at worst STAMPS the freshly-warmed row, which the next pass
-	// re-evaluates and clears — harmless. With holdSeconds == 0 there is no
-	// grace: a "not newest-N" verdict deletes immediately, so a stale memo
-	// could reap a just-adopted version on the very tick it was warmed. Pass
-	// nil there so each batch re-queries and sees the new version.
-	var memo *cache.URLPathGCMemo
-	if holdSeconds > 0 {
-		memo = cache.NewURLPathGCMemo()
-	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return deleted, false, nil
@@ -83,7 +64,7 @@ func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase strin
 			return deleted, true, nil
 		}
 
-		res, err := g.cfg.Cache.RunURLPathGCBatch(ctx, g.cfg.BatchSize, ttlSeconds, holdSeconds, maxVersions, curScheme, curHost, curPath, memo)
+		res, err := g.cfg.Cache.RunURLPathGCBatch(ctx, g.cfg.BatchSize, ttlSeconds, holdSeconds, maxVersions, curScheme, curHost, curPath)
 		if err != nil {
 			return deleted, false, fmt.Errorf("url_path gc batch: %w", err)
 		}

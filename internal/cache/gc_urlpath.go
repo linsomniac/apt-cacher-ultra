@@ -58,7 +58,7 @@ type URLPathGCBatchResult struct {
 // snapshots — evaluated per group and memoized for the batch. Ranking is done
 // in Go (SQLite cannot order by Debian version) over only the groups the
 // batch actually touches, so the cost is candidate-bounded.
-func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int, afterScheme, afterHost, afterPath string, memo *URLPathGCMemo) (URLPathGCBatchResult, error) {
+func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int, afterScheme, afterHost, afterPath string) (URLPathGCBatchResult, error) {
 	if batchSize < 1 {
 		return URLPathGCBatchResult{}, fmt.Errorf("RunURLPathGCBatch: batchSize must be >= 1, got %d", batchSize)
 	}
@@ -101,14 +101,18 @@ func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds
 		// AIDEV-NOTE: mirror-retained rows (kept-version .debs not recently
 		// requested, e.g. prefetched fat-index versions) are NOT excluded by
 		// this prefilter, so each is re-evaluated every pass even though its
-		// verdict is stable. This is a deliberate, bounded cost: the heavy
-		// part (newest-N ranking) is memoized once per pass via URLPathGCMemo,
-		// and the cursor + per-tick deadline cap the work per tick and resume
-		// next tick. Widening the prefilter to also drop provably-kept rows was
-		// considered and rejected — it would have to reproduce the rule-2/3/4
-		// retention logic in SQL (the NULL-last_requested and current-snapshot
-		// edge cases are exactly where past regressions hid), trading a real
-		// correctness risk for a latency win the memo already largely captures.
+		// verdict is stable. This is a deliberate, bounded cost: the heavy part
+		// (newest-N ranking) is memoized per batch and runs an index-backed
+		// query (idx_package_hash_pkg_arch via topNVersionSetTx), and the
+		// cursor + per-tick deadline cap the work per tick and resume next
+		// tick. A cross-pass ranking memo was tried (be2debd) and reverted —
+		// reusing a set across batch txs let a concurrent mid-pass adoption
+		// make it stale and, with the in-grace fast-path skipping
+		// re-evaluation, spuriously stamp a current version and truncate its
+		// hold grace. Widening the prefilter to drop provably-kept rows in SQL
+		// was also rejected — it would have to reproduce the rule-2/3/4
+		// retention logic (the NULL-last_requested and current-snapshot edge
+		// cases are exactly where past regressions hid).
 		rows, err := tx.QueryContext(ctx, `
 SELECT canonical_scheme, canonical_host, path, blob_hash, last_requested_at, dropped_at
   FROM url_path
@@ -134,22 +138,15 @@ SELECT canonical_scheme, canonical_host, path, blob_hash, last_requested_at, dro
 		}
 		_ = rows.Close()
 
-		// Newest-N ranking memo. When the caller threads a per-pass memo
-		// (NewURLPathGCMemo), a fat-index package whose versions span several
-		// 100-row batches is ranked once per PASS instead of once per batch;
-		// nil falls back to per-batch ranking (direct/test callers). Reusing a
-		// set computed in a prior batch's tx is safe: it is a plain map with no
-		// tx dependency once populated. A concurrent mid-pass adoption can make
-		// the cached set stale (missing a just-flipped version); the GC driver
-		// therefore shares a memo only when hold > 0, where a stale verdict
-		// merely stamps (and the next pass clears) rather than deleting — see
-		// URLPathGCMemo's caller contract.
-		var topNCache map[topNKey]map[string]struct{}
-		if memo != nil {
-			topNCache = memo.topN
-		} else {
-			topNCache = make(map[topNKey]map[string]struct{})
-		}
+		// Per-batch newest-N ranking memo: within one batch the same
+		// (suite,name,arch) group is ranked once. Scoped to the batch (not the
+		// whole pass) on purpose — a cross-pass memo reused across batch txs
+		// could be made stale by a concurrent mid-pass adoption and, combined
+		// with the in-grace fast-path skipping re-evaluation, spuriously stamp
+		// a just-warmed current version and truncate its hold grace. The
+		// ranking query itself is index-backed (idx_package_hash_pkg_arch via
+		// topNVersionSetTx), so re-ranking a group across batches is cheap.
+		topNCache := make(map[topNKey]map[string]struct{})
 
 		for _, r := range batch {
 			res.Scanned++
@@ -218,33 +215,6 @@ UPDATE url_path SET dropped_at = ?
 // ranking group, memoized within a single batch.
 type topNKey struct {
 	scheme, host, suite, name, arch string
-}
-
-// URLPathGCMemo carries the per-(suite,name,arch) newest-N ranking cache
-// across the cursor-paged RunURLPathGCBatch calls of ONE url_path GC pass, so
-// a fat-index package whose many cached versions span several batches (default
-// 100 rows/batch) is ranked once per pass instead of once per batch — the
-// redundant ranking otherwise burns the shared per-tick deadline and delays
-// the blob-reclamation pass that runs after it. Construct one per pass with
-// NewURLPathGCMemo and pass the SAME pointer to every batch call in that pass;
-// pass nil to rank per-batch (direct/test callers).
-//
-// Caller contract: share a memo ONLY when the pass runs with a hold grace
-// (hold_packages.window > 0). The cached set is computed in an earlier batch's
-// tx and reused in later batches' txs; if an adoption flips a new version
-// mid-pass (after the group was cached), the stale set ranks the new version
-// "not newest-N". With a grace that only STAMPS the freshly-warmed row (the
-// next pass re-evaluates and clears it — harmless); with grace == 0 it would
-// DELETE immediately, reaping a just-warmed version, so the GC driver passes
-// nil there and each batch re-queries.
-type URLPathGCMemo struct {
-	topN map[topNKey]map[string]struct{}
-}
-
-// NewURLPathGCMemo allocates a per-pass newest-N ranking memo for
-// RunURLPathGCBatch. See URLPathGCMemo.
-func NewURLPathGCMemo() *URLPathGCMemo {
-	return &URLPathGCMemo{topN: make(map[topNKey]map[string]struct{})}
 }
 
 // urlPathRetainedTx reports whether a url_path row is retained by the
@@ -399,14 +369,23 @@ func (c *Cache) topNVersionSetTx(ctx context.Context, tx *sql.Tx,
 	if set, ok := topNCache[k]; ok {
 		return set, nil
 	}
+	// ph.canonical_scheme/host are constrained explicitly (not just via the
+	// suite_snapshot JOIN) so SQLite can use idx_package_hash_pkg_arch
+	// (canonical_scheme, canonical_host, snapshot_id, package_name,
+	// architecture) for an O(log N) probe instead of full-scanning every
+	// package_hash row of the current snapshot per ranked group — the heavy
+	// cost on the fat-index caches this feature targets. Equivalent: a snapshot
+	// belongs to exactly one (scheme, host), so the ph predicate matches the
+	// JOIN. Mirrors the sibling mirror-match query above, which already does it.
 	vrows, err := tx.QueryContext(ctx, `
 SELECT DISTINCT ph.version
   FROM package_hash ph
   JOIN suite_snapshot ss ON ss.snapshot_id = ph.snapshot_id
  WHERE ss.canonical_scheme = ? AND ss.canonical_host = ? AND ss.suite_path = ?
+   AND ph.canonical_scheme = ? AND ph.canonical_host = ?
    AND ph.package_name = ? AND ph.architecture = ? AND ph.version <> ''
    AND ph.snapshot_id IN (SELECT current_snapshot_id FROM suite_freshness WHERE current_snapshot_id IS NOT NULL)`,
-		scheme, host, suite, name, arch)
+		scheme, host, suite, scheme, host, name, arch)
 	if err != nil {
 		return nil, fmt.Errorf("topNVersionSetTx: %w", err)
 	}
