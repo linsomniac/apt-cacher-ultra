@@ -2074,20 +2074,15 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 	}
 
 	rows := make([]cache.PackageHash, 0, len(dedup))
-	emptyVersion := 0
 	for debPath, decl := range dedup {
-		// Binary invariant (version-aware retention design §1): every
-		// post-v6 binary package_hash row must carry a non-empty Version,
-		// because the §3 retention mirror rule treats version='' as the
-		// "non-binary / pre-migration" marker that falls through to the
-		// snapshot-reference guard. A binary stanza with no Version: is a
-		// malformed index — skip the row and drop coverage to incomplete
-		// rather than insert a row that would silently re-open the
-		// fat-index leak for new data.
-		if decl.version == "" {
-			emptyVersion++
-			continue
-		}
+		// Carry Version into package_hash. The §3 retention mirror rule caps
+		// non-empty-version rows to newest-N; a stanza that omitted Version:
+		// (a malformed/odd index — rare, since Version is mandatory) rides
+		// along with version='' and is retained by the current-snapshot
+		// guard-a fallback exactly as in the pre-version behavior. We
+		// deliberately do NOT skip such a row or flip coverage: one odd
+		// stanza must not downgrade the whole suite's strict-mode posture or
+		// evict its still-valid blob.
 		rows = append(rows, cache.PackageHash{
 			CanonicalScheme: suite.CanonicalScheme,
 			CanonicalHost:   suite.CanonicalHost,
@@ -2098,16 +2093,6 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 			Architecture:    decl.architecture,
 			Version:         decl.version,
 		})
-	}
-	if emptyVersion > 0 {
-		a.logger.Info("package_coverage_incomplete",
-			"canonical_host", suite.CanonicalHost,
-			"suite_path", suite.SuitePath,
-			"snapshot_id", snapshotID,
-			"reason", "missing_version",
-			"skipped_rows", emptyVersion,
-		)
-		return packageHashBuildResult{rows: rows, coverageComplete: false}, nil
 	}
 
 	// SPEC3 §7.5.4: coverage_complete classification.

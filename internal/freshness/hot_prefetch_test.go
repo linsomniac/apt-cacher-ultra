@@ -387,12 +387,13 @@ func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 	}
 }
 
-// TestBuildPackageHashes_SkipsBinaryStanzaMissingVersion locks the
-// version-aware-retention binary invariant: a binary Packages stanza with
-// no Version: is malformed; it must be omitted from package_hash (never
-// inserted with version=”) and drop the snapshot to coverage-incomplete,
-// so the §3 empty-version fallback can never re-open the fat-index leak.
-func TestBuildPackageHashes_SkipsBinaryStanzaMissingVersion(t *testing.T) {
+// TestBuildPackageHashes_VersionlessStanzaKeptCoverageIntact: a binary
+// Packages stanza without Version: (rare/odd index) must still produce a
+// package_hash row (version=”) and must NOT downgrade the snapshot's
+// coverage — one odd stanza can't degrade the whole suite's strict-mode
+// posture or evict its still-valid blob. The version=” row is retained by
+// the §3 current-snapshot guard-a fallback (the proven pre-version behavior).
+func TestBuildPackageHashes_VersionlessStanzaKeptCoverageIntact(t *testing.T) {
 	dir := t.TempDir()
 	c, err := cache.Open(context.Background(), dir, nil)
 	if err != nil {
@@ -419,14 +420,18 @@ func TestBuildPackageHashes_SkipsBinaryStanzaMissingVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildPackageHashes: %v", err)
 	}
-	if len(res.rows) != 1 {
-		t.Fatalf("got %d rows, want 1 (versionless stanza skipped)", len(res.rows))
+	if len(res.rows) != 2 {
+		t.Fatalf("got %d rows, want 2 (versionless stanza kept, not skipped)", len(res.rows))
 	}
-	if res.rows[0].Version != "1.0" {
-		t.Errorf("kept row version = %q, want 1.0", res.rows[0].Version)
+	byVer := map[string]bool{}
+	for _, r := range res.rows {
+		byVer[r.Version] = true
 	}
-	if res.coverageComplete {
-		t.Error("coverageComplete = true, want false (a binary stanza was skipped for missing Version)")
+	if !byVer["1.0"] || !byVer[""] {
+		t.Errorf("expected rows with version 1.0 and '' (kept), got versions %v", byVer)
+	}
+	if !res.coverageComplete {
+		t.Error("coverageComplete = false, want true (a single versionless stanza must not flip coverage)")
 	}
 }
 

@@ -115,6 +115,16 @@ type GC struct {
 	// metrics refresher).
 	lastRunMu sync.Mutex
 	lastRun   *LastRunSummary
+
+	// urlPathCursor persists the url_path GC scan position across ticks.
+	// A pass that hits the per-tick deadline before draining saves its
+	// place here and resumes next tick, instead of restarting from the
+	// beginning — which would rescan the same prefix forever, never reach
+	// rows later in (scheme,host,path) order, and starve the snapshot/blob
+	// passes that run after it. Reset to empty once a pass drains. Touched
+	// only by the tick goroutine (StartupPass runs before Run starts), so
+	// no lock is needed.
+	urlPathCursor struct{ scheme, host, path string }
 }
 
 // LastRunSummary is the SPEC5 §9.6 / §9.7.8 in-memory captured copy

@@ -31,6 +31,12 @@ func TestCompare(t *testing.T) {
 		{"1:1.0", "1.0", 1},
 		{"0:1.0", "1.0", 0}, // explicit epoch 0 == no epoch
 
+		// epochs larger than int64 must order numerically (no strconv
+		// overflow): compared as digit strings.
+		{"99999999999999999999:1.0", "1:1.0", 1},
+		{"99999999999999999999:1.0", "100000000000000000000:1.0", -1},
+		{"00000000000000000001:1.0", "1:1.0", 0}, // leading zeros, equal epoch
+
 		// debian revision split on the LAST hyphen
 		{"1.0-1", "1.0-2", -1},
 		{"1.0-1", "1.0-1", 0},

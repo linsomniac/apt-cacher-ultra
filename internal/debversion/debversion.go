@@ -10,7 +10,6 @@
 package debversion
 
 import (
-	"strconv"
 	"strings"
 )
 
@@ -21,11 +20,8 @@ import (
 func Compare(a, b string) int {
 	ea, ua, ra := parse(a)
 	eb, ub, rb := parse(b)
-	switch {
-	case ea < eb:
-		return -1
-	case ea > eb:
-		return 1
+	if c := compareNumericString(ea, eb); c != 0 {
+		return c
 	}
 	if c := verrevcmp(ua, ub); c != 0 {
 		return c
@@ -34,14 +30,14 @@ func Compare(a, b string) int {
 }
 
 // parse splits a version into (epoch, upstream, revision). A leading
-// `<digits>:` is the epoch (default 0 when absent or non-numeric); the
-// debian_revision is everything after the LAST hyphen (empty when absent,
-// which compares equal to "0" via verrevcmp).
-func parse(v string) (epoch int, upstream, revision string) {
+// `<digits>:` is the epoch as a raw digit string (empty == 0 when absent
+// or non-numeric); the debian_revision is everything after the LAST hyphen
+// (empty when absent, which compares equal to "0" via verrevcmp).
+func parse(v string) (epoch, upstream, revision string) {
 	rest := v
 	if i := strings.IndexByte(rest, ':'); i > 0 {
-		if n, err := strconv.Atoi(rest[:i]); err == nil && isAllDigits(rest[:i]) {
-			epoch = n
+		if isAllDigits(rest[:i]) {
+			epoch = rest[:i]
 			rest = rest[i+1:]
 		}
 	}
@@ -52,6 +48,30 @@ func parse(v string) (epoch int, upstream, revision string) {
 		upstream = rest
 	}
 	return epoch, upstream, revision
+}
+
+// compareNumericString compares two non-negative integers given as digit
+// strings without converting to a fixed-width int — epochs are unbounded in
+// principle and strconv.Atoi would overflow and silently misorder a huge
+// epoch. Empty and all-zero strings are both 0. Strips leading zeros, then
+// compares by length and lexically.
+func compareNumericString(a, b string) int {
+	a = strings.TrimLeft(a, "0")
+	b = strings.TrimLeft(b, "0")
+	if len(a) != len(b) {
+		if len(a) < len(b) {
+			return -1
+		}
+		return 1
+	}
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func isAllDigits(s string) bool {

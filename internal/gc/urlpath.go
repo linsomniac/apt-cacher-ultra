@@ -38,17 +38,21 @@ func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase strin
 		stamped    int
 		cleared    int
 		batchesRun int
-		// Cursor over the url_path primary key (scheme, host, path). Each
-		// batch scans rows strictly after this; advancing it guarantees
-		// the pass terminates (every row visited once) even though most
-		// rows are no-ops. Reset to empty each tick.
-		curScheme, curHost, curPath string
 	)
+	// Cursor over the url_path primary key (scheme, host, path). Each batch
+	// scans rows strictly after this; advancing it guarantees the pass
+	// terminates (every row visited once) even though most rows are no-ops.
+	// It resumes from g.urlPathCursor (where a prior deadline-truncated tick
+	// left off) and is reset to empty only once a pass fully drains.
+	curScheme, curHost, curPath := g.urlPathCursor.scheme, g.urlPathCursor.host, g.urlPathCursor.path
 	for {
 		if err := ctx.Err(); err != nil {
 			return deleted, false, nil
 		}
 		if !time.Now().Before(deadline) {
+			// Persist the cursor so the next tick resumes here instead of
+			// rescanning the prefix already visited this tick.
+			g.urlPathCursor.scheme, g.urlPathCursor.host, g.urlPathCursor.path = curScheme, curHost, curPath
 			g.cfg.Logger.Info("gc_tick_deadline_reached",
 				"phase", phase,
 				"which", "url_path",
@@ -69,9 +73,10 @@ func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase strin
 		stamped += res.Stamped
 		cleared += res.Cleared
 
-		// Scanned == 0 means the cursor reached the end of url_path for
-		// this tick — the pass is drained.
+		// Scanned == 0 means the cursor reached the end of url_path — the
+		// pass is drained; reset so the next tick starts a fresh full scan.
 		if res.Scanned == 0 {
+			g.urlPathCursor.scheme, g.urlPathCursor.host, g.urlPathCursor.path = "", "", ""
 			return deleted, false, nil
 		}
 		curScheme, curHost, curPath = res.LastScheme, res.LastHost, res.LastPath

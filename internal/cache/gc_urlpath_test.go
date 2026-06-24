@@ -255,12 +255,12 @@ func TestRunURLPathGCBatch_MirrorOnCurrentSnapshotProtects(t *testing.T) {
 	}
 }
 
-// TestRunURLPathGCBatch_DisplacedSnapshotMirrorProtects: under version-aware
-// retention "held snapshots" include displaced ones, so a version present
-// only in a displaced (but still-held) snapshot is retained if it ranks in
-// the newest N. (This intentionally changes the pre-version behavior where
-// displaced snapshots never vouched.)
-func TestRunURLPathGCBatch_DisplacedSnapshotMirrorProtects(t *testing.T) {
+// TestRunURLPathGCBatch_DisplacedSnapshotDoesNotProtect: the mirror rule is
+// scoped to CURRENT snapshots (the live published index), so a .deb present
+// only in a displaced/forensic snapshot is NOT vouched and is reapable —
+// matching the pre-version guard (a). Just-superseded versions get the
+// hold-grace window, not indefinite displaced-snapshot retention.
+func TestRunURLPathGCBatch_DisplacedSnapshotDoesNotProtect(t *testing.T) {
 	c := openCache(t)
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
@@ -288,8 +288,8 @@ func TestRunURLPathGCBatch_DisplacedSnapshotMirrorProtects(t *testing.T) {
 	seedPackageHash(t, c, scheme, host, path, h, snapID, "y", "amd64", "1.0")
 
 	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
-	if agg.Deleted != 0 {
-		t.Errorf("deleted = %d, want 0 (held displaced snapshot vouches via mirror)", agg.Deleted)
+	if agg.Deleted != 1 {
+		t.Errorf("deleted = %d, want 1 (displaced-only snapshot does not vouch a .deb)", agg.Deleted)
 	}
 }
 

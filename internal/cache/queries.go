@@ -909,7 +909,11 @@ SELECT DISTINCT ph.package_name, ph.architecture
 		// hundreds of versions of one package in a single snapshot;
 		// warming them all is the leak. The kept-version set matches the
 		// §3 retention mirror rule so prefetch and GC agree on "kept".
-		keep := topNVersions(matches, maxVersionsPerPackage)
+		versions := make([]string, 0, len(matches))
+		for _, ph := range matches {
+			versions = append(versions, ph.Version)
+		}
+		keep := keepNewestNVersionSet(versions, maxVersionsPerPackage)
 		for _, ph := range matches {
 			if _, ok := keep[ph.Version]; !ok {
 				continue
@@ -920,29 +924,46 @@ SELECT DISTINCT ph.package_name, ph.architecture
 	return out, nil
 }
 
-// topNVersions returns the set of the newest n distinct Debian versions
-// among rows, ranked by debversion.Compare. n < 1 is clamped to 1 so the
-// caller never accidentally warms/keeps nothing (which would defeat the
-// warm-mirror goal); the config layer already enforces >= 1.
-func topNVersions(rows []PackageHash, n int) map[string]struct{} {
+// keepNewestNVersionSet returns the set of raw version strings belonging to
+// the newest n Debian-version EQUIVALENCE CLASSES among the input. dpkg
+// considers some textually-distinct strings equal (e.g. "1.0" == "1.0-0" ==
+// "1.00"); those must share a single slot of n and BOTH be retained — not
+// consume two slots, and not have one arbitrarily reaped while the other is
+// kept. Sorting is deterministic (Debian order, then raw-string tie-break)
+// so the boundary selection is stable across runs. n < 1 is clamped to 1 so
+// the caller never accidentally keeps/warms nothing.
+//
+// Shared by ComputeHotSet (bounded prefetch) and the url_path GC mirror rule
+// so prefetch and retention agree on exactly which versions are "kept".
+func keepNewestNVersionSet(versions []string, n int) map[string]struct{} {
 	if n < 1 {
 		n = 1
 	}
-	seen := make(map[string]struct{}, len(rows))
-	versions := make([]string, 0, len(rows))
-	for _, r := range rows {
-		if _, ok := seen[r.Version]; ok {
+	seen := make(map[string]struct{}, len(versions))
+	distinct := make([]string, 0, len(versions))
+	for _, v := range versions {
+		if _, ok := seen[v]; ok {
 			continue
 		}
-		seen[r.Version] = struct{}{}
-		versions = append(versions, r.Version)
+		seen[v] = struct{}{}
+		distinct = append(distinct, v)
 	}
-	sort.Slice(versions, func(i, j int) bool {
-		return debversion.Compare(versions[i], versions[j]) > 0 // newest first
+	sort.Slice(distinct, func(i, j int) bool {
+		if c := debversion.Compare(distinct[i], distinct[j]); c != 0 {
+			return c > 0 // newest first
+		}
+		return distinct[i] < distinct[j] // stable tie-break for equal versions
 	})
-	keep := make(map[string]struct{}, n)
-	for i := 0; i < len(versions) && i < n; i++ {
-		keep[versions[i]] = struct{}{}
+	keep := make(map[string]struct{}, len(distinct))
+	classes := 0
+	for i, v := range distinct {
+		if i > 0 && debversion.Compare(distinct[i-1], v) != 0 {
+			classes++ // crossed into a new Debian-equivalence class
+		}
+		if classes >= n {
+			break
+		}
+		keep[v] = struct{}{}
 	}
 	return keep
 }

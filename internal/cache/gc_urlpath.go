@@ -4,9 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"sort"
-
-	"github.com/linsomniac/apt-cacher-ultra/internal/debversion"
 )
 
 // URLPathGCBatchResult reports one cursor-paged url_path GC batch
@@ -220,11 +217,19 @@ SELECT
 		return false, nil
 	}
 
+	// Scope to CURRENT snapshots only (the active published index per suite),
+	// matching the legacy guard (a). Displaced/forensic snapshots must not
+	// vouch a .deb or contribute versions to the newest-N ranking: a
+	// displaced snapshot listing a version absent from the live index could
+	// otherwise reap a still-published version, or keep a withdrawn one.
+	// Just-superseded versions that leave the current index are covered by
+	// the hold-grace window, not by displaced-snapshot membership.
 	mrows, err := tx.QueryContext(ctx, `
 SELECT ss.suite_path, ph.package_name, ph.architecture, ph.version
   FROM package_hash ph
   JOIN suite_snapshot ss ON ss.snapshot_id = ph.snapshot_id
- WHERE ph.canonical_scheme = ? AND ph.canonical_host = ? AND ph.path = ? AND ph.declared_sha256 = ?`,
+ WHERE ph.canonical_scheme = ? AND ph.canonical_host = ? AND ph.path = ? AND ph.declared_sha256 = ?
+   AND ph.snapshot_id IN (SELECT current_snapshot_id FROM suite_freshness WHERE current_snapshot_id IS NOT NULL)`,
 		scheme, host, path, blobHash.String)
 	if err != nil {
 		return false, fmt.Errorf("urlPathRetainedTx: mirror match: %w", err)
@@ -246,9 +251,10 @@ SELECT ss.suite_path, ph.package_name, ph.architecture, ph.version
 	_ = mrows.Close()
 
 	for _, m := range matches {
-		// Empty-version fallback: a matching held package_hash row with no
-		// version is a non-binary artifact (Sources/pdiff/Contents) — keep
-		// it via the legacy snapshot-reference guard.
+		// Empty-version fallback: a matching current-snapshot package_hash row
+		// with no version is a non-binary artifact (Sources/pdiff/Contents) or
+		// a pre-v6 row — keep it via the legacy snapshot-reference guard (the
+		// proven-safe pre-version behavior).
 		if m.version == "" {
 			return true, nil
 		}
@@ -265,9 +271,11 @@ SELECT ss.suite_path, ph.package_name, ph.architecture, ph.version
 	return false, nil
 }
 
-// topNVersionSetTx returns the set of the newest maxVersions distinct
-// Debian versions of (scheme, host, suite, name, arch) across all held
-// snapshots, memoized per batch via topNCache.
+// topNVersionSetTx returns the set of raw version strings in the newest
+// maxVersions Debian-version equivalence classes of (scheme, host, suite,
+// name, arch) within the CURRENT snapshots, memoized per batch via topNCache.
+// Current-snapshot scope (not all held snapshots) keeps the ranking anchored
+// to what the live index publishes — see the mirror-match comment above.
 func (c *Cache) topNVersionSetTx(ctx context.Context, tx *sql.Tx,
 	scheme, host, suite, name, arch string, maxVersions int,
 	topNCache map[topNKey]map[string]struct{}) (map[string]struct{}, error) {
@@ -280,7 +288,8 @@ SELECT DISTINCT ph.version
   FROM package_hash ph
   JOIN suite_snapshot ss ON ss.snapshot_id = ph.snapshot_id
  WHERE ss.canonical_scheme = ? AND ss.canonical_host = ? AND ss.suite_path = ?
-   AND ph.package_name = ? AND ph.architecture = ? AND ph.version <> ''`,
+   AND ph.package_name = ? AND ph.architecture = ? AND ph.version <> ''
+   AND ph.snapshot_id IN (SELECT current_snapshot_id FROM suite_freshness WHERE current_snapshot_id IS NOT NULL)`,
 		scheme, host, suite, name, arch)
 	if err != nil {
 		return nil, fmt.Errorf("topNVersionSetTx: %w", err)
@@ -300,13 +309,7 @@ SELECT DISTINCT ph.version
 	}
 	_ = vrows.Close()
 
-	sort.Slice(versions, func(i, j int) bool {
-		return debversion.Compare(versions[i], versions[j]) > 0 // newest first
-	})
-	set := make(map[string]struct{}, maxVersions)
-	for i := 0; i < len(versions) && i < maxVersions; i++ {
-		set[versions[i]] = struct{}{}
-	}
+	set := keepNewestNVersionSet(versions, maxVersions)
 	topNCache[k] = set
 	return set, nil
 }

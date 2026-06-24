@@ -45,15 +45,27 @@ SELECT declared_sha256, version FROM package_hash
 			return fmt.Errorf("insertPackageHashTx: %q already declares %s, reconcile has %s",
 				ph.Path, existing.sha256, ph.DeclaredSHA256)
 		}
-		// Version-aware retention: a same-path/same-hash row whose version
-		// disagrees is still a real cross-index disagreement (the mirror
-		// rule ranks on version), so it is loud like the hash case — not a
-		// silent no-op.
-		if existing.version != ph.Version {
+		// Version-aware retention: an existing row with version='' is a pre-v6
+		// (un-backfilled) row OR a non-binary artifact — NOT a conflict. Heal
+		// it in place when reconcile carries a real version, so the documented
+		// POST /reconcile recovery still works on v6-upgraded caches (where
+		// every pre-existing row defaults to version=''). Only a same-hash row
+		// whose BOTH versions are non-empty and differ is a real cross-index
+		// disagreement and stays loud (mirrors the H7 hash rule).
+		if existing.version == "" && ph.Version != "" {
+			if _, err := tx.ExecContext(ctx, `
+UPDATE package_hash SET version = ?
+ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`,
+				ph.Version, ph.CanonicalScheme, ph.CanonicalHost, ph.Path, ph.SnapshotID); err != nil {
+				return fmt.Errorf("insertPackageHashTx: heal version %q: %w", ph.Path, err)
+			}
+			return nil
+		}
+		if existing.version != "" && ph.Version != "" && existing.version != ph.Version {
 			return fmt.Errorf("insertPackageHashTx: %q already declares version %q, reconcile has %q",
 				ph.Path, existing.version, ph.Version)
 		}
-		return nil // byte-identical — idempotent no-op
+		return nil // byte-identical (or incoming version unknown) — idempotent no-op
 	case errors.Is(err, sql.ErrNoRows):
 		// not present — insert below
 	default:
