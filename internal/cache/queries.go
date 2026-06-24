@@ -942,20 +942,29 @@ SELECT DISTINCT ph.package_name, ph.architecture
 	return out, nil
 }
 
+// defaultMaxVersionsPerPackage is the retention/prefetch newest-N default
+// (config Retention.MaxVersionsPerPackage default, Validate()-enforced >= 1).
+// Every clamp of an unset/invalid N in the cache package resolves to this one
+// value so the two consumers of keepNewestNVersionSet (bounded prefetch and
+// the url_path GC mirror rule) can never disagree on N — matching the
+// gc.go / freshness NewAdopter fallbacks (also 3).
+const defaultMaxVersionsPerPackage = 3
+
 // keepNewestNVersionSet returns the set of raw version strings belonging to
 // the newest n Debian-version EQUIVALENCE CLASSES among the input. dpkg
 // considers some textually-distinct strings equal (e.g. "1.0" == "1.0-0" ==
 // "1.00"); those must share a single slot of n and BOTH be retained — not
 // consume two slots, and not have one arbitrarily reaped while the other is
 // kept. Sorting is deterministic (Debian order, then raw-string tie-break)
-// so the boundary selection is stable across runs. n < 1 is clamped to 1 so
-// the caller never accidentally keeps/warms nothing.
+// so the boundary selection is stable across runs. n < 1 is clamped to the
+// shared default so the caller never accidentally keeps/warms nothing and the
+// floor agrees with every other clamp site.
 //
 // Shared by ComputeHotSet (bounded prefetch) and the url_path GC mirror rule
 // so prefetch and retention agree on exactly which versions are "kept".
 func keepNewestNVersionSet(versions []string, n int) map[string]struct{} {
 	if n < 1 {
-		n = 1
+		n = defaultMaxVersionsPerPackage
 	}
 	seen := make(map[string]struct{}, len(versions))
 	distinct := make([]string, 0, len(versions))

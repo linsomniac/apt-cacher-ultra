@@ -387,7 +387,12 @@ VALUES (?, ?, ?, ?, ?, 0, NULL, 0, ?, NULL, NULL)
 ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
   blob_hash       = excluded.blob_hash,
   upstream_url    = excluded.upstream_url,
-  last_fetched_at = excluded.last_fetched_at`,
+  last_fetched_at = excluded.last_fetched_at,
+  -- Re-warming re-establishes the row with a fresh blob; clear any
+  -- hold-grace drop stamp so it isn't reaped at a stale pre-re-warm
+  -- deadline (matches PutURLPath/TouchURLPath). last_requested_at /
+  -- request_count are still intentionally omitted to preserve hotness.
+  dropped_at      = NULL`,
 				up.CanonicalScheme, up.CanonicalHost, up.Path,
 				up.BlobHash, up.UpstreamURL, now); err != nil {
 				return fmt.Errorf("CommitAdoption: prefetched url_path %q: %w", up.Path, err)
@@ -427,7 +432,8 @@ UPDATE suite_snapshot SET package_coverage_complete = ?
 		//
 		// AIDEV-NOTE: ON CONFLICT preserves the existing (port-correct)
 		// upstream_url, last_requested_at, and request_count — only
-		// blob_hash / is_metadata / last_fetched_at are (re)written.
+		// blob_hash / is_metadata / last_fetched_at are (re)written, plus
+		// dropped_at cleared to NULL (re-establish-clears-hold invariant).
 		// Mirrors Step 3a's hotness-preservation rationale. The INSERT
 		// branch (anchor was already reaped) reconstructs upstream_url as
 		// scheme://host+path, which is port-less (SPEC §3.2) — acceptable
@@ -453,7 +459,12 @@ VALUES (?, ?, ?, ?, ?, 1, NULL, 0, ?, NULL, NULL)
 ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
   blob_hash       = excluded.blob_hash,
   is_metadata     = 1,
-  last_fetched_at = excluded.last_fetched_at`,
+  last_fetched_at = excluded.last_fetched_at,
+  -- Re-synced anchor points at fresh bytes; clear any drop stamp so the
+  -- invariant "re-establishing a row clears hold-grace" holds at every
+  -- url_path upsert site (the metadata guards already protect anchors,
+  -- so this is defense-in-depth, not the primary keep).
+  dropped_at      = NULL`,
 				scheme, host, anchorPath, h.String,
 				scheme+"://"+host+anchorPath, now)
 			return err

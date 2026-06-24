@@ -379,12 +379,16 @@ func TestRunURLPathGCBatch_EmptyVersionFallbackProtects(t *testing.T) {
 	}
 }
 
-// TestRunURLPathGCBatch_EmptyVersionBinaryIsReaped: the empty-version
-// fallback is NARROW — only architecture="source" artifacts get it. A
-// version-less BINARY .deb (malformed/odd stanza, arch=amd64) must NOT be
-// unconditionally kept, or a fat version-less index would reopen the leak.
-// It falls through the mirror loop (no rankable version) and is reaped.
-func TestRunURLPathGCBatch_EmptyVersionBinaryIsReaped(t *testing.T) {
+// TestRunURLPathGCBatch_EmptyVersionBinaryKept: per design §6 and the
+// "Empty-version rows" rule, a version-less row of ANY kind — source, pdiff,
+// Contents, OR a pre-v6 / malformed binary .deb (arch=amd64, version='') —
+// that a CURRENT snapshot vouches is KEPT via the snapshot-reference guard. It
+// has no Debian version to rank, so the newest-N cap cannot apply. The
+// pre-migration 25 GB is reclaimed operationally (wipe, or re-adoption that
+// backfills version), NOT by GC reaping version-less binaries; reaping them
+// here would mass-evict still-published binaries during the migration window
+// (round-4 finding). The gate is the package_hash.version, not the path suffix.
+func TestRunURLPathGCBatch_EmptyVersionBinaryKept(t *testing.T) {
 	c := openCache(t)
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
@@ -399,15 +403,55 @@ func TestRunURLPathGCBatch_EmptyVersionBinaryIsReaped(t *testing.T) {
 	seedPackageHash(t, c, scheme, host, path, h, snapID, "bad", "amd64", "") // binary, empty version
 
 	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
-	if agg.Deleted != 1 {
-		t.Errorf("deleted = %d, want 1 (version-less binary row is not fallback-kept)", agg.Deleted)
+	if agg.Deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (version-less binary kept via snapshot-reference guard; reclaimed operationally)", agg.Deleted)
+	}
+}
+
+// TestRunURLPathGCBatch_DdebVersionCapped: a .ddeb debug-symbol package is a
+// versioned binary and MUST be subject to the newest-N version cap, exactly
+// like .deb/.udeb. dbgsym repos (ddebs.ubuntu.com) are the most extreme
+// fat-index class, so the cap MUST key on package_hash.version, not the path
+// suffix — a path-suffix gate that excluded .ddeb would immortalize every
+// version and reopen the disk leak (round-4 finding).
+func TestRunURLPathGCBatch_DdebVersionCapped(t *testing.T) {
+	c := openCache(t)
+	const now = int64(2_000_000_000)
+	defer stubNow(t, now)()
+
+	scheme, host, suite := "http", "ddebs.ubuntu.test", "/ubuntu/dists/noble"
+	ir := seedBlob(t, c, "ddeb inrelease")
+	snapID := seedCurrentSnapshot(t, c, scheme, host, suite, ir, now)
+
+	versions := []string{"1.0", "2.0", "3.0"}
+	pathFor := map[string]string{}
+	for _, v := range versions {
+		p := "/ubuntu/pool/main/f/foo/foo-dbgsym_" + v + "_amd64.ddeb"
+		pathFor[v] = p
+		blob := seedBlob(t, c, "foo-dbgsym "+v)
+		putURLPathRow(t, c, scheme, host, p, blob, sql.NullInt64{}, false)
+		seedPackageHash(t, c, scheme, host, p, blob, snapID, "foo-dbgsym", "amd64", v)
+	}
+
+	agg := drainURLPathGC(t, c, 100, 7*86400, 0, 1) // cap = newest 1
+	if agg.Deleted != 2 {
+		t.Fatalf("deleted = %d, want 2 (.ddeb subject to version cap; older 1.0,2.0 reaped)", agg.Deleted)
+	}
+	if !urlPathExists(t, c, pathFor["3.0"]) {
+		t.Error("newest .ddeb 3.0 was reaped but must be kept")
+	}
+	for _, v := range []string{"1.0", "2.0"} {
+		if urlPathExists(t, c, pathFor[v]) {
+			t.Errorf("old .ddeb %s survived but must be reaped (cap bypassed)", v)
+		}
 	}
 }
 
 // TestRunURLPathGCBatch_BinaryPdiffPatchKept: a binary-arch pdiff patch
-// file (non-.deb path, arch="amd64", version=”) referenced by the current
-// snapshot is kept via the non-binary-package fallback — same as a
-// source-arch one — because the fallback is gated on the path, not the arch.
+// file (arch="amd64", version='') referenced by the current snapshot is kept
+// via the empty-version snapshot-reference fallback — same as a source-arch
+// one — because the fallback is gated on the empty version, not the path or
+// arch. A versioned binary in the same path tree would instead hit the cap.
 func TestRunURLPathGCBatch_BinaryPdiffPatchKept(t *testing.T) {
 	c := openCache(t)
 	const now = int64(2_000_000_000)
@@ -425,7 +469,7 @@ func TestRunURLPathGCBatch_BinaryPdiffPatchKept(t *testing.T) {
 
 	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
 	if agg.Deleted != 0 {
-		t.Errorf("deleted = %d, want 0 (binary-arch pdiff patch kept via non-.deb fallback)", agg.Deleted)
+		t.Errorf("deleted = %d, want 0 (binary-arch pdiff patch kept via empty-version fallback)", agg.Deleted)
 	}
 }
 
@@ -451,6 +495,52 @@ func TestTouchURLPath_ClearsDroppedAt(t *testing.T) {
 	}
 	if urlPathDroppedAt(t, c, "/p/touch.deb") != -1 {
 		t.Error("TouchURLPath must clear dropped_at to NULL on a client request")
+	}
+}
+
+// TestCommitAdoption_PrefetchUpsertClearsDroppedAt: re-warming a hot .deb via
+// adoption (Step 3a url_path upsert) must clear any hold-grace drop stamp, the
+// same invariant PutURLPath/TouchURLPath enforce. Otherwise a re-warmed blob
+// keeps its stale pre-re-warm deadline; because the in-grace fast-path skips
+// re-evaluating still-stamped rows, the row can be reaped at the OLD deadline
+// before the operator-configured hold window elapses (round-4 finding).
+func TestCommitAdoption_PrefetchUpsertClearsDroppedAt(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, 1_700_000_000)()
+
+	const host = "archive.test"
+	const suite = "/ubuntu/dists/noble"
+	const path = "/ubuntu/pool/main/d/docker-ce/docker-ce_1.0_amd64.deb"
+
+	stale := seedBlob(t, c, "stale prewarm blob")
+	rewarmed := seedBlob(t, c, "rewarmed blob")
+	ir := seedBlob(t, c, "adopted inrelease")
+
+	// Pre-existing .deb row carrying a hold-grace drop deadline.
+	putURLPathRow(t, c, "http", host, path, stale, sql.NullInt64{}, false)
+	if _, err := c.db.Exec(`UPDATE url_path SET dropped_at = ? WHERE path = ?`,
+		int64(1_699_000_000), path); err != nil {
+		t.Fatalf("seed dropped_at: %v", err)
+	}
+
+	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
+		InReleaseHash: &ir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id, nil, nil, nil,
+		[]PrefetchedURLPath{{
+			CanonicalScheme: "http", CanonicalHost: host, Path: path,
+			BlobHash: rewarmed, UpstreamURL: "http://" + host + path,
+		}}, false); err != nil {
+		t.Fatalf("CommitAdoption: %v", err)
+	}
+
+	if got := urlPathDroppedAt(t, c, path); got != -1 {
+		t.Errorf("dropped_at = %d, want -1 (NULL) after adoption re-warm", got)
 	}
 }
 

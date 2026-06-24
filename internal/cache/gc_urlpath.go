@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 )
 
 // URLPathGCBatchResult reports one cursor-paged url_path GC batch
@@ -67,7 +66,11 @@ func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds
 		return URLPathGCBatchResult{}, fmt.Errorf("RunURLPathGCBatch: ttlSeconds must be > 0, got %d", ttlSeconds)
 	}
 	if maxVersions < 1 {
-		maxVersions = 1
+		// Resolve unset/invalid N to the shared default (3), agreeing with
+		// gc.go, freshness NewAdopter, and keepNewestNVersionSet — never the
+		// old floor-of-1, which would over-reap two extra still-published
+		// versions per package if a caller reached here unset.
+		maxVersions = defaultMaxVersionsPerPackage
 	}
 	now := nowUnix()
 	ttlCutoff := now - ttlSeconds
@@ -190,14 +193,6 @@ type topNKey struct {
 	scheme, host, suite, name, arch string
 }
 
-// isBinaryPackagePath reports whether path is a binary package (.deb/.udeb),
-// which is subject to the newest-N version cap. Everything else recorded in
-// package_hash (source artifacts, pdiff patch files, Contents) has no Debian
-// binary version and keeps the current-snapshot reference guard.
-func isBinaryPackagePath(path string) bool {
-	return strings.HasSuffix(path, ".deb") || strings.HasSuffix(path, ".udeb")
-}
-
 // urlPathRetainedTx reports whether a url_path row is retained by the
 // three-rule union plus the unchanged metadata-anchor / snapshot_member
 // guards. It runs inside the writer tx so its verdict is consistent with
@@ -209,12 +204,15 @@ func isBinaryPackagePath(path string) bool {
 //  1. recency (last_requested within TTL) — keeps actively-pulled versions;
 //  2. metadata guards b/c/d (current-snapshot scoped) — MUST stay to avoid
 //     the freshness-freeze trap; never reap an InRelease/Release anchor;
-//  3. non-binary-package fallback (path not .deb/.udeb — source artifacts,
-//     pdiff patch files, Contents — vouched by a current snapshot) keeps
-//     the legacy guard (a); a version-less BINARY .deb falls through and is
-//     reaped, so a fat version-less index can't reopen the leak;
-//  4. mirror: newest-N distinct versions per (suite,name,arch) in the
-//     CURRENT snapshot only — displaced snapshots must not vouch a .deb.
+//  3. empty-version fallback (any current-snapshot match lacks a rankable
+//     Debian version — source artifacts, pdiff patch files, Contents, OR a
+//     pre-v6/malformed binary stanza) keeps the legacy snapshot-reference
+//     guard (a). Gated on package_hash.version, NOT the path suffix: the
+//     pre-migration 25 GB is reclaimed operationally (design §6), never by GC
+//     reaping a still-published version-less binary;
+//  4. mirror: newest-N distinct versions per (suite,name,arch) in the CURRENT
+//     snapshot only — applies to every versioned binary (.deb/.udeb/.ddeb);
+//     displaced snapshots must not vouch a package.
 //
 // Anything failing all of these is reapable (subject to the dropped_at
 // hold-grace in the caller). Changing any clause risks either re-opening the
@@ -297,29 +295,33 @@ SELECT ss.suite_path, ph.package_name, ph.architecture, ph.version
 	}
 	_ = mrows.Close()
 
-	// Non-binary-package fallback: source artifacts (.dsc/tarballs, arch
-	// "source") and metadata patch files (pdiff Packages.diff/*.gz, which
-	// buildPdiffHashes records in package_hash with the Index's arch and no
-	// version) have no Debian binary version to rank. If the url_path is for
-	// such a path and a CURRENT snapshot vouches it, keep it via the legacy
-	// snapshot-reference guard (a). Gated on the PATH, not architecture, so a
-	// binary-arch pdiff patch (arch="amd64", version="") is kept the same as
-	// its source-arch twin — only real .deb/.udeb packages are subject to the
-	// version cap. A version-less BINARY .deb (malformed stanza / pre-v6 row)
-	// is NOT kept here: it falls through to the mirror loop, matches no top-N
-	// set, and is reaped (re-fetched on demand, still vouched by package_hash
-	// under strict mode) so a fat version-less index can't reopen the leak.
-	if !isBinaryPackagePath(path) && len(matches) > 0 {
-		return true, nil
-	}
+	// Rule 3: empty-version fallback (design §"Empty-version rows" + §6).
+	// A current-snapshot match with an incomplete (name, arch, version)
+	// identity has no Debian binary version to rank: source artifacts
+	// (.dsc/tarballs, arch="source"), pdiff patch files (Packages.diff/*.gz,
+	// which buildPdiffHashes records with the Index's arch and version=""),
+	// Contents, OR a pre-v6/malformed binary stanza (a fat-index repo carries
+	// a real Version: in every stanza, so version="" on a .deb means it has
+	// not been re-adopted under v6 yet — never that the live index is fat-but-
+	// versionless). Keep it via the legacy snapshot-reference guard while a
+	// CURRENT snapshot vouches it. The gate is the VERSION, not the path
+	// suffix: a versioned .ddeb debug package still hits the cap below (so
+	// dbgsym fat indexes are bounded), and the pre-migration 25 GB of
+	// version-less binaries is reclaimed OPERATIONALLY (wipe / re-adoption
+	// that backfills version), never by GC reaping a still-published binary —
+	// doing so would mass-evict live packages during the migration window.
+	// (A single blob is one package file, so all matches share one
+	// (name, arch, version); "any incomplete" therefore means "all
+	// incomplete", and keeping on the incomplete case is the safe choice.)
 	for _, m := range matches {
-		// Only rank rows with a complete (name, arch, version) identity.
-		// Empty identity columns (odd/old rows) cannot be meaningfully
-		// ranked and must not group together under ("", "") — that would
-		// let unrelated packages evict each other from newest-N.
 		if m.name == "" || m.arch == "" || m.version == "" {
-			continue
+			return true, nil
 		}
+	}
+	// Rule 4: mirror. All matches are rankable versioned binaries
+	// (.deb/.udeb/.ddeb alike). Keep iff some match's version is in the
+	// newest-N set for its (suite, name, arch) group within current snapshots.
+	for _, m := range matches {
 		set, err := c.topNVersionSetTx(ctx, tx, scheme, host, m.suite, m.name, m.arch, maxVersions, topNCache)
 		if err != nil {
 			return false, err
