@@ -97,6 +97,18 @@ func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds
 		// returned. Stamped rows are still returned (so a re-qualified one is
 		// cleared and an expired one is reaped); the in-grace fast-path below
 		// handles stamped-but-in-grace rows cheaply.
+		//
+		// AIDEV-NOTE: mirror-retained rows (kept-version .debs not recently
+		// requested, e.g. prefetched fat-index versions) are NOT excluded by
+		// this prefilter, so each is re-evaluated every pass even though its
+		// verdict is stable. This is a deliberate, bounded cost: the heavy
+		// part (newest-N ranking) is memoized once per pass via URLPathGCMemo,
+		// and the cursor + per-tick deadline cap the work per tick and resume
+		// next tick. Widening the prefilter to also drop provably-kept rows was
+		// considered and rejected — it would have to reproduce the rule-2/3/4
+		// retention logic in SQL (the NULL-last_requested and current-snapshot
+		// edge cases are exactly where past regressions hid), trading a real
+		// correctness risk for a latency win the memo already largely captures.
 		rows, err := tx.QueryContext(ctx, `
 SELECT canonical_scheme, canonical_host, path, blob_hash, last_requested_at, dropped_at
   FROM url_path
