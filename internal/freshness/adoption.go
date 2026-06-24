@@ -2074,15 +2074,31 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 	}
 
 	rows := make([]cache.PackageHash, 0, len(dedup))
+	skippedVersionless := 0
 	for debPath, decl := range dedup {
-		// Carry Version into package_hash. The §3 retention mirror rule caps
-		// non-empty-version rows to newest-N; a stanza that omitted Version:
-		// (a malformed/odd index — rare, since Version is mandatory) rides
-		// along with version='' and is retained by the current-snapshot
-		// guard-a fallback exactly as in the pre-version behavior. We
-		// deliberately do NOT skip such a row or flip coverage: one odd
-		// stanza must not downgrade the whole suite's strict-mode posture or
-		// evict its still-valid blob.
+		// Binary non-empty-version invariant (design §1, load-bearing): a
+		// binary stanza with no Version: is a malformed index entry (Debian
+		// Policy makes Version mandatory; apt itself rejects such stanzas).
+		// SKIP it — never write a version='' binary package_hash row —
+		// because the §3 GC empty-version fallback KEEPS version-less rows
+		// (legitimate source/pdiff/Contents artifacts and pre-migration
+		// leftovers). Writing a FRESH version-less binary would let it ride
+		// that fallback forever and re-open the fat-index leak. Skipping
+		// guarantees "version='' => non-binary" for every post-v6 row, which
+		// is exactly what the fallback relies on.
+		//
+		// AIDEV-NOTE: the skip is NON-PUNITIVE by deliberate decision
+		// (round-5): it does NOT flip the snapshot's coverage_complete, so
+		// one malformed stanza cannot downgrade strict mode for the whole
+		// suite (coverage=false relaxes strict mode suite-wide — the harm the
+		// round-1 review flagged). The lone malformed .deb is left unvouched:
+		// reapable by GC and fail-closed under strict mode, which is safe
+		// because it is apt-unusable anyway. Reverses the round-1 ride-along;
+		// keep in lockstep with the §3 url_path GC empty-version fallback.
+		if decl.version == "" {
+			skippedVersionless++
+			continue
+		}
 		rows = append(rows, cache.PackageHash{
 			CanonicalScheme: suite.CanonicalScheme,
 			CanonicalHost:   suite.CanonicalHost,
@@ -2093,6 +2109,17 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 			Architecture:    decl.architecture,
 			Version:         decl.version,
 		})
+	}
+	if skippedVersionless > 0 {
+		// Observability only — coverage is intentionally NOT downgraded here
+		// (see the AIDEV-NOTE above). Lets operators spot a malformed upstream
+		// index without it silently degrading the suite's strict-mode posture.
+		a.logger.Info("package_hash_versionless_binary_skipped",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID,
+			"skipped_rows", skippedVersionless,
+		)
 	}
 
 	// SPEC3 §7.5.4: coverage_complete classification.

@@ -388,13 +388,17 @@ func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 	}
 }
 
-// TestBuildPackageHashes_VersionlessStanzaKeptCoverageIntact: a binary
-// Packages stanza without Version: (rare/odd index) must still produce a
-// package_hash row (version=”) and must NOT downgrade the snapshot's
-// coverage — one odd stanza can't degrade the whole suite's strict-mode
-// posture or evict its still-valid blob. The version=” row is retained by
-// the §3 current-snapshot guard-a fallback (the proven pre-version behavior).
-func TestBuildPackageHashes_VersionlessStanzaKeptCoverageIntact(t *testing.T) {
+// TestBuildPackageHashes_VersionlessBinaryStanzaSkippedCoverageIntact: a
+// binary Packages stanza without Version: is a malformed index entry (Debian
+// Policy makes Version mandatory; apt itself rejects such stanzas). It is
+// SKIPPED — no package_hash row is written — so the load-bearing invariant
+// "version='' => non-binary" holds and the round-4 GC empty-version fallback
+// can never keep a FRESH version-less binary (which would re-open the
+// fat-index leak). The skip is NON-PUNITIVE: it does NOT flip the snapshot's
+// coverage, so one malformed stanza can't downgrade strict mode for the whole
+// suite. The lone malformed .deb is simply left unvouched (apt-unusable
+// anyway). User decision (round-5); reverses the round-1 ride-along.
+func TestBuildPackageHashes_VersionlessBinaryStanzaSkippedCoverageIntact(t *testing.T) {
 	dir := t.TempDir()
 	c, err := cache.Open(context.Background(), dir, nil)
 	if err != nil {
@@ -421,18 +425,18 @@ func TestBuildPackageHashes_VersionlessStanzaKeptCoverageIntact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildPackageHashes: %v", err)
 	}
-	if len(res.rows) != 2 {
-		t.Fatalf("got %d rows, want 2 (versionless stanza kept, not skipped)", len(res.rows))
+	if len(res.rows) != 1 {
+		t.Fatalf("got %d rows, want 1 (versionless binary stanza skipped, not written)", len(res.rows))
 	}
 	byVer := map[string]bool{}
 	for _, r := range res.rows {
 		byVer[r.Version] = true
 	}
-	if !byVer["1.0"] || !byVer[""] {
-		t.Errorf("expected rows with version 1.0 and '' (kept), got versions %v", byVer)
+	if !byVer["1.0"] || byVer[""] {
+		t.Errorf("expected only version 1.0 (versionless binary skipped), got versions %v", byVer)
 	}
 	if !res.coverageComplete {
-		t.Error("coverageComplete = false, want true (a single versionless stanza must not flip coverage)")
+		t.Error("coverageComplete = false, want true (skipping a malformed stanza must NOT flip whole-suite coverage)")
 	}
 }
 
