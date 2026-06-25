@@ -18,7 +18,8 @@ available from the cache at all times.
 
 ## Status
 
-2026/06/25:
+2026/06/25:  I'd like to let this run another couple weeks before cutting
+a 1.0.0.
 
 I've released 0.10.4 — the second Release Candidate of 1.0.0. This RC fixes
 unbounded cache growth on "fat" repositories: repos whose indices list many
