@@ -18,7 +18,15 @@ available from the cache at all times.
 
 ## Status
 
-I've released 0.10.3, which I'm thinking of as the first Release Candidate of 1.0.0.
+2026/06/25:
+
+I've released 0.10.4 — the second Release Candidate of 1.0.0. This RC fixes
+unbounded cache growth on "fat" repositories: repos whose indices list many
+historical versions of each package (e.g. Docker, Elastic) used to have every
+version prefetched and retained, so the cache grew without bound. Retention is
+now version-aware — only the newest `retention.max_versions_per_package`
+versions (default 3) per package/arch/suite are kept and warmed.
+
 This service has been running in my 4 environments and has served tens of thousands
 of "apt update", "apt upgrade" and "apt install" sessions.
 
