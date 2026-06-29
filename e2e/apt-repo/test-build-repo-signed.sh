@@ -13,7 +13,7 @@ export GNUPGHOME="$work/gnupg"; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
 trap 'rm -rf "$work"' EXIT
 debs="$work/debs"; out="$work/site"; mkdir -p "$debs"
 
-d="$(mktemp -d)"; mkdir -p "$d/DEBIAN"
+d="$(mktemp -d -p "$work")"; mkdir -p "$d/DEBIAN"
 cat > "$d/DEBIAN/control" <<EOF
 Package: apt-cacher-ultra
 Version: 0.10.4
@@ -36,6 +36,9 @@ head -1 "$inrel" | grep -q 'BEGIN PGP SIGNED MESSAGE' \
                                        || { echo "FAIL: InRelease not clearsigned"; exit 1; }
 test -f "$out/dists/stable/Release.gpg" || { echo "FAIL: no Release.gpg"; exit 1; }
 test -f "$out/apt-cacher-ultra.gpg"     || { echo "FAIL: no exported public key"; exit 1; }
+if head -c 64 "$out/apt-cacher-ultra.gpg" | grep -q 'BEGIN PGP'; then
+    echo "FAIL: exported public key is ASCII-armored, expected binary"; exit 1
+fi
 gpg --verify "$inrel" >/dev/null 2>&1   || { echo "FAIL: InRelease signature does not verify"; exit 1; }
 grep -q "$fpr" "$out/index.html"        || { echo "FAIL: index.html missing fingerprint"; exit 1; }
 
