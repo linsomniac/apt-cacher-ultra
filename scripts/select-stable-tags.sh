@@ -12,7 +12,7 @@ set -euo pipefail
 
 n="${1:?usage: select-stable-tags.sh <N> (JSON on stdin)}"
 case "$n" in
-    ''|*[!0-9]*) echo "select-stable-tags.sh: N must be a positive integer, got '$n'" >&2; exit 2 ;;
+    *[!0-9]*) echo "select-stable-tags.sh: N must be a positive integer, got '$n'" >&2; exit 2 ;;
 esac
 
 # Drop drafts and prereleases, emit bare tag names. `sort -V` orders

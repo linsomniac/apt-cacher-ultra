@@ -18,9 +18,8 @@ fi
 n_all="$(scripts/select-stable-tags.sh 10 < "$fixture" | grep -c .)"
 [ "$n_all" = "6" ] || { echo "FAIL fewer-than-N: expected 6, got $n_all"; exit 1; }
 
-# Non-integer N is rejected.
-if scripts/select-stable-tags.sh abc < "$fixture" >/dev/null 2>&1; then
-    echo "FAIL: non-integer N should exit non-zero"; exit 1
-fi
+# Non-integer N is rejected with the documented exit code 2.
+scripts/select-stable-tags.sh abc < "$fixture" >/dev/null 2>&1 || rc=$?
+[ "${rc:-0}" = "2" ] || { echo "FAIL: non-integer N should exit 2, got ${rc:-0}"; exit 1; }
 
 echo "PASS test-select-tags"
