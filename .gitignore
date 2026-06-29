@@ -6,3 +6,6 @@
 *.deb
 .codex/
 .phase-loop-notes.md
+/site/
+/debs/
+/tags.txt
