@@ -58,6 +58,23 @@ request-path callers.
 
 ## Quickstart
 
+### Install from the apt repository (recommended):
+
+```sh
+sudo install -d -m0755 /etc/apt/keyrings
+curl -fsSL https://linsomniac.github.io/apt-cacher-ultra/apt-cacher-ultra.gpg \
+  | sudo tee /etc/apt/keyrings/apt-cacher-ultra.gpg >/dev/null
+echo 'deb [signed-by=/etc/apt/keyrings/apt-cacher-ultra.gpg] https://linsomniac.github.io/apt-cacher-ultra/ stable main' \
+  | sudo tee /etc/apt/sources.list.d/apt-cacher-ultra.list
+sudo apt-get update
+sudo apt-get install apt-cacher-ultra
+#  EDIT: /etc/apt-cacher-ultra/config.toml
+sudo systemctl enable --now apt-cacher-ultra
+```
+
+Prebuilt `amd64` packages are published to
+<https://linsomniac.github.io/apt-cacher-ultra/> (newest stable releases).
+
 ### As Deb Package:
 
 ```sh
