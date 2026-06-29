@@ -1,4 +1,4 @@
-.PHONY: build test test-race lint fmt deb e2e deb-test clean
+.PHONY: build test test-race lint fmt deb e2e deb-test apt-repo-test clean
 
 GO        ?= go
 BIN       := apt-cacher-ultra
@@ -46,6 +46,13 @@ e2e:
 # with UBUNTU_VERSIONS for development.
 deb-test:
 	bash e2e/deb/run.sh
+
+# Fast, docker-free unit tests for the apt-repo publishing scripts
+# (scripts/select-stable-tags.sh, scripts/build-apt-repo.sh). The
+# containerized signature/install gate lives in
+# scripts/smoke-test-apt-repo.sh and runs in CI.
+apt-repo-test:
+	bash e2e/apt-repo/test.sh
 
 clean:
 	rm -rf $(BUILD_DIR)

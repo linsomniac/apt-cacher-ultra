@@ -1,0 +1,10 @@
+[
+  {"tagName": "0.10.4", "isDraft": false, "isPrerelease": false},
+  {"tagName": "0.10.4-rc2", "isDraft": false, "isPrerelease": true},
+  {"tagName": "0.9.8", "isDraft": false, "isPrerelease": false},
+  {"tagName": "0.10.1", "isDraft": false, "isPrerelease": false},
+  {"tagName": "0.10.3", "isDraft": false, "isPrerelease": false},
+  {"tagName": "0.10.2", "isDraft": false, "isPrerelease": false},
+  {"tagName": "0.11.0-draft", "isDraft": true, "isPrerelease": false},
+  {"tagName": "0.9.7", "isDraft": false, "isPrerelease": false}
+]
