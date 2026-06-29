@@ -1,0 +1,90 @@
+name: Publish apt repo
+
+# release.yaml creates the GitHub Release with GITHUB_TOKEN, which by
+# design does NOT emit a release:published event (anti-recursion). So we
+# chain off the Release workflow's completion via workflow_run, and also
+# expose a manual button for rebuilds and day-one population. An RC tag
+# also triggers Release (and therefore this) but the rebuild only ever
+# republishes the current stable set, so it is an idempotent no-op.
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read   # gh release list/download
+  pages: write     # deploy-pages
+  id-token: write  # deploy-pages OIDC
+
+# Never run two Pages deploys at once; queue rather than cancel an
+# in-flight publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Skip when the triggering Release run did not succeed. Manual
+    # dispatch always proceeds.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KEEP_VERSIONS: '5'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install apt repo tooling
+        run: sudo apt-get update && sudo apt-get install -y apt-utils gnupg
+
+      - name: Import signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APT_GPG_PRIVATE_KEY:-}" ]; then
+            echo "::error::APT_GPG_PRIVATE_KEY secret is not set"; exit 1
+          fi
+          printf '%s\n' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          fpr="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')"
+          [ -n "$fpr" ] || { echo "::error::no secret key after import"; exit 1; }
+          echo "GPG_FPR=$fpr" >> "$GITHUB_ENV"
+
+      - name: Select newest stable releases and download verified .debs
+        run: |
+          set -euo pipefail
+          gh release list --limit 200 --json tagName,isDraft,isPrerelease \
+            | scripts/select-stable-tags.sh "$KEEP_VERSIONS" > tags.txt
+          if [ ! -s tags.txt ]; then
+            echo "::error::no stable releases found to publish"; exit 1
+          fi
+          echo "Publishing these tags:"; cat tags.txt
+          mkdir -p debs
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            dir="debs/$tag"; mkdir -p "$dir"
+            gh release download "$tag" -D "$dir" -p '*_amd64.deb' -p 'SHA256SUMS'
+            ( cd "$dir" && grep '_amd64\.deb$' SHA256SUMS | sha256sum -c - )
+            cp "$dir"/*_amd64.deb debs/
+          done < tags.txt
+
+      - name: Build signed apt repo
+        run: GPG_SIGN_KEY="$GPG_FPR" scripts/build-apt-repo.sh debs site
+
+      - name: Smoke test (signed install in a clean container)
+        run: scripts/smoke-test-apt-repo.sh site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
