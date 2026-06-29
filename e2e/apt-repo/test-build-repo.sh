@@ -19,7 +19,7 @@ Architecture: amd64
 Maintainer: test <t@example.invalid>
 Description: fixture package
 EOF
-    dpkg-deb --build "$d" "$debs/apt-cacher-ultra_${v}_amd64.deb" >/dev/null
+    dpkg-deb --root-owner-group --build "$d" "$debs/apt-cacher-ultra_${v}_amd64.deb" >/dev/null
     rm -rf "$d"
 }
 make_deb 0.10.3
@@ -35,6 +35,10 @@ test -f "$rel"        || { echo "FAIL: no Release";     exit 1; }
 grep -q '^Suite: stable'        "$rel"  || { echo "FAIL: Release missing 'Suite: stable'"; exit 1; }
 grep -q '^Components: main'      "$rel"  || { echo "FAIL: Release missing 'Components: main'"; exit 1; }
 grep -q '^Architectures: amd64' "$rel"  || { echo "FAIL: Release missing 'Architectures: amd64'"; exit 1; }
+grep -q '^Origin: apt-cacher-ultra'   "$rel" || { echo "FAIL: Release missing Origin"; exit 1; }
+grep -q '^Label: apt-cacher-ultra'    "$rel" || { echo "FAIL: Release missing Label"; exit 1; }
+grep -q '^Codename: stable'           "$rel" || { echo "FAIL: Release missing Codename"; exit 1; }
+grep -q '^Description: apt-cacher-ultra' "$rel" || { echo "FAIL: Release missing Description"; exit 1; }
 grep -q '^Package: apt-cacher-ultra' "$pkgs" || { echo "FAIL: package not indexed"; exit 1; }
 grep -q '^Filename: pool/main/a/apt-cacher-ultra/apt-cacher-ultra_0.10.4_amd64.deb' "$pkgs" \
     || { echo "FAIL: Filename path not repo-root-relative"; exit 1; }

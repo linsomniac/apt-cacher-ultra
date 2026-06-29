@@ -13,6 +13,7 @@ IMAGE="${IMAGE:-debian:stable}"
 
 command -v docker  >/dev/null || { echo "smoke-test: docker not found"  >&2; exit 2; }
 command -v python3 >/dev/null || { echo "smoke-test: python3 not found" >&2; exit 2; }
+command -v curl    >/dev/null || { echo "smoke-test: curl not found"    >&2; exit 2; }
 test -f "$SITE/apt-cacher-ultra.gpg" \
     || { echo "smoke-test: $SITE is unsigned (no apt-cacher-ultra.gpg)" >&2; exit 2; }
 
@@ -23,7 +24,7 @@ trap 'kill "$server" 2>/dev/null || true' EXIT
 # Wait until the InRelease file is actually served.
 ok=0
 for _ in $(seq 1 50); do
-    if curl -fsS "http://localhost:$PORT/dists/stable/InRelease" -o /dev/null 2>/dev/null; then
+    if curl -fs "http://localhost:$PORT/dists/stable/InRelease" -o /dev/null 2>/dev/null; then
         ok=1; break
     fi
     sleep 0.2

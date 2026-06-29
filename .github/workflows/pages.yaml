@@ -71,7 +71,13 @@ jobs:
             [ -n "$tag" ] || continue
             dir="debs/$tag"; mkdir -p "$dir"
             gh release download "$tag" -D "$dir" -p '*_amd64.deb' -p 'SHA256SUMS'
+            if ! ls "$dir"/*_amd64.deb >/dev/null 2>&1; then
+              echo "::error::release $tag has no _amd64.deb asset"; exit 1
+            fi
             ( cd "$dir" && grep '_amd64\.deb$' SHA256SUMS | sha256sum -c - )
+            # AIDEV-NOTE: flat-copy into debs/ is safe because each stable
+            # release's .deb embeds its version in the filename, so distinct
+            # tags cannot collide on name.
             cp "$dir"/*_amd64.deb debs/
           done < tags.txt
 

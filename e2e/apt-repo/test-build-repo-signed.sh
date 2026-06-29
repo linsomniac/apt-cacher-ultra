@@ -21,7 +21,7 @@ Architecture: amd64
 Maintainer: test <t@example.invalid>
 Description: fixture package
 EOF
-dpkg-deb --build "$d" "$debs/apt-cacher-ultra_0.10.4_amd64.deb" >/dev/null; rm -rf "$d"
+dpkg-deb --root-owner-group --build "$d" "$debs/apt-cacher-ultra_0.10.4_amd64.deb" >/dev/null; rm -rf "$d"
 
 gpg --batch --pinentry-mode loopback --passphrase '' \
     --quick-generate-key 'acu test <test@example.invalid>' rsa3072 sign 0

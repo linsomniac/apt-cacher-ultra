@@ -101,4 +101,4 @@ sudo apt-get update && sudo apt-get install apt-cacher-ultra
   final release first.
 - **Smoke test fails:** inspect the failed step's container log; a signature
   error means the imported key and the published key disagree (shouldn't happen
-  since the imported key is derived from the secret) — check the import step.
+  since the pubkey is derived from the secret) — check the import step.

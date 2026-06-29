@@ -64,3 +64,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: bash e2e/deb/run.sh
+
+  # Fast unit tests for the apt-repo publishing scripts
+  # (scripts/select-stable-tags.sh, scripts/build-apt-repo.sh). Docker-free
+  # and self-skipping if tooling is absent; apt-ftparchive comes from
+  # apt-utils (dpkg-deb, gpg, jq are already on the runner).
+  apt-repo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y apt-utils
+      - run: make apt-repo-test

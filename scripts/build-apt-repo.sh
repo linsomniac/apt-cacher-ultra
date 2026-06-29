@@ -35,6 +35,10 @@ command -v apt-ftparchive >/dev/null \
 
 POOL="$OUT/pool/$COMPONENT/a/apt-cacher-ultra"
 BINDIR="$OUT/dists/$SUITE/$COMPONENT/binary-$ARCH"
+# Start from a clean tree so a re-run into a reused out-dir cannot retain
+# stale .debs or a previous InRelease (which would be hashed into the new
+# Release). CI always uses a fresh dir; this protects local re-runs.
+rm -rf "$OUT/pool" "$OUT/dists"
 mkdir -p "$POOL" "$BINDIR"
 
 shopt -s nullglob
