@@ -63,6 +63,25 @@ APT::FTPArchive::Release::Description "$DESCRIPTION";
 EOF
 ( cd "$OUT" && apt-ftparchive -c "$conf" release "dists/$SUITE" > "dists/$SUITE/Release" )
 
-# --- Signing + pubkey + index rendering are added in Task 3 ---
+# Signing (opt-in). The key is a passphraseless secret already imported
+# into the gpg keyring; --passphrase '' + loopback keeps gpg non-interactive.
+FINGERPRINT="UNSIGNED"
+if [ -n "${GPG_SIGN_KEY:-}" ]; then
+    FINGERPRINT="$GPG_SIGN_KEY"
+    gpg --batch --yes --pinentry-mode loopback --passphrase '' \
+        --default-key "$GPG_SIGN_KEY" --clearsign \
+        --output "$OUT/dists/$SUITE/InRelease" "$OUT/dists/$SUITE/Release"
+    gpg --batch --yes --pinentry-mode loopback --passphrase '' \
+        --default-key "$GPG_SIGN_KEY" --detach-sign --armor \
+        --output "$OUT/dists/$SUITE/Release.gpg" "$OUT/dists/$SUITE/Release"
+    # Binary (dearmored) public key for /etc/apt/keyrings/.
+    gpg --batch --yes --output "$OUT/apt-cacher-ultra.gpg" --export "$GPG_SIGN_KEY"
+fi
+
+# Landing page (fingerprint substituted; '|' delimiter avoids clashing
+# with the hex fingerprint).
+if [ -f "$INDEX_TEMPLATE" ]; then
+    sed "s|@FINGERPRINT@|$FINGERPRINT|g" "$INDEX_TEMPLATE" > "$OUT/index.html"
+fi
 
 echo "build-apt-repo.sh: built $SUITE repo with ${#debs[@]} package file(s) at $OUT"

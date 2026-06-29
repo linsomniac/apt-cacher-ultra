@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>apt-cacher-ultra apt repository</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { background: rgba(127,127,127,.12); padding: 1rem; border-radius: 6px; overflow-x: auto; }
+  h1 { margin-bottom: .25rem; }
+  .fpr { word-break: break-all; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<h1>apt-cacher-ultra</h1>
+<p>APT package repository for
+  <a href="https://github.com/linsomniac/apt-cacher-ultra">apt-cacher-ultra</a>
+  — a robust apt cache focused on availability under upstream failure.</p>
+
+<h2>Install</h2>
+<pre><code>sudo install -d -m0755 /etc/apt/keyrings
+curl -fsSL https://linsomniac.github.io/apt-cacher-ultra/apt-cacher-ultra.gpg \
+  | sudo tee /etc/apt/keyrings/apt-cacher-ultra.gpg &gt;/dev/null
+echo 'deb [signed-by=/etc/apt/keyrings/apt-cacher-ultra.gpg] https://linsomniac.github.io/apt-cacher-ultra/ stable main' \
+  | sudo tee /etc/apt/sources.list.d/apt-cacher-ultra.list
+sudo apt-get update
+sudo apt-get install apt-cacher-ultra</code></pre>
+
+<h2>deb822 alternative</h2>
+<p>Save as <code>/etc/apt/sources.list.d/apt-cacher-ultra.sources</code>:</p>
+<pre><code>Types: deb
+URIs: https://linsomniac.github.io/apt-cacher-ultra/
+Suites: stable
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/apt-cacher-ultra.gpg</code></pre>
+
+<h2>Signing key</h2>
+<p class="fpr">This repository is signed by GPG key fingerprint:<br>
+  <code>@FINGERPRINT@</code></p>
+<p>Only <code>amd64</code> is published. The repository keeps the most recent
+  stable releases; prereleases are not published here.</p>
+</body>
+</html>
