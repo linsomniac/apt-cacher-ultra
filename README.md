@@ -54,7 +54,7 @@ request-path callers.
   automatically on the next unchanged freshness check or on demand via `POST /reconcile` (see "Recovering a degraded
   repository").
 - Observability — /metrics endpoint, status page, structured logs (see docs/log-fields.md).
-- Packaging — ships as a .deb with systemd unit, or as standalone go executable.
+- Packaging — install from the [apt repository](https://linsomniac.github.io/apt-cacher-ultra/), the `.deb` with systemd unit, or the standalone Go executable.
 
 ## Quickstart
 
