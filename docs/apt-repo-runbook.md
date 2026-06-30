@@ -67,6 +67,7 @@ gh run watch "$(gh run list --workflow 'Publish apt repo' --limit 1 --json datab
 sudo install -d -m0755 /etc/apt/keyrings
 curl -fsSL https://linsomniac.github.io/apt-cacher-ultra/apt-cacher-ultra.gpg \
   | sudo tee /etc/apt/keyrings/apt-cacher-ultra.gpg >/dev/null
+sudo chmod a+r /etc/apt/keyrings/apt-cacher-ultra.gpg  # apt verifies as the _apt user; the key must be world-readable
 echo 'deb [signed-by=/etc/apt/keyrings/apt-cacher-ultra.gpg] https://linsomniac.github.io/apt-cacher-ultra/ stable main' \
   | sudo tee /etc/apt/sources.list.d/apt-cacher-ultra.list
 sudo apt-get update && sudo apt-get install apt-cacher-ultra
