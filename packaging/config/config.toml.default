@@ -7,12 +7,37 @@ listen_tls  = ""                          # empty disables TLS listener
 tls_cert    = ""
 tls_key     = ""
 
+# Client-facing host (or host:port) emitted by `--print-apt-conf`. Empty =
+# derive it from `listen`. Set this when `listen` binds 0.0.0.0/:: and the
+# generated apt snippet would otherwise point at a non-routable address.
+# Must be a host or host:port (no scheme, no path). The daemon never reads
+# this for request handling — it only affects the printed snippet.
+# (SPEC6 §14.2)
+advertise_host = ""
+
 [upstream]
 connect_timeout         = "30s"
 total_timeout           = "5m"
 idle_read_timeout       = "60s"
 max_retries             = 3
 max_concurrent_per_host = 8
+
+# Fast-fail for hosts whose dial just failed (SPEC §1 "never hang"). After a
+# dial failure, further dials to that host within `unreachable_cooldown` are
+# collapsed to a single short probe with an `unreachable_probe_timeout`
+# deadline, and retries are suppressed if that probe fails — instead of
+# paying the full connect_timeout × max_retries budget on every miss.
+# `unreachable_cooldown = "0s"` disables the fast-fail path (legacy behavior).
+unreachable_cooldown      = "30s"
+unreachable_probe_timeout = "1s"
+
+# Follow a 3xx that downgrades an https:// fetch to http://. The host
+# allowlist gate and the dial-side deny-CIDR check still run regardless.
+# true keeps real-world mirrors that redirect to an HTTP CDN working; the
+# GPG-signed apt index still hash-pins every artifact. Set false to refuse
+# the downgrade with 502 (ErrRedirectBlocked) — then add a [[remap]] rule
+# pointing at the redirect target instead.
+allow_https_to_http_redirect = true
 
 # --- Upstream access policy ------------------------------------------------
 # Default: ALLOW EVERYTHING. apt-cacher-ultra works as a drop-in cache for any
@@ -121,7 +146,9 @@ allow_short_keyid     = true
 # found on disk — apt-cacher-ultra ships with usable trust for stock
 # Debian/Ubuntu repositories out of the box, even on minimal hosts
 # where /etc/apt/* is unpopulated.
-# keyring_dirs        = ["/opt/extra-keyrings"]
+#
+# Example: keyring_dirs = ["/opt/extra-keyrings"]
+keyring_dirs          = []
 
 # SPEC6_5 §5.1 / SPEC6_7 §7 per-arch adoption allowlist. Empty
 # (default) adopts every Release-listed per-arch index regardless of
@@ -253,6 +280,26 @@ refuse_unvouched_debs     = false
 [hot_packages]
 window = "24h"
 
+# Grace window for superseded package versions (version-aware retention
+# design §3 rule 3). When a cached .deb leaves the kept set (no longer among
+# the newest `retention.max_versions_per_package` for its (package,
+# architecture), and not recently requested), the URL-path GC stamps
+# url_path.dropped_at and keeps the row for this window before reaping it —
+# so a client holding a stale apt index can still resolve a just-superseded
+# version. "0s" = no grace (reap in the same batch once the row fails the
+# recency and mirror guards).
+[hold_packages]
+window = "24h"
+
+# Version-aware retention (design: docs/superpowers/specs/
+# 2026-06-23-version-aware-retention-design.md §3 rule 2). Bounds how many
+# versions of a package the cache keeps (and prefetches) so fat-index repos
+# (Docker, Elastic) cannot accumulate their entire back-catalog.
+[retention]
+# Newest distinct Debian versions kept (and prefetched) per
+# (package, architecture) per suite. Must be >= 1.
+max_versions_per_package = 3
+
 # Phase 4 garbage collection (SPEC4 §5).
 #
 # Reaps three classes of dead rows:
@@ -325,6 +372,46 @@ heartbeat_interval    = "60s"
 # rejected at load below that bound.
 url_path_ttl          = "168h"
 
+# --- Admin listener (SPEC5 §5) ---------------------------------------------
+# A third, read-only HTTP listener (separate from the proxy and TLS
+# listeners) serving /metrics, /, and /healthz. Bound to loopback by
+# default — the bind address is the security boundary. Widen it only
+# together with htpasswd_file: an exposure of admin.listen to a
+# non-loopback address with no auth triggers admin_unauthenticated_non_loopback
+# at startup.
+[admin]
+# Master switch. false = listener not bound; /metrics, /, and /healthz are
+# unreachable (admin_disabled Warn at startup). The proxy keeps serving
+# normally, so this only opts out of observability.
+enabled            = true
+
+# Bind address. Default 127.0.0.1:6789 — loopback, port chosen to avoid the
+# proxy's 3142. Reuses the same host:port validation as cache.listen.
+listen             = "127.0.0.1:6789"
+
+# Optional Apache htpasswd file (bcrypt-only: $2a$/$2b$/$2y$) enabling HTTP
+# Basic auth on every admin request. Empty = no auth. The file is re-read
+# when its mtime changes, so users can be added/removed without a restart.
+# Apache MD5 ($apr1$), SHA-1 ({SHA}), and crypt(3) entries are rejected at
+# startup with a config error naming the offending line.
+htpasswd_file      = ""
+
+# Cadence of the in-process gauge refresher (acu_blobs_db_count,
+# acu_pool_disk_bytes, acu_per_host_inflight, ...). A scrape may read a cell
+# up to this stale. Must be > 0 and <= 1h.
+gauge_refresh      = "30s"
+
+# Admin HTTP server timeouts. read_timeout bounds the request line +
+# headers (must be > 0 and <= 1m); idle_timeout bounds keep-alive idle wait
+# (must be > 0 and <= 10m).
+read_timeout       = "5s"
+idle_timeout       = "30s"
+
+# Per-metric series cap for labeled metrics. A new label-value tuple that
+# would push a metric past this cap is dropped, and a one-shot
+# metrics_series_cap_reached Warn fires. Must be >= 1.
+metric_series_cap  = 1024
+
 [serve]
 serve_stale_when_upstream_down = true
 log_stale_serves               = true
@@ -352,6 +439,32 @@ format = "text"
 [tls_mitm]
 enabled                = true
 allow_unconstrained_ca = true
+
+# Auto-generated CA. ca_cert / ca_key empty = generate the CA under
+# ca_storage_dir (<cache.dir>/ca when that is empty) on first start. Supply
+# BOTH ca_cert and ca_key to use an operator-managed CA (setting only one is
+# a config error).
+ca_cert                = ""
+ca_key                 = ""
+ca_storage_dir         = ""
+
+# In-memory leaf-certificate LRU bound. Must be >= 1.
+cert_cache_size        = 256
+
+# Validity windows. leaf_cert_lifetime applies to every signed leaf; range
+# [5m, 5y], default 30 days. ca_cert_lifetime applies only to the
+# auto-generated CA; range [1d, 50y], default 10 years.
+leaf_cert_lifetime     = "720h"
+ca_cert_lifetime       = "87600h"
+
+# Leaf key type: "ecdsa-p256" (default) or "rsa2048" for legacy clients.
+leaf_algorithm         = "ecdsa-p256"
+
+# Signing predicate: empty = sign for ALL hosts (the just-works default),
+# paired with allow_unconstrained_ca = true. Non-empty = only sign for hosts
+# matching this RE2 regex; it is also translated into the auto-generated
+# CA's X.509 Name Constraints (see the hardened alternative below).
+allowed_host_regex     = ""
 #
 # Hardened alternative — restrict which hosts MITM will sign for, and fail
 # closed. allowed_host_regex is translated into the CA's X.509 NameConstraints,
