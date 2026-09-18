@@ -1,379 +1,211 @@
-# apt-cacher-ultra default configuration. See SPEC.md, SPEC2.md, and SPEC3.md for full reference.
+# apt-cacher-ultra packaged configuration.
+# Full reference: docs/configuration.md in the source repository:
+# https://github.com/linsomniac/apt-cacher-ultra/blob/main/docs/configuration.md
+# Restart the daemon after editing. Durations are quoted ("30s", "5m", "24h",
+# "7d"); zero has option-specific meaning. Regexes use TOML single quotes.
+# Active values preserve the shipped defaults; optional table examples below
+# are inactive. The proxy allows all upstreams and enables HTTPS MITM by
+# default: restrict network access and install the CA on HTTPS proxy clients.
 
 [cache]
+# Required: an existing directory writable by the daemon user.
 dir         = "/var/cache/apt-cacher-ultra"
-listen      = "0.0.0.0:3142"
-listen_tls  = ""                          # empty disables TLS listener
+listen      = "0.0.0.0:3142"               # proxy host:port; ports 1-65535
+# Optional TLS listener for client-to-cache traffic, separate from MITM.
+# Set listen_tls, tls_cert and tls_key together; PEM files must be readable.
+listen_tls  = ""
 tls_cert    = ""
 tls_key     = ""
+# Host or host:port for --print-apt-conf (no scheme/path). Required when
+# generating snippets from a wildcard listen address; no effect on binding.
+advertise_host = ""
 
 [upstream]
-connect_timeout         = "30s"
-total_timeout           = "5m"
-idle_read_timeout       = "60s"
-max_retries             = 3
-max_concurrent_per_host = 8
+connect_timeout         = "30s"  # TCP dial and TLS handshake limit
+total_timeout           = "5m"   # whole fetch budget, including retries
+idle_read_timeout       = "60s"  # accepted but currently NOT enforced
+max_retries             = 3      # extra attempts for retryable failures
+max_concurrent_per_host = 8      # concurrent fetches per canonical host
+# The five settings above reject negatives; explicit zero restores defaults.
+# After dial failure, subsequent dials in this window use a short probe;
+# failed probes suppress retries. 0s cooldown disables this mechanism.
+unreachable_cooldown      = "30s"
+unreachable_probe_timeout = "1s" # 0s removes the shorter probe deadline only
+# Permit HTTPS-to-HTTP redirects. false refuses downgrades with 502.
+# apt-secure verifies signed repository data, but HTTP loses confidentiality;
+# unsigned content has no equivalent signature-backed integrity assurance.
+allow_https_to_http_redirect = true
 
-# --- Upstream access policy ------------------------------------------------
-# Default: ALLOW EVERYTHING. apt-cacher-ultra works as a drop-in cache for any
-# apt repository with no editing required (like apt-cacher-ng). Tighten the two
-# settings below if the cache port is reachable by untrusted clients.
-#
-# allowed_host_regex: only upstream hosts matching one of these Go regexes are
-# fetched. '^.*$' = allow all. An empty list ([]) = deny-all (the cache becomes
-# read-only on miss). (SPEC §6.6 open-proxy hardening.)
+# Upstream hostname regex list (Go/RE2). [] denies upstream fetches;
+# ['^.*$'] allows all. Anchor expressions to avoid substring matches.
 allowed_host_regex = ['^.*$']
-#
-# Hardened alternative — restrict to specific upstreams. Uncomment & edit:
-# allowed_host_regex = [
-#   '^([a-z0-9-]+\.)*debian\.org$',   # deb.debian.org, security.debian.org, ftp.<cc>.debian.org
-#   '^([a-z0-9-]+\.)*ubuntu\.com$',   # archive/security/ports.ubuntu.com, <cc>.archive...
-#   '^download\.docker\.com$',
-#   '^ppa\.launchpadcontent\.net$',
-#   '^apt\.corretto\.aws$',
-#   '^repo\.charm\.sh$',
-#   '^pkg\.haproxy\.com$',
-#   # ...add your own repositories here...
-# ]
-
-# deny_target_ranges: after DNS resolution, every resolved IP is checked
-# against these CIDRs and the request is refused if any match.
-# Default: EMPTY (no IP filter) so private/LAN mirrors work with zero config.
+# Restrictive example: REPLACE the setting above, then add your other repos.
+# allowed_host_regex = ['^deb\.debian\.org$', '^security\.debian\.org$']
+# CIDRs blocked on each connection attempt, after DNS resolution.
+# [] permits private/LAN mirrors too; choose ranges for your network.
 deny_target_ranges = []
-#
-# Hardened alternative — block internal ranges (SSRF / DNS-rebinding guard).
-# Recommended if the cache is reachable by untrusted clients. Uncomment:
+# Example: REPLACE the setting above to block common internal ranges.
 # deny_target_ranges = [
-#   "127.0.0.0/8", "::1/128",
-#   "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-#   "169.254.0.0/16", "fe80::/10",
-#   "::ffff:127.0.0.0/104",
+#   "127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12",
+#   "192.168.0.0/16", "169.254.0.0/16", "fe80::/10", "fc00::/7",
 # ]
 
 [freshness]
-cooldown          = "60s"
-periodic_refresh  = "15m"
-# Cap on adoption goroutines running concurrently across the whole
-# cache (SPEC2 §9.3.1). Each adoption pre-fetches every member of a
-# suite's InRelease before flipping the snapshot pointer, so this
-# bounds total upstream pressure during a refresh storm. 0 = unlimited.
-max_concurrent_adoptions = 2
+cooldown                 = "60s" # minimum gap between per-suite checks
+periodic_refresh         = "15m" # background refresh cadence
+# Explicit 0s for either duration above restores its default, not off.
+max_concurrent_adoptions = 2     # global adoption cap; 0 = unlimited
 
-# Phase 2 atomic-snapshot adoption (SPEC2 §7.5).
-#
-# When enabled, the cache observes upstream's signed InRelease for each
-# known suite (on T1 cache hits and on the periodic scheduler). When
-# the bytes change, the cache GPG-verifies the new InRelease, hash-
-# validates every declared member, and atomically flips that suite's
-# "current snapshot" pointer. After the flip, all clients see metadata
-# and .debs from the same point-in-time view of upstream — no torn
-# updates, no silently-cached bytes that disagree with the declared
-# hash. A failure at any step (GPG, member fetch, hash mismatch) keeps
-# the prior snapshot in place.
-#
-# Off by default. Turn on once /etc/apt/trusted.gpg.d/ +
-# /etc/apt/keyrings/ contain the signing keys for every upstream you
-# adopt from. With require_signature=true (the secure default), an
-# upstream with no matching key in the host keyring will simply fail
-# to adopt and fall back to the prior snapshot — never silent.
 [adoption]
+# Adopt verified, coherent metadata snapshots atomically; failure retains
+# the previous snapshot. Enable after loading keys for your repositories.
 enabled               = false
-require_signature     = true
-require_pinned_signer = false
-
-# When true, unpinned suites bypass the trust + cryptographic check at
-# adoption time: the clearsign envelope (or Release.gpg) must still
-# parse structurally, but the signer need not be known to the host
-# keyring. Apt clients on the fleet remain the authoritative trust
-# anchor via per-source Signed-By rules. Off by default — the secure
-# posture is to load the upstream's signing key and verify here too.
-# Enable when you want the proxy to act as a transparent metadata
-# mirror for a long tail of third-party repos whose keys would
-# otherwise require ongoing manual keyring maintenance on the cache
-# host. Loud WARN at startup so the choice is auditable; per-suite
-# adoption_unverified_signer INFO lines fire once per (host, suite)
-# the first time each suite adopts under the bypass. [[trusted_signer]]
-# blocks remain authoritative for matched suites — pin overrides the
-# relaxation.
-accept_any_signer     = false
-
-# When true (the default), signatures that lack the long-form
-# IssuerFingerprint subpacket (33) are still accepted provided their
-# 8-byte issuer keyid maps unambiguously to a key in the per-suite
-# trust set. Matches apt's broad behavior; needed for real-world
-# third-party signers (notably Docker, Microsoft) that still publish
-# InRelease bodies without subpacket 33. Set to false for the
-# stricter SPEC2 §7.6.3 posture where any short-keyid-only signature
-# fails closed regardless of whether the keyid would resolve. Each
-# (host, suite) pair logs one INFO line the first time the fallback
-# accepts a signature so operators can inventory affected repos.
-allow_short_keyid     = true
-
-# Extra directories the keyring loader scans at startup, on top of
-# the built-in defaults: /etc/apt/trusted.gpg.d, /etc/apt/keyrings,
-# and /usr/share/keyrings. Paths must be absolute; nonexistent paths
-# are silently skipped. All three default directories are scanned so
-# adoption verifies third-party repos (Microsoft, Confluent, Docker)
-# whose signing keys are conventionally installed under
-# /usr/share/keyrings via per-source Signed-By directives.
-# In addition, canonical Ubuntu, Debian, and Ubuntu Pro ESM archive
-# keys are baked into the binary and load alongside whatever is
-# found on disk — apt-cacher-ultra ships with usable trust for stock
-# Debian/Ubuntu repositories out of the box, even on minimal hosts
-# where /etc/apt/* is unpopulated.
-# keyring_dirs        = ["/opt/extra-keyrings"]
-
-# SPEC6_5 §5.1 / SPEC6_7 §7 per-arch adoption allowlist. Empty
-# (default) adopts every Release-listed per-arch index regardless of
-# architecture. Non-empty restricts adoption to the listed
-# architectures' members: binary-<arch>/Packages*, source/Sources*
-# (the pseudo-arch "source" controls Sources adoption), and the
-# per-arch optional members Contents-<arch>*, cnf/Commands-<arch>*,
-# and dep11/Components-<arch>.yml*. Saves disk and removes the bulk of
-# the guaranteed-404 fetch attempts on Ubuntu suites (the main archive
-# declares foreign-arch members only ports.ubuntu.com serves). The
-# pseudo-arch "all" (arch-independent content, e.g. Debian's
-# Contents-all) is never filtered.
-#
-# Use the literal Debian architecture name: "amd64", "arm64", "armhf",
-# "i386", "ppc64el", "s390x", etc. The validator rejects uppercase,
-# underscores, hyphens, and any character outside [a-z0-9].
-#
-# Examples:
-#   architectures = []                            # default — all
-#   architectures = ["amd64"]                     # x86_64-only fleet
-#   architectures = ["amd64", "arm64"]            # mixed binary, no source
-#   architectures = ["amd64", "arm64", "source"]  # binary + source
+require_signature     = true    # false relaxes signature presence; see reference
+require_pinned_signer = false   # true requires a matching trusted_signer rule
+# Skip trust AND cryptographic verification for unpinned suites. Matched
+# pins still apply; require_signature still requires a signature envelope.
+# Clients must perform their own apt signature verification when enabled.
+accept_any_signer      = false
+# Accept signatures carrying only a legacy issuer key ID when unambiguous.
+allow_short_keyid      = true
+# Additional absolute directories of .gpg/.asc keys; missing dirs skipped.
+# Built-in archive keys and /etc/apt/trusted.gpg.d, /etc/apt/keyrings,
+# /usr/share/keyrings are always loaded as well.
+keyring_dirs          = []
+# [] adopts all architectures; e.g. ["amd64", "arm64", "source"].
+# "all" content is always included. At most 32 entries, each [a-z][a-z0-9]*.
 architectures         = []
-
-# SPEC6_7 §6 served-index guard. Architectures (or "source") whose
-# index groups MUST be served for a snapshot to commit: if every
-# declared variant of a required arch's Packages*/Sources* group is
-# missing upstream (e.g. a transient mirror 404), the adoption fails
-# and the previous coherent snapshot keeps serving — instead of
-# committing a snapshot that would hard-fail `apt update` for that
-# arch until the next InRelease publication. One served variant
-# satisfies a group, so upstream's uncompressed decoy declarations
-# stay harmless. Empty (default) disables the guard. Must be a subset
-# of `architectures` when that allowlist is set. Recommended:
-# the arches your clients actually run, e.g. ["amd64"].
+# Require a fetched variant in every declared Packages/Sources group for
+# these architectures; [] adds no explicit requirements. Same entry rules;
+# must be a subset of architectures when that list is nonempty.
 required_architectures = []
-
-# REC 1 (SPEC6_5): when true (the default), an integrity/availability
-# failure on a non-IndexTarget member (Contents-*, dep11, i18n — files
-# apt does not need for `apt update`/`apt install`) skips that member
-# instead of failing the whole suite adoption. IndexTarget members
-# (Packages*/Sources*) are always fatal-on-failure. A skipped member
-# is never served — clients get 404 until it is repaired (below) or
-# the next InRelease adoption. false = strict all-or-nothing adoption.
+# Skip failed optional metadata (Contents/dep11/i18n); skipped files may
+# return 404 until repaired. Packages/Sources integrity failures stay fatal.
 tolerate_optional_member_failures = true
-
-# SPEC6_7 §1 in-adoption member retry. A member fetch that fails its
-# integrity check (the signature of a round-robin mirror serving the
-# previous publication generation mid-sync) is re-attempted after
-# member_retry_delay, up to member_retry_count extra attempts. Each
-# attempt re-probes the content-addressed by-hash URL first, which
-# heals as soon as the lagging mirror backend syncs. 404/410-skipped
-# members (publication artifacts) are never retried.
-# member_retry_count = 0 restores single-attempt adoption.
+# Extra member attempts after integrity/availability failures; 404/410 skips
+# are not retried here. Nonnegative; 0 attempts or 0s delay are meaningful.
 member_retry_count    = 2
 member_retry_delay    = "30s"
-
-# SPEC6_7 §3 skipped-member repair. When true (the default), a
-# freshness check that finds an adopted suite unchanged at upstream
-# re-attempts the snapshot's integrity-skipped members (recorded with
-# their signed declarations at adoption) and promotes each into the
-# snapshot once the mirror serves the declared bytes — bounding
-# recovery from a degraded adoption to mirror-sync time instead of
-# the next InRelease publication (up to ~17h on slow-publishing
-# suites). 4xx-skipped members are never re-attempted.
+# Repair integrity-skipped members and missing required indices when a
+# freshness check finds unchanged metadata at upstream.
 repair_skipped_members = true
-
-# SPEC3 §7.5 hot-deb prefetch wall-clock guard. After a snapshot flip,
-# adoption proactively warms the (Package, Architecture) tuples that
-# clients hit in the prior `hot_packages.window` (next block) so the
-# first post-flip request for each is a HIT instead of a fetch.
-# 0s = no wall-clock guard; the loop runs until every hot deb has
-# terminated (success or full-retry failure). Per-deb fetches still
-# respect upstream.total_timeout × upstream.max_retries regardless of
-# this setting; budget=0s does NOT mean "retry one deb forever."
-# A startup warning fires when set to 0s.
+# Hot-package prefetch budget before publishing a snapshot; 0s removes it.
+# Each individual fetch remains bounded by upstream.total_timeout.
 hot_prefetch_budget   = "5m"
 
-# Optional: narrow the trust set for a suite to specific keys
-# (SPEC2 §7.6.2). Without any [[trusted_signer]] blocks, the entire
-# host keyring is trusted (matching apt's broad-trust default). Set
-# adoption.require_pinned_signer=true above to require an explicit
-# pin for every suite — recommended for production.
-#
-# [[trusted_signer]]
-# match_canonical_host = "archive.ubuntu.com"
-# fingerprints         = [
-#   # 40-char uppercase hex; long-form fingerprints only.
-#   # "F6ECB3762474EDA9D21B7022871920D1991BC93C",
-# ]
-
-# Phase 2 at-rest integrity scanner (SPEC2 §6.5 / §12.5).
-#
-# Re-hashes pool blobs on a slow ticker and evicts any whose on-disk
-# bytes no longer match their filename hash — the bytes the cache
-# wrote and verified at fetch time may rot later (bit flip, fs bug,
-# manual tampering, partial restore). On mismatch the blob is removed
-# and an at_rest_corruption Error is logged with the snapshot it
-# belonged to; the next request re-fetches and re-validates.
-#
-# The candidate query starts from blobs reachable from a current
-# snapshot; orphan cleanup remains Phase 4 GC's job. If a snapshot
-# flips mid-scan, member files that have since become unreachable
-# are non-actionable and skipped. Workers cap parallelism so a
-# multi-GiB pool/ doesn't starve request handling.
 [integrity]
-validate_at_rest_interval = "24h"  # "0s" disables the scanner entirely
-validate_at_rest_workers  = 4      # must be >= 1 when interval > 0
-
-# SPEC3 §6.1 strict mode for .deb requests. When true, refuse .deb GETs
-# under a host whose current snapshots have proven complete coverage
-# (every snapshot has package_coverage_complete = 1) but where the
-# requested path is not vouched for. Hosts whose snapshots have
-# package_coverage_complete = 0 fall back to trust-upstream regardless
-# of this flag. Default false during Phase 3 — a default-flip to true
-# is a future-phase decision after production observational data
-# (SPEC3 §1.3). Inert when adoption.enabled = false (a startup warning
-# fires in that combination).
+# Rehash current-snapshot blobs to detect disk corruption; 0s disables.
+validate_at_rest_interval = "24h"
+validate_at_rest_workers  = 4     # >= 1 with scanning on; >= 0 otherwise
+# Refuse unvouched .debs with 502 only when adoption is enabled and every
+# current snapshot on the host has complete package coverage.
 refuse_unvouched_debs     = false
 
-# SPEC3 §7.5 hot-package proactive refresh. A .deb path is "hot" if a
-# client has requested it within `window`. After every snapshot flip,
-# adoption pre-fetches the new versions of those debs so the first
-# post-flip request for each is a HIT instead of a fetch. The window
-# also bounds how stale the hot signal can be — paths last requested
-# longer ago than `window` are not warmed.
-# "0s" disables hot-package proactive refresh entirely; adoption falls
-# back to Phase 2 behavior (no .deb prefetch).
 [hot_packages]
-window = "24h"
+# Look back this far for client-requested packages to prefetch during adoption.
+window = "24h"  # nonnegative; 0s disables hot-package prefetch
 
-# Phase 4 garbage collection (SPEC4 §5).
-#
-# Reaps three classes of dead rows:
-#   - blobs whose refcount has dropped to <= 0 and aged past
-#     blob_grace (no remaining url_path or snapshot_member references)
-#   - displaced snapshots beyond keep_displaced (per suite)
-#   - orphan candidate snapshots whose heartbeat aged past
-#     max(upstream.total_timeout * upstream.max_retries, 30m)
-#
-# Plus, on every process startup, a one-shot pool/ orphan scan
-# repairs files left over from a crash between COMMIT and unlink.
-#
-# Tuning. Defaults are conservative for steady-state operation; raise
-# batch_size (or lower interval) only after gc_tick_deadline_reached
-# Info events show that the per-tick deadline is consistently tripped.
+[hold_packages]
+# Grace after a .deb falls out of both newest-version and recent-use sets.
+# Stale-index clients can still fetch it during this GC retention window.
+window = "24h"  # nonnegative; 0s permits deletion in the same GC batch
+
+[retention]
+# Newest distinct Debian versions retained/prefetched per package + arch
+# per suite. Recent use and hold_packages.window can retain older versions.
+max_versions_per_package = 3  # >= 1
+
 [gc]
-enabled               = true
-interval              = "1h"
-batch_size            = 100
-snapshot_batch_size   = 10
+enabled             = true  # false also skips startup GC and pool orphan scan
+interval            = "1h"  # > 0; use enabled=false to disable
+batch_size          = 100   # blob/URL-row batch bound; >= 1
+snapshot_batch_size = 10    # snapshot deletion batch bound; >= 1
+max_tick_duration   = "5m"  # > 0; tick budget checked between batches
+blob_grace          = "5m"  # >= 1s after a blob's refcount reaches zero
+keep_displaced      = 3     # displaced snapshots kept per suite; >= 0
+pool_scan_workers   = 4     # startup orphan-scan parallelism; >= 1
+# Must be > 0, with 2 * heartbeat_interval < blob_grace, and also less
+# than max(upstream.total_timeout * upstream.max_retries, 30m).
+heartbeat_interval  = "60s"
+# URL rows survive while recently used or in the newest-version kept set;
+# superseded .debs also get hold_packages.window grace, even if never served.
+# 0s disables URL-row expiration; otherwise >= 1m. Referenced version-less
+# artifacts stay protected. Blob reclamation follows after blob_grace.
+url_path_ttl        = "168h"
+# GC numeric constraints still apply when enabled=false.
 
-# Per-tick wall-clock budget. The pass exits cleanly between batches
-# if exceeded; the next tick (or next startup) picks up backlog.
-max_tick_duration     = "5m"
-
-# "Refcount reached 0" grace before a blob is reapable. Default 5m
-# matches the tmp/ partials cutoff (the existing "is this in flight?"
-# timescale). Sub-second values are rejected at load — the reap
-# predicate works in unix-epoch-seconds and would silently truncate.
-# heartbeat_interval (below) MUST be strictly less than blob_grace,
-# or in-flight member blobs can be reaped between heartbeats.
-blob_grace            = "5m"
-
-# Per-suite forensic retention for displaced snapshots. The most
-# recent N displaced snapshots per suite survive for operator
-# inspection. 0 disables retention entirely.
-keep_displaced        = 3
-
-# Worker pool size for the startup-only pool/ orphan scan.
-pool_scan_workers     = 4
-
-# Per-adoption heartbeat ticker (SPEC4 §7.5.2 site 6). Bounds the
-# heartbeat-gap during phases the five event-driven sites do not
-# cover (Packages-parse, hot-set computation, writer-queue waits).
-# Must be > 0s, strictly less than gc.blob_grace, and strictly less
-# than the runtime-derived heartbeat_stale_grace_effective
-# (max(upstream.total_timeout * upstream.max_retries, 30m)).
-heartbeat_interval    = "60s"
-
-# URL-path TTL — the fourth GC reap class. A url_path row whose
-# last_requested_at is older than this AND whose (scheme, host, path)
-# is NOT vouched for by any current snapshot's package_hash is
-# deleted. The deletion decrements the row's blob refcount; once the
-# refcount reaches 0 and gc.blob_grace elapses, the existing blob GC
-# reaps the on-disk bytes. Rows with last_requested_at IS NULL (rows
-# pre-warmed by adoption but never served) are protected
-# unconditionally.
-#
-# The primary use case is to cache a *current* working set: an "apt
-# update" before "apt install" is a reasonable precondition, so paths
-# the fleet hasn't asked for in this window are unlikely to be hit
-# again before upstream rolls them off anyway. Tune up for caches
-# that serve archival workloads (CI pinning ancient versions,
-# security backports across years), tune down for tight-disk
-# deployments. Set to "0s" to disable URL-path expiration entirely
-# (the Phase 1-4 default: only hash-mismatch eviction at serve time
-# touches url_path).
-#
-# Values >0 must be >= 1m to avoid thrashing under request bursts;
-# rejected at load below that bound.
-url_path_ttl          = "168h"
+[admin]
+# HTTP status page, /metrics, /healthz, and mutating POST /reconcile.
+enabled           = true
+listen            = "127.0.0.1:6789" # host:port; protect access if widened
+# Optional bcrypt-only Apache htpasswd file ($2a$/$2b$/$2y$). Empty = no auth.
+# Reloaded on requests when mtime/size changes. HTTP Basic auth is not
+# encrypted: use a trusted network, SSH tunnel, or TLS reverse proxy.
+htpasswd_file     = ""
+gauge_refresh     = "30s" # > 0 and <= 1h; expensive metrics refresh cadence
+read_timeout      = "5s"  # > 0 and <= 1m; request headers, not body/response
+idle_timeout      = "30s" # > 0 and <= 10m; idle keep-alive connections
+metric_series_cap = 1024  # >= 1; per-metric label tuple cap; excess dropped
+# These constraints are checked only while the admin listener is enabled.
 
 [serve]
+# Metadata fallback after upstream failure; normal cache hits are unaffected.
 serve_stale_when_upstream_down = true
-log_stale_serves               = true
+log_stale_serves               = true # emit stale_serve when fallback succeeds
 
 [log]
-level  = "info"
-# Log output format: "text" (the default) emits human-readable logfmt-style
-# key=value lines; "json" emits structured single-line JSON objects for
-# machine ingestion (log shippers, SIEMs). Both carry identical fields — set
-# this to "json" if you forward logs to a structured pipeline.
-format = "text"
+level  = "info" # debug | info | warn | error; empty restores info
+format = "text" # text (key=value) | json; empty restores text
 
-# --- HTTPS caching via MITM (ON by default) --------------------------------
-# By default the cache MITM-signs https:// repos so they are CACHED: it signs
-# per-host leaf certs from a local CA, then decrypts, caches, and re-serves
-# https sources. The default CA has NO name constraints (signs for all hosts) —
-# the just-works posture. IMPORTANT: every apt client must trust the cache's CA
-# or https fetches fail with certificate errors (see the README "Enable the
-# MITM HTTPS proxy" section). To turn MITM OFF — CONNECT then returns 405 and
-# apt talks straight to the upstream (those repos work but are NOT cached) —
-# set enabled = false.
-#
-# ca_cert / ca_key empty = auto-generate the CA under <cache.dir>/ca on first
-# start. allowed_host_regex defaults to '' (empty) = sign for ALL hosts.
 [tls_mitm]
+# Cache HTTPS via CONNECT and a local CA. Clients MUST trust the CA certificate.
+# false returns 405 for CONNECT; clients do not automatically bypass the proxy.
 enabled                = true
+# Both empty: create/reuse a CA in ca_storage_dir. Otherwise provide BOTH
+# readable PEM paths to a valid, matching CA certificate and private key.
+ca_cert                = ""
+ca_key                 = ""
+ca_storage_dir         = ""          # empty = <cache.dir>/ca; parent must exist
+cert_cache_size        = 256         # in-memory leaf certificate LRU; >= 1
+leaf_cert_lifetime     = "720h"      # 5m..43800h (5 years), inclusive
+ca_cert_lifetime       = "87600h"    # generated CA: 24h..438000h (50 years)
+leaf_algorithm         = "ecdsa-p256" # ecdsa-p256 | rsa2048
+# Signing regex (one string, unlike upstream.allowed_host_regex's list).
+# Empty permits all hosts; upstream fetch policy still applies.
+allowed_host_regex     = ""
+# Allow a generated CA without name constraints for empty/untranslatable
+# regexes. false requires a supported regex; no effect on supplied CAs.
 allow_unconstrained_ca = true
-#
-# Hardened alternative — restrict which hosts MITM will sign for, and fail
-# closed. allowed_host_regex is translated into the CA's X.509 NameConstraints,
-# so allow_unconstrained_ca = false refuses to start if it can't be translated.
-# SUPPORTED grammar (anchors ^...$ are optional but must be balanced):
-#   literal host:             '^deb\.debian\.org$'
-#   single-label prefix:      '^[a-z0-9-]+\.debian\.org$'   (note: + not *)
-#   optional 2-letter region: '^([a-z]{2}\.)?archive\.ubuntu\.com$'
-#   alternation of LITERALS:  '^(deb\.debian\.org|security\.debian\.org)$'
-# NOT supported: '*' quantifiers, or alternations with non-literal branches.
-# Replace the [tls_mitm] block above with:
-# [tls_mitm]
-# enabled                = true
-# allowed_host_regex     = '^(deb\.debian\.org|security\.debian\.org|download\.docker\.com)$'
+# Constrained example: REPLACE the two corresponding values above.
+# allowed_host_regex = '^(deb\.debian\.org|security\.debian\.org)$'
 # allow_unconstrained_ca = false
+# Supported shapes: literal host, [a-z0-9-]+ single-label prefix, optional
+# ([a-z]{2}\.)? region, or alternation of literal hosts; balanced ^/$ optional.
+# '*' and nonliteral alternation are unsupported for name constraints.
+# Existing CA material is reused, not regenerated by editing settings;
+# see the reference before changing CA constraints or lifetime.
 
-# Custom Remap rules. User rules apply before built-ins (SPEC §3.2).
+# Optional repeated tables: uncomment only the rules you need, replacing
+# example values. No custom remaps, mirror prefixes or signer pins by default.
+# Keep each table header with its fields. These examples are checked by tests.
+# BEGIN OPTIONAL TABLE EXAMPLES
+# # Restrict a suite host to verified, locally loaded signing keys. Host match
+# # is a Go regex against the canonical hostname; fingerprints are 40 hex chars.
+# # Replace this placeholder with a fingerprint verified out of band.
+# [[trusted_signer]]
+# match_canonical_host = '^repo\.example\.org$'
+# fingerprints = ["0123456789ABCDEF0123456789ABCDEF01234567"]
+#
+# # Host alias for identical repository content; user rules run before built-ins,
+# # first match wins. canonical_host is a host only, not a URL/path rewrite.
 # [[remap]]
-# match_host_regex = '^my-internal-mirror\.example\.com$'
-# canonical_host   = "archive.ubuntu.com"
-
-# Optional secondary mirror-mode prefixes:
+# match_host_regex = '^mirror\.example\.org$'
+# canonical_host = "archive.ubuntu.com"
+#
+# # Map a local path prefix to an HTTP(S) upstream, optionally with a base path.
+# # Prefixes must start with / and not overlap; upstream has no credentials,
+# # query or fragment. E.g. /corretto/dists/... fetches /dists/... upstream.
 # [[mirror]]
-# prefix   = "/corretto"
+# prefix = "/corretto"
 # upstream = "https://apt.corretto.aws/"
+# END OPTIONAL TABLE EXAMPLES

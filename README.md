@@ -86,6 +86,24 @@ cp packaging/config/config.toml.default config.toml
 ./build/apt-cacher-ultra -config config.toml
 ```
 
+## Configuration
+
+Edit `/etc/apt-cacher-ultra/config.toml` (or the file passed to `-config`),
+then restart the daemon. The [configuration reference](docs/configuration.md)
+documents every option, its defaults, valid values, and interactions. The
+[packaged example](packaging/config/config.toml.default) includes every option
+with concise comments and optional signer, remap, and mirror examples.
+
+The packaged configuration listens on `0.0.0.0:3142`, allows all upstreams,
+and enables HTTPS MITM; HTTPS proxy clients must trust the cache's CA.
+Snapshot adoption is initially disabled. The admin interface, including
+`POST /reconcile`, listens on `127.0.0.1:6789`. Review these settings before
+making either listener available beyond your trusted network.
+
+For maintainers, [documentation publishing options](docs/documentation-hosting.md)
+compares hosting the docs alongside the apt repository, on a separate Pages
+site, or on an existing server.
+
 ### Configure apt clients:
 
 Point clients at it as a proxy (matches existing apt-cacher-ng deployments)
@@ -94,31 +112,37 @@ by creating the following file with these contents:
 ```
 # /etc/apt/apt.conf.d/00aptcacher
 Acquire::http::Proxy "http://APT_CACHER_ULTRA_HOSTNAME:3142";
+Acquire::https::Proxy "DIRECT";
 ```
+
+The explicit `DIRECT` keeps HTTPS uncached until you configure MITM below.
+APT inherits HTTP options for HTTPS when their HTTPS counterparts are unset;
+see [APT HTTPS options](https://manpages.debian.org/unstable/apt/apt-transport-https.1.en.html#OPTIONS).
 
 For apt repositories using **https**, pick one of these (the cache allows all
 upstream hosts by default, so no allowlist editing is needed):
 
-- **https, not cached** — leave the sources as `https://` and set **only**
-  `Acquire::http::Proxy` (do *not* set `Acquire::https::Proxy`). apt connects
-  directly to the upstream over TLS; those packages are simply not cached.
-  (If you point `Acquire::https::Proxy` at the cache while MITM is off, the
-  cache returns `405` to the `CONNECT` and apt fails — so leave it unset.)
+- **https, not cached** — leave the sources as `https://` and set
+  `Acquire::https::Proxy "DIRECT";`. apt connects directly to the upstream
+  over TLS. Pointing HTTPS at the cache while MITM is off produces a `405`
+  response to `CONNECT` and apt fails.
 - **https, cached, no MITM** — rewrite each source from `https://HOST/path`
   to `http://HTTPS///HOST/path` (the apt-cacher-ng convention). The
   client↔cache hop is plain http through the proxy above; the cache fetches
   the upstream over https and caches the result. No CA setup required.
-- **https, cached, with MITM** — keep the sources as `https://`, enable the
-  MITM proxy, and install its CA on each client (see the next section).
+- **https, cached, with MITM** — keep the sources as `https://`, configure
+  the MITM proxy, and install its CA on each client (see the next section).
 
-### Enable the MITM HTTPS proxy (optional):
+### Configure the MITM HTTPS proxy (optional):
 
-By default `CONNECT` for `https://` repos returns `405` — apt then talks
-TLS straight to the upstream and the cache is bypassed for those repos.
-Enabling MITM lets the cache decrypt, cache, and re-serve HTTPS sources
-by signing per-host leaf certs from a local CA.
+MITM is enabled by default. It decrypts, caches, and re-serves HTTPS sources
+by signing per-host leaf certificates from a local CA. Clients using
+`Acquire::https::Proxy` must trust that CA. Setting `tls_mitm.enabled = false`
+rejects `CONNECT` with `405`; apt does not automatically fall back to a direct
+connection. To access HTTPS repositories directly, explicitly set
+`Acquire::https::Proxy "DIRECT";`.
 
-1. Add a `[tls_mitm]` block to `config.toml`:
+1. Edit the existing `[tls_mitm]` block in `config.toml` (add it if absent):
 
    ```toml
    [tls_mitm]
@@ -128,12 +152,13 @@ by signing per-host leaf certs from a local CA.
    # restricted grammar (see the table below). This example covers the
    # Debian repos plus Docker:
    allowed_host_regex = '^(deb\.debian\.org|security\.debian\.org|download\.docker\.com)$'
+   allow_unconstrained_ca = false
    # ca_cert / ca_key empty = auto-generate under <cache.dir>/ca on first start.
    ```
 
    **Supported `allowed_host_regex` shapes** (anchors `^…$` optional but must
-   be balanced). Anything else is refused at startup with
-   `mitm_ca_unconstrained_refused` unless you set `allow_unconstrained_ca = true`:
+   be balanced). When generating a new CA, anything else is refused with
+   `mitm_ca_unconstrained_refused` if `allow_unconstrained_ca = false`:
 
    | Shape | Example |
    |-------|---------|
@@ -154,6 +179,10 @@ by signing per-host leaf certs from a local CA.
    allow_unconstrained_ca = true
    ```
 
+   These generation settings apply when creating a CA. An existing CA is
+   reused; changing the regex does not replace its name constraints. See
+   [CA reuse and policy changes](docs/configuration.md#ca-reuse-and-policy-changes).
+
 2. Start the daemon once so the CA is materialized, then export it:
 
    ```sh
@@ -161,7 +190,8 @@ by signing per-host leaf certs from a local CA.
    sudo apt-cacher-ultra ca print > apt-cacher-ultra-ca.crt
    ```
 
-3. Set up the CA key on every apt client. Choose one of:
+3. Install the CA **certificate** on every apt client; keep the private key
+   on the cache host. Choose one of:
 
    a. Install the CA and refresh the system-wide trust store:
 
@@ -181,16 +211,28 @@ by signing per-host leaf certs from a local CA.
       ```
       # /etc/apt/apt.conf.d/00aptcacher
       Acquire::http::Proxy "http://APT_CACHER_ULTRA_HOSTNAME:3142";
+      Acquire::https::Proxy "http://APT_CACHER_ULTRA_HOSTNAME:3142";
       Acquire::https::CaInfo "/etc/ssl/certs/apt-cacher-ultra-ca.crt";
       ```
 
-4. Generate the client apt-conf snippet (includes the CA fingerprint as
-   a comment for verification):
+4. Set `cache.advertise_host` to the cache's client-facing hostname or
+   host:port if `cache.listen` uses a wildcard address such as `0.0.0.0`.
+   Generate the client apt-conf snippet (includes both proxy settings and
+   the CA fingerprint as a comment for verification):
 
    ```sh
-   apt-cacher-ultra --print-apt-conf -config /etc/apt-cacher-ultra/config.toml \
-       > /etc/apt/apt.conf.d/00aptcacher
+   # Run on the cache host:
+   sudo apt-cacher-ultra --print-apt-conf -config /etc/apt-cacher-ultra/config.toml \
+       > 00aptcacher.generated
    ```
+
+   Copy the generated file to each client, then install it there with
+   `sudo install -m 0644 00aptcacher.generated /etc/apt/apt.conf.d/00aptcacher`.
+   If using apt-only CA trust from step 3b, retain the
+   `Acquire::https::CaInfo` line when installing the generated snippet.
+   `--print-apt-conf` emits an HTTPS proxy line even when MITM is disabled;
+   use it for this MITM setup, or replace its HTTPS proxy value with `DIRECT`
+   for HTTP-only caching.
 
 ## Inspecting the cache
 
@@ -261,4 +303,3 @@ make clean
 ## License
 
 Released into the public domain under [CC0 1.0 Universal](LICENSE).
-
