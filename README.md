@@ -95,7 +95,8 @@ documents every option, its defaults, valid values, and interactions. The
 with concise comments and optional signer, remap, and mirror examples.
 
 The packaged configuration listens on `0.0.0.0:3142`, allows all upstreams,
-and enables HTTPS MITM; HTTPS proxy clients must trust the cache's CA.
+and enables HTTPS MITM;
+[HTTPS proxy clients must trust the cache's CA](#configure-the-mitm-https-proxy-optional).
 Snapshot adoption is initially disabled. The admin interface, including
 `POST /reconcile`, listens on `127.0.0.1:6789`. Review these settings before
 making either listener available beyond your trusted network.
