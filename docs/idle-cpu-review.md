@@ -5,6 +5,10 @@ The issue reports CPU use both with and without network activity. Code review
 identifies substantial work that runs without proxy requests; it does not by
 itself establish which work dominates an affected deployment.
 
+The subsequent [staging log analysis](staging-cpu-findings.md) finds periodic GC occupies
+only about 0.1% of the captured time and prioritizes admin profiling and verified
+package-prefetch reuse for further investigation.
+
 Here, cache GC means deleting obsolete cache records and files. Go's runtime
 garbage collector is a different subsystem. No production path explicitly calls
 `runtime.GC`; changing `GOGC` is not part of this fix.
