@@ -411,6 +411,105 @@ func TestLastRunSummary_IsCopy(t *testing.T) {
 	}
 }
 
+// Zero reclamation does not imply zero GC work: rows protected by hold
+// grace are still evaluated. Keep that work visible in summaries and logs.
+func TestStartupPass_ReportsRetainedURLCandidates(t *testing.T) {
+	c := openTestCache(t)
+	db := dbOf(t, c)
+	if _, err := db.Exec(`INSERT INTO url_path
+  (canonical_scheme, canonical_host, path, upstream_url, is_metadata, last_requested_at)
+  VALUES ('http', 'example.test', '/old.deb', 'http://example.test/old.deb', 0, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	logger, logs := captureLogger()
+	g, err := New(Config{
+		Cache: c, Logger: logger, Enabled: true, Interval: time.Hour,
+		BatchSize: 100, SnapshotBatchSize: 10, MaxTickDuration: time.Minute,
+		BlobGrace: time.Hour, KeepDisplaced: 3, PoolScanWorkers: 1,
+		HeartbeatStaleGrace: time.Hour, URLPathTTL: time.Hour, HoldWindow: 24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.StartupPass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s, ok := g.LastRunSummary()
+	if !ok || s.URLPathRowsScanned != 1 || s.URLPathRowsStamped != 1 || s.URLPathRowsReaped != 0 {
+		t.Fatalf("summary = %+v, present %t; want one scanned/stamped row and no reaping", s, ok)
+	}
+	if s.URLPathDurationSeconds <= 0 || s.SnapshotDurationSeconds <= 0 || s.BlobDurationSeconds <= 0 {
+		t.Fatalf("missing pass durations: %+v", s)
+	}
+	if !strings.Contains(logs.String(), `"url_path_rows_scanned":1`) ||
+		!strings.Contains(logs.String(), `"url_path_rows_stamped":1`) {
+		t.Fatalf("missing candidate counts in logs: %s", logs)
+	}
+
+	// Repeating the scan sees the held row again but does not reset grace.
+	res, err := g.runTick(context.Background(), "held")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.urlPath.scanned != 1 || res.urlPath.stamped != 0 || res.urlPath.deleted != 0 {
+		t.Fatalf("held-row pass = %+v", res.urlPath)
+	}
+	if _, err := db.Exec(`UPDATE url_path SET last_requested_at = ?`, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	res, err = g.runTick(context.Background(), "requalified")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.urlPath.scanned != 1 || res.urlPath.cleared != 1 || res.urlPath.deleted != 0 {
+		t.Fatalf("requalified-row pass = %+v", res.urlPath)
+	}
+}
+
+func TestRunTick_ResumesPendingBlobBeforeStartingAnotherSnapshotPass(t *testing.T) {
+	c := openTestCache(t)
+	logger, _ := captureLogger()
+	orphanBlob := seedReapableBlob(t, c, "orphan awaiting blob pass")
+	anchor := putPoolBlob(t, c, "orphan candidate anchor")
+	id, _, err := c.InsertCandidateSnapshot(context.Background(), cache.SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "example.test", SuitePath: "/dists/stable", InReleaseHash: &anchor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := dbOf(t, c)
+	if _, err := db.Exec(`UPDATE suite_snapshot SET heartbeat_at = 1 WHERE snapshot_id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	g, err := New(Config{
+		Cache: c, Logger: logger, Enabled: true, Interval: time.Hour,
+		BatchSize: 100, SnapshotBatchSize: 10, MaxTickDuration: time.Minute,
+		BlobGrace: time.Hour, KeepDisplaced: 3, PoolScanWorkers: 1, HeartbeatStaleGrace: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The prior snapshot pass drained, but its final batch overran the
+	// budget. The waiting blob stage must survive another exhausted tick.
+	g.nextPass = blobPass
+	g.cfg.MaxTickDuration = -time.Second
+	res, err := g.runTick(context.Background(), "exhausted")
+	if err != nil || !res.deadlineReached || g.nextPass != blobPass {
+		t.Fatalf("exhausted tick = %+v, next = %v, err = %v", res, g.nextPass, err)
+	}
+	g.cfg.MaxTickDuration = time.Minute
+	res, err = g.runTick(context.Background(), "resumed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.blobsReaped != 1 || blobRowExists(t, db, orphanBlob) || !snapshotRowExists(t, db, id) {
+		t.Fatalf("pending blob pass failed or snapshot pass was repeated: %+v", res)
+	}
+	if g.nextPass != urlPathPass {
+		t.Fatalf("completed cycle left nextPass = %v", g.nextPass)
+	}
+}
+
 // TestStartupPass_PoolOrphans_ReapedAndCounted plants three orphan
 // pool files (no blob row) at correct prefixes and one referenced
 // pool file (blob row exists). StartupPass runs the pool scan + a

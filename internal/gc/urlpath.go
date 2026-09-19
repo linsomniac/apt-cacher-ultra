@@ -17,8 +17,8 @@ import (
 // per-row DELETE + refcount UPDATE, batched at gc.batch_size, capped
 // by the shared per-tick deadline.
 //
-// Returns the cumulative count of url_path rows reaped, a deadline-
-// reached flag, and an error iff a DB-level failure occurred.
+// Returns cumulative evaluated/stamped/cleared/deleted row counts, a
+// deadline-reached flag, and an error iff a DB-level failure occurred.
 //
 // AIDEV-NOTE: ordered FIRST in the tick (before snapshot + blob
 // passes) so the refcount decrements this pass emits are visible to
@@ -28,15 +28,17 @@ import (
 // snapshot DELETEs remove FK references the blob pass's NOT EXISTS
 // reachability predicate consults — preserving the SPEC4 §9.6
 // rationale for snapshot-before-blob.
-func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase string, ttlSeconds, holdSeconds int64, maxVersions int) (int, bool, error) {
+type urlPathResult struct {
+	scanned, stamped, cleared, deleted int
+}
+
+func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase string, ttlSeconds, holdSeconds int64, maxVersions int) (urlPathResult, bool, error) {
 	if ttlSeconds <= 0 {
-		return 0, false, nil
+		return urlPathResult{}, false, nil
 	}
 
 	var (
-		deleted    int // url_path rows actually reaped (feeds url_path_rows_reaped)
-		stamped    int
-		cleared    int
+		acc        urlPathResult
 		batchesRun int
 	)
 	// Cursor over the url_path primary key (scheme, host, path). Each batch
@@ -47,7 +49,7 @@ func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase strin
 	curScheme, curHost, curPath := g.urlPathCursor.scheme, g.urlPathCursor.host, g.urlPathCursor.path
 	for {
 		if err := ctx.Err(); err != nil {
-			return deleted, false, nil
+			return acc, false, nil
 		}
 		if !time.Now().Before(deadline) {
 			// Persist the cursor so the next tick resumes here instead of
@@ -57,27 +59,29 @@ func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase strin
 				"phase", phase,
 				"which", "url_path",
 				"batches_completed", batchesRun,
-				"rows_reaped_this_tick", deleted,
-				"rows_stamped_this_tick", stamped,
-				"rows_cleared_this_tick", cleared,
+				"rows_scanned_this_tick", acc.scanned,
+				"rows_reaped_this_tick", acc.deleted,
+				"rows_stamped_this_tick", acc.stamped,
+				"rows_cleared_this_tick", acc.cleared,
 			)
-			return deleted, true, nil
+			return acc, true, nil
 		}
 
 		res, err := g.cfg.Cache.RunURLPathGCBatch(ctx, g.cfg.BatchSize, ttlSeconds, holdSeconds, maxVersions, curScheme, curHost, curPath)
 		if err != nil {
-			return deleted, false, fmt.Errorf("url_path gc batch: %w", err)
+			return acc, false, fmt.Errorf("url_path gc batch: %w", err)
 		}
 		batchesRun++
-		deleted += res.Deleted
-		stamped += res.Stamped
-		cleared += res.Cleared
+		acc.scanned += res.Scanned
+		acc.deleted += res.Deleted
+		acc.stamped += res.Stamped
+		acc.cleared += res.Cleared
 
 		// Scanned == 0 means the cursor reached the end of url_path — the
 		// pass is drained; reset so the next tick starts a fresh full scan.
 		if res.Scanned == 0 {
 			g.urlPathCursor.scheme, g.urlPathCursor.host, g.urlPathCursor.path = "", "", ""
-			return deleted, false, nil
+			return acc, false, nil
 		}
 		curScheme, curHost, curPath = res.LastScheme, res.LastHost, res.LastPath
 	}

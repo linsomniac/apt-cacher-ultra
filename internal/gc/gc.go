@@ -2,9 +2,9 @@
 // blobs, orphan/displaced suite_snapshot rows, and pool/ orphan files.
 //
 // Architecture: a single dedicated goroutine runs the periodic tick
-// loop (gc.interval cadence). Each tick computes a wall-clock deadline
-// (gc.max_tick_duration) once at the top, then runs the snapshot pass
-// followed by the blob pass; both passes share that one deadline.
+// loop (gc.interval delay after completion). Each tick computes a wall-clock
+// deadline (gc.max_tick_duration) once at the top, then resumes URL-path,
+// snapshot, and blob passes in order under that shared deadline.
 // Snapshot before blob because snapshot DELETEs remove the FK
 // references that the blob pass's NOT EXISTS reachability predicate
 // consults — running them in the reverse order would leave one tick of
@@ -109,6 +109,13 @@ type Config struct {
 type GC struct {
 	cfg Config
 
+	// nextPass preserves progress through URL-path → snapshot → blob work.
+	// Even the final batch of a pass can exceed the shared tick deadline;
+	// resume at the following pass next tick instead of restarting URL scans
+	// and indefinitely starving snapshot/blob cleanup. Only the GC goroutine
+	// touches this, after the sequential startup pass.
+	nextPass pass
+
 	// lastRunMu guards lastRun. Writes happen at the end of each
 	// completed tick (Run goroutine and StartupPass — sequential, but
 	// the field is read concurrently by status-page handler and the
@@ -127,6 +134,14 @@ type GC struct {
 	urlPathCursor struct{ scheme, host, path string }
 }
 
+type pass uint8
+
+const (
+	urlPathPass pass = iota
+	snapshotPass
+	blobPass
+)
+
 // LastRunSummary is the SPEC5 §9.6 / §9.7.8 in-memory captured copy
 // of the most recently completed gc_run_complete payload. The
 // status-page handler renders this; the §9.7.6 refresher mirrors
@@ -140,6 +155,12 @@ type LastRunSummary struct {
 	OrphanCandidatesReaped  int
 	DisplacedReaped         int
 	URLPathRowsReaped       int
+	URLPathRowsScanned      int
+	URLPathRowsStamped      int
+	URLPathRowsCleared      int
+	URLPathDurationSeconds  float64
+	SnapshotDurationSeconds float64
+	BlobDurationSeconds     float64
 	PoolOrphansRepaired     int
 	PoolOrphanBytesRepaired int64
 	PoolUnlinkErrors        int
@@ -259,6 +280,12 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		"orphan_candidates_reaped", tick.orphanCandidatesReaped,
 		"displaced_reaped", tick.displacedReaped,
 		"url_path_rows_reaped", tick.urlPathRowsReaped,
+		"url_path_rows_scanned", tick.urlPath.scanned,
+		"url_path_rows_stamped", tick.urlPath.stamped,
+		"url_path_rows_cleared", tick.urlPath.cleared,
+		"url_path_duration_ms", tick.urlPathDuration.Milliseconds(),
+		"snapshot_duration_ms", tick.snapshotDuration.Milliseconds(),
+		"blob_duration_ms", tick.blobDuration.Milliseconds(),
 		"pool_orphans_repaired", scan.orphansRepaired,
 		"pool_orphan_bytes_repaired", scan.orphanBytesRepaired,
 		"pool_unlink_errors", tick.poolUnlinkErrors+scan.unlinkErrors,
@@ -279,6 +306,7 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		tick.poolUnlinkErrors+scan.unlinkErrors,
 		tick.deadlineReached,
 	)
+	emitGCPassMetrics("startup", tick)
 	g.recordLastRun(LastRunSummary{
 		Phase:                   "startup",
 		AtUnixTime:              endUnix,
@@ -288,6 +316,12 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		OrphanCandidatesReaped:  tick.orphanCandidatesReaped,
 		DisplacedReaped:         tick.displacedReaped,
 		URLPathRowsReaped:       tick.urlPathRowsReaped,
+		URLPathRowsScanned:      tick.urlPath.scanned,
+		URLPathRowsStamped:      tick.urlPath.stamped,
+		URLPathRowsCleared:      tick.urlPath.cleared,
+		URLPathDurationSeconds:  tick.urlPathDuration.Seconds(),
+		SnapshotDurationSeconds: tick.snapshotDuration.Seconds(),
+		BlobDurationSeconds:     tick.blobDuration.Seconds(),
 		PoolOrphansRepaired:     scan.orphansRepaired,
 		PoolOrphanBytesRepaired: scan.orphanBytesRepaired,
 		PoolUnlinkErrors:        tick.poolUnlinkErrors + scan.unlinkErrors,
@@ -297,9 +331,9 @@ func (g *GC) StartupPass(ctx context.Context) error {
 }
 
 // Run owns the periodic tick goroutine. Returns when ctx is cancelled.
-// Each tick fires `gc.interval` after the previous tick *started* (a
-// long tick simply pushes the next firing back; we don't queue
-// missed ticks).
+// Each tick fires `gc.interval` after the previous tick completed. A
+// long tick cannot leave a pending timer firing that starts work again
+// immediately, even when an individual batch exceeds the tick budget.
 //
 // When Enabled = false, returns immediately — the goroutine is not
 // started.
@@ -307,7 +341,7 @@ func (g *GC) Run(ctx context.Context) {
 	if !g.cfg.Enabled {
 		return
 	}
-	t := time.NewTicker(g.cfg.Interval)
+	t := time.NewTimer(g.cfg.Interval)
 	defer t.Stop()
 
 	for {
@@ -315,6 +349,9 @@ func (g *GC) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			if ctx.Err() != nil {
+				return
+			}
 			start := time.Now()
 			tick, err := g.runTick(ctx, "periodic")
 			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
@@ -329,6 +366,12 @@ func (g *GC) Run(ctx context.Context) {
 				"orphan_candidates_reaped", tick.orphanCandidatesReaped,
 				"displaced_reaped", tick.displacedReaped,
 				"url_path_rows_reaped", tick.urlPathRowsReaped,
+				"url_path_rows_scanned", tick.urlPath.scanned,
+				"url_path_rows_stamped", tick.urlPath.stamped,
+				"url_path_rows_cleared", tick.urlPath.cleared,
+				"url_path_duration_ms", tick.urlPathDuration.Milliseconds(),
+				"snapshot_duration_ms", tick.snapshotDuration.Milliseconds(),
+				"blob_duration_ms", tick.blobDuration.Milliseconds(),
 				"pool_orphans_repaired", 0,
 				"pool_orphan_bytes_repaired", int64(0),
 				"pool_unlink_errors", tick.poolUnlinkErrors,
@@ -349,6 +392,7 @@ func (g *GC) Run(ctx context.Context) {
 				tick.poolUnlinkErrors,
 				tick.deadlineReached,
 			)
+			emitGCPassMetrics("periodic", tick)
 			g.recordLastRun(LastRunSummary{
 				Phase:                   "periodic",
 				AtUnixTime:              endUnix,
@@ -358,11 +402,18 @@ func (g *GC) Run(ctx context.Context) {
 				OrphanCandidatesReaped:  tick.orphanCandidatesReaped,
 				DisplacedReaped:         tick.displacedReaped,
 				URLPathRowsReaped:       tick.urlPathRowsReaped,
+				URLPathRowsScanned:      tick.urlPath.scanned,
+				URLPathRowsStamped:      tick.urlPath.stamped,
+				URLPathRowsCleared:      tick.urlPath.cleared,
+				URLPathDurationSeconds:  tick.urlPathDuration.Seconds(),
+				SnapshotDurationSeconds: tick.snapshotDuration.Seconds(),
+				BlobDurationSeconds:     tick.blobDuration.Seconds(),
 				PoolOrphansRepaired:     0,
 				PoolOrphanBytesRepaired: 0,
 				PoolUnlinkErrors:        tick.poolUnlinkErrors,
 				DeadlineReached:         tick.deadlineReached,
 			})
+			t.Reset(g.cfg.Interval)
 		}
 	}
 }
@@ -377,11 +428,15 @@ type tickResult struct {
 	urlPathRowsReaped      int
 	poolUnlinkErrors       int
 	deadlineReached        bool
+	urlPath                urlPathResult
+	urlPathDuration        time.Duration
+	snapshotDuration       time.Duration
+	blobDuration           time.Duration
 }
 
-// runTick executes one snapshot pass + one blob pass under a single
-// shared deadline computed at tick start (SPEC4 §9.6.1). Snapshot
-// pass first; blob pass second.
+// runTick resumes ordered URL-path, snapshot, and blob passes under a
+// single shared deadline. A completed pass is not repeated until all
+// following passes have drained, even if that takes multiple ticks.
 //
 // `phase` is "startup" or "periodic" — passed through to
 // gc_tick_deadline_reached events so an operator can correlate.
@@ -394,42 +449,60 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	// land before the same-tick blob pass evaluates reachability.
 	// Short-circuits when URLPathTTL is 0 (operator disabled the
 	// pass).
-	if ttl := int64(g.cfg.URLPathTTL.Seconds()); ttl > 0 {
-		hold := int64(g.cfg.HoldWindow.Seconds())
-		maxV := g.cfg.MaxVersionsPerPackage
-		if maxV < 1 {
-			// Match the prefetch-side fallback (freshness NewAdopter) so the
-			// two consumers of keepNewestNVersionSet never disagree on N when
-			// the value reaches a consumer unset. Production always passes the
-			// config default (3, Validate()-enforced >= 1); this is the
-			// defense-in-depth floor for direct/test construction.
-			maxV = 3
+	if g.nextPass == urlPathPass {
+		if ttl := int64(g.cfg.URLPathTTL.Seconds()); ttl > 0 {
+			hold := int64(g.cfg.HoldWindow.Seconds())
+			maxV := g.cfg.MaxVersionsPerPackage
+			if maxV < 1 {
+				// Match the prefetch-side fallback (freshness NewAdopter) so the
+				// two consumers of keepNewestNVersionSet never disagree on N when
+				// the value reaches a consumer unset. Production always passes the
+				// config default (3, Validate()-enforced >= 1); this is the
+				// defense-in-depth floor for direct/test construction.
+				maxV = 3
+			}
+			start := time.Now()
+			urls, urlPathDeadline, err := g.runURLPathPass(ctx, deadline, phase, ttl, hold, maxV)
+			res.urlPathDuration = time.Since(start)
+			res.urlPath = urls
+			res.urlPathRowsReaped += urls.deleted
+			if urlPathDeadline {
+				res.deadlineReached = true
+			}
+			if err != nil {
+				return res, err
+			}
+			if urlPathDeadline {
+				return res, nil
+			}
 		}
-		n, urlPathDeadline, err := g.runURLPathPass(ctx, deadline, phase, ttl, hold, maxV)
-		res.urlPathRowsReaped += n
-		if urlPathDeadline {
+		g.nextPass = snapshotPass
+	}
+
+	// Snapshot pass.
+	if g.nextPass == snapshotPass {
+		start := time.Now()
+		snap, snapDeadline, err := g.runSnapshotPass(ctx, deadline, phase)
+		res.snapshotDuration = time.Since(start)
+		res.orphanCandidatesReaped += snap.OrphanReaped
+		res.displacedReaped += snap.DisplacedReaped
+		if snapDeadline {
 			res.deadlineReached = true
 		}
 		if err != nil {
 			return res, err
 		}
+		if snapDeadline {
+			return res, nil
+		}
+		g.nextPass = blobPass
 	}
 
-	// Snapshot pass.
-	snap, snapDeadline, err := g.runSnapshotPass(ctx, deadline, phase)
-	res.orphanCandidatesReaped += snap.OrphanReaped
-	res.displacedReaped += snap.DisplacedReaped
-	if snapDeadline {
-		res.deadlineReached = true
-	}
-	if err != nil {
-		return res, err
-	}
-
-	// Blob pass — receives the same deadline. If snapshot pass
-	// exhausted it, blob pass exits immediately at its first
-	// per-batch deadline check.
+	// Blob pass receives the same deadline. Even an empty final snapshot
+	// batch can finish past it; preserve blobPass for the next tick then.
+	start := time.Now()
 	blob, blobDeadline, blobUnlinkErrs, err := g.runBlobPass(ctx, deadline, phase)
+	res.blobDuration = time.Since(start)
 	res.blobsReaped += blob.count
 	res.bytesReclaimed += blob.bytes
 	res.poolUnlinkErrors += blobUnlinkErrs
@@ -438,6 +511,9 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	}
 	if err != nil {
 		return res, err
+	}
+	if !blobDeadline {
+		g.nextPass = urlPathPass
 	}
 
 	return res, nil

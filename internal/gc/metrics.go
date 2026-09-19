@@ -1,6 +1,8 @@
 package gc
 
 import (
+	"time"
+
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 )
 
@@ -19,6 +21,29 @@ import (
 // periodic tick). Adding a new gc_run_complete field means adding both
 // a metric here AND extending the SPEC5 §10.4.5 inventory.
 var (
+	gcPassDurationSeconds = metrics.NewHistogramWithCap(
+		"acu_gc_pass_duration_seconds",
+		"Wall-clock duration of each GC pass, including database queue waits, by phase and pass.",
+		[]float64{0.001, 0.01, 0.1, 0.5, 1, 5, 10, 30, 60, 300, 600},
+		metrics.DefaultMaxSeries,
+		"phase", "pass",
+	)
+	gcURLPathRowsScannedTotal = metrics.NewCounterWithCap(
+		"acu_gc_url_path_rows_scanned_total",
+		"URL-path candidates evaluated by GC, including retained rows.",
+		0,
+	)
+	gcURLPathRowsStampedTotal = metrics.NewCounterWithCap(
+		"acu_gc_url_path_rows_stamped_total",
+		"URL-path rows entering hold grace during GC.",
+		0,
+	)
+	gcURLPathRowsClearedTotal = metrics.NewCounterWithCap(
+		"acu_gc_url_path_rows_cleared_total",
+		"URL-path hold-grace stamps cleared after retention re-qualification.",
+		0,
+	)
+
 	gcRunsTotal = metrics.NewCounterWithCap(
 		"acu_gc_runs_total",
 		"Total GC runs completed, labeled by phase (`startup` or `periodic`) (SPEC5 §10.4.5).",
@@ -100,6 +125,24 @@ var (
 		"phase",
 	)
 )
+
+func emitGCPassMetrics(phase string, tick tickResult) {
+	for _, p := range []struct {
+		name     string
+		duration time.Duration
+	}{
+		{"url_path", tick.urlPathDuration},
+		{"snapshot", tick.snapshotDuration},
+		{"blob", tick.blobDuration},
+	} {
+		if p.duration > 0 {
+			gcPassDurationSeconds.Observe(p.duration.Seconds(), phase, p.name)
+		}
+	}
+	gcURLPathRowsScannedTotal.Add(float64(tick.urlPath.scanned))
+	gcURLPathRowsStampedTotal.Add(float64(tick.urlPath.stamped))
+	gcURLPathRowsClearedTotal.Add(float64(tick.urlPath.cleared))
+}
 
 // emitGCMetrics records all GC metrics for one gc_run_complete log
 // emit. Called from RunStartup and the periodic tick loop with the

@@ -372,9 +372,8 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 	// SPEC6_5 §9.7.6: repo_coverage and cache_summary read from the
 	// refresher-populated atomic.Pointers, NOT a live DB query. The
 	// renderer cannot stall a slow /metrics scraper behind these
-	// aggregates, and they only change at adoption time (snapshot
-	// flip) — operationally fine to be up to admin.gauge_refresh
-	// stale. Both pointers are nil before the first refresh
+	// aggregates. Their observations can lag by admin.gauge_refresh
+	// plus refresh work time. Both pointers are nil before the first refresh
 	// completes; the render uses zero-value defaults in that window
 	// so the JSON contract (top-level keys always present) holds.
 	var repo cache.RepoCoverage

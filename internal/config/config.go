@@ -356,7 +356,7 @@ type GCConfig struct {
 	// gc_disabled Warn fires at startup when false.
 	Enabled bool `toml:"enabled"`
 
-	// Interval is the cadence of the periodic GC tick. Default 1h.
+	// Interval is the delay after a completed periodic GC tick. Default 24h.
 	// 0 is rejected at load (use enabled = false to disable).
 	Interval Duration `toml:"interval"`
 
@@ -370,8 +370,8 @@ type GCConfig struct {
 	// snapshot_member + package_hash rows. Default 10. Must be >= 1.
 	SnapshotBatchSize int `toml:"snapshot_batch_size"`
 
-	// MaxTickDuration is the hard upper bound on a single GC tick
-	// (periodic OR startup). Default 5m. 0 is rejected at load.
+	// MaxTickDuration is the budget checked between batches of a GC tick
+	// (periodic OR startup). A batch may exceed it. Default 5m; 0 is rejected.
 	MaxTickDuration Duration `toml:"max_tick_duration"`
 
 	// BlobGrace is the "since refcount reached 0" grace before a
@@ -451,11 +451,16 @@ type AdminConfig struct {
 	// startup with a config error naming the offending line.
 	HtpasswdFile string `toml:"htpasswd_file"`
 
-	// GaugeRefresh is the period of the in-process refresher
-	// goroutine that recomputes expensive gauges (acu_blobs_db_count,
+	// PprofEnabled exposes CPU, heap, and goroutine profiles on the admin
+	// listener, behind the same authentication. Disabled by default; profiles
+	// can reveal process details and CPU sampling adds temporary overhead.
+	PprofEnabled bool `toml:"pprof_enabled"`
+
+	// GaugeRefresh is the delay after each completed refresh cycle
+	// that recomputes expensive gauges (acu_blobs_db_count,
 	// acu_pool_disk_bytes, acu_per_host_inflight, etc.). Default
-	// 30s. A scrape can read a cell up to GaugeRefresh seconds
-	// stale; the refresher does an immediate first recompute at
+	// 30s. Observed values lag by GaugeRefresh plus refresh work time;
+	// the refresher does an immediate first recompute at
 	// startup so the first /metrics scrape is not zeros. Must be
 	// > 0 and ≤ 1h.
 	GaugeRefresh Duration `toml:"gauge_refresh"`
@@ -704,9 +709,9 @@ func Load(path string) (*Config, error) {
 	// default to non-zero values that don't collide with documented
 	// 0 semantics, but we still apply them via IsDefined so an
 	// operator who writes `interval = "0s"` (rejected by Validate)
-	// is not silently rescued by Defaults() to "1h".
+	// is not silently rescued by Defaults() to "24h".
 	if !md.IsDefined("gc", "interval") {
-		cfg.GC.Interval.Duration = 1 * time.Hour
+		cfg.GC.Interval.Duration = 24 * time.Hour
 	}
 	if !md.IsDefined("gc", "batch_size") {
 		cfg.GC.BatchSize = 100

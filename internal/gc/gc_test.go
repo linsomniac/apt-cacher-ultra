@@ -532,10 +532,9 @@ func TestRunSnapshotPass_DeadlineReached_EmitsEvent(t *testing.T) {
 	}
 }
 
-// TestRunTick_SnapshotDeadlineCascadesToBlobPass: §9.6.1 spec —
-// snapshot pass first; if it exhausts the deadline, the blob pass runs
-// against an already-expired deadline and exits with zero batches.
-func TestRunTick_SnapshotDeadlineCascadesToBlobPass(t *testing.T) {
+// Exhausting the shared budget defers the remaining passes. The next tick
+// must resume at snapshots rather than restart URL-path work.
+func TestRunTick_SnapshotDeadlineDefersBlobPass(t *testing.T) {
 	c := openTestCache(t)
 	logger, buf := captureLogger()
 
@@ -571,14 +570,40 @@ func TestRunTick_SnapshotDeadlineCascadesToBlobPass(t *testing.T) {
 		t.Errorf("blobsReaped = %d, want 0 (cascade should have starved blob pass)", res.blobsReaped)
 	}
 
-	// Both snapshot and blob deadline events should fire — but if the
-	// snapshot pass returns the moment its first deadline check trips,
-	// the blob pass also gets a deadline check before any work, so we
-	// expect at least the "blob" deadline event (and likely "snapshot"
-	// too).
 	logs := buf.String()
-	if !strings.Contains(logs, `"which":"blob"`) {
-		t.Errorf(`expected which="blob" deadline event: %s`, logs)
+	if !strings.Contains(logs, `"which":"snapshot"`) {
+		t.Errorf(`expected which="snapshot" deadline event: %s`, logs)
+	}
+	if g.nextPass != snapshotPass {
+		t.Fatalf("next pass = %v, want snapshot", g.nextPass)
+	}
+
+	// Make new URL-path work eligible before resuming. It must wait until
+	// the pending snapshot/blob passes drain, even with URL GC enabled.
+	db := dbOf(t, c)
+	if _, err := db.Exec(`INSERT INTO url_path
+  (canonical_scheme, canonical_host, path, upstream_url, is_metadata, last_requested_at)
+  VALUES ('http', 'example.test', '/old.deb', 'http://example.test/old.deb', 0, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	g.cfg.URLPathTTL = time.Hour
+	g.cfg.MaxTickDuration = time.Minute
+	res, err = g.runTick(context.Background(), "resumed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.blobsReaped != 1 || res.urlPath.scanned != 0 || res.deadlineReached {
+		t.Fatalf("resumed tick = %+v; want blob reaped and no URL scan", res)
+	}
+	if g.nextPass != urlPathPass {
+		t.Fatalf("next pass = %v, want fresh URL sweep", g.nextPass)
+	}
+	res, err = g.runTick(context.Background(), "next-sweep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.urlPathRowsReaped != 1 {
+		t.Fatalf("next sweep reaped %d URL rows, want 1", res.urlPathRowsReaped)
 	}
 }
 

@@ -278,16 +278,7 @@ func (s *Server) startRefresher() {
 	period := s.cfg.Admin.GaugeRefresh.Duration
 	go func() {
 		defer close(done)
-		t := time.NewTicker(period)
-		defer t.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-t.C:
-				s.runRefreshOnce(ctx)
-			}
-		}
+		runRefresherLoop(ctx, period, s.runRefreshOnce)
 	}()
 }
 
@@ -304,7 +295,7 @@ func (s *Server) startRefresher() {
 // AIDEV-NOTE: the §9.7.6 "refresh in progress" guard wraps ONLY the
 // pool walk; other queries proceed even when the prior pool walk is
 // still running. This bounds parallelism on the slow filesystem path
-// without serializing the cheap DB queries behind it.
+// without serializing the database queries behind it.
 func (s *Server) runRefreshOnce(lifecycleCtx context.Context) {
 	s.refreshCacheStats(lifecycleCtx)
 	s.refreshSuiteStats(lifecycleCtx)
@@ -341,14 +332,14 @@ func (s *Server) refreshProcessMetrics() {
 	s.proc.maxFDs.Set(float64(stats.maxFDs))
 }
 
-// refreshCacheStats updates the four cache.GetCacheStats-derived
-// gauges. One DB transaction, three queries — all inside a single
-// 10s deadline because they share the helper.
+// refreshCacheStats updates the cache.GetCacheStats-derived gauges.
+// Its four queries share a single 10s deadline.
 func (s *Server) refreshCacheStats(parent context.Context) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	stats, err := s.cfg.Cache.GetCacheStats(ctx)
+	s.observeRefresh("cache_stats", start, err)
 	if err != nil {
 		s.logRefresherFailure("acu_blobs_db_count", err, time.Since(start))
 		return
@@ -368,6 +359,7 @@ func (s *Server) refreshSuiteStats(parent context.Context) {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	st, err := s.cfg.Cache.GetSuiteStats(ctx)
+	s.observeRefresh("suite_stats", start, err)
 	if err != nil {
 		s.logRefresherFailure("acu_suites_tracked", err, time.Since(start))
 		return
@@ -386,10 +378,10 @@ func (s *Server) refreshSuiteStats(parent context.Context) {
 // it without re-querying the DB) and the SPEC6_5 §10.3
 // acu_package_hash_rows_by_kind gauge.
 //
-// AIDEV-NOTE: this method runs four aggregates inside a single
+// AIDEV-NOTE: this method runs two aggregates inside a single
 // read-only transaction; see cache.GetRepoCoverage for the SQL
 // rationale. The refresher pattern means a /?format=json scrape sees
-// values stale by up to admin.gauge_refresh — operationally fine for
+// values delayed by admin.gauge_refresh plus refresh work — acceptable for
 // this surface because the per-kind counts only change at adoption
 // time (snapshot lifecycle), not per-request.
 func (s *Server) refreshRepoCoverage(parent context.Context) {
@@ -397,6 +389,7 @@ func (s *Server) refreshRepoCoverage(parent context.Context) {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	rc, err := s.cfg.Cache.GetRepoCoverage(ctx)
+	s.observeRefresh("repo_coverage", start, err)
 	if err != nil {
 		s.logRefresherFailure("acu_package_hash_rows_by_kind", err, time.Since(start))
 		return
@@ -413,14 +406,15 @@ func (s *Server) refreshRepoCoverage(parent context.Context) {
 //
 // AIDEV-NOTE: the (host, arch) cardinality is bounded by real-world
 // fleet shapes (≤ tens of hosts × ≤ tens of arches); the two-query
-// pattern in cache.GetCacheSummaryByHostArch handles this in
-// milliseconds for typical caches. A future scale-test escalation
-// would push this onto its own deadline rather than the shared 10s.
+// pattern in cache.GetCacheSummaryByHostArch avoids visiting uncached
+// package rows for the blob totals. Catalog-size-dependent work is
+// measured separately and has its own 10s deadline.
 func (s *Server) refreshCacheSummary(parent context.Context) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	summary, err := s.cfg.Cache.GetCacheSummaryByHostArch(ctx)
+	s.observeRefresh("cache_summary", start, err)
 	if err != nil {
 		s.logRefresherFailure("acu_cache_summary_by_host_arch", err, time.Since(start))
 		return
@@ -512,6 +506,7 @@ func (s *Server) runPoolWalk(ctx context.Context) {
 		}
 		return nil
 	})
+	s.observeRefresh("pool_walk", start, err)
 	if err != nil {
 		// Missing pool/ pre-Open is the normal case during the
 		// startup window between admin Serve and cache.Open. Don't

@@ -125,7 +125,7 @@ max_versions_per_package = 3  # >= 1
 
 [gc]
 enabled             = true  # false also skips startup GC and pool orphan scan
-interval            = "1h"  # > 0; use enabled=false to disable
+interval            = "24h" # delay after completed GC; > 0
 batch_size          = 100   # blob/URL-row batch bound; >= 1
 snapshot_batch_size = 10    # snapshot deletion batch bound; >= 1
 max_tick_duration   = "5m"  # > 0; tick budget checked between batches
@@ -150,6 +150,7 @@ listen            = "127.0.0.1:6789" # host:port; protect access if widened
 # Reloaded on requests when mtime/size changes. HTTP Basic auth is not
 # encrypted: use a trusted network, SSH tunnel, or TLS reverse proxy.
 htpasswd_file     = ""
+pprof_enabled     = false # opt-in CPU/heap/goroutine profiles; same admin auth
 gauge_refresh     = "30s" # > 0 and <= 1h; expensive metrics refresh cadence
 read_timeout      = "5s"  # > 0 and <= 1m; request headers, not body/response
 idle_timeout      = "30s" # > 0 and <= 10m; idle keep-alive connections

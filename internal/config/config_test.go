@@ -1124,6 +1124,30 @@ interval = "0s"
 	}
 }
 
+func TestLoad_GCIntervalDefaultAndOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name, gc string
+		want     time.Duration
+	}{
+		{"omitted", "", 24 * time.Hour},
+		{"empty block", "[gc]\n", 24 * time.Hour},
+		{"explicit hourly", "[gc]\ninterval = \"1h\"\n", time.Hour},
+		{"explicit weekly", "[gc]\ninterval = \"168h\"\n", 7 * 24 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := writeTOML(t, dir, "config.toml", "[cache]\ndir = \""+dir+"\"\n"+tc.gc)
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.GC.Interval.Duration != tc.want {
+				t.Errorf("gc.interval = %s, want %s", cfg.GC.Interval.Duration, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidate_RejectsZeroBatchSize(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, "config.toml", `
@@ -1190,8 +1214,8 @@ func TestLoad_PackagedDefaultConfig(t *testing.T) {
 	if !cfg.GC.Enabled {
 		t.Errorf("packaged default has gc.enabled=false; expected true")
 	}
-	if cfg.GC.Interval.Duration != time.Hour {
-		t.Errorf("packaged default gc.interval = %s, want 1h", cfg.GC.Interval.Duration)
+	if cfg.GC.Interval.Duration != 24*time.Hour {
+		t.Errorf("packaged default gc.interval = %s, want 24h", cfg.GC.Interval.Duration)
 	}
 	if cfg.GC.BlobGrace.Duration != 5*time.Minute {
 		t.Errorf("packaged default gc.blob_grace = %s, want 5m", cfg.GC.BlobGrace.Duration)

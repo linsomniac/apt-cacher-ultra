@@ -384,6 +384,7 @@ func serveListeners(
 		"admin_listen", cfg.Admin.Listen,
 		"admin_htpasswd_file", cfg.Admin.HtpasswdFile,
 		"admin_htpasswd_users", htpasswdUsers,
+		"admin_pprof_enabled", cfg.Admin.PprofEnabled,
 		"admin_gauge_refresh", cfg.Admin.GaugeRefresh.Duration,
 		"admin_read_timeout", cfg.Admin.ReadTimeout.Duration,
 		"admin_idle_timeout", cfg.Admin.IdleTimeout.Duration,

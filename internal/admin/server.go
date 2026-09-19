@@ -179,6 +179,11 @@ type Server struct {
 	// the bare handler in that case.
 	auth *htpasswdAuthenticator
 
+	// profilingCancel stops an on-demand CPU capture before Shutdown waits
+	// for HTTP handlers to drain. No profiler runs until explicitly requested.
+	profilingCtx    context.Context
+	profilingCancel context.CancelFunc
+
 	// refresher coordinates the §9.7.6 refresher goroutine. Closed
 	// on Shutdown. refresherCancel cancels the context that
 	// in-flight queries inside runRefreshOnce inherit, so a slow
@@ -207,8 +212,8 @@ type Server struct {
 
 	// proc holds the §10.4.7 Prometheus-standard process collector
 	// metrics (process_cpu_seconds_total etc.). Refreshed on the
-	// same cadence as the refresher gauges; values stale by at
-	// most admin.gauge_refresh.
+	// same cadence as the refresher gauges; lag includes
+	// admin.gauge_refresh and refresh work time.
 	proc *processGauges
 
 	// self holds the §10.4.8 admin-listener self-metrics
@@ -224,8 +229,8 @@ type Server struct {
 	// (architectures_seen: [], counts: 0).
 	//
 	// AIDEV-NOTE: the migration from live-query to cached path means
-	// the JSON value can be stale by up to admin.gauge_refresh
-	// (default 30s). Status consumers that need real-time row counts
+	// the JSON value can lag by admin.gauge_refresh (default 30s)
+	// plus refresh work time. Consumers that need real-time row counts
 	// run their own query; the JSON contract documents this latency.
 	repoCoverage atomic.Pointer[cache.RepoCoverage]
 
@@ -290,6 +295,9 @@ func New(cfg Config) (*Server, error) {
 		}
 		s.auth = auth
 	}
+	if cfg.Admin.PprofEnabled {
+		s.profilingCtx, s.profilingCancel = context.WithCancel(context.Background())
+	}
 
 	s.server = &http.Server{
 		Addr:              cfg.AdminAddr,
@@ -327,11 +335,25 @@ func (s *Server) buildHandler() http.Handler {
 		"/healthz": s.handleHealthz,
 		"/":        s.handleStatus,
 	}
+	profiles := s.profileRoutes()
 
 	dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions {
-			w.Header().Set("Allow", allowMethods)
+			if _, profile := profiles[r.URL.Path]; profile {
+				w.Header().Set("Allow", "GET, OPTIONS")
+			} else {
+				w.Header().Set("Allow", allowMethods)
+			}
 			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if h, known := profiles[r.URL.Path]; known {
+			if r.Method != http.MethodGet {
+				w.Header().Set("Allow", "GET, OPTIONS")
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			h(w, r)
 			return
 		}
 		// POST /reconcile is a mutating endpoint — handled before the
@@ -397,6 +419,9 @@ func (s *Server) Serve(ln net.Listener) error {
 // scrapes within ctx's deadline.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.shuttingDown.Store(true)
+	if s.profilingCancel != nil {
+		s.profilingCancel()
+	}
 
 	s.mu.Lock()
 	s.shutdownStarted = true
@@ -491,6 +516,10 @@ type countingWriter struct {
 	status int
 	bytes  int64
 }
+
+// Unwrap lets ResponseController reach the underlying connection's write
+// deadline support for bounded diagnostic-profile responses.
+func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
 
 func (c *countingWriter) WriteHeader(code int) {
 	if c.status == 0 {

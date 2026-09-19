@@ -289,7 +289,7 @@ can fetch it again; affected snapshot metadata fails closed until restored.
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | Run startup and periodic garbage collection, including the startup orphan-file scan. `false` disables those passes and logs a warning. |
-| `interval` | duration | `"1h"` | Periodic GC cadence. Must be positive; disable through `enabled`. |
+| `interval` | duration | `"24h"` | Delay after a GC tick completes before the next periodic tick. Must be positive; disable through `enabled`. |
 | `batch_size` | integer | `100` | Maximum URL-path/blob rows processed per GC batch. At least `1`. |
 | `snapshot_batch_size` | integer | `10` | Maximum snapshots removed per batch. Snapshot deletion can cascade through many member rows. At least `1`. |
 | `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. Must be positive. |
@@ -298,6 +298,18 @@ can fetch it again; affected snapshot metadata fails closed until restored.
 | `pool_scan_workers` | integer | `4` | Workers for the startup orphan-file scan. At least `1`. |
 | `heartbeat_interval` | duration | `"60s"` | Refresh in-progress adoption liveness and blob protection. Positive and subject to both bounds below. |
 | `url_path_ttl` | duration | `"168h"` | Requests within this window protect cached URL rows. Older or never-requested rows are evaluated against snapshot/version retention and hold grace. `"0s"` disables URL-path expiration; other values must be at least `"1m"`. |
+
+Startup still runs the orphan-file scan and a GC tick. Periodic ticks wait a full
+`interval` after the previous tick completes, so a long run cannot trigger an
+immediate catch-up run. Existing configuration files that explicitly set
+`interval = "1h"` keep that setting; change it to `"24h"` for daily collection.
+
+Less frequent collection retains eligible data longer and can require more disk
+space. The interval controls cleanup only: freshness checks, integrity checks,
+adoption heartbeats, and offline serving remain independent. GC resumes unfinished
+work across ticks in URL-path, snapshot, then blob order; a large backlog can take
+several intervals to drain. `max_tick_duration` is checked between batches and
+does not interrupt a running batch or bound the startup orphan-file scan.
 
 Both heartbeat conditions must hold:
 
@@ -323,7 +335,8 @@ HTTP Basic authentication does not encrypt credentials in transit.
 | `enabled` | boolean | `true` | Bind the admin listener and run its background refresh work. `false` leaves proxy service running and logs a warning. |
 | `listen` | string | `"127.0.0.1:6789"` | Admin bind address. A non-loopback address without authentication emits a startup warning. Explicit empty string is invalid when enabled. |
 | `htpasswd_file` | string | `""` | Optional readable Apache htpasswd file with at least one user; only bcrypt (`$2a$`, `$2b$`, `$2y$`) entries are accepted. Empty disables authentication. Applies to every admin endpoint. |
-| `gauge_refresh` | duration | `"30s"` | Recompute expensive metrics at this cadence; scrapes can be this stale. Positive and at most `"1h"`. |
+| `pprof_enabled` | boolean | `false` | Enable `GET /debug/pprof/profile`, `/debug/pprof/heap`, and `/debug/pprof/goroutine` on the admin listener, with the same authentication. CPU capture defaults to 30 seconds; `?seconds=N` accepts integers from 1 through 300. Profiles expose process details; enable only for trusted operators. |
+| `gauge_refresh` | duration | `"30s"` | Delay after a completed refresh before recomputing gauges. Values can lag by this delay plus refresh work time. Positive and at most `"1h"`. |
 | `read_timeout` | duration | `"5s"` | HTTP request-line/header timeout, not a response or request-body timeout. Positive and at most `"1m"`. |
 | `idle_timeout` | duration | `"30s"` | Keep-alive idle timeout. Positive and at most `"10m"`. |
 | `metric_series_cap` | integer | `1024` | Per-metric limit on distinct label combinations. Excess new series are dropped and a warning is emitted. At least `1`. |
@@ -333,6 +346,16 @@ request when its modification time (in whole seconds) or size changes. A same-si
 rewrite within the same second may be missed. Reload failures retain the previous
 credentials and log a warning. Changing the configured file path needs a daemon
 restart. These per-key constraints are skipped when `admin.enabled = false`.
+
+Profiling is inactive until explicitly enabled and requested. Profile routes
+accept GET only, use binary `go tool pprof` format, and do not force a Go garbage
+collection. CPU sampling stops on client disconnect or shutdown; a capture
+interrupted by shutdown returns `503`. Profile response writes have a five-second
+deadline and are interrupted when the client or server stops. No profiling index,
+command-line, trace, or other debug routes are exposed.
+
+See the [idle CPU investigation](idle-cpu-review.md) for findings, maintenance
+metrics, tuning tradeoffs, and profile-capture commands.
 
 ## `[serve]`: stale responses
 

@@ -24,6 +24,11 @@ import (
 // so admin can be constructed against arbitrary registries —
 // metrics.Default in production, metrics.NewRegistry() in tests.
 type refresherGauges struct {
+	// Work performed by the refresher, including successful queries.
+	refreshDuration    *metrics.Histogram // labels: stage
+	refreshFailures    *metrics.Counter   // labels: stage
+	refreshLastSuccess *metrics.Gauge     // labels: stage
+
 	// Database-derivable (cache.GetCacheStats).
 	blobsDBCount             *metrics.Gauge
 	blobsDBTotalBytes        *metrics.Gauge
@@ -55,6 +60,19 @@ type refresherGauges struct {
 // — applied to the per-host gauges; unlabeled gauges use cap=0.
 func newRefresherGauges(r *metrics.Registry, capLimit int) *refresherGauges {
 	return &refresherGauges{
+		refreshDuration: metrics.NewHistogramWithCapIn(r,
+			"acu_admin_refresh_duration_seconds",
+			"Wall-clock duration of each admin refresh stage, including failures; not CPU time.",
+			[]float64{0.001, 0.01, 0.1, 0.5, 1, 5, 10, 30, 60},
+			0, "stage"),
+		refreshFailures: metrics.NewCounterWithCapIn(r,
+			"acu_admin_refresh_failures_total",
+			"Failed admin refresh stages, including cancellation; prior gauge values are retained.",
+			0, "stage"),
+		refreshLastSuccess: metrics.NewGaugeWithCapIn(r,
+			"acu_admin_refresh_last_success_unixtime",
+			"Unix time of each admin refresh stage's last successful completion.",
+			0, "stage"),
 		blobsDBCount: metrics.NewGaugeWithCapIn(r,
 			"acu_blobs_db_count",
 			"Number of blob rows in the cache database (refresher-driven).",

@@ -372,7 +372,7 @@ func (c *Cache) GetCacheStats(ctx context.Context) (CacheStats, error) {
 // lowercase "packages.diff/" path slip into the pdiff bucket here while
 // classifyPath would not call it pdiff at serve time.
 //
-// AIDEV-NOTE: the four reads run inside a single read-only transaction
+// AIDEV-NOTE: the two reads run inside a single read-only transaction
 // so a concurrent CommitAdoption between statements cannot make the
 // architectures_seen / snapshot counts / row totals describe different
 // moments. Without the transaction, callers could observe a row total
@@ -381,10 +381,11 @@ func (c *Cache) GetCacheStats(ctx context.Context) (CacheStats, error) {
 // AIDEV-NOTE: this method runs on the SPEC5 §9.7.6 refresher
 // goroutine (admin.refreshRepoCoverage), NOT on every /?format=json
 // request. The renderer reads from an atomic.Pointer that the
-// refresher Store()s after each recompute — values can be up to
-// admin.gauge_refresh (default 30s) stale, but per-kind row counts
-// only change at adoption-time (snapshot flip), so the staleness is
-// operationally fine. The refresher also feeds the SPEC6_5 §10.3
+// refresher Store()s after each recompute. Updates are separated by
+// admin.gauge_refresh (default 30s) plus the time spent refreshing;
+// failed reads keep the last successful result. Per-kind row counts
+// change with catalog adoption/reconciliation, not ordinary requests.
+// The refresher also feeds the SPEC6_5 §10.3
 // acu_package_hash_rows_by_kind gauge from the same Snapshot, so the
 // JSON and the Prometheus exposition are always in sync.
 func (c *Cache) GetRepoCoverage(ctx context.Context) (RepoCoverage, error) {
@@ -396,70 +397,15 @@ func (c *Cache) GetRepoCoverage(ctx context.Context) (RepoCoverage, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// architectures_seen: distinct arch values across current snapshots'
-	// package_hash rows, excluding empty (Phase 2 pre-v3 rows have ""
-	// arch and shouldn't surface).
+	// Walk each current catalog once for all package-derived fields. Pin the
+	// small suite table as the outer loop: retained/displaced catalogs can
+	// greatly outnumber current ones, especially with a daily GC interval.
+	// The existing (scheme, host, snapshot_id, ...) index serves this join.
+	// Grouping by snapshot preserves the distinct source-snapshot count;
+	// grouping by architecture also supplies the architecture list without
+	// a second package_hash scan. Keep the path classifier case-sensitive.
 	rows, err := tx.QueryContext(ctx, `
-SELECT DISTINCT p.architecture
-FROM package_hash p
-JOIN suite_freshness sf
-  ON sf.canonical_scheme = p.canonical_scheme
- AND sf.canonical_host   = p.canonical_host
- AND sf.current_snapshot_id = p.snapshot_id
-WHERE p.architecture != ''
-ORDER BY p.architecture`)
-	if err != nil {
-		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage architectures_seen: %w", err)
-	}
-	for rows.Next() {
-		var a string
-		if err := rows.Scan(&a); err != nil {
-			_ = rows.Close()
-			return RepoCoverage{}, fmt.Errorf("GetRepoCoverage architectures_seen scan: %w", err)
-		}
-		r.ArchitecturesSeen = append(r.ArchitecturesSeen, a)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage architectures_seen iter: %w", err)
-	}
-	_ = rows.Close()
-
-	// snapshots_with_sources: current snapshots having >=1 row with
-	// architecture=source.
-	if err := tx.QueryRowContext(ctx, `
-SELECT count(DISTINCT sf.current_snapshot_id)
-FROM package_hash p
-JOIN suite_freshness sf
-  ON sf.canonical_scheme = p.canonical_scheme
- AND sf.canonical_host   = p.canonical_host
- AND sf.current_snapshot_id = p.snapshot_id
-WHERE p.architecture = 'source'`).Scan(&r.SnapshotsWithSources); err != nil {
-		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage snapshots_with_sources: %w", err)
-	}
-
-	// snapshots_with_pdiff: current snapshots having >=1 *.diff/Index
-	// in snapshot_member. GLOB (case-sensitive) used so a lowercase
-	// "packages.diff/index" cannot inflate the count.
-	if err := tx.QueryRowContext(ctx, `
-SELECT count(DISTINCT sf.current_snapshot_id)
-FROM snapshot_member m
-JOIN suite_freshness sf
-  ON sf.current_snapshot_id = m.snapshot_id
-WHERE m.path GLOB '*/Packages.diff/Index'
-   OR m.path GLOB '*/Sources.diff/Index'`).Scan(&r.SnapshotsWithPdiff); err != nil {
-		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage snapshots_with_pdiff: %w", err)
-	}
-
-	// package_hash_rows by kind: bucket on the same predicate as
-	// handler.classifyPath. The CASE order matters: pdiff paths live
-	// under /<thing>.diff/ regardless of arch label, so the pdiff
-	// branch must check the path BEFORE the arch=source branch (a
-	// hypothetical Sources.diff/<patch>.gz would otherwise be
-	// double-counted as both source and pdiff). GLOB is used (rather
-	// than LIKE) for case-sensitivity parity with handler.classifyPath.
-	rowsByKind, err := tx.QueryContext(ctx, `
-SELECT
+SELECT sf.current_snapshot_id, p.architecture,
   CASE
     WHEN p.path GLOB '*/Packages.diff/*' OR p.path GLOB '*/Sources.diff/*' THEN 'pdiff'
     WHEN p.architecture = 'source' THEN 'source'
@@ -467,40 +413,63 @@ SELECT
     ELSE 'other'
   END AS kind,
   count(*) AS n
-FROM package_hash p
-JOIN suite_freshness sf
+FROM suite_freshness sf
+CROSS JOIN package_hash p
   ON sf.canonical_scheme = p.canonical_scheme
  AND sf.canonical_host   = p.canonical_host
  AND sf.current_snapshot_id = p.snapshot_id
-GROUP BY kind`)
+GROUP BY sf.current_snapshot_id, p.architecture, kind`)
 	if err != nil {
-		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage rows_by_kind: %w", err)
+		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage package aggregates: %w", err)
 	}
-	for rowsByKind.Next() {
-		var kind string
-		var n int64
-		if err := rowsByKind.Scan(&kind, &n); err != nil {
-			_ = rowsByKind.Close()
-			return RepoCoverage{}, fmt.Errorf("GetRepoCoverage rows_by_kind scan: %w", err)
+	architectures := make(map[string]struct{})
+	sourceSnapshots := make(map[int64]struct{})
+	for rows.Next() {
+		var snapshotID, n int64
+		var arch, kind string
+		if err := rows.Scan(&snapshotID, &arch, &kind, &n); err != nil {
+			_ = rows.Close()
+			return RepoCoverage{}, fmt.Errorf("GetRepoCoverage package aggregates scan: %w", err)
+		}
+		if arch != "" {
+			architectures[arch] = struct{}{}
+		}
+		if arch == "source" {
+			sourceSnapshots[snapshotID] = struct{}{}
 		}
 		switch kind {
 		case "binary":
-			r.PackageHashRowsBinary = n
+			r.PackageHashRowsBinary += n
 		case "source":
-			r.PackageHashRowsSource = n
+			r.PackageHashRowsSource += n
 		case "pdiff":
-			r.PackageHashRowsPdiff = n
+			r.PackageHashRowsPdiff += n
 		}
-		// "other" rows (empty arch, non-pdiff path) are not surfaced
-		// to keep the §2.4 contract clean (binary/source/pdiff/total).
-		// They DO contribute to total below.
+		// Legacy empty-architecture rows still contribute to the total.
 		r.PackageHashRowsTotal += n
 	}
-	if err := rowsByKind.Err(); err != nil {
-		_ = rowsByKind.Close()
-		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage rows_by_kind iter: %w", err)
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage package aggregates iter: %w", err)
 	}
-	_ = rowsByKind.Close()
+	_ = rows.Close()
+	for arch := range architectures {
+		r.ArchitecturesSeen = append(r.ArchitecturesSeen, arch)
+	}
+	sort.Strings(r.ArchitecturesSeen)
+	r.SnapshotsWithSources = int64(len(sourceSnapshots))
+
+	// Pdiff coverage depends on snapshot members, including snapshots with
+	// no package rows. Keep it separate from the package aggregate above.
+	if err := tx.QueryRowContext(ctx, `
+SELECT count(DISTINCT sf.current_snapshot_id)
+FROM suite_freshness sf
+CROSS JOIN snapshot_member m
+  ON sf.current_snapshot_id = m.snapshot_id
+WHERE m.path GLOB '*/Packages.diff/Index'
+   OR m.path GLOB '*/Sources.diff/Index'`).Scan(&r.SnapshotsWithPdiff); err != nil {
+		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage snapshots_with_pdiff: %w", err)
+	}
 
 	return r, nil
 }
