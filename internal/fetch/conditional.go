@@ -124,6 +124,9 @@ func (c *Client) Conditional(
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if c.proxyEnabled && resp.StatusCode == http.StatusProxyAuthRequired {
+		return nil, ErrProxyAuthRequired
+	}
 
 	out := &ConditionalResult{
 		Status:       resp.StatusCode,

@@ -338,13 +338,13 @@ func serveListeners(
 	// the operator what policy they're running under (timeouts,
 	// concurrency caps, allowlist, freshness cadence, Phase 2
 	// adoption + integrity policy + trusted-signer block count).
-	// Secrets do not appear in cfg, so the dump is safe to emit at
-	// Info.
+	// upstream.proxy may contain credentials: log only whether it is set.
 	logger.Info("apt-cacher-ultra starting",
 		"version", Version,
 		"listen", plainLn.Addr().String(),
 		"listen_tls", tlsAddrString(tlsLn),
 		"cache_dir", cfg.Cache.Dir,
+		"upstream_proxy_enabled", cfg.Upstream.Proxy != "",
 		"upstream_connect_timeout", cfg.Upstream.ConnectTimeout.Duration,
 		"upstream_total_timeout", cfg.Upstream.TotalTimeout.Duration,
 		"upstream_idle_read_timeout", cfg.Upstream.IdleReadTimeout.Duration,
@@ -504,6 +504,7 @@ func serveListeners(
 	}
 
 	fetchClient, err := fetch.New(fetch.Options{
+		Proxy:                    cfg.Upstream.Proxy,
 		ConnectTimeout:           cfg.Upstream.ConnectTimeout.Duration,
 		TotalTimeout:             cfg.Upstream.TotalTimeout.Duration,
 		IdleReadTimeout:          cfg.Upstream.IdleReadTimeout.Duration,

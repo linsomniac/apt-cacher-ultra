@@ -21,6 +21,12 @@ tls_key     = ""
 advertise_host = ""
 
 [upstream]
+# Optional HTTP(S) forward proxy for all repository fetches; empty = direct.
+# Example: "http://proxy.example.net:3128"; Basic auth: "https://user:pass@proxy:3129".
+# HTTPS repositories use CONNECT. No direct fallback or environment overrides.
+# With a proxy, deny_target_ranges must be []; enforce IP rules on that proxy.
+# Credentials need URL percent-encoding; protect this file if it contains them.
+proxy                   = ""
 connect_timeout         = "30s"  # TCP dial and TLS handshake limit
 total_timeout           = "5m"   # whole fetch budget, including retries
 idle_read_timeout       = "60s"  # accepted but currently NOT enforced
@@ -28,7 +34,8 @@ max_retries             = 3      # extra attempts for retryable failures
 max_concurrent_per_host = 8      # concurrent fetches per canonical host
 # The five settings above reject negatives; explicit zero restores defaults.
 # After dial failure, subsequent dials in this window use a short probe;
-# failed probes suppress retries. 0s cooldown disables this mechanism.
+# failed probes suppress retries. With a proxy, its cooldown covers all repos.
+# 0s cooldown disables this mechanism.
 unreachable_cooldown      = "30s"
 unreachable_probe_timeout = "1s" # 0s removes the shorter probe deadline only
 # Permit HTTPS-to-HTTP redirects. false refuses downgrades with 502.
@@ -41,7 +48,8 @@ allow_https_to_http_redirect = true
 allowed_host_regex = ['^.*$']
 # Restrictive example: REPLACE the setting above, then add your other repos.
 # allowed_host_regex = ['^deb\.debian\.org$', '^security\.debian\.org$']
-# CIDRs blocked on each connection attempt, after DNS resolution.
+# Direct-mode CIDRs blocked on each connection attempt, after DNS resolution.
+# Must be empty when proxy is set: the proxy resolves repository addresses.
 # [] permits private/LAN mirrors too; choose ranges for your network.
 deny_target_ranges = []
 # Example: REPLACE the setting above to block common internal ranges.

@@ -51,6 +51,7 @@ func TestClassifyFetchOutcome_AllSentinels(t *testing.T) {
 		{"ErrUpstreamServerError bare", ErrUpstreamServerError, "5xx"},
 		{"ErrUpstreamStatus bare", ErrUpstreamStatus, "4xx"},
 		{"ErrUpstreamUnavailable", ErrUpstreamUnavailable, "unavailable"},
+		{"ErrProxyAuthRequired", ErrProxyAuthRequired, "unavailable"},
 		{"DNS error", dnsErr, "dns_failed"},
 		{"connect refused", dialErr, "connect_failed"},
 		{"synthetic catch-all", errors.New("synthetic"), "error"},
@@ -146,6 +147,7 @@ func TestClassifyConditionalOutcome_Sentinels(t *testing.T) {
 		{"ErrHostNotAllowed", ErrHostNotAllowed, "host_not_allowed"},
 		{"ErrUpstreamServerError", &StatusError{Code: 502}, "5xx"},
 		{"ErrUpstreamStatus", &StatusError{Code: 404}, "4xx"},
+		{"ErrProxyAuthRequired", ErrProxyAuthRequired, "unavailable"},
 		{"timeout", context.DeadlineExceeded, "timeout"},
 	}
 	for _, tc := range cases {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/linsomniac/apt-cacher-ultra/internal/upstreamproxy"
 )
 
 // DefaultCacheDir is the on-disk cache root when not overridden.
@@ -87,6 +88,9 @@ type CacheConfig struct {
 }
 
 type UpstreamConfig struct {
+	// Proxy is an explicit HTTP(S) forward proxy URL; empty means direct.
+	// May contain Basic-auth credentials. Never log this value.
+	Proxy                string   `toml:"proxy"`
 	ConnectTimeout       Duration `toml:"connect_timeout"`
 	TotalTimeout         Duration `toml:"total_timeout"`
 	IdleReadTimeout      Duration `toml:"idle_read_timeout"`
@@ -896,6 +900,9 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if _, err := upstreamproxy.Parse(c.Upstream.Proxy, c.Upstream.DenyTargetRanges); err != nil {
+		errs = append(errs, err)
+	}
 	if c.Upstream.ConnectTimeout.Duration < 0 {
 		errs = append(errs, errors.New("upstream.connect_timeout must not be negative"))
 	}

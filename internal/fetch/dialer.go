@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -103,12 +104,11 @@ func addrInDeny(addr netip.Addr, deny []netip.Prefix) (bool, netip.Prefix) {
 // runs as a single short-deadline probe and surfaces ErrHostUnreachable
 // instead of consuming the full retry budget).
 //
-// AIDEV-NOTE: Proxy is set to nil. We never want to honor HTTP_PROXY for
-// upstream fetches because that would route requests through whatever the
-// host environment claims is a proxy — including, in some hosting
-// environments, an attacker-controlled HTTP_PROXY value. apt-cacher-ultra
-// is itself the proxy.
-func newTransport(opts Options, deny []netip.Prefix, tracker *unreachableTracker) http.RoundTripper {
+// Only an explicitly configured proxy is used; environment proxy settings
+// never affect routing. With a proxy, DNS and destination IP policy belong
+// to that proxy. New rejects combining a proxy with a nonempty deny list.
+// The dial tracker then observes the proxy endpoint, shared by all origins.
+func newTransport(opts Options, deny []netip.Prefix, tracker *unreachableTracker, proxyURL *url.URL) http.RoundTripper {
 	dialer := &net.Dialer{
 		Timeout:   opts.ConnectTimeout,
 		KeepAlive: 30 * time.Second,
@@ -138,8 +138,14 @@ func newTransport(opts Options, deny []netip.Prefix, tracker *unreachableTracker
 	if pool := rootCAsForTest.Load(); pool != nil {
 		tlsCfg = &tls.Config{RootCAs: pool}
 	}
-	return &http.Transport{
-		Proxy:                 nil,
+	var proxy func(*http.Request) (*url.URL, error)
+	if proxyURL != nil {
+		// net/http scopes Basic credentials to the proxy hop (or CONNECT),
+		// and verifies TLS for both HTTPS proxies and tunneled origins.
+		proxy = http.ProxyURL(proxyURL)
+	}
+	transport := &http.Transport{
+		Proxy:                 proxy,
 		DialContext:           dialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
@@ -148,6 +154,21 @@ func newTransport(opts Options, deny []netip.Prefix, tracker *unreachableTracker
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSClientConfig:       tlsCfg,
 	}
+	if proxyURL != nil {
+		transport.OnProxyConnectResponse = func(_ context.Context, _ *url.URL, _ *http.Request, resp *http.Response) error {
+			if resp.StatusCode == http.StatusProxyAuthRequired {
+				return ErrProxyAuthRequired
+			}
+			return nil
+		}
+	}
+	if proxyURL != nil && proxyURL.Scheme == "https" {
+		// net/http sends HTTP/1 forwarding requests and CONNECT to the
+		// proxy. Do not negotiate h2 on that TLS hop, even if offered.
+		transport.Protocols = new(http.Protocols)
+		transport.Protocols.SetHTTP1(true)
+	}
+	return transport
 }
 
 // wrapDialWithTracker returns a DialContext that consults tracker before

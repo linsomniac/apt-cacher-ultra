@@ -101,6 +101,11 @@ Snapshot adoption is initially disabled. The admin interface, including
 `POST /reconcile`, listens on `127.0.0.1:6789`. Review these settings before
 making either listener available beyond your trusted network.
 
+To fetch through another proxy, set `proxy = "http://proxy.example.net:3128"`
+in `[upstream]`. Direct access remains the default. See
+[upstream proxy setup](docs/configuration.md#using-an-upstream-proxy) for
+authentication, HTTPS, and access-policy requirements.
+
 For maintainers, [documentation publishing options](docs/documentation-hosting.md)
 compares hosting the docs alongside the apt repository, on a separate Pages
 site, or on an existing server.

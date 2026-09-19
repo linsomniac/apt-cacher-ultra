@@ -76,6 +76,7 @@ additional service policy changes. See the [packaged service](../packaging/syste
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
+| `proxy` | string | `""` | HTTP or HTTPS forward proxy URL for all upstream fetches. Empty means direct access. Optional Basic-auth credentials; see [upstream proxy setup](#using-an-upstream-proxy). Requires empty `deny_target_ranges`. |
 | `connect_timeout` | duration | `"30s"` | Connection establishment timeout. Nonnegative; `"0s"` selects the default. |
 | `total_timeout` | duration | `"5m"` | Overall budget for a fetch, including its retries. Nonnegative; `"0s"` selects the default. |
 | `idle_read_timeout` | duration | `"60s"` | Accepted and logged, but currently **does not enforce an idle-read timeout**. `total_timeout` bounds the fetch. Nonnegative; `"0s"` selects the default. |
@@ -84,13 +85,81 @@ additional service policy changes. See the [packaged service](../packaging/syste
 | `unreachable_cooldown` | duration | `"30s"` | After a failed dial, subsequent dials within this window use a short probe and stop retrying if that probe fails. `"0s"` disables this fast-failure behavior. Nonnegative. |
 | `unreachable_probe_timeout` | duration | `"1s"` | Additional dial deadline while a host is in cooldown. `"0s"` removes this shorter deadline but still suppresses retries after a failed probe. Nonnegative. |
 | `allowed_host_regex` | array of strings | `['^.*$']` | Allow a canonical hostname if any regex matches. Checked again for redirect destinations. Explicit `[]` denies all upstream hosts. Hostnames have no port. |
-| `deny_target_ranges` | array of strings | `[]` | IPv4/IPv6 CIDR ranges blocked when dialing resolved addresses, including redirect targets. Empty means no IP-range filter. |
-| `allow_https_to_http_redirect` | boolean | `true` | Follow HTTPS-to-HTTP redirects. `false` rejects downgrades. Host and IP policy still apply. |
+| `deny_target_ranges` | array of strings | `[]` | In direct mode, IPv4/IPv6 CIDR ranges blocked when dialing resolved addresses, including redirect targets. Empty means no IP-range filter. Nonempty lists cannot be combined with `proxy`. |
+| `allow_https_to_http_redirect` | boolean | `true` | Follow HTTPS-to-HTTP redirects. `false` rejects downgrades. Host policy still applies; in direct mode, IP policy does too. |
 
 The first failed dial can put the next retry of the same fetch into cooldown;
 it is not necessary to wait for another client request. Retry counts are upper
 bounds: nonretryable failures, cooldown probes, and `total_timeout` can stop a
 fetch earlier. Adoption's member retries are a separate outer retry policy.
+
+### Using an upstream proxy
+
+To chain this cache through another forward proxy (including apt-cacher-ng),
+set `proxy` in the existing `[upstream]` table, then restart the daemon:
+
+```toml
+[upstream]
+proxy = "http://proxy.example.net:3128"
+deny_target_ranges = []
+```
+
+The route is `apt client → apt-cacher-ultra → upstream proxy → repository`.
+Cache hits remain local. All outbound repository requests use the proxy,
+including cache misses, freshness checks, adoption, prefetches, and redirects.
+The proxy receives absolute URLs for HTTP repositories and `CONNECT` tunnels
+for HTTPS repositories; it must permit CONNECT to the repository ports.
+Repository hostnames are resolved by the proxy, so they need not resolve on
+the cache server. Client-side HTTPS interception and CA setup are unchanged.
+
+Use an absolute `http://` or `https://` proxy URL with a hostname or bracketed
+IPv6 address. The port is optional (defaults to 80 or 443 respectively); an
+explicit port must be 1–65535. A trailing `/` is allowed, but other paths,
+queries, and fragments are rejected. SOCKS, PAC, per-host proxy selection, and
+automatic direct fallback are not supported. `HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`, `NO_PROXY`, and their lowercase equivalents are ignored, whether
+`proxy` is set or empty. To restore direct access, set `proxy = ""` and restart.
+
+For Basic authentication, include credentials in the URL:
+
+```toml
+proxy = "https://cache-user:secret%40value@proxy.example.net:3129"
+```
+
+Percent-encode reserved characters in credentials (`%40` represents `@`).
+Usernames must be nonempty and cannot contain `:`; credentials cannot contain
+control characters. Protect a config file containing credentials so only root
+and the daemon's service account can read it. Credentials go to the proxy,
+including on CONNECT requests, and are not used as repository authentication.
+An `http://` proxy exposes Basic credentials on the cache-to-proxy network hop,
+even for HTTPS repositories; use `https://` when that hop needs encryption.
+
+Both HTTPS proxy certificates and HTTPS repository certificates are verified
+against the cache server's system trust store. For a private proxy CA, install
+its public certificate into that trust store and restart apt-cacher-ultra.
+The CA generated by this cache for its clients is separate from that trust
+store. Connections through an HTTPS proxy use HTTP/1.1 for compatibility with
+Go's forwarding/CONNECT transport, even if the proxy advertises HTTP/2.
+
+`allowed_host_regex` and the HTTPS-to-HTTP redirect policy still apply to
+repository hosts. The proxy hostname itself need not match the allowlist.
+**A nonempty `deny_target_ranges` with `proxy` is a startup error:** the cache
+cannot check the repository IP chosen by the proxy's resolver. Configure any
+destination IP restrictions on the upstream proxy before switching to proxy
+mode; clearing the local list alone does not preserve those restrictions.
+
+If the proxy fails, fetches fail under the usual retry and stale-cache rules;
+the cache never bypasses it by fetching directly. TCP dial failures put the
+proxy endpoint into cooldown, shared across repositories; CONNECT or TLS
+failures do not trigger that dial cooldown. `connect_timeout` limits TCP and
+TLS handshakes, while `total_timeout` bounds the entire fetch, including the
+wait for a CONNECT response and any retries. Per-host concurrency limits still
+apply to repository hosts, not to the proxy as a whole.
+An upstream proxy's `407 Proxy Authentication Required` fails immediately
+without retrying the same credentials. Cache clients receive stale data where
+eligible or `502 Bad Gateway`; fix the proxy credentials in the cache config.
+
+### Repository access policy
 
 These access policies govern upstream activity. Ordinary HTTP cache hits can
 still be served after a host is removed from the allowlist. HTTPS `CONNECT`

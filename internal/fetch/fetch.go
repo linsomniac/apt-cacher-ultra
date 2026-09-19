@@ -23,6 +23,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/upstreamproxy"
 )
 
 // Sentinel errors. Callers identify retryable-vs-fatal failures with
@@ -31,6 +33,9 @@ var (
 	ErrHostNotAllowed      = errors.New("fetch: upstream host not allowed by allowlist")
 	ErrTargetDenied        = errors.New("fetch: resolved IP is in deny range")
 	ErrUpstreamUnavailable = errors.New("fetch: upstream unavailable after retries")
+	// Proxy credentials are cache configuration, not client authentication.
+	// Classify a 407 as unavailable so clients get stale data or 502, not 407.
+	ErrProxyAuthRequired   = fmt.Errorf("%w: upstream proxy authentication required (407)", ErrUpstreamUnavailable)
 	ErrUpstreamStatus      = errors.New("fetch: upstream returned non-success status")
 	ErrUpstreamServerError = errors.New("fetch: upstream returned 5xx")
 	ErrSizeMismatch        = errors.New("fetch: response body length disagrees with declared length")
@@ -82,6 +87,7 @@ const defaultUserAgent = "apt-cacher-ultra/0.1"
 // timeouts mean "no timeout" at the transport level and rely on
 // TotalTimeout (set by Defaults) for the overall budget.
 type Options struct {
+	Proxy            string // explicit HTTP(S) proxy URL; empty means direct; may contain credentials
 	ConnectTimeout   time.Duration
 	TotalTimeout     time.Duration
 	IdleReadTimeout  time.Duration // currently informational; per-byte read timeouts are a Phase 2 candidate.
@@ -126,6 +132,7 @@ type Options struct {
 // allowlist, and a deny-CIDR list applied at dial time.
 type Client struct {
 	httpClient   *http.Client
+	proxyEnabled bool
 	allow        []*regexp.Regexp
 	maxRetries   int
 	totalTimeout time.Duration
@@ -172,6 +179,10 @@ type FetchResult struct {
 
 // New constructs a Client from validated upstream options.
 func New(opts Options) (*Client, error) {
+	proxyURL, err := upstreamproxy.Parse(opts.Proxy, opts.DenyTargetRanges)
+	if err != nil {
+		return nil, err
+	}
 	if opts.MaxRetries < 0 {
 		return nil, fmt.Errorf("fetch: max_retries must be >= 0, got %d", opts.MaxRetries)
 	}
@@ -197,7 +208,7 @@ func New(opts Options) (*Client, error) {
 	}
 	allowDowngrade := opts.AllowHTTPSToHTTPRedirect
 	tracker := newUnreachableTracker(opts.UnreachableCooldown, opts.UnreachableProbeTimeout, opts.now)
-	transport := newTransport(opts, deny, tracker)
+	transport := newTransport(opts, deny, tracker, proxyURL)
 	ua := opts.UserAgent
 	if ua == "" {
 		ua = defaultUserAgent
@@ -269,6 +280,7 @@ func New(opts Options) (*Client, error) {
 			},
 		},
 		allow:        allow,
+		proxyEnabled: proxyURL != nil,
 		maxRetries:   opts.MaxRetries,
 		totalTimeout: opts.TotalTimeout,
 		userAgent:    ua,
@@ -468,6 +480,9 @@ func (c *Client) doAttempt(
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if c.proxyEnabled && resp.StatusCode == http.StatusProxyAuthRequired {
+		return nil, ErrProxyAuthRequired
+	}
 
 	out := &FetchResult{
 		Status:        resp.StatusCode,
@@ -648,6 +663,9 @@ func isRetryable(err error) bool {
 	}
 	if errors.Is(err, ErrHostNotAllowed) || errors.Is(err, ErrTargetDenied) {
 		return false
+	}
+	if errors.Is(err, ErrProxyAuthRequired) {
+		return false // Repeating the same configured credentials cannot fix a 407.
 	}
 	// HTTP-status carriers: 4xx is not retryable (apt-style probing of
 	// non-existent index variants must surface to the caller); 5xx is
