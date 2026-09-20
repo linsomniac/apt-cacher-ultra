@@ -222,8 +222,8 @@ type Server struct {
 	self *selfMetrics
 
 	// repoCoverage caches the SPEC6_5 §2.4 repo_coverage payload
-	// across status-page renders. The §9.7.6 refresher recomputes the
-	// value on each tick and Store()s it here; the renderer reads via
+	// across status-page renders. The §9.7.6 refresher checks for DB
+	// changes on each tick and recomputes when needed; the renderer reads via
 	// Load() without touching the DB. nil before the first refresh
 	// completes — renderer treats nil as the zero-value RepoCoverage
 	// (architectures_seen: [], counts: 0).
@@ -238,6 +238,13 @@ type Server struct {
 	// summary the renderer surfaces under cache_summary.by_host[*].
 	// Same refresh cadence + stale tolerance as repoCoverage.
 	cacheSummaryByHostArch atomic.Pointer[map[string]map[string]cache.CacheSummaryEntry]
+
+	// aggregateMu serializes revision checks and refreshes, including direct
+	// test-driven passes. Each result is reusable only after a successful read
+	// with no concurrent database commit. Renderers still use atomic pointers.
+	aggregateMu      sync.Mutex
+	coverageRevision aggregateRevision
+	summaryRevision  aggregateRevision
 
 	// mu guards refresherStop / refresherDone / refresherCancel —
 	// Shutdown must be idempotent, and the refresher goroutine

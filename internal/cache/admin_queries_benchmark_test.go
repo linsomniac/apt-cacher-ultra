@@ -75,4 +75,20 @@ SELECT 'https', 'mirror.example', '/pool/pkg-' || i || '.deb', ?,
 			}
 		}
 	})
+	b.Run("DatabaseRevision", func(b *testing.B) {
+		initial, err := c.DatabaseRevision(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		for b.Loop() {
+			revision, err := c.DatabaseRevision(ctx)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if revision != initial {
+				b.Fatal("database changed without writes")
+			}
+		}
+	})
 }

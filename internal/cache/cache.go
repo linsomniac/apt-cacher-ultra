@@ -36,6 +36,13 @@ type Cache struct {
 	closeCh chan struct{}
 	closed  atomic.Bool
 	wg      sync.WaitGroup
+
+	// SQLite data_version values are comparable only on one connection.
+	// This lazy observer stays pinned between polls, without holding a
+	// transaction. revisionMu serializes polling, recovery, and shutdown.
+	revisionMu    sync.Mutex
+	revisionConn  *sql.Conn
+	revisionEpoch uint64
 }
 
 // Open initializes (or attaches to) the cache rooted at dir. Creates
@@ -96,7 +103,14 @@ func (c *Cache) Close() error {
 	}
 	close(c.closeCh)
 	c.wg.Wait()
-	return c.db.Close()
+	c.revisionMu.Lock()
+	var revisionErr error
+	if c.revisionConn != nil {
+		revisionErr = c.revisionConn.Close()
+		c.revisionConn = nil
+	}
+	c.revisionMu.Unlock()
+	return errors.Join(revisionErr, c.db.Close())
 }
 
 // openDB opens cache.db with the pragmas SPEC §4.3 mandates.

@@ -9,6 +9,10 @@ The subsequent [staging log analysis](staging-cpu-findings.md) finds periodic GC
 only about 0.1% of the captured time and prioritizes admin profiling and verified
 package-prefetch reuse for further investigation.
 
+The subsequent [idle CPU profile](idle-cpu-profile.md) attributes 96.57% of its
+sampled CPU to repository coverage and cache-summary queries. These aggregates
+now reuse successful results while SQLite reports no committed database change.
+
 Here, cache GC means deleting obsolete cache records and files. Go's runtime
 garbage collector is a different subsystem. No production path explicitly calls
 `runtime.GC`; changing `GOGC` is not part of this fix.
@@ -17,7 +21,7 @@ garbage collector is a different subsystem. No production path explicitly calls
 
 | Candidate | Evidence | Action |
 | --- | --- | --- |
-| Admin repository aggregates | `internal/admin/handlers.go` runs cache stats, suite stats, repository coverage and cache summary every `admin.gauge_refresh` (default 30s), even with no admin visitors. Coverage and summary repeatedly traverse `package_hash`, potentially millions of rows. The former source-snapshot count scans retained catalogs too. | Combine coverage queries into one current-snapshot package pass; measure successful and failed stages. Keep existing result semantics. |
+| Admin repository aggregates | The background refresher checks statistics every `admin.gauge_refresh` (default 30s), even with no admin visitors. Coverage and summary repeatedly traversed `package_hash`, potentially millions of rows; together they account for 96.57% of the supplied idle CPU profile. | Combine coverage queries into one current-snapshot package pass; reuse coverage and summary while SQLite reports no database changes. Measure computations, failures and reuse separately. |
 | Admin filesystem walk | Every refresh also traverses and stats files under `pool/`. A guard prevents simultaneous walks, but a large idle cache still incurs repeated filesystem work. | Measure the walk separately. Existing `admin.gauge_refresh` allows observation-only tuning; incremental disk accounting remains a profile-driven follow-up. |
 | Cache GC | Formerly hourly. URL retention revisits old or never-requested rows even when all are protected. Per-row reachability and version checks can consume CPU while deleting nothing. | Default to 24h, retain explicit configured intervals and startup cleanup, report scanned/stamped/cleared rows and per-pass duration. |
 | Maintenance overrun | Fixed tickers can leave an immediately due tick after a slow run. GC's budget is checked between batches; a large SQL batch can exceed it. | GC and admin refresh wait a full configured interval after completion. Resume unfinished GC stages before restarting earlier stages, preventing later passes from being repeatedly deferred. |
@@ -120,10 +124,11 @@ New admin metrics are always available with the admin listener enabled:
 | --- | --- |
 | `acu_admin_refresh_duration_seconds{stage=...}` | Duration histogram, including failed attempts. `_count` shows how often work ran. |
 | `acu_admin_refresh_failures_total{stage=...}` | Failed attempts, including cancellation. Existing gauge values survive errors. |
-| `acu_admin_refresh_last_success_unixtime{stage=...}` | Last successful completion; helps identify stale observations. |
+| `acu_admin_refresh_last_success_unixtime{stage=...}` | Last successful computation; can age while an unchanged aggregate remains valid. |
+| `acu_admin_refresh_reused_total{stage=...}` | Coverage/summary recomputations avoided because their database inputs are unchanged. |
 
 Stages are the fixed labels `cache_stats`, `suite_stats`, `repo_coverage`,
-`cache_summary`, and `pool_walk`. Debug logging adds `admin_refresh_complete`
+`cache_summary`, `database_revision`, and `pool_walk`. Debug logging adds `admin_refresh_complete`
 with `stage`, `duration_ms`, and `success`. Routine successful refreshes do not
 add info-level log traffic. Each stage adds only a few metric updates and clock
 reads, without per-row instrumentation.
@@ -176,13 +181,12 @@ unprofiled process CPU before/after as well.
 
 ## Follow-up decisions
 
-Use the stage timings and CPU profiles to decide whether to cache aggregates
-until relevant data changes, separate expensive observation cadence from cheap
-process metrics, maintain disk-byte counts incrementally, or optimize GC SQL.
-Any invalidation scheme must retry failed reads and detect mutations during a
-refresh; otherwise a performance change can leave the admin view indefinitely
-stale. Do not weaken reachability, hash, signature or offline-serving guarantees
-to obtain a lower CPU number.
+The supplied profile led to aggregate reuse until a committed database change,
+with failed-read retries and detection of mutations during a refresh. Measure
+the resulting build before pursuing further changes. Separate adoption profiles
+can evaluate verified prefetch reuse; filesystem accounting and GC SQL remain
+candidates if future measurements justify them. Preserve reachability, hash,
+signature and offline-serving guarantees throughout.
 
 ## Validation
 

@@ -5,6 +5,10 @@ the [initial review](idle-cpu-review.md). Raw logs and configuration remain
 untracked. Times below use the log's server timestamps; its timezone is not
 specified in the file.
 
+Follow-up: the [supplied idle CPU profile](idle-cpu-profile.md) confirms admin
+aggregation dominates that later two-minute sample and documents the resulting
+optimization. The log-based findings below describe the older build's workload.
+
 ## Capture and configuration
 
 The capture has 290,122 lines, spanning September 6 at 03:15:46 through September
@@ -115,9 +119,9 @@ of 34 failed attempts against an already-adopted snapshot on September 11 totals
 approximately four seconds from matched trigger to failure and does not plausibly
 explain sustained CPU throughout the capture.
 
-## Next measurement
+## Follow-up measurement
 
-The final hour contains 103 freshness checks, one 5.354-second GC run, and no
+The final hour of this log contains 103 freshness checks, one 5.354-second GC run, and no
 logged requests or adoptions. A similar window is useful: high CPU while also
 confirming no adoption remains in progress would further implicate other
 background work.

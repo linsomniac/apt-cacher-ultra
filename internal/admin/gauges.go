@@ -28,6 +28,7 @@ type refresherGauges struct {
 	refreshDuration    *metrics.Histogram // labels: stage
 	refreshFailures    *metrics.Counter   // labels: stage
 	refreshLastSuccess *metrics.Gauge     // labels: stage
+	refreshReused      *metrics.Counter   // labels: stage
 
 	// Database-derivable (cache.GetCacheStats).
 	blobsDBCount             *metrics.Gauge
@@ -71,7 +72,11 @@ func newRefresherGauges(r *metrics.Registry, capLimit int) *refresherGauges {
 			0, "stage"),
 		refreshLastSuccess: metrics.NewGaugeWithCapIn(r,
 			"acu_admin_refresh_last_success_unixtime",
-			"Unix time of each admin refresh stage's last successful completion.",
+			"Unix time of each admin refresh stage's last successful computation; unchanged aggregates may be reused afterward.",
+			0, "stage"),
+		refreshReused: metrics.NewCounterWithCapIn(r,
+			"acu_admin_refresh_reused_total",
+			"Admin aggregate refreshes avoided because the database has not changed since their successful computation.",
 			0, "stage"),
 		blobsDBCount: metrics.NewGaugeWithCapIn(r,
 			"acu_blobs_db_count",
