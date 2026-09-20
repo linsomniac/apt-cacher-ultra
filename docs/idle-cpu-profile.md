@@ -1,9 +1,10 @@
 # Staging idle CPU profile
 
-The supplied `cpu-info/acu-idle.cpu.pprof` identifies admin database aggregation
-as the dominant CPU consumer in this capture. It confirms the leading candidate
+The supplied idle CPU profiles identify admin database aggregation as the
+dominant CPU consumer in both baseline captures. They confirm the leading candidate
 from the [code review](idle-cpu-review.md) and [log analysis](staging-cpu-findings.md).
-The raw profile remains untracked.
+The user replaces `cpu-info/acu-idle.cpu.pprof` with each new capture; identify
+captures by their timestamp and embedded build ID. Raw profiles remain untracked.
 
 ## Measured work
 
@@ -43,6 +44,41 @@ go tool pprof -list 'GetRepoCoverage|GetCacheSummaryByHostArch' \
 Keep the matching executable before replacing it with another build. On a Go
 installation that omits the `pprof` executable but includes its source,
 `go build -o /tmp/acu-pprof cmd/pprof` produces an equivalent analysis tool.
+
+## Second capture: still the earlier executable
+
+The replacement profile starts at **10:54:51 MDT** on September 20 and contains
+**8.47 CPU seconds over 120.01 seconds**, approximately **7.06% of one CPU**.
+It has the same embedded executable build ID as the first capture:
+`70ff6ced14c0c3c01086134a53d08ab25af7a5ca`, matching `1.0.1-3-g72e1298`.
+
+Coverage accounts for 6.09 CPU seconds (71.90%) and cache summaries for 2.13
+(25.15%): together **97.05%**. Other synchronous admin statistics account for
+0.07 seconds, and the pool walk for 0.12 seconds. Go GC has one 0.01-second
+sample; no cache-cleanup or freshness/adoption application stack appears.
+
+This strengthens the attribution to repeated admin aggregation, but **does not
+measure the reuse fix** committed as `7cded10`. The locally rebuilt executable
+containing that fix reports `1.0.1-4-g7cded10`, with ELF build ID
+`e419561b4c7bf6816cc1a2890fe73ea6ed2ccb29`. The second profile's raw mapping
+metadata was checked against both executables, independently of symbol lookup.
+Its higher CPU total cannot be interpreted as a regression in the new code.
+
+Before the next capture, compare the running and installed executable versions
+on the staging host:
+
+```sh
+acu_pid=$(systemctl show -p MainPID --value apt-cacher-ultra)
+readlink "/proc/$acu_pid/exe"
+"/proc/$acu_pid/exe" -version
+/usr/sbin/apt-cacher-ultra -version
+```
+
+The running process must contain `7cded10` or a later descendant. A replacement
+installed file does not establish which executable is running; restart after
+installing the new binary and verify the process version before profiling.
+The profile alone does not identify why the earlier executable was captured
+or which version is running now.
 
 ## Implemented response
 
