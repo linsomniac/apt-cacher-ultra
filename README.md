@@ -306,6 +306,13 @@ make deb             # .deb package (nfpm must be installed)
 make clean
 ```
 
+For Linux targets, `make build` disables cgo and produces a statically linked
+binary that can be copied from NixOS to Ubuntu without requiring the build host's
+dynamic loader or glibc. The operating system and architecture must match the
+destination; for Linux amd64 explicitly, use `GOOS=linux GOARCH=amd64 make build`.
+Like the container build, this uses Go's DNS resolver. This also applies to
+`make deb`; race-enabled tests keep cgo available.
+
 ## License
 
 Released into the public domain under [CC0 1.0 Universal](LICENSE).

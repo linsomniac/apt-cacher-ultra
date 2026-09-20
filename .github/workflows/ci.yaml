@@ -20,6 +20,20 @@ jobs:
           cache: true
       - run: go vet ./...
       - run: go test -race -timeout 10m ./...
+      - name: Verify portable Linux binary
+        run: |
+          CGO_ENABLED=1 make build
+          program_headers="$(readelf --program-headers --wide build/apt-cacher-ultra)"
+          if [[ "$program_headers" == *INTERP* ]]; then
+            echo "Binary requires an external ELF interpreter" >&2
+            exit 1
+          fi
+          dynamic_entries="$(readelf --dynamic --wide build/apt-cacher-ultra)"
+          if [[ "$dynamic_entries" == *NEEDED* ]]; then
+            echo "Binary requires external shared libraries" >&2
+            exit 1
+          fi
+          ./build/apt-cacher-ultra -version
 
   lint:
     runs-on: ubuntu-latest

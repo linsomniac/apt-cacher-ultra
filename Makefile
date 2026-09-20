@@ -14,9 +14,11 @@ LDFLAGS   := -s -w -X main.Version=$(VERSION)
 # `git describe` printed "dev"), fall back to "0".
 DEB_VERSION := $(shell echo '$(VERSION)' | sed -E -e 's/^[^0-9]+//' -e 's/^$$/0/')
 
+# Keep the distributed binary independent of the build host's libc/loader.
+# Scope this to the build: the race-enabled test target needs cgo.
 build:
 	@mkdir -p $(BUILD_DIR)
-	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BUILD_DIR)/$(BIN) ./cmd/apt-cacher-ultra
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BUILD_DIR)/$(BIN) ./cmd/apt-cacher-ultra
 
 test:
 	$(GO) test ./...
