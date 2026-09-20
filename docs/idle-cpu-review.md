@@ -192,6 +192,13 @@ Separate adoption profiles can evaluate verified prefetch reuse; filesystem
 accounting and GC SQL remain candidates if future measurements justify them.
 Preserve reachability, hash, signature and offline-serving guarantees throughout.
 
+A subsequent report of 79 CPU seconds over the first 30 minutes warrants
+separating startup cost from continuing background activity. The
+[follow-up review](idle-cpu-profile.md#follow-up-79-cpu-seconds-over-the-first-30-minutes)
+identifies startup SQL batching, verified package-prefetch reuse, more selective
+admin invalidation and repeated adoption heartbeat work as candidates requiring
+that attribution.
+
 ## Validation
 
 Three independent ultra-effort reviews covered the initial plan, background work,

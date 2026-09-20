@@ -123,6 +123,48 @@ or reducing any maintenance guarantees. Keep the current behavior and use a
 separate adoption-window profile if further background CPU investigation is
 needed. The optional profiler can be disabled when collection is complete.
 
+## Follow-up: 79 CPU seconds over the first 30 minutes
+
+The user subsequently reported 1m19s of CPU after approximately 30 minutes of
+uptime on the updated build. That is about **4.39% of one CPU averaged since
+startup**, rather than an idle-only measurement. Extending the quiet profile's
+0.125% rate across 30 minutes would account for about 2.25 CPU seconds. This
+comparison identifies additional work to investigate; it does not attribute
+the remaining time to a particular subsystem.
+
+Three ultra-effort reviews identified these next candidates, without changing
+production code:
+
+| Candidate | Evidence and potential improvement | Conditions and safeguards |
+| --- | --- | --- |
+| Startup pool cleanup | `gc.runPoolScan` calls `Cache.HashKnown` once per valid pool file, each through a separate SQL query. A prepared statement or bounded batches could reduce parsing/call overhead. | Smallest implementation candidate if startup accounts for much of the total. Preserve every orphan check, cancellation, malformed-file handling and the rule to keep files on query errors. Keep the scan before serving starts. |
+| Package prefetch reuse | `fetchHotDeb` downloads, hashes, writes and finalizes each selected package even when its expected content is already cached. Verified local reuse could avoid network/TLS and write work. Earlier logs show 109,985 successful prefetch downloads, but do not establish the redundant fraction. | Preserve the 300-day working set and rehash existing content. Handle cancellation, missing/corrupt files, concurrent repair/GC, blob grace, heartbeat tracking and atomic URL publication. This is a bounded feature, not a safe copy-and-paste of metadata reuse. |
+| More selective admin invalidation | The current conservative revision changes on any committed database write. Request counters, freshness timestamps and adoption heartbeat updates can therefore restart aggregate calculations even though their inputs are unchanged. | Confirm repeated calculations using refresh/reuse counters and an activity profile. Snapshot IDs or row counts alone miss in-place repairs and are insufficient. A replacement must retain external-write detection and before/after validation without adding substantial adoption/write overhead. |
+| Adoption heartbeat work | After each prefetched package, the heartbeat copies and updates the entire growing tracked-blob list. Large hot sets can create quadratic cumulative work. | Investigate only if a profile implicates it. Preserve the maximum heartbeat gap and protection of every in-flight blob; reducing heartbeat frequency blindly could compromise GC safety. |
+
+The supplied 24-hour integrity interval does **not** trigger an at-rest scan at
+startup; its first scan waits a full interval. It therefore cannot explain this
+first 30-minute total if configuration is unchanged. Startup GC does run before
+the listeners, however, so the HTTP profiler cannot capture its initial pool
+scan. Existing startup GC logs report wall time, which includes I/O and waiting
+and must not be treated as CPU time.
+
+The quickest discriminator is another process CPU reading after ten minutes,
+without restarting. At the measured quiet rate that would add roughly 0.75 CPU
+seconds; a continuing 4.39% rate would add about 26 seconds. These are reference
+rates, not promised bounds. Current-run logs and before/after metrics can then
+correlate growth with startup, adoption and admin recalculation. Useful series
+include `acu_admin_refresh_duration_seconds_count`,
+`acu_admin_refresh_reused_total`, `acu_freshness_check_total`,
+`acu_adoption_total` and `acu_hot_prefetch_total`; stage-duration sums measure
+wall time, not CPU. Record the process PID with each reading to detect restarts.
+
+If CPU continues accumulating, collect a profile during that activity (up to
+300 seconds per capture) plus the matching log window. Quiet pool walks remain
+a low priority: the measured 0.075% of one CPU would account for about 1.35 CPU
+seconds over 30 minutes. No functionality-reducing changes are justified by the
+cumulative total alone.
+
 ## Implemented response
 
 The admin refresher now reuses each successful coverage and cache-summary result
