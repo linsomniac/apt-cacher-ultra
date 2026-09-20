@@ -165,6 +165,12 @@ a low priority: the measured 0.075% of one CPU would account for about 1.35 CPU
 seconds over 30 minutes. No functionality-reducing changes are justified by the
 cumulative total alone.
 
+The user then supplied [logs for the current run](staging-cpu-followup.md) and
+reported 170 CPU seconds. Those logs show only 1.007 seconds of startup cleanup,
+but five automatic adoptions, 616 package prefetches and 20 freshness-check
+batches. They shift priority toward adoption work and recurring aggregate
+invalidation, with current metrics needed to quantify the latter.
+
 ## Implemented response
 
 The admin refresher now reuses each successful coverage and cache-summary result

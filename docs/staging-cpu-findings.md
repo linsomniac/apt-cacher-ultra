@@ -1,9 +1,11 @@
 # Staging CPU evidence
 
-Analysis of the supplied `cpu-info/acu.log` and `cpu-info/config.toml` following
-the [initial review](idle-cpu-review.md). Raw logs and configuration remain
-untracked. Times below use the log's server timestamps; its timezone is not
-specified in the file.
+Historical analysis of the first supplied `cpu-info/acu.log` (September 6–19)
+and `cpu-info/config.toml` following the [initial review](idle-cpu-review.md).
+The log file has since been replaced with a September 20 capture, analyzed in
+the [current-run follow-up](staging-cpu-followup.md). Raw logs and configuration
+remain untracked. Times below use the original log's server timestamps; its
+timezone is not specified in the file.
 
 Follow-up: the [supplied idle CPU profile](idle-cpu-profile.md) confirms admin
 aggregation dominates that later two-minute sample and documents the resulting
