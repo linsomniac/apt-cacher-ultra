@@ -39,6 +39,7 @@ func TestAdminAggregatesCurrentSnapshots(t *testing.T) {
 		{"https", "mirror.example", "/dists/stable", false}, // retained old catalog
 		{"https", "mirror.example", "/dists/members-only", true},
 		{"https", "mirror.example", "/dists/candidate", false},
+		{"https", "other.example", "/dists/pdiff-only", true},
 	}
 	for i, s := range snapshots {
 		id := i + 1
@@ -72,6 +73,11 @@ current_snapshot_id) VALUES (?, ?, ?, ?)`, s.scheme, s.host, s.suite, id)
 		{4, "/pool/shared.deb", "arm64"},
 		{5, "/pool/old.deb", "riscv64"},
 		{7, "/pool/candidate.deb", "mips"},
+		// A pdiff-only group still contributes its architecture and source
+		// snapshot, even though subtracting pdiff leaves zero ordinary rows.
+		// Matching both path patterns must count this row only once.
+		{8, "/dists/pdiff-only/main/source/Sources.diff/Packages.diff/patch.gz", "source"},
+		{8, "/dists/pdiff-only/main/binary-ppc64el/Packages.diff/patch.gz", "ppc64el"},
 	} {
 		s := snapshots[p.snapshot-1]
 		exec(`INSERT INTO package_hash(canonical_scheme, canonical_host, path,
@@ -123,13 +129,13 @@ blob_hash, upstream_url, is_metadata) VALUES (?, ?, ?, ?, ?, 0)`,
 		t.Fatal(err)
 	}
 	wantCoverage := RepoCoverage{
-		ArchitecturesSeen:     []string{"amd64", "arm64", "source"},
-		SnapshotsWithSources:  2,
+		ArchitecturesSeen:     []string{"amd64", "arm64", "ppc64el", "source"},
+		SnapshotsWithSources:  3,
 		SnapshotsWithPdiff:    3,
 		PackageHashRowsBinary: 6,
 		PackageHashRowsSource: 2,
-		PackageHashRowsPdiff:  2,
-		PackageHashRowsTotal:  11,
+		PackageHashRowsPdiff:  4,
+		PackageHashRowsTotal:  13,
 	}
 	if !reflect.DeepEqual(coverage, wantCoverage) {
 		t.Errorf("coverage = %+v, want %+v", coverage, wantCoverage)
@@ -145,7 +151,9 @@ blob_hash, upstream_url, is_metadata) VALUES (?, ?, ?, ?, ?, 0)`,
 			"source": {PackageHashCount: 3, BlobCount: 1, BlobBytes: 123},
 		},
 		"other.example": {
-			"arm64": {PackageHashCount: 1, BlobCount: 1, BlobBytes: 123},
+			"arm64":   {PackageHashCount: 1, BlobCount: 1, BlobBytes: 123},
+			"ppc64el": {PackageHashCount: 1},
+			"source":  {PackageHashCount: 1},
 		},
 	}
 	if !reflect.DeepEqual(summary, wantSummary) {

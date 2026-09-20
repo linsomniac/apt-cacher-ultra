@@ -403,31 +403,30 @@ func (c *Cache) GetRepoCoverage(ctx context.Context) (RepoCoverage, error) {
 	// The existing (scheme, host, snapshot_id, ...) index serves this join.
 	// Grouping by snapshot preserves the distinct source-snapshot count;
 	// grouping by architecture also supplies the architecture list without
-	// a second package_hash scan. Keep the path classifier case-sensitive.
+	// a second package_hash scan. Count pdiff rows inside each group instead
+	// of sorting by their computed kind, then classify the remaining rows by
+	// architecture. Keep the path classifier case-sensitive.
 	rows, err := tx.QueryContext(ctx, `
-SELECT sf.current_snapshot_id, p.architecture,
-  CASE
-    WHEN p.path GLOB '*/Packages.diff/*' OR p.path GLOB '*/Sources.diff/*' THEN 'pdiff'
-    WHEN p.architecture = 'source' THEN 'source'
-    WHEN p.architecture != '' THEN 'binary'
-    ELSE 'other'
-  END AS kind,
-  count(*) AS n
+SELECT sf.current_snapshot_id, p.architecture, count(*) AS n,
+  sum(CASE
+    WHEN p.path GLOB '*/Packages.diff/*' OR p.path GLOB '*/Sources.diff/*' THEN 1
+    ELSE 0
+  END) AS pdiff
 FROM suite_freshness sf
 CROSS JOIN package_hash p
   ON sf.canonical_scheme = p.canonical_scheme
  AND sf.canonical_host   = p.canonical_host
  AND sf.current_snapshot_id = p.snapshot_id
-GROUP BY sf.current_snapshot_id, p.architecture, kind`)
+GROUP BY sf.current_snapshot_id, p.architecture`)
 	if err != nil {
 		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage package aggregates: %w", err)
 	}
 	architectures := make(map[string]struct{})
 	sourceSnapshots := make(map[int64]struct{})
 	for rows.Next() {
-		var snapshotID, n int64
-		var arch, kind string
-		if err := rows.Scan(&snapshotID, &arch, &kind, &n); err != nil {
+		var snapshotID, n, pdiff int64
+		var arch string
+		if err := rows.Scan(&snapshotID, &arch, &n, &pdiff); err != nil {
 			_ = rows.Close()
 			return RepoCoverage{}, fmt.Errorf("GetRepoCoverage package aggregates scan: %w", err)
 		}
@@ -436,15 +435,12 @@ GROUP BY sf.current_snapshot_id, p.architecture, kind`)
 		}
 		if arch == "source" {
 			sourceSnapshots[snapshotID] = struct{}{}
+			r.PackageHashRowsSource += n - pdiff
+		} else if arch != "" {
+			r.PackageHashRowsBinary += n - pdiff
 		}
-		switch kind {
-		case "binary":
-			r.PackageHashRowsBinary += n
-		case "source":
-			r.PackageHashRowsSource += n
-		case "pdiff":
-			r.PackageHashRowsPdiff += n
-		}
+		// Pdiff takes precedence over source, binary and empty architecture.
+		r.PackageHashRowsPdiff += pdiff
 		// Legacy empty-architecture rows still contribute to the total.
 		r.PackageHashRowsTotal += n
 	}

@@ -70,12 +70,13 @@ failures are reported. Warning volume alone does not establish a CPU bottleneck.
 
 ## Updated priorities
 
-1. **Measure recurring admin recalculation.** All 20 freshness batches can
+1. **Reduce recurring admin recalculation cost.** All 20 freshness batches can
    invalidate the summaries through timestamp writes, even when the upstream
    returns 304. Active adoptions add blob writes and heartbeats. The earlier
    two-minute quiet profile establishes the cost between writes, not the cost
-   over this full scheduler/adoption cycle. Existing refresh and reuse counters
-   reveal actual computation frequency without restarting.
+   over this full scheduler/adoption cycle. The later metrics snapshot below
+   confirms 87 computations of each aggregate and makes these queries a
+   concrete optimization target.
 2. **Investigate verified package reuse during adoption.** Prefetch activity is
    now directly observed in the current run. Avoiding downloads and writes for
    already-present, hash-verified content remains promising, while preserving
@@ -101,8 +102,8 @@ feeds both admin results from one package aggregate query. The pdiff-member
 and cached-blob queries are unchanged. Complete results must match the current
 production helpers before timing begins; fixture creation is excluded.
 
-With 100,000 current and 900,000 retained package rows, three runs of three
-iterations each gave these median combined query times on the development
+At commit `aa52082`, with 100,000 current and 900,000 retained package rows,
+three runs of three iterations each gave these median combined query times on the development
 machine (Go 1.26.5, Linux amd64, Intel i7-10750H):
 
 | Implementation | Median wall time per pair |
@@ -116,7 +117,7 @@ exact-result comparison with multiple hosts and suites, shared cached blobs,
 source and pdiff rows, empty architectures, case-sensitive path classification
 and a current snapshot containing only metadata members.
 
-Reproduce the repeated timing comparison with:
+Run the repeated timing comparison with:
 
 ```sh
 go test ./internal/cache -run '^$' \
@@ -125,20 +126,115 @@ go test ./internal/cache -run '^$' \
 ```
 
 Run both fixtures by omitting `/ExistingFixture/` from the benchmark pattern.
+The measurements above predate the coverage-only production optimization below;
+the benchmark compares against the current production helpers, so running it on
+a newer commit changes its baseline.
 No production query or refresh behavior changes in this experiment. Integrating
 it must preserve the two stages' independent failure and retry handling and
 define timeout and publication behavior; the prototype does not establish those
-properties. The metrics snapshot below will help determine how often this
-saving could apply to the affected process.
+properties. The metrics snapshot below establishes that expensive queries
+continue to run regularly on the affected process.
 
-## Next measurement without restarting
+## Later cumulative metrics
 
-The current metrics snapshot can show cumulative computations since this known
-startup, even though no monitoring system was scraping them:
+The user supplied a full metrics response from the same reported build,
+`1.0.1-6-g9253467`. Its process start time is 1789929045 and the most recent
+synchronous admin refresh timestamp is 1789945759, approximately **4h38m34s**
+later. The response reports process CPU of **405.66 seconds**, averaging about
+**2.43% of one CPU core**. This is a longer observation window than the log
+above, and its totals must not be attributed to the earlier 75-minute capture.
+
+| Admin stage | Computations | Reuses | Total wall time | Mean wall time per computation |
+| --- | ---: | ---: | ---: | ---: |
+| Repository coverage | 87 | 464 | 150.322 s | 1.728 s |
+| Cache summary | 87 | 464 | 49.784 s | 0.572 s |
+| Pool filesystem walk | 551 | — | 18.338 s | 33.3 ms |
+| Basic cache statistics | 551 | — | 7.723 s | 14.0 ms |
+| Suite statistics | 551 | — | 0.312 s | 0.566 ms |
+| Database revision check | 1,276 | — | 0.116 s | 0.091 ms |
+
+All reported refresh failure counters are zero. Reuse avoided **84.2%** of
+coverage and summary calculations (464 of 551 opportunities for each). The
+remaining 87 pairs consumed **200.106 seconds wall time**, averaging 2.300
+seconds per pair. That is about one computed pair every 3m12s over the capture,
+consistent with freshness batches plus adoption writes, but the counters do
+not identify each invalidating transaction.
+
+These are not CPU timers: **200 seconds of query wall time is not proof that
+these queries consumed half of the 405.66 CPU seconds**. Earlier CPU profiles
+establish that these scans can be CPU-heavy. Together, the profile and current
+metrics justify prioritizing cheaper aggregate queries before investigating
+the small revision-observer overhead. Coverage accounts for about 75% of the
+two queries' measured wall time, making a coverage-only SQL optimization a
+useful alternative to coupling both stages in the shared-scan prototype.
+
+The longer capture also reports seven successful adoptions, 404 freshness
+checks (376 HTTP 304, 21 unchanged-content HTTP 200, seven changed), one startup
+GC and no recorded periodic GC or at-rest integrity scans. Adoption durations
+sum to 434.072 seconds wall time, including network and disk waits and possible
+overlap. `acu_hot_prefetch_total` counts seven completed prefetch operations,
+not individual package downloads; it cannot update the earlier log's package
+count. There are no proxy-request or dashboard-render samples and only two
+recorded metrics scrapes, reinforcing that this work runs without those clients.
+
+## Implemented coverage-only optimization
+
+`GetRepoCoverage` now groups package rows by snapshot and architecture, counting
+pdiff rows with a conditional sum. It derives the remaining source/binary counts
+from each group's architecture. The previous query also sorted/grouped by a
+computed kind string. Removing that grouping key reduces work while keeping the
+same selected rows, case-sensitive path classification and complete output.
+
+The two coverage queries still share one read-only transaction. The separate
+cache-summary stage, per-stage deadlines, error handling, revision checks and
+refresh cadence are preserved. There is no schema change or additional write
+overhead. Request serving, adoption, verification, GC and offline availability
+are unaffected by this query change.
+
+The durable `BenchmarkCoverageGrouping` keeps the old query as a benchmark-only
+baseline and compares it with the actual production method. Exact outputs must
+match before timing starts. Three iterations across three repeats, on the same
+development machine as above, produced these medians:
+
+| Fixture | Previous query | Production query | Reduction in query wall time |
+| --- | ---: | ---: | ---: |
+| One host / suite | 197.66 ms | 170.38 ms | 13.8% |
+| Multiple hosts / suites | 206.95 ms | 181.16 ms | 12.5% |
+
+Both fixtures contain 100,000 current and 900,000 retained package rows.
+An earlier prototype run measured 16–18% improvement; the actual-production run
+had more timing variability, so **about 12–14%** is the appropriate result to
+report here. These are local query wall times, not staging CPU measurements or
+daemon-wide savings. Reproduce with:
 
 ```sh
-curl -fsS http://127.0.0.1:6789/metrics | grep -E \
-  '^(process_(cpu_seconds_total|start_time_seconds)|acu_admin_refresh_(duration_seconds_(sum|count)|reused_total|failures_total))([ {])'
+go test ./internal/cache -run '^$' \
+  -bench '^BenchmarkCoverageGrouping/' -benchtime=3x -count=3 -benchmem
+```
+
+The existing aggregate regression fixture now includes a snapshot containing
+only source/binary pdiff rows. It checks that those architectures and the source
+snapshot remain represented even when their ordinary source/binary counts are
+zero, and that a path matching both pdiff patterns counts once. Existing cases
+cover empty architectures, mixed kinds, current/displaced snapshots, origin
+filtering, shared blobs and member-only coverage.
+
+Validation passed: `go test ./...`, `golangci-lint run ./cmd/... ./internal/...`,
+and the repeated production-versus-baseline benchmarks above. Ultra-effort
+reviewers checked the metrics interpretation, implementation plan and final
+query semantics.
+
+## Collecting another snapshot
+
+No additional snapshot is needed to establish that admin computations recur.
+For a future before/after comparison, this filter uses separate, short patterns
+so copying it does not require keeping a long parenthesized expression intact:
+
+```sh
+curl -fsS http://127.0.0.1:6789/metrics | \
+  grep -e '^process_cpu_seconds_total ' -e '^process_start_time_seconds ' \
+       -e '^acu_admin_refresh_' | \
+  grep -v '_bucket'
 ```
 
 For each of `repo_coverage` and `cache_summary`, duration `_count` is the number
@@ -147,7 +243,10 @@ wall time, not CPU. Repeating the snapshot after five to ten minutes and keeping
 the process identity provides a useful delta. An adoption-window CPU profile can
 then separate hashing, SQL, decompression, network handling and heartbeat work
 if needed. Enable the optional profiler for that later measurement; collect the
-current process's counters before any restart resets them.
+current process's counters before any restart resets them. A newline inserted
+inside the earlier quoted extended expression makes grep parse separate,
+unbalanced patterns. The resulting curl error 23 is a consequence of grep
+closing the pipe, not an application metrics failure.
 
 Two independent ultra-effort reviews checked the log totals and the resulting
 plan. Raw logs and configuration remain untracked and unmodified.
