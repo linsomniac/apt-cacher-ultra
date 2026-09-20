@@ -12,6 +12,9 @@ package-prefetch reuse for further investigation.
 The subsequent [idle CPU profile](idle-cpu-profile.md) attributes 96.57% of its
 sampled CPU to repository coverage and cache-summary queries. These aggregates
 now reuse successful results while SQLite reports no committed database change.
+The verified capture after this fix shows **0.15 CPU-seconds over two minutes**,
+versus 7.00–8.47 seconds in the baselines: approximately **98% less sampled idle
+CPU**, averaging 0.125% of one CPU. See the profile report for measurement limits.
 
 Here, cache GC means deleting obsolete cache records and files. Go's runtime
 garbage collector is a different subsystem. No production path explicitly calls
@@ -181,12 +184,13 @@ unprofiled process CPU before/after as well.
 
 ## Follow-up decisions
 
-The supplied profile led to aggregate reuse until a committed database change,
-with failed-read retries and detection of mutations during a refresh. Measure
-the resulting build before pursuing further changes. Separate adoption profiles
-can evaluate verified prefetch reuse; filesystem accounting and GC SQL remain
-candidates if future measurements justify them. Preserve reachability, hash,
-signature and offline-serving guarantees throughout.
+The supplied profiles led to aggregate reuse until a committed database change,
+with failed-read retries and detection of mutations during a refresh, and then
+confirmed approximately 98% lower sampled idle CPU. The remaining work is small
+in absolute terms, so this evidence does not warrant further idle-path changes.
+Separate adoption profiles can evaluate verified prefetch reuse; filesystem
+accounting and GC SQL remain candidates if future measurements justify them.
+Preserve reachability, hash, signature and offline-serving guarantees throughout.
 
 ## Validation
 
@@ -200,5 +204,6 @@ GC, profiling lifecycle and final changes. Local checks passed:
 
 Full-workspace lint also visits an existing untracked `debug/dbq` utility, whose
 two unchecked `Close` calls remain outside this change. Docker end-to-end and
-package-install suites were not run. No production daemon was changed, so the
-effect on real-world idle CPU remains to be measured.
+package-install suites were not run. The user subsequently deployed the branch
+build to staging and supplied the [before/after profiles](idle-cpu-profile.md),
+which establish the improvement in those idle windows.

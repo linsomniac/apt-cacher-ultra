@@ -3,10 +3,12 @@
 The supplied idle CPU profiles identify admin database aggregation as the
 dominant CPU consumer in both baseline captures. They confirm the leading candidate
 from the [code review](idle-cpu-review.md) and [log analysis](staging-cpu-findings.md).
+The verified capture after aggregate reuse was deployed shows approximately
+**98% less sampled idle CPU**, averaging **0.125% of one CPU**.
 The user replaces `cpu-info/acu-idle.cpu.pprof` with each new capture; identify
 captures by their timestamp and embedded build ID. Raw profiles remain untracked.
 
-## Measured work
+## First baseline capture
 
 The profile started September 20, 2026 at 10:24:17 MDT and covers 120 seconds.
 It contains **7.00 CPU seconds**, averaging **5.83% of one CPU**. Its executable
@@ -74,11 +76,52 @@ readlink "/proc/$acu_pid/exe"
 /usr/sbin/apt-cacher-ultra -version
 ```
 
-The running process must contain `7cded10` or a later descendant. A replacement
-installed file does not establish which executable is running; restart after
-installing the new binary and verify the process version before profiling.
-The profile alone does not identify why the earlier executable was captured
-or which version is running now.
+The version checks subsequently confirmed both the installed file and running
+process still reported `1.0.1-3-g72e1298`. The user then deployed the newer build
+and supplied the third capture below. Checking the running process, rather than
+only the installed pathname, remains useful when profiling another deployment.
+
+## Third capture: verified improvement after the fix
+
+The capture starting **11:02:33 MDT** on September 20 has embedded executable
+build ID `59450ef2d7a98a2d2dfe76b0a955fb39a80716c7`. This exactly matches the
+local executable reporting **`1.0.1-5-gf265f42`**, also reported by the user on
+staging. Commit `f265f42` includes the reuse fix in `7cded10` plus documentation
+changes; application code is identical between those two commits.
+
+| Capture | Version | Duration | Sampled CPU time | Average share of one CPU |
+| --- | --- | ---: | ---: | ---: |
+| First baseline, 10:24:17 | `1.0.1-3-g72e1298` | 120 s | 7.00 s | 5.83% |
+| Second baseline, 10:54:51 | `1.0.1-3-g72e1298` | 120.01 s | 8.47 s | 7.06% |
+| After reuse, 11:02:33 | `1.0.1-5-gf265f42` | 120.01 s | **0.15 s** | **0.125%** |
+
+Normalized to elapsed time, the reduction versus these two baselines is
+approximately **97.9%–98.2%**. Neither `GetRepoCoverage` nor
+`GetCacheSummaryByHostArch` appears in the new samples, consistent with avoiding
+the repeated aggregate scans. The small remaining workload is:
+
+| Work | Sampled CPU time | Average share of one CPU |
+| --- | ---: | ---: |
+| Pool filesystem walk | 0.09 s | 0.075% |
+| Basic cache statistics (`GetCacheStats`) | 0.04 s | 0.033% |
+| Other runtime work | 0.02 s | 0.017% |
+
+No cache-cleanup, Go GC or freshness/adoption stack appears in this capture.
+The profile contains only **15 samples at a 10 ms sampling period**, so individual
+shares are coarse. An absent stack means no sampled CPU in that path, not proof
+that the path never executed. There are no accompanying before/after metric
+snapshots to establish exact reuse counts or query counts.
+
+This measures improvement in the supplied idle windows; it is not a prediction
+of process-lifetime CPU or work during adoption, GC, startup or client traffic.
+The earlier 13.79% lifetime figure is still a different workload and interval.
+Unprofiled monitoring over normal operation can establish the broader impact.
+
+The remaining pool walk is 60% of this much smaller profile but only 0.075% of
+one CPU. This capture does not justify adding filesystem accounting complexity
+or reducing any maintenance guarantees. Keep the current behavior and use a
+separate adoption-window profile if further background CPU investigation is
+needed. The optional profiler can be disabled when collection is complete.
 
 ## Implemented response
 
@@ -144,18 +187,19 @@ are not a prediction of CPU consumption on the staging server.
 go test ./internal/cache -run '^$' -bench '^BenchmarkAdminCacheSummaries$' -benchtime=3x -count=1
 ```
 
-The sampled 96.57% identifies work eligible for avoidance when data stays
-unchanged; it is **not a measured reduction from the new build**. Collect another
-120-second idle profile and before/after `/metrics` snapshots using the
-[profiling guide](idle-cpu-review.md#optional-profiles), keeping configuration and
-workload comparable and excluding startup. Reuse counters should rise while
-aggregate computation counts remain steady between writes. Compare unprofiled
-process CPU too, since sampling adds overhead. A separate adoption-window
-profile can guide the prefetch investigation without weakening the offline
-working set.
+The third capture above supplies the measured idle comparison. Future captures
+can use the [profiling guide](idle-cpu-review.md#optional-profiles), with
+before/after `/metrics` snapshots to supplement sampling. Reuse counters should
+rise while aggregate computation counts remain steady between writes. Compare
+unprofiled process CPU too, since sampling adds overhead. A separate
+adoption-window profile can guide the prefetch investigation without weakening
+the offline working set.
 
 Validation passed: `go test ./...`, `go test -race -timeout 5m ./...`,
 `go vet ./...`, and `golangci-lint run ./cmd/... ./internal/...`. Independent
 ultra-effort reviews covered the profile, plan, implementation and tests. Docker
 end-to-end and package-install suites were not rerun for this change. The raw
 profile, logs and supplied configuration remain untracked and unmodified.
+Only documentation changed while analyzing the second and third captures; the
+application checks above apply to the implementation commit. Profile identities,
+sample totals and attribution received an independent ultra-effort review.

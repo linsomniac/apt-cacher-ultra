@@ -7,7 +7,9 @@ specified in the file.
 
 Follow-up: the [supplied idle CPU profile](idle-cpu-profile.md) confirms admin
 aggregation dominates that later two-minute sample and documents the resulting
-optimization. The log-based findings below describe the older build's workload.
+optimization. A verified capture after deploying it shows approximately 98%
+less sampled idle CPU. The log-based findings below describe the older build's
+workload; its lifetime CPU totals are not directly comparable to idle samples.
 
 ## Capture and configuration
 
