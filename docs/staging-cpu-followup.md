@@ -94,46 +94,21 @@ another option: it must ignore irrelevant timestamp changes while preserving
 the timestamps that freshness scheduling needs and detecting all writes that
 actually affect the aggregates.
 
-## Shared-scan benchmark prototype
+## Historical shared-scan experiment
 
-The benchmark-only implementation in
-[`internal/cache/combined_admin_benchmark_test.go`](../internal/cache/combined_admin_benchmark_test.go)
-feeds both admin results from one package aggregate query. The pdiff-member
-and cached-blob queries are unchanged. Complete results must match the current
-production helpers before timing begins; fixture creation is excluded.
+An unimplemented prototype shared one package aggregate query between coverage
+and cache-summary counts. With 100,000 current and 900,000 retained package rows,
+it reduced median combined query wall time from 356.25 ms to 259.27 ms (about
+27%) on the development machine (Go 1.26.5, Linux amd64, Intel i7-10750H).
+Those local results predate the coverage-only optimization below and do not
+measure staging CPU savings. The experiment did not establish production
+timeout, independent-stage failure/retry or publication behavior.
 
-At commit `aa52082`, with 100,000 current and 900,000 retained package rows,
-three runs of three iterations each gave these median combined query times on the development
-machine (Go 1.26.5, Linux amd64, Intel i7-10750H):
-
-| Implementation | Median wall time per pair |
-| --- | ---: |
-| Current separate helpers | 356.25 ms |
-| Shared package scan | 259.27 ms |
-
-That is about **27% less query wall time locally**, not a measurement of CPU
-savings on staging or across the whole daemon. A second fixture also passed
-exact-result comparison with multiple hosts and suites, shared cached blobs,
-source and pdiff rows, empty architectures, case-sensitive path classification
-and a current snapshot containing only metadata members.
-
-Run the repeated timing comparison with:
-
-```sh
-go test ./internal/cache -run '^$' \
-  -bench '^BenchmarkCombinedAdminExperiment/ExistingFixture/' \
-  -benchtime=3x -count=3 -benchmem
-```
-
-Run both fixtures by omitting `/ExistingFixture/` from the benchmark pattern.
-The measurements above predate the coverage-only production optimization below;
-the benchmark compares against the current production helpers, so running it on
-a newer commit changes its baseline.
-No production query or refresh behavior changes in this experiment. Integrating
-it must preserve the two stages' independent failure and retry handling and
-define timeout and publication behavior; the prototype does not establish those
-properties. The metrics snapshot below establishes that expensive queries
-continue to run regularly on the affected process.
+The prototype has been removed; its code remains in
+[commit `aa52082`](https://github.com/linsomniac/apt-cacher-ultra/blob/aa52082/internal/cache/combined_admin_benchmark_test.go).
+Its datasets and coverage checks are retained with `BenchmarkCoverageGrouping`
+in [`coverage_group_benchmark_test.go`](../internal/cache/coverage_group_benchmark_test.go),
+which compares the implemented optimization with the previous production query.
 
 ## Later cumulative metrics
 

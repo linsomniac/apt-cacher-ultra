@@ -7,6 +7,9 @@ package cache
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"io"
+	"log/slog"
 	"reflect"
 	"sort"
 	"testing"
@@ -22,7 +25,7 @@ func BenchmarkCoverageGrouping(b *testing.B) {
 	} {
 		b.Run(fixture.name, func(b *testing.B) {
 			ctx := context.Background()
-			c := seedCombinedAdminExperiment(b, fixture.groups)
+			c := seedCoverageGroupingBenchmark(b, fixture.groups)
 			want, err := coverageGroupByKindBaseline(ctx, c)
 			if err != nil {
 				b.Fatal(err)
@@ -33,6 +36,12 @@ func BenchmarkCoverageGrouping(b *testing.B) {
 			}
 			if !reflect.DeepEqual(got, want) {
 				b.Fatalf("coverage mismatch:\ngot  %+v\nwant %+v", got, want)
+			}
+			if got.PackageHashRowsTotal != 100000 {
+				b.Fatalf("current row count = %d, want 100000", got.PackageHashRowsTotal)
+			}
+			if fixture.groups > 1 && (got.PackageHashRowsPdiff == 0 || got.SnapshotsWithPdiff != 5) {
+				b.Fatalf("fixture missing pdiff coverage cases: %+v", got)
 			}
 			for _, query := range []struct {
 				name string
@@ -129,4 +138,101 @@ WHERE m.path GLOB '*/Packages.diff/Index'
 		return coverage, err
 	}
 	return coverage, nil
+}
+
+// Keep both benchmark datasets at 100k current and 900k retained rows,
+// including their cached-blob layout, for comparable measurements.
+func seedCoverageGroupingBenchmark(b *testing.B, groups int) *Cache {
+	b.Helper()
+	ctx := context.Background()
+	c, err := Open(ctx, b.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = c.Close() })
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	exec := func(query string, args ...any) {
+		b.Helper()
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if groups > 1 {
+		// The same blobs are reachable via multiple paths, architectures,
+		// suites, and hosts. Distinct blob counts are per host/architecture.
+		exec(`WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<49)
+INSERT INTO blob(hash, size, created_at)
+SELECT printf('%064x', 100000+i), 1000+3*i, 1 FROM n`)
+	}
+	for group := 0; group < groups; group++ {
+		host, suite := "mirror.example", "/dists/stable"
+		if groups > 1 {
+			host = fmt.Sprintf("mirror-%d.example", group/2)
+			suite = fmt.Sprintf("/dists/suite-%d", group%2)
+		}
+		for generation := 1; generation <= 10; generation++ {
+			snapshot := group*10 + generation
+			hash := fmt.Sprintf("%064x", snapshot)
+			exec(`INSERT INTO blob(hash, size, created_at) VALUES (?, 1000, 1)`, hash)
+			exec(`INSERT INTO suite_snapshot(snapshot_id, canonical_scheme, canonical_host,
+suite_path, inrelease_hash, created_at, adopted_at)
+VALUES (?, 'https', ?, ?, ?, 1, 1)`, snapshot, host, suite, hash)
+			if groups == 1 {
+				exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000)
+INSERT INTO package_hash(canonical_scheme, canonical_host, path, declared_sha256,
+snapshot_id, package_name, architecture, version)
+SELECT 'https', 'mirror.example', '/pool/pkg-' || i || '.deb', ?, ?,
+'pkg-' || i, CASE WHEN i%10=0 THEN 'source' WHEN i%2=0 THEN 'arm64' ELSE 'amd64' END,
+'1.0' FROM n`, hash, snapshot)
+			} else {
+				exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?)
+INSERT INTO package_hash(canonical_scheme, canonical_host, path, declared_sha256,
+snapshot_id, package_name, architecture, version)
+SELECT 'https', ?, ? ||
+CASE WHEN i%31=0 THEN '/Packages.diff/'
+     WHEN i%37=0 THEN '/Sources.diff/'
+     WHEN i%41=0 THEN '/packages.diff/'
+     ELSE '/pool/' END || 'pkg-' || i || '.deb', ?, ?,
+'pkg-' || i, CASE WHEN i%17=0 THEN '' WHEN i%10=0 THEN 'source'
+                 WHEN i%2=0 THEN 'arm64' ELSE 'amd64' END, '1.0' FROM n`,
+					100000/groups, host, suite, hash, snapshot)
+			}
+		}
+		current := group*10 + 10
+		exec(`INSERT INTO suite_freshness(canonical_scheme, canonical_host, suite_path,
+current_snapshot_id) VALUES ('https', ?, ?, ?)`, host, suite, current)
+		if groups == 1 {
+			exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000)
+INSERT INTO url_path(canonical_scheme, canonical_host, path, blob_hash, upstream_url, is_metadata)
+SELECT 'https', 'mirror.example', '/pool/pkg-' || i || '.deb', ?,
+'https://mirror.example/pool/pkg-' || i || '.deb', 0 FROM n`, fmt.Sprintf("%064x", current))
+		} else {
+			exec(`INSERT INTO url_path(canonical_scheme, canonical_host, path, blob_hash, upstream_url, is_metadata)
+SELECT canonical_scheme, canonical_host, path,
+printf('%064x', 100000+rowid%50), 'https://' || canonical_host || path, 0
+FROM package_hash WHERE snapshot_id=? ORDER BY path LIMIT ?`, current, 1000/groups)
+			exec(`INSERT INTO snapshot_member(snapshot_id, path, blob_hash, declared_sha256)
+VALUES (?, 'main/Packages.diff/Index', ?, ?)`, current, fmt.Sprintf("%064x", current), fmt.Sprintf("%064x", current))
+		}
+	}
+	if groups > 1 {
+		// A current member-only snapshot contributes pdiff coverage but
+		// must not create an empty host bucket in cache_summary.
+		hash := fmt.Sprintf("%064x", 1)
+		exec(`INSERT INTO suite_snapshot(snapshot_id, canonical_scheme, canonical_host,
+suite_path, inrelease_hash, created_at, adopted_at)
+VALUES (1000, 'https', 'member-only.example', '/dists/stable', ?, 1, 1)`, hash)
+		exec(`INSERT INTO suite_freshness(canonical_scheme, canonical_host, suite_path,
+current_snapshot_id) VALUES ('https', 'member-only.example', '/dists/stable', 1000)`)
+		exec(`INSERT INTO snapshot_member(snapshot_id, path, blob_hash, declared_sha256)
+VALUES (1000, 'main/Sources.diff/Index', ?, ?)`, hash, hash)
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+	return c
 }
