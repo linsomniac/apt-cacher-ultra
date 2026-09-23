@@ -568,3 +568,86 @@ func TestPhase3StrictMode_MissPathPopulatesSnapshotCount(t *testing.T) {
 		t.Errorf("current_snapshot_count = %v, want 2 (two full-coverage snapshots adopted)", count)
 	}
 }
+
+// TestPhase3StrictMode_FlatSnapshotScopedToItsDirectory: a flat
+// repository's snapshot never has package coverage, so counted host-wide
+// it would switch strict mode off for every dists repository on the same
+// host. It takes part only for .debs under its own directory (where they
+// pass through); dists snapshots still take part host-wide.
+func TestPhase3StrictMode_FlatSnapshotScopedToItsDirectory(t *testing.T) {
+	type snap struct {
+		suite    string
+		complete bool
+	}
+	fullDists := snap{"/ubuntu/dists/noble", true}
+	cases := []struct {
+		name  string
+		snaps []snap
+		path  string
+		want  int
+	}{
+		{"mixed host: unvouched dists deb still refused",
+			[]snap{fullDists, {"/flat", false}}, "/ubuntu/pool/main/u/unknown/unknown.deb", http.StatusBadGateway},
+		{"mixed host: flat repo's own deb passes through",
+			[]snap{fullDists, {"/flat", false}}, "/flat/amd64/kubelet_1_amd64.deb", http.StatusOK},
+		{"mixed host: `deb <uri> ./` suite scopes to its parent",
+			[]snap{fullDists, {"/flat/.", false}}, "/flat/amd64/kubelet_1_amd64.deb", http.StatusOK},
+		{"mixed host: ./ in the deb path is cleaned",
+			[]snap{fullDists, {"/flat/.", false}}, "/flat/./amd64/kubelet_1_amd64.deb", http.StatusOK},
+		{"mixed host: .. cannot escape into the flat directory",
+			[]snap{fullDists, {"/flat", false}}, "/flat/../ubuntu/pool/unknown.deb", http.StatusBadGateway},
+		{"mixed host: deb outside a sub/ flat directory is not scoped to it",
+			[]snap{fullDists, {"/r/sub", false}}, "/r/amd64/x_1_amd64.deb", http.StatusBadGateway},
+		{"flat-only host: deb outside the flat directory is inactive, not refused",
+			[]snap{{"/flat", false}}, "/other/pool/x_1_amd64.deb", http.StatusOK},
+		{"flat-only host: flat repo's own deb passes through",
+			[]snap{{"/flat", false}}, "/flat/amd64/x_1_amd64.deb", http.StatusOK},
+		{"incomplete dists snapshot still disables strict mode host-wide",
+			[]snap{{"/ubuntu/dists/noble", false}, {"/flat", false}}, "/ubuntu/pool/unknown.deb", http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var upstreamHits atomic.Int32
+			h, srv := newPhase3StrictHandler(t, true, true, &upstreamHits)
+			scheme, host, port := splitURL(t, srv.URL)
+			canonHost := hostKey(host, port)
+			for _, s := range tc.snaps {
+				adoptCoverageComplete(t, h, scheme, canonHost, s.suite, s.complete)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, proxyReq("GET", srv.URL, tc.path))
+			if rec.Code != tc.want {
+				t.Fatalf("GET %s: status=%d, want %d", tc.path, rec.Code, tc.want)
+			}
+			if tc.want == http.StatusBadGateway && upstreamHits.Load() != 0 {
+				t.Errorf("refused request contacted upstream")
+			}
+		})
+	}
+}
+
+// TestPhase3StrictMode_SnapshotCountExcludesOutOfScopeFlat: the
+// current_snapshot_count on a refusal counts the snapshots that took
+// part, so a flat snapshot not covering the .deb is not in it.
+func TestPhase3StrictMode_SnapshotCountExcludesOutOfScopeFlat(t *testing.T) {
+	var upstreamHits atomic.Int32
+	h, srv, logBuf := newPhase3StrictHandlerCapturing(t, true, true, &upstreamHits)
+	scheme, host, port := splitURL(t, srv.URL)
+	canonHost := hostKey(host, port)
+	adoptCoverageComplete(t, h, scheme, canonHost, "/dists/noble", true)
+	adoptCoverageComplete(t, h, scheme, canonHost, "/dists/jammy", true)
+	adoptCoverageComplete(t, h, scheme, canonHost, "/flat", false)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, "/pool/main/u/unknown/unknown.deb"))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	events := logBuf.find("unvouched_deb_refused")
+	if len(events) == 0 {
+		t.Fatalf("no unvouched_deb_refused event")
+	}
+	if count, _ := events[0]["current_snapshot_count"].(float64); int(count) != 2 {
+		t.Errorf("current_snapshot_count = %v, want 2 (the flat snapshot does not take part)", events[0]["current_snapshot_count"])
+	}
+}

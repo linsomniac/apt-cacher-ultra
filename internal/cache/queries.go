@@ -983,7 +983,7 @@ func keepNewestNVersionSet(versions []string, n int) map[string]struct{} {
 // is the contract on this host" — falls through to trust-upstream.
 func (c *Cache) HostCurrentSnapshotsCoverage(ctx context.Context, scheme, host string) ([]SnapshotCoverage, error) {
 	const q = `
-SELECT ss.snapshot_id, ss.package_coverage_complete
+SELECT ss.snapshot_id, ss.suite_path, ss.package_coverage_complete
   FROM suite_snapshot ss
   JOIN suite_freshness sf
     ON sf.canonical_scheme   = ss.canonical_scheme
@@ -1003,7 +1003,7 @@ SELECT ss.snapshot_id, ss.package_coverage_complete
 			sc       SnapshotCoverage
 			coverage int64
 		)
-		if err := rows.Scan(&sc.SnapshotID, &coverage); err != nil {
+		if err := rows.Scan(&sc.SnapshotID, &sc.SuitePath, &coverage); err != nil {
 			return nil, fmt.Errorf("HostCurrentSnapshotsCoverage scan: %w", err)
 		}
 		sc.PackageCoverageComplete = coverage != 0

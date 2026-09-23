@@ -148,6 +148,7 @@ type SuiteSnapshot struct {
 // log unvouched_deb_passthrough_no_coverage.
 type SnapshotCoverage struct {
 	SnapshotID              int64
+	SuitePath               string
 	PackageCoverageComplete bool
 }
 

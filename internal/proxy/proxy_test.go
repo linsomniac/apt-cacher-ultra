@@ -510,6 +510,30 @@ func TestSuitePath(t *testing.T) {
 	}
 }
 
+func TestFlatSuiteDir(t *testing.T) {
+	cases := []struct {
+		suite string
+		dir   string
+		flat  bool
+	}{
+		{"/core:/stable:/v1.34/deb", "/core:/stable:/v1.34/deb", true},
+		{"/core:/stable:/v1.34/deb/.", "/core:/stable:/v1.34/deb", true}, // `deb <uri> ./`
+		{"/ubuntu/dists/noble", "", false},
+		{"/dists/stable", "", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		dir, flat := FlatSuiteDir(c.suite)
+		if dir != c.dir || flat != c.flat {
+			t.Errorf("FlatSuiteDir(%q) = (%q, %v), want (%q, %v)", c.suite, dir, flat, c.dir, c.flat)
+		}
+		// Every flat suite SuitePath produces must be recognised here.
+		if c.flat && SuitePath(c.suite+"/InRelease") != c.suite {
+			t.Errorf("SuitePath(%q) does not round-trip to %q", c.suite+"/InRelease", c.suite)
+		}
+	}
+}
+
 func TestStripPort(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"archive.ubuntu.com", "archive.ubuntu.com"},

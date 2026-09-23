@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -743,7 +744,7 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 			return false, "", 0, 0, false, packageValidation{}
 		}
 		switch sm, snapID, count := h.classifyStrictMode(r.Context(),
-			req.CanonicalScheme, req.CanonicalHost); sm {
+			req.CanonicalScheme, req.CanonicalHost, req.Path); sm {
 		case strictRefuse:
 			st, body := h.refuseUnvouchedDeb(w, req.CanonicalHost, req.Path, count)
 			return true, "unvouched_deb_refused", st, body, false, packageValidation{}
@@ -1354,7 +1355,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 			// that legitimately have no package_hash row.
 			if len(distinct) == 0 && isDebPath(req.Path) {
 				switch sm, snapID, count := h.classifyStrictMode(ctx,
-					req.CanonicalScheme, req.CanonicalHost); sm {
+					req.CanonicalScheme, req.CanonicalHost, req.Path); sm {
 				case strictRefuse:
 					h.logger.Info("unvouched_deb_refused",
 						"canonical_host", req.CanonicalHost,
@@ -2137,11 +2138,24 @@ const (
 // snapshots inspected (the value SPEC3 §10.2 names
 // `current_snapshot_count` on the `unvouched_deb_refused` event; 0 on
 // fail-open paths where no inspection occurred).
-func (h *Handler) classifyStrictMode(ctx context.Context, scheme, host string) (strictModeOutcome, int64, int) {
+//
+// A flat repository's snapshot (proxy.FlatSuiteDir) takes part only for
+// .debs under its own directory, where it can never vouch — flat
+// snapshots have no package coverage (repoRootFromSuitePath: the archive
+// root of a flat repository is ambiguous) — so those .debs pass through.
+// Every /dists/ snapshot on the host still takes part for every .deb, as
+// before flat repositories had snapshots. Counting a flat snapshot
+// host-wide would let one flat repository switch strict mode off for
+// every dists repository on the same host. count is the number of
+// snapshots that took part.
+//
+// debPath is compared cleaned: request paths are not normalised, and
+// "/flat/../ubuntu/pool/x.deb" must not be scoped to the /flat snapshot.
+func (h *Handler) classifyStrictMode(ctx context.Context, scheme, host, debPath string) (strictModeOutcome, int64, int) {
 	if !h.refuseUnvouchedDebs || !h.adoptionEnabled {
 		return strictInactive, 0, 0
 	}
-	rows, err := h.cache.HostCurrentSnapshotsCoverage(ctx, scheme, host)
+	all, err := h.cache.HostCurrentSnapshotsCoverage(ctx, scheme, host)
 	if err != nil {
 		// SPEC3 §6.1 is silent on DB failures of this lookup. The
 		// least-disruptive behavior is "fail open" — strict mode is
@@ -2154,9 +2168,18 @@ func (h *Handler) classifyStrictMode(ctx context.Context, scheme, host string) (
 		)
 		return strictInactive, 0, 0
 	}
+	clean := path.Clean(debPath)
+	rows := all[:0]
+	for _, sc := range all {
+		if dir, flat := proxy.FlatSuiteDir(sc.SuitePath); flat && !strings.HasPrefix(clean, dir+"/") {
+			continue
+		}
+		rows = append(rows, sc)
+	}
 	if len(rows) == 0 {
-		// Host has no adopted suites — strict mode has no contract to
-		// uphold. Phase 1 trust-upstream regime.
+		// Host has no adopted suites that take part for this .deb —
+		// strict mode has no contract to uphold. Phase 1 trust-upstream
+		// regime.
 		return strictInactive, 0, 0
 	}
 	count := len(rows)

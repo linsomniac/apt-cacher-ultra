@@ -150,3 +150,21 @@ func flatSuitePath(p string) string {
 	}
 	return dir
 }
+
+// FlatSuiteDir reports whether suitePath is a flat repository's suite (as
+// returned by SuitePath for a path outside dists/) and, if so, the
+// directory its packages are addressed under: the suite path itself, or
+// its parent for a `deb <uri> ./` suite ("/repo/." -> "/repo"). A
+// /dists/<suite> path returns ("", false).
+//
+// apt fetches a flat repository's .debs at <uri>/<Filename>, and the
+// Filename fields of every flat repository checked (pkgs.k8s.io, OBS) are
+// relative paths such as amd64/kubelet_….deb, so they land under this
+// directory. Strict mode uses it to scope a flat snapshot to its own
+// .debs; keep it in step with flatSuitePath.
+func FlatSuiteDir(suitePath string) (string, bool) {
+	if suitePath == "" || suiteRegex.MatchString(suitePath) {
+		return "", false
+	}
+	return strings.TrimSuffix(suitePath, "/."), true
+}
