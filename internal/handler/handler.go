@@ -2041,11 +2041,16 @@ func archFromPath(p string) string {
 // not on its own "apt update is broken."
 //
 // AIDEV-NOTE: keep in lockstep with internal/freshness indexTargetGroupRE
-// (the adoption-side group key). The two live in different packages on
-// purpose (no import edge), but they describe the SAME surface — the
-// files apt installs from. Widen/narrow them together.
+// and flatIndexTargetGroupRE (the adoption-side group keys). They live in
+// different packages on purpose (no import edge), but they describe the
+// SAME surface — the files apt installs from. Widen/narrow them together.
+//
+// The second alternative is a flat repository's root-level index: the
+// handler passes suite-relative member paths, where a flat suite's
+// Packages is just "Packages.gz".
 var indexTargetPathRE = regexp.MustCompile(
-	`(?:^|/)(?:binary-[a-z][a-z0-9]*/Packages|source/Sources)(?:\.[a-z0-9]+)?$`)
+	`(?:^|/)(?:binary-[a-z][a-z0-9]*/Packages|source/Sources)(?:\.[a-z0-9]+)?$` +
+		`|^(?:Packages|Sources)(?:\.[a-z0-9]+)?$`)
 
 // isIndexTargetPath reports whether a request path is an apt IndexTarget
 // (see indexTargetPathRE). The handler increments a dedicated counter and

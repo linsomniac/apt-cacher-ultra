@@ -668,6 +668,14 @@ func TestIndexTargetGroup(t *testing.T) {
 		{"Contents-amd64.gz", "", "", false},
 		{"main/dep11/Components-amd64.yml.gz", "", "", false},
 		{"InRelease", "", "", false},
+		// Flat repository indexes: Packages serves every arch ("all"),
+		// Sources is the "source" pseudo-arch.
+		{"Packages", "Packages", "all", true},
+		{"Packages.gz", "Packages", "all", true},
+		{"Packages.xz", "Packages", "all", true},
+		{"Sources.gz", "Sources", "source", true},
+		{"Packages.diff/Index", "", "", false},
+		{"main/Packages.gz", "", "", false},
 	}
 	for _, tc := range cases {
 		group, arch, ok := indexTargetGroup(tc.path)

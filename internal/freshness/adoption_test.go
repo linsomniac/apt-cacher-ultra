@@ -787,6 +787,14 @@ func TestIsIndexTarget(t *testing.T) {
 		"main/source/Sources.gz",
 		"main/source/Sources.zst",
 		"main/source/Sources.diff/Index",
+		// A flat repository's (`deb <uri>/ /`) indexes sit at the suite root.
+		"Packages",
+		"Packages.gz",
+		"Packages.xz",
+		"Packages.zst",
+		"Packages.diff/Index",
+		"Sources",
+		"Sources.gz",
 	}
 	optional := []string{
 		"Contents-amd64",
@@ -796,6 +804,10 @@ func TestIsIndexTarget(t *testing.T) {
 		"main/i18n/Translation-en.gz",
 		"Release",
 		"InRelease",
+		// Only a root-level Packages is a flat index; a nested one outside
+		// binary-<arch>/ is not an apt IndexTarget shape.
+		"main/Packages.gz",
+		"Packages_1.0_all.deb",
 	}
 	for _, p := range indexTargets {
 		if !isIndexTarget(p) {
@@ -919,6 +931,71 @@ func TestAdopter_IndexTargetFailureAlwaysFatal(t *testing.T) {
 	err := ad.Run(ctx, env.suite, releaseText, "", "")
 	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
 		t.Errorf("IndexTarget failure must stay fatal even when tolerant; got %v", err)
+	}
+}
+
+// flatSuite is a flat repository (`deb <uri>/ /`): no dists/, Release
+// members declared at the suite root.
+var flatSuite = SuiteRef{CanonicalScheme: "https", CanonicalHost: "pkgs.k8s.io", SuitePath: "/core:/stable:/v1.34/deb"}
+
+// TestAdopter_FlatSuiteAdopts: a flat suite adopts with its root-level
+// Packages fetched relative to the suite path.
+func TestAdopter_FlatSuiteAdopts(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	pkgs := fakePackagesStanzas(map[string]string{"amd64/kubelet_1.deb": strings.Repeat("a", 64)})
+	gz := gzipBytes(pkgs)
+	releaseText, _ := makeRelease(map[string][]byte{"Packages": pkgs, "Packages.gz": gz})
+	base := "https://pkgs.k8s.io/core:/stable:/v1.34/deb/"
+	env.fetcher.put(base+"Packages", pkgs)
+	env.fetcher.put(base+"Packages.gz", gz)
+
+	if err := env.adopter.Run(ctx, flatSuite, releaseText, "", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	sf, err := env.cache.GetSuiteFreshness(ctx, flatSuite.CanonicalScheme, flatSuite.CanonicalHost, flatSuite.SuitePath)
+	if err != nil || sf.CurrentSnapshotID == nil {
+		t.Fatalf("flat suite not adopted: %v", err)
+	}
+	members, err := env.cache.ListSnapshotMembers(ctx, *sf.CurrentSnapshotID)
+	if err != nil {
+		t.Fatalf("ListSnapshotMembers: %v", err)
+	}
+	have := map[string]bool{}
+	for _, m := range members {
+		have[m.Path] = true
+	}
+	for _, want := range []string{"InRelease", "Packages", "Packages.gz"} {
+		if !have[want] {
+			t.Errorf("snapshot missing member %q (have %v)", want, have)
+		}
+	}
+}
+
+// TestAdopter_FlatPackagesFailureFatal: a flat repository's root Packages
+// is an IndexTarget, so its failure aborts adoption even when optional
+// failures are tolerated. Before flat indexes were IndexTargets, the 404
+// was skipped as optional and the suite adopted a snapshot answering apt's
+// Packages request with an authoritative 404. Translation-en is here so the
+// run is not failed by the all-members-4xx guard instead.
+func TestAdopter_FlatPackagesFailureFatal(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newTolerantAdopter(t, env)
+	pkgs := fakePackagesStanzas(map[string]string{"amd64/kubelet_1.deb": strings.Repeat("a", 64)})
+	tr := []byte("Package: kubelet\nDescription-en: kubelet\n")
+	releaseText, _ := makeRelease(map[string][]byte{"Packages.gz": gzipBytes(pkgs), "Translation-en": tr})
+	base := "https://pkgs.k8s.io/core:/stable:/v1.34/deb/"
+	env.fetcher.put(base+"Translation-en", tr)
+	env.fetcher.fail404(base + "Packages.gz")
+
+	err := ad.Run(ctx, flatSuite, releaseText, "", "")
+	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
+		t.Errorf("flat Packages 404 must be fatal; got %v", err)
+	}
+	sf, gerr := env.cache.GetSuiteFreshness(ctx, flatSuite.CanonicalScheme, flatSuite.CanonicalHost, flatSuite.SuitePath)
+	if gerr == nil && sf.CurrentSnapshotID != nil {
+		t.Errorf("a snapshot without Packages was published")
 	}
 }
 
@@ -2116,6 +2193,15 @@ func TestArchFromFilteredPath(t *testing.T) {
 		{"source-Sources.xz", "main/source/Sources.xz", "source", true},
 		{"source-pdiff-index", "main/source/Sources.diff/Index", "source", true},
 
+		// Flat repository (`deb <uri>/ /`): a root Sources is scoped to
+		// "source" like a per-component one; a root Packages carries every
+		// architecture and is never filtered.
+		{"flat-Sources", "Sources", "source", true},
+		{"flat-Sources.xz", "Sources.xz", "source", true},
+		{"flat-Sources-pdiff-index", "Sources.diff/Index", "source", true},
+		{"flat-Packages", "Packages", "", false},
+		{"flat-Packages.gz", "Packages.gz", "", false},
+
 		// SPEC6_7 §7 filter extension — per-arch optional members.
 		// Foreign-arch Contents/cnf/dep11 are the bulk of the ~160
 		// guaranteed-404 fetch attempts per Ubuntu suite when the
@@ -2315,6 +2401,31 @@ func TestMissingRequestableIndexGroups(t *testing.T) {
 			declared:  []ReleaseMember{rm("main/binary-amd64/Packages"), rm("main/binary-armhf/Packages")},
 			fetched:   []ReleaseMember{rm("main/binary-amd64/Packages")},
 			allowlist: nil,
+			want:      nil,
+		},
+		{
+			// A flat repository's single root Packages carries every
+			// architecture, so it is required even with no allowlist: a
+			// snapshot without it answers apt's Packages request with an
+			// authoritative 404 for the snapshot's whole lifetime.
+			name:      "flat Packages declared but not fetched is flagged",
+			declared:  []ReleaseMember{rm("Packages"), rm("Packages.gz")},
+			fetched:   nil,
+			allowlist: nil,
+			want:      []string{"Packages"},
+		},
+		{
+			name:      "flat Packages served by a compressed variant is fine",
+			declared:  []ReleaseMember{rm("Packages"), rm("Packages.gz")},
+			fetched:   []ReleaseMember{rm("Packages.gz")},
+			allowlist: amd64,
+			want:      nil,
+		},
+		{
+			name:      "flat Sources absent is NOT flagged when source not allowlisted",
+			declared:  []ReleaseMember{rm("Packages.gz"), rm("Sources.gz")},
+			fetched:   []ReleaseMember{rm("Packages.gz")},
+			allowlist: amd64,
 			want:      nil,
 		},
 		{

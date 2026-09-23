@@ -472,6 +472,35 @@ func TestSuitePath(t *testing.T) {
 		{"/debian/dists/bookworm-updates/InRelease", "/debian/dists/bookworm-updates"},
 		// nested repo paths
 		{"/some/deep/repo/dists/sid/InRelease", "/some/deep/repo/dists/sid"},
+		// flat repositories: the directory holding the Release files is the suite
+		{"/core:/stable:/v1.34/deb/InRelease", "/core:/stable:/v1.34/deb"},
+		{"/core:/stable:/v1.34/deb/Release", "/core:/stable:/v1.34/deb"},
+		{"/core:/stable:/v1.34/deb/Release.gpg", "/core:/stable:/v1.34/deb"},
+		{"/core:/stable:/v1.34/deb/Packages", "/core:/stable:/v1.34/deb"},
+		{"/core:/stable:/v1.34/deb/Packages.gz", "/core:/stable:/v1.34/deb"},
+		{"/core:/stable:/v1.34/deb/Packages.zst", "/core:/stable:/v1.34/deb"},
+		{"/repo/flat/Sources.xz", "/repo/flat"},
+		// ...but not the packages in it, nor other metadata outside dists/
+		{"/core:/stable:/v1.34/deb/amd64/kubelet_1.34.1-1.1_amd64.deb", ""},
+		{"/repo/flat/Packages_1.0_all.deb", ""},
+		{"/repo/flat/Translation-en", ""},
+		{"/repo/flat/Contents-amd64.gz", ""},
+		{"/repo/flat/by-hash/SHA256/abc", ""},
+		// a flat repository at the host root has no joinable suite path
+		{"/InRelease", ""},
+		{"/Packages.gz", ""},
+		{"InRelease", ""}, // not absolute
+		// `deb <uri> ./` requests <uri>/./InRelease: the literal "/." dir is
+		// the suite, so snapshot lookups strip the same prefix the client sent
+		{"/core:/stable:/v1.34/deb/./InRelease", "/core:/stable:/v1.34/deb/."},
+		{"/core:/stable:/v1.34/deb/./Packages.gz", "/core:/stable:/v1.34/deb/."},
+		// any other non-canonical directory gets no suite (never a cleaned one)
+		{"/repo//InRelease", ""},
+		{"/repo/./sub/InRelease", ""},
+		{"/evil/../pkgs/InRelease", ""},
+		{"/repo/%2E/InRelease", ""},
+		{"/./InRelease", ""},
+		{"/ubuntu/dists//noble/InRelease", ""},
 	}
 	for _, c := range cases {
 		got := SuitePath(c.path)
