@@ -2617,8 +2617,13 @@ func TestHostCurrentSnapshotsCoverage_ReturnsRowsPerCurrentSnapshot(t *testing.T
 		t.Fatalf("got %d rows, want 2 (A current + B current; C never adopted)", len(got))
 	}
 	gotMap := make(map[int64]bool, len(got))
+	wantSuite := map[int64]string{idA: "/dists/A", idB: "/dists/B"}
 	for _, sc := range got {
 		gotMap[sc.SnapshotID] = sc.PackageCoverageComplete
+		// Strict mode scopes flat snapshots by their suite path.
+		if sc.SuitePath != wantSuite[sc.SnapshotID] {
+			t.Errorf("snapshot %d SuitePath = %q, want %q", sc.SnapshotID, sc.SuitePath, wantSuite[sc.SnapshotID])
+		}
 	}
 	if !gotMap[idA] {
 		t.Errorf("A coverage = false, want true")

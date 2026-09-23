@@ -111,6 +111,13 @@ func TestIsIndexTargetPath(t *testing.T) {
 		{"deb-not-flagged", "pool/main/f/foo/foo_1.0_all.deb", false},
 		{"contents-not-flagged", "dists/noble/main/Contents-all.gz", false},
 		{"empty", "", false},
+		// Flat repository: suite-relative member paths are bare basenames.
+		{"flat-Packages", "Packages", true},
+		{"flat-Packages.gz", "Packages.gz", true},
+		{"flat-Sources.xz", "Sources.xz", true},
+		{"flat-inrelease-not-flagged", "InRelease", false},
+		{"flat-deb-not-flagged", "amd64/kubelet_1.34.1-1.1_amd64.deb", false},
+		{"flat-pdiff-not-flagged", "Packages.diff/Index", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

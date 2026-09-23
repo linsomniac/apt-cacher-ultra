@@ -150,7 +150,13 @@ var archFilterBinaryRE = regexp.MustCompile(`(?:^|/)binary-([a-z][a-z0-9]*)/(?:P
 // archFilterSourceRE matches the source-component index files (Sources
 // and Sources.diff/Index) — the §7.2 filter treats these under the
 // pseudo-arch "source".
-var archFilterSourceRE = regexp.MustCompile(`(?:^|/)source/(?:Sources(?:\.(?:gz|xz|bz2))?|Sources\.diff/Index)$`)
+//
+// The second alternative is a flat repository's root-level Sources (see
+// indexTargetRE), so `architectures` without "source" skips it the same
+// way it skips <component>/source/Sources. A flat root Packages is NOT
+// filtered: it carries every architecture in one file.
+var archFilterSourceRE = regexp.MustCompile(`(?:^|/)source/(?:Sources(?:\.(?:gz|xz|bz2))?|Sources\.diff/Index)$` +
+	`|^(?:Sources(?:\.(?:gz|xz|bz2))?|Sources\.diff/Index)$`)
 
 // archFilterOptionalRES are the SPEC6_7 §7 filter extension: per-arch
 // OPTIONAL member shapes — Contents (plain and udeb flavor, component
@@ -221,8 +227,15 @@ func archFromFilteredPath(p string) (arch string, filtered bool) {
 // a suite publishes would adopt an empty index. The `[a-z0-9]+` suffix
 // class matches future/unknown codecs by construction. Never narrow
 // this without a security review — it is the surface apt installs from.
+//
+// The second alternative is a flat repository's index (`deb <uri>/ /`):
+// its Release declares Packages*/Sources* at the suite root, with no
+// binary-<arch>/ or source/ directory. Anchored at the start, so it can
+// only match a root-level member — a dists/<suite> Release never declares
+// one there.
 var indexTargetRE = regexp.MustCompile(
-	`(?:^|/)(?:binary-[a-z][a-z0-9]*/Packages|source/Sources)(?:\.diff/Index|\.[a-z0-9]+)?$`)
+	`(?:^|/)(?:binary-[a-z][a-z0-9]*/Packages|source/Sources)(?:\.diff/Index|\.[a-z0-9]+)?$` +
+		`|^(?:Packages|Sources)(?:\.diff/Index|\.[a-z0-9]+)?$`)
 
 // isIndexTarget reports whether a Release member's suite-relative path
 // is an apt IndexTarget — a per-arch Packages* / per-component Sources*
@@ -247,6 +260,14 @@ func isIndexTarget(p string) bool {
 var indexTargetGroupRE = regexp.MustCompile(
 	`(?:^|/)(binary-([a-z][a-z0-9]*)/Packages|source/Sources)(?:\.[a-z0-9]+)?$`)
 
+// flatIndexTargetGroupRE matches a flat repository's root-level index
+// (see indexTargetRE). Capture 1 is the base name, which is the group key.
+//
+// AIDEV-NOTE: together with indexTargetGroupRE this is the adoption-side
+// half of internal/handler indexTargetPathRE, whose second alternative is
+// the flat shape. Widen/narrow all three together.
+var flatIndexTargetGroupRE = regexp.MustCompile(`^(Packages|Sources)(?:\.[a-z0-9]+)?$`)
+
 // indexTargetGroup classifies a Release member path into its SPEC6_7
 // §6 index-target GROUP: all compression variants of one logical index
 // collapse to a single key (the path minus codec suffix), because an
@@ -259,7 +280,18 @@ var indexTargetGroupRE = regexp.MustCompile(
 // Returns (group key, arch, true) for base IndexTarget shapes — arch
 // is the pseudo-arch "source" for Sources groups — and ("", "", false)
 // for everything else.
+//
+// A flat repository's root Packages holds every architecture in one
+// file, so every client needs it whatever its arch: it groups under the
+// pseudo-arch "all", which missingRequestableIndexGroups always requires.
+// Its root Sources groups under "source", like a per-component one.
 func indexTargetGroup(p string) (group, arch string, ok bool) {
+	if fm := flatIndexTargetGroupRE.FindStringSubmatch(p); fm != nil {
+		if fm[1] == "Sources" {
+			return fm[1], "source", true
+		}
+		return fm[1], "all", true
+	}
 	m := indexTargetGroupRE.FindStringSubmatchIndex(p)
 	if m == nil {
 		return "", "", false

@@ -980,6 +980,57 @@ func TestServeHTTP_FreshnessTriggeredOnMetadataHit(t *testing.T) {
 	}
 }
 
+// TestServeHTTP_FlatRepositoryFreshness: a flat repository's InRelease
+// (`deb <uri>/ /`, no dists/) seeds suite freshness on the miss and fires a
+// freshness check on the hit, under the directory holding it. Before flat
+// repositories had a suite, neither happened and the first InRelease cached
+// was served forever. The "./" case is what apt requests for `deb <uri> ./`:
+// its literal "/." directory is the suite, so the snapshot lookup strips
+// the prefix that client actually sends.
+func TestServeHTTP_FlatRepositoryFreshness(t *testing.T) {
+	cases := []struct{ path, suite string }{
+		{"/core:/stable:/v1.34/deb/InRelease", "/core:/stable:/v1.34/deb"},
+		{"/core:/stable:/v1.34/deb/./InRelease", "/core:/stable:/v1.34/deb/."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			body := []byte("Origin: obs://build.opensuse.org/isv:kubernetes\n")
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+				_, _ = w.Write(body)
+			}))
+			defer srv.Close()
+
+			rec := newRecordingFreshness()
+			h := newTestHandlerWithFreshness(t, rec)
+			defer h.Close()
+
+			miss := httptest.NewRecorder()
+			h.ServeHTTP(miss, proxyReq("GET", srv.URL, tc.path))
+			if miss.Code != http.StatusOK {
+				t.Fatalf("miss status=%d", miss.Code)
+			}
+			if _, err := h.cache.GetSuiteFreshness(context.Background(), "http", "127.0.0.1", tc.suite); err != nil {
+				t.Errorf("InRelease miss did not seed suite %q: %v", tc.suite, err)
+			}
+
+			hit := httptest.NewRecorder()
+			h.ServeHTTP(hit, proxyReq("GET", srv.URL, tc.path))
+			if hit.Code != http.StatusOK || hit.Header().Get("X-Cache") != "HIT" {
+				t.Fatalf("hit status=%d X-Cache=%q", hit.Code, hit.Header().Get("X-Cache"))
+			}
+			select {
+			case <-rec.signal:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("freshness Check never fired after flat InRelease hit")
+			}
+			if calls := rec.snapshot(); len(calls) != 1 || calls[0].suitePath != tc.suite {
+				t.Errorf("calls = %+v, want one for suite %q", calls, tc.suite)
+			}
+		})
+	}
+}
+
 // TestServeHTTP_FreshnessNotTriggeredOnBlobHit asserts that a hit on a
 // non-metadata path (a .deb) does not fire the T1 trigger.
 func TestServeHTTP_FreshnessNotTriggeredOnBlobHit(t *testing.T) {
