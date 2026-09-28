@@ -12,29 +12,34 @@
 
 ## Global Constraints
 
-- Never edit an existing entry of `migrations` in `internal/cache/schema.go`; all schema changes go in the single new v7 entry (spec §6).
+- Never edit an existing entry of `migrations` in `internal/cache/schema.go`. Phase A adds v7, which is the complete schema for every phase (spec §6). Once v7 is committed, a development or test cache may already be at v7, so v7 is never edited either: a later phase that needs another schema change adds v8.
 - Production SQL never uses SQLite clock functions (`strftime`, `CURRENT_TIMESTAMP`, `julianday`, `unixepoch`); persisted stamps come from `wallclock.Now()`.
-- Every persisted Unix stamp comes from `internal/wallclock`; durations, deadlines and in-memory timing use monotonic `time.Now`/`time.Since`.
+- Every persisted Unix stamp comes from `internal/wallclock`; durations, deadlines and in-memory timing use monotonic `time.Now`/`time.Since`. `Checker.now` and `Adopter.now` are wall clocks: never measure a duration with them.
+- Tests that call `wallclock.SetOffsetForTest` never use `t.Parallel()` (the offset is process-global).
+- Simulations (synctest bubbles, `internal/simtest`) cost about 3.5 ms per freshness check and 1 ms per scheduler tick under `-race`. Size each one to finish in under 5 s under `-race` by choosing coarser intervals, never by dropping assertions, and keep each package under 5 min under `-race` (CI runs `go test -race -timeout 10m ./...`).
 - `internal/cache` must not import `internal/proxy`; shared path logic lives in the leaf package `internal/aptpath` (standard library only).
 - Adoption-disabled (Phase 1) behaviour stays as today: with no adopter, nothing refreshes and the seed is today's seed.
 - New code that can block does so on channels/timers, never a `sync.Mutex` held across a wait.
 - Constants from spec §C11: backoff 2 m → 1 h; hold 20 s; phase-A cap 60 s; waiter caps 256 (barrier) and 64 (strict wait); strict wait 15 s; reaps 25 per run; unsigned member cap 1,000; check deadline 2 min; interest window 7 d; marker TTL 365 d; cap-rejection cache 10 min.
 - Config keys and defaults: `adoption.adopt_unsigned = true`; `adoption.flip_quiet_period = "10s"` (0s disables, ≤ 15s); `adoption.max_duration = "30m"` (≥ 1m); `freshness.max_suites = 5000` (≥ 10; per-host = max_suites/10); `gc.suite_idle_ttl = "720h"` (0s disables; else ≥ 24h).
 - Every changed invariant gets an `AIDEV-NOTE`; existing `AIDEV-*` comments are kept and updated, never removed.
-- `go test -race ./...` and `golangci-lint run ./...` are clean, and `gofmt -l .` lists no files beyond the five already listed on `main` (formatter drift we do not touch), at the end of every task that touches Go code.
+- `go test -race ./...` and `golangci-lint run ./...` are clean, and `gofmt -l .` lists no files beyond the five already listed on `main` (formatter drift we do not touch: `cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`), at the end of every task that touches Go code. Never run `gofmt -w` on those five; edit them by hand.
+- Every goroutine started under `internal/freshness` recovers panics (I-1); `grep -n 'go func' internal/freshness/*.go` lists them.
 - Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - Credit: the flat-repository problem was reported and first analysed by Venkat (@venkatamutyala) in PR #8; the final phase adds him to `Contributors.md`.
 
 ## Deliberate deviations from the spec
 
-1. **`anchor_form` trigger fills instead of rejecting** (spec §6 says "a trigger rejects inserts with an empty form"). About 30 existing test fixtures insert `suite_snapshot` rows with raw SQL and no `anchor_form`. The v7 trigger is `AFTER INSERT … WHEN NEW.anchor_form = ''` and sets the form from the hash columns (inline if `inrelease_hash` is set, else detached). Production inserts always set the form explicitly (`InsertCandidateSnapshot`), unsigned snapshots can only be created with an explicit form, and a duplicate of existing content still fails on the unique index when the trigger's UPDATE runs. Phase A updates the spec text to match.
-2. **Production-path fixture for C1** (spec §C1.4 says "a fixture extracted from the production `url_path` snapshot"). Committing real cache paths could leak internal hostnames. Phase A commits a synthetic table of real-world public path shapes, plus an opt-in test that walks a local database when `ACU_URLPATH_FIXTURE_DB` points at one.
+1. **Production-path fixture for C1** (spec §C1.4 says "a fixture extracted from the production `url_path` snapshot"). Committing real cache paths could leak internal hostnames. Phase A commits a synthetic table of public path shapes (plain and special: `+`, `~`, literal `%`, `./`, `:`), plus an opt-in test that walks a local database when `ACU_URLPATH_FIXTURE_DB` points at one (the plan review ran it on the production copy: 1,467 of 1,467 paths round-trip).
+2. **No counter on a `RawPath` mismatch** (spec §C1.2 says a mismatch "increments a counter and falls back"). `aptpath` is standard-library-only, and the fallback is unreachable: escaping is byte-local and a test checks every byte on every toolchain CI builds with, so a Go change to `net/url` fails that test before it ships. The fallback (Go's own escaping, still a correct URL) is kept.
+
+Earlier drafts also filled an empty `anchor_form` from the hash columns instead of rejecting it. The plan review showed that fill can store an empty form under `INSERT OR IGNORE` and can never produce `unsigned`, so phase A follows the spec: a trigger rejects form-less rows, and the 11 test fixtures that insert raw rows name their form.
 
 ## Review Focus
 
 The input classes the spec implies that are most likely to bite users, each pinned by a test in the owning phase:
 
-1. **Upgrading a live v6 cache** (never-adopted suites, legacy flat anchors in `url_path`, suites that are dormant): upgrade must not burst-adopt dormant suites or leave legacy flat suites row-less. Tests: phase A (v6-fixture migration), D (legacy `dists/` onboarding), E (production-shaped fixture), G (legacy flat onboarding).
+1. **Upgrading a live v6 cache** (never-adopted suites, legacy flat anchors in `url_path`, suites that are dormant): upgrade must not burst-adopt dormant suites or leave legacy flat suites row-less. Tests: phase A (v6-fixture migration, backfill correlation, atomic rollback), D (legacy `dists/` onboarding), E (production-shaped fixture), G (legacy flat onboarding).
 2. **Paths with unusual bytes** (`+`, `~`, `%`, space, UTF-8, `|{}`) must reach upstream as apt would send them and map back to the same cache key. Test: phase A (encoding table and round trip).
 3. **Upstreams answering 200 HTML for missing files** (soft-404, captive portals, maintenance pages) must never become anchors, suites, or refreshed indexes. Tests: phase D (sniffs), E (classification), G (anchorless sniff rejection).
 4. **Clients sharing one apt queue** (mirror mode, many sources on one host) during flips must not straddle. Test: phase C (cross-suite hold test).
@@ -42,7 +47,7 @@ The input classes the spec implies that are most likely to bite users, each pinn
 
 ## Phases
 
-Each phase: write its detailed plan (`2026-09-28-flat-repositories-<letter>-<name>.md`) → max-effort plan review → implement task by task (TDD) → full race suite + lint → max-effort review of the phase diff → fixes → commit → update memory.
+Each phase: write its detailed plan (`2026-09-28-flat-repositories-<letter>-<name>.md`) → max-effort plan review (reviewers apply the plan in a throwaway worktree and mutation-test its tests) → implement task by task (TDD) → full race suite + lint → max-effort review of the phase diff → fixes → commit → update memory.
 
 | Phase | Plan file | Spec sections | Depends on | Status |
 |---|---|---|---|---|
@@ -65,19 +70,19 @@ Created in phase A (exact signatures in the phase A plan):
 - `aptpath.AptEncodePath(p string) string`, `aptpath.BuildUpstreamURL(scheme, authority, path string) string`
 - `cache.AnchorForm` with `cache.FormInline`, `cache.FormDetached`, `cache.FormUnsigned`
 - `cache.SuiteSnapshot.SingleAnchorHash *string`, `.Form cache.AnchorForm`, `.ReleaseDate *int64`, `.RetiredAt *int64`
-- `cache.SnapshotCandidate.Form cache.AnchorForm` (empty ⇒ derived from hash columns)
-- v7 columns and table exactly as spec §6 (`suite_freshness.last_requested_at`, `adoption_fail_*`; `suite_snapshot.anchor_form`, `release_date`, `retired_at`; `package_hash.flat_filename`; `suite_signed_seen`)
+- `cache.SnapshotCandidate.Form cache.AnchorForm` (empty ⇒ derived for the inline and detached hash shapes only; `FormUnsigned` is never derived), `cache.ErrInvalidAnchorForm`
+- v7 columns and table exactly as spec §6 (`suite_freshness.last_requested_at`, `adoption_fail_*`; `suite_snapshot.anchor_form` with the rejecting trigger, `release_date`, `retired_at`; `package_hash.flat_filename`; `suite_signed_seen`); `migrationGoSteps`. New suite rows get `last_requested_at = now` on insert (`PutSuiteFreshness`, `CommitAdoption`), so no row is created without an interest stamp.
 - `handler.Fetcher` interface (`HostAllowed`, `Fetch`)
-- `freshness.ErrAdoptionPanicked`, `freshness.ErrAdoptionGuardFailed`
-- Test harness `internal/simtest` (synctest helpers)
+- `freshness.ErrAdoptionPanicked`, `freshness.ErrAdoptionGuardFailed`, `(*Checker).recoverGoroutine(where, suite)` (phase B adds the failure record there, before the mutex is released), `(*Checker).clockStep`, `clockStepTolerance` (2 s)
+- Test harness `internal/simtest` (synctest helpers) and the simulation starter `startSimChecker` in `internal/freshness/sim_smoke_test.go`
 
 Later phases add (named here so phase plans stay consistent):
 
-- B: `cache.RecordAdoptionFailure`, `cache.ClearAdoptionFailure`, `freshness.contentKey`, `freshness.backoffDelay`, `cache.ErrSuiteGone`
+- B: `cache.RecordAdoptionFailure`, `cache.ClearAdoptionFailure`, `freshness.contentKey`, `freshness.backoffDelay`. `adoption_next_retry_at` is a future-event stamp: B clamps it to now + 1 h and never routes it through `clockStep`; B tests that a future `next_retry_at` after a backward step yields a retry within 1 h, not immediately. B also records panicked adoptions in the admin adoption ring.
 - C: `flipgate.Gate` with `AnchorStart`, `Flip`
-- D: `cache.CreateSuite`, `cache.UpdateSuiteFreshness`, `cache.TouchSuite`, `cache.MarkSignedSeen`, `aptpath` sniffs (`SniffInRelease`, `SniffRelease`, `SniffReleaseGPG`, `SniffFlatIndex`)
-- E: `freshness` probe classification (`classPresent`, `classAbsent`, `classUnknown`), `Adopter.RunUnsigned`
-- F: `cache.ReapIdleSuite`, `cache.RetireSuiteSnapshots`, admin `POST /forget`
+- D: `cache.CreateSuite`, `cache.UpdateSuiteFreshness`, `cache.TouchSuite`, `cache.MarkSignedSeen`, `cache.ErrSuiteGone` (the UPDATE-only `CommitAdoption` Step 6, spec C3), `aptpath` sniffs (`SniffInRelease`, `SniffRelease`, `SniffReleaseGPG`, `SniffFlatIndex`)
+- E: `freshness` probe classification (`classPresent`, `classAbsent`, `classUnknown`), `Adopter.RunUnsigned`, `aptpath.AnchorPaths(form)` (spec C5). E's unsigned candidates set `Form: cache.FormUnsigned` explicitly, and its tests assert that an unsigned adoption stores `anchor_form = 'unsigned'` and vouches no `.deb`. E also resolves the two `AIDEV-TODO(phase E)` raw-SQL readers (url_path GC guard, `CommitAdoption` anchor seed).
+- F: `cache.ReapIdleSuite`, `cache.RetireSuiteSnapshots`, admin `POST /forget`. Non-canonical legacy suite rows (`!aptpath.IsCanonicalSuitePath`) are reaped regardless of idleness (spec C9); the plan review found none in production.
 - G: `aptpath.IsFlatSuitePath`, `aptpath.FlatBase`, `aptpath.DotClean`, `freshness.validateFilename`
 
 ## Execution handoff
