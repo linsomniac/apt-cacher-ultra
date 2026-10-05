@@ -2322,8 +2322,10 @@ func TestReparseSnapshotRelease_IgnoresArmorInjection(t *testing.T) {
 }
 
 func TestReparseSnapshotRelease_PlainTextInReleaseStillParses(t *testing.T) {
-	// require_signature = false stores a non-clearsigned InRelease; its
-	// whole body is the verified text.
+	// Test fixtures (makeRelease + passThroughVerifier) still adopt
+	// plain-text InRelease bodies until phase D migrates them to
+	// clearsignedFixture(); reconcile keeps parsing them until then.
+	// AIDEV-TODO(phase D): flip to _PlainTextInReleaseIsAnError.
 	env := newAdoptionTestEnv(t)
 	body := "Origin: Test\nSHA256:\n " + strings.Repeat("a", 64) + " 10 main/binary-amd64/Packages\n"
 	id := storeInlineSnapshot(t, env, []byte(body))
@@ -2439,9 +2441,13 @@ and add:
 //
 // AIDEV-NOTE: R-1. Never ParseRelease the raw envelope: lines placed
 // after a forged "=CRC" line inside the signature armor are part of the
-// stored bytes but were never signed. A body with no clearsign marker at
-// all is the require_signature=false "unsigned inline" case, whose whole
-// body is the verified text. The marker test is bytes.Contains, never
+// stored bytes but were never signed. A body with no clearsign marker is
+// returned as-is ONLY because test fixtures still adopt plain-text
+// InRelease bodies through a pass-through verifier; production cannot
+// reach it (VerifyInline rejects plain text in every mode, and the startup
+// audit quarantines legacy plain-text snapshots before any reconcile).
+// AIDEV-TODO(phase D): return an error for a marker-less body once
+// clearsignedFixture() replaces those fixtures. The marker test is bytes.Contains, never
 // HasPrefix (the verifier accepts leading whitespace), and a decode
 // failure is an error, never a raw parse. The decode runs under
 // recover(): a stored blob cannot trigger I-1, but reconcile must never
@@ -3983,7 +3989,7 @@ In `TestClassifyVerifyErr` add the case `{ErrMalformedClearsign, "malformed_clea
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test ./internal/gpg/ -run 'FailsClosed|MalformedEnvelope|RequireFalse|MarkerlessBody|ClassifyVerifyErr'`
+Run: `go test ./internal/gpg/ -run 'FailsClosed|MalformedEnvelope|RequireFalse|MarkerlessBody|ClassifyVerifyErr|EmptyKeyring'`
 Expected: compile failure (`undefined: ErrMalformedClearsign`). With the sentinel added alone, the plain-text and malformed cases under `require=false` FAIL (the body comes back verbatim) and the adoption test FAILS (a snapshot is created).
 
 - [ ] **Step 3: Implement**
@@ -4005,7 +4011,7 @@ In `internal/gpg/verifier.go`:
 	ErrMalformedClearsign = errors.New("InRelease clearsign envelope is malformed")
 ```
 
-2. Make Task 9's panic sentinel part of the malformed class:
+2. Make Task 9's panic sentinel part of the malformed class — **replace** Task 9's `var errClearsignPanicked = errors.New(…)` definition (a second `var` does not compile):
 
 ```go
 var errClearsignPanicked = fmt.Errorf("%w (decoder panicked)", ErrMalformedClearsign)
@@ -4036,7 +4042,36 @@ var errClearsignPanicked = fmt.Errorf("%w (decoder panicked)", ErrMalformedClear
 
 4. Delete the `requireSignature` field from `Verifier` and its assignment in `NewVerifier`. Keep `VerifierConfig.RequireSignature` (callers and tests set it) with the doc comment: `// RequireSignature no longer affects verification (spec C5 rev 4); cmd uses adoption.require_signature only for its empty-keyring startup gate.` Update the `VerifyInline` doc comment's "Order of checks" item 3 to: "Decode the clearsigned block; a body without the marker is ErrMissingSignature, one that does not decode is ErrMalformedClearsign, in every mode." Update the comment above `requireBareClearsigned`'s call ("plain-text bodies … reach the no-clearsign branch") to say they reach `ErrMissingSignature`.
 
-5. In `ClassifyVerifyErr` add before the `ErrMissingSignature` case:
+5. Empty keyring without a matching pin (possible since `require_signature = false` admits an empty keyring at startup) currently reports "pin matched but no key in host keyring satisfies it". In both `VerifyInline` and `VerifyDetached`, capture `resolveTrustSet`'s third result (`pinned`, today discarded as `_`) and replace the `len(trustSet) == 0` branch with:
+
+```go
+	if len(trustSet) == 0 {
+		if !pinned {
+			return nil, fmt.Errorf("%w: the host keyring is empty — signed suites cannot adopt until keys are installed or adoption.accept_any_signer is set", ErrNoUsableSignature)
+		}
+		return nil, fmt.Errorf("%w: pin matched but no key in host keyring satisfies it", ErrNoUsableSignature)
+	}
+```
+
+   and add to `failclosed_test.go`:
+
+```go
+func TestVerifyInline_EmptyKeyringSaysSo(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t), RequireSignature: false, Logger: silentLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = v.VerifyInline(context.Background(), newSuite(), clearsignWith(t, signer, []byte(fakeReleasePlaintext)))
+	if !errors.Is(err, ErrNoUsableSignature) || !strings.Contains(err.Error(), "keyring is empty") {
+		t.Fatalf("err = %v, want ErrNoUsableSignature naming the empty keyring", err)
+	}
+}
+```
+
+   (add `"strings"` to the test imports).
+
+6. In `ClassifyVerifyErr` add before the `ErrMissingSignature` case:
 
 ```go
 	case errors.Is(err, ErrMalformedClearsign):
@@ -4045,7 +4080,7 @@ var errClearsignPanicked = fmt.Errorf("%w (decoder panicked)", ErrMalformedClear
 
 In `internal/admin/status.go` `reasonTooltip`: change the `missing_signature` text to `"InRelease body is not clearsigned. Plain-text InRelease files are never adopted as signed metadata, whatever adoption.require_signature says."` and add `case "malformed_clearsign": return "InRelease starts like a clearsigned message but its signature frame does not decode."`.
 
-In `cmd/apt-cacher-ultra/main.go` replace the `require_signature = false` startup WARN message with: `"adoption.require_signature = false: an empty keyring is allowed at startup; plain-text or malformed InRelease files are still never adopted as signed metadata"`, and update the SPEC2 §5.1 comment above it to say the setting no longer affects verification (spec C5 rev 4).
+In `cmd/apt-cacher-ultra/main.go` replace the `require_signature = false` startup WARN message with: `"adoption.require_signature = false: an empty keyring is allowed at startup; plain-text or malformed InRelease files are never adopted as signed metadata, and with an empty keyring signed suites cannot adopt until keys are installed or adoption.accept_any_signer is set"`, and update the SPEC2 §5.1 comment above it to say the setting no longer affects verification (spec C5 rev 4).
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -4425,20 +4460,20 @@ EOF
 
 ### Task 15: Legacy trust audit at startup (spec §6.1)
 
-Plan review 2026-10-05, findings 1–3: rows written before this release may carry trust they never earned — R-1 members, aliases and `package_hash` rows added from unsigned armor declarations, and plain-text "InRelease" snapshots adopted through the old fallback — and suites that were served signed metadata but never adopted have no signed-seen history. This task drains the `legacy_trust_audit` queue (Task 5) at every start, before anything serves, and runs the marker pass over cached anchors.
+Plan review 2026-10-05, findings 1–3: rows written before this release may carry trust they never earned — R-1 members, aliases and `package_hash` rows added from unsigned armor declarations, and plain-text "InRelease" snapshots adopted through the old fallback — and suites that were served signed metadata but never adopted have no signed-seen history. This task drains the `legacy_trust_audit` queue (Task 5) at every start, before anything serves, and runs the marker pass over cached anchors. A follow-up review added: I/O faults must never become quarantines (pre-flight + abort), anchor blobs are hash-checked, batches commit in one transaction, and the detached path is tested.
 
 **Files:**
 - Create: `internal/cache/legacy_audit.go`, `internal/cache/legacy_audit_test.go`, `internal/freshness/legacy_audit.go`, `internal/freshness/legacy_audit_test.go`
-- Modify: `internal/cache/adoption.go` (`CommitAdoption`: retired guard; Step 8 moves into `decrementSnapshotRefcountsTx`), `internal/cache/adoption.go` also gains `ErrSnapshotRetired` next to `ErrSnapshotAlreadyAdopted` (line ~15), `internal/freshness/metrics.go` (`legacyQuarantinedTotal`), `cmd/apt-cacher-ultra/main.go` (call the audit after `SweepTmp`)
+- Modify: `internal/cache/adoption.go` (`CommitAdoption`: retired guard; Step 8 moves into `decrementSnapshotRefcountsTx`; `ErrSnapshotRetired` next to `ErrSnapshotAlreadyAdopted`, line ~15), `internal/freshness/metrics.go` (`legacyQuarantinedTotal`), `cmd/apt-cacher-ultra/main.go` (call the audit after `SweepTmp`)
 
 **Interfaces:**
-- Consumes: Task 5 (`legacy_trust_audit`, `FormInline`/`FormDetached`, `SingleAnchorHash` from Task 6, `RetiredAt` from Task 6); Task 8 (`inReleasePlaintext`, test helpers `clearsignForTest`); Task 14 (`aptpath.SniffInRelease`, `aptpath.SniffReleaseGPG`, `aptpath.SniffHeadBytes`, `aptpath.MarkerBase`, `markSignedSeen`, `MarkSignedSeenBatch`, `SignedSeenMark`, `SignedSeen`); existing helpers `openCache`, `stubNow`, `seedBlob` (cache) and `newAdoptionTestEnv` (freshness; `env.adopter.writeBlobBytes`).
+- Consumes: Task 5 (`legacy_trust_audit`, `FormInline`/`FormDetached`), Task 6 (`SingleAnchorHash`, `RetiredAt`), Task 8 (`inReleasePlaintext`, test helper `clearsignForTest`), Task 14 (`aptpath.SniffInRelease`, `aptpath.SniffReleaseGPG`, `aptpath.SniffHeadBytes`, `aptpath.MarkerBase`, `markSignedSeen`, `MarkSignedSeenBatch`, `SignedSeenMark`, `SignedSeen`); existing helpers `openCache`, `stubNow`, `seedBlob` (cache), `newAdoptionTestEnv`, `hashOf` (freshness; `env.adopter.writeBlobBytes(ctx, []byte) (string, error)`), `testHex64` (Task 4); `(*cache.Cache).Dir()`.
 - Produces:
-  - cache: `type LegacyAuditItem struct{ SnapshotID int64; CanonicalScheme, CanonicalHost, SuitePath string; Form AnchorForm; SingleAnchorHash *string; Missing bool }`; `LegacyAuditBatch(ctx, limit int) ([]LegacyAuditItem, error)`; `QuarantineLegacySnapshot(ctx, snapshotID int64, markSigned bool) (wasCurrent bool, err error)`; `CompleteLegacyAudit(ctx, snapshotID int64, markSigned bool) error`; `EnqueueLegacyTrustAudit(ctx, ids ...int64) error`; `type TrackedAnchor struct{ CanonicalScheme, CanonicalHost, SuitePath, Path, BlobHash string; SeenAt int64 }`; `ListTrackedSuiteAnchors(ctx) ([]TrackedAnchor, error)`; `ErrSnapshotRetired`; unexported `decrementSnapshotRefcountsTx(ctx, tx *sql.Tx, snapshotID, now int64) error`.
-  - freshness: `RunLegacyTrustAudit(ctx, c *cache.Cache, logger *slog.Logger) (LegacyAuditResult, error)`; `type LegacyAuditResult struct{ Audited, Signed, Quarantined, AnchorMarkers int }`; unexported `classifyLegacyInline(blob []byte) legacyVerdict`.
-  - log events `legacy_snapshot_quarantined` (WARN) and `legacy_trust_audit_completed` (INFO); counter `acu_legacy_snapshots_quarantined_total` (unlabelled).
+  - cache: `type LegacyAuditItem struct{ SnapshotID int64; CanonicalScheme, CanonicalHost, SuitePath string; Form AnchorForm; SingleAnchorHash *string; Missing bool }`; `LegacyAuditBatch(ctx, limit int) ([]LegacyAuditItem, error)` (limit ≤ 0 = all); `type LegacyAuditOutcome int` with `LegacyAuditKeep`, `LegacyAuditDrop`, `LegacyAuditQuarantine`, `LegacyAuditQuarantineSigned`; `type LegacyAuditDecision struct{ SnapshotID int64; Outcome LegacyAuditOutcome }`; `ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision) (wasCurrent map[int64]bool, err error)`; `EnqueueLegacyTrustAudit(ctx, ids ...int64) error`; `type TrackedAnchor struct{ CanonicalScheme, CanonicalHost, SuitePath, Path, BlobHash string; SeenAt int64 }`; `ListTrackedSuiteAnchors(ctx) ([]TrackedAnchor, error)`; `ClearSignedSeenForTest(ctx) error`; `ErrSnapshotRetired`; unexported `decrementSnapshotRefcountsTx(ctx, tx *sql.Tx, snapshotID, now int64) error`.
+  - freshness: `RunLegacyTrustAudit(ctx, c *cache.Cache, logger *slog.Logger) (LegacyAuditResult, error)`; `type LegacyAuditResult struct{ Audited, Signed, Quarantined, AnchorMarkers int }`; unexported `classifyLegacyInline(blob []byte) legacyVerdict`, `auditLegacySnapshot(c, item) (legacyVerdict, error)`, `preflightLegacyAudit(ctx, c) error`; test seams `legacyAuditBatchSize`, `legacyAuditAnchorCap`, `legacyAuditAfterBatch`.
+  - log events `legacy_snapshot_quarantined` (WARN), `legacy_trust_audit_progress` and `legacy_trust_audit_completed` (INFO); counter `acu_legacy_snapshots_quarantined_total` (unlabelled).
 
-Decisions this task implements (spec §6.1): quarantine, not in-place repair; a quarantined snapshot loses its current pointer (refcounts released exactly once), is retired, and can never be committed; its suite falls back to Phase 1 serving until it re-adopts. A tampered but decodable envelope (R-1) still proves the upstream signs, so it is quarantined **and** marked; plain-text, undecodable and unreadable anchors get no marker.
+Decisions this task implements (spec §6.1): quarantine, not in-place repair; a quarantined snapshot loses its current pointer (pins released exactly once), is retired, and can never be committed; its suite falls back to Phase 1 serving until it re-adopts. A decodable but tampered or unparseable envelope still proves the upstream signs: quarantined **and** marked. Plain-text, undecodable, missing, oversized and corrupt anchors get no marker. Any pool read error other than "does not exist" aborts startup without changing anything.
 
 - [ ] **Step 1: Write the failing cache tests**
 
@@ -4462,8 +4497,8 @@ func refcount(t *testing.T, c *Cache, hash string) int64 {
 	return b.RefCount
 }
 
-// commitInline adopts an inline snapshot of suite with the given members
-// and returns its id.
+// commitInline adopts an inline snapshot of suite with the given extra
+// members and returns its id.
 func commitInline(t *testing.T, c *Cache, suite, anchor string, extra ...SnapshotMember) int64 {
 	t.Helper()
 	ctx := context.Background()
@@ -4482,9 +4517,19 @@ func commitInline(t *testing.T, c *Cache, suite, anchor string, extra ...Snapsho
 	return id
 }
 
+// applyOne applies a single decision and reports whether it was current.
+func applyOne(t *testing.T, c *Cache, id int64, o LegacyAuditOutcome) bool {
+	t.Helper()
+	cur, err := c.ApplyLegacyAuditDecisions(context.Background(), []LegacyAuditDecision{{SnapshotID: id, Outcome: o}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cur[id]
+}
+
 // Spec §6.1: quarantining a current snapshot clears the pointer, releases
 // its pins exactly once, retires it and dequeues it; a repeat is a no-op.
-func TestQuarantineLegacySnapshot_CurrentReleasesPinsOnce(t *testing.T) {
+func TestApplyLegacyAuditDecisions_QuarantineCurrentReleasesPinsOnce(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	defer stubNow(t, 1_800_000_000)()
@@ -4497,9 +4542,8 @@ func TestQuarantineLegacySnapshot_CurrentReleasesPinsOnce(t *testing.T) {
 	}
 	beforeA, beforeP := refcount(t, c, anchor), refcount(t, c, pkgs)
 
-	wasCurrent, err := c.QuarantineLegacySnapshot(ctx, id, false)
-	if err != nil || !wasCurrent {
-		t.Fatalf("quarantine: wasCurrent=%v err=%v", wasCurrent, err)
+	if !applyOne(t, c, id, LegacyAuditQuarantine) {
+		t.Fatal("quarantine did not report the snapshot as current")
 	}
 	if a, p := refcount(t, c, anchor), refcount(t, c, pkgs); a != beforeA-1 || p != beforeP-1 {
 		t.Fatalf("refcounts after quarantine = %d, %d; want %d, %d", a, p, beforeA-1, beforeP-1)
@@ -4515,15 +4559,15 @@ func TestQuarantineLegacySnapshot_CurrentReleasesPinsOnce(t *testing.T) {
 		t.Fatalf("queue = %+v (%v), want empty", items, err)
 	}
 	// Idempotent: a second quarantine changes nothing.
-	if wasCurrent, err := c.QuarantineLegacySnapshot(ctx, id, false); err != nil || wasCurrent {
-		t.Fatalf("second quarantine: wasCurrent=%v err=%v", wasCurrent, err)
+	if applyOne(t, c, id, LegacyAuditQuarantine) {
+		t.Fatal("second quarantine reported the snapshot as current")
 	}
 	if a := refcount(t, c, anchor); a != beforeA-1 {
 		t.Fatalf("second quarantine changed refcount to %d", a)
 	}
 	// The suite can adopt the same content again: retired rows leave the
-	// natural key (TestCommitAdoption_RefusesRetiredCandidate pins that
-	// the retired row itself can never be committed).
+	// natural key (TestCommitAdoption_RefusesRetiredCandidate pins that the
+	// retired row itself can never be committed).
 	if _, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/q", InReleaseHash: &anchor}); err != nil {
 		t.Fatalf("re-adoption candidate refused: %v", err)
@@ -4531,32 +4575,66 @@ func TestQuarantineLegacySnapshot_CurrentReleasesPinsOnce(t *testing.T) {
 }
 
 // A displaced snapshot's pins were released at displacement: quarantine
-// must not release them again.
-func TestQuarantineLegacySnapshot_DisplacedKeepsRefcounts(t *testing.T) {
+// must release nothing — neither the displaced snapshot's blobs nor the
+// current snapshot's.
+func TestApplyLegacyAuditDecisions_QuarantineDisplacedKeepsRefcounts(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	defer stubNow(t, 1_800_000_000)()
-	old := commitInline(t, c, "/r/dists/d", seedBlob(t, c, "displaced anchor v1"))
+	oldAnchor := seedBlob(t, c, "displaced anchor v1")
+	oldPkgs := seedBlob(t, c, "displaced packages v1")
+	old := commitInline(t, c, "/r/dists/d", oldAnchor,
+		SnapshotMember{Path: "main/binary-amd64/Packages", BlobHash: oldPkgs, DeclaredSHA256: oldPkgs})
 	newAnchor := seedBlob(t, c, "displaced anchor v2")
 	cur := commitInline(t, c, "/r/dists/d", newAnchor)
-	before := refcount(t, c, newAnchor)
-	// CommitAdoption already marked the suite (signed commits are marked); clear it so the
-	// marker assertion below observes markSigned alone.
+	before := map[string]int64{}
+	for _, h := range []string{oldAnchor, oldPkgs, newAnchor} {
+		before[h] = refcount(t, c, h)
+	}
+	// CommitAdoption marks signed commits; clear the markers so the
+	// assertion below observes LegacyAuditQuarantineSigned alone.
 	if _, err := c.db.Exec(`DELETE FROM suite_signed_seen`); err != nil {
 		t.Fatal(err)
 	}
-	if wasCurrent, err := c.QuarantineLegacySnapshot(ctx, old, true); err != nil || wasCurrent {
-		t.Fatalf("quarantine displaced: wasCurrent=%v err=%v", wasCurrent, err)
+	if applyOne(t, c, old, LegacyAuditQuarantineSigned) {
+		t.Fatal("displaced snapshot reported as current")
 	}
-	if got := refcount(t, c, newAnchor); got != before {
-		t.Fatalf("current snapshot's refcount changed: %d -> %d", before, got)
+	for h, want := range before {
+		if got := refcount(t, c, h); got != want {
+			t.Errorf("refcount of %s changed %d -> %d (a double release)", h[:8], want, got)
+		}
 	}
 	sf, err := c.GetSuiteFreshness(ctx, "http", "h", "/r/dists/d")
 	if err != nil || sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != cur {
 		t.Fatalf("current pointer changed: %+v (%v)", sf, err)
 	}
 	if _, ok, _ := c.SignedSeen(ctx, "http", "h", "/r/dists/d"); !ok {
-		t.Fatal("markSigned=true wrote no marker")
+		t.Fatal("LegacyAuditQuarantineSigned wrote no marker")
+	}
+}
+
+// One batch is one transaction: an invalid decision rolls back the
+// decisions before it.
+func TestApplyLegacyAuditDecisions_BatchIsAtomic(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	id := commitInline(t, c, "/r/dists/atomic", seedBlob(t, c, "atomic anchor"))
+	if err := c.EnqueueLegacyTrustAudit(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision{
+		{SnapshotID: id, Outcome: LegacyAuditQuarantine},
+		{SnapshotID: id, Outcome: 0}, // invalid
+	})
+	if err == nil {
+		t.Fatal("invalid outcome accepted")
+	}
+	sf, err := c.GetSuiteFreshness(ctx, "http", "h", "/r/dists/atomic")
+	if err != nil || sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != id {
+		t.Fatalf("partial batch applied: %+v (%v)", sf, err)
+	}
+	if items, _ := c.LegacyAuditBatch(ctx, 10); len(items) != 1 {
+		t.Fatalf("queue = %+v, want the item still queued", items)
 	}
 }
 
@@ -4578,37 +4656,34 @@ func TestCommitAdoption_RefusesRetiredCandidate(t *testing.T) {
 	}
 }
 
-func TestCompleteLegacyAudit_MarksWithAdoptionStamp(t *testing.T) {
+func TestApplyLegacyAuditDecisions_KeepMarksWithAdoptionStamp(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	restore := stubNow(t, 1_700_000_000)
 	signed := commitInline(t, c, "/r/dists/s", seedBlob(t, c, "complete anchor s"))
-	other := commitInline(t, c, "/r/dists/o", seedBlob(t, c, "complete anchor o"))
 	restore()
 	defer stubNow(t, 1_800_000_000)()
-	// CommitAdoption already marked both (signed commits are marked); clear them to observe
-	// CompleteLegacyAudit alone.
 	if _, err := c.db.Exec(`DELETE FROM suite_signed_seen`); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.EnqueueLegacyTrustAudit(ctx, signed, other, 999_999); err != nil {
+	if err := c.EnqueueLegacyTrustAudit(ctx, signed, 999_999); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.CompleteLegacyAudit(ctx, signed, true); err != nil {
-		t.Fatal(err)
+	items, err := c.LegacyAuditBatch(ctx, 0)
+	if err != nil || len(items) != 2 || items[1].SnapshotID != 999_999 || !items[1].Missing || items[0].Missing {
+		t.Fatalf("queue = %+v (%v), want the snapshot and the missing 999999", items, err)
 	}
-	if err := c.CompleteLegacyAudit(ctx, other, false); err != nil {
+	if _, err := c.ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision{
+		{SnapshotID: signed, Outcome: LegacyAuditKeep},
+		{SnapshotID: 999_999, Outcome: LegacyAuditDrop},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if at, ok, _ := c.SignedSeen(ctx, "http", "h", "/r/dists/s"); !ok || at != 1_700_000_000 {
 		t.Fatalf("marker = %d, %v; want the adoption stamp 1700000000", at, ok)
 	}
-	if _, ok, _ := c.SignedSeen(ctx, "http", "h", "/r/dists/o"); ok {
-		t.Fatal("markSigned=false wrote a marker")
-	}
-	items, err := c.LegacyAuditBatch(ctx, 10)
-	if err != nil || len(items) != 1 || items[0].SnapshotID != 999_999 || !items[0].Missing {
-		t.Fatalf("queue = %+v (%v), want only the missing snapshot 999999", items, err)
+	if items, _ := c.LegacyAuditBatch(ctx, 0); len(items) != 0 {
+		t.Fatalf("queue = %+v, want empty", items)
 	}
 }
 
@@ -4629,7 +4704,7 @@ func TestListTrackedSuiteAnchors_OnlyTrackedSignedAnchorNames(t *testing.T) {
 	}
 	put("/r/dists/t/InRelease")
 	put("/r/dists/t/Release.gpg")
-	put("/r/dists/t/Release")         // not a signed anchor name
+	put("/r/dists/t/Release")           // not a signed anchor name
 	put("/r/dists/untracked/InRelease") // no suite_freshness row
 	got, err := c.ListTrackedSuiteAnchors(ctx)
 	if err != nil {
@@ -4659,6 +4734,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -4696,45 +4773,122 @@ func TestClassifyLegacyInline(t *testing.T) {
 	inject := func(evil string) []byte {
 		return append(append(append([]byte{}, signed[:end]...), evil...), signed[end:]...)
 	}
+	// A whitespace-only line inside the SHA256 block: the clearsign decoder
+	// reads it as a blank line; the raw parse must too (no false
+	// quarantine). go-crypto's encoder never emits one, so splice it in.
+	sha := bytes.Index(signed, []byte("SHA256:\n")) + len("SHA256:\n")
+	firstEnd := sha + bytes.IndexByte(signed[sha:], '\n') + 1
+	wsLine := append(append(append([]byte{}, signed[:firstEnd]...), "  \t\n"...), signed[firstEnd:]...)
 	noSHA256 := clearsignForTest(t, "Origin: x\nSuite: y\nMD5Sum:\n "+strings.Repeat("a", 32)+" 1 main/x\n")
 	cases := []struct {
-		name   string
-		blob   []byte
-		signed bool
-		reason string
+		name    string
+		blob    []byte
+		outcome cache.LegacyAuditOutcome
+		reason  string
 	}{
-		{"realistic signed envelope", signed, true, ""},
-		{"leading whitespace", append([]byte("\n \n"), signed...), true, ""},
-		{"plain text (old require_signature=false)", []byte(genuine), false, "legacy_plaintext"},
-		{"marker but no END line", append([]byte{}, signed[:end]...), false, "malformed_envelope"},
-		{"zero plaintext (I-1)", []byte("-----BEGIN PGP SIGNED MESSAGE-----\n\n-----BEGIN PGP SIGNATURE-----\n\nwsBc\n-----END PGP SIGNATURE-----\n"), false, "malformed_envelope"},
-		{"R-1: new member in the armor", inject("=AAAA\nSHA256:\n " + strings.Repeat("e", 64) + " 10 main/binary-evilarch/Packages\n"), false, "unsigned_declarations"},
-		{"R-1: same path, other hash", inject("=AAAA\nSHA256:\n " + strings.Repeat("f", 64) + " 12340 main/binary-amd64/Packages\n"), false, "unsigned_declarations"},
-		{"R-1: same path and hash, other size", inject("=AAAA\nSHA256:\n " + strings.Repeat("0", 64) + " 99 main/binary-amd64/Packages\n"), false, "unsigned_declarations"},
-		{"R-1: unparseable armor declaration", inject("=AAAA\nSHA256:\n not-a-hash x y\n"), false, "unsigned_declarations"},
-		{"signed but no SHA256 block", noSHA256, false, "unparseable"},
+		{"realistic signed envelope", signed, cache.LegacyAuditKeep, ""},
+		{"leading whitespace", append([]byte("\n \n"), signed...), cache.LegacyAuditKeep, ""},
+		{"CRLF line endings", bytes.ReplaceAll(signed, []byte("\n"), []byte("\r\n")), cache.LegacyAuditKeep, ""},
+		{"whitespace-only line in a hash block", wsLine, cache.LegacyAuditKeep, ""},
+		{"plain text (old require_signature=false)", []byte(genuine), cache.LegacyAuditQuarantine, "legacy_plaintext"},
+		{"marker but no END line", append([]byte{}, signed[:end]...), cache.LegacyAuditQuarantine, "malformed_envelope"},
+		{"zero plaintext (I-1)", []byte("-----BEGIN PGP SIGNED MESSAGE-----\n\n-----BEGIN PGP SIGNATURE-----\n\nwsBc\n-----END PGP SIGNATURE-----\n"), cache.LegacyAuditQuarantine, "malformed_envelope"},
+		{"R-1: new member in the armor", inject("=AAAA\nSHA256:\n " + strings.Repeat("e", 64) + " 10 main/binary-evilarch/Packages\n"), cache.LegacyAuditQuarantineSigned, "unsigned_declarations"},
+		{"R-1: same path, other hash", inject("=AAAA\nSHA256:\n " + strings.Repeat("f", 64) + " 12340 main/binary-amd64/Packages\n"), cache.LegacyAuditQuarantineSigned, "unsigned_declarations"},
+		{"R-1: same path and hash, other size", inject("=AAAA\nSHA256:\n " + strings.Repeat("0", 64) + " 99 main/binary-amd64/Packages\n"), cache.LegacyAuditQuarantineSigned, "unsigned_declarations"},
+		{"R-1: unparseable armor declaration", inject("=AAAA\nSHA256:\n not-a-hash x y\n"), cache.LegacyAuditQuarantineSigned, "unsigned_declarations"},
+		{"signed but no SHA256 block", noSHA256, cache.LegacyAuditQuarantineSigned, "unparseable"},
 	}
 	for _, c := range cases {
 		v := classifyLegacyInline(c.blob)
-		if v.signed != c.signed || v.reason != c.reason {
-			t.Errorf("%s: verdict %+v, want signed=%v reason=%q", c.name, v, c.signed, c.reason)
+		if v.outcome != c.outcome || v.reason != c.reason {
+			t.Errorf("%s: verdict %+v, want outcome=%d reason=%q", c.name, v, c.outcome, c.reason)
 		}
+	}
+}
+
+// Every routing arm of auditLegacySnapshot, including the detached arm
+// (a wrong switch order would quarantine every detached suite at upgrade).
+func TestAuditLegacySnapshot_Routes(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	ctx := context.Background()
+	c := env.cache
+	good, err := env.adopter.writeBlobBytes(ctx, clearsignForTest(t, realisticRelease()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A pool file whose bytes no longer match its name.
+	corrupt := hashOf([]byte("corrupt anchor original"))
+	if err := os.MkdirAll(filepath.Dir(c.BlobPath(corrupt)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(c.BlobPath(corrupt), []byte("different bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	absent := hashOf([]byte("never written"))
+	str := func(s string) *string { return &s }
+	cases := []struct {
+		name    string
+		item    cache.LegacyAuditItem
+		outcome cache.LegacyAuditOutcome
+		reason  string
+	}{
+		{"row gone", cache.LegacyAuditItem{Missing: true}, cache.LegacyAuditDrop, ""},
+		{"detached", cache.LegacyAuditItem{Form: cache.FormDetached}, cache.LegacyAuditKeep, ""},
+		{"unexpected form", cache.LegacyAuditItem{Form: "bogus"}, cache.LegacyAuditQuarantine, "unexpected_form"},
+		{"inline, no hash", cache.LegacyAuditItem{Form: cache.FormInline}, cache.LegacyAuditQuarantine, "anchor_missing"},
+		{"inline, file absent", cache.LegacyAuditItem{Form: cache.FormInline, SingleAnchorHash: str(absent)}, cache.LegacyAuditQuarantine, "anchor_missing"},
+		{"inline, corrupt", cache.LegacyAuditItem{Form: cache.FormInline, SingleAnchorHash: str(corrupt)}, cache.LegacyAuditQuarantine, "anchor_corrupt"},
+		{"inline, signed", cache.LegacyAuditItem{Form: cache.FormInline, SingleAnchorHash: str(good)}, cache.LegacyAuditKeep, ""},
+	}
+	for _, tc := range cases {
+		v, err := auditLegacySnapshot(c, tc.item)
+		if err != nil || v.outcome != tc.outcome || v.reason != tc.reason {
+			t.Errorf("%s: verdict %+v err=%v, want outcome=%d reason=%q", tc.name, v, err, tc.outcome, tc.reason)
+		}
+	}
+	prevCap := legacyAuditAnchorCap
+	legacyAuditAnchorCap = 16
+	t.Cleanup(func() { legacyAuditAnchorCap = prevCap })
+	if v, err := auditLegacySnapshot(c, cache.LegacyAuditItem{Form: cache.FormInline, SingleAnchorHash: str(good)}); err != nil ||
+		v.outcome != cache.LegacyAuditQuarantine || v.reason != "anchor_oversized" {
+		t.Errorf("oversized: verdict %+v err=%v", v, err)
+	}
+}
+
+// An anchor the daemon cannot read (permissions, I/O) is an error, never a
+// quarantine: a fault at one boot must not irreversibly retire snapshots.
+func TestAuditLegacySnapshot_UnreadableAnchorIsAnError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	env := newAdoptionTestEnv(t)
+	h, err := env.adopter.writeBlobBytes(context.Background(), clearsignForTest(t, realisticRelease()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := env.cache.BlobPath(h)
+	if err := os.Chmod(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(p, 0o644) })
+	if _, err := auditLegacySnapshot(env.cache, cache.LegacyAuditItem{Form: cache.FormInline, SingleAnchorHash: &h}); err == nil {
+		t.Fatal("unreadable anchor did not return an error")
 	}
 }
 
 // legacyFixture is a pre-fix cache state on the real cache: one
 // R-1-polluted current suite, one plain-text current suite, one clean
-// suite, and a suite whose displaced snapshot is polluted.
+// inline suite, one clean detached suite, and a suite whose displaced
+// snapshot is polluted.
 type legacyFixture struct {
 	env                         *adoptionTestEnv
 	polluted, plain, clean      int64
+	detached                    int64
 	displacedBad, displacedGood int64
 	evilIndexBlob               string
 	evilDeb, goodDeb, plainDeb  string
-}
-
-func ref(scheme, host, suite string) SuiteRef {
-	return SuiteRef{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite}
+	detDeb                      string
 }
 
 // adoptLegacy commits an inline snapshot for suite whose InRelease blob is
@@ -4767,11 +4921,47 @@ func adoptLegacy(t *testing.T, env *adoptionTestEnv, suite string, anchor []byte
 	return id
 }
 
+// adoptDetached commits a detached snapshot (Release + Release.gpg) with
+// one Packages member and one package_hash row for deb.
+func adoptDetached(t *testing.T, env *adoptionTestEnv, suite, deb string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	rel, err := env.adopter.writeBlobBytes(ctx, []byte(realisticRelease()+"Note: detached\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := env.adopter.writeBlobBytes(ctx, []byte("-----BEGIN PGP SIGNATURE-----\n\nwsBc\n=abcd\n-----END PGP SIGNATURE-----\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ph, err := env.adopter.writeBlobBytes(ctx, []byte("Packages for "+suite))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := env.cache.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: suite, ReleaseHash: &rel, ReleaseGPGHash: &sig})
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := []cache.SnapshotMember{
+		{SnapshotID: id, Path: "Release", BlobHash: rel, DeclaredSHA256: rel},
+		{SnapshotID: id, Path: "Release.gpg", BlobHash: sig, DeclaredSHA256: sig},
+		{SnapshotID: id, Path: "main/binary-amd64/Packages", BlobHash: ph, DeclaredSHA256: ph},
+	}
+	hashes := []cache.PackageHash{{CanonicalScheme: "http", CanonicalHost: "h", Path: deb,
+		DeclaredSHA256: testHex64, SnapshotID: id, PackageName: "d", Architecture: "amd64", Version: "1"}}
+	if err := env.cache.CommitAdoption(ctx, id, members, nil, hashes, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 func buildLegacyFixture(t *testing.T) *legacyFixture {
 	t.Helper()
 	ctx := context.Background()
 	f := &legacyFixture{env: newAdoptionTestEnv(t),
-		evilDeb: "/r/pool/evil_1_amd64.deb", goodDeb: "/r/pool/good_1_amd64.deb", plainDeb: "/r/pool/plain_1_amd64.deb"}
+		evilDeb: "/r/pool/evil_1_amd64.deb", goodDeb: "/r/pool/good_1_amd64.deb",
+		plainDeb: "/r/pool/plain_1_amd64.deb", detDeb: "/r/pool/det_1_amd64.deb"}
 	genuine := realisticRelease()
 	signed := clearsignForTest(t, genuine)
 	end := bytes.LastIndex(signed, []byte("-----END PGP SIGNATURE-----"))
@@ -4800,19 +4990,20 @@ func buildLegacyFixture(t *testing.T) *legacyFixture {
 	}
 	// Plain-text current suite (old require_signature=false fallback).
 	f.plain = adoptLegacy(t, f.env, "/r/dists/plain", []byte(genuine), f.plainDeb)
-	// Clean signed suite.
+	// Clean signed suites, inline and detached.
 	f.clean = adoptLegacy(t, f.env, "/r/dists/clean", clearsignForTest(t, genuine), f.goodDeb)
+	f.detached = adoptDetached(t, f.env, "/r/dists/det", f.detDeb)
 	// Displaced polluted snapshot under a clean current one.
 	f.displacedBad = adoptLegacy(t, f.env, "/r/dists/disp", tampered, "/r/pool/d1_amd64.deb")
 	f.displacedGood = adoptLegacy(t, f.env, "/r/dists/disp", clearsignForTest(t, genuine+"Note: v2\n"), "/r/pool/d2_amd64.deb")
 
-	// CommitAdoption marked every inline commit, as a v7 binary
-	// would. A pre-v7 cache has no markers: start from none.
+	// CommitAdoption marked every signed-form commit, as a v7 binary would.
+	// A pre-v7 cache has no markers: start from none.
 	if err := f.env.cache.ClearSignedSeenForTest(ctx); err != nil {
 		t.Fatal(err)
 	}
 	// As the v7 migration does: every pre-v7 snapshot awaits the audit.
-	if err := f.env.cache.EnqueueLegacyTrustAudit(ctx, f.polluted, f.plain, f.clean, f.displacedBad, f.displacedGood); err != nil {
+	if err := f.env.cache.EnqueueLegacyTrustAudit(ctx, f.polluted, f.plain, f.clean, f.detached, f.displacedBad, f.displacedGood); err != nil {
 		t.Fatal(err)
 	}
 	return f
@@ -4820,10 +5011,28 @@ func buildLegacyFixture(t *testing.T) *legacyFixture {
 
 func discardAuditLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+func blobRefcount(t *testing.T, c *cache.Cache, hash string) int64 {
+	t.Helper()
+	b, err := c.GetBlob(context.Background(), hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b.RefCount
+}
+
+func currentOf(t *testing.T, c *cache.Cache, suite string) *int64 {
+	t.Helper()
+	sf, err := c.GetSuiteFreshness(context.Background(), "http", "h", suite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sf.CurrentSnapshotID
+}
+
 // Spec §6.1 acceptance: a polluted pre-fix cache, upgraded. The forged
 // index is not served, forged and plain-text hashes do not vouch, clean
-// suites keep serving and gain markers, pins are released exactly once,
-// and a second run changes nothing.
+// inline and detached suites keep serving and gain markers, pins are
+// released exactly once, and a second run changes nothing.
 func TestRunLegacyTrustAudit_PollutedCacheUpgrade(t *testing.T) {
 	f := buildLegacyFixture(t)
 	ctx := context.Background()
@@ -4834,27 +5043,16 @@ func TestRunLegacyTrustAudit_PollutedCacheUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Audited != 5 || res.Signed != 2 || res.Quarantined != 3 {
-		t.Fatalf("result = %+v, want 5 audited, 2 signed, 3 quarantined", res)
+	if res.Audited != 6 || res.Signed != 3 || res.Quarantined != 3 {
+		t.Fatalf("result = %+v, want 6 audited, 3 signed, 3 quarantined", res)
 	}
-	check := func(suite string, wantCurrent int64) {
-		t.Helper()
-		sf, err := c.GetSuiteFreshness(ctx, "http", "h", suite)
-		if err != nil {
-			t.Fatal(err)
-		}
-		switch {
-		case wantCurrent == 0 && sf.CurrentSnapshotID != nil:
-			t.Errorf("%s: still has current snapshot %d", suite, *sf.CurrentSnapshotID)
-		case wantCurrent != 0 && (sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != wantCurrent):
-			t.Errorf("%s: current = %v, want %d", suite, sf.CurrentSnapshotID, wantCurrent)
+	for suite, want := range map[string]int64{"/r/dists/polluted": 0, "/r/dists/plain": 0,
+		"/r/dists/clean": f.clean, "/r/dists/det": f.detached, "/r/dists/disp": f.displacedGood} {
+		got := currentOf(t, c, suite)
+		if (want == 0) != (got == nil) || (got != nil && *got != want) {
+			t.Errorf("%s: current = %v, want %d (0 = none)", suite, got, want)
 		}
 	}
-	check("/r/dists/polluted", 0)
-	check("/r/dists/plain", 0)
-	check("/r/dists/clean", f.clean)
-	check("/r/dists/disp", f.displacedGood)
-
 	if _, err := c.LookupSnapshotMember(ctx, "http", "h", "/r/dists/polluted", "main/binary-evilarch/Packages"); !errors.Is(err, cache.ErrNotFound) {
 		t.Errorf("forged index still served from a snapshot: %v", err)
 	}
@@ -4863,8 +5061,10 @@ func TestRunLegacyTrustAudit_PollutedCacheUpgrade(t *testing.T) {
 			t.Errorf("%s still vouched: %+v (%v)", deb, got, err)
 		}
 	}
-	if got, err := c.DeclaredHashesForPath(ctx, "http", "h", f.goodDeb); err != nil || len(got) != 1 {
-		t.Errorf("clean suite's .deb lost its vouching: %+v (%v)", got, err)
+	for _, deb := range []string{f.goodDeb, f.detDeb} {
+		if got, err := c.DeclaredHashesForPath(ctx, "http", "h", deb); err != nil || len(got) != 1 {
+			t.Errorf("clean suite's %s lost its vouching: %+v (%v)", deb, got, err)
+		}
 	}
 	if u, err := c.LookupURL(ctx, "http", "h", "/r/dists/polluted/InRelease"); err != nil || u.BlobHash == nil {
 		t.Errorf("polluted suite's anchor row gone (Phase 1 serving needs it): %+v (%v)", u, err)
@@ -4874,9 +5074,10 @@ func TestRunLegacyTrustAudit_PollutedCacheUpgrade(t *testing.T) {
 			t.Errorf("snapshot %d not retired: %+v (%v)", id, s, err)
 		}
 	}
-	// Markers: signed (and the tampered-but-signed polluted suite) yes;
-	// plain text no.
-	for suite, want := range map[string]bool{"/r/dists/clean": true, "/r/dists/disp": true, "/r/dists/polluted": true, "/r/dists/plain": false} {
+	// Markers: signed suites (incl. the tampered-but-signed polluted one)
+	// yes; plain text no.
+	for suite, want := range map[string]bool{"/r/dists/clean": true, "/r/dists/det": true, "/r/dists/disp": true,
+		"/r/dists/polluted": true, "/r/dists/plain": false} {
 		if _, ok, err := c.SignedSeen(ctx, "http", "h", suite); err != nil || ok != want {
 			t.Errorf("%s: marker=%v (%v), want %v", suite, ok, err, want)
 		}
@@ -4895,16 +5096,18 @@ func TestRunLegacyTrustAudit_PollutedCacheUpgrade(t *testing.T) {
 }
 
 // An interrupted audit resumes at the next start without repeating
-// effects (spec §6.1).
+// effects (spec §6.1): batches of 2, crash after the first.
 func TestRunLegacyTrustAudit_ResumesAfterInterruption(t *testing.T) {
 	f := buildLegacyFixture(t)
 	ctx := context.Background()
 	c := f.env.cache
 	evilRefBefore := blobRefcount(t, c, f.evilIndexBlob)
 	crash := errors.New("simulated crash")
-	prev := legacyAuditAfterItem
-	legacyAuditAfterItem = func(n int) error {
-		if n == 2 {
+	prevSize, prevAfter := legacyAuditBatchSize, legacyAuditAfterBatch
+	t.Cleanup(func() { legacyAuditBatchSize, legacyAuditAfterBatch = prevSize, prevAfter })
+	legacyAuditBatchSize = 2
+	legacyAuditAfterBatch = func(n int) error {
+		if n == 1 {
 			return crash
 		}
 		return nil
@@ -4912,23 +5115,85 @@ func TestRunLegacyTrustAudit_ResumesAfterInterruption(t *testing.T) {
 	if _, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger()); !errors.Is(err, crash) {
 		t.Fatalf("first run err = %v, want the simulated crash", err)
 	}
-	legacyAuditAfterItem = prev
+	legacyAuditAfterBatch = prevAfter
 	res, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger())
-	if err != nil || res.Audited != 3 {
-		t.Fatalf("resumed run = %+v (%v), want the remaining 3 items", res, err)
+	if err != nil || res.Audited != 4 {
+		t.Fatalf("resumed run = %+v (%v), want the remaining 4 items", res, err)
 	}
 	if got := blobRefcount(t, c, f.evilIndexBlob); got != evilRefBefore-1 {
 		t.Fatalf("forged index refcount = %d, want %d", got, evilRefBefore-1)
 	}
 	for _, suite := range []string{"/r/dists/polluted", "/r/dists/plain"} {
-		if sf, _ := c.GetSuiteFreshness(ctx, "http", "h", suite); sf.CurrentSnapshotID != nil {
+		if currentOf(t, c, suite) != nil {
 			t.Errorf("%s still current after the resumed run", suite)
 		}
+	}
+	if currentOf(t, c, "/r/dists/det") == nil || currentOf(t, c, "/r/dists/clean") == nil {
+		t.Error("a clean suite lost its current snapshot")
+	}
+}
+
+// A missing, empty or foreign pool must stop startup and change nothing:
+// otherwise every anchor looks missing and every snapshot is quarantined.
+func TestRunLegacyTrustAudit_PreflightRefusesMissingOrEmptyPool(t *testing.T) {
+	f := buildLegacyFixture(t)
+	ctx := context.Background()
+	c := f.env.cache
+	pool := filepath.Join(c.Dir(), "pool")
+	moved := pool + ".away"
+	if err := os.Rename(pool, moved); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger()); err == nil {
+		t.Fatal("audit ran without a pool")
+	}
+	if err := os.Mkdir(pool, 0o755); err != nil { // an empty (unmounted) pool
+		t.Fatal(err)
+	}
+	if _, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger()); err == nil {
+		t.Fatal("audit ran against an empty pool")
+	}
+	if currentOf(t, c, "/r/dists/clean") == nil || currentOf(t, c, "/r/dists/polluted") == nil {
+		t.Fatal("a refused audit changed current pointers")
+	}
+	if err := os.Remove(pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moved, pool); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger()); err != nil || res.Audited != 6 {
+		t.Fatalf("audit after the pool returned = %+v (%v), want 6 audited", res, err)
+	}
+}
+
+// A single unreadable anchor aborts the run before its batch commits.
+func TestRunLegacyTrustAudit_UnreadableAnchorAbortsWithoutChanges(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	f := buildLegacyFixture(t)
+	ctx := context.Background()
+	c := f.env.cache
+	s, err := c.GetSuiteSnapshot(ctx, f.clean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := c.BlobPath(*s.SingleAnchorHash)
+	if err := os.Chmod(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(p, 0o644) })
+	if _, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger()); err == nil {
+		t.Fatal("unreadable anchor did not abort the audit")
+	}
+	if currentOf(t, c, "/r/dists/polluted") == nil || currentOf(t, c, "/r/dists/clean") == nil {
+		t.Fatal("the aborted batch changed current pointers")
 	}
 }
 
 // Spec C3: the startup pass marks tracked suites whose cached signed
-// anchors pass the sniff, stamped with the anchor's last request — so a
+// anchors pass the sniff, stamped with the anchor's last use — so a
 // never-adopted suite that clients were served signed metadata for gains
 // history before any check runs. Plain text and untracked suites do not.
 func TestRunLegacyTrustAudit_MarksFromCachedSignedAnchors(t *testing.T) {
@@ -4972,22 +5237,13 @@ func TestRunLegacyTrustAudit_MarksFromCachedSignedAnchors(t *testing.T) {
 		}
 	}
 }
-
-func blobRefcount(t *testing.T, c *cache.Cache, hash string) int64 {
-	t.Helper()
-	b, err := c.GetBlob(context.Background(), hash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b.RefCount
-}
 ```
 
-`hashOf(body []byte) string` (existing, `freshness_test.go`) and `testHex64` (Task 4) are reused; `clearsignForTest` is Task 8's; `ClearSignedSeenForTest` is the test-only cache method defined in Step 4.
+`hashOf(body []byte) string` (existing, `freshness_test.go`) and `testHex64` (Task 4) are reused; `clearsignForTest` is Task 8's; `ClearSignedSeenForTest` is the test-only cache method defined in Step 4. Pool files written by `writeBlobBytes` may be read-only; the tests only `chmod` and restore them.
 
 - [ ] **Step 3: Run to verify failure**
 
-Run: `go test ./internal/cache/ -run 'Quarantine|RetiredCandidate|CompleteLegacyAudit|TrackedSuiteAnchors' ; go test ./internal/freshness/ -run 'LegacyInline|LegacyTrustAudit'`
+Run: `go test ./internal/cache/ -run 'ApplyLegacyAuditDecisions|RetiredCandidate|TrackedSuiteAnchors' ; go test ./internal/freshness/ -run 'LegacyInline|AuditLegacySnapshot|LegacyTrustAudit'`
 Expected: compile failures (the new cache and freshness identifiers are undefined).
 
 - [ ] **Step 4: Implement the cache side**
@@ -5000,8 +5256,8 @@ In `internal/cache/adoption.go`:
 // decrementSnapshotRefcountsTx releases one pin per distinct blob the
 // snapshot's members reference (SPEC4 §7.5.1 Rule 3). It must run exactly
 // once per snapshot, when it stops being current: CommitAdoption Step 8
-// (displacement) and QuarantineLegacySnapshot (spec §6.1) are the only
-// callers; phase F's reaper adds the third.
+// (displacement) and the legacy trust audit's quarantine (spec §6.1) are
+// the only callers; phase F's reaper adds the third.
 //
 // AIDEV-NOTE: COALESCE keeps an existing refcount_zeroed_at on a 0 → -1
 // transition; the IIF writes `now` only on the first <= 0 crossing.
@@ -5021,9 +5277,7 @@ UPDATE blob
 }
 ```
 
-2. Step 1: add `retired_at` to the candidate SELECT (scan into `retiredAt sql.NullInt64`) and, after the `adoptedAt.Valid` check, `if retiredAt.Valid { return fmt.Errorf("%w: snapshot_id=%d", ErrSnapshotRetired, snapshotID) }`.
-
-Next to `ErrSnapshotAlreadyAdopted` add:
+2. Step 1: add `retired_at` to the candidate SELECT (scan into `retiredAt sql.NullInt64`) and, after the `adoptedAt.Valid` check, `if retiredAt.Valid { return fmt.Errorf("%w: snapshot_id=%d", ErrSnapshotRetired, snapshotID) }`. Next to `ErrSnapshotAlreadyAdopted` add:
 
 ```go
 // ErrSnapshotRetired: the candidate was retired (legacy trust audit or,
@@ -5058,8 +5312,34 @@ type LegacyAuditItem struct {
 	Missing          bool
 }
 
-// LegacyAuditBatch returns up to limit queued items in snapshot_id order.
+// LegacyAuditOutcome is the audit's decision for one queued snapshot.
+// The zero value is invalid on purpose.
+type LegacyAuditOutcome int
+
+const (
+	// LegacyAuditKeep: signed and clean — mark signed-seen, dequeue.
+	LegacyAuditKeep LegacyAuditOutcome = iota + 1
+	// LegacyAuditDrop: the snapshot row is gone — dequeue.
+	LegacyAuditDrop
+	// LegacyAuditQuarantine: remove all trust, no marker.
+	LegacyAuditQuarantine
+	// LegacyAuditQuarantineSigned: remove all trust, but the envelope
+	// proves the upstream signs — mark signed-seen.
+	LegacyAuditQuarantineSigned
+)
+
+// LegacyAuditDecision pairs a queued snapshot with its outcome.
+type LegacyAuditDecision struct {
+	SnapshotID int64
+	Outcome    LegacyAuditOutcome
+}
+
+// LegacyAuditBatch returns up to limit queued items in snapshot_id order;
+// limit <= 0 returns every queued item.
 func (c *Cache) LegacyAuditBatch(ctx context.Context, limit int) ([]LegacyAuditItem, error) {
+	if limit <= 0 {
+		limit = -1 // SQLite: no limit
+	}
 	rows, err := c.db.QueryContext(ctx, `
 SELECT q.snapshot_id, s.snapshot_id IS NULL,
        COALESCE(s.canonical_scheme, ''), COALESCE(s.canonical_host, ''), COALESCE(s.suite_path, ''),
@@ -5086,79 +5366,83 @@ SELECT q.snapshot_id, s.snapshot_id IS NULL,
 	return out, rows.Err()
 }
 
-// QuarantineLegacySnapshot removes all trust from a pre-v7 snapshot the
-// audit could not prove signed and clean (spec §6.1), in one writer
-// transaction: if it is a suite's current snapshot, the pointer and that
-// suite's validators are cleared and its pins are released; retired_at is
-// set; with markSigned (a decodable, signed but tampered envelope) the
-// signed-seen marker is recorded; the queue row is deleted.
+// ApplyLegacyAuditDecisions applies one batch of audit decisions in ONE
+// writer transaction (spec §6.1) and reports which quarantined snapshots
+// were current. An invalid outcome rolls the whole batch back.
 //
-// AIDEV-NOTE: idempotent by construction — a repeat finds the snapshot
-// non-current (no second decrement) and already retired. Never release
-// pins for a non-current snapshot: displacement already did.
-func (c *Cache) QuarantineLegacySnapshot(ctx context.Context, snapshotID int64, markSigned bool) (wasCurrent bool, err error) {
-	err = c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+// AIDEV-NOTE: every effect is idempotent — a quarantine finds an already
+// handled snapshot non-current (no second refcount release) and already
+// retired; a repeated marker keeps the newest stamp — so a crash between
+// batches never double-applies. Never release pins for a non-current
+// snapshot: displacement already did.
+func (c *Cache) ApplyLegacyAuditDecisions(ctx context.Context, decisions []LegacyAuditDecision) (map[int64]bool, error) {
+	wasCurrent := make(map[int64]bool)
+	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
-			return fmt.Errorf("QuarantineLegacySnapshot: begin: %w", err)
+			return fmt.Errorf("ApplyLegacyAuditDecisions: begin: %w", err)
 		}
 		defer func() { _ = tx.Rollback() }()
 		now := nowUnix()
-		res, err := tx.ExecContext(ctx, `
+		for _, d := range decisions {
+			switch d.Outcome {
+			case LegacyAuditKeep:
+				if err := markSnapshotBaseTx(ctx, tx, d.SnapshotID); err != nil {
+					return err
+				}
+			case LegacyAuditDrop:
+			case LegacyAuditQuarantine, LegacyAuditQuarantineSigned:
+				cur, err := quarantineSnapshotTx(ctx, tx, d.SnapshotID, now)
+				if err != nil {
+					return err
+				}
+				wasCurrent[d.SnapshotID] = cur
+				if d.Outcome == LegacyAuditQuarantineSigned {
+					if err := markSnapshotBaseTx(ctx, tx, d.SnapshotID); err != nil {
+						return err
+					}
+				}
+			default:
+				return fmt.Errorf("ApplyLegacyAuditDecisions: snapshot %d: invalid outcome %d", d.SnapshotID, d.Outcome)
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM legacy_trust_audit WHERE snapshot_id = ?`, d.SnapshotID); err != nil {
+				return fmt.Errorf("ApplyLegacyAuditDecisions: dequeue %d: %w", d.SnapshotID, err)
+			}
+		}
+		return tx.Commit()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return wasCurrent, nil
+}
+
+// quarantineSnapshotTx removes all trust from a snapshot: if it is a
+// suite's current snapshot, the pointer and that suite's validators are
+// cleared and its pins released; it is retired.
+func quarantineSnapshotTx(ctx context.Context, tx *sql.Tx, snapshotID, now int64) (wasCurrent bool, err error) {
+	res, err := tx.ExecContext(ctx, `
 UPDATE suite_freshness
    SET current_snapshot_id = NULL, inrelease_etag = NULL,
        inrelease_lastmod = NULL, inrelease_change_seen_at = NULL
  WHERE current_snapshot_id = ?`, snapshotID)
-		if err != nil {
-			return fmt.Errorf("QuarantineLegacySnapshot: clear pointer: %w", err)
+	if err != nil {
+		return false, fmt.Errorf("quarantine %d: clear pointer: %w", snapshotID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("quarantine %d: rows: %w", snapshotID, err)
+	}
+	if n > 0 {
+		if err := decrementSnapshotRefcountsTx(ctx, tx, snapshotID, now); err != nil {
+			return false, fmt.Errorf("quarantine %d: %w", snapshotID, err)
 		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("QuarantineLegacySnapshot: rows: %w", err)
-		}
-		wasCurrent = n > 0
-		if wasCurrent {
-			if err := decrementSnapshotRefcountsTx(ctx, tx, snapshotID, now); err != nil {
-				return fmt.Errorf("QuarantineLegacySnapshot: %w", err)
-			}
-		}
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE suite_snapshot SET retired_at = ? WHERE snapshot_id = ? AND retired_at IS NULL`, now, snapshotID); err != nil {
-			return fmt.Errorf("QuarantineLegacySnapshot: retire: %w", err)
-		}
-		if markSigned {
-			if err := markSnapshotBaseTx(ctx, tx, snapshotID); err != nil {
-				return fmt.Errorf("QuarantineLegacySnapshot: %w", err)
-			}
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM legacy_trust_audit WHERE snapshot_id = ?`, snapshotID); err != nil {
-			return fmt.Errorf("QuarantineLegacySnapshot: dequeue: %w", err)
-		}
-		return tx.Commit()
-	})
-	return wasCurrent, err
-}
-
-// CompleteLegacyAudit dequeues an audited (or missing) snapshot; with
-// markSigned it records the signed-seen marker for the snapshot's base,
-// stamped with COALESCE(adopted_at, created_at), in the same transaction.
-func (c *Cache) CompleteLegacyAudit(ctx context.Context, snapshotID int64, markSigned bool) error {
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		tx, err := conn.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("CompleteLegacyAudit: begin: %w", err)
-		}
-		defer func() { _ = tx.Rollback() }()
-		if markSigned {
-			if err := markSnapshotBaseTx(ctx, tx, snapshotID); err != nil {
-				return fmt.Errorf("CompleteLegacyAudit: %w", err)
-			}
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM legacy_trust_audit WHERE snapshot_id = ?`, snapshotID); err != nil {
-			return fmt.Errorf("CompleteLegacyAudit: dequeue: %w", err)
-		}
-		return tx.Commit()
-	})
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE suite_snapshot SET retired_at = ? WHERE snapshot_id = ? AND retired_at IS NULL`, now, snapshotID); err != nil {
+		return false, fmt.Errorf("quarantine %d: retire: %w", snapshotID, err)
+	}
+	return n > 0, nil
 }
 
 // markSnapshotBaseTx records the signed-seen marker for a snapshot's base
@@ -5200,7 +5484,8 @@ func (c *Cache) EnqueueLegacyTrustAudit(ctx context.Context, ids ...int64) error
 
 // TrackedAnchor is a cached InRelease or Release.gpg url_path row of a
 // suite that has a suite_freshness row. SeenAt is the newer of the row's
-// last request and last fetch.
+// last request and last fetch (CommitAdoption-seeded anchors have no
+// request stamp).
 type TrackedAnchor struct {
 	CanonicalScheme string
 	CanonicalHost   string
@@ -5271,10 +5556,15 @@ package freshness
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -5282,16 +5572,14 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
-// legacyAuditAnchorCap bounds how much of a stored InRelease the audit
-// reads (spec C11). Real InRelease files are well under 1 MiB.
-const legacyAuditAnchorCap = 8 << 20
+// Test seams (spec C11 constants: anchor read cap 8 MiB, batch 100).
+var (
+	legacyAuditAnchorCap  int64 = 8 << 20
+	legacyAuditBatchSize        = 100
+	legacyAuditAfterBatch       = func(batch int) error { return nil }
+)
 
-// legacyAuditBatchSize is how many queued snapshots one listing returns.
-const legacyAuditBatchSize = 100
-
-// legacyAuditAfterItem is a test seam called after each dequeued item; a
-// non-nil error aborts the audit like a crash would.
-var legacyAuditAfterItem = func(int) error { return nil }
+var errAnchorTooLarge = errors.New("anchor exceeds the audit read cap")
 
 // LegacyAuditResult summarises one RunLegacyTrustAudit call.
 type LegacyAuditResult struct {
@@ -5299,28 +5587,31 @@ type LegacyAuditResult struct {
 }
 
 type legacyVerdict struct {
-	signed     bool   // clean and signed: keep, mark
-	markSigned bool   // quarantined, but the envelope proves the upstream signs
-	missing    bool   // the snapshot row is gone
-	reason     string // quarantine reason when !signed && !missing
+	outcome cache.LegacyAuditOutcome
+	reason  string // set for quarantines
 }
 
 // RunLegacyTrustAudit drains legacy_trust_audit, then records signed-seen
-// markers from tracked suites' cached signed anchors (spec §6.1, C3).
-// main runs it after cache.Open and before GC, the checker or any
-// listener. An error means the database failed; the caller refuses to
-// start (the service manager retries, and the audit resumes).
+// markers from tracked suites' cached signed anchors (spec §6.1, C3). main
+// runs it after cache.Open and before GC, the checker or any listener
+// serves. An error means the database or the pool failed: the caller
+// refuses to start, nothing in the failed batch was applied, and the audit
+// resumes on the next start.
 //
-// AIDEV-NOTE: plan review 2026-10-05 findings 1–3. Quarantine is the
-// remedy for anything that cannot be proved signed AND clean; never
-// "repair" a polluted snapshot in place, and never write a marker for a
-// plain-text or undecodable anchor (it would block the suite's correct
-// unsigned adoption in phase E).
+// AIDEV-NOTE: plan review 2026-10-05 findings 1–3 and its follow-up.
+// Quarantine is the remedy for anything that cannot be proved signed AND
+// clean; never "repair" a polluted snapshot in place; never write a marker
+// for a plain-text, undecodable, missing or corrupt anchor (it would block
+// the suite's correct unsigned adoption in phase E); and never turn an I/O
+// fault into a quarantine — only "file does not exist" is evidence.
 func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logger) (LegacyAuditResult, error) {
 	start := time.Now()
 	var res LegacyAuditResult
+	if err := preflightLegacyAudit(ctx, c); err != nil {
+		return res, err
+	}
 	lastFirst := int64(-1)
-	for {
+	for batch := 1; ; batch++ {
 		items, err := c.LegacyAuditBatch(ctx, legacyAuditBatchSize)
 		if err != nil {
 			return res, fmt.Errorf("legacy trust audit: %w", err)
@@ -5332,36 +5623,42 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 			return res, fmt.Errorf("legacy trust audit: no progress at snapshot %d", lastFirst)
 		}
 		lastFirst = items[0].SnapshotID
-		for _, it := range items {
-			v := auditLegacySnapshot(c, it)
-			switch {
-			case v.missing:
-				err = c.CompleteLegacyAudit(ctx, it.SnapshotID, false)
-			case v.signed:
-				err = c.CompleteLegacyAudit(ctx, it.SnapshotID, true)
-				res.Signed++
-			default:
-				var wasCurrent bool
-				wasCurrent, err = c.QuarantineLegacySnapshot(ctx, it.SnapshotID, v.markSigned)
-				if err == nil {
-					res.Quarantined++
-					legacyQuarantinedTotal.Inc()
-					logger.Warn("legacy_snapshot_quarantined",
-						"reason", v.reason,
-						"snapshot_id", it.SnapshotID,
-						"canonical_host", it.CanonicalHost,
-						"suite_path", it.SuitePath,
-						"was_current", wasCurrent,
-					)
-				}
-			}
+		decisions := make([]cache.LegacyAuditDecision, len(items))
+		reasons := make([]string, len(items))
+		for i, it := range items {
+			v, err := auditLegacySnapshot(c, it)
 			if err != nil {
-				return res, fmt.Errorf("legacy trust audit: snapshot %d: %w", it.SnapshotID, err)
+				return res, fmt.Errorf("legacy trust audit: snapshot %d: %w (nothing in this batch was changed; fix the pool and restart)", it.SnapshotID, err)
 			}
+			decisions[i] = cache.LegacyAuditDecision{SnapshotID: it.SnapshotID, Outcome: v.outcome}
+			reasons[i] = v.reason
+		}
+		wasCurrent, err := c.ApplyLegacyAuditDecisions(ctx, decisions)
+		if err != nil {
+			return res, fmt.Errorf("legacy trust audit: %w", err)
+		}
+		for i, d := range decisions {
 			res.Audited++
-			if err := legacyAuditAfterItem(res.Audited); err != nil {
-				return res, err
+			switch d.Outcome {
+			case cache.LegacyAuditKeep:
+				res.Signed++
+			case cache.LegacyAuditQuarantine, cache.LegacyAuditQuarantineSigned:
+				res.Quarantined++
+				legacyQuarantinedTotal.Inc()
+				// Logged after the batch commits: a crash can lose the
+				// line, never the effect.
+				logger.Warn("legacy_snapshot_quarantined",
+					"reason", reasons[i],
+					"snapshot_id", d.SnapshotID,
+					"canonical_host", items[i].CanonicalHost,
+					"suite_path", items[i].SuitePath,
+					"was_current", wasCurrent[d.SnapshotID],
+				)
 			}
+		}
+		logger.Info("legacy_trust_audit_progress", "audited", res.Audited, "quarantined", res.Quarantined)
+		if err := legacyAuditAfterBatch(batch); err != nil {
+			return res, err
 		}
 	}
 	n, err := markFromCachedSignedAnchors(ctx, c)
@@ -5375,48 +5672,103 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 	return res, nil
 }
 
-func auditLegacySnapshot(c *cache.Cache, it cache.LegacyAuditItem) legacyVerdict {
+// preflightLegacyAudit refuses to audit against a pool that is not there.
+// An unmounted, empty or foreign pool makes every anchor look missing,
+// which would quarantine every snapshot (spec §6.1). Nothing is changed.
+func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
+	items, err := c.LegacyAuditBatch(ctx, 0)
+	if err != nil {
+		return fmt.Errorf("legacy trust audit: %w", err)
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	pool := filepath.Join(c.Dir(), "pool")
+	f, err := os.Open(pool)
+	if err != nil {
+		return fmt.Errorf("legacy trust audit: pool %s is not readable: %w (fix it and restart; nothing was changed)", pool, err)
+	}
+	_, rerr := f.Readdirnames(1)
+	_ = f.Close()
+	if rerr != nil && !errors.Is(rerr, io.EOF) {
+		return fmt.Errorf("legacy trust audit: pool %s is not readable: %w (fix it and restart; nothing was changed)", pool, rerr)
+	}
+	inline, missing := 0, 0
+	for _, it := range items {
+		if it.Missing || it.Form != cache.FormInline || it.SingleAnchorHash == nil {
+			continue
+		}
+		inline++
+		if _, err := os.Stat(c.BlobPath(*it.SingleAnchorHash)); errors.Is(err, fs.ErrNotExist) {
+			missing++
+		} else if err != nil {
+			return fmt.Errorf("legacy trust audit: anchor of snapshot %d: %w (nothing was changed)", it.SnapshotID, err)
+		}
+	}
+	if inline >= 2 && missing == inline {
+		return fmt.Errorf("legacy trust audit: none of the %d queued inline anchors exist under %s — is the pool mounted? Fix it and restart (nothing was changed)", inline, pool)
+	}
+	return nil
+}
+
+func auditLegacySnapshot(c *cache.Cache, it cache.LegacyAuditItem) (legacyVerdict, error) {
+	quarantine := func(reason string) (legacyVerdict, error) {
+		return legacyVerdict{outcome: cache.LegacyAuditQuarantine, reason: reason}, nil
+	}
 	switch {
 	case it.Missing:
-		return legacyVerdict{missing: true}
+		return legacyVerdict{outcome: cache.LegacyAuditDrop}, nil
 	case it.Form == cache.FormDetached:
 		// Detached adoption always verified Release.gpg (or, under
 		// accept_any_signer, checked its structure): signed. R-1 cannot
 		// apply — the whole Release file is the signed text.
-		return legacyVerdict{signed: true}
+		return legacyVerdict{outcome: cache.LegacyAuditKeep}, nil
 	case it.Form != cache.FormInline:
-		return legacyVerdict{reason: "unexpected_form"}
+		return quarantine("unexpected_form")
 	case it.SingleAnchorHash == nil:
-		return legacyVerdict{reason: "anchor_unreadable"}
+		return quarantine("anchor_missing")
 	}
 	blob, err := readCapped(c.BlobPath(*it.SingleAnchorHash), legacyAuditAnchorCap)
-	if err != nil {
-		return legacyVerdict{reason: "anchor_unreadable"}
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return quarantine("anchor_missing")
+	case errors.Is(err, errAnchorTooLarge):
+		return quarantine("anchor_oversized")
+	case err != nil:
+		return legacyVerdict{}, err // an I/O fault is never evidence
 	}
-	return classifyLegacyInline(blob)
+	sum := sha256.Sum256(blob)
+	if hex.EncodeToString(sum[:]) != *it.SingleAnchorHash {
+		return quarantine("anchor_corrupt")
+	}
+	return classifyLegacyInline(blob), nil
 }
 
 // classifyLegacyInline decides whether a stored InRelease proves a signed,
 // unpolluted inline snapshot (spec §6.1). Pure; table-tested.
 func classifyLegacyInline(blob []byte) legacyVerdict {
 	if !bytes.Contains(blob, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
-		return legacyVerdict{reason: "legacy_plaintext"}
+		return legacyVerdict{outcome: cache.LegacyAuditQuarantine, reason: "legacy_plaintext"}
 	}
 	text, err := inReleasePlaintext(blob)
 	if err != nil {
-		return legacyVerdict{reason: "malformed_envelope"}
+		return legacyVerdict{outcome: cache.LegacyAuditQuarantine, reason: "malformed_envelope"}
+	}
+	signedOnly := func(reason string) legacyVerdict {
+		return legacyVerdict{outcome: cache.LegacyAuditQuarantineSigned, reason: reason}
 	}
 	signed, err := ParseRelease(text)
 	if err != nil {
-		return legacyVerdict{reason: "unparseable", markSigned: true}
+		return signedOnly("unparseable")
 	}
-	// What the pre-fix reconcile saw: the whole envelope. Anything it
-	// declares that the signed text does not — or a parse error the signed
-	// text does not have — means declarations were placed outside the
-	// signature (R-1).
-	raw, err := ParseRelease(blob)
+	// What the pre-fix reconcile saw: the whole envelope (with
+	// whitespace-only lines read as blank, as the clearsign decoder reads
+	// them). Anything it declares that the signed text does not — or a
+	// parse error the signed text does not have — means declarations were
+	// placed outside the signature (R-1).
+	raw, err := ParseRelease(blankWhitespaceLines(blob))
 	if err != nil {
-		return legacyVerdict{reason: "unsigned_declarations", markSigned: true}
+		return signedOnly("unsigned_declarations")
 	}
 	type key struct {
 		path, sha256 string
@@ -5428,10 +5780,21 @@ func classifyLegacyInline(blob []byte) legacyVerdict {
 	}
 	for _, m := range raw {
 		if _, ok := have[key{m.Path, m.SHA256, m.Size}]; !ok {
-			return legacyVerdict{reason: "unsigned_declarations", markSigned: true}
+			return signedOnly("unsigned_declarations")
 		}
 	}
-	return legacyVerdict{signed: true}
+	return legacyVerdict{outcome: cache.LegacyAuditKeep}
+}
+
+// blankWhitespaceLines returns b with every whitespace-only line emptied.
+func blankWhitespaceLines(b []byte) []byte {
+	lines := bytes.Split(b, []byte("\n"))
+	for i, l := range lines {
+		if len(bytes.TrimRight(l, " \t\r")) == 0 {
+			lines[i] = nil
+		}
+	}
+	return bytes.Join(lines, []byte("\n"))
 }
 
 // markFromCachedSignedAnchors is the C3 startup marker pass: every
@@ -5446,8 +5809,8 @@ func markFromCachedSignedAnchors(ctx context.Context, c *cache.Cache) (int, erro
 	var marks []cache.SignedSeenMark
 	for _, a := range anchors {
 		head, err := readCapped(c.BlobPath(a.BlobHash), aptpath.SniffHeadBytes)
-		if err != nil && head == nil {
-			continue // pool file gone: no evidence
+		if err != nil && !errors.Is(err, errAnchorTooLarge) {
+			continue // pool file gone or unreadable: no evidence either way
 		}
 		ok := false
 		switch {
@@ -5467,9 +5830,9 @@ func markFromCachedSignedAnchors(ctx context.Context, c *cache.Cache) (int, erro
 	return len(marks), nil
 }
 
-// readCapped reads at most max bytes of path. A file longer than max
-// returns its first max bytes AND an error, so callers that only need a
-// head (the sniffs) can use the bytes while the full-body reader rejects.
+// readCapped reads at most max bytes of path. A longer file returns its
+// first max bytes AND an error wrapping errAnchorTooLarge, so the sniffs
+// can use the head while the full-body reader rejects.
 func readCapped(path string, max int64) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -5481,13 +5844,13 @@ func readCapped(path string, max int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(b)) > max {
-		return b[:max], fmt.Errorf("%s exceeds %d bytes", path, max)
+		return b[:max], fmt.Errorf("%s: %w (%d bytes)", path, errAnchorTooLarge, max)
 	}
 	return b, nil
 }
 ```
 
-(The anchor read cap is generous on purpose: a real archive InRelease is 100–300 KiB; adoption already bounds inline bodies near 4 MiB.)
+(The anchor read cap is generous on purpose: a real archive InRelease is 100–300 KiB; adoption already bounds inline bodies near 4 MiB. `ctx` is accepted by `preflightLegacyAudit` for the queue read only.)
 
 - [ ] **Step 6: Wire it into startup**
 
@@ -5497,8 +5860,9 @@ In `cmd/apt-cacher-ultra/main.go`, directly after the `c.SweepTmp(...)` block an
 	// Spec §6.1: remove trust from pre-v7 snapshots that cannot be proved
 	// signed and clean, and record signed-seen history from cached signed
 	// anchors, BEFORE anything collects garbage, checks, adopts or serves.
-	// AIDEV-NOTE: a returned error is a database failure; refusing to
-	// start is deliberate (the audit resumes on the next start).
+	// AIDEV-NOTE: a returned error is a database or pool I/O failure (or a
+	// missing/unmounted pool); refusing to start is deliberate — nothing in
+	// the failed batch was applied and the audit resumes on the next start.
 	if _, err := freshness.RunLegacyTrustAudit(ctx, c, logger); err != nil {
 		return fmt.Errorf("legacy trust audit: %w", err)
 	}
@@ -5509,7 +5873,7 @@ It runs whether or not adoption is enabled (a cache adopted under an earlier con
 - [ ] **Step 7: Run to verify it passes**
 
 Run: `go test -race ./internal/cache/ ./internal/freshness/ ./cmd/...`
-Expected: PASS. Then run the whole repository: `go test -race ./...` (every package that opens a cache now runs the audit only where `main` does, so other tests are unaffected).
+Expected: PASS. Then run the whole repository: `go test -race ./...`.
 
 - [ ] **Step 8: Commit**
 
@@ -5523,12 +5887,13 @@ Before this release, reconcile could add members and package hashes from
 declarations outside an InRelease signature (R-1), and require_signature
 = false adopted plain-text InRelease files as signed snapshots. Fixing
 the code removed neither from existing caches. A resumable startup audit
-now drains a queue of every pre-v7 snapshot: signed, clean snapshots are
-kept and marked signed-seen; anything else is quarantined (pointer
-cleared, pins released once, retired, never committable) and its suite
-falls back to Phase 1 serving until it re-adopts. A marker pass records
-signed-seen history from tracked suites' cached signed anchors at every
-start.
+now drains a queue of every pre-v7 snapshot in batched transactions:
+signed, clean snapshots are kept and marked signed-seen; anything else is
+quarantined (pointer cleared, pins released once, retired, never
+committable) and its suite falls back to Phase 1 serving until it
+re-adopts. Missing pools and I/O faults stop startup instead of
+quarantining. A marker pass records signed-seen history from tracked
+suites' cached signed anchors at every start.
 
 Reported by the 2026-10-05 plan review.
 
@@ -5555,7 +5920,8 @@ In `docs/log-fields.md` add an "Operational events" subsection (create it if the
 | `adoption_panicked` | ERROR | `where` (`adoption`, `repair`, `reconcile`, `heartbeat`), `canonical_host`, `suite_path`, `panic`, `stack` (first occurrence per `where` per process only) | A panic inside an adoption, repair, reconcile or heartbeat goroutine was recovered; the prior snapshot keeps serving. |
 | `freshness_check_panicked` | ERROR | `where` (`check`, `scheduler`, `t1`), `canonical_host`, `suite_path`, `panic`, `stack` (first occurrence per `where` per process only) | A panic during a freshness check was recovered; the check counts as failed (`last_check_at` bumped, so the cooldown applies). |
 | `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute. |
-| `legacy_snapshot_quarantined` | WARN | `reason` (`legacy_plaintext`, `malformed_envelope`, `unsigned_declarations`, `unparseable`, `anchor_unreadable`, `unexpected_form`), `snapshot_id`, `canonical_host`, `suite_path`, `was_current` | The startup trust audit could not prove a pre-upgrade snapshot signed and clean; it no longer serves or vouches, and its suite is served unadopted until it re-adopts. |
+| `legacy_snapshot_quarantined` | WARN | `reason` (`legacy_plaintext`, `malformed_envelope`, `unsigned_declarations`, `unparseable`, `anchor_missing`, `anchor_oversized`, `anchor_corrupt`, `unexpected_form`), `snapshot_id`, `canonical_host`, `suite_path`, `was_current` | The startup trust audit could not prove a pre-upgrade snapshot signed and clean; it no longer serves or vouches, and its suite is served unadopted until it re-adopts. |
+| `legacy_trust_audit_progress` | INFO | `audited`, `quarantined` | One batch of up to 100 queued snapshots was audited and committed (first start after an upgrade only). |
 | `legacy_trust_audit_completed` | INFO | `audited`, `signed`, `quarantined`, `anchor_markers`, `duration` | The startup trust audit finished (every start; `audited` is 0 once the upgrade queue has drained). |
 
 - [ ] **Step 2: Document the upstream encoding change, the signature rule and the upgrade audit**
@@ -5566,7 +5932,7 @@ In `docs/configuration.md` `[adoption]`:
 
 - Replace the `require_signature` table row's description with: "Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are handled by the unsigned form (a later release)."
 - In "Trust and signer pins", replace the sentence beginning "`require_signature = false` also allows unsigned data through the inline verification path." (through "…adoptable.") with: "`require_signature = false` no longer lets unsigned data through the inline path. The detached fallback still requires both `Release` and `Release.gpg`."
-- Add a subsection "Upgrading an existing cache": "On its first start after an upgrade, the daemon audits every metadata snapshot adopted by earlier versions before it serves anything. A snapshot whose stored `InRelease` is not a signed, clean clearsigned message — a plain-text file adopted with `require_signature = false`, or one carrying declarations outside its signature — is quarantined: it stops serving and vouching, its suite is served from the ordinary cache until it adopts again, and a `legacy_snapshot_quarantined` line names it. The audit resumes if the start is interrupted and is a no-op afterwards."
+- Add a subsection "Upgrading an existing cache": "On its first start after an upgrade, the daemon audits every metadata snapshot adopted by earlier versions before it serves anything (a large cache can take a little while; progress is logged per 100 snapshots). A snapshot whose stored `InRelease` is not a signed, clean clearsigned message — a plain-text file adopted with `require_signature = false`, or one carrying declarations outside its signature — or whose pool file is missing or corrupt, is quarantined: it stops serving and vouching, its suite is served from the ordinary cache until it adopts again (on the next upstream change in this release), and a `legacy_snapshot_quarantined` line names it. In strict mode, a quarantined suite's packages are refused while other suites on the same host have complete coverage, as for any unadopted suite. The cache directory's `pool/` must be present and readable: if it is missing, empty, or a pool file cannot be read, the daemon refuses to start and changes nothing (under `Restart=always` this repeats every few seconds until fixed). The audit resumes if the start is interrupted and is a no-op afterwards. A suite whose signed `InRelease` was served by an earlier version is recorded as signed from cached anchors; one whose cached anchor was already garbage-collected leaves no record."
 
 In `packaging/config/config.toml.default` change the `require_signature` line's comment to `# false only allows an empty keyring; see reference` and the `accept_any_signer` comment's last clause to `require a decodable signed envelope`.
 
@@ -5612,7 +5978,7 @@ Dispatch the max-effort review of `git diff main...HEAD` for phase A (correctnes
 - I-1: `TestVerifyInline_ZeroPlaintextIsAnErrorNotAPanic`, `TestCheck_AdoptionPanicIsRecovered` and `TestMaybeFireFreshness_RecoversPanic` fail (crash) on `main` and pass here; `TestCheck_AdoptionPanicRecoveredBeforeMutexRelease`, `TestCheck_RepairPanicIsRecovered`, `TestRecoverGoroutine_LogsAndSwallows`, `TestCheck_SynchronousPanicReleasesMutex`, `TestCheck_PanickingCheckIsCooldownGated`, `TestReportPanic_LogsStackOncePerKind` pass.
 - Clock: `TestCheck_FutureLastCheckAtDoesNotFreezeAndHeals`, `TestCheck_StampWithinToleranceKeepsCooldown`, `TestTick_FutureLastSuccessAtIsDue`, `TestStaleSuiteCounts` pass.
 - Simulation: `TestSimSmoke_30DaysPeriodicRefresh` (exactly 360 checks) and `TestSimClockSteps_KeepChecking` pass, each under 5 s under `-race`; `TestHandler_InMemoryFetcherInsideBubble` passes.
-- Fail-closed inline verification: `TestVerifyInline_FailsClosedWhateverRequireSignature` and `TestAdopter_MalformedEnvelopeCreatesNoSnapshot` fail on `main` and pass here; the three renamed passthrough tests pin rejection.
+- Fail-closed inline verification: `TestVerifyInline_FailsClosedWhateverRequireSignature` and `TestAdopter_MalformedEnvelopeCreatesNoSnapshot` fail on `main` and pass here; `TestVerifyInline_EmptyKeyringSaysSo` passes; the three renamed passthrough tests pin rejection.
 - Signed-seen: `TestSniffInRelease`, `TestSniffReleaseGPG`, `TestMarkerBase`, `TestMarkSignedSeenBatch_KeepsNewestStamp`, `TestCommitAdoption_SignedFormsRecordSignedSeen` pass.
-- Legacy trust audit: `TestClassifyLegacyInline`, `TestRunLegacyTrustAudit_PollutedCacheUpgrade`, `_ResumesAfterInterruption`, `_MarksFromCachedSignedAnchors`, `TestQuarantineLegacySnapshot_CurrentReleasesPinsOnce`, `_DisplacedKeepsRefcounts`, `TestCommitAdoption_RefusesRetiredCandidate`, `TestCompleteLegacyAudit_MarksWithAdoptionStamp`, `TestListTrackedSuiteAnchors_OnlyTrackedSignedAnchorNames` pass; `main` runs the audit before the GC pass and listeners.
+- Legacy trust audit: `TestClassifyLegacyInline`, `TestAuditLegacySnapshot_Routes`, `_UnreadableAnchorIsAnError`, `TestRunLegacyTrustAudit_PollutedCacheUpgrade`, `_ResumesAfterInterruption`, `_PreflightRefusesMissingOrEmptyPool`, `_UnreadableAnchorAbortsWithoutChanges`, `_MarksFromCachedSignedAnchors`, `TestApplyLegacyAuditDecisions_QuarantineCurrentReleasesPinsOnce`, `_QuarantineDisplacedKeepsRefcounts`, `_BatchIsAtomic`, `_KeepMarksWithAdoptionStamp`, `TestCommitAdoption_RefusesRetiredCandidate`, `TestListTrackedSuiteAnchors_OnlyTrackedSignedAnchorNames` pass; `main` runs the audit before the GC pass and before anything serves.
 - `go test -race ./...`, `go vet ./...`, `golangci-lint run ./...` clean; no new `gofmt -l .` entries; docs updated; phase review findings resolved.
