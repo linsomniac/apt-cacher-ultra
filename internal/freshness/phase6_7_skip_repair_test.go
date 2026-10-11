@@ -719,8 +719,8 @@ func TestAdopter_RequiredArchGroupAllMissingDefersAdoption(t *testing.T) {
 	env.fetcher.put(base+"Contents-amd64.gz", contents)
 
 	err := ad.Run(ctx, env.suite, releaseText, "", "")
-	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
-		t.Fatalf("want ErrAdoptionMemberFetchFailed (deferred), got %v", err)
+	if !errors.Is(err, ErrAdoptionGuardFailed) {
+		t.Fatalf("want ErrAdoptionGuardFailed (deferred), got %v", err)
 	}
 	memberPath, detail := memberErrorFields(err)
 	if memberPath != "main/binary-amd64/Packages" {

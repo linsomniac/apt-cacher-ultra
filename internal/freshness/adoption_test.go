@@ -1996,8 +1996,8 @@ func TestAdopter_MemberSkipped_AllMembers404Fails(t *testing.T) {
 	env.fetcher.fail404(base + "main/source/Sources")
 
 	err := env.adopter.Run(context.Background(), env.suite, releaseText, "", "")
-	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
-		t.Fatalf("Run err = %v, want wrapped ErrAdoptionMemberFetchFailed (all-skipped guard)", err)
+	if !errors.Is(err, ErrAdoptionGuardFailed) {
+		t.Fatalf("Run err = %v, want ErrAdoptionGuardFailed (all-skipped guard)", err)
 	}
 	if !strings.Contains(err.Error(), "all 2 declared members returned 4xx") {
 		t.Errorf("Run err = %q, want 'all 2 declared members returned 4xx' substring", err.Error())
@@ -2647,8 +2647,8 @@ func TestAdopter_Allowlist_BlocksPublishWhenBinaryAllUnavailable(t *testing.T) {
 	ff.fail404(base + "main/binary-all/Packages")
 
 	err = ad.Run(context.Background(), suite, releaseText, "etag-1", "")
-	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
-		t.Fatalf("want ErrAdoptionMemberFetchFailed (deferred), got %v", err)
+	if !errors.Is(err, ErrAdoptionGuardFailed) {
+		t.Fatalf("want ErrAdoptionGuardFailed (deferred), got %v", err)
 	}
 
 	// No degraded snapshot adopted — the (here: nonexistent) prior keeps serving.

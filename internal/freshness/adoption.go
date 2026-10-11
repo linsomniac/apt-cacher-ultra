@@ -83,6 +83,12 @@ var (
 	ErrAdoptionMemberMismatch    = errors.New("adoption_member_mismatch")
 	ErrAdoptionDBFailed          = errors.New("adoption_db_failed")
 
+	// ErrAdoptionGuardFailed marks a pre-commit guard refusal (required
+	// architecture group missing, every member 4xx, serve-contract target
+	// absent). It wraps ErrAdoptionMemberFetchFailed so the outcome label
+	// stays member_fetch_failed; retry logic can tell guards apart.
+	ErrAdoptionGuardFailed = fmt.Errorf("adoption_guard_failed: %w", ErrAdoptionMemberFetchFailed)
+
 	// ErrAdoptionUnpinnedSuite is the freshness-level sentinel for
 	// the SPEC5 §10.4.3 `unpinned_suite` outcome — emitted by the
 	// gpg verifier when integrity.require_pinned_signer is set and
@@ -1015,7 +1021,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 				"err", err,
 			)
 		}
-		return fmt.Errorf("%w: insert candidate: %v", ErrAdoptionDBFailed, err)
+		return fmt.Errorf("%w: insert candidate: %w", ErrAdoptionDBFailed, err)
 	}
 	if reused {
 		a.logger.Info("adoption: reusing orphaned candidate",
@@ -1232,7 +1238,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 				"group", g,
 				"declared_variants", requiredGroupDeclared[g],
 			)
-			return newMemberErr(ErrAdoptionMemberFetchFailed, g,
+			return newMemberErr(ErrAdoptionGuardFailed, g,
 				fmt.Sprintf("required-architecture index target: all %d declared variants missing",
 					requiredGroupDeclared[g]))
 		}
@@ -1248,7 +1254,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// prefix.
 	if fetchedCount == 0 && len(members) > 0 {
 		return fmt.Errorf("%w: all %d declared members returned 4xx",
-			ErrAdoptionMemberFetchFailed, skippedCount)
+			ErrAdoptionGuardFailed, skippedCount)
 	}
 
 	// SPEC6_8 serve-contract guard: before committing, refuse to publish a
@@ -1278,7 +1284,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			)
 			adoptionServeTargetMissingTotal.Inc(arch)
 		}
-		return newMemberErr(ErrAdoptionMemberFetchFailed, missing[0],
+		return newMemberErr(ErrAdoptionGuardFailed, missing[0],
 			fmt.Sprintf("requestable index target absent from snapshot: %s "+
 				"(committing would 404 apt update; deferring to keep prior snapshot)",
 				strings.Join(missing, ", ")))
@@ -1429,7 +1435,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			"snapshot_id", snapshotID,
 			"err", err,
 		)
-		return fmt.Errorf("%w: commit: %v", ErrAdoptionDBFailed, err)
+		return fmt.Errorf("%w: commit: %w", ErrAdoptionDBFailed, err)
 	}
 
 	// Step 12 (SPEC3 §10.2): aggregate adoption_hot_prefetch_complete.
@@ -2026,7 +2032,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 		}
 		body, err := a.readPackagesBlob(m.Path, m.SHA256)
 		if err != nil {
-			return packageHashBuildResult{}, fmt.Errorf("%w: read %q: %v", ErrAdoptionParseFailed, m.Path, err)
+			return packageHashBuildResult{}, fmt.Errorf("%w: read %q: %w", ErrAdoptionParseFailed, m.Path, err)
 		}
 		refs, err := ParsePackages(body)
 		if err != nil {
