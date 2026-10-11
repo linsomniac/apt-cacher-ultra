@@ -630,16 +630,19 @@ func TestStaleSuiteCounts(t *testing.T) {
 	mk := func(lastSuccess, snap *int64) cache.SuiteFreshness {
 		return cache.SuiteFreshness{LastSuccessAt: lastSuccess, CurrentSnapshotID: snap}
 	}
+	const now = int64(3000)
 	suites := []cache.SuiteFreshness{
 		mk(i(2000), i(7)), // fresh adopted        -> not stale
 		mk(i(500), i(7)),  // stale adopted        -> count adopted
 		mk(i(999), i(7)),  // just-stale adopted   -> count adopted
 		mk(i(400), nil),   // stale unadopted      -> count unadopted
 		mk(nil, i(7)),     // never-succeeded      -> not "went stale", skip
+		mk(i(9000), i(7)), // in the future (clock step) -> infinitely old: count adopted
+		mk(i(3001), i(7)), // 1 s ahead, within tolerance -> fresh
 	}
-	adopted, unadopted := staleSuiteCounts(suites, staleBefore)
-	if adopted != 2 {
-		t.Errorf("adopted stale = %d, want 2", adopted)
+	adopted, unadopted := staleSuiteCounts(suites, staleBefore, now)
+	if adopted != 3 {
+		t.Errorf("adopted stale = %d, want 3", adopted)
 	}
 	if unadopted != 1 {
 		t.Errorf("unadopted stale = %d, want 1", unadopted)

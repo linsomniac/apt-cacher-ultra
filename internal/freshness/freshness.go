@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
@@ -196,6 +197,8 @@ type Checker struct {
 	// memory is small (one *sync.Mutex pointer plus map overhead),
 	// so the long-tail growth is acceptable for Phase 1.
 	locks sync.Map
+
+	lastClockStepLog atomic.Int64 // monotonic ns since processStart of the last clock_step_detected line
 }
 
 // New constructs a Checker. Returns an error on missing required fields.
@@ -528,6 +531,44 @@ func (c *Checker) bumpFailedCheck(ctx context.Context, scheme, host, suitePath s
 	_ = c.cache.PutSuiteFreshness(ctx, *cur)
 }
 
+// clockStepTolerance: stamps are whole seconds, so a sub-second backward
+// NTP step can make a just-written stamp look up to 1 s in the future.
+// Only a stamp further ahead than this counts as a clock step.
+const clockStepTolerance = 2 * time.Second
+
+// clockStepLogEvery rate-limits clock_step_detected to one line per
+// minute per checker (monotonic).
+const clockStepLogEvery = time.Minute
+
+var processStart = time.Now()
+
+// clockStep records a past-event stamp found in the future (spec C4).
+//
+// AIDEV-NOTE: only PAST-EVENT stamps (last_check_at, last_success_at,
+// last_requested_at, adoption_fail_first_at/last_at, adopted_at) are
+// "infinitely old" when in the future. adoption_next_retry_at is a
+// FUTURE-event stamp: phase B only clamps it to now+1h; never route it
+// through this rule, or a backward step would disable backoff.
+func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64, now time.Time) {
+	clockStepsTotal.Inc()
+	last := c.lastClockStepLog.Load()
+	mono := int64(time.Since(processStart))
+	if last != 0 && time.Duration(mono-last) < clockStepLogEvery {
+		return
+	}
+	if !c.lastClockStepLog.CompareAndSwap(last, mono) {
+		return
+	}
+	c.logger.Warn("clock_step_detected",
+		"stamp", stamp,
+		"canonical_scheme", scheme,
+		"canonical_host", host,
+		"suite_path", suitePath,
+		"stored_unixtime", stored,
+		"now_unixtime", now.Unix(),
+	)
+}
+
 // checkLocked is the body of Check, run with the per-suite mutex held.
 // Returns a non-nil *adoptionRequest iff the observed result is "changed"
 // AND the caller has an Adopter wired in (Phase 2 path); the caller
@@ -587,10 +628,15 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 		return nil, nil
 	}
 
-	// Cooldown gate.
+	// Cooldown gate. Spec C4 clock-step rule: a past-event stamp found in
+	// the future (backward wall-clock step) is treated as infinitely old,
+	// never as "just checked" — otherwise the suite freezes for the size
+	// of the step (security finding I-7).
 	if cur.LastCheckAt != nil && c.cooldown > 0 {
-		elapsed := now.Sub(time.Unix(*cur.LastCheckAt, 0))
-		if elapsed < c.cooldown {
+		last := time.Unix(*cur.LastCheckAt, 0)
+		if last.After(now.Add(clockStepTolerance)) {
+			c.clockStep("last_check_at", scheme, host, suitePath, *cur.LastCheckAt, now)
+		} else if now.Sub(last) < c.cooldown {
 			return nil, nil
 		}
 	}

@@ -25,10 +25,18 @@ const staleSuiteFactor = 4
 // staleBefore into adopted (current_snapshot_id set — the dangerous case
 // that serves stale metadata) and unadopted. A nil last_success_at is
 // treated as "never succeeded" rather than "went stale" and is not
-// counted, so brand-new suites don't trip the gauge. SPEC §7.4.
-func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore int64) (adopted, unadopted int) {
+// counted, so brand-new suites don't trip the gauge. A last_success_at
+// more than clockStepTolerance past now (backward clock step) counts as
+// stale (spec C4). SPEC §7.4.
+func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore, now int64) (adopted, unadopted int) {
+	futureAfter := now + int64(clockStepTolerance/time.Second)
 	for _, s := range suites {
-		if s.LastSuccessAt == nil || *s.LastSuccessAt >= staleBefore {
+		if s.LastSuccessAt == nil {
+			continue
+		}
+		// Spec C4: a success stamp in the future is infinitely old, so a
+		// suite frozen across a backward clock step still raises the gauge.
+		if *s.LastSuccessAt >= staleBefore && *s.LastSuccessAt <= futureAfter {
 			continue
 		}
 		if s.CurrentSnapshotID != nil {
@@ -79,12 +87,13 @@ func (c *Checker) tick(ctx context.Context) {
 		c.logger.Warn("freshness: list suites failed", "err", err)
 		return
 	}
+	nowT := c.now()
 	// SPEC §7.4 observability: surface suites that have gone silently
 	// stale (last_success_at past staleSuiteFactor*refresh). An adopted
 	// stale suite is the freeze signature — it keeps serving its snapshot
 	// while never re-checking upstream. The gauge is absolute per tick.
-	staleBefore := c.now().Add(-staleSuiteFactor * c.refresh).Unix()
-	adoptedStale, unadoptedStale := staleSuiteCounts(suites, staleBefore)
+	staleBefore := nowT.Add(-staleSuiteFactor * c.refresh).Unix()
+	adoptedStale, unadoptedStale := staleSuiteCounts(suites, staleBefore, nowT.Unix())
 	freshnessStaleSuites.Set(float64(adoptedStale), "true")
 	freshnessStaleSuites.Set(float64(unadoptedStale), "false")
 	if adoptedStale > 0 {
@@ -95,13 +104,18 @@ func (c *Checker) tick(ctx context.Context) {
 		)
 	}
 
-	threshold := c.now().Add(-c.refresh).Unix()
+	threshold := nowT.Add(-c.refresh).Unix()
 	for _, s := range suites {
 		// Already-fresh suites (last_success_at within refresh window)
 		// are skipped. The cooldown gate inside Check still applies
-		// to anything we do attempt here.
+		// to anything we do attempt here. Spec C4: a last_success_at
+		// beyond clockStepTolerance in the future (backward clock step)
+		// is infinitely old, so the suite is due, not skipped.
 		if s.LastSuccessAt != nil && *s.LastSuccessAt > threshold {
-			continue
+			if *s.LastSuccessAt <= nowT.Add(clockStepTolerance).Unix() {
+				continue
+			}
+			c.clockStep("last_success_at", s.CanonicalScheme, s.CanonicalHost, s.SuitePath, *s.LastSuccessAt, nowT)
 		}
 		// Honor ctx cancellation between suites — Run is scoped to the
 		// cache lifecycle and a long iteration over many suites must

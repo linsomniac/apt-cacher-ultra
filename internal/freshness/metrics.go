@@ -56,6 +56,13 @@ var (
 		"adopted",
 	)
 
+	// clockStepsTotal counts past-event stamps found in the future
+	// (backward wall-clock steps, spec C4).
+	clockStepsTotal = metrics.NewCounter(
+		"acu_clock_steps_detected_total",
+		"Past-event timestamps found in the future (backward wall-clock step).",
+	)
+
 	adoptionTotal = metrics.NewCounterWithCap(
 		"acu_adoption_total",
 		"Total adoption attempts, labeled by outcome and host (SPEC5 §10.4.3).",
