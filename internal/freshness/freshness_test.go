@@ -1,9 +1,11 @@
 package freshness
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1819,6 +1821,89 @@ func TestCheck_FailedTick_DoesNotReconcile(t *testing.T) {
 	// unchanged, so reconcile must not have run.
 	if _, err := env.cache.GetSnapshotMember(ctx, snapID, "main/binary-all/Packages"); err == nil {
 		t.Error("reconcile ran on a non-confirmed (failed) tick — must only run when repair != nil")
+	}
+}
+
+// TestCheck_UnchangedTick_LogsReconcileFailure: the tick-path reconcile
+// must not swallow its error. R-1 made reconcile fail closed on a stored
+// InRelease that carries the clearsign marker but no decodable frame; on
+// the confirmed-unchanged tick that error has to reach the operator as the
+// same Warn line the on-demand path (Checker.Reconcile) emits, otherwise
+// such a snapshot silently stops healing. Harness as in
+// TestCheck_UnchangedTick_ReconcilesDegraded; the snapshot comes from
+// storeInlineSnapshot with an undecodable envelope.
+func TestCheck_UnchangedTick_LogsReconcileFailure(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	env.suite = SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/ubuntu/dists/noble"}
+
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:                env.cache,
+		Fetcher:              env.fetcher,
+		Verifier:             passThroughVerifier{},
+		HostLimiter:          hostsem.New(8),
+		Architectures:        []string{"amd64"},
+		RepairSkippedMembers: true, // gates the tick-path reconcile too
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+
+	// Current inline snapshot whose stored envelope lost its END marker:
+	// it still carries a parseable SHA256 block in the raw text, but no
+	// longer decodes, so reconcile must fail closed.
+	signed := clearsignForTest(t, "Origin: Test\nSuite: noble\nSHA256:\n "+
+		strings.Repeat("a", 64)+" 10 main/binary-amd64/Packages\n")
+	anchor := append([]byte{}, signed[:bytes.LastIndex(signed, []byte("-----END PGP SIGNATURE-----"))]...)
+	snapID := storeInlineSnapshot(t, env, anchor)
+
+	// Upstream serves the byte-identical anchor → "unchanged" → repair != nil.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ubuntu/dists/noble/InRelease" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(anchor)
+	}))
+	defer srv.Close()
+	anchorHash := hashOf(anchor)
+	if err := env.cache.PutURLPath(ctx, cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/ubuntu/dists/noble/InRelease", BlobHash: &anchorHash,
+		UpstreamURL: srv.URL + "/ubuntu/dists/noble/InRelease", IsMetadata: true,
+	}); err != nil {
+		t.Fatalf("PutURLPath: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	checker, err := New(Config{
+		Cache: env.cache, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Adopter: ad, Logger: slog.New(slog.NewJSONHandler(&logBuf, nil)),
+		now: func() time.Time { return time.Unix(11000, 0) },
+	})
+	if err != nil {
+		t.Fatalf("New checker: %v", err)
+	}
+
+	checker.Check(ctx, "http", "127.0.0.1", "/ubuntu/dists/noble")
+	checker.WaitForAdoptions() // the reconcile goroutine has logged by now
+
+	var found bool
+	for _, line := range bytes.Split(logBuf.Bytes(), []byte("\n")) {
+		var rec map[string]any
+		if json.Unmarshal(line, &rec) != nil || rec["msg"] != "adoption_reconcile_failed" {
+			continue
+		}
+		found = true
+		errText, _ := rec["err"].(string)
+		if rec["level"] != "WARN" || rec["canonical_host"] != "127.0.0.1" ||
+			rec["suite_path"] != "/ubuntu/dists/noble" || rec["snapshot_id"] != float64(snapID) ||
+			!strings.Contains(errText, "not a valid clearsigned message") {
+			t.Errorf("adoption_reconcile_failed record = %v; want WARN with host, suite path, snapshot_id %d and the decode error", rec, snapID)
+		}
+	}
+	if !found {
+		t.Fatalf("no adoption_reconcile_failed line on the tick path; log:\n%s", logBuf.String())
 	}
 }
 

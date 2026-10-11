@@ -346,7 +346,14 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 				defer mu.Unlock()
 				defer c.adoptionWg.Done()
 				c.adopter.RepairSkippedMembers(c.lifetimeCtx, repair.suite, repair.snapshotID)
-				_, _ = c.adopter.ReconcileSnapshot(c.lifetimeCtx, repair.suite, repair.snapshotID, false)
+				// ReconcileSnapshot leaves logging to its caller; log like
+				// the on-demand path (Reconcile) so a fail-closed anchor
+				// (R-1 decode error) is visible, not a silent non-heal.
+				if _, err := c.adopter.ReconcileSnapshot(c.lifetimeCtx, repair.suite, repair.snapshotID, false); err != nil {
+					c.logger.Warn("adoption_reconcile_failed",
+						"canonical_host", repair.suite.CanonicalHost, "suite_path", repair.suite.SuitePath,
+						"snapshot_id", repair.snapshotID, "err", err)
+				}
 			}()
 			return
 		}
