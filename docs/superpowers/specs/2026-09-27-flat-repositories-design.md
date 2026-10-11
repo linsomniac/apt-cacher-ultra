@@ -1,6 +1,6 @@
 # Flat repositories, eager adoption, and suite lifecycle — design
 
-- **Date:** 2026-09-27 (revision 4, 2026-10-05: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review and a follow-up review of that revision)
+- **Date:** 2026-09-27 (revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk)
 - **Status:** draft for maintainer review
 - **Branch:** `feature/flat-repos` (from `main` @ 536a1ab)
 - **Origin:** reimplementation of the problem reported in PR #8 ("Refresh flat
@@ -26,7 +26,7 @@ fixes the robustness problems flat support multiplies:
 |---|---|
 | C1 Request canonicalisation | One path-canonicality rule; upstream URLs encoded exactly as apt encodes them. |
 | C2 Suite identity | Whole-directory flat suites; tightened `dists/` grammar; a leaf path package. |
-| C3 Suite rows and signals | One creation choke point with caps; client-interest stamp; signed-seen marker (written at adoption, at startup from cached anchors, and write-ahead when serving). |
+| C3 Suite rows and signals | One creation choke point with caps; client-interest stamp; signed-seen marker (written at adoption, at startup from cached anchors, and in the miss path's writer operation before a signed anchor is served). |
 | C4 Freshness check | Probe tree in apt's order; eager first adoption; form transitions; anchorless refresh; adoption capacity; fair concurrent scheduler with a latency bound; clock rules. |
 | C5 Adoption input | Flat IndexTargets; `./` and `%` Filenames; SHA512 hash blocks; apt's `Date` rules; R-1 fix; I-1 panic recovery; inline verification accepts only decodable clearsigned envelopes; unsigned form. |
 | C6 Flat package coverage | Exact path + Filename-suffix fallback. |
@@ -274,19 +274,20 @@ so an over-cap suite does not cost a writer operation per request.
 
 Only the handler calls it, for a response whose bytes pass the sniff for
 the path, on a miss **or** a `url_path` hit (so anchors cached before this
-release are onboarded). For the anchor paths (`InRelease`, `Release`,
-`Release.gpg`) the row — and, for a signed anchor, the signed-seen marker —
-is created in **one writer operation before the body is written to the
-client**: the miss path holds the whole body before serving, so the order is
-sniff → `CreateSuite` + marker → write body → T1; a hit is sniffed from the
-pool file the same way. Today's handler already seeds its row inside
-`runFetch` before serving; this keeps that order. Flat index rows may be
-created after serving. Paths that create a row:
+release are onboarded). For the anchor paths (`InRelease`, `Release`) the
+row — and, for a signed anchor, the signed-seen marker — is created in the
+**writer operation that stores the `url_path` row, before the body is
+written to the client**: the miss path holds the whole body before serving,
+so the order is sniff → `url_path` + `CreateSuite` + marker → write body →
+T1. Today's handler already seeds its row inside `runFetch` before serving;
+this keeps that order. A hit onboards a cached anchor (creates the row) the
+same way. Flat index rows may be created after serving. Paths that create a
+row:
 
-- with an adopter wired: `<suite>/InRelease`, `<suite>/Release`,
-  `<suite>/Release.gpg` (so a detached client that fetches `Release.gpg`
-  before `Release` still leaves a marker), and flat
-  `<D>/Packages*`/`Sources*`. The new row leaves `last_check_at` NULL and the
+- with an adopter wired: `<suite>/InRelease`, `<suite>/Release`, and flat
+  `<D>/Packages*`/`Sources*` (a sniff-passing `<suite>/Release.gpg` writes the
+  marker for a suite that already has a row but creates none: apt fetches it
+  only after `Release`). The new row leaves `last_check_at` NULL and the
   handler fires T1 once the response is written, so eager adoption starts
   within seconds of first contact (subject to slots);
 - with no adopter (Phase 1): `<suite>/InRelease` only, stamping
@@ -329,7 +330,7 @@ that have a `suite_freshness` row. Writers:
 - `CommitAdoption`, inside its transaction, for every inline or detached
   snapshot — from phase A, so snapshots adopted by any later binary carry
   their history even before the handler writer exists;
-- the startup legacy pass (§6.1): every pre-v7 snapshot the audit classifies
+- the startup legacy pass (§6.1): every adopted pre-v7 snapshot the audit classifies
   as signed; and, at **every** start, each tracked suite whose cached
   `InRelease` or `Release.gpg` `url_path` row passes the sniff
   (`last_seen_at` = the newer of that row's `last_requested_at` and
@@ -339,22 +340,29 @@ that have a `suite_freshness` row. Writers:
   adoption runs. A never-adopted suite whose anchor row was already deleted
   by `url_path` GC before the upgrade leaves no evidence and gets no marker
   (documented);
-- the handler (phase D), **write-ahead**: before writing the body of a
-  sniff-passing `InRelease` or `Release.gpg` — including on first contact,
-  where the marker is written in the same writer operation that creates the
-  row — if its coalescing map (one entry per base per day) has no entry, it
-  commits the marker, waiting at most 2 s for the writer. The 2 s bound
-  applies to the wait only: the enqueued write is not cancelled with the
-  request. On timeout or error it serves anyway and counts
-  `acu_signed_seen_write_failures_total` (the only window left, and it is
-  counted). A client therefore never holds signed bytes for a base whose
-  marker an unsigned commit could miss, because that commit re-reads the
-  marker in its own transaction (C5).
+- the handler (phase D), on the **miss path only**, inside the writer
+  operation that stores the `url_path` row (and, on first contact, creates
+  the suite row): for a sniff-passing `InRelease` or `Release.gpg` the marker
+  is part of that operation, which completes before the body is served. If
+  the operation fails the miss fails as it does today (502, no body), so a
+  signed anchor body is never written to a client before its base has a
+  marker — no timeout path, no residual window. The hit path writes no
+  marker: every cached sniff-passing anchor row was created by a miss under
+  this rule, seeded by `CommitAdoption` (which marks in its transaction),
+  rebuilt by `reconstructAnchor` from a snapshot marked at commit or by the
+  audit, or created by an earlier binary and marked by the startup pass
+  before this binary serves; the blob behind a row is content-addressed, so a
+  row that failed the sniff cannot pass it later. The writer is a FIFO queue
+  drained by one goroutine (`cache.submitWrite`), so an unsigned
+  `CommitAdoption` enqueued after a marker write runs after it, and its
+  in-transaction re-read (C5) sees the marker.
 
 A plain-text "InRelease" fails the sniff and never creates a marker. The
-marker survives suite reaping (the reaper sweeps markers not renewed for
-365 days). `POST /forget` deletes it only if no other suite with the same
-base has a row.
+marker survives suite reaping: the reaper sweeps a marker only once no
+suite row exists for its base or its `/.` twin and its `last_seen_at` is
+older than 365 days (a live suite's marker is never swept, so no renewal
+write is needed). `POST /forget` deletes it only if no other suite with the
+same base has a row.
 
 ### C4. Freshness check
 
@@ -365,7 +373,10 @@ failed: `last_check_at` is bumped, so the cooldown applies).
 
 **Scheduler fairness (T2, phase B).** A per-check deadline does not bound how
 long one suite waits behind others (a sequential loop with 500 two-minute
-failing checks ahead of a healthy suite delays it by 16 h 40 min). The
+failing checks ahead of a healthy suite delays it by 16 h 40 min — a host
+that accepts connections and stalls or answers late with 5xx; a host that
+refuses or ignores connections is already collapsed by the fetch client's
+`upstream.unreachable_cooldown` fast-fail, which the probes share). The
 scheduler therefore keeps a **per-host queue of due suites**, refreshed every
 tick (newly due suites appended, queued ones not duplicated; at most
 `freshness.max_suites` entries in all), served by a fixed pool of **4 check
@@ -373,12 +384,23 @@ workers** (constant):
 
 - **across hosts:** at most one check in flight per canonical host; hosts
   take turns round-robin, **one check per turn**;
-- **within a host:** *healthy* suites (last scheduled check not *unknown*)
-  before *failing* ones (last *k* ≥ 1 scheduled checks *unknown*), each class
-  in rotation by oldest `last_check_at` (never-checked first);
+- **within a host:** three classes, all from persisted columns so they
+  survive restarts — *healthy* (`check_fail_count = 0`, checked before), then
+  *never checked* (`last_check_at IS NULL`; a new suite is reached by T1 at
+  first contact anyway), then *failing* (`check_fail_count` = *k* ≥ 1).
+  Inside a class, first in first out by the time the suite was queued (a
+  suite re-queued after its check goes to the back), so a suite that becomes
+  due later never moves ahead of one already queued and *n* below is fixed at
+  queue time. `suite_freshness.check_fail_count` (v7) is the streak of
+  consecutive checks that ended *unknown*: the UPDATE that bumps
+  `last_check_at` after a failed check increments it, any other result resets
+  it to 0 (no extra writer operation); every check, T1 or T2, maintains it;
+  only the scheduler reads it;
 - **failure backoff:** a failing suite is not due before
-  `last_check_at + min(1 h, 2 min × 2^(k−1))` (in memory, reset by any
-  non-*unknown* result and by restart; T1 checks keep only the cooldown);
+  `last_check_at + min(1 h, 2 min × 2^(k−1))`, computed from the persisted
+  columns (the clock-step rule applies to `last_check_at`), so a restart
+  neither reorders the queues nor makes every failing suite due at once; T1
+  checks keep only the cooldown;
 - queues persist across ticks, so a long-running batch never delays the
   detection of newly due suites; memory is bounded by the queues and the
   pool.
@@ -394,10 +416,15 @@ healthy. A due suite *S* is checked within
 
   one tick interval (until it is queued) + (*n* + 1) × ⌈*H*/4⌉ × *D*.
 
-Examples: 500 timing-out suites on host A delay a healthy suite on host B by
-at most one tick + 2 min (*H* = 2); a healthy suite on host A itself waits at
-most one tick + ⌈*H*/4⌉ × 2 min, because healthy suites go before failing
-ones. Failing suites share what is left of their host's turns, slowed by the
+Examples: 500 stalling suites on host A delay a healthy suite on host B by
+at most one tick + 2 min (*H* = 2). A healthy suite on host A itself waits at
+most one tick + ⌈*H*/4⌉ × 2 min once each of the 500 has failed once —
+including after a restart, because the class and the backoff are persisted
+and healthy suites go before never-checked and failing ones. A suite's first
+failure is paid in the healthy class, once: if *n* healthy suites on a host
+start stalling together, its other healthy suites wait up to *n* × 2 min
+that one time; afterwards the stalled ones sit in the failing class.
+Failing suites share what is left of their host's turns, slowed by the
 backoff; they cannot starve healthy ones anywhere.
 
 **Response classification** (defined once, used everywhere):
@@ -595,7 +622,11 @@ false` therefore changes meaning (documented): it only permits starting with
 an empty keyring (useful with `accept_any_signer` or for unsigned
 repositories). A plain-text "InRelease" fails the first-line sniff, is
 *absent*, and the suite is handled as unsigned (or anchorless), so it never
-vouches. Real apt rejects such files anyway. `accept_any_signer` is
+vouches. Real apt rejects such files anyway. This costs no apt-usable
+repository anything: apt itself rejects an `InRelease` whose first line is
+not the clearsign marker (§3), so the only metadata the old fallback ever
+adopted was metadata no apt client could consume; it lands in phase A
+because keeping the fallback until phase E protects nothing. `accept_any_signer` is
 unchanged: a decodable envelope with a structurally valid signature is still
 accepted without cryptographic verification (delegating trust to the
 clients), which is distinct from accepting an undecodable envelope. Snapshots
@@ -615,8 +646,9 @@ upgrade (§6.1).
    established unsigned suite adopt at once.
 3. **Never downgrade:** refused (`unsigned_downgrade_refused`, a refusal
    state) when a `suite_signed_seen` marker exists for the suite's base. The
-   marker outlives reaping, covers the `./` twin, and is committed before any
-   client is served a signed anchor (C3 write-ahead). The check runs twice:
+   marker outlives reaping, covers the `./` twin, and is committed in the
+   writer operation that stores a signed anchor, before any client is served
+   it (C3). The check runs twice:
    at eligibility, and again **inside the `CommitAdoption` writer
    transaction**, which re-reads the marker for the candidate's base and
    refuses an unsigned candidate (no pointer change, no rows) when one exists
@@ -795,7 +827,9 @@ client's queued requests for another suite past that suite's flip.
 Residuals (documented, counted): phase-B expiry when the commit or an
 in-flight reader exceeds 20 s (F-2 on very large suites), hold-token timeout
 (more than three suites flipping at once), waiters beyond the cap, and anchor
-reads slower than apt's own timeout.
+reads slower than apt's own timeout. A flip waiting for the token keeps its
+global adoption slot, so with several suites flipping at once other
+adoptions can queue for up to about 140 s (bounded).
 by-hash clients remain covered by retained by-hash. Answering held requests
 with `503 Retry-After` instead was rejected: apt before 2.3.2 treats a 5xx as
 an item failure without retrying, while answering from the current snapshot is
@@ -853,8 +887,9 @@ the suite mutex (busy → skip), then:
    snapshots; delete the `suite_freshness` row.
 
 Then it purges in-memory state (lock-map `CompareAndDelete`, flipgate entry,
-touch- and marker-coalescing entries). It also sweeps signed-seen markers not
-renewed for 365 days and the reconcile memo (against current snapshot ids).
+touch-coalescing entry). It also sweeps signed-seen markers whose base and
+`/.` twin have no `suite_freshness` row and whose `last_seen_at` is older
+than 365 days, and the reconcile memo (against current snapshot ids).
 The gpg once-logger maps reset when they exceed 10,000 entries. Snapshot GC
 gains sub-job C: retired snapshots are deleted with their members and
 `package_hash` rows in bounded chunks (10,000 rows per writer transaction),
@@ -910,7 +945,8 @@ upgrade.
 `adoption_failing_persistently`, `adoption_refused` (reason),
 `adoption_flip_barrier`, `adoption_panicked`, `clock_step_detected`,
 `flat_host_root_unsupported`, `legacy_snapshot_quarantined`,
-`legacy_trust_audit_progress`, `legacy_trust_audit_completed`; new fields `anchor_form`, `flat`,
+`legacy_trust_audit_progress`, `legacy_trust_audit_deferred`,
+`legacy_trust_audit_completed`; new fields `anchor_form`, `flat`,
 `snapshot_displaced`. New metrics are host-labelled or unlabelled (no suite
 labels) and are added to the metrics inventory comments in
 `internal/freshness/metrics.go` and `internal/handler/metrics.go`.
@@ -928,8 +964,8 @@ Constants, not knobs: backoff 2 m → 1 h (adoption failures and repeated
 *unknown* checks); hold 20 s; phase A cap 60 s; hold-token wait 60 s; waiter
 caps 256 (barrier) and 64 (strict wait); strict wait 15 s; reaps 25 per run;
 unsigned member cap 1,000; check deadline 2 min; check workers 4; interest
-window 7 d; marker TTL 365 d; marker write-ahead wait 2 s; cap-rejection
-cache 10 min; legacy-audit anchor read cap 8 MiB and batch 100.
+window 7 d; orphan-marker TTL 365 d; cap-rejection cache 10 min;
+legacy-audit anchor read cap 8 MiB and batch 100.
 
 ## 6. Migration v6 → v7
 
@@ -950,6 +986,7 @@ ALTER TABLE suite_freshness ADD COLUMN adoption_fail_last_at  INTEGER;
 ALTER TABLE suite_freshness ADD COLUMN adoption_next_retry_at INTEGER;
 ALTER TABLE suite_freshness ADD COLUMN adoption_fail_etag     TEXT;
 ALTER TABLE suite_freshness ADD COLUMN adoption_fail_lastmod  TEXT;
+ALTER TABLE suite_freshness ADD COLUMN check_fail_count       INTEGER NOT NULL DEFAULT 0;
 
 ALTER TABLE suite_snapshot ADD COLUMN anchor_form TEXT NOT NULL DEFAULT ''
   CHECK (anchor_form IN ('', 'inline', 'detached', 'unsigned'));
@@ -980,11 +1017,14 @@ CREATE TABLE suite_signed_seen (
   PRIMARY KEY (canonical_scheme, canonical_host, base)
 );
 
--- Every pre-v7 snapshot awaits the legacy trust audit (§6.1).
+-- Every adopted pre-v7 snapshot awaits the legacy trust audit (§6.1).
+-- Never-adopted candidates are inert (a later adoption that reuses one
+-- verifies its own bytes) and their anchors are unpinned, so not queued.
 CREATE TABLE legacy_trust_audit (
   snapshot_id INTEGER PRIMARY KEY
 );
-INSERT INTO legacy_trust_audit (snapshot_id) SELECT snapshot_id FROM suite_snapshot;
+INSERT INTO legacy_trust_audit (snapshot_id)
+  SELECT snapshot_id FROM suite_snapshot WHERE adopted_at IS NOT NULL;
 
 -- Go step, same transaction, :now = nowUnix()
 UPDATE suite_freshness SET last_requested_at = COALESCE(
@@ -1023,32 +1063,43 @@ weaknesses that the schema cannot show:
   `package_hash` rows and strict-mode participation. The migration labels it
   `inline` like every single-anchor row.
 
-The v7 migration queues every existing snapshot in `legacy_trust_audit`. At
+The v7 migration queues every adopted snapshot in `legacy_trust_audit`. At
 every start, after the migration and before the GC loops, the freshness
 checker and the HTTP listeners serve, `freshness.RunLegacyTrustAudit` drains
-the queue. **Pre-flight:** when the queue is not empty, the pool directory
-must be readable and at least one queued inline anchor must exist; an
-unmounted, empty or foreign pool would otherwise make every anchor look
-missing, so startup refuses with a message naming the path and changes
-nothing. Each batch of 100 is decided in memory and applied in **one writer
-transaction** (an INFO `legacy_trust_audit_progress` line per batch):
+the queue. **Pre-flight:** when the queue holds inline snapshots, the pool
+directory must be readable, and when two or more inline anchors are queued
+at least one of them must exist; an unmounted, empty or foreign pool would
+otherwise make every anchor look missing, so startup refuses with a message
+naming the path and the two ways out (restore the pool, or wipe the cache)
+and changes nothing. A single queued inline anchor that is missing is
+quarantined (one lost pool file cannot be told from a lost mount, and
+refusing would leave no recovery short of wiping the cache); detached-only
+queues read no pool files. Each batch of up to 100 is decided in memory and
+applied in **one writer transaction** (an INFO `legacy_trust_audit_progress`
+line per batch):
 
 - **Detached** snapshots are signed (adoption always verified `Release.gpg`,
   or under `accept_any_signer` checked its structure): marker for the base
-  (`last_seen_at` = `adopted_at`, else `created_at`), dequeue.
+  (`last_seen_at` = `adopted_at`, else `created_at`), dequeue. An
+  **unsigned** snapshot (possible only if one is re-queued after phase E) is
+  never trust-bearing: dequeue, no marker.
 - **Inline** snapshots: read the stored `InRelease` blob (at most 8 MiB) from
   the pool and check its SHA256 against the pinned hash. A missing file
   (`anchor_missing`), an oversized one (`anchor_oversized`) or a hash
-  mismatch (`anchor_corrupt`) is quarantined without a marker; **any other
-  read error aborts startup** (an I/O fault must never become an
-  irreversible quarantine). It is **signed and clean** when it decodes as a clearsigned
+  mismatch (`anchor_corrupt`) is quarantined without a marker. **Any other
+  read error is not evidence:** the snapshot stays queued and untouched (it
+  keeps serving as before the upgrade), an ERROR
+  `legacy_trust_audit_deferred` names it, and the next start retries it;
+  startup continues. It is **signed and clean** when it decodes as a clearsigned
   message, its plaintext parses, and parsing the raw envelope the way the old
-  reconcile did (each whitespace-only line read as a blank line, as the
-  clearsign decoder does) yields no (path, SHA256, size) declaration that the
+  reconcile did (with line endings and trailing spaces canonicalised exactly
+  as the clearsign decoder canonicalises the plaintext: CRLF → LF, trailing
+  spaces and tabs removed) yields no (path, SHA256, size) declaration that the
   plaintext lacks and no parse error: marker, dequeue. Anything else — no
   clearsign marker (legacy plain text), a marker that does not decode, extra
-  or unparseable declarations in the raw envelope (R-1), unparseable
-  plaintext — is **quarantined**, like the missing, oversized and corrupt
+  or unparseable declarations in the raw envelope (R-1: after a forged
+  `=CRC` line, or as colon-bearing armor headers), unparseable plaintext — is
+  **quarantined**, like the missing, oversized and corrupt
   blobs above. An envelope that decodes (R-1 tampering, unparseable
   plaintext) still proves the upstream signs, so it is quarantined **and**
   marked; plain-text, undecodable, missing, oversized and corrupt anchors get
@@ -1066,26 +1117,42 @@ transaction** (an INFO `legacy_trust_audit_progress` line per batch):
   serves, never vouches or counts for strict mode (both read current
   snapshots only), is excluded from retained by-hash (non-retired only), can
   never be committed (`CommitAdoption` refuses retired candidates with
-  `ErrSnapshotRetired`), and is deleted by snapshot GC. Its blobs' refcounts
-  are released exactly once.
+  `ErrSnapshotRetired`), and is deleted by snapshot GC sub-job C (phase F);
+  until then it is a retired displaced row, which sub-job B's
+  `keep_displaced` ranking skips from phase F on. Its blobs' refcounts are
+  released exactly once.
 
 Each batch commits with its outcomes, so an interrupted audit resumes at the
-next start without repeating effects; a database or pool I/O error aborts
-startup (the service manager restarts it: with `Restart=always` that is a
-restart loop until the fault is fixed, documented). The quarantine WARN is
-logged after its batch commits, so a crash in between can lose the line but
-never the effect. Retired snapshots still count in the displaced-snapshot
-gauge until snapshot GC deletes them. After the queue drains, the **marker pass**
+next start without repeating effects. Only a database error or a failed
+pre-flight refuses to start (those would misjudge every snapshot); a single
+unreadable anchor defers that snapshot. The quarantine WARN is logged after
+its batch commits, so a crash in between can lose the line but never the
+effect. Retired snapshots still count in the displaced-snapshot gauge until
+snapshot GC deletes them. The listeners are bound before the cache opens, so
+during a long first audit connections are accepted and wait; apt clients may
+time out once (documented). After the queue drains, the **marker pass**
 (C3) runs at every start. `INFO legacy_trust_audit_completed` reports counts
 and duration.
 
-A quarantined suite falls back to Phase 1 serving until it re-adopts: on the
-next upstream change (phases A–D) or by eager first adoption (phase E). A
-legacy plain-text repository then adopts in the unsigned form through
-`Release`, with no false downgrade refusal, because no marker was written for
-it. Rebuilding derived rows in place was rejected: quarantine is simpler to
-prove correct, and both conditions require an attack or a non-default
-setting.
+A quarantined suite falls back to Phase 1 serving (its `url_path` anchor row
+is kept) until it re-adopts. Re-adoption happens on the first check that
+observes anchor bytes different from the cached ones (phases A–D) or by
+eager first adoption (phase E). For an R-1 quarantine that is the first
+post-upgrade check: the cached anchor holds the tampered envelope, which a
+clean upstream does not serve, so the check sees *changed* and adopts the
+clean content with the fixed parser. An `anchor_missing`, `anchor_corrupt`
+or `anchor_oversized` quarantine of a suite whose upstream is unchanged, and
+a legacy plain-text suite, stay unadopted until upstream changes or phase E
+(a vendor that never republishes stays unadopted until then); with
+`refuse_unvouched_debs = true` their `.deb`s are refused meanwhile whenever
+another current snapshot on the host has complete coverage (C10 treats them
+as unadopted) — documented at upgrade. A legacy plain-text repository then
+adopts in the unsigned form through `Release` (phase E), with no false
+downgrade refusal, because no marker was written for it. Rebuilding derived
+rows in place was rejected: `package_hash` rows do not record which index
+produced them, so a rebuild is a full re-derivation, and quarantine is
+simpler to prove correct; both conditions require an attack or a
+non-default setting.
 
 ## 7. Testing strategy
 
@@ -1117,8 +1184,13 @@ files), in phase D.
   D, flat in G); a named adoption-disabled parity test (seed values, no T1,
   no new seeds); touch coalescing; marker written only for tracked suites;
   marker written at adoption (signed forms only) and by the startup pass for
-  a never-adopted suite whose signed anchor was served; handler write-ahead
-  ordering (marker committed before the body).
+  a never-adopted suite whose signed anchor was served; miss-path ordering
+  (the marker is in the writer operation that stores the anchor row; a failed
+  operation serves no body); the hit-path invariant (after a mix of misses,
+  adoptions, `reconstructAnchor` and restarts, every `url_path` anchor row
+  whose blob passes the sniff has a marker for its base); FIFO ordering (a
+  marker write enqueued before an unsigned commit is visible to the commit's
+  transaction).
 - C4: classification table (every status class per anchor); form transitions
   both ways incl. detached → inline and the two-observation rule;
   `anchor_absent` visible and not silent; anchorless refresh (IMS, sniff
@@ -1177,11 +1249,15 @@ files), in phase D.
   `package_hash` rows) upgraded: the forged index is not served, its hashes
   do not vouch, clean suites keep serving and get markers, refcounts balance,
   interruption and restart resume without double effects; a detached
-  snapshot is kept; a missing pool, an empty pool or an unreadable anchor
-  stops startup without changing anything; a missing or corrupt anchor blob
-  is quarantined; a whitespace-only line inside a hash block does not cause
-  a false quarantine; the quarantined plain-text suite later adopts unsigned
-  without a downgrade refusal (E).
+  snapshot is kept; a missing or empty pool stops startup without changing
+  anything; an unreadable anchor defers only that snapshot; a missing or
+  corrupt anchor blob is quarantined; CRLF envelopes and whitespace-only
+  lines inside a hash block do not cause a false quarantine, and an
+  injection inside a CRLF envelope or the armor headers is still caught; an
+  R-1-quarantined suite re-adopts on its first check against a clean
+  upstream; the audit runs before GC and serving with adoption disabled; the
+  quarantined plain-text suite later adopts unsigned without a downgrade
+  refusal (E).
 - C10: strict matrix per `sources.list` form × Filename shape; mixed host;
   the in-flight wait turns a first-install refusal into a success on both the
   hit and miss paths; unsigned and anchorless suites never change posture.
@@ -1219,7 +1295,9 @@ every phase.
   adoption-enabled requirement, corrected coherence claim, GC and `/forget`.
 - `docs/configuration.md`: new keys (C11); unsigned trust, never-downgrade and
   the LAN-client note; the changed meaning of `require_signature = false`
-  (phase A); the legacy trust audit and quarantine at upgrade;
+  (phase A; release note: it affects only deployments whose `InRelease` URL
+  serves a non-clearsigned body, which apt rejects on its first line); the
+  legacy trust audit and quarantine at upgrade;
   strict-mode behaviour for flat, unsigned, anchorless and first use; eager
   first adoption; suite reaping; the apt timeout constraint on the barrier;
   the per-host suite cap.
@@ -1237,13 +1315,13 @@ item depends on a later phase.
 | Phase | Items | Definition of Done (highlights) |
 |---|---|---|
 | **A. Foundations** | v7 migration (final schema, Go backfill step, trigger) and Go types incl. the `SingleAnchorHash`/`Form`/`ReleaseDate`/`RetiredAt` fields; `aptpath` and `wallclock` packages; handler fetch seam; C1 complete (changes `+`/`~` request lines to apt's form); C2 `dists/` tightening (no flat grammar yet); `%w` wraps and sentinels; R-1; I-1 recover (logging) in adoption, repair, reconcile, T1 and scheduler goroutines; clock-step rule in existing gates; synctest harness + smoke simulation; inline verification fails closed; signed-seen markers written at adoption and by the startup marker pass (with the `InRelease`/`Release.gpg` sniffs and `MarkSignedSeenBatch`); §6.1 legacy trust audit with quarantine. | v6-fixture migration test; no-SQLite-clock test; C1 tables and production-fixture round trip; existing suite green except enumerated `SuitePath` tightening cases and the `require_signature = false` passthrough tests; R-1 and I-1 fixtures fail on main, pass here; polluted-v6 audit test (current and displaced, plain text, interruption); 30-day smoke simulation < 5 s under `-race`. |
-| **B. Retry discipline and capacity** | C7 record, gate, schedule, refusal states, restart; `Date` rules; validators at commit; `change_seen` semantics; capacity (TryAcquire global + host slots for adoption, repair and reconcile; reserved slot; `max_duration`; `WithoutCancel` commit; queued results); panic recorded; fair concurrent scheduler (C4: per-host queues, 4 workers, one check per host turn, healthy before failing, rotation, failure backoff); admin, gauge, logs. | lim1 reproduction bound; T1-storm test; 30-day simulation incl. flapping mirror and clock step (liveness + bounds); slow-drip + degraded-suite capacity simulation exercising both check and adoption admission; scheduler latency-bound simulation (H = 8 with timing-out hosts and n = 3 healthy suites ahead; 500 failing + 1 healthy suite on one host); "lagging" visible. |
-| **C. Flip consistency** | C8 flipgate with the hold token, handler anchor hook, retained by-hash (SHA256, non-retired only), monotonic `Last-Modified`. | Straddle test fails on the B tip, passes here; overlapping-hold trace in a shared-queue simulation; busy-suite, cross-suite and slow-reader tests; hold ≤ 20 s; chaos straddles = 0; `flip_quiet_period = 0s` keeps existing tests unchanged. |
-| **D. Creation bounds and signals** | C3 in full: sniffs, `CreateSuite` with caps (anchor rows and markers before the body, including first contact), eviction and rejection cache, legacy onboarding, adoption-disabled seed parity, UPDATE-only writers, I-4 (both sides), touch (anchors, vouched `.deb`s), handler write-ahead signed-seen marker; `Release` and flat-index sniffs; `clearsignedFixture()` migration. | Single-INSERT-site test; minted-suite scale test; `dists/` onboarding test on a v6 fixture; adoption-disabled parity test. |
+| **B. Retry discipline and capacity** | C7 record, gate, schedule, refusal states, restart; `Date` rules; validators at commit; `change_seen` semantics; capacity (TryAcquire global + host slots for adoption, repair and reconcile; reserved slot; `max_duration`; `WithoutCancel` commit; queued results); panic recorded; fair concurrent scheduler (C4: per-host queues, 4 workers, one check per host turn, healthy → never-checked → failing, FIFO, persisted failure streak and backoff); admin, gauge, logs. | lim1 reproduction bound; T1-storm test; 30-day simulation incl. flapping mirror and clock step (liveness + bounds); slow-drip + degraded-suite capacity simulation exercising both check and adoption admission; scheduler latency-bound simulations with stalling (not refusing) responders: H = 8 with n = 3 healthy suites ahead; 500 failing + 1 healthy suite on one host, repeated after a simulated restart; "lagging" visible. |
+| **C. Flip consistency** | C8 flipgate with the hold token, handler anchor hook, retained by-hash (SHA256, non-retired only), monotonic `Last-Modified`. | Straddle test fails on the B tip, passes here; overlapping-hold trace in a shared-queue simulation; five busy suites flipping within 0.1 s (holds never overlap, at most three hold, the rest commit unheld within 60 s + 20 s and are counted, zero straddles for held suites); busy-suite, cross-suite and slow-reader tests; hold ≤ 20 s; chaos straddles = 0; `flip_quiet_period = 0s` keeps existing tests unchanged. |
+| **D. Creation bounds and signals** | C3 in full: sniffs, `CreateSuite` with caps (anchor rows and markers before the body, including first contact), eviction and rejection cache, legacy onboarding, adoption-disabled seed parity, UPDATE-only writers, I-4 (both sides), touch (anchors, vouched `.deb`s), signed-seen marker in the miss path's writer operation; `Release` and flat-index sniffs; `clearsignedFixture()` migration. | Single-INSERT-site test; minted-suite scale test; `dists/` onboarding test on a v6 fixture; adoption-disabled parity test. |
 | **E. Eager adoption and anchor forms** | C4 probe tree, classification, form transitions, `anchor_absent`, eager first adoption with interest window, T1-on-seed; C5 unsigned form with safeguards; SHA512 merge, shared verify helper, aliases, retained by-hash SHA512; C10 in-flight wait. | Production-shaped fixture: active never-adopted suites adopt once, dormant ones make zero requests; classification table; never-downgrade at both points, including the in-transaction recheck race; a §6.1-quarantined plain-text suite adopts unsigned without a downgrade refusal; unsigned never changes posture; nvidia-shaped fixture adopts; SHA512 by-hash served; in-flight wait on hit and miss paths. |
 | **F. Suite reaping** | C9 retirement, reaper (own ticker), batched metadata deletion, sub-job C, memory purge, marker TTL, `POST /forget`. | 90-day simulation at `gc.interval = 24h` with restarts; return-before-GC and `/forget` re-adoption tests; forward-step self-heal; never-downgrade after reap; `/forget` CSRF test; twins untouched. |
-| **G. Flat repositories** | C2 flat grammar; flat IndexTargets (layout-aware, adoption and handler sides); `validateFilename`; C6 materialisation, fallback, coverage; anchorless refresh; flat root-index touch; flat pdiff arch labels. | Every real Filename shape adopts and vouches; flat `Packages` failure fatal; strict matrix; anchorless refresh tests; flat legacy onboarding on a v6 fixture (an untrusted flat suite makes ≤ 1 attempt per backoff step); reaping `/repo` leaves `/repo/.` intact. |
-| **H. End to end and docs** | `e2e/flat/`; documentation; config file; final full-diff review. | `make e2e-flat` green on all images with the grep assertions; docs complete. |
+| **G. Flat repositories** | C2 flat grammar; flat IndexTargets (layout-aware, adoption and handler sides); `validateFilename`; C6 materialisation, fallback, coverage; anchorless refresh; flat root-index touch; flat pdiff arch labels. | PR #8's evidence: a miss on `/…/deb/InRelease` and on `/…/deb/./InRelease` creates one suite row each and fires T1 under it, a hit fires T1 again, and `/…/deb/Packages_1.0_all.deb`, host-root `/InRelease` and `/…/deb//InRelease` create none (no check fires for either path on `main`); `/core:/stable:/v1.34/deb/InRelease` → suite `/core:/stable:/v1.34/deb`; every real Filename shape adopts and vouches; flat `Packages` failure fatal; strict matrix; anchorless refresh tests; flat legacy onboarding on a v6 fixture (an untrusted flat suite makes ≤ 1 attempt per backoff step); reaping `/repo` leaves `/repo/.` intact. |
+| **H. End to end and docs** | `e2e/flat/`; documentation; config file; final full-diff review. | `make e2e-flat` green on all images with the grep assertions, including PR #8's end-to-end table (one signed flat repository configured as `deb <uri>/ /` on one client and `deb <uri> ./` on another: both report 2.0 within one cooldown of the v2 publish, and with the upstream stopped two fresh clients install 2.0 from the snapshots); docs complete. |
 
 ## 10. Out of scope / follow-ups
 
@@ -1282,7 +1360,8 @@ item depends on a later phase.
 | Unsigned adoption abused by a MITM or a LAN client. | Two observations (1 h for 401/403), signed-seen marker outliving reaps and written before signed bytes are served, never-downgrade in check and inside the commit transaction, member cap, capacity bounds, no vouching, no strict-mode effect; documented hardening knobs. |
 | Trust derived before this release (R-1 pollution, plain-text inline snapshots) survives the upgrade. | §6.1 startup audit quarantines them before serving; resumable; tests on a polluted v6 cache. |
 | The audit misclassifies clean snapshots and quarantines them. | Clean = decodable envelope whose raw and signed declarations agree (true of every real InRelease); tests use realistic multi-section envelopes; a quarantine only degrades the suite to Phase 1 serving until it re-adopts. |
-| One host's failing checks starve other suites. | Fair worker pool with per-host round-robin, rotation and failure backoff; a stated latency bound pinned by simulation. |
+| One host's failing checks starve other suites. | Fair worker pool with per-host round-robin, healthy-first FIFO classes and a failure streak and backoff persisted across restarts; a stated latency bound pinned by simulation. |
+| The startup audit makes a whole fleet's proxy unavailable. | Only a database error or a missing/empty pool refuses to start; a single unreadable pool file defers that snapshot; the audit is one-time and batched. |
 | Barrier stalls or times out clients. | Holds only in phase B, ≤ 20 s (< apt's 30 s), one hold at a time, bounded in-flight wait, waiter cap, cross-suite quiet in both phases; `0s` disables; counters. |
 | Suite reaping removes a live suite, or a returning suite cannot re-adopt. | 30-day TTL, touches from anchors/indexes/vouched `.deb`s, compare-and-delete, hourly cap, uptime floor, snapshot retirement; a false reap self-heals on the next request; tests pin it. |
 | New code paths leave a suite silently stuck (freeze-trap class). | An explicit, visible state for every refusal, `POST /forget`, liveness assertions in every simulation. |
