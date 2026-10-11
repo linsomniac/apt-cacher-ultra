@@ -1686,7 +1686,7 @@ func TestCommitAdoption_NewSuiteRowGetsInterestStamp(t *testing.T) {
 - [ ] **Step 3: Run to verify failure**
 
 Run: `go test ./internal/cache/ -run 'SchemaV7|SQLiteClock|InsertCandidateSnapshot_|StampsInterest|InterestStamp'`
-Expected: compile failure (`migrationGoSteps`, `FormUnsigned`, `ErrInvalidAnchorForm`, `SnapshotCandidate.Form` undefined). The SQL-clock test alone passes already; it guards the new migration.
+Expected: compile failure (`migrationGoSteps`, `FormUnsigned`, `ErrInvalidAnchorForm`, `SnapshotCandidate.Form` undefined). (`TestNoSQLiteClockFunctionsInProductionCode` needs no production change and passes once the package compiles; it guards the new migration.)
 
 - [ ] **Step 4: Implement the migration**
 
@@ -2147,6 +2147,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
+gofmt -l internal/cache/types.go internal/cache/adoption.go internal/cache/gc_urlpath.go internal/cache/anchor_form_test.go internal/freshness/freshness.go internal/freshness/adoption.go internal/freshness/freshness_test.go
 git add -A internal/
 git commit -m "$(cat <<'EOF'
 Read the snapshot anchor form instead of guessing it
@@ -3013,7 +3014,7 @@ Expected: the freshness package fails to compile (`recoverGoroutine`, `reportPan
 
 - [ ] **Step 7: Implement in the freshness package**
 
-Add to `freshness.go` (imports `runtime/debug`, `sync`):
+Add to `freshness.go` (add the `runtime/debug` import; `sync` is already imported):
 
 ```go
 // ErrAdoptionPanicked is recorded (phase B) when an adoption, repair or
@@ -3206,7 +3207,7 @@ Expected: PASS (the repeated run shows the defer ordering is deterministic).
 - [ ] **Step 10: Commit**
 
 ```bash
-gofmt -l internal/gpg internal/freshness/freshness.go internal/freshness/scheduler.go internal/freshness/panic_recovery_test.go internal/handler/handler.go internal/handler/panic_recovery_test.go
+gofmt -l internal/gpg internal/freshness/freshness.go internal/freshness/adoption.go internal/freshness/scheduler.go internal/freshness/metrics.go internal/freshness/panic_recovery_test.go internal/handler/handler.go internal/handler/panic_recovery_test.go
 git add internal/gpg/verifier.go internal/gpg/clearsign_panic_test.go internal/freshness/freshness.go internal/freshness/adoption.go internal/freshness/scheduler.go internal/freshness/metrics.go internal/freshness/panic_recovery_test.go internal/handler/handler.go internal/handler/panic_recovery_test.go
 git commit -m "$(cat <<'EOF'
 Stop malformed InRelease files from crashing the daemon (I-1)
@@ -5273,6 +5274,34 @@ func TestRunLegacyTrustAudit_UnreadableAnchorIsDeferred(t *testing.T) {
 	}
 }
 
+// An anchor that cannot even be stat'ed (its pool subdirectory is not
+// searchable) is an I/O fault, not evidence of a lost pool: pre-flight
+// must not refuse to start, and the audit defers that snapshot.
+func TestRunLegacyTrustAudit_UnstatableAnchorDoesNotRefuseStart(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	f := buildLegacyFixture(t)
+	ctx := context.Background()
+	c := f.env.cache
+	s, err := c.GetSuiteSnapshot(ctx, f.clean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(c.BlobPath(*s.SingleAnchorHash))
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	res, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger())
+	if err != nil || res.Deferred < 1 {
+		t.Fatalf("run = %+v (%v), want no refusal and the unstatable snapshot deferred", res, err)
+	}
+	if cur := currentOf(t, c, "/r/dists/clean"); cur == nil || *cur != f.clean {
+		t.Fatalf("deferred snapshot changed: current = %v", cur)
+	}
+}
+
 // urlConditional answers conditional GETs from a fixed URL → body map
 // (200), and 404 for anything else.
 type urlConditional map[string][]byte
@@ -5728,7 +5757,7 @@ var errAnchorTooLarge = errors.New("anchor exceeds the audit read cap")
 
 // LegacyAuditResult summarises one RunLegacyTrustAudit call.
 type LegacyAuditResult struct {
-	Audited, Signed, Quarantined, AnchorMarkers int
+	Audited, Signed, Quarantined, Deferred, AnchorMarkers int
 }
 
 type legacyVerdict struct {
@@ -5842,7 +5871,15 @@ func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 	if err != nil {
 		return fmt.Errorf("legacy trust audit: %w", err)
 	}
-	if len(items) == 0 {
+	var anchors []string
+	for _, it := range items {
+		if it.Missing || it.Form != cache.FormInline || it.SingleAnchorHash == nil {
+			continue
+		}
+		anchors = append(anchors, c.BlobPath(*it.SingleAnchorHash))
+	}
+	if len(anchors) == 0 {
+		// Spec §6.1: detached-only queues read no pool files.
 		return nil
 	}
 	pool := filepath.Join(c.Dir(), "pool")
@@ -5855,16 +5892,13 @@ func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 	if rerr != nil && !errors.Is(rerr, io.EOF) {
 		return fmt.Errorf("legacy trust audit: pool %s is not readable: %w (fix it and restart; nothing was changed)", pool, rerr)
 	}
-	inline, missing := 0, 0
-	for _, it := range items {
-		if it.Missing || it.Form != cache.FormInline || it.SingleAnchorHash == nil {
-			continue
-		}
-		inline++
-		if _, err := os.Stat(c.BlobPath(*it.SingleAnchorHash)); errors.Is(err, fs.ErrNotExist) {
+	inline, missing := len(anchors), 0
+	for _, p := range anchors {
+		// AIDEV-NOTE: only "does not exist" counts as missing. Any other
+		// stat error is an I/O fault, not evidence of a lost pool: it never
+		// refuses the start here, and the audit defers that one snapshot.
+		if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
 			missing++
-		} else if err != nil {
-			return fmt.Errorf("legacy trust audit: anchor of snapshot %d: %w (nothing was changed)", it.SnapshotID, err)
 		}
 	}
 	if inline >= 2 && missing == inline {
@@ -6131,6 +6165,14 @@ func TestServeListeners_LegacyAuditRunsBeforeGCAndServing(t *testing.T) {
 	cfg := minimalCfg(cacheDir, nil)
 	cfg.Adoption.Enabled = false
 	cfg.GC.Enabled = true
+	// config.Defaults() leaves the [gc] tunables zero (Load() fills them),
+	// and gc.New rejects zero tunables when GC is enabled: mirror Load().
+	cfg.GC.Interval.Duration = 24 * time.Hour
+	cfg.GC.BatchSize = 100
+	cfg.GC.SnapshotBatchSize = 10
+	cfg.GC.MaxTickDuration.Duration = 5 * time.Minute
+	cfg.GC.BlobGrace.Duration = 5 * time.Minute
+	cfg.GC.PoolScanWorkers = 4
 	logs := &syncLogBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	cacheLn, err := net.Listen("tcp", "127.0.0.1:0")
@@ -6302,5 +6344,5 @@ Dispatch the max-effort review of `git diff main...HEAD` for phase A (correctnes
 - Simulation: `TestSimSmoke_30DaysPeriodicRefresh` (exactly 360 checks) and `TestSimClockSteps_KeepChecking` pass, each under 5 s under `-race`; `TestHandler_InMemoryFetcherInsideBubble` passes.
 - Fail-closed inline verification: `TestVerifyInline_FailsClosedWhateverRequireSignature` and `TestAdopter_MalformedEnvelopeCreatesNoSnapshot` fail on `main` and pass here; `TestVerifyInline_EmptyKeyringSaysSo` passes; the three renamed passthrough tests pin rejection.
 - Signed-seen: `TestSniffInRelease`, `TestSniffReleaseGPG`, `TestMarkerBase`, `TestMarkSignedSeenBatch_KeepsNewestStamp`, `TestCommitAdoption_SignedFormsRecordSignedSeen` pass.
-- Legacy trust audit: `TestClassifyLegacyInline` (incl. CRLF, whitespace-only lines, CRLF and armor-header injections), `TestAuditLegacySnapshot_Routes` (incl. detached and unsigned), `_UnreadableAnchorIsAnError`, `TestRunLegacyTrustAudit_PollutedCacheUpgrade`, `_ResumesAfterInterruption`, `_PreflightRefusesMissingOrEmptyPool`, `_UnreadableAnchorIsDeferred`, `_QuarantinedR1SuiteReadoptsOnFirstCheck`, `_MarksFromCachedSignedAnchors`, `TestApplyLegacyAuditDecisions_QuarantineCurrentReleasesPinsOnce`, `_QuarantineDisplacedKeepsRefcounts`, `_BatchIsAtomic`, `_KeepMarksWithAdoptionStamp`, `_KeepNeverMarksUnsigned`, `TestCommitAdoption_RefusesRetiredCandidate`, `TestListTrackedSuiteAnchors_OnlyTrackedSignedAnchorNames` and `TestServeListeners_LegacyAuditRunsBeforeGCAndServing` pass.
+- Legacy trust audit: `TestClassifyLegacyInline` (incl. CRLF, whitespace-only lines, CRLF and armor-header injections), `TestAuditLegacySnapshot_Routes` (incl. detached and unsigned), `_UnreadableAnchorIsAnError`, `TestRunLegacyTrustAudit_PollutedCacheUpgrade`, `_ResumesAfterInterruption`, `_PreflightRefusesMissingOrEmptyPool`, `_UnreadableAnchorIsDeferred`, `_UnstatableAnchorDoesNotRefuseStart`, `_QuarantinedR1SuiteReadoptsOnFirstCheck`, `_MarksFromCachedSignedAnchors`, `TestApplyLegacyAuditDecisions_QuarantineCurrentReleasesPinsOnce`, `_QuarantineDisplacedKeepsRefcounts`, `_BatchIsAtomic`, `_KeepMarksWithAdoptionStamp`, `_KeepNeverMarksUnsigned`, `TestCommitAdoption_RefusesRetiredCandidate`, `TestListTrackedSuiteAnchors_OnlyTrackedSignedAnchorNames` and `TestServeListeners_LegacyAuditRunsBeforeGCAndServing` pass.
 - `go test -race ./...`, `go vet ./...`, `golangci-lint run ./...` clean; no new `gofmt -l .` entries; docs updated; phase review findings resolved.
