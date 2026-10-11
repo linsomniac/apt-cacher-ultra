@@ -1,5 +1,7 @@
 package cache
 
+import "errors"
+
 // URLPath mirrors the url_path table (SPEC §4.3). Pointer fields hold
 // SQL NULLs; non-nullable columns are plain values.
 type URLPath struct {
@@ -41,6 +43,21 @@ type SuiteFreshness struct {
 	CurrentSnapshotID     *int64 // SPEC2 §4.3.1: NULL until first adoption
 }
 
+// AnchorForm is how a snapshot's Release metadata was anchored (spec C5).
+// It is stored in suite_snapshot.anchor_form and never empty.
+type AnchorForm string
+
+const (
+	FormInline   AnchorForm = "inline"   // InRelease, verified clearsigned
+	FormDetached AnchorForm = "detached" // Release + Release.gpg, verified
+	FormUnsigned AnchorForm = "unsigned" // Release only, unverified (phase E)
+)
+
+// ErrInvalidAnchorForm is returned by InsertCandidateSnapshot when a
+// candidate's Form does not match its hash shape (or cannot be derived
+// from it). It is raised before any SQL runs.
+var ErrInvalidAnchorForm = errors.New("cache: invalid anchor form for snapshot candidate")
+
 // SnapshotCandidate is the input to InsertCandidateSnapshot — a fresh
 // suite_snapshot row with adopted_at = NULL. Exactly one of (InReleaseHash)
 // or (ReleaseHash + ReleaseGPGHash) must be set; the schema CHECK enforces
@@ -60,6 +77,10 @@ type SnapshotCandidate struct {
 	ReleaseHash             *string // sha256 hex of detached Release bytes
 	ReleaseGPGHash          *string // sha256 hex of Release.gpg
 	PackageCoverageComplete bool
+	// Form of the candidate. Empty is accepted only for the unambiguous
+	// inline and detached hash shapes and is derived from them;
+	// FormUnsigned is never derived and must be set explicitly.
+	Form AnchorForm
 }
 
 // SnapshotMember mirrors the snapshot_member table — one (snapshot_id, path)

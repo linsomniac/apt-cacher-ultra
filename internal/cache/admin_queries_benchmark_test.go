@@ -33,8 +33,8 @@ func BenchmarkAdminCacheSummaries(b *testing.B) {
 		hash := fmt.Sprintf("%064x", snapshot)
 		exec(`INSERT INTO blob(hash, size, created_at) VALUES (?, 1000, 1)`, hash)
 		exec(`INSERT INTO suite_snapshot(snapshot_id, canonical_scheme, canonical_host,
-suite_path, inrelease_hash, created_at, adopted_at)
-VALUES (?, 'https', 'mirror.example', '/dists/stable', ?, 1, 1)`, snapshot, hash)
+suite_path, inrelease_hash, anchor_form, created_at, adopted_at)
+VALUES (?, 'https', 'mirror.example', '/dists/stable', ?, 'inline', 1, 1)`, snapshot, hash)
 		exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000)
 INSERT INTO package_hash(canonical_scheme, canonical_host, path, declared_sha256,
 snapshot_id, package_name, architecture, version)

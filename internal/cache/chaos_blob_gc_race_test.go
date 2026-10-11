@@ -405,8 +405,8 @@ func chaosSeedAdoptedSnapshot(t *testing.T, c *Cache, scheme, host, suite, inrel
 	res, err := c.db.Exec(`
 INSERT INTO suite_snapshot
   (canonical_scheme, canonical_host, suite_path,
-   inrelease_hash, created_at, adopted_at, package_coverage_complete, heartbeat_at)
-VALUES (?, ?, ?, ?, 1, 1, 1, 1)`, scheme, host, suite, inrelease)
+   inrelease_hash, anchor_form, created_at, adopted_at, package_coverage_complete, heartbeat_at)
+VALUES (?, ?, ?, ?, 'inline', 1, 1, 1, 1)`, scheme, host, suite, inrelease)
 	if err != nil {
 		t.Fatalf("seed adopted snapshot: %v", err)
 	}

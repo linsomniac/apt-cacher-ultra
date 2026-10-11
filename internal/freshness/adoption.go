@@ -965,7 +965,9 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// Step 4: insert the candidate suite_snapshot row. The schema
 	// CHECK constraint enforces XOR between inrelease_hash and
 	// (release_hash + release_gpg_hash); we set whichever pair this
-	// adoption form uses. The validators (etag/lastmod) are stored
+	// adoption form uses, and always name the form explicitly (it is
+	// stored in suite_snapshot.anchor_form; the cache never derives
+	// the unsigned form). The validators (etag/lastmod) are stored
 	// alongside whichever metadata file the freshness checker
 	// conditional-GETs next time, so the inrelease_etag /
 	// inrelease_lastmod columns end up holding Release's validators
@@ -978,9 +980,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	switch p.form {
 	case adoptionFormInline:
 		cand.InReleaseHash = &p.inlineHash
+		cand.Form = cache.FormInline
 	case adoptionFormDetached:
 		cand.ReleaseHash = &p.releaseHash
 		cand.ReleaseGPGHash = &p.releaseGPGHash
+		cand.Form = cache.FormDetached
 	}
 	if etag != "" {
 		v := etag

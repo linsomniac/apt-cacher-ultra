@@ -852,8 +852,8 @@ func adoptCandidate(t *testing.T, c *Cache, scheme, host, suite string, inrel st
 	res, err := c.db.Exec(`
 INSERT INTO suite_snapshot
   (canonical_scheme, canonical_host, suite_path,
-   inrelease_hash, created_at, adopted_at, package_coverage_complete, heartbeat_at)
-VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+   inrelease_hash, anchor_form, created_at, adopted_at, package_coverage_complete, heartbeat_at)
+VALUES (?, ?, ?, ?, 'inline', ?, ?, 0, ?)`,
 		scheme, host, suite, inrel, adoptedAt, adoptedAt, adoptedAt)
 	if err != nil {
 		t.Fatalf("adoptCandidate: %v", err)
@@ -869,8 +869,8 @@ func orphanCandidate(t *testing.T, c *Cache, scheme, host, suite string, inrel s
 	res, err := c.db.Exec(`
 INSERT INTO suite_snapshot
   (canonical_scheme, canonical_host, suite_path,
-   inrelease_hash, created_at, adopted_at, package_coverage_complete, heartbeat_at)
-VALUES (?, ?, ?, ?, ?, NULL, 0, ?)`,
+   inrelease_hash, anchor_form, created_at, adopted_at, package_coverage_complete, heartbeat_at)
+VALUES (?, ?, ?, ?, 'inline', ?, NULL, 0, ?)`,
 		scheme, host, suite, inrel, heartbeatAt, heartbeatAt)
 	if err != nil {
 		t.Fatalf("orphanCandidate: %v", err)

@@ -1017,23 +1017,30 @@ SELECT ss.snapshot_id, ss.package_coverage_complete
 
 // PutSuiteFreshness upserts the per-suite freshness state.
 func (c *Cache) PutSuiteFreshness(ctx context.Context, s SuiteFreshness) error {
+	// AIDEV-NOTE: last_requested_at (v7) is the suite's client-interest
+	// stamp. A new row starts "requested now"; this writer never updates
+	// it (phase D's TouchSuite owns updates), so a scheduler write cannot
+	// keep an idle suite alive.
 	const q = `
 INSERT INTO suite_freshness
   (canonical_scheme, canonical_host, suite_path,
    last_check_at, last_success_at,
-   inrelease_etag, inrelease_lastmod, inrelease_change_seen_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+   inrelease_etag, inrelease_lastmod, inrelease_change_seen_at,
+   last_requested_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
   last_check_at            = excluded.last_check_at,
   last_success_at          = excluded.last_success_at,
   inrelease_etag           = excluded.inrelease_etag,
   inrelease_lastmod        = excluded.inrelease_lastmod,
   inrelease_change_seen_at = excluded.inrelease_change_seen_at`
+	now := nowUnix()
 	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, q,
 			s.CanonicalScheme, s.CanonicalHost, s.SuitePath,
 			s.LastCheckAt, s.LastSuccessAt,
-			s.InReleaseETag, s.InReleaseLastMod, s.InReleaseChangeSeenAt)
+			s.InReleaseETag, s.InReleaseLastMod, s.InReleaseChangeSeenAt,
+			now)
 		if err != nil {
 			return fmt.Errorf("PutSuiteFreshness: %w", err)
 		}

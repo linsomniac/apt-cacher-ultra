@@ -179,8 +179,8 @@ SELECT printf('%064x', 100000+i), 1000+3*i, 1 FROM n`)
 			hash := fmt.Sprintf("%064x", snapshot)
 			exec(`INSERT INTO blob(hash, size, created_at) VALUES (?, 1000, 1)`, hash)
 			exec(`INSERT INTO suite_snapshot(snapshot_id, canonical_scheme, canonical_host,
-suite_path, inrelease_hash, created_at, adopted_at)
-VALUES (?, 'https', ?, ?, ?, 1, 1)`, snapshot, host, suite, hash)
+suite_path, inrelease_hash, anchor_form, created_at, adopted_at)
+VALUES (?, 'https', ?, ?, ?, 'inline', 1, 1)`, snapshot, host, suite, hash)
 			if groups == 1 {
 				exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000)
 INSERT INTO package_hash(canonical_scheme, canonical_host, path, declared_sha256,
@@ -224,8 +224,8 @@ VALUES (?, 'main/Packages.diff/Index', ?, ?)`, current, fmt.Sprintf("%064x", cur
 		// must not create an empty host bucket in cache_summary.
 		hash := fmt.Sprintf("%064x", 1)
 		exec(`INSERT INTO suite_snapshot(snapshot_id, canonical_scheme, canonical_host,
-suite_path, inrelease_hash, created_at, adopted_at)
-VALUES (1000, 'https', 'member-only.example', '/dists/stable', ?, 1, 1)`, hash)
+suite_path, inrelease_hash, anchor_form, created_at, adopted_at)
+VALUES (1000, 'https', 'member-only.example', '/dists/stable', ?, 'inline', 1, 1)`, hash)
 		exec(`INSERT INTO suite_freshness(canonical_scheme, canonical_host, suite_path,
 current_snapshot_id) VALUES ('https', 'member-only.example', '/dists/stable', 1000)`)
 		exec(`INSERT INTO snapshot_member(snapshot_id, path, blob_hash, declared_sha256)

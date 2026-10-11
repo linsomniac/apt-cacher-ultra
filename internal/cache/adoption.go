@@ -17,9 +17,9 @@ import (
 var ErrSnapshotAlreadyAdopted = errors.New("cache: snapshot already adopted")
 
 // ErrSnapshotNaturalKeyAdopted is returned by InsertCandidateSnapshot
-// when a row matching the natural key (scheme, host, suite_path,
-// COALESCE(inrelease_hash, release_hash)) already exists *and* is
-// already adopted (adopted_at IS NOT NULL). The adoption pipeline
+// when a non-retired row matching the natural key (scheme, host,
+// suite_path, COALESCE(inrelease_hash, release_hash), anchor_form)
+// already exists *and* is already adopted (adopted_at IS NOT NULL). The adoption pipeline
 // surfaces this as a distinct WARN; auto-reusing an adopted row is
 // out of scope (would bypass the lifecycle and refcount accounting
 // in CommitAdoption).
@@ -67,6 +67,39 @@ func (c *Cache) HeartbeatSnapshot(ctx context.Context, snapshotID int64) error {
 	})
 }
 
+// candidateForm derives (or validates) the anchor form of a candidate.
+// Inline and unsigned use the single-anchor slot (InReleaseHash);
+// detached uses Release + Release.gpg.
+//
+// AIDEV-NOTE: deriving an empty Form exists for the unambiguous shapes
+// only (test fixtures and legacy callers). FormUnsigned is NEVER derived:
+// an unsigned candidate that forgot its Form would be stored as inline
+// and vouch .debs. Production candidate construction (runShared) always
+// sets Form, and phase E's tests assert that an unsigned adoption stores
+// "unsigned".
+func candidateForm(sc SnapshotCandidate) (AnchorForm, error) {
+	single := sc.InReleaseHash != nil && sc.ReleaseHash == nil && sc.ReleaseGPGHash == nil
+	detached := sc.InReleaseHash == nil && sc.ReleaseHash != nil && sc.ReleaseGPGHash != nil
+	switch sc.Form {
+	case "":
+		if single {
+			return FormInline, nil
+		}
+		if detached {
+			return FormDetached, nil
+		}
+	case FormInline, FormUnsigned:
+		if single {
+			return sc.Form, nil
+		}
+	case FormDetached:
+		if detached {
+			return FormDetached, nil
+		}
+	}
+	return "", fmt.Errorf("%w: form=%q", ErrInvalidAnchorForm, sc.Form)
+}
+
 // InsertCandidateSnapshot inserts a fresh suite_snapshot row with
 // adopted_at = NULL and returns the auto-assigned snapshot_id. SPEC2
 // §7.5 step 4. Caller uses the returned id to key the snapshot_member
@@ -83,16 +116,25 @@ func (c *Cache) HeartbeatSnapshot(ctx context.Context, snapshotID int64) error {
 //
 // All non-nil *Hash fields must point at blob.hash values the caller
 // has already persisted via PutBlob; the FK constraints fail closed
-// otherwise. The schema CHECK on suite_snapshot enforces the
-// "exactly one of inline-or-detached" invariant; passing both modes
-// or all-NULL produces a constraint-violation error.
+// otherwise. candidateForm checks the hash shape against sc.Form before
+// any SQL runs: both modes, all-NULL, or a Form that does not fit the
+// hashes returns ErrInvalidAnchorForm. The schema CHECK on
+// suite_snapshot still enforces the "exactly one of single-anchor or
+// detached" invariant at the DB layer, and the v7 trigger rejects any
+// row without an anchor_form.
 //
 // AIDEV-NOTE: idempotent on natural-key collision — reuses an existing
 // unadopted candidate row so a Step-5/6/7/8 failure in runShared does
 // not poison subsequent adoption attempts. The natural key
-// (scheme, host, suite_path, COALESCE(inrelease_hash, release_hash))
-// already requires "one row per (suite, content)"; this method makes
-// the API surface that fact instead of choking with a UNIQUE error.
+// (scheme, host, suite_path, COALESCE(inrelease_hash, release_hash),
+// anchor_form) among non-retired rows (spec §6; the partial unique
+// index idx_suite_snapshot_natural_v7 ... WHERE retired_at IS NULL)
+// already requires "one live row per (suite, content, form)"; this
+// method makes the API surface that fact instead of choking with a
+// UNIQUE error. The collision lookup carries the same predicates as
+// the index: without anchor_form an unsigned candidate could reuse an
+// inline row with the same hash (and vouch .debs); without
+// retired_at IS NULL it could match a retired incarnation.
 // reused == true on the second-and-later attempts at the same content;
 // callers can log it once for diagnostics. CommitAdoption is its own
 // transaction guarded by adopted_at IS NULL, so retrying with a reused
@@ -102,17 +144,23 @@ func (c *Cache) HeartbeatSnapshot(ctx context.Context, snapshotID int64) error {
 // ErrSnapshotNaturalKeyAdopted instead — reusing an adopted row would
 // bypass the snapshot lifecycle and refcount bookkeeping.
 func (c *Cache) InsertCandidateSnapshot(ctx context.Context, sc SnapshotCandidate) (id int64, reused bool, err error) {
+	form, err := candidateForm(sc)
+	if err != nil {
+		return 0, false, err
+	}
 	const insertQ = `
 INSERT INTO suite_snapshot
   (canonical_scheme, canonical_host, suite_path,
    inrelease_hash, inrelease_etag, inrelease_lastmod,
-   release_hash, release_gpg_hash, created_at, adopted_at,
+   release_hash, release_gpg_hash, anchor_form, created_at, adopted_at,
    package_coverage_complete, heartbeat_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
 	const lookupQ = `
 SELECT snapshot_id, adopted_at FROM suite_snapshot
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?
-   AND COALESCE(inrelease_hash, release_hash) = ?`
+   AND COALESCE(inrelease_hash, release_hash) = ?
+   AND anchor_form = ?
+   AND retired_at IS NULL`
 	now := nowUnix()
 	coverage := int64(0)
 	if sc.PackageCoverageComplete {
@@ -122,7 +170,7 @@ SELECT snapshot_id, adopted_at FROM suite_snapshot
 		res, execErr := conn.ExecContext(ctx, insertQ,
 			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath,
 			sc.InReleaseHash, sc.InReleaseETag, sc.InReleaseLastMod,
-			sc.ReleaseHash, sc.ReleaseGPGHash, now, coverage, now)
+			sc.ReleaseHash, sc.ReleaseGPGHash, string(form), now, coverage, now)
 		if execErr == nil {
 			id, execErr = res.LastInsertId()
 			if execErr != nil {
@@ -153,7 +201,7 @@ SELECT snapshot_id, adopted_at FROM suite_snapshot
 			adoptedAt  sql.NullInt64
 		)
 		lookupErr := conn.QueryRowContext(ctx, lookupQ,
-			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath, coalesceHash).
+			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath, coalesceHash, string(form)).
 			Scan(&existingID, &adoptedAt)
 		if lookupErr != nil {
 			return fmt.Errorf("InsertCandidateSnapshot: lookup colliding row: %w (orig: %v)",
@@ -519,14 +567,16 @@ SELECT current_snapshot_id FROM suite_freshness
 
 		// Step 6: upsert the pointer. Other suite_freshness columns are
 		// preserved on conflict — adoption flips the snapshot pointer
-		// only, not the freshness state.
+		// only, not the freshness state. A suite row created here starts
+		// with its v7 client-interest stamp (last_requested_at = now, as
+		// in PutSuiteFreshness); an existing row keeps its stamp.
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO suite_freshness
-  (canonical_scheme, canonical_host, suite_path, current_snapshot_id)
-VALUES (?, ?, ?, ?)
+  (canonical_scheme, canonical_host, suite_path, current_snapshot_id, last_requested_at)
+VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
   current_snapshot_id = excluded.current_snapshot_id`,
-			scheme, host, suite, snapshotID); err != nil {
+			scheme, host, suite, snapshotID, now); err != nil {
 			return fmt.Errorf("CommitAdoption: flip pointer: %w", err)
 		}
 
