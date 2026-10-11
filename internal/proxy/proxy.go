@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 )
 
@@ -168,8 +169,19 @@ func (p *Parser) Parse(requestURI, hostHeader string) (*Request, error) {
 		return nil, fmt.Errorf("%w: %q", ErrInvalidPath, path)
 	}
 
+	// Spec C1: a decoded control byte is never a legitimate apt path
+	// (apt percent-encodes them) and must not reach the cache key.
+	for i := 0; i < len(path); i++ {
+		if path[i] < 0x20 || path[i] == 0x7f {
+			return nil, fmt.Errorf("%w: control byte in path", ErrInvalidPath)
+		}
+	}
+
 	canonHost, upstreamAuthority := p.canonicalize(host)
-	upstream := scheme + "://" + upstreamAuthority + path
+	// AIDEV-NOTE: never concatenate a decoded path into a URL string — a
+	// decoded '#', '?' or '%' would be re-parsed (S-3). BuildUpstreamURL
+	// re-encodes exactly as apt would.
+	upstream := aptpath.BuildUpstreamURL(scheme, upstreamAuthority, path)
 
 	return &Request{
 		Mode:            mode,

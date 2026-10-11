@@ -781,3 +781,76 @@ func TestCanonicalHosts_DuplicatesCollapsed(t *testing.T) {
 		t.Errorf("expected shared.example.com exactly once, got %d times in %v", count, hosts)
 	}
 }
+
+func TestParse_ControlBytesRejected(t *testing.T) {
+	p, err := New(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, uri := range []string{
+		"http://archive.ubuntu.com/ubuntu/dists/noble/In%00Release",
+		"http://archive.ubuntu.com/ubuntu/dists/noble/In%0aRelease",
+		"http://archive.ubuntu.com/ubuntu/dists/noble/In%7fRelease",
+	} {
+		if _, err := p.Parse(uri, ""); !errors.Is(err, ErrInvalidPath) {
+			t.Errorf("Parse(%q) err = %v, want ErrInvalidPath", uri, err)
+		}
+	}
+}
+
+// Spec C1 / S-3: a decoded '#' must not truncate the upstream URL nor
+// mint a suite.
+func TestParse_EncodedHashKeepsKeyAndURLInSync(t *testing.T) {
+	p, err := New(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := p.Parse("http://archive.ubuntu.com/ubuntu%23x/dists/noble/InRelease", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Path != "/ubuntu#x/dists/noble/InRelease" {
+		t.Fatalf("Path = %q", req.Path)
+	}
+	if req.SuitePath != "" {
+		t.Errorf("SuitePath = %q, want none", req.SuitePath)
+	}
+	if want := "http://archive.ubuntu.com/ubuntu%23x/dists/noble/InRelease"; req.UpstreamURL != want {
+		t.Errorf("UpstreamURL = %q, want %q", req.UpstreamURL, want)
+	}
+}
+
+func TestParse_UpstreamURLUsesAptEncoding(t *testing.T) {
+	p, err := New(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := p.Parse("http://archive.ubuntu.com/ubuntu/pool/main/g/gcc/libstdc%2b%2b6_14.2.0-4ubuntu2~24.04_amd64.deb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "http://archive.ubuntu.com/ubuntu/pool/main/g/gcc/libstdc%2b%2b6_14.2.0-4ubuntu2%7e24.04_amd64.deb"
+	if req.UpstreamURL != want {
+		t.Errorf("UpstreamURL = %q, want %q", req.UpstreamURL, want)
+	}
+}
+
+// Mirror mode (abs_path request line) goes through the same checks.
+func TestParse_MirrorModeControlBytesAndEncoding(t *testing.T) {
+	p, err := New(nil, []config.MirrorRule{
+		{Prefix: "/ubuntu", Upstream: "http://archive.ubuntu.com/ubuntu/"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Parse("/ubuntu/dists/noble/In%00Release", "cache.example.com:3142"); !errors.Is(err, ErrInvalidPath) {
+		t.Errorf("mirror control byte: err = %v, want ErrInvalidPath", err)
+	}
+	req, err := p.Parse("/ubuntu/pool/main/g/gcc/libstdc%2b%2b6_14.2.0-4ubuntu2~24.04_amd64.deb", "cache.example.com:3142")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "http://archive.ubuntu.com/ubuntu/pool/main/g/gcc/libstdc%2b%2b6_14.2.0-4ubuntu2%7e24.04_amd64.deb"; req.UpstreamURL != want {
+		t.Errorf("mirror UpstreamURL = %q, want %q", req.UpstreamURL, want)
+	}
+}
