@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 	_ "modernc.org/sqlite"
 )
 
@@ -225,5 +225,6 @@ func (c *Cache) drainWrites(err error) {
 	}
 }
 
-// nowUnix is the test seam for "what time is it"; default is time.Now.
-var nowUnix = func() int64 { return time.Now().Unix() }
+// nowUnix is the test seam for "what time is it". Production reads the
+// shared wall clock (internal/wallclock) so simulations can step it.
+var nowUnix = func() int64 { return wallclock.Unix() }

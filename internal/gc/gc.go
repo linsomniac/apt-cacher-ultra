@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // Config wires the gc package to its dependencies. All fields are
@@ -272,7 +273,7 @@ func (g *GC) StartupPass(ctx context.Context) error {
 	}
 
 	duration := time.Since(start)
-	endUnix := time.Now().Unix()
+	endUnix := wallclock.Unix()
 	g.cfg.Logger.Info("gc_run_complete",
 		"phase", "startup",
 		"blobs_reaped", tick.blobsReaped,
@@ -358,7 +359,7 @@ func (g *GC) Run(ctx context.Context) {
 				g.cfg.Logger.Warn("gc_tick_failed", "err", err)
 			}
 			duration := time.Since(start)
-			endUnix := time.Now().Unix()
+			endUnix := wallclock.Unix()
 			g.cfg.Logger.Info("gc_run_complete",
 				"phase", "periodic",
 				"blobs_reaped", tick.blobsReaped,

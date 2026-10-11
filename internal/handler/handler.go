@@ -25,6 +25,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // Compile-time assertion: *cache.BlobWriter satisfies fetch.FetchDst.
@@ -676,7 +677,7 @@ func (h *Handler) tryByHashContentAddressed(w http.ResponseWriter, r *http.Reque
 func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	now := time.Now().Unix()
+	now := wallclock.Unix()
 	row := cache.URLPath{
 		CanonicalScheme: req.CanonicalScheme,
 		CanonicalHost:   req.CanonicalHost,
@@ -864,7 +865,7 @@ func (h *Handler) serveBlobWithHeaders(w http.ResponseWriter, r *http.Request, r
 		w.Header().Set(hdrXCacheSnapshot, strconv.FormatInt(meta.snapshotID, 10))
 	}
 	if meta.lastFetchedAt != nil {
-		age := time.Now().Unix() - *meta.lastFetchedAt
+		age := wallclock.Unix() - *meta.lastFetchedAt
 		if age < 0 {
 			age = 0
 		}
@@ -1519,7 +1520,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 		return sfResult{err: fmt.Errorf("handler: put blob row: %w", err), status: fres.Status}
 	}
 
-	now := time.Now().Unix()
+	now := wallclock.Unix()
 	row := cache.URLPath{
 		CanonicalScheme: req.CanonicalScheme,
 		CanonicalHost:   req.CanonicalHost,
@@ -1789,7 +1790,7 @@ func (h *Handler) tryServeStale(w http.ResponseWriter, r *http.Request, req *pro
 
 	w.Header().Set(hdrXCache, cacheHitStale)
 	if row.LastFetchedAt != nil {
-		age := time.Now().Unix() - *row.LastFetchedAt
+		age := wallclock.Unix() - *row.LastFetchedAt
 		if age < 0 {
 			age = 0
 		}

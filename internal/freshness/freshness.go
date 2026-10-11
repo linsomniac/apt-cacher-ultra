@@ -30,6 +30,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // Suite-anchor filenames. Inline mode checks one file (InRelease,
@@ -135,7 +136,11 @@ type Config struct {
 	// verifier in the dependency graph.
 	GPGReasonClassifier func(error) string
 
-	// now is a test seam; production uses time.Now.
+	// now is a test seam; production uses wallclock.Now.
+	//
+	// AIDEV-NOTE: wall clock, for persisted stamps and comparisons with
+	// them only. Never measure a duration or a deadline with it (it has no
+	// monotonic reading and tests step it); use time.Now / time.Since.
 	now func() time.Time
 
 	// urlReconstruct rebuilds the upstream URL for a metadata anchor
@@ -218,7 +223,7 @@ func New(cfg Config) (*Checker, error) {
 	}
 	now := cfg.now
 	if now == nil {
-		now = time.Now
+		now = wallclock.Now
 	}
 	lifeCtx := cfg.LifetimeCtx
 	if lifeCtx == nil {
@@ -359,7 +364,11 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		// SPEC5 §10.4.3 / §9.7.7: time the adoption from goroutine
 		// entry, not from inside Run/RunDetached, so the duration
 		// reflects what the operator observes (queueing + run).
-		start := c.now()
+		// AIDEV-NOTE: duration uses monotonic time.Now/time.Since, not
+		// c.now() (wallclock.Now has no monotonic reading) — a wall-clock
+		// step mid-adoption would otherwise feed a negative duration into
+		// acu_adoption_duration_seconds.
+		start := time.Now()
 		var err error
 		switch req.form {
 		case adoptionFormInline:
@@ -367,7 +376,7 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		case adoptionFormDetached:
 			err = c.adopter.RunDetached(c.lifetimeCtx, req.suite, req.releaseBytes, req.sigBytes, req.etag, req.lastmod)
 		}
-		duration := c.now().Sub(start)
+		duration := time.Since(start)
 		outcome := classifyAdoptionOutcome(err)
 		reason := classifyAdoptionReason(err, outcome, c.gpgReasonClassifier)
 		adoptionTotal.Inc(outcome, req.suite.CanonicalHost)

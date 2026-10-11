@@ -23,6 +23,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // maxDecompressedPackagesBytes caps how much we'll inflate a single
@@ -460,7 +461,11 @@ type AdoptionConfig struct {
 
 	Logger *slog.Logger
 
-	// now is a test seam; production uses time.Now.
+	// now is a test seam; production uses wallclock.Now.
+	//
+	// AIDEV-NOTE: wall clock, for persisted stamps and comparisons with
+	// them only. Never measure a duration or a deadline with it (it has no
+	// monotonic reading and tests step it); use time.Now / time.Since.
 	now func() time.Time
 }
 
@@ -587,7 +592,7 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 	}
 	now := cfg.now
 	if now == nil {
-		now = time.Now
+		now = wallclock.Now
 	}
 	var sem chan struct{}
 	if cfg.MaxConcurrent > 0 {
