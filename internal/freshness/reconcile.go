@@ -1,12 +1,15 @@
 package freshness
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
+
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
@@ -124,8 +127,13 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 // (InRelease or Release) and parses it into the declared member set.
 //
 // AIDEV-NOTE: this is the trust anchor for ReconcileSnapshot. The blob it
-// reads was pinned at adoption time (refcounted via snapshot_member), so
-// os.ReadFile reads the exact bytes the original GPG signature covered.
+// reads was pinned at adoption time (refcounted via snapshot_member), and
+// the hash check below proves the stored envelope is intact at rest: the
+// exact bytes adoption verified. Intact is not the same as signed — an
+// InRelease envelope also carries unsigned regions (armor headers, lines
+// after the armor CRC), so for InRelease inReleasePlaintext limits the
+// parse to the signed region (R-1). A detached Release is covered whole by
+// its Release.gpg and is parsed as-is.
 // Callers MUST treat the returned []ReleaseMember as the authoritative
 // declared set — do not accept member declarations from any other source.
 func (a *Adopter) reparseSnapshotRelease(ctx context.Context, snapshotID int64) ([]ReleaseMember, error) {
@@ -153,9 +161,52 @@ func (a *Adopter) reparseSnapshotRelease(ctx context.Context, snapshotID int64) 
 			return nil, fmt.Errorf("reconcile: %s anchor blob hash mismatch (file=%s pinned=%s) — corrupt at rest",
 				name, got, mem.BlobHash)
 		}
+		if name == "InRelease" {
+			text, err := inReleasePlaintext(blob)
+			if err != nil {
+				return nil, err
+			}
+			return ParseRelease(text)
+		}
 		return ParseRelease(blob)
 	}
 	return nil, fmt.Errorf("reconcile: snapshot %d has no InRelease/Release member", snapshotID)
+}
+
+// inReleasePlaintext returns the signed plaintext of a stored InRelease
+// without re-verifying the signature (the bytes were verified at adoption
+// and are content-addressed; re-verification would also fail after a
+// legitimate keyring change).
+//
+// AIDEV-NOTE: R-1. Never ParseRelease the raw envelope: lines placed
+// after a forged "=CRC" line inside the signature armor are part of the
+// stored bytes but were never signed — whether placed after a forged
+// "=CRC" line or as colon-bearing armor headers (both verify with
+// go-crypto v1.4.1). A body with no clearsign marker is
+// returned as-is ONLY because test fixtures still adopt plain-text
+// InRelease bodies through a pass-through verifier; production cannot
+// reach it (VerifyInline rejects plain text in every mode, and the startup
+// audit quarantines legacy plain-text snapshots before any reconcile).
+// AIDEV-TODO(phase D): return an error for a marker-less body once
+// clearsignedFixture() replaces those fixtures. The marker test is bytes.Contains, never
+// HasPrefix (the verifier accepts leading whitespace), and a decode
+// failure is an error, never a raw parse. The decode runs under
+// recover(): a stored blob cannot trigger I-1, but reconcile must never
+// crash the daemon.
+func inReleasePlaintext(blob []byte) (text []byte, err error) {
+	if !bytes.Contains(blob, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
+		return blob, nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			text, err = nil, fmt.Errorf("reconcile: clearsign decode panicked: %v", r)
+		}
+	}()
+	block, _ := clearsign.Decode(blob)
+	if block == nil {
+		return nil, errors.New("reconcile: stored InRelease is not a valid clearsigned message")
+	}
+	return block.Plaintext, nil
 }
 
 // missingRequestableMembers returns the declared ReleaseMembers belonging
