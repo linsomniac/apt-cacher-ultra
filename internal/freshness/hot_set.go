@@ -4,14 +4,15 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
 // hotSetEntry is one (.deb path, declared_sha256, upstream_url) tuple
 // the SPEC3 §7.5 hot-prefetch loop will attempt to warm. The freshness
-// adopter constructs upstream_url textually from the suite's canonical
-// scheme/host plus the canonical path that cache.ComputeHotSet
-// returned.
+// adopter constructs upstream_url via aptpath.BuildUpstreamURL from the
+// suite's canonical scheme/host plus the canonical path that
+// cache.ComputeHotSet returned.
 type hotSetEntry struct {
 	path           string
 	declaredSHA256 string
@@ -59,7 +60,7 @@ func (a *Adopter) computeHotSet(ctx context.Context, suite SuiteRef,
 		out = append(out, hotSetEntry{
 			path:           r.Path,
 			declaredSHA256: r.DeclaredSHA256,
-			upstreamURL:    suite.CanonicalScheme + "://" + suite.CanonicalHost + r.Path,
+			upstreamURL:    aptpath.BuildUpstreamURL(suite.CanonicalScheme, suite.CanonicalHost, r.Path),
 		})
 	}
 	return out, nil

@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
@@ -147,7 +148,7 @@ type Config struct {
 	// (InRelease/Release/Release.gpg) when its url_path row has been
 	// reaped but the suite still has a current snapshot (SPEC2 §7.4
 	// freshness recovery). Test seam; production defaults to
-	// scheme://host + path. AIDEV-NOTE: canonical host is port-less
+	// aptpath.BuildUpstreamURL(scheme, host, path). AIDEV-NOTE: canonical host is port-less
 	// (SPEC §3.2), so reconstruction drops a non-default upstream port;
 	// the GC identity guard (SPEC4 §5 guard (d)) preserves the original
 	// row's port-correct upstream_url whenever it still exists, so
@@ -232,7 +233,7 @@ func New(cfg Config) (*Checker, error) {
 	reconstruct := cfg.urlReconstruct
 	if reconstruct == nil {
 		reconstruct = func(scheme, host, path string) string {
-			return scheme + "://" + host + path
+			return aptpath.BuildUpstreamURL(scheme, host, path)
 		}
 	}
 	return &Checker{
@@ -1042,7 +1043,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 // the hash-based guards (b)/(c) also match.
 //
 // AIDEV-TODO(port-correctness): upstream_url is reconstructed via the
-// (test-seam) policy scheme://host + path. Canonical host is port-less
+// (test-seam) policy aptpath.BuildUpstreamURL(scheme, host, path). Canonical host is port-less
 // (SPEC §3.2), so a non-default upstream port (e.g. http://host:8080/...)
 // is lost here. A reaped anchor on a non-default-port upstream therefore
 // recovers to the wrong authority — the conditional GET fails (logged,

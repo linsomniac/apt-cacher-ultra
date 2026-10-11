@@ -108,3 +108,33 @@ func TestCommitAdoption_CreatesInReleaseAnchorWhenMissing(t *testing.T) {
 		t.Error("created anchor is_metadata must be 1")
 	}
 }
+
+// Spec C1.3: a reconstructed anchor URL uses apt's path encoding.
+func TestCommitAdoption_CreatesAnchorWithAptEncodedURL(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, 1_700_000_000)()
+
+	adopted := seedBlob(t, c, "adopted inrelease bytes (encoded path)")
+	const host = "archive.test"
+	const suite = "/a+b/dists/x"
+
+	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite, InReleaseHash: &adopted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id, []SnapshotMember{
+		{SnapshotID: id, Path: "InRelease", BlobHash: adopted, DeclaredSHA256: adopted},
+	}, nil, nil, nil, false); err != nil {
+		t.Fatalf("CommitAdoption: %v", err)
+	}
+	u, err := c.LookupURL(ctx, "http", host, suite+"/InRelease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "http://archive.test/a%2bb/dists/x/InRelease"; u.UpstreamURL != want {
+		t.Errorf("anchor upstream_url = %q, want %q", u.UpstreamURL, want)
+	}
+}

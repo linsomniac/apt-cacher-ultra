@@ -19,6 +19,7 @@ import (
 
 	"github.com/ulikunitz/xz"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
@@ -2615,16 +2616,13 @@ func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) 
 // "<scheme>://<host><suite_path>/InRelease"; member URLs follow the
 // same pattern with the relative path appended.
 //
-// AIDEV-NOTE: this composes URL strings textually rather than going
-// through net/url, because the inputs are already canonicalized: the
-// suite_path is opaque from canonicalization, and the relative
+// AIDEV-NOTE: the URL is built by aptpath.BuildUpstreamURL so the
+// member path is encoded exactly as apt would send it (spec C1.3).
+// The suite_path is opaque from canonicalization, and the relative
 // member path was validated by ParseRelease (no NUL, no absolute
-// prefix, no dotdot). A conservative approach is to ensure exactly
-// one "/" between suite and member.
+// prefix, no dotdot); this still ensures exactly one "/" between
+// suite and member. Canonical host is port-less (SPEC §3.2).
 func buildMemberURL(suite SuiteRef, relPath string) string {
-	base := suite.CanonicalScheme + "://" + suite.CanonicalHost + suite.SuitePath
-	if !strings.HasSuffix(base, "/") {
-		base += "/"
-	}
-	return base + relPath
+	p := strings.TrimSuffix(suite.SuitePath, "/") + "/" + relPath
+	return aptpath.BuildUpstreamURL(suite.CanonicalScheme, suite.CanonicalHost, p)
 }

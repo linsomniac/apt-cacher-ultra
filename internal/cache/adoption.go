@@ -7,6 +7,8 @@ import (
 	"fmt"
 
 	sqlite "modernc.org/sqlite"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 )
 
 // ErrSnapshotAlreadyAdopted is returned by CommitAdoption when invoked
@@ -435,9 +437,10 @@ UPDATE suite_snapshot SET package_coverage_complete = ?
 		// blob_hash / is_metadata / last_fetched_at are (re)written, plus
 		// dropped_at cleared to NULL (re-establish-clears-hold invariant).
 		// Mirrors Step 3a's hotness-preservation rationale. The INSERT
-		// branch (anchor was already reaped) reconstructs upstream_url as
-		// scheme://host+path, which is port-less (SPEC §3.2) — acceptable
-		// because it only fires when the original row is already gone.
+		// branch (anchor was already reaped) reconstructs upstream_url
+		// with aptpath.BuildUpstreamURL(scheme, host, path), which is
+		// port-less (SPEC §3.2) — acceptable because it only fires when
+		// the original row is already gone.
 		var anchorInRel, anchorRel, anchorRelGPG sql.NullString
 		if err := tx.QueryRowContext(ctx, `
 SELECT inrelease_hash, release_hash, release_gpg_hash
@@ -466,7 +469,7 @@ ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
   -- so this is defense-in-depth, not the primary keep).
   dropped_at      = NULL`,
 				scheme, host, anchorPath, h.String,
-				scheme+"://"+host+anchorPath, now)
+				aptpath.BuildUpstreamURL(scheme, host, anchorPath), now)
 			return err
 		}
 		if err := seedAnchor("/InRelease", anchorInRel); err != nil {
