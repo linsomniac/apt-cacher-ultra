@@ -462,10 +462,10 @@ func TestSuitePath(t *testing.T) {
 		want string
 	}{
 		{"/ubuntu/dists/noble/InRelease", "/ubuntu/dists/noble"},
-		{"/ubuntu/dists/noble", "/ubuntu/dists/noble"},
+		{"/ubuntu/dists/noble", ""}, // spec C2: a suite needs a member
 		{"/ubuntu/dists/noble/main/binary-amd64/Packages.gz", "/ubuntu/dists/noble"},
 		{"/dists/stable/Release", "/dists/stable"},  // no repo prefix
-		{"/dists/stable", "/dists/stable"},          // bare suite path
+		{"/dists/stable", ""},                       // spec C2: a suite needs a member
 		{"/ubuntu/pool/main/h/hello/hello.deb", ""}, // not under /dists/
 		{"/", ""}, // root
 		{"", ""},  // empty

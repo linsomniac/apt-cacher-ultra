@@ -2,8 +2,9 @@ package proxy
 
 import (
 	"path"
-	"regexp"
 	"strings"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 )
 
 // metadataPrefixes lists filename prefixes that classify a path as
@@ -63,33 +64,7 @@ func IsMetadata(p string) bool {
 	return false
 }
 
-// suiteRegex matches the SPEC §4.4 suite identification pattern:
-//
-//	^/(?:(.+)/)?dists/([^/]+)(?:/.*)?$
-//
-// Captures the optional repo path before "dists/" and the suite codename
-// after. repo_path may be empty for upstreams that serve /dists/ off the
-// host root (apt.corretto.aws, repo.charm.sh).
-var suiteRegex = regexp.MustCompile(`^/(?:(.+)/)?dists/([^/]+)(?:/.*)?$`)
-
-// SuitePath returns the canonical suite path for p (the longest prefix
-// that identifies a single suite for freshness purposes), or "" when p
-// is not under any /dists/<suite> hierarchy.
-//
-// Examples:
-//
-//	/ubuntu/dists/noble/InRelease       -> /ubuntu/dists/noble
-//	/dists/stable/InRelease             -> /dists/stable
-//	/ubuntu/pool/main/h/hello/...       -> "" (a blob, not under a suite)
-func SuitePath(p string) string {
-	m := suiteRegex.FindStringSubmatch(p)
-	if m == nil {
-		return ""
-	}
-	repo := m[1]
-	suite := m[2]
-	if repo == "" {
-		return "/dists/" + suite
-	}
-	return "/" + repo + "/dists/" + suite
-}
+// SuitePath returns the canonical suite path for p (see
+// aptpath.SuitePath, which owns the grammar). Kept as a proxy-level name
+// because callers throughout the package use it.
+func SuitePath(p string) string { return aptpath.SuitePath(p) }
