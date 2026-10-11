@@ -1066,6 +1066,19 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		tickerWG.Add(1)
 		go func() {
 			defer tickerWG.Done()
+			// AIDEV-NOTE: I-1. A panic in this goroutine is invisible to
+			// the adoption goroutine's recover. Recover here, log, and stop
+			// heartbeating; a candidate whose heartbeat lapses is reaped by
+			// snapshot GC and the adoption fails at commit, which is safe.
+			defer func() {
+				if r := recover(); r != nil {
+					a.logger.Error("adoption_panicked",
+						"where", "heartbeat",
+						"canonical_host", suite.CanonicalHost,
+						"suite_path", suite.SuitePath,
+						"panic", fmt.Sprint(r))
+				}
+			}()
 			a.runHeartbeatTicker(tickerCtx, suite.CanonicalHost, snapshotID, tracker)
 		}()
 	}

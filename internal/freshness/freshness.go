@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -312,7 +313,11 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		return
 	}
 
-	req, repair := c.checkLocked(ctx, scheme, host, suitePath)
+	req, repair, ok := c.checkLockedSafe(ctx, scheme, host, suitePath)
+	if !ok {
+		mu.Unlock()
+		return
+	}
 	if req == nil || c.adopter == nil {
 		// SPEC6_7 §3 + SPEC6_8 §6: an unchanged suite with a current
 		// snapshot gets a repair pass (integrity-skip heal) AND a
@@ -338,13 +343,17 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		// re-parse + re-fetch on every client metadata request. repair's
 		// suite/snapshotID ARE the current snapshot (repairIfUnchanged
 		// requires CurrentSnapshotID != nil). Mutex handoff (mu.Unlock via
-		// defer) and adoptionWg mirror the adoption goroutine above;
+		// defer) and adoptionWg mirror the adoption goroutine below;
 		// WaitForAdoptions drains both.
+		//
+		// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock,
+		// recover (first). See recoverGoroutine.
 		if repair != nil && c.adopter != nil && c.adopter.repairSkippedMembers {
 			c.adoptionWg.Add(1)
 			go func() {
-				defer mu.Unlock()
 				defer c.adoptionWg.Done()
+				defer mu.Unlock()
+				defer c.recoverGoroutine("repair", repair.suite)
 				c.adopter.RepairSkippedMembers(c.lifetimeCtx, repair.suite, repair.snapshotID)
 				// ReconcileSnapshot leaves logging to its caller; log like
 				// the on-demand path (Reconcile) so a fail-closed anchor
@@ -365,10 +374,13 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 	// against c.lifetimeCtx (the lifecycle ctx — possibly different
 	// from the request ctx that triggered T1) so a request closing
 	// before adoption finishes does not abort the adoption.
+	//
+	// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, recover (first). See recoverGoroutine.
 	c.adoptionWg.Add(1)
 	go func() {
-		defer mu.Unlock()
 		defer c.adoptionWg.Done()
+		defer mu.Unlock()
+		defer c.recoverGoroutine("adoption", req.suite)
 		// SPEC5 §10.4.3 / §9.7.7: time the adoption from goroutine
 		// entry, not from inside Run/RunDetached, so the duration
 		// reflects what the operator observes (queueing + run).
@@ -430,6 +442,91 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 // assertions and by graceful shutdown to drain SPEC2 §9.5 step 5
 // after cancelling the lifecycle ctx.
 func (c *Checker) WaitForAdoptions() { c.adoptionWg.Wait() }
+
+// ErrAdoptionPanicked is recorded (phase B) when an adoption, repair or
+// reconcile goroutine panics (security finding I-1).
+var ErrAdoptionPanicked = errors.New("adoption_panicked")
+
+// panicStackLogged holds the goroutine kinds ("adoption", "repair",
+// "reconcile", "check", "scheduler") whose stack was already logged.
+var panicStackLogged sync.Map
+
+// reportPanic logs a recovered panic. The stack is attached to the first
+// occurrence per goroutine kind per process only (spec C5 "log the stack
+// once"): a deterministic panic on every attempt must not flood the log.
+func (c *Checker) reportPanic(event, where string, suite SuiteRef, r any) {
+	attrs := []any{
+		"where", where,
+		"canonical_host", suite.CanonicalHost,
+		"suite_path", suite.SuitePath,
+		"panic", fmt.Sprint(r),
+	}
+	if _, seen := panicStackLogged.LoadOrStore(where, struct{}{}); !seen {
+		attrs = append(attrs, "stack", string(debug.Stack()))
+	}
+	c.logger.Error(event, attrs...)
+}
+
+// recoverGoroutine is deferred by the adoption, repair and on-demand
+// reconcile goroutines as their LAST defer, so it runs first: the panic
+// is logged while the suite mutex is still held, then the goroutine's
+// other defers release the mutex and the WaitGroup.
+//
+// AIDEV-NOTE: recover() works only because this method IS the deferred
+// function (`defer c.recoverGoroutine(...)`). Wrapping it in a closure
+// (`defer func() { c.recoverGoroutine(...) }()`) makes recover() return
+// nil and the panic kills the daemon. Phase B records ErrAdoptionPanicked
+// as an adoption failure here, before the mutex is released (spec C5).
+func (c *Checker) recoverGoroutine(where string, suite SuiteRef) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	c.reportPanic("adoption_panicked", where, suite, r)
+	if where == "adoption" {
+		adoptionTotal.Inc("panicked", suite.CanonicalHost)
+	}
+}
+
+// checkLockedSafe runs checkLocked and converts a panic into a FAILED
+// check (spec C4): logged, and last_check_at bumped like any failed check
+// so the cooldown gates the next T1/T2 trigger. The caller releases the
+// suite mutex.
+//
+// AIDEV-NOTE: nothing in Check between TryLock and this call, or between
+// it and the goroutine hand-off, may panic: checkRecovered (scheduler)
+// and the T1 recover cannot release a mutex they do not know about.
+func (c *Checker) checkLockedSafe(ctx context.Context, scheme, host, suitePath string) (req *adoptionRequest, repair *repairRequest, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.reportPanic("freshness_check_panicked", "check",
+				SuiteRef{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}, r)
+			c.bumpFailedCheck(ctx, scheme, host, suitePath)
+			freshnessCheckTotal.Inc("failed", host)
+			req, repair, ok = nil, nil, false
+		}
+	}()
+	req, repair = c.checkLocked(ctx, scheme, host, suitePath)
+	return req, repair, true
+}
+
+// bumpFailedCheck mirrors checkLocked's failure bookkeeping
+// (last_check_at = now, last_success_at untouched). Best effort; it
+// never panics its caller.
+// AIDEV-NOTE: phase D turns the Put into the UPDATE-only writer.
+func (c *Checker) bumpFailedCheck(ctx context.Context, scheme, host, suitePath string) {
+	defer func() { _ = recover() }()
+	cur, err := c.cache.GetSuiteFreshness(ctx, scheme, host, suitePath)
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		cur = &cache.SuiteFreshness{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}
+	case err != nil:
+		return
+	}
+	now := c.now().Unix()
+	cur.LastCheckAt = &now
+	_ = c.cache.PutSuiteFreshness(ctx, *cur)
+}
 
 // checkLocked is the body of Check, run with the per-suite mutex held.
 // Returns a non-nil *adoptionRequest iff the observed result is "changed"
@@ -1210,10 +1307,13 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 	if !mu.TryLock() {
 		return false
 	}
+	// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock,
+	// recover (first). See recoverGoroutine.
 	c.adoptionWg.Add(1)
 	go func() {
-		defer mu.Unlock()
 		defer c.adoptionWg.Done()
+		defer mu.Unlock()
+		defer c.recoverGoroutine("reconcile", suite)
 		if _, err := c.adopter.ReconcileSnapshot(c.lifetimeCtx, suite, snapID, true); err != nil {
 			c.logger.Warn("adoption_reconcile_failed",
 				"canonical_host", host, "suite_path", suitePath,

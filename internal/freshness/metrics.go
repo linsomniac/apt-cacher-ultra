@@ -18,6 +18,11 @@ import (
 // adoption attempts, so a missing classification would silently
 // under-count a category. Adding a new ErrAdoption* sentinel means
 // classifying it AND extending the SPEC5 §10.4.3 outcome enum.
+// Outcome inventory: success, unpinned_suite, gpg_failed, parse_failed,
+// member_mismatch, member_fetch_failed, db_failed, run_failed (all from
+// classifyAdoptionOutcome) and panicked (I-1: counted by
+// Checker.recoverGoroutine when the adoption goroutine panics, which in
+// practice means inside Run/RunDetached, before classification).
 var (
 	freshnessCheckTotal = metrics.NewCounterWithCap(
 		"acu_freshness_check_total",

@@ -14,9 +14,11 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -950,9 +952,28 @@ func (h *Handler) maybeFireFreshness(req *proxy.Request) {
 	h.activeWG.Add(1)
 	go func() {
 		defer h.activeWG.Done()
+		// AIDEV-NOTE: I-1. A panic in the T1 check must not kill the
+		// daemon. This recover runs before Done, so Close still drains.
+		defer func() {
+			if r := recover(); r != nil {
+				attrs := []any{
+					"where", "t1",
+					"canonical_host", req.CanonicalHost,
+					"suite_path", req.SuitePath,
+					"panic", fmt.Sprint(r),
+				}
+				if t1PanicStackLogged.CompareAndSwap(false, true) {
+					attrs = append(attrs, "stack", string(debug.Stack()))
+				}
+				h.logger.Error("freshness_check_panicked", attrs...)
+			}
+		}()
 		h.freshness.Check(h.lifecycleCtx, req.CanonicalScheme, req.CanonicalHost, req.SuitePath)
 	}()
 }
+
+// t1PanicStackLogged limits the T1 panic stack to one per process (spec C5).
+var t1PanicStackLogged atomic.Bool
 
 // touchAsync updates last_requested_at + request_count without blocking
 // the response. Uses a fresh ctx so an already-disconnected client does

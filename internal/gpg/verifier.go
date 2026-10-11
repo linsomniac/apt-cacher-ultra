@@ -196,6 +196,28 @@ var (
 	ErrAmbiguousKeyID = errors.New("ambiguous short issuer keyid in trust set")
 )
 
+// errClearsignPanicked reports a clearsigned body that made the go-crypto
+// decoder panic. It is always an error, whatever require_signature says:
+// the body claims to be clearsigned and is not a valid clearsigned message.
+var errClearsignPanicked = errors.New("clearsigned message is malformed (decoder panicked)")
+
+// decodeClearsigned is clearsign.Decode with a panic turned into
+// errClearsignPanicked.
+//
+// AIDEV-NOTE: I-1. go-crypto v1.4.1 panics (slice bounds [:-1]) when the
+// signed text has no lines. Every clearsign.Decode call on untrusted bytes
+// in this package goes through this wrapper; the freshness goroutines
+// also recover, as defence in depth.
+func decodeClearsigned(b []byte) (block *clearsign.Block, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			block, err = nil, fmt.Errorf("%w: %v", errClearsignPanicked, r)
+		}
+	}()
+	block, _ = clearsign.Decode(b)
+	return block, nil
+}
+
 // VerifyInline implements freshness.Verifier. Returns the verified
 // Release-equivalent plaintext (the cleartext between BEGIN/END
 // markers) on success.
@@ -241,7 +263,10 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 	}
 
 	// Step 3: clearsign decode.
-	block, _ := clearsign.Decode(inRelease)
+	block, err := decodeClearsigned(inRelease)
+	if err != nil {
+		return nil, err
+	}
 	if block == nil {
 		if v.requireSignature {
 			return nil, ErrMissingSignature

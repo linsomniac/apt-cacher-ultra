@@ -109,6 +109,19 @@ func (c *Checker) tick(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		c.Check(ctx, s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
+		c.checkRecovered(ctx, s)
 	}
+}
+
+// checkRecovered keeps one suite's panic from ending the scheduler loop.
+// Check already converts a checkLocked panic into a failed check; this
+// catches anything outside it.
+func (c *Checker) checkRecovered(ctx context.Context, s cache.SuiteFreshness) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.reportPanic("freshness_check_panicked", "scheduler",
+				SuiteRef{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath}, r)
+		}
+	}()
+	c.Check(ctx, s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
 }
