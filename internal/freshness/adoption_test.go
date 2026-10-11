@@ -399,8 +399,8 @@ func TestAdopter_DetachedHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSuiteSnapshot: %v", err)
 	}
-	if snap.InReleaseHash != nil {
-		t.Errorf("detached snapshot has unexpected inrelease_hash=%s", *snap.InReleaseHash)
+	if snap.SingleAnchorHash != nil {
+		t.Errorf("detached snapshot has unexpected inrelease_hash=%s", *snap.SingleAnchorHash)
 	}
 	if snap.ReleaseHash == nil || *snap.ReleaseHash != shaOf(releaseText) {
 		t.Errorf("release_hash = %v, want %s", snap.ReleaseHash, shaOf(releaseText))

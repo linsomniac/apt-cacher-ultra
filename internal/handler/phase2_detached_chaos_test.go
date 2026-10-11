@@ -122,8 +122,8 @@ func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSuiteSnapshot(A): %v", err)
 	}
-	if snapASnap.InReleaseHash != nil {
-		t.Errorf("post-A detached adoption: snapshot has unexpected inrelease_hash=%s", *snapASnap.InReleaseHash)
+	if snapASnap.SingleAnchorHash != nil {
+		t.Errorf("post-A detached adoption: snapshot has unexpected inrelease_hash=%s", *snapASnap.SingleAnchorHash)
 	}
 	if snapASnap.ReleaseHash == nil {
 		t.Error("post-A detached adoption: snapshot missing release_hash")
@@ -200,7 +200,7 @@ func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 		preStraddles, postStraddles)
 
 	// Final state: current_snapshot_id points at a detached snapshot
-	// with B's release_hash + release_gpg_hash, and InReleaseHash is
+	// with B's release_hash + release_gpg_hash, and SingleAnchorHash is
 	// still nil (a confused inline adoption against detached fixtures
 	// would set inrelease_hash).
 	suite, err = stack.handler.cache.GetSuiteFreshness(context.Background(),
@@ -215,8 +215,8 @@ func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-chaos: GetSuiteSnapshot(%d): %v", *suite.CurrentSnapshotID, err)
 	}
-	if finalSnap.InReleaseHash != nil {
-		t.Errorf("post-chaos: unexpected inrelease_hash=%s — flip went to inline form?", *finalSnap.InReleaseHash)
+	if finalSnap.SingleAnchorHash != nil {
+		t.Errorf("post-chaos: unexpected inrelease_hash=%s — flip went to inline form?", *finalSnap.SingleAnchorHash)
 	}
 	wantRH := chaos2Sha256Hex(snapB.release)
 	if finalSnap.ReleaseHash == nil || *finalSnap.ReleaseHash != wantRH {

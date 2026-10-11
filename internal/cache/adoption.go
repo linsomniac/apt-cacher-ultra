@@ -489,6 +489,9 @@ UPDATE suite_snapshot SET package_coverage_complete = ?
 		// with aptpath.BuildUpstreamURL(scheme, host, path), which is
 		// port-less (SPEC §3.2) — acceptable because it only fires when
 		// the original row is already gone.
+		//
+		// AIDEV-TODO(phase E): an unsigned snapshot stores its Release
+		// hash in inrelease_hash; guard by anchor_form.
 		var anchorInRel, anchorRel, anchorRelGPG sql.NullString
 		if err := tx.QueryRowContext(ctx, `
 SELECT inrelease_hash, release_hash, release_gpg_hash
@@ -629,18 +632,19 @@ func (c *Cache) GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*SuiteS
 SELECT snapshot_id, canonical_scheme, canonical_host, suite_path,
        inrelease_hash, inrelease_etag, inrelease_lastmod,
        release_hash, release_gpg_hash, created_at, adopted_at,
-       package_coverage_complete
+       package_coverage_complete, anchor_form, release_date, retired_at
 FROM suite_snapshot
 WHERE snapshot_id = ?`
 	var (
 		s        SuiteSnapshot
 		coverage int64
+		form     string
 	)
 	err := c.db.QueryRowContext(ctx, q, snapshotID).Scan(
 		&s.SnapshotID, &s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
-		&s.InReleaseHash, &s.InReleaseETag, &s.InReleaseLastMod,
+		&s.SingleAnchorHash, &s.InReleaseETag, &s.InReleaseLastMod,
 		&s.ReleaseHash, &s.ReleaseGPGHash, &s.CreatedAt, &s.AdoptedAt,
-		&coverage,
+		&coverage, &form, &s.ReleaseDate, &s.RetiredAt,
 	)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -649,6 +653,7 @@ WHERE snapshot_id = ?`
 		return nil, fmt.Errorf("GetSuiteSnapshot: %w", err)
 	}
 	s.PackageCoverageComplete = coverage != 0
+	s.Form = AnchorForm(form)
 	return &s, nil
 }
 

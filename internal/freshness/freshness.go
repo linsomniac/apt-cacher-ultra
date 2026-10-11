@@ -517,6 +517,8 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 // (cur.CurrentSnapshotID == nil) and snapshots that fail to load
 // default to inline; the inline-path fallback handles the boot-strap
 // case for detached-only upstreams.
+//
+// AIDEV-TODO(phase E): unsigned form dispatch.
 func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) adoptionForm {
 	if cur.CurrentSnapshotID == nil {
 		return adoptionFormInline
@@ -525,7 +527,7 @@ func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) ado
 	if err != nil || snap == nil {
 		return adoptionFormInline
 	}
-	if snap.ReleaseHash != nil {
+	if snap.Form == cache.FormDetached {
 		return adoptionFormDetached
 	}
 	return adoptionFormInline
@@ -599,8 +601,8 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 	if cur.CurrentSnapshotID != nil {
 		snap, serr := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
 		switch {
-		case serr == nil && snap.InReleaseHash != nil:
-			cachedHash = *snap.InReleaseHash
+		case serr == nil && snap.Form == cache.FormInline && snap.SingleAnchorHash != nil:
+			cachedHash = *snap.SingleAnchorHash
 		case serr != nil:
 			c.logger.Warn("freshness: snapshot lookup failed; falling back to url_path",
 				"err", serr,
@@ -1110,7 +1112,9 @@ func (c *Checker) snapshotAnchorHash(ctx context.Context, snapshotID int64, file
 	var h *string
 	switch filename {
 	case inReleaseFilename:
-		h = snap.InReleaseHash
+		if snap.Form == cache.FormInline {
+			h = snap.SingleAnchorHash
+		}
 	case releaseFilename:
 		h = snap.ReleaseHash
 	case releaseGPGFilename:

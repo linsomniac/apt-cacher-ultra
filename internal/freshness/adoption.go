@@ -1513,10 +1513,10 @@ func (a *Adopter) priorAdoptionForm(ctx context.Context, suite SuiteRef) (adopti
 	if err != nil || snap == nil {
 		return 0, false
 	}
-	switch {
-	case snap.InReleaseHash != nil:
+	switch snap.Form {
+	case cache.FormInline:
 		return adoptionFormInline, true
-	case snap.ReleaseHash != nil:
+	case cache.FormDetached:
 		return adoptionFormDetached, true
 	}
 	return 0, false

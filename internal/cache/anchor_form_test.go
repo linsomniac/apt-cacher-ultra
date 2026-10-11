@@ -130,3 +130,42 @@ func TestInsertCandidateSnapshot_LookupSkipsRetiredIncarnation(t *testing.T) {
 		t.Fatalf("id3=%d reused=%v err=%v; want reuse of live candidate %d", id3, reused, err, id2)
 	}
 }
+
+func TestGetSuiteSnapshot_ReturnsFormAndLifecycleFields(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	putBlobs(t, c, hA, hB, hC)
+	h := hA
+	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x", InReleaseHash: &h, Form: FormUnsigned})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.Exec(`UPDATE suite_snapshot SET release_date = 1700000000, retired_at = 1700000500 WHERE snapshot_id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	s, err := c.GetSuiteSnapshot(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Form != FormUnsigned || s.SingleAnchorHash == nil || *s.SingleAnchorHash != hA {
+		t.Fatalf("unsigned snapshot = %+v", s)
+	}
+	if s.ReleaseDate == nil || *s.ReleaseDate != 1700000000 || s.RetiredAt == nil || *s.RetiredAt != 1700000500 {
+		t.Fatalf("release_date/retired_at not scanned: %+v", s)
+	}
+
+	rel, sig := hB, hC
+	id2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/y", ReleaseHash: &rel, ReleaseGPGHash: &sig})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := c.GetSuiteSnapshot(ctx, id2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2.Form != FormDetached || s2.SingleAnchorHash != nil || s2.ReleaseDate != nil || s2.RetiredAt != nil {
+		t.Fatalf("detached snapshot = %+v", s2)
+	}
+}

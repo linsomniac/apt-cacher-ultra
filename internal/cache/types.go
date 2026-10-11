@@ -142,17 +142,26 @@ type PackageHash struct {
 // by request-path lookups and adoption diagnostics. SPEC2 §4.3.1,
 // SPEC3 §4.3.1 (PackageCoverageComplete).
 type SuiteSnapshot struct {
-	SnapshotID       int64
-	CanonicalScheme  string
-	CanonicalHost    string
-	SuitePath        string
-	InReleaseHash    *string
+	SnapshotID      int64
+	CanonicalScheme string
+	CanonicalHost   string
+	SuitePath       string
+	// SingleAnchorHash is the suite_snapshot.inrelease_hash column: the
+	// single anchor blob for the inline form (InRelease) AND the unsigned
+	// form (Release). Read Form to know which file it is.
+	//
+	// AIDEV-NOTE: renamed from InReleaseHash so the compiler lists every
+	// reader when forms change (spec C5). Never assume "set ⇒ inline".
+	SingleAnchorHash *string
 	InReleaseETag    *string
 	InReleaseLastMod *string
 	ReleaseHash      *string
 	ReleaseGPGHash   *string
 	CreatedAt        int64
 	AdoptedAt        *int64 // NULL while candidate; set on flip
+	Form             AnchorForm
+	ReleaseDate      *int64 // parsed Release Date (phase B); NULL until then
+	RetiredAt        *int64 // set when the suite incarnation is reaped/forgotten (phase F)
 
 	// PackageCoverageComplete is the SPEC3 §7.5.4 per-snapshot proof
 	// that strict mode (§6.1) keys on. True iff every Release-listed

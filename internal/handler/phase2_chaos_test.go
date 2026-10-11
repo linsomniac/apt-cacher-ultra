@@ -261,10 +261,10 @@ func TestPhase2Chaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 		t.Fatalf("post-chaos: GetSuiteSnapshot(%d): %v", *suite.CurrentSnapshotID, err)
 	}
 	wantBHash := chaos2Sha256Hex(snapB.inRelease)
-	if finalSnap.InReleaseHash == nil || *finalSnap.InReleaseHash != wantBHash {
+	if finalSnap.SingleAnchorHash == nil || *finalSnap.SingleAnchorHash != wantBHash {
 		gotHash := "<nil>"
-		if finalSnap.InReleaseHash != nil {
-			gotHash = *finalSnap.InReleaseHash
+		if finalSnap.SingleAnchorHash != nil {
+			gotHash = *finalSnap.SingleAnchorHash
 		}
 		t.Errorf("post-chaos: final inrelease_hash=%s, want B's hash %s",
 			gotHash, wantBHash)

@@ -1591,8 +1591,8 @@ func TestInsertCandidateSnapshot_InlineMode(t *testing.T) {
 	if got.AdoptedAt != nil {
 		t.Errorf("candidate adopted_at = %v, want NULL", *got.AdoptedAt)
 	}
-	if got.InReleaseHash == nil || *got.InReleaseHash != h {
-		t.Errorf("InReleaseHash mismatch: %v", got.InReleaseHash)
+	if got.SingleAnchorHash == nil || *got.SingleAnchorHash != h {
+		t.Errorf("SingleAnchorHash mismatch: %v", got.SingleAnchorHash)
 	}
 	if got.ReleaseHash != nil || got.ReleaseGPGHash != nil {
 		t.Errorf("detached fields should be NULL: %+v", got)
@@ -1619,8 +1619,8 @@ func TestInsertCandidateSnapshot_DetachedMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSuiteSnapshot: %v", err)
 	}
-	if got.InReleaseHash != nil {
-		t.Errorf("inline field should be NULL in detached mode: %v", got.InReleaseHash)
+	if got.SingleAnchorHash != nil {
+		t.Errorf("inline field should be NULL in detached mode: %v", got.SingleAnchorHash)
 	}
 	if got.ReleaseHash == nil || *got.ReleaseHash != rh {
 		t.Errorf("ReleaseHash mismatch: %v", got.ReleaseHash)

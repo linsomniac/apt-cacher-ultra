@@ -123,6 +123,11 @@ func (f *fakeCache) GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*ca
 }
 
 func (f *fakeCache) putSnapshot(s cache.SuiteSnapshot) {
+	// Production snapshots always carry a Form (the v7 trigger rejects
+	// form-less rows), so a fixture without one models an impossible row.
+	if s.Form == "" {
+		panic("fakeCache.putSnapshot: fixture must set Form")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.snapshots[s.SnapshotID] = s
@@ -877,8 +882,9 @@ func TestCheck_UsesSnapshotHashForComparison(t *testing.T) {
 		CurrentSnapshotID: &snapID,
 	})
 	fc.putSnapshot(cache.SuiteSnapshot{
-		SnapshotID:    snapID,
-		InReleaseHash: &bodyHash,
+		SnapshotID:       snapID,
+		SingleAnchorHash: &bodyHash,
+		Form:             cache.FormInline,
 	})
 
 	c, err := New(Config{
@@ -928,7 +934,7 @@ func TestCheck_RecoversWhenAnchorMissingButSnapshotPresent(t *testing.T) {
 	// so the rolled-forward upstream body reads as "changed".
 	staleHash := strings.Repeat("a", 64)
 	snapID := int64(1481)
-	fc.putSnapshot(cache.SuiteSnapshot{SnapshotID: snapID, InReleaseHash: &staleHash})
+	fc.putSnapshot(cache.SuiteSnapshot{SnapshotID: snapID, SingleAnchorHash: &staleHash, Form: cache.FormInline})
 	fc.putSuite(cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		SuitePath:         "/dists/noble-updates",
@@ -1012,6 +1018,7 @@ func TestCheck_DetachedRecoversWhenAnchorsMissing(t *testing.T) {
 	fc.putSnapshot(cache.SuiteSnapshot{
 		SnapshotID: snapID, CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		SuitePath: "/dists/noble", ReleaseHash: &staleRH, ReleaseGPGHash: &rgh,
+		Form: cache.FormDetached,
 	})
 	fc.putSuite(cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble",
@@ -1158,9 +1165,9 @@ func TestCheck_AdopterInvokedOnChange(t *testing.T) {
 	if snap.AdoptedAt == nil {
 		t.Errorf("snapshot adopted_at not stamped — adoption goroutine didn't reach commit")
 	}
-	if snap.InReleaseHash == nil || *snap.InReleaseHash != hashOf(body) {
+	if snap.SingleAnchorHash == nil || *snap.SingleAnchorHash != hashOf(body) {
 		t.Errorf("snapshot.inrelease_hash mismatch: got %v, want %s",
-			snap.InReleaseHash, hashOf(body))
+			snap.SingleAnchorHash, hashOf(body))
 	}
 }
 
@@ -1233,6 +1240,7 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 		SuitePath:       "/dists/noble",
 		ReleaseHash:     &rh,
 		ReleaseGPGHash:  &rgh,
+		Form:            cache.FormDetached,
 	})
 	id := int64(42)
 	fc.putSuite(cache.SuiteFreshness{
@@ -1303,8 +1311,8 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 		t.Errorf("snapshot.release_gpg_hash mismatch: got %v, want %s",
 			snap.ReleaseGPGHash, hashOf(sigBody))
 	}
-	if snap.InReleaseHash != nil {
-		t.Errorf("snapshot.inrelease_hash should be nil in detached mode, got %s", *snap.InReleaseHash)
+	if snap.SingleAnchorHash != nil {
+		t.Errorf("snapshot.inrelease_hash should be nil in detached mode, got %s", *snap.SingleAnchorHash)
 	}
 }
 
@@ -1419,7 +1427,7 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 		t.Errorf("snapshot.release_hash mismatch: got %v, want %s",
 			snap.ReleaseHash, hashOf(releaseText))
 	}
-	if snap.InReleaseHash != nil {
+	if snap.SingleAnchorHash != nil {
 		t.Errorf("fallback adoption set inrelease_hash; want detached form (nil)")
 	}
 }
@@ -1528,7 +1536,7 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	if snap.ReleaseHash == nil {
 		t.Errorf("snapshot.release_hash unset after detached fallback")
 	}
-	if snap.InReleaseHash != nil {
+	if snap.SingleAnchorHash != nil {
 		t.Errorf("snapshot.inrelease_hash unexpectedly set in detached fallback")
 	}
 }

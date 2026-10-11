@@ -271,6 +271,8 @@ SELECT
   OR EXISTS(SELECT 1 FROM suite_freshness sf
               JOIN suite_snapshot ss ON ss.snapshot_id = sf.current_snapshot_id
              WHERE sf.canonical_scheme = ? AND sf.canonical_host = ?
+               -- AIDEV-TODO(phase E): an unsigned snapshot stores its
+               -- Release hash in inrelease_hash; guard by anchor_form.
                AND ((ss.inrelease_hash IS NOT NULL AND ? = sf.suite_path || '/InRelease')
                  OR (ss.release_hash   IS NOT NULL AND ? IN (sf.suite_path || '/Release', sf.suite_path || '/Release.gpg'))))`,
 		blobHash, blobHash, blobHash, blobHash, scheme, host, path, path).Scan(&guarded)
