@@ -146,11 +146,12 @@ type AdoptionConfig struct {
 	// the divergence, do not adopt). Default false during rollout.
 	Enabled bool `toml:"enabled"`
 
-	// RequireSignature rejects an InRelease that fails GPG verification.
-	// Default true. Setting false only allows starting with an empty
-	// keyring; it is loud (WARN at startup) but does not relax
-	// verification: only a decodable clearsigned InRelease is adopted
-	// as inline metadata in every mode (a plain-text body or an
+	// RequireSignature, when true, refuses to start with an empty apt
+	// keyring unless accept_any_signer is set; it does not affect
+	// verification. Default true. Setting false only allows starting
+	// with an empty keyring; it is loud (WARN at startup) but does not
+	// relax verification: only a decodable clearsigned InRelease is
+	// adopted as inline metadata in every mode (a plain-text body or an
 	// undecodable envelope still fails closed). Unsigned repositories
 	// are handled by the unsigned form, added in a later release.
 	RequireSignature bool `toml:"require_signature"`
