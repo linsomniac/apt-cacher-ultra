@@ -57,7 +57,7 @@ Each phase: write its detailed plan (`2026-09-28-flat-repositories-<letter>-<nam
 
 | Phase | Plan file | Spec sections | Depends on | Status |
 |---|---|---|---|---|
-| A. Foundations | `…-A-foundations.md` | Shared infrastructure, C1, C2 (`dists/` only), §6, §6.1 legacy trust audit, C3 marker writes at adoption + sniffs + startup pass, C5 (R-1, I-1 logging, fail-closed inline verification), C4 clock rule | — | done (commit a9d0a8e) |
+| A. Foundations | `…-A-foundations.md` | Shared infrastructure, C1, C2 (`dists/` only), §6, §6.1 legacy trust audit, C3 marker writes at adoption + sniffs + startup pass, C5 (R-1, I-1 logging, fail-closed inline verification), C4 clock rule | — | done (commit ffa8256) |
 | B. Retry discipline and capacity | `…-B-retry.md` | C7, C5 `Date` rules, C4 capacity/validators/`change_seen`, C4 scheduler fairness | A | to write after A |
 | C. Flip consistency | `…-C-flip.md` | C8 incl. the hold token | B | to write after B |
 | D. Creation bounds and signals | `…-D-creation.md` | C3 (rest: caps, touch, miss-path signed-seen marker, `Release`/flat sniffs) | A | to write after C |
