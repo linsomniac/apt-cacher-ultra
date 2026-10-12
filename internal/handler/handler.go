@@ -36,6 +36,19 @@ import (
 // package surfaces here at build time rather than as a runtime panic.
 var _ fetch.FetchDst = (*cache.BlobWriter)(nil)
 
+// Fetcher is the subset of *fetch.Client the handler uses; an interface
+// so virtual-clock simulations can drive the handler with an in-memory
+// upstream — the real client does not advance testing/synctest time.
+type Fetcher interface {
+	HostAllowed(host string) bool
+	Fetch(ctx context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error)
+}
+
+// Compile-time assertion: *fetch.Client satisfies Fetcher. Production
+// wiring (cmd/apt-cacher-ultra/main.go) keeps passing a *fetch.Client
+// unchanged; this assertion catches an interface drift at build time.
+var _ Fetcher = (*fetch.Client)(nil)
+
 // FreshnessChecker is the subset of *freshness.Checker the handler uses
 // to fire SPEC §7.1 T1 triggers. Defined as an interface so handler
 // tests can supply a recorder without spinning up the real freshness
@@ -49,7 +62,7 @@ type FreshnessChecker interface {
 type Config struct {
 	Parser *proxy.Parser
 	Cache  *cache.Cache
-	Fetch  *fetch.Client
+	Fetch  Fetcher
 	Logger *slog.Logger
 
 	// HostLimiter bounds concurrent upstream connections to a single
@@ -111,7 +124,7 @@ type ConnectHandler interface {
 type Handler struct {
 	parser    *proxy.Parser
 	cache     *cache.Cache
-	fetch     *fetch.Client
+	fetch     Fetcher
 	sf        *sfGroup
 	sem       *hostsem.Sem
 	freshness FreshnessChecker
