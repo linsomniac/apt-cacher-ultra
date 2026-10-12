@@ -72,6 +72,11 @@ func TestServeListeners_LegacyAuditRunsBeforeGCAndServing(t *testing.T) {
 	if err := c.CommitAdoption(ctx, id, []cache.SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: h, DeclaredSHA256: h}}, nil, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
+	// CommitAdoption marked the inline commit, as a v7 binary would. A
+	// pre-v7 cache has no markers: start from none.
+	if err := c.ClearSignedSeenForTest(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.EnqueueLegacyTrustAudit(ctx, id); err != nil {
 		t.Fatal(err)
 	}
