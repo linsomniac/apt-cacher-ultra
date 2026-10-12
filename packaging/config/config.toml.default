@@ -71,7 +71,7 @@ enabled               = false
 require_signature     = true    # false only allows an empty keyring; see reference
 require_pinned_signer = false   # true requires a matching trusted_signer rule
 # Skip trust AND cryptographic verification for unpinned suites. Matched
-# pins still apply; require_signature still requires a decodable signed envelope.
+# pins still apply, and a decodable signed envelope is always required.
 # Clients must perform their own apt signature verification when enabled.
 accept_any_signer      = false
 # Accept signatures carrying only a legacy issuer key ID when unambiguous.

@@ -216,8 +216,9 @@ type AdoptionConfig struct {
 	// while keeping broad relaxation for the rest.
 	//
 	// require_signature is orthogonal: a decodable clearsign envelope
-	// (or verified detached Release/Release.gpg pair) must still be
-	// present even though it is not cryptographically verified here.
+	// (or structurally valid detached Release/Release.gpg pair) must
+	// still be present even though it is not cryptographically verified
+	// here.
 	// require_signature = false only allows starting with an empty
 	// keyring; it does not admit plain-text or undecodable envelopes,
 	// and does not make unsigned upstreams adoptable (a later release

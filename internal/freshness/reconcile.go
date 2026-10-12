@@ -183,10 +183,13 @@ func (a *Adopter) reparseSnapshotRelease(ctx context.Context, snapshotID int64) 
 // stored bytes but were never signed — whether placed after a forged
 // "=CRC" line or as colon-bearing armor headers (both verify with
 // go-crypto v1.4.1). A body with no clearsign marker is
-// returned as-is ONLY because test fixtures still adopt plain-text
-// InRelease bodies through a pass-through verifier; production cannot
-// reach it (VerifyInline rejects plain text in every mode, and the startup
-// audit quarantines legacy plain-text snapshots before any reconcile).
+// returned as-is because test fixtures still adopt plain-text InRelease
+// bodies through a pass-through verifier. VerifyInline rejects plain text
+// in every mode, and the startup audit quarantines legacy plain-text
+// snapshots, but one the audit DEFERRED (read error at boot) stays current
+// and its reconcile can reach this fallback until a later start audits it.
+// That adds no trust beyond what the snapshot already had: its members
+// came from the same body. Phase D removes the fallback.
 // AIDEV-TODO(phase D): return an error for a marker-less body once
 // clearsignedFixture() replaces those fixtures. The marker test is bytes.Contains, never
 // HasPrefix (the verifier accepts leading whitespace), and a decode
