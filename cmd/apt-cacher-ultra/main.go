@@ -475,7 +475,8 @@ func serveListeners(
 	// AIDEV-NOTE: a returned error is a database failure or a missing /
 	// unmounted pool; refusing to start is deliberate — nothing in the
 	// failed batch was applied and the audit resumes on the next start. A
-	// single unreadable anchor is deferred inside the audit, not returned.
+	// single unreadable anchor, or a panic auditing one snapshot, is
+	// deferred inside the audit, not returned.
 	if _, err := freshness.RunLegacyTrustAudit(ctx, c, logger); err != nil {
 		return fmt.Errorf("legacy trust audit: %w", err)
 	}

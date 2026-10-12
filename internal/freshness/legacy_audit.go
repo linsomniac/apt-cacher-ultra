@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -24,6 +25,9 @@ var (
 	legacyAuditAnchorCap  int64 = 8 << 20
 	legacyAuditBatchSize        = 100
 	legacyAuditAfterBatch       = func(batch int) error { return nil }
+	// legacyClassify is auditLegacySnapshot's classifier; tests swap it to
+	// inject a panic.
+	legacyClassify = classifyLegacyInline
 )
 
 var errAnchorTooLarge = errors.New("anchor exceeds the audit read cap")
@@ -43,8 +47,9 @@ type legacyVerdict struct {
 // runs it after cache.Open and before GC, the checker or any listener
 // serves. An error means the database failed or the pool is missing: the
 // caller refuses to start, nothing in the failed batch was applied, and the
-// audit resumes on the next start. A single unreadable anchor is not an
-// error: that snapshot is deferred (left queued, unchanged, ERROR logged).
+// audit resumes on the next start. A single unreadable anchor, or a panic
+// while auditing one snapshot, is not an error: that snapshot is deferred
+// (left queued, unchanged, ERROR logged).
 //
 // AIDEV-NOTE: plan review 2026-10-05 findings 1–3 and its follow-ups.
 // Quarantine is the remedy for anything that cannot be proved signed AND
@@ -74,17 +79,22 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 			reasons   []string
 		)
 		for _, it := range items {
-			v, err := auditLegacySnapshot(c, it)
+			v, stack, err := auditLegacySnapshotRecovered(c, it)
 			if err != nil {
-				// An I/O fault is never evidence: leave the row queued,
-				// decide nothing for it, retry at the next start.
+				// An I/O fault (or a recovered panic) is never evidence:
+				// leave the row queued, decide nothing for it, retry at
+				// the next start.
 				res.Deferred++
-				logger.Error("legacy_trust_audit_deferred",
+				attrs := []any{
 					"snapshot_id", it.SnapshotID,
 					"canonical_host", it.CanonicalHost,
 					"suite_path", it.SuitePath,
 					"err", err,
-				)
+				}
+				if stack != nil {
+					attrs = append(attrs, "stack", string(stack))
+				}
+				logger.Error("legacy_trust_audit_deferred", attrs...)
 				continue
 			}
 			decisions = append(decisions, cache.LegacyAuditDecision{SnapshotID: it.SnapshotID, Outcome: v.outcome})
@@ -180,6 +190,26 @@ func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 	return nil
 }
 
+// auditLegacySnapshotRecovered runs auditLegacySnapshot and turns a panic
+// into an error carrying the panic value, plus the stack, so the caller
+// defers that one snapshot exactly as it defers an I/O fault.
+//
+// AIDEV-NOTE: the audit runs synchronously on main's goroutine before
+// anything serves, and the queue and pool blob are identical at the next
+// start, so an unrecovered panic here would recur on every start (a crash
+// loop whose only escape is editing legacy_trust_audit by hand). A panic
+// is not evidence: it never quarantines and never marks; the row stays
+// queued and untouched, and the rest of the batch proceeds.
+func auditLegacySnapshotRecovered(c *cache.Cache, it cache.LegacyAuditItem) (v legacyVerdict, stack []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			v, stack, err = legacyVerdict{}, debug.Stack(), fmt.Errorf("audit panicked: %v", r)
+		}
+	}()
+	v, err = auditLegacySnapshot(c, it)
+	return v, nil, err
+}
+
 func auditLegacySnapshot(c *cache.Cache, it cache.LegacyAuditItem) (legacyVerdict, error) {
 	quarantine := func(reason string) (legacyVerdict, error) {
 		return legacyVerdict{outcome: cache.LegacyAuditQuarantine, reason: reason}, nil
@@ -214,7 +244,7 @@ func auditLegacySnapshot(c *cache.Cache, it cache.LegacyAuditItem) (legacyVerdic
 	if hex.EncodeToString(sum[:]) != *it.SingleAnchorHash {
 		return quarantine("anchor_corrupt")
 	}
-	return classifyLegacyInline(blob), nil
+	return legacyClassify(blob), nil
 }
 
 // classifyLegacyInline decides whether a stored InRelease proves a signed,

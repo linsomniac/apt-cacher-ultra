@@ -3,7 +3,9 @@ package freshness
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -495,6 +497,72 @@ func TestRunLegacyTrustAudit_UnreadableAnchorIsDeferred(t *testing.T) {
 	res, err = RunLegacyTrustAudit(ctx, c, discardAuditLogger())
 	if err != nil || res.Audited != 1 || res.Deferred != 0 || res.Signed != 1 {
 		t.Fatalf("second run = %+v (%v), want the one deferred snapshot audited and kept", res, err)
+	}
+}
+
+// A panic while auditing one snapshot is handled like an I/O fault: that
+// snapshot is deferred (left current and queued, ERROR with the stack), the
+// rest of the batch is applied, and the start is not refused. The queue and
+// blob are the same at every start, so an unrecovered panic here would be a
+// crash loop with no escape short of editing the database.
+// Swaps the package-level legacyClassify seam, so NOT t.Parallel.
+func TestRunLegacyTrustAudit_ClassifyPanicIsDeferred(t *testing.T) {
+	f := buildLegacyFixture(t)
+	ctx := context.Background()
+	c := f.env.cache
+	s, err := c.GetSuiteSnapshot(ctx, f.clean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanAnchor := *s.SingleAnchorHash
+	prev := legacyClassify
+	t.Cleanup(func() { legacyClassify = prev })
+	legacyClassify = func(blob []byte) legacyVerdict {
+		if hashOf(blob) == cleanAnchor {
+			panic("injected classifier panic")
+		}
+		return prev(blob)
+	}
+	var logBuf bytes.Buffer
+	res, err := RunLegacyTrustAudit(ctx, c, slog.New(slog.NewJSONHandler(&logBuf, nil)))
+	if err != nil || res.Deferred != 1 || res.Audited != 5 || res.Signed != 2 || res.Quarantined != 3 {
+		t.Fatalf("run = %+v (%v), want no error, 5 audited (2 signed, 3 quarantined) and 1 deferred", res, err)
+	}
+	if cur := currentOf(t, c, "/r/dists/clean"); cur == nil || *cur != f.clean {
+		t.Fatalf("panicked snapshot changed: current = %v", cur)
+	}
+	if items, _ := c.LegacyAuditBatch(ctx, 0, 0); len(items) != 1 || items[0].SnapshotID != f.clean {
+		t.Fatalf("queue = %+v, want only the panicked snapshot", items)
+	}
+	if currentOf(t, c, "/r/dists/polluted") != nil || currentOf(t, c, "/r/dists/plain") != nil {
+		t.Fatal("the rest of the batch was not applied")
+	}
+	var deferred map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		if rec["msg"] == "legacy_trust_audit_deferred" {
+			deferred = rec
+		}
+	}
+	switch {
+	case deferred == nil:
+		t.Fatalf("no legacy_trust_audit_deferred line:\n%s", logBuf.String())
+	case deferred["level"] != "ERROR":
+		t.Errorf("deferred level = %v, want ERROR", deferred["level"])
+	case !strings.Contains(fmt.Sprint(deferred["err"]), "injected classifier panic"):
+		t.Errorf("deferred err = %v, want the panic value", deferred["err"])
+	case !strings.Contains(fmt.Sprint(deferred["stack"]), "TestRunLegacyTrustAudit_ClassifyPanicIsDeferred"):
+		t.Errorf("deferred stack does not reach the panicking frame: %v", deferred["stack"])
+	}
+	// Next start with a healthy classifier: the deferred snapshot is
+	// audited and kept.
+	legacyClassify = prev
+	res, err = RunLegacyTrustAudit(ctx, c, discardAuditLogger())
+	if err != nil || res.Audited != 1 || res.Deferred != 0 || res.Signed != 1 {
+		t.Fatalf("second run = %+v (%v), want the deferred snapshot audited and kept", res, err)
 	}
 }
 
