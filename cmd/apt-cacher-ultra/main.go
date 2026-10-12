@@ -397,9 +397,11 @@ func serveListeners(
 
 	// SPEC2 §5.1 documents require_signature = false as a loud
 	// configuration: emit at WARN so the operator's choice is visible
-	// in the journal even before adoption is actually wired.
+	// in the journal even before adoption is actually wired. The
+	// setting no longer affects verification (spec C5 rev 4): it only
+	// admits an empty keyring at startup (see buildAdopter).
 	if !cfg.Adoption.RequireSignature {
-		logger.Warn("adoption.require_signature = false: unsigned upstream metadata would be adopted (auditable per SPEC2 §5.1)")
+		logger.Warn("adoption.require_signature = false: an empty keyring is allowed at startup; plain-text or malformed InRelease files are never adopted as signed metadata, and with an empty keyring signed suites cannot adopt until keys are installed or adoption.accept_any_signer is set")
 	}
 
 	// SPEC2 §5.1: accept_any_signer = true is a loud relaxation —
@@ -924,9 +926,11 @@ func serveListeners(
 // require_signature = true (no key would satisfy any verification —
 // the cache would never adopt and the operator would never see why
 // without this gate). With require_signature = false the empty
-// keyring is allowed; signature checks fall through to "trust the
-// body verbatim" mode for InRelease bodies that lack a clearsign
-// block, and any clearsign-bearing body would simply fail to verify.
+// keyring is allowed, and that is all the setting does (spec C5
+// rev 4): InRelease bodies without a decodable clearsign block are
+// still rejected, and signed bodies fail with no_usable_signature
+// (naming the empty keyring for an unpinned suite), except unpinned
+// suites under accept_any_signer, which skip the keyring.
 func buildAdopter(
 	cfg *config.Config,
 	c *cache.Cache,

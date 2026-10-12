@@ -579,10 +579,11 @@ func TestOutcomeBadgeClass(t *testing.T) {
 
 // TestReasonTooltip pins the human-readable hover text for the adoption
 // reason chips. The two outcomes broken out of run_failed
-// (member_fetch_failed, db_failed) must each return a specific,
-// non-passthrough explanation; unknown tags pass through verbatim.
+// (member_fetch_failed, db_failed) and the malformed_clearsign gpg
+// reason (spec C5 rev 4) must each return a specific, non-passthrough
+// explanation; unknown tags pass through verbatim.
 func TestReasonTooltip(t *testing.T) {
-	for _, tag := range []string{"member_fetch_failed", "db_failed"} {
+	for _, tag := range []string{"member_fetch_failed", "db_failed", "malformed_clearsign"} {
 		got := reasonTooltip(tag)
 		if got == "" || got == tag {
 			t.Errorf("reasonTooltip(%q) = %q; want a specific explanation, not passthrough", tag, got)

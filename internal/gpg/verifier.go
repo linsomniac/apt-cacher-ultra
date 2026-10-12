@@ -28,8 +28,10 @@ type SignerPin struct {
 
 // VerifierConfig bundles dependencies for NewVerifier.
 type VerifierConfig struct {
-	Keyring          *Keyring
-	Pins             []SignerPin
+	Keyring *Keyring
+	Pins    []SignerPin
+	// RequireSignature no longer affects verification (spec C5 rev 4); cmd
+	// uses adoption.require_signature only for its empty-keyring startup gate.
 	RequireSignature bool
 	RequirePinned    bool
 
@@ -74,13 +76,12 @@ type VerifierConfig struct {
 // narrowed per-suite by SPEC2 §7.6.2 trust-set rules. One Verifier
 // instance is shared across all suites.
 type Verifier struct {
-	keyring          *Keyring
-	pins             []SignerPin
-	requireSignature bool
-	requirePinned    bool
-	allowShortKeyID  bool
-	acceptAnySigner  bool
-	logger           *slog.Logger
+	keyring         *Keyring
+	pins            []SignerPin
+	requirePinned   bool
+	allowShortKeyID bool
+	acceptAnySigner bool
+	logger          *slog.Logger
 
 	// shortKeyIDLogged tracks suites for which a short-keyid-fallback
 	// acceptance has already been logged this process. Keyed by
@@ -120,13 +121,12 @@ func NewVerifier(cfg VerifierConfig) (*Verifier, error) {
 		logger = slog.Default()
 	}
 	return &Verifier{
-		keyring:          cfg.Keyring,
-		pins:             cfg.Pins,
-		requireSignature: cfg.RequireSignature,
-		requirePinned:    cfg.RequirePinned,
-		allowShortKeyID:  cfg.AllowShortKeyID,
-		acceptAnySigner:  cfg.AcceptAnySigner,
-		logger:           logger,
+		keyring:         cfg.Keyring,
+		pins:            cfg.Pins,
+		requirePinned:   cfg.RequirePinned,
+		allowShortKeyID: cfg.AllowShortKeyID,
+		acceptAnySigner: cfg.AcceptAnySigner,
+		logger:          logger,
 	}, nil
 }
 
@@ -148,6 +148,8 @@ func ClassifyVerifyErr(err error) string {
 	switch {
 	case errors.Is(err, ErrUnpinnedSuite):
 		return "unpinned_suite"
+	case errors.Is(err, ErrMalformedClearsign):
+		return "malformed_clearsign"
 	case errors.Is(err, ErrMissingSignature):
 		return "missing_signature"
 	case errors.Is(err, ErrShortKeyID):
@@ -169,9 +171,16 @@ var (
 	// [[trusted_signer]] block matched the suite's canonical host.
 	ErrUnpinnedSuite = errors.New("adoption_unpinned_suite")
 
-	// ErrMissingSignature means the InRelease body is not clearsigned
-	// and RequireSignature is true.
+	// ErrMissingSignature means the InRelease body carries no clearsign
+	// marker at all. Since spec C5 rev 4 this is an error whatever
+	// adoption.require_signature says: unsigned metadata is adopted only
+	// through the explicit unsigned form (phase E), never as inline.
 	ErrMissingSignature = errors.New("InRelease is not clearsigned")
+
+	// ErrMalformedClearsign means the body carries the clearsign marker
+	// but is not a decodable clearsigned message (no END line, no
+	// signature frame, zero signed lines). It is never treated as text.
+	ErrMalformedClearsign = errors.New("InRelease clearsign envelope is malformed")
 
 	// ErrShortKeyID means the signature lacks the long-form
 	// IssuerFingerprint subpacket. SPEC2 §7.6.3 rejects short-keyid-
@@ -197,9 +206,10 @@ var (
 )
 
 // errClearsignPanicked reports a clearsigned body that made the go-crypto
-// decoder panic. It is always an error, whatever require_signature says:
-// the body claims to be clearsigned and is not a valid clearsigned message.
-var errClearsignPanicked = errors.New("clearsigned message is malformed (decoder panicked)")
+// decoder panic. It wraps ErrMalformedClearsign, so it classifies as
+// malformed_clearsign: the body claims to be clearsigned and is not a
+// valid clearsigned message.
+var errClearsignPanicked = fmt.Errorf("%w (decoder panicked)", ErrMalformedClearsign)
 
 // decodeClearsigned is clearsign.Decode with a panic turned into
 // errClearsignPanicked.
@@ -232,8 +242,9 @@ func decodeClearsigned(b []byte) (block *clearsign.Block, err error) {
 //     §7.5 step 2 stored the original (prefix-bearing) bytes as the
 //     pool blob — a cache-pollution path.
 //  2. Resolve per-suite trust set; if RequirePinned and no match, abort.
-//  3. Decode clearsigned block; if absent and RequireSignature, abort.
-//     If absent and !RequireSignature, return body verbatim.
+//  3. Decode the clearsigned block; a body without the marker is
+//     ErrMissingSignature, one that does not decode is
+//     ErrMalformedClearsign, in every mode.
 //  4. Iterate signature packets, attempting cryptographic verification
 //     of each candidate (one with a trusted IssuerFingerprint)
 //     against the trust-set EntityList. Accept only on a packet that
@@ -250,31 +261,34 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 	// Step 1: structural input guard — no prefix or suffix data
 	// around the clearsigned block. requireBareClearsigned returns
 	// nil when no BEGIN marker is present, so plain-text bodies
-	// (which the require_signature=false path returns verbatim
-	// later) reach the no-clearsign branch unobstructed.
+	// reach Step 3, which rejects them with ErrMissingSignature.
 	if err := requireBareClearsigned(inRelease); err != nil {
 		return nil, err
 	}
 
 	// Step 2: per-suite trust-set resolution.
-	trustSet, trustFPs, _, bypass, err := v.resolveTrustSet(suite)
+	trustSet, trustFPs, pinned, bypass, err := v.resolveTrustSet(suite)
 	if err != nil {
 		return nil, err
 	}
 
-	// Step 3: clearsign decode.
+	// Step 3: clearsign decode. Only a decodable clearsigned envelope is
+	// inline metadata, whatever require_signature says (spec C5 rev 4).
+	//
+	// AIDEV-NOTE: plan review finding 4. The old require_signature=false
+	// branch returned the raw body here, which let a plain-text or
+	// undecodable "InRelease" become a trust-bearing inline snapshot.
+	// Never reintroduce a text fallback: unsigned repositories go through
+	// the explicit unsigned form, which never vouches.
 	block, err := decodeClearsigned(inRelease)
 	if err != nil {
 		return nil, err
 	}
 	if block == nil {
-		if v.requireSignature {
-			return nil, ErrMissingSignature
+		if bytes.Contains(inRelease, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
+			return nil, ErrMalformedClearsign
 		}
-		// Operator opted into the loud "unsigned OK" mode at startup.
-		// Return the body verbatim — the parser downstream treats
-		// this as Release-style text.
-		return inRelease, nil
+		return nil, ErrMissingSignature
 	}
 
 	if bypass {
@@ -302,11 +316,14 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 	}
 
 	if len(trustSet) == 0 {
-		// Pinned with non-empty fingerprints, but the host keyring
-		// contains no key with any of those fingerprints. The signed
-		// metadata exists but cannot be verified — fail closed. (Note
-		// we already passed the RequirePinned gate, so this is
-		// "configured but un-loadable.")
+		// No key can verify the signed metadata — fail closed. Unpinned:
+		// the host keyring is empty (require_signature = false admits
+		// that at startup). Pinned: the keyring holds none of the
+		// pinned fingerprints (we already passed the RequirePinned
+		// gate, so this is "configured but un-loadable").
+		if !pinned {
+			return nil, fmt.Errorf("%w: the host keyring is empty — signed suites cannot adopt until keys are installed or adoption.accept_any_signer is set", ErrNoUsableSignature)
+		}
 		return nil, fmt.Errorf("%w: pin matched but no key in host keyring satisfies it", ErrNoUsableSignature)
 	}
 
@@ -345,10 +362,10 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 //     cryptographically against trustSet — same per-packet coupling
 //     as VerifyInline (SPEC2 §7.6.3).
 //
-// Unlike VerifyInline there is no "no signature, !RequireSignature
-// passes through" branch: a detached path that arrived without
-// Release.gpg never reaches this function (the freshness checker
-// only switches to detached mode after fetching both bodies).
+// As in VerifyInline, a missing signature never passes through: a
+// detached path that arrived without Release.gpg never reaches this
+// function (the freshness checker only switches to detached mode
+// after fetching both bodies).
 //
 // AIDEV-NOTE: we deliberately do NOT enforce a "bare armor" guard
 // equivalent to requireBareClearsigned. clearsign.Decode silently
@@ -369,7 +386,7 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 		return nil, errors.New("empty Release.gpg body")
 	}
 
-	trustSet, trustFPs, _, bypass, err := v.resolveTrustSet(suite)
+	trustSet, trustFPs, pinned, bypass, err := v.resolveTrustSet(suite)
 	if err != nil {
 		return nil, err
 	}
@@ -400,6 +417,9 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 	}
 
 	if len(trustSet) == 0 {
+		if !pinned {
+			return nil, fmt.Errorf("%w: the host keyring is empty — signed suites cannot adopt until keys are installed or adoption.accept_any_signer is set", ErrNoUsableSignature)
+		}
 		return nil, fmt.Errorf("%w: pin matched but no key in host keyring satisfies it", ErrNoUsableSignature)
 	}
 
@@ -468,8 +488,7 @@ func isArmoredSignature(b []byte) bool {
 // stored bytes (modulo trailing newlines)" — see SPEC2 §7.5 step 2.
 //
 // If b doesn't contain a clearsigned marker at all, this returns nil
-// — let the downstream "no clearsign" path handle the !RequireSignature
-// case.
+// — the downstream decode step rejects it with ErrMissingSignature.
 func requireBareClearsigned(b []byte) error {
 	const beginMarker = "-----BEGIN PGP SIGNED MESSAGE-----"
 	const endSig = "-----END PGP SIGNATURE-----"

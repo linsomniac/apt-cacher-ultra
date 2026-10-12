@@ -310,9 +310,10 @@ type adoptionEntry struct {
 	// Reason is the SPEC5 §10.5 additive sub-classification. Empty on
 	// success; for gpg_failed it carries the specific verifier
 	// sentinel (untrusted_signer, short_keyid, crypto_verify_failed,
-	// missing_signature, ambiguous_keyid, no_usable_signature); for
-	// other failures it mirrors Outcome. JSON-omitted when empty so
-	// the wire shape is unchanged for success rows.
+	// missing_signature, malformed_clearsign, ambiguous_keyid,
+	// no_usable_signature); for other failures it mirrors Outcome.
+	// JSON-omitted when empty so the wire shape is unchanged for
+	// success rows.
 	Reason string `json:"reason,omitempty"`
 	// MemberPath is the SPEC5 §10.5 additive field naming the declared
 	// Release member that failed (member_fetch_failed / member_mismatch),
@@ -803,7 +804,9 @@ func reasonTooltip(reason string) string {
 	case "no_usable_signature":
 		return "No signature packet in the clearsigned block carried a trusted IssuerFingerprint."
 	case "missing_signature":
-		return "InRelease body is not clearsigned and adoption.require_signature is true."
+		return "InRelease body is not clearsigned. Plain-text InRelease files are never adopted as signed metadata, whatever adoption.require_signature says."
+	case "malformed_clearsign":
+		return "InRelease starts like a clearsigned message but its signature frame does not decode."
 	case "ambiguous_keyid":
 		return "Two or more keys in the trust set share the same 8-byte keyid; the short-keyid fallback refuses to guess."
 	case "crypto_verify_failed":
