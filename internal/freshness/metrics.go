@@ -23,6 +23,11 @@ import (
 // classifyAdoptionOutcome) and panicked (I-1: counted by
 // Checker.recoverGoroutine when the adoption goroutine panics, which in
 // practice means inside Run/RunDetached, before classification).
+//
+// AIDEV-NOTE: metrics added by the flat-repository work, outside the
+// SPEC5 §10.4.3 inventory: acu_clock_steps_detected_total (spec C4) and
+// acu_legacy_snapshots_quarantined_total (spec §6.1, startup legacy
+// trust audit). Both are unlabelled counters.
 var (
 	freshnessCheckTotal = metrics.NewCounterWithCap(
 		"acu_freshness_check_total",
@@ -61,6 +66,13 @@ var (
 	clockStepsTotal = metrics.NewCounter(
 		"acu_clock_steps_detected_total",
 		"Past-event timestamps found in the future (backward wall-clock step).",
+	)
+
+	// legacyQuarantinedTotal counts pre-v7 snapshots the startup trust
+	// audit quarantined (spec §6.1); the reason is in the WARN line.
+	legacyQuarantinedTotal = metrics.NewCounter(
+		"acu_legacy_snapshots_quarantined_total",
+		"Pre-v7 snapshots quarantined by the startup legacy trust audit.",
 	)
 
 	adoptionTotal = metrics.NewCounterWithCap(

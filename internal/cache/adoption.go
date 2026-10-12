@@ -16,6 +16,10 @@ import (
 // would double-bump refcounts for every member, so the writer refuses.
 var ErrSnapshotAlreadyAdopted = errors.New("cache: snapshot already adopted")
 
+// ErrSnapshotRetired: the candidate was retired (legacy trust audit or,
+// from phase F, reaping) and must never become current.
+var ErrSnapshotRetired = errors.New("cache: snapshot is retired")
+
 // ErrSnapshotNaturalKeyAdopted is returned by InsertCandidateSnapshot
 // when a non-retired row matching the natural key (scheme, host,
 // suite_path, COALESCE(inrelease_hash, release_hash), anchor_form)
@@ -341,12 +345,12 @@ func (c *Cache) CommitAdoption(ctx context.Context, snapshotID int64,
 		// argument.
 		var (
 			scheme, host, suite, form string
-			adoptedAt                 sql.NullInt64
+			adoptedAt, retiredAt      sql.NullInt64
 		)
 		err = tx.QueryRowContext(ctx, `
-SELECT canonical_scheme, canonical_host, suite_path, anchor_form, adopted_at
+SELECT canonical_scheme, canonical_host, suite_path, anchor_form, adopted_at, retired_at
 FROM suite_snapshot
-WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adoptedAt)
+WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adoptedAt, &retiredAt)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			return fmt.Errorf("CommitAdoption: snapshot %d not found", snapshotID)
@@ -355,6 +359,12 @@ WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adopted
 		}
 		if adoptedAt.Valid {
 			return ErrSnapshotAlreadyAdopted
+		}
+		// AIDEV-NOTE: a retired snapshot (quarantined by the legacy trust
+		// audit, spec §6.1, or reaped from phase F) must never become
+		// current again — its pins were released when it was retired.
+		if retiredAt.Valid {
+			return fmt.Errorf("%w: snapshot_id=%d", ErrSnapshotRetired, snapshotID)
 		}
 
 		// Step 2: insert snapshot_member rows. Each member is validated
@@ -607,24 +617,12 @@ UPDATE suite_snapshot SET adopted_at = ? WHERE snapshot_id = ?`,
 		// Step 8 (SPEC4 §7.5.1 Rule 3): decrement refcounts for blobs
 		// the prior snapshot pinned. A blob shared between old and new
 		// gets +1 then -1 (net 0) — exactly the bookkeeping Phase 4 GC
-		// relies on.
-		//
-		// COALESCE preserves an existing refcount_zeroed_at on a 0 → -1
-		// transition (the grace clock should continue, not restart).
-		// The inner IIF only writes a fresh `now` when refcount - 1 is
-		// the *first* ≤ 0 crossing (i.e. refcount was strictly positive
-		// before this UPDATE).
+		// relies on. The decrement itself (and its refcount_zeroed_at
+		// rule) lives in decrementSnapshotRefcountsTx, shared with the
+		// legacy trust audit's quarantine.
 		if prior.Valid {
-			if _, err := tx.ExecContext(ctx, `
-UPDATE blob
-   SET refcount = refcount - 1,
-       refcount_zeroed_at = COALESCE(
-         refcount_zeroed_at,
-         IIF(refcount - 1 <= 0, ?, NULL)
-       )
- WHERE hash IN (SELECT blob_hash FROM snapshot_member WHERE snapshot_id = ?)`,
-				now, prior.Int64); err != nil {
-				return fmt.Errorf("CommitAdoption: decrement prior refcounts: %w", err)
+			if err := decrementSnapshotRefcountsTx(ctx, tx, prior.Int64, now); err != nil {
+				return fmt.Errorf("CommitAdoption: %w", err)
 			}
 		}
 
@@ -633,6 +631,29 @@ UPDATE blob
 		}
 		return nil
 	})
+}
+
+// decrementSnapshotRefcountsTx releases one pin per distinct blob the
+// snapshot's members reference (SPEC4 §7.5.1 Rule 3). It must run exactly
+// once per snapshot, when it stops being current: CommitAdoption Step 8
+// (displacement) and the legacy trust audit's quarantine (spec §6.1) are
+// the only callers; phase F's reaper adds the third.
+//
+// AIDEV-NOTE: COALESCE keeps an existing refcount_zeroed_at on a 0 → -1
+// transition; the IIF writes `now` only on the first <= 0 crossing.
+func decrementSnapshotRefcountsTx(ctx context.Context, tx *sql.Tx, snapshotID, now int64) error {
+	if _, err := tx.ExecContext(ctx, `
+UPDATE blob
+   SET refcount = refcount - 1,
+       refcount_zeroed_at = COALESCE(
+         refcount_zeroed_at,
+         IIF(refcount - 1 <= 0, ?, NULL)
+       )
+ WHERE hash IN (SELECT blob_hash FROM snapshot_member WHERE snapshot_id = ?)`,
+		now, snapshotID); err != nil {
+		return fmt.Errorf("decrement refcounts of snapshot %d: %w", snapshotID, err)
+	}
+	return nil
 }
 
 // GetSuiteSnapshot returns the suite_snapshot row by id, or ErrNotFound.

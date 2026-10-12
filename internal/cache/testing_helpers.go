@@ -63,3 +63,12 @@ func (c *Cache) DeletePackageHashForTest(ctx context.Context, scheme, host, debP
 		return nil
 	})
 }
+
+// ClearSignedSeenForTest deletes every marker. Tests that build a
+// "pre-v7" state with v7 code use it to undo CommitAdoption's marks.
+func (c *Cache) ClearSignedSeenForTest(ctx context.Context) error {
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, `DELETE FROM suite_signed_seen`)
+		return err
+	})
+}

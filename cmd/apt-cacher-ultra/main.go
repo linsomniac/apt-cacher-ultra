@@ -469,6 +469,17 @@ func serveListeners(
 		logger.Warn("startup tmp sweep failed", "err", err)
 	}
 
+	// Spec §6.1: remove trust from pre-v7 snapshots that cannot be proved
+	// signed and clean, and record signed-seen history from cached signed
+	// anchors, BEFORE anything collects garbage, checks, adopts or serves.
+	// AIDEV-NOTE: a returned error is a database failure or a missing /
+	// unmounted pool; refusing to start is deliberate — nothing in the
+	// failed batch was applied and the audit resumes on the next start. A
+	// single unreadable anchor is deferred inside the audit, not returned.
+	if _, err := freshness.RunLegacyTrustAudit(ctx, c, logger); err != nil {
+		return fmt.Errorf("legacy trust audit: %w", err)
+	}
+
 	// SPEC4 §4.2 steps 5 + 6: pool/ orphan scan + one-shot GC pass.
 	// Both are blocking — the cache does not begin answering requests
 	// until they complete (we have not yet called Serve on any
