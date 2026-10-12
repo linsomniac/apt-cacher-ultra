@@ -35,6 +35,30 @@ func commitInline(t *testing.T, c *Cache, suite, anchor string, extra ...Snapsho
 	return id
 }
 
+// Upstream validators as a real archive passes them through (an R-1 body
+// tampered in transit keeps the honest upstream's ETag/Last-Modified).
+const (
+	auditETag    = `"5f2a1c-63c1e0d4b8e00"`
+	auditLastMod = "Sat, 04 Oct 2026 12:34:56 GMT"
+)
+
+// seedValidators stores auditETag/auditLastMod on suite's freshness row,
+// preserving its other columns (PutSuiteFreshness never touches the
+// current pointer).
+func seedValidators(t *testing.T, c *Cache, suite string) {
+	t.Helper()
+	ctx := context.Background()
+	sf, err := c.GetSuiteFreshness(ctx, "http", "h", suite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	etag, lastmod := auditETag, auditLastMod
+	sf.InReleaseETag, sf.InReleaseLastMod = &etag, &lastmod
+	if err := c.PutSuiteFreshness(ctx, *sf); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // applyOne applies a single decision and reports whether it was current.
 func applyOne(t *testing.T, c *Cache, id int64, o LegacyAuditOutcome) bool {
 	t.Helper()
@@ -58,6 +82,7 @@ func TestApplyLegacyAuditDecisions_QuarantineCurrentReleasesPinsOnce(t *testing.
 	if err := c.EnqueueLegacyTrustAudit(ctx, id); err != nil {
 		t.Fatal(err)
 	}
+	seedValidators(t, c, "/r/dists/q")
 	beforeA, beforeP := refcount(t, c, anchor), refcount(t, c, pkgs)
 
 	if !applyOne(t, c, id, LegacyAuditQuarantine) {
@@ -69,6 +94,12 @@ func TestApplyLegacyAuditDecisions_QuarantineCurrentReleasesPinsOnce(t *testing.
 	sf, err := c.GetSuiteFreshness(ctx, "http", "h", "/r/dists/q")
 	if err != nil || sf.CurrentSnapshotID != nil {
 		t.Fatalf("suite still has a current snapshot: %+v (%v)", sf, err)
+	}
+	// Spec §6.1: the suite's validators go too. Kept, the next conditional
+	// GET would carry them, the honest upstream would answer 304, and the
+	// suite would never re-adopt.
+	if sf.InReleaseETag != nil || sf.InReleaseLastMod != nil {
+		t.Fatalf("validators survived the quarantine: etag=%v lastmod=%v", sf.InReleaseETag, sf.InReleaseLastMod)
 	}
 	if s, err := c.GetSuiteSnapshot(ctx, id); err != nil || s.RetiredAt == nil {
 		t.Fatalf("snapshot not retired: %+v (%v)", s, err)
@@ -105,6 +136,9 @@ func TestApplyLegacyAuditDecisions_QuarantineDisplacedKeepsRefcounts(t *testing.
 		SnapshotMember{Path: "main/binary-amd64/Packages", BlobHash: oldPkgs, DeclaredSHA256: oldPkgs})
 	newAnchor := seedBlob(t, c, "displaced anchor v2")
 	cur := commitInline(t, c, "/r/dists/d", newAnchor)
+	// The validators belong to the current snapshot: quarantining the
+	// displaced one must leave them alone.
+	seedValidators(t, c, "/r/dists/d")
 	before := map[string]int64{}
 	for _, h := range []string{oldAnchor, oldPkgs, newAnchor} {
 		before[h] = refcount(t, c, h)
@@ -125,6 +159,10 @@ func TestApplyLegacyAuditDecisions_QuarantineDisplacedKeepsRefcounts(t *testing.
 	sf, err := c.GetSuiteFreshness(ctx, "http", "h", "/r/dists/d")
 	if err != nil || sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != cur {
 		t.Fatalf("current pointer changed: %+v (%v)", sf, err)
+	}
+	if sf.InReleaseETag == nil || *sf.InReleaseETag != auditETag ||
+		sf.InReleaseLastMod == nil || *sf.InReleaseLastMod != auditLastMod {
+		t.Fatalf("the current snapshot's validators changed: etag=%v lastmod=%v", sf.InReleaseETag, sf.InReleaseLastMod)
 	}
 	if _, ok, _ := c.SignedSeen(ctx, "http", "h", "/r/dists/d"); !ok {
 		t.Fatal("LegacyAuditQuarantineSigned wrote no marker")

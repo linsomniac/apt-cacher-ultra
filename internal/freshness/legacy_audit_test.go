@@ -526,15 +526,29 @@ func TestRunLegacyTrustAudit_UnstatableAnchorDoesNotRefuseStart(t *testing.T) {
 	}
 }
 
-// urlConditional answers conditional GETs from a fixed URL → body map
-// (200), and 404 for anything else.
+// Validators the honest upstream serves for its InRelease. An R-1 body
+// tampered in transit keeps them, so a pre-fix cache stores them on the
+// suite next to the tampered bytes.
+const (
+	upstreamETag    = `"5f2a1c-63c1e0d4b8e00"`
+	upstreamLastMod = "Sat, 04 Oct 2026 12:34:56 GMT"
+)
+
+// urlConditional answers conditional GETs from a fixed URL → body map.
+// Like a real unchanged upstream it honours its own validators: a request
+// carrying upstreamETag or upstreamLastMod gets 304 with no body; any
+// other request for a known URL gets 200; an unknown URL gets 404.
 type urlConditional map[string][]byte
 
-func (u urlConditional) Conditional(_ context.Context, tg *fetch.Target, _, _ string, _ int64) (*fetch.ConditionalResult, error) {
-	if b, ok := u[tg.URL]; ok {
-		return &fetch.ConditionalResult{Status: 200, Body: b}, nil
+func (u urlConditional) Conditional(_ context.Context, tg *fetch.Target, etag, lastmod string, _ int64) (*fetch.ConditionalResult, error) {
+	b, ok := u[tg.URL]
+	switch {
+	case !ok:
+		return &fetch.ConditionalResult{Status: 404}, nil
+	case etag == upstreamETag || lastmod == upstreamLastMod:
+		return &fetch.ConditionalResult{Status: 304}, nil
 	}
-	return &fetch.ConditionalResult{Status: 404}, nil
+	return &fetch.ConditionalResult{Status: 200, Body: b}, nil
 }
 
 // Spec §6.1 recovery: an R-1 quarantine heals on the first check, because
@@ -554,6 +568,18 @@ func TestRunLegacyTrustAudit_QuarantinedR1SuiteReadoptsOnFirstCheck(t *testing.T
 	// the signed text). CommitAdoption seeds the suite's url_path anchor
 	// with the tampered bytes.
 	old := adoptLegacy(t, env, "/r/dists/p", tampered, "/r/pool/p_1_amd64.deb")
+	// ... and the upstream's validators, passed through with the tampered
+	// body. If the quarantine kept them, the first check would send them,
+	// urlConditional would answer 304 and the suite would never re-adopt.
+	sf, err := env.cache.GetSuiteFreshness(ctx, "http", "h", "/r/dists/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	etag, lastmod := upstreamETag, upstreamLastMod
+	sf.InReleaseETag, sf.InReleaseLastMod = &etag, &lastmod
+	if err := env.cache.PutSuiteFreshness(ctx, *sf); err != nil {
+		t.Fatal(err)
+	}
 	if err := env.cache.ClearSignedSeenForTest(ctx); err != nil {
 		t.Fatal(err)
 	}
