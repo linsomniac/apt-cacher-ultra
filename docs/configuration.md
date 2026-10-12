@@ -96,7 +96,9 @@ fetch earlier. Adoption's member retries are a separate outer retry policy.
 Upstream request paths are encoded exactly as apt encodes them (lowercase
 percent-encoding of `+`, `~`, space, `%`, control and non-ASCII bytes, plus
 `#` and `?`). Paths containing `+` or `~` therefore reach upstream as
-`%2b`/`%7e`, as they do when apt fetches directly. Request paths containing a
+`%2b`/`%7e`, as they do when apt fetches directly. Besides apt's set, the
+cache also escapes `"` `<` `>` `\` `^` `` ` `` `{` `|` `}`, because Go's URL
+handling requires those bytes escaped in a path. Request paths containing a
 decoded control byte are rejected with 400.
 
 ### Using an upstream proxy
@@ -207,7 +209,7 @@ whether a changed suite is staged and published as a new coherent snapshot.
 | `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them. |
 | `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are handled by the unsigned form (a later release). |
 | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
-| `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. Signature structure is still checked when present. Matching pins keep normal verification. Logs a startup warning. |
+| `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. A decodable clearsigned `InRelease` (or, for the detached pair, a parseable `Release.gpg` signature) is still required, as in every mode. Matching pins keep normal verification. Logs a startup warning. |
 | `allow_short_keyid` | boolean | `true` | Accept signatures containing only a legacy 64-bit issuer key ID when it uniquely identifies a loaded trusted key and cryptographic verification succeeds. `false` requires the long issuer fingerprint. |
 | `keyring_dirs` | array of strings | `[]` | Extra startup keyring directories containing `.gpg` or `.asc` files. Entries must be nonempty absolute paths; nonexistent directories are skipped. Adds to built-in directories and bundled keys. |
 | `architectures` | array of strings | `[]` | Architectures to adopt; empty keeps all. Filters recognized per-architecture Packages, Sources, pdiff indexes, Contents, cnf Commands, and dep11 Components. Use `"source"` for source indexes. Architecture-independent `"all"` content is always retained. |
@@ -268,16 +270,23 @@ file is missing or corrupt, is quarantined: it stops serving and vouching,
 its suite is served from the ordinary cache, and a `legacy_snapshot_quarantined`
 line names it. A suite quarantined for declarations outside its signature
 adopts again on its first freshness check, because its tampered copy never
-matches a clean upstream; one quarantined because its stored file was lost,
-or because it was plain text, waits for the next upstream change in this
-release. In strict mode, a quarantined suite's packages are refused while
-other suites on the same host have complete coverage, as for any unadopted
-suite. The cache directory's `pool/` must be present: if it is missing or
-empty, the daemon refuses to start and changes nothing (mount or restore it,
-or wipe the cache directory to start empty); a cache whose only snapshot's
-pool file is missing is not refused — that snapshot is quarantined. A single
-pool file that cannot be read for another reason (permissions, I/O error)
-does not stop the daemon: that snapshot keeps serving as before, a
+matches a clean upstream; one quarantined because its stored file was lost
+or corrupt waits for the next upstream change. A plain-text suite cannot
+adopt in this release (every attempt fails `missing_signature`): it is served
+from the ordinary cache without vouching until upstream publishes a
+clearsigned `InRelease`, or, from the release that adds the unsigned form,
+until it adopts as an unsigned snapshot. In strict mode, a quarantined
+suite's packages are refused while other suites on the same host have
+complete coverage, as for any unadopted suite. While inline snapshots are
+queued for the audit, the cache directory's `pool/` must be present: the
+daemon refuses to start, and changes nothing, when `pool/` is missing,
+unreadable or empty, or when two or more inline snapshots are queued and
+none of their pool files exists (a foreign pool). Mount or restore it, or
+wipe the cache directory to start empty. Otherwise a missing pool file does
+not stop the daemon, even when it belongs to the only queued snapshot, as
+long as `pool/` is not empty: that snapshot is quarantined. A single pool
+file that cannot be read for another reason (permissions, I/O error) does
+not stop the daemon either: that snapshot keeps serving as before, a
 `legacy_trust_audit_deferred` error names it, and the next start retries it.
 The audit resumes if the start is interrupted and is a no-op afterwards. A
 suite whose signed `InRelease` was served by an earlier version is recorded
