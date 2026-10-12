@@ -340,13 +340,13 @@ func (c *Cache) CommitAdoption(ctx context.Context, snapshotID int64,
 		// strictly safer than trusting them from a separate caller
 		// argument.
 		var (
-			scheme, host, suite string
-			adoptedAt           sql.NullInt64
+			scheme, host, suite, form string
+			adoptedAt                 sql.NullInt64
 		)
 		err = tx.QueryRowContext(ctx, `
-SELECT canonical_scheme, canonical_host, suite_path, adopted_at
+SELECT canonical_scheme, canonical_host, suite_path, anchor_form, adopted_at
 FROM suite_snapshot
-WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &adoptedAt)
+WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adoptedAt)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			return fmt.Errorf("CommitAdoption: snapshot %d not found", snapshotID)
@@ -592,6 +592,16 @@ ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
 UPDATE suite_snapshot SET adopted_at = ? WHERE snapshot_id = ?`,
 			now, snapshotID); err != nil {
 			return fmt.Errorf("CommitAdoption: stamp adopted_at: %w", err)
+		}
+
+		// Step 7a (spec C3): a signed snapshot records signed-seen history
+		// for its base in the same transaction, so every binary from phase
+		// A on keeps the never-downgrade authority current even before the
+		// handler writes markers (phase D).
+		if AnchorForm(form) == FormInline || AnchorForm(form) == FormDetached {
+			if err := markSignedSeen(ctx, tx, scheme, host, aptpath.MarkerBase(suite), now); err != nil {
+				return fmt.Errorf("CommitAdoption: %w", err)
+			}
 		}
 
 		// Step 8 (SPEC4 §7.5.1 Rule 3): decrement refcounts for blobs
