@@ -172,7 +172,15 @@ func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 	}
 	_, rerr := f.Readdirnames(1)
 	_ = f.Close()
-	if rerr != nil && !errors.Is(rerr, io.EOF) {
+	// AIDEV-NOTE: blob GC never deletes an adopted snapshot's anchor or
+	// member blobs, so an empty pool with any queued inline anchor is a
+	// lost or unmounted pool, never one lost file: refuse even for a
+	// single anchor. A lone missing anchor in a NON-empty pool is still
+	// quarantined by the audit (spec §6.1).
+	if errors.Is(rerr, io.EOF) {
+		return fmt.Errorf("legacy trust audit: pool %s is empty but %d inline snapshots are queued for the audit — is the pool mounted? Mount or restore it and restart; to start without the pool, wipe the cache directory. Nothing was changed", pool, len(anchors))
+	}
+	if rerr != nil {
 		return fmt.Errorf("legacy trust audit: pool %s is not readable: %w (fix it and restart; nothing was changed)", pool, rerr)
 	}
 	inline, missing := len(anchors), 0

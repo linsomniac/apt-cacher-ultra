@@ -1067,11 +1067,11 @@ The v7 migration queues every adopted snapshot in `legacy_trust_audit`. At
 every start, after the migration and before the GC loops, the freshness
 checker and the HTTP listeners serve, `freshness.RunLegacyTrustAudit` drains
 the queue. **Pre-flight:** when the queue holds inline snapshots, the pool
-directory must be readable, and when two or more inline anchors are queued
+directory must be readable and non-empty, and when two or more inline anchors are queued
 at least one of them must exist; an unmounted, empty or foreign pool would
 otherwise make every anchor look missing, so startup refuses with a message
 naming the path and the two ways out (restore the pool, or wipe the cache)
-and changes nothing. A single queued inline anchor that is missing is
+and changes nothing. A single queued inline anchor that is missing from a non-empty pool is
 quarantined (one lost pool file cannot be told from a lost mount, and
 refusing would leave no recovery short of wiping the cache); detached-only
 queues read no pool files. Each batch of up to 100 is decided in memory and

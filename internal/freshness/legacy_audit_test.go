@@ -454,6 +454,78 @@ func TestRunLegacyTrustAudit_PreflightRefusesMissingOrEmptyPool(t *testing.T) {
 	}
 }
 
+// oneQueuedInline is a pre-v7 cache with exactly one queued snapshot: a
+// clean, current inline one.
+func oneQueuedInline(t *testing.T) (*cache.Cache, int64) {
+	t.Helper()
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	id := adoptLegacy(t, env, "/r/dists/only", clearsignForTest(t, realisticRelease()), "/r/pool/only_1_amd64.deb")
+	if err := env.cache.ClearSignedSeenForTest(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.cache.EnqueueLegacyTrustAudit(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	return env.cache, id
+}
+
+// Blob GC never deletes an adopted snapshot's anchor or member blobs, so an
+// empty pool with even one queued inline anchor is a lost or unmounted
+// pool, not one lost file: refuse to start and change nothing.
+func TestRunLegacyTrustAudit_PreflightRefusesEmptyPoolWithOneInlineAnchor(t *testing.T) {
+	c, id := oneQueuedInline(t)
+	ctx := context.Background()
+	pool := filepath.Join(c.Dir(), "pool")
+	moved := pool + ".away"
+	if err := os.Rename(pool, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(pool, 0o755); err != nil { // an empty (unmounted) pool
+		t.Fatal(err)
+	}
+	_, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger())
+	if err == nil || !strings.Contains(err.Error(), pool) {
+		t.Fatalf("audit err = %v, want a refusal naming %s", err, pool)
+	}
+	if cur := currentOf(t, c, "/r/dists/only"); cur == nil || *cur != id {
+		t.Fatalf("a refused audit changed the current pointer: %v", cur)
+	}
+	if items, _ := c.LegacyAuditBatch(ctx, 0, 0); len(items) != 1 || items[0].SnapshotID != id {
+		t.Fatalf("a refused audit changed the queue: %+v", items)
+	}
+	if err := os.Remove(pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(moved, pool); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger()); err != nil || res.Audited != 1 || res.Signed != 1 {
+		t.Fatalf("audit after the pool returned = %+v (%v), want 1 audited and kept", res, err)
+	}
+}
+
+// One missing anchor in a non-empty pool cannot be told from one lost
+// file: it is quarantined, never a refused start.
+func TestRunLegacyTrustAudit_LoneMissingAnchorInNonEmptyPoolIsQuarantined(t *testing.T) {
+	c, id := oneQueuedInline(t)
+	ctx := context.Background()
+	s, err := c.GetSuiteSnapshot(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(c.BlobPath(*s.SingleAnchorHash)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger())
+	if err != nil || res.Audited != 1 || res.Quarantined != 1 {
+		t.Fatalf("run = %+v (%v), want the lone missing anchor quarantined", res, err)
+	}
+	if cur := currentOf(t, c, "/r/dists/only"); cur != nil {
+		t.Fatalf("quarantined snapshot still current: %v", *cur)
+	}
+}
+
 // A single unreadable anchor defers only that snapshot: the run continues,
 // the snapshot stays current and queued, and the next start audits it.
 func TestRunLegacyTrustAudit_UnreadableAnchorIsDeferred(t *testing.T) {
