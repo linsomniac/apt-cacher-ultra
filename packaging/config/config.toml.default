@@ -68,10 +68,10 @@ max_concurrent_adoptions = 2     # global adoption cap; 0 = unlimited
 # Adopt verified, coherent metadata snapshots atomically; failure retains
 # the previous snapshot. Enable after loading keys for your repositories.
 enabled               = false
-require_signature     = true    # false relaxes signature presence; see reference
+require_signature     = true    # false only allows an empty keyring; see reference
 require_pinned_signer = false   # true requires a matching trusted_signer rule
 # Skip trust AND cryptographic verification for unpinned suites. Matched
-# pins still apply; require_signature still requires a signature envelope.
+# pins still apply; require_signature still requires a decodable signed envelope.
 # Clients must perform their own apt signature verification when enabled.
 accept_any_signer      = false
 # Accept signatures carrying only a legacy issuer key ID when unambiguous.

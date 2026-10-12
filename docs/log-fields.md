@@ -147,3 +147,20 @@ re-enumerated here. The values are listed at the SPEC anchor.
   semantics (when a field appears vs is omitted) are also locked.
 - New fields may be added additively — log consumers parse the keys
   they care about and ignore the rest.
+
+## Operational events
+
+Structured events emitted outside the per-request `request` log line:
+goroutine panic recovery, wall-clock step detection, and the startup
+legacy trust audit (`internal/freshness`, `internal/handler`,
+`cmd/apt-cacher-ultra`).
+
+| Event | Level | Fields | Meaning |
+|---|---|---|---|
+| `adoption_panicked` | ERROR | `where` (`adoption`, `repair`, `reconcile`, `heartbeat`), `canonical_host`, `suite_path`, `panic`, `stack` (first occurrence per `where` per process only) | A panic inside an adoption, repair, reconcile or heartbeat goroutine was recovered; the prior snapshot keeps serving. |
+| `freshness_check_panicked` | ERROR | `where` (`check`, `scheduler`, `t1`), `canonical_host`, `suite_path`, `panic`, `stack` (first occurrence per `where` per process only) | A panic during a freshness check was recovered; the check counts as failed (`last_check_at` bumped, so the cooldown applies). |
+| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute. |
+| `legacy_snapshot_quarantined` | WARN | `reason` (`legacy_plaintext`, `malformed_envelope`, `unsigned_declarations`, `unparseable`, `anchor_missing`, `anchor_oversized`, `anchor_corrupt`, `unexpected_form`), `snapshot_id`, `canonical_host`, `suite_path`, `anchor_form`, `was_current` | The startup trust audit could not prove a pre-upgrade snapshot signed and clean; it no longer serves or vouches, and its suite is served unadopted until it re-adopts. |
+| `legacy_trust_audit_deferred` | ERROR | `snapshot_id`, `canonical_host`, `suite_path`, `err` | A pre-upgrade snapshot's pool file could not be read (not "missing"); the snapshot is left as it was and retried at the next start. |
+| `legacy_trust_audit_progress` | INFO | `audited`, `quarantined`, `deferred` | One batch of up to 100 queued snapshots was audited and committed (first start after an upgrade only). |
+| `legacy_trust_audit_completed` | INFO | `audited`, `signed`, `quarantined`, `deferred`, `anchor_markers`, `duration` | The startup trust audit finished (every start; `audited` is 0 once the upgrade queue has drained). |

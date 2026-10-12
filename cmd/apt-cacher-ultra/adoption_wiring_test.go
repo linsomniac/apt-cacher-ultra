@@ -91,8 +91,9 @@ func TestBuildAdopter_BundledKeysSatisfyRequireSignature(t *testing.T) {
 
 func TestBuildAdopter_EmptyKeyring_RequireSignatureFalse_OK(t *testing.T) {
 	// With require_signature = false, an empty keyring is allowed —
-	// the operator opted into unsigned-OK mode and saw the WARN at
-	// startup.
+	// the operator opted into starting with no loaded keys (inline
+	// verification still fails closed on anything but a decodable
+	// clearsigned InRelease) and saw the WARN at startup.
 	withKeyringDirs(t, []string{t.TempDir()})
 
 	cfg := newAdoptionEnabledCfg(t, false /* requireSignature */)

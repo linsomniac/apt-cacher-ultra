@@ -147,8 +147,12 @@ type AdoptionConfig struct {
 	Enabled bool `toml:"enabled"`
 
 	// RequireSignature rejects an InRelease that fails GPG verification.
-	// Default true. Setting false is loud (WARN at startup) and is
-	// only sensible for explicitly trusted unsigned upstreams.
+	// Default true. Setting false only allows starting with an empty
+	// keyring; it is loud (WARN at startup) but does not relax
+	// verification: only a decodable clearsigned InRelease is adopted
+	// as inline metadata in every mode (a plain-text body or an
+	// undecodable envelope still fails closed). Unsigned repositories
+	// are handled by the unsigned form, added in a later release.
 	RequireSignature bool `toml:"require_signature"`
 
 	// RequirePinnedSigner causes adoption to fail closed when a suite
@@ -210,10 +214,13 @@ type AdoptionConfig struct {
 	// before. This lets operators opt some suites into strict pinning
 	// while keeping broad relaxation for the rest.
 	//
-	// require_signature is orthogonal: when true, a clearsign envelope
-	// (or Release.gpg) must still be structurally present even though
-	// it is not verified. Set require_signature = false to also accept
-	// upstreams that publish unsigned Release files.
+	// require_signature is orthogonal: a decodable clearsign envelope
+	// (or verified detached Release/Release.gpg pair) must still be
+	// present even though it is not cryptographically verified here.
+	// require_signature = false only allows starting with an empty
+	// keyring; it does not admit plain-text or undecodable envelopes,
+	// and does not make unsigned upstreams adoptable (a later release
+	// adds the unsigned form).
 	//
 	// One adoption_unverified_signer INFO line is emitted per
 	// (canonical_host, suite_path) per process the first time a suite
@@ -789,7 +796,9 @@ func Load(path string) (*Config, error) {
 //
 // Phase 2 additions: adoption.require_signature defaults true (the
 // secure posture; operators must explicitly opt out via the loud
-// require_signature = false config). adoption.enabled and
+// require_signature = false config, which only allows starting with
+// an empty keyring — it does not admit unsigned or undecodable inline
+// metadata; see RequireSignature). adoption.enabled and
 // require_pinned_signer remain false (match apt's broad-trust default
 // during rollout; flip-to-true is a per-deployment decision).
 //

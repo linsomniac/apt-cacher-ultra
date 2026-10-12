@@ -93,6 +93,12 @@ it is not necessary to wait for another client request. Retry counts are upper
 bounds: nonretryable failures, cooldown probes, and `total_timeout` can stop a
 fetch earlier. Adoption's member retries are a separate outer retry policy.
 
+Upstream request paths are encoded exactly as apt encodes them (lowercase
+percent-encoding of `+`, `~`, space, `%`, control and non-ASCII bytes, plus
+`#` and `?`). Paths containing `+` or `~` therefore reach upstream as
+`%2b`/`%7e`, as they do when apt fetches directly. Request paths containing a
+decoded control byte are rejected with 400.
+
 ### Using an upstream proxy
 
 To chain this cache through another forward proxy (including apt-cacher-ng),
@@ -199,7 +205,7 @@ whether a changed suite is staged and published as a new coherent snapshot.
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them. |
-| `require_signature` | boolean | `true` | Require a signed envelope for inline metadata. `false` permits unsigned inline content and logs a startup warning; it does not disable verification of signatures that are present. See trust details below. |
+| `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are handled by the unsigned form (a later release). |
 | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
 | `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. Signature structure is still checked when present. Matching pins keep normal verification. Logs a startup warning. |
 | `allow_short_keyid` | boolean | `true` | Accept signatures containing only a legacy 64-bit issuer key ID when it uniquely identifies a loaded trusted key and cryptographic verification succeeds. `false` requires the long issuer fingerprint. |
@@ -224,10 +230,8 @@ restrictions from a client's `Signed-By` configuration.
 for unpinned suites: the cache continues serving the original signed bytes, but
 does not verify them cryptographically. `require_pinned_signer = true` still
 rejects unpinned suites, so combining the two does not bypass pin requirements.
-`require_signature = false` also allows unsigned data through the inline
-verification path. The detached fallback still requires both `Release` and
-`Release.gpg`; disabling this setting does not make Release-only repositories
-adoptable.
+`require_signature = false` no longer lets unsigned data through the inline
+path. The detached fallback still requires both `Release` and `Release.gpg`.
 
 ### Architecture and member availability
 
@@ -250,6 +254,35 @@ availability or integrity failures on required indexes abort adoption. A failed
 adoption leaves the previous snapshot serving. Automatic repair does not retry
 every optional `404`/`410` artifact; manual reconciliation is available through
 [`POST /reconcile`](../README.md#recovering-a-degraded-repository).
+
+### Upgrading an existing cache
+
+On its first start after an upgrade, the daemon audits every metadata snapshot
+adopted by earlier versions before it serves anything (a large cache can take
+a little while; progress is logged per 100 snapshots, and because the
+listeners are already open, connections made meanwhile wait — apt clients may
+time out once). A snapshot whose stored `InRelease` is not a signed, clean
+clearsigned message — a plain-text file adopted with `require_signature =
+false`, or one carrying declarations outside its signature — or whose pool
+file is missing or corrupt, is quarantined: it stops serving and vouching,
+its suite is served from the ordinary cache, and a `legacy_snapshot_quarantined`
+line names it. A suite quarantined for declarations outside its signature
+adopts again on its first freshness check, because its tampered copy never
+matches a clean upstream; one quarantined because its stored file was lost,
+or because it was plain text, waits for the next upstream change in this
+release. In strict mode, a quarantined suite's packages are refused while
+other suites on the same host have complete coverage, as for any unadopted
+suite. The cache directory's `pool/` must be present: if it is missing or
+empty, the daemon refuses to start and changes nothing (mount or restore it,
+or wipe the cache directory to start empty); a cache whose only snapshot's
+pool file is missing is not refused — that snapshot is quarantined. A single
+pool file that cannot be read for another reason (permissions, I/O error)
+does not stop the daemon: that snapshot keeps serving as before, a
+`legacy_trust_audit_deferred` error names it, and the next start retries it.
+The audit resumes if the start is interrupted and is a no-op afterwards. A
+suite whose signed `InRelease` was served by an earlier version is recorded
+as signed from cached anchors; one whose cached anchor was already
+garbage-collected leaves no record.
 
 ## `[hot_packages]`, `[hold_packages]`, and `[retention]`: package working set
 
