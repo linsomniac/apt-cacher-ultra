@@ -96,6 +96,39 @@ Later phases add (named here so phase plans stay consistent):
 - G: `aptpath.IsFlatSuitePath`, `aptpath.FlatBase`, `aptpath.DotClean`, `freshness.validateFilename`. Legacy flat onboarding also writes signed-seen markers for sniff-passing cached flat anchors (the startup pass only covers suites that already have rows), and the `/.` twin variant of E's in-transaction recheck test runs here. **PR #8 evidence in G's DoD:** `TestServeHTTP_FlatRepositoryFreshness` (a miss on `/…/deb/InRelease` and on `/…/deb/./InRelease` creates one suite row each and fires T1 under it; a later hit fires T1 again; `/…/deb/Packages_1.0_all.deb`, host-root `/InRelease` and `/…/deb//InRelease` create none), the pkgs.k8s.io shape `/core:/stable:/v1.34/deb/InRelease` → `/core:/stable:/v1.34/deb`, flat `Packages` failure fatal, and the mixed-host strict matrix.
 - H: PR #8's end-to-end table in `e2e/flat`: one signed flat repository configured as `deb <uri>/ /` on one client and `deb <uri> ./` on another; both report 2.0 within one cooldown of the v2 publish, and with the upstream stopped two fresh clients install 2.0 from the snapshots.
 
+## Phase A carry-forwards (from the phase A reviews, 2026-10-11)
+
+Each item is owned by the phase it is listed under; that phase's plan addresses it.
+
+**B:**
+
+- The scheduler rewrite recovers panics at the worker and run-loop level. Today a panic in `tick` before the per-suite loop (`ListSuites`, gauges) is unrecovered.
+- Panicked adoptions are recorded in the admin adoption ring and the duration histogram.
+- Scheduler pacing covers the burst after both backward and forward clock steps.
+- The backoff gate applies the C4 clock-step rule to `adoption_fail_*_at`, as the AIDEV-NOTE at the clock-step helper says.
+- `simtest` phase lengths are not exact multiples of the tick interval (same-instant goroutine order is nondeterministic). `startSimChecker`-style helpers register `t.Cleanup(stop)`. `StaticConditional`-style latency fetchers honour `ctx.Done()`.
+
+**D:**
+
+- The one-insert-site convergence for `suite_freshness` must account for the two phase-A insert sites that stamp `last_requested_at`: `CommitAdoption` Step 6 and `PutSuiteFreshness`.
+- `SniffReleaseGPG` accepts `0xC2`, which is also a UTF-8 lead byte. This is the safe direction and spec-mandated, but phase D's miss-path marker should know it.
+- `requireBareClearsigned` admits leading whitespace that apt's first-line sniff rejects. Decide whether adoption should match apt.
+
+**E:**
+
+- Production unsigned candidates must set `SnapshotCandidate.Form` explicitly; derivation from hashes is for legacy and fixture callers only.
+- `checkLockedDetached` (still tests `ReleaseHash != nil`) and `snapshotAnchorHash`'s `Release` case need `Form` dispatch for unsigned.
+- `suite_signed_seen.last_seen_at` is a past-event stamp under C4: a future stamp counts as infinitely old and is healed on the next observation. The anchor pass copies `MAX(last_requested_at, last_fetched_at)` verbatim.
+
+**F:**
+
+- Snapshot GC's `keep_displaced` ranking must exclude retired snapshots, which today occupy slots indefinitely. A quarantined plain-text suite's retired row is otherwise kept forever.
+- `IsCanonicalSuitePath("/foo/dists/InRelease")` is true: reap such suites by idleness.
+
+**Open decision (spec-level, for the maintainer):**
+
+- An `anchor_corrupt` or `anchor_oversized` quarantine leaves the known-corrupt `url_path` anchor in Phase-1 serving, and the checker sees "unchanged". This is pre-existing behaviour for any bit-rotted metadata blob. Decide in a later phase whether the audit should also invalidate that `url_path` row.
+
 ## Review findings 2026-10-05 → where they are addressed
 
 | # | Finding | Spec | Plan |
