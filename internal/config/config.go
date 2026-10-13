@@ -3,6 +3,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -442,6 +443,22 @@ type AdminConfig struct {
 	// validateListenAddr().
 	Listen string `toml:"listen"`
 
+	// TLSCert / TLSKey are optional PEM paths that switch the admin
+	// listener from plain HTTP to HTTPS on the same admin.listen
+	// address. Both empty (default) keeps HTTP — backward
+	// compatible. Both set is required; one-set-one-empty is
+	// rejected at validation, as are unreadable files and a
+	// cert/key pair that does not match (tls.LoadX509KeyPair runs at
+	// load time, so a bad pair fails fast at startup instead of at
+	// the first handshake). The pair is loaded once when the listener
+	// starts; changing either path (or rotating the certificate)
+	// needs a daemon restart. Unlike cache.listen_tls there is no
+	// separate TLS listener: the admin surface is small and
+	// loopback-bound by default, so one scheme per listener is
+	// enough.
+	TLSCert string `toml:"tls_cert"`
+	TLSKey  string `toml:"tls_key"`
+
 	// HtpasswdFile is the optional Apache htpasswd file (bcrypt-only)
 	// for HTTP Basic auth on every admin request. Empty (default)
 	// means "no auth — operator relies on bind-address as the trust
@@ -480,6 +497,15 @@ type AdminConfig struct {
 	// dropped and a one-shot metrics_series_cap_reached Warn fires.
 	// Default 1024. Must be ≥ 1.
 	MetricSeriesCap int `toml:"metric_series_cap"`
+}
+
+// TLSEnabled reports whether the admin listener serves HTTPS: true
+// only when BOTH tls_cert and tls_key are set. Validate rejects a
+// half-set pair for file-loaded configs and admin.New rejects it for
+// programmatically built ones, so callers can treat this as
+// all-or-nothing — never a silent fall back to plain HTTP.
+func (a AdminConfig) TLSEnabled() bool {
+	return a.TLSCert != "" && a.TLSKey != ""
 }
 
 // HeartbeatStaleGraceEffective returns the runtime-derived grace
@@ -1106,6 +1132,25 @@ func (c *Config) Validate() error {
 		if c.Admin.HtpasswdFile != "" {
 			if err := validateHtpasswdFile(c.Admin.HtpasswdFile); err != nil {
 				errs = append(errs, fmt.Errorf("admin.htpasswd_file: %w", err))
+			}
+		}
+		adminTLSAnySet := c.Admin.TLSCert != "" || c.Admin.TLSKey != ""
+		adminTLSAllSet := c.Admin.TLSCert != "" && c.Admin.TLSKey != ""
+		if adminTLSAnySet && !adminTLSAllSet {
+			errs = append(errs, errors.New("admin.tls_cert / admin.tls_key must both be set or both empty"))
+		} else if adminTLSAllSet {
+			if err := checkReadableFile(c.Admin.TLSCert); err != nil {
+				errs = append(errs, fmt.Errorf("admin.tls_cert %q: %w", c.Admin.TLSCert, err))
+			}
+			if err := checkReadableFile(c.Admin.TLSKey); err != nil {
+				errs = append(errs, fmt.Errorf("admin.tls_key %q: %w", c.Admin.TLSKey, err))
+			}
+			// Fail fast on a mismatched pair: the cache TLS listener
+			// surfaces a bad pair at ServeTLS time; the admin listener
+			// validates the pair at config load so a typo'd pair never
+			// reaches a half-bound daemon.
+			if _, err := tls.LoadX509KeyPair(c.Admin.TLSCert, c.Admin.TLSKey); err != nil {
+				errs = append(errs, fmt.Errorf("admin.tls_cert/tls_key: %w", err))
 			}
 		}
 		if c.Admin.GaugeRefresh.Duration <= 0 {

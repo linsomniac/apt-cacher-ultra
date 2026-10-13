@@ -544,7 +544,14 @@ func buildListenerInfo(cfg Config) []listenerInfo {
 	if cfg.TLSAddr != "" {
 		out = append(out, listenerInfo{Role: "tls", Addr: cfg.TLSAddr})
 	}
-	out = append(out, listenerInfo{Role: "admin", Addr: cfg.AdminAddr})
+	// When admin TLS is configured the listener serves HTTPS on
+	// admin.listen; prefix the scheme so the status page (and its
+	// JSON form) shows the URL an operator would actually curl.
+	adminAddr := cfg.AdminAddr
+	if cfg.Admin.TLSEnabled() {
+		adminAddr = "https://" + adminAddr
+	}
+	out = append(out, listenerInfo{Role: "admin", Addr: adminAddr})
 	return out
 }
 

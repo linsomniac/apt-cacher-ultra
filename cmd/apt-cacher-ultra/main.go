@@ -382,6 +382,7 @@ func serveListeners(
 		"gc_url_path_ttl", cfg.GC.URLPathTTL.Duration,
 		"admin_enabled", cfg.Admin.Enabled,
 		"admin_listen", cfg.Admin.Listen,
+		"admin_tls_enabled", cfg.Admin.TLSEnabled(),
 		"admin_htpasswd_file", cfg.Admin.HtpasswdFile,
 		"admin_htpasswd_users", htpasswdUsers,
 		"admin_pprof_enabled", cfg.Admin.PprofEnabled,
@@ -758,7 +759,11 @@ func serveListeners(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			logger.Info("admin listener accepting", "addr", adminLn.Addr().String())
+			scheme := "http"
+			if cfg.Admin.TLSEnabled() {
+				scheme = "https"
+			}
+			logger.Info("admin listener accepting", "addr", adminLn.Addr().String(), "scheme", scheme)
 			err := adminSrv.Serve(adminLn)
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("admin: %w", err)

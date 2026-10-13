@@ -146,9 +146,18 @@ url_path_ttl        = "168h"
 # HTTP status page, /metrics, /healthz, and mutating POST /reconcile.
 enabled           = true
 listen            = "127.0.0.1:6789" # host:port; protect access if widened
+# Optional TLS for the admin listener: PEM certificate and key paths.
+# Both empty (default) keeps plain HTTP on admin.listen. When both are
+# set, the admin endpoints are served over HTTPS on the same address and
+# the pair is validated at startup. With TLS active, Basic auth
+# credentials travel encrypted. The pair is loaded once at startup:
+# changes (or certificate rotation) need a daemon restart.
+tls_cert          = ""
+tls_key           = ""
 # Optional bcrypt-only Apache htpasswd file ($2a$/$2b$/$2y$). Empty = no auth.
 # Reloaded on requests when mtime/size changes. HTTP Basic auth is not
-# encrypted: use a trusted network, SSH tunnel, or TLS reverse proxy.
+# encrypted on a plain-HTTP listener: use a trusted network, SSH tunnel,
+# TLS above, or a TLS reverse proxy.
 htpasswd_file     = ""
 pprof_enabled     = false # opt-in CPU/heap/goroutine profiles; same admin auth
 gauge_refresh     = "30s" # > 0 and <= 1h; expensive metrics refresh cadence

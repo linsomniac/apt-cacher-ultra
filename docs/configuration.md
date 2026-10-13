@@ -324,16 +324,20 @@ applies when `enabled = false`.
 
 ## `[admin]`: status, metrics, and maintenance
 
-The separate **HTTP** admin listener serves the status page, `/metrics`, and
+The separate admin listener (plain **HTTP** by default, **HTTPS** when
+`tls_cert`/`tls_key` are set) serves the status page, `/metrics`, and
 `/healthz`, plus the mutating `POST /reconcile` maintenance endpoint. It is not a
 read-only interface. Keep access restricted to trusted operators; if exposed
-beyond loopback, protect the network path or place it behind a TLS reverse proxy.
-HTTP Basic authentication does not encrypt credentials in transit.
+beyond loopback, protect the network path, enable TLS, or place it behind a TLS
+reverse proxy. On a plain-HTTP listener, HTTP Basic authentication does not
+encrypt credentials in transit.
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | Bind the admin listener and run its background refresh work. `false` leaves proxy service running and logs a warning. |
 | `listen` | string | `"127.0.0.1:6789"` | Admin bind address. A non-loopback address without authentication emits a startup warning. Explicit empty string is invalid when enabled. |
+| `tls_cert` | string | `""` | PEM server certificate for the admin listener. Both empty (default) keeps plain HTTP on `listen`; both set switches the admin endpoints to HTTPS on the same address. Must be set together with `tls_key`. |
+| `tls_key` | string | `""` | PEM private key matching `tls_cert`. The pair is validated at startup (`tls.LoadX509KeyPair`), so a mismatched pair fails fast instead of at the first handshake. |
 | `htpasswd_file` | string | `""` | Optional readable Apache htpasswd file with at least one user; only bcrypt (`$2a$`, `$2b$`, `$2y$`) entries are accepted. Empty disables authentication. Applies to every admin endpoint. |
 | `pprof_enabled` | boolean | `false` | Enable `GET /debug/pprof/profile`, `/debug/pprof/heap`, and `/debug/pprof/goroutine` on the admin listener, with the same authentication. CPU capture defaults to 30 seconds; `?seconds=N` accepts integers from 1 through 300. Profiles expose process details; enable only for trusted operators. |
 | `gauge_refresh` | duration | `"30s"` | Delay after a completed refresh before recomputing gauges. Values can lag by this delay plus refresh work time. Positive and at most `"1h"`. |
@@ -346,6 +350,16 @@ request when its modification time (in whole seconds) or size changes. A same-si
 rewrite within the same second may be missed. Reload failures retain the previous
 credentials and log a warning. Changing the configured file path needs a daemon
 restart. These per-key constraints are skipped when `admin.enabled = false`.
+
+Set `tls_cert` and `tls_key` together to serve the admin listener over HTTPS on
+the same `listen` address — the status page, `/metrics`, `/healthz`, and
+`POST /reconcile` all move to TLS, and the status page advertises the admin
+listener with an `https://` scheme. With TLS active, `htpasswd_file` Basic auth
+credentials travel encrypted. External probes (Kubernetes, blackbox_exporter)
+should target `https://<listen>/healthz` and trust the configured certificate.
+The pair is loaded once when the listener starts: changing `tls_cert` /
+`tls_key` or rotating the certificate takes effect only after a daemon
+restart.
 
 Profiling is inactive until explicitly enabled and requested. Profile routes
 accept GET only, use binary `go tool pprof` format, and do not force a Go garbage
