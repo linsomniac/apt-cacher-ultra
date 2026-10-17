@@ -29,6 +29,17 @@ var ErrSnapshotRetired = errors.New("cache: snapshot is retired")
 // in CommitAdoption).
 var ErrSnapshotNaturalKeyAdopted = errors.New("cache: snapshot natural key already adopted")
 
+// NaturalKeyAdoptedError names the adopted snapshot a candidate collided
+// with, so the adopter can tell a rollback to a displaced snapshot (spec
+// C5 rollback_refused) from a race with the current one.
+type NaturalKeyAdoptedError struct{ SnapshotID int64 }
+
+func (e *NaturalKeyAdoptedError) Error() string {
+	return fmt.Sprintf("%v: snapshot_id=%d", ErrSnapshotNaturalKeyAdopted, e.SnapshotID)
+}
+
+func (e *NaturalKeyAdoptedError) Unwrap() error { return ErrSnapshotNaturalKeyAdopted }
+
 // sqliteConstraintUnique is the extended result code SQLITE_CONSTRAINT_UNIQUE.
 // We use the literal here rather than depending on modernc.org/sqlite/lib
 // for one constant — the value is fixed by SQLite's public ABI.
@@ -156,9 +167,9 @@ func (c *Cache) InsertCandidateSnapshot(ctx context.Context, sc SnapshotCandidat
 INSERT INTO suite_snapshot
   (canonical_scheme, canonical_host, suite_path,
    inrelease_hash, inrelease_etag, inrelease_lastmod,
-   release_hash, release_gpg_hash, anchor_form, created_at, adopted_at,
+   release_hash, release_gpg_hash, anchor_form, release_date, created_at, adopted_at,
    package_coverage_complete, heartbeat_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
 	const lookupQ = `
 SELECT snapshot_id, adopted_at FROM suite_snapshot
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?
@@ -174,7 +185,7 @@ SELECT snapshot_id, adopted_at FROM suite_snapshot
 		res, execErr := conn.ExecContext(ctx, insertQ,
 			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath,
 			sc.InReleaseHash, sc.InReleaseETag, sc.InReleaseLastMod,
-			sc.ReleaseHash, sc.ReleaseGPGHash, string(form), now, coverage, now)
+			sc.ReleaseHash, sc.ReleaseGPGHash, string(form), sc.ReleaseDate, now, coverage, now)
 		if execErr == nil {
 			id, execErr = res.LastInsertId()
 			if execErr != nil {
@@ -212,7 +223,7 @@ SELECT snapshot_id, adopted_at FROM suite_snapshot
 				lookupErr, execErr)
 		}
 		if adoptedAt.Valid {
-			return fmt.Errorf("%w: snapshot_id=%d", ErrSnapshotNaturalKeyAdopted, existingID)
+			return &NaturalKeyAdoptedError{SnapshotID: existingID}
 		}
 		// Refresh mutable, non-natural-key columns so a retry that
 		// supplies (e.g.) a re-signed Release.gpg or fresher validators
@@ -224,7 +235,9 @@ SELECT snapshot_id, adopted_at FROM suite_snapshot
 		// old (failed-attempt) signature — an internal inconsistency.
 		// inrelease_hash / release_hash are part of the natural key
 		// and cannot have changed (we only got here because they
-		// matched); leave them.
+		// matched); leave them. release_date (spec C5) is refreshed
+		// alongside the validators for the same reason: a retry may
+		// have parsed a Date the earlier attempt could not.
 		// SPEC4 §7.5.2 site 1 (reused-orphan path): refresh heartbeat_at
 		// alongside the other mutable columns. Without this, a reused
 		// candidate inherits its prior incarnation's heartbeat_at; if
@@ -235,10 +248,11 @@ UPDATE suite_snapshot
    SET release_gpg_hash   = ?,
        inrelease_etag     = ?,
        inrelease_lastmod  = ?,
+       release_date       = ?,
        heartbeat_at       = ?
  WHERE snapshot_id = ?`
 		if _, err := conn.ExecContext(ctx, refreshQ,
-			sc.ReleaseGPGHash, sc.InReleaseETag, sc.InReleaseLastMod, now,
+			sc.ReleaseGPGHash, sc.InReleaseETag, sc.InReleaseLastMod, sc.ReleaseDate, now,
 			existingID); err != nil {
 			return fmt.Errorf("InsertCandidateSnapshot: refresh mutable cols on reuse: %w", err)
 		}
@@ -285,8 +299,10 @@ type PrefetchedURLPath struct {
 //     member rows point at it.
 //  5. Read the prior current_snapshot_id from suite_freshness (NULL if
 //     this is the first adoption for the suite).
-//  6. Upsert suite_freshness.current_snapshot_id to snapshotID. The
-//     other suite_freshness columns are left untouched.
+//  6. Upsert suite_freshness.current_snapshot_id to snapshotID, set the
+//     row's validators to the candidate's, and clear
+//     inrelease_change_seen_at and the adoption failure record (spec C4,
+//     C7).
 //  7. Stamp suite_snapshot.adopted_at = now.
 //  8. If prior_id was non-NULL, decrement refcount for each distinct
 //     blob_hash referenced by the prior snapshot's members. A blob
@@ -346,11 +362,13 @@ func (c *Cache) CommitAdoption(ctx context.Context, snapshotID int64,
 		var (
 			scheme, host, suite, form string
 			adoptedAt, retiredAt      sql.NullInt64
+			candETag, candLastMod     sql.NullString
 		)
 		err = tx.QueryRowContext(ctx, `
-SELECT canonical_scheme, canonical_host, suite_path, anchor_form, adopted_at, retired_at
+SELECT canonical_scheme, canonical_host, suite_path, anchor_form, adopted_at, retired_at,
+       inrelease_etag, inrelease_lastmod
 FROM suite_snapshot
-WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adoptedAt, &retiredAt)
+WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adoptedAt, &retiredAt, &candETag, &candLastMod)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			return fmt.Errorf("CommitAdoption: snapshot %d not found", snapshotID)
@@ -578,18 +596,26 @@ SELECT current_snapshot_id FROM suite_freshness
 			return fmt.Errorf("CommitAdoption: read prior: %w", err)
 		}
 
-		// Step 6: upsert the pointer. Other suite_freshness columns are
-		// preserved on conflict — adoption flips the snapshot pointer
-		// only, not the freshness state. A suite row created here starts
-		// with its v7 client-interest stamp (last_requested_at = now, as
-		// in PutSuiteFreshness); an existing row keeps its stamp.
+		// Step 6: upsert the pointer and make the row describe the adopted
+		// anchor (spec C4 "Validators"): its validators become the
+		// candidate's, the pending-change stamp and the adoption failure
+		// record are cleared (spec C4, C7). check and success stamps and
+		// check_fail_count are freshness state and stay as they are. A suite
+		// row created here starts with its v7 client-interest stamp
+		// (last_requested_at = now, as in PutSuiteFreshness); an existing
+		// row keeps its stamp.
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO suite_freshness
-  (canonical_scheme, canonical_host, suite_path, current_snapshot_id, last_requested_at)
-VALUES (?, ?, ?, ?, ?)
+  (canonical_scheme, canonical_host, suite_path, current_snapshot_id, last_requested_at,
+   inrelease_etag, inrelease_lastmod)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
-  current_snapshot_id = excluded.current_snapshot_id`,
-			scheme, host, suite, snapshotID, now); err != nil {
+  current_snapshot_id      = excluded.current_snapshot_id,
+  inrelease_etag           = excluded.inrelease_etag,
+  inrelease_lastmod        = excluded.inrelease_lastmod,
+  inrelease_change_seen_at = NULL,
+  `+clearAdoptionFailureSet,
+			scheme, host, suite, snapshotID, now, candETag, candLastMod); err != nil {
 			return fmt.Errorf("CommitAdoption: flip pointer: %w", err)
 		}
 

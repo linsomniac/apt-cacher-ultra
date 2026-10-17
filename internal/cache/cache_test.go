@@ -2137,9 +2137,13 @@ func TestCommitAdoption_EmptyMembersStillFlips(t *testing.T) {
 }
 
 func TestCommitAdoption_PreservesExistingSuiteFreshnessColumns(t *testing.T) {
-	// The freshness checker writes last_check_at, validators, etc. before
-	// adoption fires. CommitAdoption must flip current_snapshot_id without
-	// clobbering those columns.
+	// The freshness checker writes last_check_at before adoption fires.
+	// CommitAdoption must flip current_snapshot_id without clobbering that
+	// freshness-check state. Validators are a different story (spec C4
+	// "Validators"): the flip makes the row describe the adopted anchor,
+	// so they become the candidate's — here, nil, because the candidate
+	// below sets none. Phase B's flip_state_test.go covers the
+	// candidate-has-validators case.
 	c := openCache(t)
 	ctx := context.Background()
 	now := nowUnix()
@@ -2172,8 +2176,8 @@ func TestCommitAdoption_PreservesExistingSuiteFreshnessColumns(t *testing.T) {
 	if sf.LastCheckAt == nil || *sf.LastCheckAt != now {
 		t.Errorf("last_check_at clobbered: %v", sf.LastCheckAt)
 	}
-	if sf.InReleaseETag == nil || *sf.InReleaseETag != etag {
-		t.Errorf("inrelease_etag clobbered: %v", sf.InReleaseETag)
+	if sf.InReleaseETag != nil {
+		t.Errorf("inrelease_etag = %v, want cleared to the candidate's (nil) validators", *sf.InReleaseETag)
 	}
 	if sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != id {
 		t.Errorf("current_snapshot_id not flipped: %v", sf.CurrentSnapshotID)

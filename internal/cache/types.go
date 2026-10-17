@@ -104,6 +104,10 @@ type SnapshotCandidate struct {
 	// inline and detached hash shapes and is derived from them;
 	// FormUnsigned is never derived and must be set explicitly.
 	Form AnchorForm
+	// ReleaseDate is the verified Release Date in Unix seconds (spec C5;
+	// 0 = missing or unparseable). nil leaves release_date NULL, which the
+	// Date rules treat as "no rule" (snapshots adopted before v7).
+	ReleaseDate *int64
 }
 
 // SnapshotMember mirrors the snapshot_member table — one (snapshot_id, path)
