@@ -709,7 +709,12 @@ func (c *Cache) RescheduleFailingAdoptions(ctx context.Context, now int64, offse
 		n = len(keys)
 		return nil
 	})
-	return n, err
+	if err != nil {
+		// The writer may still be running the op when submitWrite
+		// returns ctx.Err() or ErrClosed: never read n then.
+		return 0, err
+	}
+	return n, nil
 }
 ```
 
@@ -5777,15 +5782,15 @@ git commit -m "Replace the sequential T2 loop with a fair per-host scheduler"
 
 ### Task 11b: Slot-driven re-offer of queued suites
 
-Spec C4 (revision 5) "Adoption capacity" and "Admission bound". A scheduler check that ends `changed_queued` leaves its suite **waiting** in its host's queue (deduplicated, so no tick probes it again). Whenever an adoption releases a global or host slot, `admission` wakes the Run loop, which offers the freed capacity to the oldest waiting suite each host's turn allows, under the reserved-slot rule, by re-checking it at once with its cooldown bypassed (one anchor GET per offer). An offer that finds the suite busy (another goroutine holds its mutex: a client-triggered check, or an adoption still committing) keeps its place but is **held** until the next wake or tick; offering it again at once would spin a worker and the Run loop for as long as the mutex is held. Nothing new is persisted, no goroutine is added, and no new lock order appears; `tryAcquire` stays the only authority (the scheduler only peeks).
+Spec C4 (revision 5) "Adoption capacity" and "Admission bound". A scheduler check that ends `changed_queued` leaves its suite **waiting** in its host's queue (deduplicated, so no tick probes it again). Whenever an adoption releases a global or host slot, `admission` wakes the Run loop, which offers the freed capacity to the oldest waiting suite each host's turn allows, under the reserved-slot rule, by re-checking it at once with its cooldown bypassed (one anchor GET per offer). An offer that again finds no slot, or finds the suite busy (another goroutine holds its mutex: a client-triggered check, or an adoption still committing), keeps its place but is **held** until the next wake or tick; offering it again at once would spin a worker and the Run loop (and, for a lost offer, the upstream) for as long as the condition lasts. Nothing new is persisted, no goroutine is added, and no new lock order appears; `tryAcquire` stays the only authority (the scheduler only peeks).
 
 **Files:**
 - Modify: `internal/freshness/admission.go` (`freed` wake channel, `freeFor`, `wake`, waking `release`/`releaseHost`), `internal/freshness/freshness.go` (`checkOpts`, `checkReport`, `resultBusy`, `resultSkipped`, `isQueuedResult`; `Check` becomes a wrapper of `check`; `checkOutcome.report`; `opts` through `checkLockedSafe`/`checkLocked`; the cooldown bypass; the report set at each exit of the form checkers), `internal/freshness/scheduler.go` (`schedItem.waiting/signed`, `hostQueue.waiting`, `park`, `waiting`, `pop(admit)`, `checkDone`, the Run loop's offers, the worker, `checkRecovered`), `internal/freshness/metrics.go` (gauge `acu_freshness_waiting_for_slot`), `internal/freshness/scheduler_test.go` (helpers use `pop(admitAll)`), `internal/freshness/admission_test.go`
 - Create: `internal/freshness/reoffer_test.go`
 
 **Interfaces:**
-- Consumes: Task 9 (`admission`, `lease`, `mustAcquire`, `seedStaleAnchorAt`, `spawnAdoption`, `spawnRepair`, `planRepair`), Task 10 (`fetchCtx`, `checkDeadline`), Task 11 (`schedQueues`, `schedItem`, `hostQueue`, `Run`, `tick`, `drainTick`, `popAll`, `schedRow`), Task 6 rig, Task 4 `datedRelease`; `simtest.Upstream`, `simtest.Serve`, `simtest.After`, `simtest.OpenCache`.
-- Produces: `(*admission).freeFor(host string, signedCurrent bool) int`, `(*admission).wake()`, field `admission.freed chan struct{}`, `const admissionUnlimited`; `type checkOpts struct{ bypassCooldown bool }`; `type checkReport struct{ result string; signedCurrent bool }`; `resultBusy = "busy"`, `resultSkipped = "skipped"`; `isQueuedResult(string) bool`; `(*Checker).check(ctx, ref SuiteRef, opts checkOpts) checkReport`; `schedItem.waiting`, `schedItem.signed`, `schedItem.held`; `hostQueue.waiting []schedItem`; `(*schedQueues).park(item schedItem, signed bool)`; `(*schedQueues).finish(d checkDone)`; `(*schedQueues).unhold()`; `(*schedQueues).waiting() int`; `(*schedQueues).pop(admit func(host string, signed bool) bool) (schedItem, bool)`; `type checkDone struct{ item schedItem; report checkReport }`; `(*Checker).checkRecovered(ctx, item schedItem) checkReport`; gauge `freshnessWaitingForSlot`; test helpers `admitAll`, `admitNone`, and `startSched(t, cfg Config) (*Checker, func())` (moved here from Task 12, its first user is this task).
+- Consumes: Task 9 (`admission`, `lease`, `mustAcquire`, `seedStaleAnchorAt`, `spawnAdoption`, `spawnRepair`, `planRepair`), Task 10 (`fetchCtx`, `checkDeadline`) — `check()`'s body below keeps `Check`'s shape exactly as Tasks 9 and 10 left it (the `fetchCtx` split, the `spawnAdoption`/`spawnRepair` dispatch); only `opts` and the report are new, Task 11 (`schedQueues`, `schedItem`, `hostQueue`, `Run`, `tick`, `drainTick`, `popAll`, `schedRow`), Task 6 rig, Task 4 `datedRelease`; `simtest.Upstream`, `simtest.Serve`, `simtest.After`, `simtest.OpenCache`.
+- Produces: `(*admission).freeFor(host string, signedCurrent bool) int`, `(*admission).wake()`, field `admission.freed chan struct{}`, `const admissionUnlimited`; `type checkOpts struct{ bypassCooldown bool }`; `type checkReport struct{ result string; signedCurrent bool }`; `resultBusy = "busy"`, `resultSkipped = "skipped"`; `isQueuedResult(string) bool`; `(*Checker).check(ctx, ref SuiteRef, opts checkOpts) checkReport`; `schedItem.waiting`, `schedItem.signed`, `schedItem.held`; `hostQueue.waiting []schedItem`; `(*schedQueues).park(item schedItem, signed bool)`; `(*schedQueues).finish(d checkDone)` (a lost or busy offer re-parks held); `(*schedQueues).unhold()`; `(*schedQueues).waiting() int`; `(*schedQueues).pop(admit func(host string, signed bool) bool) (schedItem, bool)`; `type checkDone struct{ item schedItem; report checkReport }`; `(*Checker).checkRecovered(ctx, item schedItem) checkReport`; gauge `freshnessWaitingForSlot`; test helpers `admitAll`, `admitNone`, and `startSched(t, cfg Config) (*Checker, func())` (moved here from Task 12, its first user is this task).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5941,14 +5946,15 @@ func TestSchedQueues_ReparkKeepsItsPlace(t *testing.T) {
 	}
 }
 
-// Hosts with waiting suites take turns.
+// Hosts with waiting suites take turns. Two suites per host: the four
+// setup pops (a, b, a, b) leave the round-robin cursor back on a.
 func TestSchedQueues_RoundRobinAcrossWaitingHosts(t *testing.T) {
 	q := newSchedQueues()
 	one := int64(1)
-	for _, s := range [][2]string{{"a", "/1"}, {"a", "/2"}, {"b", "/1"}} {
+	for _, s := range [][2]string{{"a", "/1"}, {"a", "/2"}, {"b", "/1"}, {"b", "/2"}} {
 		q.enqueue(schedRow(s[0], s[1], &one, 0))
 	}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		it, ok := q.pop(admitNone)
 		if !ok {
 			t.Fatal("setup: nothing to park")
@@ -5956,12 +5962,12 @@ func TestSchedQueues_RoundRobinAcrossWaitingHosts(t *testing.T) {
 		q.park(it, true)
 	}
 	var got []string
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		it, _ := q.pop(admitAll)
 		got = append(got, it.ref.CanonicalHost+it.ref.SuitePath)
 		q.done(it)
 	}
-	if want := []string{"a/1", "b/1", "a/2"}; fmt.Sprint(got) != fmt.Sprint(want) {
+	if want := []string{"a/1", "b/1", "a/2", "b/2"}; fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("offer order = %v, want %v", got, want)
 	}
 }
@@ -5995,6 +6001,45 @@ func TestSchedQueues_BusyOfferIsHeldUntilTheNextWake(t *testing.T) {
 	q.unhold()
 	if it, _ := q.pop(admitAll); it.ref.SuitePath != "/1" || !it.waiting {
 		t.Fatalf("after unhold got %+v, want /1 waiting", it)
+	}
+}
+
+// An offer that again found no slot keeps its place but, like a busy
+// one, is not offered again before the next wake or tick: the pop loop
+// runs right after its result, and a peek that still said yes would
+// otherwise re-offer it in a loop.
+func TestSchedQueues_LostOfferIsHeldUntilTheNextWake(t *testing.T) {
+	q := newSchedQueues()
+	one := int64(1)
+	q.enqueue(schedRow("a", "/1", &one, 0))
+	it, _ := q.pop(admitNone)
+	q.finish(checkDone{item: it, report: checkReport{result: "changed_queued"}})
+	it, _ = q.pop(admitAll)
+	if !it.waiting {
+		t.Fatal("setup: the parked suite was not offered")
+	}
+	q.finish(checkDone{item: it, report: checkReport{result: "changed_queued"}})
+	if it, ok := q.pop(admitAll); ok {
+		t.Fatalf("a lost offer was re-offered before the next wake: %v", it.ref)
+	}
+	q.unhold()
+	if it, ok := q.pop(admitAll); !ok || it.ref.SuitePath != "/1" || !it.waiting {
+		t.Fatalf("after unhold got %+v, want /1 waiting", it)
+	}
+}
+
+// Only a queued result parks; every other result ends the suite's turn
+// (a deferred change waits for its C7 retry time, not for a slot).
+func TestSchedQueues_OnlyQueuedResultsPark(t *testing.T) {
+	one := int64(1)
+	for _, result := range []string{"changed_deferred", "failed", resultSkipped, "not_modified", "unchanged", "changed"} {
+		q := newSchedQueues()
+		q.enqueue(schedRow("a", "/1", &one, 0))
+		it, _ := q.pop(admitAll)
+		q.finish(checkDone{item: it, report: checkReport{result: result}})
+		if q.waiting() != 0 || q.len() != 0 {
+			t.Errorf("%s: waiting %d len %d, want 0 and 0", result, q.waiting(), q.len())
+		}
 	}
 }
 ```
@@ -6241,12 +6286,48 @@ func TestRun_BusyOfferIsRetriedAfterTheNextTick(t *testing.T) {
 		}
 	})
 }
+
+// A held suite is offered again on the next wake, not only on the next
+// tick: a release anywhere in the pool unholds it.
+func TestRun_HeldOfferIsRetriedOnTheNextWake(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := simtest.OpenCache(t)
+		up := simtest.NewUpstream()
+		members := newFakeFetcher()
+		seedStaleAnchorAt(t, c, "h", rigSuite)
+		pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
+		members.put("http://h"+rigSuite+"/main/binary-amd64/Packages", pkgs)
+		anchor := "http://h" + rigSuite + "/InRelease"
+		up.Set(anchor, simtest.Serve(datedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
+			HostLimiter: hostsem.New(8), MaxConcurrent: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		chk, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8),
+			Refresh: time.Hour, Cooldown: time.Hour, Adopter: ad, Logger: simtest.DiscardLogger()})
+		held := mustAcquire(t, chk.admission, "other", true)
+		time.Sleep(16 * time.Minute) // the first tick (15 min): the suite waits
+		v, _ := chk.locks.LoadOrStore(suiteKey("http", "h", rigSuite), &sync.Mutex{})
+		mu := v.(*sync.Mutex)
+		mu.Lock()      // a client-triggered check is running
+		held.release() // the offer finds the suite busy: held
+		time.Sleep(time.Minute)
+		mu.Unlock()
+		mustAcquire(t, chk.admission, "other", true).release() // a release elsewhere wakes the scheduler
+		time.Sleep(time.Minute)
+		if n := len(up.Calls(anchor)); n != 2 {
+			t.Fatalf("%d anchor GETs after the wake, want 2 (a held suite is offered on the next wake, not only on the next tick)", n)
+		}
+		stop()
+	})
+}
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test ./internal/freshness/ -run 'TestAdmission_FreeFor|TestAdmission_ReleaseWakes|TestSchedQueues_Park|TestSchedQueues_PopOffers|TestSchedQueues_Repark|TestSchedQueues_RoundRobinAcrossWaiting|TestSchedQueues_BusyOffer|TestCheck_ReportsResult|TestRun_Reoffers|TestRun_OfferThatLoses|TestRun_BusyOffer'`
-Expected: compile failure; Go stops at ten errors, which name among others `freeFor`, `freed`, `park`, `waiting`, `finish`, `check`, `checkOpts`, `resultBusy`.
+Run: `go test ./internal/freshness/ -run 'TestAdmission_FreeFor|TestAdmission_ReleaseWakes|TestSchedQueues_Park|TestSchedQueues_PopOffers|TestSchedQueues_Repark|TestSchedQueues_RoundRobinAcrossWaiting|TestSchedQueues_BusyOffer|TestSchedQueues_LostOffer|TestSchedQueues_OnlyQueuedResults|TestCheck_ReportsResult|TestRun_Reoffers|TestRun_OfferThatLoses|TestRun_BusyOffer|TestRun_HeldOffer'`
+Expected: compile failure naming, among others, `freeFor`, `freed`, `check`, `checkOpts`, `resultBusy` (Go stops at ten errors, so later names such as `park` or `finish` may not appear).
 
 - [ ] **Step 3: Admission peek and wake**
 
@@ -6282,7 +6363,8 @@ Add:
 // AIDEV-NOTE: a read-only peek for the scheduler's offers. tryAcquire is
 // the authority, so this arithmetic must mirror its refusal rule exactly
 // (TestAdmission_FreeForAgreesWithTryAcquire pins it). A wrong peek costs
-// one wasted GET, never a slot.
+// one wasted GET per wake or tick (the lost offer re-parks held), never a
+// slot and never a loop.
 func (a *admission) freeFor(host string, signedCurrent bool) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -6500,7 +6582,7 @@ func (h *hostQueue) empty() bool {
 }
 ```
 
-Extend the `schedQueues` AIDEV-NOTE's invariants to: "a suite key is in `queued` iff the suite sits in a class queue, or in its host's waiting list, or its check is in flight; a suite becomes waiting only through the result of a scheduler check and leaves only through the next one (never by a tick), and ticks never re-add a waiting suite (dedupe); a held waiter is offered again only after unhold, which the Run loop calls on every tick and every wake, so a held suite is never stranded and a busy suite is never re-offered in a loop; a host is in `order` iff it has a queued or waiting suite or a check in flight."
+Extend the `schedQueues` AIDEV-NOTE's invariants to: "a suite key is in `queued` iff the suite sits in a class queue, or in its host's waiting list, or its check is in flight; a suite becomes waiting only through the result of a scheduler check and leaves only through the next one (never by a tick), and ticks never re-add a waiting suite (dedupe); an offer that ends queued or busy re-parks held, and a held waiter is offered again only after unhold, which the Run loop calls on every tick and every wake, so a held suite is never stranded and no suite is re-offered in a loop; a host is in `order` iff it has a queued or waiting suite or a check in flight."
 
 Add:
 
@@ -6511,7 +6593,11 @@ Add:
 // was already waiting — an offer that found no slot keeps its place. The
 // host's check is over. The key stays in queued, so no tick re-adds it.
 func (q *schedQueues) park(item schedItem, signed bool) {
-	h := q.hosts[item.ref.CanonicalHost] // present: the item was in flight
+	h, ok := q.hosts[item.ref.CanonicalHost]
+	if !ok { // never: an in-flight item's host is kept; fail safe, not fatal
+		q.done(item)
+		return
+	}
 	h.inFlight = false
 	front := item.waiting
 	item.waiting, item.signed = true, signed
@@ -6523,14 +6609,20 @@ func (q *schedQueues) park(item schedItem, signed bool) {
 }
 
 // finish files a finished check (spec C4 slot-driven re-offer): a queued
-// result parks the suite to wait for a slot, keeping its place if it was
-// already waiting; an offer that found the suite busy (another goroutine
-// holds its mutex) parks it held, so it is not offered again until the
-// next wake or tick — re-offering at once would spin while the mutex is
+// result parks the suite to wait for a slot — keeping its place, held
+// until the next wake or tick, if it was already waiting (a lost offer);
+// an offer that found the suite busy (another goroutine holds its mutex)
+// parks it held too — re-offering at once would spin while the mutex is
 // held; any other result ends the suite's turn.
 func (q *schedQueues) finish(d checkDone) {
 	switch {
 	case isQueuedResult(d.report.result):
+		// An offer that again found no slot (someone took it between the
+		// peek and tryAcquire, or the peek was wrong) is held like a busy
+		// one: re-offered on the next wake or tick, never at once — the
+		// pop loop runs right after this done, and a peek that still says
+		// yes would otherwise re-offer it in a loop.
+		d.item.held = d.item.waiting
 		q.park(d.item, d.report.signedCurrent)
 	case d.item.waiting && d.report.result == resultBusy:
 		d.item.held = true
@@ -6654,6 +6746,10 @@ In `Run`, make `done` a `chan checkDone` and replace the dispatch loop and the s
 	offers := 0
 	admit := func(host string, signed bool) bool { return c.admission.freeFor(host, signed) > offers }
 	for {
+		// AIDEV-NOTE: the pop loop runs after every event, done included.
+		// A slot's wake can be received before the done of the check it
+		// refused (both channels are buffered and select picks at random);
+		// the suite is still offered, right after finish parks it.
 		for idle > 0 {
 			item, ok := q.pop(admit)
 			if !ok {
@@ -6669,6 +6765,7 @@ In `Run`, make `done` a `chan checkDone` and replace the dispatch loop and the s
 				return
 			}
 		}
+		freshnessWaitingForSlot.Set(float64(q.waiting()))
 		select {
 		case <-ctx.Done():
 			return
@@ -6685,7 +6782,6 @@ In `Run`, make `done` a `chan checkDone` and replace the dispatch loop and the s
 				offers--
 			}
 			q.finish(d)
-			freshnessWaitingForSlot.Set(float64(q.waiting()))
 		}
 	}
 ```
@@ -6715,7 +6811,7 @@ Expected: PASS.
 
 - [ ] **Step 7: Mutation check (do not commit)**
 
-One at a time, revert each after its run: (a) make `wake` a no-op → `TestRun_ReoffersWhenASlotFrees` FAILS (the re-check waits for the next tick); (b) make `park` always append → `TestSchedQueues_ReparkKeepsItsPlace` and `TestRun_OfferThatLosesTheSlotKeepsItsPlace` FAIL; (c) drop the reserved-slot line from `freeFor` → `TestAdmission_FreeForAgreesWithTryAcquire` FAILS; (d) ignore `opts.bypassCooldown` → `TestCheck_ReportsResultAndBypassesCooldown` and `TestRun_ReoffersWhenASlotFrees` FAIL; (e) never decrement `offers` → `TestRun_ReoffersWhenASlotFrees` FAILS (the second suite is never offered); (f) in `finish`, park a busy waiter without setting `held` → `go test -timeout 60s -run TestRun_BusyOfferIsRetriedAfterTheNextTick ./internal/freshness/` never finishes and is killed by the timeout (the spin stops the bubble's clock) and `TestSchedQueues_BusyOfferIsHeldUntilTheNextWake` FAILS; (g) drop both `q.unhold()` calls from `Run` → `TestRun_BusyOfferIsRetriedAfterTheNextTick` FAILS (one GET, not adopted: the suite is stranded); (h) make `finish` treat a busy waiter as done → `TestSchedQueues_BusyOfferIsHeldUntilTheNextWake` FAILS. Record each failure line in the commit message.
+One at a time, revert each after its run: (a) make `wake` a no-op → `TestRun_ReoffersWhenASlotFrees` FAILS (the re-check waits for the next tick); (b) make `park` always append → `TestSchedQueues_ReparkKeepsItsPlace` and `TestRun_OfferThatLosesTheSlotKeepsItsPlace` FAIL; (c) drop the reserved-slot line from `freeFor` → `TestAdmission_FreeForAgreesWithTryAcquire` FAILS (run with `-timeout`: without the hold on a lost offer this mutant also makes `TestSimCapacity_SlowDripAndDegraded` spin, so with the hold it must not); (d) ignore `opts.bypassCooldown` → `TestCheck_ReportsResultAndBypassesCooldown` and `TestRun_ReoffersWhenASlotFrees` FAIL; (e) never decrement `offers` → `TestRun_ReoffersWhenASlotFrees` FAILS (the second suite is never offered); (f) in `finish`, park a busy waiter without setting `held` → `go test -timeout 60s -run TestRun_BusyOfferIsRetriedAfterTheNextTick ./internal/freshness/` never finishes and is killed by the timeout (the spin stops the bubble's clock) and `TestSchedQueues_BusyOfferIsHeldUntilTheNextWake` FAILS; (g) drop both `q.unhold()` calls from `Run` → `TestRun_BusyOfferIsRetriedAfterTheNextTick` FAILS (one GET, not adopted: the suite is stranded); (h) make `finish` treat a busy waiter as done → `TestSchedQueues_BusyOfferIsHeldUntilTheNextWake` FAILS; (i) drop only the `q.unhold()` of the `freed` case → `TestRun_HeldOfferIsRetriedOnTheNextWake` FAILS; (j) drop `d.item.held = d.item.waiting` from `finish` → `TestSchedQueues_LostOfferIsHeldUntilTheNextWake` FAILS; (k) make `isQueuedResult` also accept `changed_deferred` → `TestSchedQueues_OnlyQueuedResultsPark` FAILS. Record each failure line in the commit message.
 
 - [ ] **Step 8: Commit**
 
@@ -7220,7 +7316,7 @@ Expected: PASS, each simulation under 5 s. If one is slower, coarsen its interva
 
 - [ ] **Step 3: Mutation check (do not commit)**
 
-Temporarily change `classOf` to return `classHealthy` for every suite (as if the streak lived in memory), run `go test -run TestSimScheduler_FiveHundredStallingOneHealthy ./internal/freshness/`, and confirm it FAILS; revert. Then swap the order of the `classHealthy` and `classNeverChecked` constants (never-checked suites first) and confirm the same simulation FAILS at the restart bound; revert. Then, one at a time against `go test -run TestSimCapacity_SlowDripAndDegraded ./internal/freshness/`: make `admission.wake` a no-op (FAILS on (1) or (4): admissions wait for ticks); drop the reserved-slot rule from `tryAcquire` and `freeFor` (FAILS on (2): `maxStall == 2`); make `enqueue` ignore the dedupe for waiting suites (FAILS on (3)); revert each. Record every failure line in the commit message.
+Temporarily change `classOf` to return `classHealthy` for every suite (as if the streak lived in memory), run `go test -run TestSimScheduler_FiveHundredStallingOneHealthy ./internal/freshness/`, and confirm it FAILS; revert. Then swap the order of the `classHealthy` and `classNeverChecked` constants (never-checked suites first) and confirm the same simulation FAILS at the restart bound; revert. Then, one at a time against `go test -run TestSimCapacity_SlowDripAndDegraded ./internal/freshness/`: make `admission.wake` a no-op (FAILS on (1) or (4): admissions wait for ticks); drop the reserved-slot rule from `tryAcquire` and `freeFor` (FAILS on (1): the signed suites wait behind both drips; (2) would fail too); make `enqueue` ignore the dedupe for waiting suites (FAILS on (3)); revert each. Record every failure line in the commit message.
 
 - [ ] **Step 4: Commit**
 

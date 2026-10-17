@@ -514,10 +514,10 @@ releases its global or host slot, the scheduler offers the freed capacity to
 waiting suites — hosts in round-robin order, oldest first within a host,
 only suites the freed capacity admits under the reserved-slot rule below —
 by re-checking the offered suite at once, bypassing its cooldown (one anchor
-GET per offer). A re-check that again finds no slot keeps its place at the
-head; one that finds the suite busy (its mutex held by a client check or a
-committing adoption) keeps its place but waits for the next release or tick;
-any other result ends the wait (an *unknown* end sends the suite through the
+GET per offer). A re-check that again finds no slot, or finds the suite
+busy (its mutex held by a client check or a committing adoption), keeps its
+place at the head and waits for the next release or tick; any other result
+ends the wait (an *unknown* end sends the suite through the
 failing class and its backoff). Waiting state is in memory: after a restart
 the first tick rebuilds it from the stale `last_success_at` (one GET per
 queued suite). A client-triggered check that is refused leaves the suite
