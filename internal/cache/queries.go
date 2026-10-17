@@ -201,23 +201,56 @@ ON CONFLICT(hash) DO UPDATE
 	})
 }
 
-// GetSuiteFreshness returns the suite_freshness row for the suite, or
-// ErrNotFound when no check has ever been recorded.
-func (c *Cache) GetSuiteFreshness(ctx context.Context, scheme, host, suitePath string) (*SuiteFreshness, error) {
-	const q = `
-SELECT canonical_scheme, canonical_host, suite_path,
-       last_check_at, last_success_at,
-       inrelease_etag, inrelease_lastmod, inrelease_change_seen_at,
-       current_snapshot_id
-FROM suite_freshness
-WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
-	var s SuiteFreshness
-	err := c.db.QueryRowContext(ctx, q, scheme, host, suitePath).Scan(
+// suiteFreshnessColumns is the column list every suite_freshness reader
+// scans, in (*SuiteFreshness).scanDest order.
+//
+// AIDEV-NOTE: keep in lockstep with scanDest. Every column is nullable or
+// defaulted, so a column added to one list and not the other shifts the
+// following fields silently instead of failing.
+var suiteFreshnessColumns = []string{
+	"canonical_scheme", "canonical_host", "suite_path",
+	"last_check_at", "last_success_at",
+	"inrelease_etag", "inrelease_lastmod", "inrelease_change_seen_at",
+	"current_snapshot_id", "last_requested_at", "check_fail_count",
+	"adoption_fail_hash", "adoption_fail_reason", "adoption_fail_count",
+	"adoption_fail_first_at", "adoption_fail_last_at", "adoption_next_retry_at",
+	"adoption_fail_etag", "adoption_fail_lastmod",
+}
+
+// suiteFreshnessSelect renders suiteFreshnessColumns for a SELECT list,
+// qualified by alias when it is not empty.
+func suiteFreshnessSelect(alias string) string {
+	cols := make([]string, len(suiteFreshnessColumns))
+	for i, c := range suiteFreshnessColumns {
+		if alias != "" {
+			c = alias + "." + c
+		}
+		cols[i] = c
+	}
+	return strings.Join(cols, ", ")
+}
+
+// scanDest returns Scan destinations matching suiteFreshnessColumns.
+func (s *SuiteFreshness) scanDest() []any {
+	return []any{
 		&s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
 		&s.LastCheckAt, &s.LastSuccessAt,
 		&s.InReleaseETag, &s.InReleaseLastMod, &s.InReleaseChangeSeenAt,
-		&s.CurrentSnapshotID,
-	)
+		&s.CurrentSnapshotID, &s.LastRequestedAt, &s.CheckFailCount,
+		&s.AdoptionFailHash, &s.AdoptionFailReason, &s.AdoptionFailCount,
+		&s.AdoptionFailFirstAt, &s.AdoptionFailLastAt, &s.AdoptionNextRetryAt,
+		&s.AdoptionFailETag, &s.AdoptionFailLastMod,
+	}
+}
+
+// GetSuiteFreshness returns the suite_freshness row for the suite, or
+// ErrNotFound when no check has ever been recorded.
+func (c *Cache) GetSuiteFreshness(ctx context.Context, scheme, host, suitePath string) (*SuiteFreshness, error) {
+	q := `SELECT ` + suiteFreshnessSelect("") + `
+FROM suite_freshness
+WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
+	var s SuiteFreshness
+	err := c.db.QueryRowContext(ctx, q, scheme, host, suitePath).Scan(s.scanDest()...)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, ErrNotFound
@@ -251,11 +284,7 @@ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
 //     "current" snapshot, but the LEFT JOIN doesn't filter on
 //     adopted_at to keep the query simple).
 func (c *Cache) ListSuitesWithAdoption(ctx context.Context) ([]SuiteWithAdoption, error) {
-	const q = `
-SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path,
-       sf.last_check_at, sf.last_success_at,
-       sf.inrelease_etag, sf.inrelease_lastmod, sf.inrelease_change_seen_at,
-       sf.current_snapshot_id, ss.adopted_at
+	q := `SELECT ` + suiteFreshnessSelect("sf") + `, ss.adopted_at, ss.anchor_form
 FROM suite_freshness sf
 LEFT JOIN suite_snapshot ss
        ON ss.snapshot_id = sf.current_snapshot_id`
@@ -267,14 +296,12 @@ LEFT JOIN suite_snapshot ss
 	var out []SuiteWithAdoption
 	for rows.Next() {
 		var s SuiteWithAdoption
-		if err := rows.Scan(
-			&s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
-			&s.LastCheckAt, &s.LastSuccessAt,
-			&s.InReleaseETag, &s.InReleaseLastMod, &s.InReleaseChangeSeenAt,
-			&s.CurrentSnapshotID, &s.CurrentAdoptedAt,
-		); err != nil {
+		var form sql.NullString
+		dest := append(s.scanDest(), &s.CurrentAdoptedAt, &form)
+		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("ListSuitesWithAdoption scan: %w", err)
 		}
+		s.CurrentAnchorForm = form.String
 		out = append(out, s)
 	}
 	if err := rows.Err(); err != nil {
@@ -712,12 +739,7 @@ SELECT canonical_host, path, is_metadata, request_count, last_requested_at
 // phase pushes this number into the thousands, the caller should switch
 // to a chunked scan keyed on (canonical_scheme, canonical_host, suite_path).
 func (c *Cache) ListSuites(ctx context.Context) ([]SuiteFreshness, error) {
-	const q = `
-SELECT canonical_scheme, canonical_host, suite_path,
-       last_check_at, last_success_at,
-       inrelease_etag, inrelease_lastmod, inrelease_change_seen_at,
-       current_snapshot_id
-FROM suite_freshness`
+	q := `SELECT ` + suiteFreshnessSelect("") + ` FROM suite_freshness`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("ListSuites: %w", err)
@@ -726,12 +748,7 @@ FROM suite_freshness`
 	var out []SuiteFreshness
 	for rows.Next() {
 		var s SuiteFreshness
-		if err := rows.Scan(
-			&s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
-			&s.LastCheckAt, &s.LastSuccessAt,
-			&s.InReleaseETag, &s.InReleaseLastMod, &s.InReleaseChangeSeenAt,
-			&s.CurrentSnapshotID,
-		); err != nil {
+		if err := rows.Scan(s.scanDest()...); err != nil {
 			return nil, fmt.Errorf("ListSuites scan: %w", err)
 		}
 		out = append(out, s)
@@ -1020,27 +1037,31 @@ func (c *Cache) PutSuiteFreshness(ctx context.Context, s SuiteFreshness) error {
 	// AIDEV-NOTE: last_requested_at (v7) is the suite's client-interest
 	// stamp. A new row starts "requested now"; this writer never updates
 	// it (phase D's TouchSuite owns updates), so a scheduler write cannot
-	// keep an idle suite alive.
+	// keep an idle suite alive. check_fail_count (spec C4) is written on
+	// every call: each check result sets or resets the streak in the same
+	// statement that bumps last_check_at. The adoption failure record
+	// (adoption_fail_*) is never written here (spec C7).
 	const q = `
 INSERT INTO suite_freshness
   (canonical_scheme, canonical_host, suite_path,
    last_check_at, last_success_at,
    inrelease_etag, inrelease_lastmod, inrelease_change_seen_at,
-   last_requested_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+   check_fail_count, last_requested_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
   last_check_at            = excluded.last_check_at,
   last_success_at          = excluded.last_success_at,
   inrelease_etag           = excluded.inrelease_etag,
   inrelease_lastmod        = excluded.inrelease_lastmod,
-  inrelease_change_seen_at = excluded.inrelease_change_seen_at`
+  inrelease_change_seen_at = excluded.inrelease_change_seen_at,
+  check_fail_count         = excluded.check_fail_count`
 	now := nowUnix()
 	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, q,
 			s.CanonicalScheme, s.CanonicalHost, s.SuitePath,
 			s.LastCheckAt, s.LastSuccessAt,
 			s.InReleaseETag, s.InReleaseLastMod, s.InReleaseChangeSeenAt,
-			now)
+			s.CheckFailCount, now)
 		if err != nil {
 			return fmt.Errorf("PutSuiteFreshness: %w", err)
 		}

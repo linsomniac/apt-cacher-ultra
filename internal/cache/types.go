@@ -41,6 +41,29 @@ type SuiteFreshness struct {
 	InReleaseLastMod      *string
 	InReleaseChangeSeenAt *int64 // diagnostic; non-nil = upstream is ahead
 	CurrentSnapshotID     *int64 // SPEC2 §4.3.1: NULL until first adoption
+
+	// v7 columns (spec §6). LastRequestedAt is the suite's client-interest
+	// stamp; only phase D's TouchSuite and the row-creating writers set it.
+	LastRequestedAt *int64
+	// CheckFailCount is the streak of consecutive freshness checks that
+	// ended unknown (spec C4). PutSuiteFreshness writes it; the scheduler
+	// reads it to order and back off suites.
+	CheckFailCount int64
+	// Adoption failure record (spec C7): the content key and reason of the
+	// latest failed or refused adoption, the streak since the last success,
+	// the next retry time, and the failing content's validators.
+	//
+	// AIDEV-NOTE: only RecordAdoptionFailure, ClearAdoptionFailure,
+	// SetAdoptionNextRetry, RescheduleFailingAdoptions and CommitAdoption's
+	// flip write these columns. PutSuiteFreshness never does.
+	AdoptionFailHash    *string
+	AdoptionFailReason  *string
+	AdoptionFailCount   int64
+	AdoptionFailFirstAt *int64
+	AdoptionFailLastAt  *int64
+	AdoptionNextRetryAt *int64
+	AdoptionFailETag    *string
+	AdoptionFailLastMod *string
 }
 
 // AnchorForm is how a snapshot's Release metadata was anchored (spec C5).
@@ -300,6 +323,9 @@ type HotURLPath struct {
 type SuiteWithAdoption struct {
 	SuiteFreshness
 	CurrentAdoptedAt *int64 // unix seconds; nil when current_snapshot_id is NULL or no matching suite_snapshot row exists
+	// CurrentAnchorForm is the current snapshot's anchor_form ("" when the
+	// suite has no current snapshot).
+	CurrentAnchorForm string
 }
 
 // HotSetEntry is one (.deb path, declared sha256) tuple that the SPEC3
