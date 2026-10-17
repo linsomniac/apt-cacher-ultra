@@ -179,5 +179,13 @@ func (c *Cache) RescheduleFailingAdoptions(ctx context.Context, now int64, offse
 		n = len(keys)
 		return nil
 	})
-	return n, err
+	// AIDEV-NOTE: on a ctx/close path, submitWrite can return before the
+	// writer goroutine finishes running op (cache.go submitWrite: the
+	// ctx.Done()/closeCh branches return without waiting for req.res) —
+	// the writer may still be assigning n with no happens-before edge to
+	// this read, a data race. Never read n after a non-nil err.
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
