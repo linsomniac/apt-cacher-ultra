@@ -1,0 +1,252 @@
+package freshness
+
+import (
+	"bufio"
+	"bytes"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// maxReleaseDateSkew is apt's Acquire::Max-FutureTime default: a Release
+// dated further ahead than this is "not valid yet" (spec C5).
+const maxReleaseDateSkew = 10 * time.Second
+
+// releaseDate returns the Date field of verified Release text in Unix
+// seconds, or 0 when the field is missing or apt would not parse it (apt
+// treats both as 0: debmetaindex.cc).
+func releaseDate(text []byte) int64 {
+	scanner := bufio.NewScanner(bytes.NewReader(text))
+	scanner.Buffer(make([]byte, 0, scanBufCap), scanBufCap)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" || line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
+		key, val, ok := strings.Cut(line, ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), "Date") {
+			continue
+		}
+		if t, ok := parseAptDate(strings.TrimSpace(val)); ok {
+			return t
+		}
+		return 0
+	}
+	return 0
+}
+
+// parseAptDate ports apt's RFC1123StrToTime (apt-pkg/contrib/strutl.cc,
+// apt 2.x/3.x). It accepts, in UTC only:
+//
+//	Sun, 06 Nov 1994 08:49:37 GMT   RFC 1123; zone GMT, UTC, Z or a zero numeric offset
+//	Sun Nov  6 08:49:37 1994        asctime
+//	Sunday, 06-Nov-94 08:49:37 GMT  RFC 850; the two-digit year is 19yy
+//
+// AIDEV-NOTE: a port, quirks included, so the cache refuses exactly what
+// apt refuses: the weekday is checked only by its first three letters and
+// never against the date; an unknown month name means January (MonthConv);
+// text after the seconds is ignored (strptime); a day past the month's end
+// rolls over (timegm). One deliberate divergence: apt reads numeric tokens
+// with istream >>, which stops at the first non-digit, so a token such as
+// "6," parses there; here numeric tokens must be all digits, and an RFC 850
+// day above 65535 is rejected instead of wrapping. Real Release files never
+// reach either difference. TestParseAptDate pins the behaviour.
+func parseAptDate(s string) (int64, bool) {
+	f := strings.Fields(s)
+	if len(f) == 0 {
+		return 0, false
+	}
+	wd := strings.ToLower(f[0])
+	if len(wd) < 3 || !isAptWeekday(wd[:3]) {
+		return 0, false
+	}
+	var (
+		year, month, day int
+		timespec, zone   string
+		ok               bool
+	)
+	switch {
+	case len(wd) == 3: // asctime: Sun Nov  6 08:49:37 1994
+		if len(f) != 5 {
+			return 0, false
+		}
+		month = aptMonth(f[1])
+		if day, ok = aptDigits(f[2]); !ok {
+			return 0, false
+		}
+		timespec = f[3]
+		if year, ok = aptSignedInt(f[4]); !ok {
+			return 0, false
+		}
+		zone = "UTC"
+	case len(wd) == 4: // RFC 1123: Sun, 06 Nov 1994 08:49:37 GMT
+		if wd[3] != ',' || len(f) != 6 {
+			return 0, false
+		}
+		if day, ok = aptDigits(f[1]); !ok {
+			return 0, false
+		}
+		month = aptMonth(f[2])
+		if year, ok = aptSignedInt(f[3]); !ok {
+			return 0, false
+		}
+		timespec, zone = f[4], f[5]
+	default: // RFC 850: Sunday, 06-Nov-94 08:49:37 GMT
+		if wd[len(wd)-1] != ',' || len(f) != 4 {
+			return 0, false
+		}
+		parts := strings.Split(f[1], "-")
+		if len(parts) != 3 {
+			return 0, false
+		}
+		if day, ok = aptStoi(parts[0]); !ok || day < 0 || day > 65535 {
+			return 0, false
+		}
+		yy, ok := aptStoi(parts[2])
+		if !ok {
+			return 0, false
+		}
+		year = 1900 + yy
+		month = aptMonth(parts[1])
+		timespec, zone = f[2], f[3]
+	}
+	if !aptUTCZone(zone) {
+		return 0, false
+	}
+	// strptime("%Y-%m-%d %H:%M:%S") over "%.4d-%.2d-%.2d <timespec>":
+	// %Y takes 0..9999 and %d 1..31.
+	if year < 0 || year > 9999 || day < 1 || day > 31 {
+		return 0, false
+	}
+	h, mi, sec, ok := aptClock(timespec)
+	if !ok {
+		return 0, false
+	}
+	return time.Date(year, time.Month(month), day, h, mi, sec, 0, time.UTC).Unix(), true
+}
+
+func isAptWeekday(s string) bool {
+	switch s {
+	case "sun", "mon", "tue", "wed", "thu", "fri", "sat":
+		return true
+	}
+	return false
+}
+
+// aptMonth is apt's MonthConv plus one: it looks at up to three letters
+// and defaults to January.
+func aptMonth(m string) int {
+	at := func(i int) byte {
+		if i >= len(m) {
+			return 0
+		}
+		c := m[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		return c
+	}
+	switch at(0) {
+	case 'a':
+		if at(1) == 'p' {
+			return 4
+		}
+		return 8
+	case 'd':
+		return 12
+	case 'f':
+		return 2
+	case 'j':
+		if at(1) == 'a' {
+			return 1
+		}
+		if at(2) == 'n' {
+			return 6
+		}
+		return 7
+	case 'm':
+		if at(2) == 'r' {
+			return 3
+		}
+		return 5
+	case 'n':
+		return 11
+	case 'o':
+		return 10
+	case 's':
+		return 9
+	}
+	return 1
+}
+
+// aptDigits reads an unsigned short token: digits only, at most 65535.
+func aptDigits(s string) (int, bool) {
+	if s == "" || len(s) > 5 {
+		return 0, false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v > 65535 {
+		return 0, false
+	}
+	return v, true
+}
+
+// aptSignedInt reads a signed int token (optional sign, digits).
+func aptSignedInt(s string) (int, bool) {
+	v, err := strconv.Atoi(s)
+	return v, err == nil
+}
+
+// aptStoi is std::stoi with "the whole string was consumed": optional
+// sign, at least one digit, nothing else.
+func aptStoi(s string) (int, bool) {
+	return aptSignedInt(s)
+}
+
+// aptUTCZone accepts GMT, UTC, Z, or any numeric zone equal to zero.
+func aptUTCZone(z string) bool {
+	switch z {
+	case "GMT", "UTC", "Z":
+		return true
+	}
+	v, ok := aptStoi(z)
+	return ok && v == 0
+}
+
+// aptClock parses strptime's "%H:%M:%S": one or two digits each, hour
+// 0..23, minute 0..59, second 0..61; anything after the seconds is
+// ignored, as strptime ignores it.
+func aptClock(ts string) (h, m, s int, ok bool) {
+	i := 0
+	num := func(max int) (int, bool) {
+		start, v := i, 0
+		for i < len(ts) && i-start < 2 && ts[i] >= '0' && ts[i] <= '9' {
+			v = v*10 + int(ts[i]-'0')
+			i++
+		}
+		return v, i > start && v <= max
+	}
+	colon := func() bool {
+		if i < len(ts) && ts[i] == ':' {
+			i++
+			return true
+		}
+		return false
+	}
+	var good bool
+	if h, good = num(23); !good || !colon() {
+		return 0, 0, 0, false
+	}
+	if m, good = num(59); !good || !colon() {
+		return 0, 0, 0, false
+	}
+	if s, good = num(61); !good {
+		return 0, 0, 0, false
+	}
+	return h, m, s, true
+}
