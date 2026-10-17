@@ -4,3 +4,4 @@ contributions:
 Nicholas Scott (@kband)
 Sam Parkes (@Sam-Parkes)
 @sdh91
+Venkat (@venkatamutyala) -- flat repository support is based on their PR #8
