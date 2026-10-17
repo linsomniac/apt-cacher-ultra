@@ -1,6 +1,6 @@
 # Flat repositories, eager adoption, and suite lifecycle — design
 
-- **Date:** 2026-09-27 (revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
+- **Date:** 2026-09-27 (revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
 - **Status:** draft for maintainer review
 - **Branch:** `feature/flat-repos` (from `main` @ 536a1ab)
 - **Origin:** reimplementation of the problem reported in PR #8 ("Refresh flat
@@ -289,7 +289,8 @@ row:
   marker for a suite that already has a row but creates none: apt fetches it
   only after `Release`). The new row leaves `last_check_at` NULL and the
   handler fires T1 once the response is written, so eager adoption starts
-  within seconds of first contact (subject to slots);
+  within seconds of first contact when a slot is free, else as soon as one
+  is released (C4 admission);
 - with no adopter (Phase 1): `<suite>/InRelease` only, stamping
   `last_check_at = last_success_at = now` and the miss validators — today's
   seed, byte for byte, and no T1.
@@ -427,6 +428,21 @@ that one time; afterwards the stalled ones sit in the failing class.
 Failing suites share what is left of their host's turns, slowed by the
 backoff; they cannot starve healthy ones anywhere.
 
+**Admission bound** (documented, simulation-tested). Admission is
+work-conserving: while any suite waits for a slot it could take, that slot
+stays idle for at most one check (*D*) plus one host turn (⌈*H*/4⌉ × *D*).
+Queued suites therefore pass through the pool at its throughput: *N* suites
+queued behind *k* slots they may use are all admitted within one tick +
+⌈*N*/*k*⌉ × (*A* + *D*), where *A* — `adoption.max_duration` plus the commit
+bound — is the longest a slot is held. With the default pool of two and a
+first adoption holding the general slot, signed suites go through the
+reserved slot back to back. First adoptions (and unsigned ones) run only
+when the pool is otherwise empty, so a burst of them is serial;
+`max_concurrent_adoptions = 3` lets two run at once. An offered re-check
+uses its host's turn like any check, so *n* in the latency bound also counts
+the host's waiting suites offered before *S* (at most one per adoption on
+that host).
+
 **Response classification** (defined once, used everywhere):
 
 | Class | Responses |
@@ -491,9 +507,22 @@ Before spawning the goroutine the check `TryAcquire`s the global slot
 (`max_concurrent_adoptions`) and a per-canonical-host slot (one per host). If
 either is busy it spawns nothing, records `result = changed_queued` (or
 `first_adoption_queued`; repair/reconcile simply skip until the next
-unchanged tick) and does **not** advance `last_success_at`, so the scheduler
-retries it in its rotation turn (above): admission rotates through queued
-suites instead of favouring scan order. When `max_concurrent_adoptions ≥ 2`, the last free
+unchanged tick) and does **not** advance `last_success_at`. A scheduler
+check that ends queued leaves its suite **waiting for a slot** in its host's
+queue (still deduplicated: no tick probes it again). Whenever an adoption
+releases its global or host slot, the scheduler offers the freed capacity to
+waiting suites — hosts in round-robin order, oldest first within a host,
+only suites the freed capacity admits under the reserved-slot rule below —
+by re-checking the offered suite at once, bypassing its cooldown (one anchor
+GET per offer). A re-check that again finds no slot keeps its place at the
+head; one that finds the suite busy (its mutex held by a client check or a
+committing adoption) keeps its place but waits for the next release or tick;
+any other result ends the wait (an *unknown* end sends the suite through the
+failing class and its backoff). Waiting state is in memory: after a restart
+the first tick rebuilds it from the stale `last_success_at` (one GET per
+queued suite). A client-triggered check that is refused leaves the suite
+due; the next tick parks it. Client-triggered checks may take a freed slot
+before the scheduler's offer; they are the same work. When `max_concurrent_adoptions ≥ 2`, the last free
 global slot is reserved for suites that have a signed current snapshot
 (security updates are never starved by first or unsigned adoptions). The
 host slot is released when the member pipeline ends (before the C8 barrier);
@@ -506,7 +535,8 @@ progress. `POST /reconcile` answers 409 when no slot is free.
 **Validators.** `suite_freshness` validators always describe the current
 snapshot's anchor (set in the flip transaction), or the `url_path` anchor
 when unadopted. They are never written from a changed or deferred response
-(C7 keeps its own).
+(C7 keeps its own). A suite waiting for a slot is not probed until a slot is
+offered, so this rule costs one GET per offer, not one per tick.
 
 **`inrelease_change_seen_at`** is set only when NULL (first sight of a
 pending change), cleared in the flip transaction and on
@@ -950,8 +980,10 @@ their directory, which this design does not do.
 `flat_host_root_unsupported`, `legacy_snapshot_quarantined`,
 `legacy_trust_audit_progress`, `legacy_trust_audit_deferred`,
 `legacy_trust_audit_completed`; new fields `anchor_form`, `flat`,
-`snapshot_displaced`. New metrics are host-labelled or unlabelled (no suite
-labels) and are added to the metrics inventory comments in
+`snapshot_displaced`. New metrics include the unlabelled gauges
+`acu_adoption_failing_suites` (C7) and `acu_freshness_waiting_for_slot`
+(suites waiting for an adoption slot, C4). New metrics are host-labelled or
+unlabelled (no suite labels) and are added to the metrics inventory comments in
 `internal/freshness/metrics.go` and `internal/handler/metrics.go`.
 `gc_run_complete` and `LastRunSummary` gain `retired_reaped`.
 
@@ -1198,9 +1230,16 @@ files), in phase D.
   both ways incl. detached → inline and the two-observation rule;
   `anchor_absent` visible and not silent; anchorless refresh (IMS, sniff
   rejection, 404 deletes, request counts preserved); capacity: 2 slow-drip
-  suites + 20 normal suites + 1 degraded suite → every normal suite adopts
-  within `max_duration + cooldown`, the degraded suite's checks continue,
-  goroutines ≤ cap + constant, the reserved slot serves a signed suite;
+  first adoptions + 20 normal signed suites changing at once (one-minute
+  adoptions) + 1 degraded suite, pool of 2 → at most one first adoption at a
+  time (the reserved slot serves the signed suites); the signed suites adopt
+  back to back — consecutive admissions ≤ 1 min + *D* apart, all adopted
+  within one tick + 20 min + *D* — and each costs at most two anchor GETs
+  before it adopts; both drips end `timed_out`; the degraded suite's checks
+  continue; goroutines ≤ workers + cap + constant; at unit level a queued
+  suite is not probed by ticks while it waits, is re-checked within *D* of
+  its slot's release with the cooldown bypassed, and a busy offer neither
+  spins nor loses its place;
   clock steps ±2 h/±30 d with liveness asserts;
   `TestCheck_NoAdopter_ChangeOnlyLogged` (setup seeds the row); scheduler
   fairness: timing-out anchor probes on one host ahead of healthy suites on
@@ -1320,7 +1359,7 @@ item depends on a later phase.
 | Phase | Items | Definition of Done (highlights) |
 |---|---|---|
 | **A. Foundations** | v7 migration (final schema, Go backfill step, trigger) and Go types incl. the `SingleAnchorHash`/`Form`/`ReleaseDate`/`RetiredAt` fields; `aptpath` and `wallclock` packages; handler fetch seam; C1 complete (changes `+`/`~` request lines to apt's form); C2 `dists/` tightening (no flat grammar yet); `%w` wraps and sentinels; R-1; I-1 recover (logging) in adoption, repair, reconcile, T1 and scheduler goroutines; clock-step rule in existing gates; synctest harness + smoke simulation; inline verification fails closed; signed-seen markers written at adoption and by the startup marker pass (with the `InRelease`/`Release.gpg` sniffs and `MarkSignedSeenBatch`); §6.1 legacy trust audit with quarantine. | v6-fixture migration test; no-SQLite-clock test; C1 tables and production-fixture round trip; existing suite green except enumerated `SuitePath` tightening cases and the `require_signature = false` passthrough tests; R-1 and I-1 fixtures fail on main, pass here; polluted-v6 audit test (current and displaced, plain text, interruption); 30-day smoke simulation < 5 s under `-race`. |
-| **B. Retry discipline and capacity** | C7 record, gate, schedule, refusal states, restart; `Date` rules; validators at commit; `change_seen` semantics; capacity (TryAcquire global + host slots for adoption, repair and reconcile; reserved slot; `max_duration`; `WithoutCancel` commit; queued results); panic recorded; fair concurrent scheduler (C4: per-host queues, 4 workers, one check per host turn, healthy → never-checked → failing, FIFO, persisted failure streak and backoff); admin, gauge, logs. | lim1 reproduction bound; T1-storm test; 30-day simulation incl. flapping mirror and clock step (liveness + bounds); slow-drip + degraded-suite capacity simulation exercising both check and adoption admission; scheduler latency-bound simulations with stalling (not refusing) responders: H = 8 with n = 3 healthy suites ahead; 500 failing + 1 healthy suite on one host, repeated after a simulated restart; "lagging" visible. |
+| **B. Retry discipline and capacity** | C7 record, gate, schedule, refusal states, restart; `Date` rules; validators at commit; `change_seen` semantics; capacity (TryAcquire global + host slots for adoption, repair and reconcile; reserved slot; `max_duration`; `WithoutCancel` commit; queued results with slot-driven re-offer); panic recorded; fair concurrent scheduler (C4: per-host queues, 4 workers, one check per host turn, healthy → never-checked → failing, FIFO, persisted failure streak and backoff); admin, gauge, logs. | lim1 reproduction bound; T1-storm test; 30-day simulation incl. flapping mirror and clock step (liveness + bounds); slow-drip + degraded-suite capacity simulation exercising both check and adoption admission; scheduler latency-bound simulations with stalling (not refusing) responders: H = 8 with n = 3 healthy suites ahead; 500 failing + 1 healthy suite on one host, repeated after a simulated restart; "lagging" visible. |
 | **C. Flip consistency** | C8 flipgate with the hold token, handler anchor hook, retained by-hash (SHA256, non-retired only), monotonic `Last-Modified`. | Straddle test fails on the B tip, passes here; overlapping-hold trace in a shared-queue simulation; five busy suites flipping within 0.1 s (holds never overlap, at most three hold, the rest commit unheld within 60 s + 20 s and are counted, zero straddles for held suites); busy-suite, cross-suite and slow-reader tests; hold ≤ 20 s; chaos straddles = 0; `flip_quiet_period = 0s` keeps existing tests unchanged. |
 | **D. Creation bounds and signals** | C3 in full: sniffs, `CreateSuite` with caps (anchor rows and markers before the body, including first contact), eviction and rejection cache, legacy onboarding, adoption-disabled seed parity, UPDATE-only writers, I-4 (both sides), touch (anchors, vouched `.deb`s), signed-seen marker in the miss path's writer operation; `Release` and flat-index sniffs; `clearsignedFixture()` migration. | Single-INSERT-site test; minted-suite scale test; `dists/` onboarding test on a v6 fixture; adoption-disabled parity test. |
 | **E. Eager adoption and anchor forms** | C4 probe tree, classification, form transitions, `anchor_absent`, eager first adoption with interest window, T1-on-seed; C5 unsigned form with safeguards; SHA512 merge, shared verify helper, aliases, retained by-hash SHA512; C10 in-flight wait. | Production-shaped fixture: active never-adopted suites adopt once, dormant ones make zero requests; classification table; never-downgrade at both points, including the in-transaction recheck race; a §6.1-quarantined plain-text suite adopts unsigned without a downgrade refusal; unsigned never changes posture; nvidia-shaped fixture adopts; SHA512 by-hash served; in-flight wait on hit and miss paths. |
@@ -1359,7 +1398,7 @@ item depends on a later phase.
 
 | Risk | Mitigation |
 |---|---|
-| Eager first adoption after upgrade (burst). | Interest window + dormant backfill; TryAcquire slots, per-host slot, reserved slot, `max_duration`; failures back off. |
+| Eager first adoption after upgrade (burst). | Interest window + dormant backfill; TryAcquire slots, per-host slot, reserved slot, `max_duration`; slot-driven admission (no idle slot, no re-probing while queued); failures back off. |
 | Tightened `dists/` grammar drops suite identity for odd client paths. | Only shapes apt never sends; Phase 1 serving continues; enumerated tests. |
 | Upstream request lines change for `+`/`~` paths. | They become exactly what apt sends directly; production-fixture round trip. |
 | Unsigned adoption abused by a MITM or a LAN client. | Two observations (1 h for 401/403), signed-seen marker outliving reaps and written before signed bytes are served, never-downgrade in check and inside the commit transaction, member cap, capacity bounds, no vouching, no strict-mode effect; documented hardening knobs. |
