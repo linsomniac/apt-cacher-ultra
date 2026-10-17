@@ -46,11 +46,25 @@ func releaseDate(text []byte) int64 {
 // apt refuses: the weekday is checked only by its first three letters and
 // never against the date; an unknown month name means January (MonthConv);
 // text after the seconds is ignored (strptime); a day past the month's end
-// rolls over (timegm). One deliberate divergence: apt reads numeric tokens
-// with istream >>, which stops at the first non-digit, so a token such as
-// "6," parses there; here numeric tokens must be all digits, and an RFC 850
-// day above 65535 is rejected instead of wrapping. Real Release files never
-// reach either difference. TestParseAptDate pins the behaviour.
+// rolls over (timegm, so :60/:61 "leap seconds" roll into the next minute).
+// The clock fields (aptClock/num) stop consuming a second digit once doing
+// so could not keep the value within range (glibc's get_number): a seconds
+// value of 70-99 truncates to its ones digit (08:49:70 parses as :07) while
+// 62 and above is rejected outright, and the same early stop in hours or
+// minutes leaves a stray digit where ':' must follow, rejecting values like
+// "30:00:00" or "08:70:00" for that reason rather than a range check.
+//
+// Two deliberate divergences remain, both confined to the day token in
+// RFC 1123/asctime form (aptDigits, which is unsigned and requires the
+// whole token to be digits): apt reads it with istream >>, which stops at
+// the first non-digit, so a token such as "6," parses there as 6, where
+// this rejects it outright; and an RFC 850 day above 65535 is rejected
+// instead of wrapping. Real Release files never reach either difference.
+// Year (aptSignedInt) and the RFC 850 month/year parts (aptStoi) are not
+// part of this divergence: they accept an optional sign and still require
+// full consumption, matching istream >> int / std::stoi (apt's own code
+// checks that stoi consumed the whole token there too). TestParseAptDate
+// pins the behaviour.
 func parseAptDate(s string) (int64, bool) {
 	f := strings.Fields(s)
 	if len(f) == 0 {
@@ -223,13 +237,25 @@ func aptUTCZone(z string) bool {
 // ignored, as strptime ignores it.
 func aptClock(ts string) (h, m, s int, ok bool) {
 	i := 0
+	// num mirrors glibc's get_number, which strptime's %H/%M/%S each call
+	// through: it reads a first digit unconditionally, then reads a
+	// second digit only if doing so could not push the value past max.
+	// A first digit of 7, 8 or 9 therefore ends a 0..61 field (%S) on one
+	// digit, leaving the next character as trailing text — accepted here
+	// (seconds 70-99 truncate to their ones digit) or, for %H/%M, left as
+	// a stray digit where ':' must follow next, which fails colon() and
+	// rejects the whole clock.
 	num := func(max int) (int, bool) {
-		start, v := i, 0
-		for i < len(ts) && i-start < 2 && ts[i] >= '0' && ts[i] <= '9' {
+		if i >= len(ts) || ts[i] < '0' || ts[i] > '9' {
+			return 0, false
+		}
+		v := int(ts[i] - '0')
+		i++
+		if v*10 <= max && i < len(ts) && ts[i] >= '0' && ts[i] <= '9' {
 			v = v*10 + int(ts[i]-'0')
 			i++
 		}
-		return v, i > start && v <= max
+		return v, v <= max
 	}
 	colon := func() bool {
 		if i < len(ts) && ts[i] == ':' {

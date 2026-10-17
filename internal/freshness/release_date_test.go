@@ -36,6 +36,17 @@ func TestParseAptDate(t *testing.T) {
 		{"Sun, 06 Xyz 1994 08:49:37 GMT", utc(1994, time.January, 6, 8, 49, 37), true}, // unknown month: January
 		{"Sun, 31 Feb 2026 00:00:00 UTC", utc(2026, time.March, 3, 0, 0, 0), true},     // timegm rolls over
 		{"Sunday, 06-Nov-26 08:49:37 GMT", utc(1926, time.November, 6, 8, 49, 37), true},
+		// strptime's get_number (via glibc) consumes a second digit of a
+		// field only when doing so could not push it past the field's
+		// max; for %S (0..61) a first digit of 7, 8 or 9 ends the field
+		// on one digit, so the second digit is trailing text (ignored).
+		{"Sun, 06 Nov 1994 08:49:70 GMT", utc(1994, time.November, 6, 8, 49, 7), true},
+		{"Sun, 06 Nov 1994 08:49:99 GMT", utc(1994, time.November, 6, 8, 49, 9), true},
+		{"Sun, 06 Nov 1994 08:49:62 GMT", 0, false},
+		// :60 and :61 ("leap seconds") are in range for %S and roll over
+		// via time.Date exactly as timegm would.
+		{"Sun, 06 Nov 1994 08:49:60 GMT", utc(1994, time.November, 6, 8, 50, 0), true},
+		{"Sun, 06 Nov 1994 08:49:61 GMT", utc(1994, time.November, 6, 8, 50, 1), true},
 		{"Sun, 06 Nov 1994 08:49:37 +0100", 0, false}, // only UTC
 		{"Sun, 06 Nov 1994 08:49:37 +00:00", 0, false},
 		{"Sun, 06 Nov 1994 08:49:37 gmt", 0, false}, // zone is case-sensitive
