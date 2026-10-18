@@ -32,9 +32,12 @@ import (
 // trust audit), both unlabelled counters; acu_adoption_failing_suites
 // (spec C7, unlabelled gauge); acu_freshness_waiting_for_slot (spec C4,
 // unlabelled gauge). The flip barrier's acu_flip_hold_skipped_total,
-// acu_flip_hold_expired_total, acu_flip_waiters_over_cap_total,
-// acu_flip_slow_anchor_reads_total and acu_flip_gate_panics_total (spec
-// C8, unlabelled counters) are declared in internal/flipgate.
+// acu_flip_hold_expired_total, acu_flip_quiet_cut_short_total,
+// acu_flip_waiters_over_cap_total, acu_flip_slow_anchor_reads_total and
+// acu_flip_gate_panics_total (spec C8, unlabelled counters) and
+// acu_flip_barrier_active (unlabelled gauge) are declared in
+// internal/flipgate. A flip abandoned at shutdown is not an adoption
+// outcome: it logs adoption_abandoned_at_shutdown and counts nowhere.
 var (
 	freshnessCheckTotal = metrics.NewCounterWithCap(
 		"acu_freshness_check_total",

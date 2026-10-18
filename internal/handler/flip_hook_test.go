@@ -186,6 +186,40 @@ func TestServeHTTP_HeldClientThatLeavesIsAClientAbort(t *testing.T) {
 		if len(lines) != 1 || lines[0]["outcome"] != "client_canceled" || lines[0]["status"] != float64(http.StatusServiceUnavailable) {
 			t.Fatalf("request lines %v, want one client_canceled (503)", lines)
 		}
+		if got := lines[0]["flip_held_ms"]; got != float64(1000) {
+			t.Errorf("flip_held_ms = %v, want 1000 (held until the client left)", got)
+		}
+	})
+}
+
+// Final review, tests Minor 2 (operability): the request line of an anchor
+// request that waited in a hold carries flip_held_ms, so a slow apt update
+// is explained by the line itself; a request that did not wait has no such
+// field.
+func TestServeHTTP_HeldAnchorRequestLineCarriesFlipHeldMs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &syncLog{}
+		s := newFlipStackLogging(t, 10*time.Second, slog.New(slog.NewJSONHandler(logs, nil)))
+		const suite = "/u/dists/s"
+		release := heldSuite(t, s, suite)
+		time.AfterFunc(2500*time.Millisecond, release) // the commit returns 2.5 s into the hold
+		if _, code := s.get(suite+"/InRelease", 0); code != http.StatusOK {
+			t.Fatalf("held request: %d, want 200", code)
+		}
+		time.Sleep(time.Minute) // every quiet period is over
+		if _, code := s.get(suite+"/InRelease", 0); code != http.StatusOK {
+			t.Fatalf("unheld request: %d, want 200", code)
+		}
+		lines := logRecords(logs, "request", slog.LevelInfo)
+		if len(lines) != 2 {
+			t.Fatalf("request lines %v, want two", lines)
+		}
+		if got := lines[0]["flip_held_ms"]; got != float64(2500) {
+			t.Errorf("the held request's flip_held_ms = %v, want 2500", got)
+		}
+		if got, ok := lines[1]["flip_held_ms"]; ok {
+			t.Errorf("the unheld request carries flip_held_ms = %v, want no field", got)
+		}
 	})
 }
 

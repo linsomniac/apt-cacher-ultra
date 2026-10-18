@@ -2,10 +2,15 @@ package flipgate
 
 import "github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 
-// Spec C8 counters, unlabelled (spec C11: no suite labels): one per
-// documented residual, plus the expiry timer's recovered panics. Listed in
-// the flat-repository inventory note in internal/freshness/metrics.go.
+// Spec C8 metrics, unlabelled (spec C11: no suite labels): a counter per
+// documented residual, the expiry timer's recovered panics, and a gauge of
+// the flips in the barrier now. Listed in the flat-repository inventory
+// note in internal/freshness/metrics.go.
 var (
+	barrierActive = metrics.NewGauge(
+		"acu_flip_barrier_active",
+		"Adoption flips in the flip barrier now: waiting for quiet or for the hold token, holding, or committing (spec C8).",
+	)
 	holdSkippedTotal = metrics.NewCounter(
 		"acu_flip_hold_skipped_total",
 		"Flips that committed without a hold because the hold token was not free within 60 s (spec C8).",

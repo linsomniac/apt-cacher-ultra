@@ -374,6 +374,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// singleflight; Done runs once the response has been written.
 	if t := h.anchorStart(r, req); t != nil {
 		defer t.Done()
+		// The request line of a request that waited in a hold says so
+		// (flip_held_ms).
+		if held := t.Held(); held > 0 {
+			r = r.WithContext(context.WithValue(r.Context(), flipHeldKey{}, held))
+		}
 		// A request whose context ended while it waited — its client left —
 		// is a client abort (the gate did not register it). Serving it
 		// would only fail its snapshot read: a WARN and a 502 "hit" line.
@@ -1144,6 +1149,11 @@ func (h *Handler) maybeFireFreshness(req *proxy.Request) {
 
 // t1PanicStackLogged limits the T1 panic stack to one per process (spec C5).
 var t1PanicStackLogged atomic.Bool
+
+// flipHeldKey carries, in a request's context, how long it waited in a
+// spec C8 flip hold (a time.Duration); ServeHTTP sets it, the request line
+// logs it as flip_held_ms.
+type flipHeldKey struct{}
 
 // anchorStart is spec C8's handler side. For <suite>/InRelease and
 // <suite>/Release of a suite with a suite_freshness row it registers the
@@ -2150,6 +2160,11 @@ func (h *Handler) logRequestWithValidation(r *http.Request, canonHost, path, out
 	// true.
 	if validation.SnapshotDisplaced {
 		attrs = append(attrs, "snapshot_displaced", true)
+	}
+	// Spec C8: flip_held_ms is how long an anchor request waited in a flip
+	// hold (it is part of duration_ms); emitted only when positive.
+	if held, _ := r.Context().Value(flipHeldKey{}).(time.Duration); held.Milliseconds() > 0 {
+		attrs = append(attrs, "flip_held_ms", held.Milliseconds())
 	}
 	if fetchAttempted {
 		attrs = append(attrs, "upstream_status", upstreamStatus)

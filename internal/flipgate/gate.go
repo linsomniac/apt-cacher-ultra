@@ -202,7 +202,18 @@ type Token struct {
 	g     *Gate
 	e     *entry
 	start time.Time
-	done  bool // guarded by g.mu
+	held  time.Duration // the wait in a hold; set before AnchorStart returns
+	done  bool          // guarded by g.mu
+}
+
+// Held reports how long the request waited in a hold before AnchorStart
+// returned (zero when it did not wait, or for a nil token). The handler
+// logs it as the request line's flip_held_ms.
+func (t *Token) Held() time.Duration {
+	if t == nil {
+		return 0
+	}
+	return t.held
 }
 
 // New returns a gate. A zero Quiet returns a disabled gate: AnchorStart
@@ -326,6 +337,7 @@ func (g *Gate) AnchorStart(ctx context.Context, key string) *Token {
 	if t != nil {
 		return t
 	}
+	joined := time.Now()
 	timer := time.NewTimer(g.holdMax)
 	defer timer.Stop()
 	left := false
@@ -338,10 +350,13 @@ func (g *Gate) AnchorStart(ctx context.Context, key string) *Token {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	h.waiting--
+	now := time.Now()
 	if left {
-		return &Token{}
+		return &Token{held: now.Sub(joined)}
 	}
-	return g.registerLocked(e, time.Now())
+	t = g.registerLocked(e, now)
+	t.held = now.Sub(joined)
+	return t
 }
 
 // join registers an anchor serve of key and returns its token or, while a
@@ -402,7 +417,8 @@ func (t *Token) Done() {
 // never the adoption's deadline (ruling R-C2): when it ends, or the gate
 // is closed, before the commit starts, Flip returns ErrAborted and commits
 // nothing; a commit that has started always runs to its end. commit's
-// error is returned as is.
+// error is returned as is. While an enabled gate's Flip runs, it counts in
+// acu_flip_barrier_active.
 func (g *Gate) Flip(ctx context.Context, key string, commit func() error) (Result, error) {
 	var res Result
 	if err := ctx.Err(); err != nil {
@@ -414,6 +430,8 @@ func (g *Gate) Flip(ctx context.Context, key string, commit func() error) (Resul
 		return res, commit()
 	}
 	start := time.Now()
+	barrierActive.Inc()
+	defer barrierActive.Dec()
 	g.mu.Lock()
 	e := g.entryLocked(key, start)
 	e.flips++

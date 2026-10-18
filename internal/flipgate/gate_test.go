@@ -896,6 +896,9 @@ func TestCounters_AreRegistered(t *testing.T) {
 			t.Errorf("%s is not registered", name)
 		}
 	}
+	if !strings.Contains(buf.String(), "# TYPE acu_flip_barrier_active gauge") {
+		t.Error("acu_flip_barrier_active is not registered")
+	}
 }
 
 // Spec §7 C8 DoD "phase-B expiry (commit or in-flight reader > 20 s)
@@ -1113,6 +1116,84 @@ func TestGate_CloseAbortsEveryFlipNotYetCommitting(t *testing.T) {
 		}
 		if st := g.Stats(); st.Holds != 1 || st.Aborted != 3 {
 			t.Fatalf("stats = %+v, want one hold (none started after Close) and three aborted flips", st)
+		}
+	})
+}
+
+// Final review, tests Minor 2 (operability): acu_flip_barrier_active counts
+// the flips in the barrier now — waiting for quiet, for the token, holding
+// or committing — and a flip leaves it however it ends. A disabled gate's
+// flips never enter it.
+func TestGate_BarrierActiveGauge(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		before := counterValue(t, "acu_flip_barrier_active")
+		reading := g.AnchorStart(bg, "a") // a's flip waits in phase A
+		outA := flipAsync(bg, g, "a", noCommit)
+		release := make(chan struct{})
+		outB := flipAsync(bg, g, "b", func() error { <-release; return nil }) // b holds and commits until released
+		synctest.Wait()
+		if got := counterValue(t, "acu_flip_barrier_active") - before; got != 2 {
+			t.Fatalf("acu_flip_barrier_active rose by %v with two flips in the barrier, want 2", got)
+		}
+		if _, err := newGate(t, 0).Flip(bg, "c", noCommit); err != nil {
+			t.Fatal(err)
+		}
+		close(release)
+		reading.Done()
+		for _, ch := range []<-chan flipOut{outA, outB} {
+			if o := <-ch; o.err != nil {
+				t.Fatal(o.err)
+			}
+		}
+		ctx, cancel := context.WithCancel(bg)
+		cancel()
+		if _, err := g.Flip(ctx, "d", noCommit); !errors.Is(err, ErrAborted) {
+			t.Fatalf("a flip whose context had ended: %v, want ErrAborted", err)
+		}
+		if got := counterValue(t, "acu_flip_barrier_active") - before; got != 0 {
+			t.Fatalf("acu_flip_barrier_active is %v above its start once every flip returned, want 0", got)
+		}
+	})
+}
+
+// Token.Held is how long the request waited in a hold (the request line's
+// flip_held_ms): zero when it did not wait, the wait until the hold ended
+// when it did, the wait until it left when its client went away.
+func TestToken_HeldIsTheWaitInAHold(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		var nilTok *Token
+		if nilTok.Held() != 0 {
+			t.Fatal("a nil token was held")
+		}
+		unheld := g.AnchorStart(bg, "k")
+		unheld.Done()
+		if unheld.Held() != 0 {
+			t.Fatalf("an unheld request: Held = %v, want 0", unheld.Held())
+		}
+		time.Sleep(time.Minute) // its quiet period is over
+		release := make(chan struct{})
+		out := flipAsync(bg, g, "k", func() error { <-release; return nil }) // idle: holds at once
+		synctest.Wait()
+		held := make(chan *Token, 1)
+		go func() { held <- g.AnchorStart(bg, "k") }()
+		ctx, cancel := context.WithCancel(bg)
+		left := make(chan *Token, 1)
+		go func() { left <- g.AnchorStart(ctx, "k") }()
+		time.Sleep(time.Second)
+		cancel() // the second client leaves after 1 s
+		l := <-left
+		time.Sleep(2 * time.Second)
+		close(release) // the hold ends at 3 s
+		h := <-held
+		h.Done()
+		l.Done()
+		if h.Held() != 3*time.Second || l.Held() != time.Second {
+			t.Fatalf("Held = %v (answered) and %v (left), want 3s and 1s", h.Held(), l.Held())
+		}
+		if o := <-out; o.err != nil {
+			t.Fatal(o.err)
 		}
 	})
 }
