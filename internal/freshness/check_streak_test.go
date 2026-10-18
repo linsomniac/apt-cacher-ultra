@@ -171,21 +171,141 @@ func TestCheck_CancelledCallerRecordsNothing(t *testing.T) {
 
 var streakForms = []string{"inline", "detached"}
 
-// seedFakeForm gives the fake suite /r/dists/x on host h stale anchor rows
-// for form (inline: InRelease; detached: Release and Release.gpg, which
-// the first-ever check reaches through the inline fallback) and a suite
-// row starting at streak.
-func seedFakeForm(fc *fakeCache, form string, streak int64) {
+// formAnchorRows are stale anchor url_path rows of suite /r/dists/x on
+// host h for form (inline: InRelease; detached: Release and Release.gpg,
+// which the first-ever check reaches through the inline fallback).
+func formAnchorRows(form string) []cache.URLPath {
 	bh := testHex64
 	paths := []string{"/r/dists/x/InRelease"}
 	if form == "detached" {
 		paths = []string{"/r/dists/x/Release", "/r/dists/x/Release.gpg"}
 	}
+	rows := make([]cache.URLPath, 0, len(paths))
 	for _, p := range paths {
-		fc.putURL(cache.URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: p, BlobHash: &bh,
+		rows = append(rows, cache.URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: p, BlobHash: &bh,
 			UpstreamURL: "http://h" + p, IsMetadata: true})
 	}
+	return rows
+}
+
+// seedFakeForm gives the fake suite form's anchor rows and a suite row
+// starting at streak.
+func seedFakeForm(fc *fakeCache, form string, streak int64) {
+	for _, u := range formAnchorRows(form) {
+		fc.putURL(u)
+	}
 	fc.putSuite(cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x", CheckFailCount: streak})
+}
+
+// realFormChecker runs a checker for form over the real cache (whose
+// writes honour their context), with sem as its host limiter and a Debug
+// log into logs.
+func realFormChecker(t *testing.T, form string, f Fetcher, sem *hostsem.Sem, logs *lockedBuffer) (*Checker, *cache.Cache) {
+	t.Helper()
+	ctx := context.Background()
+	c := simtest.OpenCache(t)
+	if err := c.PutBlob(ctx, testHex64, 1); err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range formAnchorRows(form) {
+		if err := c.PutURLPath(ctx, u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}); err != nil {
+		t.Fatal(err)
+	}
+	chk, err := New(Config{Cache: c, Fetcher: f, HostLimiter: sem,
+		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return chk, c
+}
+
+// hasFailedLine reports whether the text log holds a "freshness check
+// failed" line for form with result=failed.
+func hasFailedLine(logs, form string) bool {
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, `msg="freshness check failed"`) && strings.Contains(line, "form="+form) &&
+			strings.Contains(line, "result=failed") {
+			return true
+		}
+	}
+	return false
+}
+
+// holdHostSlot takes the only slot of a one-slot limiter for host h; the
+// slot stays held until the test ends.
+func holdHostSlot(t *testing.T) *hostsem.Sem {
+	t.Helper()
+	sem := hostsem.New(1)
+	release, err := sem.Acquire(context.Background(), "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(release)
+	return sem
+}
+
+// Spec C4: the check deadline hit while waiting for the host slot is an
+// unknown end like any other, so a host whose slots stay saturated moves
+// its suites to the scheduler's failing class.
+func TestCheck_DeadlineAtTheHostSlotIsAnUnknownEndBothForms(t *testing.T) {
+	for _, form := range streakForms {
+		t.Run(form, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				sem := holdHostSlot(t)
+				up := &changedUpstream{body: []byte("new")}
+				logs := &lockedBuffer{}
+				chk, c := realFormChecker(t, form, up, sem, logs)
+				start := time.Now()
+				chk.Check(context.Background(), "http", "h", "/r/dists/x")
+				if d := time.Since(start); d != checkDeadline {
+					t.Fatalf("check took %v, want %v", d, checkDeadline)
+				}
+				if n := up.calls.Load(); n != 0 {
+					t.Fatalf("upstream contacted %d times without a host slot", n)
+				}
+				if s := realRow(t, c); s.CheckFailCount != 1 || s.LastCheckAt == nil || s.LastSuccessAt != nil {
+					t.Fatalf("streak %d last_check_at %v last_success_at %v; want 1, set, unset",
+						s.CheckFailCount, s.LastCheckAt, s.LastSuccessAt)
+				}
+				if !hasFailedLine(logs.String(), form) {
+					t.Fatalf("no failed-check line for form %s; logs:\n%s", form, logs.String())
+				}
+			})
+		})
+	}
+}
+
+// A caller cancelled while the check waits for the host slot records
+// nothing. (The real cache would refuse the write anyway; the log tells
+// the branch apart.)
+func TestCheck_CancelledCallerAtTheHostSlotRecordsNothingBothForms(t *testing.T) {
+	for _, form := range streakForms {
+		t.Run(form, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				sem := holdHostSlot(t)
+				logs := &lockedBuffer{}
+				chk, c := realFormChecker(t, form, &changedUpstream{body: []byte("new")}, sem, logs)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				time.AfterFunc(time.Second, cancel)
+				start := time.Now()
+				chk.Check(ctx, "http", "h", "/r/dists/x")
+				if d := time.Since(start); d != time.Second {
+					t.Fatalf("check took %v, want 1s (the cancellation)", d)
+				}
+				if s := realRow(t, c); s.CheckFailCount != 0 || s.LastCheckAt != nil {
+					t.Fatalf("cancelled check recorded streak %d, last_check_at %v", s.CheckFailCount, s.LastCheckAt)
+				}
+				if out := logs.String(); strings.Contains(out, "freshness check failed") {
+					t.Fatalf("cancelled check logged as failed; logs:\n%s", out)
+				}
+			})
+		})
+	}
 }
 
 func formChecker(t *testing.T, form string, streak int64, f Fetcher, logger *slog.Logger) (*Checker, *fakeCache) {
@@ -219,14 +339,20 @@ func TestCheck_AnsweredCheckResetsTheStreakBothForms(t *testing.T) {
 }
 
 // The unexpected-status arm runs after the optimistic success bump: it
-// must extend the streak the check started with, not restart it at 1.
-func TestCheck_UnexpectedStatusExtendsAnExistingStreakBothForms(t *testing.T) {
+// must extend the streak the check started with, not restart it at 1,
+// and keep the previous success stamp (a 206 must not make the suite
+// look never-succeeded).
+func TestCheck_UnexpectedStatusExtendsTheStreakAndKeepsSuccessBothForms(t *testing.T) {
 	for _, form := range streakForms {
 		t.Run(form, func(t *testing.T) {
 			c, fc := formChecker(t, form, 2, oddStatusUpstream{}, discardLogger())
+			prev := int64(1_700_000_000)
+			s := streakOf(t, fc)
+			s.LastSuccessAt = &prev
+			fc.putSuite(s)
 			c.Check(context.Background(), "http", "h", "/r/dists/x")
-			if s := streakOf(t, fc); s.CheckFailCount != 3 || s.LastSuccessAt != nil {
-				t.Fatalf("streak = %d, last_success_at = %v; want 3 and unset", s.CheckFailCount, s.LastSuccessAt)
+			if s := streakOf(t, fc); s.CheckFailCount != 3 || i64Of(s.LastSuccessAt) != prev {
+				t.Fatalf("streak = %d, last_success_at = %d; want 3 and %d", s.CheckFailCount, i64Of(s.LastSuccessAt), prev)
 			}
 		})
 	}
