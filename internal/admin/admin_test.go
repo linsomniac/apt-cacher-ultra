@@ -22,6 +22,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -650,20 +651,17 @@ func TestParseHtpasswd_RejectsEmptyFile(t *testing.T) {
 }
 
 // TestStatusHTML_SuiteTable pins the suite-table column header
-// rename (Lagging → InRelease changed) AND the SPEC5 §12.2.4
-// lagging annotation rendering. Seeds a suite with
-// inrelease_change_seen_at well past last_success_at so the
-// "(lagging …)" muted suffix renders in the InRelease-changed cell.
+// rename (Lagging → InRelease changed) AND the spec C7 lagging
+// annotation rendering. Seeds a suite whose InRelease change was
+// first seen 1h 30m ago so the "(lagging …)" muted suffix renders
+// in the InRelease-changed cell.
 func TestStatusHTML_SuiteTable(t *testing.T) {
 	s, base, cleanup := startAdminServer(t)
 	defer cleanup()
 
-	// Seed a lagging suite: last successful re-adoption was 2 hours
-	// ago, but upstream's InRelease has been seen changing 30 minutes
-	// ago — gap = 1h 30m.
 	now := time.Now().Unix()
 	lastSuccess := now - 2*3600
-	seenAt := now - 30*60
+	seenAt := wallclock.Now().Unix() - 5400
 	if err := s.cfg.Cache.PutSuiteFreshness(context.Background(),
 		cache.SuiteFreshness{
 			CanonicalScheme:       "http",
@@ -691,35 +689,7 @@ func TestStatusHTML_SuiteTable(t *testing.T) {
 	}
 }
 
-// TestLaggingAnnotation pins SPEC5 §12.2.4 lagging-render rules:
-// nil inputs and seenAt<=successAt produce empty; the gap is
-// formatted as "Xh Ym" or just "Xm" when zero hours.
-func TestLaggingAnnotation(t *testing.T) {
-	mk := func(unix int64) *int64 { return &unix }
-	cases := []struct {
-		name    string
-		seen    *int64
-		success *int64
-		want    string
-	}{
-		{"both_nil", nil, nil, ""},
-		{"seen_nil", nil, mk(100), ""},
-		{"success_nil", mk(100), nil, ""},
-		{"in_sync", mk(100), mk(100), ""},
-		{"adopted_after_seen", mk(100), mk(200), ""},
-		{"lag_30m", mk(2000), mk(200), "(lagging 30m)"},
-		{"lag_1h_5m", mk(3900), mk(0), "(lagging 1h 5m)"},
-		{"lag_25h", mk(90000), mk(0), "(lagging 25h 0m)"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := laggingAnnotation(tc.seen, tc.success); got != tc.want {
-				t.Errorf("laggingAnnotation(%v, %v) = %q, want %q",
-					tc.seen, tc.success, got, tc.want)
-			}
-		})
-	}
-}
+// Lag rendering is covered by TestLaggingAnnotation_FromFirstSighting in suites_status_test.go.
 
 // TestAdminRequest_AuthUserAndScrapeID pins the SPEC5 §10.1
 // admin_request log fields:

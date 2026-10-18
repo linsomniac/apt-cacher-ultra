@@ -271,7 +271,10 @@ func TestVitalState(t *testing.T) {
 			func(m *htmlRenderModel) {
 				m.Suites = []suiteEntry{{
 					LastSuccessUnixTime:           ptrI64(1_000_000_000),
-					InReleaseChangeSeenAtUnixTime: ptrI64(1_000_000_000 + 3600),
+					InReleaseChangeSeenAtUnixTime: ptrI64(1_000_000_000 - 2*3600),
+					Lagging:                       "(lagging 2h 0m)",
+					LagSeconds:                    2 * 3600,
+					LagWarn:                       true,
 				}}
 			},
 			"suites", "warn",
@@ -281,10 +284,23 @@ func TestVitalState(t *testing.T) {
 			func(m *htmlRenderModel) {
 				m.Suites = []suiteEntry{{
 					LastSuccessUnixTime:           ptrI64(1_000_000_000),
-					InReleaseChangeSeenAtUnixTime: ptrI64(1_000_000_000 + 24*3600 + 1),
+					InReleaseChangeSeenAtUnixTime: ptrI64(1_000_000_000 - (24*3600 + 1)),
+					Lagging:                       "(lagging 1d 0h)",
+					LagSeconds:                    24*3600 + 1,
+					LagWarn:                       true,
 				}}
 			},
 			"suites", "crit",
+		},
+		// Spec C7: a failing adoption marks the Suites vital warn even
+		// with no lag at all — the row's problem is the adoption, not
+		// staleness.
+		{
+			"suites_warn_adoption_failing",
+			func(m *htmlRenderModel) {
+				m.Suites = []suiteEntry{{AdoptionFailing: true, AdoptionStatus: "adoption failing 1h 0m · gpg_failed · retry in 30m"}}
+			},
+			"suites", "warn",
 		},
 
 		{

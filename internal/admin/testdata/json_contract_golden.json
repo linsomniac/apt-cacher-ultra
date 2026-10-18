@@ -84,7 +84,15 @@
       "last_success_unixtime": 1700004000,
       "current_snapshot_id": 42,
       "current_snapshot_adopted_at_unixtime": 1700003500,
-      "inrelease_change_seen_at_unixtime": 1700005500
+      "inrelease_change_seen_at_unixtime": 1700005500,
+      "anchor_form": "",
+      "last_requested_unixtime": null,
+      "check_fail_count": 0,
+      "adoption_fail_reason": null,
+      "adoption_fail_count": 0,
+      "adoption_fail_first_unixtime": null,
+      "adoption_next_retry_unixtime": null,
+      "adoption_refused": false
     }
   ],
   "gc": {

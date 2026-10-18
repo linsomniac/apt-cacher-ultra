@@ -15,6 +15,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // statusModel is the SPEC5 §10.5 status-page JSON shape, also used
@@ -253,6 +254,29 @@ type suiteEntry struct {
 	// Xh Ym)" / "(lagging Xm)" matching the operator-facing
 	// duration helper.
 	Lagging string `json:"-"`
+
+	// Spec C7 "Visibility" (phase B). AnchorForm is "" for a suite with no
+	// current snapshot. The adoption_fail_* fields mirror the failure
+	// record; adoption_refused marks a refusal state (not a failure).
+	AnchorForm                string  `json:"anchor_form"`
+	LastRequestedUnixTime     *int64  `json:"last_requested_unixtime"`
+	CheckFailCount            int64   `json:"check_fail_count"`
+	AdoptionFailReason        *string `json:"adoption_fail_reason"`
+	AdoptionFailCount         int64   `json:"adoption_fail_count"`
+	AdoptionFailFirstUnixTime *int64  `json:"adoption_fail_first_unixtime"`
+	AdoptionNextRetryUnixTime *int64  `json:"adoption_next_retry_unixtime"`
+	AdoptionRefused           bool    `json:"adoption_refused"`
+
+	// HTML-only: AdoptionFailing marks a failing (not refused) record;
+	// AdoptionStatus is its one-line summary; LagSeconds feeds the panel
+	// state. JSON consumers compute these from the fields above.
+	AdoptionFailing bool   `json:"-"`
+	AdoptionStatus  string `json:"-"`
+	LagSeconds      int64  `json:"-"`
+	// LagWarn marks a lag beyond 1 h: an adoption normally completes in
+	// minutes, so a longer lag means at least one attempt failed. Rows and
+	// the LAGGING count use it; the "(lagging …)" text shows any lag.
+	LagWarn bool `json:"-"`
 }
 
 // gcInfo carries the SPEC5 §10.5 gc.* block. The pointer-typed
@@ -407,7 +431,7 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 		RepoCoverage:    buildRepoCoverageInfo(repo, s.cfg.AdoptionArchitectures),
 		Listeners:       buildListenerInfo(s.cfg),
 		TLSMITM:         buildTLSMITMInfo(s.cfg.TLSMITM),
-		Suites:          buildSuiteEntries(suitesRaw.([]cache.SuiteWithAdoption)),
+		Suites:          buildSuiteEntries(suitesRaw.([]cache.SuiteWithAdoption), wallclock.Now().Unix()),
 		HotURLPaths:     buildHotURLEntries(hotPaths.([]cache.HotURLPath)),
 		RecentAdoptions: buildAdoptionEntries(s.cfg.Ring.Snapshot()),
 		ActiveHosts:     buildActiveHostEntries(s.cfg.HostLimiter.Snapshot()),
@@ -549,10 +573,10 @@ func buildListenerInfo(cfg Config) []listenerInfo {
 	return out
 }
 
-func buildSuiteEntries(rows []cache.SuiteWithAdoption) []suiteEntry {
+func buildSuiteEntries(rows []cache.SuiteWithAdoption, now int64) []suiteEntry {
 	out := make([]suiteEntry, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, suiteEntry{
+		e := suiteEntry{
 			Host:                             r.CanonicalHost,
 			SuitePath:                        r.SuitePath,
 			LastCheckUnixTime:                r.LastCheckAt,
@@ -560,31 +584,55 @@ func buildSuiteEntries(rows []cache.SuiteWithAdoption) []suiteEntry {
 			CurrentSnapshotID:                r.CurrentSnapshotID,
 			CurrentSnapshotAdoptedAtUnixTime: r.CurrentAdoptedAt,
 			InReleaseChangeSeenAtUnixTime:    r.InReleaseChangeSeenAt,
-			Lagging:                          laggingAnnotation(r.InReleaseChangeSeenAt, r.LastSuccessAt),
-		})
+			AnchorForm:                       r.CurrentAnchorForm,
+			LastRequestedUnixTime:            r.LastRequestedAt,
+			CheckFailCount:                   r.CheckFailCount,
+			AdoptionFailReason:               r.AdoptionFailReason,
+			AdoptionFailCount:                r.AdoptionFailCount,
+			AdoptionFailFirstUnixTime:        r.AdoptionFailFirstAt,
+			AdoptionNextRetryUnixTime:        r.AdoptionNextRetryAt,
+		}
+		e.Lagging, e.LagSeconds = laggingAnnotation(r.InReleaseChangeSeenAt, now)
+		e.LagWarn = e.LagSeconds > 3600
+		if r.AdoptionFailCount > 0 && r.AdoptionFailReason != nil {
+			e.AdoptionRefused = cache.IsRefusalReason(*r.AdoptionFailReason)
+			e.AdoptionFailing = !e.AdoptionRefused
+			e.AdoptionStatus = adoptionStatus(r.SuiteFreshness, e.AdoptionRefused, now)
+		}
+		out = append(out, e)
 	}
 	return out
 }
 
-// laggingAnnotation renders the SPEC5 §12.2.4 "(lagging Xh Ym)"
-// suffix when the upstream's InRelease changed after our last
-// successful re-adoption (= the cache is serving older metadata
-// than upstream advertises). Both inputs may be nil — in which
-// case we cannot determine lag and return "".
-func laggingAnnotation(seenAt, successAt *int64) string {
-	if seenAt == nil || successAt == nil {
-		return ""
+// laggingAnnotation renders "(lagging …)" while an upstream change first
+// seen at seenAt has not been adopted, and returns the lag in seconds.
+// The lag runs from the first sighting to now (spec C7): the old rule
+// compared it with last_success_at, which every check bumps, so it could
+// never fire. A stamp in the future (clock step) shows no lag.
+func laggingAnnotation(seenAt *int64, now int64) (string, int64) {
+	if seenAt == nil || *seenAt > now {
+		return "", 0
 	}
-	if *seenAt <= *successAt {
-		return ""
+	lag := now - *seenAt
+	return "(lagging " + durationOf(lag) + ")", lag
+}
+
+// adoptionStatus summarises the spec C7 record for the suites table:
+// "adoption failing 3d 2h · untrusted_signer · retry in 41m", or
+// "refused: upstream_older · retry due".
+func adoptionStatus(s cache.SuiteFreshness, refused bool, now int64) string {
+	retry := "retry due"
+	if s.AdoptionNextRetryAt != nil && *s.AdoptionNextRetryAt > now {
+		retry = "retry in " + durationOf(*s.AdoptionNextRetryAt-now)
 	}
-	gap := time.Duration(*seenAt-*successAt) * time.Second
-	h := int(gap.Hours())
-	m := int(gap.Minutes()) % 60
-	if h == 0 {
-		return fmt.Sprintf("(lagging %dm)", m)
+	if refused {
+		return "refused: " + *s.AdoptionFailReason + " · " + retry
 	}
-	return fmt.Sprintf("(lagging %dh %dm)", h, m)
+	var since int64
+	if s.AdoptionFailFirstAt != nil && *s.AdoptionFailFirstAt < now {
+		since = now - *s.AdoptionFailFirstAt
+	}
+	return "adoption failing " + durationOf(since) + " · " + *s.AdoptionFailReason + " · " + retry
 }
 
 func buildHotURLEntries(rows []cache.HotURLPath) []hotURLEntry {
@@ -820,9 +868,21 @@ func reasonTooltip(reason string) string {
 	case "member_fetch_failed":
 		return "A Release-listed member could not be fetched intact — size/content-length mismatch (often an index republished mid-fetch, or a non-essential member the upstream serves with the wrong body), a transport error, or a 5xx. The failing member and detail are shown in the row."
 	case "db_failed":
-		return "Adoption hit a local cache/DB error (blob write, rehash, or snapshot insert), not an upstream problem. It is retried on the next freshness tick."
+		return "Adoption hit a local cache/DB error (blob write, rehash, or snapshot insert), not an upstream problem. It is retried on the backoff schedule."
 	case "run_failed":
 		return "Adoption failed for a reason not otherwise categorized; consult the adoption_run_failed log line."
+	case "refused":
+		return "Not a failure: the adoption was refused by a rule (see the reason). The current snapshot keeps serving; the same content is not retried until its retry time, new content is tried at once."
+	case "upstream_older":
+		return "The upstream Release's Date is older than the current snapshot's, or missing after a dated one: apt would refuse it too. Refused, not failed."
+	case "rollback_refused":
+		return "Upstream serves content identical to an older snapshot the cache already replaced (a flapping mirror). Refused, not failed."
+	case "release_date_in_future":
+		return "The Release's Date is more than 10 s ahead of the cache's clock (apt's Acquire::Max-FutureTime). Check the cache host's clock."
+	case "timed_out":
+		return "The adoption exceeded adoption.max_duration and was abandoned; it is retried on the backoff schedule."
+	case "panic", "panicked":
+		return "The adoption goroutine panicked; it was recovered and recorded. See the adoption_panicked log line."
 	}
 	return reason
 }
@@ -1094,24 +1154,18 @@ func vitalState(kind string, m htmlRenderModel) string {
 		if len(m.Suites) == 0 {
 			return "stale"
 		}
-		worstLagSeconds := int64(0)
-		anyLag := false
+		var worstLag int64
+		anyFailing := false
 		for _, s := range m.Suites {
-			if s.LastSuccessUnixTime == nil || s.InReleaseChangeSeenAtUnixTime == nil {
-				continue
-			}
-			if *s.InReleaseChangeSeenAtUnixTime > *s.LastSuccessUnixTime {
-				anyLag = true
-				lag := *s.InReleaseChangeSeenAtUnixTime - *s.LastSuccessUnixTime
-				if lag > worstLagSeconds {
-					worstLagSeconds = lag
-				}
-			}
+			worstLag = max(worstLag, s.LagSeconds)
+			anyFailing = anyFailing || s.AdoptionFailing
 		}
-		if worstLagSeconds > 24*3600 {
+		switch {
+		case worstLag > 24*3600:
 			return "crit"
-		}
-		if anyLag {
+		case worstLag > 3600 || anyFailing:
+			// An adoption normally completes within minutes; a lag beyond
+			// the 1 h retry cap means at least one attempt failed.
 			return "warn"
 		}
 		return "ok"
@@ -1223,20 +1277,24 @@ func verdictExplanation(m htmlRenderModel) string {
 // produced by internal/freshness/metrics.go's classifier:
 //
 //	"success", "gpg_failed", "parse_failed", "member_mismatch",
-//	"unpinned_suite", "run_failed".
+//	"member_fetch_failed", "db_failed", "unpinned_suite", "run_failed",
+//	"refused", "release_date_in_future", "timed_out", "panicked".
 //
-// All non-success outcomes are critical for the operator (the row's
-// adoption did not land); they map to b--crit. Unknown outcomes — e.g.
-// a future enum value the classifier adds before this helper is updated
-// — map to b--crit too rather than the previous b--stale, since
-// "future failure mode we don't recognise" is closer to crit than to
-// stale. Existing soft-state values ("lagging", "warn") keep their
-// b--warn mapping for non-adoption use sites.
+// "refused" is a state, not a failure (spec C7): the adoption was
+// refused by a rule (upstream_older, rollback_refused, …), the current
+// snapshot keeps serving, and the row maps to b--warn like the soft-state
+// values below. Every other non-success outcome is critical for the
+// operator (the row's adoption did not land); they map to b--crit.
+// Unknown outcomes — e.g. a future enum value the classifier adds before
+// this helper is updated — map to b--crit too rather than the previous
+// b--stale, since "future failure mode we don't recognise" is closer to
+// crit than to stale. Existing soft-state values ("lagging", "warn")
+// keep their b--warn mapping for non-adoption use sites.
 func outcomeBadgeClass(outcome string) string {
 	switch outcome {
 	case "success":
 		return "b--ok"
-	case "lagging", "warn":
+	case "lagging", "warn", "refused":
 		return "b--warn"
 	case "":
 		return "b--stale"

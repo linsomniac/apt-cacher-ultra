@@ -360,19 +360,19 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
         <span class="vital__unit">TRACKED</span>
       </div>
       <div class="vital__sub">
-        {{$lagCount := 0}}{{range .Suites}}{{if .Lagging}}{{$lagCount = (add1 $lagCount)}}{{end}}{{end}}
-        {{if eq $lagCount 0}}<span><b>0 LAGGING</b> &middot; 0 FAILING</span>{{else}}<span><b class="accent-warn">{{$lagCount}} LAGGING</b> &middot; 0 FAILING</span>{{end}}
+        {{$lagCount := 0}}{{$failCount := 0}}{{range .Suites}}{{if .LagWarn}}{{$lagCount = (add1 $lagCount)}}{{end}}{{if .AdoptionFailing}}{{$failCount = (add1 $failCount)}}{{end}}{{end}}
+        <span>{{if eq $lagCount 0}}<b>0 LAGGING</b>{{else}}<b class="accent-warn">{{$lagCount}} LAGGING</b>{{end}} &middot; {{if eq $failCount 0}}0 FAILING{{else}}<b class="accent-warn">{{$failCount}} FAILING</b>{{end}}</span>
       </div>
     </article>
 
     <article class="vital" data-vital="adoptions" data-state="{{$adoptionsState}}">
       <header class="vital__head"><span class="vital__label">Adoptions</span></header>
-      {{$nA := len .RecentAdoptions}}{{$okA := 0}}{{$failA := 0}}{{range .RecentAdoptions}}{{if eq .Outcome "success"}}{{$okA = (add1 $okA)}}{{else}}{{$failA = (add1 $failA)}}{{end}}{{end}}
+      {{$nA := len .RecentAdoptions}}{{$okA := 0}}{{$failA := 0}}{{$refA := 0}}{{range .RecentAdoptions}}{{if eq .Outcome "success"}}{{$okA = (add1 $okA)}}{{else if eq .Outcome "refused"}}{{$refA = (add1 $refA)}}{{else}}{{$failA = (add1 $failA)}}{{end}}{{end}}
       <div class="vital__readout">
         {{if eq $nA 0}}<span class="vital__num muted">&mdash;</span><span class="vital__unit">NO EVENTS</span>{{else}}<span class="vital__num">{{$okA}}</span><span class="vital__unit">/ {{$nA}} OK</span>{{end}}
       </div>
       <div class="vital__sub">
-        {{if eq $nA 0}}<span>RING EMPTY</span>{{else if eq $failA 0}}<span><b class="accent-ok">RING CLEAN</b></span>{{else}}<span><b class="accent-crit">{{$failA}} FAILED</b></span>{{end}}
+        {{if eq $nA 0}}<span>RING EMPTY</span>{{else if and (eq $failA 0) (eq $refA 0)}}<span><b class="accent-ok">RING CLEAN</b></span>{{else}}<span>{{if gt $failA 0}}<b class="accent-crit">{{$failA}} FAILED</b>{{end}}{{if gt $refA 0}}{{if gt $failA 0}} &middot; {{end}}<b class="accent-warn">{{$refA}} REFUSED</b>{{end}}</span>{{end}}
         <span>{{$nA}} EVENTS IN RING</span>
       </div>
     </article>
@@ -429,13 +429,14 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
       <!-- SUITES -->
       <section class="panel" id="suites">
         <div class="panel__eyebrow">
-          {{$lc := 0}}{{range .Suites}}{{if .Lagging}}{{$lc = (add1 $lc)}}{{end}}{{end}}
+          {{$lc := 0}}{{range .Suites}}{{if .LagWarn}}{{$lc = (add1 $lc)}}{{end}}{{end}}
           <span>Suites</span><span class="sep">&mdash;</span>
           <span>{{len .Suites}} TRACKED</span>
           {{if gt $lc 0}}<span class="sep">&middot;</span><span class="count-warn">{{$lc}} LAGGING</span>{{end}}
+          {{$fc := 0}}{{range .Suites}}{{if .AdoptionFailing}}{{$fc = (add1 $fc)}}{{end}}{{end}}{{if gt $fc 0}}<span class="sep">&middot;</span><span class="count-warn">{{$fc}} FAILING</span>{{end}}
         </div>
         <h2 class="panel__h">Suite adoption status</h2>
-        <p class="panel__desc">One row per (host, suite). Lagging rows indicate the upstream has published a newer <code>InRelease</code> than the snapshot the cache is currently serving.</p>
+        <p class="panel__desc">One row per (host, suite). Lagging rows indicate the upstream has published a newer <code>InRelease</code> than the snapshot the cache is currently serving. The Adoption column shows a failing or refused adoption and when it is retried.</p>
         {{if .Suites}}
         <div class="table-wrap">
           <table class="data">
@@ -444,10 +445,11 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
               <th class="num">Snapshot</th>
               <th>Adopted<details class="col-hint"><summary aria-label="What does Adopted mean?">i</summary><div class="col-hint__body">Adoption fires only when a fresh InRelease has been observed. Suites whose upstream has not republished since process start may stay empty here without being broken.</div></details></th>
               <th>InRelease changed</th>
+              <th>Adoption</th>
             </tr></thead>
             <tbody>
             {{range .Suites}}
-              <tr{{if .Lagging}} data-state="warn"{{end}}>
+              <tr{{if or .LagWarn .AdoptionFailing}} data-state="warn"{{end}}>
                 <td data-label="Host" class="host">{{.Host}}</td>
                 <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
                 <td data-label="Last check" class="time">{{unixTimePtr .LastCheckUnixTime}}</td>
@@ -455,6 +457,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
                 <td data-label="Snapshot" class="num mono">{{i64Ptr .CurrentSnapshotID}}</td>
                 <td data-label="Adopted" class="time">{{unixTimePtr .CurrentSnapshotAdoptedAtUnixTime}}</td>
                 <td data-label="InRelease changed" class="time">{{unixTimePtr .InReleaseChangeSeenAtUnixTime}}{{if .Lagging}} <span class="lagging">{{.Lagging}}</span>{{end}}</td>
+                <td data-label="Adoption" class="mono">{{.AdoptionStatus}}</td>
               </tr>
             {{end}}
             </tbody>
@@ -465,11 +468,12 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
 
       <!-- RECENT ADOPTIONS -->
       <section class="panel" id="adoptions">
-        {{$na := len .RecentAdoptions}}{{$okN := 0}}{{$failN := 0}}{{range .RecentAdoptions}}{{if eq .Outcome "success"}}{{$okN = (add1 $okN)}}{{else}}{{$failN = (add1 $failN)}}{{end}}{{end}}
+        {{$na := len .RecentAdoptions}}{{$okN := 0}}{{$failN := 0}}{{$refN := 0}}{{range .RecentAdoptions}}{{if eq .Outcome "success"}}{{$okN = (add1 $okN)}}{{else if eq .Outcome "refused"}}{{$refN = (add1 $refN)}}{{else}}{{$failN = (add1 $failN)}}{{end}}{{end}}
         <div class="panel__eyebrow">
           <span>Adoptions</span><span class="sep">&mdash;</span>
           <span>{{$na}} IN RING</span>
           {{if gt $failN 0}}<span class="sep">&middot;</span><span class="count-crit">{{$failN}} FAILED</span>{{end}}
+          {{if gt $refN 0}}<span class="sep">&middot;</span><span class="count-warn">{{$refN}} REFUSED</span>{{end}}
           {{if gt $okN 0}}<span class="sep">&middot;</span><span class="count-ok">{{$okN}} SUCCESS</span>{{end}}
         </div>
         <h2 class="panel__h">Recent adoption outcomes</h2>
@@ -484,7 +488,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
             </tr></thead>
             <tbody>
             {{range .RecentAdoptions}}
-              <tr{{if ne .Outcome "success"}} data-state="crit"{{end}} data-outcome="{{.Outcome}}"{{if .Reason}} data-reason="{{.Reason}}"{{end}}{{if .MemberPath}} data-member="{{.MemberPath}}"{{end}}>
+              <tr{{if eq .Outcome "refused"}} data-state="warn"{{else if ne .Outcome "success"}} data-state="crit"{{end}} data-outcome="{{.Outcome}}"{{if .Reason}} data-reason="{{.Reason}}"{{end}}{{if .MemberPath}} data-member="{{.MemberPath}}"{{end}}>
                 <td data-label="Host" class="host">{{.Host}}</td>
                 <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
                 <td data-label="Outcome">{{$ott := reasonTooltip .Outcome}}<span class="b {{outcomeBadgeClass .Outcome}}"{{if ne $ott .Outcome}} title="{{$ott}}"{{end}}>{{.Outcome}}</span>{{if and .Reason (ne .Reason .Outcome)}} <span class="b b--neutral reason" title="{{reasonTooltip .Reason}}">{{.Reason}}</span>{{end}}{{if .MemberPath}} <span class="b b--neutral mono member" title="{{.Detail}}">{{.MemberPath}}</span>{{if .Detail}} <span class="muted member-detail">{{.Detail}}</span>{{end}}{{end}}</td>
