@@ -37,11 +37,11 @@ import (
 //     branch of checkLocked because the prior snapshot has
 //     release_hash != nil).
 //
-// AIDEV-NOTE: SPEC2 §12.3's per-client coherence claim is documented
-// elsewhere as architecturally permitting straddle (see
-// TestPhase2Chaos_AdoptionFlipUnderConcurrency); the same caveat
-// applies here. We log straddle counts for regression tracking and
-// strictly assert per-request coherence.
+// AIDEV-NOTE: SPEC2 §12.3's per-client coherence comes from the spec C8
+// flip barrier (see TestPhase2Chaos_AdoptionFlipUnderConcurrency); as
+// there, neither burst crosses the flip, so its zero-straddle assertions
+// pin the burst structure (they do not exercise the barrier), and it
+// strictly asserts per-request coherence.
 func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("phase 2 detached chaos test skipped in -short mode")
@@ -194,10 +194,9 @@ func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 		}
 	}
 
-	preStraddles := chaos2CountMetadataStraddles(pre)
-	postStraddles := chaos2CountMetadataStraddles(post)
-	t.Logf("detached metadata straddle counts: pre-flip=%d post-flip=%d (architecturally allowed; inflation = regression)",
-		preStraddles, postStraddles)
+	if preN, postN := chaos2CountMetadataStraddles(pre), chaos2CountMetadataStraddles(post); preN != 0 || postN != 0 {
+		t.Errorf("detached metadata straddles: pre-flip=%d post-flip=%d, want 0", preN, postN)
+	}
 
 	// Final state: current_snapshot_id points at a detached snapshot
 	// with B's release_hash + release_gpg_hash, and SingleAnchorHash is

@@ -32,18 +32,19 @@ import (
 // the cache's final state must point at B.
 //
 // AIDEV-NOTE: SPEC2 §12.3 calls for "no client receives A's InRelease
-// with B's Packages or vice versa." The cache architecture does not
-// implement per-client snapshot pinning — every request reads
-// current_snapshot_id independently — so a client batch whose request
-// timing straddles the atomic flip can see A for some requests and B
-// for others. Per-request coherence (each individual body matches the
-// snapshot id it resolved against) IS strictly enforced; per-client
-// straddle is not. The test logs straddle counts so a regression that
-// inflates the rate (e.g. a flip that's no longer atomic, or a torn
-// member fetch) surfaces as a quantitative shift. This is documented
-// as a deliberate gap in the §12.3 invariant set; SPEC2 should be
-// revised to clarify the per-snapshot vs. per-client boundary, but
-// that is outside the scope of this test.
+// with B's Packages or vice versa." Every request reads
+// current_snapshot_id independently; per-client consistency across a flip
+// comes from the spec C8 flip barrier (internal/flipgate): the commit
+// waits until the suite's anchor serves have been quiet for
+// adoption.flip_quiet_period, so a client that asks for its indexes
+// within that period of its anchor gets the same snapshot. The flip
+// simulations (internal/handler/sim_flip_test.go, internal/flipgate's
+// sim_test.go) prove it with the apt client model; TestSimFlip_SeededChaos
+// is the barrier's chaos test. This test runs without a barrier, and
+// neither burst crosses the flip (the pre-flip burst runs while adoption
+// is blocked, the post-flip one after the commit), so its zero-straddle
+// assertions pin the burst structure rather than exercise the barrier,
+// next to the per-response coherence it asserts throughout.
 func TestPhase2Chaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("phase 2 chaos test skipped in -short mode")
@@ -234,15 +235,12 @@ func TestPhase2Chaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 		}
 	}
 
-	// Per-client metadata coherence: log the count of clients whose
-	// InRelease and Packages.gz responses came from different
-	// snapshots. Architecturally this can be non-zero (see the
-	// AIDEV-NOTE on the test function), but inflating it is a
-	// regression signal.
-	preStraddles := chaos2CountMetadataStraddles(pre)
-	postStraddles := chaos2CountMetadataStraddles(post)
-	t.Logf("metadata straddle counts: pre-flip=%d post-flip=%d (architecturally allowed; inflation = regression)",
-		preStraddles, postStraddles)
+	// Per-client metadata coherence: no client's InRelease and
+	// Packages.gz responses came from different snapshots (neither
+	// burst crosses the flip; see the AIDEV-NOTE on the test function).
+	if preN, postN := chaos2CountMetadataStraddles(pre), chaos2CountMetadataStraddles(post); preN != 0 || postN != 0 {
+		t.Errorf("metadata straddles: pre-flip=%d post-flip=%d, want 0", preN, postN)
+	}
 
 	// Final state: current_snapshot_id should point at a snapshot
 	// whose inrelease_hash matches snapB.inRelease — not just
