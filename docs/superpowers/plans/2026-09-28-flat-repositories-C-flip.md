@@ -4,7 +4,7 @@
 
 **Goal:** Close PR #8 limitation #2 — a client that fetched a suite's old `InRelease` must not then receive index members from the new snapshot — with a two-phase flip barrier bounded below apt's 30 s timeout and one hold at a time process-wide, by-hash members served from retained (displaced) snapshots, and a `Last-Modified` that never lets `If-Modified-Since` hide a flip; each proven by virtual-clock simulations with an explicit apt client model.
 
-**Architecture:** A new leaf package `internal/flipgate` owns all barrier state: per-suite in-flight anchor serves, holds, and the FIFO hold token. The handler registers every `<suite>/InRelease` and `<suite>/Release` serve of a tracked suite with the gate before it reads the snapshot pointer (waiting there while that suite's flip holds anchors) and marks it done after the response is written. The adopter runs `CommitAdoption` inside `Gate.Flip`, after the member pipeline and after freeing its host slot; the barrier waits on the checker's lifetime context, never on the adoption deadline. `CommitAdoption` keeps `adopted_at` strictly increasing per suite, the handler serves snapshot anchors with `max(pool mtime, adopted_at)`, and a by-hash member the current snapshot lacks is served from the newest of the suite's displaced, non-retired snapshots.
+**Architecture:** A new leaf package `internal/flipgate` owns all barrier state: per-suite in-flight anchor serves, holds, and the FIFO hold token. The handler registers every `<suite>/InRelease` and `<suite>/Release` serve of a tracked suite with the gate before it reads the snapshot pointer (waiting there while that suite's flip holds anchors) and marks it done after the response is written. The adopter runs `CommitAdoption` inside `Gate.Flip`, after the member pipeline and after freeing its host slot; the barrier waits on the checker's lifetime context, never on the adoption deadline, and `main` closes the gate at the shutdown signal, abandoning every flip that has not started its commit. `CommitAdoption` keeps `adopted_at` strictly increasing per suite, the handler serves snapshot anchors with `max(pool mtime, adopted_at)`, and a by-hash member the current snapshot lacks is served from the newest of the suite's displaced, non-retired snapshots.
 
 **Tech Stack:** Go 1.25 (toolchain 1.26), modernc SQLite, `testing/synctest`.
 
@@ -16,13 +16,13 @@ Everything in the overview's Global Constraints applies. In particular:
 
 - No schema change: v7 already has every column this phase reads or writes (`suite_snapshot.adopted_at`, `retired_at`; `url_path.last_fetched_at`). Never edit `migrations`.
 - Production SQL never uses SQLite clock functions; persisted stamps come from `wallclock` (the cache's `nowUnix`); all barrier timing uses monotonic `time.Now`/`time.Since`, timers and contexts.
-- `internal/flipgate` imports only the standard library and `internal/metrics` (a guard test pins it). It never waits while holding its mutex: every wait is a `select` on channels, timers and contexts.
-- Constants (spec C11), not knobs: hold 20 s (`flipgate.HoldMax`); phase-A cap 60 s; hold-token wait 60 s; waiter cap 256 per suite; apt's timeout 30 s (anchors in flight longer are ignored). New knob: `adoption.flip_quiet_period` (default `10s`, `0s` disables, at most `15s`).
-- `flip_quiet_period = 0s`, and any configuration without an adopter, behaves exactly as the phase-B tip: no gate state, no extra database read on the request path, no wait. Every existing test constructs handlers and adopters without a gate and stays unchanged (exceptions listed under Conventions).
+- `internal/flipgate` imports only the standard library and `internal/metrics` (a guard test pins it). It never waits while holding its mutex: every wait is a `select` on channels, timers and contexts. Every section that a `recover` further up can unwind (the adoption's, net/http's, the expiry timer's own) unlocks the mutex in a `defer` (design review M6), so a panic never leaves the gate locked.
+- Constants (spec C11), not knobs: hold 20 s (`flipgate.HoldMax`); phase-A cap 60 s; hold-token wait 60 s; waiter cap 256 per suite; apt's timeout 30 s (an anchor response still being sent that long is no longer waited for; design note 2). New knob: `adoption.flip_quiet_period` (default `10s`; `0s` disables; otherwise between `1s` and `15s` — controller ruling, deviation 6).
+- `flip_quiet_period = 0s`, and any configuration without an adopter, behaves as the phase-B tip: no gate state, no registration read on the request path, no wait, and `Gate.Close` does nothing. The one exception is Task 7's `Last-Modified` floor, which applies in every configuration: one extra `GetSuiteSnapshot` per snapshot-served `InRelease`/`Release`/`Release.gpg`, whose `Last-Modified` becomes `max(pool mtime, adopted_at)` (design review M4). Every existing test constructs handlers and adopters without a gate and stays unchanged (exceptions listed under Conventions).
 - The barrier never holds a host slot (the host slot is freed at `membersDone`, before the barrier) and never cancels a commit that has started.
 - Tests that call `wallclock.SetOffsetForTest` never use `t.Parallel()`.
 - Simulations run inside `testing/synctest` bubbles, finish in under 5 s under `-race`, keep events off each other's virtual instants unless the asserted outcome is order-independent, and silence loggers with `simtest.DiscardLogger()` (or capture them). Gates, caches and contexts a simulation waits on are created inside its bubble.
-- Every goroutine recovers panics (the only new production goroutines are the hold's `time.AfterFunc` expiry callback and `main`'s shutdown-drain waiter in `waitLogged`; both do).
+- Every goroutine recovers panics (the new production goroutines are the hold's `time.AfterFunc` expiry callback and `main`'s shutdown-drain waiter in `waitLogged`, which both do, and `anchorStart`'s `context.AfterFunc`, which only calls a `context.CancelFunc`).
 - `go test -race ./...` and `golangci-lint run ./...` are clean; `gofmt -l .` lists only the five known drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`) at the end of every task. Never run `gofmt -w` on those five.
 - Commit trailer: the implementer's own harness attribution line (phase A ruling); otherwise `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -32,7 +32,7 @@ Conventions in this plan:
 - Each commit step starts with `gofmt -l <files>`; it must print nothing.
 - A "verify failure" step whose expected result is a compile failure is complete when the compiler names the undefined identifiers listed.
 - Mutation checks are run one at a time, each reverted before the next; record each failing test line in the commit message.
-- **Existing tests that change** — three groups only: the `runRequest` callers in `internal/freshness/capacity_test.go` (new signature, Task 5, plus deferred minor B-29's rewrite of two timing windows there), `TestPhase2Chaos_AdoptionFlipUnderConcurrency` and its detached twin `TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency` (their logged straddle counts become assertions and their AIDEV-NOTEs cite the barrier, Task 10), and one stale comment in `internal/gc/integration_test.go` (Task 4). Any other existing test that fails means the change is wrong.
+- **Existing tests that change** — four groups only: the `runRequest` callers in `internal/freshness/capacity_test.go` (new signature, Task 5, plus deferred minor B-29's rewrite of two timing windows there), `TestPhase2Chaos_AdoptionFlipUnderConcurrency` and its detached twin `TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency` (their logged straddle counts become assertions and their AIDEV-NOTEs cite the barrier, Task 10), deferred minor B-6's nil-safe rewrite of `TestCommitAdoption_FlipDescribesAdoptedAnchor`'s check-state assertion (Task 4), and one stale comment in `internal/gc/integration_test.go` (Task 4). Any other existing test that fails means the change is wrong.
 
 ## Rulings and design notes
 
@@ -46,21 +46,27 @@ Controller rulings (binding):
 Design notes (choices the spec leaves open — the boring, bounded option, with the reason):
 
 1. **Registration needs a row, and precedes the pointer read.** Spec C8 tracks only suites with rows. The handler reads the suite row, then registers (`AnchorStart`), then serves; the serve's own `GetSuiteFreshness` (in `trySnapshotHit`) is the authoritative pointer read. Registering after reading the pointer would let a flip commit in between and hand the client the old anchor after the flip. Cost: one extra indexed read per anchor request of a tracked suite; none when the gate is disabled.
-2. **An anchor in flight for 30 s or more is ignored, and so is its completion** ("anchors in flight longer than 30 s, apt's own timeout, are ignored"): a client that slow has given up, and counting its late completion would restart the quiet period for nobody.
-3. **A held request whose own context ends is not registered.** Its client is gone (request context) or the handler is closing (by then the server has force-closed connections); counting it in flight would delay the hold for a response nobody reads.
+2. **An anchor response still being sent 30 s after it started is no longer waited for** ("anchors in flight longer than 30 s, apt's own timeout, are ignored"), so one slow link cannot stall a flip or force a hold to expire. apt's `Acquire::http::Timeout` is an *inactivity* timeout, though: a client on a slow link may still finish receiving it, and may then straddle — the spec's residual, counted in `acu_flip_slow_anchor_reads_total` (design note 20). Its completion still counts while no hold of its suite is in progress (it can only delay phase A by the quiet period), but not during a hold, where it could push the hold into expiry (design review M1, accepted refinement).
+3. **A held request whose own context ends is not registered.** Its client is gone (request context) or the handler is closing (by then the server has force-closed connections); counting it in flight would delay the hold for a response nobody reads. An HTTPS request through the MITM pipeline keeps its inner context when its client disconnects (`internal/proxy/connect.go`: once the connection is hijacked, net/http no longer cancels `r.Context()`), so such a waiter stays until the hold ends (at most 20 s) and counts against the waiter cap meanwhile (design review M13; no test: the MITM rig is not cheap to drive into a hold).
 4. **One expiry counter.** `acu_flip_hold_expired_total` counts every hold that reached its 20 s bound, whether the commit had not started (it then starts) or was still running (it continues): both are the documented phase-B-expiry residual.
 5. **The first-adoption skip compares the form's primary anchor** — `<suite>/InRelease` (inline) or `<suite>/Release` (detached) — with the url_path row's blob. Index consistency depends on the Release text a client holds, not on its detached signature. A lookup error runs the barrier (the safe direction).
-6. **The first adoption's `adopted_at`** is `max(now, MAX(last_fetched_at) + 1)` over the suite's `InRelease`, `Release` and `Release.gpg` url_path rows, read inside `CommitAdoption` before Step 3c re-seeds those rows: every anchor a client could hold was served with that `Last-Modified` or older.
+6. **The first adoption's `adopted_at`** is `max(now, MAX(last_fetched_at) + 1)` over the suite's `InRelease`, `Release` and `Release.gpg` url_path rows, read inside `CommitAdoption` before Step 3c re-seeds those rows. A url_path serve's `Last-Modified` is its pool file's mtime, not `last_fetched_at`; `runFetch` finalizes the pool file just before it stamps the row, so the mtime is not later than `last_fetched_at` (HTTP dates truncate to seconds), and every anchor a client could hold was served with that `Last-Modified` or older — by that ordering, not by construction (phase G carry-forward, Task 11).
 7. **The `Last-Modified` floor also applies on the snapshot-member recovery path** (anchor blob lost and re-fetched): it serves a snapshot anchor too.
 8. **Idle entries are swept lazily** (on gate calls, at most once per quiet period): no background goroutine. An idle entry's last completion is older than the quiet period, so dropping it loses nothing.
 9. **The adoption's heartbeat ticker runs until the adoption returns, not until its deadline**: the barrier may outlast `max_duration` (R-C2), and the candidate and its member blobs must stay protected until the commit.
-10. **`adoption_flip_barrier`** (INFO; spec C11 names it but gives no fields): `canonical_host`, `suite_path`, `snapshot_id`, `outcome` (`held`, `hold_expired`, `hold_skipped`, `not_needed`), `phase_a_seconds`, `token_wait_seconds`, `hold_seconds`, `held_requests`. Not logged when the barrier is disabled or when shutdown abandoned the wait (the adoption's own failure line covers that).
+10. **`adoption_flip_barrier`** (INFO; spec C11 names it but gives no fields): `canonical_host`, `suite_path`, `snapshot_id`, `outcome` (`held`, `hold_expired`, `hold_skipped`, `not_needed`, or `commit_failed` when the commit ran and failed — the snapshot did not switch, design review M7), `phase_a_seconds`, `token_wait_seconds`, `hold_seconds`, `held_requests` (the last four absent on the first-adoption skip). Not logged when the barrier is disabled or when shutdown abandoned the wait (the adoption's own failure line covers that).
 11. **Token hand-off:** the next queued flip's hold starts the instant the previous hold ends (pending is marked at the grant), so its 20 s bound runs from there.
-12. **Test seams:** the gate copies its three bounds (phase A, token wait, hold) into unexported fields that only `internal/flipgate` unit tests shorten; every simulation runs the real constants.
+12. **Test seams:** the gate copies its three bounds (phase A, token wait, hold) into unexported fields that only `internal/flipgate` unit tests shorten, and its unexported `onExpire` hook (nil in production) lets one unit test inject a panic into the hold-expiry timer; every simulation runs the real constants.
 13. **Wiring:** `buildAdopter` builds the gate from `adoption.flip_quiet_period` and passes it in `AdoptionConfig.FlipGate`; `Adopter.FlipGate()` (nil-safe: no adopter, no gate) hands the same gate to the handler through `main`'s new `handlerConfig` helper, which makes the wiring testable without starting the daemon. The handler's `KeepDisplaced` is `gc.keep_displaced`, also when `gc.enabled = false` (displaced snapshots then accumulate; the search stays bounded).
-14. **`Run`/`RunDetached` callers** (tests, no checker) have no lifetime context: their barrier runs to its own bounds, and a cancelled `ctx` still abandons the adoption before the commit, as today.
+14. **`Run`/`RunDetached` callers** (tests, no checker) have no lifetime context: a `ctx` cancelled before the barrier still abandons the adoption, as today; once inside the barrier, which waits under `context.WithoutCancel(ctx)`, they run to its bounds (design review M8).
 15. **Retained by-hash searches the newest `keep_displaced + 1` displaced, non-retired snapshots** (what GC keeps, plus the one a flip displaced since GC last ran) and serves from the newest of them that holds the alias; it never searches further back. A database error answers the pre-C8 404 and logs a WARN.
-16. **Deferred minor B-64:** the daemon's shutdown logs INFO `shutdown_waiting_for_adoptions` once if the adoption drain has not finished after 2 s.
+16. **Deferred minor B-64:** the daemon's shutdown logs INFO `shutdown_waiting_for_adoptions` once if the drain has not finished after 2 s. The drain waits for adoption, repair and reconcile goroutines, including member pipelines still unwinding, and its `detail` says so.
+17. **A hold that held no request starts no cross-suite quiet period** (design review I1, accepted; deviation 5). Phase A (b) and phase B (b) exist because a hold delays other suites' requests queued behind a held one on a client's shared connection; a hold with `heldTotal == 0` delayed nobody. `endHoldLocked` therefore updates `lastEnd`/`lastEndBy`/`prevEnd` only for holds that held at least one request (a held request whose client then left still counts — the safe side). Without this, every flip that is not skipped — including an idle suite's zero-length hold — would delay every other flip process-wide by up to the quiet period while keeping its global slot. A hold still in progress keeps blocking phase A (b): it may yet hold requests.
+18. **`main` closes the gate at the shutdown signal** (design review M3; controller ruling: yes). `(*Gate).Close` ends the hold in progress (its waiters are answered from the snapshot current then), starts no further hold, and makes every `Flip` that has not started its commit — in phase A, waiting for the token, holding, or called later — return `ErrAborted` wrapping `ErrClosed`; a commit that has started runs to its end. `main` calls it right after the signal, before the listeners drain, so barrier waits end at once and no commit starts late in the stop window. The lifetime context still runs then, so `spawnAdoption` never records an error that matches `flipgate.ErrAborted` (shutdown is not a failure, spec C7). A disabled gate ignores `Close` (`0s` stays the phase-B behaviour). `anchorStart` keeps ending a wait on handler shutdown as defence in depth (design review M19's removal of that context was not applied: not trivial, it changes Task 6's tests).
+19. **`timed_out` only for a deadline that fired before the member pipeline finished** (design review I2, accepted). Under R-C2 the deadline can pass while the adoption waits in the barrier; `spawnAdoption` then leaves the outcome to the commit's own error (`db_failed`, a refusal from phase E on, or `timed_out` through the chain when the commit hit `commitTimeout`). `membersDone` sets a flag on the adoption goroutine, which is what `spawnAdoption` tests.
+20. **Every residual has its own unlabelled counter** (design review M2; controller ruling: count them): `acu_flip_hold_expired_total` and `acu_flip_hold_skipped_total` (spec C8), plus `acu_flip_waiters_over_cap_total` (a request served at once because 256 already wait in the hold) and `acu_flip_slow_anchor_reads_total` (an anchor response that took 30 s or longer to send). `acu_flip_gate_panics_total` counts panics recovered in the hold-expiry timer — a bug's trace that does not depend on the logger (`internal/flipgate` has none). All are listed in `internal/freshness/metrics.go`'s inventory note and in `docs/log-fields.md`.
+21. **`Last-Modified` across a clock step during an adoption is documented, not coded** (design review M5). Folding the previous anchor blobs' mtimes into `adoptionStampTx` would close it, but one future-dated pool file (a restored backup, a `touch`) would then push every later `adopted_at` into the future, and it would change stamps under every test's stubbed clock. `docs/configuration.md` states the gap (`Last-Modified` stays monotonic across same-second flips and backward steps between flips; a step back during an adoption can leave the next flip's `Last-Modified` below the previous one for up to the step's length).
+22. **The admission bound with the barrier is simulated** (design review M15): `TestSimCapacity_TheBarrierHoldsTheGlobalSlotWithinItsBound` (Task 5, 0.4 s under `-race`) runs the scheduler with a pool of two, two busy signed suites in the barrier and a third signed suite queued behind them.
 
 ## Deliberate deviations from the spec
 
@@ -68,6 +74,8 @@ Design notes (choices the spec leaves open — the boring, bounded option, with 
 2. **"At most three hold" is replaced by what the rules guarantee** (spec §9 phase C row; the C8 residual "hold-token timeout (more than three suites flipping at once)"; the overview's "C:" line). A flip waits for the token only behind other holds, each over within 20 s. Three holds that end normally take less than 60 s, so a fourth simultaneous flip always gets the token; the token wait expires only from the fifth simultaneous busy flip (the fourth only if every hold runs exactly to its bound). The DoD simulation therefore asserts: holds never overlap and each lasts at most 20 s; with holds near that bound four hold and the fifth commits unheld exactly 60 s after asking for the token (within 60 s + 20 s of the first hold's start) and is counted; held suites never straddle. Under the default `max_concurrent_adoptions = 2` at most one flip ever waits for the token (R-C1), so it cannot time out at all. Task 11 corrects the spec and overview text.
 3. **Retained by-hash serves SHA512 aliases from phase C** (spec §7: "SHA256 in C, SHA512 in E"). The lookup is algorithm-agnostic and the SHA512 rule ("rely on the verified `snapshot_member` binding") needs no new data; phase C tests it with fixture rows, and phase E adds the adoption step that writes SHA512 alias rows.
 4. **`snapshot_displaced`** (spec C11 lists the field without defining it) is a presence-as-signal boolean on the `request` log line of a retained by-hash serve; `X-Cache-Snapshot` names the displaced snapshot.
+5. **Phase A (b) and phase B (b) apply only to holds that held at least one request** (spec C8 says "no hold … ended within the same period"; design review I1, accepted; design note 17). Task 11 amends spec C8.
+6. **`adoption.flip_quiet_period` is `0s` or between `1s` and `15s`** (spec C11: "`0s` disables; ≤ `15s`"; controller ruling): a sub-second period protects almost no one. Config validation and `flipgate.New` both enforce it; Task 11 amends spec C11.
 
 ## Definitions: straddle and the client model
 
@@ -76,12 +84,13 @@ The simulations count straddles with `simtest.Ledger` (Task 2), whose doc commen
 - **Client model (apt's).** One connection, one request at a time: apt keeps one connection and queue per host, and beyond 10 hosts and in mirror mode every source shares it. An update queues the anchors of its sources, and possibly *fillers* (unrelated downloads that keep the connection busy). When an anchor response has fully arrived, that suite's index request joins the **end** of the queue. A response takes its transfer time to arrive; a slow link keeps the anchor serve in flight at the cache for that long.
 - **Generation.** The `X-Cache-Snapshot` a response carried. In the model simulations (Task 2) it is the suite's generation counter at the moment the serve read it — after `AnchorStart` returned, as in the handler; in the end-to-end simulations (Task 10) it is the snapshot id the real handler served.
 - **Straddle.** An index response for suite *S* whose generation differs from that of the anchor of *S* the same client received earlier in the same update, when the index request was sent less than the guarantee window (`flip_quiet_period`) after that anchor's arrival — **not counting time the client's queue spent on responses the cache held**. (A request sent exactly at the window's end races a commit made at that same instant — the gate counts a suite quiet once a full period has passed — so it is outside the guarantee.) A hold must not push a client out of its window: that is the cross-suite case the hold token and phase B's cross-suite quiet exist for. Index requests sent later are outside the guarantee and are not checked. In every simulation below the clients' own transfers are short, so their index requests fall inside the window and every mismatch counts.
+- **Where the window starts.** The gate measures quiet from when the cache finished *sending* the anchor (`Token.Done`, after the handler returns); the ledger measures from when the client *received* it. In production, kernel send buffering makes the first earlier on a slow link (by at most the buffered bytes over the link's bandwidth), so the effective window is slightly shorter than `flip_quiet_period` (design review M12). In the simulations the two instants coincide.
 
 ## Review Focus (phase C share)
 
 1. **Clients sharing one apt queue** (mirror mode, many sources on one host) while several suites flip must not straddle — Tasks 1, 2, 10.
 2. **Very large suites and slow clients** (commits or anchor reads longer than the hold) must degrade to today's behaviour, never to client timeouts: no hold exceeds 20 s — Tasks 1, 2, 10.
-3. **Shutdown and deadlines:** an adoption in the barrier must never commit after shutdown, never lose finished member work to `max_duration`, and never keep its host slot — Task 5.
+3. **Shutdown and deadlines:** an adoption in the barrier must never commit after shutdown (the gate closes at the signal), never be recorded as a failure for it, never lose finished member work to `max_duration` nor be mislabelled `timed_out` for a deadline that passed in the barrier, and never keep its host slot — Tasks 1, 5, 9.
 4. **No wedge:** every barrier exit (commit, commit failure, panic, expiry, abort, token timeout) releases the hold, its waiters and the token — Task 1.
 5. **Clock steps and same-second flips** must never produce a 304 for a changed anchor — Tasks 4, 7.
 6. **Off is free and on is bounded:** `0s` changes nothing; gate state exists only for tracked suites, expires when idle and is capped per suite — Tasks 1, 6.
@@ -92,26 +101,28 @@ The simulations count straddles with `simtest.Ledger` (Task 2), whose doc commen
 |---|---|
 | `internal/flipgate/gate.go`, `metrics.go` (+ `gate_test.go`, `imports_test.go`, `sim_test.go`) | New: the barrier, its counters, unit tests, model simulations. |
 | `internal/simtest/aptclient.go` (+ `aptclient_test.go`) | apt client model and straddle ledger. |
-| `internal/config/config.go` (+ `config_test.go`), `packaging/config/config.toml.default` | `adoption.flip_quiet_period`. |
+| `internal/config/config.go` (+ `config_test.go`), `packaging/config/config.toml.default` | `adoption.flip_quiet_period` (`0s`, or `1s` to `15s`). |
 | `internal/cache/adoption.go` (+ `flip_state_test.go`, `displaced_members_test.go`) | Monotonic `adopted_at`; `DisplacedSnapshotMembers`; B-7, B-6. |
 | `internal/gc/integration_test.go` | Stale comment only. |
-| `internal/freshness/adoption.go`, `freshness.go`, `metrics.go` (+ `flip_barrier_test.go`, `capacity_test.go`) | Commit behind the barrier; `runHooks` (B-65); first-adoption skip; event; heartbeat; R-C4 test; B-15, B-26, B-29, B-68. |
+| `internal/freshness/adoption.go`, `freshness.go`, `metrics.go` (+ `flip_barrier_test.go`, `capacity_test.go`) | Commit behind the barrier; `runHooks` (B-65); first-adoption skip; event (`commit_failed`); heartbeat; `timed_out` only before the barrier; no record for a flip abandoned at shutdown; R-C4 test; admission-bound simulation; B-15, B-26, B-29, B-68. |
 | `internal/handler/handler.go`, `metrics.go` (+ `flip_stack_test.go`, `flip_hook_test.go`, `anchor_lastmod_test.go`, `wallclock_stamps_test.go`, `byhash_displaced_test.go`, `sim_flip_test.go`, `phase2_chaos_test.go`, `phase2_detached_chaos_test.go`) | Anchor hook; `Last-Modified` floor; retained by-hash; end-to-end simulations; A-3 (handler half), A-54. |
-| `cmd/apt-cacher-ultra/main.go` (+ `flip_wiring_test.go`) | Wiring; B-64; A-48. |
+| `cmd/apt-cacher-ultra/main.go` (+ `flip_wiring_test.go`) | Wiring; `Gate.Close` at the shutdown signal; B-64; A-48. |
 | `README.md`, `docs/configuration.md`, `docs/log-fields.md`, the spec, `internal/freshness/scheduler.go` (doc only), the overview, both deferred files | Documentation, amendments (R-C3, deviation 2, A-7, A-16, A-57), stamps. |
 
 ---
 
 ### Task 1: The flip barrier package (`internal/flipgate`)
 
-Spec C8 "New package `internal/flipgate`", the gate half of "Handler side", "Adopter side" (phase A, the hold token, phase B, expiry), the skip for `flip_quiet_period = 0s`, "Map entries … expire when idle for twice the quiet period, and are purged on reap", and the C11 constants and counters. The handler's "suites with a row" rule is Task 6's; the first-adoption skip is Task 5's.
+Spec C8 "New package `internal/flipgate`", the gate half of "Handler side", "Adopter side" (phase A, the hold token, phase B, expiry), the skip for `flip_quiet_period = 0s`, "Map entries … expire when idle for twice the quiet period, and are purged on reap", and the C11 constants and counters. Design notes 2 (slow anchors), 17 (holds that held nothing), 18 (`Close`) and 20 (a counter per residual); deviations 5 and 6; design review M6 (deferred unlocks; the expiry timer's recovered panic is counted), M11 (`expire.Stop()` before the hold's end), M18 (`MaxQuiet < HoldMax` pinned) and M19 (the `changed` channel is made only when a flip waits, so an anchor completion nobody waits for allocates nothing). The handler's "suites with a row" rule is Task 6's; the first-adoption skip is Task 5's.
+
+Expectations the review revision changed, and why: `TestFlip_IgnoresAnchorsInFlightPastAptsTimeout`'s second flip now waits the quiet period, because a completion after 30 s counts while no hold is in progress (design note 2, design review M1); a third part checks that one during a hold is still ignored. `TestNew_QuietBounds` rejects sub-second periods (deviation 6) and pins `MaxQuiet < HoldMax` (M18). `TestFlip_HoldsAreExclusiveFIFOAndQuietAfterEachOther` keeps its assertions; its comment now says why c still waits after b's hold, which holds nothing (design note 17). The executability review's P3 (`TestGate_SweepKeepsTheEntryOfAFlipInProgress`) gains a request held in a's hold: under design note 17 a hold that held nothing would not keep k in phase A until 30 s.
 
 **Files:**
 - Create: `internal/flipgate/gate.go`, `internal/flipgate/metrics.go`, `internal/flipgate/gate_test.go`, `internal/flipgate/imports_test.go`
 
 **Interfaces:**
 - Consumes: `internal/metrics` (`NewCounter`, `Default.Render`).
-- Produces (package `flipgate`): constants `MaxQuiet`, `PhaseAMax`, `TokenWaitMax`, `HoldMax`, `AnchorTimeout`, `MaxWaiters`; `ErrQuietOutOfRange`, `ErrAborted`; `type Config struct{ Quiet time.Duration }`; `type Outcome string` with `OutcomeDisabled`, `OutcomeHeld`, `OutcomeHoldExpired`, `OutcomeHoldSkipped`, `OutcomeAborted`; `type Result struct{ Outcome Outcome; PhaseA, TokenWait time.Duration; HoldStart, HoldEnd time.Time; Waiters int; Committed bool }`; `type Stats struct{ Flips, Holds, HoldsExpired, HoldsSkipped, Aborted, HeldRequests int }`; `New(Config) (*Gate, error)`; `Key(scheme, host, suitePath string) string`; `(*Gate).Enabled() bool`, `.Quiet() time.Duration`, `.Stats() Stats`, `.Len() int`, `.Purge(key string) bool`, `.AnchorStart(ctx, key) *Token`, `.Flip(ctx, key, commit func() error) (Result, error)`; `(*Token).Done()`; counters `acu_flip_hold_skipped_total`, `acu_flip_hold_expired_total`. Test helpers in package `flipgate` (Task 2 uses them): `testQuiet`, `bg`, `newGate`, `newTestGate`, `noCommit`, `flipOut`, `flipAsync`, `busyReaders`, `counterValue`.
+- Produces (package `flipgate`): constants `MinQuiet`, `MaxQuiet`, `PhaseAMax`, `TokenWaitMax`, `HoldMax`, `AnchorTimeout`, `MaxWaiters`; `ErrQuietOutOfRange`, `ErrAborted`, `ErrClosed`; `type Config struct{ Quiet time.Duration }`; `type Outcome string` with `OutcomeDisabled`, `OutcomeHeld`, `OutcomeHoldExpired`, `OutcomeHoldSkipped`, `OutcomeAborted`; `type Result struct{ Outcome Outcome; PhaseA, TokenWait time.Duration; HoldStart, HoldEnd time.Time; Waiters int; Committed bool }`; `type Stats struct{ Flips, Holds, HoldsExpired, HoldsSkipped, Aborted, HeldRequests int }`; `New(Config) (*Gate, error)`; `Key(scheme, host, suitePath string) string`; `(*Gate).Enabled() bool`, `.Quiet() time.Duration`, `.Stats() Stats`, `.Len() int`, `.Purge(key string) bool`, `.Close()`, `.AnchorStart(ctx, key) *Token`, `.Flip(ctx, key, commit func() error) (Result, error)`; `(*Token).Done()`; counters `acu_flip_hold_skipped_total`, `acu_flip_hold_expired_total`, `acu_flip_waiters_over_cap_total`, `acu_flip_slow_anchor_reads_total`, `acu_flip_gate_panics_total`; the unexported test seam `Gate.onExpire`. Test helpers in package `flipgate` (Task 2 uses them): `testQuiet`, `bg`, `newGate`, `newTestGate`, `noCommit`, `flipOut`, `flipAsync`, `busyReaders`, `counterValue`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -256,16 +267,23 @@ func counterValue(t *testing.T, name string) float64 {
 	return 0
 }
 
+// adoption.flip_quiet_period is 0s or within [1s, 15s] (controller
+// ruling): a sub-second period gives almost no protection.
 func TestNew_QuietBounds(t *testing.T) {
-	for _, q := range []time.Duration{-time.Second, MaxQuiet + time.Nanosecond} {
+	for _, q := range []time.Duration{-time.Second, time.Nanosecond, MinQuiet - time.Nanosecond, MaxQuiet + time.Nanosecond} {
 		if _, err := New(Config{Quiet: q}); !errors.Is(err, ErrQuietOutOfRange) {
 			t.Errorf("Quiet %v: err = %v, want ErrQuietOutOfRange", q, err)
 		}
 	}
-	for _, q := range []time.Duration{0, time.Second, MaxQuiet} {
+	for _, q := range []time.Duration{0, MinQuiet, MaxQuiet} {
 		if _, err := New(Config{Quiet: q}); err != nil {
 			t.Errorf("Quiet %v: %v", q, err)
 		}
+	}
+	// Phase B (b) can always be satisfied inside a hold only because a
+	// whole quiet period fits in one (design review M18).
+	if MaxQuiet >= HoldMax {
+		t.Errorf("MaxQuiet %v must stay below HoldMax %v", MaxQuiet, HoldMax)
 	}
 }
 
@@ -350,11 +368,15 @@ func TestFlip_WaitsForQuietAfterTheLastAnchor(t *testing.T) {
 	})
 }
 
-// apt gives up on a read after 30 s: an anchor in flight that long is
-// ignored, and so is its eventual completion (spec C8 residual).
+// Design note 2: an anchor response still being sent 30 s after it
+// started is treated as abandoned — the barrier stops waiting for it, so
+// one slow link cannot stall a flip or force a hold to expire — and is
+// counted (spec C8 residual). Its completion still counts while no hold of
+// the suite is in progress, but not during a hold.
 func TestFlip_IgnoresAnchorsInFlightPastAptsTimeout(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := newTestGate(t)
+		slowReads := counterValue(t, "acu_flip_slow_anchor_reads_total")
 		slow := g.AnchorStart(bg, "k")
 		start := time.Now()
 		if _, err := g.Flip(bg, "k", noCommit); err != nil {
@@ -364,13 +386,33 @@ func TestFlip_IgnoresAnchorsInFlightPastAptsTimeout(t *testing.T) {
 			t.Fatalf("flip returned after %v, want %v (the in-flight read is ignored then)", got, AnchorTimeout)
 		}
 		time.Sleep(15 * time.Second)
-		slow.Done() // completes 45 s after it started: ignored
+		slow.Done() // completes 45 s after it started, no hold in progress: it counts
+		start = time.Now()
+		if _, err := g.Flip(bg, "k", noCommit); err != nil {
+			t.Fatal(err)
+		}
+		if got := time.Since(start); got != testQuiet {
+			t.Fatalf("a completion after apt's timeout, outside a hold, delayed the next flip by %v, want %v", got, testQuiet)
+		}
+		slow = g.AnchorStart(bg, "k") // 55 s
+		slowStart := time.Now()
+		release := make(chan struct{})
+		out := flipAsync(bg, g, "k", func() error { <-release; return nil }) // holds from 85 s, when slow is ignored
+		time.Sleep(40 * time.Second)
+		slow.Done()    // 95 s, during the hold: ignored
+		close(release) // the hold ends at 95 s
+		if o := <-out; o.err != nil || o.res.HoldStart.Sub(slowStart) != AnchorTimeout {
+			t.Fatalf("flip = %+v, %v; want a hold from %v after the read started", o.res, o.err, AnchorTimeout)
+		}
 		start = time.Now()
 		if _, err := g.Flip(bg, "k", noCommit); err != nil {
 			t.Fatal(err)
 		}
 		if got := time.Since(start); got != 0 {
-			t.Fatalf("a completion after apt's timeout delayed the next flip by %v", got)
+			t.Fatalf("a completion after apt's timeout, during a hold, delayed the next flip by %v", got)
+		}
+		if got := counterValue(t, "acu_flip_slow_anchor_reads_total") - slowReads; got != 2 {
+			t.Fatalf("acu_flip_slow_anchor_reads_total rose by %v, want 2", got)
 		}
 	})
 }
@@ -538,10 +580,13 @@ func TestFlip_SlowCommitEndsTheHoldAt20s(t *testing.T) {
 
 // One hold at a time, granted in request order; the next hold starts
 // when the previous one ends and commits no sooner than the quiet period
-// after that end: clients released from the other hold may still have
-// this suite's requests queued behind it (spec C8 phase B (b)). b's own
-// readers stop at 55 s, so when its hold starts (~70 s) only the
-// cross-suite rule keeps it from committing at once.
+// after that end. b's own readers stop at 55 s, so when its hold starts
+// (~70 s) only the cross-suite rule keeps it from committing at once:
+// a's hold held requests, and clients released from it may still have
+// b's requests queued behind them (spec C8 phase B (b)). b's hold holds
+// nothing, so it starts no cross-suite quiet period (design note 17); c
+// is kept a quiet period past b's end by its own reads, still in flight
+// when its hold starts.
 func TestFlip_HoldsAreExclusiveFIFOAndQuietAfterEachOther(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := newTestGate(t)
@@ -683,10 +728,14 @@ func TestAnchorStart_WaiterCap(t *testing.T) {
 		if n := returned.Load(); n != 0 {
 			t.Fatalf("%d of %d waiters returned during the hold", n, MaxWaiters)
 		}
+		overCap := counterValue(t, "acu_flip_waiters_over_cap_total")
 		extra := g.AnchorStart(bg, "k") // beyond the cap: served at once
 		extra.Done()
 		if st := g.Stats(); st.HeldRequests != MaxWaiters {
 			t.Fatalf("stats = %+v, want %d held requests", st, MaxWaiters)
+		}
+		if got := counterValue(t, "acu_flip_waiters_over_cap_total") - overCap; got != 1 {
+			t.Fatalf("acu_flip_waiters_over_cap_total rose by %v, want 1", got)
 		}
 		close(release)
 		wg.Wait()
@@ -957,11 +1006,261 @@ func TestGate_PurgeKeepsOldTokensHarmless(t *testing.T) {
 func TestCounters_AreRegistered(t *testing.T) {
 	var buf bytes.Buffer
 	metrics.Default.Render(&buf)
-	for _, name := range []string{"acu_flip_hold_skipped_total", "acu_flip_hold_expired_total"} {
+	for _, name := range []string{"acu_flip_hold_skipped_total", "acu_flip_hold_expired_total",
+		"acu_flip_waiters_over_cap_total", "acu_flip_slow_anchor_reads_total", "acu_flip_gate_panics_total"} {
 		if !strings.Contains(buf.String(), "# TYPE "+name+" counter") {
 			t.Errorf("%s is not registered", name)
 		}
 	}
+}
+
+// Spec §7 C8 DoD "phase-B expiry (commit or in-flight reader > 20 s)
+// counted": a commit slower than the hold is counted like a slow reader.
+func TestFlip_SlowCommitExpiryIsCounted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		expired := counterValue(t, "acu_flip_hold_expired_total")
+		res, err := g.Flip(bg, "k", func() error { time.Sleep(25 * time.Second); return nil })
+		if err != nil || res.Outcome != OutcomeHoldExpired {
+			t.Fatalf("Flip = %+v, %v; want a hold that expired during the commit", res, err)
+		}
+		if st := g.Stats(); st.HoldsExpired != 1 {
+			t.Fatalf("stats = %+v, want one expired hold", st)
+		}
+		if got := counterValue(t, "acu_flip_hold_expired_total") - expired; got != 1 {
+			t.Fatalf("acu_flip_hold_expired_total rose by %v, want 1", got)
+		}
+	})
+}
+
+// A grant that lands at the instant the token wait times out is taken (or
+// passed on), never leaked: once both flips have returned the token is free
+// and nothing is queued. The two events share one virtual instant, so the
+// order is up to the scheduler; 200 rounds make the late-grant path all but
+// certain.
+func TestFlip_GrantAtTheTokenTimeoutNeverLeaksTheHold(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		g.phaseAMax, g.tokenWait = 0, 5*time.Second
+		for i := 0; i < 200; i++ {
+			outA := flipAsync(bg, g, "a", func() error { time.Sleep(5 * time.Second); return nil }) // holds 5 s
+			synctest.Wait()
+			outB := flipAsync(bg, g, "b", noCommit) // its 5 s token wait ends with a's hold
+			if a := <-outA; a.err != nil {
+				t.Fatal(a.err)
+			}
+			b := <-outB
+			if b.err != nil {
+				t.Fatal(b.err)
+			}
+			g.mu.Lock()
+			holder, queued := g.holder, len(g.queue)
+			g.mu.Unlock()
+			if holder != nil || queued != 0 {
+				t.Fatalf("round %d: b %s; holder %v and %d queued after both flips returned", i, b.res.Outcome, holder, queued)
+			}
+			time.Sleep(time.Minute) // every quiet period is over
+		}
+	})
+}
+
+// The idle sweep never drops the entry of a flip in progress. a's hold
+// holds a request, so k's flip waits in phase A for that hold and the quiet
+// period after it (until 30 s); a sweep at 25 s finds k's entry idle for
+// 24 s. A client that starts reading k's anchor at 26 s must still hold
+// k's commit back.
+func TestGate_SweepKeepsTheEntryOfAFlipInProgress(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		release := make(chan struct{})
+		outA := flipAsync(bg, g, "a", func() error { <-release; return nil }) // holds from 0 s to its 20 s bound
+		synctest.Wait()
+		go func() { g.AnchorStart(bg, "a").Done() }() // held until a's hold ends
+		time.Sleep(time.Second)
+		outK := flipAsync(bg, g, "k", noCommit)
+		time.Sleep(24 * time.Second)
+		g.AnchorStart(bg, "x").Done() // 25 s: sweeps
+		time.Sleep(time.Second)
+		reading := g.AnchorStart(bg, "k") // 26 s
+		time.Sleep(14 * time.Second)
+		readDone := time.Now()
+		reading.Done() // 40 s
+		k := <-outK
+		if k.err != nil {
+			t.Fatal(k.err)
+		}
+		if k.at.Before(readDone.Add(testQuiet)) {
+			t.Fatalf("k committed %v after the read it must wait for ended, want at least the quiet period", k.at.Sub(readDone))
+		}
+		close(release)
+		if a := <-outA; a.err != nil {
+			t.Fatal(a.err)
+		}
+	})
+}
+
+// A completion refreshes the entry's idle clock: an anchor read slower than
+// twice the quiet period that has just finished is not swept, so a flip
+// right after it still waits out the quiet period.
+func TestGate_SweepKeepsAJustFinishedSlowRead(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		slow := g.AnchorStart(bg, "k") // 0 s (this call sweeps an empty map)
+		time.Sleep(25 * time.Second)
+		slow.Done() // 25 s: under apt's 30 s timeout, so it counts
+		time.Sleep(time.Second)
+		g.AnchorStart(bg, "x").Done() // 26 s: sweeps
+		start := time.Now()
+		if _, err := g.Flip(bg, "k", noCommit); err != nil {
+			t.Fatal(err)
+		}
+		if got := time.Since(start); got != 9*time.Second {
+			t.Fatalf("flip waited %v, want 9s (the quiet period after the 25 s completion)", got)
+		}
+	})
+}
+
+// The waiter cap counts the requests waiting now: a waiter whose client left
+// frees its place, so a later request still waits in the hold.
+func TestAnchorStart_WaiterCapCountsOnlyCurrentWaiters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		release := make(chan struct{})
+		out := flipAsync(bg, g, "k", func() error { <-release; return nil }) // idle: holds at once
+		synctest.Wait()
+		ctx, cancel := context.WithCancel(bg)
+		var wg sync.WaitGroup
+		for i := 0; i < MaxWaiters; i++ {
+			c := bg
+			if i == 0 {
+				c = ctx
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				g.AnchorStart(c, "k").Done()
+			}()
+		}
+		synctest.Wait()
+		cancel() // one waiting client leaves
+		synctest.Wait()
+		late := make(chan struct{})
+		go func() {
+			g.AnchorStart(bg, "k").Done()
+			close(late)
+		}()
+		synctest.Wait()
+		select {
+		case <-late:
+			t.Fatalf("a request was served during the hold with only %d others waiting", MaxWaiters-1)
+		default:
+		}
+		close(release)
+		wg.Wait()
+		<-late
+		if o := <-out; o.err != nil {
+			t.Fatal(o.err)
+		}
+	})
+}
+
+// Design note 17 (design review I1): a hold that held no request delayed
+// no client's queue, so it starts no cross-suite quiet period: an idle
+// suite that flips a second after another idle suite's flip commits at
+// once.
+func TestFlip_HoldsThatHeldNothingDoNotDelayOtherFlips(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		if res, err := g.Flip(bg, "a", noCommit); err != nil || res.Waiters != 0 {
+			t.Fatalf("a: %+v, %v; want a hold that held nothing", res, err)
+		}
+		time.Sleep(time.Second)
+		start := time.Now()
+		res, err := g.Flip(bg, "b", noCommit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.PhaseA != 0 || time.Since(start) != 0 {
+			t.Fatalf("b: phase A %v, committed after %v; want both 0 (a's hold held nothing)", res.PhaseA, time.Since(start))
+		}
+	})
+}
+
+// Design note 18 (design review M3): main closes the gate at the shutdown
+// signal. Every flip that has not started its commit — in phase A, waiting
+// for the token, or called later — returns ErrAborted wrapping ErrClosed at
+// once; the hold in progress ends and answers its waiters, and no hold
+// starts again; a commit already running finishes.
+func TestGate_CloseAbortsEveryFlipNotYetCommitting(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		g.phaseAMax = time.Second
+		release := make(chan struct{})
+		committing := flipAsync(bg, g, "a", func() error { <-release; return nil }) // idle: holds at once
+		synctest.Wait()
+		held := make(chan time.Time, 1)
+		go func() { g.AnchorStart(bg, "a").Done(); held <- time.Now() }() // waits in a's hold
+		busyB := g.AnchorStart(bg, "b")
+		defer busyB.Done()
+		queued := flipAsync(bg, g, "b", noCommit) // phase A gives up at 1 s; then it queues for the token
+		time.Sleep(1500 * time.Millisecond)
+		busyC := g.AnchorStart(bg, "c")
+		defer busyC.Done()
+		inPhaseA := flipAsync(bg, g, "c", noCommit) // in phase A until 2.5 s
+		time.Sleep(500 * time.Millisecond)
+		closedAt := time.Now()
+		g.Close()
+		for name, ch := range map[string]<-chan flipOut{"queued for the token": queued, "in phase A": inPhaseA} {
+			o := <-ch
+			if !errors.Is(o.err, ErrAborted) || !errors.Is(o.err, ErrClosed) || o.res.Committed || !o.at.Equal(closedAt) {
+				t.Errorf("%s: %+v, %v, %v after Close; want ErrAborted wrapping ErrClosed at once and no commit",
+					name, o.res, o.err, o.at.Sub(closedAt))
+			}
+		}
+		if at := <-held; !at.Equal(closedAt) {
+			t.Errorf("the held request was answered %v after Close, want at once", at.Sub(closedAt))
+		}
+		if _, err := g.Flip(bg, "d", func() error { t.Error("committed after Close"); return nil }); !errors.Is(err, ErrClosed) {
+			t.Errorf("a flip after Close: %v, want ErrAborted wrapping ErrClosed", err)
+		}
+		close(release)
+		if o := <-committing; o.err != nil || o.res.Outcome != OutcomeHeld || !o.res.Committed {
+			t.Fatalf("the commit in progress: %+v, %v; want it to finish", o.res, o.err)
+		}
+		if st := g.Stats(); st.Holds != 1 || st.Aborted != 3 {
+			t.Fatalf("stats = %+v, want one hold (none started after Close) and three aborted flips", st)
+		}
+	})
+}
+
+// Design review M6 (exec review observation 4): a panic in the hold-expiry
+// timer — a gate bug, injected here — is counted, and the timer's deferred
+// unlock keeps the gate usable: the commit's return still ends the hold
+// through the flip's own deferred end, and the next flip runs.
+func TestFlip_PanicInTheExpiryTimerLeavesTheGateUsable(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		g.onExpire = func() { panic("injected gate bug") }
+		panics := counterValue(t, "acu_flip_gate_panics_total")
+		out := flipAsync(bg, g, "k", func() error { time.Sleep(25 * time.Second); return nil })
+		time.Sleep(21 * time.Second) // the expiry timer fired, and panicked, at 20 s
+		if !g.mu.TryLock() {
+			g.mu.Unlock() // let the flip finish
+			t.Fatal("a panic in the expiry timer left the gate locked")
+		}
+		g.mu.Unlock()
+		o := <-out
+		if o.err != nil || !o.res.Committed || o.res.HoldEnd.Sub(o.res.HoldStart) != 25*time.Second {
+			t.Fatalf("Flip = %+v, %v; want the commit's return at 25 s to end the hold", o.res, o.err)
+		}
+		if got := counterValue(t, "acu_flip_gate_panics_total") - panics; got != 1 {
+			t.Fatalf("acu_flip_gate_panics_total rose by %v, want 1", got)
+		}
+		start := time.Now()
+		if _, err := g.Flip(bg, "k2", noCommit); err != nil || time.Since(start) != 0 {
+			t.Fatalf("the next flip: err %v after %v, want an immediate commit", err, time.Since(start))
+		}
+	})
 }
 ```
 
@@ -979,8 +1278,9 @@ package flipgate
 
 import "github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 
-// Spec C8 counters, unlabelled (spec C11: no suite labels). Listed in the
-// flat-repository inventory note in internal/freshness/metrics.go.
+// Spec C8 counters, unlabelled (spec C11: no suite labels): one per
+// documented residual, plus the expiry timer's recovered panics. Listed in
+// the flat-repository inventory note in internal/freshness/metrics.go.
 var (
 	holdSkippedTotal = metrics.NewCounter(
 		"acu_flip_hold_skipped_total",
@@ -989,6 +1289,18 @@ var (
 	holdExpiredTotal = metrics.NewCounter(
 		"acu_flip_hold_expired_total",
 		"Flip holds that reached their 20 s bound before the commit finished (spec C8).",
+	)
+	waitersOverCapTotal = metrics.NewCounter(
+		"acu_flip_waiters_over_cap_total",
+		"Anchor requests served at once during a flip hold because 256 requests already waited in it (spec C8).",
+	)
+	slowAnchorReadsTotal = metrics.NewCounter(
+		"acu_flip_slow_anchor_reads_total",
+		"InRelease/Release responses that took 30 s or longer to send; the flip barrier does not wait for them (spec C8).",
+	)
+	gatePanicsTotal = metrics.NewCounter(
+		"acu_flip_gate_panics_total",
+		"Panics recovered in the flip barrier's hold-expiry timer: a bug, the barrier stays usable (spec C8).",
 	)
 )
 ```
@@ -1005,15 +1317,19 @@ var (
 // matching indexes:
 //
 //   - Phase A waits, at most PhaseAMax, for natural quiet: no anchor of
-//     the suite in flight, none completed within the quiet period, and no
-//     hold in progress, or ended within the quiet period, anywhere.
+//     the suite in flight, none completed within the quiet period, no hold
+//     in progress anywhere, and none that held requests ended within the
+//     quiet period.
 //   - The flip then takes the process-wide hold token (FIFO, one holder at
 //     a time, waiting at most TokenWaitMax; on timeout it commits unheld).
 //   - Phase B holds the suite's new anchor requests until it is quiet and
-//     no other suite's hold ended within the quiet period, commits, and
-//     answers the held requests from the new snapshot — all within HoldMax
-//     of the grant; at that bound the hold ends regardless and a commit
-//     not yet started starts.
+//     no other suite's hold that held requests ended within the quiet
+//     period, commits, and answers the held requests from the new
+//     snapshot — all within HoldMax of the grant; at that bound the hold
+//     ends regardless and a commit not yet started starts.
+//
+// Close (the daemon's shutdown signal) ends the hold in progress and
+// abandons every flip that has not started its commit.
 //
 // AIDEV-NOTE: the gate never waits while holding its mutex: every wait is
 // a select on channels, timers and contexts, so it runs inside
@@ -1021,7 +1337,9 @@ var (
 // entry that was purged, or expired and re-created, is never confused by
 // a late Done. Every release is idempotent and the hold's end is deferred:
 // a commit that fails or panics still ends its hold, answers its waiters
-// and passes the token on.
+// and passes the token on. Code that a recover further up can unwind (the
+// adoption's, net/http's, the expiry timer's own) unlocks the mutex in a
+// defer, so a panic never leaves the gate locked.
 package flipgate
 
 import (
@@ -1033,8 +1351,14 @@ import (
 )
 
 // Spec C11 constants, not knobs.
+//
+// AIDEV-NOTE: MaxQuiet < HoldMax is load-bearing (TestNew_QuietBounds pins
+// it): phase B (b) can always be satisfied inside a hold only because a
+// whole quiet period fits in one, and the straddle guarantee relies on it.
 const (
-	// MaxQuiet is the largest adoption.flip_quiet_period.
+	// MinQuiet and MaxQuiet bound a non-zero adoption.flip_quiet_period;
+	// zero disables the barrier.
+	MinQuiet = time.Second
 	MaxQuiet = 15 * time.Second
 	// PhaseAMax bounds phase A, the wait for natural quiet without holds.
 	PhaseAMax = 60 * time.Second
@@ -1044,21 +1368,30 @@ const (
 	// HoldMax bounds a hold, from the token's grant, and so every held
 	// anchor request; it stays below apt's 30 s Acquire::http::Timeout.
 	HoldMax = 20 * time.Second
-	// AnchorTimeout is apt's HTTP timeout. An anchor in flight this long is
-	// ignored, and so is its completion: a client that slow has given up
-	// (a documented residual).
+	// AnchorTimeout is apt's 30 s Acquire::http::Timeout. apt's is an
+	// inactivity timeout, but the barrier treats an anchor response still
+	// being sent this long after it started as abandoned and stops waiting
+	// for it, so one slow link cannot stall a flip or force a hold to
+	// expire. A client that does finish it may straddle (a documented
+	// residual, counted in acu_flip_slow_anchor_reads_total); its
+	// completion still counts while no hold of its suite is in progress.
 	AnchorTimeout = 30 * time.Second
 	// MaxWaiters caps the requests waiting in one hold; a request beyond
-	// it is served at once and counts as in flight.
+	// it is served at once, counts as in flight and is counted
+	// (acu_flip_waiters_over_cap_total).
 	MaxWaiters = 256
 )
 
 var (
-	// ErrQuietOutOfRange rejects a quiet period outside [0, MaxQuiet].
-	ErrQuietOutOfRange = errors.New("flipgate: flip quiet period must be between 0s and 15s")
-	// ErrAborted reports that the flip's context ended before its commit
-	// started, so nothing was committed. Flip wraps the context's error.
+	// ErrQuietOutOfRange rejects a quiet period that is neither zero nor
+	// within [MinQuiet, MaxQuiet].
+	ErrQuietOutOfRange = errors.New("flipgate: flip quiet period must be 0s or between 1s and 15s")
+	// ErrAborted reports that the flip's context ended, or the gate was
+	// closed, before its commit started, so nothing was committed. Flip
+	// wraps the cause: the context's error, or ErrClosed.
 	ErrAborted = errors.New("flipgate: flip abandoned before the commit")
+	// ErrClosed is the cause of a flip abandoned because Close ran.
+	ErrClosed = errors.New("flipgate: gate closed")
 )
 
 // Config configures a Gate.
@@ -1076,7 +1409,7 @@ const (
 	OutcomeHeld        Outcome = "held"         // committed within its hold
 	OutcomeHoldExpired Outcome = "hold_expired" // the hold reached HoldMax before the commit finished
 	OutcomeHoldSkipped Outcome = "hold_skipped" // no token within TokenWaitMax: committed unheld
-	OutcomeAborted     Outcome = "aborted"      // ctx ended before the commit started: nothing committed
+	OutcomeAborted     Outcome = "aborted"      // ctx ended or the gate closed before the commit started: nothing committed
 )
 
 // Result describes one Flip.
@@ -1096,7 +1429,7 @@ type Stats struct {
 	Holds        int // holds started
 	HoldsExpired int // holds that reached HoldMax before their commit finished
 	HoldsSkipped int // flips that committed unheld after waiting TokenWaitMax
-	Aborted      int // flips whose context ended before the commit started
+	Aborted      int // flips whose context ended, or whose gate closed, before the commit started
 	HeldRequests int // anchor requests that waited in a hold
 }
 
@@ -1106,16 +1439,22 @@ type Gate struct {
 	// The spec C11 bounds, copied from the constants by New; unexported so
 	// that only this package's unit tests shorten them.
 	phaseAMax, tokenWait, holdMax time.Duration
+	// onExpire is a test seam (nil in production): it runs, with the mutex
+	// held, whenever a hold reaches its bound.
+	onExpire func()
+	// closedCh is closed by Close; flips waiting for the token watch it.
+	closedCh chan struct{}
 
 	mu        sync.Mutex
 	entries   map[string]*entry
-	changed   chan struct{} // closed and replaced on every change a flip may wait for
+	changed   chan struct{} // closed on every change a flip may wait for; nil while no flip waits
 	holder    *hold         // the hold in progress, nil if none
 	queue     []*tokenWaiter
-	lastEnd   time.Time // when the most recent hold ended (zero: none yet)
+	lastEnd   time.Time // when the most recent hold that held requests ended (zero: none yet)
 	lastEndBy *entry    // whose hold that was
-	prevEnd   time.Time // the most recent hold end by an entry other than lastEndBy
+	prevEnd   time.Time // the most recent such end by an entry other than lastEndBy
 	lastSweep time.Time
+	closed    bool
 	stats     Stats
 }
 
@@ -1155,7 +1494,7 @@ type Token struct {
 // New returns a gate. A zero Quiet returns a disabled gate: AnchorStart
 // registers nothing and Flip commits at once (the pre-C8 behaviour).
 func New(cfg Config) (*Gate, error) {
-	if cfg.Quiet < 0 || cfg.Quiet > MaxQuiet {
+	if q := cfg.Quiet; q != 0 && (q < MinQuiet || q > MaxQuiet) {
 		return nil, fmt.Errorf("%w: %v", ErrQuietOutOfRange, cfg.Quiet)
 	}
 	return &Gate{
@@ -1163,8 +1502,8 @@ func New(cfg Config) (*Gate, error) {
 		phaseAMax: PhaseAMax,
 		tokenWait: TokenWaitMax,
 		holdMax:   HoldMax,
+		closedCh:  make(chan struct{}),
 		entries:   map[string]*entry{},
-		changed:   make(chan struct{}),
 	}, nil
 }
 
@@ -1221,6 +1560,30 @@ func (g *Gate) Purge(key string) bool {
 	return true
 }
 
+// Close ends the barrier at shutdown; main calls it at the signal, before
+// the listeners drain (design note 18). The hold in progress ends — its
+// waiters are answered from the snapshot current then — no hold starts
+// again, and every Flip that has not started its commit, waiting now or
+// called later, returns ErrAborted wrapping ErrClosed. A commit that has
+// started runs to its end. Idempotent. A nil or disabled gate ignores it:
+// with flip_quiet_period = 0s Flip commits at once, as before.
+func (g *Gate) Close() {
+	if !g.Enabled() {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return
+	}
+	g.closed = true
+	close(g.closedCh)
+	if g.holder != nil {
+		g.endHoldLocked(g.holder, false)
+	}
+	g.broadcastLocked()
+}
+
 // AnchorStart registers an anchor serve of key (spec C8, handler side) and
 // returns its token; Done must run once the response is written. It
 // returns at once unless a flip of key is holding anchors: then it waits
@@ -1233,26 +1596,15 @@ func (g *Gate) AnchorStart(ctx context.Context, key string) *Token {
 	if !g.Enabled() {
 		return nil
 	}
-	g.mu.Lock()
-	now := time.Now()
-	e := g.entryLocked(key, now)
-	h := e.hold
-	if h == nil || h.waiting >= MaxWaiters {
-		t := g.registerLocked(e, now)
-		g.mu.Unlock()
+	t, e, h := g.join(key)
+	if t != nil {
 		return t
 	}
-	h.waiting++
-	h.heldTotal++
-	g.stats.HeldRequests++
-	released := h.released
-	g.mu.Unlock()
-
 	timer := time.NewTimer(g.holdMax)
 	defer timer.Stop()
 	left := false
 	select {
-	case <-released:
+	case <-h.released:
 	case <-timer.C:
 	case <-ctx.Done():
 		left = true
@@ -1266,9 +1618,32 @@ func (g *Gate) AnchorStart(ctx context.Context, key string) *Token {
 	return g.registerLocked(e, time.Now())
 }
 
+// join registers an anchor serve of key and returns its token or, while a
+// flip of key holds anchors and fewer than MaxWaiters requests wait in that
+// hold, joins the hold instead: a nil token, with the entry and the hold.
+// A request beyond the cap is served at once and counted.
+func (g *Gate) join(key string) (*Token, *entry, *hold) {
+	g.mu.Lock()
+	defer g.mu.Unlock() // net/http recovers a panicking request: never leave the gate locked
+	now := time.Now()
+	e := g.entryLocked(key, now)
+	h := e.hold
+	if h == nil || h.waiting >= MaxWaiters {
+		if h != nil {
+			waitersOverCapTotal.Inc() // spec C8 residual: served at once
+		}
+		return g.registerLocked(e, now), nil, nil
+	}
+	h.waiting++
+	h.heldTotal++
+	g.stats.HeldRequests++
+	return nil, e, h
+}
+
 // Done records the serve's completion and drops it from its suite's
-// in-flight set. A serve that was in flight for AnchorTimeout or longer
-// records no completion (the barrier ignores it). Safe on a nil or
+// in-flight set. A serve that ran for AnchorTimeout or longer is counted
+// (acu_flip_slow_anchor_reads_total) and records its completion only while
+// no hold of its suite is in progress (design note 2). Safe on a nil or
 // unregistered Token, and idempotent.
 func (t *Token) Done() {
 	if t == nil || t.g == nil {
@@ -1284,7 +1659,13 @@ func (t *Token) Done() {
 	now := time.Now()
 	delete(t.e.inflight, t)
 	t.e.lastUse = now
-	if now.Sub(t.start) < AnchorTimeout && now.After(t.e.lastDone) {
+	late := now.Sub(t.start) >= AnchorTimeout
+	if late {
+		slowAnchorReadsTotal.Inc()
+	}
+	// A late completion can only delay phase A by the quiet period; during
+	// a hold it could push the hold into expiry, so it is ignored there.
+	if (!late || t.e.hold == nil) && now.After(t.e.lastDone) {
 		t.e.lastDone = now
 	}
 	g.broadcastLocked()
@@ -1292,10 +1673,10 @@ func (t *Token) Done() {
 
 // Flip runs commit behind the barrier for key and reports how it went.
 // ctx is the shutdown signal (the freshness checker's lifetime context),
-// never the adoption's deadline (ruling R-C2): when it ends before the
-// commit starts, Flip returns ErrAborted and commits nothing; a commit
-// that has started always runs to its end. commit's error is returned
-// as is.
+// never the adoption's deadline (ruling R-C2): when it ends, or the gate
+// is closed, before the commit starts, Flip returns ErrAborted and commits
+// nothing; a commit that has started always runs to its end. commit's
+// error is returned as is.
 func (g *Gate) Flip(ctx context.Context, key string, commit func() error) (Result, error) {
 	var res Result
 	if err := ctx.Err(); err != nil {
@@ -1314,9 +1695,9 @@ func (g *Gate) Flip(ctx context.Context, key string, commit func() error) (Resul
 	g.mu.Unlock()
 	defer func() {
 		g.mu.Lock()
+		defer g.mu.Unlock()
 		e.flips--
 		e.lastUse = time.Now()
-		g.mu.Unlock()
 	}()
 
 	// Phase A: natural quiet, no holds.
@@ -1324,10 +1705,16 @@ func (g *Gate) Flip(ctx context.Context, key string, commit func() error) (Resul
 	for {
 		g.mu.Lock()
 		now := time.Now()
+		closed := g.closed
 		okLocal, atLocal := g.localQuietLocked(e, now)
 		okHolds, atHolds := g.holdsQuietLocked(now)
-		changed := g.changed
+		changed := g.changedLocked()
 		g.mu.Unlock()
+		if closed {
+			res.PhaseA = time.Since(start)
+			err := g.abort(&res, ErrClosed)
+			return res, err
+		}
 		if (okLocal && okHolds) || !now.Before(limit) {
 			break
 		}
@@ -1349,7 +1736,7 @@ func (g *Gate) Flip(ctx context.Context, key string, commit func() error) (Resul
 	}
 	if h == nil {
 		// Spec C8 residual: no token within the wait, so commit unheld.
-		if err := ctx.Err(); err != nil {
+		if err := g.stopErr(ctx); err != nil {
 			err = g.abort(&res, err)
 			return res, err
 		}
@@ -1367,9 +1754,13 @@ func (g *Gate) Flip(ctx context.Context, key string, commit func() error) (Resul
 
 // acquire takes the hold token for e in FIFO order, waiting at most the
 // token wait; the hold starts at the grant. It returns (nil, nil) when the
-// wait timed out and (nil, err) when ctx ended first.
+// wait timed out and (nil, err) when ctx ended or the gate closed first.
 func (g *Gate) acquire(ctx context.Context, e *entry) (*hold, error) {
 	g.mu.Lock()
+	if g.closed {
+		g.mu.Unlock()
+		return nil, ErrClosed
+	}
 	if g.holder == nil && len(g.queue) == 0 {
 		h := g.startHoldLocked(e, time.Now())
 		g.mu.Unlock()
@@ -1388,6 +1779,8 @@ func (g *Gate) acquire(ctx context.Context, e *entry) (*hold, error) {
 	case <-timer.C:
 	case <-ctx.Done():
 		cause = ctx.Err()
+	case <-g.closedCh:
+		cause = ErrClosed
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -1416,30 +1809,37 @@ func (g *Gate) runHold(ctx context.Context, e *entry, h *hold, commit func() err
 	expiry := h.start.Add(g.holdMax)
 	defer func() {
 		g.mu.Lock()
+		defer g.mu.Unlock() // a panicking commit unwinds to the adoption's recover
 		g.endHoldLocked(h, false)
 		res.HoldEnd, res.Waiters = h.end, h.heldTotal
-		g.mu.Unlock()
+		if h.expired && res.Outcome == OutcomeHeld {
+			res.Outcome = OutcomeHoldExpired
+		}
 	}()
 	for {
 		g.mu.Lock()
 		now := time.Now()
+		closed := g.closed
+		okLocal, atLocal := g.localQuietLocked(e, now)
+		okOthers, atOthers := g.otherHoldsQuietLocked(e, now)
+		changed := g.changedLocked()
+		g.mu.Unlock()
+		if closed {
+			return g.abort(res, ErrClosed)
+		}
 		if !now.Before(expiry) {
 			// Spec C8: at the bound pending is cleared, the waiters are
 			// answered from the current snapshot, and a commit not yet
 			// started starts at once (counted).
-			g.endHoldLocked(h, true)
-			g.mu.Unlock()
-			holdExpiredTotal.Inc()
-			if err := ctx.Err(); err != nil {
+			if g.expireHold(h) {
+				holdExpiredTotal.Inc()
+			}
+			if err := g.stopErr(ctx); err != nil {
 				return g.abort(res, err)
 			}
 			res.Outcome, res.Committed = OutcomeHoldExpired, true
 			return commit()
 		}
-		okLocal, atLocal := g.localQuietLocked(e, now)
-		okOthers, atOthers := g.otherHoldsQuietLocked(e, now)
-		changed := g.changed
-		g.mu.Unlock()
 		if okLocal && okOthers {
 			break
 		}
@@ -1447,32 +1847,48 @@ func (g *Gate) runHold(ctx context.Context, e *entry, h *hold, commit func() err
 			return g.abort(res, ctx.Err())
 		}
 	}
-	if err := ctx.Err(); err != nil {
+	if err := g.stopErr(ctx); err != nil {
 		return g.abort(res, err)
 	}
 	// Commit within the hold. A commit that outlasts the bound is never
 	// interrupted, but the hold still ends at the bound.
 	expire := time.AfterFunc(time.Until(expiry), func() {
-		defer func() { _ = recover() }() // gate code only; runHold's deferred end is the backstop
-		g.mu.Lock()
-		ended := g.endHoldLocked(h, true)
-		g.mu.Unlock()
-		if ended {
+		defer func() {
+			if recover() != nil {
+				gatePanicsTotal.Inc() // a gate bug: counted; the deferred unlock kept the gate usable
+			}
+		}()
+		if g.expireHold(h) {
 			holdExpiredTotal.Inc()
 		}
 	})
 	defer expire.Stop()
-	res.Committed = true
+	res.Outcome, res.Committed = OutcomeHeld, true // the deferred end makes it hold_expired if the bound came first
 	err := commit()
-	g.mu.Lock()
-	expired := h.expired
-	g.endHoldLocked(h, false)
-	g.mu.Unlock()
-	res.Outcome = OutcomeHeld
-	if expired {
-		res.Outcome = OutcomeHoldExpired
-	}
+	expire.Stop() // design review M11: an expiry the timer has not fired by now did not happen
 	return err
+}
+
+// expireHold ends h at its bound (runHold's loop and its timer) and
+// reports whether this call ended it.
+func (g *Gate) expireHold(h *hold) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock() // the timer recovers a panic: never leave the gate locked
+	if g.onExpire != nil {
+		g.onExpire()
+	}
+	return g.endHoldLocked(h, true)
+}
+
+// stopErr reports why a flip must not start its commit: ErrClosed once the
+// gate is closed, else ctx's error (nil while both last).
+func (g *Gate) stopErr(ctx context.Context) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return ErrClosed
+	}
+	return ctx.Err()
 }
 
 // abort records a flip abandoned before its commit.
@@ -1529,11 +1945,14 @@ func (g *Gate) startHoldLocked(e *entry, now time.Time) *hold {
 // endHoldLocked ends h once and reports whether this call did: the
 // suite's anchors are no longer held, the waiters proceed (reading the
 // snapshot current then), and the token passes to the next waiting flip,
-// whose hold starts now.
+// whose hold starts now — unless the gate is closed.
 //
 // AIDEV-NOTE: lastEnd/lastEndBy/prevEnd answer "the most recent hold end
 // by another suite" in O(1): holds never overlap, so the newest end by an
 // entry other than x is lastEnd when lastEndBy != x, and prevEnd if not.
+// Only a hold that held at least one request sets them: a hold that held
+// no request delayed no client queue, so it never starts a cross-suite
+// quiet period (design note 17).
 func (g *Gate) endHoldLocked(h *hold, expired bool) bool {
 	if h.ended {
 		return false
@@ -1548,13 +1967,15 @@ func (g *Gate) endHoldLocked(h *hold, expired bool) bool {
 	}
 	h.e.lastUse = now
 	close(h.released)
-	if g.lastEndBy != h.e {
-		g.prevEnd = g.lastEnd
+	if h.heldTotal > 0 {
+		if g.lastEndBy != h.e {
+			g.prevEnd = g.lastEnd
+		}
+		g.lastEnd, g.lastEndBy = now, h.e
 	}
-	g.lastEnd, g.lastEndBy = now, h.e
 	if g.holder == h {
 		g.holder = nil
-		if len(g.queue) > 0 {
+		if len(g.queue) > 0 && !g.closed {
 			w := g.queue[0]
 			g.queue = g.queue[1:]
 			w.hold = g.startHoldLocked(w.e, now)
@@ -1565,9 +1986,21 @@ func (g *Gate) endHoldLocked(h *hold, expired bool) bool {
 	return true
 }
 
+// changedLocked returns the channel the next change closes, creating it on
+// demand: only a flip about to wait asks for it, so a change no flip waits
+// for (most anchor completions) allocates nothing.
+func (g *Gate) changedLocked() <-chan struct{} {
+	if g.changed == nil {
+		g.changed = make(chan struct{})
+	}
+	return g.changed
+}
+
 func (g *Gate) broadcastLocked() {
-	close(g.changed)
-	g.changed = make(chan struct{})
+	if g.changed != nil {
+		close(g.changed)
+		g.changed = nil
+	}
 }
 
 // localQuietLocked: no anchor of e in flight (ignoring any in flight for
@@ -1590,8 +2023,8 @@ func (g *Gate) localQuietLocked(e *entry, now time.Time) (bool, time.Time) {
 }
 
 // holdsQuietLocked is phase A (b): no hold in progress anywhere and none
-// ended within the quiet period — a hold delays other suites' requests on
-// a client's shared queue.
+// that held requests ended within the quiet period — such a hold delayed
+// other suites' requests on a client's shared queue.
 func (g *Gate) holdsQuietLocked(now time.Time) (bool, time.Time) {
 	if g.holder != nil {
 		return false, time.Time{}
@@ -1602,9 +2035,9 @@ func (g *Gate) holdsQuietLocked(now time.Time) (bool, time.Time) {
 	return true, time.Time{}
 }
 
-// otherHoldsQuietLocked is phase B (b): no other suite's hold ended within
-// the quiet period — clients released from it may still have this suite's
-// requests queued behind the held one.
+// otherHoldsQuietLocked is phase B (b): no other suite's hold that held
+// requests ended within the quiet period — clients released from it may
+// still have this suite's requests queued behind the held one.
 func (g *Gate) otherHoldsQuietLocked(e *entry, now time.Time) (bool, time.Time) {
 	end := g.lastEnd
 	if g.lastEndBy == e {
@@ -1650,7 +2083,13 @@ Expected: `ok`. Then `go vet ./internal/flipgate/ && golangci-lint run ./interna
 
 - [ ] **Step 6: Mutation check (do not commit)**
 
-One at a time, reverting each (each was verified against this plan's code): (a) in `Done`, drop the `now.Sub(t.start) < AnchorTimeout &&` condition → `TestFlip_IgnoresAnchorsInFlightPastAptsTimeout` FAILS ("delayed the next flip by 10s"); (b) in `localQuietLocked`, delete the `if !youngest.IsZero() { … }` block → `TestFlip_WaitsForQuietAfterTheLastAnchor` FAILS (commits while the anchor is in flight); (c) in `acquire`, change `if g.holder == nil && len(g.queue) == 0 {` to `if true {` (a non-exclusive token) → `TestFlip_HoldsAreExclusiveFIFOAndQuietAfterEachOther` FAILS; (d) make `otherHoldsQuietLocked` return `true, time.Time{}` first → the same test FAILS ("b committed 0s after a's hold ended"); (e) make `holdsQuietLocked` return `true, time.Time{}` first → `TestFlip_PhaseAWaitsOutAnotherSuitesHold` FAILS (b holds its anchors 10 s); (f) in `runHold`, arm the expiry timer with `time.Hour` instead of `time.Until(expiry)` → `TestFlip_SlowCommitEndsTheHoldAt20s` FAILS (the request is released at 25 s and sees generation 2); (g) in `endHoldLocked`, grant `g.queue[len(g.queue)-1]` (LIFO) instead of `g.queue[0]` → `TestFlip_HoldsAreExclusiveFIFOAndQuietAfterEachOther` FAILS; (h) in `AnchorStart`, drop `|| h.waiting >= MaxWaiters` → `TestAnchorStart_WaiterCap` FAILS (257 held requests); (i) in `AnchorStart`, return `g.registerLocked(e, time.Now())` when `left` → `TestAnchorStart_CancelledWaiterLeavesUncounted` FAILS; (j) delete `g.endHoldLocked(h, false)` from `runHold`'s deferred function → `TestFlip_CommitPanicEndsTheHold` and the `phase B` case of `TestFlip_ContextEndAbortsEveryPhase` FAIL (the held request waits 20 s); (k) in `sweepLocked`, use `>= g.quiet` instead of `>= 2*g.quiet` → `TestGate_IdleEntriesExpire` FAILS; (l) in `runHold`'s expiry branch, return `nil` instead of `commit()` → `TestFlip_SlowReaderExpiresTheHoldAt20s` FAILS.
+One at a time, reverting each (each was verified against this plan's code). Several kill their test with `t.Fatal` while bubble goroutines still wait, so the run also reports `panic: deadlock: main bubble goroutine has exited but blocked goroutines remain` — still a failure.
+
+(a) in `Done`, record every completion: change `if (!late || t.e.hold == nil) && now.After(t.e.lastDone) {` to `if now.After(t.e.lastDone) {` → `TestFlip_IgnoresAnchorsInFlightPastAptsTimeout` FAILS ("a completion after apt's timeout, during a hold, delayed the next flip by 10s"); (b) in `localQuietLocked`, delete the `if !youngest.IsZero() { … }` block → `TestFlip_WaitsForQuietAfterTheLastAnchor` FAILS (commits while the anchor is in flight); (c) in `acquire`, change `if g.holder == nil && len(g.queue) == 0 {` to `if true {` (a non-exclusive token) → `TestFlip_HoldsAreExclusiveFIFOAndQuietAfterEachOther` FAILS; (d) make `otherHoldsQuietLocked` return `true, time.Time{}` first → the same test FAILS ("b committed 0s after a's hold ended"); (e) make `holdsQuietLocked` return `true, time.Time{}` first → `TestFlip_PhaseAWaitsOutAnotherSuitesHold` FAILS (b holds its anchors 10 s); (f) in `runHold`, arm the expiry timer with `time.Hour` instead of `time.Until(expiry)` → `TestFlip_SlowCommitEndsTheHoldAt20s` FAILS (the hold ends only with the commit, at 25 s: the released request sees generation 2 or, when its own 20 s wait ends at that same instant, the result shows a hold that ended at 25 s); (g) in `endHoldLocked`, grant the newest waiter (LIFO): `w := g.queue[len(g.queue)-1]` and `g.queue = g.queue[:len(g.queue)-1]` instead of `g.queue[0]` / `g.queue[1:]` → `TestFlip_HoldsAreExclusiveFIFOAndQuietAfterEachOther` FAILS ("b's hold started at …, want a's hold end …"; changing only the index hangs the test until `-timeout`); (h) in `join`, drop `|| h.waiting >= MaxWaiters` → `TestAnchorStart_WaiterCap` FAILS (257 held requests); (i) in `AnchorStart`, return `g.registerLocked(e, time.Now())` when `left` → `TestAnchorStart_CancelledWaiterLeavesUncounted` FAILS; (j) delete `g.endHoldLocked(h, false)` from `runHold`'s deferred function → `TestFlip_CommitPanicEndsTheHold` and the `phase B` case of `TestFlip_ContextEndAbortsEveryPhase` FAIL (the held request waits 20 s); (k) in `sweepLocked`, use `>= g.quiet` instead of `>= 2*g.quiet` → `TestGate_IdleEntriesExpire` FAILS; (l) in `runHold`'s expiry branch, return `nil` instead of `commit()` → `TestFlip_SlowReaderExpiresTheHoldAt20s` FAILS.
+
+Added by the review revision: (m) in `Done`, never record a late completion: `if !late && now.After(t.e.lastDone) {` → `TestFlip_IgnoresAnchorsInFlightPastAptsTimeout` FAILS ("… outside a hold, delayed the next flip by 0s, want 10s"); (n) in `acquire`, delete the `if w.hold != nil { … }` block ("Granted as it gave up") → `TestFlip_GrantAtTheTokenTimeoutNeverLeaksTheHold` FAILS ("round N: b hold_skipped; holder … after both flips returned", within the first few rounds); (o) in the expiry timer's callback in `runHold`, replace `if g.expireHold(h) { holdExpiredTotal.Inc() }` with `_ = g.expireHold(h)` → `TestFlip_SlowCommitExpiryIsCounted` FAILS ("acu_flip_hold_expired_total rose by 0, want 1"); (p) in `sweepLocked`, drop `e.flips == 0 &&` → `TestGate_SweepKeepsTheEntryOfAFlipInProgress` FAILS ("k committed -10s after the read it must wait for ended"); (q) in `Done`, delete `t.e.lastUse = now` → `TestGate_SweepKeepsAJustFinishedSlowRead` FAILS ("flip waited 0s, want 9s"); (r) in `AnchorStart`, delete `h.waiting--` → `TestAnchorStart_WaiterCapCountsOnlyCurrentWaiters` FAILS ("a request was served during the hold with only 255 others waiting"); (s) in `join`, delete `waitersOverCapTotal.Inc()` → `TestAnchorStart_WaiterCap` FAILS ("acu_flip_waiters_over_cap_total rose by 0, want 1"); (t) in `Done`, delete the `if late { slowAnchorReadsTotal.Inc() }` block → `TestFlip_IgnoresAnchorsInFlightPastAptsTimeout` FAILS ("acu_flip_slow_anchor_reads_total rose by 0, want 2"); (u) in `endHoldLocked`, drop the `if h.heldTotal > 0 {` guard (update `prevEnd`, `lastEnd` and `lastEndBy` after every hold) → `TestFlip_HoldsThatHeldNothingDoNotDelayOtherFlips` FAILS ("b: phase A 9s, committed after 9s"); (v) in `Close`, delete the `if g.holder != nil { … }` block → `TestGate_CloseAbortsEveryFlipNotYetCommitting` FAILS ("the held request was answered 18s after Close"); (w) in `acquire`, delete the `case <-g.closedCh:` arm → the same test FAILS ("queued for the token: … 59s after Close"); (x) in `Flip`'s phase A loop, change `if closed {` to `if false && closed {` → the same test FAILS ("in phase A: … 500ms after Close"); (y) in `endHoldLocked`, drop `&& !g.closed` → the same test FAILS (`Holds:2`); (z) in `expireHold`, unlock without the defer (`ended := g.endHoldLocked(h, true)`, `g.mu.Unlock()`, `return ended`) → `TestFlip_PanicInTheExpiryTimerLeavesTheGateUsable` FAILS ("a panic in the expiry timer left the gate locked"; the test unlocks the mutex itself, so it does not hang); (aa) in the expiry timer's callback, replace the `if recover() != nil { gatePanicsTotal.Inc() … }` block with `_ = recover()` → the same test FAILS ("acu_flip_gate_panics_total rose by 0, want 1"); (bb) set `MaxQuiet = 20 * time.Second` → `TestNew_QuietBounds` FAILS ("MaxQuiet 20s must stay below HoldMax 20s"); (cc) in `New`, accept any quiet period up to `MaxQuiet` (`if q := cfg.Quiet; q < 0 || q > MaxQuiet {`) → `TestNew_QuietBounds` FAILS ("Quiet 1ns: err = <nil>, want ErrQuietOutOfRange"); (dd) make `changedLocked` return a fresh `make(chan struct{})` without storing it → `TestFlip_WaitsForQuietAfterTheLastAnchor` FAILS ("flip returned after 30s, want 14s").
+
+Not tested (equivalent or unreachable, from the executability review): the `ctx` checks at a same-instant shutdown and token timeout, the per-waiter `time.NewTimer(g.holdMax)` (defence in depth while every hold ends), M11's `expire.Stop()` before the hold's end (a same-instant race), and the absence of panics in `endHoldLocked` (it cannot panic: `h.ended` guards `close(h.released)`, and each waiter is popped before its `granted` channel is closed).
 
 - [ ] **Step 7: Commit**
 
@@ -2111,6 +2550,12 @@ type Straddle struct {
 //     must not push a client out of its guarantee. Later requests are not
 //     checked; one sent exactly at the window's end races a commit made at
 //     that instant (the gate is quiet once a full period has passed).
+//   - Where the window starts: the gate measures quiet from when the cache
+//     finished sending the anchor, this ledger from when the client
+//     received it. In production kernel send buffering makes the first
+//     earlier on a slow link (by at most the buffered bytes over the link's
+//     bandwidth), so the effective window is slightly shorter than
+//     flip_quiet_period; in the simulations the two instants coincide.
 type Ledger struct {
 	window time.Duration
 
@@ -2207,7 +2652,7 @@ Expected: PASS, each simulation well under 5 s; then `go test -race -count=1 ./i
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each (verified against this plan's code): (a) in `internal/flipgate/gate.go` `acquire`, change `if g.holder == nil && len(g.queue) == 0 {` to `if true {` (concurrent holds) → `TestSimFlip_OverlappingHoldTrace` FAILS (B's hold starts 0.1 s after A's instead of at its end; with that assertion commented out, the trace client's B anchor is held ~20 s and it straddles: `{Client:2000 Suite:A AnchorGen:1 IndexGen:2 Delay:350ms}` — the review's trace); (b) make `otherHoldsQuietLocked` return `true, time.Time{}` first → `TestSimFlip_ClientReleasedFromAnotherHold` FAILS (B commits 0 s after A's hold ends); (c) in `Flip`'s `h == nil` branch, insert `time.Sleep(time.Second)` before `return res, commit()` → `TestSimFlip_FiveBusySuites` FAILS ("s5 committed 2m1s after its flip started, want 2m0s"); (d) in `RunUpdate`, replace `sent.Sub(a.at)-(heldBefore-a.held)` with `sent.Sub(a.at)-0*(heldBefore-a.held)` → `TestLedger_CountsStraddlesInsideTheWindowNetOfHolds` FAILS (no straddle counted); (e) in `record`, make the check `delay > l.window` → `TestLedger_IgnoresIndexesOutsideTheWindow` FAILS (the exactly-10 s request is checked).
+One at a time, reverting each (verified against this plan's code): (a) in `internal/flipgate/gate.go` `acquire`, change `if g.holder == nil && len(g.queue) == 0 {` to `if true {` (concurrent holds) → `TestSimFlip_OverlappingHoldTrace` FAILS (B's hold starts 0.1 s after A's instead of at its end; with that assertion commented out it fails on the trace client's B anchor being held ~20 s (`[0s 19.804s]`); with the `traceHeld` assertion commented out too, it reports the straddle `{Client:2000 Suite:A AnchorGen:1 IndexGen:2 Delay:350ms}` — the review's trace); (b) make `otherHoldsQuietLocked` return `true, time.Time{}` first → `TestSimFlip_ClientReleasedFromAnotherHold` FAILS (B commits 0 s after A's hold ends); (c) in `Flip`'s `h == nil` branch, insert `time.Sleep(time.Second)` before `return res, commit()` → `TestSimFlip_FiveBusySuites` FAILS ("s5 committed 2m1s after its flip started, want 2m0s"); (d) in `RunUpdate`, replace `sent.Sub(a.at)-(heldBefore-a.held)` with `sent.Sub(a.at)-0*(heldBefore-a.held)` → `TestLedger_CountsStraddlesInsideTheWindowNetOfHolds` FAILS (no straddle counted); (e) in `record`, make the check `delay > l.window` → `TestLedger_IgnoresIndexesOutsideTheWindow` FAILS (the exactly-10 s request is checked).
 
 - [ ] **Step 6: Commit**
 
@@ -2221,7 +2666,7 @@ git commit -m "Simulate overlapping holds, cross-suite release and five busy sui
 
 ### Task 3: `adoption.flip_quiet_period`
 
-Spec C11: `adoption.flip_quiet_period`, default `"10s"`, `0s` disables the barrier, at most `15s`. `0s` is meaningful, so the default is presence-sensitive (applied only when the key is absent), like `hot_prefetch_budget`. Task 9 wires it.
+Spec C11: `adoption.flip_quiet_period`, default `"10s"`, `0s` disables the barrier, at most `15s` — and, by controller ruling (deviation 6), at least `1s` unless it is `0s`: a sub-second period protects almost no one. `0s` is meaningful, so the default is presence-sensitive (applied only when the key is absent), like `hot_prefetch_budget`. Task 9 wires it.
 
 **Files:**
 - Modify: `internal/config/config.go` (`AdoptionConfig`, `Load`, `Validate`), `internal/config/config_test.go`, `packaging/config/config.toml.default`
@@ -2236,7 +2681,8 @@ Append to `internal/config/config_test.go` (after `TestAdoptionMaxDuration_Defau
 
 ```go
 // adoption.flip_quiet_period (spec C11): default 10s, 0s disables the
-// flip barrier and survives Load, at most 15s.
+// flip barrier and survives Load; otherwise 1s to 15s (controller ruling:
+// a sub-second period gives almost no protection).
 func TestAdoptionFlipQuietPeriod_DefaultAndBounds(t *testing.T) {
 	load := func(extra string) (*Config, error) {
 		dir := t.TempDir()
@@ -2249,13 +2695,13 @@ func TestAdoptionFlipQuietPeriod_DefaultAndBounds(t *testing.T) {
 	for _, ok := range []struct {
 		value string
 		want  time.Duration
-	}{{"0s", 0}, {"15s", 15 * time.Second}, {"2500ms", 2500 * time.Millisecond}} {
+	}{{"0s", 0}, {"1s", time.Second}, {"15s", 15 * time.Second}, {"2500ms", 2500 * time.Millisecond}} {
 		cfg, err := load("[adoption]\nflip_quiet_period = \"" + ok.value + "\"\n")
 		if err != nil || cfg.Adoption.FlipQuietPeriod.Duration != ok.want {
 			t.Errorf("flip_quiet_period = %s: got %v (err %v), want %v", ok.value, cfg.Adoption.FlipQuietPeriod.Duration, err, ok.want)
 		}
 	}
-	for _, bad := range []string{"16s", "-1s"} {
+	for _, bad := range []string{"16s", "-1s", "500ms", "999ms"} {
 		if _, err := load("[adoption]\nflip_quiet_period = \"" + bad + "\"\n"); err == nil {
 			t.Errorf("flip_quiet_period = %s accepted, want a validation error", bad)
 		}
@@ -2273,12 +2719,13 @@ Expected: compile failure naming `cfg.Adoption.FlipQuietPeriod undefined (type A
 In `internal/config/config.go`, add to `AdoptionConfig` right after the `MaxDuration` field:
 
 ```go
+
 	// FlipQuietPeriod is adoption.flip_quiet_period (spec C8, C11): how
 	// long after the last client finished receiving a suite's anchor the
 	// cache keeps the suite's snapshot before switching to a new one, so
 	// that client's index requests still match the anchor it holds.
 	// Default 10s; 0s disables the flip barrier (the previous behaviour);
-	// at most 15s.
+	// otherwise between 1s and 15s.
 	FlipQuietPeriod Duration `toml:"flip_quiet_period"`
 ```
 
@@ -2295,8 +2742,10 @@ In `Load`, right after the `max_duration` default (`if !md.IsDefined("adoption",
 In `Validate`, right after the `adoption.max_duration must be at least 1m` check:
 
 ```go
-	if q := c.Adoption.FlipQuietPeriod.Duration; q < 0 || q > 15*time.Second {
-		errs = append(errs, errors.New("adoption.flip_quiet_period must be between 0s and 15s"))
+	// A sub-second quiet period gives almost no protection: 0s (off) or
+	// 1s..15s (controller ruling, phase C plan).
+	if q := c.Adoption.FlipQuietPeriod.Duration; q != 0 && (q < time.Second || q > 15*time.Second) {
+		errs = append(errs, errors.New("adoption.flip_quiet_period must be 0s or between 1s and 15s"))
 	}
 ```
 
@@ -2309,7 +2758,8 @@ In `packaging/config/config.toml.default`, in the `[adoption]` block right after
 # receiving its InRelease/Release before switching to a new snapshot, so
 # that client's index requests still match. A busy suite's new
 # InRelease/Release requests are held instead, one suite at a time, for at
-# most 20 s (below apt's 30 s timeout). 0s switches at once; at most 15s.
+# most 20 s (below apt's 30 s timeout). 0s switches at once; otherwise
+# between 1s and 15s.
 flip_quiet_period     = "10s"
 ```
 
@@ -2318,19 +2768,23 @@ flip_quiet_period     = "10s"
 Run: `go test -race ./internal/config/`
 Expected: PASS (including `TestDefaultConfigFileDocumentsEveryKey`).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Mutation check (do not commit)**
+
+(a) In `Validate`, accept any period up to 15 s (`if q := c.Adoption.FlipQuietPeriod.Duration; q < 0 || q > 15*time.Second {`) → `TestAdoptionFlipQuietPeriod_DefaultAndBounds` FAILS ("flip_quiet_period = 500ms accepted, want a validation error").
+
+- [ ] **Step 6: Commit**
 
 ```bash
 gofmt -l internal/config/
 git add internal/config/config.go internal/config/config_test.go packaging/config/config.toml.default
-git commit -m "Add adoption.flip_quiet_period (default 10s, 0s disables, at most 15s)"
+git commit -m "Add adoption.flip_quiet_period (default 10s; 0s disables; otherwise 1s to 15s)"
 ```
 
 ---
 
 ### Task 4: Monotonic `adopted_at` and the displaced-member lookup
 
-Spec C8 "Monotonic `Last-Modified`" (`adopted_at = max(now, prior.adopted_at + 1)`; a first adoption `max(now, url_path anchor last_fetched_at + 1)`) and "Retained by-hash" (the cache half: the suite's other adopted, non-retired snapshots, newest first, at most `gc.keep_displaced + 1`). Deferred minors B-7 (`internal/cache/adoption.go`) and B-6 (`internal/cache/flip_state_test.go`), both in files this task touches.
+Spec C8 "Monotonic `Last-Modified`" (`adopted_at = max(now, prior.adopted_at + 1)`; a first adoption `max(now, url_path anchor last_fetched_at + 1)`) and "Retained by-hash" (the cache half: the suite's other adopted, non-retired snapshots, newest first, at most `gc.keep_displaced + 1`). Deferred minors B-7 (`internal/cache/adoption.go`) and B-6 (`internal/cache/flip_state_test.go`), both in files this task touches. The executability review's P6 (each served anchor file counts on its own).
 
 **Files:**
 - Modify: `internal/cache/adoption.go` (`CommitAdoption`; new `adoptionStampTx`, `DisplacedSnapshotMembers`; B-7), `internal/cache/flip_state_test.go` (new tests; B-6), `internal/gc/integration_test.go` (comment only)
@@ -2412,6 +2866,28 @@ func TestCommitAdoption_FirstAdoptionKeepsNowPastOlderAnchors(t *testing.T) {
 	restore()
 	if got := adoptedAtOf(t, c, id); got != 1_000_000 {
 		t.Fatalf("adopted_at = %d, want now (1000000)", got)
+	}
+}
+
+// Each anchor file a client may have been served counts on its own: a
+// detached suite's clients hold Release (and Release.gpg), not InRelease.
+func TestCommitAdoption_FirstAdoptionPassesEachServedAnchorFile(t *testing.T) {
+	for _, file := range []string{"/InRelease", "/Release", "/Release.gpg"} {
+		t.Run(file, func(t *testing.T) {
+			c := openCache(t)
+			h := seedBlob(t, c, "served "+file)
+			fetched := int64(1_600_000)
+			if err := c.PutURLPath(context.Background(), URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: afSuite + file,
+				BlobHash: &h, UpstreamURL: "http://h" + afSuite + file, IsMetadata: true, LastFetchedAt: &fetched}); err != nil {
+				t.Fatal(err)
+			}
+			restore := stubNow(t, 1_000_000)
+			id := commitCandidate(t, c, SnapshotCandidate{}, "first adoption after "+file)
+			restore()
+			if got := adoptedAtOf(t, c, id); got != 1_600_001 {
+				t.Fatalf("adopted_at = %d, want 1600001 (the served %s's fetch + 1)", got, file)
+			}
+		})
 	}
 }
 ```
@@ -2533,7 +3009,7 @@ func TestDisplacedSnapshotMembers(t *testing.T) {
 - [ ] **Step 2: Run to verify failure**
 
 Run: `go test ./internal/cache/ -run 'TestCommitAdoption_AdoptedAtIsMonotonic|TestCommitAdoption_FirstAdoption|TestDisplacedSnapshotMembers'`
-Expected: compile failure naming `c.DisplacedSnapshotMembers undefined`.
+Expected: compile failure naming `c.DisplacedSnapshotMembers undefined`. (With Step 4 applied before Step 3, the stamp tests' own red state shows: `TestCommitAdoption_AdoptedAtIsMonotonic` fails with `adopted_at = [1000000 1000000 500000 2000000]`, `…FirstAdoptionPassesTheServedAnchors` and every case of `…FirstAdoptionPassesEachServedAnchorFile` with `adopted_at = 1000000, want 1600001`; `…FirstAdoptionKeepsNowPastOlderAnchors` already passes — it pins existing behaviour, and mutant (a) is its killer.)
 
 - [ ] **Step 3: The adoption stamp**
 
@@ -2695,7 +3171,7 @@ Expected: PASS. (`TestForensicRetention_KeepDisplacedThree` and the tie-break te
 
 - [ ] **Step 7: Mutation check (do not commit)**
 
-One at a time, reverting each (verified against this plan's code): (a) in `CommitAdoption`, move the `adoptionStampTx` call (with its comment and error check) to just before Step 7, after Step 3c → `TestCommitAdoption_FirstAdoptionKeepsNowPastOlderAnchors` FAILS (`adopted_at = 1000001`: Step 3c's re-seeded InRelease row is read as a served anchor); (b) in `adoptionStampTx`, return `max(now, prior.Int64)` → `TestCommitAdoption_AdoptedAtIsMonotonic` FAILS (`[1000000 1000000 1000000 2000000]`); (c) stamp `now` in Step 7 (write `now+0*stamp` to keep `stamp` used) → the same test FAILS (`[1000000 1000000 500000 2000000]`); (d) in `DisplacedSnapshotMembers`, move `LIMIT ?` from the subquery to the end of the outer query and pass `path, limit` in that order → `TestDisplacedSnapshotMembers` FAILS at limit 1; (e) drop `AND retired_at IS NULL` → `TestDisplacedSnapshotMembers` FAILS after the retirement.
+One at a time, reverting each (verified against this plan's code): (a) in `CommitAdoption`, move the `adoptionStampTx` call (with its comment and error check) to just before Step 7, after Step 3c → `TestCommitAdoption_FirstAdoptionKeepsNowPastOlderAnchors` FAILS (`adopted_at = 1000001`: Step 3c's re-seeded InRelease row is read as a served anchor); (b) in `adoptionStampTx`, return `max(now, prior.Int64)` → `TestCommitAdoption_AdoptedAtIsMonotonic` FAILS (`[1000000 1000000 1000000 2000000]`); (c) stamp `now` in Step 7 (write `now+0*stamp` to keep `stamp` used) → the same test FAILS (`[1000000 1000000 500000 2000000]`); (d) in `DisplacedSnapshotMembers`, move `LIMIT ?` from the subquery to the end of the outer query and pass `path, limit` in that order → `TestDisplacedSnapshotMembers` FAILS at limit 1; (e) drop `AND retired_at IS NULL` → `TestDisplacedSnapshotMembers` FAILS after the retirement; (f) in `adoptionStampTx`, replace `suite+"/Release"` in the `IN` list with `suite+"/Release.none"` → `TestCommitAdoption_FirstAdoptionPassesEachServedAnchorFile` FAILS (its `/Release` case: `adopted_at = 1000000, want 1600001`; the other test's values leave `Release.gpg` as the maximum either way).
 
 - [ ] **Step 8: Commit**
 
@@ -2709,15 +3185,15 @@ git commit -m "Keep adopted_at strictly increasing per suite and look up members
 
 ### Task 5: The adoption commits behind the barrier
 
-Spec C8 "Adopter side" and the skip rule for a first adoption whose anchor equals the served url_path anchor; C4 "the host slot is released when the member pipeline ends (before the C8 barrier); the global slot is held through the commit"; C11 `adoption_flip_barrier`; rulings R-C1, R-C2 (with deferred minor B-65 folded in) and R-C4; design notes 5, 9, 10, 14. The phase-C carry-forwards in the overview ("`membersDone` must stay before the barrier"; "the commit keeps `WithoutCancel` + `commitTimeout`, and a shutdown before the commit starts skips it"; "decide whether `Flip`'s waits honour `max_duration`"; "a Checker-level test that `membersDone` frees only the host slot") are all closed here. Deferred minors in files this task touches: B-15 (`metrics.go`), B-26 and B-68 (`freshness.go`), B-29 (`capacity_test.go`).
+Spec C8 "Adopter side" and the skip rule for a first adoption whose anchor equals the served url_path anchor; C4 "the host slot is released when the member pipeline ends (before the C8 barrier); the global slot is held through the commit"; C11 `adoption_flip_barrier`; rulings R-C1, R-C2 (with deferred minor B-65 folded in) and R-C4; design notes 5, 9, 10, 14, 18 (no failure record for a flip abandoned at shutdown), 19 (`timed_out` only before the barrier) and 22 (the admission-bound simulation); design review I2, M3, M7 (`commit_failed`), M15, and the executability review's P9 and P10. The phase-C carry-forwards in the overview ("`membersDone` must stay before the barrier"; "the commit keeps `WithoutCancel` + `commitTimeout`, and a shutdown before the commit starts skips it"; "decide whether `Flip`'s waits honour `max_duration`"; "a Checker-level test that `membersDone` frees only the host slot") are all closed here. Deferred minors in files this task touches: B-15 (`metrics.go`), B-26 and B-68 (`freshness.go`), B-29 (`capacity_test.go`).
 
 **Files:**
-- Modify: `internal/freshness/adoption.go` (`AdoptionConfig.FlipGate`, `Adopter.flipGate`, `FlipGate()`, `adoptionPayload.stop` with `stopErr`/`barrierCtx`, `runHooks`, `runRequest`, the heartbeat ticker's context, Step 11 in `runShared`, new `flip` and `servedAnchorUnchanged`), `internal/freshness/freshness.go` (`spawnAdoption`; B-26, B-68), `internal/freshness/metrics.go` (inventory note; B-15), `internal/freshness/capacity_test.go` (three `runRequest` callers; B-29)
+- Modify: `internal/freshness/adoption.go` (`AdoptionConfig.FlipGate`, `Adopter.flipGate`, `FlipGate()`, `adoptionPayload.stop` with `stopErr`/`barrierCtx`, `runHooks`, `runRequest`, the heartbeat ticker's context, Step 11 in `runShared`, new `flip` and `servedAnchorUnchanged`), `internal/freshness/freshness.go` (the `flipgate` import; `spawnAdoption`; B-26, B-68), `internal/freshness/metrics.go` (inventory note; B-15), `internal/freshness/capacity_test.go` (three `runRequest` callers; B-29)
 - Create: `internal/freshness/flip_barrier_test.go`
 
 **Interfaces:**
-- Consumes: Task 1 (`flipgate.New`, `Config`, `Key`, `Gate.AnchorStart`, `Gate.Flip`, `Gate.Stats`, `Result`, `Outcome*`, `ErrAborted`). Existing test helpers (package `freshness`): `rigHost`, `rigSuite`, `rigAnchorURL`, `rigPkgsURL` (`retry_rig_test.go`), `newFakeFetcher`, `fakePackagesStanzas`, `passThroughVerifier`, `testHex64` (`adoption_test.go`, `adoption_url_test.go`), `datedRelease` (`adoption_date_test.go`), `lockedBuffer` (`panic_recovery_test.go`), `changedUpstream{body}` (`panic_recovery_test.go`), `seedStaleAnchorAt` (`capacity_test.go`), `readHeartbeatAtDirect` (`adoption_test.go`), `simtest.OpenCache`, `simtest.DiscardLogger`.
-- Produces: `freshness.AdoptionConfig.FlipGate *flipgate.Gate`; `(*Adopter).FlipGate() *flipgate.Gate` (nil-safe: a nil adopter, adoption disabled, has no gate; Tasks 6 and 9); unexported `runHooks{membersDone func(); stop context.Context}` and `runRequest(ctx, req, hooks runHooks)`; the INFO event `adoption_flip_barrier`. Test helpers (package `freshness`): `barrierSuite`, `barrierKey`, `barrierRig`, `newBarrierRig`.
+- Consumes: Task 1 (`flipgate.New`, `Config`, `Key`, `Gate.AnchorStart`, `Gate.Flip`, `Gate.Close`, `Gate.Stats`, `Result`, `Outcome*`, `ErrAborted`, `PhaseAMax`, `TokenWaitMax`, `HoldMax`). Existing test helpers (package `freshness`): `rigHost`, `rigSuite`, `rigAnchorURL`, `rigPkgsURL`, `strOf` (`retry_rig_test.go`), `newFakeFetcher`, `fakePackagesStanzas`, `passThroughVerifier`, `testHex64` (`adoption_test.go`, `adoption_url_test.go`), `datedRelease` (`adoption_date_test.go`), `lockedBuffer` (`panic_recovery_test.go`), `changedUpstream{body}` (`panic_recovery_test.go`), `seedStaleAnchorAt` (`capacity_test.go`), `readHeartbeatAtDirect` (`adoption_test.go`), `hashOf` (`freshness_test.go`), `simMembers` (`sim_sched_test.go`), `startSched` (`reoffer_test.go`), `simtest.OpenCache`, `simtest.DiscardLogger`, `simtest.NewUpstream`, `simtest.Serve`, `simtest.After`, `observability.NewRing`, `cache.ApplyLegacyAuditDecisions`.
+- Produces: `freshness.AdoptionConfig.FlipGate *flipgate.Gate`; `(*Adopter).FlipGate() *flipgate.Gate` (nil-safe: a nil adopter, adoption disabled, has no gate; Tasks 6 and 9); unexported `runHooks{membersDone func(); stop context.Context}`, `runRequest(ctx, req, hooks runHooks)` and `barrierOutcome`; the INFO event `adoption_flip_barrier` (outcomes `held`, `hold_expired`, `hold_skipped`, `not_needed`, `commit_failed`). Test helpers (package `freshness`): `barrierSuite`, `barrierKey`, `barrierRig`, `newBarrierRig`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2731,8 +3207,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"maps"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -2740,6 +3218,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
@@ -3084,14 +3563,282 @@ func TestCheck_ShutdownInTheBarrierRecordsNothing(t *testing.T) {
 			t.Fatal(err)
 		}
 		if sf.CurrentSnapshotID != nil || sf.AdoptionFailCount != 0 || sf.AdoptionFailReason != nil {
-			t.Fatalf("after a shutdown in the barrier: current %v, failure count %d reason %v; want neither",
-				sf.CurrentSnapshotID, sf.AdoptionFailCount, sf.AdoptionFailReason)
+			t.Fatalf("after a shutdown in the barrier: current set %v, failure count %d, reason set %v; want neither",
+				sf.CurrentSnapshotID != nil, sf.AdoptionFailCount, sf.AdoptionFailReason != nil)
 		}
 		if g, h := chk.admission.usage(); g != 0 || h != 0 {
 			t.Fatalf("slots leaked: %d/%d", g, h)
 		}
 		if st := r.gate.Stats(); st.Aborted != 1 {
 			t.Fatalf("gate stats = %+v, want one aborted flip", st)
+		}
+	})
+}
+
+// A shutdown in the barrier is not a commit failure: no DB-failure
+// sentinel (acu_adoption_total{outcome="db_failed"}) and no WARN
+// "adoption: commit failed".
+func TestAdopter_ShutdownInTheBarrierIsNotACommitFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newBarrierRig(t, 10*time.Second, 0)
+		tok := r.gate.AnchorStart(context.Background(), barrierKey)
+		defer tok.Done()
+		stop, stopNow := context.WithCancel(context.Background())
+		time.AfterFunc(5*time.Second, stopNow)
+		err := r.ad.runRequest(context.Background(), r.request("v1"), runHooks{stop: stop})
+		if errors.Is(err, ErrAdoptionDBFailed) || classifyAdoptionOutcome(err) == "db_failed" {
+			t.Fatalf("a shutdown in the barrier is reported as a DB failure: %v", err)
+		}
+		if strings.Contains(r.logs.String(), "adoption: commit failed") {
+			t.Fatalf("a shutdown in the barrier logged a commit failure:\n%s", r.logs.String())
+		}
+	})
+}
+
+// The first-adoption skip still commits (inline and detached).
+func TestAdopter_FirstAdoptionSkipStillCommits(t *testing.T) {
+	for _, detached := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			ctx := context.Background()
+			r := newBarrierRig(t, 10*time.Second, 0)
+			rel := r.release("skip still commits")
+			h, err := r.ad.writeBlobBytes(ctx, rel)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := rigSuite + "/InRelease"
+			if detached {
+				path = rigSuite + "/Release"
+			}
+			if err := r.c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: rigHost,
+				Path: path, BlobHash: &h, UpstreamURL: "http://h" + path, IsMetadata: true}); err != nil {
+				t.Fatal(err)
+			}
+			if detached {
+				err = r.ad.RunDetached(ctx, barrierSuite, rel, []byte("a detached signature"), "", "")
+			} else {
+				err = r.ad.Run(ctx, barrierSuite, rel, "", "")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if evs := r.barrierEvents(); len(evs) != 1 || evs[0]["outcome"] != "not_needed" {
+				t.Fatalf("detached %v: events %v, want one not_needed", detached, evs)
+			}
+			if r.current(t) == 0 {
+				t.Fatalf("detached %v: the barrier was skipped but nothing was committed", detached)
+			}
+		})
+	}
+}
+
+// Design review I2: a deadline that passes in the flip barrier (ruling
+// R-C2) does not make the attempt timed_out; the commit's own error
+// classifies it. Here the commit fails — its candidate was retired while
+// the adoption waited — after adoption.max_duration (20 s) has passed: the
+// outcome and the recorded reason are db_failed, and adoption_flip_barrier
+// says commit_failed (design review M7).
+func TestCheck_BarrierPastTheDeadlineKeepsTheCommitErrorsOutcome(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		r := newBarrierRig(t, 10*time.Second, 0)
+		members := newFakeFetcher()
+		members.put(rigPkgsURL, r.pkgs)
+		ad, err := NewAdopter(AdoptionConfig{Cache: r.c, Fetcher: members, Verifier: passThroughVerifier{},
+			HostLimiter: hostsem.New(8), MaxConcurrent: 2, MaxDuration: 20 * time.Second, FlipGate: r.gate,
+			Logger: slog.New(slog.NewJSONHandler(r.logs, nil))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		seedStaleAnchorAt(t, r.c, rigHost, rigSuite)
+		ring := observability.NewRing(10)
+		rel := r.release("v1")
+		chk, err := New(Config{Cache: r.c, Fetcher: &changedUpstream{body: rel}, HostLimiter: hostsem.New(8),
+			Adopter: ad, AdoptionRing: ring, Logger: simtest.DiscardLogger()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := r.gate.AnchorStart(ctx, barrierKey) // a client reads the old anchor
+		chk.Check(ctx, "http", rigHost, rigSuite)
+		time.Sleep(25 * time.Second) // the adoption waits in the barrier; its deadline passed at 20 s
+		hash := hashOf(rel)
+		id, reused, err := r.c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{CanonicalScheme: "http",
+			CanonicalHost: rigHost, SuitePath: rigSuite, InReleaseHash: &hash})
+		if err != nil || !reused {
+			t.Fatalf("the adoption's candidate: id %d, reused %v, err %v", id, reused, err)
+		}
+		if _, err := r.c.ApplyLegacyAuditDecisions(ctx, []cache.LegacyAuditDecision{{SnapshotID: id, Outcome: cache.LegacyAuditQuarantine}}); err != nil {
+			t.Fatal(err)
+		}
+		tok.Done() // the commit runs at 35 s, and fails: the candidate is retired
+		chk.WaitForAdoptions()
+		sf, err := r.c.GetSuiteFreshness(ctx, "http", rigHost, rigSuite)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sf.CurrentSnapshotID != nil || strOf(sf.AdoptionFailReason) != "db_failed" {
+			t.Fatalf("current set %v, recorded reason %q; want no commit and db_failed",
+				sf.CurrentSnapshotID != nil, strOf(sf.AdoptionFailReason))
+		}
+		if evs := ring.Snapshot(); len(evs) != 1 || evs[0].Outcome != "db_failed" {
+			t.Fatalf("adoption ring %+v, want one db_failed attempt", evs)
+		}
+		if evs := r.barrierEvents(); len(evs) != 1 || evs[0]["outcome"] != "commit_failed" || evs[0]["held_requests"] != 0.0 {
+			t.Fatalf("adoption_flip_barrier events = %v, want one commit_failed with the barrier's fields", evs)
+		}
+	})
+}
+
+// Design note 18 (design review M3): main closes the gate at the shutdown
+// signal, while the lifetime context still runs. An adoption waiting in
+// the barrier abandons its commit at once and records nothing: an
+// abandoned flip is shutdown, never a failure (spec C7).
+func TestCheck_GateCloseInTheBarrierRecordsNothing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newBarrierRig(t, 10*time.Second, 0)
+		seedStaleAnchorAt(t, r.c, rigHost, rigSuite)
+		chk, err := New(Config{Cache: r.c, Fetcher: &changedUpstream{body: r.release("v1")}, HostLimiter: hostsem.New(8),
+			Adopter: r.ad, Logger: simtest.DiscardLogger()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := r.gate.AnchorStart(context.Background(), barrierKey)
+		defer tok.Done()
+		chk.Check(context.Background(), "http", rigHost, rigSuite)
+		time.Sleep(time.Second)
+		synctest.Wait()
+		closedAt := time.Now()
+		r.gate.Close()
+		chk.WaitForAdoptions()
+		if d := time.Since(closedAt); d != 0 {
+			t.Fatalf("the adoption ended %v after Close, want at once", d)
+		}
+		sf, err := r.c.GetSuiteFreshness(context.Background(), "http", rigHost, rigSuite)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sf.CurrentSnapshotID != nil || sf.AdoptionFailCount != 0 || sf.AdoptionFailReason != nil {
+			t.Fatalf("after Close: current set %v, failure count %d, reason set %v; want neither",
+				sf.CurrentSnapshotID != nil, sf.AdoptionFailCount, sf.AdoptionFailReason != nil)
+		}
+		if g, h := chk.admission.usage(); g != 0 || h != 0 {
+			t.Fatalf("slots leaked: %d/%d", g, h)
+		}
+		if st := r.gate.Stats(); st.Aborted != 1 {
+			t.Fatalf("gate stats = %+v, want one aborted flip", st)
+		}
+	})
+}
+
+// Spec C4 admission bound with the C8 barrier (ruling R-C3, design review
+// M15). A pool of two; two signed suites whose clients keep reading their
+// anchors, so their adoptions sit in the barrier; a third signed suite that
+// changes at the same time and queues for a slot. The busy adoptions keep
+// their global slots through the barrier (R-C1) and hold them for at most
+// the barrier's 140 s bound after their member pipelines; the queued suite
+// is re-offered the slot the moment the first of them commits, so it is
+// admitted within one tick + 140 s + D — inside one tick + (A + D), whose A
+// adds the barrier to adoption.max_duration and the commit bound, which
+// this simulation never reaches.
+func TestSimCapacity_TheBarrierHoldsTheGlobalSlotWithinItsBound(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		c := simtest.OpenCache(t)
+		gate, err := flipgate.New(flipgate.Config{Quiet: 10 * time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		members := &simMembers{fakeFetcher: newFakeFetcher(), stalled: map[string]bool{}, delay: map[string]time.Duration{}}
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
+			HostLimiter: hostsem.New(8), MaxConcurrent: 2, FlipGate: gate, Logger: simtest.DiscardLogger()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pkgsFor := func(label string) []byte {
+			return fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_" + label + ".deb": testHex64})
+		}
+		rel := func(label string, pkgs []byte) []byte {
+			return datedRelease(label, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
+		}
+		pkgsURL := func(host string) string { return "http://" + host + rigSuite + "/main/binary-amd64/Packages" }
+		up := simtest.NewUpstream()
+		hosts := []string{"busy1", "busy2", "queued"}
+		for _, host := range hosts {
+			members.put(pkgsURL(host), pkgsFor("1-"+host))
+			ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: host, SuitePath: rigSuite}
+			if err := ad.Run(ctx, ref, rel("v1-"+host, pkgsFor("1-"+host)), "", ""); err != nil {
+				t.Fatal(err)
+			}
+			members.put(pkgsURL(host), pkgsFor("2-"+host))
+			answer := simtest.Serve(rel("v2-"+host, pkgsFor("2-"+host)))
+			if host == "queued" {
+				answer = simtest.After(time.Second, answer) // the busy suites take both slots first
+			}
+			up.Set("http://"+host+rigSuite+"/InRelease", answer)
+		}
+		members.started = map[string]time.Time{}
+		ring := observability.NewRing(10)
+		t0 := time.Now()
+		var wg sync.WaitGroup
+		for _, host := range hosts[:2] {
+			key := flipgate.Key("http", host, rigSuite)
+			wg.Add(1)
+			go func() { // a client reads the anchor every 500 ms for ten minutes
+				defer wg.Done()
+				for time.Since(t0) < 10*time.Minute {
+					tok := gate.AnchorStart(ctx, key)
+					time.Sleep(50 * time.Millisecond)
+					tok.Done()
+					time.Sleep(450 * time.Millisecond)
+				}
+			}()
+		}
+		const refresh = 15 * time.Minute
+		tick := refresh / 4
+		chk, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: refresh,
+			Cooldown: time.Minute, Adopter: ad, AdoptionRing: ring, Logger: simtest.DiscardLogger(),
+			rand: func() float64 { return 0.5 }})
+		// 30 s after the first tick both busy adoptions are in the barrier:
+		// two global slots held, no host slot, the third suite not admitted.
+		time.Sleep(tick + 30*time.Second + 7*time.Millisecond)
+		members.mu.Lock()
+		_, admitted := members.started["queued"]
+		members.mu.Unlock()
+		if g, h := chk.admission.usage(); g != 2 || h != 0 || admitted {
+			t.Fatalf("in the barrier: %d global and %d host slots held, queued suite admitted %v; want 2, 0, false", g, h, admitted)
+		}
+		time.Sleep(10*time.Minute - time.Since(t0))
+		stop()
+		wg.Wait()
+
+		members.mu.Lock()
+		started := maps.Clone(members.started)
+		members.mu.Unlock()
+		ends := map[string]time.Time{}
+		for _, ev := range ring.Snapshot() {
+			if ev.Outcome != "success" {
+				t.Fatalf("adoption %s: %s (%s)", ev.Host, ev.Outcome, ev.Reason)
+			}
+			ends[ev.Host] = started[ev.Host].Add(time.Duration(ev.DurationSeconds * float64(time.Second)))
+		}
+		if len(ends) != 3 {
+			t.Fatalf("adoptions that ended: %v, want all three", ends)
+		}
+		barrierMax := flipgate.PhaseAMax + flipgate.TokenWaitMax + flipgate.HoldMax
+		first := ends["busy1"]
+		for _, host := range hosts[:2] {
+			if d := ends[host].Sub(started[host]); d > barrierMax {
+				t.Errorf("%s held its slot for %v, more than the barrier's %v", host, d, barrierMax)
+			}
+			if ends[host].Before(first) {
+				first = ends[host]
+			}
+		}
+		if q := started["queued"]; q.Before(first) || q.Sub(first) > 2*time.Second {
+			t.Errorf("the queued suite was admitted %v after the first busy commit, want within its 1 s anchor answer", q.Sub(first))
+		}
+		if bound := tick + barrierMax + checkDeadline; started["queued"].Sub(t0) > bound {
+			t.Errorf("the queued suite was admitted %v after the start, bound one tick + 140 s + D = %v", started["queued"].Sub(t0), bound)
 		}
 	})
 }
@@ -3107,6 +3854,7 @@ Expected: compile failure naming `unknown field FlipGate in struct literal of ty
 In `internal/freshness/adoption.go`, add the import `"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"`. Add to `AdoptionConfig`, right after the `MaxDuration` field:
 
 ```go
+
 	// FlipGate is the spec C8 flip barrier the commit waits behind
 	// (adoption.flip_quiet_period). nil, or a gate with a zero quiet
 	// period, commits at once (the pre-C8 behaviour). The handler must
@@ -3117,6 +3865,7 @@ In `internal/freshness/adoption.go`, add the import `"github.com/linsomniac/apt-
 Add to the `Adopter` struct, right after `maxDuration time.Duration`:
 
 ```go
+
 	// flipGate is the spec C8 barrier the commit waits behind (nil: none).
 	flipGate *flipgate.Gate
 ```
@@ -3299,21 +4048,35 @@ func (a *Adopter) flip(ctx context.Context, suite SuiteRef, p *adoptionPayload, 
 		return commit()
 	}
 	attrs := []any{"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "snapshot_id", snapshotID}
+	// first is defensive: Step 3c keeps the url_path anchor at the previous
+	// snapshot's bytes, so a later adoption never matches it today; it keeps
+	// the skip correct should a later phase write url_path anchors for
+	// adopted suites.
 	if first && a.servedAnchorUnchanged(ctx, suite, p) {
 		err := commit()
-		a.logger.Info("adoption_flip_barrier", append(attrs, "outcome", "not_needed")...)
+		a.logger.Info("adoption_flip_barrier", append(attrs, "outcome", barrierOutcome("not_needed", err))...)
 		return err
 	}
 	res, err := a.flipGate.Flip(p.barrierCtx(ctx), flipgate.Key(suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath), commit)
 	if res.Outcome != flipgate.OutcomeAborted {
 		a.logger.Info("adoption_flip_barrier", append(attrs,
-			"outcome", string(res.Outcome),
+			"outcome", barrierOutcome(string(res.Outcome), err),
 			"phase_a_seconds", res.PhaseA.Seconds(),
 			"token_wait_seconds", res.TokenWait.Seconds(),
 			"hold_seconds", res.HoldEnd.Sub(res.HoldStart).Seconds(),
 			"held_requests", res.Waiters)...)
 	}
 	return err
+}
+
+// barrierOutcome is adoption_flip_barrier's outcome: the barrier's own, or
+// commit_failed when the commit ran and failed (the snapshot did not
+// switch; the timing fields still describe the barrier).
+func barrierOutcome(outcome string, commitErr error) string {
+	if commitErr != nil {
+		return "commit_failed"
+	}
+	return outcome
 }
 
 // servedAnchorUnchanged reports whether the anchor this adoption commits
@@ -3335,13 +4098,57 @@ func (a *Adopter) servedAnchorUnchanged(ctx context.Context, suite SuiteRef, p *
 
 - [ ] **Step 6: The Checker passes its hooks; deferred minors B-15, B-26, B-68**
 
-In `internal/freshness/freshness.go` `spawnAdoption`, replace `err := c.adopter.runRequest(actx, req, l.releaseHost)` with
+In `internal/freshness/freshness.go`, add the import `"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"` (after the `fetch` import). In `spawnAdoption`, replace
 
 ```go
-		err := c.adopter.runRequest(actx, req, runHooks{membersDone: l.releaseHost, stop: c.lifetimeCtx})
+		err := c.adopter.runRequest(actx, req, l.releaseHost)
+		duration := time.Since(start)
+		outcome := classifyAdoptionOutcome(err)
+		if err != nil && errors.Is(actx.Err(), context.DeadlineExceeded) && c.lifetimeCtx.Err() == nil {
+			outcome = "timed_out" // a member fetch reports the deadline as its own failure
+		}
 ```
 
-and in its AIDEV-NOTE replace the last sentence `The host slot is freed earlier, when the member pipeline ends.` with `The host slot is freed earlier, when the member pipeline ends; the global slot only here, after the flip barrier and the commit (ruling R-C1).`
+with (design note 19)
+
+```go
+		pipelineDone := false // set by membersDone, which runs on this goroutine (runShared Step 11)
+		err := c.adopter.runRequest(actx, req, runHooks{
+			membersDone: func() { pipelineDone = true; l.releaseHost() },
+			stop:        c.lifetimeCtx,
+		})
+		duration := time.Since(start)
+		outcome := classifyAdoptionOutcome(err)
+		// A deadline that fires in the member pipeline makes the attempt
+		// timed_out (a member fetch reports it as its own failure). One that
+		// passes in the flip barrier (ruling R-C2) does not: what failed then
+		// is the commit, and its own error classifies it (a commit that hit
+		// commitTimeout is still timed_out, through its chain).
+		if err != nil && !pipelineDone && errors.Is(actx.Err(), context.DeadlineExceeded) && c.lifetimeCtx.Err() == nil {
+			outcome = "timed_out"
+		}
+```
+
+and replace its last statement in the error branch, `c.recordAdoptionFailure(req, reason)`, with (design note 18)
+
+```go
+			// A flip abandoned in the barrier means shutdown: main closes
+			// the gate at the signal, while the lifetime context still
+			// runs. Shutdown is never a failure (spec C7, design note 18).
+			if !errors.Is(err, flipgate.ErrAborted) {
+				c.recordAdoptionFailure(req, reason)
+			}
+```
+
+In its AIDEV-NOTE, replace the last sentence `The host slot is freed earlier, when the member pipeline ends.` with
+
+```go
+// The host slot is freed earlier, when the member pipeline ends; the global slot only here, after the flip barrier and the commit (ruling R-C1).
+// A deadline that passes after the member pipeline, in the flip barrier
+// (ruling R-C2), leaves the outcome to the commit's own error, and a flip
+// abandoned in the barrier (shutdown, design note 18) is never recorded as
+// a failure.
+```
 
 B-26: in `rescheduleFailingAdoptions`, put this comment directly above `if c.adopter == nil {`:
 
@@ -3359,14 +4166,25 @@ B-68: replace the `ErrAdoptionPanicked` doc comment (`// ErrAdoptionPanicked is 
 // and reconcile panics are logged, not recorded (phase B plan, deviation 7).
 ```
 
-In `internal/freshness/metrics.go`, append to the inventory AIDEV-NOTE that ends `acu_freshness_waiting_for_slot (spec C4, unlabelled gauge).` the sentence `The flip barrier's acu_flip_hold_skipped_total and acu_flip_hold_expired_total (spec C8, unlabelled counters) are declared in internal/flipgate.` B-15: in `classifyAdoptionOutcome`, directly above `case errors.Is(err, context.DeadlineExceeded):` add
+In `internal/freshness/metrics.go`, append to the inventory AIDEV-NOTE that begins `// AIDEV-NOTE: metrics added by the flat-repository work` (its last line is `// unlabelled gauge).`) a sentence, so that the note ends:
+
+```go
+// (spec C7, unlabelled gauge); acu_freshness_waiting_for_slot (spec C4,
+// unlabelled gauge). The flip barrier's acu_flip_hold_skipped_total,
+// acu_flip_hold_expired_total, acu_flip_waiters_over_cap_total,
+// acu_flip_slow_anchor_reads_total and acu_flip_gate_panics_total (spec
+// C8, unlabelled counters) are declared in internal/flipgate.
+```
+
+B-15: in `classifyAdoptionOutcome`, directly above `case errors.Is(err, context.DeadlineExceeded):` add
 
 ```go
 	// timed_out stays ahead of the member and DB sentinels: a deadline that
 	// surfaces through a %w chain is timed_out — including a commit that
 	// hit commitTimeout. Member-fetch errors flatten their cause with %v,
-	// so they never match here; spawnAdoption reclassifies an attempt
-	// whose adoption.max_duration passed as timed_out.
+	// so they never match here; spawnAdoption reclassifies as timed_out an
+	// attempt whose adoption.max_duration passed in the member pipeline,
+	// never one whose deadline passed in the flip barrier (ruling R-C2).
 ```
 
 - [ ] **Step 7: The existing `runRequest` callers and deferred minor B-29**
@@ -3457,7 +4275,7 @@ Expected: PASS. (Every existing adopter is built without `FlipGate`, so `flip` c
 
 - [ ] **Step 9: Mutation check (do not commit)**
 
-One at a time, reverting each (verified against this plan's code): (a) in `spawnAdoption`, pass `membersDone: l.release` → `TestCheck_MembersDoneFreesOnlyTheHostSlot` FAILS ("in the barrier: 0 global and 0 host slots held, want 1 and 0"); (b) in `stopErr`, make the `p.stop != nil` branch `return nil` → `TestAdoption_ShutdownAfterTheDeadlineStillAbandonsTheCommit` FAILS (it commits); (c) make `barrierCtx` return `ctx` → `TestAdopter_BarrierOutlivesTheAdoptionDeadline` FAILS ("flip abandoned before the commit: context deadline exceeded"); (d) make `barrierCtx` always return `context.WithoutCancel(ctx)` → `TestAdopter_ShutdownInTheBarrierCommitsNothing` and `TestCheck_ShutdownInTheBarrierRecordsNothing` FAIL (both commit); (e) in `flip`, change the condition to `if false && first && a.servedAnchorUnchanged(ctx, suite, p) {` → `TestAdopter_FirstAdoptionOfTheServedAnchorSkipsTheBarrier/same_bytes` ("committed after 15s, want 0s") and `TestAdopter_DetachedFirstAdoptionComparesTheRelease` FAIL; (f) in `servedAnchorUnchanged`, compare `p.inlineHash` for the detached form too → `TestAdopter_DetachedFirstAdoptionComparesTheRelease` FAILS; (g) restore `tickerCtx, tickerCancel := context.WithCancel(ctx)` → `TestAdoption_HeartbeatRunsUntilTheCommit` FAILS ("last heartbeat 10s after the start").
+One at a time, reverting each (verified against this plan's code): (a) in `spawnAdoption`'s `membersDone`, call `l.release()` instead of `l.releaseHost()` → `TestCheck_MembersDoneFreesOnlyTheHostSlot` FAILS ("in the barrier: 0 global and 0 host slots held, want 1 and 0"), and so does `TestSimCapacity_TheBarrierHoldsTheGlobalSlotWithinItsBound` when run alone ("in the barrier: 0 global and 0 host slots held, queued suite admitted true; want 2, 0, false"); (b) in `stopErr`, make the `p.stop != nil` branch `return nil` → `TestAdoption_ShutdownAfterTheDeadlineStillAbandonsTheCommit` FAILS (it commits); (c) make `barrierCtx` return `ctx` → `TestAdopter_BarrierOutlivesTheAdoptionDeadline` FAILS ("flip abandoned before the commit: context deadline exceeded"); (d) make `barrierCtx` always return `context.WithoutCancel(ctx)` → `TestAdopter_ShutdownInTheBarrierCommitsNothing` and `TestCheck_ShutdownInTheBarrierRecordsNothing` FAIL (both commit); (e) in `flip`, change the condition to `if false && first && a.servedAnchorUnchanged(ctx, suite, p) {` → `TestAdopter_FirstAdoptionOfTheServedAnchorSkipsTheBarrier/same_bytes` ("committed after 15s, want 0s") and `TestAdopter_DetachedFirstAdoptionComparesTheRelease` FAIL; (f) in `servedAnchorUnchanged`, compare `p.inlineHash` for the detached form too → `TestAdopter_DetachedFirstAdoptionComparesTheRelease` FAILS; (g) restore `tickerCtx, tickerCancel := context.WithCancel(ctx)` → `TestAdoption_HeartbeatRunsUntilTheCommit` FAILS ("last heartbeat 10s after the start"); (h) in `runShared`, delete the `if errors.Is(err, flipgate.ErrAborted) { … }` branch → `TestAdopter_ShutdownInTheBarrierIsNotACommitFailure` FAILS ("a shutdown in the barrier is reported as a DB failure"); (i) in `flip`'s skip path, replace `err := commit()` with `var err error` → `TestAdopter_FirstAdoptionSkipStillCommits` FAILS ("the barrier was skipped but nothing was committed"); (j) in `spawnAdoption`, replace `!pipelineDone &&` with `(!pipelineDone || true) &&` (dropping it leaves `pipelineDone` unused) → `TestCheck_BarrierPastTheDeadlineKeepsTheCommitErrorsOutcome` FAILS (`recorded reason "timed_out"; want no commit and db_failed`); (k) make `barrierOutcome` return `outcome` always → the same test FAILS ("want one commit_failed"); (l) in `spawnAdoption`, change `if !errors.Is(err, flipgate.ErrAborted) {` to `if true || !errors.Is(err, flipgate.ErrAborted) {` → `TestCheck_GateCloseInTheBarrierRecordsNothing` FAILS ("after Close: current set false, failure count 1, reason set true").
 
 - [ ] **Step 10: Commit**
 
@@ -3471,7 +4289,7 @@ git commit -m "Commit adoptions behind the flip barrier, keeping the global slot
 
 ### Task 6: The handler registers anchor serves with the barrier
 
-Spec C8 "Handler side": before serving `<suite>/InRelease` or `<suite>/Release` of a suite with a row, `AnchorStart` (waiting while that suite's flip holds anchors, at most 20 s, honouring the request context, handler shutdown and the waiter cap), before host-slot acquisition and singleflight; `Done` after the (re-read) response is written; `Release.gpg` never held; entries only for suites with rows. Design notes 1 and 3. Deferred minor A-54 (`handler.go`, a file this task touches). This task also adds the end-to-end harness Task 10 builds on.
+Spec C8 "Handler side": before serving `<suite>/InRelease` or `<suite>/Release` of a suite with a row, `AnchorStart` (waiting while that suite's flip holds anchors, at most 20 s, honouring the request context, handler shutdown and the waiter cap), before host-slot acquisition and singleflight; `Done` after the (re-read) response is written; `Release.gpg` never held; entries only for suites with rows. Design notes 1, 3 (including the MITM caveat, design review M13) and 18 (the handler-shutdown wait is defence in depth once `main` closes the gate at the signal). Deferred minor A-54 (`handler.go`, a file this task touches). This task also adds the end-to-end harness Task 10 builds on.
 
 **Files:**
 - Modify: `internal/handler/handler.go` (`Config.FlipGate`, `Handler.flipGate`, `New`, `ServeHTTP`, new `anchorStart` and `releaseSuffix`; A-54)
@@ -3479,7 +4297,7 @@ Spec C8 "Handler side": before serving `<suite>/InRelease` or `<suite>/Release` 
 
 **Interfaces:**
 - Consumes: Task 1 (`flipgate.New`, `Config`, `Key`, `Gate.AnchorStart`, `Token.Done`, `Gate.Flip`, `Gate.Len`, `HoldMax`), Task 5 (`freshness.AdoptionConfig.FlipGate`). Existing: `freshness.NewAdopter`, `freshness.SuiteRef`, `simtest.OpenCache`, `simtest.DiscardLogger`, the handler's `hdrXCacheSnapshot`.
-- Produces: `handler.Config.FlipGate *flipgate.Gate` (Task 9 wires it). Test helpers in package `handler` (Task 10 uses them): `flipSimHost`, `flipStack`, `newFlipStack(t, quiet)`, `(*flipStack).adopt(suite, gen)`, `.current(suite) string`, `.get(path, transfer) (gen string, code int)`, `memberStore`, `plainVerifier`, `noUpstream`, `slowWriter`. (The ledger adapters `serve` and `flipReaders` arrive with their first user, Task 10.)
+- Produces: `handler.Config.FlipGate *flipgate.Gate` (Task 9 wires it). Test helpers in package `handler` (Task 10 uses them): `flipSimHost`, `flipStack`, `newFlipStack(t, quiet)`, `(*flipStack).publish(suite, gen) (freshness.SuiteRef, []byte)`, `.adopt(suite, gen)`, `.current(suite) string`, `.get(path, transfer) (gen string, code int)`, `memberStore`, `plainVerifier`, `noUpstream`, `slowWriter`. (The ledger adapters `serve` and `flipReaders` arrive with their first user, Task 10.)
 
 - [ ] **Step 1: The harness**
 
@@ -3596,16 +4414,22 @@ func newFlipStack(t *testing.T, quiet time.Duration) *flipStack {
 	return &flipStack{t: t, c: c, h: h, gate: gate, ad: ad, members: members}
 }
 
-// adopt publishes generation gen of suite upstream and adopts it through
-// the barrier; it returns once the commit is done.
-func (s *flipStack) adopt(suite string, gen int) {
+// publish puts generation gen of suite's Packages upstream and returns
+// the suite and its Release text.
+func (s *flipStack) publish(suite string, gen int) (freshness.SuiteRef, []byte) {
 	pkgs := []byte(fmt.Sprintf("Package: p\nArchitecture: amd64\nVersion: %d\nFilename: pool/p_%d_amd64.deb\nSize: 1\nSHA256: %064x\n\n",
 		gen, gen, gen))
 	s.members.put("http://"+flipSimHost+suite+"/main/binary-amd64/Packages", pkgs)
 	sum := sha256.Sum256(pkgs)
 	rel := []byte(fmt.Sprintf("Label: %s generation %d\nSHA256:\n %s %d main/binary-amd64/Packages\n",
 		suite, gen, hex.EncodeToString(sum[:]), len(pkgs)))
-	ref := freshness.SuiteRef{CanonicalScheme: "http", CanonicalHost: flipSimHost, SuitePath: suite}
+	return freshness.SuiteRef{CanonicalScheme: "http", CanonicalHost: flipSimHost, SuitePath: suite}, rel
+}
+
+// adopt publishes generation gen of suite upstream and adopts it (inline
+// form) through the barrier; it returns once the commit is done.
+func (s *flipStack) adopt(suite string, gen int) {
+	ref, rel := s.publish(suite, gen)
 	if err := s.ad.Run(context.Background(), ref, rel, "", ""); err != nil {
 		s.t.Errorf("adopt %s generation %d: %v", suite, gen, err)
 	}
@@ -3774,7 +4598,8 @@ func TestServeHTTP_HeldAnchorIsAnsweredFromTheNewSnapshot(t *testing.T) {
 }
 
 // Spec C8: the wait honours handler shutdown — Close releases a held
-// request at once (the server has already closed its connections then).
+// request at once. Defence in depth: the daemon closes the gate at the
+// shutdown signal first (design note 18), so no hold is left by then.
 func TestHandler_CloseReleasesHeldAnchorRequests(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newFlipStack(t, 10*time.Second)
@@ -3891,7 +4716,13 @@ After `maybeFireFreshness` (and its `t1PanicStackLogged` var) add:
 // pointer (trySnapshotHit re-reads it), or a flip could commit between the
 // read and the registration and hand the client the old anchor after the
 // flip. The row check before it therefore costs one extra read per anchor
-// request of a tracked suite (none when the barrier is off).
+// request of a tracked suite (none when the barrier is off). The wait's
+// end on h.lifecycleCtx is defence in depth: the daemon closes the gate at
+// the shutdown signal (design note 18), so no hold is left when the
+// handler closes. An HTTPS request through the MITM pipeline keeps its
+// inner context when its client disconnects (internal/proxy/connect.go),
+// so such a waiter stays until the hold ends (at most HoldMax) and counts
+// against the waiter cap meanwhile (design note 3).
 func (h *Handler) anchorStart(r *http.Request, req *proxy.Request) *flipgate.Token {
 	if !h.flipGate.Enabled() || !req.IsMetadata || req.SuitePath == "" {
 		return nil
@@ -3919,7 +4750,7 @@ Expected: PASS (every existing handler is built without a gate).
 
 - [ ] **Step 6: Mutation check (do not commit)**
 
-One at a time, reverting each (verified against this plan's code): (a) in `anchorStart`, drop `&& req.Path != req.SuitePath+releaseSuffix` → `TestServeHTTP_AnchorServesRegisterWithTheBarrier` FAILS ("/Release: a flip right after the serve waited 0s, want 10s"); (b) also register `Release.gpg` (append `&& req.Path != req.SuitePath+"/Release.gpg"` to that condition) → the same test FAILS (the `/Release.gpg` case waits 10 s); (c) make the row check `false && err != nil` → `TestServeHTTP_OnlyTrackedSuitesCreateGateState` FAILS ("an untracked suite created 1 gate entries"); (d) pass `r.Context()` to `AnchorStart` instead of the merged `ctx` → `TestHandler_CloseReleasesHeldAnchorRequests` FAILS ("answered 4s after Close": at the commit); (e) move the `anchorStart` block in `ServeHTTP` to just before `h.serveCacheMiss(w, r, req, start)` → `TestServeHTTP_HeldAnchorIsAnsweredFromTheNewSnapshot` FAILS (snapshot hits no longer register: the flip sees no anchors, commits at 10 s, and the request is not held).
+One at a time, reverting each (verified against this plan's code): (a) in `anchorStart`, drop `&& req.Path != req.SuitePath+releaseSuffix` → `TestServeHTTP_AnchorServesRegisterWithTheBarrier` FAILS ("/Release: a flip right after the serve waited 0s, want 10s"); (b) also register `Release.gpg` (append `&& req.Path != req.SuitePath+"/Release.gpg"` to that condition) → the same test FAILS (the `/Release.gpg` case waits 10 s); (c) make the row check `false && err != nil` → `TestServeHTTP_OnlyTrackedSuitesCreateGateState` FAILS ("an untracked suite created 1 gate entries"); (d) pass `r.Context()` to `AnchorStart` instead of the merged `ctx` (add `_ = ctx`) → `TestHandler_CloseReleasesHeldAnchorRequests` FAILS ("answered 4s after Close": at the commit); (e) move the `anchorStart` block in `ServeHTTP` to just before `h.serveCacheMiss(w, r, req, start)` → `TestServeHTTP_HeldAnchorIsAnsweredFromTheNewSnapshot` FAILS (snapshot hits no longer register: the flip sees no anchors and commits at once, 250 ms in — the setup flip's hold held nothing, design note 17 — so the request sent at 65 s is not held: "answered 0s after it was sent (at 1m5s); the commit was at 250ms").
 
 - [ ] **Step 7: Commit**
 
@@ -3933,7 +4764,7 @@ git commit -m "Register InRelease and Release serves of tracked suites with the 
 
 ### Task 7: Snapshot anchors carry a monotonic `Last-Modified`
 
-Spec C8 "Monotonic `Last-Modified`": snapshot-served anchors (`InRelease`, `Release`, `Release.gpg`) use `max(pool mtime, adopted_at)` as the `ServeContent` modtime; with Task 4's stamp, a client's `If-Modified-Since` from the previous anchor always gets a 200 after a flip, across same-second flips, a first adoption, and backward clock steps. Design note 7 (the recovery path too). Deferred minor A-3, handler half (the handler's wall-clock stamps were never told apart from `time.Now` by a test): `handler.go` is touched here.
+Spec C8 "Monotonic `Last-Modified`": snapshot-served anchors (`InRelease`, `Release`, `Release.gpg`) use `max(pool mtime, adopted_at)` as the `ServeContent` modtime; with Task 4's stamp, a client's `If-Modified-Since` from the previous anchor always gets a 200 after a flip, across same-second flips, a first adoption, and backward clock steps between flips (a step back during an adoption is documented, design note 21). Design note 7 (the recovery path too); the executability review's P7 (the pool-mtime side of the max) and observation 1 (the AIDEV-NOTE's monotonicity condition). Deferred minor A-3, handler half (the handler's wall-clock stamps were never told apart from `time.Now` by a test): `handler.go` is touched here.
 
 **Files:**
 - Modify: `internal/handler/handler.go` (`snapshotMeta.minModTime`, `serveBlobWithHeaders`, `trySnapshotHit`, `serveSnapshotMemberMiss`; new `laterOf`, `isAnchorMember`, `anchorModFloor`)
@@ -4135,6 +4966,22 @@ func TestServeHTTP_RecoveredAnchorGetsTheFloor(t *testing.T) {
 		t.Fatalf("recovered anchor Last-Modified %q, want adopted_at %q", lm, httpTime(adoptedAt(t, h, id)))
 	}
 }
+
+// max(pool mtime, adopted_at) (spec C8): a pool file newer than adopted_at
+// keeps its own mtime as Last-Modified.
+func TestServeHTTP_SnapshotAnchorKeepsANewerPoolMtime(t *testing.T) {
+	h := newTestHandler(t, nil, nil)
+	hash := writeBlob(t, h, []byte("anchor with a newer pool mtime"))
+	id := commitInlineSnapshot(t, h, "http", "127.0.0.1", lmSuite, hash,
+		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: hash, DeclaredSHA256: hash}}, nil)
+	mt := time.Unix(adoptedAt(t, h, id)+3600, 0)
+	if err := os.Chtimes(h.cache.BlobPath(hash), mt, mt); err != nil {
+		t.Fatal(err)
+	}
+	if code, lm := lastModifiedGet(t, h, lmSuite+"/InRelease", ""); code != http.StatusOK || lm != httpTime(mt.Unix()) {
+		t.Fatalf("%d, Last-Modified %q; want 200 with the newer pool mtime %q", code, lm, httpTime(mt.Unix()))
+	}
+}
 ```
 
 `internal/handler/wallclock_stamps_test.go`:
@@ -4239,8 +5086,8 @@ func TestHandler_StampsFollowTheWallClock(t *testing.T) {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test ./internal/handler/ -run 'TestServeHTTP_SnapshotAnchorLastModified|TestServeHTTP_FirstAdoptionLastModified|TestServeHTTP_DetachedAnchorsGetTheFloor|TestServeHTTP_RecoveredAnchorGetsTheFloor|TestHandler_StampsFollowTheWallClock'`
-Expected: FAIL — `TestServeHTTP_SnapshotAnchorLastModifiedIsMonotonic`, `…SurvivesABackwardClockStep`, `TestServeHTTP_FirstAdoptionLastModifiedPassesTheServedAnchor`, `TestServeHTTP_DetachedAnchorsGetTheFloorIndexesDoNot` and `TestServeHTTP_RecoveredAnchorGetsTheFloor` report the pool mtime as `Last-Modified`; `TestHandler_StampsFollowTheWallClock` already PASSES (it pins today's behaviour; its mutation check is in Step 5).
+Run: `go test ./internal/handler/ -run 'TestServeHTTP_SnapshotAnchorLastModified|TestServeHTTP_FirstAdoptionLastModified|TestServeHTTP_DetachedAnchorsGetTheFloor|TestServeHTTP_RecoveredAnchorGetsTheFloor|TestHandler_StampsFollowTheWallClock|TestServeHTTP_SnapshotAnchorKeepsANewerPoolMtime'`
+Expected: FAIL — `TestServeHTTP_SnapshotAnchorLastModifiedIsMonotonic`, `…SurvivesABackwardClockStep`, `TestServeHTTP_FirstAdoptionLastModifiedPassesTheServedAnchor`, `TestServeHTTP_DetachedAnchorsGetTheFloorIndexesDoNot` and `TestServeHTTP_RecoveredAnchorGetsTheFloor` report the pool mtime as `Last-Modified`; `TestHandler_StampsFollowTheWallClock` and `TestServeHTTP_SnapshotAnchorKeepsANewerPoolMtime` already PASS (they pin today's behaviour and the pool-mtime side of `max(pool mtime, adopted_at)`; their mutation checks are in Step 5).
 
 - [ ] **Step 3: Implement**
 
@@ -4337,9 +5184,11 @@ func isAnchorMember(p string) bool {
 // previous anchor always gets a 200 after a flip, even across a backward
 // clock step. A read failure leaves the pool mtime (the pre-C8 behaviour).
 //
-// AIDEV-NOTE: monotonic as long as the previous anchor's pool mtime is not
-// ahead of its adopted_at — true unless the clock stepped back between that
-// anchor blob's write and its commit.
+// AIDEV-NOTE: monotonic unless the previous anchor's pool file was
+// (re)written at a wall time later than the next commit's stamp: the clock
+// stepped back between that blob's write and its commit, or after a
+// snapshot-member recovery rewrote it (docs/configuration.md states the
+// gap; design review M5).
 func (h *Handler) anchorModFloor(ctx context.Context, snapshotID int64) time.Time {
 	snap, err := h.cache.GetSuiteSnapshot(ctx, snapshotID)
 	if err != nil || snap.AdoptedAt == nil {
@@ -4365,7 +5214,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each (verified against this plan's code): (a) in `serveBlobWithHeaders`, pass `st.ModTime()` again → `TestServeHTTP_SnapshotAnchorLastModifiedIsMonotonic` FAILS ("first anchor: … want 200 and adopted_at …"); (b) in `serveSnapshotMemberMiss`, pass `st.ModTime()` again (keep `_ = minMod`) → `TestServeHTTP_RecoveredAnchorGetsTheFloor` FAILS; (c) make `isAnchorMember` return `true` → `TestServeHTTP_DetachedAnchorsGetTheFloorIndexesDoNot` FAILS ("Packages: … want its pool mtime"); (d) in `runFetch`, replace `now := wallclock.Unix()` with `now := time.Now().Unix()` → `TestHandler_StampsFollowTheWallClock` FAILS (miss stamps); (e) in `serveBlobWithHeaders`, compute the age from `time.Now().Unix()` → the same test FAILS ("hit X-Cache-Age = 0"); (f) the same in `recordByHashURLPath` → FAILS (by-hash stamps); (g) the same for `tryServeStale`'s age → FAILS ("stale X-Cache-Age = 0").
+One at a time, reverting each (verified against this plan's code): (a) in `serveBlobWithHeaders`, pass `st.ModTime()` again → `TestServeHTTP_SnapshotAnchorLastModifiedIsMonotonic` FAILS ("first anchor: … want 200 and adopted_at …"); (b) in `serveSnapshotMemberMiss`, pass `st.ModTime()` again (keep `_ = minMod`) → `TestServeHTTP_RecoveredAnchorGetsTheFloor` FAILS; (c) make `isAnchorMember` return `true` → `TestServeHTTP_DetachedAnchorsGetTheFloorIndexesDoNot` FAILS ("Packages: … want its pool mtime"); (d) in `runFetch`, replace `now := wallclock.Unix()` with `now := time.Now().Unix()` → `TestHandler_StampsFollowTheWallClock` FAILS (miss stamps); (e) in `serveBlobWithHeaders`, compute the age from `time.Now().Unix()` → the same test FAILS ("hit X-Cache-Age = 0"); (f) the same in `recordByHashURLPath` → FAILS (by-hash stamps); (g) the same for `tryServeStale`'s age → FAILS ("stale X-Cache-Age = 0"); (h) in `laterOf`, always take a set floor (`if !floor.IsZero() {`) → `TestServeHTTP_SnapshotAnchorKeepsANewerPoolMtime` FAILS ("want 200 with the newer pool mtime").
 
 - [ ] **Step 6: Commit**
 
@@ -4379,7 +5228,7 @@ git commit -m "Serve snapshot anchors with Last-Modified no older than their ado
 
 ### Task 8: Retained by-hash
 
-Spec C8 "Retained by-hash": when `trySnapshotHit` misses the current snapshot for a `by-hash/SHA256|SHA512/<hex>` member, look it up in the suite's other adopted, non-retired snapshots (newest first; at most `gc.keep_displaced + 1`), serve it with that snapshot's `X-Cache-Snapshot`; SHA256 aliases must match the served blob hash, SHA512 aliases rely on the verified `snapshot_member` binding; no recovery fetch for displaced snapshots; counter `acu_serve_byhash_displaced_total{host}`; `gc.keep_displaced = 0` disables it. Plan deviations 3 and 4, design note 15.
+Spec C8 "Retained by-hash": when `trySnapshotHit` misses the current snapshot for a `by-hash/SHA256|SHA512/<hex>` member, look it up in the suite's other adopted, non-retired snapshots (newest first; at most `gc.keep_displaced + 1`), serve it with that snapshot's `X-Cache-Snapshot`; SHA256 aliases must match the served blob hash, SHA512 aliases rely on the verified `snapshot_member` binding; no recovery fetch for displaced snapshots; counter `acu_serve_byhash_displaced_total{host}`; `gc.keep_displaced = 0` disables it. Plan deviations 3 and 4, design note 15; the executability review's P8 (a mismatched newer row must not hide an older valid one) and observation 3 (the regex's leading anchor is defensive, kept).
 
 **Files:**
 - Modify: `internal/handler/handler.go` (`Config.KeepDisplaced`, `Handler.keepDisplaced`, `New`, `trySnapshotHit`, `tryCacheHit`, `packageValidation`, `logRequestWithValidation`; new `byHashMemberRE`, `tryDisplacedByHash`), `internal/handler/metrics.go`
@@ -4642,6 +5491,20 @@ func TestNew_RejectsNegativeKeepDisplaced(t *testing.T) {
 		t.Fatal("New accepted KeepDisplaced = -1")
 	}
 }
+
+// A newer displaced snapshot whose SHA256 alias row is bound to other bytes
+// must not hide an older displaced snapshot that holds the real bytes.
+func TestServeHTTP_RetainedByHashSkipsAMismatchedNewerRow(t *testing.T) {
+	h, _ := newDisplacedHandler(t, 3, nil)
+	alias := aliasOf("Packages one")
+	id1 := adoptWithMembers(t, h, "one", map[string]string{alias: "Packages one"})
+	adoptWithMembers(t, h, "two", map[string]string{alias: "bytes that hash to something else"})
+	adoptWithMembers(t, h, "three", nil)
+	rec := getMember(t, h, alias)
+	if rec.Code != http.StatusOK || rec.Header().Get(hdrXCacheSnapshot) != itoa(id1) {
+		t.Fatalf("got %d from snapshot %q, want 200 from %d", rec.Code, rec.Header().Get(hdrXCacheSnapshot), id1)
+	}
+}
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -4739,7 +5602,21 @@ with
 		}
 ```
 
-and in its doc comment, extend regime 1's sentence `A miss in snapshot_member returns 404 — once a suite is adopted, the snapshot is the contract.` with ` The one exception is a by-hash member one of the suite's displaced snapshots declared (spec C8 retained by-hash).`
+and in its doc comment extend regime 1's sentence `A miss in snapshot_member returns 404 — once a suite is adopted, the snapshot is the contract.`: replace
+
+```go
+//     url_path fallback. A miss in snapshot_member returns 404 — once
+//     a suite is adopted, the snapshot is the contract.
+```
+
+with
+
+```go
+//     url_path fallback. A miss in snapshot_member returns 404 — once
+//     a suite is adopted, the snapshot is the contract. The one
+//     exception is a by-hash member one of the suite's displaced
+//     snapshots declared (spec C8 retained by-hash).
+```
 
 Add to `packageValidation` (after `PackageName`):
 
@@ -4765,7 +5642,8 @@ After `tryByHashContentAddressed` (and before `recordByHashURLPath`) add:
 
 ```go
 // byHashMemberRE matches a suite-relative by-hash member path, SHA256 or
-// SHA512, capturing the hex when the algorithm is SHA256.
+// SHA512, capturing the hex when the algorithm is SHA256. The leading
+// (?:^|/) is defensive: IsMetadata routes only /by-hash/ paths here.
 var byHashMemberRE = regexp.MustCompile(`(?:^|/)by-hash/(?:SHA256/([0-9a-f]{64})|SHA512/[0-9a-f]{128})$`)
 
 // tryDisplacedByHash is spec C8's retained by-hash: a by-hash member the
@@ -4819,7 +5697,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each (verified against this plan's code): (a) make the alias check `if false && m[1] != "" && row.BlobHash != m[1]` → `TestServeHTTP_RetainedByHashSHA256MustMatchTheBlob` FAILS ("an alias bound to another blob: 200, want 404"); (b) pass `h.keepDisplaced` instead of `h.keepDisplaced+1` → `TestServeHTTP_RetainedByHashSearchesKeepDisplacedPlusOne` FAILS; (c) make the early return `if false && h.keepDisplaced <= 0` → `TestServeHTTP_RetainedByHashIsOffWhenKeepDisplacedIsZero` FAILS (served with limit 1); (d) narrow `byHashMemberRE` to `(?:^|/)by-hash/(?:SHA256/([0-9a-f]{64}))$` → `TestServeHTTP_RetainedByHashSHA512UsesTheVerifiedBinding` FAILS; (e) return `packageValidation{}` from `tryCacheHit`'s snapshot branch again (`_ = displaced`) → `TestServeHTTP_RetainedByHashServesTheDisplacedSnapshot` FAILS (no `snapshot_displaced`); (f) replace the `serveByHashDisplacedTotal.Inc(req.CanonicalHost)` line with `_ = serveByHashDisplacedTotal` → the same test FAILS ("rose by 0, want 1"); (g) cross-check of Task 4: drop `AND retired_at IS NULL` from `DisplacedSnapshotMembers` → `TestServeHTTP_RetainedByHashNeverServesRetiredSnapshots` FAILS.
+One at a time, reverting each (verified against this plan's code): (a) make the alias check `if false && m[1] != "" && row.BlobHash != m[1]` → `TestServeHTTP_RetainedByHashSHA256MustMatchTheBlob` FAILS ("an alias bound to another blob: 200, want 404"); (b) pass `h.keepDisplaced` instead of `h.keepDisplaced+1` → `TestServeHTTP_RetainedByHashSearchesKeepDisplacedPlusOne` FAILS; (c) make the early return `if false && h.keepDisplaced <= 0` → `TestServeHTTP_RetainedByHashIsOffWhenKeepDisplacedIsZero` FAILS (served with limit 1); (d) narrow `byHashMemberRE` to `(?:^|/)by-hash/(?:SHA256/([0-9a-f]{64}))$` → `TestServeHTTP_RetainedByHashSHA512UsesTheVerifiedBinding` FAILS; (e) return `packageValidation{}` from `tryCacheHit`'s snapshot branch again (`_ = displaced`) → `TestServeHTTP_RetainedByHashServesTheDisplacedSnapshot` FAILS (no `snapshot_displaced`); (f) replace the `serveByHashDisplacedTotal.Inc(req.CanonicalHost)` line with `_ = serveByHashDisplacedTotal` → the same test FAILS ("rose by 0, want 1"); (g) cross-check of Task 4: drop `AND retired_at IS NULL` from `DisplacedSnapshotMembers` → `TestServeHTTP_RetainedByHashNeverServesRetiredSnapshots` FAILS; (h) in `tryDisplacedByHash`, replace `continue // a SHA256 alias must be the bytes its URL names` with `return false, 0, 0` (stop at the first mismatching row) → `TestServeHTTP_RetainedByHashSkipsAMismatchedNewerRow` FAILS ("got 404 from snapshot \"\", want 200 from …").
 
 - [ ] **Step 6: Commit**
 
@@ -4833,14 +5711,14 @@ git commit -m "Serve by-hash members of displaced snapshots to clients holding a
 
 ### Task 9: Wire the barrier and retained by-hash in `main`
 
-Spec C8, C11: `buildAdopter` builds the gate from `adoption.flip_quiet_period` and hands it to the adopter; the handler gets the same gate (`Adopter.FlipGate()`, nil with adoption disabled) and `gc.keep_displaced`; both startup lines report the knob. Design note 13. Deferred minors in `main.go`: B-64 (explain a slow adoption drain at shutdown; design note 16) and A-48 (the doubled `legacy trust audit:` prefix).
+Spec C8, C11: `buildAdopter` builds the gate from `adoption.flip_quiet_period` and hands it to the adopter; the handler gets the same gate (`Adopter.FlipGate()`, nil with adoption disabled) and `gc.keep_displaced`; both startup lines report the knob; the shutdown closes the gate at the signal (design note 18; Tasks 1 and 5 test what `Close` does and that nothing is recorded — the call itself in `serveListeners` has no test: no daemon-level test can reach a flip in the barrier cheaply). Design note 13. Deferred minors in `main.go`: B-64 (explain a slow drain at shutdown; design note 16) and A-48 (the doubled `legacy trust audit:` prefix).
 
 **Files:**
-- Modify: `cmd/apt-cacher-ultra/main.go` (import `flipgate`; `buildAdopter`; new `handlerConfig`, `adoptionDrainNotice`, `waitLogged`; the `handler.New` call; the startup line; the shutdown drain; A-48)
+- Modify: `cmd/apt-cacher-ultra/main.go` (import `flipgate`; `buildAdopter`; new `handlerConfig`, `adoptionDrainNotice`, `waitLogged`; the `handler.New` call; the startup line; `Gate.Close` at the signal; the shutdown drain; A-48)
 - Create: `cmd/apt-cacher-ultra/flip_wiring_test.go`
 
 **Interfaces:**
-- Consumes: Task 1 (`flipgate.New`, `Gate.Quiet`, `Gate.Enabled`), Task 3 (`config.AdoptionConfig.FlipQuietPeriod`), Task 5 (`freshness.AdoptionConfig.FlipGate`, nil-safe `(*Adopter).FlipGate()`), Tasks 6 and 8 (`handler.Config.FlipGate`, `handler.Config.KeepDisplaced`). Existing test helpers (package `main`): `withKeyringDirs`, `newAdoptionEnabledCfg`, `newAdoptionWiringDeps`, `silentBuildLogger` (`adoption_wiring_test.go`), `minimalCfg` (`main_test.go`), `syncLogBuffer` (`legacy_audit_wiring_test.go`); `metrics.Default.SnapshotNamesForTest` / `UnregisterAddedSinceForTest`.
+- Consumes: Task 1 (`flipgate.New`, `Gate.Quiet`, `Gate.Enabled`, `Gate.Close`), Task 3 (`config.AdoptionConfig.FlipQuietPeriod`), Task 5 (`freshness.AdoptionConfig.FlipGate`, nil-safe `(*Adopter).FlipGate()`), Tasks 6 and 8 (`handler.Config.FlipGate`, `handler.Config.KeepDisplaced`). Existing test helpers (package `main`): `withKeyringDirs`, `newAdoptionEnabledCfg`, `newAdoptionWiringDeps`, `silentBuildLogger` (`adoption_wiring_test.go`), `minimalCfg` (`main_test.go`), `syncLogBuffer` (`legacy_audit_wiring_test.go`); `metrics.Default.SnapshotNamesForTest` / `UnregisterAddedSinceForTest`.
 - Produces: unexported `handlerConfig(cfg, parser, c, fetchClient, hostLimiter, logger, freshChecker, adopter) handler.Config`, `adoptionDrainNotice`, `waitLogged(wait func(), notice time.Duration, logger *slog.Logger)`; the INFO event `shutdown_waiting_for_adoptions`; the startup fields `adoption_flip_quiet_period` and `flip_quiet_period`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -5061,8 +5939,21 @@ with
 	// rolls the transaction back). This Wait makes the shutdown
 	// deterministic before the cache is closed by the deferred
 	// c.Close(); past adoptionDrainNotice it is explained in the journal.
-	// An adoption still in the flip barrier (spec C8) aborts at once.
+	// No adoption is in the flip barrier any more: the gate was closed at
+	// the signal.
 	waitLogged(freshChecker.WaitForAdoptions, adoptionDrainNotice, logger)
+```
+
+Design note 18: directly after the `select` that waits for the shutdown signal (the one that logs `shutdown signal received`), before the `// SPEC §9.5 step 2: stop accepting` comment, insert:
+
+```go
+
+	// Spec C8 (phase C plan, design note 18): close the flip barrier
+	// before anything drains. An adoption waiting in it abandons its commit
+	// at once (and records nothing), held InRelease/Release requests are
+	// answered, and no commit starts late in the stop window. A commit
+	// already running is waited for below (waitLogged).
+	adopter.FlipGate().Close()
 ```
 
 After `buildAdopter` (before the `keyringProvider` comment) add:
@@ -5102,10 +5993,11 @@ func handlerConfig(
 const adoptionDrainNotice = 2 * time.Second
 
 // waitLogged runs wait and, once it has run for notice, logs
-// shutdown_waiting_for_adoptions at INFO (once), so a slow stop — a commit
-// that is already running is never cancelled and may take up to the
-// 5-minute commit timeout — is explained in the journal. It returns when
-// wait does.
+// shutdown_waiting_for_adoptions at INFO (once), so a slow stop is
+// explained in the journal: the drain waits for adoption, repair and
+// reconcile goroutines, and a commit already running is never cancelled
+// and may take up to the 5-minute commit timeout. It returns when wait
+// does.
 func waitLogged(wait func(), notice time.Duration, logger *slog.Logger) {
 	done := make(chan struct{})
 	go func() {
@@ -5125,7 +6017,7 @@ func waitLogged(wait func(), notice time.Duration, logger *slog.Logger) {
 	case <-timer.C:
 		logger.Info("shutdown_waiting_for_adoptions",
 			"waited", notice,
-			"detail", "an adoption commit is still running; it is never cancelled (spec C4) and takes at most the 5-minute commit timeout")
+			"detail", "an adoption, repair or reconcile is still finishing: a commit already running is never cancelled (spec C4) and takes at most the 5-minute commit timeout; other work stops at its next cancellation point")
 	}
 	<-done
 }
@@ -5152,17 +6044,17 @@ git commit -m "Wire the flip barrier and retained by-hash into the daemon"
 
 ### Task 10: End-to-end flip simulations
 
-Spec C8 tests, end to end: the real cache, adopter, barrier and handler in `testing/synctest` bubbles, driven by Task 2's apt client model (`simtest.Ledger`; plan "Definitions"). They prove the barrier's purpose (a busy suite straddles without it and never with it), the review's shared-queue trace through the real stack, the hold bound, and zero straddles under seeded chaos. The phase-2 chaos tests' logged straddle counts become assertions, with their AIDEV-NOTEs updated (see Conventions).
+Spec C8 tests, end to end: the real cache, adopter, barrier and handler in `testing/synctest` bubbles, driven by Task 2's apt client model (`simtest.Ledger`; plan "Definitions"). They prove the barrier's purpose (a busy suite straddles without it and never with it, inline and detached — design review M16: a detached client's `Release.gpg` must come from its `Release` snapshot), the review's shared-queue trace through the real stack, the hold bound, and zero straddles under seeded chaos. The phase-2 chaos tests' logged straddle counts become assertions, with their AIDEV-NOTEs updated (see Conventions); neither burst crosses the flip, so those assertions pin the burst structure and are not chaos coverage of the barrier (design review M17) — `TestSimFlip_SeededChaos` is.
 
 **Files:**
 - Create: `internal/handler/sim_flip_test.go`
 - Modify: `internal/handler/phase2_chaos_test.go`, `internal/handler/phase2_detached_chaos_test.go` (AIDEV-NOTE and the straddle-count lines only)
 
 **Interfaces:**
-- Consumes: Task 2 (`simtest.NewLedger`, `Ledger.RunUpdate`, `Straddles`, `Checked`, `AnchorGens`, `simtest.Request`, `simtest.ServeFunc`), Task 1 (`flipgate.PhaseAMax`, `HoldMax`, `Gate.Stats`), Task 6's harness (`flipStack`, `newFlipStack`, `adopt`, `get`, `flipSimHost`). Existing: `sumMetricLines` (`disabled_mode_parity_test.go`), `chaos2CountMetadataStraddles` (`phase2_chaos_test.go`).
-- Produces: the ledger adapters `(*flipStack).serve` and `flipReaders`, and `recordAnchorHeld` (test helpers, package `handler`).
+- Consumes: Task 2 (`simtest.NewLedger`, `Ledger.RunUpdate`, `Straddles`, `Checked`, `AnchorGens`, `simtest.Request`, `simtest.ServeFunc`), Task 1 (`flipgate.PhaseAMax`, `HoldMax`, `Gate.Stats`), Task 6's harness (`flipStack`, `newFlipStack`, `publish`, `adopt`, `get`, `flipSimHost`). Existing: `sumMetricLines` (`disabled_mode_parity_test.go`), `chaos2CountMetadataStraddles` (`phase2_chaos_test.go`).
+- Produces: the ledger adapters `(*flipStack).serve`, `(*flipStack).serveDetached` and `flipReaders`, `(*flipStack).adoptDetached`, `busySuiteSim` and `recordAnchorHeld` (test helpers, package `handler`).
 
-Every simulation creates its stack inside the bubble, sets the suites up (each first adoption takes a zero-length hold; a second suite's first adoption waits out the cross-suite quiet period after it), and only then takes `t0` and a `Stats` baseline. Flips start at least 1 s after the readers, off the readers' 250/500 ms grids.
+Every simulation creates its stack inside the bubble, sets the suites up (each first adoption takes a zero-length hold that holds nothing, so a second suite's first adoption does not wait for it — design note 17), and only then takes `t0` and a `Stats` baseline. Flips start at least 1 s after the readers, off the readers' 250/500 ms grids.
 
 - [ ] **Step 1: Write the simulations**
 
@@ -5172,9 +6064,12 @@ Every simulation creates its stack inside the bubble, sets the suites up (each f
 package handler
 
 import (
+	"context"
+	"fmt"
 	"math/rand/v2"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -5198,6 +6093,40 @@ func (s *flipStack) serve(anchorTransfer, indexTransfer time.Duration) simtest.S
 			s.t.Errorf("GET %s = %d", path, code)
 		}
 		return gen, max(time.Since(start)-transfer, 0)
+	}
+}
+
+// adoptDetached is adopt for the detached form: the snapshot's anchors are
+// Release and Release.gpg.
+func (s *flipStack) adoptDetached(suite string, gen int) {
+	ref, rel := s.publish(suite, gen)
+	sig := []byte(fmt.Sprintf("signature of %s generation %d", suite, gen))
+	if err := s.ad.RunDetached(context.Background(), ref, rel, sig, "", ""); err != nil {
+		s.t.Errorf("adopt %s generation %d (detached): %v", suite, gen, err)
+	}
+}
+
+// serveDetached is serve for a detached suite: an anchor is Release and
+// then Release.gpg, fetched as apt does on the client's one connection,
+// and the anchor has arrived once both have. A Release.gpg from another
+// snapshot than the Release before it is counted in sigMismatch.
+func (s *flipStack) serveDetached(anchorTransfer, indexTransfer time.Duration, sigMismatch *atomic.Int64) simtest.ServeFunc {
+	index := s.serve(anchorTransfer, indexTransfer)
+	return func(rq simtest.Request) (string, time.Duration) {
+		if !rq.Anchor {
+			return index(rq)
+		}
+		start := time.Now()
+		gen, code := s.get(rq.Suite+"/Release", anchorTransfer)
+		held := max(time.Since(start)-anchorTransfer, 0)
+		sigGen, sigCode := s.get(rq.Suite+"/Release.gpg", indexTransfer)
+		if code != http.StatusOK || sigCode != http.StatusOK {
+			s.t.Errorf("GET %s/Release = %d, Release.gpg = %d", rq.Suite, code, sigCode)
+		}
+		if sigGen != gen {
+			sigMismatch.Add(1)
+		}
+		return gen, held
 	}
 }
 
@@ -5239,20 +6168,41 @@ func recordAnchorHeld(serve simtest.ServeFunc, held *[]time.Duration) simtest.Se
 // anchor requests until the in-flight ones are done and the suite has
 // been quiet for 10 s, and no client straddles.
 func TestSimFlip_BusySuiteStraddlesOnlyWithoutTheBarrier(t *testing.T) {
+	busySuiteSim(t, false)
+}
+
+// The same for a detached suite (design review M16): each client fetches
+// Release, then Release.gpg — never held — then the index. Release.gpg
+// must come from its client's Release snapshot: apt asks for it right after
+// Release, within the quiet period.
+func TestSimFlip_DetachedBusySuiteStraddlesOnlyWithoutTheBarrier(t *testing.T) {
+	busySuiteSim(t, true)
+}
+
+// busySuiteSim runs the busy-suite simulation at 0s and 10s, for the
+// inline or the detached form.
+func busySuiteSim(t *testing.T, detached bool) {
 	for _, quiet := range []time.Duration{0, 10 * time.Second} {
 		synctest.Test(t, func(t *testing.T) {
 			s := newFlipStack(t, quiet)
 			const suite = "/u/dists/busy"
-			s.adopt(suite, 1)
+			adopt := s.adopt
+			var sigMismatch atomic.Int64
+			serve := s.serve(time.Second, 100*time.Millisecond)
+			if detached {
+				adopt = s.adoptDetached
+				serve = s.serveDetached(time.Second, 100*time.Millisecond, &sigMismatch)
+			}
+			adopt(suite, 1)
 			before := s.gate.Stats()
 			l := simtest.NewLedger(10 * time.Second)
 			var wg sync.WaitGroup
 			t0 := time.Now()
-			flipReaders(l, s.serve(time.Second, 100*time.Millisecond), []simtest.Request{{Suite: suite, Anchor: true}},
+			flipReaders(l, serve, []simtest.Request{{Suite: suite, Anchor: true}},
 				11*time.Millisecond, 500*time.Millisecond, t0.Add(120*time.Second), &wg)
 			flipAt := 30*time.Second + 7*time.Millisecond
 			time.Sleep(flipAt)
-			s.adopt(suite, 2)
+			adopt(suite, 2)
 			committed := time.Since(t0)
 			wg.Wait()
 
@@ -5264,10 +6214,16 @@ func TestSimFlip_BusySuiteStraddlesOnlyWithoutTheBarrier(t *testing.T) {
 				if len(straddles) != 2 {
 					t.Fatalf("without the barrier: %d straddles, want the 2 clients whose anchors were in flight: %+v", len(straddles), straddles)
 				}
+				if n := sigMismatch.Load(); detached && n != 2 {
+					t.Fatalf("without the barrier: %d Release.gpg responses from another snapshot than their Release, want those 2 clients'", n)
+				}
 				return
 			}
 			if len(straddles) != 0 {
 				t.Fatalf("with the barrier: %d straddles, first %+v", len(straddles), straddles[0])
+			}
+			if n := sigMismatch.Load(); n != 0 {
+				t.Fatalf("with the barrier: %d Release.gpg responses from another snapshot than their Release", n)
 			}
 			holdStart := flipAt + flipgate.PhaseAMax // the suite is never naturally quiet
 			if committed < holdStart+quiet || committed > holdStart+flipgate.HoldMax {
@@ -5297,7 +6253,7 @@ func TestSimFlip_SharedQueueTraceEndToEnd(t *testing.T) {
 		s := newFlipStack(t, 10*time.Second)
 		const a, b = "/mirror/dists/a", "/mirror/dists/b"
 		s.adopt(a, 1)
-		s.adopt(b, 1) // waits out the cross-suite quiet period after a's setup hold
+		s.adopt(b, 1) // at once: a's setup hold held nothing (design note 17)
 		before := s.gate.Stats()
 		fast := s.serve(50*time.Millisecond, 10*time.Millisecond)
 		l := simtest.NewLedger(10 * time.Second)
@@ -5498,7 +6454,7 @@ func TestSimFlip_SeededChaos(t *testing.T) {
 - [ ] **Step 2: Run the simulations**
 
 Run: `go test -race -count=1 -v ./internal/handler/ -run 'TestSimFlip_'`
-Expected: four PASS lines, each under 5 s of wall time. (They pass at once: Tasks 1–9 built what they exercise.)
+Expected: five PASS lines, each under 5 s of wall time (the detached busy-suite simulation is the slowest, about 3.3 s). (They pass at once: Tasks 1–9 built what they exercise.)
 
 - [ ] **Step 3: The phase-2 chaos tests assert their straddle counts**
 
@@ -5513,10 +6469,12 @@ In `internal/handler/phase2_chaos_test.go`, replace the AIDEV-NOTE paragraph on 
 // adoption.flip_quiet_period, so a client that asks for its indexes
 // within that period of its anchor gets the same snapshot. The flip
 // simulations (internal/handler/sim_flip_test.go, internal/flipgate's
-// sim_test.go) prove it with the apt client model. This test runs without
-// a barrier, and neither burst crosses the flip (the pre-flip burst runs
-// while adoption is blocked, the post-flip one after the commit), so it
-// asserts zero straddles in both, and per-response coherence throughout.
+// sim_test.go) prove it with the apt client model; TestSimFlip_SeededChaos
+// is the barrier's chaos test. This test runs without a barrier, and
+// neither burst crosses the flip (the pre-flip burst runs while adoption
+// is blocked, the post-flip one after the commit), so its zero-straddle
+// assertions pin the burst structure rather than exercise the barrier,
+// next to the per-response coherence it asserts throughout.
 ```
 
 and replace
@@ -5559,8 +6517,9 @@ with
 ```go
 // AIDEV-NOTE: SPEC2 §12.3's per-client coherence comes from the spec C8
 // flip barrier (see TestPhase2Chaos_AdoptionFlipUnderConcurrency); as
-// there, neither burst crosses the flip, so this test asserts zero
-// straddles and strictly asserts per-request coherence.
+// there, neither burst crosses the flip, so its zero-straddle assertions
+// pin the burst structure (they do not exercise the barrier), and it
+// strictly asserts per-request coherence.
 ```
 
 and replace
@@ -5587,7 +6546,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each (verified against this plan's code): (a) in `internal/handler/handler.go` `anchorStart`, make the first condition `if true || !h.flipGate.Enabled() || …` (nothing registers) → `TestSimFlip_BusySuiteStraddlesOnlyWithoutTheBarrier` FAILS ("with the barrier: 2 straddles"); (b) in `internal/flipgate/gate.go` `acquire`, change `if g.holder == nil && len(g.queue) == 0 {` to `if true {` (concurrent holds) → `TestSimFlip_SharedQueueTraceEndToEnd` FAILS ("the trace client's anchors were held [0s 19.754s]"); (c) make `otherHoldsQuietLocked` return `true, time.Time{}` first → the same test FAILS ("b committed 9.45s after a"); (d) in `runHold`, make the bound `expiry := h.start.Add(2 * g.holdMax)` → `TestSimFlip_SlowReaderEndsTheHoldAtHoldMax` FAILS ("committed at 1m41.003s, want … 1m21.003s"; do not disable the expiry check instead — the phase-B loop then spins without advancing virtual time and the run hangs until the test timeout); (e) make `localQuietLocked` return `true, time.Time{}` first → `TestSimFlip_SeededChaos` FAILS (14 straddles).
+One at a time, reverting each (verified against this plan's code): (a) in `internal/handler/handler.go` `anchorStart`, make the first condition `if true || !h.flipGate.Enabled() || …` (nothing registers) → `TestSimFlip_BusySuiteStraddlesOnlyWithoutTheBarrier` FAILS ("with the barrier: 2 straddles"); (b) in `internal/flipgate/gate.go` `acquire`, change `if g.holder == nil && len(g.queue) == 0 {` to `if true {` (concurrent holds) → `TestSimFlip_SharedQueueTraceEndToEnd` FAILS ("the trace client's anchors were held [0s 19.754s]"); (c) make `otherHoldsQuietLocked` return `true, time.Time{}` first → the same test FAILS ("b committed 9.45s after a"); (d) in `runHold`, make the bound `expiry := h.start.Add(2 * g.holdMax)` → `TestSimFlip_SlowReaderEndsTheHoldAtHoldMax` FAILS ("committed at 1m41.003s, want … 1m21.003s"; do not disable the expiry check instead — the phase-B loop then spins without advancing virtual time and the run hangs until the test timeout); (e) make `localQuietLocked` return `true, time.Time{}` first → `TestSimFlip_SeededChaos` FAILS (14 straddles); (f) in `internal/handler/handler.go` `anchorStart`, drop `&& req.Path != req.SuitePath+releaseSuffix` (Task 6's mutant (a)) → `TestSimFlip_DetachedBusySuiteStraddlesOnlyWithoutTheBarrier` FAILS ("with the barrier: 2 straddles": a detached suite's `Release` serves no longer register).
 
 - [ ] **Step 6: Commit**
 
@@ -5601,13 +6560,13 @@ git commit -m "Prove the flip barrier end to end in virtual-clock simulations"
 
 ### Task 11: Documentation, spec rulings, deferred minors, final verification
 
-Spec §8 (docs for C8 and C11), the rulings' spec and doc updates (R-C1 to R-C3), plan deviations 2 and 3 written into the spec, the overview's phase C bookkeeping and carry-forwards, deferred minors A-7 and A-16 (spec wording), A-57 (verified already correct), and deletion of every deferred-minor entry this plan resolved. Then the full verification.
+Spec §8 (docs for C8 and C11), the rulings' spec and doc updates (R-C1 to R-C3), plan deviations 2, 3, 5 and 6 written into the spec, the review revision's documentation items (design review M1, M2, M3, M5, M12, M14, M18 and the B-64 notice), the E and G carry-forwards, the overview's phase C bookkeeping and carry-forwards, deferred minors A-7 and A-16 (spec wording), A-57 (verified already correct), and deletion of every deferred-minor entry this plan resolved. Then the full verification.
 
 **Files:**
 - Modify: `README.md`, `docs/configuration.md`, `docs/log-fields.md`, `docs/superpowers/specs/2026-09-27-flat-repositories-design.md`, `internal/freshness/scheduler.go` (the `Run` doc only), `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md`, `docs/superpowers/plans/2026-09-28-flat-repositories-A-deferred.md`, `docs/superpowers/plans/2026-09-28-flat-repositories-B-deferred.md`
 
 **Interfaces:**
-- Consumes: the behaviour of Tasks 1–10 as built (event fields from Task 5's `flip`, counters from Tasks 1 and 8, the request field from Task 8, `shutdown_waiting_for_adoptions` from Task 9).
+- Consumes: the behaviour of Tasks 1–10 as built (event fields from Task 5's `flip`, counters from Tasks 1 and 8, the request field from Task 8, `shutdown_waiting_for_adoptions` and `Gate.Close` at the signal from Task 9).
 - Produces: documentation only.
 
 Every replacement below names text that occurs exactly once in its file; if one does not match, stop and report it instead of guessing.
@@ -5626,9 +6585,10 @@ with
 ```markdown
 - Atomic snapshot adoption — per-suite InRelease + all referenced Packages/by-hash blobs are staged, GPG-verified, and
   flipped in a single SQLite transaction. The flip waits (bounded) until clients that received the old InRelease have
-  had `adoption.flip_quiet_period` to fetch its indexes, so an apt client's InRelease and indexes match; the residuals
-  (a suite that never goes quiet within the bounds, reads slower than apt's own timeout) are counted and documented in
-  [Flip consistency](docs/configuration.md#flip-consistency).
+  had `adoption.flip_quiet_period` to fetch its indexes, so the index requests an apt client sends within that period
+  of its InRelease match it (by-hash requests are served from the displaced snapshot even later); the residuals (a
+  suite that never goes quiet within the bounds, responses slower than apt's own timeout, more than 256 held requests)
+  each have a counter and are documented in [Flip consistency](docs/configuration.md#flip-consistency).
 ```
 
 - [ ] **Step 2: `docs/configuration.md`**
@@ -5643,7 +6603,7 @@ with
 
 ```markdown
 | `max_duration` | duration | `"30m"` | Longest an adoption, repair or reconcile may run. An abandoned adoption is retried on the normal schedule; a repair or reconcile runs again on the next unchanged check. The deadline never cuts the final commit short: the commit runs under its own 5-minute bound. Nor does it cut the flip barrier short (at most 140 s, see *Flip consistency*), which only a shutdown ends early. On shutdown an adoption that has not reached its commit is abandoned at once, but a commit already running is waited for, up to those 5 minutes; the packaged systemd unit's `TimeoutStopSec=35` may kill the process first, in which case SQLite rolls the commit back and nothing is lost. At least `"1m"`. |
-| `flip_quiet_period` | duration | `"10s"` | How long a suite's `InRelease`/`Release` serves must have been quiet before a new snapshot replaces the current one, so a client that just received the old one fetches matching indexes (see *Flip consistency*). `"0s"` disables the barrier: adoptions commit at once, as before. At most `"15s"`. |
+| `flip_quiet_period` | duration | `"10s"` | How long a suite's `InRelease`/`Release` serves must have been quiet before a new snapshot replaces the current one, so a client that just received the old one fetches matching indexes (see *Flip consistency*). `"0s"` disables the barrier: adoptions commit at once, as before. Otherwise between `"1s"` and `"15s"`: a shorter period protects almost no one, and a longer one leaves less of a hold's 20 s for the responses already being sent when it starts, so more holds reach their bound (`acu_flip_hold_expired_total`). |
 ```
 
 (b) In *Capacity and fairness*, replace
@@ -5655,7 +6615,7 @@ with
 with
 
 ```markdown
-`POST /reconcile` answers 409 when no slot is free. The gauge `acu_freshness_waiting_for_slot` counts suites waiting for a slot. An adoption gives its host's slot back when its downloads are done, but keeps its global slot through the flip barrier and the commit, so a slot is held for at most `max_duration` + 140 s (the barrier, see *Flip consistency*) + the 5-minute commit bound: N suites waiting for k slots they may use are all admitted within one tick + ⌈N/k⌉ × (that sum + 2 minutes).
+`POST /reconcile` answers 409 when no slot is free. The gauge `acu_freshness_waiting_for_slot` counts suites waiting for a slot. An adoption gives its host's slot back when its downloads are done, but keeps its global slot through the flip barrier and the commit, so a slot is held for at most `max_duration` + 140 s (the barrier, see *Flip consistency*; `acu_adoption_duration_seconds` includes that time) + the 5-minute commit bound: N suites waiting for k slots they may use are all admitted within one tick + ⌈N/k⌉ × (that sum + 2 minutes).
 ```
 
 (c) Directly before the line `### Trust and signer pins`, insert:
@@ -5665,13 +6625,13 @@ with
 
 apt fetches a suite's `InRelease` (or `Release`) first and its indexes after, one request at a time on one connection. If a new snapshot replaced the current one in between, the client would get indexes that do not match its `InRelease`, and `apt update` would fail with hash-sum mismatches. Before switching a suite to a new snapshot, an adoption therefore waits:
 
-1. up to 60 s for the suite to go quiet by itself: none of its `InRelease`/`Release` responses being sent, none finished within `flip_quiet_period`, and no other suite's switch holding requests or having done so within that period;
+1. up to 60 s for the suite to go quiet by itself: none of its `InRelease`/`Release` responses being sent, none finished within `flip_quiet_period`, no other suite's switch holding requests, and none that held requests ended within that period;
 2. up to 60 s for its turn to hold (one suite holds at a time);
-3. then it holds: new `InRelease`/`Release` requests of the suite wait (`Release.gpg` never does) until the responses already being sent are done and the suite has been quiet for `flip_quiet_period`, and no other suite's hold ended within that period. Then the new snapshot is committed and the waiting requests are answered from it. A hold lasts at most 20 s, below apt's 30 s timeout.
+3. then it holds: new `InRelease`/`Release` requests of the suite wait (`Release.gpg` never does) until the responses already being sent are done and the suite has been quiet for `flip_quiet_period`, and no other suite's hold that held requests ended within that period. Then the new snapshot is committed and the waiting requests are answered from it. A hold lasts at most 20 s, below apt's 30 s timeout.
 
-A client that received the old `InRelease` therefore either finished receiving it at least `flip_quiet_period` before the switch, or waited and got the new one, so the index requests it sends within that period match its `InRelease` — also when many suites share its connection (mirror mode, or more than ten hosts). A switch takes at most 60 s + 60 s + 20 s plus its commit; `adoption.max_duration` does not cut it short, but a shutdown abandons it at once (nothing is committed, and the change is adopted after the restart). The first adoption of a suite whose `InRelease` is exactly the one clients were already being served skips the wait. Each switch logs `adoption_flip_barrier`.
+A client that received the old `InRelease` therefore either finished receiving it at least `flip_quiet_period` before the switch, or waited and got the new one, so the index requests it sends within that period of its `InRelease` match it — also when many suites share its connection (mirror mode, or more than ten hosts). The period runs from when the cache finished sending, so on a slow link it is slightly shorter for the client. A client that fetches many indexes over a slow link may send some later than that; with apt's default `Acquire-By-Hash` those are still served from the snapshot they name (below). A switch takes at most 60 s + 60 s + 20 s plus its commit; `adoption.max_duration` does not cut it short. A shutdown abandons it at once: at the signal the daemon answers the waiting requests and abandons every switch that has not started its commit (nothing is committed or recorded, and the change is adopted after the restart). The first adoption of a suite whose `InRelease` is exactly the one clients were already being served skips the wait. Each switch logs `adoption_flip_barrier`.
 
-Residuals, counted: a hold that reaches 20 s (a very slow commit, or a client still reading the old `InRelease`) answers its waiters from the snapshot current then and commits at once (`acu_flip_hold_expired_total`); a switch that waits 60 s for its turn commits without holding (`acu_flip_hold_skipped_total`; it takes three or four long holds ahead of it, so at least four suites switching at once, which needs `freshness.max_concurrent_adoptions` of 4 or more, or `0`); beyond 256 requests waiting in one hold, and for `InRelease` reads slower than apt's own 30 s timeout, nobody waits. A client still holding an older `InRelease` that asks for indexes by hash (apt's default `Acquire-By-Hash`) is still served: a by-hash file the current snapshot lacks is served from the newest `gc.keep_displaced` + 1 displaced snapshots of its suite (`acu_serve_byhash_displaced_total`; the request line carries `snapshot_displaced`). Snapshot `InRelease`, `Release` and `Release.gpg` responses carry a `Last-Modified` that grows with every switch, even across clock steps, so `If-Modified-Since` never hides a new snapshot.
+Residuals, each with a counter: a hold that reaches 20 s (a very slow commit, or a client still receiving the old `InRelease`) answers its waiters from the snapshot current then and commits at once (`acu_flip_hold_expired_total`); a switch that waits 60 s for its turn commits without holding (`acu_flip_hold_skipped_total`; it takes three or four long holds ahead of it, so at least four suites switching at once, which needs `freshness.max_concurrent_adoptions` of 4 or more, or `0`); beyond 256 requests waiting in one hold, the next are answered at once (`acu_flip_waiters_over_cap_total`); and `InRelease`/`Release` responses that take longer than 30 s to send (very slow links) are not waited for (`acu_flip_slow_anchor_reads_total`). apt clients configured with an `Acquire::http::Timeout` below 20 s can time out while held; set `flip_quiet_period = "0s"` if you run such clients. A client still holding an older `InRelease` that asks for indexes by hash (apt's default `Acquire-By-Hash`) is still served: a by-hash file the current snapshot lacks is served from the newest `gc.keep_displaced` + 1 displaced snapshots of its suite (`acu_serve_byhash_displaced_total`; the request line carries `snapshot_displaced`). Snapshot `InRelease`, `Release` and `Release.gpg` responses carry a `Last-Modified` that grows with every switch — also for two switches in the same second and across a backward clock step between switches — so `If-Modified-Since` does not hide a new snapshot; a clock that steps back while an adoption is running can leave the next switch's `Last-Modified` below the one served before it, for up to the length of the step.
 
 ```
 
@@ -5720,12 +6680,19 @@ with
 
 ```markdown
 gauge `acu_freshness_waiting_for_slot` (suites waiting for an adoption
-slot). The flip barrier (spec C8) adds the unlabelled counters
-`acu_flip_hold_skipped_total` (a flip that waited 60 s for the hold token
-and committed without a hold) and `acu_flip_hold_expired_total` (a hold
-that reached its 20 s bound before its commit finished), and retained
-by-hash adds `acu_serve_byhash_displaced_total{host}` (by-hash requests
-served from a displaced snapshot).
+slot). The flip barrier (spec C8) adds one unlabelled counter per
+residual — `acu_flip_hold_skipped_total` (a flip that waited 60 s for the
+hold token and committed without a hold), `acu_flip_hold_expired_total`
+(a hold that reached its 20 s bound before its commit finished),
+`acu_flip_waiters_over_cap_total` (an anchor request answered at once
+because 256 already waited in a hold) and
+`acu_flip_slow_anchor_reads_total` (an `InRelease`/`Release` response
+that took 30 s or longer to send) — and `acu_flip_gate_panics_total` (a
+panic recovered in the barrier's hold-expiry timer: a bug, please report
+it). Retained by-hash adds `acu_serve_byhash_displaced_total{host}`
+(by-hash requests served from a displaced snapshot).
+`acu_adoption_duration_seconds` includes the barrier's wait (at most
+140 s).
 ```
 
 (c) Replace
@@ -5746,9 +6713,9 @@ the daemon's `main`).
 (d) After the table's last row (the one starting `| \`legacy_trust_audit_completed\` |`), append:
 
 ```markdown
-| `adoption_flip_barrier` | INFO | `canonical_host`, `suite_path`, `snapshot_id`, `outcome` (`held`, `hold_expired`, `hold_skipped`, `not_needed`), `phase_a_seconds`, `token_wait_seconds`, `hold_seconds`, `held_requests` (the last four absent for `not_needed`) | An adoption committed behind the spec C8 flip barrier: `held` within its hold; `hold_expired` when the hold reached 20 s first (`acu_flip_hold_expired_total`); `hold_skipped` after 60 s without the hold token (`acu_flip_hold_skipped_total`); `not_needed` for a first adoption whose anchor clients were already being served. Not logged when `adoption.flip_quiet_period = 0s`, nor for a flip abandoned at shutdown (`adoption_run_failed` says so). |
+| `adoption_flip_barrier` | INFO | `canonical_host`, `suite_path`, `snapshot_id`, `outcome` (`held`, `hold_expired`, `hold_skipped`, `not_needed`, `commit_failed`), `phase_a_seconds`, `token_wait_seconds`, `hold_seconds`, `held_requests` (the last four absent when the barrier was skipped for a first adoption) | An adoption committed behind the spec C8 flip barrier: `held` within its hold; `hold_expired` when the hold reached 20 s first (`acu_flip_hold_expired_total`); `hold_skipped` after 60 s without the hold token (`acu_flip_hold_skipped_total`); `not_needed` for a first adoption whose anchor clients were already being served; `commit_failed` when the commit ran and failed — the snapshot did not switch, the timing fields still describe the barrier, and `adoption_run_failed` gives the error. Not logged when `adoption.flip_quiet_period = 0s`, nor for a flip abandoned at shutdown (`adoption_run_failed` says so). |
 | `displaced snapshot lookup failed` | WARN | `err`, `canonical_host`, `path` | Retained by-hash could not read the suite's displaced snapshots; the request is answered 404, as before spec C8. |
-| `shutdown_waiting_for_adoptions` | INFO | `waited`, `detail` | Shutdown has waited 2 s for in-flight adoptions: an adoption commit already running is never cancelled and may take up to its 5-minute bound (adoptions still in the flip barrier are abandoned at once). Logged once per shutdown. |
+| `shutdown_waiting_for_adoptions` | INFO | `waited`, `detail` | Shutdown has waited 2 s for the adoption, repair and reconcile goroutines: a commit already running is never cancelled and may take up to its 5-minute bound; other work stops at its next cancellation point (adoptions in the flip barrier were abandoned at the signal). Logged once per shutdown. |
 ```
 
 - [ ] **Step 4: The spec**
@@ -5758,7 +6725,7 @@ In `docs/superpowers/specs/2026-09-27-flat-repositories-design.md`:
 (a) Header: replace `- **Date:** 2026-09-27 (revision 5, 2026-10-17:` with
 
 ```markdown
-- **Date:** 2026-09-27 (revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown, so the admission bound's *A* includes it; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; revision 5, 2026-10-17:
+- **Date:** 2026-09-27 (revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; revision 5, 2026-10-17:
 ```
 
 (b) A-7, C2: replace
@@ -5827,7 +6794,7 @@ barrier (≤ 140 s) plus the commit bound — is the longest a slot is held.
 With the default pool of two and a
 ```
 
-(f) Deviation 2, C8 residuals: replace
+(f) Deviation 2 and design note 20 (with design review M18's wording), C8 residuals: replace
 
 ```markdown
 Residuals (documented, counted): phase-B expiry when the commit or an
@@ -5841,14 +6808,18 @@ adoptions can queue for up to about 140 s (bounded).
 with
 
 ```markdown
-Residuals (documented, counted): phase-B expiry when the commit or an
-in-flight reader exceeds 20 s (F-2 on very large suites), hold-token timeout
-(a flip queued behind 60 s of holds: three holds ahead of it, each at its
-20 s bound, or in practice four — the five busy suites of §9 give four
-holds and one skip — so it takes at least four suites flipping at once,
+Residuals (documented, each with its own unlabelled counter): phase-B expiry
+when the commit or an in-flight reader exceeds 20 s (F-2 on very large
+suites; `acu_flip_hold_expired_total`), hold-token timeout (a flip times out
+only behind 60 s of holds: at least three holds at their 20 s bound, in
+practice four or more, since a queued flip's suite is usually busy and its
+hold then lasts at least the quiet period — the five busy suites of §9 give
+four holds and one skip — so it takes at least four suites flipping at once,
 which needs `max_concurrent_adoptions` of 4 or more, or 0 for unlimited,
-because a flip keeps its global slot through the barrier), waiters beyond
-the cap, and anchor reads slower than apt's own timeout. A flip waiting for the token
+because a flip keeps its global slot through the barrier;
+`acu_flip_hold_skipped_total`), waiters beyond the cap
+(`acu_flip_waiters_over_cap_total`), and anchor reads slower than apt's own
+timeout (`acu_flip_slow_anchor_reads_total`). A flip waiting for the token
 keeps its global adoption slot, so while two or more suites flip other
 adoptions can queue for up to about 140 s (bounded).
 ```
@@ -5881,6 +6852,44 @@ with
 ```
 
 (i) §9 phase E row: replace `SHA512 merge, shared verify helper, aliases, retained by-hash SHA512;` with `SHA512 merge, shared verify helper, aliases (served from displaced snapshots by phase C's retained by-hash);`.
+
+(j) Deviation 5, C8 phase A: replace
+
+```markdown
+  at most `15s`), and (b) **no hold is in progress anywhere** and none ended
+  within the same period (a hold delays other suites on the client's shared
+  queue). Bounded by 60 s; on timeout proceed to phase B.
+```
+
+with
+
+```markdown
+  `1s` to `15s`), and (b) **no hold is in progress anywhere** and none
+  that held at least one request ended within the same period (such a hold
+  delayed other suites on the client's shared queue; one that held nothing
+  delayed no one). Bounded by 60 s; on timeout proceed to phase B.
+```
+
+(k) Deviation 5, C8 phase B: replace
+
+```markdown
+  *other* suite's hold ended within `flip_quiet_period` (clients released
+  from that hold may still have this suite's index requests queued behind
+  it). Then run `commit`, clear pending, wake waiters onto the new snapshot
+  and release the token. The whole of phase B, including both waits, is
+```
+
+with
+
+```markdown
+  *other* suite's hold that held at least one request ended within
+  `flip_quiet_period` (clients released from that hold may still have this
+  suite's index requests queued behind it). Then run `commit`, clear
+  pending, wake waiters onto the new snapshot and release the token. The
+  whole of phase B, including both waits, is
+```
+
+(l) Deviation 6, C11: replace `` | `adoption.flip_quiet_period` | `"10s"` | `0s` disables the barrier; ≤ `15s` | `` with `` | `adoption.flip_quiet_period` | `"10s"` | `0s` disables the barrier; otherwise `1s` to `15s` | ``.
 
 - [ ] **Step 5: The scheduler's `Run` doc (R-C3)**
 
@@ -5921,10 +6930,10 @@ with
 (c) Replace the whole `- C: \`flipgate.Gate\` with …` bullet under *Cross-phase interfaces* (it ends `Retained by-hash serves only non-retired snapshots.`) with:
 
 ```markdown
-- C: package `flipgate` — `Gate` (`New(Config{Quiet})`, `Enabled`, `Quiet`, `Stats`, `Len`, `Purge(key)`, `AnchorStart(ctx, key) *Token`, `Flip(ctx, key, commit) (Result, error)`), `Key(scheme, host, suitePath)` (the freshness suite key), `Token.Done`, outcomes `held`/`hold_expired`/`hold_skipped`/`aborted`/`disabled`, `ErrAborted`, the spec C11 constants (`PhaseAMax`, `TokenWaitMax`, `HoldMax`, `AnchorTimeout`, `MaxWaiters`, `MaxQuiet`) and the counters `acu_flip_hold_skipped_total`/`acu_flip_hold_expired_total`. `freshness.AdoptionConfig.FlipGate` and the nil-safe `(*Adopter).FlipGate()` (the handler shares the adopter's gate: `handler.Config.FlipGate`); `handler.Config.KeepDisplaced`; `cache.DisplacedSnapshotMembers`; `config.AdoptionConfig.FlipQuietPeriod`; the event `adoption_flip_barrier`; the request field `snapshot_displaced`; `acu_serve_byhash_displaced_total{host}`. Rulings: an adoption keeps its global slot through the barrier and frees its host slot before it (R-C1); the barrier's waits ignore `adoption.max_duration` and end on shutdown, committing nothing (R-C2); the admission bound's *A* includes the barrier's ≤ 140 s (R-C3). Five busy suites flipping at once: four hold, the fifth commits unheld (phase C plan, deviation 2).
+- C: package `flipgate` — `Gate` (`New(Config{Quiet})`, `Enabled`, `Quiet`, `Stats`, `Len`, `Purge(key)`, `Close()` (shutdown; `main` calls it at the signal), `AnchorStart(ctx, key) *Token`, `Flip(ctx, key, commit) (Result, error)`), `Key(scheme, host, suitePath)` (the freshness suite key), `Token.Done`, outcomes `held`/`hold_expired`/`hold_skipped`/`aborted`/`disabled`, `ErrAborted`, `ErrClosed`, the spec C11 constants (`PhaseAMax`, `TokenWaitMax`, `HoldMax`, `AnchorTimeout`, `MaxWaiters`, `MinQuiet`, `MaxQuiet`) and the counters `acu_flip_hold_skipped_total`, `acu_flip_hold_expired_total`, `acu_flip_waiters_over_cap_total`, `acu_flip_slow_anchor_reads_total`, `acu_flip_gate_panics_total`. `freshness.AdoptionConfig.FlipGate` and the nil-safe `(*Adopter).FlipGate()` (the handler shares the adopter's gate: `handler.Config.FlipGate`); `handler.Config.KeepDisplaced`; `cache.DisplacedSnapshotMembers`; `config.AdoptionConfig.FlipQuietPeriod`; the event `adoption_flip_barrier` (outcome `commit_failed` when the commit fails); the request field `snapshot_displaced`; `acu_serve_byhash_displaced_total{host}`. Rulings: an adoption keeps its global slot through the barrier and frees its host slot before it (R-C1); the barrier's waits ignore `adoption.max_duration` and end on shutdown, committing nothing (R-C2); the admission bound's *A* includes the barrier's ≤ 140 s (R-C3). Five busy suites flipping at once: four hold, the fifth commits unheld (phase C plan, deviation 2).
 ```
 
-(d) Under *Carry-forwards*, delete the `**C:**` heading and its four bullets (from the line `**C:**` through the bullet starting `- *(B)* Add a Checker-level test that \`membersDone\` frees only the host slot.`): phase C resolved all four (Tasks 5 and 11; rulings R-C1 to R-C4).
+(d) Under *Carry-forwards*, delete the `**C:**` heading, its four bullets and the empty line after them (from the line `**C:**` through the bullet starting `- *(B)* Add a Checker-level test that \`membersDone\` frees only the host slot.` and the blank line that follows it): phase C resolved all four (Tasks 5 and 11; rulings R-C1 to R-C4).
 
 (e) Append to the `**D:**` list:
 
@@ -5936,6 +6945,7 @@ with
 
 ```markdown
 - *(C)* `servedAnchorUnchanged` (`internal/freshness/adoption.go`, `AIDEV-TODO(phase E)`) must compare `<suite>/Release` for the unsigned form. Retained by-hash already serves SHA512 aliases from displaced snapshots (phase C plan, deviation 3): E's SHA512 adoption only writes the alias rows, and its SHA512 by-hash test should include a displaced snapshot.
+- *(C)* An in-commit refusal after a barrier that outlived `adoption.max_duration` must still be recorded as the refusal. `spawnAdoption` reclassifies an attempt as `timed_out` only when the deadline fired before the member pipeline finished (phase C plan, design note 19), so E's never-downgrade refusal must surface from `CommitAdoption` as its refusal sentinel through `classifyAdoptionOutcome`; E's refusal test should include a barrier that outlives the deadline.
 ```
 
 (g) Append to the `**F:**` list:
@@ -5944,7 +6954,13 @@ with
 - *(C)* Spec C8: flip-gate entries are purged on reap. After deleting a suite row the reaper calls `Adopter.FlipGate().Purge(flipgate.Key(scheme, host, suitePath))` (nil-safe; a no-op while a flip of the suite runs; idle entries also expire on their own after twice the quiet period).
 ```
 
-(h) Replace `unless marked *(B)* (the phase B reviews and its final review, 2026-10-18).` with `unless marked *(B)* (the phase B reviews and its final review, 2026-10-18) or *(C)* (the phase C plan, 2026-10-18).`
+(h) Append to the `**G:**` list:
+
+```markdown
+- *(C)* If G serves url_path metadata with `Last-Modified = max(pool mtime, last_fetched_at)` (spec C4, anchorless refresh), `adoptionStampTx`'s first-adoption floor (`MAX(last_fetched_at) + 1`, `internal/cache/adoption.go`) stays above it only while the pool file's mtime is not later than `last_fetched_at` — true today because `runFetch` finalizes the pool file before it stamps the row (`internal/handler/handler.go`). Keep that order, or fold the anchor blobs' mtimes into the floor.
+```
+
+(i) Replace `unless marked *(B)* (the phase B reviews and its final review, 2026-10-18).` with `unless marked *(B)* (the phase B reviews and its final review, 2026-10-18) or *(C)* (the phase C plan, 2026-10-18).`
 
 - [ ] **Step 7: Deferred-minor files**
 
@@ -5965,7 +6981,7 @@ Expected: no output.
 Run: `go vet ./... && golangci-lint run ./... && gofmt -l . && go test -race -count=1 ./...`
 Expected: vet and lint print nothing (lint: `0 issues.`); `gofmt -l .` prints exactly the five known drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`); every package `ok`. (No phase C test needs apt tooling or Docker.)
 
-Run: `grep -rn 'AIDEV-TODO(phase C)' --include=*.go . ; grep -rn 'flip_quiet_period' docs/configuration.md config.toml.default | head`
+Run: `grep -rn 'AIDEV-TODO(phase C)' --include=*.go . ; grep -rn 'flip_quiet_period' docs/configuration.md packaging/config/config.toml.default | head`
 Expected: no `AIDEV-TODO(phase C)` left; `flip_quiet_period` appears in both files.
 
 - [ ] **Step 9: Commit**
