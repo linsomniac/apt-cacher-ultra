@@ -269,12 +269,20 @@ func TestPhase2Chaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	}
 }
 
-// chaos2CountMetadataStraddles tallies clients whose InRelease and
-// Packages.gz responses came from different snapshots. Used as a
-// quantitative regression signal for the SPEC2 §12.3 per-client
-// claim — see the AIDEV-NOTE on TestPhase2Chaos_AdoptionFlipUnderConcurrency.
+// chaos2CountMetadataStraddles tallies clients whose anchor (InRelease,
+// or Release for a detached-form path set) and Packages.gz responses
+// came from different snapshots. Used as a quantitative regression
+// signal for the SPEC2 §12.3 per-client claim — see the AIDEV-NOTE on
+// TestPhase2Chaos_AdoptionFlipUnderConcurrency.
+//
+// AIDEV-NOTE: a client is counted only when both its anchor and its
+// Packages.gz were served, so a path set with neither anchor makes every
+// assertion on this count vacuous (the detached twin's once was, before
+// /Release counted). "/Release" does not match Release.gpg, and each
+// chaos2 path set holds exactly one anchor (chaos2AllPaths: InRelease;
+// chaos2DetachedAllPaths: Release).
 func chaos2CountMetadataStraddles(samples []chaos2Sample) int {
-	type clientMeta struct{ inRelease, packages string }
+	type clientMeta struct{ anchor, packages string }
 	per := make(map[int]*clientMeta)
 	for _, s := range samples {
 		if !s.ok {
@@ -286,15 +294,15 @@ func chaos2CountMetadataStraddles(samples []chaos2Sample) int {
 			per[s.clientID] = cm
 		}
 		switch {
-		case strings.HasSuffix(s.path, "/InRelease"):
-			cm.inRelease = s.snapLabel
+		case strings.HasSuffix(s.path, "/InRelease"), strings.HasSuffix(s.path, "/Release"):
+			cm.anchor = s.snapLabel
 		case strings.HasSuffix(s.path, "/Packages.gz"):
 			cm.packages = s.snapLabel
 		}
 	}
 	straddles := 0
 	for _, cm := range per {
-		if cm.inRelease != "" && cm.packages != "" && cm.inRelease != cm.packages {
+		if cm.anchor != "" && cm.packages != "" && cm.anchor != cm.packages {
 			straddles++
 		}
 	}

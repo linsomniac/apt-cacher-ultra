@@ -40,7 +40,9 @@ import (
 // AIDEV-NOTE: SPEC2 §12.3's per-client coherence comes from the spec C8
 // flip barrier (see TestPhase2Chaos_AdoptionFlipUnderConcurrency); as
 // there, neither burst crosses the flip, so its zero-straddle assertions
-// pin the burst structure (they do not exercise the barrier), and it
+// (each client's Release against its Packages.gz:
+// chaos2CountMetadataStraddles takes Release as the detached anchor) pin
+// the burst structure (they do not exercise the barrier), and it
 // strictly asserts per-request coherence.
 func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	if testing.Short() {
@@ -194,6 +196,9 @@ func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 		}
 	}
 
+	// Per-client metadata coherence: no client's Release and Packages.gz
+	// responses came from different snapshots (neither burst crosses the
+	// flip; see the AIDEV-NOTE on the test function).
 	if preN, postN := chaos2CountMetadataStraddles(pre), chaos2CountMetadataStraddles(post); preN != 0 || postN != 0 {
 		t.Errorf("detached metadata straddles: pre-flip=%d post-flip=%d, want 0", preN, postN)
 	}
