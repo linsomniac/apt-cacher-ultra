@@ -32,8 +32,9 @@ client configs work unchanged.
   flipped in a single SQLite transaction. The flip waits (bounded) until clients that received the old InRelease have
   had `adoption.flip_quiet_period` to fetch its indexes, so the index requests an apt client sends within that period
   of its InRelease match it (by-hash requests are served from the displaced snapshot even later); the residuals (a
-  suite that never goes quiet within the bounds, responses slower than apt's own timeout, more than 256 held requests)
-  each have a counter and are documented in [Flip consistency](docs/configuration.md#flip-consistency).
+  client still reading the old InRelease 15 s into a hold, a commit slower than the 20 s hold, a switch that waits
+  60 s for its turn to hold, responses slower than apt's own timeout, more than 256 held requests) each have a
+  counter and are documented in [Flip consistency](docs/configuration.md#flip-consistency).
 - Hash validation — every metadata file is checked against InRelease, every .deb against Packages; mismatches are
 rejected.
 - by-hash dedup — indices stored by content hash, deduplicated across suites.

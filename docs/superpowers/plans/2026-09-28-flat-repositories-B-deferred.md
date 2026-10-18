@@ -31,7 +31,7 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 - **B-20** `recordAdoptionFailure`'s shutdown check-then-act can log `adoption_failure_record_failed` "context canceled" at WARN when shutdown races a failure (log noise only).
 - **B-21** `adoption_failure_test.go` `TestAdoptionFailure_PanicIsRecorded`: `evs[len(evs)-1]` relies on a single event (`Ring.Snapshot` order).
 - **B-22** `freshness_test.go` `fakeCache.RecordAdoptionFailure` succeeds for unknown suites (production is UPDATE-only, pinned by `TestRecordAdoptionFailure_IsUpdateOnly`).
-- **B-23** `freshness.go:1682` `applyClamp` runs twice on the inline → detached fallback of a first-ever suite (a double `acu_clock_steps_detected_total` count and a redundant write); one-line fix: set `cur.AdoptionNextRetryAt = &g.clampTo` after `SetAdoptionNextRetry`.
+- **B-23** `freshness.go:1682` `applyClamp` runs twice on the inline → detached fallback of a first-ever suite (a double `acu_clock_steps_detected_total` count and a redundant write); one-line fix: set `cur.AdoptionNextRetryAt = &g.clampTo` after `SetAdoptionNextRetry`. (E; phase C touched `freshness.go` without taking it)
 - **B-24** `retry_gate_test.go` `TestGate_DueRetryHasNoValidators` cannot tell "" from the anchor's validators (the rig suite has none); add a leg on an adopted suite past `next_retry_at`.
 - **B-25** One extra `Release.gpg` GET per deferred detached check when upstream ignores validators (accepted cost; recorded so E's shared tail keeps it in mind). (E)
 - **B-27** `restart_reset_test.go`: the restart test exercises only `rand = 0.5`; a `rand = 0` leg would pin the lower bound.
@@ -39,8 +39,8 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 ## internal/freshness — check path, repair, reconcile
 
 - **B-28** A degraded snapshot's Release is parsed twice per heal attempt (`reconcile.go:122` `reconcilePending`, then `ReconcileSnapshot`; perf only, bounded by the cooldown).
-- **B-30** `freshness.go:533`, `:594`: `adoption_reconcile_failed` is emitted at the decision and at the heal with identical fields; add a `stage` attribute.
-- **B-31** `freshness.go:544`: a repair deferred for want of a slot is logged at DEBUG only, with no counter.
+- **B-30** `freshness.go:533`, `:594`: `adoption_reconcile_failed` is emitted at the decision and at the heal with identical fields; add a `stage` attribute. (E; phase C touched `freshness.go` without taking it)
+- **B-31** `freshness.go:544`: a repair deferred for want of a slot is logged at DEBUG only, with no counter. (E; phase C touched `freshness.go` without taking it)
 - **B-32** Under steady client traffic a degraded suite re-runs its repair every cooldown, and each run may take the reserved slot for up to `max_duration` if a member stalls; weigh with E's `signedCurrent` change. (E)
 - **B-33** The `Release.gpg` Conditional on `fetchCtx` is untested (reverting it to `ctx` survives); add a stall-on-gpg synctest when E moves the shared tail (D in the latency bound depends on it). (E)
 - **B-34** `recordUnknownEnd`'s `freshnessCheckTotal.Inc("failed")` is asserted nowhere. (E)
@@ -85,5 +85,5 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 
 ## Final fix-wave residuals (scoped re-review of 9a2b22b..e361704)
 
-- **B-66** `internal/freshness/scheduler.go:154-156`: `enqueue` drops a duplicate without setting `pendingChange`, so a suite queued earlier as stale and left pending by a client check before it is popped honours the cooldown once and is parked one tick later than the Run doc and configuration.md:243 promise ("within one tick"). Set the flag on a duplicate that sits in a class queue, or soften the docs.
+- **B-66** `internal/freshness/scheduler.go:154-156`: `enqueue` drops a duplicate without setting `pendingChange`, so a suite queued earlier as stale and left pending by a client check before it is popped honours the cooldown once and is parked one tick later than the Run doc and configuration.md:243 promise ("within one tick"). Set the flag on a duplicate that sits in a class queue, or soften the docs. (E; phase C touched `scheduler.go` without taking it)
 - **B-67** `docs/admin-ui-spec.md:385-386`: "logs WARN `adoption_refused_persistently` for the same condition" overstates it — the WARN also needs a streak milestone, so with hourly retries the first WARN comes at the 48th attempt (~43 h), about a day after the page warns. Reword (log-fields.md:193 and configuration.md:235 are correct), or emit the WARN on the first refusal past 24 h.

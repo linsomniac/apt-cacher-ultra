@@ -77,6 +77,15 @@ Design notes (choices the spec leaves open — the boring, bounded option, with 
 5. **Phase A (b) and phase B (b) apply only to holds that held at least one request** (spec C8 says "no hold … ended within the same period"; design review I1, accepted; design note 17). Task 11 amends spec C8.
 6. **`adoption.flip_quiet_period` is `0s` or between `1s` and `15s`** (spec C11: "`0s` disables; ≤ `15s`"; controller ruling): a sub-second period protects almost no one. Config validation and `flipgate.New` both enforce it; Task 11 amends spec C11.
 
+## Final-review fix wave (2026-10-18)
+
+The three final reviews (`.superpowers/sdd/2026-09-28-flat-repositories-C-flip/final-review-*.md`) led to these controller rulings, applied after Task 11; spec revision 6 was amended to match. Where they contradict the design notes above, they win:
+
+- **The quiet wait is cut short at 15 s** (concurrency Important 1, option b). Answering an expired hold's waiters from the old snapshot right before its commit made nearly every held client straddle once the commit took real time (41–42 against 2 without the barrier, with one slow reader). Once phase B (b) holds, a hold waits for local quiet only until `HoldMax − CommitMargin` (new constant, 5 s), then commits inside the hold: outcome `quiet_cut_short`, counter `acu_flip_quiet_cut_short_total`; expiry stays the backstop. `MaxQuiet ≤ HoldMax − CommitMargin` is pinned. This refines design note 4 (expiry now means "the bound came before the commit finished") and design note 20 (one more residual counter); the five-suite DoD simulation (deviation 2) uses 200 ms commits, and its four holds are cut short at 15 s.
+- **Snapshot anchors' `Last-Modified` is `adopted_at` alone** (spec I-1, option a). This supersedes design note 21 and the Global Constraint's `max(pool mtime, adopted_at)`: the pool mtime is used only when the `adopted_at` read fails (logged), so neither a backward step during an adoption nor a recovery rewrite can produce a 304 for a changed anchor.
+- **A skipped first-adoption flip honours a closed gate** (`(*Gate).Closed()`); **a held client that leaves is a client abort** (`client_canceled`, no WARN); **a flip abandoned at shutdown is never counted or logged as a failure** (INFO `adoption_abandoned_at_shutdown`, no `acu_adoption_total`, no admin-ring entry; refines design note 10's "the adoption's own failure line covers that"); **the barrier is visible** (gauge `acu_flip_barrier_active`, request field `flip_held_ms`).
+- Test-only: `(*Adopter).SetCommitDelayForTest` models a commit's latency in the handler simulations. The remaining can-wait minors are in `2026-09-28-flat-repositories-C-deferred.md`.
+
 ## Definitions: straddle and the client model
 
 The simulations count straddles with `simtest.Ledger` (Task 2), whose doc comment carries these definitions:

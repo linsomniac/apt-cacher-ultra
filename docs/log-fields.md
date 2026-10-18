@@ -31,6 +31,10 @@ Fields that follow this pattern:
   was served from one of its suite's displaced snapshots (spec C8
   retained by-hash, for a client holding an earlier `InRelease`);
   `X-Cache-Snapshot` names that snapshot.
+- `flip_held_ms` — emitted only when an `InRelease`/`Release` request
+  waited in a flip hold (spec C8): how long it waited, in milliseconds
+  (at most 20000; part of `duration_ms`). Also on the `client_canceled`
+  line of a held request whose client left while it waited.
 
 Always-present fields (`method`, `url`, `canonical_host`, `path`,
 `outcome`, `status`, `bytes_sent`, `duration_ms`, `client_addr`) are
@@ -151,21 +155,32 @@ outcome — the metric label `acu_adoption_total{outcome}` (and
 `acu_adoption_duration_seconds{outcome}`) and the admin JSON field
 `recent_adoptions[].outcome` — never to the `request` line's `outcome`
 above: `refused` (a refusal state; the `reason` says which),
-`release_date_in_future`, `timed_out` (`adoption.max_duration` reached) and
-`panicked` (the adoption goroutine panicked; recorded with reason `panic`).
+`release_date_in_future`, `timed_out` (`adoption.max_duration` reached
+before the downloads finished, or the commit hit its 5-minute bound; a
+deadline that passes while the adoption waits in the flip barrier is not
+`timed_out`) and `panicked` (the adoption goroutine panicked; recorded with
+reason `panic`). A flip abandoned at shutdown is not an outcome: it is
+logged as `adoption_abandoned_at_shutdown` and counted nowhere.
 It also adds the gauge `acu_adoption_failing_suites` (suites whose latest
 adoption failed, refusals excluded; 0 while adoption is disabled) and the
 gauge `acu_freshness_waiting_for_slot` (suites waiting for an adoption
 slot). The flip barrier (spec C8) adds one unlabelled counter per
 residual — `acu_flip_hold_skipped_total` (a flip that waited 60 s for the
-hold token and committed without a hold), `acu_flip_hold_expired_total`
-(a hold that reached its 20 s bound before its commit finished),
+hold token and committed without a hold),
+`acu_flip_quiet_cut_short_total` (a hold that committed 15 s in, before
+its suite was quiet: an `InRelease`/`Release` response still being sent
+then, or finished within `flip_quiet_period`, may straddle; the held
+requests got the new snapshot), `acu_flip_hold_expired_total` (a hold
+that reached its 20 s bound before its commit finished: its held requests
+were answered from the old snapshot),
 `acu_flip_waiters_over_cap_total` (an anchor request answered at once
 because 256 already waited in a hold) and
 `acu_flip_slow_anchor_reads_total` (an `InRelease`/`Release` response
-that took 30 s or longer to send) — and `acu_flip_gate_panics_total` (a
+that took 30 s or longer to send) — `acu_flip_gate_panics_total` (a
 panic recovered in the barrier's hold-expiry timer: a bug, please report
-it). Retained by-hash adds `acu_serve_byhash_displaced_total{host}`
+it) and the unlabelled gauge `acu_flip_barrier_active` (flips in the
+barrier now: waiting for quiet or for the hold token, holding, or
+committing). Retained by-hash adds `acu_serve_byhash_displaced_total{host}`
 (by-hash requests served from a displaced snapshot).
 `acu_adoption_duration_seconds` includes the barrier's wait (at most
 140 s).
@@ -220,6 +235,10 @@ the daemon's `main`).
 | `legacy_trust_audit_deferred` | ERROR | `snapshot_id`, `canonical_host`, `suite_path`, `err`, `stack` (present only for a recovered panic) | A pre-upgrade snapshot's pool file could not be read (not "missing"), or auditing it panicked (`err` carries the panic value); the snapshot is left as it was and retried at the next start. |
 | `legacy_trust_audit_progress` | INFO | `audited`, `quarantined`, `deferred` | One batch of up to 100 queued snapshots was audited and committed; the fields are running totals across this start's batches. Logged on the first start after an upgrade, and on later starts while deferred snapshots remain queued or after an interrupted audit. |
 | `legacy_trust_audit_completed` | INFO | `audited`, `signed`, `quarantined`, `deferred`, `anchor_markers`, `duration` | The startup trust audit finished (every start; `audited` is 0 once the upgrade queue has drained). |
-| `adoption_flip_barrier` | INFO | `canonical_host`, `suite_path`, `snapshot_id`, `outcome` (`held`, `hold_expired`, `hold_skipped`, `not_needed`, `commit_failed`), `phase_a_seconds`, `token_wait_seconds`, `hold_seconds`, `held_requests` (the last four absent when the barrier was skipped for a first adoption) | An adoption committed behind the spec C8 flip barrier: `held` within its hold; `hold_expired` when the hold reached 20 s first (`acu_flip_hold_expired_total`); `hold_skipped` after 60 s without the hold token (`acu_flip_hold_skipped_total`); `not_needed` for a first adoption whose anchor clients were already being served; `commit_failed` when the commit ran and failed — the snapshot did not switch, the timing fields still describe the barrier, and `adoption_run_failed` gives the error. Not logged when `adoption.flip_quiet_period = 0s`, nor for a flip abandoned at shutdown (`adoption_run_failed` says so). |
+| `adoption_flip_barrier` | INFO | `canonical_host`, `suite_path`, `snapshot_id`, `outcome` (`held`, `quiet_cut_short`, `hold_expired`, `hold_skipped`, `not_needed`, `commit_failed`), `phase_a_seconds`, `token_wait_seconds`, `hold_seconds`, `held_requests` (the last four absent when the barrier was skipped for a first adoption) | An adoption committed behind the spec C8 flip barrier: `held` within its hold, once its suite was quiet; `quiet_cut_short` within its hold at 15 s, before its suite was quiet — the held requests got the new snapshot, a client still reading the old anchor then (or done with it within `flip_quiet_period`) may straddle (`acu_flip_quiet_cut_short_total`); `hold_expired` when the hold reached 20 s before the commit finished — the held requests were answered from the old snapshot (`acu_flip_hold_expired_total`); `hold_skipped` after 60 s without the hold token (`acu_flip_hold_skipped_total`); `not_needed` for a first adoption whose anchor clients were already being served; `commit_failed` when the commit ran and failed — the snapshot did not switch, the timing fields still describe the barrier, and `adoption_run_failed` gives the error. Not logged when `adoption.flip_quiet_period = 0s`, nor for a flip abandoned at shutdown (`adoption_abandoned_at_shutdown` says so). |
+| `adoption_abandoned_at_shutdown` | INFO | `canonical_host`, `suite_path`, `form`, `err` | An adoption waiting in the flip barrier (or about to skip it) was abandoned at the shutdown signal: nothing was committed or recorded, the change is adopted after the restart. Not a failure: no `adoption_run_failed`, not counted in `acu_adoption_total` or `acu_adoption_duration_seconds`, not shown in the admin page's recent adoptions. |
 | `displaced snapshot lookup failed` | WARN | `err`, `canonical_host`, `path` | Retained by-hash could not read the suite's displaced snapshots; the request is answered 404, as before spec C8. |
+| `snapshot adopted_at lookup failed` | WARN | `err`, `snapshot_id` | A snapshot `InRelease`/`Release`/`Release.gpg` could not read its snapshot's `adopted_at` (spec C8 `Last-Modified`), so this response carries the pool file's mtime instead and its `Last-Modified` may not grow with the last flip. Not logged when the request had already ended. |
 | `shutdown_waiting_for_adoptions` | INFO | `waited`, `detail` | Shutdown has waited 2 s for the adoption, repair and reconcile goroutines: a commit already running is never cancelled and may take up to its 5-minute bound; other work stops at its next cancellation point (adoptions in the flip barrier were abandoned at the signal). Logged once per shutdown. |
+| `shutdown wait panicked` | ERROR | `panic` | The shutdown drain's wait for the adoption, repair and reconcile goroutines panicked (a bug, please report it); shutdown carries on without waiting further for them. |
+| `apt-cacher-ultra starting` | INFO | the effective configuration (see `cmd/apt-cacher-ultra/main.go`); the flat-repository work adds `adoption_flip_quiet_period` | Logged once at start. `adoption_flip_quiet_period` is the configured `adoption.flip_quiet_period`; the flip barrier runs only when it is not `0s` and adoption is enabled. |

@@ -1,6 +1,6 @@
 # Flat repositories, eager adoption, and suite lifecycle — design
 
-- **Date:** 2026-09-27 (revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
+- **Date:** 2026-09-27 (revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
 - **Status:** draft for maintainer review
 - **Branch:** `feature/flat-repos` (from `main` @ 536a1ab)
 - **Origin:** reimplementation of the problem reported in PR #8 ("Refresh flat
@@ -553,7 +553,10 @@ future is treated as infinitely old by gates that *delay* work (cooldown, T2
 threshold) and as "now" by gates that *retire* things (reap cutoff).
 `next_retry_at` is only clamped to `now + 1h` (C7). Each detection emits a
 rate-limited WARN `clock_step_detected`. Touch coalescing and all in-memory
-timing use monotonic time.
+timing use monotonic time. Since C8's monotonic stamp, `adopted_at` can
+legitimately lead the clock (by 1 s per same-second flip, by up to a
+backward step's length after one); no gate reads it as a past event today,
+and one that starts to must allow for that.
 
 New `freshness_check` result values: `first_adoption`,
 `first_adoption_queued`, `changed_deferred`, `changed_queued`,
@@ -827,7 +830,11 @@ count. `Release.gpg` is never held.
   `1s` to `15s`), and (b) **no hold is in progress anywhere** and none
   that held at least one request ended within the same period (such a hold
   delayed other suites on the client's shared queue; one that held nothing
-  delayed no one). Bounded by 60 s; on timeout proceed to phase B.
+  delayed no one). Bounded by 60 s; on timeout proceed to phase B. A
+  phase A that finds quiet still takes the hold token and holds (a
+  zero-length hold in the common case): the commit always runs inside a
+  hold, so no anchor serve can read the old pointer between the quiet check
+  and the commit. Never optimise the quiet path into a direct commit.
 - **Hold token.** Before phase B the flip acquires the process-wide hold
   token (FIFO; at most one suite holds at a time). Waiting for it is bounded
   by 60 s; on timeout the flip commits without a hold (counter
@@ -840,40 +847,64 @@ count. `Release.gpg` is never held.
   *other* suite's hold that held at least one request ended within
   `flip_quiet_period` (clients released from that hold may still have this
   suite's index requests queued behind it). Then run `commit`, clear
-  pending, wake waiters onto the new snapshot and release the token. The
-  whole of phase B, including both waits, is
-  bounded by 20 s from its start: at expiry pending is cleared, waiters are
-  answered from the current snapshot, a commit not yet started starts
-  immediately (counter `acu_flip_hold_expired_total`), and the token is
-  released. A flip therefore takes at most 60 s + 60 s + 20 s plus its
-  commit.
+  pending, wake waiters onto the new snapshot and release the token. Once
+  (b) holds, the wait for (a) is cut short at 15 s from phase B's start
+  (20 s less a 5 s commit margin, the time a commit normally needs): the
+  commit starts then, inside the hold, so the waiters still get the new
+  snapshot; anchors still being sent, or finished within
+  `flip_quiet_period`, at that moment — the late readers — are a residual
+  (counter `acu_flip_quiet_cut_short_total`). Because `flip_quiet_period`
+  ≤ 15 s = 20 s − 5 s and holds never overlap, (b) always holds by then.
+  The whole of phase B, including both waits, is bounded by 20 s from its
+  start: at expiry — the backstop for a commit that has not started or not
+  finished by then — pending is cleared, waiters are answered from the
+  current snapshot, a commit not yet started starts immediately (counter
+  `acu_flip_hold_expired_total`), and the token is released. A flip
+  therefore takes at most 60 s + 60 s + 20 s plus its commit. (Answering
+  the waiters from the old snapshot at 20 s and committing right after —
+  this rule before phase C's final review — made nearly every held client
+  fetch the new indexes for its old anchor: one slow reader made a flip
+  about 20 times worse than no barrier.)
 
 Skipped when `flip_quiet_period = 0s` (today's behaviour) and for a first
 adoption whose anchor bytes equal the `url_path` anchor clients have been
-served (the flip does not change what they hold). A first adoption stamps
+served (the flip does not change what they hold; the skip still honours the
+shutdown signal, so it commits nothing once the daemon is stopping). A
+first adoption stamps
 `adopted_at = max(now, url_path anchor last_fetched_at + 1)` so clients'
 `If-Modified-Since` still sees a change.
 
 **Guarantee.** A client that received the old anchor finished receiving it at
 least `flip_quiet_period` before the flip, or was held and answered from the
 new snapshot, so its index requests within that period come from the snapshot
-matching its anchor. Because holds never overlap and every commit waits a
-quiet period after the last hold ended, the proxy's own holds cannot push a
-client's queued requests for another suite past that suite's flip.
-Residuals (documented, each with its own unlabelled counter): phase-B expiry
-when the commit or an in-flight reader exceeds 20 s (F-2 on very large
-suites; `acu_flip_hold_expired_total`), hold-token timeout (a flip times out
-only behind 60 s of holds: at least three holds at their 20 s bound, in
-practice four or more, since a queued flip's suite is usually busy and its
-hold then lasts at least the quiet period — the five busy suites of §9 give
-four holds and one skip — so it takes at least four suites flipping at once,
-which needs `max_concurrent_adoptions` of 4 or more, or 0 for unlimited,
-because a flip keeps its global slot through the barrier;
-`acu_flip_hold_skipped_total`), waiters beyond the cap
-(`acu_flip_waiters_over_cap_total`), and anchor reads slower than apt's own
-timeout (`acu_flip_slow_anchor_reads_total`). A flip waiting for the token
-keeps its global adoption slot, so while two or more suites flip other
-adoptions can queue for up to about 140 s (bounded).
+matching its anchor. Because holds never overlap and every held commit
+waits a quiet period after the last hold that held a request ended (the
+quiet-cut, expiry and token-timeout commits are the residuals below), the
+proxy's own holds cannot push a client's queued requests for another suite
+past that suite's flip. Residuals (documented, each with its own unlabelled
+counter): the quiet period cut short at 15 s into a hold, when an anchor
+response of the suite is still being sent then or finished less than
+`flip_quiet_period` before — a read still running `20 s − 5 s −
+flip_quiet_period` (5 s by default) into the hold, such as a slow or
+stalled client — whose client then fetches its indexes from the new
+snapshot (`acu_flip_quiet_cut_short_total`; the held clients are answered
+from the new snapshot); phase-B expiry when the commit has not finished by
+20 s (F-2 on very large suites): the waiters are answered from the old
+snapshot and may fetch new indexes for it (`acu_flip_hold_expired_total`);
+hold-token timeout (a flip times out only behind 60 s of holds: at least
+three holds at their 20 s bound, which needs commits slower than the 5 s
+margin, in practice four or more, since a queued flip's suite is usually
+busy and its hold then lasts at least the quiet period and up to 15 s plus
+its commit — the five busy suites of §9 give four holds and one skip — so it
+takes at least four suites flipping at once, which needs
+`max_concurrent_adoptions` of 4 or more, or 0 for unlimited, because a flip
+keeps its global slot through the barrier; `acu_flip_hold_skipped_total`),
+waiters beyond the cap (`acu_flip_waiters_over_cap_total`), and anchor
+reads slower than apt's own timeout (`acu_flip_slow_anchor_reads_total`).
+The gauge `acu_flip_barrier_active` counts the flips in the barrier now,
+and a held request's `request` line carries `flip_held_ms`. A flip waiting
+for the token keeps its global adoption slot, so while two or more suites
+flip other adoptions can queue for up to about 140 s (bounded).
 by-hash clients remain covered by retained by-hash. Answering held requests
 with `503 Retry-After` instead was rejected: apt before 2.3.2 treats a 5xx as
 an item failure without retrying, while answering from the current snapshot is
@@ -891,11 +922,19 @@ displaced snapshots. Counter `acu_serve_byhash_displaced_total{host}`.
 
 **Monotonic `Last-Modified`.** `CommitAdoption` stamps `adopted_at =
 max(now, prior.adopted_at + 1)` (first adoption: see above), and
-snapshot-served anchors (`InRelease`, `Release`, `Release.gpg`) use
-`max(pool mtime, adopted_at)` as the `ServeContent` modtime, so a client's
-`If-Modified-Since` from the previous anchor always gets a 200 after a flip,
-even across backward clock steps. `adopted_at`'s other readers (GC ranking per
-suite, admin display) are unaffected.
+snapshot-served anchors (`InRelease`, `Release`, `Release.gpg`, also on the
+member-recovery path) use the serving snapshot's `adopted_at` alone as the
+`ServeContent` modtime — the pool file's mtime only when `adopted_at` cannot
+be read (logged) — so a client's `If-Modified-Since` from the previous
+anchor always gets a 200 after a flip, whatever the clock or a recovery
+rewrite of a pool file does. (`max(pool mtime, adopted_at)`, this rule
+before phase C's final review, let a pool file written before a backward
+clock step, or rewritten by a recovery, carry a `Last-Modified` the next
+flip's stamp did not exceed: 304s and stale lists until a later flip.)
+`Last-Modified` can lead the response's `Date` (by 1 s after two flips in
+one second, by up to a backward step's length after one); apt only echoes
+it. `adopted_at`'s other readers (GC ranking per suite, admin display) need
+only its order; see C4's clock-step rule.
 
 The README's "clients always see a coherent metadata set" claim is replaced
 with this guarantee and its residuals.
@@ -990,13 +1029,16 @@ their directory, which this design does not do.
 **Events** (documented in `docs/log-fields.md`): `suite_seed_rejected`,
 `suite_reaped`, `suite_forgotten`, `adoption_deferred`,
 `adoption_failing_persistently`, `adoption_refused` (reason),
-`adoption_flip_barrier`, `adoption_panicked`, `clock_step_detected`,
+`adoption_flip_barrier`, `adoption_abandoned_at_shutdown` (a flip abandoned
+at the shutdown signal: INFO, never counted as an adoption outcome),
+`adoption_panicked`, `clock_step_detected`,
 `flat_host_root_unsupported`, `legacy_snapshot_quarantined`,
 `legacy_trust_audit_progress`, `legacy_trust_audit_deferred`,
 `legacy_trust_audit_completed`; new fields `anchor_form`, `flat`,
-`snapshot_displaced`. New metrics include the unlabelled gauges
-`acu_adoption_failing_suites` (C7) and `acu_freshness_waiting_for_slot`
-(suites waiting for an adoption slot, C4). New metrics are host-labelled or
+`snapshot_displaced`, `flip_held_ms`. New metrics include the unlabelled
+gauges `acu_adoption_failing_suites` (C7), `acu_freshness_waiting_for_slot`
+(suites waiting for an adoption slot, C4) and `acu_flip_barrier_active`
+(flips in the C8 barrier now). New metrics are host-labelled or
 unlabelled (no suite labels) and are added to the metrics inventory comments in
 `internal/freshness/metrics.go` and `internal/handler/metrics.go`.
 `gc_run_complete` and `LastRunSummary` gain `retired_reaped`.
@@ -1010,7 +1052,8 @@ unlabelled (no suite labels) and are added to the metrics inventory comments in
 | `gc.suite_idle_ttl` | `"720h"` | `0s` disables reaping; else ≥ `24h` |
 
 Constants, not knobs: backoff 2 m → 1 h (adoption failures and repeated
-*unknown* checks); hold 20 s; phase A cap 60 s; hold-token wait 60 s; waiter
+*unknown* checks); hold 20 s, of which the last 5 s are kept for the commit
+(the C8 quiet cut at 15 s); phase A cap 60 s; hold-token wait 60 s; waiter
 caps 256 (barrier) and 64 (strict wait); strict wait 15 s; reaps 25 per run;
 unsigned member cap 1,000; check deadline 2 min; check workers 4; interest
 window 7 d; orphan-marker TTL 365 d; cap-rejection cache 10 min;
@@ -1285,13 +1328,16 @@ files), in phase D.
   plain-path straddle reproduced on the phase-B tip and fixed; busy suite
   (an anchor every 500 ms for 120 s across a flip) → zero straddles;
   mirror-mode two suites with a hold in progress → zero straddles; slow reader
-  → phase B ends within 20 s and the flip commits; hold never exceeds 20 s;
+  (12 s and 25 s, a commit with real latency) → the hold commits at 15 s,
+  the held clients get the new snapshot, only the slow reader may straddle,
+  and the cut is counted; a commit that has not started or finished by 20 s
+  → the hold ends at 20 s, counted; hold never exceeds 20 s;
   idle zero-wait; client cancel; shutdown; commit failure releases waiters;
   the chaos test's straddle count asserted zero; retained by-hash (SHA256 and
   SHA512 in C; E's SHA512 adoption writes the SHA512 alias rows) with
   stray-blob and retired-snapshot negatives;
-  `Last-Modified` across same-second flips, first adoption and a backward
-  step.
+  `Last-Modified` across same-second flips, first adoption, a backward
+  step, a pool file dated after its stamp and a recovery rewrite.
 - C9: 90-day simulation at `gc.interval = 24h` with 12-hourly restarts
   (touched / idle / near-TTL / busy / clock jump); a reaped suite that returns
   before any GC tick with unchanged upstream re-adopts within one check;
