@@ -1,8 +1,10 @@
 package freshness
 
 import (
+	"context"
 	"errors"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 )
 
@@ -18,11 +20,12 @@ import (
 // adoption attempts, so a missing classification would silently
 // under-count a category. Adding a new ErrAdoption* sentinel means
 // classifying it AND extending the SPEC5 §10.4.3 outcome enum.
-// Outcome inventory: success, unpinned_suite, gpg_failed, parse_failed,
-// member_mismatch, member_fetch_failed, db_failed, run_failed (all from
-// classifyAdoptionOutcome) and panicked (I-1: counted by
-// Checker.recoverGoroutine when the adoption goroutine panics, which in
-// practice means inside Run/RunDetached, before classification).
+// Outcome inventory: success, refused (spec C5 refusal states; the
+// reason says which), release_date_in_future, timed_out
+// (adoption.max_duration), unpinned_suite, gpg_failed, parse_failed,
+// member_mismatch, member_fetch_failed, db_failed, run_failed, and
+// panicked (Checker.recoverGoroutine; Task 6 moves it to
+// Checker.recoverAdoption).
 //
 // AIDEV-NOTE: metrics added by the flat-repository work, outside the
 // SPEC5 §10.4.3 inventory: acu_clock_steps_detected_total (spec C4) and
@@ -212,6 +215,14 @@ func classifyAdoptionOutcome(err error) string {
 		return "success"
 	}
 	switch {
+	case errors.Is(err, ErrAdoptionUpstreamOlder), errors.Is(err, ErrAdoptionRollbackRefused):
+		return "refused"
+	case errors.Is(err, ErrAdoptionReleaseDateInFuture):
+		return "release_date_in_future"
+	case errors.Is(err, ErrAdoptionPanicked):
+		return "panicked"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timed_out"
 	// unpinned_suite is checked BEFORE gpg_failed: the verifier wraps
 	// its return with both ErrAdoptionGPGFailed (the runShared
 	// category sentinel) and ErrAdoptionUnpinnedSuite (the specific
@@ -260,6 +271,15 @@ func classifyAdoptionOutcome(err error) string {
 func classifyAdoptionReason(err error, outcome string, gpgClassifier func(error) string) string {
 	if err == nil {
 		return ""
+	}
+	switch outcome {
+	case "refused":
+		if errors.Is(err, ErrAdoptionUpstreamOlder) {
+			return cache.ReasonUpstreamOlder
+		}
+		return cache.ReasonRollbackRefused
+	case "panicked":
+		return cache.ReasonPanic
 	}
 	if outcome == "gpg_failed" && gpgClassifier != nil {
 		if r := gpgClassifier(err); r != "" {

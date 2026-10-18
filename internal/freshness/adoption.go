@@ -100,6 +100,21 @@ var (
 	// already imports freshness, so a freshness->gpg edge would
 	// cycle).
 	ErrAdoptionUnpinnedSuite = errors.New("adoption_unpinned_suite")
+
+	// ErrAdoptionUpstreamOlder is the spec C5 refusal for a candidate
+	// whose verified Release Date is older than the current snapshot's
+	// (apt ignores such a Release). A refusal state, not a failure (C7).
+	ErrAdoptionUpstreamOlder = errors.New("adoption_upstream_older")
+
+	// ErrAdoptionRollbackRefused is the spec C5 refusal for content equal
+	// to an adopted snapshot of the suite that is no longer current: a
+	// flapping mirror must not flip the cache backwards.
+	ErrAdoptionRollbackRefused = errors.New("adoption_rollback_refused")
+
+	// ErrAdoptionReleaseDateInFuture fails a candidate dated more than
+	// maxReleaseDateSkew ahead of the cache's clock (apt: "not valid
+	// yet"). A failure: the normal retry schedule applies.
+	ErrAdoptionReleaseDateInFuture = errors.New("adoption_release_date_in_future")
 )
 
 // AdoptionMemberError carries the failing Release member's suite-
@@ -879,11 +894,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		}
 	}
 
-	// Step 0a: capture the prior adoption form. After CommitAdoption
-	// the prior snapshot is no longer current, so the lookup must
-	// happen before any mutation. Step 10 compares this against p.form
-	// and emits adoption_form_drift on a transition.
-	priorForm, hadPrior := a.priorAdoptionForm(ctx, suite)
+	// Step 0a: capture the prior (current) snapshot. After
+	// CommitAdoption the prior snapshot is no longer current, so the
+	// lookup must happen before any mutation. Step 3a applies apt's Date
+	// rules against its release_date, Step 4 tells a rollback from a
+	// race with it, and Step 10 compares its form against p.form and
+	// emits adoption_form_drift on a transition.
+	prior := a.priorSnapshot(ctx, suite)
+	priorForm, hadPrior := formOfSnapshot(prior)
 
 	// Step 1: GPG verify. The Verifier returns the verified Release-
 	// style plaintext (the cleartext between BEGIN/END markers in a
@@ -968,6 +986,20 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		return fmt.Errorf("%w: %v", ErrAdoptionParseFailed, err)
 	}
 
+	// Step 3a (spec C5): apt's Date rules, checked before the candidate
+	// insert so a refusal costs one verification and no member download.
+	// A missing or unparseable Date is 0 (apt). Snapshots adopted before
+	// v7 have no stored date (NULL): no rule applies to their successor.
+	relDate := releaseDate(releaseText)
+	if now := a.now(); relDate > now.Add(maxReleaseDateSkew).Unix() {
+		return fmt.Errorf("%w: Date is %ds ahead of the cache's clock",
+			ErrAdoptionReleaseDateInFuture, relDate-now.Unix())
+	}
+	if prior != nil && prior.ReleaseDate != nil && relDate < *prior.ReleaseDate {
+		return fmt.Errorf("%w: Date %d is older than the current snapshot's %d",
+			ErrAdoptionUpstreamOlder, relDate, *prior.ReleaseDate)
+	}
+
 	// Step 4: insert the candidate suite_snapshot row. The schema
 	// CHECK constraint enforces XOR between inrelease_hash and
 	// (release_hash + release_gpg_hash); we set whichever pair this
@@ -992,6 +1024,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		cand.ReleaseGPGHash = &p.releaseGPGHash
 		cand.Form = cache.FormDetached
 	}
+	cand.ReleaseDate = &relDate
 	if etag != "" {
 		v := etag
 		cand.InReleaseETag = &v
@@ -1008,6 +1041,17 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// see the fix is active without having to grep for absence of WARNs.
 	snapshotID, reused, err := a.cache.InsertCandidateSnapshot(ctx, cand)
 	if err != nil {
+		// AIDEV-NOTE: content equal to an adopted snapshot that is no
+		// longer current is a rollback (spec C5 rollback_refused). Equal to
+		// the CURRENT snapshot is a race with a check that already saw the
+		// flip; the next check reports "unchanged", so it stays a plain
+		// DB-failure wrap. The prior == nil arm is defensive: no writer
+		// today leaves a suite without a pointer while an adopted,
+		// non-retired snapshot of it exists.
+		var nk *cache.NaturalKeyAdoptedError
+		if errors.As(err, &nk) && (prior == nil || nk.SnapshotID != prior.SnapshotID) {
+			return fmt.Errorf("%w: %w", ErrAdoptionRollbackRefused, err)
+		}
 		if errors.Is(err, cache.ErrSnapshotNaturalKeyAdopted) {
 			a.logger.Warn("adoption: natural key already adopted",
 				"canonical_host", suite.CanonicalHost,
@@ -1514,22 +1558,25 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	return nil
 }
 
-// priorAdoptionForm returns the adoption form of the suite's current
-// snapshot, derived from its hash columns. Returns (form, true) when
-// a current snapshot exists with one of the known fingerprints; (0,
-// false) when there is no current snapshot, the lookup fails, or the
-// snapshot has neither hash set (the latter shouldn't happen given
-// the suite_snapshot CHECK constraint, but treat defensively).
-//
-// First-ever adoption produces (0, false), which the caller treats as
-// "no prior" — first adoption is not drift.
-func (a *Adopter) priorAdoptionForm(ctx context.Context, suite SuiteRef) (adoptionForm, bool) {
+// priorSnapshot returns the suite's current snapshot, or nil when there
+// is none or it cannot be read. runShared reads it before any mutation:
+// after CommitAdoption the prior snapshot is no longer current.
+func (a *Adopter) priorSnapshot(ctx context.Context, suite SuiteRef) *cache.SuiteSnapshot {
 	fresh, err := a.cache.GetSuiteFreshness(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
 	if err != nil || fresh == nil || fresh.CurrentSnapshotID == nil {
-		return 0, false
+		return nil
 	}
 	snap, err := a.cache.GetSuiteSnapshot(ctx, *fresh.CurrentSnapshotID)
-	if err != nil || snap == nil {
+	if err != nil {
+		return nil
+	}
+	return snap
+}
+
+// formOfSnapshot maps a snapshot's stored anchor form to the adoption
+// form; (0, false) for nil or a form adoption cannot drift from.
+func formOfSnapshot(snap *cache.SuiteSnapshot) (adoptionForm, bool) {
+	if snap == nil {
 		return 0, false
 	}
 	switch snap.Form {
