@@ -150,7 +150,8 @@ type Handler struct {
 	refuseUnvouchedDebs bool
 	adoptionEnabled     bool
 
-	// flipGate is the spec C8 barrier (see anchorStart); nil when off.
+	// flipGate is the spec C8 barrier (see anchorStart); nil or disabled
+	// when off.
 	flipGate *flipgate.Gate
 
 	// keepDisplaced bounds retained by-hash (see tryDisplacedByHash).
@@ -467,11 +468,12 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 }
 
 // trySnapshotHit is the SPEC2 §6.1 metadata fast path. Returns
-// handled=true when the request was satisfied (served from a snapshot,
-// 404 not-in-snapshot, or 502 fail-closed). Returns handled=false only
-// when the suite has not been adopted (no suite_freshness row, or
-// current_snapshot_id IS NULL), in which case the caller falls through
-// to the Phase 1 url_path lookup.
+// handled=true when the request was satisfied (served from a snapshot —
+// with displaced=true when that was one of the suite's displaced
+// snapshots, spec C8 retained by-hash — 404 not-in-snapshot, or 502
+// fail-closed). Returns handled=false only when the suite has not been
+// adopted (no suite_freshness row, or current_snapshot_id IS NULL), in
+// which case the caller falls through to the Phase 1 url_path lookup.
 //
 // AIDEV-NOTE: every failure mode after a suite has been confirmed
 // adopted (DB error on snapshot_member, etc.) must fail closed with a
@@ -482,7 +484,10 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 // contract." A SuiteFreshness DB error is the one ambiguous case —
 // we don't know whether the suite is adopted, so we fail closed too;
 // the realistic failure mode is "DB is broken everywhere", and a 502
-// across the board is the right operator signal.
+// across the board is the right operator signal. The one exception: a
+// DB error in retained by-hash's displaced-snapshot lookup answers the
+// pre-C8 404 (logged WARN, phase C design note 15) — the current
+// snapshot lacks the member either way, and the miss path stays shut.
 //
 // The "blob missing" case is the one place we *can* recover safely:
 // snapshot_member.declared_sha256 is itself a trust anchor, so a
@@ -750,8 +755,12 @@ func (h *Handler) tryByHashContentAddressed(w http.ResponseWriter, r *http.Reque
 }
 
 // byHashMemberRE matches a suite-relative by-hash member path, SHA256 or
-// SHA512, capturing the hex when the algorithm is SHA256. The leading
-// (?:^|/) is defensive: IsMetadata routes only /by-hash/ paths here.
+// SHA512, capturing the hex when the algorithm is SHA256.
+//
+// AIDEV-NOTE: the leading (?:^|/) is load-bearing, not defensive: the ^
+// alternative matches aliases directly under the suite root — the dists
+// root's Contents-* aliases today, every flat suite's indexes from phase
+// G (TestServeHTTP_RetainedByHashServesASuiteRootAlias).
 var byHashMemberRE = regexp.MustCompile(`(?:^|/)by-hash/(?:SHA256/([0-9a-f]{64})|SHA512/[0-9a-f]{128})$`)
 
 // tryDisplacedByHash is spec C8's retained by-hash: a by-hash member the
@@ -1165,14 +1174,18 @@ type flipHeldKey struct{}
 // AIDEV-NOTE: the registration must precede every read of the snapshot
 // pointer (trySnapshotHit re-reads it), or a flip could commit between the
 // read and the registration and hand the client the old anchor after the
-// flip. The row check before it therefore costs one extra read per anchor
-// request of a tracked suite (none when the barrier is off). The wait's
-// end on h.lifecycleCtx is defence in depth: the daemon closes the gate at
-// the shutdown signal (design note 18), so no hold is left when the
-// handler closes. An HTTPS request through the MITM pipeline keeps its
-// inner context when its client disconnects (internal/proxy/connect.go),
-// so such a waiter stays until the hold ends (at most HoldMax) and counts
-// against the waiter cap meanwhile (design note 3).
+// flip. The row check before it — which is what decides whether a suite is
+// tracked — therefore costs one extra indexed read per <suite>/InRelease
+// and <suite>/Release request, tracked or not, while the barrier is on
+// (none when it is off). The wait's end on h.lifecycleCtx is defence in
+// depth: the daemon closes the gate at the shutdown signal (design note
+// 18), so no hold is left when the handler closes. A request whose own
+// context ends while it waits comes back unregistered, and ServeHTTP
+// answers it as a client abort. An HTTPS request through the MITM pipeline
+// keeps its inner context when its client disconnects
+// (internal/proxy/connect.go), so such a waiter stays until the hold ends
+// (at most HoldMax) and counts against the waiter cap meanwhile (design
+// note 3).
 func (h *Handler) anchorStart(r *http.Request, req *proxy.Request) *flipgate.Token {
 	if !h.flipGate.Enabled() || !req.IsMetadata || req.SuitePath == "" {
 		return nil

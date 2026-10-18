@@ -1595,11 +1595,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// hot-set computation cannot rely on them being DB-visible yet.
 	prefetchedURLPaths, hotStats := a.runHotPrefetch(ctx, suite, snapshotID, packageHashes, tracker)
 
-	// SPEC4 §7.5.2 site 5: heartbeat right before CommitAdoption.
-	// Resets the grace clock at the latest possible moment before
-	// the adopted_at flip becomes the source of truth, defending
-	// against writer-queue depth between runHotPrefetch returning
-	// and CommitAdoption actually committing.
+	// SPEC4 §7.5.2 site 5: heartbeat at the end of the member pipeline,
+	// before the flip barrier and CommitAdoption. The barrier may wait up
+	// to 140 s before the commit; the site 6 ticker keeps heartbeating
+	// until the adoption returns (phase C design note 9), so the grace
+	// clock stays fresh through that wait and any writer-queue depth.
 	a.heartbeat(ctx, suite.CanonicalHost, snapshotID, tracker)
 
 	// Spec C4: the member pipeline is over; free the host slot so the

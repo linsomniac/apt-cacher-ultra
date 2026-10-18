@@ -136,6 +136,21 @@ func TestServeHTTP_RetainedByHashServesTheDisplacedSnapshot(t *testing.T) {
 	}
 }
 
+// A by-hash alias directly under the suite root — the dists root's
+// Contents-* aliases today, every flat suite's indexes from phase G — is
+// matched by byHashMemberRE's ^ alternative and retained like any other
+// (final review, spec M7).
+func TestServeHTTP_RetainedByHashServesASuiteRootAlias(t *testing.T) {
+	h, _ := newDisplacedHandler(t, 3, nil)
+	alias := "by-hash/SHA256/" + sha256Hex([]byte("Contents-amd64 one"))
+	id1 := adoptWithMembers(t, h, "one", map[string]string{alias: "Contents-amd64 one"})
+	adoptWithMembers(t, h, "two", nil)
+	rec := getMember(t, h, alias)
+	if rec.Code != http.StatusOK || rec.Body.String() != "Contents-amd64 one" || rec.Header().Get(hdrXCacheSnapshot) != itoa(id1) {
+		t.Fatalf("got %d %q from snapshot %q; want 200 from %d", rec.Code, rec.Body.String(), rec.Header().Get(hdrXCacheSnapshot), id1)
+	}
+}
+
 // A SHA256 alias is served only when its blob is the hash the URL names,
 // and a pool blob that no displaced snapshot declares is never served for
 // an adopted suite (stray-blob negatives).
