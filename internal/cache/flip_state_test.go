@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 )
 
@@ -45,8 +46,14 @@ func TestCommitAdoption_FlipDescribesAdoptedAnchor(t *testing.T) {
 		t.Fatalf("inrelease_change_seen_at = %d, want cleared", *s.InReleaseChangeSeenAt)
 	}
 	assertNoRecord(t, "after flip", s)
-	if s.CheckFailCount != 2 || *s.LastCheckAt != check || *s.LastSuccessAt != success {
-		t.Fatalf("flip touched check state: fail=%d check=%v success=%v", s.CheckFailCount, *s.LastCheckAt, *s.LastSuccessAt)
+	orNeg := func(p *int64) int64 {
+		if p == nil {
+			return -1
+		}
+		return *p
+	}
+	if s.CheckFailCount != 2 || orNeg(s.LastCheckAt) != check || orNeg(s.LastSuccessAt) != success {
+		t.Fatalf("flip touched check state: fail=%d check=%d success=%d", s.CheckFailCount, orNeg(s.LastCheckAt), orNeg(s.LastSuccessAt))
 	}
 }
 
@@ -97,5 +104,97 @@ func TestInsertCandidateSnapshot_NaturalKeyErrorNamesTheSnapshot(t *testing.T) {
 	var nk *NaturalKeyAdoptedError
 	if !errors.As(err, &nk) || nk.SnapshotID != id || !errors.Is(err, ErrSnapshotNaturalKeyAdopted) {
 		t.Fatalf("err = %v, want *NaturalKeyAdoptedError{%d} wrapping ErrSnapshotNaturalKeyAdopted", err, id)
+	}
+}
+
+func adoptedAtOf(t *testing.T, c *Cache, id int64) int64 {
+	t.Helper()
+	snap, err := c.GetSuiteSnapshot(context.Background(), id)
+	if err != nil || snap.AdoptedAt == nil {
+		t.Fatalf("snapshot %d: adopted_at %v (err %v)", id, snap, err)
+	}
+	return *snap.AdoptedAt
+}
+
+// Spec C8 monotonic Last-Modified: adopted_at = max(now, prior + 1), so
+// two flips in one second, or one after a backward clock step, still move
+// it forward; a forward step is taken as is.
+func TestCommitAdoption_AdoptedAtIsMonotonic(t *testing.T) {
+	c := openCache(t)
+	stamp := func(now int64, content string) int64 {
+		restore := stubNow(t, now)
+		defer restore()
+		return adoptedAtOf(t, c, commitCandidate(t, c, SnapshotCandidate{}, content))
+	}
+	got := []int64{
+		stamp(1_000_000, "monotonic one"),
+		stamp(1_000_000, "monotonic two"),  // same second
+		stamp(500_000, "monotonic three"),  // the clock stepped back
+		stamp(2_000_000, "monotonic four"), // and forward
+	}
+	if want := []int64{1_000_000, 1_000_001, 1_000_002, 2_000_000}; !slices.Equal(got, want) {
+		t.Fatalf("adopted_at = %v, want %v", got, want)
+	}
+}
+
+// A first adoption must pass the anchors clients were served from the
+// url_path cache: max(now, the newest anchor last_fetched_at + 1), read
+// before CommitAdoption Step 3c re-seeds those rows with now.
+func TestCommitAdoption_FirstAdoptionPassesTheServedAnchors(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	putAnchor := func(file string, fetched int64) {
+		h := seedBlob(t, c, "served "+file)
+		if err := c.PutURLPath(ctx, URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: afSuite + file,
+			BlobHash: &h, UpstreamURL: "http://h" + afSuite + file, IsMetadata: true, LastFetchedAt: &fetched}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putAnchor("/InRelease", 1_400_000)
+	putAnchor("/Release", 1_500_000)
+	putAnchor("/Release.gpg", 1_600_000)
+	restore := stubNow(t, 1_000_000) // the clock stepped back after those fetches
+	id := commitCandidate(t, c, SnapshotCandidate{}, "first adoption")
+	restore()
+	if got := adoptedAtOf(t, c, id); got != 1_600_001 {
+		t.Fatalf("adopted_at = %d, want 1600001 (newest anchor fetch + 1)", got)
+	}
+}
+
+func TestCommitAdoption_FirstAdoptionKeepsNowPastOlderAnchors(t *testing.T) {
+	c := openCache(t)
+	h := seedBlob(t, c, "served InRelease")
+	fetched := int64(900_000)
+	if err := c.PutURLPath(context.Background(), URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: afSuite + "/InRelease",
+		BlobHash: &h, UpstreamURL: "http://h" + afSuite + "/InRelease", IsMetadata: true, LastFetchedAt: &fetched}); err != nil {
+		t.Fatal(err)
+	}
+	restore := stubNow(t, 1_000_000)
+	id := commitCandidate(t, c, SnapshotCandidate{}, "first adoption, newer clock")
+	restore()
+	if got := adoptedAtOf(t, c, id); got != 1_000_000 {
+		t.Fatalf("adopted_at = %d, want now (1000000)", got)
+	}
+}
+
+// Each anchor file a client may have been served counts on its own: a
+// detached suite's clients hold Release (and Release.gpg), not InRelease.
+func TestCommitAdoption_FirstAdoptionPassesEachServedAnchorFile(t *testing.T) {
+	for _, file := range []string{"/InRelease", "/Release", "/Release.gpg"} {
+		t.Run(file, func(t *testing.T) {
+			c := openCache(t)
+			h := seedBlob(t, c, "served "+file)
+			fetched := int64(1_600_000)
+			if err := c.PutURLPath(context.Background(), URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: afSuite + file,
+				BlobHash: &h, UpstreamURL: "http://h" + afSuite + file, IsMetadata: true, LastFetchedAt: &fetched}); err != nil {
+				t.Fatal(err)
+			}
+			restore := stubNow(t, 1_000_000)
+			id := commitCandidate(t, c, SnapshotCandidate{}, "first adoption after "+file)
+			restore()
+			if got := adoptedAtOf(t, c, id); got != 1_600_001 {
+				t.Fatalf("adopted_at = %d, want 1600001 (the served %s's fetch + 1)", got, file)
+			}
+		})
 	}
 }

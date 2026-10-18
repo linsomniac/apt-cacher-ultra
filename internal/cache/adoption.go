@@ -27,6 +27,7 @@ var ErrSnapshotRetired = errors.New("cache: snapshot is retired")
 // surfaces this as a distinct WARN; auto-reusing an adopted row is
 // out of scope (would bypass the lifecycle and refcount accounting
 // in CommitAdoption).
+// It arrives wrapped in a *NaturalKeyAdoptedError (errors.Is matches it; errors.As recovers the snapshot id).
 var ErrSnapshotNaturalKeyAdopted = errors.New("cache: snapshot natural key already adopted")
 
 // NaturalKeyAdoptedError names the adopted snapshot a candidate collided
@@ -313,7 +314,7 @@ type PrefetchedURLPath struct {
 //     row's validators to the candidate's, and clear
 //     inrelease_change_seen_at and the adoption failure record (spec C4,
 //     C7).
-//  7. Stamp suite_snapshot.adopted_at = now.
+//  7. Stamp suite_snapshot.adopted_at (adoptionStampTx: max(now, prior + 1)).
 //  8. If prior_id was non-NULL, decrement refcount for each distinct
 //     blob_hash referenced by the prior snapshot's members. A blob
 //     shared between old and new nets to zero (+1 then -1) so the
@@ -462,6 +463,12 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		// in the first place, dropping it from the next adoption's
 		// hot-set computation.
 		now := nowUnix()
+		// Spec C8 (monotonic Last-Modified): the adoption stamp, taken
+		// before Step 3c re-seeds the url_path anchor rows with now.
+		stamp, err := adoptionStampTx(ctx, tx, scheme, host, suite, now)
+		if err != nil {
+			return fmt.Errorf("CommitAdoption: %w", err)
+		}
 		for _, up := range prefetchedURLPaths {
 			if !validBlobHash(up.BlobHash) {
 				return fmt.Errorf("CommitAdoption: prefetched %q blob_hash %w", up.Path, ErrInvalidHash)
@@ -629,14 +636,13 @@ ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
 			return fmt.Errorf("CommitAdoption: flip pointer: %w", err)
 		}
 
-		// Step 7: mark the new snapshot adopted. Reuses `now` captured
-		// at the top of the transaction for step 3a's last_fetched_at
-		// — both writes belong to the same logical commit moment, so a
-		// shared timestamp is more honest than two separate
-		// nowUnix() calls.
+		// Step 7: mark the new snapshot adopted with the spec C8 stamp:
+		// `now` (the commit moment Step 3a also uses) unless the previous
+		// anchor's stamp is not older, which keeps a client's
+		// If-Modified-Since from hiding the flip.
 		if _, err := tx.ExecContext(ctx, `
 UPDATE suite_snapshot SET adopted_at = ? WHERE snapshot_id = ?`,
-			now, snapshotID); err != nil {
+			stamp, snapshotID); err != nil {
 			return fmt.Errorf("CommitAdoption: stamp adopted_at: %w", err)
 		}
 
@@ -692,6 +698,47 @@ UPDATE blob
 	return nil
 }
 
+// adoptionStampTx returns the adopted_at a commit at now stamps (spec C8,
+// monotonic Last-Modified): max(now, prior.adopted_at + 1) when the suite
+// has a current snapshot; for a first adoption, max(now, the newest
+// last_fetched_at of the suite's InRelease/Release/Release.gpg url_path
+// rows + 1) — those rows are what clients were served, with that
+// Last-Modified or older. The handler serves snapshot anchors with
+// max(pool mtime, adopted_at), so a client's If-Modified-Since from the
+// previous anchor always gets a 200 after a flip, even across a backward
+// clock step.
+//
+// AIDEV-NOTE: call it before CommitAdoption Step 3c, which re-seeds the
+// anchor rows' last_fetched_at with now. adopted_at's other readers (GC's
+// keep_displaced ranking, the admin page) only need its order, which this
+// keeps equal to the commit order per suite.
+func adoptionStampTx(ctx context.Context, tx *sql.Tx, scheme, host, suite string, now int64) (int64, error) {
+	var prior sql.NullInt64
+	err := tx.QueryRowContext(ctx, `
+SELECT s.adopted_at
+  FROM suite_freshness f
+  JOIN suite_snapshot s ON s.snapshot_id = f.current_snapshot_id
+ WHERE f.canonical_scheme = ? AND f.canonical_host = ? AND f.suite_path = ?`,
+		scheme, host, suite).Scan(&prior)
+	switch {
+	case err == nil && prior.Valid:
+		return max(now, prior.Int64+1), nil
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return 0, fmt.Errorf("read prior adopted_at: %w", err)
+	}
+	var fetched sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+SELECT MAX(last_fetched_at) FROM url_path
+ WHERE canonical_scheme = ? AND canonical_host = ? AND path IN (?, ?, ?)`,
+		scheme, host, suite+"/InRelease", suite+"/Release", suite+"/Release.gpg").Scan(&fetched); err != nil {
+		return 0, fmt.Errorf("read anchor last_fetched_at: %w", err)
+	}
+	if fetched.Valid {
+		return max(now, fetched.Int64+1), nil
+	}
+	return now, nil
+}
+
 // GetSuiteSnapshot returns the suite_snapshot row by id, or ErrNotFound.
 // Read path; reads use the connection pool freely.
 func (c *Cache) GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*SuiteSnapshot, error) {
@@ -743,6 +790,48 @@ WHERE snapshot_id = ? AND path = ?`
 		return nil, fmt.Errorf("GetSnapshotMember: %w", err)
 	}
 	return &m, nil
+}
+
+// DisplacedSnapshotMembers returns the snapshot_member rows at path in the
+// suite's newest limit adopted, non-retired snapshots other than
+// currentID — its displaced snapshots — newest first (spec C8 retained
+// by-hash). limit bounds the snapshots searched, not the rows returned: a
+// member only an older displaced snapshot holds is not found. limit <= 0
+// returns nothing.
+//
+// AIDEV-NOTE: retired snapshots (quarantined at upgrade, or reaped from
+// phase F) never serve, so the retired_at filter is load-bearing.
+func (c *Cache) DisplacedSnapshotMembers(ctx context.Context, scheme, host, suitePath, path string, currentID int64, limit int) ([]SnapshotMember, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := c.db.QueryContext(ctx, `
+SELECT m.snapshot_id, m.path, m.blob_hash, m.declared_sha256
+  FROM (SELECT snapshot_id, adopted_at
+          FROM suite_snapshot
+         WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?
+           AND adopted_at IS NOT NULL AND retired_at IS NULL AND snapshot_id <> ?
+         ORDER BY adopted_at DESC, snapshot_id DESC
+         LIMIT ?) s
+  JOIN snapshot_member m ON m.snapshot_id = s.snapshot_id AND m.path = ?
+ ORDER BY s.adopted_at DESC, s.snapshot_id DESC`,
+		scheme, host, suitePath, currentID, limit, path)
+	if err != nil {
+		return nil, fmt.Errorf("DisplacedSnapshotMembers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []SnapshotMember
+	for rows.Next() {
+		var m SnapshotMember
+		if err := rows.Scan(&m.SnapshotID, &m.Path, &m.BlobHash, &m.DeclaredSHA256); err != nil {
+			return nil, fmt.Errorf("DisplacedSnapshotMembers: scan: %w", err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("DisplacedSnapshotMembers: %w", err)
+	}
+	return out, nil
 }
 
 // ListSnapshotMembers returns every snapshot_member row for the snapshot,
