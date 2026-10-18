@@ -121,6 +121,63 @@ func htmlRowStart(html string, offset int) string {
 	return html[trStart : trStart+end+1]
 }
 
+// Controller ruling (task-14 review round 1, spec C7): a refusal reason
+// where the cache already serves content at least as new as upstream
+// (upstream_older, rollback_refused) must not accrue lag.
+// RecordAdoptionFailure never clears inrelease_change_seen_at, and
+// deferred checks keep bumping it, so an unsuppressed row would show
+// growing "(lagging …)" text and eventually push the Suites vital to
+// warn and then crit for a suite that isn't actually behind. A refusal
+// for a reason where the cache really is behind (the phase E reasons,
+// represented here by unsigned_downgrade_refused) keeps today's lag
+// behaviour.
+func TestBuildSuiteEntries_RefusalLagSuppression(t *testing.T) {
+	const now = int64(1_800_000_000)
+	twoDaysAgo := now - 2*86400
+
+	mk := func(reason string) cache.SuiteWithAdoption {
+		return cache.SuiteWithAdoption{SuiteFreshness: cache.SuiteFreshness{
+			CanonicalHost: "h", SuitePath: "/x", AdoptionFailReason: pstr(reason),
+			AdoptionFailCount: 1, AdoptionFailFirstAt: p64(now - 60),
+			InReleaseChangeSeenAt: p64(twoDaysAgo),
+		}}
+	}
+
+	for _, reason := range []string{cache.ReasonUpstreamOlder, cache.ReasonRollbackRefused} {
+		t.Run(reason, func(t *testing.T) {
+			got := buildSuiteEntries([]cache.SuiteWithAdoption{mk(reason)}, now)
+			e := got[0]
+			if e.LagWarn || e.LagSeconds != 0 || e.Lagging != "" {
+				t.Errorf("reason %q: lag = %q / %d / warn %v; want suppressed (empty / 0 / false)",
+					reason, e.Lagging, e.LagSeconds, e.LagWarn)
+			}
+			m := htmlRenderModel{statusModel: statusModel{Suites: []suiteEntry{e}}}
+			if got := vitalState("suites", m); got != "ok" {
+				t.Errorf("reason %q: vitalState(suites) = %q; want ok", reason, got)
+			}
+			render := newHealthyModel()
+			render.Suites = []suiteEntry{e}
+			html := renderHTMLForGolden(t, render)
+			if row := htmlRowStart(html, strings.Index(html, `data-label="Host" class="host">h<`)); strings.Contains(row, `data-state="warn"`) {
+				t.Errorf("reason %q: rendered row unexpectedly carries data-state=\"warn\": %s", reason, row)
+			}
+		})
+	}
+
+	// A refusal reason where the cache really is behind keeps the
+	// ordinary lag behaviour and can still push the vital to crit.
+	got := buildSuiteEntries([]cache.SuiteWithAdoption{mk(cache.ReasonUnsignedDowngradeRefused)}, now)
+	e := got[0]
+	if !e.LagWarn || e.LagSeconds != 2*86400 || e.Lagging == "" {
+		t.Errorf("unsigned_downgrade_refused: lag = %q / %d / warn %v; want lag preserved",
+			e.Lagging, e.LagSeconds, e.LagWarn)
+	}
+	m := htmlRenderModel{statusModel: statusModel{Suites: []suiteEntry{e}}}
+	if got := vitalState("suites", m); got != "crit" {
+		t.Errorf("unsigned_downgrade_refused: vitalState(suites) = %q; want crit", got)
+	}
+}
+
 func TestLaggingAnnotation_FromFirstSighting(t *testing.T) {
 	const now = int64(100_000)
 	cases := []struct {

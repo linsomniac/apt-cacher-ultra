@@ -246,13 +246,17 @@ type suiteEntry struct {
 	CurrentSnapshotAdoptedAtUnixTime *int64 `json:"current_snapshot_adopted_at_unixtime"`
 	InReleaseChangeSeenAtUnixTime    *int64 `json:"inrelease_change_seen_at_unixtime"`
 
-	// Lagging is the SPEC5 §12.2.4 HTML annotation rendered next
-	// to InReleaseChangeSeenAtUnixTime when the upstream advertised
-	// a newer InRelease that we haven't successfully refetched yet.
-	// Empty otherwise. Excluded from JSON — consumers compute the
-	// signal themselves from the two timestamps. Format: "(lagging
-	// Xh Ym)" / "(lagging Xm)" matching the operator-facing
-	// duration helper.
+	// Lagging renders "(lagging Xh Ym)" / "(lagging Xm)" while an
+	// upstream InRelease change first seen at
+	// InReleaseChangeSeenAtUnixTime has not been adopted — the lag runs
+	// from that first sighting to now (spec C7), not the retired
+	// two-stamp comparison against last_success_at (which every check
+	// bumps, so it could never fire). Empty when there is nothing to
+	// show: no sighting yet, a future stamp (clock step), or a refusal
+	// reason where the cache already serves content at least as new as
+	// upstream (see refusalKeepsCurrent) — there the "refused: …" text
+	// in AdoptionStatus is the signal, not a lag. Excluded from JSON —
+	// consumers compute the signal themselves from the record.
 	Lagging string `json:"-"`
 
 	// Spec C7 "Visibility" (phase B). AnchorForm is "" for a suite with no
@@ -592,12 +596,22 @@ func buildSuiteEntries(rows []cache.SuiteWithAdoption, now int64) []suiteEntry {
 			AdoptionFailFirstUnixTime:        r.AdoptionFailFirstAt,
 			AdoptionNextRetryUnixTime:        r.AdoptionNextRetryAt,
 		}
-		e.Lagging, e.LagSeconds = laggingAnnotation(r.InReleaseChangeSeenAt, now)
-		e.LagWarn = e.LagSeconds > 3600
 		if r.AdoptionFailCount > 0 && r.AdoptionFailReason != nil {
 			e.AdoptionRefused = cache.IsRefusalReason(*r.AdoptionFailReason)
 			e.AdoptionFailing = !e.AdoptionRefused
 			e.AdoptionStatus = adoptionStatus(r.SuiteFreshness, e.AdoptionRefused, now)
+		}
+		// A refusal whose reason means the cache already serves content
+		// at least as new as upstream (refusalKeepsCurrent) keeps its
+		// first-sighting inrelease_change_seen_at forever — RecordAdoptionFailure
+		// never clears it, and deferred checks keep bumping it. Showing
+		// that as growing lag would eventually push the Suites vital to
+		// warn/crit for a suite that isn't actually behind (spec C7: a
+		// refusal is a state, not a failure). Suppress the lag for those
+		// rows; the "refused: …" text in AdoptionStatus is the signal.
+		if !e.AdoptionRefused || !refusalKeepsCurrent(*r.AdoptionFailReason) {
+			e.Lagging, e.LagSeconds = laggingAnnotation(r.InReleaseChangeSeenAt, now)
+			e.LagWarn = e.LagSeconds > 3600
 		}
 		out = append(out, e)
 	}
@@ -633,6 +647,36 @@ func adoptionStatus(s cache.SuiteFreshness, refused bool, now int64) string {
 		since = now - *s.AdoptionFailFirstAt
 	}
 	return "adoption failing " + durationOf(since) + " · " + *s.AdoptionFailReason + " · " + retry
+}
+
+// refusalKeepsCurrent reports whether an adoption refusal for the given
+// reason leaves the cache already serving content at least as new as
+// upstream, so there is nothing to catch up on and buildSuiteEntries
+// must not render it as lag (spec C7: a refusal is a state, not a
+// failure; RecordAdoptionFailure never clears inrelease_change_seen_at
+// and deferred checks keep bumping it, so an unsuppressed row would
+// accrue lag forever and eventually push the Suites vital to warn and
+// then crit for a suite that isn't actually behind).
+//
+//   - ReasonUpstreamOlder: upstream's Release Date is older than (or
+//     missing after) the current snapshot's — the cache is ahead or tied.
+//   - ReasonRollbackRefused: upstream is serving content identical to an
+//     older snapshot the cache already replaced (a flapping mirror) —
+//     not a step backward for the cache.
+//
+// Every other refusal reason — the phase E reasons
+// (unsigned_downgrade_refused, unsigned_unconfirmed, unsigned_too_large,
+// anchor_absent) — means the cache really is behind (e.g. a vendor that
+// stopped signing), so those keep the ordinary lag behaviour; the
+// operator must act (the spec's POST /forget escape hatch). Extend the
+// case list here, not at the call site, when phase E adds reasons that
+// also leave the cache current.
+func refusalKeepsCurrent(reason string) bool {
+	switch reason {
+	case cache.ReasonUpstreamOlder, cache.ReasonRollbackRefused:
+		return true
+	}
+	return false
 }
 
 func buildHotURLEntries(rows []cache.HotURLPath) []hotURLEntry {
