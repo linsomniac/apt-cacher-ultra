@@ -528,6 +528,9 @@ func TestCheck_GateCloseInTheBarrierRecordsNothing(t *testing.T) {
 		if st := r.gate.Stats(); st.Aborted != 1 {
 			t.Fatalf("gate stats = %+v, want one aborted flip", st)
 		}
+		if evs := r.barrierEvents(); len(evs) != 0 {
+			t.Fatalf("adoption_flip_barrier events %v after Close, want none", evs)
+		}
 	})
 }
 

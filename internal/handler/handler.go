@@ -2082,14 +2082,17 @@ func retryAfterForRequest(req *proxy.Request) string {
 
 // packageValidation carries the SPEC6_5 §2.3 validated_hash +
 // package_name signal from a hash-validation site (hit-path
-// checkPackageHash or miss-path post-fetch dispatch) back to logRequest.
+// checkPackageHash or miss-path post-fetch dispatch) back to logRequest,
+// and spec C8's snapshot provenance flag (SnapshotDisplaced) from
+// trySnapshotHit.
 //
 // Validated is true iff the served bytes were matched against a
 // package_hash row's declared SHA256. PackageName is the matching row's
 // Phase 3 v3 package_name column — empty when the row has no package
 // name (pdiff patches, legacy pre-v3 rows). The zero value
 // (`packageValidation{}`) means "no validation occurred for this
-// request" and emits neither field.
+// request, served from no displaced snapshot" and emits none of the
+// three fields.
 type packageValidation struct {
 	Validated   bool
 	PackageName string
@@ -2110,9 +2113,12 @@ func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, s
 
 // logRequestWithValidation is the SPEC6_5 §2.3 variant: also emits
 // validated_hash + package_name when the caller's validation argument
-// indicates a hash-validated serve. Fields are emitted only when
-// meaningful — the false / empty cases are omitted to match the
-// existing field-presence-as-signal pattern (`mitm`, `upstream_status`).
+// indicates a hash-validated serve, snapshot_displaced for a spec C8
+// retained by-hash serve, and flip_held_ms (from the request context)
+// for an anchor request that waited in a flip hold. Fields are emitted
+// only when meaningful — the false / empty / zero cases are omitted to
+// match the existing field-presence-as-signal pattern (`mitm`,
+// `upstream_status`).
 //
 // AIDEV-NOTE: never log r.RequestURI directly — proxy-form requests can
 // (in principle) carry userinfo like http://user:pass@host/path. The
