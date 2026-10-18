@@ -118,6 +118,7 @@ Each item is owned by the phase it is listed under; that phase's plan addresses 
 **E:**
 
 - Production unsigned candidates must set `SnapshotCandidate.Form` explicitly; derivation from hashes is for legacy and fixture callers only.
+- `checkLockedInline` and `checkLockedDetached` share long verbatim blocks after phase B (gated 304, unchanged + record clear, the persist/clear/log/metric tail; Task 7 review). E's probe-tree rewrite of the check path folds them into one shared tail (e.g. `finishCheck`) and one 304/unchanged helper, so record-clearing and the `freshness_check` line live in one place.
 - Slot-driven admission (phase B Task 11b): the probe-tree check sets `out.report` on every exit; `isQueuedResult` includes `first_adoption_queued`; first and unsigned requests pass `signedCurrent = false`. The capacity simulation gains the upgrade-burst scenario: 50 never-adopted suites with interest and a trickle of signed changes → first adoptions back to back, signed suites never wait longer than one adoption, each queued suite costs at most two probes. Document `max_concurrent_adoptions = 3` as the knob that lets two first adoptions run during the burst.
 - `checkLockedDetached` (still tests `ReleaseHash != nil`) and `snapshotAnchorHash`'s `Release` case need `Form` dispatch for unsigned.
 - `suite_signed_seen.last_seen_at` is a past-event stamp under C4: a future stamp counts as infinitely old and is healed on the next observation. The anchor pass copies `MAX(last_requested_at, last_fetched_at)` verbatim.
