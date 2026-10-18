@@ -105,9 +105,15 @@ func TestNew_QuietBounds(t *testing.T) {
 		}
 	}
 	// Phase B (b) can always be satisfied inside a hold only because a
-	// whole quiet period fits in one (design review M18).
+	// whole quiet period fits in one (design review M18) — before the
+	// commit margin, so that every hold commits by HoldMax − CommitMargin
+	// and answers its held requests from the new snapshot (final review,
+	// concurrency Important 1).
 	if MaxQuiet >= HoldMax {
 		t.Errorf("MaxQuiet %v must stay below HoldMax %v", MaxQuiet, HoldMax)
+	}
+	if MaxQuiet > HoldMax-CommitMargin {
+		t.Errorf("MaxQuiet %v must not exceed HoldMax %v − CommitMargin %v", MaxQuiet, HoldMax, CommitMargin)
 	}
 }
 
@@ -317,13 +323,17 @@ func TestFlip_BusySuiteIsHeldAndAnsweredFromTheNewGeneration(t *testing.T) {
 
 // Phase B is bounded by 20 s (spec §7 C8 "slow reader"): a read slower
 // than the hold (but faster than apt's timeout) is in flight when the
-// hold starts, so the suite never goes quiet; the hold expires at 20 s,
-// the commit starts then, the held requests are answered, and the expiry
-// is counted.
-func TestFlip_SlowReaderExpiresTheHoldAt20s(t *testing.T) {
+// hold starts, so the suite never goes quiet. No other hold ended, so
+// phase B (b) holds; the hold waits for local quiet only until HoldMax −
+// CommitMargin (15 s), then commits inside the hold and answers the held
+// requests from the new snapshot. The slow reader is the late reader: the
+// counted residual (acu_flip_quiet_cut_short_total); the hold never
+// reaches its bound.
+func TestFlip_SlowReaderCutsTheQuietShortInsideTheHold(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := newTestGate(t)
 		expired := counterValue(t, "acu_flip_hold_expired_total")
+		cutShort := counterValue(t, "acu_flip_quiet_cut_short_total")
 		var wg sync.WaitGroup
 		for _, at := range []time.Duration{0, 20 * time.Second, 40 * time.Second, 59500 * time.Millisecond} {
 			wg.Add(1)
@@ -349,22 +359,72 @@ func TestFlip_SlowReaderExpiresTheHoldAt20s(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res.Outcome != OutcomeHoldExpired || !res.Committed || res.HoldEnd.Sub(res.HoldStart) != HoldMax {
-			t.Fatalf("result = %+v, want a hold that expired after %v and then committed", res, HoldMax)
+		if res.Outcome != OutcomeQuietCutShort || !res.Committed || res.HoldEnd.Sub(res.HoldStart) != HoldMax-CommitMargin {
+			t.Fatalf("result = %+v, want a hold that committed after %v, before the suite was quiet", res, HoldMax-CommitMargin)
 		}
-		if got := committedAt.Sub(start); got != PhaseAMax+HoldMax {
-			t.Fatalf("committed %v after the start, want %v", got, PhaseAMax+HoldMax)
+		if got := committedAt.Sub(start); got != PhaseAMax+HoldMax-CommitMargin {
+			t.Fatalf("committed %v after the start, want %v", got, PhaseAMax+HoldMax-CommitMargin)
 		}
-		if w := <-waited; w != 10*time.Second {
-			t.Fatalf("the held request waited %v, want 10s (until the hold expired)", w)
+		if w := <-waited; w != 5*time.Second {
+			t.Fatalf("the held request waited %v, want 5s (until the commit at 15s into the hold)", w)
 		}
-		if st := g.Stats(); st.HoldsExpired != 1 {
-			t.Fatalf("stats = %+v, want one expired hold", st)
+		if st := g.Stats(); st.HoldsExpired != 0 || st.QuietCutShort != 1 {
+			t.Fatalf("stats = %+v, want one hold cut short and none expired", st)
+		}
+		if got := counterValue(t, "acu_flip_quiet_cut_short_total") - cutShort; got != 1 {
+			t.Fatalf("acu_flip_quiet_cut_short_total rose by %v, want 1", got)
+		}
+		if got := counterValue(t, "acu_flip_hold_expired_total") - expired; got != 0 {
+			t.Fatalf("acu_flip_hold_expired_total rose by %v, want 0", got)
+		}
+		wg.Wait()
+	})
+}
+
+// The expiry stays the backstop for a commit that has not started by the
+// bound. In production phase B (b) is always satisfied by HoldMax −
+// CommitMargin (MaxQuiet ≤ HoldMax − CommitMargin); this test shortens the
+// hold below the quiet period so that it is not: b's hold starts when a's
+// hold, which held a request, ends, and the cross-suite quiet period
+// outlasts b's 8 s hold. At the bound b's hold ends, the request waiting in
+// it is answered, and the commit starts then (counted).
+func TestFlip_ExpiryBackstopStartsACommitNotYetStarted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		g.phaseAMax, g.holdMax = time.Second, 8*time.Second
+		expired := counterValue(t, "acu_flip_hold_expired_total")
+		release := make(chan struct{})
+		outA := flipAsync(bg, g, "a", func() error { <-release; return nil }) // idle: holds at once
+		synctest.Wait()
+		go func() { g.AnchorStart(bg, "a").Done() }() // waits in a's hold: a's hold held a request
+		time.Sleep(500 * time.Millisecond)
+		outB := flipAsync(bg, g, "b", noCommit) // phase A gives up at 1.5 s; then it queues for the token
+		time.Sleep(2500 * time.Millisecond)
+		close(release) // a's hold ends at 3 s; b's starts then
+		waited := make(chan time.Duration, 1)
+		go func() {
+			time.Sleep(2 * time.Second)
+			start := time.Now()
+			g.AnchorStart(bg, "b").Done() // 5 s: waits in b's hold
+			waited <- time.Since(start)
+		}()
+		if a := <-outA; a.err != nil || a.res.Outcome != OutcomeHeld {
+			t.Fatalf("a: %+v, %v; want a held commit", a.res, a.err)
+		}
+		b := <-outB
+		if b.err != nil || b.res.Outcome != OutcomeHoldExpired || !b.res.Committed {
+			t.Fatalf("b: %+v, %v; want a hold that expired before its commit started", b.res, b.err)
+		}
+		if b.res.HoldEnd.Sub(b.res.HoldStart) != 8*time.Second || b.at.Sub(b.res.HoldStart) != 8*time.Second {
+			t.Fatalf("b held from %v until %v and committed at %v; want the hold to end, and the commit to start, at its 8s bound",
+				b.res.HoldStart, b.res.HoldEnd, b.at)
+		}
+		if w := <-waited; w != 6*time.Second {
+			t.Fatalf("the request held in b's hold waited %v, want 6s (until the bound)", w)
 		}
 		if got := counterValue(t, "acu_flip_hold_expired_total") - expired; got != 1 {
 			t.Fatalf("acu_flip_hold_expired_total rose by %v, want 1", got)
 		}
-		wg.Wait()
 	})
 }
 
@@ -490,7 +550,7 @@ func TestFlip_HoldTokenTimeoutCommitsUnheld(t *testing.T) {
 		busyReaders(g, "a", 0, 500*time.Millisecond, 50*time.Millisecond, until, &wg)
 		busyReaders(g, "b", 7*time.Millisecond, 500*time.Millisecond, 50*time.Millisecond, until, &wg)
 		wg.Add(1)
-		go func() { // a read slower than the hold keeps a's hold going to its bound
+		go func() { // a read slower than the hold keeps a's hold going until it is cut short
 			defer wg.Done()
 			time.Sleep(900 * time.Millisecond)
 			tok := g.AnchorStart(bg, "a")
@@ -498,7 +558,7 @@ func TestFlip_HoldTokenTimeoutCommitsUnheld(t *testing.T) {
 			tok.Done()
 		}()
 		synctest.Wait()                         // the first reads are registered
-		outA := flipAsync(bg, g, "a", noCommit) // phase A gives up at 1 s; holds 1 s..21 s
+		outA := flipAsync(bg, g, "a", noCommit) // phase A gives up at 1 s; holds 1 s..16 s
 		time.Sleep(10 * time.Millisecond)
 		start := time.Now()
 		res, err := g.Flip(bg, "b", noCommit) // phase A until 1.01 s, then 5 s for the token
@@ -523,8 +583,8 @@ func TestFlip_HoldTokenTimeoutCommitsUnheld(t *testing.T) {
 		if queued != 0 {
 			t.Fatalf("%d flips still queued for the token after timing out", queued)
 		}
-		if a := <-outA; a.err != nil || a.res.Outcome != OutcomeHoldExpired {
-			t.Fatalf("a: %+v, %v; want its hold to run to the bound", a.res, a.err)
+		if a := <-outA; a.err != nil || a.res.Outcome != OutcomeQuietCutShort {
+			t.Fatalf("a: %+v, %v; want its hold to run until it is cut short", a.res, a.err)
 		}
 		wg.Wait()
 	})
@@ -651,7 +711,7 @@ func TestFlip_ContextEndAbortsEveryPhase(t *testing.T) {
 			g.phaseAMax = time.Second
 			var wg sync.WaitGroup
 			defer wg.Wait()
-			slow := g.AnchorStart(bg, "a") // keeps a's hold going to its bound
+			slow := g.AnchorStart(bg, "a") // keeps a's hold going until it is cut short at 16 s
 			wg.Add(1)
 			go func() { defer wg.Done(); time.Sleep(25 * time.Second); slow.Done() }()
 			outA := flipAsync(bg, g, "a", noCommit) // holds from 1 s
@@ -669,7 +729,7 @@ func TestFlip_ContextEndAbortsEveryPhase(t *testing.T) {
 			if queued != 0 {
 				t.Fatalf("an aborted flip stayed in the token queue (%d queued)", queued)
 			}
-			if a := <-outA; a.err != nil || a.res.Outcome != OutcomeHoldExpired {
+			if a := <-outA; a.err != nil || a.res.Outcome != OutcomeQuietCutShort {
 				t.Fatalf("a: %+v, %v; want it unaffected", a.res, a.err)
 			}
 		})
@@ -830,7 +890,7 @@ func TestGate_PurgeKeepsOldTokensHarmless(t *testing.T) {
 func TestCounters_AreRegistered(t *testing.T) {
 	var buf bytes.Buffer
 	metrics.Default.Render(&buf)
-	for _, name := range []string{"acu_flip_hold_skipped_total", "acu_flip_hold_expired_total",
+	for _, name := range []string{"acu_flip_hold_skipped_total", "acu_flip_hold_expired_total", "acu_flip_quiet_cut_short_total",
 		"acu_flip_waiters_over_cap_total", "acu_flip_slow_anchor_reads_total", "acu_flip_gate_panics_total"} {
 		if !strings.Contains(buf.String(), "# TYPE "+name+" counter") {
 			t.Errorf("%s is not registered", name)

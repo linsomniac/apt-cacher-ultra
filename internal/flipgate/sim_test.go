@@ -52,7 +52,13 @@ func (m *gateModel) serve(anchor map[string]time.Duration) simtest.ServeFunc {
 
 // commit is a flip's commit: the next generation becomes current.
 func (m *gateModel) commit(key string) func() error {
-	return func() error { m.gens[key].Add(1); return nil }
+	return m.commitAfter(key, 0)
+}
+
+// commitAfter is a commit that takes latency, as a real one does: the next
+// generation becomes current when it returns, as a transaction's does.
+func (m *gateModel) commitAfter(key string, latency time.Duration) func() error {
+	return func() error { time.Sleep(latency); m.gens[key].Add(1); return nil }
 }
 
 // clients starts, every period from offset until until, a client that
@@ -170,18 +176,21 @@ func TestSimFlip_OverlappingHoldTrace(t *testing.T) {
 
 // Spec C8 phase B (b): a client released from another suite's hold may
 // still have this suite's index queued behind the held request. A's hold
-// lasts ~15 s (its readers are on 6 s links); B leaves phase A at its cap
-// while A holds, so it waits for the token. The trace client gets B's old
-// anchor, then waits in A's hold for A's anchor, then asks for B's index
-// — 18.5 s after B's anchor arrived, 12.5 s of that in A's hold. B is
-// quiet by itself when A's hold ends; only the cross-suite quiet period
-// keeps it from committing before that index arrives.
+// lasts ~13.5 s (its readers are on 4 s links), ending normally before
+// HoldMax − CommitMargin; B leaves phase A at its cap while A holds, so it
+// waits for the token. The trace client gets B's old anchor, then waits in
+// A's hold for A's anchor, then asks for B's index — 14.5 s after B's
+// anchor arrived, 10.5 s of that in A's hold. B is quiet by itself when
+// A's hold ends; only the cross-suite quiet period keeps it from committing
+// before that index arrives. The trace client runs on its own ledger, so
+// its two index requests are shown to fall inside the window.
 func TestSimFlip_ClientReleasedFromAnotherHold(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := newTestGate(t)
 		m := newGateModel(g, "A", "B")
-		serve := m.serve(map[string]time.Duration{"A": 6 * time.Second, "B": 50 * time.Millisecond})
+		serve := m.serve(map[string]time.Duration{"A": 4 * time.Second, "B": 50 * time.Millisecond})
 		l := simtest.NewLedger(testQuiet)
+		trace := simtest.NewLedger(testQuiet)
 		var wg sync.WaitGroup
 		t0 := time.Now()
 		clients(l, serve, []simtest.Request{{Suite: "A", Anchor: true}}, 11*time.Millisecond, 500*time.Millisecond, t0.Add(100*time.Second), &wg)
@@ -191,17 +200,17 @@ func TestSimFlip_ClientReleasedFromAnotherHold(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			time.Sleep(64003 * time.Millisecond)
-			l.RunUpdate(2000, []simtest.Request{{Suite: "B", Anchor: true}, {Suite: "A", Anchor: true}}, recordHeld(serve, &traceHeld))
+			trace.RunUpdate(2000, []simtest.Request{{Suite: "B", Anchor: true}, {Suite: "A", Anchor: true}}, recordHeld(serve, &traceHeld))
 		}()
 		time.Sleep(time.Second + 3*time.Millisecond) // both suites are busy by now
-		outA := flipAsync(bg, g, "A", m.commit("A")) // holds from 61.003 s to 76.511 s
+		outA := flipAsync(bg, g, "A", m.commit("A")) // holds from 61.003 s to 74.511 s
 		time.Sleep(2 * time.Second)
 		outB := flipAsync(bg, g, "B", m.commit("B")) // phase A gives up at 63.003 s, while A holds
 		a, b := <-outA, <-outB
 		wg.Wait()
 
-		if a.err != nil || b.err != nil {
-			t.Fatalf("A: %v; B: %v", a.err, b.err)
+		if a.err != nil || b.err != nil || a.res.Outcome != OutcomeHeld || b.res.Outcome != OutcomeHeld {
+			t.Fatalf("A: %+v, %v; B: %+v, %v; want both held, ending normally", a.res, a.err, b.res, b.err)
 		}
 		if len(traceHeld) != 2 || traceHeld[0] != 0 || traceHeld[1] == 0 {
 			t.Fatalf("the trace client's anchors were held %v, want B's not held and A's held", traceHeld)
@@ -210,23 +219,104 @@ func TestSimFlip_ClientReleasedFromAnotherHold(t *testing.T) {
 			t.Fatalf("B held from %v and committed %v after A's hold ended; want its hold to start at A's end and commit the quiet period later",
 				b.res.HoldStart, b.at.Sub(a.res.HoldEnd))
 		}
+		if n, s := trace.Checked(), trace.Straddles(); n != 2 || len(s) != 0 {
+			t.Fatalf("the trace client: %d index responses checked, straddles %+v; want both checked, none straddling", n, s)
+		}
 		if s := l.Straddles(); len(s) != 0 {
 			t.Fatalf("%d straddles, first %+v", len(s), s[0])
 		}
 	})
 }
 
+// Final review (concurrency Important 1), the expiry trace in the model: a
+// busy suite (an anchor every 500 ms over a 1 s link) and one slow reader
+// that starts 0.5 s before the hold, with a commit that takes 200 ms, as a
+// real one does. The slow reader keeps the suite from going quiet before
+// HoldMax − CommitMargin (its completion is less than a quiet period
+// before it, or still to come); phase B (b) holds, so the hold commits
+// then, inside the hold, and answers the ~31 held requests from the new
+// snapshot. Only the late reader can straddle: the 12 s one received its
+// anchor and index before the commit, the 25 s one is still receiving the
+// old anchor and fetches the new index. Releasing the held requests to the
+// old anchor at the bound, right before the commit, makes ~40 straddle.
+func TestSimFlip_SlowReaderCommitsInsideTheHold(t *testing.T) {
+	for _, tc := range []struct {
+		slow time.Duration
+		late int // straddles allowed: the slow reader's own
+	}{{12 * time.Second, 0}, {25 * time.Second, 1}} {
+		t.Run(tc.slow.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const commitLatency = 200 * time.Millisecond
+				g := newTestGate(t)
+				m := newGateModel(g, "K")
+				l := simtest.NewLedger(testQuiet)
+				cutShort := counterValue(t, "acu_flip_quiet_cut_short_total")
+				var wg sync.WaitGroup
+				t0 := time.Now()
+				clients(l, m.serve(map[string]time.Duration{"K": time.Second}), []simtest.Request{{Suite: "K", Anchor: true}},
+					11*time.Millisecond, 500*time.Millisecond, t0.Add(100*time.Second), &wg)
+				wg.Add(1)
+				go func() { // starts half a second before the hold
+					defer wg.Done()
+					time.Sleep(60503 * time.Millisecond)
+					l.RunUpdate(1000, []simtest.Request{{Suite: "K", Anchor: true}}, m.serve(map[string]time.Duration{"K": tc.slow}))
+				}()
+				time.Sleep(time.Second + 3*time.Millisecond) // the suite is busy by now
+				res, err := g.Flip(bg, "K", m.commitAfter("K", commitLatency))
+				wg.Wait()
+
+				s := l.Straddles()
+				if len(s) != tc.late {
+					t.Errorf("%d straddles, want %d (the slow reader's own); first %+v", len(s), tc.late, s[:min(len(s), 1)])
+				}
+				for _, x := range s {
+					if x.Client != 1000 {
+						t.Errorf("a client other than the slow reader straddled: %+v", x)
+						break
+					}
+				}
+				if err != nil || res.Outcome != OutcomeQuietCutShort || res.PhaseA != PhaseAMax {
+					t.Errorf("Flip = %+v, %v; want phase A to give up at its cap and the hold to commit before the suite was quiet", res, err)
+				}
+				if d := res.HoldEnd.Sub(res.HoldStart); d != HoldMax-CommitMargin+commitLatency || d > HoldMax {
+					t.Errorf("the hold lasted %v, want %v (the commit starts at HoldMax − CommitMargin), within %v",
+						d, HoldMax-CommitMargin+commitLatency, HoldMax)
+				}
+				if res.Waiters < 30 {
+					t.Errorf("the hold held %d requests, want about 31", res.Waiters)
+				}
+				if got := counterValue(t, "acu_flip_quiet_cut_short_total") - cutShort; got != 1 {
+					t.Errorf("acu_flip_quiet_cut_short_total rose by %v, want 1", got)
+				}
+				if st := g.Stats(); st.HoldsExpired != 0 || st.QuietCutShort != 1 {
+					t.Errorf("stats = %+v, want one hold cut short and none expired", st)
+				}
+				if gens := l.AnchorGens("K"); !slices.Equal(gens, []string{"1", "2"}) {
+					t.Errorf("clients saw anchor generations %v, want [1 2] (they crossed the flip)", gens)
+				}
+				if n := l.Checked(); n < 150 {
+					t.Errorf("only %d index responses checked", n)
+				}
+			})
+		})
+	}
+}
+
 // Spec C8 DoD "five busy suites flipping within 0.1 s" (plan deviation
 // 2). Each suite is read by a client every 500 ms over a slow link: an
-// anchor takes 9.02 s to send, so a hold waits ~9 s for the reads in
-// flight plus the 10 s quiet period (~19 s, near the 20 s bound). No
-// suite is ever quiet, so all five leave phase A at its 60 s cap, 20 ms
-// apart, and queue for the hold token in that order. Holds never overlap
-// and end normally; four fit inside the fifth's 60 s token wait (three
-// holds of under 20 s cannot exhaust a fourth's wait); the fifth commits
-// unheld at its deadline and is counted; held suites never straddle.
+// anchor takes 9.02 s to send, so local quiet would take ~9 s for the
+// reads in flight plus the 10 s quiet period (~19 s); each hold therefore
+// commits at HoldMax − CommitMargin (15 s), and its commit takes 200 ms,
+// as a real one does. No suite is ever quiet, so all five leave phase A
+// at its 60 s cap, 20 ms apart, and queue for the hold token in that
+// order. Holds never overlap and last at most 20 s; four fit inside the
+// fifth's 60 s token wait (three holds of under 20 s cannot exhaust a
+// fourth's wait); the fifth commits unheld at its deadline and is counted;
+// held suites never straddle (their late readers fetched their indexes
+// before the commit).
 func TestSimFlip_FiveBusySuites(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
+		const commitLatency = 200 * time.Millisecond
 		g := newTestGate(t)
 		keys := []string{"s1", "s2", "s3", "s4", "s5"}
 		m := newGateModel(g, keys...)
@@ -248,7 +338,7 @@ func TestSimFlip_FiveBusySuites(t *testing.T) {
 		for i, k := range keys {
 			time.Sleep(time.Until(t0.Add(time.Second + time.Duration(5+20*i)*time.Millisecond))) // the suites are busy by now
 			starts[i] = time.Now()
-			outs[i] = flipAsync(bg, g, k, m.commit(k))
+			outs[i] = flipAsync(bg, g, k, m.commitAfter(k, commitLatency))
 		}
 		res := make([]Result, len(keys))
 		ends := make([]time.Time, len(keys))
@@ -262,8 +352,8 @@ func TestSimFlip_FiveBusySuites(t *testing.T) {
 		wg.Wait()
 
 		for i := 0; i < 4; i++ {
-			if res[i].Outcome != OutcomeHeld {
-				t.Errorf("%s: outcome %s, want held", keys[i], res[i].Outcome)
+			if res[i].Outcome != OutcomeQuietCutShort {
+				t.Errorf("%s: outcome %s, want quiet_cut_short", keys[i], res[i].Outcome)
 			}
 			if d := res[i].HoldEnd.Sub(res[i].HoldStart); d <= 0 || d > HoldMax {
 				t.Errorf("%s held %v, want (0, %v]", keys[i], d, HoldMax)
@@ -276,19 +366,20 @@ func TestSimFlip_FiveBusySuites(t *testing.T) {
 		if r5.Outcome != OutcomeHoldSkipped || r5.TokenWait != TokenWaitMax || !r5.HoldStart.IsZero() {
 			t.Fatalf("s5: %+v, want an unheld commit after the %v token wait", r5, TokenWaitMax)
 		}
-		if got := ends[4].Sub(starts[4]); got != PhaseAMax+TokenWaitMax {
-			t.Errorf("s5 committed %v after its flip started, want %v", got, PhaseAMax+TokenWaitMax)
+		if got := ends[4].Sub(starts[4]); got != PhaseAMax+TokenWaitMax+commitLatency {
+			t.Errorf("s5's commit returned %v after its flip started, want %v (its commit started at its token deadline)",
+				got, PhaseAMax+TokenWaitMax+commitLatency)
 		}
-		if got := ends[4].Sub(res[0].HoldStart); got > TokenWaitMax+HoldMax {
+		if got := ends[4].Sub(res[0].HoldStart) - commitLatency; got > TokenWaitMax+HoldMax {
 			t.Errorf("s5 committed %v after the first hold started, want at most %v", got, TokenWaitMax+HoldMax)
 		}
 		for i, k := range keys {
-			if d := ends[i].Sub(starts[i]); d > PhaseAMax+TokenWaitMax+HoldMax {
-				t.Errorf("%s's flip took %v, more than %v", k, d, PhaseAMax+TokenWaitMax+HoldMax)
+			if d := ends[i].Sub(starts[i]) - commitLatency; d > PhaseAMax+TokenWaitMax+HoldMax {
+				t.Errorf("%s's flip took %v plus its commit, more than %v", k, d, PhaseAMax+TokenWaitMax+HoldMax)
 			}
 		}
-		if st := g.Stats(); st.Holds != 4 || st.HoldsSkipped != 1 || st.HoldsExpired != 0 {
-			t.Errorf("stats = %+v, want 4 holds, 1 skipped, 0 expired", st)
+		if st := g.Stats(); st.Holds != 4 || st.HoldsSkipped != 1 || st.HoldsExpired != 0 || st.QuietCutShort != 4 {
+			t.Errorf("stats = %+v, want 4 holds (all cut short), 1 skipped, 0 expired", st)
 		}
 		if got := counterValue(t, "acu_flip_hold_skipped_total") - skipped; got != 1 {
 			t.Errorf("acu_flip_hold_skipped_total rose by %v, want 1", got)

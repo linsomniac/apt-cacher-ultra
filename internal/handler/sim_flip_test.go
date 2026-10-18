@@ -265,43 +265,85 @@ func TestSimFlip_SharedQueueTraceEndToEnd(t *testing.T) {
 	})
 }
 
-// Spec C8: a reader on a 25 s link keeps the suite from ever going quiet
-// during the hold, so the hold ends at its 20 s bound, the commit starts
-// at once, and the expiry is counted.
-func TestSimFlip_SlowReaderEndsTheHoldAtHoldMax(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		s := newFlipStack(t, 10*time.Second)
-		const suite = "/u/dists/slow"
-		s.adopt(suite, 1)
-		before := s.gate.Stats()
-		expired := sumMetricLines(t, []string{"acu_flip_hold_expired_total"})["acu_flip_hold_expired_total"]
-		l := simtest.NewLedger(10 * time.Second)
-		var wg sync.WaitGroup
-		t0 := time.Now()
-		flipReaders(l, s.serve(time.Second, 10*time.Millisecond), []simtest.Request{{Suite: suite, Anchor: true}},
-			11*time.Millisecond, 500*time.Millisecond, t0.Add(100*time.Second), &wg)
-		wg.Add(1)
-		go func() { // starts half a second before the hold, on a 25 s link
-			defer wg.Done()
-			time.Sleep(60503 * time.Millisecond)
-			l.RunUpdate(1000, []simtest.Request{{Suite: suite, Anchor: true}}, s.serve(25*time.Second, 10*time.Millisecond))
-		}()
-		flipAt := time.Second + 3*time.Millisecond
-		time.Sleep(flipAt)
-		s.adopt(suite, 2)
-		committed := time.Since(t0)
-		wg.Wait()
+// Spec C8 slow reader, end to end (final review, concurrency Important 1:
+// the scenario this test had when it was SlowReaderEndsTheHoldAtHoldMax,
+// now with a commit that takes 200 ms, as a real one does). A busy suite
+// (an anchor every 500 ms over a 1 s link) and a reader on a 12 s or 25 s
+// link that starts half a second before the hold keep the suite from
+// going quiet before HoldMax − CommitMargin. No other hold ended, so the
+// hold commits then, inside its bound, and answers the ~31 held requests
+// from the new snapshot; only the slow reader — the late reader, counted
+// in acu_flip_quiet_cut_short_total — may straddle (the 12 s one fetched
+// its index before the commit, the 25 s one is still receiving the old
+// anchor). Answering the held requests from the old snapshot at the bound,
+// right before the commit, made 42 clients straddle.
+func TestSimFlip_SlowReaderCommitsInsideTheHold(t *testing.T) {
+	for _, tc := range []struct {
+		slow time.Duration
+		late int // straddles allowed: the slow reader's own
+	}{{12 * time.Second, 0}, {25 * time.Second, 1}} {
+		t.Run(tc.slow.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const commitLatency = 200 * time.Millisecond
+				s := newFlipStack(t, 10*time.Second)
+				const suite = "/u/dists/slow"
+				s.adopt(suite, 1)
+				s.ad.SetCommitDelayForTest(commitLatency)
+				before := s.gate.Stats()
+				names := []string{"acu_flip_hold_expired_total", "acu_flip_quiet_cut_short_total"}
+				counters := sumMetricLines(t, names)
+				l := simtest.NewLedger(10 * time.Second)
+				var wg sync.WaitGroup
+				t0 := time.Now()
+				flipReaders(l, s.serve(time.Second, 10*time.Millisecond), []simtest.Request{{Suite: suite, Anchor: true}},
+					11*time.Millisecond, 500*time.Millisecond, t0.Add(100*time.Second), &wg)
+				wg.Add(1)
+				go func() { // starts half a second before the hold
+					defer wg.Done()
+					time.Sleep(60503 * time.Millisecond)
+					l.RunUpdate(1000, []simtest.Request{{Suite: suite, Anchor: true}}, s.serve(tc.slow, 10*time.Millisecond))
+				}()
+				flipAt := time.Second + 3*time.Millisecond
+				time.Sleep(flipAt)
+				s.adopt(suite, 2)
+				committed := time.Since(t0)
+				wg.Wait()
 
-		if want := flipAt + flipgate.PhaseAMax + flipgate.HoldMax; committed != want {
-			t.Fatalf("committed at %v, want at the hold's bound, %v", committed, want)
-		}
-		if st := s.gate.Stats(); st.Holds-before.Holds != 1 || st.HoldsExpired-before.HoldsExpired != 1 {
-			t.Fatalf("stats %+v (before %+v): want one hold, expired", st, before)
-		}
-		if got := sumMetricLines(t, []string{"acu_flip_hold_expired_total"})["acu_flip_hold_expired_total"] - expired; got != 1 {
-			t.Fatalf("acu_flip_hold_expired_total rose by %v, want 1", got)
-		}
-	})
+				st := l.Straddles()
+				if len(st) != tc.late {
+					t.Errorf("%d straddles, want %d (the slow reader's own); first %+v", len(st), tc.late, st[:min(len(st), 1)])
+				}
+				for _, x := range st {
+					if x.Client != 1000 {
+						t.Errorf("a client other than the slow reader straddled: %+v", x)
+						break
+					}
+				}
+				holdStart := flipAt + flipgate.PhaseAMax // the suite is never naturally quiet
+				if want := holdStart + flipgate.HoldMax - flipgate.CommitMargin + commitLatency; committed != want || committed-holdStart > flipgate.HoldMax {
+					t.Errorf("committed at %v, want %v (the commit starts at HoldMax − CommitMargin), within the hold's %v",
+						committed, want, flipgate.HoldMax)
+				}
+				if gs := s.gate.Stats(); gs.Holds-before.Holds != 1 || gs.HoldsExpired != before.HoldsExpired ||
+					gs.QuietCutShort-before.QuietCutShort != 1 || gs.HeldRequests-before.HeldRequests < 30 {
+					t.Errorf("stats %+v (before %+v): want one hold, cut short, not expired, that held about 31 requests", gs, before)
+				}
+				after := sumMetricLines(t, names)
+				if d := after["acu_flip_quiet_cut_short_total"] - counters["acu_flip_quiet_cut_short_total"]; d != 1 {
+					t.Errorf("acu_flip_quiet_cut_short_total rose by %v, want 1", d)
+				}
+				if d := after["acu_flip_hold_expired_total"] - counters["acu_flip_hold_expired_total"]; d != 0 {
+					t.Errorf("acu_flip_hold_expired_total rose by %v, want 0", d)
+				}
+				if gens := l.AnchorGens(suite); len(gens) != 2 {
+					t.Errorf("clients saw anchor generations %v, want two (they crossed the flip)", gens)
+				}
+				if n := l.Checked(); n < 150 {
+					t.Errorf("only %d index responses checked", n)
+				}
+			})
+		})
+	}
 }
 
 // Spec C8 under seeded chaos: three suites on one host; 160 clients over

@@ -13,8 +13,12 @@
 //   - Phase B holds the suite's new anchor requests until it is quiet and
 //     no other suite's hold that held requests ended within the quiet
 //     period, commits, and answers the held requests from the new
-//     snapshot — all within HoldMax of the grant; at that bound the hold
-//     ends regardless and a commit not yet started starts.
+//     snapshot — all within HoldMax of the grant. Once the cross-suite
+//     condition holds, the wait for the suite's own quiet is cut short at
+//     HoldMax − CommitMargin: the commit starts then (counted), so the
+//     held requests still get the new snapshot. At HoldMax the hold ends
+//     regardless (the backstop for a commit that has not started or not
+//     finished).
 //
 // Close (the daemon's shutdown signal) ends the hold in progress and
 // abandons every flip that has not started its commit.
@@ -40,9 +44,13 @@ import (
 
 // Spec C11 constants, not knobs.
 //
-// AIDEV-NOTE: MaxQuiet < HoldMax is load-bearing (TestNew_QuietBounds pins
-// it): phase B (b) can always be satisfied inside a hold only because a
-// whole quiet period fits in one, and the straddle guarantee relies on it.
+// AIDEV-NOTE: MaxQuiet ≤ HoldMax − CommitMargin (so MaxQuiet < HoldMax) is
+// load-bearing (TestNew_QuietBounds pins it): phase B (b) waits a quiet
+// period after the last other hold that held requests, which ended at the
+// latest when this hold started, so it is always satisfied by HoldMax −
+// CommitMargin. Every hold therefore commits by then, inside its bound,
+// and answers its held requests from the new snapshot; the straddle
+// guarantee relies on it.
 const (
 	// MinQuiet and MaxQuiet bound a non-zero adoption.flip_quiet_period;
 	// zero disables the barrier.
@@ -56,6 +64,17 @@ const (
 	// HoldMax bounds a hold, from the token's grant, and so every held
 	// anchor request; it stays below apt's 30 s Acquire::http::Timeout.
 	HoldMax = 20 * time.Second
+	// CommitMargin is the end of a hold kept for its commit. Once no other
+	// suite's hold that held requests ended within the quiet period (phase
+	// B (b)), a hold waits for its own suite's quiet only until HoldMax −
+	// CommitMargin, then commits; anchors still being sent or finished
+	// within the quiet period then are the residual
+	// (acu_flip_quiet_cut_short_total).
+	//
+	// AIDEV-NOTE: the time a commit normally needs, so that the held
+	// waiters are answered from the new snapshot inside the 20 s bound,
+	// not released to the old one right before the commit.
+	CommitMargin = 5 * time.Second
 	// AnchorTimeout is apt's 30 s Acquire::http::Timeout. apt's is an
 	// inactivity timeout, but the barrier treats an anchor response still
 	// being sent this long after it started as abandoned and stops waiting
@@ -98,6 +117,10 @@ const (
 	OutcomeHoldExpired Outcome = "hold_expired" // the hold reached HoldMax before the commit finished
 	OutcomeHoldSkipped Outcome = "hold_skipped" // no token within TokenWaitMax: committed unheld
 	OutcomeAborted     Outcome = "aborted"      // ctx ended or the gate closed before the commit started: nothing committed
+	// OutcomeQuietCutShort: committed within its hold at HoldMax −
+	// CommitMargin, before the suite was quiet (its late readers may
+	// straddle).
+	OutcomeQuietCutShort Outcome = "quiet_cut_short"
 )
 
 // Result describes one Flip.
@@ -119,6 +142,9 @@ type Stats struct {
 	HoldsSkipped int // flips that committed unheld after waiting TokenWaitMax
 	Aborted      int // flips whose context ended, or whose gate closed, before the commit started
 	HeldRequests int // anchor requests that waited in a hold
+	// QuietCutShort counts holds that committed at HoldMax − CommitMargin
+	// before their suite was quiet.
+	QuietCutShort int
 }
 
 // Gate is the flip barrier, keyed by Key. A nil *Gate is a disabled gate.
@@ -493,17 +519,34 @@ func (g *Gate) acquire(ctx context.Context, e *entry) (*hold, error) {
 // hold, its waiters and the token whatever happens, a panicking commit
 // included (spec C5: the barrier releases its pending state through its
 // own defer).
+//
+// AIDEV-NOTE: once phase B (b) holds, the hold waits for its suite's local
+// quiet only until cut = expiry − CommitMargin; then it commits inside the
+// hold (OutcomeQuietCutShort, acu_flip_quiet_cut_short_total), so its held
+// requests are answered from the new snapshot. The late readers — anchor
+// responses still being sent at the cut, or finished less than the quiet
+// period before it, i.e. reads still running HoldMax − CommitMargin −
+// quiet (5 s at the default 10 s) into the hold — are the residual: a
+// client among them whose index request reaches the cache after the commit
+// straddles. Releasing the held requests to the old snapshot at the bound,
+// right before the commit, made nearly every one of them straddle (final
+// review, concurrency Important 1). MaxQuiet ≤ HoldMax − CommitMargin means
+// phase B (b) always holds by the cut, so the expiry below is only the
+// backstop: for a commit that has not started by the bound (unreachable
+// with the production constants) or that does not finish in time.
 func (g *Gate) runHold(ctx context.Context, e *entry, h *hold, commit func() error, res *Result) error {
 	expiry := h.start.Add(g.holdMax)
+	cut := expiry.Add(-CommitMargin)
 	defer func() {
 		g.mu.Lock()
 		defer g.mu.Unlock() // a panicking commit unwinds to the adoption's recover
 		g.endHoldLocked(h, false)
 		res.HoldEnd, res.Waiters = h.end, h.heldTotal
-		if h.expired && res.Outcome == OutcomeHeld {
+		if h.expired && (res.Outcome == OutcomeHeld || res.Outcome == OutcomeQuietCutShort) {
 			res.Outcome = OutcomeHoldExpired
 		}
 	}()
+	cutShort := false
 	for {
 		g.mu.Lock()
 		now := time.Now()
@@ -516,9 +559,9 @@ func (g *Gate) runHold(ctx context.Context, e *entry, h *hold, commit func() err
 			return g.abort(res, ErrClosed)
 		}
 		if !now.Before(expiry) {
-			// Spec C8: at the bound pending is cleared, the waiters are
-			// answered from the current snapshot, and a commit not yet
-			// started starts at once (counted).
+			// The backstop (spec C8): at the bound pending is cleared, the
+			// waiters are answered from the current snapshot, and a commit
+			// not yet started starts at once (counted).
 			if g.expireHold(h) {
 				holdExpiredTotal.Inc()
 			}
@@ -528,15 +571,28 @@ func (g *Gate) runHold(ctx context.Context, e *entry, h *hold, commit func() err
 			res.Outcome, res.Committed = OutcomeHoldExpired, true
 			return commit()
 		}
-		if okLocal && okOthers {
+		if okOthers && (okLocal || !now.Before(cut)) {
+			cutShort = !okLocal
 			break
 		}
-		if !waitFor(ctx, changed, earliest(atLocal, atOthers), expiry) {
+		limit := expiry
+		if now.Before(cut) {
+			limit = cut
+		}
+		if !waitFor(ctx, changed, earliest(atLocal, atOthers), limit) {
 			return g.abort(res, ctx.Err())
 		}
 	}
 	if err := g.stopErr(ctx); err != nil {
 		return g.abort(res, err)
+	}
+	res.Outcome, res.Committed = OutcomeHeld, true // the deferred end makes it hold_expired if the bound came first
+	if cutShort {
+		g.mu.Lock()
+		g.stats.QuietCutShort++
+		g.mu.Unlock()
+		quietCutShortTotal.Inc()
+		res.Outcome = OutcomeQuietCutShort
 	}
 	// Commit within the hold. A commit that outlasts the bound is never
 	// interrupted, but the hold still ends at the bound.
@@ -551,7 +607,6 @@ func (g *Gate) runHold(ctx context.Context, e *entry, h *hold, commit func() err
 		}
 	})
 	defer expire.Stop()
-	res.Outcome, res.Committed = OutcomeHeld, true // the deferred end makes it hold_expired if the bound came first
 	err := commit()
 	expire.Stop() // design review M11: an expiry the timer has not fired by now did not happen
 	return err
@@ -640,7 +695,9 @@ func (g *Gate) startHoldLocked(e *entry, now time.Time) *hold {
 // entry other than x is lastEnd when lastEndBy != x, and prevEnd if not.
 // Only a hold that held at least one request sets them: a hold that held
 // no request delayed no client queue, so it never starts a cross-suite
-// quiet period (design note 17).
+// quiet period (design note 17). This must never panic: the expiry
+// timer's recover counts a panic (acu_flip_gate_panics_total) but keeps
+// neither its value nor its stack.
 func (g *Gate) endHoldLocked(h *hold, expired bool) bool {
 	if h.ended {
 		return false

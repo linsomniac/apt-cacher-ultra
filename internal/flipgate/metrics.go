@@ -14,6 +14,10 @@ var (
 		"acu_flip_hold_expired_total",
 		"Flip holds that reached their 20 s bound before the commit finished (spec C8).",
 	)
+	quietCutShortTotal = metrics.NewCounter(
+		"acu_flip_quiet_cut_short_total",
+		"Flip holds that committed 15 s into the hold, before the suite was quiet: an InRelease/Release response still being sent, or finished within the quiet period, may straddle (spec C8).",
+	)
 	waitersOverCapTotal = metrics.NewCounter(
 		"acu_flip_waiters_over_cap_total",
 		"Anchor requests served at once during a flip hold because 256 requests already waited in it (spec C8).",

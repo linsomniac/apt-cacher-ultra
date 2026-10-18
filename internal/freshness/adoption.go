@@ -534,6 +534,10 @@ type Adopter struct {
 	// wedge the suite mutex.
 	reconcilePendingHook func()
 
+	// commitDelay is a test seam (zero in production): every commit waits
+	// this long before it runs (SetCommitDelayForTest).
+	commitDelay time.Duration
+
 	// hotPackagesWindow + hotPrefetchBudget are the SPEC3 §5.2 keys
 	// the hot-prefetch loop reads. Stored on the Adopter so each
 	// adoption invocation observes a stable snapshot of the policy at
@@ -706,6 +710,17 @@ func (a *Adopter) FlipGate() *flipgate.Gate {
 	}
 	return a.flipGate
 }
+
+// SetCommitDelayForTest makes every adoption commit wait d before it runs,
+// inside the flip barrier, as a slow transaction does: the snapshot
+// switches when the commit returns. TEST-ONLY — call it before any
+// adoption runs; zero (the default) is no delay.
+//
+// AIDEV-NOTE: exported for internal/handler's flip simulations, which
+// model a real commit's latency (a zero-time commit hides how a hold's end
+// orders against it; final review, concurrency Important 1). Named
+// *ForTest by convention; never call from non-test code.
+func (a *Adopter) SetCommitDelayForTest(d time.Duration) { a.commitDelay = d }
 
 // ctxSleep waits d, returning early with ctx.Err() on cancellation.
 // The production retrySleep — shutdown must never block on a member
@@ -1624,6 +1639,9 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// (5 min), and the unit's TimeoutStopSec (35 s) may SIGKILL first —
 	// SQLite rolls the transaction back, so nothing is lost.
 	commit := func() error {
+		if a.commitDelay > 0 {
+			time.Sleep(a.commitDelay) // test seam: a slow transaction (SetCommitDelayForTest)
+		}
 		commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
 		defer cancelCommit()
 		return a.cache.CommitAdoption(commitCtx, snapshotID, memberRows, integritySkipped, packageHashes,
