@@ -338,6 +338,23 @@ func TestVitalState(t *testing.T) {
 			},
 			"adoptions", "crit",
 		},
+		// Spec C7: a refusal is a state, not a failure. The same 5/10
+		// split that pushes the ratio to "crit" for gpg_failed must stay
+		// "ok" when every non-success row is "refused" instead.
+		{
+			"adoptions_ok_refused_not_counted_as_failure",
+			func(m *htmlRenderModel) {
+				m.RecentAdoptions = make([]adoptionEntry, 10)
+				for i := range m.RecentAdoptions {
+					if i < 5 {
+						m.RecentAdoptions[i].Outcome = "refused"
+					} else {
+						m.RecentAdoptions[i].Outcome = "success"
+					}
+				}
+			},
+			"adoptions", "ok",
+		},
 
 		{
 			"gc_stale_no_run",

@@ -1177,9 +1177,14 @@ func vitalState(kind string, m htmlRenderModel) string {
 			}
 			return "ok"
 		}
+		// A "refused" outcome is a state, not a failure (spec C7): it is
+		// excluded from the failure side of the ratio, same as "success".
+		// The denominator stays the full window (refusals are real events,
+		// just not failing ones), so a window of only refusals + successes
+		// keeps this cell "ok".
 		fail := 0
 		for _, a := range m.RecentAdoptions {
-			if a.Outcome != "success" {
+			if a.Outcome != "success" && a.Outcome != "refused" {
 				fail++
 			}
 		}
