@@ -24,6 +24,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
@@ -97,6 +98,11 @@ type Config struct {
 	// stale current_snapshot_id rows persist from prior runs (SPEC3
 	// §6.1 / Q17).
 	AdoptionEnabled bool
+
+	// FlipGate is the spec C8 flip barrier, shared with the adopter
+	// (freshness.Adopter.FlipGate). nil, or a gate with a zero quiet
+	// period, never holds or tracks anything (the pre-C8 behaviour).
+	FlipGate *flipgate.Gate
 }
 
 // ConnectHandler is the SPEC6 §2.2 CONNECT pipeline contract.
@@ -139,6 +145,9 @@ type Handler struct {
 	refuseUnvouchedDebs bool
 	adoptionEnabled     bool
 
+	// flipGate is the spec C8 barrier (see anchorStart); nil when off.
+	flipGate *flipgate.Gate
+
 	// unvouchedPassthroughLog rate-limits the
 	// unvouched_deb_passthrough_no_coverage event to once per (host,
 	// path, hour) so steady incomplete-coverage traffic doesn't flood
@@ -169,6 +178,9 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.Cache == nil {
 		return nil, errors.New("handler: nil Cache")
 	}
+	// AIDEV-NOTE: Fetch is an interface: a typed-nil *fetch.Client passes
+	// this check and panics on first use. Callers pass a constructed
+	// client (main.go) or a test fake.
 	if cfg.Fetch == nil {
 		return nil, errors.New("handler: nil Fetch")
 	}
@@ -191,6 +203,7 @@ func New(cfg Config) (*Handler, error) {
 		logger:                  logger,
 		refuseUnvouchedDebs:     cfg.RefuseUnvouchedDebs,
 		adoptionEnabled:         cfg.AdoptionEnabled,
+		flipGate:                cfg.FlipGate,
 		unvouchedPassthroughLog: make(map[string]int64),
 		lifecycleCtx:            lifecycleCtx,
 		lifecycleCancel:         lifecycleCancel,
@@ -341,6 +354,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		h.logRequest(r, "", "", "bad_request", http.StatusBadRequest, 0, false, 0, start)
 		return
+	}
+
+	// Spec C8: register an anchor serve with the flip barrier before
+	// anything reads the snapshot pointer (it may wait here while the
+	// suite's flip holds anchors) and before host-slot acquisition and
+	// singleflight; Done runs once the response has been written.
+	if t := h.anchorStart(r, req); t != nil {
+		defer t.Done()
 	}
 
 	// Fast path: SPEC §6.1.
@@ -988,6 +1009,43 @@ func (h *Handler) maybeFireFreshness(req *proxy.Request) {
 // t1PanicStackLogged limits the T1 panic stack to one per process (spec C5).
 var t1PanicStackLogged atomic.Bool
 
+// anchorStart is spec C8's handler side. For <suite>/InRelease and
+// <suite>/Release of a suite with a suite_freshness row it registers the
+// serve with the flip barrier and returns its token; while a flip of the
+// suite holds anchors it first waits — at most flipgate.HoldMax, and no
+// longer than the request or the handler lives. It returns nil otherwise:
+// Release.gpg is never held, and untracked suites create no gate state.
+//
+// AIDEV-NOTE: the registration must precede every read of the snapshot
+// pointer (trySnapshotHit re-reads it), or a flip could commit between the
+// read and the registration and hand the client the old anchor after the
+// flip. The row check before it therefore costs one extra read per anchor
+// request of a tracked suite (none when the barrier is off). The wait's
+// end on h.lifecycleCtx is defence in depth: the daemon closes the gate at
+// the shutdown signal (design note 18), so no hold is left when the
+// handler closes. An HTTPS request through the MITM pipeline keeps its
+// inner context when its client disconnects (internal/proxy/connect.go),
+// so such a waiter stays until the hold ends (at most HoldMax) and counts
+// against the waiter cap meanwhile (design note 3).
+func (h *Handler) anchorStart(r *http.Request, req *proxy.Request) *flipgate.Token {
+	if !h.flipGate.Enabled() || !req.IsMetadata || req.SuitePath == "" {
+		return nil
+	}
+	if req.Path != req.SuitePath+inReleaseSuffix && req.Path != req.SuitePath+releaseSuffix {
+		return nil
+	}
+	if _, err := h.cache.GetSuiteFreshness(r.Context(), req.CanonicalScheme, req.CanonicalHost, req.SuitePath); err != nil {
+		// No row, or the read failed (trySnapshotHit answers for that):
+		// nothing to register.
+		return nil
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	stop := context.AfterFunc(h.lifecycleCtx, cancel)
+	defer stop()
+	return h.flipGate.AnchorStart(ctx, flipgate.Key(req.CanonicalScheme, req.CanonicalHost, req.SuitePath))
+}
+
 // touchAsync updates last_requested_at + request_count without blocking
 // the response. Uses a fresh ctx so an already-disconnected client does
 // not orphan the write before the writer goroutine picks it up.
@@ -1624,6 +1682,10 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 // literal is used for the seed-detection check above and (in the
 // freshness package) the check itself.
 const inReleaseSuffix = "/InRelease"
+
+// releaseSuffix is the detached form's anchor under a suite path; spec C8
+// holds it like InRelease (and never Release.gpg).
+const releaseSuffix = "/Release"
 
 // respondError maps a fetch error to an HTTP response.
 //
