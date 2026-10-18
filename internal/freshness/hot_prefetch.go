@@ -88,8 +88,10 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 	// Set up the prefetch context. SPEC3 §7.5 step 10: prefetchCtx is
 	// derived from adoptionCtx — a parent SIGTERM/lifecycle cancel
 	// propagates here — but only the prefetch loop sees the budget
-	// timeout. The flip below uses adoptionCtx directly so a
-	// budget-elapsed prefetch never aborts the flip.
+	// timeout, so a budget-elapsed prefetch never aborts the flip. The
+	// flip itself (runShared Step 11) runs under its own commit context
+	// (WithoutCancel + commitTimeout, spec C4); a shutdown before it
+	// starts skips it.
 	prefetchCtx := adoptionCtx
 	prefetchCancel := func() {}
 	if a.hotPrefetchBudget > 0 {

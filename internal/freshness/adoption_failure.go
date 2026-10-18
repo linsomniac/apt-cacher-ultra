@@ -11,13 +11,20 @@ import (
 )
 
 // failureRecordTimeout bounds the record write after an adoption ends
-// (the adoption's own deadline may already have passed).
-const failureRecordTimeout = 30 * time.Second
+// (the adoption's own deadline may already have passed). The write is one
+// UPDATE; its wait is the single writer's queue, which can hold another
+// suite's CommitAdoption for up to commitTimeout. A shorter bound would
+// lose the record behind a long commit, and the gate would not apply to
+// the failing content. The suite mutex is held meanwhile, which is what
+// makes the record exist before the next check (spec C7).
+const failureRecordTimeout = commitTimeout + 30*time.Second
 
 // recordAdoptionFailure writes the spec C7 failure record for req's
 // content and logs it: adoption_refused for every refused attempt,
 // adoption_deferred on a state transition (the first failure of a streak
-// or a new reason), adoption_failing_persistently at streak milestones.
+// or a new reason), adoption_failing_persistently at streak milestones,
+// and adoption_refused_persistently at the same milestones for a refusal
+// whose streak is at least refusalEscalateAge old.
 // It runs in the adoption goroutine before the suite mutex is released,
 // so the next check already sees the record. Shutdown is not a failure:
 // nothing is recorded once the lifetime context is done.
@@ -77,12 +84,28 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 	if cur.AdoptionFailCount == 0 || cur.AdoptionFailReason == nil || *cur.AdoptionFailReason != reason {
 		c.logger.Info("adoption_deferred", attrs...)
 	}
-	if !refusal && isPersistentMilestone(count) {
+	switch {
+	case !isPersistentMilestone(count):
+	case !refusal:
 		c.logger.Warn("adoption_failing_persistently",
+			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath,
+			"reason", reason, "fail_count", count, "failing_since_unixtime", first)
+	case now.Unix()-first >= int64(refusalEscalateAge/time.Second):
+		// A refusal is a state, not a failure, but one that has lasted a
+		// day may be a silent freeze (a vendor that stopped emitting Date
+		// is refused upstream_older forever): make it alertable.
+		c.logger.Warn("adoption_refused_persistently",
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath,
 			"reason", reason, "fail_count", count, "failing_since_unixtime", first)
 	}
 }
+
+// refusalEscalateAge is how long a refusal streak lasts before it is
+// escalated: WARN adoption_refused_persistently at the streak milestones,
+// and a warn row and SUITES vital on the admin page (the admin package
+// keeps its own copy of the 24 h). A future streak start counts as now
+// (clock-step rule), so its age is 0.
+const refusalEscalateAge = 24 * time.Hour
 
 // isPersistentMilestone reports streak counts 3, 6, 12, 24, …, the
 // adoption_failing_persistently thresholds (spec C7).

@@ -181,13 +181,23 @@ SELECT snapshot_id, adopted_at FROM suite_snapshot
 	if sc.PackageCoverageComplete {
 		coverage = 1
 	}
+	// AIDEV-NOTE: the op writes gotID/gotReused, never the named results:
+	// on a ctx/close path submitWrite returns before the writer goroutine
+	// finishes the op (cache.go submitWrite), and `return 0, false, werr`
+	// would then race the op's writes. Read them only after a nil werr
+	// (the RescheduleFailingAdoptions pattern). The adoption deadline
+	// (adoption.max_duration) makes that path reachable mid-op.
+	var (
+		gotID     int64
+		gotReused bool
+	)
 	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		res, execErr := conn.ExecContext(ctx, insertQ,
 			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath,
 			sc.InReleaseHash, sc.InReleaseETag, sc.InReleaseLastMod,
 			sc.ReleaseHash, sc.ReleaseGPGHash, string(form), sc.ReleaseDate, now, coverage, now)
 		if execErr == nil {
-			id, execErr = res.LastInsertId()
+			gotID, execErr = res.LastInsertId()
 			if execErr != nil {
 				return fmt.Errorf("InsertCandidateSnapshot: last id: %w", execErr)
 			}
@@ -256,14 +266,14 @@ UPDATE suite_snapshot
 			existingID); err != nil {
 			return fmt.Errorf("InsertCandidateSnapshot: refresh mutable cols on reuse: %w", err)
 		}
-		id = existingID
-		reused = true
+		gotID = existingID
+		gotReused = true
 		return nil
 	})
 	if werr != nil {
 		return 0, false, werr
 	}
-	return id, reused, nil
+	return gotID, gotReused, nil
 }
 
 // PrefetchedURLPath carries one Phase 3 hot-deb prefetch outcome into

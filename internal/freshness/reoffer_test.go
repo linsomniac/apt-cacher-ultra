@@ -9,6 +9,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
@@ -271,5 +272,124 @@ func TestRun_HeldOfferIsRetriedOnTheNextWake(t *testing.T) {
 			t.Fatalf("%d anchor GETs after the wake, want 2 (a held suite is offered on the next wake, not only on the next tick)", n)
 		}
 		stop()
+	})
+}
+
+// Spec C4: "A client-triggered check that is refused leaves the suite due;
+// the next tick parks it." A client check that finds no slot leaves the
+// change pending (inrelease_change_seen_at set, no failure record), which
+// makes the suite due even though its last success is recent; the next
+// tick checks it, cooldown bypassed, and parks it, so the slot released
+// later is offered to it at once (final review I-1, probe 1: it used to
+// wait until last_success_at + periodic_refresh, 15 min, with the slot
+// idle).
+func TestRun_ClientRefusedSuiteIsParkedByTheNextTick(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		c := simtest.OpenCache(t)
+		up := simtest.NewUpstream()
+		members := newFakeFetcher()
+		const host, suite = "h", "/r/dists/x"
+		seedStaleAnchorAt(t, c, host, suite)
+		recent := time.Now().Add(-time.Minute).Unix()
+		if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host,
+			SuitePath: suite, LastCheckAt: &recent, LastSuccessAt: &recent}); err != nil {
+			t.Fatal(err)
+		}
+		pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
+		members.put("http://h"+suite+"/main/binary-amd64/Packages", pkgs)
+		anchor := "http://h" + suite + "/InRelease"
+		up.Set(anchor, simtest.Serve(datedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
+			HostLimiter: hostsem.New(8), MaxConcurrent: 1, Logger: simtest.DiscardLogger()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		chk, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8),
+			Refresh: 15 * time.Minute, Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger()})
+		held := mustAcquire(t, chk.admission, "other", true)
+		time.Sleep(10 * time.Second)
+		chk.Check(ctx, "http", host, suite) // T1: changed_queued
+		time.Sleep(4 * time.Minute)         // the first tick (3m45s) has run
+		if n := len(up.Calls(anchor)); n != 2 {
+			t.Fatalf("%d anchor GETs by 4m10s, want 2 (the client check and the first tick's, cooldown bypassed)", n)
+		}
+		released := time.Now()
+		held.release() // the slot frees at ~4m10s
+		time.Sleep(checkDeadline + time.Minute)
+		stop()
+		sf, err := c.GetSuiteFreshness(ctx, "http", host, suite)
+		if err != nil || sf.CurrentSnapshotID == nil {
+			t.Fatalf("client-refused suite not adopted within D of the release (spec C4: the next tick parks it); err %v", err)
+		}
+		calls := up.Calls(anchor)
+		if len(calls) != 3 {
+			t.Fatalf("%d anchor GETs, want 3 (client check, first tick, the offer)", len(calls))
+		}
+		if d := calls[2].Sub(released); d > checkDeadline {
+			t.Fatalf("offered %v after the release, want within %v", d, checkDeadline)
+		}
+	})
+}
+
+// Final review I-1, probe 2: a suite whose change a client check saw first,
+// with client checks every 61 s keeping its last_check_at inside the
+// cooldown, is parked by the scheduler like any other suite and goes
+// before an idle suite whose change the scheduler saw later. It used to
+// be cooldown-skipped by every tick, never parked, and adopted only after
+// the idle suite.
+func TestRun_ClientRefusedBusySuiteIsParkedInOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		c := simtest.OpenCache(t)
+		up := simtest.NewUpstream()
+		members := &simMembers{fakeFetcher: newFakeFetcher(), stalled: map[string]bool{}, delay: map[string]time.Duration{}}
+		const suite = "/r/dists/x"
+		for _, host := range []string{"s", "w"} {
+			seedStaleAnchorAt(t, c, host, suite)
+			pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_" + host + ".deb": testHex64})
+			pu := "http://" + host + suite + "/main/binary-amd64/Packages"
+			members.put(pu, pkgs)
+			members.delay[pu] = 10 * time.Minute
+			up.Set("http://"+host+suite+"/InRelease",
+				simtest.Serve(datedRelease("v1-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
+		}
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
+			HostLimiter: hostsem.New(8), MaxConcurrent: 1, Logger: simtest.DiscardLogger()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		chk, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8),
+			Refresh: 15 * time.Minute, Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger()})
+		t0 := time.Now()
+		held := mustAcquire(t, chk.admission, "other", true)
+		clientsDone := make(chan struct{})
+		go func() { // steady client traffic on S
+			defer close(clientsDone)
+			time.Sleep(10 * time.Second)
+			for time.Since(t0) < 40*time.Minute {
+				chk.Check(ctx, "http", "s", suite)
+				time.Sleep(61 * time.Second)
+			}
+		}()
+		time.Sleep(8 * time.Minute)
+		held.release()
+		adopted := map[string]time.Duration{}
+		for time.Since(t0) < 40*time.Minute {
+			time.Sleep(15 * time.Second)
+			for _, h := range []string{"s", "w"} {
+				if sf, err := c.GetSuiteFreshness(ctx, "http", h, suite); err == nil && sf.CurrentSnapshotID != nil && adopted[h] == 0 {
+					adopted[h] = time.Since(t0)
+				}
+			}
+		}
+		<-clientsDone
+		stop()
+		if adopted["s"] == 0 || adopted["w"] == 0 {
+			t.Fatalf("not both adopted in 40 min: %v", adopted)
+		}
+		if adopted["s"] > adopted["w"] {
+			t.Errorf("S (seen first, clients active) adopted at %v, after idle W at %v", adopted["s"], adopted["w"])
+		}
 	})
 }

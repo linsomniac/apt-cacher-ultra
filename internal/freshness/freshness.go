@@ -344,11 +344,12 @@ type checkOutcome struct {
 	report checkReport
 }
 
-// checkOpts tunes one check. bypassCooldown is set only by the
-// scheduler's re-check of a suite that waited for an admission slot
-// (spec C4): that retry is bounded by slot turnover (one per released
-// slot), so the cooldown's job — absorbing client-triggered storms — does
-// not apply to it.
+// checkOpts tunes one check. bypassCooldown is set only by the scheduler:
+// for the re-check of a suite that waited for an admission slot (spec C4),
+// bounded by slot turnover (one per released slot), and for the check of
+// a suite queued with a pending change (Checker.pendingChange), at most
+// one per tick until it is parked. The cooldown's job — absorbing
+// client-triggered storms — does not apply to either.
 type checkOpts struct {
 	bypassCooldown bool
 }
@@ -490,7 +491,15 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 			// log, those drop on the floor and the operator sees the
 			// "metadata changed at upstream" line followed by silence.
 			// Always surface a single line so any failure is grep-able.
-			c.logger.Warn("adoption_run_failed",
+			// A refusal is a state, not a failure (spec C7): its line is
+			// INFO, next to the INFO adoption_refused that carries the
+			// reason and timing, so operators alerting on WARN are not
+			// paged for a flapping mirror.
+			level := slog.LevelWarn
+			if outcome == "refused" {
+				level = slog.LevelInfo
+			}
+			c.logger.Log(context.Background(), level, "adoption_run_failed",
 				"canonical_host", req.suite.CanonicalHost,
 				"suite_path", req.suite.SuitePath,
 				"form", formName(req.form),
@@ -673,17 +682,29 @@ func (c *Checker) recoverGoroutine(where string, suite SuiteRef) {
 //
 // AIDEV-NOTE: nothing in check between TryLock and this call, or between
 // it and the goroutine hand-off, may panic: checkRecovered (scheduler)
-// and the T1 recover cannot release a mutex they do not know about.
+// and the T1 recover cannot release a mutex they do not know about. The
+// same holds for the recover handler itself: a panic in it (a panicking
+// logger in reportPanic) would escape with the mutex held for the life
+// of the process, so its logging and bookkeeping run under nested
+// recovers and it always returns out=nil, ok=false.
 func (c *Checker) checkLockedSafe(ctx, fetchCtx context.Context, scheme, host, suitePath string, opts checkOpts) (out *checkOutcome, ok bool) {
 	out = &checkOutcome{report: checkReport{result: resultSkipped}}
 	defer func() {
 		if r := recover(); r != nil {
 			out.lease.release()
-			c.reportPanic("freshness_check_panicked", "check",
-				SuiteRef{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}, r)
-			c.bumpFailedCheck(ctx, scheme, host, suitePath)
-			freshnessCheckTotal.Inc("failed", host)
 			out, ok = nil, false
+			guarded := func(f func()) {
+				defer func() { _ = recover() }()
+				f()
+			}
+			guarded(func() {
+				c.reportPanic("freshness_check_panicked", "check",
+					SuiteRef{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}, r)
+			})
+			guarded(func() {
+				c.bumpFailedCheck(ctx, scheme, host, suitePath)
+				freshnessCheckTotal.Inc("failed", host)
+			})
 		}
 	}()
 	c.checkLocked(ctx, fetchCtx, out, scheme, host, suitePath, opts)
@@ -737,7 +758,8 @@ func (c *Checker) bumpFailedCheck(ctx context.Context, scheme, host, suitePath s
 //
 //   - Cooldown gate fails: no DB write, return nil (reported as
 //     skipped). The scheduler's slot-driven re-check of a waiting suite
-//     bypasses the gate (opts.bypassCooldown, spec C4).
+//     and its check of a suite with a pending change bypass the gate
+//     (opts.bypassCooldown, spec C4).
 //   - Metadata url_path row absent: no DB write (we have nothing to
 //     check against), return nil — first request for this suite will
 //     land in url_path through the normal miss path.
@@ -750,7 +772,9 @@ func (c *Checker) bumpFailedCheck(ctx context.Context, scheme, host, suitePath s
 //     *adoptionRequest.
 //   - Same, but no admission slot is free (spec C4): "changed_queued",
 //     no request, last_success_at left at its previous value; the
-//     scheduler parks the suite until a slot it can use is released.
+//     scheduler parks the suite until a slot it can use is released (a
+//     client check's suite is parked by the next tick: its pending
+//     change makes it due, see Checker.pendingChange).
 //   - Spec C7 gate (retryGateFor, adopter wired only): while a failure
 //     record exists and next_retry_at has not come, the GET carries the
 //     failing content's validators, and a 304 or the same content key
@@ -802,7 +826,8 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 		case last.After(now.Add(clockStepTolerance)):
 			c.clockStep("last_check_at", scheme, host, suitePath, *cur.LastCheckAt, now)
 		case opts.bypassCooldown:
-			// The scheduler's slot-driven re-check (spec C4).
+			// The scheduler's slot-driven re-check, or its check of a
+			// suite with a pending change (spec C4).
 		case now.Sub(last) < c.cooldown:
 			return // out.report stays resultSkipped
 		}
@@ -1081,8 +1106,11 @@ func (c *Checker) checkLockedInline(ctx, fetchCtx context.Context, out *checkOut
 					// Spec C4: no slot — spawn nothing and keep
 					// last_success_at. A scheduler check reports
 					// changed_queued and the scheduler parks the suite
-					// until a slot it can use is released; a client
-					// check leaves it due for the next tick.
+					// until a slot it can use is released. A client
+					// check leaves the change pending (change seen, no
+					// record), which makes the suite due at the next
+					// tick (Checker.pendingChange); that tick's check
+					// bypasses the cooldown and parks it.
 					result, req = "changed_queued", nil
 					cur.LastSuccessAt = prevSuccess
 				} else {
@@ -1357,8 +1385,11 @@ func (c *Checker) checkLockedDetached(ctx, fetchCtx context.Context, out *checkO
 				// Spec C4: no slot — spawn nothing and keep
 				// last_success_at. A scheduler check reports
 				// changed_queued and the scheduler parks the suite
-				// until a slot it can use is released; a client
-				// check leaves it due for the next tick.
+				// until a slot it can use is released. A client
+				// check leaves the change pending (change seen, no
+				// record), which makes the suite due at the next
+				// tick (Checker.pendingChange); that tick's check
+				// bypasses the cooldown and parks it.
 				result, req = "changed_queued", nil
 				cur.LastSuccessAt = prevSuccess
 			} else {

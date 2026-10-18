@@ -1528,10 +1528,28 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		p.membersDone()
 	}
 
+	// A shutdown (the lifetime context cancelled: Canceled, not the
+	// max_duration deadline's DeadlineExceeded) before the commit starts
+	// abandons the adoption, as SPEC2 §9.5 step 5 says: starting a commit
+	// now would hold the stop for up to commitTimeout, far beyond the
+	// shipped unit's TimeoutStopSec. Nothing is recorded (the lifetime
+	// context is done); the abandoned candidate is reaped by GC after its
+	// stale grace, like any interrupted adoption, and the next start's
+	// checks see the change again.
+	if err := ctx.Err(); errors.Is(err, context.Canceled) {
+		return fmt.Errorf("adoption: shutdown before the commit: %w", err)
+	}
+
 	// Step 11: atomic flip transaction, under its own bound (spec C4): the
-	// adoption deadline (adoption.max_duration) or a shutdown must not
-	// abort a commit already in progress. coverageComplete is the SPEC3
+	// adoption deadline (adoption.max_duration) must not abort a commit,
+	// and a shutdown does not abort one already in progress — the stop
+	// waits for it, up to commitTimeout. coverageComplete is the SPEC3
 	// §7.5.4 per-snapshot proof for strict mode.
+	//
+	// AIDEV-NOTE: a commit that has started is never cancelled; a
+	// systemctl stop during a long commit is bounded by commitTimeout
+	// (5 min), and the unit's TimeoutStopSec (35 s) may SIGKILL first —
+	// SQLite rolls the transaction back, so nothing is lost.
 	commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
 	defer cancelCommit()
 	if err := a.cache.CommitAdoption(commitCtx, snapshotID, memberRows, integritySkipped, packageHashes,

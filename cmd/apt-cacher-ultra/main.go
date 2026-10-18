@@ -920,9 +920,14 @@ func serveListeners(
 
 	// SPEC2 §9.5 step 5: drain in-flight adoption goroutines spawned
 	// by the freshness Checker. freshCancel above already cancelled
-	// the LifetimeCtx those goroutines run under, so they should be
-	// returning shortly; this Wait makes the shutdown deterministic
-	// before the cache is closed by the deferred c.Close().
+	// the LifetimeCtx those goroutines run under, so they abandon
+	// their upstream work, and an adoption that has not reached its
+	// commit skips it; a commit already running is not cancelled (spec C4)
+	// and can hold this Wait for up to the 5-minute commit timeout
+	// (the packaged unit's TimeoutStopSec=35 may SIGKILL first; SQLite
+	// rolls the transaction back). This Wait makes the shutdown
+	// deterministic before the cache is closed by the deferred
+	// c.Close().
 	freshChecker.WaitForAdoptions()
 
 	wg.Wait()

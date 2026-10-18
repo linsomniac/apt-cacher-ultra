@@ -52,7 +52,9 @@ func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore, now int64) (ad
 }
 
 // failingAdoptionCount counts suites whose adoption failure record is a
-// failure rather than a refusal (spec C7 gauge).
+// failure rather than a refusal (spec C7 gauge). tick reports 0 instead
+// when no adopter is wired: a record left by an earlier run with adoption
+// enabled is inert (Phase 1 parity).
 func failingAdoptionCount(suites []cache.SuiteFreshness) int {
 	n := 0
 	for _, s := range suites {
@@ -94,6 +96,10 @@ type schedItem struct {
 	waiting bool // parked after a queued result; its re-check bypasses the cooldown
 	signed  bool // for waiting items: the current snapshot is signed (reserved-slot rule)
 	held    bool // waiting, but its last offer found the suite busy or no slot: not offered until unhold
+	// pendingChange: queued with a change pending and no failure record
+	// (Checker.pendingChange), typically a client check that found no slot;
+	// its check bypasses the cooldown, so the tick parks it (spec C4).
+	pendingChange bool
 }
 
 type hostQueue struct {
@@ -141,7 +147,9 @@ func newSchedQueues() *schedQueues {
 
 // enqueue appends s to the back of its class on its host, unless the
 // suite is already queued or in flight. It reports whether s was added.
-func (q *schedQueues) enqueue(s cache.SuiteFreshness) bool {
+// pendingChange marks the item's check to bypass the cooldown (see
+// schedItem).
+func (q *schedQueues) enqueue(s cache.SuiteFreshness, pendingChange bool) bool {
 	key := suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
 	if _, dup := q.queued[key]; dup {
 		return false
@@ -154,8 +162,9 @@ func (q *schedQueues) enqueue(s cache.SuiteFreshness) bool {
 	}
 	cls := classOf(s)
 	h.classes[cls] = append(h.classes[cls], schedItem{
-		ref: SuiteRef{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath},
-		key: key,
+		ref:           SuiteRef{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath},
+		key:           key,
+		pendingChange: pendingChange,
 	})
 	q.queued[key] = struct{}{}
 	return true
@@ -307,10 +316,13 @@ func (q *schedQueues) prune() {
 func (q *schedQueues) len() int { return len(q.queued) }
 
 // suiteDue reports whether the scheduler should queue s now (spec C4):
-// its last success is older than the refresh interval or its adoption
-// retry time has come, and it is not inside the backoff its unknown-check
-// streak earns (2 min × 2^(k−1), at most 1 h). Clock-step rule: a
-// last_success_at or last_check_at in the future is infinitely old.
+// its last success is older than the refresh interval, or its adoption
+// retry time has come, or it has a pending change (pendingChange), and it
+// is not inside the backoff its unknown-check streak earns (2 min ×
+// 2^(k−1), at most 1 h). Clock-step rule: a last_success_at or
+// last_check_at in the future is infinitely old. Without an adopter
+// nothing is ever attempted, so only staleness counts (Phase 1 parity,
+// mirroring retryGateFor).
 func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 	nowU := now.Unix()
 	future := nowU + int64(clockStepTolerance/time.Second)
@@ -319,8 +331,8 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 		c.clockStep("last_success_at", s.CanonicalScheme, s.CanonicalHost, s.SuitePath, *s.LastSuccessAt, now)
 		stale = true
 	}
-	retryDue := s.AdoptionFailCount > 0 && s.AdoptionNextRetryAt != nil && *s.AdoptionNextRetryAt <= nowU
-	if !stale && !retryDue {
+	retryDue := c.adopter != nil && s.AdoptionFailCount > 0 && s.AdoptionNextRetryAt != nil && *s.AdoptionNextRetryAt <= nowU
+	if !stale && !retryDue && !c.pendingChange(s) {
 		return false
 	}
 	if s.CheckFailCount > 0 && s.LastCheckAt != nil && *s.LastCheckAt <= future {
@@ -329,6 +341,23 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 		}
 	}
 	return true
+}
+
+// pendingChange reports whether s has an upstream change that no attempt
+// has dealt with yet: inrelease_change_seen_at is set and there is no
+// failure record (a record has its own retry time). With an adopter wired
+// this is the state a check that found no admission slot leaves behind
+// (spec C4: "A client-triggered check that is refused leaves the suite
+// due; the next tick parks it"); a successful adoption clears the stamp
+// in its flip transaction, and a failed one records a failure.
+//
+// AIDEV-NOTE: the rule is persisted state, not a hand-off from Check to
+// the Run loop, so it survives restarts. Its costs: a suite whose
+// adoption is running is queued every tick and its check ends busy (a
+// TryLock, no GET), and a detached suite whose Release.gpg fetch keeps
+// failing is re-fetched every tick (bounded by the tick interval).
+func (c *Checker) pendingChange(s cache.SuiteFreshness) bool {
+	return c.adopter != nil && s.InReleaseChangeSeenAt != nil && s.AdoptionFailCount == 0
 }
 
 // Run starts the SPEC §7.4 periodic refresh loop (T2): a fair scheduler
@@ -343,10 +372,13 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 // the number of hosts with queued suites and n the suites ahead of S in
 // its host's queue (healthy ones only when S is healthy).
 //
-// A check that finds no adoption slot leaves its suite waiting in its
-// host's queue; whenever a slot is released the loop re-checks the oldest
-// waiting suite the freed capacity admits, cooldown bypassed (spec C4
-// slot-driven re-offer). Admission is therefore work-conserving: N suites
+// A scheduler check that finds no adoption slot leaves its suite waiting
+// in its host's queue; whenever a slot is released the loop re-checks the
+// oldest waiting suite the freed capacity admits, cooldown bypassed (spec
+// C4 slot-driven re-offer). A client check that finds no slot leaves the
+// change pending, so the next tick queues the suite (suiteDue) and its
+// check, cooldown bypassed, parks it: such a suite starts waiting within
+// one tick. Admission is therefore work-conserving: N suites
 // queued behind k usable slots are admitted within one tick + ⌈N/k⌉ ×
 // (A + D), A = adoption.max_duration + commitTimeout. An offered re-check
 // uses its host's turn like any check, so n in the latency bound also
@@ -504,7 +536,11 @@ func (c *Checker) tick(ctx context.Context, q *schedQueues) {
 			"refresh", c.refresh.String(),
 		)
 	}
-	adoptionFailingSuites.Set(float64(failingAdoptionCount(suites)))
+	failing := 0
+	if c.adopter != nil {
+		failing = failingAdoptionCount(suites)
+	}
+	adoptionFailingSuites.Set(float64(failing))
 	var due []cache.SuiteFreshness
 	for _, s := range suites {
 		if c.suiteDue(s, nowT) {
@@ -518,14 +554,17 @@ func (c *Checker) tick(ctx context.Context, q *schedQueues) {
 			suiteKey(due[j].CanonicalScheme, due[j].CanonicalHost, due[j].SuitePath)
 	})
 	for _, s := range due {
-		q.enqueue(s)
+		q.enqueue(s, c.pendingChange(s))
 	}
 }
 
 // checkRecovered keeps one suite's panic from ending a worker; a panic
 // reports as a failed check. check already converts a checkLocked panic
 // into a failed check; this catches anything outside it. A waiting item's
-// re-check bypasses the cooldown (spec C4 slot-driven re-offer).
+// re-check bypasses the cooldown (spec C4 slot-driven re-offer), and so
+// does the check of a suite queued with a pending change: client checks
+// may keep its last_check_at inside the cooldown, and the tick must still
+// park it (spec C4).
 func (c *Checker) checkRecovered(ctx context.Context, item schedItem) (rep checkReport) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -533,5 +572,5 @@ func (c *Checker) checkRecovered(ctx context.Context, item schedItem) (rep check
 			rep = checkReport{result: "failed"}
 		}
 	}()
-	return c.check(ctx, item.ref, checkOpts{bypassCooldown: item.waiting})
+	return c.check(ctx, item.ref, checkOpts{bypassCooldown: item.waiting || item.pendingChange})
 }

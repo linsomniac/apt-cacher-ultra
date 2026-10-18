@@ -295,6 +295,40 @@ func TestCheck_SynchronousPanicReleasesMutex(t *testing.T) {
 	}
 }
 
+// A panic inside checkLockedSafe's own recover handler (a panicking
+// logger in reportPanic) must not leak the suite mutex: the check still
+// returns failed, the mutex is free, and the bookkeeping still ran
+// (final review T M8; pre-existing).
+func TestCheck_PanickingPanicLoggerReleasesMutex(t *testing.T) {
+	fc := newFakeCache()
+	seedFakeSuite(fc, "h", "/r/dists/x", nil)
+	up := &changedUpstream{body: []byte("x")}
+	up.panic.Store(true)
+	logger := slog.New(panicLogHandler{panicOn: func(r slog.Record) bool { return r.Message == "freshness_check_panicked" }})
+	c, err := New(Config{Cache: fc, Fetcher: up, HostLimiter: hostsem.New(8), Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rep checkReport
+	var escaped any
+	func() {
+		defer func() { escaped = recover() }()
+		rep = c.check(context.Background(), SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}, checkOpts{})
+	}()
+	if escaped != nil || rep.result != "failed" {
+		t.Fatalf("check: result %q, escaped panic %v; want failed and no panic", rep.result, escaped)
+	}
+	v, _ := c.locks.Load(suiteKey("http", "h", "/r/dists/x"))
+	mu := v.(*sync.Mutex)
+	if !mu.TryLock() {
+		t.Fatal("suite mutex leaked by a panicking logger in the check's recover handler")
+	}
+	mu.Unlock()
+	if got, _ := fc.suite("http", "h", "/r/dists/x"); got.CheckFailCount != 1 || got.LastCheckAt == nil {
+		t.Fatalf("suite after the panic = %+v, want the failed-check bookkeeping (streak 1, last_check_at set)", got)
+	}
+}
+
 // Spec C4: a recovered panic counts as a failed check, so it bumps
 // last_check_at and the cooldown gates the next trigger (otherwise every
 // client metadata request would re-run it: one upstream GET and one

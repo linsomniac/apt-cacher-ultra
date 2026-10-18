@@ -2,6 +2,7 @@ package freshness
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -167,5 +168,80 @@ func TestAdoptionFailure_RefusalIsNotAFailure(t *testing.T) {
 	}
 	if n := len(r.events("adoption_failing_persistently")); n != 0 {
 		t.Fatalf("a refusal raised %d persistent-failure warnings", n)
+	}
+}
+
+// Final review T M1 / S M8: a refused attempt logs nothing at WARN; the
+// backstop adoption_run_failed line drops to INFO for a refusal
+// (adoption_refused carries the reason and timing).
+func TestAdoptionFailure_RefusalLogsNoWarn(t *testing.T) {
+	r := newRetryRig(t, 0)
+	d2 := r.clock.now().Add(-time.Hour).Unix()
+	r.up.set(r.release("v2", d2))
+	r.check()
+	if r.row().CurrentSnapshotID == nil {
+		t.Fatal("setup: v2 not adopted")
+	}
+	mark := len(r.logs.String())
+	r.up.set(r.release("v1", d2-3600))
+	r.check() // refused: upstream_older
+	if strOf(r.row().AdoptionFailReason) != cache.ReasonUpstreamOlder {
+		t.Fatalf("setup: record reason %q, want upstream_older", strOf(r.row().AdoptionFailReason))
+	}
+	tail := r.logs.String()[mark:]
+	if strings.Contains(tail, `"level":"WARN"`) {
+		t.Fatalf("a refused attempt logged at WARN:\n%s", tail)
+	}
+	ev := r.events("adoption_run_failed")
+	if len(ev) != 1 || ev[0]["level"] != "INFO" {
+		t.Fatalf("adoption_run_failed = %v, want one INFO line", ev)
+	}
+}
+
+// Final review ruling A5: a refusal is a state, not a failure, but one
+// that has lasted 24 h (a vendor that stopped emitting Date freezes the
+// suite silently otherwise) logs WARN adoption_refused_persistently at the
+// streak milestones. A future streak start (backward clock step) restarts
+// the streak, so its age is 0.
+func TestAdoptionFailure_OldRefusalWarnsAtMilestones(t *testing.T) {
+	r := newRetryRig(t, 0)
+	ctx := context.Background()
+	ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}
+	now := r.clock.now()
+	cases := []struct {
+		name   string
+		count  int64         // the stored streak; the attempt makes it count+1
+		age    time.Duration // now - stored first_at
+		reason string
+		warn   bool
+	}{
+		{"milestone, 23 h old", 23, 23 * time.Hour, cache.ReasonUpstreamOlder, false},
+		{"milestone, 25 h old", 47, 25 * time.Hour, cache.ReasonUpstreamOlder, true},
+		{"no milestone, 30 h old", 48, 30 * time.Hour, cache.ReasonUpstreamOlder, false},
+		{"milestone, streak start in the future", 23, -24 * time.Hour, cache.ReasonUpstreamOlder, false},
+		{"rollback refusal, milestone, 2 days old", 95, 48 * time.Hour, cache.ReasonRollbackRefused, true},
+		{"failure, milestone, 2 days old", 47, 48 * time.Hour, "gpg_failed", false},
+	}
+	for _, tc := range cases {
+		first := now.Add(-tc.age).Unix()
+		if err := r.cache.RecordAdoptionFailure(ctx, "http", rigHost, rigSuite, cache.AdoptionFailure{
+			Hash: testHex64, Reason: tc.reason, Count: tc.count, FirstAt: first, LastAt: first, NextRetryAt: now.Unix()}); err != nil {
+			t.Fatal(err)
+		}
+		before := len(r.events("adoption_refused_persistently"))
+		r.checker.recordAdoptionFailure(&adoptionRequest{suite: ref, key: testHex64}, tc.reason)
+		evs := r.events("adoption_refused_persistently")
+		if got := len(evs) > before; got != tc.warn {
+			t.Errorf("%s: adoption_refused_persistently logged = %v, want %v", tc.name, got, tc.warn)
+			continue
+		}
+		if !tc.warn {
+			continue
+		}
+		e := evs[len(evs)-1]
+		if e["level"] != "WARN" || e["reason"] != tc.reason || e["fail_count"] != float64(tc.count+1) ||
+			e["failing_since_unixtime"] != float64(first) || e["canonical_host"] != rigHost || e["suite_path"] != rigSuite {
+			t.Errorf("%s: adoption_refused_persistently = %v", tc.name, e)
+		}
 	}
 }

@@ -2,6 +2,7 @@ package freshness
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -396,9 +397,44 @@ func TestAdoption_MaxDurationBoundsAStalledAdoption(t *testing.T) {
 	})
 }
 
-// Spec C4: CommitAdoption runs under context.WithoutCancel, so the end
-// of the adoption's context cannot abort a commit in progress.
+// Spec C4: CommitAdoption runs under context.WithoutCancel, so the
+// adoption deadline (adoption.max_duration) cannot abort the commit: an
+// adoption whose deadline passes after its member pipeline still commits.
 func TestAdoption_CommitSurvivesTheAdoptionDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := simtest.OpenCache(t)
+		seedStaleAnchorAt(t, c, rigHost, rigSuite)
+		members := newFakeFetcher()
+		pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
+		members.put(rigPkgsURL, pkgs)
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
+			HostLimiter: hostsem.New(8), Logger: simtest.DiscardLogger()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		req := &adoptionRequest{suite: SuiteRef{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite},
+			form: adoptionFormInline, bytes: datedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})}
+		// membersDone runs right before the commit: waiting there for the
+		// deadline models it expiring at the worst moment.
+		if err := ad.runRequest(ctx, req, func() { <-ctx.Done() }); err != nil {
+			t.Fatalf("commit aborted by the adoption deadline: %v", err)
+		}
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("setup: the deadline had not passed before the commit (ctx err %v)", ctx.Err())
+		}
+		if sf, err := c.GetSuiteFreshness(context.Background(), "http", rigHost, rigSuite); err != nil || sf.CurrentSnapshotID == nil {
+			t.Fatalf("no current snapshot after the commit (err %v)", err)
+		}
+	})
+}
+
+// Final review C M-1: a shutdown (the lifetime context cancelled) before
+// the commit starts commits nothing, so the stop is not held for up to
+// commitTimeout (the shipped unit's TimeoutStopSec is 35 s). The candidate
+// stays uncommitted (GC reaps it after its stale grace).
+func TestAdoption_ShutdownBeforeTheCommitCommitsNothing(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
 	env.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages", pkgs)
@@ -406,13 +442,18 @@ func TestAdoption_CommitSurvivesTheAdoptionDeadline(t *testing.T) {
 	defer cancel()
 	req := &adoptionRequest{suite: env.suite, form: adoptionFormInline,
 		bytes: datedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})}
-	// membersDone runs right before the commit: cancelling there models
-	// the deadline expiring at the worst moment.
-	if err := env.adopter.runRequest(ctx, req, cancel); err != nil {
-		t.Fatalf("commit aborted by the adoption context: %v", err)
+	// membersDone runs right before the commit: cancelling there models a
+	// shutdown at the worst moment.
+	err := env.adopter.runRequest(ctx, req, cancel)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runRequest = %v, want a shutdown error (context.Canceled)", err)
 	}
-	if currentSnapshotID(t, env) == 0 {
-		t.Fatal("no current snapshot after the commit")
+	sf, err := env.cache.GetSuiteFreshness(context.Background(), "http", env.suite.CanonicalHost, env.suite.SuitePath)
+	if err == nil && sf.CurrentSnapshotID != nil {
+		t.Fatalf("current snapshot %d after a shutdown before the commit, want none", *sf.CurrentSnapshotID)
+	}
+	if err != nil && !errors.Is(err, cache.ErrNotFound) {
+		t.Fatal(err)
 	}
 }
 

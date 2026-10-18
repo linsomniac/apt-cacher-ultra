@@ -1,9 +1,11 @@
 package freshness
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -12,6 +14,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
@@ -62,10 +65,10 @@ func popAll(q *schedQueues) []string {
 func TestSchedQueues_ClassesThenFIFO(t *testing.T) {
 	q := newSchedQueues()
 	one := int64(1)
-	q.enqueue(schedRow("a", "/f1", &one, 2))
-	q.enqueue(schedRow("a", "/n1", nil, 0))
-	q.enqueue(schedRow("a", "/h1", &one, 0))
-	q.enqueue(schedRow("a", "/h2", &one, 0))
+	q.enqueue(schedRow("a", "/f1", &one, 2), false)
+	q.enqueue(schedRow("a", "/n1", nil, 0), false)
+	q.enqueue(schedRow("a", "/h1", &one, 0), false)
+	q.enqueue(schedRow("a", "/h2", &one, 0), false)
 	got := popAll(q)
 	want := []string{"a/h1", "a/h2", "a/n1", "a/f1"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
@@ -79,7 +82,7 @@ func TestSchedQueues_RoundRobinOneInFlightPerHost(t *testing.T) {
 	q := newSchedQueues()
 	one := int64(1)
 	for _, s := range [][2]string{{"a", "/1"}, {"a", "/2"}, {"b", "/1"}, {"c", "/1"}, {"c", "/2"}} {
-		q.enqueue(schedRow(s[0], s[1], &one, 0))
+		q.enqueue(schedRow(s[0], s[1], &one, 0), false)
 	}
 	i1, _ := q.pop(admitAll)
 	i2, _ := q.pop(admitAll)
@@ -106,7 +109,7 @@ func TestSchedQueues_RotatesHosts(t *testing.T) {
 	q := newSchedQueues()
 	one := int64(1)
 	for _, s := range [][2]string{{"a", "/1"}, {"a", "/2"}, {"b", "/1"}, {"b", "/2"}} {
-		q.enqueue(schedRow(s[0], s[1], &one, 0))
+		q.enqueue(schedRow(s[0], s[1], &one, 0), false)
 	}
 	it, _ := q.pop(admitAll)
 	q.done(it)
@@ -145,19 +148,73 @@ func TestFailingAdoptionCount_ExcludesRefusals(t *testing.T) {
 	}
 }
 
+// renderedMetric returns the value of the unlabelled series name as
+// metrics.Default renders it, or "" if it is absent.
+func renderedMetric(name string) string {
+	var buf bytes.Buffer
+	metrics.Default.Render(&buf)
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if v, ok := strings.CutPrefix(line, name+" "); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// The spec C7 alert gauge: a tick counts failing records, not refusals
+// (final review T M3). Without an adopter the same records are inert
+// (Phase 1 parity, final review S I3): the gauge reports 0 and a due
+// retry does not queue the suite.
+func TestTick_AdoptionFailingSuitesGauge(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_800_000_000, 0)
+	recent := now.Add(-time.Minute).Unix()
+	fc := newFakeCache()
+	for _, rec := range []struct{ suite, reason string }{{"/fail", "gpg_failed"}, {"/refused", cache.ReasonUpstreamOlder}} {
+		seedFakeSuite(fc, "h", rec.suite, &recent)
+		if err := fc.RecordAdoptionFailure(ctx, "http", "h", rec.suite, cache.AdoptionFailure{
+			Hash: testHex64, Reason: rec.reason, Count: 2, FirstAt: recent, LastAt: recent, NextRetryAt: recent}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name    string
+		adopter *Adopter
+		gauge   string
+		queued  int
+	}{
+		{"with an adopter", &Adopter{}, "1", 2}, // both retries are due
+		{"without an adopter", nil, "0", 0},
+	} {
+		c, err := New(Config{Cache: fc, Fetcher: &changedUpstream{}, HostLimiter: hostsem.New(1),
+			Refresh: time.Hour, Adopter: tc.adopter, Logger: discardLogger(), now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := newSchedQueues()
+		c.tick(ctx, q)
+		if got := renderedMetric("acu_adoption_failing_suites"); got != tc.gauge {
+			t.Errorf("%s: acu_adoption_failing_suites = %q, want %s", tc.name, got, tc.gauge)
+		}
+		if q.len() != tc.queued {
+			t.Errorf("%s: %d suites queued, want %d", tc.name, q.len(), tc.queued)
+		}
+	}
+}
+
 func TestSchedQueues_NoDuplicatesWhileQueuedOrInFlight(t *testing.T) {
 	q := newSchedQueues()
 	one := int64(1)
 	s := schedRow("a", "/1", &one, 0)
-	if !q.enqueue(s) || q.enqueue(s) {
+	if !q.enqueue(s, false) || q.enqueue(s, false) {
 		t.Fatal("a queued suite was queued twice")
 	}
 	it, _ := q.pop(admitAll)
-	if q.enqueue(s) {
+	if q.enqueue(s, false) {
 		t.Fatal("a suite was queued while its check was in flight")
 	}
 	q.done(it)
-	if !q.enqueue(s) {
+	if !q.enqueue(s, false) {
 		t.Fatal("a suite could not be queued again after its check")
 	}
 }
@@ -165,8 +222,8 @@ func TestSchedQueues_NoDuplicatesWhileQueuedOrInFlight(t *testing.T) {
 func TestSchedQueues_PrunesIdleHosts(t *testing.T) {
 	q := newSchedQueues()
 	one := int64(1)
-	q.enqueue(schedRow("a", "/1", &one, 0))
-	q.enqueue(schedRow("b", "/1", &one, 0))
+	q.enqueue(schedRow("a", "/1", &one, 0), false)
+	q.enqueue(schedRow("b", "/1", &one, 0), false)
 	it, _ := q.pop(admitAll)
 	q.done(it)
 	if len(q.hosts) != 1 || len(q.order) != 1 || q.len() != 1 {
@@ -175,8 +232,9 @@ func TestSchedQueues_PrunesIdleHosts(t *testing.T) {
 }
 
 func TestSuiteDue(t *testing.T) {
+	// suiteDue only asks whether an adopter is wired.
 	c, err := New(Config{Cache: newFakeCache(), Fetcher: &changedUpstream{}, HostLimiter: hostsem.New(1),
-		Refresh: time.Hour, Logger: discardLogger()})
+		Refresh: time.Hour, Adopter: &Adopter{}, Logger: discardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,10 +258,39 @@ func TestSuiteDue(t *testing.T) {
 		{"adoption retry due", cache.SuiteFreshness{LastSuccessAt: at(-time.Minute), AdoptionFailCount: 1, AdoptionNextRetryAt: at(-time.Second)}, true},
 		{"adoption retry due exactly now", cache.SuiteFreshness{LastSuccessAt: at(-time.Minute), AdoptionFailCount: 1, AdoptionNextRetryAt: at(0)}, true},
 		{"adoption retry not yet due", cache.SuiteFreshness{LastSuccessAt: at(-time.Minute), AdoptionFailCount: 1, AdoptionNextRetryAt: at(time.Minute)}, false},
+		// Spec C4: a refused client check leaves the suite due.
+		{"pending change, no record", cache.SuiteFreshness{LastSuccessAt: at(-time.Minute), InReleaseChangeSeenAt: at(-time.Minute)}, true},
+		{"pending change with a record waits for its retry", cache.SuiteFreshness{LastSuccessAt: at(-time.Minute), InReleaseChangeSeenAt: at(-time.Minute),
+			AdoptionFailCount: 1, AdoptionNextRetryAt: at(time.Minute)}, false},
+		{"pending change inside the unknown backoff", cache.SuiteFreshness{LastSuccessAt: at(-time.Minute), InReleaseChangeSeenAt: at(-time.Minute),
+			LastCheckAt: at(-time.Minute), CheckFailCount: 1}, false},
 	}
 	for _, tc := range cases {
 		if got := c.suiteDue(tc.s, now); got != tc.want {
 			t.Errorf("%s: suiteDue = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// Phase 1 parity: with no adopter nothing is attempted, so neither a
+	// pending change nor a record left by an earlier run makes a suite due.
+	p1, err := New(Config{Cache: newFakeCache(), Fetcher: &changedUpstream{}, HostLimiter: hostsem.New(1),
+		Refresh: time.Hour, Logger: discardLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	phase1 := []struct {
+		name string
+		s    cache.SuiteFreshness
+		want bool
+	}{
+		{"fresh", cache.SuiteFreshness{LastSuccessAt: at(-time.Minute)}, false},
+		{"stale", cache.SuiteFreshness{LastSuccessAt: at(-2 * time.Hour)}, true},
+		{"pending change", cache.SuiteFreshness{LastSuccessAt: at(-time.Minute), InReleaseChangeSeenAt: at(-time.Minute)}, false},
+		{"adoption retry due", cache.SuiteFreshness{LastSuccessAt: at(-time.Minute), AdoptionFailCount: 1, AdoptionNextRetryAt: at(-time.Second)}, false},
+	}
+	for _, tc := range phase1 {
+		if got := p1.suiteDue(tc.s, now); got != tc.want {
+			t.Errorf("no adopter, %s: suiteDue = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
@@ -336,9 +423,9 @@ func TestRun_SurvivesARescheduleRestartPanic(t *testing.T) {
 }
 
 // A worker sends done for every item it received, even when the check's
-// recover path itself panics (here reportPanic's log call): a dispatched
-// item without its done would leave its host in flight and a worker slot
-// lost for good.
+// recover path itself panics (here reportPanic's log call in
+// checkRecovered): a dispatched item without its done would leave its host
+// in flight and a worker slot lost for good.
 func TestCheckWorker_SendsDoneWhenTheRecoverPathPanics(t *testing.T) {
 	fc := newFakeCache()
 	seedFakeSuite(fc, "h", "/r/dists/x", nil)
@@ -349,6 +436,10 @@ func TestCheckWorker_SendsDoneWhenTheRecoverPathPanics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// checkLockedSafe swallows a panic in its own recover handler, so the
+	// panic must come from outside it to reach checkRecovered's handler: a
+	// lock-map entry that is not a mutex fails check's type assertion.
+	c.locks.Store(suiteKey("http", "h", "/r/dists/x"), struct{}{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	work := make(chan schedItem)
@@ -443,10 +534,10 @@ func TestSchedQueues_ParkKeepsTheSuiteQueued(t *testing.T) {
 	q := newSchedQueues()
 	one := int64(1)
 	s := schedRow("a", "/1", &one, 0)
-	q.enqueue(s)
+	q.enqueue(s, false)
 	it, _ := q.pop(admitAll)
 	q.park(it, true)
-	if q.enqueue(s) {
+	if q.enqueue(s, false) {
 		t.Fatal("a tick re-queued a waiting suite")
 	}
 	if q.len() != 1 || q.waiting() != 1 {
@@ -464,10 +555,10 @@ func TestSchedQueues_ParkKeepsTheSuiteQueued(t *testing.T) {
 func TestSchedQueues_PopOffersAdmissibleWaitersFirst(t *testing.T) {
 	one := int64(1)
 	q := newSchedQueues()
-	q.enqueue(schedRow("a", "/w", &one, 0))
+	q.enqueue(schedRow("a", "/w", &one, 0), false)
 	w, _ := q.pop(admitAll)
 	q.park(w, true)
-	q.enqueue(schedRow("a", "/h", &one, 0))
+	q.enqueue(schedRow("a", "/h", &one, 0), false)
 	it, _ := q.pop(admitNone)
 	if it.ref.SuitePath != "/h" {
 		t.Fatalf("with no free capacity got %v, want the healthy suite", it.ref)
@@ -478,10 +569,10 @@ func TestSchedQueues_PopOffersAdmissibleWaitersFirst(t *testing.T) {
 	}
 
 	q2 := newSchedQueues()
-	q2.enqueue(schedRow("a", "/u", &one, 0))
+	q2.enqueue(schedRow("a", "/u", &one, 0), false)
 	u, _ := q2.pop(admitNone)
 	q2.park(u, false)
-	q2.enqueue(schedRow("a", "/s", &one, 0))
+	q2.enqueue(schedRow("a", "/s", &one, 0), false)
 	s, _ := q2.pop(admitNone)
 	q2.park(s, true)
 	signedOnly := func(_ string, signed bool) bool { return signed }
@@ -496,7 +587,7 @@ func TestSchedQueues_ReparkKeepsItsPlace(t *testing.T) {
 	q := newSchedQueues()
 	one := int64(1)
 	for _, p := range []string{"/1", "/2"} {
-		q.enqueue(schedRow("a", p, &one, 0))
+		q.enqueue(schedRow("a", p, &one, 0), false)
 		it, _ := q.pop(admitNone)
 		q.park(it, true)
 	}
@@ -516,7 +607,7 @@ func TestSchedQueues_RoundRobinAcrossWaitingHosts(t *testing.T) {
 	q := newSchedQueues()
 	one := int64(1)
 	for _, s := range [][2]string{{"a", "/1"}, {"a", "/2"}, {"b", "/1"}, {"b", "/2"}} {
-		q.enqueue(schedRow(s[0], s[1], &one, 0))
+		q.enqueue(schedRow(s[0], s[1], &one, 0), false)
 	}
 	for i := 0; i < 4; i++ {
 		it, ok := q.pop(admitNone)
@@ -545,13 +636,13 @@ func TestSchedQueues_BusyOfferIsHeldUntilTheNextWake(t *testing.T) {
 	one := int64(1)
 	s := schedRow("a", "/1", &one, 0)
 	for _, row := range []cache.SuiteFreshness{s, schedRow("a", "/2", &one, 0)} {
-		q.enqueue(row)
+		q.enqueue(row, false)
 		it, _ := q.pop(admitNone)
 		q.finish(checkDone{item: it, report: checkReport{result: "changed_queued", signedCurrent: true}})
 	}
 	head, _ := q.pop(admitAll)
 	q.finish(checkDone{item: head, report: checkReport{result: resultBusy}})
-	if q.enqueue(s) || q.len() != 2 || q.waiting() != 2 {
+	if q.enqueue(s, false) || q.len() != 2 || q.waiting() != 2 {
 		t.Fatalf("a busy offer dropped the suite: len %d waiting %d, want 2 and 2", q.len(), q.waiting())
 	}
 	it, _ := q.pop(admitAll)
@@ -575,7 +666,7 @@ func TestSchedQueues_BusyOfferIsHeldUntilTheNextWake(t *testing.T) {
 func TestSchedQueues_LostOfferIsHeldUntilTheNextWake(t *testing.T) {
 	q := newSchedQueues()
 	one := int64(1)
-	q.enqueue(schedRow("a", "/1", &one, 0))
+	q.enqueue(schedRow("a", "/1", &one, 0), false)
 	it, _ := q.pop(admitNone)
 	q.finish(checkDone{item: it, report: checkReport{result: "changed_queued"}})
 	it, _ = q.pop(admitAll)
@@ -598,7 +689,7 @@ func TestSchedQueues_OnlyQueuedResultsPark(t *testing.T) {
 	one := int64(1)
 	for _, result := range []string{"changed_deferred", "failed", resultSkipped, "not_modified", "unchanged", "changed"} {
 		q := newSchedQueues()
-		q.enqueue(schedRow("a", "/1", &one, 0))
+		q.enqueue(schedRow("a", "/1", &one, 0), false)
 		it, _ := q.pop(admitAll)
 		q.finish(checkDone{item: it, report: checkReport{result: result}})
 		if q.waiting() != 0 || q.len() != 0 {

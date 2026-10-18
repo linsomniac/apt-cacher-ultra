@@ -81,7 +81,8 @@ var (
 
 	// adoptionFailingSuites is the number of suites whose latest adoption
 	// attempt failed (refusal states excluded, spec C7), refreshed every
-	// scheduler tick.
+	// scheduler tick. 0 when no adopter is wired: records left by an
+	// earlier run with adoption enabled are inert.
 	adoptionFailingSuites = metrics.NewGauge(
 		"acu_adoption_failing_suites",
 		"Suites whose latest adoption attempt failed, refusal states excluded; refreshed every scheduler tick (spec C7).",
