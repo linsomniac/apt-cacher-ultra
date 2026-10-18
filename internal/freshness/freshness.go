@@ -744,8 +744,8 @@ func (c *Checker) bumpFailedCheck(ctx context.Context, scheme, host, suitePath s
 //
 // Form dispatch (SPEC2 §7.6.3):
 //   - If the suite has a current snapshot, the form is read from the
-//     snapshot row: snapshot.release_hash != nil → detached, otherwise
-//     inline. The check then issues a conditional GET against
+//     snapshot row's anchor_form (snap.Form): detached → detached,
+//     otherwise inline. The check then issues a conditional GET against
 //     InRelease (inline) or Release (detached).
 //   - For first-ever checks (no current snapshot), inline is tried
 //     first. If the inline conditional GET 404s AND a Release url_path
@@ -839,9 +839,9 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 		SuitePath:       suitePath,
 	}
 
-	// Form preference: if there's a current snapshot, the form is
-	// determined by which hash columns it has set. Otherwise default
-	// to inline; the inline path triggers a detached fallback on 404.
+	// Form preference: if there's a current snapshot, the form is its
+	// anchor_form (snap.Form). Otherwise default to inline; the inline
+	// path triggers a detached fallback on 404.
 	form := c.detectForm(ctx, cur)
 	if form == adoptionFormDetached {
 		out.req, out.repair = c.checkLockedDetached(ctx, fetchCtx, out, cur, suite, now, nowUnix)
@@ -858,7 +858,8 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 }
 
 // detectForm reads the suite's current snapshot (if any) and returns
-// the form whose hash columns are populated. First-ever suites
+// its anchor_form (snap.Form): detached, or inline for anything else
+// until phase E dispatches the unsigned forms. First-ever suites
 // (cur.CurrentSnapshotID == nil) and snapshots that fail to load
 // default to inline; the inline-path fallback handles the boot-strap
 // case for detached-only upstreams.

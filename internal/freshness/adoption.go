@@ -387,8 +387,9 @@ var errAdoptionMemberSkipped = errors.New("adoption_member_skipped")
 
 // AdoptionConfig bundles Adopter dependencies. Required: Cache, Fetcher,
 // Verifier, HostLimiter. Optional: MaxConcurrent (0 = unlimited),
-// MaxDuration (0 = 30m), MemberFetchTimeout (per-member upstream budget — adopters can run
-// long; we want each member call bounded), Logger.
+// MaxDuration (0 = 30m, bounds the whole run; each member fetch is
+// bounded by the Fetcher's own upstream timeouts), Logger, and the knobs
+// documented on the fields below.
 type AdoptionConfig struct {
 	Cache       *cache.Cache
 	Fetcher     AdoptionFetcher
