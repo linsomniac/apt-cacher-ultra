@@ -79,13 +79,17 @@ func TestTick_FutureLastSuccessAtIsDue(t *testing.T) {
 	_ = fc.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x", LastSuccessAt: &future})
 	up := &changedUpstream{body: []byte("new")}
+	logs := &lockedBuffer{}
 	c, err := New(Config{Cache: fc, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
-		Logger: discardLogger(), now: func() time.Time { return now }})
+		Logger: slog.New(slog.NewJSONHandler(logs, nil)), now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.tick(context.Background())
+	drainTick(context.Background(), c)
 	if up.calls.Load() != 1 {
 		t.Fatalf("scheduler skipped a suite whose last_success_at is in the future")
+	}
+	if !strings.Contains(logs.String(), `"stamp":"last_success_at"`) {
+		t.Fatalf("the scheduler path did not report the clock step; log:\n%s", logs.String())
 	}
 }

@@ -29,7 +29,8 @@ import (
 // AIDEV-NOTE: metrics added by the flat-repository work, outside the
 // SPEC5 §10.4.3 inventory: acu_clock_steps_detected_total (spec C4) and
 // acu_legacy_snapshots_quarantined_total (spec §6.1, startup legacy
-// trust audit). Both are unlabelled counters.
+// trust audit), both unlabelled counters; acu_adoption_failing_suites
+// (spec C7, unlabelled gauge).
 var (
 	freshnessCheckTotal = metrics.NewCounterWithCap(
 		"acu_freshness_check_total",
@@ -75,6 +76,14 @@ var (
 	legacyQuarantinedTotal = metrics.NewCounter(
 		"acu_legacy_snapshots_quarantined_total",
 		"Pre-v7 snapshots quarantined by the startup legacy trust audit.",
+	)
+
+	// adoptionFailingSuites is the number of suites whose latest adoption
+	// attempt failed (refusal states excluded, spec C7), refreshed every
+	// scheduler tick.
+	adoptionFailingSuites = metrics.NewGauge(
+		"acu_adoption_failing_suites",
+		"Suites whose latest adoption attempt failed, refusal states excluded; refreshed every scheduler tick (spec C7).",
 	)
 
 	adoptionTotal = metrics.NewCounterWithCap(

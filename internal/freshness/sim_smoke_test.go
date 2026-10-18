@@ -2,6 +2,7 @@ package freshness
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -14,7 +15,8 @@ import (
 
 // startSimChecker seeds one suite (/r/dists/x on host h) in a real cache
 // and runs a checker's scheduler against a 304-answering upstream. The
-// returned stop function cancels the scheduler and drains it.
+// returned stop function cancels the scheduler and drains it; it is safe
+// to call more than once and also runs at test cleanup.
 func startSimChecker(t *testing.T, refresh time.Duration) (up *simtest.StaticConditional, stop func()) {
 	t.Helper()
 	c := simtest.OpenCache(t)
@@ -39,11 +41,19 @@ func startSimChecker(t *testing.T, refresh time.Duration) (up *simtest.StaticCon
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() { chk.Run(runCtx); close(done) }()
-	return up, func() {
-		cancel()
-		<-done
-		chk.WaitForAdoptions()
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			<-done
+			chk.WaitForAdoptions()
+		})
 	}
+	// A t.Fatal before the caller's stop must not leave Run running in
+	// the bubble; registered after OpenCache, so it runs before the
+	// cache closes.
+	t.Cleanup(stop)
+	return up, stop
 }
 
 // Phase A DoD: the real cache, checker and scheduler run for 30 virtual
@@ -57,10 +67,9 @@ func TestSimSmoke_30DaysPeriodicRefresh(t *testing.T) {
 		// Ticks run every refresh/4 = 30m. The first tick (30m) checks the
 		// never-succeeded suite; after that a check lands whenever
 		// last_success_at is 2h old: 30m, 2h30m, ... = 360 checks in 30
-		// days. synctest makes this exact; the slack only absorbs an
-		// off-by-one at the window edges.
-		if got := up.Calls(); got < 358 || got > 362 {
-			t.Fatalf("checks in 30 virtual days = %d, want 360 (358..362)", got)
+		// days. synctest makes this exact.
+		if got := up.Calls(); got != 360 {
+			t.Fatalf("checks in 30 virtual days = %d, want exactly 360", got)
 		}
 	})
 }

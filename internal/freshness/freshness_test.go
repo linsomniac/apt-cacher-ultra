@@ -35,6 +35,7 @@ type fakeCache struct {
 	getErr    error
 	putErr    error
 	lookupErr error
+	listHook  func() // called at the top of ListSuites, before the mutex
 
 	putCount atomic.Int64
 }
@@ -80,6 +81,9 @@ func (f *fakeCache) PutSuiteFreshness(ctx context.Context, s cache.SuiteFreshnes
 }
 
 func (f *fakeCache) ListSuites(ctx context.Context) ([]cache.SuiteFreshness, error) {
+	if h := f.listHook; h != nil {
+		h()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.listErr != nil {
@@ -673,7 +677,7 @@ func TestTick_FilersByLastSuccessAt(t *testing.T) {
 		Logger:   discardLogger(),
 		now:      func() time.Time { return now },
 	})
-	c.tick(context.Background())
+	drainTick(context.Background(), c)
 
 	if hits.Load() != 1 {
 		t.Errorf("upstream hits = %d, want 1 (stale only)", hits.Load())
@@ -699,10 +703,12 @@ func TestStaleSuiteCounts(t *testing.T) {
 		mk(nil, i(7)),     // never-succeeded      -> not "went stale", skip
 		mk(i(9000), i(7)), // in the future (clock step) -> infinitely old: count adopted
 		mk(i(3001), i(7)), // 1 s ahead, within tolerance -> fresh
+		mk(i(3002), i(7)), // 2 s ahead: the tolerance edge -> fresh
+		mk(i(3003), i(7)), // 3 s ahead -> infinitely old: count adopted
 	}
 	adopted, unadopted := staleSuiteCounts(suites, staleBefore, now)
-	if adopted != 3 {
-		t.Errorf("adopted stale = %d, want 3", adopted)
+	if adopted != 4 {
+		t.Errorf("adopted stale = %d, want 4", adopted)
 	}
 	if unadopted != 1 {
 		t.Errorf("unadopted stale = %d, want 1", unadopted)
