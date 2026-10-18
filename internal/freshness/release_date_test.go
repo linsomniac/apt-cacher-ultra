@@ -72,6 +72,23 @@ func TestParseAptDate(t *testing.T) {
 	}
 }
 
+// Every month name, in mixed case, maps to its month (apt's MonthConv
+// looks at up to three letters, case-insensitively). A swapped month would
+// make a Release dated in it release_date_in_future (a failure) or
+// upstream_older (a refusal with no lag shown) and freeze the suite (final
+// review T M5).
+func TestParseAptDate_EveryMonth(t *testing.T) {
+	names := []string{"jAN", "Feb", "MAR", "apr", "May", "JUN", "jul", "AUG", "Sep", "oCT", "nov", "DEC"}
+	for i, name := range names {
+		mo := time.Month(i + 1)
+		in := "Mon, 15 " + name + " 2024 12:30:45 UTC"
+		got, ok := parseAptDate(in)
+		if want := utc(2024, mo, 15, 12, 30, 45); !ok || got != want {
+			t.Errorf("parseAptDate(%q) = %d, %v; want %d (%s 15), true", in, got, ok, want, mo)
+		}
+	}
+}
+
 func TestReleaseDate(t *testing.T) {
 	cases := map[string]int64{
 		"Origin: X\nDate: Sun, 06 Nov 1994 08:49:37 GMT\nSHA256:\n x 1 a\n": rfcExample,

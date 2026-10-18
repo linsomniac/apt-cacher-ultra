@@ -89,8 +89,11 @@ func TestSimLim1_DeterministicFailureAttemptsPerDay(t *testing.T) {
 		if a := s.ver.calls(); a < 18 || a > 30 {
 			t.Fatalf("attempts in a day = %d, want 18..30", a)
 		}
-		if n := len(s.up.Calls(rigAnchorURL)); n < 90 {
-			t.Fatalf("checks in a day = %d, want >= 90 (liveness)", n)
+		// About one check per refresh (96 a day) plus the retries: a
+		// deferred check must count as a success, or the suite would be
+		// due every tick (4× the checks; final review T M6).
+		if n := len(s.up.Calls(rigAnchorURL)); n < 90 || n > 110 {
+			t.Fatalf("checks in a day = %d, want 90..110 (liveness, and no check every tick)", n)
 		}
 	})
 }

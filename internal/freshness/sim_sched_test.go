@@ -316,9 +316,9 @@ func TestSimScheduler_FiveHundredStallingOneHealthy(t *testing.T) {
 			t.Fatal("S never checked in phase 1")
 		}
 		time.Sleep(3*time.Hour + 11*time.Minute)
-		calls := up.Calls(sURL)[before-1:]
-		if len(calls) < 3 {
-			t.Fatalf("S checked %d times in phase 2, want at least 3", len(calls)-1)
+		calls := up.Calls(sURL)[before-1:] // phase 1's last check, then phase 2's
+		if n := len(calls) - 1; n < 2 {
+			t.Fatalf("S checked %d times in phase 2, want at least 2", n)
 		}
 		for i := 1; i < len(calls); i++ {
 			if gap := calls[i].Sub(calls[i-1]); gap > refresh+tick+checkDeadline {
@@ -337,10 +337,26 @@ func TestSimScheduler_FiveHundredStallingOneHealthy(t *testing.T) {
 			up.Set("http://a"+suite+"/InRelease", simtest.Stall())
 		}
 		time.Sleep(time.Hour + 3*time.Minute)
+		runtime.Gosched()
+		base := runtime.NumGoroutine()
+		maxG := base
 		restart := time.Now()
 		_, stop2 := startSched(t, cfg)
-		time.Sleep(tick + checkDeadline + time.Minute)
+		// Sample goroutines every 61 s (off the tick grid) through the
+		// first tick after the restart, when 521 suites are due at once.
+		for phase3 := tick + checkDeadline + time.Minute; time.Since(restart)+61*time.Second <= phase3; {
+			time.Sleep(61 * time.Second)
+			maxG = max(maxG, runtime.NumGoroutine())
+		}
+		time.Sleep(tick + checkDeadline + time.Minute - time.Since(restart))
 		stop2()
+		// Workers + Run, plus explicit slack for transient goroutines (the
+		// cache writer's work): the burst is served by the pool, not by a
+		// goroutine per due suite (overview DoD goroutine bound).
+		const slack = 8
+		if limit := base + checkWorkers + 1 + slack; maxG > limit {
+			t.Fatalf("goroutines peaked at %d after the restart, limit %d", maxG, limit)
+		}
 		after := up.Calls(sURL)
 		last := after[len(after)-1]
 		if last.Before(restart) || last.Sub(restart) > tick+checkDeadline {
@@ -406,6 +422,13 @@ func (m *simMembers) Fetch(ctx context.Context, target *fetch.Target, dst fetch.
 // back — each re-checked as soon as the previous one releases it, never
 // probed by ticks while it waits; both drips end timed_out; the degraded
 // suite's checks continue; goroutines stay bounded.
+//
+// AIDEV-NOTE: the signed suites' anchors answer 1 s late so the drips
+// always ask for a slot first on the first tick: same-instant goroutine
+// order inside a bubble is not deterministic, and without the delay about
+// half the runs took a "pairs" path where no drip held a slot during the
+// burst, leaving the reserved-slot claim unexercised (final review T I4).
+// The 10-minute assertion pins the intended path.
 func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
@@ -440,7 +463,7 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 			members.put(pkgsURL(host), pkgsFor("2-"+host))
 			members.delay[pkgsURL(host)] = time.Minute
 			v2[host] = rel("v2-"+host, pkgsFor("2-"+host))
-			up.Set(anchorURL(host), simtest.Serve(v2[host]))
+			up.Set(anchorURL(host), simtest.After(time.Second, simtest.Serve(v2[host])))
 			normal = append(normal, host)
 		}
 		for _, host := range []string{"drip1", "drip2"} {
@@ -460,7 +483,7 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 		const refresh = 15 * time.Minute
 		tick := refresh / 4
 		_, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: refresh,
-			Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger()})
+			Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }})
 		// sample advances to until (measured from t0), sampling goroutines
 		// every 61 s: off the 3 m 45 s tick grid.
 		sample := func(until time.Duration) {
@@ -471,9 +494,24 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 			time.Sleep(until - time.Since(t0))
 		}
 
+		// (0) Mid-burst, exactly one first adoption holds the general slot
+		// while the signed suites take turns in the reserved one, and the
+		// waiting suites are counted by the gauge.
+		sample(10 * time.Minute)
+		members.mu.Lock()
+		inFlight := members.inFlight
+		members.mu.Unlock()
+		if inFlight != 1 {
+			t.Fatalf("%d first adoptions running at 10 m, want exactly 1 (the burst must run beside one)", inFlight)
+		}
+		if g := renderedMetric("acu_freshness_waiting_for_slot"); g == "" || g == "0" {
+			t.Fatalf("acu_freshness_waiting_for_slot = %q at 10 m, want > 0 while suites wait", g)
+		}
+
 		// (1) All twenty adopt v2 within one tick + 20 one-minute adoptions
-		// + D (≈ 25 m 45 s; re-offering only on ticks would need ≈ 75 min).
-		bound := tick + 20*time.Minute + checkDeadline
+		// + D (≈ 25 m 45 s; re-offering only on ticks would need ≈ 75 min),
+		// plus the 20 × 1 s their anchors take to answer.
+		bound := tick + 20*time.Minute + checkDeadline + 20*time.Second
 		sample(bound)
 		for _, host := range normal {
 			sf, err := c.GetSuiteFreshness(ctx, "http", host, rigSuite)
@@ -485,7 +523,10 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 				t.Fatalf("%s had not adopted v2 %v after the start (bound: one tick + 20 × 1 min + D)", host, bound)
 			}
 		}
-		sample(2 * time.Hour)
+		sample(2*time.Hour + 7*time.Minute) // off the tick grid
+		if g := renderedMetric("acu_freshness_waiting_for_slot"); g != "0" {
+			t.Fatalf("acu_freshness_waiting_for_slot = %q at the end, want 0", g)
+		}
 		stop()
 
 		members.mu.Lock()

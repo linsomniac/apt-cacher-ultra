@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -184,6 +186,88 @@ func TestGate_T1StormAfterFailureCostsNothing(t *testing.T) {
 	}
 	if lastResult(r) != "changed_deferred" {
 		t.Fatalf("last result = %q, want changed_deferred", lastResult(r))
+	}
+}
+
+// Spec C7: "Refusal states use the same record and schedule." After an
+// upstream_older refusal, a storm of checks before the retry time costs no
+// verification: each defers with reason upstream_older (final review T I2;
+// a mirror stuck on older content must not cost one download and one
+// verification per cooldown).
+func TestGate_RefusalStormCostsNothing(t *testing.T) {
+	r := newRetryRig(t, 0)
+	d2 := r.clock.now().Add(-time.Hour).Unix()
+	r.up.set(r.release("v2", d2))
+	r.check()
+	if r.row().CurrentSnapshotID == nil {
+		t.Fatal("setup: v2 not adopted")
+	}
+	r.up.set(r.release("v1", d2-3600))
+	r.check() // refused: upstream_older
+	if strOf(r.row().AdoptionFailReason) != cache.ReasonUpstreamOlder {
+		t.Fatalf("setup: record reason %q, want upstream_older", strOf(r.row().AdoptionFailReason))
+	}
+	before := r.ver.calls()
+	for i := 0; i < 20; i++ {
+		r.check()
+	}
+	if n := r.ver.calls() - before; n != 0 {
+		t.Fatalf("20 checks after a refusal cost %d verifications, want 0 (refused content waits for its retry)", n)
+	}
+	ev := r.events("freshness_check")
+	if last := ev[len(ev)-1]; last["result"] != "changed_deferred" || last["reason"] != cache.ReasonUpstreamOlder {
+		t.Fatalf("last freshness_check = %v, want changed_deferred with reason upstream_older", last)
+	}
+}
+
+// recordProbeCache wraps the checker's cache and, when the adoption
+// goroutine writes its failure record, notes whether the suite mutex is
+// still held at that moment.
+type recordProbeCache struct {
+	Cache
+	chk              atomic.Pointer[Checker]
+	key              string
+	recorded, locked atomic.Bool
+}
+
+func (p *recordProbeCache) RecordAdoptionFailure(ctx context.Context, s, h, sp string, f cache.AdoptionFailure) error {
+	p.recorded.Store(true)
+	if v, ok := p.chk.Load().locks.Load(p.key); ok {
+		if mu := v.(*sync.Mutex); mu.TryLock() {
+			mu.Unlock()
+		} else {
+			p.locked.Store(true)
+		}
+	}
+	return p.Cache.RecordAdoptionFailure(ctx, s, h, sp, f)
+}
+
+// Spec C7: the failure record is written before the suite mutex is
+// released (error path; the panic path is pinned by
+// TestCheck_AdoptionPanicRecoveredBeforeMutexRelease). Otherwise a check
+// that wins the mutex in between sees no record and attempts the failing
+// content again — the storm TestGate_T1StormAfterFailureCostsNothing
+// cannot see, because the rig waits for each adoption (final review T I3).
+func TestGate_RecordWrittenBeforeTheMutexIsReleased(t *testing.T) {
+	r := newRetryRig(t, 0)
+	probe := &recordProbeCache{Cache: r.cache, key: suiteKey("http", rigHost, rigSuite)}
+	chk, err := New(Config{Cache: probe, Fetcher: r.up, HostLimiter: hostsem.New(8),
+		Refresh: 15 * time.Minute, Adopter: r.adopter, Logger: discardLogger(),
+		now: r.clock.now, rand: func() float64 { return 0.5 }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe.chk.Store(chk)
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	chk.Check(context.Background(), "http", rigHost, rigSuite)
+	chk.WaitForAdoptions()
+	if !probe.recorded.Load() {
+		t.Fatal("setup: no failure recorded")
+	}
+	if !probe.locked.Load() {
+		t.Fatal("the failure record was written after the suite mutex was released (spec C7: before)")
 	}
 }
 

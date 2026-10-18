@@ -153,7 +153,7 @@ type retryRig struct {
 func newRetryRig(t *testing.T, cooldown time.Duration) *retryRig {
 	t.Helper()
 	ctx := context.Background()
-	c, err := cache.Open(ctx, t.TempDir(), nil)
+	c, err := cache.Open(ctx, t.TempDir(), discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func newRetryRig(t *testing.T, cooldown time.Duration) *retryRig {
 	}
 	r.members.put(rigPkgsURL, r.pkgs)
 	r.adopter, err = NewAdopter(AdoptionConfig{Cache: c, Fetcher: r.members, Verifier: r.ver,
-		HostLimiter: hostsem.New(8), MaxConcurrent: 2, now: r.clock.now})
+		HostLimiter: hostsem.New(8), MaxConcurrent: 2, Logger: discardLogger(), now: r.clock.now})
 	if err != nil {
 		t.Fatal(err)
 	}
