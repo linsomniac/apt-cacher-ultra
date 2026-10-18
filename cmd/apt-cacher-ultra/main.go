@@ -23,6 +23,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
 	"github.com/linsomniac/apt-cacher-ultra/internal/gpg"
@@ -363,6 +364,7 @@ func serveListeners(
 		"adoption_accept_any_signer", cfg.Adoption.AcceptAnySigner,
 		"adoption_tolerate_optional_member_failures", cfg.Adoption.TolerateOptionalMemberFailures,
 		"adoption_hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
+		"adoption_flip_quiet_period", cfg.Adoption.FlipQuietPeriod.Duration,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"hold_packages_window", cfg.HoldPackages.Window.Duration,
 		"retention_max_versions_per_package", cfg.Retention.MaxVersionsPerPackage,
@@ -478,7 +480,7 @@ func serveListeners(
 	// single unreadable anchor, or a panic auditing one snapshot, is
 	// deferred inside the audit, not returned.
 	if _, err := freshness.RunLegacyTrustAudit(ctx, c, logger); err != nil {
-		return fmt.Errorf("legacy trust audit: %w", err)
+		return err // already prefixed "legacy trust audit:"
 	}
 
 	// SPEC4 §4.2 steps 5 + 6: pool/ orphan scan + one-shot GC pass.
@@ -585,17 +587,7 @@ func serveListeners(
 		return fmt.Errorf("build freshness checker: %w", err)
 	}
 
-	h, err := handler.New(handler.Config{
-		Parser:              parser,
-		Cache:               c,
-		Fetch:               fetchClient,
-		HostLimiter:         hostLimiter,
-		Logger:              logger,
-		Freshness:           freshChecker,
-		Serve:               cfg.Serve,
-		RefuseUnvouchedDebs: cfg.Integrity.RefuseUnvouchedDebs,
-		AdoptionEnabled:     cfg.Adoption.Enabled,
-	})
+	h, err := handler.New(handlerConfig(cfg, parser, c, fetchClient, hostLimiter, logger, freshChecker, adopter))
 	if err != nil {
 		return fmt.Errorf("build handler: %w", err)
 	}
@@ -796,6 +788,13 @@ func serveListeners(
 		}
 	}
 
+	// Spec C8 (phase C plan, design note 18): close the flip barrier
+	// before anything drains. An adoption waiting in it abandons its commit
+	// at once (and records nothing), held InRelease/Release requests are
+	// answered, and no commit starts late in the stop window. A commit
+	// already running is waited for below (waitLogged).
+	adopter.FlipGate().Close()
+
 	// SPEC §9.5 step 2: stop accepting (Shutdown closes the listener
 	// before draining), then wait up to shutdownTimeout for in-flight
 	// handlers to drain. Both listeners shut down concurrently under
@@ -927,8 +926,10 @@ func serveListeners(
 	// (the packaged unit's TimeoutStopSec=35 may SIGKILL first; SQLite
 	// rolls the transaction back). This Wait makes the shutdown
 	// deterministic before the cache is closed by the deferred
-	// c.Close().
-	freshChecker.WaitForAdoptions()
+	// c.Close(); past adoptionDrainNotice it is explained in the journal.
+	// No adoption is in the flip barrier any more: the gate was closed at
+	// the signal.
+	waitLogged(freshChecker.WaitForAdoptions, adoptionDrainNotice, logger)
 
 	wg.Wait()
 	logger.Info("apt-cacher-ultra stopped")
@@ -994,6 +995,13 @@ func buildAdopter(
 		return nil, nil, fmt.Errorf("build verifier: %w", err)
 	}
 
+	// Spec C8: the flip barrier. The handler registers anchor serves with
+	// the same gate (Adopter.FlipGate); 0s disables it.
+	flipGate, err := flipgate.New(flipgate.Config{Quiet: cfg.Adoption.FlipQuietPeriod.Duration})
+	if err != nil {
+		return nil, nil, fmt.Errorf("build flip barrier: %w", err)
+	}
+
 	adopter, err := freshness.NewAdopter(freshness.AdoptionConfig{
 		Cache:                          c,
 		Fetcher:                        fetchClient,
@@ -1001,6 +1009,7 @@ func buildAdopter(
 		HostLimiter:                    hostLimiter,
 		MaxConcurrent:                  cfg.Freshness.MaxConcurrentAdoptions,
 		MaxDuration:                    cfg.Adoption.MaxDuration.Duration,
+		FlipGate:                       flipGate,
 		HotPackagesWindow:              cfg.HotPackages.Window.Duration,
 		HotPrefetchBudget:              cfg.Adoption.HotPrefetchBudget.Duration,
 		MaxVersionsPerPackage:          cfg.Retention.MaxVersionsPerPackage,
@@ -1030,10 +1039,74 @@ func buildAdopter(
 		"required_architectures", cfg.Adoption.RequiredArchitectures,
 		"max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
 		"max_duration", cfg.Adoption.MaxDuration.Duration,
+		"flip_quiet_period", cfg.Adoption.FlipQuietPeriod.Duration,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
 	)
 	return adopter, keyring, nil
+}
+
+// handlerConfig assembles the request handler's configuration. The flip
+// barrier is the adopter's — nil with adoption disabled — so anchor serves
+// and commits meet at one gate (spec C8); retained by-hash searches the
+// displaced snapshots GC keeps (gc.keep_displaced).
+func handlerConfig(
+	cfg *config.Config,
+	parser *proxy.Parser,
+	c *cache.Cache,
+	fetchClient *fetch.Client,
+	hostLimiter *hostsem.Sem,
+	logger *slog.Logger,
+	freshChecker *freshness.Checker,
+	adopter *freshness.Adopter,
+) handler.Config {
+	return handler.Config{
+		Parser:              parser,
+		Cache:               c,
+		Fetch:               fetchClient,
+		HostLimiter:         hostLimiter,
+		Logger:              logger,
+		Freshness:           freshChecker,
+		Serve:               cfg.Serve,
+		RefuseUnvouchedDebs: cfg.Integrity.RefuseUnvouchedDebs,
+		AdoptionEnabled:     cfg.Adoption.Enabled,
+		FlipGate:            adopter.FlipGate(),
+		KeepDisplaced:       cfg.GC.KeepDisplaced,
+	}
+}
+
+// adoptionDrainNotice is how long the shutdown waits on in-flight
+// adoptions before it explains the wait (deferred minor B-64).
+const adoptionDrainNotice = 2 * time.Second
+
+// waitLogged runs wait and, once it has run for notice, logs
+// shutdown_waiting_for_adoptions at INFO (once), so a slow stop is
+// explained in the journal: the drain waits for adoption, repair and
+// reconcile goroutines, and a commit already running is never cancelled
+// and may take up to the 5-minute commit timeout. It returns when wait
+// does.
+func waitLogged(wait func(), notice time.Duration, logger *slog.Logger) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("shutdown wait panicked", "panic", r)
+			}
+		}()
+		wait()
+	}()
+	timer := time.NewTimer(notice)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return
+	case <-timer.C:
+		logger.Info("shutdown_waiting_for_adoptions",
+			"waited", notice,
+			"detail", "an adoption, repair or reconcile is still finishing: a commit already running is never cancelled (spec C4) and takes at most the 5-minute commit timeout; other work stops at its next cancellation point")
+	}
+	<-done
 }
 
 // keyringProvider adapts a *gpg.Keyring to admin.KeyringProvider so
