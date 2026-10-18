@@ -6514,6 +6514,9 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 	case out.lease != nil && out.repair != nil:
 		c.spawnRepair(mu, out)
 	default:
+		// A lease is only ever taken for a req or a repair; release
+		// defensively so the invariant does not rest on inspection.
+		out.lease.release()
 		mu.Unlock()
 	}
 	return out.report
@@ -7921,6 +7924,7 @@ In `docs/log-fields.md`'s "Operational events" table, add rows:
 | `adoption_failure_record_failed` | WARN (DEBUG when the suite was removed meanwhile) | `canonical_host`, `suite_path`, `err` | The failure record could not be written; the next check may retry sooner than scheduled. |
 | `adoption_retries_rescheduled` | INFO | `suites`, `spread_seconds` | At start, failing suites were given one retry spread over the refresh interval. |
 | `adoption_retries_reschedule_failed` | WARN | `err` | The start-time retry spread could not be written; failing suites keep their schedule. |
+| `adoption_repair_list_failed` | WARN | `canonical_host`, `suite_path`, `snapshot_id`, `err` | The repair decision could not list the snapshot's repairable skipped members; no repair runs this check, the next unchanged check asks again. |
 | `freshness: clamp adoption retry failed` | WARN | `canonical_host`, `suite_path`, `err` | A retry time left in the future by a backward clock step could not be clamped; the next check tries again. |
 | `freshness: clear adoption failure failed` | WARN | `canonical_host`, `suite_path`, `err` | Upstream serves the current content again but the failure record could not be cleared; the next check tries again. |
 ```
