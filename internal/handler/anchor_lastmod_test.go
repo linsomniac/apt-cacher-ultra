@@ -13,7 +13,8 @@ import (
 )
 
 // tenYears moves the wall clock — and so every adopted_at — far past any
-// pool file's real mtime, so the Last-Modified floor shows.
+// pool file's real mtime, so a Last-Modified taken from the pool file would
+// show.
 const tenYears = 10 * 365 * 24 * time.Hour
 
 const lmSuite = "/ubuntu/dists/noble"
@@ -50,7 +51,7 @@ func adoptedAt(t *testing.T, h *Handler, id int64) int64 {
 	return *snap.AdoptedAt
 }
 
-// Spec C8: a snapshot anchor carries max(pool mtime, adopted_at), and
+// Spec C8: a snapshot anchor carries its snapshot's adopted_at, and
 // adopted_at grows by at least 1 s per flip — so after two flips in one
 // second the previous anchor's If-Modified-Since still gets a 200, while
 // the current anchor's gets a 304.
@@ -121,9 +122,9 @@ func TestServeHTTP_FirstAdoptionLastModifiedPassesTheServedAnchor(t *testing.T) 
 	}
 }
 
-// Release and Release.gpg of a detached snapshot get the floor too;
+// Release and Release.gpg of a detached snapshot carry adopted_at too;
 // index members keep their pool mtime.
-func TestServeHTTP_DetachedAnchorsGetTheFloorIndexesDoNot(t *testing.T) {
+func TestServeHTTP_DetachedAnchorsCarryAdoptedAtIndexesDoNot(t *testing.T) {
 	restore := wallclock.SetOffsetForTest(tenYears)
 	defer restore()
 	h := newTestHandler(t, nil, nil)
@@ -161,8 +162,8 @@ func TestServeHTTP_DetachedAnchorsGetTheFloorIndexesDoNot(t *testing.T) {
 }
 
 // Design note 7: a snapshot anchor recovered from upstream (its pool file
-// was lost) is served with the same floor.
-func TestServeHTTP_RecoveredAnchorGetsTheFloor(t *testing.T) {
+// was lost) carries adopted_at too.
+func TestServeHTTP_RecoveredAnchorCarriesAdoptedAt(t *testing.T) {
 	restore := wallclock.SetOffsetForTest(tenYears)
 	defer restore()
 	body := []byte("InRelease recovered from upstream")
@@ -186,18 +187,67 @@ func TestServeHTTP_RecoveredAnchorGetsTheFloor(t *testing.T) {
 	}
 }
 
-// max(pool mtime, adopted_at) (spec C8): a pool file newer than adopted_at
-// keeps its own mtime as Last-Modified.
-func TestServeHTTP_SnapshotAnchorKeepsANewerPoolMtime(t *testing.T) {
+// Spec C8 (final review, spec I-1): a snapshot anchor's Last-Modified is
+// its snapshot's adopted_at, never its pool file's mtime. A pool file
+// written an hour after its commit's stamp — the clock stepped back
+// between the blob's write and the commit — used to win under max(pool
+// mtime, adopted_at), and a client holding that anchor then got 304 after
+// the next two flips; with adopted_at alone it gets a 200 after each.
+func TestServeHTTP_SnapshotAnchorLastModifiedIgnoresAFutureDatedPoolFile(t *testing.T) {
 	h := newTestHandler(t, nil, nil)
-	hash := writeBlob(t, h, []byte("anchor with a newer pool mtime"))
-	id := commitInlineSnapshot(t, h, "http", "127.0.0.1", lmSuite, hash,
+	var lm string
+	for i, body := range []string{"anchor one", "anchor two", "anchor three"} {
+		id := commitAnchor(t, h, body)
+		mt := time.Unix(adoptedAt(t, h, id)+3600, 0) // written before a one-hour backward step
+		if err := os.Chtimes(h.cache.BlobPath(sha256Hex([]byte(body))), mt, mt); err != nil {
+			t.Fatal(err)
+		}
+		code, got := lastModifiedGet(t, h, lmSuite+"/InRelease", lm)
+		if want := httpTime(adoptedAt(t, h, id)); code != http.StatusOK || got != want {
+			t.Fatalf("anchor %d with If-Modified-Since %q: %d, Last-Modified %q; want 200 with adopted_at %q (pool mtime %q)",
+				i+1, lm, code, got, want, httpTime(mt.Unix()))
+		}
+		lm = got
+	}
+}
+
+// Spec C8 (final review, spec I-1): an anchor recovered from upstream —
+// its pool file lost and rewritten now — keeps its snapshot's adopted_at
+// as Last-Modified, so the next flip still answers its If-Modified-Since
+// with a 200. The wall clock here runs an hour behind the pool files'
+// clock (a backward step since the commit), so the rewritten file's mtime
+// is an hour past every stamp.
+func TestServeHTTP_RecoveredAnchorLastModifiedStaysAdoptedAt(t *testing.T) {
+	restore := wallclock.SetOffsetForTest(-time.Hour)
+	defer restore()
+	body := []byte("InRelease recovered from upstream, an hour after the step")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
+	defer srv.Close()
+	h := newTestHandler(t, nil, nil)
+	scheme, host, port := splitURL(t, srv.URL)
+	const suite = "/dists/noble"
+	hash := writeBlob(t, h, body)
+	id1 := commitInlineSnapshot(t, h, scheme, hostKey(host, port), suite, hash,
 		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: hash, DeclaredSHA256: hash}}, nil)
-	mt := time.Unix(adoptedAt(t, h, id)+3600, 0)
-	if err := os.Chtimes(h.cache.BlobPath(hash), mt, mt); err != nil {
+	if err := os.Remove(h.cache.BlobPath(hash)); err != nil {
 		t.Fatal(err)
 	}
-	if code, lm := lastModifiedGet(t, h, lmSuite+"/InRelease", ""); code != http.StatusOK || lm != httpTime(mt.Unix()) {
-		t.Fatalf("%d, Last-Modified %q; want 200 with the newer pool mtime %q", code, lm, httpTime(mt.Unix()))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, suite+"/InRelease"))
+	lm1 := rec.Header().Get("Last-Modified")
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Cache") != "MISS" || lm1 != httpTime(adoptedAt(t, h, id1)) {
+		t.Fatalf("recovery: %d, X-Cache %q, Last-Modified %q; want 200 MISS with adopted_at %q",
+			rec.Code, rec.Header().Get("X-Cache"), lm1, httpTime(adoptedAt(t, h, id1)))
+	}
+	next := writeBlob(t, h, []byte("the next InRelease"))
+	id2 := commitInlineSnapshot(t, h, scheme, hostKey(host, port), suite, next,
+		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: next, DeclaredSHA256: next}}, nil)
+	r := proxyReq("GET", srv.URL, suite+"/InRelease")
+	r.Header.Set("If-Modified-Since", lm1)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if lm2 := rec.Header().Get("Last-Modified"); rec.Code != http.StatusOK || lm2 != httpTime(adoptedAt(t, h, id2)) {
+		t.Fatalf("after the flip, If-Modified-Since %q got %d (Last-Modified %q); want 200 with %q",
+			lm1, rec.Code, lm2, httpTime(adoptedAt(t, h, id2)))
 	}
 }

@@ -704,14 +704,19 @@ UPDATE blob
 // last_fetched_at of the suite's InRelease/Release/Release.gpg url_path
 // rows + 1) — those rows are what clients were served, with that
 // Last-Modified or older. The handler serves snapshot anchors with
-// max(pool mtime, adopted_at), so a client's If-Modified-Since from the
-// previous anchor always gets a 200 after a flip, even across a backward
-// clock step.
+// adopted_at as their Last-Modified (never the pool file's mtime), so a
+// client's If-Modified-Since from the previous anchor always gets a 200
+// after a flip, whatever the clock does.
 //
 // AIDEV-NOTE: call it before CommitAdoption Step 3c, which re-seeds the
-// anchor rows' last_fetched_at with now. adopted_at's other readers (GC's
-// keep_displaced ranking, the admin page) only need its order, which this
-// keeps equal to the commit order per suite.
+// anchor rows' last_fetched_at with now. adopted_at can now lead the wall
+// clock (by 1 s per same-second flip, by up to a backward step's length
+// after one). GC's keep_displaced ranking and the admin page only need its
+// order, which this keeps equal to the commit order per suite; the legacy
+// audit's markSnapshotBaseTx (legacy_audit.go) reads it as a wall-clock
+// stamp, and the clock-step rule (internal/freshness/clockstep.go, spec
+// C4) still lists it as a past-event stamp — no gate reads it that way
+// today, so a stamp in the future is harmless there (phase F carry-forward).
 func adoptionStampTx(ctx context.Context, tx *sql.Tx, scheme, host, suite string, now int64) (int64, error) {
 	var prior sql.NullInt64
 	err := tx.QueryRowContext(ctx, `

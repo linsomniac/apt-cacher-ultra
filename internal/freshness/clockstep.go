@@ -20,10 +20,12 @@ var processStart = time.Now()
 //
 // AIDEV-NOTE: only PAST-EVENT stamps (last_check_at, last_success_at,
 // last_requested_at, adoption_fail_first_at/last_at, adopted_at) are
-// "infinitely old" when in the future. adoption_next_retry_at is a
-// FUTURE-event stamp: a detection is logged through this function, but
-// the stamp is clamped to now+1h (retryGateFor), never treated as
-// infinitely old.
+// "infinitely old" when in the future. adopted_at may legitimately lead
+// the clock since spec C8's monotonic stamp (max(now, prior + 1)); no gate
+// reads it as a past event today, so a check that starts to must allow
+// for that. adoption_next_retry_at is a FUTURE-event stamp: a detection
+// is logged through this function, but the stamp is clamped to now+1h
+// (retryGateFor), never treated as infinitely old.
 func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64, now time.Time) {
 	clockStepsTotal.Inc()
 	last := c.lastClockStepLog.Load()
