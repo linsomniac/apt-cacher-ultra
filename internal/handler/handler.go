@@ -374,6 +374,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// singleflight; Done runs once the response has been written.
 	if t := h.anchorStart(r, req); t != nil {
 		defer t.Done()
+		// A request whose context ended while it waited — its client left —
+		// is a client abort (the gate did not register it). Serving it
+		// would only fail its snapshot read: a WARN and a 502 "hit" line.
+		if r.Context().Err() != nil {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, false, 0, start)
+			return
+		}
 	}
 
 	// Fast path: SPEC §6.1.

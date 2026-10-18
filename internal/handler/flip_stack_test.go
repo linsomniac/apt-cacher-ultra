@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -84,6 +85,12 @@ func (noUpstream) Fetch(context.Context, *fetch.Target, fetch.FetchDst) (*fetch.
 
 func newFlipStack(t *testing.T, quiet time.Duration) *flipStack {
 	t.Helper()
+	return newFlipStackLogging(t, quiet, simtest.DiscardLogger())
+}
+
+// newFlipStackLogging is newFlipStack whose handler logs to logger.
+func newFlipStackLogging(t *testing.T, quiet time.Duration, logger *slog.Logger) *flipStack {
+	t.Helper()
 	c := simtest.OpenCache(t)
 	gate, err := flipgate.New(flipgate.Config{Quiet: quiet})
 	if err != nil {
@@ -99,7 +106,7 @@ func newFlipStack(t *testing.T, quiet time.Duration) *flipStack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := New(Config{Parser: parser, Cache: c, Fetch: noUpstream{}, Logger: simtest.DiscardLogger(),
+	h, err := New(Config{Parser: parser, Cache: c, Fetch: noUpstream{}, Logger: logger,
 		HostLimiter: hostsem.New(64), FlipGate: gate})
 	if err != nil {
 		t.Fatal(err)

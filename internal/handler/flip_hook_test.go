@@ -2,7 +2,11 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -116,6 +120,71 @@ func TestServeHTTP_HeldAnchorIsAnsweredFromTheNewSnapshot(t *testing.T) {
 		if !answered.Equal(committedAt) || answered.Sub(sent) > flipgate.HoldMax {
 			t.Fatalf("answered %v after it was sent (at %v); the commit was at %v",
 				answered.Sub(sent), answered.Sub(t0), committedAt.Sub(t0))
+		}
+	})
+}
+
+// logRecords returns the JSON log records whose level is at least level
+// (and, when msg is not empty, whose msg is msg).
+func logRecords(logs *syncLog, msg string, level slog.Level) []map[string]any {
+	var out []map[string]any
+	for _, line := range strings.Split(logs.String(), "\n") {
+		var m map[string]any
+		if line == "" || json.Unmarshal([]byte(line), &m) != nil {
+			continue
+		}
+		var l slog.Level
+		if s, _ := m["level"].(string); l.UnmarshalText([]byte(s)) != nil || l < level {
+			continue
+		}
+		if msg == "" || m["msg"] == msg {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// heldSuite adopts suite and starts a flip of it whose commit blocks until
+// the returned release is called: the suite is idle, so its hold starts at
+// once and holds its anchor requests until then. release waits for the
+// flip to return.
+func heldSuite(t *testing.T, s *flipStack, suite string) (release func()) {
+	t.Helper()
+	s.adopt(suite, 1)
+	unblock, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := s.gate.Flip(context.Background(), flipgate.Key("http", flipSimHost, suite),
+			func() error { <-unblock; return nil }); err != nil {
+			t.Error(err)
+		}
+	}()
+	synctest.Wait()
+	return func() { close(unblock); <-done }
+}
+
+// Final review, spec M2: a held request whose client leaves is a client
+// abort. It is not registered (the gate's rule), and the handler answers
+// it as one — request line outcome client_canceled, no WARN — instead of
+// failing its snapshot read (a WARN "suite_freshness lookup failed" and a
+// 502 "hit" line).
+func TestServeHTTP_HeldClientThatLeavesIsAClientAbort(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &syncLog{}
+		s := newFlipStackLogging(t, 10*time.Second, slog.New(slog.NewJSONHandler(logs, nil)))
+		const suite = "/u/dists/s"
+		release := heldSuite(t, s, suite)
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Second, cancel) // the client leaves a second into its wait
+		rec := httptest.NewRecorder()
+		s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+suite+"/InRelease", nil).WithContext(ctx))
+		release()
+		if warns := logRecords(logs, "", slog.LevelWarn); len(warns) != 0 {
+			t.Errorf("a client that left while held logged %d WARN or worse, first %v", len(warns), warns[0])
+		}
+		lines := logRecords(logs, "request", slog.LevelInfo)
+		if len(lines) != 1 || lines[0]["outcome"] != "client_canceled" || lines[0]["status"] != float64(http.StatusServiceUnavailable) {
+			t.Fatalf("request lines %v, want one client_canceled (503)", lines)
 		}
 	})
 }
