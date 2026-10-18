@@ -2,7 +2,9 @@ package freshness
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"maps"
 	"runtime"
 	"slices"
@@ -41,10 +43,19 @@ func seedSimSuite(t *testing.T, c *cache.Cache, host, suite string, lastAt, fail
 
 // Spec C4 DoD (1): H = 8 hosts, several stalling; a healthy suite S with
 // n = 3 healthy (slow) suites ahead of it is checked within
-// one tick + (n + 1) × ⌈H/4⌉ × D — while a persistent repair (h1) and a
-// suite whose upstream changes on every request (h2) contend for the
-// adoption slots, checks continue everywhere and goroutines stay bounded.
-// Repair and adoption goroutines must never hold a check worker.
+// one tick + (n + 1) × ⌈H/4⌉ × D — while a persistent repair (R on h1)
+// and suites whose upstream changes on every request (C on h2, C3 on h3)
+// contend for the two adoption slots, checks continue everywhere and
+// goroutines stay bounded. Repair and adoption goroutines must never hold
+// a check worker (spec C4): while R's repair and C's adoption hold both
+// slots, all checkWorkers workers are still checking.
+//
+// Timeline (virtual): the first tick (15 m) checks R, C and C3 first on
+// their hosts. R's repair (two 10-minute member fetches) holds a slot
+// until 35 m; C's adoption (one 10-minute member fetch) holds the other
+// until 25 m. C3 answers 1 s later, finds no slot and is queued; it is
+// offered on h3's first free turn after C's slot is released (25–27 m)
+// and adopts for 10 minutes.
 func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
@@ -52,12 +63,21 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 		up := simtest.NewUpstream()
 		members := &simMembers{fakeFetcher: newFakeFetcher(), stalled: map[string]bool{}, delay: map[string]time.Duration{}}
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
-			HostLimiter: hostsem.New(8), MaxConcurrent: 2, RepairSkippedMembers: true, TolerateOptionalMemberFailures: true})
+			HostLimiter: hostsem.New(8), MaxConcurrent: 2, RepairSkippedMembers: true, TolerateOptionalMemberFailures: true,
+			Logger: simtest.DiscardLogger()})
 		if err != nil {
 			t.Fatal(err)
 		}
 		t0 := time.Now()
 		stale := t0.Add(-2 * time.Hour).Unix()
+		// due marks an adopted suite healthy and due at the first tick:
+		// checked and succeeded at stale. It leaves the snapshot alone.
+		due := func(host, suite string) {
+			if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host,
+				SuitePath: suite, LastCheckAt: &stale, LastSuccessAt: &stale}); err != nil {
+				t.Fatal(err)
+			}
+		}
 		for _, s := range []string{"/a1/dists/s", "/a2/dists/s", "/a3/dists/s"} {
 			seedSimSuite(t, c, "x", s, stale, 0)
 			up.Set("http://x"+s+"/InRelease", simtest.After(checkDeadline-time.Second, simtest.NotModified()))
@@ -76,7 +96,9 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 			}
 		}
 		// R on h1: adopted, with a Contents member that never heals, so
-		// every unchanged check of R spawns a repair holding a slot ~60 s.
+		// every unchanged check of R spawns a repair; each repair pass
+		// probes by-hash, then the canonical path, 10 minutes each. R is
+		// healthy and due, and sorts before h1's stalling suites.
 		good, bad := []byte(strings.Repeat("C", 100)), []byte(strings.Repeat("z", 90))
 		pkgsR := fakePackagesStanzas(map[string]string{"pool/main/r/r/r_1.deb": testHex64})
 		relR := datedRelease("r", 0, map[string][]byte{"main/binary-amd64/Packages": pkgsR, "Contents-amd64.gz": good})
@@ -88,30 +110,83 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 		if err := ad.Run(ctx, SuiteRef{CanonicalScheme: "http", CanonicalHost: "h1", SuitePath: "/r/dists/s"}, relR, "", ""); err != nil {
 			t.Fatal(err)
 		}
-		members.delay[rBase+"Contents-amd64.gz"] = 30 * time.Second
-		members.delay[rByHash] = 30 * time.Second
+		due("h1", "/r/dists/s")
+		members.delay[rBase+"Contents-amd64.gz"] = 10 * time.Minute
+		members.delay[rByHash] = 10 * time.Minute
 		up.Set(rBase+"InRelease", simtest.Serve(relR))
-		// C on h2: upstream publishes new content on every request.
-		pkgsC := fakePackagesStanzas(map[string]string{"pool/main/c/c/c_1.deb": testHex64})
-		members.put("http://h2/c/dists/s/main/binary-amd64/Packages", pkgsC)
-		seedSimSuite(t, c, "h2", "/c/dists/s", stale, 0)
-		var cn atomic.Int64
-		cURL := "http://h2/c/dists/s/InRelease"
-		up.Set(cURL, func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
-			body := datedRelease(fmt.Sprintf("c-%d", cn.Add(1)), 0, map[string][]byte{"main/binary-amd64/Packages": pkgsC})
-			return simtest.Serve(body)(ctx, etag)
-		})
+		// C on h2 and C3 on h3: adopted once (so the current snapshot is
+		// signed and a re-adoption may take either slot), healthy and due,
+		// sorting before their hosts' stalling suites. Upstream publishes a
+		// new InRelease with a new Packages body on every request: a body
+		// already in the pool would be reused without a fetch and the
+		// adoption would take no time. Each adoption fetches its body in
+		// 10 minutes. C3 answers after wait = 1 s, so at the first tick R's
+		// repair and C's adoption have taken both slots when C3 asks.
+		const cSuite = "/c/dists/s"
+		changing := func(host string, wait time.Duration) (anchor, seeded string) {
+			base := "http://" + host + cSuite + "/"
+			pkgsURL := base + "main/binary-amd64/Packages"
+			pkgs := func(n int64) []byte {
+				return fakePackagesStanzas(map[string]string{fmt.Sprintf("pool/main/c/c/c_%s_%d.deb", host, n): testHex64})
+			}
+			rel := func(n int64) []byte {
+				return datedRelease(fmt.Sprintf("c-%s-%d", host, n), 0, map[string][]byte{"main/binary-amd64/Packages": pkgs(n)})
+			}
+			members.put(pkgsURL, pkgs(0))
+			if err := ad.Run(ctx, SuiteRef{CanonicalScheme: "http", CanonicalHost: host, SuitePath: cSuite}, rel(0), "", ""); err != nil {
+				t.Fatal(err)
+			}
+			due(host, cSuite)
+			members.delay[pkgsURL] = 10 * time.Minute
+			var n atomic.Int64
+			var b simtest.Behavior = func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
+				k := n.Add(1)
+				members.put(pkgsURL, pkgs(k)) // before the check can spawn the adoption
+				return simtest.Serve(rel(k))(ctx, etag)
+			}
+			if wait > 0 {
+				b = simtest.After(wait, b)
+			}
+			up.Set(base+"InRelease", b)
+			return base + "InRelease", hashOf(rel(0))
+		}
+		cURL, cSeeded := changing("h2", 0)
+		c3URL, c3Seeded := changing("h3", time.Second)
 
+		logs := &lockedBuffer{}
 		runtime.Gosched()
 		baseG := runtime.NumGoroutine()
 		maxG := baseG
 		const refresh = time.Hour
-		_, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: refresh,
-			Adopter: ad, Logger: simtest.DiscardLogger()})
-		for i := 0; i < 95; i++ { // ~1 h 37 min, off the tick grid
-			time.Sleep(61 * time.Second)
-			maxG = max(maxG, runtime.NumGoroutine())
+		chk, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: refresh,
+			Adopter: ad, Logger: slog.New(slog.NewJSONHandler(logs, nil))})
+		// sample advances to until (measured from t0), sampling goroutines
+		// every 61 s: off the 15-minute tick grid.
+		sample := func(until time.Duration) {
+			for time.Since(t0)+61*time.Second <= until {
+				time.Sleep(61 * time.Second)
+				maxG = max(maxG, runtime.NumGoroutine())
+			}
+			time.Sleep(until - time.Since(t0))
 		}
+		// The worker bound: from 16 m 30 s to 24 m 30 s R's repair and C's
+		// adoption hold both slots, and the stalling suites keep all four
+		// workers busy. A repair or adoption run on a check worker would
+		// leave at most three checks in flight.
+		sample(16*time.Minute + 30*time.Second)
+		if inUse, _ := chk.admission.usage(); inUse != 2 {
+			t.Fatalf("at 16m30s %d adoption slots were in use, want 2 (R's repair and C's adoption)", inUse)
+		}
+		up.ResetMax()
+		sample(24*time.Minute + 30*time.Second)
+		if inUse, _ := chk.admission.usage(); inUse != 2 {
+			t.Fatalf("at 24m30s %d adoption slots were in use, want 2 (R's repair and C's adoption)", inUse)
+		}
+		if total, _ := up.MaxInFlight(); total < checkWorkers {
+			t.Errorf("while a repair and an adoption held both slots, at most %d checks ran at once, want %d"+
+				" (a repair or adoption is holding a check worker)", total, checkWorkers)
+		}
+		sample(95 * 61 * time.Second) // ~1 h 37 min, off the tick grid
 		stop()
 
 		sCalls := up.Calls("http://x" + sPath + "/InRelease")
@@ -125,19 +200,37 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 		if a3 := up.Calls("http://x/a3/dists/s/InRelease"); len(a3) == 0 || !sCalls[0].After(a3[0]) {
 			t.Fatal("S overtook a healthy suite queued ahead of it")
 		}
-		for _, u := range append(stalling, rBase+"InRelease", cURL) {
+		for _, u := range append(stalling, rBase+"InRelease", cURL, c3URL) {
 			if n := len(up.Calls(u)); n < 2 {
 				t.Errorf("%s checked %d times in ~1h37m, want its checks to continue (>= 2)", u, n)
 			}
 		}
+		// Every unchanged check of R spawned a repair: a slot was always
+		// free for it (C and C3 never hold both when R is checked).
 		repairs := 0
 		for _, u := range members.requested() {
 			if u == rByHash {
 				repairs++
 			}
 		}
-		if repairs < 2 {
-			t.Errorf("R's repair ran %d times, want it retried on every unchanged check (>= 2)", repairs)
+		unchanged := countChecks(t, logs.String(), "h1", "/r/dists/s", "unchanged", "not_modified")
+		if repairs < 2 || repairs != unchanged {
+			t.Errorf("R's repair ran %d times for %d unchanged checks, want one per unchanged check (>= 2)", repairs, unchanged)
+		}
+		// The changing suites adopted new content, C3 only after it was
+		// queued for a slot (and offered one when C's was released).
+		for _, s := range []struct{ host, seeded string }{{"h2", cSeeded}, {"h3", c3Seeded}} {
+			sf, err := c.GetSuiteFreshness(ctx, "http", s.host, cSuite)
+			if err != nil || sf.CurrentSnapshotID == nil {
+				t.Fatalf("%s: no current snapshot (err %v)", s.host, err)
+			}
+			snap, err := c.GetSuiteSnapshot(ctx, *sf.CurrentSnapshotID)
+			if err != nil || snap.SingleAnchorHash == nil || *snap.SingleAnchorHash == s.seeded {
+				t.Errorf("%s never adopted new content (err %v)", s.host, err)
+			}
+		}
+		if n := countChecks(t, logs.String(), "h3", cSuite, "changed_queued"); n == 0 {
+			t.Error("C3 was never queued for a slot: the slots were never contended")
 		}
 		// Workers, Run, two adoption slots, and slack for timers and the
 		// cache writer's transient goroutines.
@@ -145,6 +238,31 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 			t.Fatalf("goroutines peaked at %d, limit %d", maxG, limit)
 		}
 	})
+}
+
+// countChecks counts the freshness_check lines of a JSON log for host's
+// suite whose result is one of results.
+func countChecks(t *testing.T, log, host, suite string, results ...string) int {
+	t.Helper()
+	n := 0
+	for _, line := range strings.Split(log, "\n") {
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			Msg    string `json:"msg"`
+			Host   string `json:"canonical_host"`
+			Suite  string `json:"suite_path"`
+			Result string `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		if rec.Msg == "freshness_check" && rec.Host == host && rec.Suite == suite && slices.Contains(results, rec.Result) {
+			n++
+		}
+	}
+	return n
 }
 
 // Spec C4 DoD (2): 500 stalling suites and one healthy suite on one host.
@@ -294,7 +412,7 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 		c := simtest.OpenCache(t)
 		members := &simMembers{fakeFetcher: newFakeFetcher(), stalled: map[string]bool{}, delay: map[string]time.Duration{}}
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
-			HostLimiter: hostsem.New(8), MaxConcurrent: 2, MaxDuration: 30 * time.Minute})
+			HostLimiter: hostsem.New(8), MaxConcurrent: 2, MaxDuration: 30 * time.Minute, Logger: simtest.DiscardLogger()})
 		if err != nil {
 			t.Fatal(err)
 		}

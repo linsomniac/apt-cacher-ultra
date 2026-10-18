@@ -97,7 +97,7 @@ func TestRun_ReoffersWhenASlotFrees(t *testing.T) {
 				simtest.Serve(datedRelease("v1-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
 		}
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
-			HostLimiter: hostsem.New(8), MaxConcurrent: 1})
+			HostLimiter: hostsem.New(8), MaxConcurrent: 1, Logger: simtest.DiscardLogger()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -161,7 +161,7 @@ func TestRun_OfferThatLosesTheSlotKeepsItsPlace(t *testing.T) {
 		})
 		up.Set("http://h/b/dists/x/InRelease", simtest.Serve(rels["/b/dists/x"]))
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
-			HostLimiter: hostsem.New(8), MaxConcurrent: 1})
+			HostLimiter: hostsem.New(8), MaxConcurrent: 1, Logger: simtest.DiscardLogger()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -209,7 +209,7 @@ func TestRun_BusyOfferIsRetriedAfterTheNextTick(t *testing.T) {
 		anchor := "http://h" + rigSuite + "/InRelease"
 		up.Set(anchor, simtest.Serve(datedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
-			HostLimiter: hostsem.New(8), MaxConcurrent: 1})
+			HostLimiter: hostsem.New(8), MaxConcurrent: 1, Logger: simtest.DiscardLogger()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -251,7 +251,7 @@ func TestRun_HeldOfferIsRetriedOnTheNextWake(t *testing.T) {
 		anchor := "http://h" + rigSuite + "/InRelease"
 		up.Set(anchor, simtest.Serve(datedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
-			HostLimiter: hostsem.New(8), MaxConcurrent: 1})
+			HostLimiter: hostsem.New(8), MaxConcurrent: 1, Logger: simtest.DiscardLogger()})
 		if err != nil {
 			t.Fatal(err)
 		}
