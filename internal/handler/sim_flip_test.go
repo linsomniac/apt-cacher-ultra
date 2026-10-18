@@ -117,63 +117,77 @@ func TestSimFlip_DetachedBusySuiteStraddlesOnlyWithoutTheBarrier(t *testing.T) {
 }
 
 // busySuiteSim runs the busy-suite simulation at 0s and 10s, for the
-// inline or the detached form.
+// inline or the detached form, each as its own subtest (final review,
+// tests Minor 4: each bubble is measured on its own against the 5 s
+// -race budget).
 func busySuiteSim(t *testing.T, detached bool) {
 	for _, quiet := range []time.Duration{0, 10 * time.Second} {
-		synctest.Test(t, func(t *testing.T) {
-			s := newFlipStack(t, quiet)
-			const suite = "/u/dists/busy"
-			adopt := s.adopt
-			var sigMismatch atomic.Int64
-			serve := s.serve(time.Second, 100*time.Millisecond)
-			if detached {
-				adopt = s.adoptDetached
-				serve = s.serveDetached(time.Second, 100*time.Millisecond, &sigMismatch)
-			}
-			adopt(suite, 1)
-			before := s.gate.Stats()
-			l := simtest.NewLedger(10 * time.Second)
-			var wg sync.WaitGroup
-			t0 := time.Now()
-			flipReaders(l, serve, []simtest.Request{{Suite: suite, Anchor: true}},
-				11*time.Millisecond, 500*time.Millisecond, t0.Add(120*time.Second), &wg)
-			flipAt := 30*time.Second + 7*time.Millisecond
-			time.Sleep(flipAt)
-			adopt(suite, 2)
-			committed := time.Since(t0)
-			wg.Wait()
-
-			straddles := l.Straddles()
-			if quiet == 0 {
-				if committed != flipAt {
-					t.Fatalf("without the barrier the commit came %v after the flip started, want at once", committed-flipAt)
-				}
-				if len(straddles) != 2 {
-					t.Fatalf("without the barrier: %d straddles, want the 2 clients whose anchors were in flight: %+v", len(straddles), straddles)
-				}
-				if n := sigMismatch.Load(); detached && n != 2 {
-					t.Fatalf("without the barrier: %d Release.gpg responses from another snapshot than their Release, want those 2 clients'", n)
-				}
-				return
-			}
-			if len(straddles) != 0 {
-				t.Fatalf("with the barrier: %d straddles, first %+v", len(straddles), straddles[0])
-			}
-			if n := sigMismatch.Load(); n != 0 {
-				t.Fatalf("with the barrier: %d Release.gpg responses from another snapshot than their Release", n)
-			}
-			holdStart := flipAt + flipgate.PhaseAMax // the suite is never naturally quiet
-			if committed < holdStart+quiet || committed > holdStart+flipgate.HoldMax {
-				t.Fatalf("committed at %v, want within the hold from %v, after the quiet period", committed, holdStart)
-			}
-			if st := s.gate.Stats(); st.Holds-before.Holds != 1 || st.HoldsExpired != before.HoldsExpired || st.HeldRequests == before.HeldRequests {
-				t.Fatalf("stats %+v (before %+v): want one hold, ended normally, that held requests", st, before)
-			}
-			if gens := l.AnchorGens(suite); len(gens) != 2 {
-				t.Fatalf("clients saw anchor generations %v, want two (they crossed the flip)", gens)
-			}
-		})
+		t.Run("quiet="+quiet.String(), func(t *testing.T) { busySuiteBubble(t, detached, quiet) })
 	}
+}
+
+// busySuiteBubble is one quiet period of busySuiteSim.
+func busySuiteBubble(t *testing.T, detached bool, quiet time.Duration) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newFlipStack(t, quiet)
+		const suite = "/u/dists/busy"
+		adopt := s.adopt
+		var sigMismatch atomic.Int64
+		serve := s.serve(time.Second, 100*time.Millisecond)
+		if detached {
+			adopt = s.adoptDetached
+			serve = s.serveDetached(time.Second, 100*time.Millisecond, &sigMismatch)
+		}
+		adopt(suite, 1)
+		before := s.gate.Stats()
+		l := simtest.NewLedger(10 * time.Second)
+		var wg sync.WaitGroup
+		t0 := time.Now()
+		flipReaders(l, serve, []simtest.Request{{Suite: suite, Anchor: true}},
+			11*time.Millisecond, 500*time.Millisecond, t0.Add(120*time.Second), &wg)
+		flipAt := 30*time.Second + 7*time.Millisecond
+		time.Sleep(flipAt)
+		adopt(suite, 2)
+		committed := time.Since(t0)
+		wg.Wait()
+
+		straddles := l.Straddles()
+		if quiet == 0 {
+			if committed != flipAt {
+				t.Fatalf("without the barrier the commit came %v after the flip started, want at once", committed-flipAt)
+			}
+			if len(straddles) != 2 {
+				t.Fatalf("without the barrier: %d straddles, want the 2 clients whose anchors were in flight: %+v", len(straddles), straddles)
+			}
+			if n := sigMismatch.Load(); detached && n != 2 {
+				t.Fatalf("without the barrier: %d Release.gpg responses from another snapshot than their Release, want those 2 clients'", n)
+			}
+			return
+		}
+		if len(straddles) != 0 {
+			t.Fatalf("with the barrier: %d straddles, first %+v", len(straddles), straddles[0])
+		}
+		if n := sigMismatch.Load(); n != 0 {
+			t.Fatalf("with the barrier: %d Release.gpg responses from another snapshot than their Release", n)
+		}
+		// The suite is never naturally quiet, so the hold starts at phase A's
+		// cap; the last anchor serve in flight then started at 89.511 s and
+		// finished at 90.511 s, and the commit follows the quiet period after
+		// it — well before HoldMax − CommitMargin. An anchor completion that
+		// failed to wake the hold would delay the commit to that cut.
+		holdStart := flipAt + flipgate.PhaseAMax
+		if want := holdStart + 504*time.Millisecond + quiet; committed != want {
+			t.Fatalf("committed at %v, want %v (the quiet period after the last anchor in flight when the hold started at %v)",
+				committed, want, holdStart)
+		}
+		if st := s.gate.Stats(); st.Holds-before.Holds != 1 || st.HoldsExpired != before.HoldsExpired ||
+			st.QuietCutShort != before.QuietCutShort || st.HeldRequests == before.HeldRequests {
+			t.Fatalf("stats %+v (before %+v): want one hold, ended normally, that held requests", st, before)
+		}
+		if gens := l.AnchorGens(suite); len(gens) != 2 {
+			t.Fatalf("clients saw anchor generations %v, want two (they crossed the flip)", gens)
+		}
+	})
 }
 
 // Spec C8 DoD, the review's overlapping-hold trace (plan review
@@ -185,15 +199,25 @@ func busySuiteSim(t *testing.T, detached bool) {
 // holding yet (one hold at a time), so neither anchor waits and the a
 // index arrives before a commits. 100 shared-queue clients cross both
 // flips; b commits at least a quiet period after a.
+//
+// AIDEV-NOTE: the trace's instants are literal, so the test checks its
+// own premise (final review, tests Minor 1): when the trace client asks
+// for b's anchor, a's hold — and only a's — has started and a has not
+// committed, and the trace client's two index requests both fall inside
+// the window (its own ledger). An adoption pipeline that starts taking
+// virtual time, or a shifted flip, would otherwise make the trace run
+// before either hold and pass vacuously under concurrent holds.
 func TestSimFlip_SharedQueueTraceEndToEnd(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newFlipStack(t, 10*time.Second)
 		const a, b = "/mirror/dists/a", "/mirror/dists/b"
 		s.adopt(a, 1)
 		s.adopt(b, 1) // at once: a's setup hold held nothing (design note 17)
+		a1 := s.current(a)
 		before := s.gate.Stats()
 		fast := s.serve(50*time.Millisecond, 10*time.Millisecond)
 		l := simtest.NewLedger(10 * time.Second)
+		trace := simtest.NewLedger(10 * time.Second)
 		var wg sync.WaitGroup
 		t0 := time.Now()
 		until := t0.Add(100 * time.Second)
@@ -206,12 +230,19 @@ func TestSimFlip_SharedQueueTraceEndToEnd(t *testing.T) {
 			l.RunUpdate(1000, []simtest.Request{{Suite: b, Anchor: true}}, s.serve(6*time.Second, 10*time.Millisecond))
 		}()
 		var traceHeld []time.Duration
+		holdsAtB, aGenAtB := -1, ""
+		premise := func(rq simtest.Request) (string, time.Duration) {
+			if rq.Suite == b && rq.Anchor {
+				holdsAtB, aGenAtB = s.gate.Stats().Holds-before.Holds, s.current(a)
+			}
+			return fast(rq)
+		}
 		wg.Add(1)
 		go func() { // the trace client
 			defer wg.Done()
 			time.Sleep(60853 * time.Millisecond)
-			l.RunUpdate(2000, []simtest.Request{{Suite: a, Anchor: true}, {Filler: 300 * time.Millisecond}, {Suite: b, Anchor: true}},
-				recordAnchorHeld(fast, &traceHeld))
+			trace.RunUpdate(2000, []simtest.Request{{Suite: a, Anchor: true}, {Filler: 300 * time.Millisecond}, {Suite: b, Anchor: true}},
+				recordAnchorHeld(premise, &traceHeld))
 		}()
 		for i := 0; i < 100; i++ { // shared-queue clients, both orders
 			q := []simtest.Request{{Suite: a, Anchor: true}, {Suite: b, Anchor: true}}
@@ -230,20 +261,31 @@ func TestSimFlip_SharedQueueTraceEndToEnd(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			time.Sleep(time.Second + 3*time.Millisecond) // both suites are busy by now
+			time.Sleep(time.Second + 3*time.Millisecond) // a is busy by now
 			s.adopt(a, 2)
 			aAt = time.Now()
 		}()
 		go func() {
 			defer wg.Done()
-			time.Sleep(time.Second + 103*time.Millisecond)
+			time.Sleep(time.Second + 103*time.Millisecond) // b is busy by now (its readers start at 1.011 s)
 			s.adopt(b, 2)
 			bAt = time.Now()
 		}()
 		wg.Wait()
 
+		if holdsAtB < 1 || aGenAtB != a1 {
+			t.Fatalf("when the trace client asked for b's anchor, %d holds had started and a served snapshot %q; "+
+				"want a's hold in progress and a not yet committed (%q): the trace no longer overlaps what it tests",
+				holdsAtB, aGenAtB, a1)
+		}
+		if holdsAtB != 1 {
+			t.Fatalf("when the trace client asked for b's anchor, %d holds had started: b held alongside a (one hold at a time)", holdsAtB)
+		}
 		if len(traceHeld) != 2 || traceHeld[0] != 0 || traceHeld[1] != 0 {
 			t.Fatalf("the trace client's anchors were held %v, want neither", traceHeld)
+		}
+		if n, st := trace.Checked(), trace.Straddles(); n != 2 || len(st) != 0 {
+			t.Fatalf("the trace client: %d index responses checked, straddles %+v; want both checked, none straddling", n, st)
 		}
 		if st := l.Straddles(); len(st) != 0 {
 			t.Fatalf("%d straddles, first %+v", len(st), st[0])
@@ -261,6 +303,97 @@ func TestSimFlip_SharedQueueTraceEndToEnd(t *testing.T) {
 		}
 		if n := l.Checked(); n < 250 {
 			t.Errorf("only %d index responses checked", n)
+		}
+	})
+}
+
+// Spec C8 phase B (b), end to end (final review, tests Minor 1): the
+// flipgate model's ClientReleasedFromAnotherHold through the real handler,
+// adopter and cache. a's readers are on 4 s links, so a's hold (from
+// 61.003 s) lasts ~13.5 s and ends normally; b's phase A gives up at
+// 63.003 s while a holds, so b waits for the token and holds from a's end.
+// The trace client gets b's old anchor at 64.053 s, waits in a's hold for
+// a's anchor, then asks for b's index — 14.5 s after b's anchor arrived,
+// 10.5 s of that in a's hold (4 s net, inside the window). b is quiet by
+// itself when a's hold ends; only the cross-suite quiet period keeps it
+// from committing before that index arrives. Disabling phase B (b) makes
+// the trace client straddle; concurrent holds make b hold its anchor. The
+// premise is checked as in SharedQueueTraceEndToEnd.
+func TestSimFlip_ClientReleasedFromAnotherHoldEndToEnd(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newFlipStack(t, 10*time.Second)
+		const a, b = "/mirror/dists/a", "/mirror/dists/b"
+		s.adopt(a, 1)
+		s.adopt(b, 1) // at once: a's setup hold held nothing (design note 17)
+		a1, b1 := s.current(a), s.current(b)
+		before := s.gate.Stats()
+		slowA := s.serve(4*time.Second, 10*time.Millisecond)
+		fast := s.serve(50*time.Millisecond, 10*time.Millisecond)
+		l := simtest.NewLedger(10 * time.Second)
+		trace := simtest.NewLedger(10 * time.Second)
+		var wg sync.WaitGroup
+		t0 := time.Now()
+		flipReaders(l, slowA, []simtest.Request{{Suite: a, Anchor: true}}, 11*time.Millisecond, 500*time.Millisecond, t0.Add(100*time.Second), &wg)
+		flipReaders(l, fast, []simtest.Request{{Suite: b, Anchor: true}}, 261*time.Millisecond, 500*time.Millisecond, t0.Add(61*time.Second), &wg)
+		var traceHeld []time.Duration
+		holdsAtB, genAtB := -1, ""
+		traceServe := func(rq simtest.Request) (string, time.Duration) {
+			if rq.Suite == a {
+				return slowA(rq)
+			}
+			if rq.Anchor {
+				holdsAtB, genAtB = s.gate.Stats().Holds-before.Holds, s.current(a)+"/"+s.current(b)
+			}
+			return fast(rq)
+		}
+		wg.Add(1)
+		go func() { // the trace client: b's anchor, then a's (held), then the indexes
+			defer wg.Done()
+			time.Sleep(64003 * time.Millisecond)
+			trace.RunUpdate(2000, []simtest.Request{{Suite: b, Anchor: true}, {Suite: a, Anchor: true}}, recordAnchorHeld(traceServe, &traceHeld))
+		}()
+		var aAt, bAt time.Time
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Second + 3*time.Millisecond) // a is busy by now
+			s.adopt(a, 2)                                // holds from 61.003 s to 74.511 s
+			aAt = time.Now()
+		}()
+		go func() {
+			defer wg.Done()
+			time.Sleep(3*time.Second + 3*time.Millisecond) // b is busy by now
+			s.adopt(b, 2)                                  // phase A gives up at 63.003 s, while a holds
+			bAt = time.Now()
+		}()
+		wg.Wait()
+
+		if holdsAtB < 1 || genAtB != a1+"/"+b1 {
+			t.Fatalf("when the trace client asked for b's anchor, %d holds had started and a/b served %q; "+
+				"want a's hold in progress and neither committed (%q): the trace no longer overlaps what it tests",
+				holdsAtB, genAtB, a1+"/"+b1)
+		}
+		if holdsAtB != 1 {
+			t.Fatalf("when the trace client asked for b's anchor, %d holds had started: b held alongside a (one hold at a time)", holdsAtB)
+		}
+		if len(traceHeld) != 2 || traceHeld[0] != 0 || traceHeld[1] == 0 {
+			t.Fatalf("the trace client's anchors were held %v, want b's not held and a's held", traceHeld)
+		}
+		if n, st := trace.Checked(), trace.Straddles(); n != 2 || len(st) != 0 {
+			t.Fatalf("the trace client: %d index responses checked, straddles %+v; want both checked, none straddling", n, st)
+		}
+		if st := l.Straddles(); len(st) != 0 {
+			t.Fatalf("%d straddles, first %+v", len(st), st[0])
+		}
+		if d := bAt.Sub(aAt); d != 10*time.Second {
+			t.Fatalf("b committed %v after a, want exactly the quiet period (its hold starts at a's end; cross-suite quiet)", d)
+		}
+		if st := s.gate.Stats(); st.Holds-before.Holds != 2 || st.HoldsExpired != before.HoldsExpired ||
+			st.HoldsSkipped != before.HoldsSkipped || st.QuietCutShort != before.QuietCutShort {
+			t.Fatalf("stats %+v (before %+v): want two holds, both ending normally", st, before)
+		}
+		if gens := l.AnchorGens(a); len(gens) != 2 {
+			t.Errorf("%s: clients saw anchor generations %v, want two (they crossed the flip)", a, gens)
 		}
 	})
 }
@@ -352,8 +485,22 @@ func TestSimFlip_SlowReaderCommitsInsideTheHold(t *testing.T) {
 // speeds (up to 3 s) and start times; two flips per suite at random times,
 // the second 30-90 s after the first was due. All random values are drawn
 // before anything runs, so the run is reproducible. Every hold ends
-// normally and no flip skips its hold, so no client may straddle; clients
-// cross all three generations of every suite.
+// normally (none expires or is cut short) and no flip skips its hold, so
+// no client may straddle; clients cross all three generations of every
+// suite.
+//
+// AIDEV-NOTE: scope, verified by mutants (final review, tests Minor 1):
+// this catches the local-quiet rule (ignoring it: 14 straddles). It does
+// not catch the cross-suite rules — its random plan never queues a
+// client's index long enough behind another suite's held anchor — nor an
+// anchor completion that fails to wake a waiting flip (the hold's cut at
+// HoldMax − CommitMargin bounds that to a later, still consistent commit).
+// "One hold at a time" and phase B (b) are pinned end to end by
+// TestSimFlip_SharedQueueTraceEndToEnd and
+// TestSimFlip_ClientReleasedFromAnotherHoldEndToEnd (and in the model by
+// internal/flipgate's trace simulations); the wake by
+// TestFlip_WaitsForQuietAfterTheLastAnchor and the busy-suite
+// simulations' exact commit instant.
 func TestSimFlip_SeededChaos(t *testing.T) {
 	type clientPlan struct {
 		at       time.Duration
@@ -412,8 +559,9 @@ func TestSimFlip_SeededChaos(t *testing.T) {
 		wg.Wait()
 
 		st := s.gate.Stats()
-		if st.Holds-before.Holds != 6 || st.HoldsExpired != before.HoldsExpired || st.HoldsSkipped != before.HoldsSkipped {
-			t.Fatalf("stats %+v (before %+v): want six holds, none expired or skipped", st, before)
+		if st.Holds-before.Holds != 6 || st.HoldsExpired != before.HoldsExpired || st.HoldsSkipped != before.HoldsSkipped ||
+			st.QuietCutShort != before.QuietCutShort {
+			t.Fatalf("stats %+v (before %+v): want six holds, none expired, cut short or skipped", st, before)
 		}
 		if got := l.Straddles(); len(got) != 0 {
 			t.Fatalf("%d straddles, first %+v", len(got), got[0])
