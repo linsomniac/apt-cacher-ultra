@@ -7385,7 +7385,8 @@ func startRetrySim(t *testing.T, refresh time.Duration) *retrySim {
 		pkgs: fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})}
 	members := newFakeFetcher()
 	members.put(rigPkgsURL, s.pkgs)
-	ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: s.ver, HostLimiter: hostsem.New(8), MaxConcurrent: 2})
+	ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: s.ver, HostLimiter: hostsem.New(8), MaxConcurrent: 2,
+		Logger: simtest.DiscardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -7579,7 +7580,8 @@ func TestSimRestartSpread(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: ver, HostLimiter: hostsem.New(8), MaxConcurrent: 2})
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: ver, HostLimiter: hostsem.New(8), MaxConcurrent: 2,
+			Logger: simtest.DiscardLogger()})
 		if err != nil {
 			t.Fatal(err)
 		}
