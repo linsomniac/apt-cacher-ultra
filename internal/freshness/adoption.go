@@ -899,8 +899,19 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// lookup must happen before any mutation. Step 3a applies apt's Date
 	// rules against its release_date, Step 4 tells a rollback from a
 	// race with it, and Step 10 compares its form against p.form and
-	// emits adoption_form_drift on a transition.
-	prior := a.priorSnapshot(ctx, suite)
+	// emits adoption_form_drift on a transition. prior == nil means
+	// exactly "no current snapshot"; a read error fails the attempt as
+	// db_failed (retried on the normal schedule) rather than skipping
+	// those rules.
+	prior, err := a.priorSnapshot(ctx, suite)
+	if err != nil {
+		a.logger.Warn("adoption: read prior snapshot failed",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"err", err,
+		)
+		return err
+	}
 	priorForm, hadPrior := formOfSnapshot(prior)
 
 	// Step 1: GPG verify. The Verifier returns the verified Release-
@@ -1045,9 +1056,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		// longer current is a rollback (spec C5 rollback_refused). Equal to
 		// the CURRENT snapshot is a race with a check that already saw the
 		// flip; the next check reports "unchanged", so it stays a plain
-		// DB-failure wrap. The prior == nil arm is defensive: no writer
-		// today leaves a suite without a pointer while an adopted,
-		// non-retired snapshot of it exists.
+		// DB-failure wrap. prior == nil means exactly "no current
+		// snapshot" (no row, a NULL pointer, or a dangling one; a read
+		// error already failed the attempt at Step 0a). That arm is
+		// defensive: no writer today leaves a suite without a pointer
+		// while an adopted, non-retired snapshot of it exists.
 		var nk *cache.NaturalKeyAdoptedError
 		if errors.As(err, &nk) && (prior == nil || nk.SnapshotID != prior.SnapshotID) {
 			return fmt.Errorf("%w: %w", ErrAdoptionRollbackRefused, err)
@@ -1558,19 +1571,37 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	return nil
 }
 
-// priorSnapshot returns the suite's current snapshot, or nil when there
-// is none or it cannot be read. runShared reads it before any mutation:
-// after CommitAdoption the prior snapshot is no longer current.
-func (a *Adopter) priorSnapshot(ctx context.Context, suite SuiteRef) *cache.SuiteSnapshot {
+// priorSnapshot returns the suite's current snapshot, or (nil, nil) when
+// the suite has none: no suite_freshness row, a NULL pointer, or a
+// pointer whose row is gone (both readers' ErrNotFound). runShared reads
+// it before any mutation: after CommitAdoption the prior snapshot is no
+// longer current.
+//
+// AIDEV-NOTE: fail closed on a real read error, open only on "no prior".
+// The prior snapshot gates spec C5's Date and rollback rules, so any
+// other error is returned (wrapped in ErrAdoptionDBFailed) instead of
+// being read as "no prior", which would silently skip both rules. A
+// missing row stays fail-open so a brand-new suite or a dangling pointer
+// cannot freeze the suite.
+func (a *Adopter) priorSnapshot(ctx context.Context, suite SuiteRef) (*cache.SuiteSnapshot, error) {
 	fresh, err := a.cache.GetSuiteFreshness(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
-	if err != nil || fresh == nil || fresh.CurrentSnapshotID == nil {
-		return nil
+	if errors.Is(err, cache.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: read prior snapshot: %w", ErrAdoptionDBFailed, err)
+	}
+	if fresh == nil || fresh.CurrentSnapshotID == nil {
+		return nil, nil
 	}
 	snap, err := a.cache.GetSuiteSnapshot(ctx, *fresh.CurrentSnapshotID)
-	if err != nil {
-		return nil
+	if errors.Is(err, cache.ErrNotFound) {
+		return nil, nil
 	}
-	return snap
+	if err != nil {
+		return nil, fmt.Errorf("%w: read prior snapshot: %w", ErrAdoptionDBFailed, err)
+	}
+	return snap, nil
 }
 
 // formOfSnapshot maps a snapshot's stored anchor form to the adoption

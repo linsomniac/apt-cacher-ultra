@@ -2,9 +2,11 @@ package freshness
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -188,5 +190,81 @@ func TestClassify_RefusalsAndNewOutcomes(t *testing.T) {
 		if r := classifyAdoptionReason(tc.err, out, nil); r != tc.reason {
 			t.Errorf("classifyAdoptionReason(%v) = %q, want %q", tc.err, r, tc.reason)
 		}
+	}
+}
+
+// execCacheDB runs one statement on env's cache.db through a separate
+// connection (foreign keys off), the side door tests use to plant states
+// the cache's own writers never produce. The Adopter holds a concrete
+// *cache.Cache, so a read failure cannot be injected by wrapping it.
+func execCacheDB(t *testing.T, env *adoptionTestEnv, q string, args ...any) {
+	t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(env.cache.Dir(), "cache.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(q, args...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A current snapshot that exists but cannot be read must fail the
+// attempt (db_failed, retried on the normal schedule) before any member
+// download: treating it as "no prior" would silently skip spec C5's Date
+// and rollback rules. The older Date here would be refused if the
+// snapshot were readable, and adopted if the read error were swallowed.
+func TestAdopter_UnreadablePriorSnapshotFailsClosed(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	ad := fixedNowAdopter(t, env, dateNow)
+	d := dateNow.Add(-time.Hour).Unix()
+	if err := adoptDated(t, env, ad, "v2", d); err != nil {
+		t.Fatal(err)
+	}
+	cur := currentSnapshotID(t, env)
+	// A TEXT release_date makes GetSuiteSnapshot's Scan fail: a real read
+	// error, not ErrNotFound.
+	execCacheDB(t, env, `UPDATE suite_snapshot SET release_date = 'garbage' WHERE snapshot_id = ?`, cur)
+	if _, err := env.cache.GetSuiteSnapshot(context.Background(), cur); err == nil || errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("fixture: GetSuiteSnapshot err = %v, want a non-ErrNotFound read error", err)
+	}
+	calls := env.fetcher.calls.Load()
+	err := adoptDated(t, env, ad, "v1", d-3600)
+	if !errors.Is(err, ErrAdoptionDBFailed) {
+		t.Fatalf("err = %v, want ErrAdoptionDBFailed", err)
+	}
+	if got := classifyAdoptionOutcome(err); got != "db_failed" {
+		t.Fatalf("outcome = %q, want db_failed", got)
+	}
+	if got := env.fetcher.calls.Load(); got != calls {
+		t.Fatalf("member fetches after an unreadable prior snapshot = %d, want 0", got-calls)
+	}
+	if got := currentSnapshotID(t, env); got != cur {
+		t.Fatalf("current snapshot moved from %d to %d", cur, got)
+	}
+}
+
+// A pointer whose snapshot row is gone (ErrNotFound) is "no current
+// snapshot": the adoption proceeds, so a dangling pointer cannot freeze
+// the suite.
+func TestAdopter_DanglingPriorPointerFailsOpen(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	ad := fixedNowAdopter(t, env, dateNow)
+	d := dateNow.Add(-time.Hour).Unix()
+	if err := adoptDated(t, env, ad, "v2", d); err != nil {
+		t.Fatal(err)
+	}
+	const dangling = 999_999
+	execCacheDB(t, env, `UPDATE suite_freshness SET current_snapshot_id = ?
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+		dangling, env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if _, err := env.cache.GetSuiteSnapshot(context.Background(), dangling); !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("fixture: GetSuiteSnapshot(%d) err = %v, want ErrNotFound", dangling, err)
+	}
+	if err := adoptDated(t, env, ad, "v1", d-3600); err != nil {
+		t.Fatalf("adoption over a dangling pointer: %v", err)
+	}
+	if got := currentSnapshotID(t, env); got == dangling {
+		t.Fatal("current pointer still dangles after a successful adoption")
 	}
 }
