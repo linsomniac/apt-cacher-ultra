@@ -523,9 +523,16 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		return h.writeFailClosed(w, "snapshot lookup failed"), http.StatusBadGateway, 0, true
 	}
 
+	// Spec C8: a snapshot anchor's Last-Modified is never older than its
+	// snapshot's adopted_at, which grows by at least 1 s per flip.
+	var floor time.Time
+	if isAnchorMember(memberPath) {
+		floor = h.anchorModFloor(r.Context(), snapshotID)
+	}
 	served, status, bytesWritten = h.serveBlobWithHeaders(w, r, req, mem.BlobHash, snapshotMeta{
 		snapshotID:    snapshotID,
 		lastFetchedAt: nil, // snapshot rows don't carry per-blob last-fetched
+		minModTime:    floor,
 	})
 	if !served {
 		// Pool blob is missing for a known snapshot member (operator
@@ -540,7 +547,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 			"snapshot_id", snapshotID,
 			"blob_hash", mem.BlobHash,
 		)
-		served, status, bytesWritten = h.serveSnapshotMemberMiss(w, r, req, mem, snapshotID, start)
+		served, status, bytesWritten = h.serveSnapshotMemberMiss(w, r, req, mem, snapshotID, floor, start)
 		return served, status, bytesWritten, true
 	}
 	go h.touchAsync(req)
@@ -863,9 +870,12 @@ func firstPackageName(rows []cache.DeclaredHash, match string) string {
 // the response headers. snapshotID = 0 marks a Phase 1 / non-snapshot
 // serve (X-Cache-Snapshot suppressed); a positive value emits the
 // header. lastFetchedAt is the source for X-Cache-Age and may be nil.
+// minModTime, when later than the pool file's mtime, is the response's
+// Last-Modified instead (spec C8: a snapshot anchor's adopted_at).
 type snapshotMeta struct {
 	snapshotID    int64
 	lastFetchedAt *int64
+	minModTime    time.Time
 }
 
 // serveBlobWithHeaders opens pool/<blobHash>, sets the SPEC2 §3 headers,
@@ -909,7 +919,7 @@ func (h *Handler) serveBlobWithHeaders(w http.ResponseWriter, r *http.Request, r
 	}
 
 	cw := &countingWriter{ResponseWriter: w}
-	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
+	http.ServeContent(cw, r, req.Path, laterOf(st.ModTime(), meta.minModTime), f)
 	return true, cw.statusCode(), cw.bytes
 }
 
@@ -928,6 +938,40 @@ func suiteRelativePath(suitePath, fullPath string) string {
 	// sees a well-defined "not in snapshot" miss rather than a partial
 	// match.
 	return fullPath
+}
+
+// isAnchorMember reports whether a suite-relative member path is a
+// snapshot anchor file: InRelease, Release or Release.gpg (spec C8).
+func isAnchorMember(p string) bool {
+	return p == "InRelease" || p == "Release" || p == "Release.gpg"
+}
+
+// anchorModFloor is the spec C8 Last-Modified floor of a snapshot-served
+// anchor: the snapshot's adopted_at. CommitAdoption keeps adopted_at
+// strictly increasing per suite, so a client's If-Modified-Since from the
+// previous anchor always gets a 200 after a flip, even across a backward
+// clock step. A read failure leaves the pool mtime (the pre-C8 behaviour).
+//
+// AIDEV-NOTE: monotonic unless the previous anchor's pool file was
+// (re)written at a wall time later than the next commit's stamp: the clock
+// stepped back between that blob's write and its commit, or after a
+// snapshot-member recovery rewrote it (docs/configuration.md states the
+// gap; design review M5).
+func (h *Handler) anchorModFloor(ctx context.Context, snapshotID int64) time.Time {
+	snap, err := h.cache.GetSuiteSnapshot(ctx, snapshotID)
+	if err != nil || snap.AdoptedAt == nil {
+		return time.Time{}
+	}
+	return time.Unix(*snap.AdoptedAt, 0)
+}
+
+// laterOf returns the later of a pool file's mtime and a Last-Modified
+// floor (a zero floor leaves the mtime).
+func laterOf(mtime, floor time.Time) time.Time {
+	if floor.After(mtime) {
+		return floor
+	}
+	return mtime
 }
 
 // distinctDeclared collapses a DeclaredHash slice down to its unique
@@ -1159,10 +1203,11 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 // Returns (served, status, bytesWritten) so the trySnapshotHit caller
 // can fold the result into its own return tuple. The access-log line
 // is emitted upstream by ServeHTTP under the existing tryCacheHit
-// path.
+// path. minMod is the spec C8 Last-Modified floor (zero for
+// non-anchors).
 func (h *Handler) serveSnapshotMemberMiss(
 	w http.ResponseWriter, r *http.Request, req *proxy.Request,
-	mem *cache.SnapshotMember, snapshotID int64, start time.Time,
+	mem *cache.SnapshotMember, snapshotID int64, minMod, start time.Time,
 ) (served bool, status int, bytesWritten int64) {
 	cw := &countingWriter{ResponseWriter: w}
 
@@ -1229,7 +1274,7 @@ func (h *Handler) serveSnapshotMemberMiss(
 	if res.status > 0 {
 		cw.Header().Set(hdrXUpstreamStat, strconv.Itoa(res.status))
 	}
-	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
+	http.ServeContent(cw, r, req.Path, laterOf(st.ModTime(), minMod), f)
 	return true, cw.statusCode(), cw.bytes
 }
 
