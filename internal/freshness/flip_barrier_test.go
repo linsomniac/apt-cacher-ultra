@@ -528,6 +528,78 @@ func TestCheck_GateCloseInTheBarrierRecordsNothing(t *testing.T) {
 	})
 }
 
+// putServedAnchor makes rel the url_path InRelease clients have been served,
+// so a first adoption of rel is eligible for the barrier skip.
+func (r *barrierRig) putServedAnchor(t *testing.T, rel []byte) {
+	t.Helper()
+	ctx := context.Background()
+	h, err := r.ad.writeBlobBytes(ctx, rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: rigHost,
+		Path: rigSuite + "/InRelease", BlobHash: &h, UpstreamURL: rigAnchorURL, IsMetadata: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Design note 18 for the first-adoption skip (final review, concurrency
+// Minor 2 / spec M1): once main has closed the gate at the shutdown
+// signal, a first adoption of the served anchor — which skips the
+// barrier — abandons its commit as a barrier flip does: nothing commits
+// late in the stop window, and no adoption_flip_barrier is logged.
+func TestAdopter_FirstAdoptionSkipHonoursGateClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newBarrierRig(t, 10*time.Second, 0)
+		req := r.request("v1")
+		r.putServedAnchor(t, req.bytes)
+		r.gate.Close()
+		err := r.ad.runRequest(context.Background(), req, runHooks{stop: context.Background()})
+		if !errors.Is(err, flipgate.ErrAborted) || !errors.Is(err, flipgate.ErrClosed) {
+			t.Fatalf("runRequest = %v, want ErrAborted wrapping ErrClosed", err)
+		}
+		if id := r.current(t); id != 0 || len(r.barrierEvents()) != 0 {
+			t.Fatalf("current %d, events %v; want no commit and no barrier event", id, r.barrierEvents())
+		}
+	})
+}
+
+// The same through the Checker: the abandoned skip records nothing (spec
+// C7: shutdown is not a failure) and releases the suite mutex and slots.
+func TestCheck_GateCloseAbortsASkippedFirstAdoption(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		r := newBarrierRig(t, 10*time.Second, 0)
+		req := r.request("v1")
+		r.putServedAnchor(t, req.bytes)
+		if err := r.c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}); err != nil {
+			t.Fatal(err)
+		}
+		chk, err := New(Config{Cache: r.c, Fetcher: &changedUpstream{body: req.bytes}, HostLimiter: hostsem.New(8),
+			Adopter: r.ad, Logger: simtest.DiscardLogger()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.gate.Close()
+		mu := &sync.Mutex{}
+		mu.Lock()
+		chk.spawnAdoption(mu, req, mustAcquire(t, chk.admission, rigHost, false))
+		chk.WaitForAdoptions()
+		sf, err := r.c.GetSuiteFreshness(ctx, "http", rigHost, rigSuite)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sf.CurrentSnapshotID != nil || sf.AdoptionFailCount != 0 || sf.AdoptionFailReason != nil || len(r.barrierEvents()) != 0 {
+			t.Fatalf("after Close: current set %v, failure count %d, reason set %v, events %v; want none of them",
+				sf.CurrentSnapshotID != nil, sf.AdoptionFailCount, sf.AdoptionFailReason != nil, r.barrierEvents())
+		}
+		free := mu.TryLock()
+		if g, h := chk.admission.usage(); g != 0 || h != 0 || !free {
+			t.Fatalf("after the abandoned adoption: %d/%d slots held, suite mutex free %v", g, h, free)
+		}
+	})
+}
+
 // Spec C4 admission bound with the C8 barrier (ruling R-C3, design review
 // M15). A pool of two; two signed suites whose clients keep reading their
 // anchors, so their adoptions sit in the barrier; a third signed suite that

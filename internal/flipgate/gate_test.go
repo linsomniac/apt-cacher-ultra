@@ -1117,6 +1117,26 @@ func TestGate_CloseAbortsEveryFlipNotYetCommitting(t *testing.T) {
 	})
 }
 
+// Closed reports Close (the adopter's first-adoption skip asks it, so a
+// skipped flip honours the shutdown signal too); a nil or disabled gate,
+// which ignores Close, is never closed.
+func TestGate_ClosedReportsClose(t *testing.T) {
+	var nilGate *Gate
+	disabled := newGate(t, 0)
+	disabled.Close()
+	if nilGate.Closed() || disabled.Closed() {
+		t.Fatal("a nil or disabled gate reports closed")
+	}
+	g := newTestGate(t)
+	if g.Closed() {
+		t.Fatal("closed before Close")
+	}
+	g.Close()
+	if !g.Closed() {
+		t.Fatal("not closed after Close")
+	}
+}
+
 // Design review M6 (exec review observation 4): a panic in the hold-expiry
 // timer — a gate bug, injected here — is counted, and the timer's deferred
 // unlock keeps the gate usable: the commit's return still ends the hold

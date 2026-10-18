@@ -1760,7 +1760,7 @@ func (a *Adopter) priorSnapshot(ctx context.Context, suite SuiteRef) (*cache.Sui
 // adoption_flip_barrier (design note 10). Without an enabled gate it
 // commits at once (the pre-C8 behaviour). A first adoption whose anchor is
 // the url_path anchor clients have been served skips the barrier: the
-// switch changes nothing they hold.
+// switch changes nothing they hold. It still honours a closed gate.
 func (a *Adopter) flip(ctx context.Context, suite SuiteRef, p *adoptionPayload, first bool, snapshotID int64, commit func() error) error {
 	if !a.flipGate.Enabled() {
 		return commit()
@@ -1771,6 +1771,12 @@ func (a *Adopter) flip(ctx context.Context, suite SuiteRef, p *adoptionPayload, 
 	// the skip correct should a later phase write url_path anchors for
 	// adopted suites.
 	if first && a.servedAnchorUnchanged(ctx, suite, p) {
+		// A closed gate (the shutdown signal, design note 18) abandons
+		// this commit as Flip would: no commit starts late in the stop
+		// window, and spawnAdoption never records ErrAborted.
+		if a.flipGate.Closed() {
+			return fmt.Errorf("%w: %w", flipgate.ErrAborted, flipgate.ErrClosed)
+		}
 		err := commit()
 		a.logger.Info("adoption_flip_barrier", append(attrs, "outcome", barrierOutcome("not_needed", err))...)
 		return err

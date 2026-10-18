@@ -298,6 +298,18 @@ func (g *Gate) Close() {
 	g.broadcastLocked()
 }
 
+// Closed reports whether Close has run; a nil or disabled gate, which
+// ignores Close, is never closed. The adopter's first-adoption skip, which
+// commits without Flip, asks it so that it honours the shutdown signal too.
+func (g *Gate) Closed() bool {
+	if !g.Enabled() {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.closed
+}
+
 // AnchorStart registers an anchor serve of key (spec C8, handler side) and
 // returns its token; Done must run once the response is written. It
 // returns at once unless a flip of key is holding anchors: then it waits
