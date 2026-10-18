@@ -383,7 +383,9 @@ func (c *Checker) pendingChange(s cache.SuiteFreshness) bool {
 // check, cooldown bypassed, parks it: such a suite starts waiting within
 // one tick. Admission is therefore work-conserving: N suites
 // queued behind k usable slots are admitted within one tick + ⌈N/k⌉ ×
-// (A + D), A = adoption.max_duration + commitTimeout. An offered re-check
+// (A + D), A = adoption.max_duration + the spec C8 flip barrier (≤ 140 s:
+// flipgate.PhaseAMax + TokenWaitMax + HoldMax; an adoption keeps its
+// global slot through it) + commitTimeout. An offered re-check
 // uses its host's turn like any check, so n in the latency bound also
 // counts the host's waiting suites offered before S (at most one per
 // adoption on that host).

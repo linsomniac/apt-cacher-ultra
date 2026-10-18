@@ -8,14 +8,13 @@ Phase A's per-task and final reviews (2026-10-11, Fable max) found these minor i
 
 - **A-1** `wallclock_test.go:27`: `restore()` is called inline, not deferred, so a failing assertion leaks the −2 h offset into later tests.
 - **A-2** No guard test that production code never calls `wallclock.SetOffsetForTest`; the doc should say restores run LIFO.
-- **A-3** Handler and GC wallclock stamps (`handler.go:680,868,1523,1793`; `gc.go:276,362`) are not distinguished from `time.Now` by any test.
+- **A-3** GC wallclock stamps (`gc.go:276,362`) are not distinguished from `time.Now` by any test (the handler's are, since phase C: `TestHandler_StampsFollowTheWallClock`).
 
 ## internal/aptpath and internal/proxy
 
 - **A-4** `suite.go:19-20` comment overclaims "matching the old greedy regex"; add `{"/a/dists/b/dists/c", "/a/dists/b"}` to `TestSuitePath_Dists`.
 - **A-5** `suite.go:25-26` AIDEV-NOTE says "raw path"; the handler strips from `req.Path`, the same string `SuitePath` received. Reword.
 - **A-6** `suite_test.go` lacks a space-byte case and a trailing-slash full-path case.
-- **A-7** Spec C2's canonicality predicate lists only `#`, `?`, `%` and `\`; the code also refuses control bytes. Amend the spec text.
 - **A-8** `TestCacheDoesNotImportProxy` checks direct imports only; comment the limitation.
 - **A-9** `encode_test.go:36`: the all-bytes loop starts at 1, skipping NUL (it round-trips). Start at 0 or comment.
 - **A-10** `proxy.go:172-173`: the control-byte invariant has a plain comment; promote it to an AIDEV-NOTE.
@@ -24,7 +23,6 @@ Phase A's per-task and final reviews (2026-10-11, Fable max) found these minor i
 - **A-13** (pre-existing, out of scope) HTTPS-magic host (`proxy/url.go:122`) has no charset validation; now strictly safer (escaped, then `url.Parse` fails). Follow-up candidate.
 - **A-14** `composers_test.go:16`: the guard regex only catches `"://" +`; it misses `"https://"+host` and `Sprintf("%s://…")`. `connect.go:591` is a legitimate exemption if widened.
 - **A-15** `hot_set.go:63` has no direct unit test (`hot_prefetch_test.go` is a gofmt-drift file).
-- **A-16** `SniffReleaseGPG` accepts an indented armor header (safe direction) and rejects gpg-tolerated leading non-header lines (exotic); note in the spec C3 table wording.
 - **A-17** `sniff_test` negatives should pin the `0x8C` and `0xC3` upper bounds.
 
 ## internal/cache
@@ -51,7 +49,6 @@ Phase A's per-task and final reviews (2026-10-11, Fable max) found these minor i
 - **A-37** Three "log a panic, stack once" implementations (`Checker.reportPanic`, the handler's `atomic.Bool`, heartbeat with none); consider one helper. Heartbeat never logs a stack.
 - **A-38** `panic_recovery_test.go:244-246`: a successful `TryLock` is never unlocked.
 - **A-47** `legacy_audit.go`: `res.Signed++` counts `FormUnsigned` keeps (after phase E re-queues); rename to `Kept` or skip unsigned.
-- **A-48** Doubled "legacy trust audit:" error prefix (`RunLegacyTrustAudit` and `main.go:480`).
 - **A-49** The marker pass silently skips tracked anchors whose pool file is missing or unreadable; add a Debug line.
 
 ## internal/gpg
@@ -63,10 +60,5 @@ Phase A's per-task and final reviews (2026-10-11, Fable max) found these minor i
 
 ## internal/handler
 
-- **A-54** `handler.go:172`: the `cfg.Fetch` nil check is now an interface compare (a typed-nil `*fetch.Client` would pass); add an AIDEV-NOTE.
 - **A-55** `fetch_seam_test.go:84` comment says "Review Focus 2" but encoding is focus item 1.
 - **A-56** `handler.Fetcher` vs `freshness.Fetcher`/`AdoptionFetcher` naming overlap. Informational.
-
-## Docs
-
-- **A-57** `configuration.md:275-278` pre-flight wording: it also refuses for an unreadable pool, or a pool holding none of the queued files (≥ 2). Verify against the current text, which the final fix wave partly reworded.

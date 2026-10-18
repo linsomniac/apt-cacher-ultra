@@ -1,6 +1,6 @@
 # Flat repositories, eager adoption, and suite lifecycle — design
 
-- **Date:** 2026-09-27 (revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
+- **Date:** 2026-09-27 (revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
 - **Status:** draft for maintainer review
 - **Branch:** `feature/flat-repos` (from `main` @ 536a1ab)
 - **Origin:** reimplementation of the problem reported in PR #8 ("Refresh flat
@@ -219,7 +219,7 @@ URL, so this is redirect-safe).
 
 **Canonicality predicate** (both grammars): every segment of the path is
 non-empty and not `.` or `..` (one flat exception below), and the decoded path
-contains none of `#`, `?`, `%`, `\`.
+contains none of `#`, `?`, `%`, `\` and no control byte (0x00–0x1F, 0x7F).
 
 **`dists/` grammar** (tightened, D5): `^/(repo/)?dists/<codename>/<member>`
 with a non-empty `<member>`; the suite is `/<repo>/dists/<codename>` as
@@ -258,7 +258,7 @@ sources).
 |---|---|
 | `InRelease` | the first line is exactly `-----BEGIN PGP SIGNED MESSAGE-----` (trailing `\r`/space/tab stripped) — apt's rule |
 | `Release` | a `SHA256:`, `SHA512:`, `SHA1:` or `MD5Sum:` header line appears in the first 64 KiB |
-| `Release.gpg` | armor header `-----BEGIN PGP SIGNATURE-----`, or a binary OpenPGP signature packet (old-format tag bytes 0x88–0x8B, new-format 0xC2) |
+| `Release.gpg` | armor header `-----BEGIN PGP SIGNATURE-----` as the first non-whitespace text (leading whitespace is accepted; leading non-header lines, which gpg tolerates, are rejected), or a binary OpenPGP signature packet (old-format tag bytes 0x88–0x8B, new-format 0xC2) |
 | flat `Packages*`/`Sources*` | the compression magic for the extension, or plain text starting `Package:`/`Package: ` (`Sources`: `Package:` too) |
 
 **Single creation choke point.** `cache.CreateSuite` is the **only**
@@ -433,8 +433,9 @@ work-conserving: while any suite waits for a slot it could take, that slot
 stays idle for at most one check (*D*) plus one host turn (⌈*H*/4⌉ × *D*).
 Queued suites therefore pass through the pool at its throughput: *N* suites
 queued behind *k* slots they may use are all admitted within one tick +
-⌈*N*/*k*⌉ × (*A* + *D*), where *A* — `adoption.max_duration` plus the commit
-bound — is the longest a slot is held. With the default pool of two and a
+⌈*N*/*k*⌉ × (*A* + *D*), where *A* — `adoption.max_duration` plus the C8
+barrier (≤ 140 s) plus the commit bound — is the longest a slot is held.
+With the default pool of two and a
 first adoption holding the general slot, signed suites go through the
 reserved slot back to back. First adoptions (and unsigned ones) run only
 when the pool is otherwise empty, so a burst of them is serial;
@@ -526,11 +527,14 @@ before the scheduler's offer; they are the same work. When `max_concurrent_adopt
 global slot is reserved for suites that have a signed current snapshot
 (security updates are never starved by first or unsigned adoptions). The
 host slot is released when the member pipeline ends (before the C8 barrier);
-the global slot is held through the commit. Every adoption, repair and
-reconcile runs under a context deadline `adoption.max_duration` (default
-`30m`); `CommitAdoption` itself runs under `context.WithoutCancel` with its
-own bounded timeout, so the deadline cannot abort a commit already in
-progress. `POST /reconcile` answers 409 when no slot is free.
+the global slot is held through the C8 barrier and the commit. Every
+adoption, repair and reconcile runs under a context deadline
+`adoption.max_duration` (default `30m`); `CommitAdoption` itself runs under
+`context.WithoutCancel` with its own bounded timeout, so the deadline cannot
+abort a commit already in progress. The C8 barrier's waits do not honour the
+deadline either (they are bounded by themselves, ≤ 140 s, and giving up would
+discard finished member work), but they end at once on shutdown, and then
+nothing is committed. `POST /reconcile` answers 409 when no slot is free.
 
 **Validators.** `suite_freshness` validators always describe the current
 snapshot's anchor (set in the flip transaction), or the `url_path` anchor
@@ -820,9 +824,10 @@ count. `Release.gpg` is never held.
 - **Phase A — natural quiet, no holds.** Wait until (a) the suite has no
   anchor in flight (anchors in flight longer than 30 s, apt's own timeout,
   are ignored) and none completed within `flip_quiet_period` (default `10s`,
-  at most `15s`), and (b) **no hold is in progress anywhere** and none ended
-  within the same period (a hold delays other suites on the client's shared
-  queue). Bounded by 60 s; on timeout proceed to phase B.
+  `1s` to `15s`), and (b) **no hold is in progress anywhere** and none
+  that held at least one request ended within the same period (such a hold
+  delayed other suites on the client's shared queue; one that held nothing
+  delayed no one). Bounded by 60 s; on timeout proceed to phase B.
 - **Hold token.** Before phase B the flip acquires the process-wide hold
   token (FIFO; at most one suite holds at a time). Waiting for it is bounded
   by 60 s; on timeout the flip commits without a hold (counter
@@ -832,10 +837,11 @@ count. `Release.gpg` is never held.
 - **Phase B — hold.** Mark the flip pending (new anchor requests wait). Wait
   until (a) no anchor of this suite is in flight and none completed within
   `flip_quiet_period` (reachable, because new anchors are held), and (b) no
-  *other* suite's hold ended within `flip_quiet_period` (clients released
-  from that hold may still have this suite's index requests queued behind
-  it). Then run `commit`, clear pending, wake waiters onto the new snapshot
-  and release the token. The whole of phase B, including both waits, is
+  *other* suite's hold that held at least one request ended within
+  `flip_quiet_period` (clients released from that hold may still have this
+  suite's index requests queued behind it). Then run `commit`, clear
+  pending, wake waiters onto the new snapshot and release the token. The
+  whole of phase B, including both waits, is
   bounded by 20 s from its start: at expiry pending is cleared, waiters are
   answered from the current snapshot, a commit not yet started starts
   immediately (counter `acu_flip_hold_expired_total`), and the token is
@@ -854,11 +860,19 @@ new snapshot, so its index requests within that period come from the snapshot
 matching its anchor. Because holds never overlap and every commit waits a
 quiet period after the last hold ended, the proxy's own holds cannot push a
 client's queued requests for another suite past that suite's flip.
-Residuals (documented, counted): phase-B expiry when the commit or an
-in-flight reader exceeds 20 s (F-2 on very large suites), hold-token timeout
-(more than three suites flipping at once), waiters beyond the cap, and anchor
-reads slower than apt's own timeout. A flip waiting for the token keeps its
-global adoption slot, so with several suites flipping at once other
+Residuals (documented, each with its own unlabelled counter): phase-B expiry
+when the commit or an in-flight reader exceeds 20 s (F-2 on very large
+suites; `acu_flip_hold_expired_total`), hold-token timeout (a flip times out
+only behind 60 s of holds: at least three holds at their 20 s bound, in
+practice four or more, since a queued flip's suite is usually busy and its
+hold then lasts at least the quiet period — the five busy suites of §9 give
+four holds and one skip — so it takes at least four suites flipping at once,
+which needs `max_concurrent_adoptions` of 4 or more, or 0 for unlimited,
+because a flip keeps its global slot through the barrier;
+`acu_flip_hold_skipped_total`), waiters beyond the cap
+(`acu_flip_waiters_over_cap_total`), and anchor reads slower than apt's own
+timeout (`acu_flip_slow_anchor_reads_total`). A flip waiting for the token
+keeps its global adoption slot, so while two or more suites flip other
 adoptions can queue for up to about 140 s (bounded).
 by-hash clients remain covered by retained by-hash. Answering held requests
 with `503 Retry-After` instead was rejected: apt before 2.3.2 treats a 5xx as
@@ -990,7 +1004,7 @@ unlabelled (no suite labels) and are added to the metrics inventory comments in
 | Key | Default | Rule |
 |---|---|---|
 | `adoption.adopt_unsigned` | `true` | bool |
-| `adoption.flip_quiet_period` | `"10s"` | `0s` disables the barrier; ≤ `15s` |
+| `adoption.flip_quiet_period` | `"10s"` | `0s` disables the barrier; otherwise `1s` to `15s` |
 | `adoption.max_duration` | `"30m"` | ≥ `1m` |
 | `freshness.max_suites` | `5000` | ≥ 10 (per-host cap = `max_suites / 10`, documented for large Artifactory/aptly/Nexus hosts) |
 | `gc.suite_idle_ttl` | `"720h"` | `0s` disables reaping; else ≥ `24h` |
@@ -1273,8 +1287,9 @@ files), in phase D.
   mirror-mode two suites with a hold in progress → zero straddles; slow reader
   → phase B ends within 20 s and the flip commits; hold never exceeds 20 s;
   idle zero-wait; client cancel; shutdown; commit failure releases waiters;
-  the chaos test's straddle count asserted zero; retained by-hash (SHA256 in
-  C, SHA512 in E) with stray-blob and retired-snapshot negatives;
+  the chaos test's straddle count asserted zero; retained by-hash (SHA256 and
+  SHA512 in C; E's SHA512 adoption writes the SHA512 alias rows) with
+  stray-blob and retired-snapshot negatives;
   `Last-Modified` across same-second flips, first adoption and a backward
   step.
 - C9: 90-day simulation at `gc.interval = 24h` with 12-hourly restarts
@@ -1360,9 +1375,9 @@ item depends on a later phase.
 |---|---|---|
 | **A. Foundations** | v7 migration (final schema, Go backfill step, trigger) and Go types incl. the `SingleAnchorHash`/`Form`/`ReleaseDate`/`RetiredAt` fields; `aptpath` and `wallclock` packages; handler fetch seam; C1 complete (changes `+`/`~` request lines to apt's form); C2 `dists/` tightening (no flat grammar yet); `%w` wraps and sentinels; R-1; I-1 recover (logging) in adoption, repair, reconcile, T1 and scheduler goroutines; clock-step rule in existing gates; synctest harness + smoke simulation; inline verification fails closed; signed-seen markers written at adoption and by the startup marker pass (with the `InRelease`/`Release.gpg` sniffs and `MarkSignedSeenBatch`); §6.1 legacy trust audit with quarantine. | v6-fixture migration test; no-SQLite-clock test; C1 tables and production-fixture round trip; existing suite green except enumerated `SuitePath` tightening cases and the `require_signature = false` passthrough tests; R-1 and I-1 fixtures fail on main, pass here; polluted-v6 audit test (current and displaced, plain text, interruption); 30-day smoke simulation < 5 s under `-race`. |
 | **B. Retry discipline and capacity** | C7 record, gate, schedule, refusal states, restart; `Date` rules; validators at commit; `change_seen` semantics; capacity (TryAcquire global + host slots for adoption, repair and reconcile; reserved slot; `max_duration`; `WithoutCancel` commit; queued results with slot-driven re-offer); panic recorded; fair concurrent scheduler (C4: per-host queues, 4 workers, one check per host turn, healthy → never-checked → failing, FIFO, persisted failure streak and backoff); admin, gauge, logs. | lim1 reproduction bound; T1-storm test; 30-day simulation incl. flapping mirror and clock step (liveness + bounds); slow-drip + degraded-suite capacity simulation exercising both check and adoption admission; scheduler latency-bound simulations with stalling (not refusing) responders: H = 8 with n = 3 healthy suites ahead; 500 failing + 1 healthy suite on one host, repeated after a simulated restart; "lagging" visible. |
-| **C. Flip consistency** | C8 flipgate with the hold token, handler anchor hook, retained by-hash (SHA256, non-retired only), monotonic `Last-Modified`. | Straddle test fails on the B tip, passes here; overlapping-hold trace in a shared-queue simulation; five busy suites flipping within 0.1 s (holds never overlap, at most three hold, the rest commit unheld within 60 s + 20 s and are counted, zero straddles for held suites); busy-suite, cross-suite and slow-reader tests; hold ≤ 20 s; chaos straddles = 0; `flip_quiet_period = 0s` keeps existing tests unchanged. |
+| **C. Flip consistency** | C8 flipgate with the hold token, handler anchor hook, retained by-hash (SHA256 and SHA512, non-retired only), monotonic `Last-Modified`. | Straddle test fails on the B tip (the busy-suite simulation at `flip_quiet_period = 0s`), passes here; overlapping-hold trace in a shared-queue simulation; five busy suites flipping within 0.1 s (holds never overlap, four hold, the fifth commits unheld within 60 s + 20 s of the first hold and is counted, zero straddles for held suites); busy-suite, cross-suite and slow-reader tests; hold ≤ 20 s; chaos straddles = 0; `flip_quiet_period = 0s` keeps existing tests unchanged. |
 | **D. Creation bounds and signals** | C3 in full: sniffs, `CreateSuite` with caps (anchor rows and markers before the body, including first contact), eviction and rejection cache, legacy onboarding, adoption-disabled seed parity, UPDATE-only writers, I-4 (both sides), touch (anchors, vouched `.deb`s), signed-seen marker in the miss path's writer operation; `Release` and flat-index sniffs; `clearsignedFixture()` migration. | Single-INSERT-site test; minted-suite scale test; `dists/` onboarding test on a v6 fixture; adoption-disabled parity test. |
-| **E. Eager adoption and anchor forms** | C4 probe tree, classification, form transitions, `anchor_absent`, eager first adoption with interest window, T1-on-seed; C5 unsigned form with safeguards; SHA512 merge, shared verify helper, aliases, retained by-hash SHA512; C10 in-flight wait. | Production-shaped fixture: active never-adopted suites adopt once, dormant ones make zero requests; classification table; never-downgrade at both points, including the in-transaction recheck race; a §6.1-quarantined plain-text suite adopts unsigned without a downgrade refusal; unsigned never changes posture; nvidia-shaped fixture adopts; SHA512 by-hash served; in-flight wait on hit and miss paths. |
+| **E. Eager adoption and anchor forms** | C4 probe tree, classification, form transitions, `anchor_absent`, eager first adoption with interest window, T1-on-seed; C5 unsigned form with safeguards; SHA512 merge, shared verify helper, aliases (served from displaced snapshots by phase C's retained by-hash); C10 in-flight wait. | Production-shaped fixture: active never-adopted suites adopt once, dormant ones make zero requests; classification table; never-downgrade at both points, including the in-transaction recheck race; a §6.1-quarantined plain-text suite adopts unsigned without a downgrade refusal; unsigned never changes posture; nvidia-shaped fixture adopts; SHA512 by-hash served; in-flight wait on hit and miss paths. |
 | **F. Suite reaping** | C9 retirement, reaper (own ticker), batched metadata deletion, sub-job C, memory purge, marker TTL, `POST /forget`. | 90-day simulation at `gc.interval = 24h` with restarts; return-before-GC and `/forget` re-adoption tests; forward-step self-heal; never-downgrade after reap; `/forget` CSRF test; twins untouched. |
 | **G. Flat repositories** | C2 flat grammar; flat IndexTargets (layout-aware, adoption and handler sides); `validateFilename`; C6 materialisation, fallback, coverage; anchorless refresh; flat root-index touch; flat pdiff arch labels. | PR #8's evidence: a miss on `/…/deb/InRelease` and on `/…/deb/./InRelease` creates one suite row each and fires T1 under it, a hit fires T1 again, and `/…/deb/Packages_1.0_all.deb`, host-root `/InRelease` and `/…/deb//InRelease` create none (no check fires for either path on `main`); `/core:/stable:/v1.34/deb/InRelease` → suite `/core:/stable:/v1.34/deb`; every real Filename shape adopts and vouches; flat `Packages` failure fatal; strict matrix; anchorless refresh tests; flat legacy onboarding on a v6 fixture (an untrusted flat suite makes ≤ 1 attempt per backoff step); reaping `/repo` leaves `/repo/.` intact; PR #8's remaining tests ported with the expected results in the plan overview's "PR #8 parity" section. |
 | **H. End to end and docs** | `e2e/flat/`; documentation; config file; final full-diff review. | `make e2e-flat` green on all images with the grep assertions, including PR #8's end-to-end table (one signed flat repository configured as `deb <uri>/ /` on one client and `deb <uri> ./` on another: both report 2.0 within one cooldown of the v2 publish, and with the upstream stopped two fresh clients install 2.0 from the snapshots); a manual live-upstream smoke (plan overview, "PR #8 parity") before the release that ships G; docs complete. |

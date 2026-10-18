@@ -11,8 +11,6 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 - **B-3** `adoption_failure_test.go:217`: the restart test reschedules one row, so a hoisted `offset()` shared by all rows would pass; add a second suite with a counting offset (`TestSimRestartSpread`'s buckets already catch it end to end).
 - **B-4** `adoption_failure.go:141`: `adoption_fail_reason NOT IN (…)` skips NULL reasons; `COALESCE` would make the invariant explicit (unreachable: empty reasons are rejected on write).
 - **B-5** `cache_test.go:2139`: `TestCommitAdoption_PreservesExistingSuiteFreshnessColumns`'s name half-contradicts its body (it now asserts the etag is replaced).
-- **B-6** `flip_state_test.go:48-49` dereference `LastCheckAt`/`LastSuccessAt` without a nil check.
-- **B-7** `adoption.go:30`: the `ErrSnapshotNaturalKeyAdopted` doc should say it arrives wrapped in `*NaturalKeyAdoptedError`.
 - **B-8** No test asserts the validators on `CommitAdoption`'s INSERT (no-conflict) branch of Step 6. (D: moot once Step 6 is UPDATE-only.)
 
 ## internal/freshness — Date parser (`release_date.go`)
@@ -26,7 +24,6 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 
 ## internal/freshness — outcomes, keys, records
 
-- **B-15** `metrics.go:242` comment: `timed_out` must stay ahead of the member sentinels and is safe only because member-fetch errors are flattened with `%v`; also note that a commit-timeout error is classified `timed_out`.
 - **B-16** `retry_test.go:10`: the detached content key is not pinned to its exact formula (`sha256(sha256(rel) || sha256(sig))`); a swapped order would pass, and keys persist across restarts (one extra attempt after an upgrade).
 - **B-17** `retry.go:52`: `jitterDelay` does not clamp `u` outside [0, 1) (callers pass `rand.Float64`).
 - **B-18** `adoption_failure.go:127`: `recoverAdoption` runs `reportPanic`, metrics and the ring after `recover()` with no second boundary; a panicking slog handler would escape (pre-existing class; `checkLockedSafe` got nested recovers in the fix wave).
@@ -37,13 +34,11 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 - **B-23** `freshness.go:1682` `applyClamp` runs twice on the inline → detached fallback of a first-ever suite (a double `acu_clock_steps_detected_total` count and a redundant write); one-line fix: set `cur.AdoptionNextRetryAt = &g.clampTo` after `SetAdoptionNextRetry`.
 - **B-24** `retry_gate_test.go` `TestGate_DueRetryHasNoValidators` cannot tell "" from the anchor's validators (the rig suite has none); add a leg on an adopted suite past `next_retry_at`.
 - **B-25** One extra `Release.gpg` GET per deferred detached check when upstream ignores validators (accepted cost; recorded so E's shared tail keeps it in mind). (E)
-- **B-26** `freshness.go:613` `rescheduleFailingAdoptions`: comment why the `c.adopter == nil` guard is safe.
 - **B-27** `restart_reset_test.go`: the restart test exercises only `rand = 0.5`; a `rand = 0` leg would pin the lower bound.
 
 ## internal/freshness — check path, repair, reconcile
 
 - **B-28** A degraded snapshot's Release is parsed twice per heal attempt (`reconcile.go:122` `reconcilePending`, then `ReconcileSnapshot`; perf only, bounded by the cooldown).
-- **B-29** `capacity_test.go:136`, `:212`: "B did not start" is proven by a 150 ms wall-clock window; assert `changed_queued` / admission usage instead.
 - **B-30** `freshness.go:533`, `:594`: `adoption_reconcile_failed` is emitted at the decision and at the heal with identical fields; add a `stage` attribute.
 - **B-31** `freshness.go:544`: a repair deferred for want of a slot is logged at DEBUG only, with no counter.
 - **B-32** Under steady client traffic a degraded suite re-runs its repair every cooldown, and each run may take the reserved slot for up to `max_duration` if a member stalls; weigh with E's `signedCurrent` change. (E)
@@ -80,10 +75,6 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 - **B-57** The 30-day simulation's untrusted phase has no attempt floor (183 measured; Lim1 has 18..30).
 - **B-58** The flapping-mirror simulation does not pin the rollback guard on its own (the cost is now pinned by `TestGate_RefusalStormCostsNothing`), and its samples land on the tick grid (harmless at a 30-minute refresh).
 
-## cmd/apt-cacher-ultra
-
-- **B-64** `main.go` shutdown: `freshChecker.WaitForAdoptions()` can wait up to `commitTimeout` for a running commit (its comment now says so); log an INFO line when the drain takes long, so a slow stop is explained in the journal.
-
 ## internal/admin
 
 - **B-59** `suites_status_test.go`: no row with 0 < lag < 3600 (a `LagWarn = lag > 0` regression would pass), and the JSON golden pins only zero values (`anchor_form ""` beside `current_snapshot_id 42`).
@@ -94,7 +85,5 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 
 ## Final fix-wave residuals (scoped re-review of 9a2b22b..e361704)
 
-- **B-65** `internal/freshness/adoption.go:1540`: the shutdown-before-commit check tests `ctx.Err()`, which stays `DeadlineExceeded` once `adoption.max_duration` has fired, so a stop that arrives after the deadline but before the commit still starts the commit (bounded by `commitTimeout`; never a regression). Test the lifetime context itself (pass `c.lifetimeCtx.Done()` or a `stopping func() bool` into `runRequest`). (C: the barrier sits in front of the commit.)
 - **B-66** `internal/freshness/scheduler.go:154-156`: `enqueue` drops a duplicate without setting `pendingChange`, so a suite queued earlier as stale and left pending by a client check before it is popped honours the cooldown once and is parked one tick later than the Run doc and configuration.md:243 promise ("within one tick"). Set the flag on a duplicate that sits in a class queue, or soften the docs.
 - **B-67** `docs/admin-ui-spec.md:385-386`: "logs WARN `adoption_refused_persistently` for the same condition" overstates it — the WARN also needs a streak milestone, so with hourly retries the first WARN comes at the 48th attempt (~43 h), about a day after the page warns. Reword (log-fields.md:193 and configuration.md:235 are correct), or emit the WARN on the first refusal past 24 h.
-- **B-68** `internal/freshness/freshness.go:633-634`: the `ErrAdoptionPanicked` doc says repair and reconcile panics are recorded; only adoption panics are (plan deviation 7). One-line comment fix.

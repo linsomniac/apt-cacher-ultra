@@ -29,7 +29,11 @@ client configs work unchanged.
 - Availability-first caching — cache hits never block on upstream; snapshot is served when upstream is down/slow
   rather than failing.
 - Atomic snapshot adoption — per-suite InRelease + all referenced Packages/by-hash blobs are staged, GPG-verified, and
-  flipped in a single SQLite transaction so clients always see a coherent metadata set.
+  flipped in a single SQLite transaction. The flip waits (bounded) until clients that received the old InRelease have
+  had `adoption.flip_quiet_period` to fetch its indexes, so the index requests an apt client sends within that period
+  of its InRelease match it (by-hash requests are served from the displaced snapshot even later); the residuals (a
+  suite that never goes quiet within the bounds, responses slower than apt's own timeout, more than 256 held requests)
+  each have a counter and are documented in [Flip consistency](docs/configuration.md#flip-consistency).
 - Hash validation — every metadata file is checked against InRelease, every .deb against Packages; mismatches are
 rejected.
 - by-hash dedup — indices stored by content hash, deduplicated across suites.
