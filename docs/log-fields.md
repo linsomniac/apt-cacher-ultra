@@ -140,18 +140,26 @@ a row with empty `package_name` and so omits the field.
 The `outcome` field's closed value set is locked by SPEC §10 and not
 re-enumerated here. The values are listed at the SPEC anchor.
 
-The flat-repository work (spec C5/C7) adds the adoption outcomes `refused`
-(a refusal state; the `reason` says which), `release_date_in_future` and
-`timed_out` (`adoption.max_duration` reached), the gauge
-`acu_adoption_failing_suites` (suites whose latest adoption failed, refusals
-excluded) and the gauge `acu_freshness_waiting_for_slot` (suites waiting for
-an adoption slot).
+### Adoption outcomes (not the request line's `outcome`)
+
+The flat-repository work (spec C5/C7) adds values to the **adoption**
+outcome — the metric label `acu_adoption_total{outcome}` (and
+`acu_adoption_duration_seconds{outcome}`) and the admin JSON field
+`recent_adoptions[].outcome` — never to the `request` line's `outcome`
+above: `refused` (a refusal state; the `reason` says which),
+`release_date_in_future`, `timed_out` (`adoption.max_duration` reached) and
+`panicked` (the adoption goroutine panicked; recorded with reason `panic`).
+It also adds the gauge `acu_adoption_failing_suites` (suites whose latest
+adoption failed, refusals excluded; 0 while adoption is disabled) and the
+gauge `acu_freshness_waiting_for_slot` (suites waiting for an adoption
+slot).
 
 The `freshness_check` line's `result` gains `changed_deferred` (upstream
 still serves content whose adoption failed or was refused; the field
 `reason` says why it is held back) and `changed_queued` (no adoption slot
-was free; the suite waits for one, and the scheduler re-checks it as soon as
-one is released, see *Capacity and fairness* in configuration.md).
+was free; the suite waits for one and is re-checked as soon as one is
+released; a client-refused change is picked up by the next tick, see
+*Capacity and fairness* in configuration.md).
 
 ## Stability guarantees
 
@@ -165,19 +173,24 @@ one is released, see *Capacity and fairness* in configuration.md).
 ## Operational events
 
 Structured events emitted outside the per-request `request` log line:
-goroutine panic recovery, wall-clock step detection, and the startup
-legacy trust audit (logged by `internal/freshness` and `internal/handler`).
+goroutine panic recovery, freshness checks that end unknown, adoption
+failure and refusal records and their retry schedule, wall-clock step
+detection, and the startup legacy trust audit (logged by
+`internal/freshness` and `internal/handler`).
 
 | Event | Level | Fields | Meaning |
 |---|---|---|---|
-| `adoption_panicked` | ERROR | `where` (`adoption`, `repair`, `reconcile`, `heartbeat`, `record`), `canonical_host`, `suite_path`, `panic`, `stack` (first occurrence per `where` per process only; never for `where=heartbeat`) | A panic inside an adoption, repair, reconcile, heartbeat or failure-record goroutine was recovered; the prior snapshot keeps serving. `where=record` is `recordAdoptionFailure`, which writes the spec C7 failure record after an adoption, repair or reconcile ends. |
-| `freshness_check_panicked` | ERROR | `where` (`check`, `scheduler`, `reschedule`), `canonical_host`, `suite_path`, `panic`, `stack` (first occurrence per `where` per process only) | A panic during a freshness check was recovered. For `where=check` the check counts as failed (`last_check_at` bumped, so the cooldown applies) and also counts as an unknown end: `last_check_at` is bumped and `check_fail_count` extended. The `scheduler` and `reschedule` recovers only log; `where=reschedule` guards the start-time retry spread (`rescheduleFailingAdoptions`). |
-| `freshness check failed` | INFO | `canonical_host`, `suite_path`, `form`, `err`, `result` (always `failed`) | A check ended unknown (transport error, the 2-minute check deadline at the host slot or the request, or an unexpected status); `last_check_at` is bumped and `check_fail_count` extended, so the scheduler backs off (2 min doubling to 1 h). |
+| `adoption_panicked` | ERROR | `where` (`adoption`, `repair`, `reconcile`, `heartbeat`, `record`), `canonical_host`, `suite_path`, `panic`, `stack` (first occurrence per `where` per process only; never for `where=heartbeat`) | A panic inside an adoption, repair, reconcile, heartbeat or failure-record goroutine was recovered; the prior snapshot keeps serving. Only an adoption panic is recorded as a failure (reason `panic`); repair and reconcile panics are logged, not recorded (plan deviation 7). `where=record` is `recordAdoptionFailure`, which writes the spec C7 failure record after an adoption ends. |
+| `freshness_check_panicked` | ERROR | `where` (`check`, `scheduler`, `reschedule`, `t1`), `canonical_host`, `suite_path`, `panic`, `stack` (first occurrence per `where` per process only) | A panic during a freshness check was recovered. For `where=check` the check counts as failed (`last_check_at` bumped, so the cooldown applies) and also counts as an unknown end: `last_check_at` is bumped and `check_fail_count` extended. The `scheduler`, `reschedule` and `t1` recovers only log; `where=reschedule` guards the start-time retry spread (`rescheduleFailingAdoptions`), and `where=t1` is the handler's client-triggered check goroutine (logged by `internal/handler`). |
+| `freshness check failed` | INFO | `canonical_host`, `suite_path`, `form`, `err`, `result` (always `failed`) | A check ended unknown (a transport error or error status from upstream, or the 2-minute check deadline at the host slot or the request); `last_check_at` is bumped and `check_fail_count` extended, so the scheduler backs off (2 min doubling to 1 h), and `acu_freshness_check_total{result="failed"}` is incremented. |
+| `freshness: unexpected success status` | ERROR | `status`, `canonical_host`, `suite_path`, `form` (detached checks only) | The fetch client returned a success status other than 200 or 304 (a contract violation). The suite row is bookkept like an unknown end (`last_check_at` bumped, `check_fail_count` extended, `last_success_at` kept), but no `freshness check failed` line is logged and `acu_freshness_check_total` is not incremented. |
+| `adoption_run_failed` | WARN; INFO when the attempt was refused (outcome `refused`) | `canonical_host`, `suite_path`, `form`, `err` | Backstop line for every adoption attempt that returned an error, so a failure with no categorised line of its own is still visible. A refusal is a state, not a failure, so its line is INFO (`adoption_refused` carries the reason and timing); operators alerting on WARN are not paged for a flapping mirror. |
 | `adoption: read prior snapshot failed` | WARN | `canonical_host`, `suite_path`, `err` | The adoption could not read the suite's current (prior) snapshot before running Date and rollback checks against it; the attempt fails as `db_failed` and is retried on the normal backoff schedule rather than skipping those checks. |
 | `adoption_failure_record_failed` | WARN; DEBUG only for the read that precedes the write, when it finds the suite already removed (a routine reap during adoption, not a fault) — the write-failure site below has no DEBUG case | `canonical_host`, `suite_path`, `err` | The failure/refusal record could not be read or written; the next check may retry sooner than scheduled. |
 | `adoption_refused` | INFO | `canonical_host`, `suite_path`, `reason`, `refusal`, `fail_count`, `retry_in_seconds`, `next_retry_unixtime` | One attempt ended in a refusal state (`upstream_older`, `rollback_refused`), not a failure; logged for every refused attempt. |
 | `adoption_deferred` | INFO | as `adoption_refused` | A suite entered the failing or refused state, or its reason changed (not logged on every attempt); the same content is retried at `next_retry_unixtime`, while new content is tried at once. |
-| `adoption_failing_persistently` | WARN | `canonical_host`, `suite_path`, `reason`, `fail_count`, `failing_since_unixtime` | The suite's adoption has failed 3, 6, 12, 24, … times in a row. Refusals never reach this (spec C7). |
+| `adoption_failing_persistently` | WARN | `canonical_host`, `suite_path`, `reason`, `fail_count`, `failing_since_unixtime` | The suite's adoption has failed 3, 6, 12, 24, … times in a row. Refusals never reach this (spec C7); see `adoption_refused_persistently`. |
+| `adoption_refused_persistently` | WARN | as `adoption_failing_persistently` (`reason` is the refusal reason; `failing_since_unixtime` is when the refusal streak began) | A refusal streak reached 3, 6, 12, 24, … attempts and began at least 24 h ago. A refusal is a state, not a failure, but one that lasts a day may be a silent freeze — a vendor that stops emitting `Date` is refused `upstream_older` forever — so it is made alertable here and on the admin page (`REFUSED 24H+`). A streak start in the future (clock step) restarts the streak, so it is never "old". |
 | `adoption_retries_rescheduled` | INFO | `suites`, `spread_seconds` | At start, failing suites were given one retry spread over the refresh interval. Refusals and panicked adoptions keep their schedule. |
 | `adoption_retries_reschedule_failed` | WARN | `err` | The start-time retry spread could not be written; failing suites keep their schedule. |
 | `adoption_repair_list_failed` | WARN | `canonical_host`, `suite_path`, `snapshot_id`, `err` | The repair decision could not list the snapshot's repairable skipped members; no repair runs this check, the next unchanged check asks again. |
@@ -185,7 +198,7 @@ legacy trust audit (logged by `internal/freshness` and `internal/handler`).
 | `freshness: clear adoption failure failed` | WARN | `canonical_host`, `suite_path`, `err` | Upstream serves the current content again but the failure record could not be cleared; the next check tries again. |
 | `freshness: read suite row after a panic failed` | WARN | `err`, `canonical_host`, `suite_path` | After a recovered check panic, the best-effort bump of `last_check_at`/`check_fail_count` could not even read the suite's row; the row is left as it was. |
 | `freshness: persist failure bump after a panic failed` | WARN | `err`, `canonical_host`, `suite_path` | After a recovered check panic, `last_check_at` and `check_fail_count` were bumped in memory but the write failed; the row is left as it was. |
-| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute. For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. `acu_clock_steps_detected_total` counts detections — one per stored timestamp found in the future — not distinct clock steps. |
+| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute. For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. `acu_clock_steps_detected_total` counts detections, not distinct clock steps or distinct stamps: the same future stamp is detected again every time it is read — every scheduler tick for a future `last_success_at`, every check for a future `last_check_at`, and twice when a first-ever check falls back from inline to detached — so alert on its rate, not its value. |
 | `legacy_snapshot_quarantined` | WARN | `reason` (`legacy_plaintext`, `malformed_envelope`, `unsigned_declarations`, `unparseable`, `anchor_missing`, `anchor_oversized`, `anchor_corrupt`, `unexpected_form`), `snapshot_id`, `canonical_host`, `suite_path`, `anchor_form`, `was_current` | The startup trust audit could not prove a pre-upgrade snapshot signed and clean; it no longer serves or vouches, and its suite is served unadopted until it re-adopts. |
 | `legacy_trust_audit_deferred` | ERROR | `snapshot_id`, `canonical_host`, `suite_path`, `err`, `stack` (present only for a recovered panic) | A pre-upgrade snapshot's pool file could not be read (not "missing"), or auditing it panicked (`err` carries the panic value); the snapshot is left as it was and retried at the next start. |
 | `legacy_trust_audit_progress` | INFO | `audited`, `quarantined`, `deferred` | One batch of up to 100 queued snapshots was audited and committed; the fields are running totals across this start's batches. Logged on the first start after an upgrade, and on later starts while deferred snapshots remain queued or after an interrupted audit. |

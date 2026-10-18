@@ -273,9 +273,11 @@ it — which shows up client-side as `apt update` failing to fetch that file.
 apt-cacher-ultra heals such snapshots **in place** (no re-adoption, no serving
 gap), two ways:
 
-- **Automatically** — on every freshness check where the upstream `InRelease`
-  is unchanged, the daemon re-parses the snapshot's signed `Release`, fetches
-  any declared-but-missing index, validates it, and inserts it into the live
+- **Automatically** — on a freshness check where the upstream `InRelease`
+  is unchanged and an adoption slot is free (`max_concurrent_adoptions`; a
+  check that finds none skips the heal until a later unchanged check), the
+  daemon re-parses the snapshot's signed `Release`, fetches any
+  declared-but-missing index, validates it, and inserts it into the live
   snapshot. Nothing to do; this is on by default (`[adoption].repair_skipped_members`).
 - **On demand** — force an immediate reconcile of one suite through the admin
   listener (default `127.0.0.1:6789`; protect it with `admin.htpasswd_file`
@@ -288,7 +290,7 @@ curl -fsS -X POST http://127.0.0.1:6789/reconcile \
     --data-urlencode 'host=packages.microsoft.com' \
     --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
 # 202 Accepted = reconcile triggered (runs asynchronously)
-# 409 = busy, unknown suite, or no current snapshot
+# 409 = busy, unknown suite, no current snapshot, or no free adoption slot
 ```
 
 The metric `acu_serve_snapshot_index_target_404_total` (and the

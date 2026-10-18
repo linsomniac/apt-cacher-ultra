@@ -102,7 +102,8 @@ repair_skipped_members = true
 hot_prefetch_budget   = "5m"
 # Longest an adoption, repair or reconcile may run. An abandoned adoption
 # is retried on the normal schedule, a repair or reconcile on the next
-# unchanged check; the final commit is never cut short.
+# unchanged check. This deadline never cuts the final commit short; the
+# commit has its own 5-minute bound.
 max_duration          = "30m"
 
 [integrity]
