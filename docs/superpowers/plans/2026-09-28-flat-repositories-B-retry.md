@@ -6549,7 +6549,7 @@ In both `changed` branches, replace the comment of Task 9's no-slot block with:
 					// check leaves it due for the next tick.
 ```
 
-In both `checkLockedInline` and `checkLockedDetached`: right before the final `c.logger.Info("freshness_check", logAttrs...)`, set `out.report = checkReport{result: result, signedCurrent: signedCurrent}`; and on the two exits that record an unknown end (the `Conditional` error path after its `PutSuiteFreshness`, and the unexpected-status `default:` branch) set `out.report.result = "failed"` before returning.
+In both `checkLockedInline` and `checkLockedDetached`: right before the final `c.logger.Info("freshness_check", logAttrs...)`, set `out.report = checkReport{result: result, signedCurrent: signedCurrent}`; and on every exit that records an unknown end set `out.report.result = "failed"` before returning: each call of Task 10's `recordUnknownEnd` helper (the host-slot deadline and the `Conditional` error paths) and the unexpected-status `default:` branch. (Setting it inside `recordUnknownEnd` is not possible — it has no `out`; set it at each call site, or give the helper an `out *checkOutcome` parameter.)
 
 - [ ] **Step 5: Parked suites and offers in the scheduler**
 
@@ -7929,7 +7929,7 @@ In `docs/log-fields.md`'s "Operational events" table, add rows:
 | `freshness: clear adoption failure failed` | WARN | `canonical_host`, `suite_path`, `err` | Upstream serves the current content again but the failure record could not be cleared; the next check tries again. |
 ```
 
-Extend the `adoption_panicked` row's `where` set with `record`. Append to the `clock_step_detected` row's meaning: "For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. `acu_clock_steps_detected_total` counts detections — one per stored timestamp found in the future — not distinct clock steps." (deferred minor A-42; plan deviation 6).
+Extend the `adoption_panicked` row's `where` set with `record`. Append to the `freshness_check_panicked` row's meaning: "With `where=check` the check also counts as an unknown end: `last_check_at` is bumped and `check_fail_count` extended." Add an INFO row for the line `freshness check failed`, fields `canonical_host`, `suite_path`, `form`, `err`, `result` (always `failed`), meaning: "A check ended unknown (transport error, the 2-minute check deadline at the host slot or the request, or an unexpected status); `last_check_at` is bumped and `check_fail_count` extended, so the scheduler backs off (2 min doubling to 1 h)." Append to the `clock_step_detected` row's meaning: "For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. `acu_clock_steps_detected_total` counts detections — one per stored timestamp found in the future — not distinct clock steps." (deferred minor A-42; plan deviation 6).
 
 After the paragraph that says the `outcome` field's values are listed at the SPEC anchor, add:
 
