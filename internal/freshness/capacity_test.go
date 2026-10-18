@@ -129,11 +129,13 @@ func TestCheck_GlobalSlotCapsConcurrentAdoptions(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("A never reached its member fetch")
 	}
-	chk.Check(ctx, "http", hosts[1], rigSuite)
-	select {
-	case <-pending:
-		t.Fatal("B started while the only global slot was held")
-	case <-time.After(150 * time.Millisecond):
+	// B's refusal is read from its result and the slot count, not
+	// inferred from a timing window (deferred minor B-29).
+	if rep := chk.check(ctx, SuiteRef{CanonicalScheme: "http", CanonicalHost: hosts[1], SuitePath: rigSuite}, checkOpts{}); rep.result != "changed_queued" {
+		t.Fatalf("B's check = %q, want changed_queued while the only global slot is held", rep.result)
+	}
+	if g, _ := chk.admission.usage(); g != 1 {
+		t.Fatalf("%d global slots in use, want 1 (A's)", g)
 	}
 	close(aReq.release)
 	chk.WaitForAdoptions()
@@ -193,8 +195,9 @@ func TestCheck_RepairObeysTheGlobalSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	logs := &lockedBuffer{}
 	chk, err := New(Config{Cache: c, Fetcher: &simtest.StaticConditional{Status: 304}, HostLimiter: hostsem.New(8),
-		Adopter: repAd, Logger: discardLogger()})
+		Adopter: repAd, Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,11 +208,21 @@ func TestCheck_RepairObeysTheGlobalSlot(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("repair A never reached its fetch")
 	}
+	// B's repair is deferred for want of a slot: read from its line and
+	// the slot count, not a timing window (deferred minor B-29).
 	chk.Check(ctx, "http", hosts[1], suitePath)
-	select {
-	case <-pending:
-		t.Fatal("repair B ran while the only global slot was held")
-	case <-time.After(150 * time.Millisecond):
+	deferred := false
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, `"msg":"freshness: repair deferred, no adoption slot"`) &&
+			strings.Contains(line, `"canonical_host":"b.example"`) {
+			deferred = true
+		}
+	}
+	if !deferred {
+		t.Fatal("repair B was not deferred while the only global slot was held")
+	}
+	if g, _ := chk.admission.usage(); g != 1 {
+		t.Fatalf("%d global slots in use, want 1 (repair A's)", g)
 	}
 	close(aReq.release)
 	chk.WaitForAdoptions()
@@ -418,7 +431,7 @@ func TestAdoption_CommitSurvivesTheAdoptionDeadline(t *testing.T) {
 			form: adoptionFormInline, bytes: datedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})}
 		// membersDone runs right before the commit: waiting there for the
 		// deadline models it expiring at the worst moment.
-		if err := ad.runRequest(ctx, req, func() { <-ctx.Done() }); err != nil {
+		if err := ad.runRequest(ctx, req, runHooks{membersDone: func() { <-ctx.Done() }, stop: context.Background()}); err != nil {
 			t.Fatalf("commit aborted by the adoption deadline: %v", err)
 		}
 		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -444,7 +457,7 @@ func TestAdoption_ShutdownBeforeTheCommitCommitsNothing(t *testing.T) {
 		bytes: datedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})}
 	// membersDone runs right before the commit: cancelling there models a
 	// shutdown at the worst moment.
-	err := env.adopter.runRequest(ctx, req, cancel)
+	err := env.adopter.runRequest(ctx, req, runHooks{membersDone: cancel, stop: ctx})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("runRequest = %v, want a shutdown error (context.Canceled)", err)
 	}
@@ -473,7 +486,7 @@ func TestAdoption_HostSlotFreedBeforeCommit(t *testing.T) {
 	}
 	req := &adoptionRequest{suite: env.suite, form: adoptionFormInline,
 		bytes: datedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})}
-	if err := env.adopter.runRequest(context.Background(), req, membersDone); err != nil {
+	if err := env.adopter.runRequest(context.Background(), req, runHooks{membersDone: membersDone}); err != nil {
 		t.Fatal(err)
 	}
 	if !called {

@@ -32,6 +32,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
@@ -439,7 +440,11 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 // AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, lease
 // release, recoverAdoption (first). The failure record is written before
 // the mutex is released on both the error and the panic path (spec C7).
-// The host slot is freed earlier, when the member pipeline ends.
+// The host slot is freed earlier, when the member pipeline ends; the global slot only here, after the flip barrier and the commit (ruling R-C1).
+// A deadline that passes after the member pipeline, in the flip barrier
+// (ruling R-C2), leaves the outcome to the commit's own error, and a flip
+// abandoned in the barrier (shutdown, design note 18) is never recorded as
+// a failure.
 func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) {
 	c.adoptionWg.Add(1)
 	go func() {
@@ -456,11 +461,20 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 		defer c.recoverAdoption(req, start)
 		actx, cancel := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
 		defer cancel()
-		err := c.adopter.runRequest(actx, req, l.releaseHost)
+		pipelineDone := false // set by membersDone, which runs on this goroutine (runShared Step 11)
+		err := c.adopter.runRequest(actx, req, runHooks{
+			membersDone: func() { pipelineDone = true; l.releaseHost() },
+			stop:        c.lifetimeCtx,
+		})
 		duration := time.Since(start)
 		outcome := classifyAdoptionOutcome(err)
-		if err != nil && errors.Is(actx.Err(), context.DeadlineExceeded) && c.lifetimeCtx.Err() == nil {
-			outcome = "timed_out" // a member fetch reports the deadline as its own failure
+		// A deadline that fires in the member pipeline makes the attempt
+		// timed_out (a member fetch reports it as its own failure). One that
+		// passes in the flip barrier (ruling R-C2) does not: what failed then
+		// is the commit, and its own error classifies it (a commit that hit
+		// commitTimeout is still timed_out, through its chain).
+		if err != nil && !pipelineDone && errors.Is(actx.Err(), context.DeadlineExceeded) && c.lifetimeCtx.Err() == nil {
+			outcome = "timed_out"
 		}
 		reason := classifyAdoptionReason(err, outcome, c.gpgReasonClassifier)
 		adoptionTotal.Inc(outcome, req.suite.CanonicalHost)
@@ -505,7 +519,12 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 				"form", formName(req.form),
 				"err", err,
 			)
-			c.recordAdoptionFailure(req, reason)
+			// A flip abandoned in the barrier means shutdown: main closes
+			// the gate at the signal, while the lifetime context still
+			// runs. Shutdown is never a failure (spec C7, design note 18).
+			if !errors.Is(err, flipgate.ErrAborted) {
+				c.recordAdoptionFailure(req, reason)
+			}
 		}
 	}()
 }
@@ -611,6 +630,9 @@ func (c *Checker) WaitForAdoptions() { c.adoptionWg.Wait() }
 // without a thundering herd. Refusal states and panic records keep
 // their schedule.
 func (c *Checker) rescheduleFailingAdoptions(ctx context.Context) {
+	// Without an adopter nothing adopts: records left by a run with
+	// adoption enabled are inert (Phase 1 parity), so rescheduling them
+	// would only cost writes.
 	if c.adopter == nil {
 		return
 	}
@@ -630,8 +652,9 @@ func (c *Checker) rescheduleFailingAdoptions(ctx context.Context) {
 	}
 }
 
-// ErrAdoptionPanicked is recorded (phase B) when an adoption, repair or
-// reconcile goroutine panics (security finding I-1).
+// ErrAdoptionPanicked marks a panicked adoption (security finding I-1):
+// the adoption goroutine records it as a failure with reason panic. Repair
+// and reconcile panics are logged, not recorded (phase B plan, deviation 7).
 var ErrAdoptionPanicked = errors.New("adoption_panicked")
 
 // panicStackLogged holds the goroutine kinds ("adoption", "repair",

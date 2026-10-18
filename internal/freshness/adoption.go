@@ -22,6 +22,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
@@ -405,6 +406,12 @@ type AdoptionConfig struct {
 	// (adoption.max_duration, spec C4). Zero means 30m.
 	MaxDuration time.Duration
 
+	// FlipGate is the spec C8 flip barrier the commit waits behind
+	// (adoption.flip_quiet_period). nil, or a gate with a zero quiet
+	// period, commits at once (the pre-C8 behaviour). The handler must
+	// register anchor serves with the same gate (Adopter.FlipGate).
+	FlipGate *flipgate.Gate
+
 	// HotPackagesWindow is the SPEC3 §5.2 hot_packages.window. 0
 	// disables hot-package proactive refresh entirely.
 	HotPackagesWindow time.Duration
@@ -518,6 +525,9 @@ type Adopter struct {
 	// run deadline (spec C4); the Adopter itself never waits for a slot.
 	maxConcurrent int
 	maxDuration   time.Duration
+
+	// flipGate is the spec C8 barrier the commit waits behind (nil: none).
+	flipGate *flipgate.Gate
 
 	// reconcilePendingHook, when set, runs at the start of
 	// reconcilePending. Test seam: a panic in the repair decision must not
@@ -669,6 +679,7 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		hostSem:                 cfg.HostLimiter,
 		maxConcurrent:           cfg.MaxConcurrent,
 		maxDuration:             maxDur,
+		flipGate:                cfg.FlipGate,
 		hotPackagesWindow:       cfg.HotPackagesWindow,
 		hotPrefetchBudget:       cfg.HotPrefetchBudget,
 		maxVersionsPerPackage:   maxVersions,
@@ -684,6 +695,16 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		logger:                  logger,
 		now:                     now,
 	}, nil
+}
+
+// FlipGate returns the spec C8 flip barrier the adopter commits behind:
+// nil when none is wired, or for a nil adopter (adoption disabled). The
+// handler registers anchor serves with the same gate.
+func (a *Adopter) FlipGate() *flipgate.Gate {
+	if a == nil {
+		return nil
+	}
+	return a.flipGate
 }
 
 // ctxSleep waits d, returning early with ctx.Err() on cancellation.
@@ -863,9 +884,40 @@ type adoptionPayload struct {
 	releaseGPGHash string // sha256 of sigBytes (set in step 2)
 
 	// membersDone, when set, runs once the member pipeline (members,
-	// by-hash, hot prefetch) is over and before the commit: the Checker
-	// frees the host slot there (spec C4).
+	// by-hash, hot prefetch) is over and before the flip barrier: the
+	// Checker frees the host slot there (spec C4).
 	membersDone func()
+
+	// stop is the shutdown signal: the Checker's lifetime context (nil for
+	// Run/RunDetached, which have none). See stopErr and barrierCtx.
+	stop context.Context
+}
+
+// stopErr reports a shutdown before the commit: the lifetime context
+// ended or, for Run/RunDetached callers, ctx was cancelled. ctx's deadline
+// (adoption.max_duration) is not a shutdown.
+//
+// AIDEV-NOTE: read the lifetime context itself, never only ctx: once the
+// deadline fired, ctx.Err() stays DeadlineExceeded and a later shutdown
+// would go unseen (deferred minor B-65).
+func (p *adoptionPayload) stopErr(ctx context.Context) error {
+	if p.stop != nil {
+		return p.stop.Err()
+	}
+	if err := ctx.Err(); errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}
+
+// barrierCtx is what the flip barrier waits under: the shutdown signal,
+// never the adoption deadline (ruling R-C2). Run/RunDetached callers have
+// no shutdown signal: their barrier runs to its own bounds.
+func (p *adoptionPayload) barrierCtx(ctx context.Context) context.Context {
+	if p.stop != nil {
+		return p.stop
+	}
+	return context.WithoutCancel(ctx)
 }
 
 // Run executes the §7.5 adoption flow for an inline (clearsigned
@@ -902,10 +954,19 @@ func (a *Adopter) RunDetached(ctx context.Context, suite SuiteRef, releaseBytes,
 	}, etag, lastmod)
 }
 
-// runRequest runs the adoption a check requested. membersDone (may be
-// nil) runs before the commit; see adoptionPayload.membersDone.
-func (a *Adopter) runRequest(ctx context.Context, req *adoptionRequest, membersDone func()) error {
-	p := &adoptionPayload{form: req.form, membersDone: membersDone}
+// runHooks is what the Checker passes into an adoption it spawned.
+type runHooks struct {
+	// membersDone runs once the member pipeline is over, before the flip
+	// barrier; the Checker frees the host slot there (spec C4).
+	membersDone func()
+	// stop is the Checker's lifetime context: its end abandons the
+	// adoption before the commit and ends the barrier's waits.
+	stop context.Context
+}
+
+// runRequest runs the adoption a check requested; see runHooks.
+func (a *Adopter) runRequest(ctx context.Context, req *adoptionRequest, hooks runHooks) error {
+	p := &adoptionPayload{form: req.form, membersDone: hooks.membersDone, stop: hooks.stop}
 	switch req.form {
 	case adoptionFormInline:
 		p.inlineBytes = req.bytes
@@ -1147,7 +1208,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// ordering trap of two separate defers, which would Wait first
 	// and deadlock waiting on a goroutine whose ctx hasn't been
 	// cancelled yet).
-	tickerCtx, tickerCancel := context.WithCancel(ctx)
+	// AIDEV-NOTE: the ticker runs until runShared returns, not until ctx's
+	// deadline: the flip barrier may outlast adoption.max_duration (ruling
+	// R-C2), and the candidate and its member blobs must stay protected
+	// until the commit. Shutdown still ends it, through runShared's return.
+	tickerCtx, tickerCancel := context.WithCancel(context.WithoutCancel(ctx))
 	var tickerWG sync.WaitGroup
 	if a.heartbeatInterval > 0 {
 		tickerWG.Add(1)
@@ -1524,37 +1589,50 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 
 	// Spec C4: the member pipeline is over; free the host slot so the
 	// next suite on this host can start. The global slot stays held
-	// through the commit.
+	// through the flip barrier and the commit (ruling R-C1).
+	//
+	// AIDEV-NOTE: membersDone must stay BEFORE the barrier: the barrier
+	// may wait up to 140 s, and holding the host slot that long would stall
+	// the host's next adoption. Only the host slot is freed here
+	// (TestCheck_MembersDoneFreesOnlyTheHostSlot).
 	if p.membersDone != nil {
 		p.membersDone()
 	}
 
-	// A shutdown (the lifetime context cancelled: Canceled, not the
-	// max_duration deadline's DeadlineExceeded) before the commit starts
-	// abandons the adoption, as SPEC2 §9.5 step 5 says: starting a commit
-	// now would hold the stop for up to commitTimeout, far beyond the
-	// shipped unit's TimeoutStopSec. Nothing is recorded (the lifetime
-	// context is done); the abandoned candidate is reaped by GC after its
-	// stale grace, like any interrupted adoption, and the next start's
-	// checks see the change again.
-	if err := ctx.Err(); errors.Is(err, context.Canceled) {
+	// A shutdown before the commit starts abandons the adoption, as SPEC2
+	// §9.5 step 5 says: starting a commit now would hold the stop for up
+	// to commitTimeout, far beyond the shipped unit's TimeoutStopSec.
+	// Nothing is recorded (the lifetime context is done); the abandoned
+	// candidate is reaped by GC after its stale grace, like any
+	// interrupted adoption, and the next start's checks see the change
+	// again. See stopErr (B-65).
+	if err := p.stopErr(ctx); err != nil {
 		return fmt.Errorf("adoption: shutdown before the commit: %w", err)
 	}
 
-	// Step 11: atomic flip transaction, under its own bound (spec C4): the
-	// adoption deadline (adoption.max_duration) must not abort a commit,
-	// and a shutdown does not abort one already in progress — the stop
-	// waits for it, up to commitTimeout. coverageComplete is the SPEC3
-	// §7.5.4 per-snapshot proof for strict mode.
+	// Step 11: the atomic flip transaction, behind the spec C8 flip
+	// barrier. The barrier's waits do not honour adoption.max_duration
+	// (they are bounded by 140 s, and giving up would throw away finished
+	// member work) but end on shutdown, when nothing commits (ruling
+	// R-C2). The commit runs under its own bound: the deadline must not
+	// abort it, and a shutdown does not abort one already in progress —
+	// the stop waits for it, up to commitTimeout. coverageComplete is the
+	// SPEC3 §7.5.4 per-snapshot proof for strict mode.
 	//
 	// AIDEV-NOTE: a commit that has started is never cancelled; a
 	// systemctl stop during a long commit is bounded by commitTimeout
 	// (5 min), and the unit's TimeoutStopSec (35 s) may SIGKILL first —
 	// SQLite rolls the transaction back, so nothing is lost.
-	commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
-	defer cancelCommit()
-	if err := a.cache.CommitAdoption(commitCtx, snapshotID, memberRows, integritySkipped, packageHashes,
-		prefetchedURLPaths, pkgHashRes.coverageComplete); err != nil {
+	commit := func() error {
+		commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
+		defer cancelCommit()
+		return a.cache.CommitAdoption(commitCtx, snapshotID, memberRows, integritySkipped, packageHashes,
+			prefetchedURLPaths, pkgHashRes.coverageComplete)
+	}
+	if err := a.flip(ctx, suite, p, prior == nil, snapshotID, commit); err != nil {
+		if errors.Is(err, flipgate.ErrAborted) {
+			return fmt.Errorf("adoption: shutdown in the flip barrier: %w", err)
+		}
 		a.logger.Warn("adoption: commit failed",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
@@ -1658,6 +1736,63 @@ func (a *Adopter) priorSnapshot(ctx context.Context, suite SuiteRef) (*cache.Sui
 		return nil, fmt.Errorf("%w: read prior snapshot: %w", ErrAdoptionDBFailed, err)
 	}
 	return snap, nil
+}
+
+// flip runs commit behind the spec C8 flip barrier and logs
+// adoption_flip_barrier (design note 10). Without an enabled gate it
+// commits at once (the pre-C8 behaviour). A first adoption whose anchor is
+// the url_path anchor clients have been served skips the barrier: the
+// switch changes nothing they hold.
+func (a *Adopter) flip(ctx context.Context, suite SuiteRef, p *adoptionPayload, first bool, snapshotID int64, commit func() error) error {
+	if !a.flipGate.Enabled() {
+		return commit()
+	}
+	attrs := []any{"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "snapshot_id", snapshotID}
+	// first is defensive: Step 3c keeps the url_path anchor at the previous
+	// snapshot's bytes, so a later adoption never matches it today; it keeps
+	// the skip correct should a later phase write url_path anchors for
+	// adopted suites.
+	if first && a.servedAnchorUnchanged(ctx, suite, p) {
+		err := commit()
+		a.logger.Info("adoption_flip_barrier", append(attrs, "outcome", barrierOutcome("not_needed", err))...)
+		return err
+	}
+	res, err := a.flipGate.Flip(p.barrierCtx(ctx), flipgate.Key(suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath), commit)
+	if res.Outcome != flipgate.OutcomeAborted {
+		a.logger.Info("adoption_flip_barrier", append(attrs,
+			"outcome", barrierOutcome(string(res.Outcome), err),
+			"phase_a_seconds", res.PhaseA.Seconds(),
+			"token_wait_seconds", res.TokenWait.Seconds(),
+			"hold_seconds", res.HoldEnd.Sub(res.HoldStart).Seconds(),
+			"held_requests", res.Waiters)...)
+	}
+	return err
+}
+
+// barrierOutcome is adoption_flip_barrier's outcome: the barrier's own, or
+// commit_failed when the commit ran and failed (the snapshot did not
+// switch; the timing fields still describe the barrier).
+func barrierOutcome(outcome string, commitErr error) string {
+	if commitErr != nil {
+		return "commit_failed"
+	}
+	return outcome
+}
+
+// servedAnchorUnchanged reports whether the anchor this adoption commits
+// is byte-for-byte the url_path anchor clients have been served: the
+// primary anchor of its form (InRelease inline, Release detached — index
+// consistency depends on the Release text, not on its signature). A read
+// error answers false, so the barrier runs (the safe direction).
+//
+// AIDEV-TODO(phase E): the unsigned form's anchor is <suite>/Release too.
+func (a *Adopter) servedAnchorUnchanged(ctx context.Context, suite SuiteRef, p *adoptionPayload) bool {
+	path, want := suite.SuitePath+inReleaseFilename, p.inlineHash
+	if p.form == adoptionFormDetached {
+		path, want = suite.SuitePath+releaseFilename, p.releaseHash
+	}
+	row, err := a.cache.LookupURL(context.WithoutCancel(ctx), suite.CanonicalScheme, suite.CanonicalHost, path)
+	return err == nil && row.BlobHash != nil && *row.BlobHash == want
 }
 
 // formOfSnapshot maps a snapshot's stored anchor form to the adoption

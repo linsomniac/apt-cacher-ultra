@@ -31,7 +31,10 @@ import (
 // acu_legacy_snapshots_quarantined_total (spec §6.1, startup legacy
 // trust audit), both unlabelled counters; acu_adoption_failing_suites
 // (spec C7, unlabelled gauge); acu_freshness_waiting_for_slot (spec C4,
-// unlabelled gauge).
+// unlabelled gauge). The flip barrier's acu_flip_hold_skipped_total,
+// acu_flip_hold_expired_total, acu_flip_waiters_over_cap_total,
+// acu_flip_slow_anchor_reads_total and acu_flip_gate_panics_total (spec
+// C8, unlabelled counters) are declared in internal/flipgate.
 var (
 	freshnessCheckTotal = metrics.NewCounterWithCap(
 		"acu_freshness_check_total",
@@ -239,6 +242,12 @@ func classifyAdoptionOutcome(err error) string {
 		return "release_date_in_future"
 	case errors.Is(err, ErrAdoptionPanicked):
 		return "panicked"
+	// timed_out stays ahead of the member and DB sentinels: a deadline that
+	// surfaces through a %w chain is timed_out — including a commit that
+	// hit commitTimeout. Member-fetch errors flatten their cause with %v,
+	// so they never match here; spawnAdoption reclassifies as timed_out an
+	// attempt whose adoption.max_duration passed in the member pipeline,
+	// never one whose deadline passed in the flip barrier (ruling R-C2).
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timed_out"
 	// unpinned_suite is checked BEFORE gpg_failed: the verifier wraps
