@@ -471,7 +471,7 @@ The five cells (left → right):
 |------|-----------------|---------------------------------------------|-------------------------------------|----------------------------------------------|
 | 1    | CACHE           | `formatBytes .Cache.BytesUsed`              | `.Cache.BlobCount` + " blobs"       | `.Cache.ZeroRefcountBacklog` (when > 0)      |
 | 2    | SUITES          | `len .Suites`                               | `N LAGGING` count (suites with `.LagWarn`)  | `M FAILING` count (suites with `.AdoptionFailing`) |
-| 3    | ADOPTIONS       | success-count / `len .RecentAdoptions`      | avg `.DurationSeconds`              | most-recent non-success `.Outcome`           |
+| 3    | ADOPTIONS       | success-count / `len .RecentAdoptions`      | `N FAILED` and `M REFUSED` counts (`RING CLEAN` when both are 0) | `{n} EVENTS IN RING`           |
 | 4    | GC              | `formatShortDuration .GC.LastRunDurationSeconds` | `durationOf` since `.GC.LastRunUnixTime` | `formatBytes .GC.LastRunBytesReclaimed` |
 | 5    | ACTIVE          | `len .ActiveHosts`                          | "idle" / "busy"                     | max `.SlotCapacity`                          |
 
@@ -480,6 +480,15 @@ described).** Lag runs from the first time the cache saw upstream's new
 metadata to now. A row, and the suites vital, warn when the lag exceeds 1 h
 or an adoption is failing; the vital is critical when the lag exceeds 24 h.
 The "(lagging …)" text shows any lag.
+
+**ADOPTIONS counts (phase B).** The sub-line splits non-success outcomes
+into `N FAILED` and `M REFUSED` (each shown only when > 0) rather than one
+combined count — a refusal is a state, not a failure (spec C7). `RING
+CLEAN` renders when both counts are 0 (refusals and successes only, or no
+non-success events); `RING EMPTY` renders instead when the ring has no
+events at all. The Recent Adoptions panel's own eyebrow (§5.8) states the
+same breakdown in full: `{n} IN RING · {failed} FAILED · {refused} REFUSED
+· {success} SUCCESS`, each clause shown only when its count is > 0.
 
 Each cell's `data-state` is computed server-side at template render time
 using helper `vitalState(...)` (§6.2) — the per-cell threshold logic
@@ -578,7 +587,9 @@ outside-click and on `Escape` (§8.4).
 Used in:
 - Recent-adoptions outcome column (one of: `success`, `gpg_failed`,
   `fetch_failed`, `parse_failed`, `refused`, `release_date_in_future`,
-  `timed_out`, etc. — phase B adds the last three, spec C5/C7)
+  `timed_out`, `panicked`, etc. — phase B adds `refused`,
+  `release_date_in_future` and `timed_out` (spec C5/C7); `panicked` has
+  been in the ring since Task 6)
 - Lagging annotation on suites
 - GC deadline-reached cell
 - TLS MITM enabled/disabled state
@@ -866,10 +877,10 @@ attributes, not from a stale roll-up).
 
 Applied to `<tr>` rows in the Recent Adoptions table. Value is the
 outcome enum string (`success`, `gpg_failed`, `fetch_failed`,
-`parse_failed`, `refused`, `release_date_in_future`, `timed_out`, etc.) —
-the JS uses this to compute the dominant non-success outcome for the
-aggregate notice (§8.2). The value is the canonical enum string from the
-JSON payload, not a localized label.
+`parse_failed`, `refused`, `release_date_in_future`, `timed_out`,
+`panicked`, etc.) — the JS uses this to compute the dominant non-success
+outcome for the aggregate notice (§8.2). The value is the canonical enum
+string from the JSON payload, not a localized label.
 
 Phase B adds a sibling `data-reason` attribute, present whenever the row
 has a sub-reason distinct from its outcome (e.g. outcome `refused` with
@@ -1054,7 +1065,8 @@ least as new as upstream); every other refusal reason keeps lag.
 **ADOPTIONS (phase B).** The non-success ratio excludes `refused` rows from
 the numerator (a refusal is a state, not a failure, spec C7) but keeps them
 in the denominator, same as `success`; a window of only refusals and
-successes stays `ok`.
+successes stays `ok`. This is the same FAILED/REFUSED split the vital's
+sub-line and the Recent Adoptions panel eyebrow render (§5.2).
 
 The CACHE `crit` threshold reads pool-unlink errors from the GC block
 (that's where `PoolUnlinkErrors` lives) rather than from `cacheInfo`.

@@ -234,7 +234,7 @@ Two outcomes are refusals, not failures, and are shown as "refused: …" on the 
 
 A Release dated more than 10 seconds ahead of the cache's clock is a failure (apt rejects it as "not valid yet"); check the cache host's clock if this persists.
 
-At start, every failing suite gets one retry spread over the next `periodic_refresh`, so installing a missing key or fixing pins takes effect without waiting an hour. Refusals keep their schedule.
+At start, every failing suite gets one retry spread over the next `periodic_refresh`, so installing a missing key or fixing pins takes effect without waiting an hour. Refusals and panicked adoptions keep their schedule.
 
 ### Capacity and fairness
 
