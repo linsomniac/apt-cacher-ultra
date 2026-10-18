@@ -570,8 +570,9 @@ var processStart = time.Now()
 // AIDEV-NOTE: only PAST-EVENT stamps (last_check_at, last_success_at,
 // last_requested_at, adoption_fail_first_at/last_at, adopted_at) are
 // "infinitely old" when in the future. adoption_next_retry_at is a
-// FUTURE-event stamp: phase B only clamps it to now+1h; never route it
-// through this rule, or a backward step would disable backoff.
+// FUTURE-event stamp: a detection is logged through this function, but
+// the stamp is clamped to now+1h (retryGateFor), never treated as
+// infinitely old.
 func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64, now time.Time) {
 	clockStepsTotal.Inc()
 	last := c.lastClockStepLog.Load()
@@ -618,9 +619,15 @@ func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64,
 //   - 304: last_check_at = last_success_at = now.
 //   - 200, body hash matches cached: bump last_check_at, last_success_at,
 //     and refresh validators (upstream may have rotated etag/lastmod
-//     while bytes are unchanged).
+//     while bytes are unchanged); clear any adoption failure record.
 //   - 200, body hash differs: bump last_check_at, last_success_at,
-//     record inrelease_change_seen_at = now, return *adoptionRequest.
+//     stamp inrelease_change_seen_at on first sighting only, return
+//     *adoptionRequest.
+//   - Spec C7 gate (retryGateFor, adopter wired only): while a failure
+//     record exists and next_retry_at has not come, the GET carries the
+//     failing content's validators, and a 304 or the same content key
+//     is "changed_deferred" (no adoption); new content is attempted at
+//     once; at next_retry_at the GET carries no validators.
 //   - Error (network, 4xx, 5xx, ctx cancel): bump last_check_at only —
 //     don't hammer a broken upstream — and log.
 //
@@ -800,13 +807,9 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 		CanonicalHost: host,
 		URL:           urlRow.UpstreamURL,
 	}
-	var etag, lastmod string
-	if cur.InReleaseETag != nil {
-		etag = *cur.InReleaseETag
-	}
-	if cur.InReleaseLastMod != nil {
-		lastmod = *cur.InReleaseLastMod
-	}
+	gate := c.retryGateFor(cur, now)
+	c.applyClamp(ctx, cur, gate, now)
+	etag, lastmod := gate.validators(cur)
 
 	// SPEC §9.3: bound concurrent upstream calls to host. Without
 	// this, distinct suites on the same host all run Conditional in
@@ -869,27 +872,31 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 	// `result` enum is what operators pivot on — success-with-no-change
 	// (the steady state) vs. success-with-change (the interesting one).
 	var (
-		result string
-		req    *adoptionRequest
+		result      string
+		req         *adoptionRequest
+		clearRecord bool
 	)
 	switch res.Status {
 	case 304:
-		// Validators by definition unchanged. If a previous check had
-		// observed an upstream-ahead InRelease, clear the diagnostic
-		// — upstream is once again serving the cached version (e.g.
-		// after a rollback, or after the cached file caught up via
-		// some other path). Leaving it set would permanently flag
-		// "upstream has newer" even after recovery.
-		cur.InReleaseChangeSeenAt = nil
-		result = "not_modified"
+		if gate.active {
+			// The failing content's validators matched: upstream still
+			// serves what failed (spec C7 changed_deferred).
+			setChangeSeen(cur, nowUnix)
+			result = "changed_deferred"
+		} else {
+			// Upstream serves the cached anchor again; clear the pending
+			// diagnostic (e.g. after an upstream rollback).
+			cur.InReleaseChangeSeenAt = nil
+			result = "not_modified"
+		}
 	case 200:
 		sum := sha256.Sum256(res.Body)
 		newHash := hex.EncodeToString(sum[:])
-		if newHash == cachedHash {
-			// Bytes unchanged despite no 304 (upstream didn't honor
-			// the conditional GET). SPEC §7.2 says refresh validators
-			// — upstream might have rotated an etag while bytes
-			// stayed the same.
+		switch {
+		case newHash == cachedHash:
+			// Same bytes as the current anchor: refresh validators (the
+			// only response they are ever taken from, spec C4), clear the
+			// pending diagnostic and any failure record (spec C7).
 			if res.ETag != "" {
 				v := res.ETag
 				cur.InReleaseETag = &v
@@ -898,15 +905,20 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 				v := res.LastModified
 				cur.InReleaseLastMod = &v
 			}
-			// Recovery: see the 304 branch comment.
 			cur.InReleaseChangeSeenAt = nil
+			clearRecord = gate.active
 			result = "unchanged"
-		} else {
+		case gate.active && !gate.due && newHash == gate.hash:
+			// An upstream that ignores validators re-served the failing
+			// bytes: deferred exactly like the 304 above.
+			setChangeSeen(cur, nowUnix)
+			result = "changed_deferred"
+		default:
 			// Upstream has a new InRelease. Record the diagnostic
 			// regardless of whether an Adopter is wired — operators
 			// monitoring a Phase 1 deployment still see the
 			// divergence.
-			cur.InReleaseChangeSeenAt = &nowUnix
+			setChangeSeen(cur, nowUnix)
 			c.logger.Info("InRelease changed at upstream",
 				"canonical_host", host,
 				"suite_path", suitePath,
@@ -914,18 +926,15 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 				"upstream_hash", newHash,
 			)
 			result = "changed"
-			// Stash the body bytes for the caller to hand off to the
-			// adoption goroutine. The body is bounded by maxBody
-			// (§7.2 cap, default 4 MiB), so retaining one
-			// InRelease's worth of bytes through the goroutine
-			// handoff is acceptable.
+			// The body is bounded by maxBody (§7.2 cap, default 4 MiB),
+			// so retaining it through the goroutine handoff is acceptable.
 			req = &adoptionRequest{
 				suite:   suite,
 				form:    adoptionFormInline,
+				key:     newHash,
 				bytes:   res.Body,
 				etag:    res.ETag,
 				lastmod: res.LastModified,
-				key:     newHash,
 			}
 		}
 	default:
@@ -939,9 +948,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 		)
 		cur.LastSuccessAt = nil // undo the optimistic success bump
 		if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
-			c.logger.Warn("freshness: persist anomaly failed",
-				"err", perr,
-			)
+			c.logger.Warn("freshness: persist anomaly failed", "err", perr)
 		}
 		return nil, nil, false
 	}
@@ -953,14 +960,24 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 			"suite_path", suitePath,
 		)
 	}
+	if clearRecord {
+		if err := c.cache.ClearAdoptionFailure(ctx, scheme, host, suitePath); err != nil {
+			c.logger.Warn("freshness: clear adoption failure failed",
+				"err", err, "canonical_host", host, "suite_path", suitePath)
+		}
+	}
 
-	c.logger.Info("freshness_check",
+	logAttrs := []any{
 		"canonical_host", host,
 		"suite_path", suitePath,
 		"form", "inline",
 		"result", result,
 		"upstream_status", res.Status,
-	)
+	}
+	if result == "changed_deferred" {
+		logAttrs = append(logAttrs, "reason", gate.reason)
+	}
+	c.logger.Info("freshness_check", logAttrs...)
 	freshnessCheckTotal.Inc(result, host)
 	return req, repairIfUnchanged(result, suite, cur), false
 }
@@ -1060,13 +1077,9 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 		CanonicalHost: host,
 		URL:           releaseURL.UpstreamURL,
 	}
-	var etag, lastmod string
-	if cur.InReleaseETag != nil {
-		etag = *cur.InReleaseETag
-	}
-	if cur.InReleaseLastMod != nil {
-		lastmod = *cur.InReleaseLastMod
-	}
+	gate := c.retryGateFor(cur, now)
+	c.applyClamp(ctx, cur, gate, now)
+	etag, lastmod := gate.validators(cur)
 
 	releaseSlot, err := c.hostSem.Acquire(ctx, host)
 	if err != nil {
@@ -1104,13 +1117,21 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 	cur.LastSuccessAt = &nowUnix
 
 	var (
-		result string
-		req    *adoptionRequest
+		result      string
+		req         *adoptionRequest
+		clearRecord bool
 	)
 	switch res.Status {
 	case 304:
-		cur.InReleaseChangeSeenAt = nil
-		result = "not_modified"
+		if gate.active {
+			// Release still matches the failing content's validators: a
+			// re-signature behind this 304 waits for the retry (spec C7).
+			setChangeSeen(cur, nowUnix)
+			result = "changed_deferred"
+		} else {
+			cur.InReleaseChangeSeenAt = nil
+			result = "not_modified"
+		}
 	case 200:
 		sum := sha256.Sum256(res.Body)
 		newHash := hex.EncodeToString(sum[:])
@@ -1124,54 +1145,52 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 				cur.InReleaseLastMod = &v
 			}
 			cur.InReleaseChangeSeenAt = nil
+			clearRecord = gate.active
 			result = "unchanged"
-		} else {
-			cur.InReleaseChangeSeenAt = &nowUnix
-			c.logger.Info("Release changed at upstream",
-				"canonical_host", host,
-				"suite_path", suitePath,
-				"cached_hash", cachedHash,
-				"upstream_hash", newHash,
-			)
-			result = "changed"
-
-			// Fetch Release.gpg fresh — no validators, since the
-			// signature is bound to the (now-changed) Release content.
-			gpgTarget := &fetch.Target{
-				CanonicalHost: host,
-				URL:           releaseGPGURL.UpstreamURL,
-			}
-			gpgRes, gerr := c.fetcher.Conditional(ctx, gpgTarget, "", "", defaultMaxReleaseGPGBytes)
-			if gerr != nil || gpgRes.Status != 200 {
-				// Release.gpg fetch failed. Don't return an
-				// adoptionRequest; record the change, persist, and
-				// rely on the next periodic tick to retry. We
-				// already bumped LastSuccessAt because the Release
-				// fetch succeeded — keep that.
-				if gerr != nil {
-					c.logger.Warn("freshness: Release.gpg fetch failed; deferring adoption",
-						"err", gerr,
-						"canonical_host", host,
-						"suite_path", suitePath,
-					)
-				} else {
-					c.logger.Warn("freshness: Release.gpg fetch returned non-200; deferring adoption",
-						"status", gpgRes.Status,
-						"canonical_host", host,
-						"suite_path", suitePath,
-					)
-				}
+			break
+		}
+		setChangeSeen(cur, nowUnix)
+		// The content key covers the signature, so Release.gpg is fetched
+		// before the gate can compare (no validators: the signature is
+		// bound to this Release).
+		gpgTarget := &fetch.Target{
+			CanonicalHost: host,
+			URL:           releaseGPGURL.UpstreamURL,
+		}
+		gpgRes, gerr := c.fetcher.Conditional(ctx, gpgTarget, "", "", defaultMaxReleaseGPGBytes)
+		if gerr != nil || gpgRes.Status != 200 {
+			// As before: record the change and retry on a later check;
+			// last_success_at stays bumped because Release answered.
+			if gerr != nil {
+				c.logger.Warn("freshness: Release.gpg fetch failed; deferring adoption",
+					"err", gerr, "canonical_host", host, "suite_path", suitePath)
 			} else {
-				req = &adoptionRequest{
-					suite:        suite,
-					form:         adoptionFormDetached,
-					releaseBytes: res.Body,
-					sigBytes:     gpgRes.Body,
-					etag:         res.ETag,
-					lastmod:      res.LastModified,
-					key:          contentKey(adoptionFormDetached, nil, res.Body, gpgRes.Body),
-				}
+				c.logger.Warn("freshness: Release.gpg fetch returned non-200; deferring adoption",
+					"status", gpgRes.Status, "canonical_host", host, "suite_path", suitePath)
 			}
+			result = "changed"
+			break
+		}
+		key := contentKey(adoptionFormDetached, nil, res.Body, gpgRes.Body)
+		if gate.active && !gate.due && key == gate.hash {
+			result = "changed_deferred"
+			break
+		}
+		c.logger.Info("Release changed at upstream",
+			"canonical_host", host,
+			"suite_path", suitePath,
+			"cached_hash", cachedHash,
+			"upstream_hash", newHash,
+		)
+		result = "changed"
+		req = &adoptionRequest{
+			suite:        suite,
+			form:         adoptionFormDetached,
+			key:          key,
+			releaseBytes: res.Body,
+			sigBytes:     gpgRes.Body,
+			etag:         res.ETag,
+			lastmod:      res.LastModified,
 		}
 	default:
 		c.logger.Error("freshness: unexpected success status",
@@ -1182,9 +1201,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 		)
 		cur.LastSuccessAt = nil
 		if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
-			c.logger.Warn("freshness: persist anomaly failed",
-				"err", perr,
-			)
+			c.logger.Warn("freshness: persist anomaly failed", "err", perr)
 		}
 		return nil, nil
 	}
@@ -1196,14 +1213,24 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 			"suite_path", suitePath,
 		)
 	}
+	if clearRecord {
+		if err := c.cache.ClearAdoptionFailure(ctx, scheme, host, suitePath); err != nil {
+			c.logger.Warn("freshness: clear adoption failure failed",
+				"err", err, "canonical_host", host, "suite_path", suitePath)
+		}
+	}
 
-	c.logger.Info("freshness_check",
+	logAttrs := []any{
 		"canonical_host", host,
 		"suite_path", suitePath,
 		"form", "detached",
 		"result", result,
 		"upstream_status", res.Status,
-	)
+	}
+	if result == "changed_deferred" {
+		logAttrs = append(logAttrs, "reason", gate.reason)
+	}
+	c.logger.Info("freshness_check", logAttrs...)
 	freshnessCheckTotal.Inc(result, host)
 	return req, repairIfUnchanged(result, suite, cur)
 }
@@ -1342,6 +1369,93 @@ func repairIfUnchanged(result string, suite SuiteRef, cur *cache.SuiteFreshness)
 		return nil
 	}
 	return &repairRequest{suite: suite, snapshotID: *cur.CurrentSnapshotID}
+}
+
+// retryGate is a check's view of the suite's adoption failure record
+// (spec C7 "Gate").
+type retryGate struct {
+	active  bool   // a failure or refusal record exists
+	due     bool   // now >= next_retry_at (after clamping)
+	hash    string // content key of the failing content
+	etag    string // the failing content's validators
+	lastmod string
+	reason  string
+	// clampTo is non-zero when the stored next_retry_at lay beyond
+	// retryHorizon (a backward clock step); applyClamp persists it.
+	clampTo int64
+}
+
+// retryGateFor reads the gate from the suite row.
+//
+// AIDEV-NOTE: next_retry_at is a FUTURE-event stamp. It is never
+// "infinitely old" (that would disable backoff after a backward step);
+// a value beyond the legitimate horizon is clamped to now + 1 h instead.
+func (c *Checker) retryGateFor(cur *cache.SuiteFreshness, now time.Time) retryGate {
+	// Phase 1 parity: with no adopter nothing is ever attempted, so a
+	// record left by an earlier run with adoption enabled is ignored.
+	if c.adopter == nil || cur.AdoptionFailCount < 1 || cur.AdoptionFailHash == nil {
+		return retryGate{}
+	}
+	g := retryGate{active: true, due: true, hash: *cur.AdoptionFailHash}
+	if cur.AdoptionFailETag != nil {
+		g.etag = *cur.AdoptionFailETag
+	}
+	if cur.AdoptionFailLastMod != nil {
+		g.lastmod = *cur.AdoptionFailLastMod
+	}
+	if cur.AdoptionFailReason != nil {
+		g.reason = *cur.AdoptionFailReason
+	}
+	if cur.AdoptionNextRetryAt != nil {
+		next := time.Unix(*cur.AdoptionNextRetryAt, 0)
+		if next.After(now.Add(retryHorizon)) {
+			next = now.Add(retryMaxDelay)
+			g.clampTo = next.Unix()
+		}
+		g.due = !now.Before(next)
+	}
+	return g
+}
+
+// validators returns what the conditional GET sends: the current
+// anchor's validators with no record, the failing content's before
+// next_retry_at, none at or after it.
+func (g retryGate) validators(cur *cache.SuiteFreshness) (etag, lastmod string) {
+	switch {
+	case g.active && g.due:
+		return "", ""
+	case g.active:
+		return g.etag, g.lastmod
+	}
+	if cur.InReleaseETag != nil {
+		etag = *cur.InReleaseETag
+	}
+	if cur.InReleaseLastMod != nil {
+		lastmod = *cur.InReleaseLastMod
+	}
+	return etag, lastmod
+}
+
+// applyClamp persists a clamped next_retry_at (backward clock step).
+func (c *Checker) applyClamp(ctx context.Context, cur *cache.SuiteFreshness, g retryGate, now time.Time) {
+	if g.clampTo == 0 {
+		return
+	}
+	c.clockStep("adoption_next_retry_at", cur.CanonicalScheme, cur.CanonicalHost, cur.SuitePath, *cur.AdoptionNextRetryAt, now)
+	if err := c.cache.SetAdoptionNextRetry(ctx, cur.CanonicalScheme, cur.CanonicalHost, cur.SuitePath, g.clampTo); err != nil {
+		c.logger.Warn("freshness: clamp adoption retry failed",
+			"err", err, "canonical_host", cur.CanonicalHost, "suite_path", cur.SuitePath)
+	}
+}
+
+// setChangeSeen stamps the first sighting of a pending upstream change;
+// later sightings keep it, so "lagging" measures from first sight
+// (spec C4).
+func setChangeSeen(cur *cache.SuiteFreshness, now int64) {
+	if cur.InReleaseChangeSeenAt == nil {
+		v := now
+		cur.InReleaseChangeSeenAt = &v
+	}
 }
 
 // Reconcile forces an in-place reconcile of one suite's current snapshot
