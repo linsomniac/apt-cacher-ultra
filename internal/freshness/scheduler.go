@@ -352,10 +352,13 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 // in its flip transaction, and a failed one records a failure.
 //
 // AIDEV-NOTE: the rule is persisted state, not a hand-off from Check to
-// the Run loop, so it survives restarts. Its costs: a suite whose
-// adoption is running is queued every tick and its check ends busy (a
-// TryLock, no GET), and a detached suite whose Release.gpg fetch keeps
-// failing is re-fetched every tick (bounded by the tick interval).
+// the Run loop, so it survives restarts (an adoption abandoned at
+// shutdown is not recorded, so its change is pending again at the first
+// tick). Its costs: a suite whose adoption is running is queued every
+// tick and its check ends busy (a TryLock, no GET); a detached suite
+// whose Release.gpg fetch keeps failing is re-fetched every tick; and a
+// failed adoption whose record could not be written is re-attempted every
+// tick — all bounded by the tick interval.
 func (c *Checker) pendingChange(s cache.SuiteFreshness) bool {
 	return c.adopter != nil && s.InReleaseChangeSeenAt != nil && s.AdoptionFailCount == 0
 }
