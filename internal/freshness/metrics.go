@@ -30,7 +30,8 @@ import (
 // SPEC5 §10.4.3 inventory: acu_clock_steps_detected_total (spec C4) and
 // acu_legacy_snapshots_quarantined_total (spec §6.1, startup legacy
 // trust audit), both unlabelled counters; acu_adoption_failing_suites
-// (spec C7, unlabelled gauge).
+// (spec C7, unlabelled gauge); acu_freshness_waiting_for_slot (spec C4,
+// unlabelled gauge).
 var (
 	freshnessCheckTotal = metrics.NewCounterWithCap(
 		"acu_freshness_check_total",
@@ -84,6 +85,14 @@ var (
 	adoptionFailingSuites = metrics.NewGauge(
 		"acu_adoption_failing_suites",
 		"Suites whose latest adoption attempt failed, refusal states excluded; refreshed every scheduler tick (spec C7).",
+	)
+
+	// freshnessWaitingForSlot is the number of suites waiting for an
+	// adoption slot; the scheduler re-checks each as soon as capacity it
+	// can use is released (spec C4).
+	freshnessWaitingForSlot = metrics.NewGauge(
+		"acu_freshness_waiting_for_slot",
+		"Suites waiting for an adoption slot; each is re-checked as soon as one it can use is released (spec C4).",
 	)
 
 	adoptionTotal = metrics.NewCounterWithCap(

@@ -1,6 +1,9 @@
 package freshness
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func mustAcquire(t *testing.T, a *admission, host string, signed bool) *lease {
 	t.Helper()
@@ -76,5 +79,72 @@ func TestLease_ReleaseHostThenRelease(t *testing.T) {
 	nilLease.releaseHost()
 	if g, h := a.usage(); g != 0 || h != 0 {
 		t.Fatalf("usage = %d/%d, want 0/0", g, h)
+	}
+}
+
+// freeFor is a peek for the scheduler's offers; it must agree with
+// tryAcquire's refusal rule exactly.
+func TestAdmission_FreeForAgreesWithTryAcquire(t *testing.T) {
+	for _, global := range []int{0, 1, 2, 3} {
+		maxUse := global
+		if global == 0 {
+			maxUse = 3
+		}
+		for inUse := 0; inUse <= maxUse; inUse++ {
+			for _, hostHeld := range []bool{false, true} {
+				if hostHeld && inUse == 0 {
+					continue
+				}
+				for _, signed := range []bool{false, true} {
+					a := newAdmission(global)
+					for i := 0; i < inUse; i++ {
+						host := fmt.Sprintf("o%d", i)
+						if hostHeld && i == 0 {
+							host = "h"
+						}
+						mustAcquire(t, a, host, true)
+					}
+					peek := a.freeFor("h", signed) > 0
+					_, ok := a.tryAcquire("h", signed)
+					if peek != ok {
+						t.Errorf("global=%d inUse=%d hostHeld=%v signed=%v: freeFor>0 = %v but tryAcquire = %v",
+							global, inUse, hostHeld, signed, peek, ok)
+					}
+				}
+			}
+		}
+	}
+}
+
+// Every release of a held slot wakes the scheduler; a repeated release
+// does not; wakes never block and coalesce into one.
+func TestAdmission_ReleaseWakesTheScheduler(t *testing.T) {
+	a := newAdmission(2)
+	woke := func() bool {
+		select {
+		case <-a.freed:
+			return true
+		default:
+			return false
+		}
+	}
+	l := mustAcquire(t, a, "a", true)
+	l.releaseHost()
+	if !woke() {
+		t.Fatal("releaseHost did not wake the scheduler")
+	}
+	l.release()
+	if !woke() {
+		t.Fatal("releasing the global slot did not wake the scheduler")
+	}
+	l.release()
+	if woke() {
+		t.Fatal("a repeated release woke the scheduler")
+	}
+	for i := 0; i < 3; i++ {
+		mustAcquire(t, a, "b", true).release()
+	}
+	if !woke() || woke() {
+		t.Fatal("three wakes should coalesce into exactly one")
 	}
 }

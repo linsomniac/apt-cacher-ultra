@@ -340,31 +340,67 @@ type checkOutcome struct {
 	needRepair    bool
 	needReconcile bool
 	lease         *lease
+	// report is what the scheduler learns from this check.
+	report checkReport
 }
 
-// Check runs the SPEC §7.2 algorithm for one suite, synchronously. It
-// returns immediately (without contacting upstream) if another goroutine
-// holds the in-memory check lock or if the suite is still in cooldown.
-//
-// On observed change with an Adopter wired in, Check spawns a goroutine
-// to run the §7.5 adoption flow. The per-suite mutex is HANDED OFF to
-// that goroutine: it serializes the entire adoption against any
-// subsequent Check on the same suite, matching SPEC2 §7.5's "the same
-// per-suite Mutex from §7.3 guards the entire adoption."
+// checkOpts tunes one check. bypassCooldown is set only by the
+// scheduler's re-check of a suite that waited for an admission slot
+// (spec C4): that retry is bounded by slot turnover (one per released
+// slot), so the cooldown's job — absorbing client-triggered storms — does
+// not apply to it.
+type checkOpts struct {
+	bypassCooldown bool
+}
+
+// checkReport is what one check tells the scheduler: the freshness_check
+// result it logged (or resultBusy / resultSkipped / "failed" when no
+// result line was logged) and, with a queued result, whether the current
+// snapshot is signed, i.e. which kind of slot the suite may take.
+type checkReport struct {
+	result        string
+	signedCurrent bool
+}
+
+const (
+	resultBusy    = "busy"    // the suite mutex was held (a T1 check or an adoption)
+	resultSkipped = "skipped" // cooldown, no row, no anchor, cancelled: nothing learned
+)
+
+// isQueuedResult reports whether result means "new content, no slot".
+// Phase E adds first_adoption_queued here.
+func isQueuedResult(result string) bool { return result == "changed_queued" }
+
+// Check runs one freshness check of the suite. It is the entry point for
+// client-triggered (T1) checks; see check.
 //
 // Callers on the request path (T1) should typically invoke Check from a
 // goroutine: the request has already been served by the time T1 fires,
 // so blocking the request goroutine on a slow upstream gains nothing.
-//
-// Before spawning anything it takes an admission slot without waiting
-// (spec C4).
 func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
+	c.check(ctx, SuiteRef{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}, checkOpts{})
+}
+
+// check runs the SPEC §7.2 algorithm for one suite, synchronously, and
+// reports its result to the scheduler. It returns at once (resultBusy),
+// without contacting upstream, if another goroutine holds the suite
+// mutex; the cooldown is applied by checkLocked (resultSkipped) unless
+// opts bypass it.
+//
+// On observed change with an Adopter wired in it takes an admission slot
+// without waiting (spec C4) and spawns a goroutine to run the §7.5
+// adoption flow. The per-suite mutex is HANDED OFF to that goroutine: it
+// serializes the entire adoption against any subsequent check on the
+// same suite, matching SPEC2 §7.5's "the same per-suite Mutex from §7.3
+// guards the entire adoption."
+func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) checkReport {
+	scheme, host, suitePath := ref.CanonicalScheme, ref.CanonicalHost, ref.SuitePath
 	key := suiteKey(scheme, host, suitePath)
 	muVal, _ := c.locks.LoadOrStore(key, &sync.Mutex{})
 	mu := muVal.(*sync.Mutex)
 	if !mu.TryLock() {
 		// Another goroutine is on it; SPEC §7.3 says skip.
-		return
+		return checkReport{result: resultBusy}
 	}
 	// Spec C4: the upstream part of a check (the host slot and the
 	// conditional GETs) runs under a 2-minute deadline. Cache reads and
@@ -376,17 +412,23 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 	// makes submitWrite fail, and the failure would go unrecorded.
 	fetchCtx, cancel := context.WithTimeout(ctx, checkDeadline)
 	defer cancel()
-	out, ok := c.checkLockedSafe(ctx, fetchCtx, scheme, host, suitePath)
-	switch {
-	case !ok:
+	out, ok := c.checkLockedSafe(ctx, fetchCtx, scheme, host, suitePath, opts)
+	if !ok {
 		mu.Unlock()
+		return checkReport{result: "failed"}
+	}
+	switch {
 	case out.lease != nil && out.req != nil:
 		c.spawnAdoption(mu, out.req, out.lease)
 	case out.lease != nil && out.repair != nil:
 		c.spawnRepair(mu, out)
 	default:
+		// A lease is only ever taken for a req or a repair; release
+		// defensively so the invariant does not rest on inspection.
+		out.lease.release()
 		mu.Unlock()
 	}
+	return out.report
 }
 
 // spawnAdoption hands the suite mutex and the admission lease to the
@@ -629,11 +671,11 @@ func (c *Checker) recoverGoroutine(where string, suite SuiteRef) {
 // check took before panicking is released here; the caller releases the
 // suite mutex.
 //
-// AIDEV-NOTE: nothing in Check between TryLock and this call, or between
+// AIDEV-NOTE: nothing in check between TryLock and this call, or between
 // it and the goroutine hand-off, may panic: checkRecovered (scheduler)
 // and the T1 recover cannot release a mutex they do not know about.
-func (c *Checker) checkLockedSafe(ctx, fetchCtx context.Context, scheme, host, suitePath string) (out *checkOutcome, ok bool) {
-	out = &checkOutcome{}
+func (c *Checker) checkLockedSafe(ctx, fetchCtx context.Context, scheme, host, suitePath string, opts checkOpts) (out *checkOutcome, ok bool) {
+	out = &checkOutcome{report: checkReport{result: resultSkipped}}
 	defer func() {
 		if r := recover(); r != nil {
 			out.lease.release()
@@ -644,7 +686,7 @@ func (c *Checker) checkLockedSafe(ctx, fetchCtx context.Context, scheme, host, s
 			out, ok = nil, false
 		}
 	}()
-	c.checkLocked(ctx, fetchCtx, out, scheme, host, suitePath)
+	c.checkLocked(ctx, fetchCtx, out, scheme, host, suitePath, opts)
 	return out, true
 }
 
@@ -732,7 +774,9 @@ func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64,
 // Outcomes (all paths must update suite_freshness so cooldown applies
 // to the next attempt):
 //
-//   - Cooldown gate fails: no DB write, return nil.
+//   - Cooldown gate fails: no DB write, return nil (reported as
+//     skipped). The scheduler's slot-driven re-check of a waiting suite
+//     bypasses the gate (opts.bypassCooldown, spec C4).
 //   - Metadata url_path row absent: no DB write (we have nothing to
 //     check against), return nil — first request for this suite will
 //     land in url_path through the normal miss path.
@@ -744,8 +788,8 @@ func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64,
 //     stamp inrelease_change_seen_at on first sighting only, return
 //     *adoptionRequest.
 //   - Same, but no admission slot is free (spec C4): "changed_queued",
-//     no request, last_success_at left at its previous value so the
-//     scheduler retries the suite on its next turn.
+//     no request, last_success_at left at its previous value; the
+//     scheduler parks the suite until a slot it can use is released.
 //   - Spec C7 gate (retryGateFor, adopter wired only): while a failure
 //     record exists and next_retry_at has not come, the GET carries the
 //     failing content's validators, and a 304 or the same content key
@@ -766,7 +810,7 @@ func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64,
 // freshness check after a successful adoption would observe "changed"
 // against the stale url_path.blob_hash and thrash the adoption
 // candidate-uniqueness constraint forever.
-func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, scheme, host, suitePath string) {
+func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, scheme, host, suitePath string, opts checkOpts) {
 	now := c.now()
 	nowUnix := now.Unix()
 
@@ -793,10 +837,13 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 	// of the step (security finding I-7).
 	if cur.LastCheckAt != nil && c.cooldown > 0 {
 		last := time.Unix(*cur.LastCheckAt, 0)
-		if last.After(now.Add(clockStepTolerance)) {
+		switch {
+		case last.After(now.Add(clockStepTolerance)):
 			c.clockStep("last_check_at", scheme, host, suitePath, *cur.LastCheckAt, now)
-		} else if now.Sub(last) < c.cooldown {
-			return
+		case opts.bypassCooldown:
+			// The scheduler's slot-driven re-check (spec C4).
+		case now.Sub(last) < c.cooldown:
+			return // out.report stays resultSkipped
 		}
 	}
 
@@ -965,6 +1012,7 @@ func (c *Checker) checkLockedInline(ctx, fetchCtx context.Context, out *checkOut
 		}
 		// Spec C4: the check deadline hit while waiting for the slot.
 		c.recordUnknownEnd(ctx, cur, suite, nowUnix, "inline", err)
+		out.report.result = "failed"
 		return nil, nil, false
 	}
 	defer release()
@@ -989,6 +1037,7 @@ func (c *Checker) checkLockedInline(ctx, fetchCtx context.Context, out *checkOut
 			return nil, nil, true
 		}
 		c.recordUnknownEnd(ctx, cur, suite, nowUnix, "inline", err)
+		out.report.result = "failed"
 		return nil, nil, false
 	}
 
@@ -1069,8 +1118,10 @@ func (c *Checker) checkLockedInline(ctx, fetchCtx context.Context, out *checkOut
 				l, ok := c.admission.tryAcquire(host, signedCurrent)
 				if !ok {
 					// Spec C4: no slot — spawn nothing and keep
-					// last_success_at, so the scheduler retries this suite on
-					// its next turn (admission rotates through queued suites).
+					// last_success_at. A scheduler check reports
+					// changed_queued and the scheduler parks the suite
+					// until a slot it can use is released; a client
+					// check leaves it due for the next tick.
 					result, req = "changed_queued", nil
 					cur.LastSuccessAt = prevSuccess
 				} else {
@@ -1092,6 +1143,7 @@ func (c *Checker) checkLockedInline(ctx, fetchCtx context.Context, out *checkOut
 		if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
 			c.logger.Warn("freshness: persist anomaly failed", "err", perr)
 		}
+		out.report.result = "failed"
 		return nil, nil, false
 	}
 
@@ -1119,6 +1171,7 @@ func (c *Checker) checkLockedInline(ctx, fetchCtx context.Context, out *checkOut
 	if result == "changed_deferred" {
 		logAttrs = append(logAttrs, "reason", gate.reason)
 	}
+	out.report = checkReport{result: result, signedCurrent: signedCurrent}
 	c.logger.Info("freshness_check", logAttrs...)
 	freshnessCheckTotal.Inc(result, host)
 	return req, repairIfUnchanged(result, suite, cur), false
@@ -1238,6 +1291,7 @@ func (c *Checker) checkLockedDetached(ctx, fetchCtx context.Context, out *checkO
 		}
 		// Spec C4: the check deadline hit while waiting for the slot.
 		c.recordUnknownEnd(ctx, cur, suite, nowUnix, "detached", err)
+		out.report.result = "failed"
 		return nil, nil
 	}
 	defer releaseSlot()
@@ -1251,6 +1305,7 @@ func (c *Checker) checkLockedDetached(ctx, fetchCtx context.Context, out *checkO
 			return nil, nil
 		}
 		c.recordUnknownEnd(ctx, cur, suite, nowUnix, "detached", err)
+		out.report.result = "failed"
 		return nil, nil
 	}
 
@@ -1339,8 +1394,10 @@ func (c *Checker) checkLockedDetached(ctx, fetchCtx context.Context, out *checkO
 			l, ok := c.admission.tryAcquire(host, signedCurrent)
 			if !ok {
 				// Spec C4: no slot — spawn nothing and keep
-				// last_success_at, so the scheduler retries this suite on
-				// its next turn (admission rotates through queued suites).
+				// last_success_at. A scheduler check reports
+				// changed_queued and the scheduler parks the suite
+				// until a slot it can use is released; a client
+				// check leaves it due for the next tick.
 				result, req = "changed_queued", nil
 				cur.LastSuccessAt = prevSuccess
 			} else {
@@ -1359,6 +1416,7 @@ func (c *Checker) checkLockedDetached(ctx, fetchCtx context.Context, out *checkO
 		if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
 			c.logger.Warn("freshness: persist anomaly failed", "err", perr)
 		}
+		out.report.result = "failed"
 		return nil, nil
 	}
 
@@ -1386,6 +1444,7 @@ func (c *Checker) checkLockedDetached(ctx, fetchCtx context.Context, out *checkO
 	if result == "changed_deferred" {
 		logAttrs = append(logAttrs, "reason", gate.reason)
 	}
+	out.report = checkReport{result: result, signedCurrent: signedCurrent}
 	c.logger.Info("freshness_check", logAttrs...)
 	freshnessCheckTotal.Inc(result, host)
 	return req, repairIfUnchanged(result, suite, cur)
