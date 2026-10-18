@@ -80,6 +80,10 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 - **B-57** The 30-day simulation's untrusted phase has no attempt floor (183 measured; Lim1 has 18..30).
 - **B-58** The flapping-mirror simulation does not pin the rollback guard on its own (the cost is now pinned by `TestGate_RefusalStormCostsNothing`), and its samples land on the tick grid (harmless at a 30-minute refresh).
 
+## cmd/apt-cacher-ultra
+
+- **B-64** `main.go` shutdown: `freshChecker.WaitForAdoptions()` can wait up to `commitTimeout` for a running commit (its comment now says so); log an INFO line when the drain takes long, so a slow stop is explained in the journal.
+
 ## internal/admin
 
 - **B-59** `suites_status_test.go`: no row with 0 < lag < 3600 (a `LagWarn = lag > 0` regression would pass), and the JSON golden pins only zero values (`anchor_form ""` beside `current_snapshot_id 42`).
