@@ -102,6 +102,9 @@ func TestSimLim1_DeterministicFailureAttemptsPerDay(t *testing.T) {
 // content still adopted, checks continue).
 func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
+		// The offset is process-global: a Fatal between a clock step and
+		// its inline restore() must not leak the step into later tests.
+		t.Cleanup(wallclock.SetOffsetForTest(0))
 		// 2 h 40 m keeps the run well under 5 s under -race while one tick
 		// (40 m) stays below the 1 h retry cap, so the attempt bounds keep
 		// their teeth; every phase boundary below stays off the tick grid.
