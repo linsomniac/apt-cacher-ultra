@@ -66,6 +66,9 @@ func (f *fakeCache) GetSuiteFreshness(ctx context.Context, scheme, host, suitePa
 }
 
 func (f *fakeCache) PutSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.putCount.Add(1)

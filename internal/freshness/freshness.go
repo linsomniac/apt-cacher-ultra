@@ -62,6 +62,11 @@ const defaultMaxInReleaseBytes int64 = 4 << 20
 // pads the file.
 const defaultMaxReleaseGPGBytes int64 = 64 << 10
 
+// checkDeadline bounds the upstream part of one freshness check (spec C4,
+// a constant): it is the D of the scheduler's latency bound. Adoption,
+// repair and reconcile goroutines run under their own contexts.
+const checkDeadline = 2 * time.Minute
+
 // Cache is the subset of *cache.Cache the freshness checker uses.
 // Defined as an interface so tests can supply a fake without standing
 // up an on-disk cache.
@@ -361,7 +366,17 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		// Another goroutine is on it; SPEC §7.3 says skip.
 		return
 	}
-	out, ok := c.checkLockedSafe(ctx, scheme, host, suitePath)
+	// Spec C4: the upstream part of a check (the host slot and the
+	// conditional GETs) runs under a 2-minute deadline. Cache reads and
+	// writes keep the caller's context, so a check that hits the deadline
+	// still records it (last_check_at, check_fail_count); the scheduler's
+	// fairness depends on that write.
+	//
+	// AIDEV-NOTE: never pass fetchCtx to a cache call: an expired deadline
+	// makes submitWrite fail, and the failure would go unrecorded.
+	fetchCtx, cancel := context.WithTimeout(ctx, checkDeadline)
+	defer cancel()
+	out, ok := c.checkLockedSafe(ctx, fetchCtx, scheme, host, suitePath)
 	switch {
 	case !ok:
 		mu.Unlock()
@@ -617,7 +632,7 @@ func (c *Checker) recoverGoroutine(where string, suite SuiteRef) {
 // AIDEV-NOTE: nothing in Check between TryLock and this call, or between
 // it and the goroutine hand-off, may panic: checkRecovered (scheduler)
 // and the T1 recover cannot release a mutex they do not know about.
-func (c *Checker) checkLockedSafe(ctx context.Context, scheme, host, suitePath string) (out *checkOutcome, ok bool) {
+func (c *Checker) checkLockedSafe(ctx, fetchCtx context.Context, scheme, host, suitePath string) (out *checkOutcome, ok bool) {
 	out = &checkOutcome{}
 	defer func() {
 		if r := recover(); r != nil {
@@ -629,13 +644,13 @@ func (c *Checker) checkLockedSafe(ctx context.Context, scheme, host, suitePath s
 			out, ok = nil, false
 		}
 	}()
-	c.checkLocked(ctx, out, scheme, host, suitePath)
+	c.checkLocked(ctx, fetchCtx, out, scheme, host, suitePath)
 	return out, true
 }
 
-// bumpFailedCheck mirrors checkLocked's failure bookkeeping
-// (last_check_at = now, last_success_at untouched). Best effort; it
-// never panics its caller.
+// bumpFailedCheck mirrors checkLocked's unknown-check bookkeeping after a
+// panic: last_check_at = now and one more on the streak (spec C4);
+// last_success_at untouched. Best effort; it never panics its caller.
 // AIDEV-NOTE: phase D turns the Put into the UPDATE-only writer.
 func (c *Checker) bumpFailedCheck(ctx context.Context, scheme, host, suitePath string) {
 	defer func() { _ = recover() }()
@@ -644,11 +659,17 @@ func (c *Checker) bumpFailedCheck(ctx context.Context, scheme, host, suitePath s
 	case errors.Is(err, cache.ErrNotFound):
 		cur = &cache.SuiteFreshness{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}
 	case err != nil:
+		c.logger.Warn("freshness: read suite row after a panic failed",
+			"err", err, "canonical_host", host, "suite_path", suitePath)
 		return
 	}
 	now := c.now().Unix()
 	cur.LastCheckAt = &now
-	_ = c.cache.PutSuiteFreshness(ctx, *cur)
+	cur.CheckFailCount++
+	if err := c.cache.PutSuiteFreshness(ctx, *cur); err != nil {
+		c.logger.Warn("freshness: persist failure bump after a panic failed",
+			"err", err, "canonical_host", host, "suite_path", suitePath)
+	}
 }
 
 // clockStepTolerance: stamps are whole seconds, so a sub-second backward
@@ -730,8 +751,13 @@ func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64,
 //     failing content's validators, and a 304 or the same content key
 //     is "changed_deferred" (no adoption); new content is attempted at
 //     once; at next_retry_at the GET carries no validators.
-//   - Error (network, 4xx, 5xx, ctx cancel): bump last_check_at only —
-//     don't hammer a broken upstream — and log.
+//   - Error (network, 4xx, 5xx, check deadline): bump last_check_at and
+//     extend check_fail_count — don't hammer a broken upstream — and log.
+//     An unexpected success status does the same and clears
+//     last_success_at. Every answered check above resets
+//     check_fail_count to 0 (spec C4).
+//   - Cancelled caller (shutdown): no DB write; it says nothing about
+//     upstream.
 //
 // SPEC2 wiring: the body-hash comparison uses
 // suite_snapshot.inrelease_hash (inline) or .release_hash (detached)
@@ -739,7 +765,7 @@ func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64,
 // freshness check after a successful adoption would observe "changed"
 // against the stale url_path.blob_hash and thrash the adoption
 // candidate-uniqueness constraint forever.
-func (c *Checker) checkLocked(ctx context.Context, out *checkOutcome, scheme, host, suitePath string) {
+func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, scheme, host, suitePath string) {
 	now := c.now()
 	nowUnix := now.Unix()
 
@@ -784,11 +810,11 @@ func (c *Checker) checkLocked(ctx context.Context, out *checkOutcome, scheme, ho
 	// to inline; the inline path triggers a detached fallback on 404.
 	form := c.detectForm(ctx, cur)
 	if form == adoptionFormDetached {
-		out.req, out.repair = c.checkLockedDetached(ctx, out, cur, suite, now, nowUnix)
+		out.req, out.repair = c.checkLockedDetached(ctx, fetchCtx, out, cur, suite, now, nowUnix)
 	} else {
-		req, repair, fellBack := c.checkLockedInline(ctx, out, cur, suite, now, nowUnix)
+		req, repair, fellBack := c.checkLockedInline(ctx, fetchCtx, out, cur, suite, now, nowUnix)
 		if fellBack {
-			req, repair = c.checkLockedDetached(ctx, out, cur, suite, now, nowUnix)
+			req, repair = c.checkLockedDetached(ctx, fetchCtx, out, cur, suite, now, nowUnix)
 		}
 		out.req, out.repair = req, repair
 	}
@@ -830,7 +856,7 @@ func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) ado
 // The body of this function is the SPEC §7.2 inline algorithm; it has
 // been factored out of checkLocked to give detached mode (SPEC2 §7.6.3)
 // a parallel implementation. Mutates *cur in the non-fallback paths.
-func (c *Checker) checkLockedInline(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest, bool) {
+func (c *Checker) checkLockedInline(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest, bool) {
 	scheme, host, suitePath := suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath
 
 	// Locate the InRelease url_path row to get the upstream URL plus
@@ -926,7 +952,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, out *checkOutcome, cur 
 	// an adversarial allowlisted upstream. Sharing the limiter with
 	// the handler's miss path means cache-miss fetches and
 	// freshness checks contend for the same per-host budget.
-	release, err := c.hostSem.Acquire(ctx, host)
+	release, err := c.hostSem.Acquire(fetchCtx, host)
 	if err != nil {
 		c.logger.Debug("freshness: host limiter acquire aborted",
 			"err", err,
@@ -937,8 +963,14 @@ func (c *Checker) checkLockedInline(ctx context.Context, out *checkOutcome, cur 
 	}
 	defer release()
 
-	res, err := c.fetcher.Conditional(ctx, target, etag, lastmod, c.maxBody)
+	res, err := c.fetcher.Conditional(fetchCtx, target, etag, lastmod, c.maxBody)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			// A cancelled caller (shutdown) is not evidence about upstream;
+			// the check deadline (DeadlineExceeded) is, and counts below.
+			c.logger.Debug("freshness: check cancelled", "canonical_host", host, "suite_path", suitePath)
+			return nil, nil, false
+		}
 		// 404 with no current snapshot AND a Release url_path row →
 		// fall back to detached without persisting. The detached
 		// attempt becomes the authoritative result for this Check.
@@ -956,6 +988,11 @@ func (c *Checker) checkLockedInline(ctx context.Context, out *checkOutcome, cur 
 		// "we know upstream is fine" signal that periodic_refresh
 		// uses.
 		cur.LastCheckAt = &nowUnix
+		// AIDEV-NOTE: in phase B every Conditional error extends the streak,
+		// including 401/403/404/410, which spec C4 classifies as absent, not
+		// unknown. Phase E's probe classification must reset the streak on
+		// absent, or anchor_absent suites inherit the hourly backoff.
+		cur.CheckFailCount++
 		if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
 			c.logger.Warn("freshness: persist failure-bump failed",
 				"err", perr,
@@ -973,9 +1010,10 @@ func (c *Checker) checkLockedInline(ctx context.Context, out *checkOutcome, cur 
 		return nil, nil, false
 	}
 
-	prevSuccess := cur.LastSuccessAt
+	prevSuccess, prevFails := cur.LastSuccessAt, cur.CheckFailCount
 	cur.LastCheckAt = &nowUnix
 	cur.LastSuccessAt = &nowUnix
+	cur.CheckFailCount = 0
 
 	// SPEC §10: every freshness attempt emits a structured log line. The
 	// `result` enum is what operators pivot on — success-with-no-change
@@ -1067,7 +1105,8 @@ func (c *Checker) checkLockedInline(ctx context.Context, out *checkOutcome, cur 
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		cur.LastSuccessAt = nil // undo the optimistic success bump
+		cur.LastSuccessAt = nil            // undo the optimistic success bump
+		cur.CheckFailCount = prevFails + 1 // undo the optimistic reset (spec C4)
 		if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
 			c.logger.Warn("freshness: persist anomaly failed", "err", perr)
 		}
@@ -1113,7 +1152,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, out *checkOutcome, cur 
 //   - On observed change, fetch Release.gpg in a second call so the
 //     Adopter can verify the detached signature.
 //   - The adoptionRequest carries form=detached + both bodies.
-func (c *Checker) checkLockedDetached(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest) {
+func (c *Checker) checkLockedDetached(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest) {
 	scheme, host, suitePath := suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath
 
 	releasePath := suitePath + releaseFilename
@@ -1205,7 +1244,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, out *checkOutcome, cu
 	c.applyClamp(ctx, cur, gate, now)
 	etag, lastmod := gate.validators(cur)
 
-	releaseSlot, err := c.hostSem.Acquire(ctx, host)
+	releaseSlot, err := c.hostSem.Acquire(fetchCtx, host)
 	if err != nil {
 		c.logger.Debug("freshness: host limiter acquire aborted",
 			"err", err,
@@ -1216,9 +1255,20 @@ func (c *Checker) checkLockedDetached(ctx context.Context, out *checkOutcome, cu
 	}
 	defer releaseSlot()
 
-	res, err := c.fetcher.Conditional(ctx, target, etag, lastmod, c.maxBody)
+	res, err := c.fetcher.Conditional(fetchCtx, target, etag, lastmod, c.maxBody)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			// A cancelled caller (shutdown) is not evidence about upstream;
+			// the check deadline (DeadlineExceeded) is, and counts below.
+			c.logger.Debug("freshness: check cancelled", "canonical_host", host, "suite_path", suitePath)
+			return nil, nil
+		}
 		cur.LastCheckAt = &nowUnix
+		// AIDEV-NOTE: in phase B every Conditional error extends the streak,
+		// including 401/403/404/410, which spec C4 classifies as absent, not
+		// unknown. Phase E's probe classification must reset the streak on
+		// absent, or anchor_absent suites inherit the hourly backoff.
+		cur.CheckFailCount++
 		if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
 			c.logger.Warn("freshness: persist failure-bump failed",
 				"err", perr,
@@ -1237,9 +1287,10 @@ func (c *Checker) checkLockedDetached(ctx context.Context, out *checkOutcome, cu
 		return nil, nil
 	}
 
-	prevSuccess := cur.LastSuccessAt
+	prevSuccess, prevFails := cur.LastSuccessAt, cur.CheckFailCount
 	cur.LastCheckAt = &nowUnix
 	cur.LastSuccessAt = &nowUnix
+	cur.CheckFailCount = 0
 
 	var (
 		result      string
@@ -1282,7 +1333,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, out *checkOutcome, cu
 			CanonicalHost: host,
 			URL:           releaseGPGURL.UpstreamURL,
 		}
-		gpgRes, gerr := c.fetcher.Conditional(ctx, gpgTarget, "", "", defaultMaxReleaseGPGBytes)
+		gpgRes, gerr := c.fetcher.Conditional(fetchCtx, gpgTarget, "", "", defaultMaxReleaseGPGBytes)
 		if gerr != nil || gpgRes.Status != 200 {
 			// As before: record the change and retry on a later check;
 			// last_success_at stays bumped because Release answered.
@@ -1337,6 +1388,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, out *checkOutcome, cu
 			"form", "detached",
 		)
 		cur.LastSuccessAt = nil
+		cur.CheckFailCount = prevFails + 1 // undo the optimistic reset (spec C4)
 		if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
 			c.logger.Warn("freshness: persist anomaly failed", "err", perr)
 		}
