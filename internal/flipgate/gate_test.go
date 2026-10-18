@@ -537,6 +537,33 @@ func TestFlip_PhaseAWaitsOutAnotherSuitesHold(t *testing.T) {
 	})
 }
 
+// Phase A (b) waits while another suite's hold is in progress, and must
+// wake the moment that hold ends (endHoldLocked broadcasts; final review,
+// concurrency Minor 3). a's hold holds nothing, so its end starts no
+// cross-suite quiet period (design note 17), and b — idle — commits at
+// once. Without the wake b would sleep to its 60 s cap and then hold its
+// clients; a's own readers cannot mask the bug here, because it has none.
+func TestFlip_PhaseAWakesWhenAnotherSuitesHoldEnds(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		release := make(chan struct{})
+		outA := flipAsync(bg, g, "a", func() error { <-release; return nil }) // idle: holds at once, holds nothing
+		synctest.Wait()
+		time.Sleep(time.Second)
+		outB := flipAsync(bg, g, "b", noCommit) // phase A waits for a's hold
+		time.Sleep(4 * time.Second)
+		close(release) // a's hold ends at 5 s
+		a, b := <-outA, <-outB
+		if a.err != nil || b.err != nil {
+			t.Fatalf("a: %v; b: %v", a.err, b.err)
+		}
+		if b.res.PhaseA != 4*time.Second || !b.at.Equal(a.res.HoldEnd) {
+			t.Fatalf("b's phase A took %v and it committed %v after a's hold ended; want 4s and at once",
+				b.res.PhaseA, b.at.Sub(a.res.HoldEnd))
+		}
+	})
+}
+
 // A flip that cannot get the hold token within the wait commits without
 // a hold and is counted (spec C8 residual). The production wait is 60 s;
 // TestSimFlip_FiveBusySuites runs it.
