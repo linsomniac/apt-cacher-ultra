@@ -125,9 +125,9 @@ func htmlRowStart(html string, offset int) string {
 // where the cache already serves content at least as new as upstream
 // (upstream_older, rollback_refused) must not accrue lag.
 // RecordAdoptionFailure never clears inrelease_change_seen_at, and
-// deferred checks keep bumping it, so an unsuppressed row would show
-// growing "(lagging …)" text and eventually push the Suites vital to
-// warn and then crit for a suite that isn't actually behind. A refusal
+// deferred checks keep the first sighting, so an unsuppressed row would
+// show growing "(lagging …)" text and eventually push the Suites vital
+// to warn and then crit for a suite that isn't actually behind. A refusal
 // for a reason where the cache really is behind (the phase E reasons,
 // represented here by unsigned_downgrade_refused) keeps today's lag
 // behaviour.
@@ -151,7 +151,7 @@ func TestBuildSuiteEntries_RefusalLagSuppression(t *testing.T) {
 				t.Errorf("reason %q: lag = %q / %d / warn %v; want suppressed (empty / 0 / false)",
 					reason, e.Lagging, e.LagSeconds, e.LagWarn)
 			}
-			m := htmlRenderModel{statusModel: statusModel{Suites: []suiteEntry{e}}}
+			m := htmlRenderModel{statusModel: statusModel{Suites: []suiteEntry{e}}, AdoptionEnabled: true}
 			if got := vitalState("suites", m); got != "ok" {
 				t.Errorf("reason %q: vitalState(suites) = %q; want ok", reason, got)
 			}
@@ -172,9 +172,194 @@ func TestBuildSuiteEntries_RefusalLagSuppression(t *testing.T) {
 		t.Errorf("unsigned_downgrade_refused: lag = %q / %d / warn %v; want lag preserved",
 			e.Lagging, e.LagSeconds, e.LagWarn)
 	}
-	m := htmlRenderModel{statusModel: statusModel{Suites: []suiteEntry{e}}}
+	m := htmlRenderModel{statusModel: statusModel{Suites: []suiteEntry{e}}, AdoptionEnabled: true}
 	if got := vitalState("suites", m); got != "crit" {
 		t.Errorf("unsigned_downgrade_refused: vitalState(suites) = %q; want crit", got)
+	}
+}
+
+// Final review S I1 / T I1: the aggregate notice's JS skips refused like
+// success (a refusal is a state, not a failure: the ADOPTIONS vital and
+// the panel counters already exclude it), and its hint table covers the
+// phase B outcomes with db_failed citing the backoff schedule. The script
+// is a static literal, so a string-level assertion on the rendered page
+// pins it, as the golden tests pin markup.
+func TestNoticeScript_RefusedIsNotAFailureAndHintsCoverPhaseB(t *testing.T) {
+	html := renderHTMLForGolden(t, newHealthyModel())
+	mustContain(t, html,
+		`if(o==='success'||o==='refused'||!o)return;`,
+		`'release_date_in_future':{text:`,
+		`'timed_out':{text:`,
+		`'panicked':{text:`,
+	)
+	i := strings.Index(html, `'db_failed':{text:'`)
+	if i < 0 {
+		t.Fatal("no db_failed hint")
+	}
+	hint := html[i:]
+	hint = hint[:strings.Index(hint, "'}")]
+	if !strings.Contains(hint, "backoff schedule") || strings.Contains(hint, "next freshness tick") {
+		t.Errorf("db_failed hint = %q; want it to cite the backoff schedule", hint)
+	}
+}
+
+// suiteRows builds the three rows the admin tests below render: a failing
+// record, a fresh refusal (upstream_older, an hour old) and a refusal
+// whose streak began 25 h ago, plus a lagging suite with no record.
+func suiteRows(now int64) []cache.SuiteWithAdoption {
+	return []cache.SuiteWithAdoption{
+		{SuiteFreshness: cache.SuiteFreshness{CanonicalHost: "fail.example", SuitePath: "/a",
+			AdoptionFailReason: pstr("untrusted_signer"), AdoptionFailCount: 4,
+			AdoptionFailFirstAt: p64(now - 2*3600), AdoptionNextRetryAt: p64(now + 41*60)}},
+		{SuiteFreshness: cache.SuiteFreshness{CanonicalHost: "refused.example", SuitePath: "/b",
+			AdoptionFailReason: pstr(cache.ReasonUpstreamOlder), AdoptionFailCount: 2,
+			AdoptionFailFirstAt: p64(now - 3600), AdoptionNextRetryAt: p64(now - 1),
+			InReleaseChangeSeenAt: p64(now - 3*86400)}},
+		{SuiteFreshness: cache.SuiteFreshness{CanonicalHost: "stuck.example", SuitePath: "/c",
+			AdoptionFailReason: pstr(cache.ReasonUpstreamOlder), AdoptionFailCount: 30,
+			AdoptionFailFirstAt: p64(now - 25*3600), AdoptionNextRetryAt: p64(now + 30*60),
+			InReleaseChangeSeenAt: p64(now - 25*3600)}},
+		{SuiteFreshness: cache.SuiteFreshness{CanonicalHost: "lag.example", SuitePath: "/d",
+			InReleaseChangeSeenAt: p64(now - 2*86400)}},
+	}
+}
+
+// suiteRow returns the opening <tr …> tag of the Suites row for host.
+func suiteRow(t *testing.T, html, host string) string {
+	t.Helper()
+	i := strings.Index(html, `data-label="Host" class="host">`+host+`<`)
+	if i < 0 {
+		t.Fatalf("no Suites row for %s", host)
+	}
+	return htmlRowStart(html, i)
+}
+
+// Final ruling A5: a refusal is a state, not a failure, but one whose
+// streak began more than 24 h ago warns (row and SUITES vital, never
+// crit), whatever refusalKeepsCurrent says, and its Adoption text says
+// since when. Below 24 h nothing changes; a future streak start (clock
+// step) counts as now.
+func TestBuildSuiteEntries_OldRefusalEscalates(t *testing.T) {
+	const now = int64(1_800_000_000)
+	mk := func(firstAt int64) cache.SuiteWithAdoption {
+		return cache.SuiteWithAdoption{SuiteFreshness: cache.SuiteFreshness{CanonicalHost: "h", SuitePath: "/x",
+			AdoptionFailReason: pstr(cache.ReasonUpstreamOlder), AdoptionFailCount: 30,
+			AdoptionFailFirstAt: p64(firstAt), AdoptionNextRetryAt: p64(now - 1),
+			InReleaseChangeSeenAt: p64(now - 3*86400)}}
+	}
+	cases := []struct {
+		name    string
+		firstAt int64
+		long    bool
+		status  string
+	}{
+		{"23 h", now - 23*3600, false, "refused: upstream_older · retry due"},
+		{"exactly 24 h", now - 24*3600, false, "refused: upstream_older · retry due"},
+		{"25 h", now - 25*3600, true, "refused: upstream_older · since 1d 1h · retry due"},
+		{"streak start in the future", now + 86400, false, "refused: upstream_older · retry due"},
+	}
+	for _, tc := range cases {
+		e := buildSuiteEntries([]cache.SuiteWithAdoption{mk(tc.firstAt)}, now)[0]
+		if e.RefusedLong != tc.long || e.AdoptionStatus != tc.status || e.AdoptionFailing || e.LagWarn {
+			t.Errorf("%s: long %v status %q failing %v lagwarn %v; want long %v status %q, not failing, no lag warn",
+				tc.name, e.RefusedLong, e.AdoptionStatus, e.AdoptionFailing, e.LagWarn, tc.long, tc.status)
+		}
+		m := htmlRenderModel{statusModel: statusModel{Suites: []suiteEntry{e}}, AdoptionEnabled: true}
+		want := "ok"
+		if tc.long {
+			want = "warn"
+		}
+		if got := vitalState("suites", m); got != want {
+			t.Errorf("%s: vitalState(suites) = %q; want %q", tc.name, got, want)
+		}
+	}
+}
+
+// Final review T M4: the Suites table renders the Adoption cell, the
+// FAILING counts and the refusal escalation; the ADOPTIONS vital renders
+// the REFUSED sub-line (a refused event is not counted as failed).
+func TestSuitesTable_RendersRecordsAndCounts(t *testing.T) {
+	const now = int64(1_800_000_000)
+	m := newHealthyModel()
+	m.Suites = buildSuiteEntries(suiteRows(now), now)
+	m.RecentAdoptions = []adoptionEntry{
+		{Host: "refused.example", SuitePath: "/b", Outcome: "refused", Reason: "upstream_older", CompletedUnixTime: 1700, DurationSeconds: 0.1},
+		{Host: "fail.example", SuitePath: "/a", Outcome: "gpg_failed", Reason: "untrusted_signer", CompletedUnixTime: 1800, DurationSeconds: 0.1},
+	}
+	html := renderHTMLForGolden(t, m)
+	mustContain(t, html,
+		`<td data-label="Adoption" class="mono">adoption failing 2h 0m · untrusted_signer · retry in 41m</td>`,
+		`<td data-label="Adoption" class="mono">refused: upstream_older · retry due</td>`,
+		`<td data-label="Adoption" class="mono">refused: upstream_older · since 1d 1h · retry in 30m</td>`,
+		// SUITES vital sub-line and panel eyebrow.
+		`<b class="accent-warn">1 LAGGING</b> &middot; <b class="accent-warn">1 FAILING</b> &middot; <b class="accent-warn">1 REFUSED 24H+</b>`,
+		`<span class="count-warn">1 FAILING</span>`,
+		`<span class="count-warn">1 REFUSED 24H+</span>`,
+		// ADOPTIONS vital sub-line: the refusal is counted apart from failures.
+		`<b class="accent-crit">1 FAILED</b> &middot; <b class="accent-warn">1 REFUSED</b>`,
+	)
+	for host, warn := range map[string]bool{"fail.example": true, "refused.example": false, "stuck.example": true, "lag.example": true} {
+		if got := strings.Contains(suiteRow(t, html, host), `data-state="warn"`); got != warn {
+			t.Errorf("%s row warn = %v, want %v", host, got, warn)
+		}
+	}
+	if !strings.Contains(extractTag(html, "<article", `data-vital="suites"`), `data-state="crit"`) {
+		t.Errorf("SUITES vital not crit with a 2-day lag; tag: %s", extractTag(html, "<article", `data-vital="suites"`))
+	}
+}
+
+// Final review S I3 / ruling A4: with adoption disabled (the shipped
+// default) a stored record is inert — its text gains "(adoption
+// disabled)" and it marks no warn — rows keep their lag text without
+// warning, and the SUITES vital is stale with "ADOPTION DISABLED —
+// METADATA NOT REFRESHED", so the page is not DEGRADED forever. Enabled,
+// the same rows keep their warn states.
+func TestSuites_AdoptionDisabledIsNotDegraded(t *testing.T) {
+	const now = int64(1_800_000_000)
+	base := newHealthyModel().statusModel
+	base.Suites = buildSuiteEntries(suiteRows(now), now)
+
+	disabled := (&Server{cfg: Config{}}).buildHTMLRenderModel(base)
+	if disabled.AdoptionEnabled {
+		t.Fatal("setup: adoption should be disabled")
+	}
+	for _, e := range disabled.Suites {
+		if e.AdoptionFailing || e.RefusedLong || e.LagWarn {
+			t.Errorf("%s: failing %v long %v lagwarn %v with adoption disabled; want none", e.Host, e.AdoptionFailing, e.RefusedLong, e.LagWarn)
+		}
+		if e.AdoptionFailReason != nil && !strings.HasSuffix(e.AdoptionStatus, " (adoption disabled)") {
+			t.Errorf("%s: status %q; want the (adoption disabled) suffix", e.Host, e.AdoptionStatus)
+		}
+	}
+	if got := vitalState("suites", disabled); got != "stale" {
+		t.Errorf("vitalState(suites) with adoption disabled = %q; want stale", got)
+	}
+	if v := verdictExplanation(disabled); strings.Contains(v, "Degraded") || strings.Contains(v, "Watching") {
+		t.Errorf("verdict with adoption disabled = %q; want nominal", v)
+	}
+	html := renderHTMLForGolden(t, disabled)
+	mustContain(t, html,
+		`ADOPTION DISABLED &mdash; METADATA NOT REFRESHED`,
+		`(lagging 2d 0h)`,
+		`adoption failing 2h 0m · untrusted_signer · retry in 41m (adoption disabled)`,
+	)
+	if tag := extractTag(html, "<article", `data-vital="suites"`); !strings.Contains(tag, `data-state="stale"`) {
+		t.Errorf("SUITES vital tag = %s; want data-state=\"stale\"", tag)
+	}
+	for _, host := range []string{"fail.example", "refused.example", "stuck.example", "lag.example"} {
+		if row := suiteRow(t, html, host); strings.Contains(row, `data-state="warn"`) {
+			t.Errorf("%s row warns with adoption disabled: %s", host, row)
+		}
+	}
+
+	enabled := (&Server{cfg: Config{Keyring: &fakeKeyringProvider{snap: []KeyringEntrySnapshot{}}}}).buildHTMLRenderModel(base)
+	if got := vitalState("suites", enabled); got != "crit" {
+		t.Errorf("vitalState(suites) with adoption enabled = %q; want crit (2-day lag)", got)
+	}
+	for _, e := range enabled.Suites {
+		if strings.HasSuffix(e.AdoptionStatus, "(adoption disabled)") {
+			t.Errorf("%s: status %q carries the disabled suffix with adoption enabled", e.Host, e.AdoptionStatus)
+		}
 	}
 }
 

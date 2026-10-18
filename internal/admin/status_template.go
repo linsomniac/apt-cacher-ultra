@@ -360,8 +360,8 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
         <span class="vital__unit">TRACKED</span>
       </div>
       <div class="vital__sub">
-        {{$lagCount := 0}}{{$failCount := 0}}{{range .Suites}}{{if .LagWarn}}{{$lagCount = (add1 $lagCount)}}{{end}}{{if .AdoptionFailing}}{{$failCount = (add1 $failCount)}}{{end}}{{end}}
-        <span>{{if eq $lagCount 0}}<b>0 LAGGING</b>{{else}}<b class="accent-warn">{{$lagCount}} LAGGING</b>{{end}} &middot; {{if eq $failCount 0}}0 FAILING{{else}}<b class="accent-warn">{{$failCount}} FAILING</b>{{end}}</span>
+        {{if not $adopting}}<span>ADOPTION DISABLED &mdash; METADATA NOT REFRESHED</span>{{else}}{{$lagCount := 0}}{{$failCount := 0}}{{$longCount := 0}}{{range .Suites}}{{if .LagWarn}}{{$lagCount = (add1 $lagCount)}}{{end}}{{if .AdoptionFailing}}{{$failCount = (add1 $failCount)}}{{end}}{{if .RefusedLong}}{{$longCount = (add1 $longCount)}}{{end}}{{end}}
+        <span>{{if eq $lagCount 0}}<b>0 LAGGING</b>{{else}}<b class="accent-warn">{{$lagCount}} LAGGING</b>{{end}} &middot; {{if eq $failCount 0}}0 FAILING{{else}}<b class="accent-warn">{{$failCount}} FAILING</b>{{end}}{{if gt $longCount 0}} &middot; <b class="accent-warn">{{$longCount}} REFUSED 24H+</b>{{end}}</span>{{end}}
       </div>
     </article>
 
@@ -434,6 +434,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
           <span>{{len .Suites}} TRACKED</span>
           {{if gt $lc 0}}<span class="sep">&middot;</span><span class="count-warn">{{$lc}} LAGGING</span>{{end}}
           {{$fc := 0}}{{range .Suites}}{{if .AdoptionFailing}}{{$fc = (add1 $fc)}}{{end}}{{end}}{{if gt $fc 0}}<span class="sep">&middot;</span><span class="count-warn">{{$fc}} FAILING</span>{{end}}
+          {{$rl := 0}}{{range .Suites}}{{if .RefusedLong}}{{$rl = (add1 $rl)}}{{end}}{{end}}{{if gt $rl 0}}<span class="sep">&middot;</span><span class="count-warn">{{$rl}} REFUSED 24H+</span>{{end}}
         </div>
         <h2 class="panel__h">Suite adoption status</h2>
         <p class="panel__desc">One row per (host, suite). Lagging rows indicate the upstream has published a newer <code>InRelease</code> than the snapshot the cache is currently serving. The Adoption column shows a failing or refused adoption and when it is retried.</p>
@@ -449,7 +450,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
             </tr></thead>
             <tbody>
             {{range .Suites}}
-              <tr{{if or .LagWarn .AdoptionFailing}} data-state="warn"{{end}}>
+              <tr{{if or .LagWarn .AdoptionFailing .RefusedLong}} data-state="warn"{{end}}>
                 <td data-label="Host" class="host">{{.Host}}</td>
                 <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
                 <td data-label="Last check" class="time">{{unixTimePtr .LastCheckUnixTime}}</td>
@@ -739,7 +740,7 @@ pill.setAttribute('data-state',verdict);lbl.textContent=label;})();
 
 (function(){var mount=document.getElementById('adoptions-notice');if(!mount)return;
 var rows=document.querySelectorAll('#adoptions tr[data-outcome]');var total=rows.length;if(total===0)return;
-var counts={};rows.forEach(function(tr){var o=tr.getAttribute('data-outcome');if(o==='success'||!o)return;counts[o]=(counts[o]||0)+1;});
+var counts={};rows.forEach(function(tr){var o=tr.getAttribute('data-outcome');if(o==='success'||o==='refused'||!o)return;counts[o]=(counts[o]||0)+1;});
 var top='',topN=0;for(var k in counts){if(counts[k]>topN){top=k;topN=counts[k];}}
 var THRESHOLD=0.10;if(top===''||(topN/total)<THRESHOLD)return;
 var keyringPanel=document.getElementById('keyring');
@@ -752,9 +753,12 @@ var hints={
 'parse_failed':{text:'Likely cause: malformed Release / Sources / Packages payload from upstream. Capture a failing fetch and inspect.'},
 'member_mismatch':{text:'Likely cause: a Release-listed member hash diverged from the cached blob. The failing member is shown per-row; inspect it in the proxy logs.'},
 'member_fetch_failed':{text:'Likely cause: a Release-listed member could not be fetched intact — an index republished mid-fetch, a size/content-length mismatch, or a mirror serving the wrong body (e.g. the .gz at the uncompressed URL). The failing member is shown per-row.'},
-'db_failed':{text:'Likely cause: a local cache/DB error (blob write, rehash, or snapshot insert), not an upstream problem. Check disk space and the proxy logs; adoption retries on the next freshness tick.'},
+'db_failed':{text:'Likely cause: a local cache/DB error (blob write, rehash, or snapshot insert), not an upstream problem. Check disk space and the proxy logs; adoption is retried on the backoff schedule.'},
 'unpinned_suite':{text:"Likely cause: this suite is not allow-listed for adoption. Add it to the operator's adoption pin list to enable verification."},
-'run_failed':{text:'Likely cause: upstream unreachable, TLS failure, rate-limiting, or another transport-level error. Check the proxy logs for the upstream host.'}
+'run_failed':{text:'Likely cause: upstream unreachable, TLS failure, rate-limiting, or another transport-level error. Check the proxy logs for the upstream host.'},
+'release_date_in_future':{text:"Likely cause: the upstream Release's Date is more than 10 s ahead of this host's clock (apt's Acquire::Max-FutureTime refuses it too). Check this host's clock first, then the repository's publishing clock; adoption is retried on the backoff schedule."},
+'timed_out':{text:'Likely cause: an adoption ran past adoption.max_duration, usually a member that drips or stalls on a slow mirror. The failing suite is shown per-row; it is retried on the backoff schedule.'},
+'panicked':{text:'Likely cause: a bug — an adoption goroutine panicked and was recovered. The stack is in the proxy log (adoption_panicked); please report it. The suite is retried on the backoff schedule.'}
 };
 var h=hints[top]||{text:'See per-row details below.'};
 var note=document.createElement('div');note.className='notice';note.setAttribute('role','alert');

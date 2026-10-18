@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -281,6 +282,11 @@ type suiteEntry struct {
 	// minutes, so a longer lag means at least one attempt failed. Rows and
 	// the LAGGING count use it; the "(lagging …)" text shows any lag.
 	LagWarn bool `json:"-"`
+	// RefusedLong marks a refusal whose streak began more than
+	// refusalEscalateAge ago: still a state, not a failure, but one that
+	// may be a silent freeze, so its row and the SUITES vital warn (never
+	// crit) and the REFUSED 24H+ count shows it.
+	RefusedLong bool `json:"-"`
 }
 
 // gcInfo carries the SPEC5 §10.5 gc.* block. The pointer-typed
@@ -599,16 +605,18 @@ func buildSuiteEntries(rows []cache.SuiteWithAdoption, now int64) []suiteEntry {
 		if r.AdoptionFailCount > 0 && r.AdoptionFailReason != nil {
 			e.AdoptionRefused = cache.IsRefusalReason(*r.AdoptionFailReason)
 			e.AdoptionFailing = !e.AdoptionRefused
-			e.AdoptionStatus = adoptionStatus(r.SuiteFreshness, e.AdoptionRefused, now)
+			e.RefusedLong = e.AdoptionRefused && streakAge(r.SuiteFreshness, now) > refusalEscalateAge
+			e.AdoptionStatus = adoptionStatus(r.SuiteFreshness, e.AdoptionRefused, e.RefusedLong, now)
 		}
 		// A refusal whose reason means the cache already serves content
 		// at least as new as upstream (refusalKeepsCurrent) keeps its
 		// first-sighting inrelease_change_seen_at forever — RecordAdoptionFailure
-		// never clears it, and deferred checks keep bumping it. Showing
-		// that as growing lag would eventually push the Suites vital to
-		// warn/crit for a suite that isn't actually behind (spec C7: a
-		// refusal is a state, not a failure). Suppress the lag for those
-		// rows; the "refused: …" text in AdoptionStatus is the signal.
+		// never clears it, and deferred checks keep the first sighting.
+		// Showing that as growing lag would eventually push the Suites
+		// vital to warn/crit for a suite that isn't actually behind (spec
+		// C7: a refusal is a state, not a failure). Suppress the lag for
+		// those rows; the "refused: …" text in AdoptionStatus is the
+		// signal, and RefusedLong escalates one older than a day.
 		if !e.AdoptionRefused || !refusalKeepsCurrent(*r.AdoptionFailReason) {
 			e.Lagging, e.LagSeconds = laggingAnnotation(r.InReleaseChangeSeenAt, now)
 			e.LagWarn = e.LagSeconds > 3600
@@ -631,22 +639,59 @@ func laggingAnnotation(seenAt *int64, now int64) (string, int64) {
 	return "(lagging " + durationOf(lag) + ")", lag
 }
 
+// refusalEscalateAge (seconds) is how old a refusal streak gets before
+// the page escalates it (RefusedLong). It matches the 24 h after which
+// the checker logs WARN adoption_refused_persistently
+// (freshness.refusalEscalateAge).
+const refusalEscalateAge = 24 * 3600
+
+// streakAge is how long the record's streak has lasted, in seconds. A
+// streak start in the future (clock step) counts as now: age 0.
+func streakAge(s cache.SuiteFreshness, now int64) int64 {
+	if s.AdoptionFailFirstAt == nil || *s.AdoptionFailFirstAt >= now {
+		return 0
+	}
+	return now - *s.AdoptionFailFirstAt
+}
+
 // adoptionStatus summarises the spec C7 record for the suites table:
-// "adoption failing 3d 2h · untrusted_signer · retry in 41m", or
-// "refused: upstream_older · retry due".
-func adoptionStatus(s cache.SuiteFreshness, refused bool, now int64) string {
+// "adoption failing 3d 2h · untrusted_signer · retry in 41m",
+// "refused: upstream_older · retry due", or, for a refusal older than
+// refusalEscalateAge, "refused: upstream_older · since 1d 1h · retry due".
+func adoptionStatus(s cache.SuiteFreshness, refused, long bool, now int64) string {
 	retry := "retry due"
 	if s.AdoptionNextRetryAt != nil && *s.AdoptionNextRetryAt > now {
 		retry = "retry in " + durationOf(*s.AdoptionNextRetryAt-now)
 	}
 	if refused {
+		if long {
+			return "refused: " + *s.AdoptionFailReason + " · since " + durationOf(streakAge(s, now)) + " · " + retry
+		}
 		return "refused: " + *s.AdoptionFailReason + " · " + retry
 	}
-	var since int64
-	if s.AdoptionFailFirstAt != nil && *s.AdoptionFailFirstAt < now {
-		since = now - *s.AdoptionFailFirstAt
+	return "adoption failing " + durationOf(streakAge(s, now)) + " · " + *s.AdoptionFailReason + " · " + retry
+}
+
+// suitesForHTML adapts the suite rows to the HTML page. With adoption
+// disabled nothing is attempted or adopted, so a record stored while it
+// was enabled is inert: its text gains " (adoption disabled)" and it marks
+// no warn (final review S I3). A lag is truthful but expected — Phase 1
+// never refreshes metadata — so rows keep their lag text without warning,
+// and vitalState shows the SUITES vital stale with "ADOPTION DISABLED —
+// METADATA NOT REFRESHED" (ruling A4). The JSON keeps the raw fields.
+func suitesForHTML(suites []suiteEntry, adoptionEnabled bool) []suiteEntry {
+	if adoptionEnabled {
+		return suites
 	}
-	return "adoption failing " + durationOf(since) + " · " + *s.AdoptionFailReason + " · " + retry
+	out := slices.Clone(suites)
+	for i := range out {
+		e := &out[i]
+		if e.AdoptionStatus != "" {
+			e.AdoptionStatus += " (adoption disabled)"
+		}
+		e.AdoptionFailing, e.RefusedLong, e.LagWarn = false, false, false
+	}
+	return out
 }
 
 // refusalKeepsCurrent reports whether an adoption refusal for the given
@@ -654,12 +699,15 @@ func adoptionStatus(s cache.SuiteFreshness, refused bool, now int64) string {
 // upstream, so there is nothing to catch up on and buildSuiteEntries
 // must not render it as lag (spec C7: a refusal is a state, not a
 // failure; RecordAdoptionFailure never clears inrelease_change_seen_at
-// and deferred checks keep bumping it, so an unsuppressed row would
-// accrue lag forever and eventually push the Suites vital to warn and
-// then crit for a suite that isn't actually behind).
+// and deferred checks keep the first sighting, so an unsuppressed row
+// would accrue lag forever and eventually push the Suites vital to warn
+// and then crit for a suite that isn't actually behind).
 //
 //   - ReasonUpstreamOlder: upstream's Release Date is older than (or
 //     missing after) the current snapshot's — the cache is ahead or tied.
+//     A missing Date says nothing about the content's age, which is why
+//     a refusal older than refusalEscalateAge warns anyway (RefusedLong):
+//     a vendor that stops emitting Date must not freeze silently.
 //   - ReasonRollbackRefused: upstream is serving content identical to an
 //     older snapshot the cache already replaced (a flapping mirror) —
 //     not a step backward for the cache.
@@ -829,6 +877,7 @@ func (s *Server) buildHTMLRenderModel(m statusModel) htmlRenderModel {
 	if s.cfg.Keyring != nil && s.cfg.Keyring.KeyringSnapshot() != nil {
 		w.AdoptionEnabled = true
 	}
+	w.Suites = suitesForHTML(m.Suites, w.AdoptionEnabled)
 	if s.cfg.GC != nil {
 		w.GCIntervalSeconds = s.cfg.GC.Interval().Seconds()
 	}
@@ -1198,18 +1247,25 @@ func vitalState(kind string, m htmlRenderModel) string {
 		if len(m.Suites) == 0 {
 			return "stale"
 		}
+		if !m.AdoptionEnabled {
+			// ADOPTION DISABLED — METADATA NOT REFRESHED (§9.1, the
+			// keyring panel's precedent): the lag is expected, not a
+			// fault, so it must not hold the page at DEGRADED.
+			return "stale"
+		}
 		var worstLag int64
-		anyFailing := false
+		anyWarn := false
 		for _, s := range m.Suites {
 			worstLag = max(worstLag, s.LagSeconds)
-			anyFailing = anyFailing || s.AdoptionFailing
+			anyWarn = anyWarn || s.AdoptionFailing || s.RefusedLong
 		}
 		switch {
 		case worstLag > 24*3600:
 			return "crit"
-		case worstLag > 3600 || anyFailing:
+		case worstLag > 3600 || anyWarn:
 			// An adoption normally completes within minutes; a lag beyond
-			// the 1 h retry cap means at least one attempt failed.
+			// the 1 h retry cap means at least one attempt failed. A
+			// refusal older than a day warns, never crits (ruling A5).
 			return "warn"
 		}
 		return "ok"

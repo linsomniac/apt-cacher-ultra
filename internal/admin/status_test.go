@@ -240,6 +240,7 @@ func TestVitalState(t *testing.T) {
 				Cache:   cacheInfo{BytesUsed: 1024},
 				GC:      &gcInfo{LastRunUnixTime: ptrI64(1_000_003_500)},
 			},
+			AdoptionEnabled:   true, // the SUITES vital is stale without it (§9.1)
 			GCIntervalSeconds: 60,
 		}
 	}
@@ -301,6 +302,24 @@ func TestVitalState(t *testing.T) {
 				m.Suites = []suiteEntry{{AdoptionFailing: true, AdoptionStatus: "adoption failing 1h 0m · gpg_failed · retry in 30m"}}
 			},
 			"suites", "warn",
+		},
+		// Ruling A5: a refusal older than a day warns, never crits.
+		{
+			"suites_warn_refused_long",
+			func(m *htmlRenderModel) {
+				m.Suites = []suiteEntry{{AdoptionRefused: true, RefusedLong: true}}
+			},
+			"suites", "warn",
+		},
+		// Ruling A4: with adoption disabled (the shipped default) the lag
+		// is expected, so the vital is stale, not crit.
+		{
+			"suites_stale_adoption_disabled",
+			func(m *htmlRenderModel) {
+				m.AdoptionEnabled = false
+				m.Suites = []suiteEntry{{LagSeconds: 2 * 86400, LagWarn: true}}
+			},
+			"suites", "stale",
 		},
 
 		{
