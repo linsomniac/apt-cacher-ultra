@@ -878,8 +878,9 @@ first adoption stamps
 least `flip_quiet_period` before the flip, or was held and answered from the
 new snapshot, so its index requests within that period come from the snapshot
 matching its anchor. Because holds never overlap and every held commit
-waits a quiet period after the last hold that held a request ended (the
-quiet-cut, expiry and token-timeout commits are the residuals below), the
+waits a quiet period after the last hold that held a request ended (only a
+commit that timed out waiting for the hold token, which holds nothing, skips
+that wait; it is a residual below), the
 proxy's own holds cannot push a client's queued requests for another suite
 past that suite's flip. Residuals (documented, each with its own unlabelled
 counter): the quiet period cut short at 15 s into a hold, when an anchor

@@ -398,7 +398,10 @@ func TestFlip_ExpiryBackstopStartsACommitNotYetStarted(t *testing.T) {
 		synctest.Wait()
 		go func() { g.AnchorStart(bg, "a").Done() }() // waits in a's hold: a's hold held a request
 		time.Sleep(500 * time.Millisecond)
-		outB := flipAsync(bg, g, "b", noCommit) // phase A gives up at 1.5 s; then it queues for the token
+		// b's phase A gives up at 1.5 s; then it queues for the token.
+		// bCommitAt is written by b's Flip goroutine and read after <-outB.
+		var bCommitAt time.Time
+		outB := flipAsync(bg, g, "b", func() error { bCommitAt = time.Now(); return nil })
 		time.Sleep(2500 * time.Millisecond)
 		close(release) // a's hold ends at 3 s; b's starts then
 		waited := make(chan time.Duration, 1)
@@ -415,9 +418,12 @@ func TestFlip_ExpiryBackstopStartsACommitNotYetStarted(t *testing.T) {
 		if b.err != nil || b.res.Outcome != OutcomeHoldExpired || !b.res.Committed {
 			t.Fatalf("b: %+v, %v; want a hold that expired before its commit started", b.res, b.err)
 		}
-		if b.res.HoldEnd.Sub(b.res.HoldStart) != 8*time.Second || b.at.Sub(b.res.HoldStart) != 8*time.Second {
-			t.Fatalf("b held from %v until %v and committed at %v; want the hold to end, and the commit to start, at its 8s bound",
-				b.res.HoldStart, b.res.HoldEnd, b.at)
+		// The commit must actually run at the bound: Outcome and Committed
+		// are set before commit() is called, so only its own instant proves
+		// it ran (a `return nil` in place of `return commit()` fails here).
+		if b.res.HoldEnd.Sub(b.res.HoldStart) != 8*time.Second || bCommitAt.IsZero() || bCommitAt.Sub(b.res.HoldStart) != 8*time.Second {
+			t.Fatalf("b held from %v until %v and its commit ran at %v; want the hold to end, and the commit to run, at its 8s bound",
+				b.res.HoldStart, b.res.HoldEnd, bCommitAt)
 		}
 		if w := <-waited; w != 6*time.Second {
 			t.Fatalf("the request held in b's hold waited %v, want 6s (until the bound)", w)
