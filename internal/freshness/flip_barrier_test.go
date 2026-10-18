@@ -1,12 +1,14 @@
 package freshness
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"maps"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +18,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
@@ -526,6 +529,89 @@ func TestCheck_GateCloseInTheBarrierRecordsNothing(t *testing.T) {
 			t.Fatalf("gate stats = %+v, want one aborted flip", st)
 		}
 	})
+}
+
+// adoptionTotalFor sums acu_adoption_total over every outcome for host.
+func adoptionTotalFor(t *testing.T, host string) float64 {
+	t.Helper()
+	var buf bytes.Buffer
+	metrics.Default.Render(&buf)
+	sum := 0.0
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if !strings.HasPrefix(line, "acu_adoption_total{") || !strings.Contains(line, `host="`+host+`"`) {
+			continue
+		}
+		v, err := strconv.ParseFloat(line[strings.LastIndexByte(line, ' ')+1:], 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum += v
+	}
+	return sum
+}
+
+// Final review, tests Minor 3: a flip abandoned at shutdown — the gate
+// closed at the signal, or the lifetime context ended — is not a failure.
+// It is not counted in acu_adoption_total, not shown in the admin ring and
+// not recorded, and it logs one INFO adoption_abandoned_at_shutdown
+// instead of WARN adoption_run_failed, so a routine restart pages nobody.
+func TestCheck_ShutdownAbandonIsNotAFailure(t *testing.T) {
+	for _, how := range []string{"gate closed", "lifetime ended"} {
+		t.Run(how, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := newBarrierRig(t, 10*time.Second, 0)
+				seedStaleAnchorAt(t, r.c, rigHost, rigSuite)
+				life, stop := context.WithCancel(context.Background())
+				defer stop()
+				ring := observability.NewRing(10)
+				logs := &lockedBuffer{}
+				chk, err := New(Config{Cache: r.c, Fetcher: &changedUpstream{body: r.release("v1")}, HostLimiter: hostsem.New(8),
+					Adopter: r.ad, AdoptionRing: ring, LifetimeCtx: life, Logger: slog.New(slog.NewJSONHandler(logs, nil))})
+				if err != nil {
+					t.Fatal(err)
+				}
+				tok := r.gate.AnchorStart(context.Background(), barrierKey) // keeps the adoption in the barrier
+				defer tok.Done()
+				chk.Check(context.Background(), "http", rigHost, rigSuite)
+				time.Sleep(time.Second)
+				synctest.Wait()
+				before := adoptionTotalFor(t, rigHost)
+				if how == "gate closed" {
+					r.gate.Close()
+				} else {
+					stop()
+				}
+				chk.WaitForAdoptions()
+				if got := adoptionTotalFor(t, rigHost) - before; got != 0 {
+					t.Errorf("acu_adoption_total for the host rose by %v, want 0", got)
+				}
+				if evs := ring.Snapshot(); len(evs) != 0 {
+					t.Errorf("admin ring %+v, want no entry", evs)
+				}
+				var warns, abandoned int
+				for _, line := range strings.Split(logs.String(), "\n") {
+					var m map[string]any
+					if line == "" || json.Unmarshal([]byte(line), &m) != nil {
+						continue
+					}
+					if m["level"] == "WARN" || m["level"] == "ERROR" {
+						warns++
+						t.Errorf("WARN or worse logged: %v", m)
+					}
+					if m["msg"] == "adoption_abandoned_at_shutdown" && m["level"] == "INFO" &&
+						m["canonical_host"] == rigHost && m["suite_path"] == rigSuite {
+						abandoned++
+					}
+				}
+				if abandoned != 1 {
+					t.Errorf("%d INFO adoption_abandoned_at_shutdown lines, want 1:\n%s", abandoned, logs.String())
+				}
+				if r.current(t) != 0 {
+					t.Error("committed after the shutdown signal")
+				}
+			})
+		})
+	}
 }
 
 // putServedAnchor makes rel the url_path InRelease clients have been served,

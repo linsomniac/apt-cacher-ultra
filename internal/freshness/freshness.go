@@ -443,8 +443,8 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 // The host slot is freed earlier, when the member pipeline ends; the global slot only here, after the flip barrier and the commit (ruling R-C1).
 // A deadline that passes after the member pipeline, in the flip barrier
 // (ruling R-C2), leaves the outcome to the commit's own error, and a flip
-// abandoned in the barrier (shutdown, design note 18) is never recorded as
-// a failure.
+// abandoned in the barrier (shutdown, design note 18) is never counted,
+// logged or recorded as a failure (INFO adoption_abandoned_at_shutdown).
 func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) {
 	c.adoptionWg.Add(1)
 	go func() {
@@ -466,6 +466,21 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 			membersDone: func() { pipelineDone = true; l.releaseHost() },
 			stop:        c.lifetimeCtx,
 		})
+		// A flip abandoned in the barrier means shutdown: main closes the
+		// gate at the signal, while the lifetime context still runs (or
+		// that context ended). Shutdown is never a failure (spec C7,
+		// design note 18): it is not counted in acu_adoption_total, not
+		// shown in the admin ring, not recorded, and logged at INFO, so a
+		// routine restart pages nobody (final review, tests Minor 3).
+		if errors.Is(err, flipgate.ErrAborted) {
+			c.logger.Info("adoption_abandoned_at_shutdown",
+				"canonical_host", req.suite.CanonicalHost,
+				"suite_path", req.suite.SuitePath,
+				"form", formName(req.form),
+				"err", err,
+			)
+			return
+		}
 		duration := time.Since(start)
 		outcome := classifyAdoptionOutcome(err)
 		// A deadline that fires in the member pipeline makes the attempt
@@ -519,12 +534,7 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 				"form", formName(req.form),
 				"err", err,
 			)
-			// A flip abandoned in the barrier means shutdown: main closes
-			// the gate at the signal, while the lifetime context still
-			// runs. Shutdown is never a failure (spec C7, design note 18).
-			if !errors.Is(err, flipgate.ErrAborted) {
-				c.recordAdoptionFailure(req, reason)
-			}
+			c.recordAdoptionFailure(req, reason)
 		}
 	}()
 }
