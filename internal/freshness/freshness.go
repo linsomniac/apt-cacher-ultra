@@ -470,6 +470,31 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 // after cancelling the lifecycle ctx.
 func (c *Checker) WaitForAdoptions() { c.adoptionWg.Wait() }
 
+// rescheduleFailingAdoptions gives every failing suite one retry spread
+// uniformly over the next periodic_refresh (spec C7 "Restart"): the
+// recovery path after an operator installs a key or changes pins,
+// without a thundering herd. Refusal states and panic records keep
+// their schedule.
+func (c *Checker) rescheduleFailingAdoptions(ctx context.Context) {
+	if c.adopter == nil {
+		return
+	}
+	spread := int64(c.refresh / time.Second)
+	n, err := c.cache.RescheduleFailingAdoptions(ctx, c.now().Unix(), func() int64 {
+		if spread <= 0 {
+			return 0
+		}
+		return int64(c.rand() * float64(spread))
+	})
+	if err != nil {
+		c.logger.Warn("adoption_retries_reschedule_failed", "err", err)
+		return
+	}
+	if n > 0 {
+		c.logger.Info("adoption_retries_rescheduled", "suites", n, "spread_seconds", spread)
+	}
+}
+
 // ErrAdoptionPanicked is recorded (phase B) when an adoption, repair or
 // reconcile goroutine panics (security finding I-1).
 var ErrAdoptionPanicked = errors.New("adoption_panicked")

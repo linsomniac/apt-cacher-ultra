@@ -50,7 +50,8 @@ func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore, now int64) (ad
 
 // Run starts the SPEC §7.4 periodic refresh loop. It returns when ctx
 // is cancelled. Refresh = 0 disables periodic refresh (Run returns
-// immediately).
+// immediately). Before anything else it reschedules failing adoptions
+// (spec C7 restart rule).
 //
 // Each tick scans suite_freshness and attempts a freshness check on any
 // suite whose last_success_at is older than refresh. The cooldown gate
@@ -59,6 +60,7 @@ func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore, now int64) (ad
 // upstream-side bound (per-host concurrency in the fetch path) keeps
 // this path well-behaved without a separate worker pool.
 func (c *Checker) Run(ctx context.Context) {
+	c.rescheduleFailingAdoptions(ctx)
 	if c.refresh <= 0 {
 		return
 	}
