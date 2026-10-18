@@ -103,6 +103,11 @@ type Config struct {
 	// (freshness.Adopter.FlipGate). nil, or a gate with a zero quiet
 	// period, never holds or tracks anything (the pre-C8 behaviour).
 	FlipGate *flipgate.Gate
+
+	// KeepDisplaced is gc.keep_displaced. Spec C8 retained by-hash serves
+	// a by-hash request the current snapshot lacks from the suite's newest
+	// KeepDisplaced+1 displaced, non-retired snapshots; 0 disables it.
+	KeepDisplaced int
 }
 
 // ConnectHandler is the SPEC6 §2.2 CONNECT pipeline contract.
@@ -148,6 +153,9 @@ type Handler struct {
 	// flipGate is the spec C8 barrier (see anchorStart); nil when off.
 	flipGate *flipgate.Gate
 
+	// keepDisplaced bounds retained by-hash (see tryDisplacedByHash).
+	keepDisplaced int
+
 	// unvouchedPassthroughLog rate-limits the
 	// unvouched_deb_passthrough_no_coverage event to once per (host,
 	// path, hour) so steady incomplete-coverage traffic doesn't flood
@@ -187,6 +195,9 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.HostLimiter == nil {
 		return nil, errors.New("handler: nil HostLimiter")
 	}
+	if cfg.KeepDisplaced < 0 {
+		return nil, errors.New("handler: negative KeepDisplaced")
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -204,6 +215,7 @@ func New(cfg Config) (*Handler, error) {
 		refuseUnvouchedDebs:     cfg.RefuseUnvouchedDebs,
 		adoptionEnabled:         cfg.AdoptionEnabled,
 		flipGate:                cfg.FlipGate,
+		keepDisplaced:           cfg.KeepDisplaced,
 		unvouchedPassthroughLog: make(map[string]int64),
 		lifecycleCtx:            lifecycleCtx,
 		lifecycleCancel:         lifecycleCancel,
@@ -400,7 +412,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //  1. Metadata under a suite with current_snapshot_id != NULL: lookup
 //     goes through suite_freshness → snapshot_member, with NO Phase 1
 //     url_path fallback. A miss in snapshot_member returns 404 — once
-//     a suite is adopted, the snapshot is the contract.
+//     a suite is adopted, the snapshot is the contract. The one
+//     exception is a by-hash member one of the suite's displaced
+//     snapshots declared (spec C8 retained by-hash).
 //  2. Metadata without a snapshot pointer (pre-Phase-2 / never-adopted):
 //     Phase 1 url_path lookup, identical to SPEC §6.1.
 //  3. Non-metadata (.deb, etc.): Phase 1 url_path lookup, then
@@ -417,8 +431,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // open(2), and one ServeContent — order-of-microseconds.
 func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, outcome string, status int, bytesWritten int64, validation packageValidation) {
 	if req.IsMetadata && req.SuitePath != "" {
-		if served, status, body, handled := h.trySnapshotHit(w, r, req, start); handled {
-			return served, "", status, body, packageValidation{}
+		if served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start); handled {
+			return served, "", status, body, packageValidation{SnapshotDisplaced: displaced}
 		}
 	}
 	if served, outcome, status, body, v := h.tryURLPathHit(w, r, req); served {
@@ -461,7 +475,7 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 // re-fetch validated against that hash is as safe as the original
 // adoption fetch. SPEC2 §6.2 names this as the local-fault recovery
 // path. serveSnapshotMemberMiss owns it.
-func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, status int, bytesWritten int64, handled bool) {
+func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, status int, bytesWritten int64, handled, displaced bool) {
 	suite, err := h.cache.GetSuiteFreshness(r.Context(),
 		req.CanonicalScheme, req.CanonicalHost, req.SuitePath)
 	switch {
@@ -469,18 +483,18 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		// Suite has never been seen — pre-Phase-2 regime. Falling through
 		// to url_path is safe because no §6.1 contract has been
 		// established for this (host, suite).
-		return false, 0, 0, false
+		return false, 0, 0, false, false
 	case err != nil:
 		h.logger.Warn("suite_freshness lookup failed",
 			"err", err,
 			"canonical_host", req.CanonicalHost,
 			"suite_path", req.SuitePath,
 		)
-		return h.writeFailClosed(w, "suite lookup failed"), http.StatusBadGateway, 0, true
+		return h.writeFailClosed(w, "suite lookup failed"), http.StatusBadGateway, 0, true, false
 	}
 	if suite.CurrentSnapshotID == nil {
 		// Suite known but never adopted — pre-Phase-2 regime.
-		return false, 0, 0, false
+		return false, 0, 0, false, false
 	}
 	snapshotID := *suite.CurrentSnapshotID
 
@@ -488,6 +502,14 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 	mem, err := h.cache.GetSnapshotMember(r.Context(), snapshotID, memberPath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
+		// Spec C8 retained by-hash: a by-hash member the current snapshot
+		// lacks may be one a displaced snapshot declared — a client that
+		// fetched an earlier anchor asks for exactly those bytes.
+		if ok, st, n := h.tryDisplacedByHash(w, r, req, snapshotID, memberPath); ok {
+			go h.touchAsync(req)
+			h.maybeFireFreshness(req)
+			return true, st, n, true, true
+		}
 		// SPEC2 §6.1: snapshot is the contract. Path not in the snapshot
 		// → 404. No Phase 1 fallback would be allowed to satisfy this
 		// request, regardless of whether url_path has a row for it.
@@ -512,7 +534,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 			serveSnapshotIndexTarget404Total.Inc(boundedArchLabel(arch))
 		}
 		http.Error(w, "not in snapshot", http.StatusNotFound)
-		return true, http.StatusNotFound, 0, true
+		return true, http.StatusNotFound, 0, true, false
 	case err != nil:
 		h.logger.Warn("snapshot_member lookup failed",
 			"err", err,
@@ -520,7 +542,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 			"path", req.Path,
 			"snapshot_id", snapshotID,
 		)
-		return h.writeFailClosed(w, "snapshot lookup failed"), http.StatusBadGateway, 0, true
+		return h.writeFailClosed(w, "snapshot lookup failed"), http.StatusBadGateway, 0, true, false
 	}
 
 	// Spec C8: a snapshot anchor's Last-Modified is never older than its
@@ -548,11 +570,11 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 			"blob_hash", mem.BlobHash,
 		)
 		served, status, bytesWritten = h.serveSnapshotMemberMiss(w, r, req, mem, snapshotID, floor, start)
-		return served, status, bytesWritten, true
+		return served, status, bytesWritten, true, false
 	}
 	go h.touchAsync(req)
 	h.maybeFireFreshness(req)
-	return true, status, bytesWritten, true
+	return true, status, bytesWritten, true, false
 }
 
 // writeFailClosed writes a 502 + Retry-After: 30 response for an
@@ -711,6 +733,54 @@ func (h *Handler) tryByHashContentAddressed(w http.ResponseWriter, r *http.Reque
 	go h.recordByHashURLPath(req, hash)
 	h.maybeFireFreshness(req)
 	return true, status, bytesWritten
+}
+
+// byHashMemberRE matches a suite-relative by-hash member path, SHA256 or
+// SHA512, capturing the hex when the algorithm is SHA256. The leading
+// (?:^|/) is defensive: IsMetadata routes only /by-hash/ paths here.
+var byHashMemberRE = regexp.MustCompile(`(?:^|/)by-hash/(?:SHA256/([0-9a-f]{64})|SHA512/[0-9a-f]{128})$`)
+
+// tryDisplacedByHash is spec C8's retained by-hash: a by-hash member the
+// current snapshot lacks is served from one of the suite's displaced,
+// non-retired snapshots — the newest of the newest keep_displaced+1 that
+// holds it — with that snapshot's X-Cache-Snapshot. A SHA256 alias is
+// served only when its blob is the hash the URL names; a SHA512 alias
+// relies on the snapshot_member binding verified at adoption. There is no
+// recovery fetch: a displaced member whose blob is gone stays a 404.
+// keep_displaced = 0 disables it.
+//
+// AIDEV-NOTE: the one place a non-current snapshot serves. It is limited
+// to content-addressed paths (a client holding an earlier anchor asks for
+// exactly those bytes) and to the snapshots GC still keeps. A lookup
+// failure answers the pre-C8 404 (logged), never the unverified miss path.
+func (h *Handler) tryDisplacedByHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, currentID int64, memberPath string) (served bool, status int, bytesWritten int64) {
+	if h.keepDisplaced <= 0 {
+		return false, 0, 0
+	}
+	m := byHashMemberRE.FindStringSubmatch(memberPath)
+	if m == nil {
+		return false, 0, 0
+	}
+	rows, err := h.cache.DisplacedSnapshotMembers(r.Context(), req.CanonicalScheme, req.CanonicalHost,
+		req.SuitePath, memberPath, currentID, h.keepDisplaced+1)
+	if err != nil {
+		h.logger.Warn("displaced snapshot lookup failed",
+			"err", err,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+		)
+		return false, 0, 0
+	}
+	for _, row := range rows {
+		if m[1] != "" && row.BlobHash != m[1] {
+			continue // a SHA256 alias must be the bytes its URL names
+		}
+		if served, status, bytesWritten = h.serveBlobWithHeaders(w, r, req, row.BlobHash, snapshotMeta{snapshotID: row.SnapshotID}); served {
+			serveByHashDisplacedTotal.Inc(req.CanonicalHost)
+			return true, status, bytesWritten
+		}
+	}
+	return false, 0, 0
 }
 
 // recordByHashURLPath inserts the url_path row for a successful by-hash
@@ -1978,6 +2048,10 @@ func retryAfterForRequest(req *proxy.Request) string {
 type packageValidation struct {
 	Validated   bool
 	PackageName string
+
+	// SnapshotDisplaced marks a spec C8 retained by-hash serve (from a
+	// displaced snapshot); logged as snapshot_displaced=true.
+	SnapshotDisplaced bool
 }
 
 // logRequest emits the per-request slog line. SPEC §10.
@@ -2048,6 +2122,12 @@ func (h *Handler) logRequestWithValidation(r *http.Request, canonHost, path, out
 		if validation.PackageName != "" {
 			attrs = append(attrs, "package_name", validation.PackageName)
 		}
+	}
+	// Spec C8: snapshot_displaced marks a retained by-hash serve (from a
+	// displaced snapshot, which X-Cache-Snapshot names); emitted only when
+	// true.
+	if validation.SnapshotDisplaced {
+		attrs = append(attrs, "snapshot_displaced", true)
 	}
 	if fetchAttempted {
 		attrs = append(attrs, "upstream_status", upstreamStatus)

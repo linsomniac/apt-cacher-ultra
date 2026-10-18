@@ -16,6 +16,10 @@ import (
 // metric calls. The unvouched_deb_passthrough_no_coverage outcome is
 // a separate rate-limited Info log line (not via logRequest); its
 // counter is emitted explicitly at logUnvouchedPassthrough.
+//
+// AIDEV-NOTE: added by the flat-repository work, outside the SPEC5
+// §10.4.1 inventory: acu_serve_byhash_displaced_total{host} (spec C8
+// retained by-hash).
 var (
 	requestsTotal = metrics.NewCounterWithCap(
 		"acu_requests_total",
@@ -81,5 +85,16 @@ var (
 		"Authoritative not-in-snapshot 404s served for an apt IndexTarget (broken apt update), by architecture (SPEC6_8).",
 		metrics.DefaultMaxSeries,
 		"architecture",
+	)
+
+	// serveByHashDisplacedTotal counts spec C8 retained by-hash serves: a
+	// by-hash member the current snapshot lacks, served from one of the
+	// suite's displaced snapshots (to a client that fetched an earlier
+	// anchor). Host-labelled, no suite labels (spec C11).
+	serveByHashDisplacedTotal = metrics.NewCounterWithCap(
+		"acu_serve_byhash_displaced_total",
+		"by-hash requests served from a displaced (earlier) snapshot of their suite, by upstream host (spec C8).",
+		metrics.DefaultMaxSeries,
+		"host",
 	)
 )
