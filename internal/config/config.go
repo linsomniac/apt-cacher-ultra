@@ -175,6 +175,14 @@ type AdoptionConfig struct {
 	// C4, C11). Default 30m; at least 1m.
 	MaxDuration Duration `toml:"max_duration"`
 
+	// FlipQuietPeriod is adoption.flip_quiet_period (spec C8, C11): how
+	// long after the last client finished receiving a suite's anchor the
+	// cache keeps the suite's snapshot before switching to a new one, so
+	// that client's index requests still match the anchor it holds.
+	// Default 10s; 0s disables the flip barrier (the previous behaviour);
+	// otherwise between 1s and 15s.
+	FlipQuietPeriod Duration `toml:"flip_quiet_period"`
+
 	// Architectures is the SPEC6_5 §5.1 per-arch adoption allowlist.
 	// Empty (default) preserves Phase 6 behavior: every Release-listed
 	// Packages / Sources / *.diff/Index file is adopted. Non-empty:
@@ -702,6 +710,11 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("adoption", "max_duration") {
 		cfg.Adoption.MaxDuration.Duration = 30 * time.Minute
 	}
+	// adoption.flip_quiet_period = 0s disables the flip barrier: a
+	// meaningful value that must survive Load.
+	if !md.IsDefined("adoption", "flip_quiet_period") {
+		cfg.Adoption.FlipQuietPeriod.Duration = 10 * time.Second
+	}
 	// Version-aware retention presence-sensitive defaults:
 	// hold_packages.window = 0 (no grace) is a documented meaningful value
 	// that must survive Defaults(); retention.max_versions_per_package
@@ -980,6 +993,11 @@ func (c *Config) Validate() error {
 	}
 	if c.Adoption.MaxDuration.Duration < time.Minute {
 		errs = append(errs, errors.New("adoption.max_duration must be at least 1m"))
+	}
+	// A sub-second quiet period gives almost no protection: 0s (off) or
+	// 1s..15s (controller ruling, phase C plan).
+	if q := c.Adoption.FlipQuietPeriod.Duration; q != 0 && (q < time.Second || q > 15*time.Second) {
+		errs = append(errs, errors.New("adoption.flip_quiet_period must be 0s or between 1s and 15s"))
 	}
 
 	// SPEC6_5 §5.2: [adoption].architectures shape and cardinality.

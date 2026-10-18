@@ -893,6 +893,34 @@ func TestAdoptionMaxDuration_DefaultAndBounds(t *testing.T) {
 	}
 }
 
+// adoption.flip_quiet_period (spec C11): default 10s, 0s disables the
+// flip barrier and survives Load; otherwise 1s to 15s (controller ruling:
+// a sub-second period gives almost no protection).
+func TestAdoptionFlipQuietPeriod_DefaultAndBounds(t *testing.T) {
+	load := func(extra string) (*Config, error) {
+		dir := t.TempDir()
+		return Load(writeTOML(t, dir, "config.toml", "[cache]\ndir = \""+dir+"\"\n"+extra))
+	}
+	cfg, err := load("")
+	if err != nil || cfg.Adoption.FlipQuietPeriod.Duration != 10*time.Second {
+		t.Fatalf("default = %v (err %v), want 10s", cfg.Adoption.FlipQuietPeriod.Duration, err)
+	}
+	for _, ok := range []struct {
+		value string
+		want  time.Duration
+	}{{"0s", 0}, {"1s", time.Second}, {"15s", 15 * time.Second}, {"2500ms", 2500 * time.Millisecond}} {
+		cfg, err := load("[adoption]\nflip_quiet_period = \"" + ok.value + "\"\n")
+		if err != nil || cfg.Adoption.FlipQuietPeriod.Duration != ok.want {
+			t.Errorf("flip_quiet_period = %s: got %v (err %v), want %v", ok.value, cfg.Adoption.FlipQuietPeriod.Duration, err, ok.want)
+		}
+	}
+	for _, bad := range []string{"16s", "-1s", "500ms", "999ms"} {
+		if _, err := load("[adoption]\nflip_quiet_period = \"" + bad + "\"\n"); err == nil {
+			t.Errorf("flip_quiet_period = %s accepted, want a validation error", bad)
+		}
+	}
+}
+
 // TestLoad_RefuseUnvouchedDebsDefault: omitted
 // integrity.refuse_unvouched_debs defaults to false (SPEC3 §1.3 —
 // the default-flip to true is gated on production data).

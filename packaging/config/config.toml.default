@@ -105,6 +105,13 @@ hot_prefetch_budget   = "5m"
 # unchanged check. This deadline never cuts the final commit short; the
 # commit has its own 5-minute bound.
 max_duration          = "30m"
+# How long the cache keeps a suite's snapshot after a client last finished
+# receiving its InRelease/Release before switching to a new snapshot, so
+# that client's index requests still match. A busy suite's new
+# InRelease/Release requests are held instead, one suite at a time, for at
+# most 20 s (below apt's 30 s timeout). 0s switches at once; otherwise
+# between 1s and 15s.
+flip_quiet_period     = "10s"
 
 [integrity]
 # Rehash current-snapshot blobs to detect disk corruption; 0s disables.
