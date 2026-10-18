@@ -43,6 +43,12 @@ func TestCheck_FutureLastCheckAtDoesNotFreezeAndHeals(t *testing.T) {
 	if got.LastCheckAt == nil || *got.LastCheckAt != now.Unix() {
 		t.Fatalf("last_check_at not healed to now: %v", got.LastCheckAt)
 	}
+	// A-40: the check succeeded (result "changed"), so last_success_at must
+	// heal to now alongside last_check_at, not just stay frozen at the
+	// stepped-forward value.
+	if got.LastSuccessAt == nil || *got.LastSuccessAt != now.Unix() {
+		t.Fatalf("last_success_at not healed to now: %v", got.LastSuccessAt)
+	}
 	// A second detection within a minute must not log again.
 	c.clockStep("last_check_at", "http", "h", "/r/dists/y", future, now)
 	if n := strings.Count(logs.String(), "clock_step_detected"); n != 1 {

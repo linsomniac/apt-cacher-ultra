@@ -90,10 +90,10 @@ var (
 	ErrAdoptionMemberMismatch    = errors.New("adoption_member_mismatch")
 	ErrAdoptionDBFailed          = errors.New("adoption_db_failed")
 
-	// ErrAdoptionGuardFailed marks a pre-commit guard refusal (required
-	// architecture group missing, every member 4xx, serve-contract target
-	// absent). It wraps ErrAdoptionMemberFetchFailed so the outcome label
-	// stays member_fetch_failed; retry logic can tell guards apart.
+	// AIDEV-NOTE: ErrAdoptionGuardFailed marks a pre-commit guard refusal
+	// (required architecture group missing, every member 4xx, serve-contract
+	// target absent). It wraps ErrAdoptionMemberFetchFailed so the outcome
+	// label stays member_fetch_failed; retry logic can tell guards apart.
 	ErrAdoptionGuardFailed = fmt.Errorf("adoption_guard_failed: %w", ErrAdoptionMemberFetchFailed)
 
 	// ErrAdoptionUnpinnedSuite is the freshness-level sentinel for

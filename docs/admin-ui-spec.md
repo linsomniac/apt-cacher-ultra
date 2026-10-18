@@ -337,6 +337,40 @@ and detail panels become `<details>` (default-closed except non-healthy).
 With JS enabled, an `IntersectionObserver` highlights the rail entry
 corresponding to the section currently in view.
 
+### 4.5 Suites row fields (phase B)
+
+The flat-repository work (spec C7) adds fields to each `suites[]` JSON
+entry. This spec carries no other per-field prose for that array (§0.1's
+locked-contract list only calls out the additive `keyring[]` fields from
+commit e5b6024 by name), so the new fields' one-line meanings live here,
+next to the Suites table contract in §5.3:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `anchor_form` | string | The current snapshot's signing form — `inline` or `detached` today (`unsigned` joins in a later phase); empty when the suite has no current snapshot. |
+| `last_requested_unixtime` | int64 or `null` | Last time a client requested content under this suite. |
+| `check_fail_count` | int64 | Consecutive checks that ended unknown (transport error, deadline, unexpected status) since the last answered check; drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check. |
+| `adoption_fail_reason` | string or `null` | The current failure or refusal reason; `null` when no record exists. |
+| `adoption_fail_count` | int64 | Consecutive adoption attempts in the current failure/refusal streak; `0` when no record exists. |
+| `adoption_fail_first_unixtime` | int64 or `null` | When the current streak started. |
+| `adoption_next_retry_unixtime` | int64 or `null` | When the same content is retried next; new content is tried at once regardless of this stamp. |
+| `adoption_refused` | boolean | `true` when the record above is a refusal state (`upstream_older`, `rollback_refused`, …), not a failure. |
+
+These are additive to the locked JSON contract (§0.1), the same way
+`keyring[]` was: no existing key changes shape or meaning.
+
+**Adoption column.** The Suites table's "Adoption" column renders the
+record above as one line, via the server-side `adoptionStatus` helper:
+`"adoption failing 3d 2h · untrusted_signer · retry in 41m"` for a failure,
+or `"refused: upstream_older · retry due"` for a refusal. Empty when the
+suite has no failure or refusal record.
+
+**FAILING count.** The Suites panel's eyebrow and the SUITES vital cell's
+sub-line count suites with a genuine failure record (`adoption_refused ==
+false` and a record exists) as FAILING; a refusal is a state, not a
+failure (spec C7), and is excluded — matching the ADOPTIONS vital's ratio
+(§9.1).
+
 ---
 
 ## 5. Component contracts
@@ -436,10 +470,16 @@ The five cells (left → right):
 | Cell | Eyebrow         | Value source                                | Sub source                          | Hint source                                  |
 |------|-----------------|---------------------------------------------|-------------------------------------|----------------------------------------------|
 | 1    | CACHE           | `formatBytes .Cache.BytesUsed`              | `.Cache.BlobCount` + " blobs"       | `.Cache.ZeroRefcountBacklog` (when > 0)      |
-| 2    | SUITES          | `len .Suites`                               | lagging count (suites with `.Lagging != ""`) | stale count (lagging > 24h)         |
+| 2    | SUITES          | `len .Suites`                               | `N LAGGING` count (suites with `.LagWarn`)  | `M FAILING` count (suites with `.AdoptionFailing`) |
 | 3    | ADOPTIONS       | success-count / `len .RecentAdoptions`      | avg `.DurationSeconds`              | most-recent non-success `.Outcome`           |
 | 4    | GC              | `formatShortDuration .GC.LastRunDurationSeconds` | `durationOf` since `.GC.LastRunUnixTime` | `formatBytes .GC.LastRunBytesReclaimed` |
 | 5    | ACTIVE          | `len .ActiveHosts`                          | "idle" / "busy"                     | max `.SlotCapacity`                          |
+
+**Lag rule (phase B; replaces the two-stamp comparison this row originally
+described).** Lag runs from the first time the cache saw upstream's new
+metadata to now. A row, and the suites vital, warn when the lag exceeds 1 h
+or an adoption is failing; the vital is critical when the lag exceeds 24 h.
+The "(lagging …)" text shows any lag.
 
 Each cell's `data-state` is computed server-side at template render time
 using helper `vitalState(...)` (§6.2) — the per-cell threshold logic
@@ -537,16 +577,19 @@ outside-click and on `Escape` (§8.4).
 
 Used in:
 - Recent-adoptions outcome column (one of: `success`, `gpg_failed`,
-  `fetch_failed`, `parse_failed`, etc.)
+  `fetch_failed`, `parse_failed`, `refused`, `release_date_in_future`,
+  `timed_out`, etc. — phase B adds the last three, spec C5/C7)
 - Lagging annotation on suites
 - GC deadline-reached cell
 - TLS MITM enabled/disabled state
 - Keyring source attribution (§5.6)
 
 The badge for an outcome maps via helper `outcomeBadgeClass(s)` (§6.2):
-`success` → `.b--ok`, others → `.b--crit` (or `.b--warn` for the few
-soft-failure modes the operator has classified that way; implementer
-chooses based on the existing outcome enum and notes the mapping inline).
+`success` → `.b--ok`; `refused` → `.b--warn` (phase B: a refusal is a state,
+not a failure — the current snapshot keeps serving, spec C7); every other
+non-success outcome → `.b--crit`, including unknown future outcomes. The
+Recent Adoptions row carries the same split: `data-state="warn"` for
+`refused`, `data-state="crit"` for every other non-success outcome.
 
 ### 5.6 Keyring section
 
@@ -823,9 +866,20 @@ attributes, not from a stale roll-up).
 
 Applied to `<tr>` rows in the Recent Adoptions table. Value is the
 outcome enum string (`success`, `gpg_failed`, `fetch_failed`,
-`parse_failed`, etc.) — the JS uses this to compute the dominant
-non-success outcome for the aggregate notice (§8.2). The value is the
-canonical enum string from the JSON payload, not a localized label.
+`parse_failed`, `refused`, `release_date_in_future`, `timed_out`, etc.) —
+the JS uses this to compute the dominant non-success outcome for the
+aggregate notice (§8.2). The value is the canonical enum string from the
+JSON payload, not a localized label.
+
+Phase B adds a sibling `data-reason` attribute, present whenever the row
+has a sub-reason distinct from its outcome (e.g. outcome `refused` with
+reason `upstream_older` or `rollback_refused`; outcome `gpg_failed` with one
+of the verifier sentinels). Both the outcome badge and, when present, the
+reason badge carry a `title=` tooltip from the server-side `reasonTooltip`
+helper — the aggregate-notice JS's own `hints` dispatch (§8.2) is a
+separate, shorter table covering only the outcomes it has hint text for
+today; an outcome missing from it falls back to a generic hint, not to
+`reasonTooltip`.
 
 ### 7.3 `data-label` (all `<td>` in `.data` tables)
 
@@ -984,10 +1038,23 @@ rules; both reference this section.
 | Cell      | `crit`                                                       | `warn`                                                           | `stale`                                |
 |-----------|--------------------------------------------------------------|------------------------------------------------------------------|----------------------------------------|
 | CACHE     | `.GC.PoolUnlinkErrors > 0`                                   | `.Cache.ZeroRefcountBacklog > 1000`                              | `.Cache.BytesUsed == 0`                |
-| SUITES    | any suite lagging > 24h                                      | any suite lagging at all                                         | `len .Suites == 0`                     |
+| SUITES    | any suite's lag exceeds 24h                                  | any suite's lag exceeds 1h, or an adoption is failing            | `len .Suites == 0`                     |
 | ADOPTIONS | non-success rate ≥ 50%                                       | non-success rate ≥ 10%                                           | ring buffer empty (uptime <5m)         |
 | GC        | `.GC.LastRunDeadlineReached` true on the last run            | last run older than `2 × .GCIntervalSeconds` (wrapper)           | `.GC.LastRunUnixTime == nil`           |
 | ACTIVE    | (no crit threshold defined; reserved)                        | (no warn threshold; reserved)                                    | no active hosts and uptime <5m         |
+
+**SUITES (phase B; replaces the two-stamp comparison this row originally
+described).** Lag runs from the first time the cache saw upstream's new
+metadata to now. A row, and the suites vital, warn when the lag exceeds 1 h
+or an adoption is failing; the vital is critical when the lag exceeds 24 h.
+The "(lagging …)" text shows any lag. A suite refused `upstream_older` or
+`rollback_refused` shows no lag at all (the cache already serves content at
+least as new as upstream); every other refusal reason keeps lag.
+
+**ADOPTIONS (phase B).** The non-success ratio excludes `refused` rows from
+the numerator (a refusal is a state, not a failure, spec C7) but keeps them
+in the denominator, same as `success`; a window of only refusals and
+successes stays `ok`.
 
 The CACHE `crit` threshold reads pool-unlink errors from the GC block
 (that's where `PoolUnlinkErrors` lives) rather than from `cacheInfo`.
@@ -1241,7 +1308,7 @@ fixtures:
 |----------------------------------|-------------------------------------------------------------------------------|
 | `golden_healthy.html`            | All `.vital[data-state]` values are `ok`; `tr[data-state]` rows have no crit/warn; `.notice-mount` is empty; `.keys-chip[data-keyring-count]` is `>0`; verdict pill renders as `STATUS` (the no-JS fallback) |
 | `golden_warming_up.html`         | `body[data-uptime-seconds] < 300`; `.GC.LastRunUnixTime == nil` branch produces "NO GC RUN YET" empty state |
-| `golden_watching_lagging.html`   | 3 suite rows carry `data-state="warn"`; suites vital cell carries `data-state="warn"` |
+| `golden_watching_lagging.html`   | 3 suite rows carry `data-state="warn"` (lag runs from the first time the cache saw upstream's new metadata to now; a row and the suites vital warn when the lag exceeds 1 h or an adoption is failing, and are critical past 24 h — phase B); suites vital cell carries `data-state="warn"` |
 | `golden_degraded_gpg.html`       | Recent-adoptions rows carry `data-outcome="gpg_failed"` at the expected ratio; the `notice-mount` placeholder is present (JS fills at runtime — markup only checked) |
 | `golden_keyring_empty_disabled.html` | Wrapper renders `.AdoptionEnabled=false`; `.empty--stale` block visible; "ADOPTION DISABLED" eyebrow present |
 | `golden_keyring_empty_enabled.html`  | Wrapper renders `.AdoptionEnabled=true`; `.empty--crit` block visible; "NO GPG KEYS LOADED" eyebrow present |

@@ -197,7 +197,7 @@ of signed repository content over HTTP, but do not cover arbitrary unsigned file
 | --- | --- | --- | --- |
 | `cooldown` | duration | `"60s"` | Minimum interval between freshness checks for a suite, shared by request-triggered and scheduled checks. Nonnegative; `"0s"` selects the default. |
 | `periodic_refresh` | duration | `"15m"` | Age after the last successful check at which a suite becomes due for background refresh. Scheduler checks for due suites every quarter of this duration, with a `5s` minimum tick. Nonnegative; `"0s"` selects the default and does not disable refresh. |
-| `max_concurrent_adoptions` | integer | `2` | Global concurrent snapshot-adoption limit. `0` means unlimited; must be nonnegative. |
+| `max_concurrent_adoptions` | integer | `2` | Global concurrent snapshot-adoption limit. `0` means unlimited; must be nonnegative. Shared by adoptions, repairs and reconciles; see *Capacity and fairness*. |
 
 Freshness checks detect changed repository metadata. `[adoption]` determines
 whether a changed suite is staged and published as a new coherent snapshot.
@@ -219,6 +219,28 @@ whether a changed suite is staged and published as a new coherent snapshot.
 | `member_retry_delay` | duration | `"30s"` | Delay between member retries. Nonnegative; `"0s"` means no delay. |
 | `repair_skipped_members` | boolean | `true` | After an unchanged successful freshness check, repair integrity/availability skips and reconcile missing declared requestable indexes in the live snapshot. The latter also covers required indexes previously skipped with `404`/`410`. |
 | `hot_prefetch_budget` | duration | `"5m"` | Wall-clock budget for fetching hot package versions before publishing a new snapshot. `"0s"` removes this overall guard; each fetch still has upstream limits. Nonnegative. |
+| `max_duration` | duration | `"30m"` | Longest an adoption, repair or reconcile may run. An abandoned adoption is retried on the normal schedule; a repair or reconcile runs again on the next unchanged check. The final commit is never cut short. At least `"1m"`. |
+
+### How failed adoptions are retried
+
+When an adoption fails (an untrusted or malformed signature, a member that will not download intact, a `Date` in the future, a timeout), the cache records the failing content and backs off: the same content is retried after 2, 4, 8, 16, 32 minutes and then hourly (each ±25 %). Until then each check asks upstream with the failing content's validators, so an unchanged upstream costs one small request and no download. **Any new content is tried at once.** A deterministic failure therefore costs about 30 attempts a day instead of one per `cooldown`.
+
+If the cache cannot read the current snapshot when an adoption starts, the attempt fails as `db_failed` (and is retried on the backoff schedule) rather than skipping the rollback checks below.
+
+Two outcomes are refusals, not failures, and are shown as "refused: …" on the status page:
+
+- `upstream_older`: upstream serves a Release whose `Date` is older than the snapshot being served, or has no `Date` at all after a dated snapshot (a missing `Date` counts as 0). apt would ignore it too; the cache keeps serving the newer snapshot.
+- `rollback_refused`: upstream serves content identical to an older snapshot the cache already replaced (a flapping mirror). Only the last `gc.keep_displaced` snapshots are remembered for this.
+
+A Release dated more than 10 seconds ahead of the cache's clock is a failure (apt rejects it as "not valid yet"); check the cache host's clock if this persists.
+
+At start, every failing suite gets one retry spread over the next `periodic_refresh`, so installing a missing key or fixing pins takes effect without waiting an hour. Refusals keep their schedule.
+
+### Capacity and fairness
+
+`freshness.max_concurrent_adoptions` slots are shared by adoptions, repairs and reconciles, plus one slot per upstream host. Nothing blocks on a slot: a suite that finds none waits in the scheduler's queue and is re-checked as soon as capacity it can use is released (hosts in turn, oldest first); while it waits, no request is made for it. Client requests still trigger checks under the normal cooldown and may take a freed slot first. When there are at least two slots, the last free one is reserved for suites that already serve a signed snapshot, so security updates are not delayed by first adoptions. With the default pool of two, first adoptions therefore run only when no other adoption is running; `max_concurrent_adoptions = 3` lets two run at once (useful for the burst after an upgrade). A repair or reconcile that finds no slot simply runs on a later unchanged check. `POST /reconcile` answers 409 when no slot is free. The gauge `acu_freshness_waiting_for_slot` counts suites waiting for a slot.
+
+Periodic checks run on four workers, at most one check per upstream host at a time, hosts taking turns. On each host, healthy suites go first, then never-checked suites, then suites whose checks keep failing; a failing suite waits 2 minutes, doubling to an hour, between checks. Each check is limited to 2 minutes. Stalling hosts therefore delay a healthy suite on another host by at most ⌈H/4⌉ checks per suite ahead of it, where H is the number of hosts with checks waiting (with four hosts or fewer, one check), and healthy suites on the stalling host itself by about one check per tick once its stalling suites are known to fail — also right after a restart.
 
 ### Trust and signer pins
 

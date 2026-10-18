@@ -42,25 +42,14 @@ Phase A's per-task and final reviews (2026-10-11, Fable max) found these minor i
 
 ## internal/freshness
 
-- **A-28** Stale doc comments on `detectForm` (`freshness.go:514-515`) and `priorAdoptionForm` (`adoption.go:1498-1503`) still say "derived from hash columns".
 - **A-29** `gc_urlpath.go:274-275`: the `AIDEV-TODO(phase E)` sits as an SQL `--` comment inside the query string; move it to a Go comment. (Phase E resolves the TODO itself.)
 - **A-30** (pre-existing) `TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange` emits INFO/WARN lines.
-- **A-31** `adoption.go:86-89`: the sentinel comment encodes a load-bearing invariant but lacks the `AIDEV-NOTE:` prefix.
 - **A-32** `reconcile.go:181-191`: AIDEV-NOTE wording ("unsigned regions") and a >100-column line.
 - **A-33** `clearsignForTest` generates an RSA key per call (slow under `-race`); use an EdDSA config.
 - **A-34** No CRLF-envelope or `Hash:`-header injection case in the reconcile tests (covered structurally; the legacy-audit tests have both).
 - **A-35** `panic_recovery_test.go:213-225`: adopters built without a logger (default-logger noise under `-v`).
-- **A-36** `bumpFailedCheck` (`freshness.go:519-528`) swallows `Get`/`PutSuiteFreshness` errors silently; add a Warn like `checkLocked`'s. (Phase B rewrites this path.)
 - **A-37** Three "log a panic, stack once" implementations (`Checker.reportPanic`, the handler's `atomic.Bool`, heartbeat with none); consider one helper. Heartbeat never logs a stack.
 - **A-38** `panic_recovery_test.go:244-246`: a successful `TryLock` is never unlocked.
-- **A-39** `TestTick_FutureLastSuccessAtIsDue` does not assert the scheduler-path `clockStep` fired (deleting `scheduler.go:118` stays green). (Phase B rewrites the scheduler.)
-- **A-40** The clock-step test does not assert `LastSuccessAt` healed to now.
-- **A-41** No tolerance-edge cases (now+2 fresh, now+3 stale) in `TestStaleSuiteCounts`.
-- **A-42** `acu_clock_steps_detected_total` counts detections, not steps; say so in the docs.
-- **A-43** `clockStep` could live in `clockstep.go` (`freshness.go` is over 1,150 lines).
-- **A-44** Smoke test asserts 358..362 although exactly 360 is safe; tighten to `== 360`.
-- **A-45** `simtest.StaticConditional`'s doc says Body only on 200 but returns it for any status.
-- **A-46** No guard that non-test code never imports `internal/simtest` (which imports `testing`).
 - **A-47** `legacy_audit.go`: `res.Signed++` counts `FormUnsigned` keeps (after phase E re-queues); rename to `Kept` or skip unsigned.
 - **A-48** Doubled "legacy trust audit:" error prefix (`RunLegacyTrustAudit` and `main.go:480`).
 - **A-49** The marker pass silently skips tracked anchors whose pool file is missing or unreadable; add a Debug line.

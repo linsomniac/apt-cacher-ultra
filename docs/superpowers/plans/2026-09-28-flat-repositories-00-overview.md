@@ -101,14 +101,6 @@ Later phases add (named here so phase plans stay consistent):
 
 Each item is owned by the phase it is listed under; that phase's plan addresses it.
 
-**B:**
-
-- The scheduler rewrite recovers panics at the worker and run-loop level. Today a panic in `tick` before the per-suite loop (`ListSuites`, gauges) is unrecovered.
-- Panicked adoptions are recorded in the admin adoption ring and the duration histogram.
-- Scheduler pacing covers the burst after both backward and forward clock steps.
-- The backoff gate applies the C4 clock-step rule to `adoption_fail_*_at`, as the AIDEV-NOTE at the clock-step helper says.
-- `simtest` phase lengths are not exact multiples of the tick interval (same-instant goroutine order is nondeterministic). `startSimChecker`-style helpers register `t.Cleanup(stop)`. `StaticConditional`-style latency fetchers honour `ctx.Done()`.
-
 **D:**
 
 - The one-insert-site convergence for `suite_freshness` must account for the two phase-A insert sites that stamp `last_requested_at`: `CommitAdoption` Step 6 and `PutSuiteFreshness`.
@@ -122,6 +114,10 @@ Each item is owned by the phase it is listed under; that phase's plan addresses 
 - Slot-driven admission (phase B Task 11b): the probe-tree check sets `out.report` on every exit; `isQueuedResult` includes `first_adoption_queued`; first and unsigned requests pass `signedCurrent = false`. The capacity simulation gains the upgrade-burst scenario: 50 never-adopted suites with interest and a trickle of signed changes → first adoptions back to back, signed suites never wait longer than one adoption, each queued suite costs at most two probes. Document `max_concurrent_adoptions = 3` as the knob that lets two first adoptions run during the burst.
 - `checkLockedDetached` (still tests `ReleaseHash != nil`) and `snapshotAnchorHash`'s `Release` case need `Form` dispatch for unsigned.
 - `suite_signed_seen.last_seen_at` is a past-event stamp under C4: a future stamp counts as infinitely old and is healed on the next observation. The anchor pass copies `MAX(last_requested_at, last_fetched_at)` verbatim.
+- The unsigned confirmation gate compares `adoption_fail_first_at`; apply the C4 past-event rule to it there. (Phase B resets a future streak start when it records a failure and clamps `next_retry_at`; no phase-B gate reads `first_at`/`last_at`.)
+- `recordUnknownEnd` treats every `Conditional` error as unknown, extending `check_fail_count` — including 401/403/404/410; E's absent classification must bypass it (reset the streak) for those statuses, or `anchor_absent` suites inherit the hourly scheduler backoff.
+- `planRepair` and `Reconcile` pass `signedCurrent = true` (true in phase B, where every current snapshot is signed); E must pass `snap.Form != FormUnsigned`. First adoptions take a slot only when two are free under the default `max_concurrent_adoptions = 2`; `configuration.md`'s *Capacity and fairness* (phase B) documents this next to eager first adoption.
+- `internal/admin`'s `refusalKeepsCurrent` lists the refusal reasons for which the cache already serves content at least as new as upstream (phase B: `upstream_older`, `rollback_refused`); E's unsigned refusal reasons stay out of it so a stuck suite keeps showing lag.
 
 **F:**
 
