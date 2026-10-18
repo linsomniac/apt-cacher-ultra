@@ -133,6 +133,7 @@ type FreshnessConfig struct {
 
 	// MaxConcurrentAdoptions caps how many SPEC2 §7.5 adoption
 	// goroutines may run at once across the whole cache. SPEC2 §9.3.1.
+	// The same global slots admit repair and reconcile passes (spec C4).
 	// 0 = unlimited; default 2.
 	MaxConcurrentAdoptions int `toml:"max_concurrent_adoptions"`
 }
@@ -169,6 +170,10 @@ type AdoptionConfig struct {
 	// Presence-sensitive: explicit 0 means "operator opted out of the
 	// wall-clock guard" and is preserved through Load.
 	HotPrefetchBudget Duration `toml:"hot_prefetch_budget"`
+
+	// MaxDuration bounds every adoption, repair and reconcile run (spec
+	// C4, C11). Default 30m; at least 1m.
+	MaxDuration Duration `toml:"max_duration"`
 
 	// Architectures is the SPEC6_5 §5.1 per-arch adoption allowlist.
 	// Empty (default) preserves Phase 6 behavior: every Release-listed
@@ -694,6 +699,9 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("adoption", "hot_prefetch_budget") {
 		cfg.Adoption.HotPrefetchBudget.Duration = 5 * time.Minute
 	}
+	if !md.IsDefined("adoption", "max_duration") {
+		cfg.Adoption.MaxDuration.Duration = 30 * time.Minute
+	}
 	// Version-aware retention presence-sensitive defaults:
 	// hold_packages.window = 0 (no grace) is a documented meaningful value
 	// that must survive Defaults(); retention.max_versions_per_package
@@ -969,6 +977,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Adoption.HotPrefetchBudget.Duration < 0 {
 		errs = append(errs, errors.New("adoption.hot_prefetch_budget must not be negative"))
+	}
+	if c.Adoption.MaxDuration.Duration < time.Minute {
+		errs = append(errs, errors.New("adoption.max_duration must be at least 1m"))
 	}
 
 	// SPEC6_5 §5.2: [adoption].architectures shape and cardinality.

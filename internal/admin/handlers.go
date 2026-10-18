@@ -542,7 +542,8 @@ func (s *Server) logRefresherFailure(metricName string, err error, dur time.Dura
 // Params (form body): host (required), suite (required suite_path), scheme
 // (optional, defaults to "https"). Returns:
 //   - 202 Accepted: reconcile triggered asynchronously.
-//   - 409 Conflict: not triggered (busy, suite unknown, or no current snapshot).
+//   - 409 Conflict: not triggered (busy, suite unknown, no current snapshot,
+//     or no free adoption slot).
 //   - 400 Bad Request: host or suite missing.
 //   - 413 Request Entity Too Large: body exceeds 8 KiB.
 //   - 501 Not Implemented: Reconciler not wired in Config.
@@ -577,7 +578,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logger.Info("admin_reconcile_requested", "scheme", scheme, "canonical_host", host, "suite_path", suite)
 	if !s.cfg.Reconciler.Reconcile(r.Context(), scheme, host, suite) {
-		http.Error(w, "reconcile not triggered (busy, unknown, or no current snapshot)\n", http.StatusConflict)
+		http.Error(w, "reconcile not triggered (busy, unknown, no current snapshot, or no free adoption slot)\n", http.StatusConflict)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)

@@ -100,6 +100,10 @@ repair_skipped_members = true
 # Hot-package prefetch budget before publishing a snapshot; 0s removes it.
 # Each individual fetch remains bounded by upstream.total_timeout.
 hot_prefetch_budget   = "5m"
+# Longest an adoption, repair or reconcile may run. An abandoned adoption
+# is retried on the normal schedule, a repair or reconcile on the next
+# unchanged check; the final commit is never cut short.
+max_duration          = "30m"
 
 [integrity]
 # Rehash current-snapshot blobs to detect disk corruption; 0s disables.

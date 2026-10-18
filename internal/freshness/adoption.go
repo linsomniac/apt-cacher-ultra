@@ -35,6 +35,13 @@ import (
 // upstream could still ship pathological content).
 const maxDecompressedPackagesBytes = 256 << 20
 
+// commitTimeout bounds CommitAdoption, which runs detached from the
+// adoption's context (spec C4).
+const commitTimeout = 5 * time.Minute
+
+// defaultMaxAdoptionDuration is adoption.max_duration's default.
+const defaultMaxAdoptionDuration = 30 * time.Minute
+
 // SuiteRef identifies a suite for adoption — the canonical scheme/host
 // (post-Remap) plus the suite path. The freshness checker passes this
 // in already-canonicalized; the Adopter does no further normalization.
@@ -380,7 +387,7 @@ var errAdoptionMemberSkipped = errors.New("adoption_member_skipped")
 
 // AdoptionConfig bundles Adopter dependencies. Required: Cache, Fetcher,
 // Verifier, HostLimiter. Optional: MaxConcurrent (0 = unlimited),
-// MemberFetchTimeout (per-member upstream budget — adopters can run
+// MaxDuration (0 = 30m), MemberFetchTimeout (per-member upstream budget — adopters can run
 // long; we want each member call bounded), Logger.
 type AdoptionConfig struct {
 	Cache       *cache.Cache
@@ -388,9 +395,14 @@ type AdoptionConfig struct {
 	Verifier    Verifier
 	HostLimiter *hostsem.Sem
 
-	// MaxConcurrent caps how many adoption goroutines may run at once
-	// across the whole cache (SPEC2 §9.3.1). Zero means unlimited.
+	// MaxConcurrent is max_concurrent_adoptions: the Checker's global
+	// admission slots for adoption, repair and reconcile (spec C4). Zero
+	// means unlimited.
 	MaxConcurrent int
+
+	// MaxDuration bounds every adoption, repair and reconcile run
+	// (adoption.max_duration, spec C4). Zero means 30m.
+	MaxDuration time.Duration
 
 	// HotPackagesWindow is the SPEC3 §5.2 hot_packages.window. 0
 	// disables hot-package proactive refresh entirely.
@@ -501,10 +513,15 @@ type Adopter struct {
 	verifier Verifier
 	hostSem  *hostsem.Sem
 
-	// concurrencySem bounds the total in-flight adoptions across all
-	// suites. nil channel means "no cap" (MaxConcurrent = 0). Acquired
-	// once at the top of Run, released after success or error.
-	concurrencySem chan struct{}
+	// maxConcurrent and maxDuration configure the Checker's admission and
+	// run deadline (spec C4); the Adopter itself never waits for a slot.
+	maxConcurrent int
+	maxDuration   time.Duration
+
+	// reconcilePendingHook, when set, runs at the start of
+	// reconcilePending. Test seam: a panic in the repair decision must not
+	// wedge the suite mutex.
+	reconcilePendingHook func()
 
 	// hotPackagesWindow + hotPrefetchBudget are the SPEC3 §5.2 keys
 	// the hot-prefetch loop reads. Stored on the Adopter so each
@@ -593,6 +610,9 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 	if cfg.MaxConcurrent < 0 {
 		return nil, fmt.Errorf("freshness: max_concurrent_adoptions must be >= 0, got %d", cfg.MaxConcurrent)
 	}
+	if cfg.MaxDuration < 0 {
+		return nil, fmt.Errorf("freshness: adoption.max_duration must be >= 0, got %s", cfg.MaxDuration)
+	}
 	if cfg.HotPackagesWindow < 0 {
 		return nil, fmt.Errorf("freshness: hot_packages.window must be >= 0, got %s", cfg.HotPackagesWindow)
 	}
@@ -616,9 +636,9 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 	if now == nil {
 		now = wallclock.Now
 	}
-	var sem chan struct{}
-	if cfg.MaxConcurrent > 0 {
-		sem = make(chan struct{}, cfg.MaxConcurrent)
+	maxDur := cfg.MaxDuration
+	if maxDur == 0 {
+		maxDur = defaultMaxAdoptionDuration
 	}
 	maxVersions := cfg.MaxVersionsPerPackage
 	if maxVersions < 1 {
@@ -646,7 +666,8 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		fetcher:                 cfg.Fetcher,
 		verifier:                cfg.Verifier,
 		hostSem:                 cfg.HostLimiter,
-		concurrencySem:          sem,
+		maxConcurrent:           cfg.MaxConcurrent,
+		maxDuration:             maxDur,
 		hotPackagesWindow:       cfg.HotPackagesWindow,
 		hotPrefetchBudget:       cfg.HotPrefetchBudget,
 		maxVersionsPerPackage:   maxVersions,
@@ -839,6 +860,11 @@ type adoptionPayload struct {
 	sigBytes       []byte
 	releaseHash    string // sha256 of releaseBytes (set in step 2)
 	releaseGPGHash string // sha256 of sigBytes (set in step 2)
+
+	// membersDone, when set, runs once the member pipeline (members,
+	// by-hash, hot prefetch) is over and before the commit: the Checker
+	// frees the host slot there (spec C4).
+	membersDone func()
 }
 
 // Run executes the §7.5 adoption flow for an inline (clearsigned
@@ -849,8 +875,8 @@ type adoptionPayload struct {
 //
 // Run is synchronous: callers (typically the freshness Checker)
 // invoke it from a goroutine. The per-suite mutex held by the caller
-// serializes overlapping adoptions on the same suite; the global
-// concurrency cap held inside Run bounds total parallel adoptions.
+// serializes overlapping adoptions on the same suite; admission (global
+// and per-host slots) is the Checker's job.
 func (a *Adopter) Run(ctx context.Context, suite SuiteRef, inRelease []byte, etag, lastmod string) error {
 	return a.runShared(ctx, suite, &adoptionPayload{
 		form:        adoptionFormInline,
@@ -875,6 +901,19 @@ func (a *Adopter) RunDetached(ctx context.Context, suite SuiteRef, releaseBytes,
 	}, etag, lastmod)
 }
 
+// runRequest runs the adoption a check requested. membersDone (may be
+// nil) runs before the commit; see adoptionPayload.membersDone.
+func (a *Adopter) runRequest(ctx context.Context, req *adoptionRequest, membersDone func()) error {
+	p := &adoptionPayload{form: req.form, membersDone: membersDone}
+	switch req.form {
+	case adoptionFormInline:
+		p.inlineBytes = req.bytes
+	case adoptionFormDetached:
+		p.releaseBytes, p.sigBytes = req.releaseBytes, req.sigBytes
+	}
+	return a.runShared(ctx, req.suite, p, req.etag, req.lastmod)
+}
+
 // runShared is the SPEC2 §7.5 adoption pipeline shared across both
 // signature forms. Form-specific dispatch happens at three points:
 //   - Step 1: VerifyInline vs VerifyDetached.
@@ -884,16 +923,6 @@ func (a *Adopter) RunDetached(ctx context.Context, suite SuiteRef, releaseBytes,
 // Steps 3–5 and 7–10 are identical: parse, candidate insert, member
 // prefetch, by-hash, package_hash, atomic flip, success log.
 func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayload, etag, lastmod string) error {
-	// Step 0: global concurrency cap. nil channel skips the gate.
-	if a.concurrencySem != nil {
-		select {
-		case a.concurrencySem <- struct{}{}:
-			defer func() { <-a.concurrencySem }()
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-
 	// Step 0a: capture the prior (current) snapshot. After
 	// CommitAdoption the prior snapshot is no longer current, so the
 	// lookup must happen before any mutation. Step 3a applies apt's Date
@@ -1492,12 +1521,20 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// and CommitAdoption actually committing.
 	a.heartbeat(ctx, suite.CanonicalHost, snapshotID, tracker)
 
-	// Step 11: atomic flip transaction. Pass adoptionCtx as ctx so the
-	// budget-cancelled prefetch loop above never causes CommitAdoption
-	// to fail — the contract is "cancel hot fetches, then flip", not
-	// "cancel hot fetches, then also cancel the flip". coverageComplete
-	// is the SPEC3 §7.5.4 per-snapshot proof for strict mode.
-	if err := a.cache.CommitAdoption(ctx, snapshotID, memberRows, integritySkipped, packageHashes,
+	// Spec C4: the member pipeline is over; free the host slot so the
+	// next suite on this host can start. The global slot stays held
+	// through the commit.
+	if p.membersDone != nil {
+		p.membersDone()
+	}
+
+	// Step 11: atomic flip transaction, under its own bound (spec C4): the
+	// adoption deadline (adoption.max_duration) or a shutdown must not
+	// abort a commit already in progress. coverageComplete is the SPEC3
+	// §7.5.4 per-snapshot proof for strict mode.
+	commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
+	defer cancelCommit()
+	if err := a.cache.CommitAdoption(commitCtx, snapshotID, memberRows, integritySkipped, packageHashes,
 		prefetchedURLPaths, pkgHashRes.coverageComplete); err != nil {
 		a.logger.Warn("adoption: commit failed",
 			"canonical_host", suite.CanonicalHost,

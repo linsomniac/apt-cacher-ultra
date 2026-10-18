@@ -873,6 +873,26 @@ hot_prefetch_budget = "0s"
 	}
 }
 
+// adoption.max_duration (spec C11): default 30m, at least 1m.
+func TestAdoptionMaxDuration_DefaultAndBounds(t *testing.T) {
+	load := func(extra string) (*Config, error) {
+		dir := t.TempDir()
+		return Load(writeTOML(t, dir, "config.toml", "[cache]\ndir = \""+dir+"\"\n"+extra))
+	}
+	cfg, err := load("")
+	if err != nil || cfg.Adoption.MaxDuration.Duration != 30*time.Minute {
+		t.Fatalf("default = %v (err %v), want 30m", cfg.Adoption.MaxDuration.Duration, err)
+	}
+	if cfg, err = load("[adoption]\nmax_duration = \"45m\"\n"); err != nil || cfg.Adoption.MaxDuration.Duration != 45*time.Minute {
+		t.Fatalf("explicit 45m = %v (err %v)", cfg.Adoption.MaxDuration.Duration, err)
+	}
+	for _, bad := range []string{"30s", "0s"} {
+		if _, err := load("[adoption]\nmax_duration = \"" + bad + "\"\n"); err == nil {
+			t.Errorf("max_duration = %s accepted, want a validation error", bad)
+		}
+	}
+}
+
 // TestLoad_RefuseUnvouchedDebsDefault: omitted
 // integrity.refuse_unvouched_debs defaults to false (SPEC3 §1.3 —
 // the default-flip to true is gated on production data).

@@ -995,6 +995,7 @@ func buildAdopter(
 		Verifier:                       verifier,
 		HostLimiter:                    hostLimiter,
 		MaxConcurrent:                  cfg.Freshness.MaxConcurrentAdoptions,
+		MaxDuration:                    cfg.Adoption.MaxDuration.Duration,
 		HotPackagesWindow:              cfg.HotPackages.Window.Duration,
 		HotPrefetchBudget:              cfg.Adoption.HotPrefetchBudget.Duration,
 		MaxVersionsPerPackage:          cfg.Retention.MaxVersionsPerPackage,
@@ -1023,6 +1024,7 @@ func buildAdopter(
 		"repair_skipped_members", cfg.Adoption.RepairSkippedMembers,
 		"required_architectures", cfg.Adoption.RequiredArchitectures,
 		"max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
+		"max_duration", cfg.Adoption.MaxDuration.Duration,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
 	)

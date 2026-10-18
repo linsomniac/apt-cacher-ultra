@@ -58,15 +58,6 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 		return 0, nil
 	}
 
-	if a.concurrencySem != nil {
-		select {
-		case a.concurrencySem <- struct{}{}:
-			defer func() { <-a.concurrencySem }()
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		}
-	}
-
 	var rows []cache.SnapshotMember
 	healedDecl := make([]ReleaseMember, 0, len(missing))
 	for _, m := range missing {
@@ -121,6 +112,33 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 		}
 	}
 	return len(healedDecl), nil
+}
+
+// reconcilePending reports whether ReconcileSnapshot(force=false) would
+// fetch anything. A memoised snapshot costs nothing; otherwise the
+// trust-anchored Release is re-parsed once, and a complete snapshot is
+// memoised so later checks skip it. The Checker asks before it takes an
+// admission slot, inside the check's recover.
+func (a *Adopter) reconcilePending(ctx context.Context, snapshotID int64) (bool, error) {
+	if a.reconcilePendingHook != nil {
+		a.reconcilePendingHook()
+	}
+	if _, done := a.reconciledSnapshots.Load(snapshotID); done {
+		return false, nil
+	}
+	declared, err := a.reparseSnapshotRelease(ctx, snapshotID)
+	if err != nil {
+		return false, err
+	}
+	present, err := a.cache.ListSnapshotMembers(ctx, snapshotID)
+	if err != nil {
+		return false, fmt.Errorf("reconcile: list members: %w", err)
+	}
+	if len(missingRequestableMembers(declared, present, a.architectureAllowlist)) == 0 {
+		a.reconciledSnapshots.Store(snapshotID, struct{}{})
+		return false, nil
+	}
+	return true, nil
 }
 
 // reparseSnapshotRelease loads the snapshot's signed metadata member

@@ -23,10 +23,9 @@ import (
 // skipped member of the suite's snapshot. Invoked by the freshness
 // Checker with the per-suite mutex held (handed off exactly like an
 // adoption goroutine), so it never overlaps an adoption or another
-// repair of the same suite. Across suites, a pass with work to do
-// counts against the same global [adoption].max_concurrent gate as
-// adoptions — per-suite mutexes and per-host limits bound neither the
-// total fan-out of repair fetches nor their cache-write pressure.
+// repair of the same suite. Admission (a global and a host slot) is
+// taken by the Checker before it spawns the repair; this method never
+// waits for one.
 //
 // Per member: the full adoptMember sequence runs — pool reuse, by-hash
 // probe (the content-addressed URL immune to the revision race; the
@@ -62,18 +61,6 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 	}
 	if len(rows) == 0 {
 		return
-	}
-
-	// Global concurrency cap, mirroring runShared Step 0. Acquired
-	// only past the no-op checks so healthy suites' ticks never touch
-	// the gate.
-	if a.concurrencySem != nil {
-		select {
-		case a.concurrencySem <- struct{}{}:
-			defer func() { <-a.concurrencySem }()
-		case <-ctx.Done():
-			return
-		}
 	}
 
 	repaired := 0
@@ -171,4 +158,18 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 		"repaired", repaired,
 		"remaining", len(rows)-repaired,
 	)
+}
+
+// repairPending reports whether the snapshot has integrity-class skip
+// rows a repair pass could heal: one indexed read, so the Checker asks
+// before it takes an admission slot.
+func (a *Adopter) repairPending(ctx context.Context, suite SuiteRef, snapshotID int64) bool {
+	rows, err := a.cache.ListRepairableSkippedMembers(ctx, snapshotID)
+	if err != nil {
+		a.logger.Warn("adoption_repair_list_failed",
+			"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID, "err", err)
+		return false
+	}
+	return len(rows) > 0
 }

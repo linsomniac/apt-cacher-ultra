@@ -185,6 +185,11 @@ type Checker struct {
 	adoptionRing        *observability.Ring
 	gpgReasonClassifier func(error) string
 
+	// admission hands out the global and per-host slots for adoption,
+	// repair and reconcile (spec C4); maxAdoptionDuration bounds each run.
+	admission           *admission
+	maxAdoptionDuration time.Duration
+
 	// adoptionWg tracks in-flight adoption goroutines spawned via
 	// Check. Production graceful shutdown (SPEC2 §9.5 step 5) calls
 	// WaitForAdoptions after cancelling lifetimeCtx; tests use it to
@@ -255,6 +260,10 @@ func New(cfg Config) (*Checker, error) {
 			return aptpath.BuildUpstreamURL(scheme, host, path)
 		}
 	}
+	maxConc, maxDur := 0, defaultMaxAdoptionDuration
+	if cfg.Adopter != nil {
+		maxConc, maxDur = cfg.Adopter.maxConcurrent, cfg.Adopter.maxDuration
+	}
 	return &Checker{
 		cache:               cfg.Cache,
 		fetcher:             cfg.Fetcher,
@@ -270,6 +279,8 @@ func New(cfg Config) (*Checker, error) {
 		lifetimeCtx:         lifeCtx,
 		adoptionRing:        cfg.AdoptionRing,
 		gpgReasonClassifier: cfg.GPGReasonClassifier,
+		admission:           newAdmission(maxConc),
+		maxAdoptionDuration: maxDur,
 	}, nil
 }
 
@@ -306,12 +317,24 @@ type adoptionRequest struct {
 // unchanged at upstream (304 or byte-identical 200) and has a current
 // snapshot — the SPEC6_7 §3 repair window. Re-adoption only fires on
 // "changed", so this is the only signal that can heal a snapshot whose
-// adoption skipped integrity-class members; the goroutine in Check
-// routes it to Adopter.RepairSkippedMembers, which no-ops cheaply when
-// the snapshot has no repairable rows (every healthy suite).
+// adoption skipped integrity-class members; planRepair asks whether
+// anything needs healing (a healthy suite, the steady state, needs
+// nothing) and spawnRepair routes it to Adopter.RepairSkippedMembers
+// and Adopter.ReconcileSnapshot.
 type repairRequest struct {
 	suite      SuiteRef
 	snapshotID int64
+}
+
+// checkOutcome is what one check produces. lease is the admission slot
+// taken for req or for the repair; on a panic checkLockedSafe releases
+// it. needRepair/needReconcile say what the repair goroutine heals.
+type checkOutcome struct {
+	req           *adoptionRequest
+	repair        *repairRequest
+	needRepair    bool
+	needReconcile bool
+	lease         *lease
 }
 
 // Check runs the SPEC §7.2 algorithm for one suite, synchronously. It
@@ -327,6 +350,9 @@ type repairRequest struct {
 // Callers on the request path (T1) should typically invoke Check from a
 // goroutine: the request has already been served by the time T1 fires,
 // so blocking the request goroutine on a slow upstream gains nothing.
+//
+// Before spawning anything it takes an admission slot without waiting
+// (spec C4).
 func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 	key := suiteKey(scheme, host, suitePath)
 	muVal, _ := c.locks.LoadOrStore(key, &sync.Mutex{})
@@ -335,95 +361,49 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		// Another goroutine is on it; SPEC §7.3 says skip.
 		return
 	}
-
-	req, repair, ok := c.checkLockedSafe(ctx, scheme, host, suitePath)
-	if !ok {
+	out, ok := c.checkLockedSafe(ctx, scheme, host, suitePath)
+	switch {
+	case !ok:
 		mu.Unlock()
-		return
-	}
-	if req == nil || c.adopter == nil {
-		// SPEC6_7 §3 + SPEC6_8 §6: an unchanged suite with a current
-		// snapshot gets a repair pass (integrity-skip heal) AND a
-		// reconcile pass (declared-but-absent requestable IndexTarget
-		// heal) in the same goroutine. Both are gated by
-		// repairSkippedMembers so a single config switch covers both.
-		// The reconcile runs even when there are no repairable skip rows
-		// (its own memo short-circuits on a healthy snapshot cheaply).
-		//
-		// AIDEV-NOTE: this goroutine heals two classes of degradation on
-		// the same CONFIRMED-unchanged-tick signal (repair != nil, built by
-		// repairIfUnchanged only on a 304 / byte-identical-200 result with a
-		// current snapshot — NOT on a cooldown skip or upstream failure):
-		//   1. RepairSkippedMembers: integrity-class skip rows left by
-		//      a stale-mirror adoption (SPEC6_7 §3).
-		//   2. ReconcileSnapshot: requestable IndexTargets declared in the
-		//      snapshot's InRelease but absent from snapshot_member rows —
-		//      e.g. binary-all that was 4xx-skipped during adoption and
-		//      was later served by the mirror (SPEC6_8 §6).
-		// Gating reconcile on repair != nil (rather than "has a current
-		// snapshot") keeps it inside the freshness cooldown: a
-		// persistently-degraded suite whose member can't be healed must not
-		// re-parse + re-fetch on every client metadata request. repair's
-		// suite/snapshotID ARE the current snapshot (repairIfUnchanged
-		// requires CurrentSnapshotID != nil). Mutex handoff (mu.Unlock via
-		// defer) and adoptionWg mirror the adoption goroutine below;
-		// WaitForAdoptions drains both.
-		//
-		// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock,
-		// recover (first). See recoverGoroutine.
-		if repair != nil && c.adopter != nil && c.adopter.repairSkippedMembers {
-			c.adoptionWg.Add(1)
-			go func() {
-				defer c.adoptionWg.Done()
-				defer mu.Unlock()
-				defer c.recoverGoroutine("repair", repair.suite)
-				c.adopter.RepairSkippedMembers(c.lifetimeCtx, repair.suite, repair.snapshotID)
-				// ReconcileSnapshot leaves logging to its caller; log like
-				// the on-demand path (Reconcile) so a fail-closed anchor
-				// (R-1 decode error) is visible, not a silent non-heal.
-				if _, err := c.adopter.ReconcileSnapshot(c.lifetimeCtx, repair.suite, repair.snapshotID, false); err != nil {
-					c.logger.Warn("adoption_reconcile_failed",
-						"canonical_host", repair.suite.CanonicalHost, "suite_path", repair.suite.SuitePath,
-						"snapshot_id", repair.snapshotID, "err", err)
-				}
-			}()
-			return
-		}
+	case out.lease != nil && out.req != nil:
+		c.spawnAdoption(mu, out.req, out.lease)
+	case out.lease != nil && out.repair != nil:
+		c.spawnRepair(mu, out)
+	default:
 		mu.Unlock()
-		return
 	}
+}
 
-	// Hand off mutex to the adoption goroutine. The goroutine runs
-	// against c.lifetimeCtx (the lifecycle ctx — possibly different
-	// from the request ctx that triggered T1) so a request closing
-	// before adoption finishes does not abort the adoption.
-	//
-	// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock,
-	// recoverAdoption (first). The failure record is written before the
-	// mutex is released on both the error path and the panic path, so the
-	// next check (T1 or T2) already sees it (spec C7).
+// spawnAdoption hands the suite mutex and the admission lease to the
+// adoption goroutine, which runs against the lifetime context bounded by
+// adoption.max_duration (a request closing must not abort it).
+//
+// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, lease
+// release, recoverAdoption (first). The failure record is written before
+// the mutex is released on both the error and the panic path (spec C7).
+// The host slot is freed earlier, when the member pipeline ends.
+func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) {
 	c.adoptionWg.Add(1)
 	go func() {
 		defer c.adoptionWg.Done()
 		defer mu.Unlock()
+		defer l.release()
 		// SPEC5 §10.4.3 / §9.7.7: time the adoption from goroutine
-		// entry, not from inside Run/RunDetached, so the duration
-		// reflects what the operator observes (queueing + run).
-		// AIDEV-NOTE: duration uses monotonic time.Now/time.Since, not
-		// c.now() (wallclock.Now has no monotonic reading) — a wall-clock
-		// step mid-adoption would otherwise feed a negative duration into
-		// acu_adoption_duration_seconds.
+		// entry, not from inside runShared, so the duration reflects what
+		// the operator observes.
+		// AIDEV-NOTE: monotonic time.Now/time.Since, never c.now(): a
+		// wall-clock step mid-adoption must not produce a negative duration
+		// in acu_adoption_duration_seconds.
 		start := time.Now()
 		defer c.recoverAdoption(req, start)
-		var err error
-		switch req.form {
-		case adoptionFormInline:
-			err = c.adopter.Run(c.lifetimeCtx, req.suite, req.bytes, req.etag, req.lastmod)
-		case adoptionFormDetached:
-			err = c.adopter.RunDetached(c.lifetimeCtx, req.suite, req.releaseBytes, req.sigBytes, req.etag, req.lastmod)
-		}
+		actx, cancel := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
+		defer cancel()
+		err := c.adopter.runRequest(actx, req, l.releaseHost)
 		duration := time.Since(start)
 		outcome := classifyAdoptionOutcome(err)
+		if err != nil && errors.Is(actx.Err(), context.DeadlineExceeded) && c.lifetimeCtx.Err() == nil {
+			outcome = "timed_out" // a member fetch reports the deadline as its own failure
+		}
 		reason := classifyAdoptionReason(err, outcome, c.gpgReasonClassifier)
 		adoptionTotal.Inc(outcome, req.suite.CanonicalHost)
 		adoptionDurationSeconds.Observe(duration.Seconds(), outcome, req.suite.CanonicalHost)
@@ -460,6 +440,95 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 				"err", err,
 			)
 			c.recordAdoptionFailure(req, reason)
+		}
+	}()
+}
+
+// planRepair decides whether an unchanged suite has anything to heal
+// (SPEC6_7 §3 repair, SPEC6_8 §6 reconcile) and, if so, takes an
+// admission slot for it. It runs inside checkLockedSafe's recover: a
+// panic here is a failed check that releases the mutex and the lease.
+//
+// AIDEV-NOTE: deliberate deviation from spec C4's "TryAcquire before
+// spawning": the cheap "anything to do?" checks run first, so healthy
+// suites (the steady state) never compete with adoptions for slots. The
+// slot is still taken without waiting and before spawning.
+func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
+	rp := out.repair
+	if c.adopter == nil || !c.adopter.repairSkippedMembers {
+		out.repair = nil
+		return
+	}
+	out.needRepair = c.adopter.repairPending(ctx, rp.suite, rp.snapshotID)
+	needReconcile, err := c.adopter.reconcilePending(ctx, rp.snapshotID)
+	if err != nil {
+		// A fail-closed anchor (R-1 decode error) must be visible, not a
+		// silent non-heal.
+		c.logger.Warn("adoption_reconcile_failed",
+			"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
+			"snapshot_id", rp.snapshotID, "err", err)
+	}
+	out.needReconcile = needReconcile
+	if !out.needRepair && !out.needReconcile {
+		out.repair = nil
+		return
+	}
+	l, ok := c.admission.tryAcquire(rp.suite.CanonicalHost, true)
+	if !ok {
+		c.logger.Debug("freshness: repair deferred, no adoption slot",
+			"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath)
+		out.repair = nil
+		return
+	}
+	out.lease = l
+}
+
+// spawnRepair hands the suite mutex and the admission lease to the heal
+// goroutine planRepair decided on.
+//
+// AIDEV-NOTE: this goroutine heals two classes of degradation on the
+// same CONFIRMED-unchanged-tick signal (out.repair, built by
+// repairIfUnchanged only on a 304 / byte-identical-200 result with a
+// current snapshot — NOT on a cooldown skip or upstream failure):
+//  1. RepairSkippedMembers: integrity-class skip rows left by a
+//     stale-mirror adoption (SPEC6_7 §3).
+//  2. ReconcileSnapshot: requestable IndexTargets declared in the
+//     snapshot's InRelease but absent from snapshot_member rows — e.g.
+//     binary-all that was 4xx-skipped during adoption and was later
+//     served by the mirror (SPEC6_8 §6).
+//
+// Both are gated by repairSkippedMembers (one config switch). Gating
+// reconcile on the unchanged signal (rather than "has a current
+// snapshot") keeps it inside the freshness cooldown: a
+// persistently-degraded suite whose member can't be healed must not
+// re-parse + re-fetch on every client metadata request. The repair's
+// suite/snapshotID ARE the current snapshot. Mutex handoff and
+// adoptionWg mirror spawnAdoption; WaitForAdoptions drains both.
+//
+// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, lease
+// release, recover (first). See recoverGoroutine.
+func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
+	rp, l, needRepair, needReconcile := out.repair, out.lease, out.needRepair, out.needReconcile
+	c.adoptionWg.Add(1)
+	go func() {
+		defer c.adoptionWg.Done()
+		defer mu.Unlock()
+		defer l.release()
+		defer c.recoverGoroutine("repair", rp.suite)
+		rctx, cancel := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
+		defer cancel()
+		if needRepair {
+			c.adopter.RepairSkippedMembers(rctx, rp.suite, rp.snapshotID)
+		}
+		if needReconcile {
+			// ReconcileSnapshot leaves logging to its caller; log like the
+			// on-demand path (Reconcile) so a fail-closed anchor (R-1
+			// decode error) is visible, not a silent non-heal.
+			if _, err := c.adopter.ReconcileSnapshot(rctx, rp.suite, rp.snapshotID, false); err != nil {
+				c.logger.Warn("adoption_reconcile_failed",
+					"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
+					"snapshot_id", rp.snapshotID, "err", err)
+			}
 		}
 	}()
 }
@@ -541,24 +610,27 @@ func (c *Checker) recoverGoroutine(where string, suite SuiteRef) {
 
 // checkLockedSafe runs checkLocked and converts a panic into a FAILED
 // check (spec C4): logged, and last_check_at bumped like any failed check
-// so the cooldown gates the next T1/T2 trigger. The caller releases the
+// so the cooldown gates the next T1/T2 trigger. An admission lease the
+// check took before panicking is released here; the caller releases the
 // suite mutex.
 //
 // AIDEV-NOTE: nothing in Check between TryLock and this call, or between
 // it and the goroutine hand-off, may panic: checkRecovered (scheduler)
 // and the T1 recover cannot release a mutex they do not know about.
-func (c *Checker) checkLockedSafe(ctx context.Context, scheme, host, suitePath string) (req *adoptionRequest, repair *repairRequest, ok bool) {
+func (c *Checker) checkLockedSafe(ctx context.Context, scheme, host, suitePath string) (out *checkOutcome, ok bool) {
+	out = &checkOutcome{}
 	defer func() {
 		if r := recover(); r != nil {
+			out.lease.release()
 			c.reportPanic("freshness_check_panicked", "check",
 				SuiteRef{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}, r)
 			c.bumpFailedCheck(ctx, scheme, host, suitePath)
 			freshnessCheckTotal.Inc("failed", host)
-			req, repair, ok = nil, nil, false
+			out, ok = nil, false
 		}
 	}()
-	req, repair = c.checkLocked(ctx, scheme, host, suitePath)
-	return req, repair, true
+	c.checkLocked(ctx, out, scheme, host, suitePath)
+	return out, true
 }
 
 // bumpFailedCheck mirrors checkLocked's failure bookkeeping
@@ -619,9 +691,11 @@ func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64,
 }
 
 // checkLocked is the body of Check, run with the per-suite mutex held.
-// Returns a non-nil *adoptionRequest iff the observed result is "changed"
-// AND the caller has an Adopter wired in (Phase 2 path); the caller
-// uses this signal to spawn the adoption goroutine.
+// It fills out: out.req is non-nil iff the observed result is "changed",
+// the caller has an Adopter wired in (Phase 2 path) AND an admission slot
+// was free (out.lease); the caller uses this signal to spawn the adoption
+// goroutine. On a confirmed-unchanged result planRepair sets out.repair
+// and out.lease when there is something to heal and a slot was free.
 //
 // Form dispatch (SPEC2 §7.6.3):
 //   - If the suite has a current snapshot, the form is read from the
@@ -648,6 +722,9 @@ func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64,
 //   - 200, body hash differs: bump last_check_at, last_success_at,
 //     stamp inrelease_change_seen_at on first sighting only, return
 //     *adoptionRequest.
+//   - Same, but no admission slot is free (spec C4): "changed_queued",
+//     no request, last_success_at left at its previous value so the
+//     scheduler retries the suite on its next turn.
 //   - Spec C7 gate (retryGateFor, adopter wired only): while a failure
 //     record exists and next_retry_at has not come, the GET carries the
 //     failing content's validators, and a 304 or the same content key
@@ -662,7 +739,7 @@ func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64,
 // freshness check after a successful adoption would observe "changed"
 // against the stale url_path.blob_hash and thrash the adoption
 // candidate-uniqueness constraint forever.
-func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath string) (*adoptionRequest, *repairRequest) {
+func (c *Checker) checkLocked(ctx context.Context, out *checkOutcome, scheme, host, suitePath string) {
 	now := c.now()
 	nowUnix := now.Unix()
 
@@ -680,7 +757,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 			"canonical_host", host,
 			"suite_path", suitePath,
 		)
-		return nil, nil
+		return
 	}
 
 	// Cooldown gate. Spec C4 clock-step rule: a past-event stamp found in
@@ -692,7 +769,7 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 		if last.After(now.Add(clockStepTolerance)) {
 			c.clockStep("last_check_at", scheme, host, suitePath, *cur.LastCheckAt, now)
 		} else if now.Sub(last) < c.cooldown {
-			return nil, nil
+			return
 		}
 	}
 
@@ -706,15 +783,18 @@ func (c *Checker) checkLocked(ctx context.Context, scheme, host, suitePath strin
 	// determined by which hash columns it has set. Otherwise default
 	// to inline; the inline path triggers a detached fallback on 404.
 	form := c.detectForm(ctx, cur)
-
 	if form == adoptionFormDetached {
-		return c.checkLockedDetached(ctx, cur, suite, now, nowUnix)
+		out.req, out.repair = c.checkLockedDetached(ctx, out, cur, suite, now, nowUnix)
+	} else {
+		req, repair, fellBack := c.checkLockedInline(ctx, out, cur, suite, now, nowUnix)
+		if fellBack {
+			req, repair = c.checkLockedDetached(ctx, out, cur, suite, now, nowUnix)
+		}
+		out.req, out.repair = req, repair
 	}
-	req, repair, fellBack := c.checkLockedInline(ctx, cur, suite, now, nowUnix)
-	if !fellBack {
-		return req, repair
+	if out.req == nil && out.repair != nil {
+		c.planRepair(ctx, out)
 	}
-	return c.checkLockedDetached(ctx, cur, suite, now, nowUnix)
 }
 
 // detectForm reads the suite's current snapshot (if any) and returns
@@ -750,7 +830,7 @@ func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) ado
 // The body of this function is the SPEC §7.2 inline algorithm; it has
 // been factored out of checkLocked to give detached mode (SPEC2 §7.6.3)
 // a parallel implementation. Mutates *cur in the non-fallback paths.
-func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest, bool) {
+func (c *Checker) checkLockedInline(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest, bool) {
 	scheme, host, suitePath := suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath
 
 	// Locate the InRelease url_path row to get the upstream URL plus
@@ -803,18 +883,21 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 	// branch, every freshness check after a successful adoption sees
 	// the stale url_path hash and reports "changed" forever.
 	var cachedHash string
+	signedCurrent := false
 	if cur.CurrentSnapshotID != nil {
 		snap, serr := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
-		switch {
-		case serr == nil && snap.Form == cache.FormInline && snap.SingleAnchorHash != nil:
-			cachedHash = *snap.SingleAnchorHash
-		case serr != nil:
+		if serr != nil {
 			c.logger.Warn("freshness: snapshot lookup failed; falling back to url_path",
 				"err", serr,
 				"snapshot_id", *cur.CurrentSnapshotID,
 				"canonical_host", host,
 				"suite_path", suitePath,
 			)
+		} else {
+			signedCurrent = snap.Form == cache.FormInline || snap.Form == cache.FormDetached
+			if snap.Form == cache.FormInline && snap.SingleAnchorHash != nil {
+				cachedHash = *snap.SingleAnchorHash
+			}
 		}
 	}
 	if cachedHash == "" {
@@ -890,6 +973,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 		return nil, nil, false
 	}
 
+	prevSuccess := cur.LastSuccessAt
 	cur.LastCheckAt = &nowUnix
 	cur.LastSuccessAt = &nowUnix
 
@@ -961,6 +1045,18 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 				etag:    res.ETag,
 				lastmod: res.LastModified,
 			}
+			if c.adopter != nil {
+				l, ok := c.admission.tryAcquire(host, signedCurrent)
+				if !ok {
+					// Spec C4: no slot — spawn nothing and keep
+					// last_success_at, so the scheduler retries this suite on
+					// its next turn (admission rotates through queued suites).
+					result, req = "changed_queued", nil
+					cur.LastSuccessAt = prevSuccess
+				} else {
+					out.lease = l
+				}
+			}
 		}
 	default:
 		// fetch.Conditional should only ever return 200 or 304 in the
@@ -1017,7 +1113,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 //   - On observed change, fetch Release.gpg in a second call so the
 //     Adopter can verify the detached signature.
 //   - The adoptionRequest carries form=detached + both bodies.
-func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest) {
+func (c *Checker) checkLockedDetached(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest) {
 	scheme, host, suitePath := suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath
 
 	releasePath := suitePath + releaseFilename
@@ -1073,18 +1169,21 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 	// landed; pre-adoption (or post-eviction) we fall back to
 	// url_path.blob_hash.
 	var cachedHash string
+	signedCurrent := false
 	if cur.CurrentSnapshotID != nil {
 		snap, serr := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
-		switch {
-		case serr == nil && snap.ReleaseHash != nil:
-			cachedHash = *snap.ReleaseHash
-		case serr != nil:
+		if serr != nil {
 			c.logger.Warn("freshness: snapshot lookup failed; falling back to url_path",
 				"err", serr,
 				"snapshot_id", *cur.CurrentSnapshotID,
 				"canonical_host", host,
 				"suite_path", suitePath,
 			)
+		} else {
+			signedCurrent = snap.Form == cache.FormInline || snap.Form == cache.FormDetached
+			if snap.ReleaseHash != nil {
+				cachedHash = *snap.ReleaseHash
+			}
 		}
 	}
 	if cachedHash == "" {
@@ -1138,6 +1237,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 		return nil, nil
 	}
 
+	prevSuccess := cur.LastSuccessAt
 	cur.LastCheckAt = &nowUnix
 	cur.LastSuccessAt = &nowUnix
 
@@ -1216,6 +1316,18 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 			sigBytes:     gpgRes.Body,
 			etag:         res.ETag,
 			lastmod:      res.LastModified,
+		}
+		if c.adopter != nil {
+			l, ok := c.admission.tryAcquire(host, signedCurrent)
+			if !ok {
+				// Spec C4: no slot — spawn nothing and keep
+				// last_success_at, so the scheduler retries this suite on
+				// its next turn (admission rotates through queued suites).
+				result, req = "changed_queued", nil
+				cur.LastSuccessAt = prevSuccess
+			} else {
+				out.lease = l
+			}
 		}
 	default:
 		c.logger.Error("freshness: unexpected success status",
@@ -1486,8 +1598,10 @@ func setChangeSeen(cur *cache.SuiteFreshness, now int64) {
 // Reconcile forces an in-place reconcile of one suite's current snapshot
 // (SPEC6_8 on-demand recovery). Returns true if a reconcile was triggered;
 // false if the suite is unknown / has no current snapshot (no lock allocated)
-// or another check holds the suite lock. The reconcile runs the full
-// trust-validated heal asynchronously — callers watch adoption_snapshot_reconciled.
+// or another check holds the suite lock. It also returns false when no
+// admission slot is free (spec C4: POST /reconcile then answers 409). The
+// reconcile runs the full trust-validated heal asynchronously — callers
+// watch adoption_snapshot_reconciled.
 //
 // AIDEV-NOTE: validate-before-LoadOrStore ordering is the SPEC6_8 lock-growth
 // mitigation. GetSuiteFreshness is called FIRST; if the suite is unknown or
@@ -1517,14 +1631,22 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 	if !mu.TryLock() {
 		return false
 	}
-	// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock,
-	// recover (first). See recoverGoroutine.
+	l, ok := c.admission.tryAcquire(host, true)
+	if !ok {
+		mu.Unlock()
+		return false // POST /reconcile answers 409 (spec C4)
+	}
+	// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, lease
+	// release, recover (first). See recoverGoroutine.
 	c.adoptionWg.Add(1)
 	go func() {
 		defer c.adoptionWg.Done()
 		defer mu.Unlock()
+		defer l.release()
 		defer c.recoverGoroutine("reconcile", suite)
-		if _, err := c.adopter.ReconcileSnapshot(c.lifetimeCtx, suite, snapID, true); err != nil {
+		rctx, cancel := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
+		defer cancel()
+		if _, err := c.adopter.ReconcileSnapshot(rctx, suite, snapID, true); err != nil {
 			c.logger.Warn("adoption_reconcile_failed",
 				"canonical_host", host, "suite_path", suitePath,
 				"snapshot_id", snapID, "err", err)
