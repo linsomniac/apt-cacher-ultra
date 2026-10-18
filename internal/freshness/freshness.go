@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	mrand "math/rand/v2"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -74,6 +75,11 @@ type Cache interface {
 	// freshness recovery (SPEC2 §7.4). See checkLockedInline's
 	// missing-anchor recovery branch.
 	PutURLPath(ctx context.Context, u cache.URLPath) error
+	// Adoption failure record (spec C7). UPDATE-only on existing rows.
+	RecordAdoptionFailure(ctx context.Context, scheme, host, suitePath string, f cache.AdoptionFailure) error
+	ClearAdoptionFailure(ctx context.Context, scheme, host, suitePath string) error
+	SetAdoptionNextRetry(ctx context.Context, scheme, host, suitePath string, next int64) error
+	RescheduleFailingAdoptions(ctx context.Context, now int64, offset func() int64) (int, error)
 }
 
 // Fetcher is the subset of *fetch.Client the freshness checker uses.
@@ -146,6 +152,10 @@ type Config struct {
 	// monotonic reading and tests step it); use time.Now / time.Since.
 	now func() time.Time
 
+	// rand returns a uniform value in [0, 1) for retry jitter and the
+	// restart spread (spec C7). Test seam; production uses math/rand/v2.
+	rand func() float64
+
 	// urlReconstruct rebuilds the upstream URL for a metadata anchor
 	// (InRelease/Release/Release.gpg) when its url_path row has been
 	// reaped but the suite still has a current snapshot (SPEC2 §7.4
@@ -168,6 +178,7 @@ type Checker struct {
 	maxBody             int64
 	logger              *slog.Logger
 	now                 func() time.Time
+	rand                func() float64
 	urlReconstruct      func(scheme, host, path string) string
 	adopter             *Adopter
 	lifetimeCtx         context.Context
@@ -230,6 +241,10 @@ func New(cfg Config) (*Checker, error) {
 	if now == nil {
 		now = wallclock.Now
 	}
+	rnd := cfg.rand
+	if rnd == nil {
+		rnd = mrand.Float64
+	}
 	lifeCtx := cfg.LifetimeCtx
 	if lifeCtx == nil {
 		lifeCtx = context.Background()
@@ -249,6 +264,7 @@ func New(cfg Config) (*Checker, error) {
 		maxBody:             maxBody,
 		logger:              logger,
 		now:                 now,
+		rand:                rnd,
 		urlReconstruct:      reconstruct,
 		adopter:             cfg.Adopter,
 		lifetimeCtx:         lifeCtx,
@@ -280,6 +296,10 @@ type adoptionRequest struct {
 	// suite_snapshot's inrelease_etag / inrelease_lastmod columns.
 	etag    string
 	lastmod string
+
+	// key is the spec C7 content key of the bytes this request carries;
+	// a failure is recorded under it.
+	key string
 }
 
 // repairRequest is what checkLocked emits when the suite is CONFIRMED
@@ -378,12 +398,14 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 	// from the request ctx that triggered T1) so a request closing
 	// before adoption finishes does not abort the adoption.
 	//
-	// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, recover (first). See recoverGoroutine.
+	// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock,
+	// recoverAdoption (first). The failure record is written before the
+	// mutex is released on both the error path and the panic path, so the
+	// next check (T1 or T2) already sees it (spec C7).
 	c.adoptionWg.Add(1)
 	go func() {
 		defer c.adoptionWg.Done()
 		defer mu.Unlock()
-		defer c.recoverGoroutine("adoption", req.suite)
 		// SPEC5 §10.4.3 / §9.7.7: time the adoption from goroutine
 		// entry, not from inside Run/RunDetached, so the duration
 		// reflects what the operator observes (queueing + run).
@@ -392,6 +414,7 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 		// step mid-adoption would otherwise feed a negative duration into
 		// acu_adoption_duration_seconds.
 		start := time.Now()
+		defer c.recoverAdoption(req, start)
 		var err error
 		switch req.form {
 		case adoptionFormInline:
@@ -436,6 +459,7 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 				"form", formName(req.form),
 				"err", err,
 			)
+			c.recordAdoptionFailure(req, reason)
 		}
 	}()
 }
@@ -470,25 +494,24 @@ func (c *Checker) reportPanic(event, where string, suite SuiteRef, r any) {
 	c.logger.Error(event, attrs...)
 }
 
-// recoverGoroutine is deferred by the adoption, repair and on-demand
-// reconcile goroutines as their LAST defer, so it runs first: the panic
-// is logged while the suite mutex is still held, then the goroutine's
-// other defers release the mutex and the WaitGroup.
+// recoverGoroutine is deferred by the repair and on-demand reconcile
+// goroutines as their LAST defer, so it runs first: the panic is logged
+// while the suite mutex is still held, then the goroutine's other defers
+// release the mutex and the WaitGroup. The adoption goroutine defers
+// recoverAdoption instead, which also counts and records the failure.
 //
 // AIDEV-NOTE: recover() works only because this method IS the deferred
 // function (`defer c.recoverGoroutine(...)`). Wrapping it in a closure
 // (`defer func() { c.recoverGoroutine(...) }()`) makes recover() return
-// nil and the panic kills the daemon. Phase B records ErrAdoptionPanicked
-// as an adoption failure here, before the mutex is released (spec C5).
+// nil and the panic kills the daemon. An adoption panic is recorded as an
+// adoption failure by recoverAdoption, before the mutex is released
+// (spec C5).
 func (c *Checker) recoverGoroutine(where string, suite SuiteRef) {
 	r := recover()
 	if r == nil {
 		return
 	}
 	c.reportPanic("adoption_panicked", where, suite, r)
-	if where == "adoption" {
-		adoptionTotal.Inc("panicked", suite.CanonicalHost)
-	}
 }
 
 // checkLockedSafe runs checkLocked and converts a panic into a FAILED
@@ -902,6 +925,7 @@ func (c *Checker) checkLockedInline(ctx context.Context, cur *cache.SuiteFreshne
 				bytes:   res.Body,
 				etag:    res.ETag,
 				lastmod: res.LastModified,
+				key:     newHash,
 			}
 		}
 	default:
@@ -1145,6 +1169,7 @@ func (c *Checker) checkLockedDetached(ctx context.Context, cur *cache.SuiteFresh
 					sigBytes:     gpgRes.Body,
 					etag:         res.ETag,
 					lastmod:      res.LastModified,
+					key:          contentKey(adoptionFormDetached, nil, res.Body, gpgRes.Body),
 				}
 			}
 		}

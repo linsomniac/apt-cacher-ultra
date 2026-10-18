@@ -1,0 +1,171 @@
+package freshness
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+)
+
+// Spec C7: a failed adoption records its content key, reason, streak,
+// next retry and the failing content's validators.
+func TestAdoptionFailure_RecordsKeyReasonScheduleAndValidators(t *testing.T) {
+	r := newRetryRig(t, 0)
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	r.check()
+	if r.ver.calls() != 1 {
+		t.Fatalf("verifier calls = %d, want 1", r.ver.calls())
+	}
+	if sent := r.up.etagsSent(rigAnchorURL); len(sent) != 1 || sent[0] != "" {
+		t.Fatalf("validators sent = %q, want one request without validators", sent)
+	}
+
+	row := r.row()
+	now := r.clock.now().Unix()
+	if row.AdoptionFailCount != 1 || strOf(row.AdoptionFailReason) != "gpg_failed" || strOf(row.AdoptionFailHash) != hashOf(bad) {
+		t.Fatalf("record = count %d reason %q hash %q", row.AdoptionFailCount, strOf(row.AdoptionFailReason), strOf(row.AdoptionFailHash))
+	}
+	if strOf(row.AdoptionFailETag) != rigETag(bad) {
+		t.Fatalf("failing validators = %q, want %q", strOf(row.AdoptionFailETag), rigETag(bad))
+	}
+	if i64Of(row.AdoptionNextRetryAt) != now+int64(2*time.Minute/time.Second) {
+		t.Fatalf("next retry = %d, want now+120 (no jitter at rand 0.5)", i64Of(row.AdoptionNextRetryAt))
+	}
+	if i64Of(row.AdoptionFailFirstAt) != now || i64Of(row.AdoptionFailLastAt) != now {
+		t.Fatalf("first/last = %d/%d, want %d", i64Of(row.AdoptionFailFirstAt), i64Of(row.AdoptionFailLastAt), now)
+	}
+	ev := r.events("adoption_deferred")
+	if len(ev) != 1 || ev[0]["reason"] != "gpg_failed" || ev[0]["fail_count"] != float64(1) || ev[0]["refusal"] != false {
+		t.Fatalf("adoption_deferred = %v", ev)
+	}
+}
+
+// The streak and its start survive new failures; the persistent warning
+// fires at 3, 6, 12, ... only.
+func TestAdoptionFailure_StreakAndPersistentWarnings(t *testing.T) {
+	r := newRetryRig(t, 0)
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	first := r.clock.now().Unix()
+	for i := 0; i < 6; i++ {
+		r.check()
+		r.clock.advance(2 * time.Hour) // past any next_retry_at
+	}
+	row := r.row()
+	if row.AdoptionFailCount != 6 || i64Of(row.AdoptionFailFirstAt) != first {
+		t.Fatalf("count %d first %d, want 6 and %d", row.AdoptionFailCount, i64Of(row.AdoptionFailFirstAt), first)
+	}
+	var counts []float64
+	for _, e := range r.events("adoption_failing_persistently") {
+		counts = append(counts, e["fail_count"].(float64))
+	}
+	if len(counts) != 2 || counts[0] != 3 || counts[1] != 6 {
+		t.Fatalf("persistent warnings at %v, want [3 6]", counts)
+	}
+	if n := len(r.events("adoption_deferred")); n != 1 {
+		t.Fatalf("adoption_deferred lines = %d, want 1 (state transitions only)", n)
+	}
+}
+
+// Past-event rule (spec C4): a streak start in the future (backward
+// clock step) is infinitely old, so the next failure restarts its stamp
+// instead of reporting "failing 0m" until the clock catches up.
+func TestAdoptionFailure_FutureStreakStartIsReset(t *testing.T) {
+	r := newRetryRig(t, 0)
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	now := r.clock.now().Unix()
+	if err := r.cache.RecordAdoptionFailure(context.Background(), "http", rigHost, rigSuite, cache.AdoptionFailure{
+		Hash: hashOf(bad), Reason: "gpg_failed", Count: 2, FirstAt: now + 86400, LastAt: now + 86400, NextRetryAt: now - 1}); err != nil {
+		t.Fatal(err)
+	}
+	r.check()
+	if row := r.row(); row.AdoptionFailCount != 3 || i64Of(row.AdoptionFailFirstAt) != now {
+		t.Fatalf("count %d first %d, want 3 and %d", row.AdoptionFailCount, i64Of(row.AdoptionFailFirstAt), now)
+	}
+}
+
+func TestIsPersistentMilestone(t *testing.T) {
+	for n := int64(0); n <= 100; n++ {
+		want := n == 3 || n == 6 || n == 12 || n == 24 || n == 48 || n == 96
+		if got := isPersistentMilestone(n); got != want {
+			t.Errorf("isPersistentMilestone(%d) = %v, want %v", n, got, want)
+		}
+	}
+}
+
+// Spec C7: a shutdown context cancellation is not recorded.
+func TestAdoptionFailure_ShutdownIsNotRecorded(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.ver.blockNext()
+	r.up.set(r.release("slow", 0))
+	go r.checker.Check(context.Background(), "http", rigHost, rigSuite)
+	<-r.ver.entered
+	r.cancelLifetime()
+	r.checker.WaitForAdoptions()
+	if row := r.row(); row.AdoptionFailCount != 0 {
+		t.Fatalf("shutdown recorded a failure: %+v", row)
+	}
+	if n := len(r.events("adoption_failure_record_failed")); n != 0 {
+		t.Fatalf("shutdown logged %d adoption_failure_record_failed lines, want 0", n)
+	}
+}
+
+// Spec C5 I-1 + C7: a panicking adoption is a recorded failure with
+// reason panic, shown in the ring, and the suite mutex is released.
+func TestAdoptionFailure_PanicIsRecorded(t *testing.T) {
+	r := newRetryRig(t, 0)
+	boom := r.release("boom", 0)
+	r.ver.panicOn(hashOf(boom))
+	r.up.set(boom)
+	r.check()
+	if row := r.row(); row.AdoptionFailCount != 1 || strOf(row.AdoptionFailReason) != cache.ReasonPanic {
+		t.Fatalf("record = %d %q, want 1 %q", row.AdoptionFailCount, strOf(row.AdoptionFailReason), cache.ReasonPanic)
+	}
+	evs := r.ring.Snapshot()
+	if len(evs) == 0 || evs[len(evs)-1].Outcome != "panicked" || evs[len(evs)-1].Reason != cache.ReasonPanic {
+		t.Fatalf("ring = %+v, want a panicked event", evs)
+	}
+	v, _ := r.checker.locks.Load(suiteKey("http", rigHost, rigSuite))
+	mu := v.(*sync.Mutex)
+	if !mu.TryLock() {
+		t.Fatal("suite mutex still held after a panic")
+	}
+	mu.Unlock()
+}
+
+// Refusals use the record and schedule but are not failures: logged as
+// adoption_refused and never as adoption_failing_persistently.
+func TestAdoptionFailure_RefusalIsNotAFailure(t *testing.T) {
+	r := newRetryRig(t, 0)
+	d2 := r.clock.now().Add(-time.Hour).Unix()
+	r.up.set(r.release("v2", d2))
+	r.check()
+	if r.row().CurrentSnapshotID == nil {
+		t.Fatal("setup: v2 not adopted")
+	}
+	r.up.set(r.release("v1", d2-3600))
+	for i := 0; i < 3; i++ {
+		r.check()
+		r.clock.advance(2 * time.Hour)
+	}
+	row := r.row()
+	if row.AdoptionFailCount != 3 || strOf(row.AdoptionFailReason) != cache.ReasonUpstreamOlder {
+		t.Fatalf("record = %d %q, want 3 upstream_older", row.AdoptionFailCount, strOf(row.AdoptionFailReason))
+	}
+	if n := len(r.events("adoption_refused")); n != 3 {
+		t.Fatalf("adoption_refused lines = %d, want 3 (one per refused attempt)", n)
+	}
+	if n := len(r.events("adoption_deferred")); n != 1 {
+		t.Fatalf("adoption_deferred lines = %d, want 1 (state transitions only)", n)
+	}
+	if n := len(r.events("adoption_failing_persistently")); n != 0 {
+		t.Fatalf("a refusal raised %d persistent-failure warnings", n)
+	}
+}

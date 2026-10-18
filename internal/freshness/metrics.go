@@ -24,8 +24,7 @@ import (
 // reason says which), release_date_in_future, timed_out
 // (adoption.max_duration), unpinned_suite, gpg_failed, parse_failed,
 // member_mismatch, member_fetch_failed, db_failed, run_failed, and
-// panicked (Checker.recoverGoroutine; Task 6 moves it to
-// Checker.recoverAdoption).
+// panicked (Checker.recoverAdoption).
 //
 // AIDEV-NOTE: metrics added by the flat-repository work, outside the
 // SPEC5 §10.4.3 inventory: acu_clock_steps_detected_total (spec C4) and

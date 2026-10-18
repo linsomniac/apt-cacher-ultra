@@ -246,8 +246,8 @@ func TestCheck_RepairPanicIsRecovered(t *testing.T) {
 	}
 }
 
-// recoverGoroutine is the single recover used by the adoption, repair and
-// on-demand reconcile goroutines.
+// recoverGoroutine is the recover used by the repair and on-demand
+// reconcile goroutines (the adoption goroutine uses recoverAdoption).
 func TestRecoverGoroutine_LogsAndSwallows(t *testing.T) {
 	logs := &lockedBuffer{}
 	c, err := New(Config{Cache: newFakeCache(), Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),

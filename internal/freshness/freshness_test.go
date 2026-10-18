@@ -124,6 +124,63 @@ func (f *fakeCache) GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*ca
 	return &cp, nil
 }
 
+func (f *fakeCache) RecordAdoptionFailure(_ context.Context, scheme, host, suitePath string, r cache.AdoptionFailure) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := keyOf(scheme, host, suitePath)
+	s, ok := f.suites[k]
+	if !ok {
+		return nil
+	}
+	hash, reason, first, last, next := r.Hash, r.Reason, r.FirstAt, r.LastAt, r.NextRetryAt
+	s.AdoptionFailHash, s.AdoptionFailReason, s.AdoptionFailCount = &hash, &reason, r.Count
+	s.AdoptionFailFirstAt, s.AdoptionFailLastAt, s.AdoptionNextRetryAt = &first, &last, &next
+	s.AdoptionFailETag, s.AdoptionFailLastMod = r.ETag, r.LastMod
+	f.suites[k] = s
+	return nil
+}
+
+func (f *fakeCache) ClearAdoptionFailure(_ context.Context, scheme, host, suitePath string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := keyOf(scheme, host, suitePath)
+	if s, ok := f.suites[k]; ok {
+		s.AdoptionFailHash, s.AdoptionFailReason, s.AdoptionFailCount = nil, nil, 0
+		s.AdoptionFailFirstAt, s.AdoptionFailLastAt, s.AdoptionNextRetryAt = nil, nil, nil
+		s.AdoptionFailETag, s.AdoptionFailLastMod = nil, nil
+		f.suites[k] = s
+	}
+	return nil
+}
+
+func (f *fakeCache) SetAdoptionNextRetry(_ context.Context, scheme, host, suitePath string, next int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := keyOf(scheme, host, suitePath)
+	if s, ok := f.suites[k]; ok && s.AdoptionFailCount > 0 {
+		s.AdoptionNextRetryAt = &next
+		f.suites[k] = s
+	}
+	return nil
+}
+
+func (f *fakeCache) RescheduleFailingAdoptions(_ context.Context, now int64, offset func() int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for k, s := range f.suites {
+		if s.AdoptionFailCount < 1 || s.AdoptionFailReason == nil ||
+			cache.IsRefusalReason(*s.AdoptionFailReason) || *s.AdoptionFailReason == cache.ReasonPanic {
+			continue
+		}
+		next := now + offset()
+		s.AdoptionNextRetryAt = &next
+		f.suites[k] = s
+		n++
+	}
+	return n, nil
+}
+
 func (f *fakeCache) putSnapshot(s cache.SuiteSnapshot) {
 	// Production snapshots always carry a Form (the v7 trigger rejects
 	// form-less rows), so a fixture without one models an impossible row.
