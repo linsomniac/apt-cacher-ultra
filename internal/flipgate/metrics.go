@@ -1,0 +1,29 @@
+package flipgate
+
+import "github.com/linsomniac/apt-cacher-ultra/internal/metrics"
+
+// Spec C8 counters, unlabelled (spec C11: no suite labels): one per
+// documented residual, plus the expiry timer's recovered panics. Listed in
+// the flat-repository inventory note in internal/freshness/metrics.go.
+var (
+	holdSkippedTotal = metrics.NewCounter(
+		"acu_flip_hold_skipped_total",
+		"Flips that committed without a hold because the hold token was not free within 60 s (spec C8).",
+	)
+	holdExpiredTotal = metrics.NewCounter(
+		"acu_flip_hold_expired_total",
+		"Flip holds that reached their 20 s bound before the commit finished (spec C8).",
+	)
+	waitersOverCapTotal = metrics.NewCounter(
+		"acu_flip_waiters_over_cap_total",
+		"Anchor requests served at once during a flip hold because 256 requests already waited in it (spec C8).",
+	)
+	slowAnchorReadsTotal = metrics.NewCounter(
+		"acu_flip_slow_anchor_reads_total",
+		"InRelease/Release responses that took 30 s or longer to send; the flip barrier does not wait for them (spec C8).",
+	)
+	gatePanicsTotal = metrics.NewCounter(
+		"acu_flip_gate_panics_total",
+		"Panics recovered in the flip barrier's hold-expiry timer: a bug, the barrier stays usable (spec C8).",
+	)
+)
