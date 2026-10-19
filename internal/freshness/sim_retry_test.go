@@ -141,20 +141,23 @@ func TestSimLim1_AttemptsAcrossTheJitter(t *testing.T) {
 	}
 }
 
-// Spec C7/C5 30-day simulation: an untrusted body (bounded attempts), new
-// content (adopted within a refresh interval), an upstream rollback to
-// older-dated content (never adopted, bounded refusals, record cleared
-// when upstream recovers), and backward and forward clock steps (new
-// content still adopted, checks continue).
+// Spec C7/C5 multi-week simulation, about 20 virtual days with per-day
+// bounds: an untrusted body (bounded attempts, 10 days), new content
+// (adopted within a refresh interval), an upstream rollback to older-dated
+// content (never adopted, bounded refusals, record cleared when upstream
+// recovers; 5 days), and backward and forward clock steps (new content
+// still adopted, checks continue; 2 days each).
 //
-// AIDEV-NOTE: the run spans about 20 virtual days (27 before phase E). The
+// AIDEV-NOTE: the name states no day count (ruling PE-9: this was
+// TestSim30Days_RetryDateRulesAndClockSteps until phase E's review fix
+// round 1). The run spans about 20 virtual days (27 before phase E). The
 // untrusted phase keeps its 10 days: the 7-day interest window lapses
 // inside it, so its floor catches a suite gone dormant without the day-5
 // touch (B-57). The older-content phase runs 5 days and each clock step 2,
 // every bound at the same per-day rate, so the run stays well under the
 // 5 s -race budget (executability review D6, ruling PE-8: about 3.6–4 s).
 // Re-time it under -race before lengthening any phase.
-func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
+func TestSimRetry_LongRunDateRulesAndClockSteps(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		// The offset is process-global: a Fatal between a clock step and
 		// its inline restore() must not leak the step into later tests.
@@ -354,7 +357,8 @@ func TestSimRetry_ClockStepsWithAnActiveRecord(t *testing.T) {
 // AIDEV-NOTE: v1 is served (and adopted) first, so re-adopting it is also
 // refused by the rollback guard (rollback_refused): this simulation holds
 // with the Date rule disabled. The Date rule alone is proved end to end
-// by TestSim30Days' older phase (content never adopted before).
+// by TestSimRetry_LongRunDateRulesAndClockSteps' older phase (content
+// never adopted before).
 func TestSimFlappingMirror_NeverFlipsBack(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := startRetrySim(t, 30*time.Minute)

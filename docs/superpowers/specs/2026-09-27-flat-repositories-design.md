@@ -1572,8 +1572,9 @@ files), in phase D.
 - C6: every real Filename shape vouches; nested-base tiebreak; `..`/`//`/
   sibling `/flat2` negatives; `EXPLAIN QUERY PLAN` uses the partial index.
 - C7: lim1 reproduction (≤ ~30 attempts/day vs ~1,440 on main); a T1 storm
-  right after a failure causes zero extra attempts; 30-day simulation
-  (untrusted body, new content, rollback, clock step); flapping mirror → zero
+  right after a failure causes zero extra attempts; a multi-week simulation
+  (about 20 virtual days, per-day bounds: untrusted body, new content,
+  rollback, clock step); flapping mirror → zero
   backward flips; restart spread; panic excluded from reset; deferred-then-
   retry liveness with 304s to the failing validators.
 - C8: the overlapping-hold trace (two busy suites entering holds 0.1 s

@@ -47,7 +47,7 @@ Left out: everything the phase C final fix wave resolved (the phase-A wake test,
 
 ## Simulation budget and flakes
 
-- **C-38** (narrowed by phase E: `TestSim30Days_RetryDateRulesAndClockSteps` was coarsened in phase E, Task 14, to about 3.6 s, every assertion kept at its per-day rate) `TestSimScheduler_FiveHundredStallingOneHealthy` has no room under the 5 s `-race` budget (6.15–7.82 s in phase B's final tests review, 6.37 s in its fix wave's run, 7.9 s in phase E). Coarsen it, never dropping assertions. (B scope; H)
+- **C-38** (narrowed by phase E: the retry simulation, now `TestSimRetry_LongRunDateRulesAndClockSteps` (ruling PE-9; about 20 virtual days), was coarsened in phase E, Task 14, to about 3.6 s, every assertion kept at its per-day rate) `TestSimScheduler_FiveHundredStallingOneHealthy` has no room under the 5 s `-race` budget (6.15–7.82 s in phase B's final tests review, 6.37 s in its fix wave's run, 7.9 s in phase E). Coarsen it, never dropping assertions. (B scope; H)
 - **C-39** One unexplained failure of `TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency` in a loaded parallel run (final review, concurrency; it did not reproduce in four `-race` reruns or alone). The test wires no gate and runs in real time. Investigate if it recurs. (H)
 
 ## Process

@@ -85,8 +85,9 @@ Plan-review rulings (binding, 2026-10-19; the reviews' findings they accept are 
 - **PE-8 — the executability review's fixes.**
   - D1–D10 text fixes, in the tasks they name.
   - O1: `unvouched_deb_refused` is logged once per fetch (only when `!shared`), pinned with two coalesced requests (Task 9).
-  - D6: the 5 s `-race` budget is firm, with about 0.5 s of margin. The burst simulations run in about 3–3.5 s (Task 8); the 30-day simulation is coarsened to about 3.6 s without weakening an assertion (Task 14).
+  - D6: the 5 s `-race` budget is firm, with about 0.5 s of margin. The burst simulations run in about 3–3.5 s (Task 8); the 30-day simulation (renamed `TestSimRetry_LongRunDateRulesAndClockSteps` by ruling PE-9, below) is coarsened to about 3.6 s without weakening an assertion (Task 14).
   - The 14 proposed tests are accepted, in the tasks the review names; X26 and X28 get no test.
+- **PE-9 — the coarsened retry simulation names no day count** (review fix round 1, Task 14). `TestSim30Days_RetryDateRulesAndClockSteps` runs about 20 virtual days since D6, so it is renamed `TestSimRetry_LongRunDateRulesAndClockSteps`, its doc comment states the horizon, and spec §7's C7 line says "a multi-week simulation (about 20 virtual days, per-day bounds)". This plan's task code blocks and mutant tables keep the old name as executed.
 
 Rulings of earlier phases this plan applies: PD-1 (a file changed only by a mechanical rename does not count as touched for the deferred-minor rule: Task 4's comment renames, Task 8's `finish(…, 0)` edit, Task 3's `sed` in the drift file `hot_prefetch_test.go`), PD-5 (no pool I/O on the writer: R-E1's sniffs run on the adoption goroutine), PD-11 (the hit path already fires T1 after onboarding).
 
@@ -169,7 +170,7 @@ Design notes (choices the spec leaves open — the boring, bounded option, with 
 | The knob | `internal/config/config.go`, `packaging/config/config.toml.default`, `cmd/apt-cacher-ultra/main.go` | 11 |
 | DoD | `internal/freshness/dod_e_test.go`, `internal/handler/unsigned_posture_test.go` (new tests) | 12 |
 | Deferred minors | `internal/freshness/flip_barrier.go` (new: the barrier code moved out of `adoption.go`), `freshness.go`, `adoption.go`, `adoption_failure.go`, `legacy_audit.go`, `reconcile.go`, `retry.go`, `internal/handler/handler.go`; tests | 13 |
-| Simulations | `internal/freshness/sim_sched_test.go`, `sim_retry_test.go` (the coarsened 30-day simulation; and the `simMembers` callers) | 14 |
+| Simulations | `internal/freshness/sim_sched_test.go`, `sim_retry_test.go` (the coarsened retry simulation, about 20 virtual days; and the `simMembers` callers) | 14 |
 | Documentation | `docs/configuration.md`, `docs/log-fields.md`, `docs/admin-ui-spec.md`, the spec, the overview, the four deferred files | 15 |
 
 No migration, no new package, no new dependency.

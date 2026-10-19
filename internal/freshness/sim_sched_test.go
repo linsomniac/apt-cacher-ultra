@@ -373,21 +373,38 @@ func TestSimScheduler_FiveHundredStallingOneHealthy(t *testing.T) {
 }
 
 // Deferred minor B-53 (phase B DoD): the stalling-host bound with an
-// adopter wired, so adoptions contend for the slots on the same host — C
-// publishes a new InRelease on every request and each adoption fetches its
-// Packages for 10 minutes — at a fifth of the 500-suite simulation's size
-// (that one, without an adopter, is already over the 5 s -race budget:
-// deferred minor C-38, phase H). Once the 100 stalling suites have failed,
-// the healthy S is checked within refresh + one tick + D every time, C
-// keeps adopting, and goroutines stay bounded.
+// adopter wired and adoptions contending on the stalling host, at a fifth
+// of the 500-suite simulation's size (that one, without an adopter, is
+// already over the 5 s -race budget: deferred minor C-38, phase H).
+//
+// The contention is real (review fix round 1, Task 14): one host limiter
+// is shared by the checker and the adopter, as in production
+// (cmd/apt-cacher-ultra/main.go, at its default 8 per host), and host a
+// carries, besides the 100 stalling suites and the healthy S, two changing
+// candidates C and C2 — each publishes a new InRelease on every request and
+// each adoption fetches its Packages for 10 minutes — and R, whose Contents
+// member never heals, so every unchanged check of R asks for a 20-minute
+// repair. One adoption or repair holds a host's admission slot at a time.
+// At the first tick (key order: C, R, C2) C's adoption takes the slot, R's
+// repair is deferred and C2 ends changed_queued and is parked; C2 is
+// re-offered when the slot is released, while the stalling checks hold
+// host a's turns ahead of S.
+//
+// Asserted: some candidate ended changed_queued, a repair was deferred, and
+// C2 adopted new content (the parked re-offer path); once the 100 stalling
+// suites have failed, the healthy S is checked within refresh + one tick +
+// D every time; the candidates keep adopting; goroutines stay bounded.
 func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
 		c := simtest.OpenCache(t)
 		up := simtest.NewUpstream()
 		members := &simMembers{fakeFetcher: newFakeFetcher(), stalled: map[string]bool{}, delay: map[string]time.Duration{}}
-		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
-			HostLimiter: hostsem.New(8), MaxConcurrent: 2, MaxDuration: 30 * time.Minute, Logger: simtest.DiscardLogger()})
+		lim := hostsem.New(8) // shared by the checker and the adopter, as in production
+		starts := &startsByURL{AdoptionFetcher: members, at: map[string]time.Time{}}
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: starts, Verifier: passThroughVerifier{},
+			HostLimiter: lim, MaxConcurrent: 2, MaxDuration: 30 * time.Minute, RepairSkippedMembers: true,
+			TolerateOptionalMemberFailures: true, Logger: simtest.DiscardLogger()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -406,33 +423,73 @@ func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		const sPath, cPath = "/zzz/dists/x", "/ccc/dists/x"
+		const sPath, cPath, rPath, c2Path = "/zzz/dists/x", "/ccc/dists/x", "/ddd/dists/x", "/eee/dists/x"
 		sURL := "http://a" + sPath + "/InRelease"
 		adopt(sPath, fakePackagesStanzas(map[string]string{"pool/s_1.deb": testHex64}))
 		up.Set(sURL, simtest.NotModified())
-		pkgs := func(n int64) []byte {
-			return fakePackagesStanzas(map[string]string{fmt.Sprintf("pool/c_%d.deb", n): testHex64})
+		// changing adopts suite and makes upstream publish a new InRelease,
+		// with a new Packages body fetched in 10 minutes, on every request
+		// (a body already in the pool would be reused without a fetch).
+		changing := func(suite string) (seeded string) {
+			pkgs := func(n int64) []byte {
+				return fakePackagesStanzas(map[string]string{fmt.Sprintf("pool/c%s_%d.deb", suite[1:4], n): testHex64})
+			}
+			rel := func(n int64) []byte {
+				return signedRelease(fmt.Sprintf("c%s%d", suite, n), 0, map[string][]byte{"main/binary-amd64/Packages": pkgs(n)})
+			}
+			ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: "a", SuitePath: suite}
+			pkgsURL := "http://a" + suite + "/main/binary-amd64/Packages"
+			members.put(pkgsURL, pkgs(0))
+			trackSuite(t, c, ref)
+			if err := ad.Run(ctx, ref, rel(0), "", ""); err != nil {
+				t.Fatal(err)
+			}
+			members.setDelay(pkgsURL, 10*time.Minute)
+			var n atomic.Int64
+			up.Set("http://a"+suite+"/InRelease", func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
+				k := n.Add(1)
+				members.put(pkgsURL, pkgs(k)) // before the check can spawn the adoption
+				return simtest.Serve(rel(k))(ctx, etag)
+			})
+			return hashOf(rel(0))
 		}
-		adopt(cPath, pkgs(0))
-		cPkgs := "http://a" + cPath + "/main/binary-amd64/Packages"
-		members.setDelay(cPkgs, 10*time.Minute)
-		var n atomic.Int64
-		up.Set("http://a"+cPath+"/InRelease", func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
-			k := n.Add(1)
-			members.put(cPkgs, pkgs(k)) // before the check can spawn the adoption
-			return simtest.Serve(signedRelease(fmt.Sprintf("c%d", k), 0, map[string][]byte{"main/binary-amd64/Packages": pkgs(k)}))(ctx, etag)
-		})
+		changing(cPath)
+		c2Seeded := changing(c2Path)
+		// R: adopted, with a Contents member that never heals, so every
+		// unchanged check of R asks for a repair, which probes by-hash, then
+		// the canonical path, 10 minutes each.
+		good, bad := []byte(strings.Repeat("C", 100)), []byte(strings.Repeat("z", 90))
+		pkgsR := fakePackagesStanzas(map[string]string{"pool/r_1.deb": testHex64})
+		relR := signedRelease("r", 0, map[string][]byte{"main/binary-amd64/Packages": pkgsR, "Contents-amd64.gz": good})
+		rBase := "http://a" + rPath + "/"
+		rByHash := rBase + "by-hash/SHA256/" + shaOf(good)
+		members.put(rBase+"main/binary-amd64/Packages", pkgsR)
+		members.put(rBase+"Contents-amd64.gz", bad)
+		members.put(rByHash, bad)
+		rRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "a", SuitePath: rPath}
+		trackSuite(t, c, rRef)
+		if err := ad.Run(ctx, rRef, relR, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		members.setDelay(rBase+"Contents-amd64.gz", 10*time.Minute)
+		members.setDelay(rByHash, 10*time.Minute)
+		up.Set(rBase+"InRelease", simtest.Serve(relR))
 		cAdoptions := func() float64 {
 			v, _ := strconv.ParseFloat(renderedMetricLabels("acu_adoption_total", `outcome="success"`, `host="a"`), 64)
 			return v
 		}
 		startAdoptions := cAdoptions()
+		starts.mu.Lock()
+		starts.at = map[string]time.Time{} // the adoptions above do not count
+		starts.mu.Unlock()
+		startQueued := checkTotal(t, "changed_queued", "a")
+		startDeferred := hostCounter(t, "acu_repair_deferred_total", "a")
 		const refresh = time.Hour
 		tick := refresh / 4
 		runtime.Gosched()
 		base := runtime.NumGoroutine()
 		maxG := base
-		_, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: refresh,
+		_, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: lim, Refresh: refresh,
 			Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }})
 		// Phase 1: every stalling suite fails once (100 × D on one host).
 		for time.Sleep(61 * time.Second); ; time.Sleep(61 * time.Second) {
@@ -470,7 +527,41 @@ func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 			}
 		}
 		if got := cAdoptions() - startAdoptions; got < 3 {
-			t.Fatalf("C adopted %v times, want it to keep adopting (>= 3)", got)
+			t.Fatalf("C and C2 adopted %v times, want them to keep adopting (>= 3)", got)
+		}
+		t.Logf("phase 1 and 2: %v changed_queued checks, %v deferred repairs, %v adoptions on host a",
+			checkTotal(t, "changed_queued", "a")-startQueued, hostCounter(t, "acu_repair_deferred_total", "a")-startDeferred,
+			cAdoptions()-startAdoptions)
+		// The contention was real: a candidate found host a's admission
+		// slot taken and was queued, a repair was deferred, and the parked
+		// C2 was re-offered and adopted new content.
+		if got := checkTotal(t, "changed_queued", "a") - startQueued; got < 1 {
+			t.Fatalf("%v checks on host a ended changed_queued, want at least 1: the slots were never contended", got)
+		}
+		if got := hostCounter(t, "acu_repair_deferred_total", "a") - startDeferred; got < 1 {
+			t.Fatalf("%v of R's repairs were deferred, want at least 1", got)
+		}
+		sf, err := c.GetSuiteFreshness(ctx, "http", "a", c2Path)
+		if err != nil || sf.CurrentSnapshotID == nil {
+			t.Fatalf("C2: no current snapshot (err %v)", err)
+		}
+		if snap, err := c.GetSuiteSnapshot(ctx, *sf.CurrentSnapshotID); err != nil || strOf(snap.SingleAnchorHash) == c2Seeded {
+			t.Fatalf("C2 never adopted new content (err %v): its parked re-offer never admitted it", err)
+		}
+		// C2 was parked by the first tick's check and admitted by the
+		// re-offer when C's adoption released host a's slot: within that
+		// adoption (10 minutes) and one host turn behind a stalling check
+		// (D), not at a later tick.
+		c2Calls := up.Calls("http://a" + c2Path + "/InRelease")
+		starts.mu.Lock()
+		c2Start, ok := starts.at["http://a"+c2Path+"/main/binary-amd64/Packages"]
+		starts.mu.Unlock()
+		if len(c2Calls) == 0 || !ok {
+			t.Fatalf("C2: %d checks, adoption started %v", len(c2Calls), ok)
+		}
+		if wait := c2Start.Sub(c2Calls[0]); wait > 10*time.Minute+checkDeadline {
+			t.Fatalf("C2 parked at %v was admitted %v later, want within one adoption + D (%v)",
+				c2Calls[0], wait, 10*time.Minute+checkDeadline)
 		}
 		const slack = 8
 		if limit := base + checkWorkers + 1 + 2 + slack; maxG > limit {
@@ -504,8 +595,8 @@ func renderedMetricLabels(name string, labels ...string) string {
 // with a delay answers only after it. It tracks how many stalled fetches
 // are in flight and, once recordStarts was called, each host's first
 // member fetch (an adoption's admission). Its maps are written only
-// through stall, setDelay and recordStarts, under its lock (deferred minor
-// B-51).
+// under its lock: by stall, setDelay, recordStarts, and Fetch's record of
+// each host's first start (deferred minor B-51).
 type simMembers struct {
 	*fakeFetcher
 	mu       sync.Mutex

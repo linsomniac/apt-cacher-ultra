@@ -243,7 +243,7 @@ func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 				seedStaleAnchorAt(t, c, host, s.SuitePath) // client interest now, a client-created anchor
 				label := host + s.SuitePath
 				members.put(pkgsURL(s), pkgsFor(label))
-				members.delay[pkgsURL(s)] = time.Minute
+				members.setDelay(pkgsURL(s), time.Minute)
 				up.Set(anchorURL(s), simtest.Serve(signedRelease("first "+label, 0,
 					map[string][]byte{"main/binary-amd64/Packages": pkgsFor(label)})))
 				first = append(first, s)
@@ -258,7 +258,7 @@ func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 					t.Fatal(err)
 				}
 				members.put(pkgsURL(s), pkgsFor("2 "+label))
-				members.delay[pkgsURL(s)] = time.Minute
+				members.setDelay(pkgsURL(s), time.Minute)
 				v2 := signedRelease("v2 "+label, 0, map[string][]byte{"main/binary-amd64/Packages": pkgsFor("2 " + label)})
 				at := time.Duration(5+6*len(signed))*time.Minute + 7*time.Second // a trickle through the burst
 				changeAt[s] = at
