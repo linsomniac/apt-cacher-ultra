@@ -26,10 +26,12 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// startAdminServer constructs an admin Server with a real cache
-// and gc.GC, binds it to an ephemeral port, and returns the server
-// + a base URL ("http://127.0.0.1:<port>") + a cleanup func.
-func startAdminServer(t *testing.T, opts ...adminOpt) (*Server, string, func()) {
+// newTestAdminConfig builds the baseline Config served by
+// startAdminServer: a real cache and gc.GC on a temp dir, discard
+// logger, test BuildInfo. Tests that exercise New's own validation
+// (e.g. the admin TLS half-set rejection) build on this so
+// config.Load / Validate is not in the loop.
+func newTestAdminConfig(t *testing.T) Config {
 	t.Helper()
 	dir := t.TempDir()
 	c, err := cache.Open(context.Background(), dir, nil)
@@ -52,8 +54,7 @@ func startAdminServer(t *testing.T, opts ...adminOpt) (*Server, string, func()) 
 	if err != nil {
 		t.Fatalf("gc.New: %v", err)
 	}
-
-	cfg := Config{
+	return Config{
 		Cache:       c,
 		GC:          g,
 		HostLimiter: hostsem.New(8),
@@ -74,6 +75,14 @@ func startAdminServer(t *testing.T, opts ...adminOpt) (*Server, string, func()) 
 		},
 		StartTime: time.Now(),
 	}
+}
+
+// startAdminServer constructs an admin Server with a real cache
+// and gc.GC, binds it to an ephemeral port, and returns the server
+// + a base URL ("http://127.0.0.1:<port>") + a cleanup func.
+func startAdminServer(t *testing.T, opts ...adminOpt) (*Server, string, func()) {
+	t.Helper()
+	cfg := newTestAdminConfig(t)
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -96,7 +105,7 @@ func startAdminServer(t *testing.T, opts ...adminOpt) (*Server, string, func()) 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = s.Shutdown(ctx)
-		_ = c.Close()
+		_ = cfg.Cache.Close()
 	}
 	return s, "http://" + cfg.AdminAddr, cleanup
 }

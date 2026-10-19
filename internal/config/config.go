@@ -3,10 +3,12 @@
 package config
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -65,6 +67,7 @@ type Config struct {
 	Serve          ServeConfig        `toml:"serve"`
 	Log            LogConfig          `toml:"log"`
 	TlsMitm        TlsMitmConfig      `toml:"tls_mitm"`
+	Acme           AcmeConfig         `toml:"acme"`
 	Remap          []RemapRule        `toml:"remap"`
 	Mirror         []MirrorRule       `toml:"mirror"`
 	TrustedSigners []TrustedSigner    `toml:"trusted_signer"`
@@ -76,6 +79,14 @@ type CacheConfig struct {
 	ListenTLS string `toml:"listen_tls"`
 	TLSCert   string `toml:"tls_cert"`
 	TLSKey    string `toml:"tls_key"`
+
+	// UseAcme switches cache.listen_tls from a manual PEM pair
+	// (tls_cert / tls_key) to the daemon-managed ACME certificate
+	// (see the [acme] block). Exactly one certificate source per
+	// surface: use_acme is incompatible with tls_cert / tls_key, and
+	// requires [acme].enabled = true. The shared certificate and its
+	// renewal are common with admin.use_acme when both are selected.
+	UseAcme bool `toml:"use_acme"`
 
 	// AdvertiseHost is the SPEC6 §14.2 client-facing host (or
 	// host:port) the `--print-apt-conf` snippet emits. Empty
@@ -442,6 +453,33 @@ type AdminConfig struct {
 	// validateListenAddr().
 	Listen string `toml:"listen"`
 
+	// TLSCert / TLSKey are optional PEM paths that switch the admin
+	// listener from plain HTTP to HTTPS on the same admin.listen
+	// address. Both empty (default) keeps HTTP — backward
+	// compatible. Both set is required; one-set-one-empty is
+	// rejected at validation, as are unreadable files and a
+	// cert/key pair that does not match (tls.LoadX509KeyPair runs at
+	// load time, so a bad pair fails fast at startup instead of at
+	// the first handshake). The pair is loaded once when the listener
+	// starts; changing either path (or rotating the certificate)
+	// needs a daemon restart. Unlike cache.listen_tls there is no
+	// separate TLS listener: the admin surface is small and
+	// loopback-bound by default, so one scheme per listener is
+	// enough.
+	//
+	// Alternatively UseAcme switches the listener to HTTPS with the
+	// daemon-managed ACME certificate (renewed without restart);
+	// it is incompatible with a manual pair — exactly one certificate
+	// source per surface.
+	TLSCert string `toml:"tls_cert"`
+	TLSKey  string `toml:"tls_key"`
+
+	// UseAcme selects the daemon-managed ACME certificate (see the
+	// [acme] block) for the admin listener instead of plain HTTP or a
+	// manual PEM pair. Requires [acme].enabled = true and
+	// admin.enabled = true; incompatible with tls_cert / tls_key.
+	UseAcme bool `toml:"use_acme"`
+
 	// HtpasswdFile is the optional Apache htpasswd file (bcrypt-only)
 	// for HTTP Basic auth on every admin request. Empty (default)
 	// means "no auth — operator relies on bind-address as the trust
@@ -480,6 +518,16 @@ type AdminConfig struct {
 	// dropped and a one-shot metrics_series_cap_reached Warn fires.
 	// Default 1024. Must be ≥ 1.
 	MetricSeriesCap int `toml:"metric_series_cap"`
+}
+
+// TLSEnabled reports whether the admin listener serves HTTPS: true
+// when BOTH tls_cert and tls_key are set, or when use_acme selects the
+// daemon-managed ACME certificate. Validate rejects a half-set pair
+// for file-loaded configs and admin.New rejects it for programmatically
+// built ones, so callers can treat this as all-or-nothing — never a
+// silent fall back to plain HTTP.
+func (a AdminConfig) TLSEnabled() bool {
+	return (a.TLSCert != "" && a.TLSKey != "") || a.UseAcme
 }
 
 // HeartbeatStaleGraceEffective returns the runtime-derived grace
@@ -581,6 +629,55 @@ type TlsMitmConfig struct {
 	// fail closed (refuse an unconstrained CA) per §5.1.1. Has no
 	// effect on operator-supplied CAs.
 	AllowUnconstrainedCA bool `toml:"allow_unconstrained_ca"`
+}
+
+// AcmeConfig holds the [acme] block (docs/acme-certificates-spec.md).
+// The ACME client obtains and renews a single server certificate via
+// an ACME authority (Let's Encrypt by default) and serves it on the
+// surfaces that select it (cache.use_acme / admin.use_acme). The ACME
+// certificate is never used as a MITM CA and the MITM CA is never
+// sent to an ACME authority.
+type AcmeConfig struct {
+	// Enabled is the master switch. False (default): no account,
+	// challenge or certificate is ever created, and any use_acme =
+	// true is a configuration error.
+	Enabled bool `toml:"enabled"`
+
+	// DirectoryURL is the ACME directory endpoint. Required when
+	// enabled; must be an HTTPS URL without credentials, fragment or
+	// query. Let's Encrypt production:
+	// https://acme-v02.api.letsencrypt.org/directory — use the
+	// staging endpoint (https://acme-staging-v02.api.letsencrypt.org/directory)
+	// for trials to avoid production rate limits.
+	DirectoryURL string `toml:"directory_url"`
+
+	// DNSName is the single FQDN placed in the server certificate.
+	// Required when enabled; no scheme, path, port, IP literal or
+	// wildcard. Both ACME surfaces (cache.listen_tls and
+	// admin.listen) are served under this one name, on different
+	// ports if needed.
+	DNSName string `toml:"dns_name"`
+
+	// Listen is the local address temporarily bound by the HTTP-01
+	// challenge server just before an issuance or renewal. Defaults
+	// to "0.0.0.0:80" when the key is absent from the config file.
+	// The public TCP port 80 of dns_name must be published (DNS,
+	// firewall, NAT or reverse proxy) to this address; a local port
+	// other than 80 requires such a forward.
+	Listen string `toml:"listen"`
+
+	// RenewBeforeDays is the renewal threshold in days: the
+	// certificate is renewed when its expiration is at most this many
+	// days away. Default 7 (Let's Encrypt certificates are valid
+	// 90 days). Must be >= 1. Presence-sensitive: applied in Load()
+	// via MetaData.IsDefined.
+	RenewBeforeDays int `toml:"renew_before_days"`
+
+	// CheckInterval is how often the certificate expiration is
+	// checked. Default 12h. Must be > 0 and should stay well below
+	// the certificate lifetime so a renewal is never missed.
+	// Presence-sensitive: applied in Load() via MetaData.IsDefined.
+	CheckInterval Duration `toml:"check_interval"`
 }
 
 type RemapRule struct {
@@ -775,6 +872,20 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("tls_mitm", "leaf_algorithm") {
 		cfg.TlsMitm.LeafAlgorithm = "ecdsa-p256"
 	}
+	// [acme] presence-sensitive defaults (docs/acme-certificates-spec.md):
+	// listen = "0.0.0.0:80", renew_before_days = 7, check_interval = 12h.
+	// Routed through IsDefined so an operator's explicit (and invalid)
+	// value survives to Validate() instead of being silently rescued
+	// to the default.
+	if !md.IsDefined("acme", "listen") {
+		cfg.Acme.Listen = "0.0.0.0:80"
+	}
+	if !md.IsDefined("acme", "renew_before_days") {
+		cfg.Acme.RenewBeforeDays = 7
+	}
+	if !md.IsDefined("acme", "check_interval") {
+		cfg.Acme.CheckInterval.Duration = 12 * time.Hour
+	}
 	cfg.Defaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -880,19 +991,31 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("cache.listen: %w", err))
 	}
 
-	tlsAnySet := c.Cache.ListenTLS != "" || c.Cache.TLSCert != "" || c.Cache.TLSKey != ""
-	tlsAllSet := c.Cache.ListenTLS != "" && c.Cache.TLSCert != "" && c.Cache.TLSKey != ""
-	if tlsAnySet && !tlsAllSet {
-		errs = append(errs, errors.New("cache.listen_tls / tls_cert / tls_key must all be set or all empty"))
-	} else if tlsAllSet {
-		if err := validateListenAddr(c.Cache.ListenTLS); err != nil {
-			errs = append(errs, fmt.Errorf("cache.listen_tls: %w", err))
+	if c.Cache.UseAcme {
+		// ACME supplies the certificate for cache.listen_tls, so the
+		// manual-PEM all-or-nothing rule does not apply. The
+		// listen_tls requirement and the PEM incompatibility are
+		// validated in the [acme] block below.
+		if c.Cache.ListenTLS != "" {
+			if err := validateListenAddr(c.Cache.ListenTLS); err != nil {
+				errs = append(errs, fmt.Errorf("cache.listen_tls: %w", err))
+			}
 		}
-		if err := checkReadableFile(c.Cache.TLSCert); err != nil {
-			errs = append(errs, fmt.Errorf("cache.tls_cert %q: %w", c.Cache.TLSCert, err))
-		}
-		if err := checkReadableFile(c.Cache.TLSKey); err != nil {
-			errs = append(errs, fmt.Errorf("cache.tls_key %q: %w", c.Cache.TLSKey, err))
+	} else {
+		tlsAnySet := c.Cache.ListenTLS != "" || c.Cache.TLSCert != "" || c.Cache.TLSKey != ""
+		tlsAllSet := c.Cache.ListenTLS != "" && c.Cache.TLSCert != "" && c.Cache.TLSKey != ""
+		if tlsAnySet && !tlsAllSet {
+			errs = append(errs, errors.New("cache.listen_tls / tls_cert / tls_key must all be set or all empty"))
+		} else if tlsAllSet {
+			if err := validateListenAddr(c.Cache.ListenTLS); err != nil {
+				errs = append(errs, fmt.Errorf("cache.listen_tls: %w", err))
+			}
+			if err := checkReadableFile(c.Cache.TLSCert); err != nil {
+				errs = append(errs, fmt.Errorf("cache.tls_cert %q: %w", c.Cache.TLSCert, err))
+			}
+			if err := checkReadableFile(c.Cache.TLSKey); err != nil {
+				errs = append(errs, fmt.Errorf("cache.tls_key %q: %w", c.Cache.TLSKey, err))
+			}
 		}
 	}
 
@@ -1108,6 +1231,31 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Errorf("admin.htpasswd_file: %w", err))
 			}
 		}
+		if c.Admin.UseAcme {
+			// ACME supplies the certificate for the admin listener, so
+			// the manual-PEM pair checks do not apply. The PEM
+			// incompatibility is validated in the [acme] block below.
+		} else {
+			adminTLSAnySet := c.Admin.TLSCert != "" || c.Admin.TLSKey != ""
+			adminTLSAllSet := c.Admin.TLSCert != "" && c.Admin.TLSKey != ""
+			if adminTLSAnySet && !adminTLSAllSet {
+				errs = append(errs, errors.New("admin.tls_cert / admin.tls_key must both be set or both empty"))
+			} else if adminTLSAllSet {
+				if err := checkReadableFile(c.Admin.TLSCert); err != nil {
+					errs = append(errs, fmt.Errorf("admin.tls_cert %q: %w", c.Admin.TLSCert, err))
+				}
+				if err := checkReadableFile(c.Admin.TLSKey); err != nil {
+					errs = append(errs, fmt.Errorf("admin.tls_key %q: %w", c.Admin.TLSKey, err))
+				}
+				// Fail fast on a mismatched pair: the cache TLS listener
+				// surfaces a bad pair at ServeTLS time; the admin listener
+				// validates the pair at config load so a typo'd pair never
+				// reaches a half-bound daemon.
+				if _, err := tls.LoadX509KeyPair(c.Admin.TLSCert, c.Admin.TLSKey); err != nil {
+					errs = append(errs, fmt.Errorf("admin.tls_cert/tls_key: %w", err))
+				}
+			}
+		}
 		if c.Admin.GaugeRefresh.Duration <= 0 {
 			errs = append(errs, errors.New("admin.gauge_refresh must be > 0"))
 		} else if c.Admin.GaugeRefresh.Duration > time.Hour {
@@ -1126,6 +1274,56 @@ func (c *Config) Validate() error {
 		if c.Admin.MetricSeriesCap < 1 {
 			errs = append(errs, errors.New("admin.metric_series_cap must be >= 1"))
 		}
+	}
+
+	// [acme] block validation (docs/acme-certificates-spec.md §
+	// "Validation de la configuration"). When enabled, all nine rules
+	// apply; when disabled, any use_acme = true is an error.
+	if c.Acme.Enabled {
+		// Rule 1: directory_url is an HTTPS ACME URL, no credentials,
+		// fragment or query.
+		if err := validateACMEDirectoryURL(c.Acme.DirectoryURL); err != nil {
+			errs = append(errs, fmt.Errorf("acme.directory_url: %w", err))
+		}
+		// Rule 2: dns_name is a single FQDN — no scheme, path, port,
+		// IP literal or wildcard.
+		if err := validateACMEDNSName(c.Acme.DNSName); err != nil {
+			errs = append(errs, fmt.Errorf("acme.dns_name: %w", err))
+		}
+		// Rule 3: acme.listen is a valid local host:port.
+		if err := validateListenAddr(c.Acme.Listen); err != nil {
+			errs = append(errs, fmt.Errorf("acme.listen: %w", err))
+		}
+		// Rule 4: at least one surface selects ACME.
+		if !c.Cache.UseAcme && !c.Admin.UseAcme {
+			errs = append(errs, errors.New("acme.enabled requires at least one of cache.use_acme or admin.use_acme"))
+		}
+		// Rule 5: cache.use_acme requires cache.listen_tls.
+		if c.Cache.UseAcme && c.Cache.ListenTLS == "" {
+			errs = append(errs, errors.New("cache.use_acme requires cache.listen_tls"))
+		}
+		// Rule 6: admin.use_acme requires admin.enabled.
+		if c.Admin.UseAcme && !c.Admin.Enabled {
+			errs = append(errs, errors.New("admin.use_acme requires admin.enabled"))
+		}
+		// Rule 7: each ACME target is devoid of manual PEM paths —
+		// exactly one certificate source per surface.
+		if c.Cache.UseAcme && (c.Cache.TLSCert != "" || c.Cache.TLSKey != "") {
+			errs = append(errs, errors.New("cache.use_acme is incompatible with cache.tls_cert / cache.tls_key (exactly one certificate source per surface)"))
+		}
+		if c.Admin.UseAcme && (c.Admin.TLSCert != "" || c.Admin.TLSKey != "") {
+			errs = append(errs, errors.New("admin.use_acme is incompatible with admin.tls_cert / admin.tls_key (exactly one certificate source per surface)"))
+		}
+		// Rule 8: renew_before_days >= 1.
+		if c.Acme.RenewBeforeDays < 1 {
+			errs = append(errs, errors.New("acme.renew_before_days must be >= 1"))
+		}
+		// Rule 9: check_interval strictly positive.
+		if c.Acme.CheckInterval.Duration <= 0 {
+			errs = append(errs, errors.New("acme.check_interval must be > 0"))
+		}
+	} else if c.Cache.UseAcme || c.Admin.UseAcme {
+		errs = append(errs, errors.New("cache.use_acme / admin.use_acme require acme.enabled = true"))
 	}
 
 	for i, ts := range c.TrustedSigners {
@@ -1296,6 +1494,127 @@ func validateListenAddr(addr string) error {
 		return fmt.Errorf("port %d out of range 1-65535", p)
 	}
 	return nil
+}
+
+// validateACMEDirectoryURL enforces [acme].directory_url rule 1: an
+// HTTPS ACME directory URL without credentials, fragment, query or any
+// other ambiguous form. The path must be present (the Let's Encrypt
+// directory lives at /directory).
+func validateACMEDirectoryURL(s string) error {
+	if s == "" {
+		return errors.New("empty")
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("scheme must be https, got %q", u.Scheme)
+	}
+	if u.User != nil {
+		return errors.New("must not contain credentials")
+	}
+	if u.Fragment != "" {
+		return errors.New("must not contain a fragment")
+	}
+	if u.RawQuery != "" {
+		return errors.New("must not contain a query string")
+	}
+	if u.Hostname() == "" {
+		return errors.New("missing host")
+	}
+	if u.Path == "" || u.Path == "/" {
+		return errors.New("missing directory path")
+	}
+	return nil
+}
+
+// acmeDNSLabelRE is the per-label shape predicate for acme.dns_name:
+// 1-63 alphanumeric characters, hyphens allowed inside but not at
+// either end (RFC 1034 §3.5, without the underscore extensions).
+var acmeDNSLabelRE = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
+
+// validateACMEDNSName enforces [acme].dns_name rule 2: a single FQDN —
+// no scheme, path, port, IP literal or wildcard.
+func validateACMEDNSName(s string) error {
+	if s == "" {
+		return errors.New("empty")
+	}
+	if len(s) > 253 {
+		return errors.New("longer than 253 characters")
+	}
+	if strings.Contains(s, "://") || strings.ContainsAny(s, "/?#") {
+		return fmt.Errorf("%q must be a bare FQDN (no scheme, path, query or fragment)", s)
+	}
+	if strings.HasPrefix(s, "*.") {
+		return fmt.Errorf("%q must not be a wildcard", s)
+	}
+	if strings.HasSuffix(s, ".") {
+		return fmt.Errorf("%q must not have a trailing dot", s)
+	}
+	if _, err := netip.ParseAddr(s); err == nil {
+		return fmt.Errorf("%q must be a DNS name, not an IP address", s)
+	}
+	if _, _, err := net.SplitHostPort(s); err == nil {
+		return fmt.Errorf("%q must not contain a port", s)
+	}
+	labels := strings.Split(s, ".")
+	if len(labels) < 2 {
+		return fmt.Errorf("%q must be a fully-qualified name with at least two labels", s)
+	}
+	for _, label := range labels {
+		if !acmeDNSLabelRE.MatchString(label) {
+			return fmt.Errorf("%q has invalid label %q", s, label)
+		}
+	}
+	return nil
+}
+
+// isWildcardHost reports whether a SplitHostPort host part binds every
+// local interface: the empty host, 0.0.0.0 or ::.
+func isWildcardHost(host string) bool {
+	return host == "" || host == "0.0.0.0" || host == "::"
+}
+
+// AcmeListenConflicts reports the daemon listeners whose bind address
+// conflicts with acme.listen: same port, and either identical hosts
+// or a wildcard on either side (a wildcard bind occupies every local
+// address, so it collides with any specific host on the same port).
+// Returns nil when ACME is disabled or acme.listen is unset/malformed
+// (Validate reports the malformed address separately). The result is
+// surfaced as a startup WARNING, not an error: the authoritative
+// failure remains the explicit bind error when the HTTP-01 challenge
+// server starts.
+func (c *Config) AcmeListenConflicts() []string {
+	if !c.Acme.Enabled || c.Acme.Listen == "" {
+		return nil
+	}
+	acmeHost, acmePort, err := net.SplitHostPort(c.Acme.Listen)
+	if err != nil {
+		return nil
+	}
+	type candidate struct {
+		name string
+		addr string
+	}
+	candidates := []candidate{{name: "cache.listen", addr: c.Cache.Listen}}
+	if c.Cache.ListenTLS != "" {
+		candidates = append(candidates, candidate{name: "cache.listen_tls", addr: c.Cache.ListenTLS})
+	}
+	if c.Admin.Enabled && c.Admin.Listen != "" {
+		candidates = append(candidates, candidate{name: "admin.listen", addr: c.Admin.Listen})
+	}
+	var out []string
+	for _, cand := range candidates {
+		host, port, err := net.SplitHostPort(cand.addr)
+		if err != nil || port != acmePort {
+			continue
+		}
+		if isWildcardHost(host) || isWildcardHost(acmeHost) || strings.EqualFold(host, acmeHost) {
+			out = append(out, cand.name)
+		}
+	}
+	return out
 }
 
 // validateAdvertiseHost accepts "host" or "host:port" — no scheme, no

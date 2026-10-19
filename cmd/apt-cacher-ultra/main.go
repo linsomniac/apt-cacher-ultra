@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"runtime/debug"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/acme"
 	"github.com/linsomniac/apt-cacher-ultra/internal/admin"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
@@ -229,6 +231,25 @@ func serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		preloadedCA = ca
 	}
 
+	// docs/acme-certificates-spec.md § "Cycle de vie et stockage":
+	// ACME materialization BEFORE any listener binds. The first
+	// issuance (or the renewal of an expired stored certificate)
+	// blocks here, and its failure must fail the daemon before any
+	// surface is served — not even the plain proxy listener. A valid
+	// stored certificate is served immediately without contacting
+	// the authority, so restarts stay fast and offline-tolerant.
+	var acmeMgr *acme.Manager
+	if cfg.Acme.Enabled {
+		mgr, err := newACMEManager(cfg, logger)
+		if err != nil {
+			return fmt.Errorf("acme: %w", err)
+		}
+		if err := mgr.EnsureCertificate(ctx); err != nil {
+			return fmt.Errorf("acme: no usable certificate for %q: %w", cfg.Acme.DNSName, err)
+		}
+		acmeMgr = mgr
+	}
+
 	plainLn, err := net.Listen("tcp", cfg.Cache.Listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.Cache.Listen, err)
@@ -259,7 +280,27 @@ func serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		}
 	}
 
-	return serveListeners(ctx, cfg, logger, plainLn, tlsLn, adminLn, preloadedCA)
+	return serveListeners(ctx, cfg, logger, plainLn, tlsLn, adminLn, preloadedCA, acmeMgr)
+}
+
+// newACMEManager builds the ACME manager for the daemon: storage
+// under <cache.dir>/acme (persistent, restrictive permissions), the
+// renewal threshold (renew_before_days) and the check cadence from
+// the [acme] config block, and structured event logging forwarded to
+// the daemon's slog.Logger.
+func newACMEManager(cfg *config.Config, logger *slog.Logger) (*acme.Manager, error) {
+	return acme.NewManager(acme.Config{
+		DirectoryURL:  cfg.Acme.DirectoryURL,
+		DNSName:       cfg.Acme.DNSName,
+		Listen:        cfg.Acme.Listen,
+		StorageDir:    filepath.Join(cfg.Cache.Dir, "acme"),
+		RenewBefore:   time.Duration(cfg.Acme.RenewBeforeDays) * 24 * time.Hour,
+		CheckInterval: cfg.Acme.CheckInterval.Duration,
+		UserAgent:     "apt-cacher-ultra/" + Version,
+		LogFn: func(level, event string, fields map[string]any) {
+			emitACMELog(logger, level, event, fields)
+		},
+	})
 }
 
 // loadMitmCA performs the SPEC6 §9.5 step 2 pre-bind CA materialization.
@@ -302,6 +343,7 @@ func serveListeners(
 	tlsLn net.Listener,
 	adminLn net.Listener,
 	preloadedCA *tlsmitm.CA,
+	acmeMgr *acme.Manager,
 ) (retErr error) {
 	defer func() {
 		// Defensive: if we error out before the goroutines start serving,
@@ -331,6 +373,15 @@ func serveListeners(
 			return fmt.Errorf("admin htpasswd %q: %w", cfg.Admin.HtpasswdFile, err)
 		}
 		htpasswdUsers = n
+	}
+
+	// config.Validate guarantees acme.enabled = true whenever a
+	// surface selects ACME, so serve() has built the manager by the
+	// time we get here. Tests calling serveListeners directly bypass
+	// serve(); reject the inconsistent combination explicitly rather
+	// than letting a TLS listener fail handshakes with no certificate.
+	if (cfg.Cache.UseAcme || cfg.Admin.UseAcme) && acmeMgr == nil {
+		return errors.New("use_acme = true requires acme.enabled = true (no ACME manager built)")
 	}
 
 	// SPEC §10 / SPEC2 §10.3: startup config dump. Capture every
@@ -382,6 +433,7 @@ func serveListeners(
 		"gc_url_path_ttl", cfg.GC.URLPathTTL.Duration,
 		"admin_enabled", cfg.Admin.Enabled,
 		"admin_listen", cfg.Admin.Listen,
+		"admin_tls_enabled", cfg.Admin.TLSEnabled(),
 		"admin_htpasswd_file", cfg.Admin.HtpasswdFile,
 		"admin_htpasswd_users", htpasswdUsers,
 		"admin_pprof_enabled", cfg.Admin.PprofEnabled,
@@ -389,6 +441,14 @@ func serveListeners(
 		"admin_read_timeout", cfg.Admin.ReadTimeout.Duration,
 		"admin_idle_timeout", cfg.Admin.IdleTimeout.Duration,
 		"admin_metric_series_cap", cfg.Admin.MetricSeriesCap,
+		"acme_enabled", cfg.Acme.Enabled,
+		"acme_dns_name", cfg.Acme.DNSName,
+		"acme_directory_url", cfg.Acme.DirectoryURL,
+		"acme_listen", cfg.Acme.Listen,
+		"acme_renew_before_days", cfg.Acme.RenewBeforeDays,
+		"acme_check_interval", cfg.Acme.CheckInterval.Duration,
+		"cache_use_acme", cfg.Cache.UseAcme,
+		"admin_use_acme", cfg.Admin.UseAcme,
 		"trusted_signer_blocks", len(cfg.TrustedSigners),
 		"serve_stale_when_upstream_down", cfg.Serve.ServeStaleWhenUpstreamDown,
 		"log_format", cfg.Log.Format,
@@ -428,6 +488,21 @@ func serveListeners(
 	if !cfg.GC.Enabled {
 		logger.Warn("gc_disabled",
 			"detail", "gc.enabled = false: orphan blobs and displaced snapshots will not be reaped; pool/ size grows unboundedly with rolling adoptions")
+	}
+
+	// docs/acme-certificates-spec.md § "Défi HTTP-01": a startup
+	// WARNING (not an error) when acme.listen collides with a daemon
+	// listener's bind address — the HTTP-01 challenge server would
+	// fail to bind at issuance time. The authoritative failure stays
+	// the explicit bind error when the challenge server starts; this
+	// Warn surfaces the likely cause at boot.
+	if cfg.Acme.Enabled {
+		for _, conflict := range cfg.AcmeListenConflicts() {
+			logger.Warn("acme_listen_conflict",
+				"acme_listen", cfg.Acme.Listen,
+				"conflicts_with", conflict,
+				"detail", "acme.listen shares a bind address with "+conflict+": the HTTP-01 challenge server cannot bind while that listener holds the address; issuance or renewal will fail explicitly")
+		}
 	}
 
 	// SPEC5 §5.2 / §10.2: admin-listener startup events.
@@ -684,6 +759,14 @@ func serveListeners(
 	// + debug.ReadBuildInfo() and passes the value-type bridge.
 	var adminSrv *admin.Server
 	if cfg.Admin.Enabled {
+		// admin.use_acme = true switches the admin listener's
+		// certificate source to the shared ACME manager (hot reload
+		// on renewal). Mutually exclusive with the PEM pair —
+		// enforced by config.Validate and admin.New.
+		var adminTLSCertProvider func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+		if cfg.Admin.UseAcme {
+			adminTLSCertProvider = acmeMgr.GetCertificate
+		}
 		adminSrv, err = admin.New(admin.Config{
 			Cache:                   c,
 			GC:                      gcsvc,
@@ -698,6 +781,8 @@ func serveListeners(
 			TLSAddr:                 tlsAddrString(tlsLn),
 			AdminAddr:               adminLn.Addr().String(),
 			TLSMITM:                 &tlsMitmProvider{h: mitmHandles},
+			ACME:                    &acmeProvider{cfg: cfg, mgr: acmeMgr},
+			TLSCertProvider:         adminTLSCertProvider,
 			AdoptionArchitectures:   cfg.Adoption.Architectures,
 			AdoptionAcceptAnySigner: cfg.Adoption.AcceptAnySigner,
 			Keyring:                 &keyringProvider{k: keyring},
@@ -720,6 +805,17 @@ func serveListeners(
 	var tlsSrv *http.Server
 	if tlsLn != nil {
 		tlsSrv = newHTTPServer(h, logger)
+		// cache.use_acme = true switches the proxy HTTPS listener to
+		// the shared ACME certificate via GetCertificate: new
+		// handshakes pick up renewals without a restart, existing
+		// connections are untouched. Mutually exclusive with the
+		// cache.tls_cert / cache.tls_key PEM pair (config.Validate).
+		if cfg.Cache.UseAcme {
+			tlsSrv.TLSConfig = &tls.Config{
+				MinVersion:     tls.VersionTLS12,
+				GetCertificate: acmeMgr.GetCertificate,
+			}
+		}
 	}
 
 	// AIDEV-NOTE: errCh is buffered to (number of servers) so a goroutine
@@ -745,7 +841,15 @@ func serveListeners(
 		go func() {
 			defer wg.Done()
 			logger.Info("https listener accepting", "addr", tlsLn.Addr().String())
-			err := tlsSrv.ServeTLS(tlsLn, cfg.Cache.TLSCert, cfg.Cache.TLSKey)
+			// With use_acme the certificate comes from TLSConfig.
+			// GetCertificate; passing empty cert/key file names makes
+			// ServeTLS use the configured TLSConfig as-is.
+			var err error
+			if cfg.Cache.UseAcme {
+				err = tlsSrv.ServeTLS(tlsLn, "", "")
+			} else {
+				err = tlsSrv.ServeTLS(tlsLn, cfg.Cache.TLSCert, cfg.Cache.TLSKey)
+			}
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("https: %w", err)
 				return
@@ -758,13 +862,37 @@ func serveListeners(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			logger.Info("admin listener accepting", "addr", adminLn.Addr().String())
+			scheme := "http"
+			if cfg.Admin.TLSEnabled() {
+				scheme = "https"
+			}
+			logger.Info("admin listener accepting", "addr", adminLn.Addr().String(), "scheme", scheme)
 			err := adminSrv.Serve(adminLn)
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("admin: %w", err)
 				return
 			}
 			errCh <- nil
+		}()
+	}
+
+	// ACME renewal loop (docs/acme-certificates-spec.md § "Cycle de
+	// vie et stockage"): checks the certificate expiration every
+	// acme.check_interval, renews inside the renew_before_days
+	// window, and backs off exponentially (1m doubling, capped at
+	// 1h) after failures while the last valid certificate keeps
+	// being served. Runs under its own ctx derived from the serve ctx,
+	// cancelled as soon as shutdown begins: a listener failure does
+	// not cancel the serve ctx, and the final wg.Wait() would
+	// otherwise block on Run forever. A renewed certificate is picked
+	// up by new TLS handshakes via GetCertificate — no restart needed.
+	acmeCtx, acmeCancel := context.WithCancel(ctx)
+	defer acmeCancel()
+	if acmeMgr != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			acmeMgr.Run(acmeCtx)
 		}()
 	}
 
@@ -781,6 +909,7 @@ func serveListeners(
 			logger.Error("listener exited unexpectedly", "err", err)
 		}
 	}
+	acmeCancel()
 
 	// SPEC §9.5 step 2: stop accepting (Shutdown closes the listener
 	// before draining), then wait up to shutdownTimeout for in-flight
@@ -1353,6 +1482,39 @@ func wireTlsMitm(ctx context.Context, cfg *config.Config, parser *proxy.Parser, 
 }
 
 // tlsMitmProvider adapts a *tlsMitmHandles into the
+// acmeProvider adapts the shared *acme.Manager to the admin.
+// ACMEProvider interface. The surfaces selecting ACME come from the
+// config (stable for the daemon's lifetime); every live signal
+// (certificate fingerprint/validity, last renewal, last error) is
+// sampled from the manager per call so the status page reflects
+// current state — including renewals picked up without a restart.
+// nil receiver returns the disabled snapshot — supports the
+// acme.enabled = false branch uniformly.
+type acmeProvider struct {
+	cfg *config.Config
+	mgr *acme.Manager
+}
+
+func (p *acmeProvider) ACMESnapshot() admin.ACMESnapshot {
+	if p == nil || p.mgr == nil || p.cfg == nil {
+		return admin.ACMESnapshot{Enabled: false}
+	}
+	snap := p.mgr.Snapshot()
+	return admin.ACMESnapshot{
+		Enabled:               p.cfg.Acme.Enabled,
+		DNSName:               snap.DNSName,
+		DirectoryURL:          snap.DirectoryURL,
+		CacheUseAcme:          p.cfg.Cache.UseAcme,
+		AdminUseAcme:          p.cfg.Admin.UseAcme,
+		HasCert:               snap.HasCert,
+		CertFingerprintSHA256: snap.CertFingerprintSHA256,
+		CertNotBefore:         snap.CertNotBefore,
+		CertNotAfter:          snap.CertNotAfter,
+		LastError:             snap.LastError,
+		LastRenewalAt:         snap.LastRenewalAt,
+	}
+}
+
 // admin.TLSMITMProvider interface. Stable inputs (CA source,
 // fingerprint, capacity) are captured at construction; live signals
 // (cert cache size, last-issued, hit rate) are sampled per call so
@@ -1404,6 +1566,13 @@ func runCertCacheSizeRefresher(ctx context.Context, sizer func() int, interval t
 			proxy.SetCertCacheSize(sizer())
 		}
 	}
+}
+
+// emitACMELog forwards a structured event from internal/acme to the
+// daemon's slog.Logger. Same transport as emitTlsMitmLog; the manager
+// never logs keys, tokens or signed URLs.
+func emitACMELog(logger *slog.Logger, level, event string, fields map[string]any) {
+	emitTlsMitmLog(logger, level, event, fields)
 }
 
 // emitTlsMitmLog forwards a structured event from internal/proxy or

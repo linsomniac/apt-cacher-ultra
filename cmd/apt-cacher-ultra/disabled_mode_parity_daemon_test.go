@@ -125,7 +125,7 @@ func TestServe_DisabledMode_AdvertisedDeltasOnly(t *testing.T) {
 
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, adminLn, nil)
+		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, adminLn, nil, nil)
 	}()
 	t.Cleanup(func() {
 		cancel()

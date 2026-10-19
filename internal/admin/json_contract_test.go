@@ -169,6 +169,9 @@ func populatedJSONContractFixture() statusModel {
 	releaseSeen := int64(1_700_005_500)
 	caExpiry := int64(1_900_000_000)
 	certIssued := int64(1_700_006_000)
+	acmeNotBefore := int64(1_700_000_000)
+	acmeNotAfter := int64(1_700_007_776) // +90 days
+	acmeRenewed := int64(1_700_006_300)
 
 	return statusModel{
 		Process: processInfo{
@@ -221,6 +224,17 @@ func populatedJSONContractFixture() statusModel {
 			LastIssued:          &lastIssuedInfo{Host: "packages.example.com", AtUnixTime: certIssued},
 			HitRate60sPercent:   &hitRate,
 			HitRate60sObserved:  800,
+		},
+		ACME: &acmeInfo{
+			Enabled:               true,
+			DNSName:               "cache.example.net",
+			DirectoryURL:          "https://acme-v02.api.letsencrypt.org/directory",
+			Surfaces:              []string{"cache", "admin"},
+			CertFingerprintSHA256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+			CertNotBeforeUnixTime: &acmeNotBefore,
+			CertNotAfterUnixTime:  &acmeNotAfter,
+			LastRenewalUnixTime:   &acmeRenewed,
+			LastError:             "",
 		},
 		Suites: []suiteEntry{
 			{
@@ -308,6 +322,7 @@ func minimalJSONContractFixture() statusModel {
 		},
 		Listeners:       []listenerInfo{{Role: "admin", Addr: "127.0.0.1:6789"}},
 		TLSMITM:         &tlsMITMInfo{Enabled: false},
+		ACME:            &acmeInfo{Enabled: false},
 		Suites:          []suiteEntry{},
 		GC:              &gcInfo{}, // LastRunUnixTime nil → abbreviated MarshalJSON
 		HotURLPaths:     []hotURLEntry{},

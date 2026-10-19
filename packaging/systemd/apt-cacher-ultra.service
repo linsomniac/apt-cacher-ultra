@@ -18,6 +18,9 @@ ProtectSystem=strict
 ReadWritePaths=/var/cache/apt-cacher-ultra
 ProtectHome=true
 NoNewPrivileges=true
+# Lets acme.listen bind a privileged port (HTTP-01 on :80) without root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true

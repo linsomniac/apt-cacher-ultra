@@ -659,7 +659,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
 
       <!-- PLUMBING -->
       <section class="panel" id="plumbing">
-        <div class="panel__eyebrow"><span>Plumbing</span><span class="sep">&mdash;</span><span>LISTENERS &middot; TLS MITM &middot; PROCESS</span></div>
+        <div class="panel__eyebrow"><span>Plumbing</span><span class="sep">&mdash;</span><span>LISTENERS &middot; TLS MITM &middot; ACME &middot; PROCESS</span></div>
         <h2 class="panel__h">Bindings, certificates, build</h2>
 
         <div class="kv" style="margin-bottom:24px">
@@ -684,6 +684,26 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
           <div class="v">{{if .TLSMITM.LastIssued}}<code>{{.TLSMITM.LastIssued.Host}}</code> @ <span class="time mono">{{unixTime .TLSMITM.LastIssued.AtUnixTime}}</span>{{else}}<span class="muted">(none yet)</span>{{end}}</div>
           <div class="k">Cert hit rate (60s)</div>
           <div class="v"><code>{{hitRatePct .TLSMITM.HitRate60sPercent .TLSMITM.HitRate60sObserved}}</code></div>
+        </div>
+        {{end}}
+
+        {{if and .ACME .ACME.Enabled}}
+        <div class="kv" style="margin-bottom:24px">
+          <div class="kv__group-head"><span>ACME</span> <span class="sep">&mdash;</span> <span class="b b--ok">enabled</span></div>
+          <div class="k">DNS name</div>
+          <div class="v"><code>{{.ACME.DNSName}}</code></div>
+          <div class="k">Authority</div>
+          <div class="v"><code>{{.ACME.DirectoryURL}}</code></div>
+          <div class="k">Surfaces</div>
+          <div class="v">{{range .ACME.Surfaces}}<span class="b b--neutral">{{.}}</span> {{end}}</div>
+          <div class="k">Cert fingerprint (SHA-256)</div>
+          <div class="v"><span class="fp">{{chunkHex .ACME.CertFingerprintSHA256 4}}</span></div>
+          <div class="k">Cert valid</div>
+          <div class="v"><span class="time mono">{{unixTimePtr .ACME.CertNotBeforeUnixTime}}</span> &rarr; <span class="time mono">{{unixTimePtr .ACME.CertNotAfterUnixTime}}</span></div>
+          <div class="k">Last renewal</div>
+          <div class="v">{{if .ACME.LastRenewalUnixTime}}<span class="time mono">{{unixTimePtr .ACME.LastRenewalUnixTime}}</span>{{else}}<span class="muted">(none yet)</span>{{end}}</div>
+          <div class="k">Last error</div>
+          <div class="v">{{if .ACME.LastError}}<span class="b b--crit">{{.ACME.LastError}}</span>{{else}}<span class="muted">(none)</span>{{end}}</div>
         </div>
         {{end}}
 

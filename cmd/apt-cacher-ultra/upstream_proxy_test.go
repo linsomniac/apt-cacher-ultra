@@ -96,7 +96,7 @@ upstream = "http://repository.invalid/"
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, nil, nil)
+		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, nil, nil, nil)
 	}()
 	var once sync.Once
 	shutdown := func() {

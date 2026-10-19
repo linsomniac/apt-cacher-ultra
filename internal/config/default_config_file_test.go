@@ -146,6 +146,7 @@ func loadConfigInTempDir(t *testing.T, raw, dir string) *Config {
 		t.Fatalf("packaged cache.dir = %q, want %q", cfg.Cache.Dir, DefaultCacheDir)
 	}
 	if cfg.Cache.TLSCert != "" || cfg.Cache.TLSKey != "" || cfg.Admin.HtpasswdFile != "" ||
+		cfg.Admin.TLSCert != "" || cfg.Admin.TLSKey != "" ||
 		cfg.TlsMitm.CaCert != "" || cfg.TlsMitm.CaKey != "" || cfg.TlsMitm.CaStorageDir != "" {
 		t.Fatal("packaged config must not require external TLS, CA, or htpasswd paths")
 	}

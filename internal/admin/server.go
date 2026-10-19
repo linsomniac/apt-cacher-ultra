@@ -19,6 +19,7 @@ package admin
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
 	"math/rand/v2"
@@ -75,6 +76,22 @@ type Config struct {
 	// skips the HTML section. Lives behind an interface so admin
 	// does not import internal/proxy or internal/proxy/tlsmitm.
 	TLSMITM TLSMITMProvider
+
+	// ACME provides the status-page ACME section snapshot (docs/
+	// acme-certificates-spec.md § "Observabilité"). nil is treated
+	// as ACME disabled — the status page emits the abbreviated
+	// `{"enabled": false}` JSON form and skips the HTML section.
+	// Lives behind an interface so admin does not import
+	// internal/acme.
+	ACME ACMEProvider
+
+	// TLSCertProvider, when non-nil, supplies the admin listener's
+	// TLS certificate via tls.Config.GetCertificate (hot reload on
+	// renewal). Used when admin.use_acme = true; mutually exclusive
+	// with the Admin.TLSCert / Admin.TLSKey PEM pair — New rejects
+	// a Config that sets both (exactly one certificate source per
+	// surface, per the ACME spec).
+	TLSCertProvider func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
 	// AdoptionArchitectures echoes the operator's
 	// [adoption].architectures setting onto the SPEC6_5 §2.4
@@ -157,6 +174,32 @@ type TLSMITMSnapshot struct {
 	LastIssuedAt        time.Time // zero when no issuance recorded
 	HitRate60sHits      int       // raw counts so the renderer can decide on n/a vs 0%
 	HitRate60sMisses    int
+}
+
+// ACMEProvider supplies the status-page ACME section snapshot
+// (docs/acme-certificates-spec.md § "Observabilité"). cmd constructs
+// an implementation that closes over the acme.Manager and the
+// surfaces selecting ACME.
+type ACMEProvider interface {
+	ACMESnapshot() ACMESnapshot
+}
+
+// ACMESnapshot is the status-page ACME payload. It carries no secret:
+// no keys, no tokens, no signed URLs. Mirrored from acme.Snapshot but
+// redefined here so admin does not import internal/acme; cmd's
+// adapter copies the values and adds the selected surfaces.
+type ACMESnapshot struct {
+	Enabled               bool
+	DNSName               string
+	DirectoryURL          string
+	CacheUseAcme          bool
+	AdminUseAcme          bool
+	HasCert               bool
+	CertFingerprintSHA256 string
+	CertNotBefore         time.Time // zero when no certificate
+	CertNotAfter          time.Time // zero when no certificate
+	LastError             string    // empty when no failure recorded
+	LastRenewalAt         time.Time // zero when no renewal recorded
 }
 
 // Server is the SPEC5 §9.7 admin HTTP server. Owns the *http.Server,
@@ -284,6 +327,26 @@ func New(cfg Config) (*Server, error) {
 	if cfg.AdminAddr == "" {
 		return nil, errors.New("admin: AdminAddr is required")
 	}
+	// config.Validate rejects a half-set pair for file-loaded configs;
+	// repeat the check here so a programmatically built Config (tests,
+	// embedders) cannot silently fall back to plain HTTP with only
+	// one of tls_cert / tls_key set.
+	if (cfg.Admin.TLSCert != "") != (cfg.Admin.TLSKey != "") {
+		return nil, errors.New("admin: Admin.TLSCert / Admin.TLSKey must both be set or both empty")
+	}
+	// Exactly one certificate source per surface: a dynamic provider
+	// (ACME) and a manual PEM pair are mutually exclusive. config.
+	// Validate enforces this for file-loaded configs; repeating it
+	// here protects programmatically built Configs (tests, embedders).
+	if cfg.TLSCertProvider != nil && (cfg.Admin.TLSCert != "" || cfg.Admin.TLSKey != "") {
+		return nil, errors.New("admin: TLSCertProvider and Admin.TLSCert / Admin.TLSKey are mutually exclusive")
+	}
+	// Admin.UseAcme makes TLSEnabled() true: without a provider, Serve
+	// would fall through to ServeTLS with no certificate at all; a
+	// provider without UseAcme would be silently ignored.
+	if cfg.Admin.UseAcme != (cfg.TLSCertProvider != nil) {
+		return nil, errors.New("admin: Admin.UseAcme requires TLSCertProvider, and TLSCertProvider requires Admin.UseAcme")
+	}
 
 	s := &Server{
 		cfg:    cfg,
@@ -402,6 +465,16 @@ func (s *Server) buildHandler() http.Handler {
 // other listener error is returned. cmd is responsible for bind
 // (net.Listen); Serve owns the Accept loop.
 //
+// When admin.tls_cert / admin.tls_key are set, the listener serves
+// HTTPS via ServeTLS on the same admin.listen address; otherwise it
+// serves plain HTTP. When Config.TLSCertProvider is set (admin.
+// use_acme = true) the listener instead serves HTTPS with a dynamic
+// GetCertificate — the same address, with the certificate renewed in
+// place. New rejects a half-set pair and the pair is validated at
+// config load (tls.LoadX509KeyPair), so ServeTLS cannot fail on a bad
+// pair here. The htpasswd and request-log middlewares run after the
+// TLS handshake, so their behavior is identical under both schemes.
+//
 // SPEC5 §3.2 / §9.7.6: the first gauge refresh runs synchronously
 // BEFORE the HTTP server begins accepting requests, so the very
 // first /metrics scrape sees populated values rather than the
@@ -411,7 +484,24 @@ func (s *Server) buildHandler() http.Handler {
 func (s *Server) Serve(ln net.Listener) error {
 	s.runRefreshOnce(context.Background())
 	s.startRefresher()
-	if err := s.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	var err error
+	if s.cfg.Admin.TLSEnabled() {
+		if s.cfg.TLSCertProvider != nil {
+			// Dynamic certificate source (admin.use_acme = true):
+			// the provider serves the current certificate and picks
+			// up renewals on new handshakes without a restart.
+			s.server.TLSConfig = &tls.Config{
+				MinVersion:     tls.VersionTLS12,
+				GetCertificate: s.cfg.TLSCertProvider,
+			}
+			err = s.server.ServeTLS(ln, "", "")
+		} else {
+			err = s.server.ServeTLS(ln, s.cfg.Admin.TLSCert, s.cfg.Admin.TLSKey)
+		}
+	} else {
+		err = s.server.Serve(ln)
+	}
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil

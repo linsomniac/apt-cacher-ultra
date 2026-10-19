@@ -76,6 +76,20 @@
     "cert_hit_rate_60s_percent": 92.5,
     "cert_hit_rate_60s_observed": 800
   },
+  "acme": {
+    "enabled": true,
+    "dns_name": "cache.example.net",
+    "directory_url": "https://acme-v02.api.letsencrypt.org/directory",
+    "surfaces": [
+      "cache",
+      "admin"
+    ],
+    "cert_fingerprint_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    "cert_not_before_unixtime": 1700000000,
+    "cert_not_after_unixtime": 1700007776,
+    "last_renewal_unixtime": 1700006300,
+    "last_error": ""
+  },
   "suites": [
     {
       "host": "archive.ubuntu.com",

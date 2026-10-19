@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/testutil/tlscert"
 )
 
 func writeTOML(t *testing.T, dir, name, content string) string {
@@ -338,6 +340,27 @@ tls_key = "/nonexistent/key.pem"
 			wantErr: "tls_cert",
 		},
 		{
+			name: "admin tls half-set",
+			body: `[cache]
+dir = "DIR"
+listen = "0.0.0.0:3142"
+[admin]
+tls_cert = "/nonexistent/cert.pem"
+`,
+			wantErr: "admin.tls_cert / admin.tls_key",
+		},
+		{
+			name: "admin tls cert path missing",
+			body: `[cache]
+dir = "DIR"
+listen = "0.0.0.0:3142"
+[admin]
+tls_cert = "/nonexistent/cert.pem"
+tls_key = "/nonexistent/key.pem"
+`,
+			wantErr: "admin.tls_cert",
+		},
+		{
 			name: "log level invalid",
 			body: `[cache]
 dir = "DIR"
@@ -360,6 +383,72 @@ level = "verbose"
 			}
 			if !strings.Contains(err.Error(), tc.wantErr) {
 				t.Errorf("error %q does not contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestLoad_AdminTLS pins the admin.tls_cert / admin.tls_key pair
+// validation: a valid pair loads, and a mismatched pair fails fast at
+// Load via tls.LoadX509KeyPair — the admin listener must never reach
+// a half-bound state with a typo'd pair.
+func TestLoad_AdminTLS(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := t.TempDir()
+	// Two independent pairs: A is the valid pairing; B's key builds
+	// the mismatched cert-A + key-B case.
+	certA, keyA := testutil.WriteSelfSignedCert(t, filepath.Join(root, "a"))
+	_, keyB := testutil.WriteSelfSignedCert(t, filepath.Join(root, "b"))
+
+	load := func(t *testing.T, cert, key string) (*Config, error) {
+		t.Helper()
+		body := fmt.Sprintf("[cache]\ndir = %q\nlisten = \"0.0.0.0:3142\"\n[admin]\ntls_cert = %q\ntls_key = %q\n",
+			cacheDir, cert, key)
+		return Load(writeTOML(t, root, "config.toml", body))
+	}
+
+	t.Run("valid pair loads", func(t *testing.T) {
+		cfg, err := load(t, certA, keyA)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Admin.TLSCert != certA || cfg.Admin.TLSKey != keyA {
+			t.Errorf("admin TLS paths = %q/%q, want %q/%q",
+				cfg.Admin.TLSCert, cfg.Admin.TLSKey, certA, keyA)
+		}
+	})
+
+	t.Run("mismatched pair rejected at load", func(t *testing.T) {
+		_, err := load(t, certA, keyB)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "admin.tls_cert/tls_key") {
+			t.Errorf("error %q does not contain %q", err.Error(), "admin.tls_cert/tls_key")
+		}
+	})
+}
+
+// TestAdminConfig_TLSEnabled pins the all-or-nothing semantics behind
+// every admin TLS branch (Serve, the status page, the startup log):
+// true only when both paths are set, so a half-set pair can never
+// read as "TLS on".
+func TestAdminConfig_TLSEnabled(t *testing.T) {
+	cases := []struct {
+		name      string
+		cert, key string
+		want      bool
+	}{
+		{name: "both empty", cert: "", key: "", want: false},
+		{name: "both set", cert: "c.pem", key: "k.pem", want: true},
+		{name: "cert only", cert: "c.pem", key: "", want: false},
+		{name: "key only", cert: "", key: "k.pem", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := AdminConfig{TLSCert: tc.cert, TLSKey: tc.key}
+			if got := a.TLSEnabled(); got != tc.want {
+				t.Errorf("TLSEnabled() = %v, want %v", got, tc.want)
 			}
 		})
 	}

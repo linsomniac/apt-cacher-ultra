@@ -38,6 +38,9 @@
   "tls_mitm": {
     "enabled": false
   },
+  "acme": {
+    "enabled": false
+  },
   "suites": [],
   "gc": {
     "last_run_unixtime": null

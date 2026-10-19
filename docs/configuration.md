@@ -48,14 +48,17 @@ only the admin listener.
 | --- | --- | --- | --- |
 | `dir` | string | **Required** | Existing writable cache root. The package example uses `/var/cache/apt-cacher-ultra`. Stores the database, blobs, temporary files, and, by default, the MITM CA. |
 | `listen` | string | `"0.0.0.0:3142"` | HTTP proxy bind address. Empty string also selects the default. |
-| `listen_tls` | string | `""` | Additional TLS proxy listener; empty disables it. Set together with `tls_cert` and `tls_key`. |
-| `tls_cert` | string | `""` | Readable PEM server certificate for `listen_tls`; validated with its key when the daemon starts. |
-| `tls_key` | string | `""` | Readable PEM private key matching `tls_cert`. |
+| `listen_tls` | string | `""` | Additional TLS proxy listener; empty disables it. Set together with `tls_cert` and `tls_key`, or select the daemon-managed certificate with `use_acme`. |
+| `tls_cert` | string | `""` | Readable PEM server certificate for `listen_tls`; validated with its key when the daemon starts. Incompatible with `use_acme`. |
+| `tls_key` | string | `""` | Readable PEM private key matching `tls_cert`. Incompatible with `use_acme`. |
+| `use_acme` | boolean | `false` | Serve `listen_tls` with the daemon-managed ACME certificate from `[acme]` instead of a manual PEM pair. Requires `listen_tls` and `acme.enabled`. See [automatic server certificates](#acme-automatic-server-certificates). |
 | `advertise_host` | string | `""` | Client-facing hostname or `host:port` for `--print-apt-conf`, without a scheme or path. A missing port uses the port from `listen`. Does not change listener binding or request routing. |
 
 `listen_tls`, `tls_cert`, and `tls_key` must be either all set or all empty.
-These settings secure the client-to-proxy connection; `[tls_mitm]` separately
-controls interception of upstream HTTPS repositories.
+Exactly one certificate source is allowed per surface: `use_acme = true` is
+incompatible with `tls_cert` / `tls_key`. These settings secure the
+client-to-proxy connection; `[tls_mitm]` separately controls interception of
+upstream HTTPS repositories.
 
 When `advertise_host` is empty, `--print-apt-conf` uses `listen`. The command
 refuses unspecified bind hosts (`0.0.0.0`, `::`, or an empty host), so a typical
@@ -324,16 +327,21 @@ applies when `enabled = false`.
 
 ## `[admin]`: status, metrics, and maintenance
 
-The separate **HTTP** admin listener serves the status page, `/metrics`, and
+The separate admin listener (plain **HTTP** by default, **HTTPS** when
+`tls_cert`/`tls_key` are set) serves the status page, `/metrics`, and
 `/healthz`, plus the mutating `POST /reconcile` maintenance endpoint. It is not a
 read-only interface. Keep access restricted to trusted operators; if exposed
-beyond loopback, protect the network path or place it behind a TLS reverse proxy.
-HTTP Basic authentication does not encrypt credentials in transit.
+beyond loopback, protect the network path, enable TLS, or place it behind a TLS
+reverse proxy. On a plain-HTTP listener, HTTP Basic authentication does not
+encrypt credentials in transit.
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | Bind the admin listener and run its background refresh work. `false` leaves proxy service running and logs a warning. |
 | `listen` | string | `"127.0.0.1:6789"` | Admin bind address. A non-loopback address without authentication emits a startup warning. Explicit empty string is invalid when enabled. |
+| `tls_cert` | string | `""` | PEM server certificate for the admin listener. Both empty (default) keeps plain HTTP on `listen`; both set switches the admin endpoints to HTTPS on the same address. Must be set together with `tls_key`. Incompatible with `use_acme`. |
+| `tls_key` | string | `""` | PEM private key matching `tls_cert`. The pair is validated at startup (`tls.LoadX509KeyPair`), so a mismatched pair fails fast instead of at the first handshake. Incompatible with `use_acme`. |
+| `use_acme` | boolean | `false` | Serve the admin listener over HTTPS with the daemon-managed ACME certificate from `[acme]` instead of a manual PEM pair. Requires `enabled` and `acme.enabled`. See [automatic server certificates](#acme-automatic-server-certificates). |
 | `htpasswd_file` | string | `""` | Optional readable Apache htpasswd file with at least one user; only bcrypt (`$2a$`, `$2b$`, `$2y$`) entries are accepted. Empty disables authentication. Applies to every admin endpoint. |
 | `pprof_enabled` | boolean | `false` | Enable `GET /debug/pprof/profile`, `/debug/pprof/heap`, and `/debug/pprof/goroutine` on the admin listener, with the same authentication. CPU capture defaults to 30 seconds; `?seconds=N` accepts integers from 1 through 300. Profiles expose process details; enable only for trusted operators. |
 | `gauge_refresh` | duration | `"30s"` | Delay after a completed refresh before recomputing gauges. Values can lag by this delay plus refresh work time. Positive and at most `"1h"`. |
@@ -346,6 +354,17 @@ request when its modification time (in whole seconds) or size changes. A same-si
 rewrite within the same second may be missed. Reload failures retain the previous
 credentials and log a warning. Changing the configured file path needs a daemon
 restart. These per-key constraints are skipped when `admin.enabled = false`.
+
+Set `tls_cert` and `tls_key` together to serve the admin listener over HTTPS on
+the same `listen` address — the status page, `/metrics`, `/healthz`, and
+`POST /reconcile` all move to TLS, and the status page advertises the admin
+listener with an `https://` scheme. With TLS active, `htpasswd_file` Basic auth
+credentials travel encrypted. External probes (Kubernetes, blackbox_exporter)
+should target `https://<listen>/healthz` and trust the configured certificate.
+The pair is loaded once when the listener starts: changing `tls_cert` /
+`tls_key` or rotating the certificate takes effect only after a daemon
+restart. With `use_acme = true` the daemon renews the certificate instead, and
+new handshakes pick up a renewed certificate without a restart.
 
 Profiling is inactive until explicitly enabled and requested. Profile routes
 accept GET only, use binary `go tool pprof` format, and do not force a Go garbage
@@ -429,6 +448,88 @@ changing its lifetime or setting `allow_unconstrained_ca = false` also does not
 replace or recheck the existing CA against the new generation policy. To adopt
 a new CA policy, provision a new CA (for example in a new `ca_storage_dir`) and
 distribute its certificate to clients as a planned trust change.
+
+## `[acme]`: automatic server certificates
+
+The daemon can obtain and renew a public server certificate from an ACME
+authority (Let's Encrypt by default) and serve it on `cache.listen_tls`,
+`admin.listen`, or both. The certificate is managed by the daemon: obtained
+before the ACME surfaces start serving, renewed before expiration, and
+reloaded without a restart. The ACME certificate is never used as a MITM CA,
+and the MITM CA is never sent to an ACME authority — the two TLS subsystems
+are independent.
+
+| Key | Type | Default | Behavior and constraints |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Master switch. `false` creates no account, challenge, or certificate, and any `use_acme = true` is a configuration error. |
+| `directory_url` | string | `""` | ACME directory endpoint; required when enabled. Must be an HTTPS URL without credentials, fragment, or query. Use the staging endpoint for trials — production enforces rate limits: `https://acme-staging-v02.api.letsencrypt.org/directory` (production: `https://acme-v02.api.letsencrypt.org/directory`). |
+| `dns_name` | string | `""` | Single FQDN placed in the server certificate; required when enabled. No scheme, path, port, IP literal, or wildcard. Both ACME surfaces are served under this one name. |
+| `listen` | string | `"0.0.0.0:80"` | Local address temporarily bound by the HTTP-01 challenge server during issuance or renewal. |
+| `renew_before_days` | integer | `7` | Renew when the certificate expiration is at most this many days away. At least `1`. When it covers the whole certificate lifetime (e.g. `7` with 6-day certificates), the window is clamped to a third of the lifetime and `acme_renew_before_clamped` is logged, so a certificate is never due as soon as issued. |
+| `check_interval` | duration | `"12h"` | How often the certificate expiration is checked. Must be positive and well below the certificate lifetime so a renewal is never missed. |
+
+Each surface selects the ACME certificate independently with `cache.use_acme`
+(requires `cache.listen_tls`) or `admin.use_acme` (requires `admin.enabled`);
+at least one of them must be set when `[acme]` is enabled. Both surfaces share
+the one certificate and its renewal. A surface's `use_acme = true` is
+incompatible with its manual `tls_cert` / `tls_key` pair — exactly one
+certificate source per surface.
+
+The HTTP-01 challenge requires the authority to reach
+`http://<dns_name>/.well-known/acme-challenge/<token>` on public TCP port 80.
+Point DNS for `dns_name` at the cache host and publish port 80 to
+`acme.listen` through a firewall rule, NAT, or reverse proxy. A local
+`acme.listen` port other than 80 (for example `127.0.0.1:8080`) works only when
+such a forward exists; changing `acme.listen` alone does not make the
+validation succeed. Binding port 80 requires `CAP_NET_BIND_SERVICE`: the
+packaged systemd unit grants it through `AmbientCapabilities` (with a matching
+`CapabilityBoundingSet`) so the daemon keeps running as its unprivileged user.
+A custom unit must do the same; `setcap` on the binary does not work under the
+packaged unit's `NoNewPrivileges=true`. The challenge server runs only during
+an issuance or renewal and serves only the `/.well-known/acme-challenge/` path.
+If no usable certificate is available at startup — the first issuance failed,
+or the stored certificate is expired and its renewal failed — the daemon exits
+with an error and serves nothing.
+
+The account, certificate, and renewal metadata persist in `<cache.dir>/acme`
+(directory mode `0700`, private keys `0600`). Keep this directory on persistent
+storage: a valid stored certificate is served immediately on restart without
+contacting the authority. After a failed renewal the daemon retries with an
+exponential backoff (1 minute, doubling per failure, capped at 1 hour) while
+the last valid certificate keeps being served; new TLS handshakes pick up a
+renewed certificate without a restart. The status page's `acme` section shows
+the DNS name, authority, selected surfaces, and the current certificate's
+fingerprint and validity — never any key material.
+
+The stored account and certificate are reused only when they come from the
+configured `acme.directory_url`: after a directory change (for example from the
+Let's Encrypt staging endpoint to production), the daemon registers a new
+account and obtains a new certificate instead of serving the old one. A stored
+certificate that cannot be read, or whose chain does not match its private key,
+is treated as absent and issued again. Before issuing, the daemon re-reads the
+storage once it holds the interprocess lock: if another instance sharing the
+directory has just obtained a valid certificate, it reuses that certificate
+instead of issuing a duplicate.
+
+```toml
+[acme]
+enabled = true
+directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
+dns_name = "cache.example.net"
+listen = "0.0.0.0:80"
+
+[cache]
+listen_tls = "0.0.0.0:443"
+use_acme = true
+
+[admin]
+enabled = true
+listen = "0.0.0.0:8443"
+use_acme = true
+```
+
+See [the ACME certificate spec](acme-certificates-spec.md) for the full design,
+validation rules, and observability events.
 
 ## `[[trusted_signer]]`: restrict repository signing keys
 

@@ -115,7 +115,7 @@ func TestServe_GracefulShutdown_DrainsInflightCONNECT(t *testing.T) {
 
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
+		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil, nil)
 	}()
 
 	// Wait for the daemon's serve loop to be accepting+handling — the
@@ -286,7 +286,7 @@ func TestServe_GracefulShutdown_StalledCONNECT_DrainBudget(t *testing.T) {
 
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
+		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil, nil)
 	}()
 
 	if err := waitForDaemonReady(t, cacheAddr, 10*time.Second); err != nil {
