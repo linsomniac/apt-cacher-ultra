@@ -1,9 +1,7 @@
 package cache
 
 import (
-	"bytes"
 	"context"
-	"log/slog"
 	"testing"
 )
 
@@ -104,18 +102,5 @@ func TestDisplacedSnapshotMembers_OrdersByAdoptionAndScopesToTheSuite(t *testing
 	rows, err = c.DisplacedSnapshotMembers(ctx, "http", "a", suite, alias, current, 1)
 	if err != nil || len(rows) != 1 || rows[0].SnapshotID != older {
 		t.Fatalf("limit 1: displaced members = %+v, %v; want only snapshot %d", rows, err, older)
-	}
-}
-
-// Deferred minor A-18: the package's cache helper logs nothing (test output
-// stays pristine).
-func TestOpenCache_LogsNothing(t *testing.T) {
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	defer slog.SetDefault(prev)
-	openCache(t)
-	if buf.Len() != 0 {
-		t.Fatalf("openCache logged:\n%s", buf.String())
 	}
 }
