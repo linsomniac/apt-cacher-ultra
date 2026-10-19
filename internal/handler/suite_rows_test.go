@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -394,14 +393,7 @@ func TestServeHTTP_MarkerPrecedesTheFirstBodyByte(t *testing.T) {
 // failures and rewinds state the cache's API does not expose).
 func (r *suiteRig) secondConn() *sql.DB {
 	r.t.Helper()
-	q := url.Values{}
-	q.Add("_pragma", "busy_timeout(5000)")
-	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: filepath.Join(r.dir, "cache.db"), RawQuery: q.Encode()}).String())
-	if err != nil {
-		r.t.Fatal(err)
-	}
-	r.t.Cleanup(func() { _ = db.Close() })
-	return db
+	return sqliteFile(r.t, filepath.Join(r.dir, "cache.db"))
 }
 
 // Spec C3: a failed writer operation serves no body — 502, as a url_path

@@ -288,10 +288,12 @@ func TestServeHTTP_OnboardsADistsSuiteFromAV6Cache(t *testing.T) {
 
 // assertHitPathInvariant checks deviation 1's invariant: every
 // sniff-passing InRelease or Release.gpg url_path row of a tracked suite
-// has a marker for its base.
+// has a marker for its base. Every read error fails the test: the oracle
+// never skips a row it could not check.
 func assertHitPathInvariant(t *testing.T, c *cache.Cache, db *sql.DB, when string) {
 	t.Helper()
-	rows, err := db.Query(`SELECT canonical_host, path, blob_hash FROM url_path
+	ctx := context.Background()
+	rows, err := db.Query(`SELECT canonical_scheme, canonical_host, path, blob_hash FROM url_path
  WHERE path LIKE '%/InRelease' OR path LIKE '%/Release.gpg'`)
 	if err != nil {
 		t.Fatal(err)
@@ -299,12 +301,16 @@ func assertHitPathInvariant(t *testing.T, c *cache.Cache, db *sql.DB, when strin
 	defer func() { _ = rows.Close() }()
 	checked := 0
 	for rows.Next() {
-		var host, path, hash string
-		if err := rows.Scan(&host, &path, &hash); err != nil {
+		var scheme, host, path, hash string
+		if err := rows.Scan(&scheme, &host, &path, &hash); err != nil {
 			t.Fatal(err)
 		}
 		suite := strings.TrimSuffix(strings.TrimSuffix(path, "/InRelease"), "/Release.gpg")
-		if ok, err := c.SuiteExists(context.Background(), cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite}); err != nil || !ok {
+		ok, err := c.SuiteExists(ctx, cache.SuiteKey{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite})
+		if err != nil {
+			t.Fatalf("%s: %s %s%s: SuiteExists: %v", when, scheme, host, suite, err)
+		}
+		if !ok {
 			continue
 		}
 		body, err := os.ReadFile(c.BlobPath(hash))
@@ -316,9 +322,16 @@ func assertHitPathInvariant(t *testing.T, c *cache.Cache, db *sql.DB, when strin
 			continue
 		}
 		checked++
-		if _, ok, err := c.SignedSeen(context.Background(), "http", host, aptpath.MarkerBase(suite)); err != nil || !ok {
+		_, marked, err := c.SignedSeen(ctx, scheme, host, aptpath.MarkerBase(suite))
+		if err != nil {
+			t.Fatalf("%s: %s %s%s: SignedSeen: %v", when, scheme, host, path, err)
+		}
+		if !marked {
 			t.Errorf("%s: %s of a tracked suite has no marker", when, path)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("%s: scanning url_path: %v", when, err)
 	}
 	if checked == 0 {
 		t.Fatalf("%s: no tracked signed anchor to check", when)
@@ -340,8 +353,16 @@ func TestHitPathInvariant_EveryTrackedSignedAnchorHasAMarker(t *testing.T) {
 	r.serve("/r/dists/b/Release.gpg", upFile{body: rowGPG})
 	r.get("/r/dists/a/InRelease") // first contact: tracked
 	assertHitPathInvariant(t, r.c, db, "after a's first contact")
-	r.get("/r/dists/b/InRelease") // refused at the per-host cap
-	r.get("/r/dists/b/Release.gpg")
+	// b is refused at the per-host cap; its anchors are still served and
+	// cached, for the onboarding below to find.
+	for _, p := range []string{"/r/dists/b/InRelease", "/r/dists/b/Release.gpg"} {
+		if rec := r.get(p); rec.Code != http.StatusOK {
+			t.Fatalf("premise: refused %s = %d, want 200", p, rec.Code)
+		}
+		if _, err := r.c.LookupURL(ctx, "http", "127.0.0.1", p); err != nil {
+			t.Fatalf("premise: refused %s was not cached (%v)", p, err)
+		}
+	}
 	if r.suite("/r/dists/b") != nil {
 		t.Fatal("premise: b must be refused")
 	}
@@ -354,26 +375,43 @@ func TestHitPathInvariant_EveryTrackedSignedAnchorHasAMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(h2.Close)
-	get2 := func(path string) {
+	get2 := func(path string) *httptest.ResponseRecorder {
 		t.Helper()
 		rec := httptest.NewRecorder()
 		h2.ServeHTTP(rec, proxyReq("GET", r.srv.URL, path))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s = %d", path, rec.Code)
 		}
+		return rec
 	}
-	get2("/r/dists/b/InRelease") // onboards b, marking its cached anchors
+	// onboard2 serves a cached anchor through h2 — a url_path hit — and
+	// requires that it tracked the suite: onboarding fails open by design
+	// (design note 23), so the invariant checks below would otherwise pass
+	// with the suite left untracked.
+	onboard2 := func(path, suite string) {
+		t.Helper()
+		if rec := get2(path); rec.Header().Get(hdrXCache) != cacheHit {
+			t.Fatalf("%s: X-Cache %q, want %q (onboarding is a url_path hit)", path, rec.Header().Get(hdrXCache), cacheHit)
+		}
+		if r.suite(suite) == nil {
+			t.Fatalf("%s: %s was not onboarded (no row)", path, suite)
+		}
+	}
+	onboard2("/r/dists/b/InRelease", "/r/dists/b") // onboards b, marking its cached anchors
 	assertHitPathInvariant(t, r.c, db, "after b's onboarding")
 	r.cacheAnchor("/r/dists/c/InRelease", rowInRelease, 1_700_000_000)
 	r.cacheAnchor("/r/dists/c/Release.gpg", rowGPG, 1_700_000_000)
-	get2("/r/dists/c/Release.gpg") // legacy rows: Release.gpg creates no row
-	get2("/r/dists/c/InRelease")   // onboards c
+	if rec := get2("/r/dists/c/Release.gpg"); rec.Header().Get(hdrXCache) != cacheHit || r.suite("/r/dists/c") != nil {
+		t.Fatalf("c's Release.gpg: X-Cache %q, row %v; want a hit that creates no row (Release.gpg never does)",
+			rec.Header().Get(hdrXCache), r.suite("/r/dists/c") != nil)
+	}
+	onboard2("/r/dists/c/InRelease", "/r/dists/c") // onboards c
 	assertHitPathInvariant(t, r.c, db, "after c's onboarding")
 	r.cacheAnchor("/r/dists/e/Release", rowRelease, 1_700_000_000)
 	r.cacheAnchor("/r/dists/e/Release.gpg", rowGPG, 1_700_000_000)
 	// Onboards e: Release marks nothing itself; the creating transaction
 	// marks its cached Release.gpg (SuiteSeed.Cached).
-	get2("/r/dists/e/Release")
+	onboard2("/r/dists/e/Release", "/r/dists/e")
 	assertHitPathInvariant(t, r.c, db, "after e's onboarding")
 	if _, err := db.Exec(`DELETE FROM url_path WHERE path = '/r/dists/a/InRelease';
 DELETE FROM suite_signed_seen WHERE base = '/r/dists/a'`); err != nil {
