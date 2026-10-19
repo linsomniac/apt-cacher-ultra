@@ -1,6 +1,6 @@
 # Flat repositories, eager adoption, and suite lifecycle — design
 
-- **Date:** 2026-09-27 (revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
+- **Date:** 2026-09-27 (revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
 - **Status:** draft for maintainer review
 - **Branch:** `feature/flat-repos` (from `main` @ 536a1ab)
 - **Origin:** reimplementation of the problem reported in PR #8 ("Refresh flat
@@ -258,19 +258,43 @@ sources).
 |---|---|
 | `InRelease` | the first line is exactly `-----BEGIN PGP SIGNED MESSAGE-----` (trailing `\r`/space/tab stripped) — apt's rule |
 | `Release` | a `SHA256:`, `SHA512:`, `SHA1:` or `MD5Sum:` header line appears in the first 64 KiB |
-| `Release.gpg` | armor header `-----BEGIN PGP SIGNATURE-----` as the first non-whitespace text (leading whitespace is accepted; leading non-header lines, which gpg tolerates, are rejected), or a binary OpenPGP signature packet (old-format tag bytes 0x88–0x8B, new-format 0xC2) |
+| `Release.gpg` | armor header `-----BEGIN PGP SIGNATURE-----` as the first non-whitespace text (leading whitespace is accepted; leading non-header lines, which gpg tolerates, are rejected), or a binary OpenPGP signature packet: old-format tag byte 0x88–0x8B or new-format 0xC2, whose body — at the offset its length header gives (old format: one, two or four length octets, none for the indeterminate type; new format: one octet below 192, two for 192–223, five for 255, one for a partial length) — starts with a signature version 3–6 (phase D, ruling PD-10: text starting with a UTF-8 lead byte, such as "©" or U+00A0, does not pass) |
 | flat `Packages*`/`Sources*` | the compression magic for the extension, or plain text starting `Package:`/`Package: ` (`Sources`: `Package:` too) |
 
 **Single creation choke point.** `cache.CreateSuite` is the **only**
 `INSERT INTO suite_freshness`: create-only (`ON CONFLICT DO NOTHING`), sets
 `last_requested_at = now`, and enforces two caps: `freshness.max_suites`
-(default 5000) globally and `max_suites / 10` per canonical host. At the
-global cap it first tries to evict (via the reaper path, under its mutex) the
-least-recently-requested suite that has no current snapshot and has been
-idle ≥ 24 h; otherwise it creates nothing and emits a rate-limited WARN
-`suite_seed_rejected` ("suite will not refresh"), a counter and a gauge.
-Rejections are cached in memory per suite key for 10 minutes (bounded map),
-so an over-cap suite does not cost a writer operation per request.
+(default 5000) globally and `max_suites / 10` per canonical host (a host's
+`http` and `https` suites counted together). At or above the global cap it
+first tries to evict the least-recently-requested suite that has no current
+snapshot and has been idle ≥ 24 h, through the compare-and-delete helper
+phase F's reaper reuses, holding the evictee's suite mutex: the checker is
+the cache's guard and takes the mutex with `TryLock`, a busy suite is
+skipped, at most eight candidates are tried, and the writer runs no foreign
+code. A candidate is held once the table is within eight rows of the cap,
+so concurrent creations at the boundary do not refuse while an idle suite
+exists. An attempt evicts at most one suite: above the cap (after
+`max_suites` was lowered, or after an upgrade) it evicts one and is still
+refused while the count stays at or above the cap, so the table converges
+under the 24 h rule (phase D, ruling PD-8). The per-host cap never evicts;
+a host at its cap shrinks only through the reaper (C9, `gc.suite_idle_ttl`,
+30 days by default). The daemon logs WARN `suite_caps_exceeded` at start
+when the table is at or above the global cap or a host is at its cap. An
+eviction leaves the evictee's `url_path` rows to `url_path` GC, drops its
+lock-map, flip-gate and touch entries, and logs INFO `suite_evicted`.
+Otherwise `CreateSuite` creates nothing and emits a rate-limited WARN
+`suite_seed_rejected` ("suite will not refresh"; one line a minute, field
+`suppressed`), the counter `acu_suite_seed_rejected_total{host}` (refusals
+that reached the writer) and the unlabelled gauge `acu_suites_seed_rejected`
+(the rejection cache's size, swept within a minute). Rejections are cached
+in memory per suite key — whichever of the suite's files was refused — for
+10 minutes, so an over-cap suite does not cost a writer operation per
+request; the map holds at most 4,096 suites (when it is full, expired
+entries are dropped and, if it is still full, it is cleared, so a suite can
+then be counted again within its 10 minutes). A suite path longer than
+1024 bytes is not a suite for tracking: classification never treats its
+files as suite files, so it gets no row, marker, touch or rejection-cache
+entry (phase D, ruling PD-9).
 
 Only the handler calls it, for a response whose bytes pass the sniff for
 the path, on a miss **or** a `url_path` hit (so anchors cached before this
@@ -288,12 +312,28 @@ row:
   `<D>/Packages*`/`Sources*` (a sniff-passing `<suite>/Release.gpg` writes the
   marker for a suite that already has a row but creates none: apt fetches it
   only after `Release`). The new row leaves `last_check_at` NULL and the
-  handler fires T1 once the response is written, so eager adoption starts
-  within seconds of first contact when a slot is free, else as soon as one
-  is released (C4 admission);
+  handler fires T1 once the response is written (from phase E, §9
+  "T1-on-seed"; until then the suite's first check is the next hit's T1 or
+  the scheduler's never-checked class), so eager adoption starts within
+  seconds of first contact when a slot is free, else as soon as one is
+  released (C4 admission). A refresh miss leaves an existing row as it is;
 - with no adopter (Phase 1): `<suite>/InRelease` only, stamping
   `last_check_at = last_success_at = now` and the miss validators — today's
-  seed, byte for byte, and no T1.
+  seed, byte for byte, and no T1. A refresh miss of a tracked suite's
+  `InRelease` (its cached copy was garbage-collected) re-stamps the row the
+  same way — the stamps, the validators, `inrelease_change_seen_at` cleared,
+  `check_fail_count = 0` — with an UPDATE in the same writer operation,
+  unless the suite has a current snapshot (phase D, ruling PD-6). A
+  detached-only suite (`Release` and `Release.gpg`, no `InRelease`) is not
+  tracked: before phase D its `Release` hit's T1 created a row through the
+  old upsert, so it loses its Phase-1 change observations and its admin row
+  (documented).
+
+A creation by a hit (legacy onboarding) leaves the check stamps and
+validators NULL in both modes, so its first check runs at once. A plain-text
+"InRelease" fails the sniff, so it seeds no row in either mode. A `url_path`
+hit fires T1 only for a tracked suite (after onboarding; phase D, ruling
+PD-11).
 
 Everything else writes with UPDATE-only statements: `PutSuiteFreshness`
 becomes `UpdateSuiteFreshness` (0 rows ⇒ no-op); `CommitAdoption` Step 6 is
@@ -306,8 +346,9 @@ content-addressed fallback requires a known suite (I-4, handler side). A test
 proves exactly one INSERT site.
 
 **Client interest.** `suite_freshness.last_requested_at` (distinct from
-`url_path.last_requested_at`; an `AIDEV-NOTE` says so) is written only by
-`TouchSuite` from client-serving paths:
+`url_path.last_requested_at`; an `AIDEV-NOTE` says so) is set by the
+creating request (`CreateSuite`) and otherwise written only by `TouchSuite`
+from client-serving paths:
 
 - anchor serves (`InRelease`, `Release`, `Release.gpg`; status < 400,
   including 304, HEAD and stale serves);
@@ -317,7 +358,13 @@ proves exactly one INSERT site.
   install-only clients keep their suite alive.
 
 Touches are coalesced in memory (at most one write per suite per hour; the
-map holds only tracked suites and is purged on reap).
+map holds only tracked suites and is purged on reap and on eviction). The
+coalescing is monotonic: after a forward wall-clock step of 23 h or more, an
+active suite without a snapshot keeps its pre-step stamp for up to an hour
+and is evictable meanwhile — bounded and self-healing. A stamp in the future
+(a backward step) never makes a suite evictable; the eviction scan reports
+it through the rate-limited `clock_step_detected` (C4; phase D, ruling
+PD-11).
 
 **Signed-seen marker.** Table `suite_signed_seen(scheme, host, base,
 last_seen_at)` where `base` is the suite path with one trailing `/.` removed
@@ -341,22 +388,34 @@ that have a `suite_freshness` row. Writers:
   adoption runs. A never-adopted suite whose anchor row was already deleted
   by `url_path` GC before the upgrade leaves no evidence and gets no marker
   (documented);
-- the handler (phase D), on the **miss path only**, inside the writer
-  operation that stores the `url_path` row (and, on first contact, creates
-  the suite row): for a sniff-passing `InRelease` or `Release.gpg` the marker
-  is part of that operation, which completes before the body is served. If
-  the operation fails the miss fails as it does today (502, no body), so a
+- the handler (phase D). On a miss, inside the writer operation that
+  stores the `url_path` row (and, on first contact, creates the suite row):
+  for a sniff-passing `InRelease` or `Release.gpg` the marker is part of
+  that operation, which completes before the body is served. If the
+  operation fails the miss fails as it does today (502, no body), so a
   signed anchor body is never written to a client before its base has a
-  marker — no timeout path, no residual window. The hit path writes no
-  marker: every cached sniff-passing anchor row was created by a miss under
-  this rule, seeded by `CommitAdoption` (which marks in its transaction),
-  rebuilt by `reconstructAnchor` from a snapshot marked at commit or by the
-  audit, or created by an earlier binary and marked by the startup pass
-  before this binary serves; the blob behind a row is content-addressed, so a
-  row that failed the sniff cannot pass it later. The writer is a FIFO queue
-  drained by one goroutine (`cache.submitWrite`), so an unsigned
-  `CommitAdoption` enqueued after a marker write runs after it, and its
-  in-transaction re-read (C5) sees the marker.
+  marker — no timeout path, no residual window. A row creation — by a miss,
+  or by a hit (legacy onboarding, or a suite once refused at a cap) — also
+  marks, in its own transaction, the base for every sniff-passing
+  `InRelease`/`Release.gpg` the suite has cached: an anchor cached while its
+  suite had no row earned no marker, since markers are written only for
+  suites with rows. The handler reads and sniffs those rows before it
+  submits, outside the writer; the transaction re-reads them and marks the
+  ones whose blob is unchanged, and a row that changed or appeared in
+  between makes the creation unproven: only then does a follow-up writer
+  operation sniff and mark it after the commit (a failure is logged and
+  healed by the startup pass at the next start; phase D plan, deviation 2,
+  ruling PD-5). Serving a tracked suite's anchor writes no marker: every
+  cached sniff-passing anchor row of a tracked suite was created by a miss
+  under this rule, marked by its suite's creation, seeded by
+  `CommitAdoption` (which marks in its transaction), rebuilt by
+  `reconstructAnchor` from a snapshot marked at commit or by the audit, or
+  created by an earlier binary and marked by the startup pass before this
+  binary serves; the blob behind a row is content-addressed, so a row that
+  failed the sniff cannot pass it later. The writer is a FIFO queue drained
+  by one goroutine (`cache.submitWrite`), so an unsigned `CommitAdoption`
+  enqueued after a marker write runs after it, and its in-transaction
+  re-read (C5) sees the marker.
 
 A plain-text "InRelease" fails the sniff and never creates a marker. The
 marker survives suite reaping: the reaper sweeps a marker only once no
@@ -653,7 +712,12 @@ release_hash), anchor_form) WHERE retired_at IS NULL`.
 without a clearsign marker and `ErrMalformedClearsign`
 (`malformed_clearsign`) for a body with a marker that does not decode
 (including a missing signature frame), whatever `adoption.require_signature`
-says. Unsigned metadata is adopted only through the explicit unsigned form
+says. A body that carries the marker but whose first line is not exactly
+the marker — apt's rule: trailing `\r`, space and tab ignored, leading
+whitespace or a leading blank line refused — is `malformed_clearsign` as
+well, and a marker line with trailing blanks, which apt accepts and
+go-crypto's decoder alone does not, is decoded (phase D, ruling R-D2).
+Unsigned metadata is adopted only through the explicit unsigned form
 below (phase E), never as an inline snapshot. `adoption.require_signature =
 false` therefore changes meaning (documented): it only permits starting with
 an empty keyring (useful with `accept_any_signer` or for unsigned
@@ -759,8 +823,11 @@ retained by recency and hold-grace like unvouched files (documented).
 `adoption_fail_reason`, `adoption_fail_count`, `adoption_fail_first_at`,
 `adoption_fail_last_at`, `adoption_next_retry_at`, `adoption_fail_etag`,
 `adoption_fail_lastmod`. UPDATE-only statements; written **before** the suite
-mutex is released; a shutdown context cancellation is not recorded. `count`
-and `first_at` describe the failure streak since the last success.
+mutex is released; an attempt a shutdown ends — in the flip barrier or
+before it — is not recorded, not counted as an adoption outcome and logged
+at INFO only (`adoption_abandoned_at_shutdown`; phase D, deferred minor
+C-20). `count` and `first_at` describe the failure streak since the last
+success.
 
 **Content key.** inline: sha256(InRelease); detached: sha256(sha256(Release)
 ‖ sha256(Release.gpg)); unsigned: sha256(Release). Any byte change is new
@@ -1030,16 +1097,20 @@ their directory, which this design does not do.
 **Events** (documented in `docs/log-fields.md`): `suite_seed_rejected`,
 `suite_reaped`, `suite_forgotten`, `adoption_deferred`,
 `adoption_failing_persistently`, `adoption_refused` (reason),
-`adoption_flip_barrier`, `adoption_abandoned_at_shutdown` (a flip abandoned
-at the shutdown signal: INFO, never counted as an adoption outcome),
-`adoption_panicked`, `clock_step_detected`,
+`adoption_flip_barrier`, `adoption_abandoned_at_shutdown` (an adoption
+ended by shutdown, in the flip barrier or before it: INFO, never counted as
+an adoption outcome), `suite_evicted`, `suite_caps_exceeded`,
+`handler_goroutine_panicked`, `adoption_panicked`, `clock_step_detected`,
 `flat_host_root_unsupported`, `legacy_snapshot_quarantined`,
 `legacy_trust_audit_progress`, `legacy_trust_audit_deferred`,
 `legacy_trust_audit_completed`; new fields `anchor_form`, `flat`,
 `snapshot_displaced`, `flip_held_ms`. New metrics include the unlabelled
 gauges `acu_adoption_failing_suites` (C7), `acu_freshness_waiting_for_slot`
 (suites waiting for an adoption slot, C4) and `acu_flip_barrier_active`
-(flips in the C8 barrier now). New metrics are host-labelled or
+(flips in the C8 barrier now), the C3 pair
+`acu_suite_seed_rejected_total{host}` (counter) and
+`acu_suites_seed_rejected` (gauge), and `acu_freshness_unlogged_panics_total`.
+New metrics are host-labelled or
 unlabelled (no suite labels) and are added to the metrics inventory comments in
 `internal/freshness/metrics.go` and `internal/handler/metrics.go`.
 `gc_run_complete` and `LastRunSummary` gain `retired_reaped`.
@@ -1057,8 +1128,9 @@ Constants, not knobs: backoff 2 m → 1 h (adoption failures and repeated
 (the C8 quiet cut at 15 s); phase A cap 60 s; hold-token wait 60 s; waiter
 caps 256 (barrier) and 64 (strict wait); strict wait 15 s; reaps 25 per run;
 unsigned member cap 1,000; check deadline 2 min; check workers 4; interest
-window 7 d; orphan-marker TTL 365 d; cap-rejection cache 10 min;
-legacy-audit anchor read cap 8 MiB and batch 100.
+window 7 d; orphan-marker TTL 365 d; cap-rejection cache 10 min (at most
+4,096 suites); tracked suite path at most 1024 bytes; legacy-audit anchor
+read cap 8 MiB and batch 100.
 
 ## 6. Migration v6 → v7
 
@@ -1280,9 +1352,11 @@ files), in phase D.
   a never-adopted suite whose signed anchor was served; miss-path ordering
   (the marker is in the writer operation that stores the anchor row; a failed
   operation serves no body); the hit-path invariant (after a mix of misses,
-  adoptions, `reconstructAnchor` and restarts, every `url_path` anchor row
-  whose blob passes the sniff has a marker for its base); FIFO ordering (a
-  marker write enqueued before an unsigned commit is visible to the commit's
+  adoptions, `reconstructAnchor` and restarts, every `url_path` `InRelease`
+  or `Release.gpg` row of a tracked suite whose blob passes the sniff has a
+  marker for its base, at every committed state (markers exist only for
+  tracked suites; phase D plan, deviation 1)); FIFO ordering (a marker write
+  enqueued before an unsigned commit is visible to the commit's
   transaction).
 - C4: classification table (every status class per anchor); form transitions
   both ways incl. detached → inline and the two-observation rule;

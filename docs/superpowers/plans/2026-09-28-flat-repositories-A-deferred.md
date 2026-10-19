@@ -23,40 +23,24 @@ Phase A's per-task and final reviews (2026-10-11, Fable max) found these minor i
 - **A-13** (pre-existing, out of scope) HTTPS-magic host (`proxy/url.go:122`) has no charset validation; now strictly safer (escaped, then `url.Parse` fails). Follow-up candidate.
 - **A-14** `composers_test.go:16`: the guard regex only catches `"://" +`; it misses `"https://"+host` and `Sprintf("%s://…")`. `connect.go:591` is a legitimate exemption if widened.
 - **A-15** `hot_set.go:63` has no direct unit test (`hot_prefetch_test.go` is a gofmt-drift file).
-- **A-17** `sniff_test` negatives should pin the `0x8C` and `0xC3` upper bounds.
 
 ## internal/cache
 
-- **A-18** (pre-existing) Cache tests emit `schema_migrating`/`schema migrated` INFO lines; test output is not pristine.
 - **A-19** `schema_v7_test.go:216-218` swaps `migrationGoSteps[6]`; add a "no `t.Parallel`" comment.
 - **A-20** `sqlclock_test.go:16-17`: `CURRENT_TIMESTAMP` is redundant with the `CURRENT_TIME` substring.
 - **A-21** The schema test asserts `idx_package_hash_flat_filename` exists, not that it is partial.
-- **A-22** No test asserts `GetSuiteSnapshot` returns `FormInline` for an inline row.
-- **A-23** `CommitAdoption` Step 7a's `MarkerBase` call is unexercised (no `/r/.` suite in tests); add one commit case.
-- **A-24** `MarkSignedSeenBatch`'s multi-mark and 500-row chunk loop are untested.
-- **A-25** `signed_seen.go:55-57`: per-row error unprefixed.
 - **A-26** `cache/legacy_audit.go:235` re-filters by path suffix what the SQL `IN` already guarantees.
 - **A-27** `cache/legacy_audit.go:48` doc says "missing", should say "missing or empty".
 
 ## internal/freshness
 
 - **A-29** `gc_urlpath.go:274-275`: the `AIDEV-TODO(phase E)` sits as an SQL `--` comment inside the query string; move it to a Go comment. (Phase E resolves the TODO itself.)
-- **A-30** (pre-existing) `TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange` emits INFO/WARN lines.
-- **A-32** `reconcile.go:181-191`: AIDEV-NOTE wording ("unsigned regions") and a >100-column line.
-- **A-33** `clearsignForTest` generates an RSA key per call (slow under `-race`); use an EdDSA config.
-- **A-34** No CRLF-envelope or `Hash:`-header injection case in the reconcile tests (covered structurally; the legacy-audit tests have both).
-- **A-35** `panic_recovery_test.go:213-225`: adopters built without a logger (default-logger noise under `-v`).
-- **A-37** Three "log a panic, stack once" implementations (`Checker.reportPanic`, the handler's `atomic.Bool`, heartbeat with none); consider one helper. Heartbeat never logs a stack.
-- **A-38** `panic_recovery_test.go:244-246`: a successful `TryLock` is never unlocked.
+- **A-37** the freshness side — `Checker.reportPanic` (`freshness.go`) and the heartbeat's recover (`freshness/adoption.go`) — still has its own copies; phase D gave the handler's two recovers one helper, `logGoroutinePanic`.
 - **A-47** `legacy_audit.go`: `res.Signed++` counts `FormUnsigned` keeps (after phase E re-queues); rename to `Kept` or skip unsigned.
 - **A-49** The marker pass silently skips tracked anchors whose pool file is missing or unreadable; add a Debug line.
 
 ## internal/gpg
 
-- **A-50** The begin-marker literal is duplicated (`verifier.go:288` and `:493`); hoist to a const.
-- **A-51** (pre-existing) `requireBareClearsigned` errors (`verifier.go:500,508`) are plain `errors.New` and classify as `crypto_verify_failed`; wrap with `ErrMalformedClearsign`.
-- **A-52** `failclosed_test.go:98`: the `GetSuiteFreshness` check passes vacuously on any error.
-- **A-53** No test for `VerifyDetached`'s "keyring is empty" message (`verifier.go:420-421`).
 
 ## internal/handler
 

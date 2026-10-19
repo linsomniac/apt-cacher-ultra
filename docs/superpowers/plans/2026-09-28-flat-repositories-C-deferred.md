@@ -26,41 +26,23 @@ Left out: everything the phase C final fix wave resolved (the phase-A wake test,
 
 ## internal/cache
 
-- **C-10** `adoption.go:720-750`, `:809-822`: the scoping and ordering predicates of `adoptionStampTx` and `DisplacedSnapshotMembers` are untested — no test has a same-path suite on a second host or scheme, and snapshot_id order equals adoption order in every test, although `InsertCandidateSnapshot` can reuse an older candidate. Add a second host and a reused older-id candidate.
 - **C-11** `adoption.go:720`: "strictly increasing per suite" holds only along the current-snapshot chain. When `current_snapshot_id` is cleared (quarantine today, the reaper next), the first-adoption rule ignores the suite's remaining displaced snapshots, whose `adopted_at` may lead the clock, so GC's `keep_displaced` ranking and retained by-hash's newest-first window could misorder. Take `MAX(adopted_at)` over the suite's adopted snapshots as a floor, or narrow the AIDEV-NOTE. (F)
 - **C-12** `flip_state_test.go:158`, `:174`, `:194`: `restore()` runs after `commitCandidate` instead of being deferred, and `stubNow` (`gc_test.go:42`) registers no cleanup, so a failing stamp test leaves `nowUnix` stubbed for the rest of the package.
 - **C-13** `flip_state_test.go:146-191`: the served-anchor `PutURLPath` setup is written out three times; hoist `putAnchor`.
-- **C-14** `adoption.go` (`CommitAdoption` Step 3a): the stamp block separates Step 3a's comment from its loop; move `now :=` and the stamp above the comment.
-- **C-15** `adoption.go` is 1,173 lines, past the ~1,150 at which `freshness.go` was split; move the read-side snapshot helpers (`GetSuiteSnapshot`, `GetSnapshotMember`, `DisplacedSnapshotMembers`, `LookupSnapshotMember`) to their own file.
 
 ## internal/freshness
 
 - **C-16** `adoption.go:1813`: `servedAnchorUnchanged` reads under `context.WithoutCancel(ctx)` — neither shutdown nor any bound ends the read while the goroutine holds the suite mutex and a global slot — and drops errors other than not-found silently. Read under `p.barrierCtx(ctx)` and log the others (the barrier still runs on an error). (E: it touches this function for the unsigned form)
 - **C-17** `adoption.go:918`: `stopErr`'s fallback for `Run`/`RunDetached` (no stop context) has no direct test; a mutant returning `nil` survives. A case with `runHooks{membersDone: cancel}` and a nil stop would pin design note 14.
-- **C-18** `flip_barrier_test.go`: `TestAdopter_ShutdownInTheBarrierIsNotACommitFailure` repeats `TestAdopter_ShutdownInTheBarrierCommitsNothing` line for line, and three older tests seed the served anchor by hand instead of `barrierRig.putServedAnchor`.
-- **C-19** `freshness.go:443` is a 146-column line inside `spawnAdoption`'s AIDEV-NOTE; the barrier code in `adoption.go` (2,944 lines: `flip`, `barrierOutcome`, `servedAnchorUnchanged`) would sit better in `adoption_flip.go`.
-- **C-20** `freshness.go` (`spawnAdoption`): a shutdown while the member pipeline runs is still classified (usually `run_failed`), counted, put in the admin ring and logged WARN `adoption_run_failed`; since the fix wave only a flip abandoned in the barrier is treated as shutdown (final review, tests Minor 3; a pre-existing pattern). The same holds for a shutdown between the member pipeline and the barrier: `runShared`'s "shutdown before the commit" check (`adoption.go`, after `membersDone`) returns an error that does not wrap `flipgate.ErrAborted` (final re-review, out-of-scope observation). Treat an attempt that ended because the lifetime context did the same way (e.g. wrap `ErrAborted` there and widen `adoption_abandoned_at_shutdown`'s documented meaning).
+- **C-19** (narrowed by phase D) only its file-split half remains: split the barrier code out of `freshness/adoption.go`; the long `spawnAdoption` AIDEV-NOTE line was wrapped in phase D.
 
 ## internal/handler
 
-- **C-21** `handler.go:1189-1206` (performance, final review concurrency Minor 5): every tracked anchor request builds `context.WithCancel` plus `context.AfterFunc(h.lifecycleCtx)` — a child registered on a process-wide context under its mutex — even when no hold is pending, which is almost always; and the presence check reads the full suite row, for untracked suites' anchor requests too. A non-blocking fast path (contexts only when the request must wait) and an EXISTS query would remove both; not done in the fix wave because it needs new gate API or a new cache query for no measured gain.
-- **C-22** `handler.go:1197`: every `GetSuiteFreshness` error is treated as "no row", so a transient failure followed by a successful `trySnapshotHit` read serves the anchor unregistered — an uncounted straddle window, the opposite of design note 5's safe direction. Return nil only for `cache.ErrNotFound` or an ended request context, and register otherwise.
-- **C-23** `handler.go:1189`: "no registration read while the barrier is off" rests only on the order of the checks; a mutant that swaps them survives every test.
-- **C-24** `handler.go:528`, `:594`, `:654`: `go h.touchAsync(req)` starts goroutines with no recover (global constraint: every goroutine recovers panics); a pre-existing pattern around one SQL UPDATE.
-- **C-25** `handler.go:779` `tryDisplacedByHash`: a displaced member whose pool blob is gone is a silent 404, while the current-snapshot path logs WARN `snapshot_member_blob_missing`; add a Debug or WARN line.
-- **C-26** `byhash_displaced_test.go`: missing negatives — (a) a current-snapshot hit carries no `snapshot_displaced` and `X-Cache-Snapshot` is the current id; (b) a non-by-hash member declared only by a displaced snapshot stays 404 with `KeepDisplaced > 0`; (c) the 404 negatives should assert `up.count() == 0`, to tell a snapshot 404 from a miss-path fall-through.
-- **C-27** `sim_flip_test.go` `serveDetached`: the ledger stamps the anchor's arrival after `Release.gpg`, `indexTransfer` after the gate's quiet clock started at `Release`'s completion (stricter, never laxer than the plan's "the two instants coincide"); say so in its doc.
+- **C-21** (narrowed by phase D) only its context fast path remains (it needs new `flipgate` API); the `EXISTS` read landed in phase D, Task 10.
 
 ## cmd/apt-cacher-ultra
 
-- **C-28** `main.go:796`: the gate's `Close` call and its position (right after the signal, before the listeners drain) are untested; every `serveListeners` test runs with the barrier off. Add a smoke test with adoption on and `flip_quiet_period = 10s`, and an AIDEV-NOTE marking the order load-bearing.
 - **C-29** `main.go:483` / `internal/freshness/legacy_audit.go:45-59`: A-48 relies on every `RunLegacyTrustAudit` error being prefixed "legacy trust audit:"; state the rule in the callee's doc.
-- **C-30** `main.go:1094`: the recovered shutdown-wait panic is logged without a stack, under a non-snake_case event name (`shutdown wait panicked`, documented as it is), and `waitLogged` then returns as if the drain had finished. Add the stack and a test; practically unreachable (`WaitGroup.Wait`).
-- **C-31** `flip_wiring_test.go:41-44`: the 16 s case asserts only `err != nil`; pin `errors.Is(err, flipgate.ErrQuietOutOfRange)`.
-- **C-32** `flip_wiring_test.go:51-70`: the handler-config test uses `KeepDisplaced = 3` (the `Load()` default), relies on `minimalCfg`'s `GC.Enabled = false` without saying so, and its nil-adopter comment says "adoption disabled" while `Adoption.Enabled` is true.
-- **C-33** `main.go:925`, `:1086`, `:1107`: the "5-minute commit timeout" text duplicates the unexported `freshness.commitTimeout`.
-- **C-34** `flip_wiring_test.go:101-141` and the B-64 test are not about flip wiring (the A-48 test belongs in `legacy_audit_wiring_test.go`); `waitLogged` has a generic name but hard-codes an adoptions event and detail.
-- **C-35** `main.go:367`: the `adoption_flip_quiet_period` startup field (now documented) is pinned by no test, like every field of that line.
 
 ## Docs and packaging
 

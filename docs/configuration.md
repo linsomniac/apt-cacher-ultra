@@ -198,9 +198,63 @@ of signed repository content over HTTP, but do not cover arbitrary unsigned file
 | `cooldown` | duration | `"60s"` | Minimum interval between freshness checks for a suite, shared by request-triggered and scheduled checks. Nonnegative; `"0s"` selects the default. |
 | `periodic_refresh` | duration | `"15m"` | Age after the last successful check at which a suite becomes due for background refresh. Scheduler checks for due suites every quarter of this duration, with a `5s` minimum tick. Nonnegative; `"0s"` selects the default and does not disable refresh. |
 | `max_concurrent_adoptions` | integer | `2` | Global concurrent snapshot-adoption limit. `0` means unlimited; must be nonnegative. Shared by adoptions, repairs and reconciles; see *Capacity and fairness*. |
+| `max_suites` | integer | `5000` | Most suites tracked (checked, adopted, shown on the status page) at once, and at most a tenth of it per upstream host (`http` and `https` counted together). At least `10`; an explicit `0` is an error. See *Tracked suites*. |
 
 Freshness checks detect changed repository metadata. `[adoption]` determines
 whether a changed suite is staged and published as a new coherent snapshot.
+
+### Tracked suites
+
+A suite is tracked once a client fetches its `InRelease` — or, with adoption
+enabled, its `Release` — and the bytes are what they claim (an `InRelease`
+starts with the clearsign line apt requires; a `Release` has a hash block):
+an HTML error page or a stub never tracks a suite, and `Release.gpg` never
+does on its own. A suite whose `InRelease` (with adoption enabled, also
+`Release`) an earlier release cached is tracked on its first cache hit. A
+suite path longer than 1024 bytes is never tracked; its files are served
+untracked.
+
+With adoption disabled only `InRelease` tracks a suite, and a refetched
+`InRelease` (after its cached copy was garbage-collected) still counts as a
+successful check, as before. Two things differ from earlier releases: a
+plain-text "InRelease" (no clearsign line; apt rejects it too) no longer
+tracks a suite, and neither does a repository that publishes only `Release`
+and `Release.gpg` (for example pkg.jenkins.io). Earlier releases tracked
+such a repository from its first `Release` hit; it is now served as before
+but no longer checked for changes or shown on the status page while
+adoption is disabled.
+
+At most `max_suites` suites are tracked and at most `max_suites / 10` per
+host. At the total cap, a new suite makes room by evicting the least
+recently requested suite that has no adopted snapshot and has not been
+requested for 24 hours (at most eight are tried, a suite being checked or
+adopted is skipped, INFO `suite_evicted` names it). A suite refused a row is
+still served — it just does not refresh — and is not retried for 10
+minutes: each refusal that reaches the database is counted in
+`acu_suite_seed_rejected_total{host}` (at most once per suite per 10
+minutes, unless more than 4,096 suites were refused within them), the gauge
+`acu_suites_seed_rejected` shows how many suites are waiting out those 10
+minutes (updated within a minute), and WARN `suite_seed_rejected` (at most
+one a minute, with how many were suppressed) names the suite. Raise
+`max_suites` for very large Artifactory, aptly or Nexus hosts.
+
+A cache can hold more suites than the caps allow: after `max_suites` is
+lowered, or after an upgrade from a release without the caps (one that
+collected more than 5,000 suites, or more than 500 on one host, for example
+from an upstream that answers missing `InRelease` files with an HTML page).
+The daemon then logs WARN `suite_caps_exceeded` at start, and new suites
+(for a host at its cap, that host's) are refused. Above the total cap each
+refused attempt still evicts one suite that qualifies (no adopted snapshot,
+not requested for 24 hours), so the table shrinks back under the cap as
+suites fall idle. A host at its own cap evicts nothing: its suites go only
+when idle-suite reaping (a later release) removes those not requested for
+30 days.
+
+Serving a tracked suite's `InRelease`, `Release` or `Release.gpg`, or a
+`.deb` its current snapshot vouches for, records that the suite is in use
+(at most one write per suite per hour). A by-hash request with no cached
+copy under its own path is answered from an identical cached file only for
+a tracked suite; otherwise it is fetched from upstream.
 
 ## `[adoption]`: snapshots, trust, and recovery
 
@@ -328,7 +382,11 @@ not stop the daemon either: that snapshot keeps serving as before, a
 The audit resumes if the start is interrupted and is a no-op afterwards. A
 suite whose signed `InRelease` was served by an earlier version is recorded
 as signed from cached anchors; one whose cached anchor was already
-garbage-collected leaves no record.
+garbage-collected leaves no record. Suites whose `InRelease` an earlier
+release cached but never tracked are tracked, with their signed-seen record,
+on their first cache hit. A cache with more suites than `freshness.max_suites`
+allows, or more than a tenth of it on one host, logs WARN
+`suite_caps_exceeded` at start; see *Tracked suites*.
 
 ## `[hot_packages]`, `[hold_packages]`, and `[retention]`: package working set
 

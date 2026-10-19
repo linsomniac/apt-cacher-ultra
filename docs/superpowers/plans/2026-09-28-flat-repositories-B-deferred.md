@@ -6,12 +6,6 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 
 ## internal/cache
 
-- **B-1** `queries.go:207` AIDEV-NOTE rationale: a column-count mismatch fails `Scan` loudly; the silent hazard it should name is a same-position edit or reorder.
-- **B-2** `adoption_failure.go:133` `RescheduleFailingAdoptions` doc: `offset` runs on the writer goroutine per row, possibly after the call returned on a cancelled context, so the caller must pass a goroutine-safe source (production's `math/rand/v2` is).
-- **B-3** `adoption_failure_test.go:217`: the restart test reschedules one row, so a hoisted `offset()` shared by all rows would pass; add a second suite with a counting offset (`TestSimRestartSpread`'s buckets already catch it end to end).
-- **B-4** `adoption_failure.go:141`: `adoption_fail_reason NOT IN (…)` skips NULL reasons; `COALESCE` would make the invariant explicit (unreachable: empty reasons are rejected on write).
-- **B-5** `cache_test.go:2139`: `TestCommitAdoption_PreservesExistingSuiteFreshnessColumns`'s name half-contradicts its body (it now asserts the etag is replaced).
-- **B-8** No test asserts the validators on `CommitAdoption`'s INSERT (no-conflict) branch of Step 6. (D: moot once Step 6 is UPDATE-only.)
 
 ## internal/freshness — Date parser (`release_date.go`)
 
@@ -30,7 +24,6 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 - **B-19** `adoption_failure_test.go`: no test for a reason change mid-streak (the `adoption_deferred` re-log), `AdoptionFailLastMod`, the retry attributes, or a detached-form record.
 - **B-20** `recordAdoptionFailure`'s shutdown check-then-act can log `adoption_failure_record_failed` "context canceled" at WARN when shutdown races a failure (log noise only).
 - **B-21** `adoption_failure_test.go` `TestAdoptionFailure_PanicIsRecorded`: `evs[len(evs)-1]` relies on a single event (`Ring.Snapshot` order).
-- **B-22** `freshness_test.go` `fakeCache.RecordAdoptionFailure` succeeds for unknown suites (production is UPDATE-only, pinned by `TestRecordAdoptionFailure_IsUpdateOnly`).
 - **B-23** `freshness.go:1682` `applyClamp` runs twice on the inline → detached fallback of a first-ever suite (a double `acu_clock_steps_detected_total` count and a redundant write); one-line fix: set `cur.AdoptionNextRetryAt = &g.clampTo` after `SetAdoptionNextRetry`. (E; phase C touched `freshness.go` without taking it)
 - **B-24** `retry_gate_test.go` `TestGate_DueRetryHasNoValidators` cannot tell "" from the anchor's validators (the rig suite has none); add a leg on an adopted suite past `next_retry_at`.
 - **B-25** One extra `Release.gpg` GET per deferred detached check when upstream ignores validators (accepted cost; recorded so E's shared tail keeps it in mind). (E)
@@ -51,21 +44,11 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 ## internal/freshness — scheduler and admission
 
 - **B-38** `scheduler.go:326` `suiteDue` re-detects (and counts) a future `last_success_at` on every tick; only `acu_clock_steps_detected_total`'s rate is affected (`docs/log-fields.md` now says it counts detections).
-- **B-39** `scheduler_test.go:299` `TestRun_FourWorkersOneCheckPerHost` does not exercise the in-flight skip (needs 3 hosts × 3 suites or a slow host); `TestSchedQueues_RoundRobinOneInFlightPerHost` covers pop's skip.
-- **B-40** `scheduler.go:291` `prune` resets `q.next` to 0 when the next host is pruned (bounded one-turn skew).
-- **B-41** `scheduler.go:552`: the tick's sort comparator builds `suiteKey` strings per comparison (perf nit).
-- **B-42** `scheduler_test.go:634` the busy-arm re-park test asserts only `it.waiting`; also assert the previous `signed` is kept.
-- **B-43** Nothing pins that a non-waiting scheduler check (no pending change) honours the cooldown (`checkRecovered` with `waiting = false` inside the cooldown → `skipped`).
-- **B-44** `scheduler.go:491` `checkWorker`'s last-resort recover leaves no trace; add a counter (not via the logger).
 - **B-45** `scheduler.go:424`: the wake-versus-done race can spend a wake on an in-flight item, so its re-offer waits for the next wake or tick (bounded by one tick; documented). A release-generation counter would let an offer whose slot was released after dispatch park unheld.
 - **B-46** `scheduler.go:178` `park`: every re-parked waiter goes to index 0, so two lost or busy offers in a row on one host invert the waiters' order (final review C M-3; kept deferred by ruling). Give each waiter a waiting-since sequence number and re-insert sorted.
 
 ## internal/freshness — simulations
 
-- **B-47** `sim_sched_test.go:237`: the latency simulation's goroutine slack is 16, loose for its load (the capacity simulation uses 8).
-- **B-48** The latency simulation does not seed the `rand` seam (spec §7 "fixed seeds"; it records no adoption failures today). Seed it when touched.
-- **B-49** The pacing simulation never measures a +2 h forward clock step (spec §7 lists ±2 h; +30 d covers "every suite due at once").
-- **B-50** `sim_sched_test.go:217`: the repair assertion (≥ 2) is looser than its message.
 - **B-51** `simMembers`' `delay` and `started` maps are written without the lock (always before the scheduler starts; the doc states the rule).
 - **B-52** The phase B plan's Task 12 Step 1 text is stale against the strengthened simulations (reference only).
 - **B-53** The 500-suite simulation has no adopter, so no persistent repair or changing-candidate contention (overview DoD); add a changing candidate on host `a`.

@@ -33,8 +33,10 @@ Fields that follow this pattern:
   `X-Cache-Snapshot` names that snapshot.
 - `flip_held_ms` — emitted only when an `InRelease`/`Release` request
   waited in a flip hold (spec C8): how long it waited, in milliseconds
-  (at most 20000; part of `duration_ms`). Also on the `client_canceled`
-  line of a held request whose client left while it waited.
+  (at most 20000; part of `duration_ms`). A request waits when it
+  arrives, or right after it created its suite's row. Also on the
+  `client_canceled` line of a held request whose client left while it
+  waited.
 
 Always-present fields (`method`, `url`, `canonical_host`, `path`,
 `outcome`, `status`, `bytes_sent`, `duration_ms`, `client_addr`) are
@@ -159,8 +161,9 @@ above: `refused` (a refusal state; the `reason` says which),
 before the downloads finished, or the commit hit its 5-minute bound; a
 deadline that passes while the adoption waits in the flip barrier is not
 `timed_out`) and `panicked` (the adoption goroutine panicked; recorded with
-reason `panic`). A flip abandoned at shutdown is not an outcome: it is
-logged as `adoption_abandoned_at_shutdown` and counted nowhere.
+reason `panic`). An adoption ended by shutdown, in the flip barrier or
+before it, is not an outcome: it is logged as
+`adoption_abandoned_at_shutdown` and counted nowhere.
 It also adds the gauge `acu_adoption_failing_suites` (suites whose latest
 adoption failed, refusals excluded; 0 while adoption is disabled) and the
 gauge `acu_freshness_waiting_for_slot` (suites waiting for an adoption
@@ -181,7 +184,15 @@ panic recovered in the barrier's hold-expiry timer: a bug, please report
 it) and the unlabelled gauge `acu_flip_barrier_active` (flips in the
 barrier now: waiting for quiet or for the hold token, holding, or
 committing). Retained by-hash adds `acu_serve_byhash_displaced_total{host}`
-(by-hash requests served from a displaced snapshot).
+(by-hash requests served from a displaced snapshot). Suite rows (spec C3)
+add `acu_suite_seed_rejected_total{host}` (refusals at the
+`freshness.max_suites` caps that reached the database: at most one per
+suite per 10 minutes, unless the rejection cache, which holds 4,096 suites,
+had to clear itself) and the unlabelled gauge `acu_suites_seed_rejected`
+(suites refused within the last 10 minutes, updated within a minute). The
+scheduler adds the unlabelled counter `acu_freshness_unlogged_panics_total`
+(scheduled checks whose panic could not be logged because reporting it
+panicked too: a bug, please report it).
 `acu_adoption_duration_seconds` includes the barrier's wait (at most
 140 s).
 
@@ -206,9 +217,9 @@ released; a client-refused change is picked up by the next tick, see
 Structured events emitted outside the per-request `request` log line:
 goroutine panic recovery, freshness checks that end unknown, adoption
 failure and refusal records and their retry schedule, wall-clock step
-detection, the startup legacy trust audit, the flip barrier and a slow
-shutdown drain (logged by `internal/freshness`, `internal/handler` and
-the daemon's `main`).
+detection, the startup legacy trust audit, the flip barrier, suite rows
+(cap refusals and evictions) and a slow shutdown drain (logged by
+`internal/freshness`, `internal/handler` and the daemon's `main`).
 
 | Event | Level | Fields | Meaning |
 |---|---|---|---|
@@ -230,15 +241,23 @@ the daemon's `main`).
 | `freshness: clear adoption failure failed` | WARN | `canonical_host`, `suite_path`, `err` | Upstream serves the current content again but the failure record could not be cleared; the next check tries again. |
 | `freshness: read suite row after a panic failed` | WARN | `err`, `canonical_host`, `suite_path` | After a recovered check panic, the best-effort bump of `last_check_at`/`check_fail_count` could not even read the suite's row; the row is left as it was. |
 | `freshness: persist failure bump after a panic failed` | WARN | `err`, `canonical_host`, `suite_path` | After a recovered check panic, `last_check_at` and `check_fail_count` were bumped in memory but the write failed; the row is left as it was. |
-| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute. For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. `acu_clock_steps_detected_total` counts detections, not distinct clock steps or distinct stamps: the same future stamp is detected again every time it is read — every scheduler tick for a future `last_success_at`, every check for a future `last_check_at`, and twice when a first-ever check falls back from inline to detached — so alert on its rate, not its value. |
+| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute. For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. For `stamp=last_requested_at` (a suite's client-interest stamp, read when the suite cap looks for an idle suite to evict) the suite is not evicted: a future stamp never counts as idle. `acu_clock_steps_detected_total` counts detections, not distinct clock steps or distinct stamps: the same future stamp is detected again every time it is read — every scheduler tick for a future `last_success_at`, every check for a future `last_check_at`, and twice when a first-ever check falls back from inline to detached — so alert on its rate, not its value. |
 | `legacy_snapshot_quarantined` | WARN | `reason` (`legacy_plaintext`, `malformed_envelope`, `unsigned_declarations`, `unparseable`, `anchor_missing`, `anchor_oversized`, `anchor_corrupt`, `unexpected_form`), `snapshot_id`, `canonical_host`, `suite_path`, `anchor_form`, `was_current` | The startup trust audit could not prove a pre-upgrade snapshot signed and clean; it no longer serves or vouches, and its suite is served unadopted until it re-adopts. |
 | `legacy_trust_audit_deferred` | ERROR | `snapshot_id`, `canonical_host`, `suite_path`, `err`, `stack` (present only for a recovered panic) | A pre-upgrade snapshot's pool file could not be read (not "missing"), or auditing it panicked (`err` carries the panic value); the snapshot is left as it was and retried at the next start. |
 | `legacy_trust_audit_progress` | INFO | `audited`, `quarantined`, `deferred` | One batch of up to 100 queued snapshots was audited and committed; the fields are running totals across this start's batches. Logged on the first start after an upgrade, and on later starts while deferred snapshots remain queued or after an interrupted audit. |
 | `legacy_trust_audit_completed` | INFO | `audited`, `signed`, `quarantined`, `deferred`, `anchor_markers`, `duration` | The startup trust audit finished (every start; `audited` is 0 once the upgrade queue has drained). |
 | `adoption_flip_barrier` | INFO | `canonical_host`, `suite_path`, `snapshot_id`, `outcome` (`held`, `quiet_cut_short`, `hold_expired`, `hold_skipped`, `not_needed`, `commit_failed`), `phase_a_seconds`, `token_wait_seconds`, `hold_seconds`, `held_requests` (the last four absent when the barrier was skipped for a first adoption) | An adoption committed behind the spec C8 flip barrier: `held` within its hold, once its suite was quiet; `quiet_cut_short` within its hold at 15 s, before its suite was quiet — the held requests got the new snapshot, a client still reading the old anchor then (or done with it within `flip_quiet_period`) may straddle (`acu_flip_quiet_cut_short_total`); `hold_expired` when the hold reached 20 s before the commit finished — the held requests were answered from the old snapshot (`acu_flip_hold_expired_total`); `hold_skipped` after 60 s without the hold token (`acu_flip_hold_skipped_total`); `not_needed` for a first adoption whose anchor clients were already being served; `commit_failed` when the commit ran and failed — the snapshot did not switch, the timing fields still describe the barrier, and `adoption_run_failed` gives the error. Not logged when `adoption.flip_quiet_period = 0s`, nor for a flip abandoned at shutdown (`adoption_abandoned_at_shutdown` says so). |
-| `adoption_abandoned_at_shutdown` | INFO | `canonical_host`, `suite_path`, `form`, `err` | An adoption waiting in the flip barrier (or about to skip it) was abandoned at the shutdown signal: nothing was committed or recorded, the change is adopted after the restart. Not a failure: no `adoption_run_failed`, not counted in `acu_adoption_total` or `acu_adoption_duration_seconds`, not shown in the admin page's recent adoptions. |
+| `adoption_abandoned_at_shutdown` | INFO | `canonical_host`, `suite_path`, `form`, `err` | An adoption was abandoned at shutdown — waiting in the flip barrier (or about to skip it) when the daemon closed the barrier at the signal, or in any step before its commit once the daemon's lifetime context ended: nothing was committed or recorded, the change is adopted after the restart. Not a failure: no `adoption_run_failed`, not counted in `acu_adoption_total` or `acu_adoption_duration_seconds`, not shown in the admin page's recent adoptions. |
 | `displaced snapshot lookup failed` | WARN | `err`, `canonical_host`, `path` | Retained by-hash could not read the suite's displaced snapshots; the request is answered 404, as before spec C8. |
 | `snapshot adopted_at lookup failed` | WARN | `err`, `snapshot_id` | A snapshot `InRelease`/`Release`/`Release.gpg` could not read its snapshot's `adopted_at` (spec C8 `Last-Modified`), so this response carries the pool file's mtime instead and its `Last-Modified` may not grow with the last flip. Not logged when the request had already ended. |
 | `shutdown_waiting_for_adoptions` | INFO | `waited`, `detail` | Shutdown has waited 2 s for the adoption, repair and reconcile goroutines: a commit already running is never cancelled and may take up to its 5-minute bound; other work stops at its next cancellation point (adoptions in the flip barrier were abandoned at the signal). Logged once per shutdown. |
-| `shutdown wait panicked` | ERROR | `panic` | The shutdown drain's wait for the adoption, repair and reconcile goroutines panicked (a bug, please report it); shutdown carries on without waiting further for them. |
-| `apt-cacher-ultra starting` | INFO | the effective configuration (see `cmd/apt-cacher-ultra/main.go`); the flat-repository work adds `adoption_flip_quiet_period` | Logged once at start. `adoption_flip_quiet_period` is the configured `adoption.flip_quiet_period`; the flip barrier runs only when it is not `0s` and adoption is enabled. |
+| `suite_seed_rejected` | WARN | `canonical_host`, `suite_path`, `cap` (`global_cap`, `host_cap`), `max_suites`, `suppressed`, `detail` | A suite was refused a row by `freshness.max_suites`: it is served but will not refresh; retried after 10 minutes. At most one line a minute; `suppressed` counts the refusals since the last line. |
+| `suite_evicted` | INFO | `canonical_host`, `suite_path` (the evicted suite), `for_host`, `for_suite` | At or above the global cap, a suite with no adopted snapshot that had not been requested for 24 hours was evicted for a new one. Above the cap (after `freshness.max_suites` was lowered, or after an upgrade) the new suite is still refused (`suite_seed_rejected`) until the table is back under the cap. |
+| `suite_caps_exceeded` | WARN | `suites`, `max_suites`, `hosts_at_cap`, `per_host_cap`, `fullest_host`, `fullest_host_suites` | At start, the suite table holds `freshness.max_suites` suites or more, or a host holds a tenth of it or more (a lowered `max_suites`, or an upgraded cache): new suites are refused. Above the total cap each refused attempt still evicts one suite idle for 24 hours, so the table shrinks back; a host at its cap evicts nothing, and its suites go only when idle-suite reaping (a later release) removes them. Logged once per start. |
+| `suite cap usage read failed` | WARN | `err` | The startup check behind `suite_caps_exceeded` could not count the suites; the caps apply either way. |
+| `handler_goroutine_panicked` | ERROR | `where` (`touch`, `seed_rejections`), `canonical_host` and `path` (`touch` only), `panic`, `stack` (first occurrence per `where` per process only) | A panic in one of the handler's background goroutines — the touch goroutine, or the cap-rejection cache's sweep timer — was recovered (a bug, please report it). |
+| `suite onboarding failed` | WARN | `err`, `canonical_host`, `suite_path` | A cache hit on an untracked suite's anchor could not create its row (including the 5 s bound on that write); the anchor is served and the next hit retries. |
+| `suite signed-seen mark failed` | WARN | `err`, `canonical_host`, `suite_path` | A suite's row was created, and one of its cached signed anchors changed between the handler's read and the creating write, so it was marked afterwards — and that write failed. The startup pass marks it at the next start. (Every other mark is part of the write that creates the row or stores the anchor.) |
+| `snapshot_member_blob_missing` | WARN | `canonical_host`, `path`, `snapshot_id`, `blob_hash`, `snapshot_displaced` (present for a displaced snapshot's member) | A snapshot member's pool file is gone: a current member is re-fetched and checked against its declared hash; a displaced one (retained by-hash) answers 404. |
+| `shutdown wait panicked` | ERROR | `panic`, `stack` | The shutdown drain's wait for the adoption, repair and reconcile goroutines panicked (a bug, please report it); shutdown carries on without waiting further for them. |
+| `apt-cacher-ultra starting` | INFO | the effective configuration (see `cmd/apt-cacher-ultra/main.go`); the flat-repository work adds `adoption_flip_quiet_period` and `freshness_max_suites` | Logged once at start. `adoption_flip_quiet_period` is the configured `adoption.flip_quiet_period`; the flip barrier runs only when it is not `0s` and adoption is enabled. `freshness_max_suites` is the configured `freshness.max_suites`. |
