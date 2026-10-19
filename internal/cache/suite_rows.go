@@ -523,8 +523,10 @@ const (
 // refuses a retired candidate, and retired rows leave the natural-key,
 // rollback and retained-by-hash lookups, so a returning suite re-adopts
 // unchanged content at once (spec C9). Every statement is keyed by the
-// full (scheme, host, suite_path): a same-path suite of another host is
-// never touched (TestCreateSuite_EvictionTouchesOnlyTheEvictee).
+// full (scheme, host, suite_path): a same-path suite of another host, or
+// the other scheme's twin, is never touched
+// (TestCreateSuite_EvictionTouchesOnlyTheEvictee,
+// TestCreateSuite_EvictionLeavesTheOtherSchemesTwin).
 func deleteSuiteTx(ctx context.Context, tx *sql.Tx, key SuiteKey, wantCurrent *int64, cutoff, now int64) (deleteOutcome, error) {
 	var current, requested sql.NullInt64
 	err := tx.QueryRowContext(ctx, `

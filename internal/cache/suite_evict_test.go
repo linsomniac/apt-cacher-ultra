@@ -250,6 +250,58 @@ func TestCreateSuite_EvictionTouchesOnlyTheEvictee(t *testing.T) {
 	}
 }
 
+// R-D1: deleteSuiteTx is keyed by scheme too — evicting http://b/idle
+// leaves an adopted https://b/idle (its row and its current snapshot)
+// alone. Phase F's reaper reuses the delete for adopted suites, where a
+// cross-scheme retire would leak the twin's pins (final review, tests I-2).
+func TestCreateSuite_EvictionLeavesTheOtherSchemesTwin(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	seedRow(t, c, sk("b", "/idle"), evictNow-3*evictDay)
+	twin := SuiteKey{CanonicalScheme: "https", CanonicalHost: "b", SuitePath: "/idle"}
+	seedRow(t, c, twin, evictNow-3600)
+	id := adoptRow(t, c, twin)
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 2}, newFakeGuard())
+	if err != nil || res.Evicted == nil || *res.Evicted != sk("b", "/idle") {
+		t.Fatalf("CreateSuite = %+v, %v; want http://b/idle evicted", res, err)
+	}
+	if !rowExists(t, c, twin) {
+		t.Fatal("the eviction deleted the https twin's row")
+	}
+	if snap, err := c.GetSuiteSnapshot(ctx, id); err != nil || snap.RetiredAt != nil {
+		t.Fatalf("the eviction retired the https twin's current snapshot: %+v, %v", snap, err)
+	}
+}
+
+// Design review M3 (final review, tests I-1): a CreateSuite whose writer
+// operation fails — its context ends after the candidate is held, before
+// the writer runs it — still releases the held candidate, once, as not
+// deleted (a leaked hold keeps that suite's mutex locked: no check,
+// adoption or eviction of it until a restart), and evicts and creates
+// nothing.
+func TestCreateSuite_AFailedSubmitReleasesItsCandidate(t *testing.T) {
+	// The cancelled operation may still run on the writer after CreateSuite
+	// returned (submitWrite's documented ctx path), so nowUnix is restored
+	// only after the cache's Close (cleanups run last-in first-out): a
+	// deferred restore would race with it.
+	t.Cleanup(stubNow(t, evictNow))
+	c := openCache(t)
+	fourRows(t, c)
+	ctx, cancel := context.WithCancel(context.Background())
+	g := newFakeGuard()
+	g.onHold = func(SuiteKey) { cancel() }
+	if _, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 4}, g); err == nil {
+		t.Fatal("premise: the submit fails on an ended context")
+	}
+	if got := g.released[sk("b", "/idle")]; !slices.Equal(got, []bool{false}) {
+		t.Fatalf("released %v; want b/idle released once, as not deleted", g.released)
+	}
+	if !rowExists(t, c, sk("b", "/idle")) || rowExists(t, c, sk("e", "/new")) {
+		t.Fatal("a failed creation evicted or created a row")
+	}
+}
+
 // Design review M4: a held candidate whose row a concurrent creation
 // evicted before this one held it (here: deleted inside HoldSuite, the
 // table refilled behind it) is released as gone — its in-memory state is

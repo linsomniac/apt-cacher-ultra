@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -19,6 +21,9 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
+	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
+	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
+	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
@@ -184,6 +189,204 @@ func TestServeHTTP_ConcurrentHitsShareOneOnboarding(t *testing.T) {
 	if r.suite("/r/dists/s") == nil || !r.marked("/r/dists/s") {
 		t.Fatal("the shared onboarding did not create and mark the suite")
 	}
+}
+
+// Spec C3 on the hit path (final review, tests I-3): onboarding — the
+// creation path of an upgraded cache — honours the caps. A legacy anchor
+// whose onboarding is refused at the per-host cap is served untracked, and
+// the refusal is cached (the next hit costs no writer operation), counted
+// once and logged.
+func TestServeHTTP_OnboardingRefusalIsCachedCountedAndLogged(t *testing.T) {
+	r := newSuiteRig(t, true, 10) // per-host cap 1
+	r.cacheAnchor("/r/dists/a/InRelease", rowInRelease, 1_700_000_000)
+	r.cacheAnchor("/r/dists/b/InRelease", rowInRelease, 1_700_000_000)
+	before := sumMetricLines(t, []string{"acu_suite_seed_rejected_total"})["acu_suite_seed_rejected_total"]
+	for _, p := range []string{"/r/dists/a/InRelease", "/r/dists/b/InRelease", "/r/dists/b/InRelease"} {
+		if rec := r.get(p); rec.Code != http.StatusOK || rec.Header().Get(hdrXCache) != cacheHit {
+			t.Fatalf("%s = %d %q, want a 200 hit", p, rec.Code, rec.Header().Get(hdrXCache))
+		}
+	}
+	if r.suite("/r/dists/a") == nil || r.suite("/r/dists/b") != nil || r.marked("/r/dists/b") {
+		t.Fatal("want a onboarded, b refused at the per-host cap with no marker")
+	}
+	if d := sumMetricLines(t, []string{"acu_suite_seed_rejected_total"})["acu_suite_seed_rejected_total"] - before; d != 1 {
+		t.Fatalf("acu_suite_seed_rejected_total rose by %v, want 1 (the repeat is cached)", d)
+	}
+	if n := r.h.rejections.len(); n != 1 {
+		t.Fatalf("rejection cache = %d entries, want 1", n)
+	}
+	recs := logRecords(r.logs, "suite_seed_rejected", slog.LevelWarn)
+	if len(recs) != 1 || recs[0]["suite_path"] != "/r/dists/b" || recs[0]["cap"] != "host_cap" {
+		t.Fatalf("suite_seed_rejected records = %v", recs)
+	}
+}
+
+// Spec C3, design note 14 (final review, tests I-3): an onboarding at the
+// global cap evicts the idle suite (no snapshot, not requested for a day)
+// and says so: INFO suite_evicted names the evictee and the suite it made
+// room for — the operator's only evidence of an eviction.
+func TestServeHTTP_OnboardingAtTheGlobalCapEvictsAndSaysSo(t *testing.T) {
+	r := newSuiteRig(t, true, 10)
+	ctx := context.Background()
+	for i := range 10 {
+		if err := r.c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http",
+			CanonicalHost: fmt.Sprintf("h%d.example", i), SuitePath: "/r/dists/x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := r.secondConn().Exec(`UPDATE suite_freshness SET last_requested_at = ? WHERE canonical_host = 'h3.example'`,
+		time.Now().Add(-48*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	r.cacheAnchor("/r/dists/s/InRelease", rowInRelease, 1_700_000_000)
+	if rec := r.get("/r/dists/s/InRelease"); rec.Code != http.StatusOK {
+		t.Fatalf("hit = %d", rec.Code)
+	}
+	if r.suite("/r/dists/s") == nil {
+		t.Fatal("the onboarding at the global cap did not create its row")
+	}
+	ev := logRecords(r.logs, "suite_evicted", slog.LevelInfo)
+	if len(ev) != 1 || ev[0]["level"] != "INFO" || ev[0]["canonical_host"] != "h3.example" || ev[0]["suite_path"] != "/r/dists/x" ||
+		ev[0]["for_host"] != "127.0.0.1" || ev[0]["for_suite"] != "/r/dists/s" {
+		t.Fatalf("suite_evicted records = %v; want one INFO naming h3.example /r/dists/x for 127.0.0.1 /r/dists/s", ev)
+	}
+}
+
+// drainedT1 runs the handler's T1 checks to completion even once Close has
+// cancelled the lifecycle context, so Close drains every check and the
+// checker's lock-map count is exact (a check that starts on an ended
+// context skips the suite and stores no entry).
+type drainedT1 struct{ ck *freshness.Checker }
+
+func (f drainedT1) Check(ctx context.Context, scheme, host, suitePath string) {
+	f.ck.Check(context.WithoutCancel(ctx), scheme, host, suitePath)
+}
+
+// R-D1 on the hit path: an onboarding at the global cap evicts under the
+// checker's guard, as a miss does, so the evictee's lock-map and flip-gate
+// entries leave with its row. Production wiring, as in the scale test: the
+// adopter's gate, the checker as the guard (design note 21).
+func TestServeHTTP_OnboardingAtTheGlobalCapEvictsUnderTheGuard(t *testing.T) {
+	c := simtest.OpenCache(t)
+	gate, err := flipgate.New(flipgate.Config{Quiet: flipgate.MaxQuiet}) // no entry is swept during the test
+	if err != nil {
+		t.Fatal(err)
+	}
+	ad, err := freshness.NewAdopter(freshness.AdoptionConfig{Cache: c, Fetcher: &memberStore{bodies: map[string][]byte{}},
+		Verifier: plainVerifier{}, HostLimiter: hostsem.New(16), Logger: simtest.DiscardLogger(), FlipGate: gate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const maxSuites = 10 // per-host cap 1: one suite per host
+	ck, err := freshness.New(freshness.Config{Cache: c, Fetcher: &simtest.StaticConditional{Status: http.StatusNotModified},
+		HostLimiter: hostsem.New(16), Logger: simtest.DiscardLogger(), MaxSuites: maxSuites, Adopter: ad})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parser, err := proxy.New(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newHandler := func() *Handler {
+		h, err := New(Config{Parser: parser, Cache: c, Fetch: mintedUpstream{}, Logger: simtest.DiscardLogger(),
+			HostLimiter: hostsem.New(16), Freshness: drainedT1{ck}, AdoptionEnabled: true, FlipGate: ad.FlipGate(),
+			MaxSuites: maxSuites, SuiteGuard: ck})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	get := func(h *Handler, url string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s = %d", url, rec.Code)
+		}
+		return rec
+	}
+	// A full table: each suite's miss and url_path hit give it a lock-map,
+	// gate and touch-map entry; h3's is the one idle suite.
+	first := newHandler()
+	for i := range maxSuites {
+		base := fmt.Sprintf("http://h%d.example/r/dists/old", i)
+		get(first, base+"/InRelease")
+		get(first, base+"/InRelease")
+	}
+	first.Close() // drains their T1 checks
+	db := sqliteFile(t, filepath.Join(c.Dir(), "cache.db"))
+	if _, err := db.Exec(`UPDATE suite_freshness SET last_requested_at = ? WHERE canonical_host = 'h3.example'`,
+		time.Now().Add(-48*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	h := newHandler()
+	hash := writeBlob(t, h, rowInRelease) // a legacy anchor: cached, no suite row
+	at := wallclock.Unix()
+	if err := c.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: "http", CanonicalHost: "n.example",
+		Path: "/r/dists/new/InRelease", BlobHash: &hash, UpstreamURL: "http://n.example/r/dists/new/InRelease",
+		IsMetadata: true, LastRequestedAt: &at, RequestCount: 1, LastFetchedAt: &at}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := get(h, "http://n.example/r/dists/new/InRelease"); rec.Header().Get(hdrXCache) != cacheHit {
+		t.Fatalf("X-Cache %q, want an onboarding hit", rec.Header().Get(hdrXCache))
+	}
+	h.Close() // drains the onboarded suite's T1
+	ctx := context.Background()
+	key := func(host, suite string) cache.SuiteKey {
+		return cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite}
+	}
+	if ok, err := c.SuiteExists(ctx, key("n.example", "/r/dists/new")); err != nil || !ok {
+		t.Fatalf("the onboarding did not create its row (%v, %v)", ok, err)
+	}
+	if ok, err := c.SuiteExists(ctx, key("h3.example", "/r/dists/old")); err != nil || ok {
+		t.Fatalf("the idle suite was not evicted (%v, %v)", ok, err)
+	}
+	if n := ck.LockCount(); n != maxSuites {
+		t.Errorf("lock map = %d entries, want %d (one per row): the evictee's entry stayed", n, maxSuites)
+	}
+	if n := gate.Len(); n != maxSuites {
+		t.Errorf("flip gate = %d entries, want %d (one per row): the evictee's entry stayed", n, maxSuites)
+	}
+	if n := c.TouchedSuites(); n != maxSuites {
+		t.Errorf("touch map = %d entries, want %d (one per row)", n, maxSuites)
+	}
+}
+
+// Design review M8 (final review, tests I-3; Task 9 ruling d overturned:
+// the seam exists): an onboarding whose writer operation outlasts
+// onboardTimeout serves the hit untracked, logs WARN suite onboarding
+// failed, and the next hit onboards. cachedAnchorsHook runs under the
+// onboarding's bounded context, so it stands in for a slow writer.
+func TestServeHTTP_OnboardingTimeoutServesUntracked(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &syncLog{}
+		s := newFlipStackLogging(t, 0, slog.New(slog.NewJSONHandler(logs, nil)))
+		const suite = "/n/dists/s"
+		key := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: flipSimHost, SuitePath: suite}
+		s.cacheLegacyAnchor(suite, rowInRelease)
+		// A writer slower than any wait apt tolerates (30 s): the onboarding
+		// must have given up by then (its bound is well under apt's timeout).
+		s.h.cachedAnchorsHook = func() { time.Sleep(25 * time.Second) }
+		get := func() *httptest.ResponseRecorder {
+			rec := httptest.NewRecorder()
+			s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+suite+"/InRelease", nil))
+			return rec
+		}
+		if rec := get(); rec.Code != http.StatusOK || rec.Header().Get(hdrXCache) != cacheHit {
+			t.Fatalf("hit = %d %q, want a 200 hit", rec.Code, rec.Header().Get(hdrXCache))
+		}
+		if ok, err := s.c.SuiteExists(context.Background(), key); err != nil || ok {
+			t.Fatalf("a timed-out onboarding tracked the suite (%v, %v)", ok, err)
+		}
+		if n := len(logRecords(logs, "suite onboarding failed", slog.LevelWarn)); n != 1 {
+			t.Fatalf("%d suite onboarding failed records, want 1", n)
+		}
+		s.h.cachedAnchorsHook = nil
+		get()
+		if ok, err := s.c.SuiteExists(context.Background(), key); err != nil || !ok {
+			t.Fatalf("the next hit did not onboard the suite (%v, %v)", ok, err)
+		}
+	})
 }
 
 // requested reads a suite's client-interest stamp.
