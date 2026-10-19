@@ -41,4 +41,4 @@ Phase A's per-task and final reviews (2026-10-11, Fable max) found these minor i
 ## internal/handler
 
 - **A-55** `fetch_seam_test.go:84` comment says "Review Focus 2" but encoding is focus item 1.
-- **A-56** `handler.Fetcher` vs `freshness.Fetcher`/`AdoptionFetcher` naming overlap. Informational.
+- **A-56** `handler.Fetcher` (`handler.go`) vs `freshness.Fetcher` (`freshness.go`)/`AdoptionFetcher` (`adoption.go`) naming overlap. Informational naming with no behaviour: a rename would churn three packages (`handler`, `freshness`, `simtest`) for no change in what the code does, so phase E, whose tasks hand-edit these files, left it (re-filed in phase E's review fix round 1, which corrected Task 15's "in files no task changes"). (H)

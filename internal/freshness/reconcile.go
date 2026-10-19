@@ -24,9 +24,13 @@ import (
 // re-checks (the on-demand caller).
 //
 // AIDEV-NOTE: trust-sensitive path — three invariants must hold:
-//  1. Trust anchor: all declared members are validated against reparseSnapshotRelease,
-//     which re-reads the original GPG-verified Release blob from the pool.
-//     Never skip reparseSnapshotRelease or accept an un-verified declared set.
+//  1. Trust anchor: all declared members are validated against the declared
+//     set reparseSnapshotRelease returns for this snapshotID, which re-reads
+//     the original GPG-verified Release blob from the pool — parsed here, or
+//     handed down by reconcilePending, which parsed the same snapshot on the
+//     same tick (reconcileSnapshot's declared, deferred minor B-28). Never
+//     accept a declared set from any other source, and never pass down a set
+//     parsed for another snapshot.
 //  2. Displacement guard: InsertReconciledMembers re-checks current_snapshot_id
 //     inside its transaction. A displaced snapshot returns ErrSnapshotNotCurrent
 //     and this function returns (0, nil) — benign race, not an error.
@@ -37,10 +41,13 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	return a.reconcileSnapshot(ctx, suite, snapshotID, nil, force)
 }
 
-// reconcileSnapshot is ReconcileSnapshot; a non-nil declared is the
-// snapshot's declared set its caller already parsed from the same pinned
-// anchor (reconcilePending on the tick), so the Release is parsed once per
-// heal (deferred minor B-28).
+// reconcileSnapshot is ReconcileSnapshot; a non-nil declared must be
+// reparseSnapshotRelease's output for this same snapshotID, which its
+// caller already parsed from the same pinned anchor (reconcilePending on
+// the tick, through spawnRepair), so the Release is parsed once per heal
+// (deferred minor B-28). Nothing ties declared to snapshotID but that
+// contract: a set from any other source, or another snapshot's, would
+// heal members the snapshot's own Release never declared.
 func (a *Adopter) reconcileSnapshot(ctx context.Context, suite SuiteRef, snapshotID int64, declared []ReleaseMember, force bool) (int, error) {
 	if !force {
 		if _, done := a.reconciledSnapshots.Load(snapshotID); done {
@@ -53,6 +60,9 @@ func (a *Adopter) reconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	// verified; re-reading it from the pinned pool means the declared set
 	// cannot be tampered with without changing the blob hash (which would
 	// invalidate the snapshot_member.declared_sha256 = blob.hash invariant).
+	// The set is parsed here, or it is the one reconcilePending parsed for
+	// this snapshotID on the same tick (B-28) — never a set from any other
+	// source.
 	if declared == nil {
 		var err error
 		if declared, err = a.reparseSnapshotRelease(ctx, snapshotID); err != nil {
@@ -167,6 +177,9 @@ func (a *Adopter) reconcilePending(ctx context.Context, snapshotID int64) ([]Rel
 // as-is.
 // Callers MUST treat the returned []ReleaseMember as the authoritative
 // declared set — do not accept member declarations from any other source.
+// Handing the set down within one tick (reconcilePending → spawnRepair →
+// reconcileSnapshot, B-28) is not another source: it is this function's
+// output for the same snapshotID.
 func (a *Adopter) reparseSnapshotRelease(ctx context.Context, snapshotID int64) ([]ReleaseMember, error) {
 	if a.reparseHook != nil {
 		a.reparseHook()
