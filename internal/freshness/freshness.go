@@ -214,17 +214,19 @@ type Checker struct {
 	// repair or reconcile the check hands it to.
 	//
 	// AIDEV-NOTE: I-4 (spec C3) bounds the map by the suite table: Check
-	// and Reconcile read the suite's row before LoadOrStore and, after
-	// TryLock, re-validate that the map still holds the same mutex; a check
-	// that then finds the row gone drops its entry (CompareAndDelete), and
-	// cap eviction (phase F's reaper too) drops the evictee's through
-	// HoldSuite's release(true). An entry outlives its row only while a
-	// check that loaded it unwinds (LockCount).
+	// and Reconcile read the suite's row before LoadOrStore, and every
+	// acquisition (check, Reconcile, HoldSuite) goes through lockSuite,
+	// which re-validates after TryLock that the map still holds the same
+	// mutex; a check or Reconcile that then finds the row gone drops its
+	// entry, and cap eviction (phase F's reaper too) drops the evictee's
+	// through HoldSuite's release(true) — every drop through unlockDropped
+	// (drop, then unlock). An entry outlives its row only while a check or
+	// Reconcile that loaded it unwinds, or after a read error (LockCount).
 	locks sync.Map
 
-	// lockLoadedHook, when set (tests only), runs in check and Reconcile
-	// between loading a suite's mutex and TryLock: the window I-4's
-	// re-validation closes.
+	// lockLoadedHook, when set (tests only), runs in lockSuite — so in
+	// check, Reconcile and HoldSuite — between loading a suite's mutex and
+	// TryLock: the window I-4's re-validation closes.
 	lockLoadedHook func(key string)
 
 	lastClockStepLog atomic.Int64 // monotonic ns since processStart of the last clock_step_detected line
@@ -413,21 +415,16 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 	if !c.suiteRowExists(ctx, ref) {
 		return checkReport{result: resultSkipped}
 	}
-	muVal, _ := c.locks.LoadOrStore(key, &sync.Mutex{})
-	mu := muVal.(*sync.Mutex)
-	if c.lockLoadedHook != nil {
-		c.lockLoadedHook(key)
-	}
-	if !mu.TryLock() {
+	mu, st := c.lockSuite(key)
+	switch st {
+	case lockBusy:
 		// Another goroutine is on it; SPEC §7.3 says skip.
 		return checkReport{result: resultBusy}
-	}
-	// I-4: the mutex counts only while the lock map still holds it. Cap
-	// eviction (and phase F's reaper) drops the entry of a suite it deleted
-	// while holding this mutex; a check that loaded it before then must not
-	// run beside one that loads the new entry.
-	if cur, ok := c.locks.Load(key); !ok || cur != muVal {
-		mu.Unlock()
+	case lockStale:
+		// I-4: the mutex counts only while the lock map still holds it. Cap
+		// eviction (and phase F's reaper) drops the entry of a suite it
+		// deleted while holding this mutex; a check that loaded it before
+		// then must not run beside one that loads the new entry.
 		return checkReport{result: resultSkipped}
 	}
 	// Spec C4: the upstream part of a check (the host slot and the
@@ -447,8 +444,7 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 	}
 	if out.vanished {
 		// I-4: keep the lock map to suites with rows.
-		c.locks.CompareAndDelete(key, muVal)
-		mu.Unlock()
+		c.unlockDropped(key, mu)
 		return out.report
 	}
 	switch {
@@ -1787,7 +1783,8 @@ func setChangeSeen(cur *cache.SuiteFreshness, now int64) {
 
 // Reconcile forces an in-place reconcile of one suite's current snapshot
 // (SPEC6_8 on-demand recovery). Returns true if a reconcile was triggered;
-// false if the suite is unknown / has no current snapshot (no lock allocated)
+// false if the suite is unknown / has no current snapshot (no lock allocated;
+// a row that vanishes after that read has its entry dropped again)
 // or another check holds the suite lock. It also returns false when no
 // admission slot is free (spec C4: POST /reconcile then answers 409). The
 // reconcile runs the full trust-validated heal asynchronously — callers
@@ -1800,8 +1797,9 @@ func setChangeSeen(cur *cache.SuiteFreshness, now int64) {
 // who forges (host, suite) pairs cannot grow c.locks unless the suite is
 // already in the cache's suite_freshness table (which requires a successful
 // upstream adoption). Check does the same since phase D (I-4, spec C3), and
-// both re-validate after TryLock: the map must still hold the mutex and the
-// row must still name the snapshot read before.
+// both re-validate after TryLock (lockSuite): the map must still hold the
+// mutex and the row must still name the snapshot read before; a row found
+// gone has its entry dropped (unlockDropped), as in check.
 func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string) bool {
 	if c.adopter == nil {
 		return false
@@ -1817,24 +1815,23 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 	suite := SuiteRef{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}
 
 	key := suiteKey(scheme, host, suitePath)
-	muVal, _ := c.locks.LoadOrStore(key, &sync.Mutex{})
-	mu := muVal.(*sync.Mutex)
-	if c.lockLoadedHook != nil {
-		c.lockLoadedHook(key)
-	}
-	if !mu.TryLock() {
+	// I-4 (spec C3): lockSuite re-validates that the lock map still holds
+	// the mutex; then, under it, the suite must still have its row, with the
+	// snapshot read above still current. Otherwise the suite was deleted
+	// (cap eviction, phase F's reaper) or re-adopted meanwhile.
+	mu, st := c.lockSuite(key)
+	if st != lockOK {
 		return false
 	}
-	// I-4 (spec C3): re-validate under the mutex — the lock map must still
-	// hold it and the suite must still have its row, with the snapshot read
-	// above still current. Otherwise the suite was deleted (cap eviction,
-	// phase F's reaper) or re-adopted meanwhile.
-	if cur, ok := c.locks.Load(key); !ok || cur != muVal {
-		mu.Unlock()
+	sf, err = c.cache.GetSuiteFreshness(ctx, scheme, host, suitePath)
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		// The row vanished after the pre-read: drop the entry this call
+		// may have stored, exactly as check does (the map stays bounded by
+		// the suite table).
+		c.unlockDropped(key, mu)
 		return false
-	}
-	if sf, err := c.cache.GetSuiteFreshness(ctx, scheme, host, suitePath); err != nil ||
-		sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != snapID {
+	case err != nil || sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != snapID:
 		mu.Unlock()
 		return false
 	}

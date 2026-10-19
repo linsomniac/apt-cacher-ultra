@@ -261,7 +261,9 @@ func TestScheduler_FlushesAnEvictedWaiter(t *testing.T) {
 }
 
 // Spec C3 I-4: Reconcile re-validates that the row still exists — a row
-// deleted in the window (lock map intact) starts nothing.
+// deleted in the window (lock map intact) starts nothing and, as in check,
+// drops the lock-map entry Reconcile stored for it, so the map stays
+// bounded by the suite table.
 func TestReconcile_RevalidatesAVanishedRow(t *testing.T) {
 	ad, _, _ := gatedAdopter(t)
 	fc := newFakeCache()
@@ -278,6 +280,9 @@ func TestReconcile_RevalidatesAVanishedRow(t *testing.T) {
 		t.Fatal("reconciled a suite whose row vanished in the window")
 	}
 	c.WaitForAdoptions()
+	if n := c.LockCount(); n != 0 {
+		t.Fatalf("lock entries = %d, want 0 (a vanished row's entry is dropped, as check drops it)", n)
+	}
 }
 
 // R-D1 / I-4: HoldSuite re-validates after TryLock like check does — a
