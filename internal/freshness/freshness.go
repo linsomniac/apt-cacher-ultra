@@ -484,11 +484,15 @@ func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
 // AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, lease
 // release, recoverAdoption (first). The failure record is written before
 // the mutex is released on both the error and the panic path (spec C7).
-// The host slot is freed earlier, when the member pipeline ends; the global slot only here, after the flip barrier and the commit (ruling R-C1).
+// The host slot is freed earlier, when the member pipeline ends; the
+// global slot only here, after the flip barrier and the commit (ruling
+// R-C1).
 // A deadline that passes after the member pipeline, in the flip barrier
-// (ruling R-C2), leaves the outcome to the commit's own error, and a flip
-// abandoned in the barrier (shutdown, design note 18) is never counted,
-// logged or recorded as a failure (INFO adoption_abandoned_at_shutdown).
+// (ruling R-C2), leaves the outcome to the commit's own error. An attempt
+// ended by shutdown — a flip abandoned in the barrier (design note 18), or
+// any error once the lifetime context has ended (deferred minor C-20) — is
+// never counted, logged or recorded as a failure (INFO
+// adoption_abandoned_at_shutdown).
 func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) {
 	c.adoptionWg.Add(1)
 	go func() {
@@ -515,8 +519,11 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 		// that context ended). Shutdown is never a failure (spec C7,
 		// design note 18): it is not counted in acu_adoption_total, not
 		// shown in the admin ring, not recorded, and logged at INFO, so a
-		// routine restart pages nobody (final review, tests Minor 3).
-		if errors.Is(err, flipgate.ErrAborted) {
+		// routine restart pages nobody (final review, tests Minor 3). So
+		// does any error once the lifetime context has ended: a
+		// verification or member fetch cut short, or runShared's
+		// shutdown-before-the-commit check (deferred minor C-20).
+		if errors.Is(err, flipgate.ErrAborted) || (err != nil && c.lifetimeCtx.Err() != nil) {
 			c.logger.Info("adoption_abandoned_at_shutdown",
 				"canonical_host", req.suite.CanonicalHost,
 				"suite_path", req.suite.SuitePath,

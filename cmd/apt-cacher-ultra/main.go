@@ -786,7 +786,13 @@ func serveListeners(
 	// before anything drains. An adoption waiting in it abandons its commit
 	// at once (and records nothing), held InRelease/Release requests are
 	// answered, and no commit starts late in the stop window. A commit
-	// already running is waited for below (waitLogged).
+	// already running is waited for below (waitAdoptionDrain).
+	//
+	// AIDEV-NOTE: the order is load-bearing (deferred minor C-28): before
+	// the listeners shut down, so held requests are answered while they
+	// still can be, and before the drain, so the drain never waits on a
+	// barrier. TestServeListeners_ShutsDownWithTheBarrierOn is a smoke test
+	// only: no daemon test reaches a flip in the barrier.
 	adopter.FlipGate().Close()
 
 	// SPEC §9.5 step 2: stop accepting (Shutdown closes the listener
@@ -923,7 +929,7 @@ func serveListeners(
 	// c.Close(); past adoptionDrainNotice it is explained in the journal.
 	// No adoption is in the flip barrier any more: the gate was closed at
 	// the signal.
-	waitLogged(freshChecker.WaitForAdoptions, adoptionDrainNotice, logger)
+	waitAdoptionDrain(freshChecker.WaitForAdoptions, adoptionDrainNotice, logger)
 
 	wg.Wait()
 	logger.Info("apt-cacher-ultra stopped")
@@ -1129,19 +1135,25 @@ func handlerConfig(
 // adoptions before it explains the wait (deferred minor B-64).
 const adoptionDrainNotice = 2 * time.Second
 
-// waitLogged runs wait and, once it has run for notice, logs
-// shutdown_waiting_for_adoptions at INFO (once), so a slow stop is
-// explained in the journal: the drain waits for adoption, repair and
-// reconcile goroutines, and a commit already running is never cancelled
-// and may take up to the 5-minute commit timeout. It returns when wait
-// does.
-func waitLogged(wait func(), notice time.Duration, logger *slog.Logger) {
+// waitAdoptionDrain runs wait (the adoption drain) and, once it has run
+// for notice, logs shutdown_waiting_for_adoptions at INFO (once), so a
+// slow stop is explained in the journal: the drain waits for adoption,
+// repair and reconcile goroutines, and a commit already running is never
+// cancelled and may take up to the 5-minute commit timeout. It returns
+// when wait does; a panicking wait is logged with its stack (deferred
+// minor C-30) and the shutdown carries on.
+//
+// AIDEV-NOTE: the 5-minute figure here, in the notice's detail, in the
+// drain comment above and in docs/log-fields.md and docs/configuration.md
+// is freshness's unexported commitTimeout (internal/freshness/adoption.go):
+// change them together (deferred minor C-33).
+func waitAdoptionDrain(wait func(), notice time.Duration, logger *slog.Logger) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		defer func() {
 			if r := recover(); r != nil {
-				logger.Error("shutdown wait panicked", "panic", r)
+				logger.Error("shutdown wait panicked", "panic", r, "stack", string(debug.Stack()))
 			}
 		}()
 		wait()

@@ -231,6 +231,55 @@ func TestSchedQueues_PrunesIdleHosts(t *testing.T) {
 	}
 }
 
+// Deferred minor B-40: when the host whose turn is next is pruned, the
+// turn passes to the first surviving host after it, not back to the first.
+func TestSchedQueues_PruneHandsTheTurnToTheNextHost(t *testing.T) {
+	q := newSchedQueues()
+	one := int64(1)
+	for _, h := range []string{"a", "b", "c", "d"} {
+		q.enqueue(schedRow(h, "/1", &one, 0), false)
+	}
+	c := q.hosts["c"]
+	for i := range c.classes {
+		c.classes[i] = nil
+	}
+	delete(q.queued, suiteKey("http", "c", "/1"))
+	q.next = 2 // c's turn
+	q.prune()
+	if got := q.order[q.next]; got != "d" || len(q.order) != 3 {
+		t.Fatalf("after pruning c: order %v, turn %q; want d's turn", q.order, got)
+	}
+	q.next = 2 // d's turn, the last host
+	q.hosts["d"].classes = [numSchedClasses][]schedItem{}
+	delete(q.queued, suiteKey("http", "d", "/1"))
+	q.prune()
+	if got := q.order[q.next]; got != "a" {
+		t.Fatalf("after pruning the last host: turn %q, want a's (wrapped)", got)
+	}
+}
+
+// Deferred minor B-43: an ordinary scheduler check — neither a waiter's
+// re-offer nor a pending change — honours the cooldown; a waiter's does not.
+func TestCheckRecovered_OrdinaryCheckHonoursTheCooldown(t *testing.T) {
+	fc := newFakeCache()
+	recent := time.Now().Unix()
+	seedFakeSuite(fc, "h", "/r/dists/x", &recent)
+	up := &changedUpstream{body: []byte("x")}
+	c, err := New(Config{Cache: fc, Fetcher: up, HostLimiter: hostsem.New(1), Cooldown: time.Hour, Logger: discardLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}
+	item := schedItem{ref: ref, key: suiteKey("http", "h", "/r/dists/x")}
+	if rep := c.checkRecovered(context.Background(), item); rep.result != resultSkipped || up.calls.Load() != 0 {
+		t.Fatalf("ordinary check inside the cooldown = %q with %d upstream calls; want skipped, 0", rep.result, up.calls.Load())
+	}
+	item.waiting = true
+	if c.checkRecovered(context.Background(), item); up.calls.Load() != 1 {
+		t.Fatalf("a waiter's re-check made %d upstream calls, want 1 (it bypasses the cooldown)", up.calls.Load())
+	}
+}
+
 func TestSuiteDue(t *testing.T) {
 	// suiteDue only asks whether an adopter is wired.
 	c, err := New(Config{Cache: newFakeCache(), Fetcher: &changedUpstream{}, HostLimiter: hostsem.New(1),
@@ -334,6 +383,44 @@ func TestRun_FourWorkersOneCheckPerHost(t *testing.T) {
 	})
 }
 
+// Deferred minor B-39: with fewer hosts than workers, pop skips the hosts
+// whose check is in flight: at most one check per host, so three hosts
+// never have four checks in flight, and every suite is still checked.
+func TestRun_InFlightHostsAreSkipped(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fc := newFakeCache()
+		up := simtest.NewUpstream()
+		var urls []string
+		for h := range 3 {
+			for s := range 3 {
+				host, suite := fmt.Sprintf("h%d", h), fmt.Sprintf("/s%d/dists/x", s)
+				seedFakeSuite(fc, host, suite, nil)
+				url := "http://" + host + suite + "/InRelease"
+				up.Set(url, simtest.After(time.Minute, simtest.NotModified()))
+				urls = append(urls, url)
+			}
+		}
+		c, err := New(Config{Cache: fc, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute, Logger: discardLogger()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { c.Run(ctx); close(done) }()
+		time.Sleep(time.Hour)
+		cancel()
+		<-done
+		if total, perHost := up.MaxInFlight(); total != 3 || perHost != 1 {
+			t.Fatalf("max in flight = %d overall, %d per host; want 3 (one per host) and 1", total, perHost)
+		}
+		for _, u := range urls {
+			if len(up.Calls(u)) == 0 {
+				t.Errorf("%s never checked", u)
+			}
+		}
+	})
+}
+
 // The carry-forward from phase A: a panic in a tick (before any check)
 // must not stop the scheduler.
 func TestRun_SurvivesATickPanic(t *testing.T) {
@@ -425,7 +512,8 @@ func TestRun_SurvivesARescheduleRestartPanic(t *testing.T) {
 // A worker sends done for every item it received, even when the check's
 // recover path itself panics (here reportPanic's log call in
 // checkRecovered): a dispatched item without its done would leave its host
-// in flight and a worker slot lost for good.
+// in flight and a worker slot lost for good. That panic cannot be logged,
+// so acu_freshness_unlogged_panics_total counts it (deferred minor B-44).
 func TestCheckWorker_SendsDoneWhenTheRecoverPathPanics(t *testing.T) {
 	fc := newFakeCache()
 	seedFakeSuite(fc, "h", "/r/dists/x", nil)
@@ -440,6 +528,16 @@ func TestCheckWorker_SendsDoneWhenTheRecoverPathPanics(t *testing.T) {
 	// panic must come from outside it to reach checkRecovered's handler: a
 	// lock-map entry that is not a mutex fails check's type assertion.
 	c.locks.Store(suiteKey("http", "h", "/r/dists/x"), struct{}{})
+	unlogged := func() float64 {
+		var f float64
+		if v := renderedMetric("acu_freshness_unlogged_panics_total"); v != "" {
+			if _, err := fmt.Sscan(v, &f); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return f
+	}
+	before := unlogged()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	work := make(chan schedItem)
@@ -465,6 +563,9 @@ func TestCheckWorker_SendsDoneWhenTheRecoverPathPanics(t *testing.T) {
 		}
 	case r := <-escaped:
 		t.Fatalf("a panic escaped the worker (%v): its item got no done", r)
+	}
+	if got := unlogged() - before; got != 1 {
+		t.Errorf("acu_freshness_unlogged_panics_total rose by %v, want 1 (deferred minor B-44)", got)
 	}
 	cancel()
 	<-exited
@@ -654,8 +755,8 @@ func TestSchedQueues_BusyOfferIsHeldUntilTheNextWake(t *testing.T) {
 		t.Fatalf("a held suite was offered before the next wake: %v", it.ref)
 	}
 	q.unhold()
-	if it, _ := q.pop(admitAll); it.ref.SuitePath != "/1" || !it.waiting {
-		t.Fatalf("after unhold got %+v, want /1 waiting", it)
+	if it, _ := q.pop(admitAll); it.ref.SuitePath != "/1" || !it.waiting || !it.signed {
+		t.Fatalf("after unhold got %+v, want /1 waiting, still signed (deferred minor B-42)", it)
 	}
 }
 

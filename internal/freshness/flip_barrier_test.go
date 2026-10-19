@@ -165,14 +165,7 @@ func TestAdopter_FirstAdoptionOfTheServedAnchorSkipsTheBarrier(t *testing.T) {
 				ctx := context.Background()
 				r := newBarrierRig(t, 10*time.Second, 0)
 				rel := r.release("v1")
-				h, err := r.ad.writeBlobBytes(ctx, tc.served(rel))
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := r.c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: rigHost,
-					Path: rigSuite + "/InRelease", BlobHash: &h, UpstreamURL: rigAnchorURL, IsMetadata: true}); err != nil {
-					t.Fatal(err)
-				}
+				r.putServedAnchor(t, "InRelease", tc.served(rel))
 				tok := r.gate.AnchorStart(ctx, barrierKey)
 				go func() { time.Sleep(5 * time.Second); tok.Done() }()
 				start := time.Now()
@@ -198,14 +191,7 @@ func TestAdopter_DetachedFirstAdoptionComparesTheRelease(t *testing.T) {
 		ctx := context.Background()
 		r := newBarrierRig(t, 10*time.Second, 0)
 		rel := r.release("detached v1")
-		h, err := r.ad.writeBlobBytes(ctx, rel)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := r.c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: rigHost,
-			Path: rigSuite + "/Release", BlobHash: &h, UpstreamURL: "http://h/r/dists/x/Release", IsMetadata: true}); err != nil {
-			t.Fatal(err)
-		}
+		r.putServedAnchor(t, "Release", rel)
 		tok := r.gate.AnchorStart(ctx, barrierKey)
 		defer tok.Done()
 		start := time.Now()
@@ -259,6 +245,16 @@ func TestAdopter_ShutdownInTheBarrierCommitsNothing(t *testing.T) {
 		if id := r.current(t); id != 0 || r.gate.Stats().Aborted != 1 || len(r.barrierEvents()) != 0 {
 			t.Fatalf("current %d, stats %+v, events %v; want no commit, one abort, no barrier event",
 				id, r.gate.Stats(), r.barrierEvents())
+		}
+		// Not a commit failure either (merged from a duplicate test:
+		// deferred minor C-18): no DB-failure sentinel
+		// (acu_adoption_total{outcome="db_failed"}) and no WARN
+		// "adoption: commit failed".
+		if errors.Is(err, ErrAdoptionDBFailed) || classifyAdoptionOutcome(err) == "db_failed" {
+			t.Fatalf("a shutdown in the barrier is reported as a DB failure: %v", err)
+		}
+		if strings.Contains(r.logs.String(), "adoption: commit failed") {
+			t.Fatalf("a shutdown in the barrier logged a commit failure:\n%s", r.logs.String())
 		}
 	})
 }
@@ -377,26 +373,6 @@ func TestCheck_ShutdownInTheBarrierRecordsNothing(t *testing.T) {
 	})
 }
 
-// A shutdown in the barrier is not a commit failure: no DB-failure
-// sentinel (acu_adoption_total{outcome="db_failed"}) and no WARN
-// "adoption: commit failed".
-func TestAdopter_ShutdownInTheBarrierIsNotACommitFailure(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		r := newBarrierRig(t, 10*time.Second, 0)
-		tok := r.gate.AnchorStart(context.Background(), barrierKey)
-		defer tok.Done()
-		stop, stopNow := context.WithCancel(context.Background())
-		time.AfterFunc(5*time.Second, stopNow)
-		err := r.ad.runRequest(context.Background(), r.request("v1"), runHooks{stop: stop})
-		if errors.Is(err, ErrAdoptionDBFailed) || classifyAdoptionOutcome(err) == "db_failed" {
-			t.Fatalf("a shutdown in the barrier is reported as a DB failure: %v", err)
-		}
-		if strings.Contains(r.logs.String(), "adoption: commit failed") {
-			t.Fatalf("a shutdown in the barrier logged a commit failure:\n%s", r.logs.String())
-		}
-	})
-}
-
 // The first-adoption skip still commits (inline and detached).
 func TestAdopter_FirstAdoptionSkipStillCommits(t *testing.T) {
 	for _, detached := range []bool{false, true} {
@@ -404,18 +380,12 @@ func TestAdopter_FirstAdoptionSkipStillCommits(t *testing.T) {
 			ctx := context.Background()
 			r := newBarrierRig(t, 10*time.Second, 0)
 			rel := r.release("skip still commits")
-			h, err := r.ad.writeBlobBytes(ctx, rel)
-			if err != nil {
-				t.Fatal(err)
-			}
-			path := rigSuite + "/InRelease"
+			file := "InRelease"
 			if detached {
-				path = rigSuite + "/Release"
+				file = "Release"
 			}
-			if err := r.c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: rigHost,
-				Path: path, BlobHash: &h, UpstreamURL: "http://h" + path, IsMetadata: true}); err != nil {
-				t.Fatal(err)
-			}
+			r.putServedAnchor(t, file, rel)
+			var err error
 			if detached {
 				err = r.ad.RunDetached(ctx, barrierSuite, rel, []byte("a detached signature"), "", "")
 			} else {
@@ -618,17 +588,50 @@ func TestCheck_ShutdownAbandonIsNotAFailure(t *testing.T) {
 	}
 }
 
-// putServedAnchor makes rel the url_path InRelease clients have been served,
-// so a first adoption of rel is eligible for the barrier skip.
-func (r *barrierRig) putServedAnchor(t *testing.T, rel []byte) {
+// Deferred minor C-20: an attempt the shutdown ends before the flip
+// barrier (here in its verification, when the lifetime context ends) is
+// not a failure either: not counted, not in the admin ring, not recorded,
+// and logged as INFO adoption_abandoned_at_shutdown instead of WARN
+// adoption_run_failed.
+func TestCheck_ShutdownBeforeTheBarrierIsNotAFailure(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.ver.blockNext()
+	r.up.set(r.release("slow", 0))
+	before := adoptionTotalFor(t, rigHost)
+	go r.checker.Check(context.Background(), "http", rigHost, rigSuite)
+	<-r.ver.entered
+	r.cancelLifetime()
+	r.checker.WaitForAdoptions()
+	if got := adoptionTotalFor(t, rigHost) - before; got != 0 {
+		t.Errorf("acu_adoption_total for the host rose by %v, want 0", got)
+	}
+	if evs := r.ring.Snapshot(); len(evs) != 0 {
+		t.Errorf("admin ring %+v, want no entry", evs)
+	}
+	if n := len(r.events("adoption_run_failed")); n != 0 {
+		t.Errorf("%d adoption_run_failed lines, want 0:\n%s", n, r.logs.String())
+	}
+	if evs := r.events("adoption_abandoned_at_shutdown"); len(evs) != 1 || evs[0]["level"] != "INFO" {
+		t.Errorf("adoption_abandoned_at_shutdown lines %v, want one at INFO", evs)
+	}
+	if row := r.row(); row.AdoptionFailCount != 0 {
+		t.Errorf("shutdown recorded a failure: %+v", row)
+	}
+}
+
+// putServedAnchor makes body the url_path anchor file (InRelease or
+// Release) clients have been served, so a first adoption of body is
+// eligible for the barrier skip.
+func (r *barrierRig) putServedAnchor(t *testing.T, file string, body []byte) {
 	t.Helper()
 	ctx := context.Background()
-	h, err := r.ad.writeBlobBytes(ctx, rel)
+	h, err := r.ad.writeBlobBytes(ctx, body)
 	if err != nil {
 		t.Fatal(err)
 	}
+	path := rigSuite + "/" + file
 	if err := r.c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: rigHost,
-		Path: rigSuite + "/InRelease", BlobHash: &h, UpstreamURL: rigAnchorURL, IsMetadata: true}); err != nil {
+		Path: path, BlobHash: &h, UpstreamURL: "http://" + rigHost + path, IsMetadata: true}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -642,7 +645,7 @@ func TestAdopter_FirstAdoptionSkipHonoursGateClose(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newBarrierRig(t, 10*time.Second, 0)
 		req := r.request("v1")
-		r.putServedAnchor(t, req.bytes)
+		r.putServedAnchor(t, "InRelease", req.bytes)
 		r.gate.Close()
 		err := r.ad.runRequest(context.Background(), req, runHooks{stop: context.Background()})
 		if !errors.Is(err, flipgate.ErrAborted) || !errors.Is(err, flipgate.ErrClosed) {
@@ -661,7 +664,7 @@ func TestCheck_GateCloseAbortsASkippedFirstAdoption(t *testing.T) {
 		ctx := context.Background()
 		r := newBarrierRig(t, 10*time.Second, 0)
 		req := r.request("v1")
-		r.putServedAnchor(t, req.bytes)
+		r.putServedAnchor(t, "InRelease", req.bytes)
 		if err := r.c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}); err != nil {
 			t.Fatal(err)
 		}

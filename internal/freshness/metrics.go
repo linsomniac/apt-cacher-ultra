@@ -31,12 +31,13 @@ import (
 // acu_legacy_snapshots_quarantined_total (spec §6.1, startup legacy
 // trust audit), both unlabelled counters; acu_adoption_failing_suites
 // (spec C7, unlabelled gauge); acu_freshness_waiting_for_slot (spec C4,
-// unlabelled gauge). The flip barrier's acu_flip_hold_skipped_total,
+// unlabelled gauge); acu_freshness_unlogged_panics_total (deferred minor
+// B-44, unlabelled counter). The flip barrier's acu_flip_hold_skipped_total,
 // acu_flip_hold_expired_total, acu_flip_quiet_cut_short_total,
 // acu_flip_waiters_over_cap_total, acu_flip_slow_anchor_reads_total and
 // acu_flip_gate_panics_total (spec C8, unlabelled counters) and
 // acu_flip_barrier_active (unlabelled gauge) are declared in
-// internal/flipgate. A flip abandoned at shutdown is not an adoption
+// internal/flipgate. An adoption ended by shutdown is not an adoption
 // outcome: it logs adoption_abandoned_at_shutdown and counts nowhere.
 var (
 	freshnessCheckTotal = metrics.NewCounterWithCap(
@@ -100,6 +101,15 @@ var (
 	freshnessWaitingForSlot = metrics.NewGauge(
 		"acu_freshness_waiting_for_slot",
 		"Suites waiting for an adoption slot; each is re-checked as soon as one it can use is released (spec C4).",
+	)
+
+	// freshnessUnloggedPanics counts scheduled checks whose panic could
+	// not be logged: the panic report in checkRecovered's recover panicked
+	// too, and checkWorker's last-resort recover caught it (deferred minor
+	// B-44). Any increase is a bug.
+	freshnessUnloggedPanics = metrics.NewCounter(
+		"acu_freshness_unlogged_panics_total",
+		"Scheduled freshness checks whose panic could not be logged because reporting it panicked too (a bug).",
 	)
 
 	adoptionTotal = metrics.NewCounterWithCap(

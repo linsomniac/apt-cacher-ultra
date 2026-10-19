@@ -161,7 +161,8 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 		maxG := baseG
 		const refresh = time.Hour
 		chk, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: refresh,
-			Adopter: ad, Logger: slog.New(slog.NewJSONHandler(logs, nil))})
+			Adopter: ad, Logger: slog.New(slog.NewJSONHandler(logs, nil)),
+			rand: func() float64 { return 0.5 }}) // spec §7 fixed seeds (deferred minor B-48)
 		// sample advances to until (measured from t0), sampling goroutines
 		// every 61 s: off the 15-minute tick grid.
 		sample := func(until time.Duration) {
@@ -235,8 +236,9 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 			t.Error("C3 was never queued for a slot: the slots were never contended")
 		}
 		// Workers, Run, two adoption slots, and slack for timers and the
-		// cache writer's transient goroutines.
-		if limit := baseG + checkWorkers + 1 + 2 + 16; maxG > limit {
+		// cache writer's transient goroutines (8, as in the capacity
+		// simulation: deferred minor B-47).
+		if limit := baseG + checkWorkers + 1 + 2 + 8; maxG > limit {
 			t.Fatalf("goroutines peaked at %d, limit %d", maxG, limit)
 		}
 	})
@@ -589,7 +591,8 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 
 // Phase A carry-forward: the burst after a forward or backward clock
 // step (every suite due at once) stays within the pool's bounds and
-// every suite is still checked.
+// every suite is still checked. The steps: +30 d, -30 d, and spec §7's
+// -2 h and +2 h (deferred minor B-49 added the +2 h step).
 func TestSimScheduler_PacingAfterClockSteps(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		c := simtest.OpenCache(t)
@@ -629,5 +632,6 @@ func TestSimScheduler_PacingAfterClockSteps(t *testing.T) {
 		phase("forward +30d", 30*24*time.Hour)
 		phase("back to 0 (-30d step)", 0)
 		phase("backward -2h", -2*time.Hour)
+		phase("forward +2h (back to 0)", 0)
 	})
 }

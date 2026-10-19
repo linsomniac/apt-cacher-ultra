@@ -288,30 +288,29 @@ func (q *schedQueues) done(item schedItem) {
 	q.prune()
 }
 
-// prune drops hosts with nothing queued and nothing in flight, keeping
-// the round-robin position on the same host where it survives.
+// prune drops hosts with nothing queued and nothing in flight. The turn
+// stays with the host whose turn it was, or, when that host is dropped,
+// passes to the first surviving host after it (deferred minor B-40).
 func (q *schedQueues) prune() {
 	if len(q.order) == 0 {
 		return
 	}
-	nextHost := q.order[q.next%len(q.order)]
+	nextIdx := q.next % len(q.order)
 	kept := q.order[:0]
-	for _, host := range q.order {
+	newNext := -1
+	for i, host := range q.order {
 		h := q.hosts[host]
 		if h.inFlight || !h.empty() {
+			if newNext < 0 && i >= nextIdx {
+				newNext = len(kept)
+			}
 			kept = append(kept, host)
 			continue
 		}
 		delete(q.hosts, host)
 	}
 	q.order = kept
-	q.next = 0
-	for i, host := range q.order {
-		if host == nextHost {
-			q.next = i
-			break
-		}
-	}
+	q.next = max(newNext, 0) // none after it: wrap to the first
 }
 
 // len is the number of suites queued or in flight.
@@ -500,7 +499,8 @@ type checkDone struct {
 // own recover handler panics (reportPanic formats and logs): a dispatched
 // item without its done would leave its host marked in flight and one
 // worker slot lost for good. The inner recover cannot log (logging is
-// what may have panicked), so the item just reports failed.
+// what may have panicked), so the item just reports failed and
+// acu_freshness_unlogged_panics_total counts it (deferred minor B-44).
 func (c *Checker) checkWorker(ctx context.Context, work <-chan schedItem, done chan<- checkDone) {
 	for {
 		select {
@@ -509,7 +509,11 @@ func (c *Checker) checkWorker(ctx context.Context, work <-chan schedItem, done c
 		case item := <-work:
 			rep := checkReport{result: "failed"}
 			func() {
-				defer func() { _ = recover() }()
+				defer func() {
+					if recover() != nil {
+						freshnessUnloggedPanics.Inc()
+					}
+				}()
 				rep = c.checkRecovered(ctx, item)
 			}()
 			done <- checkDone{item: item, report: rep}
@@ -554,26 +558,31 @@ func (c *Checker) tick(ctx context.Context, q *schedQueues) {
 		failing = failingAdoptionCount(suites)
 	}
 	adoptionFailingSuites.Set(float64(failing))
-	var due []cache.SuiteFreshness
+	var due []dueSuite
 	for _, s := range suites {
 		if c.suiteDue(s, nowT) {
-			due = append(due, s)
+			due = append(due, dueSuite{key: suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath), s: s})
 		}
 	}
 	// Spec C4: FIFO by queue time. Suites that become due on the same
-	// tick are queued in key order, so a suite's position is fixed.
-	sort.Slice(due, func(i, j int) bool {
-		return suiteKey(due[i].CanonicalScheme, due[i].CanonicalHost, due[i].SuitePath) <
-			suiteKey(due[j].CanonicalScheme, due[j].CanonicalHost, due[j].SuitePath)
-	})
+	// tick are queued in key order, so a suite's position is fixed. Keys
+	// are built once per suite, not per comparison (deferred minor B-41).
+	sort.Slice(due, func(i, j int) bool { return due[i].key < due[j].key })
 	if c.maxSuites > 0 {
 		// Spec C4: at most freshness.max_suites suites queued, waiting or
 		// in flight; the rest are queued by a later tick.
 		due = boundDue(due, q, c.maxSuites, nowT.Unix())
 	}
-	for _, s := range due {
-		q.enqueue(s, c.pendingChange(s))
+	for _, d := range due {
+		q.enqueue(d.s, c.pendingChange(d.s))
 	}
+}
+
+// dueSuite is a suite a tick found due, with its queue key built once
+// (deferred minor B-41).
+type dueSuite struct {
+	key string
+	s   cache.SuiteFreshness
 }
 
 // boundDue applies spec C4's queue bound — at most maxSuites suites
@@ -588,11 +597,11 @@ func (c *Checker) tick(ctx context.Context, q *schedQueues) {
 // failing suite re-enters after every backoff); the bound binds only above
 // the cap (a lowered max_suites, an upgraded table). The sort runs only
 // when the list is cut.
-func boundDue(due []cache.SuiteFreshness, q *schedQueues, maxSuites int, now int64) []cache.SuiteFreshness {
-	fresh := make([]cache.SuiteFreshness, 0, len(due))
-	for _, s := range due {
-		if !q.has(suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)) {
-			fresh = append(fresh, s)
+func boundDue(due []dueSuite, q *schedQueues, maxSuites int, now int64) []dueSuite {
+	fresh := make([]dueSuite, 0, len(due))
+	for _, d := range due {
+		if !q.has(d.key) {
+			fresh = append(fresh, d)
 		}
 	}
 	room := maxSuites - q.len()
@@ -602,22 +611,22 @@ func boundDue(due []cache.SuiteFreshness, q *schedQueues, maxSuites int, now int
 	if room <= 0 {
 		return nil
 	}
-	lastCheck := func(s cache.SuiteFreshness) int64 {
-		if s.LastCheckAt == nil || *s.LastCheckAt > now+int64(clockStepTolerance/time.Second) {
+	lastCheck := func(d dueSuite) int64 {
+		if d.s.LastCheckAt == nil || *d.s.LastCheckAt > now+int64(clockStepTolerance/time.Second) {
 			return math.MinInt64
 		}
-		return *s.LastCheckAt
+		return *d.s.LastCheckAt
 	}
 	byCheck := slices.Clone(fresh)
-	slices.SortStableFunc(byCheck, func(a, b cache.SuiteFreshness) int { return cmp.Compare(lastCheck(a), lastCheck(b)) })
+	slices.SortStableFunc(byCheck, func(a, b dueSuite) int { return cmp.Compare(lastCheck(a), lastCheck(b)) })
 	admit := make(map[string]bool, room)
-	for _, s := range byCheck[:room] {
-		admit[suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)] = true
+	for _, d := range byCheck[:room] {
+		admit[d.key] = true
 	}
-	out := make([]cache.SuiteFreshness, 0, room)
-	for _, s := range fresh {
-		if admit[suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)] {
-			out = append(out, s)
+	out := make([]dueSuite, 0, room)
+	for _, d := range fresh {
+		if admit[d.key] {
+			out = append(out, d)
 		}
 	}
 	return out

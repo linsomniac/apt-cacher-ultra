@@ -22,7 +22,7 @@ import (
 func openCache(t *testing.T) *Cache {
 	t.Helper()
 	dir := t.TempDir()
-	c, err := Open(context.Background(), dir, nil)
+	c, err := Open(context.Background(), dir, discardSlog()) // deferred minor A-18: no log noise
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

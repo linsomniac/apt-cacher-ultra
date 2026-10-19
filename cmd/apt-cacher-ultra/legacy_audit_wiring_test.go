@@ -150,3 +150,48 @@ func TestServeListeners_LegacyAuditRunsBeforeGCAndServing(t *testing.T) {
 		t.Fatalf("suite still has a current snapshot after startup: %+v (%v)", sf, err)
 	}
 }
+
+// Deferred minor A-48: a failed legacy trust audit refuses the start with
+// one "legacy trust audit:" prefix, not two. (Moved from
+// flip_wiring_test.go: deferred minor C-34.)
+func TestServeListeners_LegacyAuditErrorHasOnePrefix(t *testing.T) {
+	preMetrics := metrics.Default.SnapshotNamesForTest()
+	t.Cleanup(func() { metrics.Default.UnregisterAddedSinceForTest(preMetrics) })
+	ctx := context.Background()
+	cacheDir := t.TempDir()
+	c, err := cache.Open(ctx, cacheDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A queued inline snapshot whose anchor is not in the (empty) pool:
+	// the audit's pre-flight refuses the start.
+	h := strings.Repeat("ab", 32)
+	if err := c.PutBlob(ctx, h, 1); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x", InReleaseHash: &h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id, []cache.SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: h, DeclaredSHA256: h}}, nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EnqueueLegacyTrustAudit(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = serveListeners(ctx, minimalCfg(cacheDir, nil), silentBuildLogger(), ln, nil, nil, nil)
+	if err == nil {
+		t.Fatal("serveListeners started with the pool's anchors missing")
+	}
+	if n := strings.Count(err.Error(), "legacy trust audit:"); n != 1 {
+		t.Fatalf("the error carries the prefix %d times: %v", n, err)
+	}
+}

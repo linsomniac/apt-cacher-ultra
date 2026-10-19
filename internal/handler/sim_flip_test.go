@@ -47,7 +47,11 @@ func (s *flipStack) adoptDetached(suite string, gen int) {
 // serveDetached is serve for a detached suite: an anchor is Release and
 // then Release.gpg, fetched as apt does on the client's one connection,
 // and the anchor has arrived once both have. A Release.gpg from another
-// snapshot than the Release before it is counted in sigMismatch.
+// snapshot than the Release before it is counted in sigMismatch. The
+// ledger stamps the anchor's arrival after Release.gpg, while the gate's
+// quiet clock started at Release's completion: the window the ledger
+// checks is stricter, never laxer, than the plan's "the two instants
+// coincide" (deferred minor C-27).
 func (s *flipStack) serveDetached(anchorTransfer, indexTransfer time.Duration, sigMismatch *atomic.Int64) simtest.ServeFunc {
 	index := s.serve(anchorTransfer, indexTransfer)
 	return func(rq simtest.Request) (string, time.Duration) {
