@@ -67,14 +67,22 @@ func interested(lastRequested *int64, now time.Time) (ok, future bool) {
 // (T1) inside that window asks nothing. The scheduler's stale check (the
 // last check at least periodic_refresh old) and the due retry still run
 // the probe tree, so new content of a failing suite is attempted within
-// one refresh interval. A last_check_at in the future reads as infinitely
-// old (spec C4 clock-step rule: a gate that delays work never freezes on
-// it); with periodic refresh off (0) nothing is paced.
+// one refresh interval. The scheduler's slot-driven re-offer of a parked
+// suite is exempt (checkFirst's offered; review fix round 1, Task 6). A
+// last_check_at in the future reads as infinitely old (spec C4 clock-step
+// rule: a gate that delays work never freezes on it); with periodic
+// refresh off (0) nothing is paced.
 //
 // AIDEV-NOTE: the probe tree sends no validators (it must adopt an
 // unchanged upstream, spec C4), so without this pacing every client check
 // of a deferred suite downloaded its anchor in full — up to hundreds of
-// MiB a day per suite for a missing vendor key.
+// MiB a day per suite for a missing vendor key. Never pace the re-offer:
+// it runs seconds after the check that parked the suite (record still
+// active and not due), and a paced re-offer ends skipped, which drops the
+// suite from the waiting list (work-conserving admission, PE-4's "the
+// offered re-check that admits it"). Re-offers are bounded by slot
+// turnover, not by client traffic, so exempting them costs nothing PE-3
+// was ruled to stop.
 func (c *Checker) pacedFirst(cur *cache.SuiteFreshness, gate retryGate, now time.Time) bool {
 	if !gate.active || gate.due || cur.LastCheckAt == nil {
 		return false
@@ -187,7 +195,11 @@ func (t probeTree) signatureSeen() bool {
 // client-created InRelease or Release url_path row, is dormant: no request
 // and no write (the scheduler does not queue it either, see suiteDue). A
 // suite whose record is active and not due is paced (pacedFirst): no
-// request between the scheduler's refresh checks. Otherwise the probe tree
+// request between the scheduler's refresh checks, except the scheduler's
+// slot-driven re-offer of the parked suite (offered: the check's
+// bypassCooldown, which the scheduler sets for a waiting item and for a
+// pending-change item; the latter has no record, so it is never paced
+// anyway). Otherwise the probe tree
 // runs without validators and the form found is adopted — result
 // first_adoption, or first_adoption_queued with no slot — through the spec
 // C7 gate (content keys only: the probes carry no validators) and, for the
@@ -207,7 +219,7 @@ func (t probeTree) signatureSeen() bool {
 // freshness_check line of a tree result carries upstream_status 200, the
 // status of the anchor the form was found by; the absent probes before it
 // are not logged.
-func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) *adoptionRequest {
+func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64, offered bool) *adoptionRequest {
 	host, suitePath := suite.CanonicalHost, suite.SuitePath
 	ok, future := interested(cur.LastRequestedAt, now)
 	if future {
@@ -232,7 +244,7 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 
 	gate := c.retryGateFor(cur, now)
 	c.applyClamp(ctx, cur, gate, now)
-	if c.pacedFirst(cur, gate, now) {
+	if !offered && c.pacedFirst(cur, gate, now) {
 		c.logger.Debug("freshness: deferred never-adopted suite paced until its retry or the next refresh check",
 			"canonical_host", host, "suite_path", suitePath, "reason", gate.reason)
 		return nil

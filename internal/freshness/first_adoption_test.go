@@ -606,6 +606,50 @@ func TestCheckFirst_DeferredSuiteIgnoresClientChecksUntilItsRetry(t *testing.T) 
 	}
 }
 
+// Ruling PE-3's pacing exempts the scheduler's slot-driven re-offer (review
+// fix round 1, Task 6). A deferred never-adopted suite whose refresh check
+// found new content while no slot was free is parked; when a slot frees,
+// the scheduler re-offers it (a waiting item, cooldown bypassed) seconds
+// after that check, with its record still active and not due. Pacing that
+// re-offer ended it skipped and dropped the suite from the waiting list,
+// so admission stopped being work-conserving. The re-offer probes and
+// admits; a client check at the same moment is still paced.
+func TestCheckFirst_ReofferOfAParkedFirstAdoptionIsNotPaced(t *testing.T) {
+	r := newRetryRig(t, 0)
+	ctx := context.Background()
+	ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	r.check() // the attempt fails: a record
+	if r.row().AdoptionFailCount != 1 {
+		t.Fatalf("setup: record count %d, want 1", r.row().AdoptionFailCount)
+	}
+	if err := r.cache.SetAdoptionNextRetry(ctx, "http", rigHost, rigSuite, r.clock.now().Add(time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	probes := func() int { return len(r.up.etagsSent(rigAnchorURL)) }
+	r.clock.advance(15 * time.Minute) // the scheduler's refresh check
+	r.up.set(r.release("new", 0))
+	held := mustAcquire(t, r.checker.admission, rigHost, true)
+	if rep := r.checker.checkRecovered(ctx, schedItem{ref: ref}); rep.result != "first_adoption_queued" {
+		t.Fatalf("refresh check with no slot: %q, want first_adoption_queued", rep.result)
+	}
+	before := probes()
+	held.release()
+	r.clock.advance(30 * time.Second) // a slot frees
+	r.check()                         // a client check inside the window: still paced
+	if got := probes() - before; got != 0 || r.row().CurrentSnapshotID != nil {
+		t.Fatalf("a client check of the parked suite: %d probes, adopted %v; want it paced", got, r.row().CurrentSnapshotID != nil)
+	}
+	rep := r.checker.checkRecovered(ctx, schedItem{ref: ref, waiting: true}) // the re-offer
+	r.checker.WaitForAdoptions()
+	if rep.result != "first_adoption" || probes()-before != 1 || r.row().CurrentSnapshotID == nil {
+		t.Fatalf("the re-offer: result %q, %d probes, adopted %v; want first_adoption, one probe tree, adopted",
+			rep.result, probes()-before, r.row().CurrentSnapshotID != nil)
+	}
+}
+
 // Spec C3 revision 8 (ruling PE-5, design review I-2): a probe that finds
 // a signature — InRelease, or Release.gpg — for a suite without a signed
 // current snapshot marks the suite's base, stamped now, before anything is

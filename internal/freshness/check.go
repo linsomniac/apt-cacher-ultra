@@ -133,7 +133,7 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 	// Spec C4 Dispatch 3: with an adopter wired, a suite with no current
 	// snapshot runs the probe tree (or stays dormant).
 	if c.adopter != nil && cur.CurrentSnapshotID == nil {
-		out.req = c.checkFirst(ctx, fetchCtx, out, cur, suite, now, nowUnix)
+		out.req = c.checkFirst(ctx, fetchCtx, out, cur, suite, now, nowUnix, opts.bypassCooldown)
 		return
 	}
 	// Ruling PE-2: an adopted suite in the refusal state anchor_absent is
