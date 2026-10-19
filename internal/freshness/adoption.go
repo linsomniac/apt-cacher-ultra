@@ -2025,16 +2025,23 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 	// declared sha256 in its path, so it is immune to the publication
 	// race where the mutable path serves a newer-but-valid revision than
 	// our InRelease declared (the dominant intermittent failure on the
-	// Ubuntu archives). The probe is best-effort and side-effect-free:
-	// tryByHashFetch never logs adoption_member_skipped / increments the
-	// skip metric and never lets mismatched bytes reach pool/ (it uses
-	// FinalizeExpectingHash). On ANY by-hash failure we fall back to the
+	// Ubuntu archives). The probe is best-effort: tryByHashFetch never
+	// logs adoption_member_skipped / increments the skip metric and never
+	// lets mismatched bytes reach pool/ (verifyMember). On any by-hash
+	// failure of the upstream or its bytes we fall back to the
 	// authoritative plain-path fetch below, which keeps today's exact
-	// semantics (404/410 → skip; size/hash mismatch → typed-fatal).
-	// The probe uses the strongest declared hash, as apt does (spec §3).
+	// semantics (404/410 → skip; size/hash mismatch → typed-fatal). A local
+	// fault (ErrAdoptionDBFailed, from the rehash-on-reuse hook of a
+	// SHA512-only member) is not "by-hash unavailable": it fails the
+	// member at once, so it costs no second download and a corrupt file
+	// the hook could not evict is logged and counted once (review fix
+	// round 2, Task 2). The probe uses the strongest declared hash, as apt
+	// does (spec §3).
 	if acquireByHash && m.Path != "" {
 		if hash, ferr := a.tryByHashFetch(ctx, suite, m, byHashProbePath(m)); ferr == nil {
 			return hash, nil
+		} else if errors.Is(ferr, ErrAdoptionDBFailed) {
+			return "", ferr
 		} else {
 			a.logger.Debug("adoption_byhash_fallback",
 				"canonical_host", suite.CanonicalHost,
@@ -2048,15 +2055,20 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 }
 
 // tryByHashFetch attempts to fetch a member from its content-addressed
-// by-hash URL (byHashRelPath). It is a SIDE-EFFECT-FREE probe: unlike
-// fetchMemberURL it emits no adoption_member_skipped WARN, increments no
-// skip metric, and — by verifying every declared hash before the bytes
-// reach pool/ (verifyMember) — never promotes bytes whose hash differs
-// from the declaration into pool/ (a by-hash URL that serves wrong bytes
-// is rejected with the temp removed, leaving no orphan). On success the
-// verified blob is PutBlob'd and its SHA-256 returned. Any error means
-// "by-hash unavailable or wrong"; the caller falls back to the
-// authoritative plain-path fetch.
+// by-hash URL (byHashRelPath). It is a probe: unlike fetchMemberURL it
+// emits no adoption_member_skipped WARN, increments no skip metric, and —
+// by verifying every declared hash before the bytes reach pool/
+// (verifyMember) — never promotes bytes whose hash differs from the
+// declaration into pool/ (a by-hash URL that serves wrong bytes is
+// rejected with the temp removed, leaving no orphan). On success the
+// verified blob is PutBlob'd and its SHA-256 returned.
+//
+// It is not free of side effects: for a SHA512-only member verifyMember
+// runs the rehash-on-reuse hook (rehashPooledBlob), which may WARN
+// pool_corruption_during_adoption, count it and evict a corrupt pool file.
+// A local fault there is returned as ErrAdoptionDBFailed, and the caller
+// fails the member with it; any other error means "by-hash unavailable or
+// wrong", and the caller falls back to the authoritative plain-path fetch.
 func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseMember, byHashRelPath string) (string, error) {
 	target := &fetch.Target{
 		CanonicalHost: suite.CanonicalHost,

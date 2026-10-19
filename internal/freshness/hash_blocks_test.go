@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -484,6 +485,66 @@ func TestAdopter_SHA512OnlyPoolRehashFailureIsALocalFault(t *testing.T) {
 	}
 	if sf, gerr := env.cache.GetSuiteFreshness(context.Background(), "http", "archive.ubuntu.com", env.suite.SuitePath); gerr != nil || sf.CurrentSnapshotID != nil {
 		t.Fatalf("suite = %+v (%v), want no snapshot adopted", sf, gerr)
+	}
+}
+
+// The by-hash probe's local fault is not "by-hash unavailable" (review fix
+// round 2, Task 2): when the rehash-on-reuse hook cannot read or evict a
+// SHA512-only member's pool file inside the probe, the member fails as
+// ErrAdoptionDBFailed at once — no second download on the plain path, and
+// a corrupt file it could not evict is logged and counted once, not again
+// by the plain path's hook.
+func TestAdopter_ByHashProbeLocalFaultIsNotRetriedOnThePlainPath(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		evict bool // a corrupt pool file whose eviction fails, else an unreadable pool path
+	}{{"unreadable pool path", false}, {"eviction fails", true}} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.evict && os.Geteuid() == 0 {
+				t.Skip("root ignores the read-only bucket directory")
+			}
+			env := newAdoptionTestEnv(t)
+			var logs lockedBuffer
+			env.adopter.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo_1.deb": testHex64})
+			byHash := noble + "main/binary-amd64/by-hash/SHA512/" + sha512Of(pkgs)
+			env.fetcher.put(byHash, pkgs)
+			env.fetcher.put(noble+"main/binary-amd64/Packages", pkgs)
+			p := env.cache.BlobPath(shaOf(pkgs))
+			if c.evict {
+				if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte("corrupt at rest"), 0o640); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(filepath.Dir(p), 0o550); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(filepath.Dir(p), 0o750) })
+			} else if err := os.MkdirAll(p, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			before := poolCorruptionTotal(t)
+			rel := hashRelease("Origin: x\nAcquire-By-Hash: yes\n", false, true, map[string][]byte{"main/binary-amd64/Packages": pkgs}, nil)
+			err := env.adopter.Run(context.Background(), env.suite, simtest.ClearsignedFixture(string(rel)), "", "")
+			if !errors.Is(err, ErrAdoptionDBFailed) {
+				t.Fatalf("Run = %v, want ErrAdoptionDBFailed", err)
+			}
+			if got := env.fetcher.requested(); len(got) != 1 || got[0] != byHash {
+				t.Errorf("fetched %q, want only the by-hash URL (no plain-path retry of a local fault)", got)
+			}
+			want := 0
+			if c.evict {
+				want = 1
+			}
+			if recs := logRecords(t, &logs, "pool_corruption_during_adoption"); len(recs) != want {
+				t.Errorf("%d pool_corruption_during_adoption records, want %d", len(recs), want)
+			}
+			if got := poolCorruptionTotal(t) - before; got != float64(want) {
+				t.Errorf("acu_pool_corruption_during_adoption_total grew by %v, want %d", got, want)
+			}
+		})
 	}
 }
 

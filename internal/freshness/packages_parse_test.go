@@ -366,6 +366,39 @@ func TestParsePackages_ReportsFilenameWithoutSHA256(t *testing.T) {
 	}
 }
 
+// MaxPackageStanzas bounds everything parsePackages keeps — rows and
+// no_sha256 Filenames together (review fix round 2, Task 2) — so a hostile
+// allowlisted upstream cannot grow memory past it with stanzas that lack
+// a SHA256. Exactly the cap parses; one more fails, whichever kind it is.
+func TestParsePackages_CapCountsStanzasWithoutSHA256(t *testing.T) {
+	good := "Package: good\nArchitecture: amd64\nVersion: 1\nFilename: pool/good.deb\nSHA256: " + sha(1) + "\n\n"
+	gaps := func(n int) string { return strings.Repeat("Filename: p\n\n", n) }
+	for _, c := range []struct {
+		name    string
+		body    string
+		refs    int
+		gaps    int
+		refused bool
+	}{
+		{"a row and gaps up to the cap", good + gaps(MaxPackageStanzas-1), 1, MaxPackageStanzas - 1, false},
+		{"one gap past the cap", good + gaps(MaxPackageStanzas), 0, 0, true},
+		{"one row past the cap", gaps(MaxPackageStanzas) + good, 0, 0, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			refs, noSHA256, err := parsePackages([]byte(c.body))
+			if c.refused {
+				if err == nil || !strings.Contains(err.Error(), "exceeds "+strconvI(MaxPackageStanzas)+" stanzas") {
+					t.Fatalf("err = %v, want the stanza cap", err)
+				}
+				return
+			}
+			if err != nil || len(refs) != c.refs || len(noSHA256) != c.gaps {
+				t.Fatalf("%d rows, %d no_sha256, err %v; want %d and %d", len(refs), len(noSHA256), err, c.refs, c.gaps)
+			}
+		})
+	}
+}
+
 // strconvI is a tiny helper to keep strconv off the test dependency
 // list — only the parser test needs int formatting and strings is
 // already imported.

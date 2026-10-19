@@ -25,7 +25,9 @@ type PackageRef struct {
 	Version      string // Debian Version: string; "" when missing (malformed binary stanza)
 }
 
-// MaxPackageStanzas caps how many entries ParsePackages will return.
+// MaxPackageStanzas caps how many entries parsePackages keeps: the rows
+// it returns and the no_sha256 Filenames it reports, together (review fix
+// round 2, Task 2: a stanza without a SHA256 costs memory too).
 // Ubuntu noble main amd64 Packages is roughly 50k stanzas; 1M leaves
 // room for fan-out of multiple suites in a single Release while still
 // bounding the memory cost of a hostile (allowlisted) upstream feeding
@@ -87,6 +89,9 @@ func parsePackages(text []byte) ([]PackageRef, []string, error) {
 		// silently.
 		if filename == "" || sha256 == "" {
 			if filename != "" {
+				if len(out)+len(noSHA256) >= MaxPackageStanzas {
+					return fmt.Errorf("exceeds %d stanzas", MaxPackageStanzas)
+				}
 				noSHA256 = append(noSHA256, filename)
 			}
 			filename = ""
@@ -104,7 +109,7 @@ func parsePackages(text []byte) ([]PackageRef, []string, error) {
 		if err := validateMemberPath(filename); err != nil {
 			return fmt.Errorf("invalid filename %q: %w", filename, err)
 		}
-		if len(out) >= MaxPackageStanzas {
+		if len(out)+len(noSHA256) >= MaxPackageStanzas {
 			return fmt.Errorf("exceeds %d stanzas", MaxPackageStanzas)
 		}
 		var s int64
