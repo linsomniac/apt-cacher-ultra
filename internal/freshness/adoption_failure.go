@@ -69,6 +69,11 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 		Hash: req.key, Reason: reason, Count: count, FirstAt: first, LastAt: now.Unix(),
 		NextRetryAt: next, ETag: nonEmpty(req.etag), LastMod: nonEmpty(req.lastmod),
 	}
+	if req.crossForm {
+		// Another anchor file's validators: never sent on the current
+		// form's GET (design review I-1, retryGate.validators).
+		f.ETag, f.LastMod = nil, nil
+	}
 	if err := c.cache.RecordAdoptionFailure(ctx, s.CanonicalScheme, s.CanonicalHost, s.SuitePath, f); err != nil {
 		c.logger.Warn("adoption_failure_record_failed",
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath, "err", err)

@@ -40,15 +40,30 @@ func rigETag(body []byte) string { return "e-" + hashOf(body)[:12] }
 
 // rigUpstream answers the checker's conditional GETs by URL: 200 with the
 // body and its ETag, or 304 when If-None-Match equals that ETag (unless
-// validators are ignored). A URL without a body answers 404. While
-// stalled, every request blocks until its context ends.
+// validators are ignored). A URL given a Last-Modified stamp
+// (setLastModified) answers like a CDN that sends no ETag: 200 with the
+// stamp, or 304 when If-Modified-Since is at or after it. A URL without a
+// body answers 404. While stalled, every request blocks until its context
+// ends.
 type rigUpstream struct {
 	mu               sync.Mutex
 	bodies           map[string][]byte
 	ignoreValidators bool
 	stall            bool
 	fail             map[string]error    // per URL: the error Conditional returns (setFail)
+	modified         map[string]string   // per URL: Last-Modified, sortable (setLastModified)
 	sent             map[string][]string // If-None-Match per URL, in order
+}
+
+// setLastModified makes url answer with Last-Modified stamp and no ETag
+// (stamps compare as strings: use one sortable format).
+func (u *rigUpstream) setLastModified(url, stamp string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.modified == nil {
+		u.modified = map[string]string{}
+	}
+	u.modified[url] = stamp
 }
 
 func (u *rigUpstream) set(body []byte) { u.setAt(rigAnchorURL, body) }
@@ -80,11 +95,11 @@ func (u *rigUpstream) etagsSent(url string) []string {
 	return append([]string(nil), u.sent[url]...)
 }
 
-func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, etag, _ string, _ int64) (*fetch.ConditionalResult, error) {
+func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, etag, lastmod string, _ int64) (*fetch.ConditionalResult, error) {
 	u.mu.Lock()
 	u.sent[target.URL] = append(u.sent[target.URL], etag)
 	body, ok := u.bodies[target.URL]
-	stall, ignore, failErr := u.stall, u.ignoreValidators, u.fail[target.URL]
+	stall, ignore, failErr, stamp := u.stall, u.ignoreValidators, u.fail[target.URL], u.modified[target.URL]
 	u.mu.Unlock()
 	if stall {
 		<-ctx.Done()
@@ -95,6 +110,12 @@ func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, eta
 	}
 	if !ok {
 		return nil, &fetch.StatusError{Code: 404}
+	}
+	if stamp != "" {
+		if !ignore && lastmod != "" && lastmod >= stamp {
+			return &fetch.ConditionalResult{Status: 304, LastModified: stamp}, nil
+		}
+		return &fetch.ConditionalResult{Status: 200, Body: body, LastModified: stamp}, nil
 	}
 	tag := rigETag(body)
 	if !ignore && etag != "" && etag == tag {

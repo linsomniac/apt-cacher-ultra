@@ -334,6 +334,13 @@ type adoptionRequest struct {
 	// key is the spec C7 content key of the bytes this request carries;
 	// a failure is recorded under it.
 	key string
+
+	// crossForm marks a request whose form is not the suite's current
+	// form (a lateral move, an unsigned suite's upgrade, the probe tree of
+	// an absent anchor): its validators belong to another anchor file than
+	// the one the check conditional-GETs, so a failure record keeps none
+	// (design review I-1). A successful adoption still stores them.
+	crossForm bool
 }
 
 // repairRequest is what checkLocked emits when the suite is CONFIRMED
@@ -347,6 +354,10 @@ type adoptionRequest struct {
 type repairRequest struct {
 	suite      SuiteRef
 	snapshotID int64
+	// signed: the current snapshot is signed, so the repair may take the
+	// slot the reserved-slot rule keeps for signed suites (spec C4;
+	// overview "E:" carry-forward).
+	signed bool
 }
 
 // checkOutcome is what one check produces. lease is the admission slot
@@ -625,6 +636,13 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 // spawning": the cheap "anything to do?" checks run first, so healthy
 // suites (the steady state) never compete with adoptions for slots. The
 // slot is still taken without waiting and before spawning.
+// AIDEV-NOTE: the reserved-slot rule follows the suite (rp.signed: its
+// current snapshot is signed), so a signed suite's repair may take the
+// last free slot and hold it for up to adoption.max_duration if a member
+// stalls (deferred minor B-32, weighed in phase E: kept — spec C4 reserves
+// the slot for suites with a signed current snapshot, not for adoptions,
+// and the per-host slot keeps one such repair per host). A deferred
+// repair is counted (acu_repair_deferred_total, B-31).
 func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 	rp := out.repair
 	if c.adopter == nil || !c.adopter.repairSkippedMembers {
@@ -638,17 +656,18 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 		// silent non-heal.
 		c.logger.Warn("adoption_reconcile_failed",
 			"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
-			"snapshot_id", rp.snapshotID, "err", err)
+			"snapshot_id", rp.snapshotID, "stage", "decision", "err", err)
 	}
 	out.needReconcile = needReconcile
 	if !out.needRepair && !out.needReconcile {
 		out.repair = nil
 		return
 	}
-	l, ok := c.admission.tryAcquire(rp.suite.CanonicalHost, true)
+	l, ok := c.admission.tryAcquire(rp.suite.CanonicalHost, rp.signed)
 	if !ok {
 		c.logger.Debug("freshness: repair deferred, no adoption slot",
 			"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath)
+		repairDeferredTotal.Inc(rp.suite.CanonicalHost)
 		out.repair = nil
 		return
 	}
@@ -679,6 +698,12 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 //
 // AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, lease
 // release, recover (first). See recoverGoroutine.
+// AIDEV-NOTE: a repair or reconcile that panics deterministically is
+// logged (freshness_check_panicked, where=repair), not recorded: the spec
+// C7 record is keyed on upstream content, and an unchanged suite's heal
+// has none, so the next unchanged check runs it again — one ERROR line
+// per cooldown at most (deferred minor B-37, phase B deviation 7; kept in
+// phase E: v7 has no record keyed on a snapshot).
 func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
 	rp, l, needRepair, needReconcile := out.repair, out.lease, out.needRepair, out.needReconcile
 	c.adoptionWg.Add(1)
@@ -699,7 +724,7 @@ func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
 			if _, err := c.adopter.ReconcileSnapshot(rctx, rp.suite, rp.snapshotID, false); err != nil {
 				c.logger.Warn("adoption_reconcile_failed",
 					"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
-					"snapshot_id", rp.snapshotID, "err", err)
+					"snapshot_id", rp.snapshotID, "stage", "heal", "err", err)
 			}
 		}
 	}()
@@ -1021,14 +1046,31 @@ func (c *Checker) retryGateFor(cur *cache.SuiteFreshness, now time.Time) retryGa
 	return g
 }
 
-// validators returns what the conditional GET sends: the current
-// anchor's validators with no record, the failing content's before
-// next_retry_at, none at or after it.
+// recordValidators reports whether the conditional GET sends the failure
+// record's validators: a record is active, not due, and holds validators —
+// the failing content's, from a request of the current form (a cross-form
+// request records none).
+func (g retryGate) recordValidators() bool {
+	return g.active && !g.due && (g.etag != "" || g.lastmod != "")
+}
+
+// validators returns what the conditional GET sends: none at or after the
+// record's next_retry_at; the failing content's before it when the record
+// holds validators; otherwise — no record, or a record without validators —
+// the current anchor's own.
+//
+// AIDEV-NOTE: design review I-1. A record's validators are those of the
+// anchor file its request fetched; sent on another file's GET they can
+// answer 304 for content never seen (a detached suite's Release behind a
+// CDN that sends Last-Modified only, after its lateral InRelease failed),
+// which froze the suite. Cross-form requests therefore record none, and a
+// 304 is changed_deferred only when the record's own were sent
+// (steadyResult).
 func (g retryGate) validators(cur *cache.SuiteFreshness) (etag, lastmod string) {
 	switch {
 	case g.active && g.due:
 		return "", ""
-	case g.active:
+	case g.recordValidators():
 		return g.etag, g.lastmod
 	}
 	if cur.InReleaseETag != nil {
@@ -1121,7 +1163,14 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 		mu.Unlock()
 		return false
 	}
-	l, ok := c.admission.tryAcquire(host, true)
+	// The reserved-slot rule (spec C4): only a signed current snapshot may
+	// take the last free slot; a snapshot that cannot be read counts as
+	// unsigned.
+	signed := false
+	if snap, err := c.cache.GetSuiteSnapshot(ctx, snapID); err == nil {
+		signed = snap.Form != cache.FormUnsigned
+	}
+	l, ok := c.admission.tryAcquire(host, signed)
 	if !ok {
 		mu.Unlock()
 		return false // POST /reconcile answers 409 (spec C4)
@@ -1139,7 +1188,7 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 		if _, err := c.adopter.ReconcileSnapshot(rctx, suite, snapID, true); err != nil {
 			c.logger.Warn("adoption_reconcile_failed",
 				"canonical_host", host, "suite_path", suitePath,
-				"snapshot_id", snapID, "err", err)
+				"snapshot_id", snapID, "stage", "on_demand", "err", err)
 		}
 	}()
 	return true

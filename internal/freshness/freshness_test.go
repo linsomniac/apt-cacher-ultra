@@ -786,12 +786,15 @@ func TestStaleSuiteCounts(t *testing.T) {
 		mk(i(3002), i(7)), // 2 s ahead: the tolerance edge -> fresh
 		mk(i(3003), i(7)), // 3 s ahead -> infinitely old: count adopted
 	}
-	adopted, unadopted := staleSuiteCounts(suites, staleBefore, now)
+	adopted, unadopted, refused := staleSuiteCounts(suites, staleBefore, now)
 	if adopted != 4 {
 		t.Errorf("adopted stale = %d, want 4", adopted)
 	}
 	if unadopted != 1 {
 		t.Errorf("unadopted stale = %d, want 1", unadopted)
+	}
+	if refused != 0 {
+		t.Errorf("refused stale = %d, want 0 (no suite has a record)", refused)
 	}
 }
 
@@ -1411,8 +1414,8 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 			w.WriteHeader(200)
 			_, _ = w.Write(sigBody)
 		case "/dists/noble/InRelease":
-			// Detached path must NOT hit InRelease for a known-detached
-			// suite — the form is dispatched up front.
+			// Spec C4 Dispatch 1: a known-detached suite probes InRelease
+			// on every check (a lateral move to inline); absent here.
 			gotInReleaseFetch.Store(true)
 			w.WriteHeader(http.StatusNotFound)
 		default:
@@ -1495,8 +1498,8 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
 	c.WaitForAdoptions()
 
-	if gotInReleaseFetch.Load() {
-		t.Error("known-detached suite unexpectedly fetched InRelease")
+	if !gotInReleaseFetch.Load() {
+		t.Error("known-detached suite did not probe InRelease")
 	}
 	if releaseHits.Load() != 1 {
 		t.Errorf("Release hits = %d, want 1", releaseHits.Load())
@@ -2121,7 +2124,7 @@ func TestCheck_UnchangedTick_LogsReconcileFailure(t *testing.T) {
 		}
 		found = true
 		errText, _ := rec["err"].(string)
-		if rec["level"] != "WARN" || rec["canonical_host"] != "127.0.0.1" ||
+		if rec["level"] != "WARN" || rec["stage"] != "decision" || rec["canonical_host"] != "127.0.0.1" ||
 			rec["suite_path"] != "/ubuntu/dists/noble" || rec["snapshot_id"] != float64(snapID) ||
 			!strings.Contains(errText, "not a valid clearsigned message") {
 			t.Errorf("adoption_reconcile_failed record = %v; want WARN with host, suite path, snapshot_id %d and the decode error", rec, snapID)

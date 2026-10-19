@@ -28,12 +28,14 @@ const staleSuiteFactor = 4
 
 // staleSuiteCounts partitions suites whose last_success_at has aged past
 // staleBefore into adopted (current_snapshot_id set — the dangerous case
-// that serves stale metadata) and unadopted. A nil last_success_at is
-// treated as "never succeeded" rather than "went stale" and is not
-// counted, so brand-new suites don't trip the gauge. A last_success_at
-// more than clockStepTolerance past now (backward clock step) counts as
-// stale (spec C4). SPEC §7.4.
-func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore, now int64) (adopted, unadopted int) {
+// that serves stale metadata) and unadopted, and counts the adopted ones
+// in a refusal state (refused, a subset of adopted: an anchor_absent suite
+// keeps its old last_success_at on purpose, spec C4). A nil
+// last_success_at is treated as "never succeeded" rather than "went
+// stale" and is not counted, so brand-new suites don't trip the gauge. A
+// last_success_at more than clockStepTolerance past now (backward clock
+// step) counts as stale (spec C4). SPEC §7.4.
+func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore, now int64) (adopted, unadopted, refused int) {
 	futureAfter := now + int64(clockStepTolerance/time.Second)
 	for _, s := range suites {
 		if s.LastSuccessAt == nil {
@@ -44,13 +46,17 @@ func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore, now int64) (ad
 		if *s.LastSuccessAt >= staleBefore && *s.LastSuccessAt <= futureAfter {
 			continue
 		}
-		if s.CurrentSnapshotID != nil {
-			adopted++
-		} else {
+		switch {
+		case s.CurrentSnapshotID == nil:
 			unadopted++
+		case s.AdoptionFailCount > 0 && s.AdoptionFailReason != nil && cache.IsRefusalReason(*s.AdoptionFailReason):
+			adopted++
+			refused++
+		default:
+			adopted++
 		}
 	}
-	return adopted, unadopted
+	return adopted, unadopted, refused
 }
 
 // failingAdoptionCount counts suites whose adoption failure record is a
@@ -334,6 +340,16 @@ func (q *schedQueues) has(key string) bool {
 func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 	nowU := now.Unix()
 	future := nowU + int64(clockStepTolerance/time.Second)
+	// Ruling PE-2: an adopted suite in the refusal state anchor_absent is
+	// due only at its record's retry time (pacedAbsent), whatever its
+	// last_success_at. A next_retry_at beyond the legitimate horizon (a
+	// backward clock step) is not paced here: once the suite is due (its
+	// last_success_at is old), the check clamps it (retryGateFor).
+	if c.adopter != nil && s.CurrentSnapshotID != nil && s.AdoptionFailCount > 0 && s.AdoptionFailReason != nil &&
+		*s.AdoptionFailReason == cache.ReasonAnchorAbsent && s.AdoptionNextRetryAt != nil &&
+		*s.AdoptionNextRetryAt > nowU && *s.AdoptionNextRetryAt <= nowU+int64(retryHorizon/time.Second) {
+		return false
+	}
 	stale := s.LastSuccessAt == nil || *s.LastSuccessAt <= now.Add(-c.refresh).Unix()
 	if s.LastSuccessAt != nil && *s.LastSuccessAt > future {
 		c.clockStep("last_success_at", s.CanonicalScheme, s.CanonicalHost, s.SuitePath, *s.LastSuccessAt, now)
@@ -554,12 +570,20 @@ func (c *Checker) tick(ctx context.Context, q *schedQueues) {
 	// SPEC §7.4 observability: an adopted suite stale past
 	// staleSuiteFactor*refresh is the freeze signature.
 	staleBefore := nowT.Add(-staleSuiteFactor * c.refresh).Unix()
-	adoptedStale, unadoptedStale := staleSuiteCounts(suites, staleBefore, nowT.Unix())
+	adoptedStale, unadoptedStale, refusedStale := staleSuiteCounts(suites, staleBefore, nowT.Unix())
 	freshnessStaleSuites.Set(float64(adoptedStale), "true")
 	freshnessStaleSuites.Set(float64(unadoptedStale), "false")
-	if adoptedStale > 0 {
+	// Design review M-13: a suite in a refusal state (anchor_absent keeps
+	// its last_success_at old on purpose) is visible on its own — the
+	// status page, adoption_refused and, after a day,
+	// adoption_refused_persistently — so the WARN leaves it out; the gauge
+	// counts it. Without an adopter records are inert and count as stale.
+	if c.adopter == nil {
+		refusedStale = 0
+	}
+	if warnStale := adoptedStale - refusedStale; warnStale > 0 {
 		c.logger.Warn("freshness: adopted suites stale beyond threshold",
-			"adopted_stale", adoptedStale,
+			"adopted_stale", warnStale,
 			"stale_factor", staleSuiteFactor,
 			"refresh", c.refresh.String(),
 		)

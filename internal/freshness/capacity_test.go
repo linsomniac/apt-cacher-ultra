@@ -211,8 +211,13 @@ func TestCheck_RepairObeysTheGlobalSlot(t *testing.T) {
 		t.Fatal("repair A never reached its fetch")
 	}
 	// B's repair is deferred for want of a slot: read from its line and
-	// the slot count, not a timing window (deferred minor B-29).
+	// the slot count, not a timing window (deferred minor B-29), and
+	// counted (B-31).
+	deferredBefore := hostCounter(t, "acu_repair_deferred_total", hosts[1])
 	chk.Check(ctx, "http", hosts[1], suitePath)
+	if got := hostCounter(t, "acu_repair_deferred_total", hosts[1]) - deferredBefore; got != 1 {
+		t.Fatalf("acu_repair_deferred_total{host=b.example} rose by %v, want 1", got)
+	}
 	deferred := false
 	for _, line := range strings.Split(logs.String(), "\n") {
 		if strings.Contains(line, `"msg":"freshness: repair deferred, no adoption slot"`) &&

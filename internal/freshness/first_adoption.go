@@ -297,6 +297,29 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 	return req
 }
 
+// unsignedRefusal applies spec C5's refusals to an unsigned request before
+// a slot is taken — the first adoption's (unsignedFirst) and an unsigned
+// suite's update (checkUnsigned, anchorFoundAgain): never-downgrade
+// (Adopter.unsignedEligible's signed history: unsigned_downgrade_refused)
+// and the member cap (unsignedTooLarge: unsigned_too_large; design review
+// M-5). It records the refusal and returns its reason, "" to go on, or an
+// error — the knob off, a read error — for which the caller fails the
+// check.
+func (c *Checker) unsignedRefusal(ctx context.Context, req *adoptionRequest) (string, error) {
+	switch err := c.adopter.unsignedEligible(ctx, req.suite); {
+	case errors.Is(err, ErrAdoptionUnsignedDowngradeRefused):
+		c.recordAdoptionFailure(req, cache.ReasonUnsignedDowngradeRefused)
+		return cache.ReasonUnsignedDowngradeRefused, nil
+	case err != nil:
+		return "", err
+	}
+	if err := unsignedTooLarge(req.releaseBytes); err != nil {
+		c.recordAdoptionFailure(req, cache.ReasonUnsignedTooLarge)
+		return cache.ReasonUnsignedTooLarge, nil
+	}
+	return "", nil
+}
+
 // unsignedFirst applies spec C5's safeguards to an unsigned candidate of
 // a never-adopted suite, before a slot is taken: the knob (off: an error,
 // the check fails), never-downgrade (signed history, see
@@ -320,16 +343,8 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 // clock-step rule, which would read it as infinitely old and skip the
 // confirmation.
 func (c *Checker) unsignedFirst(ctx context.Context, cur *cache.SuiteFreshness, req *adoptionRequest, t probeTree, gate retryGate, now time.Time) (proceed bool, reason string, err error) {
-	switch err := c.adopter.unsignedEligible(ctx, req.suite); {
-	case errors.Is(err, ErrAdoptionUnsignedDowngradeRefused):
-		c.recordAdoptionFailure(req, cache.ReasonUnsignedDowngradeRefused)
-		return false, cache.ReasonUnsignedDowngradeRefused, nil
-	case err != nil:
-		return false, "", err
-	}
-	if err := unsignedTooLarge(req.releaseBytes); err != nil {
-		c.recordAdoptionFailure(req, cache.ReasonUnsignedTooLarge)
-		return false, cache.ReasonUnsignedTooLarge, nil
+	if refusal, err := c.unsignedRefusal(ctx, req); err != nil || refusal != "" {
+		return false, refusal, err
 	}
 	sameContent := gate.active && gate.hash == req.key
 	if sameContent && gate.reason != cache.ReasonUnsignedUnconfirmed && gate.reason != cache.ReasonUnsignedDowngradeRefused {

@@ -129,15 +129,28 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 		out.req = c.checkFirst(ctx, fetchCtx, out, cur, suite, now, nowUnix)
 		return
 	}
+	// Ruling PE-2: an adopted suite in the refusal state anchor_absent is
+	// paced by its record: no request before the record's retry time.
+	if c.adopter != nil {
+		if gate := c.retryGateFor(cur, now); pacedAbsent(gate) {
+			c.applyClamp(ctx, cur, gate, now)
+			c.logger.Debug("freshness: anchor_absent suite paced until its retry",
+				"canonical_host", host, "suite_path", suitePath)
+			return
+		}
+	}
 
 	// Form preference: if there's a current snapshot, the form is its
 	// anchor_form (snap.Form). Otherwise (no adopter: the Phase 1
 	// observation) default to inline; the inline path triggers a detached
 	// fallback on 404.
 	form := c.detectForm(ctx, cur)
-	if form == adoptionFormDetached {
+	switch form {
+	case adoptionFormUnsigned:
+		out.req, out.repair = c.checkUnsigned(ctx, fetchCtx, out, cur, suite, now, nowUnix)
+	case adoptionFormDetached:
 		out.req, out.repair = c.checkDetached(ctx, fetchCtx, out, cur, suite, now, nowUnix)
-	} else {
+	default:
 		req, repair, fellBack := c.checkInline(ctx, fetchCtx, out, cur, suite, now, nowUnix)
 		if fellBack {
 			req, repair = c.checkDetached(ctx, fetchCtx, out, cur, suite, now, nowUnix)
@@ -150,23 +163,18 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 }
 
 // detectForm reads the suite's current snapshot (if any) and returns
-// its anchor_form (snap.Form): detached, or inline for anything else
-// until phase E dispatches the unsigned forms. First-ever suites
-// (cur.CurrentSnapshotID == nil) and snapshots that fail to load
-// default to inline; the inline-path fallback handles the boot-strap
-// case for detached-only upstreams.
-//
-// AIDEV-TODO(phase E): unsigned form dispatch.
+// its anchor_form (snap.Form): inline, detached or unsigned. First-ever
+// suites (cur.CurrentSnapshotID == nil; only without an adopter, see
+// checkFirst) and snapshots that fail to load default to inline; the
+// inline-path fallback handles the boot-strap case for detached-only
+// upstreams.
 func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) adoptionForm {
 	if cur.CurrentSnapshotID == nil {
 		return adoptionFormInline
 	}
 	snap, err := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
-	if err != nil || snap == nil {
-		return adoptionFormInline
-	}
-	if snap.Form == cache.FormDetached {
-		return adoptionFormDetached
+	if form, ok := formOfSnapshot(snap); err == nil && ok {
+		return form
 	}
 	return adoptionFormInline
 }
@@ -218,7 +226,11 @@ func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache
 	out.report = checkReport{result: e.result, signedCurrent: e.signedCurrent}
 	c.logger.Info("freshness_check", logAttrs...)
 	freshnessCheckTotal.Inc(e.result, host)
-	return repairIfUnchanged(e.result, suite, cur)
+	rp := repairIfUnchanged(e.result, suite, cur)
+	if rp != nil {
+		rp.signed = e.signedCurrent
+	}
+	return rp
 }
 
 // failCheck is the bookkeeping of a check that ended unknown (spec C4): a
@@ -232,10 +244,13 @@ func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache
 //
 // AIDEV-NOTE: ctx is the caller's context, never fetchCtx: the deadline
 // that ended the check must not fail the write that records it.
-// AIDEV-NOTE: in phase B every Conditional error extends the streak,
-// including 401/403/404/410, which spec C4 classifies as absent, not
-// unknown. Phase E's probe classification must reset the streak on
-// absent, or anchor_absent suites inherit the hourly backoff.
+// AIDEV-NOTE: with an adopter wired, classify sends 401/403/404/410 and a
+// 200 failing its sniff to absent before this point (ruling R-E4: an
+// absent anchor resets the streak, so an anchor_absent suite never
+// inherits the hourly backoff); only unknown ends and checks that find
+// nothing they may adopt (no anchor at all; an unsigned candidate while
+// adoption.adopt_unsigned is off) fail here. Without an adopter (Phase 1)
+// every Conditional error still extends the streak, as before phase E.
 func (c *Checker) failCheck(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, nowUnix int64, form string, err error) {
 	host, suitePath := suite.CanonicalHost, suite.SuitePath
 	cur.LastCheckAt = &nowUnix
@@ -262,17 +277,18 @@ func (c *Checker) failCheck(ctx context.Context, out *checkOutcome, cur *cache.S
 // fetch.Conditional: a contract violation, a failed check (ruling R-E3).
 var errUnexpectedStatus = errors.New("unexpected success status")
 
-// steadyResult handles, for both signed forms (ruling R-E3: one 304/
-// unchanged helper), the responses that say upstream still serves what
-// the suite has: a 304 — which, while a failure record's validators were
-// sent, says upstream still serves the failing content (spec C7
-// changed_deferred) — and a 200 carrying the current anchor's bytes
+// steadyResult handles, for every form (ruling R-E3: one 304/unchanged
+// helper), the responses that say upstream still serves what the suite
+// has: a 304 — which, when the failure record's own validators were sent
+// (retryGate.recordValidators), says upstream still serves the failing
+// content (spec C7 changed_deferred), and otherwise that it still serves
+// the current anchor — and a 200 carrying the current anchor's bytes
 // (newHash == cachedHash), whose validators are taken (the only response
 // they are ever taken from, spec C4) and which clears a failure record
 // (spec C7). ok is false for any other response.
 func steadyResult(cur *cache.SuiteFreshness, res *fetch.ConditionalResult, newHash, cachedHash string, gate retryGate, nowUnix int64) (result string, clearRecord, ok bool) {
 	switch {
-	case res.Status == 304 && gate.active:
+	case res.Status == 304 && gate.recordValidators():
 		setChangeSeen(cur, nowUnix)
 		return "changed_deferred", false, true
 	case res.Status == 304:
@@ -467,6 +483,11 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, 
 	defer release()
 
 	res, err := c.fetcher.Conditional(fetchCtx, target, etag, lastmod, c.maxBody)
+	if c.adopter != nil && cur.CurrentSnapshotID != nil {
+		if o := classify(res, err, sniffInRelease, etag != "" || lastmod != ""); o.class == classAbsent {
+			return c.anchorAbsent(ctx, fetchCtx, out, cur, suite, now, nowUnix, adoptionFormInline, o, gate, signedCurrent), nil, false
+		}
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			// A cancelled caller (shutdown) is not evidence about upstream;
@@ -640,7 +661,22 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 	}
 	defer releaseSlot()
 
+	lateralHeld := false
+	if c.adopter != nil && cur.CurrentSnapshotID != nil {
+		urls := c.anchorURLsFor(suite, map[string]string{"Release": releaseURL.UpstreamURL})
+		req, done, held := c.lateralInline(ctx, fetchCtx, out, cur, suite, urls, gate, signedCurrent, nowUnix)
+		if done {
+			return req, nil
+		}
+		lateralHeld = held
+	}
+
 	res, err := c.fetcher.Conditional(fetchCtx, target, etag, lastmod, c.maxBody)
+	if c.adopter != nil && cur.CurrentSnapshotID != nil {
+		if o := classify(res, err, sniffRelease, etag != "" || lastmod != ""); o.class == classAbsent {
+			return c.anchorAbsent(ctx, fetchCtx, out, cur, suite, now, nowUnix, adoptionFormDetached, o, gate, signedCurrent), nil
+		}
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			// A cancelled caller (shutdown) is not evidence about upstream;
@@ -667,8 +703,9 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 	if result, clear, ok := steadyResult(cur, res, newHash, cachedHash, gate, nowUnix); ok {
 		// A 304 while a failure record exists: Release still matches the
 		// failing content's validators, and a re-signature behind it waits
-		// for the retry (spec C7).
-		e.result, e.clearRecord = result, clear
+		// for the retry (spec C7). A record the lateral InRelease still
+		// holds is not cleared by the detached anchor's "unchanged".
+		e.result, e.clearRecord = result, clear && !lateralHeld
 	} else {
 		setChangeSeen(cur, nowUnix)
 		// The content key covers the signature, so Release.gpg is fetched
@@ -679,7 +716,23 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 			URL:           releaseGPGURL.UpstreamURL,
 		}
 		gpgRes, gerr := c.fetcher.Conditional(fetchCtx, gpgTarget, "", "", defaultMaxReleaseGPGBytes)
+		var sig probeOutcome
+		if c.adopter != nil && cur.CurrentSnapshotID != nil {
+			sig = classify(gpgRes, gerr, sniffReleaseGPG, false)
+		}
 		switch {
+		case sig.class == classAbsent:
+			// Design review M-14: the changed Release has no signature —
+			// absent (ruling R-E4), never adopted. The refusal state
+			// anchor_absent makes it visible and paces the suite
+			// (pacedAbsent); a record the lateral InRelease still holds
+			// keeps its own schedule. last_success_at stays, as for an
+			// absent current anchor (spec C4).
+			if !lateralHeld {
+				c.recordAdoptionFailure(&adoptionRequest{suite: suite, key: anchorAbsentKey}, cache.ReasonAnchorAbsent)
+			}
+			cur.LastSuccessAt = prevSuccess
+			e.result, e.reason, e.status = "anchor_absent", cache.ReasonAnchorAbsent, sig.status
 		case gerr != nil || gpgRes.Status != 200:
 			// As before: record the change and retry on a later check;
 			// last_success_at stays bumped because Release answered.

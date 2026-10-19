@@ -32,7 +32,8 @@ import (
 // trust audit), both unlabelled counters; acu_adoption_failing_suites
 // (spec C7, unlabelled gauge); acu_freshness_waiting_for_slot (spec C4,
 // unlabelled gauge); acu_freshness_unlogged_panics_total (deferred minor
-// B-44, unlabelled counter). The flip barrier's acu_flip_hold_skipped_total,
+// B-44, unlabelled counter); acu_repair_deferred_total (deferred minor
+// B-31, counter by host). The flip barrier's acu_flip_hold_skipped_total,
 // acu_flip_hold_expired_total, acu_flip_quiet_cut_short_total,
 // acu_flip_waiters_over_cap_total, acu_flip_slow_anchor_reads_total and
 // acu_flip_gate_panics_total (spec C8, unlabelled counters) and
@@ -56,6 +57,17 @@ var (
 	freshnessAnchorReconstructedTotal = metrics.NewCounterWithCap(
 		"acu_freshness_anchor_reconstructed_total",
 		"Metadata anchor url_path rows reconstructed during freshness recovery, by host (SPEC2 §7.4).",
+		metrics.DefaultMaxSeries,
+		"host",
+	)
+
+	// repairDeferredTotal counts repairs and reconciles of an unchanged
+	// suite that found no free admission slot and wait for its next
+	// unchanged check (deferred minor B-31: the DEBUG line alone was
+	// invisible).
+	repairDeferredTotal = metrics.NewCounterWithCap(
+		"acu_repair_deferred_total",
+		"Repairs and reconciles deferred because no adoption slot was free, by host (spec C4).",
 		metrics.DefaultMaxSeries,
 		"host",
 	)
