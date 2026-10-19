@@ -20,6 +20,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // silentLogger discards all log output so test failures do not get drowned
@@ -877,7 +878,7 @@ func newTestHandlerWithFreshness(t *testing.T, fc FreshnessChecker) *Handler {
 // first follow-up freshness check can issue a real conditional GET
 // (instead of an unconditional one because validators are nil).
 func TestServeHTTP_MissOnInReleaseSeedsFreshness(t *testing.T) {
-	body := []byte("Origin: Ubuntu\nSuite: noble\n")
+	body := simtest.ClearsignedFixture("Origin: Ubuntu\nSuite: noble\n")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("ETag", `"v1"`)
 		w.Header().Set("Last-Modified", "Mon, 01 Jan 2024 00:00:00 GMT")
@@ -938,7 +939,7 @@ func TestServeHTTP_MissOnPackagesDoesNotSeedFreshness(t *testing.T) {
 // hit on an InRelease (metadata under a suite) fires the SPEC §7.1 T1
 // trigger with the right (scheme, host, suite_path).
 func TestServeHTTP_FreshnessTriggeredOnMetadataHit(t *testing.T) {
-	body := []byte("Origin: Ubuntu\nSuite: noble\n")
+	body := simtest.ClearsignedFixture("Origin: Ubuntu\nSuite: noble\n")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 		_, _ = w.Write(body)
@@ -1012,7 +1013,7 @@ func TestServeHTTP_FreshnessNotTriggeredOnBlobHit(t *testing.T) {
 // does not fire the T1 trigger — the spec says "cached metadata file
 // is requested", which presupposes the file is already cached.
 func TestServeHTTP_FreshnessNotTriggeredOnMiss(t *testing.T) {
-	body := []byte("InRelease bytes")
+	body := simtest.ClearsignedFixture("InRelease bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 		_, _ = w.Write(body)
@@ -1040,7 +1041,7 @@ func TestServeHTTP_FreshnessNotTriggeredOnMiss(t *testing.T) {
 // goroutine is still using the cache — leading to a write to a closed
 // DB at process shutdown.
 func TestHandler_Close_DrainsFreshnessGoroutine(t *testing.T) {
-	body := []byte("InRelease body")
+	body := simtest.ClearsignedFixture("InRelease body")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(body)
 	}))
@@ -1222,7 +1223,7 @@ func TestServeHTTP_UpstreamUnavailable_MetadataRetryAfter30(t *testing.T) {
 // served so the caller can compare them against tryServeStale's output.
 func stalePrime(t *testing.T, h *Handler, srvURL, path string) []byte {
 	t.Helper()
-	body := []byte("staled-bytes-" + path)
+	body := staleBody(path)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, proxyReq("GET", srvURL, path)) // server already started by caller
 	if rec.Code != http.StatusOK {
@@ -1235,13 +1236,22 @@ func stalePrime(t *testing.T, h *Handler, srvURL, path string) []byte {
 	return body
 }
 
+// staleBody is the canonical body the stale tests' upstream serves for
+// path: an InRelease is clearsigned (spec §7 "Fixtures").
+func staleBody(path string) []byte {
+	if strings.HasSuffix(path, "/InRelease") {
+		return simtest.ClearsignedFixture("staled-bytes-" + path)
+	}
+	return []byte("staled-bytes-" + path)
+}
+
 // staleUpstream returns a server whose body for any GET is the same
 // canonical bytes stalePrime expects. Used to seed cached entries with
 // known-good blobs.
 func staleUpstream(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body := []byte("staled-bytes-" + r.URL.Path)
+		body := staleBody(r.URL.Path)
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 		_, _ = w.Write(body)
 	}))
@@ -1514,7 +1524,7 @@ func TestServeHTTP_OrphanRowUpstreamDownReturns502(t *testing.T) {
 		// First request: 200 with body so the cache primes. Subsequent
 		// requests: 503 to drive the miss-path through respondError.
 		if hits.Add(1) == 1 {
-			body := []byte("staled-bytes-" + r.URL.Path)
+			body := staleBody(r.URL.Path)
 			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 			_, _ = w.Write(body)
 			return

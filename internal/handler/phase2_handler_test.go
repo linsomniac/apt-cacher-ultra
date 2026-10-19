@@ -18,6 +18,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // TestSuiteRelativePath_TrimsPrefix verifies the helper that converts
@@ -50,7 +51,7 @@ func TestServeHTTP_SnapshotHit_ServesFromSnapshotMember(t *testing.T) {
 
 	// Seed a blob containing fake InRelease bytes, register a snapshot
 	// at that blob, and make it the current snapshot for the suite.
-	body := []byte("InRelease snapshot bytes")
+	body := simtest.ClearsignedFixture("InRelease snapshot bytes")
 	bodyHash := writeBlob(t, h, body)
 	const (
 		scheme = "http"
@@ -95,7 +96,7 @@ func TestServeHTTP_SnapshotMissReturns404(t *testing.T) {
 	suite := "/dists/noble"
 
 	// Adopt a snapshot containing only "InRelease".
-	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("real InRelease"))
 	commitInlineSnapshot(t, h, scheme, host, suite, releaseBlob, []cache.SnapshotMember{
 		{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
 	}, nil)
@@ -149,7 +150,7 @@ func TestServeHTTP_SnapshotMissIndexTargetRaisesAlert(t *testing.T) {
 	scheme, host, port := splitURL(t, srv.URL)
 	suite := "/dists/noble"
 
-	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("real InRelease"))
 	commitInlineSnapshot(t, h, scheme, host, suite, releaseBlob, []cache.SnapshotMember{
 		{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
 	}, nil)
@@ -182,7 +183,7 @@ func TestServeHTTP_SnapshotMissIndexTargetRaisesAlert(t *testing.T) {
 // suite_freshness row but current_snapshot_id = NULL still uses the
 // Phase 1 url_path lookup. This is the v1→v2 backward-compatible path.
 func TestServeHTTP_PreSnapshotSuiteUsesURLPath(t *testing.T) {
-	body := []byte("Phase 1 InRelease bytes")
+	body := simtest.ClearsignedFixture("Phase 1 InRelease bytes") // creates the row (spec C3 sniff)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(body)
 	}))
@@ -283,7 +284,7 @@ func TestServeHTTP_DebHitMatchingPackageHashServes(t *testing.T) {
 
 	// Adopt a snapshot whose package_hash row declares bodyHash for
 	// this .deb path. DeclaredHashesForPath will match url_path.
-	releaseBlob := writeBlob(t, h, []byte("InRelease for noble"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for noble"))
 	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
@@ -348,7 +349,7 @@ func TestServeHTTP_DebHitMismatchingPackageHashEvictsAndRefetchFailsClosed(t *te
 
 	// Seed a snapshot whose package_hash declares a DIFFERENT hash for
 	// the same .deb path. The mismatch fires the §6.1 step-5 eviction.
-	releaseBlob := writeBlob(t, h, []byte("InRelease for noble"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for noble"))
 	wrongHash := strings.Repeat("d", 64) // never matches actual content
 	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
 		[]cache.SnapshotMember{
@@ -402,7 +403,7 @@ func TestServeHTTP_DebMissValidatesAgainstPackageHash(t *testing.T) {
 	// Seed a covering snapshot with the wrong declared hash, BEFORE any
 	// fetch. The first request goes straight to the miss path and must
 	// fail validation.
-	releaseBlob := writeBlob(t, h, []byte("InRelease for noble"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for noble"))
 	wrongHash := strings.Repeat("e", 64)
 	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/noble", releaseBlob,
 		[]cache.SnapshotMember{
@@ -448,8 +449,8 @@ func TestServeHTTP_DebMissConflictingPackageHashFailsClosed(t *testing.T) {
 	debPath := "/pool/main/h/hello/hello.deb"
 	canonHost := hostKey(host, port)
 
-	rA := writeBlob(t, h, []byte("InRelease A"))
-	rB := writeBlob(t, h, []byte("InRelease B"))
+	rA := writeBlob(t, h, simtest.ClearsignedFixture("InRelease A"))
+	rB := writeBlob(t, h, simtest.ClearsignedFixture("InRelease B"))
 	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/A", rA,
 		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: rA, DeclaredSHA256: rA}},
 		[]cache.PackageHash{{CanonicalScheme: scheme, CanonicalHost: canonHost,
@@ -516,7 +517,7 @@ func TestServeHTTP_DebMissHashCollisionPreservesUnrelatedBlob(t *testing.T) {
 	if declaredHash == collidingHash {
 		t.Fatalf("test hash collision: declared %q matches collidingHash", declaredHash)
 	}
-	releaseBlob := writeBlob(t, h, []byte("InRelease for noble"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for noble"))
 	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/noble", releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
@@ -615,7 +616,7 @@ func TestServeHTTP_DebMissAdoptionFlipMidFetchUsesPostFetchContract(t *testing.T
 						flipFailed.Store(true)
 					}
 				}()
-				newReleaseBlob := writeBlob(t, hCapture, []byte("InRelease v2"))
+				newReleaseBlob := writeBlob(t, hCapture, simtest.ClearsignedFixture("InRelease v2"))
 				_ = commitInlineSnapshot(t, hCapture, schemeC, canonHostC, suite, newReleaseBlob,
 					[]cache.SnapshotMember{
 						{Path: "InRelease", BlobHash: newReleaseBlob, DeclaredSHA256: newReleaseBlob},
@@ -640,7 +641,7 @@ func TestServeHTTP_DebMissAdoptionFlipMidFetchUsesPostFetchContract(t *testing.T
 	// Pre-fetch state: snapshot S1 declares bodyHash for debPath.
 	// If pre-fetch validation were authoritative, the request would
 	// succeed (bytes hash to bodyHash, declaration is bodyHash).
-	releaseBlob := writeBlob(t, h, []byte("InRelease v1"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("InRelease v1"))
 	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
@@ -709,7 +710,7 @@ func TestServeHTTP_AdoptedSuiteSnapshotMemberDBError_FailsClosed(t *testing.T) {
 	canonHost := hostKey(host, port)
 
 	// Adopt a snapshot, then close the cache so subsequent reads error.
-	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("real InRelease"))
 	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/noble", releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
@@ -746,7 +747,7 @@ func TestServeHTTP_AdoptedSuiteSnapshotMemberDBError_FailsClosed(t *testing.T) {
 // validates the match, persists the file back into pool/, and serves
 // it with X-Cache: MISS + X-Cache-Snapshot.
 func TestServeHTTP_AdoptedSuiteMissingBlob_RefetchMatchServes(t *testing.T) {
-	body := []byte("real InRelease")
+	body := simtest.ClearsignedFixture("real InRelease")
 	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
@@ -805,7 +806,7 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_RefetchMismatchFailsClosed(t *testing
 	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
-		_, _ = w.Write([]byte("attacker-supplied bytes"))
+		_, _ = w.Write(simtest.ClearsignedFixture("attacker-supplied bytes"))
 	}))
 	defer srv.Close()
 
@@ -816,7 +817,7 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_RefetchMismatchFailsClosed(t *testing
 
 	// declared_sha256 is the hash of "real InRelease"; upstream returns
 	// different bytes.
-	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("real InRelease"))
 	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
@@ -860,7 +861,7 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_RefetchUpstream404FailsClosed(t *test
 	scheme, host, port := splitURL(t, srv.URL)
 	canonHost := hostKey(host, port)
 	suite := "/dists/noble"
-	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("real InRelease"))
 	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
@@ -898,7 +899,7 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_StaleNotServed(t *testing.T) {
 	scheme, host, port := splitURL(t, srv.URL)
 	canonHost := hostKey(host, port)
 	suite := "/dists/noble"
-	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("real InRelease"))
 	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
@@ -907,7 +908,8 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_StaleNotServed(t *testing.T) {
 	// Seed a stale url_path row for the same path. respondError's
 	// upstream-unreachable path would otherwise serve this; the
 	// recovery responder must not.
-	stale := writeBlob(t, h, []byte("stale Phase 1 InRelease"))
+	staleBody := simtest.ClearsignedFixture("stale Phase 1 InRelease")
+	stale := writeBlob(t, h, staleBody)
 	now := nowUnixForTest()
 	if err := h.cache.PutURLPath(context.Background(), cache.URLPath{
 		CanonicalScheme: scheme, CanonicalHost: canonHost,
@@ -928,7 +930,7 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_StaleNotServed(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Errorf("status=%d, want 502 (must not stale-serve url_path during recovery)", rec.Code)
 	}
-	if rec.Body.String() == "stale Phase 1 InRelease" {
+	if rec.Body.String() == string(staleBody) {
 		t.Errorf("body returned stale Phase 1 bytes: %q", rec.Body.String())
 	}
 	if got := rec.Header().Get("X-Cache"); got == "HIT-STALE" {
@@ -944,7 +946,7 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_StaleNotServed(t *testing.T) {
 // FinalizeExpectingHash now gates on the declared hash before
 // rename-or-dedup, so the unrelated blob's pool file is preserved.
 func TestServeHTTP_AdoptedSuiteMissingBlob_MismatchPreservesUnrelatedBlob(t *testing.T) {
-	collidingContent := []byte("collision-bytes")
+	collidingContent := simtest.ClearsignedFixture("collision-bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(collidingContent)
 	}))
@@ -969,7 +971,7 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_MismatchPreservesUnrelatedBlob(t *tes
 	// from collidingBlob. Recovery will try to validate the upstream's
 	// collision bytes against this declared hash — they don't match,
 	// so the recovery 502s WITHOUT touching the colliding blob.
-	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("real InRelease"))
 	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
@@ -1047,8 +1049,8 @@ func TestServeHTTP_DebHitConflictingPackageHash502s(t *testing.T) {
 	// Two snapshots, two suites, each declaring a DIFFERENT hash for
 	// the same .deb path. Both are current → DeclaredHashesForPath
 	// returns 2 distinct hashes → conflict.
-	rA := writeBlob(t, h, []byte("InRelease A"))
-	rB := writeBlob(t, h, []byte("InRelease B"))
+	rA := writeBlob(t, h, simtest.ClearsignedFixture("InRelease A"))
+	rB := writeBlob(t, h, simtest.ClearsignedFixture("InRelease B"))
 	hashA := strings.Repeat("a", 64)
 	hashB := strings.Repeat("b", 64)
 	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/suiteA", rA,
@@ -1108,8 +1110,8 @@ func TestServeHTTP_DebHitAgreeingDuplicateHashesServes(t *testing.T) {
 
 	// Two suites, both declaring the SAME hash. distinctDeclared
 	// collapses to one entry — match path serves cleanly.
-	rA := writeBlob(t, h, []byte("InRelease X"))
-	rB := writeBlob(t, h, []byte("InRelease Y"))
+	rA := writeBlob(t, h, simtest.ClearsignedFixture("InRelease X"))
+	rB := writeBlob(t, h, simtest.ClearsignedFixture("InRelease Y"))
 	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/suiteX", rA,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: rA, DeclaredSHA256: rA},

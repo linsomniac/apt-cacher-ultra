@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // newTestLogger returns a logger that drops everything to /dev/null. The
@@ -115,7 +116,7 @@ func minimalCfg(cacheDir string, mirrors []config.MirrorRule) *config.Config {
 func TestServe_EndToEnd_MirrorFetchAndCache(t *testing.T) {
 	t.Parallel()
 
-	const wantBody = "Package: hello\nVersion: 1.0\n"
+	wantBody := string(simtest.ClearsignedFixture("Package: hello\nVersion: 1.0\n")) // an upstream InRelease
 	var upstreamHits atomic.Int32
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -214,7 +215,7 @@ func TestServe_GracefulShutdown_DrainsInflight(t *testing.T) {
 	entered := make(chan struct{})
 	released := make(chan struct{})
 	var once sync.Once
-	const wantBody = "slow body"
+	wantBody := string(simtest.ClearsignedFixture("slow body")) // an upstream InRelease
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		once.Do(func() { close(entered) })

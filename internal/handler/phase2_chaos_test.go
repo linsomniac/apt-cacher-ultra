@@ -21,6 +21,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // TestPhase2Chaos_AdoptionFlipUnderConcurrency is the SPEC2 §12.3 gate:
@@ -499,7 +500,7 @@ func makeChaos2Snapshot(label string) chaos2Snapshot {
 
 	return chaos2Snapshot{
 		label:      label,
-		inRelease:  rel,
+		inRelease:  simtest.ClearsignedFixture(string(rel)), // passes the spec C3 sniff
 		packagesGz: pkgsGz,
 		debBodies:  debs,
 	}
@@ -526,8 +527,9 @@ func chaos2BuildPackagesText(entries map[string]string) []byte {
 }
 
 // chaos2BuildRelease constructs Release-style text declaring each
-// member's SHA256 and size. The pass-through verifier returns input
-// verbatim, so this is also the bytes upstream serves at /InRelease.
+// member's SHA256 and size. Upstream serves it at /InRelease wrapped by
+// simtest.ClearsignedFixture; the pass-through verifier returns that
+// envelope verbatim and ParseRelease skips its armor lines.
 func chaos2BuildRelease(members map[string][]byte) []byte {
 	var sb strings.Builder
 	sb.WriteString("Origin: ChaosTest\n")

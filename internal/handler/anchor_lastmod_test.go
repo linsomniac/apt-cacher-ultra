@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
@@ -34,10 +35,11 @@ func lastModifiedGet(t *testing.T, h *Handler, path, ims string) (int, string) {
 
 func httpTime(unix int64) string { return time.Unix(unix, 0).UTC().Format(http.TimeFormat) }
 
-// commitAnchor adopts an inline snapshot of lmSuite whose InRelease is body.
+// commitAnchor adopts an inline snapshot of lmSuite whose InRelease is
+// body, clearsigned (spec §7 "Fixtures").
 func commitAnchor(t *testing.T, h *Handler, body string) int64 {
 	t.Helper()
-	hash := writeBlob(t, h, []byte(body))
+	hash := writeBlob(t, h, simtest.ClearsignedFixture(body))
 	return commitInlineSnapshot(t, h, "http", "127.0.0.1", lmSuite, hash,
 		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: hash, DeclaredSHA256: hash}}, nil)
 }
@@ -101,7 +103,7 @@ func TestServeHTTP_FirstAdoptionLastModifiedPassesTheServedAnchor(t *testing.T) 
 	defer restore()
 	h := newTestHandler(t, nil, nil)
 	ctx := context.Background()
-	served := writeBlob(t, h, []byte("anchor served before adoption"))
+	served := writeBlob(t, h, simtest.ClearsignedFixture("anchor served before adoption"))
 	fetched := wallclock.Unix() + 3600 // fetched an hour "later": the clock has since stepped back
 	mt := time.Unix(fetched, 0)
 	if err := os.Chtimes(h.cache.BlobPath(served), mt, mt); err != nil {
@@ -166,7 +168,7 @@ func TestServeHTTP_DetachedAnchorsCarryAdoptedAtIndexesDoNot(t *testing.T) {
 func TestServeHTTP_RecoveredAnchorCarriesAdoptedAt(t *testing.T) {
 	restore := wallclock.SetOffsetForTest(tenYears)
 	defer restore()
-	body := []byte("InRelease recovered from upstream")
+	body := simtest.ClearsignedFixture("InRelease recovered from upstream")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
 	defer srv.Close()
 	h := newTestHandler(t, nil, nil)
@@ -199,7 +201,7 @@ func TestServeHTTP_SnapshotAnchorLastModifiedIgnoresAFutureDatedPoolFile(t *test
 	for i, body := range []string{"anchor one", "anchor two", "anchor three"} {
 		id := commitAnchor(t, h, body)
 		mt := time.Unix(adoptedAt(t, h, id)+3600, 0) // written before a one-hour backward step
-		if err := os.Chtimes(h.cache.BlobPath(sha256Hex([]byte(body))), mt, mt); err != nil {
+		if err := os.Chtimes(h.cache.BlobPath(sha256Hex(simtest.ClearsignedFixture(body))), mt, mt); err != nil {
 			t.Fatal(err)
 		}
 		code, got := lastModifiedGet(t, h, lmSuite+"/InRelease", lm)
@@ -220,7 +222,7 @@ func TestServeHTTP_SnapshotAnchorLastModifiedIgnoresAFutureDatedPoolFile(t *test
 func TestServeHTTP_RecoveredAnchorLastModifiedStaysAdoptedAt(t *testing.T) {
 	restore := wallclock.SetOffsetForTest(-time.Hour)
 	defer restore()
-	body := []byte("InRelease recovered from upstream, an hour after the step")
+	body := simtest.ClearsignedFixture("InRelease recovered from upstream, an hour after the step")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
 	defer srv.Close()
 	h := newTestHandler(t, nil, nil)
@@ -239,7 +241,7 @@ func TestServeHTTP_RecoveredAnchorLastModifiedStaysAdoptedAt(t *testing.T) {
 		t.Fatalf("recovery: %d, X-Cache %q, Last-Modified %q; want 200 MISS with adopted_at %q",
 			rec.Code, rec.Header().Get("X-Cache"), lm1, httpTime(adoptedAt(t, h, id1)))
 	}
-	next := writeBlob(t, h, []byte("the next InRelease"))
+	next := writeBlob(t, h, simtest.ClearsignedFixture("the next InRelease"))
 	id2 := commitInlineSnapshot(t, h, scheme, hostKey(host, port), suite, next,
 		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: next, DeclaredSHA256: next}}, nil)
 	r := proxyReq("GET", srv.URL, suite+"/InRelease")

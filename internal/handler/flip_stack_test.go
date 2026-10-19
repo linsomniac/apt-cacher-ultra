@@ -128,10 +128,12 @@ func (s *flipStack) publish(suite string, gen int) (freshness.SuiteRef, []byte) 
 }
 
 // adopt publishes generation gen of suite upstream and adopts it (inline
-// form) through the barrier; it returns once the commit is done.
+// form) through the barrier; it returns once the commit is done. The
+// InRelease is clearsigned (spec §7 "Fixtures"); plainVerifier hands the
+// whole envelope to ParseRelease, which skips the armor lines.
 func (s *flipStack) adopt(suite string, gen int) {
 	ref, rel := s.publish(suite, gen)
-	if err := s.ad.Run(context.Background(), ref, rel, "", ""); err != nil {
+	if err := s.ad.Run(context.Background(), ref, simtest.ClearsignedFixture(string(rel)), "", ""); err != nil {
 		s.t.Errorf("adopt %s generation %d: %v", suite, gen, err)
 	}
 }

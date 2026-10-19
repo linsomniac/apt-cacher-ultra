@@ -15,6 +15,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 const dispSuite = "/ubuntu/dists/noble"
@@ -88,7 +89,7 @@ func newDisplacedHandler(t *testing.T, keep int, logs *syncLog) (*Handler, *coun
 // are its InRelease plus extra (path → blob content).
 func adoptWithMembers(t *testing.T, h *Handler, label string, extra map[string]string) int64 {
 	t.Helper()
-	inrel := writeBlob(t, h, []byte("InRelease "+label))
+	inrel := writeBlob(t, h, simtest.ClearsignedFixture("InRelease "+label))
 	members := []cache.SnapshotMember{{Path: "InRelease", BlobHash: inrel, DeclaredSHA256: inrel}}
 	for p, content := range extra {
 		b := writeBlob(t, h, []byte(content))

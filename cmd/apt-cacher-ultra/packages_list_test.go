@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // writePackagesConfig writes a minimal config TOML pointing at a fresh
@@ -117,7 +118,7 @@ func TestPackagesList_ShowsCachedDebs(t *testing.T) {
 		put("http", "archive.ubuntu.com", "/pool/main/n/nginx/nginx_1.18.0-1_amd64.deb", "nginx body")
 		put("http", "archive.ubuntu.com", "/pool/main/v/vim/vim_9.0_amd64.deb", "vim body")
 		// non-deb — should NOT appear
-		put("http", "archive.ubuntu.com", "/dists/noble/InRelease", "release body")
+		put("http", "archive.ubuntu.com", "/dists/noble/InRelease", string(simtest.ClearsignedFixture("release body")))
 	})
 
 	var stdout, stderr bytes.Buffer

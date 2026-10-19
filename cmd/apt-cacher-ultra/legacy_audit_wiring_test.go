@@ -47,7 +47,9 @@ func TestServeListeners_LegacyAuditRunsBeforeGCAndServing(t *testing.T) {
 	ctx := context.Background()
 	cacheDir := t.TempDir()
 	// A pre-upgrade-shaped state built with the cache API: one current
-	// inline snapshot whose stored InRelease is plain text, queued.
+	// inline snapshot whose stored InRelease is plain text, queued. Plain
+	// text on purpose (spec §7 "Fixtures", ruling PD-2): it models a
+	// legacy snapshot the audit must quarantine.
 	c, err := cache.Open(ctx, cacheDir, nil)
 	if err != nil {
 		t.Fatal(err)

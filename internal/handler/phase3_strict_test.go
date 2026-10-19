@@ -19,6 +19,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // strictLogBuf captures slog JSON records so strict-mode tests can
@@ -185,7 +186,7 @@ func newPhase3StrictHandler(t *testing.T,
 func adoptCoverageComplete(t *testing.T, h *Handler,
 	scheme, host, suite string, coverageComplete bool) int64 {
 	t.Helper()
-	releaseBlob := writeBlob(t, h, []byte("InRelease for "+suite))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for "+suite))
 
 	if err := h.cache.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{
 		CanonicalScheme: scheme,

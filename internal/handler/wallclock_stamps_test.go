@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
@@ -18,7 +19,7 @@ func TestHandler_StampsFollowTheWallClock(t *testing.T) {
 	restore := wallclock.SetOffsetForTest(48 * time.Hour)
 	defer restore()
 	ctx := context.Background()
-	h := newSeamHandler(t, &recFetcher{body: []byte("deb bytes")})
+	h := newSeamHandler(t, &recFetcher{body: []byte("deb bytes"), inRelease: simtest.ClearsignedFixture("Origin: wallclock\n")})
 	defer h.Close()
 	near := func(what string, got *int64) {
 		t.Helper()

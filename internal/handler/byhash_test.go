@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // SPEC2 §0 #4 by-hash content-addressed fallback. Pool/<hex> exists; no
@@ -138,7 +139,7 @@ func TestServeHTTP_ByHashContentAddressed_AdoptedSuiteUsesSnapshot(t *testing.T)
 	suite := "/dists/noble"
 
 	// Adopt a snapshot containing only InRelease.
-	releaseBlob := writeBlob(t, h, []byte("real InRelease"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("real InRelease"))
 	commitInlineSnapshot(t, h, scheme, canonHost, suite, releaseBlob, []cache.SnapshotMember{
 		{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
 	}, nil)

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -19,9 +20,10 @@ import (
 // recFetcher is an in-memory upstream that records the URLs it is asked
 // for and answers every request with body.
 type recFetcher struct {
-	body []byte
-	mu   sync.Mutex
-	urls []string
+	body      []byte
+	inRelease []byte // when set, served for an …/InRelease target instead of body
+	mu        sync.Mutex
+	urls      []string
 }
 
 func (*recFetcher) HostAllowed(string) bool { return true }
@@ -30,10 +32,14 @@ func (r *recFetcher) Fetch(_ context.Context, tg *fetch.Target, dst fetch.FetchD
 	r.mu.Lock()
 	r.urls = append(r.urls, tg.URL)
 	r.mu.Unlock()
-	if _, err := dst.Write(r.body); err != nil {
+	body := r.body
+	if r.inRelease != nil && strings.HasSuffix(tg.URL, "/InRelease") {
+		body = r.inRelease
+	}
+	if _, err := dst.Write(body); err != nil {
 		return nil, err
 	}
-	return &fetch.FetchResult{Status: 200, ContentLength: int64(len(r.body))}, nil
+	return &fetch.FetchResult{Status: 200, ContentLength: int64(len(body))}, nil
 }
 
 func (r *recFetcher) fetched() []string {

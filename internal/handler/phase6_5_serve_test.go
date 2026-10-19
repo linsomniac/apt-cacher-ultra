@@ -19,6 +19,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // newPhase6_5Handler builds a Handler instrumented with a logger
@@ -92,7 +93,7 @@ func TestServeHash_SourceDsc_MatchedBytes_ValidatedAndCached(t *testing.T) {
 	canonHost := hostKey(host, port)
 
 	const dscPath = "/pool/main/b/bash/bash_5.1-2.dsc"
-	releaseBlob := writeBlob(t, h, []byte("InRelease for noble"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for noble"))
 	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/noble", releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
@@ -154,7 +155,7 @@ func TestServeHash_SourceDsc_HashMismatch_502(t *testing.T) {
 	canonHost := hostKey(host, port)
 
 	const dscPath = "/pool/main/b/bash/bash_5.1-2.dsc"
-	releaseBlob := writeBlob(t, h, []byte("InRelease for noble"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for noble"))
 	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/noble", releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
@@ -229,7 +230,7 @@ func TestServeHash_PdiffPatch_MatchedBytes_ValidatedAndCached(t *testing.T) {
 	canonHost := hostKey(host, port)
 
 	const patchPath = "/dists/noble/main/binary-amd64/Packages.diff/2026-05-09-1234.56.gz"
-	releaseBlob := writeBlob(t, h, []byte("InRelease for noble"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for noble"))
 	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/noble", releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
@@ -277,7 +278,7 @@ func TestServeHash_PdiffPatch_HashMismatch_502(t *testing.T) {
 	canonHost := hostKey(host, port)
 
 	const patchPath = "/dists/noble/main/binary-amd64/Packages.diff/2026-05-09-1234.56.gz"
-	releaseBlob := writeBlob(t, h, []byte("InRelease for noble"))
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for noble"))
 	commitInlineSnapshot(t, h, scheme, canonHost, "/dists/noble", releaseBlob,
 		[]cache.SnapshotMember{
 			{Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
