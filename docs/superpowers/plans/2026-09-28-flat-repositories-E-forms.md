@@ -4,11 +4,17 @@
 
 **Goal:** Make every suite with recent client interest adopt on its first check in whichever anchor form its upstream publishes — clearsigned `InRelease`, detached `Release` + `Release.gpg`, or (safeguarded, never as a downgrade) unsigned `Release` — move between the signed forms when an anchor disappears, read SHA512-only Release files, and let strict mode wait briefly for an adoption in flight before refusing a `.deb`.
 
-**Architecture:** The freshness check becomes one dispatch over the suite's current anchor form with one shared tail. Every anchor response is classified once (`present`, `absent`, `unknown`); a suite without a current snapshot runs spec C4's probe tree when it has recent client interest and a client-created anchor row, and a dormant one costs no upstream request. The adopter gains the unsigned form (`adoptionFormUnsigned`, `RunUnsigned`): eligibility (the knob, the signed-seen marker, the prior form) before any download, a member cap, no `package_hash` rows, a re-run of the cached signed-anchor mark before the commit, and `CommitAdoption`'s in-transaction never-downgrade recheck, whose refusal is recorded as a state. `ParseRelease` merges hash blocks per member; one verifier checks every declared SHA-256/SHA-512 hash and yields the aliases for every declared algorithm. The checker tracks signed adoptions in flight per host; the handler waits for them (at most 15 s, 64 waiters per host) before refusing an unvouched `.deb`, and fires T1 after a miss that created its suite's row.
+**Architecture:** The freshness check becomes one dispatch over the suite's current anchor form with one shared tail. Every anchor response is classified once (`present`, `absent`, `unknown`); a suite without a current snapshot runs spec C4's probe tree when it has recent client interest and a client-created anchor row, and a dormant one costs no upstream request. The adopter gains the unsigned form (`adoptionFormUnsigned`, `RunUnsigned`): one never-downgrade rule (signed-seen markers of the base under either scheme, or any kept signed snapshot of the base or its `/.` twin) checked before a slot is taken, before any download and inside `CommitAdoption`'s transaction, a member cap, no `package_hash` rows, a re-run of the cached signed-anchor mark before the commit, and a refusal recorded as a state. A probe that finds a signature marks the suite's base, so a signature only the checker saw is signed history too. A failure or refusal record paces its suite: a deferred never-adopted suite is probed at its retry time or once per refresh interval, an adopted `anchor_absent` suite at its retry times only, and client checks in between ask nothing. `ParseRelease` merges hash blocks per member; one verifier checks every declared SHA-256/SHA-512 hash and yields the aliases for every declared algorithm. The checker tracks signed adoptions in flight per host; the handler waits for them (at most 15 s and never past 25 s into the request, 64 waiters per host) before refusing an unvouched `.deb`, and fires T1 after a miss that created its suite's row.
 
 **Tech Stack:** Go 1.25 (toolchain 1.26), modernc SQLite, `testing/synctest`, `github.com/ProtonMail/go-crypto` (clearsign decode only).
 
 **Spec:** `docs/superpowers/specs/2026-09-27-flat-repositories-design.md` (revision 7; Task 15 records this plan's rulings, design notes and deviations as revision 8) — C4's probe tree, classification, form transitions, `anchor_absent`, eager first adoption with the 7-day interest window and T1-on-seed; C5's unsigned form with every D6 safeguard, never-downgrade at both points (including the in-transaction recheck), the SHA512 merge, the shared verify helper and the aliases; C10's bounded in-flight wait (D10); §9's phase E row. Interactions read: C3 (markers, interest, rows), C7 (refusal states, the retry gate), C8 (barrier; retained by-hash serves SHA512 aliases since phase C), C9 (what phase F's reaper needs), C11 (keys, events, metrics), §6.1 (quarantined plain-text suites adopt unsigned through `Release`), §7 (E's tests), §11. Overview: `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md` — Global Constraints, Deliberate deviations, Review Focus items 1, 3 and 6, the "E:" line under "Later phases add" and every item of the "E:" carry-forwards block (from A, B, C and D). Deferred minors: `…-A-deferred.md`, `…-B-deferred.md`, `…-C-deferred.md`, `…-D-deferred.md` (IDs cited per task; Task 15's intro lists the ones taken and the ones checked and left, and Task 15 deletes the taken ones).
+
+**Plan reviews (2026-10-19)**, revised in this version under the controller's rulings PE-1–PE-8 (below):
+- An executability review applied the draft task by task. It reported defects D1–D10 and O1, killed 132 of 133 plan mutants, and ran 30 extra mutants; 14 proposed tests kill its surviving X-mutants.
+- A design review reported I-1–I-6, M-1–M-20, its verdicts and eight underspecified items.
+
+Each task says what the revision changed in it. Every task was re-verified in code: build, tests, each expected failure, each mutation step, and a literal replay of the task's blocks.
 
 ## Global Constraints
 
@@ -18,9 +24,9 @@ Everything in the overview's Global Constraints applies. In particular:
 - Production SQL never uses SQLite clock functions; persisted stamps come from `wallclock` (the cache's `nowUnix`, the checker's and adopter's `now`). Durations, deadlines, the C10 wait and in-memory timing use monotonic `time.Now`/`time.Since`.
 - `internal/cache` never imports `internal/freshness` or `internal/proxy`. The writer goroutine never runs foreign code or pool I/O: R-E1's sniffs read pool files on the adoption goroutine before its mark is submitted, as phase D's handler does (ruling PD-5).
 - Adoption-disabled (Phase 1) behaviour stays as today: with no adopter wired the check runs the phase D algorithm (conditional `InRelease`, detached fallback on 404 for a never-adopted suite, no sniff, no probe tree), now through the shared tail (R-E3); no T1 fires on a miss (`TestServeHTTP_AdoptionDisabledSeedParity` stays green).
-- Constants (spec C11), not knobs: interest window 7 d; anchor-absent and unsigned confirmation gap `max(cooldown, 5 min)`, 1 h after a 401/403 on a signature file; unsigned member cap 1,000; strict wait 15 s; strict waiters 64 per host; check deadline 2 min. Knob: `adoption.adopt_unsigned` (bool, default `true`).
+- Constants (spec C11), not knobs: interest window 7 d; anchor-absent and unsigned confirmation gap `max(cooldown, 5 min)`, 1 h after a 401/403 on a signature file; unsigned member cap 1,000; strict wait 15 s within a 25 s request budget, none below 1 s; strict waiters 64 per host; the miss path's body budget 25 s; check deadline 2 min. Knob: `adoption.adopt_unsigned` (bool, default `true`).
 - Trust is never inferred from "adopted": an unsigned snapshot never vouches a `.deb`, never counts for strict mode, never writes a signed-seen marker; no code path stores a plain-text body as an inline snapshot. Unsigned candidates set `Form: cache.FormUnsigned` explicitly (the cache never derives it).
-- Tests that call `wallclock.SetOffsetForTest` never use `t.Parallel()`. Simulations run inside `testing/synctest` bubbles, finish in under 5 s under `-race`, and silence loggers with `simtest.DiscardLogger()` (or capture them).
+- Tests that call `wallclock.SetOffsetForTest` never use `t.Parallel()`. Simulations run inside `testing/synctest` bubbles, finish in under 5 s under `-race` with about 0.5 s of margin (ruling PE-8; only the 500-suite simulation stays over it, C-38, phase H), and silence loggers with `simtest.DiscardLogger()` (or capture them).
 - Every goroutine started under `internal/freshness` recovers panics (`grep -n 'go func' internal/freshness/*.go`), and so does every goroutine this phase starts in `internal/handler`.
 - `go test -race ./...` and `golangci-lint run ./...` are clean; `gofmt -l .` lists only the five known drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`) at the end of every task. Never run `gofmt -w` on those five; edit them by hand.
 - Commit trailer: the implementer's own harness attribution line (phase A ruling); otherwise `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
@@ -29,85 +35,141 @@ Conventions in this plan:
 
 - Each task's **Interfaces** block lists what it uses from other tasks and existing test files. Never redefine a helper: a second definition in the same package does not compile.
 - Each commit step starts with `gofmt -l <files>`; it must print nothing. Run `gofmt -w` on the non-drift files a step edits before that check; never on the five drift files.
-- A "verify failure" step whose expected result is a compile failure is complete when the compiler names the undefined identifiers listed.
+- A "verify failure" step whose expected result is a compile failure is complete when the compiler names the undefined identifiers listed. `go vet` stops at a package's first type error, so such a step runs `go test -gcflags=-e …` (every error) or names only `go vet`'s first error per package (executability review D10).
 - Mutation checks are run one at a time, each reverted before the next; record each failing test line in the commit message.
-- **Existing tests that change.** Task 5 is a fixture-only commit (clearsigned `InRelease` bodies, client interest and client-created anchor rows for the freshness tests' never-adopted suites) that stays green on the phase D code; Tasks 6 and 7 then change only the expectations the new dispatch changes, each listed with its reason. Any other existing test that fails means the change is wrong.
+- **Existing tests that change.** Task 5 is a fixture-only commit that stays green on the phase D code. It gives the freshness tests' never-adopted suites clearsigned `InRelease` bodies, client interest and client-created anchor rows. For rulings PE-3 and M-14 it also makes three gate tests start from an adopted suite and gives detached fixtures armored signatures. Tasks 6, 7 and 13 then change only the expectations the new dispatch and the rulings change, each listed with its reason. Any other existing test that fails means the change is wrong.
 
 ## Rulings and design notes
 
 Controller rulings (binding):
 
-- **R-E1 — unsigned eligibility evidence** (D carry-forward). The signed-seen marker stays the single authority `CommitAdoption` re-reads inside its writer transaction. Before any unsigned commit the adopter re-runs the cached signed-anchor mark for the suite under the suite mutex it already holds: it reads the suite's `<suite>/InRelease` and `<suite>/Release.gpg` url_path rows and sniffs their pool files outside the writer, marks through phase D's machinery (`MarkSignedSeenBatch`), then commits; the mark is enqueued first, so FIFO makes it visible to the commit's re-read. A failed mark refuses the unsigned adoption (recorded as a refusal, retried at the next check), never commits it. One authority, D's machinery reused, no pool I/O on the writer, and D's backstop residual closed where it matters. Task 3 (`remarkSignedAnchors`).
+- **R-E1 — unsigned eligibility evidence** (D carry-forward). The signed-seen marker stays the single authority `CommitAdoption` re-reads inside its writer transaction. Before any unsigned commit the adopter re-runs the cached signed-anchor mark for the suite under the suite mutex it already holds: it reads the suite's `<suite>/InRelease` and `<suite>/Release.gpg` url_path rows, and those of its `/.` twin (design review I-3, ruling PE-5), and sniffs their pool files outside the writer, marks through phase D's machinery (`MarkSignedSeenBatch`), then commits; the mark is enqueued first, so FIFO makes it visible to the commit's re-read. A failed mark refuses the unsigned adoption (recorded as a refusal and logged, design review M-1; retried at the record's retry time, spec C7), never commits it. One authority, D's machinery reused, no pool I/O on the writer, and D's backstop residual closed where it matters. Task 3 (`remarkSignedAnchors`).
 - **R-E2 — refusals are states, not failures** (C carry-forwards). An in-commit refusal surfaces as its own sentinel (`ErrAdoptionUnsignedDowngradeRefused`) through `classifyAdoptionOutcome` (outcome `refused`), bypasses the `adoption: commit failed` WARN and the `db_failed` wrap, and gives `adoption_flip_barrier` an outcome that is not `commit_failed` (`refused`) — also after a barrier that outlived `adoption.max_duration`. Each E refusal sentinel has its own `classifyAdoptionReason` case and stays out of `refusalKeepsCurrent`; tests assert the log levels and the recorded reason. Task 3.
 - **R-E3 — one check tail.** The probe-tree rewrite folds the duplicated inline/detached tails into one shared tail (`finishCheck`) and one 304/unchanged helper (`steadyResult`), so record-clearing and the `freshness_check` line live in one place; the unexpected-status default arms log through the failed-check line (`failCheck`, today's `recordUnknownEnd`) and count as `failed`. Task 4.
 - **R-E4 — absent statuses reset the streak.** 401/403/404/410 (and a 200 failing its sniff) on an anchor probe classify as absent through `classify`, not through the failed-check path; an `anchor_absent` suite does not inherit the failure backoff (B carry-forward). Tasks 6, 7; design note 19 records where spec C4 itself makes a check that found no anchor a failed one.
+
+Plan-review rulings (binding, 2026-10-19; the reviews' findings they accept are applied in the tasks named):
+
+- **PE-1 — deviation 2 stays, and covers the `anchor_absent` gap** (M-19): a future `adoption_fail_first_at` confirms neither an unsigned transition nor an absence; re-recording restarts the streak. Tasks 6, 7.
+- **PE-2 — R-E4 and C4 Dispatch 3 keep their split, with visibility and pacing.**
+  - A never-adopted suite whose tree finds no anchor fails the check (the spec's rule; the streak backs off). It also records `anchor_absent` (`anchorAbsentKey`, moved to Task 6's `probe.go`), so the status page shows it.
+  - An adopted `anchor_absent` suite is paced by its record (`pacedAbsent`; `suiteDue` does not queue it). Its anchor is asked for again only at the retry time, and client checks inside the window ask nothing.
+  - Without this, an EOL release costs 400–1,800 requests a day, forever. The cost if wrong: a returning anchor is noticed at the retry time, at most an hour later.
+  - Tasks 6, 7.
+- **PE-3 — the scheduler paces deferred never-adopted suites** (I-4). While the record is active and not due and the last check is younger than `periodic_refresh`, no probe runs (`pacedFirst`), so client checks ask nothing.
+  - Without this, a full anchor download per client check costs up to hundreds of MiB a day per suite. The cost if wrong: new content of a failing suite is attempted within one refresh interval rather than at the next client hit.
+  - It replaces design note 15's "fetches its anchor in full on each check". Task 6; Task 5 moves three gate tests to adopted suites; Task 13 adapts two of its tests.
+- **PE-4 — the probe bound** (I-5, design note 26): keep the deterministic burst simulation and add a same-host racing one. The bound is "twice by the scheduler, plus one per client check while waiting (at most one per cooldown) and one per offer another admission takes first". Task 8; docs in Task 15.
+- **PE-5 — I-1, I-2, I-3, I-6 accepted:**
+  - I-1: cross-form requests record no validators, and the current anchor's own are sent while a record without validators is active (Task 7).
+  - I-2: a fourth marker writer. A probe that finds a sniff-passing signature for a suite without a signed current snapshot marks the base before admitting; a failed write fails the check (Tasks 6, 7).
+  - I-3: R-E1's re-mark also reads the `/.` twin's rows (Task 3).
+  - I-6: the production-shaped DoD fixture is rebuilt (Task 12).
+- **PE-6 — the accepted minors.**
+  - Code:
+    - M-1: the re-mark's failure is logged, WARN or ERROR, and fails closed (Task 3).
+    - M-2: the unsigned content key is domain-separated (Task 3).
+    - M-3: the interest window is symmetric (Task 6).
+    - M-5: the member cap is checked before a slot is taken (Tasks 6, 7).
+    - M-7 and M-8: never-downgrade reads both schemes' markers and any kept signed snapshot (Tasks 1, 3).
+    - M-10: strict wait = min(15 s, 25 s − the request's age), none below 1 s (Task 9).
+    - M-13: the stale WARN leaves out refusal states (Task 7).
+    - M-14: a detached suite's changed `Release` without a signature records `anchor_absent`, done in E (Task 7).
+    - M-15: the miss path's backstop deadline counts from the request's start, done in E (Task 10).
+    - M-16: an unsigned suite's own form found again with new bytes is its update (Task 7).
+    - M-19: the deviation texts.
+    - M-20: the `last_seen_at` carry-forward is "corrected" (Task 15).
+  - Documentation (Task 15): M-4, M-6, M-9, M-11, M-12, M-17.
+  - The underspecified items 1–8, including 5: a client that left during the strict wait gets no retry (Task 9).
+- **PE-7 — C-21 re-tagged (H); C-40 closed** (M-18): the task commits are history and the tests are the durable evidence, and copying mutant tables into docs would be maintenance noise, as for D-59. Task 15.
+- **PE-8 — the executability review's fixes.**
+  - D1–D10 text fixes, in the tasks they name.
+  - O1: `unvouched_deb_refused` is logged once per fetch (only when `!shared`), pinned with two coalesced requests (Task 9).
+  - D6: the 5 s `-race` budget is firm, with about 0.5 s of margin. The burst simulations run in about 3–3.5 s (Task 8); the 30-day simulation is coarsened to about 3.6 s without weakening an assertion (Task 14).
+  - The 14 proposed tests are accepted, in the tasks the review names; X26 and X28 get no test.
 
 Rulings of earlier phases this plan applies: PD-1 (a file changed only by a mechanical rename does not count as touched for the deferred-minor rule: Task 4's comment renames, Task 8's `finish(…, 0)` edit, Task 3's `sed` in the drift file `hot_prefetch_test.go`), PD-5 (no pool I/O on the writer: R-E1's sniffs run on the adoption goroutine), PD-11 (the hit path already fires T1 after onboarding).
 
 Design notes (choices the spec leaves open — the boring, bounded option, with the reason):
 
 1. **One anchor mapping** (Task 1). `aptpath.AnchorPaths(form string) []string` takes the form's name (`aptpath` is standard-library-only and cannot import `cache`); `(*cache.SuiteSnapshot).AnchorHash(name string) *string` maps an anchor file to its hash column (the unsigned `Release` lives in the single-anchor slot). Every reader of a snapshot's anchor goes through them — `CommitAdoption` Step 3c, url_path GC guard (d), the check's baseline (`snapshotAnchorHash`, the detached baseline), `servedAnchorUnchanged`, the probe tree's `sameAs` — so no reader infers a form from which hash column is set.
-2. **The in-transaction recheck comes first** (Task 1). For an unsigned candidate, `CommitAdoption`'s Step 1a reads the marker for `aptpath.MarkerBase(suite)` (the `/.` twin shares it) and the prior current snapshot's form inside the writer transaction, before any write; its refusal (`cache.ErrUnsignedDowngradeRefused`) changes nothing.
+2. **The in-transaction recheck comes first** (Task 1). For an unsigned candidate, `CommitAdoption`'s Step 1a applies the never-downgrade rule inside the writer transaction, before any write: `refuseUnsignedDowngrade`, the rule eligibility shares (`Cache.CheckUnsignedDowngrade`), refuses when a marker exists for the host and `aptpath.MarkerBase(suite)` under either scheme (M-7; the `/.` twin shares the base), or an adopted, non-retired inline or detached snapshot of the base or its `/.` twin exists under either scheme (M-8: also a signed displaced snapshot the audit left queued and unmarked). Its refusal (`cache.ErrUnsignedDowngradeRefused`) changes nothing.
 3. **SHA512 is checked before the bytes reach `pool/`** (Task 2): a SHA512 tee during the fetch, SHA256 through `FinalizeExpectingHash`. Mismatched bytes are never left in the pool as a stray blob (the plain fetch path used to leave them).
 4. **SHA512-only members are never reused from the pool** (Task 2): the pool is keyed by SHA256, which the Release does not declare for them. A pooled blob whose SHA256 matches but whose SHA512 does not fails the member (the Release disagrees with itself), and the blob is kept (another snapshot may hold it).
 5. **Hash-block parsing** (Task 2): a malformed or conflicting SHA512 entry fails the parse as a SHA256 one does; an identical repeated entry is one member; a Release with neither block is an error (`no SHA256 or SHA512 block`).
 6. **Repair recovers SHA512 from the snapshot's Release** (Task 2): a skip record keeps only SHA256, so repair re-parses the snapshot's Release (the trust anchor) for every declared hash; when that fails it falls back to the record's SHA256 (DEBUG `adoption_repair_declarations_unavailable`).
 7. **The by-hash probe uses the strongest declared hash** (Task 2), SHA512 when declared, as apt does.
-8. **R-E1's re-mark** (Task 3) runs before the flip barrier, not inside a hold, under the barrier's context and the commit's bound. A pool file that does not exist is no evidence (as in the startup marker pass, with which it shares `sniffCachedAnchor`); any other read error, and a failed mark, refuses the attempt as `unsigned_downgrade_refused` (fail closed).
+8. **R-E1's re-mark** (Task 3) runs before the flip barrier, not inside a hold, under the barrier's context and the commit's bound, over the suite's rows and its `/.` twin's (I-3). A pool file that does not exist is no evidence (as in the startup marker pass, with which it shares `sniffCachedAnchor`); any other read error, and a failed mark, refuses the attempt as `unsigned_downgrade_refused` (fail closed) and logs `adoption: signed-anchor re-mark failed` (WARN, ERROR for a pool read error; M-1): that refusal means "could not rule out a signature".
 9. **`classifyAdoptionReason`'s refusal default** (Task 3): a refusal sentinel without its own case is recorded under the outcome (`refused`), which the admin page shows as a failure — never as `rollback_refused`, whose lag the page hides.
 10. **Unsigned snapshots build no vouching rows at all** (Task 3): besides `package_hash` (`buildPackageHashes` takes the form), the Sources and pdiff builders do not run for them.
 11. **An in-commit refusal's barrier outcome is `refused`** (Task 3), a new `adoption_flip_barrier` value (R-E2 asks only for "not `commit_failed`").
-12. **Unsigned eligibility is checked three times** (Tasks 3, 6, 7): by the check before a slot is taken (`unsignedFirst`, `checkUnsigned`: a refused candidate never holds a slot), in `runShared` before any download (so `RunUnsigned` is safe for any caller), and in the commit (design note 2).
-13. **Interest** (Task 6): `last_requested_at` within 7 days; a stamp in the future counts as interested (spec C4's clock-step rule, "retire" reading: the interest gate keeps work alive), reported by the check through `clockStep`; `suiteDue` reads it silently.
+12. **Unsigned eligibility is checked three times** (Tasks 3, 6, 7): by the check before a slot is taken (`unsignedRefusal`, from `unsignedFirst`, `checkUnsigned` and `anchorFoundAgain`: a refused candidate never holds a slot), in `runShared` before any download (so `RunUnsigned` is safe for any caller), and in the commit (design note 2). The member cap is applied twice: by the check before a slot is taken (`unsignedTooLarge`, M-5) and in `runShared` before any download; both count `ParseRelease`'s merged SHA256/SHA512 paths, so MD5- or SHA1-only entries do not count.
+13. **Interest** (Task 6): `last_requested_at` within 7 days of now in either direction (M-3: a symmetric window). A stamp up to 7 d ahead keeps the suites that were interested before a backward step; one further ahead is dormant until a client touches the suite (`TouchSuite` rewrites the stamp within its coalescing hour). Reading any future stamp as interest would turn every suite touched during a year-ahead boot into a first adoption. A future stamp is reported by the check through `clockStep`; `suiteDue` reads it silently. A returning client's first request may find its suite still dormant (its touch and the hit's T1 run concurrently); the next tick adopts it, within one tick of that request (M-12; `TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent`).
 14. **A client-created anchor row** (Task 6) is an `InRelease` or `Release` url_path row with `request_count > 0`. `Release.gpg` does not count (apt fetches it only after `Release`); flat index rows count from phase G.
-15. **The probe tree sends no validators and gates by content key** (Task 6; spec C4 "without validators"). A never-adopted suite whose content is deferred (C7) therefore fetches its anchor in full on each check until it adopts or its record clears, where C7's validators would have cost a 304; bounded by the check cadence and the backoff. (Spec C4's "without validators" and C7's "the check sends the failing content's validators" disagree for this case; the plan follows C4 and says so in spec revision 8.)
+15. **The probe tree sends no validators and gates by content key** (Task 6; spec C4 "without validators"); ruling PE-3 bounds what that costs. A never-adopted suite whose record is active and not due is paced (`pacedFirst`): no probe while its last check is younger than `periodic_refresh`, so client checks ask nothing, and the scheduler's refresh check or the due retry fetches the anchor in full. Spec C4 and C7 compose: the record gates by key, and the pacing bounds the cost (design review I-4; the draft's "C4 and C7 disagree" was overstated). With the default 15-minute refresh, a suite failing for a missing vendor key costs at most one anchor download per refresh interval, not one per client check.
 16. **The unsigned confirmation gap** (Task 6): `max(cooldown, 5 min)`, or an hour when a signature probe of the confirming observation answered 401/403 (spec C5 does not name the observation; the confirming one is the observation that would adopt, and it needs no extra state).
 17. **Confirmed once** (Task 6): bytes that already passed confirmation — a record for the same content key from an adoption attempt — are not confirmed again, so a failing unsigned first adoption keeps the C7 schedule instead of restarting a short streak per attempt.
 18. **Confirmation streaks restart** (Task 6, `restartsStreak`): an `unsigned_unconfirmed` or `anchor_absent` record for other content, or after another reason, starts at count 1 with `first_at` now, so `adoption_fail_first_at` is the first observation of this state and content — the time spec C5 compares.
-19. **Nothing adoptable is a failed check** (Tasks 6, 7): a never-adopted suite whose tree finds neither `InRelease` nor `Release` (spec C4 Dispatch 3: "otherwise a failed check") and an unsigned candidate while `adopt_unsigned` is off extend the streak and back off (2 min → 1 h). R-E4's reset applies to absent probes and to `anchor_absent`, where a snapshot keeps serving; a suite with nothing to serve does not spend its probes on every tick for as long as clients ask for it.
+19. **Nothing adoptable is a failed check** (Tasks 6, 7): a never-adopted suite whose tree finds neither `InRelease` nor `Release` (spec C4 Dispatch 3: "otherwise a failed check") and an unsigned candidate while `adopt_unsigned` is off extend the streak and back off (2 min → 1 h). The no-anchor case also records `anchor_absent` (ruling PE-2), so the status page shows it and the record paces the suite. R-E4's reset applies to absent probes and to an adopted suite's `anchor_absent`, where a snapshot keeps serving; a suite with nothing to serve does not spend its probes on every tick for as long as clients ask for it.
 20. **Probe URLs** (Task 6): each anchor URL is a cached anchor row's `upstream_url` with its last segment replaced (keeping a non-default port or a mirror prefix), else the checker's `urlReconstruct`.
 21. **A 304 is present only to a conditional request** (Task 6, `classify`); a 304 to a request without validators is a protocol violation, unknown. (Spec C4's table lists no 304.)
-22. **Lateral content keeps its record** (Task 7): a detached suite's failing lateral `InRelease` is held by its record, and the detached anchor's "unchanged" does not clear it (otherwise every other check would attempt it again).
-23. **`anchor_absent` records** (Task 7) use one constant content key, `sha256("anchor_absent")` (the absence has no content; the constant never equals a real key, so whatever upstream serves next is new content), and start at the first absent observation (deviation 1). A record from an adoption attempt (a failed lateral move) keeps its own schedule; the current form and content found again is "unchanged" and clears the record.
-24. **An unsigned suite never updates past a signature** (Task 7): an unknown signature probe fails the check (a signature may be there); a present signature whose signed adoption is deferred is `changed_deferred`, not an unsigned update.
+22. **Lateral content keeps its record** (Task 7): a detached suite's failing lateral `InRelease` is held by its record, and the detached anchor's "unchanged" does not clear it (otherwise every other check would attempt it again). **A record's validators belong to its request's own anchor file** (I-1). A cross-form request (`lateralInline`, `upgradeProbe`, an absent anchor's tree; `adoptionRequest.crossForm`) records none; the candidate keeps them, so a successful flip still stores them. While a record without validators is active and not due, the check sends the current anchor's own (`retryGate.validators`). A 304 is `changed_deferred` only when the record's validators were sent (`retryGate.recordValidators`), otherwise `not_modified`. Without this, a CDN sending `Last-Modified` alone answered the detached `Release` 304 to the failed lateral `InRelease`'s stamp, and the suite froze.
+23. **`anchor_absent` records** (Tasks 6, 7):
+    - They use one constant content key, `sha256("anchor_absent")`: the absence has no content, and the constant never equals a real key, so whatever upstream serves next is new content.
+    - They start at the first absent observation (deviation 1).
+    - The record paces an adopted suite (ruling PE-2, `pacedAbsent`): no request before its retry time, and `suiteDue` does not queue it.
+    - A record from an adoption attempt (a failed lateral move) keeps its own schedule.
+    - The current form and content found again is "unchanged" and clears the record. An unsigned suite's own form with new bytes is its update (M-16). For a signed suite, an unsigned candidate is recorded again.
+    - A detached suite whose changed `Release` comes with an absent `Release.gpg` records it too (M-14), keyed on the constant: never adopted, paced, visible.
+24. **An unsigned suite never updates past a signature** (Task 7): an unknown signature probe fails the check (a signature may be there); a present signature whose signed adoption is deferred is `changed_deferred`, not an unsigned update. The upgrade probe marks the base when it finds a signature (I-2), so after it the suite is never updated unsigned, also once the signature is gone (`TestCheck_UnsignedSuiteSeenSignedNeverUpdatesUnsigned`).
 25. **The waiters' signed flag** (Task 8) is refreshed from each suite's current form on every tick (`refreshSigned`, reading `ListSuitesWithAdoption`): exact within one tick, in both directions.
-26. **Lost offers** (Task 8): an offer that loses its slot to a concurrent admission (a client's check, or a signed check at the same instant) costs its suite a third probe and keeps its place (spec C4: a re-check that finds no slot keeps its place). The overview's "at most two probes per queued suite" holds for offers that meet no concurrent admission; the burst simulation's signed anchors answer 1 s late so its bound is deterministic.
-27. **Only signed adoptions count as in flight** (Task 9): an unsigned adoption never vouches, so waiting for it would only delay the refusal; a count ends when the adoption goroutine returns, after its commit, so a woken request re-reads rows the new snapshot already wrote. `acu_strict_adoption_waits_total` counts the requests that waited (not those refused at the 64-waiter cap).
-28. **T1 on a creating miss fires after the response** (Task 10, a `defer`), so the creating request's own serve is a registered serve its suite's first flip waits for.
+26. **The probe bound** (Task 8; ruling PE-4, I-5): a queued suite is probed twice by the scheduler — the check that queued it and the offered re-check that admits it — plus once per client check while it waits (at most one per cooldown) and once per offer another admission takes first (an offer that loses its slot keeps its place, spec C4). The deterministic burst simulation (signed anchors answer 1 s late) pins the scheduler's two; `TestSimCapacity_UpgradeBurstSameHost` races every suite on one host and checks the bound with the lost offers counted (`offerHook`).
+27. **Only signed adoptions count as in flight** (Task 9): an unsigned adoption never vouches, so waiting for it would only delay the refusal; a count ends when the adoption goroutine returns, after its commit, so a woken request re-reads rows the new snapshot already wrote. Repairs and reconciles that add `package_hash` rows are not counted (acceptable: they run on unchanged checks). `acu_strict_adoption_waits_total` counts the requests that waited (not those refused at the 64-waiter cap or below the 1 s floor).
+28. **T1 on a creating miss fires after the response** (Task 10, a `defer`), so the creating request's own serve is a registered serve its suite's first flip waits for; the `defer` also fires when the client left, which is right (the row was created). Only the creating request fires it (`TestServeHTTP_CoalescedCreatingMissFiresT1Once`).
 29. **The nvidia-shaped DoD fixture is `dists/`-shaped** (Tasks 2, 12): a SHA512-only Release dated 2018 with SHA256 Packages; the flat layout and `./` Filenames are phase G's.
+30. **The checker's marker writer always writes** (Tasks 6, 7; ruling PE-5, I-2): `Adopter.markSignatureSeen` calls `MarkSignedSeenBatch` at every probe that finds a signature for a suite without a signed current snapshot, with no read first. The marker keeps the newest stamp (its last sighting, which phase F's orphan sweep reads), and the check's pacing bounds the writes. A failed write fails the check: nothing is admitted on a signature the cache could not record.
+31. **The strict wait is bounded by the request's age** (Task 9; M-10, O1, underspecified 5):
+    - `WaitHostAdoptions(ctx, host, start)` waits at most min(`strictWait`, `strictRequestBudget` − the request's age) and not at all below `strictMinWait` (1 s). The miss path still downloads the whole `.deb` before its first byte, within apt's 30 s.
+    - A client that left during the wait gets no retry (`client_canceled`).
+    - The refusal is logged once per fetch, by the singleflight leader.
+    - Each waiting request takes a waiter slot, coalesced ones included (M-11, documented).
+32. **The miss path's backstop deadline counts from the request's start** (Task 10; M-15, D-35's sibling): `missBackstopDeadline(start)` = min(now + `backstopTimeout`, start + `missBodyBudget`). A deadline already past fails the backstop at once (logged; the body is served), as any backstop timeout does.
+33. **The stale WARN leaves out refusal states** (Task 7; M-13): `freshness: adopted suites stale beyond threshold` counts adopted stale suites minus those in a refusal state. An `anchor_absent` suite keeps its last success old on purpose, and the status page shows it. The gauge `acu_freshness_stale_suites` still counts every stale suite.
+34. **The unsigned content key is domain-separated** (Task 3; M-2): sha256("unsigned\n" ‖ Release). An `InRelease` body equal to a `Release` body (the legacy plain-text shape) can no longer share a key with an inline record and skip confirmation. No stored key is unsigned before phase E.
+35. **A `cachedAnchors` read error is logged, not recorded** (Task 6; underspecified 2): WARN `freshness: read anchor rows failed`, no request, no write, no backoff, retried at the next check — at most one per cooldown and per tick. A local fault is not an upstream failure.
 
 ## Deliberate deviations from the spec
 
-1. **`anchor_absent` is recorded at the first absent observation** (Task 7). Spec C4 records the refusal state only after two observations and a probe tree that finds no signed form. Recording it at once is the mechanism the two-observation rule needs anyway — the record's `adoption_fail_first_at` is the first observation, restart-safe — and it makes the state visible (status page, `adoption_refused`) from the first check that sees it; the snapshot keeps serving either way, and the tree still runs only after the gap.
-2. **A future `adoption_fail_first_at` never confirms an unsigned transition** (Task 6). Spec C4's clock-step rule reads a future past-event stamp as infinitely old in gates that delay work, which here would confirm at once and skip safeguard 2 (the overview's E carry-forward asked for exactly that rule). The gate instead treats it as unconfirmed, and the next record restarts the streak at now (`recordAdoptionFailure`'s past-event rule): a backward clock step costs one more gap, never a skipped confirmation.
+1. **`anchor_absent` is recorded at the first absent observation** (Task 7). Spec C4 records the refusal state only after two observations and a probe tree that finds no signed form. Recording it at once is the mechanism the two-observation rule needs anyway — the record's `adoption_fail_first_at` is the first observation, restart-safe — and it makes the state visible (status page, `adoption_refused`) from the first check that sees it; the snapshot keeps serving either way, and the tree still runs only after the gap. Its side effects (M-19): a transient blip costs an INFO `adoption_refused` + `adoption_deferred` pair and two writer operations (the record and its clear), and when another record is active and due the tree runs at once, without the two-observation gap.
+2. **A future `adoption_fail_first_at` never confirms an unsigned transition** (Task 6). Spec C4's clock-step rule reads a future past-event stamp as infinitely old in gates that delay work, which here would confirm at once and skip safeguard 2 (the overview's E carry-forward asked for exactly that rule). The gate instead treats it as unconfirmed, and the next record restarts the streak at now (`recordAdoptionFailure`'s past-event rule): a backward clock step costs one more gap, never a skipped confirmation. The same holds for the `anchor_absent` gap (ruling PE-1, M-19): a future `first_at` never confirms the absence, and re-recording restarts it.
 
 ## Review Focus (phase E share)
 
-1. **Upgrading a live v6 cache** (hundreds of never-adopted suites, most of them dormant; §6.1-quarantined plain-text suites; suites a v6 binary served signed but never adopted): only suites a client asked for in the last 7 days adopt — dormant ones make no request — signed updates never wait behind more than one first adoption, a quarantined plain-text suite adopts unsigned without a downgrade refusal, and a suite once served signed is never adopted unsigned — Tasks 6, 8, 12.
+1. **Upgrading a live v6 cache** (hundreds of never-adopted suites, most of them dormant; §6.1-quarantined plain-text suites; suites a v6 binary served signed but never adopted): only suites a client asked for in the last 7 days adopt — dormant ones make no request, and a returning client's suite adopts within one tick — signed updates never wait behind more than one first adoption, a first adoption that keeps failing is paced (no probe per client check), a quarantined plain-text suite adopts unsigned without a downgrade refusal, and a suite once served or probed signed, under either scheme, is never adopted unsigned — Tasks 1, 6, 8, 12 (the production-shaped fixture, I-6).
 2. **Upstreams answering 200 HTML, 401 or 403 for anchor files** (soft-404s, captive portals, WAFs, S3 permission errors): classified absent, never adopted and never taken for a signature; a denied signature stretches the unsigned confirmation to an hour; any other unexpected answer is a counted failed check — Tasks 4, 6, 7.
-3. **An upstream that drops its current anchor or its signature** (an inline suite's `InRelease` disappears; a detached suite's `Release.gpg` 404s while its `Release` changes): the signed snapshot keeps serving, the state is visible (`anchor_absent`, or a WARN per check for a lost `Release.gpg`), a lateral move happens only to the other signed form, and nothing moves a signed suite to unsigned; an absent anchor costs one request per tick and never inherits the failure backoff — Task 7 (`TestCheck_AbsentAnchorNeverMovesToUnsigned`, `TestCheck_DetachedSuiteThatDropsItsSignatureNeverGoesUnsigned`).
-4. **The first-adoption burst** (an upgrade, or many new suites at once) under the default pool of two: first adoptions run one at a time and back to back, each queued suite costs at most two probes (three after a lost offer), goroutines stay bounded, and contention on a stalling host does not starve a healthy suite — Task 8 (`TestSimCapacity_UpgradeBurst`), Task 14 (`TestSimScheduler_StallingHostWithAdoptionContention`).
-5. **Strict mode while suites are being adopted** (`refuse_unvouched_debs = true` during first installs after an upgrade): a `.deb` requested while a signed adoption runs on its host waits for it (at most 15 s, 64 waiters per host) on both paths and is served once vouched; unsigned snapshots never vouch and never turn strict mode on — Tasks 1, 9, 12.
+3. **An upstream that drops its current anchor or its signature** (an inline suite's `InRelease` disappears; a detached suite's `Release.gpg` 404s while its `Release` changes): the signed snapshot keeps serving, the state is visible as `anchor_absent` in both cases (M-14), a lateral move happens only to the other signed form, and nothing moves a signed suite to unsigned; an absent anchor is asked for only at its record's retry times (PE-2: about 24 requests a day after the first hour, none from client checks) and never inherits the failure backoff; a cross-form failure leaves no validators that could freeze the current form (I-1) — Task 7 (`TestCheck_AbsentAnchorIsPacedByItsRecord`, `TestCheck_AbsentAnchorNeverMovesToUnsigned`, `TestCheck_DetachedSuiteThatDropsItsSignatureNeverGoesUnsigned`, `TestCheck_DetachedSuiteKeepsAdoptingWhileItsLateralInReleaseFails`).
+4. **The first-adoption burst** (an upgrade, or many new suites at once) under the default pool of two: first adoptions run one at a time and back to back, each queued suite costs two probes by the scheduler plus one per client check and one per lost offer (PE-4), goroutines stay bounded, and contention on a stalling host does not starve a healthy suite — Task 8 (`TestSimCapacity_UpgradeBurst`, `TestSimCapacity_UpgradeBurstSameHost`), Task 14 (`TestSimScheduler_StallingHostWithAdoptionContention`).
+5. **Strict mode while suites are being adopted** (`refuse_unvouched_debs = true` during first installs after an upgrade): a `.deb` requested while a signed adoption runs on its host waits for it (at most 15 s and never past 25 s into the request, 64 waiters per host) on both paths and is served once vouched; a client that left is not retried, and the refusal is logged once per fetch; unsigned snapshots never vouch and never turn strict mode on — Tasks 1, 9, 12.
 6. **A never-downgrade race** (a signed anchor served on a client miss while an unsigned adoption of the same suite is in flight): the commit's in-transaction recheck refuses it as a state, even after a barrier past `max_duration`, and a cached signed anchor whose marker was lost is re-marked before an unsigned commit — Tasks 1, 3.
 
 ## File map
 
 | Area | Files | Task |
 |---|---|---|
-| Anchor forms in the cache | `internal/aptpath/anchor.go` (new: `AnchorPaths`); `internal/cache/types.go` (`AnchorHash`), `adoption.go` (Step 1a recheck, Step 3c by form, `DeclaredHashesForPath` skips unsigned), `gc_urlpath.go` (guard (d) by form), `queries.go` (`HostCurrentSnapshotsCoverage` skips unsigned) | 1 |
+| Anchor forms in the cache | `internal/aptpath/anchor.go` (new: `AnchorPaths`); `internal/cache/types.go` (`AnchorHash`), `adoption.go` (the never-downgrade rule `refuseUnsignedDowngrade` and `CheckUnsignedDowngrade`, Step 1a recheck, Step 3c by form, `DeclaredHashesForPath` skips unsigned), `gc_urlpath.go` (guard (d) by form), `queries.go` (`HostCurrentSnapshotsCoverage` skips unsigned) | 1 |
 | SHA512 | `internal/freshness/release_parse.go` (merged blocks), `member_verify.go` (new: the shared verifier and aliases), `adoption.go`, `repair.go`, `reconcile.go` | 2 |
-| The unsigned form in the adopter | `internal/freshness/unsigned.go` (new), `adoption.go` (`runShared`, Step 11, `buildPackageHashes`), `legacy_audit.go` (`sniffCachedAnchor`), `retry.go` (`contentKey`), `metrics.go` (refusal outcomes and reasons), `reconcile.go` | 3 |
+| The unsigned form in the adopter | `internal/freshness/unsigned.go` (new: eligibility, the cap, the re-mark over the twin's rows), `adoption.go` (`runShared`, the re-mark's log line, Step 11, `buildPackageHashes`), `legacy_audit.go` (`sniffCachedAnchor`), `retry.go` (`contentKey`, the unsigned key), `metrics.go` (refusal outcomes and reasons), `reconcile.go` | 3 |
 | One check tail | `internal/freshness/check.go` (new: the check paths moved out of `freshness.go`), `freshness.go` | 4 |
-| Fixtures | `internal/cache/testing_helpers.go` and the freshness test fixtures (Task 5's table) | 5 |
-| Eager first adoption | `internal/freshness/probe.go` (new: `classify`, `probe`), `first_adoption.go` (new: `checkFirst`, the probe tree, `unsignedFirst`), `check.go`, `scheduler.go` (dormancy), `adoption_failure.go` (`restartsStreak`), `freshness.go` | 6 |
-| Form transitions | `internal/freshness/current_form.go` (new: `anchorAbsent`, `lateralInline`, `checkUnsigned`), `check.go`, `freshness.go` (repair slot by form), `reconcile.go`, `metrics.go` | 7 |
-| Scheduler | `internal/freshness/scheduler.go`, `admission.go`, `freshness.go` (`Cache.ListSuitesWithAdoption`) | 8 |
-| Strict mode's wait | `internal/freshness/inflight.go` (new), `freshness.go`, `metrics.go`; `internal/handler/handler.go`, `singleflight.go`; `cmd/apt-cacher-ultra/main.go` | 9 |
-| First contact | `internal/handler/handler.go` (T1-on-seed), `singleflight.go`, `suite_rows.go` (onboarding's deadline) | 10 |
+| Fixtures | `internal/cache/testing_helpers.go`, the freshness test fixtures (Task 5's table) and `internal/handler/phase2_detached_chaos_test.go` (armored signatures) | 5 |
+| Eager first adoption | `internal/freshness/probe.go` (new: `classify`, `probe`, `anchorAbsentKey`), `first_adoption.go` (new: `checkFirst`, the symmetric `interested`, `pacedFirst`, the probe tree, `unsignedFirst`), `unsigned.go` (`markSignatureSeen`, `unsignedTooLarge`), `check.go`, `scheduler.go` (dormancy), `adoption_failure.go` (`restartsStreak`), `freshness.go`; `internal/cache/signed_seen.go` (the writers' note) | 6 |
+| Form transitions | `internal/freshness/current_form.go` (new: `pacedAbsent`, `anchorAbsent`, `anchorFoundAgain`, `lateralInline`, `upgradeProbe`, `checkUnsigned`), `check.go` (the paced check, `steadyResult`, M-14), `freshness.go` (repair slot by form, `crossForm`, the gate's validators), `adoption_failure.go` (cross-form records), `first_adoption.go` (`unsignedRefusal`), `scheduler.go` (the paced `suiteDue`, the stale WARN), `metrics.go` | 7 |
+| Scheduler | `internal/freshness/scheduler.go` (`offerHook`), `admission.go`, `check.go`, `freshness.go` (`Cache.ListSuitesWithAdoption`); `sim_burst_test.go` (both burst simulations) | 8 |
+| Strict mode's wait | `internal/freshness/inflight.go` (new: the request-age bound), `freshness.go`, `metrics.go`; `internal/handler/handler.go` (the client-left check, the leader's refusal line), `singleflight.go`; `cmd/apt-cacher-ultra/main.go` | 9 |
+| First contact | `internal/handler/handler.go` (T1-on-seed, the miss backstop's deadline), `singleflight.go`, `suite_rows.go` (onboarding's deadline, `missBackstopDeadline`) | 10 |
 | The knob | `internal/config/config.go`, `packaging/config/config.toml.default`, `cmd/apt-cacher-ultra/main.go` | 11 |
 | DoD | `internal/freshness/dod_e_test.go`, `internal/handler/unsigned_posture_test.go` (new tests) | 12 |
 | Deferred minors | `internal/freshness/flip_barrier.go` (new: the barrier code moved out of `adoption.go`), `freshness.go`, `adoption.go`, `adoption_failure.go`, `legacy_audit.go`, `reconcile.go`, `retry.go`, `internal/handler/handler.go`; tests | 13 |
-| Simulations | `internal/freshness/sim_sched_test.go`, `sim_retry_test.go` (and the `simMembers` callers) | 14 |
+| Simulations | `internal/freshness/sim_sched_test.go`, `sim_retry_test.go` (the coarsened 30-day simulation; and the `simMembers` callers) | 14 |
 | Documentation | `docs/configuration.md`, `docs/log-fields.md`, `docs/admin-ui-spec.md`, the spec, the overview, the four deferred files | 15 |
 
 No migration, no new package, no new dependency.
@@ -133,15 +195,15 @@ No migration, no new package, no new dependency.
 ---
 ### Task 1: Anchor forms in the cache — `AnchorPaths`, the unsigned form's storage rules and the in-transaction never-downgrade recheck
 
-Spec C5 "Anchor forms and storage" (`aptpath.AnchorPaths(form)`; the readers that must go through the form, not the hash columns: `CommitAdoption` Step 3c and url_path GC guard (d) — the two `AIDEV-TODO(phase E)` readers, overview "E:" line), safeguard 3's second point (the marker re-read inside the `CommitAdoption` writer transaction, refusing an unsigned candidate with no pointer change and no rows when a marker exists for its base — the `/.` twin shares it — or the prior current snapshot is signed; overview review finding 5), and safeguard 5's strict-mode reads (`DeclaredHashesForPath` and `HostCurrentSnapshotsCoverage` filter `anchor_form <> 'unsigned'`; spec C10: unsigned snapshots never count and never vouch). Deferred minor A-29 (the `AIDEV-TODO(phase E)` that sat as an SQL comment in `gc_urlpath.go` becomes a Go `AIDEV-NOTE`, and its TODO is resolved). No adoption produces an unsigned snapshot yet (Task 3 does), so the tests build unsigned rows directly.
+Spec C5 "Anchor forms and storage" (`aptpath.AnchorPaths(form)`; the readers that must go through the form, not the hash columns: `CommitAdoption` Step 3c and url_path GC guard (d) — the two `AIDEV-TODO(phase E)` readers, overview "E:" line), safeguard 3's second point (the never-downgrade re-read inside the `CommitAdoption` writer transaction, refusing an unsigned candidate with no pointer change and no rows when the suite has signed history; overview review finding 5), and safeguard 5's strict-mode reads (`DeclaredHashesForPath` and `HostCurrentSnapshotsCoverage` filter `anchor_form <> 'unsigned'`; spec C10: unsigned snapshots never count and never vouch). Signed history is one rule, `refuseUnsignedDowngrade`, which the commit reads inside its transaction and the early exits of Tasks 3, 6 and 7 read through `CheckUnsignedDowngrade` — the same SQL, so an early exit never admits what the commit refuses. The rule is a signed-seen marker for the suite's base (the `/.` twin shares it), or an adopted, non-retired inline or detached snapshot of the suite or its twin: the current one, or a displaced one that the legacy audit left queued, and so unmarked (design review M-8). Both count **under either scheme** (M-7): a base seen signed over https protects the same base over plain http, the scheme a man-in-the-middle can strip. A retired snapshot (quarantined, reaped) is no history. Deferred minor A-29: the `AIDEV-TODO(phase E)` that sat as an SQL comment in `gc_urlpath.go` becomes a Go `AIDEV-NOTE`, and its TODO is resolved. No adoption produces an unsigned snapshot yet (Task 3 does), so the tests build unsigned rows directly.
 
 **Files:**
 - Create: `internal/aptpath/anchor.go`, `internal/aptpath/anchor_test.go`, `internal/cache/unsigned_form_test.go`
-- Modify: `internal/cache/types.go` (`SuiteSnapshot.AnchorHash`, `anchorHash`), `internal/cache/adoption.go` (`ErrUnsignedDowngradeRefused`, Step 1a, Step 3c, `refuseUnsignedDowngradeTx`, `DeclaredHashesForPath`), `internal/cache/queries.go` (`HostCurrentSnapshotsCoverage`), `internal/cache/gc_urlpath.go` (guard (d))
+- Modify: `internal/cache/types.go` (`SuiteSnapshot.AnchorHash`, `anchorHash`), `internal/cache/adoption.go` (`ErrUnsignedDowngradeRefused`, Step 1a, Step 3c, `rowQuerier`, `CheckUnsignedDowngrade`, `refuseUnsignedDowngrade`, `DeclaredHashesForPath`), `internal/cache/queries.go` (`HostCurrentSnapshotsCoverage`), `internal/cache/gc_urlpath.go` (guard (d))
 
 **Interfaces:**
 - Consumes: cache test helpers `openCache`, `seedBlob` (`cache_test.go`), `stubNow` (`gc_test.go`), `derefI64` (`suite_rows_test.go`), `putURLPathRow`, `drainURLPathGC`, `urlPathExists`, `seedPackageHash`, `testMaxVersions` (`gc_urlpath_test.go`); `EnsureSuiteForTest`, `InsertTrackedCandidateForTest` (`testing_helpers.go`); `MarkSignedSeenBatch`, `SignedSeen` (phase A).
-- Produces: `aptpath.AnchorPaths(form string) []string`; `(*cache.SuiteSnapshot).AnchorHash(name string) *string` and the unexported `anchorHash(form, name, single, release, releaseGPG *string) *string` (Tasks 2, 3, 7 read snapshot anchors through it); `cache.ErrUnsignedDowngradeRefused` (Task 3 maps it to the adopter's refusal); the test helper `seedFormSnapshot(t, c, scheme, host, suite, form, single, release, gpg *string, coverage bool) int64` (`unsigned_form_test.go`).
+- Produces: `aptpath.AnchorPaths(form string) []string`; `(*cache.SuiteSnapshot).AnchorHash(name string) *string` and the unexported `anchorHash(form, name, single, release, releaseGPG *string) *string` (Tasks 2, 3, 7 read snapshot anchors through it); `cache.ErrUnsignedDowngradeRefused` (Task 3 maps it to the adopter's refusal); `(*cache.Cache).CheckUnsignedDowngrade(ctx, host, suite string) error` (the never-downgrade rule outside a transaction: Task 3's `unsignedEligible` reads it, for itself and for Tasks 6 and 7); the test helper `seedFormSnapshot(t, c, scheme, host, suite, form, single, release, gpg *string, coverage bool) int64` (`unsigned_form_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -332,6 +394,12 @@ func TestCommitAdoption_RefusesAnUnsignedDowngrade(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if tc.candidate == FormUnsigned {
+				// The early exits read the same rule (CheckUnsignedDowngrade).
+				if early := c.CheckUnsignedDowngrade(ctx, "h", tc.suite); errors.Is(early, ErrUnsignedDowngradeRefused) != tc.refused {
+					t.Fatalf("CheckUnsignedDowngrade = %v, want refused %v", early, tc.refused)
+				}
+			}
 			anchor := seedBlob(t, c, "candidate anchor")
 			id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{CanonicalScheme: "http", CanonicalHost: "h",
 				SuitePath: tc.suite, InReleaseHash: &anchor, Form: tc.candidate})
@@ -368,6 +436,100 @@ func TestCommitAdoption_RefusesAnUnsignedDowngrade(t *testing.T) {
 			}
 			if _, err := c.LookupURL(ctx, "http", "h", tc.suite+"/Release"); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("a refused commit seeded the Release anchor (err %v)", err)
+			}
+		})
+	}
+}
+
+// Spec C5 safeguard 3 beyond the current snapshot and the suite's own
+// scheme (design review M-7, M-8): a marker for the base under the other
+// scheme, and an adopted, non-retired signed snapshot that is not current
+// (a displaced one the legacy audit left unmarked) — of the suite, of its
+// /. twin, or under the other scheme — refuse an unsigned candidate. A
+// retired snapshot (quarantined) and a signed candidate never adopted are
+// no history. CheckUnsignedDowngrade agrees with the commit every time.
+func TestCommitAdoption_RefusesUnsignedForAnySignedHistory(t *testing.T) {
+	type history struct {
+		scheme, suite string
+		form          AnchorForm
+		current       bool
+		adopted       bool
+		retired       bool
+	}
+	for _, tc := range []struct {
+		name                     string
+		suite                    string // the unsigned candidate's, over http
+		markerScheme, markerBase string
+		snapshot                 *history
+		refused                  bool
+	}{
+		{name: "marker under the other scheme", suite: "/u/dists/s", markerScheme: "https", markerBase: "/u/dists/s", refused: true},
+		{name: "displaced signed snapshot", suite: "/u/dists/s",
+			snapshot: &history{scheme: "http", suite: "/u/dists/s", form: FormInline, adopted: true}, refused: true},
+		{name: "displaced detached snapshot of the twin", suite: "/flat",
+			snapshot: &history{scheme: "http", suite: "/flat/.", form: FormDetached, adopted: true}, refused: true},
+		{name: "signed snapshot under the other scheme", suite: "/u/dists/s",
+			snapshot: &history{scheme: "https", suite: "/u/dists/s", form: FormInline, current: true, adopted: true}, refused: true},
+		{name: "retired signed snapshot", suite: "/u/dists/s",
+			snapshot: &history{scheme: "http", suite: "/u/dists/s", form: FormInline, adopted: true, retired: true}},
+		{name: "signed candidate never adopted", suite: "/u/dists/s",
+			snapshot: &history{scheme: "http", suite: "/u/dists/s", form: FormInline}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			defer stubNow(t, 1_800_000_000)()
+			if s := tc.snapshot; s != nil {
+				h := seedBlob(t, c, "signed history")
+				var id int64
+				if s.form == FormDetached {
+					g := seedBlob(t, c, "its signature")
+					id = seedFormSnapshot(t, c, s.scheme, "h", s.suite, s.form, nil, &h, &g, true)
+				} else {
+					id = seedFormSnapshot(t, c, s.scheme, "h", s.suite, s.form, &h, nil, nil, true)
+				}
+				if !s.current {
+					if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = NULL WHERE current_snapshot_id = ?`, id); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if !s.adopted {
+					if _, err := c.db.Exec(`UPDATE suite_snapshot SET adopted_at = NULL WHERE snapshot_id = ?`, id); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if s.retired {
+					if _, err := c.db.Exec(`UPDATE suite_snapshot SET retired_at = 1 WHERE snapshot_id = ?`, id); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if tc.markerBase != "" {
+				if err := c.MarkSignedSeenBatch(ctx, []SignedSeenMark{{CanonicalScheme: tc.markerScheme, CanonicalHost: "h",
+					Base: tc.markerBase, SeenAt: 1}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if early := c.CheckUnsignedDowngrade(ctx, "h", tc.suite); errors.Is(early, ErrUnsignedDowngradeRefused) != tc.refused {
+				t.Fatalf("CheckUnsignedDowngrade = %v, want refused %v", early, tc.refused)
+			}
+			rel := seedBlob(t, c, "unsigned Release")
+			id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{CanonicalScheme: "http", CanonicalHost: "h",
+				SuitePath: tc.suite, InReleaseHash: &rel, Form: FormUnsigned})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = c.CommitAdoption(ctx, id, []SnapshotMember{{SnapshotID: id, Path: "Release", BlobHash: rel, DeclaredSHA256: rel}},
+				nil, nil, nil, false)
+			if tc.refused != errors.Is(err, ErrUnsignedDowngradeRefused) || (!tc.refused && err != nil) {
+				t.Fatalf("commit = %v, want refused %v", err, tc.refused)
+			}
+			sf, err := c.GetSuiteFreshness(ctx, "http", "h", tc.suite)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if committed := sf.CurrentSnapshotID != nil && *sf.CurrentSnapshotID == id; committed == tc.refused {
+				t.Fatalf("current snapshot %v, candidate %d: want committed %v", sf.CurrentSnapshotID, id, !tc.refused)
 			}
 		})
 	}
@@ -440,8 +602,8 @@ func TestStrictModeReads_IgnoreUnsignedSnapshots(t *testing.T) {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test ./internal/aptpath/ ./internal/cache/ -run 'TestAnchorPaths|TestSuiteSnapshot_AnchorHash|TestCommitAdoption_UnsignedSeedsItsReleaseAnchor|TestCommitAdoption_RefusesAnUnsignedDowngrade|TestRunURLPathGCBatch_IdentityGuardFollowsTheAnchorForm|TestStrictModeReads_IgnoreUnsignedSnapshots'`
-Expected: compile failures naming `undefined: AnchorPaths` (aptpath), `s.AnchorHash undefined` and `undefined: ErrUnsignedDowngradeRefused` (cache).
+Run: `go test ./internal/aptpath/ ./internal/cache/ -run 'TestAnchorPaths|TestSuiteSnapshot_AnchorHash|TestCommitAdoption_UnsignedSeedsItsReleaseAnchor|TestCommitAdoption_RefusesAnUnsignedDowngrade|TestCommitAdoption_RefusesUnsignedForAnySignedHistory|TestRunURLPathGCBatch_IdentityGuardFollowsTheAnchorForm|TestStrictModeReads_IgnoreUnsignedSnapshots'`
+Expected: compile failures naming `undefined: AnchorPaths` (aptpath), `s.AnchorHash undefined`, `c.CheckUnsignedDowngrade undefined` and `undefined: ErrUnsignedDowngradeRefused` (cache).
 
 - [ ] **Step 3: Implement**
 
@@ -481,6 +643,7 @@ In `internal/cache/types.go`, after the `SuiteSnapshot` struct, add:
 func (s *SuiteSnapshot) AnchorHash(name string) *string {
 	return anchorHash(s.Form, name, s.SingleAnchorHash, s.ReleaseHash, s.ReleaseGPGHash)
 }
+
 // anchorHash maps an anchor file of a snapshot of form to the hash column
 // that holds it (spec C5): the single-anchor slot holds InRelease for the
 // inline form and Release for the unsigned one.
@@ -504,11 +667,12 @@ func anchorHash(form AnchorForm, name string, single, release, releaseGPG *strin
 In `internal/cache/adoption.go`, after `ErrSnapshotRetired`, add:
 
 ```go
-// ErrUnsignedDowngradeRefused is CommitAdoption's refusal of an unsigned
-// candidate whose suite has signed history: a signed-seen marker for its
-// base, or a signed current snapshot (spec C5 safeguard 3, the recheck
-// inside the writer transaction). Nothing was written. A refusal state,
-// not a failure: the adopter records it as unsigned_downgrade_refused.
+// ErrUnsignedDowngradeRefused is the never-downgrade refusal of an unsigned
+// candidate whose suite has signed history (spec C5 safeguard 3,
+// refuseUnsignedDowngrade): CommitAdoption's recheck inside the writer
+// transaction returns it with nothing written, and CheckUnsignedDowngrade
+// returns it for the early exits. A refusal state, not a failure: the
+// adopter records it as unsigned_downgrade_refused.
 var ErrUnsignedDowngradeRefused = errors.New("cache: unsigned adoption refused: the suite has signed history")
 ```
 
@@ -516,25 +680,45 @@ In `CommitAdoption`, right after the `retiredAt.Valid` check (before "Step 2: in
 
 ```go
 		// Step 1a (spec C5 safeguard 3, never-downgrade): an unsigned
-		// candidate is refused, before anything is written, when its base
-		// has a signed-seen marker or the suite's current snapshot is signed.
+		// candidate is refused, before anything is written, when the
+		// suite has signed history (refuseUnsignedDowngrade: a signed-seen
+		// marker for its base, or an adopted signed snapshot, under either
+		// scheme).
 		//
 		// AIDEV-NOTE: this in-transaction re-read is the authority; the
-		// check's eligibility read and the adopter's are only early exits.
-		// The suite mutex cannot close the race on its own: the handler
-		// writes markers in its own writer operations, and the /. twin
-		// shares the base without sharing the mutex. The writer is FIFO, so
-		// a marker write enqueued before this commit is visible here
+		// check's eligibility read and the adopter's are only early exits
+		// (CheckUnsignedDowngrade, the same rule). The suite mutex cannot
+		// close the race on its own: the handler and the checker write
+		// markers in their own writer operations, and the /. twin shares
+		// the base without sharing the mutex. The writer is FIFO, so a
+		// marker write enqueued before this commit is visible here
 		// (TestStoreFetched_MarkerPrecedesALaterWriterOperation; the
 		// adopter's re-mark before an unsigned commit, ruling R-E1).
 		if AnchorForm(form) == FormUnsigned {
-			if err := refuseUnsignedDowngradeTx(ctx, tx, scheme, host, suite); err != nil {
+			if err := refuseUnsignedDowngrade(ctx, tx, host, suite); err != nil {
 				return err
 			}
 		}
 ```
 
-In Step 3c, the comment's first lines become "seed/sync the metadata anchor url_path row(s) — InRelease (inline), Release + Release.gpg (detached) or Release (unsigned) — to point at the blob this snapshot adopted." Replace
+In Step 3c, the comment's first paragraph becomes:
+
+```go
+		// Step 3c (freshness-freeze fix, SPEC3 §7.5.1 / SPEC2 §7.4):
+		// seed/sync the metadata anchor url_path row(s) — InRelease
+		// (inline), Release + Release.gpg (detached) or Release
+		// (unsigned) — to point at the blob this snapshot adopted.
+		// Historically adoption left the anchor's blob_hash pointing at
+		// whatever bytes a client cache-miss last stored, so it diverged
+		// from the snapshot's anchor hash and the SPEC4 §5 GC guards
+		// (b)/(c) could never vouch for it; the anchor was then reaped on
+		// a low-traffic lull and the suite froze (the checker silently
+		// skips when the anchor is absent, SPEC2 §7.4). Syncing it here
+		// keeps the hash-based guards matching — the SPEC4 §5 identity
+		// guard (d) is the belt to this suspenders.
+```
+
+Then replace
 
 ```go
 		// AIDEV-TODO(phase E): an unsigned snapshot stores its Release
@@ -586,40 +770,65 @@ and, at the end of the same block, replace `scheme, host, anchorPath, h.String,`
 		}
 ```
 
-Before `decrementSnapshotRefcountsTx`, add:
+Before `decrementSnapshotRefcountsTx`, add the rule and its reader outside a transaction:
 
 ```go
-// refuseUnsignedDowngradeTx is CommitAdoption's never-downgrade recheck
-// for an unsigned candidate (spec C5 safeguard 3): ErrUnsignedDowngradeRefused
-// when the suite's base (aptpath.MarkerBase, shared by the /. twin) has a
-// signed-seen marker, or when the suite's current snapshot is inline or
-// detached. A read error fails the commit like any other.
-func refuseUnsignedDowngradeTx(ctx context.Context, tx *sql.Tx, scheme, host, suite string) error {
+// rowQuerier is what refuseUnsignedDowngrade reads through: CommitAdoption's
+// writer transaction, or the read pool.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// CheckUnsignedDowngrade is spec C5's never-downgrade rule
+// (refuseUnsignedDowngrade) read outside a transaction, for the early
+// exits: the check's before an unsigned request takes a slot, the
+// adopter's before anything is downloaded. CommitAdoption re-reads the same
+// rule inside its writer transaction; that read is the authority.
+func (c *Cache) CheckUnsignedDowngrade(ctx context.Context, host, suite string) error {
+	return refuseUnsignedDowngrade(ctx, c.db, host, suite)
+}
+
+// refuseUnsignedDowngrade is the never-downgrade rule for an unsigned
+// candidate of suite (spec C5 safeguard 3): ErrUnsignedDowngradeRefused when
+// the suite has signed history on host under either scheme —
+//   - a signed-seen marker for its base (aptpath.MarkerBase: the /. twin
+//     shares it), or
+//   - an adopted, non-retired inline or detached snapshot of the suite or
+//     its twin: the current snapshot, or a displaced one the legacy trust
+//     audit left queued, and so unmarked, after an I/O fault.
+//
+// A retired snapshot (quarantined by the audit, or reaped) is no history:
+// its trust was removed. A read error is returned as it is.
+//
+// AIDEV-NOTE: one rule and one SQL at both never-downgrade points, so the
+// early exits can never admit what the commit refuses. Either scheme counts
+// (design review M-7): a base seen signed over https protects the same base
+// over plain http, the scheme a man-in-the-middle can strip. The displaced
+// snapshot clause is design review M-8.
+func refuseUnsignedDowngrade(ctx context.Context, q rowQuerier, host, suite string) error {
 	base := aptpath.MarkerBase(suite)
-	var one int
-	err := tx.QueryRowContext(ctx, `
-SELECT 1 FROM suite_signed_seen
- WHERE canonical_scheme = ? AND canonical_host = ? AND base = ?`, scheme, host, base).Scan(&one)
+	var scheme string
+	err := q.QueryRowContext(ctx, `
+SELECT canonical_scheme FROM suite_signed_seen
+ WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND base = ?
+ LIMIT 1`, host, base).Scan(&scheme)
 	switch {
 	case err == nil:
 		return fmt.Errorf("%w: %s://%s%s has a signed-seen marker", ErrUnsignedDowngradeRefused, scheme, host, base)
 	case !errors.Is(err, sql.ErrNoRows):
-		return fmt.Errorf("CommitAdoption: read signed-seen marker: %w", err)
+		return fmt.Errorf("unsigned downgrade check: read signed-seen markers: %w", err)
 	}
-	var prior string
-	err = tx.QueryRowContext(ctx, `
-SELECT ss.anchor_form
-  FROM suite_freshness sf
-  JOIN suite_snapshot ss ON ss.snapshot_id = sf.current_snapshot_id
- WHERE sf.canonical_scheme = ? AND sf.canonical_host = ? AND sf.suite_path = ?`, scheme, host, suite).Scan(&prior)
+	var path, form string
+	err = q.QueryRowContext(ctx, `
+SELECT canonical_scheme, suite_path, anchor_form FROM suite_snapshot
+ WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND suite_path IN (?, ?)
+   AND adopted_at IS NOT NULL AND retired_at IS NULL AND anchor_form IN ('inline', 'detached')
+ LIMIT 1`, host, base, base+"/.").Scan(&scheme, &path, &form)
 	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return nil
-	case err != nil:
-		return fmt.Errorf("CommitAdoption: read the current snapshot's form: %w", err)
-	}
-	if f := AnchorForm(prior); f == FormInline || f == FormDetached {
-		return fmt.Errorf("%w: the current snapshot of %s://%s%s is %s", ErrUnsignedDowngradeRefused, scheme, host, suite, f)
+	case err == nil:
+		return fmt.Errorf("%w: %s://%s%s has an adopted %s snapshot", ErrUnsignedDowngradeRefused, scheme, host, path, form)
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("unsigned downgrade check: read signed snapshots: %w", err)
 	}
 	return nil
 }
@@ -690,9 +899,15 @@ Expected: PASS (the new tests and every existing one).
 
 | Mutation | Fails |
 |---|---|
-| Step 1a's condition `AnchorForm(form) == FormUnsigned` → `false && …` | `TestCommitAdoption_RefusesAnUnsignedDowngrade/{marker_for_the_base, marker_for_the_twin's_base, signed_current_snapshot, detached_current_snapshot}` |
-| `refuseUnsignedDowngradeTx`: `base := aptpath.MarkerBase(suite)` → `base := suite` | `…/marker_for_the_twin's_base` |
-| the prior-form test → `false && (…)` | `…/signed_current_snapshot`, `…/detached_current_snapshot` |
+| Step 1a's condition `AnchorForm(form) == FormUnsigned` → `false && …` | `TestCommitAdoption_RefusesAnUnsignedDowngrade/{marker_for_the_base, marker_for_the_twin's_base, signed_current_snapshot, detached_current_snapshot}`, `TestCommitAdoption_RefusesUnsignedForAnySignedHistory/{marker_under_the_other_scheme, displaced_signed_snapshot, displaced_detached_snapshot_of_the_twin, signed_snapshot_under_the_other_scheme}` |
+| `refuseUnsignedDowngrade`: `base := aptpath.MarkerBase(suite)` → `base := suite` | `TestCommitAdoption_RefusesAnUnsignedDowngrade/marker_for_the_twin's_base` |
+| the snapshot clause finds nothing (`anchor_form IN ('inline', 'detached')` → `IN ('none')`) | `TestCommitAdoption_RefusesAnUnsignedDowngrade/{signed_current_snapshot, detached_current_snapshot}`, `TestCommitAdoption_RefusesUnsignedForAnySignedHistory/{displaced_signed_snapshot, displaced_detached_snapshot_of_the_twin, signed_snapshot_under_the_other_scheme}` |
+| the marker read keyed by scheme (`canonical_scheme IN ('http', 'https')` → `IN ('http')`) | `…ForAnySignedHistory/marker_under_the_other_scheme` |
+| the snapshot read keyed by scheme (the same edit in its query) | `…ForAnySignedHistory/signed_snapshot_under_the_other_scheme` |
+| the snapshot clause without `retired_at IS NULL` | `…ForAnySignedHistory/retired_signed_snapshot` |
+| the snapshot clause without `adopted_at IS NOT NULL` | `…ForAnySignedHistory/signed_candidate_never_adopted` |
+| the snapshot clause without the twin (`base, base+"/."` → `base, base`) | `…ForAnySignedHistory/displaced_detached_snapshot_of_the_twin` |
+| `CheckUnsignedDowngrade` returns nil | `TestCommitAdoption_RefusesAnUnsignedDowngrade/{marker_for_the_base, marker_for_the_twin's_base, signed_current_snapshot, detached_current_snapshot}`, `…ForAnySignedHistory/{the four refused legs}` |
 | Step 3c: `anchorHash(AnchorForm(form), …)` → `anchorHash(FormInline, …)` | `TestCommitAdoption_UnsignedSeedsItsReleaseAnchor` |
 | guard (d): the unsigned arm's `'/Release'` → `'/InRelease'` | `TestRunURLPathGCBatch_IdentityGuardFollowsTheAnchorForm` |
 | drop `AND ss.anchor_form <> 'unsigned'` from `DeclaredHashesForPath`, then (separately) from `HostCurrentSnapshotsCoverage` | `TestStrictModeReads_IgnoreUnsignedSnapshots` (each) |
@@ -1256,7 +1471,7 @@ In `internal/freshness/release_parse_test.go`, add `"strconv"` to the imports an
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test ./internal/freshness/ -run 'TestParseRelease|TestVerifyMember|TestMemberWriter_|TestByHashAliasesAndProbe|TestAdopter_SHA512OnlyReleaseAdopts|TestAdopter_VerifiesEveryDeclaredHash|TestAdopter_ByHashProbeUsesTheStrongestHash|TestReconcile_HealsASHA512OnlyMember|TestRepair_UsesEveryDeclaredHash|TestAdopter_PoolReuseChecksTheSHA512'`
+Run: `go test -gcflags=-e ./internal/freshness/ -run 'TestParseRelease|TestVerifyMember|TestMemberWriter_|TestByHashAliasesAndProbe|TestAdopter_SHA512OnlyReleaseAdopts|TestAdopter_VerifiesEveryDeclaredHash|TestAdopter_ByHashProbeUsesTheStrongestHash|TestReconcile_HealsASHA512OnlyMember|TestRepair_UsesEveryDeclaredHash|TestAdopter_PoolReuseChecksTheSHA512'` (`-gcflags=-e` lifts the compiler's 10-error cap, so every identifier below is named)
 Expected: compile failure naming `unknown field SHA512 in struct literal of type ReleaseMember`, `undefined: newMemberWriter`, `verifyMember`, `memberHashMismatch`, `byHashAliases`, `byHashProbePath`.
 
 Run: `go test ./internal/handler/ -run TestServeHTTP_SHA512ByHashFromAnAdoption`
@@ -1419,7 +1634,7 @@ func ParseRelease(text []byte) ([]ReleaseMember, error) {
 }
 ```
 
-Replace `parseReleaseHashLine` with the following, and add `validHexSHA512` after `validHexSHA256`:
+Replace `parseReleaseHashLine` with:
 
 ```go
 // parseReleaseHashLine parses one entry of block ("SHA256" or "SHA512"):
@@ -1456,6 +1671,11 @@ func parseReleaseHashLine(line, block string) (ReleaseMember, error) {
 	}
 	return ReleaseMember{Path: path, SHA256: hash, Size: size}, nil
 }
+```
+
+and add after `validHexSHA256`:
+
+```go
 // validHexSHA512 reports whether s is exactly 128 lowercase hex characters.
 func validHexSHA512(s string) bool {
 	return len(s) == 128 && validHexSHA256(s[:64]) && validHexSHA256(s[64:])
@@ -1743,6 +1963,7 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 	}
 	return a.fetchMemberURL(ctx, suite, m, m.Path)
 }
+
 // tryByHashFetch attempts to fetch a member from its content-addressed
 // by-hash URL (byHashRelPath). It is a SIDE-EFFECT-FREE probe: unlike
 // fetchMemberURL it emits no adoption_member_skipped WARN, increments no
@@ -1775,6 +1996,7 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 	}
 	return hashHex, nil
 }
+
 // fetchMemberURL fetches one Release member from a specific suite-
 // relative URL (either the plain declared path or its by-hash alias),
 // verifies the bytes against the member's declared Size + SHA256, and
@@ -2045,17 +2267,17 @@ git commit -m "Merge SHA256 and SHA512 hash blocks and verify every declared has
 
 Spec C5 "Unsigned safeguards" (D6), the adopter's share: safeguard 1 (`adoption.adopt_unsigned`, here the adopter's `AdoptionConfig.AdoptUnsigned`; Task 11 wires the config key), safeguard 3's first point in `runShared`'s order of checks ("signature verification (or unsigned eligibility)" — the knob, a signed current snapshot, a marker for the base, before anything is downloaded), safeguard 4 (at most 1,000 declared members, `unsigned_too_large`), safeguard 5 (no `package_hash` rows on any path: `buildPackageHashes` takes the form, and the Sources and pdiff builders are not run), the form's storage (candidate `Form: cache.FormUnsigned` set explicitly — overview "E:" carry-forward; the Release in the single-anchor slot; one `Release` metadata-self member). Ruling R-E1: before any unsigned commit the adopter re-runs the cached signed-anchor mark under the suite mutex it already holds, outside the writer, and refuses (records a refusal) when it cannot. Ruling R-E2: a refusal raised inside `CommitAdoption` surfaces as `ErrAdoptionUnsignedDowngradeRefused` through `classifyAdoptionOutcome` (outcome `refused`), bypasses the `adoption: commit failed` WARN and the `db_failed` wrap, and gives `adoption_flip_barrier` the outcome `refused` — also after a barrier that outlived `adoption.max_duration`; each E refusal sentinel has its own `classifyAdoptionReason` case and none joins admin's `refusalKeepsCurrent`. Overview "E:" carry-forwards: `contentKey`'s unsigned case (sha256(Release), never sha256(nil)); `servedAnchorUnchanged` compares `<suite>/Release` for the unsigned form (the `AIDEV-TODO(phase E)` there is resolved). Deferred minors C-16 (`servedAnchorUnchanged` reads under `p.barrierCtx(ctx)` with a bound and logs errors other than "no row") and A-49 (the startup marker pass says at DEBUG which cached anchor it skipped) sit in code this task rewrites.
 
-The re-mark (R-E1) shares one sniff helper with the startup marker pass, `sniffCachedAnchor` (`legacy_audit.go`), so the two agree on what counts as signed; phase D's handler applies the same `aptpath.SuiteFile` sniffs. The DoD's never-downgrade race is pinned here at the writer: `TestCheck_UnsignedRefusedInsideTheCommitIsAState` pauses an eligible unsigned adoption before its commit (`Adopter.beforeCommit`, a test seam), stores a signed anchor with its marker through `cache.StoreFetched` — exactly the handler's miss-path writer operation — and resumes; the barrier outlives the 20 s `max_duration`. No check produces unsigned requests yet (Task 6), so the tests drive `RunUnsigned` and `spawnAdoption` directly.
+The re-mark (R-E1) shares one sniff helper with the startup marker pass, `sniffCachedAnchor` (`legacy_audit.go`), so the two agree on what counts as signed; phase D's handler applies the same `aptpath.SuiteFile` sniffs. It reads the rows of the suite's base **and of its `/.` twin** (`MarkerBase(s)` and `MarkerBase(s)+"/."`: the twins share the marker, design review I-3 — no twin row can exist before phase G, so E's behaviour is unchanged), and marks the base. A failed re-mark is logged before the refusal is returned (`adoption: signed-anchor re-mark failed`, ERROR for a pool read error, WARN otherwise; design review M-1): the refusal it records, `unsigned_downgrade_refused`, can then mean "could not rule out signed history". The eligibility read is Task 1's `CheckUnsignedDowngrade` — the same rule as the commit's recheck, so it now also refuses a marker under the other scheme and a displaced signed snapshot (M-7, M-8) — and `unsignedEligible` no longer takes the prior snapshot. The member cap's message comes from `unsignedCap(n)`, which Tasks 6 and 7 reuse to refuse a too-large unsigned Release before a slot is taken (M-5). The unsigned content key is domain-separated, `sha256("unsigned\n" ‖ Release)`, so a record for an InRelease body never matches a Release with the same bytes (design review M-2; no stored record holds an unsigned key from before phase E). The DoD's never-downgrade race is pinned here at the writer: `TestCheck_UnsignedRefusedInsideTheCommitIsAState` pauses an eligible unsigned adoption before its commit (`Adopter.beforeCommit`, a test seam), stores a signed anchor with its marker through `cache.StoreFetched` — exactly the handler's miss-path writer operation — and resumes; the barrier outlives the 20 s `max_duration`. No check produces unsigned requests yet (Task 6), so the tests drive `RunUnsigned` and `spawnAdoption` directly.
 
-**Existing tests that change:** the four `a.buildPackageHashes(suiteRef, 1, members, members)` calls in `internal/freshness/hot_prefetch_test.go` (a gofmt drift file: edit it with the `sed` below, never `gofmt -w`) gain the form argument `cache.FormInline`.
+**Existing tests that change:** `TestUnsignedKeysAndReasons` expected `contentKey(unsigned)` to be sha256(Release); with M-2's domain separation it expects sha256("unsigned\n" ‖ Release), and also that the unsigned and inline keys of the same bytes differ. The four `a.buildPackageHashes(suiteRef, 1, members, members)` calls in `internal/freshness/hot_prefetch_test.go` (a gofmt drift file: edit it with the `sed` below, never `gofmt -w`) gain the form argument `cache.FormInline`.
 
 **Files:**
 - Create: `internal/freshness/unsigned.go`, `internal/freshness/unsigned_test.go`, `internal/admin/refusal_reasons_test.go` (a new file: no existing `internal/admin` file changes, so B-59–B-63 stay where they are)
 - Modify: `internal/freshness/adoption.go` (`adoptionFormUnsigned`, `AdoptionConfig.AdoptUnsigned`, `Adopter.adoptUnsigned`/`beforeCommit`, `runRequest`, `runShared`, `barrierOutcome`, `servedAnchorUnchanged`, `formOfSnapshot`, `formName`, `buildPackageHashes`), `internal/freshness/reconcile.go`, `internal/freshness/retry.go` (`contentKey`), `internal/freshness/metrics.go` (`classifyAdoptionOutcome`, `classifyAdoptionReason`), `internal/freshness/legacy_audit.go` (`markFromCachedSignedAnchors`, `sniffCachedAnchor`), `internal/freshness/hot_prefetch_test.go` (drift file, by `sed`)
 
 **Interfaces:**
-- Consumes: Task 1's `cache.ErrUnsignedDowngradeRefused` and Step 3c; Task 2's `hashRelease`, `snapshotPaths`, `shaOf` (`hash_blocks_test.go`). Test helpers `fakeFetcher`/`newFakeFetcher`, `fakePackagesStanzas`, `passThroughVerifier`, `trackSuite`, `testHex64`, `lockedBuffer`, `changedUpstream`, `mustAcquire`, `adoptionTotalFor`, `strOf`; `simtest.OpenCache`, `simtest.ClearsignedFixture`; `cache.(*Cache).StoreFetched`, `MarkSignedSeenBatch`, `SignedSeen`, `ClearSignedSeenForTest`.
-- Produces: `adoptionFormUnsigned`; `AdoptionConfig.AdoptUnsigned bool`; `(*Adopter).RunUnsigned(ctx, suite SuiteRef, release []byte, etag, lastmod string) error`; `(*Adopter).unsignedEligible(ctx, suite SuiteRef, prior *cache.SuiteSnapshot) error` (Task 6's check calls it before taking a slot); `(*Adopter).remarkSignedAnchors(ctx, suite) error`; `ErrAdoptionUnsignedDowngradeRefused`, `ErrAdoptionUnsignedTooLarge`, `errUnsignedDisabled`; `unsignedMemberCap = 1000`; `anchorLastUse(*cache.URLPath) int64`; `sniffCachedAnchor(c *cache.Cache, path, blobHash string) (bool, error)`; the test seam `Adopter.beforeCommit func()`; test helpers `unsignedRig`, `newUnsignedRig(t, quiet, maxDuration)`, `(*unsignedRig).release/current/marked/cacheAnchor/records`, `packageHashCount(t, c, id) int`, `derefStrP` (`unsigned_test.go`).
+- Consumes: Task 1's `cache.ErrUnsignedDowngradeRefused`, `CheckUnsignedDowngrade` and Step 3c; Task 2's `hashRelease`, `snapshotPaths`, `shaOf` (`hash_blocks_test.go`). Test helpers `fakeFetcher`/`newFakeFetcher`, `fakePackagesStanzas`, `passThroughVerifier`, `trackSuite`, `testHex64`, `lockedBuffer`, `changedUpstream`, `mustAcquire`, `adoptionTotalFor`, `strOf`; `simtest.OpenCache`, `simtest.ClearsignedFixture`; `cache.(*Cache).StoreFetched`, `MarkSignedSeenBatch`, `SignedSeen`, `ClearSignedSeenForTest`.
+- Produces: `adoptionFormUnsigned`; `AdoptionConfig.AdoptUnsigned bool`; `(*Adopter).RunUnsigned(ctx, suite SuiteRef, release []byte, etag, lastmod string) error`; `(*Adopter).unsignedEligible(ctx, suite SuiteRef) error` (Tasks 6 and 7's checks call it before taking a slot); `unsignedCap(n int) error` (Tasks 6 and 7); `(*Adopter).remarkSignedAnchors(ctx, suite) error` and `errRemarkPoolRead`; `ErrAdoptionUnsignedDowngradeRefused`, `ErrAdoptionUnsignedTooLarge`, `errUnsignedDisabled`; `unsignedMemberCap = 1000`; `anchorLastUse(*cache.URLPath) int64`; `sniffCachedAnchor(c *cache.Cache, path, blobHash string) (bool, error)`; the test seam `Adopter.beforeCommit func()`; test helpers `unsignedRig`, `newUnsignedRig(t, quiet, maxDuration)`, `(*unsignedRig).release/current/marked/cacheAnchor/cacheAnchorAt/records`, `packageHashCount(t, c, id) int`, `derefStrP` (`unsigned_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2154,12 +2376,18 @@ func (r *unsignedRig) marked() bool {
 // (InRelease, Release.gpg or Release), as a client's miss would have.
 func (r *unsignedRig) cacheAnchor(file string, body []byte) string {
 	r.t.Helper()
+	return r.cacheAnchorAt(r.suite.SuitePath, file, body)
+}
+
+// cacheAnchorAt is cacheAnchor for the suite path dir (the /. twin's).
+func (r *unsignedRig) cacheAnchorAt(dir, file string, body []byte) string {
+	r.t.Helper()
 	h, err := r.ad.writeBlobBytes(context.Background(), body)
 	if err != nil {
 		r.t.Fatal(err)
 	}
 	now := int64(1_700_000_000)
-	path := r.suite.SuitePath + "/" + file
+	path := dir + "/" + file
 	if err := r.c.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: path,
 		BlobHash: &h, UpstreamURL: "http://h" + path, IsMetadata: true, LastRequestedAt: &now, RequestCount: 1, LastFetchedAt: &now}); err != nil {
 		r.t.Fatal(err)
@@ -2230,9 +2458,9 @@ func derefStrP(p *string) string {
 }
 
 // Spec C5: eligibility comes before any download — the knob, a signed
-// current snapshot, a marker for the base (the /. twin shares it) — and
-// the member cap before any member fetch; each refusal is its sentinel and
-// writes nothing.
+// current snapshot, a marker for the base (the /. twin shares it) under
+// either scheme (design review M-7) — and the member cap before any member
+// fetch; each refusal is its sentinel and writes nothing.
 func TestRunUnsigned_EligibilityBeforeAnyDownload(t *testing.T) {
 	big := make(map[string][]byte, unsignedMemberCap+1)
 	for i := 0; i <= unsignedMemberCap; i++ {
@@ -2246,6 +2474,13 @@ func TestRunUnsigned_EligibilityBeforeAnyDownload(t *testing.T) {
 		{"knob off", func(r *unsignedRig) []byte { r.ad.adoptUnsigned = false; return r.release("x") }, errUnsignedDisabled},
 		{"marker for the base", func(r *unsignedRig) []byte {
 			if err := r.c.MarkSignedSeenBatch(context.Background(), []cache.SignedSeenMark{{CanonicalScheme: "http",
+				CanonicalHost: "h", Base: r.suite.SuitePath, SeenAt: 1}}); err != nil {
+				r.t.Fatal(err)
+			}
+			return r.release("x")
+		}, ErrAdoptionUnsignedDowngradeRefused},
+		{"marker under the other scheme", func(r *unsignedRig) []byte {
+			if err := r.c.MarkSignedSeenBatch(context.Background(), []cache.SignedSeenMark{{CanonicalScheme: "https",
 				CanonicalHost: "h", Base: r.suite.SuitePath, SeenAt: 1}}); err != nil {
 				r.t.Fatal(err)
 			}
@@ -2294,7 +2529,8 @@ func TestRunUnsigned_EligibilityBeforeAnyDownload(t *testing.T) {
 // Ruling R-E1 (overview, D carry-forward; DoD): before an unsigned commit
 // the adopter re-runs the cached signed-anchor mark. A suite whose marker
 // is missing but whose cached InRelease (or Release.gpg) passes the sniff
-// is marked and the commit is refused; a cached plain-text "InRelease"
+// — its own, or its /. twin's (design review I-3: the twins share the
+// marker) — is marked and the commit is refused; a cached plain-text "InRelease"
 // (the §6.1 legacy case) earns no marker and the adoption commits, and so
 // does one whose pool file is gone (no evidence).
 func TestRunUnsigned_RemarksCachedSignedAnchors(t *testing.T) {
@@ -2303,16 +2539,24 @@ func TestRunUnsigned_RemarksCachedSignedAnchors(t *testing.T) {
 		file    string
 		body    []byte
 		gone    bool
+		twin    bool // the suite is /flat; the row is its /. twin's, /flat/./<file>
 		refused bool
 	}{
-		{"sniff-passing InRelease", "InRelease", simtest.ClearsignedFixture("Origin: signed\n"), false, true},
-		{"sniff-passing Release.gpg", "Release.gpg", []byte("-----BEGIN PGP SIGNATURE-----\n\nwsBc\n=AAAA\n-----END PGP SIGNATURE-----\n"), false, true},
-		{"plain-text InRelease", "InRelease", []byte("Origin: plain\nSHA256:\n"), false, false},
-		{"pool file gone", "InRelease", simtest.ClearsignedFixture("Origin: gone\n"), true, false},
+		{"sniff-passing InRelease", "InRelease", simtest.ClearsignedFixture("Origin: signed\n"), false, false, true},
+		{"sniff-passing Release.gpg", "Release.gpg", []byte("-----BEGIN PGP SIGNATURE-----\n\nwsBc\n=AAAA\n-----END PGP SIGNATURE-----\n"), false, false, true},
+		{"the twin's sniff-passing InRelease", "InRelease", simtest.ClearsignedFixture("Origin: twin\n"), false, true, true},
+		{"plain-text InRelease", "InRelease", []byte("Origin: plain\nSHA256:\n"), false, false, false},
+		{"pool file gone", "InRelease", simtest.ClearsignedFixture("Origin: gone\n"), true, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newUnsignedRig(t, 0, 0)
-			h := r.cacheAnchor(tc.file, tc.body)
+			dir := r.suite.SuitePath
+			if tc.twin {
+				r.suite.SuitePath, dir = "/flat", "/flat/."
+				trackSuite(t, r.c, r.suite)
+				r.members.put("http://h/flat/main/binary-amd64/Packages", r.pkgs)
+			}
+			h := r.cacheAnchorAt(dir, tc.file, tc.body)
 			if tc.gone {
 				if err := os.Remove(r.c.BlobPath(h)); err != nil {
 					t.Fatal(err)
@@ -2340,9 +2584,11 @@ func TestRunUnsigned_RemarksCachedSignedAnchors(t *testing.T) {
 
 // Ruling R-E1, fail closed: when signed evidence cannot be read, or the
 // re-mark cannot be written, the unsigned adoption is refused, never
-// committed.
+// committed — and the fault is logged (design review M-1: the refusal
+// alone would read "the suite has signed history"), at ERROR for a pool
+// read error and at WARN for a failed mark.
 func TestRunUnsigned_FailedRemarkRefuses(t *testing.T) {
-	for _, how := range []string{"unreadable pool file", "failed mark write"} {
+	for how, level := range map[string]string{"unreadable pool file": "ERROR", "failed mark write": "WARN"} {
 		t.Run(how, func(t *testing.T) {
 			r := newUnsignedRig(t, 0, 0)
 			h := r.cacheAnchor("InRelease", simtest.ClearsignedFixture("Origin: signed\n"))
@@ -2371,6 +2617,9 @@ func TestRunUnsigned_FailedRemarkRefuses(t *testing.T) {
 			}
 			if r.current() != 0 {
 				t.Fatal("committed although the re-mark failed")
+			}
+			if recs := r.records("adoption: signed-anchor re-mark failed"); len(recs) != 1 || recs[0]["level"] != level || recs[0]["err"] == "" {
+				t.Fatalf("re-mark fault records %v, want one at %s with the error", recs, level)
 			}
 		})
 	}
@@ -2532,12 +2781,16 @@ func TestCheck_UnsignedRefusedInsideTheCommitIsAState(t *testing.T) {
 }
 
 // Overview "E:" carry-forwards: contentKey keys the unsigned Release
-// itself; classifyAdoptionReason maps every refusal sentinel to its own
-// refusal reason, and an unrecognised refusal to no refusal reason.
+// itself, domain-separated from the inline key of the same bytes (design
+// review M-2); classifyAdoptionReason maps every refusal sentinel to its
+// own refusal reason, and an unrecognised refusal to no refusal reason.
 func TestUnsignedKeysAndReasons(t *testing.T) {
 	a, b := []byte("Release a"), []byte("Release b")
-	if got := contentKey(adoptionFormUnsigned, nil, a, nil); got != shaOf(a) {
-		t.Fatalf("unsigned key = %s, want sha256(Release) %s", got, shaOf(a))
+	if got, want := contentKey(adoptionFormUnsigned, nil, a, nil), shaOf(append([]byte("unsigned\n"), a...)); got != want {
+		t.Fatalf("unsigned key = %s, want sha256(unsigned + Release) %s", got, want)
+	}
+	if contentKey(adoptionFormUnsigned, nil, a, nil) == contentKey(adoptionFormInline, a, nil, nil) {
+		t.Fatal("an unsigned Release and an InRelease with the same bytes share a content key")
 	}
 	if contentKey(adoptionFormUnsigned, nil, a, nil) == contentKey(adoptionFormUnsigned, nil, b, nil) {
 		t.Fatal("two unsigned Releases share a content key")
@@ -2565,6 +2818,65 @@ func TestUnsignedKeysAndReasons(t *testing.T) {
 	}
 	if f, ok := formOfSnapshot(&cache.SuiteSnapshot{Form: cache.FormUnsigned}); !ok || f != adoptionFormUnsigned {
 		t.Errorf("formOfSnapshot(unsigned) = %v, %v", f, ok)
+	}
+}
+
+// Ruling R-E1, fail closed: a url_path read error during the re-mark is
+// not "no evidence" — the unsigned adoption is refused before its commit,
+// and the fault is logged at WARN (design review M-1). (Proposed by the
+// executability review; kills X09.)
+func TestRunUnsigned_RemarkReadErrorRefuses(t *testing.T) {
+	r := newUnsignedRig(t, 0, 0)
+	db, err := sql.Open("sqlite", filepath.Join(r.c.Dir(), "cache.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`ALTER TABLE url_path RENAME TO url_path_unreadable`); err != nil {
+		t.Fatal(err)
+	}
+	err = r.ad.RunUnsigned(context.Background(), r.suite, r.release("unsigned"), "", "")
+	if !errors.Is(err, ErrAdoptionUnsignedDowngradeRefused) || errors.Is(err, cache.ErrUnsignedDowngradeRefused) {
+		t.Fatalf("RunUnsigned = %v, want the re-mark's refusal (before the commit)", err)
+	}
+	if r.current() != 0 {
+		t.Fatal("committed although the re-mark could not read the cached anchors")
+	}
+	if recs := r.records("adoption: signed-anchor re-mark failed"); len(recs) != 1 || recs[0]["level"] != "WARN" {
+		t.Fatalf("re-mark fault records %v, want one at WARN", recs)
+	}
+}
+
+// Ruling R-E1 for the /. twin: the re-mark marks the suite's base
+// (aptpath.MarkerBase), which the commit's in-transaction recheck reads —
+// not the twin's own path. (Proposed by the executability review; kills
+// X10.)
+func TestRunUnsigned_RemarkMarksTheTwinsBase(t *testing.T) {
+	r := newUnsignedRig(t, 0, 0)
+	r.suite.SuitePath = "/flat/."
+	trackSuite(t, r.c, r.suite)
+	r.members.put("http://h/flat/./main/binary-amd64/Packages", r.pkgs)
+	r.cacheAnchor("InRelease", simtest.ClearsignedFixture("Origin: signed\n"))
+	err := r.ad.RunUnsigned(context.Background(), r.suite, r.release("unsigned"), "", "")
+	if !errors.Is(err, cache.ErrUnsignedDowngradeRefused) || r.current() != 0 {
+		t.Fatalf("RunUnsigned = %v, current %d: want the commit's refusal and no snapshot", err, r.current())
+	}
+	if _, ok, err := r.c.SignedSeen(context.Background(), "http", "h", "/flat"); err != nil || !ok {
+		t.Fatalf("no marker for the base /flat (ok %v, err %v)", ok, err)
+	}
+}
+
+// Ruling R-E1: the re-mark's marker carries the cached anchor's last use,
+// as the startup pass and the handler's backstop stamp it (phase F's
+// orphan-marker sweep reads the stamp). (Proposed by the executability
+// review; kills X11.)
+func TestRunUnsigned_RemarkStampsTheAnchorsLastUse(t *testing.T) {
+	r := newUnsignedRig(t, 0, 0)
+	r.cacheAnchor("InRelease", simtest.ClearsignedFixture("Origin: signed\n"))
+	_ = r.ad.RunUnsigned(context.Background(), r.suite, r.release("unsigned"), "", "")
+	seen, ok, err := r.c.SignedSeen(context.Background(), "http", "h", r.suite.SuitePath)
+	if err != nil || !ok || seen != 1_700_000_000 {
+		t.Fatalf("marker = %d, %v, %v; want the cached anchor's last use 1700000000", seen, ok, err)
 	}
 }
 ```
@@ -2602,9 +2914,9 @@ func TestRefusalKeepsCurrent_OnlyUpstreamOlderAndRollback(t *testing.T) {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test ./internal/freshness/ -run 'TestRunUnsigned_|TestReconcile_UnsignedSnapshotGetsNoPackageHash|TestCheck_UnsignedRefusedInsideTheCommitIsAState|TestUnsignedKeysAndReasons'`
+Run: `go test -gcflags=-e ./internal/freshness/ -run 'TestRunUnsigned_|TestReconcile_UnsignedSnapshotGetsNoPackageHash|TestCheck_UnsignedRefusedInsideTheCommitIsAState|TestUnsignedKeysAndReasons'` (`-gcflags=-e`: every identifier below is named)
 (`TestRefusalKeepsCurrent_OnlyUpstreamOlderAndRollback` passes already: it pins what `internal/admin` must keep.)
-Expected: compile failure naming `unknown field AdoptUnsigned in struct literal of type AdoptionConfig`, `undefined: unsignedMemberCap`, `RunUnsigned`, `errUnsignedDisabled`, `ErrAdoptionUnsignedDowngradeRefused`, `ErrAdoptionUnsignedTooLarge`, `adoptionFormUnsigned`, `r.ad.beforeCommit undefined`.
+Expected: compile failure naming `unknown field AdoptUnsigned in struct literal of type AdoptionConfig`, `undefined: unsignedMemberCap`, `RunUnsigned`, `errUnsignedDisabled`, `ErrAdoptionUnsignedDowngradeRefused`, `ErrAdoptionUnsignedTooLarge`, `adoptionFormUnsigned`, `r.ad.beforeCommit undefined`, `r.ad.adoptUnsigned undefined`.
 
 - [ ] **Step 3: Implement**
 
@@ -2665,71 +2977,93 @@ func (a *Adopter) RunUnsigned(ctx context.Context, suite SuiteRef, release []byt
 }
 
 // unsignedEligible is spec C5's unsigned eligibility, checked before
-// anything is downloaded (the "order of checks in runShared"): the knob is
-// on, the suite's current snapshot (prior) is not signed, and no
-// signed-seen marker exists for its base (aptpath.MarkerBase: the /. twin
-// shares it). It is the first of the two never-downgrade points; the
-// second, the authority, is CommitAdoption's in-transaction recheck.
-func (a *Adopter) unsignedEligible(ctx context.Context, suite SuiteRef, prior *cache.SuiteSnapshot) error {
+// anything is downloaded (the "order of checks in runShared") and by the
+// check before an unsigned request takes a slot: the knob is on, and the
+// suite has no signed history — cache.CheckUnsignedDowngrade, the rule
+// CommitAdoption re-reads in its transaction (a signed-seen marker for the
+// base, or an adopted signed snapshot of the suite or its /. twin, under
+// either scheme). It is the first of the two never-downgrade points; the
+// second, the authority, is the commit's in-transaction recheck.
+func (a *Adopter) unsignedEligible(ctx context.Context, suite SuiteRef) error {
 	if !a.adoptUnsigned {
 		return errUnsignedDisabled
 	}
-	if prior != nil && (prior.Form == cache.FormInline || prior.Form == cache.FormDetached) {
-		return fmt.Errorf("%w: the current snapshot is %s", ErrAdoptionUnsignedDowngradeRefused, prior.Form)
-	}
-	base := aptpath.MarkerBase(suite.SuitePath)
-	_, marked, err := a.cache.SignedSeen(ctx, suite.CanonicalScheme, suite.CanonicalHost, base)
-	if err != nil {
-		return fmt.Errorf("%w: read signed-seen marker: %w", ErrAdoptionDBFailed, err)
-	}
-	if marked {
-		return fmt.Errorf("%w: %s has a signed-seen marker", ErrAdoptionUnsignedDowngradeRefused, base)
+	err := a.cache.CheckUnsignedDowngrade(ctx, suite.CanonicalHost, suite.SuitePath)
+	switch {
+	case errors.Is(err, cache.ErrUnsignedDowngradeRefused):
+		// %v, not %w: cache.ErrUnsignedDowngradeRefused in the chain means
+		// the commit itself refused (runShared's Step 11).
+		return fmt.Errorf("%w: %v", ErrAdoptionUnsignedDowngradeRefused, err)
+	case err != nil:
+		return fmt.Errorf("%w: %w", ErrAdoptionDBFailed, err)
 	}
 	return nil
 }
 
+// unsignedCap is spec C5 safeguard 4: ErrAdoptionUnsignedTooLarge when an
+// unsigned Release declares more than unsignedMemberCap members (n is
+// ParseRelease's count of merged member paths, the members runShared
+// would fetch).
+func unsignedCap(n int) error {
+	if n <= unsignedMemberCap {
+		return nil
+	}
+	return fmt.Errorf("%w: %d declared members, at most %d", ErrAdoptionUnsignedTooLarge, n, unsignedMemberCap)
+}
+
+// errRemarkPoolRead marks a re-mark that failed reading a pool file: an I/O
+// fault, logged at ERROR (any other re-mark failure is a WARN).
+var errRemarkPoolRead = errors.New("read the pool file")
+
 // remarkSignedAnchors re-runs, for an unsigned commit, the cached
 // signed-anchor mark of the suite (ruling R-E1, phase D's backstop rule):
-// it reads the suite's <suite>/InRelease and <suite>/Release.gpg url_path
-// rows, sniffs their pool files here — never on the writer — and marks the
-// base for each one that passes, stamped with the row's last use. The mark
-// is enqueued and committed before the commit is enqueued, so the commit's
-// in-transaction re-read (FIFO writer) sees it. A pool file that does not
-// exist is no evidence (as in the startup marker pass); any other read
-// error, and a failed mark, is an error: the caller refuses the commit.
+// it reads the InRelease and Release.gpg url_path rows of the suite's base
+// and of its /. twin (aptpath.MarkerBase(s) and MarkerBase(s)+"/.", which
+// share the marker), sniffs their pool files here — never on the writer —
+// and marks the base for each one that passes, stamped with the row's last
+// use. The mark is enqueued and committed before the commit is enqueued, so
+// the commit's in-transaction re-read (FIFO writer) sees it. A pool file
+// that does not exist is no evidence (as in the startup marker pass); any
+// other read error (errRemarkPoolRead for a pool file), and a failed mark,
+// is an error: the caller refuses the commit.
 //
 // AIDEV-NOTE: this closes phase D's backstop residual where it matters — a
 // tracked suite whose sniff-passing signed anchor stayed unmarked after a
-// failed backstop. Fail closed: never commit unsigned while signed
-// evidence could not be ruled out.
+// failed backstop, including one cached under the /. twin's path (design
+// review I-3). Fail closed: never commit unsigned while signed evidence
+// could not be ruled out, so a refusal from here can mean "could not rule
+// out" (an I/O or database fault), not only "signed".
 func (a *Adopter) remarkSignedAnchors(ctx context.Context, suite SuiteRef) error {
+	base := aptpath.MarkerBase(suite.SuitePath)
 	var marks []cache.SignedSeenMark
-	for _, name := range []string{"InRelease", "Release.gpg"} {
-		p := suite.SuitePath + "/" + name
-		row, err := a.cache.LookupURL(ctx, suite.CanonicalScheme, suite.CanonicalHost, p)
-		switch {
-		case errors.Is(err, cache.ErrNotFound):
-			continue
-		case err != nil:
-			return fmt.Errorf("read %s: %w", p, err)
-		case row.BlobHash == nil:
-			continue
+	for _, dir := range []string{base, base + "/."} {
+		for _, name := range []string{"InRelease", "Release.gpg"} {
+			p := dir + "/" + name
+			row, err := a.cache.LookupURL(ctx, suite.CanonicalScheme, suite.CanonicalHost, p)
+			switch {
+			case errors.Is(err, cache.ErrNotFound):
+				continue
+			case err != nil:
+				return fmt.Errorf("read %s: %w", p, err)
+			case row.BlobHash == nil:
+				continue
+			}
+			signed, err := sniffCachedAnchor(a.cache, p, *row.BlobHash)
+			switch {
+			case errors.Is(err, fs.ErrNotExist):
+				continue
+			case err != nil:
+				return fmt.Errorf("%w of %s: %w", errRemarkPoolRead, p, err)
+			case !signed:
+				continue
+			}
+			seen := anchorLastUse(row)
+			if seen <= 0 {
+				seen = wallclock.Unix()
+			}
+			marks = append(marks, cache.SignedSeenMark{CanonicalScheme: suite.CanonicalScheme,
+				CanonicalHost: suite.CanonicalHost, Base: base, SeenAt: seen})
 		}
-		signed, err := sniffCachedAnchor(a.cache, p, *row.BlobHash)
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
-			continue
-		case err != nil:
-			return fmt.Errorf("read the pool file of %s: %w", p, err)
-		case !signed:
-			continue
-		}
-		seen := anchorLastUse(row)
-		if seen <= 0 {
-			seen = wallclock.Unix()
-		}
-		marks = append(marks, cache.SignedSeenMark{CanonicalScheme: suite.CanonicalScheme,
-			CanonicalHost: suite.CanonicalHost, Base: aptpath.MarkerBase(suite.SuitePath), SeenAt: seen})
 	}
 	if len(marks) == 0 {
 		return nil
@@ -2788,6 +3122,7 @@ func markFromCachedSignedAnchors(ctx context.Context, c *cache.Cache, logger *sl
 	}
 	return len(marks), nil
 }
+
 // sniffCachedAnchor reports whether the pool file of a cached signed
 // anchor (path is <suite>/InRelease or <suite>/Release.gpg) passes its
 // sniff (spec C3: the rule the handler marks by). The startup marker pass
@@ -2880,7 +3215,7 @@ const (
 		// Spec C5: unsigned eligibility takes the verification's place —
 		// the first never-downgrade point, before anything is downloaded.
 		// Nothing verifies the text: it never vouches a .deb (Step 8).
-		if err := a.unsignedEligible(ctx, suite, prior); err != nil {
+		if err := a.unsignedEligible(ctx, suite); err != nil {
 			return err // a refusal: the checker records and logs it
 		}
 		releaseText = p.releaseBytes
@@ -2907,8 +3242,10 @@ const (
 ```go
 	// Spec C5 safeguard 4: an unsigned Release declaring more than
 	// unsignedMemberCap members is refused before any download.
-	if p.form == adoptionFormUnsigned && len(members) > unsignedMemberCap {
-		return fmt.Errorf("%w: %d declared members, at most %d", ErrAdoptionUnsignedTooLarge, len(members), unsignedMemberCap)
+	if p.form == adoptionFormUnsigned {
+		if err := unsignedCap(len(members)); err != nil {
+			return err
+		}
 	}
 ```
 
@@ -2957,6 +3294,11 @@ const (
 	// barrier, outside the hold, under the shutdown signal (not the
 	// adoption deadline: it would discard finished member work) and the
 	// commit's bound.
+	//
+	// AIDEV-NOTE: the refusal is recorded as unsigned_downgrade_refused,
+	// which here can mean "could not rule out signed history" (a pool or
+	// database fault), so the fault itself is logged first: ERROR for a
+	// pool read error, WARN otherwise (design review M-1).
 	if p.form == adoptionFormUnsigned {
 		mctx, cancel := context.WithTimeout(p.barrierCtx(ctx), commitTimeout)
 		err := a.remarkSignedAnchors(mctx, suite)
@@ -2965,6 +3307,12 @@ const (
 			if stop := p.stopErr(ctx); stop != nil {
 				return fmt.Errorf("adoption: shutdown before the commit: %w", stop)
 			}
+			level := slog.LevelWarn
+			if errors.Is(err, errRemarkPoolRead) {
+				level = slog.LevelError
+			}
+			a.logger.Log(ctx, level, "adoption: signed-anchor re-mark failed",
+				"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "err", err)
 			return fmt.Errorf("%w: the cached signed anchors could not be re-marked: %w",
 				ErrAdoptionUnsignedDowngradeRefused, err)
 		}
@@ -3010,6 +3358,7 @@ func barrierOutcome(outcome string, commitErr error) string {
 	}
 	return outcome
 }
+
 // servedAnchorUnchanged reports whether the anchor this adoption commits
 // is byte-for-byte the url_path anchor clients have been served: the
 // primary anchor of its form (InRelease inline; Release for the detached
@@ -3032,6 +3381,7 @@ func (a *Adopter) servedAnchorUnchanged(ctx context.Context, suite SuiteRef, p *
 	}
 	return err == nil && row.BlobHash != nil && *row.BlobHash == want
 }
+
 // formOfSnapshot maps a snapshot's stored anchor form to the adoption
 // form; (0, false) for nil or a form adoption cannot drift from.
 func formOfSnapshot(snap *cache.SuiteSnapshot) (adoptionForm, bool) {
@@ -3048,6 +3398,7 @@ func formOfSnapshot(snap *cache.SuiteSnapshot) (adoptionForm, bool) {
 	}
 	return 0, false
 }
+
 // formName renders an adoptionForm as a stable string suitable for
 // structured logs (the cache.AnchorForm values). Operators pivot
 // adoption_success on this to track per-suite form drift over time.
@@ -3100,12 +3451,17 @@ In `internal/freshness/retry.go`, replace `contentKey` with:
 // contentKey identifies the content an adoption attempted (spec C7).
 // Any byte change is new content, attempted at once. Inline:
 // sha256(InRelease). Detached: sha256(sha256(Release) || sha256(Release.gpg)),
-// so a re-signature alone is new content too. Unsigned: sha256(Release).
+// so a re-signature alone is new content too. Unsigned:
+// sha256("unsigned\n" || Release), domain-separated from the inline key, so
+// a record for an InRelease body never matches a Release with the same
+// bytes (design review M-2: the "confirmed once" rule trusts a record with
+// an equal key).
 //
 // AIDEV-NOTE: each form keys its own argument — inline the InRelease
 // (inline), detached and unsigned the Release (release). Keying the
 // unsigned Release through inline (nil) would give all unsigned content
 // one key, and new content would be deferred (overview, B carry-forward).
+// No stored record holds an unsigned key from before phase E.
 func contentKey(form adoptionForm, inline, release, sig []byte) string {
 	switch form {
 	case adoptionFormDetached:
@@ -3115,8 +3471,10 @@ func contentKey(form adoptionForm, inline, release, sig []byte) string {
 		h.Write(g[:])
 		return hex.EncodeToString(h.Sum(nil))
 	case adoptionFormUnsigned:
-		s := sha256.Sum256(release)
-		return hex.EncodeToString(s[:])
+		h := sha256.New()
+		h.Write([]byte("unsigned\n"))
+		h.Write(release)
+		return hex.EncodeToString(h.Sum(nil))
 	}
 	s := sha256.Sum256(inline)
 	return hex.EncodeToString(s[:])
@@ -3171,15 +3529,22 @@ Expected: PASS.
 | Mutation | Fails |
 |---|---|
 | `refusalKeepsCurrent` (`internal/admin/status.go`) also lists `cache.ReasonAnchorAbsent` | `TestRefusalKeepsCurrent_OnlyUpstreamOlderAndRollback` |
-| the R-E1 block's condition → `false && p.form == adoptionFormUnsigned` | `TestRunUnsigned_RemarksCachedSignedAnchors/{sniff-passing_InRelease, sniff-passing_Release.gpg}`, `TestRunUnsigned_FailedRemarkRefuses/{unreadable_pool_file, failed_mark_write}` |
+| the R-E1 block's condition → `false && p.form == adoptionFormUnsigned` | `TestRunUnsigned_RemarksCachedSignedAnchors/{sniff-passing_InRelease, sniff-passing_Release.gpg, the_twin's_sniff-passing_InRelease}`, `TestRunUnsigned_FailedRemarkRefuses/{unreadable_pool_file, failed_mark_write}` |
 | `remarkSignedAnchors`: a failed mark returns nil | `TestRunUnsigned_FailedRemarkRefuses/failed_mark_write` |
 | `remarkSignedAnchors`: any pool read error counts as no evidence | `TestRunUnsigned_FailedRemarkRefuses/unreadable_pool_file` |
-| Step 11 drops the `cache.ErrUnsignedDowngradeRefused` mapping | `TestCheck_UnsignedRefusedInsideTheCommitIsAState`, `TestRunUnsigned_RemarksCachedSignedAnchors/{sniff-passing_*}` |
+| `remarkSignedAnchors`: a url_path read error counts as no evidence (`continue`) | `TestRunUnsigned_RemarkReadErrorRefuses` |
+| `remarkSignedAnchors` reads only the suite's own rows (`range []string{suite.SuitePath}`) | `TestRunUnsigned_RemarksCachedSignedAnchors/the_twin's_sniff-passing_InRelease` |
+| `remarkSignedAnchors` marks `suite.SuitePath`, not the base | `TestRunUnsigned_RemarkMarksTheTwinsBase` |
+| `remarkSignedAnchors`: the stamp is not the row's last use (`anchorLastUse(row) * 0`) | `TestRunUnsigned_RemarkStampsTheAnchorsLastUse` |
+| the re-mark fault is not logged (its level below DEBUG) | `TestRunUnsigned_FailedRemarkRefuses/{unreadable_pool_file, failed_mark_write}`, `TestRunUnsigned_RemarkReadErrorRefuses` |
+| a pool read fault logged at WARN | `TestRunUnsigned_FailedRemarkRefuses/unreadable_pool_file` |
+| Step 11 drops the `cache.ErrUnsignedDowngradeRefused` mapping | `TestCheck_UnsignedRefusedInsideTheCommitIsAState`, `TestRunUnsigned_RemarksCachedSignedAnchors/{sniff-passing_*, the_twin's_*}` |
 | `barrierOutcome`: the refusal case → `case false:` | `TestCheck_UnsignedRefusedInsideTheCommitIsAState` |
-| `unsignedEligible` ignores the marker | `TestRunUnsigned_EligibilityBeforeAnyDownload/{marker_for_the_base, marker_for_the_twin's_base}` |
-| drop the member cap | `TestRunUnsigned_EligibilityBeforeAnyDownload/too_many_members` |
+| `unsignedEligible` ignores the signed history (`case false && errors.Is(…)`) | `TestRunUnsigned_EligibilityBeforeAnyDownload/{marker_for_the_base, marker_under_the_other_scheme, marker_for_the_twin's_base, signed_current_snapshot}` |
+| drop the member cap (`unsignedCap(0)`) | `TestRunUnsigned_EligibilityBeforeAnyDownload/too_many_members` |
 | `buildPackageHashes` builds rows for the unsigned form | `TestRunUnsigned_AdoptsWithoutVouching`, `TestReconcile_UnsignedSnapshotGetsNoPackageHash` |
 | `contentKey` drops the unsigned case | `TestUnsignedKeysAndReasons` |
+| `contentKey`'s unsigned case without the `"unsigned\n"` prefix | `TestUnsignedKeysAndReasons` |
 | `classifyAdoptionReason`'s refusal default → `cache.ReasonRollbackRefused` | `TestUnsignedKeysAndReasons` |
 | the unsigned candidate's `Form` → `cache.FormInline` | `TestRunUnsigned_AdoptsWithoutVouching` and every other unsigned test |
 | `servedAnchorUnchanged` compares InRelease for the unsigned form | `TestRunUnsigned_FirstAdoptionOfTheServedReleaseSkipsTheBarrier` |
@@ -4156,7 +4521,7 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 }
 ```
 
-In `internal/freshness/freshness.go`: delete `checkLocked` (with its doc comment), `detectForm`, `checkLockedInline`, `checkLockedDetached` and `recordUnknownEnd`; drop the now unused imports `crypto/sha256` and `encoding/hex` and add `strings`; replace `applyClamp` and `snapshotAnchorHash` with:
+In `internal/freshness/freshness.go`: delete `checkLocked` (with its doc comment), `detectForm`, `checkLockedInline`, `checkLockedDetached` and `recordUnknownEnd`; drop the now unused imports `crypto/sha256` and `encoding/hex` and add `strings`; replace `applyClamp` with:
 
 ```go
 // applyClamp persists a clamped next_retry_at (backward clock step) and
@@ -4175,6 +4540,11 @@ func (c *Checker) applyClamp(ctx context.Context, cur *cache.SuiteFreshness, g r
 	clamped := g.clampTo
 	cur.AdoptionNextRetryAt = &clamped
 }
+```
+
+and `snapshotAnchorHash` with:
+
+```go
 // snapshotAnchorHash returns the adopted hash for the given anchor
 // filename ("/InRelease", "/Release", "/Release.gpg") from the suite's
 // current snapshot, through its form (cache.SuiteSnapshot.AnchorHash: an
@@ -4246,15 +4616,18 @@ The fixture rules (one per helper, so the tests themselves barely change):
 | bodies served as `Release.gpg` | `armoredSig(label)` (an armor header, so spec C3's sniff passes) | the verifiers never parse signatures |
 | `fakeCache` | a new `interest(scheme, host, suitePath, at)` helper; the fake-cache tests whose checker has a fixed `now` stamp interest at it | — |
 | three gate tests (`TestGate_DeferredSendsFailingValidators`, `TestGate_T1StormAfterFailureCostsNothing`, `TestGate_DetachedResignature`) | start from an adopted suite (`retryRig.adopt`, `adoptDetached`) | they prove the spec C7 validators of the current form's conditional GET, which only an adopted suite has after phase E; the old code applies the gate the same way to an adopted suite |
+| three more gate tests (`TestGate_SameContent200IsDeferred`, `TestGate_NewContentIsAttemptedAtOnce`, `TestGate_DetachedSameContent200IsDeferred`) | start from an adopted suite (`retryRig.adopt`, `adoptDetached`) | their second check comes a minute after a failed attempt: after phase E a never-adopted suite inside its record's window is not probed at all (ruling PE-3, Task 6), while an adopted suite's conditional GET keeps the gate they prove; the old code applies the gate the same way to an adopted suite |
 | `TestSim30Days_RetryDateRulesAndClockSteps` | a client touches the suite when upstream publishes v2 (`retrySim.touch`) | a never-adopted suite stays checked only while clients ask for it (10 days in, the seed's interest has lapsed) |
 | `TestRunLegacyTrustAudit_QuarantinedR1SuiteReadoptsOnFirstCheck` | a client fetches the quarantined suite's anchor (`TouchURLPath`) | the anchor row was created by the adoption's seed, not by a client |
 | `TestCheck_AdopterInvokedOnChange`, `TestCheck_DetachedFallback_OnInRelease404`, `TestCheck_DetachedFallback_OnMissingInReleaseURLRow` | clearsigned `InRelease`, armored `Release.gpg`, client-created rows, interest at the checker's fixed `now` | as above |
 | `TestCheck_FutureRetryIsClampedOncePerCheck` (Task 4) | interest at the checker's `now` | as above |
+| `TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange` | its `Release.gpg` body is armored (`armoredSig`) | after phase E an adopted detached suite classifies the signature of a changed `Release` through spec C3's sniff, and one that fails it is absent (Task 7, design review M-14); the Task 4 code never reads the body |
+| `makeChaos2DetachedSnapshot` (`internal/handler`; `TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency`, `TestPhase2DetachedGPGForgery_RejectionLeavesSnapshotIntact`) | the label-distinguishing `Release.gpg` placeholder gets an armor header | as above: the detached adoption these tests drive needs a signature that passes the sniff after phase E; the verifiers ignore the signature bytes |
 | `TestCheck_RepairPanicIsRecovered`, `TestChecker_FreshTickRepairsSkippedMembers` | the adopted and served `InRelease` is clearsigned (`asInRelease`) | an adopted suite whose upstream serves the same bytes stays "unchanged"; phase E reads a plain-text `InRelease` as absent |
 | `TestCheck_HealthySuiteAsksForNoRepairSlot` | serves `r.release` itself (it is already clearsigned) instead of wrapping it twice | same bytes shape as before the rig change |
 
 **Files:**
-- Modify: `internal/cache/testing_helpers.go` (`SeedSuiteForTest`); tests in `internal/freshness/`: `adoption_date_test.go` (`signedRelease`, `asInRelease`), `capacity_test.go`, `check_tail_test.go`, `clockstep_test.go`, `flip_barrier_test.go`, `freshness_test.go` (`fakeCache.interest`), `legacy_audit_test.go`, `panic_recovery_test.go`, `phase6_7_skip_repair_test.go`, `reoffer_test.go`, `retry_gate_test.go`, `retry_rig_test.go` (`releaseText`, `armoredSig`, `adopt`, `adoptDetached`), `scheduler_test.go`, `sim_retry_test.go` (`touch`), `sim_sched_test.go`.
+- Modify: `internal/cache/testing_helpers.go` (`SeedSuiteForTest`); tests in `internal/freshness/`: `adoption_date_test.go` (`signedRelease`, `asInRelease`), `capacity_test.go`, `check_tail_test.go`, `clockstep_test.go`, `flip_barrier_test.go`, `freshness_test.go` (`fakeCache.interest`), `legacy_audit_test.go`, `panic_recovery_test.go`, `phase6_7_skip_repair_test.go`, `reoffer_test.go`, `retry_gate_test.go`, `retry_rig_test.go` (`releaseText`, `armoredSig`, `adopt`, `adoptDetached`), `scheduler_test.go`, `sim_retry_test.go` (`touch`), `sim_sched_test.go`; in `internal/handler/`: `phase2_detached_chaos_test.go` (`makeChaos2DetachedSnapshot`).
 
 **Interfaces:**
 - Consumes: `simtest.ClearsignedFixture`, `cache.(*Cache).TouchSuite`, `cache.(*Cache).TouchURLPath`.
@@ -4417,7 +4790,7 @@ index f93bf9e..8120675 100644
  		}
  		pkgsURL := func(host string) string { return "http://" + host + rigSuite + "/main/binary-amd64/Packages" }
 diff --git a/internal/freshness/freshness_test.go b/internal/freshness/freshness_test.go
-index 5cbd4ad..c9211bc 100644
+index 5cbd4ad..cddc89f 100644
 --- a/internal/freshness/freshness_test.go
 +++ b/internal/freshness/freshness_test.go
 @@ -119,4 +119,15 @@ func (f *fakeCache) track(scheme, host, suitePath string) {
@@ -4456,6 +4829,13 @@ index 5cbd4ad..c9211bc 100644
 +		UpstreamURL: srv.URL + "/dists/noble/InRelease", IsMetadata: true, RequestCount: 1,
  	})
  
+@@ -1383,5 +1395,5 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
+ 		memberHash, len(memberBody),
+ 	))
+-	sigBody := []byte("placeholder Release.gpg bytes")
++	sigBody := armoredSig("placeholder Release.gpg bytes")
+ 
+ 	staleHash := strings.Repeat("0", 64)
 @@ -1520,4 +1532,5 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
  	fc := newFakeCache()
  	fc.track("http", "127.0.0.1", "/dists/noble")
@@ -4595,7 +4975,7 @@ index 3890153..c949829 100644
  		}
  		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
 diff --git a/internal/freshness/retry_gate_test.go b/internal/freshness/retry_gate_test.go
-index 54337b2..9c3d2c1 100644
+index 54337b2..b9b821a 100644
 --- a/internal/freshness/retry_gate_test.go
 +++ b/internal/freshness/retry_gate_test.go
 @@ -49,4 +49,5 @@ func lastResult(r *retryRig) string {
@@ -4604,13 +4984,25 @@ index 54337b2..9c3d2c1 100644
 +	r.adopt()
  	bad := failOnce(t, r)
  	seen := r.row().InReleaseChangeSeenAt
-@@ -168,4 +169,5 @@ func TestGate_FutureNextRetryClampedToOneHour(t *testing.T) {
+@@ -73,4 +74,5 @@ func TestGate_DeferredSendsFailingValidators(t *testing.T) {
+ func TestGate_SameContent200IsDeferred(t *testing.T) {
+ 	r := newRetryRig(t, 0)
++	r.adopt()
+ 	failOnce(t, r)
+ 	r.up.setIgnoreValidators(true)
+@@ -85,4 +87,5 @@ func TestGate_SameContent200IsDeferred(t *testing.T) {
+ func TestGate_NewContentIsAttemptedAtOnce(t *testing.T) {
+ 	r := newRetryRig(t, 0)
++	r.adopt()
+ 	failOnce(t, r)
+ 	r.up.set(r.release("fixed", 0))
+@@ -168,4 +171,5 @@ func TestGate_FutureNextRetryClampedToOneHour(t *testing.T) {
  func TestGate_T1StormAfterFailureCostsNothing(t *testing.T) {
  	r := newRetryRig(t, 0)
 +	r.adopt()
  	bad := failOnce(t, r)
  	before := len(r.up.etagsSent(rigAnchorURL))
-@@ -349,7 +351,7 @@ func TestGate_DetachedResignature(t *testing.T) {
+@@ -349,7 +353,7 @@ func TestGate_DetachedResignature(t *testing.T) {
  	for _, via200 := range []bool{false, true} {
  		r := newRetryRig(t, 0)
 -		seedDetachedAnchors(t, r.cache)
@@ -4620,28 +5012,30 @@ index 54337b2..9c3d2c1 100644
 +		rel, sig1, sig2 := r.releaseText("det", 0), armoredSig("sig one"), armoredSig("sig two")
  		r.ver.reject(contentKey(adoptionFormDetached, nil, rel, sig1))
  		r.up.setAt(relURL, rel)
-@@ -389,5 +391,5 @@ func TestGate_DetachedSameContent200IsDeferred(t *testing.T) {
+@@ -388,6 +392,6 @@ func TestGate_DetachedResignature(t *testing.T) {
+ func TestGate_DetachedSameContent200IsDeferred(t *testing.T) {
  	r := newRetryRig(t, 0)
- 	seedDetachedAnchors(t, r.cache)
+-	seedDetachedAnchors(t, r.cache)
 -	rel, sig := r.release("det", 0), []byte("sig one")
++	r.adoptDetached()
 +	rel, sig := r.releaseText("det", 0), armoredSig("sig one")
  	r.ver.reject(contentKey(adoptionFormDetached, nil, rel, sig))
  	r.up.setAt(rigReleaseURL, rel)
-@@ -407,5 +409,5 @@ func TestGate_DetachedCurrentContentClearsTheRecord(t *testing.T) {
+@@ -407,5 +411,5 @@ func TestGate_DetachedCurrentContentClearsTheRecord(t *testing.T) {
  	r := newRetryRig(t, 0)
  	seedDetachedAnchors(t, r.cache)
 -	good, goodSig := r.release("good", 0), []byte("good sig")
 +	good, goodSig := r.releaseText("good", 0), armoredSig("good sig")
  	r.up.setAt(rigReleaseURL, good)
  	r.up.setAt(rigReleaseGPGURL, goodSig)
-@@ -414,5 +416,5 @@ func TestGate_DetachedCurrentContentClearsTheRecord(t *testing.T) {
+@@ -414,5 +418,5 @@ func TestGate_DetachedCurrentContentClearsTheRecord(t *testing.T) {
  		t.Fatal("setup: good pair not adopted")
  	}
 -	bad, badSig := r.release("bad", 0), []byte("bad sig")
 +	bad, badSig := r.releaseText("bad", 0), armoredSig("bad sig")
  	r.ver.reject(contentKey(adoptionFormDetached, nil, bad, badSig))
  	r.up.setAt(rigReleaseURL, bad)
-@@ -432,5 +434,6 @@ func TestGate_DetachedCurrentContentClearsTheRecord(t *testing.T) {
+@@ -432,5 +436,6 @@ func TestGate_DetachedCurrentContentClearsTheRecord(t *testing.T) {
  
  // seedDetachedAnchors removes the rig's InRelease anchor and caches stale
 -// Release + Release.gpg anchors, so checks take the detached path.
@@ -4649,7 +5043,7 @@ index 54337b2..9c3d2c1 100644
 +// detached path.
  func seedDetachedAnchors(t *testing.T, c *cache.Cache) {
  	t.Helper()
-@@ -446,5 +449,5 @@ func seedDetachedAnchors(t *testing.T, c *cache.Cache) {
+@@ -446,5 +451,5 @@ func seedDetachedAnchors(t *testing.T, c *cache.Cache) {
  		h := h
  		if err := c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: rigHost, Path: path,
 -			BlobHash: &h, UpstreamURL: "http://h" + path, IsMetadata: true}); err != nil {
@@ -4829,6 +5223,19 @@ index 6067a4c..f69ec01 100644
 +			return signedRelease(label, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
  		}
  		pkgsURL := func(host string) string { return "http://" + host + rigSuite + "/main/binary-amd64/Packages" }
+diff --git a/internal/handler/phase2_detached_chaos_test.go b/internal/handler/phase2_detached_chaos_test.go
+index 7d8b774..d835614 100644
+--- a/internal/handler/phase2_detached_chaos_test.go
++++ b/internal/handler/phase2_detached_chaos_test.go
+@@ -267,5 +267,7 @@ func makeChaos2DetachedSnapshot(label string) chaos2Snapshot {
+ 		chaos2PackagesGzPath: pkgsGz,
+ 	})
+-	sig := []byte(fmt.Sprintf("--detached-sig-%s--", label))
++	// An armor header (spec C3's Release.gpg sniff passes): after phase E
++	// a signature that fails the sniff is absent, not adopted.
++	sig := []byte(fmt.Sprintf("-----BEGIN PGP SIGNATURE-----\n\ndetached-sig-%s\n-----END PGP SIGNATURE-----\n", label))
+ 
+ 	return chaos2Snapshot{
 ```
 
 - [ ] **Step 2: Run the suite on the unchanged production code**
@@ -4843,8 +5250,9 @@ gofmt -l internal/cache/testing_helpers.go internal/freshness/adoption_date_test
   internal/freshness/check_tail_test.go internal/freshness/clockstep_test.go internal/freshness/flip_barrier_test.go \
   internal/freshness/freshness_test.go internal/freshness/legacy_audit_test.go internal/freshness/panic_recovery_test.go \
   internal/freshness/phase6_7_skip_repair_test.go internal/freshness/reoffer_test.go internal/freshness/retry_gate_test.go internal/freshness/retry_rig_test.go \
-  internal/freshness/scheduler_test.go internal/freshness/sim_retry_test.go internal/freshness/sim_sched_test.go
-git add internal/cache/testing_helpers.go internal/freshness/*_test.go
+  internal/freshness/scheduler_test.go internal/freshness/sim_retry_test.go internal/freshness/sim_sched_test.go \
+  internal/handler/phase2_detached_chaos_test.go
+git add internal/cache/testing_helpers.go internal/freshness/*_test.go internal/handler/phase2_detached_chaos_test.go
 git commit -m "Give the check tests' never-adopted suites client interest, client-created anchors and sniff-passing bodies"
 ```
 
@@ -4852,19 +5260,75 @@ git commit -m "Give the check tests' never-adopted suites client interest, clien
 
 Spec C4 "Response classification" (defined once: `classify`, the overview's `classPresent`/`classAbsent`/`classUnknown`) and Dispatch 3: a suite with no current snapshot (adopter wired) is checked only while it has client interest — `last_requested_at` within the constant 7-day window — and a client-created `InRelease` or `Release` `url_path` row (`request_count > 0`, never a reconstructed one); otherwise it makes no request and no write, and the scheduler does not queue it (`suiteDue`). An active one runs the probe tree without validators — `InRelease` present → inline; absent → `Release` present → `Release.gpg` present → detached, absent → unsigned candidate — and adopts the form found: `first_adoption`, or `first_adoption_queued` without a slot (`isQueuedResult` parks it; the request passes `signedCurrent = false`, overview "E:" carry-forward). Any unknown probe, a tree that finds neither `InRelease` nor `Release`, and an unsigned candidate while `adoption.adopt_unsigned` is off are failed checks (`failCheck`, streak extended); absent statuses never extend the streak (ruling R-E4). The unsigned candidate passes spec C5 safeguards at the check, before a slot is taken: eligibility (`Adopter.unsignedEligible`: the knob, a signed-seen marker → refusal state `unsigned_downgrade_refused`) and the transition confirmation (two observations of the same `Release` bytes at least `max(cooldown, 5 min)` apart, one hour when either signature file answered 401/403; `unsigned_unconfirmed` until then, the streak restarting whenever the bytes or the reason change — `restartsStreak`, so `adoption_fail_first_at` is the first observation of these bytes; the overview's past-event carry-forward for `adoption_fail_first_at`). The spec C7 gate applies in the tree by content key only (the probes carry no validators; design note 15). Phase 1 (no adopter) keeps the Task 4 algorithm.
 
-Design notes 13–21 record the choices the spec leaves open: a future interest stamp counts as interested (the clock-step rule's "retire" reading, reported through `clockStep`); the 401/403 gap is decided by the confirming observation's probes; bytes that already passed confirmation (a record for them from an adoption attempt) are not confirmed again; a future `adoption_fail_first_at` never confirms (deviation 2: the C4 rule would read it as infinitely old and skip the safeguard).
+The controller's rulings on the plan review add four behaviours here:
+- **Pacing (ruling PE-3, design review I-4):** a never-adopted suite whose failure or refusal record is active and not due, and whose last check is younger than `periodic_refresh`, is not probed (`pacedFirst`): client checks (T1) inside that window ask nothing, and the scheduler's refresh check and the due retry still run the tree. A last check stamped in the future reads as infinitely old. Without it a deferred suite downloaded its anchor in full at every client hit (no validators). Cost: new content of a failing suite is attempted within one refresh interval, not at the next client hit.
+- **No anchor at all (ruling PE-2):** still a failed check that backs off (spec C4), and it also records the refusal state `anchor_absent` (`anchorAbsentKey`, which lives in `probe.go` from this task on), so the status page shows it.
+- **The checker's marker writer (ruling PE-5, design review I-2):** a probe that finds a sniff-passing signature (`InRelease` or `Release.gpg` present) marks the suite's base (`Adopter.markSignatureSeen`, stamped now) before anything is admitted; a failed write fails the check. A signature only the cache's own probe saw is signed history from then on, so a later strip never yields an unsigned candidate.
+- **The member cap before a slot (design review M-5):** `unsignedFirst` refuses `unsigned_too_large` (`unsignedTooLarge`, Task 3's `unsignedCap` over `ParseRelease`) before the confirmation, so a too-large unsigned suite never takes a slot.
+
+The interest window is symmetric (design review M-3): a stamp up to 7 days in the future counts, one further ahead is dormant until a client touches the suite again. The executability review's tests for X01, X04, X12 and X13 are part of the test file.
+
+Design notes 13–21, 23, 30 and 35 record the choices the spec leaves open: an interest stamp up to 7 days in the future counts as interested and is reported through `clockStep`, one further ahead does not (a symmetric window); the 401/403 gap is decided by the confirming observation's probes; bytes that already passed confirmation (a record for them from an adoption attempt) are not confirmed again; a future `adoption_fail_first_at` never confirms (deviation 2: the C4 rule would read it as infinitely old and skip the safeguard).
 
 **Files:**
 - Create: `internal/freshness/probe.go`, `internal/freshness/first_adoption.go`, `internal/freshness/first_adoption_test.go`
-- Modify: `internal/freshness/check.go` (`checkLocked` dispatch), `internal/freshness/freshness.go` (`isQueuedResult`), `internal/freshness/scheduler.go` (`suiteDue`), `internal/freshness/adoption_failure.go` (`recordAdoptionFailure`, `restartsStreak`), `internal/freshness/retry_rig_test.go` (`rigUpstream.setFail`); expectations in `internal/freshness/capacity_test.go`, `internal/freshness/reoffer_test.go`, `internal/freshness/freshness_test.go`, `internal/handler/phase2_migration_test.go`
+- Modify: `internal/freshness/check.go` (`checkLocked` dispatch), `internal/freshness/freshness.go` (`isQueuedResult`), `internal/freshness/scheduler.go` (`suiteDue`), `internal/freshness/adoption_failure.go` (`recordAdoptionFailure`, `restartsStreak`), `internal/freshness/unsigned.go` (`unsignedTooLarge`, `Adopter.markSignatureSeen`), `internal/cache/signed_seen.go` (the marker writers' AIDEV-NOTE), `internal/freshness/retry_rig_test.go` (`rigUpstream.setFail`); expectations in `internal/freshness/capacity_test.go`, `internal/freshness/reoffer_test.go`, `internal/freshness/freshness_test.go`, `internal/handler/phase2_migration_test.go`
 
 **Interfaces:**
-- Consumes: Task 3's `Adopter.unsignedEligible`, `ErrAdoptionUnsignedDowngradeRefused`, `errUnsignedDisabled`, `adoptionFormUnsigned`, `formName`, `contentKey`'s unsigned case and `Adopter.adoptUnsigned`; Task 4's `checkEnd`, `finishCheck`, `failCheck`, `admit`, `checkTotal`; Task 5's rig fixtures (`release`, `releaseText`, `armoredSig`, interest stamps); `cache.ReasonUnsignedUnconfirmed`, `cache.ReasonUnsignedDowngradeRefused`, `cache.ReasonAnchorAbsent`, `cache.SignedSeenMark`, `aptpath.SniffInRelease`/`SniffRelease`/`SniffReleaseGPG`; test helpers `newRetryRig`, `rigReleaseURL`, `rigReleaseGPGURL`, `lastResult`, `adoptionTotalFor`, `renderedMetric`, `changedUpstream`.
-- Produces (package freshness): `probeClass` with `classUnknown`, `classPresent`, `classAbsent`; `probeOutcome{class probeClass; res *fetch.ConditionalResult; status int; err error}` with `cancelled()`, `authDenied()`; `classify(res *fetch.ConditionalResult, err error, sniff func([]byte) bool, conditional bool) probeOutcome`; `anchorURLs{model, modelName string; reconstruct func(string) string}` with `of(name string) string`; `(*Checker).anchorURLsFor(suite SuiteRef, rows map[string]string) anchorURLs`; `(*Checker).probe(fetchCtx context.Context, suite SuiteRef, urls anchorURLs, name string) probeOutcome`; constants `interestWindow` (7 d), `minConfirmGap` (5 min), `deniedConfirmGap` (1 h); `errNoAnchor`; `(*Checker).confirmGap() time.Duration`; `interested(lastRequested *int64, now time.Time) (ok, future bool)`; `(*Checker).cachedAnchors(ctx, suite) (urls map[string]string, clientCreated bool, err error)`; `probeTree` with `request(suite) *adoptionRequest` and `signatureDenied() bool`; `(*Checker).runProbeTree(fetchCtx, suite, urls) probeTree`; `(*Checker).checkFirst(ctx, fetchCtx, out, cur, suite, now, nowUnix) *adoptionRequest`; `(*Checker).unsignedFirst(ctx, cur, req, t probeTree, gate retryGate, now) (proceed bool, reason string, err error)`; `restartsStreak(cur *cache.SuiteFreshness, key, reason string) bool`. Test helpers: `(*rigUpstream).setFail(url string, err error)`; `(*retryRig).interestAt(at int64)`, `(*retryRig).currentSnapshot() *cache.SuiteSnapshot`, `(*retryRig).unsignedRelease(label string, sigErr error) []byte` (`first_adoption_test.go`). Task 7 reuses `classify`, `probe`, `anchorURLsFor`, `cachedAnchors`, `runProbeTree`, `confirmGap` and `restartsStreak`.
+- Consumes: Task 3's `Adopter.unsignedEligible`, `unsignedCap`, `ErrAdoptionUnsignedDowngradeRefused`, `errUnsignedDisabled`, `adoptionFormUnsigned`, `formName`, `contentKey`'s unsigned case and `Adopter.adoptUnsigned`; Task 4's `checkEnd`, `finishCheck`, `failCheck`, `admit`, `checkTotal`; Task 5's rig fixtures (`release`, `releaseText`, `armoredSig`, interest stamps); `cache.ReasonUnsignedUnconfirmed`, `cache.ReasonUnsignedDowngradeRefused`, `cache.ReasonUnsignedTooLarge`, `cache.ReasonAnchorAbsent`, `cache.SignedSeenMark`, `cache.(*Cache).SetAdoptionNextRetry`, `aptpath.SniffInRelease`/`SniffRelease`/`SniffReleaseGPG`; test helpers `newRetryRig`, `rigReleaseURL`, `rigReleaseGPGURL`, `lastResult`, `adoptionTotalFor`, `renderedMetric`, `changedUpstream`, `datedRelease`, `checkTotal`, `testHex64`.
+- Produces (package freshness): `probeClass` with `classUnknown`, `classPresent`, `classAbsent`; `probeOutcome{class probeClass; res *fetch.ConditionalResult; status int; err error}` with `cancelled()`, `authDenied()`; `classify(res *fetch.ConditionalResult, err error, sniff func([]byte) bool, conditional bool) probeOutcome`; `anchorURLs{model, modelName string; reconstruct func(string) string}` with `of(name string) string`; `(*Checker).anchorURLsFor(suite SuiteRef, rows map[string]string) anchorURLs`; `(*Checker).probe(fetchCtx context.Context, suite SuiteRef, urls anchorURLs, name string) probeOutcome`; constants `interestWindow` (7 d), `minConfirmGap` (5 min), `deniedConfirmGap` (1 h); `anchorAbsentKey` (`probe.go`; Task 7 records it too); `errNoAnchor`; `(*Checker).confirmGap() time.Duration`; `interested(lastRequested *int64, now time.Time) (ok, future bool)`; `(*Checker).pacedFirst(cur, gate retryGate, now) bool`; `(*Checker).cachedAnchors(ctx, suite) (urls map[string]string, clientCreated bool, err error)`; `probeTree` with `request(suite) *adoptionRequest`, `signatureDenied() bool` and `signatureSeen() bool`; `(*Adopter).markSignatureSeen(ctx, suite, seenAt int64) error`; `unsignedTooLarge(release []byte) error`; `(*Checker).runProbeTree(fetchCtx, suite, urls) probeTree`; `(*Checker).checkFirst(ctx, fetchCtx, out, cur, suite, now, nowUnix) *adoptionRequest`; `(*Checker).unsignedFirst(ctx, cur, req, t probeTree, gate retryGate, now) (proceed bool, reason string, err error)`; `restartsStreak(cur *cache.SuiteFreshness, key, reason string) bool`. Test helpers: `(*rigUpstream).setFail(url string, err error)`; `(*retryRig).interestAt(at int64)`, `(*retryRig).currentSnapshot() *cache.SuiteSnapshot`, `(*retryRig).unsignedRelease(label string, sigErr error) []byte` (`first_adoption_test.go`). Task 7 reuses `classify`, `probe`, `anchorURLsFor`, `cachedAnchors`, `runProbeTree`, `confirmGap`, `restartsStreak`, `anchorAbsentKey`, `signatureSeen`, `markSignatureSeen` and `unsignedTooLarge`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Add `setFail` to the rig upstream (`internal/freshness/retry_rig_test.go`) — the field, the method, and the two lines in `Conditional` — as in the `retry_rig_test.go` part of Step 3's patch below.
+Add `setFail` to the rig upstream (`internal/freshness/retry_rig_test.go`) — the field, the method, and the two lines in `Conditional` (`git apply`):
+
+```diff
+diff --git a/internal/freshness/retry_rig_test.go b/internal/freshness/retry_rig_test.go
+index 043a27b..6d91334 100644
+--- a/internal/freshness/retry_rig_test.go
++++ b/internal/freshness/retry_rig_test.go
+@@ -48,4 +48,5 @@ type rigUpstream struct {
+ 	ignoreValidators bool
+ 	stall            bool
++	fail             map[string]error    // per URL: the error Conditional returns (setFail)
+ 	sent             map[string][]string // If-None-Match per URL, in order
+ }
+@@ -53,4 +54,19 @@ type rigUpstream struct {
+ func (u *rigUpstream) set(body []byte) { u.setAt(rigAnchorURL, body) }
+ 
++// setFail makes every request for url fail with err (nil restores the
++// body or the default 404).
++func (u *rigUpstream) setFail(url string, err error) {
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	if u.fail == nil {
++		u.fail = map[string]error{}
++	}
++	if err == nil {
++		delete(u.fail, url)
++		return
++	}
++	u.fail[url] = err
++}
++
+ func (u *rigUpstream) setAt(url string, body []byte) {
+ 	u.mu.Lock()
+@@ -69,5 +85,5 @@ func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, eta
+ 	u.sent[target.URL] = append(u.sent[target.URL], etag)
+ 	body, ok := u.bodies[target.URL]
+-	stall, ignore := u.stall, u.ignoreValidators
++	stall, ignore, failErr := u.stall, u.ignoreValidators, u.fail[target.URL]
+ 	u.mu.Unlock()
+ 	if stall {
+@@ -75,4 +91,7 @@ func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, eta
+ 		return nil, ctx.Err()
+ 	}
++	if failErr != nil {
++		return nil, failErr
++	}
+ 	if !ok {
+ 		return nil, &fetch.StatusError{Code: 404}
+```
 
 Create `internal/freshness/first_adoption_test.go`:
 
@@ -4873,8 +5337,10 @@ package freshness
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -5044,7 +5510,8 @@ func TestCheckFirst_ProbeTreeAdoptsTheFormFound(t *testing.T) {
 
 // Spec C4 "Response classification" per anchor of the probe tree: absent
 // moves on, unknown fails the check at once (no further probe, the streak
-// extends), and a tree that finds no anchor fails it too.
+// extends), and a tree that finds no anchor fails it too — and records
+// anchor_absent, so the status page shows it (ruling PE-2).
 func TestCheckFirst_ClassificationPerAnchor(t *testing.T) {
 	unknowns := map[string]error{
 		"503":       &fetch.StatusError{Code: 503},
@@ -5103,12 +5570,17 @@ func TestCheckFirst_ClassificationPerAnchor(t *testing.T) {
 		if ev := r.events("freshness check failed"); len(ev) != 1 || ev[0]["form"] != "probe" {
 			t.Fatalf("failed-check lines %v, want one with form probe", ev)
 		}
+		if row := r.row(); strOf(row.AdoptionFailReason) != cache.ReasonAnchorAbsent || row.AdoptionFailCount != 1 {
+			t.Fatalf("record %q/%d, want anchor_absent/1", strOf(row.AdoptionFailReason), row.AdoptionFailCount)
+		}
 	})
 }
 
 // Spec C4 Dispatch 3: a never-adopted suite without client interest in the
 // last 7 days, or without a client-created anchor row, makes no request and
-// no write; a future interest stamp counts (clock-step rule) and is reported.
+// no write; an interest stamp up to 7 days in the future counts and is
+// reported as a clock step, one further ahead is dormant (design review M-3:
+// a symmetric window).
 func TestCheckFirst_DormantSuitesMakeNoRequest(t *testing.T) {
 	now := int64(1_800_000_000)
 	for _, tc := range []struct {
@@ -5117,6 +5589,7 @@ func TestCheckFirst_DormantSuitesMakeNoRequest(t *testing.T) {
 	}{
 		{"interest exactly 7 days old", func(r *retryRig) { r.interestAt(now - 7*24*3600) }},
 		{"interest 8 days old", func(r *retryRig) { r.interestAt(now - 8*24*3600) }},
+		{"interest 8 days in the future", func(r *retryRig) { r.interestAt(now + 8*24*3600) }},
 		{"a reconstructed anchor row (request_count 0)", func(r *retryRig) {
 			stale := testHex64
 			if err := r.cache.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: "http", CanonicalHost: rigHost,
@@ -5186,6 +5659,7 @@ func TestSuiteDue_DormantNeverAdoptedSuites(t *testing.T) {
 		{"never adopted, retry due but dormant", cache.SuiteFreshness{LastSuccessAt: stale, LastRequestedAt: at(-8 * 24 * time.Hour),
 			AdoptionFailCount: 1, AdoptionNextRetryAt: at(-time.Minute)}, false, true},
 		{"never adopted, interest in the future", cache.SuiteFreshness{LastSuccessAt: stale, LastRequestedAt: at(time.Hour)}, true, true},
+		{"never adopted, interest 8 days in the future", cache.SuiteFreshness{LastSuccessAt: stale, LastRequestedAt: at(8 * 24 * time.Hour)}, false, true},
 		{"adopted, no interest", cache.SuiteFreshness{LastSuccessAt: stale, CurrentSnapshotID: &id}, true, true},
 	}
 	for _, tc := range cases {
@@ -5200,7 +5674,10 @@ func TestSuiteDue_DormantNeverAdoptedSuites(t *testing.T) {
 
 // Spec C7 in the probe tree: the probes carry no validators, so the gate
 // compares content keys — the failing content is deferred until its retry
-// time, new content is attempted at once.
+// time, new content is attempted at its first probe. A deferred suite is
+// probed only by the scheduler's refresh check and at its retry (ruling
+// PE-3), so each step comes a refresh interval after the last check, and a
+// long retry time is set directly, as a long backoff would.
 func TestCheckFirst_GateComparesContentKeys(t *testing.T) {
 	r := newRetryRig(t, 0)
 	bad := r.release("bad", 0)
@@ -5210,7 +5687,14 @@ func TestCheckFirst_GateComparesContentKeys(t *testing.T) {
 	if r.ver.calls() != 1 || r.row().AdoptionFailCount != 1 {
 		t.Fatalf("setup: calls %d count %d", r.ver.calls(), r.row().AdoptionFailCount)
 	}
-	r.clock.advance(time.Minute)
+	retryIn := func(d time.Duration) {
+		t.Helper()
+		if err := r.cache.SetAdoptionNextRetry(context.Background(), "http", rigHost, rigSuite, r.clock.now().Add(d).Unix()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	retryIn(time.Hour)
+	r.clock.advance(16 * time.Minute)
 	r.check()
 	if r.ver.calls() != 1 || lastResult(r) != "changed_deferred" {
 		t.Fatalf("same content before its retry: calls %d result %q, want 1 changed_deferred", r.ver.calls(), lastResult(r))
@@ -5223,16 +5707,17 @@ func TestCheckFirst_GateComparesContentKeys(t *testing.T) {
 			t.Fatalf("a probe carried validator %q", e)
 		}
 	}
-	r.clock.advance(time.Minute + time.Second)
+	r.clock.advance(45 * time.Minute) // past the retry time
 	r.check()
 	if r.ver.calls() != 2 {
 		t.Fatalf("at the retry time: calls %d, want 2", r.ver.calls())
 	}
+	retryIn(time.Hour)
 	r.up.set(r.release("fixed", 0))
-	r.clock.advance(time.Minute)
+	r.clock.advance(16 * time.Minute)
 	r.check()
 	if r.ver.calls() != 3 || r.currentSnapshot() == nil {
-		t.Fatalf("new content: calls %d, adopted %v; want it attempted at once and adopted", r.ver.calls(), r.currentSnapshot() != nil)
+		t.Fatalf("new content: calls %d, adopted %v; want it attempted at its first probe and adopted", r.ver.calls(), r.currentSnapshot() != nil)
 	}
 }
 
@@ -5264,9 +5749,11 @@ func TestCheckFirst_UnsignedTransitionIsConfirmed(t *testing.T) {
 		t.Fatalf("freshness_check %v, want reason unsigned_unconfirmed and form unsigned", ev[len(ev)-1])
 	}
 	r.clock.advance(time.Minute)
-	r.check() // before the record's retry time: deferred, nothing recorded
-	if row := r.row(); row.AdoptionFailCount != 1 || lastResult(r) != "changed_deferred" {
-		t.Fatalf("inside the retry time: count %d result %q", row.AdoptionFailCount, lastResult(r))
+	lines := len(r.events("freshness_check"))
+	r.check() // before the record's retry time: paced (ruling PE-3), nothing probed or recorded
+	if row := r.row(); row.AdoptionFailCount != 1 || lastResult(r) != "changed_deferred" || len(r.events("freshness_check")) != lines {
+		t.Fatalf("inside the retry time: count %d result %q, %d new lines", row.AdoptionFailCount, lastResult(r),
+			len(r.events("freshness_check"))-lines)
 	}
 	// New bytes restart the confirmation.
 	r.unsignedRelease("u2", nil)
@@ -5395,12 +5882,249 @@ func TestIsQueuedResult_FirstAdoption(t *testing.T) {
 		}
 	}
 }
+
+// Ruling PE-3 (design review I-4): a never-adopted suite whose record is
+// active and not due is probed only by the scheduler's refresh check (its
+// last check at least periodic_refresh old) and at its due retry — a
+// client check (T1) inside that window asks nothing, so a deferred suite
+// no longer downloads its anchor in full at every client hit. A last check
+// stamped in the future reads as infinitely old (clock-step rule).
+func TestCheckFirst_DeferredSuiteIgnoresClientChecksUntilItsRetry(t *testing.T) {
+	r := newRetryRig(t, 0)
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	r.check() // the attempt fails: a record due in 2 minutes
+	probes := func() int { return len(r.up.etagsSent(rigAnchorURL)) }
+	if probes() != 1 || r.row().AdoptionFailCount != 1 {
+		t.Fatalf("setup: %d probes, record count %d", probes(), r.row().AdoptionFailCount)
+	}
+	lines := len(r.events("freshness_check"))
+	for range 10 { // client checks inside the window
+		r.clock.advance(10 * time.Second)
+		r.check()
+	}
+	if probes() != 1 || len(r.events("freshness_check")) != lines || r.ver.calls() != 1 {
+		t.Fatalf("client checks inside the window: %d probes, %d lines, %d attempts; want none",
+			probes()-1, len(r.events("freshness_check"))-lines, r.ver.calls()-1)
+	}
+	r.clock.advance(time.Minute + time.Second) // the retry is due
+	r.check()
+	if probes() != 2 || r.ver.calls() != 2 {
+		t.Fatalf("the due retry: %d probes, %d attempts; want one tree and one attempt", probes()-1, r.ver.calls()-1)
+	}
+	// A long retry time (as a long backoff would set), then the scheduler's
+	// refresh check: the last check is periodic_refresh (15 min) old.
+	if err := r.cache.SetAdoptionNextRetry(context.Background(), "http", rigHost, rigSuite, r.clock.now().Add(time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.advance(14 * time.Minute)
+	r.check()
+	if probes() != 2 {
+		t.Fatal("a check 14 minutes after the last one probed a deferred suite")
+	}
+	r.clock.advance(time.Minute)
+	r.check()
+	if probes() != 3 || lastResult(r) != "changed_deferred" {
+		t.Fatalf("the refresh check: %d probes, result %q; want one more tree, changed_deferred", probes()-2, lastResult(r))
+	}
+	future := r.clock.now().Add(24 * time.Hour).Unix()
+	row := r.row()
+	row.LastCheckAt = &future
+	if err := r.cache.UpdateSuiteFreshness(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.advance(time.Minute)
+	r.check()
+	if probes() != 4 {
+		t.Fatal("a deferred suite whose last check lies in the future was not probed")
+	}
+}
+
+// Spec C3 revision 8 (ruling PE-5, design review I-2): a probe that finds
+// a signature — InRelease, or Release.gpg — for a suite without a signed
+// current snapshot marks the suite's base, stamped now, before anything is
+// admitted, even when the signed adoption then fails; so stripping the
+// signatures later (an upstream, or a man-in-the-middle, answering 404)
+// never makes the suite an unsigned candidate. A marker write that fails
+// fails the check, and nothing is attempted.
+func TestCheckFirst_ProbedSignatureMarksTheBase(t *testing.T) {
+	for _, form := range []string{"inline", "detached"} {
+		t.Run(form, func(t *testing.T) {
+			r := newRetryRig(t, 0)
+			r.adopter.adoptUnsigned = true
+			if form == "inline" {
+				signed := r.release("signed", 0)
+				r.ver.reject(hashOf(signed))
+				r.up.set(signed)
+			} else {
+				rel, sig := r.releaseText("signed", 0), armoredSig("its signature")
+				r.ver.reject(contentKey(adoptionFormDetached, nil, rel, sig))
+				r.up.setAt(rigReleaseURL, rel)
+				r.up.setAt(rigReleaseGPGURL, sig)
+			}
+			r.check()
+			if r.currentSnapshot() != nil || r.ver.calls() != 1 {
+				t.Fatalf("setup: the signed attempt must fail (verifier calls %d)", r.ver.calls())
+			}
+			seen, ok, err := r.cache.SignedSeen(context.Background(), "http", rigHost, rigSuite)
+			if err != nil || !ok || seen != r.clock.now().Unix() {
+				t.Fatalf("marker = %d, %v, %v; want the probe's sighting at %d", seen, ok, err, r.clock.now().Unix())
+			}
+			// The signatures are stripped (both 404); the Release text stays.
+			r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 404})
+			r.unsignedRelease("stripped", &fetch.StatusError{Code: 404})
+			r.clock.advance(time.Hour)
+			r.check()
+			if row := r.row(); strOf(row.AdoptionFailReason) != cache.ReasonUnsignedDowngradeRefused || row.CurrentSnapshotID != nil {
+				t.Fatalf("record %q, current %v; want unsigned_downgrade_refused and nothing adopted",
+					strOf(row.AdoptionFailReason), row.CurrentSnapshotID)
+			}
+		})
+	}
+	t.Run("failed marker write", func(t *testing.T) {
+		r := newRetryRig(t, 0)
+		r.up.set(r.release("signed", 0))
+		db, err := sql.Open("sqlite", filepath.Join(r.cache.Dir(), "cache.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db.Close() }()
+		if _, err := db.Exec(`CREATE TRIGGER no_marks BEFORE INSERT ON suite_signed_seen
+  BEGIN SELECT RAISE(ABORT, 'marker writes fail'); END`); err != nil {
+			t.Fatal(err)
+		}
+		r.check()
+		if row := r.row(); row.CheckFailCount != 1 || row.CurrentSnapshotID != nil || r.ver.calls() != 0 {
+			t.Fatalf("row %+v, verifier calls %d: want a failed check and no attempt", row, r.ver.calls())
+		}
+	})
+}
+
+// Design review M-5 (spec C5 safeguard 4, before a slot): an unsigned
+// Release declaring more than unsignedMemberCap members is refused at the
+// check — unsigned_too_large recorded at its first observation, no
+// confirmation, no slot, nothing fetched — and stays refused at its retry.
+func TestCheckFirst_UnsignedTooLargeNeverTakesASlot(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopter.adoptUnsigned = true
+	big := make(map[string][]byte, unsignedMemberCap+1)
+	for i := 0; i <= unsignedMemberCap; i++ {
+		big[fmt.Sprintf("main/i18n/Translation-%d", i)] = []byte{byte(i)}
+	}
+	r.up.setAt(rigReleaseURL, datedRelease("big", 0, big))
+	before := adoptionTotalFor(t, rigHost)
+	r.check()
+	if row := r.row(); strOf(row.AdoptionFailReason) != cache.ReasonUnsignedTooLarge || lastResult(r) != "changed_deferred" {
+		t.Fatalf("first observation: record %q result %q, want unsigned_too_large, changed_deferred",
+			strOf(row.AdoptionFailReason), lastResult(r))
+	}
+	r.clock.advance(time.Hour)
+	r.check()
+	if row := r.row(); row.CurrentSnapshotID != nil || strOf(row.AdoptionFailReason) != cache.ReasonUnsignedTooLarge || row.AdoptionFailCount != 2 {
+		t.Fatalf("at the retry: current %v record %q/%d; want still refused, count 2",
+			row.CurrentSnapshotID, strOf(row.AdoptionFailReason), row.AdoptionFailCount)
+	}
+	if adoptionTotalFor(t, rigHost) != before || len(r.members.requested()) != 0 {
+		t.Fatal("a too-large unsigned suite ran an adoption")
+	}
+}
+
+// Spec C4 "Response classification": an unknown answer on Release.gpg (a
+// 503) is a failed check — never "absent", so never an unsigned candidate —
+// also with adoption.adopt_unsigned on. TestCheckFirst_ClassificationPerAnchor
+// runs with the knob off, which turns a wrongly unsigned candidate into a
+// failed check as well and hides the mix-up. (Proposed by the executability
+// review; kills X01.)
+func TestCheckFirst_UnknownSignatureIsNeverAnUnsignedCandidate(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopter.adoptUnsigned = true
+	r.unsignedRelease("u1", &fetch.StatusError{Code: 503})
+	before := checkTotal(t, "failed", rigHost)
+	r.check()
+	row := r.row()
+	if row.CheckFailCount != 1 || row.CurrentSnapshotID != nil || row.AdoptionFailCount != 0 {
+		t.Fatalf("row %+v, want a failed check: streak 1, no record, nothing adopted", row)
+	}
+	if got := checkTotal(t, "failed", rigHost) - before; got != 1 {
+		t.Fatalf("failed checks counted %v, want 1", got)
+	}
+}
+
+// Review Focus 2 / spec C3: a soft-404 (a 200 HTML page) on Release.gpg is
+// absent, never taken for a signature: with Release present the tree finds
+// an unsigned candidate, not the detached form. (Proposed by the
+// executability review; kills X04.)
+func TestCheckFirst_HTMLReleaseGPGIsNoSignature(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopter.adoptUnsigned = true
+	r.unsignedRelease("u1", nil)
+	r.up.setAt(rigReleaseGPGURL, []byte("<html><body>Not Found</body></html>\n"))
+	r.check()
+	row := r.row()
+	if row.CurrentSnapshotID != nil || strOf(row.AdoptionFailReason) != cache.ReasonUnsignedUnconfirmed || r.ver.calls() != 0 {
+		t.Fatalf("current %v, record %q, verifier calls %d: want the unsigned candidate's first observation, no detached attempt",
+			row.CurrentSnapshotID, strOf(row.AdoptionFailReason), r.ver.calls())
+	}
+}
+
+// Design note 14: a client-created Release.gpg row alone does not make a
+// never-adopted suite active (apt fetches it only after Release): with its
+// InRelease row reconstructed (request_count 0) the suite stays dormant.
+// (Proposed by the executability review; kills X12.)
+func TestCheckFirst_ReleaseGPGRowAloneIsNotClientInterest(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.up.set(r.release("v1", 0))
+	ctx := context.Background()
+	stale := testHex64
+	sig, err := r.adopter.writeBlobBytes(ctx, armoredSig("a signature"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.cache.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: rigHost,
+		Path: rigSuite + "/InRelease", BlobHash: &stale, UpstreamURL: rigAnchorURL, IsMetadata: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.cache.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: rigHost,
+		Path: rigSuite + "/Release.gpg", BlobHash: &sig, UpstreamURL: rigReleaseGPGURL, IsMetadata: true, RequestCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	r.check()
+	if n := len(r.up.etagsSent(rigAnchorURL)); n != 0 {
+		t.Fatalf("%d requests for a suite whose only client-created anchor row is Release.gpg, want 0", n)
+	}
+}
+
+// Design note 17 ("confirmed once"): bytes that passed the confirmation and
+// then failed their adoption attempt are not confirmed again — at the
+// record's retry time the attempt runs at once. (Proposed by the
+// executability review; kills X13.)
+func TestCheckFirst_ConfirmedUnsignedContentIsNotReconfirmed(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopter.adoptUnsigned = true
+	r.members.put(rigPkgsURL, []byte("not the declared Packages"))
+	r.unsignedRelease("u1", nil)
+	r.check() // first observation: unsigned_unconfirmed
+	r.clock.advance(6 * time.Minute)
+	r.check() // confirmed; the attempt fails on the member
+	row := r.row()
+	if row.CurrentSnapshotID != nil || strOf(row.AdoptionFailReason) == cache.ReasonUnsignedUnconfirmed {
+		t.Fatalf("setup: current %v record %q, want a failed attempt recorded", row.CurrentSnapshotID, strOf(row.AdoptionFailReason))
+	}
+	r.members.put(rigPkgsURL, r.pkgs) // the mirror synced
+	r.clock.advance(time.Hour)        // past the attempt's retry time
+	r.check()
+	if snap := r.currentSnapshot(); snap == nil || snap.Form != cache.FormUnsigned {
+		t.Fatalf("at the retry time: snapshot %+v, record %q; want the unsigned adoption at once",
+			snap, strOf(r.row().AdoptionFailReason))
+	}
+}
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test ./internal/freshness/ -run 'TestClassify_Table|TestAnchorURLs|TestCheckFirst_|TestSuiteDue_DormantNeverAdoptedSuites|TestIsQueuedResult_FirstAdoption'`
-Expected: FAIL — compile error, `undefined: probeClass` (and `classify`, `anchorURLs`, …).
+Run: `go test -gcflags=-e ./internal/freshness/ -run 'TestClassify_Table|TestAnchorURLs|TestCheckFirst_|TestSuiteDue_DormantNeverAdoptedSuites|TestIsQueuedResult_FirstAdoption'`
+Expected: FAIL — compile error naming `undefined: probeClass`, `classify`, `classUnknown`, `classPresent`, `classAbsent` and `anchorURLs` (the type checker stops at these; the other new names follow once they exist).
 
 - [ ] **Step 3: Implement**
 
@@ -5414,6 +6138,8 @@ package freshness
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 
@@ -5500,6 +6226,16 @@ func classify(res *fetch.ConditionalResult, err error, sniff func([]byte) bool, 
 	}
 	return probeOutcome{class: classUnknown, status: res.Status, err: errUnexpectedStatus}
 }
+
+// anchorAbsentKey is the content key of an anchor_absent record: the
+// absence has no content, and the constant can never equal a real content
+// key, so whatever upstream serves next is new content. A never-adopted
+// suite whose probe tree finds no anchor records it (ruling PE-2), and so
+// does an adopted suite whose current anchor is absent (anchorAbsent).
+var anchorAbsentKey = func() string {
+	s := sha256.Sum256([]byte("anchor_absent"))
+	return hex.EncodeToString(s[:])
+}()
 
 // Each anchor file's sniff (spec C3) for classify.
 var (
@@ -5604,19 +6340,48 @@ var errNoAnchor = errors.New("no anchor: InRelease and Release are absent")
 func (c *Checker) confirmGap() time.Duration { return max(c.cooldown, minConfirmGap) }
 
 // interested reports spec C4's client interest: last_requested_at within
-// the 7-day interest window. future reports a stamp in the future (a
-// backward clock step), which counts as interested: the interest gate
-// keeps work alive rather than delaying it, so a future stamp reads as
-// "now", as the reap cutoff reads it (spec C4 clock-step rule).
+// the 7-day interest window of now, in either direction. future reports a
+// stamp beyond the clock-step tolerance ahead of now (a backward clock
+// step), which the check reports.
+//
+// AIDEV-NOTE: the window is symmetric (design review M-3). A stamp up to
+// 7 d ahead keeps the suites that were interested before a backward step
+// of at most the window; one further ahead is dormant until a client
+// touches the suite again (TouchSuite rewrites the stamp with now, within
+// its coalescing hour). Reading any future stamp as interested would turn
+// every suite touched during a year-ahead boot into a first adoption.
 func interested(lastRequested *int64, now time.Time) (ok, future bool) {
 	if lastRequested == nil {
 		return false, false
 	}
 	last := time.Unix(*lastRequested, 0)
-	if last.After(now.Add(clockStepTolerance)) {
-		return true, true
+	d := now.Sub(last)
+	if d < 0 {
+		d = -d
 	}
-	return now.Sub(last) < interestWindow, false
+	return d < interestWindow, last.After(now.Add(clockStepTolerance))
+}
+
+// pacedFirst is ruling PE-3 (design review I-4): a never-adopted suite
+// whose failure or refusal record is active and not due, and whose last
+// check is younger than periodic_refresh, is not probed — a client check
+// (T1) inside that window asks nothing. The scheduler's stale check (the
+// last check at least periodic_refresh old) and the due retry still run
+// the probe tree, so new content of a failing suite is attempted within
+// one refresh interval. A last_check_at in the future reads as infinitely
+// old (spec C4 clock-step rule: a gate that delays work never freezes on
+// it); with periodic refresh off (0) nothing is paced.
+//
+// AIDEV-NOTE: the probe tree sends no validators (it must adopt an
+// unchanged upstream, spec C4), so without this pacing every client check
+// of a deferred suite downloaded its anchor in full — up to hundreds of
+// MiB a day per suite for a missing vendor key.
+func (c *Checker) pacedFirst(cur *cache.SuiteFreshness, gate retryGate, now time.Time) bool {
+	if !gate.active || gate.due || cur.LastCheckAt == nil {
+		return false
+	}
+	last := time.Unix(*cur.LastCheckAt, 0)
+	return !last.After(now.Add(clockStepTolerance)) && now.Sub(last) < c.refresh
 }
 
 // cachedAnchors reads suite's cached anchor url_path rows: the upstream
@@ -5712,21 +6477,37 @@ func (t probeTree) request(suite SuiteRef) *adoptionRequest {
 // signatureDenied reports a 401/403 on either signature file probed.
 func (t probeTree) signatureDenied() bool { return t.inRelease.authDenied() || t.sig.authDenied() }
 
+// signatureSeen reports a signature file probed present: InRelease (its
+// clearsign envelope passed the sniff) or Release.gpg.
+func (t probeTree) signatureSeen() bool {
+	return t.inRelease.class == classPresent || t.sig.class == classPresent
+}
+
 // checkFirst is spec C4 Dispatch 3 (adopter wired, no current snapshot).
 // A suite without client interest in the last 7 days, or without a
 // client-created InRelease or Release url_path row, is dormant: no request
-// and no write (the scheduler does not queue it either, see suiteDue).
-// Otherwise the probe tree runs without validators and the form found is
-// adopted — result first_adoption, or first_adoption_queued with no slot —
-// through the spec C7 gate (content keys only: the probes carry no
-// validators) and, for the unsigned form, spec C5's eligibility and
-// transition confirmation (unsignedFirst). A probe that ends unknown, a
-// tree that finds no anchor, and an unsigned candidate while
-// adoption.adopt_unsigned is off are failed checks.
+// and no write (the scheduler does not queue it either, see suiteDue). A
+// suite whose record is active and not due is paced (pacedFirst): no
+// request between the scheduler's refresh checks. Otherwise the probe tree
+// runs without validators and the form found is adopted — result
+// first_adoption, or first_adoption_queued with no slot — through the spec
+// C7 gate (content keys only: the probes carry no validators) and, for the
+// unsigned form, spec C5's eligibility, member cap and transition
+// confirmation (unsignedFirst). A probe that finds a signature marks the
+// suite's base first (Adopter.markSignatureSeen; a failed mark fails the
+// check). A probe that ends unknown, a tree that finds no anchor (which
+// also records anchor_absent, so the status page shows it: ruling PE-2),
+// and an unsigned candidate while adoption.adopt_unsigned is off are
+// failed checks. A read error of the anchor rows is logged at WARN with no
+// write and no backoff: a local fault, retried at the next check (at most
+// one per cooldown and per tick).
 //
 // AIDEV-NOTE: a first or unsigned request passes signedCurrent = false to
 // admit, so it never takes the last free slot that the reserved-slot rule
-// keeps for suites with a signed current snapshot (spec C4).
+// keeps for suites with a signed current snapshot (spec C4). The
+// freshness_check line of a tree result carries upstream_status 200, the
+// status of the anchor the form was found by; the absent probes before it
+// are not logged.
 func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) *adoptionRequest {
 	host, suitePath := suite.CanonicalHost, suite.SuitePath
 	ok, future := interested(cur.LastRequestedAt, now)
@@ -5752,6 +6533,11 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 
 	gate := c.retryGateFor(cur, now)
 	c.applyClamp(ctx, cur, gate, now)
+	if c.pacedFirst(cur, gate, now) {
+		c.logger.Debug("freshness: deferred never-adopted suite paced until its retry or the next refresh check",
+			"canonical_host", host, "suite_path", suitePath, "reason", gate.reason)
+		return nil
+	}
 
 	release, err := c.hostSem.Acquire(fetchCtx, host)
 	if err != nil {
@@ -5774,8 +6560,18 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 		c.failCheck(ctx, out, cur, suite, nowUnix, "probe", fmt.Errorf("%s: %w", t.endName, t.end.err))
 		return nil
 	case !t.found:
+		// Ruling PE-2: still a failed check (spec C4; the streak backs
+		// off), and the refusal state anchor_absent shows it on the status
+		// page; the record also paces the suite (pacedFirst).
+		c.recordAdoptionFailure(&adoptionRequest{suite: suite, key: anchorAbsentKey}, cache.ReasonAnchorAbsent)
 		c.failCheck(ctx, out, cur, suite, nowUnix, "probe", errNoAnchor)
 		return nil
+	}
+	if t.signatureSeen() {
+		if err := c.adopter.markSignatureSeen(ctx, suite, nowUnix); err != nil {
+			c.failCheck(ctx, out, cur, suite, nowUnix, "probe", fmt.Errorf("mark the signature seen: %w", err))
+			return nil
+		}
 	}
 	req := t.request(suite)
 	// Spec C7: the same content as the record's, before its retry time.
@@ -5804,8 +6600,10 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 
 // unsignedFirst applies spec C5's safeguards to an unsigned candidate of
 // a never-adopted suite, before a slot is taken: the knob (off: an error,
-// the check fails), never-downgrade (a signed-seen marker for the base:
-// refused, recorded as unsigned_downgrade_refused) and the transition
+// the check fails), never-downgrade (signed history, see
+// Adopter.unsignedEligible: refused, recorded as
+// unsigned_downgrade_refused), the member cap (unsigned_too_large; design
+// review M-5: a too-large suite never takes a slot) and the transition
 // confirmation — two observations of the same Release bytes at least
 // confirmGap apart, an hour when a signature file answered 401/403
 // (unsigned_unconfirmed until then; the streak, and with it
@@ -5823,12 +6621,16 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 // clock-step rule, which would read it as infinitely old and skip the
 // confirmation.
 func (c *Checker) unsignedFirst(ctx context.Context, cur *cache.SuiteFreshness, req *adoptionRequest, t probeTree, gate retryGate, now time.Time) (proceed bool, reason string, err error) {
-	switch err := c.adopter.unsignedEligible(ctx, req.suite, nil); {
+	switch err := c.adopter.unsignedEligible(ctx, req.suite); {
 	case errors.Is(err, ErrAdoptionUnsignedDowngradeRefused):
 		c.recordAdoptionFailure(req, cache.ReasonUnsignedDowngradeRefused)
 		return false, cache.ReasonUnsignedDowngradeRefused, nil
 	case err != nil:
 		return false, "", err
+	}
+	if err := unsignedTooLarge(req.releaseBytes); err != nil {
+		c.recordAdoptionFailure(req, cache.ReasonUnsignedTooLarge)
+		return false, cache.ReasonUnsignedTooLarge, nil
 	}
 	sameContent := gate.active && gate.hash == req.key
 	if sameContent && gate.reason != cache.ReasonUnsignedUnconfirmed && gate.reason != cache.ReasonUnsignedDowngradeRefused {
@@ -5847,9 +6649,28 @@ func (c *Checker) unsignedFirst(ctx context.Context, cur *cache.SuiteFreshness, 
 }
 ```
 
-Apply the dispatch, `isQueuedResult`, `suiteDue` and `recordAdoptionFailure` changes (and Step 1's rig change):
+Apply the dispatch, `isQueuedResult`, `suiteDue`, `recordAdoptionFailure`, `unsignedTooLarge`, `markSignatureSeen` and marker-note changes (`git apply`; Step 1 already applied the rig change, which is not in this patch):
 
 ```diff
+diff --git a/internal/cache/signed_seen.go b/internal/cache/signed_seen.go
+index f897a7d..1fe9ae9 100644
+--- a/internal/cache/signed_seen.go
++++ b/internal/cache/signed_seen.go
+@@ -30,7 +30,11 @@ type execer interface {
+ // markCreated: SuiteSeed.SignedSeenAt and every cached signed anchor in
+ // SuiteSeed.Cached, ruling PD-5), and only for an unproven creation the
+-// handler's markCachedSignedAnchors backstop. It is written only for
+-// suites with a suite_freshness row, and never for an unsigned snapshot or
+-// a plain-text anchor.
++// handler's markCachedSignedAnchors backstop; from phase E the freshness
++// checker too, through MarkSignedSeenBatch, when its probe finds a
++// sniff-passing InRelease or Release.gpg for a suite without a signed
++// current snapshot (spec C3 revision 8, design review I-2), and the
++// adopter's re-mark before an unsigned commit (ruling R-E1). It is written
++// only for suites with a suite_freshness row, and never for an unsigned
++// snapshot or a plain-text anchor.
+ func markSignedSeen(ctx context.Context, ex execer, scheme, host, base string, seenAt int64) error {
+ 	if _, err := ex.ExecContext(ctx, `
 diff --git a/internal/freshness/adoption_failure.go b/internal/freshness/adoption_failure.go
 index eb4a4b0..21987ef 100644
 --- a/internal/freshness/adoption_failure.go
@@ -5924,53 +6745,8 @@ index 8a6f099..27ae44d 100644
 +}
  
  // Check runs one freshness check of the suite. It is the entry point for
-diff --git a/internal/freshness/retry_rig_test.go b/internal/freshness/retry_rig_test.go
-index 043a27b..6d91334 100644
---- a/internal/freshness/retry_rig_test.go
-+++ b/internal/freshness/retry_rig_test.go
-@@ -48,4 +48,5 @@ type rigUpstream struct {
- 	ignoreValidators bool
- 	stall            bool
-+	fail             map[string]error    // per URL: the error Conditional returns (setFail)
- 	sent             map[string][]string // If-None-Match per URL, in order
- }
-@@ -53,4 +54,19 @@ type rigUpstream struct {
- func (u *rigUpstream) set(body []byte) { u.setAt(rigAnchorURL, body) }
- 
-+// setFail makes every request for url fail with err (nil restores the
-+// body or the default 404).
-+func (u *rigUpstream) setFail(url string, err error) {
-+	u.mu.Lock()
-+	defer u.mu.Unlock()
-+	if u.fail == nil {
-+		u.fail = map[string]error{}
-+	}
-+	if err == nil {
-+		delete(u.fail, url)
-+		return
-+	}
-+	u.fail[url] = err
-+}
-+
- func (u *rigUpstream) setAt(url string, body []byte) {
- 	u.mu.Lock()
-@@ -69,5 +85,5 @@ func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, eta
- 	u.sent[target.URL] = append(u.sent[target.URL], etag)
- 	body, ok := u.bodies[target.URL]
--	stall, ignore := u.stall, u.ignoreValidators
-+	stall, ignore, failErr := u.stall, u.ignoreValidators, u.fail[target.URL]
- 	u.mu.Unlock()
- 	if stall {
-@@ -75,4 +91,7 @@ func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, eta
- 		return nil, ctx.Err()
- 	}
-+	if failErr != nil {
-+		return nil, failErr
-+	}
- 	if !ok {
- 		return nil, &fetch.StatusError{Code: 404}
 diff --git a/internal/freshness/scheduler.go b/internal/freshness/scheduler.go
-index 54e777b..0d4e96e 100644
+index 54e777b..9108215 100644
 --- a/internal/freshness/scheduler.go
 +++ b/internal/freshness/scheduler.go
 @@ -330,5 +330,6 @@ func (q *schedQueues) has(key string) bool {
@@ -5981,13 +6757,14 @@ index 54e777b..0d4e96e 100644
 +// while it has client interest (spec C4 Dispatch 3).
  func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
  	nowU := now.Unix()
-@@ -343,4 +344,13 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
+@@ -343,4 +344,14 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
  		return false
  	}
 +	// Spec C4 Dispatch 3: with an adopter wired, a never-adopted suite
 +	// without client interest in the last 7 days is dormant and never
-+	// queued (its check would make no request anyway). A future stamp
-+	// counts as interested; checkFirst reports the clock step.
++	// queued (its check would make no request anyway). A stamp up to 7 days
++	// in the future counts as interested (interested: a symmetric window);
++	// checkFirst reports the clock step.
 +	if c.adopter != nil && s.CurrentSnapshotID == nil {
 +		if ok, _ := interested(s.LastRequestedAt, now); !ok {
 +			return false
@@ -5995,6 +6772,47 @@ index 54e777b..0d4e96e 100644
 +	}
  	if s.CheckFailCount > 0 && s.LastCheckAt != nil && *s.LastCheckAt <= future {
  		if nowU < *s.LastCheckAt+int64(backoffDelay(s.CheckFailCount)/time.Second) {
+diff --git a/internal/freshness/unsigned.go b/internal/freshness/unsigned.go
+index 589bf35..013317a 100644
+--- a/internal/freshness/unsigned.go
++++ b/internal/freshness/unsigned.go
+@@ -87,4 +87,36 @@ func unsignedCap(n int) error {
+ }
+ 
++// unsignedTooLarge is spec C5 safeguard 4 on an unsigned Release before a
++// slot is taken (design review M-5): unsignedCap over ParseRelease's merged
++// members. A Release that does not parse is not refused here: the adoption
++// reports the parse failure, and runShared applies the cap again.
++func unsignedTooLarge(release []byte) error {
++	members, err := ParseRelease(release)
++	if err != nil {
++		return nil
++	}
++	return unsignedCap(len(members))
++}
++
++// markSignatureSeen is the checker's signed-seen marker writer (spec C3,
++// revision 8; ruling PE-5, design review I-2): a probe found a sniff-passing
++// signature — InRelease, or Release.gpg — for a suite without a signed
++// current snapshot, so the cache has seen the suite signed even when no
++// client fetched the signature and no signed adoption commits. It marks
++// the suite's base (aptpath.MarkerBase, shared by the /. twin), stamped
++// seenAt, before the check admits any request; the caller fails the check
++// when it cannot.
++//
++// AIDEV-NOTE: it writes at every such probe, with no read first: the
++// marker keeps the newest stamp, its last sighting, which phase F's
++// orphan-marker sweep reads; the check's pacing bounds the writes. Without
++// this writer a signature only the checker ever saw (an unsigned suite's
++// clients never fetch one) could be stripped later and the suite adopted
++// unsigned.
++func (a *Adopter) markSignatureSeen(ctx context.Context, suite SuiteRef, seenAt int64) error {
++	return a.cache.MarkSignedSeenBatch(ctx, []cache.SignedSeenMark{{CanonicalScheme: suite.CanonicalScheme,
++		CanonicalHost: suite.CanonicalHost, Base: aptpath.MarkerBase(suite.SuitePath), SeenAt: seenAt}})
++}
++
+ // errRemarkPoolRead marks a re-mark that failed reading a pool file: an I/O
+ // fault, logged at ERROR (any other re-mark failure is a WARN).
 ```
 
 - [ ] **Step 4: Change the existing expectations the new dispatch changes**
@@ -6154,14 +6972,28 @@ Expected: PASS.
 | `classify`: 410 not absent | `TestClassify_Table`, `TestCheckFirst_ClassificationPerAnchor/absent_410…` |
 | `classify`: a 304 counts as present without validators | `TestClassify_Table` |
 | `interested`: `<` → `<=` (7 days is still interested) | `TestCheckFirst_DormantSuitesMakeNoRequest/interest_exactly_7_days_old` |
-| `interested`: a future stamp is not interested | `TestCheckFirst_DormantSuitesMakeNoRequest/interest_in_the_future`, `TestSuiteDue_DormantNeverAdoptedSuites` |
-| `cachedAnchors`: `request_count` ignored | `TestCheckFirst_DormantSuitesMakeNoRequest/a_reconstructed_anchor_row…` |
+| `interested`: a future stamp is not interested (`d = interestWindow` for `d < 0`) | `TestCheckFirst_DormantSuitesMakeNoRequest/interest_in_the_future`, `TestSuiteDue_DormantNeverAdoptedSuites` |
+| `interested`: any future stamp is interested (`d = 0` for `d < 0`; design review M-3) | `TestCheckFirst_DormantSuitesMakeNoRequest/interest_8_days_in_the_future`, `TestSuiteDue_DormantNeverAdoptedSuites` |
+| `cachedAnchors`: `request_count` ignored | `TestCheckFirst_DormantSuitesMakeNoRequest/a_reconstructed_anchor_row…`, `TestCheckFirst_ReleaseGPGRowAloneIsNotClientInterest` |
+| `cachedAnchors`: a `Release.gpg` row counts as client-created (X12) | `TestCheckFirst_ReleaseGPGRowAloneIsNotClientInterest` |
 | `suiteDue`: the dormancy clause removed | `TestSuiteDue_DormantNeverAdoptedSuites` |
 | `checkLocked`: Dispatch 3 never taken (the phase D path) | `TestCheckFirst_AdoptsUnchangedUpstreamOnTheFirstCheck`, `…ProbeTreeAdoptsTheFormFound`, `…ClassificationPerAnchor`, `…DormantSuitesMakeNoRequest` |
 | `runProbeTree`: an unknown `InRelease` treated as absent | `TestCheckFirst_ClassificationPerAnchor/unknown_…_at_…InRelease` |
-| `unsignedFirst`: the gap compared with 0 | `TestCheckFirst_UnsignedTransitionIsConfirmed`, `TestCheckFirst_UnsignedAfterADeniedSignatureWaitsAnHour` |
+| `runProbeTree`: an unknown `Release.gpg` → an unsigned candidate (X01) | `TestCheckFirst_UnknownSignatureIsNeverAnUnsignedCandidate` |
+| `probe`: the `Release.gpg` sniff always passes (X04) | `TestCheckFirst_HTMLReleaseGPGIsNoSignature` |
+| `checkFirst`: no `anchor_absent` record when the tree finds no anchor (PE-2) | `TestCheckFirst_ClassificationPerAnchor/no_anchor_at_all` |
+| `pacedFirst` always false (PE-3) | `TestCheckFirst_DeferredSuiteIgnoresClientChecksUntilItsRetry`, `TestCheckFirst_UnsignedTransitionIsConfirmed` |
+| `pacedFirst` ignores the retry being due | `TestCheckFirst_DeferredSuiteIgnoresClientChecksUntilItsRetry`, `TestCheckFirst_UnsignedTransitionIsConfirmed`, `TestCheckFirst_ConfirmedUnsignedContentIsNotReconfirmed` |
+| `pacedFirst` ignores the refresh age (paced whenever not due) | `TestCheckFirst_DeferredSuiteIgnoresClientChecksUntilItsRetry`, `TestCheckFirst_GateComparesContentKeys` |
+| `pacedFirst` reads a future last check as recent | `TestCheckFirst_DeferredSuiteIgnoresClientChecksUntilItsRetry` |
+| `checkFirst`: no marker for a probed signature (I-2) | `TestCheckFirst_ProbedSignatureMarksTheBase/{inline, detached, failed_marker_write}` |
+| `signatureSeen` ignores `Release.gpg` | `TestCheckFirst_ProbedSignatureMarksTheBase/detached` |
+| `checkFirst`: a failed marker write ignored | `TestCheckFirst_ProbedSignatureMarksTheBase/failed_marker_write` |
+| `unsignedFirst`: the gap compared with 0 (`>= gap-gap`) | `TestCheckFirst_UnsignedTransitionIsConfirmed`, `TestCheckFirst_UnsignedAfterADeniedSignatureWaitsAnHour` |
 | `unsignedFirst`: the 401/403 gap not applied | `TestCheckFirst_UnsignedAfterADeniedSignatureWaitsAnHour` |
-| `unsignedFirst`: no eligibility check | `TestCheckFirst_UnsignedRefusedWithSignedHistory` |
+| `unsignedFirst`: no eligibility check | `TestCheckFirst_UnsignedRefusedWithSignedHistory`, `TestCheckFirst_UnsignedDisabledIsAFailedCheck`, `TestCheckFirst_ProbedSignatureMarksTheBase/{inline, detached}` |
+| `unsignedFirst`: no member cap before the slot (M-5) | `TestCheckFirst_UnsignedTooLargeNeverTakesASlot` |
+| `unsignedFirst`: confirmed content confirmed again (X13) | `TestCheckFirst_ConfirmedUnsignedContentIsNotReconfirmed` |
 | `recordAdoptionFailure`: `restartsStreak` never true | `TestCheckFirst_UnsignedTransitionIsConfirmed` |
 | `isQueuedResult` without `first_adoption_queued` | `TestIsQueuedResult_FirstAdoption`, `TestRun_ReoffersWhenASlotFrees`, `TestRun_OfferThatLosesTheSlotKeepsItsPlace`, `TestRun_HeldOfferIsRetriedOnTheNextWake`, `TestRun_ClientRefusedSuiteIsParkedByTheNextTick` |
 | `checkFirst`: `admit(…, signedCurrent = true, …)` | `TestCheck_ReservedSlotGoesToSignedCurrent` |
@@ -6171,10 +7003,12 @@ Expected: PASS.
 ```bash
 gofmt -l internal/freshness/probe.go internal/freshness/first_adoption.go internal/freshness/first_adoption_test.go \
   internal/freshness/check.go internal/freshness/freshness.go internal/freshness/scheduler.go internal/freshness/adoption_failure.go \
+  internal/freshness/unsigned.go internal/cache/signed_seen.go \
   internal/freshness/retry_rig_test.go internal/freshness/capacity_test.go internal/freshness/reoffer_test.go \
   internal/freshness/freshness_test.go internal/handler/phase2_migration_test.go
 git add internal/freshness/probe.go internal/freshness/first_adoption.go internal/freshness/first_adoption_test.go \
   internal/freshness/check.go internal/freshness/freshness.go internal/freshness/scheduler.go internal/freshness/adoption_failure.go \
+  internal/freshness/unsigned.go internal/cache/signed_seen.go \
   internal/freshness/retry_rig_test.go internal/freshness/capacity_test.go internal/freshness/reoffer_test.go \
   internal/freshness/freshness_test.go internal/handler/phase2_migration_test.go
 git commit -m "Adopt never-adopted suites with client interest on their first check, in the form their upstream publishes"
@@ -6185,21 +7019,88 @@ git commit -m "Adopt never-adopted suites with client interest on their first ch
 Spec C4 Dispatch 1 and 2 with an adopter wired (Phase 1 keeps the Task 4 algorithm):
 
 - **Detached current:** `InRelease` is probed on every check (`lateralInline`); present → an inline request, result `form_changed` (`changed_queued` without a slot). An absent or unknown `InRelease`, or the failing content before its retry time, leaves the check to the detached path, whose "unchanged" then does not clear the lateral content's record (otherwise every other check would attempt it again; spec C7's bounded attempts).
-- **Current anchor absent** (inline `InRelease`, detached `Release`, unsigned `Release`: 401/403/404/410 or a 200 failing the sniff, through `classify`): `anchorAbsent`. The first observation records the refusal state `anchor_absent` (deviation 1: recorded at once, so it is visible and survives restarts); at the record's retry time, once the absence has lasted `max(cooldown, 5 min)`, the probe tree runs without validators and the other signed form found is adopted (`form_changed`); the same form and content found again is "unchanged"; an unsigned candidate or nothing is recorded again — never unsigned from signed. A record from an adoption attempt (the lateral move failed) keeps its own schedule. `last_success_at` is not bumped (spec C4) and the streak resets (ruling R-E4), so such a suite is checked every tick at the cost of one anchor request (Review Focus item 3).
-- **Unsigned current** (`checkUnsigned`, Dispatch 2): `InRelease` present → inline request; else `Release.gpg` present → `Release` and a detached request — an upgrade, `form_changed`; an unknown signature probe fails the check (a signature may be there). Both absent → the conditional GET of `Release`; changed → an unsigned request at once (spec C5 safeguard 2: no re-confirmation), refused as `unsigned_downgrade_refused` when a signed-seen marker appeared for the base; the knob off is a failed check. A reaped `Release` anchor is reconstructed through the form (`TestCheck_UnsignedRecoversWhenReleaseAnchorMissing`, spec §7).
+- **Cross-form requests record no validators (design review I-1):** a lateral move, an unsigned suite's upgrade and a tree's request of another form fetch another anchor file than the one the check conditional-GETs, so `adoptionRequest.crossForm` keeps their validators out of the failure record (a successful adoption still stores them). While a record without validators is active and not due, the GET carries the current anchor's own validators, and a 304 is `changed_deferred` only when the record's own were sent (`retryGate.recordValidators`), `not_modified` otherwise. Before, a detached suite behind a CDN that sends `Last-Modified` but no ETag sent its failing lateral `InRelease`'s stamp on `Release`, got 304 for a new `Release` of the same publish, and froze (`TestCheck_DetachedSuiteKeepsAdoptingWhileItsLateralInReleaseFails`, with the rig's new `setLastModified` mode).
+- **Current anchor absent** (inline `InRelease`, detached `Release`, unsigned `Release`: 401/403/404/410 or a 200 failing the sniff, through `classify`): `anchorAbsent`. The first observation records the refusal state `anchor_absent` (deviation 1: recorded at once, so it is visible and survives restarts); at the record's retry time, once the absence has lasted `max(cooldown, 5 min)`, the probe tree runs without validators (`anchorFoundAgain`): the other signed form found is adopted (`form_changed`); the same form and content found again is "unchanged"; an unsigned suite's own form found again with new bytes is its update (design review M-16: result `changed`, after the unsigned refusals); an unsigned candidate of a signed suite, or nothing, is recorded again — never unsigned from signed. A record from an adoption attempt (the lateral move failed) keeps its own schedule. `last_success_at` is not bumped (spec C4) and the streak resets (ruling R-E4). A future `adoption_fail_first_at` never confirms the absence (deviation 2, design review M-19: `TestCheck_AbsentAnchorWithAFutureFirstAtWaitsAnotherGap`).
+- **`anchor_absent` is paced by its record (ruling PE-2):** while the record is active and not due, `checkLocked` makes no request (`pacedAbsent`; client checks ask nothing) and `suiteDue` does not queue the suite, so an absent anchor costs one request per retry (2 min doubling to 1 h, about 24 a day after the first hour), not one per tick and per client check forever; a `next_retry_at` beyond the legitimate horizon is not paced, so the check clamps it. The stale-suite WARN leaves out adopted suites in a refusal state (they keep an old `last_success_at` on purpose and are visible on their own); the gauge still counts them (design review M-13).
+- **Detached current, signature absent (design review M-14):** a changed `Release` whose `Release.gpg` is absent (404, or a 200 failing its sniff) records `anchor_absent` (unless the lateral `InRelease`'s record is held), keeps `last_success_at`, and is paced like any `anchor_absent` suite — before, it cost three requests and a WARN per tick, forever. A signature fetch that ends unknown keeps the old behaviour (WARN, result `changed`, retried at the next tick).
+- **Unsigned current** (`checkUnsigned`, Dispatch 2): `InRelease` present → inline request; else `Release.gpg` present → `Release` and a detached request — an upgrade, `form_changed`; either signature found first marks the suite's base (`Adopter.markSignatureSeen`, design review I-2: the suite's clients never fetch a signature, so only this probe can record that the suite was seen signed; a failed mark fails the check); an unknown signature probe fails the check (a signature may be there). Both absent → the conditional GET of `Release`; changed → an unsigned request at once (spec C5 safeguard 2: no re-confirmation) after the unsigned refusals before a slot (`unsignedRefusal`, shared with Task 6's `unsignedFirst`: signed history → `unsigned_downgrade_refused`; more than 1,000 members → `unsigned_too_large`, design review M-5); the knob off is a failed check. A reaped `Release` anchor is reconstructed through the form (`TestCheck_UnsignedRecoversWhenReleaseAnchorMissing`, spec §7). The absent-anchor tree marks the base too when it finds a signature for an unsigned suite.
 - **`detectForm`** dispatches the unsigned form; **repair and reconcile** take the reserved slot only for a signed current snapshot (`repairRequest.signed`, set by `finishCheck`; `Reconcile` reads the snapshot's form), the overview's "E:" carry-forward.
 
 Deferred minors (`freshness.go`): B-30 (`adoption_reconcile_failed` gains `stage`: `decision`, `heal`, `on_demand`), B-31 (a repair deferred for want of a slot is counted, `acu_repair_deferred_total{host}`), B-32 (weighed: a signed suite's repair keeps the reserved-slot right; AIDEV-NOTE at `planRepair`), B-37 (kept: a deterministic repair panic is logged, not recorded — no record keyed on a snapshot exists in v7; AIDEV-NOTE at `spawnRepair`).
 
 **Files:**
 - Create: `internal/freshness/current_form.go`, `internal/freshness/current_form_test.go`
-- Modify: `internal/freshness/check.go` (`checkLocked`, `detectForm`, `finishCheck`, `checkInline`, `checkDetached`), `internal/freshness/freshness.go` (`repairRequest.signed`, `planRepair`, `spawnRepair`, `Reconcile`), `internal/freshness/metrics.go` (`repairDeferredTotal`); expectations in `internal/freshness/freshness_test.go`, `internal/freshness/capacity_test.go`
+- Modify: `internal/freshness/check.go` (`checkLocked`: the dispatch and `anchor_absent` pacing; `detectForm`, `finishCheck`, `steadyResult`, `checkInline`, `checkDetached`), `internal/freshness/freshness.go` (`adoptionRequest.crossForm`, `retryGate.recordValidators`/`validators`, `repairRequest.signed`, `planRepair`, `spawnRepair`, `Reconcile`), `internal/freshness/adoption_failure.go` (no validators for a cross-form record), `internal/freshness/first_adoption.go` (`unsignedRefusal`, used by `unsignedFirst`), `internal/freshness/scheduler.go` (`suiteDue`'s `anchor_absent` pacing, `staleSuiteCounts` and the stale WARN), `internal/freshness/metrics.go` (`repairDeferredTotal`), `internal/freshness/retry_rig_test.go` (`rigUpstream.setLastModified`); expectations in `internal/freshness/freshness_test.go`, `internal/freshness/capacity_test.go`
 
 **Interfaces:**
-- Consumes: Task 6's `classify`, `classAbsent`, `probe`, `anchorURLsFor`, `cachedAnchors`, `runProbeTree`, `probeTree.request`, `confirmGap`, `restartsStreak` (via `recordAdoptionFailure`), `rigUpstream.setFail`, `retryRig.currentSnapshot`, `retryRig.unsignedRelease`; Task 5's `retryRig.adopt`, `adoptDetached`, `asInRelease`; Task 4's `admit`, `baseline`, `steadyResult`; Task 3's `Adopter.RunUnsigned`, `unsignedEligible`, `formOfSnapshot`; Task 1's `aptpath.AnchorPaths`, `SuiteSnapshot.AnchorHash`.
-- Produces (package freshness): `anchorAbsentKey`; `(probeTree).body(name string) []byte`, `(probeTree).sameAs(snap *cache.SuiteSnapshot) bool`; `(*Checker).anchorAbsent(ctx, fetchCtx, out, cur, suite, now, nowUnix, form adoptionForm, o probeOutcome, gate retryGate, signedCurrent bool) *adoptionRequest`; `(*Checker).lateralInline(ctx, fetchCtx, out, cur, suite, urls anchorURLs, gate retryGate, signedCurrent bool, nowUnix int64) (req *adoptionRequest, done, held bool)`; `(*Checker).upgradeProbe(ctx, fetchCtx, out, cur, suite, urls, gate, nowUnix) (req *adoptionRequest, done bool)`; `(*Checker).checkUnsigned(ctx, fetchCtx, out, cur, suite, now, nowUnix) (*adoptionRequest, *repairRequest)`; `repairRequest.signed`; metric `acu_repair_deferred_total{host}` (`repairDeferredTotal`). Test helpers: `(*retryRig).adoptUnsigned(label string) []byte`, `hostCounter(t, name, host string) float64` (`current_form_test.go`).
+- Consumes: Task 6's `classify`, `classAbsent`, `probe`, `anchorURLsFor`, `cachedAnchors`, `runProbeTree`, `probeTree.request`, `probeTree.signatureSeen`, `confirmGap`, `restartsStreak` (via `recordAdoptionFailure`), `anchorAbsentKey`, `Adopter.markSignatureSeen`, `unsignedTooLarge`, `rigUpstream.setFail`, `retryRig.currentSnapshot`, `retryRig.unsignedRelease`; Task 5's `retryRig.adopt`, `adoptDetached`, `asInRelease`; Task 4's `admit`, `baseline`, `steadyResult`; Task 3's `Adopter.RunUnsigned`, `unsignedEligible`, `formOfSnapshot`; Task 1's `aptpath.AnchorPaths`, `SuiteSnapshot.AnchorHash`.
+- Produces (package freshness): `pacedAbsent(g retryGate) bool`; `adoptionRequest.crossForm`; `(retryGate).recordValidators() bool`; `(*Checker).unsignedRefusal(ctx, req) (string, error)`; `(probeTree).body(name string) []byte`, `(probeTree).sameAs(snap *cache.SuiteSnapshot) bool`; `(*Checker).anchorAbsent(ctx, fetchCtx, out, cur, suite, now, nowUnix, form adoptionForm, o probeOutcome, gate retryGate, signedCurrent bool) *adoptionRequest`; `(*Checker).anchorFoundAgain(ctx, out, cur, suite, nowUnix, form adoptionForm, t probeTree, signedCurrent bool) *adoptionRequest`; `(*Checker).lateralInline(ctx, fetchCtx, out, cur, suite, urls anchorURLs, gate retryGate, signedCurrent bool, nowUnix int64) (req *adoptionRequest, done, held bool)`; `(*Checker).upgradeProbe(ctx, fetchCtx, out, cur, suite, urls, gate, nowUnix) (req *adoptionRequest, done bool)`; `(*Checker).checkUnsigned(ctx, fetchCtx, out, cur, suite, now, nowUnix) (*adoptionRequest, *repairRequest)`; `repairRequest.signed`; metric `acu_repair_deferred_total{host}` (`repairDeferredTotal`); `staleSuiteCounts` returns `(adopted, unadopted, refused int)`. Test helpers: `(*rigUpstream).setLastModified(url, stamp string)` (`retry_rig_test.go`); `(*retryRig).adoptUnsigned(label string) []byte`, `hostCounter(t, name, host string) float64` (`current_form_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
+
+Give the rig upstream a `Last-Modified`-only mode (`internal/freshness/retry_rig_test.go`, `git apply`):
+
+```diff
+diff --git a/internal/freshness/retry_rig_test.go b/internal/freshness/retry_rig_test.go
+index 6d91334..f8e16e6 100644
+--- a/internal/freshness/retry_rig_test.go
++++ b/internal/freshness/retry_rig_test.go
+@@ -41,6 +41,9 @@ func rigETag(body []byte) string { return "e-" + hashOf(body)[:12] }
+ // rigUpstream answers the checker's conditional GETs by URL: 200 with the
+ // body and its ETag, or 304 when If-None-Match equals that ETag (unless
+-// validators are ignored). A URL without a body answers 404. While
+-// stalled, every request blocks until its context ends.
++// validators are ignored). A URL given a Last-Modified stamp
++// (setLastModified) answers like a CDN that sends no ETag: 200 with the
++// stamp, or 304 when If-Modified-Since is at or after it. A URL without a
++// body answers 404. While stalled, every request blocks until its context
++// ends.
+ type rigUpstream struct {
+ 	mu               sync.Mutex
+@@ -49,7 +52,19 @@ type rigUpstream struct {
+ 	stall            bool
+ 	fail             map[string]error    // per URL: the error Conditional returns (setFail)
++	modified         map[string]string   // per URL: Last-Modified, sortable (setLastModified)
+ 	sent             map[string][]string // If-None-Match per URL, in order
+ }
+ 
++// setLastModified makes url answer with Last-Modified stamp and no ETag
++// (stamps compare as strings: use one sortable format).
++func (u *rigUpstream) setLastModified(url, stamp string) {
++	u.mu.Lock()
++	defer u.mu.Unlock()
++	if u.modified == nil {
++		u.modified = map[string]string{}
++	}
++	u.modified[url] = stamp
++}
++
+ func (u *rigUpstream) set(body []byte) { u.setAt(rigAnchorURL, body) }
+ 
+@@ -81,9 +96,9 @@ func (u *rigUpstream) etagsSent(url string) []string {
+ }
+ 
+-func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, etag, _ string, _ int64) (*fetch.ConditionalResult, error) {
++func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, etag, lastmod string, _ int64) (*fetch.ConditionalResult, error) {
+ 	u.mu.Lock()
+ 	u.sent[target.URL] = append(u.sent[target.URL], etag)
+ 	body, ok := u.bodies[target.URL]
+-	stall, ignore, failErr := u.stall, u.ignoreValidators, u.fail[target.URL]
++	stall, ignore, failErr, stamp := u.stall, u.ignoreValidators, u.fail[target.URL], u.modified[target.URL]
+ 	u.mu.Unlock()
+ 	if stall {
+@@ -97,4 +112,10 @@ func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, eta
+ 		return nil, &fetch.StatusError{Code: 404}
+ 	}
++	if stamp != "" {
++		if !ignore && lastmod != "" && lastmod >= stamp {
++			return &fetch.ConditionalResult{Status: 304, LastModified: stamp}, nil
++		}
++		return &fetch.ConditionalResult{Status: 200, Body: body, LastModified: stamp}, nil
++	}
+ 	tag := rigETag(body)
+ 	if !ignore && etag != "" && etag == tag {
+```
 
 Create `internal/freshness/current_form_test.go`:
 
@@ -6209,8 +7110,13 @@ package freshness
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -6218,6 +7124,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // adoptUnsigned makes the rig suite's current snapshot an unsigned
@@ -6261,7 +7168,10 @@ func TestCheck_DetachedSuiteMovesToInlineWhenInReleaseAppears(t *testing.T) {
 
 // Spec C7 in the lateral probe: an InRelease that failed stays deferred
 // until its retry time, and the detached anchor's "unchanged" does not
-// clear its record (otherwise every other check would attempt it).
+// clear its record (otherwise every other check would attempt it). The
+// record holds no validators (a cross-form request), so the detached GET
+// carries the current Release's own, and its 304 is not_modified (design
+// review I-1).
 func TestCheck_LateralFailingContentKeepsItsRecord(t *testing.T) {
 	r := newRetryRig(t, 0)
 	r.adoptDetached()
@@ -6278,6 +7188,9 @@ func TestCheck_LateralFailingContentKeepsItsRecord(t *testing.T) {
 	}
 	if r.ver.calls() != 1 || r.row().AdoptionFailCount != 1 {
 		t.Fatalf("before the retry time: calls %d count %d, want 1 and the record kept", r.ver.calls(), r.row().AdoptionFailCount)
+	}
+	if lastResult(r) != "not_modified" {
+		t.Fatalf("result %q, want not_modified: the detached anchor answered its own validators", lastResult(r))
 	}
 	r.clock.advance(2 * time.Minute)
 	r.check()
@@ -6365,31 +7278,66 @@ func TestCheck_AbsentAnchorNeverMovesToUnsigned(t *testing.T) {
 
 // Review Focus 3: a detached repository whose upstream publishes a new
 // Release but drops Release.gpg (a vendor that stopped signing, or a
-// signature lost in a mirror sync) keeps its signed snapshot, says so on
-// every check (WARN, result changed) and is never adopted unsigned — with
-// adoption.adopt_unsigned on and long past the unsigned confirmation gap.
-// Its current anchor, Release, is present, so this is not anchor_absent.
+// signature lost in a mirror sync) keeps its signed snapshot and is never
+// adopted unsigned — with adoption.adopt_unsigned on and long past the
+// unsigned confirmation gap. An absent signature (404) is the refusal
+// state anchor_absent, paced by its record (design review M-14: before,
+// it cost three requests and a WARN per tick, forever); a signature fetch
+// that fails unknown (503) is retried at every check, with a WARN.
 func TestCheck_DetachedSuiteThatDropsItsSignatureNeverGoesUnsigned(t *testing.T) {
-	r := newRetryRig(t, 0)
-	r.adoptDetached()
-	r.adopter.adoptUnsigned = true
-	before := r.currentSnapshot()
-	r.up.setAt(rigReleaseURL, r.releaseText("v2", 0))
-	r.up.setFail(rigReleaseGPGURL, &fetch.StatusError{Code: 404})
-	for i := 0; i < 6; i++ {
-		r.clock.advance(10 * time.Minute)
-		r.check()
-	}
-	if snap := r.currentSnapshot(); snap.SnapshotID != before.SnapshotID || snap.Form != cache.FormDetached {
-		t.Fatalf("snapshot %+v, want the signed detached one kept", snap)
-	}
-	if lastResult(r) != "changed" || r.ver.calls() != 0 || r.row().AdoptionFailCount != 0 {
-		t.Fatalf("result %q, %d verifications, record %q/%d; want changed, none, none", lastResult(r), r.ver.calls(),
-			strOf(r.row().AdoptionFailReason), r.row().AdoptionFailCount)
-	}
-	if n := len(r.events("freshness: Release.gpg fetch failed; deferring adoption")); n != 6 {
-		t.Fatalf("%d WARN lines over six checks, want one per check", n)
-	}
+	t.Run("absent", func(t *testing.T) {
+		r := newRetryRig(t, 0)
+		r.adoptDetached()
+		r.adopter.adoptUnsigned = true
+		before := r.currentSnapshot()
+		r.up.setAt(rigReleaseURL, r.releaseText("v2", 0))
+		r.up.setFail(rigReleaseGPGURL, &fetch.StatusError{Code: 404})
+		gpgBefore, success := len(r.up.etagsSent(rigReleaseGPGURL)), r.row().LastSuccessAt
+		for i := 0; i < 6; i++ {
+			r.clock.advance(10 * time.Minute)
+			r.check()
+		}
+		if snap := r.currentSnapshot(); snap.SnapshotID != before.SnapshotID || snap.Form != cache.FormDetached {
+			t.Fatalf("snapshot %+v, want the signed detached one kept", snap)
+		}
+		if lastResult(r) != "anchor_absent" || r.ver.calls() != 0 || strOf(r.row().AdoptionFailReason) != cache.ReasonAnchorAbsent {
+			t.Fatalf("result %q, %d verifications, record %q; want anchor_absent, none, anchor_absent", lastResult(r),
+				r.ver.calls(), strOf(r.row().AdoptionFailReason))
+		}
+		// Due at +2, +4, +8, +16 and +32 min after each observation: the
+		// check at 50 min is inside the record's retry time.
+		if n := len(r.up.etagsSent(rigReleaseGPGURL)) - gpgBefore; n != 5 {
+			t.Fatalf("%d signature requests over six checks, want 5 (one check paced)", n)
+		}
+		if n := len(r.events("freshness: Release.gpg fetch failed; deferring adoption")); n != 0 {
+			t.Fatalf("%d WARN lines for an absent signature, want none (a refusal state)", n)
+		}
+		if got := i64Of(r.row().LastSuccessAt); got != i64Of(success) {
+			t.Fatalf("last_success_at moved to %d, want it kept at %d (an absent anchor, spec C4)", got, i64Of(success))
+		}
+	})
+	t.Run("unknown", func(t *testing.T) {
+		r := newRetryRig(t, 0)
+		r.adoptDetached()
+		r.adopter.adoptUnsigned = true
+		before := r.currentSnapshot()
+		r.up.setAt(rigReleaseURL, r.releaseText("v2", 0))
+		r.up.setFail(rigReleaseGPGURL, &fetch.StatusError{Code: 503})
+		for i := 0; i < 6; i++ {
+			r.clock.advance(10 * time.Minute)
+			r.check()
+		}
+		if snap := r.currentSnapshot(); snap.SnapshotID != before.SnapshotID || snap.Form != cache.FormDetached {
+			t.Fatalf("snapshot %+v, want the signed detached one kept", snap)
+		}
+		if lastResult(r) != "changed" || r.ver.calls() != 0 || r.row().AdoptionFailCount != 0 {
+			t.Fatalf("result %q, %d verifications, record %q/%d; want changed, none, none", lastResult(r), r.ver.calls(),
+				strOf(r.row().AdoptionFailReason), r.row().AdoptionFailCount)
+		}
+		if n := len(r.events("freshness: Release.gpg fetch failed; deferring adoption")); n != 6 {
+			t.Fatalf("%d WARN lines over six checks, want one per check", n)
+		}
+	})
 }
 
 // Spec C4 "Response classification" on the current anchor: a soft 404
@@ -6624,12 +7572,461 @@ func TestCheck_RepairOfAnUnsignedSuiteNeverTakesTheReservedSlot(t *testing.T) {
 		})
 	}
 }
+
+// Design review I-1: a record's validators belong to the anchor file its
+// request fetched. A detached suite whose lateral InRelease keeps failing
+// (a key not imported), behind a CDN that sends Last-Modified but no ETag,
+// keeps adopting its new Release: the lateral record holds no validators,
+// so the Release GET carries the current Release's own — never the
+// InRelease's Last-Modified, which answers 304 for a Release of the same
+// publish and froze the suite.
+func TestCheck_DetachedSuiteKeepsAdoptingWhileItsLateralInReleaseFails(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.up.setLastModified(rigReleaseURL, "2026-01-01T00:00:00Z")
+	r.up.setLastModified(rigReleaseGPGURL, "2026-01-01T00:00:00Z")
+	r.adoptDetached()
+	// One publish: an InRelease the cache cannot verify, a new Release and its signature.
+	in := r.release("v2", 0)
+	r.ver.reject(hashOf(in))
+	r.up.set(in)
+	rel := r.releaseText("v2", 0)
+	r.up.setAt(rigReleaseURL, rel)
+	r.up.setAt(rigReleaseGPGURL, armoredSig("v2 sig"))
+	for _, url := range []string{rigAnchorURL, rigReleaseURL, rigReleaseGPGURL} {
+		r.up.setLastModified(url, "2026-02-01T00:00:00Z")
+	}
+	r.clock.advance(time.Minute)
+	r.check() // the lateral attempt fails
+	if row := r.row(); r.ver.calls() != 1 || row.AdoptionFailCount != 1 || row.AdoptionFailLastMod != nil || row.AdoptionFailETag != nil {
+		t.Fatalf("setup: calls %d, record %d with validators %v/%v; want the lateral failure recorded without validators",
+			r.ver.calls(), row.AdoptionFailCount, strOf(row.AdoptionFailETag), strOf(row.AdoptionFailLastMod))
+	}
+	r.clock.advance(time.Minute) // before the record's retry time
+	r.check()
+	if snap := r.currentSnapshot(); snap.Form != cache.FormDetached || strOf(snap.ReleaseHash) != hashOf(rel) {
+		t.Fatalf("snapshot %+v, result %q; want the detached v2 adopted while the lateral InRelease is deferred",
+			snap, lastResult(r))
+	}
+}
+
+// Spec C3 revision 8 (ruling PE-5, design review I-2): an unsigned suite
+// whose upstream starts signing is marked as seen signed by the upgrade
+// probe — even when the upgrade then fails (a key not imported) — so a
+// later strip of both signature files (a man-in-the-middle answering 404)
+// never updates it unsigned: refused as unsigned_downgrade_refused, the
+// snapshot kept. A marker write that fails fails the check.
+func TestCheck_UnsignedSuiteSeenSignedNeverUpdatesUnsigned(t *testing.T) {
+	t.Run("stripped after a failed upgrade", func(t *testing.T) {
+		r := newRetryRig(t, 0)
+		u1 := r.adoptUnsigned("u1")
+		signed := r.release("now signed", 0)
+		r.ver.reject(hashOf(signed))
+		r.up.set(signed)
+		r.check() // the upgrade probe marks the base; the upgrade fails
+		if r.ver.calls() != 1 || r.currentSnapshot().Form != cache.FormUnsigned {
+			t.Fatalf("setup: calls %d, snapshot %+v; want a failed upgrade", r.ver.calls(), r.currentSnapshot())
+		}
+		if _, ok, err := r.cache.SignedSeen(context.Background(), "http", rigHost, rigSuite); err != nil || !ok {
+			t.Fatalf("no marker after the probe saw the signature (ok %v, err %v)", ok, err)
+		}
+		r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 404})
+		r.unsignedRelease("u2, modified", &fetch.StatusError{Code: 404})
+		r.clock.advance(time.Hour)
+		r.check()
+		if snap := r.currentSnapshot(); strOf(snap.SingleAnchorHash) != hashOf(u1) ||
+			strOf(r.row().AdoptionFailReason) != cache.ReasonUnsignedDowngradeRefused {
+			t.Fatalf("snapshot %+v, record %q; want u1 kept and unsigned_downgrade_refused", snap, strOf(r.row().AdoptionFailReason))
+		}
+	})
+	t.Run("failed marker write", func(t *testing.T) {
+		r := newRetryRig(t, 0)
+		r.adoptUnsigned("u1")
+		r.up.set(r.release("now signed", 0))
+		db, err := sql.Open("sqlite", filepath.Join(r.cache.Dir(), "cache.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db.Close() }()
+		if _, err := db.Exec(`CREATE TRIGGER no_marks BEFORE INSERT ON suite_signed_seen
+  BEGIN SELECT RAISE(ABORT, 'marker writes fail'); END`); err != nil {
+			t.Fatal(err)
+		}
+		r.check()
+		if row := r.row(); row.CheckFailCount != 1 || r.ver.calls() != 0 || r.currentSnapshot().Form != cache.FormUnsigned {
+			t.Fatalf("row %+v, verifier calls %d: want a failed check, no upgrade attempt", row, r.ver.calls())
+		}
+	})
+}
+
+// Ruling PE-2: an adopted suite in anchor_absent is paced by its record —
+// a client check (T1) inside the record's retry time asks nothing, and the
+// scheduler does not queue it (suiteDue) until that time. A next_retry_at
+// beyond the legitimate horizon (a backward clock step) is not paced: once
+// the suite is due (its last success is old), the check clamps it to an
+// hour and asks nothing.
+func TestCheck_AbsentAnchorIsPacedByItsRecord(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopt()
+	r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 404})
+	r.clock.advance(time.Minute)
+	r.check() // the first observation: anchor_absent, due in 2 minutes
+	gets := func() int { return len(r.up.etagsSent(rigAnchorURL)) }
+	before, lines := gets(), len(r.events("freshness_check"))
+	for range 5 {
+		r.clock.advance(20 * time.Second)
+		r.check()
+	}
+	if gets() != before || len(r.events("freshness_check")) != lines {
+		t.Fatalf("client checks inside the retry time: %d requests, %d lines; want none", gets()-before,
+			len(r.events("freshness_check"))-lines)
+	}
+	// A long refusal backoff (as a later observation sets), and the last
+	// success older than periodic_refresh: stale, but paced by the record.
+	if err := r.cache.SetAdoptionNextRetry(context.Background(), "http", rigHost, rigSuite,
+		r.clock.now().Add(30*time.Minute).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.advance(16 * time.Minute)
+	if r.checker.suiteDue(r.row(), r.clock.now()) {
+		t.Fatal("the scheduler queues an anchor_absent suite inside its record's retry time")
+	}
+	r.check()
+	if gets() != before {
+		t.Fatal("a check inside the record's retry time made a request")
+	}
+	r.clock.advance(15 * time.Minute) // past the retry time
+	if !r.checker.suiteDue(r.row(), r.clock.now()) {
+		t.Fatal("an anchor_absent suite is not due at its record's retry time")
+	}
+	r.check() // the anchor's GET, and — the absence confirmed — the tree, whose first probe is InRelease
+	if gets() != before+2 {
+		t.Fatalf("the due check made %d InRelease requests, want 2", gets()-before)
+	}
+	if err := r.cache.SetAdoptionNextRetry(context.Background(), "http", rigHost, rigSuite,
+		r.clock.now().Add(24*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.advance(16 * time.Minute) // the last success is older than periodic_refresh
+	if !r.checker.suiteDue(r.row(), r.clock.now()) {
+		t.Fatal("a next_retry_at beyond the horizon kept the suite from being due")
+	}
+	r.check()
+	if gets() != before+2 || i64Of(r.row().AdoptionNextRetryAt) != r.clock.now().Add(time.Hour).Unix() {
+		t.Fatalf("beyond the horizon: %d requests, next_retry_at %d; want none and now + 1 h", gets()-before-2,
+			i64Of(r.row().AdoptionNextRetryAt))
+	}
+}
+
+// Design review M-5: an established unsigned suite whose new Release
+// declares more than unsignedMemberCap members is refused at the check —
+// unsigned_too_large, no slot, no adoption — and keeps its snapshot.
+func TestCheck_UnsignedSuiteTooLargeUpdateIsRefused(t *testing.T) {
+	r := newRetryRig(t, 0)
+	u1 := r.adoptUnsigned("u1")
+	big := make(map[string][]byte, unsignedMemberCap+1)
+	for i := 0; i <= unsignedMemberCap; i++ {
+		big[fmt.Sprintf("main/i18n/Translation-%d", i)] = []byte{byte(i)}
+	}
+	r.up.setAt(rigReleaseURL, datedRelease("big", 0, big))
+	before := adoptionTotalFor(t, rigHost)
+	r.check()
+	if snap := r.currentSnapshot(); strOf(snap.SingleAnchorHash) != hashOf(u1) ||
+		strOf(r.row().AdoptionFailReason) != cache.ReasonUnsignedTooLarge || lastResult(r) != "changed_deferred" {
+		t.Fatalf("snapshot %+v record %q result %q; want u1 kept, unsigned_too_large, changed_deferred", snap,
+			strOf(r.row().AdoptionFailReason), lastResult(r))
+	}
+	if adoptionTotalFor(t, rigHost) != before {
+		t.Fatal("a too-large unsigned update ran an adoption")
+	}
+}
+
+// Design review M-16: an unsigned suite whose Release was absent and is
+// found again by the probe tree — its own form — is "unchanged" when the
+// bytes are the snapshot's (the record is cleared) and an unsigned update
+// otherwise (result changed, adopted at once, after the unsigned refusals:
+// signed history refuses it); it is never re-recorded as anchor_absent.
+func TestCheck_AbsentUnsignedReleaseThatComesBack(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		update, marker bool
+		result         string
+	}{
+		{"same bytes", false, false, "unchanged"},
+		{"new bytes", true, false, "changed"},
+		{"new bytes with signed history", true, true, "changed_deferred"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRetryRig(t, 0)
+			u1 := r.adoptUnsigned("u1")
+			back := u1
+			if tc.update {
+				back = r.releaseText("u2", 0)
+			}
+			var n atomic.Int32
+			up := simtest.NewUpstream()
+			up.Set(rigReleaseURL, func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
+				if n.Add(1) <= 2 { // the check's GET twice; the tree's probe finds it
+					return nil, &fetch.StatusError{Code: 404}
+				}
+				return simtest.Serve(back)(ctx, etag)
+			})
+			chk, err := New(Config{Cache: r.cache, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+				Adopter: r.adopter, Logger: slog.New(slog.NewJSONHandler(r.logs, nil)), // lastResult reads its lines
+				now: r.clock.now, rand: func() float64 { return 0.5 }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			chk.Check(ctx, "http", rigHost, rigSuite) // absent: anchor_absent recorded
+			chk.WaitForAdoptions()
+			if row := r.row(); strOf(row.AdoptionFailReason) != cache.ReasonAnchorAbsent {
+				t.Fatalf("setup: record %q, want anchor_absent", strOf(row.AdoptionFailReason))
+			}
+			if tc.marker {
+				if err := r.cache.MarkSignedSeenBatch(ctx, []cache.SignedSeenMark{{CanonicalScheme: "http",
+					CanonicalHost: rigHost, Base: rigSuite, SeenAt: r.clock.now().Unix()}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r.clock.advance(10 * time.Minute) // past the confirmation gap and the record's retry time
+			chk.Check(ctx, "http", rigHost, rigSuite)
+			chk.WaitForAdoptions()
+			row, snap := r.row(), r.currentSnapshot()
+			if res := lastResult(r); res != tc.result {
+				t.Fatalf("result %q, want %q", res, tc.result)
+			}
+			if tc.marker {
+				if strOf(row.AdoptionFailReason) != cache.ReasonUnsignedDowngradeRefused || strOf(snap.SingleAnchorHash) != hashOf(u1) {
+					t.Fatalf("record %q, snapshot %+v; want unsigned_downgrade_refused and u1 kept", strOf(row.AdoptionFailReason), snap)
+				}
+				return
+			}
+			if row.AdoptionFailCount != 0 || snap.Form != cache.FormUnsigned || strOf(snap.SingleAnchorHash) != hashOf(back) {
+				t.Fatalf("record %q/%d, snapshot %+v; want no record and the unsigned snapshot of the Release served",
+					strOf(row.AdoptionFailReason), row.AdoptionFailCount, snap)
+			}
+		})
+	}
+}
+
+// Design review I-2 on the absent-anchor path of an unsigned suite: when
+// the probe tree finds a signature (InRelease appeared between the check's
+// probes and the tree), the suite's base is marked before the upgrade is
+// admitted — so it stays marked when the upgrade fails.
+func TestCheck_AbsentUnsignedReleaseTreeFindsASignature(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptUnsigned("u1")
+	signed := r.release("now signed", 0)
+	r.ver.reject(hashOf(signed))
+	var n atomic.Int32
+	up := simtest.NewUpstream() // Release and Release.gpg: 404
+	up.Set(rigAnchorURL, func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
+		if n.Add(1) <= 2 { // the upgrade probes of both checks; the tree's probe finds it
+			return nil, &fetch.StatusError{Code: 404}
+		}
+		return simtest.Serve(signed)(ctx, etag)
+	})
+	chk, err := New(Config{Cache: r.cache, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+		Adopter: r.adopter, Logger: discardLogger(), now: r.clock.now, rand: func() float64 { return 0.5 }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	chk.Check(ctx, "http", rigHost, rigSuite) // Release absent: anchor_absent recorded
+	chk.WaitForAdoptions()
+	r.clock.advance(10 * time.Minute)
+	chk.Check(ctx, "http", rigHost, rigSuite) // the tree finds InRelease: the upgrade, which fails
+	chk.WaitForAdoptions()
+	if r.ver.calls() != 1 || r.currentSnapshot().Form != cache.FormUnsigned {
+		t.Fatalf("setup: calls %d, snapshot %+v; want one failed upgrade", r.ver.calls(), r.currentSnapshot())
+	}
+	if _, ok, err := r.cache.SignedSeen(ctx, "http", rigHost, rigSuite); err != nil || !ok {
+		t.Fatalf("no marker after the tree found a signature (ok %v, err %v)", ok, err)
+	}
+}
+
+// Deviation 2, for anchor_absent (design review M-19): a future
+// adoption_fail_first_at never confirms the absence — the tree does not
+// run — and re-recording restarts it at now (recordAdoptionFailure's
+// past-event rule), so a backward clock step costs one more gap, never a
+// skipped observation.
+func TestCheck_AbsentAnchorWithAFutureFirstAtWaitsAnotherGap(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopt()
+	r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 404})
+	r.up.setAt(rigReleaseURL, r.releaseText("v2", 0))
+	r.up.setAt(rigReleaseGPGURL, armoredSig("v2 sig"))
+	now := r.clock.now()
+	if err := r.cache.RecordAdoptionFailure(context.Background(), "http", rigHost, rigSuite, cache.AdoptionFailure{
+		Hash: anchorAbsentKey, Reason: cache.ReasonAnchorAbsent, Count: 1,
+		FirstAt: now.Add(2 * time.Hour).Unix(), LastAt: now.Unix(), NextRetryAt: now.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	r.check()
+	if n := len(r.up.etagsSent(rigReleaseURL)); n != 0 {
+		t.Fatalf("the tree ran (%d Release probes) on an absence first observed in the future", n)
+	}
+	if first := i64Of(r.row().AdoptionFailFirstAt); first != now.Unix() {
+		t.Fatalf("first_at = %d, want it restarted at %d", first, now.Unix())
+	}
+	r.clock.advance(6 * time.Minute) // past the gap and the record's retry time
+	r.check()
+	if snap := r.currentSnapshot(); lastResult(r) != "form_changed" || snap.Form != cache.FormDetached {
+		t.Fatalf("result %q snapshot %+v, want the lateral move one gap later", lastResult(r), snap)
+	}
+}
+
+// Design review M-13: an adopted suite stale in a refusal state
+// (anchor_absent keeps its last success old on purpose) counts in the
+// stale gauge but not in the stale WARN, which keeps alerting on a suite
+// stale for any other reason.
+func TestStaleSuiteCounts_RefusalStates(t *testing.T) {
+	id, old := int64(7), int64(500)
+	absent, failing := cache.ReasonAnchorAbsent, "gpg_failed"
+	suites := []cache.SuiteFreshness{
+		{LastSuccessAt: &old, CurrentSnapshotID: &id, AdoptionFailCount: 3, AdoptionFailReason: &absent},
+		{LastSuccessAt: &old, CurrentSnapshotID: &id, AdoptionFailCount: 3, AdoptionFailReason: &failing},
+		{LastSuccessAt: &old, CurrentSnapshotID: &id},
+		{LastSuccessAt: &old, AdoptionFailCount: 1, AdoptionFailReason: &absent},
+	}
+	adopted, unadopted, refused := staleSuiteCounts(suites, 1000, 3000)
+	if adopted != 3 || unadopted != 1 || refused != 1 {
+		t.Fatalf("adopted %d unadopted %d refused %d, want 3, 1, 1", adopted, unadopted, refused)
+	}
+}
+
+func TestTick_StaleWarnLeavesOutRefusalStates(t *testing.T) {
+	for _, absent := range []bool{true, false} {
+		r := newRetryRig(t, 0)
+		r.adopt()
+		if absent {
+			r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 404}) // anchor_absent
+		} else {
+			r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 503}) // failed checks
+		}
+		r.clock.advance(time.Minute)
+		r.check()
+		r.clock.advance(time.Hour) // past 4 × periodic_refresh
+		r.checker.tick(context.Background(), newSchedQueues())
+		warns := r.events("freshness: adopted suites stale beyond threshold")
+		if absent && len(warns) != 0 {
+			t.Fatalf("anchor_absent: %d stale WARNs, want none", len(warns))
+		}
+		if !absent && (len(warns) != 1 || warns[0]["adopted_stale"] != float64(1)) {
+			t.Fatalf("failing upstream: stale WARNs %v, want one with adopted_stale 1", warns)
+		}
+	}
+}
+
+// Design note 23 / design review M-14: a changed Release whose signature
+// is absent does not take the record a still-served lateral InRelease
+// holds — that content keeps its own schedule.
+func TestCheck_AbsentSignatureKeepsTheLateralRecord(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptDetached()
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	r.clock.advance(time.Minute)
+	r.check() // the lateral attempt fails: a record for the InRelease content
+	r.up.setAt(rigReleaseURL, r.releaseText("v2", 0))
+	r.up.setFail(rigReleaseGPGURL, &fetch.StatusError{Code: 404})
+	r.clock.advance(20 * time.Second) // before the record's retry time: the lateral content is held
+	r.check()
+	if row := r.row(); lastResult(r) != "anchor_absent" || strOf(row.AdoptionFailReason) == cache.ReasonAnchorAbsent ||
+		strOf(row.AdoptionFailHash) != hashOf(bad) {
+		t.Fatalf("result %q record %q; want anchor_absent reported and the lateral content's record kept", lastResult(r),
+			strOf(row.AdoptionFailReason))
+	}
+}
+
+// Design note 24: an unsigned suite never updates past a signature that may
+// be there — an unknown Release.gpg probe fails the check exactly as an
+// unknown InRelease does (TestCheck_UnsignedSuiteUpgradesWhenSigned covers
+// only the latter). (Proposed by the executability review; kills X06.)
+func TestCheck_UnsignedSuiteUnknownReleaseGPGFailsTheCheck(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptUnsigned("u1")
+	r.unsignedRelease("u2", &fetch.StatusError{Code: 503})
+	before := r.currentSnapshot().SnapshotID
+	r.check()
+	if row := r.row(); row.CheckFailCount != 1 || r.currentSnapshot().SnapshotID != before {
+		t.Fatalf("row %+v, current %d: want a failed check and no unsigned update", row, r.currentSnapshot().SnapshotID)
+	}
+}
+
+// Spec C4 reserved slot: an unsigned suite (its current snapshot vouches
+// nothing) never takes the last free slot — neither for an update of its
+// unsigned Release nor for an upgrade to a signed form; both queue.
+// (Proposed by the executability review; kills X07, X08.)
+func TestCheck_UnsignedSuiteNeverTakesTheReservedSlotToAdopt(t *testing.T) {
+	for _, upgrade := range []bool{false, true} {
+		r := newRetryRig(t, 0) // MaxConcurrent: 2
+		r.adoptUnsigned("u1")
+		if upgrade {
+			r.up.set(r.release("now signed", 0)) // InRelease present: the upgrade
+		} else {
+			r.unsignedRelease("u2", nil) // an update of the unsigned Release
+		}
+		held := mustAcquire(t, r.checker.admission, "other", true) // one of two slots taken
+		r.check()
+		held.release()
+		if lastResult(r) != "changed_queued" {
+			t.Fatalf("upgrade=%v: result %q, want changed_queued (the last slot is reserved for signed suites)", upgrade, lastResult(r))
+		}
+	}
+}
+
+// Spec C4 Dispatch 1 / design note 23: an anchor that was absent and is
+// found again by the probe tree — the same form and the same bytes as the
+// current snapshot — is "unchanged" and clears the anchor_absent record;
+// it is not a form change that re-adopts the current content. The
+// upstream answers the anchor's own GET 404 on the first two checks and
+// serves it again to the tree's probe (an anchor that comes back within a
+// check). (Proposed by the executability review; kills X25, which the plan
+// pinned at the predicate only.)
+func TestCheck_AbsentAnchorThatComesBackIsUnchanged(t *testing.T) {
+	r := newRetryRig(t, 0)
+	v1 := r.release("v1", 0)
+	r.up.set(v1)
+	r.check() // the first adoption: inline v1
+	snap := r.currentSnapshot()
+	if snap == nil {
+		t.Fatal("setup: v1 not adopted")
+	}
+	var n atomic.Int32
+	up := simtest.NewUpstream()
+	up.Set(rigAnchorURL, func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
+		if n.Add(1) <= 2 {
+			return nil, &fetch.StatusError{Code: 404}
+		}
+		return simtest.Serve(v1)(ctx, etag)
+	})
+	chk, err := New(Config{Cache: r.cache, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+		Adopter: r.adopter, Logger: discardLogger(), now: r.clock.now, rand: func() float64 { return 0.5 }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	chk.Check(ctx, "http", rigHost, rigSuite) // absent: anchor_absent recorded
+	chk.WaitForAdoptions()
+	if row := r.row(); strOf(row.AdoptionFailReason) != cache.ReasonAnchorAbsent {
+		t.Fatalf("setup: record %q, want anchor_absent", strOf(row.AdoptionFailReason))
+	}
+	r.clock.advance(10 * time.Minute) // past the confirmation gap and the record's retry time
+	chk.Check(ctx, "http", rigHost, rigSuite)
+	chk.WaitForAdoptions()
+	row := r.row()
+	if row.AdoptionFailCount != 0 || row.CurrentSnapshotID == nil || *row.CurrentSnapshotID != snap.SnapshotID {
+		t.Fatalf("row %+v: want the record cleared and snapshot %d still current", row, snap.SnapshotID)
+	}
+}
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `go test ./internal/freshness/ -run 'TestCheck_DetachedSuiteMovesToInline|TestCheck_LateralFailingContent|TestCheck_AbsentAnchor|TestCheck_CurrentAnchorClassification|TestProbeTree_SameAs|TestCheck_UnsignedSuite|TestCheck_UnsignedRecovers|TestReconcile_UnsignedSuite|TestFinishCheck_Repair|TestCheck_RepairOfAnUnsignedSuite'`
-Expected: FAIL — compile error, `tree.sameAs undefined (type probeTree has no field or method sameAs)` (and `rp.signed`). (`TestCheck_DetachedSuiteThatDropsItsSignatureNeverGoesUnsigned` pins behaviour the detached path already has and must keep: Review Focus 3.)
+Expected: FAIL — compile error naming `tree.sameAs undefined (type probeTree has no field or method sameAs)`, `rp.signed undefined` and `assignment mismatch: 3 variables but staleSuiteCounts returns 2 values` (with `-gcflags=-e` every one is listed).
 
 - [ ] **Step 3: Implement**
 
@@ -6656,13 +8053,21 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 )
 
-// anchorAbsentKey is the content key of an anchor_absent record: the
-// absence has no content, and the constant can never equal a real
-// content key, so whatever upstream serves next is new content.
-var anchorAbsentKey = func() string {
-	s := sha256.Sum256([]byte("anchor_absent"))
-	return hex.EncodeToString(s[:])
-}()
+// pacedAbsent is ruling PE-2 for an adopted suite: while its active record
+// is anchor_absent and not due, the check makes no request — the current
+// anchor is asked for again at the record's retry time (2 min doubling to
+// 1 h: about 24 requests a day once the absence has lasted an hour), not at
+// every tick and every client check (T1). checkLocked applies it before
+// any request, and suiteDue does not queue such a suite.
+//
+// AIDEV-NOTE: the record's schedule is the refusal's, not the failure
+// backoff: the check_fail_count streak stays 0 (ruling R-E4). Cost: a
+// returning anchor is noticed at the record's retry time (at most 1 h
+// later) instead of at once. An EOL release removed upstream would
+// otherwise cost 400–1,800 requests a day, forever.
+func pacedAbsent(g retryGate) bool {
+	return g.active && !g.due && g.reason == cache.ReasonAnchorAbsent
+}
 
 // body returns the bytes of the anchor file name the tree fetched.
 func (t probeTree) body(name string) []byte {
@@ -6697,20 +8102,24 @@ func (t probeTree) sameAs(snap *cache.SuiteSnapshot) bool {
 // The first absent observation records the refusal state anchor_absent
 // (keyed anchorAbsentKey); once the record is due and the absence has
 // lasted confirmGap (two observations at least max(cooldown, 5 min)
-// apart), the probe tree runs without validators: the other signed form
-// found is adopted (a lateral move, result form_changed); the current
-// form and content found again is "unchanged" (the record is cleared);
-// anything else — an unsigned candidate, or nothing — is recorded again:
-// never unsigned from signed. A record from an adoption attempt (the
-// lateral move failed) keeps its own schedule: at its retry time the
-// tree runs at once. Every outcome but a probe that ends unknown leaves
-// last_success_at alone and resets the check_fail_count streak (ruling
-// R-E4: an absent anchor is an answer, not an unknown end).
+// apart), the probe tree runs without validators (anchorFoundAgain): the
+// other signed form found is adopted (a lateral move or an upgrade, result
+// form_changed); the current form and content found again is "unchanged"
+// (the record is cleared); an unsigned suite's own form found again with
+// new bytes is its update; anything else — an unsigned candidate of a
+// signed suite, or nothing — is recorded again: never unsigned from signed.
+// A record from an adoption attempt (the lateral move failed) keeps its own
+// schedule: at its retry time the tree runs at once. Every outcome but a
+// probe that ends unknown leaves last_success_at alone and resets the
+// check_fail_count streak (ruling R-E4: an absent anchor is an answer, not
+// an unknown end).
 //
 // AIDEV-NOTE: last_success_at stays old on purpose (spec C4: "visible;
-// last_success_at not bumped"), so the suite is due every tick and costs
-// one anchor request per tick while its anchor stays absent, plus the
-// probe tree at each due retry (2 min doubling to 1 h).
+// last_success_at not bumped"); the record paces the suite (pacedAbsent),
+// so it costs one anchor request per retry, plus the probe tree once the
+// absence is confirmed. A future adoption_fail_first_at never confirms
+// (its age is negative) and re-recording restarts it — deviation 2, here
+// for the absence's two observations.
 func (c *Checker) anchorAbsent(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef,
 	now time.Time, nowUnix int64, form adoptionForm, o probeOutcome, gate retryGate, signedCurrent bool) *adoptionRequest {
 	record := &adoptionRequest{suite: suite, key: anchorAbsentKey}
@@ -6720,7 +8129,8 @@ func (c *Checker) anchorAbsent(ctx, fetchCtx context.Context, out *checkOutcome,
 	case !gate.active:
 		c.recordAdoptionFailure(record, cache.ReasonAnchorAbsent) // the first observation
 	case !gate.due:
-		// Inside the record's retry time: nothing new to decide.
+		// Inside the retry time of a record from an adoption attempt (an
+		// anchor_absent record is paced before any request: pacedAbsent).
 	case !absentRecord:
 		runTree = true
 	case cur.AdoptionFailFirstAt != nil && now.Sub(time.Unix(*cur.AdoptionFailFirstAt, 0)) >= c.confirmGap():
@@ -6741,22 +8151,8 @@ func (c *Checker) anchorAbsent(ctx, fetchCtx context.Context, out *checkOutcome,
 		case t.end != nil:
 			c.failCheck(ctx, out, cur, suite, nowUnix, formName(form), fmt.Errorf("%s: %w", t.endName, t.end.err))
 			return nil
-		case t.found && t.form != adoptionFormUnsigned:
-			snap, _ := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
-			prevSuccess := cur.LastSuccessAt
-			cur.LastCheckAt, cur.LastSuccessAt, cur.CheckFailCount = &nowUnix, &nowUnix, 0
-			if t.sameAs(snap) {
-				cur.InReleaseChangeSeenAt = nil
-				c.finishCheck(ctx, out, cur, suite, checkEnd{form: formName(form), result: "unchanged", status: 200,
-					clearRecord: true, signedCurrent: signedCurrent})
-				return nil
-			}
-			setChangeSeen(cur, nowUnix)
-			req := t.request(suite)
-			e := checkEnd{form: formName(t.form), status: 200, signedCurrent: signedCurrent}
-			req, e.result = c.admit(out, cur, req, signedCurrent, prevSuccess, "form_changed", "changed_queued")
-			c.finishCheck(ctx, out, cur, suite, e)
-			return req
+		case t.found && (t.form != adoptionFormUnsigned || form == adoptionFormUnsigned):
+			return c.anchorFoundAgain(ctx, out, cur, suite, nowUnix, form, t, signedCurrent)
 		}
 		c.recordAdoptionFailure(record, cache.ReasonAnchorAbsent)
 	}
@@ -6767,17 +8163,70 @@ func (c *Checker) anchorAbsent(ctx, fetchCtx context.Context, out *checkOutcome,
 	return nil
 }
 
+// anchorFoundAgain handles a probe tree, run for an absent current anchor,
+// that found a form the suite may adopt: a signed form, or — for an
+// unsigned suite — the unsigned form again (design review M-16). The
+// current snapshot's own anchors are "unchanged" (the record is cleared);
+// anything else is a request: another form's (form_changed, a cross-form
+// request), or new content of the current form (changed), an unsigned
+// suite's update after the unsigned refusals (unsignedRefusal). A signature
+// found for a suite without a signed current snapshot is marked first
+// (Adopter.markSignatureSeen); a failed mark fails the check.
+func (c *Checker) anchorFoundAgain(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef,
+	nowUnix int64, form adoptionForm, t probeTree, signedCurrent bool) *adoptionRequest {
+	if !signedCurrent && t.signatureSeen() {
+		if err := c.adopter.markSignatureSeen(ctx, suite, nowUnix); err != nil {
+			c.failCheck(ctx, out, cur, suite, nowUnix, formName(form), fmt.Errorf("mark the signature seen: %w", err))
+			return nil
+		}
+	}
+	snap, _ := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
+	same := t.sameAs(snap)
+	req := t.request(suite)
+	req.crossForm = t.form != form
+	refusal := ""
+	if !same && t.form == adoptionFormUnsigned {
+		var err error
+		if refusal, err = c.unsignedRefusal(ctx, req); err != nil {
+			c.failCheck(ctx, out, cur, suite, nowUnix, formName(form), err)
+			return nil
+		}
+	}
+	prevSuccess := cur.LastSuccessAt
+	cur.LastCheckAt, cur.LastSuccessAt, cur.CheckFailCount = &nowUnix, &nowUnix, 0
+	e := checkEnd{form: formName(t.form), status: 200, signedCurrent: signedCurrent}
+	switch {
+	case same:
+		cur.InReleaseChangeSeenAt = nil
+		e.result, e.clearRecord, req = "unchanged", true, nil
+	case refusal != "":
+		setChangeSeen(cur, nowUnix)
+		e.result, e.reason, req = "changed_deferred", refusal, nil
+	case t.form == form:
+		setChangeSeen(cur, nowUnix)
+		req, e.result = c.admit(out, cur, req, signedCurrent, prevSuccess, "changed", "changed_queued")
+	default:
+		setChangeSeen(cur, nowUnix)
+		req, e.result = c.admit(out, cur, req, signedCurrent, prevSuccess, "form_changed", "changed_queued")
+	}
+	c.finishCheck(ctx, out, cur, suite, e)
+	return req
+}
+
 // lateralInline is spec C4 Dispatch 1 for a detached current snapshot:
 // InRelease is probed on every check, and present → an inline adoption
-// request (a lateral move, result form_changed). An absent or unknown
-// InRelease, or the failing content before its retry time (held), leaves
-// the check to the detached path (done = false): the current form's own
-// request decides the result. The caller holds the host slot.
+// request (a lateral move, result form_changed; a cross-form request). An
+// absent or unknown InRelease, or the failing content before its retry
+// time (held), leaves the check to the detached path (done = false): the
+// current form's own request decides the result. The caller holds the host
+// slot.
 //
 // AIDEV-NOTE: held must stop the detached path's "unchanged" from
 // clearing the record: it belongs to the InRelease content, which
 // upstream still serves, and clearing it would let every other check
-// attempt that content again (spec C7's bounded attempts).
+// attempt that content again (spec C7's bounded attempts). The record
+// keeps no validators (crossForm), so the detached path's GET carries the
+// current Release's own (design review I-1).
 func (c *Checker) lateralInline(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef,
 	urls anchorURLs, gate retryGate, signedCurrent bool, nowUnix int64) (req *adoptionRequest, done, held bool) {
 	o := c.probe(fetchCtx, suite, urls, "InRelease")
@@ -6785,6 +8234,7 @@ func (c *Checker) lateralInline(ctx, fetchCtx context.Context, out *checkOutcome
 		return nil, false, false
 	}
 	req = probeTree{form: adoptionFormInline, found: true, inRelease: o}.request(suite)
+	req.crossForm = true
 	if gate.active && !gate.due && req.key == gate.hash {
 		return nil, false, true
 	}
@@ -6801,10 +8251,13 @@ func (c *Checker) lateralInline(ctx, fetchCtx context.Context, out *checkOutcome
 // unsigned): InRelease present → an inline request; else Release.gpg
 // present → Release (no validators) and a detached request — an upgrade,
 // result form_changed (changed_deferred while the gate holds that content,
-// changed_queued without a slot). Both absent → done = false: the
-// unsigned check goes on. A probe that ends unknown is a failed check: a
-// signature may be there, so the unsigned path does not run. The caller
-// holds the host slot.
+// changed_queued without a slot), a cross-form request. A signature found
+// marks the suite's base before anything else (Adopter.markSignatureSeen,
+// design review I-2: the suite's clients never fetch one, so only this
+// probe can record that the suite was seen signed; a failed mark fails the
+// check). Both absent → done = false: the unsigned check goes on. A probe
+// that ends unknown is a failed check: a signature may be there, so the
+// unsigned path does not run. The caller holds the host slot.
 func (c *Checker) upgradeProbe(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef,
 	urls anchorURLs, gate retryGate, nowUnix int64) (req *adoptionRequest, done bool) {
 	fail := func(name string, o probeOutcome) (*adoptionRequest, bool) {
@@ -6833,7 +8286,12 @@ func (c *Checker) upgradeProbe(ctx, fetchCtx context.Context, out *checkOutcome,
 		}
 		t.form = adoptionFormDetached
 	}
+	if err := c.adopter.markSignatureSeen(ctx, suite, nowUnix); err != nil {
+		c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", fmt.Errorf("mark the signature seen: %w", err))
+		return nil, true
+	}
 	req = t.request(suite)
+	req.crossForm = true
 	prevSuccess := cur.LastSuccessAt
 	cur.LastCheckAt, cur.LastSuccessAt, cur.CheckFailCount = &nowUnix, &nowUnix, 0
 	setChangeSeen(cur, nowUnix)
@@ -6851,10 +8309,11 @@ func (c *Checker) upgradeProbe(ctx, fetchCtx context.Context, out *checkOutcome,
 // upgrade probes (adopter wired), then a conditional GET of Release
 // against the snapshot's Release hash; changed → an unsigned adoption
 // request — no re-confirmation (spec C5 safeguard 2: updates of an
-// established unsigned suite adopt at once), but the never-downgrade
-// check (a signed-seen marker refuses it, recorded as
-// unsigned_downgrade_refused) and the knob (off: a failed check) apply.
-// A reaped Release anchor is reconstructed from the snapshot
+// established unsigned suite adopt at once), but the unsigned refusals
+// apply before a slot is taken (unsignedRefusal: signed history refuses
+// it as unsigned_downgrade_refused, a member count over the cap as
+// unsigned_too_large) and the knob (off: a failed check). A reaped Release
+// anchor is reconstructed from the snapshot
 // (TestCheck_UnsignedRecoversWhenReleaseAnchorMissing). Without an adopter
 // it only observes, like the other forms.
 func (c *Checker) checkUnsigned(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef,
@@ -6924,14 +8383,14 @@ func (c *Checker) checkUnsigned(ctx, fetchCtx context.Context, out *checkOutcome
 	steady := res.Status == 304 || newHash == cachedHash
 	deferred := !steady && gate.active && !gate.due && key == gate.hash
 	if !steady && !deferred && c.adopter != nil {
-		switch err := c.adopter.unsignedEligible(ctx, suite, nil); {
-		case errors.Is(err, ErrAdoptionUnsignedDowngradeRefused):
-			c.recordAdoptionFailure(&adoptionRequest{suite: suite, key: key, etag: res.ETag, lastmod: res.LastModified},
-				cache.ReasonUnsignedDowngradeRefused)
-			deferred, gate.reason = true, cache.ReasonUnsignedDowngradeRefused
-		case err != nil:
+		refusal, err := c.unsignedRefusal(ctx, &adoptionRequest{suite: suite, key: key, releaseBytes: res.Body,
+			etag: res.ETag, lastmod: res.LastModified})
+		if err != nil {
 			c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", err)
 			return nil, nil
+		}
+		if refusal != "" {
+			deferred, gate.reason = true, refusal
 		}
 	}
 	prevSuccess := cur.LastSuccessAt
@@ -6955,14 +8414,43 @@ func (c *Checker) checkUnsigned(ctx, fetchCtx context.Context, out *checkOutcome
 }
 ```
 
-Apply the dispatch, absence, repair and reconcile changes:
+Apply the dispatch, pacing, validators, absence, refusal, stale-WARN, repair and reconcile changes — `failCheck`'s second AIDEV-NOTE and the metrics inventory's line for `acu_repair_deferred_total` (deferred minor B-31) included (`git apply`):
 
 ```diff
+diff --git a/internal/freshness/adoption_failure.go b/internal/freshness/adoption_failure.go
+index 21987ef..6a37587 100644
+--- a/internal/freshness/adoption_failure.go
++++ b/internal/freshness/adoption_failure.go
+@@ -70,4 +70,9 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
+ 		NextRetryAt: next, ETag: nonEmpty(req.etag), LastMod: nonEmpty(req.lastmod),
+ 	}
++	if req.crossForm {
++		// Another anchor file's validators: never sent on the current
++		// form's GET (design review I-1, retryGate.validators).
++		f.ETag, f.LastMod = nil, nil
++	}
+ 	if err := c.cache.RecordAdoptionFailure(ctx, s.CanonicalScheme, s.CanonicalHost, s.SuitePath, f); err != nil {
+ 		c.logger.Warn("adoption_failure_record_failed",
 diff --git a/internal/freshness/check.go b/internal/freshness/check.go
-index 33c5c8f..a4156eb 100644
+index 33c5c8f..7597646 100644
 --- a/internal/freshness/check.go
 +++ b/internal/freshness/check.go
-@@ -136,7 +136,10 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome,
+@@ -130,4 +130,14 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome,
+ 		return
+ 	}
++	// Ruling PE-2: an adopted suite in the refusal state anchor_absent is
++	// paced by its record: no request before the record's retry time.
++	if c.adopter != nil {
++		if gate := c.retryGateFor(cur, now); pacedAbsent(gate) {
++			c.applyClamp(ctx, cur, gate, now)
++			c.logger.Debug("freshness: anchor_absent suite paced until its retry",
++				"canonical_host", host, "suite_path", suitePath)
++			return
++		}
++	}
+ 
+ 	// Form preference: if there's a current snapshot, the form is its
+@@ -136,7 +146,10 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome,
  	// fallback on 404.
  	form := c.detectForm(ctx, cur)
 -	if form == adoptionFormDetached {
@@ -6975,7 +8463,7 @@ index 33c5c8f..a4156eb 100644
 +	default:
  		req, repair, fellBack := c.checkInline(ctx, fetchCtx, out, cur, suite, now, nowUnix)
  		if fellBack {
-@@ -151,11 +154,9 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome,
+@@ -151,11 +164,9 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome,
  
  // detectForm reads the suite's current snapshot (if any) and returns
 -// its anchor_form (snap.Form): detached, or inline for anything else
@@ -6992,7 +8480,7 @@ index 33c5c8f..a4156eb 100644
 +// upstreams.
  func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) adoptionForm {
  	if cur.CurrentSnapshotID == nil {
-@@ -163,9 +164,6 @@ func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) ado
+@@ -163,9 +174,6 @@ func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) ado
  	}
  	snap, err := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
 -	if err != nil || snap == nil {
@@ -7004,7 +8492,7 @@ index 33c5c8f..a4156eb 100644
 +		return form
  	}
  	return adoptionFormInline
-@@ -219,5 +217,9 @@ func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache
+@@ -219,5 +227,9 @@ func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache
  	c.logger.Info("freshness_check", logAttrs...)
  	freshnessCheckTotal.Inc(e.result, host)
 -	return repairIfUnchanged(e.result, suite, cur)
@@ -7015,7 +8503,46 @@ index 33c5c8f..a4156eb 100644
 +	return rp
  }
  
-@@ -468,4 +470,9 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome,
+@@ -233,8 +245,11 @@ func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache
+ // AIDEV-NOTE: ctx is the caller's context, never fetchCtx: the deadline
+ // that ended the check must not fail the write that records it.
+-// AIDEV-NOTE: in phase B every Conditional error extends the streak,
+-// including 401/403/404/410, which spec C4 classifies as absent, not
+-// unknown. Phase E's probe classification must reset the streak on
+-// absent, or anchor_absent suites inherit the hourly backoff.
++// AIDEV-NOTE: with an adopter wired, classify sends 401/403/404/410 and a
++// 200 failing its sniff to absent before this point (ruling R-E4: an
++// absent anchor resets the streak, so an anchor_absent suite never
++// inherits the hourly backoff); only unknown ends and checks that find
++// nothing they may adopt (no anchor at all; an unsigned candidate while
++// adoption.adopt_unsigned is off) fail here. Without an adopter (Phase 1)
++// every Conditional error still extends the streak, as before phase E.
+ func (c *Checker) failCheck(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, nowUnix int64, form string, err error) {
+ 	host, suitePath := suite.CanonicalHost, suite.SuitePath
+@@ -263,9 +278,10 @@ func (c *Checker) failCheck(ctx context.Context, out *checkOutcome, cur *cache.S
+ var errUnexpectedStatus = errors.New("unexpected success status")
+ 
+-// steadyResult handles, for both signed forms (ruling R-E3: one 304/
+-// unchanged helper), the responses that say upstream still serves what
+-// the suite has: a 304 — which, while a failure record's validators were
+-// sent, says upstream still serves the failing content (spec C7
+-// changed_deferred) — and a 200 carrying the current anchor's bytes
++// steadyResult handles, for every form (ruling R-E3: one 304/unchanged
++// helper), the responses that say upstream still serves what the suite
++// has: a 304 — which, when the failure record's own validators were sent
++// (retryGate.recordValidators), says upstream still serves the failing
++// content (spec C7 changed_deferred), and otherwise that it still serves
++// the current anchor — and a 200 carrying the current anchor's bytes
+ // (newHash == cachedHash), whose validators are taken (the only response
+ // they are ever taken from, spec C4) and which clears a failure record
+@@ -273,5 +289,5 @@ var errUnexpectedStatus = errors.New("unexpected success status")
+ func steadyResult(cur *cache.SuiteFreshness, res *fetch.ConditionalResult, newHash, cachedHash string, gate retryGate, nowUnix int64) (result string, clearRecord, ok bool) {
+ 	switch {
+-	case res.Status == 304 && gate.active:
++	case res.Status == 304 && gate.recordValidators():
+ 		setChangeSeen(cur, nowUnix)
+ 		return "changed_deferred", false, true
+@@ -468,4 +484,9 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome,
  
  	res, err := c.fetcher.Conditional(fetchCtx, target, etag, lastmod, c.maxBody)
 +	if c.adopter != nil && cur.CurrentSnapshotID != nil {
@@ -7025,7 +8552,7 @@ index 33c5c8f..a4156eb 100644
 +	}
  	if err != nil {
  		if errors.Is(err, context.Canceled) {
-@@ -641,5 +648,20 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
+@@ -641,5 +662,20 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
  	defer releaseSlot()
  
 +	lateralHeld := false
@@ -7046,7 +8573,7 @@ index 33c5c8f..a4156eb 100644
 +	}
  	if err != nil {
  		if errors.Is(err, context.Canceled) {
-@@ -668,6 +690,7 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
+@@ -668,6 +704,7 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
  		// A 304 while a failure record exists: Release still matches the
  		// failing content's validators, and a re-signature behind it waits
 -		// for the retry (spec C7).
@@ -7056,11 +8583,94 @@ index 33c5c8f..a4156eb 100644
 +		e.result, e.clearRecord = result, clear && !lateralHeld
  	} else {
  		setChangeSeen(cur, nowUnix)
+@@ -680,5 +717,21 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
+ 		}
+ 		gpgRes, gerr := c.fetcher.Conditional(fetchCtx, gpgTarget, "", "", defaultMaxReleaseGPGBytes)
++		var sig probeOutcome
++		if c.adopter != nil && cur.CurrentSnapshotID != nil {
++			sig = classify(gpgRes, gerr, sniffReleaseGPG, false)
++		}
+ 		switch {
++		case sig.class == classAbsent:
++			// Design review M-14: the changed Release has no signature —
++			// absent (ruling R-E4), never adopted. The refusal state
++			// anchor_absent makes it visible and paces the suite
++			// (pacedAbsent); a record the lateral InRelease still holds
++			// keeps its own schedule. last_success_at stays, as for an
++			// absent current anchor (spec C4).
++			if !lateralHeld {
++				c.recordAdoptionFailure(&adoptionRequest{suite: suite, key: anchorAbsentKey}, cache.ReasonAnchorAbsent)
++			}
++			cur.LastSuccessAt = prevSuccess
++			e.result, e.reason, e.status = "anchor_absent", cache.ReasonAnchorAbsent, sig.status
+ 		case gerr != nil || gpgRes.Status != 200:
+ 			// As before: record the change and retry on a later check;
+diff --git a/internal/freshness/first_adoption.go b/internal/freshness/first_adoption.go
+index 9a60a77..825b351 100644
+--- a/internal/freshness/first_adoption.go
++++ b/internal/freshness/first_adoption.go
+@@ -298,4 +298,27 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
+ }
+ 
++// unsignedRefusal applies spec C5's refusals to an unsigned request before
++// a slot is taken — the first adoption's (unsignedFirst) and an unsigned
++// suite's update (checkUnsigned, anchorFoundAgain): never-downgrade
++// (Adopter.unsignedEligible's signed history: unsigned_downgrade_refused)
++// and the member cap (unsignedTooLarge: unsigned_too_large; design review
++// M-5). It records the refusal and returns its reason, "" to go on, or an
++// error — the knob off, a read error — for which the caller fails the
++// check.
++func (c *Checker) unsignedRefusal(ctx context.Context, req *adoptionRequest) (string, error) {
++	switch err := c.adopter.unsignedEligible(ctx, req.suite); {
++	case errors.Is(err, ErrAdoptionUnsignedDowngradeRefused):
++		c.recordAdoptionFailure(req, cache.ReasonUnsignedDowngradeRefused)
++		return cache.ReasonUnsignedDowngradeRefused, nil
++	case err != nil:
++		return "", err
++	}
++	if err := unsignedTooLarge(req.releaseBytes); err != nil {
++		c.recordAdoptionFailure(req, cache.ReasonUnsignedTooLarge)
++		return cache.ReasonUnsignedTooLarge, nil
++	}
++	return "", nil
++}
++
+ // unsignedFirst applies spec C5's safeguards to an unsigned candidate of
+ // a never-adopted suite, before a slot is taken: the knob (off: an error,
+@@ -321,14 +344,6 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
+ // confirmation.
+ func (c *Checker) unsignedFirst(ctx context.Context, cur *cache.SuiteFreshness, req *adoptionRequest, t probeTree, gate retryGate, now time.Time) (proceed bool, reason string, err error) {
+-	switch err := c.adopter.unsignedEligible(ctx, req.suite); {
+-	case errors.Is(err, ErrAdoptionUnsignedDowngradeRefused):
+-		c.recordAdoptionFailure(req, cache.ReasonUnsignedDowngradeRefused)
+-		return false, cache.ReasonUnsignedDowngradeRefused, nil
+-	case err != nil:
+-		return false, "", err
+-	}
+-	if err := unsignedTooLarge(req.releaseBytes); err != nil {
+-		c.recordAdoptionFailure(req, cache.ReasonUnsignedTooLarge)
+-		return false, cache.ReasonUnsignedTooLarge, nil
++	if refusal, err := c.unsignedRefusal(ctx, req); err != nil || refusal != "" {
++		return false, refusal, err
+ 	}
+ 	sameContent := gate.active && gate.hash == req.key
 diff --git a/internal/freshness/freshness.go b/internal/freshness/freshness.go
-index 27ae44d..84a987b 100644
+index 27ae44d..6ed48cb 100644
 --- a/internal/freshness/freshness.go
 +++ b/internal/freshness/freshness.go
-@@ -348,4 +348,8 @@ type repairRequest struct {
+@@ -335,4 +335,11 @@ type adoptionRequest struct {
+ 	// a failure is recorded under it.
+ 	key string
++
++	// crossForm marks a request whose form is not the suite's current
++	// form (a lateral move, an unsigned suite's upgrade, the probe tree of
++	// an absent anchor): its validators belong to another anchor file than
++	// the one the check conditional-GETs, so a failure record keeps none
++	// (design review I-1). A successful adoption still stores them.
++	crossForm bool
+ }
+ 
+@@ -348,4 +355,8 @@ type repairRequest struct {
  	suite      SuiteRef
  	snapshotID int64
 +	// signed: the current snapshot is signed, so the repair may take the
@@ -7069,7 +8679,7 @@ index 27ae44d..84a987b 100644
 +	signed bool
  }
  
-@@ -626,4 +630,11 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease)
+@@ -626,4 +637,11 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease)
  // suites (the steady state) never compete with adoptions for slots. The
  // slot is still taken without waiting and before spawning.
 +// AIDEV-NOTE: the reserved-slot rule follows the suite (rp.signed: its
@@ -7081,14 +8691,14 @@ index 27ae44d..84a987b 100644
 +// repair is counted (acu_repair_deferred_total, B-31).
  func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
  	rp := out.repair
-@@ -639,5 +650,5 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
+@@ -639,5 +657,5 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
  		c.logger.Warn("adoption_reconcile_failed",
  			"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
 -			"snapshot_id", rp.snapshotID, "err", err)
 +			"snapshot_id", rp.snapshotID, "stage", "decision", "err", err)
  	}
  	out.needReconcile = needReconcile
-@@ -646,8 +657,9 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
+@@ -646,8 +664,9 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
  		return
  	}
 -	l, ok := c.admission.tryAcquire(rp.suite.CanonicalHost, true)
@@ -7099,7 +8709,7 @@ index 27ae44d..84a987b 100644
 +		repairDeferredTotal.Inc(rp.suite.CanonicalHost)
  		out.repair = nil
  		return
-@@ -680,4 +692,10 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
+@@ -680,4 +699,10 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
  // AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, lease
  // release, recover (first). See recoverGoroutine.
 +// AIDEV-NOTE: a repair or reconcile that panics deterministically is
@@ -7110,14 +8720,48 @@ index 27ae44d..84a987b 100644
 +// phase E: v7 has no record keyed on a snapshot).
  func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
  	rp, l, needRepair, needReconcile := out.repair, out.lease, out.needRepair, out.needReconcile
-@@ -700,5 +718,5 @@ func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
+@@ -700,5 +725,5 @@ func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
  				c.logger.Warn("adoption_reconcile_failed",
  					"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
 -					"snapshot_id", rp.snapshotID, "err", err)
 +					"snapshot_id", rp.snapshotID, "stage", "heal", "err", err)
  			}
  		}
-@@ -1122,5 +1140,12 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
+@@ -1022,12 +1047,29 @@ func (c *Checker) retryGateFor(cur *cache.SuiteFreshness, now time.Time) retryGa
+ }
+ 
+-// validators returns what the conditional GET sends: the current
+-// anchor's validators with no record, the failing content's before
+-// next_retry_at, none at or after it.
++// recordValidators reports whether the conditional GET sends the failure
++// record's validators: a record is active, not due, and holds validators —
++// the failing content's, from a request of the current form (a cross-form
++// request records none).
++func (g retryGate) recordValidators() bool {
++	return g.active && !g.due && (g.etag != "" || g.lastmod != "")
++}
++
++// validators returns what the conditional GET sends: none at or after the
++// record's next_retry_at; the failing content's before it when the record
++// holds validators; otherwise — no record, or a record without validators —
++// the current anchor's own.
++//
++// AIDEV-NOTE: design review I-1. A record's validators are those of the
++// anchor file its request fetched; sent on another file's GET they can
++// answer 304 for content never seen (a detached suite's Release behind a
++// CDN that sends Last-Modified only, after its lateral InRelease failed),
++// which froze the suite. Cross-form requests therefore record none, and a
++// 304 is changed_deferred only when the record's own were sent
++// (steadyResult).
+ func (g retryGate) validators(cur *cache.SuiteFreshness) (etag, lastmod string) {
+ 	switch {
+ 	case g.active && g.due:
+ 		return "", ""
+-	case g.active:
++	case g.recordValidators():
+ 		return g.etag, g.lastmod
+ 	}
+@@ -1122,5 +1164,12 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
  		return false
  	}
 -	l, ok := c.admission.tryAcquire(host, true)
@@ -7131,7 +8775,7 @@ index 27ae44d..84a987b 100644
 +	l, ok := c.admission.tryAcquire(host, signed)
  	if !ok {
  		mu.Unlock()
-@@ -1140,5 +1165,5 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
+@@ -1140,5 +1189,5 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
  			c.logger.Warn("adoption_reconcile_failed",
  				"canonical_host", host, "suite_path", suitePath,
 -				"snapshot_id", snapID, "err", err)
@@ -7139,10 +8783,18 @@ index 27ae44d..84a987b 100644
  		}
  	}()
 diff --git a/internal/freshness/metrics.go b/internal/freshness/metrics.go
-index f66d9a1..8212903 100644
+index f66d9a1..c064827 100644
 --- a/internal/freshness/metrics.go
 +++ b/internal/freshness/metrics.go
-@@ -61,4 +61,15 @@ var (
+@@ -33,5 +33,6 @@ import (
+ // (spec C7, unlabelled gauge); acu_freshness_waiting_for_slot (spec C4,
+ // unlabelled gauge); acu_freshness_unlogged_panics_total (deferred minor
+-// B-44, unlabelled counter). The flip barrier's acu_flip_hold_skipped_total,
++// B-44, unlabelled counter); acu_repair_deferred_total (deferred minor
++// B-31, counter by host). The flip barrier's acu_flip_hold_skipped_total,
+ // acu_flip_hold_expired_total, acu_flip_quiet_cut_short_total,
+ // acu_flip_waiters_over_cap_total, acu_flip_slow_anchor_reads_total and
+@@ -61,4 +62,15 @@ var (
  	)
  
 +	// repairDeferredTotal counts repairs and reconciles of an unchanged
@@ -7158,33 +8810,86 @@ index f66d9a1..8212903 100644
 +
  	// freshnessStaleSuites is the per-tick gauge of suites whose
  	// last_success_at has aged past staleSuiteFactor*refresh (SPEC §7.4
-```
-
-Two comments the new dispatch makes stale change with it. In `internal/freshness/check.go`, `failCheck`'s second AIDEV-NOTE (the one that begins "in phase B every Conditional error extends the streak") becomes:
-
-```go
-// AIDEV-NOTE: with an adopter wired, classify sends 401/403/404/410 and a
-// 200 failing its sniff to absent before this point (ruling R-E4: an
-// absent anchor resets the streak, so an anchor_absent suite never
-// inherits the hourly backoff); only unknown ends and checks that find
-// nothing they may adopt (no anchor at all; an unsigned candidate while
-// adoption.adopt_unsigned is off) fail here. Without an adopter (Phase 1)
-// every Conditional error still extends the streak, as before phase E.
-```
-
-In `internal/freshness/metrics.go`, the metrics inventory AIDEV-NOTE (spec C11 lists every new metric there) records the counter: its lines
-
-```go
-// unlabelled gauge); acu_freshness_unlogged_panics_total (deferred minor
-// B-44, unlabelled counter). The flip barrier's acu_flip_hold_skipped_total,
-```
-
-become
-
-```go
-// unlabelled gauge); acu_freshness_unlogged_panics_total (deferred minor
-// B-44, unlabelled counter); acu_repair_deferred_total (deferred minor
-// B-31, counter by host). The flip barrier's acu_flip_hold_skipped_total,
+diff --git a/internal/freshness/scheduler.go b/internal/freshness/scheduler.go
+index 9108215..706cf58 100644
+--- a/internal/freshness/scheduler.go
++++ b/internal/freshness/scheduler.go
+@@ -29,10 +29,12 @@ const staleSuiteFactor = 4
+ // staleSuiteCounts partitions suites whose last_success_at has aged past
+ // staleBefore into adopted (current_snapshot_id set — the dangerous case
+-// that serves stale metadata) and unadopted. A nil last_success_at is
+-// treated as "never succeeded" rather than "went stale" and is not
+-// counted, so brand-new suites don't trip the gauge. A last_success_at
+-// more than clockStepTolerance past now (backward clock step) counts as
+-// stale (spec C4). SPEC §7.4.
+-func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore, now int64) (adopted, unadopted int) {
++// that serves stale metadata) and unadopted, and counts the adopted ones
++// in a refusal state (refused, a subset of adopted: an anchor_absent suite
++// keeps its old last_success_at on purpose, spec C4). A nil
++// last_success_at is treated as "never succeeded" rather than "went
++// stale" and is not counted, so brand-new suites don't trip the gauge. A
++// last_success_at more than clockStepTolerance past now (backward clock
++// step) counts as stale (spec C4). SPEC §7.4.
++func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore, now int64) (adopted, unadopted, refused int) {
+ 	futureAfter := now + int64(clockStepTolerance/time.Second)
+ 	for _, s := range suites {
+@@ -45,11 +47,15 @@ func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore, now int64) (ad
+ 			continue
+ 		}
+-		if s.CurrentSnapshotID != nil {
+-			adopted++
+-		} else {
++		switch {
++		case s.CurrentSnapshotID == nil:
+ 			unadopted++
++		case s.AdoptionFailCount > 0 && s.AdoptionFailReason != nil && cache.IsRefusalReason(*s.AdoptionFailReason):
++			adopted++
++			refused++
++		default:
++			adopted++
+ 		}
+ 	}
+-	return adopted, unadopted
++	return adopted, unadopted, refused
+ }
+ 
+@@ -335,4 +341,14 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
+ 	nowU := now.Unix()
+ 	future := nowU + int64(clockStepTolerance/time.Second)
++	// Ruling PE-2: an adopted suite in the refusal state anchor_absent is
++	// due only at its record's retry time (pacedAbsent), whatever its
++	// last_success_at. A next_retry_at beyond the legitimate horizon (a
++	// backward clock step) is not paced here: once the suite is due (its
++	// last_success_at is old), the check clamps it (retryGateFor).
++	if c.adopter != nil && s.CurrentSnapshotID != nil && s.AdoptionFailCount > 0 && s.AdoptionFailReason != nil &&
++		*s.AdoptionFailReason == cache.ReasonAnchorAbsent && s.AdoptionNextRetryAt != nil &&
++		*s.AdoptionNextRetryAt > nowU && *s.AdoptionNextRetryAt <= nowU+int64(retryHorizon/time.Second) {
++		return false
++	}
+ 	stale := s.LastSuccessAt == nil || *s.LastSuccessAt <= now.Add(-c.refresh).Unix()
+ 	if s.LastSuccessAt != nil && *s.LastSuccessAt > future {
+@@ -555,10 +571,18 @@ func (c *Checker) tick(ctx context.Context, q *schedQueues) {
+ 	// staleSuiteFactor*refresh is the freeze signature.
+ 	staleBefore := nowT.Add(-staleSuiteFactor * c.refresh).Unix()
+-	adoptedStale, unadoptedStale := staleSuiteCounts(suites, staleBefore, nowT.Unix())
++	adoptedStale, unadoptedStale, refusedStale := staleSuiteCounts(suites, staleBefore, nowT.Unix())
+ 	freshnessStaleSuites.Set(float64(adoptedStale), "true")
+ 	freshnessStaleSuites.Set(float64(unadoptedStale), "false")
+-	if adoptedStale > 0 {
++	// Design review M-13: a suite in a refusal state (anchor_absent keeps
++	// its last_success_at old on purpose) is visible on its own — the
++	// status page, adoption_refused and, after a day,
++	// adoption_refused_persistently — so the WARN leaves it out; the gauge
++	// counts it. Without an adopter records are inert and count as stale.
++	if c.adopter == nil {
++		refusedStale = 0
++	}
++	if warnStale := adoptedStale - refusedStale; warnStale > 0 {
+ 		c.logger.Warn("freshness: adopted suites stale beyond threshold",
+-			"adopted_stale", adoptedStale,
++			"adopted_stale", warnStale,
+ 			"stale_factor", staleSuiteFactor,
+ 			"refresh", c.refresh.String(),
 ```
 
 - [ ] **Step 4: Change the existing expectations**
@@ -7194,6 +8899,7 @@ become
 | `TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange` | `InRelease` never requested | requested (answers 404), then the detached adoption | spec C4 Dispatch 1: a detached suite probes `InRelease` on every check |
 | `TestCheck_UnchangedTick_LogsReconcileFailure` | — | also asserts `stage: decision` | deferred minor B-30 |
 | `TestCheck_RepairObeysTheGlobalSlot` | — | also asserts `acu_repair_deferred_total{host=b.example}` rose by 1 | deferred minor B-31 |
+| `TestStaleSuiteCounts` | two return values | three: also `refused`, 0 for its suites (none has a record) | design review M-13: the stale WARN leaves out suites in a refusal state |
 
 ```diff
 diff --git a/internal/freshness/capacity_test.go b/internal/freshness/capacity_test.go
@@ -7214,10 +8920,25 @@ index d3ec4d5..43637dc 100644
  	deferred := false
  	for _, line := range strings.Split(logs.String(), "\n") {
 diff --git a/internal/freshness/freshness_test.go b/internal/freshness/freshness_test.go
-index 3cddaf4..3af979b 100644
+index 69512f9..cd0c3cd 100644
 --- a/internal/freshness/freshness_test.go
 +++ b/internal/freshness/freshness_test.go
-@@ -1412,6 +1412,6 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
+@@ -787,5 +787,5 @@ func TestStaleSuiteCounts(t *testing.T) {
+ 		mk(i(3003), i(7)), // 3 s ahead -> infinitely old: count adopted
+ 	}
+-	adopted, unadopted := staleSuiteCounts(suites, staleBefore, now)
++	adopted, unadopted, refused := staleSuiteCounts(suites, staleBefore, now)
+ 	if adopted != 4 {
+ 		t.Errorf("adopted stale = %d, want 4", adopted)
+@@ -794,4 +794,7 @@ func TestStaleSuiteCounts(t *testing.T) {
+ 		t.Errorf("unadopted stale = %d, want 1", unadopted)
+ 	}
++	if refused != 0 {
++		t.Errorf("refused stale = %d, want 0 (no suite has a record)", refused)
++	}
+ }
+ 
+@@ -1412,6 +1415,6 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
  			_, _ = w.Write(sigBody)
  		case "/dists/noble/InRelease":
 -			// Detached path must NOT hit InRelease for a known-detached
@@ -7226,7 +8947,7 @@ index 3cddaf4..3af979b 100644
 +			// on every check (a lateral move to inline); absent here.
  			gotInReleaseFetch.Store(true)
  			w.WriteHeader(http.StatusNotFound)
-@@ -1496,6 +1496,6 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
+@@ -1496,6 +1499,6 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
  	c.WaitForAdoptions()
  
 -	if gotInReleaseFetch.Load() {
@@ -7235,7 +8956,7 @@ index 3cddaf4..3af979b 100644
 +		t.Error("known-detached suite did not probe InRelease")
  	}
  	if releaseHits.Load() != 1 {
-@@ -2122,5 +2122,5 @@ func TestCheck_UnchangedTick_LogsReconcileFailure(t *testing.T) {
+@@ -2122,5 +2125,5 @@ func TestCheck_UnchangedTick_LogsReconcileFailure(t *testing.T) {
  		found = true
  		errText, _ := rec["err"].(string)
 -		if rec["level"] != "WARN" || rec["canonical_host"] != "127.0.0.1" ||
@@ -7253,49 +8974,74 @@ Expected: PASS.
 
 | Mutation | Fails |
 |---|---|
-| `lateralInline` never requests (`if true \|\| o.class != classPresent`) | `TestCheck_DetachedSuiteMovesToInlineWhenInReleaseAppears`, `TestCheck_LateralFailingContentKeepsItsRecord` |
-| `lateralInline` never reports held content | `TestCheck_LateralFailingContentKeepsItsRecord` |
+| `lateralInline` never requests (`if true \|\| o.class != classPresent`) | `TestCheck_DetachedSuiteMovesToInlineWhenInReleaseAppears`, `TestCheck_LateralFailingContentKeepsItsRecord`, `TestCheck_DetachedSuiteKeepsAdoptingWhileItsLateralInReleaseFails`, `TestCheck_AbsentSignatureKeepsTheLateralRecord` |
+| `lateralInline` never reports held content | `TestCheck_AbsentSignatureKeepsTheLateralRecord` |
 | `anchorAbsent`: the gap compared with 0 | `TestCheck_AbsentAnchorMovesLaterallyAfterTwoObservations` |
-| `anchorAbsent`: an unsigned candidate counts as a form found | `TestCheck_AbsentAnchorNeverMovesToUnsigned` |
+| `anchorAbsent`: a future first observation confirms (deviation 2, M-19) | `TestCheck_AbsentAnchorWithAFutureFirstAtWaitsAnotherGap` |
+| `anchorAbsent`: an unsigned candidate counts as a form found (`case t.found:`) | `TestCheck_AbsentAnchorNeverMovesToUnsigned` |
+| `anchorAbsent`: an unsigned suite's own form found again is not handled (M-16) | `TestCheck_AbsentUnsignedReleaseThatComesBack/{same_bytes, new_bytes, new_bytes_with_signed_history}` |
 | `anchorAbsent`: the streak not reset | `TestCheck_AbsentAnchorMovesLaterallyAfterTwoObservations` |
 | `anchorAbsent`: `last_success_at` bumped | `TestCheck_AbsentAnchorMovesLaterallyAfterTwoObservations` |
+| `anchorFoundAgain`: `same` never true (X25) | `TestCheck_AbsentAnchorThatComesBackIsUnchanged`, `TestCheck_AbsentUnsignedReleaseThatComesBack/same_bytes` |
+| `anchorFoundAgain`: an unsigned update without the refusals | `TestCheck_AbsentUnsignedReleaseThatComesBack/new_bytes_with_signed_history` |
+| `anchorFoundAgain`: new content of the same form reported `form_changed` | `TestCheck_AbsentUnsignedReleaseThatComesBack/new_bytes` |
+| `anchorFoundAgain`: no marker for a found signature (I-2) | `TestCheck_AbsentUnsignedReleaseTreeFindsASignature` |
+| `checkLocked`: no `anchor_absent` pacing (PE-2) | `TestCheck_AbsentAnchorIsPacedByItsRecord`, `TestCheck_DetachedSuiteThatDropsItsSignatureNeverGoesUnsigned/absent` |
+| `suiteDue`: no `anchor_absent` pacing | `TestCheck_AbsentAnchorIsPacedByItsRecord` |
+| `suiteDue`: the pacing ignores the horizon | `TestCheck_AbsentAnchorIsPacedByItsRecord` |
+| `recordAdoptionFailure` keeps a cross-form request's validators (I-1) | `TestCheck_DetachedSuiteKeepsAdoptingWhileItsLateralInReleaseFails`, `TestCheck_LateralFailingContentKeepsItsRecord` |
+| `steadyResult`: any 304 with an active record is `changed_deferred` (`gate.active`) | `TestCheck_LateralFailingContentKeepsItsRecord` |
+| `validators` sends a record's empty validators (`case g.active:`) | `TestCheck_LateralFailingContentKeepsItsRecord` |
 | `checkInline`: the absence test without the sniff | `TestCheck_CurrentAnchorClassification/HTML_200` |
-| `upgradeProbe`: `InRelease` never present | `TestCheck_UnsignedSuiteUpgradesWhenSigned/InRelease` |
+| `checkDetached`: a `Release.gpg` that fails unknown reports `unchanged` (the first `e.result = "changed"`) | `TestCheck_DetachedSuiteThatDropsItsSignatureNeverGoesUnsigned/unknown` |
+| `checkDetached`: the signature never classified (`sig = probeOutcome{}`; M-14) | `TestCheck_DetachedSuiteThatDropsItsSignatureNeverGoesUnsigned/absent`, `TestCheck_AbsentSignatureKeepsTheLateralRecord` |
+| `checkDetached`: an absent signature takes the lateral content's record (`if true`) | `TestCheck_AbsentSignatureKeepsTheLateralRecord` |
+| `checkDetached`: an absent signature bumps `last_success_at` | `TestCheck_DetachedSuiteThatDropsItsSignatureNeverGoesUnsigned/absent` |
+| `upgradeProbe`: `InRelease` never present | `TestCheck_UnsignedSuiteUpgradesWhenSigned/InRelease`, `TestCheck_UnsignedSuiteSeenSignedNeverUpdatesUnsigned` |
 | `upgradeProbe`: an unknown `InRelease` falls through to the unsigned path | `TestCheck_UnsignedSuiteUpgradesWhenSigned/an_unknown_signature_probe_fails_the_check` |
-| `checkUnsigned`: no never-downgrade check | `TestCheck_UnsignedSuiteUpdates` |
+| `upgradeProbe`: an unknown `Release.gpg` falls through (X06) | `TestCheck_UnsignedSuiteUnknownReleaseGPGFailsTheCheck` |
+| `upgradeProbe`: no marker (I-2) | `TestCheck_UnsignedSuiteSeenSignedNeverUpdatesUnsigned/{stripped_after_a_failed_upgrade, failed_marker_write}` |
+| `upgradeProbe`: a failed mark ignored | `TestCheck_UnsignedSuiteSeenSignedNeverUpdatesUnsigned/failed_marker_write` |
+| `upgradeProbe`: `admit(…, true, …)` (X07) | `TestCheck_UnsignedSuiteNeverTakesTheReservedSlotToAdopt` |
+| `checkUnsigned`: no unsigned refusals | `TestCheck_UnsignedSuiteUpdates`, `TestCheck_UnsignedSuiteTooLargeUpdateIsRefused` |
+| `unsignedRefusal`: no member cap (M-5) | `TestCheck_UnsignedSuiteTooLargeUpdateIsRefused`, `TestCheckFirst_UnsignedTooLargeNeverTakesASlot` |
+| `checkUnsigned`: an unsigned update admitted as signed (X08) | `TestCheck_UnsignedSuiteNeverTakesTheReservedSlotToAdopt` |
 | `detectForm` never returns unsigned | `TestCheck_UnsignedSuiteUpgradesWhenSigned`, `TestCheck_UnsignedSuiteUpdates`, `TestCheck_UnsignedRecoversWhenReleaseAnchorMissing` |
-| `Reconcile`: `signed` always true | `TestReconcile_UnsignedSuiteNeverTakesTheReservedSlot` |
+| the stale WARN counts refusal states (M-13) | `TestTick_StaleWarnLeavesOutRefusalStates` |
+| `staleSuiteCounts` never counts `refused` | `TestStaleSuiteCounts_RefusalStates`, `TestTick_StaleWarnLeavesOutRefusalStates` |
+| `Reconcile`: `signed` always true (`signed = snap.Form != cache.FormUnsigned \|\| true`) | `TestReconcile_UnsignedSuiteNeverTakesTheReservedSlot` |
 | `planRepair`: `tryAcquire(…, true)` | `TestCheck_RepairOfAnUnsignedSuiteNeverTakesTheReservedSlot/unsigned` |
 | `finishCheck`: `rp.signed = true` | `TestFinishCheck_RepairCarriesSignedCurrent`, `TestCheck_RepairOfAnUnsignedSuiteNeverTakesTheReservedSlot/unsigned` |
 | `planRepair` without `repairDeferredTotal.Inc` | `TestCheck_RepairObeysTheGlobalSlot` |
 | `planRepair`'s `adoption_reconcile_failed` without `stage` | `TestCheck_UnchangedTick_LogsReconcileFailure` |
-| `checkDetached`: a `Release.gpg` that fails reports `unchanged` (the first `e.result = "changed"`) | `TestCheck_DetachedSuiteThatDropsItsSignatureNeverGoesUnsigned` |
 
-(`anchorAbsent`'s "same form and content found again" branch is pinned by `TestProbeTree_SameAsTheCurrentSnapshot` at the predicate only: hitting it end to end needs an anchor that disappears and reappears within one check.)
+(`lateralInline`'s held flag is pinned through the lateral record an absent signature must not take: with the current Release's own validators, the held window's detached GET answers 304, which never clears a record.)
 
 - [ ] **Step 7: Commit**
 
 ```bash
 gofmt -l internal/freshness/current_form.go internal/freshness/current_form_test.go internal/freshness/check.go \
-  internal/freshness/freshness.go internal/freshness/metrics.go internal/freshness/freshness_test.go internal/freshness/capacity_test.go
+  internal/freshness/freshness.go internal/freshness/metrics.go internal/freshness/adoption_failure.go internal/freshness/first_adoption.go \
+  internal/freshness/scheduler.go internal/freshness/retry_rig_test.go internal/freshness/freshness_test.go internal/freshness/capacity_test.go
 git add internal/freshness/current_form.go internal/freshness/current_form_test.go internal/freshness/check.go \
-  internal/freshness/freshness.go internal/freshness/metrics.go internal/freshness/freshness_test.go internal/freshness/capacity_test.go
+  internal/freshness/freshness.go internal/freshness/metrics.go internal/freshness/adoption_failure.go internal/freshness/first_adoption.go \
+  internal/freshness/scheduler.go internal/freshness/retry_rig_test.go internal/freshness/freshness_test.go internal/freshness/capacity_test.go
 git commit -m "Move adopted suites between anchor forms: lateral moves, anchor_absent, the unsigned upgrade"
 ```
 
 ### Task 8: The scheduler under eager adoption — waiters' signed flag, the upgrade-burst simulation, and the scheduler's deferred minors
 
-The overview's "E:" carry-forwards for slot-driven admission: a parked waiter kept the `signed` flag of the check that parked it, so a waiter parked as a first adoption that a client check has since adopted (signed) waited for two free slots instead of one until its next re-check. The tick now reads each suite's current form (`ListSuitesWithAdoption`, which the admin page already uses; the checker's `Cache` interface swaps `ListSuites` for it) and sets every waiter's flag to "its current snapshot is signed" (`refreshSigned`): within one tick, and never wrong in either direction (design note 25). The capacity simulation gains the upgrade burst: 50 never-adopted suites with interest and a trickle of signed changes, pool of two — first adoptions one at a time and back to back, a signed change waits for at most one adoption, each first-adoption suite costs at most two probes, goroutines bounded. Documenting `max_concurrent_adoptions = 3` as the knob that lets two first adoptions run at once is Task 15's.
+The overview's "E:" carry-forwards for slot-driven admission: a parked waiter kept the `signed` flag of the check that parked it, so a waiter parked as a first adoption that a client check has since adopted (signed) waited for two free slots instead of one until its next re-check. The tick now reads each suite's current form (`ListSuitesWithAdoption`, which the admin page already uses; the checker's `Cache` interface swaps `ListSuites` for it) and sets every waiter's flag to "its current snapshot is signed" (`refreshSigned`): within one tick, and never wrong in either direction (design note 25). The capacity simulation gains the upgrade burst: 50 never-adopted suites with interest and a trickle of signed changes, pool of two — first adoptions one at a time and back to back, a signed change waits for at most one adoption, each first-adoption suite costs at most two probes, goroutines bounded. It is deterministic (its signed anchors answer 1 s late, so an offer never races a same-instant signed check) and runs 80 virtual minutes, about 3 s under `-race` (ruling PE-8: under 5 s with margin; the last adoption starts at about 68 minutes). Ruling PE-4 (design review I-5) adds the burst where production has it — `TestSimCapacity_UpgradeBurstSameHost`: 3 hosts × (8 never-adopted + 2 signed) suites, commits that take 2 s, a client checking each never-adopted suite every 5 minutes until it adopts, and no delay ordering the checks, so admissions race. It asserts first adoptions one at a time; a signed change waiting for at most one adoption (its commit included) + D + one host turn; each never-adopted suite's anchor probes before its adoption at most 2 + its client checks + its lost offers — the bound design note 26 now states; and lost offers in all at most the admissions in all (work-conserving). A test-only `Checker.offerHook` (run on the Run goroutine for each finished offer) counts the lost offers. Documenting `max_concurrent_adoptions = 3` as the knob that lets two first adoptions run at once is Task 15's.
 
 Deferred minors in `scheduler.go` and `admission.go`: B-38 (a future `last_success_at` was counted as a clock step on every tick: `suiteDue` now reads it as infinitely old silently and the check that heals it reports it once), B-45 (an offer refused after a slot release it could not see is re-offered at once: a release generation stamps each dispatched item), B-46 (a re-parked waiter returns to its place by a waiting sequence number, so lost or busy offers in a row never invert the order), B-66 (a suite already class-queued as stale that a client check leaves with a pending change keeps the mark for its turn), D-23 (`boundDue`'s "admitted suites keep key order" is pinned).
 
 **Files:**
 - Create: `internal/freshness/sched_e_test.go`, `internal/freshness/sim_burst_test.go`
-- Modify: `internal/freshness/scheduler.go` (`schedItem`, `schedQueues`, `enqueue`, `park`, `refreshSigned`, `finish`, `pop`, `done`, `Run`, `withGen`, `suiteDue`, `tick`), `internal/freshness/admission.go` (`releases`, `generation`), `internal/freshness/freshness.go` (the `Cache` interface), `internal/freshness/check.go` (`checkLocked` reports a future `last_success_at`), `internal/freshness/freshness_test.go` (`fakeCache.ListSuitesWithAdoption`); `internal/freshness/scheduler_test.go` and `internal/freshness/suite_lock_test.go` only by the mechanical `finish` signature change below (PD-1)
+- Modify: `internal/freshness/scheduler.go` (`schedItem`, `schedQueues`, `enqueue`, `park`, `refreshSigned`, `finish`, `pop`, `done`, `Run` (and its `offerHook` call), `withGen`, `suiteDue`, `tick`), `internal/freshness/admission.go` (`releases`, `generation`), `internal/freshness/freshness.go` (the `Cache` interface, `Checker.offerHook`), `internal/freshness/check.go` (`checkLocked` reports a future `last_success_at`), `internal/freshness/freshness_test.go` (`fakeCache.ListSuitesWithAdoption`); `internal/freshness/scheduler_test.go` and `internal/freshness/suite_lock_test.go` only by the mechanical `finish` signature change below (PD-1)
 
 **Interfaces:**
 - Consumes: Task 6's first-adoption results, `seedStaleAnchorAt` (Task 5: client interest and a client-created anchor); `cache.(*Cache).ListSuitesWithAdoption`, `cache.SuiteWithAdoption.CurrentAnchorForm`; test helpers `simMembers`, `startSched`, `signedRelease`, `trackSuite`, `schedRow`, `admitAll`, `admitNone`, `mustAcquire`, `seedFakeSuite`, `fakeCache.putSnapshot`, `renderedMetric`.
-- Produces: `freshness.Cache.ListSuitesWithAdoption(ctx) ([]cache.SuiteWithAdoption, error)` (replaces `ListSuites` in the interface); `(*admission).generation() uint64`; `schedItem.waitSeq`, `schedItem.gen`; `(*schedQueues).refreshSigned(signed map[string]bool)`; `(*schedQueues).finish(d checkDone, gen uint64)`; `withGen(item schedItem, gen uint64) schedItem`. Test helper `admitSigned` (`sched_e_test.go`).
+- Produces: `freshness.Cache.ListSuitesWithAdoption(ctx) ([]cache.SuiteWithAdoption, error)` (replaces `ListSuites` in the interface); `(*admission).generation() uint64`; `schedItem.waitSeq`, `schedItem.gen`; `(*schedQueues).refreshSigned(signed map[string]bool)`; `(*schedQueues).finish(d checkDone, gen uint64)`; `withGen(item schedItem, gen uint64) schedItem`; the test seam `Checker.offerHook func(ref SuiteRef, rep checkReport)`. Test helpers `admitSigned` (`sched_e_test.go`), `startsByURL` (`sim_burst_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -7476,6 +9222,36 @@ func TestBoundDue_AdmittedSuitesKeepKeyOrder(t *testing.T) {
 		t.Fatalf("admitted %v, want /b then /c (the two least recently checked, in key order)", got)
 	}
 }
+
+// Deferred minor B-66 (proposed by the executability review, D5): a
+// pending mark that reaches a suite while it is in flight (a client check
+// leaves a pending change during the scheduled check) is dropped when the
+// suite's turn ends (done), so it never makes the suite's NEXT queued
+// turn bypass the cooldown. Kills "done keeps the pending mark", which
+// TestSchedQueues_PendingChangeReachesAQueuedSuite cannot: there pop has
+// already dropped the mark before done runs.
+func TestSchedQueues_PendingMarkWhileInFlightEndsWithTheTurn(t *testing.T) {
+	q := newSchedQueues()
+	one := int64(1)
+	s := schedRow("a", "/1", &one, 0)
+	q.enqueue(s, false)
+	it, ok := q.pop(admitAll)
+	if !ok || it.pendingChange {
+		t.Fatalf("setup: pop = %+v, %v; want the suite without a pending mark", it, ok)
+	}
+	if q.enqueue(s, true) { // in flight: a duplicate, the mark is noted
+		t.Fatal("an in-flight suite was queued twice")
+	}
+	q.done(it)
+	q.enqueue(s, false)
+	next, ok := q.pop(admitAll)
+	if !ok {
+		t.Fatal("the suite was not queued again after its turn")
+	}
+	if next.pendingChange {
+		t.Fatal("a pending mark noted while the suite was in flight outlived its turn")
+	}
+}
 ```
 
 Create `internal/freshness/sim_burst_test.go`:
@@ -7488,6 +9264,7 @@ import (
 	"fmt"
 	"runtime"
 	"slices"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -7511,9 +9288,12 @@ import (
 // takes its slot before a signed check that runs at the same instant asks
 // for one: same-instant goroutine order inside a bubble is not
 // deterministic, and an offer that loses its slot to a concurrent check
-// costs its suite a third probe (a lost offer, spec C4: it keeps its place
+// costs its suite one more probe (a lost offer, spec C4: it keeps its place
 // and waits for the next release). The two-probe bound is for offers that
-// meet no concurrent admission (phase E plan, design note 26).
+// meet no concurrent admission and suites no client checks (phase E plan,
+// design note 26); TestSimCapacity_UpgradeBurstSameHost has both. The run
+// lasts 80 virtual minutes (the last adoption starts at about 68): ruling
+// PE-8's 5 s budget under -race, with margin.
 func TestSimCapacity_UpgradeBurst(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
@@ -7575,7 +9355,7 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
 		maxG := base
 		_, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
 			Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }})
-		for time.Since(t0) < 3*time.Hour {
+		for time.Since(t0) < 80*time.Minute {
 			time.Sleep(61 * time.Second) // off the 3 m 45 s tick grid
 			maxG = max(maxG, runtime.NumGoroutine())
 		}
@@ -7648,18 +9428,238 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
 		}
 	})
 }
+
+// startsByURL wraps a member fetcher and records each URL's first fetch:
+// the start of the adoption that fetches it.
+type startsByURL struct {
+	AdoptionFetcher
+	mu sync.Mutex
+	at map[string]time.Time
+}
+
+func (s *startsByURL) Fetch(ctx context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
+	s.mu.Lock()
+	if _, seen := s.at[target.URL]; !seen {
+		s.at[target.URL] = time.Now()
+	}
+	s.mu.Unlock()
+	return s.AdoptionFetcher.Fetch(ctx, target, dst)
+}
+
+// Ruling PE-4 (design review I-5): the upgrade burst where production has
+// it — shared hosts (an archive host carries several suites) — and with
+// admissions that race: 3 hosts × (8 never-adopted + 2 signed) suites, a
+// pool of two, commits that take 2 s, a client checking each never-adopted
+// suite every 5 minutes until it is adopted, and no delay ordering the
+// signed checks behind the offers. Asserted:
+//  1. first adoptions run one at a time;
+//  2. a signed change waits for at most one adoption (its commit included)
+//     + D + one host turn (its host's check in flight, at most D);
+//  3. each never-adopted suite's anchor probes before its adoption started
+//     are at most 2 (the scheduler's) + its client checks + its lost offers
+//     (offers another admission took first);
+//  4. lost offers in all are at most the admissions in all — each lost
+//     offer coincides with another admission (work-conserving);
+//  5. goroutines stay bounded.
+func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		c := simtest.OpenCache(t)
+		members := &simMembers{fakeFetcher: newFakeFetcher(), stalled: map[string]bool{}, delay: map[string]time.Duration{}}
+		starts := &startsByURL{AdoptionFetcher: members, at: map[string]time.Time{}}
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: starts, Verifier: passThroughVerifier{},
+			HostLimiter: hostsem.New(8), MaxConcurrent: 2, MaxDuration: 30 * time.Minute, Logger: simtest.DiscardLogger()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const commit = 2 * time.Second
+		ad.SetCommitDelayForTest(commit)
+		pkgsFor := func(label string) []byte {
+			return fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_" + label + ".deb": testHex64})
+		}
+		pkgsURL := func(s SuiteRef) string {
+			return "http://" + s.CanonicalHost + s.SuitePath + "/main/binary-amd64/Packages"
+		}
+		anchorURL := func(s SuiteRef) string { return "http://" + s.CanonicalHost + s.SuitePath + "/InRelease" }
+		up := simtest.NewUpstream()
+		t0 := time.Now()
+		var first, signed []SuiteRef
+		changeAt := map[SuiteRef]time.Duration{}
+		for h := 0; h < 3; h++ {
+			host := fmt.Sprintf("h%d", h)
+			for i := 0; i < 8; i++ {
+				s := SuiteRef{CanonicalScheme: "http", CanonicalHost: host, SuitePath: fmt.Sprintf("/r/dists/f%d", i)}
+				seedStaleAnchorAt(t, c, host, s.SuitePath) // client interest now, a client-created anchor
+				label := host + s.SuitePath
+				members.put(pkgsURL(s), pkgsFor(label))
+				members.delay[pkgsURL(s)] = time.Minute
+				up.Set(anchorURL(s), simtest.Serve(signedRelease("first "+label, 0,
+					map[string][]byte{"main/binary-amd64/Packages": pkgsFor(label)})))
+				first = append(first, s)
+			}
+			for i := 0; i < 2; i++ {
+				s := SuiteRef{CanonicalScheme: "http", CanonicalHost: host, SuitePath: fmt.Sprintf("/r/dists/s%d", i)}
+				label := host + s.SuitePath
+				members.put(pkgsURL(s), pkgsFor("1 "+label))
+				trackSuite(t, c, s)
+				v1 := signedRelease("v1 "+label, 0, map[string][]byte{"main/binary-amd64/Packages": pkgsFor("1 " + label)})
+				if err := ad.Run(ctx, s, v1, "", ""); err != nil {
+					t.Fatal(err)
+				}
+				members.put(pkgsURL(s), pkgsFor("2 "+label))
+				members.delay[pkgsURL(s)] = time.Minute
+				v2 := signedRelease("v2 "+label, 0, map[string][]byte{"main/binary-amd64/Packages": pkgsFor("2 " + label)})
+				at := time.Duration(5+6*len(signed))*time.Minute + 7*time.Second // a trickle through the burst
+				changeAt[s] = at
+				up.Set(anchorURL(s), func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
+					if time.Since(t0) < at {
+						return simtest.Serve(v1)(ctx, etag)
+					}
+					return simtest.Serve(v2)(ctx, etag)
+				})
+				signed = append(signed, s)
+			}
+		}
+		starts.mu.Lock()
+		starts.at = map[string]time.Time{} // the signed v1 adoptions above do not count
+		starts.mu.Unlock()
+
+		var mu sync.Mutex
+		lost := map[SuiteRef]int{}
+		clients := map[SuiteRef][]time.Time{}
+		started := func(s SuiteRef) (time.Time, bool) {
+			starts.mu.Lock()
+			defer starts.mu.Unlock()
+			at, ok := starts.at[pkgsURL(s)]
+			return at, ok
+		}
+		runtime.Gosched()
+		base := runtime.NumGoroutine()
+		maxG := base
+		chk, err := New(Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+			Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		chk.offerHook = func(ref SuiteRef, rep checkReport) {
+			if isQueuedResult(rep.result) {
+				mu.Lock()
+				lost[ref]++
+				mu.Unlock()
+			}
+		}
+		runCtx, cancel := context.WithCancel(ctx)
+		runDone := make(chan struct{})
+		go func() { chk.Run(runCtx); close(runDone) }()
+		clientDone := make(chan struct{})
+		go func() { // the clients: every 5 minutes, apt update on each suite not adopted yet
+			defer close(clientDone)
+			for runCtx.Err() == nil {
+				for _, s := range first {
+					if _, ok := started(s); ok {
+						continue
+					}
+					mu.Lock()
+					clients[s] = append(clients[s], time.Now())
+					mu.Unlock()
+					chk.Check(runCtx, s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
+				}
+				select {
+				case <-runCtx.Done():
+				case <-time.After(5 * time.Minute):
+				}
+			}
+		}()
+		for time.Since(t0) < 50*time.Minute {
+			time.Sleep(61 * time.Second) // off the 3 m 45 s tick grid
+			maxG = max(maxG, runtime.NumGoroutine())
+		}
+		cancel()
+		<-runDone
+		<-clientDone
+		chk.WaitForAdoptions()
+
+		mu.Lock()
+		defer mu.Unlock()
+		// (1) Every first adoption ran, one at a time.
+		var firstStarts []time.Time
+		totalLost := 0
+		for _, s := range first {
+			at, ok := started(s)
+			if !ok {
+				t.Fatalf("%v: its first adoption never started", s)
+			}
+			if sf, err := c.GetSuiteFreshness(ctx, "http", s.CanonicalHost, s.SuitePath); err != nil || sf.CurrentSnapshotID == nil {
+				t.Fatalf("%v: not adopted after 50 min (err %v)", s, err)
+			}
+			firstStarts = append(firstStarts, at)
+			// (3) Anchor probes before its adoption started.
+			probes, checks := 0, 0
+			for _, call := range up.Calls(anchorURL(s)) {
+				if !call.After(at) {
+					probes++
+				}
+			}
+			for _, call := range clients[s] {
+				if !call.After(at) {
+					checks++
+				}
+			}
+			if probes > 2+checks+lost[s] {
+				t.Errorf("%v: %d anchor probes before its adoption, want <= 2 + %d client checks + %d lost offers",
+					s, probes, checks, lost[s])
+			}
+			totalLost += lost[s]
+		}
+		slices.SortFunc(firstStarts, time.Time.Compare)
+		for i := 1; i < len(firstStarts); i++ {
+			if gap := firstStarts[i].Sub(firstStarts[i-1]); gap < time.Minute {
+				t.Fatalf("first adoptions %d and %d overlapped (%v apart): the last free slot is reserved", i-1, i, gap)
+			}
+		}
+		// (2) A signed change waits for at most one adoption + D + one host turn.
+		for _, s := range signed {
+			at, ok := started(s)
+			if !ok {
+				t.Fatalf("%v: its v2 adoption never started", s)
+			}
+			var seen time.Time
+			for _, call := range up.Calls(anchorURL(s)) {
+				if call.Sub(t0) >= changeAt[s] {
+					seen = call
+					break
+				}
+			}
+			if limit := time.Minute + commit + 2*checkDeadline; seen.IsZero() || at.Sub(seen) > limit {
+				t.Errorf("%v: its change was seen at %v and its adoption started %v later, want <= %v",
+					s, seen.Sub(t0), at.Sub(seen), limit)
+			}
+			totalLost += lost[s]
+		}
+		// (4) Work-conserving: a lost offer needs another admission.
+		if admissions := len(first) + len(signed); totalLost > admissions {
+			t.Errorf("%d lost offers for %d admissions", totalLost, admissions)
+		}
+		// (5) Workers + Run + the clients + two adoptions, plus slack for
+		// transient goroutines (the cache writer's work, timer callbacks).
+		const slack = 8
+		if limit := base + checkWorkers + 1 + 1 + 2 + slack; maxG > limit {
+			t.Fatalf("goroutines peaked at %d, limit %d", maxG, limit)
+		}
+	})
+}
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `go test ./internal/freshness/ -run 'TestSchedQueues_LostOffersKeep|TestSchedQueues_LostOfferAfterARelease|TestAdmission_Generation|TestSchedQueues_PendingChangeReaches|TestTick_RefreshesTheWaiters|TestSuiteDue_FutureSuccess|TestBoundDue_Admitted|TestSimCapacity_UpgradeBurst'`
-Expected: FAIL — compile error: `not enough arguments in call to q.finish`, `a.generation undefined`.
+Expected: FAIL — compile error: `too many arguments in call to q.finish` (the new tests pass the generation: `have (checkDone, number)`, `want (checkDone)`), `a.generation undefined` and `chk.offerHook undefined` (add `-gcflags=-e` to see all three past the compiler's 10-error cap).
 
 - [ ] **Step 3: Implement**
 
 ```diff
 diff --git a/internal/freshness/admission.go b/internal/freshness/admission.go
-index e18666f..bf26474 100644
+index e18666f..10bb9b8 100644
 --- a/internal/freshness/admission.go
 +++ b/internal/freshness/admission.go
 @@ -22,4 +22,8 @@ type admission struct {
@@ -7671,9 +9671,9 @@ index e18666f..bf26474 100644
 +	releases uint64
  }
  
-@@ -92,4 +96,11 @@ func (a *admission) wake() {
+@@ -91,4 +95,11 @@ func (a *admission) wake() {
+ }
  
- // usage reports the global slots and hosts in use.
 +// generation is the number of slot releases so far.
 +func (a *admission) generation() uint64 {
 +	a.mu.Lock()
@@ -7681,8 +9681,8 @@ index e18666f..bf26474 100644
 +	return a.releases
 +}
 +
+ // usage reports the global slots and hosts in use.
  func (a *admission) usage() (global, hosts int) {
- 	a.mu.Lock()
 @@ -111,4 +122,5 @@ func (l *lease) releaseHost() {
  		delete(l.a.hosts, l.host)
  		l.hostHeld = false
@@ -7698,7 +9698,7 @@ index e18666f..bf26474 100644
  	l.a.mu.Unlock()
  	if freed {
 diff --git a/internal/freshness/check.go b/internal/freshness/check.go
-index a4156eb..ebf2d0d 100644
+index 7597646..1323602 100644
 --- a/internal/freshness/check.go
 +++ b/internal/freshness/check.go
 @@ -101,4 +101,11 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome,
@@ -7714,7 +9714,7 @@ index a4156eb..ebf2d0d 100644
  	// Cooldown gate. Spec C4 clock-step rule: a past-event stamp found in
  	// the future (backward wall-clock step) is treated as infinitely old,
 diff --git a/internal/freshness/freshness.go b/internal/freshness/freshness.go
-index 84a987b..1e272c0 100644
+index 6ed48cb..684686c 100644
 --- a/internal/freshness/freshness.go
 +++ b/internal/freshness/freshness.go
 @@ -79,5 +79,5 @@ type Cache interface {
@@ -7724,8 +9724,19 @@ index 84a987b..1e272c0 100644
 +	ListSuitesWithAdoption(ctx context.Context) ([]cache.SuiteWithAdoption, error)
  	LookupURL(ctx context.Context, scheme, host, path string) (*cache.URLPath, error)
  	GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*cache.SuiteSnapshot, error)
+@@ -232,4 +232,10 @@ type Checker struct {
+ 	lockLoadedHook func(key string)
+ 
++	// offerHook, when set (tests only), runs on the Run goroutine for each
++	// finished offer — a waiting suite's slot-driven re-check — with its
++	// report; a queued result is a lost offer (another admission took the
++	// slot first). The upgrade-burst simulations count lost offers with it.
++	offerHook func(ref SuiteRef, rep checkReport)
++
+ 	// unlockDroppedHook, when set (tests only), runs in unlockDropped
+ 	// between dropping a suite's lock-map entry and unlocking its mutex:
 diff --git a/internal/freshness/freshness_test.go b/internal/freshness/freshness_test.go
-index 3af979b..74898a8 100644
+index cd0c3cd..742eb65 100644
 --- a/internal/freshness/freshness_test.go
 +++ b/internal/freshness/freshness_test.go
 @@ -154,5 +154,5 @@ func (f *fakeCache) UpdateSuiteFreshness(ctx context.Context, s cache.SuiteFresh
@@ -7752,10 +9763,10 @@ index 3af979b..74898a8 100644
  	}
  	return out, nil
 diff --git a/internal/freshness/scheduler.go b/internal/freshness/scheduler.go
-index 0d4e96e..a0e179f 100644
+index 706cf58..09cdb3f 100644
 --- a/internal/freshness/scheduler.go
 +++ b/internal/freshness/scheduler.go
-@@ -103,4 +103,10 @@ type schedItem struct {
+@@ -109,4 +109,10 @@ type schedItem struct {
  	// its check bypasses the cooldown, so the tick parks it (spec C4).
  	pendingChange bool
 +	// waitSeq orders the waiting list: when the suite first became
@@ -7766,7 +9777,7 @@ index 0d4e96e..a0e179f 100644
 +	gen uint64
  }
  
-@@ -142,8 +148,13 @@ type schedQueues struct {
+@@ -148,8 +154,13 @@ type schedQueues struct {
  	next   int      // index in order of the host whose turn is next
  	queued map[string]struct{}
 +	// pending holds the keys of class-queued suites a later tick found
@@ -7781,7 +9792,7 @@ index 0d4e96e..a0e179f 100644
 +	return &schedQueues{hosts: map[string]*hostQueue{}, queued: map[string]struct{}{}, pending: map[string]struct{}{}}
  }
  
-@@ -155,4 +166,11 @@ func (q *schedQueues) enqueue(s cache.SuiteFreshness, pendingChange bool) bool {
+@@ -161,4 +172,11 @@ func (q *schedQueues) enqueue(s cache.SuiteFreshness, pendingChange bool) bool {
  	key := suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
  	if _, dup := q.queued[key]; dup {
 +		// A suite queued earlier as merely stale that a client check
@@ -7793,7 +9804,7 @@ index 0d4e96e..a0e179f 100644
 +		}
  		return false
  	}
-@@ -185,10 +203,27 @@ func (q *schedQueues) park(item schedItem, signed bool) {
+@@ -191,10 +209,27 @@ func (q *schedQueues) park(item schedItem, signed bool) {
  	}
  	h.inFlight = false
 -	front := item.waiting
@@ -7826,14 +9837,14 @@ index 0d4e96e..a0e179f 100644
 +		}
  	}
  }
-@@ -200,5 +235,5 @@ func (q *schedQueues) park(item schedItem, signed bool) {
+@@ -206,5 +241,5 @@ func (q *schedQueues) park(item schedItem, signed bool) {
  // parks it held too — re-offering at once would spin while the mutex is
  // held; any other result ends the suite's turn.
 -func (q *schedQueues) finish(d checkDone) {
 +func (q *schedQueues) finish(d checkDone, gen uint64) {
  	switch {
  	case isQueuedResult(d.report.result):
-@@ -207,6 +242,9 @@ func (q *schedQueues) finish(d checkDone) {
+@@ -213,6 +248,9 @@ func (q *schedQueues) finish(d checkDone) {
  		// one: re-offered on the next wake or tick, never at once — the
  		// pop loop runs right after this done, and a peek that still says
 -		// yes would otherwise re-offer it in a loop.
@@ -7845,7 +9856,7 @@ index 0d4e96e..a0e179f 100644
 +		d.item.held = d.item.waiting && gen == d.item.gen
  		q.park(d.item, d.report.signedCurrent)
  	case d.item.waiting && d.report.result == resultBusy:
-@@ -268,4 +306,8 @@ func (q *schedQueues) pop(admit func(host string, signed bool) bool) (schedItem,
+@@ -274,4 +312,8 @@ func (q *schedQueues) pop(admit func(host string, signed bool) bool) (schedItem,
  			h.classes[c][0] = schedItem{}
  			h.classes[c] = h.classes[c][1:]
 +			if _, ok := q.pending[item.key]; ok {
@@ -7854,15 +9865,15 @@ index 0d4e96e..a0e179f 100644
 +			}
  			if len(h.classes[c]) == 0 {
  				h.classes[c] = nil // let the backing array go
-@@ -283,4 +325,5 @@ func (q *schedQueues) pop(admit func(host string, signed bool) bool) (schedItem,
+@@ -289,4 +331,5 @@ func (q *schedQueues) pop(admit func(host string, signed bool) bool) (schedItem,
  func (q *schedQueues) done(item schedItem) {
  	delete(q.queued, item.key)
 +	delete(q.pending, item.key)
  	if h, ok := q.hosts[item.ref.CanonicalHost]; ok {
  		h.inFlight = false
-@@ -335,9 +378,6 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
- 	nowU := now.Unix()
- 	future := nowU + int64(clockStepTolerance/time.Second)
+@@ -351,9 +394,6 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
+ 		return false
+ 	}
 -	stale := s.LastSuccessAt == nil || *s.LastSuccessAt <= now.Add(-c.refresh).Unix()
 -	if s.LastSuccessAt != nil && *s.LastSuccessAt > future {
 -		c.clockStep("last_success_at", s.CanonicalScheme, s.CanonicalHost, s.SuitePath, *s.LastSuccessAt, now)
@@ -7872,21 +9883,25 @@ index 0d4e96e..a0e179f 100644
 +		*s.LastSuccessAt > future // infinitely old; checkLocked reports it once (B-38)
  	retryDue := c.adopter != nil && s.AdoptionFailCount > 0 && s.AdoptionNextRetryAt != nil && *s.AdoptionNextRetryAt <= nowU
  	if !stale && !retryDue && !c.pendingChange(s) {
-@@ -456,5 +496,5 @@ func (c *Checker) Run(ctx context.Context) {
+@@ -473,5 +513,5 @@ func (c *Checker) Run(ctx context.Context) {
  			}
  			select {
 -			case work <- item:
 +			case work <- withGen(item, c.admission.generation()):
  				idle--
  				if item.waiting {
-@@ -481,5 +521,5 @@ func (c *Checker) Run(ctx context.Context) {
+@@ -497,6 +537,9 @@ func (c *Checker) Run(ctx context.Context) {
+ 			if d.item.waiting {
  				offers--
++				if c.offerHook != nil {
++					c.offerHook(d.item.ref, d.report)
++				}
  			}
 -			q.finish(d)
 +			q.finish(d, c.admission.generation())
  		}
  	}
-@@ -497,4 +537,10 @@ func (c *Checker) safeReschedule(ctx context.Context) {
+@@ -514,4 +557,10 @@ func (c *Checker) safeReschedule(ctx context.Context) {
  }
  
 +// withGen stamps item with the admission generation at dispatch (B-45).
@@ -7897,7 +9912,7 @@ index 0d4e96e..a0e179f 100644
 +
  // checkDone is a worker's report of one scheduled check.
  type checkDone struct {
-@@ -543,11 +589,21 @@ func (c *Checker) safeTick(ctx context.Context, q *schedQueues) {
+@@ -560,11 +609,21 @@ func (c *Checker) safeTick(ctx context.Context, q *schedQueues) {
  }
  
 -// tick refreshes the queues with every due suite and updates the gauges.
@@ -7932,7 +9947,7 @@ perl -pi -e 's/q\.finish\((checkDone\{.*\})\)/q.finish($1, 0)/' internal/freshne
 - [ ] **Step 4: Run the tests**
 
 Run: `go test -race ./internal/freshness/ ./internal/handler/ ./cmd/...`
-Expected: PASS; `TestSimCapacity_UpgradeBurst` under 5 s with `-race` (3.6 s measured), deterministic (40 runs: its signed anchors answer 1 s late, so an offer never races a same-instant signed check — design note 26).
+Expected: PASS; under `-race` `TestSimCapacity_UpgradeBurst` takes about 3.0–3.4 s and `TestSimCapacity_UpgradeBurstSameHost` about 2.2–2.5 s (12 cores, load 3), both under ruling PE-8's 5 s budget with margin. The first is deterministic (its signed anchors answer 1 s late — design note 26); the second lets admissions race and bounds the probes by its counted client checks and lost offers.
 
 - [ ] **Step 5: Mutation checks** (one at a time, each reverted)
 
@@ -7943,13 +9958,13 @@ Expected: PASS; `TestSimCapacity_UpgradeBurst` under 5 s with `-race` (3.6 s mea
 | `finish`: a lost offer never held | `TestSchedQueues_LostOffersKeepTheWaitersOrder`, `TestSchedQueues_LostOfferAfterAReleaseIsNotHeld`, `TestSchedQueues_LostOfferIsHeldUntilTheNextWake` |
 | `lease.releaseHost` does not count | `TestAdmission_GenerationCountsReleases` |
 | `enqueue` drops the pending mark of a duplicate | `TestSchedQueues_PendingChangeReachesAQueuedSuite` |
-| `done` keeps the pending mark | `TestSchedQueues_PendingChangeReachesAQueuedSuite` |
+| `done` keeps the pending mark | `TestSchedQueues_PendingMarkWhileInFlightEndsWithTheTurn` (a mark noted while the suite is in flight; `pop` drops a queued suite's mark before `done` runs) |
 | `pop` ignores the pending mark | `TestSchedQueues_PendingChangeReachesAQueuedSuite` |
 | `refreshSigned` never promotes a waiter | `TestTick_RefreshesTheWaitersSignedFlag` |
 | `checkLocked` does not report a future `last_success_at` | `TestTick_FutureLastSuccessAtIsDue` |
-| `tryAcquire` without the reserved-slot rule | `TestSimCapacity_UpgradeBurst` |
+| `tryAcquire` without the reserved-slot rule | `TestSimCapacity_UpgradeBurst`, `TestSimCapacity_UpgradeBurstSameHost`, `TestAdmission_ReservedSlotForSignedSuites`, `TestAdmission_FreeForAgreesWithTryAcquire` |
 | `boundDue` returns `byCheck[:room]` | `TestBoundDue_AdmittedSuitesKeepKeyOrder` |
-| `boundDue` admits by key alone | `TestBoundDue_AdmittedSuitesKeepKeyOrder` |
+| `boundDue` admits by key alone | `TestBoundDue_AdmittedSuitesKeepKeyOrder`, `TestTick_BoundAdmitsTheLeastRecentlyChecked` |
 
 - [ ] **Step 6: Commit**
 
@@ -7965,17 +9980,17 @@ git commit -m "Keep waiters' signed flag current, simulate the upgrade burst, an
 
 ### Task 9: Strict mode waits for adoptions in flight (C10, D10)
 
-Spec C10 "In-flight adoptions": the checker tracks the signed adoptions in flight per canonical host (`hostAdoptions`: counted from `spawnAdoption` until the goroutine returns, after its commit; unsigned adoptions never vouch, so they are not counted — design note 27). On the **hit path**, before `unvouched_deb_refused`, the handler waits — while an adoption is in flight on the host — at most 15 s, then re-runs the lookup once (`checkPackageHashWait`). On the **miss path**, where the strict decision sits inside singleflight after the host slot by design, `runFetch` returns `errUnvouchedRetryable` (giving the slot back); `serveCacheMiss`, outside singleflight, waits at most 15 s and retries the miss once — the waiting requests coalesce again — and a second `errUnvouchedRetryable` is the refusal (logged once, `unvouched_deb_refused` with its `current_snapshot_count`). At most 64 waiters per host; beyond that the refusal is immediate. With adoption disabled `main` wires no waiter (Phase 1 parity). New counter `acu_strict_adoption_waits_total{host}` (a request that waited); `docs/log-fields.md` and `docs/configuration.md` get it in Task 15, with the spec's documented consequences (an adoption over 15 s, a queued first adoption, an unsigned or anchorless repository on a host that also serves complete signed suites all still refuse).
+Spec C10 "In-flight adoptions": the checker tracks the signed adoptions in flight per canonical host (`hostAdoptions`: counted from `spawnAdoption` until the goroutine returns, after its commit; unsigned adoptions never vouch, so they are not counted — design note 27). On the **hit path**, before `unvouched_deb_refused`, the handler waits — while an adoption is in flight on the host — then re-runs the lookup once (`checkPackageHashWait`). On the **miss path**, where the strict decision sits inside singleflight after the host slot by design, `runFetch` returns `errUnvouchedRetryable` (giving the slot back); `serveCacheMiss`, outside singleflight, waits and retries the miss once — the waiting requests coalesce again — and a second `errUnvouchedRetryable` is the refusal. Each wait is bounded by the request's age (design review M-10): at most min(15 s, 25 s − the time since the request started), and none when less than 1 s of that is left (an immediate refusal, not counted as a wait) — the miss path still downloads the whole `.deb` after the wait, before its first byte, and apt gives up after 30 s without one; both paths pass the request's `start`. At most 64 waiters per host; beyond that the refusal is immediate. The refusal is logged once per fetch, by the singleflight leader (design review O1: `unvouched_deb_refused` with its `current_snapshot_count`, as `runFetch` logged it before phase E; pinned with two coalesced requests), and a client that left while it waited gets no retry and ends `client_canceled` (underspecified item 5). The executability review's `TestServeHTTP_StrictHitWaitsOnce` (X19) and `TestSpecC11PhaseEConstants` (X14–X18, here with the two new constants) are part of the tests. With adoption disabled `main` wires no waiter (Phase 1 parity). New counter `acu_strict_adoption_waits_total{host}` (a request that waited); `docs/log-fields.md` and `docs/configuration.md` get it in Task 15, with the spec's documented consequences (an adoption over 15 s, a queued first adoption, an unsigned or anchorless repository on a host that also serves complete signed suites all still refuse).
 
 Deferred minor D-33 (`tryByHashContentAddressed`'s doc lists four gates, the known-suite gate second) sits in `handler.go`, which this task changes.
 
 **Files:**
 - Create: `internal/freshness/inflight.go`, `internal/freshness/inflight_test.go`, `internal/handler/strict_wait_test.go`, `cmd/apt-cacher-ultra/strict_wait_wiring_test.go`
-- Modify: `internal/freshness/freshness.go` (`Checker.inflight`, `New`, `spawnAdoption`), `internal/freshness/metrics.go` (`strictWaitsTotal`), `internal/handler/handler.go` (`AdoptionWaiter`, `Config.Adoptions`, `Handler.adoptions`, `checkPackageHash` → `checkPackageHashWait`, `runFetch`'s strict branch, `serveCacheMiss`, `errUnvouchedRetryable`, `logUnvouchedRefused`, D-33), `internal/handler/singleflight.go` (`sfResult.snapshotCount`), `cmd/apt-cacher-ultra/main.go` (`handlerConfig`)
+- Modify: `internal/freshness/freshness.go` (`Checker.inflight`, `New`, `spawnAdoption`), `internal/freshness/metrics.go` (`strictWaitsTotal` and the metrics inventory), `internal/handler/handler.go` (`AdoptionWaiter`, `Config.Adoptions`, `Handler.adoptions`, `tryURLPathHit`, `checkPackageHash` (takes `start`) → `checkPackageHashWait`, `runFetch`'s strict branch, `serveCacheMiss`, `errUnvouchedRetryable`, `logUnvouchedRefused`, D-33), `internal/handler/singleflight.go` (`sfResult.snapshotCount`), `cmd/apt-cacher-ultra/main.go` (`handlerConfig`)
 
 **Interfaces:**
 - Consumes: `Adopter.beforeCommit` (Task 3's test seam), Task 7's `retryRig.adoptUnsigned` and `hostCounter`, Task 6's `retryRig.unsignedRelease`, `retryRig.currentSnapshot`; handler test helpers `newPhase3StrictHandlerCapturing`, `adoptCoverageComplete`, `strictLogBuf.records`, `writeBlob`, `splitURL`, `hostKey`, `proxyReq`, `sha256Hex`; cmd test helpers `withKeyringDirs`, `newAdoptionEnabledCfg`, `newAdoptionWiringDeps`, `buildAdopter`, `checkerConfig`, `silentBuildLogger`.
-- Produces: `freshness.(*Checker).AdoptionsInFlight(host string) bool`, `freshness.(*Checker).WaitHostAdoptions(ctx context.Context, host string) bool` (false only at the 64-waiter cap; true at once when nothing is in flight); unexported `hostAdoptions` with `begin`, `end`, `inFlight`, `wait`, constants `strictWait` (15 s), `strictWaitersPerHost` (64); `handler.AdoptionWaiter` (the two methods), `handler.Config.Adoptions`; metric `acu_strict_adoption_waits_total{host}` (requests that waited: counted in `wait` after the cap check). Test helpers `fakeAdoptions`, `commitVouching`, `strictWaitRig`, `waitDebPath` (`strict_wait_test.go`).
+- Produces: `freshness.(*Checker).AdoptionsInFlight(host string) bool`, `freshness.(*Checker).WaitHostAdoptions(ctx context.Context, host string, start time.Time) bool` (false at the 64-waiter cap and when less than 1 s of the request's 25 s budget is left; true at once when nothing is in flight); unexported `hostAdoptions` with `begin`, `end`, `inFlight`, `wait`, constants `strictWait` (15 s), `strictWaitersPerHost` (64), `strictRequestBudget` (25 s), `strictMinWait` (1 s); `handler.AdoptionWaiter` (the two methods), `handler.Config.Adoptions`; metric `acu_strict_adoption_waits_total{host}` (requests that waited: counted in `wait` after the cap check). Test helpers `fakeAdoptions` (records each wait's request age and counts `AdoptionsInFlight` calls), `holdHostSlots`, `commitVouching`, `strictWaitRig`, `waitDebPath` (`strict_wait_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -8035,6 +10050,38 @@ func TestHostAdoptions_Wait(t *testing.T) {
 	})
 }
 
+// Design review M-10: a request waits at most min(15 s, 25 s − its age),
+// and not at all (an immediate refusal, not counted as a wait) when less
+// than 1 s of that budget is left: the miss path still downloads the .deb
+// after the wait, inside apt's 30 s.
+func TestChecker_WaitIsBoundedByTheRequestsAge(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := &Checker{inflight: newHostAdoptions()}
+		c.inflight.begin("a")
+		for _, tc := range []struct {
+			age, want time.Duration
+			ok        bool
+		}{
+			{0, strictWait, true},
+			{20 * time.Second, 5 * time.Second, true},
+			{24*time.Second + 500*time.Millisecond, 0, false},
+		} {
+			before := hostCounter(t, "acu_strict_adoption_waits_total", "a")
+			start := time.Now()
+			if got := c.WaitHostAdoptions(context.Background(), "a", start.Add(-tc.age)); got != tc.ok {
+				t.Fatalf("age %v: WaitHostAdoptions = %v, want %v", tc.age, got, tc.ok)
+			}
+			if d := time.Since(start); d != tc.want {
+				t.Fatalf("age %v: waited %v, want %v", tc.age, d, tc.want)
+			}
+			if counted := hostCounter(t, "acu_strict_adoption_waits_total", "a") - before; counted != map[bool]float64{true: 1, false: 0}[tc.ok] {
+				t.Fatalf("age %v: %v waits counted", tc.age, counted)
+			}
+		}
+		c.inflight.end("a")
+	})
+}
+
 // Spec C10: at most 64 waiters per host; the 65th is refused at once.
 // acu_strict_adoption_waits_total counts the requests that waited: not the
 // refused one, nor one with nothing in flight.
@@ -8090,6 +10137,27 @@ func TestChecker_CountsSignedAdoptionsInFlight(t *testing.T) {
 		}
 	}
 }
+
+// Spec C11: phase E's constants are not knobs, and every other test uses
+// them symbolically, so only this one sees a change of value. (Proposed by
+// the executability review; kills X14–X18. The request budget and the
+// minimum wait are design review M-10's.)
+func TestSpecC11PhaseEConstants(t *testing.T) {
+	for name, c := range map[string]struct{ got, want int64 }{
+		"interest window":         {int64(interestWindow), int64(7 * 24 * time.Hour)},
+		"confirmation gap floor":  {int64(minConfirmGap), int64(5 * time.Minute)},
+		"denied-signature gap":    {int64(deniedConfirmGap), int64(time.Hour)},
+		"strict wait":             {int64(strictWait), int64(15 * time.Second)},
+		"strict waiters per host": {int64(strictWaitersPerHost), 64},
+		"strict request budget":   {int64(strictRequestBudget), int64(25 * time.Second)},
+		"strict minimum wait":     {int64(strictMinWait), int64(time.Second)},
+		"unsigned member cap":     {int64(unsignedMemberCap), 1000},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d (spec C11)", name, c.got, c.want)
+		}
+	}
+}
 ```
 
 Create `internal/handler/strict_wait_test.go`:
@@ -8101,31 +10169,62 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // fakeAdoptions is a handler.AdoptionWaiter: inFlight answers
-// AdoptionsInFlight; WaitHostAdoptions runs during (the adoption that
-// finishes while the request waits) and returns ok.
+// AdoptionsInFlight (asks counts the calls: one per strict-mode refusal
+// the miss path's runFetch considers); WaitHostAdoptions records the
+// request's age, runs during (the adoption that finishes while the request
+// waits) and returns ok.
 type fakeAdoptions struct {
 	inFlight bool
 	ok       bool
 	during   func()
 	waits    atomic.Int32
+	asks     atomic.Int32
+	mu       sync.Mutex
+	ages     []time.Duration // time.Since(start) at each wait
 }
 
-func (f *fakeAdoptions) AdoptionsInFlight(string) bool { return f.inFlight }
+func (f *fakeAdoptions) AdoptionsInFlight(string) bool { f.asks.Add(1); return f.inFlight }
 
-func (f *fakeAdoptions) WaitHostAdoptions(context.Context, string) bool {
+func (f *fakeAdoptions) WaitHostAdoptions(_ context.Context, _ string, start time.Time) bool {
+	f.mu.Lock()
+	f.ages = append(f.ages, time.Since(start))
+	f.mu.Unlock()
 	f.waits.Add(1)
 	if f.during != nil {
 		f.during()
 	}
 	return f.ok
+}
+
+// holdHostSlots takes every host-limiter slot of host for d, so a miss's
+// runFetch waits at its slot and concurrent misses of one path coalesce in
+// singleflight (strict mode refuses before any upstream fetch).
+func holdHostSlots(t *testing.T, h *Handler, host string, d time.Duration) {
+	t.Helper()
+	var rels []func()
+	for range 4 { // the strict rig's hostsem.New(4)
+		rel, err := h.sem.Acquire(context.Background(), host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rels = append(rels, rel)
+	}
+	go func() {
+		time.Sleep(d)
+		for _, rel := range rels {
+			rel()
+		}
+	}()
 }
 
 // commitVouching adopts a complete-coverage inline snapshot of suite whose
@@ -8241,6 +10340,116 @@ func TestServeHTTP_StrictWaitRefusals(t *testing.T) {
 			}
 		})
 	}
+	// Design review O1: two coalesced requests share one fetch, so the
+	// refusal is logged once — by the singleflight leader — also after the
+	// retry, whose requests coalesce again. Each request's wait is bounded
+	// by its own age (design review M-10: the miss path passes the
+	// request's start, so the time spent before the wait counts).
+	for _, tc := range []struct {
+		name string
+		a    *fakeAdoptions
+	}{
+		{"the waiter cap, two coalesced requests", &fakeAdoptions{inFlight: true, ok: false}},
+		{"still unvouched after the wait, two coalesced requests", &fakeAdoptions{inFlight: true, ok: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, logs, srvURL, _, canon := strictWaitRig(t, tc.a)
+			const delay = 300 * time.Millisecond
+			holdHostSlots(t, h, canon, delay) // the first call's leader waits: the second request joins it
+			var once sync.Once
+			tc.a.during = func() { once.Do(func() { holdHostSlots(t, h, canon, delay) }) } // so does the retry's
+			var wg sync.WaitGroup
+			for range 2 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					rec := httptest.NewRecorder()
+					h.ServeHTTP(rec, proxyReq("GET", srvURL, waitDebPath))
+					if rec.Code != http.StatusBadGateway {
+						t.Errorf("status %d, want the strict-mode refusal", rec.Code)
+					}
+				}()
+			}
+			wg.Wait()
+			shared := 0 // the leader's line, for the request's last singleflight call
+			for _, rec := range logs.records() {
+				if rec["msg"] == "singleflight coalesced" {
+					shared++
+				}
+			}
+			if shared != 1 {
+				t.Fatalf("%d singleflight coalesced lines, want 1 (setup: the requests must coalesce)", shared)
+			}
+			if got := tc.a.waits.Load(); got != 2 {
+				t.Fatalf("waited %d times, want 2 (each request waits)", got)
+			}
+			for _, age := range tc.a.ages {
+				if age < delay {
+					t.Fatalf("a wait began %v into its request, want at least the %v at the host slot: the request's start, not the wait's", age, delay)
+				}
+			}
+			n := 0
+			for _, rec := range logs.records() {
+				if rec["msg"] == "unvouched_deb_refused" {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Fatalf("%d unvouched_deb_refused events for one fetch, want 1", n)
+			}
+		})
+	}
+}
+
+// Underspecified item 5 of the design review: a client that leaves while
+// its miss waits gets no retry — no second attempt for nobody — and the
+// request ends client_canceled, not as a logged refusal.
+func TestServeHTTP_StrictMissClientLeftDuringTheWait(t *testing.T) {
+	a := &fakeAdoptions{inFlight: true, ok: true}
+	h, logs, srvURL, _, _ := strictWaitRig(t, a)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.during = cancel // the client leaves while it waits
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srvURL, waitDebPath).WithContext(ctx))
+	if a.asks.Load() != 1 || rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("%d attempts, status %d; want one attempt and the client_canceled answer", a.asks.Load(), rec.Code)
+	}
+	for _, rec := range logs.records() {
+		if rec["msg"] == "unvouched_deb_refused" {
+			t.Fatal("a client that left was logged as refused")
+		}
+	}
+}
+
+// Spec C10 on the hit path: one wait per request — a cached .deb still
+// unvouched after the wait is refused, not waited for again (the miss
+// path's "still unvouched" case is TestServeHTTP_StrictWaitRefusals).
+// (Proposed by the executability review; kills X19. The fake stops
+// reporting an adoption after four waits so the mutant fails cleanly
+// instead of recursing forever.)
+func TestServeHTTP_StrictHitWaitsOnce(t *testing.T) {
+	a := &fakeAdoptions{inFlight: true, ok: true}
+	a.during = func() {
+		if a.waits.Load() >= 4 {
+			a.inFlight = false
+		}
+	}
+	h, _, srvURL, scheme, canon := strictWaitRig(t, a)
+	deb := []byte("a cached .deb")
+	blob := writeBlob(t, h, deb)
+	if err := h.cache.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: scheme, CanonicalHost: canon,
+		Path: waitDebPath, BlobHash: &blob, UpstreamURL: srvURL + waitDebPath}); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srvURL, waitDebPath))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status %d, want the strict-mode refusal", rec.Code)
+	}
+	if got := a.waits.Load(); got != 1 {
+		t.Fatalf("waited %d times, want 1", got)
+	}
 }
 ```
 
@@ -8314,6 +10523,15 @@ const (
 	// strictWaitersPerHost caps the requests waiting per host; beyond it
 	// the refusal is immediate (a C11 constant).
 	strictWaitersPerHost = 64
+	// strictRequestBudget bounds the wait by the request's age: it waits
+	// at most strictRequestBudget minus the time since the request started
+	// (design review M-10). The miss path still downloads the whole .deb
+	// after the wait before its first byte, and apt gives up after 30 s
+	// without one (a C11 constant).
+	strictRequestBudget = 25 * time.Second
+	// strictMinWait: a wait shorter than this is not started; the refusal
+	// is immediate (a C11 constant).
+	strictMinWait = time.Second
 )
 
 // hostAdoptions counts signed adoptions in flight per host and lets
@@ -8366,9 +10584,10 @@ func (h *hostAdoptions) inFlight(host string) bool {
 
 // wait blocks until host has no signed adoption in flight, max passes or
 // ctx ends, and reports whether the caller may re-run its lookup: false
-// only when the host already has strictWaitersPerHost waiters (the caller
-// refuses at once). With nothing in flight it returns true at once. A
-// request that waits is counted (acu_strict_adoption_waits_total).
+// when the host already has strictWaitersPerHost waiters, or max is below
+// strictMinWait (the caller refuses at once). With nothing in flight it
+// returns true at once. A request that waits is counted
+// (acu_strict_adoption_waits_total).
 func (h *hostAdoptions) wait(ctx context.Context, host string, max time.Duration) bool {
 	h.mu.Lock()
 	if h.waiters[host] >= strictWaitersPerHost {
@@ -8378,6 +10597,10 @@ func (h *hostAdoptions) wait(ctx context.Context, host string, max time.Duration
 	if h.n[host] == 0 {
 		h.mu.Unlock()
 		return true
+	}
+	if max < strictMinWait {
+		h.mu.Unlock()
+		return false
 	}
 	h.waiters[host]++
 	strictWaitsTotal.Inc(host)
@@ -8408,16 +10631,17 @@ func (h *hostAdoptions) wait(ctx context.Context, host string, max time.Duration
 // canonical host (spec C10: the miss path asks before it refuses).
 func (c *Checker) AdoptionsInFlight(host string) bool { return c.inflight.inFlight(host) }
 
-// WaitHostAdoptions waits, at most 15 s, until no signed adoption is in
-// flight on the canonical host (spec C10), and reports whether the caller
-// should re-run its lookup once: false only when 64 requests already wait
-// on the host — the caller then refuses at once.
-func (c *Checker) WaitHostAdoptions(ctx context.Context, host string) bool {
-	return c.inflight.wait(ctx, host, strictWait)
+// WaitHostAdoptions waits until no signed adoption is in flight on the
+// canonical host (spec C10) — at most min(15 s, 25 s − the time since the
+// request started at start) — and reports whether the caller should re-run
+// its lookup once: false when 64 requests already wait on the host or
+// less than 1 s of that budget is left, and the caller refuses at once.
+func (c *Checker) WaitHostAdoptions(ctx context.Context, host string, start time.Time) bool {
+	return c.inflight.wait(ctx, host, min(strictWait, strictRequestBudget-time.Since(start)))
 }
 ```
 
-Then:
+Then (`git apply`; the metrics inventory's line for the counter included):
 
 ```diff
 diff --git a/cmd/apt-cacher-ultra/main.go b/cmd/apt-cacher-ultra/main.go
@@ -8442,7 +10666,7 @@ index 5f584a3..1e39b2d 100644
  	}
  }
 diff --git a/internal/freshness/freshness.go b/internal/freshness/freshness.go
-index 1e272c0..28b6b69 100644
+index 684686c..3f9f4c0 100644
 --- a/internal/freshness/freshness.go
 +++ b/internal/freshness/freshness.go
 @@ -191,4 +191,5 @@ type Checker struct {
@@ -8451,13 +10675,13 @@ index 1e272c0..28b6b69 100644
 +	inflight            *hostAdoptions // spec C10: signed adoptions in flight per host
  	maxBody             int64
  	logger              *slog.Logger
-@@ -304,4 +305,5 @@ func New(cfg Config) (*Checker, error) {
+@@ -310,4 +311,5 @@ func New(cfg Config) (*Checker, error) {
  		gpgReasonClassifier: cfg.GPGReasonClassifier,
  		admission:           newAdmission(maxConc),
 +		inflight:            newHostAdoptions(),
  		maxAdoptionDuration: maxDur,
  	}, nil
-@@ -526,6 +528,16 @@ func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
+@@ -539,6 +541,16 @@ func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
  func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) {
  	c.adoptionWg.Add(1)
 +	// Spec C10: a signed adoption is in flight from here (before the
@@ -8475,10 +10699,18 @@ index 1e272c0..28b6b69 100644
  		defer mu.Unlock()
  		defer l.release()
 diff --git a/internal/freshness/metrics.go b/internal/freshness/metrics.go
-index 8212903..5737b27 100644
+index c064827..ead2a68 100644
 --- a/internal/freshness/metrics.go
 +++ b/internal/freshness/metrics.go
-@@ -61,4 +61,13 @@ var (
+@@ -34,5 +34,6 @@ import (
+ // unlabelled gauge); acu_freshness_unlogged_panics_total (deferred minor
+ // B-44, unlabelled counter); acu_repair_deferred_total (deferred minor
+-// B-31, counter by host). The flip barrier's acu_flip_hold_skipped_total,
++// B-31, counter by host); acu_strict_adoption_waits_total (spec C10,
++// counter by host). The flip barrier's acu_flip_hold_skipped_total,
+ // acu_flip_hold_expired_total, acu_flip_quiet_cut_short_total,
+ // acu_flip_waiters_over_cap_total, acu_flip_slow_anchor_reads_total and
+@@ -62,4 +63,13 @@ var (
  	)
  
 +	// strictWaitsTotal counts requests that waited for a host's signed
@@ -8493,10 +10725,10 @@ index 8212903..5737b27 100644
  	// repairDeferredTotal counts repairs and reconciles of an unchanged
  	// suite that found no free admission slot and wait for its next
 diff --git a/internal/handler/handler.go b/internal/handler/handler.go
-index df04bf9..601e2b5 100644
+index df04bf9..69aaa64 100644
 --- a/internal/handler/handler.go
 +++ b/internal/handler/handler.go
-@@ -60,4 +60,17 @@ type FreshnessChecker interface {
+@@ -60,4 +60,18 @@ type FreshnessChecker interface {
  }
  
 +// AdoptionWaiter is strict mode's view of the freshness checker's signed
@@ -8506,15 +10738,16 @@ index df04bf9..601e2b5 100644
 +	// AdoptionsInFlight reports whether a signed adoption is in flight on
 +	// the canonical host.
 +	AdoptionsInFlight(host string) bool
-+	// WaitHostAdoptions waits (at most 15 s) until none is, and reports
-+	// whether to re-run the lookup once: false when 64 requests already
-+	// wait on the host.
-+	WaitHostAdoptions(ctx context.Context, host string) bool
++	// WaitHostAdoptions waits until none is — at most min(15 s, 25 s −
++	// the time since the request started at start) — and reports whether
++	// to re-run the lookup once: false when 64 requests already wait on
++	// the host or less than 1 s of the budget is left.
++	WaitHostAdoptions(ctx context.Context, host string, start time.Time) bool
 +}
 +
  // Config carries handler dependencies. All non-pointer fields are
  // optional and defaulted in New.
-@@ -79,4 +92,9 @@ type Config struct {
+@@ -79,4 +93,9 @@ type Config struct {
  	Freshness FreshnessChecker
  
 +	// Adoptions lets strict mode wait for adoptions in flight on the
@@ -8524,19 +10757,19 @@ index df04bf9..601e2b5 100644
 +
  	// Serve is the SPEC §6.4 / §8 stale-serve policy. Zero value is
  	// safe (both flags off): the handler will always 502 on a metadata
-@@ -151,4 +169,5 @@ type Handler struct {
+@@ -151,4 +170,5 @@ type Handler struct {
  	sem       *hostsem.Sem
  	freshness FreshnessChecker
 +	adoptions AdoptionWaiter
  	serve     config.ServeConfig
  	logger    *slog.Logger
-@@ -250,4 +269,5 @@ func New(cfg Config) (*Handler, error) {
+@@ -250,4 +270,5 @@ func New(cfg Config) (*Handler, error) {
  		sem:                     cfg.HostLimiter,
  		freshness:               cfg.Freshness,
 +		adoptions:               cfg.Adoptions,
  		serve:                   cfg.Serve,
  		logger:                  logger,
-@@ -370,4 +390,10 @@ var (
+@@ -370,4 +391,10 @@ var (
  	// failure) so operators can grep for the strict-mode contribution.
  	ErrUnvouchedDebRefused = errors.New("handler: unvouched .deb refused (strict mode)")
 +
@@ -8547,7 +10780,14 @@ index df04bf9..601e2b5 100644
 +	errUnvouchedRetryable = errors.New("handler: unvouched .deb, an adoption is in flight on the host")
  )
  
-@@ -759,10 +785,12 @@ var byHashSuffixRegex = regexp.MustCompile(`/by-hash/SHA256/([0-9a-f]{64})$`)
+@@ -690,5 +717,5 @@ func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *pro
+ 	var v packageValidation
+ 	if !req.IsMetadata {
+-		if served, outcome, status, body, fellThrough, gotV := h.checkPackageHash(w, r, req, *row.BlobHash); fellThrough {
++		if served, outcome, status, body, fellThrough, gotV := h.checkPackageHash(w, r, req, *row.BlobHash, start); fellThrough {
+ 			return false, "", 0, 0, packageValidation{}
+ 		} else if served {
+@@ -759,10 +786,12 @@ var byHashSuffixRegex = regexp.MustCompile(`/by-hash/SHA256/([0-9a-f]{64})$`)
  // non-adoption upholds it.
  //
 -// Three security gates apply *before* a serve:
@@ -8562,14 +10802,14 @@ index df04bf9..601e2b5 100644
 +//  3. HostAllowed — ServeHTTP delays the §6.6 allowlist check until after
  //     tryCacheHit (lines 213/225). For Phase 1/2 hits that's safe because
  //     url_path rows are host-scoped — only previously-allowed hosts have
-@@ -770,5 +798,5 @@ var byHashSuffixRegex = regexp.MustCompile(`/by-hash/SHA256/([0-9a-f]{64})$`)
+@@ -770,5 +799,5 @@ var byHashSuffixRegex = regexp.MustCompile(`/by-hash/SHA256/([0-9a-f]{64})$`)
  //     re-runs the allowlist check; otherwise a client could request a
  //     known SHA256 under a disallowed host and bypass §6.6.
 -//  3. Same-host provenance (HostHasBlob) — the blob must have been
 +//  4. Same-host provenance (HostHasBlob) — the blob must have been
  //     fetched under this host before. Without this, a caller who learns
  //     a SHA256 from one cached host could request it under any other
-@@ -929,4 +957,13 @@ func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
+@@ -929,4 +958,13 @@ func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
  }
  
 +// logUnvouchedRefused logs the miss path's strict-mode refusal.
@@ -8583,36 +10823,39 @@ index df04bf9..601e2b5 100644
 +
  // checkPackageHash runs the SPEC2 §6.1 defense-in-depth on a .deb hit.
  //
-@@ -947,4 +984,12 @@ func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
+@@ -946,5 +984,14 @@ func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
+ // validated_hash=true + package_name=<name>. The mismatch + conflict
  // branches also increment acu_serve_hash_validated_total{outcome=mismatch}.
- func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
-+	return h.checkPackageHashWait(w, r, req, blobHash, true)
+-func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
++func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, start time.Time) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
++	return h.checkPackageHashWait(w, r, req, blobHash, start, true)
 +}
 +
 +// checkPackageHashWait is checkPackageHash; mayWait lets a strict-mode
 +// refusal first wait for the host's signed adoptions in flight and run
-+// the lookup once more (spec C10: at most 15 s, at most 64 waiters per
-+// host, beyond which the refusal is immediate).
-+func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, mayWait bool) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
++// the lookup once more (spec C10: at most 15 s and at most 25 s since the
++// request started at start, at most 64 waiters per host, beyond which the
++// refusal is immediate).
++func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, start time.Time, mayWait bool) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
  	rows, err := h.cache.DeclaredHashesForPath(r.Context(),
  		req.CanonicalScheme, req.CanonicalHost, req.Path)
-@@ -976,4 +1021,8 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
+@@ -976,4 +1023,8 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
  			req.CanonicalScheme, req.CanonicalHost); sm {
  		case strictRefuse:
 +			if mayWait && h.adoptions != nil && h.adoptions.AdoptionsInFlight(req.CanonicalHost) &&
-+				h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost) {
-+				return h.checkPackageHashWait(w, r, req, blobHash, false)
++				h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost, start) {
++				return h.checkPackageHashWait(w, r, req, blobHash, start, false)
 +			}
  			st, body := h.refuseUnvouchedDeb(w, req.CanonicalHost, req.Path, count)
  			return true, "unvouched_deb_refused", st, body, false, packageValidation{}
-@@ -1349,5 +1398,5 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
+@@ -1349,5 +1400,5 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
  
  	file, trackedAtStart := sr.file, sr.tracked
 -	res, shared, waiters := h.sf.Do(key, func() sfResult {
 +	fetchOnce := func() sfResult {
  		// Use the handler's lifecycle ctx, not the request ctx. Two
  		// goals: (1) a leader who disconnects must not kill the fetch
-@@ -1359,5 +1408,23 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
+@@ -1359,5 +1410,33 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
  		// drain budget elapses.
  		return h.runFetch(h.lifecycleCtx, req, file, trackedAtStart)
 -	})
@@ -8626,18 +10869,28 @@ index df04bf9..601e2b5 100644
 +		//
 +		// AIDEV-NOTE: the retry is one more singleflight call: requests
 +		// that waited together coalesce again, and a waiter over the
-+		// 64-per-host cap is refused at once.
-+		if h.adoptions != nil && h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost) {
++		// 64-per-host cap, or with less than 1 s of its 25 s budget left,
++		// is refused at once. A client that left while it waited gets no
++		// retry (it ends client_canceled). The refusal is logged once per
++		// fetch, by the singleflight leader (design review O1), as
++		// runFetch logged it before phase E.
++		waited := h.adoptions != nil && h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost, start)
++		switch {
++		case r.Context().Err() != nil:
++			res.err = r.Context().Err()
++		case waited:
 +			res, shared, waiters = h.sf.Do(key, fetchOnce)
 +		}
 +		if errors.Is(res.err, errUnvouchedRetryable) {
-+			h.logUnvouchedRefused(req, res.snapshotCount)
++			if !shared {
++				h.logUnvouchedRefused(req, res.snapshotCount)
++			}
 +			res.err = ErrUnvouchedDebRefused
 +		}
 +	}
  
  	// SPEC §10: leader emits a structured log line whenever waiters
-@@ -1779,9 +1846,11 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
+@@ -1779,9 +1858,11 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
  					req.CanonicalScheme, req.CanonicalHost); sm {
  				case strictRefuse:
 -					h.logger.Info("unvouched_deb_refused",
@@ -8668,13 +10921,6 @@ index 14bd4b6..770d675 100644
  
 ```
 
-In `internal/freshness/metrics.go`, the metrics inventory AIDEV-NOTE records the counter: `// B-31, counter by host). The flip barrier's acu_flip_hold_skipped_total,` (Task 7) becomes
-
-```go
-// B-31, counter by host); acu_strict_adoption_waits_total (spec C10,
-// counter by host). The flip barrier's acu_flip_hold_skipped_total,
-```
-
 - [ ] **Step 4: Run the tests**
 
 Run: `go test -race ./internal/freshness/ ./internal/handler/ ./cmd/...`
@@ -8687,17 +10933,27 @@ Expected: PASS.
 | `wait`: the cap admits a 65th waiter (`>`) | `TestHostAdoptions_WaiterCap` |
 | `wait`: a request that waits is not counted (the `Inc` removed) | `TestHostAdoptions_WaiterCap` |
 | `wait`: the refused 65th request is counted too (the `Inc` before the cap check) | `TestHostAdoptions_WaiterCap` |
-| `end`: wakes waiters while another adoption runs (`>= 0`) | `TestHostAdoptions_Wait` |
-| `wait`: waits even with nothing in flight | `TestHostAdoptions_Wait` |
+| `end`: never wakes the waiters (`>= 0`) | `TestHostAdoptions_Wait` |
+| `end`: wakes waiters while another adoption runs (`> 1`) | `TestHostAdoptions_Wait` |
+| `wait`: waits even with nothing in flight | `TestHostAdoptions_Wait`, `TestHostAdoptions_WaiterCap` |
 | `wait`: ignores a cancelled request | `TestHostAdoptions_Wait` |
+| `wait`: no minimum wait (M-10) | `TestChecker_WaitIsBoundedByTheRequestsAge` |
+| `WaitHostAdoptions` ignores the request's age (`strictWait` alone) | `TestChecker_WaitIsBoundedByTheRequestsAge` |
 | `spawnAdoption`: counts unsigned adoptions | `TestChecker_CountsSignedAdoptionsInFlight` |
 | `spawnAdoption`: never uncounts | `TestChecker_CountsSignedAdoptionsInFlight` |
 | hit path: refuses after the wait without re-running the lookup | `TestServeHTTP_StrictHitWaitsForAnAdoptionInFlight` |
+| hit path: waits again after the re-run (`mayWait` ignored, X19) | `TestServeHTTP_StrictHitWaitsOnce` |
 | miss path: `runFetch` refuses at once | `TestServeHTTP_StrictMissWaitsForAnAdoptionInFlight`, `TestServeHTTP_StrictWaitRefusals` |
 | miss path: no retry after the wait | `TestServeHTTP_StrictMissWaitsForAnAdoptionInFlight` |
 | miss path: the converted refusal is not logged | `TestServeHTTP_StrictWaitRefusals` |
+| miss path: every coalesced request logs the refusal (`if true`, O1) | `TestServeHTTP_StrictWaitRefusals/{the_waiter_cap,_two_coalesced_requests, still_unvouched_after_the_wait,_two_coalesced_requests}` |
+| miss path: the wait gets a fresh start (`time.Now()`) | `TestServeHTTP_StrictWaitRefusals/{… two coalesced legs}` |
+| miss path: a retry for a client that left | `TestServeHTTP_StrictMissClientLeftDuringTheWait` |
+| a C11 constant changed: `minConfirmGap` 4 min, `deniedConfirmGap` 62 min, `unsignedMemberCap` 2,000, `strictWait` 16 s, `strictWaitersPerHost` 65, `strictRequestBudget` 30 s, `strictMinWait` 0 (X14–X18) | `TestSpecC11PhaseEConstants` (the last two also `TestChecker_WaitIsBoundedByTheRequestsAge`) |
 | `handlerConfig`: no waiter wired | `TestHandlerConfig_StrictModeWaitsOnTheCheckersAdoptions` |
 | `handlerConfig`: a waiter wired without an adopter | `TestHandlerConfig_StrictModeWaitsOnTheCheckersAdoptions` |
+
+(The hit path passing a fresh `start` instead of the request's is a near-equivalent mutant: nothing slow happens before the hit path's wait, so the two ages differ by microseconds.)
 
 - [ ] **Step 6: Commit**
 
@@ -8708,25 +10964,27 @@ gofmt -l internal/freshness/inflight.go internal/freshness/inflight_test.go inte
 git add internal/freshness/inflight.go internal/freshness/inflight_test.go internal/freshness/freshness.go internal/freshness/metrics.go \
   internal/handler/handler.go internal/handler/singleflight.go internal/handler/strict_wait_test.go \
   cmd/apt-cacher-ultra/main.go cmd/apt-cacher-ultra/strict_wait_wiring_test.go
-git commit -m "Let strict mode wait up to 15 s for a host's signed adoptions in flight before refusing an unvouched .deb"
+git commit -m "Let strict mode wait for a host's signed adoptions in flight before refusing an unvouched .deb"
 ```
 
 ### Task 10: The handler at first contact — T1-on-seed, waiters' late registration, onboarding's deadline
 
 Overview "E:" carry-forwards from phase D:
 
-- **T1-on-seed** (spec C3; phase D plan, design note 2): a miss that created its suite's row fires T1 once its response is done, so the new suite's eager first adoption starts at first contact. It is keyed on the creation (`sfResult.created` from `FetchedResult.Create.Outcome == cache.SuiteCreated`; `Tracked` stays what the late flip-barrier registration uses), fired by the creating request only (a coalesced waiter shares its result), and only with adoption enabled (`TestServeHTTP_AdoptionDisabledSeedParity`). The hit path already fires T1 after onboarding (ruling PD-11); no second T1 is added there. Firing after the response (a `defer`) keeps the creating request's own serve out of its suite's first flip: the barrier waits for it like any registered serve (design note 28).
+- **T1-on-seed** (spec C3; phase D plan, design note 2): a miss that created its suite's row fires T1 once its response is done, so the new suite's eager first adoption starts at first contact. It is keyed on the creation (`sfResult.created` from `FetchedResult.Create.Outcome == cache.SuiteCreated`; `Tracked` stays what the late flip-barrier registration uses), fired by the creating request only (a coalesced waiter shares its result), and only with adoption enabled (`TestServeHTTP_AdoptionDisabledSeedParity`). The hit path already fires T1 after onboarding (ruling PD-11); no second T1 is added there. Firing after the response (a `defer`) keeps the creating request's own serve out of its suite's first flip: the barrier waits for it like any registered serve; the `defer` also fires when the client left, which is right — the row was created (design note 28). The executability review's `TestServeHTTP_CoalescedCreatingMissFiresT1Once` (X27) pins "the creating request only".
 - **Waiters' late registration**, untested in phase D because no flip could hold a just-created suite: a coalesced miss waiter (`t9_miss_waiter_noreg`) and an onboarding waiter (`t10_waiter_noreg`) each register their own serve; with eager first adoption a flip of a just-created suite is reachable, so each path gets a test that the waiter waits in that flip's hold and serves what it committed.
 
 Deferred minors in `internal/handler/suite_rows.go`: D-35 (E; onboarding's creation and its backstop share one deadline, `onboardTimeout`, so a hold of the just-created suite between them cannot push the wait before the body past 5 s + `flipgate.HoldMax`), D-34 (onboarding runs under the handler's lifecycle context, so a graceful shutdown cuts it short), D-37 (the backstop's bound covers its database steps; its pool reads take no context — `backstopTimeout`'s doc and the miss path's AIDEV-NOTE say so; `docs/log-fields.md`'s row in Task 15). D-32 is tagged G and stays.
 
+Design review M-15 (D-35's sibling on the miss path): the miss path's backstop got a fresh `backstopTimeout` after the fetch, the store and a possible flip hold (≤ 20 s), so the body could start 27 s or more into the request. Its deadline now counts from the request's start too: `missBackstopDeadline(start)` = min(now + 5 s, start + `missBodyBudget`, 25 s). A deadline already past fails the backstop at once (logged WARN; the body is served), as any backstop timeout does.
+
 **Files:**
 - Create: `internal/handler/seed_t1_test.go`
-- Modify: `internal/handler/handler.go` (`runFetch`'s result, `serveCacheMiss`, the miss path's AIDEV-NOTE), `internal/handler/singleflight.go` (`sfResult.created`), `internal/handler/suite_rows.go` (`backstopTimeout` and `onboardTimeout` docs, `onboard`, `runOnboard`)
+- Modify: `internal/handler/handler.go` (`runFetch`'s result, `serveCacheMiss`: T1-on-seed and the backstop's deadline, the miss path's AIDEV-NOTE), `internal/handler/singleflight.go` (`sfResult.created`), `internal/handler/suite_rows.go` (`backstopTimeout` and `onboardTimeout` docs, `missBodyBudget`, `missBackstopDeadline`, `onboard`, `runOnboard`)
 
 **Interfaces:**
 - Consumes: Task 6's eager first adoption (what T1 starts); handler test helpers `newSuiteRig`, `suiteRig.serve/get/suite/cacheAnchor`, `recordingFreshness.snapshot`, `upFile`, `rowInRelease`, `rowRelease`, `newFlipStack`, `flipStack.holdUntilTracked/cacheRow/signsAfterTheSniff`, `staticUpstream`, `writeBlob`, `flipSimHost`; handler test seams `cachedAnchorsHook`, `backstopHook`, `activeWG`, `lifecycleCancel`.
-- Produces: `sfResult.created`; `runOnboard(r, req, sr, deadline time.Time)`. Test helpers `slowUpstream`, `commitSnapshotWhenTracked`, `twoGets` (`seed_t1_test.go`).
+- Produces: `sfResult.created`; `runOnboard(r, req, sr, deadline time.Time)`; `missBodyBudget` (25 s), `missBackstopDeadline(start time.Time) time.Time`. Test helpers `slowUpstream`, `commitSnapshotWhenTracked`, `twoGets` (`seed_t1_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -8916,21 +11174,80 @@ func TestServeHTTP_OnboardingStopsAtShutdown(t *testing.T) {
 		t.Fatal("the onboarding outlived the shutdown")
 	}
 }
+
+// Design review M-15: the miss path's backstop deadline counts from the
+// request's start, so a slow fetch (or a flip's hold) leaves the backstop
+// only what is left of the 25 s budget (missBodyBudget): the body still
+// starts inside apt's 30 s, not after the fetch plus a fresh
+// backstopTimeout.
+func TestServeHTTP_MissBackstopSharesTheRequestsBudget(t *testing.T) {
+	const budget = 25 * time.Second // missBodyBudget
+	for _, fetchTime := range []time.Duration{2 * time.Second, 22 * time.Second} {
+		t.Run(fetchTime.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s := newFlipStack(t, 0)
+				const suite = "/n/dists/s"
+				s.h.adoptionEnabled = true // a Release creates the row; it marks nothing itself
+				var fetches atomic.Int32
+				s.h.fetch = slowUpstream{staticUpstream: staticUpstream{"http://" + flipSimHost + suite + "/Release": rowRelease},
+					delay: fetchTime, fetches: &fetches}
+				s.signsAfterTheSniff(suite, wallclock.Unix())                 // the creation is unproven: the backstop runs
+				s.h.backstopHook = func(ctx context.Context) { <-ctx.Done() } // a writer that never answers
+				start := time.Now()
+				rec := httptest.NewRecorder()
+				s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+suite+"/Release", nil))
+				want := min(fetchTime+backstopTimeout, budget)
+				if elapsed := time.Since(start); rec.Code != http.StatusOK || elapsed != want {
+					t.Fatalf("status %d after %v, want 200 after %v (the %v fetch, then the backstop within the %v budget)",
+						rec.Code, elapsed, want, fetchTime, budget)
+				}
+			})
+		})
+	}
+}
+
+// Spec C3 T1-on-seed: only the creating request fires T1 — a coalesced
+// miss waiter shares the leader's result, creation included, and fires
+// nothing. (Proposed by the executability review; kills X27.)
+func TestServeHTTP_CoalescedCreatingMissFiresT1Once(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	var fetches atomic.Int32
+	r.h.fetch = slowUpstream{staticUpstream: staticUpstream{r.srv.URL + "/r/dists/s/InRelease": rowInRelease},
+		delay: 300 * time.Millisecond, fetches: &fetches}
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if rec := r.get("/r/dists/s/InRelease"); rec.Code != http.StatusOK {
+				t.Errorf("miss = %d", rec.Code)
+			}
+		}()
+	}
+	wg.Wait()
+	r.h.activeWG.Wait()
+	if fetches.Load() != 1 {
+		t.Fatalf("%d upstream fetches, want 1 (setup: the two misses must coalesce)", fetches.Load())
+	}
+	if calls := r.fresh.snapshot(); len(calls) != 1 {
+		t.Fatalf("T1 calls %v, want exactly one (the creating leader's)", calls)
+	}
+}
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test ./internal/handler/ -run 'TestServeHTTP_MissThatCreatesItsSuiteFiresT1|TestServeHTTP_CoalescedMissWaiter|TestServeHTTP_OnboardingWaiter|TestServeHTTP_OnboardingSharesOneDeadline|TestServeHTTP_OnboardingStopsAtShutdown'`
-Expected: FAIL — `TestServeHTTP_MissThatCreatesItsSuiteFiresT1` (`adoption=true: T1 calls [], want 1 for /r/dists/s`), `TestServeHTTP_OnboardingSharesOneDeadlineWithItsBackstop` (`status 200 after 8s, want 200 after the shared 5s`), `TestServeHTTP_OnboardingStopsAtShutdown` (`the onboarding outlived the shutdown`). The two waiter tests pass already: they pin phase D's registration now that a flip can reach it.
+Run: `go test ./internal/handler/ -run 'TestServeHTTP_MissThatCreatesItsSuiteFiresT1|TestServeHTTP_CoalescedMissWaiter|TestServeHTTP_OnboardingWaiter|TestServeHTTP_OnboardingSharesOneDeadline|TestServeHTTP_OnboardingStopsAtShutdown|TestServeHTTP_MissBackstopSharesTheRequestsBudget|TestServeHTTP_CoalescedCreatingMissFiresT1Once'`
+Expected: FAIL — `TestServeHTTP_MissThatCreatesItsSuiteFiresT1` (`adoption=true: T1 calls [], want 1 for /r/dists/s`), `TestServeHTTP_OnboardingSharesOneDeadlineWithItsBackstop` (`status 200 after 8.01s, want 200 after the shared 5s`), `TestServeHTTP_OnboardingStopsAtShutdown` (`the onboarding outlived the shutdown`), `TestServeHTTP_MissBackstopSharesTheRequestsBudget/22s` (`status 200 after 27s, want 200 after 25s`), `TestServeHTTP_CoalescedCreatingMissFiresT1Once` (`T1 calls [], want exactly one`). The two waiter tests and the budget test's `2s` leg pass already: they pin phase D's behaviour now that a flip can reach it.
 
 - [ ] **Step 3: Implement**
 
 ```diff
 diff --git a/internal/handler/handler.go b/internal/handler/handler.go
-index 601e2b5..49c17f5 100644
+index 69aaa64..acfb5e7 100644
 --- a/internal/handler/handler.go
 +++ b/internal/handler/handler.go
-@@ -1443,4 +1443,14 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
+@@ -1455,4 +1455,14 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
  		return
  	}
 +	// Spec C3 T1-on-seed (phase D plan, design note 2): a miss that created
@@ -8945,7 +11262,7 @@ index 601e2b5..49c17f5 100644
 +	}
  	outcome, logOutcome := cacheMiss, "miss"
  	if shared {
-@@ -1467,6 +1477,10 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
+@@ -1479,6 +1489,13 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
  		//
  		// AIDEV-NOTE: the body waits on the backstop, so backstopTimeout
 -		// (5 s) bounds it well under apt's 30 s inactivity timeout (Task 9
@@ -8955,10 +11272,20 @@ index 601e2b5..49c17f5 100644
 +		// pool reads (readHead, at most HeadBytes of a local file) take no
 +		// context (deferred minor D-37). Before it the body may also wait
 +		// in a flip's hold of the just-created suite (at most
-+		// flipgate.HoldMax): reachable since eager first adoption.
++		// flipgate.HoldMax): reachable since eager first adoption — so the
++		// deadline also counts from the request's start (design review
++		// M-15, missBackstopDeadline): at most missBodyBudget (25 s) after
++		// it, under apt's 30 s inactivity timeout.
  		// On a timeout or any other failure markCachedSignedAnchors logs
  		// WARN and the body is served anyway: the body in hand was marked in
-@@ -2045,6 +2059,6 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
+@@ -1486,5 +1503,5 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
+ 		// marker pass marks the other cached anchors at the next start —
+ 		// the one residual (spec C3).
+-		bctx, cancel := context.WithTimeout(h.lifecycleCtx, backstopTimeout)
++		bctx, cancel := context.WithDeadline(h.lifecycleCtx, missBackstopDeadline(start))
+ 		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
+ 		cancel()
+@@ -2057,6 +2074,6 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
  	//
  	// AIDEV-NOTE: the sniff reads the finalized pool file (SniffReleaseGPG
 -	// requires a binary signature's version byte: ruling PD-10). Phase E's
@@ -8967,7 +11294,7 @@ index 601e2b5..49c17f5 100644
 +	// keys on stored.Create.Outcome == cache.SuiteCreated (sfResult.created);
  	// stored.Tracked is what the late flip-barrier registration uses.
  	// A pool file that cannot be read back (a local disk fault) is logged
-@@ -2094,4 +2108,5 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
+@@ -2106,4 +2123,5 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
  		vouchingSuites: vouchers,
  		suiteTracked:   stored.Tracked,
 +		created:        stored.Create.Outcome == cache.SuiteCreated,
@@ -8986,10 +11313,10 @@ index 770d675..bf57f1a 100644
  	// snapshotCount: the strict-mode current_snapshot_count of an
  	// errUnvouchedRetryable result, for the refusal's log line.
 diff --git a/internal/handler/suite_rows.go b/internal/handler/suite_rows.go
-index 842bf83..7082ded 100644
+index 842bf83..3c29bbe 100644
 --- a/internal/handler/suite_rows.go
 +++ b/internal/handler/suite_rows.go
-@@ -330,8 +330,11 @@ func (h *Handler) cachedAnchors(ctx context.Context, key cache.SuiteKey, except
+@@ -330,10 +330,32 @@ func (h *Handler) cachedAnchors(ctx context.Context, key cache.SuiteKey, except
  
  // backstopTimeout bounds markCachedSignedAnchors where it runs before the
 -// body — after an unproven creation on the miss path and after onboarding —
@@ -9005,7 +11332,28 @@ index 842bf83..7082ded 100644
 +// served.
  const backstopTimeout = 5 * time.Second
  
-@@ -416,7 +419,10 @@ func (h *Handler) registerLate(r *http.Request, req *proxy.Request, sr *suiteReq
++// missBodyBudget bounds, from a miss's start, how long it may wait before
++// its body (design review M-15): the fetch, the store and a flip's hold of
++// the just-created suite (at most flipgate.HoldMax) come first, then the
++// backstop of an unproven creation, and apt gives up after 30 s without a
++// byte.
++const missBodyBudget = 25 * time.Second
++
++// missBackstopDeadline is the miss path's backstop deadline:
++// backstopTimeout from now, but never past missBodyBudget from the
++// request's start (an expired deadline fails the backstop at once; it is
++// logged WARN and the body is served).
++func missBackstopDeadline(start time.Time) time.Time {
++	d := time.Now().Add(backstopTimeout)
++	if limit := start.Add(missBodyBudget); limit.Before(d) {
++		return limit
++	}
++	return d
++}
++
+ // markCachedSignedAnchors is the backstop for an unproven creation
+ // (cache.CreateResult.Unproven): a cached anchor row that changed or
+@@ -416,7 +438,10 @@ func (h *Handler) registerLate(r *http.Request, req *proxy.Request, sr *suiteReq
  }
  
 -// onboardTimeout bounds onboarding's writer operation (design review M8):
@@ -9019,7 +11367,7 @@ index 842bf83..7082ded 100644
 +// timeout the hit serves untracked, as on any onboarding error.
  const onboardTimeout = 5 * time.Second
  
-@@ -445,5 +451,8 @@ func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blo
+@@ -445,5 +470,8 @@ func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blo
  	}
  	key := "onboard|" + sr.key.CanonicalScheme + "|" + sr.key.CanonicalHost + "|" + sr.key.SuitePath
 -	res, shared, _ := h.sf.Do(key, func() sfResult { return h.runOnboard(r, req, sr) })
@@ -9029,21 +11377,21 @@ index 842bf83..7082ded 100644
 +	res, shared, _ := h.sf.Do(key, func() sfResult { return h.runOnboard(r, req, sr, deadline) })
  	if !res.suiteTracked {
  		return nil
-@@ -452,5 +461,5 @@ func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blo
+@@ -452,5 +480,5 @@ func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blo
  	t := h.registerLate(r, req, sr)
  	if res.unproven && !shared {
 -		bctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), backstopTimeout)
 +		bctx, cancel := context.WithDeadline(h.lifecycleCtx, deadline)
  		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
  		cancel()
-@@ -463,5 +472,5 @@ func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blo
+@@ -463,5 +491,5 @@ func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blo
  // (created, or found), and in unproven whether the creation needs the
  // backstop.
 -func (h *Handler) runOnboard(r *http.Request, req *proxy.Request, sr *suiteReq) sfResult {
 +func (h *Handler) runOnboard(r *http.Request, req *proxy.Request, sr *suiteReq, deadline time.Time) sfResult {
  	now := wallclock.Unix()
  	seed := h.suiteSeed(sr, false, "", "", now)
-@@ -469,5 +478,5 @@ func (h *Handler) runOnboard(r *http.Request, req *proxy.Request, sr *suiteReq)
+@@ -469,5 +497,5 @@ func (h *Handler) runOnboard(r *http.Request, req *proxy.Request, sr *suiteReq)
  		seed.SignedSeenAt = now
  	}
 -	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), onboardTimeout)
@@ -9061,13 +11409,18 @@ Expected: PASS.
 
 | Mutation | Fails |
 |---|---|
-| `serveCacheMiss` never fires T1-on-seed | `TestServeHTTP_MissThatCreatesItsSuiteFiresT1` |
+| `serveCacheMiss` never fires T1-on-seed | `TestServeHTTP_MissThatCreatesItsSuiteFiresT1`, `TestServeHTTP_CoalescedCreatingMissFiresT1Once` |
+| T1-on-seed fired by coalesced waiters too (`!shared` dropped, X27) | `TestServeHTTP_CoalescedCreatingMissFiresT1Once` |
 | `created` keyed on `stored.Tracked` (fires for an existing suite) | `TestServeHTTP_MissThatCreatesItsSuiteFiresT1` |
 | T1-on-seed without the adoption check | `TestServeHTTP_MissThatCreatesItsSuiteFiresT1`, `TestServeHTTP_AdoptionDisabledSeedParity` |
 | `serveCacheMiss`: only the leader registers (`if !shared { t = h.registerLate(…) }`) | `TestServeHTTP_CoalescedMissWaiterRegistersItsOwnServe` |
 | `onboard`: only the leader registers | `TestServeHTTP_OnboardingWaiterRegistersItsOwnServe` |
 | `onboard`: the backstop gets a fresh `backstopTimeout` | `TestServeHTTP_OnboardingSharesOneDeadlineWithItsBackstop` |
 | `runOnboard` under `context.WithoutCancel(r.Context())` again | `TestServeHTTP_OnboardingStopsAtShutdown` |
+| the miss path's backstop gets a fresh `backstopTimeout` again (M-15) | `TestServeHTTP_MissBackstopSharesTheRequestsBudget/22s` |
+| `missBackstopDeadline` is the budget alone (`true \|\| limit.Before(d)`) | `TestServeHTTP_MissBackstopSharesTheRequestsBudget/2s`, `TestServeHTTP_BackstopIsBoundedBeforeTheBody/miss` |
+
+(T1 fired before the response — the `defer` dropped, the review's X28 — is near-equivalent and has no test: the creating serve registered before its body, so the flip waits for it either way; only the timing differs.)
 
 - [ ] **Step 6: Commit**
 
@@ -9194,7 +11547,7 @@ func TestWarnSuiteCaps_ZeroCapAndReadFailure(t *testing.T) {
 - [ ] **Step 2: Run to verify failure**
 
 Run: `go vet ./internal/config/ ./cmd/apt-cacher-ultra/`
-Expected: FAIL — `cfg.Adoption.AdoptUnsigned undefined`, `a.AdoptsUnsigned undefined`.
+Expected: FAIL — `cfg.Adoption.AdoptUnsigned undefined` in both packages (vet stops at the first error of a package; `go test -gcflags=-e ./cmd/apt-cacher-ultra/` also names `a.AdoptsUnsigned undefined`).
 
 - [ ] **Step 3: Implement**
 
@@ -9251,7 +11604,7 @@ index 7321b5c..4a582be 100644
  		},
  		GC: GCConfig{
 diff --git a/internal/freshness/unsigned.go b/internal/freshness/unsigned.go
-index b770e44..faaca97 100644
+index 013317a..8abf007 100644
 --- a/internal/freshness/unsigned.go
 +++ b/internal/freshness/unsigned.go
 @@ -52,4 +52,8 @@ func (a *Adopter) RunUnsigned(ctx context.Context, suite SuiteRef, release []byt
@@ -9262,7 +11615,7 @@ index b770e44..faaca97 100644
 +func (a *Adopter) AdoptsUnsigned() bool { return a.adoptUnsigned }
 +
  // unsignedEligible is spec C5's unsigned eligibility, checked before
- // anything is downloaded (the "order of checks in runShared"): the knob is
+ // anything is downloaded (the "order of checks in runShared") and by the
 diff --git a/packaging/config/config.toml.default b/packaging/config/config.toml.default
 index b133bc5..ec24d1d 100644
 --- a/packaging/config/config.toml.default
@@ -9306,28 +11659,34 @@ git commit -m "Add adoption.adopt_unsigned (default true) and wire it to the ado
 
 ### Task 12: Definition of done — the end-to-end scenarios and the DoD map
 
-Spec §9's E row, the overview's "E:" line and the brief's mandatory DoD, each tied to the test that proves it. Five scenarios are new here; the rest landed with the code they pin.
+Spec §9's E row, the overview's "E:" line and the brief's mandatory DoD, each tied to the test that proves it. Five scenarios are new here (the production-shaped fixture rebuilt as design review I-6 asks); the rest landed with the code they pin.
 
 | DoD item | Test (task) |
 |---|---|
-| Production-shaped fixture: active never-adopted suites adopt once, dormant ones (the v7 backfill's stamp) make zero requests — scheduler and client checks | `TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent` (12) |
+| Production-shaped fixture (design review I-6: 3 hosts × 8 never-adopted suites, half dormant by the v7 backfill's stamp, a reconstructed anchor row on each host, a client returning at hour 1, a rejected first adoption): active suites adopt exactly once, dormant ones make zero requests (scheduler and client checks), the returning suite adopts within one tick of its touch (M-12), the rejected one keeps its C7 schedule | `TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent` (12) |
 | Classification table, every status class per anchor | `TestClassify_Table`, `TestCheckFirst_ClassificationPerAnchor` (6), `TestCheck_CurrentAnchorClassification` (7) |
 | Form transitions both ways (incl. detached → inline) and the two-observation rule; `anchor_absent` visible | `TestCheckFirst_ProbeTreeAdoptsTheFormFound` (6), `TestCheck_DetachedSuiteMovesToInlineWhenInReleaseAppears`, `TestCheck_AbsentAnchorMovesLaterallyAfterTwoObservations`, `TestCheck_AbsentAnchorNeverMovesToUnsigned`, `TestCheck_UnsignedSuiteUpgradesWhenSigned` (7) |
-| Never-downgrade at eligibility | `TestRunUnsigned_EligibilityBeforeAnyDownload` (3), `TestCheckFirst_UnsignedRefusedWithSignedHistory` (6), `TestCheck_UnsignedSuiteUpdates` (7) |
+| Never-downgrade at eligibility | `TestRunUnsigned_EligibilityBeforeAnyDownload` (3), `TestCheckFirst_UnsignedRefusedWithSignedHistory` (6), `TestCheck_UnsignedSuiteUpdates`, `TestCheck_UnsignedSuiteSeenSignedNeverUpdatesUnsigned` (7) |
+| One never-downgrade rule at eligibility and in the commit: a marker under either scheme (M-7), or an adopted non-retired signed snapshot of the base or its `/.` twin (M-8) | `TestCommitAdoption_RefusesUnsignedForAnySignedHistory` (1), `TestRunUnsigned_EligibilityBeforeAnyDownload` (3) |
 | Never-downgrade inside the commit transaction, incl. the race (paused before commit, signed anchor served, marker committed, resumed → refused) and a barrier past `max_duration`; the refusal is a state (R-E2) | `TestCommitAdoption_RefusesAnUnsignedDowngrade` (1), `TestCheck_UnsignedRefusedInsideTheCommitIsAState`, `TestRefusalKeepsCurrent_OnlyUpstreamOlderAndRollback` (3) |
-| R-E1: a missing marker with a sniff-passing cached signed anchor is re-marked and refuses; a failed mark refuses | `TestRunUnsigned_RemarksCachedSignedAnchors`, `TestRunUnsigned_FailedRemarkRefuses` (3) |
+| R-E1: a missing marker with a sniff-passing cached signed anchor is re-marked and refuses, also from the `/.` twin's rows (I-3); a failed mark or pool read refuses and is logged (M-1) | `TestRunUnsigned_RemarksCachedSignedAnchors`, `TestRunUnsigned_FailedRemarkRefuses`, `TestRunUnsigned_RemarkReadErrorRefuses`, `TestRunUnsigned_RemarkMarksTheTwinsBase` (3) |
+| The fourth marker writer (I-2): a probe that finds a sniff-passing signature for a suite without a signed current snapshot marks the base before admitting | `TestCheckFirst_ProbedSignatureMarksTheBase` (6), `TestCheck_AbsentUnsignedReleaseTreeFindsASignature` (7) |
 | §6.1-quarantined plain-text suite adopts unsigned through `Release`, never `unsigned_downgrade_refused` | `TestDoD_QuarantinedPlainTextSuiteAdoptsUnsigned` (12) |
 | A never-adopted suite whose signed anchor a v6 binary served is refused unsigned on its first post-upgrade check | `TestDoD_V6ServedSignedAnchorRefusesUnsigned` (12) |
 | Unsigned never changes posture (vouches nothing, never counts, never turns strict on) | `TestStrictModeReads_IgnoreUnsignedSnapshots` (1), `TestServeHTTP_UnsignedNeverChangesStrictPosture` (12) |
 | Unsigned candidates set `Form: FormUnsigned`, store `anchor_form = 'unsigned'`, vouch no `.deb` on any path | `TestRunUnsigned_AdoptsWithoutVouching`, `TestReconcile_UnsignedSnapshotGetsNoPackageHash` (3) |
 | Step 3c seeds `<suite>/Release` for unsigned; GC guard (d) keeps it; a reaped one is reconstructed | `TestCommitAdoption_UnsignedSeedsItsReleaseAnchor`, `TestRunURLPathGCBatch_IdentityGuardFollowsTheAnchorForm` (1), `TestCheck_UnsignedRecoversWhenReleaseAnchorMissing` (7) |
-| Unsigned confirmation (404 and 401/403 timings), member cap | `TestCheckFirst_UnsignedTransitionIsConfirmed`, `TestCheckFirst_UnsignedAfterADeniedSignatureWaitsAnHour` (6), `TestUnsignedKeysAndReasons` (3) |
+| Unsigned confirmation (404 and 401/403 timings), member cap — refused before a slot is taken (M-5) | `TestCheckFirst_UnsignedTransitionIsConfirmed`, `TestCheckFirst_UnsignedAfterADeniedSignatureWaitsAnHour`, `TestCheckFirst_UnsignedTooLargeNeverTakesASlot` (6), `TestUnsignedKeysAndReasons` (3), `TestCheck_UnsignedSuiteTooLargeUpdateIsRefused` (7) |
+| Pacing (rulings PE-2, PE-3): a deferred never-adopted suite and an `anchor_absent` suite make no request before their record's retry or the next refresh check | `TestCheckFirst_DeferredSuiteIgnoresClientChecksUntilItsRetry` (6), `TestCheck_AbsentAnchorIsPacedByItsRecord` (7) |
+| A cross-form request records no validators; the current anchor's own are sent while a record is active (I-1) | `TestCheck_DetachedSuiteKeepsAdoptingWhileItsLateralInReleaseFails`, `TestCheck_LateralFailingContentKeepsItsRecord` (7) |
+| The stale-suite WARN leaves out suites in a refusal state (M-13) | `TestStaleSuiteCounts_RefusalStates`, `TestTick_StaleWarnLeavesOutRefusalStates` (7) |
 | nvidia-shaped fixture adopts (SHA512-only Release, Date 2018, SHA256 Packages) | `TestAdopter_SHA512OnlyReleaseAdopts` (2), `TestDoD_NvidiaShapedSuiteAdopts` (12) |
 | SHA512 merge, every-hash verification, aliases; SHA512 by-hash served, also from a displaced snapshot | `TestParseRelease_MergesHashBlocks`, `TestAdopter_VerifiesEveryDeclaredHash`, `TestReconcile_HealsASHA512OnlyMember` (2), `TestServeHTTP_SHA512ByHashFromAnAdoption` (2) |
-| C10 wait on the hit and the miss path; 64-waiter cap; adoption disabled → no wait | `TestServeHTTP_StrictHitWaitsForAnAdoptionInFlight`, `TestServeHTTP_StrictMissWaitsForAnAdoptionInFlight`, `TestServeHTTP_StrictWaitRefusals`, `TestHostAdoptions_WaiterCap`, `TestHandlerConfig_StrictModeWaitsOnTheCheckersAdoptions` (9) |
-| T1-on-seed on the miss path, keyed on the creation | `TestServeHTTP_MissThatCreatesItsSuiteFiresT1` (10) |
+| C10 wait on the hit and the miss path, bounded by the request's age (M-10); 64-waiter cap; adoption disabled → no wait | `TestServeHTTP_StrictHitWaitsForAnAdoptionInFlight`, `TestServeHTTP_StrictMissWaitsForAnAdoptionInFlight`, `TestServeHTTP_StrictWaitRefusals`, `TestHostAdoptions_WaiterCap`, `TestHandlerConfig_StrictModeWaitsOnTheCheckersAdoptions`, `TestChecker_WaitIsBoundedByTheRequestsAge`, `TestServeHTTP_StrictMissClientLeftDuringTheWait` (9) |
+| T1-on-seed on the miss path, keyed on the creation, fired by the creating request only | `TestServeHTTP_MissThatCreatesItsSuiteFiresT1`, `TestServeHTTP_CoalescedCreatingMissFiresT1Once` (10) |
+| The miss path's backstop deadline counts from the request's start (M-15) | `TestServeHTTP_MissBackstopSharesTheRequestsBudget` (10) |
 | Waiters' late registration, both paths | `TestServeHTTP_CoalescedMissWaiterRegistersItsOwnServe`, `TestServeHTTP_OnboardingWaiterRegistersItsOwnServe` (10) |
-| Capacity upgrade burst: 50 never-adopted suites with interest, signed suites never wait more than one adoption, ≤ 2 probes per queued suite | `TestSimCapacity_UpgradeBurst` (8) |
+| Capacity upgrade burst: 50 never-adopted suites with interest, signed suites never wait more than one adoption, ≤ 2 probes per queued suite; also all on one host | `TestSimCapacity_UpgradeBurst`, `TestSimCapacity_UpgradeBurstSameHost` (8) |
 | One check tail; unexpected statuses counted as failed (R-E3); absent statuses reset the streak (R-E4) | `TestCheck_UnexpectedStatusIsAFailedCheck` (4), `TestCheckFirst_ClassificationPerAnchor`, `TestCheck_AbsentAnchorMovesLaterallyAfterTwoObservations` (6, 7) |
 | `signedCurrent = form != unsigned` for repair and reconcile | `TestCheck_RepairOfAnUnsignedSuiteNeverTakesTheReservedSlot`, `TestReconcile_UnsignedSuiteNeverTakesTheReservedSlot` (7) |
 | Waiters' signed flag current | `TestTick_RefreshesTheWaitersSignedFlag` (8) |
@@ -9339,8 +11698,8 @@ The `/.` twin variant of the in-commit race test belongs to phase G (Task 15 rec
 - Create: `internal/freshness/dod_e_test.go`, `internal/handler/unsigned_posture_test.go`
 
 **Interfaces:**
-- Consumes: everything above; test helpers `newRetryRig`, `retryRig.release/releaseText/unsignedRelease/currentSnapshot/check/row`, `signedRelease`, `seedStaleAnchorAt`, `startSched`, `rigVerifier`, `fakePackagesStanzas`, `newFakeFetcher`, `sha512Of`, `discardAuditLogger`, `lastResult`; `RunLegacyTrustAudit`, `Adopter.writeBlobBytes`; handler helpers `newPhase3StrictHandler(Capturing)`, `adoptCoverageComplete`, `writeBlob`, `splitURL`, `hostKey`, `proxyReq`, `sha256Hex`.
-- Produces: test helpers `commitLegacyInline(t, r *retryRig, anchor []byte) int64` (`dod_e_test.go`), `commitUnsigned(t, h, scheme, host, suite, debPath string)` (`unsigned_posture_test.go`).
+- Consumes: everything above; test helpers `newRetryRig`, `retryRig.release/releaseText/unsignedRelease/currentSnapshot/check/row`, `signedRelease`, `seedStaleAnchorAt`, `startSched`, `errRigUntrusted`, `fakePackagesStanzas`, `newFakeFetcher`, `sha512Of`, `discardAuditLogger`, `lastResult`; `RunLegacyTrustAudit`, `Adopter.writeBlobBytes`, `contentKey`, `backoffDelay`, `interestWindow`, `checkDeadline`; cache `PutURLPath`, `SeedSuiteForTest`, `TouchSuite`; handler helpers `newPhase3StrictHandler(Capturing)`, `adoptCoverageComplete`, `writeBlob`, `splitURL`, `hostKey`, `proxyReq`, `sha256Hex`.
+- Produces: test helpers `dodVerifier` (a `Verifier` recording each suite's verification times, rejecting chosen content keys) and `commitLegacyInline(t, r *retryRig, anchor []byte) int64` (`dod_e_test.go`), `commitUnsigned(t, h, scheme, host, suite, debPath string)` (`unsigned_posture_test.go`).
 
 - [ ] **Step 1: Write the scenario tests**
 
@@ -9352,6 +11711,7 @@ package freshness
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -9361,64 +11721,162 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
-// Phase E DoD (spec §9 row E): a production-shaped fixture — never-adopted
-// suites clients use today, and never-adopted suites the v7 backfill left
-// dormant (interest stamped migration time minus the 7-day window) — under
-// the real scheduler: every active suite adopts exactly once, every
-// dormant suite costs zero upstream requests.
+// dodVerifier passes every InRelease through as its own plaintext and
+// records each verification per suite; content keys in reject fail as an
+// untrusted signer would.
+type dodVerifier struct {
+	mu     sync.Mutex
+	reject map[string]bool
+	calls  map[SuiteRef][]time.Time
+}
+
+func (v *dodVerifier) VerifyInline(_ context.Context, s SuiteRef, b []byte) ([]byte, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.calls[s] = append(v.calls[s], time.Now())
+	if v.reject[contentKey(adoptionFormInline, b, nil, nil)] {
+		return nil, errRigUntrusted
+	}
+	return b, nil
+}
+
+func (v *dodVerifier) VerifyDetached(_ context.Context, _ SuiteRef, rel, _ []byte) ([]byte, error) {
+	return rel, nil
+}
+
+func (v *dodVerifier) attempts(s SuiteRef) []time.Time {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return append([]time.Time(nil), v.calls[s]...)
+}
+
+// Phase E DoD (spec §9 row E; design review I-6): a production-shaped
+// fixture under the real scheduler at a 15-minute refresh — 3 hosts × 8
+// never-adopted suites; on each host half are dormant by the v7 backfill
+// rule (interest stamped migration time minus the 7-day window), three are
+// used by clients today, and one has interest but only a reconstructed
+// anchor row (request_count 0). Asserted: every active suite adopts exactly
+// once (verifications); every dormant suite costs zero upstream requests,
+// also to a client check; a dormant suite whose client returns at hour 1 —
+// its hit's T1 running before the touch is visible, the handler's race
+// (design review M-12) — adopts once, within one scheduler tick of the
+// touch; and an active suite whose first adoption is rejected keeps the
+// spec C7 schedule: never retried before its backoff, and not frozen.
 func TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
 		c := simtest.OpenCache(t)
 		members := newFakeFetcher()
-		ver := &rigVerifier{rejected: map[string]bool{}, panics: map[string]bool{}, entered: make(chan struct{}, 1)}
+		ver := &dodVerifier{reject: map[string]bool{}, calls: map[SuiteRef][]time.Time{}}
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: ver, HostLimiter: hostsem.New(8),
 			MaxConcurrent: 2, Logger: simtest.DiscardLogger()})
 		if err != nil {
 			t.Fatal(err)
 		}
 		up := simtest.NewUpstream()
-		anchorURL := func(host string) string { return "http://" + host + rigSuite + "/InRelease" }
+		anchorURL := func(s SuiteRef) string { return "http://" + s.CanonicalHost + s.SuitePath + "/InRelease" }
 		backfill := time.Now().Add(-interestWindow).Unix()
-		var active, dormant []string
-		for i := 0; i < 6; i++ {
-			host := fmt.Sprintf("a%d", i)
-			if i%2 == 1 {
-				host = fmt.Sprintf("d%d", i)
-			}
-			seedStaleAnchorAt(t, c, host, rigSuite)
-			pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_" + host + ".deb": testHex64})
-			members.put("http://"+host+rigSuite+"/main/binary-amd64/Packages", pkgs)
-			up.Set(anchorURL(host), simtest.Serve(signedRelease("v1-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
-			if i%2 == 1 {
-				if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host,
-					SuitePath: rigSuite, LastRequestedAt: &backfill}); err != nil {
-					t.Fatal(err)
+		var active, dormant []SuiteRef
+		var rejected, returning SuiteRef
+		for h := 0; h < 3; h++ {
+			host := fmt.Sprintf("h%d", h)
+			for i := 0; i < 8; i++ {
+				s := SuiteRef{CanonicalScheme: "http", CanonicalHost: host, SuitePath: fmt.Sprintf("/r/dists/s%d", i)}
+				pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_" + host + s.SuitePath + ".deb": testHex64})
+				members.put("http://"+host+s.SuitePath+"/main/binary-amd64/Packages", pkgs)
+				in := signedRelease("v1 "+host+s.SuitePath, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
+				up.Set(anchorURL(s), simtest.Serve(in))
+				switch {
+				case i < 3: // clients use it today: interest now, a client-created anchor
+					seedStaleAnchorAt(t, c, host, s.SuitePath)
+					active = append(active, s)
+					if h == 0 && i == 2 {
+						rejected = s
+						ver.reject[contentKey(adoptionFormInline, in, nil, nil)] = true
+					}
+				case i == 3: // interest now, but its anchor row was reconstructed (request_count 0)
+					stale := testHex64
+					if err := c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: host,
+						Path: s.SuitePath + "/InRelease", BlobHash: &stale, UpstreamURL: anchorURL(s), IsMetadata: true}); err != nil {
+						t.Fatal(err)
+					}
+					if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host,
+						SuitePath: s.SuitePath}); err != nil {
+						t.Fatal(err)
+					}
+					dormant = append(dormant, s)
+				default: // the v7 backfill: dormant
+					seedStaleAnchorAt(t, c, host, s.SuitePath)
+					if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host,
+						SuitePath: s.SuitePath, LastRequestedAt: &backfill}); err != nil {
+						t.Fatal(err)
+					}
+					if h == 0 && i == 4 {
+						returning = s
+					} else {
+						dormant = append(dormant, s)
+					}
 				}
-				dormant = append(dormant, host)
-				continue
 			}
-			active = append(active, host)
 		}
 		chk, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
 			Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }})
-		time.Sleep(3*time.Hour + 7*time.Minute)
+		time.Sleep(time.Hour + 7*time.Second)
+		// The returning client: the hit's T1 runs before its touch is
+		// visible (both are asynchronous in the handler), so it finds the
+		// suite dormant; the scheduler's next tick sees the touch.
+		chk.Check(ctx, "http", returning.CanonicalHost, returning.SuitePath)
+		if n := len(up.Calls(anchorURL(returning))); n != 0 {
+			t.Fatalf("returning %v: %d upstream requests before its touch, want 0", returning, n)
+		}
+		touched := time.Now()
+		if err := c.TouchSuite(ctx, cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: returning.CanonicalHost,
+			SuitePath: returning.SuitePath}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2*time.Hour - 7*time.Second)
 		stop()
-		for _, host := range dormant { // a client check (T1) of a dormant suite asks upstream nothing either
-			chk.Check(ctx, "http", host, rigSuite)
+		for _, s := range dormant { // a client check (T1) of a dormant suite asks upstream nothing either
+			chk.Check(ctx, "http", s.CanonicalHost, s.SuitePath)
 		}
-		for _, host := range active {
-			if sf, err := c.GetSuiteFreshness(ctx, "http", host, rigSuite); err != nil || sf.CurrentSnapshotID == nil {
-				t.Fatalf("active %s: not adopted (err %v)", host, err)
+
+		for _, s := range append(active, returning) {
+			if s == rejected {
+				continue
+			}
+			if sf, err := c.GetSuiteFreshness(ctx, "http", s.CanonicalHost, s.SuitePath); err != nil || sf.CurrentSnapshotID == nil {
+				t.Fatalf("%v: not adopted (err %v)", s, err)
+			}
+			if n := len(ver.attempts(s)); n != 1 {
+				t.Fatalf("%v: %d verifications, want exactly one adoption", s, n)
 			}
 		}
-		if n := ver.calls(); n != len(active) {
-			t.Fatalf("%d verifications for %d active suites, want exactly one adoption each", n, len(active))
+		const tick = 15 * time.Minute / 4 // the scheduler's tick: periodic_refresh / 4
+		if at := ver.attempts(returning); at[0].Sub(touched) > tick+checkDeadline {
+			t.Fatalf("returning %v: adopted %v after its touch, want within one scheduler tick (%v) and its check",
+				returning, at[0].Sub(touched), tick)
 		}
-		for _, host := range dormant {
-			if n := len(up.Calls(anchorURL(host))); n != 0 {
-				t.Fatalf("dormant %s: %d upstream requests, want 0", host, n)
+		for _, s := range dormant {
+			if n := len(up.Calls(anchorURL(s))); n != 0 {
+				t.Fatalf("dormant %v: %d upstream requests, want 0", s, n)
 			}
+		}
+		// The rejected suite keeps its record's schedule (spec C7): each
+		// retry at least its backoff after the attempt before it, and the
+		// record counts every attempt.
+		at := ver.attempts(rejected)
+		if len(at) < 5 {
+			t.Fatalf("rejected %v: %d attempts in 3 h, want the C7 schedule's retries (not frozen)", rejected, len(at))
+		}
+		for i := 1; i < len(at); i++ {
+			if gap := at[i].Sub(at[i-1]); gap < backoffDelay(int64(i)) {
+				t.Fatalf("rejected %v: attempt %d came %v after the one before, want at least its %v backoff",
+					rejected, i+1, gap, backoffDelay(int64(i)))
+			}
+		}
+		sf, err := c.GetSuiteFreshness(ctx, "http", rejected.CanonicalHost, rejected.SuitePath)
+		if err != nil || sf.CurrentSnapshotID != nil || sf.AdoptionFailCount != int64(len(at)) {
+			t.Fatalf("rejected %v: row %+v (err %v), want no snapshot and a record of %d attempts", rejected, sf, err, len(at))
 		}
 	})
 }
@@ -9629,6 +12087,9 @@ Expected: PASS (the behaviour landed in Tasks 1–11; these pin it end to end). 
 | `DeclaredHashesForPath` without its `anchor_form <> 'unsigned'` filter | `TestServeHTTP_UnsignedNeverChangesStrictPosture/a_protected_host_stays_protected` |
 | `HostCurrentSnapshotsCoverage` without its filter | `TestServeHTTP_UnsignedNeverChangesStrictPosture` (both legs) |
 | `checkFirst`: every suite interested | `TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent` |
+| `cachedAnchors`: a reconstructed row counts as client-created (`row.RequestCount > 0` dropped) | `TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent` |
+| a failure record's retry ignores its count (`backoffDelay(1)`) | `TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent` |
+| `TouchSuite` writes nothing (the returning client's interest is lost) | `TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent` |
 | the startup pass marks nothing (`sniffCachedAnchor` false) | `TestDoD_V6ServedSignedAnchorRefusesUnsigned` |
 | the startup pass marks a plain-text anchor (`sniffCachedAnchor` true) | `TestDoD_QuarantinedPlainTextSuiteAdoptsUnsigned` |
 | `ParseRelease` ignores SHA512 blocks | `TestDoD_NvidiaShapedSuiteAdopts` |
@@ -9676,6 +12137,8 @@ The deferred-minor rule (brief): every untagged or E-tagged item in a file a tas
 
 Checked and left (tagged for another phase, or in a file no task changes by hand): see Task 15's intro, which lists every ID with its file.
 
+Two tests here meet ruling PE-3 (a deferred never-adopted suite asks upstream nothing before its record's retry): `TestAdoptionPanicWithABrokenLoggerIsContained`'s second check runs past the record's retry, and B-19's `TestAdoptionFailure_ReasonChangeValidatorsAndDetachedKey` runs on an adopted suite, where new content is attempted at once. The record write keeps Task 7's cross-form rule next to the new `recordHook`.
+
 **Files:**
 - Create: `internal/freshness/flip_barrier.go`, `internal/freshness/deferred_e_test.go`, `internal/handler/anchor_readback_test.go`
 - Modify: `internal/freshness/adoption.go`, `internal/freshness/adoption_failure.go`, `internal/freshness/freshness.go`, `internal/freshness/legacy_audit.go`, `internal/freshness/reconcile.go`, `internal/freshness/retry.go`, `internal/handler/handler.go`; tests `internal/aptpath/sniff_test.go` (D-1, D-2, D-5), `internal/freshness/adoption_failure_test.go`, `internal/freshness/retry_gate_test.go`, `internal/freshness/retry_test.go`, `internal/cache/adoption_scope_test.go`
@@ -9684,7 +12147,32 @@ Checked and left (tagged for another phase, or in a file no task changes by hand
 - Consumes: Task 5's `retryRig.adopt`, `releaseText`, `armoredSig`, `signedRelease`; Task 6's `seedDetachedAnchors` use; Task 7's `retryRig.adoptUnsigned`; test helpers `simMembers`, `logRecords`, `panicLogHandler`, `renderedMetric`, `newSuiteRig`, `suiteRig.unreadableBlob`, cache `commitFor`, `seedBlob`, `stubNow`.
 - Produces: `logPanic(logger *slog.Logger, event, where string, suite SuiteRef, r any)`, `unloggedPanic(report func())`; `(*Adopter).reconcileSnapshot(ctx, suite, snapshotID int64, declared []ReleaseMember, force bool) (int, error)`; `reconcilePending` now returns `([]ReleaseMember, bool, error)`; `checkOutcome.declared`; test seams `Adopter.heartbeatHook`, `Adopter.reparseHook`, `Checker.recordHook`.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Move the barrier code (C-19)**
+
+Move these six declarations, with their doc comments and unchanged, from `internal/freshness/adoption.go` to a new file `internal/freshness/flip_barrier.go`: `(*Adopter).FlipGate`, `(*adoptionPayload).stopErr`, `(*adoptionPayload).barrierCtx`, `(*Adopter).flip`, `barrierOutcome`, `(*Adopter).servedAnchorUnchanged`. The new file starts:
+
+```go
+package freshness
+
+// The spec C8 flip barrier, the adopter's side: the commit waits behind the
+// barrier (flip), the shutdown signal and the context the barrier waits
+// under (stopErr, barrierCtx), the barrier event's outcome, and the first
+// adoption that skips it (servedAnchorUnchanged). Split out of adoption.go
+// unchanged (deferred minor C-19).
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
+)
+```
+
+Run: `go build ./... && go test ./internal/freshness/` — PASS (a move only; it runs first, on the Task 12 tree, because Step 2's tests use the three test seams Step 4 adds — executability review D2).
+
+- [ ] **Step 2: Write the failing tests**
 
 Create `internal/freshness/deferred_e_test.go`:
 
@@ -9811,6 +12299,9 @@ func TestAdoptionPanicWithABrokenLoggerIsContained(t *testing.T) {
 	if strOf(r.row().AdoptionFailReason) != cache.ReasonPanic {
 		t.Fatalf("record reason %q, want panic", strOf(r.row().AdoptionFailReason))
 	}
+	// Past the record's retry: before it, a check of the deferred
+	// never-adopted suite asks upstream nothing (ruling PE-3).
+	r.clock.advance(backoffDelay(1) + time.Minute)
 	r.check() // the suite mutex was released: a second check runs
 	if n := len(r.up.etagsSent(rigAnchorURL)); n != 2 {
 		t.Fatalf("%d checks reached upstream, want 2", n)
@@ -9975,7 +12466,7 @@ index 30f02e0..c5e129a 100644
  	}
  	// The limit keeps the newest by adoption too.
 diff --git a/internal/freshness/adoption_failure_test.go b/internal/freshness/adoption_failure_test.go
-index ee1aa5c..251108d 100644
+index ee1aa5c..c174565 100644
 --- a/internal/freshness/adoption_failure_test.go
 +++ b/internal/freshness/adoption_failure_test.go
 @@ -130,7 +130,12 @@ func TestAdoptionFailure_PanicIsRecorded(t *testing.T) {
@@ -9994,7 +12485,7 @@ index ee1aa5c..251108d 100644
 +		t.Fatalf("ring = %+v, want one panicked event", r.ring.Snapshot())
  	}
  	v, _ := r.checker.locks.Load(suiteKey("http", rigHost, rigSuite))
-@@ -142,4 +147,49 @@ func TestAdoptionFailure_PanicIsRecorded(t *testing.T) {
+@@ -142,4 +147,56 @@ func TestAdoptionFailure_PanicIsRecorded(t *testing.T) {
  }
  
 +// Deferred minor B-19: a reason change mid-streak keeps the streak and
@@ -10003,6 +12494,13 @@ index ee1aa5c..251108d 100644
 +// failure is keyed sha256(sha256(Release) || sha256(Release.gpg)).
 +func TestAdoptionFailure_ReasonChangeValidatorsAndDetachedKey(t *testing.T) {
 +	r := newRetryRig(t, 0)
++	// An adopted suite: a never-adopted one would not attempt the new
++	// content before its record's retry (ruling PE-3).
++	r.up.set(r.release("v1", 0))
++	r.check()
++	if r.row().CurrentSnapshotID == nil {
++		t.Fatal("setup: v1 not adopted")
++	}
 +	bad := r.release("bad", 0)
 +	r.ver.reject(hashOf(bad))
 +	r.up.set(bad)
@@ -10045,10 +12543,10 @@ index ee1aa5c..251108d 100644
  // Refusals use the record and schedule but are not failures: logged as
  // adoption_refused and never as adoption_failing_persistently.
 diff --git a/internal/freshness/retry_gate_test.go b/internal/freshness/retry_gate_test.go
-index 9c3d2c1..dc221c0 100644
+index b9b821a..fc05101 100644
 --- a/internal/freshness/retry_gate_test.go
 +++ b/internal/freshness/retry_gate_test.go
-@@ -99,6 +99,13 @@ func TestGate_NewContentIsAttemptedAtOnce(t *testing.T) {
+@@ -101,6 +101,13 @@ func TestGate_NewContentIsAttemptedAtOnce(t *testing.T) {
  
  // At next_retry_at the check sends no validators and retries.
 +//
@@ -10110,41 +12608,16 @@ and, after the `"colon at byte 65536"` row:
 		{"", "/Packages.gz", NotSuiteFile}, // nor a host-root flat index
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [ ] **Step 3: Run to verify failure**
 
-Run: `go vet ./internal/freshness/ ./internal/handler/ ./internal/cache/`
-Expected: FAIL — compile errors `ad.heartbeatHook undefined`, `r.checker.recordHook undefined`, `r.adopter.reparseHook undefined`. With those three fields added, `TestHeartbeatPanicIsLoggedWithItsStackOnce`, `TestRunLegacyTrustAudit_UnsignedKeepIsNotSigned`, `TestRunLegacyTrustAudit_ErrorsCarryThePrefix`, `TestJitterDelay_ClampsTheRandomValue`, `TestAdoptionFailureRecordCutByShutdownIsNotAWarning`, `TestCheck_ReconcileOnTheTickParsesTheReleaseOnce` (2 parses), `TestServeHTTP_UnreadableFetchedAnchorIsACacheFault` (outcome `bad_gateway`) fail; `TestAdoptionPanicWithABrokenLoggerIsContained` crashes the test binary (`panic: log handler bug: adoption_panicked`); `TestContentKey`, `TestGate_DueRetryHasNoValidators`, `TestAdoptionFailure_*`, `TestRunRequest_CancelledWithoutAStopContextCommitsNothing`, `TestAdoptionStamp_IsScopedToTheSuitesSchemeAndHost`, `TestDisplacedSnapshotMembers_OrdersByAdoptionAndScopesToTheSuite`, `TestDecodableClearsign`, `TestSniffRelease` and `TestClassifySuiteFile` pass (they pin behaviour the code already has; Step 6 shows their teeth).
-
-- [ ] **Step 3: Move the barrier code (C-19)**
-
-Move these six declarations, with their doc comments and unchanged, from `internal/freshness/adoption.go` to a new file `internal/freshness/flip_barrier.go`: `(*Adopter).FlipGate`, `(*adoptionPayload).stopErr`, `(*adoptionPayload).barrierCtx`, `(*Adopter).flip`, `barrierOutcome`, `(*Adopter).servedAnchorUnchanged`. The new file starts:
-
-```go
-package freshness
-
-// The spec C8 flip barrier, the adopter's side: the commit waits behind the
-// barrier (flip), the shutdown signal and the context the barrier waits
-// under (stopErr, barrierCtx), the barrier event's outcome, and the first
-// adoption that skips it (servedAnchorUnchanged). Split out of adoption.go
-// unchanged (deferred minor C-19).
-
-import (
-	"context"
-	"errors"
-	"fmt"
-
-	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
-	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
-)
-```
-
-Run: `go build ./... && go test ./internal/freshness/` — PASS (a move only).
+Run: `go test -gcflags=-e -run '^$' ./internal/freshness/ ./internal/handler/ ./internal/cache/`
+Expected: FAIL — `internal/freshness` does not build: `ad.heartbeatHook undefined`, `r.checker.recordHook undefined`, `r.adopter.reparseHook undefined` (`go vet` stops at a package's first error; `-gcflags=-e` lists them all). With those three fields declared (and not yet called), `TestHeartbeatPanicIsLoggedWithItsStackOnce`, `TestRunLegacyTrustAudit_UnsignedKeepIsNotSigned`, `TestRunLegacyTrustAudit_ErrorsCarryThePrefix`, `TestJitterDelay_ClampsTheRandomValue`, `TestAdoptionFailureRecordCutByShutdownIsNotAWarning`, `TestCheck_ReconcileOnTheTickParsesTheReleaseOnce` (`parsed 0 times for one heal, want 1`: the hook has no call site yet), `TestServeHTTP_UnreadableFetchedAnchorIsACacheFault` (outcome `bad_gateway`) fail; `TestAdoptionPanicWithABrokenLoggerIsContained` crashes the test binary (`panic: log handler bug: adoption_panicked`); `TestContentKey`, `TestGate_DueRetryHasNoValidators`, `TestAdoptionFailure_*`, `TestRunRequest_CancelledWithoutAStopContextCommitsNothing`, `TestAdoptionStamp_IsScopedToTheSuitesSchemeAndHost`, `TestDisplacedSnapshotMembers_OrdersByAdoptionAndScopesToTheSuite`, `TestDecodableClearsign`, `TestSniffRelease` and `TestClassifySuiteFile` pass (they pin behaviour the code already has; Step 6 shows their teeth).
 
 - [ ] **Step 4: Implement the rest**
 
 ```diff
 diff --git a/internal/freshness/adoption.go b/internal/freshness/adoption.go
-index 1f90f17..ec24bbc 100644
+index ee045de..b2033be 100644
 --- a/internal/freshness/adoption.go
 +++ b/internal/freshness/adoption.go
 @@ -544,4 +544,11 @@ type Adopter struct {
@@ -10167,7 +12640,7 @@ index 1f90f17..ec24bbc 100644
 +			}
  			a.heartbeat(ctx, host, snapshotID, tracker)
  		}
-@@ -1257,9 +1267,5 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
+@@ -1259,9 +1269,5 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
  			defer func() {
  				if r := recover(); r != nil {
 -					a.logger.Error("adoption_panicked",
@@ -10179,7 +12652,7 @@ index 1f90f17..ec24bbc 100644
  				}
  			}()
 diff --git a/internal/freshness/adoption_failure.go b/internal/freshness/adoption_failure.go
-index 21987ef..7f30a0d 100644
+index 6a37587..da85796 100644
 --- a/internal/freshness/adoption_failure.go
 +++ b/internal/freshness/adoption_failure.go
 @@ -33,5 +33,5 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
@@ -10189,8 +12662,8 @@ index 21987ef..7f30a0d 100644
 +			unloggedPanic(func() { c.reportPanic("adoption_panicked", "record", s, r) })
  		}
  	}()
-@@ -70,6 +70,15 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
- 		NextRetryAt: next, ETag: nonEmpty(req.etag), LastMod: nonEmpty(req.lastmod),
+@@ -75,6 +75,15 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
+ 		f.ETag, f.LastMod = nil, nil
  	}
 +	if c.recordHook != nil {
 +		c.recordHook()
@@ -10206,7 +12679,7 @@ index 21987ef..7f30a0d 100644
 +		c.logger.Log(ctx, level, "adoption_failure_record_failed",
  			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath, "err", err)
  		return
-@@ -159,15 +168,19 @@ func (c *Checker) recoverAdoption(req *adoptionRequest, start time.Time) {
+@@ -164,15 +173,19 @@ func (c *Checker) recoverAdoption(req *adoptionRequest, start time.Time) {
  		return
  	}
 -	c.reportPanic("adoption_panicked", "adoption", req.suite, r)
@@ -10238,10 +12711,10 @@ index 21987ef..7f30a0d 100644
  	c.recordAdoptionFailure(req, cache.ReasonPanic)
  }
 diff --git a/internal/freshness/freshness.go b/internal/freshness/freshness.go
-index 28b6b69..3b2582b 100644
+index 3f9f4c0..6517004 100644
 --- a/internal/freshness/freshness.go
 +++ b/internal/freshness/freshness.go
-@@ -238,4 +238,8 @@ type Checker struct {
+@@ -244,4 +244,8 @@ type Checker struct {
  	unlockDroppedHook func(key string)
  
 +	// recordHook, when set (tests only), runs in recordAdoptionFailure
@@ -10250,41 +12723,41 @@ index 28b6b69..3b2582b 100644
 +
  	lastClockStepLog atomic.Int64 // monotonic ns since processStart of the last clock_step_detected line
  }
-@@ -364,4 +368,5 @@ type checkOutcome struct {
+@@ -377,4 +381,5 @@ type checkOutcome struct {
  	needRepair    bool
  	needReconcile bool
 +	declared      []ReleaseMember // what reconcilePending parsed, for the heal (B-28)
  	lease         *lease
  	// report is what the scheduler learns from this check.
-@@ -656,5 +661,5 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
+@@ -669,5 +674,5 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
  	}
  	out.needRepair = c.adopter.repairPending(ctx, rp.suite, rp.snapshotID)
 -	needReconcile, err := c.adopter.reconcilePending(ctx, rp.snapshotID)
 +	declared, needReconcile, err := c.adopter.reconcilePending(ctx, rp.snapshotID)
  	if err != nil {
  		// A fail-closed anchor (R-1 decode error) must be visible, not a
-@@ -664,5 +669,5 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
+@@ -677,5 +682,5 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
  			"snapshot_id", rp.snapshotID, "stage", "decision", "err", err)
  	}
 -	out.needReconcile = needReconcile
 +	out.needReconcile, out.declared = needReconcile, declared
  	if !out.needRepair && !out.needReconcile {
  		out.repair = nil
-@@ -711,5 +716,5 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
+@@ -724,5 +729,5 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
  // phase E: v7 has no record keyed on a snapshot).
  func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
 -	rp, l, needRepair, needReconcile := out.repair, out.lease, out.needRepair, out.needReconcile
 +	rp, l, needRepair, needReconcile, declared := out.repair, out.lease, out.needRepair, out.needReconcile, out.declared
  	c.adoptionWg.Add(1)
  	go func() {
-@@ -727,5 +732,5 @@ func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
+@@ -740,5 +745,5 @@ func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
  			// on-demand path (Reconcile) so a fail-closed anchor (R-1
  			// decode error) is visible, not a silent non-heal.
 -			if _, err := c.adopter.ReconcileSnapshot(rctx, rp.suite, rp.snapshotID, false); err != nil {
 +			if _, err := c.adopter.reconcileSnapshot(rctx, rp.suite, rp.snapshotID, declared, false); err != nil {
  				c.logger.Warn("adoption_reconcile_failed",
  					"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
-@@ -779,8 +784,17 @@ var ErrAdoptionPanicked = errors.New("adoption_panicked")
+@@ -792,8 +797,17 @@ var ErrAdoptionPanicked = errors.New("adoption_panicked")
  var panicStackLogged sync.Map
  
 -// reportPanic logs a recovered panic. The stack is attached to the first
@@ -10305,7 +12778,7 @@ index 28b6b69..3b2582b 100644
 +func logPanic(logger *slog.Logger, event, where string, suite SuiteRef, r any) {
  	attrs := []any{
  		"where", where,
-@@ -792,5 +806,17 @@ func (c *Checker) reportPanic(event, where string, suite SuiteRef, r any) {
+@@ -805,5 +819,17 @@ func (c *Checker) reportPanic(event, where string, suite SuiteRef, r any) {
  		attrs = append(attrs, "stack", string(debug.Stack()))
  	}
 -	c.logger.Error(event, attrs...)
@@ -10431,10 +12904,10 @@ index 26b62b6..67a670a 100644
  	for _, name := range []string{"InRelease", "Release"} {
  		mem, err := a.cache.GetSnapshotMember(ctx, snapshotID, name)
 diff --git a/internal/freshness/retry.go b/internal/freshness/retry.go
-index 2c2dcaa..0cdf134 100644
+index 8ad987e..df1d0d5 100644
 --- a/internal/freshness/retry.go
 +++ b/internal/freshness/retry.go
-@@ -57,6 +57,12 @@ func backoffDelay(count int64) time.Duration {
+@@ -64,6 +64,12 @@ func backoffDelay(count int64) time.Duration {
  }
  
 -// jitterDelay spreads d by ±25 %: u is uniform in [0, 1); u = 0.5 is d.
@@ -10449,10 +12922,10 @@ index 2c2dcaa..0cdf134 100644
  	return d + time.Duration((u*2-1)*retryJitterFrac*float64(d))
  }
 diff --git a/internal/handler/handler.go b/internal/handler/handler.go
-index 49c17f5..4d0d075 100644
+index acfb5e7..e7a9886 100644
 --- a/internal/handler/handler.go
 +++ b/internal/handler/handler.go
-@@ -2076,5 +2076,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
+@@ -2091,5 +2091,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
  				"err", herr, "canonical_host", req.CanonicalHost, "suite_path", req.SuitePath, "path", req.Path)
  			if file.Marks() {
 -				return sfResult{err: fmt.Errorf("handler: read suite file head: %w", herr), status: fres.Status}
@@ -10504,7 +12977,13 @@ git commit -m "Close the deferred minors in the files phase E changes"
 
 ### Task 14: Deferred minors in the simulations this phase changes
 
-`sim_sched_test.go` and `sim_retry_test.go` change by hand in Task 5 (fixtures), so their untagged deferred minors are taken here. C-38 (the 5 s `-race` budget of the 500-suite and 30-day simulations) is tagged H and stays; nothing here makes either slower than before phase E (the 30-day simulation is back at its pre-E cost, about 4.4 s, once a client keeps its suite interesting through the untrusted phase).
+`sim_sched_test.go` and `sim_retry_test.go` change by hand in Task 5 (fixtures), so their untagged deferred minors are taken here. Ruling PE-8 keeps the 5 s `-race` budget firm, with about 0.5 s of margin (executability review D6). B-57's day-5 touch keeps the 30-day simulation's suite checked through the whole 10-day untrusted phase, and each check of a never-adopted suite now reads its anchor rows. That took the run to 4.6–5.6 s under `-race` (pre-E 4.0 s). So the simulation is coarsened here, every assertion kept at its per-day rate:
+- The older-content phase runs 5 days (was 8): 3..150 verifications, still at most 30 a day.
+- Each clock-step phase runs 2 days (was 4).
+- The liveness floor is 10 checks per simulated day: 190 over the run's 19 full days, where it was 280 over "~28".
+- The untrusted phase keeps its 10 days: the 7-day interest window must lapse inside it, so its floor catches a suite gone dormant.
+
+The run spans about 20 virtual days and takes about 3.6 s under `-race`. Four extra mutants in Step 3 show the coarsened phases keep their teeth. C-38 (H) keeps only the 500-suite simulation.
 
 | ID | Change |
 |---|---|
@@ -10527,7 +13006,7 @@ git commit -m "Close the deferred minors in the files phase E changes"
 
 ```diff
 diff --git a/internal/freshness/deferred_e_test.go b/internal/freshness/deferred_e_test.go
-index 50fb6f4..2a55e63 100644
+index dab1294..2c2c921 100644
 --- a/internal/freshness/deferred_e_test.go
 +++ b/internal/freshness/deferred_e_test.go
 @@ -34,5 +34,5 @@ func TestHeartbeatPanicIsLoggedWithItsStackOnce(t *testing.T) {
@@ -10560,24 +13039,24 @@ index ba03681..5af3bf9 100644
  			up.Set("http://"+host+suite+"/InRelease",
  				simtest.Serve(signedRelease("v1-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
 diff --git a/internal/freshness/sim_burst_test.go b/internal/freshness/sim_burst_test.go
-index fb94c7a..4344f0d 100644
+index 87ab8d8..089eb32 100644
 --- a/internal/freshness/sim_burst_test.go
 +++ b/internal/freshness/sim_burst_test.go
-@@ -53,5 +53,5 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
+@@ -57,5 +57,5 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
  			seedStaleAnchorAt(t, c, host, rigSuite) // client interest now, a client-created anchor
  			members.put(pkgsURL(host), pkgsFor(host))
 -			members.delay[pkgsURL(host)] = time.Minute
 +			members.setDelay(pkgsURL(host), time.Minute)
  			up.Set(anchorURL(host), simtest.Serve(signedRelease("first-"+host, 0,
  				map[string][]byte{"main/binary-amd64/Packages": pkgsFor(host)})))
-@@ -72,5 +72,5 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
+@@ -76,5 +76,5 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
  			}
  			members.put(pkgsURL(host), pkgsFor("2-"+host))
 -			members.delay[pkgsURL(host)] = time.Minute
 +			members.setDelay(pkgsURL(host), time.Minute)
  			v2[host] = signedRelease("v2-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgsFor("2-" + host)})
  			at := time.Duration(10+12*i)*time.Minute + 7*time.Second // a trickle, off the tick grid
-@@ -86,5 +86,5 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
+@@ -90,5 +90,5 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
  			signed = append(signed, host)
  		}
 -		members.started = map[string]time.Time{}
@@ -10585,7 +13064,7 @@ index fb94c7a..4344f0d 100644
  
  		runtime.Gosched()
 diff --git a/internal/freshness/sim_retry_test.go b/internal/freshness/sim_retry_test.go
-index 2c56055..0d23f7f 100644
+index 2c56055..b20eb93 100644
 --- a/internal/freshness/sim_retry_test.go
 +++ b/internal/freshness/sim_retry_test.go
 @@ -29,4 +29,11 @@ type retrySim struct {
@@ -10640,7 +13119,20 @@ index 2c56055..0d23f7f 100644
 +
  // Spec C7/C5 30-day simulation: an untrusted body (bounded attempts), new
  // content (adopted within a refresh interval), an upstream rollback to
-@@ -129,7 +164,9 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
+@@ -112,4 +147,12 @@ func TestSimLim1_DeterministicFailureAttemptsPerDay(t *testing.T) {
+ // when upstream recovers), and backward and forward clock steps (new
+ // content still adopted, checks continue).
++//
++// AIDEV-NOTE: the run spans about 20 virtual days (27 before phase E). The
++// untrusted phase keeps its 10 days: the 7-day interest window lapses
++// inside it, so its floor catches a suite gone dormant without the day-5
++// touch (B-57). The older-content phase runs 5 days and each clock step 2,
++// every bound at the same per-day rate, so the run stays well under the
++// 5 s -race budget (executability review D6, ruling PE-8: about 3.6–4 s).
++// Re-time it under -race before lengthening any phase.
+ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
+ 	synctest.Test(t, func(t *testing.T) {
+@@ -129,7 +172,9 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
  		s.ver.reject(hashOf(bad))
  		s.serve(bad)
 -		time.Sleep(10*day + 7*time.Minute)
@@ -10653,9 +13145,46 @@ index 2c56055..0d23f7f 100644
 +			t.Fatalf("untrusted body: %d attempts in 10 days, want 150..300", a)
  		}
  		if s.current(t) != "" {
-@@ -191,4 +228,116 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
- }
+@@ -148,10 +193,10 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
+ 		s.serve(older)
+ 		before := s.ver.calls()
+-		time.Sleep(8*day + 11*time.Minute)
++		time.Sleep(5*day + 11*time.Minute)
+ 		if s.current(t) != hashOf(v2) {
+ 			t.Fatal("the suite moved back to older-dated content")
+ 		}
+-		if a := s.ver.calls() - before; a < 3 || a > 8*30 {
+-			t.Fatalf("older content cost %d verifications in 8 days, want 3..240", a)
++		if a := s.ver.calls() - before; a < 3 || a > 5*30 {
++			t.Fatalf("older content cost %d verifications in 5 days, want 3..150", a)
+ 		}
+ 		if r := strOf(s.row(t).AdoptionFailReason); r != cache.ReasonUpstreamOlder {
+@@ -166,5 +211,5 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
  
+ 		restore := wallclock.SetOffsetForTest(-2 * time.Hour)
+-		time.Sleep(4*day + 13*time.Minute)
++		time.Sleep(2*day + 13*time.Minute)
+ 		v3 := s.release("v3", wallclock.Now().Unix())
+ 		s.serve(v3)
+@@ -176,5 +221,5 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
+ 
+ 		restore = wallclock.SetOffsetForTest(30 * day)
+-		time.Sleep(4*day + 17*time.Minute)
++		time.Sleep(2*day + 17*time.Minute)
+ 		v4 := s.release("v4", wallclock.Now().Unix())
+ 		s.serve(v4)
+@@ -185,10 +230,123 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
+ 		restore()
+ 		s.stop()
+-		if n := len(s.up.Calls(rigAnchorURL)); n < 28*10 {
+-			t.Fatalf("only %d checks over ~28 days, want >= 280 (liveness)", n)
++		days := int(time.Since(t0) / day)
++		if n := len(s.up.Calls(rigAnchorURL)); n < days*10 {
++			t.Fatalf("only %d checks over %d days, want >= %d (liveness)", n, days, days*10)
++		}
++	})
++}
++
 +// Deferred minor B-58: with no Date on either side the Date rule cannot
 +// refuse the older content; the rollback guard alone keeps the suite on
 +// v2, and records it as the refusal state rollback_refused, not a failure.
@@ -10699,10 +13228,10 @@ index 2c56055..0d23f7f 100644
 +		// whenever it is there, it is the refusal state.
 +		if len(reasons) != 1 || !reasons[cache.ReasonRollbackRefused] {
 +			t.Fatalf("record reasons %v, want only rollback_refused", reasons)
-+		}
-+	})
-+}
-+
+ 		}
+ 	})
+ }
+ 
 +// Deferred minor B-56: clock steps while a failure record is active. A
 +// backward step leaves next_retry_at far ahead: the retry still comes
 +// within the clamped hour (spec C7). A forward step makes it long overdue:
@@ -10770,13 +13299,13 @@ index 2c56055..0d23f7f 100644
 +
  // Spec C5: a flapping mirror alternating old and new content never moves
  // the suite backwards.
-@@ -212,4 +361,5 @@ func TestSimFlappingMirror_NeverFlipsBack(t *testing.T) {
+@@ -212,4 +370,5 @@ func TestSimFlappingMirror_NeverFlipsBack(t *testing.T) {
  		})
  		seenV2 := false
 +		time.Sleep(4 * time.Minute)   // samples off the 7 m 30 s tick grid (deferred minor B-58)
  		for i := 0; i < 3*24*4; i++ { // sample every 15 min for 3 days
  			time.Sleep(15 * time.Minute)
-@@ -283,4 +433,9 @@ func TestSimRestartSpread(t *testing.T) {
+@@ -283,4 +442,9 @@ func TestSimRestartSpread(t *testing.T) {
  			t.Fatalf("%d of 50 failing suites retried within the refresh interval after the restart", retried)
  		}
 +		// Deferred minor B-55: each was attempted once — an adoption, not
@@ -11000,7 +13529,7 @@ index f69ec01..fa72d47 100644
 - [ ] **Step 2: Run them**
 
 Run: `go test -race -run 'TestSim' -v ./internal/freshness/`
-Expected: PASS; every simulation but `TestSimScheduler_FiveHundredStallingOneHealthy` (C-38, phase H) under 5 s. They pin behaviour the code already has; Step 3 shows their teeth.
+Expected: PASS; every simulation but `TestSimScheduler_FiveHundredStallingOneHealthy` (C-38, phase H) under 4.5 s — the 30-day one about 3.6 s, the burst 3.0–3.5 s. They pin behaviour the code already has; Step 3 shows their teeth.
 
 - [ ] **Step 3: Mutation checks** (one at a time, each reverted)
 
@@ -11014,6 +13543,15 @@ Expected: PASS; every simulation but `TestSimScheduler_FiveHundredStallingOneHea
 | `retryMaxDelay` 2 h | `TestSim30Days_RetryDateRulesAndClockSteps` (124 attempts in 10 days) |
 | the natural-key collision not classified `rollback_refused` | `TestSimFlappingMirror_UndatedContentIsARefusedRollback` |
 
+The coarsened 30-day simulation keeps its teeth (each mutant run against it alone):
+
+| Mutation | Fails |
+|---|---|
+| `retryMaxDelay` 30 min (a retry storm) | `TestSim30Days_RetryDateRulesAndClockSteps` (360 attempts in 10 days) |
+| `retryMaxDelay` 2 h | `TestSim30Days_RetryDateRulesAndClockSteps` (124 attempts in 10 days) |
+| a refusal's streak restarts at every attempt (`\|\| cache.IsRefusalReason(reason)`) | `TestSim30Days_RetryDateRulesAndClockSteps` (180 verifications of the older content in 5 days) |
+| the Date rule off (`if false && prior != nil && …`) | `TestSim30Days_RetryDateRulesAndClockSteps` |
+
 - [ ] **Step 4: Commit**
 
 ```bash
@@ -11026,16 +13564,16 @@ git commit -m "Close the simulations' deferred minors: contention, jitter, clock
 
 ### Task 15: Documentation, spec revision 8, overview, deferred files, final verification
 
-Spec §8 for this phase — the operator documentation of eager first adoption (C4), the anchor forms and the unsigned form with its safeguards and its threat notes at the knob (C5), SHA512-only repositories, strict mode's in-flight wait (C10), and the events and metrics C11 lists — then the rulings R-E1–R-E4, deviations 1 and 2 and the design notes the spec should state, written into the spec as revision 8; the overview's phase E bookkeeping and the carry-forwards for F, G and H; and the deferred files. `packaging/config/config.toml.default` documented `adopt_unsigned` in Task 11 (its C-37 comments are phase H's).
+Spec §8 for this phase — the operator documentation of eager first adoption (C4), the anchor forms and the unsigned form with its safeguards and its threat notes at the knob (C5), SHA512-only repositories, strict mode's in-flight wait (C10), and the events and metrics C11 lists — then the rulings R-E1–R-E4 and PE-1–PE-8 (with the design-review items they accept), deviations 1 and 2 and the design notes the spec should state, written into the spec as revision 8; the overview's phase E bookkeeping and the carry-forwards for F, G and H; and the deferred files. `packaging/config/config.toml.default` documented `adopt_unsigned` in Task 11 (its C-37 comments are phase H's).
 
-Deferred minors in the files this task changes: B-67 (`docs/admin-ui-spec.md`: the `adoption_refused_persistently` sentence), D-53 (`docs/log-fields.md`: `clock_step_detected` names the creation attempts' re-reads), D-54 (spec C4: the queue bound's admission order), D-51 (resolved by A-37 in Task 13: the heartbeat now logs its stack), D-59 (moot: Task 13 finishes C-19's file split, so no summary needs "C-19 (wrap only)"). Left in these files: C-36, C-37, D-50, D-52, D-55 (H; the new **H:** carry-forward block holds phase E's items only), C-40 (process: its mutant evidence lives in phase C's session scratchpads, not in the repository).
+Deferred minors in the files this task changes: B-67 (`docs/admin-ui-spec.md`: the `adoption_refused_persistently` sentence), D-53 (`docs/log-fields.md`: `clock_step_detected` names the creation attempts' re-reads), D-54 (spec C4: the queue bound's admission order), D-51 (resolved by A-37 in Task 13: the heartbeat now logs its stack), D-59 (moot: Task 13 finishes C-19's file split, so no summary needs "C-19 (wrap only)"). Left in these files: C-36, C-37, D-50, D-52, D-55 (H; the new **H:** carry-forward block holds phase E's items only). C-40 is closed (ruling PE-7): the task commits are history and the tests are the durable evidence; copying mutant tables into the docs would be maintenance noise — the reasoning that closed D-59. C-21 is re-tagged (H) (ruling PE-7, design review M-18), so the deferred-minor rule stays mechanical, and C-38 is narrowed to the 500-suite simulation (Task 14 coarsened the 30-day one).
 
-**Every deferred minor, as this plan leaves it.** Taken: A-29 (Task 1); A-49, C-16 (Task 3); B-23, B-25, B-33, B-34, B-35 (Task 4); B-30, B-31, B-32, B-37 (Task 7); B-38, B-45, B-46, B-66, D-23 (Task 8); D-33 (Task 9); D-34, D-35, D-37 (Task 10); D-45, D-47 (Task 11); A-37, A-47, B-16, B-17, B-18, B-19, B-20, B-21, B-24, B-28, C-17, C-19, C-29, D-1, D-2, D-5, D-21, D-22, D-38 (Task 13); B-51, B-53, B-54, B-55, B-56, B-57, B-58 (Task 14); B-67, D-51, D-53, D-54, D-59 (this task). Checked and left:
+The docs and the spec state the design as the plan reviews' rulings leave it: the checker's marker writer (PE-5, I-2); the pacing of deferred never-adopted suites and adopted `anchor_absent` suites (PE-2, PE-3) and C7's gate wording (I-1); the symmetric interest window (M-3); never-downgrade under both schemes and with any kept signed snapshot (M-7, M-8), the re-mark's twin rows and its log line (I-3, M-1); strict mode's wait bounded by the request's age (M-10), its per-request cost and the barrier's (M-11 and the verdict table), the refusal logged once per fetch (O1); the miss path's backstop deadline (M-15); the probe bound (PE-4); and the documentation items M-4, M-5, M-6, M-9, M-12, M-13, M-14, M-17 and underspecified 3 (a tree result's `upstream_status`), 7 and 8. M-20's correction of the `last_seen_at` carry-forward is said in so many words. M-14 and M-15 are done in phase E, so no H carry-forward is needed for them, and I-3 is done too (PE-5), so it needs no G item.
 
-- tagged for another phase: C-11 (F; `cache/adoption.go`); D-3, D-4 (G; `aptpath/sniff_test.go`, `sniff.go`), D-32 (G; `handler/suite_rows.go`); C-9, C-36, C-37, C-38, C-39, D-50, D-52, D-55, D-56, D-57, D-58 (H);
+**Every deferred minor, as this plan leaves it.** Taken: A-29 (Task 1); A-49, C-16 (Task 3); B-23, B-25, B-33, B-34, B-35 (Task 4); B-30, B-31, B-32, B-37 (Task 7); B-38, B-45, B-46, B-66, D-23 (Task 8); D-33 (Task 9); D-34, D-35, D-37 (Task 10); D-45, D-47 (Task 11); A-37, A-47, B-16, B-17, B-18, B-19, B-20, B-21, B-24, B-28, C-17, C-19, C-29, D-1, D-2, D-5, D-21, D-22, D-38 (Task 13); B-51, B-53, B-54, B-55, B-56, B-57, B-58 (Task 14); B-67, C-40, D-51, D-53, D-54, D-59 (this task; C-40 and D-59 closed with their reasons). Checked and left:
+
+- tagged for another phase: C-11 (F; `cache/adoption.go`); D-3, D-4 (G; `aptpath/sniff_test.go`, `sniff.go`), D-32 (G; `handler/suite_rows.go`); C-9, C-21 (re-tagged here, ruling PE-7), C-36, C-37, C-38 (narrowed here), C-39, D-50, D-52, D-55, D-56, D-57, D-58 (H);
 - in files phase E changes only mechanically (ruling PD-1): B-36 (`check_streak_test.go`), D-24, D-25 (`suite_lock_test.go`, `suite_lock.go`), A-15 (`hot_set.go`; `hot_prefetch_test.go` gets only Task 3's `sed`);
-- untagged, in a file phase E changes, left by exception: C-21 (`handler/handler.go`: the anchor hook's context fast path needs new `flipgate` API, a package no task changes, for no measured gain, and would touch the barrier's registration race; phase H's sweep decides it);
-- process: C-40 (above);
 - in files no task changes: A-1–A-14 (`wallclock`, `aptpath` suite and encoding, `proxy`), A-19–A-21 (cache schema tests), A-26, A-27 (`cache/legacy_audit.go`), A-55, A-56; B-9–B-14 (`release_date.go`), B-27 (`restart_reset_test.go`), B-52 (the phase B plan), B-59–B-63 (`internal/admin`); C-1–C-8 (`flipgate`, `simtest`), C-12, C-13 (`flip_state_test.go`); D-6 (`gpg/failclosed_test.go`), D-7 (`simtest/clearsign.go`), D-8–D-20 (`cache` tests, `cache/adoption_failure.go`, `cache/suite_rows.go`, `cache/fetched_row.go`), D-26, D-27 (reconcile tests), D-28–D-31 (handler tests), D-36 (`suite_hit_test.go`), D-39–D-44 (`suite_dod_test.go`), D-46, D-48, D-49 (cmd tests), D-60 (`cache/open_cache_test.go`).
 
 **Files:**
@@ -11051,10 +13589,10 @@ Deferred minors in the files this task changes: B-67 (`docs/admin-ui-spec.md`: t
 
 ```diff
 diff --git a/docs/configuration.md b/docs/configuration.md
-index 2a00cd2..b08816a 100644
+index 2a00cd2..9e49236 100644
 --- a/docs/configuration.md
 +++ b/docs/configuration.md
-@@ -266,4 +266,30 @@ copy under its own path is answered from an identical cached file only for
+@@ -266,4 +266,46 @@ copy under its own path is answered from an identical cached file only for
  a tracked suite; otherwise it is fetched from upstream.
  
 +### Eager first adoption
@@ -11067,25 +13605,41 @@ index 2a00cd2..b08816a 100644
 +request that creates a suite starts its first check once its response is
 +sent, so a new repository is adopted within seconds of its first
 +`apt update` when an adoption slot is free. A suite nobody asked for in 7
-+days is dormant: it costs no upstream request until a client asks again.
-+After an upgrade, a suite counts as asked for when a client fetched one of
-+its anchor files in the 7 days before the upgrade.
++days is dormant: it costs no upstream request until a client asks again,
++and is then checked — and adopted, when a slot is free — within one
++scheduler tick (`periodic_refresh / 4`) of that request (the request's own
++check may run before its interest is recorded). A request stamp up to 7 days in the future, left by a clock
++that was stepped back, still counts as interest; one further ahead leaves
++the suite dormant until a client asks for it again. After an upgrade, a
++suite counts as asked for when a client fetched one of its anchor files in
++the 7 days before the upgrade.
++
++A suite whose first adoption failed or was refused (see *How failed
++adoptions are retried*) is probed again at its retry time (2 minutes,
++doubling to an hour), or once `periodic_refresh` has passed since its last
++check if that comes first; checks that clients trigger in between ask
++upstream nothing. A suite whose upstream serves neither `InRelease` nor
++`Release` fails its check (backing off from 2 minutes to an hour) and
++shows "refused: anchor_absent" on the status page.
 +
 +First adoptions never take the last free adoption slot, which is kept for
 +suites that already serve a signed snapshot (see *Capacity and
-+fairness*): with the default `max_concurrent_adoptions = 2` they run one
-+at a time, and only while no other adoption runs; `3` lets two run at
-+once, for example for the burst of first adoptions after an upgrade. A
-+suite waiting for a slot is probed at most twice before its adoption
-+starts — by the check that queued it and the re-check that admits it —
-+or three times when a client's check takes the freed slot first.
++fairness*): with the default `max_concurrent_adoptions = 2` a first
++adoption runs only while no other adoption runs, so on a cache kept busy
++by signed updates it can wait a long time. Busy caches should set `3`,
++which also lets two first adoptions run at once, for example for the
++burst after an upgrade. A suite waiting for a slot is probed twice by the
++scheduler — by the check that queued it and by the re-check that admits
++it — plus once for each client check while it waits (at most one per
++`cooldown`) and once for each slot offered to it that another admission
++takes first.
 +
 +With adoption disabled nothing changes: suites are checked for changes
 +only, and the request that creates a suite starts no check.
 +
  ## `[adoption]`: snapshots, trust, and recovery
  
-@@ -271,5 +297,6 @@ a tracked suite; otherwise it is fetched from upstream.
+@@ -271,5 +313,6 @@ a tracked suite; otherwise it is fetched from upstream.
  | --- | --- | --- | --- |
  | `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them, so tracked suites lag upstream by design: the status page's SUITES vital then reads "ADOPTION DISABLED — METADATA NOT REFRESHED" (stale, not a fault), rows keep their lag text without warning, and failure records left from a time adoption was enabled are inert (no retries, `acu_adoption_failing_suites` reports 0). |
 -| `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are handled by the unsigned form (a later release). |
@@ -11093,7 +13647,7 @@ index 2a00cd2..b08816a 100644
 +| `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` leaves such repositories served from the ordinary cache, unadopted. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
  | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
  | `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. A decodable clearsigned `InRelease` (or, for the detached pair, a parseable `Release.gpg` signature) is still required, as in every mode. Matching pins keep normal verification. Logs a startup warning. |
-@@ -292,10 +319,14 @@ When an adoption fails (an untrusted or malformed signature, a member that will
+@@ -292,10 +335,14 @@ When an adoption fails (an untrusted or malformed signature, a member that will
  If the cache cannot read the current snapshot when an adoption starts, the attempt fails as `db_failed` (and is retried on the backoff schedule) rather than skipping the rollback checks below.
  
 -Two outcomes are refusals, not failures, and are shown as "refused: …" on the status page:
@@ -11104,20 +13658,20 @@ index 2a00cd2..b08816a 100644
 +- `unsigned_unconfirmed`: an unsigned repository's first adoption waits for a second observation of the same `Release` (see *Anchor forms and unsigned repositories*).
 +- `unsigned_downgrade_refused`: the suite has been seen signed, so its unsigned `Release` is not adopted.
 +- `unsigned_too_large`: an unsigned `Release` declares more than 1,000 files.
-+- `anchor_absent`: the suite's current anchor file is gone upstream; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one.
++- `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too.
  
 -Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO), is not counted by `acu_adoption_failing_suites`, and shows no lag. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
 +Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO) and is not counted by `acu_adoption_failing_suites`. `upstream_older` and `rollback_refused` show no lag (the cache already serves content at least as new as upstream's); the other four keep their lag, because the suite is in fact behind. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
  
  A Release dated more than 10 seconds ahead of the cache's clock is a failure (apt rejects it as "not valid yet"); check the cache host's clock if this persists.
-@@ -305,5 +336,5 @@ At start, every failing suite gets one retry spread over the next `periodic_refr
+@@ -305,5 +352,5 @@ At start, every failing suite gets one retry spread over the next `periodic_refr
  ### Capacity and fairness
  
 -`freshness.max_concurrent_adoptions` slots are shared by adoptions, repairs and reconciles, plus one slot per upstream host. Nothing blocks on a slot: a suite whose scheduled check finds none waits in the scheduler's queue and is re-checked as soon as capacity it can use is released (hosts in turn, oldest first); while it waits, no request is made for it. A change found by a client-triggered check that finds no slot stays pending, and the next scheduler tick checks that suite (bypassing the cooldown) and queues it the same way, so it starts waiting within one tick. Client requests still trigger checks under the normal cooldown and may take a freed slot first. When there are at least two slots, the last free one is reserved for suites that already serve a signed snapshot, so security updates are not delayed by first adoptions. With the default pool of two, first adoptions therefore run only when no other adoption is running; `max_concurrent_adoptions = 3` lets two run at once (useful for the burst after an upgrade). A repair or reconcile that finds no slot simply runs on a later unchanged check. `POST /reconcile` answers 409 when no slot is free. The gauge `acu_freshness_waiting_for_slot` counts suites waiting for a slot. An adoption gives its host's slot back when its downloads are done, but keeps its global slot through the flip barrier and the commit, so a slot is held for at most `max_duration` + 140 s (the barrier, see *Flip consistency*; `acu_adoption_duration_seconds` includes that time) + the 5-minute commit bound: N suites waiting for k slots they may use are all admitted within one tick + ⌈N/k⌉ × (that sum + 2 minutes).
-+`freshness.max_concurrent_adoptions` slots are shared by adoptions, repairs and reconciles, plus one slot per upstream host. Nothing blocks on a slot: a suite whose scheduled check finds none waits in the scheduler's queue and is re-checked as soon as capacity it can use is released (hosts in turn, oldest first); while it waits, no request is made for it. A change found by a client-triggered check that finds no slot stays pending, and the next scheduler tick checks that suite (bypassing the cooldown) and queues it the same way, so it starts waiting within one tick. Client requests still trigger checks under the normal cooldown and may take a freed slot first. When there are at least two slots, the last free one is reserved for suites that already serve a signed snapshot, so security updates are not delayed by first or unsigned adoptions. With the default pool of two, first adoptions therefore run only when no other adoption is running; `max_concurrent_adoptions = 3` lets two run at once (useful for the burst after an upgrade). A repair or reconcile that finds no slot simply runs on a later unchanged check (`acu_repair_deferred_total{host}` counts them); one of a suite whose current snapshot is unsigned never takes the reserved slot. `POST /reconcile` answers 409 when no slot is free. The gauge `acu_freshness_waiting_for_slot` counts suites waiting for a slot. An adoption gives its host's slot back when its downloads are done, but keeps its global slot through the flip barrier and the commit, so a slot is held for at most `max_duration` + 140 s (the barrier, see *Flip consistency*; `acu_adoption_duration_seconds` includes that time) + the 5-minute commit bound: N suites waiting for k slots they may use are all admitted within one tick + ⌈N/k⌉ × (that sum + 2 minutes).
++`freshness.max_concurrent_adoptions` slots are shared by adoptions, repairs and reconciles, plus one slot per upstream host. Nothing blocks on a slot: a suite whose scheduled check finds none waits in the scheduler's queue and is re-checked as soon as capacity it can use is released (hosts in turn, oldest first); while it waits, no request is made for it. A change found by a client-triggered check that finds no slot stays pending, and the next scheduler tick checks that suite (bypassing the cooldown) and queues it the same way, so it starts waiting within one tick. Client requests still trigger checks under the normal cooldown and may take a freed slot first. When there are at least two slots, the last free one is reserved for suites that already serve a signed snapshot, so security updates are not delayed by first or unsigned adoptions. With the default pool of two, first adoptions therefore run only when no other adoption is running, and can wait a long time on a cache kept busy by signed updates; `max_concurrent_adoptions = 3` avoids that and lets two run at once (useful for the burst after an upgrade). A repair or reconcile that finds no slot simply runs on a later unchanged check (`acu_repair_deferred_total{host}` counts them); one of a suite whose current snapshot is unsigned never takes the reserved slot. `POST /reconcile` answers 409 when no slot is free. The gauge `acu_freshness_waiting_for_slot` counts suites waiting for a slot. An adoption gives its host's slot back when its downloads are done, but keeps its global slot through the flip barrier and the commit, so a slot is held for at most `max_duration` + 140 s (the barrier, see *Flip consistency*; `acu_adoption_duration_seconds` includes that time) + the 5-minute commit bound: N suites waiting for k slots they may use are all admitted within one tick + ⌈N/k⌉ × (that sum + 2 minutes).
  
  Periodic checks run on four workers, at most one check per upstream host at a time, hosts taking turns. On each host, healthy suites go first, then never-checked suites, then suites whose checks keep failing; a failing suite waits 2 minutes, doubling to an hour, between checks. The upstream part of each check (waiting for the host's fetch slot and the requests) is limited to 2 minutes; the check's own cache writes are not cut short, so the deadline is always recorded. A due suite S is therefore checked within one tick + (n + 1) × ⌈H/4⌉ × 2 minutes, where H is the number of hosts with suites waiting and n the number of suites ahead of S in its host's queue (only healthy ones when S is healthy): stalling hosts delay a healthy suite on another host by at most ⌈H/4⌉ checks per suite ahead of it (with four hosts or fewer, one check), and once a stalling host's suites are known to fail they queue behind its healthy suites — also right after a restart, because the order is persisted. The bound assumes responsive cache I/O.
-@@ -334,5 +365,77 @@ does not verify them cryptographically. `require_pinned_signer = true` still
+@@ -334,5 +381,108 @@ does not verify them cryptographically. `require_pinned_signer = true` still
  rejects unpinned suites, so combining the two does not bypass pin requirements.
  `require_signature = false` no longer lets unsigned data through the inline
 -path. The detached fallback still requires both `Release` and `Release.gpg`.
@@ -11140,47 +13694,78 @@ index 2a00cd2..b08816a 100644
 +for `InRelease` on every check and moves to the inline form as soon as
 +upstream serves one. When a suite's current anchor (`InRelease` for
 +inline, `Release` for detached and unsigned) is absent, the status page
-+shows "refused: anchor_absent" while the snapshot keeps serving; once the
-+absence has lasted `max(cooldown, 5 minutes)`, the suite moves to the other
-+signed form if upstream serves it. While its anchor stays absent the suite
-+is checked every scheduler tick (one request), and the other forms are
-+probed at each retry (2 minutes, doubling to an hour). A suite never moves
-+from a signed form to unsigned: a signed suite whose upstream stops signing
-+keeps its last signed snapshot (a detached suite whose `Release` changes
-+while its `Release.gpg` is gone logs WARN `freshness: Release.gpg fetch
-+failed; deferring adoption` on every check). An unsigned suite moves to a
-+signed form at the first check that finds `InRelease` or `Release.gpg`.
++shows "refused: anchor_absent" while the snapshot keeps serving. The suite
++then asks for its anchor again only at its retry times (2 minutes,
++doubling to an hour); checks in between, including those clients trigger,
++ask upstream nothing, so a returning anchor is noticed at the next retry.
++Once the absence has lasted `max(cooldown, 5 minutes)`, each retry also
++probes the other forms, and the suite moves to the other signed form if
++upstream serves it. The snapshot keeps serving however long its anchor
++stays absent: clients of a release removed upstream (an end-of-life
++distribution) keep getting it through the cache where upstream would
++answer 404, so "refused: anchor_absent" is the sign to update their
++sources. A suite never moves from a signed form to unsigned: a signed
++suite whose upstream stops signing keeps its last signed snapshot (a
++detached suite whose `Release` changes while its `Release.gpg` is absent
++shows "refused: anchor_absent" and is paced the same way; a `Release.gpg`
++request that fails — a 5xx, a timeout — logs WARN `freshness: Release.gpg
++fetch failed; deferring adoption` and is tried again at the next check).
++An unsigned suite moves to a signed form at the first check that finds
++`InRelease` or `Release.gpg`. From that check on the cache has seen the
++suite signed, so it is never adopted unsigned again, even when the signed
++adoption fails (a key the cache does not trust) or the signature later
++disappears.
 +
 +Unsigned adoption has five safeguards:
 +
 +1. `adopt_unsigned` (default `true`).
 +2. A suite's first unsigned adoption waits for two checks that see the same
 +   `Release` at least `max(cooldown, 5 minutes)` apart — an hour apart when
-+   `InRelease` or `Release.gpg` answered 401 or 403, since a firewall or an
-+   S3 permission error can hide a signature. Until then the status page
-+   shows "refused: unsigned_unconfirmed". Later updates of an unsigned
-+   suite are adopted at once.
-+3. Never a downgrade: a suite that has a signed snapshot, or whose signed
-+   `InRelease` or `Release.gpg` the cache has served (recorded when it is
-+   served, and at upgrade from what an earlier version cached), is never
-+   adopted unsigned ("refused: unsigned_downgrade_refused"). The rule is
-+   checked before anything is downloaded and again inside the commit, so a
-+   signed anchor served while an unsigned adoption runs still stops it.
-+4. At most 1,000 declared files ("refused: unsigned_too_large").
++   `InRelease` or `Release.gpg` answers 401 or 403 at the confirming check,
++   since a firewall or an S3 permission error can hide a signature (a 403
++   that later turns into 404s confirms after the shorter gap). Until then
++   the status page shows "refused: unsigned_unconfirmed". A `Release`
++   generated anew for each request, or one that differs between
++   load-balanced backends, never shows the same bytes twice and stays
++   unconfirmed. Later updates of an unsigned suite are adopted at once.
++3. Never a downgrade: a suite the cache has seen signed is never adopted
++   unsigned ("refused: unsigned_downgrade_refused"). Seen signed means it
++   has a signed snapshot (the current one, or one of the displaced
++   snapshots the cache keeps), or the cache served its signed `InRelease`
++   or `Release.gpg`, a check found one upstream, or an earlier version had
++   cached one (recorded at upgrade). The record covers the repository path on its host under both
++   `http` and `https`, so a suite seen signed over one scheme is never
++   adopted unsigned over the other. The rule is checked before an adoption slot is taken and again
++   inside the commit, so a signed anchor served while an unsigned adoption
++   runs still stops it. Just before the commit the cache also re-reads the
++   signed anchors it has cached for the suite and records any it finds; if
++   it cannot read them, the adoption is refused as well (logged as
++   `adoption: signed-anchor re-mark failed`): that refusal means the cache
++   could not rule out a signature.
++4. At most 1,000 files declared in the `Release`'s SHA256 and SHA512
++   lists, each path counted once (files listed only under MD5Sum or SHA1
++   do not count), checked before an adoption slot is taken
++   ("refused: unsigned_too_large").
 +5. An unsigned snapshot vouches no `.deb`, never counts for strict mode
 +   and never records its suite as signed.
 +
 +Threat notes. The record that a suite was seen signed cuts both ways:
-+anyone who can make the cache serve one signed-looking `InRelease` for a
-+repository path — a man in the middle, a compromised upstream, or a LAN
-+client pointing the cache at a host it controls — blocks unsigned adoption
-+of that path until its suite is forgotten (`POST /forget`, added with suite
++anyone who can make the cache see one signed-looking `InRelease` or
++`Release.gpg` for a repository path — served to a client, or found by a
++check; a man in the middle, a compromised upstream, or a LAN client
++pointing the cache at a host it controls — blocks unsigned adoption of
++that path until its suite is forgotten (`POST /forget`, added with suite
 +reaping in a later release). That denial of service is the accepted price
 +of never downgrading. A man in the middle between the cache and upstream
 +can make the cache adopt forged unsigned content only for a suite never
 +seen signed, and only after two consistent observations; apt clients that
 +verify signatures reject it, and `[trusted=yes]` clients accept it as they
-+would when fetching directly. Under the default allow-all upstream policy
++would when fetching directly. A suite whose pre-upgrade snapshot was
++quarantined because its stored `InRelease` was missing, corrupt or
++oversized (see *Upgrading an existing cache*) may have no record that it
++was signed until a check sees its signature upstream; if its signatures
++are gone by then (stripped by a man in the middle, for instance), it
++adopts unsigned. Under the default allow-all upstream policy
 +with adoption enabled, a LAN client can make the cache adopt unsigned
 +directories it controls; that is bounded by the per-host adoption slot,
 +the reserved slot, `max_duration`, the 1,000-file cap and
@@ -11196,7 +13781,7 @@ index 2a00cd2..b08816a 100644
 +still heals the index files apt requests.
  
  ### Architecture and member availability
-@@ -372,9 +475,10 @@ line names it. A suite quarantined for declarations outside its signature
+@@ -372,9 +522,12 @@ line names it. A suite quarantined for declarations outside its signature
  adopts again on its first freshness check, because its tampered copy never
  matches a clean upstream; one quarantined because its stored file was lost
 -or corrupt waits for the next upstream change. A plain-text suite cannot
@@ -11204,7 +13789,9 @@ index 2a00cd2..b08816a 100644
 -from the ordinary cache without vouching until upstream publishes a
 -clearsigned `InRelease`, or, from the release that adds the unsigned form,
 -until it adopts as an unsigned snapshot. In strict mode, a quarantined
-+or corrupt waits for the next upstream change. A quarantined plain-text
++or corrupt waits for the next upstream change, and may have no record that
++it was signed (see the threat notes in *Anchor forms and unsigned
++repositories*). A quarantined plain-text
 +suite adopts again in the unsigned form, through its `Release` (its
 +plain-text "InRelease" counts as absent), once a client has asked for it
 +and two checks have seen the same `Release` (see *Anchor forms and
@@ -11212,7 +13799,7 @@ index 2a00cd2..b08816a 100644
 +snapshot vouches no package. In strict mode, a quarantined
  suite's packages are refused while other suites on the same host have
  complete coverage, as for any unadopted suite. While inline snapshots are
-@@ -391,11 +495,21 @@ not stop the daemon either: that snapshot keeps serving as before, a
+@@ -391,11 +544,21 @@ not stop the daemon either: that snapshot keeps serving as before, a
  The audit resumes if the start is interrupted and is a no-op afterwards. A
  suite whose signed `InRelease` was served by an earlier version is recorded
 -as signed from cached anchors; one whose cached anchor was already
@@ -11237,25 +13824,34 @@ index 2a00cd2..b08816a 100644
 +
  ## `[hot_packages]`, `[hold_packages]`, and `[retention]`: package working set
  
-@@ -425,5 +539,5 @@ grace starts; bytes are later reclaimed after references disappear and
+@@ -425,5 +588,5 @@ grace starts; bytes are later reclaimed after references disappear and
  | `validate_at_rest_interval` | duration | `"24h"` | Periodically rehash blobs reachable from current snapshots. `"0s"` disables this background scan. Nonnegative. |
  | `validate_at_rest_workers` | integer | `4` | Parallel scan workers. Must be at least `1` when the interval is positive; `0` is allowed only with scanning disabled. Never negative. |
 -| `refuse_unvouched_debs` | boolean | `false` | Reject `.deb` requests with `502` and `Retry-After` when the path lacks a current-snapshot hash and all current snapshots for that host have proven complete package coverage. Inert when adoption is disabled; incomplete coverage retains the permissive fetch behavior. |
 +| `refuse_unvouched_debs` | boolean | `false` | Reject `.deb` requests with `502` and `Retry-After` when the path lacks a current-snapshot hash and all current signed snapshots for that host have proven complete package coverage (unsigned snapshots never count). Inert when adoption is disabled; incomplete coverage retains the permissive fetch behavior. A request first waits up to 15 seconds for a signed adoption running on its host; see below. |
  
  These switches do not disable the normal download-time hash checks. A detected
-@@ -431,4 +545,19 @@ at-rest mismatch logs an error and removes the corrupt pool file. Package misses
+@@ -431,4 +594,28 @@ at-rest mismatch logs an error and removes the corrupt pool file. Package misses
  can fetch it again; affected snapshot metadata fails closed until restored.
  
 +With `refuse_unvouched_debs = true`, a `.deb` that no current snapshot
 +vouches for, requested while a signed adoption is running for a suite on
-+the same upstream host, waits for that adoption (at most 15 seconds; at
-+most 64 requests per host wait, and the next are refused at once) and is
-+looked up again, so a package from an update being adopted is served
-+rather than refused (`acu_strict_adoption_waits_total{host}` counts the
-+requests that waited). Refusals remain when an adoption takes longer than
-+15 seconds (large `dists/` suites), when a first adoption is still
-+waiting for a slot, and for packages of an unsigned repository on a host
++the same upstream host, waits for the host's signed adoptions to end and
++is looked up once more, so a package from an update being adopted is
++served rather than refused (`acu_strict_adoption_waits_total{host}` counts
++the requests that waited). The wait lasts at most 15 seconds, and never
++past 25 seconds after the request arrived, so that a miss still has time
++to download the package before apt's 30-second timeout; a request with
++less than a second of that left, or arriving while 64 requests of its host
++already wait, is refused at once. Each request waits on its own: requests
++for the same package each count toward the 64, and a client fetching
++several unvouched packages one after another while a long adoption runs
++waits up to 15 seconds for each. An adoption ends after its flip barrier
++(up to 140 seconds for a busy suite; see *Flip consistency*), so a package
++whose snapshot is still in its barrier is likely to wait the full 15
++seconds and be refused. Refusals also remain when an adoption takes longer
++than that (large `dists/` suites), when a first adoption is still waiting
++for a slot, and for packages of an unsigned repository on a host
 +whose signed suites all have complete coverage: unsigned snapshots never
 +vouch and never count, so a host whose only snapshots are unsigned is
 +never strict. Strict posture changes as eager first adoptions land after
@@ -11272,7 +13868,7 @@ The metrics paragraph gains `acu_repair_deferred_total{host}` and `acu_strict_ad
 
 ```diff
 diff --git a/docs/log-fields.md b/docs/log-fields.md
-index 8e2aca9..0d518a7 100644
+index 8e2aca9..4a47a63 100644
 --- a/docs/log-fields.md
 +++ b/docs/log-fields.md
 @@ -194,8 +194,15 @@ had to clear itself) and the unlabelled gauge `acu_suites_seed_rejected`
@@ -11289,16 +13885,18 @@ index 8e2aca9..0d518a7 100644
 +(repairs and reconciles of an unchanged suite deferred because no adoption
 +slot was free; they run on a later unchanged check) and
 +`acu_strict_adoption_waits_total{host}` (unvouched `.deb` requests that
-+waited, at most 15 s, for a signed adoption running on their host before
-+strict mode decided; the wait is part of the request line's
-+`duration_ms`).
++waited — at most 15 s, and never past 25 s after the request arrived — for
++a signed adoption running on their host before strict mode decided; the
++wait is part of the request line's `duration_ms`).
  
  The `freshness_check` line's `result` gains `changed_deferred` (upstream
-@@ -206,4 +213,19 @@ released; a client-refused change is picked up by the next tick, see
+@@ -206,4 +213,26 @@ released; a client-refused change is picked up by the next tick, see
  *Capacity and fairness* in configuration.md).
  
 +Eager adoption (spec C4) adds `first_adoption` (a suite without a snapshot
-+found its anchor and starts its first adoption; `form` is the form found),
++found its anchor and starts its first adoption; `form` is the form found,
++and `upstream_status` is 200, the answer of the anchor the form was found
++by — the absent probes before it are not logged),
 +`first_adoption_queued` (the same, waiting for an adoption slot),
 +`form_changed` (an adopted suite starts adopting another anchor form: a
 +detached suite whose upstream now serves `InRelease`, a suite whose
@@ -11307,14 +13905,19 @@ index 8e2aca9..0d518a7 100644
 +no slot is free) and `anchor_absent` (the current snapshot's anchor is
 +absent upstream: `upstream_status` is the absent answer — 401, 403, 404,
 +410, or 200 for a body that is not that file — and `reason` is
-+`anchor_absent`; the snapshot keeps serving). `form` also takes the value
-+`unsigned`. A suite without a snapshot that no client asked for in the
-+last 7 days, or whose anchor files only the cache itself fetched, is
-+dormant: its checks make no request and log no `freshness_check` line.
++`anchor_absent`; the snapshot keeps serving; also a detached suite whose
++changed `Release` comes without its `Release.gpg`, `upstream_status` then
++being the `Release.gpg`'s answer). `form` also takes the value `unsigned`.
++A suite without a snapshot that no client asked for in the last 7 days, or
++whose anchor files only the cache itself fetched, is dormant: its checks
++make no request and log no `freshness_check` line. Neither do the checks
++a failure or refusal record paces: those of a suite without a snapshot
++whose record is not due yet, within `periodic_refresh` of its last check,
++and those of an adopted suite in `anchor_absent` before its retry time.
 +
  ## Stability guarantees
  
-@@ -226,12 +248,11 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
+@@ -226,12 +255,12 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
  | Event | Level | Fields | Meaning |
  |---|---|---|---|
 -| `adoption_panicked` | ERROR | `where` (`adoption`, `repair`, `reconcile`, `heartbeat`, `record`), `canonical_host`, `suite_path`, `panic`, `stack` (first occurrence per `where` per process only; never for `where=heartbeat`) | A panic inside an adoption, repair, reconcile, heartbeat or failure-record goroutine was recovered; the prior snapshot keeps serving. Only an adoption panic is recorded as a failure (reason `panic`); repair and reconcile panics are logged, not recorded (plan deviation 7). `where=record` is `recordAdoptionFailure`, which writes the spec C7 failure record after an adoption ends. |
@@ -11322,23 +13925,26 @@ index 8e2aca9..0d518a7 100644
  | `freshness_check_panicked` | ERROR | `where` (`check`, `scheduler`, `reschedule`, `t1`), `canonical_host`, `suite_path`, `panic`, `stack` (first occurrence per `where` per process only) | A panic during a freshness check was recovered. For `where=check` the check counts as failed (`last_check_at` bumped, so the cooldown applies) and also counts as an unknown end: `last_check_at` is bumped and `check_fail_count` extended. The `scheduler`, `reschedule` and `t1` recovers only log; `where=reschedule` guards the start-time retry spread (`rescheduleFailingAdoptions`), and `where=t1` is the handler's client-triggered check goroutine (logged by `internal/handler`). |
 -| `freshness check failed` | INFO | `canonical_host`, `suite_path`, `form`, `err`, `result` (always `failed`) | A check ended unknown (a transport error or error status from upstream, or the 2-minute check deadline at the host slot or the request); `last_check_at` is bumped and `check_fail_count` extended, so the scheduler backs off (2 min doubling to 1 h), and `acu_freshness_check_total{result="failed"}` is incremented. |
 -| `freshness: unexpected success status` | ERROR | `status`, `canonical_host`, `suite_path`, `form` (detached checks only) | The fetch client returned a success status other than 200 or 304 (a contract violation). The suite row is bookkept like an unknown end (`last_check_at` bumped, `check_fail_count` extended, `last_success_at` kept), but no `freshness check failed` line is logged and `acu_freshness_check_total` is not incremented. |
-+| `freshness check failed` | INFO | `canonical_host`, `suite_path`, `form` (`inline`, `detached`, `unsigned`, or `probe` for the probe tree of a suite without a snapshot), `err`, `result` (always `failed`) | A check ended unknown — a transport error, an error status that is not an absent answer, a success status other than 200 or 304 (a fetch contract violation: `err` says `unexpected success status`), or the 2-minute check deadline at the host slot or the request — or found nothing it may adopt: a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, or an unsigned `Release` while `adoption.adopt_unsigned` is off. `last_check_at` is bumped and `check_fail_count` extended, so the scheduler backs off (2 min doubling to 1 h), and `acu_freshness_check_total{result="failed"}` is incremented. With adoption enabled, 401, 403, 404, 410 and a 200 whose body is not the file asked for are answers, not failures (the anchor is absent): they never extend the streak. |
++| `freshness check failed` | INFO | `canonical_host`, `suite_path`, `form` (`inline`, `detached`, `unsigned`, or `probe` for the probe tree of a suite without a snapshot), `err`, `result` (always `failed`) | A check ended unknown — a transport error, an error status that is not an absent answer, a success status other than 200 or 304 (a fetch contract violation: `err` says `unexpected success status`), or the 2-minute check deadline at the host slot or the request — or found nothing it may adopt: a suite without a snapshot whose upstream has neither `InRelease` nor `Release` (which also records the refusal state `anchor_absent`, shown on the status page), or an unsigned `Release` while `adoption.adopt_unsigned` is off. A check whose probe found a signature but could not record the suite as seen signed fails too (`err` starts `mark the signature seen:`). `last_check_at` is bumped and `check_fail_count` extended, so the scheduler backs off (2 min doubling to 1 h), and `acu_freshness_check_total{result="failed"}` is incremented. With adoption enabled, 401, 403, 404, 410 and a 200 whose body is not the file asked for are answers, not failures (the anchor is absent): they never extend the streak. |
  | `adoption_run_failed` | WARN; INFO when the attempt was refused (outcome `refused`) | `canonical_host`, `suite_path`, `form`, `err` | Backstop line for every adoption attempt that returned an error, so a failure with no categorised line of its own is still visible. A refusal is a state, not a failure, so its line is INFO (`adoption_refused` carries the reason and timing); operators alerting on WARN are not paged for a flapping mirror. |
  | `adoption: read prior snapshot failed` | WARN | `canonical_host`, `suite_path`, `err` | The adoption could not read the suite's current (prior) snapshot before running Date and rollback checks against it; the attempt fails as `db_failed` and is retried on the normal backoff schedule rather than skipping those checks. |
 -| `adoption_failure_record_failed` | WARN; DEBUG only for the read that precedes the write, when it finds the suite already removed (a routine reap during adoption, not a fault) — the write-failure site below has no DEBUG case | `canonical_host`, `suite_path`, `err` | The failure/refusal record could not be read or written; the next check may retry sooner than scheduled. |
 -| `adoption_refused` | INFO | `canonical_host`, `suite_path`, `reason`, `refusal`, `fail_count`, `retry_in_seconds`, `next_retry_unixtime` | One attempt ended in a refusal state (`upstream_older`, `rollback_refused`), not a failure; logged for every refused attempt. |
++| `adoption: signed-anchor re-mark failed` | WARN; ERROR when a cached anchor's pool file could not be read (a missing file is not an error) | `canonical_host`, `suite_path`, `err` | Before an unsigned adoption's commit, the adopter re-reads the suite's cached `InRelease` and `Release.gpg` (and those of its `/.` twin) to record any signed one (spec C5 safeguard 3), and could not read a `url_path` row or a pool file, or write the record. The adoption is refused `unsigned_downgrade_refused` (fail closed): here that refusal means the cache could not rule out a signature, not that it saw one. It is retried on the refusal's schedule. |
 +| `adoption_failure_record_failed` | WARN; DEBUG for the read that precedes the write when it finds the suite already removed (a routine reap during adoption, not a fault), and for a write that a shutdown cut short (nothing is recorded at shutdown) | `canonical_host`, `suite_path`, `err` | The failure/refusal record could not be read or written; the next check may retry sooner than scheduled. |
-+| `adoption_refused` | INFO | `canonical_host`, `suite_path`, `reason`, `refusal`, `fail_count`, `retry_in_seconds`, `next_retry_unixtime` | One attempt ended in a refusal state, not a failure; logged for every refused attempt. The states: `upstream_older`, `rollback_refused`, `unsigned_downgrade_refused` (the suite was seen signed; decided before any download, or inside the commit), `unsigned_too_large`, and two that the check records itself: `unsigned_unconfirmed` (an unsigned repository waiting for its second observation) and `anchor_absent` (the current anchor is absent upstream). |
++| `adoption_refused` | INFO | `canonical_host`, `suite_path`, `reason`, `refusal`, `fail_count`, `retry_in_seconds`, `next_retry_unixtime` | One attempt ended in a refusal state, not a failure; logged for every refused attempt. The states: `upstream_older`, `rollback_refused`, `unsigned_downgrade_refused` (the suite was seen signed: decided by the check before a slot is taken, again before any download, and inside the commit), `unsigned_too_large` (decided by the check before a slot is taken, and again before any download), `unsigned_unconfirmed` (an unsigned repository waiting for its second observation) and `anchor_absent` (the current anchor is absent upstream, a detached suite's changed `Release` has no `Release.gpg`, or a suite without a snapshot has neither anchor). |
  | `adoption_deferred` | INFO | as `adoption_refused` | A suite entered the failing or refused state, or its reason changed (not logged on every attempt); the same content is retried at `next_retry_unixtime`, while new content is tried at once. |
  | `adoption_failing_persistently` | WARN | `canonical_host`, `suite_path`, `reason`, `fail_count`, `failing_since_unixtime` | The suite's adoption has failed 3, 6, 12, 24, … times in a row. Refusals never reach this (spec C7); see `adoption_refused_persistently`. |
-@@ -243,12 +264,14 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
+@@ -242,13 +271,16 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
+ | `freshness: clamp adoption retry failed` | WARN | `canonical_host`, `suite_path`, `err` | A retry time left in the future by a backward clock step could not be clamped; the next check tries again. |
  | `freshness: clear adoption failure failed` | WARN | `canonical_host`, `suite_path`, `err` | Upstream serves the current content again but the failure record could not be cleared; the next check tries again. |
++| `freshness: adopted suites stale beyond threshold` | WARN | `adopted_stale`, `stale_factor`, `refresh` | Logged at each scheduler tick while adopted suites have had no successful check for `stale_factor` × `periodic_refresh` (4 × 15 min by default), or carry a success stamp in the future: the signature of a freeze. Suites in a refusal state are left out of `adopted_stale` (an `anchor_absent` suite keeps its last success old on purpose; the status page and `adoption_refused` show them). The gauge `acu_freshness_stale_suites{adopted}` counts every stale suite, those included. With adoption disabled, records are inert and every stale adopted suite counts. |
  | `freshness: read suite row failed` | WARN | `err`, `canonical_host`, `suite_path` | A freshness check could not read the suite's row: either the existence read a check makes before it takes the suite's lock (a suite is checked only while it has a row), or the full read after it. The check is skipped and writes nothing; the next trigger (a client hit's check or the scheduler) tries again. |
 +| `freshness: read anchor rows failed` | WARN | `err`, `canonical_host`, `suite_path` | A check could not read the suite's cached anchor rows (`url_path`). A suite without a snapshot is not probed this time — no request, nothing written; the next check tries again. A suite whose current anchor is absent probes the other forms at their canonical URLs instead. |
  | `freshness: read suite row after a panic failed` | WARN | `err`, `canonical_host`, `suite_path` | After a recovered check panic, the best-effort bump of `last_check_at`/`check_fail_count` could not even read the suite's row; the row is left as it was. |
  | `freshness: persist failure bump after a panic failed` | WARN | `err`, `canonical_host`, `suite_path` | After a recovered check panic, `last_check_at` and `check_fail_count` were bumped in memory but the write failed; the row is left as it was. |
 -| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute. For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. For `stamp=last_requested_at` (a suite's client-interest stamp, read when the suite cap looks for an idle suite to evict) the suite is not evicted: a future stamp never counts as idle. `acu_clock_steps_detected_total` counts detections, not distinct clock steps or distinct stamps: the same future stamp is detected again every time it is read — every scheduler tick for a future `last_success_at`, every check for a future `last_check_at`, and twice when a first-ever check falls back from inline to detached — so alert on its rate, not its value. |
-+| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute. For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. For `stamp=last_requested_at` (a suite's client-interest stamp, read when the suite cap looks for an idle suite to evict, and by the check of a suite without a snapshot) the suite is neither evicted nor dormant: a future stamp counts as recent interest. `acu_clock_steps_detected_total` counts detections, not distinct clock steps or distinct stamps: the same future stamp is detected again every time it is read — every check for a future `last_check_at` or `last_success_at` (the scheduler reads a future `last_success_at` without reporting it), every check of a suite without a snapshot for a future `last_requested_at`, and every creation attempt within eight rows of the global cap for the future `last_requested_at` its eviction scan re-reads (the line stays rate-limited) — so alert on its rate, not its value. |
++| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute. For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. For `stamp=last_requested_at` (a suite's client-interest stamp, read when the suite cap looks for an idle suite to evict, and by the check of a suite without a snapshot) the suite is not evicted — a future stamp never counts as idle — and the check counts a stamp up to 7 days ahead as recent interest; further ahead, the suite is dormant until a client asks for it again. `acu_clock_steps_detected_total` counts detections, not distinct clock steps or distinct stamps: the same future stamp is detected again every time it is read — every check for a future `last_check_at` or `last_success_at` (the scheduler reads a future `last_success_at` without reporting it), every check of a suite without a snapshot for a future `last_requested_at`, and every creation attempt within eight rows of the global cap for the future `last_requested_at` its eviction scan re-reads (the line stays rate-limited) — so alert on its rate, not its value. |
  | `legacy_snapshot_quarantined` | WARN | `reason` (`legacy_plaintext`, `malformed_envelope`, `unsigned_declarations`, `unparseable`, `anchor_missing`, `anchor_oversized`, `anchor_corrupt`, `unexpected_form`), `snapshot_id`, `canonical_host`, `suite_path`, `anchor_form`, `was_current` | The startup trust audit could not prove a pre-upgrade snapshot signed and clean; it no longer serves or vouches, and its suite is served unadopted until it re-adopts. |
  | `legacy_trust_audit_deferred` | ERROR | `snapshot_id`, `canonical_host`, `suite_path`, `err`, `stack` (present only for a recovered panic) | A pre-upgrade snapshot's pool file could not be read (not "missing"), or auditing it panicked (`err` carries the panic value); the snapshot is left as it was and retried at the next start. |
  | `legacy_trust_audit_progress` | INFO | `audited`, `quarantined`, `deferred` | One batch of up to 100 queued snapshots was audited and committed; the fields are running totals across this start's batches. Logged on the first start after an upgrade, and on later starts while deferred snapshots remain queued or after an interrupted audit. |
@@ -11348,7 +13954,7 @@ index 8e2aca9..0d518a7 100644
 +| `adoption: served anchor read failed; the flip barrier runs` | WARN | `canonical_host`, `suite_path`, `path`, `err` | Before a first adoption's commit, the adopter could not read the anchor the cache serves for the suite (when clients already get the anchor being adopted, the barrier is not needed); the barrier runs — the safe direction. A missing row is not logged. |
  | `adoption_abandoned_at_shutdown` | INFO | `canonical_host`, `suite_path`, `form`, `err` | An adoption was abandoned at shutdown — waiting in the flip barrier (or about to skip it) when the daemon closed the barrier at the signal, or in any step before its commit once the daemon's lifetime context ended: nothing was committed or recorded, the change is adopted after the restart. Not a failure: no `adoption_run_failed`, not counted in `acu_adoption_total` or `acu_adoption_duration_seconds`, not shown in the admin page's recent adoptions. |
  | `displaced snapshot lookup failed` | WARN | `err`, `canonical_host`, `path` | Retained by-hash could not read the suite's displaced snapshots; the request is answered 404, as before spec C8. |
-@@ -260,10 +283,10 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
+@@ -260,10 +292,10 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
  | `suite cap usage read failed` | WARN | `err` | The startup check behind `suite_caps_exceeded` could not count the suites; the caps apply either way. |
  | `handler_goroutine_panicked` | ERROR | `where` (`touch`, `seed_rejections`), `canonical_host` and `path` (`touch` only), `panic`, `stack` (first occurrence per `where` per process only) | A panic in one of the handler's background goroutines — the touch goroutine, or the cap-rejection cache's sweep timer — was recovered (a bug, please report it). |
 -| `suite onboarding failed` | WARN | `err`, `canonical_host`, `suite_path` | A cache hit on an untracked suite's anchor could not create its row (including the 5 s bound on that write); the anchor is served and the next hit retries. |
@@ -11358,7 +13964,7 @@ index 8e2aca9..0d518a7 100644
 +| `suite file head read failed` | WARN | `err`, `canonical_host`, `suite_path`, `path` | A suite file just fetched on a miss could not be read back from the cache's pool for its content check (a local disk fault). For a signed anchor (`InRelease`, `Release.gpg`) the miss fails — 502 with `Retry-After`, request outcome `cache_write_failed` (and ERROR `cache write failed`), no body, nothing stored — because the anchor must not be served before its suite is marked as signed; apt retries. Any other suite file (`Release`, a flat index) is stored and served, but creates no suite row and re-stamps none. |
  | `suite cached anchor read failed` | WARN | `err`, `canonical_host`, `suite_path`, `path` | Creating a suite's row, the handler could not read one of the suite's cached signed anchors (its `url_path` row or its pool file; an absent row is not logged). The row is created anyway, and the anchor is read again and marked right after the write, before the response — also when the client left, or the request is answered from a new snapshot, while it waited for a flip (`suite signed-seen backstop read failed` if that fails too). Between the write and that mark the suite is tracked with the anchor unmarked; if the mark fails, it stays so until the startup pass at the next start. |
 -| `suite signed-seen backstop read failed` | WARN | `err`, `canonical_host`, `suite_path`, `path` | After creating a suite's row, the handler's second read of a cached signed anchor (see `suite cached anchor read failed`; also run when the anchor changed during the creation) failed — its `url_path` row or its pool file, including the 5 s bound on that step; an absent row is not logged. The response is served; the anchor stays unmarked until the startup pass marks it at the next start. |
-+| `suite signed-seen backstop read failed` | WARN | `err`, `canonical_host`, `suite_path`, `path` | After creating a suite's row, the handler's second read of a cached signed anchor (see `suite cached anchor read failed`; also run when the anchor changed during the creation) failed — its `url_path` row (within the backstop's 5 s bound, which covers its database steps; after onboarding the bound is shared with the creation) or its pool file (a local read of a few KiB, not bounded); an absent row is not logged. The response is served; the anchor stays unmarked until the startup pass marks it at the next start. |
++| `suite signed-seen backstop read failed` | WARN | `err`, `canonical_host`, `suite_path`, `path` | After creating a suite's row, the handler's second read of a cached signed anchor (see `suite cached anchor read failed`; also run when the anchor changed during the creation) failed — its `url_path` row (within the backstop's 5 s bound, which covers its database steps; after onboarding the bound is shared with the creation, and on a miss it ends at most 25 s after the request arrived) or its pool file (a local read of a few KiB, not bounded); an absent row is not logged. The response is served; the anchor stays unmarked until the startup pass marks it at the next start. |
  | `snapshot_member_blob_missing` | WARN | `canonical_host`, `path`, `snapshot_id`, `blob_hash`, `snapshot_displaced` (present for a displaced snapshot's member) | A snapshot member's pool file is gone: a current member is re-fetched and checked against its declared hash; a displaced one (retained by-hash) answers 404. |
  | `shutdown wait panicked` | ERROR | `panic`, `stack` | The shutdown drain's wait for the adoption, repair and reconcile goroutines panicked (a bug, please report it); shutdown carries on without waiting further for them. |
 -| `apt-cacher-ultra starting` | INFO | the effective configuration (see `cmd/apt-cacher-ultra/main.go`); the flat-repository work adds `adoption_flip_quiet_period` and `freshness_max_suites` | Logged once at start. `adoption_flip_quiet_period` is the configured `adoption.flip_quiet_period`; the flip barrier runs only when it is not `0s` and adoption is enabled. `freshness_max_suites` is the configured `freshness.max_suites`. |
@@ -11371,7 +13977,7 @@ index 8e2aca9..0d518a7 100644
 
 ```diff
 diff --git a/docs/admin-ui-spec.md b/docs/admin-ui-spec.md
-index 43053b6..5be43eb 100644
+index 43053b6..f23cbda 100644
 --- a/docs/admin-ui-spec.md
 +++ b/docs/admin-ui-spec.md
 @@ -348,12 +348,12 @@ next to the Suites table contract in §5.3:
@@ -11381,7 +13987,7 @@ index 43053b6..5be43eb 100644
 +| `anchor_form` | string | The current snapshot's anchor form — `inline`, `detached` or `unsigned` (a `Release` no signature covers: it vouches no `.deb`); empty when the suite has no current snapshot. |
  | `last_requested_unixtime` | int64 or `null` | When a client last showed interest in the suite (spec C3): written when the suite's row is created, then by coalesced touches — at most one write per suite per hour — from serves of its anchors (`InRelease`, `Release`, `Release.gpg`; status below 400, 304 and HEAD included), of its flat indexes, and of `.deb`s its current snapshot vouched for. Index requests such as `Packages.gz` never move it. It decides cap eviction: at the `freshness.max_suites` cap, a suite with no current snapshot whose stamp is 24 hours old or more can be evicted for a new one (`suite_evicted`). |
 -| `check_fail_count` | int64 | Consecutive checks that ended unknown (transport error, deadline, unexpected status) since the last answered check; drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check. |
-+| `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`; an unsigned `Release` while `adoption.adopt_unsigned` is off). Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. |
++| `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, which also records `anchor_absent`; an unsigned `Release` while `adoption.adopt_unsigned` is off; a signature the check found but could not record as seen). Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. |
  | `adoption_fail_reason` | string or `null` | The current failure or refusal reason; `null` when no record exists. |
  | `adoption_fail_count` | int64 | Consecutive adoption attempts in the current failure/refusal streak; `0` when no record exists. |
  | `adoption_fail_first_unixtime` | int64 or `null` | When the current streak started. |
@@ -11390,24 +13996,32 @@ index 43053b6..5be43eb 100644
 +| `adoption_refused` | boolean | `true` when the record above is a refusal state (`upstream_older`, `rollback_refused`, `unsigned_downgrade_refused`, `unsigned_unconfirmed`, `unsigned_too_large`, `anchor_absent`), not a failure. |
  
  These are additive to the locked JSON contract (§0.1), the same way
-@@ -370,4 +370,16 @@ refusal record. While adoption is disabled, the text gains the suffix
+@@ -370,4 +370,24 @@ refusal record. While adoption is disabled, the text gains the suffix
  and is inert now.
  
 +**Unsigned and absent-anchor refusals (phase E).** `unsigned_unconfirmed`
 +is an unsigned repository waiting for its second observation
-+(`max(cooldown, 5 min)` after the first, an hour after a 401/403 on a
-+signature file) and clears itself when it adopts;
-+`unsigned_downgrade_refused` (the suite was seen signed) and
-+`unsigned_too_large` (more than 1,000 declared files) last until upstream
-+changes or the suite is forgotten (`POST /forget`, added with suite
-+reaping in a later release); `anchor_absent` means the current snapshot's
-+anchor is gone upstream while the snapshot keeps serving. None of them
-+hides lag (only `upstream_older` and `rollback_refused` do, §9.1), and all
-+four follow the `REFUSED 24H+` rule below.
++(`max(cooldown, 5 min)` after the first, an hour when the confirming check
++sees a 401/403 on a signature file) and clears itself when it adopts;
++`unsigned_downgrade_refused` (the suite was seen signed) lasts until
++upstream serves a signature the cache adopts, or the suite is forgotten
++(`POST /forget`, added with suite reaping in a later release);
++`unsigned_too_large` (more than 1,000 declared files) lasts until
++upstream's `Release` declares fewer; `anchor_absent` means the current
++snapshot's anchor is gone upstream (or a detached suite's changed
++`Release` has no `Release.gpg`) while the snapshot keeps serving, or, for
++a suite without a snapshot, that upstream serves neither `InRelease` nor
++`Release`. None of them hides lag (only `upstream_older` and
++`rollback_refused` do, §9.1), and all four follow the `REFUSED 24H+` rule
++below. A suite without a snapshot shows lag from the first check that
++found its anchor, so a first adoption refused for good
++(`unsigned_downgrade_refused`, or an `unsigned_unconfirmed` that never
++confirms) shows a lag that keeps growing: the suite has in fact never been
++adopted.
 +
  **FAILING count.** The Suites panel's eyebrow and the SUITES vital cell's
  sub-line count suites with a genuine failure record (`adoption_refused ==
-@@ -383,6 +395,9 @@ silent freeze — a vendor that stops emitting `Date` is refused
+@@ -383,6 +403,9 @@ silent freeze — a vendor that stops emitting `Date` is refused
  warns (`data-state="warn"`), the SUITES vital warns (never crit), and the
  eyebrow and the vital's sub-line add `{n} REFUSED 24H+` (only when > 0).
 -Below 24 h nothing changes. The checker logs WARN
@@ -11427,17 +14041,40 @@ The Date line's revision entry; C4 (D-54's admission order; R-E4 and design note
 
 ```diff
 diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/docs/superpowers/specs/2026-09-27-flat-repositories-design.md
-index 9be6f46..1ba0726 100644
+index 9be6f46..8911bcd 100644
 --- a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md
 +++ b/docs/superpowers/specs/2026-09-27-flat-repositories-design.md
 @@ -1,5 +1,5 @@
  # Flat repositories, eager adoption, and suite lifecycle — design
  
 -- **Date:** 2026-09-27 (revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
-+- **Date:** 2026-09-27 (revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
++- **Date:** 2026-09-27 (revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
  - **Status:** draft for maintainer review
  - **Branch:** `feature/flat-repos` (from `main` @ 536a1ab)
-@@ -459,6 +459,9 @@ refuses or ignores connections is already collapsed by the fetch client's
+@@ -27,5 +27,5 @@ fixes the robustness problems flat support multiplies:
+ | C1 Request canonicalisation | One path-canonicality rule; upstream URLs encoded exactly as apt encodes them. |
+ | C2 Suite identity | Whole-directory flat suites; tightened `dists/` grammar; a leaf path package. |
+-| C3 Suite rows and signals | One creation choke point with caps; client-interest stamp; signed-seen marker (written at adoption, at startup from cached anchors, and in the miss path's writer operation before a signed anchor is served). |
++| C3 Suite rows and signals | One creation choke point with caps; client-interest stamp; signed-seen marker (written at adoption, at startup from cached anchors, in the miss path's writer operation before a signed anchor is served, and by the checker when a probe finds a signature). |
+ | C4 Freshness check | Probe tree in apt's order; eager first adoption; form transitions; anchorless refresh; adoption capacity; fair concurrent scheduler with a latency bound; clock rules. |
+ | C5 Adoption input | Flat IndexTargets; `./` and `%` Filenames; SHA512 hash blocks; apt's `Date` rules; R-1 fix; I-1 panic recovery; inline verification accepts only decodable clearsigned envelopes; unsigned form. |
+@@ -435,5 +435,14 @@ that have a `suite_freshness` row. Writers:
+   by one goroutine (`cache.submitWrite`), so an unsigned `CommitAdoption`
+   enqueued after a marker write runs after it, and its in-transaction
+-  re-read (C5) sees the marker.
++  re-read (C5) sees the marker;
++- the freshness checker (phase E, ruling PE-5): when a probe finds a
++  sniff-passing `InRelease` or `Release.gpg` for a suite without a signed
++  current snapshot — a first adoption's probe tree, an unsigned suite's
++  upgrade probe, an absent anchor's tree — it marks the base
++  (`MarkSignedSeenBatch`, `last_seen_at` = the check's time) before the
++  check admits any request; a failed write fails the check. An unsigned
++  suite's clients never fetch a signature, so without this writer one only
++  the checker saw could be stripped later and the suite adopted unsigned;
++- the adopter, before an unsigned commit (C5 safeguard 3, ruling R-E1).
+ 
+ A plain-text "InRelease" fails the sniff and never creates a marker. The
+@@ -459,6 +468,9 @@ refuses or ignores connections is already collapsed by the fetch client's
  scheduler therefore keeps a **per-host queue of due suites**, refreshed every
  tick (newly due suites appended, queued ones not duplicated; at most
 -`freshness.max_suites` entries in all), served by a fixed pool of **4 check
@@ -11449,7 +14086,20 @@ index 9be6f46..1ba0726 100644
 +**4 check workers** (constant):
  
  - **across hosts:** at most one check in flight per canonical host; hosts
-@@ -532,5 +535,9 @@ that host).
+@@ -517,6 +529,10 @@ With the default pool of two and a
+ first adoption holding the general slot, signed suites go through the
+ reserved slot back to back. First adoptions (and unsigned ones) run only
+-when the pool is otherwise empty, so a burst of them is serial;
+-`max_concurrent_adoptions = 3` lets two run at once. An offered re-check
++when the pool is otherwise empty, so a burst of them is serial, and under
++sustained signed load they can wait a long time; `max_concurrent_adoptions
++= 3` lets two run at once. A queued suite is probed twice by the scheduler
++(the check that queued it and the offered re-check that admits it), plus
++once per client check while it waits (at most one per cooldown) and once
++per offer another admission takes first (phase E, ruling PE-4). An offered re-check
+ uses its host's turn like any check, so *n* in the latency bound also counts
+ the host's waiting suites offered before *S* (at most one per adoption on
+@@ -532,5 +548,9 @@ that host).
  
  Counting 401/403/410 as *absent* is more lenient than apt's signed fallback
 -(404 only); for signed forms it can only cause a lateral move.
@@ -11460,7 +14110,7 @@ index 9be6f46..1ba0726 100644
 +it is *unknown* (phase E, design note 21).
  
  **Dispatch** (adopter wired; with no adopter the Phase 1 algorithm runs
-@@ -540,12 +547,21 @@ unchanged, observation only):
+@@ -540,24 +560,59 @@ unchanged, observation only):
     changed → C7 gate → adoption request.
     **Current snapshot detached** — also probe `InRelease` each check;
 -   *present* → inline adoption request (lateral). Then the conditional GET of
@@ -11474,23 +14124,35 @@ index 9be6f46..1ba0726 100644
 +   *present* → inline adoption request (lateral; lateral content whose
 +   adoption failed keeps its record, which the detached anchor's
 +   `unchanged` does not clear). Then the conditional GET of `Release` as
-+   today.
++   today; a changed `Release` whose `Release.gpg` is *absent* records
++   `anchor_absent` and is never adopted (phase E, design review M-14).
 +   **Current anchor absent** (inline: `InRelease`; detached and unsigned:
 +   `Release`) → the first absent observation records the refusal state
 +   `anchor_absent` (visible at once; `last_success_at` not bumped;
 +   `check_fail_count` reset; the snapshot keeps serving; content key
-+   sha256("anchor_absent"), which no content matches). Once the record is
-+   due and the absence has lasted `max(cooldown, 5m)` — two observations,
-+   measured from `adoption_fail_first_at` — run the probe tree without
-+   validators and adopt the signed form found: inline ⇄ detached is a
-+   lateral move, and an unsigned suite may find a signed form. The current
-+   form and content found again is `unchanged` and clears the record; an
-+   unsigned candidate or nothing is recorded again — never unsigned from
-+   signed. A record from an adoption attempt (a failed lateral move) keeps
-+   its own C7 schedule (phase E, deviation 1).
++   sha256("anchor_absent"), which no content matches). The record paces the
++   suite: while it is active and not due, a check makes no request and the
++   scheduler does not queue the suite — the anchor is asked for again at
++   the record's retry time, and client checks in between ask nothing
++   (phase E, ruling PE-2). Once the record is due and the absence has
++   lasted `max(cooldown, 5m)` — two observations, measured from
++   `adoption_fail_first_at`, which never confirms when it lies in the
++   future (deviation 2) — run the probe tree without validators and adopt
++   the signed form found: inline ⇄ detached is a lateral move, and an
++   unsigned suite may find a signed form; a signature found for a suite
++   without a signed current snapshot is marked first (C3). The current form
++   and content found again is `unchanged` and clears the record; an
++   unsigned suite's own form with new bytes is its update; for a signed
++   suite an unsigned candidate, or nothing, is recorded again — never
++   unsigned from signed. A record from an adoption attempt (a failed
++   lateral move) keeps its own C7 schedule (phase E, deviation 1).
  2. **Current snapshot unsigned** — probe `InRelease` and `Release.gpg`; if
-    either is *present* → signed adoption request (upgrade). Otherwise
-@@ -554,10 +570,18 @@ unchanged, observation only):
+-   either is *present* → signed adoption request (upgrade). Otherwise
++   either is *present* → mark the base (C3) and make a signed adoption
++   request (upgrade): from then on the suite is never adopted unsigned
++   (C5 safeguard 3), also after the signature goes away. Otherwise
+    conditional GET `Release`; changed → unsigned adoption request (no
+    re-confirmation). If a signature is present but the signed adoption
     cannot succeed (key not on the cache host), the suite keeps its last
     unsigned snapshot and the admin page shows the reason; the fix is
 -   installing the key (or `adoption.accept_any_signer`).
@@ -11503,24 +14165,34 @@ index 9be6f46..1ba0726 100644
     (independent of GC settings) and the suite has a client-created anchor or
 -   flat index `url_path` row (`request_count > 0`; never reconstructed).
 -   Probe tree without validators:
-+   flat index `url_path` row (`request_count > 0`; never reconstructed). A
-+   future `last_requested_at` counts as interest, and of the anchor rows
-+   only `InRelease` and `Release` count (apt fetches `Release.gpg` only
-+   after `Release`; phase E, design notes 13 and 14). Probe tree without
-+   validators (the C7 gate compares content keys, so a never-adopted suite
-+   whose content is deferred fetches its anchor in full on each check;
-+   phase E, design note 15):
++   flat index `url_path` row (`request_count > 0`; never reconstructed). The
++   window is symmetric: a `last_requested_at` up to 7 d in the future counts
++   as interest, one further ahead is dormant until a client touches the
++   suite (design review M-3). Of the anchor rows only `InRelease` and
++   `Release` count (apt fetches `Release.gpg` only after `Release`; phase
++   E, design notes 13 and 14). A returning client's first request may find
++   its suite still dormant (its touch and its T1 run concurrently); the
++   next tick checks it, within one tick of that request (M-12). A suite
++   whose record is active and not due is paced: while its last check is
++   younger than `periodic_refresh`, no probe runs, so client checks ask
++   nothing and new content is attempted within one refresh interval (phase
++   E, ruling PE-3). Otherwise the probe tree runs without validators (the
++   C7 gate compares content keys; phase E, design note 15), and a
++   *present* signature marks the base before any request is admitted
++   (C3):
     - `InRelease` *present* → inline request;
     - `InRelease` *absent* → `Release`: *present* → `Release.gpg`: *present* →
-@@ -565,5 +589,6 @@ unchanged, observation only):
+@@ -565,5 +620,8 @@ unchanged, observation only):
     - `Release` *absent* → for flat suites that have no signed-seen marker and
       no sniff-passing cached anchor row, the **anchorless refresh**; otherwise
 -     a failed check;
 +     a failed check, which extends `check_fail_count`: a suite with nothing
-+     to serve backs off like an *unknown* end (phase E, design note 19);
++     to serve backs off like an *unknown* end (phase E, design note 19), and
++     records the refusal state `anchor_absent`, so the status page shows it
++     (ruling PE-2);
     - any *unknown* → failed check.
  4. **Anchorless refresh** (flat, Release-less suites only): conditional GET
-@@ -684,4 +709,10 @@ SHA256 makes coverage incomplete (reason `no_sha256`), never a silent drop.
+@@ -684,4 +742,10 @@ SHA256 makes coverage incomplete (reason `no_sha256`), never a silent drop.
  Limitation (documented): integrity-skipped SHA512-only members are not
  recorded for skip-repair; reconcile still heals requestable IndexTargets.
 +SHA512 is verified before the bytes reach the pool; a SHA512-only member
@@ -11531,7 +14203,7 @@ index 9be6f46..1ba0726 100644
 +the strongest declared hash (phase E, design notes 3–7).
  
  **`Date` rules** (apt's). The verified Release text's `Date:` is parsed with a
-@@ -763,6 +794,12 @@ upgrade (§6.1).
+@@ -763,18 +827,46 @@ upgrade (§6.1).
     either signature file answered 401/403 (WAF and S3-permission incidents);
     the first observation records reason `unsigned_unconfirmed` and the
 -   comparison uses `adoption_fail_first_at` (restart-safe). Updates of an
@@ -11545,35 +14217,81 @@ index 9be6f46..1ba0726 100644
 +   never confirms (phase E, design notes 16–18 and deviation 2). Updates
 +   of an established unsigned suite adopt at once.
  3. **Never downgrade:** refused (`unsigned_downgrade_refused`, a refusal
-    state) when a `suite_signed_seen` marker exists for the suite's base. The
-@@ -775,5 +812,16 @@ upgrade (§6.1).
-    or when the prior current snapshot is signed. The suite mutex alone cannot
+-   state) when a `suite_signed_seen` marker exists for the suite's base. The
+-   marker outlives reaping, covers the `./` twin, and is committed in the
+-   writer operation that stores a signed anchor, before any client is served
+-   it (C3). The check runs twice:
+-   at eligibility, and again **inside the `CommitAdoption` writer
+-   transaction**, which re-reads the marker for the candidate's base and
+-   refuses an unsigned candidate (no pointer change, no rows) when one exists
+-   or when the prior current snapshot is signed. The suite mutex alone cannot
++   state) when a `suite_signed_seen` marker exists for the suite's host and
++   base under either scheme (`http` or `https`: a base seen signed over
++   `https` gives the same base over plain `http` the same protection; phase
++   E, design review M-7), or when an adopted, non-retired inline or
++   detached snapshot of the base or its `/.` twin exists under either
++   scheme (M-8: also a signed displaced snapshot the audit left queued and
++   unmarked while it quarantined the current one). The marker outlives
++   reaping, covers the `./` twin, and is committed in the writer operation
++   that stores a signed anchor, before any client is served it (C3). One
++   rule, one function (`refuseUnsignedDowngrade`: a marker read and a
++   snapshot read) at every point it runs: at eligibility, and again
++   **inside the `CommitAdoption` writer transaction**, which refuses an
++   unsigned candidate (no pointer change, no rows) when it holds. The suite mutex alone cannot
     close this race: the handler and the `/.` twin establish signed history
 -   without it.
+-4. At most 1,000 declared members (`unsigned_too_large`).
 +   without it. Before an unsigned commit the adopter also re-runs the
-+   cached signed-anchor mark under the suite mutex: it reads the suite's
-+   `<suite>/InRelease` and `<suite>/Release.gpg` `url_path` rows, sniffs
-+   their pool files outside the writer and marks the base for each that
-+   passes, before the commit is enqueued (FIFO: the commit's re-read sees
-+   it); a failed mark, or a pool read error other than a missing file,
-+   refuses the adoption (phase E, ruling R-E1). A refusal inside the
++   cached signed-anchor mark under the suite mutex: it reads the
++   `<suite>/InRelease` and `<suite>/Release.gpg` `url_path` rows of the
++   suite and of its `/.` twin (design review I-3), sniffs their pool files
++   outside the writer and marks the base for each that passes, before the
++   commit is enqueued (FIFO: the commit's re-read sees it); a failed mark,
++   or a pool read error other than a missing file, refuses the adoption
++   (phase E, ruling R-E1) and is logged (`adoption: signed-anchor re-mark
++   failed`, WARN; ERROR for a pool read error; M-1) — that refusal means
++   "could not rule out a signature". A refusal inside the
 +   commit is the refusal state, not a failure: its own sentinel, no
 +   `adoption: commit failed` WARN, no `db_failed`, `adoption_flip_barrier`
 +   outcome `refused`, also after a barrier that outlived
 +   `adoption.max_duration` (ruling R-E2). Eligibility is also checked by the
 +   check, before a slot is taken.
- 4. At most 1,000 declared members (`unsigned_too_large`).
++4. At most 1,000 declared members, counted as the distinct paths of the
++   merged SHA256 and SHA512 lists (`unsigned_too_large`); the check applies
++   it before a slot is taken, and the adoption again before any download
++   (phase E, design review M-5).
  5. No `package_hash` rows on **any** path (adoption, repair, reconcile:
-@@ -850,5 +898,7 @@ success.
+    `buildPackageHashes` takes the form); `DeclaredHashesForPath` and
+@@ -782,9 +874,13 @@ upgrade (§6.1).
+ 
+ Threat notes (documented at the knob): the signed-seen marker cuts both
+-ways — anyone who can make the cache serve one sniff-passing `InRelease`
+-for a base (a MITM, a compromised upstream, or a LAN client pointing the
+-cache at a host it controls) blocks unsigned adoption of that base until
+-`POST /forget`; this denial of service is the accepted price of never
+-downgrading. A MITM on the cache→upstream path can
++ways — anyone who can make the cache serve, or a check find (C3), one
++sniff-passing `InRelease` or `Release.gpg` for a base (a MITM, a
++compromised upstream, or a LAN client pointing the cache at a host it
++controls) blocks unsigned adoption of that base until `POST /forget`; this
++denial of service is the accepted price of never downgrading. A suite
++whose pre-v7 snapshot §6.1 quarantined for `anchor_missing`,
++`anchor_corrupt` or `anchor_oversized` may have no marker until a check
++sees its signature upstream; if its signatures are stripped before then,
++it adopts unsigned (phase E, design review M-9). A MITM on the cache→upstream path can
+ make the cache adopt forged unsigned content only for a suite never seen
+ signed, after two consistent observations; verifying clients reject it,
+@@ -850,5 +946,8 @@ success.
  
  **Content key.** inline: sha256(InRelease); detached: sha256(sha256(Release)
 -‖ sha256(Release.gpg)); unsigned: sha256(Release). Any byte change is new
-+‖ sha256(Release.gpg)); unsigned: sha256(Release); an `anchor_absent` record:
++‖ sha256(Release.gpg)); unsigned: sha256("unsigned\n" ‖ Release), domain-separated
++from an inline key over the same bytes (phase E, design review M-2); an `anchor_absent` record:
 +sha256("anchor_absent"), a constant no content matches (phase E). Any byte
 +change is new
  content and is attempted at once (subject to slots). A re-signature alone of
  a detached suite is noticed at the next retry (≤ 1 h), because a 304 on
-@@ -866,5 +916,7 @@ re-downloading everything.
+@@ -866,5 +965,7 @@ re-downloading everything.
  **Refusal states** use the same record and schedule but are not failures:
  `upstream_older`, `rollback_refused`, `unsigned_downgrade_refused`,
 -`unsigned_unconfirmed` (confirmation timing from `adoption_fail_first_at`),
@@ -11582,30 +14300,66 @@ index 9be6f46..1ba0726 100644
 +reason),
  `unsigned_too_large`, `anchor_absent`. They are excluded from the
  failing-suites gauge and from `adoption_failing_persistently`, and shown as
-@@ -875,6 +927,8 @@ failing-suites gauge and from `adoption_failing_persistently`, and shown as
+@@ -875,6 +976,18 @@ failing-suites gauge and from `adoption_failing_persistently`, and shown as
  304 or a 200 with the same key ⇒ `changed_deferred` (no clear, no repair);
  new content ⇒ attempt. At or after `next_retry_at` the check GETs without
 -validators and attempts. The record is cleared in the flip transaction and
 -when upstream again serves the current snapshot's content.
-+validators and attempts. The C4 probe tree sends no validators: there the
-+gate compares content keys only (phase E, design note 15). The record is
-+cleared in the flip transaction and when upstream again serves the current
-+snapshot's content.
++validators and attempts. A record's validators are those of the anchor
++file its request fetched: a cross-form request (a detached suite's lateral
++`InRelease`, an unsigned suite's upgrade probe, an absent anchor's tree)
++records none, and while a record without validators is active and not due
++the check sends the current anchor's own; a 304 is `changed_deferred` only
++when the record's validators were sent, otherwise `not_modified` (phase E,
++design review I-1). The C4 probe tree sends no validators: there the gate
++compares content keys only (phase E, design note 15). Two records pace
++their suite instead of gating a request: an adopted suite's
++`anchor_absent` (no request before its retry time) and a never-adopted
++suite's active record (no probe before its retry time while its last check
++is younger than `periodic_refresh`) — C4 Dispatch 1 and 3, rulings PE-2
++and PE-3. The record is cleared in the flip transaction and when upstream
++again serves the current snapshot's content.
  
  **Restart.** At checker start every failing row (not refusal states, not
-@@ -1093,6 +1147,9 @@ snapshots now normally have complete coverage, so strict mode protects flat
+@@ -1093,15 +1206,28 @@ snapshots now normally have complete coverage, so strict mode protects flat
  hosts.
  
 -**In-flight adoptions (D10).** The checker tracks in-flight adoptions per
 -canonical host. On the hit path, before answering `unvouched_deb_refused`,
+-the handler waits up to 15 s for in-flight adoptions on the request's host,
+-then re-runs the lookup once. On the miss path, where the strict decision sits
 +**In-flight adoptions (D10).** The checker tracks in-flight signed adoptions
 +per canonical host (an unsigned adoption never vouches, so it is not waited
 +for; a count ends when the adoption goroutine returns, after its commit:
 +phase E, design note 27). On the hit path, before answering
 +`unvouched_deb_refused`,
- the handler waits up to 15 s for in-flight adoptions on the request's host,
- then re-runs the lookup once. On the miss path, where the strict decision sits
-@@ -1129,5 +1186,7 @@ gauges `acu_adoption_failing_suites` (C7), `acu_freshness_waiting_for_slot`
++the handler waits for in-flight adoptions on the request's host — at most
++min(15 s, 25 s − the request's age), and not at all when less than 1 s of
++that is left (phase E, design review M-10: the miss path still downloads
++the whole `.deb` before its first byte, within apt's 30 s) — then re-runs
++the lookup once. On the miss path, where the strict decision sits
+ inside singleflight after host-slot acquisition by design, `runFetch` returns
+ `errUnvouchedRetryable` (releasing its slot) when an adoption is in flight on
+-the host; `serveCacheMiss`, outside singleflight, waits up to 15 s and retries
+-the miss once. At most 64 waiters per host; beyond that the refusal is
+-immediate.
+-
+-Documented consequences: an adoption that takes longer than 15 s (large
++the host; `serveCacheMiss`, outside singleflight, waits under the same
++bound and retries the miss once: requests that waited together coalesce
++again, a client that left during the wait gets no retry, and the refusal
++is logged once per fetch, by the singleflight leader (design review O1).
++At most 64 waiters per host, each waiting request counting (coalesced
++requests for one `.deb` included); beyond that the refusal is immediate.
++
++Documented consequences: a client fetching N unvouched packages one
++after another during a long adoption waits up to 15 s for each (M-11); an
++adoption's count ends after its flip barrier (up to 140 s for a busy
++suite), so a package whose snapshot is still in its barrier is likely to
++wait the full 15 s and be refused; an adoption that takes longer than 15 s (large
+ `dists/` suites), a queued (not yet running) first adoption, and an unsigned
+ or anchorless repository on a host that also serves complete signed suites
+@@ -1129,5 +1255,7 @@ gauges `acu_adoption_failing_suites` (C7), `acu_freshness_waiting_for_slot`
  (flips in the C8 barrier now), the C3 pair
  `acu_suite_seed_rejected_total{host}` (counter) and
 -`acu_suites_seed_rejected` (gauge), and `acu_freshness_unlogged_panics_total`.
@@ -11614,29 +14368,35 @@ index 9be6f46..1ba0726 100644
 +`acu_strict_adoption_waits_total{host}`.
  New metrics are host-labelled or
  unlabelled (no suite labels) and are added to the metrics inventory comments in
-@@ -1147,6 +1206,8 @@ Constants, not knobs: backoff 2 m → 1 h (adoption failures and repeated
+@@ -1146,7 +1274,11 @@ Constants, not knobs: backoff 2 m → 1 h (adoption failures and repeated
+ *unknown* checks); hold 20 s, of which the last 5 s are kept for the commit
  (the C8 quiet cut at 15 s); phase A cap 60 s; hold-token wait 60 s; waiter
- caps 256 (barrier) and 64 (strict wait); strict wait 15 s; reaps 25 per run;
+-caps 256 (barrier) and 64 (strict wait); strict wait 15 s; reaps 25 per run;
 -unsigned member cap 1,000; check deadline 2 min; check workers 4; interest
 -window 7 d; orphan-marker TTL 365 d; cap-rejection cache 10 min (1 min for
++caps 256 (barrier) and 64 (strict wait); strict wait 15 s, within a 25 s
++request budget, none below 1 s; the miss path's backstop deadline at most
++25 s after the request started; reaps 25 per run;
 +unsigned member cap 1,000; anchor-absent and unsigned confirmation gap
 +`max(cooldown, 5 min)`, 1 h after a 401/403 on a signature file; check
 +deadline 2 min; check workers 4; interest window 7 d; orphan-marker TTL
 +365 d; cap-rejection cache 10 min (1 min for
  a refusal while every eviction candidate is busy; at most 4,096 suites);
  tracked suite path at most 1024 bytes; legacy-audit anchor
-@@ -1392,5 +1453,9 @@ files), in phase D.
+@@ -1392,5 +1524,11 @@ files), in phase D.
    suite is not probed by ticks while it waits, is re-checked within *D* of
    its slot's release with the cooldown bypassed, and a busy offer neither
 -  spins nor loses its place;
 +  spins nor loses its place; the upgrade burst — 50 never-adopted suites
 +  with interest and a trickle of signed changes, pool of 2: first
 +  adoptions back to back, a signed change waits for at most one adoption,
-+  each first adoption costs at most two probes unless its offer loses the
-+  slot to a concurrent check (a third; phase E, design note 26);
++  each first adoption costs two probes by the scheduler, plus one per client
++  check while it waits and one per offer another admission takes first
++  (phase E, ruling PE-4: the deterministic burst, and a racing one with
++  every suite on one host);
    clock steps ±2 h/±30 d with liveness asserts;
    `TestCheck_NoAdopter_ChangeOnlyLogged` (setup seeds the row); scheduler
-@@ -1405,6 +1470,9 @@ files), in phase D.
+@@ -1405,6 +1543,9 @@ files), in phase D.
    timings), never-downgrade at both points, member cap, no `package_hash`
    from reconcile; an unsigned adoption paused before commit while a signed
 -  anchor is served and its marker committed (also via the `/.` twin) is
@@ -11656,7 +14416,7 @@ The spec reference becomes revision 8; phase E's row reads "in progress (plan wr
 
 ```diff
 diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md b/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md
-index 57770dc..1988b07 100644
+index 57770dc..d294426 100644
 --- a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md
 +++ b/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md
 @@ -9,5 +9,5 @@
@@ -11715,7 +14475,7 @@ index 57770dc..1988b07 100644
  - *(D)* Legacy junk rows — suites a v6 binary created whose cached `InRelease` is an HTML page — stay alive because every anchor serve with a status below 400 touches its suite, sniff-failing bytes included. Reap them regardless of idleness (like non-canonical rows), or make the anchor touch require that the suite's anchor passed its sniff.
 +- *(E)* `docs/configuration.md` (*Anchor forms and unsigned repositories*, the threat notes) and `docs/admin-ui-spec.md` (§4.5, the unsigned and absent-anchor refusals) name `POST /forget` "added with suite reaping in a later release": rewrite both when F lands.
 +- *(E)* `POST /forget` is the documented escape hatch for `unsigned_downgrade_refused` (spec C5 threat notes): F's `/forget` re-adoption tests include a suite refused that way whose marker `/forget` deletes (no other suite row with its base), which then adopts unsigned after the two observations, and one whose `/.` twin keeps a row, which stays refused.
-+- *(E)* `suite_signed_seen.last_seen_at` is a past-event stamp (spec C4): phase E reads markers only for their existence (unsigned eligibility, `CommitAdoption`'s recheck), and its re-mark (ruling R-E1) stamps the anchor row's last use verbatim, as the startup anchor pass does. F's 365-day orphan-marker sweep is the stamp's first reader: apply the clock-step rule there as for a gate that retires things — a future stamp reads as now, never as old — and heal it on the next observation.
++- *(E)* `suite_signed_seen.last_seen_at` is a past-event stamp (spec C4): phase E reads markers only for their existence (unsigned eligibility, `CommitAdoption`'s recheck), and its re-mark (ruling R-E1) stamps the anchor row's last use verbatim, as the startup anchor pass does. F's 365-day orphan-marker sweep is the stamp's first reader: apply the clock-step rule there as for a gate that retires things — a future stamp reads as now, never as old — and heal it on the next observation. This corrects the earlier E carry-forward, which said a future stamp "counts as infinitely old": the sweep retires markers, and reading a future stamp as old would delete signed history after a backward clock step (phase E plan review, M-20).
  
  **G:**
 @@ -140,4 +122,12 @@ Each item is owned by the phase it is listed under; that phase's plan addresses
@@ -11727,7 +14487,7 @@ index 57770dc..1988b07 100644
 +
 +**H:**
 +
-+- *(E)* The prose WARN names phase E adds — `freshness: read anchor rows failed` and `adoption: served anchor read failed; the flip barrier runs` (documented as they are) — may become snake_case in H's documentation sweep, with phase D's (listed under "PR #8 parity").
++- *(E)* The prose WARN names phase E adds — `freshness: read anchor rows failed`, `adoption: served anchor read failed; the flip barrier runs` and `adoption: signed-anchor re-mark failed` (documented as they are) — may become snake_case in H's documentation sweep, with phase D's (listed under "PR #8 parity").
 +- *(E)* `README.md` (spec §8): unsigned and SHA512-only repositories, eager first adoption and the `adopt_unsigned` threat notes, beside the flat forms H documents.
  
  **Open decision (spec-level, for the maintainer):**
@@ -11735,9 +14495,31 @@ index 57770dc..1988b07 100644
 
 - [ ] **Step 6: Deferred files**
 
-Delete the entries this plan resolved (each is one `- **ID** …` line; leave the section headings): A-29, A-37, A-47, A-49 (`…-A-deferred.md`); B-16, B-17, B-18, B-19, B-20, B-21, B-23, B-24, B-25, B-28, B-30, B-31, B-32, B-33, B-34, B-35, B-37, B-38, B-45, B-46, B-51, B-53, B-54, B-55, B-56, B-57, B-58, B-66, B-67 (`…-B-deferred.md`); C-16, C-17, C-19, C-29 (`…-C-deferred.md`); D-1, D-2, D-5, D-21, D-22, D-23, D-33, D-34, D-35, D-37, D-38, D-45, D-47, D-51, D-53, D-54, D-59 (`…-D-deferred.md`).
+Delete the entries this plan resolved (each is one `- **ID** …` line; leave the section headings): A-29, A-37, A-47, A-49 (`…-A-deferred.md`); B-16, B-17, B-18, B-19, B-20, B-21, B-23, B-24, B-25, B-28, B-30, B-31, B-32, B-33, B-34, B-35, B-37, B-38, B-45, B-46, B-51, B-53, B-54, B-55, B-56, B-57, B-58, B-66, B-67 (`…-B-deferred.md`); C-16, C-17, C-19, C-29, C-40 (`…-C-deferred.md`); D-1, D-2, D-5, D-21, D-22, D-23, D-33, D-34, D-35, D-37, D-38, D-45, D-47, D-51, D-53, D-54, D-59 (`…-D-deferred.md`).
 
-Check: `grep -c -E '^- \*\*[A-D]-[0-9]+\*\*' docs/superpowers/plans/2026-09-28-flat-repositories-[ABCD]-deferred.md` prints 4, 29, 4 and 17 fewer than before: 25, 43, 22 and 60 at `aecc0e9`, then 21, 14, 18 and 43.
+Then re-tag C-21 and narrow C-38 (ruling PE-7; Task 14):
+
+```diff
+diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-C-deferred.md b/docs/superpowers/plans/2026-09-28-flat-repositories-C-deferred.md
+--- a/docs/superpowers/plans/2026-09-28-flat-repositories-C-deferred.md
++++ b/docs/superpowers/plans/2026-09-28-flat-repositories-C-deferred.md
+@@ -36,5 +36,5 @@
+ ## internal/handler
+ 
+-- **C-21** (narrowed by phase D) only its context fast path remains (it needs new `flipgate` API); the `EXISTS` read landed in phase D, Task 10.
++- **C-21** (narrowed by phase D) only its context fast path remains (it needs new `flipgate` API); the `EXISTS` read landed in phase D, Task 10. Phase E leaves it (no measured gain, and it would touch the barrier's registration race; ruling PE-7). (H)
+ 
+ ## cmd/apt-cacher-ultra
+@@ -48,5 +48,5 @@
+ ## Simulation budget and flakes
+ 
+-- **C-38** Two phase-B simulations have little or no room under the 5 s `-race` budget: `TestSimScheduler_FiveHundredStallingOneHealthy` (6.15–7.82 s in the final tests review, 6.37 s in the fix wave's run) and `TestSim30Days_RetryDateRulesAndClockSteps` (4.4–5.1 s, then 3.85 s). Phase C does not change them. Coarsen them, never dropping assertions. (B scope; H)
++- **C-38** (narrowed by phase E: `TestSim30Days_RetryDateRulesAndClockSteps` was coarsened in phase E, Task 14, to about 3.6 s, every assertion kept at its per-day rate) `TestSimScheduler_FiveHundredStallingOneHealthy` has no room under the 5 s `-race` budget (6.15–7.82 s in phase B's final tests review, 6.37 s in its fix wave's run, 7.9 s in phase E). Coarsen it, never dropping assertions. (B scope; H)
+ - **C-39** One unexplained failure of `TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency` in a loaded parallel run (final review, concurrency; it did not reproduce in four `-race` reruns or alone). The test wires no gate and runs in real time. Investigate if it recurs. (H)
+ 
+```
+
+Check: `grep -c -E '^- \*\*[A-D]-[0-9]+\*\*' docs/superpowers/plans/2026-09-28-flat-repositories-[ABCD]-deferred.md` prints 4, 29, 5 and 17 fewer than before: 25, 43, 22 and 60 at `aecc0e9`, then 21, 14, 17 and 43.
 
 - [ ] **Step 7: Final verification**
 
@@ -11755,7 +14537,7 @@ go test -race -count=1 -v -run 'TestServeHTTP_Strict(Hit|Miss)WaitsForAnAdoption
 go test -race -count=1 -run 'TestSim' -v ./internal/freshness/ 2>&1 | grep -E '^--- (PASS|FAIL)'
 ```
 
-Expected: PASS everywhere; vet clean; lint `0 issues`; `gofmt -l` lists exactly the five drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`); both `grep`s print nothing; every simulation but `TestSimScheduler_FiveHundredStallingOneHealthy` (C-38, phase H) under 5 s.
+Expected: PASS everywhere; vet clean; lint `0 issues`; `gofmt -l` lists exactly the five drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`); both `grep`s print nothing; every simulation but `TestSimScheduler_FiveHundredStallingOneHealthy` (C-38, phase H) under 4.5 s (ruling PE-8: the 5 s budget with about 0.5 s of margin).
 
 - [ ] **Step 8: Commit**
 
