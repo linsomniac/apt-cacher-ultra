@@ -564,9 +564,9 @@ fetched one of their anchor files in the 7 days before the upgrade, or asks
 again (see *Eager first adoption*); with the default
 `max_concurrent_adoptions = 2` these first adoptions run one at a time,
 while signed updates keep their own slot. Snapshots adopted before the
-upgrade carry no SHA512 by-hash names: such requests are answered as
-before (from the ordinary cache or upstream) until the suite's next
-adoption.
+upgrade carry no SHA512 by-hash names: such requests are answered 404
+from the snapshot, and apt then fetches the file by its name, until the
+suite's next adoption.
 
 ## `[hot_packages]`, `[hold_packages]`, and `[retention]`: package working set
 
