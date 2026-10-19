@@ -263,3 +263,24 @@ func TestSuiteFile_Rules(t *testing.T) {
 		}
 	}
 }
+
+// Ruling R-D2: a marker line with trailing blanks passes apt's rule; the
+// copy go-crypto decodes has the bare marker line, and nothing else moves.
+func TestDecodableClearsign(t *testing.T) {
+	const m = "-----BEGIN PGP SIGNED MESSAGE-----"
+	cases := []struct{ in, want string }{
+		{m + "\nHash: SHA256\n", m + "\nHash: SHA256\n"},
+		{m + "\r\nHash: SHA256\r\n", m + "\r\nHash: SHA256\r\n"},
+		{m + " \t\nHash: SHA256\n", m + "\nHash: SHA256\n"},
+		{m + " \r\nHash: SHA256\r\n", m + "\nHash: SHA256\r\n"},
+		{m, m},
+		{m + "  ", m},
+		{" " + m + "\n", " " + m + "\n"}, // fails apt's rule: left alone, refused later
+		{"Origin: x\n", "Origin: x\n"},
+	}
+	for _, c := range cases {
+		if got := string(DecodableClearsign([]byte(c.in))); got != c.want {
+			t.Errorf("DecodableClearsign(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

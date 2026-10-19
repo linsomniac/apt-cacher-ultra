@@ -266,3 +266,28 @@ func (f SuiteFile) Sniff(path string, head []byte) bool {
 	}
 	return false
 }
+
+// DecodableClearsign returns b ready for go-crypto's clearsign decoder:
+// when b's first line passes SniffInRelease but carries trailing blanks —
+// which apt's rule ignores and RFC 4880 §6.2 allows after an armor header
+// line, but go-crypto v1.4.1 refuses — it returns a copy whose first line
+// is exactly the marker; otherwise b itself. Nothing else changes, so
+// neither does the signed text.
+//
+// AIDEV-NOTE: ruling R-D2 (phase D): adoption accepts exactly apt's first
+// line. Every decode of an InRelease envelope (the verifier, reconcile's
+// inReleasePlaintext) goes through this, so a body apt accepts is never
+// refused, nor later found undecodable, for its marker line alone.
+func DecodableClearsign(b []byte) []byte {
+	if !SniffInRelease(b) {
+		return b
+	}
+	end := bytes.IndexByte(b, '\n')
+	if end < 0 {
+		end = len(b)
+	}
+	if end == len(clearsignBegin) || (end == len(clearsignBegin)+1 && b[end-1] == '\r') {
+		return b
+	}
+	return append([]byte(clearsignBegin), b[end:]...)
+}

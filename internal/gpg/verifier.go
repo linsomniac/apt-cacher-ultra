@@ -15,6 +15,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 )
 
@@ -212,7 +213,9 @@ var (
 var errClearsignPanicked = fmt.Errorf("%w (decoder panicked)", ErrMalformedClearsign)
 
 // decodeClearsigned is clearsign.Decode with a panic turned into
-// errClearsignPanicked.
+// errClearsignPanicked. It decodes aptpath.DecodableClearsign(b), so a
+// marker line with trailing blanks — accepted by apt — decodes too
+// (ruling R-D2).
 //
 // AIDEV-NOTE: I-1. go-crypto v1.4.1 panics (slice bounds [:-1]) when the
 // signed text has no lines. Every clearsign.Decode call on untrusted bytes
@@ -224,7 +227,7 @@ func decodeClearsigned(b []byte) (block *clearsign.Block, err error) {
 			block, err = nil, fmt.Errorf("%w: %v", errClearsignPanicked, r)
 		}
 	}()
-	block, _ = clearsign.Decode(b)
+	block, _ = clearsign.Decode(aptpath.DecodableClearsign(b))
 	return block, nil
 }
 
@@ -285,7 +288,7 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 		return nil, err
 	}
 	if block == nil {
-		if bytes.Contains(inRelease, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
+		if bytes.Contains(inRelease, []byte(clearsignBeginMarker)) {
 			return nil, ErrMalformedClearsign
 		}
 		return nil, ErrMissingSignature
@@ -481,23 +484,34 @@ func isArmoredSignature(b []byte) bool {
 	return bytes.HasPrefix(b, []byte("-----BEGIN PGP SIGNATURE-----"))
 }
 
-// requireBareClearsigned returns an error if b contains anything
-// other than (optional whitespace) + clearsigned message + (optional
-// whitespace). clearsign.Decode silently strips prefix bytes; we
-// reject them here to preserve the invariant that "verified bytes ==
-// stored bytes (modulo trailing newlines)" — see SPEC2 §7.5 step 2.
+// clearsignBeginMarker opens a clearsigned message (deferred minor A-50:
+// one literal).
+const clearsignBeginMarker = "-----BEGIN PGP SIGNED MESSAGE-----"
+
+// requireBareClearsigned enforces apt's shape on a body that carries the
+// clearsign marker: its FIRST line is exactly the marker (trailing CR,
+// space and tab ignored — aptpath.SniffInRelease, apt's
+// StartsWithGPGClearTextSignature), and only whitespace follows the END
+// line. clearsign.Decode silently strips bytes around the message; we
+// reject them to keep "verified bytes == stored bytes (modulo trailing
+// newlines)" — SPEC2 §7.5 step 2. Both failures are
+// ErrMalformedClearsign (deferred minor A-51).
 //
-// If b doesn't contain a clearsigned marker at all, this returns nil
-// — the downstream decode step rejects it with ErrMissingSignature.
+// AIDEV-NOTE: ruling R-D2 (phase D). A snapshot anchor is served to apt
+// clients, which reject an InRelease whose first line is not the marker
+// (leading whitespace or a blank line included), so adoption accepts
+// exactly what apt accepts — the same rule the handler's sniff applies
+// before a body earns a suite row or a signed-seen marker.
+//
+// A body without the marker returns nil: the decode step rejects it with
+// ErrMissingSignature.
 func requireBareClearsigned(b []byte) error {
-	const beginMarker = "-----BEGIN PGP SIGNED MESSAGE-----"
 	const endSig = "-----END PGP SIGNATURE-----"
-	idx := bytes.Index(b, []byte(beginMarker))
-	if idx < 0 {
+	if !bytes.Contains(b, []byte(clearsignBeginMarker)) {
 		return nil
 	}
-	if !isWhitespaceOnly(b[:idx]) {
-		return errors.New("clearsigned message has extraneous bytes before BEGIN marker")
+	if !aptpath.SniffInRelease(b) {
+		return fmt.Errorf("%w: the first line is not the BEGIN marker (apt rejects it)", ErrMalformedClearsign)
 	}
 	endIdx := bytes.Index(b, []byte(endSig))
 	if endIdx < 0 {
@@ -505,9 +519,8 @@ func requireBareClearsigned(b []byte) error {
 		// error. Don't fabricate one here.
 		return nil
 	}
-	tail := b[endIdx+len(endSig):]
-	if !isWhitespaceOnly(tail) {
-		return errors.New("clearsigned message has extraneous bytes after END marker")
+	if !isWhitespaceOnly(b[endIdx+len(endSig):]) {
+		return fmt.Errorf("%w: extraneous bytes after the END marker", ErrMalformedClearsign)
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
@@ -87,6 +88,12 @@ func TestAdopter_MalformedEnvelopeCreatesNoSnapshot(t *testing.T) {
 	good := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
 	end := bytes.LastIndex(good, []byte("-----END PGP SIGNATURE-----"))
 	suite := freshness.SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}
+	// The suite is tracked, so the closing check reads a row (deferred
+	// minor A-52: it passed vacuously on ErrNotFound).
+	if err := c.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{
+		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}); err != nil {
+		t.Fatal(err)
+	}
 	for _, body := range [][]byte{append([]byte{}, good[:end]...), []byte(fakeReleasePlaintext)} {
 		if err := ad.Run(context.Background(), suite, body, "", ""); !errors.Is(err, freshness.ErrAdoptionGPGFailed) {
 			t.Fatalf("Run(%q...) err = %v, want ErrAdoptionGPGFailed", body[:20], err)
@@ -95,8 +102,8 @@ func TestAdopter_MalformedEnvelopeCreatesNoSnapshot(t *testing.T) {
 	if cov, err := c.HostCurrentSnapshotsCoverage(context.Background(), "http", "h"); err != nil || len(cov) != 0 {
 		t.Fatalf("strict-mode participants = %v (%v), want none", cov, err)
 	}
-	if sf, err := c.GetSuiteFreshness(context.Background(), "http", "h", "/r/dists/x"); err == nil && sf.CurrentSnapshotID != nil {
-		t.Fatalf("a current snapshot was created: %+v", sf)
+	if sf, err := c.GetSuiteFreshness(context.Background(), "http", "h", "/r/dists/x"); err != nil || sf.CurrentSnapshotID != nil {
+		t.Fatalf("suite row = %+v (err %v), want the row with no current snapshot", sf, err)
 	}
 }
 
@@ -107,6 +114,61 @@ func TestVerifyInline_EmptyKeyringSaysSo(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = v.VerifyInline(context.Background(), newSuite(), clearsignWith(t, signer, []byte(fakeReleasePlaintext)))
+	if !errors.Is(err, ErrNoUsableSignature) || !strings.Contains(err.Error(), "keyring is empty") {
+		t.Fatalf("err = %v, want ErrNoUsableSignature naming the empty keyring", err)
+	}
+}
+
+// Ruling R-D2 (phase D): adoption accepts exactly what apt's first-line
+// rule accepts. apt rejects an InRelease whose first line is not the
+// clearsign marker — a leading blank line or leading whitespace included
+// (apt-pkg/acquire-item.cc pkgAcqMetaClearSig::VerifyDone →
+// StartsWithGPGClearTextSignature in apt-pkg/contrib/fileutl.cc, which
+// strips only trailing whitespace with _strrstrip, apt-pkg/contrib/
+// strutl.cc; spec §3's probes of real apt agree) — so the verifier refuses
+// it too, as malformed_clearsign, and the handler's sniff agrees. Trailing
+// blanks on the marker line are stripped by apt and accepted here.
+func TestVerifyInline_FollowsAptsFirstLineRule(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, signer), RequireSignature: true, Logger: silentLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
+	for name, prefix := range map[string]string{
+		"leading newline": "\n",
+		"leading CRLF":    "\r\n",
+		"leading spaces":  "  ",
+		"leading tab":     "\t",
+		"leading BOM":     "\xef\xbb\xbf",
+	} {
+		body := append([]byte(prefix), good...)
+		_, err := v.VerifyInline(context.Background(), newSuite(), body)
+		if !errors.Is(err, ErrMalformedClearsign) || ClassifyVerifyErr(err) != "malformed_clearsign" {
+			t.Errorf("%s: err = %v, want malformed_clearsign", name, err)
+		}
+		if aptpath.SniffInRelease(body) {
+			t.Errorf("%s: the handler's sniff accepts a body adoption refuses", name)
+		}
+	}
+	trailing := bytes.Replace(good, []byte(clearsignBeginMarker+"\n"), []byte(clearsignBeginMarker+" \t\r\n"), 1)
+	if bytes.Equal(trailing, good) {
+		t.Fatal("test premise: the marker line was not rewritten")
+	}
+	if _, err := v.VerifyInline(context.Background(), newSuite(), trailing); err != nil {
+		t.Fatalf("trailing blanks on the marker line: %v, want accepted (apt strips them)", err)
+	}
+}
+
+// Deferred minor A-53: the detached path names an empty keyring too.
+func TestVerifyDetached_EmptyKeyringSaysSo(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t), RequireSignature: false, Logger: silentLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel := []byte(fakeReleasePlaintext)
+	_, err = v.VerifyDetached(context.Background(), newSuite(), rel, detachSignWith(t, signer, rel, true))
 	if !errors.Is(err, ErrNoUsableSignature) || !strings.Contains(err.Error(), "keyring is empty") {
 		t.Fatalf("err = %v, want ErrNoUsableSignature naming the empty keyring", err)
 	}

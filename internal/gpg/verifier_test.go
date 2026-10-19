@@ -413,6 +413,9 @@ func TestVerifier_RejectsPrefixGarbage(t *testing.T) {
 	if !bytes.Contains([]byte(err.Error()), []byte("BEGIN marker")) {
 		t.Fatalf("error doesn't mention BEGIN marker: %v", err)
 	}
+	if ClassifyVerifyErr(err) != "malformed_clearsign" { // deferred minor A-51
+		t.Fatalf("reason = %q, want malformed_clearsign", ClassifyVerifyErr(err))
+	}
 }
 
 func TestVerifier_RejectsSuffixGarbage(t *testing.T) {
@@ -432,6 +435,9 @@ func TestVerifier_RejectsSuffixGarbage(t *testing.T) {
 	}
 	if !bytes.Contains([]byte(err.Error()), []byte("END marker")) {
 		t.Fatalf("error doesn't mention END marker: %v", err)
+	}
+	if ClassifyVerifyErr(err) != "malformed_clearsign" { // deferred minor A-51
+		t.Fatalf("reason = %q, want malformed_clearsign", ClassifyVerifyErr(err))
 	}
 }
 
