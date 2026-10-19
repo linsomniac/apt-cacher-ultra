@@ -14,6 +14,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
+	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 )
 
 // Spec C11: freshness.max_suites reaches the checker (the scheduler's
@@ -136,4 +137,27 @@ func TestServeListeners_WarnsWhenTheSuiteCapsAreReached(t *testing.T) {
 		return
 	}
 	t.Fatal("suite_caps_exceeded not logged")
+}
+
+// Spec C3: the handler gets freshness.max_suites and the checker as its
+// cap-eviction guard; with no checker the guard is a nil interface, never
+// a typed nil.
+func TestHandlerConfig_CarriesTheSuiteCapsAndGuard(t *testing.T) {
+	cfg := minimalCfg(t.TempDir(), nil)
+	cfg.Freshness.MaxSuites = 1234
+	c, fetcher, hosts := newAdoptionWiringDeps(t)
+	ck, err := freshness.New(checkerConfig(context.Background(), cfg, c, fetcher, hosts, silentBuildLogger(), nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hc := handlerConfig(cfg, nil, c, fetcher, hosts, silentBuildLogger(), ck, nil)
+	if hc.MaxSuites != 1234 {
+		t.Fatalf("MaxSuites = %d, want freshness.max_suites (1234)", hc.MaxSuites)
+	}
+	if g, ok := hc.SuiteGuard.(*freshness.Checker); !ok || g != ck {
+		t.Fatalf("SuiteGuard = %T %v, want the checker", hc.SuiteGuard, hc.SuiteGuard)
+	}
+	if hc := handlerConfig(cfg, nil, c, fetcher, hosts, silentBuildLogger(), nil, nil); hc.SuiteGuard != nil {
+		t.Fatalf("no checker, yet SuiteGuard = %T (a typed nil would be called)", hc.SuiteGuard)
+	}
 }

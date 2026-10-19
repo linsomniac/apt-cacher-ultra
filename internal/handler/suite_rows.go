@@ -1,0 +1,350 @@
+package handler
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+)
+
+// suiteReq is what one request knows about its suite (spec C3), threaded
+// from ServeHTTP through the hit, miss and stale paths.
+type suiteReq struct {
+	key  cache.SuiteKey
+	file aptpath.SuiteFile
+	// tracked: the suite has a suite_freshness row, as this request last
+	// read or wrote it.
+	tracked bool
+	// tok is this request's flip-barrier registration; ServeHTTP's
+	// deferred Done covers a registration made after the suite's row was
+	// created (phase C carry-forward).
+	tok *flipgate.Token
+}
+
+func newSuiteReq(req *proxy.Request) *suiteReq {
+	sr := &suiteReq{}
+	if req.IsMetadata && req.SuitePath != "" {
+		sr.key = suiteKeyOf(req)
+		sr.file = aptpath.ClassifySuiteFile(req.SuitePath, req.Path)
+	}
+	return sr
+}
+
+// suiteKeyOf is the key of req's suite.
+func suiteKeyOf(req *proxy.Request) cache.SuiteKey {
+	return cache.SuiteKey{CanonicalScheme: req.CanonicalScheme, CanonicalHost: req.CanonicalHost, SuitePath: req.SuitePath}
+}
+
+// seedRejectTTL, seedRejectMax and seedRejectSweep shape spec C3's
+// cap-rejection cache: a suite refused a row is not retried for 10
+// minutes (spec C11 constant); the cache holds at most seedRejectMax
+// suites and drops expired ones at most once a minute.
+const (
+	seedRejectTTL   = 10 * time.Minute
+	seedRejectMax   = 4096
+	seedRejectSweep = time.Minute
+)
+
+// seedRejections caches cap rejections per suite (spec C3), so an over-cap
+// suite costs no writer operation per request. The key is the suite alone,
+// whichever of its files was refused (InRelease, Release, a flat index):
+// phase G's flat files share the entry. Monotonic time. At seedRejectMax
+// entries, expired ones are dropped; if it is still full it is cleared
+// (each suite then costs one more writer operation). While it holds
+// entries a timer sweeps it once per seedRejectSweep, so expired refusals
+// — and acu_suites_seed_rejected — fall back without traffic (design
+// review M10).
+type seedRejections struct {
+	mu        sync.Mutex
+	until     map[cache.SuiteKey]time.Time
+	lastSweep time.Time
+	// timer is the pending sweep while entries remain; closed (by
+	// Handler.Close) stops the sweeps for good.
+	timer  *time.Timer
+	closed bool
+	// onPanic reports a panic recovered in the timer's goroutine.
+	onPanic func(v any)
+}
+
+// rejected reports whether key was refused a row within seedRejectTTL.
+func (s *seedRejections) rejected(key cache.SuiteKey) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sweepLocked(false)
+	t, ok := s.until[key]
+	if ok && !time.Now().Before(t) {
+		delete(s.until, key)
+		ok = false
+	}
+	seedRejectedSuites.Set(float64(len(s.until)))
+	return ok
+}
+
+// add caches a rejection of key.
+func (s *seedRejections) add(key cache.SuiteKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.until == nil {
+		s.until = make(map[cache.SuiteKey]time.Time)
+	}
+	if len(s.until) >= seedRejectMax {
+		s.sweepLocked(true)
+		if len(s.until) >= seedRejectMax {
+			clear(s.until)
+		}
+	}
+	s.until[key] = time.Now().Add(seedRejectTTL)
+	s.armLocked()
+	seedRejectedSuites.Set(float64(len(s.until)))
+}
+
+// armLocked schedules the next sweep while entries remain.
+func (s *seedRejections) armLocked() {
+	if s.timer == nil && !s.closed && len(s.until) > 0 {
+		s.timer = time.AfterFunc(seedRejectSweep, s.expire)
+	}
+}
+
+// expire is the timer's sweep: it drops expired entries, sets the gauge
+// and re-arms while entries remain. Deferred minor C-24: the timer's
+// goroutine recovers its panics.
+func (s *seedRejections) expire() {
+	defer func() {
+		if v := recover(); v != nil && s.onPanic != nil {
+			s.onPanic(v)
+		}
+	}()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.timer = nil
+	if s.closed {
+		return
+	}
+	s.sweepLocked(true)
+	seedRejectedSuites.Set(float64(len(s.until)))
+	s.armLocked()
+}
+
+// close stops the sweeps (Handler.Close). Idempotent.
+func (s *seedRejections) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	if s.timer != nil {
+		s.timer.Stop()
+		s.timer = nil
+	}
+}
+
+// len is the number of suites cached as refused (tests).
+func (s *seedRejections) len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.until)
+}
+
+// sweepLocked drops expired entries, at most once per seedRejectSweep
+// unless forced.
+func (s *seedRejections) sweepLocked(force bool) {
+	now := time.Now()
+	if !force && now.Sub(s.lastSweep) < seedRejectSweep {
+		return
+	}
+	s.lastSweep = now
+	for k, t := range s.until {
+		if !now.Before(t) {
+			delete(s.until, k)
+		}
+	}
+}
+
+// seedWarnEvery rate-limits suite_seed_rejected: at most one line per
+// minute process-wide; suppressed counts the rejections in between.
+const seedWarnEvery = time.Minute
+
+// seedWarn is suite_seed_rejected's rate limiter.
+type seedWarn struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+
+// suiteCaps is CreateSuite's bounds: freshness.max_suites globally and a
+// tenth of it per canonical host (spec C3); 0 is unbounded (tests).
+func (h *Handler) suiteCaps() cache.SuiteCaps {
+	return cache.SuiteCaps{Global: h.maxSuites, PerHost: h.maxSuites / 10}
+}
+
+// suiteSeed is the row a creation inserts (spec C3). Only an
+// adoption-disabled miss of <suite>/InRelease stamps the miss as a
+// successful check with its validators — today's seed, byte for byte
+// (TestServeHTTP_AdoptionDisabledSeedParity); every other creation leaves
+// the stamps and validators NULL, so the suite's first check runs at once
+// and unconditionally.
+func (h *Handler) suiteSeed(sr *suiteReq, miss bool, etag, lastmod string, now int64) *cache.SuiteSeed {
+	s := &cache.SuiteSeed{SuiteKey: sr.key, RequestedAt: now}
+	if miss && !h.adoptionEnabled && sr.file == aptpath.FileInRelease {
+		s.LastCheckAt, s.LastSuccessAt = &now, &now
+		if etag != "" {
+			s.InReleaseETag = &etag
+		}
+		if lastmod != "" {
+			s.InReleaseLastMod = &lastmod
+		}
+	}
+	return s
+}
+
+// noteCreate handles a creation's outcome: a cap rejection is cached,
+// counted and logged (rate-limited WARN suite_seed_rejected); an eviction
+// is logged at INFO (suite_evicted).
+func (h *Handler) noteCreate(key cache.SuiteKey, res cache.CreateResult) {
+	if res.Evicted != nil {
+		h.logger.Info("suite_evicted",
+			"canonical_host", res.Evicted.CanonicalHost,
+			"suite_path", res.Evicted.SuitePath,
+			"for_host", key.CanonicalHost,
+			"for_suite", key.SuitePath,
+		)
+	}
+	if !res.Outcome.Rejected() {
+		return
+	}
+	h.rejections.add(key)
+	suiteSeedRejectedTotal.Inc(key.CanonicalHost)
+	h.seedWarn.mu.Lock()
+	now := time.Now()
+	if !h.seedWarn.last.IsZero() && now.Sub(h.seedWarn.last) < seedWarnEvery {
+		h.seedWarn.suppressed++
+		h.seedWarn.mu.Unlock()
+		return
+	}
+	suppressed := h.seedWarn.suppressed
+	h.seedWarn.last, h.seedWarn.suppressed = now, 0
+	h.seedWarn.mu.Unlock()
+	h.logger.Warn("suite_seed_rejected",
+		"canonical_host", key.CanonicalHost,
+		"suite_path", key.SuitePath,
+		"cap", res.Outcome.String(),
+		"max_suites", h.maxSuites,
+		"suppressed", suppressed,
+		"detail", "suite will not refresh",
+	)
+}
+
+// readHead reads at most n leading bytes of a pool file.
+func readHead(path string, n int) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	return io.ReadAll(io.LimitReader(f, int64(n)))
+}
+
+// lastUse is a url_path row's last use: the newer of its last_requested_at
+// and last_fetched_at (0 when neither is set), the stamp a signed-seen
+// marker from it carries, as in the startup marker pass.
+func lastUse(row *cache.URLPath) int64 {
+	var seen int64
+	if row.LastRequestedAt != nil {
+		seen = *row.LastRequestedAt
+	}
+	if row.LastFetchedAt != nil && *row.LastFetchedAt > seen {
+		seen = *row.LastFetchedAt
+	}
+	return seen
+}
+
+// cachedAnchors reads the suite's signed-anchor url_path rows —
+// <suite>/InRelease and <suite>/Release.gpg, but not except, the path this
+// request stores itself — and sniffs each blob here, outside the writer,
+// for a creation to mark in its transaction (cache.SuiteSeed.Cached,
+// ruling PD-5). A missing row is listed without a blob, so one that
+// appears before the transaction makes the creation unproven; a row whose
+// read or pool file fails is listed as not signed (no evidence, no
+// marker), and the transaction's re-read decides whether it changed.
+//
+// AIDEV-NOTE: a row creation marks the suite's cached signed anchors in
+// the creating transaction, so a tracked suite never serves an unmarked
+// signed anchor (spec C3, the hit-path invariant at every committed
+// state): markers are written only for suites with rows, and serving an
+// existing tracked suite's anchor writes none.
+func (h *Handler) cachedAnchors(ctx context.Context, key cache.SuiteKey, except string) []cache.CachedAnchor {
+	var out []cache.CachedAnchor
+	for _, name := range []string{"/InRelease", "/Release.gpg"} {
+		p := key.SuitePath + name
+		if p == except {
+			continue
+		}
+		a := cache.CachedAnchor{Path: p}
+		if row, err := h.cache.LookupURL(ctx, key.CanonicalScheme, key.CanonicalHost, p); err == nil && row.BlobHash != nil {
+			a.BlobHash, a.SeenAt = *row.BlobHash, lastUse(row)
+			file := aptpath.ClassifySuiteFile(key.SuitePath, p)
+			if head, err := readHead(h.cache.BlobPath(a.BlobHash), file.HeadBytes()); err == nil {
+				a.Signed = file.Sniff(p, head)
+			}
+		}
+		out = append(out, a)
+	}
+	if h.cachedAnchorsHook != nil {
+		h.cachedAnchorsHook()
+	}
+	return out
+}
+
+// markCachedSignedAnchors is the backstop for an unproven creation
+// (cache.CreateResult.Unproven): a cached anchor row that changed or
+// appeared between cachedAnchors' read and the creating transaction was
+// never sniffed, so it is read, sniffed and marked after the commit (SeenAt
+// is its last use). A failure is logged WARN; the startup marker pass heals
+// it at the next start.
+func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKey, except string) {
+	var marks []cache.SignedSeenMark
+	for _, name := range []string{"/InRelease", "/Release.gpg"} {
+		p := key.SuitePath + name
+		if p == except {
+			continue
+		}
+		row, err := h.cache.LookupURL(ctx, key.CanonicalScheme, key.CanonicalHost, p)
+		if err != nil || row.BlobHash == nil {
+			continue
+		}
+		file := aptpath.ClassifySuiteFile(key.SuitePath, p)
+		head, err := readHead(h.cache.BlobPath(*row.BlobHash), file.HeadBytes())
+		if err != nil || !file.Sniff(p, head) {
+			continue
+		}
+		if seen := lastUse(row); seen > 0 {
+			marks = append(marks, cache.SignedSeenMark{CanonicalScheme: key.CanonicalScheme,
+				CanonicalHost: key.CanonicalHost, Base: aptpath.MarkerBase(key.SuitePath), SeenAt: seen})
+		}
+	}
+	if len(marks) == 0 {
+		return
+	}
+	if err := h.cache.MarkSignedSeenBatch(ctx, marks); err != nil {
+		h.logger.Warn("suite signed-seen mark failed",
+			"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath)
+	}
+}
+
+// registerLate registers, with the flip barrier, the anchor serve of a
+// suite whose row this request created or found created after ServeHTTP's
+// anchorStart (phase C carry-forward: the serve that creates a row is
+// tracked like any other), and returns its token — nil when there is
+// nothing to register. ServeHTTP's deferred Done covers it.
+func (h *Handler) registerLate(r *http.Request, req *proxy.Request, sr *suiteReq) *flipgate.Token {
+	if sr.tok != nil || !sr.tracked {
+		return nil
+	}
+	sr.tok = h.anchorStart(r, req)
+	return sr.tok
+}

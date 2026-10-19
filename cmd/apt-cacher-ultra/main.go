@@ -1102,6 +1102,12 @@ func handlerConfig(
 	freshChecker *freshness.Checker,
 	adopter *freshness.Adopter,
 ) handler.Config {
+	// Spec C3: the checker holds an evicted suite's mutex. A nil checker
+	// must stay a nil interface (a typed nil would be called).
+	var guard cache.SuiteGuard
+	if freshChecker != nil {
+		guard = freshChecker
+	}
 	return handler.Config{
 		Parser:              parser,
 		Cache:               c,
@@ -1114,6 +1120,8 @@ func handlerConfig(
 		AdoptionEnabled:     cfg.Adoption.Enabled,
 		FlipGate:            adopter.FlipGate(),
 		KeepDisplaced:       cfg.GC.KeepDisplaced,
+		MaxSuites:           cfg.Freshness.MaxSuites,
+		SuiteGuard:          guard,
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
@@ -108,6 +109,16 @@ type Config struct {
 	// a by-hash request the current snapshot lacks from the suite's newest
 	// KeepDisplaced+1 displaced, non-retired snapshots; 0 disables it.
 	KeepDisplaced int
+
+	// MaxSuites is freshness.max_suites: the spec C3 suite-row caps (this
+	// many rows in all, a tenth of it per canonical host). 0 is unbounded
+	// (tests); production configs validate it to at least 10.
+	MaxSuites int
+
+	// SuiteGuard holds a suite's in-memory mutex for cap eviction (spec
+	// C3); production passes the freshness checker. nil evicts without
+	// holding one (no checker, so no in-memory suite state).
+	SuiteGuard cache.SuiteGuard
 }
 
 // ConnectHandler is the SPEC6 §2.2 CONNECT pipeline contract.
@@ -157,6 +168,18 @@ type Handler struct {
 	// keepDisplaced bounds retained by-hash (see tryDisplacedByHash).
 	keepDisplaced int
 
+	// Spec C3 suite rows: the caps, the eviction guard, the cap-rejection
+	// cache and suite_seed_rejected's rate limiter.
+	maxSuites  int
+	suiteGuard cache.SuiteGuard
+	rejections seedRejections
+	seedWarn   seedWarn
+
+	// cachedAnchorsHook, when set (tests only), runs right after
+	// cachedAnchors' read: the window in which a changed anchor row makes
+	// a creation unproven.
+	cachedAnchorsHook func()
+
 	// unvouchedPassthroughLog rate-limits the
 	// unvouched_deb_passthrough_no_coverage event to once per (host,
 	// path, hour) so steady incomplete-coverage traffic doesn't flood
@@ -199,12 +222,15 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.KeepDisplaced < 0 {
 		return nil, errors.New("handler: negative KeepDisplaced")
 	}
+	if cfg.MaxSuites < 0 {
+		return nil, errors.New("handler: negative MaxSuites")
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
-	return &Handler{
+	h := &Handler{
 		parser:                  cfg.Parser,
 		cache:                   cfg.Cache,
 		fetch:                   cfg.Fetch,
@@ -217,11 +243,21 @@ func New(cfg Config) (*Handler, error) {
 		adoptionEnabled:         cfg.AdoptionEnabled,
 		flipGate:                cfg.FlipGate,
 		keepDisplaced:           cfg.KeepDisplaced,
+		maxSuites:               cfg.MaxSuites,
+		suiteGuard:              cfg.SuiteGuard,
 		unvouchedPassthroughLog: make(map[string]int64),
 		lifecycleCtx:            lifecycleCtx,
 		lifecycleCancel:         lifecycleCancel,
-	}, nil
+	}
+	h.rejections.onPanic = func(v any) {
+		h.logGoroutinePanic("handler_goroutine_panicked", &rejectionPanicStackLogged, v, "where", "seed_rejections")
+	}
+	return h, nil
 }
+
+// rejectionPanicStackLogged limits the cap-rejection sweep's panic stack to
+// one per process.
+var rejectionPanicStackLogged atomic.Bool
 
 // allowHeader returns the SPEC6 §2.5 Allow header for a 405
 // response: "GET, HEAD, CONNECT" when MITM is enabled, "GET, HEAD"
@@ -267,6 +303,7 @@ func (h *Handler) SetConnectHandler(c ConnectHandler) {
 // after Server.Shutdown returns guarantees no new ServeHTTP starts.
 func (h *Handler) Close() {
 	h.lifecycleCancel()
+	h.rejections.close()
 	h.activeWG.Wait()
 }
 
@@ -369,30 +406,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Spec C3: what this request knows about its suite's row, threaded
+	// through the hit, miss and stale paths. Its barrier token's Done runs
+	// once the response has been written, also for a token registered
+	// after the request created the suite's row.
+	sr := newSuiteReq(req)
+	defer func() { sr.tok.Done() }()
+
 	// Spec C8: register an anchor serve with the flip barrier before
 	// anything reads the snapshot pointer (it may wait here while the
 	// suite's flip holds anchors) and before host-slot acquisition and
-	// singleflight; Done runs once the response has been written.
+	// singleflight.
 	if t := h.anchorStart(r, req); t != nil {
-		defer t.Done()
-		// The request line of a request that waited in a hold says so
-		// (flip_held_ms).
-		if held := t.Held(); held > 0 {
-			r = r.WithContext(context.WithValue(r.Context(), flipHeldKey{}, held))
-		}
-		// A request whose context ended while it waited — its client left —
-		// is a client abort (the gate did not register it). Serving it
-		// would only fail its snapshot read: a WARN and a 502 "hit" line.
-		if r.Context().Err() != nil {
-			w.Header().Set("Retry-After", "5")
-			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		sr.tok = t
+		if r = heldContext(r, t); clientLeft(w, r) {
 			h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, false, 0, start)
 			return
 		}
 	}
 
 	// Fast path: SPEC §6.1.
-	if served, outcome, status, body, validation := h.tryCacheHit(w, r, req, start); served {
+	if served, outcome, status, body, validation := h.tryCacheHit(w, r, req, start, sr); served {
 		if outcome == "" {
 			outcome = "hit"
 		}
@@ -413,7 +447,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Miss: SPEC §6.2.
-	h.serveCacheMiss(w, r, req, start)
+	h.serveCacheMiss(w, r, req, start, sr)
 }
 
 // tryCacheHit attempts to serve from disk. Returns served=true if the
@@ -444,9 +478,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // The fast path on every successful return is one DB read, one stat, one
 // open(2), and one ServeContent — order-of-microseconds.
-func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, outcome string, status int, bytesWritten int64, validation packageValidation) {
+func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time, sr *suiteReq) (served bool, outcome string, status int, bytesWritten int64, validation packageValidation) {
 	if req.IsMetadata && req.SuitePath != "" {
-		if served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start); handled {
+		if served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start, sr); handled {
 			return served, "", status, body, packageValidation{SnapshotDisplaced: displaced}
 		}
 	}
@@ -494,7 +528,7 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 // re-fetch validated against that hash is as safe as the original
 // adoption fetch. SPEC2 §6.2 names this as the local-fault recovery
 // path. serveSnapshotMemberMiss owns it.
-func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, status int, bytesWritten int64, handled, displaced bool) {
+func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time, sr *suiteReq) (served bool, status int, bytesWritten int64, handled, displaced bool) {
 	suite, err := h.cache.GetSuiteFreshness(r.Context(),
 		req.CanonicalScheme, req.CanonicalHost, req.SuitePath)
 	switch {
@@ -502,6 +536,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		// Suite has never been seen — pre-Phase-2 regime. Falling through
 		// to url_path is safe because no §6.1 contract has been
 		// established for this (host, suite).
+		sr.tracked = false
 		return false, 0, 0, false, false
 	case err != nil:
 		h.logger.Warn("suite_freshness lookup failed",
@@ -511,6 +546,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		)
 		return h.writeFailClosed(w, "suite lookup failed"), http.StatusBadGateway, 0, true, false
 	}
+	sr.tracked = true
 	if suite.CurrentSnapshotID == nil {
 		// Suite known but never adopted — pre-Phase-2 regime.
 		return false, 0, 0, false, false
@@ -1140,16 +1176,8 @@ func (h *Handler) maybeFireFreshness(req *proxy.Request) {
 		// daemon. This recover runs before Done, so Close still drains.
 		defer func() {
 			if r := recover(); r != nil {
-				attrs := []any{
-					"where", "t1",
-					"canonical_host", req.CanonicalHost,
-					"suite_path", req.SuitePath,
-					"panic", fmt.Sprint(r),
-				}
-				if t1PanicStackLogged.CompareAndSwap(false, true) {
-					attrs = append(attrs, "stack", string(debug.Stack()))
-				}
-				h.logger.Error("freshness_check_panicked", attrs...)
+				h.logGoroutinePanic("freshness_check_panicked", &t1PanicStackLogged, r,
+					"where", "t1", "canonical_host", req.CanonicalHost, "suite_path", req.SuitePath)
 			}
 		}()
 		h.freshness.Check(h.lifecycleCtx, req.CanonicalScheme, req.CanonicalHost, req.SuitePath)
@@ -1159,10 +1187,46 @@ func (h *Handler) maybeFireFreshness(req *proxy.Request) {
 // t1PanicStackLogged limits the T1 panic stack to one per process (spec C5).
 var t1PanicStackLogged atomic.Bool
 
+// logGoroutinePanic logs a recovered panic of a handler goroutine as
+// event, with the stack the first time stackOnce is claimed in this
+// process (one flag per where: the T1 check, the cap-rejection sweep, the
+// touch goroutine).
+func (h *Handler) logGoroutinePanic(event string, stackOnce *atomic.Bool, v any, attrs ...any) {
+	attrs = append(attrs, "panic", fmt.Sprint(v))
+	if stackOnce.CompareAndSwap(false, true) {
+		attrs = append(attrs, "stack", string(debug.Stack()))
+	}
+	h.logger.Error(event, attrs...)
+}
+
 // flipHeldKey carries, in a request's context, how long it waited in a
-// spec C8 flip hold (a time.Duration); ServeHTTP sets it, the request line
-// logs it as flip_held_ms.
+// spec C8 flip hold (a time.Duration); heldContext sets it, the request
+// line logs it as flip_held_ms.
 type flipHeldKey struct{}
+
+// heldContext records a flip-barrier registration's wait in a hold in r's
+// context, for the request line's flip_held_ms (no wait, or a nil token:
+// r unchanged).
+func heldContext(r *http.Request, t *flipgate.Token) *http.Request {
+	if held := t.Held(); held > 0 {
+		return r.WithContext(context.WithValue(r.Context(), flipHeldKey{}, held))
+	}
+	return r
+}
+
+// clientLeft answers a request whose context ended — its client left
+// while it waited in a flip hold; the gate did not register it — as a
+// client abort (503) and reports it; the caller logs client_canceled.
+// Serving it would only fail its snapshot read: a WARN and a 502 "hit"
+// line (design review M1, for the entry and the late registrations).
+func clientLeft(w http.ResponseWriter, r *http.Request) bool {
+	if r.Context().Err() == nil {
+		return false
+	}
+	w.Header().Set("Retry-After", "5")
+	http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+	return true
+}
 
 // anchorStart is spec C8's handler side. For <suite>/InRelease and
 // <suite>/Release of a suite with a suite_freshness row it registers the
@@ -1222,9 +1286,10 @@ func (h *Handler) touchAsync(req *proxy.Request) {
 
 // serveCacheMiss runs the singleflight fetch and serves the cached file
 // (or an error response) afterward.
-func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) {
+func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time, sr *suiteReq) {
 	key := req.CanonicalScheme + "|" + req.CanonicalHost + "|" + req.Path
 
+	file, trackedAtStart := sr.file, sr.tracked
 	res, shared, waiters := h.sf.Do(key, func() sfResult {
 		// Use the handler's lifecycle ctx, not the request ctx. Two
 		// goals: (1) a leader who disconnects must not kill the fetch
@@ -1234,7 +1299,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 		// fetch.TotalTimeout. Without this, a hung upstream would
 		// keep the cache from closing for several minutes after the
 		// drain budget elapses.
-		return h.runFetch(h.lifecycleCtx, req)
+		return h.runFetch(h.lifecycleCtx, req, file, trackedAtStart)
 	})
 
 	// SPEC §10: leader emits a structured log line whenever waiters
@@ -1251,6 +1316,43 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	if res.err != nil {
 		h.respondError(w, r, req, res, start)
 		return
+	}
+	outcome, logOutcome := cacheMiss, "miss"
+	if shared {
+		outcome, logOutcome = cacheCoalesced, "hit_coalesced"
+	}
+	if res.suiteTracked {
+		sr.tracked = true
+	}
+	// Phase C carry-forward: the serve of an anchor whose suite row this
+	// miss created (or found created by a concurrent request) registers
+	// with the flip barrier right after the creation, before anything else
+	// (ruling PD-5). A registration that waited in a hold serves what is
+	// current now — the flip may have committed a snapshot (design note
+	// 9) — and its line keeps the miss's outcome, fetch and upstream status;
+	// a client that left while it waited is a client abort (design review
+	// M1).
+	if t := h.registerLate(r, req, sr); t != nil {
+		if r = heldContext(r, t); clientLeft(w, r) {
+			h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, true, res.status, start)
+			return
+		}
+		if t.Held() > 0 {
+			if served, hitOutcome, status, body, v := h.tryCacheHit(w, r, req, start, sr); served {
+				if hitOutcome == "" {
+					hitOutcome = logOutcome
+				}
+				h.logRequestWithValidation(r, req.CanonicalHost, req.Path, hitOutcome, status, body, true, res.status, start, v)
+				return
+			}
+		}
+	}
+	if res.unproven && !shared {
+		// The creation's transaction could not prove a cached anchor that
+		// changed after it was sniffed: mark it now (the backstop).
+		bctx, cancel := context.WithTimeout(h.lifecycleCtx, 30*time.Second)
+		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
+		cancel()
 	}
 
 	hash := res.blobHash
@@ -1276,12 +1378,6 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 		return
 	}
 
-	outcome := cacheMiss
-	logOutcome := "miss"
-	if shared {
-		outcome = cacheCoalesced
-		logOutcome = "hit_coalesced"
-	}
 	w.Header().Set(hdrXCache, outcome)
 	w.Header().Set(hdrXCacheAge, "0")
 	if res.status > 0 {
@@ -1551,7 +1647,7 @@ func (h *Handler) respondRecoveryError(w http.ResponseWriter, r *http.Request, r
 // trySnapshotHit fails closed before metadata can reach runFetch on an
 // adopted suite. Metadata on non-adopted suites is the Phase 1 trust-
 // upstream path with no snapshot to validate against.
-func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
+func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath.SuiteFile, trackedAtStart bool) sfResult {
 	release, err := h.sem.Acquire(ctx, req.CanonicalHost)
 	if err != nil {
 		return sfResult{err: fmt.Errorf("handler: acquire host slot: %w", err)}
@@ -1792,46 +1888,46 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 		lm := fres.LastModified
 		row.UpstreamLastMod = &lm
 	}
-	if err := h.cache.PutURLPath(dbCtx, row); err != nil {
+	// Spec C3: one writer operation stores the url_path row and, for a
+	// suite file whose body passes its sniff, creates the suite's row
+	// (InRelease always; Release and flat indexes with an adopter wired)
+	// with the markers its cached signed anchors earn (ruling PD-5),
+	// re-stamps it on an adoption-disabled refresh miss (ruling PD-6), and
+	// writes the signed-seen marker of a signed anchor (InRelease,
+	// Release.gpg) — before the body is served. A failed operation fails
+	// the miss (502, no body) as a url_path write failure always has, so a
+	// signed anchor body is never served before its base has a marker.
+	// A suite row created here — the scheduler scans suite_freshness —
+	// replaces the old InRelease seed.
+	//
+	// AIDEV-NOTE: the sniff reads the finalized pool file (SniffReleaseGPG
+	// requires a binary signature's version byte: ruling PD-10). Phase E's
+	// T1-on-seed keys on stored.Create.Outcome == cache.SuiteCreated;
+	// stored.Tracked is what the late flip-barrier registration uses.
+	sr := &suiteReq{key: suiteKeyOf(req), file: file}
+	fetched := cache.FetchedRow{Row: row}
+	if file != aptpath.NotSuiteFile {
+		fetched.Suite = sr.key
+		head, herr := readHead(h.cache.BlobPath(hash), file.HeadBytes())
+		if herr == nil && file.Sniff(req.Path, head) {
+			if file.Marks() {
+				fetched.MarkSeenAt = now
+			}
+			if !trackedAtStart && file.CreatesRow(h.adoptionEnabled) && !h.rejections.rejected(sr.key) {
+				fetched.Create = h.suiteSeed(sr, true, fres.ETag, fres.LastModified, now)
+				fetched.Create.Cached = h.cachedAnchors(dbCtx, sr.key, req.Path)
+			}
+			if file == aptpath.FileInRelease && !h.adoptionEnabled {
+				fetched.Restamp = h.suiteSeed(sr, true, fres.ETag, fres.LastModified, now)
+			}
+		}
+	}
+	stored, err := h.cache.StoreFetched(dbCtx, fetched, h.suiteCaps(), h.suiteGuard)
+	if err != nil {
 		return sfResult{err: fmt.Errorf("handler: put url row: %w", err), status: fres.Status}
 	}
-
-	// Seed suite_freshness on a successful InRelease miss. Without
-	// this, a freshly-cached suite is invisible to the periodic
-	// scheduler (which scans suite_freshness, not url_path) until the
-	// first cache-hit T1 fires — and that first T1 has no validators,
-	// so it does an unconditional GET when a 304 was achievable.
-	// Seed failures are non-fatal (the file IS cached); we just lose
-	// the periodic-scheduler benefit until the next miss/T1. CreateSuite
-	// is create-only (spec C3): until this seed moves into StoreFetched,
-	// whose UPDATE-only re-stamp restores today's refresh miss, a refresh
-	// miss leaves an existing row as it is.
-	if req.IsMetadata && req.SuitePath != "" && req.Path == req.SuitePath+inReleaseSuffix {
-		seed := cache.SuiteSeed{
-			SuiteKey: cache.SuiteKey{
-				CanonicalScheme: req.CanonicalScheme,
-				CanonicalHost:   req.CanonicalHost,
-				SuitePath:       req.SuitePath,
-			},
-			LastCheckAt:   &now,
-			LastSuccessAt: &now,
-			RequestedAt:   now,
-		}
-		if fres.ETag != "" {
-			etag := fres.ETag
-			seed.InReleaseETag = &etag
-		}
-		if fres.LastModified != "" {
-			lm := fres.LastModified
-			seed.InReleaseLastMod = &lm
-		}
-		if _, err := h.cache.CreateSuite(dbCtx, seed, cache.SuiteCaps{}, nil); err != nil {
-			h.logger.Warn("seed suite_freshness failed",
-				"err", err,
-				"canonical_host", req.CanonicalHost,
-				"suite_path", req.SuitePath,
-			)
-		}
+	if fetched.Create != nil {
+		h.noteCreate(sr.key, stored.Create)
 	}
 
 	return sfResult{
@@ -1840,13 +1936,13 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 		status:        fres.Status,
 		validatedHash: validatedHash,
 		packageName:   packageName,
+		suiteTracked:  stored.Tracked,
+		unproven:      stored.Create.Outcome == cache.SuiteCreated && stored.Create.Unproven,
 	}
 }
 
 // inReleaseSuffix is the path suffix that identifies the InRelease
-// file under a suite path. Kept as a package constant so the same
-// literal is used for the seed-detection check above and (in the
-// freshness package) the check itself.
+// file under a suite path (anchorStart's anchor test).
 const inReleaseSuffix = "/InRelease"
 
 // releaseSuffix is the detached form's anchor under a suite path; spec C8

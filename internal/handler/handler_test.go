@@ -872,10 +872,10 @@ func newTestHandlerWithFreshness(t *testing.T, fc FreshnessChecker) *Handler {
 }
 
 // TestServeHTTP_MissOnInReleaseSeedsFreshness asserts the codex fix:
-// after a successful miss-fetch of a suite's InRelease, the cache
-// upserts a suite_freshness row carrying the upstream validators —
-// so the periodic scheduler picks the suite up immediately and the
-// first follow-up freshness check can issue a real conditional GET
+// after a successful miss-fetch of a suite's (clearsigned, spec C3 sniff)
+// InRelease, the cache creates a suite_freshness row carrying the upstream
+// validators — so the periodic scheduler picks the suite up immediately
+// and the first follow-up freshness check can issue a real conditional GET
 // (instead of an unconditional one because validators are nil).
 func TestServeHTTP_MissOnInReleaseSeedsFreshness(t *testing.T) {
 	body := simtest.ClearsignedFixture("Origin: Ubuntu\nSuite: noble\n")

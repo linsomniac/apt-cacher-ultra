@@ -21,6 +21,13 @@ type sfResult struct {
 	err           error
 	validatedHash bool
 	packageName   string
+	// suiteTracked: the request's suite has a row after the miss's writer
+	// operation (spec C3).
+	suiteTracked bool
+	// unproven: the miss created its suite's row, but a cached signed
+	// anchor changed after it was sniffed (cache.CreateResult.Unproven);
+	// the leader runs markCachedSignedAnchors after its late registration.
+	unproven bool
 }
 
 // sfCall is a single in-flight singleflight call. The leader populates
