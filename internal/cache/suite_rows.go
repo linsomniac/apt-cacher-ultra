@@ -171,6 +171,19 @@ type ClockStepReporter interface {
 type heldSuite struct {
 	key     SuiteKey
 	release func(deleted bool)
+	// settled: settle has run. Only the creating goroutine touches it.
+	settled bool
+}
+
+// settle releases the hold once (SuiteGuard: release exactly once); later
+// calls do nothing. It is marked settled before release runs, so a release
+// that panics is never called again.
+func (h *heldSuite) settle(deleted bool) {
+	if h.settled {
+		return
+	}
+	h.settled = true
+	h.release(deleted)
 }
 
 // CreateSuite is spec C3's single creation choke point, for a suite the
@@ -192,47 +205,86 @@ type heldSuite struct {
 // that work, off the request path). The guard is taken before the writer
 // operation is submitted — the writer goroutine never runs foreign code.
 func (c *Cache) CreateSuite(ctx context.Context, seed SuiteSeed, caps SuiteCaps, guard SuiteGuard) (CreateResult, error) {
-	res, err := c.createSuiteOnce(ctx, seed, caps, guard)
+	attempt := func() (CreateResult, error) {
+		r, err := c.creationAttempt(ctx, "CreateSuite", &seed, caps, guard,
+			func(ctx context.Context, tx *sql.Tx, held *heldSuite) (FetchedResult, error) {
+				cr, err := createSuiteTx(ctx, tx, seed, caps, held, nowUnix())
+				return FetchedResult{Create: cr}, err
+			})
+		return r.Create, err
+	}
+	res, err := attempt()
 	if err == nil && res.heldGone {
 		// The held candidate's row was deleted between the candidate list
 		// and the writer (a concurrent creation evicted it): one more
 		// attempt, with a fresh list (design review M4).
-		res, err = c.createSuiteOnce(ctx, seed, caps, guard)
+		res, err = attempt()
 	}
 	return res, err
 }
 
-// createSuiteOnce is one CreateSuite attempt: hold a candidate, run the
-// writer operation, release the candidate.
-func (c *Cache) createSuiteOnce(ctx context.Context, seed SuiteSeed, caps SuiteCaps, guard SuiteGuard) (CreateResult, error) {
-	held, err := c.holdEvictionCandidate(ctx, caps, guard)
-	if err != nil {
-		return CreateResult{}, err
+// creationAttempt is one attempt of a row creation — the lifecycle
+// CreateSuite (hits) and StoreFetched (misses) share: when create is set,
+// hold an eviction candidate (holdEvictionCandidate); run body in one
+// writer transaction with it; then settle the candidate exactly once
+// (afterCreate) — after a commit, after a failed submit, or on a panic.
+// op names the caller in errors. With create nil nothing is held or
+// settled.
+//
+// AIDEV-NOTE: the release-exactly-once protocol lives here alone (Task 6
+// minor 5; final review, concurrency M1). A held candidate's hold is the
+// checker's suite mutex: one leaked by a panic would leave that suite
+// unchecked, unadopted and unevictable until a restart. So a panic
+// between the hold and the settle releases it as not deleted (its
+// lock-map and flip-gate entries then stay, one each, as after
+// afterCreate's read error) and continues. Never read got after an
+// error: on a ctx/close path the op may still be running (see
+// InsertCandidateSnapshot).
+func (c *Cache) creationAttempt(ctx context.Context, op string, create *SuiteSeed, caps SuiteCaps, guard SuiteGuard,
+	body func(ctx context.Context, tx *sql.Tx, held *heldSuite) (FetchedResult, error)) (FetchedResult, error) {
+	var held *heldSuite
+	if create != nil {
+		h, err := c.holdEvictionCandidate(ctx, caps, guard)
+		if err != nil {
+			return FetchedResult{}, err
+		}
+		held = h
 	}
-	var got CreateResult
-	err = c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	if held != nil {
+		// A no-op once afterCreate settled the hold; on a panic it releases
+		// it as not deleted, and the panic continues.
+		defer held.settle(false)
+		if c.heldHook != nil {
+			c.heldHook(held.key)
+		}
+	}
+	var got FetchedResult
+	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
-			return fmt.Errorf("CreateSuite: begin: %w", err)
+			return fmt.Errorf("%s: begin: %w", op, err)
 		}
 		defer func() { _ = tx.Rollback() }()
-		r, err := createSuiteTx(ctx, tx, seed, caps, held, nowUnix())
+		r, err := body(ctx, tx, held)
 		if err != nil {
 			return err
 		}
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("CreateSuite: commit: %w", err)
+			return fmt.Errorf("%s: commit: %w", op, err)
 		}
 		got = r
 		return nil
 	})
-	if err != nil {
-		// Never read got after an error: on a ctx/close path the op may
-		// still be running (see InsertCandidateSnapshot).
-		c.afterCreate(seed.SuiteKey, CreateResult{}, held)
-		return CreateResult{}, err
+	if create != nil {
+		var res CreateResult // unknown after an error: afterCreate reads the row
+		if err == nil {
+			res = got.Create
+		}
+		c.afterCreate(create.SuiteKey, res, held)
 	}
-	c.afterCreate(seed.SuiteKey, got, held)
+	if err != nil {
+		return FetchedResult{}, err
+	}
 	return got, nil
 }
 
@@ -268,7 +320,7 @@ func (c *Cache) afterCreate(key SuiteKey, res CreateResult, held *heldSuite) {
 	if gone {
 		c.forgetTouch(held.key)
 	}
-	held.release(gone)
+	held.settle(gone)
 }
 
 // suiteRowGone reports whether key's row is absent, read under a fresh

@@ -302,6 +302,47 @@ func TestCreateSuite_AFailedSubmitReleasesItsCandidate(t *testing.T) {
 	}
 }
 
+// Final review, concurrency M1: a panic between the hold and the settle —
+// injected right after the hold, through the test seam — still releases
+// the held candidate, once, as not deleted, and continues to the caller.
+// CreateSuite (onboarding) and StoreFetched (a miss) share the lifecycle.
+func TestCreateSuite_APanicReleasesTheHeldCandidate(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	fourRows(t, c)
+	c.heldHook = func(SuiteKey) { panic("boom") }
+	seed := SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}
+	row := fetchedRow(t, c, seed.SuiteKey, "/InRelease")
+	for _, tc := range []struct {
+		name   string
+		create func(g *fakeGuard)
+	}{
+		{"CreateSuite", func(g *fakeGuard) {
+			_, _ = c.CreateSuite(context.Background(), seed, SuiteCaps{Global: 4}, g)
+		}},
+		{"StoreFetched", func(g *fakeGuard) {
+			_, _ = c.StoreFetched(context.Background(), FetchedRow{Row: row, Suite: seed.SuiteKey, Create: &seed},
+				SuiteCaps{Global: 4}, g)
+		}},
+	} {
+		g := newFakeGuard()
+		func() {
+			defer func() {
+				if v := recover(); v != "boom" {
+					t.Errorf("%s: recovered %v, want the panic to continue to the caller", tc.name, v)
+				}
+			}()
+			tc.create(g)
+		}()
+		if got := g.released[sk("b", "/idle")]; !slices.Equal(got, []bool{false}) {
+			t.Errorf("%s: released %v; want b/idle released once, as not deleted", tc.name, g.released)
+		}
+	}
+	if !rowExists(t, c, sk("b", "/idle")) || rowExists(t, c, seed.SuiteKey) {
+		t.Fatal("a creation that panicked before its writer operation evicted or created a row")
+	}
+}
+
 // Design review M4: a held candidate whose row a concurrent creation
 // evicted before this one held it (here: deleted inside HoldSuite, the
 // table refilled behind it) is released as gone — its in-memory state is

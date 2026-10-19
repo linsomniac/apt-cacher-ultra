@@ -55,94 +55,70 @@ type FetchedResult struct {
 // operation runs after it, and its in-transaction marker re-read (phase E)
 // sees the marker (TestStoreFetched_MarkerPrecedesALaterWriterOperation).
 func (c *Cache) StoreFetched(ctx context.Context, m FetchedRow, caps SuiteCaps, guard SuiteGuard) (FetchedResult, error) {
-	res, err := c.storeFetchedOnce(ctx, m, caps, guard)
+	attempt := func() (FetchedResult, error) {
+		return c.creationAttempt(ctx, "StoreFetched", m.Create, caps, guard,
+			func(ctx context.Context, tx *sql.Tx, held *heldSuite) (FetchedResult, error) {
+				return storeFetchedTx(ctx, tx, m, caps, held)
+			})
+	}
+	res, err := attempt()
 	if err == nil && res.Create.heldGone {
 		// The held candidate was evicted by a concurrent creation first:
 		// one more attempt with a fresh list (the url_path upsert repeats
 		// harmlessly).
-		res, err = c.storeFetchedOnce(ctx, m, caps, guard)
+		res, err = attempt()
 	}
 	return res, err
 }
 
-// storeFetchedOnce is one StoreFetched attempt.
-func (c *Cache) storeFetchedOnce(ctx context.Context, m FetchedRow, caps SuiteCaps, guard SuiteGuard) (FetchedResult, error) {
-	var held *heldSuite
-	if m.Create != nil {
-		h, err := c.holdEvictionCandidate(ctx, caps, guard)
-		if err != nil {
-			return FetchedResult{}, err
-		}
-		held = h
-	}
+// storeFetchedTx is one StoreFetched attempt's transaction body
+// (creationAttempt runs it on the writer, with the held candidate).
+func storeFetchedTx(ctx context.Context, tx *sql.Tx, m FetchedRow, caps SuiteCaps, held *heldSuite) (FetchedResult, error) {
 	isMD := int64(0)
 	if m.Row.IsMetadata {
 		isMD = 1
 	}
-	var got FetchedResult
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		tx, err := conn.BeginTx(ctx, nil)
+	u := m.Row
+	if _, err := tx.ExecContext(ctx, putURLPathSQL,
+		u.CanonicalScheme, u.CanonicalHost, u.Path, u.BlobHash, u.UpstreamURL,
+		isMD, u.LastRequestedAt, u.RequestCount, u.LastFetchedAt,
+		u.UpstreamETag, u.UpstreamLastMod); err != nil {
+		return FetchedResult{}, fmt.Errorf("StoreFetched: url_path: %w", err)
+	}
+	var r FetchedResult
+	if m.Create != nil {
+		cr, err := createSuiteTx(ctx, tx, *m.Create, caps, held, nowUnix())
 		if err != nil {
-			return fmt.Errorf("StoreFetched: begin: %w", err)
+			return FetchedResult{}, err
 		}
-		defer func() { _ = tx.Rollback() }()
-		u := m.Row
-		if _, err := tx.ExecContext(ctx, putURLPathSQL,
-			u.CanonicalScheme, u.CanonicalHost, u.Path, u.BlobHash, u.UpstreamURL,
-			isMD, u.LastRequestedAt, u.RequestCount, u.LastFetchedAt,
-			u.UpstreamETag, u.UpstreamLastMod); err != nil {
-			return fmt.Errorf("StoreFetched: url_path: %w", err)
+		r.Create = cr
+	}
+	if m.Restamp != nil && r.Create.Outcome != SuiteCreated {
+		if err := restampSuiteTx(ctx, tx, *m.Restamp); err != nil {
+			return FetchedResult{}, err
 		}
-		var r FetchedResult
-		if m.Create != nil {
-			cr, err := createSuiteTx(ctx, tx, *m.Create, caps, held, nowUnix())
-			if err != nil {
-				return err
-			}
-			r.Create = cr
-		}
-		if m.Restamp != nil && r.Create.Outcome != SuiteCreated {
-			if err := restampSuiteTx(ctx, tx, *m.Restamp); err != nil {
-				return err
-			}
-		}
-		if m.Suite != (SuiteKey{}) {
-			var one int
-			err := tx.QueryRowContext(ctx, `
+	}
+	if m.Suite != (SuiteKey{}) {
+		var one int
+		err := tx.QueryRowContext(ctx, `
 SELECT 1 FROM suite_freshness
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
-				m.Suite.CanonicalScheme, m.Suite.CanonicalHost, m.Suite.SuitePath).Scan(&one)
-			switch {
-			case err == nil:
-				r.Tracked = true
-			case !errors.Is(err, sql.ErrNoRows):
-				return fmt.Errorf("StoreFetched: read suite row: %w", err)
-			}
+			m.Suite.CanonicalScheme, m.Suite.CanonicalHost, m.Suite.SuitePath).Scan(&one)
+		switch {
+		case err == nil:
+			r.Tracked = true
+		case !errors.Is(err, sql.ErrNoRows):
+			return FetchedResult{}, fmt.Errorf("StoreFetched: read suite row: %w", err)
 		}
-		if m.MarkSeenAt != 0 && r.Tracked {
-			if err := markSignedSeen(ctx, tx, m.Suite.CanonicalScheme, m.Suite.CanonicalHost,
-				aptpath.MarkerBase(m.Suite.SuitePath), m.MarkSeenAt); err != nil {
-				return fmt.Errorf("StoreFetched: %w", err)
-			}
-			r.Marked = true
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("StoreFetched: commit: %w", err)
-		}
-		got = r
-		return nil
-	})
-	if err != nil {
-		// Never read got after an error (see CreateSuite).
-		if m.Create != nil {
-			c.afterCreate(m.Create.SuiteKey, CreateResult{}, held)
-		}
-		return FetchedResult{}, err
 	}
-	if m.Create != nil {
-		c.afterCreate(m.Create.SuiteKey, got.Create, held)
+	if m.MarkSeenAt != 0 && r.Tracked {
+		if err := markSignedSeen(ctx, tx, m.Suite.CanonicalScheme, m.Suite.CanonicalHost,
+			aptpath.MarkerBase(m.Suite.SuitePath), m.MarkSeenAt); err != nil {
+			return FetchedResult{}, fmt.Errorf("StoreFetched: %w", err)
+		}
+		r.Marked = true
 	}
-	return got, nil
+	return r, nil
 }
 
 // restampSuiteTx is the adoption-disabled refresh miss's re-stamp (ruling

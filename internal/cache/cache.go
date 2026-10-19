@@ -46,6 +46,12 @@ type Cache struct {
 
 	// touches coalesces TouchSuite writes (spec C3).
 	touches suiteTouches
+
+	// heldHook, when set (tests only), runs on the creating goroutine right
+	// after creationAttempt holds an eviction candidate, before the writer
+	// operation: a panic there stands in for a bug between the hold and the
+	// settle (TestCreateSuite_APanicReleasesTheHeldCandidate).
+	heldHook func(SuiteKey)
 }
 
 // Open initializes (or attaches to) the cache rooted at dir. Creates

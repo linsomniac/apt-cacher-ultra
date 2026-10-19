@@ -1,6 +1,13 @@
 package handler
 
-import "sync"
+import (
+	"errors"
+	"sync"
+)
+
+// errSFLeaderPanicked is the result a singleflight call's waiters get when
+// its leader's fn panicked (the panic continues on the leader's goroutine).
+var errSFLeaderPanicked = errors.New("handler: the shared request's leader panicked")
 
 // sfResult is the value the leader of a singleflight call produces and
 // every waiter on the same key reads.
@@ -82,6 +89,14 @@ var sfTestHookAfterDone func()
 // coalescing guarantee. With Done first, that same caller still finds
 // the (just-finished) call in the map, joins it via wg.Wait (which
 // returns immediately), and reads the same result.
+//
+// AIDEV-NOTE: a leader whose fn panics completes its call in the deferred
+// func below (final review, concurrency M1): its waiters get
+// errSFLeaderPanicked, the key is deleted so the next caller leads, and
+// the panic continues — unrecovered here, so its original stack reaches
+// net/http's recover. Without it every waiter, and every later caller of
+// the key, would block in wg.Wait for good, and Handler.Close
+// (activeWG.Wait) would hang at shutdown.
 func (g *sfGroup) Do(key string, fn func() sfResult) (res sfResult, shared bool, waiters int) {
 	g.mu.Lock()
 	if c, ok := g.calls[key]; ok {
@@ -95,7 +110,19 @@ func (g *sfGroup) Do(key string, fn func() sfResult) (res sfResult, shared bool,
 	g.calls[key] = c
 	g.mu.Unlock()
 
+	returned := false
+	defer func() {
+		if returned {
+			return
+		}
+		c.res = sfResult{err: errSFLeaderPanicked}
+		c.wg.Done()
+		g.mu.Lock()
+		delete(g.calls, key)
+		g.mu.Unlock()
+	}()
 	c.res = fn()
+	returned = true
 	c.wg.Done()
 	if hook := sfTestHookAfterDone; hook != nil {
 		hook()

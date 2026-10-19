@@ -630,6 +630,73 @@ func TestSFGroup_ArrivalDuringCleanupWindow(t *testing.T) {
 	}
 }
 
+// Final review, concurrency M1: a leader whose fn panics completes its
+// call on the way out — its waiters get an error result instead of
+// blocking for good (and holding Handler.Close), the key is freed so a
+// later Do runs fn again, and the panic continues to the leader's caller
+// (net/http recovers it).
+func TestSFGroup_PanickingLeaderReleasesItsWaiters(t *testing.T) {
+	g := newSFGroup()
+	const key = "onboard|http|h|/dists/s"
+	inFn, release := make(chan struct{}), make(chan struct{})
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }() // what net/http does for the leader
+		g.Do(key, func() sfResult {
+			close(inFn)
+			<-release
+			panic("boom")
+		})
+	}()
+	<-inFn
+	waiter := make(chan sfResult, 1)
+	go func() {
+		res, _, _ := g.Do(key, func() sfResult {
+			t.Error("the waiter ran fn; want it to join the leader's call")
+			return sfResult{}
+		})
+		waiter <- res
+	}()
+	for deadline := time.Now().Add(5 * time.Second); sfWaiters(g, key) != 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the waiter never joined the leader's call")
+		}
+	}
+	close(release)
+	select {
+	case v := <-panicked:
+		if v != "boom" {
+			t.Fatalf("the leader's caller recovered %v, want the panic to continue", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the leader never returned")
+	}
+	select {
+	case res := <-waiter:
+		if res.err == nil {
+			t.Fatalf("waiter result %+v, want an error", res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiter is still blocked 5 s after the leader panicked: the key is wedged")
+	}
+	next := make(chan sfResult, 1)
+	go func() {
+		res, shared, _ := g.Do(key, func() sfResult { return sfResult{blobHash: "next"} })
+		if shared {
+			t.Error("a later Do joined the dead call")
+		}
+		next <- res
+	}()
+	select {
+	case res := <-next:
+		if res.blobHash != "next" {
+			t.Fatalf("later Do = %+v, want its own fn's result", res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a later Do on the key is still blocked 5 s after the leader panicked")
+	}
+}
+
 // TestServeHTTP_DisallowedHostShortCircuits asserts the handler's
 // pre-fetch allowlist check rejects unknown hosts before allocating any
 // per-host bookkeeping. This is the open-proxy DoS hardening from
