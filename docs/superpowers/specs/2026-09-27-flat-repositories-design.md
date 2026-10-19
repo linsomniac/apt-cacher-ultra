@@ -742,7 +742,10 @@ SHA256 makes coverage incomplete (reason `no_sha256`), never a silent drop.
 Limitation (documented): integrity-skipped SHA512-only members are not
 recorded for skip-repair; reconcile still heals requestable IndexTargets.
 SHA512 is verified before the bytes reach the pool; a SHA512-only member
-is never reused from the pool (which is keyed by SHA256); a pooled blob
+is never reused from the pool without a fetch (the pool is keyed by SHA256),
+and once its fetched bytes verified, an existing pool file under their
+SHA256 is re-hashed before it is kept and evicted when corrupt
+(`pool_corruption_during_adoption`), as for any reused member; a pooled blob
 whose SHA256 matches but whose SHA512 does not fails the member; a
 malformed or conflicting SHA512 entry fails the parse; repair recovers
 the declared hashes from the snapshot's Release; the by-hash probe uses

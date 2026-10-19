@@ -1,18 +1,23 @@
 package freshness
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha512"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
@@ -137,7 +142,7 @@ func TestVerifyMember(t *testing.T) {
 			if _, err := w.Write(body); err != nil {
 				t.Fatal(err)
 			}
-			got, err := verifyMember(w, c.m, int64(len(body)))
+			got, err := verifyMember(w, c.m, int64(len(body)), nil)
 			exists, xerr := env.cache.BlobExists(shaOf(body))
 			if xerr != nil {
 				t.Fatal(xerr)
@@ -178,7 +183,7 @@ func TestMemberWriter_TruncateRestartsBothHashes(t *testing.T) {
 	if _, err := w.Write(body); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := verifyMember(w, ReleaseMember{Path: "p", SHA512: sha512Of(body)}, int64(len(body))); err != nil || got != shaOf(body) {
+	if got, err := verifyMember(w, ReleaseMember{Path: "p", SHA512: sha512Of(body)}, int64(len(body)), nil); err != nil || got != shaOf(body) {
 		t.Fatalf("after Truncate: %q, %v; want the real bytes verified", got, err)
 	}
 }
@@ -269,6 +274,61 @@ func TestAdopter_SHA512OnlyReleaseAdopts(t *testing.T) {
 	}
 }
 
+// Spec C5 "Hash blocks" (review fix round 1, Task 2 controller addition):
+// a Packages stanza with a Filename but no SHA256 — reachable now that
+// SHA512-only Releases adopt — vouches nothing and makes the snapshot's
+// coverage incomplete (package_coverage_incomplete, reason no_sha256),
+// never a silent drop that a strict host would turn into refusals while
+// reporting complete coverage. The stanzas that declare a SHA256 still
+// vouch. Without such a stanza coverage is complete.
+func TestAdopter_StanzaWithoutSHA256MakesCoverageIncomplete(t *testing.T) {
+	for _, withGap := range []bool{true, false} {
+		t.Run(map[bool]string{true: "no_sha256 stanza", false: "every stanza has a SHA256"}[withGap], func(t *testing.T) {
+			env := newAdoptionTestEnv(t)
+			var logs lockedBuffer
+			env.adopter.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			ctx := context.Background()
+			pkgs := fakePackagesStanzas(map[string]string{"pool/main/g/good_1_amd64.deb": testHex64})
+			if withGap {
+				pkgs = append(pkgs, []byte("Package: nosha\nArchitecture: amd64\nVersion: 1\n"+
+					"Filename: pool/main/n/nosha_1_amd64.deb\nSize: 10\nSHA512: "+strings.Repeat("a", 128)+"\n\n")...)
+			}
+			env.fetcher.put(noble+"main/binary-amd64/Packages", pkgs)
+			rel := hashRelease("Origin: x\n", false, true, map[string][]byte{"main/binary-amd64/Packages": pkgs}, nil)
+			if err := env.adopter.Run(ctx, env.suite, simtest.ClearsignedFixture(string(rel)), "", ""); err != nil {
+				t.Fatal(err)
+			}
+			snap, err := env.cache.GetSuiteSnapshot(ctx, currentID(t, env.cache, env.suite))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if snap.PackageCoverageComplete == withGap {
+				t.Errorf("package_coverage_complete = %v, want %v", snap.PackageCoverageComplete, !withGap)
+			}
+			if rows, err := env.cache.DeclaredHashesForPath(ctx, "http", "archive.ubuntu.com", "/ubuntu/pool/main/g/good_1_amd64.deb"); err != nil ||
+				len(rows) != 1 || rows[0].DeclaredSHA256 != testHex64 {
+				t.Errorf("the stanza with a SHA256 is not vouched: %v, %v", rows, err)
+			}
+			if rows, err := env.cache.DeclaredHashesForPath(ctx, "http", "archive.ubuntu.com", "/ubuntu/pool/main/n/nosha_1_amd64.deb"); err != nil || len(rows) != 0 {
+				t.Errorf("the stanza without a SHA256 vouches %v (%v), want nothing", rows, err)
+			}
+			var gaps []map[string]any
+			for _, r := range logRecords(t, &logs, "package_coverage_incomplete") {
+				if r["reason"] == "no_sha256" {
+					gaps = append(gaps, r)
+				}
+			}
+			switch {
+			case !withGap && len(gaps) != 0:
+				t.Errorf("no_sha256 logged for a complete index: %v", gaps)
+			case withGap && (len(gaps) != 1 || gaps[0]["level"] != "INFO" || gaps[0]["no_sha256_stanzas"] != float64(1) ||
+				gaps[0]["snapshot_id"] != float64(snap.SnapshotID)):
+				t.Errorf("package_coverage_incomplete reason no_sha256 = %v, want one INFO line naming the snapshot and 1 stanza", gaps)
+			}
+		})
+	}
+}
+
 // Spec C5: the fetched bytes are verified against every declared hash: a
 // dual-hash Release whose SHA512 (or SHA256) entry is forged fails the
 // member — an IndexTarget, so the adoption — and the bytes never reach
@@ -307,6 +367,123 @@ func TestAdopter_VerifiesEveryDeclaredHash(t *testing.T) {
 				t.Fatal("bytes that failed a declared hash reached the pool")
 			}
 		})
+	}
+}
+
+// poolCorruptionTotal returns acu_pool_corruption_during_adoption_total.
+func poolCorruptionTotal(t *testing.T) float64 {
+	t.Helper()
+	var buf bytes.Buffer
+	metrics.Default.Render(&buf)
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if v, ok := strings.CutPrefix(line, "acu_pool_corruption_during_adoption_total "); ok {
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return f
+		}
+	}
+	return 0
+}
+
+// SPEC2 §7.5 step 5 "rehash on reuse", for every member (review fix
+// round 1, Task 2): a pool file corrupted at rest under the SHA-256 of an
+// unchanged member is never bound to a snapshot. A dual-hash member's pool
+// file is re-hashed before the fetch; a SHA512-only member's SHA-256 is
+// known only once its fetched bytes verified, so its pool file is
+// re-hashed then, before Finalize would keep it (Finalize's dedup keeps an
+// existing pool/<hash> unread) — on the plain path and on the by-hash
+// probe. Either way the corrupt file is logged
+// (pool_corruption_during_adoption), counted, evicted and replaced by the
+// verified bytes, and the .deb is vouched by its true hash.
+func TestAdopter_PoolReuseRehashesEveryMember(t *testing.T) {
+	for _, c := range []struct {
+		name            string
+		with256, byHash bool
+	}{
+		{"dual", true, false},
+		{"sha512-only", false, false},
+		{"sha512-only by-hash", false, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			env := newAdoptionTestEnv(t)
+			var logs lockedBuffer
+			env.adopter.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			ctx := context.Background()
+			const debPath = "/ubuntu/pool/main/f/foo_1.deb"
+			pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo_1.deb": testHex64})
+			header := "Origin: x\n"
+			if c.byHash {
+				header += "Acquire-By-Hash: yes\n"
+				env.fetcher.put(noble+"main/binary-amd64/by-hash/SHA512/"+sha512Of(pkgs), pkgs)
+			} else {
+				env.fetcher.put(noble+"main/binary-amd64/Packages", pkgs)
+			}
+			members := map[string][]byte{"main/binary-amd64/Packages": pkgs}
+			rel1 := hashRelease("Date: Thu, 05 Apr 2018 16:50:03 +0000\n"+header, c.with256, true, members, nil)
+			if err := env.adopter.Run(ctx, env.suite, simtest.ClearsignedFixture(string(rel1)), "", ""); err != nil {
+				t.Fatal(err)
+			}
+			id1 := currentID(t, env.cache, env.suite)
+			// Corrupt the pooled Packages at rest: same size, the .deb's
+			// SHA256 field changed.
+			p := env.cache.BlobPath(shaOf(pkgs))
+			corrupt := bytes.Replace(pkgs, []byte(testHex64), []byte(strings.Repeat("e", 64)), 1)
+			if err := os.WriteFile(p, corrupt, 0o640); err != nil {
+				t.Fatal(err)
+			}
+			before := poolCorruptionTotal(t)
+			rel2 := hashRelease("Date: Fri, 06 Apr 2018 16:50:03 +0000\n"+header, c.with256, true, members, nil)
+			if err := env.adopter.Run(ctx, env.suite, simtest.ClearsignedFixture(string(rel2)), "", ""); err != nil {
+				t.Fatalf("second adoption: %v", err)
+			}
+			if id2 := currentID(t, env.cache, env.suite); id2 == id1 {
+				t.Fatalf("the second adoption did not flip (current %d)", id2)
+			}
+			if got, err := os.ReadFile(p); err != nil || !bytes.Equal(got, pkgs) {
+				t.Errorf("pool file = %q (%v), want the verified bytes", got, err)
+			}
+			recs := logRecords(t, &logs, "pool_corruption_during_adoption")
+			if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["path"] != "main/binary-amd64/Packages" ||
+				recs[0]["actual_sha256"] != shaOf(corrupt) {
+				t.Errorf("pool_corruption_during_adoption records = %v, want one WARN for the Packages member with the corrupt bytes' hash", recs)
+			}
+			if got := poolCorruptionTotal(t) - before; got < 1 {
+				t.Errorf("acu_pool_corruption_during_adoption_total grew by %v, want 1", got)
+			}
+			rows, err := env.cache.DeclaredHashesForPath(ctx, "http", "archive.ubuntu.com", debPath)
+			if err != nil || len(rows) == 0 {
+				t.Fatalf("the .deb is not vouched: %v, %v", rows, err)
+			}
+			for _, r := range rows {
+				if r.DeclaredSHA256 != testHex64 {
+					t.Errorf("the .deb is vouched as %s (snapshot %d), want %s: corrupt pool bytes were bound",
+						r.DeclaredSHA256, r.SnapshotID, testHex64)
+				}
+			}
+		})
+	}
+}
+
+// A SHA512-only member whose existing pool/<derived> cannot be re-hashed
+// (here a directory stands in the file's place) fails the adoption as a
+// local fault (ErrAdoptionDBFailed), never binding the unread pool entry
+// through Finalize's dedup.
+func TestAdopter_SHA512OnlyPoolRehashFailureIsALocalFault(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo_1.deb": testHex64})
+	env.fetcher.put(noble+"main/binary-amd64/Packages", pkgs)
+	if err := os.MkdirAll(env.cache.BlobPath(shaOf(pkgs)), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	rel := hashRelease("Origin: x\n", false, true, map[string][]byte{"main/binary-amd64/Packages": pkgs}, nil)
+	err := env.adopter.Run(context.Background(), env.suite, simtest.ClearsignedFixture(string(rel)), "", "")
+	if !errors.Is(err, ErrAdoptionDBFailed) {
+		t.Fatalf("Run = %v, want ErrAdoptionDBFailed", err)
+	}
+	if sf, gerr := env.cache.GetSuiteFreshness(context.Background(), "http", "archive.ubuntu.com", env.suite.SuitePath); gerr != nil || sf.CurrentSnapshotID != nil {
+		t.Fatalf("suite = %+v (%v), want no snapshot adopted", sf, gerr)
 	}
 }
 

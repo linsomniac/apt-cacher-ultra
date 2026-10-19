@@ -73,10 +73,23 @@ func (e *memberHashMismatch) Error() string {
 // derived one (controlling it needs a SHA-512 preimage). A hash mismatch
 // is a *memberHashMismatch; the temp is removed on every failure.
 //
+// rehashPooled is the rehash on reuse (SPEC2 §7.5 step 5) for a
+// SHA512-only member: called with the derived SHA-256 once the SHA-512
+// matched and before Finalize, it must leave no pool/<derived> whose bytes
+// are not <derived> (the adopter's rehashPooledBlob re-hashes, logs, counts
+// and evicts). An error from it fails the member with the temp removed.
+// Production callers always pass it; nil (tests only) skips the step.
+//
 // AIDEV-NOTE: never Finalize before every declared hash matched: Finalize
 // renames the temp into pool/ under its own hash, so a forged member would
-// otherwise sit in the pool as a stray blob.
-func verifyMember(w *memberWriter, m ReleaseMember, size int64) (string, error) {
+// otherwise sit in the pool as a stray blob. And never Finalize a
+// SHA512-only member before rehashPooled ran: Finalize's dedup branch
+// keeps an existing pool/<hash> unread and drops the verified temp, so a
+// file corrupted at rest would be bound to the snapshot and its Packages
+// would vouch the corrupt hashes (review fix round 1, Task 2). A member
+// that declares a SHA-256 is re-hashed in the pool before its fetch
+// (adoptMember), so it needs no hook. verifyMember itself never logs.
+func verifyMember(w *memberWriter, m ReleaseMember, size int64, rehashPooled func(derived string) error) (string, error) {
 	if m.SHA256 == "" && m.SHA512 == "" {
 		_ = w.Abort()
 		return "", fmt.Errorf("member %s declares no SHA256 or SHA512 hash", m.Path)
@@ -88,6 +101,12 @@ func verifyMember(w *memberWriter, m ReleaseMember, size int64) (string, error) 
 		}
 	}
 	if m.SHA256 == "" {
+		if rehashPooled != nil {
+			if err := rehashPooled(w.HashSum()); err != nil {
+				_ = w.Abort()
+				return "", err
+			}
+		}
 		return w.Finalize(size)
 	}
 	got, err := w.FinalizeExpectingHash(m.SHA256, size)

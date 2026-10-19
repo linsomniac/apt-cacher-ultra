@@ -33,12 +33,23 @@ type PackageRef struct {
 const MaxPackageStanzas = 1_000_000
 
 // ParsePackages parses an apt Packages file (uncompressed) and returns
-// every stanza that declares both Filename and SHA256. Stanzas missing
-// either field are silently skipped — SPEC2 §7.5 step 8 says "for each
-// pkg with Filename and SHA256." A stanza that declares both but lists
-// a malformed SHA256 (wrong length, non-hex, mixed case) is an error;
-// a corrupted-but-signed Packages file should fail adoption, not slip
-// through with a bogus row.
+// every stanza that declares both Filename and SHA256 (parsePackages
+// without its no_sha256 report). Stanzas missing either field vouch
+// nothing — SPEC2 §7.5 step 8 says "for each pkg with Filename and
+// SHA256." A stanza that declares both but lists a malformed SHA256
+// (wrong length, non-hex, mixed case) is an error; a corrupted-but-signed
+// Packages file should fail adoption, not slip through with a bogus row.
+func ParsePackages(text []byte) ([]PackageRef, error) {
+	refs, _, err := parsePackages(text)
+	return refs, err
+}
+
+// parsePackages is ParsePackages that also returns the Filename of every
+// stanza that declares a Filename but no SHA256 (in file order, repeats
+// kept). Such a stanza vouches nothing, and spec C5 makes it no silent
+// drop: the adopter marks the snapshot's coverage incomplete (reason
+// no_sha256, buildPackageHashes). A stanza without a Filename is not a
+// package file and is not reported.
 //
 // AIDEV-NOTE: callers pass already-decompressed bytes. Decompression
 // of Packages.gz / Packages.xz is the fetch layer's job, not parsing.
@@ -48,8 +59,11 @@ const MaxPackageStanzas = 1_000_000
 // and skipped — none of the fields we care about (Filename, SHA256,
 // Size) have multi-line values in the wild, so dropping the body of
 // continuation lines is safe.
-func ParsePackages(text []byte) ([]PackageRef, error) {
-	var out []PackageRef
+func parsePackages(text []byte) ([]PackageRef, []string, error) {
+	var (
+		out      []PackageRef
+		noSHA256 []string
+	)
 	scanner := bufio.NewScanner(bytes.NewReader(text))
 	scanner.Buffer(make([]byte, 0, scanBufCap), scanBufCap)
 
@@ -65,10 +79,16 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 	)
 
 	flush := func() error {
-		// Stanzas missing either required field are intentionally
-		// silent: a Packages file legitimately contains entries that
-		// don't declare both (rare, but well-formed apt allows it).
+		// Stanzas missing either required field give no row: a
+		// Packages file legitimately contains entries that don't
+		// declare both (rare, but well-formed apt allows it). A
+		// Filename without a SHA256 is reported (spec C5 no_sha256):
+		// the caller makes coverage incomplete rather than dropping it
+		// silently.
 		if filename == "" || sha256 == "" {
+			if filename != "" {
+				noSHA256 = append(noSHA256, filename)
+			}
 			filename = ""
 			sha256 = ""
 			size = 0
@@ -114,7 +134,7 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 		line := scanner.Text()
 		if line == "" {
 			if err := flush(); err != nil {
-				return nil, fmt.Errorf("packages: line %d: %w", lineNo, err)
+				return nil, nil, fmt.Errorf("packages: line %d: %w", lineNo, err)
 			}
 			continue
 		}
@@ -126,7 +146,7 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 		}
 		idx := strings.IndexByte(line, ':')
 		if idx <= 0 {
-			return nil, fmt.Errorf("packages: line %d: malformed header %q", lineNo, line)
+			return nil, nil, fmt.Errorf("packages: line %d: malformed header %q", lineNo, line)
 		}
 		field := strings.TrimSpace(line[:idx])
 		value := strings.TrimSpace(line[idx+1:])
@@ -138,10 +158,10 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 		case "size":
 			n, err := strconv.ParseInt(value, 10, 64)
 			if err != nil {
-				return nil, fmt.Errorf("packages: line %d: invalid size %q: %w", lineNo, value, err)
+				return nil, nil, fmt.Errorf("packages: line %d: invalid size %q: %w", lineNo, value, err)
 			}
 			if n < 0 {
-				return nil, fmt.Errorf("packages: line %d: negative size %d", lineNo, n)
+				return nil, nil, fmt.Errorf("packages: line %d: negative size %d", lineNo, n)
 			}
 			size = n
 			sizeSet = true
@@ -160,11 +180,11 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("packages: scan: %w", err)
+		return nil, nil, fmt.Errorf("packages: scan: %w", err)
 	}
 	// EOF without a trailing blank line still ends the last stanza.
 	if err := flush(); err != nil {
-		return nil, fmt.Errorf("packages: tail: %w", err)
+		return nil, nil, fmt.Errorf("packages: tail: %w", err)
 	}
 	if len(out) == 0 {
 		// A non-empty input that produced zero usable stanzas is
@@ -172,8 +192,8 @@ func ParsePackages(text []byte) ([]PackageRef, error) {
 		// page or a truncated file. The freshness layer logs this as
 		// adoption_parse_failed and the next periodic tick retries.
 		if len(bytes.TrimSpace(text)) > 0 {
-			return nil, errors.New("packages: no stanzas with both Filename and SHA256")
+			return nil, nil, errors.New("packages: no stanzas with both Filename and SHA256")
 		}
 	}
-	return out, nil
+	return out, noSHA256, nil
 }

@@ -1947,9 +1947,15 @@ func (a *Adopter) adoptMemberWithRetry(ctx context.Context, suite SuiteRef, m Re
 // declares (spec C5) — m.SHA256 itself when it is declared, the derived
 // SHA-256 for a SHA512-only member (verifyMember).
 //
-// AIDEV-NOTE: a SHA512-only member is never reused from the pool (its
-// SHA-256 is not known before the fetch): it is fetched at every
-// adoption, as small repositories that publish only SHA512 can afford.
+// AIDEV-NOTE: a SHA512-only member is never reused from the pool without
+// a fetch (its SHA-256 is not known before the fetch): it is fetched at
+// every adoption, as small repositories that publish only SHA512 can
+// afford. Its rehash on reuse runs after the fetch instead: once the
+// fetched bytes matched the declared SHA-512, an existing pool/<derived>
+// is re-hashed before Finalize's dedup could keep it (verifyMember's
+// rehashPooled hook, rehashPooledBlob), and a corrupt one is logged
+// (pool_corruption_during_adoption), counted and evicted, so the verified
+// bytes replace it (review fix round 1, Task 2).
 func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMember, acquireByHash bool) (string, error) {
 	exists := false
 	if m.SHA256 != "" {
@@ -2064,7 +2070,7 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 	if _, err := a.fetcher.Fetch(ctx, target, w); err != nil {
 		return "", err // by-hash 404 (pruned), transport, etc. — silent fallback
 	}
-	hashHex, err := verifyMember(w, m, m.Size)
+	hashHex, err := verifyMember(w, m, m.Size, a.rehashPooledBlob(suite, m))
 	if err != nil {
 		return "", err
 	}
@@ -2159,9 +2165,13 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 			fmt.Sprintf("served %d vs declared %d", res.ContentLength, m.Size))
 	}
 
-	hashHex, err := verifyMember(w, m, res.ContentLength)
+	hashHex, err := verifyMember(w, m, res.ContentLength, a.rehashPooledBlob(suite, m))
 	var mm *memberHashMismatch
 	switch {
+	case errors.Is(err, ErrAdoptionDBFailed):
+		// rehashPooledBlob could not read or evict the pool file: a local
+		// fault, not the member's.
+		return "", err
 	case errors.As(err, &mm):
 		// Mismatch: adoption rejects, and the bytes never reached pool/
 		// (verifyMember removed the temp). Log loudly.
@@ -2186,6 +2196,43 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 		return "", fmt.Errorf("%w: PutBlob %s: %v", ErrAdoptionDBFailed, hashHex, err)
 	}
 	return hashHex, nil
+}
+
+// rehashPooledBlob returns verifyMember's rehashPooled hook for m, a
+// SHA512-only member of suite: SPEC2 §7.5 step 5's rehash on reuse for a
+// blob whose SHA-256 is known only once its fetched bytes verified. When
+// pool/<derived> exists its bytes are re-hashed; a file whose bytes are
+// not <derived> (corrupted at rest) is logged and counted as
+// pool_corruption_during_adoption and evicted, exactly as adoptMember and
+// writeBlobBytes do, so Finalize moves the verified bytes in instead of
+// keeping it. A missing file is nothing to check. A read or evict error
+// is ErrAdoptionDBFailed (a local fault).
+func (a *Adopter) rehashPooledBlob(suite SuiteRef, m ReleaseMember) func(derived string) error {
+	return func(derived string) error {
+		p := a.cache.BlobPath(derived)
+		actual, err := hashFile(p)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return nil
+		case err != nil:
+			return fmt.Errorf("%w: rehash %s: %v", ErrAdoptionDBFailed, derived, err)
+		case actual == derived:
+			return nil
+		}
+		a.logger.Warn("pool_corruption_during_adoption",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"path", m.Path,
+			"declared_sha512", m.SHA512,
+			"derived_sha256", derived,
+			"actual_sha256", actual,
+		)
+		integrity.IncPoolCorruptionDuringAdoption()
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: evict corrupted %s: %v", ErrAdoptionDBFailed, derived, err)
+		}
+		return nil
+	}
 }
 
 // writeBlobBytes persists in-memory bytes as a blob, returning the
@@ -2387,7 +2434,12 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 	//
 	// Iterates fetchedMembers only: a 4xx-skipped Packages member
 	// has no blob in the pool, so readPackagesBlob would miss.
+	//
+	// noSHA256 holds the deb paths of stanzas with a Filename but no
+	// SHA256 (spec C5 "Hash blocks"), deduplicated across variants: they
+	// vouch nothing and make coverage incomplete below (no_sha256).
 	dedup := make(map[string]debPathDecl)
+	noSHA256 := make(map[string]bool)
 	for _, m := range fetchedMembers {
 		if !isPackagesMember(m.Path) {
 			continue
@@ -2396,9 +2448,12 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 		if err != nil {
 			return packageHashBuildResult{}, fmt.Errorf("%w: read %q: %w", ErrAdoptionParseFailed, m.Path, err)
 		}
-		refs, err := ParsePackages(body)
+		refs, gaps, err := parsePackages(body)
 		if err != nil {
 			return packageHashBuildResult{}, fmt.Errorf("%w: parse %q: %v", ErrAdoptionParseFailed, m.Path, err)
+		}
+		for _, f := range gaps {
+			noSHA256[repoRoot+f] = true
 		}
 		hasParseable[path.Dir(m.Path)] = true
 		for _, ref := range refs {
@@ -2533,6 +2588,25 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 			"snapshot_id", snapshotID,
 			"reason", "unsupported_variants",
 			"directories", missingDirs,
+		)
+		return packageHashBuildResult{rows: rows, coverageComplete: false}, nil
+	}
+	if len(noSHA256) > 0 {
+		// Spec C5 "Hash blocks": a stanza with a Filename but no SHA256
+		// (an index that declares only MD5sum/SHA1/SHA512 for it) vouches
+		// nothing, and is no silent drop: coverage cannot be proven, so it
+		// is incomplete — strict mode stays off for the host rather than
+		// refusing these packages while reporting complete coverage.
+		//
+		// AIDEV-NOTE: unlike the incomplete-identity skip above (round-5,
+		// non-punitive), one such stanza flips coverage: the spec names
+		// it, and the package it declares can never be vouched.
+		a.logger.Info("package_coverage_incomplete",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID,
+			"reason", "no_sha256",
+			"no_sha256_stanzas", len(noSHA256),
 		)
 		return packageHashBuildResult{rows: rows, coverageComplete: false}, nil
 	}

@@ -339,6 +339,33 @@ func TestParsePackages_CaseInsensitivePackageArchitecture(t *testing.T) {
 	}
 }
 
+// Spec C5 "Hash blocks": a stanza with a Filename but no SHA256 gives no
+// row and is reported (no_sha256), in file order with repeats kept; a
+// stanza without a Filename is not reported. ParsePackages returns the
+// same rows.
+func TestParsePackages_ReportsFilenameWithoutSHA256(t *testing.T) {
+	h := sha(1)
+	body := "Package: good\nArchitecture: amd64\nVersion: 1\nFilename: pool/good.deb\nSHA256: " + h + "\n\n" +
+		"Package: sha512only\nFilename: pool/sha512only.deb\nSHA512: " + strings.Repeat("a", 128) + "\n\n" +
+		"Package: md5only\nFilename: pool/md5only.deb\nMD5sum: 0123456789abcdef0123456789abcdef\n\n" +
+		"Package: nofile\nSHA256: " + h + "\n\n" +
+		"Package: md5only\nFilename: pool/md5only.deb\n"
+	refs, noSHA256, err := parsePackages([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || refs[0].Filename != "pool/good.deb" {
+		t.Fatalf("refs = %+v, want the one stanza with both fields", refs)
+	}
+	want := []string{"pool/sha512only.deb", "pool/md5only.deb", "pool/md5only.deb"}
+	if strings.Join(noSHA256, ",") != strings.Join(want, ",") {
+		t.Fatalf("no_sha256 = %q, want %q", noSHA256, want)
+	}
+	if got, err := ParsePackages([]byte(body)); err != nil || len(got) != 1 || got[0] != refs[0] {
+		t.Fatalf("ParsePackages = %+v, %v; want parsePackages' rows", got, err)
+	}
+}
+
 // strconvI is a tiny helper to keep strconv off the test dependency
 // list — only the parser test needs int formatting and strings is
 // already imported.
