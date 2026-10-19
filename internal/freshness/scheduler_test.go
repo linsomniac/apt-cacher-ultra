@@ -747,10 +747,10 @@ func TestSchedQueues_BusyOfferIsHeldUntilTheNextWake(t *testing.T) {
 	for _, row := range []cache.SuiteFreshness{s, schedRow("a", "/2", &one, 0)} {
 		q.enqueue(row, false)
 		it, _ := q.pop(admitNone)
-		q.finish(checkDone{item: it, report: checkReport{result: "changed_queued", signedCurrent: true}})
+		q.finish(checkDone{item: it, report: checkReport{result: "changed_queued", signedCurrent: true}}, 0)
 	}
 	head, _ := q.pop(admitAll)
-	q.finish(checkDone{item: head, report: checkReport{result: resultBusy}})
+	q.finish(checkDone{item: head, report: checkReport{result: resultBusy}}, 0)
 	if q.enqueue(s, false) || q.len() != 2 || q.waiting() != 2 {
 		t.Fatalf("a busy offer dropped the suite: len %d waiting %d, want 2 and 2", q.len(), q.waiting())
 	}
@@ -777,12 +777,12 @@ func TestSchedQueues_LostOfferIsHeldUntilTheNextWake(t *testing.T) {
 	one := int64(1)
 	q.enqueue(schedRow("a", "/1", &one, 0), false)
 	it, _ := q.pop(admitNone)
-	q.finish(checkDone{item: it, report: checkReport{result: "changed_queued"}})
+	q.finish(checkDone{item: it, report: checkReport{result: "changed_queued"}}, 0)
 	it, _ = q.pop(admitAll)
 	if !it.waiting {
 		t.Fatal("setup: the parked suite was not offered")
 	}
-	q.finish(checkDone{item: it, report: checkReport{result: "changed_queued"}})
+	q.finish(checkDone{item: it, report: checkReport{result: "changed_queued"}}, 0)
 	if it, ok := q.pop(admitAll); ok {
 		t.Fatalf("a lost offer was re-offered before the next wake: %v", it.ref)
 	}
@@ -800,7 +800,7 @@ func TestSchedQueues_OnlyQueuedResultsPark(t *testing.T) {
 		q := newSchedQueues()
 		q.enqueue(schedRow("a", "/1", &one, 0), false)
 		it, _ := q.pop(admitAll)
-		q.finish(checkDone{item: it, report: checkReport{result: result}})
+		q.finish(checkDone{item: it, report: checkReport{result: result}}, 0)
 		if q.waiting() != 0 || q.len() != 0 {
 			t.Errorf("%s: waiting %d len %d, want 0 and 0", result, q.waiting(), q.len())
 		}

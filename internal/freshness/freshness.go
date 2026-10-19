@@ -78,7 +78,7 @@ type Cache interface {
 	// UpdateSuiteFreshness writes a check's result to an existing row
 	// (UPDATE-only, spec C3: a vanished row is left alone).
 	UpdateSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error
-	ListSuites(ctx context.Context) ([]cache.SuiteFreshness, error)
+	ListSuitesWithAdoption(ctx context.Context) ([]cache.SuiteWithAdoption, error)
 	LookupURL(ctx context.Context, scheme, host, path string) (*cache.URLPath, error)
 	GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*cache.SuiteSnapshot, error)
 	// PutURLPath re-seeds a reaped metadata anchor url_path row during
@@ -230,6 +230,12 @@ type Checker struct {
 	// check, Reconcile and HoldSuite — between loading a suite's mutex and
 	// TryLock: the window I-4's re-validation closes.
 	lockLoadedHook func(key string)
+
+	// offerHook, when set (tests only), runs on the Run goroutine for each
+	// finished offer — a waiting suite's slot-driven re-check — with its
+	// report; a queued result is a lost offer (another admission took the
+	// slot first). The upgrade-burst simulations count lost offers with it.
+	offerHook func(ref SuiteRef, rep checkReport)
 
 	// unlockDroppedHook, when set (tests only), runs in unlockDropped
 	// between dropping a suite's lock-map entry and unlocking its mutex:

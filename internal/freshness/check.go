@@ -100,6 +100,13 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 		return
 	}
 
+	// A last_success_at in the future made the suite due (suiteDue reads
+	// it as infinitely old without reporting it on every tick, deferred
+	// minor B-38); the check reports it once and any answer heals it.
+	if cur.LastSuccessAt != nil && time.Unix(*cur.LastSuccessAt, 0).After(now.Add(clockStepTolerance)) {
+		c.clockStep("last_success_at", scheme, host, suitePath, *cur.LastSuccessAt, now)
+	}
+
 	// Cooldown gate. Spec C4 clock-step rule: a past-event stamp found in
 	// the future (backward wall-clock step) is treated as infinitely old,
 	// never as "just checked" — otherwise the suite freezes for the size

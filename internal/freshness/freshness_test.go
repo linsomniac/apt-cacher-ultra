@@ -153,7 +153,7 @@ func (f *fakeCache) UpdateSuiteFreshness(ctx context.Context, s cache.SuiteFresh
 	return nil
 }
 
-func (f *fakeCache) ListSuites(ctx context.Context) ([]cache.SuiteFreshness, error) {
+func (f *fakeCache) ListSuitesWithAdoption(ctx context.Context) ([]cache.SuiteWithAdoption, error) {
 	if h := f.listHook; h != nil {
 		h()
 	}
@@ -162,9 +162,15 @@ func (f *fakeCache) ListSuites(ctx context.Context) ([]cache.SuiteFreshness, err
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	out := make([]cache.SuiteFreshness, 0, len(f.suites))
+	out := make([]cache.SuiteWithAdoption, 0, len(f.suites))
 	for _, s := range f.suites {
-		out = append(out, s)
+		row := cache.SuiteWithAdoption{SuiteFreshness: s}
+		if s.CurrentSnapshotID != nil {
+			if snap, ok := f.snapshots[*s.CurrentSnapshotID]; ok {
+				row.CurrentAnchorForm = string(snap.Form)
+			}
+		}
+		out = append(out, row)
 	}
 	return out, nil
 }

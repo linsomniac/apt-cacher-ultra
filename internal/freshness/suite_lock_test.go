@@ -246,7 +246,7 @@ func TestScheduler_FlushesAnEvictedWaiter(t *testing.T) {
 	if !ok {
 		t.Fatal("nothing queued")
 	}
-	q.finish(checkDone{item: it, report: checkReport{result: "changed_queued"}}) // waits for a slot
+	q.finish(checkDone{item: it, report: checkReport{result: "changed_queued"}}, 0) // waits for a slot
 	fc.mu.Lock()
 	delete(fc.suites, keyOf("http", "h", "/r/dists/x")) // evicted meanwhile
 	fc.mu.Unlock()
@@ -255,7 +255,7 @@ func TestScheduler_FlushesAnEvictedWaiter(t *testing.T) {
 		t.Fatalf("offer = %+v, %v; want the waiter", it, ok)
 	}
 	rep := c.checkRecovered(ctx, it)
-	q.finish(checkDone{item: it, report: rep})
+	q.finish(checkDone{item: it, report: rep}, 0)
 	if rep.result != resultSkipped || q.len() != 0 || q.waiting() != 0 || c.LockCount() != 0 {
 		t.Fatalf("after the offer: result %q, queued %d, waiting %d, locks %d; want skipped, 0, 0, 0",
 			rep.result, q.len(), q.waiting(), c.LockCount())

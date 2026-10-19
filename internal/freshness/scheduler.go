@@ -108,6 +108,12 @@ type schedItem struct {
 	// (Checker.pendingChange), typically a client check that found no slot;
 	// its check bypasses the cooldown, so the tick parks it (spec C4).
 	pendingChange bool
+	// waitSeq orders the waiting list: when the suite first became
+	// waiting (deferred minor B-46: re-parks keep that order).
+	waitSeq uint64
+	// gen is the admission generation when the item was dispatched
+	// (deferred minor B-45).
+	gen uint64
 }
 
 type hostQueue struct {
@@ -147,10 +153,15 @@ type schedQueues struct {
 	order  []string // round-robin ring of hosts
 	next   int      // index in order of the host whose turn is next
 	queued map[string]struct{}
+	// pending holds the keys of class-queued suites a later tick found
+	// with a pending change (deferred minor B-66): pop sets the item's
+	// pendingChange from it.
+	pending map[string]struct{}
+	waitSeq uint64 // the last waitSeq handed out
 }
 
 func newSchedQueues() *schedQueues {
-	return &schedQueues{hosts: map[string]*hostQueue{}, queued: map[string]struct{}{}}
+	return &schedQueues{hosts: map[string]*hostQueue{}, queued: map[string]struct{}{}, pending: map[string]struct{}{}}
 }
 
 // enqueue appends s to the back of its class on its host, unless the
@@ -160,6 +171,13 @@ func newSchedQueues() *schedQueues {
 func (q *schedQueues) enqueue(s cache.SuiteFreshness, pendingChange bool) bool {
 	key := suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
 	if _, dup := q.queued[key]; dup {
+		// A suite queued earlier as merely stale that a client check
+		// has since left with a pending change keeps its place but
+		// bypasses the cooldown when its turn comes (B-66). A waiting or
+		// in-flight suite ignores the mark (pop and done drop it).
+		if pendingChange {
+			q.pending[key] = struct{}{}
+		}
 		return false
 	}
 	h, ok := q.hosts[s.CanonicalHost]
@@ -190,12 +208,29 @@ func (q *schedQueues) park(item schedItem, signed bool) {
 		return
 	}
 	h.inFlight = false
-	front := item.waiting
+	if !item.waiting {
+		q.waitSeq++
+		item.waitSeq = q.waitSeq
+	}
 	item.waiting, item.signed = true, signed
-	if front {
-		h.waiting = slices.Insert(h.waiting, 0, item)
-	} else {
-		h.waiting = append(h.waiting, item)
+	// Oldest first: a re-parked waiter goes back to its place, so lost or
+	// busy offers in a row never invert the order (B-46).
+	i, _ := slices.BinarySearchFunc(h.waiting, item.waitSeq, func(w schedItem, seq uint64) int {
+		return cmp.Compare(w.waitSeq, seq)
+	})
+	h.waiting = slices.Insert(h.waiting, i, item)
+}
+
+// refreshSigned sets every waiter's signed flag from signed (keys of
+// suites whose current snapshot is signed, read by the tick): a waiter
+// parked as a first adoption that a client check has since adopted is
+// admitted under the reserved-slot rule as the signed suite it now is
+// (overview "E:" carry-forward: the flag was the parking check's).
+func (q *schedQueues) refreshSigned(signed map[string]bool) {
+	for _, h := range q.hosts {
+		for i := range h.waiting {
+			h.waiting[i].signed = signed[h.waiting[i].key]
+		}
 	}
 }
 
@@ -205,15 +240,18 @@ func (q *schedQueues) park(item schedItem, signed bool) {
 // an offer that found the suite busy (another goroutine holds its mutex)
 // parks it held too — re-offering at once would spin while the mutex is
 // held; any other result ends the suite's turn.
-func (q *schedQueues) finish(d checkDone) {
+func (q *schedQueues) finish(d checkDone, gen uint64) {
 	switch {
 	case isQueuedResult(d.report.result):
 		// An offer that again found no slot (someone took it between the
 		// peek and tryAcquire, or the peek was wrong) is held like a busy
 		// one: re-offered on the next wake or tick, never at once — the
 		// pop loop runs right after this done, and a peek that still says
-		// yes would otherwise re-offer it in a loop.
-		d.item.held = d.item.waiting
+		// yes would otherwise re-offer it in a loop. Unless a slot was
+		// released after it was dispatched (gen moved on, B-45): that
+		// release's wake may already be spent, so it is offered at once —
+		// each such re-offer needs a new release, so it cannot loop.
+		d.item.held = d.item.waiting && gen == d.item.gen
 		q.park(d.item, d.report.signedCurrent)
 	case d.item.waiting && d.report.result == resultBusy:
 		d.item.held = true
@@ -273,6 +311,10 @@ func (q *schedQueues) pop(admit func(host string, signed bool) bool) (schedItem,
 			item := h.classes[c][0]
 			h.classes[c][0] = schedItem{}
 			h.classes[c] = h.classes[c][1:]
+			if _, ok := q.pending[item.key]; ok {
+				item.pendingChange = true
+				delete(q.pending, item.key)
+			}
 			if len(h.classes[c]) == 0 {
 				h.classes[c] = nil // let the backing array go
 			}
@@ -288,6 +330,7 @@ func (q *schedQueues) pop(admit func(host string, signed bool) bool) (schedItem,
 // suite and the suite may be queued again.
 func (q *schedQueues) done(item schedItem) {
 	delete(q.queued, item.key)
+	delete(q.pending, item.key)
 	if h, ok := q.hosts[item.ref.CanonicalHost]; ok {
 		h.inFlight = false
 	}
@@ -350,11 +393,8 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 		*s.AdoptionNextRetryAt > nowU && *s.AdoptionNextRetryAt <= nowU+int64(retryHorizon/time.Second) {
 		return false
 	}
-	stale := s.LastSuccessAt == nil || *s.LastSuccessAt <= now.Add(-c.refresh).Unix()
-	if s.LastSuccessAt != nil && *s.LastSuccessAt > future {
-		c.clockStep("last_success_at", s.CanonicalScheme, s.CanonicalHost, s.SuitePath, *s.LastSuccessAt, now)
-		stale = true
-	}
+	stale := s.LastSuccessAt == nil || *s.LastSuccessAt <= now.Add(-c.refresh).Unix() ||
+		*s.LastSuccessAt > future // infinitely old; checkLocked reports it once (B-38)
 	retryDue := c.adopter != nil && s.AdoptionFailCount > 0 && s.AdoptionNextRetryAt != nil && *s.AdoptionNextRetryAt <= nowU
 	if !stale && !retryDue && !c.pendingChange(s) {
 		return false
@@ -472,7 +512,7 @@ func (c *Checker) Run(ctx context.Context) {
 				break
 			}
 			select {
-			case work <- item:
+			case work <- withGen(item, c.admission.generation()):
 				idle--
 				if item.waiting {
 					offers++
@@ -496,8 +536,11 @@ func (c *Checker) Run(ctx context.Context) {
 			idle++
 			if d.item.waiting {
 				offers--
+				if c.offerHook != nil {
+					c.offerHook(d.item.ref, d.report)
+				}
 			}
-			q.finish(d)
+			q.finish(d, c.admission.generation())
 		}
 	}
 }
@@ -511,6 +554,12 @@ func (c *Checker) safeReschedule(ctx context.Context) {
 		}
 	}()
 	c.rescheduleFailingAdoptions(ctx)
+}
+
+// withGen stamps item with the admission generation at dispatch (B-45).
+func withGen(item schedItem, gen uint64) schedItem {
+	item.gen = gen
+	return item
 }
 
 // checkDone is a worker's report of one scheduled check.
@@ -559,13 +608,23 @@ func (c *Checker) safeTick(ctx context.Context, q *schedQueues) {
 	c.tick(ctx, q)
 }
 
-// tick refreshes the queues with every due suite and updates the gauges.
+// tick refreshes the queues with every due suite, the waiting suites'
+// signed flags (the reserved-slot rule), and the gauges.
 func (c *Checker) tick(ctx context.Context, q *schedQueues) {
-	suites, err := c.cache.ListSuites(ctx)
+	rows, err := c.cache.ListSuitesWithAdoption(ctx)
 	if err != nil {
 		c.logger.Warn("freshness: list suites failed", "err", err)
 		return
 	}
+	suites := make([]cache.SuiteFreshness, len(rows))
+	signed := make(map[string]bool)
+	for i, r := range rows {
+		suites[i] = r.SuiteFreshness
+		if r.CurrentAnchorForm == string(cache.FormInline) || r.CurrentAnchorForm == string(cache.FormDetached) {
+			signed[suiteKey(r.CanonicalScheme, r.CanonicalHost, r.SuitePath)] = true
+		}
+	}
+	q.refreshSigned(signed)
 	nowT := c.now()
 	// SPEC §7.4 observability: an adopted suite stale past
 	// staleSuiteFactor*refresh is the freeze signature.

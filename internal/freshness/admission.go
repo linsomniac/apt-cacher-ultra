@@ -21,6 +21,10 @@ type admission struct {
 	// coalesced wake is enough, because the Run loop re-reads the pool
 	// through freeFor rather than counting events. Never closed.
 	freed chan struct{}
+	// releases counts slot releases (a generation): an offer dispatched
+	// before a release that then finds no slot is re-offered at once
+	// rather than held (deferred minor B-45).
+	releases uint64
 }
 
 // admissionUnlimited is what freeFor reports for a pool with no global cap.
@@ -90,6 +94,13 @@ func (a *admission) wake() {
 	}
 }
 
+// generation is the number of slot releases so far.
+func (a *admission) generation() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.releases
+}
+
 // usage reports the global slots and hosts in use.
 func (a *admission) usage() (global, hosts int) {
 	a.mu.Lock()
@@ -110,6 +121,7 @@ func (l *lease) releaseHost() {
 	if l.hostHeld {
 		delete(l.a.hosts, l.host)
 		l.hostHeld = false
+		l.a.releases++
 	}
 	l.a.mu.Unlock()
 	if freed {
@@ -132,6 +144,9 @@ func (l *lease) release() {
 	if l.globalHeld {
 		l.a.inUse--
 		l.globalHeld = false
+	}
+	if freed {
+		l.a.releases++
 	}
 	l.a.mu.Unlock()
 	if freed {
