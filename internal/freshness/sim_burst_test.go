@@ -56,7 +56,7 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
 			host := fmt.Sprintf("f%02d", i)
 			seedStaleAnchorAt(t, c, host, rigSuite) // client interest now, a client-created anchor
 			members.put(pkgsURL(host), pkgsFor(host))
-			members.delay[pkgsURL(host)] = time.Minute
+			members.setDelay(pkgsURL(host), time.Minute)
 			up.Set(anchorURL(host), simtest.Serve(signedRelease("first-"+host, 0,
 				map[string][]byte{"main/binary-amd64/Packages": pkgsFor(host)})))
 			first = append(first, host)
@@ -75,7 +75,7 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
 				t.Fatal(err)
 			}
 			members.put(pkgsURL(host), pkgsFor("2-"+host))
-			members.delay[pkgsURL(host)] = time.Minute
+			members.setDelay(pkgsURL(host), time.Minute)
 			v2[host] = signedRelease("v2-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgsFor("2-" + host)})
 			at := time.Duration(10+12*i)*time.Minute + 7*time.Second // a trickle, off the tick grid
 			changeAt[host] = at
@@ -89,7 +89,7 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
 			}))
 			signed = append(signed, host)
 		}
-		members.started = map[string]time.Time{}
+		members.recordStarts()
 
 		runtime.Gosched()
 		base := runtime.NumGoroutine()

@@ -33,7 +33,7 @@ func TestHeartbeatPanicIsLoggedWithItsStackOnce(t *testing.T) {
 		members := &simMembers{fakeFetcher: newFakeFetcher(), stalled: map[string]bool{}, delay: map[string]time.Duration{}}
 		pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
 		members.put(rigPkgsURL, pkgs)
-		members.delay[rigPkgsURL] = 3 * time.Second // the heartbeat ticks while the member arrives
+		members.setDelay(rigPkgsURL, 3*time.Second) // the heartbeat ticks while the member arrives
 		logs := &lockedBuffer{}
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
 			HostLimiter: hostsem.New(8), HeartbeatInterval: time.Second, Logger: slog.New(slog.NewJSONHandler(logs, nil))})

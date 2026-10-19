@@ -350,7 +350,7 @@ func TestRun_ClientRefusedBusySuiteIsParkedInOrder(t *testing.T) {
 			pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_" + host + ".deb": testHex64})
 			pu := "http://" + host + suite + "/main/binary-amd64/Packages"
 			members.put(pu, pkgs)
-			members.delay[pu] = 10 * time.Minute
+			members.setDelay(pu, 10*time.Minute)
 			up.Set("http://"+host+suite+"/InRelease",
 				simtest.Serve(signedRelease("v1-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
 		}

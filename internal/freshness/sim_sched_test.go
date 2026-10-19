@@ -1,6 +1,7 @@
 package freshness
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"maps"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
@@ -112,8 +115,8 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 			t.Fatal(err)
 		}
 		due("h1", "/r/dists/s")
-		members.delay[rBase+"Contents-amd64.gz"] = 10 * time.Minute
-		members.delay[rByHash] = 10 * time.Minute
+		members.setDelay(rBase+"Contents-amd64.gz", 10*time.Minute)
+		members.setDelay(rByHash, 10*time.Minute)
 		up.Set(rBase+"InRelease", simtest.Serve(relR))
 		// C on h2 and C3 on h3: adopted once (so the current snapshot is
 		// signed and a re-adoption may take either slot), healthy and due,
@@ -139,7 +142,7 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 				t.Fatal(err)
 			}
 			due(host, cSuite)
-			members.delay[pkgsURL] = 10 * time.Minute
+			members.setDelay(pkgsURL, 10*time.Minute)
 			var n atomic.Int64
 			var b simtest.Behavior = func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
 				k := n.Add(1)
@@ -369,12 +372,140 @@ func TestSimScheduler_FiveHundredStallingOneHealthy(t *testing.T) {
 	})
 }
 
+// Deferred minor B-53 (phase B DoD): the stalling-host bound with an
+// adopter wired, so adoptions contend for the slots on the same host — C
+// publishes a new InRelease on every request and each adoption fetches its
+// Packages for 10 minutes — at a fifth of the 500-suite simulation's size
+// (that one, without an adopter, is already over the 5 s -race budget:
+// deferred minor C-38, phase H). Once the 100 stalling suites have failed,
+// the healthy S is checked within refresh + one tick + D every time, C
+// keeps adopting, and goroutines stay bounded.
+func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		c := simtest.OpenCache(t)
+		up := simtest.NewUpstream()
+		members := &simMembers{fakeFetcher: newFakeFetcher(), stalled: map[string]bool{}, delay: map[string]time.Duration{}}
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
+			HostLimiter: hostsem.New(8), MaxConcurrent: 2, MaxDuration: 30 * time.Minute, Logger: simtest.DiscardLogger()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale := time.Now().Add(-2 * time.Hour).Unix()
+		for i := 0; i < 100; i++ {
+			suite := fmt.Sprintf("/s%03d/dists/x", i)
+			seedSimSuite(t, c, "a", suite, stale, 0)
+			up.Set("http://a"+suite+"/InRelease", simtest.Stall())
+		}
+		adopt := func(suite string, pkgs []byte) {
+			t.Helper()
+			ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: "a", SuitePath: suite}
+			members.put("http://a"+suite+"/main/binary-amd64/Packages", pkgs)
+			trackSuite(t, c, ref)
+			if err := ad.Run(ctx, ref, signedRelease("v0"+suite, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs}), "", ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+		const sPath, cPath = "/zzz/dists/x", "/ccc/dists/x"
+		sURL := "http://a" + sPath + "/InRelease"
+		adopt(sPath, fakePackagesStanzas(map[string]string{"pool/s_1.deb": testHex64}))
+		up.Set(sURL, simtest.NotModified())
+		pkgs := func(n int64) []byte {
+			return fakePackagesStanzas(map[string]string{fmt.Sprintf("pool/c_%d.deb", n): testHex64})
+		}
+		adopt(cPath, pkgs(0))
+		cPkgs := "http://a" + cPath + "/main/binary-amd64/Packages"
+		members.setDelay(cPkgs, 10*time.Minute)
+		var n atomic.Int64
+		up.Set("http://a"+cPath+"/InRelease", func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
+			k := n.Add(1)
+			members.put(cPkgs, pkgs(k)) // before the check can spawn the adoption
+			return simtest.Serve(signedRelease(fmt.Sprintf("c%d", k), 0, map[string][]byte{"main/binary-amd64/Packages": pkgs(k)}))(ctx, etag)
+		})
+		cAdoptions := func() float64 {
+			v, _ := strconv.ParseFloat(renderedMetricLabels("acu_adoption_total", `outcome="success"`, `host="a"`), 64)
+			return v
+		}
+		startAdoptions := cAdoptions()
+		const refresh = time.Hour
+		tick := refresh / 4
+		runtime.Gosched()
+		base := runtime.NumGoroutine()
+		maxG := base
+		_, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: refresh,
+			Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }})
+		// Phase 1: every stalling suite fails once (100 × D on one host).
+		for time.Sleep(61 * time.Second); ; time.Sleep(61 * time.Second) {
+			maxG = max(maxG, runtime.NumGoroutine())
+			all, err := c.ListSuites(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			failing := 0
+			for _, s := range all {
+				if s.CheckFailCount > 0 {
+					failing++
+				}
+			}
+			if failing == 100 {
+				break
+			}
+		}
+		before := len(up.Calls(sURL))
+		if before == 0 {
+			t.Fatal("S never checked in phase 1")
+		}
+		// Phase 2: three hours of contention.
+		for end := time.Now().Add(3*time.Hour + 11*time.Minute); time.Now().Before(end); time.Sleep(61 * time.Second) {
+			maxG = max(maxG, runtime.NumGoroutine())
+		}
+		stop()
+		calls := up.Calls(sURL)[before-1:]
+		if len(calls) < 3 {
+			t.Fatalf("S checked %d times in phase 2, want at least 2", len(calls)-1)
+		}
+		for i := 1; i < len(calls); i++ {
+			if gap := calls[i].Sub(calls[i-1]); gap > refresh+tick+checkDeadline {
+				t.Fatalf("S waited %v between checks, bound %v", gap, refresh+tick+checkDeadline)
+			}
+		}
+		if got := cAdoptions() - startAdoptions; got < 3 {
+			t.Fatalf("C adopted %v times, want it to keep adopting (>= 3)", got)
+		}
+		const slack = 8
+		if limit := base + checkWorkers + 1 + 2 + slack; maxG > limit {
+			t.Fatalf("goroutines peaked at %d, limit %d", maxG, limit)
+		}
+	})
+}
+
+// renderedMetricLabels returns the value of the series name whose labels
+// include every one of labels, as metrics.Default renders it ("" if none).
+func renderedMetricLabels(name string, labels ...string) string {
+	var buf bytes.Buffer
+	metrics.Default.Render(&buf)
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if !strings.HasPrefix(line, name+"{") {
+			continue
+		}
+		ok := true
+		for _, l := range labels {
+			ok = ok && strings.Contains(line, l)
+		}
+		if ok {
+			return line[strings.LastIndexByte(line, ' ')+1:]
+		}
+	}
+	return ""
+}
+
 // simMembers is an AdoptionFetcher serving canned members, except that
 // every fetch for a stalled host blocks until its context ends and a URL
 // with a delay answers only after it. It tracks how many stalled fetches
-// are in flight and, once started is set, each host's first member fetch
-// (an adoption's admission). Set delays and started before the scheduler
-// starts.
+// are in flight and, once recordStarts was called, each host's first
+// member fetch (an adoption's admission). Its maps are written only
+// through stall, setDelay and recordStarts, under its lock (deferred minor
+// B-51).
 type simMembers struct {
 	*fakeFetcher
 	mu       sync.Mutex
@@ -386,6 +517,16 @@ type simMembers struct {
 }
 
 func (m *simMembers) stall(host string) { m.mu.Lock(); m.stalled[host] = true; m.mu.Unlock() }
+
+// setDelay makes every fetch of url answer only after d.
+func (m *simMembers) setDelay(url string, d time.Duration) {
+	m.mu.Lock()
+	m.delay[url] = d
+	m.mu.Unlock()
+}
+
+// recordStarts starts recording each host's first member fetch.
+func (m *simMembers) recordStarts() { m.mu.Lock(); m.started = map[string]time.Time{}; m.mu.Unlock() }
 
 func (m *simMembers) Fetch(ctx context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
 	m.mu.Lock()
@@ -466,7 +607,7 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 				t.Fatal(err)
 			}
 			members.put(pkgsURL(host), pkgsFor("2-"+host))
-			members.delay[pkgsURL(host)] = time.Minute
+			members.setDelay(pkgsURL(host), time.Minute)
 			v2[host] = rel("v2-"+host, pkgsFor("2-"+host))
 			up.Set(anchorURL(host), simtest.After(time.Second, simtest.Serve(v2[host])))
 			normal = append(normal, host)
@@ -479,7 +620,7 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 		}
 		seedStaleAnchorAt(t, c, "deg", rigSuite)
 		up.Set(anchorURL("deg"), simtest.Stall())
-		members.started = map[string]time.Time{}
+		members.recordStarts()
 
 		runtime.Gosched()
 		base := runtime.NumGoroutine()

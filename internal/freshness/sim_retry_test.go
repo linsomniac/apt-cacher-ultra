@@ -29,6 +29,13 @@ type retrySim struct {
 
 func startRetrySim(t *testing.T, refresh time.Duration) *retrySim {
 	t.Helper()
+	return startRetrySimRand(t, refresh, func() float64 { return 0.5 })
+}
+
+// startRetrySimRand is startRetrySim with the scheduler's random seam rnd
+// (the retry jitter: 0.5 is none).
+func startRetrySimRand(t *testing.T, refresh time.Duration, rnd func() float64) *retrySim {
+	t.Helper()
 	c := simtest.OpenCache(t)
 	seedStaleAnchorAt(t, c, rigHost, rigSuite)
 	s := &retrySim{c: c, up: simtest.NewUpstream(),
@@ -42,7 +49,7 @@ func startRetrySim(t *testing.T, refresh time.Duration) *retrySim {
 		t.Fatal(err)
 	}
 	_, s.stop = startSched(t, Config{Cache: c, Fetcher: s.up, HostLimiter: hostsem.New(8), Refresh: refresh,
-		Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }})
+		Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger(), rand: rnd})
 	return s
 }
 
@@ -106,11 +113,47 @@ func TestSimLim1_DeterministicFailureAttemptsPerDay(t *testing.T) {
 	})
 }
 
+// Deferred minor B-54: limitation #1's attempt count at both ends of the
+// ±25 % retry jitter — more attempts with the shortest delays, fewer with
+// the longest, both far below main's 1,440 a day.
+func TestSimLim1_AttemptsAcrossTheJitter(t *testing.T) {
+	attempts := map[string]int{}
+	for _, leg := range []struct {
+		name     string
+		u        float64
+		min, max int
+	}{{"shortest", 0, 28, 40}, {"longest", 0.999, 16, 26}} {
+		synctest.Test(t, func(t *testing.T) {
+			s := startRetrySimRand(t, 15*time.Minute, func() float64 { return leg.u })
+			bad := s.release("untrusted", 0)
+			s.ver.reject(hashOf(bad))
+			s.serve(bad)
+			time.Sleep(24*time.Hour + 7*time.Minute)
+			s.stop()
+			attempts[leg.name] = s.ver.calls()
+			if a := s.ver.calls(); a < leg.min || a > leg.max {
+				t.Fatalf("%s jitter: %d attempts in a day, want %d..%d", leg.name, a, leg.min, leg.max)
+			}
+		})
+	}
+	if attempts["shortest"] <= attempts["longest"] {
+		t.Fatalf("attempts %v: the shortest delays must give more attempts", attempts)
+	}
+}
+
 // Spec C7/C5 30-day simulation: an untrusted body (bounded attempts), new
 // content (adopted within a refresh interval), an upstream rollback to
 // older-dated content (never adopted, bounded refusals, record cleared
 // when upstream recovers), and backward and forward clock steps (new
 // content still adopted, checks continue).
+//
+// AIDEV-NOTE: the run spans about 20 virtual days (27 before phase E). The
+// untrusted phase keeps its 10 days: the 7-day interest window lapses
+// inside it, so its floor catches a suite gone dormant without the day-5
+// touch (B-57). The older-content phase runs 5 days and each clock step 2,
+// every bound at the same per-day rate, so the run stays well under the
+// 5 s -race budget (executability review D6, ruling PE-8: about 3.6–4 s).
+// Re-time it under -race before lengthening any phase.
 func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		// The offset is process-global: a Fatal between a clock step and
@@ -128,9 +171,11 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
 		bad := s.release("untrusted", t0.Unix())
 		s.ver.reject(hashOf(bad))
 		s.serve(bad)
-		time.Sleep(10*day + 7*time.Minute)
-		if a := s.ver.calls(); a > 10*30 {
-			t.Fatalf("untrusted body: %d attempts in 10 days, want <= 300", a)
+		time.Sleep(5 * day)
+		s.touch(t) // a client asks again: the suite stays interesting
+		time.Sleep(5*day + 7*time.Minute)
+		if a := s.ver.calls(); a < 10*15 || a > 10*30 { // deferred minor B-57: a floor too
+			t.Fatalf("untrusted body: %d attempts in 10 days, want 150..300", a)
 		}
 		if s.current(t) != "" {
 			t.Fatal("untrusted content was adopted")
@@ -147,12 +192,12 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
 		older := s.release("v1-older", t0.Add(day).Unix())
 		s.serve(older)
 		before := s.ver.calls()
-		time.Sleep(8*day + 11*time.Minute)
+		time.Sleep(5*day + 11*time.Minute)
 		if s.current(t) != hashOf(v2) {
 			t.Fatal("the suite moved back to older-dated content")
 		}
-		if a := s.ver.calls() - before; a < 3 || a > 8*30 {
-			t.Fatalf("older content cost %d verifications in 8 days, want 3..240", a)
+		if a := s.ver.calls() - before; a < 3 || a > 5*30 {
+			t.Fatalf("older content cost %d verifications in 5 days, want 3..150", a)
 		}
 		if r := strOf(s.row(t).AdoptionFailReason); r != cache.ReasonUpstreamOlder {
 			t.Fatalf("record reason = %q, want upstream_older", r)
@@ -165,7 +210,7 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
 		}
 
 		restore := wallclock.SetOffsetForTest(-2 * time.Hour)
-		time.Sleep(4*day + 13*time.Minute)
+		time.Sleep(2*day + 13*time.Minute)
 		v3 := s.release("v3", wallclock.Now().Unix())
 		s.serve(v3)
 		time.Sleep(window)
@@ -175,7 +220,7 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
 		restore()
 
 		restore = wallclock.SetOffsetForTest(30 * day)
-		time.Sleep(4*day + 17*time.Minute)
+		time.Sleep(2*day + 17*time.Minute)
 		v4 := s.release("v4", wallclock.Now().Unix())
 		s.serve(v4)
 		time.Sleep(window)
@@ -184,9 +229,122 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
 		}
 		restore()
 		s.stop()
-		if n := len(s.up.Calls(rigAnchorURL)); n < 28*10 {
-			t.Fatalf("only %d checks over ~28 days, want >= 280 (liveness)", n)
+		days := int(time.Since(t0) / day)
+		if n := len(s.up.Calls(rigAnchorURL)); n < days*10 {
+			t.Fatalf("only %d checks over %d days, want >= %d (liveness)", n, days, days*10)
 		}
+	})
+}
+
+// Deferred minor B-58: with no Date on either side the Date rule cannot
+// refuse the older content; the rollback guard alone keeps the suite on
+// v2, and records it as the refusal state rollback_refused, not a failure.
+func TestSimFlappingMirror_UndatedContentIsARefusedRollback(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := startRetrySim(t, 30*time.Minute)
+		v1, v2 := s.release("v1", 0), s.release("v2", 0)
+		s.serve(v1)
+		time.Sleep(34 * time.Minute) // v1 adopted (the first tick)
+		if s.current(t) != hashOf(v1) {
+			t.Fatal("setup: v1 not adopted")
+		}
+		var n atomic.Int64
+		s.up.Set(rigAnchorURL, func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
+			if n.Add(1)%2 == 1 {
+				return simtest.Serve(v2)(ctx, etag)
+			}
+			return simtest.Serve(v1)(ctx, etag)
+		})
+		seenV2 := false
+		reasons := map[string]bool{}
+		for i := 0; i < 24*4; i++ { // sample every 15 min for a day, off the tick grid
+			time.Sleep(15 * time.Minute)
+			switch s.current(t) {
+			case hashOf(v2):
+				seenV2 = true
+			case hashOf(v1):
+				if seenV2 {
+					t.Fatalf("flipped back to v1 after %v", time.Duration(i+1)*15*time.Minute)
+				}
+			}
+			if r := s.row(t).AdoptionFailReason; r != nil {
+				reasons[*r] = true
+			}
+		}
+		s.stop()
+		if !seenV2 || s.current(t) != hashOf(v2) {
+			t.Fatal("never settled on v2")
+		}
+		// v2 served again clears the record (spec C7), so it comes and goes;
+		// whenever it is there, it is the refusal state.
+		if len(reasons) != 1 || !reasons[cache.ReasonRollbackRefused] {
+			t.Fatalf("record reasons %v, want only rollback_refused", reasons)
+		}
+	})
+}
+
+// Deferred minor B-56: clock steps while a failure record is active. A
+// backward step leaves next_retry_at far ahead: the retry still comes
+// within the clamped hour (spec C7). A forward step makes it long overdue:
+// the retry comes at the next tick. In both, content dated by the stepped
+// clock is adopted, and content dated more than 10 s ahead of it is the
+// failure release_date_in_future, not an adoption.
+func TestSimRetry_ClockStepsWithAnActiveRecord(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		t.Cleanup(wallclock.SetOffsetForTest(0))
+		const refresh = 40 * time.Minute
+		tick := refresh / 4
+		s := startRetrySim(t, refresh)
+		failFor := func(label string) {
+			t.Helper()
+			bad := s.release(label, wallclock.Now().Unix())
+			s.ver.reject(hashOf(bad))
+			s.serve(bad)
+			for i := 0; i < 5 && s.row(t).AdoptionFailCount < 4; i++ {
+				time.Sleep(time.Hour) // the streak grows: next retry 16 min, then 32
+			}
+			if s.row(t).AdoptionFailCount < 4 {
+				t.Fatalf("%s: streak %d, want >= 4", label, s.row(t).AdoptionFailCount)
+			}
+		}
+		// Backward: the record's next_retry_at lands 2 h in the future.
+		failFor("bad-before-the-backward-step")
+		restore := wallclock.SetOffsetForTest(-2 * time.Hour)
+		before := s.ver.calls()
+		time.Sleep(time.Hour + tick + time.Minute)
+		if s.ver.calls() == before {
+			t.Fatal("after a backward step, no retry within the clamped hour")
+		}
+		ahead := s.release("ahead-of-the-stepped-clock", wallclock.Now().Add(time.Hour).Unix())
+		s.serve(ahead)
+		time.Sleep(refresh + tick + time.Minute) // the suite is due again once stale
+		if s.current(t) == hashOf(ahead) || strOf(s.row(t).AdoptionFailReason) != "release_date_in_future" {
+			t.Fatalf("content dated an hour ahead: current %q reason %q, want refused as release_date_in_future",
+				s.current(t), strOf(s.row(t).AdoptionFailReason))
+		}
+		good := s.release("good-after-the-backward-step", wallclock.Now().Unix())
+		s.serve(good)
+		time.Sleep(refresh + tick + time.Minute)
+		if s.current(t) != hashOf(good) {
+			t.Fatal("after a backward step, new content was not adopted")
+		}
+		restore()
+		// Forward: the record's next_retry_at is 30 days overdue.
+		failFor("bad-before-the-forward-step")
+		restore = wallclock.SetOffsetForTest(30 * 24 * time.Hour)
+		before = s.ver.calls()
+		time.Sleep(tick + time.Minute)
+		if s.ver.calls() == before {
+			t.Fatal("after a forward step, the overdue retry did not come at the next tick")
+		}
+		good = s.release("good-after-the-forward-step", wallclock.Now().Unix())
+		s.serve(good)
+		time.Sleep(refresh + tick + time.Minute)
+		if s.current(t) != hashOf(good) {
+			t.Fatal("after a forward step, new content was not adopted")
+		}
+		restore()
+		s.stop()
 	})
 }
 
@@ -211,6 +369,7 @@ func TestSimFlappingMirror_NeverFlipsBack(t *testing.T) {
 			return simtest.Serve(v2)(ctx, etag)
 		})
 		seenV2 := false
+		time.Sleep(4 * time.Minute)   // samples off the 7 m 30 s tick grid (deferred minor B-58)
 		for i := 0; i < 3*24*4; i++ { // sample every 15 min for 3 days
 			time.Sleep(15 * time.Minute)
 			switch s.current(t) {
@@ -281,6 +440,11 @@ func TestSimRestartSpread(t *testing.T) {
 		}
 		if retried != 50 {
 			t.Fatalf("%d of 50 failing suites retried within the refresh interval after the restart", retried)
+		}
+		// Deferred minor B-55: each was attempted once — an adoption, not
+		// only an upstream request.
+		if n := ver.calls(); n != 50 {
+			t.Fatalf("%d adoption attempts after the restart, want 50", n)
 		}
 		for b, n := range buckets {
 			if n > 25 {

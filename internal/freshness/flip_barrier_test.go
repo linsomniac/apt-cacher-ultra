@@ -740,7 +740,7 @@ func TestSimCapacity_TheBarrierHoldsTheGlobalSlotWithinItsBound(t *testing.T) {
 			}
 			up.Set("http://"+host+rigSuite+"/InRelease", answer)
 		}
-		members.started = map[string]time.Time{}
+		members.recordStarts()
 		ring := observability.NewRing(10)
 		t0 := time.Now()
 		var wg sync.WaitGroup
