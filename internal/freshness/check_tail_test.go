@@ -179,6 +179,7 @@ func TestCheck_FutureRetryIsClampedOncePerCheck(t *testing.T) {
 	}
 	fc.track("http", "h", "/r/dists/x")
 	now := time.Unix(1_800_000_000, 0)
+	fc.interest("http", "h", "/r/dists/x", now.Unix())
 	if err := fc.RecordAdoptionFailure(context.Background(), "http", "h", "/r/dists/x", cache.AdoptionFailure{
 		Hash: testHex64, Reason: "gpg_failed", Count: 1, FirstAt: now.Unix(), LastAt: now.Unix(),
 		NextRetryAt: now.Add(10 * time.Hour).Unix()}); err != nil {

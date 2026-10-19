@@ -574,6 +574,7 @@ func TestChecker_FreshTickRepairsSkippedMembers(t *testing.T) {
 		"main/binary-amd64/Packages": pkgs,
 		"Contents-amd64.gz":          goodContents,
 	})
+	releaseText = asInRelease(releaseText)
 	base := "http://127.0.0.1/dists/noble/"
 	env.fetcher.put(base+"main/binary-amd64/Packages", pkgs)
 	env.fetcher.put(base+"Contents-amd64.gz", []byte(strings.Repeat("c", 90))) // stale at adoption time

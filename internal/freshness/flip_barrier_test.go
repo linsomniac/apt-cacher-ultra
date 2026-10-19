@@ -61,7 +61,7 @@ func newBarrierRig(t *testing.T, quiet, heartbeat time.Duration) *barrierRig {
 }
 
 func (r *barrierRig) release(label string) []byte {
-	return datedRelease(label, 0, map[string][]byte{"main/binary-amd64/Packages": r.pkgs})
+	return signedRelease(label, 0, map[string][]byte{"main/binary-amd64/Packages": r.pkgs})
 }
 
 func (r *barrierRig) request(label string) *adoptionRequest {
@@ -721,7 +721,7 @@ func TestSimCapacity_TheBarrierHoldsTheGlobalSlotWithinItsBound(t *testing.T) {
 			return fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_" + label + ".deb": testHex64})
 		}
 		rel := func(label string, pkgs []byte) []byte {
-			return datedRelease(label, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
+			return signedRelease(label, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
 		}
 		pkgsURL := func(host string) string { return "http://" + host + rigSuite + "/main/binary-amd64/Packages" }
 		up := simtest.NewUpstream()

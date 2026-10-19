@@ -32,7 +32,7 @@ func seedSimSuite(t *testing.T, c *cache.Cache, host, suite string, lastAt, fail
 		t.Fatal(err)
 	}
 	if err := c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: host, Path: suite + "/InRelease",
-		BlobHash: &bh, UpstreamURL: "http://" + host + suite + "/InRelease", IsMetadata: true}); err != nil {
+		BlobHash: &bh, UpstreamURL: "http://" + host + suite + "/InRelease", IsMetadata: true, RequestCount: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
@@ -101,7 +101,7 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 		// healthy and due, and sorts before h1's stalling suites.
 		good, bad := []byte(strings.Repeat("C", 100)), []byte(strings.Repeat("z", 90))
 		pkgsR := fakePackagesStanzas(map[string]string{"pool/main/r/r/r_1.deb": testHex64})
-		relR := datedRelease("r", 0, map[string][]byte{"main/binary-amd64/Packages": pkgsR, "Contents-amd64.gz": good})
+		relR := signedRelease("r", 0, map[string][]byte{"main/binary-amd64/Packages": pkgsR, "Contents-amd64.gz": good})
 		rBase := "http://h1/r/dists/s/"
 		rByHash := rBase + "by-hash/SHA256/" + shaOf(good)
 		members.put(rBase+"main/binary-amd64/Packages", pkgsR)
@@ -131,7 +131,7 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 				return fakePackagesStanzas(map[string]string{fmt.Sprintf("pool/main/c/c/c_%s_%d.deb", host, n): testHex64})
 			}
 			rel := func(n int64) []byte {
-				return datedRelease(fmt.Sprintf("c-%s-%d", host, n), 0, map[string][]byte{"main/binary-amd64/Packages": pkgs(n)})
+				return signedRelease(fmt.Sprintf("c-%s-%d", host, n), 0, map[string][]byte{"main/binary-amd64/Packages": pkgs(n)})
 			}
 			members.put(pkgsURL, pkgs(0))
 			trackSuite(t, c, SuiteRef{CanonicalScheme: "http", CanonicalHost: host, SuitePath: cSuite})
@@ -450,7 +450,7 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 			return fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_" + label + ".deb": testHex64})
 		}
 		rel := func(label string, pkgs []byte) []byte {
-			return datedRelease(label, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
+			return signedRelease(label, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
 		}
 		pkgsURL := func(host string) string { return "http://" + host + rigSuite + "/main/binary-amd64/Packages" }
 		anchorURL := func(host string) string { return "http://" + host + rigSuite + "/InRelease" }

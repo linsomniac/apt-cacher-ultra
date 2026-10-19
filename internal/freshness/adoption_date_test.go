@@ -12,6 +12,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // datedRelease is makeRelease's text headed by a Label (so otherwise equal
@@ -24,6 +25,17 @@ func datedRelease(label string, date int64, members map[string][]byte) []byte {
 	}
 	return append([]byte(hdr), rel...)
 }
+
+// signedRelease is datedRelease in a clearsign envelope: an InRelease body
+// that spec C3's sniff passes. A pass-through verifier hands the envelope
+// to ParseRelease, which skips the armor lines.
+func signedRelease(label string, date int64, members map[string][]byte) []byte {
+	return simtest.ClearsignedFixture(string(datedRelease(label, date, members)))
+}
+
+// asInRelease wraps Release text in a clearsign envelope, as signedRelease
+// does.
+func asInRelease(text []byte) []byte { return simtest.ClearsignedFixture(string(text)) }
 
 // adoptDated runs one adoption of env's suite whose Release is labelled
 // label and dated date (0 = no Date field).

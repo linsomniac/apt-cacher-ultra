@@ -729,6 +729,11 @@ func TestRunLegacyTrustAudit_QuarantinedR1SuiteReadoptsOnFirstCheck(t *testing.T
 	if res, err := RunLegacyTrustAudit(ctx, env.cache, discardAuditLogger()); err != nil || res.Quarantined != 1 {
 		t.Fatalf("audit = %+v (%v), want 1 quarantined", res, err)
 	}
+	// A client fetched the anchor (spec C4 Dispatch 3 needs a
+	// client-created anchor row).
+	if err := env.cache.TouchURLPath(ctx, "http", "h", "/r/dists/p/InRelease"); err != nil {
+		t.Fatal(err)
+	}
 	// A clean upstream: the signed InRelease, and its Packages member for
 	// the adopter's fetcher.
 	env.fetcher.put("http://h/r/dists/p/main/binary-amd64/Packages", pkgs)

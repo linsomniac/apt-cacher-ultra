@@ -47,10 +47,18 @@ func startRetrySim(t *testing.T, refresh time.Duration) *retrySim {
 }
 
 func (s *retrySim) release(label string, date int64) []byte {
-	return datedRelease(label, date, map[string][]byte{"main/binary-amd64/Packages": s.pkgs})
+	return signedRelease(label, date, map[string][]byte{"main/binary-amd64/Packages": s.pkgs})
 }
 
 func (s *retrySim) serve(body []byte) { s.up.Set(rigAnchorURL, simtest.Serve(body)) }
+
+// touch records a client's request for the suite (its interest stamp).
+func (s *retrySim) touch(t *testing.T) {
+	t.Helper()
+	if err := s.c.TouchSuite(context.Background(), cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func (s *retrySim) row(t *testing.T) cache.SuiteFreshness {
 	t.Helper()
@@ -129,6 +137,7 @@ func TestSim30Days_RetryDateRulesAndClockSteps(t *testing.T) {
 		}
 
 		v2 := s.release("v2", time.Now().Unix())
+		s.touch(t) // apt update: a client asks for the suite again
 		s.serve(v2)
 		time.Sleep(window)
 		if s.current(t) != hashOf(v2) {
@@ -235,7 +244,7 @@ func TestSimRestartSpread(t *testing.T) {
 		for i := 0; i < 50; i++ {
 			host := fmt.Sprintf("h%02d", i)
 			seedSimSuite(t, c, host, rigSuite, now, 0) // fresh: only the retry makes it due
-			bad := datedRelease("bad-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
+			bad := signedRelease("bad-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
 			ver.reject(hashOf(bad))
 			url := "http://" + host + rigSuite + "/InRelease"
 			up.Set(url, simtest.Serve(bad))

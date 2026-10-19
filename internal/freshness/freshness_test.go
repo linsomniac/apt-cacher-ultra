@@ -118,6 +118,17 @@ func (f *fakeCache) track(scheme, host, suitePath string) {
 	}
 }
 
+// interest stamps a tracked suite's client interest (last_requested_at,
+// spec C4) at unix time at.
+func (f *fakeCache) interest(scheme, host, suitePath string, at int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := keyOf(scheme, host, suitePath)
+	s := f.suites[k]
+	s.LastRequestedAt = &at
+	f.suites[k] = s
+}
+
 // UpdateSuiteFreshness mirrors the production writer: UPDATE-only (an
 // unknown suite is left alone) and only the check columns.
 func (f *fakeCache) UpdateSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error {
@@ -1287,12 +1298,13 @@ func TestCheck_NoAdopter_ChangeOnlyLogged(t *testing.T) {
 func TestCheck_AdopterInvokedOnChange(t *testing.T) {
 	fc := newFakeCache()
 	fc.track("http", "127.0.0.1", "/dists/noble")
+	fc.interest("http", "127.0.0.1", "/dists/noble", 11000)
 	memberBody := []byte("member content")
 	memberHash := hashOf(memberBody)
 	releaseText := fmt.Sprintf(
 		"Origin: Test\nSuite: noble\nSHA256:\n %s %d main/Sources\n",
 		memberHash, len(memberBody))
-	body := []byte(releaseText)
+	body := simtest.ClearsignedFixture(releaseText)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -1304,7 +1316,7 @@ func TestCheck_AdopterInvokedOnChange(t *testing.T) {
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		Path: "/dists/noble/InRelease", BlobHash: &stale,
-		UpstreamURL: srv.URL + "/dists/noble/InRelease", IsMetadata: true,
+		UpstreamURL: srv.URL + "/dists/noble/InRelease", IsMetadata: true, RequestCount: 1,
 	})
 
 	// Real *cache.Cache for the Adopter side-effect; fakeCache for
@@ -1382,7 +1394,7 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 		"Origin: Test\nSuite: noble\nSHA256:\n %s %d main/Sources\n",
 		memberHash, len(memberBody),
 	))
-	sigBody := []byte("placeholder Release.gpg bytes")
+	sigBody := armoredSig("placeholder Release.gpg bytes")
 
 	staleHash := strings.Repeat("0", 64)
 
@@ -1519,6 +1531,7 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 	fc := newFakeCache()
 	fc.track("http", "127.0.0.1", "/dists/noble")
+	fc.interest("http", "127.0.0.1", "/dists/noble", 12000)
 
 	memberBody := []byte("fallback member content")
 	memberHash := hashOf(memberBody)
@@ -1526,7 +1539,7 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 		"Origin: Test\nSuite: noble\nSHA256:\n %s %d main/Sources\n",
 		memberHash, len(memberBody),
 	))
-	sigBody := []byte("placeholder Release.gpg bytes for fallback")
+	sigBody := armoredSig("placeholder Release.gpg bytes for fallback")
 
 	var inReleaseHits, releaseHits, gpgHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1565,7 +1578,7 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		Path: "/dists/noble/Release", BlobHash: &staleRH,
-		UpstreamURL: srv.URL + "/dists/noble/Release", IsMetadata: true,
+		UpstreamURL: srv.URL + "/dists/noble/Release", IsMetadata: true, RequestCount: 1,
 	})
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
@@ -1642,6 +1655,7 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	fc := newFakeCache()
 	fc.track("http", "127.0.0.1", "/dists/noble")
+	fc.interest("http", "127.0.0.1", "/dists/noble", 14000)
 
 	memberBody := []byte("missing-row member content")
 	memberHash := hashOf(memberBody)
@@ -1649,7 +1663,7 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 		"Origin: Test\nSuite: noble\nSHA256:\n %s %d main/Sources\n",
 		memberHash, len(memberBody),
 	))
-	sigBody := []byte("placeholder Release.gpg")
+	sigBody := armoredSig("placeholder Release.gpg")
 
 	var inReleaseHits, releaseHits, gpgHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1678,7 +1692,7 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		Path: "/dists/noble/Release", BlobHash: &staleRH,
-		UpstreamURL: srv.URL + "/dists/noble/Release", IsMetadata: true,
+		UpstreamURL: srv.URL + "/dists/noble/Release", IsMetadata: true, RequestCount: 1,
 	})
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",

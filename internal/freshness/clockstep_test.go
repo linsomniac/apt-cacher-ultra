@@ -14,7 +14,7 @@ import (
 func seedFakeAnchor(fc *fakeCache) {
 	stale := testHex64
 	fc.putURL(cache.URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: "/r/dists/x/InRelease",
-		BlobHash: &stale, UpstreamURL: "http://h/r/dists/x/InRelease", IsMetadata: true})
+		BlobHash: &stale, UpstreamURL: "http://h/r/dists/x/InRelease", IsMetadata: true, RequestCount: 1})
 }
 
 // I-7 / spec C4: a last_check_at stamp in the future (backward clock

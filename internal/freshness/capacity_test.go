@@ -16,8 +16,9 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
-// seedStaleAnchorAt caches a stale InRelease anchor (testHex64) and a
-// suite row for suite on host, so any body upstream serves is "changed".
+// seedStaleAnchorAt caches a stale client-created InRelease anchor
+// (testHex64, request_count 1) and a suite row for suite on host, so any
+// body upstream serves is "changed".
 func seedStaleAnchorAt(t *testing.T, c *cache.Cache, host, suite string) {
 	t.Helper()
 	ctx := context.Background()
@@ -26,7 +27,7 @@ func seedStaleAnchorAt(t *testing.T, c *cache.Cache, host, suite string) {
 		t.Fatal(err)
 	}
 	if err := c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: host, Path: suite + "/InRelease",
-		BlobHash: &stale, UpstreamURL: "http://" + host + suite + "/InRelease", IsMetadata: true}); err != nil {
+		BlobHash: &stale, UpstreamURL: "http://" + host + suite + "/InRelease", IsMetadata: true, RequestCount: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite}); err != nil {
@@ -64,8 +65,8 @@ func TestCheck_NoSlotQueuesWithoutAdvancingSuccess(t *testing.T) {
 func TestCheck_NoSlotQueuesDetachedToo(t *testing.T) {
 	r := newRetryRig(t, 0)
 	seedDetachedAnchors(t, r.cache)
-	r.up.setAt(rigReleaseURL, r.release("det1", 0))
-	r.up.setAt(rigReleaseGPGURL, []byte("sig one"))
+	r.up.setAt(rigReleaseURL, r.releaseText("det1", 0))
+	r.up.setAt(rigReleaseGPGURL, armoredSig("sig one"))
 	r.check()
 	adopted := r.row()
 	if adopted.CurrentSnapshotID == nil || adopted.LastSuccessAt == nil {
@@ -73,8 +74,8 @@ func TestCheck_NoSlotQueuesDetachedToo(t *testing.T) {
 	}
 	r.clock.advance(time.Hour)
 	held := mustAcquire(t, r.checker.admission, rigHost, true)
-	r.up.setAt(rigReleaseURL, r.release("det2", 0))
-	r.up.setAt(rigReleaseGPGURL, []byte("sig two"))
+	r.up.setAt(rigReleaseURL, r.releaseText("det2", 0))
+	r.up.setAt(rigReleaseGPGURL, armoredSig("sig two"))
 	r.check()
 	if r.ver.calls() != 1 || lastResult(r) != "changed_queued" {
 		t.Fatalf("calls %d result %q, want 1 changed_queued", r.ver.calls(), lastResult(r))
@@ -110,7 +111,7 @@ func TestCheck_GlobalSlotCapsConcurrentAdoptions(t *testing.T) {
 		pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat(string(rune('a'+i)), 64)})
 		seedStaleAnchorAt(t, c, host, rigSuite)
 		bf.put("http://"+host+rigSuite+"/main/binary-amd64/Packages", pkgs)
-		up.setAt("http://"+host+rigSuite+"/InRelease", datedRelease("cap", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs}))
+		up.setAt("http://"+host+rigSuite+"/InRelease", signedRelease("cap", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs}))
 	}
 	ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: bf, Verifier: passThroughVerifier{},
 		HostLimiter: hostsem.New(8), MaxConcurrent: 1})
@@ -324,7 +325,7 @@ func TestCheck_HealthySuiteAsksForNoRepairSlot(t *testing.T) {
 	r.adopter.repairSkippedMembers = true
 	// Clearsigned: the unchanged check reconciles, which parses only
 	// clearsigned InRelease (phase D).
-	r.up.set(simtest.ClearsignedFixture(string(r.release("v1", 0))))
+	r.up.set(r.release("v1", 0))
 	r.check()
 	held := mustAcquire(t, r.checker.admission, rigHost, true)
 	defer held.release()
@@ -386,7 +387,7 @@ func TestAdoption_MaxDurationBoundsAStalledAdoption(t *testing.T) {
 		c := simtest.OpenCache(t)
 		seedStaleAnchorAt(t, c, rigHost, rigSuite)
 		pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
-		rel := datedRelease("slow", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
+		rel := signedRelease("slow", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: stallFetcher{}, Verifier: passThroughVerifier{},
 			HostLimiter: hostsem.New(8), MaxConcurrent: 2, MaxDuration: 20 * time.Minute})
 		if err != nil {

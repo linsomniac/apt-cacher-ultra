@@ -66,9 +66,9 @@ func (l *lockedBuffer) String() string {
 	return l.b.String()
 }
 
-// seedStaleAnchor gives suite /r/dists/x on host h an InRelease anchor
-// whose hash differs from anything upstream serves, so a check sees
-// "changed".
+// seedStaleAnchor gives suite /r/dists/x on host h a client-created
+// InRelease anchor (request_count 1) whose hash differs from anything
+// upstream serves, so a check sees "changed".
 func seedStaleAnchor(t *testing.T, c *cache.Cache) {
 	t.Helper()
 	ctx := context.Background()
@@ -78,7 +78,7 @@ func seedStaleAnchor(t *testing.T, c *cache.Cache) {
 	}
 	if err := c.PutURLPath(ctx, cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "h", Path: "/r/dists/x/InRelease",
-		BlobHash: &stale, UpstreamURL: "http://h/r/dists/x/InRelease", IsMetadata: true,
+		BlobHash: &stale, UpstreamURL: "http://h/r/dists/x/InRelease", IsMetadata: true, RequestCount: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -195,6 +195,7 @@ func TestCheck_RepairPanicIsRecovered(t *testing.T) {
 		"main/binary-amd64/Packages": pkgs,
 		"Contents-amd64.gz":          []byte(strings.Repeat("C", 100)),
 	})
+	releaseText = asInRelease(releaseText)
 	base := "http://127.0.0.1/dists/noble/"
 	env.fetcher.put(base+"main/binary-amd64/Packages", pkgs)
 	env.fetcher.put(base+"Contents-amd64.gz", []byte(strings.Repeat("c", 90))) // stale: skipped at adoption

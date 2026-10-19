@@ -266,7 +266,9 @@ func makeChaos2DetachedSnapshot(label string) chaos2Snapshot {
 	rel := chaos2BuildRelease(map[string][]byte{
 		chaos2PackagesGzPath: pkgsGz,
 	})
-	sig := []byte(fmt.Sprintf("--detached-sig-%s--", label))
+	// An armor header (spec C3's Release.gpg sniff passes): after phase E
+	// a signature that fails the sniff is absent, not adopted.
+	sig := []byte(fmt.Sprintf("-----BEGIN PGP SIGNATURE-----\n\ndetached-sig-%s\n-----END PGP SIGNATURE-----\n", label))
 
 	return chaos2Snapshot{
 		label:      label,

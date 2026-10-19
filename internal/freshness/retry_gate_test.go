@@ -48,6 +48,7 @@ func lastResult(r *retryRig) string {
 // a 304 defers without an attempt and keeps the first-sighting stamp.
 func TestGate_DeferredSendsFailingValidators(t *testing.T) {
 	r := newRetryRig(t, 0)
+	r.adopt()
 	bad := failOnce(t, r)
 	seen := r.row().InReleaseChangeSeenAt
 	r.clock.advance(time.Minute)
@@ -72,6 +73,7 @@ func TestGate_DeferredSendsFailingValidators(t *testing.T) {
 // deferred the same way.
 func TestGate_SameContent200IsDeferred(t *testing.T) {
 	r := newRetryRig(t, 0)
+	r.adopt()
 	failOnce(t, r)
 	r.up.setIgnoreValidators(true)
 	r.clock.advance(time.Minute)
@@ -84,6 +86,7 @@ func TestGate_SameContent200IsDeferred(t *testing.T) {
 // New content is attempted at once, whatever the schedule says.
 func TestGate_NewContentIsAttemptedAtOnce(t *testing.T) {
 	r := newRetryRig(t, 0)
+	r.adopt()
 	failOnce(t, r)
 	r.up.set(r.release("fixed", 0))
 	r.clock.advance(time.Minute)
@@ -167,6 +170,7 @@ func TestGate_FutureNextRetryClampedToOneHour(t *testing.T) {
 // of one suite serialize on its mutex, so they run one after another.
 func TestGate_T1StormAfterFailureCostsNothing(t *testing.T) {
 	r := newRetryRig(t, 0)
+	r.adopt()
 	bad := failOnce(t, r)
 	before := len(r.up.etagsSent(rigAnchorURL))
 	for i := 0; i < 50; i++ {
@@ -348,9 +352,9 @@ func TestChangeSeenAndValidatorsRules(t *testing.T) {
 func TestGate_DetachedResignature(t *testing.T) {
 	for _, via200 := range []bool{false, true} {
 		r := newRetryRig(t, 0)
-		seedDetachedAnchors(t, r.cache)
+		r.adoptDetached()
 		relURL, sigURL := "http://h/r/dists/x/Release", "http://h/r/dists/x/Release.gpg"
-		rel, sig1, sig2 := r.release("det", 0), []byte("sig one"), []byte("sig two")
+		rel, sig1, sig2 := r.releaseText("det", 0), armoredSig("sig one"), armoredSig("sig two")
 		r.ver.reject(contentKey(adoptionFormDetached, nil, rel, sig1))
 		r.up.setAt(relURL, rel)
 		r.up.setAt(sigURL, sig1)
@@ -387,8 +391,8 @@ func TestGate_DetachedResignature(t *testing.T) {
 // pair is deferred too: same content key.
 func TestGate_DetachedSameContent200IsDeferred(t *testing.T) {
 	r := newRetryRig(t, 0)
-	seedDetachedAnchors(t, r.cache)
-	rel, sig := r.release("det", 0), []byte("sig one")
+	r.adoptDetached()
+	rel, sig := r.releaseText("det", 0), armoredSig("sig one")
 	r.ver.reject(contentKey(adoptionFormDetached, nil, rel, sig))
 	r.up.setAt(rigReleaseURL, rel)
 	r.up.setAt(rigReleaseGPGURL, sig)
@@ -406,14 +410,14 @@ func TestGate_DetachedSameContent200IsDeferred(t *testing.T) {
 func TestGate_DetachedCurrentContentClearsTheRecord(t *testing.T) {
 	r := newRetryRig(t, 0)
 	seedDetachedAnchors(t, r.cache)
-	good, goodSig := r.release("good", 0), []byte("good sig")
+	good, goodSig := r.releaseText("good", 0), armoredSig("good sig")
 	r.up.setAt(rigReleaseURL, good)
 	r.up.setAt(rigReleaseGPGURL, goodSig)
 	r.check()
 	if r.row().CurrentSnapshotID == nil {
 		t.Fatal("setup: good pair not adopted")
 	}
-	bad, badSig := r.release("bad", 0), []byte("bad sig")
+	bad, badSig := r.releaseText("bad", 0), armoredSig("bad sig")
 	r.ver.reject(contentKey(adoptionFormDetached, nil, bad, badSig))
 	r.up.setAt(rigReleaseURL, bad)
 	r.up.setAt(rigReleaseGPGURL, badSig)
@@ -431,7 +435,8 @@ func TestGate_DetachedCurrentContentClearsTheRecord(t *testing.T) {
 }
 
 // seedDetachedAnchors removes the rig's InRelease anchor and caches stale
-// Release + Release.gpg anchors, so checks take the detached path.
+// Release + Release.gpg anchors (client-created), so checks take the
+// detached path.
 func seedDetachedAnchors(t *testing.T, c *cache.Cache) {
 	t.Helper()
 	ctx := context.Background()
@@ -445,7 +450,7 @@ func seedDetachedAnchors(t *testing.T, c *cache.Cache) {
 	for path, h := range map[string]string{rigSuite + "/Release": testHex64, rigSuite + "/Release.gpg": other} {
 		h := h
 		if err := c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: rigHost, Path: path,
-			BlobHash: &h, UpstreamURL: "http://h" + path, IsMetadata: true}); err != nil {
+			BlobHash: &h, UpstreamURL: "http://h" + path, IsMetadata: true, RequestCount: 1}); err != nil {
 			t.Fatal(err)
 		}
 	}

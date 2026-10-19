@@ -38,9 +38,14 @@ func drainTick(ctx context.Context, c *Checker) {
 func seedFakeSuite(fc *fakeCache, host, suite string, lastSuccess *int64) {
 	bh := testHex64
 	fc.putURL(cache.URLPath{CanonicalScheme: "http", CanonicalHost: host, Path: suite + "/InRelease",
-		BlobHash: &bh, UpstreamURL: "http://" + host + suite + "/InRelease", IsMetadata: true})
+		BlobHash: &bh, UpstreamURL: "http://" + host + suite + "/InRelease", IsMetadata: true, RequestCount: 1})
+	// Client interest (spec C4): at the last success, else now.
+	interest := time.Now().Unix()
+	if lastSuccess != nil {
+		interest = *lastSuccess
+	}
 	fc.putSuite(cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
-		LastSuccessAt: lastSuccess, LastCheckAt: lastSuccess})
+		LastSuccessAt: lastSuccess, LastCheckAt: lastSuccess, LastRequestedAt: &interest})
 }
 
 func schedRow(host, suite string, lastCheck *int64, fails int64) cache.SuiteFreshness {
@@ -315,6 +320,9 @@ func TestSuiteDue(t *testing.T) {
 			LastCheckAt: at(-time.Minute), CheckFailCount: 1}, false},
 	}
 	for _, tc := range cases {
+		if tc.s.LastRequestedAt == nil {
+			tc.s.LastRequestedAt = at(-time.Minute) // client interest (spec C4)
+		}
 		if got := c.suiteDue(tc.s, now); got != tc.want {
 			t.Errorf("%s: suiteDue = %v, want %v", tc.name, got, tc.want)
 		}

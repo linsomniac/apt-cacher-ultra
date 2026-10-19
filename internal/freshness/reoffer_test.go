@@ -95,7 +95,7 @@ func TestRun_ReoffersWhenASlotFrees(t *testing.T) {
 			pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat(string(rune('a'+i)), 64)})
 			members.put("http://"+host+rigSuite+"/main/binary-amd64/Packages", pkgs)
 			up.Set("http://"+host+rigSuite+"/InRelease",
-				simtest.Serve(datedRelease("v1-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
+				simtest.Serve(signedRelease("v1-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
 		}
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
 			HostLimiter: hostsem.New(8), MaxConcurrent: 1, Logger: simtest.DiscardLogger()})
@@ -151,7 +151,7 @@ func TestRun_OfferThatLosesTheSlotKeepsItsPlace(t *testing.T) {
 			seedStaleAnchorAt(t, c, "h", suite)
 			pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat(string(rune('a'+i)), 64)})
 			members.put("http://h"+suite+"/main/binary-amd64/Packages", pkgs)
-			rels[suite] = datedRelease("v1"+suite, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
+			rels[suite] = signedRelease("v1"+suite, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
 		}
 		var aCalls atomic.Int32
 		up.Set("http://h/a/dists/x/InRelease", func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
@@ -208,7 +208,7 @@ func TestRun_BusyOfferIsRetriedAfterTheNextTick(t *testing.T) {
 		pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
 		members.put("http://h"+rigSuite+"/main/binary-amd64/Packages", pkgs)
 		anchor := "http://h" + rigSuite + "/InRelease"
-		up.Set(anchor, simtest.Serve(datedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
+		up.Set(anchor, simtest.Serve(signedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
 			HostLimiter: hostsem.New(8), MaxConcurrent: 1, Logger: simtest.DiscardLogger()})
 		if err != nil {
@@ -250,7 +250,7 @@ func TestRun_HeldOfferIsRetriedOnTheNextWake(t *testing.T) {
 		pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
 		members.put("http://h"+rigSuite+"/main/binary-amd64/Packages", pkgs)
 		anchor := "http://h" + rigSuite + "/InRelease"
-		up.Set(anchor, simtest.Serve(datedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
+		up.Set(anchor, simtest.Serve(signedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
 			HostLimiter: hostsem.New(8), MaxConcurrent: 1, Logger: simtest.DiscardLogger()})
 		if err != nil {
@@ -299,7 +299,7 @@ func TestRun_ClientRefusedSuiteIsParkedByTheNextTick(t *testing.T) {
 		pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
 		members.put("http://h"+suite+"/main/binary-amd64/Packages", pkgs)
 		anchor := "http://h" + suite + "/InRelease"
-		up.Set(anchor, simtest.Serve(datedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
+		up.Set(anchor, simtest.Serve(signedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
 			HostLimiter: hostsem.New(8), MaxConcurrent: 1, Logger: simtest.DiscardLogger()})
 		if err != nil {
@@ -352,7 +352,7 @@ func TestRun_ClientRefusedBusySuiteIsParkedInOrder(t *testing.T) {
 			members.put(pu, pkgs)
 			members.delay[pu] = 10 * time.Minute
 			up.Set("http://"+host+suite+"/InRelease",
-				simtest.Serve(datedRelease("v1-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
+				simtest.Serve(signedRelease("v1-"+host, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})))
 		}
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
 			HostLimiter: hostsem.New(8), MaxConcurrent: 1, Logger: simtest.DiscardLogger()})

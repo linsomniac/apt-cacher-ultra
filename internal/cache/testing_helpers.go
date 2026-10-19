@@ -77,8 +77,9 @@ func (c *Cache) ClearSignedSeenForTest(ctx context.Context) error {
 // SeedSuiteForTest stores s's suite row the way fixtures relied on before
 // spec C3 made every writer but CreateSuite UPDATE-only: it creates the
 // row if absent (createSuiteTx, uncapped, interest stamp now) and writes
-// s's six check columns with UpdateSuiteFreshness's statement, in one
-// writer transaction. Fixtures use it to build a tracked suite in a given
+// s's six check columns with UpdateSuiteFreshness's statement, and its
+// LastRequestedAt (the client-interest stamp) when set, in one writer
+// transaction. Fixtures use it to build a tracked suite in a given
 // state. This file is not a _test.go file, so the helper is compiled into
 // the production binary; never call it from non-test code
 // (TestOnlyTheHandlerCreatesSuiteRows fails on such a call). TEST-ONLY.
@@ -95,6 +96,13 @@ func (c *Cache) SeedSuiteForTest(ctx context.Context, s SuiteFreshness) error {
 		}
 		if err := updateSuiteFreshness(ctx, tx, s); err != nil {
 			return fmt.Errorf("SeedSuiteForTest: update: %w", err)
+		}
+		if s.LastRequestedAt != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE suite_freshness SET last_requested_at = ?
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+				*s.LastRequestedAt, s.CanonicalScheme, s.CanonicalHost, s.SuitePath); err != nil {
+				return fmt.Errorf("SeedSuiteForTest: interest: %w", err)
+			}
 		}
 		return tx.Commit()
 	})

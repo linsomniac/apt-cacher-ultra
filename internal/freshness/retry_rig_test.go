@@ -14,6 +14,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 const (
@@ -159,7 +160,10 @@ func newRetryRig(t *testing.T, cooldown time.Duration) *retryRig {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	seedStaleAnchor(t, c)
-	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}); err != nil {
+	// Client interest at the rig clock's now (spec C4 Dispatch 3).
+	interest := int64(1_800_000_000)
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite,
+		LastRequestedAt: &interest}); err != nil {
 		t.Fatal(err)
 	}
 	r := &retryRig{
@@ -190,10 +194,55 @@ func newRetryRig(t *testing.T, cooldown time.Duration) *retryRig {
 	return r
 }
 
-// release is a Release body the rig can adopt: label makes it distinct;
-// date != 0 adds a Date field.
+// release is an InRelease body the rig can adopt: the Release text of
+// releaseText in a clearsign envelope (spec C3's sniff passes it, the rig
+// verifier hands it to ParseRelease, which skips the armor lines).
 func (r *retryRig) release(label string, date int64) []byte {
+	return simtest.ClearsignedFixture(string(r.releaseText(label, date)))
+}
+
+// releaseText is a Release body the rig can adopt (detached and unsigned
+// forms): label makes it distinct; date != 0 adds a Date field.
+func (r *retryRig) releaseText(label string, date int64) []byte {
 	return datedRelease(label, date, map[string][]byte{"main/binary-amd64/Packages": r.pkgs})
+}
+
+// armoredSig is a Release.gpg body that passes spec C3's sniff (an armor
+// header); label makes it distinct. The rig verifier never checks it.
+func armoredSig(label string) []byte {
+	return []byte("-----BEGIN PGP SIGNATURE-----\n\n" + label + "\n-----END PGP SIGNATURE-----\n")
+}
+
+// adopt makes the rig suite adopted — a current snapshot of a clearsigned
+// "base" InRelease — so its checks run the current form's conditional GET
+// (spec C4 Dispatch 1), whose validators the spec C7 gate sets. The
+// verifier's call count restarts at 0.
+func (r *retryRig) adopt() {
+	r.t.Helper()
+	r.up.set(r.release("base", 0))
+	r.check()
+	if r.row().CurrentSnapshotID == nil {
+		r.t.Fatal("rig: base content not adopted")
+	}
+	r.ver.mu.Lock()
+	r.ver.n = 0
+	r.ver.mu.Unlock()
+}
+
+// adoptDetached is adopt for the detached form: the rig suite's current
+// snapshot is a "base" Release + Release.gpg pair (seedDetachedAnchors).
+func (r *retryRig) adoptDetached() {
+	r.t.Helper()
+	seedDetachedAnchors(r.t, r.cache)
+	r.up.setAt(rigReleaseURL, r.releaseText("base", 0))
+	r.up.setAt(rigReleaseGPGURL, armoredSig("base sig"))
+	r.check()
+	if r.row().CurrentSnapshotID == nil {
+		r.t.Fatal("rig: base pair not adopted")
+	}
+	r.ver.mu.Lock()
+	r.ver.n = 0
+	r.ver.mu.Unlock()
 }
 
 // check runs one freshness check and waits for any adoption it started.
