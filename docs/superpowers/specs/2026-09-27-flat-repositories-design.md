@@ -1,6 +1,6 @@
 # Flat repositories, eager adoption, and suite lifecycle — design
 
-- **Date:** 2026-09-27 (revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
+- **Date:** 2026-09-27 (revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
 - **Status:** draft for maintainer review
 - **Branch:** `feature/flat-repos` (from `main` @ 536a1ab)
 - **Origin:** reimplementation of the problem reported in PR #8 ("Refresh flat
@@ -26,7 +26,7 @@ fixes the robustness problems flat support multiplies:
 |---|---|
 | C1 Request canonicalisation | One path-canonicality rule; upstream URLs encoded exactly as apt encodes them. |
 | C2 Suite identity | Whole-directory flat suites; tightened `dists/` grammar; a leaf path package. |
-| C3 Suite rows and signals | One creation choke point with caps; client-interest stamp; signed-seen marker (written at adoption, at startup from cached anchors, and in the miss path's writer operation before a signed anchor is served). |
+| C3 Suite rows and signals | One creation choke point with caps; client-interest stamp; signed-seen marker (written at adoption, at startup from cached anchors, in the miss path's writer operation before a signed anchor is served, and by the checker when a probe finds a signature). |
 | C4 Freshness check | Probe tree in apt's order; eager first adoption; form transitions; anchorless refresh; adoption capacity; fair concurrent scheduler with a latency bound; clock rules. |
 | C5 Adoption input | Flat IndexTargets; `./` and `%` Filenames; SHA512 hash blocks; apt's `Date` rules; R-1 fix; I-1 panic recovery; inline verification accepts only decodable clearsigned envelopes; unsigned form. |
 | C6 Flat package coverage | Exact path + Filename-suffix fallback. |
@@ -434,7 +434,16 @@ that have a `suite_freshness` row. Writers:
   failed the sniff cannot pass it later. The writer is a FIFO queue drained
   by one goroutine (`cache.submitWrite`), so an unsigned `CommitAdoption`
   enqueued after a marker write runs after it, and its in-transaction
-  re-read (C5) sees the marker.
+  re-read (C5) sees the marker;
+- the freshness checker (phase E, ruling PE-5): when a probe finds a
+  sniff-passing `InRelease` or `Release.gpg` for a suite without a signed
+  current snapshot — a first adoption's probe tree, an unsigned suite's
+  upgrade probe, an absent anchor's tree — it marks the base
+  (`MarkSignedSeenBatch`, `last_seen_at` = the check's time) before the
+  check admits any request; a failed write fails the check. An unsigned
+  suite's clients never fetch a signature, so without this writer one only
+  the checker saw could be stripped later and the suite adopted unsigned;
+- the adopter, before an unsigned commit (C5 safeguard 3, ruling R-E1).
 
 A plain-text "InRelease" fails the sniff and never creates a marker. The
 marker survives suite reaping: the reaper sweeps a marker only once no
@@ -458,8 +467,11 @@ refuses or ignores connections is already collapsed by the fetch client's
 `upstream.unreachable_cooldown` fast-fail, which the probes share). The
 scheduler therefore keeps a **per-host queue of due suites**, refreshed every
 tick (newly due suites appended, queued ones not duplicated; at most
-`freshness.max_suites` entries in all), served by a fixed pool of **4 check
-workers** (constant):
+`freshness.max_suites` entries in all — when that bound cuts a tick's due
+list, the least recently checked suites are admitted first, never-checked
+ones before any and a future `last_check_at` counting as never, still
+queued in key order: phase D, ruling PD-11), served by a fixed pool of
+**4 check workers** (constant):
 
 - **across hosts:** at most one check in flight per canonical host; hosts
   take turns round-robin, **one check per turn**;
@@ -516,8 +528,12 @@ barrier (≤ 140 s) plus the commit bound — is the longest a slot is held.
 With the default pool of two and a
 first adoption holding the general slot, signed suites go through the
 reserved slot back to back. First adoptions (and unsigned ones) run only
-when the pool is otherwise empty, so a burst of them is serial;
-`max_concurrent_adoptions = 3` lets two run at once. An offered re-check
+when the pool is otherwise empty, so a burst of them is serial, and under
+sustained signed load they can wait a long time; `max_concurrent_adoptions
+= 3` lets two run at once. A queued suite is probed twice by the scheduler
+(the check that queued it and the offered re-check that admits it), plus
+once per client check while it waits (at most one per cooldown) and once
+per offer another admission takes first (phase E, ruling PE-4). An offered re-check
 uses its host's turn like any check, so *n* in the latency bound also counts
 the host's waiting suites offered before *S* (at most one per adoption on
 that host).
@@ -531,7 +547,11 @@ that host).
 | *unknown* | transport error, any other status (408, 429, 5xx, other 4xx, unfollowed 3xx), deadline — no form decision; the check fails (bump `last_check_at`) |
 
 Counting 401/403/410 as *absent* is more lenient than apt's signed fallback
-(404 only); for signed forms it can only cause a lateral move.
+(404 only); for signed forms it can only cause a lateral move. An *absent*
+answer is not an *unknown* end: it resets `check_fail_count` (phase E,
+ruling R-E4). A 304 is *present* only as the answer to a conditional
+request (the current anchor, unchanged); to a request without validators
+it is *unknown* (phase E, design note 21).
 
 **Dispatch** (adopter wired; with no adopter the Phase 1 algorithm runs
 unchanged, observation only):
@@ -539,32 +559,70 @@ unchanged, observation only):
 1. **Current snapshot inline** — conditional GET `InRelease` as today;
    changed → C7 gate → adoption request.
    **Current snapshot detached** — also probe `InRelease` each check;
-   *present* → inline adoption request (lateral). Then the conditional GET of
-   `Release` as today.
-   **Current anchor absent** (inline: `InRelease`; detached: `Release`) on two
-   checks at least `max(cooldown, 5m)` apart → run the probe tree without
-   validators and adopt the form found: inline ⇄ detached is a lateral move;
-   never unsigned from signed. If no signed form is *present*, record the
-   refusal state `anchor_absent` (visible; `last_success_at` not bumped;
-   the snapshot keeps serving).
+   *present* → inline adoption request (lateral; lateral content whose
+   adoption failed keeps its record, which the detached anchor's
+   `unchanged` does not clear). Then the conditional GET of `Release` as
+   today; a changed `Release` whose `Release.gpg` is *absent* records
+   `anchor_absent` and is never adopted (phase E, design review M-14).
+   **Current anchor absent** (inline: `InRelease`; detached and unsigned:
+   `Release`) → the first absent observation records the refusal state
+   `anchor_absent` (visible at once; `last_success_at` not bumped;
+   `check_fail_count` reset; the snapshot keeps serving; content key
+   sha256("anchor_absent"), which no content matches). The record paces the
+   suite: while it is active and not due, a check makes no request and the
+   scheduler does not queue the suite — the anchor is asked for again at
+   the record's retry time, and client checks in between ask nothing
+   (phase E, ruling PE-2). Once the record is due and the absence has
+   lasted `max(cooldown, 5m)` — two observations, measured from
+   `adoption_fail_first_at`, which never confirms when it lies in the
+   future (deviation 2) — run the probe tree without validators and adopt
+   the signed form found: inline ⇄ detached is a lateral move, and an
+   unsigned suite may find a signed form; a signature found for a suite
+   without a signed current snapshot is marked first (C3). The current form
+   and content found again is `unchanged` and clears the record; an
+   unsigned suite's own form with new bytes is its update; for a signed
+   suite an unsigned candidate, or nothing, is recorded again — never
+   unsigned from signed. A record from an adoption attempt (a failed
+   lateral move) keeps its own C7 schedule (phase E, deviation 1).
 2. **Current snapshot unsigned** — probe `InRelease` and `Release.gpg`; if
-   either is *present* → signed adoption request (upgrade). Otherwise
+   either is *present* → mark the base (C3) and make a signed adoption
+   request (upgrade): from then on the suite is never adopted unsigned
+   (C5 safeguard 3), also after the signature goes away. Otherwise
    conditional GET `Release`; changed → unsigned adoption request (no
    re-confirmation). If a signature is present but the signed adoption
    cannot succeed (key not on the cache host), the suite keeps its last
    unsigned snapshot and the admin page shows the reason; the fix is
-   installing the key (or `adoption.accept_any_signer`).
+   installing the key (or `adoption.accept_any_signer`). A signature probe
+   that ends *unknown* fails the check, and a *present* signature whose
+   signed adoption is deferred (C7) is `changed_deferred`: an unsigned
+   suite is never updated past a signature (phase E, design note 24).
 3. **No current snapshot (eager first adoption)** — only if
    `last_requested_at` is within a constant **7-day interest window**
    (independent of GC settings) and the suite has a client-created anchor or
-   flat index `url_path` row (`request_count > 0`; never reconstructed).
-   Probe tree without validators:
+   flat index `url_path` row (`request_count > 0`; never reconstructed). The
+   window is symmetric: a `last_requested_at` up to 7 d in the future counts
+   as interest, one further ahead is dormant until a client touches the
+   suite (design review M-3). Of the anchor rows only `InRelease` and
+   `Release` count (apt fetches `Release.gpg` only after `Release`; phase
+   E, design notes 13 and 14). A returning client's first request may find
+   its suite still dormant (its touch and its T1 run concurrently); the
+   next tick checks it, within one tick of that request (M-12). A suite
+   whose record is active and not due is paced: while its last check is
+   younger than `periodic_refresh`, no probe runs, so client checks ask
+   nothing and new content is attempted within one refresh interval (phase
+   E, ruling PE-3). Otherwise the probe tree runs without validators (the
+   C7 gate compares content keys; phase E, design note 15), and a
+   *present* signature marks the base before any request is admitted
+   (C3):
    - `InRelease` *present* → inline request;
    - `InRelease` *absent* → `Release`: *present* → `Release.gpg`: *present* →
      detached request; *absent* → unsigned candidate (C5);
    - `Release` *absent* → for flat suites that have no signed-seen marker and
      no sniff-passing cached anchor row, the **anchorless refresh**; otherwise
-     a failed check;
+     a failed check, which extends `check_fail_count`: a suite with nothing
+     to serve backs off like an *unknown* end (phase E, design note 19), and
+     records the refusal state `anchor_absent`, so the status page shows it
+     (ruling PE-2);
    - any *unknown* → failed check.
 4. **Anchorless refresh** (flat, Release-less suites only): conditional GET
    (stored `upstream_etag`/`upstream_lastmod`) of each cached `url_path` row
@@ -683,6 +741,12 @@ for **every** declared algorithm. A Packages stanza with a Filename but no
 SHA256 makes coverage incomplete (reason `no_sha256`), never a silent drop.
 Limitation (documented): integrity-skipped SHA512-only members are not
 recorded for skip-repair; reconcile still heals requestable IndexTargets.
+SHA512 is verified before the bytes reach the pool; a SHA512-only member
+is never reused from the pool (which is keyed by SHA256); a pooled blob
+whose SHA256 matches but whose SHA512 does not fails the member; a
+malformed or conflicting SHA512 entry fails the parse; repair recovers
+the declared hashes from the snapshot's Release; the by-hash probe uses
+the strongest declared hash (phase E, design notes 3–7).
 
 **`Date` rules** (apt's). The verified Release text's `Date:` is parsed with a
 port of apt's `RFC1123StrToTime` (GMT/UTC/Z or zero numeric offset; asctime;
@@ -762,30 +826,62 @@ upgrade (§6.1).
    least `max(cooldown, 5m)` apart for 404/410, or at least 1 h apart when
    either signature file answered 401/403 (WAF and S3-permission incidents);
    the first observation records reason `unsigned_unconfirmed` and the
-   comparison uses `adoption_fail_first_at` (restart-safe). Updates of an
-   established unsigned suite adopt at once.
+   comparison uses `adoption_fail_first_at` (restart-safe; the record's
+   streak restarts whenever the bytes or the reason change, so the stamp is
+   the first observation of these bytes). The hour applies when a
+   signature probe of the confirming observation answered 401/403; bytes
+   that already passed confirmation (a record for them from an adoption
+   attempt) are not confirmed again; a future `adoption_fail_first_at`
+   never confirms (phase E, design notes 16–18 and deviation 2). Updates
+   of an established unsigned suite adopt at once.
 3. **Never downgrade:** refused (`unsigned_downgrade_refused`, a refusal
-   state) when a `suite_signed_seen` marker exists for the suite's base. The
-   marker outlives reaping, covers the `./` twin, and is committed in the
-   writer operation that stores a signed anchor, before any client is served
-   it (C3). The check runs twice:
-   at eligibility, and again **inside the `CommitAdoption` writer
-   transaction**, which re-reads the marker for the candidate's base and
-   refuses an unsigned candidate (no pointer change, no rows) when one exists
-   or when the prior current snapshot is signed. The suite mutex alone cannot
+   state) when a `suite_signed_seen` marker exists for the suite's host and
+   base under either scheme (`http` or `https`: a base seen signed over
+   `https` gives the same base over plain `http` the same protection; phase
+   E, design review M-7), or when an adopted, non-retired inline or
+   detached snapshot of the base or its `/.` twin exists under either
+   scheme (M-8: also a signed displaced snapshot the audit left queued and
+   unmarked while it quarantined the current one). The marker outlives
+   reaping, covers the `./` twin, and is committed in the writer operation
+   that stores a signed anchor, before any client is served it (C3). One
+   rule, one function (`refuseUnsignedDowngrade`: a marker read and a
+   snapshot read) at every point it runs: at eligibility, and again
+   **inside the `CommitAdoption` writer transaction**, which refuses an
+   unsigned candidate (no pointer change, no rows) when it holds. The suite mutex alone cannot
    close this race: the handler and the `/.` twin establish signed history
-   without it.
-4. At most 1,000 declared members (`unsigned_too_large`).
+   without it. Before an unsigned commit the adopter also re-runs the
+   cached signed-anchor mark under the suite mutex: it reads the
+   `<suite>/InRelease` and `<suite>/Release.gpg` `url_path` rows of the
+   suite and of its `/.` twin (design review I-3), sniffs their pool files
+   outside the writer and marks the base for each that passes, before the
+   commit is enqueued (FIFO: the commit's re-read sees it); a failed mark,
+   or a pool read error other than a missing file, refuses the adoption
+   (phase E, ruling R-E1) and is logged (`adoption: signed-anchor re-mark
+   failed`, WARN; ERROR for a pool read error; M-1) — that refusal means
+   "could not rule out a signature". A refusal inside the
+   commit is the refusal state, not a failure: its own sentinel, no
+   `adoption: commit failed` WARN, no `db_failed`, `adoption_flip_barrier`
+   outcome `refused`, also after a barrier that outlived
+   `adoption.max_duration` (ruling R-E2). Eligibility is also checked by the
+   check, before a slot is taken.
+4. At most 1,000 declared members, counted as the distinct paths of the
+   merged SHA256 and SHA512 lists (`unsigned_too_large`); the check applies
+   it before a slot is taken, and the adoption again before any download
+   (phase E, design review M-5).
 5. No `package_hash` rows on **any** path (adoption, repair, reconcile:
    `buildPackageHashes` takes the form); `DeclaredHashesForPath` and
    `HostCurrentSnapshotsCoverage` filter `anchor_form <> 'unsigned'`.
 
 Threat notes (documented at the knob): the signed-seen marker cuts both
-ways — anyone who can make the cache serve one sniff-passing `InRelease`
-for a base (a MITM, a compromised upstream, or a LAN client pointing the
-cache at a host it controls) blocks unsigned adoption of that base until
-`POST /forget`; this denial of service is the accepted price of never
-downgrading. A MITM on the cache→upstream path can
+ways — anyone who can make the cache serve, or a check find (C3), one
+sniff-passing `InRelease` or `Release.gpg` for a base (a MITM, a
+compromised upstream, or a LAN client pointing the cache at a host it
+controls) blocks unsigned adoption of that base until `POST /forget`; this
+denial of service is the accepted price of never downgrading. A suite
+whose pre-v7 snapshot §6.1 quarantined for `anchor_missing`,
+`anchor_corrupt` or `anchor_oversized` may have no marker until a check
+sees its signature upstream; if its signatures are stripped before then,
+it adopts unsigned (phase E, design review M-9). A MITM on the cache→upstream path can
 make the cache adopt forged unsigned content only for a suite never seen
 signed, after two consistent observations; verifying clients reject it,
 `[trusted=yes]` clients accept it as they would fetching directly. Under the
@@ -849,7 +945,10 @@ C-20). `count` and `first_at` describe the failure streak since the last
 success.
 
 **Content key.** inline: sha256(InRelease); detached: sha256(sha256(Release)
-‖ sha256(Release.gpg)); unsigned: sha256(Release). Any byte change is new
+‖ sha256(Release.gpg)); unsigned: sha256("unsigned\n" ‖ Release), domain-separated
+from an inline key over the same bytes (phase E, design review M-2); an `anchor_absent` record:
+sha256("anchor_absent"), a constant no content matches (phase E). Any byte
+change is new
 content and is attempted at once (subject to slots). A re-signature alone of
 a detached suite is noticed at the next retry (≤ 1 h), because a 304 on
 `Release` does not fetch `Release.gpg`.
@@ -865,7 +964,9 @@ re-downloading everything.
 
 **Refusal states** use the same record and schedule but are not failures:
 `upstream_older`, `rollback_refused`, `unsigned_downgrade_refused`,
-`unsigned_unconfirmed` (confirmation timing from `adoption_fail_first_at`),
+`unsigned_unconfirmed` (confirmation timing from `adoption_fail_first_at`;
+its streak, like `anchor_absent`'s, restarts on new content or a new
+reason),
 `unsigned_too_large`, `anchor_absent`. They are excluded from the
 failing-suites gauge and from `adoption_failing_persistently`, and shown as
 "refused: …" in the admin page.
@@ -874,8 +975,20 @@ failing-suites gauge and from `adoption_failing_persistently`, and shown as
 `now < next_retry_at` the check sends the *failing content's* validators: a
 304 or a 200 with the same key ⇒ `changed_deferred` (no clear, no repair);
 new content ⇒ attempt. At or after `next_retry_at` the check GETs without
-validators and attempts. The record is cleared in the flip transaction and
-when upstream again serves the current snapshot's content.
+validators and attempts. A record's validators are those of the anchor
+file its request fetched: a cross-form request (a detached suite's lateral
+`InRelease`, an unsigned suite's upgrade probe, an absent anchor's tree)
+records none, and while a record without validators is active and not due
+the check sends the current anchor's own; a 304 is `changed_deferred` only
+when the record's validators were sent, otherwise `not_modified` (phase E,
+design review I-1). The C4 probe tree sends no validators: there the gate
+compares content keys only (phase E, design note 15). Two records pace
+their suite instead of gating a request: an adopted suite's
+`anchor_absent` (no request before its retry time) and a never-adopted
+suite's active record (no probe before its retry time while its last check
+is younger than `periodic_refresh`) — C4 Dispatch 1 and 3, rulings PE-2
+and PE-3. The record is cleared in the flip transaction and when upstream
+again serves the current snapshot's content.
 
 **Restart.** At checker start every failing row (not refusal states, not
 reason `panic`) gets `next_retry_at = now + rand(0, periodic_refresh)`: one
@@ -1092,17 +1205,30 @@ suites and seeded-but-unadopted suites never count and never vouch. Flat
 snapshots now normally have complete coverage, so strict mode protects flat
 hosts.
 
-**In-flight adoptions (D10).** The checker tracks in-flight adoptions per
-canonical host. On the hit path, before answering `unvouched_deb_refused`,
-the handler waits up to 15 s for in-flight adoptions on the request's host,
-then re-runs the lookup once. On the miss path, where the strict decision sits
+**In-flight adoptions (D10).** The checker tracks in-flight signed adoptions
+per canonical host (an unsigned adoption never vouches, so it is not waited
+for; a count ends when the adoption goroutine returns, after its commit:
+phase E, design note 27). On the hit path, before answering
+`unvouched_deb_refused`,
+the handler waits for in-flight adoptions on the request's host — at most
+min(15 s, 25 s − the request's age), and not at all when less than 1 s of
+that is left (phase E, design review M-10: the miss path still downloads
+the whole `.deb` before its first byte, within apt's 30 s) — then re-runs
+the lookup once. On the miss path, where the strict decision sits
 inside singleflight after host-slot acquisition by design, `runFetch` returns
 `errUnvouchedRetryable` (releasing its slot) when an adoption is in flight on
-the host; `serveCacheMiss`, outside singleflight, waits up to 15 s and retries
-the miss once. At most 64 waiters per host; beyond that the refusal is
-immediate.
+the host; `serveCacheMiss`, outside singleflight, waits under the same
+bound and retries the miss once: requests that waited together coalesce
+again, a client that left during the wait gets no retry, and the refusal
+is logged once per fetch, by the singleflight leader (design review O1).
+At most 64 waiters per host, each waiting request counting (coalesced
+requests for one `.deb` included); beyond that the refusal is immediate.
 
-Documented consequences: an adoption that takes longer than 15 s (large
+Documented consequences: a client fetching N unvouched packages one
+after another during a long adoption waits up to 15 s for each (M-11); an
+adoption's count ends after its flip barrier (up to 140 s for a busy
+suite), so a package whose snapshot is still in its barrier is likely to
+wait the full 15 s and be refused; an adoption that takes longer than 15 s (large
 `dists/` suites), a queued (not yet running) first adoption, and an unsigned
 or anchorless repository on a host that also serves complete signed suites
 all lead to refusals; strict posture changes as eager adoptions land after
@@ -1128,7 +1254,9 @@ gauges `acu_adoption_failing_suites` (C7), `acu_freshness_waiting_for_slot`
 (suites waiting for an adoption slot, C4) and `acu_flip_barrier_active`
 (flips in the C8 barrier now), the C3 pair
 `acu_suite_seed_rejected_total{host}` (counter) and
-`acu_suites_seed_rejected` (gauge), and `acu_freshness_unlogged_panics_total`.
+`acu_suites_seed_rejected` (gauge), `acu_freshness_unlogged_panics_total`,
+and phase E's `acu_repair_deferred_total{host}` and
+`acu_strict_adoption_waits_total{host}`.
 New metrics are host-labelled or
 unlabelled (no suite labels) and are added to the metrics inventory comments in
 `internal/freshness/metrics.go` and `internal/handler/metrics.go`.
@@ -1145,9 +1273,13 @@ unlabelled (no suite labels) and are added to the metrics inventory comments in
 Constants, not knobs: backoff 2 m → 1 h (adoption failures and repeated
 *unknown* checks); hold 20 s, of which the last 5 s are kept for the commit
 (the C8 quiet cut at 15 s); phase A cap 60 s; hold-token wait 60 s; waiter
-caps 256 (barrier) and 64 (strict wait); strict wait 15 s; reaps 25 per run;
-unsigned member cap 1,000; check deadline 2 min; check workers 4; interest
-window 7 d; orphan-marker TTL 365 d; cap-rejection cache 10 min (1 min for
+caps 256 (barrier) and 64 (strict wait); strict wait 15 s, within a 25 s
+request budget, none below 1 s; the miss path's backstop deadline at most
+25 s after the request started; reaps 25 per run;
+unsigned member cap 1,000; anchor-absent and unsigned confirmation gap
+`max(cooldown, 5 min)`, 1 h after a 401/403 on a signature file; check
+deadline 2 min; check workers 4; interest window 7 d; orphan-marker TTL
+365 d; cap-rejection cache 10 min (1 min for
 a refusal while every eviction candidate is busy; at most 4,096 suites);
 tracked suite path at most 1024 bytes; legacy-audit anchor
 read cap 8 MiB and batch 100.
@@ -1391,7 +1523,13 @@ files), in phase D.
   continue; goroutines ≤ workers + cap + constant; at unit level a queued
   suite is not probed by ticks while it waits, is re-checked within *D* of
   its slot's release with the cooldown bypassed, and a busy offer neither
-  spins nor loses its place;
+  spins nor loses its place; the upgrade burst — 50 never-adopted suites
+  with interest and a trickle of signed changes, pool of 2: first
+  adoptions back to back, a signed change waits for at most one adoption,
+  each first adoption costs two probes by the scheduler, plus one per client
+  check while it waits and one per offer another admission takes first
+  (phase E, ruling PE-4: the deterministic burst, and a racing one with
+  every suite on one host);
   clock steps ±2 h/±30 d with liveness asserts;
   `TestCheck_NoAdopter_ChangeOnlyLogged` (setup seeds the row); scheduler
   fairness: timing-out anchor probes on one host ahead of healthy suites on
@@ -1404,8 +1542,11 @@ files), in phase D.
   older/future/equal/missing rules; unsigned confirmation (404 and 403
   timings), never-downgrade at both points, member cap, no `package_hash`
   from reconcile; an unsigned adoption paused before commit while a signed
-  anchor is served and its marker committed (also via the `/.` twin) is
-  refused with no pointer change; `require_signature = false` with
+  anchor is served and its marker committed (also via the `/.` twin, in
+  phase G) is refused with no pointer change, as a refusal state; a
+  missing marker with a sniff-passing cached signed anchor is re-marked
+  before the commit, which then refuses (ruling R-E1);
+  `require_signature = false` with
   marker-present malformed or frameless bodies creates no inline snapshot,
   `package_hash` row or strict participant (`malformed_clearsign` distinct
   from `missing_signature`); `TestCheck_UnsignedRecoversWhenReleaseAnchorMissing`;

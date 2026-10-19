@@ -347,14 +347,14 @@ next to the Suites table contract in §5.3:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `anchor_form` | string | The current snapshot's signing form — `inline` or `detached` today (`unsigned` joins in a later phase); empty when the suite has no current snapshot. |
+| `anchor_form` | string | The current snapshot's anchor form — `inline`, `detached` or `unsigned` (a `Release` no signature covers: it vouches no `.deb`); empty when the suite has no current snapshot. |
 | `last_requested_unixtime` | int64 or `null` | When a client last showed interest in the suite (spec C3): written when the suite's row is created, then by coalesced touches — at most one write per suite per hour — from serves of its anchors (`InRelease`, `Release`, `Release.gpg`; status below 400, 304 and HEAD included), of its flat indexes, and of `.deb`s its current snapshot vouched for. Index requests such as `Packages.gz` never move it. It decides cap eviction: at the `freshness.max_suites` cap, a suite with no current snapshot whose stamp is 24 hours old or more can be evicted for a new one (`suite_evicted`). |
-| `check_fail_count` | int64 | Consecutive checks that ended unknown (transport error, deadline, unexpected status) since the last answered check; drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check. |
+| `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, which also records `anchor_absent`; an unsigned `Release` while `adoption.adopt_unsigned` is off; a signature the check found but could not record as seen). Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. |
 | `adoption_fail_reason` | string or `null` | The current failure or refusal reason; `null` when no record exists. |
 | `adoption_fail_count` | int64 | Consecutive adoption attempts in the current failure/refusal streak; `0` when no record exists. |
 | `adoption_fail_first_unixtime` | int64 or `null` | When the current streak started. |
 | `adoption_next_retry_unixtime` | int64 or `null` | When the same content is retried next; new content is tried at once regardless of this stamp. |
-| `adoption_refused` | boolean | `true` when the record above is a refusal state (`upstream_older`, `rollback_refused`, …), not a failure. |
+| `adoption_refused` | boolean | `true` when the record above is a refusal state (`upstream_older`, `rollback_refused`, `unsigned_downgrade_refused`, `unsigned_unconfirmed`, `unsigned_too_large`, `anchor_absent`), not a failure. |
 
 These are additive to the locked JSON contract (§0.1), the same way
 `keyring[]` was: no existing key changes shape or meaning.
@@ -369,6 +369,26 @@ refusal record. While adoption is disabled, the text gains the suffix
 ` (adoption disabled)`: the record was stored while adoption was enabled
 and is inert now.
 
+**Unsigned and absent-anchor refusals (phase E).** `unsigned_unconfirmed`
+is an unsigned repository waiting for its second observation
+(`max(cooldown, 5 min)` after the first, an hour when the confirming check
+sees a 401/403 on a signature file) and clears itself when it adopts;
+`unsigned_downgrade_refused` (the suite was seen signed) lasts until
+upstream serves a signature the cache adopts, or the suite is forgotten
+(`POST /forget`, added with suite reaping in a later release);
+`unsigned_too_large` (more than 1,000 declared files) lasts until
+upstream's `Release` declares fewer; `anchor_absent` means the current
+snapshot's anchor is gone upstream (or a detached suite's changed
+`Release` has no `Release.gpg`) while the snapshot keeps serving, or, for
+a suite without a snapshot, that upstream serves neither `InRelease` nor
+`Release`. None of them hides lag (only `upstream_older` and
+`rollback_refused` do, §9.1), and all four follow the `REFUSED 24H+` rule
+below. A suite without a snapshot shows lag from the first check that
+found its anchor, so a first adoption refused for good
+(`unsigned_downgrade_refused`, or an `unsigned_unconfirmed` that never
+confirms) shows a lag that keeps growing: the suite has in fact never been
+adopted.
+
 **FAILING count.** The Suites panel's eyebrow and the SUITES vital cell's
 sub-line count suites with a genuine failure record (`adoption_refused ==
 false` and a record exists) as FAILING; a refusal is a state, not a
@@ -382,8 +402,11 @@ silent freeze — a vendor that stops emitting `Date` is refused
 `upstream_older` forever, and that reason's lag is suppressed. Such a row
 warns (`data-state="warn"`), the SUITES vital warns (never crit), and the
 eyebrow and the vital's sub-line add `{n} REFUSED 24H+` (only when > 0).
-Below 24 h nothing changes. The checker logs WARN
-`adoption_refused_persistently` for the same condition.
+Below 24 h nothing changes. The checker also logs WARN
+`adoption_refused_persistently`, but only at a streak milestone (the 3rd,
+6th, 12th, 24th, 48th … attempt) reached once the streak is 24 h old:
+with hourly retries the first comes at the 48th attempt, about 43 h in —
+about a day after the row starts warning.
 
 **Adoption disabled.** With adoption disabled (the shipped default) a
 stored record marks no warn and is not counted as FAILING or REFUSED 24H+,

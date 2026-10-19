@@ -32,17 +32,13 @@ Left out: everything the phase C final fix wave resolved (the phase-A wake test,
 
 ## internal/freshness
 
-- **C-16** `adoption.go:1813`: `servedAnchorUnchanged` reads under `context.WithoutCancel(ctx)` — neither shutdown nor any bound ends the read while the goroutine holds the suite mutex and a global slot — and drops errors other than not-found silently. Read under `p.barrierCtx(ctx)` and log the others (the barrier still runs on an error). (E: it touches this function for the unsigned form)
-- **C-17** `adoption.go:918`: `stopErr`'s fallback for `Run`/`RunDetached` (no stop context) has no direct test; a mutant returning `nil` survives. A case with `runHooks{membersDone: cancel}` and a nil stop would pin design note 14.
-- **C-19** (narrowed by phase D) only its file-split half remains: split the barrier code out of `freshness/adoption.go`; the long `spawnAdoption` AIDEV-NOTE line was wrapped in phase D.
 
 ## internal/handler
 
-- **C-21** (narrowed by phase D) only its context fast path remains (it needs new `flipgate` API); the `EXISTS` read landed in phase D, Task 10.
+- **C-21** (narrowed by phase D) only its context fast path remains (it needs new `flipgate` API); the `EXISTS` read landed in phase D, Task 10. Phase E leaves it (no measured gain, and it would touch the barrier's registration race; ruling PE-7). (H)
 
 ## cmd/apt-cacher-ultra
 
-- **C-29** `main.go:483` / `internal/freshness/legacy_audit.go:45-59`: A-48 relies on every `RunLegacyTrustAudit` error being prefixed "legacy trust audit:"; state the rule in the callee's doc.
 
 ## Docs and packaging
 
@@ -51,9 +47,8 @@ Left out: everything the phase C final fix wave resolved (the phase-A wake test,
 
 ## Simulation budget and flakes
 
-- **C-38** Two phase-B simulations have little or no room under the 5 s `-race` budget: `TestSimScheduler_FiveHundredStallingOneHealthy` (6.15–7.82 s in the final tests review, 6.37 s in the fix wave's run) and `TestSim30Days_RetryDateRulesAndClockSteps` (4.4–5.1 s, then 3.85 s). Phase C does not change them. Coarsen them, never dropping assertions. (B scope; H)
+- **C-38** (narrowed by phase E: `TestSim30Days_RetryDateRulesAndClockSteps` was coarsened in phase E, Task 14, to about 3.6 s, every assertion kept at its per-day rate) `TestSimScheduler_FiveHundredStallingOneHealthy` has no room under the 5 s `-race` budget (6.15–7.82 s in phase B's final tests review, 6.37 s in its fix wave's run, 7.9 s in phase E). Coarsen it, never dropping assertions. (B scope; H)
 - **C-39** One unexplained failure of `TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency` in a loaded parallel run (final review, concurrency; it did not reproduce in four `-race` reruns or alone). The test wires no gate and runs in real time. Investigate if it recurs. (H)
 
 ## Process
 
-- **C-40** Phase C's task commits (1f5d37e, a8eb0cd, 02d4474, 34465fa, 2df0acc, d823746) carry no mutant → failing-test lines, and that evidence lives only in session scratchpads; record a mutant table where it survives (the phase C stamp commit or the overview's phase C row; final review spec R2, task reviews 4, 6–10).

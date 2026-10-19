@@ -8,11 +8,8 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
 
 ## internal/aptpath
 
-- **D-1** `sniff_test.go:195`: the empty-suite row `{"", "/x/InRelease", NotSuiteFile}` does not exercise `ClassifySuiteFile`'s `suite == ""` guard (`sniff.go:193`): without the guard it still passes (the name becomes `x/InRelease`), yet `ClassifySuiteFile("", "/InRelease")` would return `FileInRelease`. Fix: use `{"", "/InRelease", NotSuiteFile}` and add `{"", "/Packages.gz", NotSuiteFile}`. Can wait: callers guard `SuitePath != ""`, except the stale touch, an UPDATE no-op. (Task 1 minor 1)
-- **D-2** `sniff_test.go` (`TestSniffRelease`): one row covers the 64 KiB window's outer edge, with the header one byte past it, so an overrun of 1 to 7 bytes at `sniff.go:100` survives. Fix: add a row whose header line ends exactly at the window's edge. Can wait: a harmless overrun of a few bytes. (Task 1 minor 3)
 - **D-3** `sniff_test.go` (`TestSniffFlatIndex`): only `.gz` and `.xz` have negative magic rows; shortening the `.zst` or `.lzma` magic (`sniff.go:123-125`; `.bz2`, `.lz4` alike) survives. Fix: one near-miss row per extension. Can wait: flat indexes are unreachable until G. (G) (Task 1 minor 4)
 - **D-4** `sniff.go:192`: `ClassifySuiteFile` (the PD-9 gate and the R-D3 routing point) has no AIDEV-NOTE naming its precondition (`suite` is `SuitePath(path)`), the `""` guard its callers rely on, and that its flat branch is reachable only from tests until G; `SuitePath`'s phase-G AIDEV-NOTE does not point here. (G) (Task 1 minor 5)
-- **D-5** `sniff_test.go` (`TestDecodableClearsign`): `(end == len(clearsignBegin)+1 && b[end-1] == '\r')` → `end == len(clearsignBegin)+1` survives: a marker line with exactly one trailing space or tab is not rewritten, and go-crypto refuses a body apt accepts. Fix: add `{m + " \nHash: SHA256\n", m + "\nHash: SHA256\n"}`. Can wait: an adoption-only liveness gap for rare repositories. (E) (Task 2 minor 3)
 
 ## internal/gpg
 
@@ -37,12 +34,9 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
 - **D-18** `fetched_row.go:17-31`: "Create.SuiteKey == Suite" (and Restamp's key) is documented, not checked; a mismatched caller would create one suite, re-stamp another and mark a third, silently. Fix: a guard in `StoreFetched` that returns an error. (Task 6 minor 4)
 - **D-19** Doc nits: `fetched_row.go:12` and `:44` say "a metadata miss", but every miss goes through `StoreFetched`, `.deb` rows included; `FetchedResult.Marked` has no production reader and does not cover `markCreated`'s marks (`fetched_row_test.go` asserts it false while a marker was written) — say "MarkSeenAt's marker was written". (Task 6 minor 8)
 - **D-20** `suite_rows.go` (`creationAttempt`): the exact purge after a failed submit whose eviction did commit (design review M3: afterCreate's re-read) has no end-to-end test. Since the fix wave, dropping the failure-path `afterCreate` still releases the hold (the deferred settle) and survives `TestCreateSuite_AFailedSubmitReleasesItsCandidate`; what it loses is that purge — one lock-map, gate and touch entry left behind, bounded, as after afterCreate's read error. A test needs a commit that races its context's end in `submitWrite`. (Final fix wave, FW-2)
-- **D-21** C-10's scheme predicates are still unpinned: the stamp's prior read, `f.canonical_scheme = ?` (`adoption.go`), and `DisplacedSnapshotMembers`' `canonical_scheme = ?` (`snapshot_reads.go`); dropping either survives, although the test claims "another host or scheme". Fix: an `https` twin whose current snapshot is adopted later, and an adopted `https` snapshot holding the alias. (Task 12 minor 3)
-- **D-22** `adoption_scope_test.go`: when `GetSuiteSnapshot` fails it returns a nil `snap`, and the `t.Fatalf` argument `derefI64(snap.AdoptedAt)` panics, hiding the error. Fix: check `err` in its own `if`. (Task 12 minor 4)
 
 ## internal/freshness
 
-- **D-23** `scheduler.go:600` (`boundDue`): the "admitted ones keep key order" half is untested — a `boundDue` returning `byCheck[:room]` passes every test, breaking C4's FIFO-by-key enqueue silently. Fix: `MaxSuites` 2 with three healthy suites checked 1000 s, 2000 s and 100 s ago; the pop order must be `/s1`, `/s2`. Can wait: it matters only when the bound binds, above the cap. (Task 7 minor 2)
 - **D-24** `suite_lock_test.go` (`TestCreateSuite_ReportsAFutureStampThroughTheChecker`): asserts `stamp` and `suite_path` but not `canonical_host`/`canonical_scheme`; `ReportClockStep` passes three same-typed strings by position, so swapping two compiles and passes. (Task 7 minor 4)
 - **D-25** Placement and doc nits: `ReportClockStep` (`suite_lock.go:113`) belongs in `clockstep.go` beside `clockStep`; the three scheduler tests in `suite_lock_test.go` belong in `scheduler_test.go`; `HoldSuite`'s doc names "a check, adoption, repair or reconcile" and the stale entry as the reasons `ok` is false, but not a concurrent `HoldSuite` (a racing eviction, F's reaper) or, since the fix wave, a check's lock-map peek. (Task 7 minor 5 — its other two bullets were fixed in the first fix round; re-review r1)
 - **D-26** `reconcile_r1_test.go` (`DecodesAptsMarkerLine`) never asserts that `bytes.Replace` matched: if the encoder's first line ever ended in "\r\n", the test would pass without exercising the trailing-blank path. Fix: a `bytes.Equal(blanks, signed)` guard. (Task 3 minor 5)
@@ -55,12 +49,7 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
 - **D-30** `phase2_handler_test.go` (`TestServeHTTP_AdoptedSuiteSnapshotMemberDBError_FailsClosed`): its upstream `/InRelease` body `"attacker bytes"` stays plain text with no PD-2 comment (no effect: the test asserts zero upstream calls; its sibling was wrapped). (Task 3 minor 4)
 - **D-31** Untested: the recover inside the rejection sweep's `expire` itself (its `onPanic` wiring and `Handler.Close` stopping it are pinned since the fix wave), and `New` refusing a negative `MaxSuites`. (Task 9 minor 2, narrowed)
 - **D-32** `suite_rows.go`: `cachedAnchors` and `markCachedSignedAnchors` repeat one loop (iterate, skip `except`, `LookupURL`, classify, `readHead`, sniff); the in-transaction mark and the backstop must agree on what counts as signed. One helper returning `(row, signed, err)` would keep them together. `runFetch` also builds `suiteSeed` twice with identical arguments. Can wait: the copies agree today. (G: if the sniff rules change) (Task 9 minor 3)
-- **D-33** `handler.go:761`: `tryByHashContentAddressed`'s doc says "Three security gates apply before a serve" and omits the known-suite gate, now the second of four. (Task 10 minor 4)
-- **D-34** `suite_rows.go:454`, `:471`: onboarding's creation and backstop derive from `context.WithoutCancel(r.Context())`, so a graceful shutdown cannot cut them short (the miss path uses `h.lifecycleCtx` for exactly that). Bounded (5 s + 5 s; `Handler.Close` drains before `Cache.Close`). Fix: `context.WithTimeout(h.lifecycleCtx, …)`. (Task 10 minor 5)
-- **D-35** `suite_rows.go:419`: "well under apt's 30 s" holds for the creation alone: the worst case before the body is creation 5 s + a flip hold (`flipgate.HoldMax`, 20 s) + backstop 5 s = 30 s. It needs a slow writer, a hold of the just-created suite (unreachable before E) and an unproven creation at once. One deadline shared by creation and backstop would cap it at 25 s. (E) (Task 10 minor 6)
 - **D-36** `suite_hit_test.go:699`: `recs[0]["stack"].(string)` panics, instead of failing with the test's message, when the stack is missing; use the comma-ok form. (Task 10 minor 8)
-- **D-37** The backstop's 5 s bound covers only its database steps: `readHead` takes no context, so a blocked pool read is not bounded; `backstopTimeout`'s doc, the miss path's AIDEV-NOTE and the `suite signed-seen backstop read failed` row ("including the 5 s bound on that step") overstate it. Exposure negligible (at most `HeadBytes` of a local file). (Re-review r1, Task 9)
-- **D-38** The 502 for a fetched signed anchor whose pool file cannot be read back goes to `respondError`'s default branch (outcome `bad_gateway`, extra ERROR `unclassified fetch error`), like the other post-fetch local faults, while the serve path maps an open or stat failure of the same blob to `cache_write_failed`, and the docs call it a local disk fault. (Re-review r1, Task 9: an inherited labelling inconsistency)
 - **D-39** `suite_dod_test.go:66-67`: "the longest one (30 s)" is wrong: `flipgate.MaxQuiet` is 15 s, and 30 s is the gate's sweep horizon (twice the quiet period). (Task 11 minor 1)
 - **D-40** `suite_dod_test.go` (`TestHitPathInvariant_…`): the check after d's reconstruction is labelled "after serving"; rename it "after d's reconstruction". (Task 11 minor 2)
 - **D-41** `suite_dod_test.go`: no invariant assertion after c's `Release.gpg` hit or after d's adoption (before the delete), though the brief and the test's comment say "after every step". (Task 11 minor 3)
@@ -70,9 +59,7 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
 
 ## cmd/apt-cacher-ultra
 
-- **D-45** `main.go` (`warnSuiteCaps`): no guard for `maxSuites <= 0`: with 0, every `serveListeners` test built from `minimalCfg` (`Defaults()` leaves `MaxSuites` 0) logs a false WARN `suite_caps_exceeded` at start — noise, and a trap for a future "no WARN at startup" assertion. `Validate` makes it unreachable in production. Fix: `if maxSuites <= 0 { return }`, or set 5000 in `minimalCfg`. (Task 8 minor 2)
 - **D-46** `suite_caps_wiring_test.go` (`startupLogs`): on its timeout path it cancels and calls `t.Fatalf` without draining `done`, so `serveListeners` can outlive the test and write to `logs` afterwards. Fix: `cancel(); <-done` first, or a draining `t.Cleanup`. Failure path only. (Task 8 minor 3)
-- **D-47** `main.go` (`warnSuiteCaps`): its read-error path is untested (trivial). (Task 8 minor 4)
 - **D-48** `legacy_audit_wiring_test.go:162`: `cache.Open(ctx, cacheDir, nil)` prints 14 migration INFO lines under `TestServeListeners_LegacyAuditErrorHasOnePrefix`; pass `silentBuildLogger()`. (Task 12 minor 5)
 - **D-49** `shutdown_drain_test.go`: its start/poll/stop loop repeats `startupLogs`' (`suite_caps_wiring_test.go`) almost line for line, and neither `http.Get` has a timeout, so a hung request is not bounded by the 15 s deadline. Fix: reuse `startupLogs`, or one shared helper with a timed `http.Client`. Test-only. (Task 12 minor 6)
 
@@ -82,10 +69,7 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
 
 ## Docs and spec
 
-- **D-51** `A-deferred.md` (A-37): the narrowing lost the old fact that the adoption heartbeat never logs a stack (`internal/freshness/adoption.go`). (Task 13 minor 2, its secondary remark)
 - **D-52** `docs/configuration.md` (the detached-only paragraph) and spec C3 (the Phase-1 difference): "no longer checked for changes or shown on the status page" holds only for a detached-only repository first seen after the upgrade; a row an earlier release created stays tracked (`servedSuite` touches it on every `Release` serve, so neither eviction nor F's reaper removes it). Suggested: "is not tracked when first seen; one an earlier release already tracks stays tracked". (H) (Task 13 minor 3)
-- **D-53** `docs/log-fields.md` (`clock_step_detected`): the list of repeated detections omits that every creation attempt within eight rows of the global cap re-reads and re-counts a future `last_requested_at` (`reportFutureInterest`; the counter increments on each call, the WARN stays rate-limited). Observability only. (Task 13 minor 6)
-- **D-54** Spec C4's queue-bound text ("at most `freshness.max_suites` entries in all") omits ruling PD-11's rule: when the bound cuts a tick's due list, the least recently checked suites are admitted first (`boundDue`). Add it with spec revision 8. (Task 13 minor 7)
 - **D-55** Overview: the *(D)* H item (the prose WARN names) sits under the "PR #8 parity" section's **H:** block, outside the Carry-forwards section, whose ownership rule and *(D)* legend therefore do not cover it; add an **H:** block to Carry-forwards. (H) (Task 13 minor 8)
 
 ## Test output and flakes
@@ -98,4 +82,3 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
 
 ## Process
 
-- **D-59** The Task 12 commit (02caf47) lists "C-18–C-20", but only C-19's line wrap landed (its file split is C-19's remaining half). History stays as it is; where phase D's work is summarised (the stamp commit or the overview's phase D row), say "C-19 (wrap only)". (Task 12 minor 7)

@@ -18,45 +18,18 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 
 ## internal/freshness — outcomes, keys, records
 
-- **B-16** `retry_test.go:10`: the detached content key is not pinned to its exact formula (`sha256(sha256(rel) || sha256(sig))`); a swapped order would pass, and keys persist across restarts (one extra attempt after an upgrade).
-- **B-17** `retry.go:52`: `jitterDelay` does not clamp `u` outside [0, 1) (callers pass `rand.Float64`).
-- **B-18** `adoption_failure.go:127`: `recoverAdoption` runs `reportPanic`, metrics and the ring after `recover()` with no second boundary; a panicking slog handler would escape (pre-existing class; `checkLockedSafe` got nested recovers in the fix wave).
-- **B-19** `adoption_failure_test.go`: no test for a reason change mid-streak (the `adoption_deferred` re-log), `AdoptionFailLastMod`, the retry attributes, or a detached-form record.
-- **B-20** `recordAdoptionFailure`'s shutdown check-then-act can log `adoption_failure_record_failed` "context canceled" at WARN when shutdown races a failure (log noise only).
-- **B-21** `adoption_failure_test.go` `TestAdoptionFailure_PanicIsRecorded`: `evs[len(evs)-1]` relies on a single event (`Ring.Snapshot` order).
-- **B-23** `freshness.go:1682` `applyClamp` runs twice on the inline → detached fallback of a first-ever suite (a double `acu_clock_steps_detected_total` count and a redundant write); one-line fix: set `cur.AdoptionNextRetryAt = &g.clampTo` after `SetAdoptionNextRetry`. (E; phase C touched `freshness.go` without taking it)
-- **B-24** `retry_gate_test.go` `TestGate_DueRetryHasNoValidators` cannot tell "" from the anchor's validators (the rig suite has none); add a leg on an adopted suite past `next_retry_at`.
-- **B-25** One extra `Release.gpg` GET per deferred detached check when upstream ignores validators (accepted cost; recorded so E's shared tail keeps it in mind). (E)
 - **B-27** `restart_reset_test.go`: the restart test exercises only `rand = 0.5`; a `rand = 0` leg would pin the lower bound.
 
 ## internal/freshness — check path, repair, reconcile
 
-- **B-28** A degraded snapshot's Release is parsed twice per heal attempt (`reconcile.go:122` `reconcilePending`, then `ReconcileSnapshot`; perf only, bounded by the cooldown).
-- **B-30** `freshness.go:533`, `:594`: `adoption_reconcile_failed` is emitted at the decision and at the heal with identical fields; add a `stage` attribute. (E; phase C touched `freshness.go` without taking it)
-- **B-31** `freshness.go:544`: a repair deferred for want of a slot is logged at DEBUG only, with no counter. (E; phase C touched `freshness.go` without taking it)
-- **B-32** Under steady client traffic a degraded suite re-runs its repair every cooldown, and each run may take the reserved slot for up to `max_duration` if a member stalls; weigh with E's `signedCurrent` change. (E)
-- **B-33** The `Release.gpg` Conditional on `fetchCtx` is untested (reverting it to `ctx` survives); add a stall-on-gpg synctest when E moves the shared tail (D in the latency bound depends on it). (E)
-- **B-34** `recordUnknownEnd`'s `freshnessCheckTotal.Inc("failed")` is asserted nowhere. (E)
-- **B-35** The inline unexpected-status default arm's ERROR line lacks the `form` attribute (the detached arm has it). (E)
 - **B-36** `check_streak_test.go:23`, `:43`, `:203`, `:311`: four overlapping checker constructors.
-- **B-37** A deterministic repair or reconcile panic is logged, not recorded (plan deviation 7), so it re-runs on later unchanged checks with an ERROR line each; revisit if a record keyed on the snapshot (not the content) becomes available. (E)
 
 ## internal/freshness — scheduler and admission
 
-- **B-38** `scheduler.go:326` `suiteDue` re-detects (and counts) a future `last_success_at` on every tick; only `acu_clock_steps_detected_total`'s rate is affected (`docs/log-fields.md` now says it counts detections).
-- **B-45** `scheduler.go:424`: the wake-versus-done race can spend a wake on an in-flight item, so its re-offer waits for the next wake or tick (bounded by one tick; documented). A release-generation counter would let an offer whose slot was released after dispatch park unheld.
-- **B-46** `scheduler.go:178` `park`: every re-parked waiter goes to index 0, so two lost or busy offers in a row on one host invert the waiters' order (final review C M-3; kept deferred by ruling). Give each waiter a waiting-since sequence number and re-insert sorted.
 
 ## internal/freshness — simulations
 
-- **B-51** `simMembers`' `delay` and `started` maps are written without the lock (always before the scheduler starts; the doc states the rule).
 - **B-52** The phase B plan's Task 12 Step 1 text is stale against the strengthened simulations (reference only).
-- **B-53** The 500-suite simulation has no adopter, so no persistent repair or changing-candidate contention (overview DoD); add a changing candidate on host `a`.
-- **B-54** `sim_retry_test.go` Lim1 pins jitter at 0.5, so ±25 % is never exercised end to end (the low end gives about 37 attempts a day, not "about 30").
-- **B-55** `TestSimRestartSpread`'s `retried` counts upstream calls, not adoption attempts (the tick buckets give it teeth).
-- **B-56** The 30-day simulation's clock-step phases prove little about retry or Date handling (no active record during the step).
-- **B-57** The 30-day simulation's untrusted phase has no attempt floor (183 measured; Lim1 has 18..30).
-- **B-58** The flapping-mirror simulation does not pin the rollback guard on its own (the cost is now pinned by `TestGate_RefusalStormCostsNothing`), and its samples land on the tick grid (harmless at a 30-minute refresh).
 
 ## internal/admin
 
@@ -68,5 +41,3 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec 
 
 ## Final fix-wave residuals (scoped re-review of 9a2b22b..e361704)
 
-- **B-66** `internal/freshness/scheduler.go:154-156`: `enqueue` drops a duplicate without setting `pendingChange`, so a suite queued earlier as stale and left pending by a client check before it is popped honours the cooldown once and is parked one tick later than the Run doc and configuration.md:243 promise ("within one tick"). Set the flag on a duplicate that sits in a class queue, or soften the docs. (E; phase C touched `scheduler.go` without taking it)
-- **B-67** `docs/admin-ui-spec.md:385-386`: "logs WARN `adoption_refused_persistently` for the same condition" overstates it — the WARN also needs a streak milestone, so with hourly retries the first WARN comes at the 48th attempt (~43 h), about a day after the page warns. Reword (log-fields.md:193 and configuration.md:235 are correct), or emit the WARN on the first refusal past 24 h.

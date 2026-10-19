@@ -265,12 +265,55 @@ Serving a tracked suite's `InRelease`, `Release` or `Release.gpg`, or a
 copy under its own path is answered from an identical cached file only for
 a tracked suite; otherwise it is fetched from upstream.
 
+### Eager first adoption
+
+With adoption enabled, a tracked suite that has no snapshot yet is
+adopted on its first check, in whichever form its upstream publishes (see
+*Anchor forms and unsigned repositories*), when a client asked for it in
+the last 7 days and a client fetched its `InRelease` or `Release` through
+the cache (a copy the cache rebuilt for itself does not count). The
+request that creates a suite starts its first check once its response is
+sent, so a new repository is adopted within seconds of its first
+`apt update` when an adoption slot is free. A suite nobody asked for in 7
+days is dormant: it costs no upstream request until a client asks again,
+and is then checked — and adopted, when a slot is free — within one
+scheduler tick (`periodic_refresh / 4`) of that request (the request's own
+check may run before its interest is recorded). A request stamp up to 7 days in the future, left by a clock
+that was stepped back, still counts as interest; one further ahead leaves
+the suite dormant until a client asks for it again. After an upgrade, a
+suite counts as asked for when a client fetched one of its anchor files in
+the 7 days before the upgrade.
+
+A suite whose first adoption failed or was refused (see *How failed
+adoptions are retried*) is probed again at its retry time (2 minutes,
+doubling to an hour), or once `periodic_refresh` has passed since its last
+check if that comes first; checks that clients trigger in between ask
+upstream nothing. A suite whose upstream serves neither `InRelease` nor
+`Release` fails its check (backing off from 2 minutes to an hour) and
+shows "refused: anchor_absent" on the status page.
+
+First adoptions never take the last free adoption slot, which is kept for
+suites that already serve a signed snapshot (see *Capacity and
+fairness*): with the default `max_concurrent_adoptions = 2` a first
+adoption runs only while no other adoption runs, so on a cache kept busy
+by signed updates it can wait a long time. Busy caches should set `3`,
+which also lets two first adoptions run at once, for example for the
+burst after an upgrade. A suite waiting for a slot is probed twice by the
+scheduler — by the check that queued it and by the re-check that admits
+it — plus once for each client check while it waits (at most one per
+`cooldown`) and once for each slot offered to it that another admission
+takes first.
+
+With adoption disabled nothing changes: suites are checked for changes
+only, and the request that creates a suite starts no check.
+
 ## `[adoption]`: snapshots, trust, and recovery
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them, so tracked suites lag upstream by design: the status page's SUITES vital then reads "ADOPTION DISABLED — METADATA NOT REFRESHED" (stale, not a fault), rows keep their lag text without warning, and failure records left from a time adoption was enabled are inert (no retries, `acu_adoption_failing_suites` reports 0). |
-| `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are handled by the unsigned form (a later release). |
+| `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are adopted in the unsigned form instead (`adopt_unsigned`). |
+| `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` leaves such repositories served from the ordinary cache, unadopted. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
 | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
 | `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. A decodable clearsigned `InRelease` (or, for the detached pair, a parseable `Release.gpg` signature) is still required, as in every mode. Matching pins keep normal verification. Logs a startup warning. |
 | `allow_short_keyid` | boolean | `true` | Accept signatures containing only a legacy 64-bit issuer key ID when it uniquely identifies a loaded trusted key and cryptographic verification succeeds. `false` requires the long issuer fingerprint. |
@@ -291,12 +334,16 @@ When an adoption fails (an untrusted or malformed signature, a member that will 
 
 If the cache cannot read the current snapshot when an adoption starts, the attempt fails as `db_failed` (and is retried on the backoff schedule) rather than skipping the rollback checks below.
 
-Two outcomes are refusals, not failures, and are shown as "refused: …" on the status page:
+Six outcomes are refusals, not failures, and are shown as "refused: …" on the status page:
 
 - `upstream_older`: upstream serves a Release whose `Date` is older than the snapshot being served, or has no `Date` at all after a dated snapshot (a missing `Date` counts as 0). apt would ignore it too; the cache keeps serving the newer snapshot.
 - `rollback_refused`: upstream serves content identical to an older snapshot the cache already replaced (a flapping mirror). Only the last `gc.keep_displaced` snapshots are remembered for this.
+- `unsigned_unconfirmed`: an unsigned repository's first adoption waits for a second observation of the same `Release` (see *Anchor forms and unsigned repositories*).
+- `unsigned_downgrade_refused`: the suite has been seen signed, so its unsigned `Release` is not adopted.
+- `unsigned_too_large`: an unsigned `Release` declares more than 1,000 files.
+- `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too.
 
-Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO), is not counted by `acu_adoption_failing_suites`, and shows no lag. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
+Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO) and is not counted by `acu_adoption_failing_suites`. `upstream_older` and `rollback_refused` show no lag (the cache already serves content at least as new as upstream's); the other four keep their lag, because the suite is in fact behind. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
 
 A Release dated more than 10 seconds ahead of the cache's clock is a failure (apt rejects it as "not valid yet"); check the cache host's clock if this persists.
 
@@ -304,7 +351,7 @@ At start, every failing suite gets one retry spread over the next `periodic_refr
 
 ### Capacity and fairness
 
-`freshness.max_concurrent_adoptions` slots are shared by adoptions, repairs and reconciles, plus one slot per upstream host. Nothing blocks on a slot: a suite whose scheduled check finds none waits in the scheduler's queue and is re-checked as soon as capacity it can use is released (hosts in turn, oldest first); while it waits, no request is made for it. A change found by a client-triggered check that finds no slot stays pending, and the next scheduler tick checks that suite (bypassing the cooldown) and queues it the same way, so it starts waiting within one tick. Client requests still trigger checks under the normal cooldown and may take a freed slot first. When there are at least two slots, the last free one is reserved for suites that already serve a signed snapshot, so security updates are not delayed by first adoptions. With the default pool of two, first adoptions therefore run only when no other adoption is running; `max_concurrent_adoptions = 3` lets two run at once (useful for the burst after an upgrade). A repair or reconcile that finds no slot simply runs on a later unchanged check. `POST /reconcile` answers 409 when no slot is free. The gauge `acu_freshness_waiting_for_slot` counts suites waiting for a slot. An adoption gives its host's slot back when its downloads are done, but keeps its global slot through the flip barrier and the commit, so a slot is held for at most `max_duration` + 140 s (the barrier, see *Flip consistency*; `acu_adoption_duration_seconds` includes that time) + the 5-minute commit bound: N suites waiting for k slots they may use are all admitted within one tick + ⌈N/k⌉ × (that sum + 2 minutes).
+`freshness.max_concurrent_adoptions` slots are shared by adoptions, repairs and reconciles, plus one slot per upstream host. Nothing blocks on a slot: a suite whose scheduled check finds none waits in the scheduler's queue and is re-checked as soon as capacity it can use is released (hosts in turn, oldest first); while it waits, no request is made for it. A change found by a client-triggered check that finds no slot stays pending, and the next scheduler tick checks that suite (bypassing the cooldown) and queues it the same way, so it starts waiting within one tick. Client requests still trigger checks under the normal cooldown and may take a freed slot first. When there are at least two slots, the last free one is reserved for suites that already serve a signed snapshot, so security updates are not delayed by first or unsigned adoptions. With the default pool of two, first adoptions therefore run only when no other adoption is running, and can wait a long time on a cache kept busy by signed updates; `max_concurrent_adoptions = 3` avoids that and lets two run at once (useful for the burst after an upgrade). A repair or reconcile that finds no slot simply runs on a later unchanged check (`acu_repair_deferred_total{host}` counts them); one of a suite whose current snapshot is unsigned never takes the reserved slot. `POST /reconcile` answers 409 when no slot is free. The gauge `acu_freshness_waiting_for_slot` counts suites waiting for a slot. An adoption gives its host's slot back when its downloads are done, but keeps its global slot through the flip barrier and the commit, so a slot is held for at most `max_duration` + 140 s (the barrier, see *Flip consistency*; `acu_adoption_duration_seconds` includes that time) + the 5-minute commit bound: N suites waiting for k slots they may use are all admitted within one tick + ⌈N/k⌉ × (that sum + 2 minutes).
 
 Periodic checks run on four workers, at most one check per upstream host at a time, hosts taking turns. On each host, healthy suites go first, then never-checked suites, then suites whose checks keep failing; a failing suite waits 2 minutes, doubling to an hour, between checks. The upstream part of each check (waiting for the host's fetch slot and the requests) is limited to 2 minutes; the check's own cache writes are not cut short, so the deadline is always recorded. A due suite S is therefore checked within one tick + (n + 1) × ⌈H/4⌉ × 2 minutes, where H is the number of hosts with suites waiting and n the number of suites ahead of S in its host's queue (only healthy ones when S is healthy): stalling hosts delay a healthy suite on another host by at most ⌈H/4⌉ checks per suite ahead of it (with four hosts or fewer, one check), and once a stalling host's suites are known to fail they queue behind its healthy suites — also right after a restart, because the order is persisted. The bound assumes responsive cache I/O.
 
@@ -333,7 +380,110 @@ for unpinned suites: the cache continues serving the original signed bytes, but
 does not verify them cryptographically. `require_pinned_signer = true` still
 rejects unpinned suites, so combining the two does not bypass pin requirements.
 `require_signature = false` no longer lets unsigned data through the inline
-path. The detached fallback still requires both `Release` and `Release.gpg`.
+path, and the detached form still requires both `Release` and `Release.gpg`:
+unsigned metadata is adopted only in the unsigned form below, which trusts
+nothing.
+
+### Anchor forms and unsigned repositories
+
+A suite is adopted in whichever form its upstream publishes: **inline** (a
+clearsigned `InRelease`), **detached** (`Release` with `Release.gpg`) or
+**unsigned** (`Release` alone). A suite with no snapshot yet asks for
+`InRelease`, then `Release`, then `Release.gpg`; an answer counts as present
+only when it is the file it claims to be. An HTML page served with status
+200 is absent, like 401, 403, 404 and 410; any other answer (a 5xx, a
+timeout, a redirect) fails the check without deciding anything. The admin
+JSON's `suites[].anchor_form` names a suite's form.
+
+Suites move between the signed forms by themselves. A detached suite asks
+for `InRelease` on every check and moves to the inline form as soon as
+upstream serves one. When a suite's current anchor (`InRelease` for
+inline, `Release` for detached and unsigned) is absent, the status page
+shows "refused: anchor_absent" while the snapshot keeps serving. The suite
+then asks for its anchor again only at its retry times (2 minutes,
+doubling to an hour); checks in between, including those clients trigger,
+ask upstream nothing, so a returning anchor is noticed at the next retry.
+Once the absence has lasted `max(cooldown, 5 minutes)`, each retry also
+probes the other forms, and the suite moves to the other signed form if
+upstream serves it. The snapshot keeps serving however long its anchor
+stays absent: clients of a release removed upstream (an end-of-life
+distribution) keep getting it through the cache where upstream would
+answer 404, so "refused: anchor_absent" is the sign to update their
+sources. A suite never moves from a signed form to unsigned: a signed
+suite whose upstream stops signing keeps its last signed snapshot (a
+detached suite whose `Release` changes while its `Release.gpg` is absent
+shows "refused: anchor_absent" and is paced the same way; a `Release.gpg`
+request that fails — a 5xx, a timeout — logs WARN `freshness: Release.gpg
+fetch failed; deferring adoption` and is tried again at the next check).
+An unsigned suite moves to a signed form at the first check that finds
+`InRelease` or `Release.gpg`. From that check on the cache has seen the
+suite signed, so it is never adopted unsigned again, even when the signed
+adoption fails (a key the cache does not trust) or the signature later
+disappears.
+
+Unsigned adoption has five safeguards:
+
+1. `adopt_unsigned` (default `true`).
+2. A suite's first unsigned adoption waits for two checks that see the same
+   `Release` at least `max(cooldown, 5 minutes)` apart — an hour apart when
+   `InRelease` or `Release.gpg` answers 401 or 403 at the confirming check,
+   since a firewall or an S3 permission error can hide a signature (a 403
+   that later turns into 404s confirms after the shorter gap). Until then
+   the status page shows "refused: unsigned_unconfirmed". A `Release`
+   generated anew for each request, or one that differs between
+   load-balanced backends, never shows the same bytes twice and stays
+   unconfirmed. Later updates of an unsigned suite are adopted at once.
+3. Never a downgrade: a suite the cache has seen signed is never adopted
+   unsigned ("refused: unsigned_downgrade_refused"). Seen signed means it
+   has a signed snapshot (the current one, or one of the displaced
+   snapshots the cache keeps), or the cache served its signed `InRelease`
+   or `Release.gpg`, a check found one upstream, or an earlier version had
+   cached one (recorded at upgrade). The record covers the repository path on its host under both
+   `http` and `https`, so a suite seen signed over one scheme is never
+   adopted unsigned over the other. The rule is checked before an adoption slot is taken and again
+   inside the commit, so a signed anchor served while an unsigned adoption
+   runs still stops it. Just before the commit the cache also re-reads the
+   signed anchors it has cached for the suite and records any it finds; if
+   it cannot read them, the adoption is refused as well (logged as
+   `adoption: signed-anchor re-mark failed`): that refusal means the cache
+   could not rule out a signature.
+4. At most 1,000 files declared in the `Release`'s SHA256 and SHA512
+   lists, each path counted once (files listed only under MD5Sum or SHA1
+   do not count), checked before an adoption slot is taken
+   ("refused: unsigned_too_large").
+5. An unsigned snapshot vouches no `.deb`, never counts for strict mode
+   and never records its suite as signed.
+
+Threat notes. The record that a suite was seen signed cuts both ways:
+anyone who can make the cache see one signed-looking `InRelease` or
+`Release.gpg` for a repository path — served to a client, or found by a
+check; a man in the middle, a compromised upstream, or a LAN client
+pointing the cache at a host it controls — blocks unsigned adoption of
+that path until its suite is forgotten (`POST /forget`, added with suite
+reaping in a later release). That denial of service is the accepted price
+of never downgrading. A man in the middle between the cache and upstream
+can make the cache adopt forged unsigned content only for a suite never
+seen signed, and only after two consistent observations; apt clients that
+verify signatures reject it, and `[trusted=yes]` clients accept it as they
+would when fetching directly. A suite whose pre-upgrade snapshot was
+quarantined because its stored `InRelease` was missing, corrupt or
+oversized (see *Upgrading an existing cache*) may have no record that it
+was signed until a check sees its signature upstream; if its signatures
+are gone by then (stripped by a man in the middle, for instance), it
+adopts unsigned. Under the default allow-all upstream policy
+with adoption enabled, a LAN client can make the cache adopt unsigned
+directories it controls; that is bounded by the per-host adoption slot,
+the reserved slot, `max_duration`, the 1,000-file cap and
+`freshness.max_suites`. To harden, set `adopt_unsigned = false` or narrow
+`upstream.allowed_host_regex`.
+
+`Release` files that list only SHA512 hashes (some vendor repositories)
+adopt: every declared SHA256 and SHA512 hash of a file is checked, and
+by-hash requests are answered for both algorithms, from the current
+snapshot and from the displaced ones kept for retained by-hash. An
+optional file that lists only a SHA512 hash and fails its integrity check
+is not retried by automatic repair; the reconcile on unchanged checks
+still heals the index files apt requests.
 
 ### Architecture and member availability
 
@@ -371,11 +521,14 @@ its suite is served from the ordinary cache, and a `legacy_snapshot_quarantined`
 line names it. A suite quarantined for declarations outside its signature
 adopts again on its first freshness check, because its tampered copy never
 matches a clean upstream; one quarantined because its stored file was lost
-or corrupt waits for the next upstream change. A plain-text suite cannot
-adopt in this release (every attempt fails `missing_signature`): it is served
-from the ordinary cache without vouching until upstream publishes a
-clearsigned `InRelease`, or, from the release that adds the unsigned form,
-until it adopts as an unsigned snapshot. In strict mode, a quarantined
+or corrupt waits for the next upstream change, and may have no record that
+it was signed (see the threat notes in *Anchor forms and unsigned
+repositories*). A quarantined plain-text
+suite adopts again in the unsigned form, through its `Release` (its
+plain-text "InRelease" counts as absent), once a client has asked for it
+and two checks have seen the same `Release` (see *Anchor forms and
+unsigned repositories*), unless the cache has seen it signed; an unsigned
+snapshot vouches no package. In strict mode, a quarantined
 suite's packages are refused while other suites on the same host have
 complete coverage, as for any unadopted suite. While inline snapshots are
 queued for the audit, the cache directory's `pool/` must be present: the
@@ -390,12 +543,22 @@ not stop the daemon either: that snapshot keeps serving as before, a
 `legacy_trust_audit_deferred` error names it, and the next start retries it.
 The audit resumes if the start is interrupted and is a no-op afterwards. A
 suite whose signed `InRelease` was served by an earlier version is recorded
-as signed from cached anchors; one whose cached anchor was already
-garbage-collected leaves no record. Suites whose `InRelease` an earlier
-release cached but never tracked are tracked, with their signed-seen record,
+as signed from cached anchors, so it is never adopted unsigned; one whose
+cached anchor was already garbage-collected leaves no record. Suites whose
+`InRelease` an earlier release cached but never tracked are tracked, with
+their signed-seen record,
 on their first cache hit. A cache with more than `freshness.max_suites`
 suites, or a tenth of it or more on one host, logs WARN
 `suite_caps_exceeded` at start; see *Tracked suites*.
+
+After the upgrade, suites without a snapshot adopt eagerly only if a client
+fetched one of their anchor files in the 7 days before the upgrade, or asks
+again (see *Eager first adoption*); with the default
+`max_concurrent_adoptions = 2` these first adoptions run one at a time,
+while signed updates keep their own slot. Snapshots adopted before the
+upgrade carry no SHA512 by-hash names: such requests are answered as
+before (from the ordinary cache or upstream) until the suite's next
+adoption.
 
 ## `[hot_packages]`, `[hold_packages]`, and `[retention]`: package working set
 
@@ -424,11 +587,35 @@ grace starts; bytes are later reclaimed after references disappear and
 | --- | --- | --- | --- |
 | `validate_at_rest_interval` | duration | `"24h"` | Periodically rehash blobs reachable from current snapshots. `"0s"` disables this background scan. Nonnegative. |
 | `validate_at_rest_workers` | integer | `4` | Parallel scan workers. Must be at least `1` when the interval is positive; `0` is allowed only with scanning disabled. Never negative. |
-| `refuse_unvouched_debs` | boolean | `false` | Reject `.deb` requests with `502` and `Retry-After` when the path lacks a current-snapshot hash and all current snapshots for that host have proven complete package coverage. Inert when adoption is disabled; incomplete coverage retains the permissive fetch behavior. |
+| `refuse_unvouched_debs` | boolean | `false` | Reject `.deb` requests with `502` and `Retry-After` when the path lacks a current-snapshot hash and all current signed snapshots for that host have proven complete package coverage (unsigned snapshots never count). Inert when adoption is disabled; incomplete coverage retains the permissive fetch behavior. A request first waits up to 15 seconds for a signed adoption running on its host; see below. |
 
 These switches do not disable the normal download-time hash checks. A detected
 at-rest mismatch logs an error and removes the corrupt pool file. Package misses
 can fetch it again; affected snapshot metadata fails closed until restored.
+
+With `refuse_unvouched_debs = true`, a `.deb` that no current snapshot
+vouches for, requested while a signed adoption is running for a suite on
+the same upstream host, waits for the host's signed adoptions to end and
+is looked up once more, so a package from an update being adopted is
+served rather than refused (`acu_strict_adoption_waits_total{host}` counts
+the requests that waited). The wait lasts at most 15 seconds, and never
+past 25 seconds after the request arrived, so that a miss still has time
+to download the package before apt's 30-second timeout; a request with
+less than a second of that left, or arriving while 64 requests of its host
+already wait, is refused at once. Each request waits on its own: requests
+for the same package each count toward the 64, and a client fetching
+several unvouched packages one after another while a long adoption runs
+waits up to 15 seconds for each. An adoption ends after its flip barrier
+(up to 140 seconds for a busy suite; see *Flip consistency*), so a package
+whose snapshot is still in its barrier is likely to wait the full 15
+seconds and be refused. Refusals also remain when an adoption takes longer
+than that (large `dists/` suites), when a first adoption is still waiting
+for a slot, and for packages of an unsigned repository on a host
+whose signed suites all have complete coverage: unsigned snapshots never
+vouch and never count, so a host whose only snapshots are unsigned is
+never strict. Strict posture changes as eager first adoptions land after
+an upgrade. Conversely, a signed snapshot with incomplete coverage turns
+strict mode off for its whole host.
 
 ## `[gc]`: garbage collection
 
