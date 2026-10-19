@@ -102,6 +102,10 @@ type Config struct {
 	Cooldown time.Duration // SPEC §7.2 cooldown gate
 	Refresh  time.Duration // SPEC §7.4 periodic_refresh interval
 	Logger   *slog.Logger
+	// MaxSuites is freshness.max_suites (spec C4, C11): the scheduler
+	// keeps at most this many suites queued, waiting for a slot or in
+	// flight. Zero is unbounded (tests).
+	MaxSuites int
 
 	// HostLimiter bounds concurrent upstream conditional GETs to a
 	// single canonical host. SPEC §9.3. Production wires this to the
@@ -183,6 +187,7 @@ type Checker struct {
 	hostSem             *hostsem.Sem
 	cooldown            time.Duration
 	refresh             time.Duration
+	maxSuites           int
 	maxBody             int64
 	logger              *slog.Logger
 	now                 func() time.Time
@@ -205,22 +210,22 @@ type Checker struct {
 	adoptionWg sync.WaitGroup
 
 	// locks holds *sync.Mutex per suite key. SPEC §7.3 specifies the
-	// lock is in-memory and held only for the duration of the upstream
-	// call. Memory upper bound is the number of distinct
-	// (canonical_scheme, canonical_host, suite_path) values that have
-	// ever been the subject of a Check call — i.e. metadata-bearing
-	// suite paths the cache has either cached (T1 spawn) or written
-	// to suite_freshness (T2 scan). An unauthenticated attacker
-	// cannot grow this map without first producing successful upstream
-	// metadata fetches on an allowlisted host, so the practical bound
-	// is the cache's actual data set, not request volume.
+	// lock is in-memory; it is held for a check and for the adoption,
+	// repair or reconcile the check hands it to.
 	//
-	// AIDEV-NOTE: entries are not actively reaped. A suite that was
-	// once cached but later evicted (Phase 4 GC) will leave its
-	// mutex in this map for the lifetime of the process. Per-entry
-	// memory is small (one *sync.Mutex pointer plus map overhead),
-	// so the long-tail growth is acceptable for Phase 1.
+	// AIDEV-NOTE: I-4 (spec C3) bounds the map by the suite table: Check
+	// and Reconcile read the suite's row before LoadOrStore and, after
+	// TryLock, re-validate that the map still holds the same mutex; a check
+	// that then finds the row gone drops its entry (CompareAndDelete), and
+	// cap eviction (phase F's reaper too) drops the evictee's through
+	// HoldSuite's release(true). An entry outlives its row only while a
+	// check that loaded it unwinds (LockCount).
 	locks sync.Map
+
+	// lockLoadedHook, when set (tests only), runs in check and Reconcile
+	// between loading a suite's mutex and TryLock: the window I-4's
+	// re-validation closes.
+	lockLoadedHook func(key string)
 
 	lastClockStepLog atomic.Int64 // monotonic ns since processStart of the last clock_step_detected line
 }
@@ -278,6 +283,7 @@ func New(cfg Config) (*Checker, error) {
 		hostSem:             cfg.HostLimiter,
 		cooldown:            cfg.Cooldown,
 		refresh:             cfg.Refresh,
+		maxSuites:           cfg.MaxSuites,
 		maxBody:             maxBody,
 		logger:              logger,
 		now:                 now,
@@ -345,6 +351,8 @@ type checkOutcome struct {
 	lease         *lease
 	// report is what the scheduler learns from this check.
 	report checkReport
+	// vanished: the suite row was gone when the check read it (I-4).
+	vanished bool
 }
 
 // checkOpts tunes one check. bypassCooldown is set only by the scheduler:
@@ -407,9 +415,20 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 	}
 	muVal, _ := c.locks.LoadOrStore(key, &sync.Mutex{})
 	mu := muVal.(*sync.Mutex)
+	if c.lockLoadedHook != nil {
+		c.lockLoadedHook(key)
+	}
 	if !mu.TryLock() {
 		// Another goroutine is on it; SPEC §7.3 says skip.
 		return checkReport{result: resultBusy}
+	}
+	// I-4: the mutex counts only while the lock map still holds it. Cap
+	// eviction (and phase F's reaper) drops the entry of a suite it deleted
+	// while holding this mutex; a check that loaded it before then must not
+	// run beside one that loads the new entry.
+	if cur, ok := c.locks.Load(key); !ok || cur != muVal {
+		mu.Unlock()
+		return checkReport{result: resultSkipped}
 	}
 	// Spec C4: the upstream part of a check (the host slot and the
 	// conditional GETs) runs under a 2-minute deadline. Cache reads and
@@ -425,6 +444,12 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 	if !ok {
 		mu.Unlock()
 		return checkReport{result: "failed"}
+	}
+	if out.vanished {
+		// I-4: keep the lock map to suites with rows.
+		c.locks.CompareAndDelete(key, muVal)
+		mu.Unlock()
+		return out.report
 	}
 	switch {
 	case out.lease != nil && out.req != nil:
@@ -855,8 +880,10 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 	cur, err := c.cache.GetSuiteFreshness(ctx, scheme, host, suitePath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
-		// The row vanished after check's pre-read (I-4): nothing to check
-		// and nothing to write.
+		// I-4: the row vanished after check's pre-read (cap eviction, later
+		// the reaper). Nothing to check and nothing to write; check drops
+		// the lock-map entry.
+		out.vanished = true
 		return
 	case err != nil:
 		c.logger.Warn("freshness: read suite row failed",
@@ -1765,9 +1792,9 @@ func setChangeSeen(cur *cache.SuiteFreshness, now int64) {
 // This bounds the lock map to real adopted suites: an unauthenticated caller
 // who forges (host, suite) pairs cannot grow c.locks unless the suite is
 // already in the cache's suite_freshness table (which requires a successful
-// upstream adoption). Compare Check, which does LoadOrStore unconditionally
-// because T1 callers have already verified the host via the handler's
-// allowlist and the suite path via a cache hit.
+// upstream adoption). Check does the same since phase D (I-4, spec C3), and
+// both re-validate after TryLock: the map must still hold the mutex and the
+// row must still name the snapshot read before.
 func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string) bool {
 	if c.adopter == nil {
 		return false
@@ -1782,9 +1809,26 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 	snapID := *sf.CurrentSnapshotID
 	suite := SuiteRef{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}
 
-	muVal, _ := c.locks.LoadOrStore(suiteKey(scheme, host, suitePath), &sync.Mutex{})
+	key := suiteKey(scheme, host, suitePath)
+	muVal, _ := c.locks.LoadOrStore(key, &sync.Mutex{})
 	mu := muVal.(*sync.Mutex)
+	if c.lockLoadedHook != nil {
+		c.lockLoadedHook(key)
+	}
 	if !mu.TryLock() {
+		return false
+	}
+	// I-4 (spec C3): re-validate under the mutex — the lock map must still
+	// hold it and the suite must still have its row, with the snapshot read
+	// above still current. Otherwise the suite was deleted (cap eviction,
+	// phase F's reaper) or re-adopted meanwhile.
+	if cur, ok := c.locks.Load(key); !ok || cur != muVal {
+		mu.Unlock()
+		return false
+	}
+	if sf, err := c.cache.GetSuiteFreshness(ctx, scheme, host, suitePath); err != nil ||
+		sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != snapID {
+		mu.Unlock()
 		return false
 	}
 	l, ok := c.admission.tryAcquire(host, true)

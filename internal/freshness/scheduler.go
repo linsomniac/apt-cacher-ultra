@@ -1,7 +1,9 @@
 package freshness
 
 import (
+	"cmp"
 	"context"
+	"math"
 	"slices"
 	"sort"
 	"sync"
@@ -315,6 +317,12 @@ func (q *schedQueues) prune() {
 // len is the number of suites queued or in flight.
 func (q *schedQueues) len() int { return len(q.queued) }
 
+// has reports whether key is queued, waiting or in flight.
+func (q *schedQueues) has(key string) bool {
+	_, ok := q.queued[key]
+	return ok
+}
+
 // suiteDue reports whether the scheduler should queue s now (spec C4):
 // its last success is older than the refresh interval, or its adoption
 // retry time has come, or it has a pending change (pendingChange), and it
@@ -558,9 +566,61 @@ func (c *Checker) tick(ctx context.Context, q *schedQueues) {
 		return suiteKey(due[i].CanonicalScheme, due[i].CanonicalHost, due[i].SuitePath) <
 			suiteKey(due[j].CanonicalScheme, due[j].CanonicalHost, due[j].SuitePath)
 	})
+	if c.maxSuites > 0 {
+		// Spec C4: at most freshness.max_suites suites queued, waiting or
+		// in flight; the rest are queued by a later tick.
+		due = boundDue(due, q, c.maxSuites, nowT.Unix())
+	}
 	for _, s := range due {
 		q.enqueue(s, c.pendingChange(s))
 	}
+}
+
+// boundDue applies spec C4's queue bound — at most maxSuites suites
+// queued, waiting or in flight — to a tick's due list (key order): it
+// returns the due suites not queued yet that fit and, when not all of them
+// fit, the least recently checked of them (never checked first; a
+// last_check_at in the future counts as never, the clock-step rule), still
+// in key order.
+//
+// AIDEV-NOTE: design review M12. Admitting by key alone would let suites
+// late in key order wait behind early-key ones that keep becoming due (a
+// failing suite re-enters after every backoff); the bound binds only above
+// the cap (a lowered max_suites, an upgraded table). The sort runs only
+// when the list is cut.
+func boundDue(due []cache.SuiteFreshness, q *schedQueues, maxSuites int, now int64) []cache.SuiteFreshness {
+	fresh := make([]cache.SuiteFreshness, 0, len(due))
+	for _, s := range due {
+		if !q.has(suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)) {
+			fresh = append(fresh, s)
+		}
+	}
+	room := maxSuites - q.len()
+	if len(fresh) <= room {
+		return fresh
+	}
+	if room <= 0 {
+		return nil
+	}
+	lastCheck := func(s cache.SuiteFreshness) int64 {
+		if s.LastCheckAt == nil || *s.LastCheckAt > now+int64(clockStepTolerance/time.Second) {
+			return math.MinInt64
+		}
+		return *s.LastCheckAt
+	}
+	byCheck := slices.Clone(fresh)
+	slices.SortStableFunc(byCheck, func(a, b cache.SuiteFreshness) int { return cmp.Compare(lastCheck(a), lastCheck(b)) })
+	admit := make(map[string]bool, room)
+	for _, s := range byCheck[:room] {
+		admit[suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)] = true
+	}
+	out := make([]cache.SuiteFreshness, 0, room)
+	for _, s := range fresh {
+		if admit[suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)] {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // checkRecovered keeps one suite's panic from ending a worker; a panic
