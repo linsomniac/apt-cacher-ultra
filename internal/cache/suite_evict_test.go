@@ -1,0 +1,575 @@
+package cache
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"slices"
+	"sync"
+	"testing"
+)
+
+// fakeGuard is a SuiteGuard: it holds any suite not marked busy, records
+// the order it was asked in and how each hold was released, and runs
+// onHold (if set) inside HoldSuite — before the writer operation.
+type fakeGuard struct {
+	mu       sync.Mutex
+	busy     map[SuiteKey]bool
+	asked    []SuiteKey
+	released map[SuiteKey][]bool
+	onHold   func(SuiteKey)
+}
+
+func newFakeGuard() *fakeGuard {
+	return &fakeGuard{busy: map[SuiteKey]bool{}, released: map[SuiteKey][]bool{}}
+}
+
+func (g *fakeGuard) HoldSuite(key SuiteKey) (func(deleted bool), bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.asked = append(g.asked, key)
+	if g.busy[key] {
+		return nil, false
+	}
+	if g.onHold != nil {
+		g.onHold(key)
+	}
+	return func(deleted bool) {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.released[key] = append(g.released[key], deleted)
+	}, true
+}
+
+const evictNow = int64(1_800_000_000)
+const evictDay = int64(24 * 3600)
+
+func sk(host, suite string) SuiteKey {
+	return SuiteKey{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite}
+}
+
+// seedRow creates a row whose client-interest stamp is requested.
+func seedRow(t *testing.T, c *Cache, key SuiteKey, requested int64) {
+	t.Helper()
+	res, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: key, RequestedAt: requested}, SuiteCaps{}, nil)
+	if err != nil || res.Outcome != SuiteCreated {
+		t.Fatalf("seed %v: %+v, %v", key, res, err)
+	}
+}
+
+// adoptRow gives an existing row a current snapshot.
+func adoptRow(t *testing.T, c *Cache, key SuiteKey) int64 {
+	t.Helper()
+	ctx := context.Background()
+	h := seedBlob(t, c, "anchor of "+key.SuitePath)
+	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{CanonicalScheme: key.CanonicalScheme,
+		CanonicalHost: key.CanonicalHost, SuitePath: key.SuitePath, InReleaseHash: &h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CommitAdoption(ctx, id, []SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: h, DeclaredSHA256: h}},
+		nil, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func rowExists(t *testing.T, c *Cache, key SuiteKey) bool {
+	t.Helper()
+	_, err := c.GetSuiteFreshness(context.Background(), key.CanonicalScheme, key.CanonicalHost, key.SuitePath)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		t.Fatal(err)
+	}
+	return err == nil
+}
+
+// fourRows fills a cache to a global cap of 4: an adopted suite (the
+// idlest, never evictable), two idle suites without a snapshot, and one
+// requested an hour ago (not idle).
+func fourRows(t *testing.T, c *Cache) {
+	t.Helper()
+	seedRow(t, c, sk("a", "/adopted"), evictNow-5*evictDay)
+	adoptRow(t, c, sk("a", "/adopted"))
+	seedRow(t, c, sk("b", "/idle"), evictNow-3*evictDay)
+	seedRow(t, c, sk("c", "/idle2"), evictNow-2*evictDay)
+	seedRow(t, c, sk("d", "/fresh"), evictNow-3600)
+}
+
+// Spec C3 / R-D1: at the global cap, CreateSuite evicts the
+// least-recently-requested suite that has no current snapshot and has been
+// idle for 24 h, under its mutex (the guard), in the creating transaction:
+// the evictee's snapshots are retired (CommitAdoption refuses its
+// candidate), its url_path rows are left to GC, and the guard is told the
+// row is gone.
+func TestCreateSuite_EvictsTheIdlestSuiteAtTheGlobalCap(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	fourRows(t, c)
+	h := seedBlob(t, c, "candidate of /idle")
+	cand, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{CanonicalScheme: "http", CanonicalHost: "b",
+		SuitePath: "/idle", InReleaseHash: &h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PutURLPath(ctx, URLPath{CanonicalScheme: "http", CanonicalHost: "b", Path: "/idle/InRelease",
+		UpstreamURL: "http://b/idle/InRelease", IsMetadata: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.MarkSignedSeenBatch(ctx, []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "b", Base: "/idle",
+		SeenAt: evictNow - 3*evictDay}}); err != nil {
+		t.Fatal(err)
+	}
+	g := newFakeGuard()
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 4}, g)
+	if err != nil || res.Outcome != SuiteCreated || res.Evicted == nil || *res.Evicted != sk("b", "/idle") {
+		t.Fatalf("CreateSuite = %+v (evicted %v), %v; want created, evicting b/idle", res, res.Evicted, err)
+	}
+	if !slices.Equal(g.asked, []SuiteKey{sk("b", "/idle")}) || !slices.Equal(g.released[sk("b", "/idle")], []bool{true}) {
+		t.Fatalf("guard asked %v, released %v; want b/idle held and released as deleted", g.asked, g.released)
+	}
+	if rowExists(t, c, sk("b", "/idle")) || !rowExists(t, c, sk("e", "/new")) || !rowExists(t, c, sk("a", "/adopted")) {
+		t.Fatal("rows after the eviction: want b/idle gone, e/new and a/adopted present")
+	}
+	if snap, err := c.GetSuiteSnapshot(ctx, cand); err != nil || snap.RetiredAt == nil || *snap.RetiredAt != evictNow {
+		t.Fatalf("evictee's candidate = %+v, %v; want retired at %d", snap, err, evictNow)
+	}
+	if err := c.CommitAdoption(ctx, cand, nil, nil, nil, nil, false); !errors.Is(err, ErrSnapshotRetired) {
+		t.Fatalf("CommitAdoption of the evictee's candidate = %v, want ErrSnapshotRetired", err)
+	}
+	if _, err := c.LookupURL(ctx, "http", "b", "/idle/InRelease"); err != nil {
+		t.Fatalf("the evictee's url_path row was deleted (%v): url_path GC owns it", err)
+	}
+	if _, ok, err := c.SignedSeen(ctx, "http", "b", "/idle"); err != nil || !ok {
+		t.Fatalf("the evictee's signed-seen marker is gone (%v): markers survive reaping (spec C3)", err)
+	}
+}
+
+// A busy candidate (a check or an adoption holds its mutex) is skipped for
+// the next one; nothing busy is ever deleted.
+func TestCreateSuite_EvictionSkipsBusySuites(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	fourRows(t, c)
+	g := newFakeGuard()
+	g.busy[sk("b", "/idle")] = true
+	res, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow},
+		SuiteCaps{Global: 4}, g)
+	if err != nil || res.Outcome != SuiteCreated || res.Evicted == nil || *res.Evicted != sk("c", "/idle2") {
+		t.Fatalf("CreateSuite = %+v, %v; want created, evicting c/idle2", res, err)
+	}
+	if !slices.Equal(g.asked, []SuiteKey{sk("b", "/idle"), sk("c", "/idle2")}) || len(g.released[sk("b", "/idle")]) != 0 {
+		t.Fatalf("guard asked %v, released %v", g.asked, g.released)
+	}
+	if !rowExists(t, c, sk("b", "/idle")) {
+		t.Fatal("the busy suite was deleted")
+	}
+}
+
+// With nothing evictable (every suite adopted, recently requested or
+// busy), a creation at the global cap is refused and nothing is deleted.
+func TestCreateSuite_RefusesWhenNothingIsEvictable(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	fourRows(t, c)
+	g := newFakeGuard()
+	g.busy[sk("b", "/idle")], g.busy[sk("c", "/idle2")] = true, true
+	res, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow},
+		SuiteCaps{Global: 4}, g)
+	if err != nil || res.Outcome != SuiteRejectedGlobal || res.Evicted != nil {
+		t.Fatalf("CreateSuite = %+v, %v; want global_cap, nothing evicted", res, err)
+	}
+	if st, err := c.GetSuiteStats(context.Background()); err != nil || st.Tracked != 4 {
+		t.Fatalf("tracked = %+v, %v; want 4", st, err)
+	}
+}
+
+// Ruling PD-8: above the cap (a lowered max_suites, an upgraded v6 table)
+// one eviction cannot make room, but each creation attempt still evicts
+// one idle suite — and is refused — so the table converges under the 24 h
+// rule: here the first attempt evicts f/idle3 and is refused, and the next
+// one, at the cap, evicts b/idle and creates its row.
+func TestCreateSuite_AboveTheCapEvictsOneAndRefuses(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	fourRows(t, c)
+	seedRow(t, c, sk("f", "/idle3"), evictNow-4*evictDay)
+	g := newFakeGuard()
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 4}, g)
+	if err != nil || res.Outcome != SuiteRejectedGlobal || res.Evicted == nil || *res.Evicted != sk("f", "/idle3") {
+		t.Fatalf("CreateSuite = %+v, %v; want global_cap, evicting f/idle3", res, err)
+	}
+	if !slices.Equal(g.released[sk("f", "/idle3")], []bool{true}) || rowExists(t, c, sk("f", "/idle3")) || rowExists(t, c, sk("e", "/new")) {
+		t.Fatalf("released %v; want f/idle3 deleted and released as deleted, e/new not created", g.released)
+	}
+	res, err = c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new2"), RequestedAt: evictNow}, SuiteCaps{Global: 4}, g)
+	if err != nil || res.Outcome != SuiteCreated || res.Evicted == nil || *res.Evicted != sk("b", "/idle") {
+		t.Fatalf("CreateSuite at the cap = %+v, %v; want created, evicting b/idle", res, err)
+	}
+	if st, err := c.GetSuiteStats(ctx); err != nil || st.Tracked != 4 {
+		t.Fatalf("tracked = %+v, %v; want 4 (the cap)", st, err)
+	}
+}
+
+// A creation refused at its host's cap evicts nothing, even at the global
+// cap with an evictable suite: the per-host check comes first.
+func TestCreateSuite_HostCapRefusalEvictsNothing(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	fourRows(t, c) // hosts a, b, c, d (one row each); b and c are evictable
+	res, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("d", "/new"), RequestedAt: evictNow},
+		SuiteCaps{Global: 4, PerHost: 1}, newFakeGuard())
+	if err != nil || res.Outcome != SuiteRejectedHost || res.Evicted != nil {
+		t.Fatalf("CreateSuite = %+v, %v; want host_cap, nothing evicted", res, err)
+	}
+	if !rowExists(t, c, sk("b", "/idle")) {
+		t.Fatal("a host-cap refusal evicted a suite")
+	}
+}
+
+// The compare-and-delete retires and deletes only the evictee, not a suite
+// with the same path on another host.
+func TestCreateSuite_EvictionTouchesOnlyTheEvictee(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	seedRow(t, c, sk("b", "/idle"), evictNow-3*evictDay)
+	seedRow(t, c, sk("z", "/idle"), evictNow-3600)
+	id := adoptRow(t, c, sk("z", "/idle"))
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 2}, newFakeGuard())
+	if err != nil || res.Evicted == nil || *res.Evicted != sk("b", "/idle") {
+		t.Fatalf("CreateSuite = %+v, %v; want b/idle evicted", res, err)
+	}
+	if !rowExists(t, c, sk("z", "/idle")) {
+		t.Fatal("the eviction deleted a same-path suite on another host")
+	}
+	if snap, err := c.GetSuiteSnapshot(ctx, id); err != nil || snap.RetiredAt != nil {
+		t.Fatalf("the eviction retired another host's snapshot: %+v, %v", snap, err)
+	}
+}
+
+// Design review M4: a held candidate whose row a concurrent creation
+// evicted before this one held it (here: deleted inside HoldSuite, the
+// table refilled behind it) is released as gone — its in-memory state is
+// stale — and the creation tries once more with a fresh candidate list; a
+// second vanished candidate ends it with a refusal (at most two attempts).
+// An unused candidate that vanished (room was left) is released as gone
+// too.
+func TestCreateSuite_RetriesOnceWhenTheCandidateVanished(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	fourRows(t, c)
+	refills := 0
+	evictedElsewhere := func(k SuiteKey) {
+		if _, err := c.db.Exec(`DELETE FROM suite_freshness WHERE canonical_host = ? AND suite_path = ?`,
+			k.CanonicalHost, k.SuitePath); err != nil {
+			t.Error(err)
+		}
+		refills++
+		seedRow(t, c, sk("r", fmt.Sprintf("/refill%d", refills)), evictNow-3600)
+	}
+	g := newFakeGuard()
+	g.onHold = func(k SuiteKey) {
+		if k == sk("b", "/idle") {
+			evictedElsewhere(k)
+		}
+	}
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 4}, g)
+	if err != nil || res.Outcome != SuiteCreated || res.Evicted == nil || *res.Evicted != sk("c", "/idle2") {
+		t.Fatalf("CreateSuite = %+v, %v; want created on the second attempt, evicting c/idle2", res, err)
+	}
+	if !slices.Equal(g.released[sk("b", "/idle")], []bool{true}) || !slices.Equal(g.released[sk("c", "/idle2")], []bool{true}) {
+		t.Fatalf("released %v; want b/idle released as gone and c/idle2 as deleted", g.released)
+	}
+	// Every candidate vanishes: two attempts, then a refusal.
+	seedRow(t, c, sk("f", "/idle4"), evictNow-3*evictDay)
+	seedRow(t, c, sk("g", "/idle5"), evictNow-3*evictDay)
+	g2 := newFakeGuard()
+	g2.onHold = evictedElsewhere
+	res, err = c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new2"), RequestedAt: evictNow}, SuiteCaps{Global: 6}, g2)
+	if err != nil || res.Outcome != SuiteRejectedGlobal || len(g2.asked) != 2 {
+		t.Fatalf("CreateSuite = %+v, %v, asked %v; want global_cap after two candidates", res, err, g2.asked)
+	}
+	for _, k := range g2.asked {
+		if !slices.Equal(g2.released[k], []bool{true}) {
+			t.Fatalf("released %v; want each vanished candidate released as gone", g2.released)
+		}
+	}
+	// Below the cap a held candidate goes unused; if it vanished, it is
+	// released as gone all the same.
+	seedRow(t, c, sk("h", "/idle6"), evictNow-3*evictDay)
+	g3 := newFakeGuard()
+	g3.onHold = func(k SuiteKey) {
+		if _, err := c.db.Exec(`DELETE FROM suite_freshness WHERE canonical_host = ? AND suite_path = ?`,
+			k.CanonicalHost, k.SuitePath); err != nil {
+			t.Error(err)
+		}
+	}
+	res, err = c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new3"), RequestedAt: evictNow}, SuiteCaps{Global: 10}, g3)
+	if err != nil || res.Outcome != SuiteCreated || len(g3.asked) != 1 || !slices.Equal(g3.released[g3.asked[0]], []bool{true}) {
+		t.Fatalf("CreateSuite = %+v, %v; asked %v, released %v; want created and the vanished candidate released as gone",
+			res, err, g3.asked, g3.released)
+	}
+}
+
+// Design review M5: within suiteEvictCandidates of the global cap a
+// creation already holds a candidate (creations racing at the boundary
+// each find their own), and releases it unused while there is room; well
+// below the cap it holds none.
+func TestCreateSuite_HoldsACandidateNearTheCap(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	fourRows(t, c)
+	g := newFakeGuard()
+	res, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow},
+		SuiteCaps{Global: 4 + suiteEvictCandidates}, g)
+	if err != nil || res.Outcome != SuiteCreated || res.Evicted != nil {
+		t.Fatalf("CreateSuite = %+v, %v; want created, nothing evicted", res, err)
+	}
+	if !slices.Equal(g.asked, []SuiteKey{sk("b", "/idle")}) || !slices.Equal(g.released[sk("b", "/idle")], []bool{false}) {
+		t.Fatalf("asked %v, released %v; want b/idle held and released unused", g.asked, g.released)
+	}
+	g = newFakeGuard()
+	if _, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("e", "/new2"), RequestedAt: evictNow},
+		SuiteCaps{Global: 6 + suiteEvictCandidates}, g); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.asked) != 0 {
+		t.Fatalf("asked %v well below the cap; want none", g.asked)
+	}
+}
+
+// clockGuard is a fakeGuard that is also a ClockStepReporter.
+type clockGuard struct {
+	*fakeGuard
+	reports []string
+}
+
+func (g *clockGuard) ReportClockStep(stamp string, key SuiteKey, stored, now int64) {
+	g.reports = append(g.reports, fmt.Sprintf("%s %s%s %d %d", stamp, key.CanonicalHost, key.SuitePath, stored-now, now))
+}
+
+// Ruling PD-11 (design review M11): a suite whose last_requested_at lies
+// more than 2 s in the future is never evicted (deleteSuiteTx), and the
+// eviction tells a reporting guard, which rate-limits spec C4's
+// clock_step_detected; a stamp within the slack is not a clock step.
+func TestCreateSuite_ReportsAFutureInterestStamp(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	seedRow(t, c, sk("a", "/slack"), evictNow+futureStampSlack)
+	g := &clockGuard{fakeGuard: newFakeGuard()}
+	if _, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 1}, g); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.reports) != 0 {
+		t.Fatalf("reports = %q for a stamp within the slack, want none", g.reports)
+	}
+	seedRow(t, c, sk("a", "/future"), evictNow+evictDay)
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 2}, g)
+	if err != nil || res.Outcome != SuiteRejectedGlobal || res.Evicted != nil {
+		t.Fatalf("CreateSuite = %+v, %v; want global_cap, nothing evicted", res, err)
+	}
+	if want := fmt.Sprintf("last_requested_at a/future %d %d", evictDay, evictNow); !slices.Equal(g.reports, []string{want}) {
+		t.Fatalf("reports = %q, want [%q]", g.reports, want)
+	}
+	if !rowExists(t, c, sk("a", "/future")) {
+		t.Fatal("a suite requested in the future was evicted")
+	}
+}
+
+// Design review M3: after a failed submit (no result), afterCreate decides
+// by reading the held candidate's row: absent — this creation's eviction
+// committed after all — releases it as deleted; present releases it as
+// kept. A result that names the eviction needs no read.
+func TestAfterCreate_ReadsTheCandidatesRowUnlessTheResultSays(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	seedRow(t, c, sk("b", "/kept"), evictNow-3*evictDay)
+	var got []bool
+	held := func(k SuiteKey) *heldSuite {
+		return &heldSuite{key: k, release: func(deleted bool) { got = append(got, deleted) }}
+	}
+	c.afterCreate(CreateResult{}, held(sk("b", "/kept")))
+	c.afterCreate(CreateResult{}, held(sk("b", "/gone")))
+	kept := sk("b", "/kept")
+	c.afterCreate(CreateResult{Outcome: SuiteCreated, Evicted: &kept}, held(kept))
+	if !slices.Equal(got, []bool{false, true, true}) {
+		t.Fatalf("released %v; want [false true true] (present: kept; absent: deleted; evicted: deleted)", got)
+	}
+}
+
+// SuiteCapUsage reports the table against the caps (ruling PD-8's startup
+// WARN): the total, the hosts at or above the per-host cap — across
+// schemes — and the fullest host.
+func TestSuiteCapUsage(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	if u, err := c.SuiteCapUsage(ctx, 2); err != nil || u != (SuiteCapUsage{}) {
+		t.Fatalf("empty table: %+v, %v", u, err)
+	}
+	for _, k := range []SuiteKey{sk("a", "/1"), {CanonicalScheme: "https", CanonicalHost: "a", SuitePath: "/2"}, sk("a", "/3"),
+		sk("b", "/1"), sk("b", "/2"), sk("c", "/1")} {
+		seedRow(t, c, k, evictNow)
+	}
+	u, err := c.SuiteCapUsage(ctx, 2)
+	if err != nil || u != (SuiteCapUsage{Total: 6, HostsAtCap: 2, FullestHost: "a", FullestHostRows: 3}) {
+		t.Fatalf("usage = %+v, %v; want 6 rows, 2 hosts at the cap, a fullest with 3", u, err)
+	}
+	if u, err := c.SuiteCapUsage(ctx, 0); err != nil || u.HostsAtCap != 0 || u.Total != 6 {
+		t.Fatalf("no per-host cap: %+v, %v", u, err)
+	}
+}
+
+// R-D1: the writer re-checks the candidate (compare-and-delete). A
+// candidate requested after it was chosen — here inside HoldSuite, before
+// the writer operation — is no longer idle: nothing is deleted and the
+// creation is refused.
+func TestCreateSuite_EvictionRechecksInTheWriter(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	fourRows(t, c)
+	g := newFakeGuard()
+	g.onHold = func(k SuiteKey) {
+		if _, err := c.db.Exec(`UPDATE suite_freshness SET last_requested_at = ? WHERE suite_path = ?`, evictNow, k.SuitePath); err != nil {
+			t.Error(err)
+		}
+	}
+	res, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow},
+		SuiteCaps{Global: 4}, g)
+	if err != nil || res.Outcome != SuiteRejectedGlobal {
+		t.Fatalf("CreateSuite = %+v, %v; want global_cap", res, err)
+	}
+	if !slices.Equal(g.released[sk("b", "/idle")], []bool{false}) || !rowExists(t, c, sk("b", "/idle")) {
+		t.Fatalf("released %v; want b/idle kept", g.released)
+	}
+}
+
+// R-D1: deleteSuiteTx is a compare-and-delete phase F's reaper reuses: it
+// deletes only a row still idle at the cutoff with the expected current
+// snapshot (releasing that snapshot's pins), retires the suite's
+// snapshots, and treats a future stamp (backward clock step) as not idle.
+func TestDeleteSuiteTx_IsACompareAndDelete(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	key := sk("h", "/r/dists/x")
+	seedRow(t, c, key, evictNow-2*evictDay)
+	id := adoptRow(t, c, key)
+	anchor, err := c.GetSnapshotMember(ctx, id, "InRelease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	del := func(k SuiteKey, want *int64, cutoff int64) deleteOutcome {
+		t.Helper()
+		var out deleteOutcome
+		if err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+			tx, err := conn.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = tx.Rollback() }()
+			if out, err = deleteSuiteTx(ctx, tx, k, want, cutoff, evictNow); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	other := id + 1
+	for name, out := range map[string]deleteOutcome{
+		"no current snapshot expected": del(key, nil, evictNow-evictDay),
+		"another current snapshot":     del(key, &other, evictNow-evictDay),
+		"requested after the cutoff":   del(key, &id, evictNow-3*evictDay),
+	} {
+		if out != suiteKept {
+			t.Fatalf("%s: outcome %d, want kept", name, out)
+		}
+	}
+	if out := del(sk("h", "/nope"), nil, evictNow); out != suiteNoRow {
+		t.Fatalf("no such row: outcome %d, want suiteNoRow", out)
+	}
+	if del(key, &id, evictNow-evictDay) != suiteDeleted {
+		t.Fatal("a qualifying row was not deleted")
+	}
+	if rowExists(t, c, key) {
+		t.Fatal("row still present")
+	}
+	if b, err := c.GetBlob(ctx, anchor.BlobHash); err != nil || b.RefCount != 0 {
+		t.Fatalf("anchor blob = %+v, %v; want its pin released (refcount 0)", b, err)
+	}
+	if snap, err := c.GetSuiteSnapshot(ctx, id); err != nil || snap.RetiredAt == nil {
+		t.Fatalf("snapshot = %+v, %v; want retired", snap, err)
+	}
+	// A stamp in the future never qualifies, whatever the cutoff.
+	future := sk("h", "/future")
+	seedRow(t, c, future, evictNow+evictDay)
+	if del(future, nil, evictNow) == suiteDeleted {
+		t.Fatal("a row requested in the future was deleted")
+	}
+	// The cutoff is inclusive (spec C3: idle >= 24 h), and a row without an
+	// interest stamp never qualifies.
+	exact := sk("h", "/exact")
+	seedRow(t, c, exact, evictNow-evictDay)
+	if del(exact, nil, evictNow-evictDay) != suiteDeleted {
+		t.Fatal("a suite idle exactly 24 h was not deleted")
+	}
+	null := sk("h", "/null")
+	seedRow(t, c, null, evictNow-evictDay)
+	if _, err := c.db.Exec(`UPDATE suite_freshness SET last_requested_at = NULL WHERE suite_path = '/null'`); err != nil {
+		t.Fatal(err)
+	}
+	if del(null, nil, evictNow) != suiteKept {
+		t.Fatal("a suite without an interest stamp was deleted")
+	}
+}
+
+// Count, eviction and insert run in one writer transaction, so concurrent
+// creations never exceed either cap.
+func TestCreateSuite_ConcurrentCreationsNeverExceedTheCaps(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	caps := SuiteCaps{Global: 10, PerHost: 3}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	created := 0
+	for h := range 8 {
+		for s := range 5 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk(fmt.Sprintf("h%d", h), fmt.Sprintf("/s%d", s)),
+					RequestedAt: nowUnix()}, caps, newFakeGuard())
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if res.Outcome == SuiteCreated {
+					mu.Lock()
+					created++
+					mu.Unlock()
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	all, err := c.ListSuites(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	perHost := map[string]int{}
+	for _, s := range all {
+		perHost[s.CanonicalHost]++
+		if perHost[s.CanonicalHost] > 3 {
+			t.Fatalf("host %s has %d rows, cap 3", s.CanonicalHost, perHost[s.CanonicalHost])
+		}
+	}
+	if len(all) != 10 || created != 10 {
+		t.Fatalf("rows = %d, created = %d; want 10 and 10 (the global cap)", len(all), created)
+	}
+}

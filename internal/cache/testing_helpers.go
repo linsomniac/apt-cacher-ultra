@@ -89,7 +89,7 @@ func (c *Cache) SeedSuiteForTest(ctx context.Context, s SuiteFreshness) error {
 			return fmt.Errorf("SeedSuiteForTest: begin: %w", err)
 		}
 		defer func() { _ = tx.Rollback() }()
-		if _, err := createSuiteTx(ctx, tx, SuiteSeed{SuiteKey: key, RequestedAt: nowUnix()}, SuiteCaps{}); err != nil {
+		if _, err := createSuiteTx(ctx, tx, SuiteSeed{SuiteKey: key, RequestedAt: nowUnix()}, SuiteCaps{}, nil, nowUnix()); err != nil {
 			return fmt.Errorf("SeedSuiteForTest: %w", err)
 		}
 		if err := updateSuiteFreshness(ctx, tx, s); err != nil {
