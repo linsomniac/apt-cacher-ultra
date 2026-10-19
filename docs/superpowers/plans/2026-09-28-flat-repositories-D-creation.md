@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give `suite_freshness` one creation choke point with caps and bounded eviction, make every other writer UPDATE-only, record client interest and signed-seen history at the points spec C3 names — the signed-seen marker inside the writer operation that stores a signed anchor, before its body is served — and close I-4 on both sides, so minted paths can grow no table or map past the caps.
+**Goal:** Give `suite_freshness` one creation choke point with caps and bounded eviction, make every other writer UPDATE-only, record client interest and signed-seen history at the points spec C3 names — the signed-seen marker inside the writer operation that stores a signed anchor, before its body is served, and every row creation's marks in its own transaction — and close I-4 on both sides, so minted paths can grow no table or map past the caps.
 
-**Architecture:** `aptpath` gains the `Release` and flat-index sniffs and one classifier (`ClassifySuiteFile`) that tells the handler, for any request path, whether serving it creates the suite's row, earns its base a signed-seen marker, or records client interest. `internal/cache` holds the only `INSERT INTO suite_freshness` (`createSuiteTx`, reached through `CreateSuite` for url_path-hit onboarding and `StoreFetched` for misses), enforces `freshness.max_suites` globally and a tenth of it per host, and at the global cap evicts the least-recently-requested idle suite without a current snapshot — holding that suite's in-memory mutex through a `SuiteGuard` the freshness checker implements, and deleting it with the compare-and-delete helper phase F's reaper will reuse. The handler's miss path stores the url_path row, the suite row and the marker in one writer transaction before writing the body, then registers the serve with the flip barrier; its hit path onboards anchors cached before this release, touches suites it serves (coalesced in the cache to one write per suite per hour), and serves by-hash from the pool only for known suites. The checker checks and reconciles only suites with rows and re-validates its lock after `TryLock`.
+**Architecture:** `aptpath` gains the `Release` and flat-index sniffs and one classifier (`ClassifySuiteFile`) that tells the handler, for any request path, whether serving it creates the suite's row, earns its base a signed-seen marker, or records client interest. `internal/cache` holds the only `INSERT INTO suite_freshness` (`createSuiteTx`, reached through `CreateSuite` for url_path-hit onboarding and `StoreFetched` for misses), enforces `freshness.max_suites` globally and a tenth of it per host, and at or above the global cap evicts the least-recently-requested idle suite without a current snapshot, one per attempt — holding that suite's in-memory mutex through a `SuiteGuard` the freshness checker implements, and deleting it with the compare-and-delete helper phase F's reaper will reuse. Every creation also marks, in its transaction, the suite's cached signed anchors, which the handler read and sniffed before it submitted. The handler's miss path stores the url_path row, the suite row and the marker in one writer transaction before writing the body (with no adopter, a refresh miss re-stamps the row there as today), then registers the serve with the flip barrier; its hit path onboards anchors cached before this release (one shared creation per suite), touches suites it serves (coalesced in the cache to one write per suite per hour), fires T1 only for tracked suites, and serves by-hash from the pool only for known suites. The checker checks and reconciles only suites with rows and re-validates its lock after `TryLock`; the scheduler's queue bound admits the least recently checked suites.
 
 **Tech Stack:** Go 1.25 (toolchain 1.26), modernc SQLite, `testing/synctest`, `github.com/ProtonMail/go-crypto` (clearsign decode only).
 
@@ -18,60 +18,76 @@ Everything in the overview's Global Constraints applies. In particular:
 - Production SQL never uses SQLite clock functions; persisted stamps come from `wallclock` (the cache's `nowUnix`, the handler's `wallclock.Unix()`). In-memory timing — touch coalescing, the rejection cache, the WARN rate limit — uses monotonic `time.Now`/`time.Since`.
 - `internal/cache` never imports `internal/freshness` or `internal/proxy`; the eviction guard is the cache-side interface `cache.SuiteGuard`, which `*freshness.Checker` implements. The writer goroutine never runs foreign code: the guard is taken before the writer operation is submitted.
 - Exactly one `INSERT INTO suite_freshness` exists in production code, in `createSuiteTx` (`TestSuiteFreshnessHasOneInsertSite`). Every other writer of `suite_freshness` is UPDATE-only. Outside `internal/cache`, only `internal/handler` calls `CreateSuite` or `StoreFetched`, and no production code calls the three test-only seeding helpers `SeedSuiteForTest`, `EnsureSuiteForTest` and `InsertTrackedCandidateForTest` (`TestOnlyTheHandlerCreatesSuiteRows`; other `…ForTest` helpers, such as the `ResetForTest` that `internal/proxy` calls, are out of its scope).
-- Constants (spec C3/C11), not knobs: rejection cache 10 min (at most 4,096 suites); eviction idle 24 h, at most eight candidates; touch coalescing 1 h; `suite_seed_rejected` at most once a minute. Knob: `freshness.max_suites` (default `5000`, at least `10`; per-host cap `max_suites / 10`).
-- Adoption-disabled behaviour stays as today: with no adopter the only rows created are `<suite>/InRelease` seeds, stamped exactly as the phase C tip stamps them (`TestServeHTTP_AdoptionDisabledSeedParity`), and no T1 fires on a miss.
+- Constants (spec C3/C11), not knobs: rejection cache 10 min (at most 4,096 suites); eviction idle 24 h, at most eight candidates; touch coalescing 1 h; `suite_seed_rejected` at most once a minute; tracked suite paths at most 1024 bytes (`aptpath.MaxSuitePathBytes`, ruling PD-9); onboarding's writer operation 5 s. Knob: `freshness.max_suites` (default `5000`, at least `10`; per-host cap `max_suites / 10`).
+- Adoption-disabled behaviour stays as today: with no adopter the only rows created are `<suite>/InRelease` seeds, stamped exactly as the phase C tip stamps them, a refresh miss re-stamps the row as today's upsert did (ruling PD-6), and no T1 fires on a miss (`TestServeHTTP_AdoptionDisabledSeedParity`). The one Phase-1 difference spec C3 makes — a detached-only suite (`Release` + `Release.gpg`) is no longer tracked — is documented (design review M7, Task 13).
 - Tests that call `wallclock.SetOffsetForTest` never use `t.Parallel()`. Simulations and the scale test run inside `testing/synctest` bubbles where they need virtual time, finish in under 5 s under `-race`, and silence loggers with `simtest.DiscardLogger()` (or capture them).
-- Every goroutine started under `internal/freshness` recovers panics, and so does every goroutine this phase starts in `internal/handler` (deferred minor C-24).
+- Every goroutine started under `internal/freshness` recovers panics, and so does every goroutine this phase starts in `internal/handler`: the touch goroutine (deferred minor C-24) and the rejection cache's sweep timer (design review M10).
 - `go test -race ./...` and `golangci-lint run ./...` are clean; `gofmt -l .` lists only the five known drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`) at the end of every task. Never run `gofmt -w` on those five; edit them by hand (Task 4's rename scripts edit three of them — `cache_test.go`, `gc_urlpath_test.go`, `hot_prefetch_test.go` — word by word and must not reformat them).
 - Commit trailer: the implementer's own harness attribution line (phase A ruling); otherwise `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 Conventions in this plan:
 
 - Each task's **Interfaces** block lists what it uses from other tasks and existing test files. Never redefine a helper: a second definition in the same package does not compile.
-- Each commit step starts with `gofmt -l <files>`; it must print nothing (the drift files are named where a task touches them).
+- Each commit step starts with `gofmt -l <files>`; it must print nothing (the drift files are named where a task touches them). Run `gofmt -w` on the non-drift files a step edits before that check (exec review D27: Task 4's A-30 edit leaves `freshness_test.go` unformatted otherwise); never on the five drift files.
 - A "verify failure" step whose expected result is a compile failure is complete when the compiler names the undefined identifiers listed.
 - Mutation checks are run one at a time, each reverted before the next; record each failing test line in the commit message.
-- **Existing tests that change.** Task 4 migrates every fixture that relied on an upsert (listed there, applied by a script whose counts it states); Tasks 3 and 9 replace plain-text `InRelease` fixtures with `simtest.ClearsignedFixture` (listed there); Task 10 seeds the suite row in the one by-hash test whose suite had none. Any other existing test that fails means the change is wrong.
+- **Existing tests that change.** Task 4 migrates every fixture that relied on an upsert (listed there, applied by a script whose counts it states); Task 3 replaces the freshness fixtures reconcile parses and, in its own fixture-only commit, every handler and cmd `InRelease` fixture that models an upstream response, a cached anchor or a snapshot anchor with `simtest.ClearsignedFixture` (ruling PD-2; the bodies left plain on purpose are listed in Task 12's intro); Task 10 seeds the suite row in the by-hash tests whose request's suite had none (`…_PoolHit`, and `…_DisallowedHostRejected` and `…_RejectsCrossHostBlob` so their own gates still answer). Each task text says why an existing expectation changes where one does. Any other existing test that fails means the change is wrong.
 
 ## Rulings and design notes
 
 Controller rulings (binding):
 
 - **R-D1 — cap eviction before phase F's reaper.** One compare-and-delete helper, `deleteSuiteTx` (Task 5), is the only suite-row delete: inside the caller's writer transaction it re-reads the row and deletes it only if it still qualifies (no current snapshot — or, for F, the listed one — and `last_requested_at` at or before the cutoff), releasing the current snapshot's pins (F only), retiring every snapshot of the suite and deleting the row; F's `cache.ReapIdleSuite` reuses it. Count, evict and insert run in the one writer transaction `CreateSuite`/`StoreFetched` already is, so concurrent creations can never exceed a cap, and no request ever runs a batched `url_path` delete: the evictee's metadata rows are left to `url_path` GC (AIDEV-NOTE on `CreateSuite`). After a committed eviction the evictee's in-memory state is purged exactly as F's reaper will purge it: the guard's `release(true)` drops the lock-map entry (`CompareAndDelete`) and the flip-gate entry (`Purge`), the cache drops its touch-coalescing entry, and the scheduler flushes a queued entry through I-4 (no row → `skipped` → done). "Under its mutex" fits the layering: the checker's `HoldSuite` takes the candidate's mutex with `TryLock` (busy → the next candidate) before the writer operation is submitted, and releases it after the commit.
-- **R-D2 — adoption accepts exactly apt's first line.** apt's `pkgAcqMetaClearSig::VerifyDone` rejects an `InRelease` unless `StartsWithGPGClearTextSignature` holds (`acquire-item.cc`, line 2040 of the copy in the controller scratchpad): the first line, with trailing `' '`, `'\t'`, `'\r'` and `'\n'` stripped by `_strrstrip` (`strutl.cc`, line 240), must equal `-----BEGIN PGP SIGNED MESSAGE-----` exactly; leading whitespace or a leading blank line fails. A snapshot anchor is served to apt clients, so `requireBareClearsigned` now requires `aptpath.SniffInRelease` (the same rule) of any body that contains the marker, and returns `ErrMalformedClearsign` otherwise (Task 2). The other direction is closed too: go-crypto v1.4.1's `clearsign.Decode` refuses a marker line with trailing blanks, which apt (and RFC 4880 §6.2) accepts, so every decode of an envelope — the verifier and reconcile's `inReleasePlaintext` — goes through `aptpath.DecodableClearsign`, which hands the decoder a copy with the bare marker line (Tasks 2, 3). Pinned by `TestVerifyInline_FollowsAptsFirstLineRule`.
+- **R-D2 — adoption accepts exactly apt's first line.** apt's `pkgAcqMetaClearSig::VerifyDone` rejects an `InRelease` unless `StartsWithGPGClearTextSignature` holds (`apt-pkg/acquire-item.cc`, line 2040 of the copy in the controller scratchpad). That function lives in `apt-pkg/contrib/fileutl.cc`, which the scratchpad copies do not include: it reads the first line, strips trailing `' '`, `'\t'`, `'\r'` and `'\n'` with `_strrstrip` (`apt-pkg/contrib/strutl.cc`, line 240 of the copy), and requires `-----BEGIN PGP SIGNED MESSAGE-----` exactly, so leading whitespace or a leading blank line fails. Spec §3's probes of real apt (2.8.3–3.3.2) agree: "An InRelease whose first line is not exactly `-----BEGIN PGP SIGNED MESSAGE-----` is rejected (no fallback)". A snapshot anchor is served to apt clients, so `requireBareClearsigned` now requires `aptpath.SniffInRelease` (the same rule) of any body that contains the marker, and returns `ErrMalformedClearsign` otherwise (Task 2). The other direction is closed too: go-crypto v1.4.1's `clearsign.Decode` refuses a marker line with trailing blanks, which apt (and RFC 4880 §6.2) accepts, so every decode of an envelope — the verifier and reconcile's `inReleasePlaintext` — goes through `aptpath.DecodableClearsign`, which hands the decoder a copy with the bare marker line (Tasks 2, 3). Pinned by `TestVerifyInline_FollowsAptsFirstLineRule`.
 - **R-D3 — the flat index sniff before phase G.** `aptpath.SniffRelease` and `aptpath.SniffFlatIndex` land with full tables; `ClassifySuiteFile(suite, path)` returns `FileFlatIndex` for a root `Packages*`/`Sources*` of a suite without a `dists` segment, so the handler already routes flat indexes through the sniff, the row creation and the touch. No flat grammar is added: `SuitePath` gives no flat suite before G, so the branch is reachable only in unit tests until then.
 - **R-D4 — adoption-disabled parity.** The parity test (Task 9) pins every column of the row today's first-contact `InRelease` miss creates with no adopter, as measured on the phase C tip: `last_check_at = last_success_at = last_requested_at =` the miss's stamp, the miss's `ETag`/`Last-Modified`, `inrelease_change_seen_at`/`current_snapshot_id` NULL, `check_fail_count = 0`, an empty failure record — and that no T1 fires and no other path seeds a row.
 - **R-D5 — metric names.** `acu_suite_seed_rejected_total{host}` (counter: refusals that reached the writer, so at most one per suite per rejection-cache window) and `acu_suites_seed_rejected` (unlabelled gauge: the rejection cache's size). The WARN is rate-limited to one line per minute process-wide, with `suppressed`. The rejection cache holds at most 4,096 suites: at the bound it drops expired entries and, if still full, clears itself (each suite then costs one more writer operation). All documented in `docs/log-fields.md` and the handler's metrics inventory comment.
+
+Plan-review rulings (binding; controller, 2026-10-18, after the executability and design reviews):
+
+- **PD-1 — the deferred-minor reading.** Files a task changes only through Task 4's mechanical rename scripts do not count as touched, and phase tags override the brief's "every item": a rename diff puts no reviewer on the file's logic, and mixing unrelated fixes into it blurs the review. B-27, B-36, C-12 and C-13 wait for phase H's sweep (Task 12's intro).
+- **PD-2 — clearsigned fixtures** (design review I3; spec §7). Every handler and cmd `InRelease` fixture that models an upstream response, a cached anchor or a snapshot anchor is `simtest.ClearsignedFixture`, converted in a fixture-only commit in Task 3 — right after the helper exists, before anything sniffs — so the unchanged green suite proves the conversion changed no outcome. Bodies that are plain text on purpose stay, each with a comment; Task 12's intro lists them. Spec §7's fixture paragraph stands as written.
+- **PD-3 — public names.** `handler_goroutine_panicked`, `suite_evicted`, `acu_freshness_unlogged_panics_total`, `acu_suite_seed_rejected_total{host}` and `acu_suites_seed_rejected` follow the existing event and metric conventions (renaming before the 1.1.0 RC is free); PD-8's `suite_caps_exceeded` follows them too.
+- **PD-4 — `commitTimeout` stays unexported**; an AIDEV-NOTE ties the "5-minute" texts to it (deferred minor C-33, Task 12).
+- **PD-5 — every row creation marks in its own transaction** (design review I1). Before submitting, the handler reads the suite's `<suite>/InRelease` and `<suite>/Release.gpg` url_path rows and sniffs their blobs outside the writer (`SuiteSeed.Cached`, `cachedAnchors`). `createSuiteTx` re-reads those rows after its INSERT and marks the base once, with the newest stamp among the body in hand and every row whose blob is unchanged; a row that changed or appeared in between sets `CreateResult.Unproven`, and only then does the caller run the `markCachedSignedAnchors` backstop after the commit. `registerLate` follows `StoreFetched`/`CreateSuite` immediately; no pool I/O runs on the writer goroutine (Tasks 4, 6, 9, 10, 11).
+- **PD-6 — Phase-1 refresh misses re-stamp** (design review I2). With no adopter, a sniff-passing `InRelease` refresh miss re-stamps the existing row with today's upsert columns — `last_check_at`, `last_success_at`, the miss's validators, `inrelease_change_seen_at = NULL`, `check_fail_count = 0` — in `StoreFetched`'s transaction, UPDATE-only and only while the row has no current snapshot (`FetchedRow.Restamp`); `last_requested_at` is left alone. With an adopter wired the row is left as it is (design note 5) (Tasks 6, 9).
+- **PD-7 — the reviews' other findings.** Design review I4, I5, M1, M3, M4, M5, M7, M8, M9, M10, M14, M15 and M17 and exec review D1–D29 are accepted (D20's test in Task 10).
+- **PD-8 — eviction above the cap** (design review M6). At or above the global cap each creation attempt evicts one held candidate (idle 24 h, no current snapshot); an attempt is still refused while the count stays at or above the cap, so a lowered `max_suites` or an upgraded v6 table converges under the 24 h rule. The per-host cap never evicts. A startup WARN `suite_caps_exceeded` names a table at or above either cap; the docs and the spec name the upgrade case and the 30-day reaper horizon (Tasks 5, 8, 13).
+- **PD-9 — suite paths over 1024 bytes are not tracked** (design review M13): `ClassifySuiteFile` returns `NotSuiteFile` for them, so they get no row, marker, touch or rejection-cache entry — a pure function bounds the key size of every per-suite table and map (Tasks 1, 9).
+- **PD-10 — the binary `Release.gpg` sniff checks the version byte** (design review M19). The byte at the packet body's offset — from the old-format length type (0x88–0x8B; one, two or four length octets, none for the indeterminate type) or the new-format 0xC2 first length octet (below 192: one octet, 192–223: two, 255: five, 224–254 partial: one) — must be a signature version 3–6, with enough bytes present. Text starting with a UTF-8 lead byte ("©", U+00A0) no longer earns a false marker, which in phase E would block unsigned adoption for good; spec C3's table is amended (Tasks 1, 13).
+- **PD-11 — clock steps, the scheduler bound and T1 for untracked suites** (design review M11, M12, M18). The touch-coalescing residual after a forward wall-clock step is documented (AIDEV-NOTE in `suite_touch.go`, spec C3); cap eviction reports future-stamped interest through the checker's rate-limited `clock_step_detected` (`cache.ClockStepReporter`, which the guard implements, since the cache cannot import freshness). When the scheduler's bound cuts a tick's due list, it admits the least recently checked suites (`boundDue`). A url_path hit fires T1 only for a tracked suite, which onboarding sets first (Tasks 6, 7, 10).
 
 Design notes (choices the spec leaves open — the boring, bounded option, with the reason):
 
 1. **Seed values.** Only the adoption-disabled miss of `<suite>/InRelease` stamps the row as a successful check with the miss's validators (today's seed, R-D4). Every other creation — any adopter-wired creation and every url_path-hit onboarding — leaves `last_check_at`, `last_success_at` and the validators NULL, as spec C3 says for the adopter-wired seed: the first check runs at once (no cooldown) and unconditionally, and no row ever carries one anchor's validators for another (a `Release`-created row reused by the inline check would send `Release`'s validators for `InRelease`).
 2. **T1 on the miss path stays phase E's** (spec §9: "T1-on-seed"). Until E an adopter-wired row is first checked by the next hit's T1 (hits fire T1 today) or the next scheduler tick (never-checked class), at the cost of one unconditional anchor GET (spec §10.11). `TestServeHTTP_FreshnessNotTriggeredOnMiss` keeps passing.
-3. **Url_path-hit onboarding seeds the NULL row in both modes** and is followed by the T1 every hit already fires, which then checks at once — the sequence today's hit produced when its T1 created the row through the old upsert. Without onboarding, I-4 would leave a row-less legacy suite unchecked forever.
-4. **Creating a row also marks the suite's other cached signed anchors** (`markCachedSignedAnchors`, Task 9). Markers are written only for tracked suites, so an `InRelease` or `Release.gpg` url_path row stored while its suite had no row (refused at a cap, or cached by a pre-v7 binary for a suite without a row) has none; once a hit or miss creates the row, the hit-path invariant needs it. The body in hand is marked in the creating transaction; the other cached anchors in one follow-up writer operation whose failure is logged and healed by the startup marker pass at the next start (deviation 2).
-5. **A refresh miss no longer re-stamps an existing row.** Today's upsert overwrote the check stamps and validators of a suite whose `InRelease` url_path row had been evicted; `CreateSuite` is create-only, so the next check refreshes them (one unconditional-or-stale conditional GET). The marker is still written on a refresh miss.
-6. **Eviction takes at most eight candidates** (least recently requested first; a busy one is skipped) and runs only at exactly the global cap: above it — rows created before `max_suites` was lowered — one eviction cannot make room, so nothing is evicted and phase F's reaper shrinks the table. A creation that races another at the cap boundary may be refused (cached for 10 minutes); caps are never exceeded.
-7. **Touch coalescing lives in the cache** (`TouchSuite`): the cache deletes suite rows (eviction now, F's reaper next), so it purges its own map; created rows are noted at creation, so the creating request's touch writes nothing. The map holds only suites whose UPDATE found a row and is swept of entries older than an hour when it reaches 4,096. A touch claims its entry before the write, so concurrent touches of one suite write once, and drops it when the write fails or finds no row, so an untracked suite never stays.
+3. **Url_path-hit onboarding seeds the NULL row in both modes** and is followed by the T1 the hit fires — only for a tracked suite, which onboarding makes it (ruling PD-11) — which then checks at once: the sequence today's hit produced when its T1 created the row through the old upsert. Without onboarding, I-4 would leave a row-less legacy suite unchecked forever. Phase-1 parity covers it (design review, underspecified 4): `TestServeHTTP_HitOnboardsALegacyAnchor`'s adoption-disabled leg pins the NULL row, its marker and the T1; `TestServeHTTP_AdoptionDisabledSeedParity` pins the seed and the refresh-miss re-stamp.
+4. **A row creation marks every signed anchor its suite has cached, in the creating transaction** (ruling PD-5). Markers are written only for tracked suites, so an `InRelease` or `Release.gpg` url_path row stored while its suite had no row (refused at a cap, or cached by a pre-v7 binary for a suite without a row) has none; once a hit or miss creates the row, the hit-path invariant needs it. The handler pre-reads and sniffs those rows (`cachedAnchors` → `SuiteSeed.Cached`, outside the writer); `createSuiteTx` marks the unchanged ones with the body in hand. A sniff result is a function of the blob hash, so an unchanged hash needs no re-read; a changed or new row sets `CreateResult.Unproven`, and only then does the `markCachedSignedAnchors` backstop run after the commit, its failure logged and healed by the startup marker pass at the next start. A creation whose transaction fails leaves the suite untracked, and an untracked suite needs no marker (deviation 2).
+5. **A refresh miss re-stamps an existing row only with no adopter wired** (ruling PD-6): in `StoreFetched`'s transaction, the UPDATE-only re-stamp of today's upsert columns (`FetchedRow.Restamp`), for a row with no current snapshot. With an adopter wired the row is left as it is, so a never-checked row stays never-checked and eager adoption is not delayed. The marker is written on every refresh miss.
+6. **Eviction takes at most eight candidates** (least recently requested first; a busy one is skipped) and runs at or above the global cap, evicting at most one suite per attempt; above the cap the attempt is still refused while the count stays at or above it (ruling PD-8). A candidate is held once the table is within eight rows of the cap (design review M5), so creations at the boundary do not refuse while an idle suite exists. A held candidate the transaction did not delete is released as not deleted; one whose row was already gone is purged and the creation retried once with the next candidate (design review M4); after a failed submit the candidate's row is read again, so an eviction that did commit is purged exactly (M3). Caps are never exceeded.
+7. **Touch coalescing lives in the cache** (`TouchSuite`): the cache deletes suite rows (eviction now, F's reaper next), so it purges its own map; created rows are noted at creation, so the creating request's touch writes nothing. The map holds only suites whose UPDATE found a row and is swept of entries older than an hour once it reaches 4,096 entries — at most once a minute unless it has doubled since the last sweep (design review M9). A touch claims its entry before the write, so concurrent touches of one suite write once, and drops it when the write fails or finds no row, so an untracked suite never stays. The coalescing is monotonic: after a forward wall-clock step of 23 h or more an active suite can look idle for up to an hour (ruling PD-11, documented).
 8. **Touch call sites.** Anchor serves (`InRelease`, `Release`, `Release.gpg`; status below 400 — 200, 206, 304, HEAD) from a snapshot, the url_path cache, the miss path and the snapshot-member recovery path touch their suite when it is tracked; a stale serve touches without knowing (TouchSuite is UPDATE-only: an untracked suite costs one no-op write per stale serve, a rare path); a hash-validated `.deb` serve touches every suite whose current snapshot vouched it (`DeclaredHash.SuitePath`). Flat root-index touches come with G's grammar through `ClassifySuiteFile` (R-D3).
-9. **Late gate registration re-dispatches.** The serve that creates a suite's row registers with the flip barrier right after the creation (phase C carry-forward). If that registration waited in a hold, the flip may have committed a snapshot, so the request is served through the hit path instead of with the bytes it fetched.
+9. **Late gate registration re-dispatches.** The serve that creates a suite's row — on a miss or through onboarding — registers with the flip barrier right after the creation (phase C carry-forward). If that registration waited in a hold, the flip may have committed a snapshot, so the request is served through the snapshot path instead of with the bytes it fetched or found. Its line keeps the miss's outcome, fetch and upstream status and carries `flip_held_ms`; a client that left while it waited is a client abort (503 `client_canceled`, no WARN), as on the entry path (design review M1; `heldContext`, `clientLeft`).
 10. **`SniffRelease`** matches a hash-block header line the way `ParseRelease` reads one: the field name with its colon alone on a line, trailing CR, space and tab ignored, case-sensitive. **`SniffFlatIndex`** follows the spec table literally: an empty uncompressed index fails; `.lzma` is the classic `5D 00 00` header.
 11. **Test fixtures reach the single INSERT site through test-only helpers** (`SeedSuiteForTest`, `EnsureSuiteForTest`, `InsertTrackedCandidateForTest` in `internal/cache/testing_helpers.go`, beside the existing `…ForTest` helpers), so the migration of ~160 fixture call sites is a mechanical rename; a guard test keeps them out of production code.
 12. **`ErrSuiteGone` is classified `db_failed`** (no new outcome): every deleter of a suite row holds the suite's mutex (an adoption holds it from its check to its commit), so it is a backstop, not an expected path.
 13. **The per-host cap counts rows by `canonical_host` across schemes**, like the per-host admission slot.
 14. **`suite_evicted`** (INFO; spec C11 names no event for it) logs each eviction: `canonical_host`, `suite_path` (the evictee), `for_host`, `for_suite`.
-15. **Scheduler queue bound** (spec C4, phase B plan deviation 4): a tick enqueues due suites only while fewer than `freshness.max_suites` are queued, waiting or in flight.
-16. **`handler_goroutine_panicked`** (ERROR, `where = touch`): the touch goroutine's recover (deferred minor C-24) needs an event and spec C11 names none; the T1 goroutine keeps `freshness_check_panicked`. Both go through one helper, `logGoroutinePanic`, with the stack once per `where` per process.
+15. **Scheduler queue bound** (spec C4, phase B plan deviation 4): a tick enqueues due suites only while fewer than `freshness.max_suites` are queued, waiting or in flight; when the bound cuts the due list it admits the least recently checked (never checked first; a future `last_check_at` counts as never), still in key order (ruling PD-11, `boundDue`).
+16. **`handler_goroutine_panicked`** (ERROR, `where = touch` or `seed_rejections`): the touch goroutine's recover (deferred minor C-24) and the rejection cache's sweep timer need an event and spec C11 names none; the T1 goroutine keeps `freshness_check_panicked`. All go through one helper, `logGoroutinePanic` (Task 9), with the stack once per `where` per process.
 17. **`freshness.max_suites` is presence-sensitive**, like `adoption.max_duration`: absent means 5000; any value below 10, an explicit 0 included, fails validation (spec C11: "≥ 10").
 18. **The displaced-blob WARN** (deferred minor C-25) reuses `snapshot_member_blob_missing` with `snapshot_displaced = true` rather than a new event: same condition, same operator action.
 19. **`acu_freshness_unlogged_panics_total`** (deferred minor B-44; the item asks for a counter, not a log line): unlabelled, named like `acu_flip_gate_panics_total`, incremented only by the scheduler's last-resort recover, never through the logger that panicked.
 20. **A shutdown before the flip barrier** (deferred minor C-20) is decided in `spawnAdoption` alone: any error once the lifetime context has ended is an abandon at shutdown (spec C7, phase C design note 18), so `freshness/adoption.go` stays untouched; a genuine failure that coincides with the shutdown is logged at INFO and its change retried after the restart.
-21. **The scale test's gate** (Task 11) is a `flipgate.New` gate wired into the handler, the object `Adopter.FlipGate()` returns in production: minting suites needs no adopter, and `Len()` is read from the gate itself.
-22. **Clearsigned fixtures where an outcome depends on them** (spec §7 "Fixtures": the helper "replaces the non-clearsigned `InRelease` bodies in existing handler and cmd tests (about 18 files)"): Tasks 3 and 9 convert the fixtures whose test needs a sniff-passing `InRelease` — a miss that must create a row or marker (five handler files) and reconcile's parse (four freshness files). The other plain-text bodies (snapshot anchors, url_path rows of suites the test never tracks, the cmd tests) are served exactly as before, so converting them changes no outcome; they are left, and the full suite passing unchanged is the evidence.
+21. **The scale test's gate** (Task 11) is the adopter's: the handler gets `Adopter.FlipGate()` and the checker that guards eviction has that adopter, so eviction's `release(true)` purges the gate the handler registers on, as in production (design review I5). Its quiet period is the longest (`flipgate.MaxQuiet`), so the gate's idle sweep cannot blur the exact entry count the test asserts; every check answers 304, so nothing adopts.
+22. **Clearsigned fixtures** (ruling PD-2; spec §7 "Fixtures"). Every handler and cmd test `InRelease` body that models an upstream response, a cached anchor or a snapshot anchor is wrapped with `simtest.ClearsignedFixture` in Task 3's fixture-only commit; reconcile's four freshness fixtures in Task 3 itself. A body that is plain text on purpose stays, with a comment (Task 12's intro lists them).
+23. **Onboarding shares one creation per suite** (design review M8): concurrent hits on one untracked suite collapse onto one `runOnboard` through the handler's singleflight under its own key namespace (`"onboard|"+scheme+"|"+host+"|"+suite`), and the creation's writer operation is bounded at 5 s (`onboardTimeout`), well under apt's 30 s timeout; on a timeout or any other error the hit serves untracked. Each hit then registers its own serve; the leader alone runs an unproven creation's backstop.
+24. **The rejection cache expires without traffic** (design review M10): while it holds entries it runs a sweep timer (once a minute, `time.AfterFunc`; `Handler.Close` stops it), so expired refusals leave it and `acu_suites_seed_rejected` within a minute of their 10 minutes even when no request arrives; its goroutine recovers panics (design note 16). Chosen over computing the gauge at scrape time: the metrics package has no gauge-func type, and a package-level hook would couple every live handler.
 
 ## Deliberate deviations from the spec
 
-1. **The hit-path invariant covers tracked suites.** Spec C3/§7 say every `url_path` anchor row whose blob passes the sniff has a marker. Markers are written only for suites with a `suite_freshness` row (spec C3), so a sniff-passing anchor of a suite refused at a cap has none, by the spec's own rule. The invariant tested (Task 11) is: every sniff-passing `InRelease`/`Release.gpg` row of a tracked suite has a marker for its base. Task 13 amends spec C3 and §7.
-2. **Row creation on a hit writes markers.** Spec C3 says the hit path writes no marker. A url_path-hit onboarding creates the row of a suite whose anchors were cached while it had none — a legacy `dists/` suite (the startup pass marks only tracked suites) or one refused at a cap — so the creating transaction marks a sniff-passing `InRelease` in hand, and `markCachedSignedAnchors` marks the suite's other cached signed anchors (design note 4). Serving an existing tracked suite's anchor still writes no marker. Task 13 amends spec C3.
+1. **The hit-path invariant covers tracked suites.** Spec C3/§7 say every `url_path` anchor row whose blob passes the sniff has a marker. Markers are written only for suites with a `suite_freshness` row (spec C3), so a sniff-passing anchor of a suite refused at a cap has none, by the spec's own rule. The invariant tested (Task 11) is: every sniff-passing `InRelease`/`Release.gpg` row of a tracked suite has a marker for its base — at every committed state, since every creation marks in its own transaction (ruling PD-5). Task 13 amends spec C3 and §7.
+2. **Row creation on a hit writes markers.** Spec C3 says the hit path writes no marker. A url_path-hit onboarding creates the row of a suite whose anchors were cached while it had none — a legacy `dists/` suite (the startup pass marks only tracked suites) or one refused at a cap — so the creating transaction marks the base for a sniff-passing `InRelease` in hand and for every sniff-passing signed anchor the suite has cached (design note 4, ruling PD-5; a miss's creation does the same). Serving an existing tracked suite's anchor still writes no marker. Task 13 amends spec C3.
 
 ## Review Focus (phase D share)
 
@@ -80,32 +96,34 @@ Design notes (choices the spec leaves open — the boring, bounded option, with 
 3. **Upstreams answering 200 HTML for missing files** must never create a row or a marker: every suite file is sniffed before it counts — Tasks 1, 9, 10.
 4. **A failing or full writer** must never serve a signed anchor body without its marker, and must never leave the url_path row without the marker it was stored with — Tasks 6, 9.
 5. **A suite deleted while it is being checked or adopted** (eviction, later the reaper) must end that work without resurrecting the row or running two checks of one suite — Tasks 4, 5, 7.
+6. **A row creation and its marks are one commit**: no committed state has a tracked suite with an unmarked sniff-passing signed anchor, including a cached anchor that changes while the creation is in flight (the backstop) — Tasks 4, 6, 9, 10, 11.
+7. **A table above its caps** (a lowered `max_suites`, an upgraded v6 cache) converges under the 24 h rule and says so at start; a host at its cap waits for the reaper — Tasks 5, 8, 13.
 
 ## File map
 
 | File | Change |
 |---|---|
-| `internal/aptpath/sniff.go` (+ `sniff_test.go`) | `SniffRelease`, `SniffFlatIndex`, `SuiteFile`, `ClassifySuiteFile`, `DecodableClearsign` (R-D2); A-17. |
+| `internal/aptpath/sniff.go` (+ `sniff_test.go`) | `SniffRelease`, `SniffFlatIndex`, `SuiteFile`, `ClassifySuiteFile`, `MaxSuitePathBytes` (PD-9), `SniffReleaseGPG`'s version check (PD-10), `DecodableClearsign` (R-D2); A-17. |
 | `internal/gpg/verifier.go` (+ `failclosed_test.go`, `verifier_test.go`) | apt's first-line rule in `requireBareClearsigned`; envelopes decoded through `DecodableClearsign` (R-D2); A-50, A-51, A-52, A-53. |
 | `internal/simtest/clearsign.go` (new) (+ `clearsign_test.go`) | `ClearsignedFixture`. |
-| `internal/freshness/reconcile.go` (+ `reconcile_r1_test.go`, `reconcile_test.go`, `freshness_test.go`, `phase6_7_skip_repair_test.go`) | Reconcile parses only clearsigned `InRelease`; fixtures; A-32, A-33, A-34. |
-| `internal/cache/suite_rows.go` (new) (+ `suite_rows_test.go`, `single_insert_test.go`, `suite_evict_test.go`, `suite_interest_test.go`) | `SuiteKey`, `SuiteSeed`, `SuiteCaps`, `CreateOutcome`, `CreateResult`, `SuiteGuard`, `CreateSuite`, `createSuiteTx`, `deleteSuiteTx`, `holdEvictionCandidate`, `SuiteExists`, `UpdateSuiteFreshness`, `ErrSuiteGone`. |
-| `internal/cache/fetched_row.go` (new) (+ `fetched_row_test.go`) | `FetchedRow`, `FetchedResult`, `StoreFetched`; the FIFO test. |
-| `internal/cache/suite_touch.go` (new) (+ `suite_touch_test.go`) | `TouchSuite` with coalescing, `TouchedSuites`. |
+| `internal/freshness/reconcile.go` (+ `reconcile_r1_test.go`, `reconcile_test.go`, `freshness_test.go`, `capacity_test.go`) | Reconcile parses only clearsigned `InRelease`; fixtures; A-32, A-33, A-34. |
+| `internal/cache/suite_rows.go` (new) (+ `suite_rows_test.go`, `single_insert_test.go`, `suite_evict_test.go`, `suite_interest_test.go`, `signed_seen_test.go`) | `SuiteKey`, `SuiteSeed` (`Cached`), `CachedAnchor`, `SuiteCaps`, `CreateOutcome`, `CreateResult` (`Unproven`), `SuiteGuard`, `ClockStepReporter`, `CreateSuite`, `createSuiteTx` (the in-transaction marks), `deleteSuiteTx`, `holdEvictionCandidate`, `afterCreate`, `SuiteExists`, `SuiteCapUsage`, `UpdateSuiteFreshness`, `ErrSuiteGone`. |
+| `internal/cache/fetched_row.go` (new) (+ `fetched_row_test.go`) | `FetchedRow` (`Restamp`), `FetchedResult`, `StoreFetched`, `restampSuiteTx`; the FIFO test. |
+| `internal/cache/suite_touch.go` (new) (+ `suite_touch_test.go`) | `TouchSuite` with coalescing and the rate-limited sweep, `TouchedSuites`. |
 | `internal/cache/snapshot_reads.go` (new) (+ `adoption_scope_test.go`) | The read-side snapshot helpers moved out of `adoption.go` (C-15); C-10, A-18. |
 | `internal/cache/queries.go`, `adoption.go`, `adoption_failure.go`, `cache.go`, `signed_seen.go`, `types.go`, `testing_helpers.go` (+ `cache_test.go`, `adoption_failure_test.go`, `anchor_form_test.go`, `signed_seen_test.go`) | `PutSuiteFreshness` removed; `putURLPathSQL`; Step 6 UPDATE-only; `DeclaredHash.SuitePath`; `touches` field; test-only seeding helpers and `MigrateToVersionForTest`; A-18, A-22, A-23, A-24, A-25, B-1–B-5, B-8, C-14. |
-| `internal/freshness/freshness.go`, `suite_lock.go` (new), `scheduler.go`, `metrics.go` (+ `suite_lock_test.go`, `scheduler_test.go`, `sim_sched_test.go`, `flip_barrier_test.go`, `panic_recovery_test.go`, `freshness_test.go`) | `UpdateSuiteFreshness`; I-4 pre-check and re-validation in `Check` and `Reconcile`; `HoldSuite`; `LockCount`; queue bound; `acu_freshness_unlogged_panics_total`; A-30, A-35, A-38, B-22, B-39–B-44, B-47–B-50, C-18, C-19 (its line), C-20. |
+| `internal/freshness/freshness.go`, `suite_lock.go` (new), `scheduler.go`, `metrics.go` (+ `suite_lock_test.go`, `scheduler_test.go`, `sim_sched_test.go`, `flip_barrier_test.go`, `panic_recovery_test.go`, `freshness_test.go`) | `UpdateSuiteFreshness`; I-4 pre-check and re-validation in `Check` and `Reconcile`; `HoldSuite`, `ReportClockStep`; `LockCount`; queue bound (`boundDue`, `dueSuite`); `acu_freshness_unlogged_panics_total`; A-30, A-35, A-38, B-22, B-39–B-44, B-47–B-50, C-18, C-19 (its line), C-20. |
 | `internal/config/config.go` (+ `config_test.go`), `packaging/config/config.toml.default` | `freshness.max_suites`. |
-| `internal/handler/handler.go`, `suite_rows.go` (new), `metrics.go`, `singleflight.go` (+ `suite_rows_test.go`, `suite_hit_test.go`, `suite_dod_test.go`, `byhash_test.go`, `byhash_displaced_test.go`, `sim_flip_test.go`) | C3 creation, markers, touches, onboarding, rejection cache, late registration, by-hash I-4; C-21 (its query half), C-22–C-27. |
-| `cmd/apt-cacher-ultra/main.go` (+ `suite_caps_wiring_test.go`, `shutdown_drain_test.go`, `flip_wiring_test.go`, `legacy_audit_wiring_test.go`) | Wiring `MaxSuites` and the guard; C-28, C-30–C-35. |
-| ~40 existing test files | Fixture migration (Task 4), clearsigned fixtures (Tasks 3, 9), deferred minors in touched files (Task 12). |
+| `internal/handler/handler.go`, `suite_rows.go` (new), `metrics.go`, `singleflight.go` (+ `suite_rows_test.go`, `suite_hit_test.go`, `suite_dod_test.go`, `byhash_test.go`, `byhash_displaced_test.go`, `sim_flip_test.go`) | C3 creation, markers (`cachedAnchors`, the backstop), the refresh-miss re-stamp, touches, onboarding (shared, 5 s), rejection cache and its sweep timer, late registration (`heldContext`, `clientLeft`), T1 for tracked suites only, by-hash I-4; C-21 (its query half), C-22–C-27. |
+| `cmd/apt-cacher-ultra/main.go` (+ `suite_caps_wiring_test.go`, `shutdown_drain_test.go`, `flip_wiring_test.go`, `legacy_audit_wiring_test.go`) | Wiring `MaxSuites` and the guard; the startup WARN `suite_caps_exceeded` (`warnSuiteCaps`, PD-8); C-28, C-30–C-35. |
+| ~50 existing test files | Clearsigned fixtures (Task 3 and its fixture-only commit: 17 handler and cmd files, four freshness files), fixture migration (Task 4), deferred minors in touched files (Task 12). |
 | `docs/configuration.md`, `docs/log-fields.md`, the spec, the overview, the three deferred files | Documentation, amendments, stamps. |
 
 ## Tasks
 
 1. The `Release` and flat-index sniffs and the suite-file classifier (`internal/aptpath`).
 2. Adoption accepts exactly apt's first line (R-D2).
-3. `simtest.ClearsignedFixture`; reconcile parses only clearsigned `InRelease`.
+3. `simtest.ClearsignedFixture`; reconcile parses only clearsigned `InRelease`; the clearsigned handler and cmd fixtures (a fixture-only commit).
 4. One INSERT site; UPDATE-only writers; Check needs a row; the fixture migration.
 5. Caps and cap eviction under the suite's mutex.
 6. The miss path's writer operation, client-interest touches and the FIFO guarantee (cache).
@@ -121,14 +139,14 @@ Design notes (choices the spec leaves open — the boring, bounded option, with 
 
 ### Task 1: The `Release` and flat-index sniffs and the suite-file classifier
 
-Spec C3 "Sniffs" (the `Release` row and the flat `Packages*`/`Sources*` row; the `InRelease` and `Release.gpg` sniffs exist since phase A) and the rule of which paths create a row, earn a marker and record client interest; ruling R-D3 (the flat branch is tested now, reachable from G). Deferred minor A-17 (`sniff_test.go`).
+Spec C3 "Sniffs" (the `Release` row and the flat `Packages*`/`Sources*` row; the `InRelease` and `Release.gpg` sniffs exist since phase A) and the rule of which paths create a row, earn a marker and record client interest; ruling R-D3 (the flat branch is tested now, reachable from G); ruling PD-10 (`SniffReleaseGPG`'s binary branch requires the signature version at the packet body's offset, so text starting with the UTF-8 lead byte 0xC2 — U+00A0, "©" — no longer passes); ruling PD-9 (a suite path over 1,024 bytes is no suite: `ClassifySuiteFile` gives `NotSuiteFile`, so no row, marker, touch or rejection-cache entry ever carries one). Deferred minor A-17 (`sniff_test.go`).
 
 **Files:**
 - Modify: `internal/aptpath/sniff.go` (append), `internal/aptpath/sniff_test.go`
 
 **Interfaces:**
-- Consumes: `aptpath.SniffInRelease`, `SniffReleaseGPG`, `SniffHeadBytes` (phase A).
-- Produces: `const ReleaseSniffBytes = 64 << 10`; `SniffRelease(head []byte) bool`; `SniffFlatIndex(name string, head []byte) bool`; `type SuiteFile int` with `NotSuiteFile`, `FileInRelease`, `FileRelease`, `FileReleaseGPG`, `FileFlatIndex`; `ClassifySuiteFile(suite, path string) SuiteFile`; methods `(SuiteFile).CreatesRow(adopter bool) bool`, `.Marks() bool`, `.Touches() bool`, `.HeadBytes() int`, `.Sniff(path string, head []byte) bool`.
+- Consumes: `aptpath.SniffInRelease`, `SniffReleaseGPG`, `SniffHeadBytes` (phase A). `SniffReleaseGPG`'s other caller, the startup marker pass (`freshness/legacy_audit.go` `markFromCachedSignedAnchors`), and its tests (armored signatures only) are unaffected by PD-10.
+- Produces: `SniffReleaseGPG` tightened (PD-10; helper `sigPacketBodyOffset`); `const MaxSuitePathBytes = 1024` (PD-9); `const ReleaseSniffBytes = 64 << 10`; `SniffRelease(head []byte) bool`; `SniffFlatIndex(name string, head []byte) bool`; `type SuiteFile int` with `NotSuiteFile`, `FileInRelease`, `FileRelease`, `FileReleaseGPG`, `FileFlatIndex`; `ClassifySuiteFile(suite, path string) SuiteFile`; methods `(SuiteFile).CreatesRow(adopter bool) bool`, `.Marks() bool`, `.Touches() bool`, `.HeadBytes() int`, `.Sniff(path string, head []byte) bool`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -141,9 +159,12 @@ import (
 )
 ```
 
-In `TestSniffReleaseGPG`'s table (deferred minor A-17), replace
+In `TestSniffReleaseGPG`'s table (ruling PD-10, deferred minor A-17), replace
 
 ```go
+		{[]byte{0x88, 0x01}, true}, // old-format signature packet
+		{[]byte{0x8b, 0x00}, true},
+		{[]byte{0xc2, 0x01}, true}, // new-format signature packet
 		{[]byte{0x87, 0x00}, false},
 		{[]byte{0xc1, 0x00}, false},
 ```
@@ -151,11 +172,45 @@ In `TestSniffReleaseGPG`'s table (deferred minor A-17), replace
 with
 
 ```go
-		{[]byte{0x87, 0x00}, false},
-		{[]byte{0x8c, 0x00}, false}, // just above the old-format range (A-17)
-		{[]byte{0xc1, 0x00}, false},
-		{[]byte{0xc3, 0x00}, false}, // just above the new-format tag (A-17)
+		// A binary signature packet: the signature version (3-6) at the
+		// packet body's offset, which the header form gives (PD-10).
+		{[]byte{0x88, 0x5e, 0x04}, true},                         // old format, one-octet length
+		{[]byte{0x89, 0x01, 0x1c, 0x04}, true},                   // two-octet length
+		{[]byte{0x8a, 0x00, 0x00, 0x01, 0x1c, 0x04}, true},       // four-octet length
+		{[]byte{0x8b, 0x04}, true},                               // indeterminate length
+		{[]byte{0xc2, 0x5e, 0x04}, true},                         // new format, one-octet length
+		{[]byte{0xc2, 0xc0, 0x1c, 0x04}, true},                   // two-octet length
+		{[]byte{0xc2, 0xdf, 0xff, 0x04}, true},                   // two-octet length, top of its range
+		{[]byte{0xc2, 0xff, 0x00, 0x00, 0x01, 0x1c, 0x04}, true}, // five-octet length
+		{[]byte{0xc2, 0xe0, 0x04}, true},                         // partial body length
+		{[]byte{0xc2, 0xfe, 0x04}, true},                         // partial body length, top of its range
+		{[]byte{0xc2, 0x5e, 0x03}, true},                         // version 3
+		{[]byte{0xc2, 0x5e, 0x05}, true},                         // version 5
+		{[]byte{0x88, 0x5e, 0x06}, true},                         // version 6
+		{[]byte{0xc2, 0x5e, 0x02}, false},                        // version 2
+		{[]byte{0x88, 0x5e, 0x07}, false},                        // version 7
+		{[]byte{0x89, 0x04, 0x00, 0x00}, false},                  // a version where a length octet is
+		{[]byte{0xc2, 0xc0, 0x04, 0x00}, false},
+		{[]byte{0xc2, 0xff, 0x04, 0x00, 0x00, 0x00, 0x00}, false},
+		// Truncated heads: the tag-only rule passed the first three.
+		{[]byte{0x88, 0x01}, false},
+		{[]byte{0x8b, 0x00}, false},
+		{[]byte{0xc2, 0x01}, false},
+		{[]byte{0x88}, false},
+		{[]byte{0xc2}, false},
+		{[]byte{0x8a, 0x00, 0x00, 0x01, 0x1c}, false},
+		{[]byte{0xc2, 0xff, 0x00, 0x00, 0x01, 0x1c}, false},
+		// Neighbouring tags with a valid length and version (A-17).
+		{[]byte{0x87, 0x04}, false},
+		{[]byte{0x8c, 0x5e, 0x04}, false}, // just above the old-format range (A-17)
+		{[]byte{0xc1, 0x5e, 0x04}, false},
+		{[]byte{0xc3, 0x5e, 0x04}, false}, // just above the new-format tag (A-17)
+		// Text whose first byte is the UTF-8 lead byte 0xC2.
+		{[]byte("\u00a0Not Found\n"), false},
+		{[]byte("© 2026 Example. All rights reserved.\n"), false},
 ```
+
+Three existing expectations change, on purpose: `{0x88, 0x01}`, `{0x8b, 0x00}` and `{0xc2, 0x01}` passed the tag-only rule, but none holds a signature version (3–6) at its packet body's offset — the first and third end before it, the second has version 0 — so under PD-10 they are rejected; real signatures are the new `true` rows. A-17's boundary rows carry a valid length and version, so only the tag byte decides them.
 
 Append to the file:
 
@@ -164,6 +219,7 @@ Append to the file:
 func TestSniffRelease(t *testing.T) {
 	inside := strings.Repeat("y", ReleaseSniffBytes-len("SHA256:\n")-1) + "\nSHA256:\n"
 	outside := strings.Repeat("y", ReleaseSniffBytes) + "\nSHA256:\n"
+	atEdge := strings.Repeat("y", ReleaseSniffBytes-len("SHA256:")-1) + "\nSHA256:\n tail"
 	cases := []struct {
 		name, head string
 		want       bool
@@ -175,6 +231,7 @@ func TestSniffRelease(t *testing.T) {
 		{"trailing blanks", "SHA256: \t\n", true},
 		{"last line, no newline", "Origin: x\nSHA256:", true},
 		{"header ends at 64 KiB", inside, true},
+		{"colon at byte 65536", atEdge, true},
 		{"header after 64 KiB", outside, false},
 		{"HTML soft-404", "<html><body>Not Found</body></html>\n", false},
 		{"value on the header line", "SHA256: 0123 12 Packages\n", false},
@@ -246,11 +303,28 @@ func TestClassifySuiteFile(t *testing.T) {
 		{"/repo/flat/.", "/repo/flat/./Packages.xz", FileFlatIndex},
 		{"/repo/flat", "/repo/flat/Packages.diff/Index", NotSuiteFile},
 		{"/repo/flat", "/repo/flat/Packages_1.0_all.deb", NotSuiteFile},
+		{"/repo/distsy", "/repo/distsy/Packages.gz", FileFlatIndex},
 		{"", "/x/InRelease", NotSuiteFile},
 	}
 	for _, c := range cases {
 		if got := ClassifySuiteFile(c.suite, c.path); got != c.want {
 			t.Errorf("ClassifySuiteFile(%q, %q) = %d, want %d", c.suite, c.path, got, c.want)
+		}
+	}
+}
+
+// Ruling PD-9: a suite path over 1 KiB is no suite (its files are served
+// untracked); one of exactly 1 KiB is.
+func TestClassifySuiteFile_SuitePathBound(t *testing.T) {
+	at := "/u/dists/" + strings.Repeat("x", MaxSuitePathBytes-len("/u/dists/"))
+	if got := ClassifySuiteFile(at, at+"/InRelease"); got != FileInRelease {
+		t.Errorf("a %d-byte suite's InRelease = %d, want %d", len(at), got, FileInRelease)
+	}
+	over, flat := at+"y", "/r/"+strings.Repeat("f", MaxSuitePathBytes-len("/r/")+1)
+	for _, p := range []string{over + "/InRelease", over + "/Release", over + "/Release.gpg", flat + "/Packages.gz"} {
+		suite := p[:strings.LastIndexByte(p, '/')]
+		if got := ClassifySuiteFile(suite, p); got != NotSuiteFile {
+			t.Errorf("a %d-byte suite's %s = %d, want %d", len(suite), p[len(suite)+1:], got, NotSuiteFile)
 		}
 	}
 }
@@ -314,9 +388,63 @@ func TestSuiteFile_Rules(t *testing.T) {
 - [ ] **Step 2: Run to verify failure**
 
 Run: `go test ./internal/aptpath/`
-Expected: compile failure naming `undefined: ReleaseSniffBytes`, `SniffRelease`, `SniffFlatIndex`, `SuiteFile`, `ClassifySuiteFile`, `NotSuiteFile`, `FileInRelease`, `FileRelease`, `FileReleaseGPG`, `FileFlatIndex`.
+Expected: compile failure naming `undefined: ReleaseSniffBytes`, `MaxSuitePathBytes`, `SniffRelease`, `SniffFlatIndex`, `SuiteFile`, `ClassifySuiteFile`, `NotSuiteFile`, `FileInRelease`, `FileRelease`, `FileReleaseGPG`, `FileFlatIndex`.
 
 - [ ] **Step 3: Implement**
+
+In `internal/aptpath/sniff.go`, replace `SniffReleaseGPG` (ruling PD-10) with
+
+```go
+// SniffReleaseGPG reports whether head looks like a detached OpenPGP
+// signature: the armor header (after optional whitespace), or a binary
+// signature packet — an old-format (0x88-0x8B) or new-format (0xC2)
+// signature tag whose packet body starts with a signature version, 3 to 6
+// (spec C3; RFC 9580 §4.2, §5.2).
+//
+// AIDEV-NOTE: the version byte is what keeps text out (ruling PD-10). A
+// plain-text soft-404 starting with U+00A0 or "©" (UTF-8 lead byte 0xC2)
+// passed the tag-only rule, and a false signed-seen marker blocks unsigned
+// adoption of its suite for good (phase E). A non-conforming binary
+// signature that fails here only earns no marker: the fail-open direction.
+func SniffReleaseGPG(head []byte) bool {
+	if bytes.HasPrefix(bytes.TrimLeft(head, " \t\r\n"), []byte(armorSigBegin)) {
+		return true
+	}
+	off, ok := sigPacketBodyOffset(head)
+	if !ok || len(head) <= off {
+		return false
+	}
+	return head[off] >= 3 && head[off] <= 6
+}
+
+// sigPacketBodyOffset returns the offset of the packet body of the
+// signature packet head starts with: the tag octet plus the length octets
+// its header form gives (RFC 9580 §4.2). ok is false when head does not
+// start with a signature packet tag (old format 0x88-0x8B, new format
+// 0xC2 followed by a length octet).
+func sigPacketBodyOffset(head []byte) (int, bool) {
+	switch {
+	case len(head) == 0:
+		return 0, false
+	case head[0] >= 0x88 && head[0] <= 0x8b:
+		// Old format: the low two bits are the length type — one, two or
+		// four length octets, or 3: an indeterminate length, none.
+		return [4]int{2, 3, 5, 1}[head[0]&0x03], true
+	case head[0] == 0xc2 && len(head) > 1:
+		switch l := head[1]; {
+		case l < 192: // one-octet length
+			return 2, true
+		case l <= 223: // two-octet length
+			return 3, true
+		case l == 255: // five-octet length
+			return 6, true
+		default: // 224-254: a partial body length, one octet
+			return 2, true
+		}
+	}
+	return 0, false
+}
+```
 
 Append to `internal/aptpath/sniff.go` (its imports, `bytes` and `strings`, already cover it):
 
@@ -415,11 +543,18 @@ const (
 	FileFlatIndex
 )
 
+// MaxSuitePathBytes bounds the suite paths spec C3 tracks (ruling PD-9):
+// a longer suite path is no suite, so no row, marker, touch or
+// rejection-cache entry ever carries one, and every per-suite key in the
+// tables and maps stays small.
+const MaxSuitePathBytes = 1024
+
 // ClassifySuiteFile reports what path is to suite, which must be
 // SuitePath(path) ("" gives NotSuiteFile). A dists suite's root
-// Packages*/Sources* is not a flat index.
+// Packages*/Sources* is not a flat index, and a suite path longer than
+// MaxSuitePathBytes gives NotSuiteFile: its files are served untracked.
 func ClassifySuiteFile(suite, path string) SuiteFile {
-	if suite == "" {
+	if suite == "" || len(suite) > MaxSuitePathBytes {
 		return NotSuiteFile
 	}
 	name, ok := strings.CutPrefix(path, suite+"/")
@@ -504,7 +639,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each: (a) in `SniffRelease`, `switch string(line) {` → `TestSniffRelease` FAILS (`SHA512 block, CRLF: SniffRelease = false, want true`); (b) delete the `if len(head) > ReleaseSniffBytes { … }` truncation → `TestSniffRelease` FAILS (`header after 64 KiB: SniffRelease = true, want false`); (c) in `SniffFlatIndex`, `return len(head) == 0 || bytes.HasPrefix(head, []byte("Package:"))` → `TestSniffFlatIndex` FAILS (`SniffFlatIndex("Packages", "") = true, want false`); (d) in `ClassifySuiteFile`, drop `&& !hasDistsSegment(suite)` → `TestClassifySuiteFile` FAILS (`ClassifySuiteFile("/u/dists/noble", "/u/dists/noble/Packages.gz") = 4, want 0`); (e) in `CreatesRow`, return `true` for `FileRelease, FileFlatIndex` → `TestSuiteFile_Rules` FAILS (`2.CreatesRow(no adopter) = true, want false`); (f) `Marks` returns `f == FileInRelease` → `TestSuiteFile_Rules` FAILS (`3.Marks = false, want true`); (g) `.lzma` magic `{0x5d, 0x00, 0x01}` → `TestSniffFlatIndex` FAILS.
+One at a time, reverting each: (a) in `SniffRelease`, `switch string(line) {` → `TestSniffRelease` FAILS (`SHA512 block, CRLF: SniffRelease = false, want true`); (b) delete the `if len(head) > ReleaseSniffBytes { … }` truncation → `TestSniffRelease` FAILS (`header after 64 KiB: SniffRelease = true, want false`); (c) in `SniffFlatIndex`, `return len(head) == 0 || bytes.HasPrefix(head, []byte("Package:"))` → `TestSniffFlatIndex` FAILS (`SniffFlatIndex("Packages", "") = true, want false`); (d) in `ClassifySuiteFile`, drop `&& !hasDistsSegment(suite)` → `TestClassifySuiteFile` FAILS (`ClassifySuiteFile("/u/dists/noble", "/u/dists/noble/Packages.gz") = 4, want 0`); (e) in `CreatesRow`, return `true` for `FileRelease, FileFlatIndex` → `TestSuiteFile_Rules` FAILS (`2.CreatesRow(no adopter) = true, want false`); (f) `Marks` returns `f == FileInRelease` → `TestSuiteFile_Rules` FAILS (`3.Marks = false, want true`); (g) `.lzma` magic `{0x5d, 0x00, 0x01}` → `TestSniffFlatIndex` FAILS (`SniffFlatIndex("Packages.lzma", …) = false, want true`); (h) the truncation `if len(head) >= ReleaseSniffBytes { head = head[:ReleaseSniffBytes-1] }` → `TestSniffRelease` FAILS (`colon at byte 65536: SniffRelease = false, want true`); (i) `hasDistsSegment(suite)` → `strings.Contains(suite, "dists")` → `TestClassifySuiteFile` FAILS (`ClassifySuiteFile("/repo/distsy", "/repo/distsy/Packages.gz") = 0, want 4`); (j) `SniffReleaseGPG` returns `true` instead of the version check → `TestSniffReleaseGPG` FAILS (`SniffReleaseGPG("\u00a0Not Found\n") = true, want false`, and the "©" row); (k) `len(head) <= off` → `len(head) < off` → `TestSniffReleaseGPG` FAILS (panic: `index out of range [2] with length 2`); (l) the old-format offsets `{2, 3, 5, 1}` → `{2, 3, 4, 1}` → FAILS (`SniffReleaseGPG("\x8a\x00\x00\x01\x1c\x04") = false, want true`); (m) `l <= 223` → `l < 223` → FAILS (`"\xc2\xdf\xff\x04" … want true`); (n) the five-octet offset `6` → `5` → FAILS (`"\xc2\xff\x00\x00\x01\x1c\x04" … want true`); (o) the partial-length offset `2` → `3` → FAILS (`"\xc2\xe0\x04" … want true`); (p) the version bound `<= 6` → `<= 5` → FAILS (`"\x88^\x06" … want true`); (q) `>= 3` → `>= 2` → FAILS (`"\xc2^\x02" … want false`); (r) the old-format range `<= 0x8b` → `<= 0x8c` → FAILS (`"\x8c^\x04" … want false`); (s) the new-format tag also `0xc3` → FAILS (`"\xc3^\x04" … want false`); (t) drop `|| len(suite) > MaxSuitePathBytes` → `TestClassifySuiteFile_SuitePathBound` FAILS (`a 1025-byte suite's InRelease = 1, want 0`); (u) `>` → `>=` there → FAILS (`a 1024-byte suite's InRelease = 0, want 1`).
 
 - [ ] **Step 6: Commit**
 
@@ -587,10 +722,12 @@ with
 // Ruling R-D2 (phase D): adoption accepts exactly what apt's first-line
 // rule accepts. apt rejects an InRelease whose first line is not the
 // clearsign marker — a leading blank line or leading whitespace included
-// (acquire-item.cc VerifyDone → StartsWithGPGClearTextSignature, which
-// strips only trailing whitespace) — so the verifier refuses it too, as
-// malformed_clearsign, and the handler's sniff agrees. Trailing blanks on
-// the marker line are stripped by apt and accepted here.
+// (apt-pkg/acquire-item.cc pkgAcqMetaClearSig::VerifyDone →
+// StartsWithGPGClearTextSignature in apt-pkg/contrib/fileutl.cc, which
+// strips only trailing whitespace with _strrstrip, apt-pkg/contrib/
+// strutl.cc; spec §3's probes of real apt agree) — so the verifier refuses
+// it too, as malformed_clearsign, and the handler's sniff agrees. Trailing
+// blanks on the marker line are stripped by apt and accepted here.
 func TestVerifyInline_FollowsAptsFirstLineRule(t *testing.T) {
 	signer := newTestEntity(t, "Signer", "signer@example.com")
 	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, signer), RequireSignature: true, Logger: silentLogger()})
@@ -649,7 +786,7 @@ In `internal/gpg/verifier_test.go` (deferred minor A-51), in `TestVerifier_Rejec
 - [ ] **Step 2: Run to verify failure**
 
 Run: `go test ./internal/aptpath/ ./internal/gpg/`
-Expected: compile failure naming `undefined: DecodableClearsign` (aptpath) and `undefined: clearsignBeginMarker` (gpg). (With Step 3's `clearsignBeginMarker` alone in place, the red state shows: `TestVerifyInline_FollowsAptsFirstLineRule` fails with `leading newline: err = <nil>, want malformed_clearsign` and with `trailing blanks on the marker line: InRelease clearsign envelope is malformed, want accepted`; both garbage tests fail with `reason = "crypto_verify_failed", want malformed_clearsign`.)
+Expected: compile failure naming `undefined: DecodableClearsign` (aptpath) and `undefined: clearsignBeginMarker` (gpg). (With Step 3's `clearsignBeginMarker` alone in place, the red state shows: `TestVerifyInline_FollowsAptsFirstLineRule` fails with `leading newline: err = <nil>, want malformed_clearsign`, `leading CRLF: err = <nil>, want malformed_clearsign`, `leading BOM: err = clearsigned message has extraneous bytes before BEGIN marker, want malformed_clearsign` (an unwrapped error, classified `crypto_verify_failed`) and `trailing blanks on the marker line: InRelease clearsign envelope is malformed, want accepted (apt strips them)`; "leading spaces" and "leading tab" already pass, because go-crypto finds no marker at the start of a line and the verifier answers `ErrMalformedClearsign`; both garbage tests fail with `reason = "crypto_verify_failed", want malformed_clearsign`; `TestVerifyDetached_EmptyKeyringSaysSo` (A-53 adds only the test) passes.)
 
 - [ ] **Step 3: Implement**
 
@@ -762,17 +899,18 @@ git commit -m "Accept exactly apt's InRelease first line in adoption"
 
 ---
 
-### Task 3: `simtest.ClearsignedFixture`; reconcile parses only clearsigned `InRelease`
+### Task 3: `simtest.ClearsignedFixture`; reconcile parses only clearsigned `InRelease`; the clearsigned handler and cmd fixtures
 
-Spec §7 "Fixtures" (a shared `clearsignedFixture()` helper) and the overview's "D:" line and Global Constraint: reconcile's plain-text fallback in `inReleasePlaintext` is removed and `TestReparseSnapshotRelease_PlainTextInReleaseStillParses` becomes `_PlainTextInReleaseIsAnError`. The decode goes through `aptpath.DecodableClearsign` (ruling R-D2). Only the six freshness fixtures that relied on the fallback change here (measured: `TestReparseSnapshotRelease_PlainTextInReleaseStillParses`, `TestReconcileSnapshot_HealsBinaryAllInPlace`, `TestReconcileSnapshot_GateAndForce`, `TestReconcileMetric_Increments`, `TestCheck_UnchangedTick_ReconcilesDegraded`, `TestCheck_HealthySuiteAsksForNoRepairSlot`; plus `TestReconcileSnapshot_RejectsCorruptedAnchor`, whose corrupt bytes would otherwise be refused for being plain text before its hash check is reached); the handler and cmd fixtures change in Task 9, where the handler starts sniffing. Deferred minors A-32 (`reconcile.go` wording and a line over 100 columns), A-33 (`clearsignForTest` uses Ed25519) and A-34 (a CRLF-envelope and a header-block injection case), all in files this task touches.
+Spec §7 "Fixtures" (a shared `clearsignedFixture()` helper) and the overview's "D:" line and Global Constraint: reconcile's plain-text fallback in `inReleasePlaintext` is removed and `TestReparseSnapshotRelease_PlainTextInReleaseStillParses` becomes `_PlainTextInReleaseIsAnError`. The decode goes through `aptpath.DecodableClearsign` (ruling R-D2). Only the six freshness fixtures that relied on the fallback change here (measured: `TestReparseSnapshotRelease_PlainTextInReleaseStillParses`, `TestReconcileSnapshot_HealsBinaryAllInPlace`, `TestReconcileSnapshot_GateAndForce`, `TestReconcileMetric_Increments`, `TestCheck_UnchangedTick_ReconcilesDegraded`, `TestCheck_HealthySuiteAsksForNoRepairSlot`; plus `TestReconcileSnapshot_RejectsCorruptedAnchor`, whose corrupt bytes would otherwise be refused for being plain text before its hash check is reached). Ruling PD-2 (spec §7 "Fixtures"): every handler and cmd test `InRelease` body that models an upstream response, a cached anchor or a snapshot anchor is wrapped with `simtest.ClearsignedFixture` in this task's second, fixture-only commit (Steps 7–9). Nothing sniffs yet, so the unchanged suite proves the conversion changed no outcome; later tasks, which make row creation, markers and T1 depend on the sniff, then run on production-shaped fixtures. Deferred minors A-32 (`reconcile.go` wording and a line over 100 columns), A-33 (`clearsignForTest` uses Ed25519) and A-34 (a CRLF-envelope and a header-block injection case), all in files this task touches.
 
 **Files:**
 - Create: `internal/simtest/clearsign.go`, `internal/simtest/clearsign_test.go`
 - Modify: `internal/freshness/reconcile.go`, `internal/freshness/reconcile_r1_test.go`, `internal/freshness/reconcile_test.go`, `internal/freshness/capacity_test.go`, `internal/freshness/freshness_test.go`
+- Modify (fixture-only commit, Steps 7–9): `internal/handler/anchor_lastmod_test.go`, `byhash_displaced_test.go`, `byhash_test.go`, `chaos_test.go`, `fetch_seam_test.go`, `flip_stack_test.go`, `handler_test.go`, `phase2_chaos_test.go`, `phase2_handler_test.go`, `phase3_chaos_test.go`, `phase3_strict_test.go`, `phase6_5_log_fields_test.go`, `phase6_5_serve_test.go`, `wallclock_stamps_test.go`; `cmd/apt-cacher-ultra/legacy_audit_wiring_test.go` (comment only), `main_test.go`, `packages_list_test.go`
 
 **Interfaces:**
 - Consumes: `aptpath.DecodableClearsign`, `aptpath.SniffInRelease` (Task 2, phase A); freshness test helpers `newAdoptionTestEnv`, `storeInlineSnapshot`, `clearsignForTest`, `makeRelease`, `newRetryRig` (package `freshness`).
-- Produces: `simtest.ClearsignedFixture(text string) []byte` (Tasks 4, 9 and 11 use it).
+- Produces: `simtest.ClearsignedFixture(text string) []byte` (Steps 7–9 and Tasks 4, 9 and 11 use it); handler test helpers `staleBody(path string) []byte` (`handler_test.go`) and `recFetcher.inRelease` (`fetch_seam_test.go`: when set, served for an `…/InRelease` target).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1034,13 +1172,124 @@ git add internal/simtest/clearsign.go internal/simtest/clearsign_test.go interna
 git commit -m "Parse only clearsigned InRelease in reconcile; add the clearsigned test fixture"
 ```
 
+- [ ] **Step 7: Convert the handler and cmd `InRelease` fixtures (ruling PD-2; fixture-only)**
+
+Each edit below wraps an `InRelease` body with `simtest.ClearsignedFixture` and adds `"github.com/linsomniac/apt-cacher-ultra/internal/simtest"` to the file's imports where it is missing. The list is complete: a temporary probe (not committed) that reported every plain-text `InRelease` body fetched with status 200, stored as a url_path row or committed as a snapshot member found 87 handler and cmd tests, all covered here; after the edits it reports only the deliberate body in `legacy_audit_wiring_test.go`. Bodies whose bytes a test compares, measures or hashes are converted at their single source, so both sides of each comparison change together (the two places that hashed a literal now hash the fixture).
+
+`internal/handler`:
+- `anchor_lastmod_test.go`: `commitAnchor` writes `simtest.ClearsignedFixture(body)` (its doc gains "clearsigned (spec §7 "Fixtures")"), and `TestServeHTTP_SnapshotAnchorLastModifiedIgnoresAFutureDatedPoolFile`'s `sha256Hex([]byte(body))` becomes `sha256Hex(simtest.ClearsignedFixture(body))`; `"anchor served before adoption"`, `"InRelease recovered from upstream"`, `"InRelease recovered from upstream, an hour after the step"` and `"the next InRelease"` are wrapped where they are written or served.
+- `byhash_displaced_test.go`: the snapshot helper's `writeBlob(t, h, []byte("InRelease "+label))` → `writeBlob(t, h, simtest.ClearsignedFixture("InRelease "+label))`.
+- `byhash_test.go`: `TestServeHTTP_ByHashContentAddressed_AdoptedSuiteUsesSnapshot`'s `"real InRelease"` blob.
+- `chaos_test.go`: `chaosBodyFor` becomes
+
+```go
+// chaosBodyFor returns the canonical bytes the upstream serves (and the
+// cache stores) for a chaos path. Distinct per path so a body-mixup bug
+// surfaces as a clear comparison failure rather than a uniform-bytes
+// false-positive.
+func chaosBodyFor(path string) []byte {
+	if path == "/ubuntu/dists/noble/InRelease" {
+		// Clearsigned, so the priming miss creates the suite's row and
+		// later hits fire freshness checks.
+		return simtest.ClearsignedFixture("chaos-body|" + path)
+	}
+	return []byte("chaos-body|" + path)
+}
+```
+
+- `fetch_seam_test.go`: `recFetcher` gains an `inRelease` body (add `"strings"` to the imports):
+
+```go
+// recFetcher is an in-memory upstream that records the URLs it is asked
+// for and answers every request with body.
+type recFetcher struct {
+	body      []byte
+	inRelease []byte // when set, served for an …/InRelease target instead of body
+	mu        sync.Mutex
+	urls      []string
+}
+```
+
+and its `Fetch` becomes
+
+```go
+func (r *recFetcher) Fetch(_ context.Context, tg *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
+	r.mu.Lock()
+	r.urls = append(r.urls, tg.URL)
+	r.mu.Unlock()
+	body := r.body
+	if r.inRelease != nil && strings.HasSuffix(tg.URL, "/InRelease") {
+		body = r.inRelease
+	}
+	if _, err := dst.Write(body); err != nil {
+		return nil, err
+	}
+	return &fetch.FetchResult{Status: 200, ContentLength: int64(len(body))}, nil
+}
+```
+
+- `flip_stack_test.go`: `adopt` passes the clearsigned envelope to the adopter (`publish`, and `adoptDetached`'s detached `Release`, are unchanged):
+
+```go
+// adopt publishes generation gen of suite upstream and adopts it (inline
+// form) through the barrier; it returns once the commit is done. The
+// InRelease is clearsigned (spec §7 "Fixtures"); plainVerifier hands the
+// whole envelope to ParseRelease, which skips the armor lines.
+func (s *flipStack) adopt(suite string, gen int) {
+	ref, rel := s.publish(suite, gen)
+	if err := s.ad.Run(context.Background(), ref, simtest.ClearsignedFixture(string(rel)), "", ""); err != nil {
+		s.t.Errorf("adopt %s generation %d: %v", suite, gen, err)
+	}
+}
+```
+
+- `handler_test.go`: `TestServeHTTP_MissOnInReleaseSeedsFreshness` and `TestServeHTTP_FreshnessTriggeredOnMetadataHit` (`"Origin: Ubuntu\nSuite: noble\n"`), `TestServeHTTP_FreshnessNotTriggeredOnMiss` (`"InRelease bytes"`) and `TestHandler_Close_DrainsFreshnessGoroutine` (`"InRelease body"`) wrap their bodies; `stalePrime`, `staleUpstream` and `TestServeHTTP_OrphanRowUpstreamDownReturns502` take their body from a new helper placed before `staleUpstream`:
+
+```go
+// staleBody is the canonical body the stale tests' upstream serves for
+// path: an InRelease is clearsigned (spec §7 "Fixtures").
+func staleBody(path string) []byte {
+	if strings.HasSuffix(path, "/InRelease") {
+		return simtest.ClearsignedFixture("staled-bytes-" + path)
+	}
+	return []byte("staled-bytes-" + path)
+}
+```
+
+- `phase2_chaos_test.go`: `makeChaos2Snapshot`'s `inRelease: rel,` → `inRelease:  simtest.ClearsignedFixture(string(rel)), // passes the spec C3 sniff`, and `chaos2BuildRelease`'s doc ends "Upstream serves it at /InRelease wrapped by simtest.ClearsignedFixture; the pass-through verifier returns that envelope verbatim and ParseRelease skips its armor lines." This covers `phase2_gpg_forgery_test.go` and `phase2_migration_test.go`, which build on the same rig: the v1 cache the migration test writes now holds a clearsigned anchor, as a real v1 cache did — its legacy state is the schema, not the body format.
+- `phase3_chaos_test.go`: `makeChaos3Snapshot`'s `inRelease` likewise.
+- `phase2_handler_test.go`: every `writeBlob(t, h, []byte("InRelease …"))` and `writeBlob(t, h, []byte("real InRelease"))` (19 sites) → `writeBlob(t, h, simtest.ClearsignedFixture("…"))`; the bodies `"InRelease snapshot bytes"`, `"real InRelease"` (upstream), `"Phase 1 InRelease bytes"` (with the comment `// creates the row (spec C3 sniff)`), `"attacker-supplied bytes"` (an upstream `InRelease` that mismatches) and `collidingContent` are wrapped; in `TestServeHTTP_AdoptedSuiteMissingBlob_StaleNotServed` the stale anchor becomes `staleBody := simtest.ClearsignedFixture("stale Phase 1 InRelease")`, written with `writeBlob(t, h, staleBody)` and compared with `if rec.Body.String() == string(staleBody) {`.
+- `phase3_strict_test.go`: `writeBlob(t, h, []byte("InRelease for "+suite))` → `writeBlob(t, h, simtest.ClearsignedFixture("InRelease for "+suite))`.
+- `phase6_5_log_fields_test.go` (5 sites) and `phase6_5_serve_test.go` (4 sites): `writeBlob(t, h, []byte("InRelease for noble"))` → `writeBlob(t, h, simtest.ClearsignedFixture("InRelease for noble"))`.
+- `wallclock_stamps_test.go`: `newSeamHandler(t, &recFetcher{body: []byte("deb bytes"), inRelease: simtest.ClearsignedFixture("Origin: wallclock\n")})`.
+
+`cmd/apt-cacher-ultra`:
+- `main_test.go`: `TestServe_EndToEnd_MirrorFetchAndCache`'s `const wantBody = "Package: hello\nVersion: 1.0\n"` → `wantBody := string(simtest.ClearsignedFixture("Package: hello\nVersion: 1.0\n")) // an upstream InRelease`, and `TestServe_GracefulShutdown_DrainsInflight`'s `"slow body"` the same way.
+- `packages_list_test.go`: the cached `/dists/noble/InRelease` row's content → `string(simtest.ClearsignedFixture("release body"))`.
+- `legacy_audit_wiring_test.go`: the body stays plain text; its comment gains "Plain text on purpose (spec §7 "Fixtures", ruling PD-2): it models a legacy snapshot the audit must quarantine."
+
+The handler and cmd fixtures left in plain text, with their reasons, are listed in Task 12's intro.
+
+- [ ] **Step 8: Run the tests**
+
+Run: `go test -race ./internal/handler/ ./cmd/apt-cacher-ultra/`
+Expected: PASS with no test changed — nothing sniffs an `InRelease` body before Task 9, so this proves the conversion changed no outcome.
+
+- [ ] **Step 9: Commit (fixture-only)**
+
+```bash
+gofmt -l internal/handler/ cmd/apt-cacher-ultra/   # prints only cmd/apt-cacher-ultra/ca_print.go (drift)
+git add internal/handler/ cmd/apt-cacher-ultra/
+git commit -m "Use clearsigned InRelease fixtures in the handler and cmd tests"
+```
+
 ---
 
 ### Task 4: One INSERT site; UPDATE-only writers; Check needs a row; the fixture migration
 
-Spec C3 "one creation choke point" (`cache.CreateSuite`, its per-host and global caps; cap eviction is Task 5), "every other writer is UPDATE-only" (`PutSuiteFreshness` becomes `UpdateSuiteFreshness`; `CommitAdoption` Step 6 becomes an UPDATE that rolls the flip back with `cache.ErrSuiteGone` when the row is gone), and I-4's checker side: `Check` reads the row before it creates a lock-map entry and never creates a row (Task 7 adds the re-validation after `TryLock`). The handler's adoption-disabled `InRelease` seed keeps its values and moves to `CreateSuite` (Task 9 moves it into the miss path's writer operation). Design notes 5 (a refresh miss no longer re-stamps the row), 11 (test-only seeding helpers), 12 (`ErrSuiteGone` is classified `db_failed`: the adopter already wraps every `CommitAdoption` error as `"%w: commit: %w", ErrAdoptionDBFailed` in `freshness/adoption.go`, so no freshness change) and 13 (the per-host cap counts across schemes). Deferred minors, all in files this task touches: B-1 (`queries.go`), B-2 and B-4 (`cache/adoption_failure.go`), B-3 (`cache/adoption_failure_test.go`), B-5 (`cache_test.go`), B-8 (moot: Step 6 has no INSERT branch left; Task 13 deletes it), A-22 (`GetSuiteSnapshot` in `cache/adoption.go`, test in `anchor_form_test.go`), A-23 (`CommitAdoption` Step 7a, test in `signed_seen_test.go`), A-30 (`freshness_test.go`), A-35 and A-38 (`panic_recovery_test.go`). B-22 (`freshness_test.go`'s fake `RecordAdoptionFailure`) was checked: since 7877898 the fake writes nothing for an unknown suite and returns nil, exactly like production, so nothing changes and Task 13 deletes it.
+Spec C3 "one creation choke point" (`cache.CreateSuite`, its per-host and global caps; cap eviction is Task 5), "every other writer is UPDATE-only" (`PutSuiteFreshness` becomes `UpdateSuiteFreshness`; `CommitAdoption` Step 6 becomes an UPDATE that rolls the flip back with `cache.ErrSuiteGone` when the row is gone), and I-4's checker side: `Check` reads the row before it creates a lock-map entry and never creates a row (Task 7 adds the re-validation after `TryLock`). The handler's adoption-disabled `InRelease` seed keeps its values and moves to `CreateSuite` (Task 9 moves it into the miss path's writer operation). Ruling PD-5: a row creation marks the suite's base, in the creating transaction, for the body in hand (`SuiteSeed.SignedSeenAt`) and for every cached signed anchor whose url_path row still holds the blob the caller sniffed (`SuiteSeed.Cached`, `markCreated`; a row that changed or appeared since the read sets `CreateResult.Unproven`, and only then does the caller's backstop run); the handler fills `Cached` from Task 9 on. The single-INSERT guard also catches a quoted or schema-qualified table name and an INSERT split over a literal concatenation (exec review D12), and `UpdateSuiteFreshness`'s scheme predicate is pinned (D13). Design notes 5 (the seed is create-only here; the adoption-disabled refresh miss's UPDATE-only re-stamp returns with `StoreFetched` in Tasks 6 and 9, ruling PD-6), 11 (test-only seeding helpers), 12 (`ErrSuiteGone` is classified `db_failed`: the adopter already wraps every `CommitAdoption` error as `"%w: commit: %w", ErrAdoptionDBFailed` in `freshness/adoption.go`, so no freshness change) and 13 (the per-host cap counts across schemes). Deferred minors, all in files this task touches: B-1 (`queries.go`), B-2 and B-4 (`cache/adoption_failure.go`), B-3 (`cache/adoption_failure_test.go`), B-5 (`cache_test.go`), B-8 (moot: Step 6 has no INSERT branch left; Task 13 deletes it), A-22 (`GetSuiteSnapshot` in `cache/adoption.go`, test in `anchor_form_test.go`), A-23 (`CommitAdoption` Step 7a, test in `signed_seen_test.go`), A-30 (`freshness_test.go`), A-35 and A-38 (`panic_recovery_test.go`). B-22 (`freshness_test.go`'s fake `RecordAdoptionFailure`) was checked: since 7877898 the fake writes nothing for an unknown suite and returns nil, exactly like production, so nothing changes and Task 13 deletes it.
 
-Intermediate state, by design: until Tasks 9 and 10 land, rows are created only by the `InRelease`-miss seed (as today, minus the re-stamp), so a suite first seen through a hit or a detached anchor is neither checked (I-4) nor adoptable (Step 6). The phase ships whole; every existing test below passes at every task boundary.
+Intermediate state, by design: until Tasks 9 and 10 land, rows are created only by the `InRelease`-miss seed (as today, minus the adoption-disabled refresh miss's re-stamp, which returns in Task 9), so a suite first seen through a hit or a detached anchor is neither checked (I-4) nor adoptable (Step 6). The phase ships whole; every existing test below passes at every task boundary.
 
 **Files:**
 - Create: `internal/cache/suite_rows.go`, `internal/cache/suite_rows_test.go`, `internal/cache/single_insert_test.go`
@@ -1052,11 +1301,11 @@ Intermediate state, by design: until Tasks 9 and 10 land, rows are created only 
 **Interfaces:**
 - Consumes: `aptpath.MarkerBase(suite string) string`; in `internal/cache`: `markSignedSeen(ctx, tx, scheme, host, base string, at int64) error`, `submitWrite`, `nowUnix`, test helpers `openCache`, `seedBlob`, `stubNow`, `putSuite`, `getSuite`, `sampleFailure`, `assertRecord`, `assertNoRecord`, `afSuite` (`adoption_failure_test.go`), `commitCandidate` (`flip_state_test.go`); in `internal/freshness`: test helpers `newFakeCache`, `hashOf`, `newTestFetcher`, `discardLogger`, `checkOpts`, `resultSkipped`.
 - Produces (later tasks use these exact names):
-  - `cache.SuiteKey`, `cache.SuiteSeed`, `cache.SuiteCaps`, `cache.CreateOutcome` (`SuiteCreated`, `SuiteExists`, `SuiteRejectedGlobal`, `SuiteRejectedHost`; `String()` = `created`, `exists`, `global_cap`, `host_cap`; `Rejected() bool`), `cache.CreateResult{Outcome; Evicted *SuiteKey}`, `cache.SuiteGuard`, `cache.ErrSuiteGone` (block below).
+  - `cache.SuiteKey`, `cache.SuiteSeed` (with `Cached []CachedAnchor`), `cache.CachedAnchor{Path, BlobHash string; Signed bool; SeenAt int64}`, `cache.SuiteCaps`, `cache.CreateOutcome` (`SuiteCreated`, `SuiteExists`, `SuiteRejectedGlobal`, `SuiteRejectedHost`; `String()` = `created`, `exists`, `global_cap`, `host_cap`; `Rejected() bool`), `cache.CreateResult{Outcome; Evicted *SuiteKey; Unproven bool}`, `cache.SuiteGuard`, `cache.ErrSuiteGone` (block below).
   - `func (c *Cache) CreateSuite(ctx context.Context, seed SuiteSeed, caps SuiteCaps, guard SuiteGuard) (CreateResult, error)` — `guard` is unused until Task 5.
-  - `func createSuiteTx(ctx context.Context, tx *sql.Tx, seed SuiteSeed, caps SuiteCaps) (CreateResult, error)` — Task 5 adds the eviction parameters, Task 6's `StoreFetched` calls it.
-  - `func (c *Cache) UpdateSuiteFreshness(ctx context.Context, s SuiteFreshness) error`; `freshness.Cache` declares it in place of `PutSuiteFreshness`.
-  - Test-only (`testing_helpers.go`): `(*Cache).SeedSuiteForTest(ctx, s SuiteFreshness) error`, `(*Cache).EnsureSuiteForTest(ctx, scheme, host, suitePath string) error`, `(*Cache).InsertTrackedCandidateForTest(ctx, sc SnapshotCandidate) (int64, bool, error)`.
+  - `func createSuiteTx(ctx context.Context, tx *sql.Tx, seed SuiteSeed, caps SuiteCaps) (CreateResult, error)` — Task 5 adds the eviction parameters, Task 6's `StoreFetched` calls it; `func markCreated(ctx context.Context, tx *sql.Tx, seed SuiteSeed) (unproven bool, err error)` (PD-5).
+  - `func (c *Cache) UpdateSuiteFreshness(ctx context.Context, s SuiteFreshness) error`, its statement factored as `updateSuiteFreshness(ctx, ex execer, s SuiteFreshness) error` (shared with `SeedSuiteForTest`, so the two cannot drift; exec review D28); `freshness.Cache` declares `UpdateSuiteFreshness` in place of `PutSuiteFreshness`.
+  - Test-only (`testing_helpers.go`, which is not a `_test.go` file: the helpers are compiled into the production binary, and `TestOnlyTheHandlerCreatesSuiteRows` keeps production code from calling them): `(*Cache).SeedSuiteForTest(ctx, s SuiteFreshness) error`, `(*Cache).EnsureSuiteForTest(ctx, scheme, host, suitePath string) error`, `(*Cache).InsertTrackedCandidateForTest(ctx, sc SnapshotCandidate) (int64, bool, error)`.
   - Test helpers: `derefI64(*int64) int64`, `derefStr(*string) string` (`suite_rows_test.go`); `productionGoFiles`, `stringLiterals` (`single_insert_test.go`); `trackSuite(t testing.TB, c *cache.Cache, suite SuiteRef)` (`freshness/adoption_test.go`); `(*fakeCache).track(scheme, host, suitePath string)` (`freshness_test.go`); `(*flipStack).track(suite string)` (`handler/flip_stack_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
@@ -1183,6 +1432,100 @@ func TestCreateSuite_MarksSignedSeenInTheCreatingTransaction(t *testing.T) {
 	}
 }
 
+// Ruling PD-5: a creation marks its base, in the creating transaction, for
+// every cached signed anchor whose url_path row still holds the blob that
+// passed the sniff (with the newest of their stamps), and for no
+// plain-text one. A listed row that changed or appeared since the read is
+// left to the caller (Unproven); a failing marker write creates no row.
+func TestCreateSuite_MarksCachedSignedAnchors(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	put := func(path, body string) string {
+		t.Helper()
+		h := seedBlob(t, c, body)
+		if err := c.PutURLPath(ctx, URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: path, BlobHash: &h,
+			UpstreamURL: "http://h" + path, IsMetadata: true}); err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	create := func(suite string, cached ...CachedAnchor) (CreateResult, error) {
+		t.Helper()
+		return c.CreateSuite(ctx, SuiteSeed{SuiteKey: SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: suite},
+			RequestedAt: 1_800_000_009, Cached: cached}, SuiteCaps{}, nil)
+	}
+	marker := func(base string) (int64, bool) {
+		t.Helper()
+		at, ok, err := c.SignedSeen(ctx, "http", "h", base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return at, ok
+	}
+	// Two cached signed anchors: the base is marked once, with the newer stamp.
+	inA, gpgA := put("/r/dists/a/InRelease", "inrelease a"), put("/r/dists/a/Release.gpg", "sig a")
+	res, err := create("/r/dists/a",
+		CachedAnchor{Path: "/r/dists/a/InRelease", BlobHash: inA, Signed: true, SeenAt: 1_700_000_500},
+		CachedAnchor{Path: "/r/dists/a/Release.gpg", BlobHash: gpgA, Signed: true, SeenAt: 1_700_000_000})
+	if err != nil || res.Outcome != SuiteCreated || res.Unproven {
+		t.Fatalf("a: %+v, %v; want created, proven", res, err)
+	}
+	if at, ok := marker("/r/dists/a"); !ok || at != 1_700_000_500 {
+		t.Fatalf("a: marker %d %v, want the newest cached stamp 1700000500", at, ok)
+	}
+	// A plain-text cached InRelease (an HTML soft-404) and an absent
+	// Release.gpg: nothing to mark.
+	htmlB := put("/r/dists/b/InRelease", "<html>Not Found</html>")
+	if res, err := create("/r/dists/b", CachedAnchor{Path: "/r/dists/b/InRelease", BlobHash: htmlB, SeenAt: 5},
+		CachedAnchor{Path: "/r/dists/b/Release.gpg"}); err != nil || res.Unproven {
+		t.Fatalf("b: %+v, %v", res, err)
+	}
+	if _, ok := marker("/r/dists/b"); ok {
+		t.Fatal("b: a plain-text cached anchor earned a marker")
+	}
+	// A signed anchor whose row's stamps were unknown: the creation's stamp.
+	gpgC := put("/r/dists/c/Release.gpg", "sig c")
+	if _, err := create("/r/dists/c", CachedAnchor{Path: "/r/dists/c/Release.gpg", BlobHash: gpgC, Signed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if at, ok := marker("/r/dists/c"); !ok || at != 1_800_000_009 {
+		t.Fatalf("c: marker %d %v, want the creation's stamp", at, ok)
+	}
+	// A row whose blob changed since the read, and one that appeared:
+	// the stale sniff marks nothing, and the caller is told.
+	put("/r/dists/d/InRelease", "a newer inrelease d")
+	put("/r/dists/d/Release.gpg", "a late sig d")
+	res, err = create("/r/dists/d",
+		CachedAnchor{Path: "/r/dists/d/InRelease", BlobHash: "an older blob", Signed: true, SeenAt: 5},
+		CachedAnchor{Path: "/r/dists/d/Release.gpg"})
+	if err != nil || res.Outcome != SuiteCreated || !res.Unproven {
+		t.Fatalf("d: %+v, %v; want created, unproven", res, err)
+	}
+	if _, ok := marker("/r/dists/d"); ok {
+		t.Fatal("d: a changed row was marked from a stale sniff")
+	}
+	// A cached anchor row deleted since the read: nothing to mark, nothing unproven.
+	if res, err := create("/r/dists/e", CachedAnchor{Path: "/r/dists/e/InRelease", BlobHash: "gone", Signed: true, SeenAt: 5}); err != nil || res.Unproven {
+		t.Fatalf("e: %+v, %v", res, err)
+	}
+	if _, ok := marker("/r/dists/e"); ok {
+		t.Fatal("e: a vanished row was marked")
+	}
+	// A failing marker write fails the creation: no row is tracked with an
+	// unmarked signed anchor.
+	if _, err := c.db.Exec(`CREATE TRIGGER fail_mark BEFORE INSERT ON suite_signed_seen
+BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	gpgF := put("/r/dists/f/Release.gpg", "sig f")
+	if _, err := create("/r/dists/f", CachedAnchor{Path: "/r/dists/f/Release.gpg", BlobHash: gpgF, Signed: true, SeenAt: 5}); err == nil {
+		t.Fatal("f: the creation succeeded with a failing marker write")
+	}
+	if _, err := c.GetSuiteFreshness(ctx, "http", "h", "/r/dists/f"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("f: the row was created without its marker (%v)", err)
+	}
+}
+
 // Spec C3: UpdateSuiteFreshness is UPDATE-only — it never creates a row —
 // and writes a check's columns only: not current_snapshot_id, not
 // last_requested_at, not the failure record.
@@ -1220,6 +1563,27 @@ func TestUpdateSuiteFreshness_IsUpdateOnly(t *testing.T) {
 		t.Fatalf("UpdateSuiteFreshness wrote current_snapshot_id or last_requested_at: %+v", s)
 	}
 	assertRecord(t, "after UpdateSuiteFreshness", s, sampleFailure())
+}
+
+// UpdateSuiteFreshness writes only the row of its own scheme: http and
+// https of one host and path are two suites.
+func TestUpdateSuiteFreshness_IsSchemeScoped(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	for _, scheme := range []string{"http", "https"} {
+		if _, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: SuiteKey{CanonicalScheme: scheme, CanonicalHost: "h", SuitePath: afSuite},
+			RequestedAt: 1}, SuiteCaps{}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := int64(77)
+	if err := c.UpdateSuiteFreshness(ctx, SuiteFreshness{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: afSuite,
+		LastCheckAt: &check}); err != nil {
+		t.Fatal(err)
+	}
+	if s := getSuite(t, c); s.LastCheckAt != nil {
+		t.Fatalf("an https check wrote the http row: %+v", s)
+	}
 }
 
 // Spec C3: CommitAdoption Step 6 is UPDATE-only. A suite without a row is
@@ -1272,7 +1636,7 @@ func derefStr(p *string) string {
 }
 ```
 
-Create `internal/cache/single_insert_test.go` (it parses production sources; comments never count, only string literals):
+Create `internal/cache/single_insert_test.go` (it parses production sources; comments never count, only string literals and concatenations made only of string literals; the pattern also matches a quoted or schema-qualified table name — exec review D12):
 
 ```go
 package cache
@@ -1285,14 +1649,17 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
 
 // insertSuiteFreshnessRE matches a statement that inserts into
 // suite_freshness: INSERT (OR IGNORE / OR REPLACE …) or REPLACE INTO,
-// across line breaks, any case.
-var insertSuiteFreshnessRE = regexp.MustCompile(`(?is)\b(?:INSERT(?:\s+OR\s+\w+)?|REPLACE)\s+INTO\s+suite_freshness\b`)
+// across line breaks, any case, with the table name quoted ("…", `…`,
+// […]) or schema-qualified (main.suite_freshness) too.
+var insertSuiteFreshnessRE = regexp.MustCompile("(?is)\\b(?:INSERT(?:\\s+OR\\s+\\w+)?|REPLACE)\\s+INTO\\s+" +
+	"(?:[\"`\\[]?\\w+[\"`\\]]?\\s*\\.\\s*)?[\"`\\[]?suite_freshness\\b")
 
 // productionGoFiles calls fn for every non-test .go file of the module
 // (internal/cache is two levels below its root).
@@ -1324,14 +1691,37 @@ func productionGoFiles(t *testing.T, fn func(path string, src []byte)) {
 	}
 }
 
-// stringLiterals calls fn with every string literal of a Go source file
-// and the name of the function declaration that holds it. Comments are
-// not literals, so prose that mentions an INSERT never counts.
+// stringLiterals calls fn with every string literal of a Go source file,
+// unquoted, and with every concatenation made only of string literals
+// ("INSERT INTO " + "suite_freshness …") folded into one string, each with
+// the name of the function declaration that holds it. Comments are not
+// literals, so prose that mentions an INSERT never counts.
 func stringLiterals(t *testing.T, path string, src []byte, fn func(funcName, lit string)) {
 	t.Helper()
 	f, err := parser.ParseFile(token.NewFileSet(), path, src, 0)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var fold func(e ast.Expr) (string, bool)
+	fold = func(e ast.Expr) (string, bool) {
+		switch x := e.(type) {
+		case *ast.BasicLit:
+			if x.Kind != token.STRING {
+				return "", false
+			}
+			s, err := strconv.Unquote(x.Value)
+			return s, err == nil
+		case *ast.ParenExpr:
+			return fold(x.X)
+		case *ast.BinaryExpr:
+			if x.Op != token.ADD {
+				return "", false
+			}
+			l, okL := fold(x.X)
+			r, okR := fold(x.Y)
+			return l + r, okL && okR
+		}
+		return "", false
 	}
 	for _, d := range f.Decls {
 		name := "(top level)"
@@ -1339,8 +1729,11 @@ func stringLiterals(t *testing.T, path string, src []byte, fn func(funcName, lit
 			name = fd.Name.Name
 		}
 		ast.Inspect(d, func(n ast.Node) bool {
-			if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-				fn(name, lit.Value)
+			if e, ok := n.(ast.Expr); ok {
+				if s, ok := fold(e); ok {
+					fn(name, s)
+					return false // a folded concatenation's parts are not visited again
+				}
 			}
 			return true
 		})
@@ -1558,11 +1951,11 @@ In `internal/freshness/panic_recovery_test.go`, `TestCheck_RepairPanicIsRecovere
 - [ ] **Step 2: Run to verify failure**
 
 Run: `go vet ./internal/cache/; go test ./internal/freshness/ -run TestCheck_UntrackedSuiteIsNotChecked`
-Expected: the cache test package does not compile (first error `c.UpdateSuiteFreshness undefined`; `CreateSuite`, `SuiteSeed`, `SuiteKey`, `SuiteCaps`, `ErrSuiteGone` and the outcomes are undefined too); `TestCheck_UntrackedSuiteIsNotChecked` FAILS with `result = "not_modified", want "skipped"`.
+Expected: the cache test package does not compile (first error `c.UpdateSuiteFreshness undefined`; `CreateSuite`, `SuiteSeed`, `SuiteKey`, `SuiteCaps`, `CachedAnchor`, `ErrSuiteGone` and the outcomes are undefined too); `TestCheck_UntrackedSuiteIsNotChecked` FAILS with `result = "not_modified", want "skipped"`.
 
 - [ ] **Step 3: Implement the choke point and the UPDATE-only writers**
 
-Create `internal/cache/suite_rows.go` starting with this block (the contract later tasks build on):
+Create `internal/cache/suite_rows.go` (the contract later tasks build on; `execer` is `signed_seen.go`'s):
 
 ```go
 package cache
@@ -1613,6 +2006,31 @@ type SuiteSeed struct {
 	// suite's base in the creating transaction: the creating request served
 	// sniff-passing signed metadata.
 	SignedSeenAt int64
+	// Cached lists the suite's signed-anchor url_path rows as the creating
+	// request read them (ruling PD-5): a created row's base is marked, in
+	// the creating transaction, for every one whose row still holds the
+	// blob that passed the sniff. A listed row whose blob changed — or that
+	// appeared — since the read sets CreateResult.Unproven.
+	Cached []CachedAnchor
+}
+
+// CachedAnchor is one of a suite's signed-anchor url_path rows
+// (<suite>/InRelease or <suite>/Release.gpg) as the creating request read
+// it, its blob sniffed outside the writer (ruling PD-5: no pool I/O on the
+// writer goroutine). A sniff result is a function of the blob, so
+// createSuiteTx needs only to see that the row still holds BlobHash.
+type CachedAnchor struct {
+	// Path is the url_path path, e.g. "/ubuntu/dists/noble/Release.gpg".
+	Path string
+	// BlobHash is the blob the row held; "" when there was no row (or no
+	// blob).
+	BlobHash string
+	// Signed: that blob passed the anchor's sniff (spec C3).
+	Signed bool
+	// SeenAt is the stamp the marker gets: the row's last use (the newer
+	// of last_requested_at and last_fetched_at); 0 when unknown, which
+	// stamps the creation's RequestedAt.
+	SeenAt int64
 }
 
 // SuiteCaps bounds row creation (spec C3): Global is freshness.max_suites,
@@ -1659,6 +2077,11 @@ func (o CreateOutcome) Rejected() bool { return o == SuiteRejectedGlobal || o ==
 type CreateResult struct {
 	Outcome CreateOutcome
 	Evicted *SuiteKey
+	// Unproven: a row listed in SuiteSeed.Cached changed or appeared
+	// between the caller's read and the creating transaction, so its blob
+	// was never sniffed; the caller marks it after the commit (the
+	// handler's markCachedSignedAnchors backstop).
+	Unproven bool
 }
 
 // SuiteGuard lets cap eviction hold a candidate's in-memory suite mutex
@@ -1671,50 +2094,147 @@ type CreateResult struct {
 type SuiteGuard interface {
 	HoldSuite(key SuiteKey) (release func(deleted bool), ok bool)
 }
-```
 
-then add, in the same file:
+// CreateSuite is spec C3's single creation choke point, for a suite the
+// caller found without a row (the handler's url_path-hit onboarding). It
+// creates the row only if absent (SuiteExists otherwise), within caps: it
+// refuses at the per-host cap, and at the global cap until cap eviction
+// (for which guard holds the evicted suite's mutex) is wired. Count and
+// insert run in one writer transaction, so concurrent creations never
+// exceed a cap. A created row's base is marked signed-seen in the same
+// transaction for seed.SignedSeenAt and for every sniff-passing anchor in
+// seed.Cached whose row still holds the sniffed blob (ruling PD-5).
+func (c *Cache) CreateSuite(ctx context.Context, seed SuiteSeed, caps SuiteCaps, guard SuiteGuard) (CreateResult, error) {
+	_ = guard // unused until cap eviction (Task 5)
+	var got CreateResult
+	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("CreateSuite: begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		r, err := createSuiteTx(ctx, tx, seed, caps)
+		if err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("CreateSuite: commit: %w", err)
+		}
+		got = r
+		return nil
+	})
+	if err != nil {
+		// Never read got after an error: on a ctx/close path the op may
+		// still be running (see InsertCandidateSnapshot).
+		return CreateResult{}, err
+	}
+	return got, nil
+}
 
-- `CreateSuite` with the doc comment "CreateSuite is spec C3's single creation choke point, for a suite the caller found without a row (the handler's url_path-hit onboarding). It creates the row only if absent (SuiteExists otherwise), within caps: it refuses at the per-host cap, and at the global cap until cap eviction (for which guard holds the evicted suite's mutex) is wired. Count and insert run in one writer transaction, so concurrent creations never exceed a cap. With seed.SignedSeenAt set, a created row's base is marked signed-seen in the same transaction." Body: one `submitWrite` operation that begins a transaction, calls `createSuiteTx`, commits, and stores the result in a local only after the commit; the result is read only after `submitWrite` returned nil (on a ctx/close path the operation may still run — the `InsertCandidateSnapshot` rule).
-- `createSuiteTx`, with the doc and AIDEV-NOTE
-
-```go
 // createSuiteTx inserts seed's row unless it exists, enforcing caps inside
-// the caller's writer transaction. It holds the only INSERT INTO
-// suite_freshness in production code (spec C3).
+// the caller's writer transaction, and marks a created row's base
+// signed-seen for the signed metadata its creation knows of (markCreated).
+// It holds the only INSERT INTO suite_freshness in production code (spec
+// C3).
 //
 // AIDEV-NOTE: keep this the single INSERT site
 // (TestSuiteFreshnessHasOneInsertSite). Everything else that writes
 // suite_freshness is UPDATE-only, so no writer can resurrect a row that
 // eviction (or phase F's reaper) deleted.
-```
-
-  In order: the row exists (`SELECT 1 … WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`) → `SuiteExists`, nothing written; `caps.PerHost > 0` and `SELECT COUNT(*) FROM suite_freshness WHERE canonical_host = ?` ≥ `caps.PerHost` → `SuiteRejectedHost`; `caps.Global > 0` and `SELECT COUNT(*) FROM suite_freshness` ≥ `caps.Global` → `SuiteRejectedGlobal`; otherwise
-
-```sql
+func createSuiteTx(ctx context.Context, tx *sql.Tx, seed SuiteSeed, caps SuiteCaps) (CreateResult, error) {
+	var one int
+	err := tx.QueryRowContext(ctx, `
+SELECT 1 FROM suite_freshness
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+		seed.CanonicalScheme, seed.CanonicalHost, seed.SuitePath).Scan(&one)
+	switch {
+	case err == nil:
+		return CreateResult{Outcome: SuiteExists}, nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return CreateResult{}, fmt.Errorf("CreateSuite: read row: %w", err)
+	}
+	if caps.PerHost > 0 {
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM suite_freshness WHERE canonical_host = ?`,
+			seed.CanonicalHost).Scan(&n); err != nil {
+			return CreateResult{}, fmt.Errorf("CreateSuite: count host suites: %w", err)
+		}
+		if n >= caps.PerHost {
+			return CreateResult{Outcome: SuiteRejectedHost}, nil
+		}
+	}
+	if caps.Global > 0 {
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM suite_freshness`).Scan(&n); err != nil {
+			return CreateResult{}, fmt.Errorf("CreateSuite: count suites: %w", err)
+		}
+		if n >= caps.Global {
+			return CreateResult{Outcome: SuiteRejectedGlobal}, nil
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO suite_freshness
   (canonical_scheme, canonical_host, suite_path,
    last_check_at, last_success_at, inrelease_etag, inrelease_lastmod, last_requested_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-```
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		seed.CanonicalScheme, seed.CanonicalHost, seed.SuitePath,
+		seed.LastCheckAt, seed.LastSuccessAt, seed.InReleaseETag, seed.InReleaseLastMod, seed.RequestedAt); err != nil {
+		return CreateResult{}, fmt.Errorf("CreateSuite: insert: %w", err)
+	}
+	unproven, err := markCreated(ctx, tx, seed)
+	if err != nil {
+		return CreateResult{}, err
+	}
+	return CreateResult{Outcome: SuiteCreated, Unproven: unproven}, nil
+}
 
-  with the seed's fields (`RequestedAt` last), then, if `seed.SignedSeenAt != 0`, `markSignedSeen(ctx, tx, scheme, host, aptpath.MarkerBase(seed.SuitePath), seed.SignedSeenAt)`, and `SuiteCreated`. Errors are wrapped `CreateSuite: read row: %w`, `CreateSuite: count host suites: %w`, `CreateSuite: count suites: %w`, `CreateSuite: insert: %w`, `CreateSuite: %w`.
-- `UpdateSuiteFreshness`, one `submitWrite` operation running
+// markCreated marks a just-created suite's base signed-seen, in its
+// creating transaction, once, with the newest stamp among the signed
+// metadata the creation knows of: the body in hand (seed.SignedSeenAt) and
+// every seed.Cached anchor that passed the sniff and whose url_path row
+// still holds that blob. It reports unproven when a listed row's blob
+// changed or appeared since the caller read it: that blob was never
+// sniffed, so the caller marks it after the commit.
+//
+// AIDEV-NOTE: ruling PD-5. The marker is the never-downgrade authority
+// (spec C5): a suite must never be tracked while one of its cached signed
+// anchors is served without its base marked, so these marks commit with
+// the row or not at all (spec C3 "no residual window") — never in a
+// follow-up operation that could fail. The blobs were sniffed by the
+// caller: no pool I/O runs on the writer goroutine.
+func markCreated(ctx context.Context, tx *sql.Tx, seed SuiteSeed) (unproven bool, err error) {
+	seen := seed.SignedSeenAt
+	for _, a := range seed.Cached {
+		var cur sql.NullString
+		err := tx.QueryRowContext(ctx, `
+SELECT blob_hash FROM url_path
+ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ?`,
+			seed.CanonicalScheme, seed.CanonicalHost, a.Path).Scan(&cur)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, fmt.Errorf("CreateSuite: read cached anchor %s: %w", a.Path, err)
+		}
+		switch {
+		case cur.String != a.BlobHash:
+			// Changed or appeared (unproven), or gone (nothing to mark).
+			unproven = unproven || cur.String != ""
+		case a.Signed && a.BlobHash != "":
+			at := a.SeenAt
+			if at <= 0 {
+				at = seed.RequestedAt
+			}
+			seen = max(seen, at)
+		}
+	}
+	if seen == 0 {
+		return unproven, nil
+	}
+	if err := markSignedSeen(ctx, tx, seed.CanonicalScheme, seed.CanonicalHost,
+		aptpath.MarkerBase(seed.SuitePath), seen); err != nil {
+		return false, fmt.Errorf("CreateSuite: %w", err)
+	}
+	return unproven, nil
+}
 
-```sql
-UPDATE suite_freshness
-   SET last_check_at            = ?,
-       last_success_at          = ?,
-       inrelease_etag           = ?,
-       inrelease_lastmod        = ?,
-       inrelease_change_seen_at = ?,
-       check_fail_count         = ?
- WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?
-```
-
-  (0 rows is not an error; errors wrapped `UpdateSuiteFreshness: %w`), with this doc, which carries `PutSuiteFreshness`'s AIDEV-NOTE over:
-
-```go
 // UpdateSuiteFreshness writes a check's result to an existing suite row:
 // last_check_at, last_success_at, the validators, inrelease_change_seen_at
 // and check_fail_count. UPDATE-only (spec C3): a suite without a row is
@@ -1728,7 +2248,34 @@ UPDATE suite_freshness
 // sets or resets the streak in the same statement that bumps
 // last_check_at. The adoption failure record (adoption_fail_*) is never
 // written here (spec C7). (Carried over from PutSuiteFreshness.)
+func (c *Cache) UpdateSuiteFreshness(ctx context.Context, s SuiteFreshness) error {
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		if err := updateSuiteFreshness(ctx, conn, s); err != nil {
+			return fmt.Errorf("UpdateSuiteFreshness: %w", err)
+		}
+		return nil
+	})
+}
+
+// updateSuiteFreshness is UpdateSuiteFreshness's statement (also run by
+// the test-only SeedSuiteForTest).
+func updateSuiteFreshness(ctx context.Context, ex execer, s SuiteFreshness) error {
+	_, err := ex.ExecContext(ctx, `
+UPDATE suite_freshness
+   SET last_check_at            = ?,
+       last_success_at          = ?,
+       inrelease_etag           = ?,
+       inrelease_lastmod        = ?,
+       inrelease_change_seen_at = ?,
+       check_fail_count         = ?
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+		s.LastCheckAt, s.LastSuccessAt, s.InReleaseETag, s.InReleaseLastMod, s.InReleaseChangeSeenAt,
+		s.CheckFailCount, s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
+	return err
+}
 ```
+
+`createSuiteTx` checks the row, then the per-host cap, then the global cap: Task 5's eviction lives in the global block, and a refusal after it would commit an eviction. `CreateSuite` reads its result only after `submitWrite` returned nil (on a ctx/close path the operation may still run — the `InsertCandidateSnapshot` rule).
 
 In `internal/cache/queries.go`, delete `PutSuiteFreshness` (its AIDEV-NOTE now lives on `UpdateSuiteFreshness`). Deferred minor B-1: replace the `suiteFreshnessColumns` AIDEV-NOTE (`// AIDEV-NOTE: keep in lockstep with scanDest. Every column is nullable or` … `// following fields silently instead of failing.`) with
 
@@ -1774,11 +2321,56 @@ UPDATE suite_freshness
 
 In `internal/cache/adoption_failure.go`: `clearAdoptionFailureSet`'s doc says `CommitAdoption's flip` / `// appends it to its UPDATE, so a successful adoption clears the record in` / `// the same transaction that makes the snapshot current.`; deferred minor B-2 appends to `RescheduleFailingAdoptions`'s doc `// offset runs on the writer goroutine, possibly after this call returned` / `// on a cancelled context, so it must be safe to call from another` / `// goroutine (math/rand/v2's top-level functions are; deferred minor B-2).`; deferred minor B-4 changes the select's `AND adoption_fail_reason NOT IN (` to `AND COALESCE(adoption_fail_reason, '') NOT IN (`. In `internal/cache/types.go`, the two comments naming `PutSuiteFreshness` (`CheckFailCount`'s and the failure-record AIDEV-NOTE's) name `UpdateSuiteFreshness`.
 
-Append to `internal/cache/testing_helpers.go` (beside the existing `…ForTest` helpers; each doc ends `TEST-ONLY.`, and `SeedSuiteForTest`'s says `never call from non-test code (TestOnlyTheHandlerCreatesSuiteRows)`):
+Append to `internal/cache/testing_helpers.go` (beside the existing `…ForTest` helpers; its imports already cover them):
 
-- `SeedSuiteForTest(ctx context.Context, s SuiteFreshness) error` — the upsert fixtures relied on: in one writer transaction, `createSuiteTx(ctx, tx, SuiteSeed{SuiteKey: key, RequestedAt: nowUnix()}, SuiteCaps{})`, then the `UpdateSuiteFreshness` UPDATE of `s`'s six check columns.
-- `EnsureSuiteForTest(ctx context.Context, scheme, host, suitePath string) error` — `c.CreateSuite(ctx, SuiteSeed{SuiteKey: …, RequestedAt: nowUnix()}, SuiteCaps{}, nil)`, result discarded.
-- `InsertTrackedCandidateForTest(ctx context.Context, sc SnapshotCandidate) (int64, bool, error)` — `EnsureSuiteForTest` for `sc`'s suite, then `c.InsertCandidateSnapshot(ctx, sc)`.
+```go
+// SeedSuiteForTest stores s's suite row the way fixtures relied on before
+// spec C3 made every writer but CreateSuite UPDATE-only: it creates the
+// row if absent (createSuiteTx, uncapped, interest stamp now) and writes
+// s's six check columns with UpdateSuiteFreshness's statement, in one
+// writer transaction. Fixtures use it to build a tracked suite in a given
+// state. This file is not a _test.go file, so the helper is compiled into
+// the production binary; never call it from non-test code
+// (TestOnlyTheHandlerCreatesSuiteRows fails on such a call). TEST-ONLY.
+func (c *Cache) SeedSuiteForTest(ctx context.Context, s SuiteFreshness) error {
+	key := SuiteKey{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath}
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("SeedSuiteForTest: begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := createSuiteTx(ctx, tx, SuiteSeed{SuiteKey: key, RequestedAt: nowUnix()}, SuiteCaps{}); err != nil {
+			return fmt.Errorf("SeedSuiteForTest: %w", err)
+		}
+		if err := updateSuiteFreshness(ctx, tx, s); err != nil {
+			return fmt.Errorf("SeedSuiteForTest: update: %w", err)
+		}
+		return tx.Commit()
+	})
+}
+
+// EnsureSuiteForTest gives a suite an empty row (uncapped, interest stamp
+// now) unless it has one: spec C3 lets only the handler create rows, and
+// CommitAdoption (UPDATE-only) and the checker (I-4) need one. TEST-ONLY.
+func (c *Cache) EnsureSuiteForTest(ctx context.Context, scheme, host, suitePath string) error {
+	_, err := c.CreateSuite(ctx, SuiteSeed{
+		SuiteKey:    SuiteKey{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath},
+		RequestedAt: nowUnix(),
+	}, SuiteCaps{}, nil)
+	return err
+}
+
+// InsertTrackedCandidateForTest is InsertCandidateSnapshot for a suite
+// that EnsureSuiteForTest first gives a row, so the candidate can be
+// committed (CommitAdoption Step 6 is UPDATE-only). TEST-ONLY.
+func (c *Cache) InsertTrackedCandidateForTest(ctx context.Context, sc SnapshotCandidate) (int64, bool, error) {
+	if err := c.EnsureSuiteForTest(ctx, sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath); err != nil {
+		return 0, false, err
+	}
+	return c.InsertCandidateSnapshot(ctx, sc)
+}
+```
 
 In `internal/freshness/freshness.go`: in the `Cache` interface, replace `PutSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error` with
 
@@ -1816,7 +2408,34 @@ func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
 
 In `checkLocked`, the `errors.Is(err, cache.ErrNotFound)` case no longer builds a fresh row: it is `// The row vanished after check's pre-read (I-4): nothing to check` / `// and nothing to write.` and `return` (the outcome stays `skipped`). In `bumpFailedCheck`, the same case is `return // the row is gone: nothing to bump (UPDATE-only, spec C3)`, and its `// AIDEV-NOTE: phase D turns the Put into the UPDATE-only writer.` becomes `// AIDEV-NOTE: UPDATE-only since phase D (spec C3): a row deleted since the` / `// panic records nothing, and nothing here may create one.`
 
-In `internal/handler/handler.go`, the `InRelease`-miss seed builds a `cache.SuiteSeed` (the same `LastCheckAt`/`LastSuccessAt` = `&now`, the miss's `ETag`/`Last-Modified`, plus `RequestedAt: now`) and calls `h.cache.CreateSuite(dbCtx, seed, cache.SuiteCaps{}, nil)` (result discarded; the WARN on error unchanged); append to the comment above it `CreateSuite` / `// is create-only (spec C3): a refresh miss leaves an existing row as` / `// it is.`
+In `internal/handler/handler.go`, `runFetch`'s `InRelease`-miss seed — from the comment's last sentence (`// the periodic-scheduler benefit until the next miss/T1.`) through its `PutSuiteFreshness` call — becomes (the WARN below it is unchanged; the same `LastCheckAt`/`LastSuccessAt` = `&now` and the miss's validators, plus `RequestedAt: now`):
+
+```go
+	// the periodic-scheduler benefit until the next miss/T1. CreateSuite
+	// is create-only (spec C3): until this seed moves into StoreFetched,
+	// whose UPDATE-only re-stamp restores today's refresh miss, a refresh
+	// miss leaves an existing row as it is.
+	if req.IsMetadata && req.SuitePath != "" && req.Path == req.SuitePath+inReleaseSuffix {
+		seed := cache.SuiteSeed{
+			SuiteKey: cache.SuiteKey{
+				CanonicalScheme: req.CanonicalScheme,
+				CanonicalHost:   req.CanonicalHost,
+				SuitePath:       req.SuitePath,
+			},
+			LastCheckAt:   &now,
+			LastSuccessAt: &now,
+			RequestedAt:   now,
+		}
+		if fres.ETag != "" {
+			etag := fres.ETag
+			seed.InReleaseETag = &etag
+		}
+		if fres.LastModified != "" {
+			lm := fres.LastModified
+			seed.InReleaseLastMod = &lm
+		}
+		if _, err := h.cache.CreateSuite(dbCtx, seed, cache.SuiteCaps{}, nil); err != nil {
+```
 
 - [ ] **Step 4: Run the new cache tests**
 
@@ -1864,7 +2483,7 @@ for k in sorted(changed):
 print('total', sum(changed.values()), 'in', len(changed), 'files')
 ```
 
-Expected last line: `total 65 in 25 files`. Second, every test candidate gets a suite row first, except in the two files whose tests need a row-less candidate — `python3 -I /tmp/m2.py . internal/cache/anchor_form_test.go internal/cache/suite_rows_test.go`:
+Expected last line: `total 65 in 25 files` — on the tree as Steps 1–4 leave it: Task 2's `failclosed_test.go` fixture adds one call, and Step 1's rewrites of `suite_interest_test.go` (two), `adoption_failure_test.go` (two) and `cache_test.go` (three) remove seven, so on the phase C tip the same script prints `total 71 in 25 files` (design review M15). Second, every test candidate gets a suite row first, except in the two files whose tests need a row-less candidate — `python3 -I /tmp/m2.py . internal/cache/anchor_form_test.go internal/cache/suite_rows_test.go`:
 
 ```python
 """Phase D fixture migration, step 2: test candidates get a suite row first."""
@@ -1894,7 +2513,7 @@ for k in sorted(changed):
 print('total', sum(changed.values()), 'in', len(changed), 'files')
 ```
 
-Expected last line: `total 116 in 30 files`.
+Expected last line: `total 116 in 30 files` (on the phase C tip `total 117 in 31 files`: Step 1's `suite_interest_test.go` rewrite removes one).
 
 Then by hand. In `internal/freshness/freshness_test.go`, replace the fake's (now renamed) `SeedSuiteForTest` method with these three:
 
@@ -2002,7 +2621,7 @@ Expected: PASS. `grep -rn 'PutSuiteFreshness' --include=*.go .` prints only the 
 
 - [ ] **Step 7: Mutation check (do not commit)**
 
-One at a time, reverting each: (a) the per-host check `n >= caps.PerHost && false` → `TestCreateSuite_EnforcesTheCaps` FAILS (`step 2 (http://a/3): created, want host_cap`); (b) count per `canonical_scheme = ? AND canonical_host = ?` → same test FAILS at step 2; (c) `n > caps.Global` → same test FAILS (`step 6 (http://d/1): created, want global_cap`); (d) mark on `SuiteExists` too → `TestCreateSuite_MarksSignedSeenInTheCreatingTransaction` FAILS (`finding an existing row wrote a marker`); (e) ignore `n == 0` in Step 6 → `TestCommitAdoption_RefusesAGoneSuite` FAILS; (f) on `n == 0` INSERT the row instead → that test and `TestSuiteFreshnessHasOneInsertSite` FAIL (`sites = [../../internal/cache/adoption.go:CommitAdoption …]`); (g) `UpdateSuiteFreshness` also sets `last_requested_at` → `TestUpdateSuiteFreshness_IsUpdateOnly` and `TestSuiteInterestStamp_SetAtCreationKeptByWriters` FAIL; (h) drop the `suiteRowExists` pre-check → `TestCheck_UntrackedSuiteIsNotChecked` FAILS (`lock map holds 1 entries, want 0`); (i) Step 7a marks `suite` instead of `aptpath.MarkerBase(suite)` → `TestCommitAdoption_SignedFormsRecordSignedSeen` FAILS (`/flat: marker ok=false`); (j) a `c.CreateSuite(…)` call added to `freshness.go` → `TestOnlyTheHandlerCreatesSuiteRows` FAILS; (k) hoist `offset()` out of `RescheduleFailingAdoptions`' loop → `TestRescheduleFailingAdoptions_SkipsRefusalsAndPanics` FAILS; (l) `GetSuiteSnapshot` blanks `FormInline` → `TestGetSuiteSnapshot_ReturnsFormAndLifecycleFields` FAILS.
+One at a time, reverting each: (a) the per-host check `n >= caps.PerHost && false` → `TestCreateSuite_EnforcesTheCaps` FAILS (`step 2 (http://a/3): created, want host_cap`); (b) count per `canonical_scheme = ? AND canonical_host = ?` → same test FAILS at step 2; (c) `n > caps.Global` → same test FAILS (`step 6 (http://d/1): created, want global_cap`); (d) mark on `SuiteExists` too → `TestCreateSuite_MarksSignedSeenInTheCreatingTransaction` FAILS (`finding an existing row wrote a marker`); (e) ignore `n == 0` in Step 6 → `TestCommitAdoption_RefusesAGoneSuite` FAILS; (f) on `n == 0` INSERT the row instead → that test and `TestSuiteFreshnessHasOneInsertSite` FAIL (`sites = [../../internal/cache/adoption.go:CommitAdoption …]`); (g) `UpdateSuiteFreshness` also sets `last_requested_at` → `TestUpdateSuiteFreshness_IsUpdateOnly` and `TestSuiteInterestStamp_SetAtCreationKeptByWriters` FAIL; (h) drop the `suiteRowExists` pre-check → `TestCheck_UntrackedSuiteIsNotChecked` FAILS (`lock map holds 1 entries, want 0`); (i) Step 7a marks `suite` instead of `aptpath.MarkerBase(suite)` → `TestCommitAdoption_SignedFormsRecordSignedSeen` FAILS (`/flat: marker ok=false`); (j) a `c.CreateSuite(…)` call added to `freshness.go` → `TestOnlyTheHandlerCreatesSuiteRows` FAILS; (k) hoist `offset()` out of `RescheduleFailingAdoptions`' loop → `TestRescheduleFailingAdoptions_SkipsRefusalsAndPanics` FAILS; (l) `GetSuiteSnapshot` blanks `FormInline` → `TestGetSuiteSnapshot_ReturnsFormAndLifecycleFields` FAILS; (m) a production function in `suite_rows.go` running ``INSERT INTO "suite_freshness" …``, (n) one running `INSERT INTO main.suite_freshness …`, (o) one running `"INSERT INTO "+"suite_freshness …"` → `TestSuiteFreshnessHasOneInsertSite` FAILS for each (`sites = [… suite_rows.go:createSuiteTx … suite_rows.go:mutantInsert…]`); (p) `UpdateSuiteFreshness`'s `canonical_scheme = ?` → `(canonical_scheme = ? OR 1)` → `TestUpdateSuiteFreshness_IsSchemeScoped` FAILS (`an https check wrote the http row`); (q) `markCreated` marks a changed row (`case cur.String != a.BlobHash && !a.Signed:`) → `TestCreateSuite_MarksCachedSignedAnchors` FAILS (`d: a changed row was marked from a stale sniff`); (r) it marks an anchor that failed the sniff (`case a.BlobHash != "":`) → FAILS (`b: a plain-text cached anchor earned a marker`); (s) it never sets `unproven` → FAILS (`d: … want created, unproven`); (t) it sets `unproven` for a vanished row too → FAILS (`e: {… Unproven:true}`); (u) `seen = at` instead of `max(seen, at)` → FAILS (`a: marker 1700000000 true, want the newest cached stamp 1700000500`); (v) drop the `at <= 0` fallback to `seed.RequestedAt` → FAILS (`c: marker 0 false, want the creation's stamp`); (w) ignore `markSignedSeen`'s error → FAILS (`f: the creation succeeded with a failing marker write`).
 
 - [ ] **Step 8: Commit**
 
@@ -2020,20 +2639,23 @@ Expected: `gofmt -l` prints exactly the four drift files under `internal/` and `
 
 ### Task 5: Caps and cap eviction under the suite's mutex
 
-Spec C3 "At the global cap it first tries to evict (via the reaper path, under its mutex) the least-recently-requested suite that has no current snapshot and has been idle ≥ 24 h; otherwise it creates nothing"; ruling R-D1 (one compare-and-delete helper, `deleteSuiteTx`, which phase F's `ReapIdleSuite` reuses; count, evict and insert in one writer transaction; the evictee's `url_path` rows left to GC; the guard taken before the writer operation is submitted); design note 6 (at most eight candidates, and only at exactly the cap). The production guard — the checker's `HoldSuite`, whose `release(true)` drops the lock-map and flip-gate entries — is Task 7; Task 6 adds the touch-map purge to `afterCreate`; the handler passes the guard from Task 9. The marker of an evicted suite survives (spec C3: only phase F's sweep removes markers).
+Spec C3 "At the global cap it first tries to evict (via the reaper path, under its mutex) the least-recently-requested suite that has no current snapshot and has been idle ≥ 24 h; otherwise it creates nothing"; ruling R-D1 (one compare-and-delete helper, `deleteSuiteTx`, which phase F's `ReapIdleSuite` reuses; count, evict and insert in one writer transaction; the evictee's `url_path` rows left to GC; the guard taken before the writer operation is submitted); design note 6 as ruling PD-8 revised it (at most eight candidates; at and above the global cap each creation attempt evicts one, and above it the attempt is still refused, so a lowered cap or an upgraded v6 table converges under the 24 h rule instead of waiting up to 30 days for phase F's reaper). Design review M3–M5 and M11 (ruling PD-11): after the writer operation `afterCreate` reads an unused or unsettled candidate's row and releases it as gone when it has none (a failed submit, or a candidate a concurrent creation evicted first); a vanished candidate at the cap makes the creation retry once with a fresh list (`deleteSuiteTx` reports "no row" apart from "kept"); a candidate is held from `max_suites − 8` rows on, so creations racing at the cap boundary are not refused while idle suites exist; a future `last_requested_at` (a backward clock step) is reported to a guard that is a `ClockStepReporter`, which the checker is from Task 7 (spec C4's rate-limited `clock_step_detected`). Exec review D7, D8 and D15 pin the host scoping of the compare-and-delete, the per-host-before-global order and the cutoff's boundary and NULL. `SuiteExists` moves here from Task 6 (`afterCreate` uses it), and `SuiteCapUsage` serves Task 8's startup WARN `suite_caps_exceeded` (PD-8). The production guard — the checker's `HoldSuite`, whose `release(true)` drops the lock-map and flip-gate entries — is Task 7; Task 6 adds the touch-map purge to `afterCreate`; the handler passes the guard from Task 9. The marker of an evicted suite survives (spec C3: only phase F's sweep removes markers).
 
 **Files:**
-- Modify: `internal/cache/suite_rows.go`, `internal/cache/testing_helpers.go` (the `createSuiteTx` call in `SeedSuiteForTest`)
+- Modify: `internal/cache/suite_rows.go`, `internal/cache/testing_helpers.go` (the `createSuiteTx` call in `SeedSuiteForTest`), `internal/cache/suite_rows_test.go` (`TestSuiteExists`)
 - Create: `internal/cache/suite_evict_test.go`
 
 **Interfaces:**
 - Consumes: Task 4's `SuiteKey`, `SuiteSeed`, `SuiteCaps`, `CreateResult`, `SuiteGuard`, `createSuiteTx`; `decrementSnapshotRefcountsTx(ctx, tx, snapshotID, now int64) error` (`cache/adoption.go`, `CommitAdoption`'s Step 8 helper); `MarkSignedSeenBatch`, `SignedSeen`, `LookupURL`, `PutURLPath`, `GetSnapshotMember`, `GetBlob`; test helpers `openCache`, `seedBlob`, `stubNow`.
 - Produces:
-  - `func deleteSuiteTx(ctx context.Context, tx *sql.Tx, key SuiteKey, wantCurrent *int64, cutoff, now int64) (bool, error)` — the single suite-row delete (F reuses it with `wantCurrent` set).
-  - `func createSuiteTx(ctx context.Context, tx *sql.Tx, seed SuiteSeed, caps SuiteCaps, held *heldSuite, now int64) (CreateResult, error)` (Task 6's `StoreFetched` passes a held candidate too).
-  - `type heldSuite struct { key SuiteKey; release func(deleted bool) }`; `func (c *Cache) holdEvictionCandidate(ctx context.Context, caps SuiteCaps, guard SuiteGuard) (*heldSuite, error)`; `func (c *Cache) afterCreate(res CreateResult, held *heldSuite)` (Task 6 extends it).
-  - Constants `suiteEvictIdle = 24 * time.Hour`, `suiteEvictCandidates = 8`.
-  - Test helpers (`suite_evict_test.go`): `fakeGuard` / `newFakeGuard()` (fields `busy`, `asked`, `released`, `onHold`), `sk(host, suite string) SuiteKey`, `seedRow`, `adoptRow`, `rowExists`, `fourRows`, constants `evictNow`, `evictDay`.
+  - `type deleteOutcome int` (`suiteKept`, `suiteDeleted`, `suiteNoRow`); `func deleteSuiteTx(ctx context.Context, tx *sql.Tx, key SuiteKey, wantCurrent *int64, cutoff, now int64) (deleteOutcome, error)` — the single suite-row delete (F reuses it with `wantCurrent` set).
+  - `func createSuiteTx(ctx context.Context, tx *sql.Tx, seed SuiteSeed, caps SuiteCaps, held *heldSuite, now int64) (CreateResult, error)` (Task 6's `StoreFetched` passes a held candidate too); `CreateResult.heldGone` (unexported: the held candidate had no row; the caller retries once).
+  - `type heldSuite struct { key SuiteKey; release func(deleted bool) }`; `func (c *Cache) holdEvictionCandidate(ctx context.Context, caps SuiteCaps, guard SuiteGuard) (*heldSuite, error)`; `func (c *Cache) createSuiteOnce(…) (CreateResult, error)`; `func (c *Cache) afterCreate(res CreateResult, held *heldSuite)` (Task 6 extends it); `func (c *Cache) suiteRowGone(key SuiteKey) bool`; `func (c *Cache) reportFutureInterest(ctx context.Context, r ClockStepReporter, now int64)`.
+  - `type ClockStepReporter interface { ReportClockStep(stamp string, key SuiteKey, stored, now int64) }` (Task 7's checker implements it).
+  - `func (c *Cache) SuiteExists(ctx context.Context, key SuiteKey) (bool, error)` (here, not in Task 6: `afterCreate` uses it; Task 10's flip-barrier registration too).
+  - `type SuiteCapUsage struct { Total, HostsAtCap int; FullestHost string; FullestHostRows int }`; `func (c *Cache) SuiteCapUsage(ctx context.Context, perHost int) (SuiteCapUsage, error)` (Task 8's startup WARN).
+  - Constants `suiteEvictIdle = 24 * time.Hour`, `suiteEvictCandidates = 8`, `suiteRowGoneTimeout = 5 * time.Second`, `futureStampSlack = 2`.
+  - Test helpers (`suite_evict_test.go`): `fakeGuard` / `newFakeGuard()` (fields `busy`, `asked`, `released`, `onHold`), `clockGuard`, `sk(host, suite string) SuiteKey`, `seedRow`, `adoptRow`, `rowExists`, `fourRows`, constants `evictNow`, `evictDay`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2227,22 +2849,242 @@ func TestCreateSuite_RefusesWhenNothingIsEvictable(t *testing.T) {
 	}
 }
 
-// Design note 6: above the cap (rows created before max_suites was
-// lowered) one eviction cannot make room, so nothing is evicted; the held
-// candidate is released as not deleted.
-func TestCreateSuite_NeverEvictsAboveTheCap(t *testing.T) {
+// Ruling PD-8: above the cap (a lowered max_suites, an upgraded v6 table)
+// one eviction cannot make room, but each creation attempt still evicts
+// one idle suite — and is refused — so the table converges under the 24 h
+// rule: here the first attempt evicts f/idle3 and is refused, and the next
+// one, at the cap, evicts b/idle and creates its row.
+func TestCreateSuite_AboveTheCapEvictsOneAndRefuses(t *testing.T) {
 	c := openCache(t)
+	ctx := context.Background()
 	defer stubNow(t, evictNow)()
 	fourRows(t, c)
 	seedRow(t, c, sk("f", "/idle3"), evictNow-4*evictDay)
 	g := newFakeGuard()
-	res, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow},
-		SuiteCaps{Global: 4}, g)
-	if err != nil || res.Outcome != SuiteRejectedGlobal || res.Evicted != nil {
-		t.Fatalf("CreateSuite = %+v, %v; want global_cap", res, err)
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 4}, g)
+	if err != nil || res.Outcome != SuiteRejectedGlobal || res.Evicted == nil || *res.Evicted != sk("f", "/idle3") {
+		t.Fatalf("CreateSuite = %+v, %v; want global_cap, evicting f/idle3", res, err)
 	}
-	if !slices.Equal(g.released[sk("f", "/idle3")], []bool{false}) || !rowExists(t, c, sk("f", "/idle3")) {
-		t.Fatalf("released %v; want f/idle3 kept and released as not deleted", g.released)
+	if !slices.Equal(g.released[sk("f", "/idle3")], []bool{true}) || rowExists(t, c, sk("f", "/idle3")) || rowExists(t, c, sk("e", "/new")) {
+		t.Fatalf("released %v; want f/idle3 deleted and released as deleted, e/new not created", g.released)
+	}
+	res, err = c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new2"), RequestedAt: evictNow}, SuiteCaps{Global: 4}, g)
+	if err != nil || res.Outcome != SuiteCreated || res.Evicted == nil || *res.Evicted != sk("b", "/idle") {
+		t.Fatalf("CreateSuite at the cap = %+v, %v; want created, evicting b/idle", res, err)
+	}
+	if st, err := c.GetSuiteStats(ctx); err != nil || st.Tracked != 4 {
+		t.Fatalf("tracked = %+v, %v; want 4 (the cap)", st, err)
+	}
+}
+
+// A creation refused at its host's cap evicts nothing, even at the global
+// cap with an evictable suite: the per-host check comes first.
+func TestCreateSuite_HostCapRefusalEvictsNothing(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	fourRows(t, c) // hosts a, b, c, d (one row each); b and c are evictable
+	res, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("d", "/new"), RequestedAt: evictNow},
+		SuiteCaps{Global: 4, PerHost: 1}, newFakeGuard())
+	if err != nil || res.Outcome != SuiteRejectedHost || res.Evicted != nil {
+		t.Fatalf("CreateSuite = %+v, %v; want host_cap, nothing evicted", res, err)
+	}
+	if !rowExists(t, c, sk("b", "/idle")) {
+		t.Fatal("a host-cap refusal evicted a suite")
+	}
+}
+
+// The compare-and-delete retires and deletes only the evictee, not a suite
+// with the same path on another host.
+func TestCreateSuite_EvictionTouchesOnlyTheEvictee(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	seedRow(t, c, sk("b", "/idle"), evictNow-3*evictDay)
+	seedRow(t, c, sk("z", "/idle"), evictNow-3600)
+	id := adoptRow(t, c, sk("z", "/idle"))
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 2}, newFakeGuard())
+	if err != nil || res.Evicted == nil || *res.Evicted != sk("b", "/idle") {
+		t.Fatalf("CreateSuite = %+v, %v; want b/idle evicted", res, err)
+	}
+	if !rowExists(t, c, sk("z", "/idle")) {
+		t.Fatal("the eviction deleted a same-path suite on another host")
+	}
+	if snap, err := c.GetSuiteSnapshot(ctx, id); err != nil || snap.RetiredAt != nil {
+		t.Fatalf("the eviction retired another host's snapshot: %+v, %v", snap, err)
+	}
+}
+
+// Design review M4: a held candidate whose row a concurrent creation
+// evicted before this one held it (here: deleted inside HoldSuite, the
+// table refilled behind it) is released as gone — its in-memory state is
+// stale — and the creation tries once more with a fresh candidate list; a
+// second vanished candidate ends it with a refusal (at most two attempts).
+// An unused candidate that vanished (room was left) is released as gone
+// too.
+func TestCreateSuite_RetriesOnceWhenTheCandidateVanished(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	fourRows(t, c)
+	refills := 0
+	evictedElsewhere := func(k SuiteKey) {
+		if _, err := c.db.Exec(`DELETE FROM suite_freshness WHERE canonical_host = ? AND suite_path = ?`,
+			k.CanonicalHost, k.SuitePath); err != nil {
+			t.Error(err)
+		}
+		refills++
+		seedRow(t, c, sk("r", fmt.Sprintf("/refill%d", refills)), evictNow-3600)
+	}
+	g := newFakeGuard()
+	g.onHold = func(k SuiteKey) {
+		if k == sk("b", "/idle") {
+			evictedElsewhere(k)
+		}
+	}
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 4}, g)
+	if err != nil || res.Outcome != SuiteCreated || res.Evicted == nil || *res.Evicted != sk("c", "/idle2") {
+		t.Fatalf("CreateSuite = %+v, %v; want created on the second attempt, evicting c/idle2", res, err)
+	}
+	if !slices.Equal(g.released[sk("b", "/idle")], []bool{true}) || !slices.Equal(g.released[sk("c", "/idle2")], []bool{true}) {
+		t.Fatalf("released %v; want b/idle released as gone and c/idle2 as deleted", g.released)
+	}
+	// Every candidate vanishes: two attempts, then a refusal.
+	seedRow(t, c, sk("f", "/idle4"), evictNow-3*evictDay)
+	seedRow(t, c, sk("g", "/idle5"), evictNow-3*evictDay)
+	g2 := newFakeGuard()
+	g2.onHold = evictedElsewhere
+	res, err = c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new2"), RequestedAt: evictNow}, SuiteCaps{Global: 6}, g2)
+	if err != nil || res.Outcome != SuiteRejectedGlobal || len(g2.asked) != 2 {
+		t.Fatalf("CreateSuite = %+v, %v, asked %v; want global_cap after two candidates", res, err, g2.asked)
+	}
+	for _, k := range g2.asked {
+		if !slices.Equal(g2.released[k], []bool{true}) {
+			t.Fatalf("released %v; want each vanished candidate released as gone", g2.released)
+		}
+	}
+	// Below the cap a held candidate goes unused; if it vanished, it is
+	// released as gone all the same.
+	seedRow(t, c, sk("h", "/idle6"), evictNow-3*evictDay)
+	g3 := newFakeGuard()
+	g3.onHold = func(k SuiteKey) {
+		if _, err := c.db.Exec(`DELETE FROM suite_freshness WHERE canonical_host = ? AND suite_path = ?`,
+			k.CanonicalHost, k.SuitePath); err != nil {
+			t.Error(err)
+		}
+	}
+	res, err = c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new3"), RequestedAt: evictNow}, SuiteCaps{Global: 10}, g3)
+	if err != nil || res.Outcome != SuiteCreated || len(g3.asked) != 1 || !slices.Equal(g3.released[g3.asked[0]], []bool{true}) {
+		t.Fatalf("CreateSuite = %+v, %v; asked %v, released %v; want created and the vanished candidate released as gone",
+			res, err, g3.asked, g3.released)
+	}
+}
+
+// Design review M5: within suiteEvictCandidates of the global cap a
+// creation already holds a candidate (creations racing at the boundary
+// each find their own), and releases it unused while there is room; well
+// below the cap it holds none.
+func TestCreateSuite_HoldsACandidateNearTheCap(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	fourRows(t, c)
+	g := newFakeGuard()
+	res, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow},
+		SuiteCaps{Global: 4 + suiteEvictCandidates}, g)
+	if err != nil || res.Outcome != SuiteCreated || res.Evicted != nil {
+		t.Fatalf("CreateSuite = %+v, %v; want created, nothing evicted", res, err)
+	}
+	if !slices.Equal(g.asked, []SuiteKey{sk("b", "/idle")}) || !slices.Equal(g.released[sk("b", "/idle")], []bool{false}) {
+		t.Fatalf("asked %v, released %v; want b/idle held and released unused", g.asked, g.released)
+	}
+	g = newFakeGuard()
+	if _, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("e", "/new2"), RequestedAt: evictNow},
+		SuiteCaps{Global: 6 + suiteEvictCandidates}, g); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.asked) != 0 {
+		t.Fatalf("asked %v well below the cap; want none", g.asked)
+	}
+}
+
+// clockGuard is a fakeGuard that is also a ClockStepReporter.
+type clockGuard struct {
+	*fakeGuard
+	reports []string
+}
+
+func (g *clockGuard) ReportClockStep(stamp string, key SuiteKey, stored, now int64) {
+	g.reports = append(g.reports, fmt.Sprintf("%s %s%s %d %d", stamp, key.CanonicalHost, key.SuitePath, stored-now, now))
+}
+
+// Ruling PD-11 (design review M11): a suite whose last_requested_at lies
+// more than 2 s in the future is never evicted (deleteSuiteTx), and the
+// eviction tells a reporting guard, which rate-limits spec C4's
+// clock_step_detected; a stamp within the slack is not a clock step.
+func TestCreateSuite_ReportsAFutureInterestStamp(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	seedRow(t, c, sk("a", "/slack"), evictNow+futureStampSlack)
+	g := &clockGuard{fakeGuard: newFakeGuard()}
+	if _, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 1}, g); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.reports) != 0 {
+		t.Fatalf("reports = %q for a stamp within the slack, want none", g.reports)
+	}
+	seedRow(t, c, sk("a", "/future"), evictNow+evictDay)
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 2}, g)
+	if err != nil || res.Outcome != SuiteRejectedGlobal || res.Evicted != nil {
+		t.Fatalf("CreateSuite = %+v, %v; want global_cap, nothing evicted", res, err)
+	}
+	if want := fmt.Sprintf("last_requested_at a/future %d %d", evictDay, evictNow); !slices.Equal(g.reports, []string{want}) {
+		t.Fatalf("reports = %q, want [%q]", g.reports, want)
+	}
+	if !rowExists(t, c, sk("a", "/future")) {
+		t.Fatal("a suite requested in the future was evicted")
+	}
+}
+
+// Design review M3: after a failed submit (no result), afterCreate decides
+// by reading the held candidate's row: absent — this creation's eviction
+// committed after all — releases it as deleted; present releases it as
+// kept. A result that names the eviction needs no read.
+func TestAfterCreate_ReadsTheCandidatesRowUnlessTheResultSays(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	seedRow(t, c, sk("b", "/kept"), evictNow-3*evictDay)
+	var got []bool
+	held := func(k SuiteKey) *heldSuite {
+		return &heldSuite{key: k, release: func(deleted bool) { got = append(got, deleted) }}
+	}
+	c.afterCreate(CreateResult{}, held(sk("b", "/kept")))
+	c.afterCreate(CreateResult{}, held(sk("b", "/gone")))
+	kept := sk("b", "/kept")
+	c.afterCreate(CreateResult{Outcome: SuiteCreated, Evicted: &kept}, held(kept))
+	if !slices.Equal(got, []bool{false, true, true}) {
+		t.Fatalf("released %v; want [false true true] (present: kept; absent: deleted; evicted: deleted)", got)
+	}
+}
+
+// SuiteCapUsage reports the table against the caps (ruling PD-8's startup
+// WARN): the total, the hosts at or above the per-host cap — across
+// schemes — and the fullest host.
+func TestSuiteCapUsage(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	if u, err := c.SuiteCapUsage(ctx, 2); err != nil || u != (SuiteCapUsage{}) {
+		t.Fatalf("empty table: %+v, %v", u, err)
+	}
+	for _, k := range []SuiteKey{sk("a", "/1"), {CanonicalScheme: "https", CanonicalHost: "a", SuitePath: "/2"}, sk("a", "/3"),
+		sk("b", "/1"), sk("b", "/2"), sk("c", "/1")} {
+		seedRow(t, c, k, evictNow)
+	}
+	u, err := c.SuiteCapUsage(ctx, 2)
+	if err != nil || u != (SuiteCapUsage{Total: 6, HostsAtCap: 2, FullestHost: "a", FullestHostRows: 3}) {
+		t.Fatalf("usage = %+v, %v; want 6 rows, 2 hosts at the cap, a fullest with 3", u, err)
+	}
+	if u, err := c.SuiteCapUsage(ctx, 0); err != nil || u.HostsAtCap != 0 || u.Total != 6 {
+		t.Fatalf("no per-host cap: %+v, %v", u, err)
 	}
 }
 
@@ -2285,36 +3127,38 @@ func TestDeleteSuiteTx_IsACompareAndDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	del := func(k SuiteKey, want *int64, cutoff int64) bool {
+	del := func(k SuiteKey, want *int64, cutoff int64) deleteOutcome {
 		t.Helper()
-		var deleted bool
+		var out deleteOutcome
 		if err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 			tx, err := conn.BeginTx(ctx, nil)
 			if err != nil {
 				return err
 			}
 			defer func() { _ = tx.Rollback() }()
-			if deleted, err = deleteSuiteTx(ctx, tx, k, want, cutoff, evictNow); err != nil {
+			if out, err = deleteSuiteTx(ctx, tx, k, want, cutoff, evictNow); err != nil {
 				return err
 			}
 			return tx.Commit()
 		}); err != nil {
 			t.Fatal(err)
 		}
-		return deleted
+		return out
 	}
 	other := id + 1
-	for name, ok := range map[string]bool{
+	for name, out := range map[string]deleteOutcome{
 		"no current snapshot expected": del(key, nil, evictNow-evictDay),
 		"another current snapshot":     del(key, &other, evictNow-evictDay),
 		"requested after the cutoff":   del(key, &id, evictNow-3*evictDay),
-		"no such row":                  del(sk("h", "/nope"), nil, evictNow),
 	} {
-		if ok {
-			t.Fatalf("%s: deleted", name)
+		if out != suiteKept {
+			t.Fatalf("%s: outcome %d, want kept", name, out)
 		}
 	}
-	if !del(key, &id, evictNow-evictDay) {
+	if out := del(sk("h", "/nope"), nil, evictNow); out != suiteNoRow {
+		t.Fatalf("no such row: outcome %d, want suiteNoRow", out)
+	}
+	if del(key, &id, evictNow-evictDay) != suiteDeleted {
 		t.Fatal("a qualifying row was not deleted")
 	}
 	if rowExists(t, c, key) {
@@ -2329,8 +3173,23 @@ func TestDeleteSuiteTx_IsACompareAndDelete(t *testing.T) {
 	// A stamp in the future never qualifies, whatever the cutoff.
 	future := sk("h", "/future")
 	seedRow(t, c, future, evictNow+evictDay)
-	if del(future, nil, evictNow) {
+	if del(future, nil, evictNow) == suiteDeleted {
 		t.Fatal("a row requested in the future was deleted")
+	}
+	// The cutoff is inclusive (spec C3: idle >= 24 h), and a row without an
+	// interest stamp never qualifies.
+	exact := sk("h", "/exact")
+	seedRow(t, c, exact, evictNow-evictDay)
+	if del(exact, nil, evictNow-evictDay) != suiteDeleted {
+		t.Fatal("a suite idle exactly 24 h was not deleted")
+	}
+	null := sk("h", "/null")
+	seedRow(t, c, null, evictNow-evictDay)
+	if _, err := c.db.Exec(`UPDATE suite_freshness SET last_requested_at = NULL WHERE suite_path = '/null'`); err != nil {
+		t.Fatal(err)
+	}
+	if del(null, nil, evictNow) != suiteKept {
+		t.Fatal("a suite without an interest stamp was deleted")
 	}
 }
 
@@ -2380,10 +3239,35 @@ func TestCreateSuite_ConcurrentCreationsNeverExceedTheCaps(t *testing.T) {
 }
 ```
 
+Three expectations of the draft's tests changed, on purpose: `TestCreateSuite_NeverEvictsAboveTheCap` becomes `TestCreateSuite_AboveTheCapEvictsOneAndRefuses` — ruling PD-8 reverses "nothing is evicted above the cap", so the expected `Evicted == nil` and the release as not deleted become f/idle3 evicted and released as deleted (the refusal stays), and a second attempt at the cap now succeeds; `TestDeleteSuiteTx_IsACompareAndDelete`'s "no such row" expects `suiteNoRow` rather than plain "not deleted" (design review M4).
+
+Append to `internal/cache/suite_rows_test.go`:
+
+```go
+// SuiteExists is the handler's cheap tracked-suite test.
+func TestSuiteExists(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	key := SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: afSuite}
+	if ok, err := c.SuiteExists(ctx, key); err != nil || ok {
+		t.Fatalf("before creation: %v, %v", ok, err)
+	}
+	if _, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: key, RequestedAt: 1}, SuiteCaps{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := c.SuiteExists(ctx, key); err != nil || !ok {
+		t.Fatalf("after creation: %v, %v", ok, err)
+	}
+	if ok, err := c.SuiteExists(ctx, SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: afSuite}); err != nil || ok {
+		t.Fatalf("another scheme: %v, %v", ok, err)
+	}
+}
+```
+
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test ./internal/cache/ -run 'TestCreateSuite_|TestDeleteSuiteTx_'`
-Expected: build failure `undefined: deleteSuiteTx`.
+Run: `go test ./internal/cache/ -run 'TestCreateSuite_|TestDeleteSuiteTx_|TestAfterCreate_|TestSuiteCapUsage|TestSuiteExists'`
+Expected: build failure naming `undefined: deleteSuiteTx` (and `deleteOutcome`, `heldSuite`, `ClockStepReporter`, `futureStampSlack`, `SuiteCapUsage`, `SuiteExists`).
 
 - [ ] **Step 3: Implement eviction in `internal/cache/suite_rows.go`**
 
@@ -2396,12 +3280,47 @@ Add `"time"` to the imports and, after them:
 const (
 	suiteEvictIdle       = 24 * time.Hour
 	suiteEvictCandidates = 8
+	// suiteRowGoneTimeout bounds afterCreate's read of a held candidate's
+	// row after a failed submit.
+	suiteRowGoneTimeout = 5 * time.Second
+	// futureStampSlack is how far ahead of now a last_requested_at must be
+	// to count as a backward clock step (stamps are whole seconds; the
+	// checker's clockStepTolerance).
+	futureStampSlack = 2
 )
+```
+
+`CreateResult` becomes (the new field is unexported: only this package retries on it):
+
+```go
+// CreateResult reports a creation and the suite evicted to make room.
+type CreateResult struct {
+	Outcome CreateOutcome
+	Evicted *SuiteKey
+	// Unproven: a row listed in SuiteSeed.Cached changed or appeared
+	// between the caller's read and the creating transaction, so its blob
+	// was never sniffed; the caller marks it after the commit (the
+	// handler's markCachedSignedAnchors backstop).
+	Unproven bool
+	// heldGone: the held eviction candidate had no row when the writer ran
+	// (a concurrent creation had evicted it); CreateSuite and StoreFetched
+	// then try once more with a fresh candidate list.
+	heldGone bool
+}
 ```
 
 After the `SuiteGuard` interface:
 
 ```go
+// ClockStepReporter is an optional SuiteGuard capability
+// (*freshness.Checker has it): cap eviction reports a suite whose
+// last_requested_at lies in the future — a backward wall-clock step, which
+// deleteSuiteTx treats as not idle — through spec C4's rate-limited
+// clock_step_detected (ruling PD-11).
+type ClockStepReporter interface {
+	ReportClockStep(stamp string, key SuiteKey, stored, now int64)
+}
+
 // heldSuite is an eviction candidate whose in-memory mutex the caller
 // holds (through a SuiteGuard) while the writer operation runs.
 type heldSuite struct {
@@ -2410,7 +3329,7 @@ type heldSuite struct {
 }
 ```
 
-Replace `CreateSuite` (doc included) with the following, and add `afterCreate` after it:
+Replace `CreateSuite` (doc included) with the following four functions and add the two eviction helpers after them:
 
 ```go
 // CreateSuite is spec C3's single creation choke point, for a suite the
@@ -2419,16 +3338,32 @@ Replace `CreateSuite` (doc included) with the following, and add `afterCreate` a
 // refuses at the per-host cap; at the global cap it first evicts the
 // least-recently-requested suite that has no current snapshot, has been
 // idle for suiteEvictIdle and whose mutex guard takes without waiting (a
-// nil guard takes none: no in-memory state exists to protect). Count,
-// eviction and insert run in one writer transaction, so concurrent
-// creations never exceed a cap. With seed.SignedSeenAt set, a created
-// row's base is marked signed-seen in the same transaction.
+// nil guard holds no mutex — no in-memory state exists to protect — and
+// the candidate is still evicted); above the global cap it evicts one such
+// suite and still refuses (ruling PD-8). Count, eviction and insert run in
+// one writer transaction, so concurrent creations never exceed a cap. A
+// created row's base is marked signed-seen in the same transaction for
+// seed.SignedSeenAt and for every sniff-passing anchor in seed.Cached
+// whose row still holds the sniffed blob (ruling PD-5).
 //
 // AIDEV-NOTE: the evictee's metadata url_path rows are left to url_path
 // GC: a request never pays for a batched delete (phase F's reaper does
 // that work, off the request path). The guard is taken before the writer
 // operation is submitted — the writer goroutine never runs foreign code.
 func (c *Cache) CreateSuite(ctx context.Context, seed SuiteSeed, caps SuiteCaps, guard SuiteGuard) (CreateResult, error) {
+	res, err := c.createSuiteOnce(ctx, seed, caps, guard)
+	if err == nil && res.heldGone {
+		// The held candidate's row was deleted between the candidate list
+		// and the writer (a concurrent creation evicted it): one more
+		// attempt, with a fresh list (design review M4).
+		res, err = c.createSuiteOnce(ctx, seed, caps, guard)
+	}
+	return res, err
+}
+
+// createSuiteOnce is one CreateSuite attempt: hold a candidate, run the
+// writer operation, release the candidate.
+func (c *Cache) createSuiteOnce(ctx context.Context, seed SuiteSeed, caps SuiteCaps, guard SuiteGuard) (CreateResult, error) {
 	held, err := c.holdEvictionCandidate(ctx, caps, guard)
 	if err != nil {
 		return CreateResult{}, err
@@ -2460,38 +3395,169 @@ func (c *Cache) CreateSuite(ctx context.Context, seed SuiteSeed, caps SuiteCaps,
 	return got, nil
 }
 
-// afterCreate releases the held eviction candidate, telling the guard
-// whether its row was deleted.
+// afterCreate releases the held eviction candidate after the writer
+// operation, telling the guard whether its row is gone — deleted by this
+// creation's eviction, or found absent — so that release(true) drops the
+// suite's in-memory state exactly when the suite has no row. Unless the
+// result says so, it reads the row: after a failed submit the outcome is
+// unknown, and an unused candidate's row may have been evicted by a
+// concurrent creation before this one held it (the hold then made a fresh
+// lock-map entry for a suite without a row).
 //
-// AIDEV-NOTE: after a failed submit (cancelled context, closing cache)
-// the outcome is unknown and the candidate is released as not deleted. A
-// queued operation may still commit its eviction later: the evictee's
-// lock-map and flip-gate entries then stay (one each, bounded), and a
-// check that started meanwhile meets a vanished row, which I-4's
+// AIDEV-NOTE: while this creation holds the candidate's mutex no other
+// deleter can remove its row (every deleter holds the guard), and the one
+// way a failed submit still commits is a commit that raced the context's
+// end in submitWrite (an operation run on an ended context rolls back), so
+// the read decides (design review M3, M4). A read error, or a read that
+// lands before a commit still in flight, answers "present": the evictee's
+// lock-map, flip-gate and touch entries then stay (one each, bounded), and
+// a check that starts meanwhile meets a vanished row, which I-4's
 // re-validation and the UPDATE-only writers make harmless (its candidate,
 // if any, was retired: CommitAdoption refuses it).
 func (c *Cache) afterCreate(res CreateResult, held *heldSuite) {
-	if held != nil {
-		held.release(res.Evicted != nil)
+	if held == nil {
+		return
 	}
+	held.release(res.Evicted != nil || res.heldGone || c.suiteRowGone(held.key))
 }
-```
 
-Add `holdEvictionCandidate`. It counts rows outside the writer (`SELECT COUNT(*) FROM suite_freshness`; below `caps.Global`, or `caps.Global <= 0`, it returns nil), lists at most `suiteEvictCandidates` candidates with
+// suiteRowGone reports whether key's row is absent, read under a fresh
+// context (after a failed submit the caller's may have ended). A read
+// error answers false.
+func (c *Cache) suiteRowGone(key SuiteKey) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), suiteRowGoneTimeout)
+	defer cancel()
+	exists, err := c.SuiteExists(ctx, key)
+	return err == nil && !exists
+}
 
-```sql
+// holdEvictionCandidate returns a held eviction candidate when the table is
+// at, above or within suiteEvictCandidates of the global cap (a read
+// outside the writer; createSuiteTx re-checks everything, and afterCreate
+// releases an unused candidate as not deleted), or nil: the least recently
+// requested of at most suiteEvictCandidates evictable suites whose mutex
+// guard takes at once (a nil guard takes the first, with a no-op release).
+// A guard that is a ClockStepReporter is told of a suite whose
+// last_requested_at lies in the future.
+//
+// AIDEV-NOTE: holding a candidate from caps.Global-suiteEvictCandidates on
+// (design review M5) keeps creations that race at the cap boundary — each
+// saw room outside the writer — from being refused, and cached for 10
+// minutes, while idle suites could make room: TryLock keeps their
+// candidates distinct, so each one that runs after the table filled
+// evicts its own.
+func (c *Cache) holdEvictionCandidate(ctx context.Context, caps SuiteCaps, guard SuiteGuard) (*heldSuite, error) {
+	if caps.Global <= 0 {
+		return nil, nil
+	}
+	var n int
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM suite_freshness`).Scan(&n); err != nil {
+		return nil, fmt.Errorf("CreateSuite: count suites: %w", err)
+	}
+	if n < caps.Global-suiteEvictCandidates {
+		return nil, nil
+	}
+	now := nowUnix()
+	if r, ok := guard.(ClockStepReporter); ok {
+		c.reportFutureInterest(ctx, r, now)
+	}
+	cutoff := now - int64(suiteEvictIdle/time.Second)
+	rows, err := c.db.QueryContext(ctx, `
 SELECT canonical_scheme, canonical_host, suite_path
   FROM suite_freshness
  WHERE current_snapshot_id IS NULL AND last_requested_at <= ?
  ORDER BY last_requested_at, canonical_scheme, canonical_host, suite_path
- LIMIT ?
+ LIMIT ?`, cutoff, suiteEvictCandidates)
+	if err != nil {
+		return nil, fmt.Errorf("CreateSuite: list eviction candidates: %w", err)
+	}
+	var cands []SuiteKey
+	for rows.Next() {
+		var k SuiteKey
+		if err := rows.Scan(&k.CanonicalScheme, &k.CanonicalHost, &k.SuitePath); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("CreateSuite: scan eviction candidate: %w", err)
+		}
+		cands = append(cands, k)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("CreateSuite: list eviction candidates: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("CreateSuite: list eviction candidates: %w", err)
+	}
+	for _, k := range cands {
+		if guard == nil {
+			return &heldSuite{key: k, release: func(bool) {}}, nil
+		}
+		if release, ok := guard.HoldSuite(k); ok {
+			return &heldSuite{key: k, release: release}, nil
+		}
+	}
+	return nil, nil
+}
+
+// reportFutureInterest tells r of the suite without a current snapshot
+// whose last_requested_at lies furthest in the future, if any lies more
+// than futureStampSlack ahead: cap eviction treats it as not idle, and
+// spec C4 asks every gate that meets a future past-event stamp to say so
+// (r rate-limits the WARN). A read error reports nothing.
+func (c *Cache) reportFutureInterest(ctx context.Context, r ClockStepReporter, now int64) {
+	var k SuiteKey
+	var stored int64
+	if err := c.db.QueryRowContext(ctx, `
+SELECT canonical_scheme, canonical_host, suite_path, last_requested_at
+  FROM suite_freshness
+ WHERE current_snapshot_id IS NULL AND last_requested_at > ?
+ ORDER BY last_requested_at DESC
+ LIMIT 1`, now+futureStampSlack).Scan(&k.CanonicalScheme, &k.CanonicalHost, &k.SuitePath, &stored); err == nil {
+		r.ReportClockStep("last_requested_at", k, stored, now)
+	}
+}
 ```
 
-(cutoff `nowUnix() - int64(suiteEvictIdle/time.Second)`), and returns the first one `guard.HoldSuite` takes (a nil guard takes the first with a no-op release); none taken → nil. Errors are wrapped `CreateSuite: count suites: %w`, `CreateSuite: list eviction candidates: %w`, `CreateSuite: scan eviction candidate: %w` (check `rows.Close()` and `rows.Err()`). Doc: "holdEvictionCandidate returns a held eviction candidate when the global cap looks reached (a read outside the writer; createSuiteTx re-checks everything), or nil: the least recently requested of at most suiteEvictCandidates evictable suites whose mutex guard takes at once."
-
-`createSuiteTx` takes `held *heldSuite, now int64` after `caps`; its doc's first sentence becomes "createSuiteTx inserts seed's row unless it exists, enforcing caps inside the caller's writer transaction; at exactly the global cap it first evicts held (deleteSuiteTx), refusing when held is nil or no longer qualifies." (the rest, with the AIDEV-NOTE, unchanged). Its global-cap block becomes
+Replace `createSuiteTx` (doc included; `markCreated` is unchanged) with:
 
 ```go
+// createSuiteTx inserts seed's row unless it exists, enforcing caps inside
+// the caller's writer transaction, and marks a created row's base
+// signed-seen for the signed metadata its creation knows of (markCreated).
+// At or above the global cap it first evicts held (deleteSuiteTx), and
+// refuses when held is nil or no longer qualifies — or, above the cap,
+// after the eviction (ruling PD-8). It holds the only INSERT INTO
+// suite_freshness in production code (spec C3).
+//
+// AIDEV-NOTE: keep this the single INSERT site
+// (TestSuiteFreshnessHasOneInsertSite). Everything else that writes
+// suite_freshness is UPDATE-only, so no writer can resurrect a row that
+// eviction (or phase F's reaper) deleted.
+func createSuiteTx(ctx context.Context, tx *sql.Tx, seed SuiteSeed, caps SuiteCaps, held *heldSuite, now int64) (CreateResult, error) {
+	var one int
+	err := tx.QueryRowContext(ctx, `
+SELECT 1 FROM suite_freshness
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+		seed.CanonicalScheme, seed.CanonicalHost, seed.SuitePath).Scan(&one)
+	switch {
+	case err == nil:
+		return CreateResult{Outcome: SuiteExists}, nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return CreateResult{}, fmt.Errorf("CreateSuite: read row: %w", err)
+	}
+	// AIDEV-NOTE: the per-host refusal must precede the global block,
+	// which may evict: a refusal after an eviction commits the eviction
+	// (TestCreateSuite_HostCapRefusalEvictsNothing). The global block's own
+	// "evict, then refuse" above the cap is deliberate and reported in
+	// CreateResult.Evicted, so the evictee's in-memory state is purged.
+	if caps.PerHost > 0 {
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM suite_freshness WHERE canonical_host = ?`,
+			seed.CanonicalHost).Scan(&n); err != nil {
+			return CreateResult{}, fmt.Errorf("CreateSuite: count host suites: %w", err)
+		}
+		if n >= caps.PerHost {
+			return CreateResult{Outcome: SuiteRejectedHost}, nil
+		}
+	}
 	var res CreateResult
 	if caps.Global > 0 {
 		var n int
@@ -2499,43 +3565,78 @@ SELECT canonical_scheme, canonical_host, suite_path
 			return CreateResult{}, fmt.Errorf("CreateSuite: count suites: %w", err)
 		}
 		if n >= caps.Global {
-			// One eviction makes room only at the cap itself; above it
-			// (rows created before the cap was lowered) nothing is evicted
-			// and phase F's reaper shrinks the table.
-			if held == nil || n > caps.Global {
+			if held == nil {
 				return CreateResult{Outcome: SuiteRejectedGlobal}, nil
 			}
-			deleted, err := deleteSuiteTx(ctx, tx, held.key, nil, now-int64(suiteEvictIdle/time.Second), now)
+			out, err := deleteSuiteTx(ctx, tx, held.key, nil, now-int64(suiteEvictIdle/time.Second), now)
 			if err != nil {
 				return CreateResult{}, err
 			}
-			if !deleted {
-				return CreateResult{Outcome: SuiteRejectedGlobal}, nil
+			if out != suiteDeleted {
+				return CreateResult{Outcome: SuiteRejectedGlobal, heldGone: out == suiteNoRow}, nil
 			}
 			evicted := held.key
 			res.Evicted = &evicted
+			if n-1 >= caps.Global {
+				// Above the cap (a lowered max_suites, or an upgraded v6
+				// table): the eviction does not make room, but each attempt
+				// still evicts one, so the table converges under the 24 h
+				// rule instead of waiting for phase F's 30-day reaper.
+				res.Outcome = SuiteRejectedGlobal
+				return res, nil
+			}
 		}
 	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO suite_freshness
+  (canonical_scheme, canonical_host, suite_path,
+   last_check_at, last_success_at, inrelease_etag, inrelease_lastmod, last_requested_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		seed.CanonicalScheme, seed.CanonicalHost, seed.SuitePath,
+		seed.LastCheckAt, seed.LastSuccessAt, seed.InReleaseETag, seed.InReleaseLastMod, seed.RequestedAt); err != nil {
+		return CreateResult{}, fmt.Errorf("CreateSuite: insert: %w", err)
+	}
+	unproven, err := markCreated(ctx, tx, seed)
+	if err != nil {
+		return CreateResult{}, err
+	}
+	res.Outcome, res.Unproven = SuiteCreated, unproven
+	return res, nil
+}
 ```
 
-and its end `res.Outcome = SuiteCreated` / `return res, nil`. Add, after `createSuiteTx`:
+Add, before `UpdateSuiteFreshness` (`SuiteExists` is new here; Task 6 no longer adds it):
 
 ```go
+// deleteOutcome is what deleteSuiteTx did.
+type deleteOutcome int
+
+const (
+	// suiteKept: the row no longer qualifies; nothing was written.
+	suiteKept deleteOutcome = iota
+	// suiteDeleted: the row was deleted.
+	suiteDeleted
+	// suiteNoRow: there was no row.
+	suiteNoRow
+)
+
 // deleteSuiteTx is the single suite-row delete (spec C3 cap eviction; phase
 // F's ReapIdleSuite reuses it), run inside the caller's writer
 // transaction as a compare-and-delete: it re-reads the row and deletes it
 // only if the row still qualifies — last_requested_at at or before cutoff
-// (a stamp in the future, after a backward clock step, never qualifies)
-// and current_snapshot_id equal to wantCurrent (nil: no current
-// snapshot). It releases the current snapshot's pins (the Step-8
-// decrement), retires every snapshot of the suite, and deletes the row.
-// It reports whether it deleted.
+// (a stamp in the future, after a backward clock step, never qualifies;
+// nor does a NULL one) and current_snapshot_id equal to wantCurrent (nil:
+// no current snapshot). It releases the current snapshot's pins (the
+// Step-8 decrement), retires every snapshot of the suite, and deletes the
+// row.
 //
 // AIDEV-NOTE: retiring the snapshots is load-bearing: CommitAdoption
 // refuses a retired candidate, and retired rows leave the natural-key,
 // rollback and retained-by-hash lookups, so a returning suite re-adopts
-// unchanged content at once (spec C9).
-func deleteSuiteTx(ctx context.Context, tx *sql.Tx, key SuiteKey, wantCurrent *int64, cutoff, now int64) (bool, error) {
+// unchanged content at once (spec C9). Every statement is keyed by the
+// full (scheme, host, suite_path): a same-path suite of another host is
+// never touched (TestCreateSuite_EvictionTouchesOnlyTheEvictee).
+func deleteSuiteTx(ctx context.Context, tx *sql.Tx, key SuiteKey, wantCurrent *int64, cutoff, now int64) (deleteOutcome, error) {
 	var current, requested sql.NullInt64
 	err := tx.QueryRowContext(ctx, `
 SELECT current_snapshot_id, last_requested_at FROM suite_freshness
@@ -2543,34 +3644,102 @@ SELECT current_snapshot_id, last_requested_at FROM suite_freshness
 		key.CanonicalScheme, key.CanonicalHost, key.SuitePath).Scan(&current, &requested)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
+		return suiteNoRow, nil
 	case err != nil:
-		return false, fmt.Errorf("delete suite %s%s: read row: %w", key.CanonicalHost, key.SuitePath, err)
+		return suiteKept, fmt.Errorf("delete suite %s%s: read row: %w", key.CanonicalHost, key.SuitePath, err)
 	}
 	if !requested.Valid || requested.Int64 > cutoff {
-		return false, nil
+		return suiteKept, nil
 	}
 	if current.Valid != (wantCurrent != nil) || (current.Valid && current.Int64 != *wantCurrent) {
-		return false, nil
+		return suiteKept, nil
 	}
 	if current.Valid {
 		if err := decrementSnapshotRefcountsTx(ctx, tx, current.Int64, now); err != nil {
-			return false, fmt.Errorf("delete suite %s%s: %w", key.CanonicalHost, key.SuitePath, err)
+			return suiteKept, fmt.Errorf("delete suite %s%s: %w", key.CanonicalHost, key.SuitePath, err)
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `
 UPDATE suite_snapshot SET retired_at = ?
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ? AND retired_at IS NULL`,
 		now, key.CanonicalScheme, key.CanonicalHost, key.SuitePath); err != nil {
-		return false, fmt.Errorf("delete suite %s%s: retire snapshots: %w", key.CanonicalHost, key.SuitePath, err)
+		return suiteKept, fmt.Errorf("delete suite %s%s: retire snapshots: %w", key.CanonicalHost, key.SuitePath, err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM suite_freshness
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
 		key.CanonicalScheme, key.CanonicalHost, key.SuitePath); err != nil {
-		return false, fmt.Errorf("delete suite %s%s: %w", key.CanonicalHost, key.SuitePath, err)
+		return suiteKept, fmt.Errorf("delete suite %s%s: %w", key.CanonicalHost, key.SuitePath, err)
+	}
+	return suiteDeleted, nil
+}
+
+// SuiteExists reports whether the suite has a suite_freshness row: the
+// handler's cheap tracked-suite test (one indexed read; the flip barrier
+// registers only tracked suites' anchor serves) and afterCreate's decider.
+func (c *Cache) SuiteExists(ctx context.Context, key SuiteKey) (bool, error) {
+	var one int
+	err := c.db.QueryRowContext(ctx, `
+SELECT 1 FROM suite_freshness
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+		key.CanonicalScheme, key.CanonicalHost, key.SuitePath).Scan(&one)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("SuiteExists: %w", err)
 	}
 	return true, nil
+}
+
+// SuiteCapUsage is the suite table measured against the caps (ruling
+// PD-8's startup WARN suite_caps_exceeded).
+type SuiteCapUsage struct {
+	// Total is the number of suite rows.
+	Total int
+	// HostsAtCap is the number of canonical hosts with at least the
+	// per-host cap's rows.
+	HostsAtCap int
+	// FullestHost has the most rows (ties: the first by name); "" when
+	// there are none.
+	FullestHost     string
+	FullestHostRows int
+}
+
+// SuiteCapUsage counts suite rows in all and per canonical host (across
+// schemes, as the per-host cap counts); perHost <= 0 counts no host as
+// at its cap.
+func (c *Cache) SuiteCapUsage(ctx context.Context, perHost int) (SuiteCapUsage, error) {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT canonical_host, COUNT(*) AS n FROM suite_freshness
+ GROUP BY canonical_host
+ ORDER BY n DESC, canonical_host`)
+	if err != nil {
+		return SuiteCapUsage{}, fmt.Errorf("SuiteCapUsage: %w", err)
+	}
+	var u SuiteCapUsage
+	for rows.Next() {
+		var host string
+		var n int
+		if err := rows.Scan(&host, &n); err != nil {
+			_ = rows.Close()
+			return SuiteCapUsage{}, fmt.Errorf("SuiteCapUsage: scan: %w", err)
+		}
+		u.Total += n
+		if u.FullestHost == "" {
+			u.FullestHost, u.FullestHostRows = host, n
+		}
+		if perHost > 0 && n >= perHost {
+			u.HostsAtCap++
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return SuiteCapUsage{}, fmt.Errorf("SuiteCapUsage: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return SuiteCapUsage{}, fmt.Errorf("SuiteCapUsage: %w", err)
+	}
+	return u, nil
 }
 ```
 
@@ -2583,14 +3752,14 @@ Expected: PASS (Task 4's `TestCreateSuite_EnforcesTheCaps` creates freshly reque
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each: (a) `ORDER BY last_requested_at DESC, …` → `TestCreateSuite_EvictsTheIdlestSuiteAtTheGlobalCap` FAILS (`evicting &{http c /idle2}`); (b) drop `current_snapshot_id IS NULL AND` from the candidate query → the same test FAILS (`global_cap`: the adopted suite is chosen, and `deleteSuiteTx` refuses it); (c) `if held == nil {` (evict above the cap) → `TestCreateSuite_NeverEvictsAboveTheCap` FAILS; (d) drop `|| requested.Int64 > cutoff` → `TestCreateSuite_EvictionRechecksInTheWriter` and `TestDeleteSuiteTx_IsACompareAndDelete` FAIL; (e) make the retire `UPDATE` match nothing (`AND 0`) → `TestCreateSuite_EvictsTheIdlestSuiteAtTheGlobalCap` FAILS (`want retired`); (f) `held.release(true)` always → `TestCreateSuite_NeverEvictsAboveTheCap` FAILS (`released map[{http f /idle3}:[true]]`); (g) take a busy candidate anyway → `TestCreateSuite_EvictionSkipsBusySuites` FAILS; (h) skip `decrementSnapshotRefcountsTx` → `TestDeleteSuiteTx_IsACompareAndDelete` FAILS (`RefCount:1`); (i) ignore `wantCurrent` → the same test FAILS (`no current snapshot expected: deleted`).
+One at a time, reverting each: (a) `ORDER BY last_requested_at DESC, …` → `TestCreateSuite_EvictsTheIdlestSuiteAtTheGlobalCap` FAILS (`CreateSuite = {…} (evicted &{http c /idle2}), <nil>; want created, evicting b/idle`); (b) drop `current_snapshot_id IS NULL AND` from the candidate query → the same test FAILS (`global_cap`: the adopted suite is chosen, and `deleteSuiteTx` refuses it); (c) never evict above the cap (`if held == nil || n > caps.Global {`) → `TestCreateSuite_AboveTheCapEvictsOneAndRefuses` FAILS (`want global_cap, evicting f/idle3`); (d) drop `|| requested.Int64 > cutoff` → `TestCreateSuite_EvictionRechecksInTheWriter` and `TestDeleteSuiteTx_IsACompareAndDelete` FAIL (`requested after the cutoff: outcome 1, want kept`); (e) make the retire `UPDATE` match nothing (`AND 0`) → `TestCreateSuite_EvictsTheIdlestSuiteAtTheGlobalCap` FAILS (`want retired`); (f) `held.release(true)` always → `TestCreateSuite_EvictionRechecksInTheWriter` (`want b/idle kept`), `TestCreateSuite_HoldsACandidateNearTheCap` and `TestAfterCreate_ReadsTheCandidatesRowUnlessTheResultSays` FAIL; (g) take a busy candidate anyway → `TestCreateSuite_EvictionSkipsBusySuites` FAILS; (h) skip `decrementSnapshotRefcountsTx` → `TestDeleteSuiteTx_IsACompareAndDelete` FAILS (`RefCount:1`); (i) ignore `wantCurrent` → the same test FAILS (`no current snapshot expected: outcome 1, want kept`); (j) create after an above-cap eviction (`if n-1 >= caps.Global && false {`) → `TestCreateSuite_AboveTheCapEvictsOneAndRefuses` FAILS (`Outcome:created`); (k) move the per-host block after the global block → `TestCreateSuite_HostCapRefusalEvictsNothing` FAILS (`a host-cap refusal evicted a suite`); (l) `requested.Int64 >= cutoff` → `TestDeleteSuiteTx_IsACompareAndDelete` FAILS (`a suite idle exactly 24 h was not deleted`); (m) let a NULL stamp qualify (`if requested.Valid && requested.Int64 > cutoff {`) → the same test FAILS (`a suite without an interest stamp was deleted`); (n) the retire `UPDATE` without `canonical_host = ?` (`(canonical_host = ? OR 1)`) → `TestCreateSuite_EvictionTouchesOnlyTheEvictee` FAILS (`the eviction retired another host's snapshot`); (o) the `DELETE` likewise → the same test FAILS (`the eviction deleted a same-path suite on another host`); (p) no retry (`res.heldGone && false`) → `TestCreateSuite_RetriesOnceWhenTheCandidateVanished` FAILS (`{Outcome:global_cap … heldGone:true}`); (q) `deleteSuiteTx` reports a missing row as kept → that test and `TestDeleteSuiteTx_IsACompareAndDelete` FAIL (`no such row: outcome 0, want suiteNoRow`); (r) `afterCreate` never reads (`held.release(res.Evicted != nil || res.heldGone)`) → `TestAfterCreate_ReadsTheCandidatesRowUnlessTheResultSays` FAILS (`released [false false true]`) and the retry test's unused-vanished case FAILS; (s) hold only at the cap (`if n < caps.Global {`) → `TestCreateSuite_HoldsACandidateNearTheCap` FAILS (`asked [], …`); (t) never report a future stamp → `TestCreateSuite_ReportsAFutureInterestStamp` FAILS (`reports = [], want ["last_requested_at a/future 86400 1800000000"]`); (u) report within the slack (`now` instead of `now+futureStampSlack`) → the same test FAILS (`… a/slack 2 1800000000"] for a stamp within the slack, want none`); (v) `SuiteCapUsage` counts hosts strictly above the cap → `TestSuiteCapUsage` FAILS (`HostsAtCap:1`).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-gofmt -l internal/cache/suite_rows.go internal/cache/suite_evict_test.go internal/cache/testing_helpers.go
+gofmt -l internal/cache/suite_rows.go internal/cache/suite_evict_test.go internal/cache/suite_rows_test.go internal/cache/testing_helpers.go
 golangci-lint run ./internal/cache/...
-git add internal/cache/suite_rows.go internal/cache/suite_evict_test.go internal/cache/testing_helpers.go
+git add internal/cache/suite_rows.go internal/cache/suite_evict_test.go internal/cache/suite_rows_test.go internal/cache/testing_helpers.go
 git commit -m "Evict the idlest suite without a current snapshot at the global suite cap"
 ```
 
@@ -2598,20 +3767,19 @@ git commit -m "Evict the idlest suite without a current snapshot at the global s
 
 ### Task 6: The miss path's writer operation, client-interest touches and the FIFO guarantee (cache)
 
-Spec C3, cache side: the anchor row and the signed-seen marker are created "in the writer operation that stores the `url_path` row, before the body is written" (`StoreFetched`: one transaction — the `url_path` upsert, `createSuiteTx` under the caps with eviction, the marker only for a suite with a row); "a failed operation serves no body" (here: it stores nothing and returns the error; Task 9 answers 502); FIFO ordering (a writer operation enqueued after the marker write sees it — phase E's unsigned `CommitAdoption` re-read); client interest (`TouchSuite`: UPDATE-only, at most one write per suite per hour, the map holds only tracked suites and is purged on eviction); vouched `.deb` serves touch "the suite path `DeclaredHashesForPath` returns" (`DeclaredHash.SuitePath`); and `SuiteExists`, the one-row `EXISTS` read the handler's flip-barrier registration uses (deferred minor C-21's query half, Task 10). Design note 7. Deferred minors A-24 and A-25 (`signed_seen.go`, which this task touches to list the new marker writers in `markSignedSeen`'s AIDEV-NOTE).
+Spec C3, cache side: the anchor row and the signed-seen marker are created "in the writer operation that stores the `url_path` row, before the body is written" (`StoreFetched`: one transaction — the `url_path` upsert, `createSuiteTx` under the caps with eviction, the marker only for a suite with a row); "a failed operation serves no body" (here: it stores nothing and returns the error; Task 9 answers 502); FIFO ordering (a writer operation enqueued after the marker write sees it — phase E's unsigned `CommitAdoption` re-read); client interest (`TouchSuite`: UPDATE-only, at most one write per suite per hour, the map holds only tracked suites and is purged on eviction); vouched `.deb` serves touch "the suite path `DeclaredHashesForPath` returns" (`DeclaredHash.SuitePath`). Ruling PD-6: with no adopter, a refresh miss of a sniff-passing `InRelease` re-stamps the existing row in the same transaction (`FetchedRow.Restamp`, `restampSuiteTx`: today's Phase-1 seed columns, UPDATE-only, only while the row has no current snapshot). Ruling PD-5: `StoreFetched` hands `Create`'s `Cached` anchors to `createSuiteTx`, so a creating miss marks the suite's cached signed anchors in its transaction. Design review M4: `StoreFetched` retries once, like `CreateSuite`, when its held candidate vanished; M9: the touch map's sweep runs at most once a minute unless the map doubled; M11 (ruling PD-11): the touch residual after a forward wall-clock step is documented. Exec review D6 pins the release of a failed operation's candidate. (`SuiteExists`, deferred minor C-21's query half, moved to Task 5.) Design note 7. Deferred minors A-24 and A-25 (`signed_seen.go`, which this task touches to list the new marker writers in `markSignedSeen`'s AIDEV-NOTE).
 
 **Files:**
 - Create: `internal/cache/fetched_row.go`, `internal/cache/fetched_row_test.go`, `internal/cache/suite_touch.go`, `internal/cache/suite_touch_test.go`
-- Modify: `internal/cache/queries.go` (`putURLPathSQL`), `internal/cache/cache.go` (`touches` field), `internal/cache/suite_rows.go` (`afterCreate`, `SuiteExists`), `internal/cache/adoption.go` (`DeclaredHash.SuitePath`), `internal/cache/signed_seen.go` (AIDEV-NOTE; A-25), `internal/cache/suite_rows_test.go`, `internal/cache/signed_seen_test.go` (A-24, A-25)
+- Modify: `internal/cache/queries.go` (`putURLPathSQL`), `internal/cache/cache.go` (`touches` field), `internal/cache/suite_rows.go` (`afterCreate`), `internal/cache/adoption.go` (`DeclaredHash.SuitePath`), `internal/cache/signed_seen.go` (AIDEV-NOTE; A-25), `internal/cache/suite_evict_test.go` (`afterCreate`'s new argument), `internal/cache/signed_seen_test.go` (A-24, A-25)
 
 **Interfaces:**
 - Consumes: Task 5's `holdEvictionCandidate`, `createSuiteTx(…, held, now)`, `afterCreate`, and its test helpers `fakeGuard`, `fourRows`, `seedRow`, `sk`, `rowExists`, `evictNow`; Task 4's `derefI64`; `markSignedSeen`, `submitWrite`, `c.writes` (the writer's FIFO channel).
 - Produces:
-  - `type FetchedRow struct { Row URLPath; Suite SuiteKey; Create *SuiteSeed; MarkSeenAt int64 }`, `type FetchedResult struct { Create CreateResult; Tracked, Marked bool }`, `func (c *Cache) StoreFetched(ctx context.Context, m FetchedRow, caps SuiteCaps, guard SuiteGuard) (FetchedResult, error)` (Task 9's miss path).
+  - `type FetchedRow struct { Row URLPath; Suite SuiteKey; Create *SuiteSeed; MarkSeenAt int64; Restamp *SuiteSeed }`, `type FetchedResult struct { Create CreateResult; Tracked, Marked bool }`, `func (c *Cache) StoreFetched(ctx context.Context, m FetchedRow, caps SuiteCaps, guard SuiteGuard) (FetchedResult, error)` (Task 9's miss path); `storeFetchedOnce`, `restampSuiteTx(ctx, tx, s SuiteSeed) error`.
   - `func (c *Cache) TouchSuite(ctx context.Context, key SuiteKey) error`, `func (c *Cache) TouchedSuites() int` (Tasks 10, 11).
-  - `func (c *Cache) SuiteExists(ctx context.Context, key SuiteKey) (bool, error)` (Task 10).
   - `DeclaredHash.SuitePath string` (Task 10).
-  - `afterCreate(key SuiteKey, res CreateResult, held *heldSuite)`; constants `touchEvery = time.Hour`, `touchSweepAt = 4096`.
+  - `afterCreate(key SuiteKey, res CreateResult, held *heldSuite)`; constants `touchEvery = time.Hour`, `touchSweepAt = 4096`, `touchSweepEvery = time.Minute`.
   - Test helpers `fetchedRow(t, c, key, file) URLPath` (`fetched_row_test.go`), `requestedAt(t, c, key) int64` (`suite_touch_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
@@ -2795,6 +3963,140 @@ func TestStoreFetched_MarkerPrecedesALaterWriterOperation(t *testing.T) {
 		t.Fatal("a writer operation enqueued after StoreFetched did not see its marker")
 	}
 }
+
+// A failed operation releases its held eviction candidate, as not deleted
+// (the checker's suite mutex must not leak), and commits no eviction.
+func TestStoreFetched_AFailedOperationReleasesItsCandidate(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	fourRows(t, c)
+	key := sk("e", "/new")
+	row := fetchedRow(t, c, key, "/InRelease")
+	if _, err := c.db.Exec(`CREATE TRIGGER fail_insert BEFORE INSERT ON suite_freshness
+BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	g := newFakeGuard()
+	if _, err := c.StoreFetched(context.Background(), FetchedRow{Row: row, Suite: key,
+		Create: &SuiteSeed{SuiteKey: key, RequestedAt: evictNow}}, SuiteCaps{Global: 4}, g); err == nil {
+		t.Fatal("premise: the insert fails")
+	}
+	if got := g.released[sk("b", "/idle")]; len(got) != 1 || got[0] {
+		t.Fatalf("released %v; want b/idle released once, as not deleted", g.released)
+	}
+	if !rowExists(t, c, sk("b", "/idle")) {
+		t.Fatal("the failed operation's eviction was committed")
+	}
+}
+
+// Ruling PD-6: with no adopter, a refresh miss of an InRelease re-stamps an
+// existing row without a current snapshot with today's Phase-1 seed
+// columns, UPDATE-only — the miss's stamps and validators, the pending
+// change and the failure streak cleared — and leaves last_requested_at and
+// the failure record alone. A row with a current snapshot, and a suite
+// without a row, are left as they are.
+func TestStoreFetched_RestampsOnlyATrackedUnadoptedRow(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	key := sk("h", afSuite)
+	old, seen, etag := int64(1_700_000_000), int64(1_700_000_100), "old"
+	if err := c.SeedSuiteForTest(ctx, SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: afSuite,
+		LastCheckAt: &old, LastSuccessAt: &old, InReleaseETag: &etag, InReleaseChangeSeenAt: &seen, CheckFailCount: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RecordAdoptionFailure(ctx, "http", "h", afSuite, sampleFailure()); err != nil {
+		t.Fatal(err)
+	}
+	requested := derefI64(getSuite(t, c).LastRequestedAt)
+	stamp, tag := int64(1_800_000_500), `"v2"`
+	seed := &SuiteSeed{SuiteKey: key, LastCheckAt: &stamp, LastSuccessAt: &stamp, InReleaseETag: &tag, RequestedAt: stamp}
+	res, err := c.StoreFetched(ctx, FetchedRow{Row: fetchedRow(t, c, key, "/InRelease"), Suite: key, Create: seed,
+		Restamp: seed, MarkSeenAt: stamp}, SuiteCaps{}, nil)
+	if err != nil || res.Create.Outcome != SuiteExists || !res.Tracked {
+		t.Fatalf("StoreFetched = %+v, %v; want exists, tracked", res, err)
+	}
+	s := getSuite(t, c)
+	if derefI64(s.LastCheckAt) != stamp || derefI64(s.LastSuccessAt) != stamp || derefStr(s.InReleaseETag) != tag ||
+		s.InReleaseLastMod != nil || s.InReleaseChangeSeenAt != nil || s.CheckFailCount != 0 {
+		t.Fatalf("row = %+v; want the miss's stamps and validators, the change and the streak cleared", s)
+	}
+	if derefI64(s.LastRequestedAt) != requested {
+		t.Fatalf("last_requested_at = %d, want %d (a refresh miss is no creation)", derefI64(s.LastRequestedAt), requested)
+	}
+	assertRecord(t, "after the re-stamp", s, sampleFailure())
+	commitCandidate(t, c, SnapshotCandidate{}, "re-stamp snapshot")
+	later := int64(1_800_000_900)
+	adopted := &SuiteSeed{SuiteKey: key, LastCheckAt: &later, LastSuccessAt: &later, RequestedAt: later}
+	if _, err := c.StoreFetched(ctx, FetchedRow{Row: fetchedRow(t, c, key, "/InRelease"), Suite: key, Create: adopted,
+		Restamp: adopted}, SuiteCaps{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := derefI64(getSuite(t, c).LastCheckAt); got != stamp {
+		t.Fatalf("an adopted row was re-stamped: last_check_at = %d, want %d", got, stamp)
+	}
+	none := sk("h", "/r/dists/none")
+	if _, err := c.StoreFetched(ctx, FetchedRow{Row: fetchedRow(t, c, none, "/InRelease"), Suite: none,
+		Restamp: &SuiteSeed{SuiteKey: none, LastCheckAt: &later, LastSuccessAt: &later}}, SuiteCaps{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if rowExists(t, c, none) {
+		t.Fatal("a re-stamp created a row")
+	}
+}
+
+// Ruling PD-5: a miss that creates its suite's row marks, in the same
+// transaction, the suite's cached signed anchors the caller sniffed (here
+// a Release miss with an adopter wired and a cached Release.gpg).
+func TestStoreFetched_CreationMarksCachedSignedAnchors(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	key := sk("h", "/r/dists/d")
+	gpg := fetchedRow(t, c, key, "/Release.gpg")
+	if err := c.PutURLPath(ctx, gpg); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.StoreFetched(ctx, FetchedRow{Row: fetchedRow(t, c, key, "/Release"), Suite: key,
+		Create: &SuiteSeed{SuiteKey: key, RequestedAt: 1_800_000_001, Cached: []CachedAnchor{
+			{Path: gpg.Path, BlobHash: *gpg.BlobHash, Signed: true, SeenAt: 1_800_000_000}}}}, SuiteCaps{}, nil)
+	if err != nil || res.Create.Outcome != SuiteCreated || res.Create.Unproven || res.Marked {
+		t.Fatalf("StoreFetched = %+v, %v; want created, proven, no marker for the Release itself", res, err)
+	}
+	if at, ok, err := c.SignedSeen(ctx, "http", "h", "/r/dists/d"); err != nil || !ok || at != 1_800_000_000 {
+		t.Fatalf("marker = %d %v %v, want the cached Release.gpg's stamp", at, ok, err)
+	}
+}
+
+// Design review M4: like CreateSuite, StoreFetched tries once more when its
+// held candidate was evicted by a concurrent creation before it ran.
+func TestStoreFetched_RetriesOnceWhenTheCandidateVanished(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	fourRows(t, c)
+	g := newFakeGuard()
+	g.onHold = func(k SuiteKey) {
+		if k != sk("b", "/idle") {
+			return
+		}
+		if _, err := c.db.Exec(`DELETE FROM suite_freshness WHERE canonical_host = 'b' AND suite_path = '/idle'`); err != nil {
+			t.Error(err)
+		}
+		seedRow(t, c, sk("r", "/refill"), evictNow-3600)
+	}
+	key := sk("e", "/new")
+	res, err := c.StoreFetched(ctx, FetchedRow{Row: fetchedRow(t, c, key, "/InRelease"), Suite: key,
+		Create: &SuiteSeed{SuiteKey: key, RequestedAt: evictNow}}, SuiteCaps{Global: 4}, g)
+	if err != nil || res.Create.Outcome != SuiteCreated || res.Create.Evicted == nil || *res.Create.Evicted != sk("c", "/idle2") ||
+		!res.Tracked {
+		t.Fatalf("StoreFetched = %+v, %v; want created on the second attempt, evicting c/idle2", res, err)
+	}
+	if len(g.released[sk("b", "/idle")]) != 1 || !g.released[sk("b", "/idle")][0] {
+		t.Fatalf("released %v; want b/idle released once, as gone", g.released)
+	}
+	if _, err := c.LookupURL(ctx, "http", "e", "/new/InRelease"); err != nil {
+		t.Fatalf("url_path row: %v", err)
+	}
+}
 ```
 
 Create `internal/cache/suite_touch_test.go`:
@@ -2930,6 +4232,38 @@ func TestTouchSuite_MapIsSwept(t *testing.T) {
 	}
 }
 
+// Design review M9: once swept, the map is swept again only after
+// touchSweepEvery or once it has doubled, so a map of fresh entries costs
+// no O(map) scan per claim.
+func TestTouchSuite_SweepIsRateLimited(t *testing.T) {
+	c := openCache(t)
+	c.touches.mu.Lock()
+	c.touches.last = make(map[SuiteKey]time.Time)
+	now := time.Now()
+	for i := range touchSweepAt {
+		c.touches.last[sk("fresh", "/"+strings.Repeat("f", i+1))] = now
+	}
+	c.touches.mu.Unlock()
+	c.noteTouch(sk("new", "/1")) // a sweep: nothing is old; it keeps 4096
+	c.touches.mu.Lock()
+	old := now.Add(-2 * touchEvery)
+	for i := range 100 {
+		c.touches.last[sk("fresh", "/"+strings.Repeat("f", i+1))] = old
+	}
+	c.touches.mu.Unlock()
+	c.noteTouch(sk("new", "/2")) // within the minute and not doubled: no sweep
+	if n := c.TouchedSuites(); n != touchSweepAt+2 {
+		t.Fatalf("map = %d entries, want %d (no second sweep within the minute)", n, touchSweepAt+2)
+	}
+	c.touches.mu.Lock()
+	c.touches.swept = c.touches.swept.Add(-touchSweepEvery)
+	c.touches.mu.Unlock()
+	c.noteTouch(sk("new", "/3")) // a minute later: swept
+	if n := c.TouchedSuites(); n != touchSweepAt+3-100 {
+		t.Fatalf("map = %d entries, want %d (the 100 old entries swept)", n, touchSweepAt+3-100)
+	}
+}
+
 // Spec C3: a vouched .deb serve touches the suite whose current snapshot
 // declared it, so DeclaredHashesForPath names that suite.
 func TestDeclaredHashesForPath_NamesTheVouchingSuites(t *testing.T) {
@@ -2961,29 +4295,6 @@ func TestDeclaredHashesForPath_NamesTheVouchingSuites(t *testing.T) {
 	slices.Sort(suites)
 	if !slices.Equal(suites, []string{"/ubuntu/dists/noble", "/ubuntu/dists/noble-updates"}) {
 		t.Fatalf("vouching suites = %v", suites)
-	}
-}
-```
-
-Append to `internal/cache/suite_rows_test.go`:
-
-```go
-// SuiteExists is the handler's cheap tracked-suite test.
-func TestSuiteExists(t *testing.T) {
-	c := openCache(t)
-	ctx := context.Background()
-	key := SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: afSuite}
-	if ok, err := c.SuiteExists(ctx, key); err != nil || ok {
-		t.Fatalf("before creation: %v, %v", ok, err)
-	}
-	if _, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: key, RequestedAt: 1}, SuiteCaps{}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if ok, err := c.SuiteExists(ctx, key); err != nil || !ok {
-		t.Fatalf("after creation: %v, %v", ok, err)
-	}
-	if ok, err := c.SuiteExists(ctx, SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: afSuite}); err != nil || ok {
-		t.Fatalf("another scheme: %v, %v", ok, err)
 	}
 }
 ```
@@ -3036,7 +4347,7 @@ BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
 - [ ] **Step 2: Run to verify failure**
 
 Run: `go vet ./internal/cache/`
-Expected: the test package does not compile (first error `c.StoreFetched undefined`; `FetchedRow`, `TouchSuite`, `TouchedSuites`, `SuiteExists`, `c.touches`, `touchEvery`, `touchSweepAt` and `DeclaredHash.SuitePath` are undefined too).
+Expected: the test package does not compile (first error `c.StoreFetched undefined`; `FetchedRow`, `TouchSuite`, `TouchedSuites`, `c.touches`, `touchEvery`, `touchSweepAt`, `touchSweepEvery` and `DeclaredHash.SuitePath` are undefined too).
 
 - [ ] **Step 3: Implement**
 
@@ -3068,6 +4379,12 @@ type FetchedRow struct {
 	// suite has a row once Create has run: the body is a sniff-passing
 	// InRelease or Release.gpg.
 	MarkSeenAt int64
+	// Restamp, when set (adoption disabled; a sniff-passing InRelease),
+	// re-stamps an existing row without a current snapshot with Restamp's
+	// check stamps and validators — today's Phase-1 refresh miss (ruling
+	// PD-6) — UPDATE-only, in the same transaction; a row Create just made
+	// already carries them.
+	Restamp *SuiteSeed
 }
 
 // FetchedResult reports what StoreFetched did for the suite.
@@ -3080,19 +4397,32 @@ type FetchedResult struct {
 	Marked bool
 }
 
-// StoreFetched stores a metadata miss's url_path row, creates the suite row
-// and writes the signed-seen marker as m asks, all in ONE writer
-// transaction (spec C3): a signed anchor body is never served before its
-// base has a marker, and a failure stores nothing — the caller then fails
-// the miss (502, no body) as it does today. A cap rejection is not a
+// StoreFetched stores a metadata miss's url_path row, creates the suite row,
+// re-stamps it and writes the signed-seen marker as m asks, all in ONE
+// writer transaction (spec C3): a signed anchor body is never served before
+// its base has a marker, and a failure stores nothing — the caller then
+// fails the miss (502, no body) as it does today. A cap rejection is not a
 // failure: the url_path row is stored and the suite stays untracked (no
-// marker).
+// marker). Like CreateSuite, it tries once more when its held eviction
+// candidate vanished before the writer ran.
 //
 // AIDEV-NOTE: the writer is a FIFO queue drained by one goroutine
 // (submitWrite), so an unsigned CommitAdoption enqueued after this
 // operation runs after it, and its in-transaction marker re-read (phase E)
 // sees the marker (TestStoreFetched_MarkerPrecedesALaterWriterOperation).
 func (c *Cache) StoreFetched(ctx context.Context, m FetchedRow, caps SuiteCaps, guard SuiteGuard) (FetchedResult, error) {
+	res, err := c.storeFetchedOnce(ctx, m, caps, guard)
+	if err == nil && res.Create.heldGone {
+		// The held candidate was evicted by a concurrent creation first:
+		// one more attempt with a fresh list (the url_path upsert repeats
+		// harmlessly).
+		res, err = c.storeFetchedOnce(ctx, m, caps, guard)
+	}
+	return res, err
+}
+
+// storeFetchedOnce is one StoreFetched attempt.
+func (c *Cache) storeFetchedOnce(ctx context.Context, m FetchedRow, caps SuiteCaps, guard SuiteGuard) (FetchedResult, error) {
 	var held *heldSuite
 	if m.Create != nil {
 		h, err := c.holdEvictionCandidate(ctx, caps, guard)
@@ -3126,6 +4456,11 @@ func (c *Cache) StoreFetched(ctx context.Context, m FetchedRow, caps SuiteCaps, 
 				return err
 			}
 			r.Create = cr
+		}
+		if m.Restamp != nil && r.Create.Outcome != SuiteCreated {
+			if err := restampSuiteTx(ctx, tx, *m.Restamp); err != nil {
+				return err
+			}
 		}
 		if m.Suite != (SuiteKey{}) {
 			var one int
@@ -3165,6 +4500,29 @@ SELECT 1 FROM suite_freshness
 	}
 	return got, nil
 }
+
+// restampSuiteTx is the adoption-disabled refresh miss's re-stamp (ruling
+// PD-6): UPDATE-only, an existing row without a current snapshot takes
+// the miss's check stamps and validators as today's Phase-1 seed upsert
+// wrote them — the miss counts as a successful check, and the pending
+// change and the failure streak clear. last_requested_at and the adoption
+// failure record stay, as they did.
+func restampSuiteTx(ctx context.Context, tx *sql.Tx, s SuiteSeed) error {
+	if _, err := tx.ExecContext(ctx, `
+UPDATE suite_freshness
+   SET last_check_at            = ?,
+       last_success_at          = ?,
+       inrelease_etag           = ?,
+       inrelease_lastmod        = ?,
+       inrelease_change_seen_at = NULL,
+       check_fail_count         = 0
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ? AND current_snapshot_id IS NULL`,
+		s.LastCheckAt, s.LastSuccessAt, s.InReleaseETag, s.InReleaseLastMod,
+		s.CanonicalScheme, s.CanonicalHost, s.SuitePath); err != nil {
+		return fmt.Errorf("StoreFetched: re-stamp: %w", err)
+	}
+	return nil
+}
 ```
 
 Create `internal/cache/suite_touch.go`:
@@ -3185,14 +4543,23 @@ import (
 const touchEvery = time.Hour
 
 // touchSweepAt is the coalescing map size at which entries older than
-// touchEvery (which no longer suppress anything) are dropped.
-const touchSweepAt = 4096
+// touchEvery (which no longer suppress anything) are dropped — at most once
+// per touchSweepEvery, unless the map has doubled since the last sweep
+// (design review M9: a sweep is O(map) under the touch mutex).
+const (
+	touchSweepAt    = 4096
+	touchSweepEvery = time.Minute
+)
 
 // suiteTouches is the in-memory coalescing state of TouchSuite: when each
 // tracked suite's last_requested_at was last written, in monotonic time.
 type suiteTouches struct {
 	mu   sync.Mutex
 	last map[SuiteKey]time.Time
+	// swept is when the map was last swept, and kept how many entries the
+	// sweep left (the doubling rule).
+	swept time.Time
+	kept  int
 }
 
 // TouchSuite records client interest in a suite (spec C3): it sets
@@ -3207,7 +4574,12 @@ type suiteTouches struct {
 // stamp (eager-adoption window, eviction, reaping), distinct from
 // url_path.last_requested_at; only TouchSuite and the row's creation write
 // it, from client-serving paths. Coalescing uses monotonic time, so a wall
-// clock step neither suppresses nor multiplies writes.
+// clock step neither suppresses nor multiplies writes. Residual (design
+// review M11, ruling PD-11): after a forward wall-clock step of about 23 h
+// or more, an active suite keeps its pre-step stamp until its next due
+// touch, up to touchEvery later, and meanwhile — without a current
+// snapshot — looks idle for 24 h to cap eviction; bounded by the hour and
+// self-healing.
 func (c *Cache) TouchSuite(ctx context.Context, key SuiteKey) error {
 	if !c.claimTouch(key) {
 		return nil
@@ -3272,12 +4644,14 @@ func (c *Cache) noteTouchLocked(key SuiteKey) {
 	if c.touches.last == nil {
 		c.touches.last = make(map[SuiteKey]time.Time)
 	}
-	if len(c.touches.last) >= touchSweepAt {
+	if n := len(c.touches.last); n >= touchSweepAt &&
+		(n >= 2*c.touches.kept || time.Since(c.touches.swept) >= touchSweepEvery) {
 		for k, t := range c.touches.last {
 			if time.Since(t) >= touchEvery {
 				delete(c.touches.last, k)
 			}
 		}
+		c.touches.swept, c.touches.kept = time.Now(), len(c.touches.last)
 	}
 	c.touches.last[key] = time.Now()
 }
@@ -3302,52 +4676,43 @@ In `internal/cache/queries.go`, move `PutURLPath`'s statement out of the functio
 In `internal/cache/suite_rows.go`, replace `afterCreate` (doc included) with
 
 ```go
-// afterCreate releases the held eviction candidate, telling the guard
-// whether its row was deleted, and keeps the touch-coalescing map in step
-// with a committed eviction (the evictee's entry goes) or creation (its
-// insert stamped last_requested_at, so it counts as a touch).
+// afterCreate settles a creation attempt after its writer operation. A
+// created row counts as touched (its insert stamped last_requested_at),
+// and the held eviction candidate is released, telling the guard whether
+// its row is gone — deleted by this creation's eviction, or found absent —
+// so that release(true), and the dropped touch-coalescing entry, purge the
+// suite's in-memory state exactly when the suite has no row. Unless the
+// result says so, it reads the row: after a failed submit the outcome is
+// unknown, and an unused candidate's row may have been evicted by a
+// concurrent creation before this one held it (the hold then made a fresh
+// lock-map entry for a suite without a row).
 //
-// AIDEV-NOTE: after a failed submit (cancelled context, closing cache)
-// the outcome is unknown and the candidate is released as not deleted. A
-// queued operation may still commit its eviction later: the evictee's
-// lock-map, flip-gate and touch entries then stay (one each, bounded), and a
-// check that started meanwhile meets a vanished row, which I-4's
+// AIDEV-NOTE: while this creation holds the candidate's mutex no other
+// deleter can remove its row (every deleter holds the guard), and the one
+// way a failed submit still commits is a commit that raced the context's
+// end in submitWrite (an operation run on an ended context rolls back), so
+// the read decides (design review M3, M4). A read error, or a read that
+// lands before a commit still in flight, answers "present": the evictee's
+// lock-map, flip-gate and touch entries then stay (one each, bounded), and
+// a check that starts meanwhile meets a vanished row, which I-4's
 // re-validation and the UPDATE-only writers make harmless (its candidate,
 // if any, was retired: CommitAdoption refuses it).
 func (c *Cache) afterCreate(key SuiteKey, res CreateResult, held *heldSuite) {
-	if res.Evicted != nil {
-		c.forgetTouch(*res.Evicted)
-	}
 	if res.Outcome == SuiteCreated {
 		c.noteTouch(key)
 	}
-	if held != nil {
-		held.release(res.Evicted != nil)
+	if held == nil {
+		return // an eviction needs a held candidate: nothing was evicted
 	}
+	gone := res.Evicted != nil || res.heldGone || c.suiteRowGone(held.key)
+	if gone {
+		c.forgetTouch(held.key)
+	}
+	held.release(gone)
 }
 ```
 
-pass `seed.SuiteKey` as its new first argument at both call sites in `CreateSuite`, and add before `UpdateSuiteFreshness`:
-
-```go
-// SuiteExists reports whether the suite has a suite_freshness row: the
-// handler's cheap tracked-suite test (one indexed read; the flip barrier
-// registers only tracked suites' anchor serves).
-func (c *Cache) SuiteExists(ctx context.Context, key SuiteKey) (bool, error) {
-	var one int
-	err := c.db.QueryRowContext(ctx, `
-SELECT 1 FROM suite_freshness
- WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
-		key.CanonicalScheme, key.CanonicalHost, key.SuitePath).Scan(&one)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("SuiteExists: %w", err)
-	}
-	return true, nil
-}
-```
+pass `seed.SuiteKey` as its new first argument at both call sites in `createSuiteOnce`, and `sk("e", "/new")` at the three in `suite_evict_test.go`'s `TestAfterCreate_ReadsTheCandidatesRowUnlessTheResultSays` (its outcome-0 results note no touch).
 
 In `internal/cache/adoption.go`: `DeclaredHash` gains, after `PackageName`,
 
@@ -3367,10 +4732,12 @@ In `internal/cache/signed_seen.go`, the `markSignedSeen` AIDEV-NOTE becomes
 // transaction), the startup legacy audit and anchor pass (spec §6.1), and
 // from phase D the handler: on a miss, StoreFetched (the same writer
 // transaction as the anchor's url_path row, before the body is served);
-// on a suite-row creation, CreateSuite's transaction (SuiteSeed.SignedSeenAt)
-// and markCachedSignedAnchors for the suite's other cached anchors. It is
-// written only for suites with a suite_freshness row, and never for an
-// unsigned snapshot or a plain-text anchor.
+// on a suite-row creation, the creating transaction (createSuiteTx's
+// markCreated: SuiteSeed.SignedSeenAt and every cached signed anchor in
+// SuiteSeed.Cached, ruling PD-5), and only for an unproven creation the
+// handler's markCachedSignedAnchors backstop. It is written only for
+// suites with a suite_freshness row, and never for an unsigned snapshot or
+// a plain-text anchor.
 ```
 
 and, deferred minor A-25, `MarkSignedSeenBatch`'s per-row error is returned as `fmt.Errorf("MarkSignedSeenBatch: %w", err) // deferred minor A-25`.
@@ -3382,12 +4749,12 @@ Expected: PASS.
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each: (a) `if m.MarkSeenAt != 0 {` (mark untracked suites) → `TestStoreFetched_MarksOnlyTrackedSuites` FAILS (`Marked:true`); (b) pass `nil` for `held` in `StoreFetched` → `TestStoreFetched_EvictsAtTheGlobalCap` FAILS (`global_cap`); (c) ignore the marker's error → `TestStoreFetched_AFailedOperationStoresNothing` FAILS; (d) write the marker in a second writer operation after the first (`MarkSignedSeenBatch` after `submitWrite` returns) → `TestStoreFetched_MarkerPrecedesALaterWriterOperation` and `TestStoreFetched_AFailedOperationStoresNothing` FAIL; (e) `claimTouch` checks without recording → `TestTouchSuite_ConcurrentTouchesWriteOnce` and `TestTouchSuite_WritesAtMostOncePerHour` FAIL; (f) drop `noteTouch` from `afterCreate` → `TestTouchSuite_WritesAtMostOncePerHour` FAILS (`after 10m0s more: last_requested_at = 600, want 0`); (g) keep the entry when the UPDATE found no row → `TestTouchSuite_MapHoldsOnlyTrackedSuites` FAILS (`50 entries`); (h) drop `forgetTouch(*res.Evicted)` → the same test FAILS (`evictee true`); (i) never sweep → `TestTouchSuite_MapIsSwept` FAILS (`4097 entries`); (j) select `''` for the suite path → `TestDeclaredHashesForPath_NamesTheVouchingSuites` FAILS; (k) undo A-25 → `TestMarkSignedSeenBatch_ErrorsArePrefixed` FAILS; (l) `marks = nil` after the first chunk → `TestMarkSignedSeenBatch_ManyMarksInChunks` FAILS (`markers = 500`).
+One at a time, reverting each: (a) `if m.MarkSeenAt != 0 {` (mark untracked suites) → `TestStoreFetched_MarksOnlyTrackedSuites` FAILS (`Marked:true`); (b) pass `nil` for `held` in `storeFetchedOnce` → `TestStoreFetched_EvictsAtTheGlobalCap` FAILS (`global_cap`); (c) ignore the marker's error → `TestStoreFetched_AFailedOperationStoresNothing` FAILS; (d) write the marker in a second writer operation after the first (`MarkSignedSeenBatch` after `submitWrite` returns) → `TestStoreFetched_MarkerPrecedesALaterWriterOperation` and `TestStoreFetched_AFailedOperationStoresNothing` FAIL; (e) `claimTouch` checks without recording → `TestTouchSuite_ConcurrentTouchesWriteOnce` and `TestTouchSuite_WritesAtMostOncePerHour` FAIL; (f) drop `noteTouch` from `afterCreate` → `TestTouchSuite_WritesAtMostOncePerHour` FAILS (`after 10m0s more: last_requested_at = 600, want 0`); (g) keep the entry when the UPDATE found no row → `TestTouchSuite_MapHoldsOnlyTrackedSuites` FAILS (`50 entries`); (h) drop `forgetTouch(held.key)` for a gone candidate → the same test FAILS (`evictee true`); (i) never sweep → `TestTouchSuite_MapIsSwept` and `TestTouchSuite_SweepIsRateLimited` FAIL (`4097 entries`); (j) select `''` for the suite path → `TestDeclaredHashesForPath_NamesTheVouchingSuites` FAILS; (k) undo A-25 → `TestMarkSignedSeenBatch_ErrorsArePrefixed` FAILS; (l) `marks = nil` after the first chunk → `TestMarkSignedSeenBatch_ManyMarksInChunks` FAILS (`markers = 500`); (m) drop the `afterCreate` call in `storeFetchedOnce`'s error branch → `TestStoreFetched_AFailedOperationReleasesItsCandidate` FAILS (`released map[]`); (n) never re-stamp → `TestStoreFetched_RestampsOnlyATrackedUnadoptedRow` FAILS (`want the miss's stamps and validators …`); (o) re-stamp without `AND current_snapshot_id IS NULL` → the same test FAILS (`an adopted row was re-stamped`); (p) the re-stamp also writes `last_requested_at` → it FAILS (`a refresh miss is no creation`); (q) the re-stamp keeps `check_fail_count` → it FAILS (`… the change and the streak cleared`); (r) `storeFetchedOnce` drops `Create.Cached` → `TestStoreFetched_CreationMarksCachedSignedAnchors` FAILS (`marker = 0 false`); (s) no retry (`res.Create.heldGone && false`) → `TestStoreFetched_RetriesOnceWhenTheCandidateVanished` FAILS (`heldGone:true`); (t) sweep on every claim at the size (`… && true {`) → `TestTouchSuite_SweepIsRateLimited` FAILS (`no second sweep within the minute`); (u) drop the minute rule (`n >= 2*c.touches.kept {` alone) → the same test FAILS (`the 100 old entries swept`).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-gofmt -l internal/cache/fetched_row.go internal/cache/fetched_row_test.go internal/cache/suite_touch.go internal/cache/suite_touch_test.go internal/cache/queries.go internal/cache/cache.go internal/cache/suite_rows.go internal/cache/adoption.go internal/cache/signed_seen.go internal/cache/suite_rows_test.go internal/cache/signed_seen_test.go
+gofmt -l internal/cache/fetched_row.go internal/cache/fetched_row_test.go internal/cache/suite_touch.go internal/cache/suite_touch_test.go internal/cache/queries.go internal/cache/cache.go internal/cache/suite_rows.go internal/cache/adoption.go internal/cache/signed_seen.go internal/cache/suite_evict_test.go internal/cache/signed_seen_test.go
 golangci-lint run ./internal/cache/...
 git add internal/cache/
 git commit -m "Store a miss's url_path row, suite row and marker in one writer operation; coalesce suite touches"
@@ -3397,19 +4764,20 @@ git commit -m "Store a miss's url_path row, suite row and marker in one writer o
 
 ### Task 7: I-4 re-validation in the checker; `HoldSuite`; the scheduler's queue bound
 
-Spec C3: "`Check` and `Reconcile` require an existing row before `LoadOrStore` (I-4) and re-validate after `TryLock` that the lock map still holds the same mutex and the row still exists" (Task 4 added `Check`'s pre-read; `Reconcile` already read first); ruling R-D1's guard: `*freshness.Checker` implements `cache.SuiteGuard` — `HoldSuite` takes the candidate's mutex with `TryLock`, and `release(true)` drops the lock-map entry (`CompareAndDelete`) and the flip-gate entry (`Purge`) while still holding it; a check that finds its row gone drops its own entry; the scheduler flushes an evicted suite's queued or parked entry through I-4 (no row → `skipped` → done; overview "A reaped suite's parked scheduler entry"). Spec C4's queue bound ("at most `freshness.max_suites` entries in all", phase B plan deviation 4; design note 15): `freshness.Config.MaxSuites`, wired in Task 8. The `locks` field's AIDEV-NOTE ("entries are not actively reaped") and `Reconcile`'s ("Compare Check, which does LoadOrStore unconditionally") are no longer true and are rewritten.
+Spec C3: "`Check` and `Reconcile` require an existing row before `LoadOrStore` (I-4) and re-validate after `TryLock` that the lock map still holds the same mutex and the row still exists" (Task 4 added `Check`'s pre-read; `Reconcile` already read first); ruling R-D1's guard: `*freshness.Checker` implements `cache.SuiteGuard` — `HoldSuite` takes the candidate's mutex with `TryLock`, and `release(true)` drops the lock-map entry (`CompareAndDelete`) and the flip-gate entry (`Purge`) while still holding it; a check that finds its row gone drops its own entry; the scheduler flushes an evicted suite's queued or parked entry through I-4 (no row → `skipped` → done; overview "A reaped suite's parked scheduler entry"). Spec C4's queue bound ("at most `freshness.max_suites` entries in all", phase B plan deviation 4; design note 15): `freshness.Config.MaxSuites`, wired in Task 8; when it cuts a tick's due list, the least recently checked suites get in (design review M12, ruling PD-11: never checked first, a future `last_check_at` counting as never), so late keys cannot starve. Exec review D9 and D19: `Reconcile`'s row re-check is pinned, and `HoldSuite` gets the `lockLoadedHook` seam and a test of its post-`TryLock` re-validation. Ruling PD-11: the checker is Task 5's `cache.ClockStepReporter` — `ReportClockStep` routes a future `last_requested_at` found by cap eviction through the checker's rate-limited `clock_step_detected`. The `locks` field's AIDEV-NOTE ("entries are not actively reaped") and `Reconcile`'s ("Compare Check, which does LoadOrStore unconditionally") are no longer true and are rewritten.
 
 **Files:**
 - Create: `internal/freshness/suite_lock.go`, `internal/freshness/suite_lock_test.go`
-- Modify: `internal/freshness/freshness.go` (`Config.MaxSuites`; `Checker.maxSuites`, `lockLoadedHook`; `checkOutcome.vanished`; `check`, `checkLocked`, `Reconcile`; two AIDEV-NOTEs), `internal/freshness/scheduler.go` (`tick`)
+- Modify: `internal/freshness/freshness.go` (`Config.MaxSuites`; `Checker.maxSuites`, `lockLoadedHook`; `checkOutcome.vanished`; `check`, `checkLocked`, `Reconcile`; two AIDEV-NOTEs), `internal/freshness/scheduler.go` (`tick`, `boundDue`, `schedQueues.has`)
 
 **Interfaces:**
 - Consumes: Task 4's `suiteRowExists`, `resultSkipped`; Task 5's `cache.SuiteGuard`; `Adopter.FlipGate()` and `(*flipgate.Gate).Purge`/`AnchorStart`/`Len` (nil-safe); test helpers `newFakeCache`, `seedFakeSuite`, `keyOf`, `fc.track`, `fc.putSuite`, `changedUpstream` (`panic_recovery_test.go`), `newFakeFetcher`, `passThroughVerifier`, `newSchedQueues`, `admitAll`, `admitNone`, `checkDone`.
 - Produces:
-  - `func (c *Checker) HoldSuite(key cache.SuiteKey) (func(deleted bool), bool)` (the guard Task 9 passes to the cache); `func (c *Checker) LockCount() int` (Task 11).
+  - `func (c *Checker) HoldSuite(key cache.SuiteKey) (func(deleted bool), bool)` (the guard Task 9 passes to the cache); `func (c *Checker) ReportClockStep(stamp string, key cache.SuiteKey, stored, now int64)` (`cache.ClockStepReporter`); `func (c *Checker) LockCount() int` (Task 11).
+  - `func boundDue(due []cache.SuiteFreshness, q *schedQueues, maxSuites int, now int64) []cache.SuiteFreshness`; `func (q *schedQueues) has(key string) bool`.
   - `freshness.Config.MaxSuites int` (Task 8 wires `freshness.max_suites`).
   - `Checker.lockLoadedHook func(key string)` (test seam).
-  - Test helpers `gatedAdopter(t) (*Adopter, *cache.Cache, *flipgate.Gate)`, `lockChecker(t, c Cache, f Fetcher, ad *Adopter) *Checker`.
+  - Test helpers `gatedAdopter(t) (*Adopter, *cache.Cache, *flipgate.Gate)`, `lockChecker(t, c Cache, f Fetcher, ad *Adopter) *Checker`; it uses `lockedBuffer` (`panic_recovery_test.go`) and `renderedMetric` (`scheduler_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3421,6 +4789,10 @@ package freshness
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -3673,6 +5045,128 @@ func TestScheduler_FlushesAnEvictedWaiter(t *testing.T) {
 			rep.result, q.len(), q.waiting(), c.LockCount())
 	}
 }
+
+// Spec C3 I-4: Reconcile re-validates that the row still exists — a row
+// deleted in the window (lock map intact) starts nothing.
+func TestReconcile_RevalidatesAVanishedRow(t *testing.T) {
+	ad, _, _ := gatedAdopter(t)
+	fc := newFakeCache()
+	id := int64(42)
+	fc.putSuite(cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x", CurrentSnapshotID: &id})
+	c := lockChecker(t, fc, newTestFetcher(t), ad)
+	c.lockLoadedHook = func(string) {
+		c.lockLoadedHook = nil
+		fc.mu.Lock()
+		delete(fc.suites, keyOf("http", "h", "/r/dists/x"))
+		fc.mu.Unlock()
+	}
+	if c.Reconcile(context.Background(), "http", "h", "/r/dists/x") {
+		t.Fatal("reconciled a suite whose row vanished in the window")
+	}
+	c.WaitForAdoptions()
+}
+
+// R-D1 / I-4: HoldSuite re-validates after TryLock like check does — a
+// hold that loaded the mutex of a suite another hold evicted in the window
+// (its entry dropped) is refused, so two holders never share a suite.
+func TestHoldSuite_RevalidatesItsLockAfterTryLock(t *testing.T) {
+	fc := newFakeCache()
+	fc.track("http", "h", "/r/dists/x")
+	c := lockChecker(t, fc, newTestFetcher(t), nil)
+	c.lockLoadedHook = func(string) {
+		c.lockLoadedHook = nil
+		release, ok := c.HoldSuite(lockKey) // an eviction in the window
+		if !ok {
+			t.Error("HoldSuite in the window failed")
+			return
+		}
+		release(true)
+	}
+	if release, ok := c.HoldSuite(lockKey); ok {
+		release(false)
+		t.Fatal("a hold on a stale mutex was granted")
+	}
+	if c.LockCount() != 0 {
+		t.Fatalf("lock entries = %d, want 0 (the refused hold leaves none)", c.LockCount())
+	}
+	release, ok := c.HoldSuite(lockKey)
+	if !ok {
+		t.Fatal("an undisturbed hold was refused")
+	}
+	release(false)
+}
+
+// Ruling PD-11: with the checker as the guard, cap eviction reports a
+// future last_requested_at through the checker's rate-limited
+// clock_step_detected (and acu_clock_steps_detected_total), and leaves the
+// suite alone.
+func TestCreateSuite_ReportsAFutureStampThroughTheChecker(t *testing.T) {
+	_, rc, _ := gatedAdopter(t)
+	logs := &lockedBuffer{}
+	c, err := New(Config{Cache: rc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Logger: slog.New(slog.NewTextHandler(logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	future := time.Now().Unix() + 86400
+	if _, err := rc.CreateSuite(ctx, cache.SuiteSeed{SuiteKey: lockKey, RequestedAt: future}, cache.SuiteCaps{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	steps := func() float64 {
+		v, _ := strconv.ParseFloat(renderedMetric("acu_clock_steps_detected_total"), 64)
+		return v
+	}
+	before := steps()
+	res, err := rc.CreateSuite(ctx, cache.SuiteSeed{SuiteKey: cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h",
+		SuitePath: "/r/dists/new"}, RequestedAt: time.Now().Unix()}, cache.SuiteCaps{Global: 1}, c)
+	if err != nil || res.Outcome != cache.SuiteRejectedGlobal || res.Evicted != nil {
+		t.Fatalf("CreateSuite = %+v, %v; want global_cap, nothing evicted", res, err)
+	}
+	if got := steps() - before; got != 1 {
+		t.Fatalf("acu_clock_steps_detected_total rose by %v, want 1", got)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "clock_step_detected") || !strings.Contains(out, "stamp=last_requested_at") ||
+		!strings.Contains(out, "suite_path=/r/dists/x") {
+		t.Fatalf("log = %q; want clock_step_detected for /r/dists/x's last_requested_at", out)
+	}
+}
+
+// Design review M12: when the bound cuts a tick's due list, the least
+// recently checked suites get in — never checked first, and a
+// last_check_at in the future (a clock step) counts as never — not the
+// first by key, so a suite late in key order cannot starve behind early
+// ones that keep becoming due; ties and the admitted ones keep key order.
+func TestTick_BoundAdmitsTheLeastRecentlyChecked(t *testing.T) {
+	fc := newFakeCache()
+	recent, future := time.Now().Unix()-100, time.Now().Unix()+86400
+	for i := range 6 {
+		s := cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: fmt.Sprintf("/s%d/dists/x", i)}
+		switch i {
+		case 0:
+			s.LastCheckAt = &future // a backward clock step: never checked
+		case 1, 2:
+			s.LastCheckAt = &recent // checked a moment ago and still due
+		}
+		fc.putSuite(s)
+	}
+	c, err := New(Config{Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+		MaxSuites: 3, Logger: discardLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := newSchedQueues()
+	c.tick(context.Background(), q)
+	var got []string
+	for it, ok := q.pop(admitAll); ok; it, ok = q.pop(admitAll) {
+		got = append(got, it.ref.SuitePath)
+		q.done(it) // one check per host at a time
+	}
+	if want := []string{"/s0/dists/x", "/s3/dists/x", "/s4/dists/x"}; !slices.Equal(got, want) {
+		t.Fatalf("queued %v, want %v (the first three of the never-checked ones)", got, want)
+	}
+}
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -3689,14 +5183,18 @@ package freshness
 
 import (
 	"sync"
+	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 )
 
-// The checker is the cache's SuiteGuard: spec C3 cap eviction runs under
-// the evicted suite's mutex.
-var _ cache.SuiteGuard = (*Checker)(nil)
+// The checker is the cache's SuiteGuard — spec C3 cap eviction runs under
+// the evicted suite's mutex — and its ClockStepReporter (ruling PD-11).
+var (
+	_ cache.SuiteGuard        = (*Checker)(nil)
+	_ cache.ClockStepReporter = (*Checker)(nil)
+)
 
 // HoldSuite takes the suite's mutex without waiting (cache.SuiteGuard): ok
 // is false while a check, adoption, repair or reconcile holds it.
@@ -3713,6 +5211,9 @@ func (c *Checker) HoldSuite(key cache.SuiteKey) (func(deleted bool), bool) {
 	k := suiteKey(key.CanonicalScheme, key.CanonicalHost, key.SuitePath)
 	muVal, _ := c.locks.LoadOrStore(k, &sync.Mutex{})
 	mu := muVal.(*sync.Mutex)
+	if c.lockLoadedHook != nil {
+		c.lockLoadedHook(k)
+	}
 	if !mu.TryLock() {
 		return nil, false
 	}
@@ -3730,6 +5231,14 @@ func (c *Checker) HoldSuite(key cache.SuiteKey) (func(deleted bool), bool) {
 			mu.Unlock()
 		})
 	}, true
+}
+
+// ReportClockStep reports a past-event stamp that cap eviction found in
+// the future — a backward wall-clock step (cache.ClockStepReporter, ruling
+// PD-11) — through the checker's rate-limited clock_step_detected and
+// acu_clock_steps_detected_total, like every other gate (spec C4).
+func (c *Checker) ReportClockStep(stamp string, key cache.SuiteKey, stored, now int64) {
+	c.clockStep(stamp, key.CanonicalScheme, key.CanonicalHost, key.SuitePath, stored, time.Unix(now, 0))
 }
 
 // LockCount is the number of suites with a lock-map entry (tests and
@@ -3820,17 +5329,79 @@ In `internal/freshness/freshness.go`:
 	}
 ```
 
-In `internal/freshness/scheduler.go`, `tick`'s enqueue loop becomes:
+In `internal/freshness/scheduler.go` (add `"cmp"` and `"math"` to its imports), `tick`'s enqueue loop becomes:
 
 ```go
-	for _, s := range due {
+	if c.maxSuites > 0 {
 		// Spec C4: at most freshness.max_suites suites queued, waiting or
 		// in flight; the rest are queued by a later tick.
-		if c.maxSuites > 0 && q.len() >= c.maxSuites {
-			break
-		}
+		due = boundDue(due, q, c.maxSuites, nowT.Unix())
+	}
+	for _, s := range due {
 		q.enqueue(s, c.pendingChange(s))
 	}
+}
+```
+
+add after `tick`:
+
+```go
+// boundDue applies spec C4's queue bound — at most maxSuites suites
+// queued, waiting or in flight — to a tick's due list (key order): it
+// returns the due suites not queued yet that fit and, when not all of them
+// fit, the least recently checked of them (never checked first; a
+// last_check_at in the future counts as never, the clock-step rule), still
+// in key order.
+//
+// AIDEV-NOTE: design review M12. Admitting by key alone would let suites
+// late in key order wait behind early-key ones that keep becoming due (a
+// failing suite re-enters after every backoff); the bound binds only above
+// the cap (a lowered max_suites, an upgraded table). The sort runs only
+// when the list is cut.
+func boundDue(due []cache.SuiteFreshness, q *schedQueues, maxSuites int, now int64) []cache.SuiteFreshness {
+	fresh := make([]cache.SuiteFreshness, 0, len(due))
+	for _, s := range due {
+		if !q.has(suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)) {
+			fresh = append(fresh, s)
+		}
+	}
+	room := maxSuites - q.len()
+	if len(fresh) <= room {
+		return fresh
+	}
+	if room <= 0 {
+		return nil
+	}
+	lastCheck := func(s cache.SuiteFreshness) int64 {
+		if s.LastCheckAt == nil || *s.LastCheckAt > now+int64(clockStepTolerance/time.Second) {
+			return math.MinInt64
+		}
+		return *s.LastCheckAt
+	}
+	byCheck := slices.Clone(fresh)
+	slices.SortStableFunc(byCheck, func(a, b cache.SuiteFreshness) int { return cmp.Compare(lastCheck(a), lastCheck(b)) })
+	admit := make(map[string]bool, room)
+	for _, s := range byCheck[:room] {
+		admit[suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)] = true
+	}
+	out := make([]cache.SuiteFreshness, 0, room)
+	for _, s := range fresh {
+		if admit[suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)] {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+```
+
+and after `schedQueues.len`:
+
+```go
+// has reports whether key is queued, waiting or in flight.
+func (q *schedQueues) has(key string) bool {
+	_, ok := q.queued[key]
+	return ok
+}
 ```
 
 - [ ] **Step 4: Run the tests**
@@ -3840,7 +5411,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each: (a) drop `check`'s post-`TryLock` re-validation → `TestCheck_RevalidatesItsLockAfterTryLock` FAILS (`check on a stale mutex = "changed" with 1 upstream calls`); (b) drop the `vanished` `CompareAndDelete` → `TestCheck_VanishedRowDropsItsLockEntry` FAILS (`1 lock entries`); (c) drop `Reconcile`'s lock re-validation → `TestReconcile_RevalidatesUnderTheMutex` FAILS (`reconciled on a stale mutex`); (d) drop its snapshot comparison (`|| false` for `*sf.CurrentSnapshotID != snapID`) → the same test FAILS (`no longer current`); (e) `HoldSuite`'s `release(true)` skips `Purge` → `TestHoldSuite_TakesOnlyAFreeSuiteAndPurgesOnDelete` and `TestCreateSuite_EvictionUnderTheChecker` FAIL; (f) it skips `CompareAndDelete` → those two and the re-validation tests FAIL; (g) drop the queue bound → `TestTick_QueuesAtMostMaxSuites` FAILS (`queued after one tick = 30`).
+One at a time, reverting each: (a) drop `check`'s post-`TryLock` re-validation → `TestCheck_RevalidatesItsLockAfterTryLock` FAILS (`check on a stale mutex = "changed" with 1 upstream calls`); (b) drop the `vanished` `CompareAndDelete` → `TestCheck_VanishedRowDropsItsLockEntry` FAILS (`1 lock entries`); (c) drop `Reconcile`'s lock re-validation → `TestReconcile_RevalidatesUnderTheMutex` FAILS (`reconciled on a stale mutex`); (d) drop its snapshot comparison (`|| false` for `*sf.CurrentSnapshotID != snapID`) → the same test FAILS (`no longer current`); (e) `HoldSuite`'s `release(true)` skips `Purge` → `TestHoldSuite_TakesOnlyAFreeSuiteAndPurgesOnDelete` and `TestCreateSuite_EvictionUnderTheChecker` FAIL; (f) it skips `CompareAndDelete` → those two and the re-validation tests FAIL; (g) drop the queue bound (`if false && c.maxSuites > 0 {`) → `TestTick_QueuesAtMostMaxSuites` FAILS (`queued after one tick = 30`); (h) `Reconcile`'s re-read passes when the row is gone (`err == nil && (…)`) → `TestReconcile_RevalidatesAVanishedRow` FAILS (`reconciled a suite whose row vanished in the window`); (i) drop `HoldSuite`'s post-`TryLock` re-validation → `TestHoldSuite_RevalidatesItsLockAfterTryLock` FAILS (`a hold on a stale mutex was granted`); (j) `ReportClockStep` reports nothing → `TestCreateSuite_ReportsAFutureStampThroughTheChecker` FAILS (`acu_clock_steps_detected_total rose by 0, want 1`); (k) `boundDue` skips the sort (admits by key) → `TestTick_BoundAdmitsTheLeastRecentlyChecked` FAILS (`queued [/s0/dists/x /s1/dists/x /s2/dists/x], want [/s0/dists/x /s3/dists/x /s4/dists/x]`); (l) it counts already-queued suites against the room (`if true {` for the `q.has` filter) → `TestTick_QueuesAtMostMaxSuites` FAILS (`queued after four checks and a tick = 8, want 10`); (m) it ignores the future-stamp rule (`if s.LastCheckAt == nil {`) → `TestTick_BoundAdmitsTheLeastRecentlyChecked` FAILS (`queued [/s3/dists/x /s4/dists/x /s5/dists/x]`).
 
 - [ ] **Step 6: Commit**
 
@@ -3855,7 +5426,7 @@ git commit -m "Re-validate suite locks after TryLock; let cap eviction hold a su
 
 ### Task 8: `freshness.max_suites` and its wiring
 
-Spec C11's knob (`freshness.max_suites`: default `5000`, at least `10`; the per-host cap is `max_suites / 10`), following `adoption.max_duration`'s convention (phase C): the default is applied in `Load` only when the key is absent, so an explicit value below 10 — `0` included — fails `Validate` instead of being rescued. The checker gets it here (Task 7's queue bound); the handler gets it, with the checker as its eviction guard, in Task 9. The packaged config documents it (`TestDefaultConfigFileDocumentsEveryKey` and `TestDefaultConfigFilePreservesProfile` check that). The startup line reports it; the new startup-line test also pins `adoption_flip_quiet_period` (deferred minor C-35, `main.go`, a file this task touches).
+Spec C11's knob (`freshness.max_suites`: default `5000`, at least `10`; the per-host cap is `max_suites / 10`), following `adoption.max_duration`'s convention (phase C): the default is applied in `Load` only when the key is absent, so an explicit value below 10 — `0` included — fails `Validate` instead of being rescued. The checker gets it here (Task 7's queue bound); the handler gets it, with the checker as its eviction guard, in Task 9. The packaged config documents it (`TestDefaultConfigFileDocumentsEveryKey` and `TestDefaultConfigFilePreservesProfile` check that). The startup line reports it; the new startup-line test also pins `adoption_flip_quiet_period` (deferred minor C-35, `main.go`, a file this task touches). Ruling PD-8: after the legacy audit, `warnSuiteCaps` logs WARN `suite_caps_exceeded` (suites, max_suites, hosts_at_cap, per_host_cap, fullest_host, fullest_host_suites; from Task 5's `SuiteCapUsage`) when the table is at or above `max_suites` or a host holds a tenth of it — the lowered-cap and upgraded-v6 cases. Exec review D10: the config test fails instead of panicking when `Load` errors.
 
 **Files:**
 - Modify: `internal/config/config.go`, `internal/config/config_test.go`, `packaging/config/config.toml.default`, `cmd/apt-cacher-ultra/main.go` (new `checkerConfig`; the startup line)
@@ -3863,7 +5434,7 @@ Spec C11's knob (`freshness.max_suites`: default `5000`, at least `10`; the per-
 
 **Interfaces:**
 - Consumes: Task 7's `freshness.Config.MaxSuites`; test helpers `writeTOML` (`config_test.go`), `minimalCfg` (`main_test.go`), `silentBuildLogger` (`adoption_wiring_test.go`), `captureBuilder` (`cert_cache_evicted_test.go`).
-- Produces: `config.FreshnessConfig.MaxSuites int` (`toml:"max_suites"`); `func checkerConfig(lifetimeCtx context.Context, cfg *config.Config, c *cache.Cache, fetchClient *fetch.Client, hostLimiter *hostsem.Sem, logger *slog.Logger, adopter *freshness.Adopter, ring *observability.Ring) freshness.Config` (`main.go`); the test file Task 9 extends.
+- Produces: `config.FreshnessConfig.MaxSuites int` (`toml:"max_suites"`); `func checkerConfig(lifetimeCtx context.Context, cfg *config.Config, c *cache.Cache, fetchClient *fetch.Client, hostLimiter *hostsem.Sem, logger *slog.Logger, adopter *freshness.Adopter, ring *observability.Ring) freshness.Config` and `func warnSuiteCaps(ctx context.Context, c *cache.Cache, maxSuites int, logger *slog.Logger)` (`main.go`); test helper `startupLogs(t, cacheDir, extra string) []map[string]any`; the test file Task 9 extends.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3878,12 +5449,19 @@ func TestFreshnessMaxSuites_DefaultAndBounds(t *testing.T) {
 		return Load(writeTOML(t, dir, "config.toml", "[cache]\ndir = \""+dir+"\"\n"+extra))
 	}
 	cfg, err := load("")
-	if err != nil || cfg.Freshness.MaxSuites != 5000 {
-		t.Fatalf("default = %d (err %v), want 5000", cfg.Freshness.MaxSuites, err)
+	if err != nil {
+		t.Fatalf("default: %v", err)
+	}
+	if cfg.Freshness.MaxSuites != 5000 {
+		t.Fatalf("default = %d, want 5000", cfg.Freshness.MaxSuites)
 	}
 	for _, good := range []int{10, 20000} {
-		if cfg, err = load(fmt.Sprintf("[freshness]\nmax_suites = %d\n", good)); err != nil || cfg.Freshness.MaxSuites != good {
-			t.Fatalf("explicit %d = %d (err %v)", good, cfg.Freshness.MaxSuites, err)
+		cfg, err := load(fmt.Sprintf("[freshness]\nmax_suites = %d\n", good))
+		if err != nil {
+			t.Fatalf("explicit %d: %v", good, err)
+		}
+		if cfg.Freshness.MaxSuites != good {
+			t.Fatalf("explicit %d = %d", good, cfg.Freshness.MaxSuites)
 		}
 	}
 	for _, bad := range []int{9, 0, -1} {
@@ -3912,6 +5490,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 )
 
@@ -3929,12 +5508,12 @@ func TestCheckerConfig_CarriesMaxSuites(t *testing.T) {
 	}
 }
 
-// The startup line reports freshness.max_suites, and (deferred minor C-35)
-// adoption.flip_quiet_period, with their configured values.
-func TestServeListeners_StartupLineReportsTheSuiteCap(t *testing.T) {
+// startupLogs runs the daemon on a config of cacheDir plus extra TOML until
+// it serves, shuts it down, and returns its log lines, decoded.
+func startupLogs(t *testing.T, cacheDir, extra string) []map[string]any {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.toml")
-	text := "[cache]\ndir = \"" + t.TempDir() + "\"\n[freshness]\nmax_suites = 1234\n[adoption]\nflip_quiet_period = \"5s\"\n" +
-		"[tls_mitm]\nenabled = false\n[admin]\nenabled = false\n"
+	text := "[cache]\ndir = \"" + cacheDir + "\"\n" + extra + "[tls_mitm]\nenabled = false\n[admin]\nenabled = false\n"
 	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -3950,8 +5529,8 @@ func TestServeListeners_StartupLineReportsTheSuiteCap(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- serveListeners(ctx, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), ln, nil, nil, nil) }()
-	// Wait until the daemon serves (the startup line precedes opening the
-	// cache), then shut it down.
+	// Wait until the daemon serves (the startup line and the startup
+	// checks precede it), then shut it down.
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		resp, err := http.Get("http://" + ln.Addr().String() + "/healthz-probe")
@@ -3969,11 +5548,28 @@ func TestServeListeners_StartupLineReportsTheSuiteCap(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("serveListeners: %v", err)
 	}
+	var recs []map[string]any
 	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
 		var rec map[string]any
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			t.Fatalf("decode %q: %v", line, err)
 		}
+		recs = append(recs, rec)
+	}
+	return recs
+}
+
+// The startup line reports freshness.max_suites, and (deferred minor C-35)
+// adoption.flip_quiet_period, with their configured values; an empty
+// suite table reaches no cap.
+func TestServeListeners_StartupLineReportsTheSuiteCap(t *testing.T) {
+	recs := startupLogs(t, t.TempDir(), "[freshness]\nmax_suites = 1234\n[adoption]\nflip_quiet_period = \"5s\"\n")
+	for _, rec := range recs {
+		if rec["msg"] == "suite_caps_exceeded" {
+			t.Errorf("suite_caps_exceeded on an empty cache: %v", rec)
+		}
+	}
+	for _, rec := range recs {
 		if rec["msg"] != "apt-cacher-ultra starting" {
 			continue
 		}
@@ -3986,6 +5582,38 @@ func TestServeListeners_StartupLineReportsTheSuiteCap(t *testing.T) {
 		return
 	}
 	t.Fatal("startup line not found")
+}
+
+// Ruling PD-8: a suite table that already reaches a cap is reported at
+// startup — here two suites of one host against max_suites = 10, whose
+// per-host cap is one.
+func TestServeListeners_WarnsWhenTheSuiteCapsAreReached(t *testing.T) {
+	cacheDir := t.TempDir()
+	ctx := context.Background()
+	c, err := cache.Open(ctx, cacheDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, suite := range []string{"/a/dists/x", "/b/dists/x"} {
+		if err := c.EnsureSuiteForTest(ctx, "http", "h.example", suite); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range startupLogs(t, cacheDir, "[freshness]\nmax_suites = 10\n") {
+		if rec["msg"] != "suite_caps_exceeded" {
+			continue
+		}
+		if rec["level"] != "WARN" || rec["suites"] != float64(2) || rec["max_suites"] != float64(10) ||
+			rec["hosts_at_cap"] != float64(1) || rec["per_host_cap"] != float64(1) ||
+			rec["fullest_host"] != "h.example" || rec["fullest_host_suites"] != float64(2) {
+			t.Fatalf("suite_caps_exceeded = %v; want 2 suites of max 10, one host at its cap of 1 (h.example, 2)", rec)
+		}
+		return
+	}
+	t.Fatal("suite_caps_exceeded not logged")
 }
 ```
 
@@ -4025,7 +5653,47 @@ In `packaging/config/config.toml.default`, `[freshness]`, after `max_concurrent_
 max_suites               = 5000  # tracked suites; a tenth per host; at least 10
 ```
 
-In `cmd/apt-cacher-ultra/main.go`: add `"freshness_max_suites", cfg.Freshness.MaxSuites,` to the startup line after `"freshness_max_concurrent_adoptions", …`; replace the inline `freshness.New(freshness.Config{…})` literal with `freshness.New(checkerConfig(freshCtx, cfg, c, fetchClient, hostLimiter, logger, adopter, adoptionRing))`, and add before `handlerConfig`:
+In `cmd/apt-cacher-ultra/main.go`: after the `RunLegacyTrustAudit` block add
+
+```go
+	// Ruling PD-8: a suite table already at or above a cap refuses new
+	// suites until cap eviction or phase F's reaper makes room; say so.
+	warnSuiteCaps(ctx, c, cfg.Freshness.MaxSuites, logger)
+```
+
+and, before `checkerConfig`,
+
+```go
+// warnSuiteCaps logs WARN suite_caps_exceeded at startup when the suite
+// table is at or above freshness.max_suites or a canonical host holds at
+// least a tenth of it (ruling PD-8): a lowered cap, or an upgraded v6
+// table, then refuses new suites. At or above the global cap every
+// creation attempt still evicts one suite idle for 24 h, so the table
+// converges; a host at its cap never evicts and waits for phase F's
+// reaper (gc.suite_idle_ttl, 30 days). A read error is logged and
+// otherwise ignored: the caps hold either way.
+func warnSuiteCaps(ctx context.Context, c *cache.Cache, maxSuites int, logger *slog.Logger) {
+	perHost := maxSuites / 10
+	u, err := c.SuiteCapUsage(ctx, perHost)
+	if err != nil {
+		logger.Warn("suite cap usage read failed", "err", err)
+		return
+	}
+	if u.Total < maxSuites && u.HostsAtCap == 0 {
+		return
+	}
+	logger.Warn("suite_caps_exceeded",
+		"suites", u.Total,
+		"max_suites", maxSuites,
+		"hosts_at_cap", u.HostsAtCap,
+		"per_host_cap", perHost,
+		"fullest_host", u.FullestHost,
+		"fullest_host_suites", u.FullestHostRows,
+	)
+}
+```
+
+Add `"freshness_max_suites", cfg.Freshness.MaxSuites,` to the startup line after `"freshness_max_concurrent_adoptions", …`; replace the inline `freshness.New(freshness.Config{…})` literal with `freshness.New(checkerConfig(freshCtx, cfg, c, fetchClient, hostLimiter, logger, adopter, adoptionRing))`, and add before `handlerConfig`:
 
 ```go
 // checkerConfig is the freshness checker's configuration (spec C4, C11:
@@ -4042,7 +5710,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each: (a) drop the `Load` default → `TestFreshnessMaxSuites_DefaultAndBounds` FAILS; (b) `MaxSuites < 1` → the same test FAILS (`max_suites = 9: err = <nil>`); (c) drop `MaxSuites` from `checkerConfig` → `TestCheckerConfig_CarriesMaxSuites` FAILS; (d) drop the startup field → `TestServeListeners_StartupLineReportsTheSuiteCap` FAILS (`freshness_max_suites = <nil>`); (e) drop the packaged line → `TestDefaultConfigFileDocumentsEveryKey` FAILS.
+One at a time, reverting each: (a) drop the `Load` default → `TestFreshnessMaxSuites_DefaultAndBounds` FAILS (`default: freshness.max_suites must be at least 10` — with D10's split checks, a failure rather than the draft's nil-pointer panic); (b) `MaxSuites < 1` → the same test FAILS (`max_suites = 9: err = <nil>`); (c) drop `MaxSuites` from `checkerConfig` → `TestCheckerConfig_CarriesMaxSuites` FAILS; (d) drop the startup field → `TestServeListeners_StartupLineReportsTheSuiteCap` FAILS (`freshness_max_suites = <nil>`); (e) drop the packaged line → `TestDefaultConfigFileDocumentsEveryKey` FAILS; (f) drop the `warnSuiteCaps` call → `TestServeListeners_WarnsWhenTheSuiteCapsAreReached` FAILS (`suite_caps_exceeded not logged`); (g) warn only at the global cap (`if u.Total < maxSuites {`) → the same test FAILS; (h) `perHost := maxSuites` → the same test FAILS; (i) warn unconditionally → `TestServeListeners_StartupLineReportsTheSuiteCap` FAILS (`suite_caps_exceeded on an empty cache`).
 
 - [ ] **Step 6: Commit**
 
@@ -4059,23 +5727,23 @@ Expected: `gofmt -l` prints nothing; lint `0 issues`.
 
 ### Task 9: The handler's miss path creates rows and markers before the body
 
-Spec C3, handler side, for misses: a suite file's bytes must pass their sniff before they count; the url_path row, the suite row (`<suite>/InRelease` always; `<suite>/Release` and flat indexes with an adopter wired) and the marker of a sniff-passing `InRelease`/`Release.gpg` are stored by one writer operation (`StoreFetched`, Task 6) before the body is written; a failed operation answers 502 with no body (today's url_path-write failure path, unchanged); `Release.gpg` creates no row; the caps with the checker as the eviction guard; the 10-minute rejection cache; WARN `suite_seed_rejected` (rate-limited), its counter and gauge (R-D5); the adoption-disabled seed byte for byte with no T1 (R-D4: `TestServeHTTP_AdoptionDisabledSeedParity`); the overview's phase C carry-forward "the serve that creates a suite's row registers with the flip barrier" (a test that fails without it). Design notes 1 (seed values), 2 (no T1 on the miss path), 4 and deviation 2 (a creation marks the suite's other cached signed anchors), 5 (a refresh miss no longer re-stamps), 9 (a late registration that waited serves what is current), 14 (`suite_evicted`). From here the handler sniffs `InRelease`, so the five handler fixtures that relied on a plain-text `InRelease` creating a row serve `simtest.ClearsignedFixture` (Step 1; they pass before and after the production change).
+Spec C3, handler side, for misses: a suite file's bytes must pass their sniff before they count; the url_path row, the suite row (`<suite>/InRelease` always; `<suite>/Release` and flat indexes with an adopter wired) and the marker of a sniff-passing `InRelease`/`Release.gpg` are stored by one writer operation (`StoreFetched`, Task 6) before the body is written; a failed operation answers 502 with no body (today's url_path-write failure path, unchanged); `Release.gpg` creates no row; the caps with the checker as the eviction guard; the 10-minute rejection cache; WARN `suite_seed_rejected` (rate-limited), its counter and gauge (R-D5); the adoption-disabled seed byte for byte with no T1 (R-D4: `TestServeHTTP_AdoptionDisabledSeedParity`); the overview's phase C carry-forward "the serve that creates a suite's row registers with the flip barrier" (a test that fails without it). Design notes 1 (seed values), 2 (no T1 on the miss path), 4 and deviation 2 (ruling PD-5: a creating miss reads and sniffs the suite's other cached signed anchors before it submits — `cachedAnchors` fills `SuiteSeed.Cached` — so the creating transaction marks them; only an unproven creation runs the `markCachedSignedAnchors` backstop, after the late registration), 5 (ruling PD-6: with no adopter, a sniff-passing `InRelease` refresh miss re-stamps the row — `FetchedRow.Restamp`), 9 (a late registration that waited serves what is current; design review M1: its line keeps the miss's outcome and upstream status and carries `flip_held_ms`, and a client that left while it waited is a client abort — `heldContext` and `clientLeft`, shared with `ServeHTTP`'s entry registration and Task 10's onboarding hits), 14 (`suite_evicted`). Design review M10: the rejection cache runs a sweep timer while it holds entries (so its refusals and `acu_suites_seed_rejected` expire without traffic; `Close` stops it; the timer's goroutine recovers panics through the new `logGoroutinePanic`, which `maybeFireFreshness` now shares). Exec review D2, D4, D11, D14 and D17 add tests (validator-less seed, no marker for an unsigned `Release`, the rejection cache on a url_path hit — it bites from Task 10's onboarding on —, an existing row is no refusal, the per-call sweep); ruling PD-9's end-to-end test serves an overlong suite path untracked. The rejection cache is keyed by the suite alone, whichever file was refused, so phase G's flat indexes share an entry. Phase E's T1-on-seed keys on `FetchedResult.Create.Outcome == cache.SuiteCreated` (`CreateResult.Outcome` on the hit path); `FetchedResult.Tracked` is what the late registration uses. The handler and cmd fixtures already serve clearsigned `InRelease` bodies (Task 3's fixture-only commit, ruling PD-2).
 
 **Files:**
 - Create: `internal/handler/suite_rows.go`, `internal/handler/suite_rows_test.go`
-- Modify: `internal/handler/handler.go` (`Config.MaxSuites`, `Config.SuiteGuard`; handler fields; `New`; `ServeHTTP`; `tryCacheHit`, `trySnapshotHit`; `serveCacheMiss`; `runFetch`), `internal/handler/metrics.go`, `internal/handler/singleflight.go`, `cmd/apt-cacher-ultra/main.go` (`handlerConfig`), `cmd/apt-cacher-ultra/suite_caps_wiring_test.go`
-- Modify tests (fixtures): `internal/handler/handler_test.go`, `phase2_handler_test.go`, `phase2_chaos_test.go`, `phase3_chaos_test.go`, `chaos_test.go`
+- Modify: `internal/handler/handler.go` (`Config.MaxSuites`, `Config.SuiteGuard`; handler fields; `New`; `Close`; `ServeHTTP`; `heldContext`, `clientLeft`; `maybeFireFreshness`, `logGoroutinePanic`; `tryCacheHit`, `trySnapshotHit`; `serveCacheMiss`; `runFetch`), `internal/handler/metrics.go`, `internal/handler/singleflight.go`, `cmd/apt-cacher-ultra/main.go` (`handlerConfig`), `cmd/apt-cacher-ultra/suite_caps_wiring_test.go`
+- Modify tests: `internal/handler/handler_test.go` (`TestServeHTTP_MissOnInReleaseSeedsFreshness`'s doc)
 
 **Interfaces:**
-- Consumes: Task 1's `aptpath.ClassifySuiteFile`, `SuiteFile` (`CreatesRow`, `Marks`, `HeadBytes`, `Sniff`), `aptpath.MarkerBase`; Task 4's `cache.SuiteKey`, `SuiteSeed`, `SuiteCaps`, `CreateResult`, `SuiteGuard`; Task 5's eviction (through the guard); Task 6's `FetchedRow`, `StoreFetched`, `MarkSignedSeenBatch`; Task 7's `(*freshness.Checker).HoldSuite`; Task 8's `checkerConfig`; test helpers `syncLog`, `logRecords` (`flip_hook_test.go`), `sumMetricLines` (`disabled_mode_parity_test.go`), `newRecordingFreshness`, `silentLogger`, `proxyReq` (`handler_test.go`), `writeBlob` (`phase2_handler_test.go`), `newFlipStack` (`flip_stack_test.go`), `newAdoptionWiringDeps`, `minimalCfg`, `silentBuildLogger` (cmd).
+- Consumes: Task 1's `aptpath.ClassifySuiteFile`, `SuiteFile` (`CreatesRow`, `Marks`, `HeadBytes`, `Sniff`), `aptpath.MarkerBase`, `aptpath.MaxSuitePathBytes`; Task 4's `cache.SuiteKey`, `SuiteSeed` (`Cached`), `CachedAnchor`, `SuiteCaps`, `CreateResult` (`Unproven`), `SuiteGuard`; Task 5's eviction (through the guard) and `SuiteExists`; Task 6's `FetchedRow` (`Restamp`), `StoreFetched`, `MarkSignedSeenBatch`; Task 7's `(*freshness.Checker).HoldSuite`; Task 8's `checkerConfig`; test helpers `syncLog` (`byhash_displaced_test.go`), `logRecords` (`flip_hook_test.go`), `newFlipStackLogging` (`flip_stack_test.go`), `sumMetricLines` (`disabled_mode_parity_test.go`), `newRecordingFreshness`, `silentLogger`, `proxyReq` (`handler_test.go`), `writeBlob` (`phase2_handler_test.go`), `newFlipStack` (`flip_stack_test.go`), `newAdoptionWiringDeps`, `minimalCfg`, `silentBuildLogger` (cmd).
 - Produces (Task 10 builds on them):
-  - `handler.Config.MaxSuites int`, `handler.Config.SuiteGuard cache.SuiteGuard`; handler fields `maxSuites`, `suiteGuard`, `rejections seedRejections`, `seedWarn seedWarn`.
-  - In `suite_rows.go`: `type suiteReq struct { key cache.SuiteKey; file aptpath.SuiteFile; tracked bool; tok *flipgate.Token }`, `newSuiteReq(req *proxy.Request) *suiteReq`, `suiteKeyOf(req *proxy.Request) cache.SuiteKey`, `seedRejections` (`rejected`, `add`, `len`), `seedWarn`, `(h *Handler) suiteCaps() cache.SuiteCaps`, `(h *Handler) suiteSeed(sr *suiteReq, miss bool, etag, lastmod string, now int64) *cache.SuiteSeed`, `(h *Handler) noteCreate(key cache.SuiteKey, res cache.CreateResult)`, `readHead(path string, n int) ([]byte, error)`, `(h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKey, except string)`, `(h *Handler) registerLate(r *http.Request, req *proxy.Request, sr *suiteReq) bool`; constants `seedRejectTTL = 10 * time.Minute`, `seedRejectMax = 4096`, `seedRejectSweep = time.Minute`, `seedWarnEvery = time.Minute`.
-  - `tryCacheHit(…, sr *suiteReq)`, `trySnapshotHit(…, sr *suiteReq)`, `serveCacheMiss(…, sr *suiteReq)`, `runFetch(ctx, req, file aptpath.SuiteFile, trackedAtStart bool)`; `sfResult.suiteTracked bool`.
+  - `handler.Config.MaxSuites int`, `handler.Config.SuiteGuard cache.SuiteGuard`; handler fields `maxSuites`, `suiteGuard`, `rejections seedRejections`, `seedWarn seedWarn`, `cachedAnchorsHook func()` (test seam); `heldContext(r *http.Request, t *flipgate.Token) *http.Request`, `clientLeft(w http.ResponseWriter, r *http.Request) bool`; `(h *Handler) logGoroutinePanic(event string, stackOnce *atomic.Bool, v any, attrs ...any)`; `rejectionPanicStackLogged`.
+  - In `suite_rows.go`: `type suiteReq struct { key cache.SuiteKey; file aptpath.SuiteFile; tracked bool; tok *flipgate.Token }`, `newSuiteReq(req *proxy.Request) *suiteReq`, `suiteKeyOf(req *proxy.Request) cache.SuiteKey`, `seedRejections` (`rejected`, `add`, `len`, `close`; sweep timer `armLocked`/`expire`), `seedWarn`, `(h *Handler) suiteCaps() cache.SuiteCaps`, `(h *Handler) suiteSeed(sr *suiteReq, miss bool, etag, lastmod string, now int64) *cache.SuiteSeed`, `(h *Handler) noteCreate(key cache.SuiteKey, res cache.CreateResult)`, `readHead(path string, n int) ([]byte, error)`, `lastUse(row *cache.URLPath) int64`, `(h *Handler) cachedAnchors(ctx context.Context, key cache.SuiteKey, except string) []cache.CachedAnchor`, `(h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKey, except string)` (the backstop), `(h *Handler) registerLate(r *http.Request, req *proxy.Request, sr *suiteReq) *flipgate.Token`; constants `seedRejectTTL = 10 * time.Minute`, `seedRejectMax = 4096`, `seedRejectSweep = time.Minute`, `seedWarnEvery = time.Minute`.
+  - `tryCacheHit(…, sr *suiteReq)`, `trySnapshotHit(…, sr *suiteReq)`, `serveCacheMiss(…, sr *suiteReq)`, `runFetch(ctx, req, file aptpath.SuiteFile, trackedAtStart bool)`; `sfResult.suiteTracked bool`, `sfResult.unproven bool`.
   - Metrics `acu_suite_seed_rejected_total{host}` (`suiteSeedRejectedTotal`) and `acu_suites_seed_rejected` (`seedRejectedSuites`).
-  - Test helpers (`suite_rows_test.go`): `suiteRig` / `newSuiteRig(t, adoption bool, maxSuites int)` with `serve`, `get`, `suite`, `marked`, `watch`, `secondConn`; `upFile`; `staticUpstream`; fixtures `rowInRelease`, `rowRelease`, `rowGPG`, `rowHTML`; `derefI64`, `derefStr`.
+  - Test helpers (`suite_rows_test.go`): `suiteRig` / `newSuiteRig(t, adoption bool, maxSuites int)` with `serve`, `get`, `suite`, `marked`, `watch`, `secondConn`; `upFile`; `staticUpstream`; fixtures `rowInRelease`, `rowRelease`, `rowGPG`, `rowHTML`; `derefI64`, `derefStr`; `(s *flipStack) holdUntilTracked(suite string, linger time.Duration, commit func() error) chan struct{}`.
 
-- [ ] **Step 1: Write the failing tests, and migrate the fixtures**
+- [ ] **Step 1: Write the failing tests**
 
 Create `internal/handler/suite_rows_test.go`:
 
@@ -4218,9 +5886,10 @@ func (r *suiteRig) marked(base string) bool {
 }
 
 // R-D4: with no adopter, the first-contact miss of <suite>/InRelease
-// creates the row today's handler creates — every column — and no T1
-// fires; no other path creates a row, and an InRelease that fails the
-// sniff creates none.
+// creates the row today's handler creates — every column, NULL validators
+// for a miss without them — and no T1 fires; a refresh miss re-stamps the
+// row as today's seed upsert did (ruling PD-6); no other path creates a
+// row, and an InRelease that fails the sniff creates none.
 func TestServeHTTP_AdoptionDisabledSeedParity(t *testing.T) {
 	r := newSuiteRig(t, false, 0)
 	const lm = "Mon, 01 Jan 2024 00:00:00 GMT"
@@ -4248,6 +5917,42 @@ func TestServeHTTP_AdoptionDisabledSeedParity(t *testing.T) {
 	if s.AdoptionFailHash != nil || s.AdoptionFailReason != nil || s.AdoptionFailCount != 0 || s.AdoptionFailFirstAt != nil ||
 		s.AdoptionFailLastAt != nil || s.AdoptionNextRetryAt != nil || s.AdoptionFailETag != nil || s.AdoptionFailLastMod != nil {
 		t.Fatalf("row = %+v, want an empty failure record", s)
+	}
+	// A miss without validators seeds NULL validators, as today's seed does.
+	r.serve("/r/dists/n/InRelease", upFile{body: rowInRelease})
+	if rec := r.get("/r/dists/n/InRelease"); rec.Code != http.StatusOK {
+		t.Fatalf("validator-less miss = %d", rec.Code)
+	}
+	if n := r.suite("/r/dists/n"); n == nil || n.InReleaseETag != nil || n.InReleaseLastMod != nil {
+		t.Fatalf("validator-less seed = %+v, want NULL validators", n)
+	}
+	// Ruling PD-6: a refresh miss (the url_path anchor gone, upstream moved
+	// on) re-stamps the row with the second miss's stamps and validators,
+	// clears the pending change and the failed checks, and keeps the
+	// interest stamp — today's seed upsert, UPDATE-only.
+	if _, err := r.secondConn().Exec(`DELETE FROM url_path WHERE path = '/r/dists/s/InRelease';
+UPDATE suite_freshness SET last_check_at = 7, last_success_at = 7, inrelease_change_seen_at = 5, check_fail_count = 3
+ WHERE suite_path = '/r/dists/s'`); err != nil {
+		t.Fatal(err)
+	}
+	const lm2 = "Tue, 02 Jan 2024 00:00:00 GMT"
+	r.serve("/r/dists/s/InRelease", upFile{body: simtest.ClearsignedFixture("Origin: T\nSuite: s\nVersion: 2\n"), etag: `"e2"`, lastMod: lm2})
+	before = wallclock.Unix()
+	if rec := r.get("/r/dists/s/InRelease"); rec.Code != http.StatusOK {
+		t.Fatalf("refresh miss = %d", rec.Code)
+	}
+	after = wallclock.Unix()
+	s = r.suite("/r/dists/s")
+	if stamp2 := derefI64(s.LastCheckAt); stamp2 < before || stamp2 > after || derefI64(s.LastSuccessAt) != stamp2 {
+		t.Fatalf("after the refresh miss check=%v success=%v, want the second miss's second in [%d, %d]",
+			s.LastCheckAt, s.LastSuccessAt, before, after)
+	}
+	if derefStr(s.InReleaseETag) != `"e2"` || derefStr(s.InReleaseLastMod) != lm2 || s.InReleaseChangeSeenAt != nil ||
+		s.CheckFailCount != 0 || s.CurrentSnapshotID != nil {
+		t.Fatalf("after the refresh miss row = %+v, want the second miss's validators, no change, no failed checks", s)
+	}
+	if derefI64(s.LastRequestedAt) != stamp {
+		t.Fatalf("last_requested_at = %d, want %d (a refresh miss is no creation)", derefI64(s.LastRequestedAt), stamp)
 	}
 	for path, f := range map[string]upFile{
 		"/r/dists/t/Release":       {body: rowRelease},
@@ -4295,6 +6000,83 @@ func TestServeHTTP_AdopterWiredMissesCreateUnstampedRows(t *testing.T) {
 		if r.suite(suite) != nil {
 			t.Errorf("%s: a row was created (HTML Release, or Release.gpg)", suite)
 		}
+	}
+	if r.marked("/r/dists/b") {
+		t.Fatal("an unsigned Release miss wrote a signed-seen marker")
+	}
+	// Design note 5: with an adopter, a refresh miss leaves the row as it
+	// is — here the state its checks wrote.
+	if _, err := r.secondConn().Exec(`DELETE FROM url_path WHERE path = '/r/dists/a/InRelease';
+UPDATE suite_freshness SET last_check_at = 7, last_success_at = 6, inrelease_etag = 'checked', inrelease_change_seen_at = 5,
+       check_fail_count = 2 WHERE suite_path = '/r/dists/a'`); err != nil {
+		t.Fatal(err)
+	}
+	r.serve("/r/dists/a/InRelease", upFile{body: simtest.ClearsignedFixture("Origin: T\nVersion: 2\n"), etag: `"e9"`})
+	if rec := r.get("/r/dists/a/InRelease"); rec.Code != http.StatusOK {
+		t.Fatalf("refresh miss = %d", rec.Code)
+	}
+	if s := r.suite("/r/dists/a"); s == nil || derefI64(s.LastCheckAt) != 7 || derefI64(s.LastSuccessAt) != 6 ||
+		derefStr(s.InReleaseETag) != "checked" || derefI64(s.InReleaseChangeSeenAt) != 5 || s.CheckFailCount != 2 {
+		t.Fatalf("after an adopter-wired refresh miss row = %+v, want it as its checks left it", s)
+	}
+}
+
+// Ruling PD-5: a miss that creates its suite's row marks, in the creating
+// transaction, the signed anchors the suite already has cached — here a
+// Release.gpg stored while the suite was untracked — and no plain-text
+// one; a cached anchor that changed after it was sniffed makes the
+// creation unproven, and the backstop marks it after the commit.
+func TestServeHTTP_CreatingMissMarksCachedSignedAnchors(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	r.serve("/r/dists/g/Release.gpg", upFile{body: rowGPG})
+	r.get("/r/dists/g/Release.gpg")
+	if r.marked("/r/dists/g") {
+		t.Fatal("premise: an untracked suite's Release.gpg is unmarked")
+	}
+	r.serve("/r/dists/g/Release", upFile{body: rowRelease})
+	if rec := r.get("/r/dists/g/Release"); rec.Code != http.StatusOK || r.suite("/r/dists/g") == nil || !r.marked("/r/dists/g") {
+		t.Fatalf("Release miss = %d; want the row created and its cached Release.gpg marked", rec.Code)
+	}
+	r.serve("/r/dists/p/InRelease", upFile{body: rowHTML}) // an HTML soft-404, cached
+	r.get("/r/dists/p/InRelease")
+	r.serve("/r/dists/p/Release", upFile{body: rowRelease})
+	if r.get("/r/dists/p/Release"); r.suite("/r/dists/p") == nil || r.marked("/r/dists/p") {
+		t.Fatal("p: want the row created, with no marker for its plain-text cached InRelease")
+	}
+	r.serve("/r/dists/q/Release.gpg", upFile{body: []byte("not a signature\n")})
+	r.get("/r/dists/q/Release.gpg")
+	r.h.cachedAnchorsHook = func() { // the cached Release.gpg changes after it was sniffed
+		r.h.cachedAnchorsHook = nil
+		h := writeBlob(t, r.h, rowGPG)
+		at := wallclock.Unix()
+		if err := r.c.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+			Path: "/r/dists/q/Release.gpg", BlobHash: &h, UpstreamURL: r.srv.URL + "/r/dists/q/Release.gpg", IsMetadata: true,
+			LastFetchedAt: &at}); err != nil {
+			t.Error(err)
+		}
+	}
+	r.serve("/r/dists/q/Release", upFile{body: rowRelease})
+	if r.get("/r/dists/q/Release"); r.suite("/r/dists/q") == nil || !r.marked("/r/dists/q") {
+		t.Fatal("q: want the row created and the changed Release.gpg marked by the backstop")
+	}
+}
+
+// Ruling PD-9: a suite path over 1 KiB is no suite — its anchors are
+// served, but create no row and no marker.
+func TestServeHTTP_OverlongSuitePathIsServedUntracked(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	suite := "/r/dists/" + strings.Repeat("x", aptpath.MaxSuitePathBytes)
+	for _, f := range []struct {
+		name string
+		body []byte
+	}{{"/InRelease", rowInRelease}, {"/Release", rowRelease}, {"/Release.gpg", rowGPG}} {
+		r.serve(suite+f.name, upFile{body: f.body})
+		if rec := r.get(suite + f.name); rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), f.body) {
+			t.Fatalf("%s = %d", f.name, rec.Code)
+		}
+	}
+	if r.suite(suite) != nil || r.marked(suite) {
+		t.Fatal("an overlong suite path got a row or a marker")
 	}
 }
 
@@ -4427,6 +6209,7 @@ func TestServeHTTP_SuiteCapRejectionIsCachedCountedAndLogged(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.get("/r/dists/b/InRelease") // a second miss within the window: the cache answers
+	r.get("/r/dists/b/InRelease") // a url_path hit within the window: onboarding asks the cache too
 	got := sumMetricLines(t, []string{"acu_suite_seed_rejected_total", "acu_suites_seed_rejected"})
 	if d := got["acu_suite_seed_rejected_total"] - before; d != 1 {
 		t.Fatalf("acu_suite_seed_rejected_total rose by %v, want 1 (the repeat is cached)", d)
@@ -4463,7 +6246,55 @@ func TestSeedRejections_TTLAndBound(t *testing.T) {
 		if n := s.len(); n != 1 {
 			t.Fatalf("after overflowing with live entries: %d entries, want 1 (cleared, then the new one)", n)
 		}
+		// An expired entry is swept when another suite is asked about (the
+		// sweep timer is stopped, so only that sweep can drop it).
+		s.close()
+		time.Sleep(seedRejectTTL + seedRejectSweep)
+		other := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/other"}
+		if s.rejected(other) || s.len() != 0 {
+			t.Fatalf("after the TTL: %d entries, want 0 (swept)", s.len())
+		}
 	})
+}
+
+// Design review M10: without traffic, the cache's sweep timer expires its
+// refusals and keeps acu_suites_seed_rejected current; Close stops it.
+func TestSeedRejections_ExpireWithoutTraffic(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var s seedRejections
+		s.add(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/s"})
+		if got := sumMetricLines(t, []string{"acu_suites_seed_rejected"})["acu_suites_seed_rejected"]; got != 1 {
+			t.Fatalf("gauge = %v, want 1", got)
+		}
+		time.Sleep(seedRejectTTL + seedRejectSweep)
+		synctest.Wait()
+		if s.len() != 0 {
+			t.Fatalf("%d entries after the TTL with no traffic, want 0", s.len())
+		}
+		if got := sumMetricLines(t, []string{"acu_suites_seed_rejected"})["acu_suites_seed_rejected"]; got != 0 {
+			t.Fatalf("gauge = %v after the TTL with no traffic, want 0", got)
+		}
+		s.add(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/t"})
+		s.close()
+		time.Sleep(seedRejectTTL + seedRejectSweep)
+		synctest.Wait()
+		if s.len() != 1 {
+			t.Fatalf("%d entries; want the closed cache's timer stopped (1 entry left)", s.len())
+		}
+	})
+}
+
+// A creation that found its row already there is no refusal: nothing is
+// cached, counted or logged.
+func TestNoteCreate_AnExistingRowIsNoRefusal(t *testing.T) {
+	logs := &syncLog{}
+	h := &Handler{logger: slog.New(slog.NewJSONHandler(logs, nil)), maxSuites: 10}
+	before := sumMetricLines(t, []string{"acu_suite_seed_rejected_total"})["acu_suite_seed_rejected_total"]
+	h.noteCreate(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/s"}, cache.CreateResult{Outcome: cache.SuiteExists})
+	if h.rejections.len() != 0 || len(logRecords(logs, "", slog.LevelDebug)) != 0 ||
+		sumMetricLines(t, []string{"acu_suite_seed_rejected_total"})["acu_suite_seed_rejected_total"] != before {
+		t.Fatal("an existing row was treated as a refusal")
+	}
 }
 
 // R-D5: suite_seed_rejected is rate-limited to one line per minute
@@ -4530,12 +6361,42 @@ func TestServeHTTP_RowCreatingServeRegistersWithTheBarrier(t *testing.T) {
 	})
 }
 
+// holdUntilTracked starts a flip of suite (idle: its hold starts at once)
+// whose hold lasts until the suite has a row — at most a minute of the
+// bubble's time, so a test whose request never creates it fails instead
+// of hanging — plus linger, and then runs commit; it returns once the hold
+// is in place, with a channel closed when the flip is done.
+func (s *flipStack) holdUntilTracked(suite string, linger time.Duration, commit func() error) chan struct{} {
+	s.t.Helper()
+	ctx := context.Background()
+	key := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: flipSimHost, SuitePath: suite}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, err := s.gate.Flip(ctx, flipgate.Key("http", flipSimHost, suite), func() error {
+			for start := time.Now(); time.Since(start) < time.Minute; time.Sleep(10 * time.Millisecond) {
+				if ok, err := s.c.SuiteExists(ctx, key); err != nil || ok {
+					break
+				}
+			}
+			time.Sleep(linger)
+			return commit()
+		})
+		if err != nil {
+			s.t.Error(err)
+		}
+	}()
+	synctest.Wait()
+	return done
+}
+
 // Design note 9: a row-creating serve whose late registration waited in a
 // flip's hold is answered from what is current after the flip — here the
 // snapshot the flip committed — not with the bytes its miss fetched.
 func TestServeHTTP_LateRegistrationThatWaitedServesTheNewSnapshot(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s := newFlipStack(t, 10*time.Second)
+		logs := &syncLog{}
+		s := newFlipStackLogging(t, 10*time.Second, slog.New(slog.NewJSONHandler(logs, nil)))
 		const suite = "/n/dists/s"
 		s.h.fetch = staticUpstream{"http://" + flipSimHost + suite + "/InRelease": rowInRelease}
 		snapBody := simtest.ClearsignedFixture("Origin: snapshot\n")
@@ -4546,31 +6407,52 @@ func TestServeHTTP_LateRegistrationThatWaitedServesTheNewSnapshot(t *testing.T) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		flipped := make(chan struct{})
-		go func() {
-			defer close(flipped)
-			// The suite is idle: the hold starts at once. The commit waits
-			// for the row the client's miss creates.
-			_, err := s.gate.Flip(ctx, flipgate.Key("http", flipSimHost, suite), func() error {
-				for {
-					if ok, err := s.c.SuiteExists(ctx, cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: flipSimHost, SuitePath: suite}); err != nil || ok {
-						break
-					}
-					time.Sleep(time.Millisecond)
-				}
-				return s.c.CommitAdoption(ctx, cand, []cache.SnapshotMember{{SnapshotID: cand, Path: "InRelease",
-					BlobHash: hash, DeclaredSHA256: hash}}, nil, nil, nil, false)
-			})
-			if err != nil {
-				t.Error(err)
-			}
-		}()
-		synctest.Wait() // the flip holds
+		// The commit waits for the row the client's miss creates.
+		flipped := s.holdUntilTracked(suite, 0, func() error {
+			return s.c.CommitAdoption(ctx, cand, []cache.SnapshotMember{{SnapshotID: cand, Path: "InRelease",
+				BlobHash: hash, DeclaredSHA256: hash}}, nil, nil, nil, false)
+		})
 		rec := httptest.NewRecorder()
 		s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+suite+"/InRelease", nil))
 		<-flipped
 		if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), snapBody) {
 			t.Fatalf("status %d body %q; want the committed snapshot's InRelease", rec.Code, rec.Body.String())
+		}
+		// Design review M1: the line keeps the miss's outcome and upstream
+		// status, and says the request waited.
+		lines := logRecords(logs, "request", slog.LevelInfo)
+		if len(lines) != 1 || lines[0]["outcome"] != "miss" || lines[0]["upstream_status"] != float64(200) || lines[0]["flip_held_ms"] == nil {
+			t.Fatalf("request lines %v, want one miss line with upstream_status 200 and flip_held_ms", lines)
+		}
+	})
+}
+
+// Design review M1: a row-creating serve whose client leaves during its
+// late registration's wait is a client abort, as on the entry path — 503,
+// no WARN — and its line keeps the miss's upstream status.
+func TestServeHTTP_LateRegistrationClientThatLeftIsAClientAbort(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &syncLog{}
+		s := newFlipStackLogging(t, 10*time.Second, slog.New(slog.NewJSONHandler(logs, nil)))
+		const suite = "/n/dists/s"
+		s.h.fetch = staticUpstream{"http://" + flipSimHost + suite + "/InRelease": rowInRelease}
+		// The hold ends two seconds after the client's miss created the row.
+		flipped := s.holdUntilTracked(suite, 2*time.Second, func() error { return nil })
+		rctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Second, cancel) // the client leaves during the late wait
+		rec := httptest.NewRecorder()
+		s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+suite+"/InRelease", nil).WithContext(rctx))
+		<-flipped
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status %d, want 503", rec.Code)
+		}
+		if warns := logRecords(logs, "", slog.LevelWarn); len(warns) != 0 {
+			t.Errorf("a client that left during the late wait logged %d WARN or worse, first %v", len(warns), warns[0])
+		}
+		lines := logRecords(logs, "request", slog.LevelInfo)
+		if len(lines) != 1 || lines[0]["outcome"] != "client_canceled" || lines[0]["upstream_status"] != float64(200) ||
+			lines[0]["flip_held_ms"] == nil {
+			t.Fatalf("request lines %v, want one client_canceled line with upstream_status 200 and flip_held_ms", lines)
 		}
 	})
 }
@@ -4617,17 +6499,21 @@ func TestHandlerConfig_CarriesTheSuiteCapsAndGuard(t *testing.T) {
 }
 ```
 
-Fixtures (each test's `InRelease` now passes the sniff; add the `internal/simtest` import where missing):
-- `handler_test.go`, `TestServeHTTP_MissOnInReleaseSeedsFreshness`: `body := simtest.ClearsignedFixture("Origin: Ubuntu\nSuite: noble\n")`; its doc says the cache "creates" (not "upserts") a row after a miss of a suite's "(clearsigned, spec C3 sniff) InRelease".
-- `phase2_handler_test.go`, `TestServeHTTP_PreSnapshotSuiteUsesURLPath`: `body := simtest.ClearsignedFixture("Phase 1 InRelease bytes") // creates the row (spec C3 sniff)`.
-- `phase2_chaos_test.go`, `makeChaos2Snapshot`: `inRelease: simtest.ClearsignedFixture(string(rel)), // passes the spec C3 sniff`; `chaos2BuildRelease`'s doc ends "Upstream serves it at /InRelease wrapped by simtest.ClearsignedFixture; the pass-through verifier returns that envelope verbatim and ParseRelease skips its armor lines."
-- `phase3_chaos_test.go`, `makeChaos3Snapshot`: the same `inRelease:` change.
-- `chaos_test.go`, `chaosBodyFor`: for `path == "/ubuntu/dists/noble/InRelease"` return `simtest.ClearsignedFixture("chaos-body|" + path)` (comment: clearsigned, so the priming miss creates the suite's row and later hits fire freshness checks).
+In `internal/handler/handler_test.go`, `TestServeHTTP_MissOnInReleaseSeedsFreshness`'s doc becomes (its body already serves a clearsigned fixture, Task 3):
+
+```go
+// TestServeHTTP_MissOnInReleaseSeedsFreshness asserts the codex fix:
+// after a successful miss-fetch of a suite's (clearsigned, spec C3 sniff)
+// InRelease, the cache creates a suite_freshness row carrying the upstream
+// validators — so the periodic scheduler picks the suite up immediately
+// and the first follow-up freshness check can issue a real conditional GET
+// (instead of an unconditional one because validators are nil).
+```
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `go vet ./internal/handler/ ./cmd/apt-cacher-ultra/`
-Expected: `unknown field MaxSuites in struct literal of type Config` (handler) and `hc.MaxSuites undefined` (cmd). The migrated fixture tests pass on the old handler too.
+Expected: `unknown field MaxSuites in struct literal of type Config` (handler) and `hc.MaxSuites undefined` (cmd).
 
 - [ ] **Step 3: Implement**
 
@@ -4689,13 +6575,24 @@ const (
 )
 
 // seedRejections caches cap rejections per suite (spec C3), so an over-cap
-// suite costs no writer operation per request. Monotonic time. At
-// seedRejectMax entries, expired ones are dropped; if it is still full it
-// is cleared (each suite then costs one more writer operation).
+// suite costs no writer operation per request. The key is the suite alone,
+// whichever of its files was refused (InRelease, Release, a flat index):
+// phase G's flat files share the entry. Monotonic time. At seedRejectMax
+// entries, expired ones are dropped; if it is still full it is cleared
+// (each suite then costs one more writer operation). While it holds
+// entries a timer sweeps it once per seedRejectSweep, so expired refusals
+// — and acu_suites_seed_rejected — fall back without traffic (design
+// review M10).
 type seedRejections struct {
 	mu        sync.Mutex
 	until     map[cache.SuiteKey]time.Time
 	lastSweep time.Time
+	// timer is the pending sweep while entries remain; closed (by
+	// Handler.Close) stops the sweeps for good.
+	timer  *time.Timer
+	closed bool
+	// onPanic reports a panic recovered in the timer's goroutine.
+	onPanic func(v any)
 }
 
 // rejected reports whether key was refused a row within seedRejectTTL.
@@ -4726,7 +6623,46 @@ func (s *seedRejections) add(key cache.SuiteKey) {
 		}
 	}
 	s.until[key] = time.Now().Add(seedRejectTTL)
+	s.armLocked()
 	seedRejectedSuites.Set(float64(len(s.until)))
+}
+
+// armLocked schedules the next sweep while entries remain.
+func (s *seedRejections) armLocked() {
+	if s.timer == nil && !s.closed && len(s.until) > 0 {
+		s.timer = time.AfterFunc(seedRejectSweep, s.expire)
+	}
+}
+
+// expire is the timer's sweep: it drops expired entries, sets the gauge
+// and re-arms while entries remain. Deferred minor C-24: the timer's
+// goroutine recovers its panics.
+func (s *seedRejections) expire() {
+	defer func() {
+		if v := recover(); v != nil && s.onPanic != nil {
+			s.onPanic(v)
+		}
+	}()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.timer = nil
+	if s.closed {
+		return
+	}
+	s.sweepLocked(true)
+	seedRejectedSuites.Set(float64(len(s.until)))
+	s.armLocked()
+}
+
+// close stops the sweeps (Handler.Close). Idempotent.
+func (s *seedRejections) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	if s.timer != nil {
+		s.timer.Stop()
+		s.timer = nil
+	}
 }
 
 // len is the number of suites cached as refused (tests).
@@ -4835,16 +6771,63 @@ func readHead(path string, n int) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(f, int64(n)))
 }
 
-// markCachedSignedAnchors gives a suite this request just created the
-// signed-seen marker its other cached signed anchors earn (spec C3): an
-// InRelease or Release.gpg url_path row stored while the suite had no row
-// (refused at a cap, or cached by an earlier binary) wrote no marker.
-// SeenAt is that row's last use, as in the startup marker pass. A failure
-// is logged; the startup pass heals it at the next start.
+// lastUse is a url_path row's last use: the newer of its last_requested_at
+// and last_fetched_at (0 when neither is set), the stamp a signed-seen
+// marker from it carries, as in the startup marker pass.
+func lastUse(row *cache.URLPath) int64 {
+	var seen int64
+	if row.LastRequestedAt != nil {
+		seen = *row.LastRequestedAt
+	}
+	if row.LastFetchedAt != nil && *row.LastFetchedAt > seen {
+		seen = *row.LastFetchedAt
+	}
+	return seen
+}
+
+// cachedAnchors reads the suite's signed-anchor url_path rows —
+// <suite>/InRelease and <suite>/Release.gpg, but not except, the path this
+// request stores itself — and sniffs each blob here, outside the writer,
+// for a creation to mark in its transaction (cache.SuiteSeed.Cached,
+// ruling PD-5). A missing row is listed without a blob, so one that
+// appears before the transaction makes the creation unproven; a row whose
+// read or pool file fails is listed as not signed (no evidence, no
+// marker), and the transaction's re-read decides whether it changed.
 //
-// AIDEV-NOTE: this keeps the hit-path invariant — every sniff-passing
-// anchor row of a tracked suite has a marker for its base — across row
-// creation, since markers are written only for suites with rows.
+// AIDEV-NOTE: a row creation marks the suite's cached signed anchors in
+// the creating transaction, so a tracked suite never serves an unmarked
+// signed anchor (spec C3, the hit-path invariant at every committed
+// state): markers are written only for suites with rows, and serving an
+// existing tracked suite's anchor writes none.
+func (h *Handler) cachedAnchors(ctx context.Context, key cache.SuiteKey, except string) []cache.CachedAnchor {
+	var out []cache.CachedAnchor
+	for _, name := range []string{"/InRelease", "/Release.gpg"} {
+		p := key.SuitePath + name
+		if p == except {
+			continue
+		}
+		a := cache.CachedAnchor{Path: p}
+		if row, err := h.cache.LookupURL(ctx, key.CanonicalScheme, key.CanonicalHost, p); err == nil && row.BlobHash != nil {
+			a.BlobHash, a.SeenAt = *row.BlobHash, lastUse(row)
+			file := aptpath.ClassifySuiteFile(key.SuitePath, p)
+			if head, err := readHead(h.cache.BlobPath(a.BlobHash), file.HeadBytes()); err == nil {
+				a.Signed = file.Sniff(p, head)
+			}
+		}
+		out = append(out, a)
+	}
+	if h.cachedAnchorsHook != nil {
+		h.cachedAnchorsHook()
+	}
+	return out
+}
+
+// markCachedSignedAnchors is the backstop for an unproven creation
+// (cache.CreateResult.Unproven): a cached anchor row that changed or
+// appeared between cachedAnchors' read and the creating transaction was
+// never sniffed, so it is read, sniffed and marked after the commit (SeenAt
+// is its last use). A failure is logged WARN; the startup marker pass heals
+// it at the next start.
 func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKey, except string) {
 	var marks []cache.SignedSeenMark
 	for _, name := range []string{"/InRelease", "/Release.gpg"} {
@@ -4861,14 +6844,7 @@ func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKe
 		if err != nil || !file.Sniff(p, head) {
 			continue
 		}
-		var seen int64
-		if row.LastRequestedAt != nil {
-			seen = *row.LastRequestedAt
-		}
-		if row.LastFetchedAt != nil && *row.LastFetchedAt > seen {
-			seen = *row.LastFetchedAt
-		}
-		if seen > 0 {
+		if seen := lastUse(row); seen > 0 {
 			marks = append(marks, cache.SignedSeenMark{CanonicalScheme: key.CanonicalScheme,
 				CanonicalHost: key.CanonicalHost, Base: aptpath.MarkerBase(key.SuitePath), SeenAt: seen})
 		}
@@ -4885,27 +6861,119 @@ func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKe
 // registerLate registers, with the flip barrier, the anchor serve of a
 // suite whose row this request created or found created after ServeHTTP's
 // anchorStart (phase C carry-forward: the serve that creates a row is
-// tracked like any other). It reports whether the registration waited in a
-// hold.
-func (h *Handler) registerLate(r *http.Request, req *proxy.Request, sr *suiteReq) bool {
+// tracked like any other), and returns its token — nil when there is
+// nothing to register. ServeHTTP's deferred Done covers it.
+func (h *Handler) registerLate(r *http.Request, req *proxy.Request, sr *suiteReq) *flipgate.Token {
 	if sr.tok != nil || !sr.tracked {
-		return false
+		return nil
 	}
-	t := h.anchorStart(r, req)
-	if t == nil {
-		return false
-	}
-	sr.tok = t
-	return t.Held() > 0
+	sr.tok = h.anchorStart(r, req)
+	return sr.tok
 }
 ```
 
-In `internal/handler/metrics.go`: append to the inventory AIDEV-NOTE `; acu_suite_seed_rejected_total{host} (a suite refused` / `// a row by the spec C3 caps; counted once per refusal that reached the` / `// writer, i.e. at most once per suite per 10-minute rejection-cache` / `// window) and acu_suites_seed_rejected (unlabelled gauge: suites in that` / `// cache now).` (after "retained by-hash)"), and declare `suiteSeedRejectedTotal = metrics.NewCounterWithCap("acu_suite_seed_rejected_total", "Suites refused a suite row by freshness.max_suites (global or per-host cap): they will not refresh. By upstream host (spec C3).", metrics.DefaultMaxSeries, "host")` and `seedRejectedSuites = metrics.NewGaugeWithCap("acu_suites_seed_rejected", "Suites refused a suite row by freshness.max_suites within the last 10 minutes (spec C3 rejection cache).", 0)`, each with a short doc comment. In `internal/handler/singleflight.go`, `sfResult` gains `// suiteTracked: the request's suite has a row after the miss's writer` / `// operation (spec C3).` / `suiteTracked bool`.
+In `internal/handler/metrics.go`: the inventory AIDEV-NOTE becomes
+
+```go
+// AIDEV-NOTE: added by the flat-repository work, outside the SPEC5
+// §10.4.1 inventory: acu_serve_byhash_displaced_total{host} (spec C8
+// retained by-hash); acu_suite_seed_rejected_total{host} (a suite refused
+// a row by the spec C3 caps; counted once per refusal that reached the
+// writer, i.e. at most once per suite per 10-minute rejection-cache
+// window, unless the cache had to clear itself at its 4,096-suite bound)
+// and acu_suites_seed_rejected (unlabelled gauge: suites in that cache
+// now, kept current within a minute by its sweep timer even without
+// traffic).
+```
+
+and declare `suiteSeedRejectedTotal = metrics.NewCounterWithCap("acu_suite_seed_rejected_total", "Suites refused a suite row by freshness.max_suites (global or per-host cap): they will not refresh. By upstream host (spec C3).", metrics.DefaultMaxSeries, "host")` and `seedRejectedSuites = metrics.NewGaugeWithCap("acu_suites_seed_rejected", "Suites refused a suite row by freshness.max_suites within the last 10 minutes (spec C3 rejection cache).", 0)`, each with a short doc comment. In `internal/handler/singleflight.go`, `sfResult` becomes
+
+```go
+// sfResult is the value the leader of a singleflight call produces and
+// every waiter on the same key reads.
+//
+// blobHash is the sha256 hex of the cached file after a successful
+// fetch; on error it is empty. status is the upstream HTTP status (or 0
+// when no response was received), used for X-Upstream-Status diagnostics.
+//
+// SPEC6_5 §2.3: when the post-fetch dispatch validated the body against
+// a package_hash row's declared SHA256, validatedHash is set true and
+// packageName carries that row's Package: column (empty for pdiff
+// patches, which have no package name). Both fields are zero when no
+// validation occurred (Phase 1 trust-upstream regime, or metadata).
+type sfResult struct {
+	blobHash      string
+	size          int64
+	status        int
+	err           error
+	validatedHash bool
+	packageName   string
+	// suiteTracked: the request's suite has a row after the miss's writer
+	// operation (spec C3).
+	suiteTracked bool
+	// unproven: the miss created its suite's row, but a cached signed
+	// anchor changed after it was sniffed (cache.CreateResult.Unproven);
+	// the leader runs markCachedSignedAnchors after its late registration.
+	unproven bool
+}
+```
 
 In `internal/handler/handler.go`:
 
-- Import `internal/aptpath`. `Config` gains, after `KeepDisplaced`: `MaxSuites int` (doc: "freshness.max_suites: the spec C3 suite-row caps (this many rows in all, a tenth of it per canonical host). 0 is unbounded (tests); production configs validate it to at least 10.") and `SuiteGuard cache.SuiteGuard` (doc: "holds a suite's in-memory mutex for cap eviction (spec C3); production passes the freshness checker. nil evicts without holding one (no checker, so no in-memory suite state)."). `Handler` gains, after `keepDisplaced`, `maxSuites int`, `suiteGuard cache.SuiteGuard`, `rejections seedRejections`, `seedWarn seedWarn` (comment: "Spec C3 suite rows: the caps, the eviction guard, the cap-rejection cache and suite_seed_rejected's rate limiter."). `New` refuses `cfg.MaxSuites < 0` (`errors.New("handler: negative MaxSuites")`) and copies both fields.
-- `ServeHTTP`: replace the `anchorStart` block's opening (`if t := h.anchorStart(r, req); t != nil {` / `defer t.Done()`) with
+- Import `internal/aptpath`. `Config` gains, after `KeepDisplaced`: `MaxSuites int` (doc: "freshness.max_suites: the spec C3 suite-row caps (this many rows in all, a tenth of it per canonical host). 0 is unbounded (tests); production configs validate it to at least 10.") and `SuiteGuard cache.SuiteGuard` (doc: "holds a suite's in-memory mutex for cap eviction (spec C3); production passes the freshness checker. nil evicts without holding one (no checker, so no in-memory suite state)."). `Handler` gains, after `keepDisplaced`:
+
+```go
+	// Spec C3 suite rows: the caps, the eviction guard, the cap-rejection
+	// cache and suite_seed_rejected's rate limiter.
+	maxSuites  int
+	suiteGuard cache.SuiteGuard
+	rejections seedRejections
+	seedWarn   seedWarn
+
+	// cachedAnchorsHook, when set (tests only), runs right after
+	// cachedAnchors' read: the window in which a changed anchor row makes
+	// a creation unproven.
+	cachedAnchorsHook func()
+```
+
+- `New` refuses `cfg.MaxSuites < 0` (`errors.New("handler: negative MaxSuites")`), copies both fields, and — instead of returning the literal — names it `h` and ends:
+
+```go
+		unvouchedPassthroughLog: make(map[string]int64),
+		lifecycleCtx:            lifecycleCtx,
+		lifecycleCancel:         lifecycleCancel,
+	}
+	h.rejections.onPanic = func(v any) {
+		h.logGoroutinePanic("handler_goroutine_panicked", &rejectionPanicStackLogged, v, "where", "seed_rejections")
+	}
+	return h, nil
+}
+
+// rejectionPanicStackLogged limits the cap-rejection sweep's panic stack to
+// one per process.
+var rejectionPanicStackLogged atomic.Bool
+```
+
+- `Close` stops the rejection cache's sweep timer:
+
+```go
+// Close implements SPEC §9.5 step 3: cancel any in-flight upstream
+// fetches and wait for active ServeHTTP invocations to return. Safe to
+// call multiple times; lifecycleCancel is idempotent and Wait is too.
+//
+// Contract: Close MUST be called only after the embedding *http.Server
+// has been Shutdown (or otherwise stopped accepting new requests).
+// Otherwise activeWG.Add(1) at the top of ServeHTTP can race
+// activeWG.Wait() here, which is undefined behavior. Calling Close
+// after Server.Shutdown returns guarantees no new ServeHTTP starts.
+func (h *Handler) Close() {
+	h.lifecycleCancel()
+	h.rejections.close()
+	h.activeWG.Wait()
+}
+```
+
+- `ServeHTTP`: replace the `anchorStart` block (from its comment through the closing brace of `if t := h.anchorStart(r, req); t != nil {`) with
 
 ```go
 	// Spec C3: what this request knows about its suite's row, threaded
@@ -4921,29 +6989,112 @@ In `internal/handler/handler.go`:
 	// singleflight.
 	if t := h.anchorStart(r, req); t != nil {
 		sr.tok = t
+		if r = heldContext(r, t); clientLeft(w, r) {
+			h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, false, 0, start)
+			return
+		}
+	}
 ```
 
-  (the rest of that block unchanged; the comment above it loses "; Done runs once the response has been written"), and pass `sr` to `tryCacheHit` and `serveCacheMiss`.
-- `tryCacheHit` and `trySnapshotHit` take `sr *suiteReq` last; `tryCacheHit` passes it to `trySnapshotHit`, which sets `sr.tracked = false` in its `cache.ErrNotFound` case and `sr.tracked = true` once the suite row was read.
-- `serveCacheMiss` takes `sr *suiteReq`, captures `file, trackedAtStart := sr.file, sr.tracked` before the singleflight call, calls `h.runFetch(h.lifecycleCtx, req, file, trackedAtStart)`, and right after the `res.err != nil` return adds:
+  and pass `sr` to `tryCacheHit` and `serveCacheMiss`. Add after `flipHeldKey` (whose doc now says `heldContext` sets it):
 
 ```go
+// heldContext records a flip-barrier registration's wait in a hold in r's
+// context, for the request line's flip_held_ms (no wait, or a nil token:
+// r unchanged).
+func heldContext(r *http.Request, t *flipgate.Token) *http.Request {
+	if held := t.Held(); held > 0 {
+		return r.WithContext(context.WithValue(r.Context(), flipHeldKey{}, held))
+	}
+	return r
+}
+
+// clientLeft answers a request whose context ended — its client left
+// while it waited in a flip hold; the gate did not register it — as a
+// client abort (503) and reports it; the caller logs client_canceled.
+// Serving it would only fail its snapshot read: a WARN and a 502 "hit"
+// line (design review M1, for the entry and the late registrations).
+func clientLeft(w http.ResponseWriter, r *http.Request) bool {
+	if r.Context().Err() == nil {
+		return false
+	}
+	w.Header().Set("Retry-After", "5")
+	http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+	return true
+}
+```
+
+- `maybeFireFreshness`'s recover becomes
+
+```go
+		defer func() {
+			if r := recover(); r != nil {
+				h.logGoroutinePanic("freshness_check_panicked", &t1PanicStackLogged, r,
+					"where", "t1", "canonical_host", req.CanonicalHost, "suite_path", req.SuitePath)
+			}
+		}()
+```
+
+  with, after `t1PanicStackLogged`,
+
+```go
+// logGoroutinePanic logs a recovered panic of a handler goroutine as
+// event, with the stack the first time stackOnce is claimed in this
+// process (one flag per where: the T1 check, the cap-rejection sweep, the
+// touch goroutine).
+func (h *Handler) logGoroutinePanic(event string, stackOnce *atomic.Bool, v any, attrs ...any) {
+	attrs = append(attrs, "panic", fmt.Sprint(v))
+	if stackOnce.CompareAndSwap(false, true) {
+		attrs = append(attrs, "stack", string(debug.Stack()))
+	}
+	h.logger.Error(event, attrs...)
+}
+```
+
+- `tryCacheHit` and `trySnapshotHit` take `sr *suiteReq` last; `tryCacheHit` passes it to `trySnapshotHit`, which sets `sr.tracked = false` in its `cache.ErrNotFound` case and `sr.tracked = true` once the suite row was read.
+- `serveCacheMiss` takes `sr *suiteReq`, captures `file, trackedAtStart := sr.file, sr.tracked` before the singleflight call, calls `h.runFetch(h.lifecycleCtx, req, file, trackedAtStart)`, and from its `res.err != nil` return to `hash := res.blobHash` reads (the old `outcome`/`logOutcome` block further down goes; the code below sets them):
+
+```go
+	if res.err != nil {
+		h.respondError(w, r, req, res, start)
+		return
+	}
+	outcome, logOutcome := cacheMiss, "miss"
+	if shared {
+		outcome, logOutcome = cacheCoalesced, "hit_coalesced"
+	}
 	if res.suiteTracked {
 		sr.tracked = true
 	}
 	// Phase C carry-forward: the serve of an anchor whose suite row this
 	// miss created (or found created by a concurrent request) registers
-	// with the flip barrier right after the creation, before its body. A
-	// registration that waited in a hold serves what is current now: the
-	// flip may have committed a snapshot (design note 9).
-	if h.registerLate(r, req, sr) {
-		if served, outcome, status, body, v := h.tryCacheHit(w, r, req, start, sr); served {
-			if outcome == "" {
-				outcome = "hit"
-			}
-			h.logRequestWithValidation(r, req.CanonicalHost, req.Path, outcome, status, body, false, 0, start, v)
+	// with the flip barrier right after the creation, before anything else
+	// (ruling PD-5). A registration that waited in a hold serves what is
+	// current now — the flip may have committed a snapshot (design note
+	// 9) — and its line keeps the miss's outcome, fetch and upstream status;
+	// a client that left while it waited is a client abort (design review
+	// M1).
+	if t := h.registerLate(r, req, sr); t != nil {
+		if r = heldContext(r, t); clientLeft(w, r) {
+			h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, true, res.status, start)
 			return
 		}
+		if t.Held() > 0 {
+			if served, hitOutcome, status, body, v := h.tryCacheHit(w, r, req, start, sr); served {
+				if hitOutcome == "" {
+					hitOutcome = logOutcome
+				}
+				h.logRequestWithValidation(r, req.CanonicalHost, req.Path, hitOutcome, status, body, true, res.status, start, v)
+				return
+			}
+		}
+	}
+	if res.unproven && !shared {
+		// The creation's transaction could not prove a cached anchor that
+		// changed after it was sniffed: mark it now (the backstop).
+		bctx, cancel := context.WithTimeout(h.lifecycleCtx, 30*time.Second)
+		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
+		cancel()
 	}
 ```
 
@@ -4953,18 +7104,19 @@ In `internal/handler/handler.go`:
 	// Spec C3: one writer operation stores the url_path row and, for a
 	// suite file whose body passes its sniff, creates the suite's row
 	// (InRelease always; Release and flat indexes with an adopter wired)
-	// and writes the signed-seen marker of a signed anchor (InRelease,
+	// with the markers its cached signed anchors earn (ruling PD-5),
+	// re-stamps it on an adoption-disabled refresh miss (ruling PD-6), and
+	// writes the signed-seen marker of a signed anchor (InRelease,
 	// Release.gpg) — before the body is served. A failed operation fails
 	// the miss (502, no body) as a url_path write failure always has, so a
 	// signed anchor body is never served before its base has a marker.
 	// A suite row created here — the scheduler scans suite_freshness —
-	// replaces the old InRelease seed (a refresh miss no longer re-stamps
-	// an existing row: design note 5).
+	// replaces the old InRelease seed.
 	//
-	// AIDEV-NOTE: the sniff reads the finalized pool file. SniffReleaseGPG
-	// accepts a leading 0xC2 byte (a new-format signature packet) that is
-	// also a UTF-8 lead byte: such a body writes a marker, the safe
-	// direction (it can only refuse unsigned adoption).
+	// AIDEV-NOTE: the sniff reads the finalized pool file (SniffReleaseGPG
+	// requires a binary signature's version byte: ruling PD-10). Phase E's
+	// T1-on-seed keys on stored.Create.Outcome == cache.SuiteCreated;
+	// stored.Tracked is what the late flip-barrier registration uses.
 	sr := &suiteReq{key: suiteKeyOf(req), file: file}
 	fetched := cache.FetchedRow{Row: row}
 	if file != aptpath.NotSuiteFile {
@@ -4976,6 +7128,10 @@ In `internal/handler/handler.go`:
 			}
 			if !trackedAtStart && file.CreatesRow(h.adoptionEnabled) && !h.rejections.rejected(sr.key) {
 				fetched.Create = h.suiteSeed(sr, true, fres.ETag, fres.LastModified, now)
+				fetched.Create.Cached = h.cachedAnchors(dbCtx, sr.key, req.Path)
+			}
+			if file == aptpath.FileInRelease && !h.adoptionEnabled {
+				fetched.Restamp = h.suiteSeed(sr, true, fres.ETag, fres.LastModified, now)
 			}
 		}
 	}
@@ -4985,13 +7141,24 @@ In `internal/handler/handler.go`:
 	}
 	if fetched.Create != nil {
 		h.noteCreate(sr.key, stored.Create)
-		if stored.Create.Outcome == cache.SuiteCreated {
-			h.markCachedSignedAnchors(dbCtx, sr.key, req.Path)
-		}
 	}
 ```
 
-  and set `suiteTracked: stored.Tracked` in the returned `sfResult`. `inReleaseSuffix`'s doc becomes `// inReleaseSuffix is the path suffix that identifies the InRelease` / `// file under a suite path (anchorStart's anchor test).`
+  and its return becomes
+
+```go
+	return sfResult{
+		blobHash:      hash,
+		size:          fres.ContentLength,
+		status:        fres.Status,
+		validatedHash: validatedHash,
+		packageName:   packageName,
+		suiteTracked:  stored.Tracked,
+		unproven:      stored.Create.Outcome == cache.SuiteCreated && stored.Create.Unproven,
+	}
+```
+
+  `inReleaseSuffix`'s doc becomes `// inReleaseSuffix is the path suffix that identifies the InRelease` / `// file under a suite path (anchorStart's anchor test).`
 
 In `cmd/apt-cacher-ultra/main.go`, `handlerConfig` sets `MaxSuites: cfg.Freshness.MaxSuites` and `SuiteGuard: guard`, where before the literal:
 
@@ -5011,7 +7178,7 @@ Expected: PASS (the cache's `TestOnlyTheHandlerCreatesSuiteRows` included).
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each: (a) `suiteSeed` stamps regardless of the adopter → `TestServeHTTP_AdopterWiredMissesCreateUnstampedRows` FAILS; (b) it never stamps → `TestServeHTTP_AdoptionDisabledSeedParity` FAILS (`stamps check=<nil>`); (c) `file.CreatesRow(true)` → the parity test FAILS (`/r/dists/t: a row was created`); (d) skip the sniff (`|| true`) → the parity and adopter-wired tests FAIL (`/r/dists/v: a row was created`); (e) mark only when `!trackedAtStart` → `TestServeHTTP_MarkerPrecedesTheFirstBodyByte` FAILS (`refresh miss: no marker`); (f) ignore `StoreFetched`'s error → `TestServeHTTP_FailedMissWriteServesNoBody` FAILS (`status 200`); (g) drop `!h.rejections.rejected(sr.key)` → `TestServeHTTP_SuiteCapRejectionIsCachedCountedAndLogged` FAILS (`rose by 2`); (h) no WARN rate limit → `TestNoteCreate_WarnIsRateLimited` FAILS; (i) cached refusals never expire → `TestSeedRejections_TTLAndBound` FAILS; (j) skip `registerLate` → `TestServeHTTP_RowCreatingServeRegistersWithTheBarrier` (`gate entries … = 0`) and `TestServeHTTP_LateRegistrationThatWaitedServesTheNewSnapshot` FAIL; (k) keep the late registration but not the re-dispatch → the latter FAILS (it serves the fetched bytes); (l) `var guard cache.SuiteGuard = freshChecker` → `TestHandlerConfig_CarriesTheSuiteCapsAndGuard` FAILS.
+One at a time, reverting each: (a) `suiteSeed` stamps regardless of the adopter → `TestServeHTTP_AdopterWiredMissesCreateUnstampedRows` FAILS; (b) it never stamps → `TestServeHTTP_AdoptionDisabledSeedParity` FAILS (`stamps check=<nil>`); (c) `file.CreatesRow(true)` → the parity test FAILS (`/r/dists/t: a row was created`); (d) skip the sniff (`|| true`) → the parity and adopter-wired tests FAIL (`/r/dists/v: a row was created`); (e) mark only when `!trackedAtStart` → `TestServeHTTP_MarkerPrecedesTheFirstBodyByte` FAILS (`refresh miss: no marker`); (f) ignore `StoreFetched`'s error → `TestServeHTTP_FailedMissWriteServesNoBody` FAILS (`status 200`); (g) drop `!h.rejections.rejected(sr.key)` → `TestServeHTTP_SuiteCapRejectionIsCachedCountedAndLogged` FAILS (`rose by 2`); (h) no WARN rate limit → `TestNoteCreate_WarnIsRateLimited` FAILS; (i) cached refusals never expire → `TestSeedRejections_TTLAndBound` and `TestSeedRejections_ExpireWithoutTraffic` FAIL; (j) skip `registerLate` (`t := (*flipgate.Token)(nil)`) → `TestServeHTTP_RowCreatingServeRegistersWithTheBarrier`, `TestServeHTTP_LateRegistrationThatWaitedServesTheNewSnapshot` and `TestServeHTTP_LateRegistrationClientThatLeftIsAClientAbort` (`status 200, want 503`) FAIL; (k) keep the late registration but not the re-dispatch (`t.Held() > 0 && false`) → the second FAILS (it serves the fetched bytes); (l) `var guard cache.SuiteGuard = freshChecker` → `TestHandlerConfig_CarriesTheSuiteCapsAndGuard` FAILS; (m) `suiteSeed` sets the validators even when empty → the parity test FAILS (`want NULL validators`); (n) the miss path marks `Release` too → `TestServeHTTP_AdopterWiredMissesCreateUnstampedRows` FAILS (`an unsigned Release miss wrote a signed-seen marker`); (o) `noteCreate` treats `SuiteExists` as a refusal → `TestNoteCreate_AnExistingRowIsNoRefusal` FAILS; (p) `rejected` never sweeps → `TestSeedRejections_TTLAndBound` FAILS (`after the TTL: 1 entries, want 0 (swept)`); (q) drop `fetched.Create.Cached = h.cachedAnchors(…)` → `TestServeHTTP_CreatingMissMarksCachedSignedAnchors` FAILS (`want the row created and its cached Release.gpg marked`); (r) `cachedAnchors` calls every anchor signed → the same test FAILS (`p: … no marker for its plain-text cached InRelease`); (s) drop the backstop (`res.unproven && false`) → it FAILS (`q: … marked by the backstop`); (t) never re-stamp → the parity test FAILS (`after the refresh miss check=…`); (u) re-stamp with an adopter wired too → the adopter-wired test FAILS (`want it as its checks left it`); (v) the sweep timer never arms → `TestSeedRejections_ExpireWithoutTraffic` FAILS (`1 entries after the TTL with no traffic`); (w) `close` does not stop it → the same test FAILS (`want the closed cache's timer stopped`); (x) drop the client-abort check after the late registration → `TestServeHTTP_LateRegistrationClientThatLeftIsAClientAbort` FAILS (`status 502, want 503`) and the re-dispatch test's line check FAILS; (y) the re-dispatched line says `hit` without the fetch → `TestServeHTTP_LateRegistrationThatWaitedServesTheNewSnapshot` FAILS (`want one miss line with upstream_status 200`); (z) `heldContext` drops `flip_held_ms` → both late-registration tests FAIL.
 
 - [ ] **Step 6: Commit**
 
@@ -5026,15 +7193,15 @@ git commit -m "Create suite rows and signed-seen markers in the miss path's writ
 
 ### Task 10: The handler's hit path: onboarding, touches, by-hash for known suites
 
-Spec C3, handler side, for hits: a url_path hit on a cached, sniff-passing anchor (or flat index) of a suite without a row creates the row before the body — legacy `dists/` onboarding, and suites once refused at a cap — with its marker (deviation 2; design notes 3, 4); client interest from anchor serves (`InRelease`, `Release`, `Release.gpg`; status below 400: 200, 206, 304, HEAD; snapshot, url_path, miss, recovery and stale serves) and from hash-validated `.deb` serves (the vouching suites, `DeclaredHash.SuitePath`), coalesced in the cache (design notes 7, 8); "the handler's by-hash content-addressed fallback requires a known suite (I-4, handler side)". Deferred minors in `handler.go` and `byhash_displaced_test.go`, files this task touches: C-21 (its query half: one `SuiteExists` read in `anchorStart`; the context fast path needs new gate API and stays), C-22 (a failed registration read registers), C-23 (a test that no read happens while the barrier is off, via `existsReads`), C-24 (the touch goroutine recovers, through one helper the T1 goroutine now shares — `logGoroutinePanic`, one stack per `where`), C-25 (a displaced member's missing blob is logged), C-26 (three missing negatives). The one by-hash test whose suite had no row (`TestServeHTTP_ByHashContentAddressed_PoolHit`) gets one.
+Spec C3, handler side, for hits: a url_path hit on a cached, sniff-passing anchor (or flat index) of a suite without a row creates the row before the body — legacy `dists/` onboarding, and suites once refused at a cap — and the creating transaction marks its base: the anchor in hand when it is a sniff-passing `InRelease`, and the suite's other cached signed anchors, which Task 9's `cachedAnchors` reads and sniffs before the submit (deviation 2; design notes 3, 4; ruling PD-5 — only an unproven creation runs the `markCachedSignedAnchors` backstop, in the singleflight leader, after the late registration). Design review M8: concurrent hits on one untracked suite share one creation through the handler's singleflight under its own key namespace (`"onboard|"+scheme+"|"+host+"|"+suite`), and the creation's writer operation is bounded at 5 s (`onboardTimeout`, well under apt's 30 s inactivity timeout); on a timeout or any other error the hit serves untracked. The onboarding hit's serve registers with the flip barrier right after the creation; a registration that waited in a hold serves what is current (design note 9), its line carries `flip_held_ms` (`ServeHTTP` logs a hit through `heldContext(r, sr.tok)`), and a client that left while it waited is a client abort — 503 `client_canceled` through `clientLeft`, no WARN (design review M1; both helpers are Task 9's). Ruling PD-11 (design review M18): a url_path hit fires T1 only for a tracked suite — an untracked suite's check would only read its absent row and skip (I-4). Client interest from anchor serves (`InRelease`, `Release`, `Release.gpg`; status below 400: 200, 206, 304, HEAD; snapshot, url_path, miss, recovery and stale serves) and from hash-validated `.deb` serves (the vouching suites, `DeclaredHash.SuitePath`, on the url_path hit and the miss path), coalesced in the cache (design notes 7, 8); "the handler's by-hash content-addressed fallback requires a known suite (I-4, handler side)". Exec review D1: the by-hash allowlist and provenance tests give their request's suite a row, so the gate each names — not the known-suite gate — is what refuses; D3, D18 and D20 add the snapshot-serve, vouched-`.deb`-miss and recovery-serve touch tests; D5 checks that a plain-text cached `InRelease` earns an onboarded suite no marker. Deferred minors in `handler.go` and `byhash_displaced_test.go`, files this task touches: C-21 (its query half: one `SuiteExists` read in `anchorStart`; the context fast path needs new gate API and stays), C-22 (a failed registration read registers), C-23 (a test that no read happens while the barrier is off, via `existsReads`), C-24 (the touch goroutine recovers, through Task 9's `logGoroutinePanic`, one stack per `where`), C-25 (a displaced member's missing blob is logged), C-26 (three missing negatives). The one by-hash test whose suite had no row (`TestServeHTTP_ByHashContentAddressed_PoolHit`) gets one.
 
 **Files:**
-- Modify: `internal/handler/suite_rows.go` (`onboard`, `touchAsync`, `servedSuite`, `vouchingSuites`, `vouchedSuites`), `internal/handler/handler.go`, `internal/handler/singleflight.go` (`vouchingSuites`), `internal/handler/byhash_test.go`, `internal/handler/byhash_displaced_test.go`
+- Modify: `internal/handler/suite_rows.go` (`onboardTimeout`, `onboard`, `runOnboard`, `touchAsync`, `servedSuite`, `vouchingSuites`, `vouchedSuites`), `internal/handler/handler.go`, `internal/handler/singleflight.go` (`vouchingSuites`), `internal/handler/byhash_test.go`, `internal/handler/byhash_displaced_test.go`
 - Create: `internal/handler/suite_hit_test.go`
 
 **Interfaces:**
-- Consumes: Task 9's `suiteReq`, `suiteKeyOf`, `suiteSeed`, `suiteCaps`, `noteCreate`, `readHead`, `markCachedSignedAnchors`, `registerLate`, `seedRejections`, and its test rig (`newSuiteRig`, `serve`, `get`, `suite`, `marked`, `secondConn`, fixtures, `derefI64`); Task 6's `TouchSuite`, `SuiteExists`, `DeclaredHash.SuitePath`; Task 4's `CreateSuite`; test helpers `writeBlob`, `commitInlineSnapshot`, `splitURL`, `hostKey`, `newProxyReqHostPort` (`phase2_handler_test.go`), `newFlipStack`, `syncLog`, `logRecords`, `newDisplacedHandler`, `adoptWithMembers`, `aliasOf`, `getMember`, `itoa`.
-- Produces: `(h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blobHash string) (held bool)`; `(h *Handler) touchAsync(req *proxy.Request, touchURL bool, suites []cache.SuiteKey)`; `servedSuite(sr *suiteReq, status int) []cache.SuiteKey`; `vouchingSuites(rows []cache.DeclaredHash, hash string) []string`; `vouchedSuites(req *proxy.Request, v packageValidation, status int) []cache.SuiteKey`; `packageValidation.Suites []string`; `sfResult.vouchingSuites []string`; `(h *Handler) logGoroutinePanic(event string, stackOnce *atomic.Bool, v any, attrs ...any)`; `(h *Handler) suiteExists(ctx, key) (bool, error)`; handler fields `existsReads atomic.Int64`, `suiteExistsForTest func(cache.SuiteKey) (bool, error)`; `tryURLPathHit(…, start time.Time, sr *suiteReq)`, `tryByHashContentAddressed(…, sr *suiteReq)`; event `handler_goroutine_panicked` (Task 13 documents it); test helpers `cacheAnchor`, `waitFor`, `requested`, `trackOld` (`suite_hit_test.go`).
+- Consumes: Task 9's `suiteReq`, `suiteKeyOf`, `suiteSeed`, `suiteCaps`, `noteCreate`, `readHead`, `cachedAnchors` (and its `cachedAnchorsHook` seam), `markCachedSignedAnchors`, `registerLate`, `seedRejections`, `heldContext`, `clientLeft`, `logGoroutinePanic`, `sfResult.suiteTracked`/`unproven`, and its test rig (`newSuiteRig`, `serve`, `get`, `suite`, `marked`, `secondConn`, `holdUntilTracked`, fixtures, `derefI64`); Task 6's `TouchSuite`, `DeclaredHash.SuitePath`; Task 5's `SuiteExists`; Task 4's `CreateSuite`, `CreateResult.Unproven`; the handler's singleflight (`sfGroup.Do`; the test helper `sfWaiters` reads its `calls`); test helpers `writeBlob`, `commitInlineSnapshot`, `sha256Hex`, `splitURL`, `hostKey`, `newProxyReqHostPort`, `itoa` (`phase2_handler_test.go`), `newTestHandler` (`handler_test.go`), `newFlipStack`, `newFlipStackLogging`, `flipSimHost` (`flip_stack_test.go`), `syncLog`, `newDisplacedHandler`, `adoptWithMembers`, `aliasOf`, `getMember` (`byhash_displaced_test.go`), `logRecords` (`flip_hook_test.go`), `simtest.ClearsignedFixture`.
+- Produces: `onboardTimeout = 5 * time.Second`; `(h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blobHash string) *flipgate.Token`; `(h *Handler) runOnboard(r *http.Request, req *proxy.Request, sr *suiteReq) sfResult`; `(h *Handler) touchAsync(req *proxy.Request, touchURL bool, suites []cache.SuiteKey)`; `servedSuite(sr *suiteReq, status int) []cache.SuiteKey`; `vouchingSuites(rows []cache.DeclaredHash, hash string) []string`; `vouchedSuites(req *proxy.Request, v packageValidation, status int) []cache.SuiteKey`; `packageValidation.Suites []string`; `sfResult.vouchingSuites []string`; `(h *Handler) suiteExists(ctx, key) (bool, error)`; handler fields `existsReads atomic.Int64`, `suiteExistsForTest func(cache.SuiteKey) (bool, error)`; `tryURLPathHit(…, start time.Time, sr *suiteReq)`, `tryByHashContentAddressed(…, sr *suiteReq)`; event `handler_goroutine_panicked` with `where=touch` (Task 13 documents it); test helpers `cacheAnchor`, `waitFor`, `requested`, `trackOld`, `sfWaiters`, `(s *flipStack) cacheLegacyAnchor` (`suite_hit_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5044,13 +7211,17 @@ Create `internal/handler/suite_hit_test.go`:
 package handler
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -5059,6 +7230,8 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // cacheAnchor stores body as the url_path row of path, as a binary before
@@ -5088,11 +7261,13 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 
 // Spec C3 legacy onboarding (deviation 2): a url_path hit on a cached
 // sniff-passing anchor of a suite without a row creates the row (NULL
-// check stamps, design note 3) before the body, marks its base — the
-// anchor in hand and the suite's other cached signed anchors
-// (markCachedSignedAnchors) — and the hit's T1 then checks the suite. A
-// plain-text InRelease onboards nothing; without an adopter a Release
-// does not either.
+// check stamps, design note 3) before the body, marks its base in the
+// creating transaction — the anchor in hand and the suite's other cached
+// signed anchors (ruling PD-5) — and the hit's T1 then checks the suite. A
+// plain-text InRelease onboards nothing and fires no T1 (ruling PD-11:
+// T1 only for tracked suites); without an adopter a Release does not
+// onboard either; a plain-text cached InRelease earns an onboarded
+// suite no marker.
 func TestServeHTTP_HitOnboardsALegacyAnchor(t *testing.T) {
 	for _, adoption := range []bool{false, true} {
 		r := newSuiteRig(t, adoption, 0)
@@ -5131,7 +7306,93 @@ func TestServeHTTP_HitOnboardsALegacyAnchor(t *testing.T) {
 			if at, ok, err := r.c.SignedSeen(context.Background(), "http", "127.0.0.1", "/r/dists/d"); err != nil || !ok || at != 1_700_000_100 {
 				t.Fatalf("marker = %d %v %v, want the cached Release.gpg's 1700000100", at, ok, err)
 			}
+			// A plain-text cached InRelease earns the onboarded suite no marker.
+			r.cacheAnchor("/r/dists/q/InRelease", []byte("Origin: plain\n"), 1_700_000_000)
+			r.cacheAnchor("/r/dists/q/Release", rowRelease, 1_700_000_000)
+			r.get("/r/dists/q/Release")
+			if r.suite("/r/dists/q") == nil || r.marked("/r/dists/q") {
+				t.Fatal("q: want onboarded through Release, with no marker for its plain-text InRelease")
+			}
 		}
+		r.h.Close() // drains the T1 goroutines
+		for _, c := range r.fresh.snapshot() {
+			if c.suitePath == "/r/dists/p" || (!adoption && c.suitePath == "/r/dists/d") {
+				t.Errorf("adoption=%v: T1 fired for the untracked suite %s", adoption, c.suitePath)
+			}
+		}
+	}
+}
+
+// Ruling PD-5 on the hit path: an onboarding whose suite's cached
+// Release.gpg changed after it was sniffed is unproven, and the backstop
+// marks the changed anchor after the commit.
+func TestServeHTTP_OnboardingBackstopMarksAChangedAnchor(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	r.cacheAnchor("/r/dists/b/Release", rowRelease, 1_700_000_000)
+	r.cacheAnchor("/r/dists/b/Release.gpg", []byte("not a signature\n"), 1_700_000_000)
+	r.h.cachedAnchorsHook = func() { // the cached Release.gpg becomes a real signature after the sniff
+		r.h.cachedAnchorsHook = nil
+		r.cacheAnchor("/r/dists/b/Release.gpg", rowGPG, 1_700_000_200)
+	}
+	if rec := r.get("/r/dists/b/Release"); rec.Code != http.StatusOK || r.suite("/r/dists/b") == nil {
+		t.Fatalf("onboarding hit = %d", rec.Code)
+	}
+	if at, ok, err := r.c.SignedSeen(context.Background(), "http", "127.0.0.1", "/r/dists/b"); err != nil || !ok || at != 1_700_000_200 {
+		t.Fatalf("marker = %d %v %v, want the changed Release.gpg marked by the backstop at 1700000200", at, ok, err)
+	}
+}
+
+// sfWaiters is how many callers wait on key's in-flight singleflight call.
+func sfWaiters(g *sfGroup, key string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if c, ok := g.calls[key]; ok {
+		return c.waiters
+	}
+	return 0
+}
+
+// Design review M8: concurrent hits on one untracked suite share one
+// onboarding (one writer operation, not one per request), and every one
+// of them is served from the onboarded suite.
+func TestServeHTTP_ConcurrentHitsShareOneOnboarding(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	r.cacheAnchor("/r/dists/s/InRelease", rowInRelease, 1_700_000_000)
+	var calls atomic.Int32
+	release := make(chan struct{})
+	r.h.cachedAnchorsHook = func() { // runs inside each onboarding's creation
+		if calls.Add(1) == 1 {
+			<-release // the first waits until the others queue behind it
+		}
+	}
+	var wg sync.WaitGroup
+	codes := make([]int, 8)
+	for i := range codes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes[i] = r.get("/r/dists/s/InRelease").Code
+		}()
+	}
+	queued := false
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if sfWaiters(r.h.sf, "onboard|http|127.0.0.1|/r/dists/s") == len(codes)-1 {
+			queued = true
+			break
+		}
+	}
+	close(release)
+	wg.Wait()
+	if !queued || calls.Load() != 1 {
+		t.Fatalf("queued %v, %d onboardings ran; want the hits to share one", queued, calls.Load())
+	}
+	for i, code := range codes {
+		if code != http.StatusOK {
+			t.Fatalf("hit %d = %d", i, code)
+		}
+	}
+	if r.suite("/r/dists/s") == nil || !r.marked("/r/dists/s") {
+		t.Fatal("the shared onboarding did not create and mark the suite")
 	}
 }
 
@@ -5158,8 +7419,9 @@ func (r *suiteRig) trackOld(suite string) {
 	}
 }
 
-// Spec C3 client interest: a tracked suite's anchor served from the
-// url_path cache, from the miss path, or stale records interest (TouchSuite).
+// Spec C3 client interest: a tracked suite's anchor served from a
+// snapshot, the url_path cache, the miss path, or stale records interest
+// (TouchSuite).
 func TestServeHTTP_AnchorServesTouchTheirSuite(t *testing.T) {
 	r := newSuiteRig(t, true, 0)
 	r.trackOld("/r/dists/hit")
@@ -5183,6 +7445,132 @@ func TestServeHTTP_AnchorServesTouchTheirSuite(t *testing.T) {
 		t.Fatal("no stale serve")
 	}
 	waitFor(t, "the stale serve's touch", func() bool { return r.requested("/r/dists/stale") > 1000 })
+
+	// commitInlineSnapshot seeds its row through SeedSuiteForTest, which
+	// notes no touch, so the snapshot serve's touch is due.
+	inrel := writeBlob(t, r.h, rowInRelease)
+	commitInlineSnapshot(t, r.h, "http", "127.0.0.1", "/r/dists/snap", inrel,
+		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: inrel, DeclaredSHA256: inrel}}, nil)
+	if _, err := r.secondConn().Exec(`UPDATE suite_freshness SET last_requested_at = 1000 WHERE suite_path = '/r/dists/snap'`); err != nil {
+		t.Fatal(err)
+	}
+	r.get("/r/dists/snap/InRelease")
+	waitFor(t, "the snapshot serve's touch", func() bool { return r.requested("/r/dists/snap") > 1000 })
+}
+
+// Spec C3 client interest: an anchor served by the snapshot-member
+// recovery path (its pool file was lost and fetched again) touches its
+// suite too.
+func TestServeHTTP_RecoveredAnchorServeTouchesItsSuite(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	inrel := writeBlob(t, r.h, rowInRelease)
+	commitInlineSnapshot(t, r.h, "http", "127.0.0.1", "/r/dists/rec", inrel,
+		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: inrel, DeclaredSHA256: inrel}}, nil)
+	if err := os.Remove(r.h.cache.BlobPath(inrel)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.secondConn().Exec(`UPDATE suite_freshness SET last_requested_at = 1000 WHERE suite_path = '/r/dists/rec'`); err != nil {
+		t.Fatal(err)
+	}
+	r.serve("/r/dists/rec/InRelease", upFile{body: rowInRelease})
+	if rec := r.get("/r/dists/rec/InRelease"); rec.Code != http.StatusOK || rec.Header().Get(hdrXCache) != cacheMiss {
+		t.Fatalf("recovery = %d %q, want 200 MISS", rec.Code, rec.Header().Get(hdrXCache))
+	}
+	waitFor(t, "the recovery serve's touch", func() bool { return r.requested("/r/dists/rec") > 1000 })
+}
+
+// Spec C3: a hash-validated .deb served by the miss path touches the
+// suite whose current snapshot vouched it.
+func TestServeHTTP_VouchedDebMissTouchesItsSuite(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	deb := []byte("a vouched .deb fetched on a miss")
+	const debPath = "/r/pool/main/h/hello_2_amd64.deb"
+	r.serve(debPath, upFile{body: deb})
+	inrel := writeBlob(t, r.h, rowInRelease)
+	commitInlineSnapshot(t, r.h, "http", "127.0.0.1", "/r/dists/s", inrel,
+		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: inrel, DeclaredSHA256: inrel}},
+		[]cache.PackageHash{{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", Path: debPath, DeclaredSHA256: sha256Hex(deb)}})
+	if _, err := r.secondConn().Exec(`UPDATE suite_freshness SET last_requested_at = 1000`); err != nil {
+		t.Fatal(err)
+	}
+	if rec := r.get(debPath); rec.Code != http.StatusOK || rec.Body.String() != string(deb) {
+		t.Fatalf("deb miss = %d %q", rec.Code, rec.Body.String())
+	}
+	waitFor(t, "the vouched .deb miss's touch", func() bool { return r.requested("/r/dists/s") > 1000 })
+}
+
+// cacheLegacyAnchor stores body as the url_path anchor of suite on the
+// flip stack's host, with no suite row (a binary before phase D).
+func (s *flipStack) cacheLegacyAnchor(suite string, body []byte) {
+	s.t.Helper()
+	hash := writeBlob(s.t, s.h, body)
+	at := wallclock.Unix()
+	if err := s.c.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: "http", CanonicalHost: flipSimHost,
+		Path: suite + "/InRelease", BlobHash: &hash, UpstreamURL: "http://" + flipSimHost + suite + "/InRelease",
+		IsMetadata: true, LastRequestedAt: &at, RequestCount: 1, LastFetchedAt: &at}); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+// Design note 9 on the hit path: an onboarding whose late registration
+// waited in a flip's hold serves what is current after the flip — the
+// snapshot it committed — and its line says it waited (flip_held_ms).
+func TestServeHTTP_OnboardingThatWaitedServesTheNewSnapshot(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &syncLog{}
+		s := newFlipStackLogging(t, 10*time.Second, slog.New(slog.NewJSONHandler(logs, nil)))
+		const suite = "/n/dists/s"
+		s.cacheLegacyAnchor(suite, rowInRelease)
+		snapBody := simtest.ClearsignedFixture("Origin: snapshot\n")
+		hash := writeBlob(t, s.h, snapBody)
+		ctx := context.Background()
+		cand, _, err := s.c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{CanonicalScheme: "http",
+			CanonicalHost: flipSimHost, SuitePath: suite, InReleaseHash: &hash})
+		if err != nil {
+			t.Fatal(err)
+		}
+		flipped := s.holdUntilTracked(suite, time.Second, func() error {
+			return s.c.CommitAdoption(ctx, cand, []cache.SnapshotMember{{SnapshotID: cand, Path: "InRelease",
+				BlobHash: hash, DeclaredSHA256: hash}}, nil, nil, nil, false)
+		})
+		rec := httptest.NewRecorder()
+		s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+suite+"/InRelease", nil))
+		<-flipped
+		if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), snapBody) {
+			t.Fatalf("status %d body %q; want the committed snapshot's InRelease", rec.Code, rec.Body.String())
+		}
+		lines := logRecords(logs, "request", slog.LevelInfo)
+		if len(lines) != 1 || lines[0]["outcome"] != "hit" || lines[0]["flip_held_ms"] == nil {
+			t.Fatalf("request lines %v, want one hit line with flip_held_ms", lines)
+		}
+	})
+}
+
+// Design review M1 on the hit path: an onboarding hit whose client leaves
+// during the late registration's wait is a client abort — 503, no WARN.
+func TestServeHTTP_OnboardingClientThatLeftIsAClientAbort(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &syncLog{}
+		s := newFlipStackLogging(t, 10*time.Second, slog.New(slog.NewJSONHandler(logs, nil)))
+		const suite = "/n/dists/s"
+		s.cacheLegacyAnchor(suite, rowInRelease)
+		flipped := s.holdUntilTracked(suite, 2*time.Second, func() error { return nil })
+		rctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Second, cancel) // the client leaves during the late wait
+		rec := httptest.NewRecorder()
+		s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+suite+"/InRelease", nil).WithContext(rctx))
+		<-flipped
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status %d, want 503", rec.Code)
+		}
+		if warns := logRecords(logs, "", slog.LevelWarn); len(warns) != 0 {
+			t.Errorf("a client that left during the onboarding wait logged %d WARN or worse, first %v", len(warns), warns[0])
+		}
+		lines := logRecords(logs, "request", slog.LevelInfo)
+		if len(lines) != 1 || lines[0]["outcome"] != "client_canceled" || lines[0]["flip_held_ms"] == nil {
+			t.Fatalf("request lines %v, want one client_canceled line with flip_held_ms", lines)
+		}
+	})
 }
 
 // Spec C3: a hash-validated .deb serve touches every suite whose current
@@ -5336,9 +7724,44 @@ func TestServeHTTP_ByHashContentAddressed_UnknownSuiteIsNotServed(t *testing.T) 
 }
 ```
 
+Exec review D1: the known-suite gate now answers first, so the two tests that name a later gate give their request's suite a row. In `TestServeHTTP_ByHashContentAddressed_DisallowedHostRejected`, before `rec := httptest.NewRecorder()`, insert
+
+```go
+	// I-4 (spec C3): the suite is known, so the allowlist — not the
+	// known-suite gate — is what refuses the serve.
+	if err := h.cache.EnsureSuiteForTest(context.Background(), "http", "evil.example.com", "/dists/foo"); err != nil {
+		t.Fatal(err)
+	}
+```
+
+and in `TestServeHTTP_ByHashContentAddressed_RejectsCrossHostBlob`, before its `rec := httptest.NewRecorder()`,
+
+```go
+	// I-4 (spec C3): host-b's suite is tracked, so the provenance gate —
+	// not the known-suite gate — is what refuses the cross-host serve.
+	if err := h.cache.EnsureSuiteForTest(context.Background(), "http", "host-b.example", "/dists/foo"); err != nil {
+		t.Fatal(err)
+	}
+```
+
 In `internal/handler/byhash_displaced_test.go`:
-- Deferred minor C-26 (c): `TestServeHTTP_RetainedByHashSHA256MustMatchTheBlob`, `…SearchesKeepDisplacedPlusOne`, `…IsOffWhenKeepDisplacedIsZero` and `…NeverServesRetiredSnapshots` keep `up` from `newDisplacedHandler` and, after their last 404 check, assert `up.count() == 0` (`// deferred minor C-26: a snapshot 404, not a miss`).
-- Deferred minor C-25: `TestServeHTTP_RetainedByHashLostBlobIs404WithoutAFetch` passes a `logs := &syncLog{}` to `newDisplacedHandler`, keeps `id1 :=` from the first `adoptWithMembers`, and ends with
+- Deferred minor C-26 (c): `TestServeHTTP_RetainedByHashSHA256MustMatchTheBlob`, `…SearchesKeepDisplacedPlusOne`, `…IsOffWhenKeepDisplacedIsZero` and `…NeverServesRetiredSnapshots` keep `up` from `newDisplacedHandler` (`h, up := newDisplacedHandler(…)`) and, after their last 404 check, end with
+
+```go
+	if n := up.count(); n != 0 { // deferred minor C-26: a snapshot 404, not a miss
+		t.Fatalf("upstream was asked %d times, want 0", n)
+	}
+```
+
+- Deferred minor C-25: `TestServeHTTP_RetainedByHashLostBlobIs404WithoutAFetch` starts
+
+```go
+	logs := &syncLog{}
+	h, up := newDisplacedHandler(t, 3, logs)
+	id1 := adoptWithMembers(t, h, "one", map[string]string{aliasOf("Packages one"): "Packages one"})
+```
+
+  and ends with
 
 ```go
 	recs := logRecords(logs, "snapshot_member_blob_missing", slog.LevelWarn)
@@ -5389,49 +7812,75 @@ Expected: build failure naming `undefined: servedSuite`, `undefined: vouchedSuit
 Append to `internal/handler/suite_rows.go` (imports gain `slices`, `sync/atomic` and `internal/wallclock`):
 
 ```go
+// onboardTimeout bounds onboarding's writer operation (design review M8):
+// the body waits on it, so it stays well under apt's 30 s inactivity
+// timeout; on timeout the hit serves untracked, as on any onboarding error.
+const onboardTimeout = 5 * time.Second
+
 // onboard creates, before the body is served, the row of an untracked
 // suite whose cached anchor (or flat index) a url_path hit serves — the
 // legacy onboarding of spec C3, for anchors cached before this release or
 // while the suite was refused a row: sniff the blob, CreateSuite (marking
-// a sniff-passing InRelease's base in the same transaction), mark the
-// suite's other cached signed anchors, and register the serve with the
-// flip barrier. It reports whether that registration waited in a flip's
-// hold: the caller then serves through the snapshot path, which may have
-// changed meanwhile.
-func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blobHash string) (held bool) {
+// the base in the same transaction for a sniff-passing InRelease in hand
+// and for the suite's other cached signed anchors, ruling PD-5), and
+// register the serve with the flip barrier right after it. It returns that
+// registration's token (nil: nothing registered), whose wait in a hold
+// means the snapshot path may have changed meanwhile; the singleflight
+// leader then runs the backstop of an unproven creation.
+//
+// AIDEV-NOTE: concurrent hits on one untracked suite share one creation
+// through the handler's singleflight under its own key namespace (design
+// review M8: a herd after an upgrade, or when a refusal expires, costs one
+// writer operation), and each request then registers its own serve.
+func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blobHash string) *flipgate.Token {
 	if sr.tracked || !sr.file.CreatesRow(h.adoptionEnabled) || h.rejections.rejected(sr.key) {
-		return false
+		return nil
 	}
 	head, err := readHead(h.cache.BlobPath(blobHash), sr.file.HeadBytes())
 	if err != nil || !sr.file.Sniff(req.Path, head) {
-		return false
+		return nil
 	}
+	key := "onboard|" + sr.key.CanonicalScheme + "|" + sr.key.CanonicalHost + "|" + sr.key.SuitePath
+	res, shared, _ := h.sf.Do(key, func() sfResult { return h.runOnboard(r, req, sr) })
+	if !res.suiteTracked {
+		return nil
+	}
+	sr.tracked = true
+	t := h.registerLate(r, req, sr)
+	if res.unproven && !shared {
+		bctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), onboardTimeout)
+		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
+		cancel()
+	}
+	return t
+}
+
+// runOnboard is one onboarding's creation, shared by the concurrent hits
+// on the suite: it reports in suiteTracked whether the suite has a row now
+// (created, or found), and in unproven whether the creation needs the
+// backstop.
+func (h *Handler) runOnboard(r *http.Request, req *proxy.Request, sr *suiteReq) sfResult {
 	now := wallclock.Unix()
 	seed := h.suiteSeed(sr, false, "", "", now)
 	if sr.file.Marks() {
 		seed.SignedSeenAt = now
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), onboardTimeout)
 	defer cancel()
+	seed.Cached = h.cachedAnchors(ctx, sr.key, req.Path)
 	res, err := h.cache.CreateSuite(ctx, *seed, h.suiteCaps(), h.suiteGuard)
 	if err != nil {
 		// Untracked suites need no marker: serving on is safe, and the next
 		// hit tries again.
 		h.logger.Warn("suite onboarding failed",
 			"err", err, "canonical_host", req.CanonicalHost, "suite_path", req.SuitePath)
-		return false
+		return sfResult{err: err}
 	}
 	h.noteCreate(sr.key, res)
-	switch res.Outcome {
-	case cache.SuiteCreated:
-		h.markCachedSignedAnchors(ctx, sr.key, req.Path)
-		sr.tracked = true
-	case cache.SuiteExists:
-		sr.tracked = true
-	default:
-		return false
+	return sfResult{
+		suiteTracked: res.Outcome == cache.SuiteCreated || res.Outcome == cache.SuiteExists,
+		unproven:     res.Outcome == cache.SuiteCreated && res.Unproven,
 	}
-	return h.registerLate(r, req, sr)
 }
 
 // touchAsync updates the url_path row's last_requested_at and
@@ -5501,23 +7950,130 @@ func vouchedSuites(req *proxy.Request, v packageValidation, status int) []cache.
 }
 ```
 
-In `internal/handler/singleflight.go`, `sfResult` gains `// vouchingSuites: the suites whose snapshots vouched a validated .deb.` / `vouchingSuites []string`.
+In `internal/handler/singleflight.go`, `sfResult` becomes
+
+```go
+// sfResult is the value the leader of a singleflight call produces and
+// every waiter on the same key reads.
+//
+// blobHash is the sha256 hex of the cached file after a successful
+// fetch; on error it is empty. status is the upstream HTTP status (or 0
+// when no response was received), used for X-Upstream-Status diagnostics.
+//
+// SPEC6_5 §2.3: when the post-fetch dispatch validated the body against
+// a package_hash row's declared SHA256, validatedHash is set true and
+// packageName carries that row's Package: column (empty for pdiff
+// patches, which have no package name). Both fields are zero when no
+// validation occurred (Phase 1 trust-upstream regime, or metadata).
+type sfResult struct {
+	blobHash      string
+	size          int64
+	status        int
+	err           error
+	validatedHash bool
+	packageName   string
+	// suiteTracked: the request's suite has a row after the miss's writer
+	// operation (spec C3).
+	suiteTracked bool
+	// unproven: the miss created its suite's row, but a cached signed
+	// anchor changed after it was sniffed (cache.CreateResult.Unproven);
+	// the leader runs markCachedSignedAnchors after its late registration.
+	unproven bool
+	// vouchingSuites: the suites whose snapshots vouched a validated .deb.
+	vouchingSuites []string
+}
+```
 
 In `internal/handler/handler.go`:
 
-- `Handler` gains, after `seedWarn`: `existsReads atomic.Int64` and `suiteExistsForTest func(cache.SuiteKey) (bool, error)` (comment: "existsReads counts anchorStart's registration reads (tests: deferred minor C-23, no read while the barrier is off); suiteExistsForTest, when set (tests only), answers them instead of the cache."). `packageValidation` gains `Suites []string` ("the suite paths whose current snapshots vouched the served bytes (spec C3: a vouched .deb serve touches them). Not logged.").
-- After `t1PanicStackLogged`, add the shared helper, and make `maybeFireFreshness`'s recover call `h.logGoroutinePanic("freshness_check_panicked", &t1PanicStackLogged, r, "where", "t1", "canonical_host", req.CanonicalHost, "suite_path", req.SuitePath)`:
+- `Handler` gains, after `cachedAnchorsHook`:
 
 ```go
-// logGoroutinePanic logs a recovered panic of a handler goroutine as
-// event, with the stack the first time stackOnce is claimed in this
-// process (one flag per where: the T1 check, the touch goroutine).
-func (h *Handler) logGoroutinePanic(event string, stackOnce *atomic.Bool, v any, attrs ...any) {
-	attrs = append(attrs, "panic", fmt.Sprint(v))
-	if stackOnce.CompareAndSwap(false, true) {
-		attrs = append(attrs, "stack", string(debug.Stack()))
+	// existsReads counts anchorStart's registration reads (tests: deferred
+	// minor C-23, no read while the barrier is off); suiteExistsForTest,
+	// when set (tests only), answers them instead of the cache.
+	existsReads        atomic.Int64
+	suiteExistsForTest func(cache.SuiteKey) (bool, error)
+```
+
+  and `packageValidation` gains, after `SnapshotDisplaced`:
+
+```go
+	// Suites are the suite paths whose current snapshots vouched the
+	// served bytes (spec C3: a vouched .deb serve touches them). Not
+	// logged.
+	Suites []string
+```
+
+- `ServeHTTP`'s fast path logs the hit through `heldContext`, so an onboarding hit whose late registration waited carries `flip_held_ms`:
+
+```go
+	// Fast path: SPEC §6.1.
+	if served, outcome, status, body, validation := h.tryCacheHit(w, r, req, start, sr); served {
+		if outcome == "" {
+			outcome = "hit"
+		}
+		// An onboarding hit's late registration may have waited too
+		// (heldContext of the entry token again is harmless).
+		h.logRequestWithValidation(heldContext(r, sr.tok), req.CanonicalHost, req.Path, outcome, status, body, false, 0, start, validation)
+		return
 	}
-	h.logger.Error(event, attrs...)
+```
+
+- `tryCacheHit` passes `start` and `sr` on:
+
+```go
+func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time, sr *suiteReq) (served bool, outcome string, status int, bytesWritten int64, validation packageValidation) {
+	if req.IsMetadata && req.SuitePath != "" {
+		if served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start, sr); handled {
+			return served, "", status, body, packageValidation{SnapshotDisplaced: displaced}
+		}
+	}
+	if served, outcome, status, body, v := h.tryURLPathHit(w, r, req, start, sr); served {
+		return served, outcome, status, body, v
+	}
+	// SPEC2 §0 #4: when both lookups missed for a non-adopted metadata
+	// path of the form .../by-hash/SHA256/<hex>, the existing pool/
+	// content-addressed store may already hold the right bytes (cross-
+	// suite dedup, or a prior fetch under a different URL). Serve them
+	// directly — pool's content addressing makes this safe without a
+	// snapshot_member row, but the gate above ensures we never bypass
+	// an adopted suite's §6.1 contract.
+	if req.IsMetadata {
+		served, status, body := h.tryByHashContentAddressed(w, r, req, sr)
+		return served, "", status, body, packageValidation{}
+	}
+	return false, "", 0, 0, packageValidation{}
+}
+```
+
+- `trySnapshotHit` records client interest: the displaced by-hash serve touches only its url_path row,
+
+```go
+		if ok, st, n := h.tryDisplacedByHash(w, r, req, snapshotID, memberPath); ok {
+			go h.touchAsync(req, true, nil)
+			h.maybeFireFreshness(req)
+			return true, st, n, true, true
+		}
+```
+
+  the recovery of a lost member touches the suite (exec review D20),
+
+```go
+		served, status, bytesWritten = h.serveSnapshotMemberMiss(w, r, req, mem, snapshotID, modTime, start)
+		if suites := servedSuite(sr, status); served && suites != nil {
+			go h.touchAsync(req, false, suites)
+		}
+		return served, status, bytesWritten, true, false
+	}
+```
+
+  and the ordinary serve both:
+
+```go
+	go h.touchAsync(req, true, servedSuite(sr, status))
+	h.maybeFireFreshness(req)
+	return true, status, bytesWritten, true, false
 }
 ```
 
@@ -5534,9 +8090,41 @@ func (h *Handler) suiteExists(ctx context.Context, key cache.SuiteKey) (bool, er
 }
 ```
 
-- `anchorStart`: the `GetSuiteFreshness` check becomes
+- `anchorStart` reads the row with one EXISTS and registers on a failed read (deferred minors C-21, C-22); it becomes:
 
 ```go
+// anchorStart is spec C8's handler side. For <suite>/InRelease and
+// <suite>/Release of a suite with a suite_freshness row it registers the
+// serve with the flip barrier and returns its token; while a flip of the
+// suite holds anchors it first waits — at most flipgate.HoldMax, and no
+// longer than the request or the handler lives. It returns nil otherwise:
+// Release.gpg is never held, and untracked suites create no gate state.
+//
+// AIDEV-NOTE: the registration must precede every read of the snapshot
+// pointer (trySnapshotHit re-reads it), or a flip could commit between the
+// read and the registration and hand the client the old anchor after the
+// flip. The row check before it — which is what decides whether a suite is
+// tracked — therefore costs one indexed EXISTS read (SuiteExists; deferred
+// minor C-21) per <suite>/InRelease and <suite>/Release request, tracked or
+// not, while the barrier is on (none when it is off; existsReads counts
+// them). A failed read registers anyway (deferred minor C-22): an
+// unneeded registration only delays a flip by this serve, a missed one
+// could hand the client the old anchor after the flip. The wait's end on
+// h.lifecycleCtx is defence in depth: the daemon closes the gate at the
+// shutdown signal (design note 18), so no hold is left when the handler
+// closes. A request whose own context ends while it waits comes back
+// unregistered, and ServeHTTP answers it as a client abort. An HTTPS
+// request through the MITM pipeline keeps its inner context when its
+// client disconnects (internal/proxy/connect.go), so such a waiter stays
+// until the hold ends (at most HoldMax) and counts against the waiter cap
+// meanwhile (design note 3).
+func (h *Handler) anchorStart(r *http.Request, req *proxy.Request) *flipgate.Token {
+	if !h.flipGate.Enabled() || !req.IsMetadata || req.SuitePath == "" {
+		return nil
+	}
+	if req.Path != req.SuitePath+inReleaseSuffix && req.Path != req.SuitePath+releaseSuffix {
+		return nil
+	}
 	h.existsReads.Add(1)
 	exists, err := h.suiteExists(r.Context(), suiteKeyOf(req))
 	switch {
@@ -5545,21 +8133,38 @@ func (h *Handler) suiteExists(ctx context.Context, key cache.SuiteKey) (bool, er
 	case err != nil && r.Context().Err() != nil:
 		return nil // the client left during the read
 	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	stop := context.AfterFunc(h.lifecycleCtx, cancel)
+	defer stop()
+	return h.flipGate.AnchorStart(ctx, flipgate.Key(req.CanonicalScheme, req.CanonicalHost, req.SuitePath))
+}
 ```
 
-  and its AIDEV-NOTE's sentence "The row check before it — which is what decides whether a suite is tracked — therefore costs one extra indexed read per <suite>/InRelease and <suite>/Release request, tracked or not, while the barrier is on (none when it is off)." becomes "… — which is what decides whether a suite is tracked — therefore costs one indexed EXISTS read (SuiteExists; deferred minor C-21) per <suite>/InRelease and <suite>/Release request, tracked or not, while the barrier is on (none when it is off; existsReads counts them). A failed read registers anyway (deferred minor C-22): an unneeded registration only delays a flip by this serve, a missed one could hand the client the old anchor after the flip."
-- `trySnapshotHit`: the displaced by-hash serve calls `go h.touchAsync(req, true, nil)`; after `serveSnapshotMemberMiss`, `if suites := servedSuite(sr, status); served && suites != nil { go h.touchAsync(req, false, suites) }`; the ordinary serve calls `go h.touchAsync(req, true, servedSuite(sr, status))`.
-- `tryCacheHit` calls `h.tryURLPathHit(w, r, req, start, sr)` and `h.tryByHashContentAddressed(w, r, req, sr)`.
-- `tryURLPathHit(w, r, req, start time.Time, sr *suiteReq)`: after the `.deb` validation block, the rest of the function becomes
+- `tryURLPathHit`'s signature becomes
+
+```go
+func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time, sr *suiteReq) (served bool, outcome string, status int, bytesWritten int64, validation packageValidation) {
+```
+
+  and, after the `.deb` validation block, the rest of the function becomes
 
 ```go
 	// Spec C3 legacy onboarding: a cached anchor (or flat index) of a suite
-	// without a row creates the row before its body is served.
-	if req.IsMetadata && h.onboard(r, req, sr, *row.BlobHash) {
-		// The registration waited in a flip's hold: what is current now
-		// may be a snapshot (design note 9).
-		if served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start, sr); handled {
-			return served, "", status, body, packageValidation{SnapshotDisplaced: displaced}
+	// without a row creates the row before its body is served, and the
+	// serve registers with the flip barrier right after.
+	if req.IsMetadata {
+		if t := h.onboard(r, req, sr, *row.BlobHash); t != nil {
+			if clientLeft(w, r) {
+				return true, "client_canceled", http.StatusServiceUnavailable, 0, packageValidation{}
+			}
+			if t.Held() > 0 {
+				// The registration waited in a flip's hold: what is current
+				// now may be a snapshot (design note 9).
+				if served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start, sr); handled {
+					return served, "", status, body, packageValidation{SnapshotDisplaced: displaced}
+				}
+			}
 		}
 	}
 
@@ -5570,13 +8175,72 @@ func (h *Handler) suiteExists(ctx context.Context, key cache.SuiteKey) (bool, er
 		return false, "", 0, 0, packageValidation{}
 	}
 	go h.touchAsync(req, true, append(servedSuite(sr, status), vouchedSuites(req, v, status)...))
-	h.maybeFireFreshness(req)
+	// T1 only for a tracked suite (ruling PD-11, design review M18:
+	// onboarding above tracks it first); an untracked suite's check would
+	// only read its absent row and skip (I-4). The other T1 sites serve
+	// snapshot or known-suite content.
+	if sr.tracked {
+		h.maybeFireFreshness(req)
+	}
 	return true, "", status, bytesWritten, v
+}
 ```
 
-- `checkPackageHash`'s matching-row return adds `Suites: vouchingSuites(rows, distinct[0]),`.
-- `tryByHashContentAddressed(…, sr *suiteReq)`: right after the `req.SuitePath == ""` check, `if !sr.tracked { return false, 0, 0 }` with the comment "I-4, handler side (spec C3): only a known suite (one with a row) is served from the pool by hash; a minted suite name falls through to the miss path and creates nothing here."; `byHashSuffixRegex`'s AIDEV-NOTE ends "Since phase D only known suites (with a suite_freshness row) get it (I-4, spec C3)."
-- `tryDisplacedByHash`: inside the loop, after the `served` return, log the miss (C-25): `h.logger.Warn("snapshot_member_blob_missing", "canonical_host", req.CanonicalHost, "path", req.Path, "snapshot_id", row.SnapshotID, "blob_hash", row.BlobHash, "snapshot_displaced", true)` with the comment "Deferred minor C-25: no recovery fetch for a displaced member, but its missing blob is logged like a current member's."
+- `checkPackageHash`'s matching-row return carries the vouching suites:
+
+```go
+			return false, "", 0, 0, false, packageValidation{
+				Validated:   true,
+				PackageName: firstPackageName(rows, distinct[0]),
+				Suites:      vouchingSuites(rows, distinct[0]),
+			}
+```
+
+- `byHashSuffixRegex`'s AIDEV-NOTE gains the I-4 sentence:
+
+```go
+// byHashSuffixRegex matches the trailing "/by-hash/SHA256/<64hex>" of a
+// request path. apt's Acquire-By-Hash mode appends this suffix under each
+// component directory; the trailing 64-char hex segment IS the SHA256 of
+// the file. Compiled once at package init.
+//
+// AIDEV-NOTE: SPEC2 §0 #4 by-hash content-addressed serve — pool's
+// content addressing makes this safe without a snapshot_member row, but
+// ONLY for non-adopted suites; adopted suites must keep going through
+// trySnapshotHit per SPEC2 §6.1. Since phase D only known suites (with a
+// suite_freshness row) get it (I-4, spec C3).
+var byHashSuffixRegex = regexp.MustCompile(`/by-hash/SHA256/([0-9a-f]{64})$`)
+```
+
+  and `tryByHashContentAddressed` takes `sr` and answers only for known suites:
+
+```go
+func (h *Handler) tryByHashContentAddressed(w http.ResponseWriter, r *http.Request, req *proxy.Request, sr *suiteReq) (served bool, status int, bytesWritten int64) {
+	if req.SuitePath == "" {
+		return false, 0, 0
+	}
+	// I-4, handler side (spec C3): only a known suite (one with a row) is
+	// served from the pool by hash; a minted suite name falls through to
+	// the miss path and creates nothing here.
+	if !sr.tracked {
+		return false, 0, 0
+	}
+```
+
+- `tryDisplacedByHash`: inside the loop, after the `served` return:
+
+```go
+		// Deferred minor C-25: no recovery fetch for a displaced member,
+		// but its missing blob is logged like a current member's.
+		h.logger.Warn("snapshot_member_blob_missing",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"snapshot_id", row.SnapshotID,
+			"blob_hash", row.BlobHash,
+			"snapshot_displaced", true,
+		)
+```
+
 - `serveCacheMiss`: replace the final `logRequestWithValidation(…, packageValidation{Validated: res.validatedHash, PackageName: res.packageName})` with
 
 ```go
@@ -5587,7 +8251,39 @@ func (h *Handler) suiteExists(ctx context.Context, key cache.SuiteKey) (bool, er
 	h.logRequestWithValidation(r, req.CanonicalHost, req.Path, logOutcome, cw.statusCode(), cw.bytes, true, res.status, start, v)
 ```
 
-- `runFetch`: declare `vouchers []string` beside `validatedHash`/`packageName`, set `vouchers = vouchingSuites(rows, distinct[0])` where `packageName = firstPackageName(rows, distinct[0])` is set, and return `vouchingSuites: vouchers` (realign the `sfResult` literal).
+- `runFetch` declares
+
+```go
+	var (
+		validatedHash bool
+		packageName   string
+		vouchers      []string
+	)
+```
+
+  sets the vouchers where it sets the package name,
+
+```go
+				validatedHash = true
+				packageName = firstPackageName(rows, distinct[0])
+				vouchers = vouchingSuites(rows, distinct[0])
+```
+
+  and returns them:
+
+```go
+	return sfResult{
+		blobHash:       hash,
+		size:           fres.ContentLength,
+		status:         fres.Status,
+		validatedHash:  validatedHash,
+		packageName:    packageName,
+		vouchingSuites: vouchers,
+		suiteTracked:   stored.Tracked,
+		unproven:       stored.Create.Outcome == cache.SuiteCreated && stored.Create.Unproven,
+	}
+```
+
 - `tryServeStale`: right after its `http.ServeContent`:
 
 ```go
@@ -5607,7 +8303,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each: (a) skip `onboard` → `TestServeHTTP_HitOnboardsALegacyAnchor` FAILS (`row = <nil>`); (b) onboard without `SignedSeenAt` → the same test FAILS (`earned no marker`); (c) skip `markCachedSignedAnchors` in `onboard` → it FAILS (`want the cached Release.gpg's 1700000100`); (d) onboard without the sniff (`&& false`) → it FAILS (`a plain-text InRelease onboarded its suite`); (e) drop the by-hash `!sr.tracked` check → `TestServeHTTP_ByHashContentAddressed_UnknownSuiteIsNotServed` FAILS; (f) the url_path hit touches only vouched suites → `TestServeHTTP_AnchorServesTouchTheirSuite` FAILS (`the hit's touch`); (g) the miss touches only vouched suites → it FAILS (`the miss's touch`); (h) no stale touch → it FAILS (`the stale serve's touch`); (i) drop `Suites` from the hit's validation → `TestServeHTTP_VouchedDebServeTouchesItsSuite` FAILS; (j) `servedSuite` ignores the status → `TestServedSuite_Rules` FAILS; (k) count a read before the `Enabled` check → `TestAnchorStart_ReadsOnlyWhileTheBarrierIsOn` FAILS; (l) a read error returns nil → `TestAnchorStart_RegistersOnAReadError` FAILS; (m) `touchAsync` without its recover → `TestTouchAsync_RecoversItsPanic` FAILS (the panic escapes); (n) drop the C-25 log → `TestServeHTTP_RetainedByHashLostBlobIs404WithoutAFetch` FAILS.
+One at a time, reverting each: (a) skip onboarding (`if t := (*flipgate.Token)(nil); t != nil && h.onboard(…) != nil {`) → `TestServeHTTP_HitOnboardsALegacyAnchor` FAILS (`row = <nil>`); (b) onboard without `SignedSeenAt` → the same test FAILS (`earned no marker`); (c) onboard without `seed.Cached = h.cachedAnchors(…)` → it FAILS (`want the cached Release.gpg's 1700000100`); (d) onboard without the sniff (`&& false`) → it FAILS (`a plain-text InRelease onboarded its suite`); (e) drop the by-hash `!sr.tracked` check → `TestServeHTTP_ByHashContentAddressed_UnknownSuiteIsNotServed` FAILS; (f) the url_path hit touches only vouched suites → `TestServeHTTP_AnchorServesTouchTheirSuite` FAILS (`the hit's touch`); (g) the miss touches only vouched suites → it FAILS (`the miss's touch`); (h) no stale touch → it FAILS (`the stale serve's touch`); (i) drop `Suites` from the hit's validation → `TestServeHTTP_VouchedDebServeTouchesItsSuite` FAILS; (j) `servedSuite` ignores the status → `TestServedSuite_Rules` FAILS; (k) count a read before the `Enabled` check → `TestAnchorStart_ReadsOnlyWhileTheBarrierIsOn` FAILS; (l) a read error returns nil → `TestAnchorStart_RegistersOnAReadError` FAILS; (m) `touchAsync` without its recover → `TestTouchAsync_RecoversItsPanic` FAILS (the panic escapes); (n) drop the C-25 log → `TestServeHTTP_RetainedByHashLostBlobIs404WithoutAFetch` FAILS; (o) drop `if !hasIt { return false, 0, 0 }` in `tryByHashContentAddressed` → `TestServeHTTP_ByHashContentAddressed_RejectsCrossHostBlob` FAILS (`leaked the cached bytes (status=200)`); (p) the snapshot serve touches no suite (`touchAsync(req, true, nil)`) → `TestServeHTTP_AnchorServesTouchTheirSuite` FAILS (`the snapshot serve's touch`); (q) `cachedAnchors` calls every cached anchor signed (`true || file.Sniff(p, head)`) → `TestServeHTTP_HitOnboardsALegacyAnchor` FAILS (`q: … no marker for its plain-text InRelease`), as does Task 9's `TestServeHTTP_CreatingMissMarksCachedSignedAnchors`; (r) `onboard` ignores the rejection cache → `TestServeHTTP_SuiteCapRejectionIsCachedCountedAndLogged` FAILS (`rose by 2`); (s) no touch after the recovery serve → `TestServeHTTP_RecoveredAnchorServeTouchesItsSuite` FAILS; (t) the miss touches only its own suite → `TestServeHTTP_VouchedDebMissTouchesItsSuite` FAILS; (u) every hit runs `runOnboard` itself (no singleflight) → `TestServeHTTP_ConcurrentHitsShareOneOnboarding` FAILS (`… onboardings ran; want the hits to share one`); (v) the url_path hit fires T1 whether or not the suite is tracked → `TestServeHTTP_HitOnboardsALegacyAnchor` FAILS (`T1 fired for the untracked suite /r/dists/p`); (w) drop the onboarding hit's `clientLeft` check → `TestServeHTTP_OnboardingClientThatLeftIsAClientAbort` FAILS (`status 502, want 503`); (x) `ServeHTTP` logs the hit with `r` instead of `heldContext(r, sr.tok)` → `TestServeHTTP_OnboardingThatWaitedServesTheNewSnapshot` and the client-abort test FAIL (no `flip_held_ms`); (y) no re-dispatch after a wait (`t.Held() > 0 && false`) → `TestServeHTTP_OnboardingThatWaitedServesTheNewSnapshot` FAILS (it serves the cached bytes); (z) drop the onboarding backstop (`res.unproven && !shared && false`) → `TestServeHTTP_OnboardingBackstopMarksAChangedAnchor` FAILS (`marked by the backstop`).
 
 - [ ] **Step 6: Commit**
 
@@ -5622,14 +8318,19 @@ git commit -m "Onboard cached anchors, record client interest and serve by-hash 
 
 ### Task 11: Phase D DoD: minted suites at scale, `dists/` onboarding from a v6 cache, the hit-path invariant
 
-The §9 phase D row's DoD tests that Tasks 4–10 did not already provide (the single-INSERT-site test is Task 4's; the adoption-disabled parity test Task 9's): the minted-suite scale test (rows, markers, the lock map, `FlipGate().Len()`, the touch map and the rejection cache stay bounded by the tracked suites; Review Focus 1), `dists/` onboarding on a cache a v6 binary wrote (Review Focus 2), and the hit-path invariant as deviation 1 states it, across first-contact and refresh misses, a cap refusal later lifted, legacy onboarding (also through a `Release` hit, where only `markCachedSignedAnchors` marks), an adoption whose anchor row the checker reconstructs (`reconstructAnchor`), and a restart (the startup pass in `freshness.RunLegacyTrustAudit`). The scale test runs in under 3 s under `-race` (measured 2.9 s), inside the 5 s budget.
+The §9 phase D row's DoD tests that Tasks 4–10 did not already provide (the single-INSERT-site test is Task 4's; the adoption-disabled parity test Task 9's):
+- **The minted-suite scale test** (Review Focus 1; design review I5): 11 hosts × 8 minted suites (352 requests) against `max_suites = 40` reach both caps — ten hosts fill their per-host cap of 4, the eleventh is refused at the global cap — after four suites idle for two days, unadopted, are evicted at the global cap first. Rows end at exactly 40, markers exist exactly for tracked suites, and the checker's lock map, the flip gate and the touch map each hold exactly one entry per surviving row, so every evictee left all three; the rejection cache holds the 48 refused suites. The handler's gate is the adopter's (`FlipGate()`) and the checker that guards eviction has that adopter, so eviction purges the gate the handler registers on, as in production (design note 21); the gate's quiet period is the longest, so its idle sweep (twice the quiet period) cannot blur the count. Every check answers 304, so nothing adopts.
+- **`dists/` onboarding on a cache a v6 binary wrote** (Review Focus 2): row and marker at the first body byte.
+- **The hit-path invariant** as deviation 1 states it, across first-contact and refresh misses, a cap refusal later lifted, legacy onboarding (also through a `Release` hit, where only the creating transaction's mark of the cached `Release.gpg` — `SuiteSeed.Cached` — covers it), an adoption whose lost anchor row the checker reconstructs (design review I4: the test deletes the row `CommitAdoption` seeded, so `reconstructAnchor` really runs, and checks the rebuilt row), and a restart (the startup pass in `freshness.RunLegacyTrustAudit`). Since every creation marks in its own transaction (ruling PD-5), the invariant holds at every committed state; the test asserts it after every step.
+
+The scale test runs in about 2.5 s under `-race` (measured 2.45–2.69 s alone), inside the 5 s budget.
 
 **Files:**
 - Create: `internal/handler/suite_dod_test.go`
 - Modify: `internal/cache/testing_helpers.go` (`MigrateToVersionForTest`)
 
 **Interfaces:**
-- Consumes: everything from Tasks 4–10; `freshness.RunLegacyTrustAudit`; `flipgate.MinQuiet`; `simtest.OpenCache`, `simtest.StaticConditional`, `simtest.DiscardLogger`; Task 9's and 10's test helpers (`newSuiteRig`, `serve`, `get`, `suite`, `secondConn`, `cacheAnchor`, fixtures); `writeBlob`, `commitInlineSnapshot`, `newProxyReqHostPort`, `noUpstream`, `silentLogger`.
+- Consumes: everything from Tasks 4–10 (`LockCount`, `TouchedSuites`, `FlipGate().Len()`, `rejections.len`); `freshness.RunLegacyTrustAudit`, `freshness.NewAdopter`; `flipgate.MaxQuiet`; `(*cache.Cache).Dir`; `simtest.OpenCache`, `simtest.StaticConditional`, `simtest.DiscardLogger`; Task 9's and 10's test helpers (`newSuiteRig`, `serve`, `get`, `suite`, `secondConn`, `cacheAnchor`, fixtures); `writeBlob`, `commitInlineSnapshot`, `newProxyReqHostPort` (`phase2_handler_test.go`), `noUpstream`, `plainVerifier`, `memberStore` (`flip_stack_test.go`), `silentLogger`, `proxyReq` (`handler_test.go`).
 - Produces: `func MigrateToVersionForTest(ctx context.Context, dir string, version int) error` (`internal/cache/testing_helpers.go`, TEST-ONLY: creates `dir/cache.db` with the migrations before `version` applied); test helpers `mintedUpstream`, `firstByteProbe`, `sqliteFile`, `assertHitPathInvariant`.
 
 - [ ] **Step 1: Write the tests**
@@ -5644,6 +8345,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -5652,6 +8354,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -5689,17 +8392,34 @@ func (mintedUpstream) Fetch(_ context.Context, target *fetch.Target, dst fetch.F
 // Phase D DoD (spec §9; Review Focus 1): minted dists/ codenames, their
 // Release.gpg and by-hash names on many hosts, from an upstream that
 // answers all of them with sniff-passing bytes, create rows only up to the
-// caps (here 4 per host), markers only for tracked suites, and no growth
-// of the checker's lock map, the flip gate or the touch map beyond the
-// tracked suites; the rejection cache holds the refused suites only.
+// caps — 4 per host and 40 in all, the global cap first evicting the
+// suites idle for a day without a current snapshot (design review I5) —
+// markers only for tracked suites, and no growth of the checker's lock
+// map, the flip gate or the touch map beyond the tracked suites: each
+// holds exactly one entry per surviving row, so an evicted suite left all
+// three. The rejection cache holds the refused suites only. The gate is
+// the adopter's, so eviction purges the gate the handler registers on, as
+// in production (design note 21).
 func TestServeHTTP_MintedSuitesAtScale(t *testing.T) {
 	c := simtest.OpenCache(t)
-	gate, err := flipgate.New(flipgate.Config{Quiet: flipgate.MinQuiet})
+	ctx := context.Background()
+	// The gate sweeps an entry idle for twice its quiet period; with the
+	// longest one (30 s) none is swept during the test, so its count is exact.
+	gate, err := flipgate.New(flipgate.Config{Quiet: flipgate.MaxQuiet})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ck, err := freshness.New(freshness.Config{Cache: c, Fetcher: &simtest.StaticConditional{Status: http.StatusNotModified},
-		HostLimiter: hostsem.New(64), Logger: simtest.DiscardLogger(), MaxSuites: 40})
+	// Every check answers 304, so no check sees a change and nothing adopts:
+	// the adopter is here for its gate.
+	up := &simtest.StaticConditional{Status: http.StatusNotModified}
+	ad, err := freshness.NewAdopter(freshness.AdoptionConfig{Cache: c, Fetcher: &memberStore{bodies: map[string][]byte{}},
+		Verifier: plainVerifier{}, HostLimiter: hostsem.New(64), Logger: simtest.DiscardLogger(), FlipGate: gate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const hosts, perHost, perHostCap, maxSuites = 11, 8, 4, 40
+	ck, err := freshness.New(freshness.Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(64),
+		Logger: simtest.DiscardLogger(), MaxSuites: maxSuites, Adopter: ad})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5707,41 +8427,80 @@ func TestServeHTTP_MintedSuitesAtScale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := New(Config{Parser: parser, Cache: c, Fetch: mintedUpstream{}, Logger: simtest.DiscardLogger(),
-		HostLimiter: hostsem.New(64), Freshness: ck, AdoptionEnabled: true, FlipGate: gate, MaxSuites: 40, SuiteGuard: ck})
-	if err != nil {
+	newHandler := func() *Handler {
+		h, err := New(Config{Parser: parser, Cache: c, Fetch: mintedUpstream{}, Logger: simtest.DiscardLogger(),
+			HostLimiter: hostsem.New(64), Freshness: ck, AdoptionEnabled: true, FlipGate: ad.FlipGate(),
+			MaxSuites: maxSuites, SuiteGuard: ck})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	get := func(h *Handler, url string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s = %d", url, rec.Code)
+		}
+	}
+	// Four suites a client used two days ago, unadopted: the global cap's
+	// eviction candidates. Their miss and url_path hit give each a
+	// lock-map, gate and touch-map entry.
+	idle := newHandler()
+	for j := range 4 {
+		base := fmt.Sprintf("http://idle.example/r/dists/old%d", j)
+		get(idle, base+"/InRelease")
+		get(idle, base+"/InRelease")
+	}
+	idle.Close() // drains their T1 checks
+	db := sqliteFile(t, filepath.Join(c.Dir(), "cache.db"))
+	if _, err := db.Exec(`UPDATE suite_freshness SET last_requested_at = ? WHERE canonical_host = 'idle.example'`,
+		time.Now().Add(-48*time.Hour).Unix()); err != nil {
 		t.Fatal(err)
 	}
-	const hosts, perHost, perHostCap = 8, 15, 4
+	h := newHandler()
 	byHash := "/main/by-hash/SHA256/" + strings.Repeat("ab", 32)
 	for i := range hosts {
 		for j := range perHost {
 			base := fmt.Sprintf("http://h%02d.example/r/dists/minted%03d", i, j)
 			for _, p := range []string{"/InRelease", "/Release.gpg", byHash, "/InRelease"} {
-				rec := httptest.NewRecorder()
-				h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, base+p, nil))
-				if rec.Code != http.StatusOK {
-					t.Fatalf("%s%s = %d", base, p, rec.Code)
-				}
+				get(h, base+p)
 			}
 		}
 	}
 	h.Close() // drains the hits' T1 checks
-	all, err := c.ListSuites(context.Background())
+	all, err := c.ListSuites(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tracked := map[string]bool{}
+	rowsOf := map[string]int{}
 	for _, s := range all {
 		tracked[s.CanonicalHost+s.SuitePath] = true
+		rowsOf[s.CanonicalHost]++
 	}
-	if len(all) != hosts*perHostCap {
-		t.Fatalf("rows = %d, want %d (the per-host cap on every host)", len(all), hosts*perHostCap)
+	if len(all) != maxSuites {
+		t.Fatalf("rows = %d, want %d (the global cap)", len(all), maxSuites)
+	}
+	// Ten hosts fill their per-host cap (the tenth only after the global
+	// cap evicted the idle suites); the eleventh is refused at the global
+	// cap with no row of its own.
+	if n := rowsOf["idle.example"]; n != 0 {
+		t.Fatalf("%d idle suites survive, want all 4 evicted at the global cap", n)
+	}
+	for i := range hosts - 1 {
+		if n := rowsOf[fmt.Sprintf("h%02d.example", i)]; n != perHostCap {
+			t.Fatalf("h%02d: %d rows, want the per-host cap %d", i, n, perHostCap)
+		}
+	}
+	if n := rowsOf[fmt.Sprintf("h%02d.example", hosts-1)]; n != 0 {
+		t.Fatalf("h%02d: %d rows, want 0 (refused at the global cap)", hosts-1, n)
 	}
 	for i := range hosts {
 		for j := range perHost {
 			host, suite := fmt.Sprintf("h%02d.example", i), fmt.Sprintf("/r/dists/minted%03d", j)
-			_, ok, err := c.SignedSeen(context.Background(), "http", host, suite)
+			_, ok, err := c.SignedSeen(ctx, "http", host, suite)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -5750,16 +8509,16 @@ func TestServeHTTP_MintedSuitesAtScale(t *testing.T) {
 			}
 		}
 	}
-	if n := ck.LockCount(); n > len(all) {
-		t.Errorf("lock map = %d entries, more than the %d tracked suites", n, len(all))
+	if n := ck.LockCount(); n != len(all) {
+		t.Errorf("lock map = %d entries, want one per tracked suite (%d): an evicted suite leaves it", n, len(all))
 	}
-	if n := gate.Len(); n == 0 || n > len(all) {
-		t.Errorf("flip gate = %d entries, want 1..%d (tracked suites only)", n, len(all))
+	if n := gate.Len(); n != len(all) {
+		t.Errorf("flip gate = %d entries, want one per tracked suite (%d): an evicted suite leaves it", n, len(all))
 	}
-	if n := c.TouchedSuites(); n > len(all) {
-		t.Errorf("touch map = %d entries, more than the %d tracked suites", n, len(all))
+	if n := c.TouchedSuites(); n != len(all) {
+		t.Errorf("touch map = %d entries, want one per tracked suite (%d): an evicted suite leaves it", n, len(all))
 	}
-	if n, want := h.rejections.len(), hosts*(perHost-perHostCap); n != want {
+	if n, want := h.rejections.len(), (hosts-1)*(perHost-perHostCap)+perHost; n != want {
 		t.Errorf("rejection cache = %d entries, want the %d refused suites", n, want)
 	}
 }
@@ -5909,7 +8668,9 @@ func assertHitPathInvariant(t *testing.T, c *cache.Cache, db *sql.DB, when strin
 // Deviation 1, spec §7: after first-contact and refresh misses, a cap
 // refusal later lifted, legacy onboarding, an adoption whose anchor row
 // the checker reconstructs, and a restart, every sniff-passing anchor row
-// of a tracked suite has a marker for its base.
+// of a tracked suite has a marker for its base. Since a creation marks in
+// its own transaction (ruling PD-5), the invariant holds at every
+// committed state; the test checks it after every step.
 func TestHitPathInvariant_EveryTrackedSignedAnchorHasAMarker(t *testing.T) {
 	r := newSuiteRig(t, true, 10) // per-host cap 1
 	ctx := context.Background()
@@ -5918,11 +8679,13 @@ func TestHitPathInvariant_EveryTrackedSignedAnchorHasAMarker(t *testing.T) {
 	r.serve("/r/dists/b/InRelease", upFile{body: rowInRelease})
 	r.serve("/r/dists/b/Release.gpg", upFile{body: rowGPG})
 	r.get("/r/dists/a/InRelease") // first contact: tracked
+	assertHitPathInvariant(t, r.c, db, "after a's first contact")
 	r.get("/r/dists/b/InRelease") // refused at the per-host cap
 	r.get("/r/dists/b/Release.gpg")
 	if r.suite("/r/dists/b") != nil {
 		t.Fatal("premise: b must be refused")
 	}
+	assertHitPathInvariant(t, r.c, db, "after b's refusal")
 	// The cap is lifted (a restart with a larger max_suites): a second
 	// handler over the same cache.
 	h2, err := New(Config{Parser: r.h.parser, Cache: r.c, Fetch: r.h.fetch, Logger: silentLogger(),
@@ -5940,31 +8703,44 @@ func TestHitPathInvariant_EveryTrackedSignedAnchorHasAMarker(t *testing.T) {
 		}
 	}
 	get2("/r/dists/b/InRelease") // onboards b, marking its cached anchors
+	assertHitPathInvariant(t, r.c, db, "after b's onboarding")
 	r.cacheAnchor("/r/dists/c/InRelease", rowInRelease, 1_700_000_000)
 	r.cacheAnchor("/r/dists/c/Release.gpg", rowGPG, 1_700_000_000)
 	get2("/r/dists/c/Release.gpg") // legacy rows: Release.gpg creates no row
 	get2("/r/dists/c/InRelease")   // onboards c
+	assertHitPathInvariant(t, r.c, db, "after c's onboarding")
 	r.cacheAnchor("/r/dists/e/Release", rowRelease, 1_700_000_000)
 	r.cacheAnchor("/r/dists/e/Release.gpg", rowGPG, 1_700_000_000)
-	get2("/r/dists/e/Release") // onboards e: Release marks nothing itself, its cached Release.gpg does
+	// Onboards e: Release marks nothing itself; the creating transaction
+	// marks its cached Release.gpg (SuiteSeed.Cached).
+	get2("/r/dists/e/Release")
+	assertHitPathInvariant(t, r.c, db, "after e's onboarding")
 	if _, err := db.Exec(`DELETE FROM url_path WHERE path = '/r/dists/a/InRelease';
 DELETE FROM suite_signed_seen WHERE base = '/r/dists/a'`); err != nil {
 		t.Fatal(err)
 	}
 	get2("/r/dists/a/InRelease") // refresh miss
-	// d: adopted (CommitAdoption marks); its anchor row is gone, and the
-	// checker reconstructs it from the snapshot.
+	assertHitPathInvariant(t, r.c, db, "after a's refresh miss")
+	// d: adopted (CommitAdoption marks and seeds its anchor row); the row
+	// is then lost, and the checker reconstructs it from the snapshot
+	// (design review I4: without the delete, reconstructAnchor never runs).
 	inrel := writeBlob(t, r.h, rowInRelease)
 	commitInlineSnapshot(t, r.h, "http", "127.0.0.1", "/r/dists/d", inrel,
 		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: inrel, DeclaredSHA256: inrel}}, nil)
+	if _, err := db.Exec(`DELETE FROM url_path WHERE path = '/r/dists/d/InRelease'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.c.LookupURL(ctx, "http", "127.0.0.1", "/r/dists/d/InRelease"); !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("premise: d's anchor row is gone (%v)", err)
+	}
 	ck, err := freshness.New(freshness.Config{Cache: r.c, Fetcher: &simtest.StaticConditional{Status: http.StatusNotModified},
 		HostLimiter: hostsem.New(4), Logger: silentLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	ck.Check(ctx, "http", "127.0.0.1", "/r/dists/d")
-	if _, err := r.c.LookupURL(ctx, "http", "127.0.0.1", "/r/dists/d/InRelease"); err != nil {
-		t.Fatalf("premise: the checker reconstructs d's anchor row (%v)", err)
+	if row, err := r.c.LookupURL(ctx, "http", "127.0.0.1", "/r/dists/d/InRelease"); err != nil || row.BlobHash == nil || *row.BlobHash != inrel {
+		t.Fatalf("the checker did not reconstruct d's anchor row from its snapshot (%+v, %v)", row, err)
 	}
 	assertHitPathInvariant(t, r.c, db, "after serving")
 	// A restart: markers lost (an earlier binary never wrote them), healed
@@ -6017,7 +8793,7 @@ Expected: PASS, the scale test in under 5 s.
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each: (a) `suiteCaps` returns `cache.SuiteCaps{}` → `TestServeHTTP_MintedSuitesAtScale` FAILS (`rows = 120, want 32`); (b) skip `onboard` → `TestServeHTTP_OnboardsADistsSuiteFromAV6Cache` FAILS (`row=false marker=false`); (c) `onboard` skips `markCachedSignedAnchors` → `TestHitPathInvariant_EveryTrackedSignedAnchorHasAMarker` FAILS (`/r/dists/e/Release.gpg of a tracked suite has no marker`); (d) mark only when the miss creates the row → the invariant test FAILS (`/r/dists/a/InRelease …`). (The by-hash I-4 check is pinned by Task 10's `TestServeHTTP_ByHashContentAddressed_UnknownSuiteIsNotServed`; the scale test's by-hash names hold no pool blob.)
+One at a time, reverting each: (a) `suiteCaps` returns `cache.SuiteCaps{}` → `TestServeHTTP_MintedSuitesAtScale` FAILS (`rows = 92, want 40`); (b) skip onboarding (`if t := (*flipgate.Token)(nil); t != nil && h.onboard(…) != nil {`) → `TestServeHTTP_OnboardsADistsSuiteFromAV6Cache` FAILS (`row=false marker=false`); (c) `runOnboard` without `seed.Cached = h.cachedAnchors(…)` → `TestHitPathInvariant_EveryTrackedSignedAnchorHasAMarker` FAILS (`after e's onboarding: /r/dists/e/Release.gpg of a tracked suite has no marker`); (d) mark only when the miss creates the row (`file.Marks() && !trackedAtStart`) → the invariant test FAILS (`after a's refresh miss: /r/dists/a/InRelease …`); (e) `reconstructAnchor` writes nothing (`if perr := error(nil); perr != nil {`) → it FAILS (`the checker did not reconstruct d's anchor row`); (f) `HoldSuite`'s `release(true)` skips the gate `Purge` → the scale test FAILS (`flip gate = 44 entries`); (g) it skips `CompareAndDelete` → it FAILS (`lock map = 44 entries`); (h) `afterCreate` keeps an evictee's touch entry → it FAILS (`touch map = 44 entries`); (i) `suiteCaps` drops the global cap → it FAILS (`rows = 48, want 40`); (j) `holdEvictionCandidate` returns no candidate → it FAILS (`4 idle suites survive`). (The by-hash I-4 check is pinned by Task 10's `TestServeHTTP_ByHashContentAddressed_UnknownSuiteIsNotServed`; the scale test's by-hash names hold no pool blob.)
 
 - [ ] **Step 6: Commit**
 
@@ -6031,7 +8807,16 @@ git commit -m "Phase D DoD: minted suites at scale, v6 onboarding, the hit-path 
 
 ### Task 12: Deferred minors in the files this phase touches
 
-The deferred-minor rule (overview Global Constraints; the three deferred files' "How they get done"): this phase includes the items that sit in files it changes, except items tagged with another phase (owned by it). Applied as: an item is taken when its fix changes a file a task of this phase edits for its own work; the files Task 4's two rename scripts change only mechanically (a call renamed, nothing else) do not count (B-27 `restart_reset_test.go`, B-36 `check_streak_test.go`, C-12 and C-13 `flip_state_test.go` live in such files, and A-15 asks for a test of the untouched `hot_set.go`, which would go in another, `hot_prefetch_test.go`). Tasks 1–11 took A-17, A-22–A-25, A-30, A-32–A-35, A-38, A-50–A-53, B-1–B-5, B-8 (moot), B-22 (already true), C-21 (query half), C-22–C-26 and C-35. This task takes the rest of the untagged items in those files:
+The deferred-minor rule (overview Global Constraints; the three deferred files' "How they get done"): this phase includes the items that sit in files it changes, except items tagged with another phase (owned by it). Applied as: an item is taken when its fix changes a file a task of this phase edits for its own work; the files Task 4's two rename scripts change only mechanically (a call renamed, nothing else) do not count (B-27 `restart_reset_test.go`, B-36 `check_streak_test.go`, C-12 and C-13 `flip_state_test.go` live in such files, and A-15 asks for a test of the untouched `hot_set.go`, which would go in another, `hot_prefetch_test.go`). Tasks 1–11 took A-17, A-22–A-25, A-30, A-32–A-35, A-38, A-50–A-53, B-1–B-5, B-8 (moot), B-22 (already true), C-21 (query half), C-22–C-26 and C-35. Ruling PD-1 (restated for design review M16) confirms this reading: a file only a rename script touched is not "touched" — a rename diff puts no reviewer on the file's logic, and mixing unrelated fixes into it blurs the review — and phase tags override the brief's "every item"; B-27, B-36, C-12 and C-13 wait for phase H's sweep, which takes every remaining item anyway.
+
+Plain-text `InRelease` bodies left in the handler and cmd tests (ruling PD-2): every other `InRelease` fixture that models an upstream response, a cached anchor or a snapshot anchor is `simtest.ClearsignedFixture` since Task 3's fixture-only commit. The list is measured, not recalled: instrumenting the fetch paths, `PutURLPath` and `CommitAdoption` to report every non-clearsigned `InRelease` during a full handler and cmd test run finds exactly these, each plain on purpose and commented so:
+- `internal/handler/suite_rows_test.go`, `rowHTML` (an HTML soft-404): served as `<suite>/InRelease` in `TestServeHTTP_AdoptionDisabledSeedParity` (a body that fails the sniff creates no row) and cached as one in `TestServeHTTP_CreatingMissMarksCachedSignedAnchors` (an unsigned cached anchor earns the new row no marker).
+- `internal/handler/suite_hit_test.go`, `"Origin: plain\n"` cached as `<suite>/InRelease` in `TestServeHTTP_HitOnboardsALegacyAnchor`: a plain-text anchor onboards nothing and fires no T1, and a plain-text cached `InRelease` earns an onboarded suite no marker.
+- `cmd/apt-cacher-ultra/legacy_audit_wiring_test.go`, the legacy plain-text snapshot anchor the startup audit must quarantine (`TestServeListeners_LegacyAuditRunsBeforeGCAndServing`).
+
+(Freshness's `TestReparseSnapshotRelease_PlainTextInReleaseIsAnError` is plain on purpose too, outside the handler and cmd tests.)
+
+This task takes the rest of the untagged items in the files this phase touches:
 
 - `internal/freshness/scheduler.go` (Task 7) and `scheduler_test.go`: B-40 (pruning the host whose turn is next resets the turn to the first host), B-41 (the tick's comparator built keys per comparison), B-44 (`checkWorker`'s last-resort recover left no trace: it now counts `acu_freshness_unlogged_panics_total`, declared in `metrics.go`), and, in the test file this task opens, B-39 (no test exercised the in-flight skip), B-42 (the busy re-park test did not check `signed`), B-43 (nothing pinned that an ordinary scheduler check honours the cooldown).
 - `internal/freshness/sim_sched_test.go` (Task 4 edits it by hand): B-47 (goroutine slack 16 → 8, as in the capacity simulation), B-48 (seed the rand seam), B-49 (the pacing simulation gains spec §7's +2 h forward step). B-50 was checked: the assertion is already `repairs < 2 || repairs != unchanged`, as tight as its message; Task 13 deletes it.
@@ -6431,7 +9216,7 @@ In `cmd/apt-cacher-ultra/flip_wiring_test.go`: delete `TestWaitLogged_ExplainsAS
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go vet ./cmd/apt-cacher-ultra/ && go test ./internal/cache/ ./internal/freshness/ -run 'TestOpenCache_LogsNothing|TestAdoptionStamp_|TestDisplacedSnapshotMembers_|TestSchedQueues_|TestCheckRecovered_|TestRun_InFlightHostsAreSkipped|TestCheckWorker_|TestCheck_ShutdownBeforeTheBarrier|TestSimScheduler_PacingAfterClockSteps'`
+Run: `go vet ./cmd/apt-cacher-ultra/; go test ./internal/cache/ ./internal/freshness/ -run 'TestOpenCache_LogsNothing|TestAdoptionStamp_|TestDisplacedSnapshotMembers_|TestSchedQueues_|TestCheckRecovered_|TestRun_InFlightHostsAreSkipped|TestCheckWorker_|TestCheck_ShutdownBeforeTheBarrier|TestSimScheduler_PacingAfterClockSteps'` (`;`, not `&&`: the vet fails by design, and the tests must still run)
 Expected: cmd: `undefined: waitAdoptionDrain`; `TestOpenCache_LogsNothing` FAILS (`openCache logged:` the migration lines); `TestSchedQueues_PruneHandsTheTurnToTheNextHost` FAILS (`order [a b d], turn "a"; want d's turn`); `TestCheckWorker_SendsDoneWhenTheRecoverPathPanics` FAILS (`rose by 0, want 1`); `TestCheck_ShutdownBeforeTheBarrierIsNotAFailure` FAILS (`acu_adoption_total for the host rose by 1, want 0`, then the ring entry and the `adoption_run_failed` line). The C-10, B-39, B-42, B-43 and B-49 tests pass on the current code: they pin behaviour that had no test (the mutants of the first four are in Step 5; the +2 h phase checks the burst bound the other phases pin).
 
 - [ ] **Step 3: Implement**
@@ -6465,7 +9250,91 @@ func (q *schedQueues) prune() {
 }
 ```
 
-B-41: in `tick`, collect `type dueSuite struct { key string; s cache.SuiteFreshness }` values with the key built once (`suiteKey(…)`), sort by `due[i].key < due[j].key`, and enqueue `d.s` (the queue bound unchanged); the FIFO comment gains "Keys are built once per suite, not per comparison (deferred minor B-41)."
+B-41: `tick` builds each due suite's key once and sorts by it; the queue bound (Task 7's `boundDue`) takes the same elements, so it builds no key either. From `var due` to the end of `tick`:
+
+```go
+	var due []dueSuite
+	for _, s := range suites {
+		if c.suiteDue(s, nowT) {
+			due = append(due, dueSuite{key: suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath), s: s})
+		}
+	}
+	// Spec C4: FIFO by queue time. Suites that become due on the same
+	// tick are queued in key order, so a suite's position is fixed. Keys
+	// are built once per suite, not per comparison (deferred minor B-41).
+	sort.Slice(due, func(i, j int) bool { return due[i].key < due[j].key })
+	if c.maxSuites > 0 {
+		// Spec C4: at most freshness.max_suites suites queued, waiting or
+		// in flight; the rest are queued by a later tick.
+		due = boundDue(due, q, c.maxSuites, nowT.Unix())
+	}
+	for _, d := range due {
+		q.enqueue(d.s, c.pendingChange(d.s))
+	}
+}
+```
+
+after `tick`:
+
+```go
+// dueSuite is a suite a tick found due, with its queue key built once
+// (deferred minor B-41).
+type dueSuite struct {
+	key string
+	s   cache.SuiteFreshness
+}
+```
+
+and `boundDue` becomes:
+
+```go
+// boundDue applies spec C4's queue bound — at most maxSuites suites
+// queued, waiting or in flight — to a tick's due list (key order): it
+// returns the due suites not queued yet that fit and, when not all of them
+// fit, the least recently checked of them (never checked first; a
+// last_check_at in the future counts as never, the clock-step rule), still
+// in key order.
+//
+// AIDEV-NOTE: design review M12. Admitting by key alone would let suites
+// late in key order wait behind early-key ones that keep becoming due (a
+// failing suite re-enters after every backoff); the bound binds only above
+// the cap (a lowered max_suites, an upgraded table). The sort runs only
+// when the list is cut.
+func boundDue(due []dueSuite, q *schedQueues, maxSuites int, now int64) []dueSuite {
+	fresh := make([]dueSuite, 0, len(due))
+	for _, d := range due {
+		if !q.has(d.key) {
+			fresh = append(fresh, d)
+		}
+	}
+	room := maxSuites - q.len()
+	if len(fresh) <= room {
+		return fresh
+	}
+	if room <= 0 {
+		return nil
+	}
+	lastCheck := func(d dueSuite) int64 {
+		if d.s.LastCheckAt == nil || *d.s.LastCheckAt > now+int64(clockStepTolerance/time.Second) {
+			return math.MinInt64
+		}
+		return *d.s.LastCheckAt
+	}
+	byCheck := slices.Clone(fresh)
+	slices.SortStableFunc(byCheck, func(a, b dueSuite) int { return cmp.Compare(lastCheck(a), lastCheck(b)) })
+	admit := make(map[string]bool, room)
+	for _, d := range byCheck[:room] {
+		admit[d.key] = true
+	}
+	out := make([]dueSuite, 0, room)
+	for _, d := range fresh {
+		if admit[d.key] {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+```
 
 `internal/freshness/sim_sched_test.go`, `TestSimScheduler_LatencyBoundEightHosts`: B-48 adds `rand: func() float64 { return 0.5 }}) // spec §7 fixed seeds (deferred minor B-48)` to its `startSched` config; B-47 makes the goroutine limit `baseG + checkWorkers + 1 + 2 + 8` (comment: "… (8, as in the capacity simulation: deferred minor B-47)").
 
@@ -6521,7 +9390,7 @@ Expected: PASS (the latency simulation within the tighter goroutine limit on eve
 
 - [ ] **Step 5: Mutation check (do not commit)**
 
-One at a time, reverting each: (a) `q.next = 0` in `prune` → `TestSchedQueues_PruneHandsTheTurnToTheNextHost` FAILS; (b) `pop` no longer skips in-flight hosts → `TestRun_InFlightHostsAreSkipped` FAILS (`4 overall, 2 per host`); (c) the busy arm re-parks with `signed = false` → `TestSchedQueues_BusyOfferIsHeldUntilTheNextWake` FAILS; (d) `checkRecovered` always bypasses the cooldown → `TestCheckRecovered_OrdinaryCheckHonoursTheCooldown` FAILS (`"changed" with 1 upstream calls`); (e) `adoptionStampTx`'s prior read ignores the host → `TestAdoptionStamp_IsScopedToTheSuitesSchemeAndHost` FAILS (`stamped 1800010000`), (f) its anchor read ignores the scheme → the same test FAILS (`stamped 1800005001`); (g) `DisplacedSnapshotMembers` orders by `snapshot_id` in the outer query, (h) in the inner one, or (i) ignores the host → `TestDisplacedSnapshotMembers_OrdersByAdoptionAndScopesToTheSuite` FAILS; (j) `openCache` with a nil logger → `TestOpenCache_LogsNothing` FAILS; (k) the shutdown-wait log without its stack → `TestWaitAdoptionDrain_LogsAPanicWithItsStack` FAILS; (l) the last-resort recover counts nothing → `TestCheckWorker_SendsDoneWhenTheRecoverPathPanics` FAILS (`rose by 0, want 1`); (m) `spawnAdoption` abandons only on `flipgate.ErrAborted` → `TestCheck_ShutdownBeforeTheBarrierIsNotAFailure` FAILS (`rose by 1, want 0`); (n) it abandons on any error → the `TestAdoptionFailure_` record tests FAIL (`record = count 0`).
+One at a time, reverting each: (a) `q.next = 0` in `prune` → `TestSchedQueues_PruneHandsTheTurnToTheNextHost` FAILS; (b) `pop` no longer skips in-flight hosts → `TestRun_InFlightHostsAreSkipped` FAILS (`4 overall, 2 per host`); (c) the busy arm re-parks with `signed = false` → `TestSchedQueues_BusyOfferIsHeldUntilTheNextWake` FAILS; (d) `checkRecovered` always bypasses the cooldown → `TestCheckRecovered_OrdinaryCheckHonoursTheCooldown` FAILS (`"changed" with 1 upstream calls`); (e) `adoptionStampTx`'s prior read ignores the host → `TestAdoptionStamp_IsScopedToTheSuitesSchemeAndHost` FAILS (`stamped 1800010000`), (f) its anchor read ignores the scheme → the same test FAILS (`stamped 1800005001`); (g) `DisplacedSnapshotMembers` orders by `snapshot_id` in the outer query, (h) in the inner one, or (i) ignores the host → `TestDisplacedSnapshotMembers_OrdersByAdoptionAndScopesToTheSuite` FAILS; (j) `openCache` with a nil logger → `TestOpenCache_LogsNothing` FAILS; (k) the shutdown-wait log without its stack → `TestWaitAdoptionDrain_LogsAPanicWithItsStack` FAILS; (l) the last-resort recover counts nothing → `TestCheckWorker_SendsDoneWhenTheRecoverPathPanics` FAILS (`rose by 0, want 1`); (m) `spawnAdoption` abandons only on `flipgate.ErrAborted` → `TestCheck_ShutdownBeforeTheBarrierIsNotAFailure` FAILS (`rose by 1, want 0`); (n) it abandons on any error → the `TestAdoptionFailure_` record tests FAIL (`record = count 0`); (o) B-41's sort compares with `>` → `TestTick_QueuesSameTickSuitesInKeyOrder` FAILS (`queue order = [h/f h/e …]`). Task 7's queue-bound steps (g), (k), (l) and (m), restated for `dueSuite` (`q.has(d.key)`, `d.s.LastCheckAt`), still fail `TestTick_QueuesAtMostMaxSuites` and `TestTick_BoundAdmitsTheLeastRecentlyChecked` with the messages Task 7 gives.
 
 - [ ] **Step 6: Commit**
 
@@ -6538,7 +9407,7 @@ Expected: `gofmt -l` prints only `cmd/apt-cacher-ultra/ca_print.go` (a drift fil
 
 ### Task 13: Documentation, spec amendments, overview, deferred files, final verification
 
-Spec §8 (operator docs for C3, C11's `freshness.max_suites` and the events and metrics this phase adds), the rulings R-D1–R-D5, deviations 1 and 2 and the design notes the spec should state, written into the spec as revision 7; the overview's phase D bookkeeping and the carry-forwards D hands to E, F, G and H; the deferred files (every item this plan took is deleted, three are narrowed); then the full verification. No Go code changes in this task.
+Spec §8 (operator docs for C3, C11's `freshness.max_suites` and the events and metrics this phase adds), the rulings R-D1–R-D5 and PD-5–PD-11, deviations 1 and 2 and the design notes the spec should state, written into the spec as revision 7; the overview's phase D bookkeeping and the carry-forwards D hands to E, F, G and H; the deferred files (every item this plan took is deleted, three are narrowed); then the full verification. No Go code changes in this task. The operator docs and the spec say what changed for Phase 1 (design review M7: a detached-only suite is no longer tracked with adoption disabled; ruling PD-6: a refresh miss still re-stamps), how a table above its caps behaves (ruling PD-8: the upgrade case, the startup WARN, eviction above the cap, the 30-day horizon for a host at its cap), the suite-path bound (ruling PD-9), the binary `Release.gpg` sniff (ruling PD-10, which also retires the overview's `0xC2` carry-forward: no note is needed once the sniff checks the version byte), the in-transaction marks (ruling PD-5: `suite signed-seen mark failed` is the backstop's alone) and the touch residual (ruling PD-11). The spec's §7 fixture paragraph stays as written: Task 3 converted the fixtures (ruling PD-2).
 
 **Files:**
 - Modify: `docs/configuration.md`, `docs/log-fields.md`, `docs/superpowers/specs/2026-09-27-flat-repositories-design.md`, `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md`, `docs/superpowers/plans/2026-09-28-flat-repositories-A-deferred.md`, `…-B-deferred.md`, `…-C-deferred.md`
@@ -6551,60 +9420,345 @@ Spec §8 (operator docs for C3, C11's `freshness.max_suites` and the events and 
 | `max_suites` | integer | `5000` | Most suites tracked (checked, adopted, shown on the status page) at once, and at most a tenth of it per upstream host (`http` and `https` counted together). At least `10`; an explicit `0` is an error. See *Tracked suites*. |
 ```
 
-After the table's closing paragraph, a subsection `### Tracked suites` saying: a suite is tracked once a client fetches its `InRelease` — or, with adoption enabled, its `Release` — and the bytes are what they claim (an `InRelease` starts with the clearsign line apt requires; a `Release` has a hash block): an HTML error page or a stub never tracks a suite, and `Release.gpg` never does on its own. A suite whose `InRelease` (with adoption enabled, also `Release`) an earlier release cached is tracked on its first cache hit. With adoption disabled only `InRelease` tracks, as before, except that a plain-text "InRelease" (no clearsign line; apt rejects it too) no longer does. At most `max_suites` suites are tracked and at most `max_suites / 10` per host; at the total cap, the least recently requested suite that has no adopted snapshot and has not been requested for 24 hours makes room (at most eight are tried, a suite being checked or adopted is skipped, INFO `suite_evicted` names it). A suite refused a row is still served — it just does not refresh — and is not retried for 10 minutes: each refusal that reaches the database (at most one per suite per 10 minutes) is counted in `acu_suite_seed_rejected_total{host}`, the gauge `acu_suites_seed_rejected` shows how many suites are waiting out those 10 minutes, and WARN `suite_seed_rejected` (at most one a minute, with how many were suppressed) names the suite. Raise `max_suites` for very large Artifactory, aptly or Nexus hosts; lowering it below the number of tracked suites refuses new suites until the count falls below it. Serving a tracked suite's `InRelease`, `Release` or `Release.gpg`, or a `.deb` its current snapshot vouches for, records that the suite is in use (at most one write per suite per hour). A by-hash request with no cached copy under its own path is answered from an identical cached file only for a tracked suite; otherwise it is fetched from upstream. In *Upgrading an existing cache*, add: "Suites whose `InRelease` an earlier release cached but never tracked are tracked, with their signed-seen record, on their first cache hit."
+After the table's closing paragraph (and a blank line before `## [adoption]`):
+
+```markdown
+### Tracked suites
+
+A suite is tracked once a client fetches its `InRelease` — or, with adoption
+enabled, its `Release` — and the bytes are what they claim (an `InRelease`
+starts with the clearsign line apt requires; a `Release` has a hash block):
+an HTML error page or a stub never tracks a suite, and `Release.gpg` never
+does on its own. A suite whose `InRelease` (with adoption enabled, also
+`Release`) an earlier release cached is tracked on its first cache hit. A
+suite path longer than 1024 bytes is never tracked; its files are served
+untracked.
+
+With adoption disabled only `InRelease` tracks a suite, and a refetched
+`InRelease` (after its cached copy was garbage-collected) still counts as a
+successful check, as before. Two things differ from earlier releases: a
+plain-text "InRelease" (no clearsign line; apt rejects it too) no longer
+tracks a suite, and neither does a repository that publishes only `Release`
+and `Release.gpg` (for example pkg.jenkins.io). Earlier releases tracked
+such a repository from its first `Release` hit; it is now served as before
+but no longer checked for changes or shown on the status page while
+adoption is disabled.
+
+At most `max_suites` suites are tracked and at most `max_suites / 10` per
+host. At the total cap, a new suite makes room by evicting the least
+recently requested suite that has no adopted snapshot and has not been
+requested for 24 hours (at most eight are tried, a suite being checked or
+adopted is skipped, INFO `suite_evicted` names it). A suite refused a row is
+still served — it just does not refresh — and is not retried for 10
+minutes: each refusal that reaches the database is counted in
+`acu_suite_seed_rejected_total{host}` (at most once per suite per 10
+minutes, unless more than 4,096 suites were refused within them), the gauge
+`acu_suites_seed_rejected` shows how many suites are waiting out those 10
+minutes (updated within a minute), and WARN `suite_seed_rejected` (at most
+one a minute, with how many were suppressed) names the suite. Raise
+`max_suites` for very large Artifactory, aptly or Nexus hosts.
+
+A cache can hold more suites than the caps allow: after `max_suites` is
+lowered, or after an upgrade from a release without the caps (one that
+collected more than 5,000 suites, or more than 500 on one host, for example
+from an upstream that answers missing `InRelease` files with an HTML page).
+The daemon then logs WARN `suite_caps_exceeded` at start, and new suites
+(for a host at its cap, that host's) are refused. Above the total cap each
+refused attempt still evicts one suite that qualifies (no adopted snapshot,
+not requested for 24 hours), so the table shrinks back under the cap as
+suites fall idle. A host at its own cap evicts nothing: its suites go only
+when idle-suite reaping (a later release) removes those not requested for
+30 days.
+
+Serving a tracked suite's `InRelease`, `Release` or `Release.gpg`, or a
+`.deb` its current snapshot vouches for, records that the suite is in use
+(at most one write per suite per hour). A by-hash request with no cached
+copy under its own path is answered from an identical cached file only for
+a tracked suite; otherwise it is fetched from upstream.
+```
+
+In *Upgrading an existing cache*, the last paragraph ends: "…leaves no record. Suites whose `InRelease` an earlier release cached but never tracked are tracked, with their signed-seen record, on their first cache hit. A cache with more suites than `freshness.max_suites` allows, or more than a tenth of it on one host, logs WARN `suite_caps_exceeded` at start; see *Tracked suites*."
 
 `docs/log-fields.md`:
-- The metrics paragraph, after the retained by-hash sentence: "Suite rows (spec C3) add `acu_suite_seed_rejected_total{host}` (refusals at the `freshness.max_suites` caps that reached the database: at most one per suite per 10 minutes) and the unlabelled gauge `acu_suites_seed_rejected` (suites refused within the last 10 minutes). The scheduler adds the unlabelled counter `acu_freshness_unlogged_panics_total` (scheduled checks whose panic could not be logged because reporting it panicked too: a bug, please report it)."
+- The request-line field `flip_held_ms` becomes:
+
+```markdown
+- `flip_held_ms` — emitted only when an `InRelease`/`Release` request
+  waited in a flip hold (spec C8): how long it waited, in milliseconds
+  (at most 20000; part of `duration_ms`). A request waits when it
+  arrives, or right after it created its suite's row. Also on the
+  `client_canceled` line of a held request whose client left while it
+  waited.
+```
+
+- The metrics paragraph, after the retained by-hash sentence:
+
+```markdown
+Suite rows (spec C3)
+add `acu_suite_seed_rejected_total{host}` (refusals at the
+`freshness.max_suites` caps that reached the database: at most one per
+suite per 10 minutes, unless the rejection cache, which holds 4,096 suites,
+had to clear itself) and the unlabelled gauge `acu_suites_seed_rejected`
+(suites refused within the last 10 minutes, updated within a minute). The
+scheduler adds the unlabelled counter `acu_freshness_unlogged_panics_total`
+(scheduled checks whose panic could not be logged because reporting it
+panicked too: a bug, please report it).
+```
+
 - The adoption outcomes paragraph: "A flip abandoned at shutdown is not an outcome" becomes "An adoption ended by shutdown, in the flip barrier or before it, is not an outcome".
 - The operational events intro gains "suite rows (cap refusals and evictions)".
-- New operational events rows: `suite_seed_rejected` | WARN | `canonical_host`, `suite_path`, `cap` (`global_cap`, `host_cap`), `max_suites`, `suppressed`, `detail` | A suite was refused a row by `freshness.max_suites`: it is served but will not refresh; retried after 10 minutes. At most one line a minute; `suppressed` counts the refusals since the last line. — `suite_evicted` | INFO | `canonical_host`, `suite_path` (the evicted suite), `for_host`, `for_suite` | At the global cap, an idle suite with no adopted snapshot made room for a new one. — `handler_goroutine_panicked` | ERROR | `where` (`touch`), `canonical_host`, `path`, `panic`, `stack` (first occurrence per `where` per process only) | A panic in the handler's background touch goroutine was recovered (a bug, please report it). — `suite onboarding failed` | WARN | `err`, `canonical_host`, `suite_path` | A cache hit on an untracked suite's anchor could not create its row; the anchor is served and the next hit retries. — `suite signed-seen mark failed` | WARN | `err`, `canonical_host`, `suite_path` | After creating a suite's row, its other cached signed anchors could not be marked; the startup pass marks them at the next start. — `snapshot_member_blob_missing` | WARN | `canonical_host`, `path`, `snapshot_id`, `blob_hash`, `snapshot_displaced` (present for a displaced snapshot's member) | A snapshot member's pool file is gone: a current member is re-fetched and checked against its declared hash; a displaced one (retained by-hash) answers 404.
+- `clock_step_detected` ends: "For `stamp=last_requested_at` (a suite's client-interest stamp, read when the suite cap looks for an idle suite to evict) the suite is not evicted: a future stamp never counts as idle."
+- New operational events rows, between `shutdown_waiting_for_adoptions` and `shutdown wait panicked`:
+
+```markdown
+| `suite_seed_rejected` | WARN | `canonical_host`, `suite_path`, `cap` (`global_cap`, `host_cap`), `max_suites`, `suppressed`, `detail` | A suite was refused a row by `freshness.max_suites`: it is served but will not refresh; retried after 10 minutes. At most one line a minute; `suppressed` counts the refusals since the last line. |
+| `suite_evicted` | INFO | `canonical_host`, `suite_path` (the evicted suite), `for_host`, `for_suite` | At or above the global cap, a suite with no adopted snapshot that had not been requested for 24 hours was evicted for a new one. Above the cap (after `freshness.max_suites` was lowered, or after an upgrade) the new suite is still refused (`suite_seed_rejected`) until the table is back under the cap. |
+| `suite_caps_exceeded` | WARN | `suites`, `max_suites`, `hosts_at_cap`, `per_host_cap`, `fullest_host`, `fullest_host_suites` | At start, the suite table holds `freshness.max_suites` suites or more, or a host holds a tenth of it or more (a lowered `max_suites`, or an upgraded cache): new suites are refused. Above the total cap each refused attempt still evicts one suite idle for 24 hours, so the table shrinks back; a host at its cap evicts nothing, and its suites go only when idle-suite reaping (a later release) removes them. Logged once per start. |
+| `suite cap usage read failed` | WARN | `err` | The startup check behind `suite_caps_exceeded` could not count the suites; the caps apply either way. |
+| `handler_goroutine_panicked` | ERROR | `where` (`touch`, `seed_rejections`), `canonical_host` and `path` (`touch` only), `panic`, `stack` (first occurrence per `where` per process only) | A panic in one of the handler's background goroutines — the touch goroutine, or the cap-rejection cache's sweep timer — was recovered (a bug, please report it). |
+| `suite onboarding failed` | WARN | `err`, `canonical_host`, `suite_path` | A cache hit on an untracked suite's anchor could not create its row (including the 5 s bound on that write); the anchor is served and the next hit retries. |
+| `suite signed-seen mark failed` | WARN | `err`, `canonical_host`, `suite_path` | A suite's row was created, and one of its cached signed anchors changed between the handler's read and the creating write, so it was marked afterwards — and that write failed. The startup pass marks it at the next start. (Every other mark is part of the write that creates the row or stores the anchor.) |
+| `snapshot_member_blob_missing` | WARN | `canonical_host`, `path`, `snapshot_id`, `blob_hash`, `snapshot_displaced` (present for a displaced snapshot's member) | A snapshot member's pool file is gone: a current member is re-fetched and checked against its declared hash; a displaced one (retained by-hash) answers 404. |
+```
+
 - The `adoption_abandoned_at_shutdown` row's meaning becomes: "An adoption was abandoned at shutdown — waiting in the flip barrier (or about to skip it) when the daemon closed the barrier at the signal, or in any step before its commit once the daemon's lifetime context ended: nothing was committed or recorded, the change is adopted after the restart." (the "Not a failure: …" sentence unchanged).
 - `shutdown wait panicked` gains the field `stack`; the `apt-cacher-ultra starting` row adds `freshness_max_suites` ("the configured `freshness.max_suites`").
 
 - [ ] **Step 2: Spec revision 7**
 
 In `docs/superpowers/specs/2026-09-27-flat-repositories-design.md`:
-- The Date line starts `revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, runs only at exactly the cap and deletes through the compare-and-delete the reaper reuses; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and a row creation on a hit marks the suite's signed anchors; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it;` followed by the existing revision 6 text.
-- C3 "Single creation choke point": "(via the reaper path, under its mutex)" becomes "(through the compare-and-delete helper phase F's reaper reuses, holding the evictee's suite mutex)"; after "(bounded map)" insert "— at most 4,096 suites; when it is full, expired entries are dropped and, if it is still full, it is cleared —"; after "per request." add: "The WARN is rate-limited to one line a minute (field `suppressed`); the counter is `acu_suite_seed_rejected_total{host}` (refusals that reached the writer) and the unlabelled gauge `acu_suites_seed_rejected` the cache's size. The per-host cap counts a host's `http` and `https` suites together. Eviction tries at most eight candidates, least recently requested first, skipping a suite whose mutex is held (the checker is the cache's guard; the writer runs no foreign code); it runs only at exactly the global cap — above it, after `max_suites` was lowered, creation is refused until the reaper (C9) shrinks the table — leaves the evictee's `url_path` rows to `url_path` GC and logs INFO `suite_evicted`."
-- C3, adopter-wired creation: after "the handler fires T1 once the response is written" add "(from phase E, §9 "T1-on-seed"; until then the suite's first check is the next hit's T1 or the scheduler's never-checked class)". After the Phase 1 bullet ("— today's seed, byte for byte, and no T1.") add: "A creation by a hit (legacy onboarding) leaves the check stamps and validators NULL in both modes; a refresh miss of a tracked suite leaves its row as it is (create-only). A plain-text "InRelease" fails the sniff, so it seeds no row in either mode."
-- C3 "Client interest": "is written only by `TouchSuite` from client-serving paths" becomes "is set by the creating request (`CreateSuite`) and otherwise written only by `TouchSuite` from client-serving paths".
-- C3 marker writers, handler entry: "The hit path writes no marker: …" becomes "Serving a tracked suite's anchor writes no marker: …" (the rest unchanged), followed by: "A row creation on a hit — legacy onboarding, or a suite once refused at a cap — marks the anchor in hand in the creating transaction and the suite's other cached signed anchors in one follow-up writer operation (a failure is logged and healed by the startup pass at the next start): an anchor cached while its suite had no row earned no marker, since markers are written only for suites with rows (phase D plan, deviation 2)."
-- C5 "Inline verification accepts only clearsigned envelopes": add "A body that carries the marker but whose first line is not exactly the marker — apt's rule: trailing `\r`, space and tab ignored, leading whitespace or a leading blank line refused — is `malformed_clearsign` as well, and a marker line with trailing blanks, which apt accepts and go-crypto's decoder alone does not, is decoded (phase D, ruling R-D2)."
-- C7 "Failure record": "a shutdown context cancellation is not recorded" becomes "an attempt a shutdown ends — in the flip barrier or before it — is not recorded, not counted as an adoption outcome and logged at INFO only (`adoption_abandoned_at_shutdown`; phase D, deferred minor C-20)".
-- §7, C3 tests: the hit-path invariant reads "every `url_path` `InRelease` or `Release.gpg` row of a tracked suite whose blob passes the sniff has a marker for its base (markers exist only for tracked suites; phase D plan, deviation 1)".
-- §7 "Fixtures": "(about 18 files), in phase D" becomes "in phase D: the ones whose outcome depends on a sniff-passing `InRelease` (phase D plan, design note 22)".
-- C11: `adoption_abandoned_at_shutdown`'s gloss becomes "(an adoption ended by shutdown, in the flip barrier or before it: INFO, never counted as an adoption outcome)"; the events gain `suite_evicted` and `handler_goroutine_panicked`; after "`acu_flip_barrier_active` (flips in the C8 barrier now)" add "and the C3 pair `acu_suite_seed_rejected_total{host}` (counter) and `acu_suites_seed_rejected` (gauge), plus `acu_freshness_unlogged_panics_total`"; the constant "cap-rejection cache 10 min" becomes "cap-rejection cache 10 min (at most 4,096 suites)".
+- The Date line starts `revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it;` followed by the existing revision 6 text.
+- C3's sniff table, the `Release.gpg` row (ruling PD-10):
+
+```markdown
+| `Release.gpg` | armor header `-----BEGIN PGP SIGNATURE-----` as the first non-whitespace text (leading whitespace is accepted; leading non-header lines, which gpg tolerates, are rejected), or a binary OpenPGP signature packet: old-format tag byte 0x88–0x8B or new-format 0xC2, whose body — at the offset its length header gives (old format: one, two or four length octets, none for the indeterminate type; new format: one octet below 192, two for 192–223, five for 255, one for a partial length) — starts with a signature version 3–6 (phase D, ruling PD-10: text starting with a UTF-8 lead byte, such as "©" or U+00A0, does not pass) |
+```
+
+- C3 "Single creation choke point" becomes (rulings R-D1, R-D5, PD-8, PD-9; design review M5, M10):
+
+```markdown
+**Single creation choke point.** `cache.CreateSuite` is the **only**
+`INSERT INTO suite_freshness`: create-only (`ON CONFLICT DO NOTHING`), sets
+`last_requested_at = now`, and enforces two caps: `freshness.max_suites`
+(default 5000) globally and `max_suites / 10` per canonical host (a host's
+`http` and `https` suites counted together). At or above the global cap it
+first tries to evict the least-recently-requested suite that has no current
+snapshot and has been idle ≥ 24 h, through the compare-and-delete helper
+phase F's reaper reuses, holding the evictee's suite mutex: the checker is
+the cache's guard and takes the mutex with `TryLock`, a busy suite is
+skipped, at most eight candidates are tried, and the writer runs no foreign
+code. A candidate is held once the table is within eight rows of the cap,
+so concurrent creations at the boundary do not refuse while an idle suite
+exists. An attempt evicts at most one suite: above the cap (after
+`max_suites` was lowered, or after an upgrade) it evicts one and is still
+refused while the count stays at or above the cap, so the table converges
+under the 24 h rule (phase D, ruling PD-8). The per-host cap never evicts;
+a host at its cap shrinks only through the reaper (C9, `gc.suite_idle_ttl`,
+30 days by default). The daemon logs WARN `suite_caps_exceeded` at start
+when the table is at or above the global cap or a host is at its cap. An
+eviction leaves the evictee's `url_path` rows to `url_path` GC, drops its
+lock-map, flip-gate and touch entries, and logs INFO `suite_evicted`.
+Otherwise `CreateSuite` creates nothing and emits a rate-limited WARN
+`suite_seed_rejected` ("suite will not refresh"; one line a minute, field
+`suppressed`), the counter `acu_suite_seed_rejected_total{host}` (refusals
+that reached the writer) and the unlabelled gauge `acu_suites_seed_rejected`
+(the rejection cache's size, swept within a minute). Rejections are cached
+in memory per suite key — whichever of the suite's files was refused — for
+10 minutes, so an over-cap suite does not cost a writer operation per
+request; the map holds at most 4,096 suites (when it is full, expired
+entries are dropped and, if it is still full, it is cleared, so a suite can
+then be counted again within its 10 minutes). A suite path longer than
+1024 bytes is not a suite for tracking: classification never treats its
+files as suite files, so it gets no row, marker, touch or rejection-cache
+entry (phase D, ruling PD-9).
+```
+
+- C3's two creation bullets and the paragraph after them become (rulings PD-6, PD-11; design review M7):
+
+```markdown
+- with an adopter wired: `<suite>/InRelease`, `<suite>/Release`, and flat
+  `<D>/Packages*`/`Sources*` (a sniff-passing `<suite>/Release.gpg` writes the
+  marker for a suite that already has a row but creates none: apt fetches it
+  only after `Release`). The new row leaves `last_check_at` NULL and the
+  handler fires T1 once the response is written (from phase E, §9
+  "T1-on-seed"; until then the suite's first check is the next hit's T1 or
+  the scheduler's never-checked class), so eager adoption starts within
+  seconds of first contact when a slot is free, else as soon as one is
+  released (C4 admission). A refresh miss leaves an existing row as it is;
+- with no adopter (Phase 1): `<suite>/InRelease` only, stamping
+  `last_check_at = last_success_at = now` and the miss validators — today's
+  seed, byte for byte, and no T1. A refresh miss of a tracked suite's
+  `InRelease` (its cached copy was garbage-collected) re-stamps the row the
+  same way — the stamps, the validators, `inrelease_change_seen_at` cleared,
+  `check_fail_count = 0` — with an UPDATE in the same writer operation,
+  unless the suite has a current snapshot (phase D, ruling PD-6). A
+  detached-only suite (`Release` and `Release.gpg`, no `InRelease`) is not
+  tracked: before phase D its `Release` hit's T1 created a row through the
+  old upsert, so it loses its Phase-1 change observations and its admin row
+  (documented).
+
+A creation by a hit (legacy onboarding) leaves the check stamps and
+validators NULL in both modes, so its first check runs at once. A plain-text
+"InRelease" fails the sniff, so it seeds no row in either mode. A `url_path`
+hit fires T1 only for a tracked suite (after onboarding; phase D, ruling
+PD-11).
+```
+
+- C3 "Client interest" opens:
+
+```markdown
+**Client interest.** `suite_freshness.last_requested_at` (distinct from
+`url_path.last_requested_at`; an `AIDEV-NOTE` says so) is set by the
+creating request (`CreateSuite`) and otherwise written only by `TouchSuite`
+from client-serving paths:
+```
+
+  and its coalescing sentence becomes (ruling PD-11):
+
+```markdown
+Touches are coalesced in memory (at most one write per suite per hour; the
+map holds only tracked suites and is purged on reap and on eviction). The
+coalescing is monotonic: after a forward wall-clock step of 23 h or more, an
+active suite without a snapshot keeps its pre-step stamp for up to an hour
+and is evictable meanwhile — bounded and self-healing. A stamp in the future
+(a backward step) never makes a suite evictable; the eviction scan reports
+it through the rate-limited `clock_step_detected` (C4; phase D, ruling
+PD-11).
+```
+
+- C3 marker writers, the handler entry becomes (deviation 2, ruling PD-5):
+
+```markdown
+- the handler (phase D). On a miss, inside the writer operation that
+  stores the `url_path` row (and, on first contact, creates the suite row):
+  for a sniff-passing `InRelease` or `Release.gpg` the marker is part of
+  that operation, which completes before the body is served. If the
+  operation fails the miss fails as it does today (502, no body), so a
+  signed anchor body is never written to a client before its base has a
+  marker — no timeout path, no residual window. A row creation — by a miss,
+  or by a hit (legacy onboarding, or a suite once refused at a cap) — also
+  marks, in its own transaction, the base for every sniff-passing
+  `InRelease`/`Release.gpg` the suite has cached: an anchor cached while its
+  suite had no row earned no marker, since markers are written only for
+  suites with rows. The handler reads and sniffs those rows before it
+  submits, outside the writer; the transaction re-reads them and marks the
+  ones whose blob is unchanged, and a row that changed or appeared in
+  between makes the creation unproven: only then does a follow-up writer
+  operation sniff and mark it after the commit (a failure is logged and
+  healed by the startup pass at the next start; phase D plan, deviation 2,
+  ruling PD-5). Serving a tracked suite's anchor writes no marker: every
+  cached sniff-passing anchor row of a tracked suite was created by a miss
+  under this rule, marked by its suite's creation, seeded by
+  `CommitAdoption` (which marks in its transaction), rebuilt by
+  `reconstructAnchor` from a snapshot marked at commit or by the audit, or
+  created by an earlier binary and marked by the startup pass before this
+  binary serves; the blob behind a row is content-addressed, so a row that
+  failed the sniff cannot pass it later. The writer is a FIFO queue drained
+  by one goroutine (`cache.submitWrite`), so an unsigned `CommitAdoption`
+  enqueued after a marker write runs after it, and its in-transaction
+  re-read (C5) sees the marker.
+```
+
+- C5 "Inline verification accepts only clearsigned envelopes" (ruling R-D2):
+
+```markdown
+says. A body that carries the marker but whose first line is not exactly
+the marker — apt's rule: trailing `\r`, space and tab ignored, leading
+whitespace or a leading blank line refused — is `malformed_clearsign` as
+well, and a marker line with trailing blanks, which apt accepts and
+go-crypto's decoder alone does not, is decoded (phase D, ruling R-D2).
+Unsigned metadata is adopted only through the explicit unsigned form
+below (phase E), never as an inline snapshot.
+```
+
+- C7 "Failure record" (deferred minor C-20):
+
+```markdown
+mutex is released; an attempt a shutdown ends — in the flip barrier or
+before it — is not recorded, not counted as an adoption outcome and logged
+at INFO only (`adoption_abandoned_at_shutdown`; phase D, deferred minor
+C-20). `count` and `first_at` describe the failure streak since the last
+success.
+```
+
+- §7, C3 tests, the hit-path invariant (deviation 1):
+
+```markdown
+  adoptions, `reconstructAnchor` and restarts, every `url_path` `InRelease`
+  or `Release.gpg` row of a tracked suite whose blob passes the sniff has a
+  marker for its base, at every committed state (markers exist only for
+  tracked suites; phase D plan, deviation 1)); FIFO ordering (a marker write
+  enqueued before an unsigned commit is visible to the commit's
+  transaction).
+```
+
+- C11's events:
+
+```markdown
+`adoption_flip_barrier`, `adoption_abandoned_at_shutdown` (an adoption
+ended by shutdown, in the flip barrier or before it: INFO, never counted as
+an adoption outcome), `suite_evicted`, `suite_caps_exceeded`,
+`handler_goroutine_panicked`, `adoption_panicked`,
+```
+
+  its new metrics:
+
+```markdown
+(flips in the C8 barrier now), the C3 pair
+`acu_suite_seed_rejected_total{host}` (counter) and
+`acu_suites_seed_rejected` (gauge), and `acu_freshness_unlogged_panics_total`.
+```
+
+  and its constants:
+
+```markdown
+window 7 d; orphan-marker TTL 365 d; cap-rejection cache 10 min (at most
+4,096 suites); tracked suite path at most 1024 bytes; legacy-audit anchor
+read cap 8 MiB and batch 100.
+```
 
 - [ ] **Step 3: Overview**
 
 In `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md`:
 - The header's spec reference becomes "(revision 7)"; the deferred-minor line's "(IDs C-1…)" becomes "(IDs C-1…C-40)".
 - Phase table: D's status becomes "in progress (plan written 2026-10-18)", as phase C's docs task set its own; it becomes "done (commit …)" after the final review.
-- "Later phases add", the D line: after its first sentence add the names as built — `cache.CreateSuite(ctx, SuiteSeed, SuiteCaps, SuiteGuard) (CreateResult, error)`, `cache.StoreFetched(ctx, FetchedRow, SuiteCaps, SuiteGuard) (FetchedResult, error)`, `cache.SuiteExists`, `cache.TouchSuite` / `TouchedSuites`, `cache.SuiteGuard` (implemented by `(*freshness.Checker).HoldSuite`), unexported `deleteSuiteTx(ctx, tx, key, wantCurrent *int64, cutoff, now)` (F's `ReapIdleSuite` reuses it), `freshness.Config.MaxSuites`, `config.FreshnessConfig.MaxSuites`, `aptpath.ClassifySuiteFile` / `SuiteFile`, `aptpath.DecodableClearsign`, `simtest.ClearsignedFixture`, `(*freshness.Checker).LockCount`; "→ write body → T1, today's seed-before-serve order" gains "(the T1 on a creating miss: phase E, design note 2)"; "nowhere else in the handler — no hit-path write" gains "(except that a row creation on a hit marks the suite's cached signed anchors: phase D plan, deviation 2)"; "every sniff-passing anchor row has a marker" becomes "every sniff-passing anchor row of a tracked suite has a marker (deviation 1)".
-- Carry-forwards: delete the "**D:**" block, as phase C deleted its own — its four items are done (the one-insert-site convergence: Task 4; the `0xC2` note: Task 9's AIDEV-NOTE in `runFetch`; apt's first line: ruling R-D2, Task 2; the row-creating serve's registration: Task 9, with the scale test's gate-size check in Task 11). The section's intro gains "or *(D)* (the phase D plan, 2026-10-18)". Add:
-  - under **E:** *(D)* Fire T1 once a miss creates an adopter-wired row (spec C3; phase D plan, design note 2); until then the next hit's T1 or the never-checked class checks it.
-  - under **F:** *(D)* `ReapIdleSuite` deletes through `deleteSuiteTx` (`internal/cache/suite_rows.go`), passing the current snapshot it read as `wantCurrent`, and purges in-memory state as cap eviction does: the checker's lock-map entry and the flip-gate entry (hold the suite through the `SuiteGuard`; its `release(true)` after the commit drops both) and the cache's touch entry (`forgetTouch`). Cap eviction stops above the cap, so after `max_suites` is lowered only the reaper shrinks the table.
-  - under **G:** *(D)* `ClassifySuiteFile` already returns `FileFlatIndex` for a root `Packages*`/`Sources*` of a suite without a `dists` segment, and the handler already sniffs, creates rows for and touches it; G's grammar makes those paths reachable (spec C3; phase D plan, ruling R-D3), so G adds no handler code for them — its tests add the flat cases to the miss-path, onboarding and touch tests.
-  - under **H:** *(D)* The two prose WARN names `suite onboarding failed` and `suite signed-seen mark failed` (documented as they are) may become snake_case in H's documentation sweep.
+- "Later phases add", the D line: after its first sentence add
+
+```markdown
+As built: `cache.CreateSuite(ctx, SuiteSeed, SuiteCaps, SuiteGuard) (CreateResult, error)` (`SuiteSeed.Cached` carries the suite's pre-read cached anchors, `CreateResult.Unproven` asks for the backstop mark), `cache.StoreFetched(ctx, FetchedRow, SuiteCaps, SuiteGuard) (FetchedResult, error)` (`FetchedRow.Restamp`: the adoption-disabled refresh miss), `cache.SuiteExists`, `cache.SuiteCapUsage`, `cache.TouchSuite` / `TouchedSuites`, `cache.SuiteGuard` (implemented by `(*freshness.Checker).HoldSuite`) and the optional `cache.ClockStepReporter` (the checker reports eviction's future stamps), unexported `deleteSuiteTx(ctx, tx, key, wantCurrent *int64, cutoff, now) (deleteOutcome, error)` (F's `ReapIdleSuite` reuses it), `freshness.Config.MaxSuites`, `config.FreshnessConfig.MaxSuites`, `aptpath.ClassifySuiteFile` / `SuiteFile`, `aptpath.MaxSuitePathBytes`, `aptpath.DecodableClearsign`, `simtest.ClearsignedFixture`, `(*freshness.Checker).LockCount`.
+```
+
+  "→ write body → T1, today's seed-before-serve order" gains "(the T1 on a creating miss: phase E, design note 2)"; "nowhere else in the handler — no hit-path write" gains "(except that every row creation, on a miss or on a hit, marks the suite's cached signed anchors in its own transaction: phase D plan, deviation 2, ruling PD-5)"; "every sniff-passing anchor row has a marker" becomes "every sniff-passing anchor row of a tracked suite has a marker (deviation 1)".
+- Carry-forwards: delete the "**D:**" block, as phase C deleted its own — its four items are done (the one-insert-site convergence: Task 4; the `0xC2` lead byte: ruling PD-10, Task 1's sniff requires the signature version; apt's first line: ruling R-D2, Task 2; the row-creating serve's registration: Task 9, with the scale test's gate-size check in Task 11). The section's intro gains "or *(D)* (the phase D plan, 2026-10-18)". Add, under **E:**, **F:** (three items), **G:** and **H:** respectively:
+
+```markdown
+- *(D)* Fire T1 once a miss creates an adopter-wired row (spec C3; phase D plan, design note 2); until then the next hit's T1 or the never-checked class checks it. Key it on `FetchedResult.Create.Outcome == cache.SuiteCreated` (on the hit path, `CreateResult.Outcome`); `FetchedResult.Tracked` is what the late flip-gate registration uses.
+- *(D)* `ReapIdleSuite` deletes through `deleteSuiteTx` (`internal/cache/suite_rows.go`), passing the current snapshot it read as `wantCurrent`, and purges in-memory state as cap eviction does: the checker's lock-map entry and the flip-gate entry (hold the suite through the `SuiteGuard`; its `release(true)` after the commit drops both) and the cache's touch entry (`forgetTouch`). Above the global cap, cap eviction removes one suite idle for 24 h without a current snapshot per refused creation (ruling PD-8), so a lowered `max_suites` converges by itself; a host at its per-host cap never evicts, and only the reaper shrinks it.
+- *(D)* `POST /forget` deletes through `deleteSuiteTx` too (cutoff `math.MaxInt64`, `wantCurrent` = the current snapshot it read), holding the suite through the `SuiteGuard`: otherwise R-D1's "one suite-row delete path" breaks, and so does `ErrSuiteGone`'s "a backstop, not an expected path" (phase D plan, design note 12).
+- *(D)* Legacy junk rows — suites a v6 binary created whose cached `InRelease` is an HTML page — stay alive because every anchor serve with a status below 400 touches its suite, sniff-failing bytes included. Reap them regardless of idleness (like non-canonical rows), or make the anchor touch require that the suite's anchor passed its sniff.
+- *(D)* `ClassifySuiteFile` already returns `FileFlatIndex` for a root `Packages*`/`Sources*` of a suite without a `dists` segment, and the handler already sniffs, creates rows for and touches it; G's grammar makes those paths reachable (spec C3; phase D plan, ruling R-D3), so G adds no handler code for them — its tests add the flat cases to the miss-path, onboarding and touch tests. The cap-rejection cache is keyed by the suite alone, whichever file was refused, so a flat suite's indexes share one entry: G adds no per-file key.
+- *(D)* The three prose WARN names `suite onboarding failed`, `suite signed-seen mark failed` and `suite cap usage read failed` (documented as they are) may become snake_case in H's documentation sweep.
+```
 
 - [ ] **Step 4: Deferred files**
 
-Delete the entries this plan resolved: A-17, A-18, A-22, A-23, A-24, A-25, A-30, A-32, A-33, A-34, A-35, A-38, A-50, A-51, A-52, A-53 (`…-A-deferred.md`); B-1, B-2, B-3, B-4, B-5, B-8 (moot: Step 6 is UPDATE-only), B-22 (already true), B-39, B-40, B-41, B-42, B-43, B-44, B-47, B-48, B-49, B-50 (already tight) (`…-B-deferred.md`); C-10, C-14, C-15, C-18, C-20, C-22, C-23, C-24, C-25, C-26, C-27, C-28, C-30, C-31, C-32, C-33, C-34, C-35 (`…-C-deferred.md`). Narrow three: A-37 to "the freshness side — `Checker.reportPanic` (`freshness.go`) and the heartbeat's recover (`freshness/adoption.go`) — still has its own copies; phase D gave the handler's two recovers one helper, `logGoroutinePanic`"; C-19 to its file-split half; C-21 to its context fast path (the `EXISTS` read landed in phase D, Task 10). Every other item stays unchanged; Task 12's intro lists the ones in files this phase touches and why each stays.
+Delete the entries this plan resolved: A-17, A-18, A-22, A-23, A-24, A-25, A-30, A-32, A-33, A-34, A-35, A-38, A-50, A-51, A-52, A-53 (`…-A-deferred.md`); B-1, B-2, B-3, B-4, B-5, B-8 (moot: Step 6 is UPDATE-only), B-22 (already true), B-39, B-40, B-41, B-42, B-43, B-44, B-47, B-48, B-49, B-50 (already tight) (`…-B-deferred.md`); C-10, C-14, C-15, C-18, C-20, C-22, C-23, C-24, C-25, C-26, C-27, C-28, C-30, C-31, C-32, C-33, C-34, C-35 (`…-C-deferred.md`). Narrow three: A-37 to "the freshness side — `Checker.reportPanic` (`freshness.go`) and the heartbeat's recover (`freshness/adoption.go`) — still has its own copies; phase D gave the handler's recovers one helper, `logGoroutinePanic`"; C-19 to its file-split half; C-21 to its context fast path (the `EXISTS` read landed in phase D, Task 10). Every other item stays unchanged; Task 12's intro lists the ones in files this phase touches and why each stays.
 
 - [ ] **Step 5: Final verification**
 
 Run:
 
 ```bash
-go test -race ./...
+go vet ./...
 golangci-lint run ./...
 gofmt -l .
+go test -race -count=1 ./...
 grep -rn 'AIDEV-TODO(phase D)' --include=*.go .
 grep -rn 'PutSuiteFreshness' --include=*.go .
 go test -race -count=1 -v -run 'TestSuiteFreshnessHasOneInsertSite|TestOnlyTheHandlerCreatesSuiteRows|TestServeHTTP_AdoptionDisabledSeedParity|TestServeHTTP_MintedSuitesAtScale|TestServeHTTP_OnboardsADistsSuiteFromAV6Cache|TestHitPathInvariant_' ./internal/cache/ ./internal/handler/
 ```
 
-Expected: PASS everywhere; lint `0 issues`; `gofmt -l` lists exactly the five drift files; no `AIDEV-TODO(phase D)`; `PutSuiteFreshness` appears only in `UpdateSuiteFreshness`'s "Carried over from PutSuiteFreshness" note; the DoD tests pass, the scale test in under 5 s under `-race`.
+Expected: PASS everywhere; vet clean; lint `0 issues`; `gofmt -l` lists exactly the five drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`); no `AIDEV-TODO(phase D)`; `PutSuiteFreshness` appears only in `UpdateSuiteFreshness`'s "Carried over from PutSuiteFreshness" note; the DoD tests pass, the scale test in under 5 s under `-race`.
 
 - [ ] **Step 6: Commit**
 
