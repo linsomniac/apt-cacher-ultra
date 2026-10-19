@@ -1899,7 +1899,7 @@ func TestCheck_UnchangedTick_ReconcilesDegraded(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Seed the url_path anchor row so checkLockedInline finds it and uses
+	// Seed the url_path anchor row so checkInline finds it and uses
 	// the test server. The BlobHash must match sha256(releaseText) so the
 	// body-equality comparison classifies the result as "unchanged".
 	inReleaseHash := hashOf(releaseText)

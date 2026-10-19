@@ -1,0 +1,714 @@
+package freshness
+
+// The freshness check (spec C4), run with the suite mutex held: checkLocked
+// reads the row, applies the cooldown and dispatches on the suite's anchor
+// form. Every answered check ends in one tail, finishCheck, and every
+// failed one in failCheck (ruling R-E3: record-clearing, the
+// freshness_check line and its counter live in one place).
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+)
+
+// checkLocked is the body of Check, run with the per-suite mutex held.
+// It fills out: out.req is non-nil iff the observed result is "changed",
+// the caller has an Adopter wired in (Phase 2 path) AND an admission slot
+// was free (out.lease); the caller uses this signal to spawn the adoption
+// goroutine. On a confirmed-unchanged result planRepair sets out.repair
+// and out.lease when there is something to heal and a slot was free.
+//
+// Form dispatch (SPEC2 §7.6.3):
+//   - If the suite has a current snapshot, the form is read from the
+//     snapshot row's anchor_form (snap.Form): detached → detached,
+//     otherwise inline. The check then issues a conditional GET against
+//     InRelease (inline) or Release (detached).
+//   - For first-ever checks (no current snapshot), inline is tried
+//     first. If the inline conditional GET 404s AND a Release url_path
+//     row exists, we fall back to the detached path. This is what
+//     bootstraps detached-mode adoption for upstreams that ship only
+//     Release + Release.gpg.
+//
+// Outcomes (all paths must update suite_freshness so cooldown applies
+// to the next attempt):
+//
+//   - Cooldown gate fails: no DB write, return nil (reported as
+//     skipped). The scheduler's slot-driven re-check of a waiting suite
+//     and its check of a suite with a pending change bypass the gate
+//     (opts.bypassCooldown, spec C4).
+//   - Metadata url_path row absent: no DB write (we have nothing to
+//     check against), return nil — first request for this suite will
+//     land in url_path through the normal miss path.
+//   - 304: last_check_at = last_success_at = now.
+//   - 200, body hash matches cached: bump last_check_at, last_success_at,
+//     and refresh validators (upstream may have rotated etag/lastmod
+//     while bytes are unchanged); clear any adoption failure record.
+//   - 200, body hash differs: bump last_check_at, last_success_at,
+//     stamp inrelease_change_seen_at on first sighting only, return
+//     *adoptionRequest.
+//   - Same, but no admission slot is free (spec C4): "changed_queued",
+//     no request, last_success_at left at its previous value; the
+//     scheduler parks the suite until a slot it can use is released (a
+//     client check's suite is parked by the next tick: its pending
+//     change makes it due, see Checker.pendingChange).
+//   - Spec C7 gate (retryGateFor, adopter wired only): while a failure
+//     record exists and next_retry_at has not come, the GET carries the
+//     failing content's validators, and a 304 or the same content key
+//     is "changed_deferred" (no adoption); new content is attempted at
+//     once; at next_retry_at the GET carries no validators.
+//   - Error (network, 4xx, 5xx, check deadline — also one hit while
+//     waiting for the host slot) or a success status other than 200 and
+//     304: a failed check (failCheck) — last_check_at bumped,
+//     check_fail_count extended (don't hammer a broken upstream), the
+//     "freshness check failed" line and the failed counter;
+//     last_success_at keeps its previous value. Every answered check
+//     above resets check_fail_count to 0 (spec C4).
+//   - Cancelled caller (shutdown), at the host slot or the GET: no DB
+//     write; it says nothing about upstream.
+//
+// SPEC2 wiring: the body-hash comparison uses
+// suite_snapshot.inrelease_hash (inline) or .release_hash (detached)
+// when the suite has an adopted snapshot. Without this, every
+// freshness check after a successful adoption would observe "changed"
+// against the stale url_path.blob_hash and thrash the adoption
+// candidate-uniqueness constraint forever.
+func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, scheme, host, suitePath string, opts checkOpts) {
+	now := c.now()
+	nowUnix := now.Unix()
+
+	cur, err := c.cache.GetSuiteFreshness(ctx, scheme, host, suitePath)
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		// I-4: the row vanished after check's pre-read (cap eviction, later
+		// the reaper). Nothing to check and nothing to write; check drops
+		// the lock-map entry.
+		out.vanished = true
+		return
+	case err != nil:
+		c.logger.Warn("freshness: read suite row failed",
+			"err", err,
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+		return
+	}
+
+	// Cooldown gate. Spec C4 clock-step rule: a past-event stamp found in
+	// the future (backward wall-clock step) is treated as infinitely old,
+	// never as "just checked" — otherwise the suite freezes for the size
+	// of the step (security finding I-7).
+	if cur.LastCheckAt != nil && c.cooldown > 0 {
+		last := time.Unix(*cur.LastCheckAt, 0)
+		switch {
+		case last.After(now.Add(clockStepTolerance)):
+			c.clockStep("last_check_at", scheme, host, suitePath, *cur.LastCheckAt, now)
+		case opts.bypassCooldown:
+			// The scheduler's slot-driven re-check, or its check of a
+			// suite with a pending change (spec C4).
+		case now.Sub(last) < c.cooldown:
+			return // out.report stays resultSkipped
+		}
+	}
+
+	suite := SuiteRef{
+		CanonicalScheme: scheme,
+		CanonicalHost:   host,
+		SuitePath:       suitePath,
+	}
+
+	// Form preference: if there's a current snapshot, the form is its
+	// anchor_form (snap.Form). Otherwise default to inline; the inline
+	// path triggers a detached fallback on 404.
+	form := c.detectForm(ctx, cur)
+	if form == adoptionFormDetached {
+		out.req, out.repair = c.checkDetached(ctx, fetchCtx, out, cur, suite, now, nowUnix)
+	} else {
+		req, repair, fellBack := c.checkInline(ctx, fetchCtx, out, cur, suite, now, nowUnix)
+		if fellBack {
+			req, repair = c.checkDetached(ctx, fetchCtx, out, cur, suite, now, nowUnix)
+		}
+		out.req, out.repair = req, repair
+	}
+	if out.req == nil && out.repair != nil {
+		c.planRepair(ctx, out)
+	}
+}
+
+// detectForm reads the suite's current snapshot (if any) and returns
+// its anchor_form (snap.Form): detached, or inline for anything else
+// until phase E dispatches the unsigned forms. First-ever suites
+// (cur.CurrentSnapshotID == nil) and snapshots that fail to load
+// default to inline; the inline-path fallback handles the boot-strap
+// case for detached-only upstreams.
+//
+// AIDEV-TODO(phase E): unsigned form dispatch.
+func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) adoptionForm {
+	if cur.CurrentSnapshotID == nil {
+		return adoptionFormInline
+	}
+	snap, err := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
+	if err != nil || snap == nil {
+		return adoptionFormInline
+	}
+	if snap.Form == cache.FormDetached {
+		return adoptionFormDetached
+	}
+	return adoptionFormInline
+}
+
+// checkEnd is how an answered check ended, for finishCheck: the
+// freshness_check line's form, result, upstream status and (for
+// changed_deferred and refusals) reason; whether the adoption failure
+// record is cleared; and whether the current snapshot is signed (the
+// scheduler's reserved-slot rule).
+type checkEnd struct {
+	form          string
+	result        string
+	status        int
+	reason        string
+	clearRecord   bool
+	signedCurrent bool
+}
+
+// finishCheck is the one tail of every answered check (ruling R-E3): it
+// persists the row, clears the failure record when upstream serves the
+// current content again (spec C7), logs freshness_check, counts it,
+// reports it to the scheduler, and returns the repair signal of a
+// confirmed-unchanged suite with a current snapshot.
+func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, e checkEnd) *repairRequest {
+	host, suitePath := suite.CanonicalHost, suite.SuitePath
+	if perr := c.cache.UpdateSuiteFreshness(ctx, *cur); perr != nil {
+		c.logger.Warn("freshness: persist success failed",
+			"err", perr,
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+	}
+	if e.clearRecord {
+		if err := c.cache.ClearAdoptionFailure(ctx, suite.CanonicalScheme, host, suitePath); err != nil {
+			c.logger.Warn("freshness: clear adoption failure failed",
+				"err", err, "canonical_host", host, "suite_path", suitePath)
+		}
+	}
+	logAttrs := []any{
+		"canonical_host", host,
+		"suite_path", suitePath,
+		"form", e.form,
+		"result", e.result,
+		"upstream_status", e.status,
+	}
+	if e.reason != "" {
+		logAttrs = append(logAttrs, "reason", e.reason)
+	}
+	out.report = checkReport{result: e.result, signedCurrent: e.signedCurrent}
+	c.logger.Info("freshness_check", logAttrs...)
+	freshnessCheckTotal.Inc(e.result, host)
+	return repairIfUnchanged(e.result, suite, cur)
+}
+
+// failCheck is the bookkeeping of a check that ended unknown (spec C4): a
+// Conditional error, the check deadline hit while waiting for the host
+// slot, or a success status other than 200 and 304 (a fetch.Conditional
+// contract violation; ruling R-E3). SPEC §7.2: last_check_at is bumped to
+// space out the next attempt and the streak extends; last_success_at is
+// left alone — it carries the "we know upstream is fine" signal that
+// periodic_refresh uses. It logs "freshness check failed" and counts
+// acu_freshness_check_total{result="failed"}, and reports failed.
+//
+// AIDEV-NOTE: ctx is the caller's context, never fetchCtx: the deadline
+// that ended the check must not fail the write that records it.
+// AIDEV-NOTE: in phase B every Conditional error extends the streak,
+// including 401/403/404/410, which spec C4 classifies as absent, not
+// unknown. Phase E's probe classification must reset the streak on
+// absent, or anchor_absent suites inherit the hourly backoff.
+func (c *Checker) failCheck(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, nowUnix int64, form string, err error) {
+	host, suitePath := suite.CanonicalHost, suite.SuitePath
+	cur.LastCheckAt = &nowUnix
+	cur.CheckFailCount++
+	if perr := c.cache.UpdateSuiteFreshness(ctx, *cur); perr != nil {
+		c.logger.Warn("freshness: persist failure-bump failed",
+			"err", perr,
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+	}
+	c.logger.Info("freshness check failed",
+		"err", err,
+		"canonical_host", host,
+		"suite_path", suitePath,
+		"form", form,
+		"result", "failed",
+	)
+	freshnessCheckTotal.Inc("failed", host)
+	out.report.result = "failed"
+}
+
+// errUnexpectedStatus is a success status other than 200 and 304 from
+// fetch.Conditional: a contract violation, a failed check (ruling R-E3).
+var errUnexpectedStatus = errors.New("unexpected success status")
+
+// steadyResult handles, for both signed forms (ruling R-E3: one 304/
+// unchanged helper), the responses that say upstream still serves what
+// the suite has: a 304 — which, while a failure record's validators were
+// sent, says upstream still serves the failing content (spec C7
+// changed_deferred) — and a 200 carrying the current anchor's bytes
+// (newHash == cachedHash), whose validators are taken (the only response
+// they are ever taken from, spec C4) and which clears a failure record
+// (spec C7). ok is false for any other response.
+func steadyResult(cur *cache.SuiteFreshness, res *fetch.ConditionalResult, newHash, cachedHash string, gate retryGate, nowUnix int64) (result string, clearRecord, ok bool) {
+	switch {
+	case res.Status == 304 && gate.active:
+		setChangeSeen(cur, nowUnix)
+		return "changed_deferred", false, true
+	case res.Status == 304:
+		// Upstream serves the cached anchor again; clear the pending
+		// diagnostic (e.g. after an upstream rollback).
+		cur.InReleaseChangeSeenAt = nil
+		return "not_modified", false, true
+	case res.Status == 200 && newHash == cachedHash:
+		if res.ETag != "" {
+			v := res.ETag
+			cur.InReleaseETag = &v
+		}
+		if res.LastModified != "" {
+			v := res.LastModified
+			cur.InReleaseLastMod = &v
+		}
+		cur.InReleaseChangeSeenAt = nil
+		return "unchanged", gate.active, true
+	}
+	return "", false, false
+}
+
+// baseline is what a check compares the current form's anchor file name
+// ("InRelease" or "Release") with: the current snapshot's hash of that
+// anchor — through the snapshot's form (cache.SuiteSnapshot.AnchorHash),
+// since an unsigned snapshot keeps its Release in the single-anchor slot —
+// else the url_path anchor's blob; and whether the current snapshot is
+// signed (the reserved-slot rule, spec C4). hash is "" when there is no
+// baseline: the check skips without a write (logged at DEBUG).
+//
+// AIDEV-NOTE: the snapshot is authoritative once a suite is adopted:
+// comparing with the url_path blob instead would see "changed" after
+// every adoption and thrash the candidate-uniqueness constraint.
+func (c *Checker) baseline(ctx context.Context, cur *cache.SuiteFreshness, suite SuiteRef, row *cache.URLPath, name string) (hash string, signedCurrent bool) {
+	if cur.CurrentSnapshotID != nil {
+		snap, err := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
+		if err != nil {
+			c.logger.Warn("freshness: snapshot lookup failed; falling back to url_path",
+				"err", err,
+				"snapshot_id", *cur.CurrentSnapshotID,
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+			)
+		} else {
+			signedCurrent = snap.Form == cache.FormInline || snap.Form == cache.FormDetached
+			if h := snap.AnchorHash(name); h != nil {
+				hash = *h
+			}
+		}
+	}
+	if hash == "" && row.BlobHash != nil {
+		hash = *row.BlobHash
+	}
+	if hash == "" {
+		c.logger.Debug("freshness: no baseline anchor hash, skipping",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"anchor", name,
+		)
+	}
+	return hash, signedCurrent
+}
+
+// admit takes an admission slot for req (spec C4: TryAcquire before
+// spawning, never wait) and returns req with the result to log: result
+// when a slot was free (out.lease holds it), or queued with no request
+// when none was — the suite's last_success_at then keeps its previous
+// value (prevSuccess). With no adopter wired nothing is admitted and req
+// is returned as it is (Phase 1 observes and adopts nothing).
+//
+// AIDEV-NOTE: a queued result is what the scheduler parks a suite on
+// (isQueuedResult). A client check's queued result leaves the change
+// pending (change seen, no record), which makes the suite due at the next
+// tick (Checker.pendingChange); that tick's check bypasses the cooldown
+// and parks it.
+func (c *Checker) admit(out *checkOutcome, cur *cache.SuiteFreshness, req *adoptionRequest, signedCurrent bool,
+	prevSuccess *int64, result, queued string) (*adoptionRequest, string) {
+	if c.adopter == nil {
+		return req, result
+	}
+	l, ok := c.admission.tryAcquire(req.suite.CanonicalHost, signedCurrent)
+	if !ok {
+		cur.LastSuccessAt = prevSuccess
+		return nil, queued
+	}
+	out.lease = l
+	return req, result
+}
+
+// bodyHash is the sha256 hex of a 200 response's body ("" for a 304).
+func bodyHash(res *fetch.ConditionalResult) string {
+	if res.Status != 200 {
+		return ""
+	}
+	sum := sha256.Sum256(res.Body)
+	return hex.EncodeToString(sum[:])
+}
+
+// checkInline runs the conditional GET against InRelease and
+// processes the result. Returns:
+//   - (req, false) on success (req may be nil for unchanged/304).
+//   - (nil, true) when the inline path got 404 AND the suite has no
+//     current snapshot AND a Release url_path row exists — the
+//     dispatcher then retries via checkDetached. We return
+//     without persisting in the fallback case so the detached
+//     attempt's persist is the only one that runs.
+//
+// The body of this function is the SPEC §7.2 inline algorithm; it has
+// been factored out of checkLocked to give detached mode (SPEC2 §7.6.3)
+// a parallel implementation. Mutates *cur in the non-fallback paths.
+func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest, bool) {
+	scheme, host, suitePath := suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath
+
+	// Locate the InRelease url_path row to get the upstream URL plus
+	// (Phase 1 fallback) the cached blob hash for byte-equality
+	// comparison on 200.
+	inReleasePath := suitePath + inReleaseFilename
+	urlRow, err := c.cache.LookupURL(ctx, scheme, host, inReleasePath)
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		// Suite has freshness state but no cached InRelease url_path row.
+		if cur.CurrentSnapshotID == nil {
+			// First-ever / never-adopted suite. The detached fallback
+			// path triggers on 404 from the upstream's /InRelease, which
+			// requires us to actually issue the GET. If we don't even
+			// have a url_path row to attempt the GET, try the symmetric
+			// detached lookup directly.
+			if c.hasReleaseURLRow(ctx, scheme, host, suitePath) {
+				return nil, nil, true
+			}
+			c.logger.Debug("freshness: no cached InRelease url_path, skipping",
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return nil, nil, false
+		}
+		// SPEC2 §7.4 freshness recovery. The suite HAS a current
+		// snapshot but its InRelease anchor row was reaped (SPEC4 §5 GC
+		// TTL during a low-traffic request lull). Without this branch
+		// the check dead-ends here and the suite freezes forever: it
+		// keeps serving the stale snapshot from snapshot_member and
+		// never observes upstream rolling forward — the production
+		// freeze trap. Reconstruct the upstream URL from the suite
+		// identity, re-seed the anchor (pinned to the snapshot's adopted
+		// hash so the SPEC4 §5 guards re-protect it), and fall through
+		// to the conditional GET with the synthesized row.
+		anchorHash := c.snapshotAnchorHash(ctx, *cur.CurrentSnapshotID, inReleaseFilename)
+		urlRow = c.reconstructAnchor(ctx, scheme, host, suitePath, inReleasePath, *cur.CurrentSnapshotID, anchorHash, nowUnix)
+	case err != nil:
+		c.logger.Warn("freshness: lookup InRelease url_path failed",
+			"err", err,
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+		return nil, nil, false
+	}
+
+	cachedHash, signedCurrent := c.baseline(ctx, cur, suite, urlRow, "InRelease")
+	if cachedHash == "" {
+		return nil, nil, false
+	}
+
+	target := &fetch.Target{
+		CanonicalHost: host,
+		URL:           urlRow.UpstreamURL,
+	}
+	gate := c.retryGateFor(cur, now)
+	c.applyClamp(ctx, cur, gate, now)
+	etag, lastmod := gate.validators(cur)
+
+	// SPEC §9.3: bound concurrent upstream calls to host. Without
+	// this, distinct suites on the same host all run Conditional in
+	// parallel, each capable of pulling MaxInReleaseBytes into
+	// memory — a resource-exhaustion path under a refresh storm or
+	// an adversarial allowlisted upstream. Sharing the limiter with
+	// the handler's miss path means cache-miss fetches and
+	// freshness checks contend for the same per-host budget.
+	release, err := c.hostSem.Acquire(fetchCtx, host)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			c.logger.Debug("freshness: host limiter acquire aborted",
+				"err", err,
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return nil, nil, false
+		}
+		// Spec C4: the check deadline hit while waiting for the slot.
+		c.failCheck(ctx, out, cur, suite, nowUnix, "inline", err)
+		return nil, nil, false
+	}
+	defer release()
+
+	res, err := c.fetcher.Conditional(fetchCtx, target, etag, lastmod, c.maxBody)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			// A cancelled caller (shutdown) is not evidence about upstream;
+			// the check deadline (DeadlineExceeded) is, and counts below.
+			c.logger.Debug("freshness: check cancelled", "canonical_host", host, "suite_path", suitePath)
+			return nil, nil, false
+		}
+		// 404 with no current snapshot AND a Release url_path row →
+		// fall back to detached without persisting. The detached
+		// attempt becomes the authoritative result for this Check.
+		if cur.CurrentSnapshotID == nil && isStatusNotFound(err) &&
+			c.hasReleaseURLRow(ctx, scheme, host, suitePath) {
+			c.logger.Debug("freshness: InRelease 404 on first-ever check, falling back to detached",
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return nil, nil, true
+		}
+		c.failCheck(ctx, out, cur, suite, nowUnix, "inline", err)
+		return nil, nil, false
+	}
+	if res.Status != 200 && res.Status != 304 {
+		// fetch.Conditional answers only 200 or 304 on success: anything
+		// else is a contract violation, a failed check (ruling R-E3).
+		c.failCheck(ctx, out, cur, suite, nowUnix, "inline", fmt.Errorf("%w %d", errUnexpectedStatus, res.Status))
+		return nil, nil, false
+	}
+
+	prevSuccess := cur.LastSuccessAt
+	cur.LastCheckAt = &nowUnix
+	cur.LastSuccessAt = &nowUnix
+	cur.CheckFailCount = 0
+
+	// SPEC §10: every freshness attempt emits a structured log line. The
+	// `result` enum is what operators pivot on — success-with-no-change
+	// (the steady state) vs. success-with-change (the interesting one).
+	newHash := bodyHash(res)
+	e := checkEnd{form: "inline", status: res.Status, signedCurrent: signedCurrent}
+	var req *adoptionRequest
+	if result, clear, ok := steadyResult(cur, res, newHash, cachedHash, gate, nowUnix); ok {
+		e.result, e.clearRecord = result, clear
+	} else if gate.active && !gate.due && newHash == gate.hash {
+		// An upstream that ignores validators re-served the failing
+		// bytes: deferred exactly like the 304 above.
+		setChangeSeen(cur, nowUnix)
+		e.result = "changed_deferred"
+	} else {
+		// Upstream has a new InRelease. Record the diagnostic
+		// regardless of whether an Adopter is wired — operators
+		// monitoring a Phase 1 deployment still see the
+		// divergence.
+		setChangeSeen(cur, nowUnix)
+		c.logger.Info("InRelease changed at upstream",
+			"canonical_host", host,
+			"suite_path", suitePath,
+			"cached_hash", cachedHash,
+			"upstream_hash", newHash,
+		)
+		e.result = "changed"
+		// The body is bounded by maxBody (§7.2 cap, default 4 MiB),
+		// so retaining it through the goroutine handoff is acceptable.
+		req = &adoptionRequest{
+			suite:   suite,
+			form:    adoptionFormInline,
+			key:     newHash,
+			bytes:   res.Body,
+			etag:    res.ETag,
+			lastmod: res.LastModified,
+		}
+		req, e.result = c.admit(out, cur, req, signedCurrent, prevSuccess, "changed", "changed_queued")
+	}
+	if e.result == "changed_deferred" {
+		e.reason = gate.reason
+	}
+	return req, c.finishCheck(ctx, out, cur, suite, e), false
+}
+
+// checkDetached runs the SPEC2 §7.6.3 detached-form freshness
+// check: a conditional GET on Release for change detection, plus a
+// fresh GET on Release.gpg when Release has changed. Mutates *cur.
+//
+// Logically symmetric to checkInline. The differences:
+//   - Two url_path rows are required (Release AND Release.gpg).
+//     Either missing → skip.
+//   - On observed change, fetch Release.gpg in a second call so the
+//     Adopter can verify the detached signature.
+//   - The adoptionRequest carries form=detached + both bodies.
+//
+// AIDEV-NOTE: a Release that changed costs one Release.gpg GET even when
+// the result is then deferred (its content key covers the signature), and
+// an upstream that ignores validators pays it on every deferred check
+// (deferred minor B-25: an accepted cost). The Release.gpg GET runs under
+// fetchCtx, the check deadline (TestCheck_DetachedSignatureStallEndsAtTheCheckDeadline).
+func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest) {
+	scheme, host, suitePath := suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath
+
+	releasePath := suitePath + releaseFilename
+	releaseGPGPath := suitePath + releaseGPGFilename
+
+	releaseURL, err := c.cache.LookupURL(ctx, scheme, host, releasePath)
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		// SPEC2 §7.4 freshness recovery (detached): an adopted suite
+		// whose Release anchor was reaped must recover, not freeze —
+		// symmetric to the inline path. First-ever suites (no snapshot)
+		// still skip.
+		if cur.CurrentSnapshotID == nil {
+			c.logger.Debug("freshness: no cached Release url_path, skipping detached",
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return nil, nil
+		}
+		relHash := c.snapshotAnchorHash(ctx, *cur.CurrentSnapshotID, releaseFilename)
+		releaseURL = c.reconstructAnchor(ctx, scheme, host, suitePath, releasePath, *cur.CurrentSnapshotID, relHash, nowUnix)
+	case err != nil:
+		c.logger.Warn("freshness: lookup Release url_path failed",
+			"err", err,
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+		return nil, nil
+	}
+	releaseGPGURL, err := c.cache.LookupURL(ctx, scheme, host, releaseGPGPath)
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		if cur.CurrentSnapshotID == nil {
+			c.logger.Debug("freshness: no cached Release.gpg url_path, skipping detached",
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return nil, nil
+		}
+		gpgHash := c.snapshotAnchorHash(ctx, *cur.CurrentSnapshotID, releaseGPGFilename)
+		releaseGPGURL = c.reconstructAnchor(ctx, scheme, host, suitePath, releaseGPGPath, *cur.CurrentSnapshotID, gpgHash, nowUnix)
+	case err != nil:
+		c.logger.Warn("freshness: lookup Release.gpg url_path failed",
+			"err", err,
+			"canonical_host", host,
+			"suite_path", suitePath,
+		)
+		return nil, nil
+	}
+
+	cachedHash, signedCurrent := c.baseline(ctx, cur, suite, releaseURL, "Release")
+	if cachedHash == "" {
+		return nil, nil
+	}
+
+	target := &fetch.Target{
+		CanonicalHost: host,
+		URL:           releaseURL.UpstreamURL,
+	}
+	gate := c.retryGateFor(cur, now)
+	c.applyClamp(ctx, cur, gate, now)
+	etag, lastmod := gate.validators(cur)
+
+	releaseSlot, err := c.hostSem.Acquire(fetchCtx, host)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			c.logger.Debug("freshness: host limiter acquire aborted",
+				"err", err,
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+			return nil, nil
+		}
+		// Spec C4: the check deadline hit while waiting for the slot.
+		c.failCheck(ctx, out, cur, suite, nowUnix, "detached", err)
+		return nil, nil
+	}
+	defer releaseSlot()
+
+	res, err := c.fetcher.Conditional(fetchCtx, target, etag, lastmod, c.maxBody)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			// A cancelled caller (shutdown) is not evidence about upstream;
+			// the check deadline (DeadlineExceeded) is, and counts below.
+			c.logger.Debug("freshness: check cancelled", "canonical_host", host, "suite_path", suitePath)
+			return nil, nil
+		}
+		c.failCheck(ctx, out, cur, suite, nowUnix, "detached", err)
+		return nil, nil
+	}
+	if res.Status != 200 && res.Status != 304 {
+		c.failCheck(ctx, out, cur, suite, nowUnix, "detached", fmt.Errorf("%w %d", errUnexpectedStatus, res.Status))
+		return nil, nil
+	}
+
+	prevSuccess := cur.LastSuccessAt
+	cur.LastCheckAt = &nowUnix
+	cur.LastSuccessAt = &nowUnix
+	cur.CheckFailCount = 0
+
+	newHash := bodyHash(res)
+	e := checkEnd{form: "detached", status: res.Status, signedCurrent: signedCurrent}
+	var req *adoptionRequest
+	if result, clear, ok := steadyResult(cur, res, newHash, cachedHash, gate, nowUnix); ok {
+		// A 304 while a failure record exists: Release still matches the
+		// failing content's validators, and a re-signature behind it waits
+		// for the retry (spec C7).
+		e.result, e.clearRecord = result, clear
+	} else {
+		setChangeSeen(cur, nowUnix)
+		// The content key covers the signature, so Release.gpg is fetched
+		// before the gate can compare (no validators: the signature is
+		// bound to this Release).
+		gpgTarget := &fetch.Target{
+			CanonicalHost: host,
+			URL:           releaseGPGURL.UpstreamURL,
+		}
+		gpgRes, gerr := c.fetcher.Conditional(fetchCtx, gpgTarget, "", "", defaultMaxReleaseGPGBytes)
+		switch {
+		case gerr != nil || gpgRes.Status != 200:
+			// As before: record the change and retry on a later check;
+			// last_success_at stays bumped because Release answered.
+			if gerr != nil {
+				c.logger.Warn("freshness: Release.gpg fetch failed; deferring adoption",
+					"err", gerr, "canonical_host", host, "suite_path", suitePath)
+			} else {
+				c.logger.Warn("freshness: Release.gpg fetch returned non-200; deferring adoption",
+					"status", gpgRes.Status, "canonical_host", host, "suite_path", suitePath)
+			}
+			e.result = "changed"
+		default:
+			key := contentKey(adoptionFormDetached, nil, res.Body, gpgRes.Body)
+			if gate.active && !gate.due && key == gate.hash {
+				e.result = "changed_deferred"
+				break
+			}
+			c.logger.Info("Release changed at upstream",
+				"canonical_host", host,
+				"suite_path", suitePath,
+				"cached_hash", cachedHash,
+				"upstream_hash", newHash,
+			)
+			req = &adoptionRequest{
+				suite:        suite,
+				form:         adoptionFormDetached,
+				key:          key,
+				releaseBytes: res.Body,
+				sigBytes:     gpgRes.Body,
+				etag:         res.ETag,
+				lastmod:      res.LastModified,
+			}
+			req, e.result = c.admit(out, cur, req, signedCurrent, prevSuccess, "changed", "changed_queued")
+		}
+	}
+	if e.result == "changed_deferred" {
+		e.reason = gate.reason
+	}
+	return req, c.finishCheck(ctx, out, cur, suite, e)
+}

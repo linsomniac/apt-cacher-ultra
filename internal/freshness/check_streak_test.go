@@ -166,7 +166,7 @@ func TestCheck_CancelledCallerRecordsNothing(t *testing.T) {
 	})
 }
 
-// Both forms. checkLockedInline and checkLockedDetached carry the same
+// Both forms. checkInline and checkDetached carry the same
 // streak and deadline edits; these cover each copy.
 
 var streakForms = []string{"inline", "detached"}
