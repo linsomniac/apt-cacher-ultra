@@ -321,7 +321,9 @@ func TestCheck_ReservedSlotGoesToSignedCurrent(t *testing.T) {
 func TestCheck_HealthySuiteAsksForNoRepairSlot(t *testing.T) {
 	r := newRetryRig(t, 0)
 	r.adopter.repairSkippedMembers = true
-	r.up.set(r.release("v1", 0))
+	// Clearsigned: the unchanged check reconciles, which parses only
+	// clearsigned InRelease (phase D).
+	r.up.set(simtest.ClearsignedFixture(string(r.release("v1", 0))))
 	r.check()
 	held := mustAcquire(t, r.checker.admission, rigHost, true)
 	defer held.release()

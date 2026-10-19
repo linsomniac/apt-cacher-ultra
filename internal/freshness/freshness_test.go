@@ -20,6 +20,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // fakeCache is the in-memory Cache used by these tests. The real cache
@@ -1719,6 +1720,7 @@ func TestCheck_UnchangedTick_ReconcilesDegraded(t *testing.T) {
 		"main/binary-amd64/Packages": pkgsAmd64,
 		"main/binary-all/Packages":   pkgsAll,
 	})
+	releaseText = simtest.ClearsignedFixture(string(releaseText)) // reconcile parses only clearsigned InRelease
 	base := "http://127.0.0.1/ubuntu/dists/noble/"
 	env.fetcher.put(base+"main/binary-amd64/Packages", pkgsAmd64)
 	env.fetcher.put(base+"main/binary-all/Packages", pkgsAll)

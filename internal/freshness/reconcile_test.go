@@ -11,6 +11,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 func TestMissingRequestableMembers(t *testing.T) {
@@ -72,6 +73,7 @@ func adoptCompleteSnapshot(t *testing.T, env *adoptionTestEnv, ad *Adopter) int6
 		"main/binary-amd64/Packages": pkgsAmd64,
 		"main/binary-all/Packages":   pkgsAll,
 	})
+	releaseText = simtest.ClearsignedFixture(string(releaseText)) // reconcile parses only clearsigned InRelease
 	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
 	env.fetcher.put(base+"main/binary-amd64/Packages", pkgsAmd64)
 	env.fetcher.put(base+"main/binary-all/Packages", pkgsAll)
@@ -229,6 +231,8 @@ func TestReconcileSnapshot_RejectsCorruptedAnchor(t *testing.T) {
 			"pool/main/x/x/x_9_amd64.deb": strings.Repeat("9", 64),
 		}),
 	})
+	// Clearsigned, so only the hash check can refuse it.
+	corrupt = simtest.ClearsignedFixture(string(corrupt))
 	if err := os.WriteFile(env.cache.BlobPath(inRel.BlobHash), corrupt, 0o644); err != nil {
 		t.Fatalf("corrupt anchor: %v", err)
 	}

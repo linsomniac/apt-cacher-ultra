@@ -11,6 +11,7 @@ import (
 
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
@@ -147,11 +148,12 @@ func (a *Adopter) reconcilePending(ctx context.Context, snapshotID int64) (bool,
 // AIDEV-NOTE: this is the trust anchor for ReconcileSnapshot. The blob it
 // reads was pinned at adoption time (refcounted via snapshot_member), and
 // the hash check below proves the stored envelope is intact at rest: the
-// exact bytes adoption verified. Intact is not the same as signed — an
-// InRelease envelope also carries unsigned regions (armor headers, lines
-// after the armor CRC), so for InRelease inReleasePlaintext limits the
-// parse to the signed region (R-1). A detached Release is covered whole by
-// its Release.gpg and is parsed as-is.
+// exact bytes adoption verified. Intact is not the same as signed: an
+// InRelease envelope also carries regions outside the signature (armor
+// headers, lines after the armor CRC), so for InRelease
+// inReleasePlaintext limits the parse to the signed plaintext (R-1). A
+// detached Release is covered whole by its Release.gpg and is parsed
+// as-is.
 // Callers MUST treat the returned []ReleaseMember as the authoritative
 // declared set — do not accept member declarations from any other source.
 func (a *Adopter) reparseSnapshotRelease(ctx context.Context, snapshotID int64) ([]ReleaseMember, error) {
@@ -197,33 +199,29 @@ func (a *Adopter) reparseSnapshotRelease(ctx context.Context, snapshotID int64) 
 // legitimate keyring change).
 //
 // AIDEV-NOTE: R-1. Never ParseRelease the raw envelope: lines placed
-// after a forged "=CRC" line inside the signature armor are part of the
-// stored bytes but were never signed — whether placed after a forged
-// "=CRC" line or as colon-bearing armor headers (both verify with
-// go-crypto v1.4.1). A body with no clearsign marker is
-// returned as-is because test fixtures still adopt plain-text InRelease
-// bodies through a pass-through verifier. VerifyInline rejects plain text
-// in every mode, and the startup audit quarantines legacy plain-text
-// snapshots, but one the audit DEFERRED (read error at boot) stays current
-// and its reconcile can reach this fallback until a later start audits it.
-// That adds no trust beyond what the snapshot already had: its members
-// came from the same body. Phase D removes the fallback.
-// AIDEV-TODO(phase D): return an error for a marker-less body once
-// clearsignedFixture() replaces those fixtures. The marker test is bytes.Contains, never
-// HasPrefix (the verifier accepts leading whitespace), and a decode
-// failure is an error, never a raw parse. The decode runs under
-// recover(): a stored blob cannot trigger I-1, but reconcile must never
-// crash the daemon.
+// after a forged "=CRC" line inside the signature armor, or as
+// colon-bearing armor headers, are part of the stored bytes but were never
+// signed (both verify with go-crypto v1.4.1). A body without a clearsign
+// marker is an error since phase D (the plain-text fallback served only
+// test fixtures; VerifyInline never adopts plain text, and the startup
+// audit quarantines legacy plain-text snapshots — one it deferred fails
+// its reconcile here, closed, until a later start audits it). The marker
+// test is bytes.Contains, never HasPrefix: snapshots adopted before phase
+// D may hold whitespace before the marker (ruling R-D2 now refuses that at
+// adoption). A decode failure is an error, never a raw parse; the decode
+// sees aptpath.DecodableClearsign(blob) (R-D2) and runs under recover():
+// a stored blob cannot trigger I-1, but reconcile must never crash the
+// daemon.
 func inReleasePlaintext(blob []byte) (text []byte, err error) {
 	if !bytes.Contains(blob, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
-		return blob, nil
+		return nil, errors.New("reconcile: stored InRelease is not clearsigned")
 	}
 	defer func() {
 		if r := recover(); r != nil {
 			text, err = nil, fmt.Errorf("reconcile: clearsign decode panicked: %v", r)
 		}
 	}()
-	block, _ := clearsign.Decode(blob)
+	block, _ := clearsign.Decode(aptpath.DecodableClearsign(blob))
 	if block == nil {
 		return nil, errors.New("reconcile: stored InRelease is not a valid clearsigned message")
 	}

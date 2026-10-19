@@ -1,0 +1,31 @@
+package simtest
+
+import (
+	"testing"
+
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
+)
+
+// The fixture is what spec C3's sniff and reconcile's decoder take for a
+// clearsigned InRelease, and its plaintext is the text it wraps.
+func TestClearsignedFixture(t *testing.T) {
+	cases := []struct{ text, plain string }{
+		{"Origin: x\nSHA256:\n 0123 1 main/Packages\n", "Origin: x\nSHA256:\n 0123 1 main/Packages"},
+		{"Origin: x\nSuite: y", "Origin: x\nSuite: y"},
+	}
+	for _, c := range cases {
+		f := ClearsignedFixture(c.text)
+		if !aptpath.SniffInRelease(f) {
+			t.Fatalf("%q: fails the InRelease sniff", f)
+		}
+		b, _ := clearsign.Decode(f)
+		if b == nil {
+			t.Fatalf("%q: does not decode", f)
+		}
+		if string(b.Plaintext) != c.plain {
+			t.Fatalf("plaintext = %q, want %q", b.Plaintext, c.plain)
+		}
+	}
+}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
@@ -35,17 +36,16 @@ func TestReparseSnapshotRelease_IgnoresArmorInjection(t *testing.T) {
 	}
 }
 
-func TestReparseSnapshotRelease_PlainTextInReleaseStillParses(t *testing.T) {
-	// Test fixtures (makeRelease + passThroughVerifier) still adopt
-	// plain-text InRelease bodies until phase D migrates them to
-	// clearsignedFixture(); reconcile keeps parsing them until then.
-	// AIDEV-TODO(phase D): flip to _PlainTextInReleaseIsAnError.
+// Phase D removed reconcile's plain-text fallback: a stored InRelease
+// without a clearsign marker is an error, never parsed (the fixtures that
+// needed it use simtest.ClearsignedFixture).
+func TestReparseSnapshotRelease_PlainTextInReleaseIsAnError(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	body := "Origin: Test\nSHA256:\n " + strings.Repeat("a", 64) + " 10 main/binary-amd64/Packages\n"
 	id := storeInlineSnapshot(t, env, []byte(body))
 	got, err := env.adopter.reparseSnapshotRelease(context.Background(), id)
-	if err != nil || len(got) != 1 {
-		t.Fatalf("got %+v, %v", got, err)
+	if err == nil || len(got) != 0 || !strings.Contains(err.Error(), "not clearsigned") {
+		t.Fatalf("got %+v, %v; want a not-clearsigned error and no members", got, err)
 	}
 }
 
@@ -82,9 +82,11 @@ func TestReparseSnapshotRelease_UndecodableEnvelopeFailsClosed(t *testing.T) {
 	}
 }
 
-// R-1: the verifier accepts whitespace before the BEGIN marker, so the
-// clearsign detection must find a marker anywhere (never HasPrefix), and
-// the injection must be ignored for a whitespace-prefixed envelope too.
+// R-1: until phase D the verifier accepted whitespace before the BEGIN
+// marker (ruling R-D2 now refuses it), so snapshots adopted earlier can
+// hold such an envelope: the clearsign detection must find a marker
+// anywhere (never HasPrefix), and the injection must be ignored for a
+// whitespace-prefixed envelope too.
 func TestReparseSnapshotRelease_IgnoresInjectionWithLeadingWhitespace(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	genuine := "Origin: Test\nSuite: noble\nSHA256:\n " + strings.Repeat("a", 64) + " 10 main/binary-amd64/Packages\n"
@@ -101,7 +103,8 @@ func TestReparseSnapshotRelease_IgnoresInjectionWithLeadingWhitespace(t *testing
 
 func clearsignForTest(t *testing.T, text string) []byte {
 	t.Helper()
-	ent, err := openpgp.NewEntity("t", "", "t@example.invalid", nil)
+	// Ed25519: an RSA key per call is slow under -race (deferred minor A-33).
+	ent, err := openpgp.NewEntity("t", "", "t@example.invalid", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +120,55 @@ func clearsignForTest(t *testing.T, text string) []byte {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
+}
+
+// Deferred minor A-34: an injection after the armor CRC of a CRLF envelope
+// is ignored like one in an LF envelope.
+func TestReparseSnapshotRelease_IgnoresInjectionInACRLFEnvelope(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	genuine := "Origin: Test\nSuite: noble\nSHA256:\n " + strings.Repeat("a", 64) + " 10 main/binary-amd64/Packages\n"
+	signed := clearsignForTest(t, genuine)
+	evil := "=AAAA\nSHA256:\n " + strings.Repeat("b", 64) + " 10 main/binary-evilarch/Packages\n"
+	idx := bytes.LastIndex(signed, []byte("-----END PGP SIGNATURE-----"))
+	tampered := append(append(append([]byte{}, signed[:idx]...), evil...), signed[idx:]...)
+	id := storeInlineSnapshot(t, env, bytes.ReplaceAll(tampered, []byte("\n"), []byte("\r\n")))
+	got, err := env.adopter.reparseSnapshotRelease(context.Background(), id)
+	if err != nil || len(got) != 1 || got[0].Path != "main/binary-amd64/Packages" {
+		t.Fatalf("declared = %+v, err=%v; want only the signed member", got, err)
+	}
+}
+
+// Deferred minor A-34: a declaration placed in the signed message's own
+// header block (beside "Hash:") makes the envelope undecodable — an error,
+// never a parse of the raw bytes.
+func TestReparseSnapshotRelease_HeaderBlockInjectionFailsClosed(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	genuine := "Origin: Test\nSuite: noble\nSHA256:\n " + strings.Repeat("a", 64) + " 10 main/binary-amd64/Packages\n"
+	signed := clearsignForTest(t, genuine)
+	hashLine := bytes.Index(signed, []byte("Hash: "))
+	lineEnd := hashLine + bytes.IndexByte(signed[hashLine:], '\n') + 1
+	tampered := append(append(append([]byte{}, signed[:lineEnd]...),
+		"SHA256: "+strings.Repeat("d", 64)+" 10 main/binary-evilarch/Packages\n"...), signed[lineEnd:]...)
+	id := storeInlineSnapshot(t, env, tampered)
+	got, err := env.adopter.reparseSnapshotRelease(context.Background(), id)
+	if err == nil || len(got) != 0 {
+		t.Fatalf("got %d members, err=%v; want a decode error and no members", len(got), err)
+	}
+}
+
+// Ruling R-D2: a stored envelope whose marker line carries trailing blanks
+// — apt accepts it, go-crypto's decoder alone would not — still decodes.
+func TestReparseSnapshotRelease_DecodesAptsMarkerLine(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	genuine := "Origin: Test\nSuite: noble\nSHA256:\n " + strings.Repeat("a", 64) + " 10 main/binary-amd64/Packages\n"
+	signed := clearsignForTest(t, genuine)
+	const marker = "-----BEGIN PGP SIGNED MESSAGE-----"
+	blanks := bytes.Replace(signed, []byte(marker+"\n"), []byte(marker+" \t\n"), 1)
+	id := storeInlineSnapshot(t, env, blanks)
+	got, err := env.adopter.reparseSnapshotRelease(context.Background(), id)
+	if err != nil || len(got) != 1 || got[0].Path != "main/binary-amd64/Packages" {
+		t.Fatalf("declared = %+v, err=%v; want the signed member", got, err)
+	}
 }
 
 // storeInlineSnapshot writes blob to the pool and records an adopted
