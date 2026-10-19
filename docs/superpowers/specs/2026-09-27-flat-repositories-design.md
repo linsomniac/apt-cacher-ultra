@@ -1230,7 +1230,9 @@ the handler waits for in-flight adoptions on the request's host — at most
 min(15 s, 25 s − the request's age), and not at all when less than 1 s of
 that is left (phase E, design review M-10: the miss path still downloads
 the whole `.deb` before its first byte, within apt's 30 s) — then re-runs
-the lookup once. On the miss path, where the strict decision sits
+the lookup once; a request whose client left during the wait is answered
+503 (`client_canceled`) and never served (phase E fix round 1: a re-run
+lookup with the dead context failed open). On the miss path, where the strict decision sits
 inside singleflight after host-slot acquisition by design, `runFetch` returns
 `errUnvouchedRetryable` (releasing its slot) when an adoption is in flight on
 the host; `serveCacheMiss`, outside singleflight, waits under the same

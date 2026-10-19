@@ -12,7 +12,8 @@ import (
 
 // Spec C10: a request waits until the host's last signed adoption in
 // flight ends, at most strictWait; with nothing in flight it may re-run its
-// lookup at once; a cancelled request stops waiting.
+// lookup at once; a cancelled request stops waiting and may not re-run its
+// lookup (design note 31: its client left, review fix round 1, Task 9).
 func TestHostAdoptions_Wait(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHostAdoptions()
@@ -33,16 +34,22 @@ func TestHostAdoptions_Wait(t *testing.T) {
 		}
 		h.begin("a")
 		start = time.Now()
-		h.wait(context.Background(), "a", strictWait)
+		ok := h.wait(context.Background(), "a", strictWait)
 		if d := time.Since(start); d != strictWait {
 			t.Fatalf("waited %v, want the %v bound", d, strictWait)
+		}
+		if !ok {
+			t.Fatal("a wait that reached its bound must re-run the lookup (and refuse if still unvouched)")
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() { time.Sleep(3 * time.Second); cancel() }()
 		start = time.Now()
-		h.wait(ctx, "a", strictWait)
+		ok = h.wait(ctx, "a", strictWait)
 		if d := time.Since(start); d != 3*time.Second {
 			t.Fatalf("a cancelled request waited %v, want 3 s", d)
+		}
+		if ok {
+			t.Fatal("a cancelled request's wait returned true: its lookup would re-run with a dead context")
 		}
 		h.end("a")
 		if h.inFlight("a") {

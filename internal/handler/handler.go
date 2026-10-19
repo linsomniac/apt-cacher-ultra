@@ -991,7 +991,8 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 // refusal first wait for the host's signed adoptions in flight and run
 // the lookup once more (spec C10: at most 15 s and at most 25 s since the
 // request started at start, at most 64 waiters per host, beyond which the
-// refusal is immediate).
+// refusal is immediate). A request whose context ended during the wait
+// is answered 503 with outcome client_canceled (design note 31).
 func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, start time.Time, mayWait bool) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
 	rows, err := h.cache.DeclaredHashesForPath(r.Context(),
 		req.CanonicalScheme, req.CanonicalHost, req.Path)
@@ -1022,9 +1023,23 @@ func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, r
 		switch sm, snapID, count := h.classifyStrictMode(r.Context(),
 			req.CanonicalScheme, req.CanonicalHost); sm {
 		case strictRefuse:
-			if mayWait && h.adoptions != nil && h.adoptions.AdoptionsInFlight(req.CanonicalHost) &&
-				h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost, start) {
-				return h.checkPackageHashWait(w, r, req, blobHash, start, false)
+			if mayWait && h.adoptions != nil && h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
+				waited := h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost, start)
+				// A client that left during the wait gets no retry, as on
+				// the miss path (design note 31): 503, client_canceled.
+				//
+				// AIDEV-NOTE: check the context before any re-run. The
+				// re-run lookup with a dead context fails, and a lookup
+				// error fails open — the unvouched .deb was served, and a
+				// MITM tunnel's writer (alive while Drain cancels the inner
+				// request's context) delivered it (review fix round 1,
+				// Task 9). Whatever the wait reports.
+				if clientLeft(w, r) {
+					return true, "client_canceled", http.StatusServiceUnavailable, 0, false, packageValidation{}
+				}
+				if waited {
+					return h.checkPackageHashWait(w, r, req, blobHash, start, false)
+				}
 			}
 			st, body := h.refuseUnvouchedDeb(w, req.CanonicalHost, req.Path, count)
 			return true, "unvouched_deb_refused", st, body, false, packageValidation{}

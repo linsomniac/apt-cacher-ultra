@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
@@ -284,5 +285,67 @@ func TestServeHTTP_StrictHitWaitsOnce(t *testing.T) {
 	}
 	if got := a.waits.Load(); got != 1 {
 		t.Fatalf("waited %d times, want 1", got)
+	}
+}
+
+// Spec C10 on the hit path, design note 31 (review fix round 1, Task 9): a
+// client whose request context ends during the strict wait gets no retry —
+// 503, outcome client_canceled — and never the unvouched .deb. The lookup
+// is not re-run with the dead context (it would fail, and its error fails
+// open: the hit was served). Both wait results are covered: the real wait
+// returns false on ctx.Done, a waiter whose adoptions ended at that moment
+// true. The MITM leg is the shape that delivered the bytes: the tunnel
+// manager's Drain cancels the inner request's context while its writer
+// stays live (the recorder stands in for it).
+func TestServeHTTP_StrictHitClientLeftDuringTheWait(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mitm   bool
+		waitOK bool
+	}{
+		{"plain, the wait ends false", false, false},
+		{"plain, the wait ends true", false, true},
+		{"MITM, the wait ends false", true, false},
+		{"MITM, the wait ends true", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &fakeAdoptions{inFlight: true, ok: tc.waitOK}
+			h, logs, srvURL, scheme, canon := strictWaitRig(t, a)
+			deb := []byte("a cached unvouched .deb")
+			blob := writeBlob(t, h, deb)
+			if err := h.cache.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: scheme, CanonicalHost: canon,
+				Path: waitDebPath, BlobHash: &blob, UpstreamURL: srvURL + waitDebPath}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.mitm {
+				ctx = proxy.WithMITMContext(ctx)
+			}
+			a.during = cancel // the client leaves (or Drain cancels the tunnel) while it waits
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, proxyReq("GET", srvURL, waitDebPath).WithContext(ctx))
+			if rec.Code != http.StatusServiceUnavailable || rec.Body.String() == string(deb) {
+				t.Fatalf("status %d body %q; want 503 and never the unvouched .deb", rec.Code, rec.Body.String())
+			}
+			if a.waits.Load() != 1 {
+				t.Fatalf("waited %d times, want 1", a.waits.Load())
+			}
+			var lines []map[string]any
+			for _, r := range logs.records() {
+				switch r["msg"] {
+				case "package_hash lookup failed", "unvouched_deb_refused":
+					t.Fatalf("logged %q for a client that left: %v", r["msg"], r)
+				case "request":
+					lines = append(lines, r)
+				}
+			}
+			if len(lines) != 1 || lines[0]["outcome"] != "client_canceled" || lines[0]["status"] != float64(http.StatusServiceUnavailable) {
+				t.Fatalf("request lines %v, want one client_canceled 503", lines)
+			}
+			if m, _ := lines[0]["mitm"].(bool); m != tc.mitm {
+				t.Fatalf("request line mitm = %v, want %v", lines[0]["mitm"], tc.mitm)
+			}
+		})
 	}
 }

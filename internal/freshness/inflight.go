@@ -80,9 +80,17 @@ func (h *hostAdoptions) inFlight(host string) bool {
 // wait blocks until host has no signed adoption in flight, max passes or
 // ctx ends, and reports whether the caller may re-run its lookup: false
 // when the host already has strictWaitersPerHost waiters, or max is below
-// strictMinWait (the caller refuses at once). With nothing in flight it
-// returns true at once. A request that waits is counted
+// strictMinWait (the caller refuses at once), and false when ctx ended
+// during the wait (the client left: design note 31, no retry — the
+// caller answers client_canceled). With nothing in flight it returns true
+// at once. A request that waits is counted
 // (acu_strict_adoption_waits_total).
+//
+// AIDEV-NOTE: never return true on ctx.Done: the caller's re-run lookup
+// would run with the dead context, fail, and fail open — the hit path
+// served the unvouched .deb, which a MITM tunnel's writer (alive while
+// Drain cancels the inner request's context) delivered (review fix round
+// 1, Task 9). The handler also checks the context itself after any wait.
 func (h *hostAdoptions) wait(ctx context.Context, host string, max time.Duration) bool {
 	h.mu.Lock()
 	if h.waiters[host] >= strictWaitersPerHost {
@@ -118,6 +126,7 @@ func (h *hostAdoptions) wait(ctx context.Context, host string, max time.Duration
 	case <-ch:
 	case <-t.C:
 	case <-ctx.Done():
+		return false
 	}
 	return true
 }
@@ -130,7 +139,9 @@ func (c *Checker) AdoptionsInFlight(host string) bool { return c.inflight.inFlig
 // canonical host (spec C10) — at most min(15 s, 25 s − the time since the
 // request started at start) — and reports whether the caller should re-run
 // its lookup once: false when 64 requests already wait on the host or
-// less than 1 s of that budget is left, and the caller refuses at once.
+// less than 1 s of that budget is left, and the caller refuses at once;
+// false too when ctx ended during the wait, and the caller answers
+// client_canceled.
 func (c *Checker) WaitHostAdoptions(ctx context.Context, host string, start time.Time) bool {
 	return c.inflight.wait(ctx, host, min(strictWait, strictRequestBudget-time.Since(start)))
 }
