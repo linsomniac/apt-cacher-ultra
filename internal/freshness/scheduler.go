@@ -141,10 +141,13 @@ func (h *hostQueue) empty() bool {
 // in a class queue, or in its host's waiting list, or its check is in
 // flight; a suite becomes waiting only through the result of a scheduler
 // check and leaves only through the next one (never by a tick), and ticks
-// never re-add a waiting suite (dedupe); an offer that ends queued or
-// busy re-parks held, and a held waiter is offered again only after
-// unhold, which the Run loop calls on every tick and every wake, so a
-// held suite is never stranded and no suite is re-offered in a loop; a
+// never re-add a waiting suite (dedupe); an offer that ends busy re-parks
+// held, and so does one that ends queued unless a slot was released after
+// it was dispatched (the admission generation moved on: B-45, finish),
+// which re-parks it unheld so it is offered at once; a held waiter is
+// offered again only after unhold, which the Run loop calls on every tick
+// and every wake, so a held suite is never stranded, and no suite is
+// re-offered in a loop (an unheld re-park needs a new release each time); a
 // host is in `order` iff it has a queued or waiting suite or a check in
 // flight; pop never returns a second suite of a host whose check is in
 // flight. Memory is bounded by the suite table (each key at most once).
@@ -198,9 +201,11 @@ func (q *schedQueues) enqueue(s cache.SuiteFreshness, pendingChange bool) bool {
 
 // park keeps item queued as waiting for an admission slot once its check
 // ended queued (or busy while it was already waiting): at the back of its
-// host's waiting list when it just became waiting, at the front when it
-// was already waiting — an offer that found no slot keeps its place. The
-// host's check is over. The key stays in queued, so no tick re-adds it.
+// host's waiting list when it just became waiting, and back at its own
+// place — ordered by waitSeq, when it first became waiting (B-46) — when it
+// was already waiting, so an offer that found no slot keeps its place
+// among the waiters. The host's check is over. The key stays in queued,
+// so no tick re-adds it.
 func (q *schedQueues) park(item schedItem, signed bool) {
 	h, ok := q.hosts[item.ref.CanonicalHost]
 	if !ok { // never: an in-flight item's host is kept; fail safe, not fatal
@@ -472,7 +477,7 @@ func (c *Checker) pendingChange(s cache.SuiteFreshness) bool {
 //
 // Panic safety: the queue operations are pure in-memory code with no
 // interface calls; the panic-prone work (the restart reschedule,
-// ListSuites, gauges, checks) runs under safeReschedule, safeTick and
+// ListSuitesWithAdoption, gauges, checks) runs under safeReschedule, safeTick and
 // checkRecovered, and checkWorker sends a done for every item even if
 // checkRecovered's own recover handler panics.
 func (c *Checker) Run(ctx context.Context) {
@@ -511,7 +516,11 @@ func (c *Checker) Run(ctx context.Context) {
 		// refused (both channels are buffered and select picks at random);
 		// the suite is still offered, right after finish parks it. A
 		// suite whose refused check was itself an offer is parked held
-		// instead and waits for the next wake or tick (at most one tick).
+		// and waits for the next wake or tick (at most one tick) — unless
+		// a slot was released after that offer was dispatched (the
+		// admission generation moved on, B-45): that release's wake may
+		// already be spent, so finish parks it unheld and this loop offers
+		// it at once.
 		for idle > 0 {
 			item, ok := q.pop(admit)
 			if !ok {
@@ -603,7 +612,7 @@ func (c *Checker) checkWorker(ctx context.Context, work <-chan schedItem, done c
 	}
 }
 
-// safeTick keeps a panic in a tick (ListSuites, gauges) from ending the
+// safeTick keeps a panic in a tick (ListSuitesWithAdoption, gauges) from ending the
 // scheduler; the next tick tries again.
 func (c *Checker) safeTick(ctx context.Context, q *schedQueues) {
 	defer func() {

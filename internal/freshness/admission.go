@@ -68,8 +68,9 @@ func (a *admission) tryAcquire(host string, signedCurrent bool) (*lease, bool) {
 // AIDEV-NOTE: a read-only peek for the scheduler's offers. tryAcquire is
 // the authority, so this arithmetic must mirror its refusal rule exactly
 // (TestAdmission_FreeForAgreesWithTryAcquire pins it). A wrong peek costs
-// one wasted GET per wake or tick (the lost offer re-parks held), never a
-// slot and never a loop.
+// one wasted GET per wake or tick (the lost offer re-parks held, or unheld
+// and offered at once when a slot was released after its dispatch, B-45:
+// each such re-offer needs a new release), never a slot and never a loop.
 func (a *admission) freeFor(host string, signedCurrent bool) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()

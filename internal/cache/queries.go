@@ -271,11 +271,20 @@ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
 // to show "this suite was last adopted at <timestamp>" without an
 // N+1 GetSuiteSnapshot lookup.
 //
-// AIDEV-NOTE: SPEC5 §9.7.8 — exists alongside ListSuites (which is
-// untouched and continues to back the periodic freshness scheduler);
-// the two helpers have different return shapes. Use ListSuites when
-// you only need freshness columns; use ListSuitesWithAdoption when
-// you need the snapshot's adopted_at too.
+// AIDEV-NOTE: SPEC5 §9.7.8 — exists alongside ListSuites; the two
+// helpers have different return shapes. Since phase E this is also the
+// periodic freshness scheduler's per-tick read (freshness.Cache; the
+// tick uses CurrentAnchorForm to refresh its waiters' signed flag), and
+// ListSuites has no production caller (tests only).
+// AIDEV-NOTE: this is a full-table scan (a LEFT JOIN) with no LIMIT, run
+// at every scheduler tick (periodic_refresh / 4) and every status-page
+// render. Deployments are expected to track tens to low thousands of
+// suites (freshness.max_suites, 5,000 by default, caps the table), so the
+// scan is cheap. If a future phase pushes the table much further, or an
+// operator raises the cap far beyond it, the tick should switch
+// to a chunked scan keyed on (canonical_scheme, canonical_host,
+// suite_path). (Moved here from ListSuites, which the tick no longer
+// runs.)
 //
 // CurrentAdoptedAt is nil when:
 //   - suite_freshness.current_snapshot_id IS NULL (suite never
@@ -735,14 +744,13 @@ SELECT canonical_host, path, is_metadata, request_count, last_requested_at
 }
 
 // ListSuites returns every suite_freshness row, in no guaranteed order.
-// Used by the periodic freshness scheduler (SPEC §7.4) to pick suites
-// whose last_success_at is older than periodic_refresh.
+// It has no production caller since phase E: the periodic freshness
+// scheduler (SPEC §7.4) reads ListSuitesWithAdoption at every tick. Kept
+// for tests and diagnostics.
 //
-// AIDEV-NOTE: this is a full-table scan with no LIMIT. Phase 1 deployments
-// are expected to track tens — at worst low hundreds — of suites
-// (canonical_host × suite_codename), so the scan is cheap. If a future
-// phase pushes this number into the thousands, the caller should switch
-// to a chunked scan keyed on (canonical_scheme, canonical_host, suite_path).
+// AIDEV-NOTE: a full-table scan with no LIMIT. The scaling caveat for the
+// scheduler's per-tick scan now lives on ListSuitesWithAdoption, the query
+// the tick runs.
 func (c *Cache) ListSuites(ctx context.Context) ([]SuiteFreshness, error) {
 	q := `SELECT ` + suiteFreshnessSelect("") + ` FROM suite_freshness`
 	rows, err := c.db.QueryContext(ctx, q)

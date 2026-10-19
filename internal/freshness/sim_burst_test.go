@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -188,19 +189,28 @@ func (s *startsByURL) Fetch(ctx context.Context, target *fetch.Target, dst fetch
 }
 
 // Ruling PE-4 (design review I-5): the upgrade burst where production has
-// it — shared hosts (an archive host carries several suites) — and with
-// admissions that race: 3 hosts × (8 never-adopted + 2 signed) suites, a
-// pool of two, commits that take 2 s, a client checking each never-adopted
-// suite every 5 minutes until it is adopted, and no delay ordering the
-// signed checks behind the offers. Asserted:
+// it — shared hosts (an archive host carries several suites) — with client
+// checks and signed checks that may take a slot while an offer runs:
+// 3 hosts × (8 never-adopted + 2 signed) suites, a pool of two, commits
+// that take 2 s, a client checking each never-adopted suite every 5
+// minutes until it is adopted, and no delay ordering the signed checks
+// behind the offers. One more never-adopted suite, hx, has no clients, and
+// its first offer loses its slot by construction (review fix round 1,
+// Task 8): its anchor handler takes a slot for another host for a second
+// on the tick's check and on that offer's GET, as
+// TestRun_OfferThatLosesTheSlotKeepsItsPlace does — an offer's GET takes
+// no virtual time, so the burst's own races almost never meet one.
+// Asserted:
 //  1. first adoptions run one at a time;
 //  2. a signed change waits for at most one adoption (its commit included)
 //     + D + one host turn (its host's check in flight, at most D);
 //  3. each never-adopted suite's anchor probes before its adoption started
 //     are at most 2 (the scheduler's) + its client checks + its lost offers
-//     (offers another admission took first);
+//     (offers another admission took first, counted through offerHook);
 //  4. lost offers in all are at most the admissions in all — each lost
-//     offer coincides with another admission (work-conserving);
+//     offer coincides with another admission (work-conserving) — and at
+//     least one: hx's, which offerHook counts exactly (its probes are the
+//     tick's, its lost offers' and the winning offer's);
 //  5. goroutines stay bounded.
 func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
@@ -261,6 +271,28 @@ func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 				signed = append(signed, s)
 			}
 		}
+		// hx: a never-adopted suite no client checks, whose first offer
+		// loses its slot. Its anchor handler takes a slot for another host
+		// for one second on its first two calls — the tick's check, which
+		// therefore queues it, and its first offer (an offer is made only
+		// with both slots free; with one taken, a first adoption may not
+		// take the last, reserved one) — then serves normally.
+		x := SuiteRef{CanonicalScheme: "http", CanonicalHost: "hx", SuitePath: "/r/dists/x"}
+		seedStaleAnchorAt(t, c, x.CanonicalHost, x.SuitePath)
+		members.put(pkgsURL(x), pkgsFor("hx"))
+		members.setDelay(pkgsURL(x), time.Minute)
+		xRel := signedRelease("first hx", 0, map[string][]byte{"main/binary-amd64/Packages": pkgsFor("hx")})
+		var chkp atomic.Pointer[Checker]
+		var xCalls atomic.Int32
+		up.Set(anchorURL(x), func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
+			if xCalls.Add(1) <= 2 {
+				if l, ok := chkp.Load().admission.tryAcquire("other", true); ok {
+					time.AfterFunc(time.Second, l.release)
+				}
+			}
+			return simtest.Serve(xRel)(ctx, etag)
+		})
+		first = append(first, x)
 		starts.mu.Lock()
 		starts.at = map[string]time.Time{} // the signed v1 adoptions above do not count
 		starts.mu.Unlock()
@@ -282,6 +314,7 @@ func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		chkp.Store(chk)
 		chk.offerHook = func(ref SuiteRef, rep checkReport) {
 			if isQueuedResult(rep.result) {
 				mu.Lock()
@@ -297,7 +330,7 @@ func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 			defer close(clientDone)
 			for runCtx.Err() == nil {
 				for _, s := range first {
-					if _, ok := started(s); ok {
+					if _, ok := started(s); ok || s == x {
 						continue
 					}
 					mu.Lock()
@@ -350,6 +383,12 @@ func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 				t.Errorf("%v: %d anchor probes before its adoption, want <= 2 + %d client checks + %d lost offers",
 					s, probes, checks, lost[s])
 			}
+			// hx's probes are the tick's check, its lost offers and the
+			// winning offer: offerHook counted each offer and only offers.
+			if s == x && (lost[s] < 1 || lost[s] != probes-2) {
+				t.Errorf("%v: %d lost offers counted for %d anchor probes before its adoption, want at least 1 and probes - 2",
+					s, lost[s], probes)
+			}
 			totalLost += lost[s]
 		}
 		slices.SortFunc(firstStarts, time.Time.Compare)
@@ -377,9 +416,10 @@ func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 			}
 			totalLost += lost[s]
 		}
-		// (4) Work-conserving: a lost offer needs another admission.
-		if admissions := len(first) + len(signed); totalLost > admissions {
-			t.Errorf("%d lost offers for %d admissions", totalLost, admissions)
+		// (4) Work-conserving: a lost offer needs another admission; and
+		// the lost-offer term is exercised (hx's).
+		if admissions := len(first) + len(signed); totalLost > admissions || totalLost < 1 {
+			t.Errorf("%d lost offers for %d admissions, want at least 1 and at most the admissions", totalLost, admissions)
 		}
 		// (5) Workers + Run + the clients + two adoptions, plus slack for
 		// transient goroutines (the cache writer's work, timer callbacks).
