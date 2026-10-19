@@ -63,9 +63,15 @@ func (c *Checker) lockSuite(key string) (*sync.Mutex, lockState) {
 // first would let a caller that loaded mu earlier take it and pass
 // lockSuite's re-validation; the drop would then remove an entry that live
 // holder relies on, and a re-created suite could get a second mutex (two
-// checks of one suite).
+// checks of one suite). unlockDroppedHook runs between the two steps
+// (tests): TestUnlockDropped_DropsBeforeItUnlocks lets such a caller's
+// TryLock run there and fails on two holders if the order flips. Phase F's
+// reaper drops through this same helper.
 func (c *Checker) unlockDropped(key string, mu *sync.Mutex) {
 	c.locks.CompareAndDelete(key, mu)
+	if c.unlockDroppedHook != nil {
+		c.unlockDroppedHook(key)
+	}
 	mu.Unlock()
 }
 

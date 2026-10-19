@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -313,6 +314,74 @@ func TestHoldSuite_RevalidatesItsLockAfterTryLock(t *testing.T) {
 		t.Fatal("an undisturbed hold was refused")
 	}
 	release(false)
+}
+
+// I-4 (Task 7 minor 3; final review, concurrency m2): unlockDropped drops
+// the suite's lock-map entry before it unlocks the mutex. A waiter that
+// loaded the mutex before the drop and runs its TryLock between the two
+// steps must fail it; then a newcomer, after the suite's re-creation,
+// stores a fresh entry and is the only holder. Unlock-first lets the
+// waiter take the old mutex and pass the re-validation, and the late drop
+// then lets the newcomer hold a second mutex: two checks of one suite.
+func TestUnlockDropped_DropsBeforeItUnlocks(t *testing.T) {
+	fc := newFakeCache()
+	fc.track("http", "h", "/r/dists/x")
+	c := lockChecker(t, fc, newTestFetcher(t), nil)
+	k := suiteKey("http", "h", "/r/dists/x")
+	release, ok := c.HoldSuite(lockKey) // the deleter
+	if !ok {
+		t.Fatal("premise: the deleter holds the suite")
+	}
+	old, _ := c.locks.Load(k)
+	loaded, proceed := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	c.lockLoadedHook = func(string) { // the waiter, between its load and its TryLock
+		once.Do(func() {
+			close(loaded)
+			<-proceed
+		})
+	}
+	type lockResult struct {
+		mu *sync.Mutex
+		st lockState
+	}
+	waiter := make(chan lockResult, 1)
+	go func() {
+		mu, st := c.lockSuite(k)
+		waiter <- lockResult{mu, st}
+	}()
+	select {
+	case <-loaded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiter never loaded the mutex")
+	}
+	var w lockResult
+	c.unlockDroppedHook = func(string) { // the deleter, between its two steps
+		close(proceed)
+		select {
+		case w = <-waiter:
+		case <-time.After(5 * time.Second):
+			t.Error("the waiter's TryLock did not return")
+		}
+	}
+	release(true) // the deleter's row is gone: drop, then unlock
+	c.unlockDroppedHook = nil
+	if w.st == lockOK {
+		defer w.mu.Unlock()
+	}
+	nmu, nst := c.lockSuite(k) // a newcomer, after the suite's re-creation
+	if nst == lockOK {
+		defer nmu.Unlock()
+	}
+	if w.st == lockOK && nst == lockOK {
+		t.Fatal("two holders of one suite: the waiter kept the old mutex, the newcomer took a new one")
+	}
+	if w.st != lockBusy || nst != lockOK {
+		t.Fatalf("waiter %v, newcomer %v; want the waiter busy (the deleter still held the mutex) and the newcomer ok", w.st, nst)
+	}
+	if any(nmu) == old {
+		t.Fatal("the newcomer took the deleted suite's old mutex; want a fresh entry (the deleter drops the old one)")
+	}
 }
 
 // Ruling PD-11: with the checker as the guard, cap eviction reports a

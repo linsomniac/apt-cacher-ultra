@@ -229,6 +229,11 @@ type Checker struct {
 	// TryLock: the window I-4's re-validation closes.
 	lockLoadedHook func(key string)
 
+	// unlockDroppedHook, when set (tests only), runs in unlockDropped
+	// between dropping a suite's lock-map entry and unlocking its mutex:
+	// the window whose order (drop, then unlock) keeps two holders apart.
+	unlockDroppedHook func(key string)
+
 	lastClockStepLog atomic.Int64 // monotonic ns since processStart of the last clock_step_detected line
 }
 
