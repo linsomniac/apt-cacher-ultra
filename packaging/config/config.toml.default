@@ -113,6 +113,12 @@ max_duration          = "30m"
 # most 20 s (below apt's 30 s timeout). 0s switches at once; otherwise
 # between 1s and 15s.
 flip_quiet_period     = "10s"
+# Adopt suites whose upstream publishes only an unsigned Release (after two
+# consistent observations). Such a snapshot never vouches a .deb or counts
+# for strict mode, and is refused once a signed anchor has been served for
+# the suite (which a party able to inject one can use to block it; see the
+# reference). false keeps such suites unadopted.
+adopt_unsigned        = true
 
 [integrity]
 # Rehash current-snapshot blobs to detect disk corruption; 0s disables.

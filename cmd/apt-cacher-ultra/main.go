@@ -1022,6 +1022,7 @@ func buildAdopter(
 		MemberRetryDelay:               cfg.Adoption.MemberRetryDelay.Duration,
 		RepairSkippedMembers:           cfg.Adoption.RepairSkippedMembers,
 		RequiredArchitectures:          cfg.Adoption.RequiredArchitectures,
+		AdoptUnsigned:                  cfg.Adoption.AdoptUnsigned,
 		Logger:                         logger,
 	})
 	if err != nil {
@@ -1032,6 +1033,7 @@ func buildAdopter(
 		"keyring_keys", keyring.Size(),
 		"trusted_signer_blocks", len(pins),
 		"require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
+		"adopt_unsigned", adopter.AdoptsUnsigned(),
 		"allow_short_keyid", cfg.Adoption.AllowShortKeyID,
 		"accept_any_signer", cfg.Adoption.AcceptAnySigner,
 		"tolerate_optional_member_failures", cfg.Adoption.TolerateOptionalMemberFailures,
@@ -1063,6 +1065,12 @@ func buildAdopter(
 // runtime) — and warning on every restart would steer operators to raise
 // max_suites needlessly (PD-12).
 func warnSuiteCaps(ctx context.Context, c *cache.Cache, maxSuites int, logger *slog.Logger) {
+	// Validate keeps max_suites >= 10; an unvalidated configuration (the
+	// tests' minimalCfg) has 0, which means no cap here, not "exceeded"
+	// (deferred minor D-45).
+	if maxSuites <= 0 {
+		return
+	}
 	perHost := maxSuites / 10
 	u, err := c.SuiteCapUsage(ctx, perHost)
 	if err != nil {

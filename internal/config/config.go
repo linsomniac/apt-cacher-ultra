@@ -190,6 +190,14 @@ type AdoptionConfig struct {
 	// otherwise between 1s and 15s.
 	FlipQuietPeriod Duration `toml:"flip_quiet_period"`
 
+	// AdoptUnsigned is adoption.adopt_unsigned (spec C5 safeguard 1, C11):
+	// adopt suites whose upstream publishes only an unsigned Release, in
+	// the unsigned form — which never vouches a .deb, never counts for
+	// strict mode, and is refused whenever the suite has signed history.
+	// Default true (pre-populated in defaultConfig: no zero value can tell
+	// "absent" from "false").
+	AdoptUnsigned bool `toml:"adopt_unsigned"`
+
 	// Architectures is the SPEC6_5 §5.1 per-arch adoption allowlist.
 	// Empty (default) preserves Phase 6 behavior: every Release-listed
 	// Packages / Sources / *.diff/Index file is adopted. Non-empty:
@@ -868,6 +876,8 @@ func defaultConfig() *Config {
 			// self-heals instead of persisting for the snapshot's
 			// lifetime). Opt out with `repair_skipped_members = false`.
 			RepairSkippedMembers: true,
+			// Spec C5 D6: unsigned adoption on by default, safeguarded.
+			AdoptUnsigned: true,
 		},
 		GC: GCConfig{
 			// SPEC4 §5.1: gc.enabled defaults true. Bool fields must

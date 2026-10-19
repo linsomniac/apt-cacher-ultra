@@ -51,6 +51,10 @@ func (a *Adopter) RunUnsigned(ctx context.Context, suite SuiteRef, release []byt
 	}, etag, lastmod)
 }
 
+// AdoptsUnsigned reports adoption.adopt_unsigned as the adopter was built
+// with (the startup line logs it).
+func (a *Adopter) AdoptsUnsigned() bool { return a.adoptUnsigned }
+
 // unsignedEligible is spec C5's unsigned eligibility, checked before
 // anything is downloaded (the "order of checks in runShared") and by the
 // check before an unsigned request takes a slot: the knob is on, and the
