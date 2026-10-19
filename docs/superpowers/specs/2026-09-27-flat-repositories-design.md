@@ -279,7 +279,9 @@ refused while the count stays at or above the cap, so the table converges
 under the 24 h rule (phase D, ruling PD-8). The per-host cap never evicts;
 a host at its cap shrinks only through the reaper (C9, `gc.suite_idle_ttl`,
 30 days by default). The daemon logs WARN `suite_caps_exceeded` at start
-when the table is at or above the global cap or a host is at its cap. An
+when the table is above the global cap or a host is at its cap — at
+exactly the global cap a creation evicts, so a full table is normal
+operation and logs nothing (phase D, ruling PD-12). An
 eviction leaves the evictee's `url_path` rows to `url_path` GC, drops its
 lock-map, flip-gate and touch entries, and logs INFO `suite_evicted`.
 Otherwise `CreateSuite` creates nothing and emits a rate-limited WARN

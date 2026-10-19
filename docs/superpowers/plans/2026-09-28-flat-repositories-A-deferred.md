@@ -35,7 +35,7 @@ Phase A's per-task and final reviews (2026-10-11, Fable max) found these minor i
 ## internal/freshness
 
 - **A-29** `gc_urlpath.go:274-275`: the `AIDEV-TODO(phase E)` sits as an SQL `--` comment inside the query string; move it to a Go comment. (Phase E resolves the TODO itself.)
-- **A-37** the freshness side — `Checker.reportPanic` (`freshness.go`) and the heartbeat's recover (`freshness/adoption.go`) — still has its own copies; phase D gave the handler's two recovers one helper, `logGoroutinePanic`.
+- **A-37** the freshness side — `Checker.reportPanic` (`freshness.go`) and the heartbeat's recover (`freshness/adoption.go`) — still has its own copies; phase D gave the handler's three recovers (the T1 goroutine, the touch goroutine and the rejection cache's sweep timer) one helper, `logGoroutinePanic`.
 - **A-47** `legacy_audit.go`: `res.Signed++` counts `FormUnsigned` keeps (after phase E re-queues); rename to `Kept` or skip unsigned.
 - **A-49** The marker pass silently skips tracked anchors whose pool file is missing or unreadable; add a Debug line.
 

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -107,9 +108,9 @@ func TestServeListeners_StartupLineReportsTheSuiteCap(t *testing.T) {
 	t.Fatal("startup line not found")
 }
 
-// Ruling PD-8: a suite table that already reaches a cap is reported at
-// startup — here two suites of one host against max_suites = 10, whose
-// per-host cap is one.
+// Rulings PD-8, PD-12: a suite table that already refuses new suites is
+// reported at startup — here two suites of one host against max_suites =
+// 10, whose per-host cap is one.
 func TestServeListeners_WarnsWhenTheSuiteCapsAreReached(t *testing.T) {
 	cacheDir := t.TempDir()
 	ctx := context.Background()
@@ -137,6 +138,51 @@ func TestServeListeners_WarnsWhenTheSuiteCapsAreReached(t *testing.T) {
 		return
 	}
 	t.Fatal("suite_caps_exceeded not logged")
+}
+
+// Ruling PD-12: suite_caps_exceeded fires when new suites are refused — the
+// table above the global cap, or a host at or above its per-host cap. A
+// table at exactly the global cap is normal operation (a new suite evicts
+// an idle one, and is refused only when none qualifies) and logs nothing.
+func TestWarnSuiteCaps_AboveTheGlobalCapOrAtAHostCap(t *testing.T) {
+	const maxSuites = 20 // per-host cap 2
+
+	// spread returns n suites' hosts, each suite on its own host.
+	spread := func(n int) []string {
+		var hosts []string
+		for i := range n {
+			hosts = append(hosts, fmt.Sprintf("h%d.example", i))
+		}
+		return hosts
+	}
+	for _, tc := range []struct {
+		name  string
+		hosts []string // one suite per entry
+		warn  bool
+	}{
+		{"exactly at the global cap", spread(maxSuites), false},
+		{"above the global cap", spread(maxSuites + 1), true},
+		{"a host at its cap", []string{"h.example", "h.example"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			c, err := cache.Open(ctx, t.TempDir(), silentBuildLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = c.Close() })
+			for i, h := range tc.hosts {
+				if err := c.EnsureSuiteForTest(ctx, "http", h, fmt.Sprintf("/s%d/dists/x", i)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var logs captureBuilder
+			warnSuiteCaps(ctx, c, maxSuites, slog.New(slog.NewJSONHandler(&logs, nil)))
+			if got := strings.Contains(logs.String(), `"msg":"suite_caps_exceeded"`); got != tc.warn {
+				t.Fatalf("suite_caps_exceeded logged = %v, want %v (log %q)", got, tc.warn, logs.String())
+			}
+		})
+	}
 }
 
 // Spec C3: the handler gets freshness.max_suites and the checker as its

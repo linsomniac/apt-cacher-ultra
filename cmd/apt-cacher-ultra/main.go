@@ -1046,14 +1046,20 @@ func buildAdopter(
 	return adopter, keyring, nil
 }
 
-// warnSuiteCaps logs WARN suite_caps_exceeded at startup when the suite
-// table is at or above freshness.max_suites or a canonical host holds at
-// least a tenth of it (ruling PD-8): a lowered cap, or an upgraded v6
-// table, then refuses new suites. At or above the global cap every
-// creation attempt still evicts one suite idle for 24 h, so the table
-// converges; a host at its cap never evicts and waits for phase F's
-// reaper (gc.suite_idle_ttl, 30 days). A read error is logged and
-// otherwise ignored: the caps hold either way.
+// warnSuiteCaps logs WARN suite_caps_exceeded at startup when new suites
+// are refused: the suite table holds more than freshness.max_suites rows
+// (a lowered cap, or an upgraded v6 table), or a canonical host holds at
+// least a tenth of it (ruling PD-12, narrowing PD-8). Above the global cap
+// every creation attempt is refused but still evicts one suite idle for
+// 24 h, so the table converges; a host at its cap never evicts and waits
+// for phase F's reaper (gc.suite_idle_ttl, 30 days). A read error is logged
+// and otherwise ignored: the caps hold either way.
+//
+// AIDEV-NOTE: a table at exactly the global cap logs nothing. That is
+// normal operation for a full cache — a new suite evicts an idle one and
+// is refused only when none qualifies (suite_seed_rejected says so at
+// runtime) — and warning on every restart would steer operators to raise
+// max_suites needlessly (PD-12).
 func warnSuiteCaps(ctx context.Context, c *cache.Cache, maxSuites int, logger *slog.Logger) {
 	perHost := maxSuites / 10
 	u, err := c.SuiteCapUsage(ctx, perHost)
@@ -1061,7 +1067,7 @@ func warnSuiteCaps(ctx context.Context, c *cache.Cache, maxSuites int, logger *s
 		logger.Warn("suite cap usage read failed", "err", err)
 		return
 	}
-	if u.Total < maxSuites && u.HostsAtCap == 0 {
+	if u.Total <= maxSuites && u.HostsAtCap == 0 {
 		return
 	}
 	logger.Warn("suite_caps_exceeded",

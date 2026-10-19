@@ -242,13 +242,17 @@ A cache can hold more suites than the caps allow: after `max_suites` is
 lowered, or after an upgrade from a release without the caps (one that
 collected more than 5,000 suites, or more than 500 on one host, for example
 from an upstream that answers missing `InRelease` files with an HTML page).
-The daemon then logs WARN `suite_caps_exceeded` at start, and new suites
-(for a host at its cap, that host's) are refused. Above the total cap each
-refused attempt still evicts one suite that qualifies (no adopted snapshot,
-not requested for 24 hours), so the table shrinks back under the cap as
-suites fall idle. A host at its own cap evicts nothing: its suites go only
-when idle-suite reaping (a later release) removes those not requested for
-30 days.
+The daemon logs WARN `suite_caps_exceeded` at start when the table holds
+more than `max_suites` suites, or a host holds `max_suites / 10` or more (a
+host can also get there by normal growth). Above the total cap new suites
+are refused, but each refused attempt still evicts one suite that qualifies
+(no adopted snapshot, not requested for 24 hours), so the table shrinks
+back under the cap as suites fall idle. A host at its own cap refuses that
+host's new suites and evicts nothing: its suites go only when idle-suite
+reaping (a later release) removes those not requested for 30 days. A table
+at exactly the total cap logs no warning: that is a full cache working
+normally, where a new suite evicts an idle one and is refused only when
+none qualifies (WARN `suite_seed_rejected`).
 
 Serving a tracked suite's `InRelease`, `Release` or `Release.gpg`, or a
 `.deb` its current snapshot vouches for, records that the suite is in use
@@ -384,8 +388,8 @@ suite whose signed `InRelease` was served by an earlier version is recorded
 as signed from cached anchors; one whose cached anchor was already
 garbage-collected leaves no record. Suites whose `InRelease` an earlier
 release cached but never tracked are tracked, with their signed-seen record,
-on their first cache hit. A cache with more suites than `freshness.max_suites`
-allows, or more than a tenth of it on one host, logs WARN
+on their first cache hit. A cache with more than `freshness.max_suites`
+suites, or a tenth of it or more on one host, logs WARN
 `suite_caps_exceeded` at start; see *Tracked suites*.
 
 ## `[hot_packages]`, `[hold_packages]`, and `[retention]`: package working set
