@@ -202,9 +202,16 @@ func TestCommitAdoption_RefusesAnUnsignedDowngrade(t *testing.T) {
 // /. twin, or under the other scheme — refuse an unsigned candidate. A
 // retired snapshot (quarantined) and a signed candidate never adopted are
 // no history. CheckUnsignedDowngrade agrees with the commit every time.
+//
+// The rule is scoped to the candidate's host and base: another suite's
+// signed snapshot or another base's marker on the same host, and the same
+// suite's signed snapshot or marker on another host, are not its history
+// (otherwise every unsigned suite on a host that also serves a signed one
+// would be refused forever).
 func TestCommitAdoption_RefusesUnsignedForAnySignedHistory(t *testing.T) {
 	type history struct {
 		scheme, suite string
+		host          string // "" for the candidate's host "h"
 		form          AnchorForm
 		current       bool
 		adopted       bool
@@ -212,8 +219,9 @@ func TestCommitAdoption_RefusesUnsignedForAnySignedHistory(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name                     string
-		suite                    string // the unsigned candidate's, over http
+		suite                    string // the unsigned candidate's, over http on host "h"
 		markerScheme, markerBase string
+		markerHost               string // "" for the candidate's host "h"
 		snapshot                 *history
 		refused                  bool
 	}{
@@ -228,6 +236,20 @@ func TestCommitAdoption_RefusesUnsignedForAnySignedHistory(t *testing.T) {
 			snapshot: &history{scheme: "http", suite: "/u/dists/s", form: FormInline, adopted: true, retired: true}},
 		{name: "signed candidate never adopted", suite: "/u/dists/s",
 			snapshot: &history{scheme: "http", suite: "/u/dists/s", form: FormInline}},
+		// Scope (review fix round 1, Task 1): none of these is the
+		// candidate's history.
+		{name: "adopted signed snapshot of another suite on the host", suite: "/u/dists/s",
+			snapshot: &history{scheme: "http", suite: "/u/dists/other", form: FormInline, current: true, adopted: true}},
+		{name: "adopted detached snapshot of another suite on the host", suite: "/u/dists/s",
+			snapshot: &history{scheme: "https", suite: "/u/dists/other", form: FormDetached, current: true, adopted: true}},
+		{name: "marker for another base on the host", suite: "/u/dists/s", markerScheme: "http", markerBase: "/u/dists/other"},
+		{name: "signed snapshot of the suite on another host", suite: "/u/dists/s",
+			snapshot: &history{scheme: "http", host: "other", suite: "/u/dists/s", form: FormInline, current: true, adopted: true}},
+		{name: "marker for the base on another host", suite: "/u/dists/s",
+			markerScheme: "http", markerHost: "other", markerBase: "/u/dists/s"},
+		{name: "signed snapshot and marker for the suite on another host", suite: "/u/dists/s",
+			markerScheme: "http", markerHost: "other", markerBase: "/u/dists/s",
+			snapshot: &history{scheme: "http", host: "other", suite: "/u/dists/s", form: FormInline, current: true, adopted: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := openCache(t)
@@ -235,12 +257,16 @@ func TestCommitAdoption_RefusesUnsignedForAnySignedHistory(t *testing.T) {
 			defer stubNow(t, 1_800_000_000)()
 			if s := tc.snapshot; s != nil {
 				h := seedBlob(t, c, "signed history")
+				host := s.host
+				if host == "" {
+					host = "h"
+				}
 				var id int64
 				if s.form == FormDetached {
 					g := seedBlob(t, c, "its signature")
-					id = seedFormSnapshot(t, c, s.scheme, "h", s.suite, s.form, nil, &h, &g, true)
+					id = seedFormSnapshot(t, c, s.scheme, host, s.suite, s.form, nil, &h, &g, true)
 				} else {
-					id = seedFormSnapshot(t, c, s.scheme, "h", s.suite, s.form, &h, nil, nil, true)
+					id = seedFormSnapshot(t, c, s.scheme, host, s.suite, s.form, &h, nil, nil, true)
 				}
 				if !s.current {
 					if _, err := c.db.Exec(`UPDATE suite_freshness SET current_snapshot_id = NULL WHERE current_snapshot_id = ?`, id); err != nil {
@@ -259,7 +285,11 @@ func TestCommitAdoption_RefusesUnsignedForAnySignedHistory(t *testing.T) {
 				}
 			}
 			if tc.markerBase != "" {
-				if err := c.MarkSignedSeenBatch(ctx, []SignedSeenMark{{CanonicalScheme: tc.markerScheme, CanonicalHost: "h",
+				markerHost := tc.markerHost
+				if markerHost == "" {
+					markerHost = "h"
+				}
+				if err := c.MarkSignedSeenBatch(ctx, []SignedSeenMark{{CanonicalScheme: tc.markerScheme, CanonicalHost: markerHost,
 					Base: tc.markerBase, SeenAt: 1}}); err != nil {
 					t.Fatal(err)
 				}
