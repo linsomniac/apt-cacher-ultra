@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -118,4 +119,22 @@ func (c *Cache) InsertTrackedCandidateForTest(ctx context.Context, sc SnapshotCa
 		return 0, false, err
 	}
 	return c.InsertCandidateSnapshot(ctx, sc)
+}
+
+// MigrateToVersionForTest creates dir/cache.db at schema version (the
+// migrations before it applied, no Go step after it), for upgrade
+// fixtures a test then fills with an older binary's rows and opens with
+// Open. TEST-ONLY.
+func MigrateToVersionForTest(ctx context.Context, dir string, version int) error {
+	db, err := openDB(filepath.Join(dir, "cache.db"))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	for v := 0; v < version; v++ {
+		if err := applyMigration(ctx, db, v); err != nil {
+			return fmt.Errorf("MigrateToVersionForTest: migration %d: %w", v, err)
+		}
+	}
+	return nil
 }
