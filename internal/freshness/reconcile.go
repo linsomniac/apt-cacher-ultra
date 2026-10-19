@@ -69,15 +69,10 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 				"snapshot_id", snapshotID, "path", m.Path, "err", ferr)
 			continue // leave uncompleted; next tick retries
 		}
-		rows = append(rows, cache.SnapshotMember{
-			SnapshotID: snapshotID, Path: m.Path, BlobHash: blobHash, DeclaredSHA256: m.SHA256,
-		})
-		if alias := byHashAliasPath(m.Path, m.SHA256); alias != "" {
-			rows = append(rows, cache.SnapshotMember{
-				SnapshotID: snapshotID, Path: alias, BlobHash: blobHash, DeclaredSHA256: m.SHA256,
-			})
-		}
-		healedDecl = append(healedDecl, m)
+		// Spec C5: the member and an alias per declared algorithm, bound
+		// to the bytes adoptMember verified against every declared hash.
+		rows = append(rows, memberRows(snapshotID, m, blobHash)...)
+		healedDecl = append(healedDecl, verifiedMember(m, blobHash))
 	}
 	if len(rows) == 0 {
 		return 0, nil

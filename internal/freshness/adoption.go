@@ -1271,8 +1271,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// (buildPackageHashes) iterate this slice instead of `members` so
 	// that 4xx-skipped paths don't get phantom alias rows pointing at
 	// a non-existent blob (FK violation on snapshot_member.blob_hash)
-	// or a Packages-blob read against an empty pool entry.
+	// or a Packages-blob read against an empty pool entry. Its SHA256 is
+	// the verified bytes' hash (verifiedMember: derived for a
+	// SHA512-only member), so the Step 8 builders read the pool by it.
 	fetchedMembers := make([]ReleaseMember, 0, len(members))
+	// pendingAliases are Step 7's rows, built from each member's
+	// declaration while it is at hand: one alias per declared algorithm
+	// (spec C5), bound to the verified blob.
+	var pendingAliases []cache.SnapshotMember
 	skippedCount := 0
 	// integritySkipped collects the SPEC6_7 §2 repair records: members
 	// skipped over an integrity failure keep their signed declaration
@@ -1366,14 +1372,20 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 					"detail", detail,
 				)
 				adoptionMembersSkippedTotal.Inc("optional_member_integrity")
-				integritySkipped = append(integritySkipped, cache.SkippedMember{
-					SnapshotID:     snapshotID,
-					Path:           m.Path,
-					DeclaredSHA256: m.SHA256,
-					Size:           m.Size,
-					Reason:         cache.SkipReasonOptionalMemberIntegrity,
-					Detail:         detail,
-				})
+				// A SHA512-only member has no SHA-256 for a repair record
+				// to verify against: it is not recorded (spec C5
+				// limitation; reconcile still heals requestable
+				// IndexTargets).
+				if m.SHA256 != "" {
+					integritySkipped = append(integritySkipped, cache.SkippedMember{
+						SnapshotID:     snapshotID,
+						Path:           m.Path,
+						DeclaredSHA256: m.SHA256,
+						Size:           m.Size,
+						Reason:         cache.SkipReasonOptionalMemberIntegrity,
+						Detail:         detail,
+					})
+				}
 				skippedCount++
 				continue
 			}
@@ -1383,9 +1395,10 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			SnapshotID:     snapshotID,
 			Path:           m.Path,
 			BlobHash:       blobHash,
-			DeclaredSHA256: m.SHA256,
+			DeclaredSHA256: blobHash,
 		})
-		fetchedMembers = append(fetchedMembers, m)
+		pendingAliases = append(pendingAliases, aliasRows(snapshotID, m, blobHash)...)
+		fetchedMembers = append(fetchedMembers, verifiedMember(m, blobHash))
 		if requiredGroup != "" {
 			requiredGroupFetched[requiredGroup] = true
 		}
@@ -1498,29 +1511,25 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	}
 
 	// Step 7: by-hash alias rows. apt's Acquire-By-Hash clients fetch
-	// from <suite>/<component>/by-hash/SHA256/<declared_sha256>; a
-	// snapshot_member row at that alias path lets §6.1 resolve those
-	// requests through the same blob. We dedupe — multiple members
-	// with the same content (e.g. "Sources" and "Sources.bz2") would
-	// produce the same alias path and trigger a unique violation.
+	// from <suite>/<component>/by-hash/<algorithm>/<declared hash> — the
+	// strongest hash the Release declares, so SHA512 whenever it is
+	// declared (spec C5) — and a snapshot_member row at that alias path
+	// lets §6.1 resolve those requests through the same blob. Each
+	// fetched member contributes one alias per declared algorithm
+	// (pendingAliases, Step 5). We dedupe — multiple members with the
+	// same content would produce the same alias path and trigger a
+	// unique violation.
 	//
-	// Iterates fetchedMembers, not members: a 4xx-skipped member has
-	// no blob in the pool, so an alias row pointing at its declared
-	// SHA256 would violate the snapshot_member.blob_hash → blob.hash
-	// foreign key.
-	aliasSeen := make(map[string]bool, len(fetchedMembers))
-	for _, m := range fetchedMembers {
-		alias := byHashAliasPath(m.Path, m.SHA256)
-		if alias == "" || aliasSeen[alias] {
+	// Only fetched members have aliases: a 4xx-skipped member has no
+	// blob in the pool, so an alias row pointing at it would violate the
+	// snapshot_member.blob_hash → blob.hash foreign key.
+	aliasSeen := make(map[string]bool, len(pendingAliases))
+	for _, r := range pendingAliases {
+		if aliasSeen[r.Path] {
 			continue
 		}
-		aliasSeen[alias] = true
-		memberRows = append(memberRows, cache.SnapshotMember{
-			SnapshotID:     snapshotID,
-			Path:           alias,
-			BlobHash:       m.SHA256,
-			DeclaredSHA256: m.SHA256,
-		})
+		aliasSeen[r.Path] = true
+		memberRows = append(memberRows, r)
 	}
 
 	// Step 8: parse every Packages member to populate package_hash
@@ -1908,12 +1917,21 @@ func (a *Adopter) adoptMemberWithRetry(ctx context.Context, suite SuiteRef, m Re
 
 // adoptMember handles step 5 for one declared member: try pool reuse
 // (with rehash defense), else fetch from upstream. Returns the blob
-// hash on success — guaranteed to equal m.SHA256, since adoption
-// rejects any byte stream whose hash differs from the declaration.
+// hash on success: the SHA-256 of bytes that matched every hash m
+// declares (spec C5) — m.SHA256 itself when it is declared, the derived
+// SHA-256 for a SHA512-only member (verifyMember).
+//
+// AIDEV-NOTE: a SHA512-only member is never reused from the pool (its
+// SHA-256 is not known before the fetch): it is fetched at every
+// adoption, as small repositories that publish only SHA512 can afford.
 func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMember, acquireByHash bool) (string, error) {
-	exists, err := a.cache.BlobExists(m.SHA256)
-	if err != nil {
-		return "", fmt.Errorf("%w: BlobExists %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
+	exists := false
+	if m.SHA256 != "" {
+		var err error
+		exists, err = a.cache.BlobExists(m.SHA256)
+		if err != nil {
+			return "", fmt.Errorf("%w: BlobExists %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
+		}
 	}
 	if exists {
 		// "Rehash on reuse" — SPEC2 §7.5 step 5. Pool blobs predating
@@ -1921,9 +1939,17 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 		// on-disk content was not verified against a declared hash at
 		// the time. Re-hashing bounds the verified set to bytes we
 		// have *just* confirmed.
-		actual, err := hashFile(a.cache.BlobPath(m.SHA256))
+		actual, actual512, err := hashFileDigests(a.cache.BlobPath(m.SHA256))
 		if err != nil {
 			return "", fmt.Errorf("%w: rehash %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
+		}
+		if actual == m.SHA256 && m.SHA512 != "" && actual512 != m.SHA512 {
+			// The pool bytes are exactly the declared SHA-256, so their
+			// SHA-512 is fixed: the Release's two declarations disagree.
+			// A fetch would bring the same bytes; fail the member (spec
+			// C5: every declared hash must match), and keep the pool file.
+			return "", newMemberErr(ErrAdoptionMemberMismatch, m.Path,
+				fmt.Sprintf("declared SHA512 %s, got %s", shortHash(m.SHA512), shortHash(actual512)))
 		}
 		if actual == m.SHA256 {
 			// Confirmed reuse. Make sure the row exists (may not, e.g.
@@ -1973,18 +1999,17 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 	// FinalizeExpectingHash). On ANY by-hash failure we fall back to the
 	// authoritative plain-path fetch below, which keeps today's exact
 	// semantics (404/410 → skip; size/hash mismatch → typed-fatal).
-	if acquireByHash {
-		if bh := byHashAliasPath(m.Path, m.SHA256); bh != "" {
-			if hash, ferr := a.tryByHashFetch(ctx, suite, m, bh); ferr == nil {
-				return hash, nil
-			} else {
-				a.logger.Debug("adoption_byhash_fallback",
-					"canonical_host", suite.CanonicalHost,
-					"suite_path", suite.SuitePath,
-					"path", m.Path,
-					"err", ferr,
-				)
-			}
+	// The probe uses the strongest declared hash, as apt does (spec §3).
+	if acquireByHash && m.Path != "" {
+		if hash, ferr := a.tryByHashFetch(ctx, suite, m, byHashProbePath(m)); ferr == nil {
+			return hash, nil
+		} else {
+			a.logger.Debug("adoption_byhash_fallback",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"path", m.Path,
+				"err", ferr,
+			)
 		}
 	}
 	return a.fetchMemberURL(ctx, suite, m, m.Path)
@@ -1993,18 +2018,19 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 // tryByHashFetch attempts to fetch a member from its content-addressed
 // by-hash URL (byHashRelPath). It is a SIDE-EFFECT-FREE probe: unlike
 // fetchMemberURL it emits no adoption_member_skipped WARN, increments no
-// skip metric, and — by finalizing through FinalizeExpectingHash — never
-// promotes bytes whose hash differs from the declaration into pool/ (a
-// by-hash URL that serves wrong bytes is rejected with the temp removed,
-// leaving no orphan). On success the verified blob is PutBlob'd and its
-// hash (== m.SHA256) returned. Any error means "by-hash unavailable or
-// wrong"; the caller falls back to the authoritative plain-path fetch.
+// skip metric, and — by verifying every declared hash before the bytes
+// reach pool/ (verifyMember) — never promotes bytes whose hash differs
+// from the declaration into pool/ (a by-hash URL that serves wrong bytes
+// is rejected with the temp removed, leaving no orphan). On success the
+// verified blob is PutBlob'd and its SHA-256 returned. Any error means
+// "by-hash unavailable or wrong"; the caller falls back to the
+// authoritative plain-path fetch.
 func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseMember, byHashRelPath string) (string, error) {
 	target := &fetch.Target{
 		CanonicalHost: suite.CanonicalHost,
 		URL:           buildMemberURL(suite, byHashRelPath),
 	}
-	w, err := a.cache.NewTempBlob()
+	w, err := newMemberWriter(a.cache)
 	if err != nil {
 		return "", err
 	}
@@ -2012,9 +2038,7 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 	if _, err := a.fetcher.Fetch(ctx, target, w); err != nil {
 		return "", err // by-hash 404 (pruned), transport, etc. — silent fallback
 	}
-	// FinalizeExpectingHash gates on the declared sha256 (and size): on
-	// any mismatch the temp is removed and pool/ is never touched.
-	hashHex, err := w.FinalizeExpectingHash(m.SHA256, m.Size)
+	hashHex, err := verifyMember(w, m, m.Size)
 	if err != nil {
 		return "", err
 	}
@@ -2034,9 +2058,10 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 // serve"); a size/content-length mismatch, finalize error, transport
 // error, or other status returns a typed *AdoptionMemberError wrapping
 // ErrAdoptionMemberFetchFailed; a hash mismatch wraps
-// ErrAdoptionMemberMismatch. Verification always uses m.Size / m.SHA256
-// (the signed-Release declarations), independent of which URL served
-// the bytes.
+// ErrAdoptionMemberMismatch. Verification always uses m.Size and every
+// hash m declares (the signed-Release declarations; verifyMember),
+// independent of which URL served the bytes; mismatched bytes never reach
+// pool/.
 func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseMember, relPath string) (string, error) {
 	upstreamURL := buildMemberURL(suite, relPath)
 	target := &fetch.Target{
@@ -2044,7 +2069,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 		URL:           upstreamURL,
 	}
 
-	w, err := a.cache.NewTempBlob()
+	w, err := newMemberWriter(a.cache)
 	if err != nil {
 		return "", fmt.Errorf("%w: NewTempBlob %s: %v", ErrAdoptionDBFailed, m.Path, err)
 	}
@@ -2108,26 +2133,28 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 			fmt.Sprintf("served %d vs declared %d", res.ContentLength, m.Size))
 	}
 
-	hashHex, err := w.Finalize(res.ContentLength)
-	if err != nil {
-		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,
-			fmt.Sprintf("finalize: %v", err))
-	}
-	if hashHex != m.SHA256 {
-		// Mismatch. The blob is now in pool/ under hashHex (its
-		// actual hash, not the declared). Adoption rejects.
-		// Don't promote a divergent blob — but also don't evict it,
-		// since a different snapshot might legitimately reference
-		// hashHex elsewhere. Log loudly.
+	hashHex, err := verifyMember(w, m, res.ContentLength)
+	var mm *memberHashMismatch
+	switch {
+	case errors.As(err, &mm):
+		// Mismatch: adoption rejects, and the bytes never reached pool/
+		// (verifyMember removed the temp). Log loudly.
+		suffix, prefix := "sha256", ""
+		if mm.algo == "SHA512" {
+			suffix, prefix = "sha512", "SHA512 "
+		}
 		a.logger.Warn("adoption_member_mismatch",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"path", m.Path,
-			"declared_sha256", m.SHA256,
-			"actual_sha256", hashHex,
+			"declared_"+suffix, mm.declared,
+			"actual_"+suffix, mm.actual,
 		)
 		return "", newMemberErr(ErrAdoptionMemberMismatch, m.Path,
-			fmt.Sprintf("declared %s, got %s", shortHash(m.SHA256), shortHash(hashHex)))
+			fmt.Sprintf("%sdeclared %s, got %s", prefix, shortHash(mm.declared), shortHash(mm.actual)))
+	case err != nil:
+		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,
+			fmt.Sprintf("finalize: %v", err))
 	}
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {
 		return "", fmt.Errorf("%w: PutBlob %s: %v", ErrAdoptionDBFailed, hashHex, err)
@@ -2239,16 +2266,13 @@ func hashFile(path string) (string, error) {
 // Ubuntu serves it). The "" special case denied root members both the
 // adoption-time by-hash probe (the URL immune to the mirror-sync
 // revision race) and the served alias row — do not reintroduce it.
-// SPEC6_7 §4.
+// SPEC6_7 §4. Since phase E the SHA512 alias (byHashPath) follows the same
+// rule (spec C5).
 func byHashAliasPath(declaredPath, sha256hex string) string {
 	if declaredPath == "" {
 		return ""
 	}
-	dir := path.Dir(declaredPath)
-	if dir == "." || dir == "" {
-		return "by-hash/SHA256/" + sha256hex
-	}
-	return dir + "/by-hash/SHA256/" + sha256hex
+	return byHashPath(declaredPath, "SHA256", sha256hex)
 }
 
 // packageHashBuildResult bundles buildPackageHashes' outputs. SPEC3

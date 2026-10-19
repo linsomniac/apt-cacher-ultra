@@ -64,6 +64,7 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 	}
 
 	repaired := 0
+	decl := a.repairDeclarations(ctx, suite, snapshotID)
 	for _, row := range rows {
 		if ctx.Err() != nil {
 			return
@@ -72,6 +73,12 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 			Path:   row.Path,
 			Size:   row.Size,
 			SHA256: row.DeclaredSHA256,
+		}
+		// Spec C5: the record keeps only the SHA-256; the snapshot's
+		// Release adds every other declared hash (a dual-hash member is
+		// verified against both and gets its SHA512 alias).
+		if d, ok := decl[row.Path]; ok && d.SHA256 == row.DeclaredSHA256 {
+			m = d
 		}
 		// acquireByHash unconditionally: the probe is silent and
 		// side-effect-free, and we no longer hold the Release text to
@@ -97,20 +104,7 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 			continue
 		}
 
-		members := []cache.SnapshotMember{{
-			SnapshotID:     snapshotID,
-			Path:           row.Path,
-			BlobHash:       blobHash,
-			DeclaredSHA256: row.DeclaredSHA256,
-		}}
-		if alias := byHashAliasPath(row.Path, row.DeclaredSHA256); alias != "" {
-			members = append(members, cache.SnapshotMember{
-				SnapshotID:     snapshotID,
-				Path:           alias,
-				BlobHash:       blobHash,
-				DeclaredSHA256: row.DeclaredSHA256,
-			})
-		}
+		members := memberRows(snapshotID, m, blobHash)
 		if rerr := a.cache.RepairSkippedMember(ctx, snapshotID, row.Path, members); rerr != nil {
 			if errors.Is(rerr, cache.ErrSnapshotNotCurrent) {
 				// A newer adoption displaced the snapshot mid-pass; its
@@ -158,6 +152,27 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 		"repaired", repaired,
 		"remaining", len(rows)-repaired,
 	)
+}
+
+// repairDeclarations re-reads the members the snapshot's Release declares
+// (reparseSnapshotRelease, the trust anchor), by path, so a repair checks
+// every declared hash and writes an alias per declared algorithm (spec
+// C5). nil when it cannot: the repair then verifies against the skip
+// records' SHA-256 alone, as before phase E (logged at DEBUG; reconcile
+// reports an unreadable anchor at WARN).
+func (a *Adopter) repairDeclarations(ctx context.Context, suite SuiteRef, snapshotID int64) map[string]ReleaseMember {
+	declared, err := a.reparseSnapshotRelease(ctx, snapshotID)
+	if err != nil {
+		a.logger.Debug("adoption_repair_declarations_unavailable",
+			"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID, "err", err)
+		return nil
+	}
+	out := make(map[string]ReleaseMember, len(declared))
+	for _, m := range declared {
+		out[m.Path] = m
+	}
+	return out
 }
 
 // repairPending reports whether the snapshot has integrity-class skip
