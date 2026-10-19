@@ -34,6 +34,7 @@ type fakeCache struct {
 	snapshots map[int64]cache.SuiteSnapshot   // key: snapshot_id
 	listErr   error
 	getErr    error
+	getErrFn  func() error // consulted after getErr: a non-nil result fails that read
 	putErr    error
 	lookupErr error
 	listHook  func() // called at the top of ListSuites, before the mutex
@@ -58,6 +59,11 @@ func (f *fakeCache) GetSuiteFreshness(ctx context.Context, scheme, host, suitePa
 	defer f.mu.Unlock()
 	if f.getErr != nil {
 		return nil, f.getErr
+	}
+	if f.getErrFn != nil {
+		if err := f.getErrFn(); err != nil {
+			return nil, err
+		}
 	}
 	s, ok := f.suites[keyOf(scheme, host, suitePath)]
 	if !ok {
@@ -281,8 +287,13 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
+// TestCheck_NoCachedInRelease_Skips: a tracked, never-adopted suite whose
+// InRelease url_path row is gone (GC reaped it) is skipped without a
+// write. The suite must be tracked: an untracked one stops at I-4's
+// pre-check and never reaches this branch.
 func TestCheck_NoCachedInRelease_Skips(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("upstream should not be contacted; got %s", r.URL.Path)
 	}))
@@ -917,6 +928,55 @@ func TestCheck_DBReadFailure_LogsAndReturns(t *testing.T) {
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
 	if fc.putCount.Load() != 0 {
 		t.Errorf("write attempted despite read error")
+	}
+}
+
+// TestCheck_RowReadFailsAfterPreCheck_LogsAndSkips reaches checkLocked's
+// own read-error branch: I-4's pre-check read succeeds (the suite is
+// tracked), then checkLocked's read fails. The check logs the failure
+// once, writes nothing, does not panic, keeps the lock-map entry (a read
+// error is not a vanished row) and leaves the mutex free.
+func TestCheck_RowReadFailsAfterPreCheck_LogsAndSkips(t *testing.T) {
+	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
+	var reads atomic.Int64
+	fc.getErrFn = func() error {
+		if reads.Add(1) == 1 {
+			return nil // I-4's pre-check
+		}
+		return fmt.Errorf("simulated DB read failure")
+	}
+	logs := &lockedBuffer{}
+	c, err := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Logger: slog.New(slog.NewTextHandler(logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"}
+	if got := c.check(context.Background(), ref, checkOpts{}).result; got != resultSkipped {
+		t.Errorf("result = %q, want %q", got, resultSkipped)
+	}
+	if n := reads.Load(); n < 2 {
+		t.Fatalf("GetSuiteFreshness called %d times; want the pre-check and checkLocked's read", n)
+	}
+	if fc.putCount.Load() != 0 {
+		t.Errorf("write attempted despite read error")
+	}
+	out := logs.String()
+	if n := strings.Count(out, "freshness: read suite row failed"); n != 1 {
+		t.Errorf("read-failure WARN logged %d times, want 1 (checkLocked's):\n%s", n, out)
+	}
+	if strings.Contains(out, "freshness_check_panicked") {
+		t.Errorf("check panicked on a read error:\n%s", out)
+	}
+	if n := c.LockCount(); n != 1 {
+		t.Errorf("LockCount = %d, want 1: a read error must not drop the entry of a suite that has a row", n)
+	}
+	fc.getErrFn = nil
+	if got := c.check(context.Background(), ref, checkOpts{}).result; got == resultBusy {
+		t.Errorf("the suite mutex is still held after the read-error check")
 	}
 }
 
