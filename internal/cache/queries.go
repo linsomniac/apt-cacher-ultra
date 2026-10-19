@@ -1004,6 +1004,8 @@ func keepNewestNVersionSet(versions []string, n int) map[string]struct{} {
 // NULL). The strict-mode predicate treats that case as "no snapshot
 // is the contract on this host" — falls through to trust-upstream.
 func (c *Cache) HostCurrentSnapshotsCoverage(ctx context.Context, scheme, host string) ([]SnapshotCoverage, error) {
+	// AIDEV-NOTE: spec C5/C10 — unsigned snapshots never count for strict
+	// mode (they vouch nothing), so they are not "snapshots in force" here.
 	const q = `
 SELECT ss.snapshot_id, ss.package_coverage_complete
   FROM suite_snapshot ss
@@ -1013,7 +1015,8 @@ SELECT ss.snapshot_id, ss.package_coverage_complete
    AND sf.suite_path         = ss.suite_path
    AND sf.current_snapshot_id = ss.snapshot_id
  WHERE ss.canonical_scheme = ?
-   AND ss.canonical_host   = ?`
+   AND ss.canonical_host   = ?
+   AND ss.anchor_form     <> 'unsigned'`
 	rows, err := c.db.QueryContext(ctx, q, scheme, host)
 	if err != nil {
 		return nil, fmt.Errorf("HostCurrentSnapshotsCoverage: %w", err)

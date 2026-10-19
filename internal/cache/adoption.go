@@ -20,6 +20,14 @@ var ErrSnapshotAlreadyAdopted = errors.New("cache: snapshot already adopted")
 // from phase F, reaping) and must never become current.
 var ErrSnapshotRetired = errors.New("cache: snapshot is retired")
 
+// ErrUnsignedDowngradeRefused is the never-downgrade refusal of an unsigned
+// candidate whose suite has signed history (spec C5 safeguard 3,
+// refuseUnsignedDowngrade): CommitAdoption's recheck inside the writer
+// transaction returns it with nothing written, and CheckUnsignedDowngrade
+// returns it for the early exits. A refusal state, not a failure: the
+// adopter records it as unsigned_downgrade_refused.
+var ErrUnsignedDowngradeRefused = errors.New("cache: unsigned adoption refused: the suite has signed history")
+
 // ErrSnapshotNaturalKeyAdopted is returned by InsertCandidateSnapshot
 // when a non-retired row matching the natural key (scheme, host,
 // suite_path, COALESCE(inrelease_hash, release_hash), anchor_form)
@@ -397,6 +405,27 @@ WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adopted
 			return fmt.Errorf("%w: snapshot_id=%d", ErrSnapshotRetired, snapshotID)
 		}
 
+		// Step 1a (spec C5 safeguard 3, never-downgrade): an unsigned
+		// candidate is refused, before anything is written, when the
+		// suite has signed history (refuseUnsignedDowngrade: a signed-seen
+		// marker for its base, or an adopted signed snapshot, under either
+		// scheme).
+		//
+		// AIDEV-NOTE: this in-transaction re-read is the authority; the
+		// check's eligibility read and the adopter's are only early exits
+		// (CheckUnsignedDowngrade, the same rule). The suite mutex cannot
+		// close the race on its own: the handler and the checker write
+		// markers in their own writer operations, and the /. twin shares
+		// the base without sharing the mutex. The writer is FIFO, so a
+		// marker write enqueued before this commit is visible here
+		// (TestStoreFetched_MarkerPrecedesALaterWriterOperation; the
+		// adopter's re-mark before an unsigned commit, ruling R-E1).
+		if AnchorForm(form) == FormUnsigned {
+			if err := refuseUnsignedDowngrade(ctx, tx, host, suite); err != nil {
+				return err
+			}
+		}
+
 		// Step 2: insert snapshot_member rows. Each member is validated
 		// against its declared invariants before we touch SQLite — a bad
 		// row should fail loud, not be smuggled past hash validation.
@@ -517,16 +546,16 @@ UPDATE suite_snapshot SET package_coverage_complete = ?
 
 		// Step 3c (freshness-freeze fix, SPEC3 §7.5.1 / SPEC2 §7.4):
 		// seed/sync the metadata anchor url_path row(s) — InRelease
-		// (inline) or Release + Release.gpg (detached) — to point at the
-		// blob this snapshot adopted. Historically adoption left the
-		// anchor's blob_hash pointing at whatever bytes a client
-		// cache-miss last stored, so it diverged from the snapshot's
-		// inrelease_hash and the SPEC4 §5 GC guards (b)/(c) could never
-		// vouch for it; the anchor was then reaped on a low-traffic lull
-		// and the suite froze (the checker silently skips when the anchor
-		// is absent, SPEC2 §7.4). Syncing it here keeps the hash-based
-		// guards matching — the SPEC4 §5 identity guard (d) is the belt
-		// to this suspenders.
+		// (inline), Release + Release.gpg (detached) or Release
+		// (unsigned) — to point at the blob this snapshot adopted.
+		// Historically adoption left the anchor's blob_hash pointing at
+		// whatever bytes a client cache-miss last stored, so it diverged
+		// from the snapshot's anchor hash and the SPEC4 §5 GC guards
+		// (b)/(c) could never vouch for it; the anchor was then reaped on
+		// a low-traffic lull and the suite froze (the checker silently
+		// skips when the anchor is absent, SPEC2 §7.4). Syncing it here
+		// keeps the hash-based guards matching — the SPEC4 §5 identity
+		// guard (d) is the belt to this suspenders.
 		//
 		// AIDEV-NOTE: ON CONFLICT preserves the existing (port-correct)
 		// upstream_url, last_requested_at, and request_count — only
@@ -538,20 +567,24 @@ UPDATE suite_snapshot SET package_coverage_complete = ?
 		// port-less (SPEC §3.2) — acceptable because it only fires when
 		// the original row is already gone.
 		//
-		// AIDEV-TODO(phase E): an unsigned snapshot stores its Release
-		// hash in inrelease_hash; guard by anchor_form.
-		var anchorInRel, anchorRel, anchorRelGPG sql.NullString
+		// AIDEV-NOTE: the files seeded are the form's anchors
+		// (aptpath.AnchorPaths, anchorHash): an unsigned snapshot keeps
+		// its Release hash in inrelease_hash, and its anchor is
+		// <suite>/Release — seeding <suite>/InRelease with it would serve
+		// a Release body as an InRelease (spec C5, phase E).
+		var anchorInRel, anchorRel, anchorRelGPG *string
 		if err := tx.QueryRowContext(ctx, `
 SELECT inrelease_hash, release_hash, release_gpg_hash
   FROM suite_snapshot WHERE snapshot_id = ?`, snapshotID).
 			Scan(&anchorInRel, &anchorRel, &anchorRelGPG); err != nil {
 			return fmt.Errorf("CommitAdoption: read anchor hashes: %w", err)
 		}
-		seedAnchor := func(filename string, h sql.NullString) error {
-			if !h.Valid || h.String == "" {
+		seedAnchor := func(name string) error {
+			h := anchorHash(AnchorForm(form), name, anchorInRel, anchorRel, anchorRelGPG)
+			if h == nil || *h == "" {
 				return nil
 			}
-			anchorPath := suite + filename
+			anchorPath := suite + "/" + name
 			_, err := tx.ExecContext(ctx, `
 INSERT INTO url_path
   (canonical_scheme, canonical_host, path, blob_hash, upstream_url,
@@ -567,18 +600,14 @@ ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
   -- url_path upsert site (the metadata guards already protect anchors,
   -- so this is defense-in-depth, not the primary keep).
   dropped_at      = NULL`,
-				scheme, host, anchorPath, h.String,
+				scheme, host, anchorPath, *h,
 				aptpath.BuildUpstreamURL(scheme, host, anchorPath), now)
 			return err
 		}
-		if err := seedAnchor("/InRelease", anchorInRel); err != nil {
-			return fmt.Errorf("CommitAdoption: seed InRelease anchor: %w", err)
-		}
-		if err := seedAnchor("/Release", anchorRel); err != nil {
-			return fmt.Errorf("CommitAdoption: seed Release anchor: %w", err)
-		}
-		if err := seedAnchor("/Release.gpg", anchorRelGPG); err != nil {
-			return fmt.Errorf("CommitAdoption: seed Release.gpg anchor: %w", err)
+		for _, name := range aptpath.AnchorPaths(form) {
+			if err := seedAnchor(name); err != nil {
+				return fmt.Errorf("CommitAdoption: seed %s anchor: %w", name, err)
+			}
 		}
 
 		// Step 4 (SPEC4 §7.5.1 Rule 2): bump refcount for blobs
@@ -679,6 +708,66 @@ UPDATE suite_snapshot SET adopted_at = ? WHERE snapshot_id = ?`,
 		}
 		return nil
 	})
+}
+
+// rowQuerier is what refuseUnsignedDowngrade reads through: CommitAdoption's
+// writer transaction, or the read pool.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// CheckUnsignedDowngrade is spec C5's never-downgrade rule
+// (refuseUnsignedDowngrade) read outside a transaction, for the early
+// exits: the check's before an unsigned request takes a slot, the
+// adopter's before anything is downloaded. CommitAdoption re-reads the same
+// rule inside its writer transaction; that read is the authority.
+func (c *Cache) CheckUnsignedDowngrade(ctx context.Context, host, suite string) error {
+	return refuseUnsignedDowngrade(ctx, c.db, host, suite)
+}
+
+// refuseUnsignedDowngrade is the never-downgrade rule for an unsigned
+// candidate of suite (spec C5 safeguard 3): ErrUnsignedDowngradeRefused when
+// the suite has signed history on host under either scheme —
+//   - a signed-seen marker for its base (aptpath.MarkerBase: the /. twin
+//     shares it), or
+//   - an adopted, non-retired inline or detached snapshot of the suite or
+//     its twin: the current snapshot, or a displaced one the legacy trust
+//     audit left queued, and so unmarked, after an I/O fault.
+//
+// A retired snapshot (quarantined by the audit, or reaped) is no history:
+// its trust was removed. A read error is returned as it is.
+//
+// AIDEV-NOTE: one rule and one SQL at both never-downgrade points, so the
+// early exits can never admit what the commit refuses. Either scheme counts
+// (design review M-7): a base seen signed over https protects the same base
+// over plain http, the scheme a man-in-the-middle can strip. The displaced
+// snapshot clause is design review M-8.
+func refuseUnsignedDowngrade(ctx context.Context, q rowQuerier, host, suite string) error {
+	base := aptpath.MarkerBase(suite)
+	var scheme string
+	err := q.QueryRowContext(ctx, `
+SELECT canonical_scheme FROM suite_signed_seen
+ WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND base = ?
+ LIMIT 1`, host, base).Scan(&scheme)
+	switch {
+	case err == nil:
+		return fmt.Errorf("%w: %s://%s%s has a signed-seen marker", ErrUnsignedDowngradeRefused, scheme, host, base)
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("unsigned downgrade check: read signed-seen markers: %w", err)
+	}
+	var path, form string
+	err = q.QueryRowContext(ctx, `
+SELECT canonical_scheme, suite_path, anchor_form FROM suite_snapshot
+ WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND suite_path IN (?, ?)
+   AND adopted_at IS NOT NULL AND retired_at IS NULL AND anchor_form IN ('inline', 'detached')
+ LIMIT 1`, host, base, base+"/.").Scan(&scheme, &path, &form)
+	switch {
+	case err == nil:
+		return fmt.Errorf("%w: %s://%s%s has an adopted %s snapshot", ErrUnsignedDowngradeRefused, scheme, host, path, form)
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("unsigned downgrade check: read signed snapshots: %w", err)
+	}
+	return nil
 }
 
 // decrementSnapshotRefcountsTx releases one pin per distinct blob the
@@ -836,13 +925,18 @@ type DeclaredHash struct {
 // (snapshot id included) so an operator can trace which adoptions
 // disagreed.
 func (c *Cache) DeclaredHashesForPath(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
+	// AIDEV-NOTE: spec C5 safeguard 5 — an unsigned snapshot never vouches
+	// a .deb. Adoption builds no package_hash rows for one; the form
+	// filter keeps any that exist out (defence in depth).
 	const q = `
 SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name, sf.suite_path
   FROM package_hash p
   JOIN suite_freshness sf ON sf.current_snapshot_id = p.snapshot_id
+  JOIN suite_snapshot ss  ON ss.snapshot_id = p.snapshot_id
  WHERE p.canonical_scheme = ?
    AND p.canonical_host   = ?
-   AND p.path             = ?`
+   AND p.path             = ?
+   AND ss.anchor_form    <> 'unsigned'`
 	rows, err := c.db.QueryContext(ctx, q, scheme, host, path)
 	if err != nil {
 		return nil, fmt.Errorf("DeclaredHashesForPath: %w", err)

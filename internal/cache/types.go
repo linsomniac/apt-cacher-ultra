@@ -197,6 +197,32 @@ type SuiteSnapshot struct {
 	PackageCoverageComplete bool
 }
 
+// AnchorHash returns the hash of the snapshot's anchor file name
+// ("InRelease", "Release" or "Release.gpg"), or nil when the snapshot's
+// form has no such anchor (aptpath.AnchorPaths).
+func (s *SuiteSnapshot) AnchorHash(name string) *string {
+	return anchorHash(s.Form, name, s.SingleAnchorHash, s.ReleaseHash, s.ReleaseGPGHash)
+}
+
+// anchorHash maps an anchor file of a snapshot of form to the hash column
+// that holds it (spec C5): the single-anchor slot holds InRelease for the
+// inline form and Release for the unsigned one.
+//
+// AIDEV-NOTE: the one place the column-to-file mapping lives; never read
+// inrelease_hash as "the InRelease" (an unsigned snapshot keeps its
+// Release there).
+func anchorHash(form AnchorForm, name string, single, release, releaseGPG *string) *string {
+	switch {
+	case name == "InRelease" && form == FormInline, name == "Release" && form == FormUnsigned:
+		return single
+	case name == "Release" && form == FormDetached:
+		return release
+	case name == "Release.gpg" && form == FormDetached:
+		return releaseGPG
+	}
+	return nil
+}
+
 // SnapshotCoverage is a compact lookup result for the SPEC3 §6.1
 // strict-mode predicate: per current snapshot on a given (scheme, host),
 // the snapshot id and its package_coverage_complete bit. The handler

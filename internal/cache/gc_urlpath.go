@@ -259,6 +259,12 @@ func (c *Cache) urlPathRetainedTx(ctx context.Context, tx *sql.Tx,
 	// anchor hashes, and the identity anchor that keeps freshness from
 	// freezing on a low-traffic lull. These protect metadata only; .deb
 	// retention is governed by the mirror rule below.
+	//
+	// AIDEV-NOTE: guard (d) keys the anchor path on the snapshot's form
+	// (aptpath.AnchorPaths), never on which hash column is set: an unsigned
+	// snapshot keeps its Release hash in inrelease_hash, and its anchor is
+	// <suite>/Release (spec C5; phase E resolved the AIDEV-TODO that sat in
+	// the SQL, deferred minor A-29).
 	var guarded int
 	err := tx.QueryRowContext(ctx, `
 SELECT
@@ -271,11 +277,10 @@ SELECT
   OR EXISTS(SELECT 1 FROM suite_freshness sf
               JOIN suite_snapshot ss ON ss.snapshot_id = sf.current_snapshot_id
              WHERE sf.canonical_scheme = ? AND sf.canonical_host = ?
-               -- AIDEV-TODO(phase E): an unsigned snapshot stores its
-               -- Release hash in inrelease_hash; guard by anchor_form.
-               AND ((ss.inrelease_hash IS NOT NULL AND ? = sf.suite_path || '/InRelease')
-                 OR (ss.release_hash   IS NOT NULL AND ? IN (sf.suite_path || '/Release', sf.suite_path || '/Release.gpg'))))`,
-		blobHash, blobHash, blobHash, blobHash, scheme, host, path, path).Scan(&guarded)
+               AND ((ss.anchor_form = 'inline'   AND ? = sf.suite_path || '/InRelease')
+                 OR (ss.anchor_form = 'detached' AND ? IN (sf.suite_path || '/Release', sf.suite_path || '/Release.gpg'))
+                 OR (ss.anchor_form = 'unsigned' AND ? = sf.suite_path || '/Release')))`,
+		blobHash, blobHash, blobHash, blobHash, scheme, host, path, path, path).Scan(&guarded)
 	if err != nil {
 		return false, fmt.Errorf("urlPathRetainedTx: guards: %w", err)
 	}
