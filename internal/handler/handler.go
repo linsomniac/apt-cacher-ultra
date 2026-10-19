@@ -59,6 +59,20 @@ type FreshnessChecker interface {
 	Check(ctx context.Context, scheme, host, suitePath string)
 }
 
+// AdoptionWaiter is strict mode's view of the freshness checker's signed
+// adoptions in flight (spec C10, D10; *freshness.Checker implements it).
+// nil (adoption disabled) refuses at once, as before.
+type AdoptionWaiter interface {
+	// AdoptionsInFlight reports whether a signed adoption is in flight on
+	// the canonical host.
+	AdoptionsInFlight(host string) bool
+	// WaitHostAdoptions waits until none is — at most min(15 s, 25 s −
+	// the time since the request started at start) — and reports whether
+	// to re-run the lookup once: false when 64 requests already wait on
+	// the host or less than 1 s of the budget is left.
+	WaitHostAdoptions(ctx context.Context, host string, start time.Time) bool
+}
+
 // Config carries handler dependencies. All non-pointer fields are
 // optional and defaulted in New.
 type Config struct {
@@ -77,6 +91,11 @@ type Config struct {
 	// triggers are disabled (tests, or operators who explicitly
 	// disabled freshness in config).
 	Freshness FreshnessChecker
+
+	// Adoptions lets strict mode wait for adoptions in flight on the
+	// request's host before refusing an unvouched .deb (spec C10). nil:
+	// no wait.
+	Adoptions AdoptionWaiter
 
 	// Serve is the SPEC §6.4 / §8 stale-serve policy. Zero value is
 	// safe (both flags off): the handler will always 502 on a metadata
@@ -150,6 +169,7 @@ type Handler struct {
 	sf        *sfGroup
 	sem       *hostsem.Sem
 	freshness FreshnessChecker
+	adoptions AdoptionWaiter
 	serve     config.ServeConfig
 	logger    *slog.Logger
 
@@ -249,6 +269,7 @@ func New(cfg Config) (*Handler, error) {
 		sf:                      newSFGroup(),
 		sem:                     cfg.HostLimiter,
 		freshness:               cfg.Freshness,
+		adoptions:               cfg.Adoptions,
 		serve:                   cfg.Serve,
 		logger:                  logger,
 		refuseUnvouchedDebs:     cfg.RefuseUnvouchedDebs,
@@ -369,6 +390,12 @@ var (
 	// (Phase 2 declared-hash failure) and bad_gateway (Phase 1 fetch
 	// failure) so operators can grep for the strict-mode contribution.
 	ErrUnvouchedDebRefused = errors.New("handler: unvouched .deb refused (strict mode)")
+
+	// errUnvouchedRetryable: strict mode would refuse a missed .deb while
+	// a signed adoption is in flight on its host (spec C10). runFetch
+	// returns it inside singleflight; serveCacheMiss waits and retries
+	// once, and turns a second one into ErrUnvouchedDebRefused.
+	errUnvouchedRetryable = errors.New("handler: unvouched .deb, an adoption is in flight on the host")
 )
 
 // ServeHTTP routes one apt request through the cache.
@@ -689,7 +716,7 @@ func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *pro
 
 	var v packageValidation
 	if !req.IsMetadata {
-		if served, outcome, status, body, fellThrough, gotV := h.checkPackageHash(w, r, req, *row.BlobHash); fellThrough {
+		if served, outcome, status, body, fellThrough, gotV := h.checkPackageHash(w, r, req, *row.BlobHash, start); fellThrough {
 			return false, "", 0, 0, packageValidation{}
 		} else if served {
 			return true, outcome, status, body, gotV
@@ -758,18 +785,20 @@ var byHashSuffixRegex = regexp.MustCompile(`/by-hash/SHA256/([0-9a-f]{64})$`)
 // "snapshot is the contract" invariant must not be bypassed; gating on
 // non-adoption upholds it.
 //
-// Three security gates apply *before* a serve:
+// Four security gates apply *before* a serve (deferred minor D-33):
 //
 //  1. SuitePath != "" — by-hash URLs are only meaningful under
 //     /dists/<suite>/. A request without a suite path is not a legitimate
 //     apt by-hash request; reject without consulting the pool.
-//  2. HostAllowed — ServeHTTP delays the §6.6 allowlist check until after
+//  2. A known suite (sr.tracked: the suite has a row, I-4, spec C3) — a
+//     minted suite name falls through to the miss path.
+//  3. HostAllowed — ServeHTTP delays the §6.6 allowlist check until after
 //     tryCacheHit (lines 213/225). For Phase 1/2 hits that's safe because
 //     url_path rows are host-scoped — only previously-allowed hosts have
 //     them. The pool is *not* host-scoped, so the fallback explicitly
 //     re-runs the allowlist check; otherwise a client could request a
 //     known SHA256 under a disallowed host and bypass §6.6.
-//  3. Same-host provenance (HostHasBlob) — the blob must have been
+//  4. Same-host provenance (HostHasBlob) — the blob must have been
 //     fetched under this host before. Without this, a caller who learns
 //     a SHA256 from one cached host could request it under any other
 //     allowlisted host and receive content that host has never vouched
@@ -928,6 +957,15 @@ func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
 	}
 }
 
+// logUnvouchedRefused logs the miss path's strict-mode refusal.
+func (h *Handler) logUnvouchedRefused(req *proxy.Request, count int) {
+	h.logger.Info("unvouched_deb_refused",
+		"canonical_host", req.CanonicalHost,
+		"path", req.Path,
+		"current_snapshot_count", count,
+	)
+}
+
 // checkPackageHash runs the SPEC2 §6.1 defense-in-depth on a .deb hit.
 //
 // Returns served=true when the function wrote a 502 (conflict or strict-
@@ -945,7 +983,16 @@ func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
 // the matching row's Package name so logRequest can surface
 // validated_hash=true + package_name=<name>. The mismatch + conflict
 // branches also increment acu_serve_hash_validated_total{outcome=mismatch}.
-func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
+func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, start time.Time) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
+	return h.checkPackageHashWait(w, r, req, blobHash, start, true)
+}
+
+// checkPackageHashWait is checkPackageHash; mayWait lets a strict-mode
+// refusal first wait for the host's signed adoptions in flight and run
+// the lookup once more (spec C10: at most 15 s and at most 25 s since the
+// request started at start, at most 64 waiters per host, beyond which the
+// refusal is immediate).
+func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, start time.Time, mayWait bool) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
 	rows, err := h.cache.DeclaredHashesForPath(r.Context(),
 		req.CanonicalScheme, req.CanonicalHost, req.Path)
 	if err != nil {
@@ -975,6 +1022,10 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 		switch sm, snapID, count := h.classifyStrictMode(r.Context(),
 			req.CanonicalScheme, req.CanonicalHost); sm {
 		case strictRefuse:
+			if mayWait && h.adoptions != nil && h.adoptions.AdoptionsInFlight(req.CanonicalHost) &&
+				h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost, start) {
+				return h.checkPackageHashWait(w, r, req, blobHash, start, false)
+			}
 			st, body := h.refuseUnvouchedDeb(w, req.CanonicalHost, req.Path, count)
 			return true, "unvouched_deb_refused", st, body, false, packageValidation{}
 		case strictPassthrough:
@@ -1348,7 +1399,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	key := req.CanonicalScheme + "|" + req.CanonicalHost + "|" + req.Path
 
 	file, trackedAtStart := sr.file, sr.tracked
-	res, shared, waiters := h.sf.Do(key, func() sfResult {
+	fetchOnce := func() sfResult {
 		// Use the handler's lifecycle ctx, not the request ctx. Two
 		// goals: (1) a leader who disconnects must not kill the fetch
 		// for waiters that are still connected, and (2) on graceful
@@ -1358,7 +1409,35 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 		// keep the cache from closing for several minutes after the
 		// drain budget elapses.
 		return h.runFetch(h.lifecycleCtx, req, file, trackedAtStart)
-	})
+	}
+	res, shared, waiters := h.sf.Do(key, fetchOnce)
+	if errors.Is(res.err, errUnvouchedRetryable) {
+		// Spec C10: strict mode would refuse this .deb while a signed
+		// adoption runs on its host. Wait for it here — outside
+		// singleflight and the host slot — at most 15 s, then retry the
+		// miss once; a second "retryable" is the refusal.
+		//
+		// AIDEV-NOTE: the retry is one more singleflight call: requests
+		// that waited together coalesce again, and a waiter over the
+		// 64-per-host cap, or with less than 1 s of its 25 s budget left,
+		// is refused at once. A client that left while it waited gets no
+		// retry (it ends client_canceled). The refusal is logged once per
+		// fetch, by the singleflight leader (design review O1), as
+		// runFetch logged it before phase E.
+		waited := h.adoptions != nil && h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost, start)
+		switch {
+		case r.Context().Err() != nil:
+			res.err = r.Context().Err()
+		case waited:
+			res, shared, waiters = h.sf.Do(key, fetchOnce)
+		}
+		if errors.Is(res.err, errUnvouchedRetryable) {
+			if !shared {
+				h.logUnvouchedRefused(req, res.snapshotCount)
+			}
+			res.err = ErrUnvouchedDebRefused
+		}
+	}
 
 	// SPEC §10: leader emits a structured log line whenever waiters
 	// joined the call (i.e. coalescing actually occurred). A leader
@@ -1778,11 +1857,13 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 				switch sm, snapID, count := h.classifyStrictMode(ctx,
 					req.CanonicalScheme, req.CanonicalHost); sm {
 				case strictRefuse:
-					h.logger.Info("unvouched_deb_refused",
-						"canonical_host", req.CanonicalHost,
-						"path", req.Path,
-						"current_snapshot_count", count,
-					)
+					// Spec C10: with a signed adoption in flight on the
+					// host, end this attempt (releasing the host slot)
+					// and let serveCacheMiss wait outside singleflight.
+					if h.adoptions != nil && h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
+						return sfResult{err: errUnvouchedRetryable, snapshotCount: count}
+					}
+					h.logUnvouchedRefused(req, count)
 					return sfResult{err: ErrUnvouchedDebRefused}
 				case strictPassthrough:
 					h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)

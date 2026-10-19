@@ -190,6 +190,7 @@ type Checker struct {
 	cooldown            time.Duration
 	refresh             time.Duration
 	maxSuites           int
+	inflight            *hostAdoptions // spec C10: signed adoptions in flight per host
 	maxBody             int64
 	logger              *slog.Logger
 	now                 func() time.Time
@@ -309,6 +310,7 @@ func New(cfg Config) (*Checker, error) {
 		adoptionRing:        cfg.AdoptionRing,
 		gpgReasonClassifier: cfg.GPGReasonClassifier,
 		admission:           newAdmission(maxConc),
+		inflight:            newHostAdoptions(),
 		maxAdoptionDuration: maxDur,
 	}, nil
 }
@@ -538,8 +540,18 @@ func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
 // adoption_abandoned_at_shutdown).
 func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) {
 	c.adoptionWg.Add(1)
+	// Spec C10: a signed adoption is in flight from here (before the
+	// goroutine runs, so a request right after the check sees it) until
+	// the goroutine has returned, its commit done.
+	signed := req.form != adoptionFormUnsigned
+	if signed {
+		c.inflight.begin(req.suite.CanonicalHost)
+	}
 	go func() {
 		defer c.adoptionWg.Done()
+		if signed {
+			defer c.inflight.end(req.suite.CanonicalHost)
+		}
 		defer mu.Unlock()
 		defer l.release()
 		// SPEC5 §10.4.3 / §9.7.7: time the adoption from goroutine

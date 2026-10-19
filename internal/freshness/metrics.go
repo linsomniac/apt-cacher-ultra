@@ -33,7 +33,8 @@ import (
 // (spec C7, unlabelled gauge); acu_freshness_waiting_for_slot (spec C4,
 // unlabelled gauge); acu_freshness_unlogged_panics_total (deferred minor
 // B-44, unlabelled counter); acu_repair_deferred_total (deferred minor
-// B-31, counter by host). The flip barrier's acu_flip_hold_skipped_total,
+// B-31, counter by host); acu_strict_adoption_waits_total (spec C10,
+// counter by host). The flip barrier's acu_flip_hold_skipped_total,
 // acu_flip_hold_expired_total, acu_flip_quiet_cut_short_total,
 // acu_flip_waiters_over_cap_total, acu_flip_slow_anchor_reads_total and
 // acu_flip_gate_panics_total (spec C8, unlabelled counters) and
@@ -57,6 +58,15 @@ var (
 	freshnessAnchorReconstructedTotal = metrics.NewCounterWithCap(
 		"acu_freshness_anchor_reconstructed_total",
 		"Metadata anchor url_path rows reconstructed during freshness recovery, by host (SPEC2 §7.4).",
+		metrics.DefaultMaxSeries,
+		"host",
+	)
+
+	// strictWaitsTotal counts requests that waited for a host's signed
+	// adoptions in flight before strict mode decided (spec C10).
+	strictWaitsTotal = metrics.NewCounterWithCap(
+		"acu_strict_adoption_waits_total",
+		"Unvouched .deb requests that waited for the host's adoptions in flight before strict mode decided, by host (spec C10).",
 		metrics.DefaultMaxSeries,
 		"host",
 	)

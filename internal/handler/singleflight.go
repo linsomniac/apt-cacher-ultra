@@ -37,6 +37,9 @@ type sfResult struct {
 	unproven bool
 	// vouchingSuites: the suites whose snapshots vouched a validated .deb.
 	vouchingSuites []string
+	// snapshotCount: the strict-mode current_snapshot_count of an
+	// errUnvouchedRetryable result, for the refusal's log line.
+	snapshotCount int
 }
 
 // sfCall is a single in-flight singleflight call. The leader populates

@@ -1122,6 +1122,12 @@ func handlerConfig(
 	if freshChecker != nil {
 		guard = freshChecker
 	}
+	// Spec C10: strict mode waits for the checker's adoptions in flight;
+	// with adoption disabled there are none (nil: no wait).
+	var adoptions handler.AdoptionWaiter
+	if freshChecker != nil && adopter != nil {
+		adoptions = freshChecker
+	}
 	return handler.Config{
 		Parser:              parser,
 		Cache:               c,
@@ -1136,6 +1142,7 @@ func handlerConfig(
 		KeepDisplaced:       cfg.GC.KeepDisplaced,
 		MaxSuites:           cfg.Freshness.MaxSuites,
 		SuiteGuard:          guard,
+		Adoptions:           adoptions,
 	}
 }
 
