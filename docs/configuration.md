@@ -341,7 +341,7 @@ Six outcomes are refusals, not failures, and are shown as "refused: …" on the 
 - `unsigned_unconfirmed`: an unsigned repository's first adoption waits for a second observation of the same `Release` (see *Anchor forms and unsigned repositories*).
 - `unsigned_downgrade_refused`: the suite has been seen signed, so its unsigned `Release` is not adopted.
 - `unsigned_too_large`: an unsigned `Release` declares more than 1,000 files.
-- `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too.
+- `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too. While a failed adoption of the suite is recorded (its move to the other form failed), the status page shows that failure's reason instead, and the suite is paced the same way.
 
 Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO) and is not counted by `acu_adoption_failing_suites`. `upstream_older` and `rollback_refused` show no lag (the cache already serves content at least as new as upstream's); the other four keep their lag, because the suite is in fact behind. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
 
@@ -397,7 +397,10 @@ JSON's `suites[].anchor_form` names a suite's form.
 
 Suites move between the signed forms by themselves. A detached suite asks
 for `InRelease` on every check and moves to the inline form as soon as
-upstream serves one. When a suite's current anchor (`InRelease` for
+upstream serves one — unless an adoption of the suite failed and its retry
+time has not come: then the move waits for that retry time (at most an
+hour), so a publish that fails in both forms (a signing key the cache does
+not trust) is attempted once per form per retry, not at every check. When a suite's current anchor (`InRelease` for
 inline, `Release` for detached and unsigned) is absent, the status page
 shows "refused: anchor_absent" while the snapshot keeps serving. The suite
 then asks for its anchor again only at its retry times (2 minutes,
@@ -415,6 +418,11 @@ detached suite whose `Release` changes while its `Release.gpg` is absent
 shows "refused: anchor_absent" and is paced the same way; a `Release.gpg`
 request that fails — a 5xx, a timeout — logs WARN `freshness: Release.gpg
 fetch failed; deferring adoption` and is tried again at the next check).
+When a failed adoption is already recorded for the suite — typically the
+move to its other signed form failed — the status page keeps showing that
+failure's reason (for example `gpg_failed`) instead of "refused:
+anchor_absent", and the suite is paced by its retry time the same way;
+the first check after each retry asks upstream once more.
 An unsigned suite moves to a signed form at the first check that finds
 `InRelease` or `Release.gpg`. From that check on the cache has seen the
 suite signed, so it is never adopted unsigned again, even when the signed

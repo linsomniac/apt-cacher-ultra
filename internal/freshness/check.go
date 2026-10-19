@@ -137,9 +137,11 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 		return
 	}
 	// Ruling PE-2: an adopted suite in the refusal state anchor_absent is
-	// paced by its record: no request before the record's retry time.
+	// paced by its record: no request before the record's retry time. So is
+	// one whose last answered check found its anchor absent while an
+	// attempt's record holds (ruling PE-10: pacedAbsentAnswer).
 	if c.adopter != nil {
-		if gate := c.retryGateFor(cur, now); pacedAbsent(gate) {
+		if gate := c.retryGateFor(cur, now); pacedAbsent(gate) || c.pacedAbsentAnswer(suiteKey(scheme, host, suitePath), gate) {
 			c.applyClamp(ctx, cur, gate, now)
 			c.logger.Debug("freshness: anchor_absent suite paced until its retry",
 				"canonical_host", host, "suite_path", suitePath)
@@ -231,6 +233,13 @@ func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache
 		logAttrs = append(logAttrs, "reason", e.reason)
 	}
 	out.report = checkReport{result: e.result, signedCurrent: e.signedCurrent}
+	// Ruling PE-10 (b): the answer the next check is paced by
+	// (pacedAbsentAnswer).
+	if key := suiteKey(suite.CanonicalScheme, host, suitePath); e.result == "anchor_absent" {
+		c.absentAnswered.Store(key, struct{}{})
+	} else {
+		c.absentAnswered.Delete(key)
+	}
 	c.logger.Info("freshness_check", logAttrs...)
 	freshnessCheckTotal.Inc(e.result, host)
 	rp := repairIfUnchanged(e.result, suite, cur)
@@ -260,6 +269,7 @@ func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache
 // every Conditional error still extends the streak, as before phase E.
 func (c *Checker) failCheck(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, nowUnix int64, form string, err error) {
 	host, suitePath := suite.CanonicalHost, suite.SuitePath
+	c.absentAnswered.Delete(suiteKey(suite.CanonicalScheme, host, suitePath)) // ruling PE-10 (b)
 	cur.LastCheckAt = &nowUnix
 	cur.CheckFailCount++
 	if perr := c.cache.UpdateSuiteFreshness(ctx, *cur); perr != nil {
@@ -733,8 +743,9 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 			// absent (ruling R-E4), never adopted. The refusal state
 			// anchor_absent makes it visible and paces the suite
 			// (pacedAbsent); a record the lateral InRelease still holds
-			// keeps its own schedule. last_success_at stays, as for an
-			// absent current anchor (spec C4).
+			// keeps its own reason and schedule, and paces the suite the
+			// same way (pacedAbsentAnswer, ruling PE-10). last_success_at
+			// stays, as for an absent current anchor (spec C4).
 			if !lateralHeld {
 				c.recordAdoptionFailure(&adoptionRequest{suite: suite, key: anchorAbsentKey}, cache.ReasonAnchorAbsent)
 			}

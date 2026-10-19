@@ -561,9 +561,15 @@ unchanged, observation only):
    **Current snapshot detached** — also probe `InRelease` each check;
    *present* → inline adoption request (lateral; lateral content whose
    adoption failed keeps its record, which the detached anchor's
-   `unchanged` does not clear). Then the conditional GET of `Release` as
-   today; a changed `Release` whose `Release.gpg` is *absent* records
-   `anchor_absent` and is never adopted (phase E, design review M-14).
+   `unchanged` does not clear). While any record of the suite is active
+   and not due, no lateral attempt is made (retry discipline beats
+   cross-form eagerness: a publish that fails in both forms is attempted
+   once per form per retry window; a good `InRelease` waits at most the
+   record's retry time behind a failing detached record; phase E, ruling
+   PE-10). Then the conditional GET of `Release` as today; a changed
+   `Release` whose `Release.gpg` is *absent* records `anchor_absent` and is
+   never adopted (phase E, design review M-14), unless a failing lateral
+   record holds: that record keeps its reason and schedule.
    **Current anchor absent** (inline: `InRelease`; detached and unsigned:
    `Release`) → the first absent observation records the refusal state
    `anchor_absent` (visible at once; `last_success_at` not bumped;
@@ -583,7 +589,14 @@ unchanged, observation only):
    unsigned suite's own form with new bytes is its update; for a signed
    suite an unsigned candidate, or nothing, is recorded again — never
    unsigned from signed. A record from an adoption attempt (a failed
-   lateral move) keeps its own C7 schedule (phase E, deviation 1).
+   lateral move) keeps its own C7 schedule (phase E, deviation 1). Once a
+   check has found the current anchor (or a changed `Release`'s signature)
+   absent behind such a record, the record paces the suite as an
+   `anchor_absent` record does — no request and no scheduler check before
+   its retry time — while the status page shows the attempt's reason (for
+   example `gpg_failed`), not `anchor_absent` (phase E, ruling PE-10). The
+   check after each attempt asks once more, so the current form's own new
+   content is never held behind the record.
 2. **Current snapshot unsigned** — probe `InRelease` and `Release.gpg`; if
    either is *present* → mark the base (C3) and make a signed adoption
    request (upgrade): from then on the suite is never adopted unsigned

@@ -227,6 +227,13 @@ type Checker struct {
 	// Reconcile that loaded it unwinds, or after a read error (LockCount).
 	locks sync.Map
 
+	// absentAnswered holds the keys of suites whose last answered check
+	// ended anchor_absent (ruling PE-10 b, pacedAbsentAnswer): set and
+	// cleared by the check tails (finishCheck, failCheck), dropped with the
+	// suite's lock-map entry (unlockDropped), so bounded by the suite table
+	// as locks is. In memory only; a restart costs one check that asks.
+	absentAnswered sync.Map
+
 	// lockLoadedHook, when set (tests only), runs in lockSuite — so in
 	// check, Reconcile and HoldSuite — between loading a suite's mutex and
 	// TryLock: the window I-4's re-validation closes.

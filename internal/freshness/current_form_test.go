@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -912,5 +913,376 @@ func TestCheck_AbsentAnchorThatComesBackIsUnchanged(t *testing.T) {
 	row := r.row()
 	if row.AdoptionFailCount != 0 || row.CurrentSnapshotID == nil || *row.CurrentSnapshotID != snap.SnapshotID {
 		t.Fatalf("row %+v: want the record cleared and snapshot %d still current", row, snap.SnapshotID)
+	}
+}
+
+// Ruling PE-10 (a) (review fix round 1, Task 7): a detached suite whose
+// upstream serves one publish that fails in both signed forms (a signing
+// key not imported) is attempted once per form, then once per retry
+// window. While any record is active and not due no cross-form attempt is
+// made; only the current form's new content is attempted at once (spec
+// C7), and only while the record is the other form's. Before the ruling
+// the two forms took the one record in turn and every check was an
+// attempt (6 in six checks 20 s apart, 1 a minute after that).
+func TestCheck_BothSignedFormsFailingAreAttemptedOncePerRetryWindow(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptDetached()
+	in := r.release("v2", 0)
+	rel, sig := r.releaseText("v2", 0), armoredSig("v2 sig")
+	kIn, kDet := contentKey(adoptionFormInline, in, nil, nil), contentKey(adoptionFormDetached, nil, rel, sig)
+	r.ver.reject(kIn)
+	r.ver.reject(kDet)
+	r.up.set(in)
+	r.up.setAt(rigReleaseURL, rel)
+	r.up.setAt(rigReleaseGPGURL, sig)
+	for range 6 { // the reviewer's probe: six checks 20 s apart
+		r.clock.advance(20 * time.Second)
+		r.check()
+	}
+	if r.ver.calls() != 2 {
+		t.Fatalf("six checks 20 s apart made %d attempts, want 2 (one per form)", r.ver.calls())
+	}
+	for i := range 240 { // four hours of checks a minute apart
+		row := r.row()
+		calls := r.ver.calls()
+		r.clock.advance(time.Minute)
+		g := r.checker.retryGateFor(&row, r.clock.now())
+		r.check()
+		n := r.ver.calls() - calls
+		switch after := r.row(); {
+		case n > 1:
+			t.Fatalf("check %d made %d attempts", i, n)
+		case n == 1 && g.active && !g.due && (g.hash != kIn || strOf(after.AdoptionFailHash) != kDet):
+			t.Fatalf("check %d: an attempt of %s inside the retry window of record %s; only the current form's new content may be attempted, behind the other form's record",
+				i, strOf(after.AdoptionFailHash), g.hash)
+		}
+	}
+	// Retry windows of 2 min doubling to 1 h, one attempt per form per
+	// window: 2 + 10 in the four hours (one a minute without the ruling).
+	t.Logf("%d attempts in four hours and two minutes", r.ver.calls())
+	if got := r.ver.calls(); got > 12 {
+		t.Fatalf("%d attempts in four hours and two minutes, want at most 12", got)
+	}
+}
+
+// pacedWindowRun runs ticks scheduler ticks (refresh/4 apart) on r, checking
+// the suite whenever suiteDue queues it, and returns the scheduler checks
+// and the upstream requests (counted by reqs) they made. It fails t when a
+// record's retry window sees more than one check that made a request: the
+// first answered check after an attempt re-observes the absence (it must,
+// or the current form's own new content would wait behind a failing record
+// forever); every later check inside that window is paced (ruling PE-10 b).
+func pacedWindowRun(t *testing.T, r *retryRig, ticks int, reqs func() int) (checks, requests int) {
+	t.Helper()
+	inWindow := map[string]int{}
+	start := reqs()
+	for range ticks {
+		r.clock.advance(15 * time.Minute / 4)
+		row := r.row()
+		if !r.checker.suiteDue(row, r.clock.now()) {
+			continue
+		}
+		checks++
+		g := r.checker.retryGateFor(&row, r.clock.now())
+		n := reqs()
+		r.check()
+		if reqs() > n && g.active && !g.due {
+			id := fmt.Sprintf("%s/%d", g.hash, row.AdoptionFailCount)
+			if inWindow[id]++; inWindow[id] > 1 {
+				t.Fatalf("record %s: %d checks inside its retry window made requests, want at most 1", id, inWindow[id])
+			}
+		}
+	}
+	return checks, reqs() - start
+}
+
+// Ruling PE-10 (b): design review M-14 with a held lateral record — a
+// detached suite whose changed Release comes without its Release.gpg while
+// a failing lateral InRelease holds the record. The check reports
+// anchor_absent and the record keeps the attempt's reason (gpg_failed, not
+// anchor_absent: it is the lateral content's), and the record paces the
+// suite as an anchor_absent record would: a client check inside its window
+// makes no request and the scheduler does not queue it. Before the ruling
+// the suite stayed stale and unpaced (20 scheduler checks and 50 requests
+// in two hours, each with full bodies).
+func TestCheck_AbsentSignatureWithAHeldLateralRecordIsPacedByIt(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptDetached()
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	r.clock.advance(time.Minute)
+	r.check() // the lateral attempt fails: a record for the InRelease content
+	r.up.setAt(rigReleaseURL, r.releaseText("v2", 0))
+	r.up.setFail(rigReleaseGPGURL, &fetch.StatusError{Code: 404})
+	reqs := func() int {
+		return len(r.up.etagsSent(rigAnchorURL)) + len(r.up.etagsSent(rigReleaseURL)) + len(r.up.etagsSent(rigReleaseGPGURL))
+	}
+	r.clock.advance(20 * time.Second)
+	r.check() // M-14 behind the held lateral record
+	if row := r.row(); lastResult(r) != "anchor_absent" || strOf(row.AdoptionFailReason) != "gpg_failed" ||
+		strOf(row.AdoptionFailHash) != hashOf(bad) {
+		t.Fatalf("result %q, record %q for %s; want anchor_absent shown and the lateral attempt's record (gpg_failed) kept",
+			lastResult(r), strOf(row.AdoptionFailReason), strOf(row.AdoptionFailHash))
+	}
+	// A long retry time (as the record's backoff reaches), so the window
+	// outlasts periodic_refresh.
+	if err := r.cache.SetAdoptionNextRetry(context.Background(), "http", rigHost, rigSuite, r.clock.now().Add(time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	n := reqs()
+	for range 3 {
+		r.clock.advance(20 * time.Second)
+		r.check()
+	}
+	if got := reqs() - n; got != 0 {
+		t.Fatalf("client checks inside the record's window made %d requests, want none", got)
+	}
+	r.clock.advance(16 * time.Minute) // stale (periodic_refresh 15 min), the record still not due
+	if r.checker.suiteDue(r.row(), r.clock.now()) {
+		t.Fatal("the scheduler queues the stale suite inside the record's window")
+	}
+	r.check()
+	if got := reqs() - n; got != 0 {
+		t.Fatalf("a check of the stale suite inside the record's window made %d requests, want none", got)
+	}
+	checks, requests := pacedWindowRun(t, r, 32, reqs) // two hours
+	t.Logf("two hours: %d scheduler checks, %d upstream requests, %d attempts", checks, requests, r.ver.calls())
+	if checks > 8 || requests > 12 {
+		t.Fatalf("two hours: %d scheduler checks, %d upstream requests; want at most 8 and 12 (paced by the record)", checks, requests)
+	}
+}
+
+// Ruling PE-10 (b): an inline suite whose InRelease disappeared and whose
+// lateral move to the detached form found by the probe tree failed. The
+// attempt's record (not anchor_absent) holds; the absent current anchor is
+// asked for again only at its retry times. Before the ruling the suite sat
+// stale and unpaced: 30 scheduler checks and 35 InRelease requests in three
+// hours (7 and 12 when paced by an anchor_absent record).
+func TestCheck_AbsentAnchorWithAFailedLateralMoveIsPacedByItsRecord(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopt()
+	r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 404})
+	rel, sig := r.releaseText("v2", 0), armoredSig("v2 sig")
+	r.ver.reject(contentKey(adoptionFormDetached, nil, rel, sig))
+	r.up.setAt(rigReleaseURL, rel)
+	r.up.setAt(rigReleaseGPGURL, sig)
+	reqs := func() int { return len(r.up.etagsSent(rigAnchorURL)) }
+	checks, requests := pacedWindowRun(t, r, 48, reqs) // three hours
+	t.Logf("three hours: %d scheduler checks, %d InRelease requests, %d attempts", checks, requests, r.ver.calls())
+	if r.ver.calls() == 0 || strOf(r.row().AdoptionFailReason) == cache.ReasonAnchorAbsent {
+		t.Fatalf("setup: %d attempts, record %q; want the lateral move attempted and its record held",
+			r.ver.calls(), strOf(r.row().AdoptionFailReason))
+	}
+	if checks > 12 || requests > 17 {
+		t.Fatalf("three hours: %d scheduler checks, %d InRelease requests; want at most 12 and 17 (paced by the record)", checks, requests)
+	}
+	if r.ver.calls() > 6 {
+		t.Fatalf("%d lateral attempts in three hours, want at most 6", r.ver.calls())
+	}
+}
+
+// snapReadFailCache fails GetSuiteSnapshot while fail is set.
+type snapReadFailCache struct {
+	Cache
+	fail atomic.Bool
+}
+
+func (c *snapReadFailCache) GetSuiteSnapshot(ctx context.Context, id int64) (*cache.SuiteSnapshot, error) {
+	if c.fail.Load() {
+		return nil, fmt.Errorf("injected snapshot read failure (id %d)", id)
+	}
+	return c.Cache.GetSuiteSnapshot(ctx, id)
+}
+
+// Review fix round 1, Task 7 Important 2: anchorFoundAgain cannot tell an
+// anchor that merely came back from new content without the current
+// snapshot. A read error is logged at WARN and fails the check (as the
+// baseline's read is logged): nothing is admitted, so the current anchor
+// is never re-adopted as "changed".
+func TestCheck_AnchorFoundAgainFailsOnASnapshotReadError(t *testing.T) {
+	r := newRetryRig(t, 0)
+	v1 := r.release("v1", 0)
+	r.up.set(v1)
+	r.check() // the first adoption: inline v1
+	snap := r.currentSnapshot()
+	if snap == nil {
+		t.Fatal("setup: v1 not adopted")
+	}
+	fc := &snapReadFailCache{Cache: r.cache}
+	var n atomic.Int32
+	up := simtest.NewUpstream()
+	up.Set(rigAnchorURL, func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
+		switch n.Add(1) {
+		case 1, 2: // the anchor's own GET on both checks
+			return nil, &fetch.StatusError{Code: 404}
+		default: // the tree's probe on the second check: the anchor came back
+			fc.fail.Store(true)
+			return simtest.Serve(v1)(ctx, etag)
+		}
+	})
+	var logs lockedBuffer
+	chk, err := New(Config{Cache: fc, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+		Adopter: r.adopter, Logger: slog.New(slog.NewJSONHandler(&logs, nil)), now: r.clock.now, rand: func() float64 { return 0.5 }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	chk.Check(ctx, "http", rigHost, rigSuite) // absent: anchor_absent recorded
+	chk.WaitForAdoptions()
+	r.clock.advance(10 * time.Minute) // past the confirmation gap and the record's retry time
+	calls := r.ver.calls()
+	chk.Check(ctx, "http", rigHost, rigSuite)
+	chk.WaitForAdoptions()
+	fc.fail.Store(false)
+	warns := logRecords(t, &logs, "freshness: read current snapshot failed")
+	if len(warns) != 1 || warns[0]["level"] != "WARN" || warns[0]["snapshot_id"] != float64(snap.SnapshotID) {
+		t.Fatalf("WARN records %v, want one naming snapshot %d", warns, snap.SnapshotID)
+	}
+	failed := logRecords(t, &logs, "freshness check failed")
+	if len(failed) != 1 || !strings.Contains(fmt.Sprint(failed[0]["err"]), "read current snapshot") {
+		t.Fatalf("failed-check records %v, want the check failed on the snapshot read", failed)
+	}
+	if row := r.row(); r.ver.calls() != calls || row.CheckFailCount != 1 || row.CurrentSnapshotID == nil ||
+		*row.CurrentSnapshotID != snap.SnapshotID {
+		t.Fatalf("attempts %d, row %+v; want no attempt, the streak at 1 and snapshot %d still current",
+			r.ver.calls()-calls, row, snap.SnapshotID)
+	}
+}
+
+// Ruling PE-10 (b) never starves the current form: a detached suite paced
+// behind a failing lateral InRelease (M-14) whose upstream then publishes a
+// signed Release adopts it at the first check after the record's retry —
+// the lateral attempt's check clears the absent answer, so the next check
+// asks once more and the detached path adopts its own new content at once
+// (spec C7), the record notwithstanding.
+func TestCheck_PacedAbsentSignatureStillAdoptsANewSignedRelease(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptDetached()
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	r.clock.advance(time.Minute)
+	r.check() // the lateral attempt fails: a record for the InRelease content
+	r.up.setAt(rigReleaseURL, r.releaseText("v2", 0))
+	r.up.setFail(rigReleaseGPGURL, &fetch.StatusError{Code: 404})
+	r.clock.advance(20 * time.Second)
+	r.check() // M-14 behind the held lateral record: paced from here
+	rel := r.releaseText("v3", 0)
+	r.up.setAt(rigReleaseURL, rel)
+	r.up.setFail(rigReleaseGPGURL, nil)
+	r.up.setAt(rigReleaseGPGURL, armoredSig("v3 sig"))
+	r.clock.advance(20 * time.Second)
+	r.check() // inside the window: paced, v3 not seen yet
+	if snap := r.currentSnapshot(); strOf(snap.ReleaseHash) == hashOf(rel) {
+		t.Fatal("setup: a paced check adopted v3")
+	}
+	r.clock.advance(2 * time.Minute)
+	r.check() // the record's retry: the lateral content is attempted again (and fails)
+	calls := r.ver.calls()
+	r.clock.advance(20 * time.Second)
+	r.check() // the next check asks once more and adopts v3
+	if snap := r.currentSnapshot(); snap.Form != cache.FormDetached || strOf(snap.ReleaseHash) != hashOf(rel) || r.ver.calls() != calls+1 {
+		t.Fatalf("snapshot %+v after %d attempts, result %q; want v3 adopted by the check after the lateral retry",
+			snap, r.ver.calls()-calls, lastResult(r))
+	}
+}
+
+// Ruling PE-10 (b): the check tails set and clear the absent answer
+// (pacedAbsentAnswer): an anchor_absent result sets it, any other answered
+// result and a failed check clear it, and so does dropping the suite's
+// lock-map entry (its row is gone).
+func TestCheckTails_AbsentAnswer(t *testing.T) {
+	r := newRetryRig(t, 0)
+	ctx := context.Background()
+	ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}
+	key := suiteKey("http", rigHost, rigSuite)
+	answered := func() bool { _, ok := r.checker.absentAnswered.Load(key); return ok }
+	cur := r.row()
+	var out checkOutcome
+	r.checker.finishCheck(ctx, &out, &cur, ref, checkEnd{form: "inline", result: "anchor_absent", status: 404})
+	if !answered() {
+		t.Fatal("an anchor_absent result did not set the absent answer")
+	}
+	r.checker.finishCheck(ctx, &out, &cur, ref, checkEnd{form: "inline", result: "unchanged", status: 200})
+	if answered() {
+		t.Fatal("an unchanged result kept the absent answer")
+	}
+	r.checker.finishCheck(ctx, &out, &cur, ref, checkEnd{form: "inline", result: "anchor_absent", status: 404})
+	r.checker.failCheck(ctx, &out, &cur, ref, r.clock.now().Unix(), "inline", errors.New("unknown end"))
+	if answered() {
+		t.Fatal("a failed check kept the absent answer")
+	}
+	r.checker.finishCheck(ctx, &out, &cur, ref, checkEnd{form: "inline", result: "anchor_absent", status: 404})
+	release, ok := r.checker.HoldSuite(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite})
+	if !ok {
+		t.Fatal("HoldSuite refused")
+	}
+	release(true) // the row was deleted while held
+	if answered() {
+		t.Fatal("dropping the suite's lock-map entry kept its absent answer")
+	}
+}
+
+// Ruling PE-10 (a): held means the record is the lateral InRelease's own
+// content, not merely that a record is active. A detached suite whose own
+// failing content holds the record clears it when upstream serves the
+// current Release again (spec C7 "unchanged"), even while a failing
+// InRelease is still served.
+func TestCheck_DetachedUnchangedClearsItsOwnRecordWhileAnInReleaseIsServed(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptDetached()
+	in := r.release("v2", 0)
+	rel, sig := r.releaseText("v2", 0), armoredSig("v2 sig")
+	r.ver.reject(contentKey(adoptionFormInline, in, nil, nil))
+	r.ver.reject(contentKey(adoptionFormDetached, nil, rel, sig))
+	r.up.set(in)
+	r.up.setAt(rigReleaseURL, rel)
+	r.up.setAt(rigReleaseGPGURL, sig)
+	for range 2 { // the lateral attempt, then the detached one: each fails
+		r.clock.advance(20 * time.Second)
+		r.check()
+	}
+	if row := r.row(); r.ver.calls() != 2 || strOf(row.AdoptionFailHash) != contentKey(adoptionFormDetached, nil, rel, sig) {
+		t.Fatalf("setup: %d attempts, record %s; want the detached content's record", r.ver.calls(), strOf(row.AdoptionFailHash))
+	}
+	r.up.setAt(rigReleaseURL, r.releaseText("base", 0)) // upstream rolls the Release back to the current one
+	r.up.setAt(rigReleaseGPGURL, armoredSig("base sig"))
+	r.clock.advance(20 * time.Second)
+	r.check()
+	if row := r.row(); lastResult(r) != "unchanged" || row.AdoptionFailCount != 0 {
+		t.Fatalf("result %q, record count %d; want unchanged and the detached record cleared", lastResult(r), row.AdoptionFailCount)
+	}
+}
+
+// Ruling PE-2's pacing is persisted, so it survives a restart: a checker
+// that never saw the absence (ruling PE-10's in-memory absent answer is
+// empty) still asks nothing inside an anchor_absent record's retry time,
+// and its scheduler does not queue the stale suite.
+func TestCheck_AbsentAnchorIsPacedByItsRecordAfterARestart(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopt()
+	r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 404})
+	r.clock.advance(time.Minute)
+	r.check() // the first observation: anchor_absent
+	if err := r.cache.SetAdoptionNextRetry(context.Background(), "http", rigHost, rigSuite,
+		r.clock.now().Add(30*time.Minute).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := New(Config{Cache: r.cache, Fetcher: r.up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+		Adopter: r.adopter, Logger: discardLogger(), now: r.clock.now, rand: func() float64 { return 0.5 }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gets := func() int { return len(r.up.etagsSent(rigAnchorURL)) }
+	before := gets()
+	r.clock.advance(16 * time.Minute) // stale, the record not due
+	if restarted.suiteDue(r.row(), r.clock.now()) {
+		t.Fatal("after a restart the scheduler queues an anchor_absent suite inside its record's retry time")
+	}
+	restarted.Check(context.Background(), "http", rigHost, rigSuite)
+	restarted.WaitForAdoptions()
+	if gets() != before {
+		t.Fatalf("after a restart a check inside the record's retry time made %d requests, want none", gets()-before)
 	}
 }

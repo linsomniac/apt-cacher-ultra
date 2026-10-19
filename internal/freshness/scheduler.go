@@ -385,13 +385,19 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 	future := nowU + int64(clockStepTolerance/time.Second)
 	// Ruling PE-2: an adopted suite in the refusal state anchor_absent is
 	// due only at its record's retry time (pacedAbsent), whatever its
-	// last_success_at. A next_retry_at beyond the legitimate horizon (a
+	// last_success_at; so is one whose last answered check ended
+	// anchor_absent while an attempt's record holds (ruling PE-10,
+	// pacedAbsentAnswer). A next_retry_at beyond the legitimate horizon (a
 	// backward clock step) is not paced here: once the suite is due (its
 	// last_success_at is old), the check clamps it (retryGateFor).
-	if c.adopter != nil && s.CurrentSnapshotID != nil && s.AdoptionFailCount > 0 && s.AdoptionFailReason != nil &&
-		*s.AdoptionFailReason == cache.ReasonAnchorAbsent && s.AdoptionNextRetryAt != nil &&
+	if c.adopter != nil && s.CurrentSnapshotID != nil && s.AdoptionFailCount > 0 && s.AdoptionNextRetryAt != nil &&
 		*s.AdoptionNextRetryAt > nowU && *s.AdoptionNextRetryAt <= nowU+int64(retryHorizon/time.Second) {
-		return false
+		if s.AdoptionFailReason != nil && *s.AdoptionFailReason == cache.ReasonAnchorAbsent {
+			return false
+		}
+		if _, ok := c.absentAnswered.Load(suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)); ok {
+			return false
+		}
 	}
 	stale := s.LastSuccessAt == nil || *s.LastSuccessAt <= now.Add(-c.refresh).Unix() ||
 		*s.LastSuccessAt > future // infinitely old; checkLocked reports it once (B-38)

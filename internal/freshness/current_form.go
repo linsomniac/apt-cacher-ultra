@@ -34,6 +34,36 @@ func pacedAbsent(g retryGate) bool {
 	return g.active && !g.due && g.reason == cache.ReasonAnchorAbsent
 }
 
+// pacedAbsentAnswer is ruling PE-10 (b): an adopted suite whose last
+// answered check ended anchor_absent (absentAnswered) while a record of
+// another reason holds — a failed adoption attempt's: the inline suite
+// whose absent InRelease's lateral move failed, or a detached suite whose
+// changed Release has no Release.gpg while a failing lateral InRelease
+// holds the record (design review M-14) — is paced by that record exactly
+// as pacedAbsent paces an anchor_absent one: no request before its retry
+// time (checkLocked), and suiteDue does not queue it. The record shown
+// keeps the attempt's reason (e.g. gpg_failed) and schedule.
+//
+// AIDEV-NOTE: "answered absent" is in-memory (absentAnswered), because no
+// persisted column tells it from a queued result: both leave
+// last_success_at older than last_check_at with the streak at 0. It is
+// set and cleared only by the check tails (finishCheck: set for an
+// anchor_absent result, cleared for any other; failCheck clears) and
+// dropped with the suite's lock-map entry (unlockDropped). A restart loses
+// it: the first check after the start asks upstream once and sets it
+// again. An attempt check (the lateral move, at the record's retry time)
+// clears it, so the next answered check inside the new window asks once
+// more — the re-observation that lets the current form's own new content
+// (a detached suite's signed Release) be adopted at once (spec C7) instead
+// of waiting behind a failing lateral record forever.
+func (c *Checker) pacedAbsentAnswer(key string, g retryGate) bool {
+	if !g.active || g.due {
+		return false
+	}
+	_, ok := c.absentAnswered.Load(key)
+	return ok
+}
+
 // body returns the bytes of the anchor file name the tree fetched.
 func (t probeTree) body(name string) []byte {
 	switch name {
@@ -94,8 +124,10 @@ func (c *Checker) anchorAbsent(ctx, fetchCtx context.Context, out *checkOutcome,
 	case !gate.active:
 		c.recordAdoptionFailure(record, cache.ReasonAnchorAbsent) // the first observation
 	case !gate.due:
-		// Inside the retry time of a record from an adoption attempt (an
-		// anchor_absent record is paced before any request: pacedAbsent).
+		// Inside the retry time of a record from an adoption attempt: the
+		// first answered check after the attempt (an anchor_absent record
+		// is paced before any request: pacedAbsent; this result paces the
+		// later checks inside the window: pacedAbsentAnswer, ruling PE-10).
 	case !absentRecord:
 		runTree = true
 	case cur.AdoptionFailFirstAt != nil && now.Sub(time.Unix(*cur.AdoptionFailFirstAt, 0)) >= c.confirmGap():
@@ -136,7 +168,8 @@ func (c *Checker) anchorAbsent(ctx, fetchCtx context.Context, out *checkOutcome,
 // request), or new content of the current form (changed), an unsigned
 // suite's update after the unsigned refusals (unsignedRefusal). A signature
 // found for a suite without a signed current snapshot is marked first
-// (Adopter.markSignatureSeen); a failed mark fails the check.
+// (Adopter.markSignatureSeen); a failed mark fails the check, and so does a
+// failed read of the current snapshot (logged at WARN).
 func (c *Checker) anchorFoundAgain(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef,
 	nowUnix int64, form adoptionForm, t probeTree, signedCurrent bool) *adoptionRequest {
 	if !signedCurrent && t.signatureSeen() {
@@ -145,7 +178,20 @@ func (c *Checker) anchorFoundAgain(ctx context.Context, out *checkOutcome, cur *
 			return nil
 		}
 	}
-	snap, _ := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
+	snap, err := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
+	if err != nil {
+		// Without the current snapshot an anchor that merely came back
+		// would be taken for new content and re-adopted (review fix round
+		// 1, Task 7): log it as the baseline's read is, and fail the check.
+		c.logger.Warn("freshness: read current snapshot failed",
+			"err", err,
+			"snapshot_id", *cur.CurrentSnapshotID,
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+		)
+		c.failCheck(ctx, out, cur, suite, nowUnix, formName(form), fmt.Errorf("read current snapshot: %w", err))
+		return nil
+	}
 	same := t.sameAs(snap)
 	req := t.request(suite)
 	req.crossForm = t.form != form
@@ -181,10 +227,11 @@ func (c *Checker) anchorFoundAgain(ctx context.Context, out *checkOutcome, cur *
 // lateralInline is spec C4 Dispatch 1 for a detached current snapshot:
 // InRelease is probed on every check, and present → an inline adoption
 // request (a lateral move, result form_changed; a cross-form request). An
-// absent or unknown InRelease, or the failing content before its retry
-// time (held), leaves the check to the detached path (done = false): the
-// current form's own request decides the result. The caller holds the host
-// slot.
+// absent or unknown InRelease, or any InRelease while a record is active
+// and not due (ruling PE-10: no cross-form attempt inside a retry window;
+// held when the record is that InRelease content's), leaves the check to
+// the detached path (done = false): the current form's own request
+// decides the result. The caller holds the host slot.
 //
 // AIDEV-NOTE: held must stop the detached path's "unchanged" from
 // clearing the record: it belongs to the InRelease content, which
@@ -192,6 +239,16 @@ func (c *Checker) anchorFoundAgain(ctx context.Context, out *checkOutcome, cur *
 // attempt that content again (spec C7's bounded attempts). The record
 // keeps no validators (crossForm), so the detached path's GET carries the
 // current Release's own (design review I-1).
+// AIDEV-NOTE: ruling PE-10 (a): retry discipline beats cross-form
+// eagerness. Holding only the record's own content let the two forms of a
+// publish that fails in both take the one record in turn, so every check
+// attempted one of them (up to 1,440 a day). Now no InRelease is attempted
+// while any record is active and not due: with both forms failing the
+// suite makes one attempt per form per retry window (the detached path
+// still attempts its own new content at once, spec C7, while the record is
+// the InRelease's), and a good InRelease waits at most the record's retry
+// time (1 h) behind a failing detached record while the suite keeps
+// serving its snapshot.
 func (c *Checker) lateralInline(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef,
 	urls anchorURLs, gate retryGate, signedCurrent bool, nowUnix int64) (req *adoptionRequest, done, held bool) {
 	o := c.probe(fetchCtx, suite, urls, "InRelease")
@@ -200,8 +257,8 @@ func (c *Checker) lateralInline(ctx, fetchCtx context.Context, out *checkOutcome
 	}
 	req = probeTree{form: adoptionFormInline, found: true, inRelease: o}.request(suite)
 	req.crossForm = true
-	if gate.active && !gate.due && req.key == gate.hash {
-		return nil, false, true
+	if gate.active && !gate.due {
+		return nil, false, req.key == gate.hash
 	}
 	prevSuccess := cur.LastSuccessAt
 	cur.LastCheckAt, cur.LastSuccessAt, cur.CheckFailCount = &nowUnix, &nowUnix, 0
