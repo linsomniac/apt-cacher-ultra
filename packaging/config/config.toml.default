@@ -63,6 +63,7 @@ cooldown                 = "60s" # minimum gap between per-suite checks
 periodic_refresh         = "15m" # background refresh cadence
 # Explicit 0s for either duration above restores its default, not off.
 max_concurrent_adoptions = 2     # global adoption cap; 0 = unlimited
+max_suites               = 5000  # tracked suites; a tenth per host; at least 10
 
 [adoption]
 # Adopt verified, coherent metadata snapshots atomically; failure retains

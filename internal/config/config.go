@@ -136,6 +136,13 @@ type FreshnessConfig struct {
 	// The same global slots admit repair and reconcile passes (spec C4).
 	// 0 = unlimited; default 2.
 	MaxConcurrentAdoptions int `toml:"max_concurrent_adoptions"`
+
+	// MaxSuites is freshness.max_suites (spec C3, C4, C11): at most this
+	// many suite rows (at the cap, cap eviction makes room for a new suite
+	// when an idle one without a snapshot exists), at most a tenth of it
+	// per canonical host, and at most this many suites in the scheduler's
+	// queues. Default 5000; at least 10.
+	MaxSuites int `toml:"max_suites"`
 }
 
 // AdoptionConfig holds the SPEC2 §5.1 [adoption] block. The defaults
@@ -682,6 +689,11 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("freshness", "max_concurrent_adoptions") {
 		cfg.Freshness.MaxConcurrentAdoptions = 2
 	}
+	// freshness.max_suites: applied only when absent, so an explicit value
+	// below 10 (0 included) fails Validate instead of being rescued.
+	if !md.IsDefined("freshness", "max_suites") {
+		cfg.Freshness.MaxSuites = 5000
+	}
 	if !md.IsDefined("integrity", "validate_at_rest_interval") {
 		cfg.Integrity.ValidateAtRestInterval.Duration = 24 * time.Hour
 	}
@@ -969,6 +981,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Freshness.MaxConcurrentAdoptions < 0 {
 		errs = append(errs, errors.New("freshness.max_concurrent_adoptions must not be negative"))
+	}
+	if c.Freshness.MaxSuites < 10 {
+		errs = append(errs, errors.New("freshness.max_suites must be at least 10"))
 	}
 	if c.Integrity.ValidateAtRestInterval.Duration < 0 {
 		errs = append(errs, errors.New("integrity.validate_at_rest_interval must not be negative"))

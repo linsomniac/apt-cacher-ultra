@@ -1661,3 +1661,34 @@ architectures = [`+strings.Join(entries, ", ")+`]
 		t.Errorf("architectures len = %d, want %d", len(cfg.Adoption.Architectures), len(cases))
 	}
 }
+
+// freshness.max_suites (spec C11): default 5000, at least 10; an explicit
+// value below 10 — 0 included — is refused, not rescued to the default.
+func TestFreshnessMaxSuites_DefaultAndBounds(t *testing.T) {
+	load := func(extra string) (*Config, error) {
+		dir := t.TempDir()
+		return Load(writeTOML(t, dir, "config.toml", "[cache]\ndir = \""+dir+"\"\n"+extra))
+	}
+	cfg, err := load("")
+	if err != nil {
+		t.Fatalf("default: %v", err)
+	}
+	if cfg.Freshness.MaxSuites != 5000 {
+		t.Fatalf("default = %d, want 5000", cfg.Freshness.MaxSuites)
+	}
+	for _, good := range []int{10, 20000} {
+		cfg, err := load(fmt.Sprintf("[freshness]\nmax_suites = %d\n", good))
+		if err != nil {
+			t.Fatalf("explicit %d: %v", good, err)
+		}
+		if cfg.Freshness.MaxSuites != good {
+			t.Fatalf("explicit %d = %d", good, cfg.Freshness.MaxSuites)
+		}
+	}
+	for _, bad := range []int{9, 0, -1} {
+		_, err := load(fmt.Sprintf("[freshness]\nmax_suites = %d\n", bad))
+		if err == nil || !strings.Contains(err.Error(), "freshness.max_suites must be at least 10") {
+			t.Errorf("max_suites = %d: err = %v, want the max_suites bound", bad, err)
+		}
+	}
+}

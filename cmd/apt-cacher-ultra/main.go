@@ -358,6 +358,7 @@ func serveListeners(
 		"freshness_cooldown", cfg.Freshness.Cooldown.Duration,
 		"freshness_periodic_refresh", cfg.Freshness.PeriodicRefresh.Duration,
 		"freshness_max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
+		"freshness_max_suites", cfg.Freshness.MaxSuites,
 		"adoption_enabled", cfg.Adoption.Enabled,
 		"adoption_require_signature", cfg.Adoption.RequireSignature,
 		"adoption_require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
@@ -483,6 +484,10 @@ func serveListeners(
 		return err // already prefixed "legacy trust audit:"
 	}
 
+	// Ruling PD-8: a suite table already at or above a cap refuses new
+	// suites until cap eviction or phase F's reaper makes room; say so.
+	warnSuiteCaps(ctx, c, cfg.Freshness.MaxSuites, logger)
+
 	// SPEC4 §4.2 steps 5 + 6: pool/ orphan scan + one-shot GC pass.
 	// Both are blocking — the cache does not begin answering requests
 	// until they complete (we have not yet called Serve on any
@@ -571,18 +576,7 @@ func serveListeners(
 	// even for failures, which leave no DB row.
 	adoptionRing := observability.NewRing(50)
 
-	freshChecker, err := freshness.New(freshness.Config{
-		Cache:               c,
-		Fetcher:             fetchClient,
-		HostLimiter:         hostLimiter,
-		Cooldown:            cfg.Freshness.Cooldown.Duration,
-		Refresh:             cfg.Freshness.PeriodicRefresh.Duration,
-		Adopter:             adopter,
-		LifetimeCtx:         freshCtx,
-		Logger:              logger,
-		AdoptionRing:        adoptionRing,
-		GPGReasonClassifier: gpg.ClassifyVerifyErr,
-	})
+	freshChecker, err := freshness.New(checkerConfig(freshCtx, cfg, c, fetchClient, hostLimiter, logger, adopter, adoptionRing))
 	if err != nil {
 		return fmt.Errorf("build freshness checker: %w", err)
 	}
@@ -1044,6 +1038,54 @@ func buildAdopter(
 		"hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
 	)
 	return adopter, keyring, nil
+}
+
+// warnSuiteCaps logs WARN suite_caps_exceeded at startup when the suite
+// table is at or above freshness.max_suites or a canonical host holds at
+// least a tenth of it (ruling PD-8): a lowered cap, or an upgraded v6
+// table, then refuses new suites. At or above the global cap every
+// creation attempt still evicts one suite idle for 24 h, so the table
+// converges; a host at its cap never evicts and waits for phase F's
+// reaper (gc.suite_idle_ttl, 30 days). A read error is logged and
+// otherwise ignored: the caps hold either way.
+func warnSuiteCaps(ctx context.Context, c *cache.Cache, maxSuites int, logger *slog.Logger) {
+	perHost := maxSuites / 10
+	u, err := c.SuiteCapUsage(ctx, perHost)
+	if err != nil {
+		logger.Warn("suite cap usage read failed", "err", err)
+		return
+	}
+	if u.Total < maxSuites && u.HostsAtCap == 0 {
+		return
+	}
+	logger.Warn("suite_caps_exceeded",
+		"suites", u.Total,
+		"max_suites", maxSuites,
+		"hosts_at_cap", u.HostsAtCap,
+		"per_host_cap", perHost,
+		"fullest_host", u.FullestHost,
+		"fullest_host_suites", u.FullestHostRows,
+	)
+}
+
+// checkerConfig is the freshness checker's configuration (spec C4, C11:
+// freshness.max_suites bounds the scheduler's queues). Factored out, like
+// handlerConfig, for the wiring tests.
+func checkerConfig(lifetimeCtx context.Context, cfg *config.Config, c *cache.Cache, fetchClient *fetch.Client,
+	hostLimiter *hostsem.Sem, logger *slog.Logger, adopter *freshness.Adopter, ring *observability.Ring) freshness.Config {
+	return freshness.Config{
+		Cache:               c,
+		Fetcher:             fetchClient,
+		HostLimiter:         hostLimiter,
+		Cooldown:            cfg.Freshness.Cooldown.Duration,
+		Refresh:             cfg.Freshness.PeriodicRefresh.Duration,
+		MaxSuites:           cfg.Freshness.MaxSuites,
+		Adopter:             adopter,
+		LifetimeCtx:         lifetimeCtx,
+		Logger:              logger,
+		AdoptionRing:        ring,
+		GPGReasonClassifier: gpg.ClassifyVerifyErr,
+	}
 }
 
 // handlerConfig assembles the request handler's configuration. The flip
