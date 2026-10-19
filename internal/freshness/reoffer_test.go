@@ -19,10 +19,18 @@ import (
 // (also registered as a cleanup; calling it twice is safe).
 func startSched(t *testing.T, cfg Config) (*Checker, func()) {
 	t.Helper()
+	return startSchedHooked(t, cfg, nil)
+}
+
+// startSchedHooked is startSched with offerHook set before Run starts (the
+// hook is read on the Run goroutine).
+func startSchedHooked(t *testing.T, cfg Config, offerHook func(SuiteRef, checkReport)) (*Checker, func()) {
+	t.Helper()
 	chk, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	chk.offerHook = offerHook
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { chk.Run(ctx); close(done) }()

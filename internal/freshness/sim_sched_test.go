@@ -489,8 +489,16 @@ func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 		runtime.Gosched()
 		base := runtime.NumGoroutine()
 		maxG := base
-		_, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: lim, Refresh: refresh,
-			Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }})
+		// offerHook (on the Run goroutine): offers that admitted C2, the
+		// parked re-offer path (review fix round 2, Task 14).
+		var c2Offered atomic.Int32
+		_, stop := startSchedHooked(t, Config{Cache: c, Fetcher: up, HostLimiter: lim, Refresh: refresh,
+			Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }},
+			func(ref SuiteRef, rep checkReport) {
+				if ref.SuitePath == c2Path && !isQueuedResult(rep.result) {
+					c2Offered.Add(1)
+				}
+			})
 		// Phase 1: every stalling suite fails once (100 × D on one host).
 		for time.Sleep(61 * time.Second); ; time.Sleep(61 * time.Second) {
 			maxG = max(maxG, runtime.NumGoroutine())
@@ -562,6 +570,13 @@ func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 		if wait := c2Start.Sub(c2Calls[0]); wait > 10*time.Minute+checkDeadline {
 			t.Fatalf("C2 parked at %v was admitted %v later, want within one adoption + D (%v)",
 				c2Calls[0], wait, 10*time.Minute+checkDeadline)
+		}
+		// …and it was parked: an offer (a waiting suite's slot-driven
+		// re-check) admitted it, in every goroutine order (under -race a
+		// suite dropped instead of parked could still be admitted in time
+		// by a later check).
+		if n := c2Offered.Load(); n < 1 {
+			t.Fatalf("no offer admitted C2 (%d): it was never parked and re-offered", n)
 		}
 		const slack = 8
 		if limit := base + checkWorkers + 1 + 2 + slack; maxG > limit {
