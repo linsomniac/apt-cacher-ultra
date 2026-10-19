@@ -292,7 +292,7 @@ func TestRun_ClientRefusedSuiteIsParkedByTheNextTick(t *testing.T) {
 		const host, suite = "h", "/r/dists/x"
 		seedStaleAnchorAt(t, c, host, suite)
 		recent := time.Now().Add(-time.Minute).Unix()
-		if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host,
+		if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host,
 			SuitePath: suite, LastCheckAt: &recent, LastSuccessAt: &recent}); err != nil {
 			t.Fatal(err)
 		}

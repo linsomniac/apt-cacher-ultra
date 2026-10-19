@@ -48,7 +48,7 @@ func TestInsertPackageHashTx_HealsPreV6EmptyVersion(t *testing.T) {
 	ctx := context.Background()
 	ir := seedBlob(t, c, "inrelease")
 	debHash := strings.Repeat("a", 64)
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "ex.test",
 		SuitePath: "/dists/noble", InReleaseHash: &ir,
 	})
@@ -96,7 +96,7 @@ func TestInsertPackageHashTx_LoudOnRealVersionConflict(t *testing.T) {
 	ctx := context.Background()
 	ir := seedBlob(t, c, "inrelease2")
 	debHash := strings.Repeat("b", 64)
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "ex.test",
 		SuitePath: "/dists/noble", InReleaseHash: &ir,
 	})

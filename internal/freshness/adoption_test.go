@@ -194,7 +194,7 @@ func newAdoptionTestEnv(t *testing.T) *adoptionTestEnv {
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
 	}
-	return &adoptionTestEnv{
+	env := &adoptionTestEnv{
 		t:        t,
 		cache:    c,
 		adopter:  ad,
@@ -205,6 +205,20 @@ func newAdoptionTestEnv(t *testing.T) *adoptionTestEnv {
 			CanonicalHost:   "archive.ubuntu.com",
 			SuitePath:       "/ubuntu/dists/noble",
 		},
+	}
+	// Spec C3: CommitAdoption is UPDATE-only, so an adopted suite needs a
+	// row — in production the handler created it before any check ran.
+	trackSuite(t, c, env.suite)
+	return env
+}
+
+// trackSuite gives suite a suite_freshness row: spec C3 lets only the
+// handler create rows, and CommitAdoption (UPDATE-only) and the checker
+// (I-4) need one.
+func trackSuite(t testing.TB, c *cache.Cache, suite SuiteRef) {
+	t.Helper()
+	if err := c.EnsureSuiteForTest(context.Background(), suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath); err != nil {
+		t.Fatalf("EnsureSuiteForTest: %v", err)
 	}
 }
 
@@ -513,6 +527,7 @@ func TestAdopter_FormDriftWARN_OnFormTransition(t *testing.T) {
 
 	// First adoption: inline. With no prior current snapshot,
 	// adoption_form_drift must NOT fire — first adoption is not drift.
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, inlineRelease, "etag-1", ""); err != nil {
 		t.Fatalf("Run inline: %v", err)
 	}
@@ -1319,6 +1334,7 @@ func TestAdopter_PackageHash_NonStandardSuiteSkips(t *testing.T) {
 	})
 	env.fetcher.put("http://weird.example/some/non-standard/path/main/binary-amd64/Packages", stanzas)
 
+	trackSuite(t, env.cache, env.suite)
 	if err := env.adopter.Run(context.Background(), env.suite, releaseText, "", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -1611,7 +1627,7 @@ func TestRunHeartbeatTicker_AdvancesHeartbeatAt(t *testing.T) {
 	if err := c.PutBlob(ctx, hash, 1); err != nil {
 		t.Fatal(err)
 	}
-	id, _, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "tick.example",
 		SuitePath:       "/p",
@@ -1805,6 +1821,7 @@ func TestAdopter_MemberSkipped_404SkipsMidList(t *testing.T) {
 	ff.fail404(base + "main/Contents-amd64")
 	ff.put(base+"main/source/Sources", src)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v (expected nil — 4xx members should skip, not abort)", err)
 	}
@@ -2152,6 +2169,7 @@ func TestAdopter_MultiArch_NoFilter_AllArchsAdopted(t *testing.T) {
 	ff.put(base+"main/binary-arm64/Packages", pkgsArm64)
 	ff.put(base+"main/binary-i386/Packages", pkgsI386)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -2360,6 +2378,7 @@ func TestAdopter_MultiArch_AllowlistFiltersOutOtherArchs(t *testing.T) {
 	// Deliberately seed arm64 too — the filter must skip without fetching.
 	ff.put(base+"main/binary-arm64/Packages", pkgsArm64)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -2465,6 +2484,7 @@ func TestAdopter_Allowlist_KeepsBinaryAllIndexTarget(t *testing.T) {
 	ff.put(base+"main/binary-amd64/Packages", pkgsAmd64)
 	ff.put(base+"main/binary-all/Packages", pkgsAll)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -2664,6 +2684,7 @@ func TestAdopter_Sources_HappyPath(t *testing.T) {
 	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
 	ff.put(base+"main/source/Sources", srcBody)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -2777,6 +2798,7 @@ func TestAdopter_Sources_CrossVariantDisagreement(t *testing.T) {
 	ff.put(base+"main/source/Sources", srcPlain)
 	ff.put(base+"main/source/Sources.gz", srcGz)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("cross-declaration Sources disagreement must be tolerated, got %v", err)
 	}
@@ -2850,6 +2872,7 @@ func TestAdopter_Sources_IntraFileOrigTarballConflict(t *testing.T) {
 	ff.put(base+"main/binary-amd64/Packages", pkgs)
 	ff.put(base+"main/source/Sources", src)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("intra-file orig conflict must be tolerated, got %v", err)
 	}
@@ -2930,6 +2953,7 @@ func TestAdopter_PdiffIndex_HappyPath(t *testing.T) {
 	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
 	ff.put(base+"main/binary-amd64/Packages.diff/Index", indexBody)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -3017,6 +3041,7 @@ func TestAdopter_PdiffIndex_MalformedEntriesSkipped(t *testing.T) {
 	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
 	ff.put(base+"main/binary-amd64/Packages.diff/Index", indexBody)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v (malformed entry should be skipped, not abort)", err)
 	}
@@ -3093,6 +3118,7 @@ func TestAdopter_MultiArch_AllowlistKeepsSourcePseudoArch(t *testing.T) {
 	ff.put(base+"main/binary-arm64/Packages", pkgsArm64)
 	ff.put(base+"main/source/Sources", srcBody)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}

@@ -612,6 +612,7 @@ func TestChecker_FreshTickRepairsSkippedMembers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	trackSuite(t, env.cache, env.suite)
 	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
 		t.Fatalf("adoption: %v", err)
 	}

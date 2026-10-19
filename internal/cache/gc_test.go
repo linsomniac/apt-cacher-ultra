@@ -84,7 +84,7 @@ func TestCommitAdoption_Rule2_ClearsZeroedAtOnPositiveCrossing(t *testing.T) {
 		t.Fatalf("pre-condition failed: refcount_zeroed_at = NULL on freshly-inserted blob")
 	}
 
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "h.example",
 		SuitePath:       "/p",
@@ -119,7 +119,7 @@ func TestCommitAdoption_Rule2_PreservesZeroedAtOnNegativeToZero(t *testing.T) {
 	restore := stubNow(t, 1000)
 	r1 := seedBlob(t, c, "neg2zero rel1")
 	m := seedBlob(t, c, "neg2zero member")
-	id1, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id1, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "n2z.example",
 		SuitePath:       "/p",
@@ -143,7 +143,7 @@ func TestCommitAdoption_Rule2_PreservesZeroedAtOnNegativeToZero(t *testing.T) {
 	// stamps refcount_zeroed_at = 2000 (Rule 3 first-≤0 crossing).
 	restore = stubNow(t, 2000)
 	r2 := seedBlob(t, c, "neg2zero rel2")
-	id2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id2, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "n2z.example",
 		SuitePath:       "/p",
@@ -199,7 +199,7 @@ func TestCommitAdoption_Rule2_PreservesZeroedAtOnNegativeToZero(t *testing.T) {
 	// the row is still ≤ 0, the grace clock continues.
 	restore = stubNow(t, 4000)
 	r3 := seedBlob(t, c, "neg2zero rel3")
-	id3, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id3, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "n2z2.example",
 		SuitePath:       "/p",
@@ -239,7 +239,7 @@ func TestCommitAdoption_Rule3_SetsZeroedAtOnFirstZeroCrossing(t *testing.T) {
 	restore := stubNow(t, 1000)
 	r1 := seedBlob(t, c, "rule3 rel1")
 	m := seedBlob(t, c, "rule3 member")
-	id1, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id1, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "r3.example",
 		SuitePath:       "/p",
@@ -266,7 +266,7 @@ func TestCommitAdoption_Rule3_SetsZeroedAtOnFirstZeroCrossing(t *testing.T) {
 	// Adopt snapshot 2 displacing snapshot 1; m is no longer a member.
 	restore = stubNow(t, 5000)
 	r2 := seedBlob(t, c, "rule3 rel2")
-	id2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id2, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "r3.example",
 		SuitePath:       "/p",
@@ -341,7 +341,7 @@ func TestEvictURLPath_Rule3_SetsZeroedAtOnFirstZeroCrossing(t *testing.T) {
 	restore := stubNow(t, 1000)
 	r := seedBlob(t, c, "evict-rule3 rel")
 	m := seedBlob(t, c, "evict-rule3 member")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "ev3.example",
 		SuitePath:       "/p",
@@ -665,7 +665,7 @@ func TestRunBlobGCBatch_SnapshotMemberReference_Excluded(t *testing.T) {
 
 	r := seedBlob(t, c, "sm-rel")
 	m := seedBlob(t, c, "sm-member")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "sm.example",
 		SuitePath:       "/p",
@@ -705,7 +705,7 @@ func TestRunBlobGCBatch_SuiteSnapshotInReleaseRef_Excluded(t *testing.T) {
 	defer stubNow(t, 10_000)()
 
 	r := seedBlob(t, c, "ss-inrel-ref")
-	if _, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	if _, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "ss-ir.example",
 		SuitePath:       "/p",
@@ -736,7 +736,7 @@ func TestRunBlobGCBatch_SuiteSnapshotReleaseRef_Excluded(t *testing.T) {
 
 	rh := seedBlob(t, c, "ss-rel-ref")
 	gh := seedBlob(t, c, "ss-rel-ref-gpg")
-	if _, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	if _, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "ss-r.example",
 		SuitePath:       "/p",
@@ -766,7 +766,7 @@ func TestRunBlobGCBatch_SuiteSnapshotReleaseGPGRef_Excluded(t *testing.T) {
 
 	rh := seedBlob(t, c, "ss-gpg-rel")
 	gh := seedBlob(t, c, "ss-gpg-ref")
-	if _, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	if _, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "ss-g.example",
 		SuitePath:       "/p",
@@ -1137,7 +1137,7 @@ func TestHeartbeatSnapshot_UpdatesOnlyHeartbeatAt(t *testing.T) {
 
 	restore := stubNow(t, 1000)
 	r := seedBlob(t, c, "hb test rel")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "hb.example",
 		SuitePath:       "/p",

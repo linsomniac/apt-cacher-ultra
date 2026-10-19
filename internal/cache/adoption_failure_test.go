@@ -14,7 +14,7 @@ func putSuite(t *testing.T, c *Cache, s SuiteFreshness) {
 	if s.CanonicalScheme == "" {
 		s.CanonicalScheme, s.CanonicalHost, s.SuitePath = "http", "h", afSuite
 	}
-	if err := c.PutSuiteFreshness(context.Background(), s); err != nil {
+	if err := c.SeedSuiteForTest(context.Background(), s); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -111,7 +111,7 @@ func TestListSuitesWithAdoption_ReportsCurrentAnchorForm(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	h := seedBlob(t, c, "inrelease for anchor-form listing")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: afSuite, InReleaseHash: &h})
 	if err != nil {
 		t.Fatal(err)
@@ -129,9 +129,9 @@ func TestListSuitesWithAdoption_ReportsCurrentAnchorForm(t *testing.T) {
 	}
 }
 
-// PutSuiteFreshness owns check_fail_count but never the failure record
+// UpdateSuiteFreshness owns check_fail_count but never the failure record
 // (spec C7: the record has its own UPDATE-only writers).
-func TestPutSuiteFreshness_WritesStreakNeverRecord(t *testing.T) {
+func TestUpdateSuiteFreshness_WritesStreakNeverRecord(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	putSuite(t, c, SuiteFreshness{})
@@ -139,12 +139,15 @@ func TestPutSuiteFreshness_WritesStreakNeverRecord(t *testing.T) {
 	if err := c.RecordAdoptionFailure(ctx, "http", "h", afSuite, f); err != nil {
 		t.Fatal(err)
 	}
-	putSuite(t, c, SuiteFreshness{CheckFailCount: 5})
+	if err := c.UpdateSuiteFreshness(ctx, SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: afSuite,
+		CheckFailCount: 5}); err != nil {
+		t.Fatal(err)
+	}
 	s := getSuite(t, c)
 	if s.CheckFailCount != 5 {
 		t.Fatalf("check_fail_count = %d, want 5", s.CheckFailCount)
 	}
-	assertRecord(t, "after PutSuiteFreshness", s, f)
+	assertRecord(t, "after UpdateSuiteFreshness", s, f)
 }
 
 func TestRecordAdoptionFailure_IsUpdateOnly(t *testing.T) {
@@ -217,9 +220,9 @@ func TestSetAdoptionNextRetry_OnlyMovesAnExistingRecord(t *testing.T) {
 func TestRescheduleFailingAdoptions_SkipsRefusalsAndPanics(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
-	reasons := map[string]string{"/a": "gpg_failed", "/b": ReasonUpstreamOlder, "/c": ReasonPanic, "/d": ""}
+	reasons := map[string]string{"/a": "gpg_failed", "/b": ReasonUpstreamOlder, "/c": ReasonPanic, "/d": "", "/e": "run_failed"}
 	for suite, reason := range reasons {
-		if err := c.PutSuiteFreshness(ctx, SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: suite}); err != nil {
+		if err := c.SeedSuiteForTest(ctx, SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: suite}); err != nil {
 			t.Fatal(err)
 		}
 		if reason == "" {
@@ -231,9 +234,12 @@ func TestRescheduleFailingAdoptions_SkipsRefusalsAndPanics(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	n, err := c.RescheduleFailingAdoptions(ctx, 5_000, func() int64 { return 42 })
-	if err != nil || n != 1 {
-		t.Fatalf("RescheduleFailingAdoptions = %d, %v; want 1, nil", n, err)
+	// B-3: offset is drawn per row, so a counting source gives each
+	// rescheduled row its own offset (a hoisted call would give both 10).
+	var calls int64
+	n, err := c.RescheduleFailingAdoptions(ctx, 5_000, func() int64 { calls++; return calls * 10 })
+	if err != nil || n != 2 {
+		t.Fatalf("RescheduleFailingAdoptions = %d, %v; want 2, nil", n, err)
 	}
 	next := func(suite string) *int64 {
 		s, err := c.GetSuiteFreshness(ctx, "http", "h", suite)
@@ -242,8 +248,9 @@ func TestRescheduleFailingAdoptions_SkipsRefusalsAndPanics(t *testing.T) {
 		}
 		return s.AdoptionNextRetryAt
 	}
-	if v := next("/a"); v == nil || *v != 5_042 {
-		t.Fatalf("/a next = %v, want 5042", v)
+	a, e := next("/a"), next("/e")
+	if a == nil || e == nil || min(*a, *e) != 5_010 || max(*a, *e) != 5_020 {
+		t.Fatalf("/a, /e next = %d, %d; want 5010 and 5020 in either order", derefI64(a), derefI64(e))
 	}
 	for _, s := range []string{"/b", "/c"} {
 		if v := next(s); v == nil || *v != 9_999_999_999 {

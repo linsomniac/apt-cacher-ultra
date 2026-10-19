@@ -13,7 +13,7 @@ func commitWithMembers(t *testing.T, c *Cache, suite, label string, extra map[st
 	t.Helper()
 	ctx := context.Background()
 	inrel := seedBlob(t, c, "InRelease "+label)
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: suite, InReleaseHash: &inrel})
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: suite, InReleaseHash: &inrel})
 	if err != nil {
 		t.Fatal(err)
 	}

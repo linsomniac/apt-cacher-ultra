@@ -204,9 +204,11 @@ ON CONFLICT(hash) DO UPDATE
 // suiteFreshnessColumns is the column list every suite_freshness reader
 // scans, in (*SuiteFreshness).scanDest order.
 //
-// AIDEV-NOTE: keep in lockstep with scanDest. Every column is nullable or
-// defaulted, so a column added to one list and not the other shifts the
-// following fields silently instead of failing.
+// AIDEV-NOTE: keep in lockstep with scanDest, position by position. A
+// column added to one list only fails Scan loudly (the counts differ); the
+// silent hazard is a reorder or a same-position edit in one list, which
+// scans a column into another field of a compatible type (deferred minor
+// B-1).
 var suiteFreshnessColumns = []string{
 	"canonical_scheme", "canonical_host", "suite_path",
 	"last_check_at", "last_success_at",
@@ -1030,43 +1032,6 @@ SELECT ss.snapshot_id, ss.package_coverage_complete
 		return nil, fmt.Errorf("HostCurrentSnapshotsCoverage iter: %w", err)
 	}
 	return out, nil
-}
-
-// PutSuiteFreshness upserts the per-suite freshness state.
-func (c *Cache) PutSuiteFreshness(ctx context.Context, s SuiteFreshness) error {
-	// AIDEV-NOTE: last_requested_at (v7) is the suite's client-interest
-	// stamp. A new row starts "requested now"; this writer never updates
-	// it (phase D's TouchSuite owns updates), so a scheduler write cannot
-	// keep an idle suite alive. check_fail_count (spec C4) is written on
-	// every call: each check result sets or resets the streak in the same
-	// statement that bumps last_check_at. The adoption failure record
-	// (adoption_fail_*) is never written here (spec C7).
-	const q = `
-INSERT INTO suite_freshness
-  (canonical_scheme, canonical_host, suite_path,
-   last_check_at, last_success_at,
-   inrelease_etag, inrelease_lastmod, inrelease_change_seen_at,
-   check_fail_count, last_requested_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
-  last_check_at            = excluded.last_check_at,
-  last_success_at          = excluded.last_success_at,
-  inrelease_etag           = excluded.inrelease_etag,
-  inrelease_lastmod        = excluded.inrelease_lastmod,
-  inrelease_change_seen_at = excluded.inrelease_change_seen_at,
-  check_fail_count         = excluded.check_fail_count`
-	now := nowUnix()
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		_, err := conn.ExecContext(ctx, q,
-			s.CanonicalScheme, s.CanonicalHost, s.SuitePath,
-			s.LastCheckAt, s.LastSuccessAt,
-			s.InReleaseETag, s.InReleaseLastMod, s.InReleaseChangeSeenAt,
-			s.CheckFailCount, now)
-		if err != nil {
-			return fmt.Errorf("PutSuiteFreshness: %w", err)
-		}
-		return nil
-	})
 }
 
 // ListCachedDebs returns every cached .deb whose filename basename

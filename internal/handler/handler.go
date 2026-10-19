@@ -1802,14 +1802,20 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 	// first cache-hit T1 fires — and that first T1 has no validators,
 	// so it does an unconditional GET when a 304 was achievable.
 	// Seed failures are non-fatal (the file IS cached); we just lose
-	// the periodic-scheduler benefit until the next miss/T1.
+	// the periodic-scheduler benefit until the next miss/T1. CreateSuite
+	// is create-only (spec C3): until this seed moves into StoreFetched,
+	// whose UPDATE-only re-stamp restores today's refresh miss, a refresh
+	// miss leaves an existing row as it is.
 	if req.IsMetadata && req.SuitePath != "" && req.Path == req.SuitePath+inReleaseSuffix {
-		seed := cache.SuiteFreshness{
-			CanonicalScheme: req.CanonicalScheme,
-			CanonicalHost:   req.CanonicalHost,
-			SuitePath:       req.SuitePath,
-			LastCheckAt:     &now,
-			LastSuccessAt:   &now,
+		seed := cache.SuiteSeed{
+			SuiteKey: cache.SuiteKey{
+				CanonicalScheme: req.CanonicalScheme,
+				CanonicalHost:   req.CanonicalHost,
+				SuitePath:       req.SuitePath,
+			},
+			LastCheckAt:   &now,
+			LastSuccessAt: &now,
+			RequestedAt:   now,
 		}
 		if fres.ETag != "" {
 			etag := fres.ETag
@@ -1819,7 +1825,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 			lm := fres.LastModified
 			seed.InReleaseLastMod = &lm
 		}
-		if err := h.cache.PutSuiteFreshness(dbCtx, seed); err != nil {
+		if _, err := h.cache.CreateSuite(dbCtx, seed, cache.SuiteCaps{}, nil); err != nil {
 			h.logger.Warn("seed suite_freshness failed",
 				"err", err,
 				"canonical_host", req.CanonicalHost,

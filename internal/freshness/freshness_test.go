@@ -67,7 +67,32 @@ func (f *fakeCache) GetSuiteFreshness(ctx context.Context, scheme, host, suitePa
 	return &cp, nil
 }
 
-func (f *fakeCache) PutSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error {
+// SeedSuiteForTest stores s whole, creating the suite: the fixture
+// upsert, like cache.(*Cache).SeedSuiteForTest.
+func (f *fakeCache) SeedSuiteForTest(ctx context.Context, s cache.SuiteFreshness) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.suites[keyOf(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)] = s
+	return nil
+}
+
+// track gives a suite an empty row (spec C3: the checker checks only
+// tracked suites).
+func (f *fakeCache) track(scheme, host, suitePath string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := keyOf(scheme, host, suitePath)
+	if _, ok := f.suites[k]; !ok {
+		f.suites[k] = cache.SuiteFreshness{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}
+	}
+}
+
+// UpdateSuiteFreshness mirrors the production writer: UPDATE-only (an
+// unknown suite is left alone) and only the check columns.
+func (f *fakeCache) UpdateSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -77,7 +102,15 @@ func (f *fakeCache) PutSuiteFreshness(ctx context.Context, s cache.SuiteFreshnes
 	if f.putErr != nil {
 		return f.putErr
 	}
-	f.suites[keyOf(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)] = s
+	k := keyOf(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
+	cur, ok := f.suites[k]
+	if !ok {
+		return nil
+	}
+	cur.LastCheckAt, cur.LastSuccessAt = s.LastCheckAt, s.LastSuccessAt
+	cur.InReleaseETag, cur.InReleaseLastMod = s.InReleaseETag, s.InReleaseLastMod
+	cur.InReleaseChangeSeenAt, cur.CheckFailCount = s.InReleaseChangeSeenAt, s.CheckFailCount
+	f.suites[k] = cur
 	return nil
 }
 
@@ -267,7 +300,7 @@ func TestCheck_NoCachedInRelease_Skips(t *testing.T) {
 	}
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
 	if fc.putCount.Load() != 0 {
-		t.Errorf("PutSuiteFreshness was called; want skip without write")
+		t.Errorf("UpdateSuiteFreshness was called; want skip without write")
 	}
 }
 
@@ -370,7 +403,7 @@ func TestCheck_Cooldown_Skips(t *testing.T) {
 	}
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
 	if fc.putCount.Load() != 0 {
-		t.Errorf("PutSuiteFreshness called inside cooldown")
+		t.Errorf("UpdateSuiteFreshness called inside cooldown")
 	}
 }
 
@@ -421,6 +454,7 @@ func TestCheck_OK_ContentMatches_RefreshesValidators(t *testing.T) {
 
 func TestCheck_OK_ContentChanged_RecordsObservation(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 	cachedBody := []byte("OLD InRelease")
 	upstreamBody := []byte("NEW InRelease")
 	cachedHash := hashOf(cachedBody)
@@ -568,6 +602,7 @@ func TestCheck_UpstreamError_BumpsCheckOnly(t *testing.T) {
 
 func TestCheck_TryLock_SecondCallSkips(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 	bh := hashOf([]byte("x"))
 
 	// gate blocks the upstream handler so the first Check stays in
@@ -749,6 +784,7 @@ func TestCheck_HostLimiterBoundsConcurrency(t *testing.T) {
 	// Two suites on the same canonical host. Both have a cached
 	// InRelease and matching url_path rows.
 	for _, sp := range []string{"/a", "/b"} {
+		fc.track("http", "127.0.0.1", sp)
 		fc.putURL(cache.URLPath{
 			CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 			Path: sp + "/InRelease", BlobHash: &bh, IsMetadata: true,
@@ -888,6 +924,7 @@ func TestCheck_DBReadFailure_LogsAndReturns(t *testing.T) {
 // the success branch — defense against future drift.
 func TestCheck_4xxFromUpstream_BumpsCheckOnly(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 	bh := hashOf([]byte("x"))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
@@ -1131,6 +1168,7 @@ func TestCheck_DetachedRecoversWhenAnchorsMissing(t *testing.T) {
 // unchanged when no Adopter is wired in.
 func TestCheck_NoAdopter_ChangeOnlyLogged(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 	body := []byte("new InRelease bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -1166,6 +1204,7 @@ func TestCheck_NoAdopter_ChangeOnlyLogged(t *testing.T) {
 // the Adopter via the goroutine + mutex handoff.
 func TestCheck_AdopterInvokedOnChange(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 	memberBody := []byte("member content")
 	memberHash := hashOf(memberBody)
 	releaseText := fmt.Sprintf(
@@ -1189,11 +1228,12 @@ func TestCheck_AdopterInvokedOnChange(t *testing.T) {
 	// Real *cache.Cache for the Adopter side-effect; fakeCache for
 	// the Checker. They don't share state.
 	dir := t.TempDir()
-	realCache, err := cache.Open(context.Background(), dir, nil)
+	realCache, err := cache.Open(context.Background(), dir, discardLogger()) // A-30
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = realCache.Close() })
+	trackSuite(t, realCache, SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"})
 
 	// Adopter's fetcher serves member content at the URL the Adopter
 	// will construct from the suite. The Adopter builds URLs from
@@ -1212,6 +1252,7 @@ func TestCheck_AdopterInvokedOnChange(t *testing.T) {
 		Fetcher:     memberFetcher,
 		Verifier:    passThroughVerifier{},
 		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1325,11 +1366,12 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 	// snapshot row, plus a fake AdoptionFetcher serving the declared
 	// member.
 	dir := t.TempDir()
-	realCache, err := cache.Open(context.Background(), dir, nil)
+	realCache, err := cache.Open(context.Background(), dir, discardLogger()) // A-30
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = realCache.Close() })
+	trackSuite(t, realCache, SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"})
 
 	memberURL := "http://127.0.0.1/dists/noble/main/Sources"
 	memberFetcher := newFakeFetcher()
@@ -1340,6 +1382,7 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 		Fetcher:     memberFetcher,
 		Verifier:    passThroughVerifier{},
 		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1393,6 +1436,7 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 // fall back to detached mode and adopt via Release + Release.gpg.
 func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 
 	memberBody := []byte("fallback member content")
 	memberHash := hashOf(memberBody)
@@ -1448,11 +1492,12 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 	})
 
 	dir := t.TempDir()
-	realCache, err := cache.Open(context.Background(), dir, nil)
+	realCache, err := cache.Open(context.Background(), dir, discardLogger()) // A-30
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = realCache.Close() })
+	trackSuite(t, realCache, SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"})
 
 	memberURL := "http://127.0.0.1/dists/noble/main/Sources"
 	memberFetcher := newFakeFetcher()
@@ -1463,6 +1508,7 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 		Fetcher:     memberFetcher,
 		Verifier:    passThroughVerifier{},
 		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1513,6 +1559,7 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 // InRelease GET.
 func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 
 	memberBody := []byte("missing-row member content")
 	memberHash := hashOf(memberBody)
@@ -1558,11 +1605,12 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	})
 
 	dir := t.TempDir()
-	realCache, err := cache.Open(context.Background(), dir, nil)
+	realCache, err := cache.Open(context.Background(), dir, discardLogger()) // A-30
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = realCache.Close() })
+	trackSuite(t, realCache, SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"})
 
 	memberURL := "http://127.0.0.1/dists/noble/main/Sources"
 	memberFetcher := newFakeFetcher()
@@ -1573,6 +1621,7 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 		Fetcher:     memberFetcher,
 		Verifier:    passThroughVerifier{},
 		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1620,6 +1669,7 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 // an inline-only suite would log a misleading detached-mode fetch.
 func TestCheck_404OnInRelease_NoFallback_WhenReleaseRowsMissing(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 
 	var releaseHits, gpgHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1725,6 +1775,7 @@ func TestCheck_UnchangedTick_ReconcilesDegraded(t *testing.T) {
 	env.fetcher.put(base+"main/binary-amd64/Packages", pkgsAmd64)
 	env.fetcher.put(base+"main/binary-all/Packages", pkgsAll)
 
+	trackSuite(t, env.cache, env.suite)
 	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
 		t.Fatalf("adoption setup: %v", err)
 	}
@@ -1847,6 +1898,7 @@ func TestCheck_FailedTick_DoesNotReconcile(t *testing.T) {
 	base := "http://127.0.0.1/ubuntu/dists/noble/"
 	env.fetcher.put(base+"main/binary-amd64/Packages", pkgsAmd64)
 	env.fetcher.put(base+"main/binary-all/Packages", pkgsAll) // member fetcher CAN serve it
+	trackSuite(t, env.cache, env.suite)
 	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
 		t.Fatalf("adoption setup: %v", err)
 	}
@@ -2013,5 +2065,41 @@ func TestCheckerReconcile_UnknownSuiteAllocatesNoLock(t *testing.T) {
 	c.locks.Range(func(_, _ any) bool { count++; return true })
 	if count != 0 {
 		t.Errorf("lock map grew to %d for an unknown suite", count)
+	}
+}
+
+// I-4 (spec C3): a suite without a row is not checked — no upstream
+// request, no row created, no lock-map entry — however its T1 fires.
+func TestCheck_UntrackedSuiteIsNotChecked(t *testing.T) {
+	fc := newFakeCache()
+	bh := hashOf([]byte("x"))
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1", Path: "/dists/minted/InRelease",
+		BlobHash: &bh, UpstreamURL: srv.URL + "/dists/minted/InRelease", IsMetadata: true,
+	})
+	c, err := New(Config{Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8), Logger: discardLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep := c.check(context.Background(), SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		SuitePath: "/dists/minted"}, checkOpts{bypassCooldown: true}); rep.result != resultSkipped {
+		t.Fatalf("result = %q, want %q", rep.result, resultSkipped)
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("upstream requests = %d, want 0", n)
+	}
+	if _, ok := fc.suite("http", "127.0.0.1", "/dists/minted"); ok {
+		t.Fatal("the check created a suite row")
+	}
+	locks := 0
+	c.locks.Range(func(any, any) bool { locks++; return true })
+	if locks != 0 {
+		t.Fatalf("lock map holds %d entries, want 0", locks)
 	}
 }

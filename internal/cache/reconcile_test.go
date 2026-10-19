@@ -18,7 +18,7 @@ func commitTestSnapshotInRelease(t *testing.T, c *Cache) int64 {
 	t.Helper()
 	ctx := context.Background()
 	rel := seedBlob(t, c, "InRelease body")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/dists/s",
@@ -65,7 +65,7 @@ func displaceCurrentSnapshot(t *testing.T, c *Cache, _ int64) {
 	t.Helper()
 	ctx := context.Background()
 	rel2 := seedBlob(t, c, "InRelease v2 body for displacement")
-	id2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id2, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/dists/s",

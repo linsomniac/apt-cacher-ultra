@@ -25,7 +25,7 @@ func TestCheck_FutureLastCheckAtDoesNotFreezeAndHeals(t *testing.T) {
 	seedFakeAnchor(fc)
 	now := time.Unix(1_800_000_000, 0)
 	future := now.Add(2 * time.Hour).Unix()
-	_ = fc.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{
+	_ = fc.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x", LastCheckAt: &future, LastSuccessAt: &future})
 	up := &changedUpstream{body: []byte("new")}
 	logs := &lockedBuffer{}
@@ -63,7 +63,7 @@ func TestCheck_StampWithinToleranceKeepsCooldown(t *testing.T) {
 	seedFakeAnchor(fc)
 	now := time.Unix(1_800_000_000, 0)
 	justAhead := now.Unix() + 1
-	_ = fc.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{
+	_ = fc.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x", LastCheckAt: &justAhead})
 	up := &changedUpstream{body: []byte("new")}
 	c, err := New(Config{Cache: fc, Fetcher: up, HostLimiter: hostsem.New(8), Cooldown: time.Minute,
@@ -82,7 +82,7 @@ func TestTick_FutureLastSuccessAtIsDue(t *testing.T) {
 	seedFakeAnchor(fc)
 	now := time.Unix(1_800_000_000, 0)
 	future := now.Add(30 * 24 * time.Hour).Unix()
-	_ = fc.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{
+	_ = fc.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x", LastSuccessAt: &future})
 	up := &changedUpstream{body: []byte("new")}
 	logs := &lockedBuffer{}

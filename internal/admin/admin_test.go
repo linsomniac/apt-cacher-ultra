@@ -662,7 +662,7 @@ func TestStatusHTML_SuiteTable(t *testing.T) {
 	now := time.Now().Unix()
 	lastSuccess := now - 2*3600
 	seenAt := wallclock.Now().Unix() - 5400
-	if err := s.cfg.Cache.PutSuiteFreshness(context.Background(),
+	if err := s.cfg.Cache.SeedSuiteForTest(context.Background(),
 		cache.SuiteFreshness{
 			CanonicalScheme:       "http",
 			CanonicalHost:         "archive.ubuntu.com",
@@ -670,7 +670,7 @@ func TestStatusHTML_SuiteTable(t *testing.T) {
 			LastSuccessAt:         &lastSuccess,
 			InReleaseChangeSeenAt: &seenAt,
 		}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
 
 	resp := mustGet(t, base+"/")

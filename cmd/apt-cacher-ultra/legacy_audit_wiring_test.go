@@ -66,7 +66,7 @@ func TestServeListeners_LegacyAuditRunsBeforeGCAndServing(t *testing.T) {
 	if err := c.PutBlob(ctx, h, int64(len(body))); err != nil {
 		t.Fatal(err)
 	}
-	id, _, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x", InReleaseHash: &h})
 	if err != nil {
 		t.Fatal(err)

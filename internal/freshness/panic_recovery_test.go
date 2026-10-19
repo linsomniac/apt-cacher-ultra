@@ -90,6 +90,7 @@ func TestCheck_AdoptionPanicIsRecovered(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	ctx := context.Background()
 	seedStaleAnchor(t, env.cache)
+	trackSuite(t, env.cache, SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"})
 	ad, err := NewAdopter(AdoptionConfig{
 		Cache: env.cache, Fetcher: env.fetcher, Verifier: panickingVerifier{}, HostLimiter: hostsem.New(8),
 	})
@@ -153,6 +154,7 @@ func TestCheck_AdoptionPanicRecoveredBeforeMutexRelease(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	ctx := context.Background()
 	seedStaleAnchor(t, env.cache)
+	trackSuite(t, env.cache, SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"})
 	ad, err := NewAdopter(AdoptionConfig{Cache: env.cache, Fetcher: env.fetcher, Verifier: panickingVerifier{}, HostLimiter: hostsem.New(8)})
 	if err != nil {
 		t.Fatal(err)
@@ -211,10 +213,11 @@ func TestCheck_RepairPanicIsRecovered(t *testing.T) {
 		t.Fatal(err)
 	}
 	good, err := NewAdopter(AdoptionConfig{Cache: env.cache, Fetcher: env.fetcher, Verifier: passThroughVerifier{},
-		HostLimiter: hostsem.New(8), TolerateOptionalMemberFailures: true, RepairSkippedMembers: true})
+		HostLimiter: hostsem.New(8), TolerateOptionalMemberFailures: true, RepairSkippedMembers: true, Logger: discardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
+	trackSuite(t, env.cache, env.suite)
 	if err := good.Run(ctx, env.suite, releaseText, "", ""); err != nil {
 		t.Fatalf("adoption: %v", err)
 	}
@@ -222,7 +225,7 @@ func TestCheck_RepairPanicIsRecovered(t *testing.T) {
 		t.Fatalf("fixture: want 1 repairable row, got %d", len(rows))
 	}
 	panicky, err := NewAdopter(AdoptionConfig{Cache: env.cache, Fetcher: panickingAdoptionFetcher{}, Verifier: passThroughVerifier{},
-		HostLimiter: hostsem.New(8), TolerateOptionalMemberFailures: true, RepairSkippedMembers: true})
+		HostLimiter: hostsem.New(8), TolerateOptionalMemberFailures: true, RepairSkippedMembers: true, Logger: discardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,6 +246,8 @@ func TestCheck_RepairPanicIsRecovered(t *testing.T) {
 	}
 	if mu := v.(*sync.Mutex); !mu.TryLock() {
 		t.Fatal("suite mutex leaked by the panicking repair goroutine")
+	} else {
+		mu.Unlock()
 	}
 }
 
@@ -273,6 +278,7 @@ func TestRecoverGoroutine_LogsAndSwallows(t *testing.T) {
 // A panic in the synchronous part of Check releases the mutex too.
 func TestCheck_SynchronousPanicReleasesMutex(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "h", "/r/dists/x")
 	stale := testHex64
 	fc.putURL(cache.URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: "/r/dists/x/InRelease",
 		BlobHash: &stale, UpstreamURL: "http://h/r/dists/x/InRelease", IsMetadata: true})
@@ -335,6 +341,7 @@ func TestCheck_PanickingPanicLoggerReleasesMutex(t *testing.T) {
 // ERROR line each).
 func TestCheck_PanickingCheckIsCooldownGated(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "h", "/r/dists/x")
 	stale := testHex64
 	fc.putURL(cache.URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: "/r/dists/x/InRelease",
 		BlobHash: &stale, UpstreamURL: "http://h/r/dists/x/InRelease", IsMetadata: true})

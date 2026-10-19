@@ -20,7 +20,7 @@ func refcount(t *testing.T, c *Cache, hash string) int64 {
 func commitInline(t *testing.T, c *Cache, suite, anchor string, extra ...SnapshotMember) int64 {
 	t.Helper()
 	ctx := context.Background()
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: suite, InReleaseHash: &anchor})
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +43,7 @@ const (
 )
 
 // seedValidators stores auditETag/auditLastMod on suite's freshness row,
-// preserving its other columns (PutSuiteFreshness never touches the
+// preserving its other columns (SeedSuiteForTest never touches the
 // current pointer).
 func seedValidators(t *testing.T, c *Cache, suite string) {
 	t.Helper()
@@ -54,7 +54,7 @@ func seedValidators(t *testing.T, c *Cache, suite string) {
 	}
 	etag, lastmod := auditETag, auditLastMod
 	sf.InReleaseETag, sf.InReleaseLastMod = &etag, &lastmod
-	if err := c.PutSuiteFreshness(ctx, *sf); err != nil {
+	if err := c.SeedSuiteForTest(ctx, *sf); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -117,7 +117,7 @@ func TestApplyLegacyAuditDecisions_QuarantineCurrentReleasesPinsOnce(t *testing.
 	// The suite can adopt the same content again: retired rows leave the
 	// natural key (TestCommitAdoption_RefusesRetiredCandidate pins that the
 	// retired row itself can never be committed).
-	if _, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	if _, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/q", InReleaseHash: &anchor}); err != nil {
 		t.Fatalf("re-adoption candidate refused: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestApplyLegacyAuditDecisions_KeepNeverMarksUnsigned(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	h := seedBlob(t, c, "unsigned Release (audit)")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/u", InReleaseHash: &h, Form: FormUnsigned})
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +217,7 @@ func TestCommitAdoption_RefusesRetiredCandidate(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	anchor := seedBlob(t, c, "retired candidate anchor")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/rc", InReleaseHash: &anchor})
 	if err != nil {
 		t.Fatal(err)
@@ -277,7 +277,7 @@ func TestListTrackedSuiteAnchors_OnlyTrackedSignedAnchorNames(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/t"}); err != nil {
+	if err := c.SeedSuiteForTest(ctx, SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/t"}); err != nil {
 		t.Fatal(err)
 	}
 	put("/r/dists/t/InRelease")

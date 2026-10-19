@@ -413,7 +413,7 @@ func TestSuiteFreshness_Roundtrip(t *testing.T) {
 		LastSuccessAt:   &now,
 		InReleaseETag:   &etag,
 	}
-	if err := c.PutSuiteFreshness(context.Background(), s); err != nil {
+	if err := c.SeedSuiteForTest(context.Background(), s); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	got, err := c.GetSuiteFreshness(context.Background(), s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
@@ -443,7 +443,7 @@ func TestListSuites(t *testing.T) {
 		{CanonicalScheme: "https", CanonicalHost: "deb.debian.org", SuitePath: "/debian/dists/bookworm", LastSuccessAt: &now},
 	}
 	for _, r := range rows {
-		if err := c.PutSuiteFreshness(ctx, r); err != nil {
+		if err := c.SeedSuiteForTest(ctx, r); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
@@ -499,7 +499,7 @@ func TestListSuitesWithAdoption(t *testing.T) {
 
 	// Adopt "noble".
 	hNoble := seedBlob(t, c, "noble InRelease")
-	idNoble, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idNoble, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "archive.ubuntu.com",
 		SuitePath:     "/ubuntu/dists/noble",
 		InReleaseHash: &hNoble,
@@ -511,7 +511,7 @@ func TestListSuitesWithAdoption(t *testing.T) {
 		t.Fatalf("CommitAdoption noble: %v", err)
 	}
 	// Seed suite_freshness for noble pointing at the adopted snapshot.
-	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, SuiteFreshness{
 		CanonicalScheme:   "http",
 		CanonicalHost:     "archive.ubuntu.com",
 		SuitePath:         "/ubuntu/dists/noble",
@@ -522,7 +522,7 @@ func TestListSuitesWithAdoption(t *testing.T) {
 	}
 
 	// "jammy" — never adopted (current_snapshot_id IS NULL).
-	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "archive.ubuntu.com",
 		SuitePath:     "/ubuntu/dists/jammy",
 		LastSuccessAt: &now,
@@ -530,11 +530,11 @@ func TestListSuitesWithAdoption(t *testing.T) {
 		t.Fatalf("Put jammy: %v", err)
 	}
 
-	// "bookworm" — candidate (adopted_at IS NULL). PutSuiteFreshness
+	// "bookworm" — candidate (adopted_at IS NULL). SeedSuiteForTest
 	// doesn't write current_snapshot_id (only CommitAdoption flips
 	// the pointer); raw UPDATE here for the candidate-pointer case.
 	hBook := seedBlob(t, c, "bookworm InRelease")
-	idBook, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idBook, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "https", CanonicalHost: "deb.debian.org",
 		SuitePath:     "/debian/dists/bookworm",
 		InReleaseHash: &hBook,
@@ -542,7 +542,7 @@ func TestListSuitesWithAdoption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Insert bookworm: %v", err)
 	}
-	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, SuiteFreshness{
 		CanonicalScheme: "https", CanonicalHost: "deb.debian.org",
 		SuitePath:     "/debian/dists/bookworm",
 		LastSuccessAt: &now,
@@ -1569,7 +1569,7 @@ func TestInsertCandidateSnapshot_InlineMode(t *testing.T) {
 
 	etag := `"etag-1"`
 	lastmod := "Thu, 25 Apr 2024 15:08:24 UTC"
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme:  "http",
 		CanonicalHost:    "archive.ubuntu.com",
 		SuitePath:        "/ubuntu/dists/noble",
@@ -1605,7 +1605,7 @@ func TestInsertCandidateSnapshot_DetachedMode(t *testing.T) {
 	rh := seedBlob(t, c, "fake Release bytes")
 	gh := seedBlob(t, c, "fake Release.gpg bytes")
 
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "deb.debian.org",
 		SuitePath:       "/debian/dists/bookworm",
@@ -1634,7 +1634,7 @@ func TestInsertCandidateSnapshot_RejectsDanglingBlobFK(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	dangling := strings.Repeat("0", 64) // valid hex shape but no blob row
-	_, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	_, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "archive.ubuntu.com",
 		SuitePath:       "/ubuntu/dists/noble",
@@ -1652,7 +1652,7 @@ func TestInsertCandidateSnapshot_RejectsBothModes(t *testing.T) {
 	rh := seedBlob(t, c, "release")
 	gh := seedBlob(t, c, "release-gpg")
 
-	_, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	_, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/p",
@@ -1668,7 +1668,7 @@ func TestInsertCandidateSnapshot_RejectsBothModes(t *testing.T) {
 func TestInsertCandidateSnapshot_RejectsAllNull(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
-	_, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	_, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/p",
@@ -1695,7 +1695,7 @@ func TestInsertCandidateSnapshot_NaturalKeyReuse(t *testing.T) {
 		SuitePath:       "/ubuntu/dists/noble",
 		InReleaseHash:   &h,
 	}
-	id1, reused1, err := c.InsertCandidateSnapshot(ctx, cand)
+	id1, reused1, err := c.InsertTrackedCandidateForTest(ctx, cand)
 	if err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
@@ -1705,7 +1705,7 @@ func TestInsertCandidateSnapshot_NaturalKeyReuse(t *testing.T) {
 	if id1 == 0 {
 		t.Fatalf("first insert: id=0, want >0")
 	}
-	id2, reused2, err := c.InsertCandidateSnapshot(ctx, cand)
+	id2, reused2, err := c.InsertTrackedCandidateForTest(ctx, cand)
 	if err != nil {
 		t.Fatalf("second insert: want nil err (reuse), got %v", err)
 	}
@@ -1732,14 +1732,14 @@ func TestInsertCandidateSnapshot_NaturalKeyAdoptedConflict(t *testing.T) {
 		SuitePath:       "/ubuntu/dists/noble",
 		InReleaseHash:   &h,
 	}
-	id, _, err := c.InsertCandidateSnapshot(ctx, cand)
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, cand)
 	if err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
 	if err := c.CommitAdoption(ctx, id, nil, nil, nil, nil, false); err != nil {
 		t.Fatalf("CommitAdoption: %v", err)
 	}
-	id2, reused, err := c.InsertCandidateSnapshot(ctx, cand)
+	id2, reused, err := c.InsertTrackedCandidateForTest(ctx, cand)
 	if err == nil {
 		t.Fatalf("second insert (post-adoption): want error, got id=%d reused=%v", id2, reused)
 	}
@@ -1773,7 +1773,7 @@ func TestInsertCandidateSnapshot_ReuseRefreshesMutableCols(t *testing.T) {
 	etag2, lm2 := "etag-v2", "lastmod-v2"
 
 	// First attempt: detached candidate with sig v1.
-	id1, reused1, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id1, reused1, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme:  "http",
 		CanonicalHost:    "archive.ubuntu.com",
 		SuitePath:        "/ubuntu/dists/noble",
@@ -1790,7 +1790,7 @@ func TestInsertCandidateSnapshot_ReuseRefreshesMutableCols(t *testing.T) {
 	}
 
 	// Second attempt: same Release bytes, fresh signature + validators.
-	id2, reused2, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id2, reused2, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme:  "http",
 		CanonicalHost:    "archive.ubuntu.com",
 		SuitePath:        "/ubuntu/dists/noble",
@@ -1850,7 +1850,7 @@ func TestCommitAdoption_FirstAdoption(t *testing.T) {
 	pkgsGzBlob := seedBlob(t, c, "Packages.gz content")
 	srcBlob := seedBlob(t, c, "Sources content")
 
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "archive.ubuntu.com",
 		SuitePath:       "/ubuntu/dists/noble",
@@ -1933,7 +1933,7 @@ func TestCommitAdoption_DisplacesPrior(t *testing.T) {
 	r1 := seedBlob(t, c, "Release v1")
 	m1 := seedBlob(t, c, "Member1 v1")
 	m2 := seedBlob(t, c, "Member2 v1")
-	id1, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id1, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/p",
@@ -1955,7 +1955,7 @@ func TestCommitAdoption_DisplacesPrior(t *testing.T) {
 	// Second snapshot: replaces M2 with M2v2; carries r1 and m1 forward.
 	r2 := seedBlob(t, c, "Release v2")
 	m2v2 := seedBlob(t, c, "Member2 v2")
-	id2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id2, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/p",
@@ -2007,7 +2007,7 @@ func TestCommitAdoption_RejectsAlreadyAdopted(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	r := seedBlob(t, c, "InRelease")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/p",
@@ -2046,7 +2046,7 @@ func TestCommitAdoption_RejectsMalformedMemberHash(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	r := seedBlob(t, c, "InRelease")
-	id, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
 		InReleaseHash: &r,
 	})
@@ -2071,7 +2071,7 @@ func TestCommitAdoption_RejectsDanglingBlobFK(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	r := seedBlob(t, c, "InRelease")
-	id, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
 		InReleaseHash: &r,
 	})
@@ -2095,7 +2095,7 @@ func TestCommitAdoption_RejectsDuplicatePath(t *testing.T) {
 	ctx := context.Background()
 	r := seedBlob(t, c, "InRelease")
 	m := seedBlob(t, c, "M1")
-	id, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
 		InReleaseHash: &r,
 	})
@@ -2116,7 +2116,7 @@ func TestCommitAdoption_EmptyMembersStillFlips(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	r := seedBlob(t, c, "InRelease")
-	id, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
 		InReleaseHash: &r,
 	})
@@ -2136,7 +2136,7 @@ func TestCommitAdoption_EmptyMembersStillFlips(t *testing.T) {
 	}
 }
 
-func TestCommitAdoption_PreservesExistingSuiteFreshnessColumns(t *testing.T) {
+func TestCommitAdoption_KeepsCheckColumnsAdoptsCandidateValidators(t *testing.T) {
 	// The freshness checker writes last_check_at before adoption fires.
 	// CommitAdoption must flip current_snapshot_id without clobbering that
 	// freshness-check state. Validators are a different story (spec C4
@@ -2148,7 +2148,7 @@ func TestCommitAdoption_PreservesExistingSuiteFreshnessColumns(t *testing.T) {
 	ctx := context.Background()
 	now := nowUnix()
 	etag := `"upstream-etag"`
-	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, SuiteFreshness{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/p",
@@ -2159,7 +2159,7 @@ func TestCommitAdoption_PreservesExistingSuiteFreshnessColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := seedBlob(t, c, "InRelease")
-	id, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
 		InReleaseHash: &r,
 	})
@@ -2184,14 +2184,14 @@ func TestCommitAdoption_PreservesExistingSuiteFreshnessColumns(t *testing.T) {
 	}
 }
 
-func TestPutSuiteFreshness_PreservesCurrentSnapshotID(t *testing.T) {
-	// Phase 1 freshness checks call PutSuiteFreshness on every probe.
-	// The Phase 2 adoption pointer must survive those writes — otherwise
+func TestUpdateSuiteFreshness_PreservesCurrentSnapshotID(t *testing.T) {
+	// Freshness checks call UpdateSuiteFreshness on every probe. The
+	// Phase 2 adoption pointer must survive those writes — otherwise
 	// every freshness tick would silently un-adopt the suite.
 	c := openCache(t)
 	ctx := context.Background()
 	r := seedBlob(t, c, "InRelease")
-	id, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p",
 		InReleaseHash: &r,
 	})
@@ -2201,9 +2201,9 @@ func TestPutSuiteFreshness_PreservesCurrentSnapshotID(t *testing.T) {
 		nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	// Now do a Phase-1-style freshness write on the same suite.
+	// Now do a freshness check's write on the same suite.
 	now := nowUnix()
-	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+	if err := c.UpdateSuiteFreshness(ctx, SuiteFreshness{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/p",
@@ -2217,7 +2217,7 @@ func TestPutSuiteFreshness_PreservesCurrentSnapshotID(t *testing.T) {
 		t.Fatal(err)
 	}
 	if sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != id {
-		t.Errorf("PutSuiteFreshness clobbered current_snapshot_id: got %v, want %d",
+		t.Errorf("UpdateSuiteFreshness clobbered current_snapshot_id: got %v, want %d",
 			sf.CurrentSnapshotID, id)
 	}
 }
@@ -2278,7 +2278,7 @@ func TestDeclaredHashesForPath_ReturnsCurrentSnapshotRowsOnly(t *testing.T) {
 
 	// First snapshot: covers the .deb. Will be displaced.
 	r1 := seedBlob(t, c, "InRelease v1")
-	id1, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id1, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &r1,
 	})
@@ -2299,7 +2299,7 @@ func TestDeclaredHashesForPath_ReturnsCurrentSnapshotRowsOnly(t *testing.T) {
 	// Second snapshot: same suite, replaces id1 as current. Carries the
 	// .deb forward with the same declared hash.
 	r2 := seedBlob(t, c, "InRelease v2")
-	id2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id2, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &r2,
 	})
@@ -2346,14 +2346,14 @@ func TestDeclaredHashesForPath_TwoSuitesDistinctHashes(t *testing.T) {
 
 	rA := seedBlob(t, c, "InRelease A")
 	rB := seedBlob(t, c, "InRelease B")
-	idA, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idA, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/A", InReleaseHash: &rA,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	idB, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idB, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/B", InReleaseHash: &rB,
 	})
@@ -2407,7 +2407,7 @@ func TestLookupSnapshotMember_ReturnsBlobOfCurrentSnapshot(t *testing.T) {
 	scheme, host, suite := "http", "archive.example", "/dists/noble"
 	r := seedBlob(t, c, "InRelease bytes")
 	pkg := seedBlob(t, c, "Packages bytes")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: suite, InReleaseHash: &r,
 	})
@@ -2440,7 +2440,7 @@ func TestLookupSnapshotMember_ReturnsBlobOfCurrentSnapshot(t *testing.T) {
 func TestLookupSnapshotMember_NotFoundWhenSuiteHasNoSnapshot(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
-	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "x.example",
 		SuitePath: "/dists/noble",
 	}); err != nil {
@@ -2459,7 +2459,7 @@ func TestLookupSnapshotMember_NotFoundWhenPathMissing(t *testing.T) {
 	ctx := context.Background()
 	scheme, host, suite := "http", "archive.example", "/dists/noble"
 	r := seedBlob(t, c, "InRelease bytes")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: suite, InReleaseHash: &r,
 	})
@@ -2495,7 +2495,7 @@ func TestEvictURLPath_DeletesRowAndDecrementsRefcount(t *testing.T) {
 	hash := seedBlob(t, c, "blob bytes")
 
 	// Snapshot adoption bumps refcount to 1 via the snapshot_member.
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &hash,
 	})
@@ -2579,14 +2579,14 @@ func TestHostCurrentSnapshotsCoverage_ReturnsRowsPerCurrentSnapshot(t *testing.T
 	rA := seedBlob(t, c, "InRelease A")
 	rB := seedBlob(t, c, "InRelease B")
 	rC := seedBlob(t, c, "InRelease C")
-	idA, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idA, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/A", InReleaseHash: &rA,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	idB, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idB, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/B", InReleaseHash: &rB,
 	})
@@ -2594,7 +2594,7 @@ func TestHostCurrentSnapshotsCoverage_ReturnsRowsPerCurrentSnapshot(t *testing.T
 		t.Fatal(err)
 	}
 	// Build C as a candidate but never CommitAdoption it.
-	if _, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	if _, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/C", InReleaseHash: &rC,
 	}); err != nil {
@@ -2659,14 +2659,14 @@ func TestComputeHotSet_TwoStageMatch(t *testing.T) {
 
 	rOld := seedBlob(t, c, "InRelease v1")
 	rNew := seedBlob(t, c, "InRelease v2")
-	idPrior, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idPrior, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &rOld,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	idNew, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idNew, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &rNew,
 	})
@@ -2747,11 +2747,11 @@ func TestComputeHotSet_BoundsToNewestNVersions(t *testing.T) {
 
 	rOld := seedBlob(t, c, "InRelease old")
 	rNew := seedBlob(t, c, "InRelease new")
-	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idPrior, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/linux/ubuntu/dists/jammy", InReleaseHash: &rOld,
 	})
-	idNew, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idNew, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/linux/ubuntu/dists/jammy", InReleaseHash: &rNew,
 	})
@@ -2830,11 +2830,11 @@ func TestComputeHotSet_WarmsVersionlessSourceArtifacts(t *testing.T) {
 
 	rOld := seedBlob(t, c, "InRelease old")
 	rNew := seedBlob(t, c, "InRelease new")
-	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idPrior, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/debian/dists/sid", InReleaseHash: &rOld,
 	})
-	idNew, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idNew, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/debian/dists/sid", InReleaseHash: &rNew,
 	})
@@ -2887,11 +2887,11 @@ func TestComputeHotSet_ExcludesPreV3Rows(t *testing.T) {
 
 	rOld := seedBlob(t, c, "InRelease pre-v3")
 	rNew := seedBlob(t, c, "InRelease v3")
-	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idPrior, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &rOld,
 	})
-	idNew, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idNew, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &rNew,
 	})
@@ -2945,11 +2945,11 @@ func TestComputeHotSet_DroppedPackageNotInCandidate(t *testing.T) {
 
 	rOld := seedBlob(t, c, "InRelease v1 dropping")
 	rNew := seedBlob(t, c, "InRelease v2 dropped")
-	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idPrior, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &rOld,
 	})
-	idNew, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idNew, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &rNew,
 	})
@@ -3031,11 +3031,11 @@ func TestComputeHotSet_RejectsCandidateMismatch(t *testing.T) {
 
 	rOld := seedBlob(t, c, "InRelease v1 mismatch")
 	rNew := seedBlob(t, c, "InRelease v2 mismatch")
-	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idPrior, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &rOld,
 	})
-	idNew, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idNew, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &rNew,
 	})
@@ -3087,7 +3087,7 @@ func TestComputeHotSet_DuplicatePackageArchEmitsAllPaths(t *testing.T) {
 	scheme, host := "http", "archive.example"
 
 	rOld := seedBlob(t, c, "InRelease v1 dup-allowed")
-	idPrior, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	idPrior, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &rOld,
 	})
@@ -3178,7 +3178,7 @@ func TestCommitAdoption_PrefetchedURLPath_PreservesHotness(t *testing.T) {
 	}
 
 	r := seedBlob(t, c, "InRelease for hot test")
-	id, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &r,
 	})
@@ -3225,7 +3225,7 @@ func TestCommitAdoption_PrefetchedURLPath_FreshInsert(t *testing.T) {
 	const debP = "/pool/main/n/new/new_1.0_amd64.deb"
 
 	r := seedBlob(t, c, "InRelease fresh")
-	id, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &r,
 	})
@@ -3265,7 +3265,7 @@ func TestCommitAdoption_StampsCoverage(t *testing.T) {
 	ctx := context.Background()
 	scheme, host := "http", "archive.example"
 	r := seedBlob(t, c, "InRelease coverage test")
-	id, _, _ := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, _ := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host,
 		SuitePath: "/dists/noble", InReleaseHash: &r,
 	})

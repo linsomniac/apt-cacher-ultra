@@ -310,10 +310,11 @@ type PrefetchedURLPath struct {
 //     member rows point at it.
 //  5. Read the prior current_snapshot_id from suite_freshness (NULL if
 //     this is the first adoption for the suite).
-//  6. Upsert suite_freshness.current_snapshot_id to snapshotID, set the
+//  6. UPDATE suite_freshness.current_snapshot_id to snapshotID, set the
 //     row's validators to the candidate's, and clear
 //     inrelease_change_seen_at and the adoption failure record (spec C4,
-//     C7).
+//     C7). UPDATE-only (spec C3): no row rolls everything back with
+//     ErrSuiteGone.
 //  7. Stamp suite_snapshot.adopted_at (adoptionStampTx: max(now, prior + 1)).
 //  8. If prior_id was non-NULL, decrement refcount for each distinct
 //     blob_hash referenced by the prior snapshot's members. A blob
@@ -600,10 +601,8 @@ UPDATE blob
 			return fmt.Errorf("CommitAdoption: bump new refcounts: %w", err)
 		}
 
-		// Step 5: read prior current_snapshot_id from suite_freshness.
-		// A missing row means the suite has never had a freshness
-		// check (highly unusual since adoption is downstream of one,
-		// but the upsert in step 6 handles it).
+		// Step 5: read prior current_snapshot_id from suite_freshness. A
+		// missing row leaves prior NULL here and fails Step 6.
 		var prior sql.NullInt64
 		err = tx.QueryRowContext(ctx, `
 SELECT current_snapshot_id FROM suite_freshness
@@ -613,27 +612,32 @@ SELECT current_snapshot_id FROM suite_freshness
 			return fmt.Errorf("CommitAdoption: read prior: %w", err)
 		}
 
-		// Step 6: upsert the pointer and make the row describe the adopted
+		// Step 6: flip the pointer and make the row describe the adopted
 		// anchor (spec C4 "Validators"): its validators become the
 		// candidate's, the pending-change stamp and the adoption failure
-		// record are cleared (spec C4, C7). check and success stamps and
-		// check_fail_count are freshness state and stay as they are. A suite
-		// row created here starts with its v7 client-interest stamp
-		// (last_requested_at = now, as in PutSuiteFreshness); an existing
-		// row keeps its stamp.
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO suite_freshness
-  (canonical_scheme, canonical_host, suite_path, current_snapshot_id, last_requested_at,
-   inrelease_etag, inrelease_lastmod)
-VALUES (?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
-  current_snapshot_id      = excluded.current_snapshot_id,
-  inrelease_etag           = excluded.inrelease_etag,
-  inrelease_lastmod        = excluded.inrelease_lastmod,
-  inrelease_change_seen_at = NULL,
-  `+clearAdoptionFailureSet,
-			scheme, host, suite, snapshotID, now, candETag, candLastMod); err != nil {
+		// record are cleared (spec C4, C7). Check and success stamps,
+		// check_fail_count and last_requested_at stay as they are.
+		//
+		// AIDEV-NOTE: UPDATE-only (spec C3). A suite whose row is gone
+		// rolls the whole flip back with ErrSuiteGone: an adoption never
+		// resurrects a suite that cap eviction (or phase F's reaper)
+		// deleted, and createSuiteTx stays the only INSERT.
+		res, err := tx.ExecContext(ctx, `
+UPDATE suite_freshness
+   SET current_snapshot_id      = ?,
+       inrelease_etag           = ?,
+       inrelease_lastmod        = ?,
+       inrelease_change_seen_at = NULL,
+       `+clearAdoptionFailureSet+`
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+			snapshotID, candETag, candLastMod, scheme, host, suite)
+		if err != nil {
 			return fmt.Errorf("CommitAdoption: flip pointer: %w", err)
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return fmt.Errorf("CommitAdoption: flip pointer: %w", err)
+		} else if n == 0 {
+			return fmt.Errorf("%w: %s://%s%s", ErrSuiteGone, scheme, host, suite)
 		}
 
 		// Step 7: mark the new snapshot adopted with the spec C8 stamp:

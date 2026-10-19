@@ -49,7 +49,7 @@ func TestChaos_SnapshotGC_DisplacementDuringTick_VariantOne(t *testing.T) {
 			r1 := seedBlob(t, c, fmt.Sprintf("V1 r1 run-%02d", run))
 			r2 := seedBlob(t, c, fmt.Sprintf("V1 r2 run-%02d", run))
 
-			s1, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+			s1, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 				CanonicalScheme: "http",
 				CanonicalHost:   "v1.example",
 				SuitePath:       "/p",
@@ -61,7 +61,7 @@ func TestChaos_SnapshotGC_DisplacementDuringTick_VariantOne(t *testing.T) {
 			if err := c.CommitAdoption(ctx, s1, nil, nil, nil, nil, false); err != nil {
 				t.Fatalf("CommitAdoption S1: %v", err)
 			}
-			s2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+			s2, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 				CanonicalScheme: "http",
 				CanonicalHost:   "v1.example",
 				SuitePath:       "/p",
@@ -160,6 +160,10 @@ func TestChaos_SnapshotGC_HeartbeatLivenessRace_VariantTwo(t *testing.T) {
 			// holds for any reasonable wall-clock now.
 			inrel := seedBlob(t, c, fmt.Sprintf("V2 inrelease run-%02d", run))
 			s := orphanCandidate(t, c, "http", "v2.example", "/p", inrel, 1)
+			// CommitAdoption is UPDATE-only (spec C3): the suite needs its row.
+			if err := c.EnsureSuiteForTest(ctx, "http", "v2.example", "/p"); err != nil {
+				t.Fatal(err)
+			}
 
 			var (
 				wg        sync.WaitGroup

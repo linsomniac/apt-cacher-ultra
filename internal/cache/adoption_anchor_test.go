@@ -40,7 +40,7 @@ func TestCommitAdoption_SyncsInReleaseAnchorBlobHash(t *testing.T) {
 		t.Fatalf("seed anchor: %v", err)
 	}
 
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
 		InReleaseHash: &adopted,
 	})
@@ -81,7 +81,7 @@ func TestCommitAdoption_CreatesInReleaseAnchorWhenMissing(t *testing.T) {
 	const suite = "/ubuntu/dists/noble"
 	const anchorPath = suite + "/InRelease"
 
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
 		InReleaseHash: &adopted,
 	})
@@ -119,7 +119,7 @@ func TestCommitAdoption_CreatesAnchorWithAptEncodedURL(t *testing.T) {
 	const host = "archive.test"
 	const suite = "/a+b/dists/x"
 
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite, InReleaseHash: &adopted,
 	})
 	if err != nil {

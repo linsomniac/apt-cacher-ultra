@@ -89,6 +89,11 @@ func TestPhase2DetachedGPGForgery_RejectionLeavesSnapshotIntact(t *testing.T) {
 		CanonicalHost:   upstreamURL.Hostname(),
 		SuitePath:       chaos2Suite,
 	}
+	// Spec C3: CommitAdoption is UPDATE-only; the detached suite's
+	// InRelease misses (404) created no row.
+	if err := stack.handler.cache.EnsureSuiteForTest(context.Background(), "http", upstreamURL.Hostname(), chaos2Suite); err != nil {
+		t.Fatal(err)
+	}
 	if err := stack.adopter.RunDetached(context.Background(), suiteRef, snapA.release, snapA.releaseGPG, "\"A\"", ""); err != nil {
 		t.Fatalf("adopt A via RunDetached: %v", err)
 	}

@@ -29,7 +29,7 @@ func seedStaleAnchorAt(t *testing.T, c *cache.Cache, host, suite string) {
 		BlobHash: &stale, UpstreamURL: "http://" + host + suite + "/InRelease", IsMetadata: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite}); err != nil {
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -181,6 +181,7 @@ func TestCheck_RepairObeysTheGlobalSlot(t *testing.T) {
 		setupFF.put(base+"main/binary-amd64/Packages", pkgs)
 		setupFF.put(base+"Contents-amd64.gz", []byte(strings.Repeat("z", 90))) // stale generation
 		suite := SuiteRef{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suitePath}
+		trackSuite(t, c, suite)
 		if err := setupAd.Run(ctx, suite, releaseText, "", ""); err != nil {
 			t.Fatalf("setup Run(%s): %v", host, err)
 		}

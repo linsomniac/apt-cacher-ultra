@@ -35,7 +35,7 @@ func seedSimSuite(t *testing.T, c *cache.Cache, host, suite string, lastAt, fail
 		BlobHash: &bh, UpstreamURL: "http://" + host + suite + "/InRelease", IsMetadata: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
 		LastCheckAt: &lastAt, LastSuccessAt: &lastAt, CheckFailCount: failCount}); err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 		// due marks an adopted suite healthy and due at the first tick:
 		// checked and succeeded at stale. It leaves the snapshot alone.
 		due := func(host, suite string) {
-			if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host,
+			if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host,
 				SuitePath: suite, LastCheckAt: &stale, LastSuccessAt: &stale}); err != nil {
 				t.Fatal(err)
 			}
@@ -107,6 +107,7 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 		members.put(rBase+"main/binary-amd64/Packages", pkgsR)
 		members.put(rBase+"Contents-amd64.gz", bad)
 		members.put(rByHash, bad)
+		trackSuite(t, c, SuiteRef{CanonicalScheme: "http", CanonicalHost: "h1", SuitePath: "/r/dists/s"})
 		if err := ad.Run(ctx, SuiteRef{CanonicalScheme: "http", CanonicalHost: "h1", SuitePath: "/r/dists/s"}, relR, "", ""); err != nil {
 			t.Fatal(err)
 		}
@@ -133,6 +134,7 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 				return datedRelease(fmt.Sprintf("c-%s-%d", host, n), 0, map[string][]byte{"main/binary-amd64/Packages": pkgs(n)})
 			}
 			members.put(pkgsURL, pkgs(0))
+			trackSuite(t, c, SuiteRef{CanonicalScheme: "http", CanonicalHost: host, SuitePath: cSuite})
 			if err := ad.Run(ctx, SuiteRef{CanonicalScheme: "http", CanonicalHost: host, SuitePath: cSuite}, rel(0), "", ""); err != nil {
 				t.Fatal(err)
 			}
@@ -457,6 +459,7 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 			host := fmt.Sprintf("n%02d", i)
 			members.put(pkgsURL(host), pkgsFor("1-"+host))
 			ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: host, SuitePath: rigSuite}
+			trackSuite(t, c, ref)
 			if err := ad.Run(ctx, ref, rel("v1-"+host, pkgsFor("1-"+host)), "", ""); err != nil {
 				t.Fatal(err)
 			}

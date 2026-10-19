@@ -60,7 +60,7 @@ func TestServeHTTP_OnlyTrackedSuitesCreateGateState(t *testing.T) {
 		if n := s.gate.Len(); n != 0 {
 			t.Fatalf("an untracked suite created %d gate entries", n)
 		}
-		if err := s.c.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{CanonicalScheme: "http",
+		if err := s.c.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{CanonicalScheme: "http",
 			CanonicalHost: flipSimHost, SuitePath: "/tracked/dists/s"}); err != nil {
 			t.Fatal(err)
 		}

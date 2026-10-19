@@ -212,7 +212,7 @@ func realFormChecker(t *testing.T, form string, f Fetcher, sem *hostsem.Sem, log
 			t.Fatal(err)
 		}
 	}
-	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}); err != nil {
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}); err != nil {
 		t.Fatal(err)
 	}
 	chk, err := New(Config{Cache: c, Fetcher: f, HostLimiter: sem,

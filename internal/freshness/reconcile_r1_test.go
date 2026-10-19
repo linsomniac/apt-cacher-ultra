@@ -180,7 +180,7 @@ func storeInlineSnapshot(t *testing.T, env *adoptionTestEnv, blob []byte) int64 
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, _, err := env.cache.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	id, _, err := env.cache.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
 		CanonicalScheme: env.suite.CanonicalScheme, CanonicalHost: env.suite.CanonicalHost,
 		SuitePath: env.suite.SuitePath, InReleaseHash: &h})
 	if err != nil {

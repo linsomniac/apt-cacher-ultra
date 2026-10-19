@@ -566,7 +566,7 @@ func TestCommitAdoption_PrefetchUpsertClearsDroppedAt(t *testing.T) {
 		t.Fatalf("seed dropped_at: %v", err)
 	}
 
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
 		InReleaseHash: &ir,
 	})

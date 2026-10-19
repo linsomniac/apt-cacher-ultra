@@ -73,7 +73,9 @@ const checkDeadline = 2 * time.Minute
 // up an on-disk cache.
 type Cache interface {
 	GetSuiteFreshness(ctx context.Context, scheme, host, suitePath string) (*cache.SuiteFreshness, error)
-	PutSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error
+	// UpdateSuiteFreshness writes a check's result to an existing row
+	// (UPDATE-only, spec C3: a vanished row is left alone).
+	UpdateSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error
 	ListSuites(ctx context.Context) ([]cache.SuiteFreshness, error)
 	LookupURL(ctx context.Context, scheme, host, path string) (*cache.URLPath, error)
 	GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*cache.SuiteSnapshot, error)
@@ -398,6 +400,11 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) checkReport {
 	scheme, host, suitePath := ref.CanonicalScheme, ref.CanonicalHost, ref.SuitePath
 	key := suiteKey(scheme, host, suitePath)
+	// I-4 (spec C3): only a suite with a row is checked, and only it gets
+	// a lock-map entry; a minted path's T1 costs one indexed read.
+	if !c.suiteRowExists(ctx, ref) {
+		return checkReport{result: resultSkipped}
+	}
 	muVal, _ := c.locks.LoadOrStore(key, &sync.Mutex{})
 	mu := muVal.(*sync.Mutex)
 	if !mu.TryLock() {
@@ -431,6 +438,18 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 		mu.Unlock()
 	}
 	return out.report
+}
+
+// suiteRowExists reports whether the suite has a suite_freshness row
+// (I-4: the checker works only on tracked suites). A read error counts as
+// "no", logged: the check is skipped and the next trigger tries again.
+func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
+	_, err := c.cache.GetSuiteFreshness(ctx, ref.CanonicalScheme, ref.CanonicalHost, ref.SuitePath)
+	if err != nil && !errors.Is(err, cache.ErrNotFound) {
+		c.logger.Warn("freshness: read suite row failed",
+			"err", err, "canonical_host", ref.CanonicalHost, "suite_path", ref.SuitePath)
+	}
+	return err == nil
 }
 
 // spawnAdoption hands the suite mutex and the admission lease to the
@@ -747,13 +766,14 @@ func (c *Checker) checkLockedSafe(ctx, fetchCtx context.Context, scheme, host, s
 // bumpFailedCheck mirrors checkLocked's unknown-check bookkeeping after a
 // panic: last_check_at = now and one more on the streak (spec C4);
 // last_success_at untouched. Best effort; it never panics its caller.
-// AIDEV-NOTE: phase D turns the Put into the UPDATE-only writer.
+// AIDEV-NOTE: UPDATE-only since phase D (spec C3): a row deleted since the
+// panic records nothing, and nothing here may create one.
 func (c *Checker) bumpFailedCheck(ctx context.Context, scheme, host, suitePath string) {
 	defer func() { _ = recover() }()
 	cur, err := c.cache.GetSuiteFreshness(ctx, scheme, host, suitePath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
-		cur = &cache.SuiteFreshness{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}
+		return // the row is gone: nothing to bump (UPDATE-only, spec C3)
 	case err != nil:
 		c.logger.Warn("freshness: read suite row after a panic failed",
 			"err", err, "canonical_host", host, "suite_path", suitePath)
@@ -762,7 +782,7 @@ func (c *Checker) bumpFailedCheck(ctx context.Context, scheme, host, suitePath s
 	now := c.now().Unix()
 	cur.LastCheckAt = &now
 	cur.CheckFailCount++
-	if err := c.cache.PutSuiteFreshness(ctx, *cur); err != nil {
+	if err := c.cache.UpdateSuiteFreshness(ctx, *cur); err != nil {
 		c.logger.Warn("freshness: persist failure bump after a panic failed",
 			"err", err, "canonical_host", host, "suite_path", suitePath)
 	}
@@ -835,11 +855,9 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 	cur, err := c.cache.GetSuiteFreshness(ctx, scheme, host, suitePath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
-		cur = &cache.SuiteFreshness{
-			CanonicalScheme: scheme,
-			CanonicalHost:   host,
-			SuitePath:       suitePath,
-		}
+		// The row vanished after check's pre-read (I-4): nothing to check
+		// and nothing to write.
+		return
 	case err != nil:
 		c.logger.Warn("freshness: read suite row failed",
 			"err", err,
@@ -1163,14 +1181,14 @@ func (c *Checker) checkLockedInline(ctx, fetchCtx context.Context, out *checkOut
 		)
 		cur.LastSuccessAt = prevSuccess    // undo the optimistic success bump
 		cur.CheckFailCount = prevFails + 1 // undo the optimistic reset (spec C4)
-		if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
+		if perr := c.cache.UpdateSuiteFreshness(ctx, *cur); perr != nil {
 			c.logger.Warn("freshness: persist anomaly failed", "err", perr)
 		}
 		out.report.result = "failed"
 		return nil, nil, false
 	}
 
-	if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
+	if perr := c.cache.UpdateSuiteFreshness(ctx, *cur); perr != nil {
 		c.logger.Warn("freshness: persist success failed",
 			"err", perr,
 			"canonical_host", host,
@@ -1439,14 +1457,14 @@ func (c *Checker) checkLockedDetached(ctx, fetchCtx context.Context, out *checkO
 		)
 		cur.LastSuccessAt = prevSuccess    // undo the optimistic success bump
 		cur.CheckFailCount = prevFails + 1 // undo the optimistic reset (spec C4)
-		if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
+		if perr := c.cache.UpdateSuiteFreshness(ctx, *cur); perr != nil {
 			c.logger.Warn("freshness: persist anomaly failed", "err", perr)
 		}
 		out.report.result = "failed"
 		return nil, nil
 	}
 
-	if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
+	if perr := c.cache.UpdateSuiteFreshness(ctx, *cur); perr != nil {
 		c.logger.Warn("freshness: persist success failed",
 			"err", perr,
 			"canonical_host", host,
@@ -1493,7 +1511,7 @@ func (c *Checker) recordUnknownEnd(ctx context.Context, cur *cache.SuiteFreshnes
 	host, suitePath := suite.CanonicalHost, suite.SuitePath
 	cur.LastCheckAt = &nowUnix
 	cur.CheckFailCount++
-	if perr := c.cache.PutSuiteFreshness(ctx, *cur); perr != nil {
+	if perr := c.cache.UpdateSuiteFreshness(ctx, *cur); perr != nil {
 		c.logger.Warn("freshness: persist failure-bump failed",
 			"err", perr,
 			"canonical_host", host,

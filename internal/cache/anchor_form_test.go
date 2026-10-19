@@ -168,4 +168,18 @@ func TestGetSuiteSnapshot_ReturnsFormAndLifecycleFields(t *testing.T) {
 	if s2.Form != FormDetached || s2.SingleAnchorHash != nil || s2.ReleaseDate != nil || s2.RetiredAt != nil {
 		t.Fatalf("detached snapshot = %+v", s2)
 	}
+	// A-22: an InRelease candidate with no explicit form is inline.
+	inl := hA
+	id3, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/z", InReleaseHash: &inl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s3, err := c.GetSuiteSnapshot(ctx, id3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s3.Form != FormInline || s3.SingleAnchorHash == nil || *s3.SingleAnchorHash != hA || s3.ReleaseHash != nil {
+		t.Fatalf("inline snapshot = %+v", s3)
+	}
 }

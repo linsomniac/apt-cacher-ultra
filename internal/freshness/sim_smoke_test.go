@@ -29,7 +29,7 @@ func startSimChecker(t *testing.T, refresh time.Duration) (up *simtest.StaticCon
 		Path: "/r/dists/x/InRelease", BlobHash: &h, UpstreamURL: "http://h/r/dists/x/InRelease", IsMetadata: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}); err != nil {
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}); err != nil {
 		t.Fatal(err)
 	}
 	up = &simtest.StaticConditional{Status: 304}

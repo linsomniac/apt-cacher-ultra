@@ -82,7 +82,7 @@ func commitSnapshotWithSkips(t *testing.T, c *Cache, skipped []SkippedMember) in
 	t.Helper()
 	ctx := context.Background()
 	rel := seedBlob(t, c, "InRelease body")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/dists/s",
@@ -160,7 +160,7 @@ func TestCommitAdoption_RejectsMalformedSkippedHash(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	rel := seedBlob(t, c, "InRelease body")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/dists/s",
@@ -240,7 +240,7 @@ func TestRepairSkippedMember_RefusesNonCurrentSnapshot(t *testing.T) {
 
 	// Displace: adopt a second snapshot for the same suite.
 	rel2 := seedBlob(t, c, "InRelease v2")
-	id2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id2, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/dists/s",
@@ -281,7 +281,7 @@ func TestRepairSkippedMember_NoDoubleBumpForBlobAlreadyInSnapshot(t *testing.T) 
 	// would leak the blob forever.
 	shared := seedBlob(t, c, "shared bytes")
 	rel := seedBlob(t, c, "InRelease body")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/dists/s",
@@ -321,7 +321,7 @@ func TestRepairSkippedMember_NoDoubleBumpForBlobAlreadyInSnapshot(t *testing.T) 
 
 	// Displace the snapshot; the shared blob must land at exactly 0.
 	rel2 := seedBlob(t, c, "InRelease v2")
-	id2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id2, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/dists/s",
@@ -387,7 +387,7 @@ func TestSnapshotGC_ReapsSkippedMemberRows(t *testing.T) {
 
 	// Displace, then GC with keep_displaced = 0.
 	rel2 := seedBlob(t, c, "InRelease v2")
-	id2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id2, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/dists/s",
@@ -434,7 +434,7 @@ func TestRepairSkippedMember_SharedAliasAlreadyInSnapshot(t *testing.T) {
 	shared := seedBlob(t, c, "identical contents bytes")
 	rel := seedBlob(t, c, "InRelease body")
 	alias := "main/by-hash/SHA256/" + shared
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/dists/s",
@@ -490,7 +490,7 @@ func TestRepairSkippedMember_SharedAliasAlreadyInSnapshot(t *testing.T) {
 		t.Errorf("post-repair refcount = %d, want 1", got)
 	}
 	rel2 := seedBlob(t, c, "InRelease v2")
-	id2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id2, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/dists/s",
@@ -520,7 +520,7 @@ func TestRepairSkippedMember_RejectsConflictingExistingRow(t *testing.T) {
 	good := seedBlob(t, c, "good bytes")
 	stale := seedBlob(t, c, "stale bytes")
 	rel := seedBlob(t, c, "InRelease body")
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/dists/s",

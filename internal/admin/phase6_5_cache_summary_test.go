@@ -330,12 +330,12 @@ func TestRepoCoverage_RefresherCached(t *testing.T) {
 		host   = "archive.example"
 		suite  = "/cached/dists/cached"
 	)
-	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{
 		CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
-	id, _, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite,
 		InReleaseHash: &releaseHash,
 	})

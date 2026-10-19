@@ -191,7 +191,7 @@ func adoptLegacy(t *testing.T, env *adoptionTestEnv, suite string, anchor []byte
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, _, err := env.cache.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	id, _, err := env.cache.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: suite, InReleaseHash: &ah})
 	if err != nil {
 		t.Fatal(err)
@@ -225,7 +225,7 @@ func adoptDetached(t *testing.T, env *adoptionTestEnv, suite, deb string) int64 
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, _, err := env.cache.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	id, _, err := env.cache.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: suite, ReleaseHash: &rel, ReleaseGPGHash: &sig})
 	if err != nil {
 		t.Fatal(err)
@@ -717,7 +717,7 @@ func TestRunLegacyTrustAudit_QuarantinedR1SuiteReadoptsOnFirstCheck(t *testing.T
 	}
 	etag, lastmod := upstreamETag, upstreamLastMod
 	sf.InReleaseETag, sf.InReleaseLastMod = &etag, &lastmod
-	if err := env.cache.PutSuiteFreshness(ctx, *sf); err != nil {
+	if err := env.cache.SeedSuiteForTest(ctx, *sf); err != nil {
 		t.Fatal(err)
 	}
 	if err := env.cache.ClearSignedSeenForTest(ctx); err != nil {
@@ -762,7 +762,7 @@ func TestRunLegacyTrustAudit_MarksFromCachedSignedAnchors(t *testing.T) {
 	seed := func(tracked bool, suite, name string, body []byte) {
 		t.Helper()
 		if tracked {
-			if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: suite}); err != nil {
+			if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: suite}); err != nil {
 				t.Fatal(err)
 			}
 		}

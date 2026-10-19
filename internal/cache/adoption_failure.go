@@ -56,8 +56,8 @@ type AdoptionFailure struct {
 }
 
 // clearAdoptionFailureSet resets the record. CommitAdoption's flip
-// appends it to its ON CONFLICT clause, so a successful adoption clears
-// the record in the same transaction that makes the snapshot current.
+// appends it to its UPDATE, so a successful adoption clears the record in
+// the same transaction that makes the snapshot current.
 const clearAdoptionFailureSet = `adoption_fail_hash     = NULL,
   adoption_fail_reason   = NULL,
   adoption_fail_count    = 0,
@@ -130,6 +130,9 @@ UPDATE suite_freshness SET adoption_next_retry_at = ?
 // at checker start: next_retry_at = now + offset(), offset drawn per row
 // (spec C7 "Restart"). Refusal states and panic records keep their
 // schedule. Returns the number of rows rescheduled. One transaction.
+// offset runs on the writer goroutine, possibly after this call returned
+// on a cancelled context, so it must be safe to call from another
+// goroutine (math/rand/v2's top-level functions are; deferred minor B-2).
 func (c *Cache) RescheduleFailingAdoptions(ctx context.Context, now int64, offset func() int64) (int, error) {
 	skip := append(slices.Clone(refusalReasons), ReasonPanic)
 	args := make([]any, len(skip))
@@ -138,7 +141,7 @@ func (c *Cache) RescheduleFailingAdoptions(ctx context.Context, now int64, offse
 	}
 	sel := `SELECT canonical_scheme, canonical_host, suite_path FROM suite_freshness
  WHERE adoption_fail_count > 0
-   AND adoption_fail_reason NOT IN (` + strings.TrimSuffix(strings.Repeat("?,", len(skip)), ",") + `)`
+   AND COALESCE(adoption_fail_reason, '') NOT IN (` + strings.TrimSuffix(strings.Repeat("?,", len(skip)), ",") + `)`
 	const upd = `UPDATE suite_freshness SET adoption_next_retry_at = ?
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
 	n := 0

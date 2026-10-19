@@ -37,6 +37,7 @@ func (s *flipStack) serve(anchorTransfer, indexTransfer time.Duration) simtest.S
 // Release and Release.gpg.
 func (s *flipStack) adoptDetached(suite string, gen int) {
 	ref, rel := s.publish(suite, gen)
+	s.track(suite)
 	sig := []byte(fmt.Sprintf("signature of %s generation %d", suite, gen))
 	if err := s.ad.RunDetached(context.Background(), ref, rel, sig, "", ""); err != nil {
 		s.t.Errorf("adopt %s generation %d (detached): %v", suite, gen, err)

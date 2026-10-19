@@ -127,12 +127,21 @@ func (s *flipStack) publish(suite string, gen int) (freshness.SuiteRef, []byte) 
 	return freshness.SuiteRef{CanonicalScheme: "http", CanonicalHost: flipSimHost, SuitePath: suite}, rel
 }
 
+// track gives suite a suite_freshness row: spec C3 lets only the handler
+// create rows, and CommitAdoption is UPDATE-only.
+func (s *flipStack) track(suite string) {
+	if err := s.c.EnsureSuiteForTest(context.Background(), "http", flipSimHost, suite); err != nil {
+		s.t.Errorf("track %s: %v", suite, err)
+	}
+}
+
 // adopt publishes generation gen of suite upstream and adopts it (inline
 // form) through the barrier; it returns once the commit is done. The
 // InRelease is clearsigned (spec §7 "Fixtures"); plainVerifier hands the
 // whole envelope to ParseRelease, which skips the armor lines.
 func (s *flipStack) adopt(suite string, gen int) {
 	ref, rel := s.publish(suite, gen)
+	s.track(suite)
 	if err := s.ad.Run(context.Background(), ref, simtest.ClearsignedFixture(string(rel)), "", ""); err != nil {
 		s.t.Errorf("adopt %s generation %d: %v", suite, gen, err)
 	}

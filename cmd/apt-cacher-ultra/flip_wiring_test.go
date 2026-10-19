@@ -113,7 +113,7 @@ func TestServeListeners_LegacyAuditErrorHasOnePrefix(t *testing.T) {
 	if err := c.PutBlob(ctx, h, 1); err != nil {
 		t.Fatal(err)
 	}
-	id, _, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x", InReleaseHash: &h})
 	if err != nil {
 		t.Fatal(err)

@@ -159,7 +159,7 @@ func newRetryRig(t *testing.T, cooldown time.Duration) *retryRig {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	seedStaleAnchor(t, c)
-	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}); err != nil {
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}); err != nil {
 		t.Fatal(err)
 	}
 	r := &retryRig{

@@ -58,7 +58,7 @@ func putPoolBlob(t *testing.T, c *cache.Cache, content string) string {
 func adoptSnapshot(t *testing.T, c *cache.Cache, scheme, host, suite, inreleaseHash string, blobHashes []string) int64 {
 	t.Helper()
 	ctx := context.Background()
-	id, _, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
 		CanonicalScheme:         scheme,
 		CanonicalHost:           host,
 		SuitePath:               suite,
@@ -471,7 +471,7 @@ func TestRunTick_ResumesPendingBlobBeforeStartingAnotherSnapshotPass(t *testing.
 	logger, _ := captureLogger()
 	orphanBlob := seedReapableBlob(t, c, "orphan awaiting blob pass")
 	anchor := putPoolBlob(t, c, "orphan candidate anchor")
-	id, _, err := c.InsertCandidateSnapshot(context.Background(), cache.SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(context.Background(), cache.SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "example.test", SuitePath: "/dists/stable", InReleaseHash: &anchor,
 	})
 	if err != nil {

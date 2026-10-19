@@ -12,7 +12,7 @@ func commitCandidate(t *testing.T, c *Cache, sc SnapshotCandidate, content strin
 	ctx := context.Background()
 	h := seedBlob(t, c, content)
 	sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath, sc.InReleaseHash = "http", "h", afSuite, &h
-	id, _, err := c.InsertCandidateSnapshot(ctx, sc)
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, sc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestInsertCandidateSnapshot_StoresReleaseDate(t *testing.T) {
 	h := seedBlob(t, c, "dated inrelease")
 	d1, d2 := int64(1_700_000_000), int64(1_700_000_500)
 	sc := SnapshotCandidate{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: afSuite, InReleaseHash: &h, ReleaseDate: &d1}
-	id, _, err := c.InsertCandidateSnapshot(ctx, sc)
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, sc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestInsertCandidateSnapshot_StoresReleaseDate(t *testing.T) {
 		t.Fatalf("release_date = %v (err %v), want %d", snap.ReleaseDate, err, d1)
 	}
 	sc.ReleaseDate = &d2
-	id2, reused, err := c.InsertCandidateSnapshot(ctx, sc)
+	id2, reused, err := c.InsertTrackedCandidateForTest(ctx, sc)
 	if err != nil || !reused || id2 != id {
 		t.Fatalf("reuse = %d, %v, %v", id2, reused, err)
 	}
@@ -99,7 +99,7 @@ func TestInsertCandidateSnapshot_NaturalKeyErrorNamesTheSnapshot(t *testing.T) {
 	c := openCache(t)
 	id := commitCandidate(t, c, SnapshotCandidate{}, "adopted once")
 	h := seedBlob(t, c, "adopted once")
-	_, _, err := c.InsertCandidateSnapshot(context.Background(), SnapshotCandidate{
+	_, _, err := c.InsertTrackedCandidateForTest(context.Background(), SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: afSuite, InReleaseHash: &h})
 	var nk *NaturalKeyAdoptedError
 	if !errors.As(err, &nk) || nk.SnapshotID != id || !errors.Is(err, ErrSnapshotNaturalKeyAdopted) {

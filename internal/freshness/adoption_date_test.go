@@ -105,7 +105,7 @@ func TestAdopter_UndatedLegacySnapshotImposesNoRule(t *testing.T) {
 	if err := env.cache.PutBlob(ctx, h, 13); err != nil {
 		t.Fatal(err)
 	}
-	id, _, err := env.cache.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{CanonicalScheme: "http",
+	id, _, err := env.cache.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{CanonicalScheme: "http",
 		CanonicalHost: "archive.ubuntu.com", SuitePath: "/ubuntu/dists/noble", InReleaseHash: &h})
 	if err != nil {
 		t.Fatal(err)

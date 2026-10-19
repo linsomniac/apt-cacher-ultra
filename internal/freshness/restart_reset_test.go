@@ -13,7 +13,7 @@ func seedRecords(t *testing.T, r *retryRig, next int64, recs map[string]string) 
 	t.Helper()
 	ctx := context.Background()
 	for path, reason := range recs {
-		if err := r.cache.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: path}); err != nil {
+		if err := r.cache.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: path}); err != nil {
 			t.Fatal(err)
 		}
 		if err := r.cache.RecordAdoptionFailure(ctx, "http", rigHost, path, cache.AdoptionFailure{

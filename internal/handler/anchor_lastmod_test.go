@@ -134,10 +134,10 @@ func TestServeHTTP_DetachedAnchorsCarryAdoptedAtIndexesDoNot(t *testing.T) {
 	rel := writeBlob(t, h, []byte("Release body"))
 	sig := writeBlob(t, h, []byte("Release.gpg body"))
 	pkgs := writeBlob(t, h, []byte("Packages body"))
-	if err := h.cache.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: lmSuite}); err != nil {
+	if err := h.cache.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: lmSuite}); err != nil {
 		t.Fatal(err)
 	}
-	id, _, err := h.cache.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+	id, _, err := h.cache.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		SuitePath: lmSuite, ReleaseHash: &rel, ReleaseGPGHash: &sig})
 	if err != nil {
 		t.Fatal(err)

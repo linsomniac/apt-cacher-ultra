@@ -46,7 +46,7 @@ type SuiteFreshness struct {
 	// stamp; only phase D's TouchSuite and the row-creating writers set it.
 	LastRequestedAt *int64
 	// CheckFailCount is the streak of consecutive freshness checks that
-	// ended unknown (spec C4). PutSuiteFreshness writes it; the scheduler
+	// ended unknown (spec C4). UpdateSuiteFreshness writes it; the scheduler
 	// reads it to order and back off suites.
 	CheckFailCount int64
 	// Adoption failure record (spec C7): the content key and reason of the
@@ -55,7 +55,7 @@ type SuiteFreshness struct {
 	//
 	// AIDEV-NOTE: only RecordAdoptionFailure, ClearAdoptionFailure,
 	// SetAdoptionNextRetry, RescheduleFailingAdoptions and CommitAdoption's
-	// flip write these columns. PutSuiteFreshness never does.
+	// flip write these columns. UpdateSuiteFreshness never does.
 	AdoptionFailHash    *string
 	AdoptionFailReason  *string
 	AdoptionFailCount   int64

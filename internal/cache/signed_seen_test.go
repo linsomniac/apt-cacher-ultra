@@ -37,7 +37,7 @@ func TestCommitAdoption_SignedFormsRecordSignedSeen(t *testing.T) {
 	commit := func(suite string, cand SnapshotCandidate, members []SnapshotMember) {
 		t.Helper()
 		cand.CanonicalScheme, cand.CanonicalHost, cand.SuitePath = "http", "h", suite
-		id, _, err := c.InsertCandidateSnapshot(ctx, cand)
+		id, _, err := c.InsertTrackedCandidateForTest(ctx, cand)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -58,10 +58,15 @@ func TestCommitAdoption_SignedFormsRecordSignedSeen(t *testing.T) {
 	commit("/r/dists/unsigned", SnapshotCandidate{InReleaseHash: &un, Form: FormUnsigned},
 		[]SnapshotMember{{Path: "Release", BlobHash: un, DeclaredSHA256: un}})
 
-	for suite, want := range map[string]bool{"/r/dists/inline": true, "/r/dists/detached": true, "/r/dists/unsigned": false} {
-		at, ok, err := c.SignedSeen(ctx, "http", "h", suite)
+	// A-23: a flat suite "/flat/." is marked at its base "/flat".
+	flat := seedBlob(t, c, "flat inline anchor (signed-seen)")
+	commit("/flat/.", SnapshotCandidate{InReleaseHash: &flat},
+		[]SnapshotMember{{Path: "InRelease", BlobHash: flat, DeclaredSHA256: flat}})
+	for base, want := range map[string]bool{"/r/dists/inline": true, "/r/dists/detached": true, "/r/dists/unsigned": false,
+		"/flat": true, "/flat/.": false} {
+		at, ok, err := c.SignedSeen(ctx, "http", "h", base)
 		if err != nil || ok != want || (ok && at != 1_800_000_000) {
-			t.Errorf("%s: marker ok=%v at=%d err=%v, want ok=%v at the commit time", suite, ok, at, err, want)
+			t.Errorf("%s: marker ok=%v at=%d err=%v, want ok=%v at the commit time", base, ok, at, err, want)
 		}
 	}
 }

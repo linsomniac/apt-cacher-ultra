@@ -75,7 +75,7 @@ func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixtu
 	priorBlobBytes := []byte("old deb bytes")
 	priorBlob := writeFixtureBlob(t, c, priorBlobBytes)
 	priorRelease := writeFixtureBlob(t, c, []byte("InRelease v1"))
-	priorID, _, err := c.InsertCandidateSnapshot(context.Background(), cache.SnapshotCandidate{
+	priorID, _, err := c.InsertTrackedCandidateForTest(context.Background(), cache.SnapshotCandidate{
 		CanonicalScheme: suite.CanonicalScheme,
 		CanonicalHost:   suite.CanonicalHost,
 		SuitePath:       suite.SuitePath,
@@ -85,12 +85,12 @@ func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixtu
 		t.Fatalf("InsertCandidateSnapshot prior: %v", err)
 	}
 	const debP = "/pool/main/h/hello/hello.deb"
-	if err := c.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{
+	if err := c.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{
 		CanonicalScheme: suite.CanonicalScheme,
 		CanonicalHost:   suite.CanonicalHost,
 		SuitePath:       suite.SuitePath,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
 	if err := c.CommitAdoption(context.Background(), priorID,
 		[]cache.SnapshotMember{{SnapshotID: priorID, Path: "InRelease", BlobHash: priorRelease, DeclaredSHA256: priorRelease}}, nil,
@@ -125,7 +125,7 @@ func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixtu
 	// to warm; we use the same path here for simplicity (a Phase 3
 	// upgrade-in-place where the filename was stable).
 	candidateRelease := writeFixtureBlob(t, c, []byte("InRelease v2"))
-	candidateID, _, err := c.InsertCandidateSnapshot(context.Background(), cache.SnapshotCandidate{
+	candidateID, _, err := c.InsertTrackedCandidateForTest(context.Background(), cache.SnapshotCandidate{
 		CanonicalScheme: suite.CanonicalScheme,
 		CanonicalHost:   suite.CanonicalHost,
 		SuitePath:       suite.SuitePath,

@@ -90,7 +90,7 @@ func TestAdopter_MalformedEnvelopeCreatesNoSnapshot(t *testing.T) {
 	suite := freshness.SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}
 	// The suite is tracked, so the closing check reads a row (deferred
 	// minor A-52: it passed vacuously on ErrNotFound).
-	if err := c.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{
+	if err := c.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}); err != nil {
 		t.Fatal(err)
 	}

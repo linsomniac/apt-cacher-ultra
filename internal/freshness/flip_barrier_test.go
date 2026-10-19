@@ -56,6 +56,7 @@ func newBarrierRig(t *testing.T, quiet, heartbeat time.Duration) *barrierRig {
 	if err != nil {
 		t.Fatal(err)
 	}
+	trackSuite(t, c, barrierSuite)
 	return &barrierRig{c: c, gate: gate, ad: ad, logs: logs, pkgs: pkgs}
 }
 
@@ -463,7 +464,7 @@ func TestCheck_BarrierPastTheDeadlineKeepsTheCommitErrorsOutcome(t *testing.T) {
 		chk.Check(ctx, "http", rigHost, rigSuite)
 		time.Sleep(25 * time.Second) // the adoption waits in the barrier; its deadline passed at 20 s
 		hash := hashOf(rel)
-		id, reused, err := r.c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{CanonicalScheme: "http",
+		id, reused, err := r.c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{CanonicalScheme: "http",
 			CanonicalHost: rigHost, SuitePath: rigSuite, InReleaseHash: &hash})
 		if err != nil || !reused {
 			t.Fatalf("the adoption's candidate: id %d, reused %v, err %v", id, reused, err)
@@ -661,7 +662,7 @@ func TestCheck_GateCloseAbortsASkippedFirstAdoption(t *testing.T) {
 		r := newBarrierRig(t, 10*time.Second, 0)
 		req := r.request("v1")
 		r.putServedAnchor(t, req.bytes)
-		if err := r.c.PutSuiteFreshness(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}); err != nil {
+		if err := r.c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}); err != nil {
 			t.Fatal(err)
 		}
 		chk, err := New(Config{Cache: r.c, Fetcher: &changedUpstream{body: req.bytes}, HostLimiter: hostsem.New(8),
@@ -725,6 +726,7 @@ func TestSimCapacity_TheBarrierHoldsTheGlobalSlotWithinItsBound(t *testing.T) {
 		for _, host := range hosts {
 			members.put(pkgsURL(host), pkgsFor("1-"+host))
 			ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: host, SuitePath: rigSuite}
+			trackSuite(t, c, ref)
 			if err := ad.Run(ctx, ref, rel("v1-"+host, pkgsFor("1-"+host)), "", ""); err != nil {
 				t.Fatal(err)
 			}

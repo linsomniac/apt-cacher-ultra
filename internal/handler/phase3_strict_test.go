@@ -188,14 +188,14 @@ func adoptCoverageComplete(t *testing.T, h *Handler,
 	t.Helper()
 	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for "+suite))
 
-	if err := h.cache.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{
+	if err := h.cache.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{
 		CanonicalScheme: scheme,
 		CanonicalHost:   host,
 		SuitePath:       suite,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
-	id, _, err := h.cache.InsertCandidateSnapshot(context.Background(),
+	id, _, err := h.cache.InsertTrackedCandidateForTest(context.Background(),
 		cache.SnapshotCandidate{
 			CanonicalScheme: scheme,
 			CanonicalHost:   host,

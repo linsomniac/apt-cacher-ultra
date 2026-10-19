@@ -72,3 +72,50 @@ func (c *Cache) ClearSignedSeenForTest(ctx context.Context) error {
 		return err
 	})
 }
+
+// SeedSuiteForTest stores s's suite row the way fixtures relied on before
+// spec C3 made every writer but CreateSuite UPDATE-only: it creates the
+// row if absent (createSuiteTx, uncapped, interest stamp now) and writes
+// s's six check columns with UpdateSuiteFreshness's statement, in one
+// writer transaction. Fixtures use it to build a tracked suite in a given
+// state. This file is not a _test.go file, so the helper is compiled into
+// the production binary; never call it from non-test code
+// (TestOnlyTheHandlerCreatesSuiteRows fails on such a call). TEST-ONLY.
+func (c *Cache) SeedSuiteForTest(ctx context.Context, s SuiteFreshness) error {
+	key := SuiteKey{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath}
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("SeedSuiteForTest: begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := createSuiteTx(ctx, tx, SuiteSeed{SuiteKey: key, RequestedAt: nowUnix()}, SuiteCaps{}); err != nil {
+			return fmt.Errorf("SeedSuiteForTest: %w", err)
+		}
+		if err := updateSuiteFreshness(ctx, tx, s); err != nil {
+			return fmt.Errorf("SeedSuiteForTest: update: %w", err)
+		}
+		return tx.Commit()
+	})
+}
+
+// EnsureSuiteForTest gives a suite an empty row (uncapped, interest stamp
+// now) unless it has one: spec C3 lets only the handler create rows, and
+// CommitAdoption (UPDATE-only) and the checker (I-4) need one. TEST-ONLY.
+func (c *Cache) EnsureSuiteForTest(ctx context.Context, scheme, host, suitePath string) error {
+	_, err := c.CreateSuite(ctx, SuiteSeed{
+		SuiteKey:    SuiteKey{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath},
+		RequestedAt: nowUnix(),
+	}, SuiteCaps{}, nil)
+	return err
+}
+
+// InsertTrackedCandidateForTest is InsertCandidateSnapshot for a suite
+// that EnsureSuiteForTest first gives a row, so the candidate can be
+// committed (CommitAdoption Step 6 is UPDATE-only). TEST-ONLY.
+func (c *Cache) InsertTrackedCandidateForTest(ctx context.Context, sc SnapshotCandidate) (int64, bool, error) {
+	if err := c.EnsureSuiteForTest(ctx, sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath); err != nil {
+		return 0, false, err
+	}
+	return c.InsertCandidateSnapshot(ctx, sc)
+}

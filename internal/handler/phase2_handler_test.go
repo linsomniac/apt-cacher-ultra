@@ -1207,14 +1207,14 @@ func commitInlineSnapshot(t *testing.T, h *Handler,
 	// CommitAdoption flips the pointer in-place. (The schema FK on
 	// current_snapshot_id is to suite_snapshot, but the adoption
 	// transaction expects a writable row to update.)
-	if err := h.cache.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{
+	if err := h.cache.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{
 		CanonicalScheme: scheme,
 		CanonicalHost:   canonHost,
 		SuitePath:       suite,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
-	id, _, err := h.cache.InsertCandidateSnapshot(context.Background(),
+	id, _, err := h.cache.InsertTrackedCandidateForTest(context.Background(),
 		cache.SnapshotCandidate{
 			CanonicalScheme: scheme,
 			CanonicalHost:   canonHost,
