@@ -133,7 +133,7 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 			return res, err
 		}
 	}
-	n, err := markFromCachedSignedAnchors(ctx, c)
+	n, err := markFromCachedSignedAnchors(ctx, c, logger)
 	if err != nil {
 		return res, err
 	}
@@ -317,23 +317,20 @@ func clearsignCanonical(b []byte) []byte {
 // tracked suite whose cached InRelease or Release.gpg passes the sniff
 // gets a marker stamped with that row's last use. Idempotent (markers
 // keep the newest stamp), so it runs at every start.
-func markFromCachedSignedAnchors(ctx context.Context, c *cache.Cache) (int, error) {
+func markFromCachedSignedAnchors(ctx context.Context, c *cache.Cache, logger *slog.Logger) (int, error) {
 	anchors, err := c.ListTrackedSuiteAnchors(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("legacy trust audit: list anchors: %w", err)
 	}
 	var marks []cache.SignedSeenMark
 	for _, a := range anchors {
-		head, err := readCapped(c.BlobPath(a.BlobHash), aptpath.SniffHeadBytes)
-		if err != nil && !errors.Is(err, errAnchorTooLarge) {
-			continue // pool file gone or unreadable: no evidence either way
-		}
-		ok := false
-		switch {
-		case strings.HasSuffix(a.Path, "/InRelease"):
-			ok = aptpath.SniffInRelease(head)
-		case strings.HasSuffix(a.Path, "/Release.gpg"):
-			ok = aptpath.SniffReleaseGPG(head)
+		ok, err := sniffCachedAnchor(c, a.Path, a.BlobHash)
+		if err != nil {
+			// Pool file gone or unreadable: no evidence either way
+			// (deferred minor A-49: said at DEBUG, not silently).
+			logger.Debug("legacy trust audit: cached anchor skipped",
+				"canonical_host", a.CanonicalHost, "path", a.Path, "err", err)
+			continue
 		}
 		if ok {
 			marks = append(marks, cache.SignedSeenMark{CanonicalScheme: a.CanonicalScheme,
@@ -344,6 +341,30 @@ func markFromCachedSignedAnchors(ctx context.Context, c *cache.Cache) (int, erro
 		return 0, fmt.Errorf("legacy trust audit: mark anchors: %w", err)
 	}
 	return len(marks), nil
+}
+
+// sniffCachedAnchor reports whether the pool file of a cached signed
+// anchor (path is <suite>/InRelease or <suite>/Release.gpg) passes its
+// sniff (spec C3: the rule the handler marks by). The startup marker pass
+// and the adopter's re-mark before an unsigned commit (ruling R-E1) share
+// it, so they agree on what counts as signed. A pool file that does not
+// exist is an error wrapping fs.ErrNotExist; any other path is never
+// signed.
+func sniffCachedAnchor(c *cache.Cache, path, blobHash string) (bool, error) {
+	var file aptpath.SuiteFile
+	switch {
+	case strings.HasSuffix(path, "/InRelease"):
+		file = aptpath.FileInRelease
+	case strings.HasSuffix(path, "/Release.gpg"):
+		file = aptpath.FileReleaseGPG
+	default:
+		return false, nil
+	}
+	head, err := readCapped(c.BlobPath(blobHash), int64(file.HeadBytes()))
+	if err != nil && !errors.Is(err, errAnchorTooLarge) {
+		return false, err
+	}
+	return file.Sniff(path, head), nil
 }
 
 // readCapped reads at most limit bytes of path. A longer file returns its

@@ -22,14 +22,29 @@ const (
 // contentKey identifies the content an adoption attempted (spec C7).
 // Any byte change is new content, attempted at once. Inline:
 // sha256(InRelease). Detached: sha256(sha256(Release) || sha256(Release.gpg)),
-// so a re-signature alone is new content too. (Phase E adds unsigned:
-// sha256(Release).)
+// so a re-signature alone is new content too. Unsigned:
+// sha256("unsigned\n" || Release), domain-separated from the inline key, so
+// a record for an InRelease body never matches a Release with the same
+// bytes (design review M-2: the "confirmed once" rule trusts a record with
+// an equal key).
+//
+// AIDEV-NOTE: each form keys its own argument — inline the InRelease
+// (inline), detached and unsigned the Release (release). Keying the
+// unsigned Release through inline (nil) would give all unsigned content
+// one key, and new content would be deferred (overview, B carry-forward).
+// No stored record holds an unsigned key from before phase E.
 func contentKey(form adoptionForm, inline, release, sig []byte) string {
-	if form == adoptionFormDetached {
+	switch form {
+	case adoptionFormDetached:
 		r, g := sha256.Sum256(release), sha256.Sum256(sig)
 		h := sha256.New()
 		h.Write(r[:])
 		h.Write(g[:])
+		return hex.EncodeToString(h.Sum(nil))
+	case adoptionFormUnsigned:
+		h := sha256.New()
+		h.Write([]byte("unsigned\n"))
+		h.Write(release)
 		return hex.EncodeToString(h.Sum(nil))
 	}
 	s := sha256.Sum256(inline)

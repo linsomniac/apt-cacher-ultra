@@ -412,6 +412,12 @@ type AdoptionConfig struct {
 	// register anchor serves with the same gate (Adopter.FlipGate).
 	FlipGate *flipgate.Gate
 
+	// AdoptUnsigned is adoption.adopt_unsigned (spec C5 safeguard 1, D6):
+	// whether a Release-only upstream is adopted in the unsigned form
+	// (never vouching a .deb, never a downgrade from signed). The zero
+	// value is off; config defaults it on.
+	AdoptUnsigned bool
+
 	// HotPackagesWindow is the SPEC3 §5.2 hot_packages.window. 0
 	// disables hot-package proactive refresh entirely.
 	HotPackagesWindow time.Duration
@@ -528,6 +534,14 @@ type Adopter struct {
 
 	// flipGate is the spec C8 barrier the commit waits behind (nil: none).
 	flipGate *flipgate.Gate
+
+	// adoptUnsigned is adoption.adopt_unsigned (spec C5 safeguard 1).
+	adoptUnsigned bool
+
+	// beforeCommit, when set (tests only), runs inside the commit — after
+	// the flip barrier, before CommitAdoption: the window spec C5's
+	// in-transaction never-downgrade recheck closes.
+	beforeCommit func()
 
 	// reconcilePendingHook, when set, runs at the start of
 	// reconcilePending. Test seam: a panic in the repair decision must not
@@ -684,6 +698,7 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		maxConcurrent:           cfg.MaxConcurrent,
 		maxDuration:             maxDur,
 		flipGate:                cfg.FlipGate,
+		adoptUnsigned:           cfg.AdoptUnsigned,
 		hotPackagesWindow:       cfg.HotPackagesWindow,
 		hotPrefetchBudget:       cfg.HotPrefetchBudget,
 		maxVersionsPerPackage:   maxVersions,
@@ -873,18 +888,19 @@ func (a *Adopter) runHeartbeatTicker(ctx context.Context, host string, snapshotI
 	}
 }
 
-// adoptionForm distinguishes the two SPEC2 §7.6.3 signature forms.
+// adoptionForm distinguishes the anchor forms (SPEC2 §7.6.3, spec C5).
 type adoptionForm int
 
 const (
 	adoptionFormInline   adoptionForm = iota // clearsigned InRelease
 	adoptionFormDetached                     // Release + Release.gpg
+	adoptionFormUnsigned                     // Release alone, unverified (spec C5, phase E)
 )
 
 // adoptionPayload carries the form-specific inputs to runShared.
-// Exactly one of (inlineBytes) or (releaseBytes + sigBytes) is set on
-// entry; runShared populates the *Hash fields once step 2 has stored
-// the verified blobs in pool/.
+// Exactly one of (inlineBytes), (releaseBytes + sigBytes) or — for the
+// unsigned form — (releaseBytes) is set on entry; runShared populates the
+// *Hash fields once step 2 has stored the blobs in pool/.
 type adoptionPayload struct {
 	form adoptionForm
 
@@ -892,7 +908,8 @@ type adoptionPayload struct {
 	inlineBytes []byte // clearsigned InRelease
 	inlineHash  string // sha256 of inlineBytes (set in step 2)
 
-	// Detached mode (form == adoptionFormDetached).
+	// Detached mode (form == adoptionFormDetached); the unsigned form uses
+	// releaseBytes and releaseHash alone.
 	releaseBytes   []byte
 	sigBytes       []byte
 	releaseHash    string // sha256 of releaseBytes (set in step 2)
@@ -987,18 +1004,26 @@ func (a *Adopter) runRequest(ctx context.Context, req *adoptionRequest, hooks ru
 		p.inlineBytes = req.bytes
 	case adoptionFormDetached:
 		p.releaseBytes, p.sigBytes = req.releaseBytes, req.sigBytes
+	case adoptionFormUnsigned:
+		p.releaseBytes = req.releaseBytes
 	}
 	return a.runShared(ctx, req.suite, p, req.etag, req.lastmod)
 }
 
-// runShared is the SPEC2 §7.5 adoption pipeline shared across both
-// signature forms. Form-specific dispatch happens at three points:
-//   - Step 1: VerifyInline vs VerifyDetached.
-//   - Step 2: persist 1 blob (InRelease) vs 2 blobs (Release, Release.gpg).
-//   - Step 6: metadata-self rows — 1 (InRelease) vs 2 (Release, Release.gpg).
+// runShared is the SPEC2 §7.5 adoption pipeline shared across the anchor
+// forms. Form-specific dispatch happens at these points:
+//   - Step 1: VerifyInline vs VerifyDetached; the unsigned form's
+//     eligibility (spec C5) instead of a verification.
+//   - Step 2: persist 1 blob (InRelease, or the unsigned Release) vs 2
+//     blobs (Release, Release.gpg).
+//   - Step 3: the unsigned form's member cap.
+//   - Step 6: metadata-self rows — InRelease, Release + Release.gpg, or
+//     Release (unsigned).
+//   - Step 8: no package_hash rows for the unsigned form.
+//   - Before the barrier: the unsigned form's re-mark (ruling R-E1).
 //
-// Steps 3–5 and 7–10 are identical: parse, candidate insert, member
-// prefetch, by-hash, package_hash, atomic flip, success log.
+// The other steps are identical: parse, candidate insert, member
+// prefetch, by-hash, atomic flip, success log.
 func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayload, etag, lastmod string) error {
 	// Step 0a: capture the prior (current) snapshot. After
 	// CommitAdoption the prior snapshot is no longer current, so the
@@ -1034,6 +1059,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		releaseText, verifyErr = a.verifier.VerifyInline(ctx, suite, p.inlineBytes)
 	case adoptionFormDetached:
 		releaseText, verifyErr = a.verifier.VerifyDetached(ctx, suite, p.releaseBytes, p.sigBytes)
+	case adoptionFormUnsigned:
+		// Spec C5: unsigned eligibility takes the verification's place —
+		// the first never-downgrade point, before anything is downloaded.
+		// Nothing verifies the text: it never vouches a .deb (Step 8).
+		if err := a.unsignedEligible(ctx, suite); err != nil {
+			return err // a refusal: the checker records and logs it
+		}
+		releaseText = p.releaseBytes
 	}
 	if verifyErr != nil {
 		a.logger.Info("adoption_gpg_failed",
@@ -1087,6 +1120,17 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		}
 		p.releaseHash = rh
 		p.releaseGPGHash = gh
+	case adoptionFormUnsigned:
+		rh, err := a.writeBlobBytes(ctx, p.releaseBytes)
+		if err != nil {
+			a.logger.Warn("adoption: persist Release failed",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"err", err,
+			)
+			return fmt.Errorf("%w: persist Release: %v", ErrAdoptionDBFailed, err)
+		}
+		p.releaseHash = rh
 	}
 
 	// Step 3: parse the verified Release-style plaintext.
@@ -1101,6 +1145,13 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			"err", err,
 		)
 		return fmt.Errorf("%w: %v", ErrAdoptionParseFailed, err)
+	}
+	// Spec C5 safeguard 4: an unsigned Release declaring more than
+	// unsignedMemberCap members is refused before any download.
+	if p.form == adoptionFormUnsigned {
+		if err := unsignedCap(len(members)); err != nil {
+			return err
+		}
 	}
 
 	// Step 3a (spec C5): apt's Date rules, checked before the candidate
@@ -1140,6 +1191,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		cand.ReleaseHash = &p.releaseHash
 		cand.ReleaseGPGHash = &p.releaseGPGHash
 		cand.Form = cache.FormDetached
+	case adoptionFormUnsigned:
+		// Spec C5: the unsigned Release sits in the single-anchor slot,
+		// and the form is named explicitly — the cache never derives it.
+		cand.InReleaseHash = &p.releaseHash
+		cand.Form = cache.FormUnsigned
 	}
 	cand.ReleaseDate = &relDate
 	if etag != "" {
@@ -1486,8 +1542,16 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// Step 6: metadata-self snapshot_member row(s). Without these
 	// the §6.1 snapshot-scoped lookup would 404 on the very URLs
 	// apt fetches first. Inline mode contributes one row (InRelease);
-	// detached mode contributes two (Release, Release.gpg).
+	// detached mode contributes two (Release, Release.gpg); the unsigned
+	// form one (Release).
 	switch p.form {
+	case adoptionFormUnsigned:
+		memberRows = append(memberRows, cache.SnapshotMember{
+			SnapshotID:     snapshotID,
+			Path:           "Release",
+			BlobHash:       p.releaseHash,
+			DeclaredSHA256: p.releaseHash,
+		})
 	case adoptionFormInline:
 		memberRows = append(memberRows, cache.SnapshotMember{
 			SnapshotID:     snapshotID,
@@ -1549,11 +1613,16 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// denominator (a 4xx-skipped Packages directory must drop
 	// coverage to false, not disappear from the count); fetchedMembers
 	// drives the parse loop (only those have blobs in the pool).
-	pkgHashRes, err := a.buildPackageHashes(suite, snapshotID, members, fetchedMembers)
+	pkgHashRes, err := a.buildPackageHashes(suite, snapshotID, cand.Form, members, fetchedMembers)
 	if err != nil {
 		return err // already wrapped with category
 	}
 	packageHashes := pkgHashRes.rows
+	// Spec C5 safeguard 5: no package_hash row on any path for the
+	// unsigned form (buildPackageHashes returns none; the Sources and
+	// pdiff builders are not run), so it vouches no .deb and hot prefetch
+	// warms nothing for it.
+	unsigned := cand.Form == cache.FormUnsigned
 
 	// SPEC6_5 §7.1: source-package adoption. Walks the same
 	// fetchedMembers slice for Sources-shaped index files and folds
@@ -1564,11 +1633,13 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// different SHA256 for one .dsc) surfaces as ErrAdoptionParseFailed
 	// alongside the existing Packages-variant disagreement check
 	// (SPEC6_5 §11 H7).
-	sourceRows, _, err := a.buildSourceHashes(suite, snapshotID, fetchedMembers)
-	if err != nil {
-		return err
+	if !unsigned {
+		sourceRows, _, err := a.buildSourceHashes(suite, snapshotID, fetchedMembers)
+		if err != nil {
+			return err
+		}
+		packageHashes = append(packageHashes, sourceRows...)
 	}
-	packageHashes = append(packageHashes, sourceRows...)
 
 	// SPEC6_5 §7.3: pdiff Index adoption. Parses each
 	// Packages.diff/Index and Sources.diff/Index, populates
@@ -1580,11 +1651,13 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// and pdiff rows. Per-Index parse failures are tolerated; cross-
 	// Index disagreement on a patch path surfaces as
 	// ErrAdoptionParseFailed (§11 H7-equivalent).
-	pdiffRows, _, err := a.buildPdiffHashes(suite, snapshotID, fetchedMembers)
-	if err != nil {
-		return err
+	if !unsigned {
+		pdiffRows, _, err := a.buildPdiffHashes(suite, snapshotID, fetchedMembers)
+		if err != nil {
+			return err
+		}
+		packageHashes = append(packageHashes, pdiffRows...)
 	}
-	packageHashes = append(packageHashes, pdiffRows...)
 
 	// SPEC4 §7.5.2 site 3: heartbeat after Packages parsing returns.
 	// debian-main at multiple architectures can be tens of MiB of
@@ -1634,6 +1707,38 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		return fmt.Errorf("adoption: shutdown before the commit: %w", err)
 	}
 
+	// Ruling R-E1: before an unsigned commit, re-run the cached
+	// signed-anchor mark of the suite (the adoption holds its mutex), so
+	// the commit's in-transaction marker re-read sees any signed anchor the
+	// suite has cached — even one phase D's backstop failed to mark. A
+	// failed re-mark refuses the commit (fail closed). It runs before the
+	// barrier, outside the hold, under the shutdown signal (not the
+	// adoption deadline: it would discard finished member work) and the
+	// commit's bound.
+	//
+	// AIDEV-NOTE: the refusal is recorded as unsigned_downgrade_refused,
+	// which here can mean "could not rule out signed history" (a pool or
+	// database fault), so the fault itself is logged first: ERROR for a
+	// pool read error, WARN otherwise (design review M-1).
+	if p.form == adoptionFormUnsigned {
+		mctx, cancel := context.WithTimeout(p.barrierCtx(ctx), commitTimeout)
+		err := a.remarkSignedAnchors(mctx, suite)
+		cancel()
+		if err != nil {
+			if stop := p.stopErr(ctx); stop != nil {
+				return fmt.Errorf("adoption: shutdown before the commit: %w", stop)
+			}
+			level := slog.LevelWarn
+			if errors.Is(err, errRemarkPoolRead) {
+				level = slog.LevelError
+			}
+			a.logger.Log(ctx, level, "adoption: signed-anchor re-mark failed",
+				"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "err", err)
+			return fmt.Errorf("%w: the cached signed anchors could not be re-marked: %w",
+				ErrAdoptionUnsignedDowngradeRefused, err)
+		}
+	}
+
 	// Step 11: the atomic flip transaction, behind the spec C8 flip
 	// barrier. The barrier's waits do not honour adoption.max_duration
 	// (they are bounded by 140 s, and giving up would throw away finished
@@ -1651,6 +1756,9 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		if a.commitDelay > 0 {
 			time.Sleep(a.commitDelay) // test seam: a slow transaction (SetCommitDelayForTest)
 		}
+		if a.beforeCommit != nil {
+			a.beforeCommit() // test seam: the window the in-transaction recheck closes
+		}
 		commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
 		defer cancelCommit()
 		return a.cache.CommitAdoption(commitCtx, snapshotID, memberRows, integritySkipped, packageHashes,
@@ -1659,6 +1767,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	if err := a.flip(ctx, suite, p, prior == nil, snapshotID, commit); err != nil {
 		if errors.Is(err, flipgate.ErrAborted) {
 			return fmt.Errorf("adoption: shutdown in the flip barrier: %w", err)
+		}
+		// Ruling R-E2: a refusal raised inside the commit transaction (the
+		// never-downgrade recheck) is a state, not a failure — its own
+		// sentinel, no WARN, no db_failed wrap — also after a barrier that
+		// outlived adoption.max_duration (spawnAdoption keeps the commit's
+		// own classification then).
+		if errors.Is(err, cache.ErrUnsignedDowngradeRefused) {
+			return fmt.Errorf("%w: %w", ErrAdoptionUnsignedDowngradeRefused, err)
 		}
 		a.logger.Warn("adoption: commit failed",
 			"canonical_host", suite.CanonicalHost,
@@ -1802,11 +1918,17 @@ func (a *Adopter) flip(ctx context.Context, suite SuiteRef, p *adoptionPayload, 
 	return err
 }
 
-// barrierOutcome is adoption_flip_barrier's outcome: the barrier's own, or
-// commit_failed when the commit ran and failed (the snapshot did not
-// switch; the timing fields still describe the barrier).
+// barrierOutcome is adoption_flip_barrier's outcome: the barrier's own;
+// refused when the commit refused the candidate (ruling R-E2: an unsigned
+// downgrade found inside the commit transaction is a state, not a failed
+// commit); or commit_failed when the commit ran and failed. Either way the
+// snapshot did not switch, and the timing fields still describe the
+// barrier.
 func barrierOutcome(outcome string, commitErr error) string {
-	if commitErr != nil {
+	switch {
+	case errors.Is(commitErr, cache.ErrUnsignedDowngradeRefused):
+		return "refused"
+	case commitErr != nil:
 		return "commit_failed"
 	}
 	return outcome
@@ -1814,17 +1936,24 @@ func barrierOutcome(outcome string, commitErr error) string {
 
 // servedAnchorUnchanged reports whether the anchor this adoption commits
 // is byte-for-byte the url_path anchor clients have been served: the
-// primary anchor of its form (InRelease inline, Release detached — index
-// consistency depends on the Release text, not on its signature). A read
-// error answers false, so the barrier runs (the safe direction).
-//
-// AIDEV-TODO(phase E): the unsigned form's anchor is <suite>/Release too.
+// primary anchor of its form (InRelease inline; Release for the detached
+// and unsigned forms — index consistency depends on the Release text, not
+// on its signature). A read error answers false, so the barrier runs (the
+// safe direction); one other than "no row" is logged (deferred minor
+// C-16). The read runs under the shutdown signal, like the barrier's own
+// waits (ruling R-C2), never unbounded.
 func (a *Adopter) servedAnchorUnchanged(ctx context.Context, suite SuiteRef, p *adoptionPayload) bool {
 	path, want := suite.SuitePath+inReleaseFilename, p.inlineHash
-	if p.form == adoptionFormDetached {
+	if p.form == adoptionFormDetached || p.form == adoptionFormUnsigned {
 		path, want = suite.SuitePath+releaseFilename, p.releaseHash
 	}
-	row, err := a.cache.LookupURL(context.WithoutCancel(ctx), suite.CanonicalScheme, suite.CanonicalHost, path)
+	rctx, cancel := context.WithTimeout(p.barrierCtx(ctx), commitTimeout)
+	defer cancel()
+	row, err := a.cache.LookupURL(rctx, suite.CanonicalScheme, suite.CanonicalHost, path)
+	if err != nil && !errors.Is(err, cache.ErrNotFound) {
+		a.logger.Warn("adoption: served anchor read failed; the flip barrier runs",
+			"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "path", path, "err", err)
+	}
 	return err == nil && row.BlobHash != nil && *row.BlobHash == want
 }
 
@@ -1839,19 +1968,23 @@ func formOfSnapshot(snap *cache.SuiteSnapshot) (adoptionForm, bool) {
 		return adoptionFormInline, true
 	case cache.FormDetached:
 		return adoptionFormDetached, true
+	case cache.FormUnsigned:
+		return adoptionFormUnsigned, true
 	}
 	return 0, false
 }
 
 // formName renders an adoptionForm as a stable string suitable for
-// structured logs. Operators pivot adoption_success on this to track
-// per-suite form drift over time.
+// structured logs (the cache.AnchorForm values). Operators pivot
+// adoption_success on this to track per-suite form drift over time.
 func formName(f adoptionForm) string {
 	switch f {
 	case adoptionFormInline:
 		return "inline"
 	case adoptionFormDetached:
 		return "detached"
+	case adoptionFormUnsigned:
+		return "unsigned"
 	default:
 		return "unknown"
 	}
@@ -2313,8 +2446,14 @@ type debPathDecl struct {
 // fetchedMembers would silently drop a 4xx-skipped Packages directory
 // from the denominator and let coverage_complete = true vacuously hold
 // for an incomplete snapshot.
-func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
-	allMembers, fetchedMembers []ReleaseMember) (packageHashBuildResult, error) {
+//
+// form is the snapshot's anchor form: the unsigned form gets no row and no
+// coverage (spec C5 safeguard 5 — no package_hash row on any path:
+// adoption here, reconcile through the same call), so it vouches no .deb.
+func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cache.AnchorForm, allMembers, fetchedMembers []ReleaseMember) (packageHashBuildResult, error) {
+	if form == cache.FormUnsigned {
+		return packageHashBuildResult{}, nil
+	}
 	repoRoot, ok := repoRootFromSuitePath(suite.SuitePath)
 	if !ok {
 		a.logger.Info("package_coverage_incomplete",

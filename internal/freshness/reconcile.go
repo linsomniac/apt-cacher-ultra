@@ -79,8 +79,13 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	}
 	// Build package_hash rows for the healed indexes (declared set = full
 	// re-parsed Release so coverage math matches adoption; fetched set =
-	// the indexes we just healed).
-	phRes, err := a.buildPackageHashes(suite, snapshotID, declared, healedDecl)
+	// the indexes we just healed). The snapshot's form decides: an
+	// unsigned snapshot gets none (spec C5 safeguard 5).
+	snap, err := a.cache.GetSuiteSnapshot(ctx, snapshotID)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile: read snapshot: %w", err)
+	}
+	phRes, err := a.buildPackageHashes(suite, snapshotID, snap.Form, declared, healedDecl)
 	if err != nil {
 		return 0, fmt.Errorf("reconcile: build package hashes: %w", err)
 	}

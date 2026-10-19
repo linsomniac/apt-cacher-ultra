@@ -366,7 +366,7 @@ func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 	members := []ReleaseMember{
 		{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))},
 	}
-	res, err := a.buildPackageHashes(suiteRef, 1, members, members)
+	res, err := a.buildPackageHashes(suiteRef, 1, cache.FormInline, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: unexpected error: %v", err)
 	}
@@ -421,7 +421,7 @@ func TestBuildPackageHashes_VersionlessBinaryStanzaSkippedCoverageIntact(t *test
 	suiteRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example", SuitePath: "/dists/noble"}
 	members := []ReleaseMember{{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))}}
 
-	res, err := a.buildPackageHashes(suiteRef, 1, members, members)
+	res, err := a.buildPackageHashes(suiteRef, 1, cache.FormInline, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestBuildPackageHashes_AllVersionlessBinaryFlipsCoverage(t *testing.T) {
 	suiteRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example", SuitePath: "/dists/noble"}
 	members := []ReleaseMember{{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))}}
 
-	res, err := a.buildPackageHashes(suiteRef, 1, members, members)
+	res, err := a.buildPackageHashes(suiteRef, 1, cache.FormInline, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: %v", err)
 	}
@@ -518,7 +518,7 @@ func TestBuildPackageHashes_IncompleteIdentityBinarySkipped(t *testing.T) {
 	suiteRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example", SuitePath: "/dists/noble"}
 	members := []ReleaseMember{{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))}}
 
-	res, err := a.buildPackageHashes(suiteRef, 1, members, members)
+	res, err := a.buildPackageHashes(suiteRef, 1, cache.FormInline, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: %v", err)
 	}

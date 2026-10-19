@@ -249,7 +249,8 @@ func classifyAdoptionOutcome(err error) string {
 		return "success"
 	}
 	switch {
-	case errors.Is(err, ErrAdoptionUpstreamOlder), errors.Is(err, ErrAdoptionRollbackRefused):
+	case errors.Is(err, ErrAdoptionUpstreamOlder), errors.Is(err, ErrAdoptionRollbackRefused),
+		errors.Is(err, ErrAdoptionUnsignedDowngradeRefused), errors.Is(err, ErrAdoptionUnsignedTooLarge):
 		return "refused"
 	case errors.Is(err, ErrAdoptionReleaseDateInFuture):
 		return "release_date_in_future"
@@ -314,10 +315,23 @@ func classifyAdoptionReason(err error, outcome string, gpgClassifier func(error)
 	}
 	switch outcome {
 	case "refused":
-		if errors.Is(err, ErrAdoptionUpstreamOlder) {
+		// AIDEV-NOTE: one case per refusal sentinel (overview, B
+		// carry-forward). A refusal recorded under another reason would be
+		// misread — rollback_refused is in admin's refusalKeepsCurrent, which
+		// hides the lag of a suite that is in fact behind — so an
+		// unrecognised refusal falls back to the outcome, which the admin
+		// page shows as a failure.
+		switch {
+		case errors.Is(err, ErrAdoptionUpstreamOlder):
 			return cache.ReasonUpstreamOlder
+		case errors.Is(err, ErrAdoptionRollbackRefused):
+			return cache.ReasonRollbackRefused
+		case errors.Is(err, ErrAdoptionUnsignedDowngradeRefused):
+			return cache.ReasonUnsignedDowngradeRefused
+		case errors.Is(err, ErrAdoptionUnsignedTooLarge):
+			return cache.ReasonUnsignedTooLarge
 		}
-		return cache.ReasonRollbackRefused
+		return outcome
 	case "panicked":
 		return cache.ReasonPanic
 	}
