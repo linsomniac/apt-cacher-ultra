@@ -48,7 +48,7 @@ type FetchedResult struct {
 // fails the miss (502, no body) as it does today. A cap rejection is not a
 // failure: the url_path row is stored and the suite stays untracked (no
 // marker). Like CreateSuite, it tries once more when its held eviction
-// candidate vanished before the writer ran.
+// candidate vanished or was kept (requested) before the writer ran.
 //
 // AIDEV-NOTE: the writer is a FIFO queue drained by one goroutine
 // (submitWrite), so an unsigned CommitAdoption enqueued after this
@@ -62,10 +62,10 @@ func (c *Cache) StoreFetched(ctx context.Context, m FetchedRow, caps SuiteCaps, 
 			})
 	}
 	res, err := attempt()
-	if err == nil && res.Create.heldGone {
-		// The held candidate was evicted by a concurrent creation first:
-		// one more attempt with a fresh list (the url_path upsert repeats
-		// harmlessly).
+	if err == nil && res.Create.retry() {
+		// The held candidate was evicted by a concurrent creation first, or
+		// kept (a client asked for it meanwhile): one more attempt with a
+		// fresh list (the url_path upsert repeats harmlessly).
 		res, err = attempt()
 	}
 	return res, err

@@ -140,11 +140,22 @@ type CreateResult struct {
 	// was never sniffed; the caller marks it after the commit (the
 	// handler's markCachedSignedAnchors backstop).
 	Unproven bool
+	// CandidatesBusy: a global-cap refusal while every listed eviction
+	// candidate was busy (its mutex held by a check, an adoption or
+	// another creation) — transient, since an idle suite may well make
+	// room within moments (the handler caches it for a minute, not ten).
+	CandidatesBusy bool
 	// heldGone: the held eviction candidate had no row when the writer ran
-	// (a concurrent creation had evicted it); CreateSuite and StoreFetched
-	// then try once more with a fresh candidate list.
-	heldGone bool
+	// (a concurrent creation had evicted it); heldKept: it no longer
+	// qualified (a client asked for it in between). Either way CreateSuite
+	// and StoreFetched try once more with a fresh candidate list.
+	heldGone, heldKept bool
 }
+
+// retry reports whether the attempt should be made once more with a fresh
+// candidate list: its held candidate vanished or was kept (design review
+// M4; final review, concurrency M2).
+func (r CreateResult) retry() bool { return r.heldGone || r.heldKept }
 
 // SuiteGuard lets cap eviction hold a candidate's in-memory suite mutex
 // (spec C3: eviction runs under the suite's mutex) without internal/cache
@@ -214,10 +225,11 @@ func (c *Cache) CreateSuite(ctx context.Context, seed SuiteSeed, caps SuiteCaps,
 		return r.Create, err
 	}
 	res, err := attempt()
-	if err == nil && res.heldGone {
+	if err == nil && res.retry() {
 		// The held candidate's row was deleted between the candidate list
-		// and the writer (a concurrent creation evicted it): one more
-		// attempt, with a fresh list (design review M4).
+		// and the writer (a concurrent creation evicted it), or kept (a
+		// client asked for it meanwhile): one more attempt, with a fresh
+		// list (design review M4; final review, concurrency M2).
 		res, err = attempt()
 	}
 	return res, err
@@ -243,12 +255,13 @@ func (c *Cache) CreateSuite(ctx context.Context, seed SuiteSeed, caps SuiteCaps,
 func (c *Cache) creationAttempt(ctx context.Context, op string, create *SuiteSeed, caps SuiteCaps, guard SuiteGuard,
 	body func(ctx context.Context, tx *sql.Tx, held *heldSuite) (FetchedResult, error)) (FetchedResult, error) {
 	var held *heldSuite
+	busy := false
 	if create != nil {
-		h, err := c.holdEvictionCandidate(ctx, caps, guard)
+		h, b, err := c.holdEvictionCandidate(ctx, caps, guard)
 		if err != nil {
 			return FetchedResult{}, err
 		}
-		held = h
+		held, busy = h, b
 	}
 	if held != nil {
 		// A no-op once afterCreate settled the hold; on a panic it releases
@@ -285,6 +298,12 @@ func (c *Cache) creationAttempt(ctx context.Context, op string, create *SuiteSee
 	if err != nil {
 		return FetchedResult{}, err
 	}
+	if busy && got.Create.Outcome == SuiteRejectedGlobal {
+		// Refused for want of a held candidate while candidates exist: they
+		// were all busy (createSuiteTx refuses at the global cap with no
+		// held candidate).
+		got.Create.CandidatesBusy = true
+	}
 	return got, nil
 }
 
@@ -316,7 +335,9 @@ func (c *Cache) afterCreate(key SuiteKey, res CreateResult, held *heldSuite) {
 	if held == nil {
 		return // an eviction needs a held candidate: nothing was evicted
 	}
-	gone := res.Evicted != nil || res.heldGone || c.suiteRowGone(held.key)
+	// A kept candidate's row was there in the committed transaction, and no
+	// deleter can have removed it since (this creation holds its guard).
+	gone := res.Evicted != nil || res.heldGone || (!res.heldKept && c.suiteRowGone(held.key))
 	if gone {
 		c.forgetTouch(held.key)
 	}
@@ -339,25 +360,28 @@ func (c *Cache) suiteRowGone(key SuiteKey) bool {
 // releases an unused candidate as not deleted), or nil: the least recently
 // requested of at most suiteEvictCandidates evictable suites whose mutex
 // guard takes at once (a nil guard takes the first, with a no-op release).
-// A guard that is a ClockStepReporter is told of a suite whose
-// last_requested_at lies in the future.
+// busy reports that it found candidates but every one was busy. A guard
+// that is a ClockStepReporter is told of a suite whose last_requested_at
+// lies in the future.
 //
 // AIDEV-NOTE: holding a candidate from caps.Global-suiteEvictCandidates on
 // (design review M5) keeps creations that race at the cap boundary — each
-// saw room outside the writer — from being refused, and cached for 10
-// minutes, while idle suites could make room: TryLock keeps their
-// candidates distinct, so each one that runs after the table filled
-// evicts its own.
-func (c *Cache) holdEvictionCandidate(ctx context.Context, caps SuiteCaps, guard SuiteGuard) (*heldSuite, error) {
+// saw room outside the writer — from being refused while idle suites could
+// make room: TryLock keeps their candidates distinct, so each one that
+// runs after the table filled evicts its own. A candidate kept by the
+// writer is retried with a fresh list, and a refusal with every candidate
+// busy is cached for a minute, not ten (CreateResult.CandidatesBusy; final
+// review, concurrency M2): either can happen in a full, healthy cache.
+func (c *Cache) holdEvictionCandidate(ctx context.Context, caps SuiteCaps, guard SuiteGuard) (held *heldSuite, busy bool, err error) {
 	if caps.Global <= 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	var n int
 	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM suite_freshness`).Scan(&n); err != nil {
-		return nil, fmt.Errorf("CreateSuite: count suites: %w", err)
+		return nil, false, fmt.Errorf("CreateSuite: count suites: %w", err)
 	}
 	if n < caps.Global-suiteEvictCandidates {
-		return nil, nil
+		return nil, false, nil
 	}
 	now := nowUnix()
 	if r, ok := guard.(ClockStepReporter); ok {
@@ -371,32 +395,32 @@ SELECT canonical_scheme, canonical_host, suite_path
  ORDER BY last_requested_at, canonical_scheme, canonical_host, suite_path
  LIMIT ?`, cutoff, suiteEvictCandidates)
 	if err != nil {
-		return nil, fmt.Errorf("CreateSuite: list eviction candidates: %w", err)
+		return nil, false, fmt.Errorf("CreateSuite: list eviction candidates: %w", err)
 	}
 	var cands []SuiteKey
 	for rows.Next() {
 		var k SuiteKey
 		if err := rows.Scan(&k.CanonicalScheme, &k.CanonicalHost, &k.SuitePath); err != nil {
 			_ = rows.Close()
-			return nil, fmt.Errorf("CreateSuite: scan eviction candidate: %w", err)
+			return nil, false, fmt.Errorf("CreateSuite: scan eviction candidate: %w", err)
 		}
 		cands = append(cands, k)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("CreateSuite: list eviction candidates: %w", err)
+		return nil, false, fmt.Errorf("CreateSuite: list eviction candidates: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("CreateSuite: list eviction candidates: %w", err)
+		return nil, false, fmt.Errorf("CreateSuite: list eviction candidates: %w", err)
 	}
 	for _, k := range cands {
 		if guard == nil {
-			return &heldSuite{key: k, release: func(bool) {}}, nil
+			return &heldSuite{key: k, release: func(bool) {}}, false, nil
 		}
 		if release, ok := guard.HoldSuite(k); ok {
-			return &heldSuite{key: k, release: release}, nil
+			return &heldSuite{key: k, release: release}, false, nil
 		}
 	}
-	return nil, nil
+	return nil, len(cands) > 0, nil
 }
 
 // reportFutureInterest tells r of the suite without a current snapshot
@@ -421,8 +445,9 @@ SELECT canonical_scheme, canonical_host, suite_path, last_requested_at
 // the caller's writer transaction, and marks a created row's base
 // signed-seen for the signed metadata its creation knows of (markCreated).
 // At or above the global cap it first evicts held (deleteSuiteTx), and
-// refuses when held is nil or no longer qualifies — or, above the cap,
-// after the eviction (ruling PD-8). It holds the only INSERT INTO
+// refuses when held is nil or no longer qualifies (the caller then retries
+// once with a fresh list, heldGone/heldKept) — or, above the cap, after
+// the eviction (ruling PD-8). It holds the only INSERT INTO
 // suite_freshness in production code (spec C3).
 //
 // AIDEV-NOTE: keep this the single INSERT site
@@ -471,7 +496,7 @@ SELECT 1 FROM suite_freshness
 				return CreateResult{}, err
 			}
 			if out != suiteDeleted {
-				return CreateResult{Outcome: SuiteRejectedGlobal, heldGone: out == suiteNoRow}, nil
+				return CreateResult{Outcome: SuiteRejectedGlobal, heldGone: out == suiteNoRow, heldKept: out == suiteKept}, nil
 			}
 			evicted := held.key
 			res.Evicted = &evicted

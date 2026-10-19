@@ -273,8 +273,12 @@ the cache's guard and takes the mutex with `TryLock`, a busy suite is
 skipped, at most eight candidates are tried, and the writer runs no foreign
 code. A candidate is held once the table is within eight rows of the cap,
 so concurrent creations at the boundary do not refuse while an idle suite
-exists. An attempt evicts at most one suite: above the cap (after
-`max_suites` was lowered, or after an upgrade) it evicts one and is still
+exists; a held candidate the writer finds gone or no longer idle (a client
+asked for it in between) makes the creation try once more with a fresh
+candidate list (at most two attempts), and a refusal because every listed
+candidate was busy is transient (below). An attempt evicts at most one
+suite: above the cap (after `max_suites` was lowered, or after an upgrade)
+it evicts one and is still
 refused while the count stays at or above the cap, so the table converges
 under the 24 h rule (phase D, ruling PD-8). The per-host cap never evicts;
 a host at its cap shrinks only through the reaper (C9, `gc.suite_idle_ttl`,
@@ -293,7 +297,12 @@ in memory per suite key — whichever of the suite's files was refused — for
 10 minutes, so an over-cap suite does not cost a writer operation per
 request; the map holds at most 4,096 suites (when it is full, expired
 entries are dropped and, if it is still full, it is cleared, so a suite can
-then be counted again within its 10 minutes). A suite path longer than
+then be counted again within its 10 minutes). A refusal at the global cap
+while every listed eviction candidate was busy (its mutex held by a check,
+an adoption or another creation) is transient: it is cached for 1 minute,
+and its `suite_seed_rejected` line, under the same once-a-minute limit,
+has `detail` "eviction candidates busy; retried after 1 minute" (phase D
+final review). A suite path longer than
 1024 bytes is not a suite for tracking: classification never treats its
 files as suite files, so it gets no row, marker, touch or rejection-cache
 entry (phase D, ruling PD-9).
@@ -1130,8 +1139,9 @@ Constants, not knobs: backoff 2 m → 1 h (adoption failures and repeated
 (the C8 quiet cut at 15 s); phase A cap 60 s; hold-token wait 60 s; waiter
 caps 256 (barrier) and 64 (strict wait); strict wait 15 s; reaps 25 per run;
 unsigned member cap 1,000; check deadline 2 min; check workers 4; interest
-window 7 d; orphan-marker TTL 365 d; cap-rejection cache 10 min (at most
-4,096 suites); tracked suite path at most 1024 bytes; legacy-audit anchor
+window 7 d; orphan-marker TTL 365 d; cap-rejection cache 10 min (1 min for
+a refusal while every eviction candidate is busy; at most 4,096 suites);
+tracked suite path at most 1024 bytes; legacy-audit anchor
 read cap 8 MiB and batch 100.
 
 ## 6. Migration v6 → v7

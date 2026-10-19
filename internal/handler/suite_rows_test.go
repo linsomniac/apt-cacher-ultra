@@ -598,7 +598,7 @@ func TestSeedRejections_TTLAndBound(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var s seedRejections
 		k := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/s"}
-		s.add(k)
+		s.add(k, seedRejectTTL)
 		time.Sleep(seedRejectTTL - time.Second)
 		if !s.rejected(k) {
 			t.Fatal("expired before 10 minutes")
@@ -608,9 +608,9 @@ func TestSeedRejections_TTLAndBound(t *testing.T) {
 			t.Fatalf("still cached after 10 minutes (%d entries)", s.len())
 		}
 		for i := range seedRejectMax {
-			s.add(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/" + strings.Repeat("x", i+1)})
+			s.add(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/" + strings.Repeat("x", i+1)}, seedRejectTTL)
 		}
-		s.add(k)
+		s.add(k, seedRejectTTL)
 		if n := s.len(); n != 1 {
 			t.Fatalf("after overflowing with live entries: %d entries, want 1 (cleared, then the new one)", n)
 		}
@@ -630,7 +630,7 @@ func TestSeedRejections_TTLAndBound(t *testing.T) {
 func TestSeedRejections_ExpireWithoutTraffic(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var s seedRejections
-		s.add(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/s"})
+		s.add(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/s"}, seedRejectTTL)
 		if got := sumMetricLines(t, []string{"acu_suites_seed_rejected"})["acu_suites_seed_rejected"]; got != 1 {
 			t.Fatalf("gauge = %v, want 1", got)
 		}
@@ -642,7 +642,7 @@ func TestSeedRejections_ExpireWithoutTraffic(t *testing.T) {
 		if got := sumMetricLines(t, []string{"acu_suites_seed_rejected"})["acu_suites_seed_rejected"]; got != 0 {
 			t.Fatalf("gauge = %v after the TTL with no traffic, want 0", got)
 		}
-		s.add(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/t"})
+		s.add(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/t"}, seedRejectTTL)
 		s.close()
 		time.Sleep(seedRejectTTL + seedRejectSweep)
 		synctest.Wait()
@@ -684,6 +684,40 @@ func TestNoteCreate_WarnIsRateLimited(t *testing.T) {
 		if len(recs) != 2 || recs[0]["suppressed"] != float64(0) || recs[1]["suppressed"] != float64(2) ||
 			recs[1]["suite_path"] != "/d" || recs[1]["cap"] != "global_cap" {
 			t.Fatalf("records = %+v; want /a (suppressed 0) and /d (suppressed 2)", recs)
+		}
+	})
+}
+
+// Final review, concurrency M2 (ruling FW-5 2): a global-cap refusal
+// while every eviction candidate was busy is transient — cached for a
+// minute, not ten, and its suite_seed_rejected line (under the same
+// once-a-minute limit) says so instead of "suite will not refresh". A
+// lasting refusal is still cached for ten minutes.
+func TestNoteCreate_ABusyRefusalIsCachedForAMinute(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &syncLog{}
+		h := &Handler{logger: slog.New(slog.NewJSONHandler(logs, nil)), maxSuites: 10}
+		defer h.rejections.close()
+		lasting := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/full"}
+		busy := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/busy"}
+		h.noteCreate(lasting, cache.CreateResult{Outcome: cache.SuiteRejectedGlobal})
+		time.Sleep(seedWarnEvery) // the busy refusal gets its own line
+		h.noteCreate(busy, cache.CreateResult{Outcome: cache.SuiteRejectedGlobal, CandidatesBusy: true})
+		time.Sleep(seedRejectBusyTTL - time.Second)
+		if !h.rejections.rejected(busy) {
+			t.Fatal("a busy refusal expired before a minute")
+		}
+		time.Sleep(time.Second)
+		if h.rejections.rejected(busy) {
+			t.Fatal("a busy refusal is still cached after a minute; want it retried")
+		}
+		if !h.rejections.rejected(lasting) {
+			t.Fatal("a lasting refusal expired after two minutes; want ten")
+		}
+		recs := logRecords(logs, "suite_seed_rejected", slog.LevelWarn)
+		if len(recs) != 2 || recs[0]["detail"] != "suite will not refresh" || recs[1]["suite_path"] != "/busy" ||
+			recs[1]["detail"] != "eviction candidates busy; retried after 1 minute" {
+			t.Fatalf("suite_seed_rejected records = %+v; want the lasting refusal's usual detail and the busy one's", recs)
 		}
 	})
 }

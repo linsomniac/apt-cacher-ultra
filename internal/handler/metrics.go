@@ -22,7 +22,8 @@ import (
 // retained by-hash); acu_suite_seed_rejected_total{host} (a suite refused
 // a row by the spec C3 caps; counted once per refusal that reached the
 // writer, i.e. at most once per suite per 10-minute rejection-cache
-// window, unless the cache had to clear itself at its 4,096-suite bound)
+// window — 1-minute for a refusal while every eviction candidate was
+// busy — unless the cache had to clear itself at its 4,096-suite bound)
 // and acu_suites_seed_rejected (unlabelled gauge: suites in that cache
 // now, kept current within a minute by its sweep timer even without
 // traffic).
@@ -108,16 +109,17 @@ var (
 	// C3 caps (refusals that reached the writer). Host-labelled.
 	suiteSeedRejectedTotal = metrics.NewCounterWithCap(
 		"acu_suite_seed_rejected_total",
-		"Suites refused a suite row by freshness.max_suites (global or per-host cap): they will not refresh. By upstream host (spec C3).",
+		"Suites refused a suite row by freshness.max_suites (global or per-host cap): they will not refresh until retried. By upstream host (spec C3).",
 		metrics.DefaultMaxSeries,
 		"host",
 	)
 
 	// seedRejectedSuites is the size of the spec C3 cap-rejection cache:
-	// suites refused a row within the last 10 minutes. Unlabelled.
+	// suites refused a row within the last 10 minutes (1 minute for a
+	// refusal while every eviction candidate was busy). Unlabelled.
 	seedRejectedSuites = metrics.NewGaugeWithCap(
 		"acu_suites_seed_rejected",
-		"Suites refused a suite row by freshness.max_suites within the last 10 minutes (spec C3 rejection cache).",
+		"Suites refused a suite row by freshness.max_suites within the last 10 minutes, or 1 minute while every eviction candidate was busy (spec C3 rejection cache).",
 		0,
 	)
 )

@@ -235,8 +235,11 @@ minutes: each refusal that reaches the database is counted in
 minutes, unless more than 4,096 suites were refused within them), the gauge
 `acu_suites_seed_rejected` shows how many suites are waiting out those 10
 minutes (updated within a minute), and WARN `suite_seed_rejected` (at most
-one a minute, with how many were suppressed) names the suite. Raise
-`max_suites` for very large Artifactory, aptly or Nexus hosts.
+one a minute, with how many were suppressed) names the suite. When the
+cache is full and every suite that could make room is busy at that moment
+(being checked or adopted, or evicted for another new suite), the refusal
+is retried after one minute instead, and the warning's `detail` says so.
+Raise `max_suites` for very large Artifactory, aptly or Nexus hosts.
 
 A cache can hold more suites than the caps allow: after `max_suites` is
 lowered, or after an upgrade from a release without the caps (one that

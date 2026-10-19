@@ -519,7 +519,9 @@ func TestSuiteCapUsage(t *testing.T) {
 
 // R-D1: the writer re-checks the candidate (compare-and-delete). A
 // candidate requested after it was chosen — here inside HoldSuite, before
-// the writer operation — is no longer idle: nothing is deleted and the
+// the writer operation — is no longer idle: nothing is deleted. The
+// creation retries once with a fresh list (FW-5); here that candidate,
+// c/idle2, is requested in its window too, so after two attempts the
 // creation is refused.
 func TestCreateSuite_EvictionRechecksInTheWriter(t *testing.T) {
 	c := openCache(t)
@@ -538,6 +540,102 @@ func TestCreateSuite_EvictionRechecksInTheWriter(t *testing.T) {
 	}
 	if !slices.Equal(g.released[sk("b", "/idle")], []bool{false}) || !rowExists(t, c, sk("b", "/idle")) {
 		t.Fatalf("released %v; want b/idle kept", g.released)
+	}
+	if !slices.Equal(g.released[sk("c", "/idle2")], []bool{false}) || !rowExists(t, c, sk("c", "/idle2")) {
+		t.Fatalf("released %v; want the retry's c/idle2 kept too", g.released)
+	}
+}
+
+// Final review, concurrency M2 (ruling FW-5 1): a held candidate the
+// writer keeps — requested between the candidate list and the
+// transaction — makes the creation try once more with a fresh list, as a
+// vanished one does, instead of refusing while another idle suite could
+// make room. CreateSuite and StoreFetched both retry (at most two
+// attempts; TestCreateSuite_EvictionRechecksInTheWriter keeps every
+// candidate and is refused after two).
+func TestCreateSuite_RetriesOnceWhenTheCandidateIsKept(t *testing.T) {
+	for _, viaMiss := range []bool{false, true} {
+		c := openCache(t)
+		restore := stubNow(t, evictNow)
+		fourRows(t, c)
+		g := newFakeGuard()
+		g.onHold = func(k SuiteKey) {
+			if k == sk("b", "/idle") { // a client asks for b/idle in the window
+				if _, err := c.db.Exec(`UPDATE suite_freshness SET last_requested_at = ? WHERE suite_path = '/idle'`, evictNow); err != nil {
+					t.Error(err)
+				}
+			}
+		}
+		seed := SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}
+		var res CreateResult
+		var err error
+		if viaMiss {
+			var fr FetchedResult
+			fr, err = c.StoreFetched(context.Background(), FetchedRow{Row: fetchedRow(t, c, seed.SuiteKey, "/InRelease"),
+				Suite: seed.SuiteKey, Create: &seed}, SuiteCaps{Global: 4}, g)
+			res = fr.Create
+		} else {
+			res, err = c.CreateSuite(context.Background(), seed, SuiteCaps{Global: 4}, g)
+		}
+		restore()
+		if err != nil || res.Outcome != SuiteCreated || res.Evicted == nil || *res.Evicted != sk("c", "/idle2") {
+			t.Fatalf("miss=%v: result %+v, %v; want created on the second attempt, evicting c/idle2", viaMiss, res, err)
+		}
+		if !slices.Equal(g.asked, []SuiteKey{sk("b", "/idle"), sk("c", "/idle2")}) ||
+			!slices.Equal(g.released[sk("b", "/idle")], []bool{false}) || !slices.Equal(g.released[sk("c", "/idle2")], []bool{true}) {
+			t.Fatalf("miss=%v: asked %v, released %v; want b/idle kept, c/idle2 evicted", viaMiss, g.asked, g.released)
+		}
+	}
+}
+
+// Final review, concurrency M2 (ruling FW-5 2) and Task 5 minor 3: at most
+// eight candidates are listed (spec C3), and a refusal because every
+// listed one is busy — held by checks, adoptions or other creations — is
+// transient (CandidatesBusy): the handler caches it for a minute, not ten.
+// Here eight idle suites are busy and a ninth, idle too, is never asked.
+// A refusal with no candidate at all (everything adopted or recently
+// requested) is not transient.
+func TestCreateSuite_ARefusalWithEveryCandidateBusyIsTransient(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	g := newFakeGuard()
+	for i := range suiteEvictCandidates + 1 {
+		k := sk(fmt.Sprintf("h%d", i), "/idle")
+		seedRow(t, c, k, evictNow-evictDay-int64(suiteEvictCandidates-i)) // h0 the idlest, h8 the least idle
+		if i < suiteEvictCandidates {
+			g.busy[k] = true
+		}
+	}
+	caps := SuiteCaps{Global: suiteEvictCandidates + 1}
+	res, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, caps, g)
+	if err != nil || res.Outcome != SuiteRejectedGlobal || res.Evicted != nil || !res.CandidatesBusy {
+		t.Fatalf("CreateSuite = %+v, %v; want global_cap with CandidatesBusy, nothing evicted", res, err)
+	}
+	if len(g.asked) != suiteEvictCandidates || slices.Contains(g.asked, sk(fmt.Sprintf("h%d", suiteEvictCandidates), "/idle")) {
+		t.Fatalf("asked %v; want the eight idlest only (at most eight candidates)", g.asked)
+	}
+	// Nothing evictable: a lasting refusal.
+	c2 := openCache(t)
+	fourRows(t, c2)
+	if _, err := c2.db.Exec(`UPDATE suite_freshness SET last_requested_at = ? WHERE current_snapshot_id IS NULL`, evictNow); err != nil {
+		t.Fatal(err)
+	}
+	res, err = c2.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 4}, newFakeGuard())
+	if err != nil || res.Outcome != SuiteRejectedGlobal || res.CandidatesBusy {
+		t.Fatalf("CreateSuite with nothing evictable = %+v, %v; want global_cap without CandidatesBusy", res, err)
+	}
+}
+
+// Task 5 minor 4: the candidate list's cutoff is inclusive, as
+// deleteSuiteTx's is (spec C3: idle for 24 h or more) — a suite last
+// requested exactly 24 h ago is evicted.
+func TestCreateSuite_ASuiteIdleExactly24HoursIsEvicted(t *testing.T) {
+	c := openCache(t)
+	defer stubNow(t, evictNow)()
+	seedRow(t, c, sk("b", "/exact"), evictNow-evictDay)
+	res, err := c.CreateSuite(context.Background(), SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 1}, newFakeGuard())
+	if err != nil || res.Outcome != SuiteCreated || res.Evicted == nil || *res.Evicted != sk("b", "/exact") {
+		t.Fatalf("CreateSuite = %+v, %v; want created, evicting the suite idle exactly 24 h", res, err)
 	}
 }
 

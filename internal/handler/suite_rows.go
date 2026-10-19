@@ -49,11 +49,15 @@ func suiteKeyOf(req *proxy.Request) cache.SuiteKey {
 // seedRejectTTL, seedRejectMax and seedRejectSweep shape spec C3's
 // cap-rejection cache: a suite refused a row is not retried for 10
 // minutes (spec C11 constant); the cache holds at most seedRejectMax
-// suites and drops expired ones at most once a minute.
+// suites and drops expired ones at most once a minute. A refusal while
+// every eviction candidate was busy (cache.CreateResult.CandidatesBusy)
+// is transient and cached for seedRejectBusyTTL only (final review,
+// concurrency M2).
 const (
-	seedRejectTTL   = 10 * time.Minute
-	seedRejectMax   = 4096
-	seedRejectSweep = time.Minute
+	seedRejectTTL     = 10 * time.Minute
+	seedRejectBusyTTL = time.Minute
+	seedRejectMax     = 4096
+	seedRejectSweep   = time.Minute
 )
 
 // seedRejections caches cap rejections per suite (spec C3), so an over-cap
@@ -91,8 +95,9 @@ func (s *seedRejections) rejected(key cache.SuiteKey) bool {
 	return ok
 }
 
-// add caches a rejection of key.
-func (s *seedRejections) add(key cache.SuiteKey) {
+// add caches a rejection of key for ttl (seedRejectTTL, or
+// seedRejectBusyTTL for a transient refusal).
+func (s *seedRejections) add(key cache.SuiteKey, ttl time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.until == nil {
@@ -104,7 +109,7 @@ func (s *seedRejections) add(key cache.SuiteKey) {
 			clear(s.until)
 		}
 	}
-	s.until[key] = time.Now().Add(seedRejectTTL)
+	s.until[key] = time.Now().Add(ttl)
 	s.armLocked()
 	seedRejectedSuites.Set(float64(len(s.until)))
 }
@@ -208,7 +213,10 @@ func (h *Handler) suiteSeed(sr *suiteReq, miss bool, etag, lastmod string, now i
 
 // noteCreate handles a creation's outcome: a cap rejection is cached,
 // counted and logged (rate-limited WARN suite_seed_rejected); an eviction
-// is logged at INFO (suite_evicted).
+// is logged at INFO (suite_evicted). A refusal while every eviction
+// candidate was busy is transient: cached for seedRejectBusyTTL, and its
+// line says it will be retried rather than that the suite will not
+// refresh.
 func (h *Handler) noteCreate(key cache.SuiteKey, res cache.CreateResult) {
 	if res.Evicted != nil {
 		h.logger.Info("suite_evicted",
@@ -221,7 +229,11 @@ func (h *Handler) noteCreate(key cache.SuiteKey, res cache.CreateResult) {
 	if !res.Outcome.Rejected() {
 		return
 	}
-	h.rejections.add(key)
+	ttl, detail := seedRejectTTL, "suite will not refresh"
+	if res.CandidatesBusy {
+		ttl, detail = seedRejectBusyTTL, "eviction candidates busy; retried after 1 minute"
+	}
+	h.rejections.add(key, ttl)
 	suiteSeedRejectedTotal.Inc(key.CanonicalHost)
 	h.seedWarn.mu.Lock()
 	now := time.Now()
@@ -239,7 +251,7 @@ func (h *Handler) noteCreate(key cache.SuiteKey, res cache.CreateResult) {
 		"cap", res.Outcome.String(),
 		"max_suites", h.maxSuites,
 		"suppressed", suppressed,
-		"detail", "suite will not refresh",
+		"detail", detail,
 	)
 }
 
