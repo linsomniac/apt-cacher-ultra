@@ -114,7 +114,7 @@ func TestServeListeners_StartupLineReportsTheSuiteCap(t *testing.T) {
 func TestServeListeners_WarnsWhenTheSuiteCapsAreReached(t *testing.T) {
 	cacheDir := t.TempDir()
 	ctx := context.Background()
-	c, err := cache.Open(ctx, cacheDir, nil)
+	c, err := cache.Open(ctx, cacheDir, newTestLogger()) // no migration noise (final review, tests Minor 2)
 	if err != nil {
 		t.Fatal(err)
 	}

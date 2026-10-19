@@ -281,12 +281,13 @@ func TestServeHTTP_ByHashContentAddressed_DisallowedHostRejected(t *testing.T) {
 	body := []byte("private content")
 	hash := writeBlob(t, h, body)
 
-	// Stage a url_path row under the allowed host so HostHasBlob would
-	// otherwise pass — proves the gate that fires is HostAllowed, not
-	// the provenance check.
+	// Stage a url_path row under the requested host itself — a host that
+	// fetched content before the allowlist dropped it — so the same-host
+	// provenance check (HostHasBlob) passes: the allowlist is the only gate
+	// that refuses (final review, Task 10 minor 3).
 	if err := h.cache.PutURLPath(context.Background(), cache.URLPath{
 		CanonicalScheme: "http",
-		CanonicalHost:   "127.0.0.1",
+		CanonicalHost:   "evil.example.com",
 		Path:            "/dists/foo/main/binary-amd64/Packages.gz",
 		BlobHash:        &hash,
 		IsMetadata:      true,

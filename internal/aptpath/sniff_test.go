@@ -68,6 +68,14 @@ func TestSniffReleaseGPG(t *testing.T) {
 		{[]byte{0x8c, 0x5e, 0x04}, false}, // just above the old-format range (A-17)
 		{[]byte{0xc1, 0x5e, 0x04}, false},
 		{[]byte{0xc3, 0x5e, 0x04}, false}, // just above the new-format tag (A-17)
+		// A body whose first byte is itself a signature version (3-6) is no
+		// signature packet: the tag check, not the version check, refuses
+		// it (Task 1 minor 2; final review, tests Minor 6 \u2014 a false marker
+		// would block unsigned adoption for good, ruling PD-10).
+		{[]byte{0x03, 0x04}, false},
+		{[]byte{0x04, 0x04}, false},
+		{[]byte{0x05}, false},
+		{[]byte{0x06, 0x00}, false},
 		// Text whose first byte is the UTF-8 lead byte 0xC2.
 		{[]byte("\u00a0Not Found\n"), false},
 		{[]byte("© 2026 Example. All rights reserved.\n"), false},

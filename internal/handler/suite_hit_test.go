@@ -389,6 +389,30 @@ func TestServeHTTP_OnboardingTimeoutServesUntracked(t *testing.T) {
 	})
 }
 
+// Design note 23 (final review, tests Minor 5): an onboarding that finds
+// the suite's row already there — CreateSuite answers SuiteExists, here
+// because a concurrent creation landed inside the window — serves the hit
+// as a tracked suite's, so its T1 fires (ruling PD-11: T1 only for tracked
+// suites).
+func TestServeHTTP_OnboardingThatFindsTheRowServesTracked(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	r.cacheAnchor("/r/dists/s/InRelease", rowInRelease, 1_700_000_000)
+	r.h.cachedAnchorsHook = func() { // a concurrent creation, before this one's transaction
+		r.h.cachedAnchorsHook = nil
+		if err := r.c.EnsureSuiteForTest(context.Background(), "http", "127.0.0.1", "/r/dists/s"); err != nil {
+			t.Error(err)
+		}
+	}
+	if rec := r.get("/r/dists/s/InRelease"); rec.Code != http.StatusOK || rec.Header().Get(hdrXCache) != cacheHit {
+		t.Fatalf("hit = %d %q, want a 200 hit", rec.Code, rec.Header().Get(hdrXCache))
+	}
+	select {
+	case <-r.fresh.signal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the hit fired no T1: an onboarding that found the row served the suite untracked")
+	}
+}
+
 // requested reads a suite's client-interest stamp.
 func (r *suiteRig) requested(suite string) int64 {
 	r.t.Helper()

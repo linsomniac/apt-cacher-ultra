@@ -6,6 +6,7 @@ import (
 	"errors"
 	"runtime"
 	"testing"
+	"time"
 )
 
 // fetchedRow is the url_path row of a miss of key's file, over a stored
@@ -139,10 +140,16 @@ func TestStoreFetched_MarkerPrecedesALaterWriterOperation(t *testing.T) {
 		})
 	}()
 	<-blocked // the writer is busy; what follows queues in order
+	// waitQueued fails after 10 s instead of hanging the package until go
+	// test's timeout when an operation never enqueues (one that errored
+	// first, say; Task 6 minor 7).
 	waitQueued := func(n int) {
 		t.Helper()
-		for len(c.writes) < n {
-			runtime.Gosched()
+		for deadline := time.Now().Add(10 * time.Second); len(c.writes) < n; runtime.Gosched() {
+			if time.Now().After(deadline) {
+				close(block) // free the writer, so the cache can close
+				t.Fatalf("%d writer operations queued after 10 s, want %d", len(c.writes), n)
+			}
 		}
 	}
 	storeErr := make(chan error, 1)

@@ -178,7 +178,7 @@ type adoptionTestEnv struct {
 func newAdoptionTestEnv(t *testing.T) *adoptionTestEnv {
 	t.Helper()
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger()) // no migration noise (final review, tests Minor 2)
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}

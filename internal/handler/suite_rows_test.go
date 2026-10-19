@@ -206,6 +206,20 @@ UPDATE suite_freshness SET last_check_at = 7, last_success_at = 7, inrelease_cha
 	if derefI64(s.LastRequestedAt) != stamp {
 		t.Fatalf("last_requested_at = %d, want %d (a refresh miss is no creation)", derefI64(s.LastRequestedAt), stamp)
 	}
+	// The re-stamp is gated on the sniff (final review, tests Minor 4): a
+	// refresh miss answered with an HTML page records no successful check
+	// and takes none of the page's validators.
+	if _, err := r.secondConn().Exec(`DELETE FROM url_path WHERE path = '/r/dists/s/InRelease'`); err != nil {
+		t.Fatal(err)
+	}
+	r.serve("/r/dists/s/InRelease", upFile{body: rowHTML, etag: `"html"`, lastMod: "Wed, 03 Jan 2024 00:00:00 GMT"})
+	if rec := r.get("/r/dists/s/InRelease"); rec.Code != http.StatusOK {
+		t.Fatalf("HTML refresh miss = %d", rec.Code)
+	}
+	if h := r.suite("/r/dists/s"); derefI64(h.LastCheckAt) != derefI64(s.LastCheckAt) || derefI64(h.LastSuccessAt) != derefI64(s.LastSuccessAt) ||
+		derefStr(h.InReleaseETag) != `"e2"` || derefStr(h.InReleaseLastMod) != lm2 {
+		t.Fatalf("after an HTML refresh miss row = %+v, want it as the second miss left it", h)
+	}
 	for path, f := range map[string]upFile{
 		"/r/dists/t/Release":       {body: rowRelease},
 		"/r/dists/u/Release.gpg":   {body: rowGPG},
@@ -685,7 +699,75 @@ func TestNoteCreate_WarnIsRateLimited(t *testing.T) {
 			recs[1]["suite_path"] != "/d" || recs[1]["cap"] != "global_cap" {
 			t.Fatalf("records = %+v; want /a (suppressed 0) and /d (suppressed 2)", recs)
 		}
+		// The count restarts with each line (final review, tests Minor 1):
+		// the third window's line carries only its own window's one.
+		refuse("/e")
+		time.Sleep(seedWarnEvery)
+		refuse("/f")
+		recs = logRecords(logs, "suite_seed_rejected", slog.LevelWarn)
+		if len(recs) != 3 || recs[2]["suite_path"] != "/f" || recs[2]["suppressed"] != float64(1) {
+			t.Fatalf("records = %+v; want a third line, /f, with suppressed 1 (/e alone)", recs)
+		}
 	})
+}
+
+// Design note 24 (final review, tests Minor 1; Task 9 minor 2):
+// Handler.Close stops the rejection cache's sweep timer, so a closed
+// handler's refusals stay where they are instead of a timer firing after
+// shutdown.
+func TestHandlerClose_StopsTheRejectionSweep(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := &Handler{logger: silentLogger(), maxSuites: 10, lifecycleCancel: func() {}}
+		h.noteCreate(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/s"},
+			cache.CreateResult{Outcome: cache.SuiteRejectedGlobal})
+		h.Close()
+		time.Sleep(seedRejectTTL + seedRejectSweep)
+		synctest.Wait()
+		if n := h.rejections.len(); n != 1 {
+			t.Fatalf("%d entries after Close and the TTL; want 1 (Close stopped the sweep timer)", n)
+		}
+	})
+}
+
+// Design note 16 (final review, tests Minor 1; Task 9 minor 2): New wires
+// the rejection sweep's panic report to ERROR handler_goroutine_panicked
+// with where = seed_rejections.
+func TestNew_WiresTheRejectionSweepsPanicReport(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	if r.h.rejections.onPanic == nil {
+		t.Fatal("New left the rejection sweep's onPanic unwired: a recovered panic would go unreported")
+	}
+	r.h.rejections.onPanic("boom")
+	recs := logRecords(r.logs, "handler_goroutine_panicked", slog.LevelError)
+	if len(recs) != 1 || recs[0]["where"] != "seed_rejections" || recs[0]["panic"] != "boom" {
+		t.Fatalf("handler_goroutine_panicked records = %v; want one with where seed_rejections and the panic", recs)
+	}
+}
+
+// Final review, tests Minor 1 (Task 9 minor 2): a backstop whose mark
+// fails is logged WARN suite signed-seen mark failed — the operator's
+// only sign that a tracked suite's signed anchor waits for the startup
+// pass — and the response is served.
+func TestServeHTTP_BackstopMarkFailureIsAWarning(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	r.serve("/r/dists/g/Release.gpg", upFile{body: []byte("not a signature\n")})
+	r.get("/r/dists/g/Release.gpg")
+	r.h.cachedAnchorsHook = func() { // the cached Release.gpg becomes a signature after the sniff
+		r.h.cachedAnchorsHook = nil
+		r.cacheAnchor("/r/dists/g/Release.gpg", rowGPG, 1_700_000_000)
+	}
+	if _, err := r.secondConn().Exec(`CREATE TRIGGER fail_mark BEFORE INSERT ON suite_signed_seen
+BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	r.serve("/r/dists/g/Release", upFile{body: rowRelease})
+	if rec := r.get("/r/dists/g/Release"); rec.Code != http.StatusOK || r.suite("/r/dists/g") == nil {
+		t.Fatalf("Release miss = %d; want 200 and the row created", rec.Code)
+	}
+	recs := logRecords(r.logs, "suite signed-seen mark failed", slog.LevelDebug)
+	if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["err"] == nil || recs[0]["suite_path"] != "/r/dists/g" {
+		t.Fatalf("suite signed-seen mark failed records = %v; want one WARN with err and suite_path", recs)
+	}
 }
 
 // Final review, concurrency M2 (ruling FW-5 2): a global-cap refusal
