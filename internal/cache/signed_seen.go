@@ -29,9 +29,13 @@ type execer interface {
 // on a suite-row creation, the creating transaction (createSuiteTx's
 // markCreated: SuiteSeed.SignedSeenAt and every cached signed anchor in
 // SuiteSeed.Cached, ruling PD-5), and only for an unproven creation the
-// handler's markCachedSignedAnchors backstop. It is written only for
-// suites with a suite_freshness row, and never for an unsigned snapshot or
-// a plain-text anchor.
+// handler's markCachedSignedAnchors backstop; from phase E the freshness
+// checker too, through MarkSignedSeenBatch, when its probe finds a
+// sniff-passing InRelease or Release.gpg for a suite without a signed
+// current snapshot (spec C3 revision 8, design review I-2), and the
+// adopter's re-mark before an unsigned commit (ruling R-E1). It is written
+// only for suites with a suite_freshness row, and never for an unsigned
+// snapshot or a plain-text anchor.
 func markSignedSeen(ctx context.Context, ex execer, scheme, host, base string, seenAt int64) error {
 	if _, err := ex.ExecContext(ctx, `
 INSERT INTO suite_signed_seen (canonical_scheme, canonical_host, base, last_seen_at)

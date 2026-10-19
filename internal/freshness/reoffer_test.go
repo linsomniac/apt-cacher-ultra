@@ -55,15 +55,15 @@ func TestCheck_ReportsResultAndBypassesCooldown(t *testing.T) {
 
 	held := mustAcquire(t, r.checker.admission, rigHost, true)
 	r.up.set(r.release("v1", 0))
-	if rep := r.checker.check(ctx, ref, checkOpts{}); rep.result != "changed_queued" || rep.signedCurrent {
-		t.Fatalf("no slot: %+v, want changed_queued for a suite with no signed snapshot", rep)
+	if rep := r.checker.check(ctx, ref, checkOpts{}); rep.result != "first_adoption_queued" || rep.signedCurrent {
+		t.Fatalf("no slot: %+v, want first_adoption_queued for a suite with no current snapshot", rep)
 	}
 	if rep := r.checker.check(ctx, ref, checkOpts{}); rep.result != resultSkipped {
 		t.Fatalf("inside the cooldown: result %q, want %q", rep.result, resultSkipped)
 	}
 	held.release()
-	if rep := r.checker.check(ctx, ref, checkOpts{bypassCooldown: true}); rep.result != "changed" {
-		t.Fatalf("bypassed cooldown with a free slot: result %q, want changed", rep.result)
+	if rep := r.checker.check(ctx, ref, checkOpts{bypassCooldown: true}); rep.result != "first_adoption" {
+		t.Fatalf("bypassed cooldown with a free slot: result %q, want first_adoption", rep.result)
 	}
 	r.checker.WaitForAdoptions()
 

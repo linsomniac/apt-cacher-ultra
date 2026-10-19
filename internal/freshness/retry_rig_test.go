@@ -47,10 +47,26 @@ type rigUpstream struct {
 	bodies           map[string][]byte
 	ignoreValidators bool
 	stall            bool
+	fail             map[string]error    // per URL: the error Conditional returns (setFail)
 	sent             map[string][]string // If-None-Match per URL, in order
 }
 
 func (u *rigUpstream) set(body []byte) { u.setAt(rigAnchorURL, body) }
+
+// setFail makes every request for url fail with err (nil restores the
+// body or the default 404).
+func (u *rigUpstream) setFail(url string, err error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.fail == nil {
+		u.fail = map[string]error{}
+	}
+	if err == nil {
+		delete(u.fail, url)
+		return
+	}
+	u.fail[url] = err
+}
 
 func (u *rigUpstream) setAt(url string, body []byte) {
 	u.mu.Lock()
@@ -68,11 +84,14 @@ func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, eta
 	u.mu.Lock()
 	u.sent[target.URL] = append(u.sent[target.URL], etag)
 	body, ok := u.bodies[target.URL]
-	stall, ignore := u.stall, u.ignoreValidators
+	stall, ignore, failErr := u.stall, u.ignoreValidators, u.fail[target.URL]
 	u.mu.Unlock()
 	if stall {
 		<-ctx.Done()
 		return nil, ctx.Err()
+	}
+	if failErr != nil {
+		return nil, failErr
 	}
 	if !ok {
 		return nil, &fetch.StatusError{Code: 404}

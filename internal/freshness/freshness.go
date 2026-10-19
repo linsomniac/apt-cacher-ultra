@@ -388,9 +388,12 @@ const (
 	resultSkipped = "skipped" // cooldown, no row, no anchor, cancelled: nothing learned
 )
 
-// isQueuedResult reports whether result means "new content, no slot".
-// Phase E adds first_adoption_queued here.
-func isQueuedResult(result string) bool { return result == "changed_queued" }
+// isQueuedResult reports whether result means "new content, no slot":
+// changed_queued, or first_adoption_queued for a suite with no current
+// snapshot (spec C4).
+func isQueuedResult(result string) bool {
+	return result == "changed_queued" || result == "first_adoption_queued"
+}
 
 // Check runs one freshness check of the suite. It is the entry point for
 // client-triggered (T1) checks; see check.

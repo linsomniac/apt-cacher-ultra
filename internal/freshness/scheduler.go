@@ -329,7 +329,8 @@ func (q *schedQueues) has(key string) bool {
 // 2^(k−1), at most 1 h). Clock-step rule: a last_success_at or
 // last_check_at in the future is infinitely old. Without an adopter
 // nothing is ever attempted, so only staleness counts (Phase 1 parity,
-// mirroring retryGateFor).
+// mirroring retryGateFor); with one, a never-adopted suite is due only
+// while it has client interest (spec C4 Dispatch 3).
 func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 	nowU := now.Unix()
 	future := nowU + int64(clockStepTolerance/time.Second)
@@ -341,6 +342,16 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 	retryDue := c.adopter != nil && s.AdoptionFailCount > 0 && s.AdoptionNextRetryAt != nil && *s.AdoptionNextRetryAt <= nowU
 	if !stale && !retryDue && !c.pendingChange(s) {
 		return false
+	}
+	// Spec C4 Dispatch 3: with an adopter wired, a never-adopted suite
+	// without client interest in the last 7 days is dormant and never
+	// queued (its check would make no request anyway). A stamp up to 7 days
+	// in the future counts as interested (interested: a symmetric window);
+	// checkFirst reports the clock step.
+	if c.adopter != nil && s.CurrentSnapshotID == nil {
+		if ok, _ := interested(s.LastRequestedAt, now); !ok {
+			return false
+		}
 	}
 	if s.CheckFailCount > 0 && s.LastCheckAt != nil && *s.LastCheckAt <= future {
 		if nowU < *s.LastCheckAt+int64(backoffDelay(s.CheckFailCount)/time.Second) {

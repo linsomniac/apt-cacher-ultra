@@ -123,9 +123,17 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 		SuitePath:       suitePath,
 	}
 
+	// Spec C4 Dispatch 3: with an adopter wired, a suite with no current
+	// snapshot runs the probe tree (or stays dormant).
+	if c.adopter != nil && cur.CurrentSnapshotID == nil {
+		out.req = c.checkFirst(ctx, fetchCtx, out, cur, suite, now, nowUnix)
+		return
+	}
+
 	// Form preference: if there's a current snapshot, the form is its
-	// anchor_form (snap.Form). Otherwise default to inline; the inline
-	// path triggers a detached fallback on 404.
+	// anchor_form (snap.Form). Otherwise (no adopter: the Phase 1
+	// observation) default to inline; the inline path triggers a detached
+	// fallback on 404.
 	form := c.detectForm(ctx, cur)
 	if form == adoptionFormDetached {
 		out.req, out.repair = c.checkDetached(ctx, fetchCtx, out, cur, suite, now, nowUnix)

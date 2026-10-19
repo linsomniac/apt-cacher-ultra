@@ -2,7 +2,9 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -171,7 +173,7 @@ func TestPhase2Migration_V1ToV2EndToEnd(t *testing.T) {
 		t.Errorf("trigger adoption: X-Cache-Snapshot=%q, want empty (adoption fires async after response is sent)",
 			got)
 	}
-	if err := waitForMigrationFlip(t, stack, upstreamURL, srv.URL, 15*time.Second); err != nil {
+	if err := waitForMigrationFlip(t, stack, upstreamURL, srv.URL, snapB.inRelease, 15*time.Second); err != nil {
 		t.Fatalf("adoption flip never happened: %v", err)
 	}
 	stack.checker.WaitForAdoptions()
@@ -458,20 +460,27 @@ func newPhase2MigrationStack(t *testing.T, c *cache.Cache, upstream *url.URL) *p
 // missed earlier attempts. The migration test starts with
 // CurrentSnapshotID = NULL (never adopted), so any non-NULL value
 // indicates the first adoption has flipped.
-func waitForMigrationFlip(t *testing.T, stack *phase2ChaosStack, upstreamURL *url.URL, srvURL string, timeout time.Duration) error {
+// The first post-migration hit already adopts A (spec C4 eager first
+// adoption), so it waits for the snapshot whose InRelease is want.
+func waitForMigrationFlip(t *testing.T, stack *phase2ChaosStack, upstreamURL *url.URL, srvURL string, want []byte, timeout time.Duration) error {
 	t.Helper()
+	sum := sha256.Sum256(want)
+	wantHash := hex.EncodeToString(sum[:])
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		suite, err := stack.handler.cache.GetSuiteFreshness(context.Background(),
 			"http", upstreamURL.Hostname(), chaos2Suite)
 		if err == nil && suite != nil && suite.CurrentSnapshotID != nil {
-			return nil
+			snap, err := stack.handler.cache.GetSuiteSnapshot(context.Background(), *suite.CurrentSnapshotID)
+			if err == nil && snap.SingleAnchorHash != nil && *snap.SingleAnchorHash == wantHash {
+				return nil
+			}
 		}
 		rec := httptest.NewRecorder()
 		stack.handler.ServeHTTP(rec, proxyReq("GET", srvURL, chaos2Suite+"/InRelease"))
 		time.Sleep(20 * time.Millisecond)
 	}
-	return fmt.Errorf("current_snapshot_id still NULL after %v", timeout)
+	return fmt.Errorf("no current snapshot of the wanted InRelease after %v", timeout)
 }
 
 // v1SchemaDDLForTest is a verbatim copy of the v0 → v1 migration in

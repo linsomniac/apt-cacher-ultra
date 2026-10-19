@@ -60,6 +60,9 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 	if cur.AdoptionFailCount > 0 && cur.AdoptionFailFirstAt != nil && *cur.AdoptionFailFirstAt <= now.Unix() {
 		first = *cur.AdoptionFailFirstAt
 	}
+	if restartsStreak(cur, req.key, reason) {
+		count, first = 1, now.Unix()
+	}
 	delay := jitterDelay(backoffDelay(count), c.rand())
 	next := now.Add(delay).Unix()
 	f := cache.AdoptionFailure{
@@ -98,6 +101,23 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath,
 			"reason", reason, "fail_count", count, "failing_since_unixtime", first)
 	}
+}
+
+// restartsStreak reports a confirmation record (spec C4, C5) that starts
+// a new streak: unsigned_unconfirmed or anchor_absent recorded for other
+// content or after another reason. Their adoption_fail_first_at is the
+// first observation of THIS state and content, which the confirmation gap
+// is measured from ("two observations of the same Release bytes").
+//
+// AIDEV-NOTE: count restarts with first_at, so the retry schedule of a
+// confirmation is short (2 min, 4 min, …) and the gap, not the backoff,
+// decides when it confirms.
+func restartsStreak(cur *cache.SuiteFreshness, key, reason string) bool {
+	if reason != cache.ReasonUnsignedUnconfirmed && reason != cache.ReasonAnchorAbsent {
+		return false
+	}
+	return cur.AdoptionFailCount == 0 || cur.AdoptionFailReason == nil || *cur.AdoptionFailReason != reason ||
+		cur.AdoptionFailHash == nil || *cur.AdoptionFailHash != key
 }
 
 // refusalEscalateAge is how long a refusal streak lasts before it is

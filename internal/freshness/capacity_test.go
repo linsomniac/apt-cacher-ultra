@@ -36,15 +36,15 @@ func seedStaleAnchorAt(t *testing.T, c *cache.Cache, host, suite string) {
 }
 
 // Spec C4: with no free slot the check spawns nothing, reports
-// changed_queued and leaves last_success_at alone so the scheduler
-// retries it on its next turn.
+// first_adoption_queued (the rig suite has no current snapshot) and leaves
+// last_success_at alone so the scheduler retries it on its next turn.
 func TestCheck_NoSlotQueuesWithoutAdvancingSuccess(t *testing.T) {
 	r := newRetryRig(t, 0)
 	held := mustAcquire(t, r.checker.admission, rigHost, true)
 	r.up.set(r.release("v1", 0))
 	r.check()
-	if r.ver.calls() != 0 || lastResult(r) != "changed_queued" {
-		t.Fatalf("calls %d result %q, want 0 changed_queued", r.ver.calls(), lastResult(r))
+	if r.ver.calls() != 0 || lastResult(r) != "first_adoption_queued" {
+		t.Fatalf("calls %d result %q, want 0 first_adoption_queued", r.ver.calls(), lastResult(r))
 	}
 	if row := r.row(); row.LastSuccessAt != nil || row.InReleaseChangeSeenAt == nil || row.LastCheckAt == nil {
 		t.Fatalf("queued check state: success %v seen %v check %v", row.LastSuccessAt, row.InReleaseChangeSeenAt, row.LastCheckAt)
@@ -132,8 +132,8 @@ func TestCheck_GlobalSlotCapsConcurrentAdoptions(t *testing.T) {
 	}
 	// B's refusal is read from its result and the slot count, not
 	// inferred from a timing window (deferred minor B-29).
-	if rep := chk.check(ctx, SuiteRef{CanonicalScheme: "http", CanonicalHost: hosts[1], SuitePath: rigSuite}, checkOpts{}); rep.result != "changed_queued" {
-		t.Fatalf("B's check = %q, want changed_queued while the only global slot is held", rep.result)
+	if rep := chk.check(ctx, SuiteRef{CanonicalScheme: "http", CanonicalHost: hosts[1], SuitePath: rigSuite}, checkOpts{}); rep.result != "first_adoption_queued" {
+		t.Fatalf("B's check = %q, want first_adoption_queued while the only global slot is held", rep.result)
 	}
 	if g, _ := chk.admission.usage(); g != 1 {
 		t.Fatalf("%d global slots in use, want 1 (A's)", g)
@@ -301,8 +301,8 @@ func TestCheck_ReservedSlotGoesToSignedCurrent(t *testing.T) {
 	other := mustAcquire(t, r.checker.admission, "other", false)
 	r.up.set(r.release("v1", 0))
 	r.check()
-	if r.ver.calls() != 0 || lastResult(r) != "changed_queued" {
-		t.Fatalf("never-adopted suite: calls %d result %q, want 0 changed_queued (the last slot is reserved)", r.ver.calls(), lastResult(r))
+	if r.ver.calls() != 0 || lastResult(r) != "first_adoption_queued" {
+		t.Fatalf("never-adopted suite: calls %d result %q, want 0 first_adoption_queued (the last slot is reserved)", r.ver.calls(), lastResult(r))
 	}
 	other.release()
 	r.check()

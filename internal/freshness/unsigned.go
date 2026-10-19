@@ -86,6 +86,38 @@ func unsignedCap(n int) error {
 	return fmt.Errorf("%w: %d declared members, at most %d", ErrAdoptionUnsignedTooLarge, n, unsignedMemberCap)
 }
 
+// unsignedTooLarge is spec C5 safeguard 4 on an unsigned Release before a
+// slot is taken (design review M-5): unsignedCap over ParseRelease's merged
+// members. A Release that does not parse is not refused here: the adoption
+// reports the parse failure, and runShared applies the cap again.
+func unsignedTooLarge(release []byte) error {
+	members, err := ParseRelease(release)
+	if err != nil {
+		return nil
+	}
+	return unsignedCap(len(members))
+}
+
+// markSignatureSeen is the checker's signed-seen marker writer (spec C3,
+// revision 8; ruling PE-5, design review I-2): a probe found a sniff-passing
+// signature — InRelease, or Release.gpg — for a suite without a signed
+// current snapshot, so the cache has seen the suite signed even when no
+// client fetched the signature and no signed adoption commits. It marks
+// the suite's base (aptpath.MarkerBase, shared by the /. twin), stamped
+// seenAt, before the check admits any request; the caller fails the check
+// when it cannot.
+//
+// AIDEV-NOTE: it writes at every such probe, with no read first: the
+// marker keeps the newest stamp, its last sighting, which phase F's
+// orphan-marker sweep reads; the check's pacing bounds the writes. Without
+// this writer a signature only the checker ever saw (an unsigned suite's
+// clients never fetch one) could be stripped later and the suite adopted
+// unsigned.
+func (a *Adopter) markSignatureSeen(ctx context.Context, suite SuiteRef, seenAt int64) error {
+	return a.cache.MarkSignedSeenBatch(ctx, []cache.SignedSeenMark{{CanonicalScheme: suite.CanonicalScheme,
+		CanonicalHost: suite.CanonicalHost, Base: aptpath.MarkerBase(suite.SuitePath), SeenAt: seenAt}})
+}
+
 // errRemarkPoolRead marks a re-mark that failed reading a pool file: an I/O
 // fault, logged at ERROR (any other re-mark failure is a WARN).
 var errRemarkPoolRead = errors.New("read the pool file")

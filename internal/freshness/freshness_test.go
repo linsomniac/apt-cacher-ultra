@@ -1669,8 +1669,10 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/dists/noble/InRelease":
+			// Spec C4 Dispatch 3: the probe tree asks for InRelease
+			// first, with or without a cached row.
 			inReleaseHits.Add(1)
-			t.Errorf("InRelease fetched despite missing url_path row — fallback should not issue a GET")
+			w.WriteHeader(404)
 		case "/dists/noble/Release":
 			releaseHits.Add(1)
 			w.WriteHeader(200)
@@ -1736,8 +1738,8 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
 	c.WaitForAdoptions()
 
-	if inReleaseHits.Load() != 0 {
-		t.Errorf("InRelease hits = %d, want 0", inReleaseHits.Load())
+	if inReleaseHits.Load() != 1 {
+		t.Errorf("InRelease hits = %d, want 1 (the probe tree's absent InRelease)", inReleaseHits.Load())
 	}
 	if releaseHits.Load() != 1 {
 		t.Errorf("Release hits = %d, want 1", releaseHits.Load())
