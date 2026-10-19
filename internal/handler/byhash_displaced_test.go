@@ -156,7 +156,7 @@ func TestServeHTTP_RetainedByHashServesASuiteRootAlias(t *testing.T) {
 // and a pool blob that no displaced snapshot declares is never served for
 // an adopted suite (stray-blob negatives).
 func TestServeHTTP_RetainedByHashSHA256MustMatchTheBlob(t *testing.T) {
-	h, _ := newDisplacedHandler(t, 3, nil)
+	h, up := newDisplacedHandler(t, 3, nil)
 	forged := "main/binary-amd64/by-hash/SHA256/" + strings.Repeat("ab", 32)
 	adoptWithMembers(t, h, "one", map[string]string{forged: "bytes that hash to something else"})
 	adoptWithMembers(t, h, "two", nil)
@@ -166,6 +166,9 @@ func TestServeHTTP_RetainedByHashSHA256MustMatchTheBlob(t *testing.T) {
 	stray := writeBlob(t, h, []byte("a stray blob"))
 	if rec := getMember(t, h, "main/binary-amd64/by-hash/SHA256/"+stray); rec.Code != http.StatusNotFound {
 		t.Errorf("a stray pool blob: %d, want 404", rec.Code)
+	}
+	if n := up.count(); n != 0 { // deferred minor C-26: a snapshot 404, not a miss
+		t.Fatalf("upstream was asked %d times, want 0", n)
 	}
 }
 
@@ -196,7 +199,7 @@ func TestServeHTTP_RetainedByHashPrefersTheNewestDisplacedSnapshot(t *testing.T)
 // The search covers the newest keep_displaced + 1 displaced snapshots:
 // what GC keeps, plus the one a flip displaced since GC last ran.
 func TestServeHTTP_RetainedByHashSearchesKeepDisplacedPlusOne(t *testing.T) {
-	h, _ := newDisplacedHandler(t, 1, nil) // searches two
+	h, up := newDisplacedHandler(t, 1, nil) // searches two
 	adoptWithMembers(t, h, "one", map[string]string{aliasOf("Packages one"): "Packages one"})
 	adoptWithMembers(t, h, "two", map[string]string{aliasOf("Packages two"): "Packages two"})
 	adoptWithMembers(t, h, "three", nil)
@@ -207,19 +210,25 @@ func TestServeHTTP_RetainedByHashSearchesKeepDisplacedPlusOne(t *testing.T) {
 	if rec := getMember(t, h, aliasOf("Packages one")); rec.Code != http.StatusNotFound {
 		t.Errorf("the third-newest displaced snapshot's alias: %d, want 404", rec.Code)
 	}
+	if n := up.count(); n != 0 { // deferred minor C-26: a snapshot 404, not a miss
+		t.Fatalf("upstream was asked %d times, want 0", n)
+	}
 }
 
 func TestServeHTTP_RetainedByHashIsOffWhenKeepDisplacedIsZero(t *testing.T) {
-	h, _ := newDisplacedHandler(t, 0, nil)
+	h, up := newDisplacedHandler(t, 0, nil)
 	adoptWithMembers(t, h, "one", map[string]string{aliasOf("Packages one"): "Packages one"})
 	adoptWithMembers(t, h, "two", nil)
 	if rec := getMember(t, h, aliasOf("Packages one")); rec.Code != http.StatusNotFound {
 		t.Fatalf("got %d, want 404 (gc.keep_displaced = 0 disables retained by-hash)", rec.Code)
 	}
+	if n := up.count(); n != 0 { // deferred minor C-26: a snapshot 404, not a miss
+		t.Fatalf("upstream was asked %d times, want 0", n)
+	}
 }
 
 func TestServeHTTP_RetainedByHashNeverServesRetiredSnapshots(t *testing.T) {
-	h, _ := newDisplacedHandler(t, 3, nil)
+	h, up := newDisplacedHandler(t, 3, nil)
 	id1 := adoptWithMembers(t, h, "one", map[string]string{aliasOf("Packages one"): "Packages one"})
 	adoptWithMembers(t, h, "two", nil)
 	if _, err := h.cache.ApplyLegacyAuditDecisions(context.Background(),
@@ -229,12 +238,16 @@ func TestServeHTTP_RetainedByHashNeverServesRetiredSnapshots(t *testing.T) {
 	if rec := getMember(t, h, aliasOf("Packages one")); rec.Code != http.StatusNotFound {
 		t.Fatalf("got %d from a retired snapshot, want 404", rec.Code)
 	}
+	if n := up.count(); n != 0 { // deferred minor C-26: a snapshot 404, not a miss
+		t.Fatalf("upstream was asked %d times, want 0", n)
+	}
 }
 
 // No recovery fetch for displaced snapshots: a lost blob is a 404.
 func TestServeHTTP_RetainedByHashLostBlobIs404WithoutAFetch(t *testing.T) {
-	h, up := newDisplacedHandler(t, 3, nil)
-	adoptWithMembers(t, h, "one", map[string]string{aliasOf("Packages one"): "Packages one"})
+	logs := &syncLog{}
+	h, up := newDisplacedHandler(t, 3, logs)
+	id1 := adoptWithMembers(t, h, "one", map[string]string{aliasOf("Packages one"): "Packages one"})
 	adoptWithMembers(t, h, "two", nil)
 	if err := os.Remove(h.cache.BlobPath(sha256Hex([]byte("Packages one")))); err != nil {
 		t.Fatal(err)
@@ -244,6 +257,38 @@ func TestServeHTTP_RetainedByHashLostBlobIs404WithoutAFetch(t *testing.T) {
 	}
 	if n := up.count(); n != 0 {
 		t.Fatalf("upstream was asked %d times, want 0", n)
+	}
+	recs := logRecords(logs, "snapshot_member_blob_missing", slog.LevelWarn)
+	if len(recs) != 1 || recs[0]["snapshot_id"] != float64(id1) || recs[0]["snapshot_displaced"] != true {
+		t.Fatalf("snapshot_member_blob_missing records = %+v, want one for snapshot %d, displaced", recs, id1)
+	}
+}
+
+// Deferred minor C-26 (a): a by-hash member of the current snapshot is an
+// ordinary snapshot serve — the current X-Cache-Snapshot, no
+// snapshot_displaced field.
+func TestServeHTTP_CurrentSnapshotByHashIsNotDisplaced(t *testing.T) {
+	logs := &syncLog{}
+	h, up := newDisplacedHandler(t, 3, logs)
+	adoptWithMembers(t, h, "one", map[string]string{aliasOf("Packages one"): "Packages one"})
+	id2 := adoptWithMembers(t, h, "two", map[string]string{aliasOf("Packages two"): "Packages two"})
+	rec := getMember(t, h, aliasOf("Packages two"))
+	if rec.Code != http.StatusOK || rec.Header().Get(hdrXCacheSnapshot) != itoa(id2) {
+		t.Fatalf("got %d from snapshot %q, want 200 from the current %d", rec.Code, rec.Header().Get(hdrXCacheSnapshot), id2)
+	}
+	if strings.Contains(logs.String(), `"snapshot_displaced"`) || up.count() != 0 {
+		t.Fatalf("a current-snapshot serve logged snapshot_displaced or asked upstream:\n%s", logs.String())
+	}
+}
+
+// Deferred minor C-26 (b): retained serving is for by-hash members only;
+// an index only a displaced snapshot declared stays a 404, with no miss.
+func TestServeHTTP_RetainedByHashIsOnlyForByHashMembers(t *testing.T) {
+	h, up := newDisplacedHandler(t, 3, nil)
+	adoptWithMembers(t, h, "one", map[string]string{"main/binary-amd64/Packages": "Packages one"})
+	adoptWithMembers(t, h, "two", nil)
+	if rec := getMember(t, h, "main/binary-amd64/Packages"); rec.Code != http.StatusNotFound || up.count() != 0 {
+		t.Fatalf("got %d with %d upstream calls, want a snapshot 404", rec.Code, up.count())
 	}
 }
 

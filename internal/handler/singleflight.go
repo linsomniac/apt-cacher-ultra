@@ -28,6 +28,8 @@ type sfResult struct {
 	// anchor changed after it was sniffed (cache.CreateResult.Unproven);
 	// the leader runs markCachedSignedAnchors after its late registration.
 	unproven bool
+	// vouchingSuites: the suites whose snapshots vouched a validated .deb.
+	vouchingSuites []string
 }
 
 // sfCall is a single in-flight singleflight call. The leader populates

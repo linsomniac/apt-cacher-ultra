@@ -48,6 +48,11 @@ func TestServeHTTP_ByHashContentAddressed_PoolHit(t *testing.T) {
 		t.Fatalf("PutURLPath: %v", err)
 	}
 
+	// I-4 (spec C3): only a known suite — one with a row — is served by
+	// hash from the pool.
+	if err := h.cache.EnsureSuiteForTest(context.Background(), scheme, hostKey(host, port), "/dists/noble"); err != nil {
+		t.Fatal(err)
+	}
 	// No url_path row for the by-hash URL itself. No snapshot.
 	path := "/dists/noble/main/binary-amd64/by-hash/SHA256/" + hash
 	rec := httptest.NewRecorder()
@@ -84,6 +89,31 @@ func TestServeHTTP_ByHashContentAddressed_PoolHit(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Errorf("url_path row was not materialized after by-hash fallback serve")
+}
+
+// I-4, handler side (spec C3): a by-hash path under a suite without a row
+// — a minted suite name — is not served from the pool, whatever blob its
+// host holds; it goes to the miss path.
+func TestServeHTTP_ByHashContentAddressed_UnknownSuiteIsNotServed(t *testing.T) {
+	upstreamCalls := atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		http.NotFound(w, nil)
+	}))
+	defer srv.Close()
+	h := newTestHandler(t, nil, nil)
+	scheme, host, port := splitURL(t, srv.URL)
+	body := []byte("by-hash Packages bytes")
+	hash := writeBlob(t, h, body)
+	if err := h.cache.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: scheme, CanonicalHost: hostKey(host, port),
+		Path: "/dists/noble/main/binary-amd64/Packages.gz", BlobHash: &hash, IsMetadata: true}); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newProxyReqHostPort("GET", scheme, host+port, "/dists/minted/main/binary-amd64/by-hash/SHA256/"+hash))
+	if rec.Body.String() == string(body) || upstreamCalls.Load() != 1 {
+		t.Fatalf("status %d, %d upstream calls; want no pool serve and one miss", rec.Code, upstreamCalls.Load())
+	}
 }
 
 // pool/<hex> missing → fallback returns false → falls through to
@@ -264,6 +294,11 @@ func TestServeHTTP_ByHashContentAddressed_DisallowedHostRejected(t *testing.T) {
 		t.Fatalf("PutURLPath: %v", err)
 	}
 
+	// I-4 (spec C3): the suite is known, so the allowlist — not the
+	// known-suite gate — is what refuses the serve.
+	if err := h.cache.EnsureSuiteForTest(context.Background(), "http", "evil.example.com", "/dists/foo"); err != nil {
+		t.Fatal(err)
+	}
 	rec := httptest.NewRecorder()
 	r := newProxyReqHostPort("GET", "http", "evil.example.com",
 		"/dists/foo/main/binary-amd64/by-hash/SHA256/"+hash)
@@ -312,6 +347,11 @@ func TestServeHTTP_ByHashContentAddressed_RejectsCrossHostBlob(t *testing.T) {
 	defer srv.Close()
 	_ = srv.URL
 
+	// I-4 (spec C3): host-b's suite is tracked, so the provenance gate —
+	// not the known-suite gate — is what refuses the cross-host serve.
+	if err := h.cache.EnsureSuiteForTest(context.Background(), "http", "host-b.example", "/dists/foo"); err != nil {
+		t.Fatal(err)
+	}
 	rec := httptest.NewRecorder()
 	r := newProxyReqHostPort("GET", "http", "host-b.example",
 		"/dists/foo/main/binary-amd64/by-hash/SHA256/"+hash)

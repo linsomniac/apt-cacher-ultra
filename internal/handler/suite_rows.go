@@ -5,13 +5,16 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // suiteReq is what one request knows about its suite (spec C3), threaded
@@ -347,4 +350,141 @@ func (h *Handler) registerLate(r *http.Request, req *proxy.Request, sr *suiteReq
 	}
 	sr.tok = h.anchorStart(r, req)
 	return sr.tok
+}
+
+// onboardTimeout bounds onboarding's writer operation (design review M8):
+// the body waits on it, so it stays well under apt's 30 s inactivity
+// timeout; on timeout the hit serves untracked, as on any onboarding error.
+const onboardTimeout = 5 * time.Second
+
+// onboard creates, before the body is served, the row of an untracked
+// suite whose cached anchor (or flat index) a url_path hit serves — the
+// legacy onboarding of spec C3, for anchors cached before this release or
+// while the suite was refused a row: sniff the blob, CreateSuite (marking
+// the base in the same transaction for a sniff-passing InRelease in hand
+// and for the suite's other cached signed anchors, ruling PD-5), and
+// register the serve with the flip barrier right after it. It returns that
+// registration's token (nil: nothing registered), whose wait in a hold
+// means the snapshot path may have changed meanwhile; the singleflight
+// leader then runs the backstop of an unproven creation.
+//
+// AIDEV-NOTE: concurrent hits on one untracked suite share one creation
+// through the handler's singleflight under its own key namespace (design
+// review M8: a herd after an upgrade, or when a refusal expires, costs one
+// writer operation), and each request then registers its own serve.
+func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blobHash string) *flipgate.Token {
+	if sr.tracked || !sr.file.CreatesRow(h.adoptionEnabled) || h.rejections.rejected(sr.key) {
+		return nil
+	}
+	head, err := readHead(h.cache.BlobPath(blobHash), sr.file.HeadBytes())
+	if err != nil || !sr.file.Sniff(req.Path, head) {
+		return nil
+	}
+	key := "onboard|" + sr.key.CanonicalScheme + "|" + sr.key.CanonicalHost + "|" + sr.key.SuitePath
+	res, shared, _ := h.sf.Do(key, func() sfResult { return h.runOnboard(r, req, sr) })
+	if !res.suiteTracked {
+		return nil
+	}
+	sr.tracked = true
+	t := h.registerLate(r, req, sr)
+	if res.unproven && !shared {
+		bctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), onboardTimeout)
+		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
+		cancel()
+	}
+	return t
+}
+
+// runOnboard is one onboarding's creation, shared by the concurrent hits
+// on the suite: it reports in suiteTracked whether the suite has a row now
+// (created, or found), and in unproven whether the creation needs the
+// backstop.
+func (h *Handler) runOnboard(r *http.Request, req *proxy.Request, sr *suiteReq) sfResult {
+	now := wallclock.Unix()
+	seed := h.suiteSeed(sr, false, "", "", now)
+	if sr.file.Marks() {
+		seed.SignedSeenAt = now
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), onboardTimeout)
+	defer cancel()
+	seed.Cached = h.cachedAnchors(ctx, sr.key, req.Path)
+	res, err := h.cache.CreateSuite(ctx, *seed, h.suiteCaps(), h.suiteGuard)
+	if err != nil {
+		// Untracked suites need no marker: serving on is safe, and the next
+		// hit tries again.
+		h.logger.Warn("suite onboarding failed",
+			"err", err, "canonical_host", req.CanonicalHost, "suite_path", req.SuitePath)
+		return sfResult{err: err}
+	}
+	h.noteCreate(sr.key, res)
+	return sfResult{
+		suiteTracked: res.Outcome == cache.SuiteCreated || res.Outcome == cache.SuiteExists,
+		unproven:     res.Outcome == cache.SuiteCreated && res.Unproven,
+	}
+}
+
+// touchAsync updates the url_path row's last_requested_at and
+// request_count (touchURL) and records client interest in suites (spec C3
+// TouchSuite, coalesced in the cache) without blocking the response: the
+// caller runs it as a goroutine. A fresh context keeps a disconnected
+// client from orphaning the writes. Deferred minor C-24: it recovers its
+// panics.
+func (h *Handler) touchAsync(req *proxy.Request, touchURL bool, suites []cache.SuiteKey) {
+	defer func() {
+		if v := recover(); v != nil {
+			h.logGoroutinePanic("handler_goroutine_panicked", &touchPanicStackLogged, v,
+				"where", "touch", "canonical_host", req.CanonicalHost, "path", req.Path)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if touchURL {
+		if err := h.cache.TouchURLPath(ctx, req.CanonicalScheme, req.CanonicalHost, req.Path); err != nil {
+			h.logger.Debug("touch failed", "err", err, "canonical_host", req.CanonicalHost, "path", req.Path)
+		}
+	}
+	for _, k := range suites {
+		if err := h.cache.TouchSuite(ctx, k); err != nil {
+			h.logger.Debug("suite touch failed", "err", err, "canonical_host", k.CanonicalHost, "suite_path", k.SuitePath)
+		}
+	}
+}
+
+// touchPanicStackLogged limits the touch goroutine's panic stack to one
+// per process.
+var touchPanicStackLogged atomic.Bool
+
+// servedSuite returns the suite a served suite file records interest in
+// (spec C3): the request's own suite when it is tracked and the response
+// status is below 400 (304, HEAD and stale serves included).
+func servedSuite(sr *suiteReq, status int) []cache.SuiteKey {
+	if !sr.file.Touches() || !sr.tracked || status >= http.StatusBadRequest {
+		return nil
+	}
+	return []cache.SuiteKey{sr.key}
+}
+
+// vouchingSuites returns the distinct suite paths of the rows that declare
+// hash (the suites a validated .deb serve keeps alive).
+func vouchingSuites(rows []cache.DeclaredHash, hash string) []string {
+	var out []string
+	for _, r := range rows {
+		if r.DeclaredSHA256 == hash && !slices.Contains(out, r.SuitePath) {
+			out = append(out, r.SuitePath)
+		}
+	}
+	return out
+}
+
+// vouchedSuites returns the suites whose snapshots vouched a served .deb
+// (spec C3: install-only clients keep their suite alive).
+func vouchedSuites(req *proxy.Request, v packageValidation, status int) []cache.SuiteKey {
+	if !v.Validated || status >= http.StatusBadRequest {
+		return nil
+	}
+	out := make([]cache.SuiteKey, 0, len(v.Suites))
+	for _, s := range v.Suites {
+		out = append(out, cache.SuiteKey{CanonicalScheme: req.CanonicalScheme, CanonicalHost: req.CanonicalHost, SuitePath: s})
+	}
+	return out
 }
