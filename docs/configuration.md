@@ -251,8 +251,10 @@ host can also get there by normal growth). Above the total cap new suites
 are refused, but each refused attempt still evicts one suite that qualifies
 (no adopted snapshot, not requested for 24 hours), so the table shrinks
 back under the cap as suites fall idle. A host at its own cap refuses that
-host's new suites and evicts nothing: its suites go only when idle-suite
-reaping (a later release) removes those not requested for 30 days. A table
+host's new suites and evicts nothing for them; its suites go when idle-suite
+reaping (a later release) removes those not requested for 30 days, or when
+a new suite of any host at the total cap evicts one of its idle suites (no
+adopted snapshot, not requested for 24 hours). A table
 at exactly the total cap logs no warning: that is a full cache working
 normally, where a new suite evicts an idle one and is refused only when
 none qualifies (WARN `suite_seed_rejected`).

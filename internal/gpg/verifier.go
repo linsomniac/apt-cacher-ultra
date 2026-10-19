@@ -238,8 +238,10 @@ func decodeClearsigned(b []byte) (block *clearsign.Block, err error) {
 // Order of checks (each fails closed):
 //  1. Reject extraneous bytes around the clearsigned block.
 //     clearsign.Decode silently discards prefix data, so we enforce
-//     "exactly one clearsigned message, with at most whitespace
-//     before/after" before invoking the decoder. Without this, an
+//     "exactly one clearsigned message: its first line is the BEGIN
+//     marker (apt's rule, ruling R-D2 — no leading byte, whitespace
+//     included), and at most whitespace follows the END marker" before
+//     invoking the decoder (requireBareClearsigned). Without this, an
 //     adversary could prepend forged content to a real InRelease;
 //     the verifier would happily verify the embedded message while
 //     §7.5 step 2 stored the original (prefix-bearing) bytes as the

@@ -348,7 +348,7 @@ next to the Suites table contract in §5.3:
 | Field | Type | Meaning |
 |---|---|---|
 | `anchor_form` | string | The current snapshot's signing form — `inline` or `detached` today (`unsigned` joins in a later phase); empty when the suite has no current snapshot. |
-| `last_requested_unixtime` | int64 or `null` | Last time a client requested content under this suite. |
+| `last_requested_unixtime` | int64 or `null` | When a client last showed interest in the suite (spec C3): written when the suite's row is created, then by coalesced touches — at most one write per suite per hour — from serves of its anchors (`InRelease`, `Release`, `Release.gpg`; status below 400, 304 and HEAD included), of its flat indexes, and of `.deb`s its current snapshot vouched for. Index requests such as `Packages.gz` never move it. It decides cap eviction: at the `freshness.max_suites` cap, a suite with no current snapshot whose stamp is 24 hours old or more can be evicted for a new one (`suite_evicted`). |
 | `check_fail_count` | int64 | Consecutive checks that ended unknown (transport error, deadline, unexpected status) since the last answered check; drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check. |
 | `adoption_fail_reason` | string or `null` | The current failure or refusal reason; `null` when no record exists. |
 | `adoption_fail_count` | int64 | Consecutive adoption attempts in the current failure/refusal streak; `0` when no record exists. |
@@ -800,7 +800,7 @@ Per-section copy:
 
 | Section          | Eyebrow                  | Body                                                                                                  |
 |------------------|--------------------------|-------------------------------------------------------------------------------------------------------|
-| Suites           | NO SUITES TRACKED YET    | Adoption begins when a client requests an InRelease through the proxy.                                |
+| Suites           | NO SUITES TRACKED YET    | A suite is tracked once a client requests its InRelease through the proxy (with adoption enabled, also its Release). |
 | Adoptions        | RING BUFFER EMPTY        | Process started {uptime} ago.                                                                         |
 | Keyring (disabled) | ADOPTION DISABLED      | Keyring is not loaded because `[adoption].enabled = false`. Enable adoption to bundle default keys.   |
 | Keyring (crit)   | NO GPG KEYS LOADED       | Adoption is enabled but no keyring entries are present. Every adoption will fail with `gpg_failed`.   |

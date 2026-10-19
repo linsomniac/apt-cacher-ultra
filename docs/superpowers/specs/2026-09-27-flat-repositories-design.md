@@ -261,9 +261,11 @@ sources).
 | `Release.gpg` | armor header `-----BEGIN PGP SIGNATURE-----` as the first non-whitespace text (leading whitespace is accepted; leading non-header lines, which gpg tolerates, are rejected), or a binary OpenPGP signature packet: old-format tag byte 0x88–0x8B or new-format 0xC2, whose body — at the offset its length header gives (old format: one, two or four length octets, none for the indeterminate type; new format: one octet below 192, two for 192–223, five for 255, one for a partial length) — starts with a signature version 3–6 (phase D, ruling PD-10: text starting with a UTF-8 lead byte, such as "©" or U+00A0, does not pass) |
 | flat `Packages*`/`Sources*` | the compression magic for the extension, or plain text starting `Package:`/`Package: ` (`Sources`: `Package:` too) |
 
-**Single creation choke point.** `cache.CreateSuite` is the **only**
-`INSERT INTO suite_freshness`: create-only (`ON CONFLICT DO NOTHING`), sets
-`last_requested_at = now`, and enforces two caps: `freshness.max_suites`
+**Single creation choke point.** `createSuiteTx` (`internal/cache`),
+reached through `cache.CreateSuite` (hits) and `cache.StoreFetched`
+(misses), is the **only** `INSERT INTO suite_freshness`: create-only (an
+existence check in the creating writer transaction leaves an existing row
+alone), sets `last_requested_at = now`, and enforces two caps: `freshness.max_suites`
 (default 5000) globally and `max_suites / 10` per canonical host (a host's
 `http` and `https` suites counted together). At or above the global cap it
 first tries to evict the least-recently-requested suite that has no current
@@ -280,15 +282,16 @@ candidate was busy is transient (below). An attempt evicts at most one
 suite: above the cap (after `max_suites` was lowered, or after an upgrade)
 it evicts one and is still
 refused while the count stays at or above the cap, so the table converges
-under the 24 h rule (phase D, ruling PD-8). The per-host cap never evicts;
-a host at its cap shrinks only through the reaper (C9, `gc.suite_idle_ttl`,
-30 days by default). The daemon logs WARN `suite_caps_exceeded` at start
+under the 24 h rule (phase D, ruling PD-8). The per-host cap never evicts:
+a host at its cap shrinks through the reaper (C9, `gc.suite_idle_ttl`, 30
+days by default), or when global-cap eviction — whose candidates come from
+every host — takes one of its idle suites. The daemon logs WARN `suite_caps_exceeded` at start
 when the table is above the global cap or a host is at its cap — at
 exactly the global cap a creation evicts, so a full table is normal
 operation and logs nothing (phase D, ruling PD-12). An
 eviction leaves the evictee's `url_path` rows to `url_path` GC, drops its
 lock-map, flip-gate and touch entries, and logs INFO `suite_evicted`.
-Otherwise `CreateSuite` creates nothing and emits a rate-limited WARN
+Otherwise the creation creates nothing and emits a rate-limited WARN
 `suite_seed_rejected` ("suite will not refresh"; one line a minute, field
 `suppressed`), the counter `acu_suite_seed_rejected_total{host}` (refusals
 that reached the writer) and the unlabelled gauge `acu_suites_seed_rejected`
@@ -307,13 +310,15 @@ final review). A suite path longer than
 files as suite files, so it gets no row, marker, touch or rejection-cache
 entry (phase D, ruling PD-9).
 
-Only the handler calls it, for a response whose bytes pass the sniff for
+Only the handler creates rows (`StoreFetched` on a miss, `CreateSuite` on a
+hit), for a response whose bytes pass the sniff for
 the path, on a miss **or** a `url_path` hit (so anchors cached before this
 release are onboarded). For the anchor paths (`InRelease`, `Release`) the
 row — and, for a signed anchor, the signed-seen marker — is created in the
 **writer operation that stores the `url_path` row, before the body is
 written to the client**: the miss path holds the whole body before serving,
-so the order is sniff → `url_path` + `CreateSuite` + marker → write body →
+so the order is sniff → `url_path` + row creation + marker (one
+`StoreFetched` transaction) → write body →
 T1. Today's handler already seeds its row inside `runFetch` before serving;
 this keeps that order. A hit onboards a cached anchor (creates the row) the
 same way. Flat index rows may be created after serving. Paths that create a
@@ -361,7 +366,7 @@ handler side). A test proves exactly one INSERT site.
 
 **Client interest.** `suite_freshness.last_requested_at` (distinct from
 `url_path.last_requested_at`; an `AIDEV-NOTE` says so) is set by the
-creating request (`CreateSuite`) and otherwise written only by `TouchSuite`
+creating request (`createSuiteTx`) and otherwise written only by `TouchSuite`
 from client-serving paths:
 
 - anchor serves (`InRelease`, `Release`, `Release.gpg`; status < 400,

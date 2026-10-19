@@ -484,8 +484,10 @@ func serveListeners(
 		return err // already prefixed "legacy trust audit:"
 	}
 
-	// Ruling PD-8: a suite table already at or above a cap refuses new
-	// suites until cap eviction or phase F's reaper makes room; say so.
+	// Rulings PD-8, PD-12: a suite table above the global cap, or with a
+	// host at its per-host cap, refuses new suites until cap eviction or
+	// phase F's reaper makes room; say so. At exactly the global cap a new
+	// suite evicts an idle one, so a full table logs nothing.
 	warnSuiteCaps(ctx, c, cfg.Freshness.MaxSuites, logger)
 
 	// SPEC4 §4.2 steps 5 + 6: pool/ orphan scan + one-shot GC pass.
