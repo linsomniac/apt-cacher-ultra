@@ -393,10 +393,10 @@ func TestAfterCreate_ReadsTheCandidatesRowUnlessTheResultSays(t *testing.T) {
 	held := func(k SuiteKey) *heldSuite {
 		return &heldSuite{key: k, release: func(deleted bool) { got = append(got, deleted) }}
 	}
-	c.afterCreate(CreateResult{}, held(sk("b", "/kept")))
-	c.afterCreate(CreateResult{}, held(sk("b", "/gone")))
+	c.afterCreate(sk("e", "/new"), CreateResult{}, held(sk("b", "/kept")))
+	c.afterCreate(sk("e", "/new"), CreateResult{}, held(sk("b", "/gone")))
 	kept := sk("b", "/kept")
-	c.afterCreate(CreateResult{Outcome: SuiteCreated, Evicted: &kept}, held(kept))
+	c.afterCreate(sk("e", "/new"), CreateResult{Outcome: SuiteCreated, Evicted: &kept}, held(kept))
 	if !slices.Equal(got, []bool{false, true, true}) {
 		t.Fatalf("released %v; want [false true true] (present: kept; absent: deleted; evicted: deleted)", got)
 	}

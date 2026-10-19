@@ -905,6 +905,9 @@ type DeclaredHash struct {
 	// whose source format does not carry a package name (e.g. pdiff
 	// patches). Callers must tolerate the empty case.
 	PackageName string
+	// SuitePath is the suite whose current snapshot the row belongs to
+	// (spec C3: a vouched .deb serve touches that suite).
+	SuitePath string
 }
 
 // DeclaredHashesForPath returns every package_hash row covering this .deb
@@ -927,7 +930,7 @@ type DeclaredHash struct {
 // disagreed.
 func (c *Cache) DeclaredHashesForPath(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
 	const q = `
-SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name
+SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name, sf.suite_path
   FROM package_hash p
   JOIN suite_freshness sf ON sf.current_snapshot_id = p.snapshot_id
  WHERE p.canonical_scheme = ?
@@ -941,7 +944,7 @@ SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name
 	var out []DeclaredHash
 	for rows.Next() {
 		var d DeclaredHash
-		if err := rows.Scan(&d.DeclaredSHA256, &d.SnapshotID, &d.PackageName); err != nil {
+		if err := rows.Scan(&d.DeclaredSHA256, &d.SnapshotID, &d.PackageName, &d.SuitePath); err != nil {
 			return nil, fmt.Errorf("DeclaredHashesForPath scan: %w", err)
 		}
 		out = append(out, d)

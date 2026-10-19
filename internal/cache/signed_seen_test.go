@@ -2,6 +2,8 @@ package cache
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -68,5 +70,46 @@ func TestCommitAdoption_SignedFormsRecordSignedSeen(t *testing.T) {
 		if err != nil || ok != want || (ok && at != 1_800_000_000) {
 			t.Errorf("%s: marker ok=%v at=%d err=%v, want ok=%v at the commit time", base, ok, at, err, want)
 		}
+	}
+}
+
+// Deferred minor A-24: a batch writes every mark, over several 500-row
+// transactions, and duplicates within a batch keep the newest stamp.
+func TestMarkSignedSeenBatch_ManyMarksInChunks(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	var marks []SignedSeenMark
+	for i := range 1201 {
+		marks = append(marks, SignedSeenMark{CanonicalScheme: "http", CanonicalHost: "h",
+			Base: fmt.Sprintf("/r/dists/s%04d", i), SeenAt: int64(1000 + i)})
+	}
+	marks = append(marks,
+		SignedSeenMark{CanonicalScheme: "http", CanonicalHost: "h", Base: "/dup", SeenAt: 100},
+		SignedSeenMark{CanonicalScheme: "http", CanonicalHost: "h", Base: "/dup", SeenAt: 50})
+	if err := c.MarkSignedSeenBatch(ctx, marks); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM suite_signed_seen WHERE base LIKE '/r/dists/s%'`).Scan(&n); err != nil || n != 1201 {
+		t.Fatalf("markers = %d, %v; want 1201", n, err)
+	}
+	if at, _, _ := c.SignedSeen(ctx, "http", "h", "/r/dists/s1200"); at != 2200 {
+		t.Fatalf("last mark of the third chunk = %d, want 2200", at)
+	}
+	if at, _, _ := c.SignedSeen(ctx, "http", "h", "/dup"); at != 100 {
+		t.Fatalf("duplicate = %d, want the newest stamp 100", at)
+	}
+}
+
+// Deferred minor A-25: a failing mark names the batch writer.
+func TestMarkSignedSeenBatch_ErrorsArePrefixed(t *testing.T) {
+	c := openCache(t)
+	if _, err := c.db.Exec(`CREATE TRIGGER fail_mark BEFORE INSERT ON suite_signed_seen
+BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	err := c.MarkSignedSeenBatch(context.Background(), []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "h", Base: "/b", SeenAt: 1}})
+	if err == nil || !strings.HasPrefix(err.Error(), "MarkSignedSeenBatch: mark signed-seen http://h/b: ") {
+		t.Fatalf("err = %v; want it prefixed \"MarkSignedSeenBatch: mark signed-seen http://h/b: \"", err)
 	}
 }

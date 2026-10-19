@@ -43,6 +43,9 @@ type Cache struct {
 	revisionMu    sync.Mutex
 	revisionConn  *sql.Conn
 	revisionEpoch uint64
+
+	// touches coalesces TouchSuite writes (spec C3).
+	touches suiteTouches
 }
 
 // Open initializes (or attaches to) the cache rooted at dir. Creates

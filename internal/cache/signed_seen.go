@@ -24,9 +24,14 @@ type execer interface {
 // AIDEV-NOTE: the marker is the never-downgrade authority for unsigned
 // adoption (spec C5). Writers: CommitAdoption (signed forms, in its
 // transaction), the startup legacy audit and anchor pass (spec §6.1), and
-// from phase D the handler's miss path (same writer operation as the
-// anchor's url_path row, before the body is served). It is never written for an
-// unsigned snapshot or a plain-text anchor.
+// from phase D the handler: on a miss, StoreFetched (the same writer
+// transaction as the anchor's url_path row, before the body is served);
+// on a suite-row creation, the creating transaction (createSuiteTx's
+// markCreated: SuiteSeed.SignedSeenAt and every cached signed anchor in
+// SuiteSeed.Cached, ruling PD-5), and only for an unproven creation the
+// handler's markCachedSignedAnchors backstop. It is written only for
+// suites with a suite_freshness row, and never for an unsigned snapshot or
+// a plain-text anchor.
 func markSignedSeen(ctx context.Context, ex execer, scheme, host, base string, seenAt int64) error {
 	if _, err := ex.ExecContext(ctx, `
 INSERT INTO suite_signed_seen (canonical_scheme, canonical_host, base, last_seen_at)
@@ -53,7 +58,7 @@ func (c *Cache) MarkSignedSeenBatch(ctx context.Context, marks []SignedSeenMark)
 			defer func() { _ = tx.Rollback() }()
 			for _, m := range chunk {
 				if err := markSignedSeen(ctx, tx, m.CanonicalScheme, m.CanonicalHost, m.Base, m.SeenAt); err != nil {
-					return err
+					return fmt.Errorf("MarkSignedSeenBatch: %w", err) // deferred minor A-25
 				}
 			}
 			if err := tx.Commit(); err != nil {

@@ -57,7 +57,25 @@ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ?`
 // upstream_etag, and upstream_lastmod are all carried through — pass nil
 // pointers for fields that should remain SQL NULL.
 func (c *Cache) PutURLPath(ctx context.Context, u URLPath) error {
-	const q = `
+	isMD := int64(0)
+	if u.IsMetadata {
+		isMD = 1
+	}
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, putURLPathSQL,
+			u.CanonicalScheme, u.CanonicalHost, u.Path, u.BlobHash, u.UpstreamURL,
+			isMD, u.LastRequestedAt, u.RequestCount, u.LastFetchedAt,
+			u.UpstreamETag, u.UpstreamLastMod)
+		if err != nil {
+			return fmt.Errorf("PutURLPath: %w", err)
+		}
+		return nil
+	})
+}
+
+// putURLPathSQL is PutURLPath's upsert, shared with StoreFetched (one
+// statement, so the miss path's url_path row matches PutURLPath's).
+const putURLPathSQL = `
 INSERT INTO url_path
   (canonical_scheme, canonical_host, path, blob_hash, upstream_url,
    is_metadata, last_requested_at, request_count, last_fetched_at,
@@ -75,21 +93,6 @@ ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
   -- A fresh fetch/serve re-establishes the row; clear any hold-grace stamp
   -- so a re-fetched path isn't reaped at a stale drop deadline.
   dropped_at        = NULL`
-	isMD := int64(0)
-	if u.IsMetadata {
-		isMD = 1
-	}
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		_, err := conn.ExecContext(ctx, q,
-			u.CanonicalScheme, u.CanonicalHost, u.Path, u.BlobHash, u.UpstreamURL,
-			isMD, u.LastRequestedAt, u.RequestCount, u.LastFetchedAt,
-			u.UpstreamETag, u.UpstreamLastMod)
-		if err != nil {
-			return fmt.Errorf("PutURLPath: %w", err)
-		}
-		return nil
-	})
-}
 
 // TouchURLPath records that a request was just served from cache for this
 // (scheme, host, path). Increments request_count and updates

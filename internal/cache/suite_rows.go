@@ -227,16 +227,18 @@ func (c *Cache) createSuiteOnce(ctx context.Context, seed SuiteSeed, caps SuiteC
 	if err != nil {
 		// Never read got after an error: on a ctx/close path the op may
 		// still be running (see InsertCandidateSnapshot).
-		c.afterCreate(CreateResult{}, held)
+		c.afterCreate(seed.SuiteKey, CreateResult{}, held)
 		return CreateResult{}, err
 	}
-	c.afterCreate(got, held)
+	c.afterCreate(seed.SuiteKey, got, held)
 	return got, nil
 }
 
-// afterCreate releases the held eviction candidate after the writer
-// operation, telling the guard whether its row is gone — deleted by this
-// creation's eviction, or found absent — so that release(true) drops the
+// afterCreate settles a creation attempt after its writer operation. A
+// created row counts as touched (its insert stamped last_requested_at),
+// and the held eviction candidate is released, telling the guard whether
+// its row is gone — deleted by this creation's eviction, or found absent —
+// so that release(true), and the dropped touch-coalescing entry, purge the
 // suite's in-memory state exactly when the suite has no row. Unless the
 // result says so, it reads the row: after a failed submit the outcome is
 // unknown, and an unused candidate's row may have been evicted by a
@@ -253,11 +255,18 @@ func (c *Cache) createSuiteOnce(ctx context.Context, seed SuiteSeed, caps SuiteC
 // a check that starts meanwhile meets a vanished row, which I-4's
 // re-validation and the UPDATE-only writers make harmless (its candidate,
 // if any, was retired: CommitAdoption refuses it).
-func (c *Cache) afterCreate(res CreateResult, held *heldSuite) {
-	if held == nil {
-		return
+func (c *Cache) afterCreate(key SuiteKey, res CreateResult, held *heldSuite) {
+	if res.Outcome == SuiteCreated {
+		c.noteTouch(key)
 	}
-	held.release(res.Evicted != nil || res.heldGone || c.suiteRowGone(held.key))
+	if held == nil {
+		return // an eviction needs a held candidate: nothing was evicted
+	}
+	gone := res.Evicted != nil || res.heldGone || c.suiteRowGone(held.key)
+	if gone {
+		c.forgetTouch(held.key)
+	}
+	held.release(gone)
 }
 
 // suiteRowGone reports whether key's row is absent, read under a fresh
