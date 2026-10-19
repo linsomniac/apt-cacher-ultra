@@ -1401,8 +1401,17 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	}
 	if res.unproven && !shared {
 		// The creation's transaction could not prove a cached anchor that
-		// changed after it was sniffed: mark it now (the backstop).
-		bctx, cancel := context.WithTimeout(h.lifecycleCtx, 30*time.Second)
+		// changed after it was sniffed, or that cachedAnchors could not
+		// read: mark it now (the backstop).
+		//
+		// AIDEV-NOTE: the body waits on the backstop, so backstopTimeout
+		// (5 s) bounds it well under apt's 30 s inactivity timeout (Task 9
+		// review, controller addition d). On a timeout or any other failure
+		// markCachedSignedAnchors logs WARN and the body is served anyway:
+		// the body in hand was marked in the creating transaction when it
+		// earns a marker, and the startup marker pass marks the other cached
+		// anchors at the next start.
+		bctx, cancel := context.WithTimeout(h.lifecycleCtx, backstopTimeout)
 		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
 		cancel()
 	}
@@ -1959,11 +1968,23 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	// requires a binary signature's version byte: ruling PD-10). Phase E's
 	// T1-on-seed keys on stored.Create.Outcome == cache.SuiteCreated;
 	// stored.Tracked is what the late flip-barrier registration uses.
+	// A pool file that cannot be read back (a local disk fault) is logged
+	// WARN: for a signed anchor (file.Marks()) the miss fails like a failed
+	// writer operation — 502, no body, nothing stored — because its sniff
+	// decides its marker; any other suite file is stored and served with no
+	// row creation or re-stamp (Task 9 review, ruling a).
 	sr := &suiteReq{key: suiteKeyOf(req), file: file}
 	fetched := cache.FetchedRow{Row: row}
 	if file != aptpath.NotSuiteFile {
 		fetched.Suite = sr.key
 		head, herr := readHead(h.cache.BlobPath(hash), file.HeadBytes())
+		if herr != nil {
+			h.logger.Warn("suite file head read failed",
+				"err", herr, "canonical_host", req.CanonicalHost, "suite_path", req.SuitePath, "path", req.Path)
+			if file.Marks() {
+				return sfResult{err: fmt.Errorf("handler: read suite file head: %w", herr), status: fres.Status}
+			}
+		}
 		if herr == nil && file.Sniff(req.Path, head) {
 			if file.Marks() {
 				fetched.MarkSeenAt = now

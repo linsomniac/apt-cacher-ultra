@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -271,9 +272,12 @@ func lastUse(row *cache.URLPath) int64 {
 // request stores itself — and sniffs each blob here, outside the writer,
 // for a creation to mark in its transaction (cache.SuiteSeed.Cached,
 // ruling PD-5). A missing row is listed without a blob, so one that
-// appears before the transaction makes the creation unproven; a row whose
-// read or pool file fails is listed as not signed (no evidence, no
-// marker), and the transaction's re-read decides whether it changed.
+// appears before the transaction makes the creation unproven. A row whose
+// url_path read or pool file read fails is logged WARN and listed without
+// a blob too: if the transaction's re-read finds it holding one, the
+// creation is unproven and the backstop retries it after the commit —
+// never "not signed, hash unchanged", which would leave a tracked suite's
+// signed anchor unmarked (Task 9 review, ruling b).
 //
 // AIDEV-NOTE: a row creation marks the suite's cached signed anchors in
 // the creating transaction, so a tracked suite never serves an unmarked
@@ -288,12 +292,21 @@ func (h *Handler) cachedAnchors(ctx context.Context, key cache.SuiteKey, except 
 			continue
 		}
 		a := cache.CachedAnchor{Path: p}
-		if row, err := h.cache.LookupURL(ctx, key.CanonicalScheme, key.CanonicalHost, p); err == nil && row.BlobHash != nil {
-			a.BlobHash, a.SeenAt = *row.BlobHash, lastUse(row)
+		row, err := h.cache.LookupURL(ctx, key.CanonicalScheme, key.CanonicalHost, p)
+		switch {
+		case errors.Is(err, cache.ErrNotFound):
+		case err != nil:
+			h.logger.Warn("suite cached anchor read failed",
+				"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath, "path", p)
+		case row.BlobHash != nil:
 			file := aptpath.ClassifySuiteFile(key.SuitePath, p)
-			if head, err := readHead(h.cache.BlobPath(a.BlobHash), file.HeadBytes()); err == nil {
-				a.Signed = file.Sniff(p, head)
+			head, err := readHead(h.cache.BlobPath(*row.BlobHash), file.HeadBytes())
+			if err != nil {
+				h.logger.Warn("suite cached anchor read failed",
+					"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath, "path", p)
+				break
 			}
+			a.BlobHash, a.SeenAt, a.Signed = *row.BlobHash, lastUse(row), file.Sniff(p, head)
 		}
 		out = append(out, a)
 	}
@@ -303,12 +316,21 @@ func (h *Handler) cachedAnchors(ctx context.Context, key cache.SuiteKey, except 
 	return out
 }
 
+// backstopTimeout bounds markCachedSignedAnchors where it runs before the
+// body — after an unproven creation on the miss path and after onboarding —
+// well under apt's 30 s inactivity timeout, like onboardTimeout (Task 9
+// review, controller addition d). On a timeout the backstop's reads or its
+// write fail and are logged WARN, and the body is served.
+const backstopTimeout = 5 * time.Second
+
 // markCachedSignedAnchors is the backstop for an unproven creation
 // (cache.CreateResult.Unproven): a cached anchor row that changed or
-// appeared between cachedAnchors' read and the creating transaction was
-// never sniffed, so it is read, sniffed and marked after the commit (SeenAt
-// is its last use). A failure is logged WARN; the startup marker pass heals
-// it at the next start.
+// appeared between cachedAnchors' read and the creating transaction — or
+// that cachedAnchors could not read — was never sniffed, so it is read,
+// sniffed and marked after the commit (SeenAt is its last use). Every
+// failure — a url_path read other than "no row", a pool file read, the
+// mark — is logged WARN; the startup marker pass heals it at the next
+// start.
 func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKey, except string) {
 	var marks []cache.SignedSeenMark
 	for _, name := range []string{"/InRelease", "/Release.gpg"} {
@@ -317,12 +339,24 @@ func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKe
 			continue
 		}
 		row, err := h.cache.LookupURL(ctx, key.CanonicalScheme, key.CanonicalHost, p)
-		if err != nil || row.BlobHash == nil {
+		switch {
+		case errors.Is(err, cache.ErrNotFound):
+			continue
+		case err != nil:
+			h.logger.Warn("suite signed-seen backstop read failed",
+				"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath, "path", p)
+			continue
+		case row.BlobHash == nil:
 			continue
 		}
 		file := aptpath.ClassifySuiteFile(key.SuitePath, p)
 		head, err := readHead(h.cache.BlobPath(*row.BlobHash), file.HeadBytes())
-		if err != nil || !file.Sniff(p, head) {
+		if err != nil {
+			h.logger.Warn("suite signed-seen backstop read failed",
+				"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath, "path", p)
+			continue
+		}
+		if !file.Sniff(p, head) {
 			continue
 		}
 		if seen := lastUse(row); seen > 0 {
@@ -388,7 +422,7 @@ func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blo
 	sr.tracked = true
 	t := h.registerLate(r, req, sr)
 	if res.unproven && !shared {
-		bctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), onboardTimeout)
+		bctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), backstopTimeout)
 		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
 		cancel()
 	}

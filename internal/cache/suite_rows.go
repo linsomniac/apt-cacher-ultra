@@ -79,7 +79,9 @@ type CachedAnchor struct {
 	// Path is the url_path path, e.g. "/ubuntu/dists/noble/Release.gpg".
 	Path string
 	// BlobHash is the blob the row held; "" when there was no row (or no
-	// blob).
+	// blob), or when the caller could not read the row or its pool file —
+	// a row the transaction then finds holding a blob makes the creation
+	// unproven, so the caller's backstop retries it.
 	BlobHash string
 	// Signed: that blob passed the anchor's sniff (spec C3).
 	Signed bool

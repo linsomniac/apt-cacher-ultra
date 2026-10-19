@@ -5,11 +5,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -419,6 +422,129 @@ BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END`); err != nil {
 	}
 	if _, err := r.c.LookupURL(context.Background(), "http", "127.0.0.1", "/r/dists/s/InRelease"); !errors.Is(err, cache.ErrNotFound) {
 		t.Fatalf("the failed operation stored the url_path row (%v)", err)
+	}
+}
+
+// unreadableBlob makes body's pool file unreadable — a directory where the
+// file belongs, so opening it succeeds and reading it fails (EISDIR), as a
+// disk fault would; a miss of the same bytes keeps it (Finalize dedups) —
+// and returns a func that puts the file back.
+func (r *suiteRig) unreadableBlob(body []byte) (restore func()) {
+	r.t.Helper()
+	p := r.c.BlobPath(sha256Hex(body))
+	aside, had := p+".aside", false
+	if _, err := os.Stat(p); err == nil {
+		if err := os.Rename(p, aside); err != nil {
+			r.t.Fatal(err)
+		}
+		had = true
+	}
+	if err := os.MkdirAll(p, 0o750); err != nil {
+		r.t.Fatal(err)
+	}
+	return func() {
+		if err := os.Remove(p); err != nil {
+			r.t.Error(err)
+		}
+		if had {
+			if err := os.Rename(aside, p); err != nil {
+				r.t.Error(err)
+			}
+		}
+	}
+}
+
+// warnPaths lists the path and suite_path of each WARN record msg, failing
+// on a record without err or with another canonical_host.
+func (r *suiteRig) warnPaths(msg string) []string {
+	r.t.Helper()
+	var out []string
+	for _, rec := range logRecords(r.logs, msg, slog.LevelWarn) {
+		if rec["err"] == nil || rec["canonical_host"] != "127.0.0.1" {
+			r.t.Errorf("%s record %v: want err and canonical_host", msg, rec)
+		}
+		out = append(out, fmt.Sprint(rec["path"], " ", rec["suite_path"]))
+	}
+	return out
+}
+
+// Task 9 review (ruling a): a fetched suite file whose pool file cannot be
+// read back for its sniff is logged WARN. A signed anchor's miss then fails
+// like a failed writer operation — 502, no body, nothing stored — since its
+// sniff decides its marker; any other suite file is stored and served, and
+// creates no row from a body nobody sniffed.
+func TestServeHTTP_UnreadableFetchedSuiteFile(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	r.serve("/r/dists/s/InRelease", upFile{body: rowInRelease})
+	r.unreadableBlob(rowInRelease)
+	rec := r.get("/r/dists/s/InRelease")
+	if rec.Code != http.StatusBadGateway || bytes.Contains(rec.Body.Bytes(), []byte("Origin: T")) {
+		t.Fatalf("InRelease: status %d body %q; want 502 without the anchor", rec.Code, rec.Body.String())
+	}
+	if r.suite("/r/dists/s") != nil || r.marked("/r/dists/s") {
+		t.Fatal("InRelease: an unread body created a row or a marker")
+	}
+	if _, err := r.c.LookupURL(context.Background(), "http", "127.0.0.1", "/r/dists/s/InRelease"); !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("InRelease: the failed miss stored the url_path row (%v)", err)
+	}
+	r.serve("/r/dists/t/Release", upFile{body: rowRelease})
+	r.unreadableBlob(rowRelease)
+	r.get("/r/dists/t/Release") // the serve reads the directory too: its status is the injection's
+	if r.suite("/r/dists/t") != nil {
+		t.Fatal("Release: an unread body created a row")
+	}
+	if _, err := r.c.LookupURL(context.Background(), "http", "127.0.0.1", "/r/dists/t/Release"); err != nil {
+		t.Fatalf("Release: the url_path row was not stored (%v)", err)
+	}
+	want := []string{"/r/dists/s/InRelease /r/dists/s", "/r/dists/t/Release /r/dists/t"}
+	if got := r.warnPaths("suite file head read failed"); !slices.Equal(got, want) {
+		t.Fatalf("suite file head read failed for %q, want %q", got, want)
+	}
+}
+
+// Task 9 review (rulings b, c): a creation that cannot read one of its
+// suite's cached signed anchors logs WARN and is unproven — never "unsigned,
+// hash unchanged" — so the backstop re-reads the anchor after the commit and
+// marks it; a backstop read that fails is logged WARN too (a missing row is
+// not). For g the cached Release.gpg is unreadable while the Release miss
+// reads it and readable again for the backstop; for h it stays unreadable.
+func TestServeHTTP_UnreadableCachedAnchorMakesTheCreationUnproven(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	r.serve("/r/dists/g/Release.gpg", upFile{body: rowGPG})
+	if rec := r.get("/r/dists/g/Release.gpg"); rec.Code != http.StatusOK || r.suite("/r/dists/g") != nil {
+		t.Fatalf("premise: Release.gpg = %d, cached for an untracked suite", rec.Code)
+	}
+	restore := r.unreadableBlob(rowGPG)
+	r.h.cachedAnchorsHook = func() { // right after cachedAnchors' read, before the creating transaction
+		r.h.cachedAnchorsHook = nil
+		restore()
+	}
+	r.serve("/r/dists/g/Release", upFile{body: rowRelease})
+	if rec := r.get("/r/dists/g/Release"); rec.Code != http.StatusOK || r.suite("/r/dists/g") == nil {
+		t.Fatalf("g: Release miss = %d; want the row created", rec.Code)
+	}
+	if !r.marked("/r/dists/g") {
+		t.Fatal("g: the cached Release.gpg the creation could not read is unmarked; want the backstop to mark it")
+	}
+	r.serve("/r/dists/h/Release.gpg", upFile{body: rowGPG})
+	if rec := r.get("/r/dists/h/Release.gpg"); rec.Code != http.StatusOK || r.suite("/r/dists/h") != nil {
+		t.Fatalf("premise: h's Release.gpg = %d, cached for an untracked suite", rec.Code)
+	}
+	defer r.unreadableBlob(rowGPG)()
+	r.serve("/r/dists/h/Release", upFile{body: rowRelease})
+	if rec := r.get("/r/dists/h/Release"); rec.Code != http.StatusOK || r.suite("/r/dists/h") == nil {
+		t.Fatalf("h: Release miss = %d; want the row created", rec.Code)
+	}
+	if r.marked("/r/dists/h") {
+		t.Fatal("h: marked from a Release.gpg nobody could read")
+	}
+	want := []string{"/r/dists/g/Release.gpg /r/dists/g", "/r/dists/h/Release.gpg /r/dists/h"}
+	if got := r.warnPaths("suite cached anchor read failed"); !slices.Equal(got, want) {
+		t.Fatalf("suite cached anchor read failed for %q, want %q", got, want)
+	}
+	want = []string{"/r/dists/h/Release.gpg /r/dists/h"} // no line for the absent InRelease rows
+	if got := r.warnPaths("suite signed-seen backstop read failed"); !slices.Equal(got, want) {
+		t.Fatalf("suite signed-seen backstop read failed for %q, want %q", got, want)
 	}
 }
 
