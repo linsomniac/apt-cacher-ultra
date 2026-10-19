@@ -32,7 +32,7 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 	s := req.suite
 	defer func() {
 		if r := recover(); r != nil {
-			c.reportPanic("adoption_panicked", "record", s, r)
+			unloggedPanic(func() { c.reportPanic("adoption_panicked", "record", s, r) })
 		}
 	}()
 	if c.lifetimeCtx.Err() != nil {
@@ -74,8 +74,17 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 		// form's GET (design review I-1, retryGate.validators).
 		f.ETag, f.LastMod = nil, nil
 	}
+	if c.recordHook != nil {
+		c.recordHook()
+	}
 	if err := c.cache.RecordAdoptionFailure(ctx, s.CanonicalScheme, s.CanonicalHost, s.SuitePath, f); err != nil {
-		c.logger.Warn("adoption_failure_record_failed",
+		// A shutdown that raced the failure ended the write: nothing is
+		// recorded at shutdown (spec C7), so that is no fault (B-20).
+		level := slog.LevelWarn
+		if c.lifetimeCtx.Err() != nil {
+			level = slog.LevelDebug
+		}
+		c.logger.Log(ctx, level, "adoption_failure_record_failed",
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath, "err", err)
 		return
 	}
@@ -163,16 +172,20 @@ func (c *Checker) recoverAdoption(req *adoptionRequest, start time.Time) {
 	if r == nil {
 		return
 	}
-	c.reportPanic("adoption_panicked", "adoption", req.suite, r)
-	d := time.Since(start)
-	host := req.suite.CanonicalHost
-	adoptionTotal.Inc("panicked", host)
-	adoptionDurationSeconds.Observe(d.Seconds(), "panicked", host)
-	if c.adoptionRing != nil {
-		c.adoptionRing.Record(observability.AdoptionEvent{
-			Host: host, SuitePath: req.suite.SuitePath, Outcome: "panicked", Reason: cache.ReasonPanic,
-			CompletedUnixSec: c.now().Unix(), DurationSeconds: d.Seconds(),
-		})
-	}
+	// The reporting runs under its own boundary (B-18): a panic there must
+	// neither escape nor skip the record below.
+	unloggedPanic(func() {
+		c.reportPanic("adoption_panicked", "adoption", req.suite, r)
+		d := time.Since(start)
+		host := req.suite.CanonicalHost
+		adoptionTotal.Inc("panicked", host)
+		adoptionDurationSeconds.Observe(d.Seconds(), "panicked", host)
+		if c.adoptionRing != nil {
+			c.adoptionRing.Record(observability.AdoptionEvent{
+				Host: host, SuitePath: req.suite.SuitePath, Outcome: "panicked", Reason: cache.ReasonPanic,
+				CompletedUnixSec: c.now().Unix(), DurationSeconds: d.Seconds(),
+			})
+		}
+	})
 	c.recordAdoptionFailure(req, cache.ReasonPanic)
 }

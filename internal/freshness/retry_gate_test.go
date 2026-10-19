@@ -100,8 +100,15 @@ func TestGate_NewContentIsAttemptedAtOnce(t *testing.T) {
 }
 
 // At next_retry_at the check sends no validators and retries.
+//
+// Deferred minor B-24: on an adopted suite, whose anchor has validators, so
+// "none" is told apart from the current anchor's.
 func TestGate_DueRetryHasNoValidators(t *testing.T) {
 	r := newRetryRig(t, 0)
+	r.adopt()
+	if strOf(r.row().InReleaseETag) == "" {
+		t.Fatal("setup: the adopted suite has no validators")
+	}
 	failOnce(t, r)
 	r.clock.advance(2 * time.Minute)
 	r.check()

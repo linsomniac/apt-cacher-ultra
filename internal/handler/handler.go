@@ -2090,7 +2090,9 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 			h.logger.Warn("suite file head read failed",
 				"err", herr, "canonical_host", req.CanonicalHost, "suite_path", req.SuitePath, "path", req.Path)
 			if file.Marks() {
-				return sfResult{err: fmt.Errorf("handler: read suite file head: %w", herr), status: fres.Status}
+				// A local disk fault, labelled like every other one
+				// (cache_write_failed; deferred minor D-38).
+				return sfResult{err: fmt.Errorf("handler: read suite file head: %w: %w", fetch.ErrCacheWriteFailed, herr), status: fres.Status}
 			}
 		}
 		if herr == nil && file.Sniff(req.Path, head) {

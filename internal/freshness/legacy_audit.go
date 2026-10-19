@@ -49,7 +49,9 @@ type legacyVerdict struct {
 // caller refuses to start, nothing in the failed batch was applied, and the
 // audit resumes on the next start. A single unreadable anchor, or a panic
 // while auditing one snapshot, is not an error: that snapshot is deferred
-// (left queued, unchanged, ERROR logged).
+// (left queued, unchanged, ERROR logged). Every error it returns starts
+// "legacy trust audit:" — main's refusal line relies on it (deferred minors
+// A-48, C-29) — so a new error path must keep the prefix.
 //
 // AIDEV-NOTE: plan review 2026-10-05 findings 1–3 and its follow-ups.
 // Quarantine is the remedy for anything that cannot be proved signed AND
@@ -110,7 +112,11 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 				res.Audited++
 				switch d.Outcome {
 				case cache.LegacyAuditKeep:
-					res.Signed++
+					// An unsigned snapshot is kept but proves nothing
+					// signed (deferred minor A-47).
+					if decided[i].Form != cache.FormUnsigned {
+						res.Signed++
+					}
 				case cache.LegacyAuditQuarantine, cache.LegacyAuditQuarantineSigned:
 					res.Quarantined++
 					legacyQuarantinedTotal.Inc()
@@ -130,7 +136,7 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 		logger.Info("legacy_trust_audit_progress",
 			"audited", res.Audited, "quarantined", res.Quarantined, "deferred", res.Deferred)
 		if err := legacyAuditAfterBatch(batch); err != nil {
-			return res, err
+			return res, fmt.Errorf("legacy trust audit: %w", err)
 		}
 	}
 	n, err := markFromCachedSignedAnchors(ctx, c, logger)

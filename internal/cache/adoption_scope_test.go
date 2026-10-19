@@ -48,11 +48,20 @@ func TestAdoptionStamp_IsScopedToTheSuitesSchemeAndHost(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Deferred minor D-21: the https twin of the same host and suite,
+	// adopted later, does not count either.
+	twin := commitFor(t, c, "https", "a", suite, "the https twin's anchor", "", "")
+	if _, err := c.db.Exec(`UPDATE suite_snapshot SET adopted_at = 1800009999 WHERE snapshot_id = ?`, twin); err != nil {
+		t.Fatal(err)
+	}
 	id := commitFor(t, c, "http", "a", suite, "a's anchor", "", "")
 	snap, err := c.GetSuiteSnapshot(ctx, id)
-	if err != nil || snap.AdoptedAt == nil || *snap.AdoptedAt != 1_800_000_000 {
-		t.Fatalf("first adoption on host a stamped %d (%v), want now (1800000000): other hosts and schemes do not count",
-			derefI64(snap.AdoptedAt), err)
+	if err != nil { // deferred minor D-22: report the error, never dereference a nil snapshot
+		t.Fatal(err)
+	}
+	if snap.AdoptedAt == nil || *snap.AdoptedAt != 1_800_000_000 {
+		t.Fatalf("first adoption on host a stamped %d, want now (1800000000): other hosts and schemes do not count",
+			derefI64(snap.AdoptedAt))
 	}
 }
 
@@ -91,12 +100,13 @@ func TestDisplacedSnapshotMembers_OrdersByAdoptionAndScopesToTheSuite(t *testing
 	}
 	current := commitFor(t, c, "http", "a", suite, "current anchor", "", "")
 	commitFor(t, c, "http", "b", suite, "b's anchor", alias, "b's member")
+	commitFor(t, c, "https", "a", suite, "the https twin's anchor", alias, "the twin's member") // D-21
 	rows, err := c.DisplacedSnapshotMembers(ctx, "http", "a", suite, alias, current, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(rows) != 2 || rows[0].SnapshotID != older || rows[1].SnapshotID != newer {
-		t.Fatalf("displaced members = %+v, want snapshot %d (adopted last) then %d, and none of host b", rows, older, newer)
+		t.Fatalf("displaced members = %+v, want snapshot %d (adopted last) then %d, and none of host b or of https", rows, older, newer)
 	}
 	// The limit keeps the newest by adoption too.
 	rows, err = c.DisplacedSnapshotMembers(ctx, "http", "a", suite, alias, current, 1)

@@ -1,6 +1,8 @@
 package freshness
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 	"time"
 )
@@ -21,6 +23,11 @@ func TestContentKey(t *testing.T) {
 	}
 	if k1 == hashOf(rel) || len(k1) != 64 {
 		t.Fatalf("detached key %q must be a distinct sha256 hex", k1)
+	}
+	// The exact formula: keys persist across restarts (deferred minor B-16).
+	r, g := sha256.Sum256(rel), sha256.Sum256(sig1)
+	if want := sha256.Sum256(append(r[:], g[:]...)); k1 != hex.EncodeToString(want[:]) {
+		t.Fatalf("detached key = %s, want sha256(sha256(Release) || sha256(Release.gpg))", k1)
 	}
 }
 

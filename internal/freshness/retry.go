@@ -63,7 +63,13 @@ func backoffDelay(count int64) time.Duration {
 	return min(retryBaseDelay<<(count-1), retryMaxDelay)
 }
 
-// jitterDelay spreads d by ±25 %: u is uniform in [0, 1); u = 0.5 is d.
+// jitterDelay spreads d by ±25 %: u is uniform in [0, 1); u = 0.5 is d. A
+// u outside [0, 1] (or NaN) is clamped, so the delay stays within ±25 %
+// whatever the random seam returns (deferred minor B-17).
 func jitterDelay(d time.Duration, u float64) time.Duration {
+	if !(u >= 0) { // also NaN
+		u = 0
+	}
+	u = min(u, 1)
 	return d + time.Duration((u*2-1)*retryJitterFrac*float64(d))
 }

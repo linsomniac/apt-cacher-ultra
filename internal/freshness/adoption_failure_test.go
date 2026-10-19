@@ -129,9 +129,14 @@ func TestAdoptionFailure_PanicIsRecorded(t *testing.T) {
 	if row := r.row(); row.AdoptionFailCount != 1 || strOf(row.AdoptionFailReason) != cache.ReasonPanic {
 		t.Fatalf("record = %d %q, want 1 %q", row.AdoptionFailCount, strOf(row.AdoptionFailReason), cache.ReasonPanic)
 	}
-	evs := r.ring.Snapshot()
-	if len(evs) == 0 || evs[len(evs)-1].Outcome != "panicked" || evs[len(evs)-1].Reason != cache.ReasonPanic {
-		t.Fatalf("ring = %+v, want a panicked event", evs)
+	panicked := 0
+	for _, ev := range r.ring.Snapshot() { // deferred minor B-21: by outcome, not position
+		if ev.Outcome == "panicked" && ev.Reason == cache.ReasonPanic {
+			panicked++
+		}
+	}
+	if panicked != 1 {
+		t.Fatalf("ring = %+v, want one panicked event", r.ring.Snapshot())
 	}
 	v, _ := r.checker.locks.Load(suiteKey("http", rigHost, rigSuite))
 	mu := v.(*sync.Mutex)
@@ -139,6 +144,58 @@ func TestAdoptionFailure_PanicIsRecorded(t *testing.T) {
 		t.Fatal("suite mutex still held after a panic")
 	}
 	mu.Unlock()
+}
+
+// Deferred minor B-19: a reason change mid-streak keeps the streak and
+// logs adoption_deferred again (a state transition), with the retry
+// attributes; the failing content's Last-Modified is recorded; a detached
+// failure is keyed sha256(sha256(Release) || sha256(Release.gpg)).
+func TestAdoptionFailure_ReasonChangeValidatorsAndDetachedKey(t *testing.T) {
+	r := newRetryRig(t, 0)
+	// An adopted suite: a never-adopted one would not attempt the new
+	// content before its record's retry (ruling PE-3).
+	r.up.set(r.release("v1", 0))
+	r.check()
+	if r.row().CurrentSnapshotID == nil {
+		t.Fatal("setup: v1 not adopted")
+	}
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	r.check() // gpg_failed
+	future := r.release("from the future", r.clock.now().Add(time.Hour).Unix())
+	r.up.set(future)
+	r.clock.advance(time.Minute)
+	r.check() // new content, attempted at once: release_date_in_future
+	row := r.row()
+	if row.AdoptionFailCount != 2 || strOf(row.AdoptionFailReason) == "gpg_failed" {
+		t.Fatalf("record %d %q, want the streak at 2 with the new reason", row.AdoptionFailCount, strOf(row.AdoptionFailReason))
+	}
+	deferred := r.events("adoption_deferred")
+	if len(deferred) != 2 || deferred[1]["reason"] != strOf(row.AdoptionFailReason) || deferred[1]["fail_count"] != float64(2) {
+		t.Fatalf("adoption_deferred lines %v, want two, the second for the new reason at count 2", deferred)
+	}
+	if deferred[1]["retry_in_seconds"] != float64(4*60) || deferred[1]["next_retry_unixtime"] != float64(i64Of(row.AdoptionNextRetryAt)) {
+		t.Fatalf("retry attributes %v, want retry_in_seconds 240 and next_retry_unixtime %d", deferred[1], i64Of(row.AdoptionNextRetryAt))
+	}
+	// The failing content's Last-Modified is kept with its record.
+	r.checker.recordAdoptionFailure(&adoptionRequest{suite: SuiteRef{CanonicalScheme: "http", CanonicalHost: rigHost,
+		SuitePath: rigSuite}, key: testHex64, lastmod: "Mon, 01 Jan 2024 00:00:00 GMT"}, "gpg_failed")
+	if got := strOf(r.row().AdoptionFailLastMod); got != "Mon, 01 Jan 2024 00:00:00 GMT" {
+		t.Fatalf("AdoptionFailLastMod = %q", got)
+	}
+
+	d := newRetryRig(t, 0)
+	seedDetachedAnchors(t, d.cache)
+	rel, sig := d.releaseText("det", 0), armoredSig("det sig")
+	key := contentKey(adoptionFormDetached, nil, rel, sig)
+	d.ver.reject(key)
+	d.up.setAt(rigReleaseURL, rel)
+	d.up.setAt(rigReleaseGPGURL, sig)
+	d.check()
+	if got := strOf(d.row().AdoptionFailHash); got != key {
+		t.Fatalf("detached record keyed %s, want %s", got, key)
+	}
 }
 
 // Refusals use the record and schedule but are not failures: logged as

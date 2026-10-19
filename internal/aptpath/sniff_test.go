@@ -108,6 +108,7 @@ func TestSniffRelease(t *testing.T) {
 	inside := strings.Repeat("y", ReleaseSniffBytes-len("SHA256:\n")-1) + "\nSHA256:\n"
 	outside := strings.Repeat("y", ReleaseSniffBytes) + "\nSHA256:\n"
 	atEdge := strings.Repeat("y", ReleaseSniffBytes-len("SHA256:")-1) + "\nSHA256:\n tail"
+	pastEdge := strings.Repeat("y", ReleaseSniffBytes-len("SHA256:")) + "\nSHA256:\n" // deferred minor D-2
 	cases := []struct {
 		name, head string
 		want       bool
@@ -120,6 +121,7 @@ func TestSniffRelease(t *testing.T) {
 		{"last line, no newline", "Origin: x\nSHA256:", true},
 		{"header ends at 64 KiB", inside, true},
 		{"colon at byte 65536", atEdge, true},
+		{"colon at byte 65537", pastEdge, false},
 		{"header after 64 KiB", outside, false},
 		{"HTML soft-404", "<html><body>Not Found</body></html>\n", false},
 		{"value on the header line", "SHA256: 0123 12 Packages\n", false},
@@ -192,7 +194,8 @@ func TestClassifySuiteFile(t *testing.T) {
 		{"/repo/flat", "/repo/flat/Packages.diff/Index", NotSuiteFile},
 		{"/repo/flat", "/repo/flat/Packages_1.0_all.deb", NotSuiteFile},
 		{"/repo/distsy", "/repo/distsy/Packages.gz", FileFlatIndex},
-		{"", "/x/InRelease", NotSuiteFile},
+		{"", "/InRelease", NotSuiteFile},   // deferred minor D-1: only the guard refuses it
+		{"", "/Packages.gz", NotSuiteFile}, // nor a host-root flat index
 	}
 	for _, c := range cases {
 		if got := ClassifySuiteFile(c.suite, c.path); got != c.want {
@@ -280,6 +283,7 @@ func TestDecodableClearsign(t *testing.T) {
 		{m + "\nHash: SHA256\n", m + "\nHash: SHA256\n"},
 		{m + "\r\nHash: SHA256\r\n", m + "\r\nHash: SHA256\r\n"},
 		{m + " \t\nHash: SHA256\n", m + "\nHash: SHA256\n"},
+		{m + " \nHash: SHA256\n", m + "\nHash: SHA256\n"}, // one trailing blank: as long as "\r" (deferred minor D-5)
 		{m + " \r\nHash: SHA256\r\n", m + "\nHash: SHA256\r\n"},
 		{m, m},
 		{m + "  ", m},

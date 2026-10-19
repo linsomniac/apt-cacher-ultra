@@ -243,6 +243,10 @@ type Checker struct {
 	// the window whose order (drop, then unlock) keeps two holders apart.
 	unlockDroppedHook func(key string)
 
+	// recordHook, when set (tests only), runs in recordAdoptionFailure
+	// right before the record is written.
+	recordHook func()
+
 	lastClockStepLog atomic.Int64 // monotonic ns since processStart of the last clock_step_detected line
 }
 
@@ -376,6 +380,7 @@ type checkOutcome struct {
 	repair        *repairRequest
 	needRepair    bool
 	needReconcile bool
+	declared      []ReleaseMember // what reconcilePending parsed, for the heal (B-28)
 	lease         *lease
 	// report is what the scheduler learns from this check.
 	report checkReport
@@ -668,7 +673,7 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 		return
 	}
 	out.needRepair = c.adopter.repairPending(ctx, rp.suite, rp.snapshotID)
-	needReconcile, err := c.adopter.reconcilePending(ctx, rp.snapshotID)
+	declared, needReconcile, err := c.adopter.reconcilePending(ctx, rp.snapshotID)
 	if err != nil {
 		// A fail-closed anchor (R-1 decode error) must be visible, not a
 		// silent non-heal.
@@ -676,7 +681,7 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 			"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
 			"snapshot_id", rp.snapshotID, "stage", "decision", "err", err)
 	}
-	out.needReconcile = needReconcile
+	out.needReconcile, out.declared = needReconcile, declared
 	if !out.needRepair && !out.needReconcile {
 		out.repair = nil
 		return
@@ -723,7 +728,7 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 // per cooldown at most (deferred minor B-37, phase B deviation 7; kept in
 // phase E: v7 has no record keyed on a snapshot).
 func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
-	rp, l, needRepair, needReconcile := out.repair, out.lease, out.needRepair, out.needReconcile
+	rp, l, needRepair, needReconcile, declared := out.repair, out.lease, out.needRepair, out.needReconcile, out.declared
 	c.adoptionWg.Add(1)
 	go func() {
 		defer c.adoptionWg.Done()
@@ -739,7 +744,7 @@ func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
 			// ReconcileSnapshot leaves logging to its caller; log like the
 			// on-demand path (Reconcile) so a fail-closed anchor (R-1
 			// decode error) is visible, not a silent non-heal.
-			if _, err := c.adopter.ReconcileSnapshot(rctx, rp.suite, rp.snapshotID, false); err != nil {
+			if _, err := c.adopter.reconcileSnapshot(rctx, rp.suite, rp.snapshotID, declared, false); err != nil {
 				c.logger.Warn("adoption_reconcile_failed",
 					"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
 					"snapshot_id", rp.snapshotID, "stage", "heal", "err", err)
@@ -791,10 +796,19 @@ var ErrAdoptionPanicked = errors.New("adoption_panicked")
 // "reconcile", "check", "scheduler") whose stack was already logged.
 var panicStackLogged sync.Map
 
-// reportPanic logs a recovered panic. The stack is attached to the first
-// occurrence per goroutine kind per process only (spec C5 "log the stack
-// once"): a deterministic panic on every attempt must not flood the log.
+// reportPanic logs a recovered panic (logPanic, with the checker's logger).
 func (c *Checker) reportPanic(event, where string, suite SuiteRef, r any) {
+	logPanic(c.logger, event, where, suite, r)
+}
+
+// logPanic logs a recovered panic as event at ERROR, with where, the suite
+// and the panic value. The stack is attached to the first occurrence per
+// goroutine kind (where) per process only (spec C5 "log the stack once"): a
+// deterministic panic on every attempt must not flood the log. One helper
+// for every recover in the package — the checker's goroutines and the
+// adopter's heartbeat (deferred minor A-37; the handler's counterpart is
+// logGoroutinePanic).
+func logPanic(logger *slog.Logger, event, where string, suite SuiteRef, r any) {
 	attrs := []any{
 		"where", where,
 		"canonical_host", suite.CanonicalHost,
@@ -804,7 +818,19 @@ func (c *Checker) reportPanic(event, where string, suite SuiteRef, r any) {
 	if _, seen := panicStackLogged.LoadOrStore(where, struct{}{}); !seen {
 		attrs = append(attrs, "stack", string(debug.Stack()))
 	}
-	c.logger.Error(event, attrs...)
+	logger.Error(event, attrs...)
+}
+
+// unloggedPanic runs report under its own recover: a report that panics
+// itself (a broken log handler) is counted, never escapes (deferred minor
+// B-18).
+func unloggedPanic(report func()) {
+	defer func() {
+		if recover() != nil {
+			freshnessUnloggedPanics.Inc()
+		}
+	}()
+	report()
 }
 
 // recoverGoroutine is deferred by the repair and on-demand reconcile

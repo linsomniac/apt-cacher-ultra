@@ -34,6 +34,14 @@ import (
 //     is stored in reconciledSnapshots so the per-tick caller skips it cheaply.
 //     force=true (on-demand path) bypasses the memo; force=false (tick path) does not.
 func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapshotID int64, force bool) (int, error) {
+	return a.reconcileSnapshot(ctx, suite, snapshotID, nil, force)
+}
+
+// reconcileSnapshot is ReconcileSnapshot; a non-nil declared is the
+// snapshot's declared set its caller already parsed from the same pinned
+// anchor (reconcilePending on the tick), so the Release is parsed once per
+// heal (deferred minor B-28).
+func (a *Adopter) reconcileSnapshot(ctx context.Context, suite SuiteRef, snapshotID int64, declared []ReleaseMember, force bool) (int, error) {
 	if !force {
 		if _, done := a.reconciledSnapshots.Load(snapshotID); done {
 			return 0, nil
@@ -45,9 +53,11 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	// verified; re-reading it from the pinned pool means the declared set
 	// cannot be tampered with without changing the blob hash (which would
 	// invalidate the snapshot_member.declared_sha256 = blob.hash invariant).
-	declared, err := a.reparseSnapshotRelease(ctx, snapshotID)
-	if err != nil {
-		return 0, err // logged by caller; do not memoize
+	if declared == nil {
+		var err error
+		if declared, err = a.reparseSnapshotRelease(ctx, snapshotID); err != nil {
+			return 0, err // logged by caller; do not memoize
+		}
 	}
 	present, err := a.cache.ListSnapshotMembers(ctx, snapshotID)
 	if err != nil {
@@ -116,30 +126,31 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 }
 
 // reconcilePending reports whether ReconcileSnapshot(force=false) would
-// fetch anything. A memoised snapshot costs nothing; otherwise the
+// fetch anything and, when it would, the declared set it parsed (the heal
+// reuses it: B-28). A memoised snapshot costs nothing; otherwise the
 // trust-anchored Release is re-parsed once, and a complete snapshot is
 // memoised so later checks skip it. The Checker asks before it takes an
 // admission slot, inside the check's recover.
-func (a *Adopter) reconcilePending(ctx context.Context, snapshotID int64) (bool, error) {
+func (a *Adopter) reconcilePending(ctx context.Context, snapshotID int64) ([]ReleaseMember, bool, error) {
 	if a.reconcilePendingHook != nil {
 		a.reconcilePendingHook()
 	}
 	if _, done := a.reconciledSnapshots.Load(snapshotID); done {
-		return false, nil
+		return nil, false, nil
 	}
 	declared, err := a.reparseSnapshotRelease(ctx, snapshotID)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	present, err := a.cache.ListSnapshotMembers(ctx, snapshotID)
 	if err != nil {
-		return false, fmt.Errorf("reconcile: list members: %w", err)
+		return nil, false, fmt.Errorf("reconcile: list members: %w", err)
 	}
 	if len(missingRequestableMembers(declared, present, a.architectureAllowlist)) == 0 {
 		a.reconciledSnapshots.Store(snapshotID, struct{}{})
-		return false, nil
+		return nil, false, nil
 	}
-	return true, nil
+	return declared, true, nil
 }
 
 // reparseSnapshotRelease loads the snapshot's signed metadata member
@@ -157,6 +168,9 @@ func (a *Adopter) reconcilePending(ctx context.Context, snapshotID int64) (bool,
 // Callers MUST treat the returned []ReleaseMember as the authoritative
 // declared set — do not accept member declarations from any other source.
 func (a *Adopter) reparseSnapshotRelease(ctx context.Context, snapshotID int64) ([]ReleaseMember, error) {
+	if a.reparseHook != nil {
+		a.reparseHook()
+	}
 	for _, name := range []string{"InRelease", "Release"} {
 		mem, err := a.cache.GetSnapshotMember(ctx, snapshotID, name)
 		if errors.Is(err, cache.ErrNotFound) {
