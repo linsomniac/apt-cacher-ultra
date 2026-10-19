@@ -343,7 +343,12 @@ func assertHitPathInvariant(t *testing.T, c *cache.Cache, db *sql.DB, when strin
 // the checker reconstructs, and a restart, every sniff-passing anchor row
 // of a tracked suite has a marker for its base. Since a creation marks in
 // its own transaction (ruling PD-5), the invariant holds at every
-// committed state; the test checks it after every step.
+// committed state but one, which spec C3 accepts: an unproven creation (a
+// cached anchor that changed, appeared or could not be read during the
+// creation) is tracked with that anchor unmarked from its commit until its
+// backstop runs — right after, before the response — and, if the backstop
+// fails, until the startup pass at the next start. The test checks the
+// invariant after every step (none of them is unproven).
 func TestHitPathInvariant_EveryTrackedSignedAnchorHasAMarker(t *testing.T) {
 	r := newSuiteRig(t, true, 10) // per-host cap 1
 	ctx := context.Background()

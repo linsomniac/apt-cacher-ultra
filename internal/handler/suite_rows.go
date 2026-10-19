@@ -327,11 +327,22 @@ const backstopTimeout = 5 * time.Second
 // (cache.CreateResult.Unproven): a cached anchor row that changed or
 // appeared between cachedAnchors' read and the creating transaction — or
 // that cachedAnchors could not read — was never sniffed, so it is read,
-// sniffed and marked after the commit (SeenAt is its last use). Every
-// failure — a url_path read other than "no row", a pool file read, the
-// mark — is logged WARN; the startup marker pass heals it at the next
-// start.
+// sniffed and marked after the commit (SeenAt is its last use, or now for
+// a row with neither stamp). Every failure — a url_path read other than
+// "no row", a pool file read, the mark — is logged WARN; the startup
+// marker pass heals it at the next start. Its callers run it right after
+// the late registration, before any early return (miss path) or the
+// response (onboarding).
+//
+// AIDEV-NOTE: this is the one marker write outside a creating or storing
+// transaction, and its window is the hit-path invariant's one residual
+// (spec C3): an unproven creation's suite is tracked with the anchor
+// unmarked from the commit until this runs, and until the next start if
+// it fails. backstopHook (tests) runs first, under the bounded context.
 func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKey, except string) {
+	if h.backstopHook != nil {
+		h.backstopHook(ctx)
+	}
 	var marks []cache.SignedSeenMark
 	for _, name := range []string{"/InRelease", "/Release.gpg"} {
 		p := key.SuitePath + name
@@ -359,10 +370,16 @@ func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKe
 		if !file.Sniff(p, head) {
 			continue
 		}
-		if seen := lastUse(row); seen > 0 {
-			marks = append(marks, cache.SignedSeenMark{CanonicalScheme: key.CanonicalScheme,
-				CanonicalHost: key.CanonicalHost, Base: aptpath.MarkerBase(key.SuitePath), SeenAt: seen})
+		seen := lastUse(row)
+		if seen <= 0 {
+			// A row with neither stamp is marked now, as the creating
+			// transaction's marks fall back to the creation's stamp
+			// (cache markCreated): never left unmarked (final review,
+			// concurrency M6).
+			seen = wallclock.Unix()
 		}
+		marks = append(marks, cache.SignedSeenMark{CanonicalScheme: key.CanonicalScheme,
+			CanonicalHost: key.CanonicalHost, Base: aptpath.MarkerBase(key.SuitePath), SeenAt: seen})
 	}
 	if len(marks) == 0 {
 		return

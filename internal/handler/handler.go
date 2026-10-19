@@ -180,6 +180,12 @@ type Handler struct {
 	// a creation unproven.
 	cachedAnchorsHook func()
 
+	// backstopHook, when set (tests only), runs at the top of
+	// markCachedSignedAnchors with the backstop's bounded context: a hook
+	// that waits on it stands in for a pool or writer that never answers
+	// (TestServeHTTP_BackstopIsBoundedBeforeTheBody).
+	backstopHook func(ctx context.Context)
+
 	// existsReads counts anchorStart's registration reads (tests: deferred
 	// minor C-23, no read while the barrier is off); suiteExistsForTest,
 	// when set (tests only), answers them instead of the cache.
@@ -1384,7 +1390,27 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	// 9) — and its line keeps the miss's outcome, fetch and upstream status;
 	// a client that left while it waited is a client abort (design review
 	// M1).
-	if t := h.registerLate(r, req, sr); t != nil {
+	t := h.registerLate(r, req, sr)
+	if res.unproven && !shared {
+		// The creation's transaction could not prove a cached anchor that
+		// changed after it was sniffed, or that cachedAnchors could not
+		// read: mark it now (the backstop), right after the registration
+		// and before either early return below, so no path skips it (final
+		// review, concurrency M5).
+		//
+		// AIDEV-NOTE: the body waits on the backstop, so backstopTimeout
+		// (5 s) bounds it well under apt's 30 s inactivity timeout (Task 9
+		// review, controller addition d; TestServeHTTP_BackstopIsBoundedBeforeTheBody).
+		// On a timeout or any other failure markCachedSignedAnchors logs
+		// WARN and the body is served anyway: the body in hand was marked in
+		// the creating transaction when it earns a marker, and the startup
+		// marker pass marks the other cached anchors at the next start —
+		// the one residual (spec C3).
+		bctx, cancel := context.WithTimeout(h.lifecycleCtx, backstopTimeout)
+		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
+		cancel()
+	}
+	if t != nil {
 		if r = heldContext(r, t); clientLeft(w, r) {
 			h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, true, res.status, start)
 			return
@@ -1398,22 +1424,6 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 				return
 			}
 		}
-	}
-	if res.unproven && !shared {
-		// The creation's transaction could not prove a cached anchor that
-		// changed after it was sniffed, or that cachedAnchors could not
-		// read: mark it now (the backstop).
-		//
-		// AIDEV-NOTE: the body waits on the backstop, so backstopTimeout
-		// (5 s) bounds it well under apt's 30 s inactivity timeout (Task 9
-		// review, controller addition d). On a timeout or any other failure
-		// markCachedSignedAnchors logs WARN and the body is served anyway:
-		// the body in hand was marked in the creating transaction when it
-		// earns a marker, and the startup marker pass marks the other cached
-		// anchors at the next start.
-		bctx, cancel := context.WithTimeout(h.lifecycleCtx, backstopTimeout)
-		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
-		cancel()
 	}
 
 	hash := res.blobHash

@@ -825,6 +825,188 @@ func TestServeHTTP_LateRegistrationClientThatLeftIsAClientAbort(t *testing.T) {
 	})
 }
 
+// cacheRow stores body as the url_path row of path on the flip stack's
+// host (no suite row, no marker), requested and fetched at at.
+func (s *flipStack) cacheRow(path string, body []byte, at int64) {
+	s.t.Helper()
+	hash := writeBlob(s.t, s.h, body)
+	if err := s.c.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: "http", CanonicalHost: flipSimHost,
+		Path: path, BlobHash: &hash, UpstreamURL: "http://" + flipSimHost + path, IsMetadata: true,
+		LastRequestedAt: &at, RequestCount: 1, LastFetchedAt: &at}); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+// signsAfterTheSniff makes the next creation on suite unproven: the
+// suite's cached Release.gpg is no signature when the creation sniffs it
+// and becomes one, stamped at, right after (cachedAnchorsHook), so only
+// the backstop can mark it.
+func (s *flipStack) signsAfterTheSniff(suite string, at int64) {
+	s.t.Helper()
+	s.cacheRow(suite+"/Release.gpg", []byte("not a signature\n"), at)
+	s.h.cachedAnchorsHook = func() {
+		s.h.cachedAnchorsHook = nil
+		s.cacheRow(suite+"/Release.gpg", rowGPG, at)
+	}
+}
+
+// marked reports whether suite's base on the flip stack's host has a
+// signed-seen marker.
+func (s *flipStack) marked(suite string) bool {
+	s.t.Helper()
+	_, ok, err := s.c.SignedSeen(context.Background(), "http", flipSimHost, aptpath.MarkerBase(suite))
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	return ok
+}
+
+// FW-4 (final review, concurrency M5; Task 9 minor 1): the miss path runs
+// an unproven creation's backstop right after its late registration,
+// before the client-left and held re-dispatch returns, so neither return
+// leaves the changed cached anchor unmarked. The InRelease miss marks the
+// base itself, at the miss's second; the suite's cached Release.gpg,
+// which became a signature after it was sniffed, carries a later stamp,
+// and a marker keeps the newest — so the marker's stamp shows whether the
+// backstop ran.
+func TestServeHTTP_LateRegistrationReturnsRunTheBackstop(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		linger   time.Duration
+		leaveAt  time.Duration
+		snapshot bool // the flip commits a snapshot, which the re-dispatch serves
+		wantCode int
+	}{
+		{"client left during the wait", 2 * time.Second, time.Second, false, http.StatusServiceUnavailable},
+		{"served from the new snapshot", 0, 0, true, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				logs := &syncLog{}
+				s := newFlipStackLogging(t, 10*time.Second, slog.New(slog.NewJSONHandler(logs, nil)))
+				const suite = "/n/dists/s"
+				ctx := context.Background()
+				s.h.fetch = staticUpstream{"http://" + flipSimHost + suite + "/InRelease": rowInRelease}
+				gpgAt := wallclock.Unix() + 1000
+				s.signsAfterTheSniff(suite, gpgAt)
+				commit := func() error { return nil }
+				snapBody := simtest.ClearsignedFixture("Origin: snapshot\n")
+				if tc.snapshot {
+					hash := writeBlob(t, s.h, snapBody)
+					cand, _, err := s.c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{CanonicalScheme: "http",
+						CanonicalHost: flipSimHost, SuitePath: suite, InReleaseHash: &hash})
+					if err != nil {
+						t.Fatal(err)
+					}
+					commit = func() error {
+						return s.c.CommitAdoption(ctx, cand, []cache.SnapshotMember{{SnapshotID: cand, Path: "InRelease",
+							BlobHash: hash, DeclaredSHA256: hash}}, nil, nil, nil, false)
+					}
+				}
+				flipped := s.holdUntilTracked(suite, tc.linger, commit)
+				rctx, cancel := context.WithCancel(ctx)
+				defer cancel()
+				if tc.leaveAt > 0 {
+					time.AfterFunc(tc.leaveAt, cancel)
+				}
+				rec := httptest.NewRecorder()
+				s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+suite+"/InRelease", nil).WithContext(rctx))
+				<-flipped
+				if rec.Code != tc.wantCode || (tc.snapshot && !bytes.Equal(rec.Body.Bytes(), snapBody)) {
+					t.Errorf("%s: status %d body %q, want %d (and the snapshot's InRelease)", tc.name, rec.Code, rec.Body.String(), tc.wantCode)
+				}
+				// Premise: the late registration waited in the hold (the path
+				// with the early returns).
+				if lines := logRecords(logs, "request", slog.LevelInfo); len(lines) != 1 || lines[0]["flip_held_ms"] == nil {
+					t.Errorf("%s: request lines %v, want one with flip_held_ms", tc.name, lines)
+				}
+				if at, ok, err := s.c.SignedSeen(ctx, "http", flipSimHost, suite); err != nil || !ok || at != gpgAt {
+					t.Errorf("%s: marker = %d %v %v, want the changed Release.gpg's %d: the backstop must run before this return",
+						tc.name, at, ok, err, gpgAt)
+				}
+			})
+		})
+	}
+}
+
+// FW-4 (final review, tests' challenge to the Task 9 ruling d fallback):
+// the backstop that runs before the body is bounded at backstopTimeout,
+// well under apt's 30 s inactivity timeout, on the miss path and after
+// onboarding. backstopHook waits on the backstop's own context: a pool or
+// writer that never answers. The body is served once the bound passes,
+// the backstop's next read fails (WARN) and the anchor stays unmarked
+// for the startup pass.
+func TestServeHTTP_BackstopIsBoundedBeforeTheBody(t *testing.T) {
+	for _, hit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "miss", true: "onboarding"}[hit], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				logs := &syncLog{}
+				s := newFlipStackLogging(t, 0, slog.New(slog.NewJSONHandler(logs, nil)))
+				const suite = "/n/dists/s"
+				s.h.adoptionEnabled = true // a Release creates the row; it marks nothing itself
+				if hit {
+					s.cacheRow(suite+"/Release", rowRelease, wallclock.Unix()) // onboarding: a url_path hit on a legacy anchor
+				} else {
+					s.h.fetch = staticUpstream{"http://" + flipSimHost + suite + "/Release": rowRelease}
+				}
+				s.signsAfterTheSniff(suite, wallclock.Unix())
+				ran := false
+				s.h.backstopHook = func(ctx context.Context) {
+					ran = true
+					select {
+					case <-ctx.Done():
+					case <-time.After(time.Hour): // the bound is gone: the test then fails on the elapsed time
+					}
+				}
+				start := time.Now()
+				rec := httptest.NewRecorder()
+				s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+suite+"/Release", nil))
+				elapsed := time.Since(start)
+				if rec.Code != http.StatusOK || !ran {
+					t.Fatalf("hit=%v: status %d, backstop ran %v; want 200 after a backstop", hit, rec.Code, ran)
+				}
+				if elapsed != backstopTimeout {
+					t.Fatalf("hit=%v: served after %v, want after the backstop's %v bound (apt gives up at 30 s)", hit, elapsed, backstopTimeout)
+				}
+				// Both anchor reads (InRelease, Release.gpg) fail on the ended
+				// context and are logged; the base stays unmarked.
+				if n := len(logRecords(logs, "suite signed-seen backstop read failed", slog.LevelWarn)); n != 2 || s.marked(suite) {
+					t.Fatalf("hit=%v: %d backstop read failures logged, marked %v; want 2 and unmarked", hit, n, s.marked(suite))
+				}
+			})
+		})
+	}
+}
+
+// FW-4 (final review, concurrency M6): the backstop stamps a sniff-passing
+// cached anchor whose url_path row has neither last_requested_at nor
+// last_fetched_at with the current time, as the creating transaction's
+// marks do, instead of leaving it unmarked (fail-open).
+func TestServeHTTP_BackstopStampsAnAnchorWithoutStamps(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	r.serve("/r/dists/g/Release.gpg", upFile{body: []byte("not a signature\n")})
+	r.get("/r/dists/g/Release.gpg")
+	r.h.cachedAnchorsHook = func() { // the cached Release.gpg becomes a signature, its row without stamps
+		r.h.cachedAnchorsHook = nil
+		h := writeBlob(t, r.h, rowGPG)
+		if err := r.c.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+			Path: "/r/dists/g/Release.gpg", BlobHash: &h, UpstreamURL: r.srv.URL + "/r/dists/g/Release.gpg",
+			IsMetadata: true}); err != nil {
+			t.Error(err)
+		}
+	}
+	r.serve("/r/dists/g/Release", upFile{body: rowRelease})
+	before := wallclock.Unix()
+	if rec := r.get("/r/dists/g/Release"); rec.Code != http.StatusOK || r.suite("/r/dists/g") == nil {
+		t.Fatalf("Release miss = %d; want the row created", rec.Code)
+	}
+	after := wallclock.Unix()
+	at, ok, err := r.c.SignedSeen(context.Background(), "http", "127.0.0.1", "/r/dists/g")
+	if err != nil || !ok || at < before || at > after {
+		t.Fatalf("marker = %d %v %v; want the backstop's mark at the current second, in [%d, %d]", at, ok, err, before, after)
+	}
+}
+
 func derefI64(p *int64) int64 {
 	if p == nil {
 		return -1
