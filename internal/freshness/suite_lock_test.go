@@ -394,16 +394,22 @@ func TestUnlockDropped_DropsBeforeItUnlocks(t *testing.T) {
 		t.Fatal("the waiter never loaded the mutex")
 	}
 	var w lockResult
+	// A zero lockResult reads as lockOK; only a received one counts.
+	got := false
 	c.unlockDroppedHook = func(string) { // the deleter, between its two steps
 		close(proceed)
 		select {
 		case w = <-waiter:
+			got = true
 		case <-time.After(5 * time.Second):
 			t.Error("the waiter's TryLock did not return")
 		}
 	}
 	release(true) // the deleter's row is gone: drop, then unlock
 	c.unlockDroppedHook = nil
+	if !got {
+		t.FailNow()
+	}
 	if w.st == lockOK {
 		defer w.mu.Unlock()
 	}

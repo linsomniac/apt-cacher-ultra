@@ -94,6 +94,8 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
 - **D-57** `TestProfilingRoutesOptInAndPrivate` (`internal/admin`): an intermittent `TempDir` cleanup failure (the WAL file still open at cleanup); pre-existing, not reproduced in phase D's runs. (H) (ledger; reviser's note)
 - **D-58** `TestServe_HTTPSUpstream_InvalidCert_Returns502` (`cmd/apt-cacher-ultra/upstream_invalid_cert_test.go`) prints TLS handshake errors in the test output (the `internal/fetch` tests too); pre-existing. Silence them, e.g. by giving the test server a discarding `ErrorLog`. (H) (ledger)
 
+- **D-60** `internal/cache/open_cache_test.go` (`TestOpenCache_LogsNothing`): it asserts on its buffer inside the subtest, before the `Cache.Close` cleanup `openCache` registers, so a line `Close` logs is never caught. Assert after the cleanups (e.g. close explicitly, or check in an outer `t.Cleanup`). Test-only. (Task 12 re-review r1 minor; final re-review)
+
 ## Process
 
 - **D-59** The Task 12 commit (02caf47) lists "C-18–C-20", but only C-19's line wrap landed (its file split is C-19's remaining half). History stays as it is; where phase D's work is summarised (the stamp commit or the overview's phase D row), say "C-19 (wrap only)". (Task 12 minor 7)

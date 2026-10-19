@@ -230,11 +230,11 @@ recently requested suite that has no adopted snapshot and has not been
 requested for 24 hours (at most eight are tried, a suite being checked or
 adopted is skipped, INFO `suite_evicted` names it). A suite refused a row is
 still served — it just does not refresh — and is not retried for 10
-minutes: each refusal that reaches the database is counted in
-`acu_suite_seed_rejected_total{host}` (at most once per suite per 10
-minutes, unless more than 4,096 suites were refused within them), the gauge
-`acu_suites_seed_rejected` shows how many suites are waiting out those 10
-minutes (updated within a minute), and WARN `suite_seed_rejected` (at most
+minutes (one minute in the busy case below): each refusal that reaches the
+database is counted in `acu_suite_seed_rejected_total{host}` (at most once
+per suite per retry window, unless more than 4,096 suites were refused
+within it), the gauge `acu_suites_seed_rejected` shows how many suites are
+waiting out their retry window (updated within a minute), and WARN `suite_seed_rejected` (at most
 one a minute, with how many were suppressed) names the suite. When the
 cache is full and every suite that could make room is busy at that moment
 (being checked or adopted, or evicted for another new suite), the refusal

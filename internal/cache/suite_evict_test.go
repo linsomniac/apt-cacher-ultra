@@ -556,8 +556,6 @@ func TestCreateSuite_EvictionRechecksInTheWriter(t *testing.T) {
 func TestCreateSuite_RetriesOnceWhenTheCandidateIsKept(t *testing.T) {
 	for _, viaMiss := range []bool{false, true} {
 		c := openCache(t)
-		restore := stubNow(t, evictNow)
-		fourRows(t, c)
 		g := newFakeGuard()
 		g.onHold = func(k SuiteKey) {
 			if k == sk("b", "/idle") { // a client asks for b/idle in the window
@@ -567,17 +565,18 @@ func TestCreateSuite_RetriesOnceWhenTheCandidateIsKept(t *testing.T) {
 			}
 		}
 		seed := SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}
-		var res CreateResult
-		var err error
-		if viaMiss {
-			var fr FetchedResult
-			fr, err = c.StoreFetched(context.Background(), FetchedRow{Row: fetchedRow(t, c, seed.SuiteKey, "/InRelease"),
-				Suite: seed.SuiteKey, Create: &seed}, SuiteCaps{Global: 4}, g)
-			res = fr.Create
-		} else {
-			res, err = c.CreateSuite(context.Background(), seed, SuiteCaps{Global: 4}, g)
-		}
-		restore()
+		// The deferred restore runs even when a helper calls t.Fatal, so the
+		// package clock is never left stubbed for later tests.
+		res, err := func() (CreateResult, error) {
+			defer stubNow(t, evictNow)()
+			fourRows(t, c)
+			if viaMiss {
+				fr, err := c.StoreFetched(context.Background(), FetchedRow{Row: fetchedRow(t, c, seed.SuiteKey, "/InRelease"),
+					Suite: seed.SuiteKey, Create: &seed}, SuiteCaps{Global: 4}, g)
+				return fr.Create, err
+			}
+			return c.CreateSuite(context.Background(), seed, SuiteCaps{Global: 4}, g)
+		}()
 		if err != nil || res.Outcome != SuiteCreated || res.Evicted == nil || *res.Evicted != sk("c", "/idle2") {
 			t.Fatalf("miss=%v: result %+v, %v; want created on the second attempt, evicting c/idle2", viaMiss, res, err)
 		}

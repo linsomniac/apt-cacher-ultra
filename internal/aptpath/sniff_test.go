@@ -70,7 +70,7 @@ func TestSniffReleaseGPG(t *testing.T) {
 		{[]byte{0xc3, 0x5e, 0x04}, false}, // just above the new-format tag (A-17)
 		// A body whose first byte is itself a signature version (3-6) is no
 		// signature packet: the tag check, not the version check, refuses
-		// it (Task 1 minor 2; final review, tests Minor 6 \u2014 a false marker
+		// it (Task 1 minor 2; final review, tests Minor 6: a false marker
 		// would block unsigned adoption for good, ruling PD-10).
 		{[]byte{0x03, 0x04}, false},
 		{[]byte{0x04, 0x04}, false},
