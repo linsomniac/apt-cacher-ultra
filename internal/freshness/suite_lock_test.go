@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -314,6 +315,43 @@ func TestHoldSuite_RevalidatesItsLockAfterTryLock(t *testing.T) {
 		t.Fatal("an undisturbed hold was refused")
 	}
 	release(false)
+}
+
+// FW-6 (final review, concurrency M3; tests Minor 10): check peeks the
+// lock map before it reads the row, so a T1 on a suite whose mutex is held
+// answers busy with no database read (as before phase D), and the row gate
+// before LoadOrStore is an existence read (SuiteExists), not a full row
+// read. An untracked suite still costs that one read, and gets no entry.
+func TestCheck_ABusySuiteCostsNoRead(t *testing.T) {
+	fc := newFakeCache()
+	fc.track("http", "h", "/r/dists/x")
+	var reads atomic.Int64
+	fc.getErrFn = func() error { reads.Add(1); return nil }
+	c := lockChecker(t, fc, newTestFetcher(t), nil)
+	ctx := context.Background()
+	release, ok := c.HoldSuite(lockKey)
+	if !ok {
+		t.Fatal("premise: the suite is held")
+	}
+	for range 20 {
+		if rep := c.check(ctx, lockRef, checkOpts{}); rep.result != resultBusy {
+			t.Fatalf("check of a held suite = %q, want %q", rep.result, resultBusy)
+		}
+	}
+	if n := reads.Load(); n != 0 {
+		t.Fatalf("20 busy checks read the suite row %d times, want 0", n)
+	}
+	release(false)
+	none := SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/none"}
+	if rep := c.check(ctx, none, checkOpts{}); rep.result != resultSkipped {
+		t.Fatalf("check of an untracked suite = %q, want %q", rep.result, resultSkipped)
+	}
+	if n, e := reads.Load(), fc.existsCalls.Load(); n != 1 || e != 1 {
+		t.Fatalf("an untracked suite's check: %d reads, %d of them SuiteExists; want one existence read", n, e)
+	}
+	if n := c.LockCount(); n != 1 {
+		t.Fatalf("LockCount = %d, want 1 (the untracked suite gets no entry)", n)
+	}
 }
 
 // I-4 (Task 7 minor 3; final review, concurrency m2): unlockDropped drops

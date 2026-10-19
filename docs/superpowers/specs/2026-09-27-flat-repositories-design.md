@@ -352,9 +352,12 @@ UPDATE-only and rolls back with `ErrSuiteGone` if the row vanished;
 `RecordAdoptionFailure`, `ClearAdoptionFailure` and `TouchSuite` are
 UPDATE-only. `Check` and `Reconcile` require an **existing row** before
 `LoadOrStore` (I-4) and re-validate after `TryLock` that the lock map still
-holds the same mutex and the row still exists. The handler's by-hash
-content-addressed fallback requires a known suite (I-4, handler side). A test
-proves exactly one INSERT site.
+holds the same mutex and the row still exists. `Check` first peeks at the
+lock map without storing: a suite whose mutex is held answers busy with no
+database read, and its row gate is an existence read (`SuiteExists`), so a
+burst of T1s on one suite costs about one read (phase D final review). The
+handler's by-hash content-addressed fallback requires a known suite (I-4,
+handler side). A test proves exactly one INSERT site.
 
 **Client interest.** `suite_freshness.last_requested_at` (distinct from
 `url_path.last_requested_at`; an `AIDEV-NOTE` says so) is set by the

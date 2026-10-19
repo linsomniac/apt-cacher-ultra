@@ -40,6 +40,9 @@ type fakeCache struct {
 	listHook  func() // called at the top of ListSuites, before the mutex
 
 	putCount atomic.Int64
+	// existsCalls counts SuiteExists reads (the I-4 row gate); they fail
+	// like GetSuiteFreshness through getErr and getErrFn.
+	existsCalls atomic.Int64
 }
 
 func newFakeCache() *fakeCache {
@@ -71,6 +74,25 @@ func (f *fakeCache) GetSuiteFreshness(ctx context.Context, scheme, host, suitePa
 	}
 	cp := s
 	return &cp, nil
+}
+
+// SuiteExists is the I-4 row gate's existence read; it fails like
+// GetSuiteFreshness (getErr, then getErrFn), so read-failure tests reach
+// the gate too.
+func (f *fakeCache) SuiteExists(ctx context.Context, key cache.SuiteKey) (bool, error) {
+	f.existsCalls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return false, f.getErr
+	}
+	if f.getErrFn != nil {
+		if err := f.getErrFn(); err != nil {
+			return false, err
+		}
+	}
+	_, ok := f.suites[keyOf(key.CanonicalScheme, key.CanonicalHost, key.SuitePath)]
+	return ok, nil
 }
 
 // SeedSuiteForTest stores s whole, creating the suite: the fixture

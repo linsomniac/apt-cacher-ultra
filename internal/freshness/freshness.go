@@ -73,6 +73,9 @@ const checkDeadline = 2 * time.Minute
 // up an on-disk cache.
 type Cache interface {
 	GetSuiteFreshness(ctx context.Context, scheme, host, suitePath string) (*cache.SuiteFreshness, error)
+	// SuiteExists is I-4's row gate before a lock-map entry is stored: one
+	// indexed existence read (SELECT 1), cheaper than GetSuiteFreshness.
+	SuiteExists(ctx context.Context, key cache.SuiteKey) (bool, error)
 	// UpdateSuiteFreshness writes a check's result to an existing row
 	// (UPDATE-only, spec C3: a vanished row is left alone).
 	UpdateSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error
@@ -415,8 +418,26 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) checkReport {
 	scheme, host, suitePath := ref.CanonicalScheme, ref.CanonicalHost, ref.SuitePath
 	key := suiteKey(scheme, host, suitePath)
+	// A suite whose mutex is held answers busy with no database read: peek
+	// at the lock map without storing (FW-6, final review concurrency M3).
+	//
+	// AIDEV-NOTE: T1 fires on every metadata hit of a tracked suite, so a
+	// burst of N index fetches is N checks; before this peek each paid a
+	// row read even when busy (N reads, against about one). The peek's
+	// TryLock holds a free mutex for an instant: a concurrent lockSuite on
+	// the same suite may then answer busy, which every caller already
+	// treats as "someone else is on it". The peek never stores, so I-4's
+	// "a row before LoadOrStore" stands; checkLocked's read after TryLock
+	// stays the re-validation.
+	if entry, ok := c.locks.Load(key); ok {
+		mu := entry.(*sync.Mutex)
+		if !mu.TryLock() {
+			return checkReport{result: resultBusy}
+		}
+		mu.Unlock()
+	}
 	// I-4 (spec C3): only a suite with a row is checked, and only it gets
-	// a lock-map entry; a minted path's T1 costs one indexed read.
+	// a lock-map entry; a minted path's T1 costs one indexed existence read.
 	if !c.suiteRowExists(ctx, ref) {
 		return checkReport{result: resultSkipped}
 	}
@@ -467,15 +488,17 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 }
 
 // suiteRowExists reports whether the suite has a suite_freshness row
-// (I-4: the checker works only on tracked suites). A read error counts as
-// "no", logged: the check is skipped and the next trigger tries again.
+// (I-4: the checker works only on tracked suites), with the cache's
+// existence read (SELECT 1; FW-6). A read error counts as "no", logged:
+// the check is skipped and the next trigger tries again.
 func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
-	_, err := c.cache.GetSuiteFreshness(ctx, ref.CanonicalScheme, ref.CanonicalHost, ref.SuitePath)
-	if err != nil && !errors.Is(err, cache.ErrNotFound) {
+	ok, err := c.cache.SuiteExists(ctx, cache.SuiteKey{CanonicalScheme: ref.CanonicalScheme,
+		CanonicalHost: ref.CanonicalHost, SuitePath: ref.SuitePath})
+	if err != nil {
 		c.logger.Warn("freshness: read suite row failed",
 			"err", err, "canonical_host", ref.CanonicalHost, "suite_path", ref.SuitePath)
 	}
-	return err == nil
+	return err == nil && ok
 }
 
 // spawnAdoption hands the suite mutex and the admission lease to the
