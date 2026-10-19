@@ -37,6 +37,9 @@ type sfResult struct {
 	unproven bool
 	// vouchingSuites: the suites whose snapshots vouched a validated .deb.
 	vouchingSuites []string
+	// created: this miss created its suite's row (cache.SuiteCreated): the
+	// leader fires T1 once its response is done (spec C3 T1-on-seed).
+	created bool
 	// snapshotCount: the strict-mode current_snapshot_count of an
 	// errUnvouchedRetryable result, for the refusal's log line.
 	snapshotCount int

@@ -329,11 +329,33 @@ func (h *Handler) cachedAnchors(ctx context.Context, key cache.SuiteKey, except 
 }
 
 // backstopTimeout bounds markCachedSignedAnchors where it runs before the
-// body — after an unproven creation on the miss path and after onboarding —
-// well under apt's 30 s inactivity timeout, like onboardTimeout (Task 9
-// review, controller addition d). On a timeout the backstop's reads or its
-// write fail and are logged WARN, and the body is served.
+// body — after an unproven creation on the miss path and after onboarding
+// (which shares one deadline with its creation, onboardTimeout) — under
+// apt's 30 s inactivity timeout (Task 9 review, controller addition d). It
+// bounds the database steps; the pool reads (readHead, at most HeadBytes
+// of a local file) take no context (deferred minor D-37). On a timeout the
+// backstop's reads or its write fail and are logged WARN, and the body is
+// served.
 const backstopTimeout = 5 * time.Second
+
+// missBodyBudget bounds, from a miss's start, how long it may wait before
+// its body (design review M-15): the fetch, the store and a flip's hold of
+// the just-created suite (at most flipgate.HoldMax) come first, then the
+// backstop of an unproven creation, and apt gives up after 30 s without a
+// byte.
+const missBodyBudget = 25 * time.Second
+
+// missBackstopDeadline is the miss path's backstop deadline:
+// backstopTimeout from now, but never past missBodyBudget from the
+// request's start (an expired deadline fails the backstop at once; it is
+// logged WARN and the body is served).
+func missBackstopDeadline(start time.Time) time.Time {
+	d := time.Now().Add(backstopTimeout)
+	if limit := start.Add(missBodyBudget); limit.Before(d) {
+		return limit
+	}
+	return d
+}
 
 // markCachedSignedAnchors is the backstop for an unproven creation
 // (cache.CreateResult.Unproven): a cached anchor row that changed or
@@ -415,9 +437,12 @@ func (h *Handler) registerLate(r *http.Request, req *proxy.Request, sr *suiteReq
 	return sr.tok
 }
 
-// onboardTimeout bounds onboarding's writer operation (design review M8):
-// the body waits on it, so it stays well under apt's 30 s inactivity
-// timeout; on timeout the hit serves untracked, as on any onboarding error.
+// onboardTimeout bounds onboarding's writer operation and its backstop
+// together (design review M8; deferred minor D-35): the body waits on
+// both, and between them on a flip's hold of the just-created suite (at
+// most flipgate.HoldMax, 20 s, reachable since eager first adoption), so
+// the worst case stays at 25 s, under apt's 30 s inactivity timeout. On a
+// timeout the hit serves untracked, as on any onboarding error.
 const onboardTimeout = 5 * time.Second
 
 // onboard creates, before the body is served, the row of an untracked
@@ -444,14 +469,17 @@ func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blo
 		return nil
 	}
 	key := "onboard|" + sr.key.CanonicalScheme + "|" + sr.key.CanonicalHost + "|" + sr.key.SuitePath
-	res, shared, _ := h.sf.Do(key, func() sfResult { return h.runOnboard(r, req, sr) })
+	// One deadline for the creation and the backstop (D-35), under the
+	// handler's lifecycle so a graceful shutdown cuts both short (D-34).
+	deadline := time.Now().Add(onboardTimeout)
+	res, shared, _ := h.sf.Do(key, func() sfResult { return h.runOnboard(r, req, sr, deadline) })
 	if !res.suiteTracked {
 		return nil
 	}
 	sr.tracked = true
 	t := h.registerLate(r, req, sr)
 	if res.unproven && !shared {
-		bctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), backstopTimeout)
+		bctx, cancel := context.WithDeadline(h.lifecycleCtx, deadline)
 		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
 		cancel()
 	}
@@ -462,13 +490,13 @@ func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blo
 // on the suite: it reports in suiteTracked whether the suite has a row now
 // (created, or found), and in unproven whether the creation needs the
 // backstop.
-func (h *Handler) runOnboard(r *http.Request, req *proxy.Request, sr *suiteReq) sfResult {
+func (h *Handler) runOnboard(r *http.Request, req *proxy.Request, sr *suiteReq, deadline time.Time) sfResult {
 	now := wallclock.Unix()
 	seed := h.suiteSeed(sr, false, "", "", now)
 	if sr.file.Marks() {
 		seed.SignedSeenAt = now
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), onboardTimeout)
+	ctx, cancel := context.WithDeadline(h.lifecycleCtx, deadline)
 	defer cancel()
 	seed.Cached = h.cachedAnchors(ctx, sr.key, req.Path)
 	res, err := h.cache.CreateSuite(ctx, *seed, h.suiteCaps(), h.suiteGuard)

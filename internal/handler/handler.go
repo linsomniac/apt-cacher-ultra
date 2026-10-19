@@ -1454,6 +1454,16 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 		h.respondError(w, r, req, res, start)
 		return
 	}
+	// Spec C3 T1-on-seed (phase D plan, design note 2): a miss that created
+	// its suite's row fires T1 once its response is done, so the new
+	// suite's eager first adoption (spec C4 Dispatch 3) starts at first
+	// contact. Only the creating request fires (a coalesced waiter shares
+	// its result), and only with adoption enabled: without it a created
+	// row is the Phase 1 observation seed (TestServeHTTP_AdoptionDisabledSeedParity).
+	// The hit path fires T1 after onboarding already (ruling PD-11).
+	if res.created && !shared && h.adoptionEnabled {
+		defer h.maybeFireFreshness(req)
+	}
 	outcome, logOutcome := cacheMiss, "miss"
 	if shared {
 		outcome, logOutcome = cacheCoalesced, "hit_coalesced"
@@ -1478,14 +1488,21 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 		// review, concurrency M5).
 		//
 		// AIDEV-NOTE: the body waits on the backstop, so backstopTimeout
-		// (5 s) bounds it well under apt's 30 s inactivity timeout (Task 9
-		// review, controller addition d; TestServeHTTP_BackstopIsBoundedBeforeTheBody).
+		// (5 s) bounds its database steps (Task 9 review, controller
+		// addition d; TestServeHTTP_BackstopIsBoundedBeforeTheBody); its
+		// pool reads (readHead, at most HeadBytes of a local file) take no
+		// context (deferred minor D-37). Before it the body may also wait
+		// in a flip's hold of the just-created suite (at most
+		// flipgate.HoldMax): reachable since eager first adoption — so the
+		// deadline also counts from the request's start (design review
+		// M-15, missBackstopDeadline): at most missBodyBudget (25 s) after
+		// it, under apt's 30 s inactivity timeout.
 		// On a timeout or any other failure markCachedSignedAnchors logs
 		// WARN and the body is served anyway: the body in hand was marked in
 		// the creating transaction when it earns a marker, and the startup
 		// marker pass marks the other cached anchors at the next start —
 		// the one residual (spec C3).
-		bctx, cancel := context.WithTimeout(h.lifecycleCtx, backstopTimeout)
+		bctx, cancel := context.WithDeadline(h.lifecycleCtx, missBackstopDeadline(start))
 		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
 		cancel()
 	}
@@ -2056,8 +2073,8 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	// replaces the old InRelease seed.
 	//
 	// AIDEV-NOTE: the sniff reads the finalized pool file (SniffReleaseGPG
-	// requires a binary signature's version byte: ruling PD-10). Phase E's
-	// T1-on-seed keys on stored.Create.Outcome == cache.SuiteCreated;
+	// requires a binary signature's version byte: ruling PD-10). T1-on-seed
+	// keys on stored.Create.Outcome == cache.SuiteCreated (sfResult.created);
 	// stored.Tracked is what the late flip-barrier registration uses.
 	// A pool file that cannot be read back (a local disk fault) is logged
 	// WARN: for a signed anchor (file.Marks()) the miss fails like a failed
@@ -2105,6 +2122,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 		packageName:    packageName,
 		vouchingSuites: vouchers,
 		suiteTracked:   stored.Tracked,
+		created:        stored.Create.Outcome == cache.SuiteCreated,
 		unproven:       stored.Create.Outcome == cache.SuiteCreated && stored.Create.Unproven,
 	}
 }
