@@ -234,6 +234,14 @@ type Checker struct {
 	// as locks is. In memory only; a restart costs one check that asks.
 	absentAnswered sync.Map
 
+	// lateralHolds holds, per suite key, the memo of its last failed
+	// lateral attempt (ruling PE-11, lateralHold, lateralHeld): written by
+	// recordAdoptionFailure for a lateral request, read by lateralInline,
+	// dropped with the suite's lock-map entry (unlockDropped). Failures of
+	// the detached form never touch it. In memory only; a restart costs at
+	// most one extra lateral attempt per suite.
+	lateralHolds sync.Map
+
 	// lockLoadedHook, when set (tests only), runs in lockSuite — so in
 	// check, Reconcile and HoldSuite — between loading a suite's mutex and
 	// TryLock: the window I-4's re-validation closes.
@@ -360,6 +368,11 @@ type adoptionRequest struct {
 	// the one the check conditional-GETs, so a failure record keeps none
 	// (design review I-1). A successful adoption still stores them.
 	crossForm bool
+
+	// lateral marks lateralInline's request (a detached suite's InRelease):
+	// its failure is also remembered in Checker.lateralHolds, the
+	// lateral's own hold (ruling PE-11).
+	lateral bool
 }
 
 // repairRequest is what checkLocked emits when the suite is CONFIRMED

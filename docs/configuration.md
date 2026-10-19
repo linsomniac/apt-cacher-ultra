@@ -397,11 +397,14 @@ JSON's `suites[].anchor_form` names a suite's form.
 
 Suites move between the signed forms by themselves. A detached suite asks
 for `InRelease` on every check and moves to the inline form as soon as
-upstream serves one — unless an adoption of the suite failed and its retry
-time has not come: then the move waits for that retry time (at most an
-hour), so a publish that fails in both forms (a signing key the cache does
-not trust) is attempted once per form per retry, not at every check. When a suite's current anchor (`InRelease` for
-inline, `Release` for detached and unsigned) is absent, the status page
+upstream serves one. An `InRelease` whose move failed (a signing key the
+cache does not trust) is tried again at its own retry time (2 minutes,
+doubling to an hour, up to 75 minutes with jitter), whatever the detached
+form publishes meanwhile, and a new `InRelease` is tried at the first
+check that sees it; so a publish that fails in both forms is attempted at
+most once per form per retry, not at every check. When a suite's current
+anchor (`InRelease` for inline, `Release` for detached and unsigned) is
+absent, the status page
 shows "refused: anchor_absent" while the snapshot keeps serving. The suite
 then asks for its anchor again only at its retry times (2 minutes,
 doubling to an hour); checks in between, including those clients trigger,

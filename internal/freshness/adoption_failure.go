@@ -88,6 +88,11 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath, "err", err)
 		return
 	}
+	if req.lateral {
+		// Ruling PE-11: the lateral's own hold, which the detached form's
+		// later failures (they replace the record) never extend.
+		c.lateralHolds.Store(suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath), lateralHold{key: req.key, retryAt: next})
+	}
 	refusal := cache.IsRefusalReason(reason)
 	attrs := []any{
 		"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath,

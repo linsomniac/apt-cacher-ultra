@@ -70,6 +70,7 @@ func (c *Checker) lockSuite(key string) (*sync.Mutex, lockState) {
 func (c *Checker) unlockDropped(key string, mu *sync.Mutex) {
 	c.locks.CompareAndDelete(key, mu)
 	c.absentAnswered.Delete(key) // ruling PE-10 (b): the suite's row is gone
+	c.lateralHolds.Delete(key)   // ruling PE-11
 	if c.unlockDroppedHook != nil {
 		c.unlockDroppedHook(key)
 	}

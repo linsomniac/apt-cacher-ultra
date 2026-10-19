@@ -227,11 +227,12 @@ func (c *Checker) anchorFoundAgain(ctx context.Context, out *checkOutcome, cur *
 // lateralInline is spec C4 Dispatch 1 for a detached current snapshot:
 // InRelease is probed on every check, and present → an inline adoption
 // request (a lateral move, result form_changed; a cross-form request). An
-// absent or unknown InRelease, or any InRelease while a record is active
-// and not due (ruling PE-10: no cross-form attempt inside a retry window;
-// held when the record is that InRelease content's), leaves the check to
-// the detached path (done = false): the current form's own request
-// decides the result. The caller holds the host slot.
+// absent or unknown InRelease, or an InRelease the lateral's own hold
+// covers (ruling PE-11, lateralHeld: its last failed content before that
+// failure's retry time, or the active, not-due record's own content),
+// leaves the check to the detached path (done = false): the current
+// form's own request decides the result. held reports the second case, a
+// record that belongs to this InRelease. The caller holds the host slot.
 //
 // AIDEV-NOTE: held must stop the detached path's "unchanged" from
 // clearing the record: it belongs to the InRelease content, which
@@ -239,16 +240,24 @@ func (c *Checker) anchorFoundAgain(ctx context.Context, out *checkOutcome, cur *
 // attempt that content again (spec C7's bounded attempts). The record
 // keeps no validators (crossForm), so the detached path's GET carries the
 // current Release's own (design review I-1).
-// AIDEV-NOTE: ruling PE-10 (a): retry discipline beats cross-form
-// eagerness. Holding only the record's own content let the two forms of a
-// publish that fails in both take the one record in turn, so every check
-// attempted one of them (up to 1,440 a day). Now no InRelease is attempted
-// while any record is active and not due: with both forms failing the
-// suite makes one attempt per form per retry window (the detached path
-// still attempts its own new content at once, spec C7, while the record is
-// the InRelease's), and a good InRelease waits at most the record's retry
-// time (1 h) behind a failing detached record while the suite keeps
-// serving its snapshot.
+// AIDEV-NOTE: rulings PE-10 (a) and PE-11 (review fix rounds 1 and 2):
+// the lateral's hold is the lateral's own. Holding only the record's own
+// content let the two forms of a publish that fails in both take the one
+// record in turn, so every check attempted one of them (up to 1,440 a
+// day); holding the lateral behind any record (PE-10) then starved a good
+// InRelease forever behind a detached form that kept publishing failing
+// content, each failure pushing the record's retry time. So a failed
+// lateral attempt is remembered per suite (Checker.lateralHolds: its
+// content key and the retry time written for it), and only that content
+// is held, until that time. The bounds: with both forms failing, each
+// form is attempted at most once per lateral retry window (the lateral
+// when its hold comes due, the detached path's content at the next check,
+// new content against the lateral's record, spec C7); a failing lateral
+// InRelease is retried within its own window — the C7 delay at its
+// failure, up to 75 minutes with the ±25 % jitter — whatever the detached
+// form does; a new InRelease is attempted at the first check that sees
+// it. The memo is in memory: a restart costs at most one extra lateral
+// attempt per suite.
 func (c *Checker) lateralInline(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef,
 	urls anchorURLs, gate retryGate, signedCurrent bool, nowUnix int64) (req *adoptionRequest, done, held bool) {
 	o := c.probe(fetchCtx, suite, urls, "InRelease")
@@ -256,9 +265,10 @@ func (c *Checker) lateralInline(ctx, fetchCtx context.Context, out *checkOutcome
 		return nil, false, false
 	}
 	req = probeTree{form: adoptionFormInline, found: true, inRelease: o}.request(suite)
-	req.crossForm = true
-	if gate.active && !gate.due {
-		return nil, false, req.key == gate.hash
+	req.crossForm, req.lateral = true, true
+	heldByRecord := gate.active && !gate.due && req.key == gate.hash
+	if heldByRecord || c.lateralHeld(suiteKey(suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath), req.key, nowUnix) {
+		return nil, false, heldByRecord
 	}
 	prevSuccess := cur.LastSuccessAt
 	cur.LastCheckAt, cur.LastSuccessAt, cur.CheckFailCount = &nowUnix, &nowUnix, 0
@@ -267,6 +277,35 @@ func (c *Checker) lateralInline(ctx, fetchCtx context.Context, out *checkOutcome
 	req, e.result = c.admit(out, cur, req, signedCurrent, prevSuccess, "form_changed", "changed_queued")
 	c.finishCheck(ctx, out, cur, suite, e)
 	return req, true, false
+}
+
+// lateralHold is the memo of a suite's last failed lateral attempt
+// (ruling PE-11): the content key attempted and the next_retry_at its
+// failure wrote (recordAdoptionFailure).
+type lateralHold struct {
+	key     string
+	retryAt int64
+}
+
+// lateralHeld reports whether the lateral InRelease content key of the
+// suite with lock-map key suite is held by its own last failure (ruling
+// PE-11): it is that failure's content and its retry time has not come. A
+// retry time beyond retryHorizon (a backward clock step) is clamped to now
+// + retryMaxDelay, as retryGateFor clamps a record's: a gate that delays
+// work is never left frozen, and never skipped.
+func (c *Checker) lateralHeld(suite, key string, nowUnix int64) bool {
+	v, ok := c.lateralHolds.Load(suite)
+	if !ok {
+		return false
+	}
+	h := v.(lateralHold)
+	if h.key != key || nowUnix >= h.retryAt {
+		return false
+	}
+	if h.retryAt > nowUnix+int64(retryHorizon/time.Second) {
+		c.lateralHolds.Store(suite, lateralHold{key: h.key, retryAt: nowUnix + int64(retryMaxDelay/time.Second)})
+	}
+	return true
 }
 
 // upgradeProbe is the first half of spec C4 Dispatch 2 (current snapshot

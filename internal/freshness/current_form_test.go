@@ -916,15 +916,16 @@ func TestCheck_AbsentAnchorThatComesBackIsUnchanged(t *testing.T) {
 	}
 }
 
-// Ruling PE-10 (a) (review fix round 1, Task 7): a detached suite whose
-// upstream serves one publish that fails in both signed forms (a signing
-// key not imported) is attempted once per form, then once per retry
-// window. While any record is active and not due no cross-form attempt is
-// made; only the current form's new content is attempted at once (spec
-// C7), and only while the record is the other form's. Before the ruling
-// the two forms took the one record in turn and every check was an
-// attempt (6 in six checks 20 s apart, 1 a minute after that).
-func TestCheck_BothSignedFormsFailingAreAttemptedOncePerRetryWindow(t *testing.T) {
+// Rulings PE-10 (a) and PE-11 (review fix rounds 1 and 2, Task 7): a
+// detached suite whose upstream serves one publish that fails in both
+// signed forms (a signing key not imported) is attempted once per form,
+// then at most once per form per lateral retry window: the lateral
+// InRelease when its own hold (the memo of its last failure) comes due,
+// the detached path's content at the next check after it (new content
+// against the lateral's record, spec C7). Before PE-10 the two forms took
+// the one record in turn and every check was an attempt (6 in six checks
+// 20 s apart, 1 a minute after that).
+func TestCheck_BothSignedFormsFailingAreAttemptedOncePerFormPerRetryWindow(t *testing.T) {
 	r := newRetryRig(t, 0)
 	r.adoptDetached()
 	in := r.release("v2", 0)
@@ -942,26 +943,211 @@ func TestCheck_BothSignedFormsFailingAreAttemptedOncePerRetryWindow(t *testing.T
 	if r.ver.calls() != 2 {
 		t.Fatalf("six checks 20 s apart made %d attempts, want 2 (one per form)", r.ver.calls())
 	}
+	// The lateral's window: the retry time written at its last failure
+	// (the second check's record was the detached one, so read it from the
+	// first attempt: 20 s + 2 min).
+	lateralRetry := r.clock.now().Add(-100 * time.Second).Unix()
+	detachedSinceLateral := 1
 	for i := range 240 { // four hours of checks a minute apart
-		row := r.row()
 		calls := r.ver.calls()
 		r.clock.advance(time.Minute)
-		g := r.checker.retryGateFor(&row, r.clock.now())
 		r.check()
 		n := r.ver.calls() - calls
-		switch after := r.row(); {
+		after := r.row()
+		switch {
 		case n > 1:
 			t.Fatalf("check %d made %d attempts", i, n)
-		case n == 1 && g.active && !g.due && (g.hash != kIn || strOf(after.AdoptionFailHash) != kDet):
-			t.Fatalf("check %d: an attempt of %s inside the retry window of record %s; only the current form's new content may be attempted, behind the other form's record",
-				i, strOf(after.AdoptionFailHash), g.hash)
+		case n == 1 && strOf(after.AdoptionFailHash) == kIn:
+			if now := r.clock.now().Unix(); now < lateralRetry {
+				t.Fatalf("check %d: the lateral InRelease was attempted %d s before its own retry time", i, lateralRetry-now)
+			}
+			lateralRetry, detachedSinceLateral = i64Of(after.AdoptionNextRetryAt), 0
+		case n == 1 && strOf(after.AdoptionFailHash) == kDet:
+			if detachedSinceLateral++; detachedSinceLateral > 1 {
+				t.Fatalf("check %d: the detached content was attempted twice in one lateral window", i)
+			}
+		case n == 1:
+			t.Fatalf("check %d: an attempt recorded %s, neither form's content", i, strOf(after.AdoptionFailHash))
 		}
 	}
-	// Retry windows of 2 min doubling to 1 h, one attempt per form per
-	// window: 2 + 10 in the four hours (one a minute without the ruling).
+	// Windows of 2 min doubling to 1 h, one attempt per form per lateral
+	// window: 2 + 12 in the four hours (one a minute without the rulings).
 	t.Logf("%d attempts in four hours and two minutes", r.ver.calls())
-	if got := r.ver.calls(); got > 12 {
-		t.Fatalf("%d attempts in four hours and two minutes, want at most 12", got)
+	if got := r.ver.calls(); got > 14 {
+		t.Fatalf("%d attempts in four hours and two minutes, want at most 14", got)
+	}
+}
+
+// churnDetached makes the rig's detached form publish new failing content
+// (a Release and its signature the verifier rejects) labelled i.
+func churnDetached(r *retryRig, i int) {
+	rel, sig := r.releaseText(fmt.Sprintf("d%d", i), 0), armoredSig(fmt.Sprintf("d%d sig", i))
+	r.ver.reject(contentKey(adoptionFormDetached, nil, rel, sig))
+	r.up.setAt(rigReleaseURL, rel)
+	r.up.setAt(rigReleaseGPGURL, sig)
+}
+
+// Ruling PE-11 (review fix round 2, Task 7; the re-review's probe): the
+// lateral's hold is its own, so the detached form's failures never extend
+// it. A detached suite whose upstream publishes failing detached content
+// every 30 minutes keeps its record from ever coming due; a good InRelease
+// that appears then is adopted at the first check that sees it. Under
+// PE-10 (a) it waited behind the record forever (12 detached attempts in
+// the next 6 h, never adopted).
+func TestCheck_GoodInReleaseIsNotStarvedByChurningFailingDetachedContent(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptDetached()
+	pub := 0
+	churnDetached(r, pub)
+	minute := 0
+	step := func() {
+		minute++
+		r.clock.advance(time.Minute)
+		if minute%30 == 0 {
+			pub++
+			churnDetached(r, pub)
+		}
+		r.check()
+	}
+	for range 3 * 60 { // three hours of failing detached publishes
+		step()
+	}
+	if row := r.row(); row.AdoptionFailCount < 5 || i64Of(row.AdoptionNextRetryAt) <= r.clock.now().Unix() {
+		t.Fatalf("setup: record count %d, retry at %d; want a long-failing record not due", row.AdoptionFailCount,
+			i64Of(row.AdoptionNextRetryAt))
+	}
+	r.up.set(r.release("good", 0)) // a good InRelease appears
+	step()
+	if snap := r.currentSnapshot(); snap.Form != cache.FormInline {
+		t.Fatalf("snapshot form %q after the first check that saw the good InRelease (result %q), want it adopted (inline)",
+			snap.Form, lastResult(r))
+	}
+}
+
+// Ruling PE-11: a failing lateral InRelease is retried within its own
+// window — the C7 delay written at its failure — however often the
+// detached form publishes failing content (which replaces the record and
+// pushes its retry time).
+func TestCheck_FailingLateralInReleaseIsRetriedWithinItsOwnWindow(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptDetached()
+	bad := r.release("bad", 0)
+	kIn := contentKey(adoptionFormInline, bad, nil, nil)
+	r.ver.reject(kIn)
+	r.up.set(bad)
+	pub := 0
+	churnDetached(r, pub)
+	var lateral []int64 // when the lateral was attempted
+	var windows []int64 // the retry time written at each lateral failure
+	for minute := 1; minute <= 4*60; minute++ {
+		r.clock.advance(time.Minute)
+		if minute%30 == 0 {
+			pub++
+			churnDetached(r, pub)
+		}
+		calls := r.ver.calls()
+		r.check()
+		if row := r.row(); r.ver.calls() > calls && strOf(row.AdoptionFailHash) == kIn {
+			lateral = append(lateral, r.clock.now().Unix())
+			windows = append(windows, i64Of(row.AdoptionNextRetryAt))
+		}
+	}
+	if len(lateral) < 4 {
+		t.Fatalf("the failing lateral InRelease was attempted %d times in four hours, want it retried in its own windows (>= 4)", len(lateral))
+	}
+	for i := 1; i < len(lateral); i++ {
+		if lateral[i] < windows[i-1] || lateral[i] > windows[i-1]+60 {
+			t.Fatalf("lateral attempt %d at %d, want at its previous failure's retry time %d (within one check)", i, lateral[i], windows[i-1])
+		}
+	}
+}
+
+// Ruling PE-11: the lateral's hold is in memory, so a restart costs at most
+// one extra lateral attempt per suite. Both forms fail until the retry
+// windows reach the 1 h cap; right after a lateral failure and the
+// detached failure that follows it (the record is the detached content's,
+// the lateral's own hold has an hour to run), a checker that keeps its
+// memory makes no lateral attempt in the next 50 minutes, and a restarted
+// one — which never saw the lateral fail — makes exactly one, then holds it
+// by the memo of that failure.
+func TestCheck_ARestartCostsAtMostOneExtraLateralAttempt(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(map[bool]string{false: "kept", true: "restarted"}[restart], func(t *testing.T) {
+			r := newRetryRig(t, 0)
+			r.adoptDetached()
+			in := r.release("v2", 0)
+			rel, sig := r.releaseText("v2", 0), armoredSig("v2 sig")
+			kIn, kDet := contentKey(adoptionFormInline, in, nil, nil), contentKey(adoptionFormDetached, nil, rel, sig)
+			r.ver.reject(kIn)
+			r.ver.reject(kDet)
+			r.up.set(in)
+			r.up.setAt(rigReleaseURL, rel)
+			r.up.setAt(rigReleaseGPGURL, sig)
+			// attempted reports the key a check attempted ("" for none).
+			attempted := func(check func()) string {
+				calls := r.ver.calls()
+				check()
+				if r.ver.calls() == calls {
+					return ""
+				}
+				return strOf(r.row().AdoptionFailHash)
+			}
+			lastLateral := false
+		setup:
+			for i := 0; ; i++ {
+				if i > 600 {
+					t.Fatal("setup: the windows never reached the cap")
+				}
+				r.clock.advance(time.Minute)
+				switch attempted(r.check) {
+				case kIn:
+					lastLateral = true
+				case kDet:
+					if lastLateral && r.row().AdoptionFailCount >= 8 {
+						break setup // a lateral failure, then the detached one, at the cap
+					}
+					lastLateral = false
+				}
+			}
+			chk := r.checker
+			if restart {
+				var err error
+				chk, err = New(Config{Cache: r.cache, Fetcher: r.up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+					Adopter: r.adopter, Logger: discardLogger(), now: r.clock.now, rand: func() float64 { return 0.5 }})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			lateral := 0
+			for range 50 { // checks a minute apart, inside the lateral's hour
+				r.clock.advance(time.Minute)
+				if attempted(func() {
+					chk.Check(context.Background(), "http", rigHost, rigSuite)
+					chk.WaitForAdoptions()
+				}) == kIn {
+					lateral++
+				}
+			}
+			if want := map[bool]int{false: 0, true: 1}[restart]; lateral != want {
+				t.Fatalf("restarted %v: the lateral InRelease was attempted %d times in 50 minutes, want %d", restart, lateral, want)
+			}
+		})
+	}
+}
+
+// Ruling PE-11: the lateral hold memo is dropped with the suite's
+// lock-map entry, like the absent answer (its row is gone).
+func TestLateralHold_DroppedWithTheLockEntry(t *testing.T) {
+	r := newRetryRig(t, 0)
+	key := suiteKey("http", rigHost, rigSuite)
+	r.checker.lateralHolds.Store(key, lateralHold{key: "k", retryAt: r.clock.now().Add(time.Hour).Unix()})
+	release, ok := r.checker.HoldSuite(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite})
+	if !ok {
+		t.Fatal("HoldSuite refused")
+	}
+	release(true)
+	if _, ok := r.checker.lateralHolds.Load(key); ok {
+		t.Fatal("dropping the suite's lock-map entry kept its lateral hold")
 	}
 }
 
@@ -1284,5 +1470,48 @@ func TestCheck_AbsentAnchorIsPacedByItsRecordAfterARestart(t *testing.T) {
 	restarted.WaitForAdoptions()
 	if gets() != before {
 		t.Fatalf("after a restart a check inside the record's retry time made %d requests, want none", gets()-before)
+	}
+}
+
+// Ruling PE-11: only the failed content is held. A detached suite whose
+// lateral InRelease failed, and whose upstream then replaces that InRelease
+// with good content inside the failure's retry window, adopts the new one
+// at the first check that sees it — it is neither the memo's content nor
+// the record's. (Under PE-10 it waited for the record's retry time.)
+func TestCheck_NewLateralInReleaseIsAttemptedAtOnce(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptDetached()
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	r.clock.advance(time.Minute)
+	r.check() // the lateral attempt fails: its memo and its record
+	if r.ver.calls() != 1 || strOf(r.row().AdoptionFailHash) != hashOf(bad) {
+		t.Fatalf("setup: %d attempts, record %s", r.ver.calls(), strOf(r.row().AdoptionFailHash))
+	}
+	r.up.set(r.release("good", 0))
+	r.clock.advance(20 * time.Second) // inside the failure's 2-minute window
+	r.check()
+	if snap := r.currentSnapshot(); snap.Form != cache.FormInline {
+		t.Fatalf("snapshot form %q, result %q; want the new InRelease adopted at once", snap.Form, lastResult(r))
+	}
+}
+
+// Ruling PE-11, the clock-step rule: a lateral hold whose retry time lies
+// beyond the legitimate horizon (a backward wall-clock step) is clamped to
+// now + 1 h, as a record's next_retry_at is — never a frozen lateral.
+func TestLateralHeld_ClampsARetryTimeBeyondTheHorizon(t *testing.T) {
+	r := newRetryRig(t, 0)
+	key := suiteKey("http", rigHost, rigSuite)
+	now := r.clock.now().Unix()
+	r.checker.lateralHolds.Store(key, lateralHold{key: "k", retryAt: now + 30*86400})
+	if !r.checker.lateralHeld(key, "k", now) {
+		t.Fatal("a held lateral was not held")
+	}
+	if r.checker.lateralHeld(key, "other", now) {
+		t.Fatal("other content was held by the memo")
+	}
+	if r.checker.lateralHeld(key, "k", now+int64(retryMaxDelay/time.Second)) {
+		t.Fatal("a retry time 30 days ahead held the lateral past now + 1 h")
 	}
 }
