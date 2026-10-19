@@ -1895,6 +1895,10 @@ func TestCheck_FailedTick_DoesNotReconcile(t *testing.T) {
 		"main/binary-amd64/Packages": pkgsAmd64,
 		"main/binary-all/Packages":   pkgsAll,
 	})
+	// Clearsigned so a reconcile that wrongly ran would heal binary-all:
+	// reconcile refuses a plain-text InRelease before healing anything,
+	// which would make this negative test pass vacuously.
+	releaseText = simtest.ClearsignedFixture(string(releaseText))
 	base := "http://127.0.0.1/ubuntu/dists/noble/"
 	env.fetcher.put(base+"main/binary-amd64/Packages", pkgsAmd64)
 	env.fetcher.put(base+"main/binary-all/Packages", pkgsAll) // member fetcher CAN serve it
