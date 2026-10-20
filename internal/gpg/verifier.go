@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"regexp"
-	"sync"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -86,22 +85,22 @@ type Verifier struct {
 
 	// shortKeyIDLogged tracks suites for which a short-keyid-fallback
 	// acceptance has already been logged this process. Keyed by
-	// "canonical_host|suite_path"; values are unused. Concurrent-safe
-	// via sync.Map's LoadOrStore.
-	shortKeyIDLogged sync.Map
+	// "canonical_host|suite_path"; at most onceSetMax keys, then it starts
+	// over (spec C9).
+	shortKeyIDLogged onceSet
 
 	// untrustedSignerLogged tracks suites for which an
 	// adoption_untrusted_signer rejection has already been logged this
 	// process. Same dedupe shape as shortKeyIDLogged so the log surface
 	// is a finite inventory of "which (host, suite) pairs need new keys"
 	// rather than a per-tick noise stream.
-	untrustedSignerLogged sync.Map
+	untrustedSignerLogged onceSet
 
 	// unverifiedSignerLogged tracks suites for which an
 	// adoption_unverified_signer acceptance has already been logged this
 	// process. Fires under accept_any_signer when the bypass branch
 	// runs. Same dedupe shape as the other once-loggers.
-	unverifiedSignerLogged sync.Map
+	unverifiedSignerLogged onceSet
 }
 
 // Compile-time interface check: Verifier satisfies freshness.Verifier.
@@ -822,7 +821,7 @@ func (v *Verifier) verifyAgainst(e *openpgp.Entity, signed []byte, sig *packet.S
 // not resolve in the trust set).
 func (v *Verifier) logUntrustedSignerOnce(suite freshness.SuiteRef, rejected []string) {
 	key := suite.CanonicalHost + "|" + suite.SuitePath
-	if _, loaded := v.untrustedSignerLogged.LoadOrStore(key, struct{}{}); loaded {
+	if !v.untrustedSignerLogged.first(key) {
 		return
 	}
 	v.logger.Info("adoption_untrusted_signer",
@@ -840,7 +839,7 @@ func (v *Verifier) logUntrustedSignerOnce(suite freshness.SuiteRef, rejected []s
 // noise stream.
 func (v *Verifier) logShortKeyIDFallbackOnce(suite freshness.SuiteRef, matched *openpgp.Entity, keyID uint64) {
 	key := suite.CanonicalHost + "|" + suite.SuitePath
-	if _, loaded := v.shortKeyIDLogged.LoadOrStore(key, struct{}{}); loaded {
+	if !v.shortKeyIDLogged.first(key) {
 		return
 	}
 	v.logger.Info("adoption_short_keyid_fallback",
@@ -866,7 +865,7 @@ func (v *Verifier) logShortKeyIDFallbackOnce(suite freshness.SuiteRef, matched *
 // line still fires, with signer_info elided.
 func (v *Verifier) logUnverifiedSignerOnce(suite freshness.SuiteRef, sigSource io.Reader) {
 	key := suite.CanonicalHost + "|" + suite.SuitePath
-	if _, loaded := v.unverifiedSignerLogged.LoadOrStore(key, struct{}{}); loaded {
+	if !v.unverifiedSignerLogged.first(key) {
 		return
 	}
 	signerInfo := extractSignerInfo(sigSource)
