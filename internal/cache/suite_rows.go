@@ -289,14 +289,15 @@ func (c *Cache) creationAttempt(ctx context.Context, op string, create *SuiteSee
 // submit can still commit: when the commit raced the context's end in
 // submitWrite (an operation run on an ended context rolls back), and when
 // submitWrite returned ErrClosed while the writer ran the operation with a
-// live context (at shutdown; the read then fails and answers "present")
-// (deferred minor D-12). So the read decides (design review M3, M4;
-// TestCreateSuite_AFailedSubmitWhoseEvictionCommittedPurges). A read
-// error, or a read that lands before a commit still in flight, answers
-// "present": the evictee's lock-map, flip-gate and touch entries then stay
-// (one each, bounded), and a check that starts meanwhile meets a vanished
-// row, which I-4's re-validation and the UPDATE-only writers make harmless
-// (its candidate, if any, was retired: CommitAdoption refuses it).
+// live context (at shutdown: Close waits for the writer before db.Close,
+// so the read races the commit and db.Close — whatever it answers is
+// harmless at shutdown) (deferred minor D-12). So the read decides (design
+// review M3, M4; TestCreateSuite_AFailedSubmitWhoseEvictionCommittedPurges).
+// A read error, or a read that lands before a commit still in flight,
+// answers "present": the evictee's lock-map, flip-gate and touch entries
+// then stay (one each, bounded), and a check that starts meanwhile meets a
+// vanished row, which I-4's re-validation and the UPDATE-only writers make
+// harmless (its candidate, if any, was retired: CommitAdoption refuses it).
 func (c *Cache) afterCreate(key SuiteKey, res CreateResult, held *heldSuite) {
 	if res.Outcome == SuiteCreated {
 		c.noteTouch(key)

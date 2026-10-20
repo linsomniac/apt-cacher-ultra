@@ -528,7 +528,10 @@ func TestCreateSuite_AFailedSubmitWhoseEvictionCommittedPurges(t *testing.T) {
 
 // Deferred minor D-15: a failed suite-row creation names no caller it was
 // not: the miss path (StoreFetched) and onboarding (CreateSuite) both say
-// "create suite row", never "CreateSuite:".
+// "create suite row", never "CreateSuite:". The eviction candidate's hold,
+// the first database call of a creation with a cap set, says "hold
+// eviction candidate" under the caller's operation (the Task 2 review's
+// minor 3: before, no test reached its errors).
 func TestCreateSuite_ErrorsNameTheOperation(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
@@ -537,13 +540,25 @@ BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
 		t.Fatal(err)
 	}
 	seed := SuiteSeed{SuiteKey: sk("h", "/r/dists/x"), RequestedAt: 1}
-	_, cerr := c.CreateSuite(ctx, seed, SuiteCaps{}, nil)
-	_, serr := c.StoreFetched(ctx, FetchedRow{Row: URLPath{CanonicalScheme: "http", CanonicalHost: "h",
+	fetched := FetchedRow{Row: URLPath{CanonicalScheme: "http", CanonicalHost: "h",
 		Path: "/r/dists/x/InRelease", UpstreamURL: "http://h/r/dists/x/InRelease", IsMetadata: true},
-		Suite: seed.SuiteKey, Create: &seed}, SuiteCaps{}, nil)
+		Suite: seed.SuiteKey, Create: &seed}
+	_, cerr := c.CreateSuite(ctx, seed, SuiteCaps{}, nil)
+	_, serr := c.StoreFetched(ctx, fetched, SuiteCaps{}, nil)
 	for name, err := range map[string]error{"CreateSuite": cerr, "StoreFetched": serr} {
 		if err == nil || !strings.Contains(err.Error(), "create suite row: insert") || strings.Contains(err.Error(), "CreateSuite:") {
 			t.Errorf("%s: err = %v, want it to say \"create suite row: insert\" and never \"CreateSuite:\"", name, err)
+		}
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel() // the candidate count fails at once
+	_, cerr = c.CreateSuite(cancelled, seed, SuiteCaps{Global: 1}, nil)
+	_, serr = c.StoreFetched(cancelled, fetched, SuiteCaps{Global: 1}, nil)
+	for name, err := range map[string]error{"CreateSuite": cerr, "StoreFetched": serr} {
+		want := name + ": hold eviction candidate: count suites: "
+		if err == nil || !strings.HasPrefix(err.Error(), want) || !errors.Is(err, context.Canceled) {
+			t.Errorf("%s with a cancelled context: err = %v, want it to start %q and wrap context.Canceled", name, err, want)
 		}
 	}
 }

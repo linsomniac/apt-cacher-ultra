@@ -61,7 +61,8 @@ func (h *heldSuite) settle(deleted bool) {
 // first, with a no-op release). busy reports that it found candidates but
 // every one was busy. A guard that is a ClockStepReporter is told of a
 // suite whose last_requested_at lies in the future. Its errors name no
-// operation: creationAttempt prefixes the caller's (deferred minor D-15).
+// caller: creationAttempt prefixes the caller's operation (deferred minor
+// D-15).
 //
 // AIDEV-NOTE: holding a candidate from caps.Global-suiteEvictCandidates on
 // (design review M5) keeps creations that race at the cap boundary — each

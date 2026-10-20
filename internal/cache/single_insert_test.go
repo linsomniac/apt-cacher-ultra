@@ -16,15 +16,17 @@ import (
 
 // insertSuiteFreshnessRE matches a statement that inserts into
 // suite_freshness: INSERT (OR IGNORE / OR REPLACE …) or REPLACE INTO,
-// across line breaks, any case, with the table name quoted ("…", `…`,
-// […]) or schema-qualified (main.suite_freshness) too.
+// across line breaks, any case, with the table name quoted ("…", '…',
+// `…`, […]: SQLite takes a single-quoted string as an identifier where
+// one is expected) or schema-qualified (main.suite_freshness) too. SQL
+// built at runtime is beyond any literal scan.
 var insertSuiteFreshnessRE = regexp.MustCompile("(?is)\\b(?:INSERT(?:\\s+OR\\s+\\w+)?|REPLACE)\\s+INTO\\s+" +
-	"(?:[\"`\\[]?\\w+[\"`\\]]?\\s*\\.\\s*)?[\"`\\[]?suite_freshness\\b")
+	"(?:[\"'`\\[]?\\w+[\"'`\\]]?\\s*\\.\\s*)?[\"'`\\[]?suite_freshness\\b")
 
 // deleteSuiteFreshnessRE matches a statement that deletes from
 // suite_freshness, with the same quoting and schema forms.
 var deleteSuiteFreshnessRE = regexp.MustCompile("(?is)\\bDELETE\\s+FROM\\s+" +
-	"(?:[\"`\\[]?\\w+[\"`\\]]?\\s*\\.\\s*)?[\"`\\[]?suite_freshness\\b")
+	"(?:[\"'`\\[]?\\w+[\"'`\\]]?\\s*\\.\\s*)?[\"'`\\[]?suite_freshness\\b")
 
 // deleteSignedSeenRE matches a statement that deletes from
 // suite_signed_seen, with the same quoting and schema forms.
@@ -146,8 +148,19 @@ func TestSuiteFreshnessHasOneDeleteSite(t *testing.T) {
 	}
 }
 
-// callSites returns "file:function" for every call of the package
-// function name in internal/cache's production code, sorted.
+// callSites returns "file:function" for every reference to the package
+// function name in internal/cache's production code, sorted: a call, and
+// equally the function taken as a value (f := name, a callback argument),
+// from which a call could be made anywhere, and any selector x.name. A
+// reference outside any function — a package-level var, or a func literal
+// assigned to one — is attributed to "(top level)". The function's own
+// declaration is not a reference (a recursive call in it adds no caller).
+//
+// AIDEV-NOTE: every identifier spelled name counts, not only call.Fun
+// (Task 2 review minor 4): counting only direct calls in FuncDecls let a
+// function value or a package-level func literal reach the guarded
+// writer unseen. A local variable or field that happens to share the name
+// is flagged too — rename it rather than widen the allowlist.
 func callSites(t *testing.T, name string) []string {
 	t.Helper()
 	var out []string
@@ -160,15 +173,19 @@ func callSites(t *testing.T, name string) []string {
 			t.Fatal(err)
 		}
 		for _, d := range f.Decls {
-			fd, ok := d.(*ast.FuncDecl)
-			if !ok {
-				continue
+			where := "(top level)"
+			if fd, ok := d.(*ast.FuncDecl); ok {
+				if fd.Recv == nil && fd.Name.Name == name {
+					continue // the declaration itself
+				}
+				where = fd.Name.Name
 			}
-			ast.Inspect(fd, func(n ast.Node) bool {
-				if call, ok := n.(*ast.CallExpr); ok {
-					if id, ok := call.Fun.(*ast.Ident); ok && id.Name == name {
-						out = append(out, filepath.Base(p)+":"+fd.Name.Name)
+			ast.Inspect(d, func(n ast.Node) bool {
+				if id, ok := n.(*ast.Ident); ok && id.Name == name {
+					if fd, ok := d.(*ast.FuncDecl); ok && id == fd.Name {
+						return true // a method's own name is its declaration, not a reference
 					}
+					out = append(out, filepath.Base(p)+":"+where)
 				}
 				return true
 			})
