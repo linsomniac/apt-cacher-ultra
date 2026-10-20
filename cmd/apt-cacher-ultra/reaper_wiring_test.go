@@ -163,3 +163,20 @@ func TestServeListeners_StartupLineReportsTheReapingKnobs(t *testing.T) {
 	}
 	t.Fatal("startup line not found")
 }
+
+// Final review spec m7: the gc_disabled WARN keeps naming what gc.enabled =
+// false stops, and says that suite reaping still runs — naming
+// gc.suite_idle_ttl, its value and "0s" — or, with "0s", that it is off.
+func TestGCDisabledDetail_NamesSuiteReaping(t *testing.T) {
+	on := gcDisabledDetail(720 * time.Hour)
+	for _, want := range []string{"gc.enabled = false: orphan blobs and displaced snapshots will not be reaped",
+		"suite reaping still runs", "gc.suite_idle_ttl = 720h0m0s", `"0s" keeps idle suites`} {
+		if !strings.Contains(on, want) {
+			t.Errorf("detail with a 720h TTL = %q; want it to contain %q", on, want)
+		}
+	}
+	off := gcDisabledDetail(0)
+	if !strings.Contains(off, `suite reaping is off too (gc.suite_idle_ttl = "0s")`) || strings.Contains(off, "still runs") {
+		t.Errorf("detail with a 0s TTL = %q; want it to say suite reaping is off", off)
+	}
+}

@@ -438,10 +438,10 @@ func serveListeners(
 
 	// SPEC4 §10.2: gc_disabled Warn names the operator's choice when
 	// the master switch is off. The cache still works, but disk usage
-	// will grow unbounded as adoptions roll.
+	// will grow unbounded as adoptions roll. Suite reaping runs whatever
+	// gc.enabled says (spec C9), and the line says so (gcDisabledDetail).
 	if !cfg.GC.Enabled {
-		logger.Warn("gc_disabled",
-			"detail", "gc.enabled = false: orphan blobs and displaced snapshots will not be reaped; pool/ size grows unboundedly with rolling adoptions")
+		logger.Warn("gc_disabled", "detail", gcDisabledDetail(cfg.GC.SuiteIdleTTL.Duration))
 	}
 
 	// SPEC5 §5.2 / §10.2: admin-listener startup events.
@@ -1073,6 +1073,24 @@ func buildAdopter(
 		"hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
 	)
 	return adopter, keyring, nil
+}
+
+// gcDisabledDetail is the gc_disabled WARN's detail: what gc.enabled =
+// false stops, and whether suite reaping still runs — it does whatever
+// gc.enabled says, unless gc.suite_idle_ttl is "0s" (spec C9).
+//
+// AIDEV-NOTE: final review spec m7. For an operator who set gc.enabled =
+// false to keep everything, this is the one in-product line at the first
+// 1.1.0 start, an hour before the reaper's first run; it must not imply
+// that nothing is deleted.
+func gcDisabledDetail(suiteIdleTTL time.Duration) string {
+	const detail = "gc.enabled = false: orphan blobs and displaced snapshots will not be reaped; " +
+		"pool/ size grows unboundedly with rolling adoptions"
+	if suiteIdleTTL == 0 {
+		return detail + `; suite reaping is off too (gc.suite_idle_ttl = "0s")`
+	}
+	return detail + fmt.Sprintf(`; suite reaping still runs: gc.suite_idle_ttl = %s reaps the suites no client asked for in that long ("0s" keeps idle suites)`,
+		suiteIdleTTL)
 }
 
 // warnSuiteCaps logs WARN suite_caps_exceeded at startup when new suites
