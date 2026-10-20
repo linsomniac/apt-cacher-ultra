@@ -465,9 +465,12 @@ type heldReap struct {
 // suiteHoldTimeout (WARN).
 //
 // AIDEV-NOTE: the steps are a function of hctx alone (the Task 6 review's
-// minor 1): with the run's context in scope, a step run on it instead of
-// hctx would escape design review M-2's bound and survive every test but
-// TestReaper_AHoldTimeoutIsAWarnedFailureAndTheNextRunReaps.
+// minor 1): with the run's context in scope, one step run on it instead of
+// hctx would escape design review M-2's bound unseen — the tests time out
+// only the first step (TestReaper_AHoldTimeoutIsAWarnedFailureAndTheNextRunReaps)
+// and check only the hook's deadline
+// (TestReaper_BoundsTheWorkUnderAHoldAtFiveMinutes). Keep the run's
+// context out of this function.
 func (r *Reaper) reapHeld(hctx context.Context, c reapCandidate) (h heldReap) {
 	if r.reapHook != nil {
 		r.reapHook(hctx, c.key)
