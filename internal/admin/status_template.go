@@ -437,7 +437,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
           {{$rl := 0}}{{range .Suites}}{{if .RefusedLong}}{{$rl = (add1 $rl)}}{{end}}{{end}}{{if gt $rl 0}}<span class="sep">&middot;</span><span class="count-warn">{{$rl}} REFUSED 24H+</span>{{end}}
         </div>
         <h2 class="panel__h">Suite adoption status</h2>
-        <p class="panel__desc">One row per (host, suite). Lagging rows indicate the upstream has published a newer <code>InRelease</code> than the snapshot the cache is currently serving. The Adoption column shows a failing or refused adoption and when it is retried.</p>
+        <p class="panel__desc">One row per (scheme, host, suite). Lagging rows indicate the upstream has published a newer <code>InRelease</code> than the snapshot the cache is currently serving. The Adoption column shows a failing or refused adoption and when it is retried.</p>
         {{if .Suites}}
         <div class="table-wrap">
           <table class="data">
@@ -451,7 +451,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
             <tbody>
             {{range .Suites}}
               <tr{{if or .LagWarn .AdoptionFailing .RefusedLong}} data-state="warn"{{end}}>
-                <td data-label="Host" class="host">{{.Host}}</td>
+                <td data-label="Host" class="host">{{if .Scheme}}{{.Scheme}}://{{end}}{{.Host}}</td>
                 <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
                 <td data-label="Last check" class="time">{{unixTimePtr .LastCheckUnixTime}}</td>
                 <td data-label="Last success" class="time">{{unixTimePtr .LastSuccessUnixTime}}</td>

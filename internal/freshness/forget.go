@@ -1,0 +1,86 @@
+package freshness
+
+// Spec C9 (D9): POST /forget, the reaper's steps for one suite on demand.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+)
+
+// Forget is POST /forget (spec C9, D9; admin.Forgetter): the reaper's
+// steps for one suite, run to completion regardless of idleness within
+// suiteHoldTimeout — under the suite's mutex every metadata batch, then
+// the final compare-and-delete with no idle check (cache.ForgetSuite),
+// which also deletes the signed-seen markers of the suite's base, and the
+// cached anchor rows of the base and its "/." twin under both schemes,
+// when no suite row of its host is left for the base or the twin, under
+// either scheme (design note 13, ruling PF-2). Its result's Deleted is
+// false, with a nil error, when the suite has no row or is busy (the
+// endpoint answers 409 for both: no existence oracle); KeptBy names the
+// rows that kept the markers (ruling PF-7). An error is a database
+// failure.
+//
+// AIDEV-NOTE: ruling R-F1 — the one suite-row delete path: the row read
+// first (I-4: a lock-map entry is stored only for a suite with a row),
+// HoldSuite, the re-read under the hold, deleteSuiteTx through
+// cache.ForgetSuite, release(gone) — gone being ForgetSuite's answer,
+// settled by a fresh read after a failed submit, or the re-read's finding
+// no row (design review M-2). The suite's next request re-creates it
+// never adopted, so unchanged upstream content re-adopts at once (signed)
+// or after the transition's confirmation (unsigned), and a deliberate
+// rollback adopts: the escape hatch for refusal states. Forgetting an
+// active suite bypasses the flip barrier (spec C8): a client in the
+// middle of an update then can see one Hash Sum mismatch (design review
+// M-7, a documented residual).
+func (r *Reaper) Forget(ctx context.Context, scheme, host, suitePath string) (cache.ForgetResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, suiteHoldTimeout)
+	defer cancel()
+	key := cache.SuiteKey{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}
+	switch _, err := r.cache.GetSuiteFreshness(ctx, scheme, host, suitePath); {
+	case errors.Is(err, cache.ErrNotFound):
+		return cache.ForgetResult{}, nil
+	case err != nil:
+		return cache.ForgetResult{}, fmt.Errorf("forget: read suite row: %w", err)
+	}
+	release, ok := r.checker.HoldSuite(key)
+	if !ok {
+		return cache.ForgetResult{}, nil
+	}
+	gone := false
+	defer func() { release(gone) }()
+	if r.reapHook != nil {
+		r.reapHook(ctx, key)
+	}
+	cur, err := r.cache.GetSuiteFreshness(ctx, scheme, host, suitePath)
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		gone = true
+		return cache.ForgetResult{}, nil
+	case err != nil:
+		return cache.ForgetResult{}, fmt.Errorf("forget: read suite row: %w", err)
+	}
+	rows, err := r.cache.DeleteSuiteMetadata(ctx, key)
+	if err != nil {
+		return cache.ForgetResult{}, fmt.Errorf("forget: %w", err)
+	}
+	res, err := r.cache.ForgetSuite(ctx, key, cur.CurrentSnapshotID)
+	gone = res.Gone
+	if err != nil {
+		return cache.ForgetResult{}, fmt.Errorf("forget: %w", err)
+	}
+	if !res.Deleted {
+		return res, nil
+	}
+	r.logger.Info("suite_forgotten",
+		"canonical_scheme", scheme,
+		"canonical_host", host,
+		"suite_path", suitePath,
+		"metadata_rows", rows,
+		"markers_deleted", res.MarkersDeleted,
+		"anchor_rows", res.AnchorRowsDeleted,
+	)
+	return res, nil
+}

@@ -224,6 +224,7 @@ func populatedJSONContractFixture() statusModel {
 		},
 		Suites: []suiteEntry{
 			{
+				Scheme:                           "http",
 				Host:                             "archive.ubuntu.com",
 				SuitePath:                        "dists/noble",
 				LastCheckUnixTime:                &suiteCheck,

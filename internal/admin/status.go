@@ -239,6 +239,10 @@ type listenerInfo struct {
 }
 
 type suiteEntry struct {
+	// Scheme is the suite's canonical scheme, http or https: a suite of
+	// either scheme may share host and path, and POST /forget takes it
+	// (ruling PF-7; additive to the locked JSON contract).
+	Scheme                           string `json:"scheme"`
 	Host                             string `json:"host"`
 	SuitePath                        string `json:"suite_path"`
 	LastCheckUnixTime                *int64 `json:"last_check_unixtime"`
@@ -587,6 +591,7 @@ func buildSuiteEntries(rows []cache.SuiteWithAdoption, now int64) []suiteEntry {
 	out := make([]suiteEntry, 0, len(rows))
 	for _, r := range rows {
 		e := suiteEntry{
+			Scheme:                           r.CanonicalScheme,
 			Host:                             r.CanonicalHost,
 			SuitePath:                        r.SuitePath,
 			LastCheckUnixTime:                r.LastCheckAt,

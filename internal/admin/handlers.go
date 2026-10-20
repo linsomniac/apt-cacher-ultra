@@ -4,12 +4,15 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
 // handleMetrics serves the /metrics endpoint in Prometheus text
@@ -583,4 +586,108 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = io.WriteString(w, "reconcile triggered\n")
+}
+
+// handleForget serves POST /forget (spec C9, D9), the documented escape
+// hatch for refusal states — a vendor that stopped signing, a deliberate
+// upstream rollback, a stuck unsigned suite: it deletes one suite as the
+// reaper would, regardless of idleness, and the signed-seen markers of its
+// base (with the base's cached anchor files) when no other suite with that
+// base has a row. The work is done when the answer comes; a client that
+// disconnects does not cut it short.
+//
+// Headers: X-ACU-Admin: 1 (required); Sec-Fetch-Site, when present, must
+// be same-origin or none (requireMutationGuard). Params (form body): host
+// and suite (required), scheme (optional: http or https, default https).
+// Returns:
+//   - 202 Accepted: the suite is forgotten; the body names it, the markers
+//     deleted and the rows that kept them (ruling PF-7).
+//   - 400 Bad Request: host or suite missing, or another scheme.
+//   - 403 Forbidden: the header is missing, or the request is cross-site.
+//   - 409 Conflict: busy or unknown (no existence oracle); the body says
+//     what to check.
+//   - 413 Request Entity Too Large: the body exceeds 8 KiB.
+//   - 500 Internal Server Error: a database failure (logged).
+//   - 501 Not Implemented: no Forgetter wired.
+func (s *Server) handleForget(w http.ResponseWriter, r *http.Request) {
+	if !requireMutationGuard(w, r) {
+		return
+	}
+	if s.cfg.Forgetter == nil {
+		http.Error(w, "forget not available\n", http.StatusNotImplemented)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "request body too large\n", http.StatusRequestEntityTooLarge)
+		return
+	}
+	host := strings.TrimSpace(r.FormValue("host"))
+	suite := strings.TrimSpace(r.FormValue("suite"))
+	scheme := strings.TrimSpace(r.FormValue("scheme"))
+	if scheme == "" {
+		scheme = "https"
+	}
+	if host == "" || suite == "" || (scheme != "http" && scheme != "https") {
+		http.Error(w, "host and suite are required; scheme is http or https\n", http.StatusBadRequest)
+		return
+	}
+	s.logger.Info("admin_forget_requested", "scheme", scheme, "canonical_host", host, "suite_path", suite)
+	res, err := s.cfg.Forgetter.Forget(context.WithoutCancel(r.Context()), scheme, host, suite)
+	switch {
+	case err != nil:
+		s.logger.Warn("admin: forget failed", "err", err, "scheme", scheme, "canonical_host", host, "suite_path", suite)
+		http.Error(w, "forget failed\n", http.StatusInternalServerError)
+		return
+	case !res.Deleted:
+		http.Error(w, "not forgotten: busy (try again) or no such suite (scheme defaults to https; "+
+			"host and suite as the status page shows them)\n", http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = io.WriteString(w, forgottenText(scheme, host, suite, res))
+}
+
+// forgottenText is POST /forget's 202 body (ruling PF-7): what was
+// forgotten, how many signed-seen markers of its base went with it, and
+// the suite rows that kept them, if any.
+func forgottenText(scheme, host, suite string, res cache.ForgetResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "forgotten %s://%s%s; signed-seen markers deleted: %d", scheme, host, suite, res.MarkersDeleted)
+	if len(res.KeptBy) > 0 {
+		b.WriteString("; kept by")
+		for _, k := range res.KeptBy {
+			fmt.Fprintf(&b, " %s://%s%s", k.CanonicalScheme, k.CanonicalHost, k.SuitePath)
+		}
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+// requireMutationGuard is the guard of the admin listener's mutating
+// endpoints (POST /forget; spec §10 G-1 brings POST /reconcile under it):
+// it answers 403 and reports false unless the request carries
+// X-ACU-Admin: 1 and, when it has one, a Sec-Fetch-Site of same-origin or
+// none. curl and scripts send no Sec-Fetch-Site.
+//
+// AIDEV-NOTE: ruling PF-6 (design review I-6); keep the claim honest. A
+// cross-site form or fetch cannot trigger an endpoint behind this guard:
+// a form POST cannot carry a custom header, a cross-origin fetch that sets
+// one is refused on the Sec-Fetch-Site the browser adds (a page cannot
+// forge it), and its CORS preflight is never granted. It does not stop
+// DNS rebinding against a listener without htpasswd_file: a page whose
+// own name resolves to the listener's address makes same-origin requests.
+// Host-header validation of the mutating endpoints is spec §10 G-1's, for
+// /forget and /reconcile together: it affects operators behind reverse
+// proxies, a maintainer call.
+func requireMutationGuard(w http.ResponseWriter, r *http.Request) bool {
+	if r.Header.Get("X-ACU-Admin") != "1" {
+		http.Error(w, "this endpoint requires the header X-ACU-Admin: 1\n", http.StatusForbidden)
+		return false
+	}
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+		http.Error(w, "cross-site requests are refused\n", http.StatusForbidden)
+		return false
+	}
+	return true
 }

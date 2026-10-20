@@ -78,6 +78,7 @@
   },
   "suites": [
     {
+      "scheme": "http",
       "host": "archive.ubuntu.com",
       "suite_path": "dists/noble",
       "last_check_unixtime": 1700005000,

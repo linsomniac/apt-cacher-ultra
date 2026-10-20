@@ -75,9 +75,9 @@ type Reaper struct {
 	// interval and floor are reapInterval and reapUptimeFloor; tests
 	// shorten them.
 	interval, floor time.Duration
-	// reapHook, when set (tests only), runs in reapSuite while the suite
-	// is held, with the context its steps run on: a panic there stands in
-	// for a bug between the hold and its release.
+	// reapHook, when set (tests only), runs in reapSuite and Forget while
+	// the suite is held, with the context its steps run on: a panic there
+	// stands in for a bug between the hold and its release.
 	reapHook func(context.Context, cache.SuiteKey)
 	// lastWall and lastMono are the checker's wall clock and the monotonic
 	// clock at the previous run, or at Run's start; deferUntil is the

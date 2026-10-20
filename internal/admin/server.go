@@ -98,6 +98,12 @@ type Config struct {
 	// New does NOT reject a nil Reconciler.
 	Reconciler Reconciler
 
+	// Forgetter is OPTIONAL. When non-nil, POST /forget is enabled and
+	// delegates to Forgetter.Forget (spec C9, D9). When nil, the endpoint
+	// returns 501 Not Implemented. cmd wires the freshness Reaper; New
+	// does NOT reject a nil Forgetter.
+	Forgetter Forgetter
+
 	// Keyring supplies the loaded GPG keyring inventory for the
 	// status page's `keyring` section. nil is treated as "adoption
 	// disabled or keyring not yet wired" — the section renders as
@@ -114,6 +120,18 @@ type Config struct {
 // reconcile holds the suite lock (caller sees 409 Conflict).
 type Reconciler interface {
 	Reconcile(ctx context.Context, scheme, host, suitePath string) bool
+}
+
+// Forgetter deletes one suite as the reaper would, regardless of
+// idleness, for POST /forget (spec C9, D9). nil → POST /forget returns
+// 501. cmd wires the freshness Reaper; the interface keeps admin from
+// importing internal/freshness. Forget's result has Deleted when the
+// suite was forgotten, with the base's markers deleted and the rows that
+// kept them (KeptBy, ruling PF-7); Deleted is false with a nil error when
+// the suite is busy or unknown (the endpoint answers 409 for both: no
+// existence oracle); an error is a database failure (500).
+type Forgetter interface {
+	Forget(ctx context.Context, scheme, host, suitePath string) (cache.ForgetResult, error)
 }
 
 // KeyringProvider returns the inventory of trusted-key entities loaded
@@ -348,6 +366,8 @@ func (s *Server) buildHandler() http.Handler {
 		if r.Method == http.MethodOptions {
 			if _, profile := profiles[r.URL.Path]; profile {
 				w.Header().Set("Allow", "GET, OPTIONS")
+			} else if r.URL.Path == "/forget" {
+				w.Header().Set("Allow", "POST, OPTIONS")
 			} else {
 				w.Header().Set("Allow", allowMethods)
 			}
@@ -373,6 +393,16 @@ func (s *Server) buildHandler() http.Handler {
 				return
 			}
 			s.handleReconcile(w, r)
+			return
+		}
+		// POST /forget, likewise (spec C9, D9).
+		if r.URL.Path == "/forget" {
+			if r.Method != http.MethodPost {
+				w.Header().Set("Allow", "POST, OPTIONS")
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			s.handleForget(w, r)
 			return
 		}
 		h, known := routes[r.URL.Path]
