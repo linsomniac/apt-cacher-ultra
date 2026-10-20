@@ -29,18 +29,25 @@ const staleSuiteFactor = 4
 // staleSuiteCounts partitions suites whose last_success_at has aged past
 // staleBefore into adopted (current_snapshot_id set — the dangerous case
 // that serves stale metadata) and unadopted, and counts the adopted ones
-// in the refusal state anchor_absent (absent, a subset of adopted: such a
-// suite keeps its old last_success_at on purpose, spec C4). A nil
+// in a refusal state that paces the suite by its record (absent, a subset
+// of adopted: anchor_absent and unsigned_disabled, recordPacesAdopted;
+// such a suite's last_success_at ages between its record's retries on
+// purpose, spec C4). A nil
 // last_success_at is treated as "never succeeded" rather than "went
 // stale" and is not counted, so brand-new suites don't trip the gauge. A
 // last_success_at more than clockStepTolerance past now (backward clock
 // step) counts as stale (spec C4). SPEC §7.4.
 //
-// AIDEV-NOTE: only anchor_absent is left out of the stale WARN (design
-// note 33 as narrowed by the final fix wave, FW-3 (b)): every other
-// refusal bumps last_success_at at each answered check, so a refused suite
-// that is stale has failing checks — a real freeze. Leaving out every
-// refusal reason (Task 7) hid it, a regression from phase D
+// AIDEV-NOTE: only the refusals that pace an adopted suite by their
+// record — anchor_absent (PE-2) and unsigned_disabled (PE-12), i.e.
+// recordPacesAdopted — are left out of the stale WARN (design note 33 as
+// narrowed by the final fix wave, FW-3 (b), and its re-review): such a
+// suite is checked only at its record's retries (up to 75 min apart), so
+// its last success ages with no failed check
+// (TestTick_StaleWarnLeavesOutAnUnsignedDisabledSuitePacedByItsRecord).
+// Every other refusal bumps last_success_at at each answered check, so a
+// refused suite that is stale has failing checks — a real freeze. Leaving
+// out every refusal reason (Task 7) hid it, a regression from phase D
 // (TestTick_StaleWarnCountsARefusedSuiteWhoseChecksFail).
 func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore, now int64) (adopted, unadopted, absent int) {
 	futureAfter := now + int64(clockStepTolerance/time.Second)
@@ -56,7 +63,7 @@ func staleSuiteCounts(suites []cache.SuiteFreshness, staleBefore, now int64) (ad
 		switch {
 		case s.CurrentSnapshotID == nil:
 			unadopted++
-		case s.AdoptionFailCount > 0 && s.AdoptionFailReason != nil && *s.AdoptionFailReason == cache.ReasonAnchorAbsent:
+		case s.AdoptionFailCount > 0 && s.AdoptionFailReason != nil && recordPacesAdopted(*s.AdoptionFailReason):
 			adopted++
 			absent++
 		default:
@@ -655,12 +662,12 @@ func (c *Checker) tick(ctx context.Context, q *schedQueues) {
 	adoptedStale, unadoptedStale, absentStale := staleSuiteCounts(suites, staleBefore, nowT.Unix())
 	freshnessStaleSuites.Set(float64(adoptedStale), "true")
 	freshnessStaleSuites.Set(float64(unadoptedStale), "false")
-	// Design review M-13: a suite in anchor_absent keeps its
-	// last_success_at old on purpose and is visible on its own — the status
-	// page, adoption_refused and, after a day, adoption_refused_persistently
-	// — so the WARN leaves it out; the gauge counts it. Any other refusal
-	// stale here has failing checks, and the WARN counts it (final fix wave
-	// FW-3 (b)). Without an adopter records are inert and count as stale.
+	// Design review M-13: a suite paced by its record (anchor_absent,
+	// unsigned_disabled) lets its last_success_at age between retries on
+	// purpose and is visible on its own — the status page, adoption_refused
+	// and, after a day, adoption_refused_persistently — so the WARN leaves
+	// it out; the gauge counts it. Any other refusal stale here has failing
+	// checks, and the WARN counts it (final fix wave FW-3 (b)). Without an adopter records are inert and count as stale.
 	if c.adopter == nil {
 		absentStale = 0
 	}

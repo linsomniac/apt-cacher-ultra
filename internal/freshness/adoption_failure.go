@@ -139,12 +139,14 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 // Restarting the count too kept a candidate whose bytes change at every
 // observation (a Release generated per request, disagreeing backends) at
 // a 2-minute retry forever: PE-3's pacing never held and it cost about
-// 1,150 requests a day with no client (720 trees with clients), never
-// escalating (final reviews I3, E9). Stable bytes still confirm at the
-// first probe at least the gap after their first observation: the
-// record's retry time, or the scheduler's refresh check (PE-3) when that
-// comes first, so a grown count delays a confirmation by at most one
-// periodic_refresh.
+// 1,150 requests a day with no client (720 trees with clients) (final
+// reviews I3, E9). Stable bytes confirm at the record's retry time: before
+// it, checkFirst's C7 gate defers the record's own content, so a count
+// grown by churn delays confirmation by up to one retry window (60 min ±
+// 25 %, at most 75 min). A churning candidate still never escalates:
+// first_at restarts with its bytes, so neither adoption_refused_persistently
+// nor the admin page's "refused 24h+" fires for it; it stays visible as a
+// growing count and lag.
 func restartsStreak(cur *cache.SuiteFreshness, key, reason string) bool {
 	if reason != cache.ReasonUnsignedUnconfirmed && reason != cache.ReasonAnchorAbsent {
 		return false

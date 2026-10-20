@@ -352,7 +352,7 @@ next to the Suites table contract in §5.3:
 | `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, which also records `anchor_absent`; a signature the check found but could not record as seen). An unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled`, not a failed check. Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. |
 | `adoption_fail_reason` | string or `null` | The current failure or refusal reason; `null` when no record exists. |
 | `adoption_fail_count` | int64 | Consecutive adoption attempts in the current failure/refusal streak; `0` when no record exists. |
-| `adoption_fail_first_unixtime` | int64 or `null` | When the current streak started. |
+| `adoption_fail_first_unixtime` | int64 or `null` | When the current streak started; for `unsigned_unconfirmed` and `anchor_absent`, when the current bytes (or absence) were first observed — it restarts on new content while `adoption_fail_count` keeps growing. |
 | `adoption_next_retry_unixtime` | int64 or `null` | When the same content is retried next; new content is tried at once regardless of this stamp. |
 | `adoption_refused` | boolean | `true` when the record above is a refusal state (`upstream_older`, `rollback_refused`, `unsigned_downgrade_refused`, `unsigned_unconfirmed`, `unsigned_too_large`, `anchor_absent`, `unsigned_disabled`), not a failure. |
 
@@ -398,7 +398,8 @@ false` and a record exists) as FAILING; a refusal is a state, not a
 failure (spec C7), and is excluded — matching the ADOPTIONS vital's ratio
 (§9.1).
 
-**Old refusals (`REFUSED 24H+`).** A refusal whose streak began more than
+**Old refusals (`REFUSED 24H+`).** A refusal whose streak began (for
+`unsigned_unconfirmed`, whose current bytes were first observed) more than
 24 h ago (`adoption_fail_first_unixtime`; a stamp in the future counts as
 now, so its age is 0) is still a state, not a failure, but it may be a
 silent freeze — a vendor that stops emitting `Date` is refused

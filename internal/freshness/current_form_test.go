@@ -1023,6 +1023,43 @@ func TestTick_StaleWarnCountsARefusedSuiteWhoseChecksFail(t *testing.T) {
 	}
 }
 
+// An established unsigned suite refused as unsigned_disabled (ruling PE-12)
+// is paced by its record, up to 60 min ± 25 %, so its last success can age
+// past the 60-min stale threshold with no failed check; like anchor_absent
+// it is a deliberate, visible state, and the freeze WARN leaves it out
+// (final re-review of the fix wave, Minor 1).
+func TestTick_StaleWarnLeavesOutAnUnsignedDisabledSuitePacedByItsRecord(t *testing.T) {
+	r := newRetryRig(t, time.Minute)
+	r.adoptUnsigned("u1")
+	r.adopter.adoptUnsigned = false
+	r.unsignedRelease("u2", nil)
+	r.clock.advance(61 * time.Second)
+	r.check()
+	for i := 0; i < 12; i++ {
+		row := r.row()
+		if strOf(row.AdoptionFailReason) != cache.ReasonUnsignedDisabled || row.CheckFailCount != 0 {
+			t.Fatalf("setup: record %q check_fail_count %d", strOf(row.AdoptionFailReason), row.CheckFailCount)
+		}
+		if row.AdoptionFailCount >= 6 {
+			break
+		}
+		next := time.Unix(i64Of(row.AdoptionNextRetryAt), 0)
+		r.clock.advance(next.Sub(r.clock.now()) + time.Second)
+		if row.AdoptionFailCount == 5 {
+			r.checker.rand = func() float64 { return 0.99 } // the last retry draws a long jitter
+		}
+		r.check()
+	}
+	r.clock.advance(70 * time.Minute) // past the 60-min stale threshold, before the record's retry
+	if r.checker.suiteDue(r.row(), r.clock.now()) {
+		t.Fatal("setup: the suite is due already")
+	}
+	r.checker.tick(context.Background(), newSchedQueues())
+	if warns := r.events("freshness: adopted suites stale beyond threshold"); len(warns) != 0 {
+		t.Fatalf("an unsigned_disabled suite paced by its record (no failed check) tripped the freeze WARN: %v", warns)
+	}
+}
+
 func TestTick_StaleWarnLeavesOutRefusalStates(t *testing.T) {
 	for _, absent := range []bool{true, false} {
 		r := newRetryRig(t, 0)

@@ -497,7 +497,8 @@ seen signed — for a suite not yet adopted only after two consistent
 observations, but for an unsigned suite already adopted at the first check
 that sees it, since updates of an unsigned suite are adopted at once
 (safeguard 2); apt clients that verify signatures reject it, and
-`[trusted=yes]` clients accept it as they would when fetching directly. A suite whose pre-upgrade snapshot was
+`[trusted=yes]` clients accept it as they would when fetching directly.
+A suite whose pre-upgrade snapshot was
 quarantined because its stored `InRelease` was missing, corrupt or
 oversized (see *Upgrading an existing cache*) may have no record that it
 was signed until a check sees its signature upstream; if its signatures
