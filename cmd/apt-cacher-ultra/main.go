@@ -486,7 +486,7 @@ func serveListeners(
 
 	// Rulings PD-8, PD-12: a suite table above the global cap, or with a
 	// host at its per-host cap, refuses new suites until cap eviction or
-	// phase F's reaper makes room; say so. At exactly the global cap a new
+	// the suite reaper makes room; say so. At exactly the global cap a new
 	// suite evicts an idle one, so a full table logs nothing.
 	warnSuiteCaps(ctx, c, cfg.Freshness.MaxSuites, logger)
 
@@ -582,6 +582,12 @@ func serveListeners(
 	if err != nil {
 		return fmt.Errorf("build freshness checker: %w", err)
 	}
+	// Spec C9: the suite reaper runs beside the checker, under its
+	// lifetime, whatever gc.enabled says, and serves POST /forget.
+	reaper, err := freshness.NewReaper(reaperConfig(cfg, c, freshChecker, logger))
+	if err != nil {
+		return fmt.Errorf("build suite reaper: %w", err)
+	}
 
 	h, err := handler.New(handlerConfig(cfg, parser, c, fetchClient, hostLimiter, logger, freshChecker, adopter))
 	if err != nil {
@@ -612,6 +618,11 @@ func serveListeners(
 	go func() {
 		defer freshWG.Done()
 		freshChecker.Run(freshCtx)
+	}()
+	freshWG.Add(1)
+	go func() {
+		defer freshWG.Done()
+		reaper.Run(freshCtx)
 	}()
 
 	// SPEC2 §6.5 at-rest integrity scanner. Shares the freshCtx so the
@@ -704,6 +715,7 @@ func serveListeners(
 			AdoptionAcceptAnySigner: cfg.Adoption.AcceptAnySigner,
 			Keyring:                 &keyringProvider{k: keyring},
 			Reconciler:              freshChecker,
+			Forgetter:               reaper,
 		})
 		if err != nil {
 			return fmt.Errorf("build admin: %w", err)
@@ -1056,8 +1068,8 @@ func buildAdopter(
 // least a tenth of it (ruling PD-12, narrowing PD-8). Above the global cap
 // every creation attempt is refused but still evicts one suite idle for
 // 24 h, so the table converges; a host at its cap never evicts and waits
-// for phase F's reaper (gc.suite_idle_ttl, 30 days). A read error is logged
-// and otherwise ignored: the caps hold either way.
+// for the suite reaper (gc.suite_idle_ttl, 30 days by default; spec C9). A
+// read error is logged and otherwise ignored: the caps hold either way.
 //
 // AIDEV-NOTE: a table at exactly the global cap logs nothing. That is
 // normal operation for a full cache — a new suite evicts an idle one and
@@ -1088,6 +1100,13 @@ func warnSuiteCaps(ctx context.Context, c *cache.Cache, maxSuites int, logger *s
 		"fullest_host", u.FullestHost,
 		"fullest_host_suites", u.FullestHostRows,
 	)
+}
+
+// reaperConfig is the suite reaper's configuration (spec C9, C11:
+// gc.suite_idle_ttl). Factored out, like checkerConfig, for the wiring
+// tests.
+func reaperConfig(cfg *config.Config, c *cache.Cache, checker *freshness.Checker, logger *slog.Logger) freshness.ReaperConfig {
+	return freshness.ReaperConfig{Cache: c, Checker: checker, IdleTTL: cfg.GC.SuiteIdleTTL.Duration, Logger: logger}
 }
 
 // checkerConfig is the freshness checker's configuration (spec C4, C11:

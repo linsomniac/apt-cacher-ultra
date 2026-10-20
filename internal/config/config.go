@@ -161,7 +161,7 @@ type AdoptionConfig struct {
 	// relax verification: only a decodable clearsigned InRelease is
 	// adopted as inline metadata in every mode (a plain-text body or an
 	// undecodable envelope still fails closed). Unsigned repositories
-	// are handled by the unsigned form, added in a later release.
+	// are handled by the unsigned form (adopt_unsigned, spec C5).
 	RequireSignature bool `toml:"require_signature"`
 
 	// RequirePinnedSigner causes adoption to fail closed when a suite
@@ -249,8 +249,8 @@ type AdoptionConfig struct {
 	// here.
 	// require_signature = false only allows starting with an empty
 	// keyring; it does not admit plain-text or undecodable envelopes,
-	// and does not make unsigned upstreams adoptable (a later release
-	// adds the unsigned form).
+	// and does not make unsigned upstreams adoptable (adopt_unsigned
+	// governs the unsigned form, spec C5).
 	//
 	// One adoption_unverified_signer INFO line is emitted per
 	// (canonical_host, suite_path) per process the first time a suite
@@ -459,6 +459,15 @@ type GCConfig struct {
 	// Values >0 must be >= 1m to avoid thrashing under request
 	// bursts; rejected at load below that bound.
 	URLPathTTL Duration `toml:"url_path_ttl"`
+
+	// SuiteIdleTTL is gc.suite_idle_ttl (spec C9, C11): the suite reaper
+	// deletes a suite no client asked for in this long — its metadata
+	// url_path rows and its row, its snapshots retired for snapshot GC —
+	// so a returning client's suite re-adopts as new. Default 720h (30
+	// days); 0s disables suite reaping (the reaper's other duties still
+	// run); otherwise at least 24h. Checked whatever gc.enabled says: the
+	// reaper runs with the freshness checker, not with GC.
+	SuiteIdleTTL Duration `toml:"suite_idle_ttl"`
 }
 
 // AdminConfig holds the SPEC5 §5.1 [admin] block. Drives the Phase 5
@@ -787,6 +796,9 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("gc", "url_path_ttl") {
 		cfg.GC.URLPathTTL.Duration = 168 * time.Hour
 	}
+	if !md.IsDefined("gc", "suite_idle_ttl") {
+		cfg.GC.SuiteIdleTTL.Duration = 720 * time.Hour
+	}
 	// SPEC5 §5.2 presence-sensitive defaults for [admin]. Non-bool
 	// ints/durations need IsDefined-gated defaults so an operator's
 	// explicit value (or explicit zero — though zero is invalid for
@@ -876,7 +888,8 @@ func defaultConfig() *Config {
 			// self-heals instead of persisting for the snapshot's
 			// lifetime). Opt out with `repair_skipped_members = false`.
 			RepairSkippedMembers: true,
-			// Spec C5 D6: unsigned adoption on by default, safeguarded.
+			// Spec C5 safeguard 1, C11: unsigned adoption on by default,
+			// safeguarded (deferred minor E-72).
 			AdoptUnsigned: true,
 		},
 		GC: GCConfig{
@@ -1157,6 +1170,12 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf(
 			"gc.url_path_ttl (%s) must be 0s (disabled) or >= 1m to avoid thrashing under request bursts",
 			c.GC.URLPathTTL.Duration))
+	}
+	if c.GC.SuiteIdleTTL.Duration < 0 {
+		errs = append(errs, errors.New("gc.suite_idle_ttl must not be negative (0s disables suite reaping)"))
+	} else if c.GC.SuiteIdleTTL.Duration > 0 && c.GC.SuiteIdleTTL.Duration < 24*time.Hour {
+		errs = append(errs, fmt.Errorf(
+			"gc.suite_idle_ttl (%s) must be 0s (disabled) or >= 24h", c.GC.SuiteIdleTTL.Duration))
 	}
 
 	// SPEC5 §5.2: [admin] block validation. Only when admin.enabled

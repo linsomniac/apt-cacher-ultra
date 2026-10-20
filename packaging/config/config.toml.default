@@ -161,10 +161,17 @@ heartbeat_interval  = "60s"
 # 0s disables URL-row expiration; otherwise >= 1m. Referenced version-less
 # artifacts stay protected. Blob reclamation follows after blob_grace.
 url_path_ttl        = "168h"
-# GC numeric constraints still apply when enabled=false.
+# A suite no client asked for in this long is reaped: its metadata rows and
+# its row; its snapshots go with the next GC runs. Its next request makes it
+# new again, from upstream. 0s disables suite reaping (an offline or archive
+# cache); otherwise >= 24h.
+suite_idle_ttl      = "720h"
+# GC numeric constraints still apply when enabled=false; suite reaping runs
+# with the freshness checker whatever enabled says.
 
 [admin]
-# HTTP status page, /metrics, /healthz, and mutating POST /reconcile.
+# HTTP status page, /metrics, /healthz, and mutating POST /reconcile and
+# POST /forget (the latter needs the header X-ACU-Admin: 1).
 enabled           = true
 listen            = "127.0.0.1:6789" # host:port; protect access if widened
 # Optional bcrypt-only Apache htpasswd file ($2a$/$2b$/$2y$). Empty = no auth.
