@@ -311,10 +311,11 @@ func TestReaper_AJunkScanStopsAtShutdown(t *testing.T) {
 	}
 }
 
-// Ruling PF-4 (design review I-4): a junk suite fails its clients'
-// updates, so it is not held back by an idle backlog: with 30 idle suites
-// waiting — more than a run reaps — the junk suite, asked for just now,
-// goes in the first run.
+// Rulings PF-4 (design review I-4) and PF-14: a junk suite fails its
+// clients' updates, so it is not held back by an idle backlog: with 30
+// idle suites waiting — more than a run reaps — the junk suite, asked for
+// just now, goes in the first run, and takes none of the idle suites'
+// budget: the run reaps it and reapsPerRun idle suites.
 func TestReaper_JunkIsNotStarvedByAnIdleBacklog(t *testing.T) {
 	r := newReaperRig(t)
 	for i := range 30 {
@@ -326,8 +327,12 @@ func TestReaper_JunkIsNotStarvedByAnIdleBacklog(t *testing.T) {
 	if r.exists("/r/dists/junk") {
 		t.Fatal("the junk suite waited behind the idle backlog")
 	}
-	if n := len(r.events("suite_reaped")); n != reapsPerRun {
-		t.Fatalf("%d reaped, want %d", n, reapsPerRun)
+	reasons := map[any]int{}
+	for _, ev := range r.events("suite_reaped") {
+		reasons[ev["reason"]]++
+	}
+	if reasons["junk"] != 1 || reasons["idle"] != reapsPerRun || len(reasons) != 2 {
+		t.Fatalf("reaped by reason %v; want the junk suite and %d idle ones", reasons, reapsPerRun)
 	}
 }
 

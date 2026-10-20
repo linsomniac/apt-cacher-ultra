@@ -29,9 +29,14 @@ const (
 	// first, so a long stop never reaps an active suite. A forward step of
 	// the wall clock defers reaping by as long (deferredByForwardStep).
 	reapUptimeFloor = time.Hour
-	// reapsPerRun bounds the suites one run tries to reap (a busy one
+	// reapsPerRun bounds the idle suites one run tries to reap (a busy one
 	// counts; it is retried next run).
 	reapsPerRun = 25
+	// regardlessReapsPerRun bounds, apart from reapsPerRun, the suites one
+	// run tries to reap regardless of idleness — non-canonical and legacy
+	// junk rows — tried before the idle ones (ruling PF-14; a busy one
+	// counts against this budget, and is retried next run).
+	regardlessReapsPerRun = 250
 	// forwardStepSlack is how far the wall clock may run ahead of the
 	// monotonic clock between two runs before the reaper takes it for a
 	// forward step (design review M-8).
@@ -188,9 +193,10 @@ type reapCandidate struct {
 }
 
 // runOnce is one reaper run (spec C9): unless a forward step of the wall
-// clock defers it, reap at most reapsPerRun of the candidates — idle,
-// non-canonical and legacy junk (junkCandidates, every run: ruling PF-4)
-// — those reaped regardless of idleness first, then the oldest, and,
+// clock defers it, reap the candidates runBudgets allows — at most
+// regardlessReapsPerRun non-canonical and legacy junk rows
+// (junkCandidates, every run: ruling PF-4) first, then at most
+// reapsPerRun idle suites, the oldest first (ruling PF-14) — and,
 // when a day has passed since it last ran (or since Run started), sweep
 // the orphan signed-seen markers (sweepMarkers); then sweep the reconcile
 // memo against the current snapshots.
@@ -220,7 +226,7 @@ func (r *Reaper) runOnce(ctx context.Context) {
 		cands := r.candidates(rows, now)
 		cands = append(cands, r.junkCandidates(ctx, rows, cands, now)...)
 		sortCandidates(cands)
-		for _, c := range cands[:min(len(cands), reapsPerRun)] {
+		for _, c := range runBudgets(cands) {
 			if ctx.Err() != nil {
 				return
 			}
@@ -373,12 +379,18 @@ func (r *Reaper) candidates(rows []cache.SuiteWithAdoption, now time.Time) []rea
 // oldest last_requested_at (no stamp first), then by key, so a run's
 // order is fixed.
 //
-// AIDEV-NOTE: ruling PF-4 (design review I-4). A junk suite's clients
-// touch it at every update, so by its stamp it would sort after every idle
-// suite and wait for an idle backlog to drain below reapsPerRun — days
-// after an upgrade — while it fails those clients' updates. The classes
-// reaped regardless are legacy rows, few and finite, so they cannot starve
-// idle reaping.
+// AIDEV-NOTE: rulings PF-4 (design review I-4) and PF-14 (final review
+// concurrency m2). A junk suite's clients touch it at every update, so by
+// its stamp it would sort after every idle suite and wait for an idle
+// backlog to drain — days after an upgrade — while it fails those
+// clients' updates; so the classes reaped regardless go first. PF-4
+// assumed them few; the upgraded table the docs describe (more than 5,000
+// suites from an upstream that answers missing InRelease files with an
+// HTML page) is that class, which one shared budget of 25 would drain in
+// some 200 runs with no idle reaping meanwhile. So each class has its own
+// budget (runBudgets): regardlessReapsPerRun of these, cheap reaps (no
+// snapshot; a junk suite has at most three anchor rows, a non-canonical
+// row deletes no metadata), and reapsPerRun idle suites in the same run.
 func sortCandidates(cands []reapCandidate) {
 	stamp := func(c reapCandidate) int64 {
 		if c.requested == nil {
@@ -409,6 +421,22 @@ func sortCandidates(cands []reapCandidate) {
 		}
 		return 0
 	})
+}
+
+// runBudgets returns the candidates one run tries, from cands in
+// sortCandidates' order (those reaped regardless of idleness first): at
+// most regardlessReapsPerRun of those, then at most reapsPerRun idle ones
+// (ruling PF-14). A try counts whether the candidate is reaped, kept or
+// busy.
+func runBudgets(cands []reapCandidate) []reapCandidate {
+	n := 0
+	for n < len(cands) && cands[n].cutoff == cache.ReapRegardless {
+		n++
+	}
+	regardless, idle := cands[:n], cands[n:]
+	out := make([]reapCandidate, 0, min(len(regardless), regardlessReapsPerRun)+min(len(idle), reapsPerRun))
+	out = append(out, regardless[:min(len(regardless), regardlessReapsPerRun)]...)
+	return append(out, idle[:min(len(idle), reapsPerRun)]...)
 }
 
 // reapSuite runs spec C9's steps for one candidate under the suite's

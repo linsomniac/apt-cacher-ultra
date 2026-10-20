@@ -371,6 +371,73 @@ func TestReaper_AtMost25PerRunOldestFirst(t *testing.T) {
 	}
 }
 
+// Ruling PF-14 (final review concurrency m2): the candidates reaped
+// regardless of idleness and the idle ones have budgets of their own. With
+// 251 non-canonical rows (legacy rows whose clients still ask for them)
+// and 26 idle suites, one run tries exactly regardlessReapsPerRun (250) of
+// the first, in key order, and reapsPerRun (25) of the second, the
+// oldest; the next run takes the one left of each. A busy candidate
+// counts against its own class's budget: with the first non-canonical row
+// held, the run tries 249 others of its class, and still 25 idle ones.
+func TestReaper_EachClassHasItsOwnBudget(t *testing.T) {
+	for _, busy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("busy %v", busy), func(t *testing.T) {
+			r := newReaperRig(t)
+			ctx := context.Background()
+			row := func(suite string, requested int64) {
+				t.Helper()
+				if err := r.cache.EnsureSuiteForTest(ctx, "http", "h", suite); err != nil {
+					t.Fatal(err)
+				}
+				if err := r.cache.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h",
+					SuitePath: suite, LastRequestedAt: &requested}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			legacy := func(i int) string { return fmt.Sprintf("/legacy//dists/x%03d", i) }
+			idle := func(i int) string { return fmt.Sprintf("/r/dists/s%02d", i) }
+			for i := range 251 {
+				row(legacy(i), reapNow)
+			}
+			for i := range 26 {
+				row(idle(i), reapNow-31*reapDay-int64(26-i)) // s00 oldest
+			}
+			if busy {
+				release, ok := r.checker.HoldSuite(reapKey(legacy(0)))
+				if !ok {
+					t.Fatal("premise: the first legacy row is free")
+				}
+				defer release(false)
+			}
+			r.reaper.runOnce(ctx)
+			reasons := map[any]int{}
+			for _, ev := range r.events("suite_reaped") {
+				reasons[ev["reason"]]++
+			}
+			wantRegardless := 250 // the literals pin the constants (a mutant of one must fail)
+			if busy {
+				wantRegardless-- // the held row was tried: its class's budget paid for it
+			}
+			if reasons["non_canonical"] != wantRegardless || reasons["idle"] != 25 {
+				t.Fatalf("one run reaped %v; want %d non_canonical and 25 idle", reasons, wantRegardless)
+			}
+			if !r.exists(legacy(250)) || !r.exists(idle(25)) {
+				t.Fatalf("the last of each class reaped by the first run (legacy %v, idle %v); want it left for the next",
+					!r.exists(legacy(250)), !r.exists(idle(25)))
+			}
+			if busy != r.exists(legacy(0)) {
+				t.Fatalf("the held legacy row exists %v; want it kept only while held", r.exists(legacy(0)))
+			}
+			if !busy {
+				r.reaper.runOnce(ctx)
+				if r.exists(legacy(250)) || r.exists(idle(25)) {
+					t.Fatal("the next run left the last of a class")
+				}
+			}
+		})
+	}
+}
+
 // Spec C9: a suite whose mutex is held (a check, an adoption) is skipped
 // and reaped by the next run once free; a suite asked for, or adopted,
 // between the listing and the hold keeps its metadata rows.
