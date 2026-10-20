@@ -163,6 +163,35 @@ func TestDeleteSuiteMetadata_DeletesOnlyTheSuitesRows(t *testing.T) {
 	}
 }
 
+// Design note 7 (the Task 3 review's Important 1): a key no suite path
+// matches — the empty path, a non-canonical one, a /. twin before phase G
+// — has no metadata rows. DeleteSuiteMetadata deletes nothing for it and
+// leaves the host's pool .deb, its flat-repo file, a canonical suite's
+// anchor and a row under the key's own prefix in place (a non-canonical
+// row's cached files are url_path GC's: metadata_rows 0). Before the fix
+// the empty path's range spanned the host and deleted the .deb and the
+// flat-repo file, whose suite path is "" too.
+func TestDeleteSuiteMetadata_ANonCanonicalKeyDeletesNothing(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	blob := seedBlob(t, c, "cached bytes")
+	paths := []string{"/debian/pool/main/f/foo/foo_1_amd64.deb", "/flat/Packages", "/debian/dists/x/InRelease",
+		"/a/dists/b/c/InRelease", "/flat/./Packages"}
+	for _, p := range paths {
+		putURLPathRow(t, c, "http", "h", p, blob, sql.NullInt64{Int64: 1, Valid: true}, false)
+	}
+	for _, suite := range []string{"", "/a/dists/b/c", "/flat/."} {
+		if n, err := c.DeleteSuiteMetadata(ctx, sk("h", suite)); err != nil || n != 0 {
+			t.Errorf("DeleteSuiteMetadata(%q) = %d, %v; want nothing deleted", suite, n, err)
+		}
+	}
+	for _, p := range paths {
+		if !urlRowExists(t, c, "http", "h", p) {
+			t.Errorf("%s was deleted, want it kept", p)
+		}
+	}
+}
+
 // Spec C9 step 1: the rows go in writer transactions of at most 1,000,
 // plain metadata first and the anchors last. A failure in the second batch
 // leaves the first batch deleted and the anchors in place; the next call
@@ -224,9 +253,16 @@ func TestDeleteSuiteMetadata_NeverRepeatsADecrement(t *testing.T) {
 	key := sk("h", "/r/dists/x")
 	seedRow(t, c, key, evictNow-40*evictDay)
 	cur, hashes := adoptWith(t, c, key, map[string]string{"InRelease": "anchor", "main/Packages": "pkgs", "main/Sources": "srcs"})
-	// main/Packages is also cached in url_path (a client's miss); main/Sources only in the snapshot.
+	// main/Packages is also cached in url_path (a client's miss), with the
+	// pin its row holds; main/Sources only in the snapshot.
 	putURLPathRow(t, c, "http", "h", "/r/dists/x/main/Packages", hashes["main/Packages"], sql.NullInt64{}, true)
 	pkgs, srcs := hashes["main/Packages"], hashes["main/Sources"]
+	if _, err := c.db.Exec(`UPDATE blob SET refcount = refcount + 1 WHERE hash = ?`, pkgs); err != nil {
+		t.Fatal(err)
+	}
+	if p, s := blobRefcount(t, c, pkgs), blobRefcount(t, c, srcs); p != 2 || s != 1 {
+		t.Fatalf("premise: Packages %d, Sources %d; want 2 (the snapshot's pin and its url_path row's) and 1", p, s)
+	}
 	cutoff := evictNow - 30*evictDay
 	if _, err := c.DeleteSuiteMetadata(ctx, key); err != nil {
 		t.Fatal(err)
@@ -234,8 +270,8 @@ func TestDeleteSuiteMetadata_NeverRepeatsADecrement(t *testing.T) {
 	if del, _, err := c.ReapIdleSuite(ctx, key, &cur, evictNow-41*evictDay); err != nil || del {
 		t.Fatalf("a final step that finds the suite requested again: deleted %v, err %v; want kept", del, err)
 	}
-	if p, s := blobRefcount(t, c, pkgs), blobRefcount(t, c, srcs); p != 0 || s != 1 {
-		t.Fatalf("after a kept reap: Packages %d, Sources %d; want 0 (its url_path row's pin released) and 1 (untouched)", p, s)
+	if p, s := blobRefcount(t, c, pkgs), blobRefcount(t, c, srcs); p != 1 || s != 1 {
+		t.Fatalf("after a kept reap: Packages %d, Sources %d; want 1 (its url_path row's pin released) and 1 (untouched)", p, s)
 	}
 	if n, err := c.DeleteSuiteMetadata(ctx, key); err != nil || n != 0 {
 		t.Fatalf("the next run's batches = %d, %v; want nothing deleted twice", n, err)
@@ -243,8 +279,8 @@ func TestDeleteSuiteMetadata_NeverRepeatsADecrement(t *testing.T) {
 	if del, _, err := c.ReapIdleSuite(ctx, key, &cur, cutoff); err != nil || !del {
 		t.Fatalf("the final step = %v, %v; want deleted", del, err)
 	}
-	if p, s := blobRefcount(t, c, pkgs), blobRefcount(t, c, srcs); p != -1 || s != 0 {
-		t.Fatalf("after the reap: Packages %d, Sources %d; want each pin released once (-1, 0)", p, s)
+	if p, s := blobRefcount(t, c, pkgs), blobRefcount(t, c, srcs); p != 0 || s != 0 {
+		t.Fatalf("after the reap: Packages %d, Sources %d; want each pin released once (0, 0)", p, s)
 	}
 }
 
@@ -257,20 +293,31 @@ func TestDeleteSuiteMetadata_NeverRepeatsADecrement(t *testing.T) {
 // same base does not keep them, and another host's anchor row stays.
 func TestForgetSuite_DeletesTheBaseMarkersOnlyWithoutAnotherSuite(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		other   *SuiteKey // another suite row, besides the forgotten /flat on http://h
-		markers int       // markers deleted
+		name      string
+		forgotten string    // the forgotten suite on http://h; "" is /flat
+		other     *SuiteKey // another suite row, besides the forgotten one
+		markers   int       // markers deleted
 	}{
 		{name: "no other suite", markers: 2},
 		{name: "the /. twin keeps them", other: &SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/flat/."}},
 		{name: "the other scheme's suite keeps them", other: &SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/flat"}},
 		{name: "the other scheme's twin keeps them", other: &SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/flat/."}},
 		{name: "another host's suite does not", other: &SuiteKey{CanonicalScheme: "http", CanonicalHost: "g", SuitePath: "/flat"}, markers: 2},
+		// The Task 3 review's minor 1: forgetting the twin while its base
+		// is tracked keeps the base's markers and anchors under both
+		// schemes (the keeper read is of the base, not the twin's path).
+		{name: "the base keeps a forgotten twin's", forgotten: "/flat/.",
+			other: &SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/flat"}},
+		{name: "the other scheme's base keeps a forgotten twin's", forgotten: "/flat/.",
+			other: &SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/flat"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := openCache(t)
 			ctx := context.Background()
 			key := sk("h", "/flat")
+			if tc.forgotten != "" {
+				key = sk("h", tc.forgotten)
+			}
 			seedRow(t, c, key, evictNow+evictDay) // requested in the future: forgotten anyway
 			if tc.other != nil {
 				seedRow(t, c, *tc.other, evictNow)
@@ -339,6 +386,30 @@ func TestForgetSuite_DeletesTheBaseMarkersOnlyWithoutAnotherSuite(t *testing.T) 
 		}
 		if _, ok, err := c.SignedSeen(ctx, "http", "h", "/flat"); err != nil || !ok {
 			t.Fatalf("the marker of a suite with no row was deleted (%v, %v)", ok, err)
+		}
+	})
+	// The Task 3 review's minor 2: a forget whose compare-and-delete keeps
+	// the row (adopted since the caller read it) is neither deleted nor
+	// gone — the caller releases its hold with release(false) — and
+	// deletes no marker.
+	t.Run("a suite adopted since the row read", func(t *testing.T) {
+		c := openCache(t)
+		ctx := context.Background()
+		key := sk("h", "/flat")
+		seedRow(t, c, key, evictNow)
+		adoptRow(t, c, key)
+		if err := c.MarkSignedSeenBatch(ctx, []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "h", Base: "/flat", SeenAt: 1}}); err != nil {
+			t.Fatal(err)
+		}
+		c.noteTouch(key)
+		if res, err := c.ForgetSuite(ctx, key, nil); err != nil || res.Deleted || res.Gone || res.MarkersDeleted != 0 {
+			t.Fatalf("ForgetSuite = %+v, %v; want the row kept: neither deleted nor gone, no marker deleted", res, err)
+		}
+		if !rowExists(t, c, key) || !isTouched(c, key) {
+			t.Fatal("the kept suite's row or touch entry was dropped")
+		}
+		if _, ok, err := c.SignedSeen(ctx, "http", "h", "/flat"); err != nil || !ok {
+			t.Fatalf("a kept suite's marker was deleted (%v, %v)", ok, err)
 		}
 	})
 }
@@ -527,17 +598,30 @@ func TestReapAndForget_AFailedSubmitWhoseDeleteCommittedIsGone(t *testing.T) {
 			}
 		})
 	}
-	t.Run("rolled back", func(t *testing.T) {
-		defer stubNow(t, evictNow)()
-		c := openCache(t)
-		key := sk("h", "/r/dists/x")
-		seedRow(t, c, key, evictNow-40*evictDay)
-		if _, err := c.db.Exec(`CREATE TRIGGER fail_delete BEFORE DELETE ON suite_freshness
+	for _, op := range []string{"reap", "forget"} {
+		t.Run("rolled back "+op, func(t *testing.T) {
+			defer stubNow(t, evictNow)()
+			c := openCache(t)
+			key := sk("h", "/r/dists/x")
+			seedRow(t, c, key, evictNow-40*evictDay)
+			c.noteTouch(key)
+			if _, err := c.db.Exec(`CREATE TRIGGER fail_delete BEFORE DELETE ON suite_freshness
 BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
-			t.Fatal(err)
-		}
-		if del, gone, err := c.ReapIdleSuite(context.Background(), key, nil, evictNow-30*evictDay); err == nil || del || gone {
-			t.Fatalf("ReapIdleSuite = %v, %v, %v; want an error, the suite neither deleted nor gone", del, gone, err)
-		}
-	})
+				t.Fatal(err)
+			}
+			var del, gone bool
+			var err error
+			if op == "reap" {
+				del, gone, err = c.ReapIdleSuite(context.Background(), key, nil, evictNow-30*evictDay)
+			} else {
+				var res ForgetResult
+				res, err = c.ForgetSuite(context.Background(), key, nil)
+				del, gone = res.Deleted, res.Gone
+			}
+			if err == nil || del || gone || !isTouched(c, key) {
+				t.Fatalf("%s = deleted %v, gone %v, err %v, touch entry %v; want an error, the suite neither deleted nor gone, "+
+					"its touch entry kept", op, del, gone, err, isTouched(c, key))
+			}
+		})
+	}
 }

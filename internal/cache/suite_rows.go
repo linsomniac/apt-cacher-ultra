@@ -187,9 +187,10 @@ func (c *Cache) CreateSuite(ctx context.Context, seed SuiteSeed, caps SuiteCaps,
 	res, err := attempt()
 	if err == nil && res.retry() {
 		// The held candidate's row was deleted between the candidate list
-		// and the writer (a concurrent creation evicted it), or kept (a
-		// client asked for it meanwhile): one more attempt, with a fresh
-		// list (design review M4; final review, concurrency M2).
+		// and the writer (a concurrent creation evicted it, or a reap or
+		// POST /forget deleted it before the hold), or kept (a client asked
+		// for it meanwhile): one more attempt, with a fresh list (design
+		// review M4; final review, concurrency M2).
 		res, err = attempt()
 	}
 	return res, err
@@ -281,8 +282,9 @@ func (c *Cache) creationAttempt(ctx context.Context, op string, create *SuiteSee
 // and touch entries come back with its next check and touch (deferred
 // minor D-12). Unless the result says so, it reads the row: after a failed
 // submit the outcome is unknown, and an unused candidate's row may have
-// been evicted by a concurrent creation before this one held it (the hold
-// then made a fresh lock-map entry for a suite without a row).
+// been deleted before this one held it — evicted by a concurrent creation,
+// or reaped or forgotten (the hold then made a fresh lock-map entry for a
+// suite without a row).
 //
 // AIDEV-NOTE: while this creation holds the candidate's mutex no other
 // deleter can remove its row (every deleter holds the guard). A failed

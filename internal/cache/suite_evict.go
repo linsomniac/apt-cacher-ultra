@@ -55,7 +55,9 @@ func (h *heldSuite) settle(deleted bool) {
 // at, above or within suiteEvictCandidates of the global cap (a read
 // outside the writer; createSuiteTx re-checks everything, and afterCreate
 // releases an unused candidate as not deleted — or as deleted when its row
-// is gone, a concurrent creation having evicted it; deferred minor D-12),
+// is gone, a concurrent creation having evicted it, or a reap or POST
+// /forget having deleted it, before this creation held it; deferred minor
+// D-12),
 // or nil: the least recently requested of at most suiteEvictCandidates
 // evictable suites whose mutex guard takes at once (a nil guard takes the
 // first, with a no-op release). busy reports that it found candidates but

@@ -63,9 +63,10 @@ func (c *Cache) StoreFetched(ctx context.Context, m FetchedRow, caps SuiteCaps, 
 	}
 	res, err := attempt()
 	if err == nil && res.Create.retry() {
-		// The held candidate was evicted by a concurrent creation first, or
-		// kept (a client asked for it meanwhile): one more attempt with a
-		// fresh list (the url_path upsert repeats harmlessly).
+		// The held candidate was deleted before the hold (evicted by a
+		// concurrent creation, or reaped or forgotten), or kept (a client
+		// asked for it meanwhile): one more attempt with a fresh list (the
+		// url_path upsert repeats harmlessly).
 		res, err = attempt()
 	}
 	return res, err

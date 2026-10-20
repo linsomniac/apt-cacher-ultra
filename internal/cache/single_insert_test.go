@@ -31,7 +31,7 @@ var deleteSuiteFreshnessRE = regexp.MustCompile("(?is)\\bDELETE\\s+FROM\\s+" +
 // deleteSignedSeenRE matches a statement that deletes from
 // suite_signed_seen, with the same quoting and schema forms.
 var deleteSignedSeenRE = regexp.MustCompile("(?is)\\bDELETE\\s+FROM\\s+" +
-	"(?:[\"`\\[]?\\w+[\"`\\]]?\\s*\\.\\s*)?[\"`\\[]?suite_signed_seen\\b")
+	"(?:[\"'`\\[]?\\w+[\"'`\\]]?\\s*\\.\\s*)?[\"'`\\[]?suite_signed_seen\\b")
 
 // productionGoFiles calls fn for every non-test .go file of the module
 // (internal/cache is two levels below its root).
@@ -254,9 +254,12 @@ func TestOnlyTheHandlerCreatesSuiteRows(t *testing.T) {
 
 // Ruling R-F1 across packages (design review M-5): outside internal/cache
 // only the suite reaper (internal/freshness/reaper.go) and POST /forget
-// (internal/freshness/forget.go) call the cache's suite deleters — each
+// (internal/freshness/forget.go) name the cache's suite deleters — each
 // holds the suite through the SuiteGuard first — so a new caller that
-// skips the guard fails here.
+// skips the guard fails here. Any selector naming a deleter counts, not
+// only a call: a method value (f := c.ForgetSuite) or a method expression
+// ((*cache.Cache).DeleteSuiteMetadata) handed elsewhere could be called
+// through a func value (the Task 3 review's minor 5).
 func TestSuiteDeletersHaveKnownCallers(t *testing.T) {
 	deleters := map[string]bool{"ReapIdleSuite": true, "ForgetSuite": true, "DeleteSuiteMetadata": true}
 	allowed := map[string]bool{"../../internal/freshness/reaper.go": true, "../../internal/freshness/forget.go": true}
@@ -270,10 +273,8 @@ func TestSuiteDeletersHaveKnownCallers(t *testing.T) {
 			t.Fatal(err)
 		}
 		ast.Inspect(f, func(n ast.Node) bool {
-			if call, ok := n.(*ast.CallExpr); ok {
-				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && deleters[sel.Sel.Name] {
-					t.Errorf("%s calls %s: only the reaper and POST /forget delete suites", fset.Position(call.Pos()), sel.Sel.Name)
-				}
+			if sel, ok := n.(*ast.SelectorExpr); ok && deleters[sel.Sel.Name] {
+				t.Errorf("%s names %s: only the reaper and POST /forget delete suites", fset.Position(sel.Pos()), sel.Sel.Name)
 			}
 			return true
 		})

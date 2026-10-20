@@ -275,6 +275,44 @@ func TestCreateSuite_EvictionLeavesTheOtherSchemesTwin(t *testing.T) {
 	}
 }
 
+// Ruling PF-10 (design review M-9 widened to every suite-row delete): a
+// cap eviction moves the evictee base's signed-seen markers, under both
+// schemes, up to the eviction — MAX(last_seen_at, now) — so a dormant
+// suite's year-old marker is not swept the day after its eviction made it
+// an orphan. A stamp ahead of now is never lowered (ruling PF-1), no
+// marker is created, and another host's or another base's marker is left
+// alone. The evictee is a /. twin: its base's markers are the ones moved.
+func TestCreateSuite_EvictionMovesTheBaseMarkersUp(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	evictee := sk("b", "/flat/.")
+	seedRow(t, c, evictee, evictNow-3*evictDay)
+	seedRow(t, c, sk("b", "/kept"), evictNow-3600) // requested within the day: not evictable
+	old, ahead := evictNow-400*evictDay, evictNow+evictDay
+	marks := []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "b", Base: "/flat", SeenAt: old},
+		{CanonicalScheme: "https", CanonicalHost: "b", Base: "/flat", SeenAt: ahead},
+		{CanonicalScheme: "http", CanonicalHost: "g", Base: "/flat", SeenAt: old},
+		{CanonicalScheme: "http", CanonicalHost: "b", Base: "/kept", SeenAt: old}}
+	if err := c.MarkSignedSeenBatch(ctx, marks); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 2}, newFakeGuard())
+	if err != nil || res.Evicted == nil || *res.Evicted != evictee {
+		t.Fatalf("CreateSuite = %+v, %v; want %v evicted", res, err, evictee)
+	}
+	for i, want := range []int64{evictNow, ahead, old, old} {
+		at, ok, err := c.SignedSeen(ctx, marks[i].CanonicalScheme, marks[i].CanonicalHost, marks[i].Base)
+		if err != nil || !ok || at != want {
+			t.Errorf("marker %+v after the eviction: %d (present %v, %v); want %d", marks[i], at, ok, err, want)
+		}
+	}
+	var n int
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM suite_signed_seen`).Scan(&n); err != nil || n != len(marks) {
+		t.Fatalf("%d markers after the eviction (%v); want %d: an eviction creates none", n, err, len(marks))
+	}
+}
+
 // Design review M3 (final review, tests I-1): a CreateSuite whose writer
 // operation fails — its context ends after the candidate is held, before
 // the writer runs it — still releases the held candidate, once, as not

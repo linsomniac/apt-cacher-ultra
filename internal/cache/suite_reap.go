@@ -48,7 +48,8 @@ const (
 // cutoff is ReapRegardless, which every row passes — and
 // current_snapshot_id equal to wantCurrent (nil: no current snapshot). It
 // releases the current snapshot's pins and retires every snapshot of the
-// suite (retireSuiteSnapshotsTx), and deletes the row.
+// suite (retireSuiteSnapshotsTx), deletes the row, and moves the base's
+// signed-seen markers up to now (stampBaseMarkersTx).
 //
 // AIDEV-NOTE: retiring the snapshots is load-bearing: CommitAdoption
 // refuses a retired candidate, and retired rows leave the natural-key,
@@ -59,7 +60,13 @@ const (
 // (TestCreateSuite_EvictionTouchesOnlyTheEvictee,
 // TestCreateSuite_EvictionLeavesTheOtherSchemesTwin). Keep it the single
 // DELETE FROM suite_freshness (TestSuiteFreshnessHasOneDeleteSite, ruling
-// R-F1; moved here from suite_rows.go, deferred minor D-14).
+// R-F1; moved here from suite_rows.go, deferred minor D-14). The marker
+// stamp is every delete's, not only a reap's (ruling PF-10, which widened
+// design review M-9): a cap eviction orphans its base's markers exactly as
+// a reap does, and a dormant suite's marker can be over a year old when it
+// is evicted, so the next daily sweep would delete the never-downgrade
+// protection of a base that was signed
+// (TestCreateSuite_EvictionMovesTheBaseMarkersUp).
 func deleteSuiteTx(ctx context.Context, tx *sql.Tx, key SuiteKey, wantCurrent *int64, cutoff, now int64) (deleteOutcome, error) {
 	var current, requested sql.NullInt64
 	err := tx.QueryRowContext(ctx, `
@@ -87,7 +94,31 @@ DELETE FROM suite_freshness
 		key.CanonicalScheme, key.CanonicalHost, key.SuitePath); err != nil {
 		return suiteKept, fmt.Errorf("delete suite %s%s: %w", key.CanonicalHost, key.SuitePath, err)
 	}
+	if err := stampBaseMarkersTx(ctx, tx, key, now); err != nil {
+		return suiteKept, fmt.Errorf("delete suite %s%s: %w", key.CanonicalHost, key.SuitePath, err)
+	}
 	return suiteDeleted, nil
+}
+
+// stampBaseMarkersTx moves the signed-seen markers of key's base
+// (aptpath.MarkerBase), under both schemes as never-downgrade reads them,
+// up to now: MAX(last_seen_at, now). deleteSuiteTx runs it in the
+// transaction that deletes the row.
+//
+// AIDEV-NOTE: design review M-9, widened to every delete by ruling PF-10:
+// the orphan sweep's year counts from the end of the suite's tracking —
+// after a long downtime, or a dormant suite's eviction, its marker would
+// otherwise be swept a day after it became an orphan. MAX never lowers a
+// stamp (ruling PF-1), and an UPDATE never creates a marker. ForgetSuite
+// may delete the markers afterwards, in the same transaction.
+func stampBaseMarkersTx(ctx context.Context, tx *sql.Tx, key SuiteKey, now int64) error {
+	if _, err := tx.ExecContext(ctx, `
+UPDATE suite_signed_seen SET last_seen_at = MAX(last_seen_at, ?)
+ WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND base = ?`,
+		now, key.CanonicalHost, aptpath.MarkerBase(key.SuitePath)); err != nil {
+		return fmt.Errorf("stamp markers: %w", err)
+	}
+	return nil
 }
 
 // retireSuiteSnapshotsTx is the reaper's retirement path (spec C9): it
@@ -122,8 +153,22 @@ UPDATE suite_snapshot SET retired_at = ?
 // exactly key's, never a /. twin's or a nested suite's (spec C9) — split
 // into plain metadata and the suite's anchors (InRelease, Release,
 // Release.gpg), each in path order. A read on the pool, outside the
-// writer.
+// writer. A key no suite path matches (aptpath.IsCanonicalSuitePath
+// rejects it, the empty path included) has none, and nothing is read.
+//
+// AIDEV-NOTE: the early return is load-bearing (Task 3 review Important
+// 1). For the empty suite path the range below spans every path of the
+// host, and every path outside a suite has aptpath.SuitePath "" too, so
+// the filter would hand every pool .deb and flat-repo file of the host to
+// DeleteSuiteMetadata — which the reaper's non_canonical class and POST
+// /forget both call. A non-canonical row's cached files are left to
+// url_path GC (design note 7: metadata_rows 0). Phase G extends the
+// grammar through aptpath.SuitePath, and IsCanonicalSuitePath follows it
+// (TestDeleteSuiteMetadata_ANonCanonicalKeyDeletesNothing).
 func (c *Cache) suiteMetadataPaths(ctx context.Context, key SuiteKey) (plain, anchors []string, err error) {
+	if !aptpath.IsCanonicalSuitePath(key.SuitePath) {
+		return nil, nil, nil
+	}
 	prefix := key.SuitePath + "/"
 	// The primary key's range [prefix, prefix with its '/' raised to '0').
 	rows, err := c.db.QueryContext(ctx, `
@@ -245,9 +290,10 @@ func (c *Cache) DeleteSuiteMetadata(ctx context.Context, key SuiteKey) (int, err
 // transaction running deleteSuiteTx's compare-and-delete with the current
 // snapshot the reaper listed (wantCurrent) and its cutoff — an idle
 // cutoff, or ReapRegardless for a non-canonical or junk row — which, when
-// it deletes the row, also moves the base's signed-seen markers up to now.
-// It reports deleted (this call deleted the row) and gone (the suite has
-// no row: deleted, none was found, or — after a failed submit — none is
+// it deletes the row, also moves the base's signed-seen markers up to now
+// (as every suite-row delete does: stampBaseMarkersTx, ruling PF-10). It
+// reports deleted (this call deleted the row) and gone (the suite has no
+// row: deleted, none was found, or — after a failed submit — none is
 // found by a fresh read). The caller releases its SuiteGuard hold with
 // release(gone), which drops the lock-map and flip-gate entries; a gone
 // suite's touch-coalescing entry is dropped here.
@@ -256,13 +302,12 @@ func (c *Cache) DeleteSuiteMetadata(ctx context.Context, key SuiteKey) (int, err
 // transaction committed (its context ended between the commit and the
 // hand-back), so a failed submit is settled by a fresh read of the row, as
 // afterCreate settles a creation; under the caller's hold no other deleter
-// runs, so a row found gone then was deleted by this call. Design review
-// M-9: the base's markers (aptpath.MarkerBase, under both schemes, as
-// never-downgrade reads them) are stamped MAX(last_seen_at, now), so the
-// orphan sweep's year counts from the end of the suite's tracking — after
-// a long downtime a reaped suite's marker would otherwise be swept a day
-// after it became an orphan. MAX never lowers a stamp (ruling PF-1), and
-// an UPDATE never creates a marker.
+// runs, so a row found gone then was deleted by this call. The settle is
+// not exact (as afterCreate's note records): a read error, or a read that
+// lands before a commit still in flight, answers "present" — the reaped
+// or forgotten suite's lock-map, flip-gate and touch entries then stay
+// (one each, bounded), and POST /forget answers an error for a forget
+// that committed (the Task 3 review's minor 4).
 func (c *Cache) ReapIdleSuite(ctx context.Context, key SuiteKey, wantCurrent *int64, cutoff int64) (deleted, gone bool, err error) {
 	var out deleteOutcome
 	err = c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
@@ -271,18 +316,9 @@ func (c *Cache) ReapIdleSuite(ctx context.Context, key SuiteKey, wantCurrent *in
 			return fmt.Errorf("ReapIdleSuite: begin: %w", err)
 		}
 		defer func() { _ = tx.Rollback() }()
-		now := nowUnix()
-		o, err := deleteSuiteTx(ctx, tx, key, wantCurrent, cutoff, now)
+		o, err := deleteSuiteTx(ctx, tx, key, wantCurrent, cutoff, nowUnix())
 		if err != nil {
 			return fmt.Errorf("ReapIdleSuite: %w", err)
-		}
-		if o == suiteDeleted {
-			if _, err := tx.ExecContext(ctx, `
-UPDATE suite_signed_seen SET last_seen_at = MAX(last_seen_at, ?)
- WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND base = ?`,
-				now, key.CanonicalHost, aptpath.MarkerBase(key.SuitePath)); err != nil {
-				return fmt.Errorf("ReapIdleSuite: stamp markers: %w", err)
-			}
 		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("ReapIdleSuite: commit: %w", err)
