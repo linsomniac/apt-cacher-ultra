@@ -2328,8 +2328,9 @@ func (a *Adopter) writeBlobBytes(ctx context.Context, content []byte) (string, e
 
 // shortHash truncates a hex digest to its first 12 characters for
 // compact display in the admin reason chip. The full digests stay in
-// the adoption_member_mismatch Warn log (declared_sha256 /
-// actual_sha256), so operators can still recover the complete values.
+// the adoption_member_mismatch Warn log (declared_sha256 / actual_sha256,
+// or declared_sha512 / actual_sha512 for a member checked by its
+// SHA-512), so operators can still recover the complete values.
 func shortHash(h string) string {
 	if len(h) <= 12 {
 		return h
@@ -2338,10 +2339,12 @@ func shortHash(h string) string {
 }
 
 // hashFile streams a file through sha256 and returns the lowercase hex
-// digest. Used by writeBlobBytes, and by adoptMember's "rehash on reuse"
-// defense for a member that declares no SHA-512 (one that does goes
-// through hashFileDigests) — content sitting in pool/ from a prior fetch
-// is re-verified before being trusted as a snapshot member.
+// digest. Used by writeBlobBytes, by rehashPooledBlob (the rehash on
+// reuse of a SHA-512-only member's pool file, once its fetched bytes
+// verified), and by adoptMember's "rehash on reuse" defense for a member
+// that declares no SHA-512 (one that does goes through hashFileDigests) —
+// content sitting in pool/ from a prior fetch is re-verified before being
+// trusted as a snapshot member.
 func hashFile(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
