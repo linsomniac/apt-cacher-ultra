@@ -1971,7 +1971,16 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 		// on-disk content was not verified against a declared hash at
 		// the time. Re-hashing bounds the verified set to bytes we
 		// have *just* confirmed.
-		actual, actual512, err := hashFileDigests(a.cache.BlobPath(m.SHA256))
+		// A SHA-512 is computed only for a member that declares one
+		// (deferred minor E-7): Debian's and Ubuntu's Releases declare
+		// SHA-256 alone.
+		var actual, actual512 string
+		var err error
+		if m.SHA512 == "" {
+			actual, err = hashFile(a.cache.BlobPath(m.SHA256))
+		} else {
+			actual, actual512, err = hashFileDigests(a.cache.BlobPath(m.SHA256))
+		}
 		if err != nil {
 			return "", fmt.Errorf("%w: rehash %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
 		}
@@ -1980,6 +1989,14 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 			// SHA-512 is fixed: the Release's two declarations disagree.
 			// A fetch would bring the same bytes; fail the member (spec
 			// C5: every declared hash must match), and keep the pool file.
+			// The WARN carries the full digests (deferred minor E-6).
+			a.logger.Warn("adoption_member_mismatch",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"path", m.Path,
+				"declared_sha512", m.SHA512,
+				"actual_sha512", actual512,
+			)
 			return "", newMemberErr(ErrAdoptionMemberMismatch, m.Path,
 				fmt.Sprintf("declared SHA512 %s, got %s", shortHash(m.SHA512), shortHash(actual512)))
 		}
@@ -2074,9 +2091,12 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 		CanonicalHost: suite.CanonicalHost,
 		URL:           buildMemberURL(suite, byHashRelPath),
 	}
+	// A local fault (the temp blob, the blob row) is ErrAdoptionDBFailed,
+	// as on the plain path, so the caller fails the member instead of
+	// downloading it again (deferred minor E-12).
 	w, err := newMemberWriter(a.cache)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: NewTempBlob %s: %v", ErrAdoptionDBFailed, byHashRelPath, err)
 	}
 	defer func() { _ = w.Abort() }() // no-op once a Finalize* wins
 	if _, err := a.fetcher.Fetch(ctx, target, w); err != nil {
@@ -2087,7 +2107,7 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 		return "", err
 	}
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: PutBlob %s: %v", ErrAdoptionDBFailed, hashHex, err)
 	}
 	return hashHex, nil
 }
@@ -2306,10 +2326,6 @@ func (a *Adopter) writeBlobBytes(ctx context.Context, content []byte) (string, e
 	return hashHex, nil
 }
 
-// hashFile streams a file through sha256 and returns the lowercase hex
-// digest. Used by writeBlobBytes and adoptMember for the "rehash on
-// reuse" defense — content sitting in pool/ from a prior fetch is
-// re-verified before being trusted as a snapshot member.
 // shortHash truncates a hex digest to its first 12 characters for
 // compact display in the admin reason chip. The full digests stay in
 // the adoption_member_mismatch Warn log (declared_sha256 /
@@ -2321,6 +2337,11 @@ func shortHash(h string) string {
 	return h[:12]
 }
 
+// hashFile streams a file through sha256 and returns the lowercase hex
+// digest. Used by writeBlobBytes, and by adoptMember's "rehash on reuse"
+// defense for a member that declares no SHA-512 (one that does goes
+// through hashFileDigests) — content sitting in pool/ from a prior fetch
+// is re-verified before being trusted as a snapshot member.
 func hashFile(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
