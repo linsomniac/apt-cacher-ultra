@@ -1,9 +1,11 @@
 package freshness
 
-// Spec C5 "Unsigned safeguards" (D6), the adopter's side: the unsigned
-// form adopts a Release no signature covers, so it never vouches a .deb,
-// never counts for strict mode, never writes a signed-seen marker, and is
-// refused whenever the suite has signed history.
+// Spec C5 "Unsigned safeguards" (D6), the adopter's side — and the
+// checker's refusals before a slot is taken (unsignedRefusal, here since
+// deferred minor E-33): the unsigned form adopts a Release no signature
+// covers, so it never vouches a .deb, never counts for strict mode, never
+// writes a signed-seen marker, and is refused whenever the suite has
+// signed history.
 
 import (
 	"context"
@@ -101,6 +103,48 @@ func unsignedTooLarge(release []byte) error {
 		return nil
 	}
 	return unsignedCap(len(members))
+}
+
+// unsignedRefusal applies spec C5's refusals to an unsigned request before
+// a slot is taken — the first adoption's (unsignedFirst) and an unsigned
+// suite's update (checkUnsigned, anchorFoundAgain): the knob
+// (adoption.adopt_unsigned off: unsigned_disabled, ruling PE-12),
+// never-downgrade (Adopter.unsignedEligible's signed history:
+// unsigned_downgrade_refused) and the member cap (unsignedTooLarge:
+// unsigned_too_large; design review M-5). It records the refusal and
+// returns its reason, "" to go on, or an error — a read error — for which
+// the caller fails the check.
+//
+// AIDEV-NOTE: ruling PE-12 (final fix wave FW-2). The knob off is a
+// refusal state, never a failed check: the record makes it visible
+// ("refused: unsigned_disabled") and paces the suite — a never-adopted one
+// by PE-3 (pacedFirst), an established unsigned one by pacedByRefusal and
+// suiteDue — so checks inside its window ask upstream nothing. The
+// established suite keeps serving its last snapshot, coherent and never
+// updated unsigned, until the knob is turned back on, the suite is
+// forgotten (POST /forget) or it is reaped as idle: ruling PF-5 dropped
+// the retirement PE-12 left to phase F — returned to the ordinary cache,
+// each index file would be frozen at its own first fetch, and every
+// upstream publish would bring Hash Sum mismatches that never clear
+// (TestServeHTTP_KnobOffKeepsServingTheUnsignedSnapshot). Before PE-12 the
+// knob off failed every check, with no record: an established suite froze
+// unpaced and invisible (final reviews E1, E2).
+func (c *Checker) unsignedRefusal(ctx context.Context, req *adoptionRequest) (string, error) {
+	switch err := c.adopter.unsignedEligible(ctx, req.suite); {
+	case errors.Is(err, errUnsignedDisabled):
+		c.recordAdoptionFailure(req, cache.ReasonUnsignedDisabled)
+		return cache.ReasonUnsignedDisabled, nil
+	case errors.Is(err, ErrAdoptionUnsignedDowngradeRefused):
+		c.recordAdoptionFailure(req, cache.ReasonUnsignedDowngradeRefused)
+		return cache.ReasonUnsignedDowngradeRefused, nil
+	case err != nil:
+		return "", err
+	}
+	if err := unsignedTooLarge(req.releaseBytes); err != nil {
+		c.recordAdoptionFailure(req, cache.ReasonUnsignedTooLarge)
+		return cache.ReasonUnsignedTooLarge, nil
+	}
+	return "", nil
 }
 
 // markSignatureSeen is the checker's signed-seen marker writer (spec C3,

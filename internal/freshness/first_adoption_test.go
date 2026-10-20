@@ -5,8 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -959,5 +962,55 @@ func TestCheckFirst_ConfirmedUnsignedContentIsNotReconfirmed(t *testing.T) {
 	if snap := r.currentSnapshot(); snap == nil || snap.Form != cache.FormUnsigned {
 		t.Fatalf("at the retry time: snapshot %+v, record %q; want the unsigned adoption at once",
 			snap, strOf(r.row().AdoptionFailReason))
+	}
+}
+
+// lookupFailCache fails LookupURL while fail is set.
+type lookupFailCache struct {
+	Cache
+	fail atomic.Bool
+}
+
+func (c *lookupFailCache) LookupURL(ctx context.Context, scheme, host, path string) (*cache.URLPath, error) {
+	if c.fail.Load() {
+		return nil, fmt.Errorf("injected url_path read failure (%s)", path)
+	}
+	return c.Cache.LookupURL(ctx, scheme, host, path)
+}
+
+// Deferred minor E-26 (phase E design note 35): a never-adopted suite whose
+// anchor rows cannot be read is logged at WARN and left alone — no
+// request, no write, no backoff (a local fault is no failed check) — and
+// the next check, the fault gone, adopts it.
+func TestCheckFirst_AnchorRowReadErrorWritesNothing(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.up.set(r.release("v1", 0))
+	fc := &lookupFailCache{Cache: r.cache}
+	fc.fail.Store(true)
+	var logs lockedBuffer
+	chk, err := New(Config{Cache: fc, Fetcher: r.up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+		Adopter: r.adopter, Logger: slog.New(slog.NewJSONHandler(&logs, nil)), now: r.clock.now, rand: func() float64 { return 0.5 }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	chk.Check(ctx, "http", rigHost, rigSuite)
+	chk.WaitForAdoptions()
+	warns := logRecords(t, &logs, "freshness: read anchor rows failed")
+	if len(warns) != 1 || warns[0]["level"] != "WARN" || warns[0]["suite_path"] != rigSuite ||
+		!strings.Contains(fmt.Sprint(warns[0]["err"]), "injected url_path read failure") {
+		t.Fatalf("WARN records %v, want one naming the suite and the read error", warns)
+	}
+	if n := len(r.up.etagsSent(rigAnchorURL)); n != 0 {
+		t.Fatalf("%d upstream requests, want none", n)
+	}
+	if row := r.row(); row.LastCheckAt != nil || row.CheckFailCount != 0 || row.AdoptionFailCount != 0 {
+		t.Fatalf("the read error wrote the row: %+v", row)
+	}
+	fc.fail.Store(false)
+	chk.Check(ctx, "http", rigHost, rigSuite)
+	chk.WaitForAdoptions()
+	if r.currentSnapshot() == nil {
+		t.Fatal("the next check, the fault gone, did not adopt")
 	}
 }

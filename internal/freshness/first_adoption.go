@@ -198,8 +198,10 @@ func (t probeTree) signatureSeen() bool {
 // request between the scheduler's refresh checks, except the scheduler's
 // slot-driven re-offer of the parked suite (offered: the check's
 // bypassCooldown, which the scheduler sets for a waiting item and for a
-// pending-change item; the latter has no record, so it is never paced
-// anyway). Otherwise the probe tree
+// pending-change item; the latter has no record when it is queued, so it
+// is not paced: at most one probe more, when a client check's failed
+// adoption recorded one between the enqueue and the dequeue; deferred
+// minor E-34). Otherwise the probe tree
 // runs without validators and the form found is adopted — result
 // first_adoption, or first_adoption_queued with no slot — through the spec
 // C7 gate (content keys only: the probes carry no validators) and, for the
@@ -312,48 +314,6 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 	}
 	c.finishCheck(ctx, out, cur, suite, e)
 	return req
-}
-
-// unsignedRefusal applies spec C5's refusals to an unsigned request before
-// a slot is taken — the first adoption's (unsignedFirst) and an unsigned
-// suite's update (checkUnsigned, anchorFoundAgain): the knob
-// (adoption.adopt_unsigned off: unsigned_disabled, ruling PE-12),
-// never-downgrade (Adopter.unsignedEligible's signed history:
-// unsigned_downgrade_refused) and the member cap (unsignedTooLarge:
-// unsigned_too_large; design review M-5). It records the refusal and
-// returns its reason, "" to go on, or an error — a read error — for which
-// the caller fails the check.
-//
-// AIDEV-NOTE: ruling PE-12 (final fix wave FW-2). The knob off is a
-// refusal state, never a failed check: the record makes it visible
-// ("refused: unsigned_disabled") and paces the suite — a never-adopted one
-// by PE-3 (pacedFirst), an established unsigned one by pacedByRefusal and
-// suiteDue — so checks inside its window ask upstream nothing. The
-// established suite keeps serving its last snapshot, coherent and never
-// updated unsigned, until the knob is turned back on, the suite is
-// forgotten (POST /forget) or it is reaped as idle: ruling PF-5 dropped
-// the retirement PE-12 left to phase F — returned to the ordinary cache,
-// each index file would be frozen at its own first fetch, and every
-// upstream publish would bring Hash Sum mismatches that never clear
-// (TestServeHTTP_KnobOffKeepsServingTheUnsignedSnapshot). Before PE-12 the
-// knob off failed every check, with no record: an established suite froze
-// unpaced and invisible (final reviews E1, E2).
-func (c *Checker) unsignedRefusal(ctx context.Context, req *adoptionRequest) (string, error) {
-	switch err := c.adopter.unsignedEligible(ctx, req.suite); {
-	case errors.Is(err, errUnsignedDisabled):
-		c.recordAdoptionFailure(req, cache.ReasonUnsignedDisabled)
-		return cache.ReasonUnsignedDisabled, nil
-	case errors.Is(err, ErrAdoptionUnsignedDowngradeRefused):
-		c.recordAdoptionFailure(req, cache.ReasonUnsignedDowngradeRefused)
-		return cache.ReasonUnsignedDowngradeRefused, nil
-	case err != nil:
-		return "", err
-	}
-	if err := unsignedTooLarge(req.releaseBytes); err != nil {
-		c.recordAdoptionFailure(req, cache.ReasonUnsignedTooLarge)
-		return cache.ReasonUnsignedTooLarge, nil
-	}
-	return "", nil
 }
 
 // unsignedFirst applies spec C5's safeguards to an unsigned candidate of

@@ -706,7 +706,11 @@ func TestTouchAsync_RecoversItsPanic(t *testing.T) {
 	touchPanicStackLogged.Store(false)
 	h.touchAsync(&proxy.Request{CanonicalScheme: "http", CanonicalHost: "h", Path: "/r/dists/s/InRelease"}, true, nil)
 	recs := logRecords(logs, "handler_goroutine_panicked", slog.LevelError)
-	if len(recs) != 1 || recs[0]["where"] != "touch" || recs[0]["panic"] == nil || !strings.Contains(recs[0]["stack"].(string), "touchAsync") {
+	var stack string
+	if len(recs) == 1 {
+		stack, _ = recs[0]["stack"].(string) // deferred minor D-36: a missing stack fails, not panics
+	}
+	if len(recs) != 1 || recs[0]["where"] != "touch" || recs[0]["panic"] == nil || !strings.Contains(stack, "touchAsync") {
 		t.Fatalf("records = %+v; want one with where=touch, the panic and its stack", recs)
 	}
 }

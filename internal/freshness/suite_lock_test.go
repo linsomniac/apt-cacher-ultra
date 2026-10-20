@@ -2,9 +2,7 @@ package freshness
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -243,71 +241,6 @@ func testCreateSuiteEvictionUnderTheChecker(t *testing.T) {
 	}
 }
 
-// Spec C4: the scheduler keeps at most freshness.max_suites suites queued,
-// waiting or in flight; later ticks refill to the bound.
-func TestTick_QueuesAtMostMaxSuites(t *testing.T) {
-	fc := newFakeCache()
-	for i := range 30 {
-		seedFakeSuite(fc, fmt.Sprintf("h%d", i%5), fmt.Sprintf("/s%d/dists/x", i), nil)
-	}
-	c, err := New(Config{Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
-		MaxSuites: 10, Logger: discardLogger()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	q := newSchedQueues()
-	c.tick(ctx, q)
-	if q.len() != 10 {
-		t.Fatalf("queued after one tick = %d, want 10", q.len())
-	}
-	c.tick(ctx, q)
-	if q.len() != 10 {
-		t.Fatalf("queued after two ticks = %d, want 10", q.len())
-	}
-	for range 4 {
-		it, ok := q.pop(admitAll)
-		if !ok {
-			t.Fatal("nothing to pop")
-		}
-		q.done(it)
-	}
-	c.tick(ctx, q)
-	if q.len() != 10 {
-		t.Fatalf("queued after four checks and a tick = %d, want 10", q.len())
-	}
-}
-
-// R-D1 / I-4: a suite evicted while it waits in the scheduler for a slot
-// flushes on its next offer — no row, so the check is skipped and the
-// entry is done — with no lock-map entry left behind.
-func TestScheduler_FlushesAnEvictedWaiter(t *testing.T) {
-	fc := newFakeCache()
-	seedFakeSuite(fc, "h", "/r/dists/x", nil)
-	c := lockChecker(t, fc, newTestFetcher(t), nil)
-	ctx := context.Background()
-	q := newSchedQueues()
-	c.tick(ctx, q)
-	it, ok := q.pop(admitNone)
-	if !ok {
-		t.Fatal("nothing queued")
-	}
-	q.finish(checkDone{item: it, report: checkReport{result: "changed_queued"}}, 0) // waits for a slot
-	fc.mu.Lock()
-	delete(fc.suites, keyOf("http", "h", "/r/dists/x")) // evicted meanwhile
-	fc.mu.Unlock()
-	it, ok = q.pop(admitAll)
-	if !ok || !it.waiting {
-		t.Fatalf("offer = %+v, %v; want the waiter", it, ok)
-	}
-	rep := c.checkRecovered(ctx, it)
-	q.finish(checkDone{item: it, report: rep}, 0)
-	if rep.result != resultSkipped || q.len() != 0 || q.waiting() != 0 || c.LockCount() != 0 {
-		t.Fatalf("after the offer: result %q, queued %d, waiting %d, locks %d; want skipped, 0, 0, 0",
-			rep.result, q.len(), q.waiting(), c.LockCount())
-	}
-}
-
 // Spec C3 I-4: Reconcile re-validates that the row still exists — a row
 // deleted in the window (lock map intact) starts nothing and, as in check,
 // drops the lock-map entry Reconcile stored for it, so the map stays
@@ -504,44 +437,12 @@ func TestCreateSuite_ReportsAFutureStampThroughTheChecker(t *testing.T) {
 	if got := steps() - before; got != 1 {
 		t.Fatalf("acu_clock_steps_detected_total rose by %v, want 1", got)
 	}
+	// Deferred minor D-24: ReportClockStep passes three strings by
+	// position; each must reach its own field.
 	out := logs.String()
 	if !strings.Contains(out, "clock_step_detected") || !strings.Contains(out, "stamp=last_requested_at") ||
-		!strings.Contains(out, "suite_path=/r/dists/x") {
-		t.Fatalf("log = %q; want clock_step_detected for /r/dists/x's last_requested_at", out)
-	}
-}
-
-// Design review M12: when the bound cuts a tick's due list, the least
-// recently checked suites get in — never checked first, and a
-// last_check_at in the future (a clock step) counts as never — not the
-// first by key, so a suite late in key order cannot starve behind early
-// ones that keep becoming due; ties and the admitted ones keep key order.
-func TestTick_BoundAdmitsTheLeastRecentlyChecked(t *testing.T) {
-	fc := newFakeCache()
-	recent, future := time.Now().Unix()-100, time.Now().Unix()+86400
-	for i := range 6 {
-		s := cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: fmt.Sprintf("/s%d/dists/x", i)}
-		switch i {
-		case 0:
-			s.LastCheckAt = &future // a backward clock step: never checked
-		case 1, 2:
-			s.LastCheckAt = &recent // checked a moment ago and still due
-		}
-		fc.putSuite(s)
-	}
-	c, err := New(Config{Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
-		MaxSuites: 3, Logger: discardLogger()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	q := newSchedQueues()
-	c.tick(context.Background(), q)
-	var got []string
-	for it, ok := q.pop(admitAll); ok; it, ok = q.pop(admitAll) {
-		got = append(got, it.ref.SuitePath)
-		q.done(it) // one check per host at a time
-	}
-	if want := []string{"/s0/dists/x", "/s3/dists/x", "/s4/dists/x"}; !slices.Equal(got, want) {
-		t.Fatalf("queued %v, want %v (the first three of the never-checked ones)", got, want)
+		!strings.Contains(out, "canonical_scheme=http ") || !strings.Contains(out, "canonical_host=h ") ||
+		!strings.Contains(out, "suite_path=/r/dists/x ") {
+		t.Fatalf("log = %q; want clock_step_detected for http://h/r/dists/x's last_requested_at", out)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -103,24 +104,33 @@ func testMintedSuitesAtScale(t *testing.T) {
 		}
 		return h
 	}
-	get := func(h *Handler, url string) {
+	get := func(h *Handler, target string) {
 		t.Helper()
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
 		if rec.Code != http.StatusOK {
-			t.Fatalf("%s = %d", url, rec.Code)
+			t.Fatalf("%s = %d", target, rec.Code)
 		}
+	}
+	// closeOnce closes h once, now or at cleanup, so a failing get never
+	// leaves its T1 goroutines and sweep timers running while the cache
+	// closes (deferred minor D-43).
+	closeOnce := func(h *Handler) func() {
+		once := sync.OnceFunc(h.Close)
+		t.Cleanup(once)
+		return once
 	}
 	// Four suites a client used two days ago, unadopted: the global cap's
 	// eviction candidates. Their miss and url_path hit give each a
 	// lock-map, gate and touch-map entry.
 	idle := newHandler()
+	closeIdle := closeOnce(idle)
 	for j := range 4 {
 		base := fmt.Sprintf("http://idle.example/r/dists/old%d", j)
 		get(idle, base+"/InRelease")
 		get(idle, base+"/InRelease")
 	}
-	idle.Close() // drains their T1 checks
+	closeIdle() // drains their T1 checks
 	// Ruling R-F2: an evictee's gate entry is purged only once its last
 	// serve is a quiet period old (a live entry expires on its own); twice
 	// that would let the sweep drop it first.
@@ -131,6 +141,7 @@ func testMintedSuitesAtScale(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := newHandler()
+	closeH := closeOnce(h)
 	byHash := "/main/by-hash/SHA256/" + strings.Repeat("ab", 32)
 	for i := range hosts {
 		for j := range perHost {
@@ -140,7 +151,7 @@ func testMintedSuitesAtScale(t *testing.T) {
 			}
 		}
 	}
-	h.Close() // drains the hits' T1 checks
+	closeH() // drains the hits' T1 checks
 	all, err := c.ListSuites(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -171,7 +182,7 @@ func testMintedSuitesAtScale(t *testing.T) {
 	for i := range hosts {
 		for j := range perHost {
 			host, suite := fmt.Sprintf("h%02d.example", i), fmt.Sprintf("/r/dists/minted%03d", j)
-			_, ok, err := c.SignedSeen(ctx, "http", host, suite)
+			_, ok, err := c.SignedSeen(ctx, "http", host, aptpath.MarkerBase(suite))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -202,14 +213,18 @@ type firstByteProbe struct {
 	suite     string
 	seen      bool
 	row, mark bool
+	err       error // the first read error (deferred minor D-44)
 }
 
 func (p *firstByteProbe) Write(b []byte) (int, error) {
 	if !p.seen {
 		p.seen = true
-		ok, err := p.c.HasSuiteRow(context.Background(), cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: p.suite})
-		p.row = err == nil && ok
-		_, p.mark, _ = p.c.SignedSeen(context.Background(), "http", "127.0.0.1", aptpath.MarkerBase(p.suite))
+		var markErr error
+		p.row, p.err = p.c.HasSuiteRow(context.Background(), cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: p.suite})
+		_, p.mark, markErr = p.c.SignedSeen(context.Background(), "http", "127.0.0.1", aptpath.MarkerBase(p.suite))
+		if p.err == nil {
+			p.err = markErr
+		}
 	}
 	return p.ResponseRecorder.Write(b)
 }
@@ -288,8 +303,8 @@ func TestServeHTTP_OnboardsADistsSuiteFromAV6Cache(t *testing.T) {
 	if p.Code != http.StatusOK || p.Header().Get(hdrXCache) != cacheHit || !p.seen {
 		t.Fatalf("hit = %d %q, body written %v", p.Code, p.Header().Get(hdrXCache), p.seen)
 	}
-	if !p.row || !p.mark {
-		t.Fatalf("at the first body byte row=%v marker=%v, want both", p.row, p.mark)
+	if p.err != nil || !p.row || !p.mark {
+		t.Fatalf("at the first body byte row=%v marker=%v (read error %v), want both", p.row, p.mark, p.err)
 	}
 	s, err := c.GetSuiteFreshness(ctx, "http", "127.0.0.1", "/u/dists/s")
 	if err != nil || s.LastCheckAt != nil || s.LastSuccessAt != nil {
@@ -386,7 +401,7 @@ func TestHitPathInvariant_EveryTrackedSignedAnchorHasAMarker(t *testing.T) {
 	// The cap is lifted (a restart with a larger max_suites): a second
 	// handler over the same cache.
 	h2, err := New(Config{Parser: r.h.parser, Cache: r.c, Fetch: r.h.fetch, Logger: silentLogger(),
-		HostLimiter: hostsem.New(4), AdoptionEnabled: true})
+		HostLimiter: hostsem.New(4), AdoptionEnabled: true, MaxSuites: 5000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,6 +436,7 @@ func TestHitPathInvariant_EveryTrackedSignedAnchorHasAMarker(t *testing.T) {
 		t.Fatalf("c's Release.gpg: X-Cache %q, row %v; want a hit that creates no row (Release.gpg never does)",
 			rec.Header().Get(hdrXCache), r.suite("/r/dists/c") != nil)
 	}
+	assertHitPathInvariant(t, r.c, db, "after c's Release.gpg hit")
 	onboard2("/r/dists/c/InRelease", "/r/dists/c") // onboards c
 	assertHitPathInvariant(t, r.c, db, "after c's onboarding")
 	r.cacheAnchor("/r/dists/e/Release", rowRelease, 1_700_000_000)
@@ -441,6 +457,7 @@ DELETE FROM suite_signed_seen WHERE base = '/r/dists/a'`); err != nil {
 	inrel := writeBlob(t, r.h, rowInRelease)
 	commitInlineSnapshot(t, r.h, "http", "127.0.0.1", "/r/dists/d", inrel,
 		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: inrel, DeclaredSHA256: inrel}}, nil)
+	assertHitPathInvariant(t, r.c, db, "after d's adoption")
 	if _, err := db.Exec(`DELETE FROM url_path WHERE path = '/r/dists/d/InRelease'`); err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +473,7 @@ DELETE FROM suite_signed_seen WHERE base = '/r/dists/a'`); err != nil {
 	if row, err := r.c.LookupURL(ctx, "http", "127.0.0.1", "/r/dists/d/InRelease"); err != nil || row.BlobHash == nil || *row.BlobHash != inrel {
 		t.Fatalf("the checker did not reconstruct d's anchor row from its snapshot (%+v, %v)", row, err)
 	}
-	assertHitPathInvariant(t, r.c, db, "after serving")
+	assertHitPathInvariant(t, r.c, db, "after d's reconstruction")
 	// A restart: markers lost (an earlier binary never wrote them), healed
 	// by the startup pass before anything serves.
 	if _, err := db.Exec(`DELETE FROM suite_signed_seen`); err != nil {
