@@ -318,7 +318,7 @@ the hit that creates the suite's row).
 | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them, so tracked suites lag upstream by design: the status page's SUITES vital then reads "ADOPTION DISABLED — METADATA NOT REFRESHED" (stale, not a fault), rows keep their lag text without warning, and failure records left from a time adoption was enabled are inert (no retries, `acu_adoption_failing_suites` reports 0). |
 | `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are adopted in the unsigned form instead (`adopt_unsigned`). |
-| `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` refuses every unsigned `Release` ("refused: unsigned_disabled", a state, not a failed check), so the cache no longer keeps unsigned repositories fresh: an unsigned suite already adopted keeps serving its last snapshot, coherent but frozen — never updated — until the knob is turned back on (it then updates at its next retry, at most 75 minutes later: a restart keeps a refusal's retry time), the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, which is worse, not fresher: a repository not yet adopted stays unadopted and is served as the cache first stored each of its files, never refreshed, so an upstream publish can leave its clients with Hash Sum mismatches. Set it to `false` only if you do not serve unsigned repositories through the cache. Either way the suite is asked upstream again only at its retry times (2 minutes, doubling to an hour; for a suite not yet adopted, also once `periodic_refresh` has passed), never at the checks clients trigger in between. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
+| `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` refuses every unsigned `Release` ("refused: unsigned_disabled", a state, not a failed check), so the cache no longer keeps unsigned repositories fresh: an unsigned suite already adopted keeps serving its last snapshot, coherent but frozen — never updated — until the knob is turned back on (it then updates at its next retry, at most 75 minutes later: a restart keeps a refusal's retry time), the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, which is worse: the forget or reap deletes its cached index files first, so its next requests fetch upstream's current files, but it stays unadopted and each file then stays as the cache first stored it, never refreshed, so an upstream publish can leave its clients with Hash Sum mismatches. Set it to `false` only if you do not serve unsigned repositories through the cache. Either way the suite is asked upstream again only at its retry times (2 minutes, doubling to an hour; for a suite not yet adopted, also once `periodic_refresh` has passed), never at the checks clients trigger in between. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
 | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
 | `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. A decodable clearsigned `InRelease` (or, for the detached pair, a parseable `Release.gpg` signature) is still required, as in every mode. Matching pins keep normal verification. Logs a startup warning. |
 | `allow_short_keyid` | boolean | `true` | Accept signatures containing only a legacy 64-bit issuer key ID when it uniquely identifies a loaded trusted key and cryptographic verification succeeds. `false` requires the long issuer fingerprint. |
@@ -742,6 +742,10 @@ request and, with adoption enabled, adopted again at its first check
 two observations of its first adoption). Its files then come from
 upstream again: a cache that must keep serving suites nobody asks for
 for a while — an offline or archive cache — sets `suite_idle_ttl = "0s"`.
+With `adoption.adopt_unsigned = false` a returning unsigned repository
+is not adopted again: it is refused `unsigned_disabled` and served as
+the cache first stores each of its files, never refreshed (see
+`adopt_unsigned` under `[adoption]`).
 The record that a repository path was seen signed survives the reap, so
 the returning suite is never adopted unsigned (see *Anchor forms and
 unsigned repositories*); the reaper deletes that record only when no
@@ -825,7 +829,11 @@ snapshots and its row are deleted. The next request for it tracks it again
 as a new repository and, with adoption enabled, adopts what upstream
 serves then. That is the way out of two refusal states: a deliberate
 upstream rollback (refused `upstream_older` or `rollback_refused`), and a
-vendor that stopped signing (`unsigned_downgrade_refused`).
+vendor that stopped signing (`unsigned_downgrade_refused`). The latter
+needs `adoption.adopt_unsigned = true` (the default): with the knob off,
+the forgotten vendor's unsigned repository is not adopted — it is refused
+`unsigned_disabled` and served as the cache first stores each of its
+files, never refreshed (see `adopt_unsigned` under `[adoption]`).
 
 When no other suite of the repository path has a row — under `http` or
 `https`, or as its `/.` twin — forgetting a suite also deletes the record
@@ -834,11 +842,12 @@ that the path was seen signed, and the cached `InRelease`, `Release` and
 signed copy left there would mark the path signed again). That is what
 lifts `unsigned_downgrade_refused`, and it happens whatever the suite was
 refused for, or if it was refused at all: forgetting a suite forgets that
-its path was signed, so until a check sees a signature there again,
-never-downgrade does not protect the path — an unsigned `Release` served
-there meanwhile is adopted like any unsigned repository's (see *Anchor
-forms and unsigned repositories*). While another suite of the path has a
-row, the record and those files stay and the answer names that suite: a
+its path was signed, so until the cache sees a signature there again
+(served to a client or found by a check), never-downgrade does not
+protect the path — an unsigned `Release` served there meanwhile is
+adopted like any unsigned repository's (see *Anchor forms and unsigned
+repositories*). While another suite of the path has a row, the record
+and those files stay and the answer names that suite: a
 suite forgotten to lift `unsigned_downgrade_refused` is then refused
 again — forget the other one too.
 

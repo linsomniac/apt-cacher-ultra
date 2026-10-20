@@ -1316,9 +1316,10 @@ Then `release(true)` purges in-memory state: the lock-map entry
 (`CompareAndDelete`), the checker's per-suite maps and the flip-gate
 entry; the cache itself drops the touch-coalescing entry once the row is
 gone. `Gate.Purge` skips a live entry — a flip in progress, a hold, an
-anchor serve in flight or one completed within the quiet period — which
-expires on its own, so a release racing a re-created suite's serve never
-shortens that serve's quiet period (ruling R-F2). Each
+anchor serve in flight, or any use of the entry within the quiet period
+(a serve completed, a hold or a flip ended) — which expires on its own,
+so a release racing a re-created suite's serve never shortens that
+serve's quiet period (ruling R-F2). Each
 run also scans for junk rows (every run, ruling PF-4: one indexed read
 that probes `url_path` by its key, pool reads only for blobs not yet
 sniffed) and sweeps the reconcile memo (against the current snapshot ids
