@@ -347,6 +347,7 @@ next to the Suites table contract in §5.3:
 
 | Field | Type | Meaning |
 |---|---|---|
+| `scheme` | string | The suite's canonical scheme, `http` or `https` (phase F, ruling PF-7): a repository can be tracked under both, as two rows with the same `host` and `suite_path`, and `POST /forget` (`docs/configuration.md`, *Forgetting a suite*) takes it, defaulting to `https`. The Suites table's Host column shows it as `scheme://host`. |
 | `anchor_form` | string | The current snapshot's anchor form — `inline`, `detached` or `unsigned` (a `Release` no signature covers: it vouches no `.deb`); empty when the suite has no current snapshot. |
 | `last_requested_unixtime` | int64 or `null` | When a client last showed interest in the suite (spec C3): written when the suite's row is created, then by coalesced touches — at most one write per suite per hour — from serves of its anchors (`InRelease`, `Release`, `Release.gpg`; status below 400, 304 and HEAD included), of its flat indexes, and of `.deb`s its current snapshot vouched for. Index requests such as `Packages.gz` never move it. It decides cap eviction: at the `freshness.max_suites` cap, a suite with no current snapshot whose stamp is 24 hours old or more can be evicted for a new one (`suite_evicted`). |
 | `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, which also records `anchor_absent`; a signature the check found but could not record as seen). An unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled`, not a failed check. Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. |
@@ -357,7 +358,9 @@ next to the Suites table contract in §5.3:
 | `adoption_refused` | boolean | `true` when the record above is a refusal state (`upstream_older`, `rollback_refused`, `unsigned_downgrade_refused`, `unsigned_unconfirmed`, `unsigned_too_large`, `anchor_absent`, `unsigned_disabled`), not a failure. |
 
 These are additive to the locked JSON contract (§0.1), the same way
-`keyring[]` was: no existing key changes shape or meaning.
+`keyring[]` was: no existing key changes shape or meaning (`scheme` too:
+the HTML Host cell gains the `scheme://` prefix, the JSON `host` is
+unchanged).
 
 **Adoption column.** The Suites table's "Adoption" column renders the
 record above as one line, via the server-side `adoptionStatus` helper:
@@ -375,7 +378,8 @@ is an unsigned repository waiting for its second observation
 sees a 401/403 on a signature file) and clears itself when it adopts;
 `unsigned_downgrade_refused` (the suite was seen signed) lasts until
 upstream serves a signature the cache adopts, or the suite is forgotten
-(`POST /forget`, added with suite reaping in a later release);
+(`POST /forget`, an admin endpoint outside this page: see
+`docs/configuration.md`, *Forgetting a suite*);
 `unsigned_too_large` (more than 1,000 declared files) lasts until
 upstream's `Release` declares fewer; `anchor_absent` means the current
 snapshot's anchor is gone upstream (or a detached suite's changed
@@ -384,7 +388,7 @@ a suite without a snapshot, that upstream serves neither `InRelease` nor
 `Release`; `unsigned_disabled` means `adoption.adopt_unsigned` is off:
 an unsigned `Release` is not adopted, and an unsigned suite already
 adopted keeps serving its last snapshot without updates until the knob is
-turned back on. None of them hides lag (only `upstream_older` and
+turned back on or the suite is forgotten. None of them hides lag (only `upstream_older` and
 `rollback_refused` do, §9.1), and all five follow the `REFUSED 24H+` rule
 below. A suite without a snapshot shows lag from the first check that
 found its anchor, so a first adoption refused for good

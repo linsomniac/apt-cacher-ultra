@@ -251,8 +251,9 @@ host can also get there by normal growth). Above the total cap new suites
 are refused, but each refused attempt still evicts one suite that qualifies
 (no adopted snapshot, not requested for 24 hours), so the table shrinks
 back under the cap as suites fall idle. A host at its own cap refuses that
-host's new suites and evicts nothing for them; its suites go when idle-suite
-reaping (a later release) removes those not requested for 30 days, or when
+host's new suites and evicts nothing for them; its suites go when the suite
+reaper removes those not requested for `gc.suite_idle_ttl` (30 days by
+default; see *Suite reaping* under `[gc]`), or when
 a new suite of any host at the total cap evicts one of its idle suites (no
 adopted snapshot, not requested for 24 hours). A table
 at exactly the total cap logs no warning: that is a full cache working
@@ -261,7 +262,9 @@ none qualifies (WARN `suite_seed_rejected`).
 
 Serving a tracked suite's `InRelease`, `Release` or `Release.gpg`, or a
 `.deb` its current snapshot vouches for, records that the suite is in use
-(at most one write per suite per hour). A by-hash request with no cached
+(at most one write per suite per hour); a suite not in use for
+`gc.suite_idle_ttl` (30 days by default) is no longer tracked (see *Suite
+reaping* under `[gc]`). A by-hash request with no cached
 copy under its own path is answered from an identical cached file only for
 a tracked suite; otherwise it is fetched from upstream.
 
@@ -491,8 +494,8 @@ anyone who can make the cache see one signed-looking `InRelease` or
 `Release.gpg` for a repository path — served to a client, or found by a
 check; a man in the middle, a compromised upstream, or a LAN client
 pointing the cache at a host it controls — blocks unsigned adoption of
-that path until its suite is forgotten (`POST /forget`, added with suite
-reaping in a later release). That denial of service is the accepted price
+that path until its suite is forgotten (`POST /forget`, see *Forgetting a
+suite* under `[admin]`). That denial of service is the accepted price
 of never downgrading. A man in the middle between the cache and upstream
 can make the cache adopt forged unsigned content only for a suite never
 seen signed — for a suite not yet adopted only after two consistent
@@ -585,7 +588,16 @@ cached anchor was already garbage-collected leaves no record. Suites whose
 their signed-seen record,
 on their first cache hit. A cache with more than `freshness.max_suites`
 suites, or a tenth of it or more on one host, logs WARN
-`suite_caps_exceeded` at start; see *Tracked suites*.
+`suite_caps_exceeded` at start; see *Tracked suites*. From an hour after
+the start the suite reaper (see *Suite reaping* under `[gc]`) deletes the
+suites no client has asked for in `gc.suite_idle_ttl`, counted from the
+last request for one of their anchor files before the upgrade (from 7 days
+before the upgrade for a suite with none: such a suite goes about 23 days
+after the upgrade unless a client asks for it), the rows an earlier
+release created for paths this version no longer tracks, and the suites
+whose cached anchor files are all error pages — with `gc.enabled = false`
+too. An offline or archive cache that must keep serving such suites sets
+`gc.suite_idle_ttl = "0s"` before upgrading.
 
 After the upgrade, suites without a snapshot adopt eagerly only if a client
 fetched one of their anchor files in the 7 days before the upgrade, or asks
@@ -667,7 +679,7 @@ served an unvouched package.
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
-| `enabled` | boolean | `true` | Run startup and periodic garbage collection, including the startup orphan-file scan. `false` disables those passes and logs a warning. |
+| `enabled` | boolean | `true` | Run startup and periodic garbage collection, including the startup orphan-file scan. `false` disables those passes and logs a warning. It does not stop the suite reaper, which deletes idle suites' cached index files whatever this says (see *Suite reaping*; `suite_idle_ttl = "0s"` turns it off). |
 | `interval` | duration | `"24h"` | Delay after a GC tick completes before the next periodic tick. Must be positive; disable through `enabled`. |
 | `batch_size` | integer | `100` | Maximum URL-path/blob rows processed per GC batch. At least `1`. |
 | `snapshot_batch_size` | integer | `10` | Maximum snapshots removed per batch. Snapshot deletion can cascade through many member rows. At least `1`. |
@@ -677,6 +689,7 @@ served an unvouched package.
 | `pool_scan_workers` | integer | `4` | Workers for the startup orphan-file scan. At least `1`. |
 | `heartbeat_interval` | duration | `"60s"` | Refresh in-progress adoption liveness and blob protection. Positive and subject to both bounds below. |
 | `url_path_ttl` | duration | `"168h"` | Requests within this window protect cached URL rows. Older or never-requested rows are evaluated against snapshot/version retention and hold grace. `"0s"` disables URL-path expiration; other values must be at least `"1m"`. |
+| `suite_idle_ttl` | duration | `"720h"` | A tracked suite no client has asked for in this long is reaped: no longer tracked, its cached index files and snapshots deleted (see *Suite reaping*). `"0s"` disables suite reaping; other values must be at least `"24h"`. |
 
 Startup still runs the orphan-file scan and a GC tick. Periodic ticks wait a full
 `interval` after the previous tick completes, so a long run cannot trigger an
@@ -701,12 +714,71 @@ The second expression is the implementation's stale-adoption grace formula;
 it is separate from the actual fetch retry budget. All `[gc]` validation still
 applies when `enabled = false`.
 
+### Suite reaping
+
+The suite reaper deletes the tracked suites (see *Tracked suites*) that no
+client has asked for in `suite_idle_ttl`: a client asks for a suite when it
+fetches the suite's `InRelease`, `Release` or `Release.gpg`, or a `.deb`
+its snapshot vouches for, through the cache. The reaper runs an hour after
+the daemon starts and then every hour, whatever `interval` and `enabled`
+say. A run deletes at most 25 suites — first those reaped however
+recently they were asked for (below), then those asked for least
+recently; a suite being checked or adopted at that moment is skipped and
+tried again at the next run. Reaping a suite deletes its cached index
+files (its `InRelease`, `Release`, `Packages` and the rest of its `dists/`
+tree, in batches of 1,000 files; packages are not touched), retires its
+snapshots and deletes its row (INFO `suite_reaped`;
+`acu_suites_reaped_total{reason}` counts the reaps). The next GC passes
+delete the retired snapshots, and then the pool files nothing else uses,
+once `blob_grace` has passed; with `enabled = false` suites are still
+reaped, but their snapshots and pool files stay until GC runs again.
+
+A reaped suite whose clients come back is tracked again at their first
+request and, with adoption enabled, adopted again at its first check
+(unchanged upstream content included; an unsigned repository after the
+two observations of its first adoption). Its files then come from
+upstream again: a cache that must keep serving suites nobody asks for
+for a while — an offline or archive cache — sets `suite_idle_ttl = "0s"`.
+The record that a repository path was seen signed survives the reap, so
+the returning suite is never adopted unsigned (see *Anchor forms and
+unsigned repositories*); the reaper deletes that record only when no
+suite of the path has a row and the path was last seen signed, or its
+last suite reaped, more than a year ago. With
+`integrity.refuse_unvouched_debs = true`, a reaped suite's packages are
+no longer vouched for, and reaping a suite whose signed snapshot was the
+host's only one with incomplete package coverage turns strict mode on for
+that host, as long as the host keeps another signed snapshot (see the
+strict-mode notes under `[integrity]`).
+
+Two kinds of suites are reaped however recently they were asked for, at
+every run: rows an earlier release created for paths this version no
+longer tracks (`reason=non_canonical`; such a path's cached files are
+left to URL-row expiry, `url_path_ttl`), and suites without a snapshot
+whose cached `InRelease`, `Release` and `Release.gpg` are all something
+else, such as an HTML error page (`reason=junk`), typically rows an
+earlier release created. A suite of the second kind is reaped only when
+every such file was fetched at least a day earlier, so a repository that
+answered with an error page for a few hours is kept, and so is one whose
+cached `InRelease` is a plain unsigned `Release` (the cache adopts such a
+repository through its `Release`); a file that cannot be read is never
+taken for an error page.
+
+A suite whose last request lies in the future (the clock was stepped
+back) is never idle. A forward step can make every suite look idle: the
+hour before the first run after a start gives clients time to ask again;
+a step while the daemon runs (a resumed virtual machine or laptop: the
+wall clock moved more than an hour further than the time that passed) is
+logged as WARN `clock_step_detected` with `stamp=wall_clock` and holds
+the reaper's deletions back for an hour; a suite reaped anyway comes back
+at its next request, as above. `"0s"` turns suite reaping off; the reaper
+then only deletes the year-old records of signed paths no suite tracks.
+
 ## `[admin]`: status, metrics, and maintenance
 
 The separate **HTTP** admin listener serves the status page, `/metrics`, and
-`/healthz`, plus the mutating `POST /reconcile` maintenance endpoint. It is not a
-read-only interface. Keep access restricted to trusted operators; if exposed
-beyond loopback, protect the network path or place it behind a TLS reverse proxy.
+`/healthz`, plus the mutating `POST /reconcile` and `POST /forget` maintenance
+endpoints. It is not a read-only interface. Keep access restricted to trusted
+operators; if exposed beyond loopback, protect the network path or place it behind a TLS reverse proxy.
 HTTP Basic authentication does not encrypt credentials in transit.
 
 | Key | Type | Default | Behavior and constraints |
@@ -735,6 +807,50 @@ command-line, trace, or other debug routes are exposed.
 
 See the [idle CPU investigation](idle-cpu-review.md) for findings, maintenance
 metrics, tuning tradeoffs, and profile-capture commands.
+
+### Forgetting a suite (`POST /forget`)
+
+`POST /forget` reaps one tracked suite at once, however recently it was
+used (see *Suite reaping* under `[gc]`): its cached index files, its
+snapshots and its row are deleted. The next request for it tracks it again
+as a new repository and, with adoption enabled, adopts what upstream
+serves then. That is the way out of two refusal states: a deliberate
+upstream rollback (refused `upstream_older` or `rollback_refused`), and a
+vendor that stopped signing (`unsigned_downgrade_refused`). For the latter
+it also deletes the record that the repository path was seen signed, and
+the cached `InRelease`, `Release` and `Release.gpg` of the path and of its
+`./` twin under either scheme (a signed copy left there would mark the
+path signed again), but only when no other suite of the path has a row —
+under `http` or `https`, or as its `./` twin; while one does, the answer
+names it: forget it too, or the forgotten suite is refused again. A
+client in the middle of an update when its suite is forgotten can see one
+Hash Sum mismatch: forgetting does not wait for the update to end, as an
+adoption's flip does (see *Flip consistency*).
+
+`scheme`, `host` and `suite` are the suite's canonical scheme, host and
+suite path as the status page shows them (its Host column reads
+`scheme://host`); `scheme` is optional (`http` or `https`, default
+`https`). The request must carry the header `X-ACU-Admin: 1`, which a
+cross-site form cannot send, and a browser request from another site is
+refused (by its `Sec-Fetch-Site` header), so a cross-site form or `fetch`
+cannot trigger it. It does not stop DNS rebinding — a web page whose own
+name is made to resolve to the admin listener's address — against a
+listener without `htpasswd_file`: configure one if a browser runs on the
+cache's host. `curl` and scripts are not affected:
+
+```sh
+curl -sS --fail-with-body -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 1' \
+    --data-urlencode 'host=packages.microsoft.com' \
+    --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
+# 202 Accepted = forgotten (the work is done when the answer comes); the body
+#   names the suite, the signed-path records deleted and the suites that kept them
+# 409 = busy (being checked or adopted: try again) or no such suite (check the
+#   scheme, which defaults to https, and the host and suite the status page shows)
+# 403 = the header is missing, or a cross-site browser request
+```
+
+Each request is logged as INFO `admin_forget_requested`, and each suite
+forgotten as INFO `suite_forgotten`.
 
 ## `[serve]`: stale responses
 

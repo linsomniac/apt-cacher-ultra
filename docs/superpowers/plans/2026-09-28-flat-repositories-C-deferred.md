@@ -8,15 +8,11 @@ Left out: everything the phase C final fix wave resolved (the phase-A wake test,
 
 ## internal/flipgate
 
-- **C-1** `gate.go:295-310`: two promised `Close` behaviours are untested — idempotence (a second call would panic on `close(g.closedCh)`) and `Close`'s own broadcast to a flip waiting only in phase A (with a hold in progress `endHoldLocked` broadcasts instead). The nil/disabled guard is covered by the cmd daemon tests. Fix: call `Close` twice in `TestDisabledGate_IsTodaysBehaviour` and the `Close` test; add a `Close` case with only a phase-A flip waiting.
-- **C-2** `gate.go:164`, `:767`: `changedLocked` is called before the break and closed checks, so an idle flip leaves a channel allocated until the next broadcast; "nil while no flip waits" and "only a flip about to wait asks for it" overstate it. Reword, or call it only on the wait path inside the same critical section.
-- **C-3** `gate.go:412`, `:767-779` (performance, final review concurrency Minor 6): every `Token.Done`, for any suite, closes the global `changed` channel, so each waiting flip re-locks, re-scans its suite's in-flight map and allocates a new channel and timer on every anchor completion in the cache, for up to the barrier's 140 s. Cheap today (ruling R-C1: at most one or two waiting flips under the default pool). Per-entry wake channels would remove it; not done in the fix wave because it changes the gate's wake mechanism for no measured gain.
-- **C-4** `gate_test.go` `TestFlip_PhaseAWaitsOutAnotherSuitesHold` asserts only a lower bound; tighten it to `resB.HoldStart.Equal(a.res.HoldEnd.Add(testQuiet))` (the wake itself is pinned by `TestFlip_PhaseAWakesWhenAnotherSuitesHoldEnds`).
 
 ## internal/simtest and the model simulations
 
 - **C-5** `simtest/aptclient.go:92`, `:103-112`: two ledger properties are pinned by no test — `held: heldBefore` (an anchor's own hold must not shorten its index's window) and recording `gens` only inside the window (`AnchorGens` is the "clients crossed the flip" proof). Add an update whose anchor is held 5 s and then followed by an 11 s filler, assert its index is not checked, and assert `AnchorGens` stays empty after out-of-window updates.
-- **C-6** `flipgate/sim_test.go` `clients` and `recordHeld` repeat `gate_test.go`'s `busyReaders` and are copied verbatim as the handler's `flipReaders` and `recordAnchorHeld`; export a periodic-client spawner and `RecordHeld` from simtest.
+- **C-6** (checked by phase F, which changes `gate_test.go`, where `busyReaders` lives, but none of the files the fix belongs to: `flipgate/sim_test.go`, simtest and the handler tests) `flipgate/sim_test.go` `clients` and `recordHeld` repeat `gate_test.go`'s `busyReaders` and are copied verbatim as the handler's `flipReaders` and `recordAnchorHeld`; export a periodic-client spawner and `RecordHeld` from simtest.
 - **C-7** `flipgate/sim_test.go` `clients`: client ids collide across groups running at once (the loop index), so `Straddle.Client` is ambiguous in a failure message; add an id-base parameter.
 - **C-8** `simtest/aptclient.go` docs: say that `RunUpdate` is safe for concurrent use and blocks for the whole update (in real time outside a bubble), and that `AnchorGens` sorts as strings ("10" before "9").
 
@@ -26,7 +22,6 @@ Left out: everything the phase C final fix wave resolved (the phase-A wake test,
 
 ## internal/cache
 
-- **C-11** `adoption.go:720`: "strictly increasing per suite" holds only along the current-snapshot chain. When `current_snapshot_id` is cleared (quarantine today, the reaper next), the first-adoption rule ignores the suite's remaining displaced snapshots, whose `adopted_at` may lead the clock, so GC's `keep_displaced` ranking and retained by-hash's newest-first window could misorder. Take `MAX(adopted_at)` over the suite's adopted snapshots as a floor, or narrow the AIDEV-NOTE. (F)
 - **C-12** `flip_state_test.go:158`, `:174`, `:194`: `restore()` runs after `commitCandidate` instead of being deferred, and `stubNow` (`gc_test.go:42`) registers no cleanup, so a failing stamp test leaves `nowUnix` stubbed for the rest of the package.
 - **C-13** `flip_state_test.go:146-191`: the served-anchor `PutURLPath` setup is written out three times; hoist `putAnchor`.
 

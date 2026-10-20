@@ -8,7 +8,6 @@ Phase A's per-task and final reviews (2026-10-11, Fable max) found these minor i
 
 - **A-1** `wallclock_test.go:27`: `restore()` is called inline, not deferred, so a failing assertion leaks the −2 h offset into later tests.
 - **A-2** No guard test that production code never calls `wallclock.SetOffsetForTest`; the doc should say restores run LIFO.
-- **A-3** GC wallclock stamps (`gc.go:276,362`) are not distinguished from `time.Now` by any test (the handler's are, since phase C: `TestHandler_StampsFollowTheWallClock`).
 
 ## internal/aptpath and internal/proxy
 
