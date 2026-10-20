@@ -16,7 +16,9 @@ import (
 )
 
 // ReconcileSnapshot heals a degraded current snapshot in place: it re-parses
-// the snapshot's GPG-verified Release (the trust anchor, pinned + refcounted),
+// the snapshot's adopted Release (the trust anchor, pinned + refcounted:
+// GPG-verified for the inline and detached forms; for an unsigned snapshot
+// the Release nothing verifies, which is why such a snapshot never vouches),
 // fetches every requestable IndexTarget the Release declared but the snapshot
 // lacks, validates each against the re-parsed declaration, and inserts it into
 // the SAME snapshot. Returns the number of members healed. force=false honors
@@ -26,7 +28,10 @@ import (
 // AIDEV-NOTE: trust-sensitive path — three invariants must hold:
 //  1. Trust anchor: all declared members are validated against the declared
 //     set reparseSnapshotRelease returns for this snapshotID, which re-reads
-//     the original GPG-verified Release blob from the pool — parsed here, or
+//     the original adopted Release blob from the pool (GPG-verified unless
+//     the snapshot is unsigned, phase E: then it is exactly the bytes the
+//     unsigned adoption accepted, and its package_hash rows are never
+//     built, buildPackageHashes taking the form) — parsed here, or
 //     handed down by reconcilePending, which parsed the same snapshot on the
 //     same tick (reconcileSnapshot's declared, deferred minor B-28). Never
 //     accept a declared set from any other source, and never pass down a set
@@ -55,10 +60,12 @@ func (a *Adopter) reconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 		}
 	}
 	// AIDEV-NOTE: reparseSnapshotRelease is the trust anchor — it reads the
-	// original GPG-verified InRelease/Release blob from the pool and re-parses
+	// original adopted InRelease/Release blob from the pool and re-parses
 	// the declared member set. This is the same blob the original adoption
-	// verified; re-reading it from the pinned pool means the declared set
-	// cannot be tampered with without changing the blob hash (which would
+	// verified (or, for an unsigned snapshot, accepted unverified: it heals
+	// members but never vouches a .deb); re-reading it from the pinned pool
+	// means the declared set cannot be tampered with without changing the
+	// blob hash (which would
 	// invalidate the snapshot_member.declared_sha256 = blob.hash invariant).
 	// The set is parsed here, or it is the one reconcilePending parsed for
 	// this snapshotID on the same tick (B-28) — never a set from any other
@@ -126,7 +133,9 @@ func (a *Adopter) reconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 		"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath,
 		"snapshot_id", snapshotID, "healed", len(healedDecl))
 	// Increment per healed member, keyed by the arch declared in the Release
-	// (trust anchor, GPG-verified — not client-controlled, so no label bound needed).
+	// (the trust anchor — GPG-verified, or for an unsigned snapshot the
+	// Release its adoption accepted — not client-controlled, so no label
+	// bound needed).
 	for _, m := range healedDecl {
 		if _, arch, ok := indexTargetGroup(m.Path); ok {
 			adoptionReconciledTotal.Inc(arch)
@@ -201,8 +210,9 @@ func (a *Adopter) reparseSnapshotRelease(ctx context.Context, snapshotID int64) 
 		// local tampering — an anchor whose bytes no longer match its hash
 		// could define FORGED member declarations, so refuse to parse it.
 		// mem.BlobHash is the InRelease/Release member's recorded content
-		// address, == the GPG-verified suite_snapshot anchor hash by adoption's
-		// construction, so this binds the parse to the verified anchor.
+		// address, == the suite_snapshot anchor hash by adoption's
+		// construction (GPG-verified, unless the snapshot is unsigned), so
+		// this binds the parse to the anchor adoption accepted.
 		sum := sha256.Sum256(blob)
 		if got := hex.EncodeToString(sum[:]); got != mem.BlobHash {
 			return nil, fmt.Errorf("reconcile: %s anchor blob hash mismatch (file=%s pinned=%s) — corrupt at rest",

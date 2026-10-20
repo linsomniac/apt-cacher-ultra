@@ -551,9 +551,13 @@ func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
 // adoption goroutine, which runs against the lifetime context bounded by
 // adoption.max_duration (a request closing must not abort it).
 //
-// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, lease
-// release, recoverAdoption (first). The failure record is written before
-// the mutex is released on both the error and the panic path (spec C7).
+// AIDEV-NOTE: defer order is load-bearing — in the order they run:
+// cancel, recoverAdoption, lease release, Unlock, inflight.end (signed
+// adoptions only), Done (last). The failure record is written before the
+// mutex is released on both the error and the panic path (spec C7), and
+// inflight.end runs after the commit and the Unlock, so a strict-mode
+// request it wakes re-reads package_hash rows the new snapshot already
+// wrote (spec C10, design note 27; final review, concurrency T9).
 // The host slot is freed earlier, when the member pipeline ends; the
 // global slot only here, after the flip barrier and the commit (ruling
 // R-C1).

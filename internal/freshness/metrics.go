@@ -125,13 +125,15 @@ var (
 		"Suites waiting for an adoption slot; each is re-checked as soon as one it can use is released (spec C4).",
 	)
 
-	// freshnessUnloggedPanics counts scheduled checks whose panic could
-	// not be logged: the panic report in checkRecovered's recover panicked
-	// too, and checkWorker's last-resort recover caught it (deferred minor
-	// B-44). Any increase is a bug.
+	// freshnessUnloggedPanics counts recovered panics whose report could
+	// not be logged because reporting them panicked too: a scheduled
+	// check's (checkRecovered's report, caught by checkWorker's last-resort
+	// recover, deferred minor B-44) and, since phase E (B-18,
+	// unloggedPanic), an adoption's, its failure record's and the adoption
+	// heartbeat's. Any increase is a bug.
 	freshnessUnloggedPanics = metrics.NewCounter(
 		"acu_freshness_unlogged_panics_total",
-		"Scheduled freshness checks whose panic could not be logged because reporting it panicked too (a bug).",
+		"Recovered panics (a scheduled freshness check, an adoption, its failure record or the adoption heartbeat) that could not be logged because reporting them panicked too (a bug).",
 	)
 
 	adoptionTotal = metrics.NewCounterWithCap(

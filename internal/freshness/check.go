@@ -19,22 +19,24 @@ import (
 )
 
 // checkLocked is the body of Check, run with the per-suite mutex held.
-// It fills out: out.req is non-nil iff the observed result is "changed",
-// the caller has an Adopter wired in (Phase 2 path) AND an admission slot
-// was free (out.lease); the caller uses this signal to spawn the adoption
+// It fills out: out.req is non-nil iff the check found content to adopt
+// (result changed, form_changed or first_adoption), the caller has an
+// Adopter wired in (Phase 2 path) AND an admission slot was free
+// (out.lease); the caller uses this signal to spawn the adoption
 // goroutine. On a confirmed-unchanged result planRepair sets out.repair
 // and out.lease when there is something to heal and a slot was free.
 //
-// Form dispatch (SPEC2 §7.6.3):
-//   - If the suite has a current snapshot, the form is read from the
-//     snapshot row's anchor_form (snap.Form): detached → detached,
-//     otherwise inline. The check then issues a conditional GET against
-//     InRelease (inline) or Release (detached).
-//   - For first-ever checks (no current snapshot), inline is tried
-//     first. If the inline conditional GET 404s AND a Release url_path
-//     row exists, we fall back to the detached path. This is what
-//     bootstraps detached-mode adoption for upstreams that ship only
-//     Release + Release.gpg.
+// Form dispatch (spec C4 Dispatch; SPEC2 §7.6.3):
+//   - With an adopter wired, a suite with no current snapshot runs the
+//     probe tree (checkFirst, Dispatch 3) or stays dormant.
+//   - A suite with a current snapshot takes its form from the snapshot
+//     row's anchor_form (snap.Form): inline, detached or unsigned
+//     (Dispatch 1 and 2). The check then issues a conditional GET against
+//     InRelease (inline) or Release (detached, unsigned).
+//   - Without an adopter (Phase 1, observation only) a first-ever check
+//     tries inline first; if the inline GET 404s AND a Release url_path
+//     row exists, it falls back to the detached path, as before phase E
+//     (TestCheck_Phase1DetachedFallback_OnInRelease404).
 //
 // Outcomes (all paths must update suite_freshness so cooldown applies
 // to the next attempt):
@@ -53,8 +55,9 @@ import (
 //   - 200, body hash differs: bump last_check_at, last_success_at,
 //     stamp inrelease_change_seen_at on first sighting only, return
 //     *adoptionRequest.
-//   - Same, but no admission slot is free (spec C4): "changed_queued",
-//     no request, last_success_at left at its previous value; the
+//   - Same, but no admission slot is free (spec C4): "changed_queued"
+//     (or first_adoption_queued for a first adoption), no request,
+//     last_success_at left at its previous value; the
 //     scheduler parks the suite until a slot it can use is released (a
 //     client check's suite is parked by the next tick: its pending
 //     change makes it due, see Checker.pendingChange).
@@ -63,19 +66,26 @@ import (
 //     failing content's validators, and a 304 or the same content key
 //     is "changed_deferred" (no adoption); new content is attempted at
 //     once; at next_retry_at the GET carries no validators.
-//   - Error (network, 4xx, 5xx, check deadline — also one hit while
-//     waiting for the host slot) or a success status other than 200 and
-//     304: a failed check (failCheck) — last_check_at bumped,
+//   - Error (network, an error status that is not an absent answer, 5xx,
+//     check deadline — also one hit while waiting for the host slot), a
+//     success status other than 200 and 304, or a 304 to a GET without
+//     validators: a failed check (failCheck) — last_check_at bumped,
 //     check_fail_count extended (don't hammer a broken upstream), the
 //     "freshness check failed" line and the failed counter;
 //     last_success_at keeps its previous value. Every answered check
 //     above resets check_fail_count to 0 (spec C4).
-//   - Cancelled caller (shutdown), at the host slot or the GET: no DB
-//     write; it says nothing about upstream.
+//   - Cancelled caller (shutdown), at the host slot, the GET or a local
+//     step after it (endedByShutdown): no DB write; it says nothing about
+//     upstream.
+//   - With an adopter wired, absent answers (401/403/404/410, a 200
+//     failing its sniff) on the current anchor are anchor_absent (ruling
+//     R-E4), and refusal states are recorded, not failed (spec C7).
 //
-// SPEC2 wiring: the body-hash comparison uses
-// suite_snapshot.inrelease_hash (inline) or .release_hash (detached)
-// when the suite has an adopted snapshot. Without this, every
+// SPEC2 wiring: the body-hash comparison uses the current snapshot's
+// hash of the form's anchor (cache.SuiteSnapshot.AnchorHash: InRelease
+// for inline, Release for detached and unsigned — the unsigned Release
+// sits in the single-anchor slot) when the suite has an adopted
+// snapshot (baseline). Without this, every
 // freshness check after a successful adoption would observe "changed"
 // against the stale url_path.blob_hash and thrash the adoption
 // candidate-uniqueness constraint forever.

@@ -305,7 +305,9 @@ it — plus once for each client check while it waits (at most one per
 takes first.
 
 With adoption disabled nothing changes: suites are checked for changes
-only, and the request that creates a suite starts no check.
+only, and a miss that creates a suite starts no check (a cache hit on a
+suite's anchor still triggers its usual check, under the `cooldown`, also
+the hit that creates the suite's row).
 
 ## `[adoption]`: snapshots, trust, and recovery
 
@@ -352,7 +354,7 @@ At start, every failing suite gets one retry spread over the next `periodic_refr
 
 ### Capacity and fairness
 
-`freshness.max_concurrent_adoptions` slots are shared by adoptions, repairs and reconciles, plus one slot per upstream host. Nothing blocks on a slot: a suite whose scheduled check finds none waits in the scheduler's queue and is re-checked as soon as capacity it can use is released (hosts in turn, oldest first); while it waits, no request is made for it. A change found by a client-triggered check that finds no slot stays pending, and the next scheduler tick checks that suite (bypassing the cooldown) and queues it the same way, so it starts waiting within one tick. Client requests still trigger checks under the normal cooldown and may take a freed slot first. When there are at least two slots, the last free one is reserved for suites that already serve a signed snapshot, so security updates are not delayed by first or unsigned adoptions. With the default pool of two, first adoptions therefore run only when no other adoption is running, and can wait a long time on a cache kept busy by signed updates; `max_concurrent_adoptions = 3` avoids that and lets two run at once (useful for the burst after an upgrade). A repair or reconcile that finds no slot simply runs on a later unchanged check (`acu_repair_deferred_total{host}` counts them); one of a suite whose current snapshot is unsigned never takes the reserved slot. `POST /reconcile` answers 409 when no slot is free. The gauge `acu_freshness_waiting_for_slot` counts suites waiting for a slot. An adoption gives its host's slot back when its downloads are done, but keeps its global slot through the flip barrier and the commit, so a slot is held for at most `max_duration` + 140 s (the barrier, see *Flip consistency*; `acu_adoption_duration_seconds` includes that time) + the 5-minute commit bound: N suites waiting for k slots they may use are all admitted within one tick + ⌈N/k⌉ × (that sum + 2 minutes).
+`freshness.max_concurrent_adoptions` slots are shared by adoptions, repairs and reconciles, plus one slot per upstream host. Nothing blocks on a slot: a suite whose scheduled check finds none waits in the scheduler's queue and is re-checked as soon as capacity it can use is released (hosts in turn, oldest first); while it waits, no request is made for it. A change found by a client-triggered check that finds no slot stays pending, and the next scheduler tick checks that suite (bypassing the cooldown) and queues it the same way, so it starts waiting within one tick. Client requests still trigger checks under the normal cooldown and may take a freed slot first. When there are at least two slots, the last free one is reserved for suites that already serve a signed snapshot, so security updates are not delayed by first or unsigned adoptions. With the default pool of two, first adoptions therefore run only when no other adoption is running, and can wait a long time on a cache kept busy by signed updates; `max_concurrent_adoptions = 3` avoids that and lets two run at once (useful for the burst after an upgrade). A repair or reconcile that finds no slot simply runs on a later unchanged check (`acu_repair_deferred_total{host}` counts them); one of a suite whose current snapshot is unsigned never takes the reserved slot. `POST /reconcile` answers 409 when no slot is free. The gauge `acu_freshness_waiting_for_slot` counts suites waiting for a slot. An adoption gives its host's slot back when its downloads are done, but keeps its global slot through the flip barrier and the commit, so a slot is held for at most `max_duration` + 140 s (the barrier, see *Flip consistency*; `acu_adoption_duration_seconds` includes that time) + the 5-minute commit bound: N suites waiting for k slots they may use are all admitted within one tick + ⌈N/k⌉ × (that sum + 2 minutes). Two short database writes made while the slot is held — an unsigned adoption's re-read of the suite's signed anchors before its commit, and a failed attempt's failure record — are outside that bound: they take microseconds unless the database writer is stuck behind another suite's long commit, in which case they can add up to 5 and 5.5 minutes.
 
 Periodic checks run on four workers, at most one check per upstream host at a time, hosts taking turns. On each host, healthy suites go first, then never-checked suites, then suites whose checks keep failing; a failing suite waits 2 minutes, doubling to an hour, between checks. The upstream part of each check (waiting for the host's fetch slot and the requests) is limited to 2 minutes; the check's own cache writes are not cut short, so the deadline is always recorded. A due suite S is therefore checked within one tick + (n + 1) × ⌈H/4⌉ × 2 minutes, where H is the number of hosts with suites waiting and n the number of suites ahead of S in its host's queue (only healthy ones when S is healthy): stalling hosts delay a healthy suite on another host by at most ⌈H/4⌉ checks per suite ahead of it (with four hosts or fewer, one check), and once a stalling host's suites are known to fail they queue behind its healthy suites — also right after a restart, because the order is persisted. The bound assumes responsive cache I/O.
 
@@ -491,9 +493,11 @@ that path until its suite is forgotten (`POST /forget`, added with suite
 reaping in a later release). That denial of service is the accepted price
 of never downgrading. A man in the middle between the cache and upstream
 can make the cache adopt forged unsigned content only for a suite never
-seen signed, and only after two consistent observations; apt clients that
-verify signatures reject it, and `[trusted=yes]` clients accept it as they
-would when fetching directly. A suite whose pre-upgrade snapshot was
+seen signed — for a suite not yet adopted only after two consistent
+observations, but for an unsigned suite already adopted at the first check
+that sees it, since updates of an unsigned suite are adopted at once
+(safeguard 2); apt clients that verify signatures reject it, and
+`[trusted=yes]` clients accept it as they would when fetching directly. A suite whose pre-upgrade snapshot was
 quarantined because its stored `InRelease` was missing, corrupt or
 oversized (see *Upgrading an existing cache*) may have no record that it
 was signed until a check sees its signature upstream; if its signatures

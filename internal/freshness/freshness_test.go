@@ -1536,7 +1536,10 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 
 // TestCheck_DetachedFallback_OnInRelease404 covers the bootstrap
 // case: a fresh suite whose upstream returns 404 on InRelease must
-// fall back to detached mode and adopt via Release + Release.gpg.
+// adopt the detached form via Release + Release.gpg. With an adopter
+// wired that is the probe tree's work since phase E (spec C4 Dispatch 3:
+// InRelease absent → Release → Release.gpg); the inline path's 404
+// fallback is Phase 1's (TestCheck_Phase1DetachedFallback_OnInRelease404).
 func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 	fc := newFakeCache()
 	fc.track("http", "127.0.0.1", "/dists/noble")
@@ -1698,9 +1701,11 @@ func TestCheck_Phase1DetachedFallback_OnInRelease404(t *testing.T) {
 // other detached-fallback bootstrap path: the suite has Release +
 // Release.gpg url_path rows but no InRelease row at all (real-world:
 // upstream never served InRelease, so apt's first request 404'd and
-// the handler created no row). The inline path's LookupURL returns
-// ErrNotFound; the fallback fires without ever issuing a wasted
-// InRelease GET.
+// the handler created no row). With an adopter wired the probe tree
+// handles it since phase E: it asks for InRelease once (absent), then
+// Release and Release.gpg, and adopts the detached form. (Before phase E
+// the inline path's LookupURL returned ErrNotFound and the fallback fired
+// without an InRelease GET; that path is Phase 1's now.)
 func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	fc := newFakeCache()
 	fc.track("http", "127.0.0.1", "/dists/noble")

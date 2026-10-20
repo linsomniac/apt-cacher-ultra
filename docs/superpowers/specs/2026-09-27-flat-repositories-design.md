@@ -532,6 +532,13 @@ Queued suites therefore pass through the pool at its throughput: *N* suites
 queued behind *k* slots they may use are all admitted within one tick +
 ⌈*N*/*k*⌉ × (*A* + *D*), where *A* — `adoption.max_duration` plus the C8
 barrier (≤ 140 s) plus the commit bound — is the longest a slot is held.
+Two writer-backlog residuals lie outside *A*: an unsigned adoption holds
+its slot through its R-E1 re-mark (C5 safeguard 3, a writer operation
+bounded by the commit bound), and a failed attempt through its failure
+record (C7, bounded at the commit bound + 30 s); each costs microseconds
+unless the single writer is backed up behind another suite's commit, so
+the worst case with a wedged writer is *A* + 5 min + 5.5 min (phase E
+final fix wave, FW-7; concurrency review M-2).
 With the default pool of two and a
 first adoption holding the general slot, signed suites go through the
 reserved slot back to back. First adoptions (and unsigned ones) run only
@@ -728,7 +735,12 @@ pending change), cleared in the flip transaction and on
 (`last_check_at`, `last_success_at`, `last_requested_at`,
 `adoption_fail_last_at`, `adoption_fail_first_at`, `adopted_at`) found in the
 future is treated as infinitely old by gates that *delay* work (cooldown, T2
-threshold) and as "now" by gates that *retire* things (reap cutoff).
+threshold) and as "now" by gates that *retire* things (reap cutoff). The
+exception is the confirmation gaps — the unsigned transition's and the
+absent anchor's — where a future `adoption_fail_first_at` never confirms
+and re-recording restarts it: reading it as infinitely old would skip a
+confirmation (phase E, deviation 2 and ruling PE-1; C4 Dispatch 1, C5
+safeguard 2).
 `next_retry_at` is only clamped to `now + 1h` (C7). Each detection emits a
 rate-limited WARN `clock_step_detected`. Touch coalescing and all in-memory
 timing use monotonic time. Since C8's monotonic stamp, `adopted_at` can
@@ -949,7 +961,9 @@ whose pre-v7 snapshot §6.1 quarantined for `anchor_missing`,
 sees its signature upstream; if its signatures are stripped before then,
 it adopts unsigned (phase E, design review M-9). A MITM on the cache→upstream path can
 make the cache adopt forged unsigned content only for a suite never seen
-signed, after two consistent observations; verifying clients reject it,
+signed — for a never-adopted suite after two consistent observations, for
+an established unsigned suite at the first check that sees it (its updates
+adopt at once, safeguard 2); verifying clients reject it,
 `[trusted=yes]` clients accept it as they would fetching directly. Under the
 default allow-all upstream policy with adoption enabled, a LAN client can make
 the cache adopt unsigned directories it controls; this is bounded by the
