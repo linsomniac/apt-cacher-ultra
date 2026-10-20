@@ -24,9 +24,10 @@ const failureRecordTimeout = commitTimeout + 30*time.Second
 // or a new reason), adoption_failing_persistently at streak milestones,
 // and adoption_refused_persistently at the same milestones for a refusal
 // whose streak is at least refusalEscalateAge old.
-// It runs in the adoption goroutine before the suite mutex is released,
-// so the next check already sees the record. Shutdown is not a failure:
-// nothing is recorded once the lifetime context is done.
+// It runs under the suite's mutex — in a check, or in the adoption
+// goroutine before it releases the mutex — so the next check already
+// sees the record. Shutdown is not a failure: nothing is recorded once
+// the lifetime context is done.
 func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 	s := req.suite
 	defer func() {
@@ -44,9 +45,15 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 		// AIDEV-NOTE: WARN, ErrNotFound included (final review spec m9).
 		// A suite row cannot vanish here: every deleter (cap eviction, the
 		// reaper, POST /forget) holds the suite's mutex through the
-		// SuiteGuard (ruling R-F1), and the adoption holds it until this
-		// record is written. A missing row is a bug, not a routine reap
-		// during the adoption, so it is not demoted to DEBUG.
+		// SuiteGuard (ruling R-F1), and every writer of this record holds
+		// it from a read of the row until the record is written (the final
+		// fix wave's re-review, logging minor 4): a check, under its lock
+		// after checkLocked's read (check.go, first_adoption.go,
+		// current_form.go, unsigned.go), or the adoption goroutine a check
+		// handed the lock to, before it releases it (spawnAdoption's
+		// goroutine and its deferred recoverAdoption). A caller without the
+		// mutex would break this. A missing row is a bug, not a routine reap
+		// during the check or adoption, so it is not demoted to DEBUG.
 		c.logger.Warn("adoption_failure_record_failed",
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath, "err", err)
 		return

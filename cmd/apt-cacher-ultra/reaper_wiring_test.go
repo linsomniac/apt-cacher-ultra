@@ -166,17 +166,50 @@ func TestServeListeners_StartupLineReportsTheReapingKnobs(t *testing.T) {
 
 // Final review spec m7: the gc_disabled WARN keeps naming what gc.enabled =
 // false stops, and says that suite reaping still runs — naming
-// gc.suite_idle_ttl, its value and "0s" — or, with "0s", that it is off.
+// gc.suite_idle_ttl, its value and "0s" — or, with "0s", that it is off,
+// and then (the final fix wave's re-review, logging minor 2) what still
+// deletes: eviction at the total cap and the daily sweep of year-old
+// signed-seen records, so the line never implies that nothing is deleted.
 func TestGCDisabledDetail_NamesSuiteReaping(t *testing.T) {
 	on := gcDisabledDetail(720 * time.Hour)
 	for _, want := range []string{"gc.enabled = false: orphan blobs and displaced snapshots will not be reaped",
-		"suite reaping still runs", "gc.suite_idle_ttl = 720h0m0s", `"0s" keeps idle suites`} {
+		"suite reaping still runs", "gc.suite_idle_ttl = 720h0m0s", `"0s" turns it off`} {
 		if !strings.Contains(on, want) {
 			t.Errorf("detail with a 720h TTL = %q; want it to contain %q", on, want)
 		}
 	}
 	off := gcDisabledDetail(0)
-	if !strings.Contains(off, `suite reaping is off too (gc.suite_idle_ttl = "0s")`) || strings.Contains(off, "still runs") {
+	for _, want := range []string{`suite reaping is off too (gc.suite_idle_ttl = "0s")`,
+		"still deleted are suites evicted at the freshness.max_suites total cap (no current snapshot, not requested for 24h)",
+		"daily, signed-seen records of untracked paths last seen over a year ago"} {
+		if !strings.Contains(off, want) {
+			t.Errorf("detail with a 0s TTL = %q; want it to contain %q", off, want)
+		}
+	}
+	if strings.Contains(off, "still runs") {
 		t.Errorf("detail with a 0s TTL = %q; want it to say suite reaping is off", off)
+	}
+}
+
+// The final fix wave's re-review (logging minor 3): startup logs the
+// gc_disabled WARN with the detail for the configured gc.suite_idle_ttl,
+// through serveListeners' real startup — not the default's, nor "0s"'s.
+func TestServeListeners_GCDisabledNamesTheConfiguredTTL(t *testing.T) {
+	for _, tc := range []struct {
+		knob string
+		ttl  time.Duration
+	}{{`"48h"`, 48 * time.Hour}, {`"0s"`, 0}} {
+		t.Run(tc.ttl.String(), func(t *testing.T) {
+			recs := startupLogs(t, t.TempDir(), "[gc]\nenabled = false\nsuite_idle_ttl = "+tc.knob+"\n")
+			var details []any
+			for _, rec := range recs {
+				if rec["msg"] == "gc_disabled" {
+					details = append(details, rec["detail"])
+				}
+			}
+			if want := gcDisabledDetail(tc.ttl); len(details) != 1 || details[0] != want {
+				t.Fatalf("gc_disabled details = %q; want one, %q", details, want)
+			}
+		})
 	}
 }

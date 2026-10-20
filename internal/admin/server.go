@@ -334,9 +334,15 @@ func New(cfg Config) (*Server, error) {
 	// AIDEV-NOTE: ErrorLog routes net/http's own lines — above all "http:
 	// panic serving …" when a handler panics (a POST /forget whose
 	// Forgetter re-panics after logging freshness_check_panicked
-	// where=forget) — through slog at ERROR, as the proxy listeners route
-	// theirs (newHTTPServer, at WARN), so a JSON log pipeline gets
-	// structured lines, not stderr text (final review spec m1).
+	// where=forget) — through this server's slog handler at ERROR, as the
+	// proxy listeners route theirs at WARN (newHTTPServer) (final review
+	// spec m1). Without it net/http falls back to the standard log
+	// package, which main's slog.SetDefault already sends through the same
+	// handler, but at INFO (so log.level "warn" or "error" drops the line),
+	// and only in a process that called SetDefault (the admin tests do
+	// not). So what this changes is the level, and the server's dependence
+	// on that process-wide setting; in the daemon the line was already a
+	// structured record (the final fix wave's re-review, logging minor 1).
 	s.server = &http.Server{
 		Addr:              cfg.AdminAddr,
 		Handler:           s.buildHandler(),

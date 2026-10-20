@@ -747,11 +747,10 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 // release, recover (first). See recoverGoroutine.
 // AIDEV-NOTE: a repair or reconcile that panics deterministically is
 // logged (adoption_panicked, where=repair: recoverGoroutine), not
-// recorded: the spec
-// C7 record is keyed on upstream content, and an unchanged suite's heal
-// has none, so the next unchanged check runs it again — one ERROR line
-// per cooldown at most (deferred minor B-37, phase B deviation 7; kept in
-// phase E: v7 has no record keyed on a snapshot).
+// recorded: the spec C7 record is keyed on upstream content, and an
+// unchanged suite's heal has none, so the next unchanged check runs it
+// again — one ERROR line per cooldown at most (deferred minor B-37, phase
+// B deviation 7; kept in phase E: v7 has no record keyed on a snapshot).
 func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
 	rp, l, needRepair, needReconcile, declared := out.repair, out.lease, out.needRepair, out.needReconcile, out.declared
 	c.adoptionWg.Add(1)

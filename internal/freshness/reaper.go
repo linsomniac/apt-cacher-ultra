@@ -729,8 +729,10 @@ type junkReadFailures struct {
 // scan reads each blob it has not sniffed once, however many suites share
 // it (at most 64 KiB each). A failed read reaches no verdict and is not
 // remembered, so fails.n counts failed reads, not pool files: one
-// unreadable blob that N suites share is read, and counted, N times (the
-// WARN's count).
+// unreadable blob that N suites share is read, and counted, once for each
+// of them whose scan reaches it — at most N times, since a suite already
+// listed (a non-canonical or idle candidate), or one whose earlier anchor
+// row is no evidence, never reaches it (the WARN's count).
 func (r *Reaper) allJunk(key cache.SuiteKey, as []cache.SuiteAnchorRow, cutoff int64, next map[sniffKey]bool, fails *junkReadFailures) bool {
 	for _, a := range as {
 		if a.BlobHash == nil || a.LastFetchedAt == nil || *a.LastFetchedAt > cutoff {
