@@ -499,12 +499,15 @@ func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 		limit := base + checkWorkers + 1 + 2 + slack
 		maxG := base
 		// offerHook (on the Run goroutine): offers that admitted C2, the
-		// parked re-offer path (review fix round 2, Task 14).
+		// parked re-offer path (review fix round 2, Task 14). Only an
+		// admitting offer counts — result changed, C2's adoption spawned —
+		// not a busy, skipped or unchanged one (final fix wave FW-6, the
+		// Task 14 round-2 re-review minor).
 		var c2Offered atomic.Int32
 		_, stop := startSchedHooked(t, Config{Cache: c, Fetcher: up, HostLimiter: lim, Refresh: refresh,
 			Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }},
 			func(ref SuiteRef, rep checkReport) {
-				if ref.SuitePath == c2Path && !isQueuedResult(rep.result) {
+				if ref.SuitePath == c2Path && rep.result == "changed" {
 					c2Offered.Add(1)
 				}
 			})

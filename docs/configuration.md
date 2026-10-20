@@ -401,9 +401,12 @@ for `InRelease` on every check and moves to the inline form as soon as
 upstream serves one. An `InRelease` whose move failed (a signing key the
 cache does not trust) is tried again at its own retry time (2 minutes,
 doubling to an hour, up to 75 minutes with jitter), whatever the detached
-form publishes meanwhile, and a new `InRelease` is tried at the first
-check that sees it; so a publish that fails in both forms is attempted at
-most once per form per retry, not at every check. When a suite's current
+form publishes meanwhile — unless the detached `Release` is absent too,
+which delays it by at most one retry of the detached form — and a new
+`InRelease` is tried at the first check that sees it; so a publish that
+fails in both forms is attempted once per `InRelease` retry and at most
+twice per `InRelease` retry in the detached form, not at every check.
+When a suite's current
 anchor (`InRelease` for inline, `Release` for detached and unsigned) is
 absent, the status page
 shows "refused: anchor_absent" while the snapshot keeps serving. The suite
@@ -460,18 +463,18 @@ Unsigned adoption has five safeguards:
    has a signed snapshot (the current one, or one of the displaced
    snapshots the cache keeps), or the cache served its signed `InRelease`
    or `Release.gpg`, a check found one upstream, or an earlier version had
-   cached one (recorded at upgrade). The record covers the repository path on its host under both
-   `http` and `https`, so a suite seen signed over one scheme is never
-   adopted unsigned over the other. The rule is checked before an adoption slot is taken and again
-   inside the commit, so a signed anchor served while an unsigned adoption
-   runs still stops it. Just before the commit the cache also re-reads the
-   signed anchors it has cached for the suite, under both schemes, and
-   records any it finds (one cached over the other scheme during the
-   commit's flip barrier, for a suite refused at `freshness.max_suites`, is
-   found only by the next attempt); if
-   it cannot read them, the adoption is refused as well (logged as
-   `adoption: signed-anchor re-mark failed`): that refusal means the cache
-   could not rule out a signature.
+   cached one (recorded at upgrade). The record covers the repository
+   path on its host under both `http` and `https`, so a suite seen signed
+   over one scheme is never adopted unsigned over the other. The rule is
+   checked before an adoption slot is taken and again inside the commit,
+   so a signed anchor served while an unsigned adoption runs still stops
+   it. Just before the commit the cache also re-reads the signed anchors
+   it has cached for the suite, under both schemes, and records any it
+   finds (one cached over the other scheme during the commit's flip
+   barrier, for a suite refused at `freshness.max_suites`, is found only
+   by the next attempt); if it cannot read them, the adoption is refused
+   as well (logged as `adoption: signed-anchor re-mark failed`): that
+   refusal means the cache could not rule out a signature.
 4. At most 1,000 files declared in the `Release`'s SHA256 and SHA512
    lists, each path counted once (files listed only under MD5Sum or SHA1
    do not count), checked before an adoption slot is taken

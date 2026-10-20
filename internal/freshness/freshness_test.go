@@ -1654,6 +1654,46 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 	}
 }
 
+// Final fix wave FW-6 (final tests review X1; Task 6 minor: the phase-D
+// fallback lost its test when the adopter-wired path moved to the probe
+// tree): with no adopter (Phase 1, a global constraint: adoption-disabled
+// behaviour stays as today) a never-adopted suite whose InRelease answers
+// 404 while a Release url_path row exists falls back to the detached
+// check: Release and Release.gpg are fetched and the change is observed
+// in the detached form — not a failed check.
+func TestCheck_Phase1DetachedFallback_OnInRelease404(t *testing.T) {
+	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
+	stale := strings.Repeat("0", 64)
+	up := simtest.NewUpstream() // InRelease: 404
+	up.Set("http://127.0.0.1/dists/noble/Release", simtest.Serve([]byte("Origin: Test\nSuite: noble\n")))
+	up.Set("http://127.0.0.1/dists/noble/Release.gpg", simtest.Serve(armoredSig("phase 1 fallback")))
+	for _, name := range []string{"InRelease", "Release", "Release.gpg"} {
+		h := stale
+		fc.putURL(cache.URLPath{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", Path: "/dists/noble/" + name,
+			BlobHash: &h, UpstreamURL: "http://127.0.0.1/dists/noble/" + name, IsMetadata: true})
+	}
+	logs := &lockedBuffer{}
+	c, err := New(Config{Cache: fc, Fetcher: up, HostLimiter: hostsem.New(8),
+		Logger: slog.New(slog.NewJSONHandler(logs, nil)), now: func() time.Time { return time.Unix(12000, 0) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := c.check(context.Background(), SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"}, checkOpts{})
+	for _, name := range []string{"InRelease", "Release", "Release.gpg"} {
+		if n := len(up.Calls("http://127.0.0.1/dists/noble/" + name)); n != 1 {
+			t.Fatalf("%s requested %d times, want 1 (the 404, then the detached check)", name, n)
+		}
+	}
+	lines := logRecords(t, logs, "freshness_check")
+	if rep.result != "changed" || len(lines) != 1 || lines[0]["form"] != "detached" || lines[0]["result"] != "changed" {
+		t.Fatalf("report %q, freshness_check lines %v; want one detached \"changed\" observation", rep.result, lines)
+	}
+	if n := len(logRecords(t, logs, "freshness check failed")); n != 0 {
+		t.Fatalf("%d failed-check lines, want 0: the 404 falls back, it does not fail", n)
+	}
+}
+
 // TestCheck_DetachedFallback_OnMissingInReleaseURLRow covers the
 // other detached-fallback bootstrap path: the suite has Release +
 // Release.gpg url_path rows but no InRelease row at all (real-world:

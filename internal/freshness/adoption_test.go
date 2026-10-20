@@ -190,6 +190,7 @@ func newAdoptionTestEnv(t *testing.T) *adoptionTestEnv {
 		Fetcher:     ff,
 		Verifier:    passThroughVerifier{},
 		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(), // silent (final fix wave FW-6: it logged adoption_success & co. to stderr)
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)

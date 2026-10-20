@@ -239,7 +239,7 @@ type Checker struct {
 	// recordAdoptionFailure for a lateral request, read by lateralInline,
 	// dropped with the suite's lock-map entry (unlockDropped). Failures of
 	// the detached form never touch it. In memory only; a restart costs at
-	// most one extra lateral attempt per suite.
+	// most one extra attempt per form (see lateralInline).
 	lateralHolds sync.Map
 
 	// lockLoadedHook, when set (tests only), runs in lockSuite — so in

@@ -201,6 +201,11 @@ func TestCheckFirst_ClassificationPerAnchor(t *testing.T) {
 				if row.CheckFailCount != 1 || row.CurrentSnapshotID != nil || row.LastSuccessAt != nil {
 					t.Fatalf("row %+v, want a failed check: streak 1, nothing adopted, no success", row)
 				}
+				// An unknown answer decides nothing: no record (an unknown
+				// Release is not an absent anchor; final fix wave FW-6, C5).
+				if row.AdoptionFailCount != 0 {
+					t.Fatalf("record %q/%d after an unknown answer, want none", strOf(row.AdoptionFailReason), row.AdoptionFailCount)
+				}
 				if got := checkTotal(t, "failed", rigHost) - before; got != 1 {
 					t.Fatalf("failed checks counted %v, want 1", got)
 				}
@@ -898,6 +903,37 @@ func TestCheckFirst_ReleaseGPGRowAloneIsNotClientInterest(t *testing.T) {
 	r.check()
 	if n := len(r.up.etagsSent(rigAnchorURL)); n != 0 {
 		t.Fatalf("%d requests for a suite whose only client-created anchor row is Release.gpg, want 0", n)
+	}
+}
+
+// Final fix wave FW-6 (final tests review P14; the Task 6 reviewer's killer
+// test): bytes refused as unsigned_downgrade_refused were never confirmed,
+// so once the signed history is gone (phase F's orphan-marker sweep,
+// POST /forget) the same bytes still need the two-observation
+// confirmation (C5 safeguard 2): the "confirmed once" rule excludes the
+// refusal (design note 17).
+func TestCheckFirst_RefusedBytesAreConfirmedOnceTheMarkerIsGone(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopter.adoptUnsigned = true
+	ctx := context.Background()
+	if err := r.cache.MarkSignedSeenBatch(ctx, []cache.SignedSeenMark{{CanonicalScheme: "http",
+		CanonicalHost: rigHost, Base: rigSuite, SeenAt: r.clock.now().Unix()}}); err != nil {
+		t.Fatal(err)
+	}
+	r.unsignedRelease("u1", nil)
+	r.check()
+	if got := strOf(r.row().AdoptionFailReason); got != cache.ReasonUnsignedDowngradeRefused {
+		t.Fatalf("setup: record %q, want unsigned_downgrade_refused", got)
+	}
+	if err := r.cache.ClearSignedSeenForTest(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.advance(3 * time.Minute) // the refusal's retry is due
+	r.check()
+	row := r.row()
+	if row.CurrentSnapshotID != nil || strOf(row.AdoptionFailReason) != cache.ReasonUnsignedUnconfirmed {
+		t.Fatalf("after the marker is gone: adopted %v, record %q; want a first observation (unsigned_unconfirmed)",
+			row.CurrentSnapshotID != nil, strOf(row.AdoptionFailReason))
 	}
 }
 

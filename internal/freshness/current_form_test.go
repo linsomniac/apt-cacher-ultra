@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	mrand "math/rand/v2"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -861,6 +862,79 @@ func TestCheck_AbsentUnsignedReleaseTreeFindsASignature(t *testing.T) {
 	}
 }
 
+// Final fix wave FW-6 (final tests review C5, the adopted-tree leg): an
+// adopted suite whose absent anchor's probe tree meets an unknown Release
+// (a 503) fails the check — the streak extends — and records nothing: an
+// unknown answer is not an absent anchor, so the anchor_absent record
+// neither grows nor resets the streak.
+func TestCheck_AbsentAnchorTreeWithAnUnknownReleaseFailsTheCheck(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopt()
+	r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 404})
+	r.clock.advance(time.Minute)
+	r.check() // the first absent observation
+	if row := r.row(); strOf(row.AdoptionFailReason) != cache.ReasonAnchorAbsent || row.AdoptionFailCount != 1 {
+		t.Fatalf("setup: record %q/%d, want anchor_absent/1", strOf(row.AdoptionFailReason), row.AdoptionFailCount)
+	}
+	r.up.setFail(rigReleaseURL, &fetch.StatusError{Code: 503})
+	r.clock.advance(6 * time.Minute) // past the gap and the record's retry time: the tree runs
+	r.check()
+	if n := len(r.up.etagsSent(rigReleaseURL)); n != 1 {
+		t.Fatalf("setup: the tree probed Release %d times, want 1", n)
+	}
+	row := r.row()
+	if row.CheckFailCount != 1 || row.AdoptionFailCount != 1 || strOf(row.AdoptionFailReason) != cache.ReasonAnchorAbsent {
+		t.Fatalf("check_fail_count %d, record %q/%d; want a failed check and the record untouched",
+			row.CheckFailCount, strOf(row.AdoptionFailReason), row.AdoptionFailCount)
+	}
+}
+
+// Final fix wave FW-6 (final tests review W3b): an unsigned suite whose
+// absent Release's probe tree finds a signature (InRelease appeared
+// between the upgrade probe and the tree) marks the base before admitting
+// the upgrade; when that marker write fails the check fails and nothing is
+// attempted — nothing is admitted on a signature the cache could not
+// record (design note 30).
+func TestCheck_AbsentUnsignedReleaseTreeFailedMarkFailsTheCheck(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptUnsigned("u1")
+	signed := r.release("now signed", 0)
+	var n atomic.Int32
+	up := simtest.NewUpstream() // Release and Release.gpg: 404
+	up.Set(rigAnchorURL, func(ctx context.Context, etag string) (*fetch.ConditionalResult, error) {
+		if n.Add(1) <= 2 { // the upgrade probes of both checks; the tree's probe finds it
+			return nil, &fetch.StatusError{Code: 404}
+		}
+		return simtest.Serve(signed)(ctx, etag)
+	})
+	chk, err := New(Config{Cache: r.cache, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+		Adopter: r.adopter, Logger: discardLogger(), now: r.clock.now, rand: func() float64 { return 0.5 }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	chk.Check(ctx, "http", rigHost, rigSuite) // Release absent: anchor_absent recorded
+	chk.WaitForAdoptions()
+	db, err := sql.Open("sqlite", filepath.Join(r.cache.Dir(), "cache.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`CREATE TRIGGER no_marks BEFORE INSERT ON suite_signed_seen
+  BEGIN SELECT RAISE(ABORT, 'marker writes fail'); END`); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.advance(10 * time.Minute)
+	chk.Check(ctx, "http", rigHost, rigSuite) // the tree finds InRelease; the mark fails
+	chk.WaitForAdoptions()
+	if n.Load() != 3 {
+		t.Fatalf("setup: InRelease probed %d times, want 3 (the tree reached it)", n.Load())
+	}
+	if row := r.row(); row.CheckFailCount != 1 || r.ver.calls() != 0 || r.currentSnapshot().Form != cache.FormUnsigned {
+		t.Fatalf("check_fail_count %d, verifier calls %d: want a failed check and no upgrade attempt", row.CheckFailCount, r.ver.calls())
+	}
+}
+
 // Deviation 2, for anchor_absent (design review M-19): a future
 // adoption_fail_first_at never confirms the absence — the tree does not
 // run — and re-recording restarts it at now (recordAdoptionFailure's
@@ -1084,7 +1158,10 @@ func TestCheck_AbsentAnchorThatComesBackIsUnchanged(t *testing.T) {
 // the detached path's content at the next check after it (new content
 // against the lateral's record, spec C7). Before PE-10 the two forms took
 // the one record in turn and every check was an attempt (6 in six checks
-// 20 s apart, 1 a minute after that).
+// 20 s apart, 1 a minute after that). The rig's jitter is off (rand 0.5):
+// with the production jitter the detached content can come due inside
+// the lateral's window, so the exact bound is at most twice per lateral
+// window (TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds).
 func TestCheck_BothSignedFormsFailingAreAttemptedOncePerFormPerRetryWindow(t *testing.T) {
 	r := newRetryRig(t, 0)
 	r.adoptDetached()
@@ -1105,8 +1182,8 @@ func TestCheck_BothSignedFormsFailingAreAttemptedOncePerFormPerRetryWindow(t *te
 	}
 	// The lateral's window: the retry time written at its last failure
 	// (the second check's record was the detached one, so read it from the
-	// first attempt: 20 s + 2 min).
-	lateralRetry := r.clock.now().Add(-100 * time.Second).Unix()
+	// first attempt: 20 s + 2 min, which is 20 s after now, 120 s in).
+	lateralRetry := r.clock.now().Add(20 * time.Second).Unix()
 	detachedSinceLateral := 1
 	for i := range 240 { // four hours of checks a minute apart
 		calls := r.ver.calls()
@@ -1136,6 +1213,136 @@ func TestCheck_BothSignedFormsFailingAreAttemptedOncePerFormPerRetryWindow(t *te
 	if got := r.ver.calls(); got > 14 {
 		t.Fatalf("%d attempts in four hours and two minutes, want at most 14", got)
 	}
+}
+
+// bothFormsFailing makes the rig's detached suite publish one release that
+// fails in both signed forms and returns the two content keys.
+func bothFormsFailing(r *retryRig) (kIn, kDet string) {
+	in := r.release("v2", 0)
+	rel, sig := r.releaseText("v2", 0), armoredSig("v2 sig")
+	kIn, kDet = contentKey(adoptionFormInline, in, nil, nil), contentKey(adoptionFormDetached, nil, rel, sig)
+	r.ver.reject(kIn)
+	r.ver.reject(kDet)
+	r.up.set(in)
+	r.up.setAt(rigReleaseURL, rel)
+	r.up.setAt(rigReleaseGPGURL, sig)
+	return kIn, kDet
+}
+
+// Ruling on the Task 7 round-2 re-review minors, as restated by the final
+// fix wave (FW-6), with the production jitter (the re-reviewer's probe 1):
+// with both signed forms failing, the lateral InRelease is never attempted
+// before its own retry time, and the detached content at most twice per
+// lateral window — at its own retry time, which the ±25 % jitter can put
+// inside the lateral's window, and at the check after each lateral
+// attempt. (About a quarter more attempts than once per form per window:
+// accepted, no further machinery.)
+func TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptDetached()
+	rnd := mrand.New(mrand.NewPCG(1, 2))
+	r.checker.rand = rnd.Float64
+	kIn, kDet := bothFormsFailing(r)
+	lateral, detached, windows, twice, since := 0, 0, 0, 0, 0
+	var lateralRetry int64
+	for m := 0; m < 2*24*60; m += 2 { // two days, a check every two minutes
+		r.clock.advance(2 * time.Minute)
+		calls := r.ver.calls()
+		r.check()
+		if r.ver.calls() == calls {
+			continue
+		}
+		row := r.row()
+		now := r.clock.now().Unix()
+		switch strOf(row.AdoptionFailHash) {
+		case kIn:
+			if lateral > 0 {
+				windows++
+				if since == 2 {
+					twice++
+				}
+				if now < lateralRetry {
+					t.Fatalf("+%d min: the lateral InRelease was attempted %d s before its own retry time", m, lateralRetry-now)
+				}
+			}
+			lateral++
+			since, lateralRetry = 0, i64Of(row.AdoptionNextRetryAt)
+		case kDet:
+			detached++
+			if since++; since > 2 {
+				t.Fatalf("+%d min: the detached content was attempted %d times in one lateral window, want at most 2", m, since)
+			}
+		}
+	}
+	t.Logf("two days: %d lateral and %d detached attempts; %d lateral windows, %d with two detached attempts",
+		lateral, detached, windows, twice)
+	if windows < 30 {
+		t.Fatalf("only %d lateral windows in two days: the lateral was starved", windows)
+	}
+	if twice == 0 {
+		t.Fatal("no lateral window had two detached attempts: the jitter no longer exercises the bound")
+	}
+}
+
+// The second restated bound (the re-reviewer's probe 3): both forms fail,
+// the detached content last, then upstream's Release and Release.gpg go
+// away. The check that finds Release absent behind the detached content's
+// record is paced by that record (ruling PE-10), so the failing lateral
+// InRelease, whose own retry time comes first, waits for it: it is
+// attempted again at most one detached window late — at the detached
+// record's retry time — never later.
+func TestCheck_LateralWaitsAtMostOneDetachedWindowBehindAnAbsentAnchor(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adoptDetached()
+	kIn, kDet := bothFormsFailing(r)
+	attempted := func() string {
+		calls := r.ver.calls()
+		r.check()
+		if r.ver.calls() == calls {
+			return ""
+		}
+		return strOf(r.row().AdoptionFailHash)
+	}
+	var lateralRetry int64
+	lastLateral := false
+	for i := 0; ; i++ { // both forms fail until the detached content holds a count-4 record
+		if i > 600 {
+			t.Fatal("setup: the detached content never failed after the lateral")
+		}
+		r.clock.advance(time.Minute)
+		switch attempted() {
+		case kIn:
+			lastLateral, lateralRetry = true, i64Of(r.row().AdoptionNextRetryAt)
+		case kDet:
+			if lastLateral && r.row().AdoptionFailCount >= 4 {
+				goto absent
+			}
+			lastLateral = false
+		}
+	}
+absent:
+	detachedRetry := i64Of(r.row().AdoptionNextRetryAt)
+	if lateralRetry >= detachedRetry {
+		t.Fatalf("setup: the lateral's retry (%d) is not before the detached record's (%d)", lateralRetry, detachedRetry)
+	}
+	r.up.mu.Lock()
+	delete(r.up.bodies, rigReleaseURL)
+	delete(r.up.bodies, rigReleaseGPGURL)
+	r.up.mu.Unlock()
+	for m := 1; m <= 180; m++ {
+		r.clock.advance(time.Minute)
+		if attempted() != kIn {
+			continue
+		}
+		if now := r.clock.now().Unix(); now > detachedRetry+60 {
+			t.Fatalf("the lateral was attempted %d s after the detached record's retry time, want at most one detached window late",
+				now-detachedRetry)
+		} else if now < lateralRetry {
+			t.Fatalf("the lateral was attempted %d s before its own retry time", lateralRetry-now)
+		}
+		return
+	}
+	t.Fatal("the lateral InRelease was not attempted again in 3 h")
 }
 
 // churnDetached makes the rig's detached form publish new failing content
@@ -1229,7 +1436,9 @@ func TestCheck_FailingLateralInReleaseIsRetriedWithinItsOwnWindow(t *testing.T) 
 // the lateral's own hold has an hour to run), a checker that keeps its
 // memory makes no lateral attempt in the next 50 minutes, and a restarted
 // one — which never saw the lateral fail — makes exactly one, then holds it
-// by the memo of that failure.
+// by the memo of that failure. (Its record replaces the detached one, so
+// the detached content is attempted once more too: a restart costs at most
+// one extra attempt per form, as lateralInline states.)
 func TestCheck_ARestartCostsAtMostOneExtraLateralAttempt(t *testing.T) {
 	for _, restart := range []bool{false, true} {
 		t.Run(map[bool]string{false: "kept", true: "restarted"}[restart], func(t *testing.T) {

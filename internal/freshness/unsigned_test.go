@@ -370,6 +370,18 @@ func TestRunUnsigned_RemarkReadsBothSchemes(t *testing.T) {
 	}
 }
 
+// Spec C5 safeguard 4 at its boundary (final fix wave FW-6, final tests
+// review X6): at most 1,000 declared members — exactly 1,000 adopts, 1,001
+// is unsigned_too_large.
+func TestUnsignedCap_Boundary(t *testing.T) {
+	if err := unsignedCap(1000); err != nil {
+		t.Fatalf("unsignedCap(1000) = %v, want nil: the cap is at most 1,000", err)
+	}
+	if err := unsignedCap(1001); !errors.Is(err, ErrAdoptionUnsignedTooLarge) {
+		t.Fatalf("unsignedCap(1001) = %v, want ErrAdoptionUnsignedTooLarge", err)
+	}
+}
+
 // Ruling R-E1, fail closed: when signed evidence cannot be read, or the
 // re-mark cannot be written, the unsigned adoption is refused, never
 // committed — and the fault is logged (design review M-1: the refusal

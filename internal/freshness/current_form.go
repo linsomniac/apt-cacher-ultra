@@ -270,15 +270,24 @@ func (c *Checker) anchorFoundAgain(ctx context.Context, out *checkOutcome, cur *
 // content, each failure pushing the record's retry time. So a failed
 // lateral attempt is remembered per suite (Checker.lateralHolds: its
 // content key and the retry time written for it), and only that content
-// is held, until that time. The bounds: with both forms failing, each
-// form is attempted at most once per lateral retry window (the lateral
-// when its hold comes due, the detached path's content at the next check,
-// new content against the lateral's record, spec C7); a failing lateral
-// InRelease is retried within its own window — the C7 delay at its
-// failure, up to 75 minutes with the ±25 % jitter — whatever the detached
-// form does; a new InRelease is attempted at the first check that sees
-// it. The memo is in memory: a restart costs at most one extra lateral
-// attempt per suite.
+// is held, until that time. The bounds, stated exactly (final fix wave
+// FW-6, ruling on the Task 7 round-2 minors; no further machinery): with
+// both forms failing, the lateral is attempted at most once per lateral
+// retry window (when its hold comes due) and the detached content at most
+// twice per lateral window — at the check after each lateral attempt (new
+// content against the lateral's record, spec C7), and at its own retry
+// time, which the ±25 % jitter can put inside the lateral's window
+// (TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds); a
+// failing lateral InRelease is retried within its own window — the C7
+// delay at its failure, up to 75 minutes with the jitter — except when
+// the detached anchor answers absent behind the detached content's
+// record: that record then paces the suite (pacedAbsentAnswer), delaying
+// the lateral by at most one detached window
+// (TestCheck_LateralWaitsAtMostOneDetachedWindowBehindAnAbsentAnchor); a
+// new InRelease is attempted at the first check that sees it. The memo is
+// in memory: a restart costs at most one extra attempt per form (the
+// restarted checker's lateral attempt replaces the detached record, so
+// the next check attempts the detached content again).
 func (c *Checker) lateralInline(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef,
 	urls anchorURLs, gate retryGate, signedCurrent bool, nowUnix int64) (req *adoptionRequest, done, held bool) {
 	o := c.probe(fetchCtx, suite, urls, "InRelease")

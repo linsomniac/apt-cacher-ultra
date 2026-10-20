@@ -575,12 +575,18 @@ unchanged, observation only):
    suite, in memory (its content key and the retry time its failure
    wrote), and only that content is held — until that time, or while it is
    the active, not-due record's content; the detached form's failures
-   never extend the hold. So with both forms failing each form is
-   attempted at most once per lateral retry window; a failing lateral
-   `InRelease` is retried within its own window (the C7 delay at its
-   failure, up to 75 minutes with jitter); a new `InRelease` is attempted
-   at the first check that sees it; a restart costs at most one extra
-   lateral attempt. Then the conditional GET of `Release` as today; a changed
+   never extend the hold. So with both forms failing the lateral is
+   attempted at most once per lateral retry window and the detached
+   content at most twice per lateral window (after each lateral attempt,
+   and at its own retry time, which the jitter can put inside the lateral's
+   window); a failing lateral `InRelease` is retried within its own window
+   (the C7 delay at its failure, up to 75 minutes with jitter), except
+   that a detached anchor answering absent behind the detached content's
+   record delays it by at most one detached window (that record paces the
+   suite, ruling PE-10); a new `InRelease` is attempted at the first check
+   that sees it; a restart costs at most one extra attempt per form (phase
+   E final fix wave, FW-6: the bounds stated exactly, jitter-tested). Then
+   the conditional GET of `Release` as today; a changed
    `Release` whose `Release.gpg` is *absent* records `anchor_absent` and is
    never adopted (phase E, design review M-14), unless a failing lateral
    record holds: that record keeps its reason and schedule.
