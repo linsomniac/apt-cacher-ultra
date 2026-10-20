@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"slices"
 	"time"
 
@@ -59,6 +60,9 @@ const (
 	// Run starts (ruling PF-13: a wrong boot clock has a day to be
 	// corrected), then a day apart (monotonic).
 	dailyEvery = 24 * time.Hour
+	// maxStepAhead is where stepAhead saturates: the largest Duration
+	// (math.MaxInt64 ns, some 292 years); see deferredByForwardStep.
+	maxStepAhead = time.Duration(math.MaxInt64)
 )
 
 // ReaperConfig configures a Reaper.
@@ -93,9 +97,9 @@ type Reaper struct {
 	// step of the wall clock (design review M-8); stepAhead is the sum of
 	// every forward step the guard detected — how far the wall clock ran
 	// ahead of the monotonic clock — which the marker sweep's cutoff takes
-	// off (ruling PF-13). reported is the furthest future interest stamp
-	// the previous run found (design review M-10). Only the run's goroutine
-	// touches them.
+	// off (ruling PF-13), saturating at maxStepAhead. reported is the
+	// furthest future interest stamp the previous run found (design review
+	// M-10). Only the run's goroutine touches them.
 	lastWall, lastMono, deferUntil time.Time
 	stepAhead                      time.Duration
 	reported                       futureStamp
@@ -209,12 +213,13 @@ type reapCandidate struct {
 // NTP fault before the start, which the guard cannot see) would make
 // orphan markers look older, and a swept marker cannot come back, so a
 // wrong boot clock has a day to be corrected. The cost: a daemon
-// restarted more often than daily never sweeps (orphan markers are tiny
-// rows; the safe side), and a wrong step that outlives a restart
-// uncorrected for a day still ages markers by it (documented residual). A
-// run the forward-step guard defers neither reaps nor sweeps, and leaves
-// the sweep due for the next run (design review M-8); a detected step no
-// longer ages markers at all (stepAhead, sweepMarkers).
+// restarted at least once a day (before its first sweep comes due) never
+// sweeps (orphan markers are tiny rows; the safe side), and a wrong step
+// that outlives a restart uncorrected for a day still ages markers by it
+// (documented residual). A run the forward-step guard defers neither reaps
+// nor sweeps, and leaves the sweep due for the next run (design review
+// M-8); a detected step no longer ages markers at all (stepAhead,
+// sweepMarkers).
 func (r *Reaper) runOnce(ctx context.Context) {
 	rows, err := r.cache.ListSuitesWithAdoption(ctx)
 	if err != nil {
@@ -268,7 +273,9 @@ func (r *Reaper) runOnce(ctx context.Context) {
 // seen signed — cannot come back. After a genuine suspend this only keeps
 // markers longer, the safe side.
 func (r *Reaper) sweepMarkers(ctx context.Context, now, fresh time.Time) {
-	res, err := r.cache.SweepOrphanMarkers(ctx, fresh.Unix(), now.Add(-r.stepAhead-markerTTL).Unix())
+	// Two Adds, never the one Duration sum −stepAhead − markerTTL, which
+	// would wrap once stepAhead nears maxStepAhead (deferredByForwardStep).
+	res, err := r.cache.SweepOrphanMarkers(ctx, fresh.Unix(), now.Add(-markerTTL).Add(-r.stepAhead).Unix())
 	var furthest cache.SignedSeenMark
 	if res.Furthest != nil {
 		furthest = *res.Furthest
@@ -306,7 +313,12 @@ func (r *Reaper) sweepMarkers(ctx context.Context, now, fresh time.Time) {
 // for the life of the process: a step later corrected backwards, or a
 // genuine suspend, then keeps markers longer — the safe side, since the
 // sweep's deletions are permanent and reaping's are not (a reaped suite
-// re-adopts at its next request).
+// re-adopts at its next request). It saturates at maxStepAhead (the final
+// fix wave's re-review, reaper minor 3): a sum that wrapped negative would
+// put the sweep's cutoff centuries ahead and sweep every orphan marker. At
+// the bound it stays there, and the cutoff, which subtracts markerTTL and
+// stepAhead in two time.Time.Add calls (sweepMarkers), lies centuries
+// back: the sweep deletes nothing.
 func (r *Reaper) deferredByForwardStep(now, mono time.Time) bool {
 	if !r.lastMono.IsZero() {
 		elapsed := mono.Sub(r.lastMono)
@@ -315,7 +327,8 @@ func (r *Reaper) deferredByForwardStep(now, mono time.Time) bool {
 			r.logger.Warn("clock_step_detected", "stamp", "wall_clock",
 				"stored_unixtime", r.lastWall.Unix()+int64(elapsed/time.Second), "now_unixtime", now.Unix())
 			r.deferUntil = mono.Add(r.floor)
-			r.stepAhead += ahead
+			// 0 <= stepAhead <= maxStepAhead, so the difference cannot wrap.
+			r.stepAhead += min(ahead, maxStepAhead-r.stepAhead)
 		}
 	}
 	r.lastWall, r.lastMono = now, mono

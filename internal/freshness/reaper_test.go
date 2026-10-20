@@ -354,8 +354,10 @@ func TestReaperCandidates_ReportsAFutureStampOnlyWhenItChanges(t *testing.T) {
 	}
 }
 
-// Spec C9: a run tries at most 25 suites, oldest last_requested_at first;
-// the next run takes the rest.
+// Spec C9: a run tries at most 25 idle suites (reapsPerRun; since ruling
+// PF-14 the suites reaped regardless of idleness have a budget of their
+// own, TestReaper_EachClassHasItsOwnBudget), oldest last_requested_at
+// first; the next run takes the rest.
 func TestReaper_AtMost25PerRunOldestFirst(t *testing.T) {
 	r := newReaperRig(t)
 	for i := range 30 {
@@ -378,9 +380,12 @@ func TestReaper_AtMost25PerRunOldestFirst(t *testing.T) {
 // 251 non-canonical rows (legacy rows whose clients still ask for them)
 // and 26 idle suites, one run tries exactly regardlessReapsPerRun (250) of
 // the first, in key order, and reapsPerRun (25) of the second, the
-// oldest; the next run takes the one left of each. A busy candidate
-// counts against its own class's budget: with the first non-canonical row
-// held, the run tries 249 others of its class, and still 25 idle ones.
+// oldest; the next run takes the one left of each. The first class is
+// tried first (the final fix wave's re-review, reaper minor 2): every
+// non_canonical suite_reaped line comes before every idle one. A busy
+// candidate counts against its own class's budget: with the first
+// non-canonical row held, the run tries 249 others of its class, and
+// still 25 idle ones.
 func TestReaper_EachClassHasItsOwnBudget(t *testing.T) {
 	for _, busy := range []bool{false, true} {
 		t.Run(fmt.Sprintf("busy %v", busy), func(t *testing.T) {
@@ -422,6 +427,15 @@ func TestReaper_EachClassHasItsOwnBudget(t *testing.T) {
 			}
 			if reasons["non_canonical"] != wantRegardless || reasons["idle"] != 25 {
 				t.Fatalf("one run reaped %v; want %d non_canonical and 25 idle", reasons, wantRegardless)
+			}
+			var order []string
+			for _, ev := range r.events("suite_reaped") {
+				order = append(order, fmt.Sprint(ev["reason"]))
+			}
+			want := append(slices.Repeat([]string{"non_canonical"}, wantRegardless), slices.Repeat([]string{"idle"}, 25)...)
+			if !slices.Equal(order, want) {
+				t.Fatalf("suite_reaped lines in log order: the first idle one at %d of %d; want the %d non_canonical first",
+					slices.Index(order, "idle"), len(order), wantRegardless)
 			}
 			if !r.exists(legacy(250)) || !r.exists(idle(25)) {
 				t.Fatalf("the last of each class reaped by the first run (legacy %v, idle %v); want it left for the next",

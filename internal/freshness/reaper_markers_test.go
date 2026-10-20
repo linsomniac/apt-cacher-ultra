@@ -3,6 +3,7 @@ package freshness
 import (
 	"context"
 	"maps"
+	"math"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -269,6 +270,92 @@ func TestReaper_AForwardStepWhileRunningAgesNoMarker(t *testing.T) {
 		}
 		if r.markerAt("/orphan/dists/s") == -1 {
 			t.Fatal("an orphan 303 days old by the monotonic count was swept after a forward step of 70 days")
+		}
+	})
+}
+
+// Ruling PF-13 (the final fix wave's re-review, reaper minor 1): stepAhead
+// adds up every forward step the guard detects, so a later step never
+// makes the sweeps forget an earlier one. Two wrong forward steps of 40
+// days each, seen by the runs at 13 h and 37 h, leave stepAhead at
+// exactly 80 days. An orphan 340 days old at the start — 343 by the
+// monotonic count at the sweep at 72 h, 423 by the stepped clock, and 383
+// with only the last step taken off — is kept by the sweeps at 24 h, 48 h
+// and 72 h, while a year-old orphan is swept.
+func TestReaper_ForwardStepsAddUp(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newReaperRig(t)
+		var step atomic.Int64
+		start := time.Now()
+		r.checker.now = func() time.Time { return time.Unix(reapNow+step.Load(), 0).Add(time.Since(start)) }
+		r.mark("/orphan/dists/s", reapNow-340*reapDay)
+		r.mark("/old/dists/s", reapNow-366*reapDay)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { r.reaper.Run(ctx); close(done) }()
+		time.Sleep(12*time.Hour + time.Second) // the runs at 1 h … 12 h
+		step.Store(40 * reapDay)               // the first step, seen by the run at 13 h
+		time.Sleep(24 * time.Hour)             // the sweep at 24 h
+		step.Store(80 * reapDay)               // the second, seen by the run at 37 h
+		time.Sleep(36 * time.Hour)             // the sweeps at 48 h and 72 h
+		cancel()
+		<-done
+		var steps int
+		for _, ev := range r.events("clock_step_detected") {
+			if ev["stamp"] == "wall_clock" {
+				steps++
+			}
+		}
+		if steps != 2 || r.reaper.stepAhead != 80*24*time.Hour {
+			t.Fatalf("%d forward steps detected, stepAhead %v; want 2 and 1920h0m0s (both steps)", steps, r.reaper.stepAhead)
+		}
+		if r.markerAt("/old/dists/s") != -1 {
+			t.Fatal("the sweeps after the steps kept an orphan a year old")
+		}
+		if r.markerAt("/orphan/dists/s") == -1 {
+			t.Fatal("an orphan 343 days old by the monotonic count was swept after two forward steps of 40 days")
+		}
+	})
+}
+
+// The final fix wave's re-review (reaper minor 3): stepAhead saturates. A
+// detected step adds to it without wrapping; at the bound — maxStepAhead,
+// the largest Duration, some 292 years — it stays there, and the sweep's
+// cutoff does not overflow. Seeded an hour short of the bound, stepAhead
+// takes one more detected step, of 70 days, and stays at the bound; the
+// sweep that follows deletes no orphan marker, neither one a day old nor
+// one two years old (a stepAhead wrapped negative, or a cutoff computed as
+// one overflowing Duration sum, puts the cutoff centuries ahead and sweeps
+// both). With stepAhead back at zero, the next sweep deletes the
+// two-year-old one: the sweeps ran.
+func TestReaper_StepAheadSaturates(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		r := newReaperRig(t)
+		r.mark("/young/dists/s", reapNow-reapDay)
+		r.mark("/old/dists/s", reapNow-2*365*reapDay)
+		r.reaper.stepAhead = math.MaxInt64 - time.Hour
+		// The previous run's readings: the wall clock (the rig's checker, at
+		// reapNow) has since run 70 days further than the monotonic clock.
+		r.reaper.lastWall, r.reaper.lastMono = time.Unix(reapNow-70*reapDay, 0), time.Now()
+		r.reaper.runOnce(ctx) // detects the step: deferred, no sweep
+		if ev := r.events("clock_step_detected"); len(ev) != 1 || ev[0]["stamp"] != "wall_clock" {
+			t.Fatalf("clock_step_detected = %v, want one with stamp=wall_clock", ev)
+		}
+		if r.reaper.stepAhead != math.MaxInt64 {
+			t.Fatalf("stepAhead = %d ns after a step at an hour short of the bound; want it saturated at %d",
+				int64(r.reaper.stepAhead), int64(math.MaxInt64))
+		}
+		time.Sleep(r.reaper.floor) // the deferral ends
+		r.reaper.runOnce(ctx)      // the sweep: due (dailyAt is zero outside Run)
+		if r.markerAt("/young/dists/s") == -1 || r.markerAt("/old/dists/s") == -1 {
+			t.Fatalf("the sweep at the bound deleted orphans (a day old: %d, two years old: %d; -1: swept); want none",
+				r.markerAt("/young/dists/s"), r.markerAt("/old/dists/s"))
+		}
+		r.reaper.stepAhead, r.reaper.dailyAt = 0, time.Time{}
+		r.reaper.runOnce(ctx)
+		if r.markerAt("/young/dists/s") == -1 || r.markerAt("/old/dists/s") != -1 {
+			t.Fatal("with stepAhead zero, the sweep did not delete just the two-year-old orphan")
 		}
 	})
 }

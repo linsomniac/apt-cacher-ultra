@@ -1415,8 +1415,8 @@ for the rest of the process (PF-13): the hour gives clients time to
 touch their suites, but no client touches an orphan marker, and a swept
 marker cannot come back. Residuals of PF-13: a wrong step that outlives
 a restart, uncorrected for a day, still ages markers by it, and a daemon
-restarted more often than daily never sweeps (orphan markers are small
-rows: the safe side). Reaps are counted by reason
+restarted at least once a day (before its first sweep comes due) never
+sweeps (orphan markers are small rows: the safe side). Reaps are counted by reason
 (`acu_suites_reaped_total{reason}`). The gpg once-logger sets start
 over when a new key finds 10,000 entries. Snapshot GC gains sub-job C,
 in the periodic ticks only — the startup pass, which runs before the

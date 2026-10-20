@@ -812,8 +812,8 @@ stops, and its first record sweep comes a day after the start (then one
 a day), so a clock that was ahead at the start has a day to be
 corrected. Two limits remain: a step the daemon was restarted across,
 not corrected within a day of the start, makes the sweep delete records
-up to the step early; and a daemon restarted more often than daily
-never sweeps those records. `"0s"` turns suite reaping off; the reaper
+up to the step early; and a daemon restarted at least once a day
+(before its first sweep comes due) never sweeps those records. `"0s"` turns suite reaping off; the reaper
 then only deletes the year-old records of signed paths no suite tracks.
 
 ## `[admin]`: status, metrics, and maintenance
