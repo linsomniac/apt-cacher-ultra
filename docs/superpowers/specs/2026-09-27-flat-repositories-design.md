@@ -1303,7 +1303,14 @@ all lead to refusals; strict posture changes as eager adoptions land after
 upgrade. Conversely, a signed snapshot with incomplete coverage turns strict
 mode off for its whole host, flat or `dists/` (for a flat suite, a
 `no_sha256` stanza): PR #8 avoided this for flat snapshots by scoping them to
-their directory, which this design does not do.
+their directory, which this design does not do. Strict mode fails open on a
+database error of its lookups (the `package_hash` read on a hit or after a
+download, the host's coverage read), each logged WARN, so a transient SQLite
+fault does not refuse every `.deb`; a lookup that failed because the
+request's context ended is no database error and is answered 503
+(`client_canceled`) on the hit path, never served (phase E final fix wave,
+FW-5: a MITM tunnel's Drain cancels the inner request while its writer
+stays live).
 
 ### C11. Observability and configuration
 

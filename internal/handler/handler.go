@@ -1005,6 +1005,16 @@ func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, r
 	rows, err := h.cache.DeclaredHashesForPath(r.Context(),
 		req.CanonicalScheme, req.CanonicalHost, req.Path)
 	if err != nil {
+		// AIDEV-NOTE: a lookup that failed because the request's context
+		// ended is no database fault: answer client_canceled (503), never
+		// the .deb (final fix wave FW-5 (a), final spec review M1). For a
+		// MITM client the tunnel manager's Drain cancels the inner
+		// request's context while the tunnel's writer stays live, so the
+		// fail-open below delivered an unvouched .deb at shutdown — the
+		// class the Task 9 fix closed only after the strict wait.
+		if clientLeft(w, r) {
+			return true, "client_canceled", http.StatusServiceUnavailable, 0, false, packageValidation{}
+		}
 		h.logger.Warn("package_hash lookup failed",
 			"err", err,
 			"canonical_host", req.CanonicalHost,
@@ -1012,7 +1022,9 @@ func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, r
 		)
 		// Fall through to a normal serve — the on-disk url_path row is
 		// our best Phase-1-grade answer. A hard fail-closed here would
-		// turn a transient SQLite hiccup into a global .deb 502 storm.
+		// turn a transient SQLite hiccup into a global .deb 502 storm
+		// (documented in configuration.md: strict mode fails open on a
+		// database error).
 		return false, "", 0, 0, false, packageValidation{}
 	}
 	distinct := distinctDeclared(rows)
@@ -1030,6 +1042,11 @@ func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, r
 		}
 		switch sm, snapID, count := h.classifyStrictMode(r.Context(),
 			req.CanonicalScheme, req.CanonicalHost); sm {
+		case strictCanceled:
+			// The coverage lookup failed on the request's ended context:
+			// client_canceled, never the .deb (FW-5 (a)).
+			clientLeft(w, r)
+			return true, "client_canceled", http.StatusServiceUnavailable, 0, false, packageValidation{}
 		case strictRefuse:
 			if mayWait && h.adoptions != nil && h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
 				waited := h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost, start)
@@ -2702,7 +2719,7 @@ func isDebPath(p string) bool {
 }
 
 // strictModeRefusal classifies an unvouched .deb GET against the SPEC3
-// §6.1 predicate. The three return modes correspond directly to the
+// §6.1 predicate. The first three return modes correspond directly to the
 // three branches in the spec:
 //
 //   - strictRefuse: refuseUnvouchedDebs is on AND adoption.enabled is
@@ -2718,6 +2735,9 @@ func isDebPath(p string) bool {
 //   - strictInactive: any of (refuseUnvouchedDebs is off, adoption.enabled
 //     is false, host has no current snapshots, or a DB error). The
 //     handler proceeds with Phase 1 / Phase 2 behavior unchanged.
+//   - strictCanceled (phase E final fix wave): the lookup failed because
+//     the request's context ended; the hit path answers client_canceled
+//     (503) instead of failing open.
 //
 // classifyStrictMode is the test seam — it returns the category and
 // the identifying snapshot id (for the passthrough log line) without
@@ -2729,6 +2749,10 @@ const (
 	strictInactive strictModeOutcome = iota
 	strictRefuse
 	strictPassthrough
+	// strictCanceled: the coverage lookup failed because the request's
+	// context ended — never a fail-open serve (FW-5 (a)). The miss path's
+	// fetch, which needs the same context, fails on it anyway.
+	strictCanceled
 )
 
 // classifyStrictMode runs the SPEC3 §6.1 predicate against a .deb
@@ -2746,11 +2770,18 @@ func (h *Handler) classifyStrictMode(ctx context.Context, scheme, host string) (
 	}
 	rows, err := h.cache.HostCurrentSnapshotsCoverage(ctx, scheme, host)
 	if err != nil {
+		// A lookup that failed because ctx ended (the client left, or
+		// Drain cancelled a MITM tunnel's request) is no database fault
+		// and must not fail open: strictCanceled, and the hit path answers
+		// client_canceled (final fix wave FW-5 (a), final spec review M1).
+		if ctx.Err() != nil {
+			return strictCanceled, 0, 0
+		}
 		// SPEC3 §6.1 is silent on DB failures of this lookup. The
 		// least-disruptive behavior is "fail open" — strict mode is
 		// an opt-in tightening; a transient SQLite hiccup must not
 		// turn into a global .deb refusal storm. Log at Warn so the
-		// signal is visible.
+		// signal is visible (documented in configuration.md).
 		h.logger.Warn("strict-mode coverage lookup failed",
 			"err", err,
 			"canonical_host", host,

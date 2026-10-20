@@ -3,8 +3,13 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +18,9 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
+	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
@@ -40,6 +48,73 @@ func TestServeHTTP_MissThatCreatesItsSuiteFiresT1(t *testing.T) {
 		if calls := r.fresh.snapshot(); len(calls) != want || (want == 1 && calls[0].suitePath != "/r/dists/s") {
 			t.Fatalf("adoption=%v: T1 calls %v, want %d for /r/dists/s", adoption, calls, want)
 		}
+	}
+}
+
+// Final fix wave FW-5 (c) (final spec review M2, its probe): T1-on-seed end
+// to end through the real handler, the real checker and the real adopter.
+// A first-contact miss of a new suite's InRelease creates its row — with
+// the miss row's request count and the creation's interest stamp, which
+// spec C4 Dispatch 3 requires — and fires T1, whose eager first adoption
+// gives the suite a current snapshot with no further client request. The
+// recording double of the other T1 tests cannot see a regression in that
+// seam.
+func TestServeHTTP_FirstContactMissAdoptsThroughTheRealChecker(t *testing.T) {
+	ctx := context.Background()
+	var logbuf syncLog
+	logger := slog.New(slog.NewJSONHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Log(logbuf.String())
+		}
+	})
+	c := simtest.OpenCache(t)
+	const host, suite = "e2e.example", "/r/dists/s"
+	pkgs := []byte("Package: p\nArchitecture: amd64\nVersion: 1\nFilename: pool/p_1_amd64.deb\nSize: 1\nSHA256: " +
+		strings.Repeat("ab", 32) + "\n\n")
+	sum := sha256.Sum256(pkgs)
+	inRel := simtest.ClearsignedFixture(fmt.Sprintf("Label: e2e\nSHA256:\n %s %d main/binary-amd64/Packages\n",
+		hex.EncodeToString(sum[:]), len(pkgs)))
+	members := &memberStore{bodies: map[string][]byte{}}
+	members.put("http://"+host+suite+"/main/binary-amd64/Packages", pkgs)
+	ad, err := freshness.NewAdopter(freshness.AdoptionConfig{Cache: c, Fetcher: members, Verifier: plainVerifier{},
+		HostLimiter: hostsem.New(8), Logger: simtest.DiscardLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probes := &simtest.StaticConditional{Status: http.StatusOK, Body: inRel}
+	ck, err := freshness.New(freshness.Config{Cache: c, Fetcher: probes, HostLimiter: hostsem.New(8),
+		Logger: logger, Adopter: ad, LifetimeCtx: ctx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parser, err := proxy.New(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := New(Config{Parser: parser, Cache: c, Fetch: staticUpstream{"http://" + host + suite + "/InRelease": inRel},
+		Logger: logger, HostLimiter: hostsem.New(8), Freshness: ck, AdoptionEnabled: true, SuiteGuard: ck})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+host+suite+"/InRelease", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first contact = %d", rec.Code)
+	}
+	h.activeWG.Wait() // the T1 goroutine (Close would cancel its context)
+	ck.WaitForAdoptions()
+	sf, err := c.GetSuiteFreshness(ctx, "http", host, suite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sf.CurrentSnapshotID == nil {
+		t.Fatalf("the first-contact miss led to no eager first adoption (%d probes)", probes.Calls())
+	}
+	snap, err := c.GetSuiteSnapshot(ctx, *sf.CurrentSnapshotID)
+	if err != nil || snap.Form != cache.FormInline {
+		t.Fatalf("current snapshot %+v (err %v), want the inline form", snap, err)
 	}
 }
 

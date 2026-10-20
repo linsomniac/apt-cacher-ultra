@@ -2,8 +2,10 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -374,5 +376,73 @@ func TestServeHTTP_StrictHitClientLeftDuringTheWait(t *testing.T) {
 				t.Fatalf("request line mitm = %v, want %v", lines[0]["mitm"], tc.mitm)
 			}
 		})
+	}
+}
+
+// Final fix wave FW-5 (a) (final spec review M1, its probe): on the hit
+// path, strict mode's first package_hash lookup on a dead context — a MITM
+// tunnel's inner request that Drain cancelled while the tunnel's writer
+// stays live — answers client_canceled (503), never the unvouched .deb its
+// fail-open used to serve, and logs no database fault.
+func TestServeHTTP_StrictHitLookupOnADeadContextIsClientCanceled(t *testing.T) {
+	a := &fakeAdoptions{inFlight: false}
+	h, logs, srvURL, _, _ := strictWaitRig(t, a)
+	r := proxyReq("GET", srvURL, waitDebPath)
+	req, err := h.parser.Parse(r.RequestURI, r.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(proxy.WithMITMContext(context.Background()))
+	cancel() // Drain cancelled the inner request's context
+	r = r.WithContext(ctx)
+	rec := httptest.NewRecorder()
+	served, outcome, status, _, fellThrough, _ := h.checkPackageHash(rec, r, req, sha256Hex([]byte("cached")), time.Now())
+	if !served || fellThrough || outcome != "client_canceled" || status != http.StatusServiceUnavailable || rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("served %v fellThrough %v outcome %q status %d (written %d); want client_canceled 503, never the fail-open serve",
+			served, fellThrough, outcome, status, rec.Code)
+	}
+	for _, rec := range logs.records() {
+		if rec["msg"] == "package_hash lookup failed" {
+			t.Fatalf("logged %q for a client that left: %v", rec["msg"], rec)
+		}
+	}
+}
+
+// FW-5 (a) for classifyStrictMode, and the documented fail-open it keeps:
+// a coverage lookup that fails on a dead context is strictCanceled, with no
+// WARN; one that fails on a live context (a database fault) fails open
+// (strictInactive) with WARN "strict-mode coverage lookup failed".
+func TestClassifyStrictMode_LookupErrors(t *testing.T) {
+	h, logs, _, scheme, canon := strictWaitRig(t, &fakeAdoptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if sm, _, _ := h.classifyStrictMode(ctx, scheme, canon); sm != strictCanceled {
+		t.Fatalf("dead context: outcome %v, want strictCanceled", sm)
+	}
+	warns := func() int {
+		n := 0
+		for _, rec := range logs.records() {
+			if rec["msg"] == "strict-mode coverage lookup failed" {
+				n++
+			}
+		}
+		return n
+	}
+	if n := warns(); n != 0 {
+		t.Fatalf("%d coverage-lookup WARNs for a dead context, want 0", n)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(h.cache.Dir(), "cache.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`ALTER TABLE suite_snapshot RENAME TO suite_snapshot_unreadable`); err != nil {
+		t.Fatal(err)
+	}
+	if sm, _, _ := h.classifyStrictMode(context.Background(), scheme, canon); sm != strictInactive {
+		t.Fatalf("database fault: outcome %v, want strictInactive (fail open)", sm)
+	}
+	if n := warns(); n != 1 {
+		t.Fatalf("%d coverage-lookup WARNs for a database fault, want 1", n)
 	}
 }

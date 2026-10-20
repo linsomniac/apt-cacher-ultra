@@ -643,6 +643,16 @@ never strict. Strict posture changes as eager first adoptions land after
 an upgrade. Conversely, a signed snapshot with incomplete coverage turns
 strict mode off for its whole host.
 
+Strict mode fails open on a database error: when the cache cannot read a
+package's vouching hashes or its host's snapshot coverage, the `.deb` is
+served as if strict mode were off, so a transient SQLite fault does not
+turn into a refusal of every package. Each such read logs WARN
+(`package_hash lookup failed` on a cache hit, `strict-mode coverage lookup
+failed`, and `package_hash validate lookup failed` after a download). A
+request whose client left (or, through the HTTPS proxy, whose tunnel is
+shutting down) is not a database error: it is answered 503 and never
+served an unvouched package.
+
 ## `[gc]`: garbage collection
 
 | Key | Type | Default | Behavior and constraints |
