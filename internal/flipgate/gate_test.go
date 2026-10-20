@@ -899,7 +899,7 @@ func TestGate_IdleEntriesExpire(t *testing.T) {
 // reaper, cap eviction, POST /forget) but never a live one — a serve in
 // flight, a serve that completed within the quiet period (a flip of a
 // re-created suite must still wait it out), or a flip in progress. A live
-// entry expires on its own; a token of a dropped entry stays harmless.
+// entry expires on its own.
 func TestGate_PurgeSkipsLiveEntries(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := newTestGate(t)
@@ -917,14 +917,6 @@ func TestGate_PurgeSkipsLiveEntries(t *testing.T) {
 		if !g.Purge("k") || g.Len() != 0 {
 			t.Fatalf("Purge kept an idle entry (%d left)", g.Len())
 		}
-		old.Done()
-		if g.Len() != 0 {
-			t.Fatal("a purged entry's token re-created it")
-		}
-		start := time.Now()
-		if _, err := g.Flip(bg, "k", noCommit); err != nil || time.Since(start) != 0 {
-			t.Fatalf("a fresh entry was delayed %v by a purged entry's serve (err %v)", time.Since(start), err)
-		}
 		release := make(chan struct{})
 		out := flipAsync(bg, g, "k2", func() error { <-release; return nil })
 		synctest.Wait()
@@ -934,6 +926,62 @@ func TestGate_PurgeSkipsLiveEntries(t *testing.T) {
 		close(release)
 		if o := <-out; o.err != nil {
 			t.Fatal(o.err)
+		}
+	})
+}
+
+// Ruling R-F2 for the requests a hold releases (the Task 1 review's minor
+// 1): the end of a flip — its hold's end and its own — counts as use, so
+// Purge keeps the entry for a quiet period after it. A released request
+// registers on the entry it joined only once it re-locks the gate, which
+// can be after the flip has returned; a Purge in that window that dropped
+// the entry would let a re-created suite's next flip skip the request's
+// serve. Which goroutine takes the gate first cannot be forced, so the
+// first half pins the clause with no request at all (the flip's end is
+// the entry's only recent use: under the old last-completion clause it
+// was purged), and the second half shows a released request's entry kept,
+// and waited on, whichever goroutine wins.
+func TestGate_PurgeKeepsTheEntryOfAFlipThatJustEnded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		g.AnchorStart(bg, "k").Done()
+		time.Sleep(testQuiet) // the serve is a quiet period old: alone it would not keep the entry
+		if _, err := g.Flip(bg, "k", func() error { time.Sleep(5 * time.Second); return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if g.Purge("k") {
+			t.Fatal("purged the entry of a flip that ended just now")
+		}
+		time.Sleep(testQuiet - time.Second)
+		if g.Purge("k") {
+			t.Fatalf("purged the entry of a flip that ended %v ago, within the quiet period", testQuiet-time.Second)
+		}
+		time.Sleep(time.Second)
+		if !g.Purge("k") || g.Len() != 0 {
+			t.Fatalf("kept the entry of a flip that ended a quiet period ago (%d left)", g.Len())
+		}
+
+		release := make(chan struct{})
+		out := flipAsync(bg, g, "h", func() error { <-release; return nil }) // idle: holds at once
+		synctest.Wait()
+		held := make(chan *Token, 1)
+		go func() { held <- g.AnchorStart(bg, "h") }()
+		synctest.Wait() // the request waits in the hold
+		close(release)
+		if o := <-out; o.err != nil {
+			t.Fatal(o.err)
+		}
+		if g.Purge("h") { // the released request may not have re-locked the gate yet
+			t.Error("purged the entry of a flip whose hold has just released a request") // not Fatal: drain the request
+		}
+		tok := <-held
+		go func() { time.Sleep(3 * time.Second); tok.Done() }()
+		start := time.Now()
+		if _, err := g.Flip(bg, "h", noCommit); err != nil {
+			t.Fatal(err)
+		}
+		if w := time.Since(start); w != 3*time.Second+testQuiet {
+			t.Fatalf("the next flip waited %v, want the released request's serve (3s) and the quiet period (%v)", w, testQuiet)
 		}
 	})
 }

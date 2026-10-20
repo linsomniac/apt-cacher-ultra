@@ -272,16 +272,24 @@ func (g *Gate) Len() int {
 // Spec C8: an entry is purged when its suite's row is deleted — reaped,
 // evicted or forgotten (the checker's HoldSuite release(true)). A live
 // entry is kept: a flip of it in progress, an anchor serve of it in
-// flight, or one that completed within the quiet period. It expires on
-// its own once idle for twice the quiet period (sweepLocked).
+// flight, or any use of it within the quiet period — a serve completed, a
+// hold or a flip ended. It expires on its own once idle for twice the
+// quiet period (sweepLocked).
 //
 // AIDEV-NOTE: ruling R-F2 (phase D final review, concurrency M4). The
 // deleter's release(true) runs after its commit, so a re-creation of the
 // suite can register a serve before it; dropping that entry would let the
 // re-created suite's next flip skip the serve's quiet period — its client
-// could fetch the new snapshot's indexes for the old anchor. Purging a
-// live entry was never needed: a dropped entry's tokens touch only it, and
-// an idle one goes with the sweep (TestGate_PurgeSkipsLiveEntries,
+// could fetch the new snapshot's indexes for the old anchor. The quiet
+// clause reads lastUse, not lastDone (the Task 1 review's minor 1): the
+// requests a hold released register on the entry they joined only once
+// they re-lock the gate, possibly after the flip has returned, and the
+// hold's end and the flip's end stamp lastUse, so a Purge in that window
+// keeps the entry. Which goroutine takes the gate first cannot be forced
+// in a test; TestGate_PurgeKeepsTheEntryOfAFlipThatJustEnded pins the
+// clause (a flip's end alone keeps the entry) and shows a released
+// request's entry kept and waited on. Purging a live entry was never
+// needed: an idle one goes with the sweep (TestGate_PurgeSkipsLiveEntries,
 // TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry).
 func (g *Gate) Purge(key string) bool {
 	if g == nil {
@@ -298,10 +306,12 @@ func (g *Gate) Purge(key string) bool {
 }
 
 // liveLocked reports whether a flip of e is in progress or holds, an
-// anchor serve of it is in flight, or one completed within quiet.
+// anchor serve of it is in flight, or e was used within quiet: lastUse is
+// at least lastDone (Token.Done sets both) and is also stamped when a hold
+// or a flip of e ends. Purge and sweepLocked share it, so their two
+// readings of "live" cannot drift apart.
 func (e *entry) liveLocked(now time.Time, quiet time.Duration) bool {
-	return e.flips > 0 || e.hold != nil || len(e.inflight) > 0 ||
-		(!e.lastDone.IsZero() && now.Sub(e.lastDone) < quiet)
+	return e.flips > 0 || e.hold != nil || len(e.inflight) > 0 || now.Sub(e.lastUse) < quiet
 }
 
 // Close ends the barrier at shutdown; main calls it at the signal, before
@@ -706,15 +716,16 @@ func (g *Gate) entryLocked(key string, now time.Time) *entry {
 }
 
 // sweepLocked drops entries idle for twice the quiet period (spec C8), at
-// most once per quiet period. An idle entry's last completion is older
-// than the quiet period, so dropping it loses nothing a flip waits for.
+// most once per quiet period. An idle entry is not live (liveLocked) and
+// its last completion is older than the quiet period, so dropping it
+// loses nothing a flip waits for.
 func (g *Gate) sweepLocked(now time.Time) {
 	if now.Sub(g.lastSweep) < g.quiet {
 		return
 	}
 	g.lastSweep = now
 	for k, e := range g.entries {
-		if len(e.inflight) == 0 && e.hold == nil && e.flips == 0 && now.Sub(e.lastUse) >= 2*g.quiet {
+		if !e.liveLocked(now, g.quiet) && now.Sub(e.lastUse) >= 2*g.quiet {
 			delete(g.entries, k)
 		}
 	}
@@ -802,9 +813,13 @@ func (g *Gate) changedLocked() <-chan struct{} {
 // and asks for a new channel and timer. The cost is bounded by the flips
 // waiting at once — one or two under the default pool, since a flip keeps
 // its global adoption slot through the barrier (ruling R-C1) — for at most
-// the barrier's 140 s. Per-entry wake channels would remove it but change
-// the wake mechanism every barrier guarantee rests on, for no measured
-// gain; revisit if max_concurrent_adoptions grows large.
+// the barrier's 140 s. With max_concurrent_adoptions = 0 (unlimited) the
+// pool bound is gone: the flips waiting at once are bounded only by the
+// suites adopting at once (one flip per suite, at most max_suites), and
+// every completion wakes them all — the case to measure first. Per-entry
+// wake channels would remove it but change the wake mechanism every
+// barrier guarantee rests on, for no measured gain; revisit if
+// max_concurrent_adoptions grows large or is set to 0 on a busy cache.
 func (g *Gate) broadcastLocked() {
 	if g.changed != nil {
 		close(g.changed)
