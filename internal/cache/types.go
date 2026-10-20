@@ -204,7 +204,12 @@ type SuiteSnapshot struct {
 	AdoptedAt        *int64 // NULL while candidate; set on flip
 	Form             AnchorForm
 	ReleaseDate      *int64 // parsed Release Date (phase B); NULL until then
-	RetiredAt        *int64 // set when the suite incarnation is reaped/forgotten (phase F)
+	// RetiredAt is set when the snapshot is retired (phase F): with every
+	// snapshot of its suite not yet retired when the suite's row is deleted
+	// — reaped, evicted at the cap, or forgotten (deleteSuiteTx,
+	// retireSuiteSnapshotsTx) — or alone when the legacy trust audit
+	// quarantines it (quarantineSnapshotTx). Sub-job C deletes it.
+	RetiredAt *int64
 
 	// PackageCoverageComplete is the SPEC3 §7.5.4 per-snapshot proof
 	// that strict mode (§6.1) keys on. True iff every Release-listed

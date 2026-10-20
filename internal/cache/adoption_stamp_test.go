@@ -12,7 +12,7 @@ import (
 // its current snapshot's stamp led the clock — it was adopted before a
 // backward step — and then re-created stamps its first adoption above the
 // retired snapshot's stamp while that snapshot is still there (sub-job C
-// deletes it at the next GC run: adoptionStampTx's residual), so a
+// deletes it at a periodic GC tick: adoptionStampTx's residual), so a
 // client's If-Modified-Since from that snapshot's anchor gets no 304 for
 // the new one (a quarantine clears the pointer with the same effect). A
 // suite with a current snapshot floors on its displaced snapshots too

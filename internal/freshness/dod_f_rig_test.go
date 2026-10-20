@@ -107,7 +107,9 @@ func firstPeriodicTick(t *testing.T, g *gc.GC) {
 // that then deletes the retired snapshot leaves the new one whole. The
 // startup GC pass, which runs before the listeners serve, leaves the
 // retired snapshot (ruling PF-15: no sub-job C there); the first periodic
-// tick deletes it.
+// tick deletes it, since the startup pass here reaches no deadline (one
+// whose blob pass did would leave sub-job C to a later tick: the passes
+// resume in rotation).
 func TestDoD_ReturnBeforeGCReadoptsWithinOneCheck(t *testing.T) {
 	ctx := context.Background()
 	r := newRetryRig(t, time.Minute)

@@ -506,8 +506,10 @@ func serveListeners(
 	// immediately and the periodic goroutine below is never started.
 	// The one-shot pass runs no snapshot-GC sub-job C (ruling PF-15):
 	// retired snapshots never serve, so a backlog of them after a burst
-	// of reaps must not keep the listeners closed; the first periodic
-	// tick deletes them.
+	// of reaps must not keep the listeners closed; the periodic ticks
+	// delete them, normally the first (a later one when an earlier pass,
+	// the startup pass's blob pass say, hit its deadline: the passes
+	// resume in rotation).
 	gcsvc, err := gc.New(gc.Config{
 		Cache:                 c,
 		Logger:                logger,

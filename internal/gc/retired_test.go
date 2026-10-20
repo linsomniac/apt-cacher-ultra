@@ -3,6 +3,7 @@ package gc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -12,16 +13,20 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
-// Spec C9 sub-job C and §7 "blobs reclaimed within two GC ticks": a suite
-// reaped (or forgotten) leaves retired snapshots — here two, the current
-// one and the one it displaced, so the pass must loop past its first
-// deleted header (the Task 4 review's minor 1). The startup pass, which
-// runs before any listener serves, leaves them and their blobs (ruling
-// PF-15: no sub-job C there, retired_reaped 0) and still runs its blob
-// pass, which reclaims an unreferenced orphan blob; the first periodic tick's
-// snapshot pass deletes them (retired_reaped in its gc_run_complete and
-// LastRunSummary) and the same tick's blob pass reclaims their blobs once
-// blob_grace has passed.
+// Spec C9 sub-job C and §7 "blobs reclaimed within two periodic GC ticks":
+// a suite reaped (or forgotten) leaves retired snapshots — here two, the
+// current one and the one it displaced, so the pass must loop past its
+// first deleted header (the Task 4 review's minor 1). The startup pass,
+// which runs before any listener serves, leaves them and their blobs
+// (ruling PF-15: no sub-job C there, retired_reaped 0), still runs
+// sub-jobs A and B — a candidate whose heartbeat went stale, and another
+// suite's fourth displaced snapshot beyond keep_displaced = 3, are deleted
+// (the final fix wave's re-review, gc-sims minor 2) — and still runs its
+// blob pass, which reclaims an unreferenced orphan blob. Since that pass
+// finishes every pass (none reaches its deadline), the first periodic
+// tick's snapshot pass deletes the retired snapshots (retired_reaped in
+// its gc_run_complete and LastRunSummary) and the same tick's blob pass
+// reclaims their blobs once blob_grace has passed.
 func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		c := openTestCache(t)
@@ -45,6 +50,21 @@ func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
 		for _, h := range append(blobs, orphan) {
 			fastForwardZeroedAt(t, db, h)
 		}
+		staleAnchor := putPoolBlob(t, c, "a stale candidate's anchor")
+		stale, _, err := c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{CanonicalScheme: "http",
+			CanonicalHost: "h", SuitePath: "/r/dists/y", InReleaseHash: &staleAnchor})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE suite_snapshot SET heartbeat_at = 1 WHERE snapshot_id = ?`, stale); err != nil {
+			t.Fatal(err)
+		}
+		var displaced int64 // the oldest of five: beyond the current one and keep_displaced = 3
+		for i := range 5 {
+			if id := adoptSnapshot(t, c, "http", "h", "/r/dists/z", putPoolBlob(t, c, fmt.Sprintf("z anchor %d", i)), nil); i == 0 {
+				displaced = id
+			}
+		}
 		g, err := New(Config{Cache: c, Logger: logger, Enabled: true, Interval: time.Hour, BatchSize: 100,
 			SnapshotBatchSize: 10, MaxTickDuration: time.Minute, BlobGrace: time.Minute, KeepDisplaced: 3,
 			PoolScanWorkers: 2, HeartbeatStaleGrace: 30 * time.Minute})
@@ -66,8 +86,14 @@ func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
 		if blobRowExists(t, db, orphan) || fileExists(t, c.BlobPath(orphan)) {
 			t.Fatal("the startup pass kept an orphan blob: ending the snapshot pass before sub-job C skipped its blob pass")
 		}
-		if s, ok := g.LastRunSummary(); !ok || s.Phase != "startup" || s.RetiredReaped != 0 {
-			t.Fatalf("startup LastRunSummary = %+v, %v; want retired_reaped 0", s, ok)
+		if s, ok := g.LastRunSummary(); !ok || s.Phase != "startup" || s.RetiredReaped != 0 ||
+			s.OrphanCandidatesReaped != 1 || s.DisplacedReaped != 1 {
+			t.Fatalf("startup LastRunSummary = %+v, %v; want retired_reaped 0, and sub-jobs A and B run "+
+				"(orphan_candidates_reaped 1, displaced_reaped 1)", s, ok)
+		}
+		if snapshotRowExists(t, db, stale) || snapshotRowExists(t, db, displaced) {
+			t.Fatalf("after the startup pass: stale candidate kept %v, displaced snapshot beyond keep_displaced kept %v; "+
+				"want both deleted (sub-jobs A and B)", snapshotRowExists(t, db, stale), snapshotRowExists(t, db, displaced))
 		}
 		life, cancel := context.WithCancel(ctx)
 		done := make(chan struct{})

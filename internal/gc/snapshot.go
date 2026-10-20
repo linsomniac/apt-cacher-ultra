@@ -36,9 +36,15 @@ type snapshotPassResult struct {
 // reap retires its current and displaced ones) could keep every listener
 // closed up to max_tick_duration. The startup pass therefore ends the
 // snapshot pass once A ∪ B is drained, as if C were done, so its blob pass
-// still runs, and the first periodic tick runs C from the start (its
-// snapshot pass begins with A ∪ B, then C). Retired rows linger one GC
-// interval longer at most.
+// still runs. The periodic ticks run C, normally the first: its snapshot
+// pass begins with A ∪ B, then C. Not always the first (the final fix
+// wave's re-review, gc-sims minor 1): the passes resume in rotation
+// (runTick), so when the startup pass's own blob pass hits its deadline,
+// the first periodic tick resumes only that blob pass, and C runs at the
+// second at the earliest; a periodic pass that hits its deadline defers C
+// the same way. Retired rows wait for that tick: normally one GC interval
+// after the startup pass, two or more when its blob pass hit its deadline.
+// They never serve meanwhile.
 //
 // Returns:
 //   - the cumulative counts (orphan, displaced, retired),

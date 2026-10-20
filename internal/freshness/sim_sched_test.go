@@ -628,16 +628,21 @@ func baseGoroutines() int {
 // starting and exiting — it read 22–49 where a goroutine profile taken at
 // once showed 12–15, all expected (9 failures in 36 runs under CPU load).
 // Waiting first let them settle (0 in 60). What is left is a goroutine
-// that has just exited — outside the bubble, so no Wait covers it; a
-// restart starts and ends several — still counted until the runtime
-// recycles it, while its thread is descheduled under load: phase F's
-// final review (tests I-1) caught 6 such reads in 64 restart-simulation
-// runs (load1 about 20), each a dump of exactly the expected goroutines
-// taken right after the second read of 9 against 8. A re-read after a
-// bare second Wait, microseconds later, did not absorb it; one after a
-// stop-the-world does (the reviewer's overlay: 0 failures in 64 runs, 4
-// transients absorbed, and 0 in 108 with the stop between the reads). A
-// real leak stays over the limit on both reads.
+// that has just exited — a bubble goroutine (a restart ends several:
+// Reaper.Run, GC.Run, the cache's writer, database/sql's
+// connectionOpener), whose exit takes it out of the bubble's count, so
+// Wait returns, while the runtime has not yet put it on a free list
+// (gdestroy's gfput), so NumGoroutine still counts it, the longer while
+// its thread is descheduled under load (the final fix wave's re-review,
+// gc-sims minor 5, from the runtime's source). Phase F's final review
+// (tests I-1) caught 6 such reads in 64 restart-simulation runs (load1
+// about 20), each a dump of exactly the expected goroutines taken right
+// after the second read of 9 against 8. A re-read after a bare second
+// Wait, microseconds later, did not absorb it; one after a stop-the-world
+// does, since the stop cannot complete until the exiting goroutine's
+// thread reaches the scheduler, after gfput (the reviewer's overlay: 0
+// failures in 64 runs, 4 transients absorbed, and 0 in 108 with the stop
+// between the reads). A real leak stays over the limit on both reads.
 func sampleGoroutines(limit int) int {
 	synctest.Wait()
 	n := runtime.NumGoroutine()

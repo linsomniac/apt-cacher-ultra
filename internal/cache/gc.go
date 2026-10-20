@@ -389,9 +389,11 @@ const retiredChunkRows = 10_000
 // when it stopped being current (displacement, the reap's or quarantine's
 // Step-8 decrement); deleting its rows and header only drops the
 // references the blob pass's reachability predicate reads, so its blobs go
-// in the same tick's blob pass once blob_grace has passed — within two GC
-// ticks of the retirement. Chunking bounds the writer's hold on a large
-// suite (tens of thousands of package_hash rows).
+// in the same tick's blob pass once blob_grace has passed — normally within
+// two periodic GC ticks of the retirement (the startup pass runs no sub-job
+// C, ruling PF-15, and a pass that hits its deadline leaves the rest to a
+// later tick). Chunking bounds the writer's hold on a large suite (tens of
+// thousands of package_hash rows).
 func (c *Cache) RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error) {
 	if maxRows <= 0 {
 		maxRows = retiredChunkRows
