@@ -630,3 +630,211 @@ BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
 		})
 	}
 }
+
+// seedSignedHistory gives key a row (last requested at requested) whose
+// only signed history is one adopted snapshot of form (inline or
+// detached) that the legacy trust audit left queued, and so unmarked,
+// after a pool read fault (design review M-8): its base has no
+// signed-seen marker. current makes it the row's current snapshot;
+// otherwise it is displaced and the row has none (the audit retired the
+// quarantined current one). It returns the snapshot's id.
+func seedSignedHistory(t *testing.T, c *Cache, key SuiteKey, form AnchorForm, current bool, requested int64) int64 {
+	t.Helper()
+	ctx := context.Background()
+	h := seedBlob(t, c, "signed history of "+key.CanonicalScheme+key.SuitePath)
+	var id int64
+	if form == FormDetached {
+		g := seedBlob(t, c, "signature of "+key.CanonicalScheme+key.SuitePath)
+		id = seedFormSnapshot(t, c, key.CanonicalScheme, key.CanonicalHost, key.SuitePath, form, nil, &h, &g, true)
+	} else {
+		id = seedFormSnapshot(t, c, key.CanonicalScheme, key.CanonicalHost, key.SuitePath, form, &h, nil, nil, true)
+	}
+	if err := c.EnqueueLegacyTrustAudit(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.Exec(`UPDATE suite_freshness SET last_requested_at = ?,
+  current_snapshot_id = CASE WHEN ? THEN current_snapshot_id END
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+		requested, current, key.CanonicalScheme, key.CanonicalHost, key.SuitePath); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// hostMarker returns the stamp of host h's marker for base under scheme,
+// or -1 when it has none (markerStamp).
+func hostMarker(t *testing.T, c *Cache, scheme, base string) int64 {
+	t.Helper()
+	return markerStamp(t, c, SignedSeenMark{CanonicalScheme: scheme, CanonicalHost: "h", Base: base})
+}
+
+// otherScheme returns the scheme that is not s.
+func otherScheme(s string) string {
+	if s == "http" {
+		return "https"
+	}
+	return "http"
+}
+
+// Ruling PF-12 (final review spec C1): a suite-row delete turns
+// never-downgrade's snapshot clause into a marker before it retires the
+// suite's snapshots. A suite whose only signed history is an adopted
+// snapshot the legacy trust audit left queued and unmarked (design review
+// M-8) — inline or detached, current or displaced, under either scheme,
+// at a /. twin path too — keeps refusing an unsigned candidate after a
+// reap: its base gains a marker under the key's scheme, stamped at the
+// reap (none under the other scheme), and the refusal names that marker,
+// since the snapshot is retired. A marker already ahead of now is never
+// lowered (ruling PF-1).
+func TestReapIdleSuite_TurnsSignedSnapshotHistoryIntoAMarker(t *testing.T) {
+	ahead := evictNow + evictDay
+	for _, tc := range []struct {
+		name    string
+		key     SuiteKey
+		base    string
+		form    AnchorForm
+		current bool
+		prior   int64 // a marker under the key's scheme before the reap; 0: none
+		want    int64 // its stamp after the reap
+	}{
+		{name: "an inline current snapshot over https", key: SuiteKey{CanonicalScheme: "https", CanonicalHost: "h",
+			SuitePath: "/r/dists/x"}, base: "/r/dists/x", form: FormInline, current: true, want: evictNow},
+		{name: "a detached displaced snapshot over http", key: sk("h", "/r/dists/y"), base: "/r/dists/y", form: FormDetached,
+			want: evictNow},
+		{name: "a twin's history marks its base", key: sk("h", "/flat/."), base: "/flat", form: FormInline, current: true,
+			want: evictNow},
+		{name: "a marker ahead of now is kept", key: sk("h", "/r/dists/z"), base: "/r/dists/z", form: FormInline, current: true,
+			prior: ahead, want: ahead},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			defer stubNow(t, evictNow)()
+			id := seedSignedHistory(t, c, tc.key, tc.form, tc.current, evictNow-40*evictDay)
+			scheme := tc.key.CanonicalScheme
+			if tc.prior != 0 {
+				if err := c.MarkSignedSeenBatch(ctx, []SignedSeenMark{{CanonicalScheme: scheme, CanonicalHost: "h",
+					Base: tc.base, SeenAt: tc.prior}}); err != nil {
+					t.Fatal(err)
+				}
+			} else if hostMarker(t, c, scheme, tc.base) != -1 {
+				t.Fatal("premise: the base has a marker")
+			}
+			if err := c.CheckUnsignedDowngrade(ctx, "h", tc.base); !errors.Is(err, ErrUnsignedDowngradeRefused) {
+				t.Fatalf("premise: before the reap an unsigned candidate is %v, want refused", err)
+			}
+			var want *int64
+			if tc.current {
+				want = &id
+			}
+			if del, gone, err := c.ReapIdleSuite(ctx, tc.key, want, evictNow-30*evictDay); err != nil || !del || !gone {
+				t.Fatalf("reap = %v, %v, %v; want deleted", del, gone, err)
+			}
+			if snap, err := c.GetSuiteSnapshot(ctx, id); err != nil || snap.RetiredAt == nil {
+				t.Fatalf("premise: the reap retired the snapshot (%+v, %v)", snap, err)
+			}
+			if at := hostMarker(t, c, scheme, tc.base); at != tc.want {
+				t.Errorf("marker %s://h%s after the reap: %d (-1: none); want %d", scheme, tc.base, at, tc.want)
+			}
+			if at := hostMarker(t, c, otherScheme(scheme), tc.base); at != -1 {
+				t.Errorf("marker %s://h%s after the reap: present at %d; want none (the key's scheme only)",
+					otherScheme(scheme), tc.base, at)
+			}
+			err := c.CheckUnsignedDowngrade(ctx, "h", tc.base)
+			if !errors.Is(err, ErrUnsignedDowngradeRefused) || !strings.Contains(err.Error(), "signed-seen marker") {
+				t.Fatalf("after the reap an unsigned candidate is %v; want refused by the base's marker", err)
+			}
+		})
+	}
+}
+
+// Ruling PF-12 through POST /forget: ForgetSuite's delete writes the
+// history marker too, and then, as before, deletes the base's markers
+// when no row is left for the base or its twin (the marker counted in
+// MarkersDeleted) and keeps them while one is.
+func TestForgetSuite_DeletesTheHistoryMarkerOnlyWithoutAnotherSuite(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		t.Run(fmt.Sprintf("twin kept %v", keep), func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			defer stubNow(t, evictNow)()
+			key := sk("h", "/r/dists/x")
+			id := seedSignedHistory(t, c, key, FormInline, true, evictNow)
+			if keep {
+				seedRow(t, c, sk("h", "/r/dists/x/."), evictNow)
+			}
+			res, err := c.ForgetSuite(ctx, key, &id)
+			if err != nil || !res.Deleted {
+				t.Fatalf("ForgetSuite = %+v, %v", res, err)
+			}
+			at := hostMarker(t, c, "http", "/r/dists/x")
+			if keep && (at != evictNow || res.MarkersDeleted != 0) {
+				t.Fatalf("a twin row left: marker %d (-1: none), %d deleted; want it kept at %d", at,
+					res.MarkersDeleted, evictNow)
+			}
+			if !keep && (at != -1 || res.MarkersDeleted != 1) {
+				t.Fatalf("no row left: marker %d, %d deleted; want the history marker deleted (1)", at,
+					res.MarkersDeleted)
+			}
+		})
+	}
+}
+
+// Ruling PF-12's bound (the harm FW-q1 names): a delete creates a marker
+// only for signed history the clause counts. A suite with no snapshot, an
+// unsigned current one, a retired (quarantined) inline one or an inline
+// candidate never adopted gets no marker under either scheme, and its
+// base's unsigned return stays admitted.
+func TestDeleteSuite_NoSignedHistoryCreatesNoMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed func(t *testing.T, c *Cache, key SuiteKey) *int64 // returns the current snapshot
+	}{
+		{"no snapshot", func(t *testing.T, c *Cache, key SuiteKey) *int64 {
+			seedRow(t, c, key, evictNow-40*evictDay)
+			return nil
+		}},
+		{"an unsigned current snapshot", func(t *testing.T, c *Cache, key SuiteKey) *int64 {
+			h := seedBlob(t, c, "unsigned Release")
+			id := seedFormSnapshot(t, c, key.CanonicalScheme, key.CanonicalHost, key.SuitePath, FormUnsigned, &h, nil, nil, true)
+			return &id
+		}},
+		{"a retired inline snapshot", func(t *testing.T, c *Cache, key SuiteKey) *int64 {
+			id := seedSignedHistory(t, c, key, FormInline, false, evictNow-40*evictDay)
+			if _, err := c.db.Exec(`UPDATE suite_snapshot SET retired_at = 1 WHERE snapshot_id = ?`, id); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		}},
+		{"an inline candidate never adopted", func(t *testing.T, c *Cache, key SuiteKey) *int64 {
+			id := seedSignedHistory(t, c, key, FormInline, false, evictNow-40*evictDay)
+			if _, err := c.db.Exec(`UPDATE suite_snapshot SET adopted_at = NULL WHERE snapshot_id = ?`, id); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			defer stubNow(t, evictNow)()
+			key := sk("h", "/r/dists/x")
+			current := tc.seed(t, c, key)
+			if _, err := c.db.Exec(`UPDATE suite_freshness SET last_requested_at = ? WHERE suite_path = ?`,
+				evictNow-40*evictDay, key.SuitePath); err != nil {
+				t.Fatal(err)
+			}
+			if del, _, err := c.ReapIdleSuite(ctx, key, current, evictNow-30*evictDay); err != nil || !del {
+				t.Fatalf("reap = %v, %v; want deleted", del, err)
+			}
+			for _, scheme := range []string{"http", "https"} {
+				if at := hostMarker(t, c, scheme, "/r/dists/x"); at != -1 {
+					t.Errorf("marker %s://h/r/dists/x after the reap: present at %d; want none", scheme, at)
+				}
+			}
+			if err := c.CheckUnsignedDowngrade(ctx, "h", "/r/dists/x"); err != nil {
+				t.Fatalf("after the reap an unsigned candidate is %v; want admitted (no signed history)", err)
+			}
+		})
+	}
+}

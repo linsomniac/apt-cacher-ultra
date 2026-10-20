@@ -47,9 +47,11 @@ const (
 // backward clock step, never qualifies; nor does a NULL one), unless
 // cutoff is ReapRegardless, which every row passes — and
 // current_snapshot_id equal to wantCurrent (nil: no current snapshot). It
-// releases the current snapshot's pins and retires every snapshot of the
-// suite (retireSuiteSnapshotsTx), deletes the row, and moves the base's
-// signed-seen markers up to now (stampBaseMarkersTx).
+// turns the suite's signed snapshot history into a marker
+// (markSnapshotHistoryTx), releases the current snapshot's pins and
+// retires every snapshot of the suite (retireSuiteSnapshotsTx), deletes
+// the row, and moves the base's signed-seen markers up to now
+// (stampBaseMarkersTx).
 //
 // AIDEV-NOTE: retiring the snapshots is load-bearing: CommitAdoption
 // refuses a retired candidate, and retired rows leave the natural-key,
@@ -66,7 +68,9 @@ const (
 // a reap does, and a dormant suite's marker can be over a year old when it
 // is evicted, so the next daily sweep would delete the never-downgrade
 // protection of a base that was signed
-// (TestCreateSuite_EvictionMovesTheBaseMarkersUp).
+// (TestCreateSuite_EvictionMovesTheBaseMarkersUp). The history marker
+// goes before the retirement, which would hide that history from it
+// (ruling PF-12).
 func deleteSuiteTx(ctx context.Context, tx *sql.Tx, key SuiteKey, wantCurrent *int64, cutoff, now int64) (deleteOutcome, error) {
 	var current, requested sql.NullInt64
 	err := tx.QueryRowContext(ctx, `
@@ -84,6 +88,9 @@ SELECT current_snapshot_id, last_requested_at FROM suite_freshness
 	}
 	if current.Valid != (wantCurrent != nil) || (current.Valid && current.Int64 != *wantCurrent) {
 		return suiteKept, nil
+	}
+	if err := markSnapshotHistoryTx(ctx, tx, key, now); err != nil {
+		return suiteKept, fmt.Errorf("delete suite %s%s: %w", key.CanonicalHost, key.SuitePath, err)
 	}
 	if err := retireSuiteSnapshotsTx(ctx, tx, key, current, now); err != nil {
 		return suiteKept, fmt.Errorf("delete suite %s%s: %w", key.CanonicalHost, key.SuitePath, err)
@@ -109,14 +116,57 @@ DELETE FROM suite_freshness
 // the orphan sweep's year counts from the end of the suite's tracking —
 // after a long downtime, or a dormant suite's eviction, its marker would
 // otherwise be swept a day after it became an orphan. MAX never lowers a
-// stamp (ruling PF-1), and an UPDATE never creates a marker. ForgetSuite
-// may delete the markers afterwards, in the same transaction.
+// stamp (ruling PF-1), and an UPDATE never creates a marker: a base with
+// no signed history must not be refused its unsigned return. The one
+// marker a delete creates is markSnapshotHistoryTx's (ruling PF-12, the
+// exception to PF-10's rule), for a base whose signed history the delete
+// is about to retire. ForgetSuite may delete the markers afterwards, in
+// the same transaction.
 func stampBaseMarkersTx(ctx context.Context, tx *sql.Tx, key SuiteKey, now int64) error {
 	if _, err := tx.ExecContext(ctx, `
 UPDATE suite_signed_seen SET last_seen_at = MAX(last_seen_at, ?)
  WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND base = ?`,
 		now, key.CanonicalHost, aptpath.MarkerBase(key.SuitePath)); err != nil {
 		return fmt.Errorf("stamp markers: %w", err)
+	}
+	return nil
+}
+
+// markSnapshotHistoryTx turns never-downgrade's snapshot clause (spec C5
+// safeguard 3, refuseUnsignedDowngrade) into a marker before deleteSuiteTx
+// retires key's snapshots: when the suite has a snapshot the clause counts
+// (signedHistorySnapshotSQL: adopted, not retired, inline or detached), it
+// upserts the signed-seen marker of its base (aptpath.MarkerBase) under
+// key's scheme, stamped MAX(last_seen_at, now) — one INSERT … SELECT …
+// WHERE EXISTS … ON CONFLICT. A suite without one gets no marker.
+//
+// AIDEV-NOTE: ruling PF-12 (final review spec C1), the one exception to
+// PF-10's "a delete never creates a marker". A retired snapshot is no
+// history, so a delete that retired a suite's only signed history — a
+// pre-v7 snapshot the legacy trust audit left queued and unmarked after a
+// pool read fault (design review M-8) — would admit an unsigned candidate
+// of the base once the row is gone, and the audit's later Keep writes no
+// marker for a suite without a row. The marker is the record that
+// outlives the row (it fails closed). For a snapshot CommitAdoption
+// committed the marker exists already, and this moves it up as
+// stampBaseMarkersTx does. It runs for every delete — cap eviction, a
+// reap, POST /forget — and ForgetSuite still deletes the base's markers
+// afterwards when no row is left for the base or its twin
+// (TestReapIdleSuite_TurnsSignedSnapshotHistoryIntoAMarker,
+// TestCreateSuite_EvictionTurnsSignedSnapshotHistoryIntoAMarker,
+// TestDeleteSuite_NoSignedHistoryCreatesNoMarker).
+func markSnapshotHistoryTx(ctx context.Context, tx *sql.Tx, key SuiteKey, now int64) error {
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO suite_signed_seen (canonical_scheme, canonical_host, base, last_seen_at)
+SELECT ?, ?, ?, ?
+ WHERE EXISTS (SELECT 1 FROM suite_snapshot
+                WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?
+                  AND `+signedHistorySnapshotSQL+`)
+ON CONFLICT(canonical_scheme, canonical_host, base) DO UPDATE SET
+  last_seen_at = MAX(last_seen_at, excluded.last_seen_at)`,
+		key.CanonicalScheme, key.CanonicalHost, aptpath.MarkerBase(key.SuitePath), now,
+		key.CanonicalScheme, key.CanonicalHost, key.SuitePath); err != nil {
+		return fmt.Errorf("mark signed snapshot history: %w", err)
 	}
 	return nil
 }
@@ -290,8 +340,10 @@ func (c *Cache) DeleteSuiteMetadata(ctx context.Context, key SuiteKey) (int, err
 // transaction running deleteSuiteTx's compare-and-delete with the current
 // snapshot the reaper listed (wantCurrent) and its cutoff — an idle
 // cutoff, or ReapRegardless for a non-canonical or junk row — which, when
-// it deletes the row, also moves the base's signed-seen markers up to now
-// (as every suite-row delete does: stampBaseMarkersTx, ruling PF-10). It
+// it deletes the row, also turns the suite's signed snapshot history into
+// a marker and moves the base's signed-seen markers up to now (as every
+// suite-row delete does: markSnapshotHistoryTx and stampBaseMarkersTx,
+// rulings PF-12 and PF-10). It
 // reports deleted (this call deleted the row) and gone (the suite has no
 // row: deleted, none was found, or — after a failed submit — none is
 // found by a fresh read). The caller releases its SuiteGuard hold with

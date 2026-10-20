@@ -39,9 +39,13 @@ type execer interface {
 // only for suites with a suite_freshness row, and never for an unsigned
 // snapshot or a plain-text anchor. Every suite-row delete (deleteSuiteTx:
 // cap eviction, a reap, POST /forget) moves its base's existing markers'
-// stamps up to the delete, in the transaction that deletes the row, and
-// never creates one (stampBaseMarkersTx; design review M-9, ruling PF-10);
-// POST /forget (ForgetSuite) and the orphan sweep delete markers.
+// stamps up to the delete, in the transaction that deletes the row
+// (stampBaseMarkersTx; design review M-9, ruling PF-10), and creates one
+// only for a base whose signed history it is about to retire — an
+// adopted, non-retired inline or detached snapshot of the suite, such as
+// a legacy one the trust audit left queued and unmarked
+// (markSnapshotHistoryTx, ruling PF-12); POST /forget (ForgetSuite) and
+// the orphan sweep delete markers.
 func markSignedSeen(ctx context.Context, ex execer, scheme, host, base string, seenAt int64) error {
 	if _, err := ex.ExecContext(ctx, `
 INSERT INTO suite_signed_seen (canonical_scheme, canonical_host, base, last_seen_at)
@@ -103,6 +107,16 @@ type rowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// signedHistorySnapshotSQL is never-downgrade's snapshot clause (spec C5
+// safeguard 3) as a predicate on suite_snapshot's columns: an adopted,
+// non-retired inline or detached snapshot.
+//
+// AIDEV-NOTE: shared by the clause's read (refuseUnsignedDowngrade) and
+// by the marker a suite-row delete writes before it retires the suite's
+// snapshots (markSnapshotHistoryTx, ruling PF-12): the delete must turn
+// into a marker exactly the history the read would have counted.
+const signedHistorySnapshotSQL = `adopted_at IS NOT NULL AND retired_at IS NULL AND anchor_form IN ('inline', 'detached')`
+
 // CheckUnsignedDowngrade is spec C5's never-downgrade rule
 // (refuseUnsignedDowngrade) read outside a transaction, for the early
 // exits: the check's before an unsigned request takes a slot, the
@@ -122,8 +136,11 @@ func (c *Cache) CheckUnsignedDowngrade(ctx context.Context, host, suite string) 
 //     audit left queued, and so unmarked, after an I/O fault.
 //
 // A retired snapshot (quarantined by the audit, or reaped) is no history:
-// its trust was removed. A read error is returned as it is. (Moved here
-// from adoption.go beside the markers it reads, deferred minor E-5.)
+// its trust was removed — a suite-row delete (cap eviction, a reap, POST
+// /forget) turns the second clause into a marker before it retires the
+// suite's snapshots (markSnapshotHistoryTx, ruling PF-12). A read error is
+// returned as it is. (Moved here from adoption.go beside the markers it
+// reads, deferred minor E-5.)
 //
 // AIDEV-NOTE: one rule and one SQL at both never-downgrade points, so the
 // early exits can never admit what the commit refuses. Either scheme counts
@@ -147,7 +164,7 @@ SELECT canonical_scheme FROM suite_signed_seen
 	err = q.QueryRowContext(ctx, `
 SELECT canonical_scheme, suite_path, anchor_form FROM suite_snapshot
  WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND suite_path IN (?, ?)
-   AND adopted_at IS NOT NULL AND retired_at IS NULL AND anchor_form IN ('inline', 'detached')
+   AND `+signedHistorySnapshotSQL+`
  LIMIT 1`, host, base, base+"/.").Scan(&scheme, &path, &form)
 	switch {
 	case err == nil:

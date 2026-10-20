@@ -279,14 +279,22 @@ func TestCreateSuite_EvictionLeavesTheOtherSchemesTwin(t *testing.T) {
 // cap eviction moves the evictee base's signed-seen markers, under both
 // schemes, up to the eviction — MAX(last_seen_at, now) — so a dormant
 // suite's year-old marker is not swept the day after its eviction made it
-// an orphan. The evictee is a /. twin: its base's markers are the ones
-// moved. Each case has the other scheme's old marker move up (a stamp
-// limited to the evictee's scheme fails both); the first leaves the
-// evictee's own scheme without a marker, which must stay absent (an
-// upsert, markSignedSeen, would create it: never-downgrade would then
-// refuse the base's unsigned return); the second has a stamp ahead of now
-// on the evictee's scheme, never lowered (ruling PF-1). Another host's or
-// another base's marker is left alone, and no marker is created.
+// an orphan. The first three evictees are /. twins: their base's markers
+// are the ones moved. Each of the stamp's wrong directions fails one case
+// on its own (the Task 3 re-reviews): the first moves the evictee's own
+// scheme's old marker up and keeps the other scheme's, ahead of now (a
+// stamp that skips the evictee's scheme, or lowers a stamp — ruling PF-1
+// — fails it); the second moves the other scheme's old marker up and
+// creates none under the evictee's scheme, which has none (a stamp
+// limited to the evictee's scheme fails it; an upsert, markSignedSeen,
+// would create the absent one); the third keeps the evictee scheme's
+// marker ahead of now while the other's moves up. The fourth evictee's
+// base has no marker under either scheme and no adopted signed snapshot:
+// none is created (ruling PF-12 creates one only for signed history the
+// delete retires), so its unsigned return stays admitted — on such a
+// base a created marker would make never-downgrade refuse it, the real
+// harm of an upsert. Another host's or another base's marker is left
+// alone.
 func TestCreateSuite_EvictionMovesTheBaseMarkersUp(t *testing.T) {
 	old, ahead := evictNow-400*evictDay, evictNow+evictDay
 	other := []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "g", Base: "/flat", SeenAt: old},
@@ -298,6 +306,11 @@ func TestCreateSuite_EvictionMovesTheBaseMarkersUp(t *testing.T) {
 		want    []int64          // each mark's stamp after the eviction
 		absent  []SignedSeenMark // no marker before the eviction, none after it
 	}{
+		{name: "the own scheme's moves up and the other's ahead is kept",
+			evictee: sk("b", "/flat/."),
+			marks: []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "b", Base: "/flat", SeenAt: old},
+				{CanonicalScheme: "https", CanonicalHost: "b", Base: "/flat", SeenAt: ahead}},
+			want: []int64{evictNow, ahead}},
 		{name: "the other scheme's moves up and none is created",
 			evictee: sk("b", "/flat/."),
 			marks:   []SignedSeenMark{{CanonicalScheme: "https", CanonicalHost: "b", Base: "/flat", SeenAt: old}},
@@ -308,6 +321,10 @@ func TestCreateSuite_EvictionMovesTheBaseMarkersUp(t *testing.T) {
 			marks: []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "b", Base: "/flat", SeenAt: old},
 				{CanonicalScheme: "https", CanonicalHost: "b", Base: "/flat", SeenAt: ahead}},
 			want: []int64{evictNow, ahead}},
+		{name: "a base without a marker or signed history gets none",
+			evictee: sk("b", "/bare"),
+			absent: []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "b", Base: "/bare"},
+				{CanonicalScheme: "https", CanonicalHost: "b", Base: "/bare"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := openCache(t)
@@ -340,7 +357,51 @@ func TestCreateSuite_EvictionMovesTheBaseMarkersUp(t *testing.T) {
 			if err := c.db.QueryRow(`SELECT COUNT(*) FROM suite_signed_seen`).Scan(&n); err != nil || n != len(marks) {
 				t.Fatalf("%d markers after the eviction (%v); want %d: an eviction creates none", n, err, len(marks))
 			}
+			if len(tc.marks) == 0 {
+				if err := c.CheckUnsignedDowngrade(ctx, "b", tc.evictee.SuitePath); err != nil {
+					t.Fatalf("after the eviction an unsigned candidate of %s is %v; want admitted", tc.evictee.SuitePath, err)
+				}
+			}
 		})
+	}
+}
+
+// Ruling PF-12 (final review spec C1) for cap eviction: an evictee has no
+// current snapshot, but its only signed history can be a displaced
+// adopted snapshot the legacy trust audit left queued and unmarked
+// (design review M-8: the audit quarantined the current one). The
+// eviction retires it, so it first writes the base's marker under the
+// evictee's scheme, stamped at the eviction: an unsigned candidate of the
+// base is still refused, by that marker.
+func TestCreateSuite_EvictionTurnsSignedSnapshotHistoryIntoAMarker(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	key := sk("b", "/r/dists/x")
+	id := seedSignedHistory(t, c, key, FormInline, false, evictNow-3*evictDay)
+	seedRow(t, c, sk("b", "/kept"), evictNow-3600) // requested within the day: not evictable
+	if markerStamp(t, c, SignedSeenMark{CanonicalScheme: "http", CanonicalHost: "b", Base: "/r/dists/x"}) != -1 {
+		t.Fatal("premise: the base has a marker")
+	}
+	if err := c.CheckUnsignedDowngrade(ctx, "b", "/r/dists/x"); !errors.Is(err, ErrUnsignedDowngradeRefused) {
+		t.Fatalf("premise: before the eviction an unsigned candidate is %v, want refused", err)
+	}
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 2}, newFakeGuard())
+	if err != nil || res.Evicted == nil || *res.Evicted != key {
+		t.Fatalf("CreateSuite = %+v, %v; want %v evicted", res, err, key)
+	}
+	if snap, err := c.GetSuiteSnapshot(ctx, id); err != nil || snap.RetiredAt == nil {
+		t.Fatalf("premise: the eviction retired the snapshot (%+v, %v)", snap, err)
+	}
+	if at := markerStamp(t, c, SignedSeenMark{CanonicalScheme: "http", CanonicalHost: "b", Base: "/r/dists/x"}); at != evictNow {
+		t.Errorf("marker http://b/r/dists/x after the eviction: %d (-1: none); want %d", at, evictNow)
+	}
+	if at := markerStamp(t, c, SignedSeenMark{CanonicalScheme: "https", CanonicalHost: "b", Base: "/r/dists/x"}); at != -1 {
+		t.Errorf("marker https://b/r/dists/x after the eviction: %d; want none (the evictee's scheme only)", at)
+	}
+	err = c.CheckUnsignedDowngrade(ctx, "b", "/r/dists/x")
+	if !errors.Is(err, ErrUnsignedDowngradeRefused) || !strings.Contains(err.Error(), "signed-seen marker") {
+		t.Fatalf("after the eviction an unsigned candidate is %v; want refused by the base's marker", err)
 	}
 }
 
