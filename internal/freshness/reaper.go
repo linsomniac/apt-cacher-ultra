@@ -50,8 +50,9 @@ const (
 	// once it was last seen this long ago.
 	markerTTL = 365 * 24 * time.Hour
 	// dailyEvery is how often a run also sweeps the orphan markers (design
-	// note 20, ruling PF-4): at the first run after a start, then a day
-	// apart (monotonic).
+	// note 20, ruling PF-4): the first sweep is due one dailyEvery after
+	// Run starts (ruling PF-13: a wrong boot clock has a day to be
+	// corrected), then a day apart (monotonic).
 	dailyEvery = 24 * time.Hour
 )
 
@@ -84,10 +85,14 @@ type Reaper struct {
 	// lastWall and lastMono are the checker's wall clock and the monotonic
 	// clock at the previous run, or at Run's start; deferUntil is the
 	// monotonic time before which a run does not reap, after a forward
-	// step of the wall clock (design review M-8). reported is the furthest
-	// future interest stamp the previous run found (design review M-10).
-	// Only the run's goroutine touches them.
+	// step of the wall clock (design review M-8); stepAhead is the sum of
+	// every forward step the guard detected — how far the wall clock ran
+	// ahead of the monotonic clock — which the marker sweep's cutoff takes
+	// off (ruling PF-13). reported is the furthest future interest stamp
+	// the previous run found (design review M-10). Only the run's goroutine
+	// touches them.
 	lastWall, lastMono, deferUntil time.Time
+	stepAhead                      time.Duration
 	reported                       futureStamp
 	// sniffs holds the previous run's junk verdicts by blob (ruling R-F3);
 	// only the run's goroutine touches it.
@@ -95,10 +100,11 @@ type Reaper struct {
 	// readHead reads the head of a pool file for the junk scan (readCapped;
 	// tests count its reads or end the run's context at one).
 	readHead func(path string, limit int64) ([]byte, error)
-	// dailyAt is when the marker sweep last ran (monotonic; zero: due);
-	// reportedMarker is the marker stamped furthest in the future that the
-	// previous sweep found (design review M-10). Only the run's goroutine
-	// touches them; tests zero dailyAt to force a sweep.
+	// dailyAt is when the marker sweep last ran, or when Run started
+	// (monotonic; zero: due — a run outside Run); reportedMarker is the
+	// marker stamped furthest in the future that the previous sweep found
+	// (design review M-10). Only the run's goroutine touches them; tests
+	// zero dailyAt to force a sweep.
 	dailyAt        time.Time
 	reportedMarker cache.SignedSeenMark
 }
@@ -138,13 +144,15 @@ func NewReaper(cfg ReaperConfig) (*Reaper, error) {
 }
 
 // Run runs the reaper until ctx ends: the first run once the uptime floor
-// has passed, then one every interval after the previous run finished.
-// A panic while a suite is held is recovered per candidate (reapSuite);
-// each run also recovers any other panic of its own (logged,
+// has passed, then one every interval after the previous run finished;
+// the first marker sweep is due one dailyEvery after Run starts (ruling
+// PF-13). A panic while a suite is held is recovered per candidate
+// (reapSuite); each run also recovers any other panic of its own (logged,
 // freshness_check_panicked with where=reaper), so the next run still
 // comes.
 func (r *Reaper) Run(ctx context.Context) {
 	r.lastWall, r.lastMono = r.checker.now(), time.Now()
+	r.dailyAt = r.lastMono
 	t := time.NewTimer(r.floor)
 	defer t.Stop()
 	for {
@@ -183,15 +191,23 @@ type reapCandidate struct {
 // clock defers it, reap at most reapsPerRun of the candidates — idle,
 // non-canonical and legacy junk (junkCandidates, every run: ruling PF-4)
 // — those reaped regardless of idleness first, then the oldest, and,
-// when a day has passed since it last ran, sweep the orphan signed-seen
-// markers (sweepMarkers); then sweep the reconcile memo against the
-// current snapshots.
+// when a day has passed since it last ran (or since Run started), sweep
+// the orphan signed-seen markers (sweepMarkers); then sweep the reconcile
+// memo against the current snapshots.
 //
-// AIDEV-NOTE: design note 20, ruling PF-4. Only the marker sweep is
-// daily: it works in years (its 365-day TTL) and costs a writer
-// transaction per batch. A run the forward-step guard defers neither
-// reaps nor sweeps, and leaves the sweep due for the next run (design
-// review M-8): a step makes markers look older too.
+// AIDEV-NOTE: design note 20, rulings PF-4 and PF-13. Only the marker
+// sweep is daily: it works in years (its 365-day TTL) and costs a writer
+// transaction per batch. Its first run is due a day after Run starts, not
+// at the first run (PF-13): a start with the wall clock ahead (an RTC or
+// NTP fault before the start, which the guard cannot see) would make
+// orphan markers look older, and a swept marker cannot come back, so a
+// wrong boot clock has a day to be corrected. The cost: a daemon
+// restarted more often than daily never sweeps (orphan markers are tiny
+// rows; the safe side), and a wrong step that outlives a restart
+// uncorrected for a day still ages markers by it (documented residual). A
+// run the forward-step guard defers neither reaps nor sweeps, and leaves
+// the sweep due for the next run (design review M-8); a detected step no
+// longer ages markers at all (stepAhead, sweepMarkers).
 func (r *Reaper) runOnce(ctx context.Context) {
 	rows, err := r.cache.ListSuitesWithAdoption(ctx)
 	if err != nil {
@@ -219,8 +235,9 @@ func (r *Reaper) runOnce(ctx context.Context) {
 }
 
 // sweepMarkers runs spec C9's orphan-marker sweep (ruling R-F5,
-// cache.SweepOrphanMarkers) with the cutoff now − markerTTL, now being the
-// run's: it deletes the orphans last seen before the cutoff, logging
+// cache.SweepOrphanMarkers) with the cutoff now − stepAhead − markerTTL,
+// now being the run's and stepAhead the forward steps the guard detected
+// (ruling PF-13): it deletes the orphans last seen before the cutoff, logging
 // signed_seen_markers_swept when it deleted any, and reports the marker
 // stamped more than clockStepTolerance past fresh — a clock read taken
 // for the sweep — furthest in the future through clock_step_detected
@@ -236,9 +253,15 @@ func (r *Reaper) runOnce(ctx context.Context) {
 // than 2 s would report its own stamps as a clock step. The cutoff keeps
 // the run's now, which the forward-step guard checked: a fresh one would
 // let a step during the run sweep markers the guard would have deferred
-// (design review M-8).
+// (design review M-8). stepAhead is ruling PF-13 (final review concurrency
+// I1): a detected forward step never ages a marker. The guard's hour
+// gives clients time to touch their suites, but an orphan marker's suite
+// has had no client for a month, so nothing would refresh the marker in
+// that hour, and a swept marker — the never-downgrade record of a base
+// seen signed — cannot come back. After a genuine suspend this only keeps
+// markers longer, the safe side.
 func (r *Reaper) sweepMarkers(ctx context.Context, now, fresh time.Time) {
-	res, err := r.cache.SweepOrphanMarkers(ctx, fresh.Unix(), now.Add(-markerTTL).Unix())
+	res, err := r.cache.SweepOrphanMarkers(ctx, fresh.Unix(), now.Add(-r.stepAhead-markerTTL).Unix())
 	var furthest cache.SignedSeenMark
 	if res.Furthest != nil {
 		furthest = *res.Furthest
@@ -262,16 +285,21 @@ func (r *Reaper) sweepMarkers(ctx context.Context, now, fresh time.Time) {
 // clock ahead. It compares how far the wall clock (the checker's) and the
 // monotonic clock advanced since the previous run, or Run's start; when
 // the wall clock ran more than forwardStepSlack ahead it logs
-// clock_step_detected (stamp=wall_clock) and defers reaping by the uptime
+// clock_step_detected (stamp=wall_clock), defers reaping by the uptime
 // floor, giving clients the hour a restart gives them to touch their
-// suites. It reports whether this run is deferred.
+// suites, and adds the step to stepAhead, which the marker sweep's cutoff
+// takes off (ruling PF-13). It reports whether this run is deferred.
 //
 // AIDEV-NOTE: the monotonic clock does not advance while a machine is
 // suspended or a VM paused, and the wall clock does; the uptime floor
 // covers only a fresh start. The wall clock is compared in whole seconds
 // (Unix), never through time.Time.Sub, which uses the monotonic readings
 // when both values carry one. A backward step needs no guard here: a
-// future interest stamp is never idle (candidates).
+// future interest stamp is never idle (candidates). stepAhead only grows,
+// for the life of the process: a step later corrected backwards, or a
+// genuine suspend, then keeps markers longer — the safe side, since the
+// sweep's deletions are permanent and reaping's are not (a reaped suite
+// re-adopts at its next request).
 func (r *Reaper) deferredByForwardStep(now, mono time.Time) bool {
 	if !r.lastMono.IsZero() {
 		elapsed := mono.Sub(r.lastMono)
@@ -280,6 +308,7 @@ func (r *Reaper) deferredByForwardStep(now, mono time.Time) bool {
 			r.logger.Warn("clock_step_detected", "stamp", "wall_clock",
 				"stored_unixtime", r.lastWall.Unix()+int64(elapsed/time.Second), "now_unixtime", now.Unix())
 			r.deferUntil = mono.Add(r.floor)
+			r.stepAhead += ahead
 		}
 	}
 	r.lastWall, r.lastMono = now, mono

@@ -149,42 +149,125 @@ func TestReaper_ClockStepReportsBypassTheRateLimit(t *testing.T) {
 	}
 }
 
-// Spec C9: the orphan-marker TTL is 365 days — an orphan seen 364 days
-// ago is kept, one seen 366 days ago is swept.
+// Spec C9: the orphan-marker TTL is 365 days, to the second (the final
+// review's tests m-4): an orphan last seen exactly 365 days before the
+// run is kept — the cutoff is strict — and one seen a second earlier is
+// swept.
 func TestReaper_TheMarkerTTLIsAYear(t *testing.T) {
 	r := newReaperRig(t)
-	r.mark("/kept/dists/s", reapNow-364*reapDay)
-	r.mark("/gone/dists/s", reapNow-366*reapDay)
+	r.mark("/kept/dists/s", reapNow-365*reapDay)
+	r.mark("/gone/dists/s", reapNow-365*reapDay-1)
 	r.reaper.runOnce(context.Background())
 	if r.markerAt("/kept/dists/s") == -1 || r.markerAt("/gone/dists/s") != -1 {
-		t.Fatalf("seen 364 days ago: %d; 366 days ago: %d; want kept and swept",
+		t.Fatalf("seen 365 days ago: %d; 365 days and a second ago: %d; want kept and swept",
 			r.markerAt("/kept/dists/s"), r.markerAt("/gone/dists/s"))
 	}
 }
 
-// Design note 20 (ruling PF-4): the marker sweep is the run's daily duty
-// — at the first run after a start, then a day apart — while the hourly
-// runs reap: an orphan a year old is swept at the first run; another
-// found an hour later waits for the run a day after the first.
-func TestReaper_DailyDutiesRunAtStartAndADayApart(t *testing.T) {
+// runReaper starts r's reaper under a context the test's end cancels,
+// waiting for Run to return.
+func (r *reaperRig) runReaper(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.reaper.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+}
+
+// Design note 20, ruling PF-13 (final review concurrency I1): the marker
+// sweep is the run's daily duty — due one dailyEvery after Run starts,
+// not at the first run (a wrong boot clock has a day to be corrected),
+// then a day after the previous sweep — while the hourly runs reap. A
+// year-old orphan is kept by the runs 1 h to 23 h after the start and
+// swept by the run at 24 h; another, marked then, is kept by the runs up
+// to 23 h after that sweep and swept by the one a day after it, so
+// dailyEvery is pinned to the run (the final review's tests m-4).
+func TestReaper_TheMarkerSweepIsDueADayAfterTheStartThenDaily(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		ctx := context.Background()
 		r := newReaperRig(t)
 		r.mark("/first/dists/s", reapNow-366*reapDay)
-		r.reaper.runOnce(ctx)
+		r.runReaper(t)
+		time.Sleep(23*time.Hour + time.Second) // the runs at 1 h … 23 h
+		if r.markerAt("/first/dists/s") == -1 {
+			t.Fatal("swept within a day of the start: the first sweep is due a day after Run starts")
+		}
+		time.Sleep(time.Hour) // the run at 24 h
 		if r.markerAt("/first/dists/s") != -1 {
-			t.Fatal("the first run after a start did not sweep")
+			t.Fatal("the run a day after the start did not sweep")
 		}
 		r.mark("/later/dists/s", reapNow-366*reapDay)
-		time.Sleep(time.Hour)
-		r.reaper.runOnce(ctx)
+		time.Sleep(23 * time.Hour) // the runs at 25 h … 47 h
 		if r.markerAt("/later/dists/s") == -1 {
-			t.Fatal("an hourly run swept: the sweep is a daily duty")
+			t.Fatal("a run 23 h after the last sweep swept: the sweep is a daily duty")
 		}
-		time.Sleep(23 * time.Hour)
-		r.reaper.runOnce(ctx)
+		time.Sleep(time.Hour) // the run at 48 h
 		if r.markerAt("/later/dists/s") != -1 {
-			t.Fatal("the run a day after the first did not sweep")
+			t.Fatal("the run a day after the last sweep did not sweep")
+		}
+	})
+}
+
+// Ruling PF-13 (final review concurrency I1, its probe (a)): a start with
+// the wall clock ahead — an RTC or NTP fault before the start, which the
+// forward-step guard cannot see — has a day to be corrected before the
+// first marker sweep. The clock starts 200 days ahead and is put right
+// 23 hours later: no run sweeps the orphan last seen 200 days ago (400
+// days by the wrong clock), and the first sweep, a day after the start,
+// keeps it and still sweeps an orphan a year old.
+func TestReaper_AClockAheadAtStartHasADayToBeCorrected(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newReaperRig(t)
+		var ahead atomic.Int64
+		ahead.Store(200 * reapDay)
+		start := time.Now()
+		r.checker.now = func() time.Time { return time.Unix(reapNow+ahead.Load(), 0).Add(time.Since(start)) }
+		r.mark("/orphan/dists/s", reapNow-200*reapDay)
+		r.mark("/old/dists/s", reapNow-366*reapDay)
+		r.runReaper(t)
+		time.Sleep(time.Hour + time.Second) // the first run
+		if r.markerAt("/orphan/dists/s") == -1 {
+			t.Fatal("an orphan 200 days old was swept an hour after a start whose wall clock was 200 days ahead")
+		}
+		time.Sleep(22 * time.Hour) // the runs up to 23 h
+		if r.markerAt("/orphan/dists/s") == -1 {
+			t.Fatal("an orphan 200 days old was swept within a day of a start whose wall clock was 200 days ahead")
+		}
+		ahead.Store(0)        // the clock is put right: a backward step, which needs no guard
+		time.Sleep(time.Hour) // the run at 24 h sweeps
+		if r.markerAt("/orphan/dists/s") == -1 {
+			t.Fatal("the first sweep, after the clock was corrected, swept an orphan 200 days old")
+		}
+		if r.markerAt("/old/dists/s") != -1 {
+			t.Fatal("the first sweep, a day after the start, kept an orphan a year old")
+		}
+	})
+}
+
+// Ruling PF-13 (its probe (b)): a wrong forward step of 70 days while the
+// daemon runs never ages a marker. The guard detects it, and the sweeps
+// after it take it off their cutoff (stepAhead): an orphan 300 days old,
+// which looks 370 days old and more by the stepped clock, is kept by the
+// three daily sweeps that follow, while a year-old orphan is swept.
+func TestReaper_AForwardStepWhileRunningAgesNoMarker(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newReaperRig(t)
+		var step atomic.Int64
+		start := time.Now()
+		r.checker.now = func() time.Time { return time.Unix(reapNow+step.Load(), 0).Add(time.Since(start)) }
+		r.mark("/orphan/dists/s", reapNow-300*reapDay)
+		r.mark("/old/dists/s", reapNow-366*reapDay)
+		r.runReaper(t)
+		time.Sleep(12*time.Hour + time.Second) // the runs at 1 h … 12 h
+		step.Store(70 * reapDay)               // a wrong forward step of 70 days
+		time.Sleep(3 * 24 * time.Hour)         // the sweeps at 24 h, 48 h and 72 h
+		if ev := r.events("clock_step_detected"); len(ev) != 1 || ev[0]["stamp"] != "wall_clock" {
+			t.Fatalf("clock_step_detected = %v, want one with stamp=wall_clock", ev)
+		}
+		if r.markerAt("/old/dists/s") != -1 {
+			t.Fatal("the sweeps after the step kept an orphan a year old")
+		}
+		if r.markerAt("/orphan/dists/s") == -1 {
+			t.Fatal("an orphan 303 days old by the monotonic count was swept after a forward step of 70 days")
 		}
 	})
 }
@@ -215,10 +298,15 @@ func TestReaper_ReportsAFutureMarkerOnlyWhenItChanges(t *testing.T) {
 	}
 }
 
-// Design review M-8: the forward-step guard defers the marker sweep too.
-// A daily sweep whose run sees the wall clock jump ten days — enough to
-// make an orphan five days short of the TTL look a year old — does not
-// sweep; the sweep stays due and runs an uptime floor later.
+// Design review M-8 and ruling PF-13 (final review concurrency I1): the
+// forward-step guard defers the marker sweep, and a detected step never
+// ages a marker. The run due to sweep a day after the start sees the wall
+// clock jump ten days — enough to make an orphan five days short of the
+// TTL look a year old — and does not sweep; the sweep stays due and runs
+// an uptime floor later (25 h), then daily, each taking the step off its
+// cutoff (stepAhead). So the orphan, 360 days old at the start, is kept
+// until the monotonic clock has aged it past the year: kept by the sweep
+// at 97 h (364 days), swept by the one at 121 h (365 days and an hour).
 func TestReaper_AForwardStepDefersTheMarkerSweep(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newReaperRig(t)
@@ -226,23 +314,20 @@ func TestReaper_AForwardStepDefersTheMarkerSweep(t *testing.T) {
 		start := time.Now()
 		r.checker.now = func() time.Time { return time.Unix(reapNow+step.Load(), 0).Add(time.Since(start)) }
 		r.mark("/orphan/dists/s", reapNow-360*reapDay)
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan struct{})
-		go func() { r.reaper.Run(ctx); close(done) }()
-		defer func() { cancel(); <-done }()
-		time.Sleep(time.Hour + time.Second) // the first run, at the floor, sweeps: 360 days is not a year
-		if r.markerAt("/orphan/dists/s") == -1 {
-			t.Fatal("swept before the step")
+		r.runReaper(t)
+		time.Sleep(23*time.Hour + time.Second) // the hourly runs to just before the first daily one
+		step.Store(10 * reapDay)               // the wall clock jumps ten days
+		time.Sleep(time.Hour)                  // the run at 24 h sees the step
+		if ev := r.events("clock_step_detected"); len(ev) != 1 || ev[0]["stamp"] != "wall_clock" {
+			t.Fatalf("clock_step_detected = %v, want one with stamp=wall_clock", ev)
 		}
-		time.Sleep(23 * time.Hour) // through the hourly runs to just before the next daily one
-		step.Store(10 * reapDay)   // the wall clock jumps ten days
-		time.Sleep(time.Hour)
+		time.Sleep(73 * time.Hour) // the sweeps at 25 h, 49 h, 73 h and 97 h
 		if r.markerAt("/orphan/dists/s") == -1 {
-			t.Fatal("swept by the run that saw the forward step")
+			t.Fatal("an orphan was swept before the monotonic clock aged it a year: the forward step aged it")
 		}
-		time.Sleep(time.Hour)
+		time.Sleep(24 * time.Hour) // the sweep at 121 h
 		if r.markerAt("/orphan/dists/s") != -1 {
-			t.Fatal("not swept an uptime floor after the step")
+			t.Fatal("an orphan aged past the year by the monotonic clock was kept")
 		}
 	})
 }
