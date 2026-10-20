@@ -333,7 +333,10 @@ func TestReaper_JunkIsNotStarvedByAnIdleBacklog(t *testing.T) {
 
 // Design review M-4: pool reads that fail — here a directory where the
 // blob should be — keep their suites (an I/O fault is never evidence) and
-// are logged once per scan with their count, not once per anchor.
+// are logged once per scan with their count, not once per anchor, naming
+// the first failure's suite scheme, host and anchor path (the scheme tells
+// an http copy of a suite from its https copy: the Task 6 re-review's
+// out-of-scope 2).
 func TestReaper_JunkReadFailuresLogOncePerScan(t *testing.T) {
 	r := newReaperRig(t)
 	for _, s := range []string{"/r/dists/a", "/r/dists/b"} {
@@ -348,7 +351,11 @@ func TestReaper_JunkReadFailuresLogOncePerScan(t *testing.T) {
 	if !r.exists("/r/dists/a") || !r.exists("/r/dists/b") {
 		t.Fatal("an unreadable anchor was taken for junk evidence")
 	}
-	if ev := r.events("suite reaper: junk anchor reads failed"); len(ev) != 1 || ev[0]["count"] != float64(2) {
+	ev := r.events("suite reaper: junk anchor reads failed")
+	if len(ev) != 1 || ev[0]["count"] != float64(2) {
 		t.Fatalf("read failure lines = %v, want one with count 2", ev)
+	}
+	if ev[0]["canonical_scheme"] != "http" || ev[0]["canonical_host"] != "h" || ev[0]["path"] != "/r/dists/a/InRelease" {
+		t.Fatalf("read failure line = %v, want the first failure named: http, h, /r/dists/a/InRelease", ev[0])
 	}
 }

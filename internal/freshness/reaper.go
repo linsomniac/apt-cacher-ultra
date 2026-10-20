@@ -564,31 +564,36 @@ func sameSnapshot(a, b *int64) bool {
 // it, so idleness never reaps it, and the hot path does not sniff (ruling
 // R-F3). The scan runs every run (ruling PF-4): such a suite fails its
 // clients' updates, and the scan is one indexed read on the pool
-// (ListUnadoptedSuiteAnchors) plus pool reads only for the blobs no
-// earlier run sniffed. Two things keep a real suite: the grace (design
-// note 8: a transient soft-404 that replaced a good anchor is younger; its
-// next check or a later miss heals the row) and the content rule (ruling
-// PF-3, design note 9: a plain-text Release cached as InRelease is a
+// (ListUnadoptedSuiteAnchors) plus pool reads only for the blobs whose
+// verdict neither this scan nor the last completed one reached (the memo,
+// below). Two things keep a real suite: the grace (design note 8: a
+// transient soft-404 that replaced a good anchor is younger; its next
+// check or a later miss heals the row) and the content rule (ruling PF-3,
+// design note 9: a plain-text Release cached as InRelease is a
 // §6.1-quarantined plain-text suite phase E adopts unsigned, not junk).
 // Adoption records are ignored: a failed adoption's record,
 // unsigned_disabled or unsigned_too_large would otherwise keep an HTML
 // anchor served forever (a suite without a snapshot has its url_path
 // metadata served as cached, never revalidated). Only blobs read and
-// sniffed are evidence: a missing or unreadable pool file of a blob no
-// earlier run sniffed keeps the suite (overview: an I/O fault is never
-// evidence; a blob an earlier run sniffed keeps its verdict, since the
-// pool is content-addressed), and an anchor no sniff applies to
-// (aptpath.NotSuiteFile: a suite path over MaxSuitePathBytes) is never
-// evidence and never read. The evidence is not read again under the hold,
-// which re-reads only the current snapshot (reapHeld): between the scan
-// and the hold a junk suite's anchor rows change only through an
-// adoption, which that comparison catches, or through url_path GC or a
-// miss that re-fetched a row whose pool file had gone, after which the
-// reap costs the suite one fetch at its next request. The sniffs run
-// here, on the reaper's goroutine, never on the writer (ruling PD-5). The
-// scan checks ctx per suite: a shutdown does not wait for the first run's
-// reads after a restart (up to 64 KiB per anchor not yet sniffed); cut
-// short, it returns no candidate and keeps the previous run's verdicts.
+// sniffed are evidence: a missing or unreadable pool file keeps the suite
+// (overview: an I/O fault is never evidence) unless this scan or the last
+// completed one reached the blob's verdict — a blob the last completed
+// scan sniffed or reused keeps its verdict, since the pool is
+// content-addressed; a completed scan keeps only the verdicts it reached
+// (r.sniffs = next), and allJunk stops at a suite's first row that is no
+// evidence, so an older verdict that scan did not reach is gone — and an
+// anchor no sniff applies to (aptpath.NotSuiteFile: a suite path over
+// MaxSuitePathBytes) is never evidence and never read. The evidence is not
+// read again under the hold, which re-reads only the current snapshot
+// (reapHeld): between the scan and the hold a junk suite's anchor rows
+// change only through an adoption, which that comparison catches, or
+// through url_path GC or a miss that re-fetched a row whose pool file had
+// gone, after which the reap costs the suite one fetch at its next
+// request. The sniffs run here, on the reaper's goroutine, never on the
+// writer (ruling PD-5). The scan checks ctx per suite: a shutdown does not
+// wait for the first run's reads after a restart (up to 64 KiB per anchor
+// not yet sniffed); cut short, it returns no candidate and keeps the memo
+// the last completed scan left.
 func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdoption, have []reapCandidate, now time.Time) []reapCandidate {
 	anchors, err := r.cache.ListUnadoptedSuiteAnchors(ctx)
 	if err != nil {
@@ -626,17 +631,18 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 	r.sniffs = next
 	if fails.n > 0 {
 		r.warn(ctx, "suite reaper: junk anchor reads failed", "count", fails.n, "err", fails.first,
-			"canonical_host", fails.host, "path", fails.path)
+			"canonical_scheme", fails.scheme, "canonical_host", fails.host, "path", fails.path)
 	}
 	return out
 }
 
 // junkReadFailures counts one junk scan's failed pool reads, keeping the
-// first, so a scan logs one line however many fail (design review M-4).
+// first — its error, and its suite's scheme and host and the anchor's
+// path — so a scan logs one line however many fail (design review M-4).
 type junkReadFailures struct {
-	n          int
-	first      error
-	host, path string
+	n                  int
+	first              error
+	scheme, host, path string
 }
 
 // allJunk reports whether every one of key's cached anchor rows holds a
@@ -672,7 +678,7 @@ func (r *Reaper) allJunk(key cache.SuiteKey, as []cache.SuiteAnchorRow, cutoff i
 			if err != nil && !errors.Is(err, errAnchorTooLarge) {
 				if !errors.Is(err, fs.ErrNotExist) {
 					if fails.n == 0 {
-						fails.first, fails.host, fails.path = err, key.CanonicalHost, a.Path
+						fails.first, fails.scheme, fails.host, fails.path = err, key.CanonicalScheme, key.CanonicalHost, a.Path
 					}
 					fails.n++
 				}
