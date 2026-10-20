@@ -25,7 +25,20 @@ type snapshotPassResult struct {
 // and DELETE inside this tx). Once A ∪ B is drained, sub-job C (spec C9)
 // deletes the retired snapshots — those of reaped, evicted and forgotten
 // suites, and those the legacy trust audit quarantined — in chunks of at
-// most 10,000 rows per writer transaction.
+// most 10,000 rows per writer transaction; the startup pass (phase
+// phaseStartup) runs no sub-job C, and its periodic ticks do (ruling
+// PF-15).
+//
+// AIDEV-NOTE: ruling PF-15 (final review concurrency m1). StartupPass runs
+// before any listener serves, and retired snapshots never serve, so
+// nothing waits on C there; but C's backlog after a burst of reaps (a
+// large suite's snapshots hold some 70-100k package_hash rows each, and a
+// reap retires its current and displaced ones) could keep every listener
+// closed up to max_tick_duration. The startup pass therefore ends the
+// snapshot pass once A ∪ B is drained, as if C were done, so its blob pass
+// still runs, and the first periodic tick runs C from the start (its
+// snapshot pass begins with A ∪ B, then C). Retired rows linger one GC
+// interval longer at most.
 //
 // Returns:
 //   - the cumulative counts (orphan, displaced, retired),
@@ -76,6 +89,9 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 		if batch.Total() == 0 {
 			break // A ∪ B drained
 		}
+	}
+	if phase == phaseStartup {
+		return acc, false, nil // no sub-job C before the listeners serve (ruling PF-15)
 	}
 	// Sub-job C (spec C9).
 	for {

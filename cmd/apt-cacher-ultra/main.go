@@ -504,6 +504,10 @@ func serveListeners(
 	// until they complete (we have not yet called Serve on any
 	// listener). When gc.enabled = false, gcsvc.StartupPass returns
 	// immediately and the periodic goroutine below is never started.
+	// The one-shot pass runs no snapshot-GC sub-job C (ruling PF-15):
+	// retired snapshots never serve, so a backlog of them after a burst
+	// of reaps must not keep the listeners closed; the first periodic
+	// tick deletes them.
 	gcsvc, err := gc.New(gc.Config{
 		Cache:                 c,
 		Logger:                logger,

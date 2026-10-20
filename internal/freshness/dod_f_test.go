@@ -383,15 +383,19 @@ func TestDoD_NinetyDaysOfReapingWithRestarts(t *testing.T) {
 					// b1 at 21:00, in a boot started at 08:00 that day; n0
 					// at 13:00, in the boot started on day 55 at 00:00. A
 					// boot's GC passes come at its start and every 24 h
-					// after, so for b0, b1 and b2 exactly two (08:00 on
-					// days l+31 and l+32) have followed the reap by 09:00
-					// on day l+32: the two-tick bound this pins (the Task
-					// 15 review's minor 1: by l+33, three had). For n0 two
-					// or three have, depending on scheduling: its boot's
-					// pass due on day 60 at 00:00 falls at the instant of
-					// that day's restart and may run before the stop, then
-					// come the new boot's startup pass and its pass on day
-					// 61 at 00:00.
+					// after; the startup pass runs no sub-job C (ruling
+					// PF-15), the periodic ticks do. So for b0, b1 and b2
+					// exactly two periodic ticks (08:00 on days l+31 and
+					// l+32) have followed the reap by 09:00 on day l+32:
+					// the two-tick bound this pins (the Task 15 review's
+					// minor 1: by l+33, three had). For n0 one or two
+					// periodic ticks have, depending on scheduling: its
+					// boot's tick due on day 60 at 00:00 falls at the
+					// instant of that day's restart and may run before the
+					// stop; then come the new boot's startup pass, which
+					// leaves n0's retired snapshot, and its tick on day 61
+					// at 00:00, which deletes it and the anchor blob if the
+					// day-60 tick did not run.
 					if ok, err := b.c.BlobExists(shaOf(inRelease[s])); err != nil || ok {
 						t.Fatalf("day %d: %s's anchor blob outlived two GC ticks (%v, %v)", day, s, ok, err)
 					}

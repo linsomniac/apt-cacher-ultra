@@ -15,61 +15,89 @@ import (
 // Spec C9 sub-job C and §7 "blobs reclaimed within two GC ticks": a suite
 // reaped (or forgotten) leaves retired snapshots — here two, the current
 // one and the one it displaced, so the pass must loop past its first
-// deleted header (the Task 4 review's minor 1) — and the next tick's
-// snapshot pass deletes them (retired_reaped in gc_run_complete and
+// deleted header (the Task 4 review's minor 1). The startup pass, which
+// runs before any listener serves, leaves them and their blobs (ruling
+// PF-15: no sub-job C there, retired_reaped 0) and still runs its blob
+// pass, which reclaims an unreferenced orphan blob; the first periodic tick's
+// snapshot pass deletes them (retired_reaped in its gc_run_complete and
 // LastRunSummary) and the same tick's blob pass reclaims their blobs once
 // blob_grace has passed.
 func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
-	c := openTestCache(t)
-	logger, buf := captureLogger()
-	db := dbOf(t, c)
-	ctx := context.Background()
-	oldAnchor, oldMember := putPoolBlob(t, c, "old anchor"), putPoolBlob(t, c, "old member")
-	old := adoptSnapshot(t, c, "http", "h", "/r/dists/x", oldAnchor, []string{oldMember})
-	anchor := putPoolBlob(t, c, "anchor")
-	b1, b2 := putPoolBlob(t, c, "member one"), putPoolBlob(t, c, "member two")
-	id := adoptSnapshot(t, c, "http", "h", "/r/dists/x", anchor, []string{b1, b2})
-	key := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}
-	if _, err := c.DeleteSuiteMetadata(ctx, key); err != nil { // the reaper's step 1: the seeded anchor row
-		t.Fatal(err)
-	}
-	if res, err := c.ForgetSuite(ctx, key, &id); err != nil || !res.Deleted {
-		t.Fatalf("ForgetSuite = %+v, %v", res, err)
-	}
-	blobs := []string{oldAnchor, oldMember, anchor, b1, b2}
-	for _, h := range blobs {
-		fastForwardZeroedAt(t, db, h)
-	}
-	g, err := New(Config{Cache: c, Logger: logger, Enabled: true, Interval: time.Hour, BatchSize: 100,
-		SnapshotBatchSize: 10, MaxTickDuration: time.Minute, BlobGrace: time.Minute, KeepDisplaced: 3,
-		PoolScanWorkers: 2, HeartbeatStaleGrace: 30 * time.Minute})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := g.StartupPass(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if snapshotRowExists(t, db, old) || snapshotRowExists(t, db, id) {
-		t.Fatalf("a retired snapshot survived the tick (displaced %v, current %v)", snapshotRowExists(t, db, old),
-			snapshotRowExists(t, db, id))
-	}
-	for _, h := range blobs {
-		if blobRowExists(t, db, h) || fileExists(t, c.BlobPath(h)) {
-			t.Fatalf("blob %s survived the tick that deleted its retired snapshot", h)
+	synctest.Test(t, func(t *testing.T) {
+		c := openTestCache(t)
+		logger, buf := captureLogger()
+		db := dbOf(t, c)
+		ctx := context.Background()
+		oldAnchor, oldMember := putPoolBlob(t, c, "old anchor"), putPoolBlob(t, c, "old member")
+		old := adoptSnapshot(t, c, "http", "h", "/r/dists/x", oldAnchor, []string{oldMember})
+		anchor := putPoolBlob(t, c, "anchor")
+		b1, b2 := putPoolBlob(t, c, "member one"), putPoolBlob(t, c, "member two")
+		id := adoptSnapshot(t, c, "http", "h", "/r/dists/x", anchor, []string{b1, b2})
+		key := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}
+		if _, err := c.DeleteSuiteMetadata(ctx, key); err != nil { // the reaper's step 1: the seeded anchor row
+			t.Fatal(err)
 		}
-	}
-	if s, ok := g.LastRunSummary(); !ok || s.RetiredReaped != 2 {
-		t.Fatalf("LastRunSummary = %+v, %v; want retired_reaped 2", s, ok)
-	}
-	var line map[string]any
-	for _, l := range strings.Split(buf.String(), "\n") {
-		if strings.Contains(l, `"msg":"gc_run_complete"`) && json.Unmarshal([]byte(l), &line) == nil {
-			break
+		if res, err := c.ForgetSuite(ctx, key, &id); err != nil || !res.Deleted {
+			t.Fatalf("ForgetSuite = %+v, %v", res, err)
 		}
-	}
-	if line["retired_reaped"] != float64(2) {
-		t.Fatalf("gc_run_complete = %v; want retired_reaped 2", line)
-	}
+		blobs := []string{oldAnchor, oldMember, anchor, b1, b2}
+		orphan := putPoolBlob(t, c, "an orphan no row references")
+		for _, h := range append(blobs, orphan) {
+			fastForwardZeroedAt(t, db, h)
+		}
+		g, err := New(Config{Cache: c, Logger: logger, Enabled: true, Interval: time.Hour, BatchSize: 100,
+			SnapshotBatchSize: 10, MaxTickDuration: time.Minute, BlobGrace: time.Minute, KeepDisplaced: 3,
+			PoolScanWorkers: 2, HeartbeatStaleGrace: 30 * time.Minute})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := g.StartupPass(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if !snapshotRowExists(t, db, old) || !snapshotRowExists(t, db, id) {
+			t.Fatalf("the startup pass ran sub-job C (displaced kept %v, current kept %v)", snapshotRowExists(t, db, old),
+				snapshotRowExists(t, db, id))
+		}
+		for _, h := range blobs {
+			if !blobRowExists(t, db, h) || !fileExists(t, c.BlobPath(h)) {
+				t.Fatalf("blob %s of a retired snapshot reclaimed by the startup pass", h)
+			}
+		}
+		if blobRowExists(t, db, orphan) || fileExists(t, c.BlobPath(orphan)) {
+			t.Fatal("the startup pass kept an orphan blob: ending the snapshot pass before sub-job C skipped its blob pass")
+		}
+		if s, ok := g.LastRunSummary(); !ok || s.Phase != "startup" || s.RetiredReaped != 0 {
+			t.Fatalf("startup LastRunSummary = %+v, %v; want retired_reaped 0", s, ok)
+		}
+		life, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() { g.Run(life); close(done) }()
+		time.Sleep(time.Hour + time.Second) // the first periodic tick
+		cancel()
+		<-done
+		if snapshotRowExists(t, db, old) || snapshotRowExists(t, db, id) {
+			t.Fatalf("a retired snapshot survived the first periodic tick (displaced %v, current %v)",
+				snapshotRowExists(t, db, old), snapshotRowExists(t, db, id))
+		}
+		for _, h := range blobs {
+			if blobRowExists(t, db, h) || fileExists(t, c.BlobPath(h)) {
+				t.Fatalf("blob %s survived the tick that deleted its retired snapshot", h)
+			}
+		}
+		if s, ok := g.LastRunSummary(); !ok || s.Phase != "periodic" || s.RetiredReaped != 2 {
+			t.Fatalf("LastRunSummary = %+v, %v; want the periodic tick's, retired_reaped 2", s, ok)
+		}
+		got := map[any]any{}
+		for _, l := range strings.Split(buf.String(), "\n") {
+			var line map[string]any
+			if strings.Contains(l, `"msg":"gc_run_complete"`) && json.Unmarshal([]byte(l), &line) == nil {
+				got[line["phase"]] = line["retired_reaped"]
+			}
+		}
+		if got["startup"] != float64(0) || got["periodic"] != float64(2) {
+			t.Fatalf("gc_run_complete retired_reaped by phase = %v; want startup 0, periodic 2", got)
+		}
+	})
 }
 
 // Deferred minor A-3: the GC's run stamps (gc_run_complete's

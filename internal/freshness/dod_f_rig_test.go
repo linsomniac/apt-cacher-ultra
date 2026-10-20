@@ -81,10 +81,33 @@ func (r *retryRig) retiredCount() int {
 		rigSuite)
 }
 
+// firstPeriodicTick runs g's periodic loop until its first tick has
+// completed (LastRunSummary's phase is then "periodic"), then stops it
+// and waits for Run to return. g's interval must be short: the first tick
+// comes one interval after the loop starts. It waits at most 10 s.
+func firstPeriodicTick(t *testing.T, g *gc.GC) {
+	t.Helper()
+	life, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { g.Run(life); close(done) }()
+	defer func() { cancel(); <-done }()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		if s, ok := g.LastRunSummary(); ok && s.Phase == "periodic" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no periodic GC tick completed within 10 s")
+		}
+	}
+}
+
 // Spec §7 C9: a reaped suite whose client returns before any GC tick
 // re-adopts its unchanged upstream content within one check — the retired
-// snapshot with the same natural key refuses nothing — and the GC pass
-// that then deletes the retired snapshot leaves the new one whole.
+// snapshot with the same natural key refuses nothing — and the GC tick
+// that then deletes the retired snapshot leaves the new one whole. The
+// startup GC pass, which runs before the listeners serve, leaves the
+// retired snapshot (ruling PF-15: no sub-job C there); the first periodic
+// tick deletes it.
 func TestDoD_ReturnBeforeGCReadoptsWithinOneCheck(t *testing.T) {
 	ctx := context.Background()
 	r := newRetryRig(t, time.Minute)
@@ -98,7 +121,7 @@ func TestDoD_ReturnBeforeGCReadoptsWithinOneCheck(t *testing.T) {
 	if snap == nil || snap.SnapshotID == old.SnapshotID || strOf(snap.SingleAnchorHash) != strOf(old.SingleAnchorHash) {
 		t.Fatalf("after one check: snapshot %+v; want the unchanged anchor adopted as a new snapshot (old %d)", snap, old.SnapshotID)
 	}
-	g, err := gc.New(gc.Config{Cache: r.cache, Logger: discardLogger(), Enabled: true, Interval: 24 * time.Hour, BatchSize: 100,
+	g, err := gc.New(gc.Config{Cache: r.cache, Logger: discardLogger(), Enabled: true, Interval: time.Millisecond, BatchSize: 100,
 		SnapshotBatchSize: 10, MaxTickDuration: 5 * time.Minute, BlobGrace: time.Nanosecond, KeepDisplaced: 3,
 		PoolScanWorkers: 1, HeartbeatStaleGrace: 30 * time.Minute})
 	if err != nil {
@@ -107,8 +130,12 @@ func TestDoD_ReturnBeforeGCReadoptsWithinOneCheck(t *testing.T) {
 	if err := g.StartupPass(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := r.cache.GetSuiteSnapshot(ctx, old.SnapshotID); err != nil {
+		t.Fatalf("the startup GC pass deleted the retired snapshot (%v): it runs no sub-job C", err)
+	}
+	firstPeriodicTick(t, g)
 	if _, err := r.cache.GetSuiteSnapshot(ctx, old.SnapshotID); !errors.Is(err, cache.ErrNotFound) {
-		t.Fatalf("the retired snapshot survived the GC pass (%v)", err)
+		t.Fatalf("the retired snapshot survived the first periodic GC tick (%v)", err)
 	}
 	m, err := r.cache.GetSnapshotMember(ctx, snap.SnapshotID, "main/binary-amd64/Packages")
 	if err != nil {

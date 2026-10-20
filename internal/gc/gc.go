@@ -143,6 +143,12 @@ const (
 	blobPass
 )
 
+// phaseStartup is runTick's phase for StartupPass's one-shot pass, the
+// pass main runs before any listener serves. The snapshot pass runs no
+// sub-job C in it (runSnapshotPass, ruling PF-15); the periodic ticks
+// ("periodic") do.
+const phaseStartup = "startup"
+
 // LastRunSummary is the SPEC5 §9.6 / §9.7.8 in-memory captured copy
 // of the most recently completed gc_run_complete payload. The
 // status-page handler renders this; the §9.7.6 refresher mirrors
@@ -248,7 +254,9 @@ func New(cfg Config) (*GC, error) {
 // StartupPass runs the SPEC4 §4.2 step 5 (pool/ orphan scan) and step
 // 6 (one-shot GC pass) sequence. Blocks until both complete or ctx is
 // cancelled. Returns the first error encountered; partial progress is
-// preserved (DB rows / pool files reaped before cancel are real).
+// preserved (DB rows / pool files reaped before cancel are real). The
+// one-shot pass runs no snapshot-GC sub-job C (spec C9's retired
+// snapshots): the first periodic tick does (ruling PF-15, runSnapshotPass).
 //
 // Order matters: pool scan runs first so its
 // `gc_pool_orphans_repaired` count reflects only pre-existing orphan
@@ -267,8 +275,9 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		return fmt.Errorf("gc startup: pool scan: %w", err)
 	}
 
-	// Step 6: one-shot GC pass.
-	tick, err := g.runTick(ctx, "startup")
+	// Step 6: one-shot GC pass — without snapshot-GC sub-job C, which the
+	// first periodic tick runs (ruling PF-15: runSnapshotPass).
+	tick, err := g.runTick(ctx, phaseStartup)
 	if err != nil {
 		return fmt.Errorf("gc startup: tick: %w", err)
 	}
