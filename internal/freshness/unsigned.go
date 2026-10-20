@@ -123,14 +123,17 @@ func unsignedTooLarge(release []byte) error {
 // established suite keeps serving its last snapshot, coherent and never
 // updated unsigned, until the knob is turned back on, the suite is
 // forgotten (POST /forget) or it is reaped as idle — forgotten or reaped
-// with the knob still off, it is then a never-adopted suite, served as
-// first cached, which is worse, not fresher: ruling PF-5 dropped
-// the retirement PE-12 left to phase F — returned to the ordinary cache,
-// each index file would be frozen at its own first fetch, and every
-// upstream publish would bring Hash Sum mismatches that never clear
-// (TestServeHTTP_KnobOffKeepsServingTheUnsignedSnapshot). Before PE-12 the
-// knob off failed every check, with no record: an established suite froze
-// unpaced and invisible (final reviews E1, E2).
+// with the knob still off, it is then a never-adopted suite, which is
+// worse: the forget or reap deletes its cached index files first
+// (DeleteSuiteMetadata), so its next requests fetch upstream's current
+// files, but each then stays as first stored, never refreshed, and an
+// upstream publish can bring Hash Sum mismatches. Ruling PF-5 dropped the
+// retirement PE-12 left to phase F for the same reason — returned to the
+// ordinary cache, each index file would be frozen at its own first fetch,
+// and every upstream publish would bring Hash Sum mismatches that never
+// clear (TestServeHTTP_KnobOffKeepsServingTheUnsignedSnapshot). Before
+// PE-12 the knob off failed every check, with no record: an established
+// suite froze unpaced and invisible (final reviews E1, E2).
 func (c *Checker) unsignedRefusal(ctx context.Context, req *adoptionRequest) (string, error) {
 	switch err := c.adopter.unsignedEligible(ctx, req.suite); {
 	case errors.Is(err, errUnsignedDisabled):
