@@ -52,6 +52,14 @@ type Cache struct {
 	// operation: a panic there stands in for a bug between the hold and the
 	// settle (TestCreateSuite_APanicReleasesTheHeldCandidate).
 	heldHook func(SuiteKey)
+
+	// committedHook, when set (tests only), runs on the writer goroutine
+	// right after a creation attempt's transaction commits, before its
+	// result is handed back: it lets a test end the creator's context
+	// there, so a submit fails although its eviction committed
+	// (TestCreateSuite_AFailedSubmitWhoseEvictionCommittedPurges, deferred
+	// minor D-20).
+	committedHook func()
 }
 
 // Open initializes (or attaches to) the cache rooted at dir. Creates

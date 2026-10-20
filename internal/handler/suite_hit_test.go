@@ -345,10 +345,10 @@ func testOnboardingAtTheGlobalCapEvictsUnderTheGuard(t *testing.T) {
 	key := func(host, suite string) cache.SuiteKey {
 		return cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite}
 	}
-	if ok, err := c.SuiteExists(ctx, key("n.example", "/r/dists/new")); err != nil || !ok {
+	if ok, err := c.HasSuiteRow(ctx, key("n.example", "/r/dists/new")); err != nil || !ok {
 		t.Fatalf("the onboarding did not create its row (%v, %v)", ok, err)
 	}
-	if ok, err := c.SuiteExists(ctx, key("h3.example", "/r/dists/old")); err != nil || ok {
+	if ok, err := c.HasSuiteRow(ctx, key("h3.example", "/r/dists/old")); err != nil || ok {
 		t.Fatalf("the idle suite was not evicted (%v, %v)", ok, err)
 	}
 	if n := ck.LockCount(); n != maxSuites {
@@ -385,7 +385,7 @@ func TestServeHTTP_OnboardingTimeoutServesUntracked(t *testing.T) {
 		if rec := get(); rec.Code != http.StatusOK || rec.Header().Get(hdrXCache) != cacheHit {
 			t.Fatalf("hit = %d %q, want a 200 hit", rec.Code, rec.Header().Get(hdrXCache))
 		}
-		if ok, err := s.c.SuiteExists(context.Background(), key); err != nil || ok {
+		if ok, err := s.c.HasSuiteRow(context.Background(), key); err != nil || ok {
 			t.Fatalf("a timed-out onboarding tracked the suite (%v, %v)", ok, err)
 		}
 		if n := len(logRecords(logs, "suite onboarding failed", slog.LevelWarn)); n != 1 {
@@ -393,7 +393,7 @@ func TestServeHTTP_OnboardingTimeoutServesUntracked(t *testing.T) {
 		}
 		s.h.cachedAnchorsHook = nil
 		get()
-		if ok, err := s.c.SuiteExists(context.Background(), key); err != nil || !ok {
+		if ok, err := s.c.HasSuiteRow(context.Background(), key); err != nil || !ok {
 			t.Fatalf("the next hit did not onboard the suite (%v, %v)", ok, err)
 		}
 	})

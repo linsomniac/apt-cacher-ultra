@@ -72,9 +72,9 @@ const checkDeadline = 2 * time.Minute
 // up an on-disk cache.
 type Cache interface {
 	GetSuiteFreshness(ctx context.Context, scheme, host, suitePath string) (*cache.SuiteFreshness, error)
-	// SuiteExists is I-4's row gate before a lock-map entry is stored: one
+	// HasSuiteRow is I-4's row gate before a lock-map entry is stored: one
 	// indexed existence read (SELECT 1), cheaper than GetSuiteFreshness.
-	SuiteExists(ctx context.Context, key cache.SuiteKey) (bool, error)
+	HasSuiteRow(ctx context.Context, key cache.SuiteKey) (bool, error)
 	// UpdateSuiteFreshness writes a check's result to an existing row
 	// (UPDATE-only, spec C3: a vanished row is left alone).
 	UpdateSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error
@@ -538,7 +538,7 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 // existence read (SELECT 1; FW-6). A read error counts as "no", logged:
 // the check is skipped and the next trigger tries again.
 func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
-	ok, err := c.cache.SuiteExists(ctx, cache.SuiteKey{CanonicalScheme: ref.CanonicalScheme,
+	ok, err := c.cache.HasSuiteRow(ctx, cache.SuiteKey{CanonicalScheme: ref.CanonicalScheme,
 		CanonicalHost: ref.CanonicalHost, SuitePath: ref.SuitePath})
 	if err != nil {
 		c.logger.Warn("freshness: read suite row failed",

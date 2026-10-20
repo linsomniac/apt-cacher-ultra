@@ -859,7 +859,7 @@ func (s *flipStack) holdUntilTracked(suite string, linger time.Duration, commit 
 		defer close(done)
 		_, err := s.gate.Flip(ctx, flipgate.Key("http", flipSimHost, suite), func() error {
 			for start := time.Now(); time.Since(start) < time.Minute; time.Sleep(10 * time.Millisecond) {
-				if ok, err := s.c.SuiteExists(ctx, key); err != nil || ok {
+				if ok, err := s.c.HasSuiteRow(ctx, key); err != nil || ok {
 					break
 				}
 			}
@@ -945,7 +945,7 @@ func TestServeHTTP_LateRegistrationAfterACommitServesTheNewSnapshot(t *testing.T
 				// The registration's read: once the suite has its row, a flip
 				// commits the snapshot before the read answers.
 				s.h.suiteExistsForTest = func(key cache.SuiteKey) (bool, error) {
-					ok, err := s.c.SuiteExists(ctx, key)
+					ok, err := s.c.HasSuiteRow(ctx, key)
 					if err == nil && ok {
 						committed.Do(func() {
 							_, ferr := s.gate.Flip(ctx, flipgate.Key("http", flipSimHost, suite), func() error {

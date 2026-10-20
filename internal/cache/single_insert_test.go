@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,6 +19,11 @@ import (
 // across line breaks, any case, with the table name quoted ("…", `…`,
 // […]) or schema-qualified (main.suite_freshness) too.
 var insertSuiteFreshnessRE = regexp.MustCompile("(?is)\\b(?:INSERT(?:\\s+OR\\s+\\w+)?|REPLACE)\\s+INTO\\s+" +
+	"(?:[\"`\\[]?\\w+[\"`\\]]?\\s*\\.\\s*)?[\"`\\[]?suite_freshness\\b")
+
+// deleteSuiteFreshnessRE matches a statement that deletes from
+// suite_freshness, with the same quoting and schema forms.
+var deleteSuiteFreshnessRE = regexp.MustCompile("(?is)\\bDELETE\\s+FROM\\s+" +
 	"(?:[\"`\\[]?\\w+[\"`\\]]?\\s*\\.\\s*)?[\"`\\[]?suite_freshness\\b")
 
 // productionGoFiles calls fn for every non-test .go file of the module
@@ -114,6 +120,73 @@ func TestSuiteFreshnessHasOneInsertSite(t *testing.T) {
 	const want = "../../internal/cache/suite_rows.go:createSuiteTx"
 	if len(sites) != 1 || sites[0] != want {
 		t.Fatalf("INSERT INTO suite_freshness sites = %v, want exactly [%s]", sites, want)
+	}
+}
+
+// Ruling R-F1 (spec C3, C9): deleteSuiteTx — the compare-and-delete cap
+// eviction, the reaper and POST /forget share — holds the only DELETE FROM
+// suite_freshness in production code.
+func TestSuiteFreshnessHasOneDeleteSite(t *testing.T) {
+	var sites []string
+	productionGoFiles(t, func(p string, src []byte) {
+		stringLiterals(t, p, src, func(funcName, lit string) {
+			for range deleteSuiteFreshnessRE.FindAllStringIndex(lit, -1) {
+				sites = append(sites, p+":"+funcName)
+			}
+		})
+	})
+	const want = "../../internal/cache/suite_reap.go:deleteSuiteTx"
+	if len(sites) != 1 || sites[0] != want {
+		t.Fatalf("DELETE FROM suite_freshness sites = %v, want exactly [%s]", sites, want)
+	}
+}
+
+// callSites returns "file:function" for every call of the package
+// function name in internal/cache's production code, sorted.
+func callSites(t *testing.T, name string) []string {
+	t.Helper()
+	var out []string
+	productionGoFiles(t, func(p string, src []byte) {
+		if !strings.HasPrefix(p, "../../internal/cache/") {
+			return
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), p, src, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			ast.Inspect(fd, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					if id, ok := call.Fun.(*ast.Ident); ok && id.Name == name {
+						out = append(out, filepath.Base(p)+":"+fd.Name.Name)
+					}
+				}
+				return true
+			})
+		}
+	})
+	slices.Sort(out)
+	return out
+}
+
+// Deferred minor D-8 and ruling R-F1: the one INSERT and the one DELETE
+// of suite_freshness are reached only from known callers, so a new writer
+// that "re-creates on 0 rows", or a second delete path, fails here.
+func TestSuiteRowWritersHaveKnownCallers(t *testing.T) {
+	for _, c := range []struct {
+		fn   string
+		want []string
+	}{
+		{"createSuiteTx", []string{"fetched_row.go:storeFetchedTx", "suite_rows.go:CreateSuite", "testing_helpers.go:SeedSuiteForTest"}},
+		{"deleteSuiteTx", []string{"suite_rows.go:createSuiteTx"}},
+	} {
+		if got := callSites(t, c.fn); !slices.Equal(got, c.want) {
+			t.Errorf("%s callers = %v, want %v", c.fn, got, c.want)
+		}
 	}
 }
 

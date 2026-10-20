@@ -207,7 +207,7 @@ type firstByteProbe struct {
 func (p *firstByteProbe) Write(b []byte) (int, error) {
 	if !p.seen {
 		p.seen = true
-		ok, err := p.c.SuiteExists(context.Background(), cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: p.suite})
+		ok, err := p.c.HasSuiteRow(context.Background(), cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: p.suite})
 		p.row = err == nil && ok
 		_, p.mark, _ = p.c.SignedSeen(context.Background(), "http", "127.0.0.1", aptpath.MarkerBase(p.suite))
 	}
@@ -317,9 +317,9 @@ func assertHitPathInvariant(t *testing.T, c *cache.Cache, db *sql.DB, when strin
 			t.Fatal(err)
 		}
 		suite := strings.TrimSuffix(strings.TrimSuffix(path, "/InRelease"), "/Release.gpg")
-		ok, err := c.SuiteExists(ctx, cache.SuiteKey{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite})
+		ok, err := c.HasSuiteRow(ctx, cache.SuiteKey{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite})
 		if err != nil {
-			t.Fatalf("%s: %s %s%s: SuiteExists: %v", when, scheme, host, suite, err)
+			t.Fatalf("%s: %s %s%s: HasSuiteRow: %v", when, scheme, host, suite, err)
 		}
 		if !ok {
 			continue

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -471,6 +472,79 @@ func TestCreateSuite_ReportsAFutureInterestStamp(t *testing.T) {
 	}
 	if !rowExists(t, c, sk("a", "/future")) {
 		t.Fatal("a suite requested in the future was evicted")
+	}
+}
+
+// Deferred minor D-11: of several suites whose last_requested_at lies in
+// the future, cap eviction reports the furthest one.
+func TestCreateSuite_ReportsTheFurthestFutureStamp(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	seedRow(t, c, sk("a", "/near"), evictNow+evictDay)
+	seedRow(t, c, sk("a", "/far"), evictNow+3*evictDay)
+	seedRow(t, c, sk("a", "/mid"), evictNow+2*evictDay)
+	g := &clockGuard{fakeGuard: newFakeGuard()}
+	if _, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 3}, g); err != nil {
+		t.Fatal(err)
+	}
+	if want := fmt.Sprintf("last_requested_at a/far %d %d", 3*evictDay, evictNow); !slices.Equal(g.reports, []string{want}) {
+		t.Fatalf("reports = %q, want [%q]", g.reports, want)
+	}
+}
+
+// Deferred minor D-20 (design review M3): a creation whose submit fails
+// although its transaction committed — its context ends right after the
+// commit, before the result is handed back — purges the evictee as a
+// successful one does: afterCreate reads the row, finds it gone, forgets
+// the evictee's touch entry and releases it as deleted.
+func TestCreateSuite_AFailedSubmitWhoseEvictionCommittedPurges(t *testing.T) {
+	defer stubNow(t, evictNow)()
+	c := openCache(t)
+	fourRows(t, c)
+	ctx, cancel := context.WithCancel(context.Background())
+	resume := make(chan struct{})
+	var once sync.Once
+	c.committedHook = func() { once.Do(func() { cancel(); <-resume }) }
+	g := newFakeGuard()
+	_, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 4}, g)
+	close(resume)
+	if err == nil {
+		t.Fatal("premise: the submit fails on the context that ended after the commit")
+	}
+	if rowExists(t, c, sk("b", "/idle")) {
+		t.Fatal("premise: the eviction committed")
+	}
+	if got := g.released[sk("b", "/idle")]; !slices.Equal(got, []bool{true}) {
+		t.Fatalf("released %v; want b/idle released once, as deleted", g.released)
+	}
+	c.touches.mu.Lock()
+	_, touched := c.touches.last[sk("b", "/idle")]
+	c.touches.mu.Unlock()
+	if touched {
+		t.Fatal("the evictee's touch entry stayed")
+	}
+}
+
+// Deferred minor D-15: a failed suite-row creation names no caller it was
+// not: the miss path (StoreFetched) and onboarding (CreateSuite) both say
+// "create suite row", never "CreateSuite:".
+func TestCreateSuite_ErrorsNameTheOperation(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	if _, err := c.db.Exec(`CREATE TRIGGER inject_insert_failure BEFORE INSERT ON suite_freshness
+BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	seed := SuiteSeed{SuiteKey: sk("h", "/r/dists/x"), RequestedAt: 1}
+	_, cerr := c.CreateSuite(ctx, seed, SuiteCaps{}, nil)
+	_, serr := c.StoreFetched(ctx, FetchedRow{Row: URLPath{CanonicalScheme: "http", CanonicalHost: "h",
+		Path: "/r/dists/x/InRelease", UpstreamURL: "http://h/r/dists/x/InRelease", IsMetadata: true},
+		Suite: seed.SuiteKey, Create: &seed}, SuiteCaps{}, nil)
+	for name, err := range map[string]error{"CreateSuite": cerr, "StoreFetched": serr} {
+		if err == nil || !strings.Contains(err.Error(), "create suite row: insert") || strings.Contains(err.Error(), "CreateSuite:") {
+			t.Errorf("%s: err = %v, want it to say \"create suite row: insert\" and never \"CreateSuite:\"", name, err)
+		}
 	}
 }
 

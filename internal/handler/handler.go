@@ -1388,7 +1388,7 @@ func clientLeft(w http.ResponseWriter, r *http.Request) bool {
 // pointer (trySnapshotHit re-reads it), or a flip could commit between the
 // read and the registration and hand the client the old anchor after the
 // flip. The row check before it — which is what decides whether a suite is
-// tracked — therefore costs one indexed EXISTS read (SuiteExists; deferred
+// tracked — therefore costs one indexed EXISTS read (HasSuiteRow; deferred
 // minor C-21) per <suite>/InRelease and <suite>/Release request, tracked or
 // not, while the barrier is on (none when it is off; existsReads counts
 // them). A failed read registers anyway (deferred minor C-22): an
@@ -1430,7 +1430,7 @@ func (h *Handler) suiteExists(ctx context.Context, key cache.SuiteKey) (bool, er
 	if h.suiteExistsForTest != nil {
 		return h.suiteExistsForTest(key)
 	}
-	return h.cache.SuiteExists(ctx, key)
+	return h.cache.HasSuiteRow(ctx, key)
 }
 
 // serveCacheMiss runs the singleflight fetch and serves the cached file

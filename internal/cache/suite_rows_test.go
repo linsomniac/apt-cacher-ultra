@@ -306,21 +306,21 @@ func TestCommitAdoption_RefusesAGoneSuite(t *testing.T) {
 	}
 }
 
-// SuiteExists is the handler's cheap tracked-suite test.
-func TestSuiteExists(t *testing.T) {
+// HasSuiteRow is the handler's cheap tracked-suite test.
+func TestHasSuiteRow(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	key := SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: afSuite}
-	if ok, err := c.SuiteExists(ctx, key); err != nil || ok {
+	if ok, err := c.HasSuiteRow(ctx, key); err != nil || ok {
 		t.Fatalf("before creation: %v, %v", ok, err)
 	}
 	if _, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: key, RequestedAt: 1}, SuiteCaps{}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := c.SuiteExists(ctx, key); err != nil || !ok {
+	if ok, err := c.HasSuiteRow(ctx, key); err != nil || !ok {
 		t.Fatalf("after creation: %v, %v", ok, err)
 	}
-	if ok, err := c.SuiteExists(ctx, SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: afSuite}); err != nil || ok {
+	if ok, err := c.HasSuiteRow(ctx, SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: afSuite}); err != nil || ok {
 		t.Fatalf("another scheme: %v, %v", ok, err)
 	}
 }
