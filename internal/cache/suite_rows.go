@@ -137,8 +137,10 @@ type CreateResult struct {
 	// heldGone: the held eviction candidate had no row when the writer ran
 	// (a concurrent creation had evicted it, or a reap or POST /forget had
 	// deleted it, before this creation held it); heldKept: it no longer
-	// qualified (a client asked for it in between). Either way CreateSuite
-	// and StoreFetched try once more with a fresh candidate list.
+	// qualified (a client asked for it in between, or an adoption gave it a
+	// current snapshot — eviction takes only suites without one). Either
+	// way CreateSuite and StoreFetched try once more with a fresh candidate
+	// list.
 	heldGone, heldKept bool
 }
 
@@ -190,8 +192,9 @@ func (c *Cache) CreateSuite(ctx context.Context, seed SuiteSeed, caps SuiteCaps,
 		// The held candidate's row was deleted between the candidate list
 		// and the writer (a concurrent creation evicted it, or a reap or
 		// POST /forget deleted it before the hold), or kept (a client asked
-		// for it meanwhile): one more attempt, with a fresh list (design
-		// review M4; final review, concurrency M2).
+		// for it meanwhile, or an adoption gave it a current snapshot): one
+		// more attempt, with a fresh list (design review M4; final review,
+		// concurrency M2).
 		res, err = attempt()
 	}
 	return res, err

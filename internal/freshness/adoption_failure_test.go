@@ -2,6 +2,7 @@ package freshness
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -115,6 +116,22 @@ func TestAdoptionFailure_ShutdownIsNotRecorded(t *testing.T) {
 	}
 	if n := len(r.events("adoption_failure_record_failed")); n != 0 {
 		t.Fatalf("shutdown logged %d adoption_failure_record_failed lines, want 0", n)
+	}
+}
+
+// Final review spec m9: a failure record whose suite row is missing at
+// the record's read is logged at WARN, not DEBUG. Under ruling R-F1 every
+// suite-row deleter holds the suite's mutex, which the adoption holds
+// until its record is written, so a missing row there is a bug, never a
+// routine reap during the adoption.
+func TestAdoptionFailure_AMissingRowAtTheRecordIsAWarning(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.checker.recordAdoptionFailure(&adoptionRequest{suite: SuiteRef{CanonicalScheme: "http", CanonicalHost: rigHost,
+		SuitePath: "/r/dists/gone"}, key: "k"}, "verify_failed")
+	recs := r.events("adoption_failure_record_failed")
+	if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["suite_path"] != "/r/dists/gone" ||
+		!strings.Contains(fmt.Sprint(recs[0]["err"]), "not found") {
+		t.Fatalf("adoption_failure_record_failed lines %v; want one at WARN for the missing row", recs)
 	}
 }
 

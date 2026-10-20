@@ -99,8 +99,9 @@ type Reaper struct {
 	lastWall, lastMono, deferUntil time.Time
 	stepAhead                      time.Duration
 	reported                       futureStamp
-	// sniffs holds the previous run's junk verdicts by blob (ruling R-F3);
-	// only the run's goroutine touches it.
+	// sniffs holds the junk verdicts the last completed scan reached, keyed
+	// by (anchor kind, blob) (ruling R-F3); only the run's goroutine
+	// touches it.
 	sniffs map[sniffKey]bool
 	// readHead reads the head of a pool file for the junk scan (readCapped;
 	// tests count its reads or end the run's context at one).
@@ -672,7 +673,7 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 	var out []reapCandidate
 	for i := range rows {
 		if ctx.Err() != nil {
-			return nil // a shutdown (the Task 7 review's minor 7): r.sniffs keeps the previous run's verdicts
+			return nil // a shutdown (the Task 7 review's minor 7): r.sniffs keeps the last completed scan's verdicts
 		}
 		s := &rows[i].SuiteFreshness
 		key := cache.SuiteKey{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath}
@@ -709,10 +710,14 @@ type junkReadFailures struct {
 // future one included: the clock-step rule), an anchor no sniff applies
 // to (aptpath.NotSuiteFile), or a pool file that is missing or does not
 // read, is no evidence; a read that fails for another reason than a
-// missing file is counted in fails. Each verdict goes into next; one this
-// run (next) or the previous run (r.sniffs) reached is reused without
-// reading the pool file again, so a run reads each blob it has not
-// sniffed once, however many suites share it (at most 64 KiB each).
+// missing file is counted in fails. Each verdict goes into next, keyed by
+// (anchor kind, blob); one this scan (next) or the last completed scan
+// (r.sniffs) reached is reused without reading the pool file again, so a
+// scan reads each blob it has not sniffed once, however many suites share
+// it (at most 64 KiB each). A failed read reaches no verdict and is not
+// remembered, so fails.n counts failed reads, not pool files: one
+// unreadable blob that N suites share is read, and counted, N times (the
+// WARN's count).
 func (r *Reaper) allJunk(key cache.SuiteKey, as []cache.SuiteAnchorRow, cutoff int64, next map[sniffKey]bool, fails *junkReadFailures) bool {
 	for _, a := range as {
 		if a.BlobHash == nil || a.LastFetchedAt == nil || *a.LastFetchedAt > cutoff {

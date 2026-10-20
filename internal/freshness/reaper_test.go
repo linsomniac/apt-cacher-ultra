@@ -40,8 +40,10 @@ const (
 // the real date passed them). Outside a synctest bubble the pinned clock
 // runs on in real time, so a test that compares a stamp the cache writes
 // (a marker moved up by a reap or a forget, a retirement) exactly, or
-// tightly, with reapNow runs inside a bubble, where it stands still (the
-// Task 9 re-review). No rig test may use t.Parallel.
+// tightly, with reapNow runs inside a bubble, where the pinned clock
+// moves only with the bubble's clock — a sleep or a timer — never with the
+// machine's speed (the Task 9 re-reviews). No rig test may use
+// t.Parallel.
 type reaperRig struct {
 	t       *testing.T
 	cache   *cache.Cache

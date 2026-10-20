@@ -746,7 +746,8 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 // AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, lease
 // release, recover (first). See recoverGoroutine.
 // AIDEV-NOTE: a repair or reconcile that panics deterministically is
-// logged (freshness_check_panicked, where=repair), not recorded: the spec
+// logged (adoption_panicked, where=repair: recoverGoroutine), not
+// recorded: the spec
 // C7 record is keyed on upstream content, and an unchanged suite's heal
 // has none, so the next unchanged check runs it again — one ERROR line
 // per cooldown at most (deferred minor B-37, phase B deviation 7; kept in
@@ -816,8 +817,9 @@ func (c *Checker) rescheduleFailingAdoptions(ctx context.Context) {
 // and reconcile panics are logged, not recorded (phase B plan, deviation 7).
 var ErrAdoptionPanicked = errors.New("adoption_panicked")
 
-// panicStackLogged holds the goroutine kinds ("adoption", "repair",
-// "reconcile", "check", "scheduler") whose stack was already logged.
+// panicStackLogged holds the kinds (logPanic's where: "adoption",
+// "record", "repair", "reconcile", "heartbeat", "check", "scheduler",
+// "reschedule", "reaper", "forget") whose stack was already logged.
 var panicStackLogged sync.Map
 
 // reportPanic logs a recovered panic (logPanic, with the checker's logger).
@@ -829,10 +831,15 @@ func (c *Checker) reportPanic(event, where string, suite SuiteRef, r any) {
 // (its scheme, host and path; empty where the panic names no suite) and
 // the panic value. The stack is attached to the first occurrence per
 // goroutine kind (where) per process only (spec C5 "log the stack once"): a
-// deterministic panic on every attempt must not flood the log. One helper
-// for every recover in the package — the checker's goroutines and the
-// adopter's heartbeat (deferred minor A-37; the handler's counterpart is
-// logGoroutinePanic, whose where=t1 line carries the same suite fields).
+// deterministic panic on every attempt must not flood the log. It is the
+// one helper for the package's recovers that log a panic — the checker's
+// (where check, scheduler, reschedule, adoption, record, repair and
+// reconcile), the adopter's heartbeat (deferred minor A-37), the reaper's
+// runs (reaper) and POST /forget (forget); the legacy trust audit
+// (legacy_audit.go) and the reconcile anchor decode (reconcile.go) turn a
+// panic into an error instead (deferred minor E-44). The handler's
+// counterpart is logGoroutinePanic, whose where=t1 line carries the same
+// suite fields.
 //
 // AIDEV-NOTE: canonical_scheme tells a suite's http copy from its https
 // copy (the Task 6 re-review's out-of-scope 1: the reaper's panic line

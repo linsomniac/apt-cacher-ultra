@@ -40,8 +40,9 @@ func (r *reaperRig) mark(base string, at int64) {
 // in the future reads as now: it is kept as it is — never rewritten
 // (ruling PF-1) — and reported as clock_step_detected (stamp
 // last_seen_at). The sweep runs with gc.suite_idle_ttl = 0s too. Inside
-// a synctest bubble the rig's pinned clock stands still, so the reap's
-// stamp is exactly reapNow.
+// a synctest bubble the rig's pinned clock moves only with the bubble's
+// clock, and this test sleeps nowhere, so the reap's stamp is exactly
+// reapNow.
 func TestReaper_SweepsOrphanMarkersAndKeepsFutureStamps(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()

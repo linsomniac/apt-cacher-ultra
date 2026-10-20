@@ -84,9 +84,10 @@ func (r *reaperRig) cacheOtherSchemeAnchor(suite string) {
 // an unknown suite gets no lock-map entry (I-4). A busy suite keeps its
 // row. Markers another suite with the base keeps (here the other scheme's
 // suite) survive the forget, and the result names that suite (ruling
-// PF-7). Inside a synctest bubble the rig's pinned clock stands still, so
-// the forget's marker stamp (PF-10: MAX(last_seen_at, the cache's now)) is
-// exactly reapNow however long the machine takes to get there (the Task 9
+// PF-7). Inside a synctest bubble the rig's pinned clock moves only with
+// the bubble's clock, and this test sleeps nowhere, so the forget's marker
+// stamp (PF-10: MAX(last_seen_at, the cache's now)) is exactly reapNow
+// however long the machine takes to get there (the Task 9
 // re-review: outside a bubble the pinned clock runs on in real time, and
 // the assertion failed past one second).
 func TestReaper_ForgetAnswersFalseForBusyAndUnknown(t *testing.T) {

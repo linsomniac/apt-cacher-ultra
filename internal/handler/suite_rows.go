@@ -512,7 +512,7 @@ func (h *Handler) touchAsync(req *proxy.Request, touchURL bool, suites []cache.S
 	defer func() {
 		if v := recover(); v != nil {
 			h.logGoroutinePanic("handler_goroutine_panicked", &touchPanicStackLogged, v,
-				"where", "touch", "canonical_host", req.CanonicalHost, "path", req.Path)
+				"where", "touch", "canonical_scheme", req.CanonicalScheme, "canonical_host", req.CanonicalHost, "path", req.Path)
 		}
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

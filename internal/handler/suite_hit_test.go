@@ -699,18 +699,21 @@ func TestAnchorStart_RegistersOnAReadError(t *testing.T) {
 }
 
 // Deferred minor C-24: the touch goroutine recovers its panic and logs it
-// once with the stack.
+// once with the stack, naming the request's scheme, host and path (the
+// scheme tells an http copy of a suite from its https copy: final review
+// spec m9).
 func TestTouchAsync_RecoversItsPanic(t *testing.T) {
 	logs := &syncLog{}
 	h := &Handler{logger: slog.New(slog.NewJSONHandler(logs, nil))} // nil cache: the touch panics
 	touchPanicStackLogged.Store(false)
-	h.touchAsync(&proxy.Request{CanonicalScheme: "http", CanonicalHost: "h", Path: "/r/dists/s/InRelease"}, true, nil)
+	h.touchAsync(&proxy.Request{CanonicalScheme: "https", CanonicalHost: "h", Path: "/r/dists/s/InRelease"}, true, nil)
 	recs := logRecords(logs, "handler_goroutine_panicked", slog.LevelError)
 	var stack string
 	if len(recs) == 1 {
 		stack, _ = recs[0]["stack"].(string) // deferred minor D-36: a missing stack fails, not panics
 	}
-	if len(recs) != 1 || recs[0]["where"] != "touch" || recs[0]["panic"] == nil || !strings.Contains(stack, "touchAsync") {
-		t.Fatalf("records = %+v; want one with where=touch, the panic and its stack", recs)
+	if len(recs) != 1 || recs[0]["where"] != "touch" || recs[0]["panic"] == nil || !strings.Contains(stack, "touchAsync") ||
+		recs[0]["canonical_scheme"] != "https" || recs[0]["canonical_host"] != "h" || recs[0]["path"] != "/r/dists/s/InRelease" {
+		t.Fatalf("records = %+v; want one with where=touch, https://h's path, the panic and its stack", recs)
 	}
 }

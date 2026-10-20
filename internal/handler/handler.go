@@ -69,7 +69,8 @@ type AdoptionWaiter interface {
 	// WaitHostAdoptions waits until none is — at most min(15 s, 25 s −
 	// the time since the request started at start) — and reports whether
 	// to re-run the lookup once: false when 64 requests already wait on
-	// the host or less than 1 s of the budget is left.
+	// the host or less than 1 s of the budget is left, and false too when
+	// ctx ended during the wait (the caller answers client_canceled).
 	WaitHostAdoptions(ctx context.Context, host string, start time.Time) bool
 }
 
@@ -2792,8 +2793,10 @@ func (h *Handler) classifyStrictMode(ctx context.Context, scheme, host string) (
 		return strictInactive, 0, 0
 	}
 	if len(rows) == 0 {
-		// Host has no adopted suites — strict mode has no contract to
-		// uphold. Phase 1 trust-upstream regime.
+		// The host has no signed (inline or detached) current snapshot —
+		// no adopted suite, or only unsigned ones, which vouch nothing —
+		// so strict mode has no contract to uphold. Phase 1
+		// trust-upstream regime.
 		return strictInactive, 0, 0
 	}
 	count := len(rows)

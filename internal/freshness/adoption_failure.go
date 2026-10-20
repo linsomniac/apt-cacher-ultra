@@ -2,7 +2,6 @@ package freshness
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"time"
 
@@ -42,13 +41,13 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 	defer cancel()
 	cur, err := c.cache.GetSuiteFreshness(ctx, s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
 	if err != nil {
-		// A suite reaped while its adoption ran (phase F) has nothing left
-		// to gate: that is routine, not a fault.
-		level := slog.LevelWarn
-		if errors.Is(err, cache.ErrNotFound) {
-			level = slog.LevelDebug
-		}
-		c.logger.Log(ctx, level, "adoption_failure_record_failed",
+		// AIDEV-NOTE: WARN, ErrNotFound included (final review spec m9).
+		// A suite row cannot vanish here: every deleter (cap eviction, the
+		// reaper, POST /forget) holds the suite's mutex through the
+		// SuiteGuard (ruling R-F1), and the adoption holds it until this
+		// record is written. A missing row is a bug, not a routine reap
+		// during the adoption, so it is not demoted to DEBUG.
+		c.logger.Warn("adoption_failure_record_failed",
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath, "err", err)
 		return
 	}
