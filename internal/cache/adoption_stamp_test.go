@@ -11,14 +11,21 @@ import (
 // snapshot of the suite, not only its current one. A suite reaped while
 // its current snapshot's stamp led the clock — it was adopted before a
 // backward step — and then re-created stamps its first adoption above the
-// retired snapshot's stamp, never below, so a client's If-Modified-Since
-// from that snapshot's anchor never gets a 304 for the new one (a
-// quarantine clears the pointer with the same effect).
+// retired snapshot's stamp while that snapshot is still there (sub-job C
+// deletes it at the next GC run: adoptionStampTx's residual), so a
+// client's If-Modified-Since from that snapshot's anchor gets no 304 for
+// the new one (a quarantine clears the pointer with the same effect). A
+// suite with a current snapshot floors on its displaced snapshots too
+// (the Task 5 review's minor 2): a displaced stamp above the current
+// one's — data written before C-11, such as a first adoption the old rule
+// stamped below a quarantined snapshot — still puts the next flip above
+// it.
 func TestAdoptionStamp_FloorsOnEverySnapshotOfTheSuite(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	const t0 = int64(1_800_000_000)
 	restore := stubNow(t, t0)
+	defer restore() // a Fatal before the explicit restore must not leave nowUnix stubbed (calling it twice is harmless)
 	key := sk("h", "/r/dists/x")
 	seedRow(t, c, key, t0)
 	s1, _ := adoptWith(t, c, key, map[string]string{"InRelease": "v1"})
@@ -35,6 +42,20 @@ func TestAdoptionStamp_FloorsOnEverySnapshotOfTheSuite(t *testing.T) {
 	snap, err := c.GetSuiteSnapshot(ctx, s2)
 	if err != nil || derefI64(snap.AdoptedAt) != t0+1001 {
 		t.Fatalf("the next adoption stamped %d (%v), want %d: above the retired snapshot's stamp", derefI64(snap.AdoptedAt), err, t0+1001)
+	}
+
+	// The current-snapshot branch: s2 is current; s3 displaces it, and s2's
+	// stamp is then raised above s3's. The next flip stamps above s2's.
+	s3, _ := adoptWith(t, c, key, map[string]string{"InRelease": "v3"})
+	if _, err := c.db.Exec(`UPDATE suite_snapshot SET adopted_at = ? WHERE snapshot_id = ?`, t0+5000, s2); err != nil {
+		t.Fatal(err)
+	}
+	s4, _ := adoptWith(t, c, key, map[string]string{"InRelease": "v4"})
+	snap3, err3 := c.GetSuiteSnapshot(ctx, s3)
+	snap4, err4 := c.GetSuiteSnapshot(ctx, s4)
+	if err3 != nil || err4 != nil || derefI64(snap3.AdoptedAt) >= t0+5000 || derefI64(snap4.AdoptedAt) != t0+5001 {
+		t.Fatalf("current %d stamped %d, next flip stamped %d (%v, %v); want the flip at %d: above the displaced snapshot's stamp",
+			s3, derefI64(snap3.AdoptedAt), derefI64(snap4.AdoptedAt), err3, err4, t0+5001)
 	}
 }
 

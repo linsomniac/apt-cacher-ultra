@@ -740,15 +740,15 @@ UPDATE blob
 
 // adoptionStampTx returns the adopted_at a commit at now stamps (spec C8,
 // monotonic Last-Modified): max(now, the newest adopted_at of any snapshot
-// of the suite + 1) — current, displaced or retired — and, for a suite
-// with no current snapshot (a first adoption, or one after a quarantine
-// or a reap), also above the newest
-// last_fetched_at of the suite's InRelease/Release/Release.gpg url_path
-// rows + 1 — those rows are what clients were served, with that
-// Last-Modified or older. The handler serves snapshot anchors with
-// adopted_at as their Last-Modified (never the pool file's mtime), so a
-// client's If-Modified-Since from the previous anchor always gets a 200
-// after a flip, whatever the clock does.
+// of the suite + 1) — current, displaced or retired, while it is still
+// there — and, for a suite with no current snapshot (a first adoption, or
+// one after a quarantine or a reap), also above the newest last_fetched_at
+// of the suite's InRelease/Release/Release.gpg url_path rows + 1 — those
+// rows are what clients were served, with that Last-Modified or older.
+// The handler serves snapshot anchors with adopted_at as their
+// Last-Modified (never the pool file's mtime), so a client's
+// If-Modified-Since from the previous anchor gets a 200 after a flip,
+// whatever the clock does — within the residual below.
 //
 // AIDEV-NOTE: call it before CommitAdoption Step 3c, which re-seeds the
 // anchor rows' last_fetched_at with now. adopted_at can now lead the wall
@@ -765,7 +765,15 @@ UPDATE blob
 // (legacy_audit.go) reads one as a wall-clock stamp, and the clock-step
 // rule (internal/freshness/clockstep.go, spec C4) lists adopted_at as a
 // past-event stamp — no gate reads it that way, so a stamp in the future
-// is harmless there.
+// is harmless there. Residual (the Task 5 review's minor 1): the floor
+// covers only the snapshots still present. Sub-job C deletes a retired
+// snapshot at the next GC run, a reap or /forget deletes the anchor rows,
+// and Step 3c seeds them with now, so after a backward step longer than
+// the time from a reap (or /forget) to the re-adoption, with a GC run in
+// between, the re-adoption can stamp below the reaped snapshot again and a
+// client holding that anchor gets a 304 until a later flip is stamped
+// above it. C-11's own readers do not care then (the row is gone); a
+// durable per-suite floor needs a schema change, which phase F forbids.
 func adoptionStampTx(ctx context.Context, tx *sql.Tx, scheme, host, suite string, now int64) (int64, error) {
 	var newest, current sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `
@@ -865,9 +873,10 @@ type DeclaredHash struct {
 
 // DeclaredHashesForPath returns every package_hash row covering this .deb
 // path under any signed (inline or detached) current snapshot — an
-// unsigned one never vouches (deferred minor E-2). Joins package_hash → suite_freshness
-// on current_snapshot_id so a row whose snapshot was displaced (orphaned
-// rows from a prior adoption) does not count. SPEC2 §6.1 step 2 / §6.2.
+// unsigned one never vouches (deferred minor E-2). Joins package_hash →
+// suite_freshness on current_snapshot_id so a row whose snapshot was
+// displaced (orphaned rows from a prior adoption) does not count. SPEC2
+// §6.1 step 2 / §6.2.
 //
 // Returns rows in no defined order. Empty slice + nil error means "no
 // snapshot covers this path" — Phase 1 trust-upstream regime.
