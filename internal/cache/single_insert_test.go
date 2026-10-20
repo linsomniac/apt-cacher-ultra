@@ -255,16 +255,27 @@ func TestOnlyTheHandlerCreatesSuiteRows(t *testing.T) {
 // Ruling R-F1 across packages (design review M-5): outside internal/cache
 // only the suite reaper (internal/freshness/reaper.go) and POST /forget
 // (internal/freshness/forget.go) name the cache's suite deleters — each
-// holds the suite through the SuiteGuard first — so a new caller that
-// skips the guard fails here. Any selector naming a deleter counts, not
-// only a call: a method value (f := c.ForgetSuite) or a method expression
-// ((*cache.Cache).DeleteSuiteMetadata) handed elsewhere could be called
-// through a func value (the Task 3 review's minor 5).
+// holds the suite through the SuiteGuard first — and only the reaper
+// names SweepOrphanMarkers, the year-old orphan sweep, whose cutoff
+// decides which never-downgrade records are deleted (final review tests
+// m-1: a "sweep now" hook with a cutoff of now would strip every orphan
+// marker younger than a year). So a new caller fails here. Any selector
+// naming a deleter counts, not only a call: a method value (f :=
+// c.ForgetSuite) or a method expression ((*cache.Cache).DeleteSuiteMetadata)
+// handed elsewhere could be called through a func value (the Task 3
+// review's minor 5). Inside internal/cache none of the four is named at
+// all (callSites), so a new in-package caller — a GC hook that forgets dead
+// suites, say — fails too.
 func TestSuiteDeletersHaveKnownCallers(t *testing.T) {
-	deleters := map[string]bool{"ReapIdleSuite": true, "ForgetSuite": true, "DeleteSuiteMetadata": true}
-	allowed := map[string]bool{"../../internal/freshness/reaper.go": true, "../../internal/freshness/forget.go": true}
+	const reaper, forget = "../../internal/freshness/reaper.go", "../../internal/freshness/forget.go"
+	allowed := map[string]map[string]bool{ // deleter → the files outside internal/cache that may name it
+		"ReapIdleSuite":       {reaper: true},
+		"ForgetSuite":         {forget: true},
+		"DeleteSuiteMetadata": {reaper: true, forget: true},
+		"SweepOrphanMarkers":  {reaper: true},
+	}
 	productionGoFiles(t, func(p string, src []byte) {
-		if strings.HasPrefix(p, "../../internal/cache/") || allowed[p] {
+		if strings.HasPrefix(p, "../../internal/cache/") {
 			return
 		}
 		fset := token.NewFileSet()
@@ -273,12 +284,21 @@ func TestSuiteDeletersHaveKnownCallers(t *testing.T) {
 			t.Fatal(err)
 		}
 		ast.Inspect(f, func(n ast.Node) bool {
-			if sel, ok := n.(*ast.SelectorExpr); ok && deleters[sel.Sel.Name] {
-				t.Errorf("%s names %s: only the reaper and POST /forget delete suites", fset.Position(sel.Pos()), sel.Sel.Name)
+			if sel, ok := n.(*ast.SelectorExpr); ok {
+				if files, deleter := allowed[sel.Sel.Name]; deleter && !files[p] {
+					t.Errorf("%s names %s: only the reaper and POST /forget delete suites, and only the reaper sweeps markers",
+						fset.Position(sel.Pos()), sel.Sel.Name)
+				}
 			}
 			return true
 		})
 	})
+	for name := range allowed {
+		if got := callSites(t, name); len(got) != 0 {
+			t.Errorf("%s is named inside internal/cache at %v; want nowhere: its callers are the reaper and POST /forget",
+				name, got)
+		}
+	}
 }
 
 // Design review M-5: the never-downgrade authority (spec C5) is deleted

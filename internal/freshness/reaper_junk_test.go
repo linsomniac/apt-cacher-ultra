@@ -164,6 +164,42 @@ func TestReaper_RemembersJunkVerdictsByBlob(t *testing.T) {
 	}
 }
 
+// Spec C9 (verdicts kept "until the next scan"; the final review's tests
+// m-3): a completed scan keeps only the verdicts it reached, so the memo
+// stays bounded by the suites' current anchors. A blob the next scan no
+// longer reaches — a kept suite's anchor replaced by another blob, a junk
+// suite reaped by the run that sniffed it — leaves the memo, and the
+// blobs that scan reached stay.
+func TestReaper_ACompletedScanDropsTheVerdictsItDidNotReach(t *testing.T) {
+	r := newReaperRig(t)
+	ctx := context.Background()
+	old := reapNow - 2*reapDay
+	blob := func(suite string) sniffKey {
+		t.Helper()
+		row, err := r.cache.LookupURL(ctx, "http", "h", suite+"/InRelease")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sniffKey{file: aptpath.FileInRelease, hash: *row.BlobHash}
+	}
+	r.junkSuite("/r/dists/good")
+	r.cacheAnchor("/r/dists/good", "InRelease", string(simtest.ClearsignedFixture("Origin: x\nSHA256:\n")), old)
+	r.junkSuite("/r/dists/junk")
+	r.cacheAnchor("/r/dists/junk", "InRelease", softPage, old)
+	first, junk := blob("/r/dists/good"), blob("/r/dists/junk")
+	r.reaper.runOnce(ctx) // sniffs both; reaps the junk suite
+	if v, ok := r.reaper.sniffs[first]; !ok || v || !r.reaper.sniffs[junk] || r.exists("/r/dists/junk") {
+		t.Fatalf("premise: verdicts %v after the first run, junk suite exists %v; want the good anchor no evidence, "+
+			"the junk one evidence, the junk suite reaped", r.reaper.sniffs, r.exists("/r/dists/junk"))
+	}
+	r.cacheAnchor("/r/dists/good", "InRelease", string(simtest.ClearsignedFixture("Origin: y\nSHA256:\n")), old)
+	second := blob("/r/dists/good")
+	r.reaper.runOnce(ctx)
+	if want := map[sniffKey]bool{second: false}; !maps.Equal(r.reaper.sniffs, want) {
+		t.Fatalf("verdicts after the second run = %v; want only the replaced anchor's, %v", r.reaper.sniffs, want)
+	}
+}
+
 // Ruling R-F3, design note 8: the junk grace is 24 h — an anchor fetched
 // less than 24 h ago may still be a transient soft-404, one fetched 24 h
 // ago or earlier is junk evidence. Both sides of the boundary are pinned

@@ -899,13 +899,18 @@ func TestGate_IdleEntriesExpire(t *testing.T) {
 // reaper, cap eviction, POST /forget) but never a live one — a serve in
 // flight, a serve that completed within the quiet period (a flip of a
 // re-created suite must still wait it out), or a flip in progress. A live
-// entry expires on its own.
+// entry expires on its own. Purge first meets the serve in flight only
+// after it has outlasted the quiet period (a slow client), so its
+// registration's use stamp no longer keeps the entry and only the
+// in-flight clause does (the final review's tests m-2).
 func TestGate_PurgeSkipsLiveEntries(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := newTestGate(t)
 		old := g.AnchorStart(bg, "k")
+		time.Sleep(testQuiet + time.Second)
 		if g.Purge("k") || g.Len() != 1 {
-			t.Fatalf("purged an entry with a serve in flight (%d left)", g.Len())
+			t.Fatalf("purged an entry whose serve has been in flight %v, past the quiet period (%d left)",
+				testQuiet+time.Second, g.Len())
 		}
 		old.Done()
 		time.Sleep(testQuiet - time.Second)
