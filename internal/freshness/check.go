@@ -63,9 +63,16 @@ import (
 //     change makes it due, see Checker.pendingChange).
 //   - Spec C7 gate (retryGateFor, adopter wired only): while a failure
 //     record exists and next_retry_at has not come, the GET carries the
-//     failing content's validators, and a 304 or the same content key
-//     is "changed_deferred" (no adoption); new content is attempted at
-//     once; at next_retry_at the GET carries no validators.
+//     failing content's validators when the record holds its own (a
+//     cross-form request records none, and then the current anchor's own
+//     are sent: design review I-1), and a 304 to the record's validators
+//     or the same content key is "changed_deferred" (no adoption); new
+//     content is attempted at once; at next_retry_at the GET carries no
+//     validators. An adopted suite whose record is anchor_absent or
+//     unsigned_disabled (or whose anchor answered absent behind an
+//     attempt's record) is paced before any request (pacedByRefusal,
+//     pacedAbsentAnswer); a detached suite probes InRelease first
+//     (lateralInline).
 //   - Error (network, an error status that is not an absent answer, 5xx,
 //     check deadline — also one hit while waiting for the host slot), a
 //     success status other than 200 and 304, or a 304 to a GET without

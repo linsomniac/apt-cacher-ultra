@@ -118,9 +118,12 @@ func (t probeTree) sameAs(snap *cache.SuiteSnapshot) bool {
 // signed suite, or nothing — is recorded again: never unsigned from signed.
 // A record from an adoption attempt (the lateral move failed) keeps its own
 // schedule: at its retry time the tree runs at once. Every outcome but a
-// probe that ends unknown leaves last_success_at alone and resets the
-// check_fail_count streak (ruling R-E4: an absent anchor is an answer, not
-// an unknown end).
+// probe that ends unknown (or a local fault: a failed marker write or
+// snapshot read, which fail the check) resets the check_fail_count streak
+// (ruling R-E4: an absent anchor is an answer, not an unknown end); the
+// anchor_absent outcomes leave last_success_at alone, while a form found
+// again (anchorFoundAgain: unchanged, an update, a lateral move or an
+// upgrade) bumps it like any answered check.
 //
 // AIDEV-NOTE: last_success_at stays old on purpose (spec C4: "visible;
 // last_success_at not bumped"); the record paces the suite (pacedByRefusal),
