@@ -186,7 +186,7 @@ func (a *Adopter) remarkSignedAnchors(ctx context.Context, suite SuiteRef) error
 				case !signed:
 					continue
 				}
-				seen := anchorLastUse(row)
+				seen := row.LastUse()
 				if seen <= 0 {
 					seen = wallclock.Unix()
 				}
@@ -202,19 +202,4 @@ func (a *Adopter) remarkSignedAnchors(ctx context.Context, suite SuiteRef) error
 		return fmt.Errorf("mark: %w", err)
 	}
 	return nil
-}
-
-// anchorLastUse is a url_path row's last use — the newer of its
-// last_requested_at and last_fetched_at (0 when neither is set) — the
-// stamp a marker from it carries, as in the startup marker pass and the
-// handler's backstop.
-func anchorLastUse(row *cache.URLPath) int64 {
-	var seen int64
-	if row.LastRequestedAt != nil {
-		seen = *row.LastRequestedAt
-	}
-	if row.LastFetchedAt != nil && *row.LastFetchedAt > seen {
-		seen = *row.LastFetchedAt
-	}
-	return seen
 }

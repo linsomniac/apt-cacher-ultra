@@ -264,7 +264,8 @@ func TestSuiteDeletersHaveKnownCallers(t *testing.T) {
 }
 
 // Design review M-5: the never-downgrade authority (spec C5) is deleted
-// only by POST /forget (ForgetSuite) and the test-only
+// only by POST /forget (ForgetSuite), the year-old orphan sweep
+// (deleteOrphanMarkers, ruling R-F5) and the test-only
 // ClearSignedSeenForTest, so a new path that deletes signed-seen markers
 // fails here.
 func TestSignedSeenHasKnownDeleteSites(t *testing.T) {
@@ -277,7 +278,8 @@ func TestSignedSeenHasKnownDeleteSites(t *testing.T) {
 		})
 	})
 	slices.Sort(sites)
-	want := []string{"../../internal/cache/suite_reap.go:ForgetSuite", "../../internal/cache/testing_helpers.go:ClearSignedSeenForTest"}
+	want := []string{"../../internal/cache/marker_sweep.go:deleteOrphanMarkers", "../../internal/cache/suite_reap.go:ForgetSuite",
+		"../../internal/cache/testing_helpers.go:ClearSignedSeenForTest"}
 	if !slices.Equal(sites, want) {
 		t.Fatalf("DELETE FROM suite_signed_seen sites = %v, want %v", sites, want)
 	}

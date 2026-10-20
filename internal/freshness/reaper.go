@@ -45,6 +45,14 @@ const (
 	// suite's cached anchor rows must all have been fetched at least this
 	// long ago, so a transient soft-404 is never taken for junk.
 	junkGrace = 24 * time.Hour
+	// markerTTL is spec C9's orphan-marker TTL: a signed-seen marker no
+	// suite row of its host has for its base or the base's twin is swept
+	// once it was last seen this long ago.
+	markerTTL = 365 * 24 * time.Hour
+	// dailyEvery is how often a run also sweeps the orphan markers (design
+	// note 20, ruling PF-4): at the first run after a start, then a day
+	// apart (monotonic).
+	dailyEvery = 24 * time.Hour
 )
 
 // ReaperConfig configures a Reaper.
@@ -82,6 +90,12 @@ type Reaper struct {
 	// sniffs holds the previous run's junk verdicts by blob (ruling R-F3);
 	// only the run's goroutine touches it.
 	sniffs map[sniffKey]bool
+	// dailyAt is when the marker sweep last ran (monotonic; zero: due);
+	// reportedMarker is the marker stamped furthest in the future that the
+	// previous sweep found (design review M-10). Only the run's goroutine
+	// touches them; tests zero dailyAt to force a sweep.
+	dailyAt        time.Time
+	reportedMarker cache.SignedSeenMark
 }
 
 // futureStamp is a suite's stamp found in the future.
@@ -159,8 +173,16 @@ type reapCandidate struct {
 // runOnce is one reaper run (spec C9): unless a forward step of the wall
 // clock defers it, reap at most reapsPerRun of the candidates — idle,
 // non-canonical and legacy junk (junkCandidates, every run: ruling PF-4)
-// — those reaped regardless of idleness first, then the oldest; then
-// sweep the reconcile memo against the current snapshots.
+// — those reaped regardless of idleness first, then the oldest, and,
+// when a day has passed since it last ran, sweep the orphan signed-seen
+// markers (sweepMarkers); then sweep the reconcile memo against the
+// current snapshots.
+//
+// AIDEV-NOTE: design note 20, ruling PF-4. Only the marker sweep is
+// daily: it works in years (its 365-day TTL) and costs a writer
+// transaction per batch. A run the forward-step guard defers neither
+// reaps nor sweeps, and leaves the sweep due for the next run (design
+// review M-8): a step makes markers look older too.
 func (r *Reaper) runOnce(ctx context.Context) {
 	rows, err := r.cache.ListSuitesWithAdoption(ctx)
 	if err != nil {
@@ -180,7 +202,38 @@ func (r *Reaper) runOnce(ctx context.Context) {
 			r.reapSuite(ctx, c)
 		}
 	}
+	if !deferred && (r.dailyAt.IsZero() || time.Since(r.dailyAt) >= dailyEvery) {
+		r.dailyAt = time.Now()
+		r.sweepMarkers(ctx, now)
+	}
 	r.sweepReconcileMemo(rows)
+}
+
+// sweepMarkers runs spec C9's orphan-marker sweep (ruling R-F5,
+// cache.SweepOrphanMarkers) with the cutoff now − markerTTL: it deletes
+// the orphans last seen before the cutoff, logging
+// signed_seen_markers_swept when it deleted any, and reports the marker
+// stamped furthest in the future through the rate-limited
+// clock_step_detected (stamp=last_seen_at) at the first sweep after a
+// start and whenever that marker or its stamp changes (design review
+// M-10). It never rewrites a stamp (ruling PF-1).
+func (r *Reaper) sweepMarkers(ctx context.Context, now time.Time) {
+	res, err := r.cache.SweepOrphanMarkers(ctx, now.Unix(), now.Add(-markerTTL).Unix())
+	var furthest cache.SignedSeenMark
+	if res.Furthest != nil {
+		furthest = *res.Furthest
+		if furthest != r.reportedMarker {
+			r.checker.clockStep("last_seen_at", furthest.CanonicalScheme, furthest.CanonicalHost, furthest.Base,
+				furthest.SeenAt, now)
+		}
+	}
+	r.reportedMarker = furthest
+	if res.Swept > 0 {
+		r.logger.Info("signed_seen_markers_swept", "count", res.Swept)
+	}
+	if err != nil {
+		r.warn(ctx, "suite reaper: marker sweep failed", "err", err, "swept", res.Swept)
+	}
 }
 
 // deferredByForwardStep is the reaper's guard against a forward step of

@@ -18,6 +18,22 @@ type URLPath struct {
 	UpstreamLastMod *string // validator fallback when ETag absent
 }
 
+// LastUse is the row's last use: the newer of its last_requested_at and
+// last_fetched_at (0 when neither is set) — the stamp a signed-seen marker
+// from the row carries (the handler's markers and backstop, the adopter's
+// re-mark; ListTrackedSuiteAnchors computes the same in SQL for the
+// startup marker pass). The orphan-marker sweep reads it back.
+func (u *URLPath) LastUse() int64 {
+	var seen int64
+	if u.LastRequestedAt != nil {
+		seen = *u.LastRequestedAt
+	}
+	if u.LastFetchedAt != nil && *u.LastFetchedAt > seen {
+		seen = *u.LastFetchedAt
+	}
+	return seen
+}
+
 // Blob mirrors the blob table.
 type Blob struct {
 	Hash      string // sha256 hex (lowercase, 64 chars)
@@ -349,7 +365,8 @@ type HotURLPath struct {
 // CurrentAdoptedAt is non-nil exactly when the LEFT JOIN found a
 // matching suite_snapshot row whose adopted_at is non-NULL — i.e.
 // the suite has a live current adoption. Returned by
-// ListSuitesWithAdoption (SPEC5 §9.7.8) for the status-page render.
+// ListSuitesWithAdoption (SPEC5 §9.7.8) for the status-page render, the
+// scheduler's tick and the suite reaper (deferred minor E-40).
 type SuiteWithAdoption struct {
 	SuiteFreshness
 	CurrentAdoptedAt *int64 // unix seconds; nil when current_snapshot_id is NULL or no matching suite_snapshot row exists

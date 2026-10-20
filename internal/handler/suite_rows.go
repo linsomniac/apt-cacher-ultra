@@ -265,20 +265,6 @@ func readHead(path string, n int) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(f, int64(n)))
 }
 
-// lastUse is a url_path row's last use: the newer of its last_requested_at
-// and last_fetched_at (0 when neither is set), the stamp a signed-seen
-// marker from it carries, as in the startup marker pass.
-func lastUse(row *cache.URLPath) int64 {
-	var seen int64
-	if row.LastRequestedAt != nil {
-		seen = *row.LastRequestedAt
-	}
-	if row.LastFetchedAt != nil && *row.LastFetchedAt > seen {
-		seen = *row.LastFetchedAt
-	}
-	return seen
-}
-
 // cachedAnchors reads the suite's signed-anchor url_path rows —
 // <suite>/InRelease and <suite>/Release.gpg, but not except, the path this
 // request stores itself — and sniffs each blob here, outside the writer,
@@ -318,7 +304,7 @@ func (h *Handler) cachedAnchors(ctx context.Context, key cache.SuiteKey, except 
 					"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath, "path", p)
 				break
 			}
-			a.BlobHash, a.SeenAt, a.Signed = *row.BlobHash, lastUse(row), file.Sniff(p, head)
+			a.BlobHash, a.SeenAt, a.Signed = *row.BlobHash, row.LastUse(), file.Sniff(p, head)
 		}
 		out = append(out, a)
 	}
@@ -404,7 +390,7 @@ func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKe
 		if !file.Sniff(p, head) {
 			continue
 		}
-		seen := lastUse(row)
+		seen := row.LastUse()
 		if seen <= 0 {
 			// A row with neither stamp is marked now, as the creating
 			// transaction's marks fall back to the creation's stamp
