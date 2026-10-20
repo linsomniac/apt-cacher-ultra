@@ -292,6 +292,47 @@ func TestEndpoint_Forget_LogsAcceptedRequestsAndFailures(t *testing.T) {
 	}
 }
 
+// panickingForgetter's Forget panics, as Reaper.Forget re-panics after
+// logging a panic under its hold.
+type panickingForgetter struct{}
+
+func (panickingForgetter) Forget(context.Context, string, string, string) (cache.ForgetResult, error) {
+	panic("forget bug")
+}
+
+// Final review spec m1: the admin http.Server routes net/http's own lines
+// through slog at ERROR (its ErrorLog), as the proxy listeners route
+// theirs: a POST /forget whose handler panics leaves a structured ERROR
+// record "http: panic serving …" naming the panic, not unstructured
+// stderr text.
+func TestEndpoint_Forget_APanicIsLoggedThroughSlog(t *testing.T) {
+	var buf lockedBuffer
+	_, base, cleanup := startAdminServer(t, withForgetter(panickingForgetter{}),
+		withLogger(slog.New(slog.NewJSONHandler(&buf, nil))))
+	defer cleanup()
+	req, err := http.NewRequest(http.MethodPost, base+"/forget", strings.NewReader("host=h&suite=/s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-ACU-Admin", "1")
+	if resp, err := http.DefaultClient.Do(req); err == nil { // net/http closes the connection: an error is expected
+		_ = resp.Body.Close()
+	}
+	var found map[string]any
+	for deadline := time.Now().Add(5 * time.Second); found == nil && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		for _, line := range strings.Split(buf.String(), "\n") {
+			var m map[string]any
+			if line != "" && json.Unmarshal([]byte(line), &m) == nil && strings.HasPrefix(fmt.Sprint(m["msg"]), "http: panic serving") {
+				found = m
+			}
+		}
+	}
+	if found == nil || found["level"] != "ERROR" || !strings.Contains(fmt.Sprint(found["msg"]), "forget bug") {
+		t.Fatalf("panic record %v; want an slog ERROR line \"http: panic serving …: forget bug\"; log:\n%s", found, buf.String())
+	}
+}
+
 // The Task 11 review's minor 3: a POST /forget in flight when the admin
 // listener's Shutdown begins is cut short at once — Shutdown does not wait
 // out its 5-minute bound and eat the proxies' drain budget — and answers

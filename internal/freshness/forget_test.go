@@ -188,7 +188,11 @@ func (r *reaperRig) failingTrigger(table string) {
 // metadata batches, the final delete. The hold is released as the cache
 // answers (design review M-2): a step that failed keeps the suite and its
 // lock-map entry; a final delete that committed although its submit
-// failed leaves the suite gone and its entry dropped.
+// failed leaves the suite gone and its entry dropped, and is logged INFO
+// suite_forgotten with settled=true and the metadata rows, without the
+// marker and anchor counts it cannot know (final review spec m2, tests
+// m-7: the reaper's suite_reaped settled=true). A step that failed logs
+// no suite_forgotten.
 func TestReaper_ForgetReportsEachStepsDatabaseError(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -221,12 +225,26 @@ func TestReaper_ForgetReportsEachStepsDatabaseError(t *testing.T) {
 			if err == nil || res.Deleted {
 				t.Fatalf("Forget = %+v, %v; want an error (a 500), not a 409's not-deleted", res, err)
 			}
+			forgotten := r.events("suite_forgotten")
 			if tc.gone {
 				if r.exists("/r/dists/x") || r.checker.LockCount() != 0 {
 					t.Fatalf("suite exists %v, %d lock-map entries; want it gone and its entry dropped (release(true))",
 						r.exists("/r/dists/x"), r.checker.LockCount())
 				}
+				if len(forgotten) != 1 {
+					t.Fatalf("suite_forgotten lines %v; want one for the forget that committed", forgotten)
+				}
+				ev := forgotten[0]
+				_, markers := ev["markers_deleted"]
+				_, anchors := ev["anchor_rows"]
+				if ev["level"] != "INFO" || ev["settled"] != true || ev["canonical_scheme"] != "http" || ev["canonical_host"] != "h" ||
+					ev["suite_path"] != "/r/dists/x" || ev["metadata_rows"] != float64(1) || markers || anchors {
+					t.Fatalf("suite_forgotten = %v; want INFO, settled, the suite and its 1 metadata row, no unknown counts", ev)
+				}
 				return
+			}
+			if len(forgotten) != 0 {
+				t.Fatalf("suite_forgotten lines %v; want none for a forget that failed", forgotten)
 			}
 			if r.checker.LockCount() != 1 {
 				t.Fatalf("%d lock-map entries; want the kept suite's entry kept (release(false))", r.checker.LockCount())
@@ -250,8 +268,10 @@ func TestReaper_ForgetReportsADatabaseError(t *testing.T) {
 // The Task 6 re-review's out-of-scope 3, as the reaper's per-candidate
 // rule (design note 23): a panic under Forget's hold releases the suite as
 // the cache then answers — a fresh read of the row — not as Forget last
-// saw it, and the panic goes on to net/http's recovery unchanged. A
-// reapHook stands in for a panic after a commit: it deletes the row
+// saw it, and the panic goes on to net/http's recovery unchanged. It is
+// logged first, with the suite: one ERROR freshness_check_panicked with
+// where=forget and the suite's scheme, host and path (final review spec
+// m1). A reapHook stands in for a panic after a commit: it deletes the row
 // through the cache, then panics, and the deleted suite's lock-map entry
 // and per-suite state go (release(true)); one that panics with the row
 // present keeps them (release(false)).
@@ -284,6 +304,11 @@ func TestReaper_ForgetReleasesAsTheCacheAnswersAfterAPanic(t *testing.T) {
 			}()
 			if got != "forget bug" {
 				t.Fatalf("Forget's panic = %v, want \"forget bug\" passed on to the caller (net/http's recovery)", got)
+			}
+			if ev := r.events("freshness_check_panicked"); len(ev) != 1 || ev[0]["level"] != "ERROR" ||
+				ev[0]["where"] != "forget" || ev[0]["canonical_scheme"] != "http" || ev[0]["canonical_host"] != "h" ||
+				ev[0]["suite_path"] != "/r/dists/x" || ev[0]["panic"] != "forget bug" {
+				t.Fatalf("panic lines = %v; want one ERROR with where=forget naming http://h/r/dists/x", ev)
 			}
 			if r.exists("/r/dists/x") == tc.delete {
 				t.Fatalf("premise: row exists %v, want %v", r.exists("/r/dists/x"), !tc.delete)

@@ -28,13 +28,20 @@ import (
 // HoldSuite, the re-read under the hold, deleteSuiteTx through
 // cache.ForgetSuite, release(gone) — gone being ForgetSuite's answer,
 // settled by a fresh read after a failed submit, or the re-read's finding
-// no row (design review M-2). A panic under the hold is released as the
-// reaper's per-candidate recovery releases one (reapSuite): with the
-// cache's fresh answer (settledGone), since it may have struck after
-// ForgetSuite's commit — a deleted suite's lock-map entry never leaks, a
-// kept one's is never dropped (design note 23) — and is then re-panicked,
-// so net/http's recovery and its log line stay as they were (the Task 6
-// re-review's out-of-scope 3). The suite's next request re-creates it
+// no row (design review M-2). A panic under the hold is logged with the
+// suite (freshness_check_panicked, where=forget: final review spec m1),
+// then released as the reaper's per-candidate recovery releases one
+// (reapSuite): with the cache's fresh answer (settledGone), since it may
+// have struck after ForgetSuite's commit — a deleted suite's lock-map
+// entry never leaks, a kept one's is never dropped (design note 23) — and
+// is then re-panicked, so net/http's recovery still ends the request (the
+// Task 6 re-review's out-of-scope 3); its "http: panic serving" line goes
+// through the admin server's ErrorLog, slog at ERROR. A final delete that
+// committed although its submit failed (ForgetSuite's settled Gone) is
+// logged suite_forgotten with settled=true and the metadata rows, its
+// marker and anchor counts unknown (final review spec m2, as the reaper's
+// suite_reaped settled=true), before the error goes back (the endpoint's
+// 500, or 503 at shutdown). The suite's next request re-creates it
 // never adopted, so unchanged upstream content re-adopts at once (signed)
 // or after the transition's confirmation (unsigned), and a deliberate
 // rollback adopts: the escape hatch for refusal states. Forgetting an
@@ -58,6 +65,10 @@ func (r *Reaper) Forget(ctx context.Context, scheme, host, suitePath string) (ca
 	gone := false
 	defer func() {
 		if v := recover(); v != nil {
+			unloggedPanic(func() {
+				r.checker.reportPanic("freshness_check_panicked", "forget",
+					SuiteRef{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}, v)
+			})
 			release(r.settledGone(key))
 			panic(v)
 		}
@@ -81,6 +92,19 @@ func (r *Reaper) Forget(ctx context.Context, scheme, host, suitePath string) (ca
 	res, err := r.cache.ForgetSuite(ctx, key, cur.CurrentSnapshotID)
 	gone = res.Gone
 	if err != nil {
+		if res.Gone {
+			// The delete committed and its submit failed: under the hold
+			// no other deleter runs, so the cache's fresh read finding no
+			// row means this call deleted it — and, if no row kept them,
+			// the base's markers. Leave a record of it.
+			r.logger.Info("suite_forgotten",
+				"canonical_scheme", scheme,
+				"canonical_host", host,
+				"suite_path", suitePath,
+				"metadata_rows", rows,
+				"settled", true,
+			)
+		}
 		return cache.ForgetResult{}, fmt.Errorf("forget: %w", err)
 	}
 	if !res.Deleted {

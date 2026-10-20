@@ -331,11 +331,18 @@ func New(cfg Config) (*Server, error) {
 		s.profilingCtx, s.profilingCancel = context.WithCancel(context.Background())
 	}
 
+	// AIDEV-NOTE: ErrorLog routes net/http's own lines — above all "http:
+	// panic serving …" when a handler panics (a POST /forget whose
+	// Forgetter re-panics after logging freshness_check_panicked
+	// where=forget) — through slog at ERROR, as the proxy listeners route
+	// theirs (newHTTPServer, at WARN), so a JSON log pipeline gets
+	// structured lines, not stderr text (final review spec m1).
 	s.server = &http.Server{
 		Addr:              cfg.AdminAddr,
 		Handler:           s.buildHandler(),
 		ReadHeaderTimeout: cfg.Admin.ReadTimeout.Duration,
 		IdleTimeout:       cfg.Admin.IdleTimeout.Duration,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 	return s, nil
 }
