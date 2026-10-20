@@ -202,6 +202,12 @@ type Server struct {
 	profilingCtx    context.Context
 	profilingCancel context.CancelFunc
 
+	// stopping ends when Shutdown begins (stop): a POST /forget in flight
+	// then ends at its next step instead of holding the listener's drain
+	// (handleForget). Set once in New().
+	stopping context.Context
+	stop     context.CancelFunc
+
 	// refresher coordinates the §9.7.6 refresher goroutine. Closed
 	// on Shutdown. refresherCancel cancels the context that
 	// in-flight queries inside runRefreshOnce inherit, so a slow
@@ -307,6 +313,7 @@ func New(cfg Config) (*Server, error) {
 		cfg:    cfg,
 		logger: logger,
 	}
+	s.stopping, s.stop = context.WithCancel(context.Background())
 	s.gauges = newRefresherGauges(cfg.Registry, cfg.Admin.MetricSeriesCap)
 	s.startup = newStartupGauges(cfg.Registry, cfg.Admin.MetricSeriesCap,
 		cfg.BuildInfo, cfg.StartTime)
@@ -459,6 +466,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.profilingCancel != nil {
 		s.profilingCancel()
 	}
+	s.stop() // a POST /forget in flight ends at its next step (handleForget)
 
 	s.mu.Lock()
 	s.shutdownStarted = true

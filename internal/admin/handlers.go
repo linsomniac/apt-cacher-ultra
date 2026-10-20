@@ -594,7 +594,22 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 // reaper would, regardless of idleness, and the signed-seen markers of its
 // base (with the base's cached anchor files) when no other suite with that
 // base has a row. The work is done when the answer comes; a client that
-// disconnects does not cut it short.
+// disconnects does not cut it short, and a shutdown does (Shutdown cancels
+// it at its next step).
+//
+// AIDEV-NOTE: the Task 11 review's minor 3. /forget is synchronous, on a
+// context a client disconnect cannot cancel and bounded at 5 minutes
+// (freshness.suiteHoldTimeout); left running at SIGTERM it would hold the
+// admin listener's Shutdown, which main runs first and alone, and eat the
+// proxy listeners' drain budget. So Shutdown cancels it (s.stopping), and
+// a forget cut short so logs admin: forget failed at DEBUG — no failure
+// (design review M-3) — and answers 503. Cutting it short is data-safe,
+// as a failed reap is: each metadata batch is its own writer transaction,
+// the anchors last, and the final delete (ForgetSuite) one transaction, so
+// a forget cut short leaves the suite's row with none, some or all of its
+// url_path metadata rows deleted — fetched again at a client's next
+// request — never half a delete. A cancel that lands after the final
+// commit still answers 503; the retry then answers 409 (no such suite).
 //
 // Headers: X-ACU-Admin: 1 (required); Sec-Fetch-Site, when present, must
 // be same-origin or none (requireMutationGuard). Params (form body): host
@@ -613,6 +628,9 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 //   - 413 Request Entity Too Large: the body exceeds 8 KiB.
 //   - 500 Internal Server Error: a database failure (logged).
 //   - 501 Not Implemented: no Forgetter wired.
+//   - 503 Service Unavailable: the admin listener began shutting down
+//     while the forget ran, and cut it short; retry once the daemon is
+//     back.
 func (s *Server) handleForget(w http.ResponseWriter, r *http.Request) {
 	if !requireMutationGuard(w, r) {
 		return
@@ -644,8 +662,15 @@ func (s *Server) handleForget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logger.Info("admin_forget_requested", "scheme", scheme, "canonical_host", host, "suite_path", suite)
-	res, err := s.cfg.Forgetter.Forget(context.WithoutCancel(r.Context()), scheme, host, suite)
+	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
+	defer cancel()
+	defer context.AfterFunc(s.stopping, cancel)()
+	res, err := s.cfg.Forgetter.Forget(ctx, scheme, host, suite)
 	switch {
+	case err != nil && s.stopping.Err() != nil:
+		s.logger.Debug("admin: forget failed", "err", err, "scheme", scheme, "canonical_host", host, "suite_path", suite)
+		http.Error(w, "shutting down; retry once the daemon is back\n", http.StatusServiceUnavailable)
+		return
 	case err != nil:
 		s.logger.Warn("admin: forget failed", "err", err, "scheme", scheme, "canonical_host", host, "suite_path", suite)
 		http.Error(w, "forget failed\n", http.StatusInternalServerError)

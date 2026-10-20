@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
@@ -22,15 +24,13 @@ type stubForgetter struct {
 	err                 error
 	calls               int
 	scheme, host, suite string
-	detached            bool // the context it got can never be canceled
 }
 
-func (s *stubForgetter) Forget(ctx context.Context, scheme, host, suitePath string) (cache.ForgetResult, error) {
+func (s *stubForgetter) Forget(_ context.Context, scheme, host, suitePath string) (cache.ForgetResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
 	s.scheme, s.host, s.suite = scheme, host, suitePath
-	s.detached = ctx.Done() == nil
 	return s.res, s.err
 }
 
@@ -38,6 +38,44 @@ func (s *stubForgetter) snapshot() (calls int, scheme, host, suite string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls, s.scheme, s.host, s.suite
+}
+
+// blockingForgetter's Forget signals entered, then waits until its context
+// ends or the test unblocks it, and returns: an error wrapping the
+// context's when it ended, else a forgotten result.
+type blockingForgetter struct {
+	entered     chan struct{}
+	release     chan struct{}
+	done        chan struct{}
+	once        sync.Once
+	ctxErr      error // set before done closes
+	unblockOnce sync.Once
+}
+
+func newBlockingForgetter() *blockingForgetter {
+	return &blockingForgetter{entered: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
+}
+
+func (b *blockingForgetter) Forget(ctx context.Context, _, _, _ string) (cache.ForgetResult, error) {
+	b.once.Do(func() { close(b.entered) })
+	defer close(b.done)
+	select {
+	case <-ctx.Done():
+	case <-b.release:
+	}
+	if b.ctxErr = ctx.Err(); b.ctxErr != nil {
+		return cache.ForgetResult{}, fmt.Errorf("forget: delete metadata: %w", b.ctxErr)
+	}
+	return forgotten(0), nil
+}
+
+// unblock lets a blocked Forget return (idempotent).
+func (b *blockingForgetter) unblock() { b.unblockOnce.Do(func() { close(b.release) }) }
+
+// result waits for Forget to return and reports its context's error.
+func (b *blockingForgetter) result() error {
+	<-b.done
+	return b.ctxErr
 }
 
 // forgotten is a stub result: the suite was forgotten, with markers
@@ -139,14 +177,31 @@ func TestEndpoint_Forget(t *testing.T) {
 		}
 	})
 	t.Run("a client that disconnects does not cut it short", func(t *testing.T) {
-		stub := &stubForgetter{res: forgotten(0)}
+		stub := newBlockingForgetter()
 		_, base, cleanup := startAdminServer(t, withForgetter(stub))
 		defer cleanup()
-		forget(t, base, "host=h&suite=/s", admin...)
-		stub.mu.Lock()
-		defer stub.mu.Unlock()
-		if !stub.detached {
-			t.Error("Forget got the request's context; want one a disconnect cannot cancel")
+		defer stub.unblock()
+		ctx, cancel := context.WithCancel(context.Background())
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/forget", strings.NewReader("host=h&suite=/s"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("X-ACU-Admin", "1")
+		sent := make(chan struct{})
+		go func() {
+			defer close(sent)
+			if resp, err := http.DefaultClient.Do(req); err == nil {
+				_ = resp.Body.Close()
+			}
+		}()
+		<-stub.entered
+		cancel() // the client gives up: its connection closes
+		<-sent
+		time.Sleep(200 * time.Millisecond) // net/http cancels a request's context once it sees the connection gone
+		stub.unblock()
+		if err := stub.result(); err != nil {
+			t.Fatalf("the forget's context ended (%v) when its client disconnected; want the work done", err)
 		}
 	})
 	t.Run("no forgetter 501", func(t *testing.T) {
@@ -234,6 +289,69 @@ func TestEndpoint_Forget_LogsAcceptedRequestsAndFailures(t *testing.T) {
 				t.Fatalf("admin: forget failed lines %v; want one at WARN with the error", failed)
 			}
 		})
+	}
+}
+
+// The Task 11 review's minor 3: a POST /forget in flight when the admin
+// listener's Shutdown begins is cut short at once — Shutdown does not wait
+// out its 5-minute bound and eat the proxies' drain budget — and answers
+// 503 (retry), logged at DEBUG, not WARN: a shutdown is no failure (design
+// review M-3).
+func TestEndpoint_Forget_ShutdownCutsItShort(t *testing.T) {
+	stub := newBlockingForgetter()
+	var buf lockedBuffer
+	s, base, cleanup := startAdminServer(t, withForgetter(stub),
+		withLogger(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+	defer cleanup()
+	defer stub.unblock() // a forget the shutdown did not end still returns
+	type answer struct {
+		status int
+		text   string
+		err    error
+	}
+	answered := make(chan answer, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, base+"/forget", strings.NewReader("host=h&suite=/s"))
+		if err != nil {
+			answered <- answer{err: err}
+			return
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("X-ACU-Admin", "1")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			answered <- answer{err: err}
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		text, err := io.ReadAll(resp.Body)
+		answered <- answer{status: resp.StatusCode, text: string(text), err: err}
+	}()
+	<-stub.entered
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown with a forget in flight: %v after %v; want the forget ended and the listener drained",
+			err, time.Since(start))
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("Shutdown took %v with a forget in flight; want it to end the forget at once", d)
+	}
+	a := <-answered
+	if a.err != nil || a.status != http.StatusServiceUnavailable ||
+		strings.TrimRight(a.text, "\n") != "shutting down; retry once the daemon is back" {
+		t.Fatalf("answer %d %q (%v); want 503 \"shutting down; retry once the daemon is back\"", a.status, a.text, a.err)
+	}
+	var failed []string
+	for _, line := range strings.Split(buf.String(), "\n") {
+		var m map[string]any
+		if line != "" && json.Unmarshal([]byte(line), &m) == nil && m["msg"] == "admin: forget failed" {
+			failed = append(failed, m["level"].(string))
+		}
+	}
+	if len(failed) != 1 || failed[0] != "DEBUG" {
+		t.Fatalf("admin: forget failed lines at levels %v; want one at DEBUG", failed)
 	}
 }
 

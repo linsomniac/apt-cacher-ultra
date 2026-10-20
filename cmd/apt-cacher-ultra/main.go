@@ -79,6 +79,13 @@ var (
 	// tens of microseconds typically. 1s is a generous ceiling.
 	tunnelDrainGrace = time.Second
 
+	// runReaper runs the suite reaper (spec C9); serveListeners starts it
+	// through this seam, in freshWG beside the checker, whatever gc.enabled
+	// and periodic_refresh say. Tests swap it to see that it is started and
+	// joined (TestServeListeners_StartsTheReaperWhateverGCSays; the Task 11
+	// review's Important 1) without waiting out its uptime floor.
+	runReaper = (*freshness.Reaper).Run
+
 	// caLockTimeoutForTest, when > 0, overrides the §4.2.2 flock
 	// acquire timeout passed to tlsmitm.LoadOrGenerate. Production
 	// leaves it at zero so LoadOrGenerate's 30s default applies;
@@ -363,6 +370,7 @@ func serveListeners(
 		"adoption_require_signature", cfg.Adoption.RequireSignature,
 		"adoption_require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
 		"adoption_accept_any_signer", cfg.Adoption.AcceptAnySigner,
+		"adoption_adopt_unsigned", cfg.Adoption.AdoptUnsigned,
 		"adoption_tolerate_optional_member_failures", cfg.Adoption.TolerateOptionalMemberFailures,
 		"adoption_hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
 		"adoption_flip_quiet_period", cfg.Adoption.FlipQuietPeriod.Duration,
@@ -383,6 +391,7 @@ func serveListeners(
 		"gc_heartbeat_interval", cfg.GC.HeartbeatInterval.Duration,
 		"gc_heartbeat_stale_grace_effective", cfg.HeartbeatStaleGraceEffective(),
 		"gc_url_path_ttl", cfg.GC.URLPathTTL.Duration,
+		"gc_suite_idle_ttl", cfg.GC.SuiteIdleTTL.Duration,
 		"admin_enabled", cfg.Admin.Enabled,
 		"admin_listen", cfg.Admin.Listen,
 		"admin_htpasswd_file", cfg.Admin.HtpasswdFile,
@@ -622,7 +631,7 @@ func serveListeners(
 	freshWG.Add(1)
 	go func() {
 		defer freshWG.Done()
-		reaper.Run(freshCtx)
+		runReaper(reaper, freshCtx)
 	}()
 
 	// SPEC2 §6.5 at-rest integrity scanner. Shares the freshCtx so the

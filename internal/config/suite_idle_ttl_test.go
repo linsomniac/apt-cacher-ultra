@@ -15,14 +15,24 @@ func TestLoad_SuiteIdleTTL(t *testing.T) {
 		t.Helper()
 		return Load(writeTOML(t, dir, name, "[cache]\ndir = \""+dir+"\"\n"+extra))
 	}
+	// A refused valid value fails here with Load's error, never a nil
+	// dereference that would stop the package's tests (the Task 11
+	// review's minor 2).
 	cfg, err := load("default.toml", "")
-	if err != nil || cfg.GC.SuiteIdleTTL.Duration != 720*time.Hour {
-		t.Fatalf("default: %v, %v; want 720h", cfg.GC.SuiteIdleTTL.Duration, err)
+	if err != nil {
+		t.Fatalf("default: %v; want it to load", err)
+	}
+	if cfg.GC.SuiteIdleTTL.Duration != 720*time.Hour {
+		t.Fatalf("default: %v; want 720h", cfg.GC.SuiteIdleTTL.Duration)
 	}
 	for i, ok := range []time.Duration{0, 24 * time.Hour, 8760 * time.Hour} {
 		cfg, err := load("ok.toml", "[gc]\nsuite_idle_ttl = \""+ok.String()+"\"\n")
-		if err != nil || cfg.GC.SuiteIdleTTL.Duration != ok {
-			t.Errorf("case %d: suite_idle_ttl %s loaded as %v, %v", i, ok, cfg.GC.SuiteIdleTTL.Duration, err)
+		if err != nil {
+			t.Errorf("case %d: suite_idle_ttl %s refused: %v", i, ok, err)
+			continue
+		}
+		if cfg.GC.SuiteIdleTTL.Duration != ok {
+			t.Errorf("case %d: suite_idle_ttl %s loaded as %v", i, ok, cfg.GC.SuiteIdleTTL.Duration)
 		}
 	}
 	for _, bad := range []string{"23h59m", "-1h"} {
