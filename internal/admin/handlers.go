@@ -602,8 +602,12 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 // Returns:
 //   - 202 Accepted: the suite is forgotten; the body names it, the markers
 //     deleted and the rows that kept them (ruling PF-7).
-//   - 400 Bad Request: host or suite missing, or another scheme.
-//   - 403 Forbidden: the header is missing, or the request is cross-site.
+//   - 400 Bad Request: host or suite missing, another scheme, or a host
+//     holding a scheme (scheme://host, as the status page's Host cell shows
+//     it: the scheme goes in scheme).
+//   - 403 Forbidden: X-ACU-Admin: 1 is missing, or Sec-Fetch-Site is
+//     present and neither same-origin nor none (a browser's cross-site or
+//     same-site request).
 //   - 409 Conflict: busy or unknown (no existence oracle); the body says
 //     what to check.
 //   - 413 Request Entity Too Large: the body exceeds 8 KiB.
@@ -632,6 +636,13 @@ func (s *Server) handleForget(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "host and suite are required; scheme is http or https\n", http.StatusBadRequest)
 		return
 	}
+	if strings.Contains(host, "://") {
+		// The status page's Host cell shows scheme://host; copied whole
+		// into host it matches no row (the Task 10 review's minor 4).
+		http.Error(w, "host is the host name alone: pass the scheme in scheme (http or https) and the host without it\n",
+			http.StatusBadRequest)
+		return
+	}
 	s.logger.Info("admin_forget_requested", "scheme", scheme, "canonical_host", host, "suite_path", suite)
 	res, err := s.cfg.Forgetter.Forget(context.WithoutCancel(r.Context()), scheme, host, suite)
 	switch {
@@ -640,8 +651,9 @@ func (s *Server) handleForget(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forget failed\n", http.StatusInternalServerError)
 		return
 	case !res.Deleted:
-		http.Error(w, "not forgotten: busy (try again) or no such suite (scheme defaults to https; "+
-			"host and suite as the status page shows them)\n", http.StatusConflict)
+		http.Error(w, "not forgotten: busy (try again) or no such suite (the status page's Host cell shows "+
+			"scheme://host: pass its scheme as scheme, default https, and the rest as host; suite as its Suite path "+
+			"column shows it)\n", http.StatusConflict)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)

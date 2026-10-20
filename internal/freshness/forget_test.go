@@ -2,7 +2,10 @@ package freshness
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -54,8 +57,10 @@ func TestReaper_ForgetDeletesASuiteRegardlessOfIdleness(t *testing.T) {
 		}
 		ev := r.events("suite_forgotten")
 		if len(ev) != 1 || ev[0]["metadata_rows"] != float64(1) || ev[0]["markers_deleted"] != float64(2) ||
-			ev[0]["anchor_rows"] != float64(1) {
-			t.Fatalf("suite_forgotten lines %v, want one with metadata_rows 1, markers_deleted 2, anchor_rows 1", ev)
+			ev[0]["anchor_rows"] != float64(1) || ev[0]["canonical_scheme"] != "http" || ev[0]["canonical_host"] != "h" ||
+			ev[0]["suite_path"] != "/r/dists/x" {
+			t.Fatalf("suite_forgotten lines %v, want one for http h /r/dists/x with metadata_rows 1, markers_deleted 2, "+
+				"anchor_rows 1", ev)
 		}
 	})
 }
@@ -153,6 +158,74 @@ func TestReaper_ForgetBoundsItsWorkAtFiveMinutes(t *testing.T) {
 	}
 	if !ok || deadline.Before(start.Add(5*time.Minute)) || deadline.After(at.Add(5*time.Minute)) {
 		t.Fatalf("Forget's deadline = %v (set %v), want 5 min after its start", deadline, ok)
+	}
+}
+
+// failingTrigger makes every DELETE on table in r's cache fail, through a
+// trigger created over a second connection to its database.
+func (r *reaperRig) failingTrigger(table string) {
+	r.t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(r.cache.Dir(), "cache.db"))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`CREATE TRIGGER fail_delete_` + table + ` BEFORE DELETE ON ` + table +
+		` BEGIN SELECT RAISE(ABORT, 'injected fault'); END`); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// The Task 10 review's minor 1: a database failure at any step after the
+// first read is an error — the endpoint's 500 and its WARN — never "not
+// deleted" (the 409 for busy or unknown): the re-read under the hold, the
+// metadata batches, the final delete. The hold is released as the cache
+// answers (design review M-2): a step that failed keeps the suite and its
+// lock-map entry; a final delete that committed although its submit
+// failed leaves the suite gone and its entry dropped.
+func TestReaper_ForgetReportsEachStepsDatabaseError(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fault func(r *reaperRig, cancel context.CancelFunc, resume <-chan struct{})
+		gone  bool
+	}{
+		{"the re-read under the hold", func(r *reaperRig, _ context.CancelFunc, _ <-chan struct{}) {
+			r.reaper.reapHook = func(context.Context, cache.SuiteKey) { _ = r.cache.Close() }
+		}, false},
+		{"the metadata batches", func(r *reaperRig, _ context.CancelFunc, _ <-chan struct{}) {
+			r.failingTrigger("url_path")
+		}, false},
+		{"the final delete", func(r *reaperRig, _ context.CancelFunc, _ <-chan struct{}) {
+			r.failingTrigger("suite_freshness")
+		}, false},
+		{"a final delete that committed, its submit failed", func(r *reaperRig, cancel context.CancelFunc, resume <-chan struct{}) {
+			var once sync.Once
+			r.cache.SetCommittedHookForTest(func() { once.Do(func() { cancel(); <-resume }) })
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newReaperRig(t)
+			r.seed("/r/dists/x", reapNow) // leaves a lock-map entry
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			resume := make(chan struct{})
+			tc.fault(r, cancel, resume)
+			res, err := r.reaper.Forget(ctx, "http", "h", "/r/dists/x")
+			close(resume)
+			if err == nil || res.Deleted {
+				t.Fatalf("Forget = %+v, %v; want an error (a 500), not a 409's not-deleted", res, err)
+			}
+			if tc.gone {
+				if r.exists("/r/dists/x") || r.checker.LockCount() != 0 {
+					t.Fatalf("suite exists %v, %d lock-map entries; want it gone and its entry dropped (release(true))",
+						r.exists("/r/dists/x"), r.checker.LockCount())
+				}
+				return
+			}
+			if r.checker.LockCount() != 1 {
+				t.Fatalf("%d lock-map entries; want the kept suite's entry kept (release(false))", r.checker.LockCount())
+			}
+		})
 	}
 }
 

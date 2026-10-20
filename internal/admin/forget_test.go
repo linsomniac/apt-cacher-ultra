@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -95,13 +96,22 @@ func TestEndpoint_Forget(t *testing.T) {
 			"scheme=http&host=h&suite=/flat", http.StatusAccepted, 1,
 			"forgotten http://h/flat; signed-seen markers deleted: 0; kept by https://h/flat http://h/flat/."},
 		{"busy or unknown 409", &stubForgetter{}, "host=h&suite=/s", http.StatusConflict, 1,
-			"not forgotten: busy (try again) or no such suite (scheme defaults to https; host and suite as the status page shows them)"},
+			"not forgotten: busy (try again) or no such suite (the status page's Host cell shows scheme://host: pass its " +
+				"scheme as scheme, default https, and the rest as host; suite as its Suite path column shows it)"},
 		{"database error 500", &stubForgetter{err: errors.New("disk I/O error")}, "host=h&suite=/s", http.StatusInternalServerError, 1,
 			"forget failed"},
 		{"missing suite 400", &stubForgetter{res: forgotten(0)}, "host=h", http.StatusBadRequest, 0,
 			"host and suite are required; scheme is http or https"},
 		{"another scheme 400", &stubForgetter{res: forgotten(0)}, "scheme=ftp&host=h&suite=/s", http.StatusBadRequest, 0,
 			"host and suite are required; scheme is http or https"},
+		// The Task 10 review's minor 4: the Host cell's scheme://host
+		// copied whole into host.
+		{"a scheme in host 400", &stubForgetter{res: forgotten(0)}, "host=http://deb.example&suite=/s", http.StatusBadRequest, 0,
+			"host is the host name alone: pass the scheme in scheme (http or https) and the host without it"},
+		// The Task 10 review's minor 5: the 8 KiB cap (without it, this
+		// body parses and the call is made).
+		{"a body over 8 KiB 413", &stubForgetter{res: forgotten(0)}, "host=h&suite=/s&pad=" + strings.Repeat("x", 9<<10),
+			http.StatusRequestEntityTooLarge, 0, "request body too large"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -162,6 +172,69 @@ func TestEndpoint_Forget(t *testing.T) {
 			}
 		}
 	})
+}
+
+// The Task 10 review's minor 5: an accepted request — past the guard, the
+// body cap and the parameter checks — is logged as INFO
+// admin_forget_requested with its scheme, host and suite, and a database
+// failure as WARN admin: forget failed with the error; a refused request
+// (403, 400) logs neither.
+func TestEndpoint_Forget_LogsAcceptedRequestsAndFailures(t *testing.T) {
+	admin := []string{"X-ACU-Admin", "1"}
+	records := func(buf *lockedBuffer, msg string) []map[string]any {
+		var out []map[string]any
+		for _, line := range strings.Split(buf.String(), "\n") {
+			var m map[string]any
+			if line != "" && json.Unmarshal([]byte(line), &m) == nil && m["msg"] == msg {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name      string
+		stub      *stubForgetter
+		body      string
+		headers   []string
+		requested bool
+		failed    bool
+	}{
+		{"accepted", &stubForgetter{res: forgotten(0)}, "scheme=http&host=h&suite=/s", admin, true, false},
+		{"a database failure", &stubForgetter{err: errors.New("disk I/O error")}, "host=h&suite=/s", admin, true, true},
+		{"refused by the guard", &stubForgetter{res: forgotten(0)}, "host=h&suite=/s", nil, false, false},
+		{"a bad parameter", &stubForgetter{res: forgotten(0)}, "host=h", admin, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf lockedBuffer
+			_, base, cleanup := startAdminServer(t, withForgetter(tc.stub),
+				withLogger(slog.New(slog.NewJSONHandler(&buf, nil))))
+			defer cleanup()
+			forget(t, base, tc.body, tc.headers...)
+			req := records(&buf, "admin_forget_requested")
+			if !tc.requested {
+				if len(req) != 0 {
+					t.Fatalf("admin_forget_requested lines %v; want none for a refused request", req)
+				}
+				return
+			}
+			_, scheme, _, _ := tc.stub.snapshot()
+			if len(req) != 1 || req[0]["level"] != "INFO" || req[0]["scheme"] != scheme || req[0]["canonical_host"] != "h" ||
+				req[0]["suite_path"] != "/s" {
+				t.Fatalf("admin_forget_requested lines %v; want one at INFO for %s h /s", req, scheme)
+			}
+			failed := records(&buf, "admin: forget failed")
+			if !tc.failed {
+				if len(failed) != 0 {
+					t.Fatalf("admin: forget failed lines %v; want none", failed)
+				}
+				return
+			}
+			if len(failed) != 1 || failed[0]["level"] != "WARN" || failed[0]["err"] != "disk I/O error" ||
+				failed[0]["canonical_host"] != "h" || failed[0]["suite_path"] != "/s" {
+				t.Fatalf("admin: forget failed lines %v; want one at WARN with the error", failed)
+			}
+		})
+	}
 }
 
 // Spec C9 and ruling PF-6: a cross-site form or fetch cannot trigger
