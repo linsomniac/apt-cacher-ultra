@@ -23,8 +23,9 @@ type snapshotPassResult struct {
 // CommitAdoption / InsertCandidateSnapshot writes serialize through
 // the same writer goroutine — they cannot interleave between SELECT
 // and DELETE inside this tx). Once A ∪ B is drained, sub-job C (spec C9)
-// deletes the retired snapshots — reaped, forgotten or quarantined — in
-// chunks of at most 10,000 rows per writer transaction.
+// deletes the retired snapshots — those of reaped, evicted and forgotten
+// suites, and those the legacy trust audit quarantined — in chunks of at
+// most 10,000 rows per writer transaction.
 //
 // Returns:
 //   - the cumulative counts (orphan, displaced, retired),

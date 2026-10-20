@@ -254,9 +254,10 @@ func (c *Cache) RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGrac
 	// 1 current + 4 displaced keeps only 2 displaced. The (adopted_at
 	// DESC, snapshot_id DESC) tie-breaker makes ranking deterministic
 	// when two displacements share the same unix-second adopted_at.
-	// Retired snapshots (reaped, forgotten or quarantined) are ranked out
-	// the same way, before the window function (spec C9): they never take
-	// one of a suite's keep_displaced slots, and sub-job C
+	// Retired snapshots (those of a suite reaped, evicted at a cap or
+	// forgotten, and those the legacy trust audit quarantined) are ranked
+	// out the same way, before the window function (spec C9): they never
+	// take one of a suite's keep_displaced slots, and sub-job C
 	// (RunRetiredSnapshotGCChunk) deletes them.
 	const selectSQL = `
 SELECT snapshot_id, reap_class FROM (

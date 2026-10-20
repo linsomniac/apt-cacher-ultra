@@ -77,7 +77,7 @@ var (
 
 	gcRetiredReapedTotal = metrics.NewCounterWithCap(
 		"acu_gc_retired_reaped_total",
-		"Total retired suite_snapshot rows reaped by snapshot-GC sub-job C: snapshots of reaped, forgotten or quarantined suites (spec C9).",
+		"Total retired suite_snapshot rows reaped by snapshot-GC sub-job C: snapshots of reaped, evicted or forgotten suites, and snapshots the legacy trust audit quarantined (spec C9).",
 		0,
 	)
 	gcURLPathRowsReapedTotal = metrics.NewCounterWithCap(
