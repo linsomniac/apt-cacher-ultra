@@ -122,7 +122,9 @@ func unsignedTooLarge(release []byte) error {
 // suiteDue — so checks inside its window ask upstream nothing. The
 // established suite keeps serving its last snapshot, coherent and never
 // updated unsigned, until the knob is turned back on, the suite is
-// forgotten (POST /forget) or it is reaped as idle: ruling PF-5 dropped
+// forgotten (POST /forget) or it is reaped as idle — forgotten or reaped
+// with the knob still off, it is then a never-adopted suite, served as
+// first cached, which is worse, not fresher: ruling PF-5 dropped
 // the retirement PE-12 left to phase F — returned to the ordinary cache,
 // each index file would be frozen at its own first fetch, and every
 // upstream publish would bring Hash Sum mismatches that never clear

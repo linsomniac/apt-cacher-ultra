@@ -30,9 +30,7 @@ func TestServeHTTP_KnobOffKeepsServingTheUnsignedSnapshot(t *testing.T) {
 		releaseURL := "http://" + flipSimHost + suite + "/Release"
 		pkgsURL := "http://" + flipSimHost + suite + "/main/binary-amd64/Packages"
 		ref, rel1 := s.publish(suite, 1)
-		s.members.mu.Lock()
-		pkgs1 := s.members.bodies[pkgsURL]
-		s.members.mu.Unlock()
+		pkgs1 := s.members.get(pkgsURL)
 		s.track(suite)
 		on, err := freshness.NewAdopter(freshness.AdoptionConfig{Cache: s.c, Fetcher: s.members, Verifier: plainVerifier{},
 			HostLimiter: hostsem.New(8), Logger: simtest.DiscardLogger(), AdoptUnsigned: true})
@@ -43,15 +41,16 @@ func TestServeHTTP_KnobOffKeepsServingTheUnsignedSnapshot(t *testing.T) {
 			t.Fatal(err)
 		}
 		snap := s.current(suite)
+		if snap == "" {
+			t.Fatal("premise: the knob-on adoption committed no snapshot")
+		}
 		get := func(path string) (snapshot, body string, code int) {
 			rec := httptest.NewRecorder()
 			s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+path, nil))
 			return rec.Header().Get(hdrXCacheSnapshot), rec.Body.String(), rec.Code
 		}
 		_, rel2 := s.publish(suite, 2) // upstream moves on
-		s.members.mu.Lock()
-		pkgs2 := s.members.bodies[pkgsURL]
-		s.members.mu.Unlock()
+		pkgs2 := s.members.get(pkgsURL)
 		s.h.fetch = staticUpstream{releaseURL: rel2, pkgsURL: pkgs2}
 		up := simtest.NewUpstream()
 		up.Set(releaseURL, simtest.Serve(rel2))
@@ -61,10 +60,14 @@ func TestServeHTTP_KnobOffKeepsServingTheUnsignedSnapshot(t *testing.T) {
 			t.Fatal(err)
 		}
 		chk.Check(ctx, "http", flipSimHost, suite)
-		if sf, err := s.c.GetSuiteFreshness(ctx, "http", flipSimHost, suite); err != nil || sf.AdoptionFailReason == nil ||
-			*sf.AdoptionFailReason != cache.ReasonUnsignedDisabled {
-			t.Fatalf("after the check: %+v, %v; want the new Release refused, unsigned_disabled", sf, err)
+		refused := func(when string) {
+			t.Helper()
+			if sf, err := s.c.GetSuiteFreshness(ctx, "http", flipSimHost, suite); err != nil || sf.AdoptionFailReason == nil ||
+				*sf.AdoptionFailReason != cache.ReasonUnsignedDisabled {
+				t.Fatalf("%s: %+v, %v; want the new Release refused, unsigned_disabled", when, sf, err)
+			}
 		}
+		refused("after the check")
 		rp, err := freshness.NewReaper(freshness.ReaperConfig{Cache: s.c, Checker: chk, IdleTTL: 30 * 24 * time.Hour,
 			Logger: simtest.DiscardLogger()})
 		if err != nil {
@@ -86,5 +89,6 @@ func TestServeHTTP_KnobOffKeepsServingTheUnsignedSnapshot(t *testing.T) {
 		if got := s.current(suite); got != snap {
 			t.Fatalf("current snapshot %q after the run, want %s kept", got, snap)
 		}
+		refused("after the reaper's run") // the refusal stays visible on the status page
 	})
 }

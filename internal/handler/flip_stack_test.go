@@ -49,6 +49,13 @@ func (m *memberStore) put(url string, body []byte) {
 	m.bodies[url] = body
 }
 
+// get returns url's canned body (nil if none).
+func (m *memberStore) get(url string) []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.bodies[url]
+}
+
 func (m *memberStore) Fetch(_ context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
 	m.mu.Lock()
 	body, ok := m.bodies[target.URL]
