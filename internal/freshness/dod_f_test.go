@@ -368,17 +368,30 @@ func TestDoD_NinetyDaysOfReapingWithRestarts(t *testing.T) {
 					}
 					// The reaper's hold stored a lock-map entry for it;
 					// release(true) dropped it with the row (the Task 15
-					// review's minor 2: sampled right after the reap, before
-					// a restart empties the map).
+					// review's minor 2). For b0, b1 and b2 the map is
+					// sampled in the boot that reaped them, no restart
+					// between (reaped on day l+30 in a boot started at
+					// 08:00 that day), so this pins the drop. n0 was
+					// reaped on day 59 at 13:00 and the day-60 00:00
+					// restart emptied the map before this check: for n0
+					// it cannot fail.
 					if _, ok := b.checker.locks.Load(suiteKey("http", "h", s)); ok {
 						t.Fatalf("day %d: reaped %s kept its lock-map entry", day, s)
 					}
 				case l + 32:
-					// Reaped on day l+30 (at 13:00, 15:00 or — the busy
-					// suite — 21:00); a boot's GC passes come at its start and
-					// every 24 h after (00:00 or 08:00), so exactly two have
-					// followed the reap by 09:00 on day l+32 (the Task 15
-					// review's minor 1: by l+33, three had).
+					// Reaped on day l+30: b0 and b2 at 15:00 and the busy
+					// b1 at 21:00, in a boot started at 08:00 that day; n0
+					// at 13:00, in the boot started on day 55 at 00:00. A
+					// boot's GC passes come at its start and every 24 h
+					// after, so for b0, b1 and b2 exactly two (08:00 on
+					// days l+31 and l+32) have followed the reap by 09:00
+					// on day l+32: the two-tick bound this pins (the Task
+					// 15 review's minor 1: by l+33, three had). For n0 two
+					// or three have, depending on scheduling: its boot's
+					// pass due on day 60 at 00:00 falls at the instant of
+					// that day's restart and may run before the stop, then
+					// come the new boot's startup pass and its pass on day
+					// 61 at 00:00.
 					if ok, err := b.c.BlobExists(shaOf(inRelease[s])); err != nil || ok {
 						t.Fatalf("day %d: %s's anchor blob outlived two GC ticks (%v, %v)", day, s, ok, err)
 					}
