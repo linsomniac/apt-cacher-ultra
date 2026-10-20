@@ -103,6 +103,58 @@ BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END`); err != nil {
 	}
 }
 
+// Deferred minor D-18: a FetchedRow whose Create or Restamp names another
+// suite than its Suite is refused before anything is written — it would
+// create one suite, re-stamp another and mark a third — and stores no
+// url_path row, no suite row and no marker. A matching one is stored.
+func TestStoreFetched_RefusesASuiteMismatch(t *testing.T) {
+	key, other := sk("h", "/r/dists/x"), sk("h", "/r/dists/y")
+	for _, tc := range []struct {
+		name            string
+		create, restamp *SuiteKey
+		refused         bool
+	}{
+		{"Create names another suite", &other, nil, true},
+		{"Restamp names another suite", nil, &other, true},
+		{"another scheme", &SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/r/dists/x"}, nil, true},
+		{"both name the suite", &key, &key, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			m := FetchedRow{Row: fetchedRow(t, c, key, "/InRelease"), Suite: key, MarkSeenAt: 1}
+			if tc.create != nil {
+				m.Create = &SuiteSeed{SuiteKey: *tc.create, RequestedAt: 1}
+			}
+			if tc.restamp != nil {
+				m.Restamp = &SuiteSeed{SuiteKey: *tc.restamp}
+			}
+			_, err := c.StoreFetched(ctx, m, SuiteCaps{}, nil)
+			if !tc.refused {
+				if err != nil || !rowExists(t, c, key) {
+					t.Fatalf("StoreFetched = %v, suite row %v; want it stored", err, rowExists(t, c, key))
+				}
+				return
+			}
+			if !errors.Is(err, errFetchedSuiteMismatch) {
+				t.Fatalf("StoreFetched = %v; want errFetchedSuiteMismatch", err)
+			}
+			if _, err := c.LookupURL(ctx, "http", "h", "/r/dists/x/InRelease"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("url_path row stored by a refused FetchedRow (%v)", err)
+			}
+			for _, k := range []SuiteKey{key, other, {CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/r/dists/x"}} {
+				if rowExists(t, c, k) {
+					t.Fatalf("suite row %v created by a refused FetchedRow", k)
+				}
+			}
+			var n int
+			if err := c.db.QueryRow(`SELECT COUNT(*) FROM suite_signed_seen`).Scan(&n); err != nil || n != 0 {
+				t.Fatalf("%d markers (%v) after a refused FetchedRow; want none", n, err)
+			}
+		})
+	}
+}
+
 // StoreFetched creates under the caps with cap eviction, like CreateSuite,
 // and releases the held candidate.
 func TestStoreFetched_EvictsAtTheGlobalCap(t *testing.T) {

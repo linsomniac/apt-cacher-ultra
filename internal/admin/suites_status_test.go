@@ -43,6 +43,25 @@ func TestBuildSuiteEntries_RecordAndLag(t *testing.T) {
 	}
 }
 
+// Deferred minor B-61: adoptionStatus nil-checks the record's reason
+// itself, not trusting its caller's guard: a row with a failure count but
+// no reason (refused or failing, escalated or not) summarises to "", where
+// it used to dereference a nil pointer.
+func TestAdoptionStatus_ANilReasonIsNoRecord(t *testing.T) {
+	const now = int64(1_800_000_000)
+	s := cache.SuiteFreshness{CanonicalHost: "h", SuitePath: "/a", AdoptionFailCount: 3,
+		AdoptionFailFirstAt: p64(now - 2*86400), AdoptionNextRetryAt: p64(now + 60)}
+	for _, tc := range []struct{ refused, long bool }{{false, false}, {true, false}, {true, true}} {
+		if got := adoptionStatus(s, tc.refused, tc.long, now); got != "" {
+			t.Errorf("adoptionStatus(refused %v, long %v) without a reason = %q; want \"\"", tc.refused, tc.long, got)
+		}
+	}
+	s.AdoptionFailReason = pstr("untrusted_signer")
+	if got := adoptionStatus(s, false, false, now); got != "adoption failing 2d 0h · untrusted_signer · retry in 1m" {
+		t.Errorf("adoptionStatus with a reason = %q", got)
+	}
+}
+
 // task-14-extra.md ruling (spec C7): a refusal is a state, not a
 // failure. outcomeBadgeClass must render it b--warn, not b--crit.
 func TestOutcomeBadgeClass_Refused(t *testing.T) {

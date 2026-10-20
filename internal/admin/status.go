@@ -663,7 +663,13 @@ func streakAge(s cache.SuiteFreshness, now int64) int64 {
 // "adoption failing 3d 2h · untrusted_signer · retry in 41m",
 // "refused: upstream_older · retry due", or, for a refusal older than
 // refusalEscalateAge, "refused: upstream_older · since 1d 1h · retry due".
+// A row without a reason has no record to summarise: "" (deferred minor
+// B-61; buildSuiteEntries calls it only with one, but it must not rely on
+// that).
 func adoptionStatus(s cache.SuiteFreshness, refused, long bool, now int64) string {
+	if s.AdoptionFailReason == nil {
+		return ""
+	}
 	retry := "retry due"
 	if s.AdoptionNextRetryAt != nil && *s.AdoptionNextRetryAt > now {
 		retry = "retry in " + durationOf(*s.AdoptionNextRetryAt-now)
