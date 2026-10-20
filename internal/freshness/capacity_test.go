@@ -21,18 +21,23 @@ import (
 // body upstream serves is "changed".
 func seedStaleAnchorAt(t *testing.T, c *cache.Cache, host, suite string) {
 	t.Helper()
-	ctx := context.Background()
+	if err := seedStaleAnchorErr(context.Background(), c, host, suite); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// seedStaleAnchorErr is seedStaleAnchorAt for a goroutine the test spawned,
+// where t.Fatal may not run: it returns the first error.
+func seedStaleAnchorErr(ctx context.Context, c *cache.Cache, host, suite string) error {
 	stale := testHex64
 	if err := c.PutBlob(ctx, stale, 1); err != nil {
-		t.Fatal(err)
+		return err
 	}
 	if err := c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: host, Path: suite + "/InRelease",
 		BlobHash: &stale, UpstreamURL: "http://" + host + suite + "/InRelease", IsMetadata: true, RequestCount: 1}); err != nil {
-		t.Fatal(err)
+		return err
 	}
-	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite}); err != nil {
-		t.Fatal(err)
-	}
+	return c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite})
 }
 
 // Spec C4: with no free slot the check spawns nothing, reports

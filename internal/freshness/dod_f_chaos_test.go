@@ -2,12 +2,10 @@ package freshness
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,22 +17,8 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
-
-// chaosCount runs a COUNT query on its own connection to c.
-func chaosCount(t *testing.T, c *cache.Cache, query string) int {
-	t.Helper()
-	db, err := sql.Open("sqlite", filepath.Join(c.Dir(), "cache.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = db.Close() }()
-	var n int
-	if err := db.QueryRow(query).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	return n
-}
 
 // countMsgs counts logs' JSON records by msg.
 func countMsgs(logs *lockedBuffer) map[string]int {
@@ -53,11 +37,14 @@ func countMsgs(logs *lockedBuffer) map[string]int {
 // Review Focus 5, spec §7 C9's reap-vs-adoption chaos: for two virtual
 // days, clients come and go on four suites (creating, touching and
 // checking them) under a suite cap of three (design review M-6: a fourth
-// suite's creation is refused, or evicts an idle one, while a suite is
-// reaped or forgotten), the upstream publishes new content that their
-// checks adopt behind a flip barrier, an operator forgets suites, and the
-// reaper runs hourly with a three-hour TTL, all at once. Nothing
-// deadlocks or panics; afterwards every current snapshot is adopted and
+// suite's creation is refused while a suite is reaped or forgotten; cap
+// eviction, the third delete path, does not run here — its 24-hour idle
+// rule outlasts the three-hour TTL, so the reaper takes every idle suite
+// first), the upstream publishes new content that their checks adopt
+// behind a flip barrier, an operator forgets suites, and the reaper runs
+// hourly with a three-hour TTL, all at once. Nothing deadlocks or panics
+// (no recovered panic is logged, and no client's database call fails);
+// afterwards every current snapshot is adopted and
 // not retired, every snapshot of a suite without a row is retired, every
 // current snapshot's member blobs are there, the table holds at most
 // three rows, and the lock map, the flip gate and the touch map hold no
@@ -136,9 +123,15 @@ func TestDoD_ReapRacesAdoptionsAndClients(t *testing.T) {
 						return
 					}
 					if ok {
-						_ = c.TouchSuite(ctx, key)
+						// TouchSuite answers nil for a row gone meanwhile: an
+						// error is a database failure under contention (the
+						// Task 15 review's Important 3).
+						if err := c.TouchSuite(ctx, key); err != nil {
+							t.Error(err)
+							return
+						}
 					} else {
-						res, err := c.CreateSuite(ctx, cache.SuiteSeed{SuiteKey: key, RequestedAt: time.Now().Unix()}, caps, ck)
+						res, err := c.CreateSuite(ctx, cache.SuiteSeed{SuiteKey: key, RequestedAt: wallclock.Unix()}, caps, ck)
 						if err != nil {
 							t.Error(err)
 							return
@@ -147,7 +140,12 @@ func TestDoD_ReapRacesAdoptionsAndClients(t *testing.T) {
 							refused.Add(1) // served untracked: no row, so no anchor row to seed or suite to check
 							continue
 						}
-						seedStaleAnchorAt(t, c, "h", s)
+						// Not seedStaleAnchorAt: t.Fatal may not run on this
+						// goroutine (the Task 15 review's minor 10).
+						if err := seedStaleAnchorErr(ctx, c, "h", s); err != nil {
+							t.Error(err)
+							return
+						}
 					}
 					ck.Check(ctx, "http", "h", s) // its T1 check
 				}
@@ -181,7 +179,7 @@ func TestDoD_ReapRacesAdoptionsAndClients(t *testing.T) {
   AND NOT EXISTS (SELECT 1 FROM suite_freshness sf WHERE sf.canonical_scheme = ss.canonical_scheme
   AND sf.canonical_host = ss.canonical_host AND sf.suite_path = ss.suite_path)`},
 		} {
-			if n := chaosCount(t, c, q.sql); n != 0 {
+			if n := countRows(t, c, q.sql); n != 0 {
 				t.Errorf("%d %s", n, q.what)
 			}
 		}
@@ -210,6 +208,7 @@ func TestDoD_ReapRacesAdoptionsAndClients(t *testing.T) {
 		if n := sampleGoroutines(base); n > base {
 			t.Errorf("%d goroutines after the run, %d before it", n, base)
 		}
+		noPanics(t, logs) // the race-induced panics Review Focus 5 is about, recovered and logged
 		got := countMsgs(logs)
 		if got["suite_reaped"] == 0 || got["suite_forgotten"] == 0 || refused.Load() == 0 || got["adoption_success"] <= len(suites) {
 			t.Errorf("reaps %d, forgets %d, refusals at the cap %d, adoptions %d; want reaps, forgets, refusals and re-adoptions",

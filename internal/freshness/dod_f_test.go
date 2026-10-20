@@ -74,7 +74,7 @@ func startSimBootAt(t *testing.T, dir string, members *fakeFetcher, logs *locked
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	b := &simBoot{c: c}
 	if b.ad, err = NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
-		HostLimiter: hostsem.New(8), Logger: discardLogger()}); err != nil {
+		HostLimiter: hostsem.New(8), Logger: logger}); err != nil { // its recovered panics land in logs (noPanics)
 		t.Fatal(err)
 	}
 	if b.checker, err = New(Config{Cache: c, Fetcher: &simtest.StaticConditional{Status: 304}, HostLimiter: hostsem.New(8),
@@ -150,19 +150,33 @@ func (b *simBoot) use(t *testing.T, suite string, inRelease []byte) bool {
 	return true
 }
 
-// count runs a COUNT query on its own connection to the boot's cache.
-func (b *simBoot) count(t *testing.T, query string) int {
+// countRows runs a COUNT query, with its arguments, on its own connection
+// to c's database (the DoD tests' one copy: the Task 15 review's minor 7).
+func countRows(t *testing.T, c *cache.Cache, query string, args ...any) int {
 	t.Helper()
-	db, err := sql.Open("sqlite", filepath.Join(b.c.Dir(), "cache.db"))
+	db, err := sql.Open("sqlite", filepath.Join(c.Dir(), "cache.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
 	var n int
-	if err := db.QueryRow(query).Scan(&n); err != nil {
+	if err := db.QueryRow(query, args...).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// noPanics fails t if logs hold a recovered panic: the checker's, the
+// reaper's or the adopter's (freshness_check_panicked, adoption_panicked).
+// They recover and go on, so only their log line tells (the Task 15
+// review's Important 3).
+func noPanics(t *testing.T, logs *lockedBuffer) {
+	t.Helper()
+	got := countMsgs(logs)
+	if got["freshness_check_panicked"] != 0 || got["adoption_panicked"] != 0 {
+		t.Errorf("recovered panics: freshness_check_panicked %d, adoption_panicked %d; want none",
+			got["freshness_check_panicked"], got["adoption_panicked"])
+	}
 }
 
 // simSuites builds the suites' upstream: each a clearsigned InRelease of
@@ -184,7 +198,8 @@ func reapedLines(logs *lockedBuffer) map[string]int {
 	for _, line := range strings.Split(logs.String(), "\n") {
 		var m map[string]any
 		if line != "" && json.Unmarshal([]byte(line), &m) == nil && m["msg"] == "suite_reaped" {
-			out[m["suite_path"].(string)]++
+			path, _ := m["suite_path"].(string) // a malformed line counts under "" (the Task 15 review's minor 8)
+			out[path]++
 		}
 	}
 	return out
@@ -223,6 +238,11 @@ func TestDoD_ForwardStepFalseReapsSelfHeal(t *testing.T) {
 				if atRestart {
 					b.stop(t)
 				}
+				// Run has read its starting clocks (lastWall, lastMono) and
+				// waits for its floor before the step: a step before that read
+				// is no step to it (the Task 15 review's Important 2; it lost
+				// that race at GOMAXPROCS=1).
+				synctest.Wait()
 				restore := wallclock.SetOffsetForTest(30*24*time.Hour + time.Minute)
 				defer restore()
 				if atRestart {
@@ -264,6 +284,7 @@ func TestDoD_ForwardStepFalseReapsSelfHeal(t *testing.T) {
 				if got := reapedLines(logs); len(got) != len(suites) {
 					t.Fatalf("suite_reaped %v, want the three false reaps", got)
 				}
+				noPanics(t, logs)
 			})
 		})
 	}
@@ -275,12 +296,15 @@ func TestDoD_ForwardStepFalseReapsSelfHeal(t *testing.T) {
 // reap). Suites used daily are never reaped; one used again on day 29
 // (near the TTL) lasts until day 59; a suite whose last use was day L is
 // there on day L+30 and gone on day L+31 — a busy one too, whose check
-// holds its mutex across the run that would reap it; its anchor blob is
-// gone within two GC ticks; a reaped suite whose client returns re-adopts
-// at once; a five-day backward clock step reaps nothing; at the end the
-// suite tables and the in-memory maps hold the live suites only, and
-// after every restart the goroutines are back at the first boot's count
-// (design review M-6).
+// holds its mutex across the run that would reap it — with the lock-map
+// entry the reaper's hold stored gone with it; its anchor blob is gone
+// within two GC ticks; a reaped suite whose client returns re-adopts at
+// once; a five-day backward clock step reaps nothing; at the end the suite
+// tables hold the live suites only and no panic was recovered, and after
+// every restart the goroutines are back at the first boot's count (design
+// review M-6). The touch map is not exercised here: every restart empties
+// it, and no reaped suite was touched in the boot that reaped it (the
+// chaos test and the reaper's unit tests cover its purge).
 func TestDoD_NinetyDaysOfReapingWithRestarts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		dir := t.TempDir()
@@ -342,7 +366,19 @@ func TestDoD_NinetyDaysOfReapingWithRestarts(t *testing.T) {
 					if b.exists(t, s) {
 						t.Fatalf("day %d: %s not reaped 31 days after its last use", day, s)
 					}
-				case l + 33:
+					// The reaper's hold stored a lock-map entry for it;
+					// release(true) dropped it with the row (the Task 15
+					// review's minor 2: sampled right after the reap, before
+					// a restart empties the map).
+					if _, ok := b.checker.locks.Load(suiteKey("http", "h", s)); ok {
+						t.Fatalf("day %d: reaped %s kept its lock-map entry", day, s)
+					}
+				case l + 32:
+					// Reaped on day l+30 (at 13:00, 15:00 or — the busy
+					// suite — 21:00); a boot's GC passes come at its start and
+					// every 24 h after (00:00 or 08:00), so exactly two have
+					// followed the reap by 09:00 on day l+32 (the Task 15
+					// review's minor 1: by l+33, three had).
 					if ok, err := b.c.BlobExists(shaOf(inRelease[s])); err != nil || ok {
 						t.Fatalf("day %d: %s's anchor blob outlived two GC ticks (%v, %v)", day, s, ok, err)
 					}
@@ -376,15 +412,13 @@ func TestDoD_NinetyDaysOfReapingWithRestarts(t *testing.T) {
 			}
 		}
 		live := len(active) + 1
-		if n := b.count(t, `SELECT COUNT(*) FROM suite_freshness`); n != live {
+		if n := countRows(t, b.c, `SELECT COUNT(*) FROM suite_freshness`); n != live {
 			t.Errorf("%d suite rows, want the %d live suites'", n, live)
 		}
-		if n := b.count(t, `SELECT COUNT(*) FROM suite_snapshot`); n != live {
+		if n := countRows(t, b.c, `SELECT COUNT(*) FROM suite_snapshot`); n != live {
 			t.Errorf("%d suite_snapshot rows, want the %d live suites' current ones", n, live)
 		}
-		if b.checker.LockCount() > live || b.c.TouchedSuites() > live {
-			t.Errorf("lock map %d, touch map %d entries; want at most %d", b.checker.LockCount(), b.c.TouchedSuites(), live)
-		}
+		noPanics(t, logs)
 		want := map[string]int{"/r/dists/b0": 1, "/r/dists/b1": 1, "/r/dists/b2": 1, "/r/dists/n0": 1, returning: 1}
 		got := reapedLines(logs)
 		if len(got) != len(want) {
@@ -401,12 +435,14 @@ func TestDoD_NinetyDaysOfReapingWithRestarts(t *testing.T) {
 // Design review (deliberate deviation 2's other half): four virtual days
 // at the production cadence — the reaper hourly after its one-hour floor,
 // gc.url_path_ttl = 168h, a restart every twelve hours. A suite whose
-// deadline falls 30 minutes before a restart, after the last run of the
+// deadline falls 29 minutes before a restart, after the last run of the
 // boot before, is reaped at the next boot's floor, never at its start; a
-// suite whose anchor rows url_path GC deleted days
-// before its deadline is still reaped, its marker kept; a suite in daily
-// use is never reaped; after every restart the goroutines are back at the
-// first boot's count.
+// suite whose anchor row url_path GC deleted before its deadline (by the
+// 48 h boot's startup pass, 6 hours before it: the four days are shorter
+// than the 168 h TTL, so the row is seeded already past it) is still
+// reaped, its marker kept; a suite in daily use is never reaped; after
+// every restart the goroutines are back at the first boot's count, and no
+// panic was recovered.
 func TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
@@ -431,8 +467,9 @@ func TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		// edge's deadline: 35 h 30 m, between the last run before the
-		// restart at 36 h (35 h) and that restart.
+		// edge's deadline: 35 h 30 m, between its boot's last run (35 h)
+		// and the restart at 35 h 59 m; without the uptime floor the next
+		// boot's first run would come at once and reap it before 36 h 58 m.
 		seed(edge, start.Add(35*time.Hour+30*time.Minute-ttl))
 		// gcd's deadline: 54 h; its cached InRelease, unused for 8 days,
 		// is past url_path_ttl, and its base was last seen signed then.
@@ -470,22 +507,25 @@ func TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts(t *testing.T) {
 			for step := 0; step < 2; step++ { // the active suite's client, every six hours
 				b.use(t, active, inRelease[active])
 				switch {
-				case half == 2 && step == 1: // 30 h; then up to 35 h 59 m: the boot's last run, at 35 h
+				case half == 2 && step == 1: // 30 h; then to 35 h 59 m: the boot's last run was at 35 h
+					// The restart comes at 35 h 59 m, before the boot's next run
+					// (due at 36 h): a restart at 36 h raced that run, which
+					// could reap edge before the stop (the Task 15 review's
+					// Important 1; it lost the race at GOMAXPROCS=1).
 					time.Sleep(5*time.Hour + 59*time.Minute)
 					if !b.exists(t, edge) {
 						t.Fatalf("%s reaped before its deadline", edge)
 					}
-					time.Sleep(time.Minute)
-				case half == 3 && step == 0: // 36 h: the restart; the floor's run at 37 h
+				case half == 3 && step == 0: // 35 h 59 m: the restart; the floor's run at 36 h 59 m
 					time.Sleep(time.Hour - time.Minute)
 					if !b.exists(t, edge) {
 						t.Fatalf("%s reaped before the boot's uptime floor", edge)
 					}
 					time.Sleep(2 * time.Minute)
 					if b.exists(t, edge) {
-						t.Fatalf("%s not reaped at the boot's floor, 90 minutes past its deadline", edge)
+						t.Fatalf("%s not reaped at the boot's floor, 89 minutes past its deadline", edge)
 					}
-					time.Sleep(5*time.Hour - time.Minute)
+					time.Sleep(5 * time.Hour) // back on the six-hour grid: 42 h
 				case half == 4 && step == 0: // 48 h: url_path GC has deleted gcd's anchor; gcd is still tracked
 					if gcdAnchor() || !b.exists(t, gcd) {
 						t.Fatalf("at 48 h: %s's anchor row %v, its row %v; want the anchor deleted by url_path GC, the row kept",
@@ -516,5 +556,6 @@ func TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts(t *testing.T) {
 		if got := reapedLines(logs); len(got) != 2 || got[edge] != 1 || got[gcd] != 1 {
 			t.Fatalf("suite_reaped %v, want %s and %s once each", got, edge, gcd)
 		}
+		noPanics(t, logs)
 	})
 }

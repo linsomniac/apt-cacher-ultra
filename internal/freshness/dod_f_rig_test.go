@@ -2,9 +2,8 @@ package freshness
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"log/slog"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -54,8 +53,10 @@ func (r *retryRig) reapRig(rp *Reaper) {
 	r.clock.advance(reapAge)
 	rp.lastMono = time.Time{}
 	rp.runOnce(context.Background())
-	if _, err := r.cache.GetSuiteFreshness(context.Background(), "http", rigHost, rigSuite); err == nil {
-		r.t.Fatal("the idle rig suite was not reaped")
+	// Only ErrNotFound proves the delete: any other error is a failed read
+	// (the Task 15 review's minor 9).
+	if _, err := r.cache.GetSuiteFreshness(context.Background(), "http", rigHost, rigSuite); !errors.Is(err, cache.ErrNotFound) {
+		r.t.Fatalf("the idle rig suite was not reaped (%v)", err)
 	}
 }
 
@@ -76,17 +77,8 @@ func (r *retryRig) clientReturns() {
 // retiredCount is the number of retired snapshots of the rig suite.
 func (r *retryRig) retiredCount() int {
 	r.t.Helper()
-	db, err := sql.Open("sqlite", filepath.Join(r.cache.Dir(), "cache.db"))
-	if err != nil {
-		r.t.Fatal(err)
-	}
-	defer func() { _ = db.Close() }()
-	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM suite_snapshot WHERE suite_path = ? AND retired_at IS NOT NULL`,
-		rigSuite).Scan(&n); err != nil {
-		r.t.Fatal(err)
-	}
-	return n
+	return countRows(r.t, r.cache, `SELECT COUNT(*) FROM suite_snapshot WHERE suite_path = ? AND retired_at IS NOT NULL`,
+		rigSuite)
 }
 
 // Spec §7 C9: a reaped suite whose client returns before any GC tick
@@ -115,8 +107,8 @@ func TestDoD_ReturnBeforeGCReadoptsWithinOneCheck(t *testing.T) {
 	if err := g.StartupPass(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.cache.GetSuiteSnapshot(ctx, old.SnapshotID); err == nil {
-		t.Fatal("the retired snapshot survived the GC pass")
+	if _, err := r.cache.GetSuiteSnapshot(ctx, old.SnapshotID); !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("the retired snapshot survived the GC pass (%v)", err)
 	}
 	m, err := r.cache.GetSnapshotMember(ctx, snap.SnapshotID, "main/binary-amd64/Packages")
 	if err != nil {
