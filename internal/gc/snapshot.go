@@ -29,9 +29,9 @@ type snapshotPassResult struct {
 // Returns:
 //   - the cumulative counts (orphan, displaced, retired),
 //   - whether the deadline tripped (true means the pass exited
-//     between batches with backlog remaining; the next tick picks
-//     up the rest, AND the same tick's blob pass receives an
-//     already-expired deadline and exits immediately),
+//     between batches with backlog remaining; runTick then returns
+//     without running the blob pass, and the next tick resumes this
+//     pass — A ∪ B, then C — before the blob pass),
 //   - error iff a DB-level failure occurred.
 func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase string) (snapshotPassResult, bool, error) {
 	staleGraceSeconds := int64(g.cfg.HeartbeatStaleGrace.Seconds())

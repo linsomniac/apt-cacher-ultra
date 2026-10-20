@@ -13,15 +13,19 @@ import (
 )
 
 // Spec C9 sub-job C and §7 "blobs reclaimed within two GC ticks": a suite
-// reaped (or forgotten) leaves retired snapshots; the next tick's snapshot
-// pass deletes them (retired_reaped in gc_run_complete and LastRunSummary)
-// and the same tick's blob pass reclaims their blobs once blob_grace has
-// passed.
+// reaped (or forgotten) leaves retired snapshots — here two, the current
+// one and the one it displaced, so the pass must loop past its first
+// deleted header (the Task 4 review's minor 1) — and the next tick's
+// snapshot pass deletes them (retired_reaped in gc_run_complete and
+// LastRunSummary) and the same tick's blob pass reclaims their blobs once
+// blob_grace has passed.
 func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
 	c := openTestCache(t)
 	logger, buf := captureLogger()
 	db := dbOf(t, c)
 	ctx := context.Background()
+	oldAnchor, oldMember := putPoolBlob(t, c, "old anchor"), putPoolBlob(t, c, "old member")
+	old := adoptSnapshot(t, c, "http", "h", "/r/dists/x", oldAnchor, []string{oldMember})
 	anchor := putPoolBlob(t, c, "anchor")
 	b1, b2 := putPoolBlob(t, c, "member one"), putPoolBlob(t, c, "member two")
 	id := adoptSnapshot(t, c, "http", "h", "/r/dists/x", anchor, []string{b1, b2})
@@ -32,7 +36,8 @@ func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
 	if res, err := c.ForgetSuite(ctx, key, &id); err != nil || !res.Deleted {
 		t.Fatalf("ForgetSuite = %+v, %v", res, err)
 	}
-	for _, h := range []string{anchor, b1, b2} {
+	blobs := []string{oldAnchor, oldMember, anchor, b1, b2}
+	for _, h := range blobs {
 		fastForwardZeroedAt(t, db, h)
 	}
 	g, err := New(Config{Cache: c, Logger: logger, Enabled: true, Interval: time.Hour, BatchSize: 100,
@@ -44,16 +49,17 @@ func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
 	if err := g.StartupPass(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if snapshotRowExists(t, db, id) {
-		t.Fatal("the retired snapshot survived the tick")
+	if snapshotRowExists(t, db, old) || snapshotRowExists(t, db, id) {
+		t.Fatalf("a retired snapshot survived the tick (displaced %v, current %v)", snapshotRowExists(t, db, old),
+			snapshotRowExists(t, db, id))
 	}
-	for _, h := range []string{anchor, b1, b2} {
+	for _, h := range blobs {
 		if blobRowExists(t, db, h) || fileExists(t, c.BlobPath(h)) {
 			t.Fatalf("blob %s survived the tick that deleted its retired snapshot", h)
 		}
 	}
-	if s, ok := g.LastRunSummary(); !ok || s.RetiredReaped != 1 {
-		t.Fatalf("LastRunSummary = %+v, %v; want retired_reaped 1", s, ok)
+	if s, ok := g.LastRunSummary(); !ok || s.RetiredReaped != 2 {
+		t.Fatalf("LastRunSummary = %+v, %v; want retired_reaped 2", s, ok)
 	}
 	var line map[string]any
 	for _, l := range strings.Split(buf.String(), "\n") {
@@ -61,8 +67,8 @@ func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
 			break
 		}
 	}
-	if line["retired_reaped"] != float64(1) {
-		t.Fatalf("gc_run_complete = %v; want retired_reaped 1", line)
+	if line["retired_reaped"] != float64(2) {
+		t.Fatalf("gc_run_complete = %v; want retired_reaped 2", line)
 	}
 }
 

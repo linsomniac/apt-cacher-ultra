@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -61,8 +62,11 @@ func TestRunSnapshotGCBatch_RetiredSnapshotsTakeNoKeepDisplacedSlot(t *testing.T
 
 // Spec C9 sub-job C: retired snapshots are deleted with their members,
 // skipped members and package_hash rows in bounded chunks, then the header
-// row; a non-retired snapshot and the current one are untouched, and the
-// sub-job says when nothing retired is left.
+// row; a displaced snapshot that is not retired (keep_displaced's to keep)
+// and the current one are untouched by every chunk, and the sub-job says
+// when nothing retired is left. The displaced one sits between the
+// retired and the current snapshot, so a chunk that ignored retired_at
+// would take it next (the Task 4 review's Important 1).
 func TestRunRetiredSnapshotGCChunk_DeletesRetiredSnapshotsInChunks(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
@@ -80,10 +84,19 @@ func TestRunRetiredSnapshotGCChunk_DeletesRetiredSnapshotsInChunks(t *testing.T)
 VALUES (?, 'main/skipped', ?, 1, '4xx', 1)`, old, hashes["main/i01"]); err != nil {
 		t.Fatal(err)
 	}
+	mid, _ := adoptWith(t, c, key, map[string]string{"InRelease": "mid anchor", "main/m": "mid member"})
 	cur, _ := adoptWith(t, c, key, map[string]string{"InRelease": "new anchor"})
 	retire(t, c, old)
 	if n := childRows(t, c, old); n != 13+9+1 {
 		t.Fatalf("premise: %d child rows, want 23", n)
+	}
+	untouched := func(when string) {
+		t.Helper()
+		if !snapshotExists(t, c, mid) || childRows(t, c, mid) != 2 || !snapshotExists(t, c, cur) || childRows(t, c, cur) != 1 {
+			t.Fatalf("%s: the displaced snapshot (header %v, %d rows) or the current one (header %v, %d rows) was touched; "+
+				"want both whole (2 and 1 rows)", when, snapshotExists(t, c, mid), childRows(t, c, mid), snapshotExists(t, c, cur),
+				childRows(t, c, cur))
+		}
 	}
 	// Chunks of 10: two full chunks (20 rows), then the last 3 and the header.
 	for i, want := range []struct {
@@ -94,12 +107,53 @@ VALUES (?, 'main/skipped', ?, 1, '4xx', 1)`, old, hashes["main/i01"]); err != ni
 			t.Fatalf("chunk %d: reaped %d, more %v, err %v, %d rows left, header %v; want reaped %d and %d rows left",
 				i+1, reaped, more, err, childRows(t, c, old), snapshotExists(t, c, old), want.reaped, want.left)
 		}
+		untouched(fmt.Sprintf("chunk %d", i+1))
 	}
 	if reaped, more, err := c.RunRetiredSnapshotGCChunk(ctx, 10); err != nil || more || reaped != 0 {
 		t.Fatalf("with nothing retired left: reaped %d, more %v, err %v; want 0, false", reaped, more, err)
 	}
-	if !snapshotExists(t, c, cur) || childRows(t, c, cur) != 1 {
-		t.Fatal("the current snapshot or its member was deleted")
+	untouched("after the last call")
+}
+
+// Spec C9 sub-job C, defensively: a retired snapshot that is still some
+// suite's current one (no retirer leaves one: each clears the pointer or
+// deletes the row in the same transaction) is never chunked — deleting
+// its rows would strand a current snapshot without members, and its
+// header delete would fail every tick (the Task 4 review's minor 4).
+func TestRunRetiredSnapshotGCChunk_SkipsARetiredSnapshotStillCurrent(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	key := sk("h", "/r/dists/x")
+	seedRow(t, c, key, 1)
+	cur, _ := adoptWith(t, c, key, map[string]string{"InRelease": "anchor", "main/Packages": "pkgs"})
+	retire(t, c, cur)
+	if reaped, more, err := c.RunRetiredSnapshotGCChunk(ctx, 10); err != nil || more || reaped != 0 {
+		t.Fatalf("RunRetiredSnapshotGCChunk = %d, %v, %v; want nothing to work on (0, false)", reaped, more, err)
+	}
+	if !snapshotExists(t, c, cur) || childRows(t, c, cur) != 2 {
+		t.Fatalf("the current snapshot: header %v, %d rows; want it whole (2 rows)", snapshotExists(t, c, cur), childRows(t, c, cur))
+	}
+}
+
+// Spec C9 sub-job C (the Task 4 review's minor 3): a header delete that
+// deletes nothing — the SELECT's and the DELETE's predicates disagree —
+// is an error the pass logs, never a silent done = 1 that would re-select
+// the same snapshot until the deadline on every tick. A trigger that
+// skips the delete stands in for the mismatch.
+func TestRunRetiredSnapshotGCChunk_AHeaderDeleteThatDeletesNothingFails(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	key := sk("h", "/r/dists/x")
+	seedRow(t, c, key, 1)
+	old, _ := adoptWith(t, c, key, map[string]string{"InRelease": "old anchor"})
+	adoptWith(t, c, key, map[string]string{"InRelease": "new anchor"})
+	retire(t, c, old)
+	if _, err := c.db.Exec(`CREATE TRIGGER keep_header BEFORE DELETE ON suite_snapshot BEGIN SELECT RAISE(IGNORE); END`); err != nil {
+		t.Fatal(err)
+	}
+	reaped, more, err := c.RunRetiredSnapshotGCChunk(ctx, 10)
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("delete snapshot %d: deleted 0 rows", old)) || reaped != 0 || more {
+		t.Fatalf("RunRetiredSnapshotGCChunk = %d, %v, %v; want an error naming snapshot %d's header delete", reaped, more, err, old)
 	}
 }
 
@@ -115,7 +169,10 @@ func TestRunRetiredSnapshotGCChunk_DeletesAuditRetiredSnapshots(t *testing.T) {
 	if _, err := c.ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision{{SnapshotID: id, Outcome: LegacyAuditQuarantine}}); err != nil {
 		t.Fatal(err)
 	}
-	for {
+	for i := 0; ; i++ {
+		if i == 10 { // one snapshot needs two calls: a stuck more = true fails here, not at the test timeout
+			t.Fatal("sub-job C still reports more after 10 calls")
+		}
 		_, more, err := c.RunRetiredSnapshotGCChunk(ctx, 0)
 		if err != nil {
 			t.Fatal(err)

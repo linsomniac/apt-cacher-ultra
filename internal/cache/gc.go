@@ -436,8 +436,20 @@ SELECT snapshot_id FROM suite_snapshot
 		}
 		done := 0
 		if left > 0 { // every child table came up short: no row of id is left
-			if _, err := tx.ExecContext(ctx, `DELETE FROM suite_snapshot WHERE snapshot_id = ? AND retired_at IS NOT NULL`, id); err != nil {
+			res, err := tx.ExecContext(ctx, `DELETE FROM suite_snapshot WHERE snapshot_id = ? AND retired_at IS NOT NULL`, id)
+			if err != nil {
 				return fmt.Errorf("RunRetiredSnapshotGCChunk: delete snapshot %d: %w", id, err)
+			}
+			// A header delete that deletes nothing means the SELECT's and the
+			// DELETE's predicates disagree: fail loudly (the pass logs it)
+			// rather than report done and re-select the same snapshot until
+			// the deadline on every tick (the Task 4 review's minor 3).
+			n, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("RunRetiredSnapshotGCChunk: delete snapshot %d: %w", id, err)
+			}
+			if n != 1 {
+				return fmt.Errorf("RunRetiredSnapshotGCChunk: delete snapshot %d: deleted %d rows, want 1", id, n)
 			}
 			done = 1
 		}
