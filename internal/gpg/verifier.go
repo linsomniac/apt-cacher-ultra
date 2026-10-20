@@ -43,8 +43,9 @@ type VerifierConfig struct {
 	// entity — matching apt's own broad behavior. When false, signatures
 	// without IssuerFingerprint are rejected with ErrShortKeyID
 	// regardless of whether the keyid would match. The fallback
-	// emits one INFO log per (host, suite_path) per process the
-	// first time it accepts a signature, so operators can inventory
+	// emits one INFO log per (host, suite_path) per process (and again
+	// once its set has started over past onceSetMax suites) the first
+	// time it accepts a signature, so operators can inventory
 	// which repos rely on the legacy form.
 	//
 	// Real-world third-party signers (notably Docker, Microsoft) still
@@ -90,16 +91,18 @@ type Verifier struct {
 	shortKeyIDLogged onceSet
 
 	// untrustedSignerLogged tracks suites for which an
-	// adoption_untrusted_signer rejection has already been logged this
-	// process. Same dedupe shape as shortKeyIDLogged so the log surface
-	// is a finite inventory of "which (host, suite) pairs need new keys"
-	// rather than a per-tick noise stream.
+	// adoption_untrusted_signer rejection has already been logged since
+	// the set last started over (at most onceSetMax keys, as
+	// shortKeyIDLogged). Same dedupe shape as shortKeyIDLogged so the log
+	// surface is a finite inventory of "which (host, suite) pairs need new
+	// keys" rather than a per-tick noise stream.
 	untrustedSignerLogged onceSet
 
 	// unverifiedSignerLogged tracks suites for which an
-	// adoption_unverified_signer acceptance has already been logged this
-	// process. Fires under accept_any_signer when the bypass branch
-	// runs. Same dedupe shape as the other once-loggers.
+	// adoption_unverified_signer acceptance has already been logged since
+	// the set last started over (at most onceSetMax keys). Fires under
+	// accept_any_signer when the bypass branch runs. Same dedupe shape as
+	// the other once-loggers.
 	unverifiedSignerLogged onceSet
 }
 
@@ -811,9 +814,10 @@ func (v *Verifier) verifyAgainst(e *openpgp.Entity, signed []byte, sig *packet.S
 }
 
 // logUntrustedSignerOnce emits one INFO log per (canonical_host,
-// suite_path) per process the first time we reject every signature on
-// a suite for "issuer not in trust set." Subsequent rejections for the
-// same suite stay silent — the goal is a one-line breadcrumb the
+// suite_path) per process (and again once its set has started over past
+// onceSetMax suites) the first time we reject every signature on a suite
+// for "issuer not in trust set." Subsequent rejections for the same suite
+// stay silent — the goal is a one-line breadcrumb the
 // operator can grep for to learn WHICH key fingerprint they need to
 // install, not a per-tick log flood. rejected carries the rejected
 // signers as "fpr:<40-hex>" (long fingerprint form) or "keyid:<16-hex>"
@@ -832,8 +836,9 @@ func (v *Verifier) logUntrustedSignerOnce(suite freshness.SuiteRef, rejected []s
 }
 
 // logShortKeyIDFallbackOnce emits one INFO log per (canonical_host,
-// suite_path) per process the first time we accept a signature via
-// the short-keyid fallback. Subsequent acceptances for the same
+// suite_path) per process (and again once its set has started over past
+// onceSetMax suites) the first time we accept a signature via the
+// short-keyid fallback. Subsequent acceptances for the same
 // suite stay silent — this keeps the log surface a finite inventory
 // of "which repos rely on the legacy form" rather than a per-check
 // noise stream.
@@ -851,8 +856,9 @@ func (v *Verifier) logShortKeyIDFallbackOnce(suite freshness.SuiteRef, matched *
 }
 
 // logUnverifiedSignerOnce emits one INFO log per (canonical_host,
-// suite_path) per process the first time accept_any_signer's bypass
-// branch accepts a suite. Subsequent acceptances for the same suite
+// suite_path) per process (and again once its set has started over past
+// onceSetMax suites) the first time accept_any_signer's bypass branch
+// accepts a suite. Subsequent acceptances for the same suite
 // stay silent. The signer-info field, when extractable from the
 // signature, names the IssuerFingerprint (preferred) or short
 // IssuerKeyId so operators have an audit trail of which signers their

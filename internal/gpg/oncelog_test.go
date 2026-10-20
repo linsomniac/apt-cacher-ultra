@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
@@ -54,6 +55,26 @@ func (h *countingHandler) Handle(_ context.Context, r slog.Record) error {
 
 func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
+
+// The Task 12 review's minor 1: each of the three once-loggers keeps its
+// own set — a suite one has logged is still new to the other two — and
+// logs a suite once. A logger wired to another's set logs nothing here.
+func TestVerifier_EachOnceLoggerHasItsOwnSet(t *testing.T) {
+	h := &countingHandler{n: map[string]int{}}
+	v := &Verifier{logger: slog.New(h)}
+	signer := newTestEntity(t, "Once Logger", "once@example.invalid")
+	suite := freshness.SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/s"}
+	for range 2 {
+		v.logUntrustedSignerOnce(suite, nil)
+		v.logShortKeyIDFallbackOnce(suite, signer, signer.PrimaryKey.KeyId)
+		v.logUnverifiedSignerOnce(suite, strings.NewReader(""))
+	}
+	for _, msg := range []string{"adoption_untrusted_signer", "adoption_short_keyid_fallback", "adoption_unverified_signer"} {
+		if n := h.n[msg]; n != 1 {
+			t.Errorf("%s logged %d times for one suite, want 1", msg, n)
+		}
+	}
+}
 
 // The verifier's once-loggers use the bounded set: the untrusted-signer
 // line is logged once per suite, and again for a suite seen before once
