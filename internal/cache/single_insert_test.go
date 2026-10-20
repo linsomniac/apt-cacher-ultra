@@ -216,11 +216,11 @@ func TestSuiteRowWritersHaveKnownCallers(t *testing.T) {
 // production code but internal/handler calls CreateSuite or StoreFetched,
 // and no production code calls a test-only seeding helper, nor
 // ClearSignedSeenForTest, which deletes every signed-seen marker (design
-// review M-5).
+// review M-5), nor SetCommittedHookForTest.
 func TestOnlyTheHandlerCreatesSuiteRows(t *testing.T) {
 	creators := map[string]bool{"CreateSuite": true, "StoreFetched": true}
 	seeders := map[string]bool{"SeedSuiteForTest": true, "EnsureSuiteForTest": true, "InsertTrackedCandidateForTest": true,
-		"ClearSignedSeenForTest": true}
+		"ClearSignedSeenForTest": true, "SetCommittedHookForTest": true}
 	productionGoFiles(t, func(p string, src []byte) {
 		inCache := strings.HasPrefix(p, "../../internal/cache/")
 		inHandler := strings.HasPrefix(p, "../../internal/handler/")

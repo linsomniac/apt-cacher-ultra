@@ -75,7 +75,7 @@ type Reaper struct {
 	// interval and floor are reapInterval and reapUptimeFloor; tests
 	// shorten them.
 	interval, floor time.Duration
-	// reapHook, when set (tests only), runs in reapSuite and Forget while
+	// reapHook, when set (tests only), runs in reapHeld and Forget while
 	// the suite is held, with the context its steps run on: a panic there
 	// stands in for a bug between the hold and its release.
 	reapHook func(context.Context, cache.SuiteKey)
@@ -134,8 +134,10 @@ func NewReaper(cfg ReaperConfig) (*Reaper, error) {
 
 // Run runs the reaper until ctx ends: the first run once the uptime floor
 // has passed, then one every interval after the previous run finished.
-// Each run recovers its own panic (logged, freshness_check_panicked with
-// where=reaper), so the next run still comes.
+// A panic while a suite is held is recovered per candidate (reapSuite);
+// each run also recovers any other panic of its own (logged,
+// freshness_check_panicked with where=reaper), so the next run still
+// comes.
 func (r *Reaper) Run(ctx context.Context) {
 	r.lastWall, r.lastMono = r.checker.now(), time.Now()
 	t := time.NewTimer(r.floor)
@@ -151,7 +153,9 @@ func (r *Reaper) Run(ctx context.Context) {
 	}
 }
 
-// safeRun is one run under a recover.
+// safeRun is one run under a recover: the backstop for a panic outside a
+// held candidate (the listing, the junk scan, the sweeps), which ends the
+// run; reapSuite recovers a held candidate's own.
 func (r *Reaper) safeRun(ctx context.Context) {
 	defer func() {
 		if v := recover(); v != nil {
@@ -360,8 +364,8 @@ func sortCandidates(cands []reapCandidate) {
 }
 
 // reapSuite runs spec C9's steps for one candidate under the suite's
-// mutex, within suiteHoldTimeout: the metadata url_path rows in batches
-// (cache.DeleteSuiteMetadata), then the final compare-and-delete
+// mutex, within suiteHoldTimeout (reapHeld): the metadata url_path rows in
+// batches (cache.DeleteSuiteMetadata), then the final compare-and-delete
 // (cache.ReapIdleSuite). A busy suite is skipped (retried next run). It
 // reports whether the suite was reaped.
 //
@@ -372,64 +376,141 @@ func sortCandidates(cands []reapCandidate) {
 // flip-gate entry unless a re-creation's serve keeps it live (ruling
 // R-F2); ReapIdleSuite drops the touch entry. Whether the row is gone is
 // ReapIdleSuite's answer, which settles a failed submit by a fresh read
-// (design review M-2). The re-read under the hold is I-4's re-validation:
-// a suite a client asked for (or that adopted) since the listing keeps its
-// metadata rows, and one that vanished meanwhile (cap eviction) has the
-// entry HoldSuite stored for it dropped. A step that fails because the
-// run's context ended (shutdown) is logged at DEBUG, not WARN (design
-// review M-3); one cut short by suiteHoldTimeout is a failure (WARN).
-func (r *Reaper) reapSuite(ctx context.Context, c reapCandidate) bool {
+// (design review M-2); a failed submit settled gone is a reap (logged
+// suite_reaped with settled=true, and counted: the Task 6 review's minor
+// 3). The re-read under the hold is I-4's re-validation: a suite a client
+// asked for (or that adopted) since the listing keeps its metadata rows,
+// and one that vanished meanwhile (cap eviction) has the entry HoldSuite
+// stored for it dropped. A step that fails because the run's context
+// ended (shutdown) is logged at DEBUG, not WARN (design review M-3); one
+// cut short by suiteHoldTimeout is a failure (WARN). A panic while the
+// suite is held is recovered here, per candidate, as checkRecovered
+// recovers a check (the Task 6 review's minor 2): it is logged with the
+// suite (freshness_check_panicked, where=reaper), the hold is released
+// with the cache's fresh answer — the panic may have struck after a
+// commit — and the run goes on to its next candidate and its sweeps.
+func (r *Reaper) reapSuite(ctx context.Context, c reapCandidate) (reaped bool) {
 	release, ok := r.checker.HoldSuite(c.key)
 	if !ok {
-		r.logger.Debug("suite reaper: suite busy, retried next run",
+		r.logger.Debug("suite reaper: suite busy, retried next run", "canonical_scheme", c.key.CanonicalScheme,
 			"canonical_host", c.key.CanonicalHost, "suite_path", c.key.SuitePath)
 		return false
 	}
 	gone := false
-	defer func() { release(gone) }()
+	defer func() {
+		if v := recover(); v != nil {
+			gone, reaped = r.settledGone(c.key), false
+			unloggedPanic(func() {
+				r.checker.reportPanic("freshness_check_panicked", "reaper", SuiteRef{CanonicalScheme: c.key.CanonicalScheme,
+					CanonicalHost: c.key.CanonicalHost, SuitePath: c.key.SuitePath}, v)
+			})
+		}
+		release(gone)
+	}()
 	hctx, cancel := context.WithTimeout(ctx, suiteHoldTimeout)
 	defer cancel()
+	h := r.reapHeld(hctx, c)
+	gone = h.gone
+	settled := h.err != nil && h.gone // a failed submit whose delete committed (the cache's fresh read)
+	if h.err != nil && !settled {
+		args := []any{"err", h.err, "canonical_scheme", c.key.CanonicalScheme, "canonical_host", c.key.CanonicalHost,
+			"suite_path", c.key.SuitePath}
+		if h.step == stepDeleteMetadata {
+			args = append(args, "metadata_rows", h.rows)
+		}
+		r.warn(ctx, h.step, args...)
+		return false
+	}
+	if !h.deleted && !settled {
+		return false
+	}
+	suitesReapedTotal.Inc(c.reason)
+	attrs := []any{
+		"canonical_scheme", c.key.CanonicalScheme,
+		"canonical_host", c.key.CanonicalHost,
+		"suite_path", c.key.SuitePath,
+		"reason", c.reason,
+		"metadata_rows", h.rows,
+	}
+	if settled {
+		attrs = append(attrs, "settled", true)
+	}
+	r.logger.Info("suite_reaped", attrs...)
+	return true
+}
+
+// The reaper's held steps, as their failure lines name them.
+const (
+	stepReadRow        = "suite reaper: read suite row failed"
+	stepDeleteMetadata = "suite reaper: delete metadata failed"
+	stepReap           = "suite reaper: reap failed"
+)
+
+// heldReap is what reapHeld did under a suite's hold.
+type heldReap struct {
+	step    string // the failed step's line (stepReadRow, …); "" when none failed
+	err     error
+	rows    int  // metadata url_path rows deleted
+	deleted bool // ReapIdleSuite deleted the row
+	gone    bool // the suite has no row: the re-read's answer, or ReapIdleSuite's
+}
+
+// reapHeld runs c's held steps on hctx, reapSuite's bounded context: the
+// re-read (I-4's re-validation), the metadata batches and the final
+// compare-and-delete. It logs nothing: reapSuite logs on the run's
+// context, which tells a shutdown (DEBUG) from a step cut short by
+// suiteHoldTimeout (WARN).
+//
+// AIDEV-NOTE: the steps are a function of hctx alone (the Task 6 review's
+// minor 1): with the run's context in scope, a step run on it instead of
+// hctx would escape design review M-2's bound and survive every test but
+// TestReaper_AHoldTimeoutIsAWarnedFailureAndTheNextRunReaps.
+func (r *Reaper) reapHeld(hctx context.Context, c reapCandidate) (h heldReap) {
 	if r.reapHook != nil {
 		r.reapHook(hctx, c.key)
 	}
 	cur, err := r.cache.GetSuiteFreshness(hctx, c.key.CanonicalScheme, c.key.CanonicalHost, c.key.SuitePath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
-		gone = true
-		return false
+		h.gone = true
+		return h
 	case err != nil:
-		r.warn(ctx, "suite reaper: read suite row failed", "err", err,
-			"canonical_host", c.key.CanonicalHost, "suite_path", c.key.SuitePath)
-		return false
+		h.step, h.err = stepReadRow, err
+		return h
 	case !sameSnapshot(cur.CurrentSnapshotID, c.current) ||
 		(c.cutoff != cache.ReapRegardless && (cur.LastRequestedAt == nil || *cur.LastRequestedAt > c.cutoff)):
-		return false // asked for, or adopted, since the listing
+		return h // asked for, or adopted, since the listing
 	}
-	rows, err := r.cache.DeleteSuiteMetadata(hctx, c.key)
-	if err != nil {
-		r.warn(ctx, "suite reaper: delete metadata failed", "err", err, "metadata_rows", rows,
-			"canonical_host", c.key.CanonicalHost, "suite_path", c.key.SuitePath)
-		return false
+	if h.rows, err = r.cache.DeleteSuiteMetadata(hctx, c.key); err != nil {
+		h.step, h.err = stepDeleteMetadata, err
+		return h
 	}
-	var deleted bool
-	deleted, gone, err = r.cache.ReapIdleSuite(hctx, c.key, c.current, c.cutoff)
-	if err != nil {
-		r.warn(ctx, "suite reaper: reap failed", "err", err,
-			"canonical_host", c.key.CanonicalHost, "suite_path", c.key.SuitePath)
-		return false
+	if h.deleted, h.gone, err = r.cache.ReapIdleSuite(hctx, c.key, c.current, c.cutoff); err != nil {
+		h.step, h.err = stepReap, err
 	}
-	if !deleted {
-		return false
-	}
-	suitesReapedTotal.Inc(c.reason)
-	r.logger.Info("suite_reaped",
-		"canonical_scheme", c.key.CanonicalScheme,
-		"canonical_host", c.key.CanonicalHost,
-		"suite_path", c.key.SuitePath,
-		"reason", c.reason,
-		"metadata_rows", rows,
-	)
-	return true
+	return h
+}
+
+// settleReadTimeout bounds settledGone's read.
+const settleReadTimeout = 5 * time.Second
+
+// settledGone reports whether key's row is gone, read on a fresh context
+// (the run's may have ended): after a panic under the hold, the cache's
+// answer decides how the hold is released, since the panic may have
+// struck after a commit. A read error answers false — present, the
+// conservative release (the cache's settle answers so too) — and so does
+// a panic in the read: settledGone runs in reapSuite's recovery, and
+// whatever it does the hold must still be released.
+func (r *Reaper) settledGone(key cache.SuiteKey) (gone bool) {
+	defer func() {
+		if recover() != nil {
+			gone = false
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), settleReadTimeout)
+	defer cancel()
+	ok, err := r.cache.HasSuiteRow(ctx, key)
+	return err == nil && !ok
 }
 
 // warn logs a failed step of a run at WARN — or at DEBUG once ctx, the
@@ -474,7 +555,7 @@ func sameSnapshot(a, b *int64) bool {
 // sniffed are evidence: a missing or unreadable pool file keeps the suite
 // (overview: an I/O fault is never evidence). The evidence is not read
 // again under the hold, which re-reads only the current snapshot
-// (reapSuite): between the scan and the hold a junk suite's anchor rows
+// (reapHeld): between the scan and the hold a junk suite's anchor rows
 // change only through an adoption, which that comparison catches, or
 // through url_path GC or a miss that re-fetched a row whose pool file had
 // gone, after which the reap costs the suite one fetch at its next

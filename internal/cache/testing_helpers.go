@@ -74,6 +74,16 @@ func (c *Cache) ClearSignedSeenForTest(ctx context.Context) error {
 	})
 }
 
+// SetCommittedHookForTest sets committedHook (cache.go): fn runs on the
+// writer goroutine right after a creation attempt's, ReapIdleSuite's or
+// ForgetSuite's transaction commits, before its result is handed back.
+// Set it before the operation it targets; tests outside the package use
+// it to fail a submit whose delete committed (the reaper's settled reap,
+// TestReaper_ASettledReapIsAReap).
+func (c *Cache) SetCommittedHookForTest(fn func()) {
+	c.committedHook = fn
+}
+
 // SeedSuiteForTest stores s's suite row the way fixtures relied on before
 // spec C3 made every writer but CreateSuite UPDATE-only: it creates the
 // row if absent (createSuiteTx, uncapped, interest stamp now) and writes

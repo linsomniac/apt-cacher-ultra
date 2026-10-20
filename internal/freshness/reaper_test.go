@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -219,8 +220,11 @@ func TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem(t *testing.T) {
 }
 
 // Spec C9 and the C4 clock-step rule: candidates reads a NULL interest
-// stamp as never idle, a future one as now (never idle), and orders the
-// candidates oldest first — a non-canonical row by its own stamp.
+// stamp as never idle and a future one as now (never idle). The order
+// here — the non-canonical row first — is ruling PF-4's (rows reaped
+// regardless of idleness first, then the oldest), though this data, whose
+// non-canonical row is also the oldest, cannot tell it from oldest-first:
+// TestReaperCandidates_ReapedRegardlessGoFirst does.
 func TestReaperCandidates_NullAndFutureStampsAreNeverIdle(t *testing.T) {
 	r := newReaperRig(t)
 	at := func(v int64) *int64 { return &v }
@@ -353,6 +357,12 @@ func TestReaper_SkipsABusySuiteAndRetriesNextRun(t *testing.T) {
 	r.reaper.runOnce(context.Background())
 	if !r.exists("/r/dists/busy") {
 		t.Fatal("a busy suite was reaped")
+	}
+	// The busy line names the scheme too (the Task 6 review's minor 4:
+	// both schemes' copies of a suite can be tracked).
+	if ev := r.events("suite reaper: suite busy, retried next run"); len(ev) != 1 || ev[0]["canonical_scheme"] != "http" ||
+		ev[0]["suite_path"] != "/r/dists/busy" {
+		t.Fatalf("busy lines = %v, want one naming http and /r/dists/busy", ev)
 	}
 	release(false)
 	r.reaper.runOnce(context.Background())
@@ -491,6 +501,161 @@ func TestReaper_BoundsTheWorkUnderAHoldAtFiveMinutes(t *testing.T) {
 	}
 }
 
+// Design review M-2 and M-3 (the Task 6 review's minor 1): the held steps
+// run on the bounded context, not the run's — a hold that outlives
+// suiteHoldTimeout cuts the re-read short — and a step cut short by the
+// bound is a failure logged at WARN (with the suite's scheme), never the
+// DEBUG a shutdown gets. The suite is kept, its hold given back, and the
+// next run reaps it.
+func TestReaper_AHoldTimeoutIsAWarnedFailureAndTheNextRunReaps(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newReaperRig(t)
+		r.seed("/r/dists/a", reapNow-31*reapDay)
+		slow := true
+		r.reaper.reapHook = func(context.Context, cache.SuiteKey) {
+			if slow {
+				slow = false
+				time.Sleep(suiteHoldTimeout + time.Second) // a wedged step: the bound passes
+			}
+		}
+		r.reaper.runOnce(context.Background())
+		if !r.exists("/r/dists/a") {
+			t.Fatal("a suite whose hold timed out was reaped: the held steps did not run on the bounded context")
+		}
+		ev := r.events("suite reaper: read suite row failed")
+		if len(ev) != 1 || ev[0]["level"] != "WARN" || ev[0]["canonical_scheme"] != "http" || ev[0]["suite_path"] != "/r/dists/a" {
+			t.Fatalf("read failures = %v, want one at WARN naming http and /r/dists/a", ev)
+		}
+		r.reaper.runOnce(context.Background())
+		if r.exists("/r/dists/a") {
+			t.Fatal("the next run did not reap the suite: the timed-out hold was not given back")
+		}
+	})
+}
+
+// Design review M-8 (the Task 6 review's minor 1): a forward step is the
+// wall clock running more than forwardStepSlack — an hour — ahead of the
+// monotonic clock between two runs. The whole-second truncation of the
+// wall clock (±1 s) and a lead of up to the hour itself are no step.
+func TestReaperForwardStep_TheSlackIsAnHour(t *testing.T) {
+	r := newReaperRig(t)
+	wall, mono := time.Unix(reapNow, 0), time.Now()
+	for _, tc := range []struct {
+		ahead    time.Duration
+		deferred bool
+	}{{time.Second, false}, {59 * time.Minute, false}, {time.Hour, false}, {time.Hour + time.Second, true}} {
+		r.reaper.lastWall, r.reaper.lastMono, r.reaper.deferUntil = wall, mono, time.Time{}
+		if got := r.reaper.deferredByForwardStep(wall.Add(time.Hour+tc.ahead), mono.Add(time.Hour)); got != tc.deferred {
+			t.Errorf("the wall clock %v ahead after an hour: deferred %v, want %v", tc.ahead, got, tc.deferred)
+		}
+	}
+}
+
+// The Task 6 review's minor 2 (controller ruling): a panic while one
+// candidate is held is recovered per candidate, as checkRecovered recovers
+// a check's: it is logged (freshness_check_panicked, where=reaper) with
+// that suite, the hold is given back, and the run goes on — the next
+// candidate is reaped, and the memo and marker sweeps still run.
+func TestReaper_APanicSkipsOnlyItsCandidate(t *testing.T) {
+	r := newReaperRig(t)
+	r.seed("/r/dists/a", reapNow-32*reapDay) // the oldest: tried first
+	r.seed("/r/dists/b", reapNow-31*reapDay)
+	r.reaper.reapHook = func(_ context.Context, k cache.SuiteKey) {
+		if k.SuitePath == "/r/dists/a" {
+			panic("reaper bug")
+		}
+	}
+	r.adopter.reconciledSnapshots.Store(int64(1_000_000), struct{}{}) // no suite's current snapshot
+	r.mark("/gone/dists/s", reapNow-366*reapDay)                      // a year-old orphan
+	r.reaper.safeRun(context.Background())
+	if !r.exists("/r/dists/a") || r.exists("/r/dists/b") {
+		t.Fatalf("a exists %v, b exists %v; want the panicking candidate kept and the next one reaped",
+			r.exists("/r/dists/a"), r.exists("/r/dists/b"))
+	}
+	if ev := r.events("freshness_check_panicked"); len(ev) != 1 || ev[0]["where"] != "reaper" || ev[0]["suite_path"] != "/r/dists/a" {
+		t.Fatalf("panic lines = %v, want one with where=reaper naming /r/dists/a", ev)
+	}
+	if _, ok := r.adopter.reconciledSnapshots.Load(int64(1_000_000)); ok {
+		t.Fatal("the panic stopped the run's reconcile memo sweep")
+	}
+	if r.markerAt("/gone/dists/s") != -1 {
+		t.Fatal("the panic stopped the run's marker sweep")
+	}
+	release, ok := r.checker.HoldSuite(reapKey("/r/dists/a"))
+	if !ok {
+		t.Fatal("the panicking candidate's hold was not given back")
+	}
+	release(false)
+}
+
+// panicOnMsg is a slog handler that panics on a record whose message is
+// msg and passes every other record to its inner handler.
+type panicOnMsg struct {
+	slog.Handler
+	msg string
+}
+
+func (h panicOnMsg) Handle(ctx context.Context, rec slog.Record) error {
+	if rec.Message == h.msg {
+		panic("log handler bug")
+	}
+	return h.Handler.Handle(ctx, rec)
+}
+
+// The Task 6 review's minor 2 (controller ruling): a panic that strikes
+// after the suite's row is gone releases the hold as gone — the cache's
+// fresh answer — so the deleted suite's lock-map entry does not leak.
+func TestReaper_APanicAfterTheDeleteReleasesTheSuiteAsGone(t *testing.T) {
+	r := newReaperRig(t)
+	r.seed("/r/dists/a", reapNow-31*reapDay)
+	r.reaper.logger = slog.New(panicOnMsg{Handler: r.reaper.logger.Handler(), msg: "suite_reaped"})
+	r.reaper.safeRun(context.Background())
+	if r.exists("/r/dists/a") {
+		t.Fatal("premise: the suite was deleted before the panic")
+	}
+	if ev := r.events("freshness_check_panicked"); len(ev) != 1 || ev[0]["suite_path"] != "/r/dists/a" {
+		t.Fatalf("panic lines = %v, want one naming /r/dists/a", ev)
+	}
+	if n := r.checker.LockCount(); n != 0 {
+		t.Fatalf("%d lock-map entries after the panic; want the deleted suite's dropped (release(true))", n)
+	}
+}
+
+// The Task 6 review's minor 3 (controller ruling): a reap whose submit
+// failed after its transaction committed — the cache settles it gone by a
+// fresh read (design review M-2) — is a reap: suite_reaped with
+// settled=true, counted in acu_suites_reaped_total, and no failure line.
+// The run's context ends right after the commit (a shutdown), before the
+// result is handed back.
+func TestReaper_ASettledReapIsAReap(t *testing.T) {
+	r := newReaperRig(t)
+	r.seed("/r/dists/a", reapNow-31*reapDay)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resume := make(chan struct{})
+	var once sync.Once
+	r.cache.SetCommittedHookForTest(func() { once.Do(func() { cancel(); <-resume }) })
+	idle0 := reapedTotal(t, "idle")
+	r.reaper.runOnce(ctx)
+	close(resume)
+	if r.exists("/r/dists/a") {
+		t.Fatal("premise: the delete committed")
+	}
+	ev := r.events("suite_reaped")
+	if len(ev) != 1 || ev[0]["settled"] != true || ev[0]["reason"] != "idle" || ev[0]["suite_path"] != "/r/dists/a" {
+		t.Fatalf("suite_reaped lines = %v, want one for /r/dists/a with settled=true", ev)
+	}
+	if fails := r.events("suite reaper: reap failed"); len(fails) != 0 {
+		t.Fatalf("reap failures = %v, want none: the reap committed", fails)
+	}
+	if d := reapedTotal(t, "idle") - idle0; d != 1 {
+		t.Fatalf("acu_suites_reaped_total{reason=idle} rose by %v, want 1", d)
+	}
+	if n := r.checker.LockCount(); n != 0 {
+		t.Fatalf("%d lock-map entries; want the settled suite's dropped", n)
+	}
+}
+
 // Design review M-3: a run cut short by shutdown — the daemon's context
 // ends while a suite is held — logs the failed step at DEBUG, not WARN,
 // and keeps the suite.
@@ -509,7 +674,7 @@ func TestReaper_AShutdownMidRunIsNoFailure(t *testing.T) {
 }
 
 // Spec C9: the first run waits out the monotonic uptime floor (1 h), then
-// one runs every hour; gc.suite_idle_ttl = 0s reaps nothing.
+// one runs every hour.
 func TestReaper_RunsAfterTheUptimeFloorThenHourly(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newReaperRig(t)
@@ -536,6 +701,12 @@ func TestReaper_RunsAfterTheUptimeFloorThenHourly(t *testing.T) {
 			t.Fatal("not reaped by the next hourly run")
 		}
 	})
+}
+
+// Design note 2: gc.suite_idle_ttl = 0s reaps nothing — neither an idle
+// suite nor one reaped regardless of idleness (split from the cadence
+// test: the Task 6 review's minor 6).
+func TestReaper_AnIdleTTLOfZeroReapsNothing(t *testing.T) {
 	r := newReaperRig(t)
 	r.reaper.idleTTL = 0
 	r.seed("/r/dists/a", reapNow-365*reapDay)
