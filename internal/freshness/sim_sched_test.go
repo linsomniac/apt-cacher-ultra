@@ -159,8 +159,11 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 		c3URL, c3Seeded := changing("h3", time.Second)
 
 		logs := &lockedBuffer{}
-		runtime.Gosched()
-		baseG := runtime.NumGoroutine()
+		// Workers, Run, two adoption slots, and slack for timers and the
+		// cache writer's transient goroutines (8, as in the capacity
+		// simulation: deferred minor B-47).
+		baseG := baseGoroutines()
+		limit := baseG + checkWorkers + 1 + 2 + 8
 		maxG := baseG
 		const refresh = time.Hour
 		chk, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: refresh,
@@ -171,7 +174,7 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 		sample := func(until time.Duration) {
 			for time.Since(t0)+61*time.Second <= until {
 				time.Sleep(61 * time.Second)
-				maxG = max(maxG, runtime.NumGoroutine())
+				maxG = max(maxG, sampleGoroutines(limit))
 			}
 			time.Sleep(until - time.Since(t0))
 		}
@@ -238,10 +241,8 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 		if n := countChecks(t, logs.String(), "h3", cSuite, "changed_queued"); n == 0 {
 			t.Error("C3 was never queued for a slot: the slots were never contended")
 		}
-		// Workers, Run, two adoption slots, and slack for timers and the
-		// cache writer's transient goroutines (8, as in the capacity
-		// simulation: deferred minor B-47).
-		if limit := baseG + checkWorkers + 1 + 2 + 8; maxG > limit {
+		// The goroutine bound (limit, above).
+		if maxG > limit {
 			t.Fatalf("goroutines peaked at %d, limit %d", maxG, limit)
 		}
 	})
@@ -344,8 +345,12 @@ func TestSimScheduler_FiveHundredStallingOneHealthy(t *testing.T) {
 			up.Set("http://a"+suite+"/InRelease", simtest.Stall())
 		}
 		time.Sleep(time.Hour + 3*time.Minute)
-		runtime.Gosched()
-		base := runtime.NumGoroutine()
+		// Workers + Run, plus explicit slack for transient goroutines (the
+		// cache writer's work): the burst is served by the pool, not by a
+		// goroutine per due suite (overview DoD goroutine bound).
+		const slack = 8
+		base := baseGoroutines()
+		limit := base + checkWorkers + 1 + slack
 		maxG := base
 		restart := time.Now()
 		_, stop2 := startSched(t, cfg)
@@ -353,15 +358,11 @@ func TestSimScheduler_FiveHundredStallingOneHealthy(t *testing.T) {
 		// first tick after the restart, when 521 suites are due at once.
 		for phase3 := tick + checkDeadline + time.Minute; time.Since(restart)+61*time.Second <= phase3; {
 			time.Sleep(61 * time.Second)
-			maxG = max(maxG, runtime.NumGoroutine())
+			maxG = max(maxG, sampleGoroutines(limit))
 		}
 		time.Sleep(tick + checkDeadline + time.Minute - time.Since(restart))
 		stop2()
-		// Workers + Run, plus explicit slack for transient goroutines (the
-		// cache writer's work): the burst is served by the pool, not by a
-		// goroutine per due suite (overview DoD goroutine bound).
-		const slack = 8
-		if limit := base + checkWorkers + 1 + slack; maxG > limit {
+		if maxG > limit {
 			t.Fatalf("goroutines peaked at %d after the restart, limit %d", maxG, limit)
 		}
 		after := up.Calls(sURL)
@@ -493,8 +494,9 @@ func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 		startDeferred := hostCounter(t, "acu_repair_deferred_total", "a")
 		const refresh = time.Hour
 		tick := refresh / 4
-		runtime.Gosched()
-		base := runtime.NumGoroutine()
+		const slack = 8
+		base := baseGoroutines()
+		limit := base + checkWorkers + 1 + 2 + slack
 		maxG := base
 		// offerHook (on the Run goroutine): offers that admitted C2, the
 		// parked re-offer path (review fix round 2, Task 14).
@@ -507,8 +509,15 @@ func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 				}
 			})
 		// Phase 1: every stalling suite fails once (100 × D on one host).
+		// AIDEV-NOTE: the loop has a virtual deadline (final fix wave FW-4
+		// (e)): 100 × D, the stalling host's checks, plus a refresh interval
+		// for the ticks and the other suites' turns. Without it a regression
+		// that keeps the count from reaching 100 (one more failing suite, or
+		// one stalling suite never checked) hung the package until go
+		// test's 10-minute timeout, as FW-3 (c)'s first draft did here.
+		phase1Deadline := time.Now().Add(100*checkDeadline + refresh)
 		for time.Sleep(61 * time.Second); ; time.Sleep(61 * time.Second) {
-			maxG = max(maxG, runtime.NumGoroutine())
+			maxG = max(maxG, sampleGoroutines(limit))
 			all, err := c.ListSuites(ctx)
 			if err != nil {
 				t.Fatal(err)
@@ -522,6 +531,10 @@ func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 			if failing == 100 {
 				break
 			}
+			if time.Now().After(phase1Deadline) {
+				t.Fatalf("phase 1: %d suites failing %v after the start, want the 100 stalling ones by %v",
+					failing, time.Since(phase1Deadline.Add(-(100*checkDeadline + refresh))), 100*checkDeadline+refresh)
+			}
 		}
 		before := len(up.Calls(sURL))
 		if before == 0 {
@@ -529,7 +542,7 @@ func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 		}
 		// Phase 2: three hours of contention.
 		for end := time.Now().Add(3*time.Hour + 11*time.Minute); time.Now().Before(end); time.Sleep(61 * time.Second) {
-			maxG = max(maxG, runtime.NumGoroutine())
+			maxG = max(maxG, sampleGoroutines(limit))
 		}
 		stop()
 		calls := up.Calls(sURL)[before-1:]
@@ -585,11 +598,42 @@ func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 		if n := c2Offered.Load(); n < 1 {
 			t.Fatalf("no offer admitted C2 (%d): it was never parked and re-offered", n)
 		}
-		const slack = 8
-		if limit := base + checkWorkers + 1 + 2 + slack; maxG > limit {
+		if maxG > limit {
 			t.Fatalf("goroutines peaked at %d, limit %d", maxG, limit)
 		}
 	})
+}
+
+// baseGoroutines is a simulation's goroutine baseline, read after
+// synctest.Wait: every other goroutine of the bubble is durably blocked
+// (final fix wave FW-4 (b)).
+func baseGoroutines() int {
+	synctest.Wait()
+	return runtime.NumGoroutine()
+}
+
+// sampleGoroutines is one goroutine sample of a simulation bounded by
+// limit: runtime.NumGoroutine read after synctest.Wait, and read once more
+// after another Wait when the first read is over limit.
+//
+// AIDEV-NOTE: final fix wave FW-4 (b), superseding the ledger's "baseline
+// delta" ruling (the limits were already relative to a baseline).
+// NumGoroutine is a process-wide, lock-free sum: sampled while the
+// bubble's goroutines still did real work — an adoption in a syscall,
+// database/sql's per-query awaitDone and interruptOnDone goroutines
+// starting and exiting — it read 22–49 where a goroutine profile taken at
+// once showed 12–15, all expected (9 failures in 36 runs under CPU load).
+// Waiting first let them settle (0 in 60); the re-read absorbs the rare
+// outlier left (37 > 21 once in 72 runs). A real leak stays over the limit
+// on both reads.
+func sampleGoroutines(limit int) int {
+	synctest.Wait()
+	n := runtime.NumGoroutine()
+	if n > limit {
+		synctest.Wait()
+		n = runtime.NumGoroutine()
+	}
+	return n
 }
 
 // renderedMetricLabels returns the value of the series name whose labels
@@ -735,8 +779,11 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 		up.Set(anchorURL("deg"), simtest.Stall())
 		members.recordStarts()
 
-		runtime.Gosched()
-		base := runtime.NumGoroutine()
+		// (6) Workers + Run + two adoptions, plus explicit slack for
+		// transient goroutines (the cache writer's work, timer callbacks).
+		const slack = 8
+		base := baseGoroutines()
+		limit := base + checkWorkers + 1 + 2 + slack
 		maxG := base
 		t0 := time.Now()
 		const refresh = 15 * time.Minute
@@ -748,7 +795,7 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 		sample := func(until time.Duration) {
 			for time.Since(t0)+61*time.Second <= until {
 				time.Sleep(61 * time.Second)
-				maxG = max(maxG, runtime.NumGoroutine())
+				maxG = max(maxG, sampleGoroutines(limit))
 			}
 			time.Sleep(until - time.Since(t0))
 		}
@@ -834,10 +881,8 @@ func TestSimCapacity_SlowDripAndDegraded(t *testing.T) {
 		if n := len(up.Calls(anchorURL("deg"))); n < 4 {
 			t.Fatalf("degraded suite checked %d times in 2 h, want its checks to continue (>= 4)", n)
 		}
-		// (6) Workers + Run + two adoptions, plus explicit slack for
-		// transient goroutines (the cache writer's work, timer callbacks).
-		const slack = 8
-		if limit := base + checkWorkers + 1 + 2 + slack; maxG > limit {
+		// (6) The goroutine bound (limit, above).
+		if maxG > limit {
 			t.Fatalf("goroutines peaked at %d, limit %d", maxG, limit)
 		}
 	})

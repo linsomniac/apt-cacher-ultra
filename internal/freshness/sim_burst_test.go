@@ -3,7 +3,6 @@ package freshness
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -22,20 +21,24 @@ import (
 // two. The first adoptions run one at a time and back to back (the last
 // free slot is reserved for signed suites); a signed change never waits for
 // more than one adoption; each first-adoption suite costs at most two
-// anchor probes before its adoption starts (the tick's and the offer's);
-// goroutines stay bounded.
+// anchor probes before its adoption starts (the tick's and the offer's)
+// plus one per offer it lost to another admission (PE-4), and the lost
+// offers are at most one per signed admission; goroutines stay bounded.
 //
 // AIDEV-NOTE: the signed suites' anchors answer 1 s late, so an offer made
 // at a slot release — on the tick grid, like the signed suites' checks —
-// takes its slot before a signed check that runs at the same instant asks
-// for one: same-instant goroutine order inside a bubble is not
-// deterministic, and an offer that loses its slot to a concurrent check
-// costs its suite one more probe (a lost offer, spec C4: it keeps its place
-// and waits for the next release). The two-probe bound is for offers that
-// meet no concurrent admission and suites no client checks (phase E plan,
-// design note 26); TestSimCapacity_UpgradeBurstSameHost has both. The run
-// lasts 80 virtual minutes (the last adoption starts at about 68): ruling
-// PE-8's 5 s budget under -race, with margin.
+// usually takes its slot before a signed check that runs at the same
+// instant asks for one. Usually, not always: with four check workers a
+// tick's four signed checks can hold every worker for their 1 s, so the
+// offer is dispatched at the instant a signed check admits its change and
+// can lose its slot (same-instant goroutine order inside a bubble is not
+// deterministic). A lost offer costs its suite one more probe (spec C4: it
+// keeps its place and waits for the next release), so the bound counts
+// them through the offer hook: n <= 2 + lost[host], and every lost offer
+// needs a signed admission, the run's only other admissions (final fix
+// wave FW-4 (a); the uncounted two-probe bound failed 4–10 runs in 40
+// under CPU load). The run lasts 80 virtual minutes (the last adoption
+// starts at about 68): ruling PE-8's 5 s budget under -race, with margin.
 func TestSimCapacity_UpgradeBurst(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
@@ -92,16 +95,30 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
 		}
 		members.recordStarts()
 
-		runtime.Gosched()
-		base := runtime.NumGoroutine()
+		// (4) Workers + Run + two adoptions, plus slack for transient
+		// goroutines (the cache writer's work, timer callbacks).
+		const slack = 8
+		base := baseGoroutines()
+		limit := base + checkWorkers + 1 + 2 + slack
 		maxG := base
-		_, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
-			Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }})
+		var lostMu sync.Mutex
+		lost := map[string]int{} // offers that lost their slot, per host (on the Run goroutine)
+		_, stop := startSchedHooked(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+			Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }},
+			func(ref SuiteRef, rep checkReport) {
+				if isQueuedResult(rep.result) {
+					lostMu.Lock()
+					lost[ref.CanonicalHost]++
+					lostMu.Unlock()
+				}
+			})
 		for time.Since(t0) < 80*time.Minute {
 			time.Sleep(61 * time.Second) // off the 3 m 45 s tick grid
-			maxG = max(maxG, runtime.NumGoroutine())
+			maxG = max(maxG, sampleGoroutines(limit))
 		}
 		stop()
+		lostMu.Lock()
+		defer lostMu.Unlock()
 
 		members.mu.Lock()
 		started := make(map[string]time.Time, len(members.started))
@@ -119,19 +136,27 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
 				t.Fatalf("%s: its first adoption never started", host)
 			}
 			if sf, err := c.GetSuiteFreshness(ctx, "http", host, rigSuite); err != nil || sf.CurrentSnapshotID == nil {
-				t.Fatalf("%s: not adopted after 3 h (err %v)", host, err)
+				t.Fatalf("%s: not adopted after 80 min (err %v)", host, err)
 			}
 			starts = append(starts, at)
-			// (3) At most two anchor probes before its adoption started.
+			// (3) At most two anchor probes before its adoption started,
+			// plus one per offer it lost.
 			n := 0
 			for _, call := range up.Calls(anchorURL(host)) {
 				if !call.After(at) {
 					n++
 				}
 			}
-			if n > 2 {
-				t.Errorf("%s: %d anchor probes before its adoption started, want <= 2", host, n)
+			if n > 2+lost[host] {
+				t.Errorf("%s: %d anchor probes before its adoption started, want <= 2 + %d lost offers", host, n, lost[host])
 			}
+		}
+		totalLost := 0
+		for _, l := range lost {
+			totalLost += l
+		}
+		if totalLost > len(signed) {
+			t.Errorf("%d lost offers, want at most one per signed admission (%d)", totalLost, len(signed))
 		}
 		slices.SortFunc(starts, time.Time.Compare)
 		for i := 1; i < len(starts); i++ {
@@ -162,10 +187,8 @@ func TestSimCapacity_UpgradeBurst(t *testing.T) {
 					host, seen.Sub(t0), at.Sub(seen))
 			}
 		}
-		// (4) Workers + Run + two adoptions, plus slack for transient
-		// goroutines (the cache writer's work, timer callbacks).
-		const slack = 8
-		if limit := base + checkWorkers + 1 + 2 + slack; maxG > limit {
+		// (4) The goroutine bound (limit, above).
+		if maxG > limit {
 			t.Fatalf("goroutines peaked at %d, limit %d", maxG, limit)
 		}
 	})
@@ -306,8 +329,11 @@ func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 			at, ok := starts.at[pkgsURL(s)]
 			return at, ok
 		}
-		runtime.Gosched()
-		base := runtime.NumGoroutine()
+		// (5) Workers + Run + the clients + two adoptions, plus slack for
+		// transient goroutines (the cache writer's work, timer callbacks).
+		const slack = 8
+		base := baseGoroutines()
+		limit := base + checkWorkers + 1 + 1 + 2 + slack
 		maxG := base
 		chk, err := New(Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
 			Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }})
@@ -346,7 +372,7 @@ func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 		}()
 		for time.Since(t0) < 50*time.Minute {
 			time.Sleep(61 * time.Second) // off the 3 m 45 s tick grid
-			maxG = max(maxG, runtime.NumGoroutine())
+			maxG = max(maxG, sampleGoroutines(limit))
 		}
 		cancel()
 		<-runDone
@@ -421,10 +447,8 @@ func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 		if admissions := len(first) + len(signed); totalLost > admissions || totalLost < 1 {
 			t.Errorf("%d lost offers for %d admissions, want at least 1 and at most the admissions", totalLost, admissions)
 		}
-		// (5) Workers + Run + the clients + two adoptions, plus slack for
-		// transient goroutines (the cache writer's work, timer callbacks).
-		const slack = 8
-		if limit := base + checkWorkers + 1 + 1 + 2 + slack; maxG > limit {
+		// (5) The goroutine bound (limit, above).
+		if maxG > limit {
 			t.Fatalf("goroutines peaked at %d, limit %d", maxG, limit)
 		}
 	})

@@ -911,6 +911,68 @@ func TestServeHTTP_LateRegistrationThatWaitedServesTheNewSnapshot(t *testing.T) 
 	})
 }
 
+// Final fix wave FW-4 (c) (final tests review, Important 3): a late
+// registration — a creating miss's, an onboarding hit's — re-dispatches
+// through the snapshot path whatever its wait in a hold read. Here a flip
+// commits right before the registration (no serve of the suite was
+// registered, so it held nothing) and the registration's Held() is 0, as
+// for a hold released at the clock reading the request joined it (a
+// coarse clocksource, or one instant in a bubble: the cause of the
+// OnboardingWaiterRegistersItsOwnServe flake). Inferring "held" from
+// Held() > 0 served the bytes read or fetched before the commit: a C8
+// straddle.
+func TestServeHTTP_LateRegistrationAfterACommitServesTheNewSnapshot(t *testing.T) {
+	for _, path := range []string{"creating miss", "onboarding hit"} {
+		t.Run(path, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s := newFlipStack(t, 10*time.Second)
+				const suite = "/n/dists/s"
+				if path == "creating miss" {
+					s.h.fetch = staticUpstream{"http://" + flipSimHost + suite + "/InRelease": rowInRelease}
+				} else {
+					s.cacheRow(suite+"/InRelease", rowInRelease, wallclock.Unix()) // a legacy anchor: the hit onboards
+				}
+				snapBody := simtest.ClearsignedFixture("Origin: snapshot\n")
+				hash := writeBlob(t, s.h, snapBody)
+				ctx := context.Background()
+				cand, _, err := s.c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{CanonicalScheme: "http",
+					CanonicalHost: flipSimHost, SuitePath: suite, InReleaseHash: &hash})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var committed sync.Once
+				flipped := false
+				// The registration's read: once the suite has its row, a flip
+				// commits the snapshot before the read answers.
+				s.h.suiteExistsForTest = func(key cache.SuiteKey) (bool, error) {
+					ok, err := s.c.SuiteExists(ctx, key)
+					if err == nil && ok {
+						committed.Do(func() {
+							_, ferr := s.gate.Flip(ctx, flipgate.Key("http", flipSimHost, suite), func() error {
+								return s.c.CommitAdoption(ctx, cand, []cache.SnapshotMember{{SnapshotID: cand, Path: "InRelease",
+									BlobHash: hash, DeclaredSHA256: hash}}, nil, nil, nil, false)
+							})
+							if ferr != nil {
+								t.Error(ferr)
+							}
+							flipped = true
+						})
+					}
+					return ok, err
+				}
+				rec := httptest.NewRecorder()
+				s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+suite+"/InRelease", nil))
+				if !flipped {
+					t.Fatal("setup: the flip never ran before the registration")
+				}
+				if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), snapBody) {
+					t.Fatalf("status %d body %q; want the snapshot committed before the registration", rec.Code, rec.Body.String())
+				}
+			})
+		})
+	}
+}
+
 // Design review M1: a row-creating serve whose client leaves during its
 // late registration's wait is a client abort, as on the entry path — 503,
 // no WARN — and its line keeps the miss's upstream status.

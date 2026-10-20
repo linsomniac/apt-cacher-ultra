@@ -452,9 +452,11 @@ const onboardTimeout = 5 * time.Second
 // the base in the same transaction for a sniff-passing InRelease in hand
 // and for the suite's other cached signed anchors, ruling PD-5), and
 // register the serve with the flip barrier right after it. It returns that
-// registration's token (nil: nothing registered), whose wait in a hold
-// means the snapshot path may have changed meanwhile; the singleflight
-// leader then runs the backstop of an unproven creation.
+// registration's token (nil: nothing registered); after a registration
+// the snapshot path may have changed — a flip may have committed, in a
+// hold the request waited in or just before it — so the caller always
+// re-dispatches through it (FW-4 (c)); the singleflight leader then runs
+// the backstop of an unproven creation.
 //
 // AIDEV-NOTE: concurrent hits on one untracked suite share one creation
 // through the handler's singleflight under its own key namespace (design

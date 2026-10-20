@@ -42,10 +42,16 @@ func (f *fakeAdoptions) WaitHostAdoptions(_ context.Context, _ string, start tim
 	return f.ok
 }
 
-// holdHostSlots takes every host-limiter slot of host for d, so a miss's
-// runFetch waits at its slot and concurrent misses of one path coalesce in
-// singleflight (strict mode refuses before any upstream fetch).
-func holdHostSlots(t *testing.T, h *Handler, host string, d time.Duration) {
+// holdHostSlotsUntilJoined takes every host-limiter slot of host, so a
+// miss's runFetch waits at its slot and concurrent misses of one path
+// coalesce in singleflight (strict mode refuses before any upstream
+// fetch), and gives them back once a singleflight call of h that was not
+// in flight when it took them has a joiner, and delay has passed since:
+// the call's leader waits at its host slot until the second request has
+// joined it — no wall-clock window to race (final fix wave FW-4 (d); the
+// 300 ms window failed under load) — and both requests are at least delay
+// old when the slots come back.
+func holdHostSlotsUntilJoined(t *testing.T, h *Handler, host string, delay time.Duration) {
 	t.Helper()
 	var rels []func()
 	for range 4 { // the strict rig's hostsem.New(4)
@@ -55,8 +61,29 @@ func holdHostSlots(t *testing.T, h *Handler, host string, d time.Duration) {
 		}
 		rels = append(rels, rel)
 	}
+	h.sf.mu.Lock()
+	before := make(map[*sfCall]bool, len(h.sf.calls))
+	for _, c := range h.sf.calls {
+		before[c] = true
+	}
+	h.sf.mu.Unlock()
+	joined := func() bool {
+		h.sf.mu.Lock()
+		defer h.sf.mu.Unlock()
+		for _, c := range h.sf.calls {
+			if !before[c] && c.waiters > 0 {
+				return true
+			}
+		}
+		return false
+	}
 	go func() {
-		time.Sleep(d)
+		// Bounded, so a regression that never coalesces fails the
+		// assertions below instead of hanging at the held slot.
+		for deadline := time.Now().Add(30 * time.Second); !joined() && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(delay)
 		for _, rel := range rels {
 			rel()
 		}
@@ -191,9 +218,9 @@ func TestServeHTTP_StrictWaitRefusals(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h, logs, srvURL, _, canon := strictWaitRig(t, tc.a)
 			const delay = 300 * time.Millisecond
-			holdHostSlots(t, h, canon, delay) // the first call's leader waits: the second request joins it
+			holdHostSlotsUntilJoined(t, h, canon, delay) // the first call's leader waits until the second request joins it
 			var once sync.Once
-			tc.a.during = func() { once.Do(func() { holdHostSlots(t, h, canon, delay) }) } // so does the retry's
+			tc.a.during = func() { once.Do(func() { holdHostSlotsUntilJoined(t, h, canon, delay) }) } // so does the retry's
 			var wg sync.WaitGroup
 			for range 2 {
 				wg.Add(1)

@@ -733,12 +733,20 @@ func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *pro
 			if clientLeft(w, r) {
 				return true, "client_canceled", http.StatusServiceUnavailable, 0, packageValidation{}
 			}
-			if t.Held() > 0 {
-				// The registration waited in a flip's hold: what is current
-				// now may be a snapshot (design note 9).
-				if served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start, sr); handled {
-					return served, "", status, body, packageValidation{SnapshotDisplaced: displaced}
-				}
+			// A late registration serves what is current now: a flip may
+			// have committed a snapshot (design note 9).
+			//
+			// AIDEV-NOTE: always re-dispatch, never only when t.Held() > 0
+			// (final fix wave FW-4 (c)). Held() is the wait measured by the
+			// clock: a hold released at the reading the request joined it
+			// (a coarse clocksource; one instant in a synctest bubble)
+			// reads 0, and a flip that committed just before the
+			// registration held nothing at all — either way the request
+			// served the bytes it read before the commit, a C8 straddle
+			// (TestServeHTTP_LateRegistrationAfterACommitServesTheNewSnapshot).
+			// Cost: one snapshot-pointer read per onboarding serve.
+			if served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start, sr); handled {
+				return served, "", status, body, packageValidation{SnapshotDisplaced: displaced}
 			}
 		}
 	}
@@ -1489,11 +1497,11 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	// Phase C carry-forward: the serve of an anchor whose suite row this
 	// miss created (or found created by a concurrent request) registers
 	// with the flip barrier right after the creation, before anything else
-	// (ruling PD-5). A registration that waited in a hold serves what is
-	// current now — the flip may have committed a snapshot (design note
-	// 9) — and its line keeps the miss's outcome, fetch and upstream status;
-	// a client that left while it waited is a client abort (design review
-	// M1).
+	// (ruling PD-5). The registration then serves what is current now — a
+	// flip may have committed a snapshot (design note 9; whether or not it
+	// waited in a hold, FW-4 (c)) — and its line keeps the miss's outcome,
+	// fetch and upstream status; a client that left while it waited is a
+	// client abort (design review M1).
 	t := h.registerLate(r, req, sr)
 	if res.unproven && !shared {
 		// The creation's transaction could not prove a cached anchor that
@@ -1526,14 +1534,19 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 			h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, true, res.status, start)
 			return
 		}
-		if t.Held() > 0 {
-			if served, hitOutcome, status, body, v := h.tryCacheHit(w, r, req, start, sr); served {
-				if hitOutcome == "" {
-					hitOutcome = logOutcome
-				}
-				h.logRequestWithValidation(r, req.CanonicalHost, req.Path, hitOutcome, status, body, true, res.status, start, v)
-				return
-			}
+		// AIDEV-NOTE: always re-dispatch through the snapshot path, never
+		// only when t.Held() > 0 (final fix wave FW-4 (c)): a hold released
+		// at the clock reading the request joined it reads 0, and a flip
+		// that committed just before the registration held nothing — the
+		// miss then served the bytes it fetched before the commit, a C8
+		// straddle. With no current snapshot the fetched body is what is
+		// current (the miss just stored it), so only the snapshot path is
+		// tried: no second url_path read, touch or T1 per creating miss.
+		// Cost: one snapshot-pointer read per creating miss of an anchor.
+		if served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start, sr); handled && served {
+			h.logRequestWithValidation(r, req.CanonicalHost, req.Path, logOutcome, status, body, true, res.status, start,
+				packageValidation{SnapshotDisplaced: displaced})
+			return
 		}
 	}
 
