@@ -598,8 +598,9 @@ before the upgrade for a suite with none: such a suite goes about 23 days
 after the upgrade unless a client asks for it), the rows an earlier
 release created for paths this version no longer tracks, and the suites
 whose cached anchor files are all error pages — with `gc.enabled = false`
-too. An offline or archive cache that must keep serving such suites sets
-`gc.suite_idle_ttl = "0s"` before upgrading.
+too. An offline or archive cache that must keep serving such suites —
+including one that relied on `gc.enabled = false` to keep everything —
+sets `gc.suite_idle_ttl = "0s"` before upgrading.
 
 After the upgrade, suites without a snapshot adopt eagerly only if a client
 fetched one of their anchor files in the 7 days before the upgrade, or asks
@@ -744,8 +745,10 @@ for a while — an offline or archive cache — sets `suite_idle_ttl = "0s"`.
 The record that a repository path was seen signed survives the reap, so
 the returning suite is never adopted unsigned (see *Anchor forms and
 unsigned repositories*); the reaper deletes that record only when no
-suite of the path has a row and the path was last seen signed, or its
-last suite reaped, more than a year ago. With
+suite of the path has a row and the path was last seen signed — or a
+suite of it last reaped, evicted at the `freshness.max_suites` cap or
+forgotten, each of which moves the record's date up to that moment —
+more than a year ago. With
 `integrity.refuse_unvouched_debs = true`, a reaped suite's packages are
 no longer vouched for, and reaping a suite whose signed snapshot was the
 host's only one with incomplete package coverage turns strict mode on for
@@ -766,8 +769,12 @@ repository through its `Release`); a file that cannot be read is never
 taken for an error page.
 
 A suite whose last request lies in the future (the clock was stepped
-back) is never idle. A forward step can make every suite look idle: the
-hour before the first run after a start gives clients time to ask again;
+back) is never idle — the two kinds above are reaped all the same — and
+the furthest such date (of a path this version tracks) is logged as WARN
+`clock_step_detected` (`stamp=last_requested_at`) by the first run that
+reaps after a start, and again only when it changes. A forward step can
+make every suite look idle: the hour before the first run after a start
+gives clients time to ask again;
 a step while the daemon runs (a resumed virtual machine or laptop: the
 wall clock moved more than an hour further than the time that passed) is
 logged as WARN `clock_step_detected` with `stamp=wall_clock` and holds
@@ -818,41 +825,67 @@ snapshots and its row are deleted. The next request for it tracks it again
 as a new repository and, with adoption enabled, adopts what upstream
 serves then. That is the way out of two refusal states: a deliberate
 upstream rollback (refused `upstream_older` or `rollback_refused`), and a
-vendor that stopped signing (`unsigned_downgrade_refused`). For the latter
-it also deletes the record that the repository path was seen signed, and
-the cached `InRelease`, `Release` and `Release.gpg` of the path and of its
-`./` twin under either scheme (a signed copy left there would mark the
-path signed again), but only when no other suite of the path has a row —
-under `http` or `https`, or as its `./` twin; while one does, the answer
-names it: forget it too, or the forgotten suite is refused again. A
-client in the middle of an update when its suite is forgotten can see one
-Hash Sum mismatch: forgetting does not wait for the update to end, as an
-adoption's flip does (see *Flip consistency*).
+vendor that stopped signing (`unsigned_downgrade_refused`).
+
+When no other suite of the repository path has a row — under `http` or
+`https`, or as its `/.` twin — forgetting a suite also deletes the record
+that the path was seen signed, and the cached `InRelease`, `Release` and
+`Release.gpg` of the path and of its `/.` twin under either scheme (a
+signed copy left there would mark the path signed again). That is what
+lifts `unsigned_downgrade_refused`, and it happens whatever the suite was
+refused for, or if it was refused at all: forgetting a suite forgets that
+its path was signed, so until a check sees a signature there again,
+never-downgrade does not protect the path — an unsigned `Release` served
+there meanwhile is adopted like any unsigned repository's (see *Anchor
+forms and unsigned repositories*). While another suite of the path has a
+row, the record and those files stay and the answer names that suite: a
+suite forgotten to lift `unsigned_downgrade_refused` is then refused
+again — forget the other one too.
+
+A client in the middle of an update when its suite is forgotten can see
+one Hash Sum mismatch: forgetting does not wait for the update to end, as
+an adoption's flip does (see *Flip consistency*). A forget still running
+when the daemon begins shutting down is cut short and answers 503: the
+index files it deleted stay deleted (the anchors go last), and it can be
+repeated once the daemon is back (409 then means it had completed after
+all, or the suite is busy).
 
 `scheme`, `host` and `suite` are the suite's canonical scheme, host and
-suite path as the status page shows them (its Host column reads
-`scheme://host`); `scheme` is optional (`http` or `https`, default
-`https`). The request must carry the header `X-ACU-Admin: 1`, which a
-cross-site form cannot send, and a browser request from another site is
-refused (by its `Sec-Fetch-Site` header), so a cross-site form or `fetch`
-cannot trigger it. It does not stop DNS rebinding — a web page whose own
-name is made to resolve to the admin listener's address — against a
-listener without `htpasswd_file`: configure one if a browser runs on the
-cache's host. `curl` and scripts are not affected:
+suite path as the status page shows them: its Host column reads
+`scheme://host`, so pass the part before `://` as `scheme` and the rest
+as `host` (a `host` holding `://` is refused with 400). `scheme` is
+optional (`http` or `https`, default `https`). The request must carry
+the header `X-ACU-Admin: 1`, which a cross-site form cannot send, and a
+browser request from another origin is refused (its `Sec-Fetch-Site`
+header must be `same-origin` or `none` when present), so a cross-site
+form or `fetch` cannot trigger it. It does not stop DNS rebinding — a
+web page whose own name is made to resolve to the admin listener's
+address — against a listener without `htpasswd_file`: configure one if a
+browser runs on the cache's host. `curl` and scripts are not affected:
 
 ```sh
 curl -sS --fail-with-body -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 1' \
+    --data-urlencode 'scheme=https' \
     --data-urlencode 'host=packages.microsoft.com' \
     --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
 # 202 Accepted = forgotten (the work is done when the answer comes); the body
 #   names the suite, the signed-path records deleted and the suites that kept them
+# 400 = host or suite missing, a scheme other than http or https, or a host
+#   holding scheme:// (pass the scheme in scheme)
+# 403 = the header is missing, or a browser request from another origin
 # 409 = busy (being checked or adopted: try again) or no such suite (check the
 #   scheme, which defaults to https, and the host and suite the status page shows)
-# 403 = the header is missing, or a cross-site browser request
+# 500 = a database error (logged as WARN admin: forget failed)
+# 503 = the daemon began shutting down while the forget ran; repeat it once it is back
 ```
 
-Each request is logged as INFO `admin_forget_requested`, and each suite
-forgotten as INFO `suite_forgotten`.
+`--fail-with-body` needs curl 7.76 or later; an older curl (Debian 11,
+Ubuntu 20.04) refuses it: use `-sS -w '%{http_code}\n'` instead, which
+prints the body and then the status.
+
+Each accepted request is logged as INFO `admin_forget_requested` (a
+request refused with 400, 403 or 413 is not), and each suite forgotten
+as INFO `suite_forgotten`.
 
 ## `[serve]`: stale responses
 

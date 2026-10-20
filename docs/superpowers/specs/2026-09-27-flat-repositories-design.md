@@ -1,6 +1,6 @@
 # Flat repositories, eager adoption, and suite lifecycle — design
 
-- **Date:** 2026-09-27 (revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
+- **Date:** 2026-09-27 (revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9) and task reviews (ruling PF-10): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503); revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
 - **Status:** draft for maintainer review
 - **Branch:** `feature/flat-repos` (from `main` @ 536a1ab)
 - **Origin:** reimplementation of the problem reported in PR #8 ("Refresh flat
@@ -359,7 +359,7 @@ UPDATE-only. `Check` and `Reconcile` require an **existing row** before
 `LoadOrStore` (I-4) and re-validate after `TryLock` that the lock map still
 holds the same mutex and the row still exists. `Check` first peeks at the
 lock map without storing: a suite whose mutex is held answers busy with no
-database read, and its row gate is an existence read (`SuiteExists`), so a
+database read, and its row gate is an existence read (`HasSuiteRow`), so a
 burst of T1s on one suite costs about one read (phase D final review). The
 handler's by-hash content-addressed fallback requires a known suite (I-4,
 handler side). A test proves exactly one INSERT site.
@@ -457,15 +457,16 @@ marker survives suite reaping: the reaper sweeps a marker only once no
 suite row exists for its base or its `/.` twin, under either scheme, and
 its `last_seen_at` is older than 365 days (a live suite's marker is never
 swept, so no renewal write is needed; a future stamp reads as now and is
-never rewritten, C9). A reap moves the base's markers up to the reap
-(`MAX(last_seen_at, now)`), so the year counts from the end of the
-suite's tracking. `POST /forget` deletes the base's markers, under both
-schemes — and the cached `InRelease`, `Release` and `Release.gpg` of the
-base and its `/.` twin under both schemes, which the unsigned commit's
-re-mark would otherwise read and mark again (phase F, ruling PF-2) — only
-if no other suite row exists for the base or its `/.` twin under either
-scheme (phase F, design note 13: never-downgrade reads both schemes'
-markers).
+never rewritten, C9). Every suite-row delete — cap eviction, a reap, a
+forget — moves the base's markers, under both schemes, up to its time
+(`MAX(last_seen_at, now)`, in the deleting transaction; phase F, ruling
+PF-10), so the year counts from the end of the suite's tracking.
+`POST /forget` deletes the base's markers, under both schemes — and the
+cached `InRelease`, `Release` and `Release.gpg` of the base and its `/.`
+twin under both schemes, which the unsigned commit's re-mark would
+otherwise read and mark again (phase F, ruling PF-2) — only if no other
+suite row exists for the base or its `/.` twin under either scheme
+(phase F, design note 13: never-downgrade reads both schemes' markers).
 
 ### C4. Freshness check
 
@@ -902,9 +903,10 @@ upgrade (§6.1).
    suite's transition is confirmed afresh. While the knob is off the cache
    does not keep unsigned repositories fresh: an established unsigned
    suite keeps serving its last snapshot, coherent and frozen, until the
-   knob is turned back on or the suite is forgotten (or reaped as idle),
-   and a never-adopted one is served as the cache first stored its files
-   (phase F, ruling PF-5, which drops R-F4's retirement into the ordinary
+   knob is turned back on or the suite is forgotten (or reaped as idle) —
+   forgotten or reaped with the knob still off, it is then a never-adopted
+   one — and a never-adopted one is served as the cache first stored its
+   files (phase F, ruling PF-5, which drops R-F4's retirement into the ordinary
    cache: there each index file would be frozen at its own first fetch,
    so every upstream publish would bring Hash Sum mismatches that never
    clear). The knob is for caches that serve no unsigned repositories.
@@ -1269,7 +1271,8 @@ PF-4), then the oldest `last_requested_at`. Candidates:
 `last_requested_at < now − gc.suite_idle_ttl` (default `720h`; `0s` disables
 reaping; a NULL or future stamp is never idle, and the furthest future one
 is reported through `clock_step_detected` at the first run after a start
-and whenever it changes),
+and whenever it changes — logged directly, outside the checker's
+one-line-a-minute limit, and counted),
 plus rows whose `suite_path` is non-canonical under the tightened grammar
 (unreachable legacy rows, reaped regardless of idleness), plus legacy junk
 rows, also reaped regardless of idleness (phase F, rulings R-F3, PF-3): a
@@ -1290,7 +1293,8 @@ suite mutex; busy → skip, retried next run) and re-read its row (I-4: a
 row gone since the listing has its lock-map entry dropped; a suite asked
 for, or adopted, since the listing is left whole; junk evidence is not
 read again), then, within 5 minutes (a step cut short is retried next
-run):
+run; a panic under the hold is recovered for that suite alone — logged,
+the hold released as the cache then answers — and the run goes on):
 
 1. delete the suite's metadata `url_path` rows — rows where
    `aptpath.SuitePath(path) == suite` (never a twin's or nested suite's) —
@@ -1301,16 +1305,20 @@ run):
    bail if the stamp is newer than the cutoff or `current_snapshot_id` changed
    since the candidate was listed; run the Step-8 refcount
    decrement for the current snapshot; set `retired_at` on all of the suite's
-   snapshots; delete the `suite_freshness` row. `deleteSuiteTx` holds the
-   only production `DELETE FROM suite_freshness`, and only cap eviction,
-   `ReapIdleSuite` and `ForgetSuite` call it (phase F, ruling R-F1).
+   snapshots; delete the `suite_freshness` row; move the base's markers
+   up (PF-10). A failed writer call is settled by a fresh read of the
+   row: gone is a reap (`suite_reaped` with `settled=true`).
+   `deleteSuiteTx` holds the only production `DELETE FROM
+   suite_freshness`, and only cap eviction, `ReapIdleSuite` and
+   `ForgetSuite` call it (phase F, ruling R-F1).
 
 Then `release(true)` purges in-memory state: the lock-map entry
-(`CompareAndDelete`), the checker's per-suite maps, the flip-gate entry and
-the touch-coalescing entry. `Gate.Purge` skips a live entry — a flip in
-progress, a hold, an anchor serve in flight or one completed within the
-quiet period — which expires on its own, so a release racing a re-created
-suite's serve never shortens that serve's quiet period (ruling R-F2). Each
+(`CompareAndDelete`), the checker's per-suite maps and the flip-gate
+entry; the cache itself drops the touch-coalescing entry once the row is
+gone. `Gate.Purge` skips a live entry — a flip in progress, a hold, an
+anchor serve in flight or one completed within the quiet period — which
+expires on its own, so a release racing a re-created suite's serve never
+shortens that serve's quiet period (ruling R-F2). Each
 run also scans for junk rows (every run, ruling PF-4: one indexed read
 that probes `url_path` by its key, pool reads only for blobs not yet
 sniffed) and sweeps the reconcile memo (against the current snapshot ids
@@ -1322,8 +1330,10 @@ its writer transaction. The sweep is a gate that retires things (C4
 clock-step rule): a future stamp reads as now, so its marker is never
 swept; the sweep never rewrites it and reports the furthest through
 `clock_step_detected` at the first sweep after a start and when it
-changes (rulings R-F5, PF-1). A forward step of the wall clock that no
-restart re-arms — the wall clock more than 1 h ahead of the monotonic
+changes — judged against a fresh clock read, since the run's own deletes
+move markers up while it runs (the cutoff stays the run's), and logged
+directly, outside the one-line-a-minute limit (rulings R-F5, PF-1). A
+forward step of the wall clock that no restart re-arms — the wall clock more than 1 h ahead of the monotonic
 clock between two runs, as when a VM or laptop resumes — is reported
 (`clock_step_detected`, `stamp=wall_clock`) and defers reaping and the
 sweep by the uptime floor (ruling PF-8). Reaps are counted by reason
@@ -1353,19 +1363,24 @@ are 403. It does not stop DNS rebinding against a listener without
 ruling PF-6). It reads the suite's row (I-4), holds the suite through the
 `SuiteGuard` and runs the reaper's steps to completion, within 5 minutes
 — all batches, then `cache.ForgetSuite` through `deleteSuiteTx` without
-the idle checks — on a context a client disconnect cannot cancel; the
-final transaction also deletes the base's signed-seen markers, under both
-schemes, and the cached anchors of the base and its `/.` twin under both
-schemes, if no row is left for the base or the twin under either scheme
-(ruling PF-2). It answers 202 once the suite is forgotten, its body naming
-the suite, the markers deleted and the rows that kept them, and 409 for
-both busy and unknown suites (no existence oracle; the body says what to
-check: the scheme, which defaults to `https`, and the host and suite as
-the status page shows them, which now shows each suite's scheme; ruling
-PF-7), 400 for a missing `host` or `suite` or another scheme, and 500 for
-a database error (logged). It is the documented escape
-hatch for refusal states: a vendor that stopped signing, a deliberate upstream
-rollback, a stuck unsigned suite. (`POST /reconcile` keeps its existing
+the idle checks — on a context a client disconnect cannot cancel but the
+admin listener's shutdown does; the final transaction also deletes the
+base's signed-seen markers, under both schemes, and the cached anchors
+of the base and its `/.` twin under both schemes, if no row is left for
+the base or the twin under either scheme (ruling PF-2). It answers 202
+once the suite is forgotten, its body naming the suite, the markers
+deleted and the rows that kept them, and 409 for both busy and unknown
+suites (no existence oracle; the body says what to check: the status
+page, which now shows each suite's scheme, shows `scheme://host` in its
+Host cell — the scheme goes in `scheme`, default `https`, the rest in
+`host` — and the suite in its Suite path column; ruling PF-7), 400 for a
+missing `host` or `suite`, another scheme, or a `host` holding `://`
+(the Host cell pasted whole), 500 for a database error (logged), and 503
+when the admin listener's shutdown cut it short (each metadata batch and
+the final delete are their own transactions, so a forget cut short is
+safe to repeat). It is the documented escape hatch for refusal states: a
+vendor that stopped signing, a deliberate upstream rollback, a stuck
+unsigned suite. (`POST /reconcile` keeps its existing
 protection; hardening it is part of G-1, §10.)
 
 ### C10. Strict mode
@@ -1442,9 +1457,12 @@ phase E's `acu_repair_deferred_total{host}` and
 `acu_strict_adoption_waits_total{host}`, and phase F's unlabelled counter
 `acu_gc_retired_reaped_total` and `acu_suites_reaped_total{reason}` (three
 values: `idle`, `non_canonical`, `junk`).
-New metrics are host-labelled or
-unlabelled (no suite labels) and are added to the metrics inventory comments in
-`internal/freshness/metrics.go` and `internal/handler/metrics.go`.
+New metrics carry no suite labels: they are unlabelled, host-labelled or,
+for `acu_suites_reaped_total`, labelled by its three reasons. They are
+listed in the metrics inventory comments of `internal/freshness/metrics.go`
+and `internal/handler/metrics.go`, except `acu_gc_retired_reaped_total`,
+declared with the other `gc_run_complete` counters in
+`internal/gc/metrics.go`.
 `gc_run_complete` and `LastRunSummary` gain `retired_reaped`.
 
 | Key | Default | Rule |

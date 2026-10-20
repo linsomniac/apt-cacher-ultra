@@ -379,7 +379,9 @@ sees a 401/403 on a signature file) and clears itself when it adopts;
 `unsigned_downgrade_refused` (the suite was seen signed) lasts until
 upstream serves a signature the cache adopts, or the suite is forgotten
 (`POST /forget`, an admin endpoint outside this page: see
-`docs/configuration.md`, *Forgetting a suite*);
+`docs/configuration.md`, *Forgetting a suite*) while no other suite of
+its repository path — under either scheme, or as its `/.` twin — has a
+row (otherwise the forgotten suite is refused again);
 `unsigned_too_large` (more than 1,000 declared files) lasts until
 upstream's `Release` declares fewer; `anchor_absent` means the current
 snapshot's anchor is gone upstream (or a detached suite's changed
@@ -388,7 +390,10 @@ a suite without a snapshot, that upstream serves neither `InRelease` nor
 `Release`; `unsigned_disabled` means `adoption.adopt_unsigned` is off:
 an unsigned `Release` is not adopted, and an unsigned suite already
 adopted keeps serving its last snapshot without updates until the knob is
-turned back on or the suite is forgotten. None of them hides lag (only `upstream_older` and
+turned back on, the suite is forgotten, or it is reaped after
+`gc.suite_idle_ttl` without a client — forgotten or reaped with the knob
+still off, it is then a suite not yet adopted, served as the cache first
+stored its files. None of them hides lag (only `upstream_older` and
 `rollback_refused` do, §9.1), and all five follow the `REFUSED 24H+` rule
 below. A suite without a snapshot shows lag from the first check that
 found its anchor, so a first adoption refused for good
