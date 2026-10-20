@@ -125,6 +125,31 @@ func TestSweepOrphanMarkers_NeverRewritesAFutureStamp(t *testing.T) {
 	}
 }
 
+// The Task 9 review's minor 2: of markers with the same future stamp — a
+// deleting reap's MAX gives a base's http and https markers the same one —
+// Furthest is the first in key order (scheme, host, base), whatever order
+// they were written in, so the reaper's once-per-change report (design
+// review M-10) sees the same marker at every sweep.
+func TestSweepOrphanMarkers_TheFurthestOfATieIsTheFirstInKeyOrder(t *testing.T) {
+	at := sweepNow + 30*86400
+	first := SignedSeenMark{"http", "g", "/z/dists/s", at}
+	others := []SignedSeenMark{{"https", "a", "/a/dists/s", at}, {"http", "h", "/a/dists/s", at},
+		{"https", "h", "/a/dists/s", at}}
+	for name, marks := range map[string][]SignedSeenMark{
+		"written first": append([]SignedSeenMark{first}, others...),
+		"written last":  append(append([]SignedSeenMark{}, others...), first),
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := openCache(t)
+			putMarks(t, c, marks)
+			res, err := c.SweepOrphanMarkers(context.Background(), sweepNow, sweepNow-sweepYear)
+			if err != nil || res.Furthest == nil || *res.Furthest != first {
+				t.Fatalf("SweepOrphanMarkers = %+v (furthest %+v), %v; want the furthest %+v", res, res.Furthest, err, first)
+			}
+		})
+	}
+}
+
 // Design review I-1, the hazard ruling PF-1 closes: a reaped suite's base
 // marker, an orphan last seen a month ago, survives a two-year backward
 // clock step and its correction. Read as now during the step (never

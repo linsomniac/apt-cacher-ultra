@@ -77,7 +77,9 @@ type Reaper struct {
 	interval, floor time.Duration
 	// reapHook, when set (tests only), runs in reapHeld and Forget while
 	// the suite is held, with the context its steps run on: a panic there
-	// stands in for a bug between the hold and its release.
+	// stands in for a bug between the hold and its release. It is a test
+	// seam set before Run and Forget start and only read afterwards —
+	// Forget reads it on net/http's goroutines, not the run's.
 	reapHook func(context.Context, cache.SuiteKey)
 	// lastWall and lastMono are the checker's wall clock and the monotonic
 	// clock at the previous run, or at Run's start; deferUntil is the
@@ -211,27 +213,38 @@ func (r *Reaper) runOnce(ctx context.Context) {
 	}
 	if !deferred && (r.dailyAt.IsZero() || time.Since(r.dailyAt) >= dailyEvery) {
 		r.dailyAt = time.Now()
-		r.sweepMarkers(ctx, now)
+		r.sweepMarkers(ctx, now, r.checker.now())
 	}
 	r.sweepReconcileMemo(rows)
 }
 
 // sweepMarkers runs spec C9's orphan-marker sweep (ruling R-F5,
-// cache.SweepOrphanMarkers) with the cutoff now − markerTTL: it deletes
-// the orphans last seen before the cutoff, logging
+// cache.SweepOrphanMarkers) with the cutoff now − markerTTL, now being the
+// run's: it deletes the orphans last seen before the cutoff, logging
 // signed_seen_markers_swept when it deleted any, and reports the marker
-// stamped furthest in the future through the rate-limited
-// clock_step_detected (stamp=last_seen_at) at the first sweep after a
-// start and whenever that marker or its stamp changes (design review
-// M-10). It never rewrites a stamp (ruling PF-1).
-func (r *Reaper) sweepMarkers(ctx context.Context, now time.Time) {
-	res, err := r.cache.SweepOrphanMarkers(ctx, now.Unix(), now.Add(-markerTTL).Unix())
+// stamped more than clockStepTolerance past fresh — a clock read taken
+// for the sweep — furthest in the future through clock_step_detected
+// (stamp=last_seen_at; counted, and logged directly: clockStepUnlimited)
+// at the first sweep after a start and whenever that marker or its stamp
+// changes (design review M-10). It never rewrites a stamp (ruling PF-1).
+//
+// AIDEV-NOTE: two clocks on purpose (the Task 9 review's Important 1).
+// Markers are stamped while the run goes on — its own reaps move their
+// bases' markers up to the cache's clock (M-9, ruling PF-10) and the
+// checker's probes re-mark at every sighting — so the future threshold is
+// the fresh read: against the run's start, a run whose reaps took more
+// than 2 s would report its own stamps as a clock step. The cutoff keeps
+// the run's now, which the forward-step guard checked: a fresh one would
+// let a step during the run sweep markers the guard would have deferred
+// (design review M-8).
+func (r *Reaper) sweepMarkers(ctx context.Context, now, fresh time.Time) {
+	res, err := r.cache.SweepOrphanMarkers(ctx, fresh.Unix(), now.Add(-markerTTL).Unix())
 	var furthest cache.SignedSeenMark
 	if res.Furthest != nil {
 		furthest = *res.Furthest
 		if furthest != r.reportedMarker {
-			r.checker.clockStep("last_seen_at", furthest.CanonicalScheme, furthest.CanonicalHost, furthest.Base,
-				furthest.SeenAt, now)
+			r.checker.clockStepUnlimited("last_seen_at", furthest.CanonicalScheme, furthest.CanonicalHost, furthest.Base,
+				furthest.SeenAt, fresh)
 		}
 	}
 	r.reportedMarker = furthest
@@ -281,13 +294,16 @@ func (r *Reaper) deferredByForwardStep(now, mono time.Time) bool {
 // AIDEV-NOTE: the reap cutoff is a gate that retires things (spec C4
 // clock-step rule): a last_requested_at in the future (a backward clock
 // step) reads as now — never idle — and the furthest is reported through
-// the checker's rate-limited clock_step_detected at the first run after a
-// start and whenever the furthest changes (design review M-10: a dead
-// suite's future stamp would otherwise be reported every hour until the
-// clock passed it); a NULL stamp is never idle either (the v7 backfill and
-// every creation set one). A canonical path with an odd codename such as
-// /foo/dists/InRelease is reaped by idleness like any suite (phase A
-// carry-forward).
+// clock_step_detected (counted, and logged directly: clockStepUnlimited)
+// at the first run after a start and whenever the furthest changes
+// (design review M-10: a dead suite's future stamp would otherwise be
+// reported every hour until the clock passed it). Only an idle candidate
+// is kept by its future stamp: a non-canonical row is reaped regardless
+// and not reported, and a junk suite is reported and still reaped as junk
+// (junkCandidates never reads the stamp). A NULL stamp is never idle
+// either (the v7 backfill and every creation set one). A canonical path
+// with an odd codename such as /foo/dists/InRelease is reaped by idleness
+// like any suite (phase A carry-forward).
 func (r *Reaper) candidates(rows []cache.SuiteWithAdoption, now time.Time) []reapCandidate {
 	idleCutoff := now.Add(-r.idleTTL).Unix()
 	futureAfter := now.Unix() + int64(clockStepTolerance/time.Second)
@@ -315,7 +331,7 @@ func (r *Reaper) candidates(rows []cache.SuiteWithAdoption, now time.Time) []rea
 		out = append(out, c)
 	}
 	if furthest.stamp != 0 && furthest != r.reported {
-		r.checker.clockStep("last_requested_at", furthest.key.CanonicalScheme, furthest.key.CanonicalHost,
+		r.checker.clockStepUnlimited("last_requested_at", furthest.key.CanonicalScheme, furthest.key.CanonicalHost,
 			furthest.key.SuitePath, furthest.stamp, now)
 	}
 	r.reported = furthest

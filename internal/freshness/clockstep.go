@@ -31,7 +31,10 @@ var processStart = time.Now()
 // rulings R-F5, PF-1) and the legacy junk grace (url_path.last_fetched_at,
 // no evidence while in the future; not reported). The reaper and the
 // sweep report the furthest such stamp at their first run after a start
-// and when it changes (design review M-10), not every run. adopted_at
+// and when it changes (design review M-10), not every run, and log it
+// directly (clockStepUnlimited): bounded so already, it never goes through
+// the one-line-a-minute limit, which a check's report could have used up
+// (the Task 16 review's minor 7). adopted_at
 // may legitimately lead the clock since spec C8's monotonic stamp
 // (max(now, prior + 1)); no gate reads it as a past event today, so a
 // check that starts to must allow for that. adoption_next_retry_at is a
@@ -48,6 +51,24 @@ func (c *Checker) clockStep(stamp, scheme, host, suitePath string, stored int64,
 	if !c.lastClockStepLog.CompareAndSwap(last, mono) {
 		return
 	}
+	c.logClockStep(stamp, scheme, host, suitePath, stored, now)
+}
+
+// clockStepUnlimited is clockStep for a caller that bounds its own reports
+// to one per change — the reaper's furthest future last_requested_at and
+// the marker sweep's furthest future last_seen_at (design review M-10):
+// counted in acu_clock_steps_detected_total like every report, and logged
+// directly, neither subject to nor using up the one-line-a-minute limit.
+// Through the limit, a check's report in the same minute would swallow the
+// line, and the reaper, having recorded it as reported, would not repeat
+// it until the stamp changed (the Task 16 review's minor 7).
+func (c *Checker) clockStepUnlimited(stamp, scheme, host, suitePath string, stored int64, now time.Time) {
+	clockStepsTotal.Inc()
+	c.logClockStep(stamp, scheme, host, suitePath, stored, now)
+}
+
+// logClockStep writes one clock_step_detected line.
+func (c *Checker) logClockStep(stamp, scheme, host, suitePath string, stored int64, now time.Time) {
 	c.logger.Warn("clock_step_detected",
 		"stamp", stamp,
 		"canonical_scheme", scheme,

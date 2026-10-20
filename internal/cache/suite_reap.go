@@ -440,6 +440,12 @@ DELETE FROM suite_signed_seen
 // baseSuiteRowsTx returns the host's suite rows at base or at its /. twin,
 // under either scheme, in key order: the rows whose suites share base's
 // signed-seen markers.
+//
+// AIDEV-NOTE: the base-or-twin rule is written twice: here, for /forget's
+// KeptBy, and in orphanSuiteRowSQL (marker_sweep.go), for the orphan
+// sweep. They must agree — a marker /forget keeps for a row must not be an
+// orphan to the sweep, and the reverse — so change them together (phase
+// G's flat paths will touch both).
 func baseSuiteRowsTx(ctx context.Context, tx *sql.Tx, host, base string) ([]SuiteKey, error) {
 	rows, err := tx.QueryContext(ctx, `
 SELECT canonical_scheme, suite_path FROM suite_freshness

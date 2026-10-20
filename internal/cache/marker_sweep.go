@@ -19,7 +19,9 @@ type MarkerSweep struct {
 	Swept int
 	// Furthest is the marker stamped furthest past now (more than
 	// futureStampSlack: a clock step), with that stamp in SeenAt; nil when
-	// none is. The sweep leaves its stamp as it is.
+	// none is. Of markers with the same stamp it is the first in key order
+	// (scheme, host, base), so a caller that reports it once per change
+	// sees the same one every time. The sweep leaves its stamp as it is.
 	Furthest *SignedSeenMark
 }
 
@@ -30,7 +32,10 @@ type MarkerSweep struct {
 // base no suite row of their host has any more — not the base itself, not
 // its "/." twin, under neither scheme — each delete re-checking that, and
 // the stamp, in its transaction. On an error, Swept counts the batches
-// already committed.
+// already committed. now and cutoff are separate on purpose: the reaper
+// passes a fresh now, so markers stamped during its own run are not taken
+// for a clock step, and a cutoff from the start of the run its
+// forward-step guard checked (the Task 9 review's Important 1).
 //
 // AIDEV-NOTE: ruling PF-1 (design review I-1; it overrides R-F5's
 // "healed"): the sweep never rewrites a stamp. A future stamp reads as
@@ -51,7 +56,7 @@ func (c *Cache) SweepOrphanMarkers(ctx context.Context, now, cutoff int64) (Mark
 	err := c.db.QueryRowContext(ctx, `
 SELECT canonical_scheme, canonical_host, base, last_seen_at FROM suite_signed_seen
  WHERE last_seen_at > ?
- ORDER BY last_seen_at DESC LIMIT 1`, now+futureStampSlack).Scan(&m.CanonicalScheme, &m.CanonicalHost, &m.Base, &m.SeenAt)
+ ORDER BY last_seen_at DESC, canonical_scheme, canonical_host, base LIMIT 1`, now+futureStampSlack).Scan(&m.CanonicalScheme, &m.CanonicalHost, &m.Base, &m.SeenAt)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
@@ -81,6 +86,13 @@ SELECT canonical_scheme, canonical_host, base, last_seen_at FROM suite_signed_se
 // orphanSuiteRowSQL is the orphan test, given a marker's host and base
 // (twice: the base and its twin): a suite row of that host, under either
 // scheme, at the base or at the base's "/." twin.
+//
+// AIDEV-NOTE: the base-or-twin rule (either scheme, the base or base +
+// "/.") is written twice: here, for the sweep's orphan test, and in
+// baseSuiteRowsTx (suite_reap.go), for /forget's KeptBy. They must agree —
+// a marker /forget keeps for a row must not be an orphan here, and the
+// reverse — so change them together (phase G's flat paths will touch
+// both).
 const orphanSuiteRowSQL = `
 SELECT 1 FROM suite_freshness sf
  WHERE sf.canonical_scheme IN ('http', 'https') AND sf.canonical_host = %s
@@ -115,22 +127,33 @@ SELECT m.canonical_scheme, m.canonical_host, m.base FROM suite_signed_seen m
 
 // deleteOrphanMarkers deletes keys in one writer transaction, each only if
 // it is still an orphan last seen before cutoff, and returns how many it
-// deleted.
+// deleted. The DELETE's text is built and prepared once per batch, not
+// once per key (the Task 9 review's minor 1): the writer is held for the
+// batch.
+//
+// AIDEV-NOTE: the text stays a literal inside this function, not a
+// package-level var: TestSignedSeenHasKnownDeleteSites names each
+// DELETE FROM suite_signed_seen by the function holding it.
 func (c *Cache) deleteOrphanMarkers(ctx context.Context, keys []SignedSeenMark, cutoff int64) (int, error) {
 	n := 0
+	query := `
+DELETE FROM suite_signed_seen
+ WHERE canonical_scheme = ? AND canonical_host = ? AND base = ? AND last_seen_at < ?
+   AND NOT EXISTS (` + fmt.Sprintf(orphanSuiteRowSQL, "?", "?", "?") + `)`
 	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("SweepOrphanMarkers: begin: %w", err)
 		}
 		defer func() { _ = tx.Rollback() }()
+		stmt, err := tx.PrepareContext(ctx, query)
+		if err != nil {
+			return fmt.Errorf("SweepOrphanMarkers: prepare: %w", err)
+		}
+		defer func() { _ = stmt.Close() }()
 		deleted := 0
 		for _, k := range keys {
-			r, err := tx.ExecContext(ctx, `
-DELETE FROM suite_signed_seen
- WHERE canonical_scheme = ? AND canonical_host = ? AND base = ? AND last_seen_at < ?
-   AND NOT EXISTS (`+fmt.Sprintf(orphanSuiteRowSQL, "?", "?", "?")+`)`,
-				k.CanonicalScheme, k.CanonicalHost, k.Base, cutoff, k.CanonicalHost, k.Base, k.Base)
+			r, err := stmt.ExecContext(ctx, k.CanonicalScheme, k.CanonicalHost, k.Base, cutoff, k.CanonicalHost, k.Base, k.Base)
 			if err != nil {
 				return fmt.Errorf("SweepOrphanMarkers: delete %s://%s%s: %w", k.CanonicalScheme, k.CanonicalHost, k.Base, err)
 			}

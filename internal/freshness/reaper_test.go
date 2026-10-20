@@ -22,6 +22,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // reapNow is the reaper rig's wall clock (the checker's now).
@@ -32,7 +33,11 @@ const (
 
 // reaperRig is a real cache, an adopter whose flip gate is enabled (10 s
 // quiet), a checker at the fixed wall clock reapNow, and a reaper with the
-// default 30-day idle TTL, all logging JSON to logs.
+// default 30-day idle TTL, all logging JSON to logs. The cache's clock
+// (wallclock) is pinned to reapNow too, running on from there, so no rig
+// test depends on the real date (the Task 9 review's Important 2: the
+// cache's stamps — M-9's marker stamp, a creation's — met reapNow's once
+// the real date passed them). No rig test may use t.Parallel.
 type reaperRig struct {
 	t       *testing.T
 	cache   *cache.Cache
@@ -45,6 +50,7 @@ type reaperRig struct {
 
 func newReaperRig(t *testing.T) *reaperRig {
 	t.Helper()
+	pinWallclock(t, reapNow)
 	ad, rc, gate := gatedAdopter(t)
 	logs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -58,6 +64,18 @@ func newReaperRig(t *testing.T) *reaperRig {
 		t.Fatal(err)
 	}
 	return &reaperRig{t: t, cache: rc, adopter: ad, gate: gate, checker: chk, reaper: rp, logs: logs}
+}
+
+// pinWallclock sets the wall clock (wallclock.Now: the cache's clock, and
+// the checker's in production) to the Unix time at for the rest of t, from
+// where it runs on; t must not be parallel. The offset is measured against
+// wallclock.Now itself, so a temporary overlay that shifts wallclock's base
+// (to prove that no test depends on the real date) leaves the pin exact.
+func pinWallclock(t *testing.T, at int64) {
+	t.Helper()
+	restore := wallclock.SetOffsetForTest(0)
+	wallclock.SetOffsetForTest(time.Unix(at, 0).Sub(wallclock.Now()))
+	t.Cleanup(restore)
 }
 
 func reapKey(suite string) cache.SuiteKey {
@@ -181,6 +199,10 @@ func TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem(t *testing.T) {
 		}
 		snap := r.adopt("/r/dists/idle", "idle anchor")
 		idle0, nonCanonical0 := reapedTotal(t, "idle"), reapedTotal(t, "non_canonical")
+		// One wall clock for the checker and the cache, as in production:
+		// the sleep below moves both, so the reap's marker stamp (M-9) is
+		// no future stamp to the run's sweep.
+		r.checker.now = wallclock.Now
 		time.Sleep(r.gate.Quiet()) // the seeded serves are a quiet period old: their gate entries are idle
 		r.reaper.runOnce(context.Background())
 		for s := range reaped {

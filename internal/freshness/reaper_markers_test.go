@@ -2,6 +2,7 @@ package freshness
 
 import (
 	"context"
+	"maps"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // markerAt returns base's marker stamp on host h over http, or -1.
@@ -37,39 +39,113 @@ func (r *reaperRig) mark(base string, at int64) {
 // ago, while a reaped suite's marker survives the reap. A marker stamped
 // in the future reads as now: it is kept as it is — never rewritten
 // (ruling PF-1) — and reported as clock_step_detected (stamp
-// last_seen_at). The sweep runs with gc.suite_idle_ttl = 0s too.
+// last_seen_at). The sweep runs with gc.suite_idle_ttl = 0s too. Inside
+// a synctest bubble the rig's pinned clock stands still, so the reap's
+// stamp is exactly reapNow.
 func TestReaper_SweepsOrphanMarkersAndKeepsFutureStamps(t *testing.T) {
-	ctx := context.Background()
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		r := newReaperRig(t)
+		r.seed("/idle/dists/s", reapNow-31*reapDay)
+		r.mark("/idle/dists/s", reapNow-31*reapDay)
+		r.mark("/gone/dists/s", reapNow-366*reapDay)
+		r.mark("/ahead/dists/s", reapNow+30*reapDay)
+		r.reaper.runOnce(ctx)
+		// The reap stamps the base's markers MAX(last_seen_at, the cache's
+		// clock) (design review M-9, ruling PF-10): kept, moved up to the
+		// reap, never lowered.
+		if r.exists("/idle/dists/s") || r.markerAt("/idle/dists/s") != reapNow {
+			t.Fatalf("idle suite exists %v, its marker %d; want the suite reaped and its marker moved up to %d",
+				r.exists("/idle/dists/s"), r.markerAt("/idle/dists/s"), reapNow)
+		}
+		if r.markerAt("/gone/dists/s") != -1 || r.markerAt("/ahead/dists/s") != reapNow+30*reapDay {
+			t.Fatalf("year-old orphan %d, future marker %d; want the orphan swept and the future stamp kept as it was (%d)",
+				r.markerAt("/gone/dists/s"), r.markerAt("/ahead/dists/s"), reapNow+30*reapDay)
+		}
+		if ev := r.events("signed_seen_markers_swept"); len(ev) != 1 || ev[0]["count"] != float64(1) {
+			t.Fatalf("signed_seen_markers_swept lines %v, want one with count 1", ev)
+		}
+		steps := r.events("clock_step_detected")
+		if len(steps) != 1 || steps[0]["stamp"] != "last_seen_at" || steps[0]["suite_path"] != "/ahead/dists/s" ||
+			steps[0]["stored_unixtime"] != float64(reapNow+30*reapDay) {
+			t.Fatalf("clock_step_detected lines %v, want one for the future marker", steps)
+		}
+		r.reaper.idleTTL = 0
+		r.mark("/old/dists/s", reapNow-400*reapDay)
+		r.reaper.dailyAt = time.Time{} // the next day's run: the sweep is daily
+		r.reaper.runOnce(ctx)
+		if r.markerAt("/old/dists/s") != -1 {
+			t.Fatal("gc.suite_idle_ttl = 0s stopped the marker sweep")
+		}
+	})
+}
+
+// clockStepsCounted returns acu_clock_steps_detected_total.
+func clockStepsCounted() float64 {
+	v, _ := strconv.ParseFloat(renderedMetric("acu_clock_steps_detected_total"), 64)
+	return v
+}
+
+// The Task 9 review's Important 1: the sweep's future threshold is a fresh
+// clock read, while its cutoff keeps the run's now. With the checker and
+// the cache on one wall clock, as in production, a reap that takes 5 s
+// stamps its base's marker 5 s after the run's start (M-9): the daily sweep
+// that follows in the same run reports no clock step for it, and the
+// counter does not move. A 10-day forward step during a run does not move
+// the run's cutoff: an orphan 360 days old is not swept by that run (a
+// fresh cutoff would sweep it, bypassing the forward-step guard, design
+// review M-8).
+func TestReaper_MarkersStampedDuringTheRunAreNoClockStep(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		step int64
+	}{{"a 5 s reap", 5}, {"a 10-day step during the run", 10 * reapDay}} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := newReaperRig(t)
+				r.checker.now = wallclock.Now // one wall clock, as in production
+				r.seed("/idle/dists/s", reapNow-31*reapDay)
+				r.mark("/idle/dists/s", reapNow-31*reapDay)
+				r.mark("/orphan/dists/s", reapNow-360*reapDay)
+				r.reaper.reapHook = func(context.Context, cache.SuiteKey) { pinWallclock(t, reapNow+tc.step) }
+				before := clockStepsCounted()
+				r.reaper.runOnce(context.Background())
+				if r.exists("/idle/dists/s") || r.markerAt("/idle/dists/s") != reapNow+tc.step {
+					t.Fatalf("idle suite exists %v, its marker %d; want it reaped, its marker stamped at the reap (%d)",
+						r.exists("/idle/dists/s"), r.markerAt("/idle/dists/s"), reapNow+tc.step)
+				}
+				if steps := r.events("clock_step_detected"); len(steps) != 0 || clockStepsCounted() != before {
+					t.Fatalf("clock_step_detected lines %v, counter moved by %v; want none: the run stamped that marker",
+						steps, clockStepsCounted()-before)
+				}
+				if r.markerAt("/orphan/dists/s") == -1 {
+					t.Fatal("an orphan 360 days old at the run's start was swept: the cutoff moved with the clock")
+				}
+			})
+		})
+	}
+}
+
+// The Task 16 review's minor 7: the reaper's two clock-step reports — the
+// furthest future last_requested_at and the furthest future marker — are
+// bounded to one per change already (design review M-10), so they are
+// logged directly: a check's report in the same minute, which takes the
+// checker's one line a minute, does not swallow them. All three count.
+func TestReaper_ClockStepReportsBypassTheRateLimit(t *testing.T) {
 	r := newReaperRig(t)
-	r.seed("/idle/dists/s", reapNow-31*reapDay)
-	r.mark("/idle/dists/s", reapNow-31*reapDay)
-	r.mark("/gone/dists/s", reapNow-366*reapDay)
-	r.mark("/ahead/dists/s", reapNow+30*reapDay)
-	r.reaper.runOnce(ctx)
-	// The reap stamps the base's markers MAX(last_seen_at, the cache's
-	// clock) (design review M-9): kept, and never lowered.
-	if r.exists("/idle/dists/s") || r.markerAt("/idle/dists/s") < reapNow-31*reapDay {
-		t.Fatalf("idle suite exists %v, its marker %d; want the suite reaped and its marker kept (at least %d)",
-			r.exists("/idle/dists/s"), r.markerAt("/idle/dists/s"), reapNow-31*reapDay)
+	r.seed("/ahead/dists/s", reapNow+30*reapDay)
+	r.mark("/marked/dists/s", reapNow+40*reapDay)
+	before := clockStepsCounted()
+	r.checker.clockStep("last_check_at", "http", "h", "/checked/dists/s", reapNow+reapDay, time.Unix(reapNow, 0))
+	r.reaper.runOnce(context.Background())
+	got := map[string]string{}
+	for _, ev := range r.events("clock_step_detected") {
+		got[ev["stamp"].(string)], _ = ev["suite_path"].(string)
 	}
-	if r.markerAt("/gone/dists/s") != -1 || r.markerAt("/ahead/dists/s") != reapNow+30*reapDay {
-		t.Fatalf("year-old orphan %d, future marker %d; want the orphan swept and the future stamp kept as it was (%d)",
-			r.markerAt("/gone/dists/s"), r.markerAt("/ahead/dists/s"), reapNow+30*reapDay)
-	}
-	if ev := r.events("signed_seen_markers_swept"); len(ev) != 1 || ev[0]["count"] != float64(1) {
-		t.Fatalf("signed_seen_markers_swept lines %v, want one with count 1", ev)
-	}
-	steps := r.events("clock_step_detected")
-	if len(steps) != 1 || steps[0]["stamp"] != "last_seen_at" || steps[0]["suite_path"] != "/ahead/dists/s" ||
-		steps[0]["stored_unixtime"] != float64(reapNow+30*reapDay) {
-		t.Fatalf("clock_step_detected lines %v, want one for the future marker", steps)
-	}
-	r.reaper.idleTTL = 0
-	r.mark("/old/dists/s", reapNow-400*reapDay)
-	r.reaper.dailyAt = time.Time{} // the next day's run: the sweep is daily
-	r.reaper.runOnce(ctx)
-	if r.markerAt("/old/dists/s") != -1 {
-		t.Fatal("gc.suite_idle_ttl = 0s stopped the marker sweep")
+	want := map[string]string{"last_check_at": "/checked/dists/s", "last_requested_at": "/ahead/dists/s",
+		"last_seen_at": "/marked/dists/s"}
+	if !maps.Equal(got, want) || clockStepsCounted()-before != 3 {
+		t.Fatalf("clock_step_detected lines %v, counted %v; want %v, 3", got, clockStepsCounted()-before, want)
 	}
 }
 
@@ -121,10 +197,7 @@ func TestReaper_DailyDutiesRunAtStartAndADayApart(t *testing.T) {
 func TestReaper_ReportsAFutureMarkerOnlyWhenItChanges(t *testing.T) {
 	ctx := context.Background()
 	r := newReaperRig(t)
-	reports := func() float64 {
-		v, _ := strconv.ParseFloat(renderedMetric("acu_clock_steps_detected_total"), 64)
-		return v
-	}
+	reports := clockStepsCounted
 	r.mark("/ahead/dists/s", reapNow+30*reapDay)
 	before := reports()
 	for range 3 {
