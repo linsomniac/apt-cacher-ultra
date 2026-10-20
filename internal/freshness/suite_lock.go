@@ -82,14 +82,23 @@ func (c *Checker) unlockDropped(key string, mu *sync.Mutex) {
 // eviction, the reaper, POST /forget) — and when lockSuite's re-validation
 // finds the loaded mutex stale (another holder deleted the suite in the
 // window; deferred minor D-25). release(true) — the suite's row was
-// deleted while held — purges its flip-gate entry, then drops its lock-map
-// entry and unlocks (unlockDropped); release(false) only unlocks. Spec C3
-// cap eviction, the reaper and POST /forget use it (ruling R-F1).
+// deleted while held — purges its flip-gate entry if it is idle (ruling
+// R-F2, flipgate.Gate.Purge: a live entry — a flip in progress, an anchor
+// serve in flight, or any use within the quiet period — is kept, and
+// expires on its own), then drops its lock-map entry and the checker's
+// per-suite state and unlocks (unlockDropped); release(false) only
+// unlocks. Spec C3 cap eviction, the reaper and POST /forget use it
+// (ruling R-F1).
 //
-// AIDEV-NOTE: both entries are dropped while the mutex is still held, so a
-// check that loaded this mutex earlier fails lockSuite's post-TryLock
-// re-validation (the map no longer holds it) instead of running beside a
-// check of a re-created suite.
+// AIDEV-NOTE: the lock-map entry is dropped while the mutex is still held
+// (the flip-gate purge runs under it too), so a check that loaded this
+// mutex earlier fails lockSuite's post-TryLock re-validation (the map no
+// longer holds it) instead of running beside a check of a re-created
+// suite. The flip-gate entry is not always gone after release(true): a
+// live one is kept (ruling R-F2), since a re-creation of the suite may
+// already have registered a serve on it
+// (TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry); it expires
+// once idle for twice the quiet period.
 func (c *Checker) HoldSuite(key cache.SuiteKey) (func(deleted bool), bool) {
 	k := suiteKey(key.CanonicalScheme, key.CanonicalHost, key.SuitePath)
 	mu, st := c.lockSuite(k)

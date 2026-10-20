@@ -38,7 +38,9 @@ func drainTick(ctx context.Context, c *Checker) {
 // http://<host><suite>/InRelease. Its client interest (spec C4) is
 // lastSuccess, or — nil — the real wall clock's now: a checker whose now
 // is more than the 7-day interest window from it sees the suite dormant,
-// so such a test passes lastSuccess (deferred minor E-49).
+// so such a test passes lastSuccess (deferred minor E-49) — which also
+// stamps LastSuccessAt and LastCheckAt — or, for a suite never checked,
+// seeds its row with fc.putSuite instead.
 func seedFakeSuite(fc *fakeCache, host, suite string, lastSuccess *int64) {
 	bh := testHex64
 	fc.putURL(cache.URLPath{CanonicalScheme: "http", CanonicalHost: host, Path: suite + "/InRelease",
