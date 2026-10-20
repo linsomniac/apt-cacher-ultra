@@ -161,7 +161,7 @@ type Gate struct {
 
 	mu        sync.Mutex
 	entries   map[string]*entry
-	changed   chan struct{} // closed on every change a flip may wait for; nil while no flip waits
+	changed   chan struct{} // closed on every change a flip may wait for; nil until a flip asks for it after a broadcast
 	holder    *hold         // the hold in progress, nil if none
 	queue     []*tokenWaiter
 	lastEnd   time.Time // when the most recent hold that held requests ended (zero: none yet)
@@ -268,9 +268,21 @@ func (g *Gate) Len() int {
 	return len(g.entries)
 }
 
-// Purge drops key's entry unless a flip of it is in progress, and reports
-// whether it did. Spec C8: entries are purged when their suite is reaped
-// (phase F). Tokens of a dropped entry stay valid and touch only it.
+// Purge drops key's entry when it is idle, and reports whether it did.
+// Spec C8: an entry is purged when its suite's row is deleted — reaped,
+// evicted or forgotten (the checker's HoldSuite release(true)). A live
+// entry is kept: a flip of it in progress, an anchor serve of it in
+// flight, or one that completed within the quiet period. It expires on
+// its own once idle for twice the quiet period (sweepLocked).
+//
+// AIDEV-NOTE: ruling R-F2 (phase D final review, concurrency M4). The
+// deleter's release(true) runs after its commit, so a re-creation of the
+// suite can register a serve before it; dropping that entry would let the
+// re-created suite's next flip skip the serve's quiet period — its client
+// could fetch the new snapshot's indexes for the old anchor. Purging a
+// live entry was never needed: a dropped entry's tokens touch only it, and
+// an idle one goes with the sweep (TestGate_PurgeSkipsLiveEntries,
+// TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry).
 func (g *Gate) Purge(key string) bool {
 	if g == nil {
 		return false
@@ -278,11 +290,18 @@ func (g *Gate) Purge(key string) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	e := g.entries[key]
-	if e == nil || e.flips > 0 {
+	if e == nil || e.liveLocked(time.Now(), g.quiet) {
 		return false
 	}
 	delete(g.entries, key)
 	return true
+}
+
+// liveLocked reports whether a flip of e is in progress or holds, an
+// anchor serve of it is in flight, or one completed within quiet.
+func (e *entry) liveLocked(now time.Time, quiet time.Duration) bool {
+	return e.flips > 0 || e.hold != nil || len(e.inflight) > 0 ||
+		(!e.lastDone.IsZero() && now.Sub(e.lastDone) < quiet)
 }
 
 // Close ends the barrier at shutdown; main calls it at the signal, before
@@ -762,8 +781,11 @@ func (g *Gate) endHoldLocked(h *hold, expired bool) bool {
 }
 
 // changedLocked returns the channel the next change closes, creating it on
-// demand: only a flip about to wait asks for it, so a change no flip waits
-// for (most anchor completions) allocates nothing.
+// demand. Only a flip asks for it, at each pass of its wait loop, before it
+// knows whether it will wait (deferred minor C-2: a flip that then commits
+// at once leaves the channel allocated until the next broadcast — one
+// channel, harmless); a change while no flip has asked since the last
+// broadcast allocates nothing.
 func (g *Gate) changedLocked() <-chan struct{} {
 	if g.changed == nil {
 		g.changed = make(chan struct{})
@@ -771,6 +793,18 @@ func (g *Gate) changedLocked() <-chan struct{} {
 	return g.changed
 }
 
+// broadcastLocked wakes every waiting flip: each re-locks the gate and
+// re-checks its own conditions.
+//
+// AIDEV-NOTE: one global channel for every suite (deferred minor C-3,
+// closed in phase F): every anchor completion in the cache, of any suite,
+// wakes every waiting flip, which re-scans its own suite's in-flight map
+// and asks for a new channel and timer. The cost is bounded by the flips
+// waiting at once — one or two under the default pool, since a flip keeps
+// its global adoption slot through the barrier (ruling R-C1) — for at most
+// the barrier's 140 s. Per-entry wake channels would remove it but change
+// the wake mechanism every barrier guarantee rests on, for no measured
+// gain; revisit if max_concurrent_adoptions grows large.
 func (g *Gate) broadcastLocked() {
 	if g.changed != nil {
 		close(g.changed)

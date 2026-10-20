@@ -10,11 +10,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 var lockRef = SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}
@@ -51,12 +53,17 @@ func lockChecker(t *testing.T, c Cache, f Fetcher, ad *Adopter) *Checker {
 
 // R-D1: HoldSuite takes a free suite's mutex without waiting and refuses a
 // busy one; release(false) only unlocks, release(true) also drops the
-// suite's lock-map and flip-gate entries (once).
+// suite's lock-map and flip-gate entries (once) — the gate entry once its
+// last serve is a quiet period old (ruling R-F2), hence the bubble.
 func TestHoldSuite_TakesOnlyAFreeSuiteAndPurgesOnDelete(t *testing.T) {
+	synctest.Test(t, testHoldSuiteTakesOnlyAFreeSuiteAndPurgesOnDelete)
+}
+
+func testHoldSuiteTakesOnlyAFreeSuiteAndPurgesOnDelete(t *testing.T) {
 	ad, _, gate := gatedAdopter(t)
 	fc := newFakeCache()
 	fc.track("http", "h", "/r/dists/x")
-	c := lockChecker(t, fc, newTestFetcher(t), ad)
+	c := lockChecker(t, fc, &simtest.StaticConditional{Status: 304}, ad)
 	ctx := context.Background()
 	gate.AnchorStart(ctx, flipgate.Key("http", "h", "/r/dists/x")).Done()
 	release, ok := c.HoldSuite(lockKey)
@@ -77,11 +84,43 @@ func TestHoldSuite_TakesOnlyAFreeSuiteAndPurgesOnDelete(t *testing.T) {
 	if !ok {
 		t.Fatal("a released suite was not held again")
 	}
+	time.Sleep(gate.Quiet()) // the serve's quiet period is over: the entry is idle
 	release(true)
 	release(true) // idempotent
 	if c.LockCount() != 0 || gate.Len() != 0 {
 		t.Fatalf("after release(true): %d lock entries, %d gate entries; want 0 and 0", c.LockCount(), gate.Len())
 	}
+}
+
+// Ruling R-F2: a deleter's release(true) runs after its commit, so a
+// re-creation of the suite can register an anchor serve first. That
+// serve's flip-gate entry is live and survives the purge: the re-created
+// suite's next flip still waits out the serve's quiet period. The
+// deleter's lock-map entry goes.
+func TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ad, _, gate := gatedAdopter(t)
+		c := lockChecker(t, newFakeCache(), &simtest.StaticConditional{Status: 304}, ad)
+		release, ok := c.HoldSuite(lockKey) // the deleter holds the suite
+		if !ok {
+			t.Fatal("a free suite was not held")
+		}
+		gk := flipgate.Key(lockKey.CanonicalScheme, lockKey.CanonicalHost, lockKey.SuitePath)
+		tok := gate.AnchorStart(context.Background(), gk) // the re-created suite's serve
+		release(true)                                     // the deleter's purge, after its commit
+		if gate.Len() != 1 || c.LockCount() != 0 {
+			t.Fatalf("after release(true): %d gate entries, %d lock entries; want the live gate entry kept, the lock entry dropped",
+				gate.Len(), c.LockCount())
+		}
+		tok.Done()
+		start := time.Now()
+		if _, err := gate.Flip(context.Background(), gk, func() error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if waited := time.Since(start); waited != gate.Quiet() {
+			t.Fatalf("the re-created suite's flip waited %v, want the serve's quiet period (%v)", waited, gate.Quiet())
+		}
+	})
 }
 
 // Spec C3 I-4: a check re-validates after TryLock that the lock map still
@@ -168,10 +207,16 @@ func TestReconcile_RevalidatesUnderTheMutex(t *testing.T) {
 }
 
 // R-D1 end to end: cap eviction with the checker as the guard skips a busy
-// suite and purges an evicted suite's lock-map and flip-gate entries.
+// suite and purges an evicted suite's lock-map and flip-gate entries (the
+// gate entry once its last serve is a quiet period old, ruling R-F2; hence
+// the bubble).
 func TestCreateSuite_EvictionUnderTheChecker(t *testing.T) {
+	synctest.Test(t, testCreateSuiteEvictionUnderTheChecker)
+}
+
+func testCreateSuiteEvictionUnderTheChecker(t *testing.T) {
 	ad, rc, gate := gatedAdopter(t)
-	c := lockChecker(t, rc, newTestFetcher(t), ad)
+	c := lockChecker(t, rc, &simtest.StaticConditional{Status: 304}, ad)
 	ctx := context.Background()
 	k := func(s string) cache.SuiteKey {
 		return cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: s}
@@ -187,6 +232,7 @@ func TestCreateSuite_EvictionUnderTheChecker(t *testing.T) {
 		t.Fatal("HoldSuite(/a)")
 	}
 	gate.AnchorStart(ctx, flipgate.Key("http", "h", "/b")).Done()
+	time.Sleep(gate.Quiet()) // /b's serve is a quiet period old: its entry is idle
 	res, err := rc.CreateSuite(ctx, cache.SuiteSeed{SuiteKey: k("/c"), RequestedAt: time.Now().Unix()}, cache.SuiteCaps{Global: 2}, c)
 	if err != nil || res.Outcome != cache.SuiteCreated || res.Evicted == nil || *res.Evicted != k("/b") {
 		t.Fatalf("CreateSuite = %+v, %v; want created, evicting /b (/a is busy)", res, err)

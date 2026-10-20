@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
@@ -59,12 +60,18 @@ func (mintedUpstream) Fetch(_ context.Context, target *fetch.Target, dst fetch.F
 // holds exactly one entry per surviving row, so an evicted suite left all
 // three. The rejection cache holds the refused suites only. The gate is
 // the adopter's, so eviction purges the gate the handler registers on, as
-// in production (design note 21).
+// in production (design note 21). A bubble, so the evictees' serves can be
+// a quiet period old: the purge keeps a live entry (ruling R-F2).
 func TestServeHTTP_MintedSuitesAtScale(t *testing.T) {
+	synctest.Test(t, testMintedSuitesAtScale)
+}
+
+func testMintedSuitesAtScale(t *testing.T) {
 	c := simtest.OpenCache(t)
 	ctx := context.Background()
-	// The gate sweeps an entry idle for twice its quiet period; with the
-	// longest one (30 s) none is swept during the test, so its count is exact.
+	// The gate sweeps an entry idle for twice its quiet period (30 s at
+	// the longest quiet period, 15 s; deferred minor D-39); no entry is
+	// that idle when the counts are read, so they are exact.
 	gate, err := flipgate.New(flipgate.Config{Quiet: flipgate.MaxQuiet})
 	if err != nil {
 		t.Fatal(err)
@@ -114,6 +121,10 @@ func TestServeHTTP_MintedSuitesAtScale(t *testing.T) {
 		get(idle, base+"/InRelease")
 	}
 	idle.Close() // drains their T1 checks
+	// Ruling R-F2: an evictee's gate entry is purged only once its last
+	// serve is a quiet period old (a live entry expires on its own); twice
+	// that would let the sweep drop it first.
+	time.Sleep(flipgate.MaxQuiet)
 	db := sqliteFile(t, filepath.Join(c.Dir(), "cache.db"))
 	if _, err := db.Exec(`UPDATE suite_freshness SET last_requested_at = ? WHERE canonical_host = 'idle.example'`,
 		time.Now().Add(-48*time.Hour).Unix()); err != nil {

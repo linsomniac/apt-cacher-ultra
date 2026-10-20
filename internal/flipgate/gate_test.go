@@ -147,6 +147,11 @@ func TestDisabledGate_IsTodaysBehaviour(t *testing.T) {
 			if g.Len() != 0 {
 				t.Fatalf("%s: %d entries, want 0", name, g.Len())
 			}
+			g.Close() // ignored, and idempotent (deferred minor C-1)
+			g.Close()
+			if g.Closed() {
+				t.Fatalf("%s: Closed after Close, want a disabled gate never closed", name)
+			}
 		}
 	})
 }
@@ -532,8 +537,8 @@ func TestFlip_PhaseAWaitsOutAnotherSuitesHold(t *testing.T) {
 			t.Fatal(err)
 		}
 		a := <-outA
-		if resB.HoldStart.Before(a.res.HoldEnd.Add(testQuiet)) {
-			t.Errorf("b's hold started %v after a's ended, want at least the quiet period",
+		if !resB.HoldStart.Equal(a.res.HoldEnd.Add(testQuiet)) {
+			t.Errorf("b's hold started %v after a's ended, want exactly the quiet period (deferred minor C-4)",
 				resB.HoldStart.Sub(a.res.HoldEnd))
 		}
 		if d := resB.HoldEnd.Sub(resB.HoldStart); d != 0 {
@@ -890,14 +895,27 @@ func TestGate_IdleEntriesExpire(t *testing.T) {
 	})
 }
 
-// Purge drops an idle entry (phase F's reaper calls it); a token of the
-// dropped instance stays harmless, and a flip in progress keeps its entry.
-func TestGate_PurgeKeepsOldTokensHarmless(t *testing.T) {
+// Ruling R-F2: Purge drops an idle entry (a deleter's release(true): the
+// reaper, cap eviction, POST /forget) but never a live one — a serve in
+// flight, a serve that completed within the quiet period (a flip of a
+// re-created suite must still wait it out), or a flip in progress. A live
+// entry expires on its own; a token of a dropped entry stays harmless.
+func TestGate_PurgeSkipsLiveEntries(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := newTestGate(t)
 		old := g.AnchorStart(bg, "k")
+		if g.Purge("k") || g.Len() != 1 {
+			t.Fatalf("purged an entry with a serve in flight (%d left)", g.Len())
+		}
+		old.Done()
+		time.Sleep(testQuiet - time.Second)
+		if g.Purge("k") || g.Len() != 1 {
+			t.Fatalf("purged an entry whose serve completed %v ago, within the quiet period (%d left)",
+				testQuiet-time.Second, g.Len())
+		}
+		time.Sleep(time.Second)
 		if !g.Purge("k") || g.Len() != 0 {
-			t.Fatalf("Purge did not drop the entry (%d left)", g.Len())
+			t.Fatalf("Purge kept an idle entry (%d left)", g.Len())
 		}
 		old.Done()
 		if g.Len() != 0 {
@@ -916,6 +934,31 @@ func TestGate_PurgeKeepsOldTokensHarmless(t *testing.T) {
 		close(release)
 		if o := <-out; o.err != nil {
 			t.Fatal(o.err)
+		}
+	})
+}
+
+// Ruling R-F2: a flip still in phase A — waiting out another suite's hold,
+// with nothing of its own in flight, no completion and no hold yet — keeps
+// its entry on Purge: only its flip count says it is live
+// (TestGate_PurgeSkipsLiveEntries's flip already holds, which the hold
+// clause alone keeps).
+func TestGate_PurgeKeepsTheEntryOfAFlipInPhaseA(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		release := make(chan struct{})
+		outA := flipAsync(bg, g, "a", func() error { <-release; return nil }) // idle: holds at once
+		synctest.Wait()
+		outB := flipAsync(bg, g, "b", noCommit) // phase A (b): waits for a's hold to end
+		synctest.Wait()
+		if g.Purge("b") {
+			t.Error("purged the entry of a flip waiting in phase A") // not Fatal: the flips must still drain
+		}
+		close(release)
+		for _, out := range []<-chan flipOut{outA, outB} {
+			if o := <-out; o.err != nil {
+				t.Fatal(o.err)
+			}
 		}
 	})
 }
@@ -1130,6 +1173,7 @@ func TestGate_CloseAbortsEveryFlipNotYetCommitting(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 		closedAt := time.Now()
 		g.Close()
+		g.Close() // idempotent (deferred minor C-1): a second close(closedCh) would panic
 		for name, ch := range map[string]<-chan flipOut{"queued for the token": queued, "in phase A": inPhaseA} {
 			o := <-ch
 			if !errors.Is(o.err, ErrAborted) || !errors.Is(o.err, ErrClosed) || o.res.Committed || !o.at.Equal(closedAt) {
@@ -1149,6 +1193,26 @@ func TestGate_CloseAbortsEveryFlipNotYetCommitting(t *testing.T) {
 		}
 		if st := g.Stats(); st.Holds != 1 || st.Aborted != 3 {
 			t.Fatalf("stats = %+v, want one hold (none started after Close) and three aborted flips", st)
+		}
+	})
+}
+
+// Deferred minor C-1: Close wakes a flip that waits only in phase A — with
+// no hold in progress endHoldLocked does not broadcast, so Close's own
+// broadcast must — and the flip returns ErrAborted wrapping ErrClosed at
+// once, not when its wait would have ended (30 s for the serve in flight).
+func TestGate_CloseWakesAFlipWaitingOnlyInPhaseA(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		busy := g.AnchorStart(bg, "a") // in flight: phase A waits for it
+		defer busy.Done()
+		out := flipAsync(bg, g, "a", func() error { t.Error("committed after Close"); return nil })
+		time.Sleep(time.Second)
+		closedAt := time.Now()
+		g.Close()
+		o := <-out
+		if !errors.Is(o.err, ErrAborted) || !errors.Is(o.err, ErrClosed) || o.res.Committed || !o.at.Equal(closedAt) {
+			t.Fatalf("flip: %+v, %v, %v after Close; want ErrAborted wrapping ErrClosed at once", o.res, o.err, o.at.Sub(closedAt))
 		}
 	})
 }

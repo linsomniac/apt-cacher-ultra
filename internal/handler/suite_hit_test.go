@@ -265,8 +265,14 @@ func (f drainedT1) Check(ctx context.Context, scheme, host, suitePath string) {
 // R-D1 on the hit path: an onboarding at the global cap evicts under the
 // checker's guard, as a miss does, so the evictee's lock-map and flip-gate
 // entries leave with its row. Production wiring, as in the scale test: the
-// adopter's gate, the checker as the guard (design note 21).
+// adopter's gate, the checker as the guard (design note 21). A bubble, so
+// the evictee's serves can be a quiet period old: the purge keeps a live
+// entry (ruling R-F2).
 func TestServeHTTP_OnboardingAtTheGlobalCapEvictsUnderTheGuard(t *testing.T) {
+	synctest.Test(t, testOnboardingAtTheGlobalCapEvictsUnderTheGuard)
+}
+
+func testOnboardingAtTheGlobalCapEvictsUnderTheGuard(t *testing.T) {
 	c := simtest.OpenCache(t)
 	gate, err := flipgate.New(flipgate.Config{Quiet: flipgate.MaxQuiet}) // no entry is swept during the test
 	if err != nil {
@@ -314,6 +320,10 @@ func TestServeHTTP_OnboardingAtTheGlobalCapEvictsUnderTheGuard(t *testing.T) {
 		get(first, base+"/InRelease")
 	}
 	first.Close() // drains their T1 checks
+	// Ruling R-F2: the evictee's entry is purged only once its last serve
+	// is a quiet period old (a live entry expires on its own); twice that
+	// would let the sweep drop it first.
+	time.Sleep(flipgate.MaxQuiet)
 	db := sqliteFile(t, filepath.Join(c.Dir(), "cache.db"))
 	if _, err := db.Exec(`UPDATE suite_freshness SET last_requested_at = ? WHERE canonical_host = 'h3.example'`,
 		time.Now().Add(-48*time.Hour).Unix()); err != nil {
