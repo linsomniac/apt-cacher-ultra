@@ -44,6 +44,33 @@ func (f *fakeAdoptions) WaitHostAdoptions(_ context.Context, _ string, start tim
 	return f.ok
 }
 
+// heldSlots is holdHostSlotsUntilJoined's hold: call is the singleflight
+// call whose joiner released it (set before the slots come back).
+type heldSlots struct {
+	mu   sync.Mutex
+	call *sfCall
+}
+
+// waitGone waits until the joined call has left h's singleflight map (its
+// leader deletes it just after waking its joiners), bounded so a
+// regression fails instead of hanging.
+func (s *heldSlots) waitGone(h *Handler) {
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		s.mu.Lock()
+		c := s.call
+		s.mu.Unlock()
+		h.sf.mu.Lock()
+		mapped := false
+		for _, m := range h.sf.calls {
+			mapped = mapped || m == c
+		}
+		h.sf.mu.Unlock()
+		if c != nil && !mapped {
+			return
+		}
+	}
+}
+
 // holdHostSlotsUntilJoined takes every host-limiter slot of host, so a
 // miss's runFetch waits at its slot and concurrent misses of one path
 // coalesce in singleflight (strict mode refuses before any upstream
@@ -52,8 +79,9 @@ func (f *fakeAdoptions) WaitHostAdoptions(_ context.Context, _ string, start tim
 // the call's leader waits at its host slot until the second request has
 // joined it — no wall-clock window to race (final fix wave FW-4 (d); the
 // 300 ms window failed under load) — and both requests are at least delay
-// old when the slots come back.
-func holdHostSlotsUntilJoined(t *testing.T, h *Handler, host string, delay time.Duration) {
+// old when the slots come back. The hold also ends with the test (and
+// after 30 s), so a hold no request joins never outlives it.
+func holdHostSlotsUntilJoined(t *testing.T, h *Handler, host string, delay time.Duration) *heldSlots {
 	t.Helper()
 	var rels []func()
 	for range 4 { // the strict rig's hostsem.New(4)
@@ -69,27 +97,43 @@ func holdHostSlotsUntilJoined(t *testing.T, h *Handler, host string, delay time.
 		before[c] = true
 	}
 	h.sf.mu.Unlock()
+	held := &heldSlots{}
 	joined := func() bool {
 		h.sf.mu.Lock()
 		defer h.sf.mu.Unlock()
 		for _, c := range h.sf.calls {
 			if !before[c] && c.waiters > 0 {
+				held.mu.Lock()
+				held.call = c
+				held.mu.Unlock()
 				return true
 			}
 		}
 		return false
 	}
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
 	go func() {
+		defer func() {
+			for _, rel := range rels {
+				rel()
+			}
+		}()
 		// Bounded, so a regression that never coalesces fails the
 		// assertions below instead of hanging at the held slot.
 		for deadline := time.Now().Add(30 * time.Second); !joined() && time.Now().Before(deadline); {
-			time.Sleep(time.Millisecond)
+			select {
+			case <-done:
+				return
+			case <-time.After(time.Millisecond):
+			}
 		}
-		time.Sleep(delay)
-		for _, rel := range rels {
-			rel()
+		select {
+		case <-done:
+		case <-time.After(delay):
 		}
 	}()
+	return held
 }
 
 // commitVouching adopts a complete-coverage inline snapshot of suite whose
@@ -220,9 +264,19 @@ func TestServeHTTP_StrictWaitRefusals(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h, logs, srvURL, _, canon := strictWaitRig(t, tc.a)
 			const delay = 300 * time.Millisecond
-			holdHostSlotsUntilJoined(t, h, canon, delay) // the first call's leader waits until the second request joins it
+			first := holdHostSlotsUntilJoined(t, h, canon, delay) // the first call's leader waits until the second request joins it
 			var once sync.Once
-			tc.a.during = func() { once.Do(func() { holdHostSlotsUntilJoined(t, h, canon, delay) }) } // so does the retry's
+			tc.a.during = func() {
+				// Each request's retry starts only once the first call has
+				// left the singleflight map: a retry that still finds the
+				// finished call mapped joins it and gets its stale result
+				// (E-deferred E-57), which under load left the retry
+				// uncoalesced and this test's setup to scheduling.
+				first.waitGone(h)
+				if tc.a.ok { // the requests retry: so does the retry's leader wait for its joiner
+					once.Do(func() { holdHostSlotsUntilJoined(t, h, canon, delay) })
+				}
+			}
 			var wg sync.WaitGroup
 			for range 2 {
 				wg.Add(1)
