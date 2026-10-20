@@ -329,13 +329,15 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 // ("refused: unsigned_disabled") and paces the suite — a never-adopted one
 // by PE-3 (pacedFirst), an established unsigned one by pacedByRefusal and
 // suiteDue — so checks inside its window ask upstream nothing. The
-// established suite keeps serving its last snapshot and is never updated
-// unsigned; returning it to the ordinary cache, as configuration.md's
-// "served from the ordinary cache, unadopted" promises, is phase F's
-// (retire the snapshot through the reaper's retirement path; overview F
-// carry-forward). Before PE-12 the knob off failed every check, with no
-// record: an established suite froze unpaced and invisible (final reviews
-// E1, E2).
+// established suite keeps serving its last snapshot, coherent and never
+// updated unsigned, until the knob is turned back on, the suite is
+// forgotten (POST /forget) or it is reaped as idle: ruling PF-5 dropped
+// the retirement PE-12 left to phase F — returned to the ordinary cache,
+// each index file would be frozen at its own first fetch, and every
+// upstream publish would bring Hash Sum mismatches that never clear
+// (TestServeHTTP_KnobOffKeepsServingTheUnsignedSnapshot). Before PE-12 the
+// knob off failed every check, with no record: an established suite froze
+// unpaced and invisible (final reviews E1, E2).
 func (c *Checker) unsignedRefusal(ctx context.Context, req *adoptionRequest) (string, error) {
 	switch err := c.adopter.unsignedEligible(ctx, req.suite); {
 	case errors.Is(err, errUnsignedDisabled):
