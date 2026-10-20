@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 )
 
 // SignedSeenMark is one signed-seen observation (spec C3).
@@ -92,4 +94,65 @@ SELECT last_seen_at FROM suite_signed_seen
 		return 0, false, fmt.Errorf("SignedSeen: %w", err)
 	}
 	return at, true, nil
+}
+
+// rowQuerier is what refuseUnsignedDowngrade reads through: CommitAdoption's
+// writer transaction, or the read pool.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// CheckUnsignedDowngrade is spec C5's never-downgrade rule
+// (refuseUnsignedDowngrade) read outside a transaction, for the early
+// exits: the check's before an unsigned request takes a slot, the
+// adopter's before anything is downloaded. CommitAdoption re-reads the same
+// rule inside its writer transaction; that read is the authority.
+func (c *Cache) CheckUnsignedDowngrade(ctx context.Context, host, suite string) error {
+	return refuseUnsignedDowngrade(ctx, c.db, host, suite)
+}
+
+// refuseUnsignedDowngrade is the never-downgrade rule for an unsigned
+// candidate of suite (spec C5 safeguard 3): ErrUnsignedDowngradeRefused when
+// the suite has signed history on host under either scheme —
+//   - a signed-seen marker for its base (aptpath.MarkerBase: the /. twin
+//     shares it), or
+//   - an adopted, non-retired inline or detached snapshot of the suite or
+//     its twin: the current snapshot, or a displaced one the legacy trust
+//     audit left queued, and so unmarked, after an I/O fault.
+//
+// A retired snapshot (quarantined by the audit, or reaped) is no history:
+// its trust was removed. A read error is returned as it is. (Moved here
+// from adoption.go beside the markers it reads, deferred minor E-5.)
+//
+// AIDEV-NOTE: one rule and one SQL at both never-downgrade points, so the
+// early exits can never admit what the commit refuses. Either scheme counts
+// (design review M-7): a base seen signed over https protects the same base
+// over plain http, the scheme a man-in-the-middle can strip. The displaced
+// snapshot clause is design review M-8.
+func refuseUnsignedDowngrade(ctx context.Context, q rowQuerier, host, suite string) error {
+	base := aptpath.MarkerBase(suite)
+	var scheme string
+	err := q.QueryRowContext(ctx, `
+SELECT canonical_scheme FROM suite_signed_seen
+ WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND base = ?
+ LIMIT 1`, host, base).Scan(&scheme)
+	switch {
+	case err == nil:
+		return fmt.Errorf("%w: %s://%s%s has a signed-seen marker", ErrUnsignedDowngradeRefused, scheme, host, base)
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("unsigned downgrade check: read signed-seen markers: %w", err)
+	}
+	var path, form string
+	err = q.QueryRowContext(ctx, `
+SELECT canonical_scheme, suite_path, anchor_form FROM suite_snapshot
+ WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND suite_path IN (?, ?)
+   AND adopted_at IS NOT NULL AND retired_at IS NULL AND anchor_form IN ('inline', 'detached')
+ LIMIT 1`, host, base, base+"/.").Scan(&scheme, &path, &form)
+	switch {
+	case err == nil:
+		return fmt.Errorf("%w: %s://%s%s has an adopted %s snapshot", ErrUnsignedDowngradeRefused, scheme, host, path, form)
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("unsigned downgrade check: read signed snapshots: %w", err)
+	}
+	return nil
 }

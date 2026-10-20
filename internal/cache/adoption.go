@@ -16,8 +16,9 @@ import (
 // would double-bump refcounts for every member, so the writer refuses.
 var ErrSnapshotAlreadyAdopted = errors.New("cache: snapshot already adopted")
 
-// ErrSnapshotRetired: the candidate was retired (legacy trust audit or,
-// from phase F, reaping) and must never become current.
+// ErrSnapshotRetired: the candidate was retired — by the legacy trust
+// audit's quarantine, or the reaper's retirement path (a reap, POST
+// /forget, cap eviction) — and must never become current.
 var ErrSnapshotRetired = errors.New("cache: snapshot is retired")
 
 // ErrUnsignedDowngradeRefused is the never-downgrade refusal of an unsigned
@@ -422,7 +423,10 @@ WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adopted
 		// adopter's re-mark before an unsigned commit, ruling R-E1).
 		if AnchorForm(form) == FormUnsigned {
 			if err := refuseUnsignedDowngrade(ctx, tx, host, suite); err != nil {
-				return err
+				// The prefix tells this authoritative read from the early
+				// exits' (deferred minor E-4); errors.Is still finds
+				// ErrUnsignedDowngradeRefused.
+				return fmt.Errorf("CommitAdoption: %w", err)
 			}
 		}
 
@@ -710,71 +714,12 @@ UPDATE suite_snapshot SET adopted_at = ? WHERE snapshot_id = ?`,
 	})
 }
 
-// rowQuerier is what refuseUnsignedDowngrade reads through: CommitAdoption's
-// writer transaction, or the read pool.
-type rowQuerier interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
-// CheckUnsignedDowngrade is spec C5's never-downgrade rule
-// (refuseUnsignedDowngrade) read outside a transaction, for the early
-// exits: the check's before an unsigned request takes a slot, the
-// adopter's before anything is downloaded. CommitAdoption re-reads the same
-// rule inside its writer transaction; that read is the authority.
-func (c *Cache) CheckUnsignedDowngrade(ctx context.Context, host, suite string) error {
-	return refuseUnsignedDowngrade(ctx, c.db, host, suite)
-}
-
-// refuseUnsignedDowngrade is the never-downgrade rule for an unsigned
-// candidate of suite (spec C5 safeguard 3): ErrUnsignedDowngradeRefused when
-// the suite has signed history on host under either scheme —
-//   - a signed-seen marker for its base (aptpath.MarkerBase: the /. twin
-//     shares it), or
-//   - an adopted, non-retired inline or detached snapshot of the suite or
-//     its twin: the current snapshot, or a displaced one the legacy trust
-//     audit left queued, and so unmarked, after an I/O fault.
-//
-// A retired snapshot (quarantined by the audit, or reaped) is no history:
-// its trust was removed. A read error is returned as it is.
-//
-// AIDEV-NOTE: one rule and one SQL at both never-downgrade points, so the
-// early exits can never admit what the commit refuses. Either scheme counts
-// (design review M-7): a base seen signed over https protects the same base
-// over plain http, the scheme a man-in-the-middle can strip. The displaced
-// snapshot clause is design review M-8.
-func refuseUnsignedDowngrade(ctx context.Context, q rowQuerier, host, suite string) error {
-	base := aptpath.MarkerBase(suite)
-	var scheme string
-	err := q.QueryRowContext(ctx, `
-SELECT canonical_scheme FROM suite_signed_seen
- WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND base = ?
- LIMIT 1`, host, base).Scan(&scheme)
-	switch {
-	case err == nil:
-		return fmt.Errorf("%w: %s://%s%s has a signed-seen marker", ErrUnsignedDowngradeRefused, scheme, host, base)
-	case !errors.Is(err, sql.ErrNoRows):
-		return fmt.Errorf("unsigned downgrade check: read signed-seen markers: %w", err)
-	}
-	var path, form string
-	err = q.QueryRowContext(ctx, `
-SELECT canonical_scheme, suite_path, anchor_form FROM suite_snapshot
- WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND suite_path IN (?, ?)
-   AND adopted_at IS NOT NULL AND retired_at IS NULL AND anchor_form IN ('inline', 'detached')
- LIMIT 1`, host, base, base+"/.").Scan(&scheme, &path, &form)
-	switch {
-	case err == nil:
-		return fmt.Errorf("%w: %s://%s%s has an adopted %s snapshot", ErrUnsignedDowngradeRefused, scheme, host, path, form)
-	case !errors.Is(err, sql.ErrNoRows):
-		return fmt.Errorf("unsigned downgrade check: read signed snapshots: %w", err)
-	}
-	return nil
-}
-
 // decrementSnapshotRefcountsTx releases one pin per distinct blob the
 // snapshot's members reference (SPEC4 §7.5.1 Rule 3). It must run exactly
 // once per snapshot, when it stops being current: CommitAdoption Step 8
-// (displacement) and the legacy trust audit's quarantine (spec §6.1) are
-// the only callers; phase F's reaper adds the third.
+// (displacement), the legacy trust audit's quarantine (spec §6.1) and the
+// reaper's retirement path (retireSuiteSnapshotsTx: cap eviction, the
+// reaper and POST /forget, spec C9) are its callers.
 //
 // AIDEV-NOTE: COALESCE keeps an existing refcount_zeroed_at on a 0 → -1
 // transition; the IIF writes `now` only on the first <= 0 crossing.
@@ -794,10 +739,12 @@ UPDATE blob
 }
 
 // adoptionStampTx returns the adopted_at a commit at now stamps (spec C8,
-// monotonic Last-Modified): max(now, prior.adopted_at + 1) when the suite
-// has a current snapshot; for a first adoption, max(now, the newest
+// monotonic Last-Modified): max(now, the newest adopted_at of any snapshot
+// of the suite + 1) — current, displaced or retired — and, for a suite
+// with no current snapshot (a first adoption, or one after a quarantine
+// or a reap), also above the newest
 // last_fetched_at of the suite's InRelease/Release/Release.gpg url_path
-// rows + 1) — those rows are what clients were served, with that
+// rows + 1 — those rows are what clients were served, with that
 // Last-Modified or older. The handler serves snapshot anchors with
 // adopted_at as their Last-Modified (never the pool file's mtime), so a
 // client's If-Modified-Since from the previous anchor always gets a 200
@@ -806,25 +753,35 @@ UPDATE blob
 // AIDEV-NOTE: call it before CommitAdoption Step 3c, which re-seeds the
 // anchor rows' last_fetched_at with now. adopted_at can now lead the wall
 // clock (by 1 s per same-second flip, by up to a backward step's length
-// after one). GC's keep_displaced ranking and the admin page only need its
-// order, which this keeps equal to the commit order per suite; the legacy
-// audit's markSnapshotBaseTx (legacy_audit.go) reads it as a wall-clock
-// stamp, and the clock-step rule (internal/freshness/clockstep.go, spec
-// C4) still lists it as a past-event stamp — no gate reads it that way
-// today, so a stamp in the future is harmless there (phase F carry-forward).
+// after one), so the floor is every snapshot of the suite, not only the
+// current one (deferred minor C-11): once current_snapshot_id is cleared
+// (a quarantine) or the row deleted (a reap, an eviction, POST /forget —
+// the re-created suite starts without one), the suite's remaining
+// snapshots may lead the clock, and a stamp below theirs would misorder
+// GC's keep_displaced ranking and retained by-hash's newest-first window,
+// and could answer a client's If-Modified-Since from a retired snapshot
+// 304. Stamps are strictly increasing per suite, so those readers need
+// only their order; the legacy audit's markSnapshotBaseTx
+// (legacy_audit.go) reads one as a wall-clock stamp, and the clock-step
+// rule (internal/freshness/clockstep.go, spec C4) lists adopted_at as a
+// past-event stamp — no gate reads it that way, so a stamp in the future
+// is harmless there.
 func adoptionStampTx(ctx context.Context, tx *sql.Tx, scheme, host, suite string, now int64) (int64, error) {
-	var prior sql.NullInt64
-	err := tx.QueryRowContext(ctx, `
-SELECT s.adopted_at
-  FROM suite_freshness f
-  JOIN suite_snapshot s ON s.snapshot_id = f.current_snapshot_id
- WHERE f.canonical_scheme = ? AND f.canonical_host = ? AND f.suite_path = ?`,
-		scheme, host, suite).Scan(&prior)
-	switch {
-	case err == nil && prior.Valid:
-		return max(now, prior.Int64+1), nil
-	case err != nil && !errors.Is(err, sql.ErrNoRows):
-		return 0, fmt.Errorf("read prior adopted_at: %w", err)
+	var newest, current sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+SELECT (SELECT MAX(adopted_at) FROM suite_snapshot
+         WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?),
+       (SELECT current_snapshot_id FROM suite_freshness
+         WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?)`,
+		scheme, host, suite, scheme, host, suite).Scan(&newest, &current); err != nil {
+		return 0, fmt.Errorf("read the suite's newest adopted_at: %w", err)
+	}
+	stamp := now
+	if newest.Valid {
+		stamp = max(stamp, newest.Int64+1)
+	}
+	if current.Valid {
+		return stamp, nil
 	}
 	var fetched sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `
@@ -834,9 +791,9 @@ SELECT MAX(last_fetched_at) FROM url_path
 		return 0, fmt.Errorf("read anchor last_fetched_at: %w", err)
 	}
 	if fetched.Valid {
-		return max(now, fetched.Int64+1), nil
+		stamp = max(stamp, fetched.Int64+1)
 	}
-	return now, nil
+	return stamp, nil
 }
 
 // ListSnapshotMembers returns every snapshot_member row for the snapshot,
@@ -907,7 +864,8 @@ type DeclaredHash struct {
 }
 
 // DeclaredHashesForPath returns every package_hash row covering this .deb
-// path under any current snapshot. Joins package_hash → suite_freshness
+// path under any signed (inline or detached) current snapshot — an
+// unsigned one never vouches (deferred minor E-2). Joins package_hash → suite_freshness
 // on current_snapshot_id so a row whose snapshot was displaced (orphaned
 // rows from a prior adoption) does not count. SPEC2 §6.1 step 2 / §6.2.
 //
