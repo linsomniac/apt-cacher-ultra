@@ -224,8 +224,10 @@ type AdoptionConfig struct {
 	// Set false for the stricter posture: short-keyid-only signatures
 	// are rejected with adoption_gpg_failed regardless of whether the
 	// keyid maps to a loaded key. Each (host, suite) pair logs one
-	// INFO line the first time the fallback accepts a signature, so
-	// operators can inventory which repos depend on it.
+	// INFO line (adoption_short_keyid_fallback) the first time the
+	// fallback accepts a signature — and again once the verifier's set
+	// of logged suites has started over past 10,000 suites (gpg's
+	// onceSetMax) — so operators can inventory which repos depend on it.
 	AllowShortKeyID bool `toml:"allow_short_keyid"`
 
 	// AcceptAnySigner relaxes adoption-time trust verification for
@@ -254,8 +256,10 @@ type AdoptionConfig struct {
 	//
 	// One adoption_unverified_signer INFO line is emitted per
 	// (canonical_host, suite_path) per process the first time a suite
-	// adopts under this relaxation. A loud startup WARN names the
-	// configuration so the choice is auditable.
+	// adopts under this relaxation, and again once the verifier's set of
+	// logged suites has started over past 10,000 suites (gpg's
+	// onceSetMax). A loud startup WARN names the configuration so the
+	// choice is auditable.
 	AcceptAnySigner bool `toml:"accept_any_signer"`
 
 	// TolerateOptionalMemberFailures controls whether an
