@@ -420,21 +420,25 @@ func TestCheckFirst_UnsignedTransitionIsConfirmed(t *testing.T) {
 		t.Fatalf("inside the retry time: count %d result %q, %d new lines", row.AdoptionFailCount, lastResult(r),
 			len(r.events("freshness_check"))-lines)
 	}
-	// New bytes restart the confirmation.
+	// New bytes restart the confirmation stamp, not the retry count (final
+	// fix wave FW-3 (a), design note 18 as amended: restarting the count
+	// too kept bytes that change at every observation at a 2-minute retry
+	// forever). This test pinned "count 1" here before the ruling.
 	r.unsignedRelease("u2", nil)
 	r.clock.advance(time.Minute)
 	t2 := r.clock.now().Unix()
 	r.check()
-	if row := r.row(); row.AdoptionFailCount != 1 || i64Of(row.AdoptionFailFirstAt) != t2 {
-		t.Fatalf("new bytes: count %d first %d, want a new streak at %d", row.AdoptionFailCount, i64Of(row.AdoptionFailFirstAt), t2)
+	if row := r.row(); row.AdoptionFailCount != 2 || i64Of(row.AdoptionFailFirstAt) != t2 {
+		t.Fatalf("new bytes: count %d first %d, want the count growing (2) and a new confirmation stamp at %d",
+			row.AdoptionFailCount, i64Of(row.AdoptionFailFirstAt), t2)
 	}
-	r.clock.advance(2 * time.Minute) // due, but only 2 min after the first observation
+	r.clock.advance(4 * time.Minute) // due (the count-2 retry), but only 4 min after the first observation
 	r.check()
-	if row := r.row(); row.CurrentSnapshotID != nil || row.AdoptionFailCount != 2 || i64Of(row.AdoptionFailFirstAt) != t2 {
-		t.Fatalf("2 min apart: adopted %v count %d first %d; want unconfirmed, count 2, the same first", row.CurrentSnapshotID != nil,
+	if row := r.row(); row.CurrentSnapshotID != nil || row.AdoptionFailCount != 3 || i64Of(row.AdoptionFailFirstAt) != t2 {
+		t.Fatalf("4 min apart: adopted %v count %d first %d; want unconfirmed, count 3, the same first", row.CurrentSnapshotID != nil,
 			row.AdoptionFailCount, i64Of(row.AdoptionFailFirstAt))
 	}
-	r.clock.advance(4 * time.Minute) // due again, 6 min after the first observation
+	r.clock.advance(8 * time.Minute) // due again, 12 min after the first observation
 	r.check()
 	snap := r.currentSnapshot()
 	if snap == nil || snap.Form != cache.FormUnsigned || lastResult(r) != "first_adoption" {
@@ -694,6 +698,52 @@ func TestCheckFirst_ReofferOfAParkedFirstAdoptionIsNotPaced(t *testing.T) {
 	if rep.result != "first_adoption" || probes()-before != 1 || r.row().CurrentSnapshotID == nil {
 		t.Fatalf("the re-offer: result %q, %d probes, adopted %v; want first_adoption, one probe tree, adopted",
 			rep.result, probes()-before, r.row().CurrentSnapshotID != nil)
+	}
+}
+
+// cancelAfter wraps the rig upstream: once url has been answered it
+// cancels cancel — a shutdown landing right after that probe.
+type cancelAfter struct {
+	*rigUpstream
+	url    string
+	cancel context.CancelFunc
+}
+
+func (u *cancelAfter) Conditional(ctx context.Context, target *fetch.Target, etag, lastmod string, limit int64) (*fetch.ConditionalResult, error) {
+	res, err := u.rigUpstream.Conditional(ctx, target, etag, lastmod, limit)
+	if target.URL == u.url {
+		u.cancel()
+	}
+	return res, err
+}
+
+// Final fix wave FW-3 (d) (final concurrency review M-1, its E8): a
+// shutdown that lands between the probe that found a signature and the
+// marker write ends the check quietly — DEBUG, no failed check, no
+// failed-check line or count, no persist WARN — as a cancelled GET does: a
+// cancelled context says nothing about upstream.
+func TestCheckFirst_ShutdownAtTheMarkerWriteIsQuiet(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.up.set(r.release("v1", 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	r.checker.fetcher = &cancelAfter{rigUpstream: r.up, url: rigAnchorURL, cancel: cancel}
+	before := checkTotal(t, "failed", rigHost)
+	r.checker.Check(ctx, "http", rigHost, rigSuite)
+	r.checker.WaitForAdoptions()
+	for _, msg := range []string{"freshness check failed", "freshness: persist failure-bump failed", "freshness_check"} {
+		if ev := r.events(msg); len(ev) != 0 {
+			t.Fatalf("%q lines %v after a shutdown, want none", msg, ev)
+		}
+	}
+	if n := checkTotal(t, "failed", rigHost) - before; n != 0 {
+		t.Fatalf("failed checks counted %v, want 0", n)
+	}
+	if row := r.row(); row.CheckFailCount != 0 || row.LastCheckAt != nil || row.CurrentSnapshotID != nil {
+		t.Fatalf("row %+v, want nothing written", row)
+	}
+	ev := r.events("freshness: check ended by shutdown")
+	if len(ev) != 1 || ev[0]["level"] != "DEBUG" || ev[0]["step"] != "mark the signature seen" {
+		t.Fatalf("shutdown lines %v, want one DEBUG line naming the marker write", ev)
 	}
 }
 

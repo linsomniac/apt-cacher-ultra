@@ -187,7 +187,9 @@ func (c *Checker) anchorFoundAgain(ctx context.Context, out *checkOutcome, cur *
 	nowUnix int64, form adoptionForm, t probeTree, signedCurrent bool) *adoptionRequest {
 	if !signedCurrent && t.signatureSeen() {
 		if err := c.adopter.markSignatureSeen(ctx, suite, nowUnix); err != nil {
-			c.failCheck(ctx, out, cur, suite, nowUnix, formName(form), fmt.Errorf("mark the signature seen: %w", err))
+			if !c.endedByShutdown(ctx, suite, "mark the signature seen", err) {
+				c.failCheck(ctx, out, cur, suite, nowUnix, formName(form), fmt.Errorf("mark the signature seen: %w", err))
+			}
 			return nil
 		}
 	}
@@ -195,7 +197,11 @@ func (c *Checker) anchorFoundAgain(ctx context.Context, out *checkOutcome, cur *
 	if err != nil {
 		// Without the current snapshot an anchor that merely came back
 		// would be taken for new content and re-adopted (review fix round
-		// 1, Task 7): log it as the baseline's read is, and fail the check.
+		// 1, Task 7): log it as the baseline's read is, and fail the check
+		// (a shutdown that ended the read returns quietly, FW-3 (d)).
+		if c.endedByShutdown(ctx, suite, "read current snapshot", err) {
+			return nil
+		}
 		c.logger.Warn("freshness: read current snapshot failed",
 			"err", err,
 			"snapshot_id", *cur.CurrentSnapshotID,
@@ -212,7 +218,9 @@ func (c *Checker) anchorFoundAgain(ctx context.Context, out *checkOutcome, cur *
 	if !same && t.form == adoptionFormUnsigned {
 		var err error
 		if refusal, err = c.unsignedRefusal(ctx, req); err != nil {
-			c.failCheck(ctx, out, cur, suite, nowUnix, formName(form), err)
+			if !c.endedByShutdown(ctx, suite, "unsigned eligibility", err) {
+				c.failCheck(ctx, out, cur, suite, nowUnix, formName(form), err)
+			}
 			return nil
 		}
 	}
@@ -365,7 +373,9 @@ func (c *Checker) upgradeProbe(ctx, fetchCtx context.Context, out *checkOutcome,
 		}
 	}
 	if err := c.adopter.markSignatureSeen(ctx, suite, nowUnix); err != nil {
-		c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", fmt.Errorf("mark the signature seen: %w", err))
+		if !c.endedByShutdown(ctx, suite, "mark the signature seen", err) {
+			c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", fmt.Errorf("mark the signature seen: %w", err))
+		}
 		return nil, true
 	}
 	if t.inRelease.class != classPresent { // Release.gpg is the signature found
@@ -460,8 +470,8 @@ func (c *Checker) checkUnsigned(ctx, fetchCtx context.Context, out *checkOutcome
 		c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", err)
 		return nil, nil
 	}
-	if res.Status != 200 && res.Status != 304 {
-		c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", fmt.Errorf("%w %d", errUnexpectedStatus, res.Status))
+	if serr := c.unusableStatus(res, etag != "" || lastmod != ""); serr != nil {
+		c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", serr)
 		return nil, nil
 	}
 
@@ -475,7 +485,9 @@ func (c *Checker) checkUnsigned(ctx, fetchCtx context.Context, out *checkOutcome
 		refusal, err := c.unsignedRefusal(ctx, &adoptionRequest{suite: suite, key: key, releaseBytes: res.Body,
 			etag: res.ETag, lastmod: res.LastModified})
 		if err != nil {
-			c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", err)
+			if !c.endedByShutdown(ctx, suite, "unsigned eligibility", err) {
+				c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", err)
+			}
 			return nil, nil
 		}
 		if refusal != "" {

@@ -183,7 +183,10 @@ func TestCheck_RepairObeysTheGlobalSlot(t *testing.T) {
 		setupFF.put(base+"Contents-amd64.gz", []byte(strings.Repeat("z", 90))) // stale generation
 		suite := SuiteRef{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suitePath}
 		trackSuite(t, c, suite)
-		if err := setupAd.Run(ctx, suite, releaseText, "", ""); err != nil {
+		// The adoption stores an ETag, so the check's GET is conditional and
+		// the upstream's 304 is not_modified: a 304 to a GET without
+		// validators is a failed check (final fix wave FW-3 (c)).
+		if err := setupAd.Run(ctx, suite, releaseText, `"e-`+host+`"`, ""); err != nil {
 			t.Fatalf("setup Run(%s): %v", host, err)
 		}
 	}

@@ -209,3 +209,88 @@ func TestCheck_FutureRetryIsClampedOncePerCheck(t *testing.T) {
 		t.Fatalf("clock steps detected: %v, want 1 (one clamp per check)", got)
 	}
 }
+
+// notModifiedTo answers every request for url with a bare 304, whatever
+// validators it carried (recorded like the rig's): an upstream that
+// answers 304 to unconditional GETs.
+type notModifiedTo struct {
+	*rigUpstream
+	url string
+}
+
+func (u notModifiedTo) Conditional(ctx context.Context, target *fetch.Target, etag, lastmod string, limit int64) (*fetch.ConditionalResult, error) {
+	if target.URL != u.url {
+		return u.rigUpstream.Conditional(ctx, target, etag, lastmod, limit)
+	}
+	u.mu.Lock()
+	u.sent[target.URL] = append(u.sent[target.URL], etag+lastmod)
+	u.mu.Unlock()
+	return &fetch.ConditionalResult{Status: 304}, nil
+}
+
+// Spec C4 (design note 21; final spec review M5 (c), final fix wave FW-3
+// (c)): a 304 is present only as the answer to a conditional request. A
+// current form's GET that carried no validators (none stored, or the
+// record due) and got a 304 is a failed check — not not_modified, which
+// bumped last_success_at and froze the suite silently behind an upstream
+// that answers 304 to unconditional GETs. Phase 1 (no adopter) runs
+// unchanged and still takes it as not_modified.
+func TestCheck_NotModifiedWithoutValidatorsIsAFailedCheck(t *testing.T) {
+	for _, form := range []string{"inline", "detached", "unsigned", "phase 1"} {
+		t.Run(form, func(t *testing.T) {
+			r := newRetryRig(t, 0)
+			url := rigReleaseURL
+			switch form {
+			case "inline", "phase 1":
+				url = rigAnchorURL
+				if form == "inline" {
+					r.adopt()
+				}
+			case "detached":
+				r.adoptDetached()
+			default:
+				r.adoptUnsigned("u1")
+			}
+			row := r.row()
+			row.InReleaseETag, row.InReleaseLastMod = nil, nil // the next GET carries no validators
+			if err := r.cache.UpdateSuiteFreshness(context.Background(), row); err != nil {
+				t.Fatal(err)
+			}
+			success := i64Of(row.LastSuccessAt)
+			fetcher := notModifiedTo{rigUpstream: r.up, url: url}
+			r.checker.fetcher = fetcher
+			if form == "phase 1" {
+				c, err := New(Config{Cache: r.cache, Fetcher: fetcher, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+					Logger: slog.New(slog.NewJSONHandler(r.logs, nil)), now: r.clock.now})
+				if err != nil {
+					t.Fatal(err)
+				}
+				r.checker = c
+			}
+			sentBefore := len(r.up.etagsSent(url))
+			before := checkTotal(t, "failed", rigHost)
+			r.clock.advance(time.Minute)
+			r.check()
+			if sent := r.up.etagsSent(url)[sentBefore:]; len(sent) != 1 || sent[0] != "" {
+				t.Fatalf("setup: requests for %s carried %q, want one without validators", url, sent)
+			}
+			got := r.row()
+			if form == "phase 1" {
+				if got.CheckFailCount != 0 || lastResult(r) != "not_modified" {
+					t.Fatalf("phase 1: check_fail_count %d, result %q; want not_modified as before phase E", got.CheckFailCount, lastResult(r))
+				}
+				return
+			}
+			if got.CheckFailCount != 1 || i64Of(got.LastSuccessAt) != success {
+				t.Fatalf("check_fail_count %d, last_success_at %d (was %d); want a failed check that keeps last_success_at",
+					got.CheckFailCount, i64Of(got.LastSuccessAt), success)
+			}
+			if n := checkTotal(t, "failed", rigHost) - before; n != 1 {
+				t.Fatalf("failed checks counted %v, want 1", n)
+			}
+			if ev := r.events("freshness check failed"); len(ev) != 1 || ev[0]["form"] != form || !strings.Contains(ev[0]["err"].(string), "304") {
+				t.Fatalf("failed-check lines %v, want one for form %s naming the 304", ev, form)
+			}
+		})
+	}
+}

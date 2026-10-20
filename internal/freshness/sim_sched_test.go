@@ -414,19 +414,26 @@ func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 			seedSimSuite(t, c, "a", suite, stale, 0)
 			up.Set("http://a"+suite+"/InRelease", simtest.Stall())
 		}
-		adopt := func(suite string, pkgs []byte) {
+		adopt := func(suite string, pkgs []byte) []byte {
 			t.Helper()
 			ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: "a", SuitePath: suite}
 			members.put("http://a"+suite+"/main/binary-amd64/Packages", pkgs)
 			trackSuite(t, c, ref)
-			if err := ad.Run(ctx, ref, signedRelease("v0"+suite, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs}), "", ""); err != nil {
+			rel := signedRelease("v0"+suite, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
+			if err := ad.Run(ctx, ref, rel, "", ""); err != nil {
 				t.Fatal(err)
 			}
+			return rel
 		}
 		const sPath, cPath, rPath, c2Path = "/zzz/dists/x", "/ccc/dists/x", "/ddd/dists/x", "/eee/dists/x"
 		sURL := "http://a" + sPath + "/InRelease"
-		adopt(sPath, fakePackagesStanzas(map[string]string{"pool/s_1.deb": testHex64}))
-		up.Set(sURL, simtest.NotModified())
+		relS := adopt(sPath, fakePackagesStanzas(map[string]string{"pool/s_1.deb": testHex64}))
+		// S's upstream answers its unchanged InRelease: 200 with the same
+		// bytes to the first GET (S was adopted without validators), 304 to
+		// the conditional ones after it. A bare 304 to a GET without
+		// validators is a failed check (final fix wave FW-3 (c)), which
+		// would make S a failing suite.
+		up.Set(sURL, simtest.Serve(relS))
 		// changing adopts suite and makes upstream publish a new InRelease,
 		// with a new Packages body fetched in 10 minutes, on every request
 		// (a body already in the pool would be reused without a fetch).

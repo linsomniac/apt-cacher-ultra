@@ -892,22 +892,60 @@ func TestCheck_AbsentAnchorWithAFutureFirstAtWaitsAnotherGap(t *testing.T) {
 	}
 }
 
-// Design review M-13: an adopted suite stale in a refusal state
-// (anchor_absent keeps its last success old on purpose) counts in the
-// stale gauge but not in the stale WARN, which keeps alerting on a suite
-// stale for any other reason.
+// Design review M-13, as narrowed by the final fix wave (FW-3 (b)): an
+// adopted suite stale in anchor_absent (which keeps its last success old
+// on purpose) counts in the stale gauge but not in the stale WARN, which
+// keeps alerting on a suite stale for any other reason — another refusal
+// state included (upstream_older below).
 func TestStaleSuiteCounts_RefusalStates(t *testing.T) {
 	id, old := int64(7), int64(500)
-	absent, failing := cache.ReasonAnchorAbsent, "gpg_failed"
+	absent, failing, older := cache.ReasonAnchorAbsent, "gpg_failed", cache.ReasonUpstreamOlder
 	suites := []cache.SuiteFreshness{
 		{LastSuccessAt: &old, CurrentSnapshotID: &id, AdoptionFailCount: 3, AdoptionFailReason: &absent},
 		{LastSuccessAt: &old, CurrentSnapshotID: &id, AdoptionFailCount: 3, AdoptionFailReason: &failing},
+		{LastSuccessAt: &old, CurrentSnapshotID: &id, AdoptionFailCount: 3, AdoptionFailReason: &older},
 		{LastSuccessAt: &old, CurrentSnapshotID: &id},
 		{LastSuccessAt: &old, AdoptionFailCount: 1, AdoptionFailReason: &absent},
 	}
-	adopted, unadopted, refused := staleSuiteCounts(suites, 1000, 3000)
-	if adopted != 3 || unadopted != 1 || refused != 1 {
-		t.Fatalf("adopted %d unadopted %d refused %d, want 3, 1, 1", adopted, unadopted, refused)
+	adopted, unadopted, absentStale := staleSuiteCounts(suites, 1000, 3000)
+	if adopted != 4 || unadopted != 1 || absentStale != 1 {
+		t.Fatalf("adopted %d unadopted %d anchor_absent %d, want 4, 1, 1", adopted, unadopted, absentStale)
+	}
+}
+
+// Final fix wave FW-3 (b) (final tests review, Important 4: a regression
+// from phase D): an adopted suite whose last attempt was refused
+// (upstream_older, a flapping mirror) and whose upstream then fails every
+// check for two hours is stale for a reason that is not its refusal — the
+// freeze WARN fires. Only anchor_absent is left out of it.
+func TestTick_StaleWarnCountsARefusedSuiteWhoseChecksFail(t *testing.T) {
+	r := newRetryRig(t, 0)
+	d2 := r.clock.now().Add(-time.Hour).Unix()
+	r.up.set(r.release("v2", d2))
+	r.check()
+	if r.row().CurrentSnapshotID == nil {
+		t.Fatal("setup: v2 not adopted")
+	}
+	r.clock.advance(time.Minute)
+	r.up.set(r.release("v1", d2-3600)) // a mirror serving older content
+	r.check()
+	if strOf(r.row().AdoptionFailReason) != cache.ReasonUpstreamOlder {
+		t.Fatalf("setup: record reason %q, want upstream_older", strOf(r.row().AdoptionFailReason))
+	}
+	r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 503}) // the whole mirror pool goes down
+	for i := 0; i < 12; i++ {
+		r.clock.advance(10 * time.Minute)
+		r.check()
+	}
+	row := r.row()
+	if row.CheckFailCount == 0 || strOf(row.AdoptionFailReason) != cache.ReasonUpstreamOlder {
+		t.Fatalf("setup: check_fail_count %d, record %q; want failing checks behind the upstream_older record",
+			row.CheckFailCount, strOf(row.AdoptionFailReason))
+	}
+	r.checker.tick(context.Background(), newSchedQueues())
+	if warns := r.events("freshness: adopted suites stale beyond threshold"); len(warns) != 1 || warns[0]["adopted_stale"] != float64(1) {
+		t.Fatalf("stale WARNs %v, want one with adopted_stale 1 (last success %v ago)", warns,
+			r.clock.now().Sub(time.Unix(i64Of(row.LastSuccessAt), 0)))
 	}
 }
 

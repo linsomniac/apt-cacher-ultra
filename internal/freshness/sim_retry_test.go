@@ -457,3 +457,62 @@ func TestSimRestartSpread(t *testing.T) {
 		}
 	})
 }
+
+// Design note 18 as amended by the final fix wave (FW-3 (a); final spec
+// review I3, concurrency E9): an unsigned candidate whose Release bytes
+// differ at every observation (generated per request, or load-balanced
+// backends that disagree) restarts only its confirmation stamp, not its
+// retry count, so it backs off and PE-3's pacing holds: under the real
+// scheduler, with no client traffic, it is probed about once per refresh
+// interval, like a stable unsigned suite — not at every 2-minute retry
+// (383 Release fetches a day before the fix). It never confirms.
+func TestSimCost_NeverConfirmingUnsignedCandidateIsPaced(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := simtest.OpenCache(t)
+		members := newFakeFetcher()
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: &dodVerifier{reject: map[string]bool{},
+			calls: map[SuiteRef][]time.Time{}}, HostLimiter: hostsem.New(8), MaxConcurrent: 2, AdoptUnsigned: true,
+			Logger: simtest.DiscardLogger()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		up := simtest.NewUpstream()
+		const host, refresh = "u", 15 * time.Minute
+		pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo.deb": testHex64})
+		var gen atomic.Int64
+		for _, suite := range []string{"/r/dists/stable", "/r/dists/churn"} {
+			members.put("http://"+host+suite+"/main/binary-amd64/Packages", pkgs)
+			seedStaleAnchorAt(t, c, host, suite)
+		}
+		stable := []byte(fmt.Sprintf("Origin: stable\nSHA256:\n %s %d main/binary-amd64/Packages\n", hashOf(pkgs), len(pkgs)))
+		up.Set("http://"+host+"/r/dists/stable/Release", func(context.Context, string) (*fetch.ConditionalResult, error) {
+			return &fetch.ConditionalResult{Status: 200, Body: stable}, nil
+		})
+		up.Set("http://"+host+"/r/dists/churn/Release", func(context.Context, string) (*fetch.ConditionalResult, error) {
+			body := []byte(fmt.Sprintf("Origin: churn\nX-Generated: %d\nSHA256:\n %s %d main/binary-amd64/Packages\n",
+				gen.Add(1), hashOf(pkgs), len(pkgs)))
+			return &fetch.ConditionalResult{Status: 200, Body: body}, nil
+		})
+		_, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: refresh,
+			Cooldown: time.Minute, Adopter: ad, Logger: simtest.DiscardLogger(), rand: func() float64 { return 0.5 }})
+		const horizon = 24 * time.Hour
+		time.Sleep(horizon)
+		stop()
+		stableN := len(up.Calls("http://" + host + "/r/dists/stable/Release"))
+		churnN := len(up.Calls("http://" + host + "/r/dists/churn/Release"))
+		// One probe tree per refresh interval (PE-3), plus the first
+		// retries (2, 4, 8 minutes) before the backoff passes the interval.
+		if bound := int(horizon/refresh) + 4; churnN > bound {
+			t.Errorf("a never-confirming unsigned candidate was probed %d times in %v (stable suite: %d), want at most %d",
+				churnN, horizon, stableN, bound)
+		}
+		row, err := c.GetSuiteFreshness(context.Background(), "http", host, "/r/dists/churn")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.CurrentSnapshotID != nil || strOf(row.AdoptionFailReason) != cache.ReasonUnsignedUnconfirmed || row.AdoptionFailCount < 10 {
+			t.Errorf("churning suite: adopted %v, record %q/%d; want unconfirmed with a growing count",
+				row.CurrentSnapshotID != nil, strOf(row.AdoptionFailReason), row.AdoptionFailCount)
+		}
+	})
+}

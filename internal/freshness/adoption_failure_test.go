@@ -302,3 +302,36 @@ func TestAdoptionFailure_OldRefusalWarnsAtMilestones(t *testing.T) {
 		}
 	}
 }
+
+// Design note 18 as amended (final fix wave FW-3 (a)): a confirmation
+// record (unsigned_unconfirmed, anchor_absent) restarts its confirmation
+// stamp on new content or a new reason, and its retry count only on a new
+// reason — new content under the same reason keeps the count growing, so
+// the retry schedule backs off; the same content keeps both.
+func TestAdoptionFailure_ConfirmationStampRestartsAndTheCountGrows(t *testing.T) {
+	r := newRetryRig(t, 0)
+	suite := SuiteRef{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}
+	t0 := r.clock.now().Unix()
+	if err := r.cache.RecordAdoptionFailure(context.Background(), "http", rigHost, rigSuite, cache.AdoptionFailure{
+		Hash: "k0", Reason: "gpg_failed", Count: 5, FirstAt: t0 - 3600, LastAt: t0, NextRetryAt: t0}); err != nil {
+		t.Fatal(err)
+	}
+	step := func(key, reason string, wantCount, wantFirst int64) {
+		t.Helper()
+		r.checker.recordAdoptionFailure(&adoptionRequest{suite: suite, key: key}, reason)
+		row := r.row()
+		if row.AdoptionFailCount != wantCount || i64Of(row.AdoptionFailFirstAt) != wantFirst {
+			t.Fatalf("%s %s: count %d first %d, want %d and %d", reason, key, row.AdoptionFailCount,
+				i64Of(row.AdoptionFailFirstAt), wantCount, wantFirst)
+		}
+	}
+	step("k1", cache.ReasonUnsignedUnconfirmed, 1, t0) // a new reason: both restart
+	r.clock.advance(time.Minute)
+	t1 := r.clock.now().Unix()
+	step("k2", cache.ReasonUnsignedUnconfirmed, 2, t1) // new bytes: the stamp restarts, the count grows
+	r.clock.advance(time.Minute)
+	step("k2", cache.ReasonUnsignedUnconfirmed, 3, t1) // the same bytes: both continue
+	r.clock.advance(time.Minute)
+	t3 := r.clock.now().Unix()
+	step(anchorAbsentKey, cache.ReasonAnchorAbsent, 1, t3) // a new reason again
+}

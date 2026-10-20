@@ -61,7 +61,10 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 		first = *cur.AdoptionFailFirstAt
 	}
 	if restartsStreak(cur, req.key, reason) {
-		count, first = 1, now.Unix()
+		first = now.Unix()
+		if cur.AdoptionFailCount == 0 || cur.AdoptionFailReason == nil || *cur.AdoptionFailReason != reason {
+			count = 1 // a new state: its retry schedule starts over too
+		}
 	}
 	delay := jitterDelay(backoffDelay(count), c.rand())
 	next := now.Add(delay).Unix()
@@ -122,15 +125,26 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 	}
 }
 
-// restartsStreak reports a confirmation record (spec C4, C5) that starts
-// a new streak: unsigned_unconfirmed or anchor_absent recorded for other
-// content or after another reason. Their adoption_fail_first_at is the
-// first observation of THIS state and content, which the confirmation gap
-// is measured from ("two observations of the same Release bytes").
+// restartsStreak reports a confirmation record (spec C4, C5) whose
+// confirmation stamp restarts: unsigned_unconfirmed or anchor_absent
+// recorded for other content or after another reason. Their
+// adoption_fail_first_at is the first observation of THIS state and
+// content, which the confirmation gap is measured from ("two observations
+// of the same Release bytes").
 //
-// AIDEV-NOTE: count restarts with first_at, so the retry schedule of a
-// confirmation is short (2 min, 4 min, …) and the gap, not the backoff,
-// decides when it confirms.
+// AIDEV-NOTE: design note 18 as amended by the final fix wave (FW-3 (a)):
+// only the confirmation stamp (first_at) restarts on new content; the
+// count — the retry schedule — keeps growing while the reason stays the
+// same, and restarts at 1 only with a new reason (recordAdoptionFailure).
+// Restarting the count too kept a candidate whose bytes change at every
+// observation (a Release generated per request, disagreeing backends) at
+// a 2-minute retry forever: PE-3's pacing never held and it cost about
+// 1,150 requests a day with no client (720 trees with clients), never
+// escalating (final reviews I3, E9). Stable bytes still confirm at the
+// first probe at least the gap after their first observation: the
+// record's retry time, or the scheduler's refresh check (PE-3) when that
+// comes first, so a grown count delays a confirmation by at most one
+// periodic_refresh.
 func restartsStreak(cur *cache.SuiteFreshness, key, reason string) bool {
 	if reason != cache.ReasonUnsignedUnconfirmed && reason != cache.ReasonAnchorAbsent {
 		return false

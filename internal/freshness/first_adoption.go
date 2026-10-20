@@ -281,7 +281,9 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 	}
 	if t.signatureSeen() {
 		if err := c.adopter.markSignatureSeen(ctx, suite, nowUnix); err != nil {
-			c.failCheck(ctx, out, cur, suite, nowUnix, "probe", fmt.Errorf("mark the signature seen: %w", err))
+			if !c.endedByShutdown(ctx, suite, "mark the signature seen", err) {
+				c.failCheck(ctx, out, cur, suite, nowUnix, "probe", fmt.Errorf("mark the signature seen: %w", err))
+			}
 			return nil
 		}
 	}
@@ -291,7 +293,9 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 	if !deferred && t.form == adoptionFormUnsigned {
 		proceed, refusal, err := c.unsignedFirst(ctx, cur, req, t, gate, now)
 		if err != nil {
-			c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", err)
+			if !c.endedByShutdown(ctx, suite, "unsigned eligibility", err) {
+				c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", err)
+			}
 			return nil
 		}
 		deferred, reason = !proceed, refusal
@@ -358,23 +362,23 @@ func (c *Checker) unsignedRefusal(ctx context.Context, req *adoptionRequest) (st
 // review M-5: a too-large suite never takes a slot) and the transition
 // confirmation — two observations of the same Release bytes at least
 // confirmGap apart, an hour when a signature file answered 401/403
-// (unsigned_unconfirmed until then; the streak, and with it
-// adoption_fail_first_at, restarts whenever the bytes or the reason change,
-// see recordAdoptionFailure). proceed is true for a confirmed candidate;
-// otherwise reason is the refusal just recorded.
+// (unsigned_unconfirmed until then; adoption_fail_first_at, the
+// confirmation stamp, restarts whenever the bytes or the reason change,
+// and the retry count only with the reason — restartsStreak, final fix
+// wave FW-3 (a)). proceed is true for a confirmed candidate; otherwise
+// reason is the refusal just recorded.
 //
 // AIDEV-NOTE: content that already passed confirmation (a record for the
 // same bytes from an adoption attempt: any reason but unsigned_unconfirmed,
 // unsigned_downgrade_refused and unsigned_disabled — refusals decided
 // before the confirmation, ruling PE-12 adding the last) is not confirmed
 // again, so a failing unsigned first adoption keeps the C7 schedule
-// instead of restarting a short streak per attempt; bytes refused while
+// instead of restarting its confirmation per attempt; bytes refused while
 // the knob was off start their confirmation when it is turned back on. A
-// future adoption_fail_first_at never
-// confirms (its age is negative) and re-recording restarts the streak
-// (recordAdoptionFailure's past-event rule): a deviation from the C4
-// clock-step rule, which would read it as infinitely old and skip the
-// confirmation.
+// future adoption_fail_first_at never confirms (its age is negative) and
+// re-recording restarts the stamp (recordAdoptionFailure's past-event
+// rule): a deviation from the C4 clock-step rule, which would read it as
+// infinitely old and skip the confirmation.
 func (c *Checker) unsignedFirst(ctx context.Context, cur *cache.SuiteFreshness, req *adoptionRequest, t probeTree, gate retryGate, now time.Time) (proceed bool, reason string, err error) {
 	if refusal, err := c.unsignedRefusal(ctx, req); err != nil || refusal != "" {
 		return false, refusal, err

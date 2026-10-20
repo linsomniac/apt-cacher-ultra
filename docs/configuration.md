@@ -451,7 +451,10 @@ Unsigned adoption has five safeguards:
    the status page shows "refused: unsigned_unconfirmed". A `Release`
    generated anew for each request, or one that differs between
    load-balanced backends, never shows the same bytes twice and stays
-   unconfirmed. Later updates of an unsigned suite are adopted at once.
+   unconfirmed; it is asked for again at its retry times (2 minutes,
+   doubling to an hour) or once `periodic_refresh` has passed, like any
+   suite whose first adoption is deferred. Later updates of an unsigned
+   suite are adopted at once.
 3. Never a downgrade: a suite the cache has seen signed is never adopted
    unsigned ("refused: unsigned_downgrade_refused"). Seen signed means it
    has a signed snapshot (the current one, or one of the displaced

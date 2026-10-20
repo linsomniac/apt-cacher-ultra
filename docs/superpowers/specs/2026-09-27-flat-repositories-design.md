@@ -558,7 +558,9 @@ Counting 401/403/410 as *absent* is more lenient than apt's signed fallback
 answer is not an *unknown* end: it resets `check_fail_count` (phase E,
 ruling R-E4). A 304 is *present* only as the answer to a conditional
 request (the current anchor, unchanged); to a request without validators
-it is *unknown* (phase E, design note 21).
+it is *unknown* (phase E, design note 21) — for the probe tree and for
+the current form's conditional GET alike, which fails the check rather
+than taking it as `not_modified` (phase E final fix wave, FW-3).
 
 **Dispatch** (adopter wired; with no adopter the Phase 1 algorithm runs
 unchanged, observation only):
@@ -875,9 +877,12 @@ upgrade (§6.1).
    least `max(cooldown, 5m)` apart for 404/410, or at least 1 h apart when
    either signature file answered 401/403 (WAF and S3-permission incidents);
    the first observation records reason `unsigned_unconfirmed` and the
-   comparison uses `adoption_fail_first_at` (restart-safe; the record's
-   streak restarts whenever the bytes or the reason change, so the stamp is
-   the first observation of these bytes). The hour applies when a
+   comparison uses `adoption_fail_first_at` (restart-safe; the
+   confirmation stamp restarts whenever the bytes or the reason change, so
+   it is the first observation of these bytes; the retry schedule keeps
+   growing while the reason stays the same, so bytes that change at every
+   observation are paced like any deferred suite and never confirm —
+   phase E final fix wave, FW-3). The hour applies when a
    signature probe of the confirming observation answered 401/403; bytes
    that already passed confirmation (a record for them from an adoption
    attempt) are not confirmed again; a future `adoption_fail_first_at`
@@ -1020,8 +1025,9 @@ re-downloading everything.
 **Refusal states** use the same record and schedule but are not failures:
 `upstream_older`, `rollback_refused`, `unsigned_downgrade_refused`,
 `unsigned_unconfirmed` (confirmation timing from `adoption_fail_first_at`;
-its streak, like `anchor_absent`'s, restarts on new content or a new
-reason),
+its confirmation stamp, like `anchor_absent`'s, restarts on new content or
+a new reason, while the retry schedule keeps growing until the reason
+changes — phase E final fix wave, FW-3),
 `unsigned_too_large`, `anchor_absent`, `unsigned_disabled` (C5 safeguard
 1, ruling PE-12). They are excluded from the
 failing-suites gauge and from `adoption_failing_persistently`, and shown as

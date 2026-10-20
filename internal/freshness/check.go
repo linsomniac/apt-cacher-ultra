@@ -293,9 +293,58 @@ func (c *Checker) failCheck(ctx context.Context, out *checkOutcome, cur *cache.S
 	out.report.result = "failed"
 }
 
+// endedByShutdown reports whether a check step failed because the
+// caller's context ended (shutdown), and then logs it at DEBUG: it says
+// nothing about upstream, so the check returns without writing — no
+// failCheck, no WARN, no failed-check count — as a cancelled GET does
+// (t.end.cancelled(), "freshness: check cancelled").
+//
+// AIDEV-NOTE: final fix wave FW-3 (d) (final concurrency review M-1): the
+// local steps between the probes and the tail — the checker's marker
+// write, the unsigned eligibility read, the current snapshot's read —
+// failed the check on a cancelled context, so a routine restart under
+// client traffic logged INFO "freshness check failed", WARN "freshness:
+// persist failure-bump failed" and a failed check. ctx is the caller's
+// context, not fetchCtx: the check deadline is no shutdown and still
+// fails the check.
+func (c *Checker) endedByShutdown(ctx context.Context, suite SuiteRef, step string, err error) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	c.logger.Debug("freshness: check ended by shutdown", "step", step, "err", err,
+		"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath)
+	return true
+}
+
 // errUnexpectedStatus is a success status other than 200 and 304 from
 // fetch.Conditional: a contract violation, a failed check (ruling R-E3).
 var errUnexpectedStatus = errors.New("unexpected success status")
+
+// errUnconditionalNotModified is a 304 answering a current form's GET
+// that carried no validators: unknown (spec C4 classification, design note
+// 21), a failed check.
+var errUnconditionalNotModified = errors.New("304 Not Modified to a request without validators")
+
+// unusableStatus returns the failed-check error for a current form's GET
+// whose success status the check cannot use: anything but 200 and 304
+// (ruling R-E3), and — with an adopter wired — a 304 to a request that
+// carried no validators (conditional false). nil otherwise.
+//
+// AIDEV-NOTE: final fix wave FW-3 (c) (final spec review M5 (c)): spec C4
+// makes a 304 present only as the answer to a conditional request.
+// Taking an unconditional 304 as not_modified bumped last_success_at, so
+// an upstream that answers 304 to unconditional GETs (sent when no
+// validators are stored, or the record is due) froze the suite silently.
+// Phase 1 (no adopter) runs unchanged, as spec C4 Dispatch requires.
+func (c *Checker) unusableStatus(res *fetch.ConditionalResult, conditional bool) error {
+	switch {
+	case res.Status != 200 && res.Status != 304:
+		return fmt.Errorf("%w %d", errUnexpectedStatus, res.Status)
+	case res.Status == 304 && !conditional && c.adopter != nil:
+		return errUnconditionalNotModified
+	}
+	return nil
+}
 
 // steadyResult handles, for every form (ruling R-E3: one 304/unchanged
 // helper), the responses that say upstream still serves what the suite
@@ -529,10 +578,11 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, 
 		c.failCheck(ctx, out, cur, suite, nowUnix, "inline", err)
 		return nil, nil, false
 	}
-	if res.Status != 200 && res.Status != 304 {
+	if serr := c.unusableStatus(res, etag != "" || lastmod != ""); serr != nil {
 		// fetch.Conditional answers only 200 or 304 on success: anything
-		// else is a contract violation, a failed check (ruling R-E3).
-		c.failCheck(ctx, out, cur, suite, nowUnix, "inline", fmt.Errorf("%w %d", errUnexpectedStatus, res.Status))
+		// else is a contract violation, a failed check (ruling R-E3); so
+		// is a 304 to a request without validators (FW-3 (c)).
+		c.failCheck(ctx, out, cur, suite, nowUnix, "inline", serr)
 		return nil, nil, false
 	}
 
@@ -707,8 +757,8 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 		c.failCheck(ctx, out, cur, suite, nowUnix, "detached", err)
 		return nil, nil
 	}
-	if res.Status != 200 && res.Status != 304 {
-		c.failCheck(ctx, out, cur, suite, nowUnix, "detached", fmt.Errorf("%w %d", errUnexpectedStatus, res.Status))
+	if serr := c.unusableStatus(res, etag != "" || lastmod != ""); serr != nil {
+		c.failCheck(ctx, out, cur, suite, nowUnix, "detached", serr)
 		return nil, nil
 	}
 
