@@ -563,7 +563,8 @@ func TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap(t *testing.T) {
 		}
 	}
 	if at, ok, err := c.SignedSeen(ctx, "http", "h", "/flat"); err != nil || ok {
-		t.Errorf("marker http://h/flat after the reaps: present %v at %d (%v); want none: a reap creates no marker", ok, at, err)
+		t.Errorf("marker http://h/flat after the reaps: present %v at %d (%v); want none: a reap creates no marker "+
+			"for a suite without signed snapshot history of its own (ruling PF-12)", ok, at, err)
 	}
 }
 
@@ -834,6 +835,54 @@ func TestDeleteSuite_NoSignedHistoryCreatesNoMarker(t *testing.T) {
 			}
 			if err := c.CheckUnsignedDowngrade(ctx, "h", "/r/dists/x"); err != nil {
 				t.Fatalf("after the reap an unsigned candidate is %v; want admitted (no signed history)", err)
+			}
+		})
+	}
+}
+
+// Ruling PF-12's scope (the final fix wave's re-review, cache minor 1):
+// the delete's marker reads the deleted key's own snapshots — its scheme,
+// host and suite path, the snapshots the delete retires — and no
+// sibling's. A suite with no signed history of its own, deleted beside a
+// sibling that holds an adopted inline snapshot the legacy trust audit
+// left unmarked — the other scheme's suite of the same path, the suite's
+// /. twin, or, for a twin, its base — gets no marker for the base under
+// either scheme, and the sibling's snapshot is not retired. Admission is
+// not asserted: the sibling's snapshot still refuses an unsigned
+// candidate of the base by itself.
+func TestDeleteSuite_ASiblingsSignedHistoryCreatesNoMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		key, sibling SuiteKey
+		base         string
+	}{
+		{"the other scheme's suite", sk("h", "/r/dists/x"),
+			SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/r/dists/x"}, "/r/dists/x"},
+		{"the /. twin", sk("h", "/flat"), sk("h", "/flat/."), "/flat"},
+		{"a twin's base", sk("h", "/flat/."), sk("h", "/flat"), "/flat"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			defer stubNow(t, evictNow)()
+			seedRow(t, c, tc.key, evictNow-40*evictDay)
+			sibling := seedSignedHistory(t, c, tc.sibling, FormInline, true, evictNow)
+			for _, scheme := range []string{"http", "https"} {
+				if at := hostMarker(t, c, scheme, tc.base); at != -1 {
+					t.Fatalf("premise: marker %s://h%s present at %d", scheme, tc.base, at)
+				}
+			}
+			if del, _, err := c.ReapIdleSuite(ctx, tc.key, nil, evictNow-30*evictDay); err != nil || !del {
+				t.Fatalf("reap = %v, %v; want deleted", del, err)
+			}
+			for _, scheme := range []string{"http", "https"} {
+				if at := hostMarker(t, c, scheme, tc.base); at != -1 {
+					t.Errorf("marker %s://h%s after the reap: present at %d; want none (the signed history is %v's, not %v's)",
+						scheme, tc.base, at, tc.sibling, tc.key)
+				}
+			}
+			if snap, err := c.GetSuiteSnapshot(ctx, sibling); err != nil || snap.RetiredAt != nil {
+				t.Errorf("the sibling's snapshot after the reap = %+v, %v; want it kept, not retired", snap, err)
 			}
 		})
 	}

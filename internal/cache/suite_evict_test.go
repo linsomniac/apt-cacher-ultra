@@ -349,13 +349,15 @@ func TestCreateSuite_EvictionMovesTheBaseMarkersUp(t *testing.T) {
 			}
 			for _, m := range tc.absent {
 				if at, ok, err := c.SignedSeen(ctx, m.CanonicalScheme, m.CanonicalHost, m.Base); err != nil || ok {
-					t.Errorf("marker %s://%s%s after the eviction: present %v at %d (%v); want none: an eviction creates no marker",
+					t.Errorf("marker %s://%s%s after the eviction: present %v at %d (%v); want none: an eviction creates no "+
+						"marker for an evictee without signed snapshot history of its own (ruling PF-12)",
 						m.CanonicalScheme, m.CanonicalHost, m.Base, ok, at, err)
 				}
 			}
 			var n int
 			if err := c.db.QueryRow(`SELECT COUNT(*) FROM suite_signed_seen`).Scan(&n); err != nil || n != len(marks) {
-				t.Fatalf("%d markers after the eviction (%v); want %d: an eviction creates none", n, err, len(marks))
+				t.Fatalf("%d markers after the eviction (%v); want %d: an eviction creates none for an evictee without "+
+					"signed snapshot history of its own (ruling PF-12)", n, err, len(marks))
 			}
 			if len(tc.marks) == 0 {
 				if err := c.CheckUnsignedDowngrade(ctx, "b", tc.evictee.SuitePath); err != nil {

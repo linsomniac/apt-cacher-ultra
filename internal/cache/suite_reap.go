@@ -343,12 +343,12 @@ func (c *Cache) DeleteSuiteMetadata(ctx context.Context, key SuiteKey) (int, err
 // it deletes the row, also turns the suite's signed snapshot history into
 // a marker and moves the base's signed-seen markers up to now (as every
 // suite-row delete does: markSnapshotHistoryTx and stampBaseMarkersTx,
-// rulings PF-12 and PF-10). It
-// reports deleted (this call deleted the row) and gone (the suite has no
-// row: deleted, none was found, or — after a failed submit — none is
-// found by a fresh read). The caller releases its SuiteGuard hold with
-// release(gone), which drops the lock-map and flip-gate entries; a gone
-// suite's touch-coalescing entry is dropped here.
+// rulings PF-12 and PF-10). It reports deleted (this call deleted the
+// row) and gone (the suite has no row: deleted, none was found, or —
+// after a failed submit — none is found by a fresh read). The caller
+// releases its SuiteGuard hold with release(gone), which drops the
+// lock-map and flip-gate entries; a gone suite's touch-coalescing entry
+// is dropped here.
 //
 // AIDEV-NOTE: design review M-2: submitWrite can fail after the
 // transaction committed (its context ended between the commit and the
