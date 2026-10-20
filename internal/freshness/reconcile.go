@@ -46,6 +46,24 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	return a.reconcileSnapshot(ctx, suite, snapshotID, nil, force)
 }
 
+// sweepReconcileMemo drops every reconciledSnapshots entry whose snapshot
+// is not in current — the suites' current snapshots, as the reaper's run
+// listed them (spec C9) — and reports how many it dropped. A displaced
+// snapshot never becomes current again, so its entry is dead; one adopted
+// after the listing may lose a fresh entry, which costs it one extra parse
+// of its Release on its next unchanged check.
+func (a *Adopter) sweepReconcileMemo(current map[int64]bool) int {
+	n := 0
+	a.reconciledSnapshots.Range(func(k, _ any) bool {
+		if id, ok := k.(int64); !ok || !current[id] {
+			a.reconciledSnapshots.Delete(k)
+			n++
+		}
+		return true
+	})
+	return n
+}
+
 // reconcileSnapshot is ReconcileSnapshot; a non-nil declared must be
 // reparseSnapshotRelease's output for this same snapshotID, which its
 // caller already parsed from the same pinned anchor (reconcilePending on

@@ -34,9 +34,11 @@ import (
 // unlabelled gauge); acu_freshness_unlogged_panics_total (deferred minor
 // B-44, unlabelled counter); acu_repair_deferred_total (deferred minor
 // B-31, counter by host); acu_strict_adoption_waits_total (spec C10,
-// counter by host). The flip barrier's acu_flip_hold_skipped_total,
-// acu_flip_hold_expired_total, acu_flip_quiet_cut_short_total,
-// acu_flip_waiters_over_cap_total, acu_flip_slow_anchor_reads_total and
+// counter by host); acu_suites_reaped_total (spec C9, design review M-16,
+// counter by reason: idle, non_canonical, junk). The flip barrier's
+// acu_flip_hold_skipped_total, acu_flip_hold_expired_total,
+// acu_flip_quiet_cut_short_total, acu_flip_waiters_over_cap_total,
+// acu_flip_slow_anchor_reads_total and
 // acu_flip_gate_panics_total (spec C8, unlabelled counters) and
 // acu_flip_barrier_active (unlabelled gauge) are declared in
 // internal/flipgate. An adoption ended by shutdown is not an adoption
@@ -80,6 +82,17 @@ var (
 		"Repairs and reconciles deferred because no adoption slot was free, by host (spec C4).",
 		metrics.DefaultMaxSeries,
 		"host",
+	)
+
+	// suitesReapedTotal counts the suites the suite reaper deleted, by
+	// reason (spec C9, design review M-16): a closed three-value enum —
+	// idle, non_canonical, junk — so dashboards see reaping without
+	// parsing suite_reaped lines.
+	suitesReapedTotal = metrics.NewCounterWithCap(
+		"acu_suites_reaped_total",
+		"Suites the suite reaper deleted, by reason: idle, non_canonical or junk (spec C9).",
+		metrics.DefaultMaxSeries,
+		"reason",
 	)
 
 	// freshnessStaleSuites is the per-tick gauge of suites whose

@@ -619,9 +619,9 @@ type Adopter struct {
 	// reparseSnapshotRelease (GPG-verified Release re-parse) and found zero
 	// missing requestable members. Clearing this map forces a full re-check,
 	// which is the right behavior for the on-demand /reconcile endpoint.
-	// Entries are never reaped; growth is bounded by distinct AUTOINCREMENT
-	// snapshot IDs over the process lifetime — the same long-tail profile the
-	// per-suite `locks` map (freshness.go) already accepts.
+	// Each reaper run drops the entries of snapshots that are no suite's
+	// current one (sweepReconcileMemo, spec C9), so the memo stays bounded
+	// by the suite table rather than by every snapshot id the process saw.
 	reconciledSnapshots sync.Map // map[int64]struct{}
 
 	logger *slog.Logger
