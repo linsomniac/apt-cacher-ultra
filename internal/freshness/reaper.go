@@ -90,6 +90,9 @@ type Reaper struct {
 	// sniffs holds the previous run's junk verdicts by blob (ruling R-F3);
 	// only the run's goroutine touches it.
 	sniffs map[sniffKey]bool
+	// readHead reads the head of a pool file for the junk scan (readCapped;
+	// tests count its reads or end the run's context at one).
+	readHead func(path string, limit int64) ([]byte, error)
 	// dailyAt is when the marker sweep last ran (monotonic; zero: due);
 	// reportedMarker is the marker stamped furthest in the future that the
 	// previous sweep found (design review M-10). Only the run's goroutine
@@ -129,7 +132,7 @@ func NewReaper(cfg ReaperConfig) (*Reaper, error) {
 		logger = slog.Default()
 	}
 	return &Reaper{cache: cfg.Cache, checker: cfg.Checker, idleTTL: cfg.IdleTTL, logger: logger,
-		interval: reapInterval, floor: reapUptimeFloor}, nil
+		interval: reapInterval, floor: reapUptimeFloor, readHead: readCapped}, nil
 }
 
 // Run runs the reaper until ctx ends: the first run once the uptime floor
@@ -552,15 +555,21 @@ func sameSnapshot(a, b *int64) bool {
 // unsigned_disabled or unsigned_too_large would otherwise keep an HTML
 // anchor served forever (a suite without a snapshot has its url_path
 // metadata served as cached, never revalidated). Only blobs read and
-// sniffed are evidence: a missing or unreadable pool file keeps the suite
-// (overview: an I/O fault is never evidence). The evidence is not read
-// again under the hold, which re-reads only the current snapshot
-// (reapHeld): between the scan and the hold a junk suite's anchor rows
-// change only through an adoption, which that comparison catches, or
-// through url_path GC or a miss that re-fetched a row whose pool file had
-// gone, after which the reap costs the suite one fetch at its next
-// request. The sniffs run here, on the reaper's goroutine, never on the
-// writer (ruling PD-5).
+// sniffed are evidence: a missing or unreadable pool file of a blob no
+// earlier run sniffed keeps the suite (overview: an I/O fault is never
+// evidence; a blob an earlier run sniffed keeps its verdict, since the
+// pool is content-addressed), and an anchor no sniff applies to
+// (aptpath.NotSuiteFile: a suite path over MaxSuitePathBytes) is never
+// evidence and never read. The evidence is not read again under the hold,
+// which re-reads only the current snapshot (reapHeld): between the scan
+// and the hold a junk suite's anchor rows change only through an
+// adoption, which that comparison catches, or through url_path GC or a
+// miss that re-fetched a row whose pool file had gone, after which the
+// reap costs the suite one fetch at its next request. The sniffs run
+// here, on the reaper's goroutine, never on the writer (ruling PD-5). The
+// scan checks ctx per suite: a shutdown does not wait for the first run's
+// reads after a restart (up to 64 KiB per anchor not yet sniffed); cut
+// short, it returns no candidate and keeps the previous run's verdicts.
 func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdoption, have []reapCandidate, now time.Time) []reapCandidate {
 	anchors, err := r.cache.ListUnadoptedSuiteAnchors(ctx)
 	if err != nil {
@@ -580,13 +589,20 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 	var fails junkReadFailures
 	var out []reapCandidate
 	for i := range rows {
+		if ctx.Err() != nil {
+			return nil // a shutdown (the Task 7 review's minor 7): r.sniffs keeps the previous run's verdicts
+		}
 		s := &rows[i].SuiteFreshness
 		key := cache.SuiteKey{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath}
 		as := bySuite[key]
 		if listed[key] || len(as) == 0 || !r.allJunk(key, as, cutoff, next, &fails) {
 			continue
 		}
-		out = append(out, reapCandidate{key: key, requested: s.LastRequestedAt, reason: "junk", cutoff: cache.ReapRegardless})
+		// current stays nil: the compare under the hold (reapHeld) and the
+		// compare-and-delete in ReapIdleSuite then require a suite still
+		// unadopted, the only kind the junk rule reaps.
+		out = append(out, reapCandidate{key: key, current: nil, requested: s.LastRequestedAt, reason: "junk",
+			cutoff: cache.ReapRegardless})
 	}
 	r.sniffs = next
 	if fails.n > 0 {
@@ -607,26 +623,33 @@ type junkReadFailures struct {
 // allJunk reports whether every one of key's cached anchor rows holds a
 // blob fetched at or before cutoff that is junk evidence (anchorEvidence).
 // A row without a blob or a fetch stamp, a fetch stamp after cutoff (a
-// future one included: the clock-step rule), or a pool file that is
-// missing or does not read, is no evidence; a read that fails for another
-// reason than a missing file is counted in fails. Each verdict goes into
-// next; one the previous run reached (r.sniffs) is reused without reading
-// the pool file again, so a run reads only the anchors it has not sniffed
-// (at most 64 KiB each).
+// future one included: the clock-step rule), an anchor no sniff applies
+// to (aptpath.NotSuiteFile), or a pool file that is missing or does not
+// read, is no evidence; a read that fails for another reason than a
+// missing file is counted in fails. Each verdict goes into next; one this
+// run (next) or the previous run (r.sniffs) reached is reused without
+// reading the pool file again, so a run reads each blob it has not
+// sniffed once, however many suites share it (at most 64 KiB each).
 func (r *Reaper) allJunk(key cache.SuiteKey, as []cache.SuiteAnchorRow, cutoff int64, next map[sniffKey]bool, fails *junkReadFailures) bool {
 	for _, a := range as {
 		if a.BlobHash == nil || a.LastFetchedAt == nil || *a.LastFetchedAt > cutoff {
 			return false
 		}
 		file := aptpath.ClassifySuiteFile(key.SuitePath, a.Path)
+		if file == aptpath.NotSuiteFile {
+			return false // no sniff applies: never evidence, never read (the Task 7 review's minor 5)
+		}
 		k := sniffKey{file: file, hash: *a.BlobHash}
-		junk, ok := r.sniffs[k]
+		junk, ok := next[k]
+		if !ok {
+			junk, ok = r.sniffs[k]
+		}
 		if !ok {
 			n := file.HeadBytes()
 			if file == aptpath.FileInRelease {
 				n = aptpath.FileRelease.HeadBytes() // the Release sniff reads up to 64 KiB
 			}
-			head, err := readCapped(r.cache.BlobPath(*a.BlobHash), int64(n))
+			head, err := r.readHead(r.cache.BlobPath(*a.BlobHash), int64(n))
 			if err != nil && !errors.Is(err, errAnchorTooLarge) {
 				if !errors.Is(err, fs.ErrNotExist) {
 					if fails.n == 0 {
