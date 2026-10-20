@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"slices"
 	"time"
@@ -40,6 +41,10 @@ const (
 	// bounds CommitAdoption (design review M-2): a wedged writer releases
 	// the suite after it instead of holding it until shutdown.
 	suiteHoldTimeout = 5 * time.Minute
+	// junkGrace is ruling R-F3's grace (design note 8): a legacy junk
+	// suite's cached anchor rows must all have been fetched at least this
+	// long ago, so a transient soft-404 is never taken for junk.
+	junkGrace = 24 * time.Hour
 )
 
 // ReaperConfig configures a Reaper.
@@ -74,12 +79,22 @@ type Reaper struct {
 	// Only the run's goroutine touches them.
 	lastWall, lastMono, deferUntil time.Time
 	reported                       futureStamp
+	// sniffs holds the previous run's junk verdicts by blob (ruling R-F3);
+	// only the run's goroutine touches it.
+	sniffs map[sniffKey]bool
 }
 
 // futureStamp is a suite's stamp found in the future.
 type futureStamp struct {
 	key   cache.SuiteKey
 	stamp int64
+}
+
+// sniffKey keys a junk verdict: what a blob's head is to one kind of
+// anchor never changes, since the pool is content-addressed.
+type sniffKey struct {
+	file aptpath.SuiteFile
+	hash string
 }
 
 // NewReaper returns a reaper over cfg.Cache whose suite holds and
@@ -142,9 +157,10 @@ type reapCandidate struct {
 }
 
 // runOnce is one reaper run (spec C9): unless a forward step of the wall
-// clock defers it, reap at most reapsPerRun of the candidates, those
-// reaped regardless of idleness first, then the oldest; then sweep the
-// reconcile memo against the current snapshots.
+// clock defers it, reap at most reapsPerRun of the candidates — idle,
+// non-canonical and legacy junk (junkCandidates, every run: ruling PF-4)
+// — those reaped regardless of idleness first, then the oldest; then
+// sweep the reconcile memo against the current snapshots.
 func (r *Reaper) runOnce(ctx context.Context) {
 	rows, err := r.cache.ListSuitesWithAdoption(ctx)
 	if err != nil {
@@ -155,6 +171,8 @@ func (r *Reaper) runOnce(ctx context.Context) {
 	deferred := r.deferredByForwardStep(now, time.Now())
 	if !deferred && r.idleTTL > 0 {
 		cands := r.candidates(rows, now)
+		cands = append(cands, r.junkCandidates(ctx, rows, cands, now)...)
+		sortCandidates(cands)
 		for _, c := range cands[:min(len(cands), reapsPerRun)] {
 			if ctx.Err() != nil {
 				return
@@ -375,6 +393,135 @@ func (r *Reaper) warn(ctx context.Context, msg string, args ...any) {
 // sameSnapshot reports whether two optional snapshot ids are equal.
 func sameSnapshot(a, b *int64) bool {
 	return (a == nil) == (b == nil) && (a == nil || *a == *b)
+}
+
+// junkCandidates returns ruling R-F3's legacy junk suites that are not
+// already in have, as candidates reaped regardless of idleness: a suite
+// without a current snapshot whose cached anchor rows (InRelease, Release,
+// Release.gpg) — at least one — were all fetched at least junkGrace ago
+// and are all junk evidence (anchorEvidence). A read failure of the anchor
+// rows skips the rule for this run; pool reads that fail are logged once,
+// with their count (design review M-4).
+//
+// AIDEV-NOTE: legacy junk is a suite a v6 binary created for an HTML page
+// served as InRelease: every anchor serve with a status below 400 touches
+// it, so idleness never reaps it, and the hot path does not sniff (ruling
+// R-F3). The scan runs every run (ruling PF-4): such a suite fails its
+// clients' updates, and the scan is one indexed read on the pool
+// (ListUnadoptedSuiteAnchors) plus pool reads only for the blobs no
+// earlier run sniffed. Two things keep a real suite: the grace (design
+// note 8: a transient soft-404 that replaced a good anchor is younger; its
+// next check or a later miss heals the row) and the content rule (ruling
+// PF-3, design note 9: a plain-text Release cached as InRelease is a
+// §6.1-quarantined plain-text suite phase E adopts unsigned, not junk).
+// Adoption records are ignored: a failed adoption's record,
+// unsigned_disabled or unsigned_too_large would otherwise keep an HTML
+// anchor served forever (a suite without a snapshot has its url_path
+// metadata served as cached, never revalidated). Only blobs read and
+// sniffed are evidence: a missing or unreadable pool file keeps the suite
+// (overview: an I/O fault is never evidence). The evidence is not read
+// again under the hold, which re-reads only the current snapshot
+// (reapSuite): between the scan and the hold a junk suite's anchor rows
+// change only through an adoption, which that comparison catches, or
+// through url_path GC or a miss that re-fetched a row whose pool file had
+// gone, after which the reap costs the suite one fetch at its next
+// request. The sniffs run here, on the reaper's goroutine, never on the
+// writer (ruling PD-5).
+func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdoption, have []reapCandidate, now time.Time) []reapCandidate {
+	anchors, err := r.cache.ListUnadoptedSuiteAnchors(ctx)
+	if err != nil {
+		r.warn(ctx, "suite reaper: list unadopted anchors failed", "err", err)
+		return nil
+	}
+	bySuite := map[cache.SuiteKey][]cache.SuiteAnchorRow{}
+	for _, a := range anchors {
+		bySuite[a.SuiteKey] = append(bySuite[a.SuiteKey], a)
+	}
+	listed := map[cache.SuiteKey]bool{}
+	for _, c := range have {
+		listed[c.key] = true
+	}
+	cutoff := now.Add(-junkGrace).Unix()
+	next := map[sniffKey]bool{}
+	var fails junkReadFailures
+	var out []reapCandidate
+	for i := range rows {
+		s := &rows[i].SuiteFreshness
+		key := cache.SuiteKey{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath}
+		as := bySuite[key]
+		if listed[key] || len(as) == 0 || !r.allJunk(key, as, cutoff, next, &fails) {
+			continue
+		}
+		out = append(out, reapCandidate{key: key, requested: s.LastRequestedAt, reason: "junk", cutoff: cache.ReapRegardless})
+	}
+	r.sniffs = next
+	if fails.n > 0 {
+		r.warn(ctx, "suite reaper: junk anchor reads failed", "count", fails.n, "err", fails.first,
+			"canonical_host", fails.host, "path", fails.path)
+	}
+	return out
+}
+
+// junkReadFailures counts one junk scan's failed pool reads, keeping the
+// first, so a scan logs one line however many fail (design review M-4).
+type junkReadFailures struct {
+	n          int
+	first      error
+	host, path string
+}
+
+// allJunk reports whether every one of key's cached anchor rows holds a
+// blob fetched at or before cutoff that is junk evidence (anchorEvidence).
+// A row without a blob or a fetch stamp, a fetch stamp after cutoff (a
+// future one included: the clock-step rule), or a pool file that is
+// missing or does not read, is no evidence; a read that fails for another
+// reason than a missing file is counted in fails. Each verdict goes into
+// next; one the previous run reached (r.sniffs) is reused without reading
+// the pool file again, so a run reads only the anchors it has not sniffed
+// (at most 64 KiB each).
+func (r *Reaper) allJunk(key cache.SuiteKey, as []cache.SuiteAnchorRow, cutoff int64, next map[sniffKey]bool, fails *junkReadFailures) bool {
+	for _, a := range as {
+		if a.BlobHash == nil || a.LastFetchedAt == nil || *a.LastFetchedAt > cutoff {
+			return false
+		}
+		file := aptpath.ClassifySuiteFile(key.SuitePath, a.Path)
+		k := sniffKey{file: file, hash: *a.BlobHash}
+		junk, ok := r.sniffs[k]
+		if !ok {
+			n := file.HeadBytes()
+			if file == aptpath.FileInRelease {
+				n = aptpath.FileRelease.HeadBytes() // the Release sniff reads up to 64 KiB
+			}
+			head, err := readCapped(r.cache.BlobPath(*a.BlobHash), int64(n))
+			if err != nil && !errors.Is(err, errAnchorTooLarge) {
+				if !errors.Is(err, fs.ErrNotExist) {
+					if fails.n == 0 {
+						fails.first, fails.host, fails.path = err, key.CanonicalHost, a.Path
+					}
+					fails.n++
+				}
+				return false
+			}
+			junk = anchorEvidence(file, a.Path, head)
+		}
+		next[k] = junk
+		if !junk {
+			return false
+		}
+	}
+	return true
+}
+
+// anchorEvidence reports whether head, the start of a cached anchor of
+// kind file at path, is junk evidence (ruling PF-3): it fails its own
+// sniff and, for an InRelease, the Release sniff too — a plain-text
+// Release cached as InRelease is a §6.1-quarantined plain-text suite on
+// its way to an unsigned adoption through Release, not junk.
+func anchorEvidence(file aptpath.SuiteFile, path string, head []byte) bool {
+	if file.Sniff(path, head) {
+		return false
+	}
+	return file != aptpath.FileInRelease || !aptpath.FileRelease.Sniff(path, head)
 }
 
 // sweepReconcileMemo drops the adopter's reconcile memo entries

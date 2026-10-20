@@ -447,3 +447,55 @@ func deleteBaseAnchorsTx(ctx context.Context, tx *sql.Tx, host, base string, now
 	}
 	return n, nil
 }
+
+// SuiteAnchorRow is a cached anchor url_path row — <suite>/InRelease,
+// <suite>/Release or <suite>/Release.gpg — of a suite without a current
+// snapshot: the evidence of the reaper's legacy junk rule (ruling R-F3).
+type SuiteAnchorRow struct {
+	SuiteKey
+	Path          string
+	BlobHash      *string
+	LastFetchedAt *int64
+}
+
+// unadoptedSuiteAnchorsSQL is ListUnadoptedSuiteAnchors' query.
+//
+// AIDEV-NOTE: design review M-14: SQLite drives from suite_freshness and
+// probes url_path's unique key (canonical_scheme, canonical_host, path)
+// once per anchor path, so the cost grows with the suites, not with
+// url_path (measured: 73 ms for 5,000 suites over 215,000 url_path rows,
+// on the read pool). Keep the join's url_path terms bare columns: an
+// expression on them turns each probe into a scan of the host's rows
+// (TestListUnadoptedSuiteAnchors_ProbesURLPathByItsKey pins the plan).
+const unadoptedSuiteAnchorsSQL = `
+SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path, u.path, u.blob_hash, u.last_fetched_at
+  FROM suite_freshness sf
+  JOIN url_path u
+    ON u.canonical_scheme = sf.canonical_scheme
+   AND u.canonical_host   = sf.canonical_host
+   AND u.path IN (sf.suite_path || '/InRelease', sf.suite_path || '/Release', sf.suite_path || '/Release.gpg')
+ WHERE sf.current_snapshot_id IS NULL
+ ORDER BY sf.canonical_scheme, sf.canonical_host, sf.suite_path, u.path`
+
+// ListUnadoptedSuiteAnchors returns the cached anchor rows of every suite
+// that has no current snapshot, in suite and path order. One read on the
+// pool per reaper run.
+func (c *Cache) ListUnadoptedSuiteAnchors(ctx context.Context) ([]SuiteAnchorRow, error) {
+	rows, err := c.db.QueryContext(ctx, unadoptedSuiteAnchorsSQL)
+	if err != nil {
+		return nil, fmt.Errorf("ListUnadoptedSuiteAnchors: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []SuiteAnchorRow
+	for rows.Next() {
+		var a SuiteAnchorRow
+		if err := rows.Scan(&a.CanonicalScheme, &a.CanonicalHost, &a.SuitePath, &a.Path, &a.BlobHash, &a.LastFetchedAt); err != nil {
+			return nil, fmt.Errorf("ListUnadoptedSuiteAnchors: scan: %w", err)
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListUnadoptedSuiteAnchors: %w", err)
+	}
+	return out, nil
+}
