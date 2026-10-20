@@ -117,9 +117,13 @@ flip_quiet_period     = "10s"
 # consistent observations). Such a snapshot never vouches a .deb or counts
 # for strict mode, and is refused once a signed anchor has been served for
 # the suite (which a party able to inject one can use to block it; see the
-# reference). false refuses them (unsigned_disabled): suites not yet adopted
-# stay unadopted, and unsigned suites already adopted keep their last
-# snapshot, not updated, until this is turned back on.
+# reference). false refuses them (unsigned_disabled), so the cache no longer
+# keeps unsigned repositories fresh: an unsigned suite already adopted keeps
+# its last snapshot, not updated, until this is turned back on or the suite
+# is forgotten or reaped; one not yet adopted (a forgotten or reaped one
+# included, from its next request) is served as the cache first stores
+# each file, never refreshed. Set false only if this cache serves no
+# unsigned repositories.
 adopt_unsigned        = true
 
 [integrity]
@@ -141,7 +145,8 @@ window = "24h"  # nonnegative; 0s permits deletion in the same GC batch
 
 [retention]
 # Newest distinct Debian versions retained/prefetched per package + arch
-# per suite. Recent use and hold_packages.window can retain older versions.
+# per suite with a current snapshot. Recent use and hold_packages.window
+# can retain older versions.
 max_versions_per_package = 3  # >= 1
 
 [gc]
@@ -162,9 +167,12 @@ heartbeat_interval  = "60s"
 # artifacts stay protected. Blob reclamation follows after blob_grace.
 url_path_ttl        = "168h"
 # A suite no client asked for in this long is reaped: its metadata rows and
-# its row; its snapshots go with the next GC runs. Its next request makes it
-# new again, from upstream. 0s disables suite reaping (an offline or archive
-# cache); otherwise >= 24h.
+# its row; its snapshots go with the next periodic GC runs. Its next
+# request makes it new again, from upstream. The reap deletes no package,
+# but its packages lose the version retention its snapshot gave them:
+# with GC on and url_path_ttl > 0s, those no client asked for within
+# url_path_ttl go after hold_packages.window. 0s disables suite reaping
+# (an offline or archive cache); otherwise >= 24h.
 suite_idle_ttl      = "720h"
 # GC numeric constraints still apply when enabled=false; suite reaping runs
 # with the freshness checker whatever enabled says.

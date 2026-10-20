@@ -255,7 +255,8 @@ host's new suites and evicts nothing for them; its suites go when the suite
 reaper removes those not requested for `gc.suite_idle_ttl` (30 days by
 default; see *Suite reaping* under `[gc]`), or when
 a new suite of any host at the total cap evicts one of its idle suites (no
-adopted snapshot, not requested for 24 hours). A table
+adopted snapshot, not requested for 24 hours) — with
+`gc.suite_idle_ttl = "0s"` only the latter. A table
 at exactly the total cap logs no warning: that is a full cache working
 normally, where a new suite evicts an idle one and is refused only when
 none qualifies (WARN `suite_seed_rejected`).
@@ -316,7 +317,7 @@ the hit that creates the suite's row).
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
-| `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them, so tracked suites lag upstream by design: the status page's SUITES vital then reads "ADOPTION DISABLED — METADATA NOT REFRESHED" (stale, not a fault), rows keep their lag text without warning, and failure records left from a time adoption was enabled are inert (no retries, `acu_adoption_failing_suites` reports 0). |
+| `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them, so tracked suites lag upstream by design: the status page's SUITES vital then reads "ADOPTION DISABLED — METADATA NOT REFRESHED" (stale, not a fault), rows keep their lag text without warning, and failure records left from a time adoption was enabled are inert (no retries, `acu_adoption_failing_suites` reports 0). The suite reaper still runs (see *Suite reaping* under `[gc]`): a suite no client asked for in `gc.suite_idle_ttl` has its cached index files deleted, so clients that come back to it fetch upstream's current files through the cache, which then stay as fetched. |
 | `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are adopted in the unsigned form instead (`adopt_unsigned`). |
 | `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` refuses every unsigned `Release` ("refused: unsigned_disabled", a state, not a failed check), so the cache no longer keeps unsigned repositories fresh: an unsigned suite already adopted keeps serving its last snapshot, coherent but frozen — never updated — until the knob is turned back on (it then updates at its next retry, at most 75 minutes later: a restart keeps a refusal's retry time), the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, which is worse: the forget or reap deletes its cached index files first, so its next requests fetch upstream's current files, but it stays unadopted and each file then stays as the cache first stored it, never refreshed, so an upstream publish can leave its clients with Hash Sum mismatches. Set it to `false` only if you do not serve unsigned repositories through the cache. Either way the suite is asked upstream again only at its retry times (2 minutes, doubling to an hour; for a suite not yet adopted, also once `periodic_refresh` has passed), never at the checks clients trigger in between. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
 | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
@@ -617,7 +618,7 @@ suite's next adoption.
 | --- | --- | --- | --- |
 | `hot_packages.window` | duration | `"24h"` | Look back this far for client-requested packages when choosing versions to prefetch during adoption. `"0s"` disables hot-package prefetch. Nonnegative. |
 | `hold_packages.window` | duration | `"24h"` | Grace after GC first notices a cached URL is no longer retained by recency or current-snapshot rules. `"0s"` permits deletion in that GC batch. Nonnegative. |
-| `retention.max_versions_per_package` | integer | `3` | Newest distinct Debian versions retained and eligible for hot prefetch per package name and architecture, per suite. Must be at least `1`. |
+| `retention.max_versions_per_package` | integer | `3` | Newest distinct Debian versions retained and eligible for hot prefetch per package name and architecture, per suite with a current snapshot (a reaped suite has none: see *Suite reaping* under `[gc]`). Must be at least `1`. |
 
 Hot prefetch runs **before** the snapshot switches, using package identities
 requested from the previous snapshot; it does not download every package in the
@@ -682,17 +683,17 @@ served an unvouched package.
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
-| `enabled` | boolean | `true` | Run startup and periodic garbage collection, including the startup orphan-file scan. `false` disables those passes and logs a warning. It does not stop the suite reaper, which deletes idle suites' cached index files whatever this says (see *Suite reaping*; `suite_idle_ttl = "0s"` turns it off). |
+| `enabled` | boolean | `true` | Run startup and periodic garbage collection, including the startup orphan-file scan. `false` disables those passes and logs WARN `gc_disabled`, whose `detail` ends by saying whether suite reaping still runs (`suite reaping still runs: gc.suite_idle_ttl = 720h0m0s …`, the value in Go's duration format, or `suite reaping is off too`). It does not stop the suite reaper, which deletes idle suites' cached index files whatever this says (see *Suite reaping*; `suite_idle_ttl = "0s"` turns it off). |
 | `interval` | duration | `"24h"` | Delay after a GC tick completes before the next periodic tick. Must be positive; disable through `enabled`. |
 | `batch_size` | integer | `100` | Maximum URL-path/blob rows processed per GC batch. At least `1`. |
 | `snapshot_batch_size` | integer | `10` | Maximum snapshots removed per batch. Snapshot deletion can cascade through many member rows. At least `1`. |
-| `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. Must be positive. |
+| `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. The startup pass, which runs before the listeners serve, deletes no retired snapshot (of a reaped, evicted or forgotten suite, or one the upgrade's trust audit quarantined): the periodic passes do, normally the first one after the start (see *Suite reaping*). Must be positive. |
 | `blob_grace` | duration | `"5m"` | Grace after a blob's reference count reaches zero before deletion. At least `"1s"`, and greater than twice `heartbeat_interval`. |
 | `keep_displaced` | integer | `3` | Recent displaced snapshots kept per suite for inspection. `0` retains none; must be nonnegative. Does not by itself retain superseded package binaries. Also bounds retained by-hash: a by-hash request the current snapshot lacks is served from the newest `keep_displaced` + 1 displaced snapshots of its suite, and `0` turns that off (see *Flip consistency*). |
 | `pool_scan_workers` | integer | `4` | Workers for the startup orphan-file scan. At least `1`. |
 | `heartbeat_interval` | duration | `"60s"` | Refresh in-progress adoption liveness and blob protection. Positive and subject to both bounds below. |
 | `url_path_ttl` | duration | `"168h"` | Requests within this window protect cached URL rows. Older or never-requested rows are evaluated against snapshot/version retention and hold grace. `"0s"` disables URL-path expiration; other values must be at least `"1m"`. |
-| `suite_idle_ttl` | duration | `"720h"` | A tracked suite no client has asked for in this long is reaped: no longer tracked, its cached index files and snapshots deleted (see *Suite reaping*). `"0s"` disables suite reaping; other values must be at least `"24h"`. |
+| `suite_idle_ttl` | duration | `"720h"` | A tracked suite no client has asked for in this long is reaped: no longer tracked, its cached index files and snapshots deleted (see *Suite reaping*). The reap deletes no package, but the suite's packages lose the version retention its snapshot gave them: with `enabled = true` and a nonzero `url_path_ttl`, GC then deletes those no client asked for within `url_path_ttl`, after `hold_packages.window`. `"0s"` disables suite reaping (a host at its per-host cap then loses suites only to eviction at the total cap, see *Tracked suites*); other values must be at least `"24h"`. |
 
 Startup still runs the orphan-file scan and a GC tick. Periodic ticks wait a full
 `interval` after the previous tick completes, so a long run cannot trigger an
@@ -724,16 +725,26 @@ client has asked for in `suite_idle_ttl`: a client asks for a suite when it
 fetches the suite's `InRelease`, `Release` or `Release.gpg`, or a `.deb`
 its snapshot vouches for, through the cache. The reaper runs an hour after
 the daemon starts and then every hour, whatever `interval` and `enabled`
-say. A run deletes at most 25 suites — first those reaped however
-recently they were asked for (below), then those asked for least
-recently; a suite being checked or adopted at that moment is skipped and
-tried again at the next run. Reaping a suite deletes its cached index
-files (its `InRelease`, `Release`, `Packages` and the rest of its `dists/`
-tree, in batches of 1,000 files; packages are not touched), retires its
-snapshots and deletes its row (INFO `suite_reaped`;
-`acu_suites_reaped_total{reason}` counts the reaps). The next GC passes
-delete the retired snapshots, and then the pool files nothing else uses,
-once `blob_grace` has passed; with `enabled = false` suites are still
+say. A run deletes at most 250 of the suites reaped however recently
+they were asked for (below), first, and at most 25 idle ones, those
+asked for least recently first; a suite being checked or adopted at
+that moment is skipped — it counts toward its kind's number — and tried
+again at the next run. Reaping a suite deletes its cached index files
+(its `InRelease`, `Release`, `Packages` and the rest of its `dists/`
+tree, in batches of 1,000 files), retires its snapshots and deletes its
+row (INFO `suite_reaped`; `acu_suites_reaped_total{reason}` counts the
+reaps). The reaper deletes no package, but a reaped suite's packages
+lose the version retention its snapshot gave them
+(`retention.max_versions_per_package` counts versions in current
+snapshots only; a package another suite's snapshot lists keeps that
+one's): with `enabled = true` and a nonzero `url_path_ttl`, GC deletes
+those no client asked for within `url_path_ttl`, after
+`hold_packages.window`, and their pool files after `blob_grace`. The
+next periodic GC passes delete the retired snapshots, and then the pool
+files nothing else uses, once `blob_grace` has passed — not the pass at
+startup (after a restart the periodic passes delete them, normally the
+first one), so a restart after many reaps does not keep the listeners
+closed while they are deleted; with `enabled = false` suites are still
 reaped, but their snapshots and pool files stay until GC runs again.
 
 A reaped suite whose clients come back is tracked again at their first
@@ -745,10 +756,21 @@ for a while — an offline or archive cache — sets `suite_idle_ttl = "0s"`.
 With `adoption.adopt_unsigned = false` a returning unsigned repository
 is not adopted again: it is refused `unsigned_disabled` and served as
 the cache first stores each of its files, never refreshed (see
-`adopt_unsigned` under `[adoption]`).
+`adopt_unsigned` under `[adoption]`). A client in the middle of an update
+when its suite is reaped can see one Hash Sum mismatch, as with a forget
+(see *Forgetting a suite* under `[admin]`).
 The record that a repository path was seen signed survives the reap, so
 the returning suite is never adopted unsigned (see *Anchor forms and
-unsigned repositories*); the reaper deletes that record only when no
+unsigned repositories*). A suite whose only evidence of a signature is
+its signed snapshot — one the upgrade's trust audit could not read yet,
+for example (see *Upgrading an existing cache*) — gets that record when
+it is reaped or evicted at the `freshness.max_suites` cap, before its
+snapshot is retired. That record stays even if a later start's audit
+reads the snapshot and quarantines it: the path then keeps refusing an
+unsigned `Release` (`unsigned_downgrade_refused`) until a suite of it,
+tracked again at a client's request, is forgotten (`POST /forget`), or,
+while no suite of the path is tracked, the reaper deletes the record a
+year later. The reaper deletes that record only when no
 suite of the path has a row and the path was last seen signed — or a
 suite of it last reaped, evicted at the `freshness.max_suites` cap or
 forgotten, each of which moves the record's date up to that moment —
@@ -783,7 +805,15 @@ a step while the daemon runs (a resumed virtual machine or laptop: the
 wall clock moved more than an hour further than the time that passed) is
 logged as WARN `clock_step_detected` with `stamp=wall_clock` and holds
 the reaper's deletions back for an hour; a suite reaped anyway comes back
-at its next request, as above. `"0s"` turns suite reaping off; the reaper
+at its next request, as above. A deleted record of a signed path does
+not come back, so a step never makes the reaper delete one early: a step
+it sees while running is left out of the records' age until the daemon
+stops, and its first record sweep comes a day after the start (then one
+a day), so a clock that was ahead at the start has a day to be
+corrected. Two limits remain: a step the daemon was restarted across,
+not corrected within a day of the start, makes the sweep delete records
+up to the step early; and a daemon restarted more often than daily
+never sweeps those records. `"0s"` turns suite reaping off; the reaper
 then only deletes the year-old records of signed paths no suite tracks.
 
 ## `[admin]`: status, metrics, and maintenance
@@ -884,7 +914,8 @@ curl -sS --fail-with-body -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 
 # 403 = the header is missing, or a browser request from another origin
 # 409 = busy (being checked or adopted: try again) or no such suite (check the
 #   scheme, which defaults to https, and the host and suite the status page shows)
-# 500 = a database error (logged as WARN admin: forget failed)
+# 500 = a database error (logged as WARN admin: forget failed); repeat it:
+#   409 then means it was forgotten after all (or is busy)
 # 503 = the daemon began shutting down while the forget ran; repeat it once it is back
 ```
 
@@ -894,7 +925,8 @@ prints the body and then the status.
 
 Each accepted request is logged as INFO `admin_forget_requested` (a
 request refused with 400, 403 or 413 is not), and each suite forgotten
-as INFO `suite_forgotten`.
+as INFO `suite_forgotten` — with `settled=true` when its final delete
+committed although the request then failed (500, or 503 at shutdown).
 
 ## `[serve]`: stale responses
 

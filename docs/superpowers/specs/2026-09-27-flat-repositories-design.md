@@ -1,6 +1,6 @@
 # Flat repositories, eager adoption, and suite lifecycle — design
 
-- **Date:** 2026-09-27 (revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9) and task reviews (ruling PF-10): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503); revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
+- **Date:** 2026-09-27 (revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9), task reviews (rulings PF-10, PF-11) and the final review (rulings PF-12–PF-15): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); a hand edit that adds one field to one log line touches that function, not the whole file, for the deferred-minor rule (PF-11); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503); after the phase F final review: before it retires a suite's snapshots, every suite-row delete turns never-downgrade's snapshot clause into a marker — when the suite has an adopted, non-retired inline or detached snapshot it upserts its base's marker under the suite's scheme, the one marker a delete creates (PF-12); a forward step the reaper detects never ages a marker (the sweep's cutoff takes off every step detected since the reaper started), and the first sweep is due a day after the reaper starts, so a start with the clock ahead has a day to be corrected (PF-13); the classes reaped regardless of idleness have their own budget of 250 a run, tried first, beside the 25 idle suites (PF-14); the startup GC pass runs no sub-job C (PF-15); a reaped suite's packages lose the version retention its snapshot gave them; a `/forget` panic is logged with its suite (`where=forget`), and a forget whose writer call failed after its commit is logged (`suite_forgotten`, `settled=true`); revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
 - **Status:** draft for maintainer review
 - **Branch:** `feature/flat-repos` (from `main` @ 536a1ab)
 - **Origin:** reimplementation of the problem reported in PR #8 ("Refresh flat
@@ -60,7 +60,11 @@ Implementation is phased safety-nets-first (§9).
 
 - Changing the shipped default `adoption.enabled = false`. **With adoption
   disabled no repository (flat or `dists/`) refreshes its metadata** — the
-  documented Phase 1 contract (`TestCheck_NoAdopter_ChangeOnlyLogged`). Every
+  documented Phase 1 contract (`TestCheck_NoAdopter_ChangeOnlyLogged`); only
+  the suite reaper (C9), which runs whatever adoption says, deletes an idle
+  suite's cached metadata, so clients that return to a suite after
+  `gc.suite_idle_ttl` fetch upstream's files of that time through the
+  cache, which then stay as fetched. Every
   refresh mechanism in this design, including the anchorless refresh,
   requires adoption to be enabled; the docs say so prominently.
 - Host-root flat repositories (`deb https://h/ /`); multi-segment `dists/`
@@ -285,12 +289,15 @@ refused while the count stays at or above the cap, so the table converges
 under the 24 h rule (phase D, ruling PD-8). The per-host cap never evicts:
 a host at its cap shrinks through the reaper (C9, `gc.suite_idle_ttl`, 30
 days by default), or when global-cap eviction — whose candidates come from
-every host — takes one of its idle suites. The daemon logs WARN `suite_caps_exceeded` at start
+every host — takes one of its idle suites (with `gc.suite_idle_ttl = 0s`,
+only then). The daemon logs WARN `suite_caps_exceeded` at start
 when the table is above the global cap or a host is at its cap — at
 exactly the global cap a creation evicts, so a full table is normal
 operation and logs nothing (phase D, ruling PD-12). An
 eviction leaves the evictee's `url_path` rows to `url_path` GC, drops its
-lock-map, flip-gate and touch entries, and logs INFO `suite_evicted`.
+lock-map and touch entries and its flip-gate entry unless that entry is
+live (a live entry expires on its own; phase F, ruling R-F2), and logs
+INFO `suite_evicted`.
 Otherwise the creation creates nothing and emits a rate-limited WARN
 `suite_seed_rejected` ("suite will not refresh"; one line a minute, field
 `suppressed`), the counter `acu_suite_seed_rejected_total{host}` (refusals
@@ -377,7 +384,8 @@ from client-serving paths:
   install-only clients keep their suite alive.
 
 Touches are coalesced in memory (at most one write per suite per hour; the
-map holds only tracked suites and is purged on reap and on eviction). The
+map holds only tracked suites and is purged when a suite row is deleted: a
+reap, an eviction or a forget). The
 coalescing is monotonic: after a forward wall-clock step of 23 h or more, an
 active suite without a snapshot keeps its pre-step stamp for up to an hour
 and is evictable meanwhile — bounded and self-healing. A stamp in the future
@@ -450,7 +458,10 @@ that have a `suite_freshness` row. Writers:
   marked under its own row's scheme. Residual: an anchor cached under the
   other scheme while its suite has no row (refused at the cap) after the
   re-mark ran — served signed during the adoption's flip barrier — earns
-  no marker before that commit (C5).
+  no marker before that commit (C5);
+- a suite-row delete (phase F, ruling PF-12), in its transaction, before
+  it retires the suite's snapshots: the marker of a base whose suite has
+  an adopted, non-retired inline or detached snapshot (below).
 
 A plain-text "InRelease" fails the sniff and never creates a marker. The
 marker survives suite reaping: the reaper sweeps a marker only once no
@@ -461,6 +472,21 @@ never rewritten, C9). Every suite-row delete — cap eviction, a reap, a
 forget — moves the base's markers, under both schemes, up to its time
 (`MAX(last_seen_at, now)`, in the deleting transaction; phase F, ruling
 PF-10), so the year counts from the end of the suite's tracking.
+Before it retires the suite's snapshots, the same transaction turns
+never-downgrade's snapshot clause (C5 safeguard 3) into a marker, since
+a retired snapshot is no history: when the suite has an adopted,
+non-retired inline or detached snapshot — a pre-v7 one the trust audit
+left queued and unmarked after a pool read fault (§6.1, M-8), for
+instance — it upserts the marker of its base under the suite's scheme
+(`MAX(last_seen_at, now)`; phase F, ruling PF-12). That is the one
+marker a delete creates: a base without such a snapshot gets none.
+Accepted residual of PF-12: a marker written from a snapshot the audit
+had left queued stays if a later audit quarantines that snapshot — a
+quarantine writes no marker and deletes none — so the base keeps
+refusing unsigned candidates (it fails closed) until a suite of the
+base, tracked again at a client's request, is forgotten (`POST
+/forget`), or, with no suite of the base tracked, the orphan sweep
+deletes the marker after its year.
 `POST /forget` deletes the base's markers, under both schemes — and the
 cached `InRelease`, `Release` and `Release.gpg` of the base and its `/.`
 twin under both schemes, which the unsigned commit's re-mark would
@@ -756,7 +782,10 @@ and re-recording restarts it: reading it as infinitely old would skip a
 confirmation (phase E, deviation 2 and ruling PE-1; C4 Dispatch 1, C5
 safeguard 2).
 `next_retry_at` is only clamped to `now + 1h` (C7). Each detection emits a
-rate-limited WARN `clock_step_detected`. Touch coalescing and all in-memory
+rate-limited WARN `clock_step_detected`, except the suite reaper's
+reports — the furthest future `last_requested_at` and `last_seen_at`,
+each once per change, and a forward step of the wall clock — which it
+bounds itself and logs directly (C9). Touch coalescing and all in-memory
 timing use monotonic time. Since C8's monotonic stamp, `adopted_at` can
 legitimately lead the clock (by 1 s per same-second flip, by up to a
 backward step's length after one); no gate reads it as a past event today,
@@ -935,8 +964,12 @@ upgrade (§6.1).
    detached snapshot of the base or its `/.` twin exists under either
    scheme (M-8: also a signed displaced snapshot the audit left queued and
    unmarked while it quarantined the current one). The marker outlives
-   reaping, covers the `./` twin, and is committed in the writer operation
-   that stores a signed anchor, before any client is served it (C3). One
+   reaping, and a suite-row delete writes one for a base whose only
+   history is an adopted signed snapshot, before it retires that snapshot
+   (phase F, ruling PF-12; the marker stays if the audit later
+   quarantines that snapshot, C3); it covers the `/.` twin, and is committed in
+   the writer operation that stores a signed anchor, before any client is
+   served it (C3). One
    rule, one function (`refuseUnsignedDowngrade`: a marker read and a
    snapshot read) at every point it runs: at eligibility, and again
    **inside the `CommitAdoption` writer transaction**, which refuses an
@@ -1215,8 +1248,11 @@ flip other adoptions can queue for up to about 140 s (bounded).
 by-hash clients remain covered by retained by-hash. Answering held requests
 with `503 Retry-After` instead was rejected: apt before 2.3.2 treats a 5xx as
 an item failure without retrying, while answering from the current snapshot is
-today's behaviour. Map entries exist only for suites with rows, expire when
-idle for twice the quiet period, and are purged on reap.
+today's behaviour. Map entries are created only for suites with rows and
+expire when idle for twice the quiet period; a suite-row delete (a reap,
+an eviction, a forget) purges its suite's entry unless it is live — a
+flip, a hold, an anchor serve in flight, or any use within the quiet
+period — which then expires on its own (phase F, ruling R-F2).
 
 **Retained by-hash.** When `trySnapshotHit` misses the current snapshot for a
 `by-hash/SHA256|SHA512/<hex>` member, it looks the alias up in the suite's
@@ -1234,7 +1270,13 @@ member-recovery path) use the serving snapshot's `adopted_at` alone as the
 `ServeContent` modtime — the pool file's mtime only when `adopted_at` cannot
 be read (logged) — so a client's `If-Modified-Since` from the previous
 anchor always gets a 200 after a flip, whatever the clock or a recovery
-rewrite of a pool file does. (`max(pool mtime, adopted_at)`, this rule
+rewrite of a pool file does — within one residual of suite reaping (C9):
+once sub-job C has deleted a reaped or forgotten suite's retired
+snapshots, a backward clock step longer than the time from the reap to
+the re-adoption can stamp the re-adoption below the reaped snapshot, and
+a client still holding that anchor gets a 304 until a later flip is
+stamped above it (a durable per-suite floor needs a schema change).
+(`max(pool mtime, adopted_at)`, this rule
 before phase C's final review, let a pool file written before a backward
 clock step, or rewritten by a recovery, carry a `Last-Modified` the next
 flip's stamp did not exceed: 304s and stale lists until a later flip.)
@@ -1249,8 +1291,9 @@ with this guarantee and its residuals.
 ### C9. Suite lifecycle (limitation #3)
 
 **Snapshot retirement.** `suite_snapshot.retired_at` marks every snapshot of a
-suite incarnation that was reaped or forgotten, in the same transaction that
-removes the suite row. Retired snapshots are invisible to everything that
+suite incarnation that was reaped, evicted at the global cap or forgotten,
+in the same transaction that removes the suite row (`deleteSuiteTx`).
+Retired snapshots are invisible to everything that
 reasons about a suite's history: the natural-key uniqueness (partial index
 `WHERE retired_at IS NULL`), `InsertCandidateSnapshot`'s collision lookup,
 `rollback_refused`, retained by-hash, `DeclaredHashesForPath`,
@@ -1260,14 +1303,21 @@ forgotten suite therefore re-adopts unchanged upstream content at once, and a
 deliberate rollback adopts after `/forget`. Only the adoption stamp still
 sees them: a re-adoption's `adopted_at` stays above every snapshot of the
 suite, retired ones included, so C8's `Last-Modified` never goes back
-(phase F, deferred minor C-11).
+while they remain (phase F, deferred minor C-11; once sub-job C has
+deleted them, C8's residual applies).
 
 **Reaper.** Its own hourly ticker under the freshness checker's lifecycle
 (independent of `gc.interval`, of `gc.enabled` and of the T2 loop), after a
 monotonic uptime floor of 1 h; each run starts an interval after the
-previous one finished. At most 25 suites per run (constant; a busy one
-counts): those reaped regardless of idleness first (phase F, ruling
-PF-4), then the oldest `last_requested_at`. Candidates:
+previous one finished. A run tries at most 250 of the suites reaped
+regardless of idleness (non-canonical and junk rows, below) first, then,
+in the same run, at most 25 idle suites, the oldest `last_requested_at`
+first (constants; a busy suite counts against its own class's budget;
+phase F, rulings PF-4, PF-14: the regardless classes are cheap reaps —
+no snapshot, at most three anchor rows for a junk suite, no metadata for
+a non-canonical row — and an upgraded table can hold thousands of them,
+which one shared budget of 25 would drain over days with no idle reaping
+meanwhile). Candidates:
 `last_requested_at < now − gc.suite_idle_ttl` (default `720h`; `0s` disables
 reaping; a NULL or future stamp is never idle, and the furthest future one
 is reported through `clock_step_detected` at the first run after a start
@@ -1291,7 +1341,13 @@ is kept per anchor blob until the next scan. For each candidate: hold the
 suite through the checker's `SuiteGuard` (`HoldSuite` `TryLock`s the
 suite mutex; busy → skip, retried next run) and re-read its row (I-4: a
 row gone since the listing has its lock-map entry dropped; a suite asked
-for, or adopted, since the listing is left whole; junk evidence is not
+for, or adopted, since the listing is left whole — up to this re-read: a
+client that asks for it between the re-read and step 2 keeps the row,
+but not the metadata step 1 deleted, so a client of a suite without a
+snapshot can see one Hash Sum mismatch in mid-update (the M-7 residual
+`/forget` documents) and an adopted suite's next check rebuilds its
+anchor row (WARN `freshness: metadata anchor missing for adopted suite;
+reconstructing`); junk evidence is not
 read again), then, within 5 minutes (a step cut short is retried next
 run; a panic under the hold is recovered for that suite alone — logged,
 the hold released as the cache then answers — and the run goes on):
@@ -1303,7 +1359,9 @@ the hold released as the cache then answers — and the run goes on):
 2. in one final writer transaction `cache.ReapIdleSuite`, through phase D's
    compare-and-delete (`deleteSuiteTx`): re-read the row and
    bail if the stamp is newer than the cutoff or `current_snapshot_id` changed
-   since the candidate was listed; run the Step-8 refcount
+   since the candidate was listed; upsert the base's marker when the suite
+   has an adopted, non-retired inline or detached snapshot (PF-12, C3);
+   run the Step-8 refcount
    decrement for the current snapshot; set `retired_at` on all of the suite's
    snapshots; delete the `suite_freshness` row; move the base's markers
    up (PF-10). A failed writer call is settled by a fresh read of the
@@ -1311,6 +1369,16 @@ the hold released as the cache then answers — and the run goes on):
    `deleteSuiteTx` holds the only production `DELETE FROM
    suite_freshness`, and only cap eviction, `ReapIdleSuite` and
    `ForgetSuite` call it (phase F, ruling R-F1).
+
+The reaper deletes no package row, but a reaped suite's cached packages
+lose the retention its current snapshot gave them — `url_path` GC's
+mirror rule ranks the newest `retention.max_versions_per_package`
+versions within current snapshots only (a package another current
+snapshot lists keeps that one's) — so with `gc.enabled = true` and a
+nonzero `gc.url_path_ttl` GC deletes those no client requested within
+`gc.url_path_ttl`, once `hold_packages.window` has passed, and their pool
+files after `gc.blob_grace`: the intended disk reclamation (phase F
+final review, spec I1).
 
 Then `release(true)` purges in-memory state: the lock-map entry
 (`CompareAndDelete`), the checker's per-suite maps and the flip-gate
@@ -1323,12 +1391,17 @@ serve's quiet period (ruling R-F2). Each
 run also scans for junk rows (every run, ruling PF-4: one indexed read
 that probes `url_path` by its key, pool reads only for blobs not yet
 sniffed) and sweeps the reconcile memo (against the current snapshot ids
-it listed). Once a day — at the first run after a start, then a day apart
-(monotonic) — it sweeps the signed-seen markers whose base and `/.` twin
-have no `suite_freshness` row under either scheme and whose
-`last_seen_at` is older than 365 days, each delete re-checking both in
-its writer transaction. The sweep is a gate that retires things (C4
-clock-step rule): a future stamp reads as now, so its marker is never
+it listed). Once a day — at the first run a day or more after the reaper
+started, then a day apart (monotonic; phase F, ruling PF-13: a start
+with the wall clock ahead, which the forward-step guard cannot see, has
+a day to be corrected) — it sweeps the signed-seen markers whose base
+and `/.` twin have no `suite_freshness` row under either scheme and
+whose `last_seen_at` is older than the cutoff `now − stepAhead − 365 d`,
+`now` being the run's clock and `stepAhead` the sum of the forward steps
+the reaper has detected since it started (PF-13: a detected step never
+ages a marker; after a genuine suspend markers are only kept longer),
+each delete re-checking both in its writer transaction. The sweep is a
+gate that retires things (C4 clock-step rule): a future stamp reads as now, so its marker is never
 swept; the sweep never rewrites it and reports the furthest through
 `clock_step_detected` at the first sweep after a start and when it
 changes — judged against a fresh clock read, since the run's own deletes
@@ -1336,11 +1409,25 @@ move markers up while it runs (the cutoff stays the run's), and logged
 directly, outside the one-line-a-minute limit (rulings R-F5, PF-1). A
 forward step of the wall clock that no restart re-arms — the wall clock more than 1 h ahead of the monotonic
 clock between two runs, as when a VM or laptop resumes — is reported
-(`clock_step_detected`, `stamp=wall_clock`) and defers reaping and the
-sweep by the uptime floor (ruling PF-8). Reaps are counted by reason
+(`clock_step_detected`, `stamp=wall_clock`), defers reaping and the
+sweep by the uptime floor (ruling PF-8), and is added to `stepAhead`
+for the rest of the process (PF-13): the hour gives clients time to
+touch their suites, but no client touches an orphan marker, and a swept
+marker cannot come back. Residuals of PF-13: a wrong step that outlives
+a restart, uncorrected for a day, still ages markers by it, and a daemon
+restarted more often than daily never sweeps (orphan markers are small
+rows: the safe side). Reaps are counted by reason
 (`acu_suites_reaped_total{reason}`). The gpg once-logger sets start
-over when a new key finds 10,000 entries. Snapshot GC gains sub-job C:
-after sub-jobs A and B, within the snapshot pass's deadline, one retired
+over when a new key finds 10,000 entries. Snapshot GC gains sub-job C,
+in the periodic ticks only — the startup pass, which runs before the
+listeners serve, skips it, since retired snapshots never serve and the
+backlog after a burst of reaps (some 70–100k `package_hash` rows per
+snapshot of a large suite) could keep the listeners closed up to
+`max_tick_duration` (phase F, ruling PF-15; after a start the periodic
+ticks run it, normally the first one — a later one when an earlier pass,
+the startup pass's blob pass say, reached its deadline, since the passes
+resume in rotation): after sub-jobs A and B, within the snapshot pass's
+deadline, one retired
 snapshot per writer transaction is deleted with its members, skipped
 members and `package_hash` rows in bounded chunks (10,000 rows per writer
 transaction), then the header row; it needs no grace, since a retired
@@ -1379,7 +1466,13 @@ missing `host` or `suite`, another scheme, or a `host` holding `://`
 (the Host cell pasted whole), 500 for a database error (logged), and 503
 when the admin listener's shutdown cut it short (each metadata batch and
 the final delete are their own transactions, so a forget cut short is
-safe to repeat). It is the documented escape hatch for refusal states: a
+safe to repeat). A final delete that committed although its writer call
+failed is logged `suite_forgotten` with `settled=true` before the 500 or
+503, as a settled reap is; a panic under the hold is logged with the
+suite (`freshness_check_panicked`, `where=forget`), the hold released as
+the cache then answers, and re-panicked to net/http, whose line the admin
+listener logs through slog at ERROR (phase F final review, spec m1, m2).
+It is the documented escape hatch for refusal states: a
 vendor that stopped signing, a deliberate upstream rollback, a stuck
 unsigned suite. (`POST /reconcile` keeps its existing
 protection; hardening it is part of G-1, §10.)
@@ -1480,7 +1573,9 @@ Constants, not knobs: backoff 2 m → 1 h (adoption failures and repeated
 caps 256 (barrier) and 64 (strict wait); strict wait 15 s, within a 25 s
 request budget, none below 1 s; the miss path's backstop deadline at most
 25 s after the request started; reaper interval and uptime floor 1 h, the
-marker sweep 24 h apart, reaps 25 per run, the forward-step threshold 1 h,
+marker sweep 24 h apart, the first 24 h after the reaper starts, per run
+250 reaps regardless of idleness and 25 idle ones, the forward-step
+threshold 1 h,
 a suite's held work (a reap, `/forget`) 5 min, junk grace 24 h, metadata
 batches 1,000 rows, sub-job C chunks 10,000 rows, gpg once-logger sets
 10,000 keys;
@@ -1798,12 +1893,17 @@ files), in phase D.
   `unsigned_downgrade_refused` unless the `/.` twin keeps a row, a signed
   anchor cached under the other scheme included; a +30 d forward step's
   false reaps all self-heal, and a step while running defers reaping by
-  the floor; four days at the production cadence (hourly reaper,
+  the floor and ages no orphan marker, and a clock ahead at a start has a
+  day to be corrected before the first sweep; each class's per-run budget
+  (250 reaped regardless of idleness, 25 idle); a reap or a cap eviction
+  turns an audit-deferred signed snapshot into a marker, and a suite with
+  no signed history gets none; four days at the production cadence (hourly reaper,
   `gc.url_path_ttl = 168h`, 12-hourly restarts, goroutines bounded);
   `gc.enabled = false` still re-adopts; never-downgrade after a reap; the
   marker sweep never rewrites a future stamp; batched metadata deletion
   never repeats the refcount decrement; reap-vs-adoption chaos under the
-  suite cap; blobs reclaimed within two GC ticks; twin and nested suites
+  suite cap; blobs reclaimed within two periodic GC ticks (the startup
+  pass runs no sub-job C); twin and nested suites
   untouched; legacy junk reaped, a transient soft-404 and a plain-text
   Release kept; an established unsigned suite keeps its coherent snapshot
   while `adopt_unsigned` is off; `/forget` rejects a cross-origin form
