@@ -20,6 +20,11 @@ const (
 	ReasonUnsignedUnconfirmed      = "unsigned_unconfirmed"
 	ReasonUnsignedTooLarge         = "unsigned_too_large"
 	ReasonAnchorAbsent             = "anchor_absent"
+	// ReasonUnsignedDisabled: adoption.adopt_unsigned is false, so an
+	// unsigned candidate is not adopted (phase E ruling PE-12): a
+	// never-adopted suite stays unadopted, an established unsigned suite
+	// keeps its last snapshot. A paced, visible state, never a failed check.
+	ReasonUnsignedDisabled = "unsigned_disabled"
 
 	// ReasonPanic marks the record of an adoption that panicked. It is a
 	// failure, but the restart reset leaves it alone (spec C7): retrying
@@ -29,7 +34,7 @@ const (
 
 var refusalReasons = []string{
 	ReasonUpstreamOlder, ReasonRollbackRefused, ReasonUnsignedDowngradeRefused,
-	ReasonUnsignedUnconfirmed, ReasonUnsignedTooLarge, ReasonAnchorAbsent,
+	ReasonUnsignedUnconfirmed, ReasonUnsignedTooLarge, ReasonAnchorAbsent, ReasonUnsignedDisabled,
 }
 
 // IsRefusalReason reports whether a persisted adoption_fail_reason is a

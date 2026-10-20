@@ -206,10 +206,11 @@ func (t probeTree) signatureSeen() bool {
 // unsigned form, spec C5's eligibility, member cap and transition
 // confirmation (unsignedFirst). A probe that finds a signature marks the
 // suite's base first (Adopter.markSignatureSeen; a failed mark fails the
-// check). A probe that ends unknown, a tree that finds no anchor (which
-// also records anchor_absent, so the status page shows it: ruling PE-2),
-// and an unsigned candidate while adoption.adopt_unsigned is off are
-// failed checks. A read error of the anchor rows is logged at WARN with no
+// check). A probe that ends unknown and a tree that finds no anchor (which
+// also records anchor_absent, so the status page shows it: ruling PE-2)
+// are failed checks; an unsigned candidate while adoption.adopt_unsigned
+// is off is the refusal unsigned_disabled, recorded and paced (ruling
+// PE-12). A read error of the anchor rows is logged at WARN with no
 // write and no backoff: a local fault, retried at the next check (at most
 // one per cooldown and per tick).
 //
@@ -311,14 +312,31 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 
 // unsignedRefusal applies spec C5's refusals to an unsigned request before
 // a slot is taken — the first adoption's (unsignedFirst) and an unsigned
-// suite's update (checkUnsigned, anchorFoundAgain): never-downgrade
-// (Adopter.unsignedEligible's signed history: unsigned_downgrade_refused)
-// and the member cap (unsignedTooLarge: unsigned_too_large; design review
-// M-5). It records the refusal and returns its reason, "" to go on, or an
-// error — the knob off, a read error — for which the caller fails the
-// check.
+// suite's update (checkUnsigned, anchorFoundAgain): the knob
+// (adoption.adopt_unsigned off: unsigned_disabled, ruling PE-12),
+// never-downgrade (Adopter.unsignedEligible's signed history:
+// unsigned_downgrade_refused) and the member cap (unsignedTooLarge:
+// unsigned_too_large; design review M-5). It records the refusal and
+// returns its reason, "" to go on, or an error — a read error — for which
+// the caller fails the check.
+//
+// AIDEV-NOTE: ruling PE-12 (final fix wave FW-2). The knob off is a
+// refusal state, never a failed check: the record makes it visible
+// ("refused: unsigned_disabled") and paces the suite — a never-adopted one
+// by PE-3 (pacedFirst), an established unsigned one by pacedByRefusal and
+// suiteDue — so checks inside its window ask upstream nothing. The
+// established suite keeps serving its last snapshot and is never updated
+// unsigned; returning it to the ordinary cache, as configuration.md's
+// "served from the ordinary cache, unadopted" promises, is phase F's
+// (retire the snapshot through the reaper's retirement path; overview F
+// carry-forward). Before PE-12 the knob off failed every check, with no
+// record: an established suite froze unpaced and invisible (final reviews
+// E1, E2).
 func (c *Checker) unsignedRefusal(ctx context.Context, req *adoptionRequest) (string, error) {
 	switch err := c.adopter.unsignedEligible(ctx, req.suite); {
+	case errors.Is(err, errUnsignedDisabled):
+		c.recordAdoptionFailure(req, cache.ReasonUnsignedDisabled)
+		return cache.ReasonUnsignedDisabled, nil
 	case errors.Is(err, ErrAdoptionUnsignedDowngradeRefused):
 		c.recordAdoptionFailure(req, cache.ReasonUnsignedDowngradeRefused)
 		return cache.ReasonUnsignedDowngradeRefused, nil
@@ -333,9 +351,9 @@ func (c *Checker) unsignedRefusal(ctx context.Context, req *adoptionRequest) (st
 }
 
 // unsignedFirst applies spec C5's safeguards to an unsigned candidate of
-// a never-adopted suite, before a slot is taken: the knob (off: an error,
-// the check fails), never-downgrade (signed history, see
-// Adopter.unsignedEligible: refused, recorded as
+// a never-adopted suite, before a slot is taken: the knob (off: refused,
+// recorded as unsigned_disabled, ruling PE-12), never-downgrade (signed
+// history, see Adopter.unsignedEligible: refused, recorded as
 // unsigned_downgrade_refused), the member cap (unsigned_too_large; design
 // review M-5: a too-large suite never takes a slot) and the transition
 // confirmation — two observations of the same Release bytes at least
@@ -346,10 +364,13 @@ func (c *Checker) unsignedRefusal(ctx context.Context, req *adoptionRequest) (st
 // otherwise reason is the refusal just recorded.
 //
 // AIDEV-NOTE: content that already passed confirmation (a record for the
-// same bytes from an adoption attempt: any reason but unsigned_unconfirmed
-// and unsigned_downgrade_refused) is not confirmed again, so a failing
-// unsigned first adoption keeps the C7 schedule instead of restarting a
-// short streak per attempt. A future adoption_fail_first_at never
+// same bytes from an adoption attempt: any reason but unsigned_unconfirmed,
+// unsigned_downgrade_refused and unsigned_disabled — refusals decided
+// before the confirmation, ruling PE-12 adding the last) is not confirmed
+// again, so a failing unsigned first adoption keeps the C7 schedule
+// instead of restarting a short streak per attempt; bytes refused while
+// the knob was off start their confirmation when it is turned back on. A
+// future adoption_fail_first_at never
 // confirms (its age is negative) and re-recording restarts the streak
 // (recordAdoptionFailure's past-event rule): a deviation from the C4
 // clock-step rule, which would read it as infinitely old and skip the
@@ -359,7 +380,7 @@ func (c *Checker) unsignedFirst(ctx context.Context, cur *cache.SuiteFreshness, 
 		return false, refusal, err
 	}
 	sameContent := gate.active && gate.hash == req.key
-	if sameContent && gate.reason != cache.ReasonUnsignedUnconfirmed && gate.reason != cache.ReasonUnsignedDowngradeRefused {
+	if sameContent && !refusedBeforeConfirmation(gate.reason) {
 		return true, "", nil
 	}
 	gap := c.confirmGap()
@@ -372,4 +393,17 @@ func (c *Checker) unsignedFirst(ctx context.Context, cur *cache.SuiteFreshness, 
 	}
 	c.recordAdoptionFailure(req, cache.ReasonUnsignedUnconfirmed)
 	return false, cache.ReasonUnsignedUnconfirmed, nil
+}
+
+// refusedBeforeConfirmation reports a record reason decided before the
+// unsigned transition's confirmation ran, so its bytes were never
+// confirmed (design note 17): unsigned_unconfirmed itself, and the
+// eligibility refusals unsigned_downgrade_refused and unsigned_disabled
+// (ruling PE-12).
+func refusedBeforeConfirmation(reason string) bool {
+	switch reason {
+	case cache.ReasonUnsignedUnconfirmed, cache.ReasonUnsignedDowngradeRefused, cache.ReasonUnsignedDisabled:
+		return true
+	}
+	return false
 }

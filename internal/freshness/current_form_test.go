@@ -615,6 +615,65 @@ func TestCheck_UpgradeProbeAbsentReleaseIsAnchorAbsent(t *testing.T) {
 	}
 }
 
+// Ruling PE-12 (final fix wave FW-2): with adoption.adopt_unsigned turned
+// off, an established unsigned suite keeps serving its last snapshot,
+// visibly refused (unsigned_disabled, changed_deferred), never as a
+// failed check, and is never updated unsigned. Its record paces it: a
+// check inside the record's window asks upstream nothing and the
+// scheduler does not queue it; at the retry time it is refused again.
+// Turning the knob back on updates it at its next retry, at once (an
+// update of an established unsigned suite needs no confirmation). E2
+// before PE-12: 30 checks, 30 full Release downloads, 60 signature probes,
+// 30 failed checks and no visible state.
+func TestCheck_UnsignedSuiteWithTheKnobOffIsAPacedRefusal(t *testing.T) {
+	r := newRetryRig(t, time.Minute)
+	u1 := r.adoptUnsigned("u1")
+	r.adopter.adoptUnsigned = false
+	u2 := r.unsignedRelease("u2", nil)
+	r.clock.advance(61 * time.Second)
+	r.check()
+	row := r.row()
+	if row.CheckFailCount != 0 || strOf(row.AdoptionFailReason) != cache.ReasonUnsignedDisabled || lastResult(r) != "changed_deferred" {
+		t.Fatalf("check_fail_count %d, record %q, result %q; want the refusal unsigned_disabled and no failed check",
+			row.CheckFailCount, strOf(row.AdoptionFailReason), lastResult(r))
+	}
+	if snap := r.currentSnapshot(); strOf(snap.SingleAnchorHash) != hashOf(u1) {
+		t.Fatalf("snapshot %+v, want u1 kept", snap)
+	}
+	if ev := r.events("freshness check failed"); len(ev) != 0 {
+		t.Fatalf("failed-check lines %v, want none", ev)
+	}
+	if ev := r.events("adoption_refused"); len(ev) != 1 || ev[0]["reason"] != cache.ReasonUnsignedDisabled {
+		t.Fatalf("adoption_refused lines %v, want one with reason unsigned_disabled", ev)
+	}
+	before := r.rigRequests()
+	r.clock.advance(61 * time.Second) // past the cooldown, inside the record's 2-minute window
+	r.check()
+	if n := r.rigRequests() - before; n != 0 {
+		t.Fatalf("a check inside the record's window made %d requests, want 0", n)
+	}
+	stale := r.row()
+	old := r.clock.now().Add(-time.Hour).Unix()
+	stale.LastSuccessAt = &old
+	if r.checker.suiteDue(stale, r.clock.now()) {
+		t.Fatal("the scheduler queues an unsigned_disabled suite inside its record's window")
+	}
+	r.clock.advance(time.Minute) // the record is due: refused again
+	r.check()
+	row = r.row()
+	if r.rigRequests() == before || row.AdoptionFailCount != 2 || strOf(row.AdoptionFailReason) != cache.ReasonUnsignedDisabled ||
+		row.CheckFailCount != 0 || strOf(r.currentSnapshot().SingleAnchorHash) != hashOf(u1) {
+		t.Fatalf("at the retry: %d requests, record %q/%d, check_fail_count %d; want the refusal again and u1 kept",
+			r.rigRequests()-before, strOf(row.AdoptionFailReason), row.AdoptionFailCount, row.CheckFailCount)
+	}
+	r.adopter.adoptUnsigned = true // the knob back on (a restart)
+	r.clock.advance(4 * time.Minute)
+	r.check()
+	if snap := r.currentSnapshot(); strOf(snap.SingleAnchorHash) != hashOf(u2) || snap.Form != cache.FormUnsigned {
+		t.Fatalf("knob on, at the retry: snapshot %+v, record %q; want u2 adopted", snap, strOf(r.row().AdoptionFailReason))
+	}
+}
+
 // Ruling PE-2: an adopted suite in anchor_absent is paced by its record —
 // a client check (T1) inside the record's retry time asks nothing, and the
 // scheduler does not queue it (suiteDue) until that time. A next_retry_at

@@ -313,7 +313,7 @@ only, and the request that creates a suite starts no check.
 | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them, so tracked suites lag upstream by design: the status page's SUITES vital then reads "ADOPTION DISABLED — METADATA NOT REFRESHED" (stale, not a fault), rows keep their lag text without warning, and failure records left from a time adoption was enabled are inert (no retries, `acu_adoption_failing_suites` reports 0). |
 | `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are adopted in the unsigned form instead (`adopt_unsigned`). |
-| `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` leaves such repositories served from the ordinary cache, unadopted. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
+| `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` refuses every unsigned `Release` ("refused: unsigned_disabled", a state, not a failed check): a repository not yet adopted stays unadopted, served from the ordinary cache; an unsigned suite already adopted keeps serving its last snapshot, frozen — never updated — until the knob is turned back on (it then updates at its next retry, within about an hour). Returning such a suite to the ordinary cache arrives with suite reaping in a later release. Either way the suite is asked upstream again only at its retry times (2 minutes, doubling to an hour; for a suite not yet adopted, also once `periodic_refresh` has passed), never at the checks clients trigger in between. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
 | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
 | `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. A decodable clearsigned `InRelease` (or, for the detached pair, a parseable `Release.gpg` signature) is still required, as in every mode. Matching pins keep normal verification. Logs a startup warning. |
 | `allow_short_keyid` | boolean | `true` | Accept signatures containing only a legacy 64-bit issuer key ID when it uniquely identifies a loaded trusted key and cryptographic verification succeeds. `false` requires the long issuer fingerprint. |
@@ -334,16 +334,17 @@ When an adoption fails (an untrusted or malformed signature, a member that will 
 
 If the cache cannot read the current snapshot when an adoption starts, the attempt fails as `db_failed` (and is retried on the backoff schedule) rather than skipping the rollback checks below.
 
-Six outcomes are refusals, not failures, and are shown as "refused: …" on the status page:
+Seven outcomes are refusals, not failures, and are shown as "refused: …" on the status page:
 
 - `upstream_older`: upstream serves a Release whose `Date` is older than the snapshot being served, or has no `Date` at all after a dated snapshot (a missing `Date` counts as 0). apt would ignore it too; the cache keeps serving the newer snapshot.
 - `rollback_refused`: upstream serves content identical to an older snapshot the cache already replaced (a flapping mirror). Only the last `gc.keep_displaced` snapshots are remembered for this.
 - `unsigned_unconfirmed`: an unsigned repository's first adoption waits for a second observation of the same `Release` (see *Anchor forms and unsigned repositories*).
 - `unsigned_downgrade_refused`: the suite has been seen signed, so its unsigned `Release` is not adopted.
 - `unsigned_too_large`: an unsigned `Release` declares more than 1,000 files.
+- `unsigned_disabled`: `adopt_unsigned = false`, so an unsigned `Release` is not adopted; an unsigned suite already adopted keeps serving its last snapshot, not updated, until the knob is turned back on.
 - `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too. While a failed adoption of the suite is recorded (its move to the other form failed), the status page shows that failure's reason instead, and the suite is paced the same way.
 
-Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO) and is not counted by `acu_adoption_failing_suites`. `upstream_older` and `rollback_refused` show no lag (the cache already serves content at least as new as upstream's); the other four keep their lag, because the suite is in fact behind. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
+Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO) and is not counted by `acu_adoption_failing_suites`. `upstream_older` and `rollback_refused` show no lag (the cache already serves content at least as new as upstream's); the other five keep their lag, because the suite is in fact behind. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
 
 A Release dated more than 10 seconds ahead of the cache's clock is a failure (apt rejects it as "not valid yet"); check the cache host's clock if this persists.
 
@@ -434,7 +435,14 @@ disappears.
 
 Unsigned adoption has five safeguards:
 
-1. `adopt_unsigned` (default `true`).
+1. `adopt_unsigned` (default `true`). With `false` an unsigned `Release`
+   is refused ("refused: unsigned_disabled"): a suite not yet adopted
+   stays unadopted, and an unsigned suite already adopted keeps serving
+   its last snapshot, frozen, until the knob is turned back on (or, once
+   suite reaping lands in a later release, until that snapshot is
+   retired and the suite is served from the ordinary cache). The suite is
+   asked upstream only at its retry times; a signature appearing upstream
+   still moves it to a signed form, at the next retry.
 2. A suite's first unsigned adoption waits for two checks that see the same
    `Release` at least `max(cooldown, 5 minutes)` apart — an hour apart when
    `InRelease` or `Release.gpg` answers 401 or 403 at the confirming check,
@@ -488,8 +496,9 @@ adopts unsigned. Under the default allow-all upstream policy
 with adoption enabled, a LAN client can make the cache adopt unsigned
 directories it controls; that is bounded by the per-host adoption slot,
 the reserved slot, `max_duration`, the 1,000-file cap and
-`freshness.max_suites`. To harden, set `adopt_unsigned = false` or narrow
-`upstream.allowed_host_regex`.
+`freshness.max_suites`. To harden, set `adopt_unsigned = false` (unsigned
+suites already adopted then stay at their last snapshot, see safeguard 1)
+or narrow `upstream.allowed_host_regex`.
 
 `Release` files that list only SHA512 hashes (some vendor repositories)
 adopt: every declared SHA256 and SHA512 hash of a file is checked, and

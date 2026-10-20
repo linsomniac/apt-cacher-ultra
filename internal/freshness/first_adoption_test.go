@@ -502,16 +502,63 @@ func TestCheckFirst_UnsignedRefusedWithSignedHistory(t *testing.T) {
 	}
 }
 
-// adoption.adopt_unsigned = false: an unsigned candidate is a failed check.
-func TestCheckFirst_UnsignedDisabledIsAFailedCheck(t *testing.T) {
-	r := newRetryRig(t, 0)
+// rigRequests is the number of requests the rig upstream got for the
+// suite's three anchor files.
+func (r *retryRig) rigRequests() int {
+	return len(r.up.etagsSent(rigAnchorURL)) + len(r.up.etagsSent(rigReleaseURL)) + len(r.up.etagsSent(rigReleaseGPGURL))
+}
+
+// Ruling PE-12 (final fix wave FW-2): adoption.adopt_unsigned = false
+// leaves a never-adopted unsigned repository unadopted as a paced, visible
+// refusal state — unsigned_disabled (changed_deferred), never a failed
+// check — and its record paces it (ruling PE-3): checks inside the
+// record's window ask upstream nothing. Turning the knob back on does not
+// skip the transition's confirmation: the refused bytes were never
+// confirmed (design note 17's "confirmed once" excludes the refusal).
+// This replaces TestCheckFirst_UnsignedDisabledIsAFailedCheck, which
+// pinned the failed check PE-12 retires (E1: 30 client checks cost 90
+// requests and 30 failed checks, with no record and no visible state).
+func TestCheckFirst_UnsignedDisabledIsAPacedRefusal(t *testing.T) {
+	r := newRetryRig(t, time.Minute)
 	r.unsignedRelease("u1", nil)
 	r.check()
-	if row := r.row(); row.CheckFailCount != 1 || row.CurrentSnapshotID != nil || row.AdoptionFailCount != 0 {
-		t.Fatalf("row %+v, want a failed check with no record", row)
+	row := r.row()
+	if row.CheckFailCount != 0 || row.CurrentSnapshotID != nil || strOf(row.AdoptionFailReason) != cache.ReasonUnsignedDisabled ||
+		lastResult(r) != "changed_deferred" {
+		t.Fatalf("check_fail_count %d, current %v, record %q, result %q; want the refusal unsigned_disabled and no failed check",
+			row.CheckFailCount, row.CurrentSnapshotID != nil, strOf(row.AdoptionFailReason), lastResult(r))
 	}
-	if ev := r.events("freshness check failed"); len(ev) != 1 || ev[0]["form"] != "unsigned" {
-		t.Fatalf("failed-check lines %v, want one with form unsigned", ev)
+	if ev := r.events("freshness check failed"); len(ev) != 0 {
+		t.Fatalf("failed-check lines %v, want none", ev)
+	}
+	if ev := r.events("adoption_refused"); len(ev) != 1 || ev[0]["reason"] != cache.ReasonUnsignedDisabled {
+		t.Fatalf("adoption_refused lines %v, want one with reason unsigned_disabled", ev)
+	}
+	if !cache.IsRefusalReason(cache.ReasonUnsignedDisabled) {
+		t.Fatal("unsigned_disabled is not a refusal reason")
+	}
+	before := r.rigRequests()
+	r.clock.advance(61 * time.Second) // past the cooldown, inside the record's 2-minute window
+	r.check()
+	if n := r.rigRequests() - before; n != 0 {
+		t.Fatalf("a client check inside the record's window made %d requests, want 0", n)
+	}
+	r.clock.advance(time.Minute) // the record is due: the tree runs and is refused again
+	r.check()
+	row = r.row()
+	if r.rigRequests() == before || row.AdoptionFailCount != 2 || strOf(row.AdoptionFailReason) != cache.ReasonUnsignedDisabled ||
+		row.CheckFailCount != 0 || row.CurrentSnapshotID != nil {
+		t.Fatalf("at the retry: %d requests, record %q/%d, check_fail_count %d, adopted %v; want the tree and the refusal again",
+			r.rigRequests()-before, strOf(row.AdoptionFailReason), row.AdoptionFailCount, row.CheckFailCount, row.CurrentSnapshotID != nil)
+	}
+	// The knob turned back on (a restart): at the next retry the same bytes
+	// start the confirmation, they are not taken as confirmed.
+	r.adopter.adoptUnsigned = true
+	r.clock.advance(4 * time.Minute)
+	r.check()
+	if row := r.row(); row.CurrentSnapshotID != nil || strOf(row.AdoptionFailReason) != cache.ReasonUnsignedUnconfirmed {
+		t.Fatalf("knob on: adopted %v, record %q; want unsigned_unconfirmed (refused bytes were never confirmed)",
+			row.CurrentSnapshotID != nil, strOf(row.AdoptionFailReason))
 	}
 }
 

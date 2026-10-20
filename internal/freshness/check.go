@@ -138,13 +138,14 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 	}
 	// Ruling PE-2: an adopted suite in the refusal state anchor_absent is
 	// paced by its record: no request before the record's retry time. So is
-	// one whose last answered check found its anchor absent while an
-	// attempt's record holds (ruling PE-10: pacedAbsentAnswer).
+	// one in unsigned_disabled (ruling PE-12), and one whose last answered
+	// check found its anchor absent while an attempt's record holds (ruling
+	// PE-10: pacedAbsentAnswer).
 	if c.adopter != nil {
-		if gate := c.retryGateFor(cur, now); pacedAbsent(gate) || c.pacedAbsentAnswer(suiteKey(scheme, host, suitePath), gate) {
+		if gate := c.retryGateFor(cur, now); pacedByRefusal(gate) || c.pacedAbsentAnswer(suiteKey(scheme, host, suitePath), gate) {
 			c.applyClamp(ctx, cur, gate, now)
-			c.logger.Debug("freshness: anchor_absent suite paced until its retry",
-				"canonical_host", host, "suite_path", suitePath)
+			c.logger.Debug("freshness: refused suite paced until its retry",
+				"canonical_host", host, "suite_path", suitePath, "reason", gate.reason)
 			return
 		}
 	}
@@ -264,9 +265,11 @@ func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache
 // 200 failing its sniff to absent before this point (ruling R-E4: an
 // absent anchor resets the streak, so an anchor_absent suite never
 // inherits the hourly backoff); only unknown ends and checks that find
-// nothing they may adopt (no anchor at all; an unsigned candidate while
-// adoption.adopt_unsigned is off) fail here. Without an adopter (Phase 1)
-// every Conditional error still extends the streak, as before phase E.
+// nothing they may adopt (no anchor at all) fail here. An unsigned
+// candidate while adoption.adopt_unsigned is off is the refusal state
+// unsigned_disabled, not a failed check (ruling PE-12, unsignedRefusal).
+// Without an adopter (Phase 1) every Conditional error still extends the
+// streak, as before phase E.
 func (c *Checker) failCheck(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, nowUnix int64, form string, err error) {
 	host, suitePath := suite.CanonicalHost, suite.SuitePath
 	c.absentAnswered.Delete(suiteKey(suite.CanonicalScheme, host, suitePath)) // ruling PE-10 (b)
@@ -742,7 +745,7 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 			// Design review M-14: the changed Release has no signature —
 			// absent (ruling R-E4), never adopted. The refusal state
 			// anchor_absent makes it visible and paces the suite
-			// (pacedAbsent); a record the lateral InRelease still holds
+			// (pacedByRefusal); a record the lateral InRelease still holds
 			// keeps its own reason and schedule, and paces the suite the
 			// same way (pacedAbsentAnswer, ruling PE-10). last_success_at
 			// stays, as for an absent current anchor (spec C4).

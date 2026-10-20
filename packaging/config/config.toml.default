@@ -117,7 +117,9 @@ flip_quiet_period     = "10s"
 # consistent observations). Such a snapshot never vouches a .deb or counts
 # for strict mode, and is refused once a signed anchor has been served for
 # the suite (which a party able to inject one can use to block it; see the
-# reference). false keeps such suites unadopted.
+# reference). false refuses them (unsigned_disabled): suites not yet adopted
+# stay unadopted, and unsigned suites already adopted keep their last
+# snapshot, not updated, until this is turned back on.
 adopt_unsigned        = true
 
 [integrity]

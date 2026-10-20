@@ -18,20 +18,33 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 )
 
-// pacedAbsent is ruling PE-2 for an adopted suite: while its active record
-// is anchor_absent and not due, the check makes no request — the current
-// anchor is asked for again at the record's retry time (2 min doubling to
-// 1 h: about 24 requests a day once the absence has lasted an hour), not at
-// every tick and every client check (T1). checkLocked applies it before
-// any request, and suiteDue does not queue such a suite.
+// pacedByRefusal is ruling PE-2 for an adopted suite: while its active
+// record is anchor_absent and not due, the check makes no request — the
+// current anchor is asked for again at the record's retry time (2 min
+// doubling to 1 h: about 24 checks a day once the absence has lasted an
+// hour, each one request for the anchor plus the probe tree's 2–3 once the
+// absence is confirmed — about 72–96 requests a day), not at every tick
+// and every client check (T1). Ruling PE-12 adds
+// unsigned_disabled: an established unsigned suite whose update the knob
+// refuses is asked again only at its retry time. checkLocked applies it
+// before any request, and suiteDue does not queue such a suite
+// (recordPacesAdopted).
 //
 // AIDEV-NOTE: the record's schedule is the refusal's, not the failure
 // backoff: the check_fail_count streak stays 0 (ruling R-E4). Cost: a
-// returning anchor is noticed at the record's retry time (at most 1 h
-// later) instead of at once. An EOL release removed upstream would
-// otherwise cost 400–1,800 requests a day, forever.
-func pacedAbsent(g retryGate) bool {
-	return g.active && !g.due && g.reason == cache.ReasonAnchorAbsent
+// returning anchor (or a signature that would upgrade a refused unsigned
+// suite) is noticed at the record's retry time (at most 1 h later)
+// instead of at once. An EOL release removed upstream would otherwise
+// cost 400–1,800 requests a day, forever.
+func pacedByRefusal(g retryGate) bool {
+	return g.active && !g.due && recordPacesAdopted(g.reason)
+}
+
+// recordPacesAdopted reports a record reason that paces an adopted suite
+// while active and not due (pacedByRefusal, suiteDue): anchor_absent
+// (ruling PE-2) and unsigned_disabled (ruling PE-12).
+func recordPacesAdopted(reason string) bool {
+	return reason == cache.ReasonAnchorAbsent || reason == cache.ReasonUnsignedDisabled
 }
 
 // pacedAbsentAnswer is ruling PE-10 (b): an adopted suite whose last
@@ -40,7 +53,7 @@ func pacedAbsent(g retryGate) bool {
 // whose absent InRelease's lateral move failed, or a detached suite whose
 // changed Release has no Release.gpg while a failing lateral InRelease
 // holds the record (design review M-14) — is paced by that record exactly
-// as pacedAbsent paces an anchor_absent one: no request before its retry
+// as pacedByRefusal paces an anchor_absent one: no request before its retry
 // time (checkLocked), and suiteDue does not queue it. The record shown
 // keeps the attempt's reason (e.g. gpg_failed) and schedule.
 //
@@ -110,7 +123,7 @@ func (t probeTree) sameAs(snap *cache.SuiteSnapshot) bool {
 // an unknown end).
 //
 // AIDEV-NOTE: last_success_at stays old on purpose (spec C4: "visible;
-// last_success_at not bumped"); the record paces the suite (pacedAbsent),
+// last_success_at not bumped"); the record paces the suite (pacedByRefusal),
 // so it costs one anchor request per retry, plus the probe tree once the
 // absence is confirmed. A future adoption_fail_first_at never confirms
 // (its age is negative) and re-recording restarts it — deviation 2, here
@@ -126,7 +139,7 @@ func (c *Checker) anchorAbsent(ctx, fetchCtx context.Context, out *checkOutcome,
 	case !gate.due:
 		// Inside the retry time of a record from an adoption attempt: the
 		// first answered check after the attempt (an anchor_absent record
-		// is paced before any request: pacedAbsent; this result paces the
+		// is paced before any request: pacedByRefusal; this result paces the
 		// later checks inside the window: pacedAbsentAnswer, ruling PE-10).
 	case !absentRecord:
 		runTree = true
@@ -384,9 +397,11 @@ func (c *Checker) upgradeProbe(ctx, fetchCtx context.Context, out *checkOutcome,
 // against the snapshot's Release hash; changed → an unsigned adoption
 // request — no re-confirmation (spec C5 safeguard 2: updates of an
 // established unsigned suite adopt at once), but the unsigned refusals
-// apply before a slot is taken (unsignedRefusal: signed history refuses
-// it as unsigned_downgrade_refused, a member count over the cap as
-// unsigned_too_large) and the knob (off: a failed check). A reaped Release
+// apply before a slot is taken (unsignedRefusal: the knob off refuses it
+// as unsigned_disabled, ruling PE-12 — the suite keeps its snapshot and
+// its record paces it, pacedByRefusal; signed history refuses it as
+// unsigned_downgrade_refused, a member count over the cap as
+// unsigned_too_large). A reaped Release
 // anchor is reconstructed from the snapshot
 // (TestCheck_UnsignedRecoversWhenReleaseAnchorMissing). Without an adopter
 // it only observes, like the other forms.

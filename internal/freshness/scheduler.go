@@ -388,16 +388,17 @@ func (q *schedQueues) has(key string) bool {
 func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 	nowU := now.Unix()
 	future := nowU + int64(clockStepTolerance/time.Second)
-	// Ruling PE-2: an adopted suite in the refusal state anchor_absent is
-	// due only at its record's retry time (pacedAbsent), whatever its
-	// last_success_at; so is one whose last answered check ended
-	// anchor_absent while an attempt's record holds (ruling PE-10,
-	// pacedAbsentAnswer). A next_retry_at beyond the legitimate horizon (a
-	// backward clock step) is not paced here: once the suite is due (its
-	// last_success_at is old), the check clamps it (retryGateFor).
+	// Ruling PE-2: an adopted suite in the refusal state anchor_absent (or,
+	// ruling PE-12, unsigned_disabled) is due only at its record's retry
+	// time (pacedByRefusal), whatever its last_success_at; so is one whose
+	// last answered check ended anchor_absent while an attempt's record
+	// holds (ruling PE-10, pacedAbsentAnswer). A next_retry_at beyond the
+	// legitimate horizon (a backward clock step) is not paced here: once the
+	// suite is due (its last_success_at is old), the check clamps it
+	// (retryGateFor).
 	if c.adopter != nil && s.CurrentSnapshotID != nil && s.AdoptionFailCount > 0 && s.AdoptionNextRetryAt != nil &&
 		*s.AdoptionNextRetryAt > nowU && *s.AdoptionNextRetryAt <= nowU+int64(retryHorizon/time.Second) {
-		if s.AdoptionFailReason != nil && *s.AdoptionFailReason == cache.ReasonAnchorAbsent {
+		if s.AdoptionFailReason != nil && recordPacesAdopted(*s.AdoptionFailReason) {
 			return false
 		}
 		if _, ok := c.absentAnswered.Load(suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)); ok {

@@ -621,7 +621,9 @@ unchanged, observation only):
    anchor absent (Dispatch 1), not a failed check (phase E final fix wave,
    FW-1). Otherwise
    conditional GET `Release`; changed → unsigned adoption request (no
-   re-confirmation). If a signature is present but the signed adoption
+   re-confirmation; with `adopt_unsigned = false` refused as
+   `unsigned_disabled`, whose record paces the suite as an `anchor_absent`
+   record does, C5 safeguard 1, ruling PE-12). If a signature is present but the signed adoption
    cannot succeed (key not on the cache host), the suite keeps its last
    unsigned snapshot and the admin page shows the reason; the fix is
    installing the key (or `adoption.accept_any_signer`). A signature probe
@@ -854,7 +856,19 @@ upgrade (§6.1).
 
 **Unsigned safeguards (D6).**
 
-1. `adoption.adopt_unsigned` (default `true`).
+1. `adoption.adopt_unsigned` (default `true`). `false` refuses every
+   unsigned candidate before a slot is taken as the refusal state
+   `unsigned_disabled` (phase E, ruling PE-12) — visible, paced by its
+   record, never a failed check: a never-adopted suite stays unadopted,
+   served from the ordinary cache (its record paces it as C4 Dispatch 3
+   does, ruling PE-3); an established unsigned suite keeps serving its
+   last snapshot, refused and never updated unsigned, and its record paces
+   it as an `anchor_absent` record does (no request and no scheduler check
+   before its retry time). Turning the knob back on updates it at its next
+   retry; bytes refused this way were never confirmed, so a never-adopted
+   suite's transition is confirmed afresh. Phase F retires an established
+   unsigned suite's current snapshot through the reaper's retirement path
+   while the knob is off, so it returns to the ordinary cache.
 2. Eligible only when `InRelease` and `Release.gpg` are both *absent* and
    `Release` is *present*. The **transition into** unsigned (a suite with no
    current snapshot) needs two observations of the same `Release` bytes at
@@ -1008,7 +1022,8 @@ re-downloading everything.
 `unsigned_unconfirmed` (confirmation timing from `adoption_fail_first_at`;
 its streak, like `anchor_absent`'s, restarts on new content or a new
 reason),
-`unsigned_too_large`, `anchor_absent`. They are excluded from the
+`unsigned_too_large`, `anchor_absent`, `unsigned_disabled` (C5 safeguard
+1, ruling PE-12). They are excluded from the
 failing-suites gauge and from `adoption_failing_persistently`, and shown as
 "refused: …" in the admin page.
 
@@ -1023,13 +1038,17 @@ records none, and while a record without validators is active and not due
 the check sends the current anchor's own; a 304 is `changed_deferred` only
 when the record's validators were sent, otherwise `not_modified` (phase E,
 design review I-1). The C4 probe tree sends no validators: there the gate
-compares content keys only (phase E, design note 15). Two records pace
+compares content keys only (phase E, design note 15). Some records pace
 their suite instead of gating a request: an adopted suite's
-`anchor_absent` (no request before its retry time) and a never-adopted
-suite's active record (no probe before its retry time while its last check
-is younger than `periodic_refresh`) — C4 Dispatch 1 and 3, rulings PE-2
-and PE-3. The record is cleared in the flip transaction and when upstream
-again serves the current snapshot's content.
+`anchor_absent` or `unsigned_disabled` (no request before its retry time;
+rulings PE-2 and PE-12); an adopted suite's record from a failed attempt
+once a check found the current anchor, or a changed `Release`'s
+signature, absent behind it (the same pacing while the record keeps its
+own reason; ruling PE-10); and a never-adopted suite's active record (no
+probe before its retry time while its last check is younger than
+`periodic_refresh`; ruling PE-3) — C4 Dispatch 1, 2 and 3. The record is
+cleared in the flip transaction and when upstream again serves the
+current snapshot's content.
 
 **Restart.** At checker start every failing row (not refusal states, not
 reason `panic`) gets `next_retry_at = now + rand(0, periodic_refresh)`: one

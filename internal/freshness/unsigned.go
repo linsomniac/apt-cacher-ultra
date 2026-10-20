@@ -34,7 +34,8 @@ var (
 	ErrAdoptionUnsignedTooLarge = errors.New("adoption_unsigned_too_large")
 
 	// errUnsignedDisabled: adoption.adopt_unsigned is false. The checker
-	// never requests an unsigned adoption then; this guards RunUnsigned.
+	// never requests an unsigned adoption then (it records the refusal
+	// unsigned_disabled, ruling PE-12); this guards RunUnsigned.
 	errUnsignedDisabled = errors.New("unsigned adoption is disabled (adoption.adopt_unsigned = false)")
 )
 
