@@ -770,14 +770,15 @@ func TestDeleteSuiteTx_IsACompareAndDelete(t *testing.T) {
 	if snap, err := c.GetSuiteSnapshot(ctx, id); err != nil || snap.RetiredAt == nil {
 		t.Fatalf("snapshot = %+v, %v; want retired", snap, err)
 	}
-	// A stamp in the future never qualifies, whatever the cutoff.
+	// A stamp in the future never qualifies for an idle cutoff
+	// (ReapRegardless lets every row through: TestReapIdleSuite_*).
 	future := sk("h", "/future")
 	seedRow(t, c, future, evictNow+evictDay)
 	if del(future, nil, evictNow) == suiteDeleted {
 		t.Fatal("a row requested in the future was deleted")
 	}
 	// The cutoff is inclusive (spec C3: idle >= 24 h), and a row without an
-	// interest stamp never qualifies.
+	// interest stamp never qualifies for an idle cutoff.
 	exact := sk("h", "/exact")
 	seedRow(t, c, exact, evictNow-evictDay)
 	if del(exact, nil, evictNow-evictDay) != suiteDeleted {

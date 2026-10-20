@@ -35,7 +35,10 @@ type execer interface {
 // current snapshot (spec C3 revision 8, design review I-2), and the
 // adopter's re-mark before an unsigned commit (ruling R-E1). It is written
 // only for suites with a suite_freshness row, and never for an unsigned
-// snapshot or a plain-text anchor.
+// snapshot or a plain-text anchor. Phase F's reap (ReapIdleSuite) moves an
+// existing marker's stamp up to the reap, in the transaction that deletes
+// the row, and never creates one (design review M-9); POST /forget
+// (ForgetSuite) and the orphan sweep delete markers.
 func markSignedSeen(ctx context.Context, ex execer, scheme, host, base string, seenAt int64) error {
 	if _, err := ex.ExecContext(ctx, `
 INSERT INTO suite_signed_seen (canonical_scheme, canonical_host, base, last_seen_at)

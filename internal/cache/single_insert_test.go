@@ -26,6 +26,11 @@ var insertSuiteFreshnessRE = regexp.MustCompile("(?is)\\b(?:INSERT(?:\\s+OR\\s+\
 var deleteSuiteFreshnessRE = regexp.MustCompile("(?is)\\bDELETE\\s+FROM\\s+" +
 	"(?:[\"`\\[]?\\w+[\"`\\]]?\\s*\\.\\s*)?[\"`\\[]?suite_freshness\\b")
 
+// deleteSignedSeenRE matches a statement that deletes from
+// suite_signed_seen, with the same quoting and schema forms.
+var deleteSignedSeenRE = regexp.MustCompile("(?is)\\bDELETE\\s+FROM\\s+" +
+	"(?:[\"`\\[]?\\w+[\"`\\]]?\\s*\\.\\s*)?[\"`\\[]?suite_signed_seen\\b")
+
 // productionGoFiles calls fn for every non-test .go file of the module
 // (internal/cache is two levels below its root).
 func productionGoFiles(t *testing.T, fn func(path string, src []byte)) {
@@ -182,7 +187,7 @@ func TestSuiteRowWritersHaveKnownCallers(t *testing.T) {
 		want []string
 	}{
 		{"createSuiteTx", []string{"fetched_row.go:storeFetchedTx", "suite_rows.go:CreateSuite", "testing_helpers.go:SeedSuiteForTest"}},
-		{"deleteSuiteTx", []string{"suite_rows.go:createSuiteTx"}},
+		{"deleteSuiteTx", []string{"suite_reap.go:ForgetSuite", "suite_reap.go:ReapIdleSuite", "suite_rows.go:createSuiteTx"}},
 	} {
 		if got := callSites(t, c.fn); !slices.Equal(got, c.want) {
 			t.Errorf("%s callers = %v, want %v", c.fn, got, c.want)
@@ -192,10 +197,13 @@ func TestSuiteRowWritersHaveKnownCallers(t *testing.T) {
 
 // Spec C3: only the handler creates suite rows. Outside internal/cache no
 // production code but internal/handler calls CreateSuite or StoreFetched,
-// and no production code calls a test-only seeding helper.
+// and no production code calls a test-only seeding helper, nor
+// ClearSignedSeenForTest, which deletes every signed-seen marker (design
+// review M-5).
 func TestOnlyTheHandlerCreatesSuiteRows(t *testing.T) {
 	creators := map[string]bool{"CreateSuite": true, "StoreFetched": true}
-	seeders := map[string]bool{"SeedSuiteForTest": true, "EnsureSuiteForTest": true, "InsertTrackedCandidateForTest": true}
+	seeders := map[string]bool{"SeedSuiteForTest": true, "EnsureSuiteForTest": true, "InsertTrackedCandidateForTest": true,
+		"ClearSignedSeenForTest": true}
 	productionGoFiles(t, func(p string, src []byte) {
 		inCache := strings.HasPrefix(p, "../../internal/cache/")
 		inHandler := strings.HasPrefix(p, "../../internal/handler/")
@@ -225,4 +233,52 @@ func TestOnlyTheHandlerCreatesSuiteRows(t *testing.T) {
 			return true
 		})
 	})
+}
+
+// Ruling R-F1 across packages (design review M-5): outside internal/cache
+// only the suite reaper (internal/freshness/reaper.go) and POST /forget
+// (internal/freshness/forget.go) call the cache's suite deleters — each
+// holds the suite through the SuiteGuard first — so a new caller that
+// skips the guard fails here.
+func TestSuiteDeletersHaveKnownCallers(t *testing.T) {
+	deleters := map[string]bool{"ReapIdleSuite": true, "ForgetSuite": true, "DeleteSuiteMetadata": true}
+	allowed := map[string]bool{"../../internal/freshness/reaper.go": true, "../../internal/freshness/forget.go": true}
+	productionGoFiles(t, func(p string, src []byte) {
+		if strings.HasPrefix(p, "../../internal/cache/") || allowed[p] {
+			return
+		}
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, p, src, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && deleters[sel.Sel.Name] {
+					t.Errorf("%s calls %s: only the reaper and POST /forget delete suites", fset.Position(call.Pos()), sel.Sel.Name)
+				}
+			}
+			return true
+		})
+	})
+}
+
+// Design review M-5: the never-downgrade authority (spec C5) is deleted
+// only by POST /forget (ForgetSuite) and the test-only
+// ClearSignedSeenForTest, so a new path that deletes signed-seen markers
+// fails here.
+func TestSignedSeenHasKnownDeleteSites(t *testing.T) {
+	var sites []string
+	productionGoFiles(t, func(p string, src []byte) {
+		stringLiterals(t, p, src, func(funcName, lit string) {
+			for range deleteSignedSeenRE.FindAllStringIndex(lit, -1) {
+				sites = append(sites, p+":"+funcName)
+			}
+		})
+	})
+	slices.Sort(sites)
+	want := []string{"../../internal/cache/suite_reap.go:ForgetSuite", "../../internal/cache/testing_helpers.go:ClearSignedSeenForTest"}
+	if !slices.Equal(sites, want) {
+		t.Fatalf("DELETE FROM suite_signed_seen sites = %v, want %v", sites, want)
+	}
 }

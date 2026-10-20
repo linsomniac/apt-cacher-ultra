@@ -54,11 +54,13 @@ type Cache struct {
 	heldHook func(SuiteKey)
 
 	// committedHook, when set (tests only), runs on the writer goroutine
-	// right after a creation attempt's transaction commits, before its
-	// result is handed back: it lets a test end the creator's context
-	// there, so a submit fails although its eviction committed
+	// right after the transaction of a creation attempt, of ReapIdleSuite
+	// or of ForgetSuite commits, before its result is handed back: it lets
+	// a test end the caller's context there, so a submit fails although its
+	// eviction or delete committed
 	// (TestCreateSuite_AFailedSubmitWhoseEvictionCommittedPurges, deferred
-	// minor D-20).
+	// minor D-20; TestReapAndForget_AFailedSubmitWhoseDeleteCommittedIsGone,
+	// design review M-2).
 	committedHook func()
 }
 
