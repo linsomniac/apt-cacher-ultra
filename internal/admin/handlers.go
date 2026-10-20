@@ -723,7 +723,10 @@ func requireMutationGuard(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
-		http.Error(w, "cross-site requests are refused\n", http.StatusForbidden)
+		// Any other origin: a same-site request is refused too (the Task 10
+		// re-review's out-of-scope 1: "cross-site" named only part of it).
+		http.Error(w, "requests from another origin are refused: Sec-Fetch-Site must be same-origin or none\n",
+			http.StatusForbidden)
 		return false
 	}
 	return true

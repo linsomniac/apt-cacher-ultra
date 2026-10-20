@@ -28,7 +28,13 @@ import (
 // HoldSuite, the re-read under the hold, deleteSuiteTx through
 // cache.ForgetSuite, release(gone) — gone being ForgetSuite's answer,
 // settled by a fresh read after a failed submit, or the re-read's finding
-// no row (design review M-2). The suite's next request re-creates it
+// no row (design review M-2). A panic under the hold is released as the
+// reaper's per-candidate recovery releases one (reapSuite): with the
+// cache's fresh answer (settledGone), since it may have struck after
+// ForgetSuite's commit — a deleted suite's lock-map entry never leaks, a
+// kept one's is never dropped (design note 23) — and is then re-panicked,
+// so net/http's recovery and its log line stay as they were (the Task 6
+// re-review's out-of-scope 3). The suite's next request re-creates it
 // never adopted, so unchanged upstream content re-adopts at once (signed)
 // or after the transition's confirmation (unsigned), and a deliberate
 // rollback adopts: the escape hatch for refusal states. Forgetting an
@@ -50,7 +56,13 @@ func (r *Reaper) Forget(ctx context.Context, scheme, host, suitePath string) (ca
 		return cache.ForgetResult{}, nil
 	}
 	gone := false
-	defer func() { release(gone) }()
+	defer func() {
+		if v := recover(); v != nil {
+			release(r.settledGone(key))
+			panic(v)
+		}
+		release(gone)
+	}()
 	if r.reapHook != nil {
 		r.reapHook(ctx, key)
 	}

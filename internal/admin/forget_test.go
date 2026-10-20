@@ -358,29 +358,38 @@ func TestEndpoint_Forget_ShutdownCutsItShort(t *testing.T) {
 // Spec C9 and ruling PF-6: a cross-site form or fetch cannot trigger
 // /forget (requireMutationGuard). A form POST (no X-ACU-Admin: 1) and a
 // cross-site or same-site fetch (Sec-Fetch-Site) are refused with 403
-// before the Forgetter runs; a same-origin request, a browser's direct
-// navigation (none) and curl (no Sec-Fetch-Site) pass. (DNS rebinding is
-// not covered: spec §10 G-1.)
+// before the Forgetter runs, the body saying which rule refused it — a
+// same-site fetch is refused too, so that text names any other origin, not
+// only another site (the Task 10 re-review's out-of-scope 1); a
+// same-origin request, a browser's direct navigation (none) and curl (no
+// Sec-Fetch-Site) pass. (DNS rebinding is not covered: spec §10 G-1.)
 func TestEndpoint_Forget_RefusesCrossOriginRequests(t *testing.T) {
+	const noHeader = "this endpoint requires the header X-ACU-Admin: 1"
+	const otherOrigin = "requests from another origin are refused: Sec-Fetch-Site must be same-origin or none"
 	for _, tc := range []struct {
 		name    string
 		headers []string
 		status  int
+		body    string // the 403's text
 	}{
-		{"form POST without the header", nil, http.StatusForbidden},
-		{"header not 1", []string{"X-ACU-Admin", "true"}, http.StatusForbidden},
-		{"cross-site fetch", []string{"X-ACU-Admin", "1", "Sec-Fetch-Site", "cross-site"}, http.StatusForbidden},
-		{"same-site fetch", []string{"X-ACU-Admin", "1", "Sec-Fetch-Site", "same-site"}, http.StatusForbidden},
-		{"same-origin", []string{"X-ACU-Admin", "1", "Sec-Fetch-Site", "same-origin"}, http.StatusAccepted},
-		{"direct (none)", []string{"X-ACU-Admin", "1", "Sec-Fetch-Site", "none"}, http.StatusAccepted},
-		{"curl", []string{"X-ACU-Admin", "1"}, http.StatusAccepted},
+		{"form POST without the header", nil, http.StatusForbidden, noHeader},
+		{"header not 1", []string{"X-ACU-Admin", "true"}, http.StatusForbidden, noHeader},
+		{"cross-site fetch", []string{"X-ACU-Admin", "1", "Sec-Fetch-Site", "cross-site"}, http.StatusForbidden, otherOrigin},
+		{"same-site fetch", []string{"X-ACU-Admin", "1", "Sec-Fetch-Site", "same-site"}, http.StatusForbidden, otherOrigin},
+		{"same-origin", []string{"X-ACU-Admin", "1", "Sec-Fetch-Site", "same-origin"}, http.StatusAccepted, ""},
+		{"direct (none)", []string{"X-ACU-Admin", "1", "Sec-Fetch-Site", "none"}, http.StatusAccepted, ""},
+		{"curl", []string{"X-ACU-Admin", "1"}, http.StatusAccepted, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := &stubForgetter{res: forgotten(0)}
 			_, base, cleanup := startAdminServer(t, withForgetter(stub))
 			defer cleanup()
-			if status, _, _ := forget(t, base, "host=h&suite=/s", tc.headers...); status != tc.status {
+			status, _, body := forget(t, base, "host=h&suite=/s", tc.headers...)
+			if status != tc.status {
 				t.Errorf("status = %d, want %d", status, tc.status)
+			}
+			if got := strings.TrimRight(body, "\n"); tc.status == http.StatusForbidden && got != tc.body {
+				t.Errorf("403 body = %q, want %q", got, tc.body)
 			}
 			calls, _, _, _ := stub.snapshot()
 			if want := map[bool]int{true: 1, false: 0}[tc.status == http.StatusAccepted]; calls != want {

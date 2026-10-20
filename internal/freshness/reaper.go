@@ -517,12 +517,13 @@ func (r *Reaper) reapHeld(hctx context.Context, c reapCandidate) (h heldReap) {
 const settleReadTimeout = 5 * time.Second
 
 // settledGone reports whether key's row is gone, read on a fresh context
-// (the run's may have ended): after a panic under the hold, the cache's
-// answer decides how the hold is released, since the panic may have
-// struck after a commit. A read error answers false — present, the
+// (the run's, or Forget's, may have ended): after a panic under the hold,
+// the cache's answer decides how the hold is released, since the panic
+// may have struck after a commit. A read error answers false — present, the
 // conservative release (the cache's settle answers so too) — and so does
-// a panic in the read: settledGone runs in reapSuite's recovery, and
-// whatever it does the hold must still be released.
+// a panic in the read: settledGone runs in the panic recovery of
+// reapSuite and of Forget, and whatever it does the hold must still be
+// released.
 func (r *Reaper) settledGone(key cache.SuiteKey) (gone bool) {
 	defer func() {
 		if recover() != nil {

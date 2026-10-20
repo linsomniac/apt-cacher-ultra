@@ -246,3 +246,58 @@ func TestReaper_ForgetReportsADatabaseError(t *testing.T) {
 		t.Fatalf("Forget on a closed cache = %+v, %v; want an error", res, err)
 	}
 }
+
+// The Task 6 re-review's out-of-scope 3, as the reaper's per-candidate
+// rule (design note 23): a panic under Forget's hold releases the suite as
+// the cache then answers — a fresh read of the row — not as Forget last
+// saw it, and the panic goes on to net/http's recovery unchanged. A
+// reapHook stands in for a panic after a commit: it deletes the row
+// through the cache, then panics, and the deleted suite's lock-map entry
+// and per-suite state go (release(true)); one that panics with the row
+// present keeps them (release(false)).
+func TestReaper_ForgetReleasesAsTheCacheAnswersAfterAPanic(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		delete bool // the hook deletes the row before it panics
+	}{
+		{"the row gone before the panic", true},
+		{"the row present at the panic", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newReaperRig(t)
+			r.seed("/r/dists/x", reapNow) // leaves a lock-map entry
+			key := suiteKey("http", "h", "/r/dists/x")
+			r.checker.absentAnswered.Store(key, struct{}{})
+			r.reaper.reapHook = func(_ context.Context, k cache.SuiteKey) {
+				r.reaper.reapHook = nil
+				if tc.delete {
+					if res, err := r.cache.ForgetSuite(context.Background(), k, nil); err != nil || !res.Deleted {
+						t.Errorf("ForgetSuite = %+v, %v; want the row deleted", res, err)
+					}
+				}
+				panic("forget bug")
+			}
+			var got any
+			func() {
+				defer func() { got = recover() }()
+				_, _ = r.reaper.Forget(context.Background(), "http", "h", "/r/dists/x")
+			}()
+			if got != "forget bug" {
+				t.Fatalf("Forget's panic = %v, want \"forget bug\" passed on to the caller (net/http's recovery)", got)
+			}
+			if r.exists("/r/dists/x") == tc.delete {
+				t.Fatalf("premise: row exists %v, want %v", r.exists("/r/dists/x"), !tc.delete)
+			}
+			want := 1 // present: release(false) keeps the entry
+			if tc.delete {
+				want = 0 // gone: release(true) drops it
+			}
+			if n := r.checker.LockCount(); n != want {
+				t.Fatalf("%d lock-map entries after the panic; want %d (released as the cache answers)", n, want)
+			}
+			if _, ok := r.checker.absentAnswered.Load(key); ok == tc.delete {
+				t.Fatalf("per-suite state kept %v after the panic; want %v", ok, !tc.delete)
+			}
+		})
+	}
+}
