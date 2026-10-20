@@ -616,8 +616,9 @@ func baseGoroutines() int {
 }
 
 // sampleGoroutines is one goroutine sample of a simulation bounded by
-// limit: runtime.NumGoroutine read after synctest.Wait, and read once more
-// after another Wait when the first read is over limit.
+// limit: runtime.NumGoroutine read after synctest.Wait, and, when that
+// read is over limit, read once more after the world was stopped
+// (runtime.ReadMemStats) and another Wait.
 //
 // AIDEV-NOTE: final fix wave FW-4 (b), superseding the ledger's "baseline
 // delta" ruling (the limits were already relative to a baseline).
@@ -626,13 +627,23 @@ func baseGoroutines() int {
 // database/sql's per-query awaitDone and interruptOnDone goroutines
 // starting and exiting — it read 22–49 where a goroutine profile taken at
 // once showed 12–15, all expected (9 failures in 36 runs under CPU load).
-// Waiting first let them settle (0 in 60); the re-read absorbs the rare
-// outlier left (37 > 21 once in 72 runs). A real leak stays over the limit
-// on both reads.
+// Waiting first let them settle (0 in 60). What is left is a goroutine
+// that has just exited — outside the bubble, so no Wait covers it; a
+// restart starts and ends several — still counted until the runtime
+// recycles it, while its thread is descheduled under load: phase F's
+// final review (tests I-1) caught 6 such reads in 64 restart-simulation
+// runs (load1 about 20), each a dump of exactly the expected goroutines
+// taken right after the second read of 9 against 8. A re-read after a
+// bare second Wait, microseconds later, did not absorb it; one after a
+// stop-the-world does (the reviewer's overlay: 0 failures in 64 runs, 4
+// transients absorbed, and 0 in 108 with the stop between the reads). A
+// real leak stays over the limit on both reads.
 func sampleGoroutines(limit int) int {
 	synctest.Wait()
 	n := runtime.NumGoroutine()
 	if n > limit {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms) // stops the world: an exited goroutine's count settles
 		synctest.Wait()
 		n = runtime.NumGoroutine()
 	}
