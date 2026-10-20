@@ -454,7 +454,10 @@ Unsigned adoption has five safeguards:
    adopted unsigned over the other. The rule is checked before an adoption slot is taken and again
    inside the commit, so a signed anchor served while an unsigned adoption
    runs still stops it. Just before the commit the cache also re-reads the
-   signed anchors it has cached for the suite and records any it finds; if
+   signed anchors it has cached for the suite, under both schemes, and
+   records any it finds (one cached over the other scheme during the
+   commit's flip barrier, for a suite refused at `freshness.max_suites`, is
+   found only by the next attempt); if
    it cannot read them, the adoption is refused as well (logged as
    `adoption: signed-anchor re-mark failed`): that refusal means the cache
    could not rule out a signature.

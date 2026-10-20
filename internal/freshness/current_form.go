@@ -316,11 +316,22 @@ func (c *Checker) lateralHeld(suite, key string, nowUnix int64) bool {
 // marks the suite's base before anything else (Adopter.markSignatureSeen,
 // design review I-2: the suite's clients never fetch one, so only this
 // probe can record that the suite was seen signed; a failed mark fails the
-// check). Both absent → done = false: the unsigned check goes on. A probe
-// that ends unknown is a failed check: a signature may be there, so the
-// unsigned path does not run. The caller holds the host slot.
+// check). A Release absent behind a present Release.gpg is the unsigned
+// suite's current anchor absent (anchorAbsent: an answer, ruling R-E4, not
+// a failed check). Both signature files absent → done = false: the
+// unsigned check goes on. A probe that ends unknown is a failed check: a
+// signature may be there, so the unsigned path does not run. The caller
+// holds the host slot.
+//
+// AIDEV-NOTE: a present Release.gpg is marked BEFORE Release is probed
+// (spec C4 Dispatch 2: "if either is present → mark the base"; final fix
+// wave FW-1 (a)). Marking only after a present Release let a Release probe
+// that ended unknown (a 503) lose the sighting: the signature could then
+// be stripped and the suite updated unsigned — a suite the cache saw
+// signed adopting unsigned
+// (TestCheck_UpgradeProbeMarksTheSignatureBeforeProbingRelease).
 func (c *Checker) upgradeProbe(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef,
-	urls anchorURLs, gate retryGate, nowUnix int64) (req *adoptionRequest, done bool) {
+	urls anchorURLs, gate retryGate, now time.Time, nowUnix int64) (req *adoptionRequest, done bool) {
 	fail := func(name string, o probeOutcome) (*adoptionRequest, bool) {
 		if !o.cancelled() {
 			c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", fmt.Errorf("%s (%s): %w", name, o.class, o.err))
@@ -339,17 +350,19 @@ func (c *Checker) upgradeProbe(ctx, fetchCtx context.Context, out *checkOutcome,
 		} else if t.sig.class == classUnknown {
 			return fail("Release.gpg", t.sig)
 		}
-		if t.release = c.probe(fetchCtx, suite, urls, "Release"); t.release.class != classPresent {
-			if t.release.err == nil {
-				t.release.err = errors.New("not a Release")
-			}
-			return fail("Release", t.release)
-		}
-		t.form = adoptionFormDetached
 	}
 	if err := c.adopter.markSignatureSeen(ctx, suite, nowUnix); err != nil {
 		c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", fmt.Errorf("mark the signature seen: %w", err))
 		return nil, true
+	}
+	if t.inRelease.class != classPresent { // Release.gpg is the signature found
+		switch t.release = c.probe(fetchCtx, suite, urls, "Release"); t.release.class {
+		case classAbsent:
+			return c.anchorAbsent(ctx, fetchCtx, out, cur, suite, now, nowUnix, adoptionFormUnsigned, t.release, gate, false), true
+		case classUnknown:
+			return fail("Release", t.release)
+		}
+		t.form = adoptionFormDetached
 	}
 	req = t.request(suite)
 	req.crossForm = true
@@ -412,7 +425,7 @@ func (c *Checker) checkUnsigned(ctx, fetchCtx context.Context, out *checkOutcome
 
 	if c.adopter != nil {
 		urls := c.anchorURLsFor(suite, map[string]string{"Release": row.UpstreamURL})
-		if req, done := c.upgradeProbe(ctx, fetchCtx, out, cur, suite, urls, gate, nowUnix); done {
+		if req, done := c.upgradeProbe(ctx, fetchCtx, out, cur, suite, urls, gate, now, nowUnix); done {
 			return req, nil
 		}
 	}

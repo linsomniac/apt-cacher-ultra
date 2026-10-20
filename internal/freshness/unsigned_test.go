@@ -296,6 +296,80 @@ func TestRunUnsigned_RemarksCachedSignedAnchors(t *testing.T) {
 	}
 }
 
+// Ruling R-E1 under both schemes (final fix wave FW-1 (b); design review
+// M-7): the commit counts a marker under either scheme as signed history,
+// so the re-mark reads the base's and the /. twin's cached anchors under
+// http and https and marks each under its own row's scheme. A signed
+// InRelease cached under the other scheme and left unmarked (phase D's
+// backstop residual, or a suite untracked when it was served) refuses the
+// unsigned commit. Both final reviewers' probes (spec I1, tests Critical
+// 2) and the concurrency lens's E3.
+func TestRunUnsigned_RemarkReadsBothSchemes(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		suiteScheme, rowScheme string
+		trackOther             bool // the other scheme's suite has a row
+		twin                   bool // the suite is /flat; the row is its /. twin's
+	}{
+		{"https row, untracked, http suite", "http", "https", false, false},
+		{"https row of a tracked https suite, http suite", "http", "https", true, false},
+		{"http row, https suite", "https", "http", false, false},
+		{"https twin row, http suite", "http", "https", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newUnsignedRig(t, 0, 0)
+			ctx := context.Background()
+			if tc.suiteScheme != "http" || tc.twin {
+				r.suite.CanonicalScheme = tc.suiteScheme
+				if tc.twin {
+					r.suite.SuitePath = "/flat"
+				}
+				trackSuite(t, r.c, r.suite)
+				r.members.put(tc.suiteScheme+"://h"+r.suite.SuitePath+"/main/binary-amd64/Packages", r.pkgs)
+			}
+			base, dir := r.suite.SuitePath, r.suite.SuitePath
+			if tc.twin {
+				dir += "/."
+			}
+			if tc.trackOther {
+				trackSuite(t, r.c, SuiteRef{CanonicalScheme: tc.rowScheme, CanonicalHost: "h", SuitePath: r.suite.SuitePath})
+			}
+			h, err := r.ad.writeBlobBytes(ctx, simtest.ClearsignedFixture("Origin: signed over "+tc.rowScheme+"\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := int64(1_700_000_000)
+			path := dir + "/InRelease"
+			if err := r.c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: tc.rowScheme, CanonicalHost: "h", Path: path,
+				BlobHash: &h, UpstreamURL: tc.rowScheme + "://h" + path, IsMetadata: true, LastRequestedAt: &now,
+				RequestCount: 1, LastFetchedAt: &now}); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.c.CheckUnsignedDowngrade(ctx, "h", base); err != nil {
+				t.Fatalf("setup: the base already counts as signed: %v", err)
+			}
+			err = r.ad.RunUnsigned(ctx, r.suite, r.release("unsigned over "+tc.suiteScheme), "", "")
+			if !errors.Is(err, ErrAdoptionUnsignedDowngradeRefused) || !errors.Is(err, cache.ErrUnsignedDowngradeRefused) {
+				t.Fatalf("RunUnsigned over %s = %v, want the commit's never-downgrade refusal", tc.suiteScheme, err)
+			}
+			sf, err := r.c.GetSuiteFreshness(ctx, tc.suiteScheme, "h", r.suite.SuitePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sf.CurrentSnapshotID != nil {
+				t.Fatal("an unsigned snapshot was committed while the other scheme's signed anchor sat cached")
+			}
+			if seen, ok, err := r.c.SignedSeen(ctx, tc.rowScheme, "h", base); err != nil || !ok || seen != now {
+				t.Fatalf("%s marker for %s = %d, %v, %v; want the re-mark's, under the row's scheme, stamped %d",
+					tc.rowScheme, base, seen, ok, err, now)
+			}
+			if _, ok, err := r.c.SignedSeen(ctx, tc.suiteScheme, "h", base); err != nil || ok {
+				t.Fatalf("%s marker for %s = %v, %v; want none (no row under the suite's own scheme)", tc.suiteScheme, base, ok, err)
+			}
+		})
+	}
+}
+
 // Ruling R-E1, fail closed: when signed evidence cannot be read, or the
 // re-mark cannot be written, the unsigned adoption is refused, never
 // committed — and the fault is logged (design review M-1: the refusal

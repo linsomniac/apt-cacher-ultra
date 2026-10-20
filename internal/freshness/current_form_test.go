@@ -552,6 +552,69 @@ func TestCheck_UnsignedSuiteSeenSignedNeverUpdatesUnsigned(t *testing.T) {
 	})
 }
 
+// Spec C4 Dispatch 2 ("if either is present → mark the base"), final fix
+// wave FW-1 (a): the upgrade probe marks the base as soon as a
+// sniff-passing Release.gpg is present, before it probes Release, so a
+// Release probe that ends unknown cannot lose the sighting — and once the
+// signature is stripped the suite is never updated unsigned. Both final
+// reviewers' probes (spec C1, tests Critical 1).
+func TestCheck_UpgradeProbeMarksTheSignatureBeforeProbingRelease(t *testing.T) {
+	r := newRetryRig(t, 0)
+	u1 := r.adoptUnsigned("u1")
+	r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 404})
+	r.up.setAt(rigReleaseGPGURL, armoredSig("a signature appears"))
+	r.up.setFail(rigReleaseGPGURL, nil)
+	r.up.setFail(rigReleaseURL, &fetch.StatusError{Code: 503})
+	r.clock.advance(time.Minute)
+	r.check()
+	if _, ok, err := r.cache.SignedSeen(context.Background(), "http", rigHost, rigSuite); err != nil || !ok {
+		t.Fatalf("no marker after the probe saw a sniff-passing Release.gpg and Release answered 503 (ok %v, err %v)", ok, err)
+	}
+	if row := r.row(); row.CheckFailCount != 1 {
+		t.Fatalf("check_fail_count %d, want the unknown Release to fail the check", row.CheckFailCount)
+	}
+	// The signature is stripped and upstream publishes new unsigned bytes.
+	r.up.setFail(rigReleaseURL, nil)
+	r.unsignedRelease("u2", &fetch.StatusError{Code: 404})
+	r.clock.advance(time.Hour)
+	r.check()
+	if snap := r.currentSnapshot(); snap.Form != cache.FormUnsigned || strOf(snap.SingleAnchorHash) != hashOf(u1) ||
+		strOf(r.row().AdoptionFailReason) != cache.ReasonUnsignedDowngradeRefused {
+		t.Fatalf("snapshot %+v, record %q; want u1 kept and unsigned_downgrade_refused", snap, strOf(r.row().AdoptionFailReason))
+	}
+}
+
+// FW-1 (a) with ruling R-E4: a present Release.gpg is marked, and an
+// absent Release behind it (the unsigned suite's current anchor) is
+// anchor_absent — an answer that resets the streak and records the refusal
+// state — not a failed check.
+func TestCheck_UpgradeProbeAbsentReleaseIsAnchorAbsent(t *testing.T) {
+	for name, releaseErr := range map[string]error{"404": &fetch.StatusError{Code: 404}, "403": &fetch.StatusError{Code: 403}} {
+		t.Run(name, func(t *testing.T) {
+			r := newRetryRig(t, 0)
+			u1 := r.adoptUnsigned("u1")
+			r.up.setAt(rigReleaseGPGURL, armoredSig("a signature appears"))
+			r.up.setFail(rigReleaseGPGURL, nil)
+			r.up.setFail(rigReleaseURL, releaseErr)
+			r.check()
+			if _, ok, err := r.cache.SignedSeen(context.Background(), "http", rigHost, rigSuite); err != nil || !ok {
+				t.Fatalf("no marker (ok %v, err %v)", ok, err)
+			}
+			row := r.row()
+			if row.CheckFailCount != 0 || lastResult(r) != "anchor_absent" || strOf(row.AdoptionFailReason) != cache.ReasonAnchorAbsent {
+				t.Fatalf("check_fail_count %d, result %q, record %q; want anchor_absent with the streak reset",
+					row.CheckFailCount, lastResult(r), strOf(row.AdoptionFailReason))
+			}
+			if len(r.events("freshness check failed")) != 0 {
+				t.Fatal("an absent Release was logged as a failed check")
+			}
+			if snap := r.currentSnapshot(); strOf(snap.SingleAnchorHash) != hashOf(u1) {
+				t.Fatalf("snapshot %+v, want u1 kept", snap)
+			}
+		})
+	}
+}
+
 // Ruling PE-2: an adopted suite in anchor_absent is paced by its record —
 // a client check (T1) inside the record's retry time asks nothing, and the
 // scheduler does not queue it (suiteDue) until that time. A next_retry_at

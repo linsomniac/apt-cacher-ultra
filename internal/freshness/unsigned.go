@@ -126,13 +126,19 @@ func (a *Adopter) markSignatureSeen(ctx context.Context, suite SuiteRef, seenAt 
 // fault, logged at ERROR (any other re-mark failure is a WARN).
 var errRemarkPoolRead = errors.New("read the pool file")
 
+// remarkSchemes are the schemes the re-mark reads cached anchors under:
+// both, as never-downgrade counts a marker under either (design review
+// M-7; final fix wave FW-1 (b)).
+var remarkSchemes = []string{"http", "https"}
+
 // remarkSignedAnchors re-runs, for an unsigned commit, the cached
 // signed-anchor mark of the suite (ruling R-E1, phase D's backstop rule):
 // it reads the InRelease and Release.gpg url_path rows of the suite's base
 // and of its /. twin (aptpath.MarkerBase(s) and MarkerBase(s)+"/.", which
-// share the marker), sniffs their pool files here — never on the writer —
-// and marks the base for each one that passes, stamped with the row's last
-// use. The mark is enqueued and committed before the commit is enqueued, so
+// share the marker) under both schemes, sniffs their pool files here —
+// never on the writer — and marks the base, under the row's own scheme,
+// for each one that passes, stamped with the row's last use. The mark is
+// enqueued and committed before the commit is enqueued, so
 // the commit's in-transaction re-read (FIFO writer) sees it. A pool file
 // that does not exist is no evidence (as in the startup marker pass); any
 // other read error (errRemarkPoolRead for a pool file), and a failed mark,
@@ -141,39 +147,51 @@ var errRemarkPoolRead = errors.New("read the pool file")
 // AIDEV-NOTE: this closes phase D's backstop residual where it matters — a
 // tracked suite whose sniff-passing signed anchor stayed unmarked after a
 // failed backstop, including one cached under the /. twin's path (design
-// review I-3). Fail closed: never commit unsigned while signed evidence
-// could not be ruled out, so a refusal from here can mean "could not rule
-// out" (an I/O or database fault), not only "signed".
+// review I-3) or under the other scheme (FW-1 (b): the commit's authority
+// is cross-scheme, M-7, so the evidence it surfaces must be too — an https
+// anchor cached while its suite was untracked, or whose backstop failed,
+// otherwise let the same base commit unsigned over plain http, the scheme
+// a man in the middle can strip). Cost: four more indexed reads per
+// unsigned commit. Residual (spec C3, C5): a signed anchor cached after
+// the re-mark ran — the other scheme's suite refused at the cap (no row)
+// and served signed during this adoption's barrier — earns no marker
+// before the commit, since markers are written only for suites with rows
+// (the next unsigned commit's re-mark finds it). Fail closed: never commit
+// unsigned while signed evidence could not be ruled out, so a refusal from
+// here can mean "could not rule out" (an I/O or database fault), not only
+// "signed".
 func (a *Adopter) remarkSignedAnchors(ctx context.Context, suite SuiteRef) error {
 	base := aptpath.MarkerBase(suite.SuitePath)
 	var marks []cache.SignedSeenMark
-	for _, dir := range []string{base, base + "/."} {
-		for _, name := range []string{"InRelease", "Release.gpg"} {
-			p := dir + "/" + name
-			row, err := a.cache.LookupURL(ctx, suite.CanonicalScheme, suite.CanonicalHost, p)
-			switch {
-			case errors.Is(err, cache.ErrNotFound):
-				continue
-			case err != nil:
-				return fmt.Errorf("read %s: %w", p, err)
-			case row.BlobHash == nil:
-				continue
+	for _, scheme := range remarkSchemes {
+		for _, dir := range []string{base, base + "/."} {
+			for _, name := range []string{"InRelease", "Release.gpg"} {
+				p := dir + "/" + name
+				row, err := a.cache.LookupURL(ctx, scheme, suite.CanonicalHost, p)
+				switch {
+				case errors.Is(err, cache.ErrNotFound):
+					continue
+				case err != nil:
+					return fmt.Errorf("read %s %s: %w", scheme, p, err)
+				case row.BlobHash == nil:
+					continue
+				}
+				signed, err := sniffCachedAnchor(a.cache, p, *row.BlobHash)
+				switch {
+				case errors.Is(err, fs.ErrNotExist):
+					continue
+				case err != nil:
+					return fmt.Errorf("%w of %s %s: %w", errRemarkPoolRead, scheme, p, err)
+				case !signed:
+					continue
+				}
+				seen := anchorLastUse(row)
+				if seen <= 0 {
+					seen = wallclock.Unix()
+				}
+				marks = append(marks, cache.SignedSeenMark{CanonicalScheme: scheme,
+					CanonicalHost: suite.CanonicalHost, Base: base, SeenAt: seen})
 			}
-			signed, err := sniffCachedAnchor(a.cache, p, *row.BlobHash)
-			switch {
-			case errors.Is(err, fs.ErrNotExist):
-				continue
-			case err != nil:
-				return fmt.Errorf("%w of %s: %w", errRemarkPoolRead, p, err)
-			case !signed:
-				continue
-			}
-			seen := anchorLastUse(row)
-			if seen <= 0 {
-				seen = wallclock.Unix()
-			}
-			marks = append(marks, cache.SignedSeenMark{CanonicalScheme: suite.CanonicalScheme,
-				CanonicalHost: suite.CanonicalHost, Base: base, SeenAt: seen})
 		}
 	}
 	if len(marks) == 0 {

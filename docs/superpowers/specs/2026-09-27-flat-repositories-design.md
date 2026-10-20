@@ -442,8 +442,15 @@ that have a `suite_freshness` row. Writers:
   (`MarkSignedSeenBatch`, `last_seen_at` = the check's time) before the
   check admits any request; a failed write fails the check. An unsigned
   suite's clients never fetch a signature, so without this writer one only
-  the checker saw could be stripped later and the suite adopted unsigned;
-- the adopter, before an unsigned commit (C5 safeguard 3, ruling R-E1).
+  the checker saw could be stripped later and the suite adopted unsigned.
+  The upgrade probe marks a *present* `Release.gpg` before it probes
+  `Release` (phase E final fix wave, FW-1);
+- the adopter, before an unsigned commit (C5 safeguard 3, ruling R-E1):
+  the suite's and its `/.` twin's cached anchors under both schemes, each
+  marked under its own row's scheme. Residual: an anchor cached under the
+  other scheme while its suite has no row (refused at the cap) after the
+  re-mark ran — served signed during the adoption's flip barrier — earns
+  no marker before that commit (C5).
 
 A plain-text "InRelease" fails the sniff and never creates a marker. The
 marker survives suite reaping: the reaper sweeps a marker only once no
@@ -607,7 +614,12 @@ unchanged, observation only):
 2. **Current snapshot unsigned** — probe `InRelease` and `Release.gpg`; if
    either is *present* → mark the base (C3) and make a signed adoption
    request (upgrade): from then on the suite is never adopted unsigned
-   (C5 safeguard 3), also after the signature goes away. Otherwise
+   (C5 safeguard 3), also after the signature goes away. A *present*
+   `Release.gpg` is marked before `Release` is probed for the detached
+   request, so a `Release` probe that ends *unknown* (a failed check) still
+   leaves the marker, and a `Release` *absent* behind it is the current
+   anchor absent (Dispatch 1), not a failed check (phase E final fix wave,
+   FW-1). Otherwise
    conditional GET `Release`; changed → unsigned adoption request (no
    re-confirmation). If a signature is present but the signed adoption
    cannot succeed (key not on the cache host), the suite keeps its last
@@ -875,9 +887,15 @@ upgrade (§6.1).
    without it. Before an unsigned commit the adopter also re-runs the
    cached signed-anchor mark under the suite mutex: it reads the
    `<suite>/InRelease` and `<suite>/Release.gpg` `url_path` rows of the
-   suite and of its `/.` twin (design review I-3), sniffs their pool files
-   outside the writer and marks the base for each that passes, before the
-   commit is enqueued (FIFO: the commit's re-read sees it); a failed mark,
+   suite and of its `/.` twin (design review I-3) under both schemes (the
+   commit counts a marker under either; phase E final fix wave, FW-1),
+   sniffs their pool files outside the writer and marks the base, under
+   each row's own scheme, for each that passes, before the
+   commit is enqueued (FIFO: the commit's re-read sees it). Residual: a
+   signed anchor cached under the other scheme after the re-mark ran —
+   that scheme's suite refused at the cap (no row, so no marker, C3) and
+   served signed during this adoption's flip barrier — earns no marker
+   before this commit; the next unsigned attempt's re-mark finds it. A failed mark,
    or a pool read error other than a missing file, refuses the adoption
    (phase E, ruling R-E1) and is logged (`adoption: signed-anchor re-mark
    failed`, WARN; ERROR for a pool read error; M-1) — that refusal means
