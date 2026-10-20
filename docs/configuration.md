@@ -687,7 +687,7 @@ served an unvouched package.
 | `interval` | duration | `"24h"` | Delay after a GC tick completes before the next periodic tick. Must be positive; disable through `enabled`. |
 | `batch_size` | integer | `100` | Maximum URL-path/blob rows processed per GC batch. At least `1`. |
 | `snapshot_batch_size` | integer | `10` | Maximum snapshots removed per batch. Snapshot deletion can cascade through many member rows. At least `1`. |
-| `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. The startup pass, which runs before the listeners serve, deletes no retired snapshot (of a reaped, evicted or forgotten suite, or one the upgrade's trust audit quarantined): the periodic passes do, normally the first one after the start (see *Suite reaping*). Must be positive. |
+| `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. The startup pass, which runs before the listeners serve, leaves the retired snapshots (of a reaped, evicted or forgotten suite, or one the upgrade's trust audit quarantined) to the periodic passes, normally the first one after the start (see *Suite reaping*); it deletes only a retired one never adopted whose heartbeat went stale, as it does any abandoned adoption candidate. Must be positive. |
 | `blob_grace` | duration | `"5m"` | Grace after a blob's reference count reaches zero before deletion. At least `"1s"`, and greater than twice `heartbeat_interval`. |
 | `keep_displaced` | integer | `3` | Recent displaced snapshots kept per suite for inspection. `0` retains none; must be nonnegative. Does not by itself retain superseded package binaries. Also bounds retained by-hash: a by-hash request the current snapshot lacks is served from the newest `keep_displaced` + 1 displaced snapshots of its suite, and `0` turns that off (see *Flip consistency*). |
 | `pool_scan_workers` | integer | `4` | Workers for the startup orphan-file scan. At least `1`. |
@@ -742,8 +742,10 @@ those no client asked for within `url_path_ttl`, after
 `hold_packages.window`, and their pool files after `blob_grace`. The
 next periodic GC passes delete the retired snapshots, and then the pool
 files nothing else uses, once `blob_grace` has passed — not the pass at
-startup (after a restart the periodic passes delete them, normally the
-first one), so a restart after many reaps does not keep the listeners
+startup, which deletes only a never-adopted one whose heartbeat went
+stale, as it does any abandoned adoption candidate (after a restart the
+periodic passes delete them, normally the first one), so a restart
+after many reaps does not keep the listeners
 closed while they are deleted; with `enabled = false` suites are still
 reaped, but their snapshots and pool files stay until GC runs again.
 
@@ -813,8 +815,9 @@ a day), so a clock that was ahead at the start has a day to be
 corrected. Two limits remain: a step the daemon was restarted across,
 not corrected within a day of the start, makes the sweep delete records
 up to the step early; and a daemon restarted at least once a day
-(before its first sweep comes due) never sweeps those records. `"0s"` turns suite reaping off; the reaper
-then only deletes the year-old records of signed paths no suite tracks.
+(before its first sweep comes due) never sweeps those records. `"0s"`
+turns suite reaping off; the reaper then only deletes the year-old
+records of signed paths no suite tracks.
 
 ## `[admin]`: status, metrics, and maintenance
 
@@ -926,7 +929,8 @@ prints the body and then the status.
 Each accepted request is logged as INFO `admin_forget_requested` (a
 request refused with 400, 403 or 413 is not), and each suite forgotten
 as INFO `suite_forgotten` — with `settled=true` when its final delete
-committed although the request then failed (500, or 503 at shutdown).
+committed although the request then failed (500, or 503 at shutdown)
+and a fresh read then found the row gone.
 
 ## `[serve]`: stale responses
 
