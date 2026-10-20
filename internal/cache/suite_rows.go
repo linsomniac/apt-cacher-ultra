@@ -135,7 +135,8 @@ type CreateResult struct {
 	// room within moments (the handler caches it for a minute, not ten).
 	CandidatesBusy bool
 	// heldGone: the held eviction candidate had no row when the writer ran
-	// (a concurrent creation had evicted it); heldKept: it no longer
+	// (a concurrent creation had evicted it, or a reap or POST /forget had
+	// deleted it, before this creation held it); heldKept: it no longer
 	// qualified (a client asked for it in between). Either way CreateSuite
 	// and StoreFetched try once more with a fresh candidate list.
 	heldGone, heldKept bool

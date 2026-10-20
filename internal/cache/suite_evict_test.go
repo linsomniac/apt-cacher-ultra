@@ -279,37 +279,68 @@ func TestCreateSuite_EvictionLeavesTheOtherSchemesTwin(t *testing.T) {
 // cap eviction moves the evictee base's signed-seen markers, under both
 // schemes, up to the eviction — MAX(last_seen_at, now) — so a dormant
 // suite's year-old marker is not swept the day after its eviction made it
-// an orphan. A stamp ahead of now is never lowered (ruling PF-1), no
-// marker is created, and another host's or another base's marker is left
-// alone. The evictee is a /. twin: its base's markers are the ones moved.
+// an orphan. The evictee is a /. twin: its base's markers are the ones
+// moved. Each case has the other scheme's old marker move up (a stamp
+// limited to the evictee's scheme fails both); the first leaves the
+// evictee's own scheme without a marker, which must stay absent (an
+// upsert, markSignedSeen, would create it: never-downgrade would then
+// refuse the base's unsigned return); the second has a stamp ahead of now
+// on the evictee's scheme, never lowered (ruling PF-1). Another host's or
+// another base's marker is left alone, and no marker is created.
 func TestCreateSuite_EvictionMovesTheBaseMarkersUp(t *testing.T) {
-	c := openCache(t)
-	ctx := context.Background()
-	defer stubNow(t, evictNow)()
-	evictee := sk("b", "/flat/.")
-	seedRow(t, c, evictee, evictNow-3*evictDay)
-	seedRow(t, c, sk("b", "/kept"), evictNow-3600) // requested within the day: not evictable
 	old, ahead := evictNow-400*evictDay, evictNow+evictDay
-	marks := []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "b", Base: "/flat", SeenAt: old},
-		{CanonicalScheme: "https", CanonicalHost: "b", Base: "/flat", SeenAt: ahead},
-		{CanonicalScheme: "http", CanonicalHost: "g", Base: "/flat", SeenAt: old},
+	other := []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "g", Base: "/flat", SeenAt: old},
 		{CanonicalScheme: "http", CanonicalHost: "b", Base: "/kept", SeenAt: old}}
-	if err := c.MarkSignedSeenBatch(ctx, marks); err != nil {
-		t.Fatal(err)
-	}
-	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 2}, newFakeGuard())
-	if err != nil || res.Evicted == nil || *res.Evicted != evictee {
-		t.Fatalf("CreateSuite = %+v, %v; want %v evicted", res, err, evictee)
-	}
-	for i, want := range []int64{evictNow, ahead, old, old} {
-		at, ok, err := c.SignedSeen(ctx, marks[i].CanonicalScheme, marks[i].CanonicalHost, marks[i].Base)
-		if err != nil || !ok || at != want {
-			t.Errorf("marker %+v after the eviction: %d (present %v, %v); want %d", marks[i], at, ok, err, want)
-		}
-	}
-	var n int
-	if err := c.db.QueryRow(`SELECT COUNT(*) FROM suite_signed_seen`).Scan(&n); err != nil || n != len(marks) {
-		t.Fatalf("%d markers after the eviction (%v); want %d: an eviction creates none", n, err, len(marks))
+	for _, tc := range []struct {
+		name    string
+		evictee SuiteKey
+		marks   []SignedSeenMark // the evictee base's markers, then other's
+		want    []int64          // each mark's stamp after the eviction
+		absent  []SignedSeenMark // no marker before the eviction, none after it
+	}{
+		{name: "the other scheme's moves up and none is created",
+			evictee: sk("b", "/flat/."),
+			marks:   []SignedSeenMark{{CanonicalScheme: "https", CanonicalHost: "b", Base: "/flat", SeenAt: old}},
+			want:    []int64{evictNow},
+			absent:  []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "b", Base: "/flat"}}},
+		{name: "the other scheme's moves up and one ahead is kept",
+			evictee: SuiteKey{CanonicalScheme: "https", CanonicalHost: "b", SuitePath: "/flat/."},
+			marks: []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "b", Base: "/flat", SeenAt: old},
+				{CanonicalScheme: "https", CanonicalHost: "b", Base: "/flat", SeenAt: ahead}},
+			want: []int64{evictNow, ahead}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			defer stubNow(t, evictNow)()
+			seedRow(t, c, tc.evictee, evictNow-3*evictDay)
+			seedRow(t, c, sk("b", "/kept"), evictNow-3600) // requested within the day: not evictable
+			marks := append(append([]SignedSeenMark{}, tc.marks...), other...)
+			want := append(append([]int64{}, tc.want...), old, old)
+			if err := c.MarkSignedSeenBatch(ctx, marks); err != nil {
+				t.Fatal(err)
+			}
+			res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 2}, newFakeGuard())
+			if err != nil || res.Evicted == nil || *res.Evicted != tc.evictee {
+				t.Fatalf("CreateSuite = %+v, %v; want %v evicted", res, err, tc.evictee)
+			}
+			for i, m := range marks {
+				at, ok, err := c.SignedSeen(ctx, m.CanonicalScheme, m.CanonicalHost, m.Base)
+				if err != nil || !ok || at != want[i] {
+					t.Errorf("marker %+v after the eviction: %d (present %v, %v); want %d", m, at, ok, err, want[i])
+				}
+			}
+			for _, m := range tc.absent {
+				if at, ok, err := c.SignedSeen(ctx, m.CanonicalScheme, m.CanonicalHost, m.Base); err != nil || ok {
+					t.Errorf("marker %s://%s%s after the eviction: present %v at %d (%v); want none: an eviction creates no marker",
+						m.CanonicalScheme, m.CanonicalHost, m.Base, ok, at, err)
+				}
+			}
+			var n int
+			if err := c.db.QueryRow(`SELECT COUNT(*) FROM suite_signed_seen`).Scan(&n); err != nil || n != len(marks) {
+				t.Fatalf("%d markers after the eviction (%v); want %d: an eviction creates none", n, err, len(marks))
+			}
+		})
 	}
 }
 

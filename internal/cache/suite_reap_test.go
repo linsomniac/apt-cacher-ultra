@@ -519,8 +519,10 @@ func TestForgetSuite_ATwinPathDeletesItsBasesMarkers(t *testing.T) {
 // both schemes, up to the reap (MAX(last_seen_at, now)), so a reaped
 // suite's marker ages from the end of its tracking, not from its last
 // sighting. A stamp ahead of now is never lowered (ruling PF-1), another
-// host's marker is left alone, a twin's reap stamps its base's markers,
-// and a reap that keeps the suite stamps nothing.
+// host's marker is left alone, a twin's reap stamps its base's markers —
+// the other scheme's, https://h/flat, moved up, and none created for its
+// own scheme (http://h/flat has none: an upsert would create it) — and a
+// reap that keeps the suite stamps nothing.
 func TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
@@ -559,6 +561,9 @@ func TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap(t *testing.T) {
 		if got := stamp(marks[i]); got != want {
 			t.Errorf("marker %+v: stamp %d after the reaps, want %d", marks[i], got, want)
 		}
+	}
+	if at, ok, err := c.SignedSeen(ctx, "http", "h", "/flat"); err != nil || ok {
+		t.Errorf("marker http://h/flat after the reaps: present %v at %d (%v); want none: a reap creates no marker", ok, at, err)
 	}
 }
 
