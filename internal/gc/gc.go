@@ -155,6 +155,7 @@ type LastRunSummary struct {
 	BytesReclaimed          int64
 	OrphanCandidatesReaped  int
 	DisplacedReaped         int
+	RetiredReaped           int // snapshot-GC sub-job C (spec C9)
 	URLPathRowsReaped       int
 	URLPathRowsScanned      int
 	URLPathRowsStamped      int
@@ -280,6 +281,7 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		"bytes_reclaimed", tick.bytesReclaimed,
 		"orphan_candidates_reaped", tick.orphanCandidatesReaped,
 		"displaced_reaped", tick.displacedReaped,
+		"retired_reaped", tick.retiredReaped,
 		"url_path_rows_reaped", tick.urlPathRowsReaped,
 		"url_path_rows_scanned", tick.urlPath.scanned,
 		"url_path_rows_stamped", tick.urlPath.stamped,
@@ -301,6 +303,7 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		tick.bytesReclaimed,
 		tick.orphanCandidatesReaped,
 		tick.displacedReaped,
+		tick.retiredReaped,
 		tick.urlPathRowsReaped,
 		scan.orphansRepaired,
 		scan.orphanBytesRepaired,
@@ -316,6 +319,7 @@ func (g *GC) StartupPass(ctx context.Context) error {
 		BytesReclaimed:          tick.bytesReclaimed,
 		OrphanCandidatesReaped:  tick.orphanCandidatesReaped,
 		DisplacedReaped:         tick.displacedReaped,
+		RetiredReaped:           tick.retiredReaped,
 		URLPathRowsReaped:       tick.urlPathRowsReaped,
 		URLPathRowsScanned:      tick.urlPath.scanned,
 		URLPathRowsStamped:      tick.urlPath.stamped,
@@ -366,6 +370,7 @@ func (g *GC) Run(ctx context.Context) {
 				"bytes_reclaimed", tick.bytesReclaimed,
 				"orphan_candidates_reaped", tick.orphanCandidatesReaped,
 				"displaced_reaped", tick.displacedReaped,
+				"retired_reaped", tick.retiredReaped,
 				"url_path_rows_reaped", tick.urlPathRowsReaped,
 				"url_path_rows_scanned", tick.urlPath.scanned,
 				"url_path_rows_stamped", tick.urlPath.stamped,
@@ -387,6 +392,7 @@ func (g *GC) Run(ctx context.Context) {
 				tick.bytesReclaimed,
 				tick.orphanCandidatesReaped,
 				tick.displacedReaped,
+				tick.retiredReaped,
 				tick.urlPathRowsReaped,
 				0,
 				0,
@@ -402,6 +408,7 @@ func (g *GC) Run(ctx context.Context) {
 				BytesReclaimed:          tick.bytesReclaimed,
 				OrphanCandidatesReaped:  tick.orphanCandidatesReaped,
 				DisplacedReaped:         tick.displacedReaped,
+				RetiredReaped:           tick.retiredReaped,
 				URLPathRowsReaped:       tick.urlPathRowsReaped,
 				URLPathRowsScanned:      tick.urlPath.scanned,
 				URLPathRowsStamped:      tick.urlPath.stamped,
@@ -426,6 +433,7 @@ type tickResult struct {
 	bytesReclaimed         int64
 	orphanCandidatesReaped int
 	displacedReaped        int
+	retiredReaped          int
 	urlPathRowsReaped      int
 	poolUnlinkErrors       int
 	deadlineReached        bool
@@ -487,6 +495,7 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 		res.snapshotDuration = time.Since(start)
 		res.orphanCandidatesReaped += snap.OrphanReaped
 		res.displacedReaped += snap.DisplacedReaped
+		res.retiredReaped += snap.retired
 		if snapDeadline {
 			res.deadlineReached = true
 		}

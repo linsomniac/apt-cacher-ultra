@@ -75,6 +75,11 @@ var (
 		0,
 	)
 
+	gcRetiredReapedTotal = metrics.NewCounterWithCap(
+		"acu_gc_retired_reaped_total",
+		"Total retired suite_snapshot rows reaped by snapshot-GC sub-job C: snapshots of reaped, forgotten or quarantined suites (spec C9).",
+		0,
+	)
 	gcURLPathRowsReapedTotal = metrics.NewCounterWithCap(
 		"acu_gc_url_path_rows_reaped_total",
 		"Total url_path rows reaped by the URL-path TTL pass (SPEC4 §5 fourth class).",
@@ -160,6 +165,7 @@ func emitGCMetrics(
 	bytesReclaimed int64,
 	orphanCandidatesReaped int,
 	displacedReaped int,
+	retiredReaped int,
 	urlPathRowsReaped int,
 	poolOrphansRepaired int,
 	poolOrphanBytesRepaired int64,
@@ -180,6 +186,9 @@ func emitGCMetrics(
 	}
 	if displacedReaped > 0 {
 		gcDisplacedReapedTotal.Add(float64(displacedReaped))
+	}
+	if retiredReaped > 0 {
+		gcRetiredReapedTotal.Add(float64(retiredReaped))
 	}
 	if urlPathRowsReaped > 0 {
 		gcURLPathRowsReapedTotal.Add(float64(urlPathRowsReaped))

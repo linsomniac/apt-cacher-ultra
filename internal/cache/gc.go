@@ -254,6 +254,10 @@ func (c *Cache) RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGrac
 	// 1 current + 4 displaced keeps only 2 displaced. The (adopted_at
 	// DESC, snapshot_id DESC) tie-breaker makes ranking deterministic
 	// when two displacements share the same unix-second adopted_at.
+	// Retired snapshots (reaped, forgotten or quarantined) are ranked out
+	// the same way, before the window function (spec C9): they never take
+	// one of a suite's keep_displaced slots, and sub-job C
+	// (RunRetiredSnapshotGCChunk) deletes them.
 	const selectSQL = `
 SELECT snapshot_id, reap_class FROM (
   SELECT snapshot_id, 'orphan' AS reap_class FROM suite_snapshot
@@ -273,6 +277,7 @@ SELECT snapshot_id, reap_class FROM (
            ) AS rn
       FROM suite_snapshot
      WHERE adopted_at IS NOT NULL
+       AND retired_at IS NULL
        AND snapshot_id NOT IN (SELECT current_snapshot_id
                                  FROM suite_freshness
                                 WHERE current_snapshot_id IS NOT NULL)
@@ -358,6 +363,94 @@ LIMIT ?`
 		return SnapshotGCBatchResult{}, werr
 	}
 	return result, nil
+}
+
+// retiredChunkRows is spec C9's chunk for snapshot-GC sub-job C: the rows
+// one writer transaction deletes.
+//
+// AIDEV-NOTE: measured (phase F design review, M-15): one 10,000-row
+// package_hash chunk held the writer about 80 ms over a 600,000-row table
+// with its four indexes. Re-measure before raising it.
+const retiredChunkRows = 10_000
+
+// RunRetiredSnapshotGCChunk is one writer transaction of snapshot-GC
+// sub-job C (spec C9): it takes the oldest retired snapshot, deletes up to
+// maxRows of its rows — snapshot_member, then snapshot_skipped_member,
+// then package_hash — and, when none is left, its suite_snapshot header.
+// It reports how many headers it deleted (0 or 1) and more = false only
+// when no retired snapshot was left to work on; the snapshot pass calls it
+// until then (or its deadline). maxRows <= 0 means retiredChunkRows.
+//
+// AIDEV-NOTE: a retired snapshot never serves, vouches or becomes current
+// again (CommitAdoption refuses it; every reader filters retired_at), and
+// its suite holds no adoption of it — every retirer holds the suite's
+// mutex (spec C9) — so it is deleted with no grace. Its pins were released
+// when it stopped being current (displacement, the reap's or quarantine's
+// Step-8 decrement); deleting its rows and header only drops the
+// references the blob pass's reachability predicate reads, so its blobs go
+// in the same tick's blob pass once blob_grace has passed — within two GC
+// ticks of the retirement. Chunking bounds the writer's hold on a large
+// suite (tens of thousands of package_hash rows).
+func (c *Cache) RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error) {
+	if maxRows <= 0 {
+		maxRows = retiredChunkRows
+	}
+	// The op writes gotReaped/gotMore, never the named results: on a
+	// ctx/close path submitWrite returns before the op ends (see
+	// InsertCandidateSnapshot).
+	var gotReaped int
+	var gotMore bool
+	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("RunRetiredSnapshotGCChunk: begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		var id int64
+		err = tx.QueryRowContext(ctx, `
+SELECT snapshot_id FROM suite_snapshot
+ WHERE retired_at IS NOT NULL
+   AND snapshot_id NOT IN (SELECT current_snapshot_id FROM suite_freshness WHERE current_snapshot_id IS NOT NULL)
+ ORDER BY snapshot_id
+ LIMIT 1`).Scan(&id)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return tx.Commit() // nothing retired is left: gotMore stays false
+		case err != nil:
+			return fmt.Errorf("RunRetiredSnapshotGCChunk: select: %w", err)
+		}
+		left := int64(maxRows)
+		for _, table := range []string{"snapshot_member", "snapshot_skipped_member", "package_hash"} {
+			res, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE rowid IN (SELECT rowid FROM `+table+
+				` WHERE snapshot_id = ? LIMIT ?)`, id, left)
+			if err != nil {
+				return fmt.Errorf("RunRetiredSnapshotGCChunk: delete %s: %w", table, err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("RunRetiredSnapshotGCChunk: delete %s: %w", table, err)
+			}
+			if left -= n; left == 0 {
+				break // the chunk is full: the header waits for the next one
+			}
+		}
+		done := 0
+		if left > 0 { // every child table came up short: no row of id is left
+			if _, err := tx.ExecContext(ctx, `DELETE FROM suite_snapshot WHERE snapshot_id = ? AND retired_at IS NOT NULL`, id); err != nil {
+				return fmt.Errorf("RunRetiredSnapshotGCChunk: delete snapshot %d: %w", id, err)
+			}
+			done = 1
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("RunRetiredSnapshotGCChunk: commit: %w", err)
+		}
+		gotReaped, gotMore = done, true
+		return nil
+	})
+	if werr != nil {
+		return 0, false, werr
+	}
+	return gotReaped, gotMore, nil
 }
 
 // HashKnown reports whether a blob row exists for hash. Used by the
