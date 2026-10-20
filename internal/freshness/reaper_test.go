@@ -295,8 +295,9 @@ func TestReaperCandidates_ReapedRegardlessGoFirst(t *testing.T) {
 	}
 }
 
-// Design note 4: of several future interest stamps a run reports the
-// furthest (clock_step_detected is rate-limited, so one line).
+// Design note 4: of several future interest stamps a run reports only the
+// furthest — one clock_step_detected line, logged directly
+// (clockStepUnlimited), not one per stamp.
 func TestReaperCandidates_ReportsTheFurthestFutureStamp(t *testing.T) {
 	r := newReaperRig(t)
 	at := func(v int64) *int64 { return &v }
