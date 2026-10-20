@@ -37,7 +37,11 @@ const (
 // (wallclock) is pinned to reapNow too, running on from there, so no rig
 // test depends on the real date (the Task 9 review's Important 2: the
 // cache's stamps — M-9's marker stamp, a creation's — met reapNow's once
-// the real date passed them). No rig test may use t.Parallel.
+// the real date passed them). Outside a synctest bubble the pinned clock
+// runs on in real time, so a test that compares a stamp the cache writes
+// (a marker moved up by a reap or a forget, a retirement) exactly, or
+// tightly, with reapNow runs inside a bubble, where it stands still (the
+// Task 9 re-review). No rig test may use t.Parallel.
 type reaperRig struct {
 	t       *testing.T
 	cache   *cache.Cache

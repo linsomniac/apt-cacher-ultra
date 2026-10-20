@@ -84,42 +84,48 @@ func (r *reaperRig) cacheOtherSchemeAnchor(suite string) {
 // an unknown suite gets no lock-map entry (I-4). A busy suite keeps its
 // row. Markers another suite with the base keeps (here the other scheme's
 // suite) survive the forget, and the result names that suite (ruling
-// PF-7).
+// PF-7). Inside a synctest bubble the rig's pinned clock stands still, so
+// the forget's marker stamp (PF-10: MAX(last_seen_at, the cache's now)) is
+// exactly reapNow however long the machine takes to get there (the Task 9
+// re-review: outside a bubble the pinned clock runs on in real time, and
+// the assertion failed past one second).
 func TestReaper_ForgetAnswersFalseForBusyAndUnknown(t *testing.T) {
-	ctx := context.Background()
-	r := newReaperRig(t)
-	stored := 0
-	r.checker.lockLoadedHook = func(string) { stored++ }
-	if res, err := r.reaper.Forget(ctx, "http", "h", "/r/dists/none"); res.Deleted || err != nil || stored != 0 {
-		t.Fatalf("unknown: %+v, %v, %d lock-map loads; want not deleted, nil, none (I-4: no entry for a suite without a row)",
-			res, err, stored)
-	}
-	r.checker.lockLoadedHook = nil
-	r.seed("/r/dists/busy", reapNow)
-	release, held := r.checker.HoldSuite(reapKey("/r/dists/busy"))
-	if !held {
-		t.Fatal("busy")
-	}
-	res, err := r.reaper.Forget(ctx, "http", "h", "/r/dists/busy")
-	release(false)
-	if res.Deleted || err != nil || !r.exists("/r/dists/busy") {
-		t.Fatalf("busy: %+v, %v, row kept %v; want not deleted, nil, kept", res, err, r.exists("/r/dists/busy"))
-	}
-	r.seed("/r/dists/both", reapNow)
-	if err := r.cache.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "https", CanonicalHost: "h",
-		SuitePath: "/r/dists/both"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.cache.MarkSignedSeenBatch(ctx, []cache.SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "h",
-		Base: "/r/dists/both", SeenAt: reapNow}}); err != nil {
-		t.Fatal(err)
-	}
-	res, err = r.reaper.Forget(ctx, "http", "h", "/r/dists/both")
-	want := cache.SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/r/dists/both"}
-	if !res.Deleted || err != nil || r.markerAt("/r/dists/both") != reapNow || len(res.KeptBy) != 1 || res.KeptBy[0] != want {
-		t.Fatalf("other scheme's suite: %+v, %v, marker %d; want forgotten, the marker kept by %v", res, err,
-			r.markerAt("/r/dists/both"), want)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		r := newReaperRig(t)
+		stored := 0
+		r.checker.lockLoadedHook = func(string) { stored++ }
+		if res, err := r.reaper.Forget(ctx, "http", "h", "/r/dists/none"); res.Deleted || err != nil || stored != 0 {
+			t.Fatalf("unknown: %+v, %v, %d lock-map loads; want not deleted, nil, none (I-4: no entry for a suite without a row)",
+				res, err, stored)
+		}
+		r.checker.lockLoadedHook = nil
+		r.seed("/r/dists/busy", reapNow)
+		release, held := r.checker.HoldSuite(reapKey("/r/dists/busy"))
+		if !held {
+			t.Fatal("busy")
+		}
+		res, err := r.reaper.Forget(ctx, "http", "h", "/r/dists/busy")
+		release(false)
+		if res.Deleted || err != nil || !r.exists("/r/dists/busy") {
+			t.Fatalf("busy: %+v, %v, row kept %v; want not deleted, nil, kept", res, err, r.exists("/r/dists/busy"))
+		}
+		r.seed("/r/dists/both", reapNow)
+		if err := r.cache.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "https", CanonicalHost: "h",
+			SuitePath: "/r/dists/both"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.cache.MarkSignedSeenBatch(ctx, []cache.SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "h",
+			Base: "/r/dists/both", SeenAt: reapNow}}); err != nil {
+			t.Fatal(err)
+		}
+		res, err = r.reaper.Forget(ctx, "http", "h", "/r/dists/both")
+		want := cache.SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/r/dists/both"}
+		if !res.Deleted || err != nil || r.markerAt("/r/dists/both") != reapNow || len(res.KeptBy) != 1 || res.KeptBy[0] != want {
+			t.Fatalf("other scheme's suite: %+v, %v, marker %d; want forgotten, the marker kept by %v", res, err,
+				r.markerAt("/r/dists/both"), want)
+		}
+	})
 }
 
 // The same as the reaper's design note 5, for POST /forget: the row read
