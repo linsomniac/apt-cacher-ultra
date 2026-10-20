@@ -269,7 +269,8 @@ func TestRecoverGoroutine_LogsAndSwallows(t *testing.T) {
 	}()
 	<-done
 	out := logs.String()
-	for _, want := range []string{"adoption_panicked", "where=reconcile", "panic=boom", "suite_path=/r/dists/x"} {
+	for _, want := range []string{"adoption_panicked", "where=reconcile", "panic=boom", "canonical_scheme=http",
+		"canonical_host=h", "suite_path=/r/dists/x"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("log lacks %q:\n%s", want, out)
 		}

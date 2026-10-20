@@ -826,15 +826,22 @@ func (c *Checker) reportPanic(event, where string, suite SuiteRef, r any) {
 }
 
 // logPanic logs a recovered panic as event at ERROR, with where, the suite
-// and the panic value. The stack is attached to the first occurrence per
+// (its scheme, host and path; empty where the panic names no suite) and
+// the panic value. The stack is attached to the first occurrence per
 // goroutine kind (where) per process only (spec C5 "log the stack once"): a
 // deterministic panic on every attempt must not flood the log. One helper
 // for every recover in the package — the checker's goroutines and the
 // adopter's heartbeat (deferred minor A-37; the handler's counterpart is
-// logGoroutinePanic).
+// logGoroutinePanic, whose where=t1 line carries the same suite fields).
+//
+// AIDEV-NOTE: canonical_scheme tells a suite's http copy from its https
+// copy (the Task 6 re-review's out-of-scope 1: the reaper's panic line
+// could not); keep the handler's where=t1 freshness_check_panicked line
+// (internal/handler, maybeFireFreshness) on the same fields.
 func logPanic(logger *slog.Logger, event, where string, suite SuiteRef, r any) {
 	attrs := []any{
 		"where", where,
+		"canonical_scheme", suite.CanonicalScheme,
 		"canonical_host", suite.CanonicalHost,
 		"suite_path", suite.SuitePath,
 		"panic", fmt.Sprint(r),

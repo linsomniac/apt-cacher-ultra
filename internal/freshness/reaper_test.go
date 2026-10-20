@@ -577,8 +577,10 @@ func TestReaperForwardStep_TheSlackIsAnHour(t *testing.T) {
 // The Task 6 review's minor 2 (controller ruling): a panic while one
 // candidate is held is recovered per candidate, as checkRecovered recovers
 // a check's: it is logged (freshness_check_panicked, where=reaper) with
-// that suite, the hold is given back, and the run goes on — the next
-// candidate is reaped, and the memo and marker sweeps still run.
+// that suite — its scheme too (the Task 6 re-review's out-of-scope 1: an
+// http copy and an https copy of a suite are told apart) — the hold is
+// given back, and the run goes on: the next candidate is reaped, and the
+// memo and marker sweeps still run.
 func TestReaper_APanicSkipsOnlyItsCandidate(t *testing.T) {
 	r := newReaperRig(t)
 	r.seed("/r/dists/a", reapNow-32*reapDay) // the oldest: tried first
@@ -595,8 +597,9 @@ func TestReaper_APanicSkipsOnlyItsCandidate(t *testing.T) {
 		t.Fatalf("a exists %v, b exists %v; want the panicking candidate kept and the next one reaped",
 			r.exists("/r/dists/a"), r.exists("/r/dists/b"))
 	}
-	if ev := r.events("freshness_check_panicked"); len(ev) != 1 || ev[0]["where"] != "reaper" || ev[0]["suite_path"] != "/r/dists/a" {
-		t.Fatalf("panic lines = %v, want one with where=reaper naming /r/dists/a", ev)
+	if ev := r.events("freshness_check_panicked"); len(ev) != 1 || ev[0]["where"] != "reaper" ||
+		ev[0]["canonical_scheme"] != "http" || ev[0]["canonical_host"] != "h" || ev[0]["suite_path"] != "/r/dists/a" {
+		t.Fatalf("panic lines = %v, want one with where=reaper naming http://h/r/dists/a", ev)
 	}
 	if _, ok := r.adopter.reconciledSnapshots.Load(int64(1_000_000)); ok {
 		t.Fatal("the panic stopped the run's reconcile memo sweep")
@@ -641,6 +644,62 @@ func TestReaper_APanicAfterTheDeleteReleasesTheSuiteAsGone(t *testing.T) {
 	}
 	if n := r.checker.LockCount(); n != 0 {
 		t.Fatalf("%d lock-map entries after the panic; want the deleted suite's dropped (release(true))", n)
+	}
+}
+
+// The Task 6 re-review's New Breakage 1: the release after a panic takes
+// the cache's fresh answer, not what reapSuite last saw. Here the row is
+// deleted (a forget through the cache, standing in for any commit) and the
+// panic strikes before reapSuite learns it: the hold is released as gone,
+// so the deleted suite's lock-map entry and per-suite state are dropped.
+func TestReaper_APanicAfterTheRowWentReleasesTheSuiteAsGone(t *testing.T) {
+	r := newReaperRig(t)
+	r.seed("/r/dists/a", reapNow-31*reapDay) // leaves a lock-map entry
+	key := suiteKey("http", "h", "/r/dists/a")
+	r.checker.absentAnswered.Store(key, struct{}{})
+	r.reaper.reapHook = func(_ context.Context, k cache.SuiteKey) {
+		r.reaper.reapHook = nil
+		if res, err := r.cache.ForgetSuite(context.Background(), k, nil); err != nil || !res.Deleted {
+			t.Errorf("ForgetSuite = %+v, %v; want the row deleted", res, err)
+		}
+		panic("after the row is gone")
+	}
+	r.reaper.safeRun(context.Background())
+	if r.exists("/r/dists/a") {
+		t.Fatal("premise: the row is gone before the panic")
+	}
+	if ev := r.events("freshness_check_panicked"); len(ev) != 1 || ev[0]["suite_path"] != "/r/dists/a" {
+		t.Fatalf("panic lines = %v, want one naming /r/dists/a", ev)
+	}
+	if n := r.checker.LockCount(); n != 0 {
+		t.Fatalf("%d lock-map entries after the panic; want the gone suite's dropped (release(true) from the fresh read)", n)
+	}
+	if _, ok := r.checker.absentAnswered.Load(key); ok {
+		t.Fatal("the gone suite's per-suite state was kept")
+	}
+}
+
+// The other direction (design note 23: "a kept one's is never dropped"):
+// a panic while the row is present releases the hold as kept
+// (release(false)), so the suite's lock-map entry and per-suite state stay.
+func TestReaper_APanicWhileTheRowIsPresentKeepsTheSuitesState(t *testing.T) {
+	r := newReaperRig(t)
+	r.seed("/r/dists/a", reapNow-31*reapDay) // leaves a lock-map entry
+	key := suiteKey("http", "h", "/r/dists/a")
+	r.checker.absentAnswered.Store(key, struct{}{})
+	r.reaper.reapHook = func(context.Context, cache.SuiteKey) { panic("before any step") }
+	r.reaper.safeRun(context.Background())
+	if !r.exists("/r/dists/a") {
+		t.Fatal("premise: the row is present")
+	}
+	if ev := r.events("freshness_check_panicked"); len(ev) != 1 || ev[0]["suite_path"] != "/r/dists/a" {
+		t.Fatalf("panic lines = %v, want one naming /r/dists/a", ev)
+	}
+	if n := r.checker.LockCount(); n != 1 {
+		t.Fatalf("%d lock-map entries after the panic; want the present suite's kept (release(false))", n)
+	}
+	if _, ok := r.checker.absentAnswered.Load(key); !ok {
+		t.Fatal("the present suite's per-suite state was dropped")
 	}
 }
 

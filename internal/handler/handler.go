@@ -1325,8 +1325,11 @@ func (h *Handler) maybeFireFreshness(req *proxy.Request) {
 		// daemon. This recover runs before Done, so Close still drains.
 		defer func() {
 			if r := recover(); r != nil {
+				// The same suite fields as internal/freshness's logPanic,
+				// which logs every other freshness_check_panicked line.
 				h.logGoroutinePanic("freshness_check_panicked", &t1PanicStackLogged, r,
-					"where", "t1", "canonical_host", req.CanonicalHost, "suite_path", req.SuitePath)
+					"where", "t1", "canonical_scheme", req.CanonicalScheme, "canonical_host", req.CanonicalHost,
+					"suite_path", req.SuitePath)
 			}
 		}()
 		h.freshness.Check(h.lifecycleCtx, req.CanonicalScheme, req.CanonicalHost, req.SuitePath)
