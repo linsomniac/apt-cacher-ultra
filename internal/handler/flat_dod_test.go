@@ -48,6 +48,14 @@ func (u mintedFlatUpstream) Fetch(ctx context.Context, target *fetch.Target, dst
 // of tracked suites (a suite and its twin share one), and no lock-map,
 // flip-gate or touch-map entry beyond the tracked suites; the rejection
 // cache holds the refused suites only.
+//
+// The counts are exact, as phase D's sibling's are, only while two things
+// hold: the bubble's time never advances, so the flip gate's idle sweep
+// never runs; and every check answers 304 to a probe that carried no
+// validators — an unknown answer, a failed check — so nothing adopts and
+// no anchorless refresh runs (it needs both anchors answered absent). An
+// edit that advances time or answers 404 changes the gate's count or
+// starts anchorless refreshes.
 func TestServeHTTP_MintedFlatSuitesAtScale(t *testing.T) {
 	synctest.Test(t, testMintedFlatSuitesAtScale)
 }

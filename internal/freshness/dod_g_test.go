@@ -31,14 +31,23 @@ func (r *flatRig) adoptFlatRig(pkgs []byte) {
 	}
 }
 
-// vouches reports whether a request for path on the flat rig's host is
-// vouched (spec C6: DeclaredHashesForPath finds testHex64).
-func (r *flatRig) vouches(path string) bool {
+// declared returns the rows DeclaredHashesForPath finds for path on the
+// flat rig's host (spec C6).
+func (r *flatRig) declared(path string) []cache.DeclaredHash {
 	r.t.Helper()
 	rows, err := r.cache.DeclaredHashesForPath(context.Background(), "http", flatRigHost, path)
 	if err != nil {
 		r.t.Fatal(err)
 	}
+	return rows
+}
+
+// vouches reports whether a request for path on the flat rig's host is
+// vouched: exactly one row, declaring testHex64. A refused path is checked
+// with declared (no row at all), not with !vouches.
+func (r *flatRig) vouches(path string) bool {
+	r.t.Helper()
+	rows := r.declared(path)
 	return len(rows) == 1 && rows[0].DeclaredSHA256 == testHex64
 }
 
@@ -112,8 +121,8 @@ func TestDoD_EveryRealFilenameShapeAdoptsAndVouches(t *testing.T) {
 				}
 			}
 			for _, p := range tc.refused {
-				if r.vouches(p) {
-					t.Errorf("%s is vouched, want nothing", p)
+				if rows := r.declared(p); len(rows) != 0 {
+					t.Errorf("%s is declared by %v, want nothing", p, rows)
 				}
 			}
 		})
@@ -127,8 +136,8 @@ func TestDoD_EveryRealFilenameShapeAdoptsAndVouches(t *testing.T) {
 		if err := r.adopter.RunUnsigned(context.Background(), r.suite, rel, "", ""); err != nil || r.row().CurrentSnapshotID == nil {
 			t.Fatalf("RunUnsigned = %v; want an unsigned snapshot", err)
 		}
-		if r.vouches("/unsigned/amd64/u_1_amd64.deb") {
-			t.Fatal("an unsigned snapshot vouched its .deb")
+		if rows := r.declared("/unsigned/amd64/u_1_amd64.deb"); len(rows) != 0 {
+			t.Fatalf("an unsigned snapshot vouched its .deb: %v", rows)
 		}
 	})
 }
@@ -228,8 +237,11 @@ func TestDoD_UntrustedFlatSuiteFromAV6CacheKeepsTheBackoff(t *testing.T) {
 		time.Sleep(3 * time.Hour)
 		stop()
 		at := ver.times()
-		if len(at) < 6 {
-			t.Fatalf("%d adoption attempts in 3 h, want at least 6: the suite must keep retrying", len(at))
+		// Seven: spec C11's schedule puts the seventh attempt by 122 min
+		// plus six ticks (144.5 min), well inside the 3 h; it is the one
+		// whose gap meets the 1 h cap, so six would leave the cap unchecked.
+		if len(at) < 7 {
+			t.Fatalf("%d adoption attempts in 3 h, want at least 7: the suite must keep retrying, the 1 h cap included", len(at))
 		}
 		// Spec C11's schedule, written out (not backoffDelay: the oracle must
 		// not be the code under test), and the scheduler's fast tick
