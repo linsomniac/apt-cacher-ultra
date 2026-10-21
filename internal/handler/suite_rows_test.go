@@ -1108,12 +1108,13 @@ func TestServeHTTP_LateRegistrationReturnsRunTheBackstop(t *testing.T) {
 }
 
 // FW-4 (final review, tests' challenge to the Task 9 ruling d fallback):
-// the backstop that runs before the body is bounded at backstopTimeout,
-// well under apt's 30 s inactivity timeout, on the miss path and after
-// onboarding. backstopHook waits on the backstop's own context: a pool or
-// writer that never answers. The body is served once the bound passes,
-// the backstop's next read fails (WARN) and the anchor stays unmarked
-// for the startup pass.
+// the backstop that runs before the body is bounded well under apt's 30 s
+// inactivity timeout: on the miss path at backstopTimeout, and after
+// onboarding at the deadline it shares with its creation (onboardTimeout;
+// deferred minor E-67). backstopHook waits on the backstop's own context:
+// a pool or writer that never answers. The body is served once the bound
+// passes, the backstop's next read fails (WARN) and the anchor stays
+// unmarked for the startup pass.
 func TestServeHTTP_BackstopIsBoundedBeforeTheBody(t *testing.T) {
 	for _, hit := range []bool{false, true} {
 		t.Run(map[bool]string{false: "miss", true: "onboarding"}[hit], func(t *testing.T) {

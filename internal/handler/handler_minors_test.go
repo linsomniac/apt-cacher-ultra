@@ -15,20 +15,27 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // Deferred minor D-32: readCachedAnchor is the one reading of a cached
 // signed anchor that the creating transaction's marks and the backstop
-// share. No row: nothing, no error; a row without a blob: unsigned; a
-// clearsigned InRelease and an armored Release.gpg: signed; a plain-text
-// InRelease: unsigned; a pool file that is gone: the row and an error.
+// share. No row: nothing, no error; a url_path read that fails: nothing
+// and its error; a row without a blob: unsigned; a clearsigned InRelease
+// and an armored Release.gpg: signed; a plain-text InRelease: unsigned; a
+// pool file that is gone: the row and an error.
 func TestReadCachedAnchor(t *testing.T) {
 	r := newSuiteRig(t, true, 0)
 	ctx := context.Background()
 	key := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/r/dists/s"}
 	if row, signed, err := r.h.readCachedAnchor(ctx, key, "/r/dists/s/InRelease"); row != nil || signed || err != nil {
 		t.Fatalf("no row: %+v %v %v, want nil, false, nil", row, signed, err)
+	}
+	ended, cancel := context.WithCancel(ctx)
+	cancel()
+	if row, signed, err := r.h.readCachedAnchor(ended, key, "/r/dists/s/InRelease"); row != nil || signed || !errors.Is(err, context.Canceled) {
+		t.Fatalf("a failed url_path read: %+v %v %v, want nil, false and its error", row, signed, err)
 	}
 	if err := r.c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		Path: "/r/dists/s/InRelease", UpstreamURL: "http://127.0.0.1/r/dists/s/InRelease", IsMetadata: true}); err != nil {
@@ -38,20 +45,17 @@ func TestReadCachedAnchor(t *testing.T) {
 		t.Fatalf("a row without a blob: %+v %v %v, want the row, unsigned, nil", row, signed, err)
 	}
 	for _, tc := range []struct {
-		path string
-		body []byte
-		want bool
+		suite, path string
+		body        []byte
+		want        bool
 	}{
-		{"/r/dists/s/InRelease", rowInRelease, true},
-		{"/r/dists/s/Release.gpg", rowGPG, true},
-		{"/r/dists/p/InRelease", []byte("Origin: plain\n"), false},
+		{"/r/dists/s", "/r/dists/s/InRelease", rowInRelease, true},
+		{"/r/dists/s", "/r/dists/s/Release.gpg", rowGPG, true},
+		{"/r/dists/p", "/r/dists/p/InRelease", []byte("Origin: plain\n"), false},
 	} {
 		r.cacheAnchor(tc.path, tc.body, 1_700_000_000)
 		k := key
-		k.SuitePath = tc.path[:len(tc.path)-len("/InRelease")]
-		if tc.path == "/r/dists/s/Release.gpg" {
-			k.SuitePath = "/r/dists/s"
-		}
+		k.SuitePath = tc.suite
 		if row, signed, err := r.h.readCachedAnchor(ctx, k, tc.path); row == nil || signed != tc.want || err != nil {
 			t.Fatalf("%s: %+v %v %v, want signed=%v", tc.path, row, signed, err, tc.want)
 		}
@@ -86,22 +90,11 @@ func TestSeedRejections_ExpireRecoversItsPanic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = New(Config{Parser: parser, Cache: openTestCache(t), Fetch: noUpstream{}, HostLimiter: hostsem.New(1),
+	_, err = New(Config{Parser: parser, Cache: simtest.OpenCache(t), Fetch: noUpstream{}, HostLimiter: hostsem.New(1),
 		Logger: silentLogger(), MaxSuites: -1})
 	if err == nil || err.Error() != "handler: negative MaxSuites" {
 		t.Fatalf("New(MaxSuites: -1) = %v, want handler: negative MaxSuites", err)
 	}
-}
-
-// openTestCache opens a cache in a test directory.
-func openTestCache(t *testing.T) *cache.Cache {
-	t.Helper()
-	c, err := cache.Open(context.Background(), t.TempDir(), silentLogger())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-	return c
 }
 
 // Deferred minor E-65 (a): only the miss that created its suite's row
@@ -195,6 +188,9 @@ func TestServeHTTP_StrictCanceledBetweenTheLookups(t *testing.T) {
 	h.ServeHTTP(rec, proxyReq("GET", srv.URL, debPath).WithContext(ctx))
 	if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), "unvouched .deb, cached") {
 		t.Fatalf("status %d body %q, want 503 and no .deb", rec.Code, rec.Body.String())
+	}
+	if n := upstreamHits.Load(); n != 0 {
+		t.Fatalf("upstream asked %d times, want 0 (the canceled hit starts no refetch)", n)
 	}
 	recs := logs.find("request")
 	if len(recs) == 0 || recs[len(recs)-1]["outcome"] != "client_canceled" {
