@@ -283,7 +283,7 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 			deletes = append(deletes, row)
 		}
 	}
-	deleted, deleteFailed := 0, false
+	deleted, deleteErr := 0, error(nil)
 	if len(deletes) > 0 {
 		n, err := c.adopter.cache.DeleteURLPathRows(ctx, deletes)
 		if err != nil {
@@ -297,19 +297,15 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 			// counting, as a failed RefreshURLPathBlob makes its row
 			// unknown.
 			answered -= answeredDeletes
-			deleteFailed, lastErr = true, fmt.Errorf("delete anchorless rows: %w", err)
+			deleteErr = fmt.Errorf("delete anchorless rows: %w", err)
 		}
 		deleted = n
 	}
 	for _, path := range overCap {
 		c.noteAnchorlessOverCap(suite, path)
 	}
-	if (requests > 0 || deleteFailed) && answered == 0 {
-		err := fmt.Errorf("%w: %w", errAnchorlessUnknown, lastErr)
-		if requests == 0 {
-			err = lastErr // no index request: the anchors' failed delete alone
-		}
-		c.failCheck(ctx, out, cur, suite, nowUnix, "anchorless", err)
+	if (requests > 0 || deleteErr != nil) && answered == 0 {
+		c.failCheck(ctx, out, cur, suite, nowUnix, "anchorless", anchorlessFailure(requests, answeredDeletes, lastErr, deleteErr))
 		return
 	}
 	cur.LastCheckAt, cur.LastSuccessAt, cur.CheckFailCount = &nowUnix, &nowUnix, 0
@@ -320,6 +316,29 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 		e.result = "anchorless_refreshed"
 	}
 	c.finishCheck(ctx, out, cur, suite, e)
+}
+
+// anchorlessFailure is the error of an anchorless check that got no
+// content answer, given its index requests' count, how many of their
+// content answers were deletes, the last unanswered request's reason
+// (reqErr) and the failed delete's (deleteErr, nil when the delete
+// committed). It leads with the decisive reason — the failed delete when
+// no index was asked or when its 404s and 410s were the check's answers,
+// the index requests' own reason otherwise — and names the other one too,
+// after "; also ", when both apply: a failed delete never hides the
+// upstream reason (the Task 10 re-review's Minor).
+func anchorlessFailure(requests, answeredDeletes int, reqErr, deleteErr error) error {
+	if requests == 0 {
+		return deleteErr // no index request: the anchors' failed delete alone
+	}
+	first, also := reqErr, deleteErr
+	if deleteErr != nil && answeredDeletes > 0 {
+		first, also = deleteErr, reqErr
+	}
+	if also == nil {
+		return fmt.Errorf("%w: %w", errAnchorlessUnknown, first)
+	}
+	return fmt.Errorf("%w: %w; also %w", errAnchorlessUnknown, first, also)
 }
 
 // noteAnchorlessOverCap logs WARN "freshness: anchorless index over its

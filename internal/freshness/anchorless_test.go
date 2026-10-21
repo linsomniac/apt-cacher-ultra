@@ -1261,24 +1261,40 @@ func TestCheck_AnchorlessKeepsAnAnchorAClientStoredDuringItsProbe(t *testing.T) 
 // The Task 10 review's M4: a delete that fails is logged and is no answer —
 // its 404s stop counting, as a failed store makes its row unknown — so a
 // check its 404s alone answered fails (the streak backs off) and the rows
-// stay; another content answer still answers the check.
+// stay; another content answer still answers the check. The failed check's
+// err leads with its decisive reason and names the other one too (the
+// Task 10 re-review's Minor): the failed delete when it took the check's
+// only answers, or when no index was asked; the index requests' own reason
+// (a 503) when they failed anyway — a failed delete beside them never
+// hides it.
 func TestCheck_AnchorlessFailedDeleteIsNoAnswer(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		cache  func(r *flatRig)
 		result string
 		err    string // the failed check's err prefix
+		also   string // the other reason the err names after "; also ", "" for none
 	}{
 		{"an index's 404", func(r *flatRig) { r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "") }, "failed",
-			"every anchorless index request ended unknown: delete anchorless rows: "},
+			"every anchorless index request ended unknown: delete anchorless rows: ", ""},
 		{"an anchor's 404, no index row", func(r *flatRig) { r.cacheRow("Release", []byte("Origin: fury\n"), 1, rigStart-3600, "") }, "failed",
-			"delete anchorless rows: "},
+			"delete anchorless rows: ", ""},
 		{"a 404 beside a 304", func(r *flatRig) {
 			pk := gzBody("v1")
 			r.cacheRow("Packages.gz", pk, 1, rigStart-3600, rigETag(pk))
 			r.up.setAt(r.url("Packages.gz"), pk)
 			r.cacheRow("Sources.gz", gzBody("src"), 1, rigStart-3600, "")
-		}, "anchorless_unchanged", ""},
+		}, "anchorless_unchanged", "", ""},
+		{"a 503 beside an anchor's 404", func(r *flatRig) {
+			r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "")
+			r.up.setFail(r.url("Packages.gz"), &fetch.StatusError{Code: 503})
+			r.cacheRow("Release", []byte("Origin: fury\n"), 1, rigStart-3600, "")
+		}, "failed", "every anchorless index request ended unknown: Packages.gz: ", "delete anchorless rows: "},
+		{"an index's 404 beside a 503", func(r *flatRig) {
+			r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "")
+			r.cacheRow("Sources.gz", gzBody("src"), 1, rigStart-3600, "")
+			r.up.setFail(r.url("Sources.gz"), &fetch.StatusError{Code: 503})
+		}, "failed", "every anchorless index request ended unknown: delete anchorless rows: ", "Sources.gz: "},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newFlatRig(t, "/fury")
@@ -1306,6 +1322,10 @@ BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`); err != nil {
 				recs := logRecords(t, r.logs, "freshness check failed")
 				if len(recs) != 1 || !strings.HasPrefix(fmt.Sprint(recs[0]["err"]), tc.err) {
 					t.Fatalf("failed check lines %v, want one whose err starts %q", recs, tc.err)
+				}
+				_, also, ok := strings.Cut(fmt.Sprint(recs[0]["err"]), "; also ")
+				if ok != (tc.also != "") || !strings.HasPrefix(also, tc.also) {
+					t.Fatalf("failed check err %q, want it to name %q after \"; also \"", recs[0]["err"], tc.also)
 				}
 			}
 		})
