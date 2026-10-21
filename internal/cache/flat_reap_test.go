@@ -118,6 +118,15 @@ func TestReap_AFlatSuiteLeavesItsTwin(t *testing.T) {
 	if ok, err := c.HasSuiteRow(ctx, repo); err != nil || ok {
 		t.Fatalf("/repo's row: %v, %v; want it gone", ok, err)
 	}
+	for k, id := range ids {
+		var retired sql.NullInt64
+		if err := c.db.QueryRowContext(ctx, `SELECT retired_at FROM suite_snapshot WHERE snapshot_id = ?`, id).Scan(&retired); err != nil {
+			t.Fatal(err)
+		}
+		if want := k == repo; retired.Valid != want {
+			t.Errorf("%s's snapshot %d: retired %v, want %v (only the reaped suite's currency ends)", k.SuitePath, id, retired.Valid, want)
+		}
+	}
 	sf, err := c.GetSuiteFreshness(ctx, "http", "h", "/repo/.")
 	if err != nil || sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != ids[twin] {
 		t.Fatalf("/repo/.: row %+v, %v; want it and its current snapshot kept", sf, err)

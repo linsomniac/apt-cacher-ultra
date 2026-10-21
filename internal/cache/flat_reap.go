@@ -11,9 +11,9 @@ import (
 // unadoptedFlatIndexRowsSQL is ListUnadoptedFlatIndexRows' query: the
 // shape of unadoptedSuiteAnchorsSQL (design review M-14), probing
 // url_path's key once per root index name of spec C2's flat member
-// grammar — Packages and Sources, plain or with one of the six
-// compression extensions — for every unadopted suite whose path has no
-// "/dists/" (instr, not LIKE: LIKE ignores ASCII case).
+// grammar (aptpath.FlatIndexNames, the list ListSuiteMetadataRows probes
+// too) for every unadopted suite whose path has no "/dists/" (instr, not
+// LIKE: LIKE ignores ASCII case).
 //
 // AIDEV-NOTE: keep the join's url_path terms bare columns, as in
 // unadoptedSuiteAnchorsSQL: an expression on them turns each probe into a
@@ -21,10 +21,8 @@ import (
 // pins the plan).
 var unadoptedFlatIndexRowsSQL = func() string {
 	var names []string
-	for _, stem := range []string{"Packages", "Sources"} {
-		for _, ext := range []string{"", ".gz", ".xz", ".bz2", ".lzma", ".lz4", ".zst"} {
-			names = append(names, "sf.suite_path || '/"+stem+ext+"'")
-		}
+	for _, n := range aptpath.FlatIndexNames() {
+		names = append(names, "sf.suite_path || '/"+n+"'")
 	}
 	return `
 SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path, u.path, u.blob_hash, u.last_fetched_at
@@ -41,7 +39,8 @@ SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path, u.path, u.blob_has
 // ListUnadoptedFlatIndexRows returns the cached root Packages* and
 // Sources* rows of every flat suite (aptpath.IsFlatSuitePath) that has no
 // current snapshot, in suite and path order: ruling R-G2's junk evidence
-// for an anchorless flat suite. One read on the pool per reaper run.
+// for an anchorless flat suite. One read on the pool, in a reaper run that
+// holds an unadopted flat suite (the reaper's hasUnadoptedFlatSuite gate).
 func (c *Cache) ListUnadoptedFlatIndexRows(ctx context.Context) ([]SuiteAnchorRow, error) {
 	rows, err := c.db.QueryContext(ctx, unadoptedFlatIndexRowsSQL)
 	if err != nil {

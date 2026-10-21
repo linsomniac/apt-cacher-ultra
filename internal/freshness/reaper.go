@@ -105,8 +105,9 @@ type Reaper struct {
 	stepAhead                      time.Duration
 	reported                       futureStamp
 	// sniffs holds the junk verdicts the last completed scan reached, keyed
-	// by (anchor kind, blob) (ruling R-F3); only the run's goroutine
-	// touches it.
+	// by (anchor kind, blob) (ruling R-F3) and, for a flat index, its name
+	// (its extension picks the sniff; ruling R-G2); only the run's
+	// goroutine touches it.
 	sniffs map[sniffKey]bool
 	// readHead reads the head of a pool file for the junk scan (readCapped;
 	// tests count its reads or end the run's context at one).
@@ -672,7 +673,8 @@ func sameSnapshot(a, b *int64) bool {
 // has no signed evidence (cache.CheckUnsignedDowngrade finds no marker and
 // no signed snapshot of the base or its twin) is judged on its anchor rows
 // and its cached root Packages*/Sources* rows together
-// (cache.ListUnadoptedFlatIndexRows, one more indexed read per run) —
+// (cache.ListUnadoptedFlatIndexRows, one more indexed read in a run that
+// holds an unadopted flat suite: hasUnadoptedFlatSuite) —
 // junk only when it has at least one such row and every one is junk
 // evidence by the same rules (aptpath.SniffFlatIndex for an index's name;
 // fetched at least junkGrace ago; whatever its record); a flat suite with
@@ -684,9 +686,10 @@ func sameSnapshot(a, b *int64) bool {
 // read again under the hold, which re-reads only the current snapshot
 // (reapHeld): between the scan and the hold a junk suite's anchor rows
 // change only through an adoption, which that comparison catches, or
-// through url_path GC or a miss that re-fetched a row whose pool file had
-// gone, after which the reap costs the suite one fetch at its next
-// request. The sniffs run here, on the reaper's goroutine, never on the
+// through url_path GC, a miss that re-fetched a row whose pool file had
+// gone, or — for an unadopted flat suite's anchor and index rows — the
+// anchorless refresh replacing or deleting them, after which the reap
+// costs the suite one fetch at its next request. The sniffs run here, on the reaper's goroutine, never on the
 // writer (ruling PD-5). The scan checks ctx per suite: a shutdown does not
 // wait for the first run's reads after a restart (up to 64 KiB per anchor
 // not yet sniffed); cut short, it returns no candidate and keeps the memo
@@ -739,7 +742,7 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 		}
 		s := &rows[i].SuiteFreshness
 		key := cache.SuiteKey{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath}
-		flat := s.CurrentSnapshotID == nil && aptpath.IsFlatSuitePath(s.SuitePath)
+		flat := unadoptedFlat(s)
 		if listed[key] || (flat && !indexesRead) {
 			continue // a failed index read: no verdict for an unadopted flat suite this run
 		}
@@ -814,12 +817,23 @@ func (r *Reaper) suiteJunk(ctx context.Context, key cache.SuiteKey, flat bool, a
 // index rows.
 func hasUnadoptedFlatSuite(rows []cache.SuiteWithAdoption) bool {
 	for i := range rows {
-		s := &rows[i].SuiteFreshness
-		if s.CurrentSnapshotID == nil && aptpath.IsFlatSuitePath(s.SuitePath) {
+		if unadoptedFlat(&rows[i].SuiteFreshness) {
 			return true
 		}
 	}
 	return false
+}
+
+// unadoptedFlat reports whether s is an unadopted flat suite, the suites
+// junkCandidates judges with their root index rows.
+//
+// AIDEV-NOTE: the gate (hasUnadoptedFlatSuite) and the per-row test in
+// junkCandidates must agree (the Task 12 review's Minor 2): a suite the
+// row test calls flat while the gate read no index rows would be judged
+// with none, and a junk-anchored suite with a good index reaped on its
+// anchors alone. One predicate keeps them equal.
+func unadoptedFlat(s *cache.SuiteFreshness) bool {
+	return s.CurrentSnapshotID == nil && aptpath.IsFlatSuitePath(s.SuitePath)
 }
 
 // junkReadFailures counts one junk scan's failed pool reads, keeping the
@@ -840,7 +854,8 @@ type junkReadFailures struct {
 // to (aptpath.NotSuiteFile), or a pool file that is missing or does not
 // read, is no evidence; a read that fails for another reason than a
 // missing file is counted in fails. Each verdict goes into next, keyed by
-// (anchor kind, blob); one this scan (next) or the last completed scan
+// (anchor kind, blob, and a flat index's name); one this scan (next) or
+// the last completed scan
 // (r.sniffs) reached is reused without reading the pool file again, so a
 // scan reads each blob it has not sniffed once, however many suites share
 // it (at most 64 KiB each). A failed read reaches no verdict and is not

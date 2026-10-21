@@ -31,15 +31,18 @@ import (
 // missing pool file (no evidence); a dists/ suite's root Packages (no flat
 // index); the same plain-text bytes cached as Packages, where they pass (a
 // verdict is remembered per blob and name); and /junk's ./ twin, judged by
-// its own good index (ruling R-G4). The signed-evidence read is lazy: only
-// the suites the two rules judge differently read it.
+// its own good index (ruling R-G4); and /empty, with no cached anchor or
+// index row at all (R-G2: junk only with at least one row). The
+// signed-evidence read is lazy: only the suites the two rules judge
+// differently read it. A reaped suite's cached indexes go with it.
 func TestReaper_ReapsAJunkAnchorlessFlatSuite(t *testing.T) {
 	r := newReaperRig(t)
 	old, young := reapNow-2*reapDay, reapNow-3600
 	gz := "\x1f\x8b\x08\x00 an index"
 	signed := string(simtest.ClearsignedFixture("Origin: x\nSHA256:\n"))
 	reaped := []string{"/junk", "/absent", "/junk-anchors-signed", "/junk-everything", "/gz-name"}
-	kept := []string{"/junk/.", "/junk-anchors", "/young", "/good", "/mixed", "/signed", "/missing", "/r/dists/x", "/plain-name"}
+	kept := []string{"/junk/.", "/junk-anchors", "/young", "/good", "/mixed", "/signed", "/missing", "/r/dists/x", "/plain-name",
+		"/empty"}
 	for _, s := range append(append([]string{}, reaped...), kept...) {
 		r.junkSuite(s)
 	}
@@ -94,6 +97,11 @@ func TestReaper_ReapsAJunkAnchorlessFlatSuite(t *testing.T) {
 	}
 	if _, err := r.cache.LookupURL(context.Background(), "http", "h", "/junk/./Packages.gz"); err != nil {
 		t.Fatalf("/junk/./Packages.gz: %v; want the twin's index kept", err)
+	}
+	for _, p := range []string{"/junk/Packages.gz", "/junk/Sources", "/junk-everything/Packages.gz", "/junk-everything/InRelease"} {
+		if _, err := r.cache.LookupURL(context.Background(), "http", "h", p); !errors.Is(err, cache.ErrNotFound) {
+			t.Errorf("%s: %v; want the reaped suite's row deleted, not served as a hit", p, err)
+		}
 	}
 	if ev := r.events("suite reaper: junk anchor reads failed"); len(ev) != 0 {
 		t.Fatalf("read failure lines = %v, want none", ev)

@@ -270,4 +270,49 @@ func TestIsFlatHostRootPath(t *testing.T) {
 	}
 }
 
+// FlatIndexNames is spec C2's root index names, the one list the cache's
+// reads probe by (the Task 9 and Task 12 reviews): 14 distinct names, each
+// a flat member of the grammar that ClassifySuiteFile calls a flat index,
+// and its extensions are exactly the flat index sniff's.
+func TestFlatIndexNames(t *testing.T) {
+	names := FlatIndexNames()
+	seen := map[string]bool{}
+	for _, n := range names {
+		if seen[n] {
+			t.Errorf("%q listed twice", n)
+		}
+		seen[n] = true
+		if got := SuitePath("/flat/" + n); got != "/flat" {
+			t.Errorf("SuitePath(/flat/%s) = %q, want /flat", n, got)
+		}
+		if f := ClassifySuiteFile("/flat", "/flat/"+n); f != FileFlatIndex {
+			t.Errorf("ClassifySuiteFile(/flat, /flat/%s) = %d, want FileFlatIndex", n, f)
+		}
+	}
+	if len(names) != 14 {
+		t.Errorf("%d names, want 14 (Packages and Sources, plain and six compressions): %v", len(names), names)
+	}
+	exts := map[string]bool{}
+	for _, e := range flatIndexExts {
+		exts[e] = true
+		if _, ok := flatIndexMagic[e]; !ok {
+			t.Errorf("extension %s has no flat index sniff", e)
+		}
+	}
+	for e := range flatIndexMagic {
+		if !exts[e] {
+			t.Errorf("the sniff's extension %s is not listed", e)
+		}
+	}
+	for _, n := range []string{"Packages.Z", "Contents-amd64", "Release"} {
+		if seen[n] {
+			t.Errorf("%q is no root index name", n)
+		}
+	}
+	names[0] = "mutated"
+	if FlatIndexNames()[0] == "mutated" {
+		t.Error("FlatIndexNames returned its own backing array")
+	}
+}
+
 const hex64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

@@ -11,18 +11,9 @@ import (
 )
 
 // suiteRowNames are the member names ListSuiteMetadataRows probes by key:
-// spec C2's anchors and root indexes — Packages and Sources, plain or with
-// one of the six compression extensions (the names
+// spec C2's anchors and root indexes (aptpath.FlatIndexNames, the list
 // unadoptedFlatIndexRowsSQL probes too).
-var suiteRowNames = func() []string {
-	names := []string{"InRelease", "Release", "Release.gpg"}
-	for _, stem := range []string{"Packages", "Sources"} {
-		for _, ext := range []string{"", ".gz", ".xz", ".bz2", ".lzma", ".lz4", ".zst"} {
-			names = append(names, stem+ext)
-		}
-	}
-	return names
-}()
+var suiteRowNames = append([]string{"InRelease", "Release", "Release.gpg"}, aptpath.FlatIndexNames()...)
 
 // listSuiteMetadataRowsSQL is ListSuiteMetadataRows' query: url_path's
 // key probed once per suiteRowNames name under the suite, and one key
@@ -61,8 +52,9 @@ SELECT canonical_scheme, canonical_host, path, blob_hash, upstream_url,
 // suite's directory: a Gemfury-style repository keeps its .debs in the
 // suite's own directory, so a directory range read every cached .deb of
 // the repository, twice per check. TestListSuiteMetadataRows_ProbesURLPathByItsKey
-// pins the plan; keep suiteRowNames in step with spec C2's flat member
-// grammar (aptpath.flatMemberRE).
+// pins the plan. suiteRowNames follows spec C2's flat member grammar
+// through aptpath.FlatIndexNames, which aptpath's TestFlatIndexNames keeps
+// equal to aptpath.flatMemberRE.
 func (c *Cache) ListSuiteMetadataRows(ctx context.Context, key SuiteKey) ([]URLPath, error) {
 	if !aptpath.IsCanonicalSuitePath(key.SuitePath) {
 		return nil, nil

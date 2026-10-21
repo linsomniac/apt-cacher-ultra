@@ -29,8 +29,9 @@ func (r *reaperRig) junkSuite(suite string) {
 	}
 }
 
-// cacheAnchor caches body as suite's anchor name (InRelease, Release or
-// Release.gpg), fetched at the unix time fetched.
+// cacheAnchor caches body as suite's file name — an anchor (InRelease,
+// Release or Release.gpg) or a flat suite's root index (ruling R-G2) —
+// fetched at the unix time fetched.
 func (r *reaperRig) cacheAnchor(suite, name, body string, fetched int64) {
 	r.t.Helper()
 	ctx := context.Background()

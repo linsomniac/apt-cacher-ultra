@@ -101,6 +101,33 @@ var (
 	hex128RE       = regexp.MustCompile(`^[0-9a-f]{128}$`)
 )
 
+// flatIndexExts are the compression extensions of spec C2's flat member
+// grammar (flatMemberRE) and of the flat index sniff (flatIndexMagic).
+var flatIndexExts = []string{".gz", ".xz", ".bz2", ".lzma", ".lz4", ".zst"}
+
+// FlatIndexNames returns spec C2's root index names of a flat suite —
+// Packages and Sources, plain or with one of the six compression
+// extensions — 14 names, in a fixed order, as a new slice.
+//
+// AIDEV-NOTE: the one list (the Task 9 review's Minor 4, the Task 12
+// review's Minor 1). The cache probes url_path's key with exactly these
+// names (ListSuiteMetadataRows for Dispatch 3 and the anchorless refresh,
+// ListUnadoptedFlatIndexRows for the reaper's junk evidence): a name
+// missing here is a flat index those reads never see — the reaper would
+// then judge an unsigned suite with junk anchors on its anchors alone.
+// TestFlatIndexNames keeps it equal to flatMemberRE, ClassifySuiteFile and
+// flatIndexMagic.
+func FlatIndexNames() []string {
+	names := make([]string, 0, 2*(1+len(flatIndexExts)))
+	for _, stem := range []string{"Packages", "Sources"} {
+		names = append(names, stem)
+		for _, ext := range flatIndexExts {
+			names = append(names, stem+ext)
+		}
+	}
+	return names
+}
+
 // flatMemberSegments returns how many trailing segments of segs form a
 // spec C2 flat member — 1 (an anchor or root index), 2 (a pdiff Index) or
 // 3 (a by-hash name) — or 0 when the tail is none of them.
