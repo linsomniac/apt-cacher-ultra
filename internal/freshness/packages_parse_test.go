@@ -393,15 +393,18 @@ func TestParsePackages_OnlyStanzasWithoutSHA256Parse(t *testing.T) {
 }
 
 // Ruling R-G1's other side: a body with no Filename stanza at all — an
-// HTML error page, a foreign file — still fails its parse.
+// HTML error page, a foreign file — still fails its parse. The RFC822-shaped
+// bodies reach R-G1's tail and fail there ("no stanzas"); an HTML page has
+// no ':' on its first line, so it fails earlier, at that line ("malformed
+// header"), and never reaches the tail.
 func TestParsePackages_NoFilenameStanzaStillFails(t *testing.T) {
-	for name, body := range map[string]string{
-		"HTML error page":          "<html><head><title>404 Not Found</title></head><body>Not Found</body></html>\n",
-		"foreign file":             "Origin: Example\nLabel: Example\nSuite: stable\n",
-		"SHA512 only, no Filename": "Package: a\nSHA512: " + strings.Repeat("a", 128) + "\n",
+	for name, c := range map[string]struct{ body, err string }{
+		"HTML error page (fails at its first line)": {"<html><head><title>404 Not Found</title></head><body>Not Found</body></html>\n", "malformed header"},
+		"foreign file":             {"Origin: Example\nLabel: Example\nSuite: stable\n", "no stanzas"},
+		"SHA512 only, no Filename": {"Package: a\nSHA512: " + strings.Repeat("a", 128) + "\n", "no stanzas"},
 	} {
-		if _, _, err := parsePackages([]byte(body)); err == nil {
-			t.Errorf("%s: parsePackages succeeded, want a parse error", name)
+		if _, _, err := parsePackages([]byte(c.body)); err == nil || !strings.Contains(err.Error(), c.err) {
+			t.Errorf("%s: parsePackages = %v, want a parse error containing %q", name, err, c.err)
 		}
 	}
 }

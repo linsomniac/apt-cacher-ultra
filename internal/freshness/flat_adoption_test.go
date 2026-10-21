@@ -353,9 +353,10 @@ func TestAdopter_SkippedSHA512OnlyMemberNamesItsHash(t *testing.T) {
 // Ruling R-G1 end to end: a signed suite whose Packages declares only
 // SHA512 in every stanza adopts — its snapshot's coverage incomplete
 // (package_coverage_incomplete, reason no_sha256), no .deb vouched — where
-// it failed adoption_parse_failed at every check before. An HTML page
-// declared as the Packages member (a broken publisher) still fails the
-// adoption, and nothing is adopted.
+// it failed adoption_parse_failed at every check before. A foreign
+// RFC822-shaped file declared as the Packages member (a broken publisher)
+// still fails the adoption at R-G1's tail, and nothing is adopted; so does
+// an HTML page, which fails earlier, at its first line.
 func TestAdopter_PackagesWithoutAnySHA256AdoptsIncomplete(t *testing.T) {
 	ctx := context.Background()
 	deb := "/ubuntu/pool/main/a/a_1_amd64.deb"
@@ -382,17 +383,21 @@ func TestAdopter_PackagesWithoutAnySHA256AdoptsIncomplete(t *testing.T) {
 			t.Fatalf("package_coverage_incomplete = %v, want one line, reason no_sha256, 1 stanza", recs)
 		}
 	})
-	t.Run("an HTML page", func(t *testing.T) {
-		env := newAdoptionTestEnv(t)
-		html := []byte("<html><body>Not Found</body></html>\n")
-		env.fetcher.put(noble+"main/binary-amd64/Packages", html)
-		rel := hashRelease("Origin: x\n", true, false, map[string][]byte{"main/binary-amd64/Packages": html}, nil)
-		if err := env.adopter.Run(ctx, env.suite, rel, "", ""); !errors.Is(err, ErrAdoptionParseFailed) {
-			t.Fatalf("Run = %v, want ErrAdoptionParseFailed", err)
-		}
-		sf, err := env.cache.GetSuiteFreshness(ctx, env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
-		if err != nil || sf.CurrentSnapshotID != nil {
-			t.Fatalf("row %+v, %v; want nothing adopted", sf, err)
-		}
-	})
+	for name, body := range map[string]string{
+		"a foreign RFC822 file": "Origin: x\nLabel: y\nSuite: stable\n",
+		"an HTML page":          "<html><body>Not Found</body></html>\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := newAdoptionTestEnv(t)
+			env.fetcher.put(noble+"main/binary-amd64/Packages", []byte(body))
+			rel := hashRelease("Origin: x\n", true, false, map[string][]byte{"main/binary-amd64/Packages": []byte(body)}, nil)
+			if err := env.adopter.Run(ctx, env.suite, rel, "", ""); !errors.Is(err, ErrAdoptionParseFailed) {
+				t.Fatalf("Run = %v, want ErrAdoptionParseFailed", err)
+			}
+			sf, err := env.cache.GetSuiteFreshness(ctx, env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+			if err != nil || sf.CurrentSnapshotID != nil {
+				t.Fatalf("row %+v, %v; want nothing adopted", sf, err)
+			}
+		})
+	}
 }

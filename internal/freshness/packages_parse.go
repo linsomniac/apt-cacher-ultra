@@ -87,6 +87,16 @@ func parsePackages(text []byte) ([]PackageRef, []string, error) {
 		// Filename without a SHA256 is reported (spec C5 no_sha256):
 		// the caller makes coverage incomplete rather than dropping it
 		// silently.
+		//
+		// AIDEV-NOTE: a gap Filename is deliberately NOT passed through
+		// validateFilename. It becomes no row and no path: the caller
+		// only counts the distinct names (buildPackageHashes logs
+		// no_sha256_stanzas), never a name. Since ruling R-G1 a
+		// body made only of such stanzas parses, so a signed index of
+		// odd gap names (even "/etc/x") adopts with incomplete coverage;
+		// that is harmless while the names stay count-only. If a gap
+		// Filename ever reaches a path, a log value or a row, validate it
+		// here first, fatal like a row's.
 		if filename == "" || sha256 == "" {
 			if filename != "" {
 				if len(out)+len(noSHA256) >= MaxPackageStanzas {
@@ -193,9 +203,10 @@ func parsePackages(text []byte) ([]PackageRef, []string, error) {
 	}
 	if len(out) == 0 && len(noSHA256) == 0 && len(bytes.TrimSpace(text)) > 0 {
 		// A non-blank input in which no stanza names a Filename is no
-		// Packages index — a downloaded HTML error page, a foreign or
-		// truncated file. The freshness layer logs it as
-		// adoption_parse_failed and the next periodic tick retries.
+		// Packages index — a foreign or truncated file (a real HTML error
+		// page usually fails earlier, at its first line: malformed
+		// header). The freshness layer logs it as adoption_parse_failed
+		// and the next periodic tick retries.
 		//
 		// AIDEV-NOTE: ruling R-G1 (the E carry-forward). A body whose
 		// stanzas all name a Filename but none a SHA256 (an index that
