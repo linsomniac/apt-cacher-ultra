@@ -57,8 +57,8 @@ func commitStrictSnap(t *testing.T, h *Handler, scheme, host string, s strictSna
 
 // PR #8 parity item 4 (plan design note 17): PR #8's nine
 // TestPhase3StrictMode_FlatSnapshotScopedToItsDirectory cases under C6
-// vouching and C10's host-wide rule, and three new ones, through the real
-// handler. A vouched .deb is served after its hash check — a fallback-
+// vouching and C10's host-wide rule, and six new ones — 15 rows — through
+// the real handler. A vouched .deb is served after its hash check — a fallback-
 // vouched one whose bytes differ from the declaration is refused
 // (hash_validation_failure) — and an unvouched one on a host whose every
 // signed current snapshot is complete is refused (502, Retry-After 60,

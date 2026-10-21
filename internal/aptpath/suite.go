@@ -115,8 +115,9 @@ var flatIndexExts = []string{".gz", ".xz", ".bz2", ".lzma", ".lz4", ".zst"}
 // ListUnadoptedFlatIndexRows for the reaper's junk evidence): a name
 // missing here is a flat index those reads never see — the reaper would
 // then judge an unsigned suite with junk anchors on its anchors alone.
-// TestFlatIndexNames keeps it equal to flatMemberRE, ClassifySuiteFile and
-// flatIndexMagic.
+// TestFlatIndexNames keeps it equal to ClassifySuiteFile's flat indexes, to
+// flatIndexMagic's extensions and to the root index names flatMemberRE
+// accepts (its Packages/Sources extension group), both ways.
 func FlatIndexNames() []string {
 	names := make([]string, 0, 2*(1+len(flatIndexExts)))
 	for _, stem := range []string{"Packages", "Sources"} {

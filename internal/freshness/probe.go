@@ -128,12 +128,14 @@ func (c *Checker) probe(fetchCtx context.Context, suite SuiteRef, urls anchorURL
 }
 
 // anchorURLs builds the upstream URLs of a suite's anchor files. A cached
-// anchor row's stored upstream_url is the model — it keeps a non-default
-// port or a mirror prefix that the canonical host and path do not carry —
-// and a sibling is that URL with its last segment replaced; without one the
-// checker's urlReconstruct builds the URL from the suite identity.
+// anchor row's stored upstream_url is the model — or, for a flat suite
+// with no cached anchor row, its client-created index row's (checkFirst,
+// ruling PG-20) — it keeps a non-default port or a mirror prefix that the
+// canonical host and path do not carry — and a sibling is that URL with
+// its last segment replaced; without one the checker's urlReconstruct
+// builds the URL from the suite identity.
 type anchorURLs struct {
-	model       string // a cached anchor row's upstream_url, or ""
+	model       string // a cached anchor row's upstream_url (or a flat index row's: PG-20), or ""
 	modelName   string // that row's file name
 	reconstruct func(name string) string
 }

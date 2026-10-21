@@ -54,7 +54,8 @@ SELECT canonical_scheme, canonical_host, path, blob_hash, upstream_url,
 // the repository, twice per check. TestListSuiteMetadataRows_ProbesURLPathByItsKey
 // pins the plan. suiteRowNames follows spec C2's flat member grammar
 // through aptpath.FlatIndexNames, which aptpath's TestFlatIndexNames keeps
-// equal to aptpath.flatMemberRE.
+// equal to ClassifySuiteFile's flat indexes, to flatIndexMagic's extensions
+// and to the root index names aptpath.flatMemberRE accepts, both ways.
 func (c *Cache) ListSuiteMetadataRows(ctx context.Context, key SuiteKey) ([]URLPath, error) {
 	if !aptpath.IsCanonicalSuitePath(key.SuitePath) {
 		return nil, nil

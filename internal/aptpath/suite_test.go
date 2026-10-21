@@ -1,6 +1,7 @@
 package aptpath
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -108,7 +109,9 @@ func TestSuitePath_Flat(t *testing.T) {
 		{"/repo/flat/old-Packages.gz", ""},
 		{"/repo/flat/by-hash/SHA256/" + hex64 + "0", ""},
 		{"/repo/flat/by-hash/SHA512/x" + hex64 + hex64, ""},
+		{"/repo/flat/by-hash/SHA512/" + hex64 + hex64 + "0", ""},
 		{"/repo/flat/xPackages.diff/Index", ""},
+		{"/repo/flat/Packages.diffx/Index", ""},
 		{"/repo/InRelease/", ""},
 		{"/repo/./InRelease/", ""},
 		{"/repo/./.", ""},
@@ -308,6 +311,23 @@ func TestFlatIndexNames(t *testing.T) {
 		if seen[n] {
 			t.Errorf("%q is no root index name", n)
 		}
+	}
+	// The other direction (the Task 12 re-review's Minor 1): the grammar
+	// accepts no root index name the list lacks — its Packages/Sources
+	// extension group is exactly flatIndexExts.
+	src := flatMemberRE.String()
+	const group = `(?:Packages|Sources)(?:\.(?:`
+	i := strings.Index(src, group)
+	j := strings.Index(src[max(i, 0):], "))?")
+	if i < 0 || j < 0 {
+		t.Fatalf("flatMemberRE %s has no Packages/Sources extension group %s…))?", src, group)
+	}
+	var want []string
+	for _, e := range flatIndexExts {
+		want = append(want, strings.TrimPrefix(e, "."))
+	}
+	if got := strings.Split(src[i+len(group):i+j], "|"); !slices.Equal(got, want) {
+		t.Errorf("flatMemberRE's root index extensions %v, want flatIndexExts %v", got, want)
 	}
 	names[0] = "mutated"
 	if FlatIndexNames()[0] == "mutated" {

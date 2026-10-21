@@ -236,9 +236,12 @@ func TestDeclaredHashesForPath_TheFallbackReadsCurrentSignedSnapshotsOnly(t *tes
 // Spec C6 "non-retired": a snapshot retired through either retirement
 // path — the legacy audit's quarantine and the reaper's delete — vouches
 // nothing, by its exact rows or through the fallback, although its
-// package_hash rows are still there. Both paths clear the current pointer
-// before they stamp retired_at; this pins that against a future
-// retirement path that leaves the pointer set.
+// package_hash rows are still there. Neither path leaves a current
+// pointer at a retired snapshot: the quarantine clears the pointer before
+// it stamps retired_at, and the reaper stamps retired_at and then deletes
+// the suite's row, in one transaction (suite_reap.go deleteSuiteTx). This
+// pins that against a future retirement path that leaves the pointer
+// set.
 func TestDeclaredHashesForPath_ARetiredSnapshotVouchesNothing(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()

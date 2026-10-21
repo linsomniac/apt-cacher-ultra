@@ -689,11 +689,11 @@ func sameSnapshot(a, b *int64) bool {
 // through url_path GC, a miss that re-fetched a row whose pool file had
 // gone, or — for an unadopted flat suite's anchor and index rows — the
 // anchorless refresh replacing or deleting them, after which the reap
-// costs the suite one fetch at its next request. The sniffs run here, on the reaper's goroutine, never on the
-// writer (ruling PD-5). The scan checks ctx per suite: a shutdown does not
-// wait for the first run's reads after a restart (up to 64 KiB per anchor
-// not yet sniffed); cut short, it returns no candidate and keeps the memo
-// the last completed scan left.
+// costs the suite one fetch at its next request. The sniffs run here, on
+// the reaper's goroutine, never on the writer (ruling PD-5). The scan
+// checks ctx per suite: a shutdown does not wait for the first run's reads
+// after a restart (up to 64 KiB per anchor not yet sniffed); cut short, it
+// returns no candidate and keeps the memo the last completed scan left.
 func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdoption, have []reapCandidate, now time.Time) []reapCandidate {
 	anchors, err := r.cache.ListUnadoptedSuiteAnchors(ctx)
 	if err != nil {
@@ -837,8 +837,9 @@ func unadoptedFlat(s *cache.SuiteFreshness) bool {
 }
 
 // junkReadFailures counts one junk scan's failed pool reads, keeping the
-// first — its error, and its suite's scheme and host and the anchor's
-// path — so a scan logs one line however many fail (design review M-4).
+// first — its error, and its suite's scheme and host and the path of the
+// anchor or flat index row it read — so a scan logs one line however many
+// fail (design review M-4).
 type junkReadFailures struct {
 	n                  int
 	first              error
@@ -855,15 +856,15 @@ type junkReadFailures struct {
 // read, is no evidence; a read that fails for another reason than a
 // missing file is counted in fails. Each verdict goes into next, keyed by
 // (anchor kind, blob, and a flat index's name); one this scan (next) or
-// the last completed scan
-// (r.sniffs) reached is reused without reading the pool file again, so a
-// scan reads each blob it has not sniffed once, however many suites share
-// it (at most 64 KiB each). A failed read reaches no verdict and is not
-// remembered, so fails.n counts failed reads, not pool files: one
-// unreadable blob that N suites share is read, and counted, once for each
-// of them whose scan reaches it — at most N times, since a suite already
-// listed (a non-canonical or idle candidate), or one whose earlier anchor
-// row is no evidence, never reaches it (the WARN's count).
+// the last completed scan (r.sniffs) reached is reused without reading the
+// pool file again, so a scan reads each blob it has not sniffed once,
+// however many suites share it (at most 64 KiB each). A failed read
+// reaches no verdict and is not remembered, so fails.n counts failed
+// reads, not pool files: one unreadable blob that N suites share is read,
+// and counted, once for each of them whose scan reaches it — at most N
+// times, since a suite already listed (a non-canonical or idle candidate),
+// or one whose earlier anchor row is no evidence, never reaches it (the
+// WARN's count).
 func (r *Reaper) allJunk(key cache.SuiteKey, as []cache.SuiteAnchorRow, cutoff int64, next map[sniffKey]bool, fails *junkReadFailures) bool {
 	for _, a := range as {
 		if a.BlobHash == nil || a.LastFetchedAt == nil || *a.LastFetchedAt > cutoff {
