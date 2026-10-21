@@ -452,7 +452,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
             {{range .Suites}}
               <tr{{if or .LagWarn .AdoptionFailing .RefusedLong}} data-state="warn"{{end}}>
                 <td data-label="Host" class="host">{{if .Scheme}}{{.Scheme}}://{{end}}{{.Host}}</td>
-                <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
+                <td data-label="Suite path" class="mono">{{.SuitePath}}{{if .Flat}} <span class="b b--neutral">flat</span>{{end}}</td>
                 <td data-label="Last check" class="time">{{unixTimePtr .LastCheckUnixTime}}</td>
                 <td data-label="Last success" class="time">{{unixTimePtr .LastSuccessUnixTime}}</td>
                 <td data-label="Snapshot" class="num mono">{{i64Ptr .CurrentSnapshotID}}</td>

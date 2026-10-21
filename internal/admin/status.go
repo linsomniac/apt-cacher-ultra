@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
@@ -242,9 +243,14 @@ type suiteEntry struct {
 	// Scheme is the suite's canonical scheme, http or https: a suite of
 	// either scheme may share host and path, and POST /forget takes it
 	// (ruling PF-7; additive to the locked JSON contract).
-	Scheme                           string `json:"scheme"`
-	Host                             string `json:"host"`
-	SuitePath                        string `json:"suite_path"`
+	Scheme    string `json:"scheme"`
+	Host      string `json:"host"`
+	SuitePath string `json:"suite_path"`
+	// Flat marks a flat repository's suite (aptpath.IsFlatSuitePath: spec
+	// C2's flat grammar, a ./ twin included; spec C7, C11): additive to
+	// the locked JSON contract, like scheme. The HTML shows it as a tag
+	// beside the suite path.
+	Flat                             bool   `json:"flat"`
 	LastCheckUnixTime                *int64 `json:"last_check_unixtime"`
 	LastSuccessUnixTime              *int64 `json:"last_success_unixtime"`
 	CurrentSnapshotID                *int64 `json:"current_snapshot_id"`
@@ -594,6 +600,7 @@ func buildSuiteEntries(rows []cache.SuiteWithAdoption, now int64) []suiteEntry {
 			Scheme:                           r.CanonicalScheme,
 			Host:                             r.CanonicalHost,
 			SuitePath:                        r.SuitePath,
+			Flat:                             aptpath.IsFlatSuitePath(r.SuitePath),
 			LastCheckUnixTime:                r.LastCheckAt,
 			LastSuccessUnixTime:              r.LastSuccessAt,
 			CurrentSnapshotID:                r.CurrentSnapshotID,

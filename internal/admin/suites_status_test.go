@@ -127,8 +127,13 @@ func TestRecentAdoptionsRow_RefusedIsWarnNotFailure(t *testing.T) {
 }
 
 // htmlRowStart returns the substring starting at the <tr preceding the
-// given offset, up to the next >, for row-scoped assertions.
+// given offset, up to the next >, for row-scoped assertions; "" for an
+// offset outside html (deferred minor B-62: a strings.Index miss, -1,
+// fails the caller's assertion instead of panicking).
 func htmlRowStart(html string, offset int) string {
+	if offset < 0 || offset > len(html) {
+		return ""
+	}
 	trStart := strings.LastIndex(html[:offset], "<tr")
 	if trStart < 0 {
 		return ""
@@ -240,6 +245,9 @@ func suiteRows(now int64) []cache.SuiteWithAdoption {
 			InReleaseChangeSeenAt: p64(now - 25*3600)}},
 		{SuiteFreshness: cache.SuiteFreshness{CanonicalHost: "lag.example", SuitePath: "/d",
 			InReleaseChangeSeenAt: p64(now - 2*86400)}},
+		// Deferred minor B-59: a lag under an hour shows, but never warns.
+		{SuiteFreshness: cache.SuiteFreshness{CanonicalHost: "young.example", SuitePath: "/e",
+			InReleaseChangeSeenAt: p64(now - 30*60)}},
 	}
 }
 
@@ -316,8 +324,10 @@ func TestSuitesTable_RendersRecordsAndCounts(t *testing.T) {
 		`<span class="count-warn">1 REFUSED 24H+</span>`,
 		// ADOPTIONS vital sub-line: the refusal is counted apart from failures.
 		`<b class="accent-crit">1 FAILED</b> &middot; <b class="accent-warn">1 REFUSED</b>`,
+		`<span class="lagging">(lagging 30m)</span>`,
 	)
-	for host, warn := range map[string]bool{"fail.example": true, "refused.example": false, "stuck.example": true, "lag.example": true} {
+	for host, warn := range map[string]bool{"fail.example": true, "refused.example": false, "stuck.example": true, "lag.example": true,
+		"young.example": false} {
 		if got := strings.Contains(suiteRow(t, html, host), `data-state="warn"`); got != warn {
 			t.Errorf("%s row warn = %v, want %v", host, got, warn)
 		}
@@ -399,6 +409,50 @@ func TestLaggingAnnotation_FromFirstSighting(t *testing.T) {
 		got, lag := laggingAnnotation(tc.seen, now)
 		if got != tc.want || lag != tc.lag {
 			t.Errorf("laggingAnnotation(%v) = %q, %d; want %q, %d", tc.seen, got, lag, tc.want, tc.lag)
+		}
+	}
+}
+
+// Spec C7, C11 (the B carry-forward): suites[].flat is
+// aptpath.IsFlatSuitePath of the row's suite path — a flat suite and its
+// ./ twin are flat; a dists/ suite and a path no grammar produces are not.
+func TestBuildSuiteEntries_Flat(t *testing.T) {
+	const now = int64(1_800_000_000)
+	want := map[string]bool{"/core:/stable:/v1.34/deb": true, "/repo/.": true, "/ubuntu/dists/noble": false,
+		"/legacy//dists/x": false, "/repo/./.": false}
+	var rows []cache.SuiteWithAdoption
+	for p := range want {
+		rows = append(rows, cache.SuiteWithAdoption{SuiteFreshness: cache.SuiteFreshness{CanonicalScheme: "http",
+			CanonicalHost: "h", SuitePath: p}})
+	}
+	for _, e := range buildSuiteEntries(rows, now) {
+		if e.Flat != want[e.SuitePath] {
+			t.Errorf("%s: flat = %v, want %v", e.SuitePath, e.Flat, want[e.SuitePath])
+		}
+	}
+}
+
+// The status page tags a flat suite's path "flat" in the Suites table;
+// a dists/ suite's cell is the path alone.
+func TestSuitesTable_ShowsTheFlatTag(t *testing.T) {
+	const now = int64(1_800_000_000)
+	m := newHealthyModel()
+	m.Suites = buildSuiteEntries([]cache.SuiteWithAdoption{
+		{SuiteFreshness: cache.SuiteFreshness{CanonicalScheme: "https", CanonicalHost: "pkgs.k8s.io", SuitePath: "/core:/stable:/v1.34/deb"}},
+		{SuiteFreshness: cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "archive.ubuntu.com", SuitePath: "/ubuntu/dists/noble"}},
+	}, now)
+	html := renderHTMLForGolden(t, m)
+	mustContain(t, html,
+		`<td data-label="Suite path" class="mono">/core:/stable:/v1.34/deb <span class="b b--neutral">flat</span></td>`,
+		`<td data-label="Suite path" class="mono">/ubuntu/dists/noble</td>`,
+	)
+}
+
+// Deferred minor B-62: an offset strings.Index did not find is no row.
+func TestHTMLRowStart_AMissIsNoRow(t *testing.T) {
+	for _, off := range []int{-1, 100} {
+		if got := htmlRowStart("<tr a><td>x</td></tr>", off); got != "" {
+			t.Errorf("htmlRowStart(…, %d) = %q, want \"\"", off, got)
 		}
 	}
 }

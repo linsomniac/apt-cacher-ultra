@@ -167,6 +167,7 @@ func populatedJSONContractFixture() statusModel {
 	snapID := int64(42)
 	snapAdopted := int64(1_700_003_500)
 	releaseSeen := int64(1_700_005_500)
+	failReason, flatSnapID := "untrusted_signer", int64(43)
 	caExpiry := int64(1_900_000_000)
 	certIssued := int64(1_700_006_000)
 
@@ -233,6 +234,24 @@ func populatedJSONContractFixture() statusModel {
 				CurrentSnapshotAdoptedAtUnixTime: &snapAdopted,
 				InReleaseChangeSeenAtUnixTime:    &releaseSeen,
 				Lagging:                          "(lagging 30m)",
+				// Deferred minor B-59: the record's fields pinned with
+				// values, not only zeros.
+				AnchorForm:                "inline",
+				LastRequestedUnixTime:     &suiteCheck,
+				CheckFailCount:            2,
+				AdoptionFailReason:        &failReason,
+				AdoptionFailCount:         3,
+				AdoptionFailFirstUnixTime: &suiteSuccess,
+				AdoptionNextRetryUnixTime: &releaseSeen,
+			},
+			// Spec C7/C11: suites[].flat (phase G), a flat suite's row.
+			{
+				Scheme:            "https",
+				Host:              "pkgs.k8s.io",
+				SuitePath:         "/core:/stable:/v1.34/deb",
+				Flat:              true,
+				CurrentSnapshotID: &flatSnapID,
+				AnchorForm:        "inline",
 			},
 		},
 		GC: &gcInfo{
