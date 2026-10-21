@@ -251,6 +251,43 @@ func TestAdopter_FlatPackagesFailureFatal(t *testing.T) {
 	}
 }
 
+// Spec C5 and plan design note 3: a flat suite's root Sources groups under
+// the pseudo-arch "source". With "source" allowlisted, a 404 on the flat
+// Sources.gz is skipped and then refused by the serve-contract guard, and
+// the guard's ERROR line and acu_adoption_serve_target_missing_total name
+// the architecture "source", not the "all" fallback.
+func TestAdopter_FlatSourcesGuardMissNamesSource(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newReconcileAdopter(t, env, []string{"amd64", "source"}) // tolerant
+	var logs lockedBuffer
+	ad.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	suite := SuiteRef{CanonicalScheme: "https", CanonicalHost: "pkgs.k8s.io", SuitePath: testFlatSuite}
+	trackSuite(t, env.cache, suite)
+	pkgs := fakePackagesStanzas(map[string]string{"amd64/kubelet_1.deb": strings.Repeat("a", 64)})
+	srcs := []byte("Package: kubelet\nDirectory: src\n")
+	releaseText, _ := makeRelease(map[string][]byte{"Packages.gz": gzipBytes(pkgs), "Sources.gz": gzipBytes(srcs)})
+	base := "https://pkgs.k8s.io" + testFlatSuite + "/"
+	env.fetcher.put(base+"Packages.gz", gzipBytes(pkgs))
+	env.fetcher.fail404(base + "Sources.gz")
+	missing := func() float64 {
+		return renderedFloat(t, renderedMetricLabels("acu_adoption_serve_target_missing_total", `arch="source"`))
+	}
+	before := missing()
+	err := ad.Run(ctx, suite, releaseText, "", "")
+	var me *AdoptionMemberError
+	if !errors.Is(err, ErrAdoptionGuardFailed) || !errors.As(err, &me) || me.Path != "Sources" {
+		t.Fatalf("Run = %v; want the serve-contract guard refusing the flat Sources group", err)
+	}
+	recs := logRecords(t, &logs, "adoption_blocked_serve_target_missing")
+	if len(recs) != 1 || recs[0]["group"] != "Sources" || recs[0]["architecture"] != "source" {
+		t.Fatalf("adoption_blocked_serve_target_missing = %v, want one line, group Sources, architecture source", recs)
+	}
+	if d := missing() - before; d != 1 {
+		t.Errorf(`acu_adoption_serve_target_missing_total{arch="source"} moved by %v, want 1`, d)
+	}
+}
+
 // skipReason returns the reason of the adoption_member_skipped line for
 // path in the JSON log text, "" without one.
 func skipReason(text, path string) string {

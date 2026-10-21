@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -55,7 +56,8 @@ func TestMissingRequestableMembers_Flat(t *testing.T) {
 // Spec C5 (layout-aware IndexTargets) on the reconcile side: a flat
 // snapshot that lost its root Packages members is pending a reconcile —
 // its "all" group is required with no allowlist — and the heal fetches
-// both variants back into the same snapshot.
+// both variants back into the same snapshot, each counted under the
+// "all" architecture of acu_adoption_reconciled_total (the flat label).
 func TestReconcileSnapshot_HealsAFlatSuitesPackages(t *testing.T) {
 	ctx := context.Background()
 	env := newAdoptionTestEnv(t)
@@ -78,8 +80,12 @@ func TestReconcileSnapshot_HealsAFlatSuitesPackages(t *testing.T) {
 	if _, pending, err := ad.reconcilePending(ctx, suite, snapID); err != nil || !pending {
 		t.Fatalf("reconcilePending = %v, %v; want the flat suite's missing Packages pending", pending, err)
 	}
+	before := reconciledAll(t)
 	if n, err := ad.ReconcileSnapshot(ctx, suite, snapID, false); err != nil || n != 2 {
 		t.Fatalf("ReconcileSnapshot = %d, %v; want both Packages variants healed", n, err)
+	}
+	if d := reconciledAll(t) - before; d != 2 {
+		t.Errorf(`acu_adoption_reconciled_total{architecture="all"} moved by %v, want 2 (one per healed flat variant)`, d)
 	}
 	paths := snapshotPaths(t, env.cache, snapID)
 	for _, m := range []string{"Packages", "Packages.gz"} {
@@ -87,6 +93,29 @@ func TestReconcileSnapshot_HealsAFlatSuitesPackages(t *testing.T) {
 			t.Errorf("healed %s = %q, want %q", m, paths[m], hashes[m])
 		}
 	}
+}
+
+// reconciledAll returns acu_adoption_reconciled_total{architecture="all"}
+// as metrics.Default renders it (0 before its first heal). The registry is
+// process-wide and no freshness test runs in parallel, so callers compare
+// before and after.
+func reconciledAll(t *testing.T) float64 {
+	t.Helper()
+	return renderedFloat(t, renderedMetricLabels("acu_adoption_reconciled_total", `architecture="all"`))
+}
+
+// renderedFloat parses a value renderedMetric or renderedMetricLabels
+// returned; "" (no series yet) is 0.
+func renderedFloat(t *testing.T, v string) float64 {
+	t.Helper()
+	if v == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil {
+		t.Fatalf("parse metric value %q: %v", v, err)
+	}
+	return f
 }
 
 // newReconcileAdopter constructs an Adopter over env.cache with the given
@@ -291,8 +320,10 @@ func TestReconcileSnapshot_RejectsCorruptedAnchor(t *testing.T) {
 		t.Fatalf("corrupt anchor: %v", err)
 	}
 
-	// Deferred minor D-27: refused by the hash check, not by anything else.
-	if _, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, false); err == nil || !strings.Contains(err.Error(), "hash mismatch") {
+	// Deferred minor D-27: refused by the hash check, not by anything else
+	// (the anchor check's own text: "hash mismatch" alone also matches
+	// adoption.go's "hash mismatch sanity").
+	if _, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, false); err == nil || !strings.Contains(err.Error(), "anchor blob hash mismatch") {
 		t.Errorf("ReconcileSnapshot = %v; want the corrupted (hash-mismatched) anchor blob refused by its hash check", err)
 	}
 }
