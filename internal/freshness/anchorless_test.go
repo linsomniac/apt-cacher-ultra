@@ -282,29 +282,47 @@ func TestCheck_AnchorlessAnswersByStatus(t *testing.T) {
 // answers 404 or 410 are deleted — the probe tree's own answers, no other
 // request — a junk InRelease and an unsigned Release among them
 // (deviation 1: neither is signed evidence); a junk Release.gpg, never
-// probed when Release is absent, stays, and so does a Release answered
-// 401. (A sniff-passing Release.gpg is signed evidence: the gate keeps
-// the suite out, TestCheck_AnchorlessGateKeepsSignedSuitesOut.)
+// probed when Release is absent, stays. Ruling PG-28: a Release answered
+// 401 or 403 is deleted too, but only when the same check got a content
+// answer for an index request (a 304, a 200 stored): upstream demonstrably
+// serves the suite, so the 401/403 is S3's or CloudFront's "no such key".
+// With no index answer — the index failing (a 503) or no index row — the
+// Release stays: upstream may be blocking the cache outright. (A
+// sniff-passing Release.gpg is signed evidence: the gate keeps the suite
+// out, TestCheck_AnchorlessGateKeepsSignedSuitesOut.)
 func TestCheck_AnchorlessDeletesTheAnchorsUpstreamDropped(t *testing.T) {
-	rel, _ := makeRelease(map[string][]byte{"Packages.gz": gzBody("v1")})
+	pk := gzBody("v1")
+	rel, _ := makeRelease(map[string][]byte{"Packages.gz": pk})
 	for _, tc := range []struct {
 		name       string
 		releaseErr error
-		release    bool
+		index      string // Packages.gz: "304", "200" (changed bytes), "503", "" (no row cached)
+		release    bool   // the Release row kept
 		result     string
 	}{
-		{"Release answered 404", nil, false, "anchorless_refreshed"},
-		{"Release answered 401", &fetch.StatusError{Code: 401}, true, "anchorless_refreshed"},
+		{"Release answered 404", nil, "304", false, "anchorless_refreshed"},
+		{"Release answered 401 beside a 304", &fetch.StatusError{Code: 401}, "304", false, "anchorless_refreshed"},
+		{"Release answered 403 beside a changed Packages.gz", &fetch.StatusError{Code: 403}, "200", false, "anchorless_refreshed"},
+		{"Release answered 401, no index answered", &fetch.StatusError{Code: 401}, "503", true, "failed"},
+		{"Release answered 403, no index row", &fetch.StatusError{Code: 403}, "", true, "anchorless_refreshed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newFlatRig(t, "/fury")
 			fetched := wallclock.Unix() - 3600
-			pk := gzBody("v1")
-			r.cacheRow("Packages.gz", pk, 1, fetched, rigETag(pk))
+			if tc.index != "" {
+				r.cacheRow("Packages.gz", pk, 1, fetched, rigETag(pk))
+			}
 			r.cacheRow("InRelease", []byte("<html>junk</html>"), 0, fetched, "")
 			r.cacheRow("Release", rel, 1, fetched, "")
 			r.cacheRow("Release.gpg", []byte("<html>junk</html>"), 0, fetched, "")
-			r.up.setAt(r.url("Packages.gz"), pk)
+			switch tc.index {
+			case "304":
+				r.up.setAt(r.url("Packages.gz"), pk)
+			case "200":
+				r.up.setAt(r.url("Packages.gz"), gzBody("v2"))
+			case "503":
+				r.up.setFail(r.url("Packages.gz"), &fetch.StatusError{Code: 503})
+			}
 			r.up.setFail(r.url("InRelease"), &fetch.StatusError{Code: 410})
 			if tc.releaseErr != nil {
 				r.up.setFail(r.url("Release"), tc.releaseErr)
@@ -314,7 +332,7 @@ func TestCheck_AnchorlessDeletesTheAnchorsUpstreamDropped(t *testing.T) {
 				t.Fatalf("result %q, want %q", got, tc.result)
 			}
 			if r.lookup("InRelease") != nil || (r.lookup("Release") != nil) != tc.release ||
-				r.lookup("Release.gpg") == nil || r.lookup("Packages.gz") == nil {
+				r.lookup("Release.gpg") == nil || (r.lookup("Packages.gz") != nil) != (tc.index != "") {
 				t.Fatalf("rows: InRelease %v, Release %v, Release.gpg %v, Packages.gz %v; want InRelease gone, Release kept = %v",
 					r.lookup("InRelease"), r.lookup("Release"), r.lookup("Release.gpg"), r.lookup("Packages.gz"), tc.release)
 			}
@@ -323,6 +341,32 @@ func TestCheck_AnchorlessDeletesTheAnchorsUpstreamDropped(t *testing.T) {
 			}
 		})
 	}
+	// The final review's scenario (spec lens I-1): a never-adopted flat
+	// suite's cached unsigned Release declares Packages.gz v1; upstream, now
+	// S3 or CloudFront, answers 403 for the InRelease and Release it no
+	// longer has and serves Packages.gz v2. Keeping the Release beside the
+	// refreshed Packages.gz would give a [trusted=yes] client a Hash Sum
+	// mismatch that never clears.
+	t.Run("a stale Release upstream answers 403 beside a refreshed Packages.gz", func(t *testing.T) {
+		v2 := gzBody("v2")
+		r := newFlatRig(t, "/fury")
+		fetched := wallclock.Unix() - 3600
+		r.cacheRow("Packages.gz", pk, 1, fetched, rigETag(pk))
+		r.cacheRow("Release", rel, 1, fetched, "")
+		r.up.setAt(r.url("Packages.gz"), v2)
+		r.up.setFail(r.url("InRelease"), &fetch.StatusError{Code: 403})
+		r.up.setFail(r.url("Release"), &fetch.StatusError{Code: 403})
+		r.check()
+		if got := r.lastResult(); got != "anchorless_refreshed" {
+			t.Fatalf("result %q, want anchorless_refreshed", got)
+		}
+		if u := r.lookup("Packages.gz"); u == nil || *u.BlobHash != hashOf(v2) {
+			t.Fatalf("Packages.gz row %+v, want v2", u)
+		}
+		if u := r.lookup("Release"); u != nil {
+			t.Fatalf("Release row %+v kept beside the refreshed Packages.gz, want it deleted (ruling PG-28)", u)
+		}
+	})
 }
 
 // Spec C4 Dispatch 3's gate (plan design note 9, deviation 1): signed

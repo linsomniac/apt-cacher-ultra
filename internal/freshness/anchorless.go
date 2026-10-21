@@ -84,7 +84,8 @@ var errAnchorlessUnknown = errors.New("every anchorless index request ended unkn
 // stripping a signed flat repository's InRelease and Release would
 // otherwise turn it into an unverified one. A cached Release that passes
 // its sniff is no signed evidence (deviation 1): the refresh deletes it
-// once upstream answers it 404. adoption.adopt_unsigned off refuses the
+// once upstream answers it 404 (or 401/403 beside an index's content
+// answer, ruling PG-28). adoption.adopt_unsigned off refuses the
 // refresh after this gate (checkFirst, anchorlessDisabled; ruling PG-1),
 // so a suite with signed evidence keeps its anchor_absent record whatever
 // the knob.
@@ -181,9 +182,11 @@ func anchorlessRank(name string) int {
 // Contents-* (anchorlessRank); then the rows to delete — those answered
 // 404 or 410, a changed plain Contents-*, and the suite's cached InRelease
 // and Release rows (anchors: read before the probe tree ran) whose probe
-// in t answered 404 or 410 — go in one writer transaction, each only while
-// it still holds the blob it was read with (cache.DeleteURLPathRows; an
-// anchor a client's miss stored anew during its probe's window is kept).
+// in t answered 404 or 410, or 401 or 403 beside an index request's
+// content answer (ruling PG-28) — go in one writer transaction, each only
+// while it still holds the blob it was read with (cache.DeleteURLPathRows;
+// an anchor a client's miss stored anew during its probe's window is
+// kept).
 // The check is answered — anchorless_refreshed when a row was replaced or
 // deleted, anchorless_unchanged otherwise — unless index requests were
 // sent and none got a content answer (anchorlessAnswer.answered: a 304, a
@@ -266,7 +269,19 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 		// as read before the probe, so a newer file a client's miss stored
 		// during the probe's window fails the delete's blob compare and is
 		// kept.
-		if row, ok := anchors[p.name]; ok && (p.o.status == 404 || p.o.status == 410) {
+		//
+		// AIDEV-NOTE: ruling PG-28. A 404 or 410 deletes the anchor
+		// whatever the indexes answered; a 401 or 403 only beside an index
+		// request's content answer in this check (answered counts them
+		// before the delete): upstream then demonstrably serves the suite,
+		// so the 401/403 is S3's or CloudFront's "no such key", and a
+		// stale unsigned Release kept beside a refreshed Packages.gz would
+		// give [trusted=yes] clients a Hash Sum mismatch that never
+		// clears. Without one — upstream may be blocking the cache — the
+		// consistent cached pair stays. A failed delete decides nothing
+		// more for these than for the 404s (M4 below).
+		row, ok := anchors[p.name]
+		if ok && (p.o.status == 404 || p.o.status == 410 || (p.o.authDenied() && answered > 0)) {
 			deletes = append(deletes, row)
 		}
 	}
