@@ -1339,14 +1339,16 @@ func distinctDeclared(rows []cache.DeclaredHash) []string {
 
 // declaredAttrs renders a DeclaredHash slice as a structured
 // log-attribute value for the package_hash_conflict log line. The
-// repeated (declared_sha256, snapshot_id) tuples let an operator trace
-// which specific snapshots disagreed.
+// repeated (declared_sha256, snapshot_id, suite_path) tuples let an
+// operator trace which specific snapshots — and suites: a flat suite and
+// its ./ twin, two channels a fallback ties — disagreed (ruling PG-33).
 func declaredAttrs(rows []cache.DeclaredHash) []map[string]any {
 	out := make([]map[string]any, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, map[string]any{
 			"declared_sha256": r.DeclaredSHA256,
 			"snapshot_id":     r.SnapshotID,
+			"suite_path":      r.SuitePath,
 		})
 	}
 	return out

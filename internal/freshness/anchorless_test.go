@@ -90,6 +90,9 @@ func TestCheck_AnchorlessRefreshRevalidatesTheIndexes(t *testing.T) {
 	if got := r.lastResult(); got != "anchorless_refreshed" {
 		t.Fatalf("result %q, want anchorless_refreshed", got)
 	}
+	if replaced, deleted := r.lastRows(); replaced != 1 || deleted != 2 {
+		t.Errorf("rows_replaced %v, rows_deleted %v; want 1 (Packages.gz) and 2 (Contents-amd64.gz, Contents-i386)", replaced, deleted)
+	}
 	for name, want := range map[string][]string{"Packages.gz": {rigETag(oldPk)}, "Sources.gz": {rigETag(src)},
 		"Contents-amd64.gz": {""}, "Packages": {rigETag(plain)}, "InRelease": {""}, "Release": {""}} {
 		if got := r.up.etagsSent(r.url(name)); !slices.Equal(got, want) {
@@ -366,6 +369,9 @@ func TestCheck_AnchorlessDeletesTheAnchorsUpstreamDropped(t *testing.T) {
 		}
 		if u := r.lookup("Release"); u != nil {
 			t.Fatalf("Release row %+v kept beside the refreshed Packages.gz, want it deleted (ruling PG-28)", u)
+		}
+		if replaced, deleted := r.lastRows(); replaced != 1 || deleted != 1 {
+			t.Fatalf("rows_replaced %v, rows_deleted %v; want 1 and 1", replaced, deleted)
 		}
 	})
 }
@@ -1004,6 +1010,47 @@ func TestCheck_AnchorlessBodiesAreBoundedProcessWide(t *testing.T) {
 	})
 }
 
+// Ruling PG-8's bound covers the pool write (plan design note 12: a slot
+// is released "once its body is in the pool or discarded"; the final
+// review's tests lens M-2): released when the response is read, any number
+// of bodies could wait on a slow pool disk while new requests took the
+// freed slots. Two refreshes held right after their pool writes keep both
+// slots, so the third suite's request is not sent until they go on; then
+// all three checks end.
+func TestCheck_AnchorlessBodySlotCoversThePoolWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newFlatRig(t, "/fury")
+		hosts := []string{flatRigHost, "fh2", "fh3"}
+		r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "")
+		r.up.setAt(r.url("Packages.gz"), gzBody("v2"))
+		for _, host := range hosts[1:] {
+			seedFlatSuiteOn(t, r, host, "/fury", gzBody("v1"), gzBody("v2"))
+		}
+		release := make(chan struct{})
+		r.checker.anchorlessStoredHook = func(string) { <-release } // a slow pool write
+		sent := func() int {
+			n := 0
+			for _, host := range hosts {
+				n += len(r.up.etagsSent("http://" + host + "/fury/Packages.gz"))
+			}
+			return n
+		}
+		var wg sync.WaitGroup
+		for _, host := range hosts {
+			wg.Go(func() { r.checker.Check(context.Background(), "http", host, "/fury") })
+		}
+		synctest.Wait()
+		if got := sent(); got != 2 {
+			t.Fatalf("%d anchorless requests sent while two bodies wait in the pool write, want 2", got)
+		}
+		close(release)
+		wg.Wait()
+		if got := strings.Count(r.logs.String(), `"result":"anchorless_refreshed"`); got != len(hosts) {
+			t.Fatalf("%d anchorless_refreshed checks, want %d: every check ends", got, len(hosts))
+		}
+	})
+}
+
 // Ruling PG-8's slots survive a panic (Global Constraints: every
 // goroutine recovers panics): a refresh that panics while it holds a slot
 // gives it back as the panic unwinds to the check's recover
@@ -1205,6 +1252,9 @@ func TestCheck_AnchorlessKeepsAnAnchorAClientStoredDuringItsProbe(t *testing.T) 
 	if u := r.lookup("Release"); u == nil || *u.BlobHash != hashOf(newer) {
 		t.Fatalf("Release row %+v, want the client's newer Release kept", u)
 	}
+	if replaced, deleted := r.lastRows(); replaced != 0 || deleted != 0 {
+		t.Fatalf("rows_replaced %v, rows_deleted %v; want 0 and 0: the delete skipped the client's row", replaced, deleted)
+	}
 }
 
 // The Task 10 review's M4: a delete that fails is logged and is no answer —
@@ -1342,5 +1392,35 @@ func TestCheck_AnchorlessRevalidatesTheRowsReadBeforeTheProbe(t *testing.T) {
 	}
 	if got := r.lastResult(); got != "anchorless_unchanged" {
 		t.Fatalf("result %q, want anchorless_unchanged (the compare lost: kept, a content answer)", got)
+	}
+}
+
+// The final review's tests lens M-1: a refresh whose replacement loses its
+// compare to a client's store (RefreshURLPathBlob: the row no longer holds
+// the blob the refresh read) is a content answer that kept the row —
+// upstream answered, and the client's newer bytes stand — so the check is
+// anchorless_unchanged, a success: neither a failed check (the streak
+// backing off although upstream answered) nor anchorless_refreshed for a
+// row nothing replaced. The client's miss lands while the Packages.gz
+// request is out, as an apt update during the check would.
+func TestCheck_AnchorlessRefreshThatLosesItsCompareKeepsTheClientsRow(t *testing.T) {
+	r := newFlatRig(t, "/fury")
+	v1, v2, newer := gzBody("v1"), gzBody("v2"), gzBody("the client's")
+	r.cacheRow("Packages.gz", v1, 1, rigStart-3600, rigETag(v1))
+	r.up.setAt(r.url("Packages.gz"), v2)
+	r.up.before = func(url string) {
+		if url == r.url("Packages.gz") {
+			r.cacheRow("Packages.gz", newer, 2, rigStart, rigETag(newer))
+		}
+	}
+	r.check()
+	if got := r.lastResult(); got != "anchorless_unchanged" {
+		t.Fatalf("result %q, want anchorless_unchanged", got)
+	}
+	if u := r.lookup("Packages.gz"); u == nil || *u.BlobHash != hashOf(newer) || strOf(u.UpstreamETag) != rigETag(newer) {
+		t.Fatalf("Packages.gz row %+v, want the client's row as it stored it", u)
+	}
+	if row := r.row(); row.CheckFailCount != 0 || row.LastSuccessAt == nil {
+		t.Fatalf("suite row %+v, want an answered check", row)
 	}
 }

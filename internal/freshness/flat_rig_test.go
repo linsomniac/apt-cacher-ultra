@@ -162,3 +162,21 @@ func (r *flatRig) lastResult() string {
 	}
 	return res
 }
+
+// lastRows is the rows_replaced and rows_deleted of the rig's last
+// freshness_check line (an anchorless refresh's counts), -1 for a field
+// the line lacks.
+func (r *flatRig) lastRows() (replaced, deleted float64) {
+	r.t.Helper()
+	recs := logRecords(r.t, r.logs, "freshness_check")
+	if len(recs) == 0 {
+		r.t.Fatal("no freshness_check line")
+	}
+	get := func(k string) float64 {
+		if v, ok := recs[len(recs)-1][k].(float64); ok {
+			return v
+		}
+		return -1
+	}
+	return get("rows_replaced"), get("rows_deleted")
+}

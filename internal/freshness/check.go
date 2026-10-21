@@ -218,6 +218,11 @@ type checkEnd struct {
 	reason        string
 	clearRecord   bool
 	signedCurrent bool
+	// anchorlessRows is set by the anchorless refresh: its line carries
+	// rows_replaced and rows_deleted, the url_path rows it replaced and
+	// deleted (the final review's tests lens M-4).
+	anchorlessRows            bool
+	rowsReplaced, rowsDeleted int
 }
 
 // finishCheck is the one tail of every answered check (ruling R-E3): it
@@ -249,6 +254,9 @@ func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache
 	}
 	if e.reason != "" {
 		logAttrs = append(logAttrs, "reason", e.reason)
+	}
+	if e.anchorlessRows {
+		logAttrs = append(logAttrs, "rows_replaced", e.rowsReplaced, "rows_deleted", e.rowsDeleted)
 	}
 	out.report = checkReport{result: e.result, signedCurrent: e.signedCurrent}
 	// Ruling PE-10 (b): the answer the next check is paced by

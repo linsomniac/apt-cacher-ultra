@@ -192,24 +192,25 @@ func anchorlessRank(name string) int {
 // with (cache.DeleteURLPathRows; an anchor a client's miss stored anew
 // during its probe's window is kept). The check is answered —
 // anchorless_refreshed when a row was replaced or deleted,
-// anchorless_unchanged otherwise — unless index requests were sent and
-// none got a content answer (anchorlessAnswer.answered: a 304, a 200
-// stored or matching the cached bytes, a 404 or 410): a failed check (the
-// streak backs off). A suite with no cached index row sends no request and
-// is answered: the anchors' 404s still apply. A delete that fails is
-// logged and is no answer: its 404s and 410s stop counting, and a check
-// they alone answered (no index request, or every content answer a delete)
-// fails. An answered check is a success (last_success_at, the streak
-// reset), clears the suite's failure or refusal record (it described an
-// anchor upstream no longer serves) and its pending change (the anchorless
-// form adopts nothing: a stamp left behind would queue the suite every
-// tick, pendingChange). Its writes (the pool, RefreshURLPathBlob,
-// DeleteURLPathRows) run under the lifecycle ctx, as the check's other
-// writes do: a refresh that passes its deadline still commits what it
-// fetched. A shutdown mid-refresh ends it silently; what it stored stays.
-// Its rows' replaces and deletes compare, as its anchors' do, with the
-// blobs read before the probe tree (design review M-4, PG-24 M3): a row a
-// client's miss stored anew meanwhile is kept.
+// anchorless_unchanged otherwise, its line counting them (rows_replaced,
+// rows_deleted: the rows the delete removed) — unless index requests were
+// sent and none got a content answer (anchorlessAnswer.answered: a 304, a
+// 200 stored or matching the cached bytes, a 404 or 410): a failed check
+// (the streak backs off). A suite with no cached index row sends no
+// request and is answered: the anchors' 404s still apply. A delete that
+// fails is logged and is no answer: its 404s and 410s stop counting, and a
+// check they alone answered (no index request, or every content answer a
+// delete) fails. An answered check is a success (last_success_at, the
+// streak reset), clears the suite's failure or refusal record (it
+// described an anchor upstream no longer serves) and its pending change
+// (the anchorless form adopts nothing: a stamp left behind would queue the
+// suite every tick, pendingChange). Its writes (the pool,
+// RefreshURLPathBlob, DeleteURLPathRows) run under the lifecycle ctx, as
+// the check's other writes do: a refresh that passes its deadline still
+// commits what it fetched. A shutdown mid-refresh ends it silently; what
+// it stored stays. Its rows' replaces and deletes compare, as its anchors'
+// do, with the blobs read before the probe tree (design review M-4, PG-24
+// M3): a row a client's miss stored anew meanwhile is kept.
 //
 // AIDEV-NOTE: no snapshot, no vouching, no strict-mode effect (spec C4):
 // the refresh only revalidates url_path rows a client's miss created, and
@@ -313,7 +314,8 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 	}
 	cur.LastCheckAt, cur.LastSuccessAt, cur.CheckFailCount = &nowUnix, &nowUnix, 0
 	cur.InReleaseChangeSeenAt = nil
-	e := checkEnd{form: "anchorless", result: "anchorless_unchanged", status: t.release.status, clearRecord: true}
+	e := checkEnd{form: "anchorless", result: "anchorless_unchanged", status: t.release.status, clearRecord: true,
+		anchorlessRows: true, rowsReplaced: replaced, rowsDeleted: deleted}
 	if replaced+deleted > 0 {
 		e.result = "anchorless_refreshed"
 	}
@@ -358,7 +360,11 @@ func (c *Checker) noteAnchorlessOverCap(suite SuiteRef, path string) {
 // check waits within its own deadline) and released by the deferred
 // receive once the body is in the pool or discarded, also when this
 // panics. One Checker per process (cmd/apt-cacher-ultra builds one), so
-// the bound is process-wide.
+// the bound is process-wide. The bound depends on the deferred receive
+// covering the pool write (writeBlobBytes): released when the response is
+// read, any number of bodies could wait on a slow pool disk while new
+// requests took the freed slots
+// (TestCheck_AnchorlessBodySlotCoversThePoolWrite).
 func (c *Checker) refreshAnchorlessRow(ctx, fetchCtx context.Context, suite SuiteRef, name string, row cache.URLPath) (anchorlessAnswer, error) {
 	var etag, lastmod string
 	if row.UpstreamETag != nil {
@@ -440,6 +446,9 @@ func (c *Checker) refreshAnchorlessRow(ctx, fetchCtx context.Context, suite Suit
 	stored, err := c.adopter.writeBlobBytes(ctx, res.Body)
 	if err != nil {
 		return anchorlessUnknown, fmt.Errorf("%s: store: %w", name, err)
+	}
+	if c.anchorlessStoredHook != nil {
+		c.anchorlessStoredHook(row.Path)
 	}
 	updated, err := c.adopter.cache.RefreshURLPathBlob(ctx, suite.CanonicalScheme, suite.CanonicalHost, row.Path, old, stored,
 		nonEmpty(res.ETag), nonEmpty(res.LastModified))

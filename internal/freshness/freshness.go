@@ -274,6 +274,12 @@ type Checker struct {
 	// suite row is read.
 	recordHook, recordReadHook func()
 
+	// anchorlessStoredHook, when set (tests only), runs in
+	// refreshAnchorlessRow right after a replacement's body is in the pool,
+	// with its row's path, while the request still holds its body slot
+	// (ruling PG-8: the slot covers the pool write).
+	anchorlessStoredHook func(path string)
+
 	lastClockStepLog atomic.Int64 // monotonic ns since processStart of the last clock_step_detected line
 }
 

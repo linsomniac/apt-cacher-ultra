@@ -131,6 +131,7 @@ func newReconcileAdopter(t *testing.T, env *adoptionTestEnv, arches []string) *A
 		HostLimiter:                    hostsem.New(8),
 		Architectures:                  arches,
 		TolerateOptionalMemberFailures: true,
+		Logger:                         discardLogger(), // silent test loggers (the final review's tests lens M-6)
 	})
 	if err != nil {
 		t.Fatalf("newReconcileAdopter: %v", err)

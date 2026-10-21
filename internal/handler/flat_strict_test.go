@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync/atomic"
 	"testing"
 
@@ -268,8 +269,26 @@ func TestServeHTTP_AFallbackTieIsAConflict(t *testing.T) {
 				t.Fatalf("status %d, Retry-After %q, package_hash_conflict %v; want 502, 60 and one conflict line",
 					rec.Code, rec.Header().Get("Retry-After"), conflicts)
 			}
-			if d, _ := conflicts[0]["declared"].([]any); len(d) != 2 {
+			d, _ := conflicts[0]["declared"].([]any)
+			if len(d) != 2 {
 				t.Fatalf("conflict declared %v, want both suites' rows", conflicts[0]["declared"])
+			}
+			// The final review's tests lens M-5 (ruling PG-33): each row
+			// names its suite, so an operator sees that the two rows are
+			// the twins (or the two channels) without joining snapshot ids.
+			var suites, want []string
+			for _, e := range d {
+				m, _ := e.(map[string]any)
+				s, _ := m["suite_path"].(string)
+				suites = append(suites, s)
+			}
+			for _, s := range tc.snaps {
+				want = append(want, s.suite)
+			}
+			slices.Sort(suites)
+			slices.Sort(want)
+			if !slices.Equal(suites, want) {
+				t.Fatalf("conflict rows name suites %q, want %q", suites, want)
 			}
 			if n := hits.Load(); n != 0 {
 				t.Fatalf("upstream asked %d times, want 0 (the conflict is refused before the fetch)", n)

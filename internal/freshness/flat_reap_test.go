@@ -23,7 +23,11 @@ import (
 // InRelease beside an HTML Packages.gz (everything junk); a signed suite
 // (a marker for its base) whose junk InRelease decides alone though its
 // Packages.gz is good; a Packages.gz whose bytes are plain text (no gzip
-// magic). Kept: the same junk InRelease and good Packages.gz without the
+// magic); junk InRelease and Release rows with no index row at all (a
+// removed Release-less repository on a soft-404 host: the refresh deleted
+// its indexes on their 404s and keeps the HTML anchors upstream still
+// answers 200, so only this reap removes it — the final review's tests
+// lens I-1). Kept: the same junk InRelease and good Packages.gz without the
 // marker — a healthy Release-less repository on a soft-404 host (ruling
 // PG-7: anchors-alone would reap it daily); an HTML index younger than the
 // grace; a good index; one good index beside a junk one; a suite whose
@@ -40,7 +44,7 @@ func TestReaper_ReapsAJunkAnchorlessFlatSuite(t *testing.T) {
 	old, young := reapNow-2*reapDay, reapNow-3600
 	gz := "\x1f\x8b\x08\x00 an index"
 	signed := string(simtest.ClearsignedFixture("Origin: x\nSHA256:\n"))
-	reaped := []string{"/junk", "/absent", "/junk-anchors-signed", "/junk-everything", "/gz-name"}
+	reaped := []string{"/junk", "/absent", "/junk-anchors-signed", "/junk-everything", "/gz-name", "/junk-anchors-only"}
 	kept := []string{"/junk/.", "/junk-anchors", "/young", "/good", "/mixed", "/signed", "/missing", "/r/dists/x", "/plain-name",
 		"/empty"}
 	for _, s := range append(append([]string{}, reaped...), kept...) {
@@ -62,6 +66,8 @@ func TestReaper_ReapsAJunkAnchorlessFlatSuite(t *testing.T) {
 	r.cacheAnchor("/junk-everything", "InRelease", softPage, old)
 	r.cacheAnchor("/junk-everything", "Packages.gz", softPage, old)
 	r.cacheAnchor("/gz-name", "Packages.gz", "Package: a\n", old)
+	r.cacheAnchor("/junk-anchors-only", "InRelease", softPage, old)
+	r.cacheAnchor("/junk-anchors-only", "Release", softPage+"release", old)
 	r.cacheAnchor("/plain-name", "Packages", "Package: a\n", old)
 	r.cacheAnchor("/young", "Packages.gz", softPage, young)
 	r.cacheAnchor("/good", "Packages.gz", gz, old)
