@@ -4,11 +4,11 @@
 
 **Goal:** Give suites a lifecycle (spec C9, limitation #3): an hourly reaper deletes the suites no client asked for in `gc.suite_idle_ttl`, unreachable legacy rows and legacy junk rows, through the one suite-row delete phase D built; retired snapshots leave every history lookup and are deleted by snapshot GC; markers, maps and memos stay bounded; and `POST /forget` lets an operator forget a suite on purpose. An unsigned suite with `adoption.adopt_unsigned = false` keeps the coherent snapshot phase E froze for it (ruling PF-5): this phase retires nothing for the knob.
 
-**Architecture:** `internal/cache` keeps one suite-row delete, `deleteSuiteTx` (phase D's compare-and-delete, which runs the reaper's retirement path `retireSuiteSnapshotsTx` — release the current snapshot's pins once, retire every snapshot of the suite — before its `DELETE`, and after it moves the base's signed-seen markers up to the delete under both schemes: `stampBaseMarkersTx`, design review M-9, widened from the reap to every delete by ruling PF-10), now beside its three callers in `suite_reap.go`: cap eviction, `ReapIdleSuite` (the reaper's final step) and `ForgetSuite` (POST /forget's, which also deletes the base's signed-seen markers and the cached anchors of the base and its `/.` twin, under both schemes, when no suite row of the host is left for the base or the twin: ruling PF-2). Both settle a failed submit by a fresh read (design review M-2). `DeleteSuiteMetadata` deletes a suite's metadata url_path rows in batches of 1,000 per writer transaction, anchors last. Snapshot GC ranks retired rows out of `keep_displaced` and gains sub-job C, which deletes them in chunks of 10,000 rows. In `internal/freshness` a `Reaper`, run by `main` under the checker's lifecycle with its own hourly timer after a one-hour uptime floor, lists candidates — rows the grammar can no longer produce and legacy junk (a suite without a snapshot whose cached anchors, fetched a day ago or earlier, are all junk by their content: rulings R-F3, PF-3), reaped regardless of idleness and first (ruling PF-4), then the idle suites, oldest first — holds each through the checker's `HoldSuite` before any writer operation, with the work under the hold bounded at 5 minutes, deletes, and purges the suite's in-memory state through `release(true)`; each run also sweeps the reconcile memo, and once a day (its daily duty) sweeps the orphan signed-seen markers (a year old, no suite row for the base or its twin; a future stamp reads as now and is reported, never rewritten: ruling PF-1). A forward step of the wall clock with no restart defers reaping and the sweep by the uptime floor (design review M-8). `Gate.Purge` keeps a live entry. The admin listener gains `POST /forget` behind `requireMutationGuard` (a cross-site form or `fetch` cannot trigger it: ruling PF-6), whose answers say what happened (ruling PF-7), and the status page shows each suite's scheme; the gpg once-logger sets reset at 10,000 keys.
+**Architecture:** `internal/cache` keeps one suite-row delete, `deleteSuiteTx` (phase D's compare-and-delete, which runs the reaper's retirement path `retireSuiteSnapshotsTx` — release the current snapshot's pins once, retire every snapshot of the suite — before its `DELETE`, and after it moves the base's signed-seen markers up to the delete under both schemes: `stampBaseMarkersTx`, design review M-9, widened from the reap to every delete by ruling PF-10; before retiring, it turns the suite's own adopted signed snapshot history into its base's marker, `markSnapshotHistoryTx`, ruling PF-12), now beside its three callers in `suite_reap.go`: cap eviction, `ReapIdleSuite` (the reaper's final step) and `ForgetSuite` (POST /forget's, which also deletes the base's signed-seen markers and the cached anchors of the base and its `/.` twin, under both schemes, when no suite row of the host is left for the base or the twin: ruling PF-2). Both settle a failed submit by a fresh read (design review M-2). `DeleteSuiteMetadata` deletes a suite's metadata url_path rows in batches of 1,000 per writer transaction, anchors last. Snapshot GC ranks retired rows out of `keep_displaced` and gains sub-job C, which deletes them in chunks of 10,000 rows, in the periodic ticks only: the startup pass, before the listeners serve, runs none (ruling PF-15). In `internal/freshness` a `Reaper`, run by `main` under the checker's lifecycle with its own hourly timer after a one-hour uptime floor, lists candidates — rows the grammar can no longer produce and legacy junk (a suite without a snapshot whose cached anchors, fetched a day ago or earlier, are all junk by their content: rulings R-F3, PF-3), reaped regardless of idleness and first (ruling PF-4), at most 250 a run, then at most 25 idle suites, oldest first, each class on its own budget (ruling PF-14) — holds each through the checker's `HoldSuite` before any writer operation, with the work under the hold bounded at 5 minutes, deletes, and purges the suite's in-memory state through `release(true)`; each run also sweeps the reconcile memo, and once a day (its daily duty, the first a day after it starts: ruling PF-13) sweeps the orphan signed-seen markers (a year old, no suite row for the base or its twin; a future stamp reads as now and is reported, never rewritten: ruling PF-1). A forward step of the wall clock with no restart defers reaping and the sweep by the uptime floor (design review M-8), and never ages a marker: the sweep's cutoff takes off every step the guard detected (ruling PF-13). `Gate.Purge` keeps a live entry. The admin listener gains `POST /forget` behind `requireMutationGuard` (a cross-site form or `fetch` cannot trigger it: ruling PF-6), whose answers say what happened (ruling PF-7), and the status page shows each suite's scheme; the gpg once-logger sets reset at 10,000 keys.
 
 **Tech Stack:** Go 1.25 (toolchain 1.26), modernc SQLite, `testing/synctest`.
 
-**Spec:** `docs/superpowers/specs/2026-09-27-flat-repositories-design.md` (revision 8; Task 16 records this plan's rulings, design notes and deviations as revision 9) — C9 in full (§9's F row: snapshot retirement, the reaper with its own ticker, batched metadata deletion, snapshot-GC sub-job C, the memory purge, the marker TTL, `POST /forget`). Interactions read: C3 (rows, caps, eviction through `deleteSuiteTx`, markers that survive reaping, touches), C4 and C5 (never-downgrade after a reap, unsigned refusals, the clock-step rule for a gate that retires things), C7 (records, `unsigned_disabled`), C8 (`Gate.Purge`), C11 (`gc.suite_idle_ttl`, events, metrics), §6.1 (audit-retired snapshots), §7 (F's tests), §10 (G-1), §11 (risks). Overview: `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md` — Global Constraints, Deliberate deviations, Review Focus item 6, the "F:" line under "Later phases add" and every item of the "F:" carry-forwards block (from A, B, C, D and E). Deferred minors: `…-A-deferred.md` through `…-E-deferred.md` (IDs cited per task; Task 16's intro lists the ones taken and the ones checked and left, and Task 16 deletes the taken ones). The plan's two reviews (execution: D1–D8 and its mutants; design: I-1–I-7, M-1–M-17) are adjudicated as rulings PF-1–PF-9 (2026-10-20), which this revision applies throughout; the maintainer confirmed PF-5 the same day. The task reviews and their two fix rounds added PF-10 and PF-11 and the fixes this revision records task by task.
+**Spec:** `docs/superpowers/specs/2026-09-27-flat-repositories-design.md` (revision 8; Task 16 records this plan's rulings, design notes and deviations as revision 9) — C9 in full (§9's F row: snapshot retirement, the reaper with its own ticker, batched metadata deletion, snapshot-GC sub-job C, the memory purge, the marker TTL, `POST /forget`). Interactions read: C3 (rows, caps, eviction through `deleteSuiteTx`, markers that survive reaping, touches), C4 and C5 (never-downgrade after a reap, unsigned refusals, the clock-step rule for a gate that retires things), C7 (records, `unsigned_disabled`), C8 (`Gate.Purge`), C11 (`gc.suite_idle_ttl`, events, metrics), §6.1 (audit-retired snapshots), §7 (F's tests), §10 (G-1), §11 (risks). Overview: `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md` — Global Constraints, Deliberate deviations, Review Focus item 6, the "F:" line under "Later phases add" and every item of the "F:" carry-forwards block (from A, B, C, D and E). Deferred minors: `…-A-deferred.md` through `…-E-deferred.md` (IDs cited per task; Task 16's intro lists the ones taken and the ones checked and left, and Task 16 deletes the taken ones). The plan's two reviews (execution: D1–D8 and its mutants; design: I-1–I-7, M-1–M-17) are adjudicated as rulings PF-1–PF-9 (2026-10-20), which this revision applies throughout; the maintainer confirmed PF-5 the same day. The task reviews and their two fix rounds added PF-10 and PF-11, and the final review (three lenses: concurrency, spec, tests) PF-12–PF-15; this revision records their fixes task by task.
 
 ## Global Constraints
 
@@ -17,11 +17,11 @@ Everything in the overview's Global Constraints applies. In particular:
 - No schema change: v7 holds every column and table this phase writes (`suite_snapshot.retired_at`, `suite_freshness.last_requested_at`, `suite_signed_seen`). Never edit an entry of `migrations`.
 - Production SQL never uses SQLite clock functions; persisted stamps come from `wallclock` (the cache's `nowUnix`, the checker's `now`). The reaper's cadence and uptime floor, and all in-memory timing, use monotonic timers; its forward-step guard compares the wall clock with the monotonic one (design note 22).
 - `internal/cache` never imports `internal/freshness` or `internal/proxy`; the reaper holds suites through the cache-side `cache.SuiteGuard` the checker implements. The writer goroutine never runs foreign code or pool I/O: the junk rule's sniffs read pool files on the reaper's goroutine, outside the writer (ruling PD-5).
-- One suite-row delete (ruling R-F1): `deleteSuiteTx` holds the only `DELETE FROM suite_freshness` in production code, and only cap eviction (`createSuiteTx`), `ReapIdleSuite` and `ForgetSuite` call it (`TestSuiteFreshnessHasOneDeleteSite`, `TestSuiteRowWritersHaveKnownCallers`); outside `internal/cache` only the reaper and `POST /forget` call the cache's suite deleters (`TestSuiteDeletersHaveKnownCallers`), and only `ForgetSuite` and the orphan sweep delete signed-seen markers (`TestSignedSeenHasKnownDeleteSites`; design review M-5). Every deleter holds the suite through the `SuiteGuard` before its writer operation and, once the row is gone, purges with `release(true)` — gone as the cache answers it, a failed submit settled by a fresh read (design review M-2).
+- One suite-row delete (ruling R-F1): `deleteSuiteTx` holds the only `DELETE FROM suite_freshness` in production code, and only cap eviction (`createSuiteTx`), `ReapIdleSuite` and `ForgetSuite` call it (`TestSuiteFreshnessHasOneDeleteSite`, `TestSuiteRowWritersHaveKnownCallers`); outside `internal/cache` only the reaper and `POST /forget` call the cache's suite deleters, each from the file that calls it today, only the reaper calls the orphan sweep, and inside `internal/cache` none of them is named (`TestSuiteDeletersHaveKnownCallers`), and only `ForgetSuite` and the orphan sweep delete signed-seen markers (`TestSignedSeenHasKnownDeleteSites`; design review M-5). Every deleter holds the suite through the `SuiteGuard` before its writer operation and, once the row is gone, purges with `release(true)` — gone as the cache answers it, a failed submit settled by a fresh read (design review M-2).
 - An I/O fault is never evidence (overview): the junk rule reaps only on blobs it read and sniffed; a missing or unreadable pool file keeps the suite.
-- Constants (spec C9, C11), not knobs: reaper interval 1 h; uptime floor 1 h; the orphan-marker sweep every 24 h (the reaper's daily duty, design note 20); at most 25 suites per run; metadata batches of 1,000 url_path rows per writer transaction; sub-job C chunks of 10,000 rows per writer transaction; orphan-marker TTL 365 d; gpg once-logger sets reset at 10,000 keys; junk grace 24 h (design note 8); the work under one suite's hold bounded at 5 min (design note 23); a forward step is the wall clock running more than 1 h ahead of the monotonic clock between two runs (design note 22). Knob: `gc.suite_idle_ttl` (default `"720h"`; `0s` disables suite reaping; otherwise at least `24h`).
+- Constants (spec C9, C11), not knobs: reaper interval 1 h; uptime floor 1 h; the orphan-marker sweep every 24 h, the first 24 h after the reaper starts (the reaper's daily duty, design note 20, ruling PF-13); at most 25 idle suites and, in the same run, at most 250 suites reaped regardless of idleness per run (ruling PF-14); metadata batches of 1,000 url_path rows per writer transaction; sub-job C chunks of 10,000 rows per writer transaction; orphan-marker TTL 365 d; gpg once-logger sets reset at 10,000 keys; junk grace 24 h (design note 8); the work under one suite's hold bounded at 5 min (design note 23); a forward step is the wall clock running more than 1 h ahead of the monotonic clock between two runs (design note 22). Knob: `gc.suite_idle_ttl` (default `"720h"`; `0s` disables suite reaping; otherwise at least `24h`).
 - Tests that call `wallclock.SetOffsetForTest` never use `t.Parallel()`. Simulations run inside `testing/synctest` bubbles, finish in under 5 s under `-race` on a quiet machine (4.5 s: phase E ruling PE-8's margin), sample goroutines only after `synctest.Wait()`, and silence loggers with `simtest.DiscardLogger()` (or capture them).
-- Every goroutine started under `internal/freshness` or `internal/gc` recovers panics (`grep -n 'go func' internal/freshness/*.go internal/gc/*.go | grep -v '_test.go:'`): the reaper recovers a panic under a candidate's hold for that candidate alone (logged `freshness_check_panicked`, `where=reaper`, naming the suite), releases the hold with the cache's fresh answer (`settledGone`) and goes on, and its runs recover the rest. The admin `/forget` handler runs on net/http's goroutine, which recovers; `Forget` releases a panicking hold as the cache answers, then re-panics.
+- Every goroutine started under `internal/freshness` or `internal/gc` recovers panics (`grep -n 'go func' internal/freshness/*.go internal/gc/*.go | grep -v '_test.go:'`): the reaper recovers a panic under a candidate's hold for that candidate alone (logged `freshness_check_panicked`, `where=reaper`, naming the suite), releases the hold with the cache's fresh answer (`settledGone`) and goes on, and its runs recover the rest. The admin `/forget` handler runs on net/http's goroutine, which recovers; `Forget` logs a panic under its hold (`freshness_check_panicked`, `where=forget`, naming the suite), releases the hold as the cache answers, then re-panics, and the admin listener logs net/http's own line at ERROR through slog.
 - `go test -race ./...` and `golangci-lint run ./...` are clean; `gofmt -l .` lists only the five known drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`) at the end of every task. Never run `gofmt -w` on those five; edit them by hand.
 - Commit trailer: the implementer's own harness attribution line (phase A ruling); otherwise `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -43,7 +43,7 @@ Controller rulings (binding), as the plan's reviews left them:
 - **R-F4 — PE-12's retirement. Withdrawn by ruling PF-5.** The draft retired an established unsigned suite's snapshots while `adoption.adopt_unsigned = false`, serving it from the ordinary cache (`cache.RetireSuiteSnapshots`, an hourly retirement in the reaper, INFO `unsigned_snapshot_retired`). None of it is built (design note 11). Task 8.
 - **R-F5 — the marker sweep's clock-step rule.** The 365-day orphan-marker sweep reads `last_seen_at` as a gate that retires things: a future stamp reads as now — never as old, so never swept — and is reported through `clock_step_detected`. Ruling PF-1 overrides the ruling's "and heals it": the sweep never rewrites a stamp (design note 12, deviation 3). Markers of a reaped or forgotten suite survive reaping; only an orphan (no suite row for its base or its `/.` twin, under either scheme) a year old is swept, and `/forget` deletes a base's markers only when no other suite of the base is left (the E carry-forward's base and twin rule; design note 13). Tasks 3, 9.
 
-The plan reviews' adjudication, and the task reviews' rulings that changed the plan (binding; 2026-10-20):
+The plan reviews' adjudication, and the task and final reviews' rulings that changed the plan (binding; 2026-10-20):
 
 - **PF-1** (design review I-1; overrides R-F5's "heals"). The marker sweep never rewrites a stamp: a future stamp reads as now, is never swept, and is reported. Lowering a stamp deletes signed history after a corrected backward step. Deviation 3. Task 9.
 - **PF-2** (I-2). When `/forget` deletes the base's markers it also deletes, in the same transaction, the cached `InRelease`, `Release` and `Release.gpg` url_path rows of the base and its `/.` twin under both schemes: otherwise the unsigned commit's re-mark (phase E ruling R-E1) marks the base again and the escape hatch stays shut with no remedy. At most 12 cached anchors are fetched again. Tasks 3, 15.
@@ -54,8 +54,12 @@ The plan reviews' adjudication, and the task reviews' rulings that changed the p
 - **PF-7** (I-7). `/forget`'s 202 body names what was forgotten, the markers deleted and the rows that kept them; its 409 text says what to check; the status page gains each suite's scheme (JSON `scheme`, additive; the HTML Host cell). Tasks 3, 10, 16.
 - **PF-8**. The design review's minors, each where it is cited: M-1 (= D1; Task 11), M-2 (design notes 5, 14, 23; Tasks 3, 6, 10), M-3 and M-4 (design note 19; Tasks 6, 7), M-5 (Global Constraints; Task 3), M-6 (design note 21; Task 15), M-7 (design note 14; documented only), M-8 (design note 22; Tasks 6, 9, 15), M-9 (design note 12; Task 3), M-10 (design note 24; Tasks 6, 9), M-11 and M-13 (Task 16), M-12 (moot: its code went with PF-5), M-14 (design note 8; Task 7), M-15 (design note 7; Tasks 3, 4), M-16 (design note 25; Task 6), M-17 (a G carry-forward; Task 16); a DoD simulation at the production cadence (deviation 2; Task 15); `--color-moved` for Task 2's review.
 - **PF-9** (the execution review). D1–D8 are applied in the tasks they name, and its proposed killer tests are added, except X12's (it tested the withdrawn retirement); X29 (sub-job C's chunk size) is pinned by a constant assertion (`TestRunRetiredSnapshotGCChunk_TheChunkIsTenThousandRows`) instead of a 4.6 s test; X3 and X19 need no test.
-- **PF-10** (task review of Task 3, ruling (b); 2026-10-20). Design review M-9 is widened to every suite-row delete: `deleteSuiteTx`, when its outcome is `suiteDeleted`, moves the base's signed-seen markers up to `MAX(last_seen_at, now)` under both schemes (`stampBaseMarkersTx`), so cap eviction, reap and forget all count an orphan's year from the end of tracking. The UPDATE never creates a marker or lowers one. Design note 12. Tasks 3, 9, 16 (`TestCreateSuite_EvictionMovesTheBaseMarkersUp`, `TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap`).
-- **PF-11** (fix round 2; extends PD-1). A hand edit that adds one field to one log line counts as touching that function, not the whole file, for the deferred-minor rule. Phase F therefore takes E-44, E-2's `handler.go` half and E-63 (comment-only items in `freshness.go` and `handler.go`) in its final fix wave; E-31 and E-45 (behaviour changes in code phase F did not change) wait for phase H's sweep. Task 16's "Every deferred minor" list.
+- **PF-10** (task review of Task 3, ruling (b); 2026-10-20). Design review M-9 is widened to every suite-row delete: `deleteSuiteTx`, when its outcome is `suiteDeleted`, moves the base's signed-seen markers up to `MAX(last_seen_at, now)` under both schemes (`stampBaseMarkersTx`), so cap eviction, reap and forget all count an orphan's year from the end of tracking. The UPDATE never creates a marker or lowers one (the one marker a delete creates is PF-12's history marker). Design note 12. Tasks 3, 9, 16 (`TestCreateSuite_EvictionMovesTheBaseMarkersUp`, `TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap`).
+- **PF-11** (fix round 2; extends PD-1). A hand edit that adds one field to one log line counts as touching that function, not the whole file, for the deferred-minor rule. Phase F therefore takes E-44, E-2's `handler.go` half and E-63 (comment-only items in `freshness.go` and `handler.go`) in its final fix wave (Tasks 6 and 14 carry them); E-31 and E-45 (behaviour changes in code phase F did not change, with design questions of their own) wait for phase H's sweep — if wrong, two can-wait items wait for H's planned sweep. Task 16's "Every deferred minor" list.
+- **PF-12** (the final review's spec C1, its one Critical; 2026-10-20). A suite-row delete turns signed snapshot history into a marker: `deleteSuiteTx`, before it retires the suite's snapshots, upserts the signed-seen marker of `aptpath.MarkerBase(key.SuitePath)` under the key's scheme, `MAX(last_seen_at, now)`, when the suite has a snapshot never-downgrade's snapshot clause counts — adopted, not retired, inline or detached, the same predicate as the clause's read (`signedHistorySnapshotSQL`; `markSnapshotHistoryTx`). The exception to PF-10's "never creates a marker", and only for the deleted suite's own history, which the delete is about to retire (a sibling's — its `/.` twin's, the other scheme's — is not retired and keeps counting on its own). Why: a retired snapshot is no history, so a reap or eviction of a suite whose only signed history was a legacy snapshot the trust audit left queued and unmarked (design review M-8) would admit an unsigned downgrade of the base once the row is gone; the marker is the record that outlives the row, and it fails closed. Cost if wrong: one extra marker on a base that was adopted signed; `/forget` still deletes it when no row is left for the base or its twin. Accepted residual: a marker written from an audit-deferred snapshot stays if a later audit quarantines that snapshot (a quarantine deletes no marker); the base fails closed until a suite of it, tracked again, is forgotten, or, with none tracked, the orphan sweep takes it after its year. Design note 12. Tasks 3, 15, 16.
+- **PF-13** (the final review's concurrency I1; challenges design notes 20 and 22, accepted). A detected forward step never ages a marker: the reaper adds every forward step its guard detects to `stepAhead`, which only grows (saturating at `maxStepAhead`), and the sweep's cutoff is now − `stepAhead` − 365 d; and the first sweep after a start is due one `dailyEvery` after `Run` starts, not at the first run, so a start with the wall clock ahead has a day to be corrected. Why: the uptime floor's hour protects suites, which clients touch, not orphan markers, which no client refreshes, and a swept marker cannot come back. Cost if wrong: markers kept longer after a genuine suspend, and a daemon restarted at least once a day (before its first sweep comes due) never sweeps — orphan markers are tiny rows, the safe side. Residual (documented): a wrong step that outlives a restart, uncorrected for a day, still ages markers by it. Design notes 20, 22, 24. Tasks 6, 9, 16.
+- **PF-14** (the final review's concurrency m2; challenges PF-4's premise, accepted). The classes reaped regardless of idleness (non-canonical, junk) get their own per-run budget of 250, tried first and in addition to the 25 idle suites; a busy candidate counts against its own class (`runBudgets`). Why: the docs' own upgrade case (5,000 and more junk suites) would take some 8 days at 25 a run with no idle reaping meanwhile, and a regardless reap is cheap (no snapshot; a non-canonical row deletes no metadata, a junk one a few anchors). Cost if wrong: a run with a large legacy backlog does up to about 1,100 small writer transactions instead of about 100. Design note 3. Tasks 6, 7, 16.
+- **PF-15** (the final review's concurrency m1). The startup GC pass, which runs before the listeners serve, runs no snapshot-GC sub-job C; the periodic ticks do (`runTick`'s `phase`: `phaseStartup`). Why: retired snapshots never serve, and C's backlog after a burst of reaps could hold every listener closed up to `max_tick_duration`. Cost if wrong: retired rows linger one GC interval longer (two or more when the startup pass's blob pass hit its deadline, since the passes resume in rotation). Design note 15. Tasks 4, 11, 15, 16.
 
 Rulings of earlier phases this plan applies: PD-1 (a file changed only by a mechanical rename does not count as touched for the deferred-minor rule: Task 2's `SuiteExists` → `HasSuiteRow` rename outside `suite_rows.go`, Task 9's `lastUse(row)` → `row.LastUse()` in `handler/suite_rows.go`), PD-5 (no pool I/O on the writer), PD-11 (gates that meet a future past-event stamp report it through the checker's rate-limited `clock_step_detected`; the exception ruled on the Task 16 review's minor 7: the reaper's two reports — the furthest future `last_requested_at` and the furthest future marker — are logged directly through `clockStepUnlimited`, since M-10 already bounds them to once per change, and are still counted in `acu_clock_steps_detected_total`), PE-3 (an `unsigned_disabled` suite's checks are paced), PE-8 (the 4.5 s simulation budget), PE-12 (its knob-off refusal state stands as phase E built it; its F half is reversed by PF-5).
 
@@ -63,7 +67,7 @@ Design notes (choices the spec leaves open — the boring, bounded option, with 
 
 1. **The reaper is its own type in `internal/freshness`** (`Reaper`, `NewReaper`, `ReaperConfig`), started by `main` beside `Checker.Run` under the same lifetime context and wait group, and wired to the admin listener as its `Forgetter`. It holds the checker (for `HoldSuite`, its clock, the clock-step and panic reporters and the adopter's memo) and the concrete `*cache.Cache` (the batched deletes need the real cache; the checker's `Cache` interface and its test fake stay as they are). `Checker.Run` returning at once for `periodic_refresh = 0` does not stop it, and it runs whatever `gc.enabled` says (spec §7: "`gc.enabled = false` still re-adopts" a reaped suite; `docs/configuration.md` says that reaping runs with GC off: design review M-11).
 2. **`gc.suite_idle_ttl = 0s` disables suite reaping** — idle, non-canonical and junk alike: no suite row is deleted by the reaper, and no junk scan runs. The run's other duties (the marker and memo sweeps) still run. The key is validated (`0s` or at least `24h`) whatever `gc.enabled` says.
-3. **Runs:** the first at the uptime floor, then one an interval after the previous run finished (as `gc.Run` does). At most 25 candidates are tried per run — a busy one counts, and is retried next run. The candidates reaped regardless of idleness (non-canonical and junk rows) go first (ruling PF-4: a junk suite fails its clients' updates, and those clients' touches would sort it after every idle suite — days behind an upgrade's idle backlog; the classes reaped regardless are legacy rows, few and finite, so they cannot starve idle reaping), then the oldest `last_requested_at` (no stamp first), then key order.
+3. **Runs:** the first at the uptime floor, then one an interval after the previous run finished (as `gc.Run` does). Each class has its own budget per run (`runBudgets`, ruling PF-14): at most 250 candidates reaped regardless of idleness and at most 25 idle ones are tried — a busy one counts against its own class, and is retried next run. The candidates reaped regardless of idleness (non-canonical and junk rows) go first (ruling PF-4: a junk suite fails its clients' updates, and those clients' touches would sort it after every idle suite — days behind an upgrade's idle backlog). PF-4 took those classes for few; the upgraded table the docs describe (more than 5,000 suites from an upstream that answers a missing `InRelease` with an HTML page) is that class, which one shared budget of 25 would drain in some 200 runs with no idle reaping meanwhile, so it has a budget of its own, and its reaps are cheap (no snapshot; a junk suite has at most three anchor rows, a non-canonical row deletes no metadata). The idle ones follow, the oldest `last_requested_at` (no stamp first), then key order.
 4. **The idle cutoff is strict** (spec C9: `last_requested_at < now − gc.suite_idle_ttl`): `ReapIdleSuite` gets `now − ttl − 1`, since `deleteSuiteTx` keeps a stamp after its cutoff. A NULL or future stamp is never idle (the clock-step rule for a gate that retires things); the furthest future one is reported (design note 24).
 5. **The re-read under the hold** is I-4's re-validation: a row that vanished since the listing (cap eviction) has the lock-map entry `HoldSuite` stored dropped (`release(true)`); a suite asked for, or adopted, since the listing is left whole — its metadata rows are not deleted for a final step that would keep it. After the final step, whether the row is gone is the cache's answer (design note 23).
 6. **`cache.ReapRegardless`** (`math.MaxInt64`) is `deleteSuiteTx`'s cutoff for a delete regardless of idleness — non-canonical and junk rows, `/forget` — and lets every row through, NULL and future stamps included (phase D's helper kept NULL rows forever).
@@ -72,19 +76,19 @@ Design notes (choices the spec leaves open — the boring, bounded option, with 
 9. **The junk rule is content-based** (ruling PF-3, which replaces the draft's record condition). An anchor is evidence when it fails its own sniff — except an `InRelease` that passes the `Release` sniff: a plain-text `Release` cached as `InRelease` is a §6.1-quarantined plain-text suite that phase E adopts unsigned through `Release`, and reaped before it adopts it could never be tracked again (a plain-text `InRelease` creates no row, spec C3). Adoption records are ignored: the draft's condition (no record, or an `anchor_absent` one) kept a suite whose adoption failed for another reason (`unsigned_disabled`, `unsigned_too_large`, a failed adoption's record) serving its HTML anchor forever, since a suite without a snapshot has its url_path metadata served as cached, never revalidated (design review I-3). The pool file must exist and read: a missing file is no evidence here, and the scan's failed reads are one WARN with their count (design note 19).
 10. **Busy and gone** are distinct for the reaper (skip, or drop the entry) but one answer for `/forget`: 409 for busy or unknown, no existence oracle (spec C9), with a text that says what to check (ruling PF-7). A database error is 500, logged.
 11. **No knob-off retirement** (ruling PF-5, which withdraws R-F4 and this note's draft). Retiring an unsigned suite into the ordinary cache would freeze each index file at its first fetch, so every upstream publish would bring Hash Sum mismatches that never clear (design review I-5). With the knob off, the suite keeps phase E's coherent snapshot, refused `unsigned_disabled` (visible on the status page, its checks paced by ruling PE-3), until the knob is turned back on — it then adopts again through the normal path — or the suite is forgotten. `TestServeHTTP_KnobOffKeepsServingTheUnsignedSnapshot` pins that it keeps serving the snapshot coherently (Task 8); `docs/configuration.md` says the cache then does not keep unsigned repositories fresh.
-12. **The sweep never rewrites a stamp** (ruling PF-1, deviation 3). A marker stamped more than 2 s past now reads as now: it is never an orphan candidate (`last_seen_at < cutoff` excludes it), and the furthest is reported through `clock_step_detected` (`stamp=last_seen_at`; design note 24). The sweep cannot tell a stamp written while the clock ran ahead from a clock now behind, and lowering the stamp in the second case deletes signed history once the clock is corrected (`TestSweepOrphanMarkers_BackwardStepThenCorrectionSweepsNothing`, design review I-1), so a future-stamped orphan lingers until the clock passes its stamp. Markers keep the newest stamp (`markSignedSeen`), and every suite-row delete — cap eviction, a reap, a forget — moves its base's markers up to the delete, `MAX(last_seen_at, now)` under both schemes, in `deleteSuiteTx`'s transaction (design review M-9, widened to every delete by ruling PF-10): the orphan's year counts from the end of its suite's tracking, so after a long downtime, or a dormant suite's eviction, its marker is not swept a day after it became an orphan. MAX never lowers a stamp, and the UPDATE never creates a marker.
+12. **The sweep never rewrites a stamp** (ruling PF-1, deviation 3). A marker stamped more than 2 s past now reads as now: it is never an orphan candidate (`last_seen_at < cutoff` excludes it), and the furthest is reported through `clock_step_detected` (`stamp=last_seen_at`; design note 24). The sweep cannot tell a stamp written while the clock ran ahead from a clock now behind, and lowering the stamp in the second case deletes signed history once the clock is corrected (`TestSweepOrphanMarkers_BackwardStepThenCorrectionSweepsNothing`, design review I-1), so a future-stamped orphan lingers until the clock passes its stamp. Markers keep the newest stamp (`markSignedSeen`), and every suite-row delete — cap eviction, a reap, a forget — moves its base's markers up to the delete, `MAX(last_seen_at, now)` under both schemes, in `deleteSuiteTx`'s transaction (design review M-9, widened to every delete by ruling PF-10): the orphan's year counts from the end of its suite's tracking, so after a long downtime, or a dormant suite's eviction, its marker is not swept a day after it became an orphan. MAX never lowers a stamp, and the UPDATE never creates a marker. The one marker a delete creates is ruling PF-12's: before it retires the suite's snapshots, `deleteSuiteTx` upserts the base's marker under the suite's scheme, `MAX(last_seen_at, now)`, when the suite has an adopted, non-retired inline or detached snapshot of its own (`markSnapshotHistoryTx`, reading never-downgrade's own snapshot clause, `signedHistorySnapshotSQL`): a retired snapshot is no history, so retiring a legacy snapshot the trust audit left queued and unmarked would otherwise drop the base's protection with the row. A suite without such a snapshot of its own gets none, whatever its `/.` twin or the other scheme's suite of its path holds (theirs are not retired, and still count in the clause). `/forget` still deletes the marker when no row is left for the base or its twin; a marker written from an audit-deferred snapshot stays if a later audit quarantines that snapshot (a quarantine deletes no marker), so the base fails closed until a suite of it, tracked again, is forgotten, or the orphan sweep takes it after its year (PF-12's accepted residual).
 13. **Cross-scheme marker rules.** Never-downgrade reads a base's markers under either scheme (spec C5, M-7), so a marker is an orphan only when no suite row of its host exists for its base or its `/.` twin under either scheme, and `/forget` deletes the base's markers under both schemes or neither — only when no suite row of the host is left for the base or the twin. Deleting one scheme's marker would leave the other refusing; deleting a marker the other scheme's suite relies on would strip its protection. With the markers, `/forget` deletes the cached anchors of the base and its twin under both schemes (ruling PF-2, at most 12 rows): no suite owns them then, and a signed one left cached would mark the base again at the next unsigned commit (ruling R-E1); with a suite row left, both stay, and the 202 body names the rows that kept them.
 14. **`POST /forget`** takes `host`, `suite` and an optional `scheme` (`http` or `https`, default `https`, as `/reconcile`; anything else is 400); it runs synchronously under the suite's hold — the row read first (I-4), all metadata batches, then `ForgetSuite` — on a context a client disconnect cannot cancel, within the hold's 5 minutes (design note 23), so the work is done when 202 comes back (spec C9's "202 on success" kept for a synchronous call); the admin listener's `Shutdown` cuts a forget in flight short at its next step (DEBUG, 503 "shutting down; retry once the daemon is back": data-safe, as a failed reap is), so a forget never holds the listener's drain (the Task 11 review's minor 3). The 202 body names the suite forgotten, the markers deleted and the rows that kept them; the 409 body says what to check — "not forgotten: busy (try again) or no such suite (the status page's Host cell shows scheme://host: pass its scheme as scheme, default https, and the rest as host; suite as its Suite path column shows it)" (ruling PF-7) — and a `host` holding `://` is 400, its text saying to pass the scheme in `scheme` and the host without it. The guard, `requireMutationGuard` (ruling PF-6): a request must carry `X-ACU-Admin: 1` and a `Sec-Fetch-Site` of `same-origin` or `none` if it has one, else 403 — a cross-site form or `fetch` cannot trigger it (a form cannot set the header; a cross-origin `fetch` that sets it is refused on the `Sec-Fetch-Site` the browser adds, and its preflight gets no CORS grant). It does not stop DNS rebinding against a listener without `htpasswd_file`; Host-header validation of `/forget` and `/reconcile` is spec §10 G-1's. `OPTIONS /forget` answers `Allow: POST, OPTIONS`. Forgetting an active suite bypasses the flip barrier (spec C8): a client in the middle of an update can see one Hash Sum mismatch, a residual the docs state (design review M-7). INFO `suite_forgotten`.
-15. **Sub-job C** works one retired snapshot per writer transaction: up to 10,000 of its `snapshot_member`, `snapshot_skipped_member` and `package_hash` rows, and its header once none is left; it runs after sub-jobs A and B have drained, inside the snapshot pass and its deadline, and needs no grace (every retirer holds the suite's mutex, so no adoption of a retired snapshot runs). `gc_run_complete` and `LastRunSummary` gain `retired_reaped`, with the counter `acu_gc_retired_reaped_total`; the admin status page's GC section is unchanged (H carry-forward).
+15. **Sub-job C** works one retired snapshot per writer transaction: up to 10,000 of its `snapshot_member`, `snapshot_skipped_member` and `package_hash` rows, and its header once none is left; it runs after sub-jobs A and B have drained, inside the snapshot pass and its deadline, and needs no grace (every retirer holds the suite's mutex, so no adoption of a retired snapshot runs). The startup pass, which runs before any listener serves, runs no sub-job C (ruling PF-15: `runTick`'s `phase`, `phaseStartup`, ends the snapshot pass once A ∪ B is drained, as if C were done, so its blob pass still runs): retired snapshots never serve, and C's backlog after a burst of reaps could hold every listener closed up to `max_tick_duration`. The periodic ticks run C — normally the first, a later one when an earlier pass, the startup pass's blob pass say, reached its deadline, since the passes resume in rotation. `gc_run_complete` and `LastRunSummary` gain `retired_reaped`, with the counter `acu_gc_retired_reaped_total`; the admin status page's GC section is unchanged (H carry-forward).
 16. **The adoption stamp's floor is every snapshot of the suite** (deferred minor C-11), retired ones included, in both of `adoptionStampTx`'s branches.
 17. **The gpg once-logger sets** each hold at most 10,000 keys: a new key when the set is full starts it over (the spec's "reset when they exceed 10,000 entries"); a suite may then log its once-line again.
 18. **The reconcile memo** is swept each run against the current snapshot ids the run listed; a snapshot adopted during the run may lose a fresh entry (one extra Release parse).
-19. **Events:** INFO `suite_reaped` (`reason`: `idle`, `non_canonical`, `junk`; `metadata_rows`), INFO `suite_forgotten` (`metadata_rows`, `markers_deleted`, `anchor_rows`), INFO `admin_forget_requested` (as `/reconcile`'s), INFO `signed_seen_markers_swept` (`count`, only when non-zero); `freshness_check_panicked` gains `where=reaper`, and every `freshness_check_panicked` and `adoption_panicked` line `canonical_scheme` (empty when the panic names no suite); `clock_step_detected` gains the stamps `last_seen_at` and `wall_clock` (design note 22). The reaper's failure WARNs carry prose names — seven `suite reaper: …` lines and `admin: forget failed` — as phases D and E's do (H may rename them); a step that fails because the run's context ended (a shutdown) logs at DEBUG, not WARN (design review M-3), and a junk scan's failed pool reads are one WARN with their count, not one each, naming the first failure's scheme, host and path (`suite reaper: junk anchor reads failed`; design review M-4).
-20. **The reaper's daily duty.** Only the orphan-marker sweep (Task 9) runs at the first run after a start and then a day apart (monotonic): it works in years (its 365-day TTL) and costs a writer transaction per batch. The junk scan runs every run (ruling PF-4, design note 8). A run the forward-step guard defers neither reaps nor sweeps, and leaves the sweep due for the next run (a step makes markers look older too). The hourly part of a run is one suite listing, the junk scan, the reaps and the memo sweep.
+19. **Events:** INFO `suite_reaped` (`reason`: `idle`, `non_canonical`, `junk`; `metadata_rows`), INFO `suite_forgotten` (`metadata_rows`, `markers_deleted`, `anchor_rows`; a forget whose final transaction committed but whose writer call failed, the row then read gone, logs `settled=true` with `metadata_rows` and without the two counts it cannot know, before its 500), INFO `admin_forget_requested` (as `/reconcile`'s), INFO `signed_seen_markers_swept` (`count`, only when non-zero); `freshness_check_panicked` gains `where=reaper` and `where=forget` (a panic under `/forget`'s hold, logged before the release and the re-panic), and every `freshness_check_panicked` and `adoption_panicked` line `canonical_scheme` (empty when the panic names no suite); the admin listener's own net/http lines (`http: panic serving …`) are slog records at ERROR (its `ErrorLog`), the proxy listeners' at WARN; WARN `gc_disabled`'s detail says whether suite reaping still runs, and, with `gc.suite_idle_ttl = "0s"`, what still deletes (`gcDisabledDetail`); `clock_step_detected` gains the stamps `last_seen_at` and `wall_clock` (design note 22). The reaper's failure WARNs carry prose names — seven `suite reaper: …` lines and `admin: forget failed` — as phases D and E's do (H may rename them); a step that fails because the run's context ended (a shutdown) logs at DEBUG, not WARN (design review M-3), and a junk scan's failed pool reads are one WARN with their count, not one each, naming the first failure's scheme, host and path (`suite reaper: junk anchor reads failed`; design review M-4).
+20. **The reaper's daily duty.** Only the orphan-marker sweep (Task 9) is daily: it works in years (its 365-day TTL) and costs a writer transaction per batch. Its first run is due one `dailyEvery` after `Run` starts (`Run` sets `dailyAt` to its start), then a day apart (monotonic) — not at the first run after a start (ruling PF-13): a start with the wall clock ahead (an RTC or NTP fault before the start, which the forward-step guard cannot see) would make orphan markers look older, and a swept marker cannot come back, so a wrong boot clock has a day to be corrected. The cost: a daemon restarted at least once a day (before its first sweep comes due) never sweeps (orphan markers are tiny rows; the safe side), and a wrong step that outlives a restart uncorrected for a day still ages markers by it (the documented residual). The junk scan runs every run (ruling PF-4, design note 8). A run the forward-step guard defers neither reaps nor sweeps, and leaves the sweep due for the next run; a step the guard detected no longer ages markers at all (design note 22). The hourly part of a run is one suite listing, the junk scan, the reaps and the memo sweep.
 21. **The DoD simulations' harness.** A boot is the cache opened on a directory, the adopter, the checker (its scheduler not running: the simulated clients adopt through the adopter, as a T1 check would) and the reaper and GC loops under one lifetime; a restart stops and reopens it all over the same directory, and the goroutine count returns to its base after every restart (design review M-6). The 90-day simulation needs deliberate deviation 2 to fit the 5 s `-race` budget (measured: 3.35 s; at production cadence with 12-hourly restarts, 12.5–12.8 s); a four-day simulation at the production cadence runs beside it (0.95 s). The chaos run races reaps, adoptions and clients under a global suite cap of 3 (M-6).
-22. **The forward-step guard** (design review M-8). The monotonic clock does not advance while a machine is suspended or a VM paused, and the wall clock does; the uptime floor covers only a fresh start. Each run compares how far the checker's wall clock and the monotonic clock advanced since the previous run (or `Run`'s start), the wall clock in whole seconds; when the wall clock ran more than 1 h ahead, the run logs `clock_step_detected` (`stamp=wall_clock`) and defers reaping and the marker sweep by the uptime floor, the hour a restart would give clients to touch their suites. A backward step needs no guard: a future interest stamp is never idle. Runs far apart on both clocks are no step.
-23. **The work under one suite's hold is bounded, and "gone" is settled** (design review M-2). The re-read, the metadata batches and the final delete run within 5 minutes (`suiteHoldTimeout`), as `commitTimeout` bounds `CommitAdoption`: a wedged writer gives the suite back instead of holding it until shutdown; a step it cuts short is a failure (WARN). `submitWrite` can fail after its transaction committed, so `ReapIdleSuite` and `ForgetSuite` settle a failed submit by a fresh read of the row (as `afterCreate` settles a creation) and report `gone`; the caller releases with `release(gone)`, so a deleted suite's lock-map entry never leaks and a kept one's is never dropped. A panic under the hold — the reaper's, per candidate, and `/forget`'s — is released with a fresh read of the row (`settledGone`); `/forget` then re-panics to net/http's recovery.
-24. **Clock-step reports once per change** (design review M-10). The reaper reports the furthest future `last_requested_at`, and the sweep the furthest future marker, at the first run (sweep) after a start and whenever that suite (marker) or its stamp changes — not every hour until the clock passes a dead suite's stamp. Bounded so, both reports are logged directly (`clockStepUnlimited`), not through the checker's one-line-a-minute limit, which a check's report in the same minute could have used up, and are still counted in `acu_clock_steps_detected_total` (PD-11's exception; the Task 16 review's minor 7). The sweep judges "in the future" against a clock read for the sweep, not the run's start, since the run's own deletes stamp markers as it goes (ruling PF-10).
+22. **The forward-step guard** (design review M-8). The monotonic clock does not advance while a machine is suspended or a VM paused, and the wall clock does; the uptime floor covers only a fresh start. Each run compares how far the checker's wall clock and the monotonic clock advanced since the previous run (or `Run`'s start), the wall clock in whole seconds; when the wall clock ran more than 1 h ahead, the run logs `clock_step_detected` (`stamp=wall_clock`) and defers reaping and the marker sweep by the uptime floor, the hour a restart would give clients to touch their suites. It also adds the step to `stepAhead`, which the sweep's cutoff takes off — now − `stepAhead` − 365 d — so a detected step never ages a marker (ruling PF-13): the floor's hour protects suites, which clients touch, not orphan markers, which no client refreshes. `stepAhead` only grows, for the life of the process (a step later corrected backwards, or a genuine suspend, then keeps markers longer: the safe side); it saturates at `maxStepAhead` (`math.MaxInt64` ns), and the cutoff subtracts `markerTTL` and `stepAhead` in two `time.Time.Add` calls, never one `Duration` sum, so neither can wrap and sweep every orphan (the final fix wave's residual R3). A backward step needs no guard: a future interest stamp is never idle. Runs far apart on both clocks are no step.
+23. **The work under one suite's hold is bounded, and "gone" is settled** (design review M-2). The re-read, the metadata batches and the final delete run within 5 minutes (`suiteHoldTimeout`), as `commitTimeout` bounds `CommitAdoption`: a wedged writer gives the suite back instead of holding it until shutdown; a step it cuts short is a failure (WARN). `submitWrite` can fail after its transaction committed, so `ReapIdleSuite` and `ForgetSuite` settle a failed submit by a fresh read of the row (as `afterCreate` settles a creation) and report `gone`; the caller releases with `release(gone)`, so a deleted suite's lock-map entry never leaks and a kept one's is never dropped. A panic under the hold — the reaper's, per candidate, and `/forget`'s — is released with a fresh read of the row (`settledGone`); `/forget`, having logged it (`freshness_check_panicked`, `where=forget`), then re-panics to net/http's recovery, and a forget whose `ForgetSuite` failed after its commit (settled gone) logs `suite_forgotten settled=true` before its 500.
+24. **Clock-step reports once per change** (design review M-10). The reaper reports the furthest future `last_requested_at` at the first run after a start, and the sweep the furthest future marker at its first sweep, a day after the start (ruling PF-13), and each whenever that suite (marker) or its stamp changes — not every hour until the clock passes a dead suite's stamp. Bounded so, both reports are logged directly (`clockStepUnlimited`), not through the checker's one-line-a-minute limit, which a check's report in the same minute could have used up, and are still counted in `acu_clock_steps_detected_total` (PD-11's exception; the Task 16 review's minor 7). The sweep judges "in the future" against a clock read for the sweep, not the run's start, since the run's own deletes stamp markers as it goes (ruling PF-10).
 25. **The reaping metric** (design review M-16): `acu_suites_reaped_total{reason}` (`idle`, `non_canonical`, `junk`) counts the reaper's deletes; `/forget` and cap eviction have their own events.
 
 ## Deliberate deviations from the spec
@@ -95,8 +99,8 @@ Design notes (choices the spec leaves open — the boring, bounded option, with 
 
 ## Review Focus (phase F share)
 
-1. **A cache restarted after a long stop, or across a wall-clock step** (days offline; NTP stepping the clock ±30 d; a VM resumed or a laptop woken after a long pause): every suite looks idle. The uptime floor gives clients an hour to touch their suites after a start, and the forward-step guard gives them the same hour after a step without a restart; a suite reaped anyway re-adopts at its next request; a future stamp is never idle, never swept, never rewritten, and is reported once per change — Tasks 6, 9, 15 (`TestReaper_AForwardStepDefersReapingByTheFloor`, `TestReaper_AForwardStepDefersTheMarkerSweep`, `TestDoD_ForwardStepFalseReapsSelfHeal`, the 90-day simulation's clock jump and restarts, `TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts`).
-2. **Upstreams answering 200 HTML for anchors** (soft-404s, captive portals) on legacy rows or for a moment: a legacy junk row is reaped after the 24 h grace even while clients keep touching it, at the next run and ahead of any idle backlog; a transient soft-404 younger than the grace is kept; a plain-text `Release` cached as `InRelease` is never junk, whatever the suite's record — Task 7 (`TestReaper_ReapsLegacyJunkKeepsTransientSoft404`, `TestReaper_JunkIsNotStarvedByAnIdleBacklog`).
+1. **A cache restarted after a long stop, or across a wall-clock step** (days offline; NTP stepping the clock ±30 d; a VM resumed or a laptop woken after a long pause): every suite looks idle. The uptime floor gives clients an hour to touch their suites after a start, and the forward-step guard gives them the same hour after a step without a restart; a suite reaped anyway re-adopts at its next request; a future stamp is never idle, never swept, never rewritten, and is reported once per change; a detected forward step never ages an orphan marker, and a start with the clock ahead has a day before the first sweep, the residuals being a wrong step that outlives a restart uncorrected for a day and a daemon restarted at least once a day, which never sweeps (ruling PF-13) — Tasks 6, 9, 15 (`TestReaper_AForwardStepDefersReapingByTheFloor`, `TestReaper_AForwardStepDefersTheMarkerSweep`, `TestReaper_AForwardStepWhileRunningAgesNoMarker`, `TestReaper_ForwardStepsAddUp`, `TestReaper_AClockAheadAtStartHasADayToBeCorrected`, `TestDoD_ForwardStepFalseReapsSelfHeal`, the 90-day simulation's clock jump and restarts, `TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts`).
+2. **Upstreams answering 200 HTML for anchors** (soft-404s, captive portals) on legacy rows or for a moment: a legacy junk row is reaped after the 24 h grace even while clients keep touching it, at the next run and ahead of any idle backlog, on a budget of its own (ruling PF-14); a transient soft-404 younger than the grace is kept; a plain-text `Release` cached as `InRelease` is never junk, whatever the suite's record — Task 7 (`TestReaper_ReapsLegacyJunkKeepsTransientSoft404`, `TestReaper_JunkIsNotStarvedByAnIdleBacklog`).
 3. **An operator, or a web page, reaching `POST /forget`**: a cross-site form or `fetch` is refused (403), DNS rebinding against a listener without `htpasswd_file` is not (documented; spec §10 G-1); a busy or unknown suite answers 409 without telling which, with a text that says what to check; forgetting a suite whose `/.` twin or other-scheme suite still has a row keeps the base's markers and cached anchors and names the rows that kept them; with none left, a signed anchor cached under the other scheme no longer marks the base again — Task 10 (`TestEndpoint_Forget`, `TestEndpoint_Forget_RefusesCrossOriginRequests`), Task 3 (`TestForgetSuite_DeletesTheBaseMarkersOnlyWithoutAnotherSuite`), Task 15 (the escape-hatch tests).
 4. **Very large suites reaped** (Ubuntu `main`: thousands of metadata rows, tens of thousands of `package_hash` rows): no writer transaction deletes more than 1,000 url_path rows or 10,000 snapshot rows (about 110 ms and 80 ms of writer time, measured), and a cut-short run resumes without repeating a decrement — Tasks 3, 4 (`TestDeleteSuiteMetadata_BatchesOfAThousandAnchorsLast`, `TestRunRetiredSnapshotGCChunk_DeletesRetiredSnapshotsInChunks`, `TestDeleteSuiteMetadata_NeverRepeatsADecrement`).
 5. **A suite reaped while it is in use** (an adoption or check in flight, a client returning mid-run, a re-creation's anchor serve racing the purge, a wedged writer): the reaper skips a held suite, keeps one asked for since the listing, never purges a live flip-gate entry, and gives a hold back after 5 minutes — Tasks 1, 6, 15 (`TestDoD_ReapRacesAdoptionsAndClients`, `TestReaper_BoundsTheWorkUnderAHoldAtFiveMinutes`).
@@ -108,20 +112,20 @@ Design notes (choices the spec leaves open — the boring, bounded option, with 
 |---|---|---|
 | Flip gate | `internal/flipgate/gate.go` (`Purge`, `liveLocked`, `sweepLocked`, C-2/C-3 notes), `gate_test.go`; `internal/freshness/suite_lock_test.go`, `internal/handler/suite_hit_test.go`, `suite_dod_test.go` (tests R-F2 changes) | 1 |
 | One delete path | `internal/cache/suite_rows.go` (split), `suite_evict.go` (new: cap eviction), `suite_reap.go` (new: `deleteSuiteTx`), `cache.go` (`committedHook`), `single_insert_test.go`, `suite_evict_test.go`; the `HasSuiteRow` rename in `internal/freshness/freshness.go`, `freshness_test.go`, `suite_lock_test.go`, `internal/handler/handler.go` and tests | 2 |
-| Reap and forget | `internal/cache/suite_reap.go`, `cache.go` (`committedHook`'s doc), `signed_seen.go` (a note), `suite_rows.go`, `fetched_row.go` (the retry comments), `single_insert_test.go` (the cross-package guards), `suite_evict_test.go`, `suite_reap_test.go` (new) | 3 |
-| Snapshot GC | `internal/cache/gc.go` (sub-job B, `RunRetiredSnapshotGCChunk`), `snapshot_gc_retired_test.go` (new); `internal/gc/snapshot.go`, `gc.go`, `metrics.go`, `retired_test.go` (new) | 4 |
+| Reap and forget | `internal/cache/suite_reap.go`, `cache.go` (`committedHook`'s doc), `signed_seen.go` (a note, `signedHistorySnapshotSQL`), `adoption.go` (the clause reads it), `suite_rows.go`, `fetched_row.go` (the retry comments; D-16 to D-19), `types.go` (`RetiredAt`'s comment), `single_insert_test.go` (the cross-package guards), `suite_evict_test.go`, `fetched_row_test.go`, `suite_reap_test.go` (new), `marker_sweep_test.go` (new: `markerStamp`) | 3 |
+| Snapshot GC | `internal/cache/gc.go` (sub-job B, `RunRetiredSnapshotGCChunk`), `snapshot_gc_retired_test.go` (new); `internal/gc/snapshot.go`, `gc.go` (`phaseStartup`), `metrics.go`, `retired_test.go` (new) | 4 |
 | Adoption stamp and the rule's home | `internal/cache/adoption.go`, `signed_seen.go`, `adoption_stamp_test.go` (new) | 5 |
-| The reaper | `internal/freshness/reaper.go` (new), `reaper_test.go` (new), `reconcile.go` (`sweepReconcileMemo`), `adoption.go` (the memo's note), `metrics.go` (`acu_suites_reaped_total`), `clockstep.go` (`clockStepUnlimited`), `freshness.go` (`logPanic`'s `canonical_scheme`), `panic_recovery_test.go`; `internal/cache/testing_helpers.go` (`SetCommittedHookForTest`), `single_insert_test.go`; `internal/handler/handler.go` (the `where=t1` line's `canonical_scheme`), `panic_recovery_test.go` | 6 |
+| The reaper | `internal/freshness/reaper.go` (new), `reaper_test.go` (new), `reconcile.go` (`sweepReconcileMemo`), `adoption.go` (the memo's note), `metrics.go` (`acu_suites_reaped_total`), `clockstep.go` (`clockStepUnlimited`), `freshness.go` (`logPanic`'s `canonical_scheme` and doc, `panicStackLogged`), `panic_recovery_test.go`; `internal/cache/testing_helpers.go` (`SetCommittedHookForTest`), `single_insert_test.go`; `internal/handler/handler.go` (the `where=t1` line's `canonical_scheme`), `panic_recovery_test.go` | 6 |
 | Junk rows | `internal/cache/suite_reap.go` (`ListUnadoptedSuiteAnchors`), `unadopted_anchors_test.go` (new); `internal/freshness/reaper.go`, `reaper_junk_test.go` (new) | 7 |
 | Unsigned suites with the knob off | `internal/freshness/first_adoption.go` (a note), `docs/configuration.md` (`adopt_unsigned`); `internal/handler/unsigned_knob_off_test.go` (new), `flip_stack_test.go` (`memberStore.get`) | 8 |
-| Marker sweep, daily duty | `internal/cache/marker_sweep.go` (new), `types.go` (`URLPath.LastUse`), `marker_sweep_test.go` (new), `single_insert_test.go`; `internal/freshness/reaper.go`, `unsigned.go`, `reaper_markers_test.go` (new); `internal/handler/suite_rows.go` (mechanical) | 9 |
-| POST /forget | `internal/freshness/forget.go` (new), `forget_test.go` (new); `internal/admin/server.go`, `handlers.go`, `status.go`, `status_template.go`, `json_contract_test.go`, `testdata/json_contract_golden.json`, `forget_test.go` (new) | 10 |
-| Knob and wiring | `internal/config/config.go`, `suite_idle_ttl_test.go` (new); `cmd/apt-cacher-ultra/main.go`, `reaper_wiring_test.go` (new); `packaging/config/config.toml.default`; `internal/admin/server.go`, `handlers.go`, `forget_test.go` (a `/forget` cut short at shutdown) | 11 |
+| Marker sweep, daily duty | `internal/cache/marker_sweep.go` (new), `types.go` (`URLPath.LastUse`), `marker_sweep_test.go` (Task 3's, filled), `single_insert_test.go`; `internal/freshness/reaper.go`, `unsigned.go`, `reaper_markers_test.go` (new); `internal/handler/suite_rows.go` (mechanical) | 9 |
+| POST /forget | `internal/freshness/forget.go` (new), `forget_test.go` (new); `internal/admin/server.go` (with `ErrorLog`), `handlers.go`, `status.go` (B-61), `status_template.go`, `suites_status_test.go`, `json_contract_test.go`, `testdata/json_contract_golden.json`, `forget_test.go` (new) | 10 |
+| Knob and wiring | `internal/config/config.go`, `suite_idle_ttl_test.go` (new); `cmd/apt-cacher-ultra/main.go` (with `gcDisabledDetail`), `reaper_wiring_test.go` (new); `packaging/config/config.toml.default`; `internal/admin/server.go`, `handlers.go`, `forget_test.go` (a `/forget` cut short at shutdown) | 11 |
 | gpg once-loggers | `internal/gpg/oncelog.go` (new), `verifier.go`, `oncelog_test.go` (new); `internal/config/config.go` (two comments) | 12 |
 | Adoption deferred minors | `internal/freshness/adoption.go`, `adoption_minors_test.go` (new) | 13 |
-| Other deferred minors | `internal/freshness/suite_lock.go`, `clockstep.go`, `first_adoption.go`, `unsigned.go`, `suite_lock_test.go`, `scheduler_test.go`, `first_adoption_test.go`; `internal/handler/suite_hit_test.go`, `suite_dod_test.go` | 14 |
-| DoD | `internal/freshness/dod_f_test.go`, `dod_f_rig_test.go`, `dod_f_chaos_test.go` (new), `capacity_test.go` (`seedStaleAnchorErr`) | 15 |
-| Documentation | `docs/configuration.md`, `docs/log-fields.md`, `docs/admin-ui-spec.md`, the spec, the overview, the A, C, D and E deferred files | 16 |
+| Other deferred minors | `internal/freshness/suite_lock.go`, `clockstep.go`, `first_adoption.go`, `unsigned.go`, `freshness.go` (`spawnRepair`'s note), `adoption_failure.go`, `suite_lock_test.go`, `scheduler_test.go`, `first_adoption_test.go`, `adoption_failure_test.go`; `internal/handler/handler.go` (two docs), `suite_rows.go` (the touch line), `suite_hit_test.go`, `suite_dod_test.go` | 14 |
+| DoD | `internal/freshness/dod_f_test.go`, `dod_f_rig_test.go`, `dod_f_chaos_test.go` (new), `capacity_test.go` (`seedStaleAnchorErr`), `sim_sched_test.go` (`sampleGoroutines`) | 15 |
+| Documentation | `docs/configuration.md`, `docs/log-fields.md`, `docs/admin-ui-spec.md`, the spec, the overview, the A, B, C, D and E deferred files | 16 |
 
 No migration, no new package, no new dependency.
 
@@ -166,13 +170,18 @@ In `internal/flipgate/gate_test.go`, replace `TestGate_PurgeKeepsOldTokensHarmle
 // reaper, cap eviction, POST /forget) but never a live one — a serve in
 // flight, a serve that completed within the quiet period (a flip of a
 // re-created suite must still wait it out), or a flip in progress. A live
-// entry expires on its own.
+// entry expires on its own. Purge first meets the serve in flight only
+// after it has outlasted the quiet period (a slow client), so its
+// registration's use stamp no longer keeps the entry and only the
+// in-flight clause does (the final review's tests m-2).
 func TestGate_PurgeSkipsLiveEntries(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := newTestGate(t)
 		old := g.AnchorStart(bg, "k")
+		time.Sleep(testQuiet + time.Second)
 		if g.Purge("k") || g.Len() != 1 {
-			t.Fatalf("purged an entry with a serve in flight (%d left)", g.Len())
+			t.Fatalf("purged an entry whose serve has been in flight %v, past the quiet period (%d left)",
+				testQuiet+time.Second, g.Len())
 		}
 		old.Done()
 		time.Sleep(testQuiet - time.Second)
@@ -383,7 +392,7 @@ func TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry(t *testing.T) {
 - [ ] **Step 2: Run to verify failure**
 
 Run: `go test ./internal/flipgate/ ./internal/freshness/ -run 'TestGate_PurgeSkipsLiveEntries|TestGate_PurgeKeepsTheEntryOfAFlipThatJustEnded|TestGate_PurgeKeepsTheEntryOfAFlipInPhaseA|TestGate_CloseWakesAFlipWaitingOnlyInPhaseA|TestDisabledGate_IsTodaysBehaviour|TestGate_CloseAbortsEveryFlipNotYetCommitting|TestFlip_PhaseAWaitsOutAnotherSuitesHold|TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry'`
-Expected: FAIL — `TestGate_PurgeSkipsLiveEntries` (`gate_test.go: purged an entry with a serve in flight (0 left)`), `TestGate_PurgeKeepsTheEntryOfAFlipThatJustEnded` (`purged the entry of a flip that ended just now`) and `TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry` (`after release(true): 0 gate entries, 0 lock entries; …`). The C-1 and C-4 tests pass: they pin behaviour the code already has; so does `TestGate_PurgeKeepsTheEntryOfAFlipInPhaseA` (the old `Purge` kept an entry whose flip runs, and the new one must still keep it).
+Expected: FAIL — `TestGate_PurgeSkipsLiveEntries` (`gate_test.go: purged an entry whose serve has been in flight 11s, past the quiet period (0 left)`), `TestGate_PurgeKeepsTheEntryOfAFlipThatJustEnded` (`purged the entry of a flip that ended just now`) and `TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry` (`after release(true): 0 gate entries, 0 lock entries; …`). The C-1 and C-4 tests pass: they pin behaviour the code already has; so does `TestGate_PurgeKeepsTheEntryOfAFlipInPhaseA` (the old `Purge` kept an entry whose flip runs, and the new one must still keep it).
 
 - [ ] **Step 3: Implement**
 
@@ -528,8 +537,8 @@ Expected: PASS (the new tests and every existing one; the two handler tests run 
 
 | Mutation | Fails |
 |---|---|
-| `Purge`'s condition back to `e == nil \|\| e.flips > 0` | `TestGate_PurgeSkipsLiveEntries` (`purged an entry with a serve in flight (0 left)`), `TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry` (`after release(true): 0 gate entries, …`) |
-| `liveLocked` without `len(e.inflight) > 0` | `TestGate_PurgeSkipsLiveEntries` (`purged an entry with a serve in flight`), `TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry` |
+| `Purge`'s condition back to `e == nil \|\| e.flips > 0` | `TestGate_PurgeSkipsLiveEntries` (`purged an entry whose serve has been in flight 11s, past the quiet period (0 left)`), `TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry` (`after release(true): 0 gate entries, …`) |
+| `liveLocked` without `len(e.inflight) > 0` (survived the registration's `lastUse` stamp until the final review's tests m-2 let the serve outlast the quiet period first; FG1) | `TestGate_PurgeSkipsLiveEntries` (`gate_test.go:912`: `purged an entry whose serve has been in flight 11s, past the quiet period (0 left)`), `TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry` |
 | `liveLocked` without the `lastUse` clause | `TestGate_PurgeSkipsLiveEntries` (`purged an entry whose serve completed 9s ago, within the quiet period`) |
 | the `lastUse` clause back to `!e.lastDone.IsZero() && now.Sub(e.lastDone) < quiet` | `TestGate_PurgeKeepsTheEntryOfAFlipThatJustEnded` (`purged the entry of a flip that ended just now`) |
 | `now.Sub(e.lastUse) < quiet` → `<= quiet` | `TestGate_PurgeSkipsLiveEntries` (`Purge kept an idle entry (1 left)`), `TestGate_PurgeKeepsTheEntryOfAFlipThatJustEnded`, and the four tests R-F2 moves into bubbles (`TestHoldSuite_TakesOnlyAFreeSuiteAndPurgesOnDelete`, `TestCreateSuite_EvictionUnderTheChecker`, `TestServeHTTP_MintedSuitesAtScale`, `TestServeHTTP_OnboardingAtTheGlobalCapEvictsUnderTheGuard`) |
@@ -926,17 +935,41 @@ git commit -m "One suite-row delete path: split cap eviction, guard the single D
 
 ### Task 3: The cache's reap, forget and retire operations
 
-Spec C9's cache side: the batched metadata deletion (step 1), `ReapIdleSuite` (step 2) and `POST /forget`'s `ForgetSuite` — each one writer transaction (the deletion one per batch), both through `deleteSuiteTx` and the reaper's retirement path it runs (`retireSuiteSnapshotsTx`; ruling R-F1). `ReapRegardless` lets `deleteSuiteTx` delete a row whatever its interest stamp (design note 6). `ForgetSuite` deletes the base's signed-seen markers under both schemes, and the cached `InRelease`, `Release` and `Release.gpg` rows of the base and its `/.` twin under both schemes (ruling PF-2), only when no suite row of the host is left for the base or the twin under either scheme; otherwise it reports the rows that kept them (`KeptBy`, ruling PF-7; design note 13; ruling R-F5). Every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to the delete, `MAX(last_seen_at, now)` under both schemes, in `deleteSuiteTx`'s transaction, so the orphan sweep's year counts from the end of tracking (design review M-9, ruling PF-8, widened from the reap to every delete by ruling PF-10); the UPDATE never creates a marker or lowers one. A key the grammar rejects (`aptpath.IsCanonicalSuitePath`: a non-canonical row, the empty path included) has no metadata to delete: `suiteMetadataPaths` returns nothing for it, unscanned, so a non-canonical row's cached files are left to url_path GC (design note 7; the Task 3 review's Important 1). Both report whether the suite is gone, settling a failed submit — which can follow a committed transaction — by a fresh read of the row, as `afterCreate` does (design review M-2); the reaper releases its hold with that answer. Two guards extend R-F1's across packages (design review M-5): outside `internal/cache` only `internal/freshness/reaper.go` and `forget.go` call the deleters, and only `ForgetSuite`, the orphan sweep (Task 9) and the test-only `ClearSignedSeenForTest` delete markers. There is no `RetireSuiteSnapshots`: ruling PF-5 dropped the knob-off retirement that was its only caller. The DoD's "twin and nested suites untouched" and "batched metadata deletion never repeats the refcount decrement" are pinned here at the cache level.
+Spec C9's cache side: the batched metadata deletion (step 1), `ReapIdleSuite` (step 2) and `POST /forget`'s `ForgetSuite` — each one writer transaction (the deletion one per batch), both through `deleteSuiteTx` and the reaper's retirement path it runs (`retireSuiteSnapshotsTx`; ruling R-F1). `ReapRegardless` lets `deleteSuiteTx` delete a row whatever its interest stamp (design note 6). `ForgetSuite` deletes the base's signed-seen markers under both schemes, and the cached `InRelease`, `Release` and `Release.gpg` rows of the base and its `/.` twin under both schemes (ruling PF-2), only when no suite row of the host is left for the base or the twin under either scheme; otherwise it reports the rows that kept them (`KeptBy`, ruling PF-7; design note 13; ruling R-F5). Every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to the delete, `MAX(last_seen_at, now)` under both schemes, in `deleteSuiteTx`'s transaction, so the orphan sweep's year counts from the end of tracking (design review M-9, ruling PF-8, widened from the reap to every delete by ruling PF-10); the UPDATE never creates a marker or lowers one. The one marker a delete creates is ruling PF-12's (the final review's spec C1): before it retires the suite's snapshots, `deleteSuiteTx` turns never-downgrade's snapshot clause into a marker — when the suite has an adopted, non-retired inline or detached snapshot (`signedHistorySnapshotSQL`, the clause's own predicate), `markSnapshotHistoryTx` upserts its base's marker under the suite's scheme, `MAX(last_seen_at, now)` — since a retired snapshot is no history, and a legacy snapshot the trust audit left queued and unmarked would otherwise leave the base unprotected once the row is gone; `/forget` still deletes that marker when no row is left. A key the grammar rejects (`aptpath.IsCanonicalSuitePath`: a non-canonical row, the empty path included) has no metadata to delete: `suiteMetadataPaths` returns nothing for it, unscanned, so a non-canonical row's cached files are left to url_path GC (design note 7; the Task 3 review's Important 1). Both report whether the suite is gone, settling a failed submit — which can follow a committed transaction — by a fresh read of the row, as `afterCreate` does (design review M-2); the reaper releases its hold with that answer. Two guards extend R-F1's across packages (design review M-5): outside `internal/cache` only `internal/freshness/reaper.go` and `forget.go` call the deleters — each only from the file that calls it today (`ReapIdleSuite` from `reaper.go`, `ForgetSuite` from `forget.go`, `DeleteSuiteMetadata` from both), only `reaper.go` names Task 9's `SweepOrphanMarkers`, and inside `internal/cache` none of the four is named (the final review's tests m-1) — and only `ForgetSuite`, the orphan sweep (Task 9) and the test-only `ClearSignedSeenForTest` delete markers. There is no `RetireSuiteSnapshots`: ruling PF-5 dropped the knob-off retirement that was its only caller. The DoD's "twin and nested suites untouched" and "batched metadata deletion never repeats the refcount decrement" are pinned here at the cache level. This task hand-edits `fetched_row.go`, so the deferred-minor rule takes its D-16 to D-19 (the final review's spec m4): the per-attempt "stores nothing", `Create.Cached` without `Row.Path`, the suite-mismatch refusal and the docs' "a miss". `SuiteSnapshot.RetiredAt`'s comment names every retirement.
 
 **Files:**
-- Modify: `internal/cache/suite_reap.go`, `internal/cache/cache.go` (`committedHook`'s doc), `internal/cache/signed_seen.go` (`markSignedSeen`'s writers note), `internal/cache/suite_rows.go` and `internal/cache/fetched_row.go` (the retry comments), `internal/cache/single_insert_test.go` (the callers list, two guards, the test-only call guard), `internal/cache/suite_evict_test.go` (two comments; the eviction's marker test, ruling PF-10)
-- Create: `internal/cache/suite_reap_test.go`
+- Modify: `internal/cache/suite_reap.go`, `internal/cache/cache.go` (`committedHook`'s doc), `internal/cache/signed_seen.go` (`markSignedSeen`'s writers note, `signedHistorySnapshotSQL`), `internal/cache/adoption.go` (`refuseUnsignedDowngrade` reads `signedHistorySnapshotSQL`), `internal/cache/suite_rows.go` (the retry comment, `CreateResult`'s `heldKept` doc), `internal/cache/fetched_row.go` (the retry comment; D-16 to D-19), `internal/cache/types.go` (`RetiredAt`'s comment), `internal/cache/single_insert_test.go` (the callers list, two guards, the test-only call guard), `internal/cache/suite_evict_test.go` (two comments; the eviction's marker tests, rulings PF-10 and PF-12), `internal/cache/fetched_row_test.go` (D-18)
+- Create: `internal/cache/suite_reap_test.go`, `internal/cache/marker_sweep_test.go` (`markerStamp` only; Task 9 fills it)
 
 **Interfaces:**
 - Consumes: `deleteSuiteTx`, `deleteOutcome`, the test seam `committedHook` (Task 2); `suiteRowGone` (`suite_rows.go`); `decrementSnapshotRefcountsTx` (`adoption.go`); `deleteURLPathRowTx` (`gc_urlpath.go`); `forgetTouch`, `noteTouch` (`suite_touch.go`); `aptpath.SuitePath`, `aptpath.MarkerBase`; cache test helpers `openCache`, `seedBlob`, `blobRefcount` (`cache_test.go`), `stubNow` (`gc_test.go`), `putURLPathRow` (`gc_urlpath_test.go`), `seedRow`, `sk`, `rowExists`, `evictNow`, `evictDay` (`suite_evict_test.go`), `productionGoFiles`, `stringLiterals` (`single_insert_test.go`).
-- Produces: `cache.ReapRegardless int64`; `(*cache.Cache).DeleteSuiteMetadata(ctx context.Context, key SuiteKey) (int, error)`; `(*cache.Cache).ReapIdleSuite(ctx context.Context, key SuiteKey, wantCurrent *int64, cutoff int64) (deleted, gone bool, err error)`; `cache.ForgetResult{Deleted, Gone bool; MarkersDeleted, AnchorRowsDeleted int; KeptBy []SuiteKey}` and `(*cache.Cache).ForgetSuite(ctx context.Context, key SuiteKey, wantCurrent *int64) (ForgetResult, error)`; the unexported `stampBaseMarkersTx` (called by `deleteSuiteTx`), `retireSuiteSnapshotsTx`, `suiteMetadataPaths`, `deleteCachedRowTx`, `deleteURLPathRows`, `baseSuiteRowsTx`, `deleteBaseAnchorsTx`, `reapMetadataBatch` (1000); test helpers `adoptWith(t, c, key, members map[string]string) (int64, map[string]string)`, `urlRowExists(t, c, scheme, host, path) bool`, `isTouched(c, key) bool` (`suite_reap_test.go`), the regexp `deleteSignedSeenRE` (`single_insert_test.go`).
+- Produces: `cache.ReapRegardless int64`; `(*cache.Cache).DeleteSuiteMetadata(ctx context.Context, key SuiteKey) (int, error)`; `(*cache.Cache).ReapIdleSuite(ctx context.Context, key SuiteKey, wantCurrent *int64, cutoff int64) (deleted, gone bool, err error)`; `cache.ForgetResult{Deleted, Gone bool; MarkersDeleted, AnchorRowsDeleted int; KeptBy []SuiteKey}` and `(*cache.Cache).ForgetSuite(ctx context.Context, key SuiteKey, wantCurrent *int64) (ForgetResult, error)`; the unexported `stampBaseMarkersTx` (called by `deleteSuiteTx`), `retireSuiteSnapshotsTx`, `suiteMetadataPaths`, `deleteCachedRowTx`, `deleteURLPathRows`, `baseSuiteRowsTx`, `deleteBaseAnchorsTx`, `reapMetadataBatch` (1000); test helpers `adoptWith(t, c, key, members map[string]string) (int64, map[string]string)`, `urlRowExists(t, c, scheme, host, path) bool`, `isTouched(c, key) bool`, `seedSignedHistory(t, c, key, form AnchorForm, current bool, requested int64) int64`, `hostMarker(t, c, scheme, base string) int64`, `otherScheme(s string) string` (`suite_reap_test.go`), `markerStamp(t, c, m SignedSeenMark) int64` (`marker_sweep_test.go`), the regexp `deleteSignedSeenRE` (`single_insert_test.go`); the unexported `markSnapshotHistoryTx` (called by `deleteSuiteTx`), `signedHistorySnapshotSQL` (`signed_seen.go`), `errFetchedSuiteMismatch` (`fetched_row.go`).
 
 - [ ] **Step 1: Write the failing tests**
+
+Create `internal/cache/marker_sweep_test.go` with `markerStamp` alone, which ruling PF-12's tests read markers through (Task 9 adds the sweep's helpers and tests, and the `fmt` import, to the file):
+
+```go
+package cache
+
+import (
+	"context"
+	"testing"
+)
+
+// markerStamp returns m's marker stamp, or -1 when it has none.
+func markerStamp(t *testing.T, c *Cache, m SignedSeenMark) int64 {
+	t.Helper()
+	at, ok, err := c.SignedSeen(context.Background(), m.CanonicalScheme, m.CanonicalHost, m.Base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		return -1
+	}
+	return at
+}
+```
 
 Create `internal/cache/suite_reap_test.go`:
 
@@ -1506,7 +1539,8 @@ func TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap(t *testing.T) {
 		}
 	}
 	if at, ok, err := c.SignedSeen(ctx, "http", "h", "/flat"); err != nil || ok {
-		t.Errorf("marker http://h/flat after the reaps: present %v at %d (%v); want none: a reap creates no marker", ok, at, err)
+		t.Errorf("marker http://h/flat after the reaps: present %v at %d (%v); want none: a reap creates no marker "+
+			"for a suite without signed snapshot history of its own (ruling PF-12)", ok, at, err)
 	}
 }
 
@@ -1573,6 +1607,262 @@ BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
 		})
 	}
 }
+
+// seedSignedHistory gives key a row (last requested at requested) whose
+// only signed history is one adopted snapshot of form (inline or
+// detached) that the legacy trust audit left queued, and so unmarked,
+// after a pool read fault (design review M-8): its base has no
+// signed-seen marker. current makes it the row's current snapshot;
+// otherwise it is displaced and the row has none (the audit retired the
+// quarantined current one). It returns the snapshot's id.
+func seedSignedHistory(t *testing.T, c *Cache, key SuiteKey, form AnchorForm, current bool, requested int64) int64 {
+	t.Helper()
+	ctx := context.Background()
+	h := seedBlob(t, c, "signed history of "+key.CanonicalScheme+key.SuitePath)
+	var id int64
+	if form == FormDetached {
+		g := seedBlob(t, c, "signature of "+key.CanonicalScheme+key.SuitePath)
+		id = seedFormSnapshot(t, c, key.CanonicalScheme, key.CanonicalHost, key.SuitePath, form, nil, &h, &g, true)
+	} else {
+		id = seedFormSnapshot(t, c, key.CanonicalScheme, key.CanonicalHost, key.SuitePath, form, &h, nil, nil, true)
+	}
+	if err := c.EnqueueLegacyTrustAudit(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.Exec(`UPDATE suite_freshness SET last_requested_at = ?,
+  current_snapshot_id = CASE WHEN ? THEN current_snapshot_id END
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+		requested, current, key.CanonicalScheme, key.CanonicalHost, key.SuitePath); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// hostMarker returns the stamp of host h's marker for base under scheme,
+// or -1 when it has none (markerStamp).
+func hostMarker(t *testing.T, c *Cache, scheme, base string) int64 {
+	t.Helper()
+	return markerStamp(t, c, SignedSeenMark{CanonicalScheme: scheme, CanonicalHost: "h", Base: base})
+}
+
+// otherScheme returns the scheme that is not s.
+func otherScheme(s string) string {
+	if s == "http" {
+		return "https"
+	}
+	return "http"
+}
+
+// Ruling PF-12 (final review spec C1): a suite-row delete turns
+// never-downgrade's snapshot clause into a marker before it retires the
+// suite's snapshots. A suite whose only signed history is an adopted
+// snapshot the legacy trust audit left queued and unmarked (design review
+// M-8) — inline or detached, current or displaced, under either scheme,
+// at a /. twin path too — keeps refusing an unsigned candidate after a
+// reap: its base gains a marker under the key's scheme, stamped at the
+// reap (none under the other scheme), and the refusal names that marker,
+// since the snapshot is retired. A marker already ahead of now is never
+// lowered (ruling PF-1).
+func TestReapIdleSuite_TurnsSignedSnapshotHistoryIntoAMarker(t *testing.T) {
+	ahead := evictNow + evictDay
+	for _, tc := range []struct {
+		name    string
+		key     SuiteKey
+		base    string
+		form    AnchorForm
+		current bool
+		prior   int64 // a marker under the key's scheme before the reap; 0: none
+		want    int64 // its stamp after the reap
+	}{
+		{name: "an inline current snapshot over https", key: SuiteKey{CanonicalScheme: "https", CanonicalHost: "h",
+			SuitePath: "/r/dists/x"}, base: "/r/dists/x", form: FormInline, current: true, want: evictNow},
+		{name: "a detached displaced snapshot over http", key: sk("h", "/r/dists/y"), base: "/r/dists/y", form: FormDetached,
+			want: evictNow},
+		{name: "a twin's history marks its base", key: sk("h", "/flat/."), base: "/flat", form: FormInline, current: true,
+			want: evictNow},
+		{name: "a marker ahead of now is kept", key: sk("h", "/r/dists/z"), base: "/r/dists/z", form: FormInline, current: true,
+			prior: ahead, want: ahead},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			defer stubNow(t, evictNow)()
+			id := seedSignedHistory(t, c, tc.key, tc.form, tc.current, evictNow-40*evictDay)
+			scheme := tc.key.CanonicalScheme
+			if tc.prior != 0 {
+				if err := c.MarkSignedSeenBatch(ctx, []SignedSeenMark{{CanonicalScheme: scheme, CanonicalHost: "h",
+					Base: tc.base, SeenAt: tc.prior}}); err != nil {
+					t.Fatal(err)
+				}
+			} else if hostMarker(t, c, scheme, tc.base) != -1 {
+				t.Fatal("premise: the base has a marker")
+			}
+			if err := c.CheckUnsignedDowngrade(ctx, "h", tc.base); !errors.Is(err, ErrUnsignedDowngradeRefused) {
+				t.Fatalf("premise: before the reap an unsigned candidate is %v, want refused", err)
+			}
+			var want *int64
+			if tc.current {
+				want = &id
+			}
+			if del, gone, err := c.ReapIdleSuite(ctx, tc.key, want, evictNow-30*evictDay); err != nil || !del || !gone {
+				t.Fatalf("reap = %v, %v, %v; want deleted", del, gone, err)
+			}
+			if snap, err := c.GetSuiteSnapshot(ctx, id); err != nil || snap.RetiredAt == nil {
+				t.Fatalf("premise: the reap retired the snapshot (%+v, %v)", snap, err)
+			}
+			if at := hostMarker(t, c, scheme, tc.base); at != tc.want {
+				t.Errorf("marker %s://h%s after the reap: %d (-1: none); want %d", scheme, tc.base, at, tc.want)
+			}
+			if at := hostMarker(t, c, otherScheme(scheme), tc.base); at != -1 {
+				t.Errorf("marker %s://h%s after the reap: present at %d; want none (the key's scheme only)",
+					otherScheme(scheme), tc.base, at)
+			}
+			err := c.CheckUnsignedDowngrade(ctx, "h", tc.base)
+			if !errors.Is(err, ErrUnsignedDowngradeRefused) || !strings.Contains(err.Error(), "signed-seen marker") {
+				t.Fatalf("after the reap an unsigned candidate is %v; want refused by the base's marker", err)
+			}
+		})
+	}
+}
+
+// Ruling PF-12 through POST /forget: ForgetSuite's delete writes the
+// history marker too, and then, as before, deletes the base's markers
+// when no row is left for the base or its twin (the marker counted in
+// MarkersDeleted) and keeps them while one is.
+func TestForgetSuite_DeletesTheHistoryMarkerOnlyWithoutAnotherSuite(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		t.Run(fmt.Sprintf("twin kept %v", keep), func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			defer stubNow(t, evictNow)()
+			key := sk("h", "/r/dists/x")
+			id := seedSignedHistory(t, c, key, FormInline, true, evictNow)
+			if keep {
+				seedRow(t, c, sk("h", "/r/dists/x/."), evictNow)
+			}
+			res, err := c.ForgetSuite(ctx, key, &id)
+			if err != nil || !res.Deleted {
+				t.Fatalf("ForgetSuite = %+v, %v", res, err)
+			}
+			at := hostMarker(t, c, "http", "/r/dists/x")
+			if keep && (at != evictNow || res.MarkersDeleted != 0) {
+				t.Fatalf("a twin row left: marker %d (-1: none), %d deleted; want it kept at %d", at,
+					res.MarkersDeleted, evictNow)
+			}
+			if !keep && (at != -1 || res.MarkersDeleted != 1) {
+				t.Fatalf("no row left: marker %d, %d deleted; want the history marker deleted (1)", at,
+					res.MarkersDeleted)
+			}
+		})
+	}
+}
+
+// Ruling PF-12's bound (the harm FW-q1 names): a delete creates a marker
+// only for signed history the clause counts. A suite with no snapshot, an
+// unsigned current one, a retired (quarantined) inline one or an inline
+// candidate never adopted gets no marker under either scheme, and its
+// base's unsigned return stays admitted.
+func TestDeleteSuite_NoSignedHistoryCreatesNoMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed func(t *testing.T, c *Cache, key SuiteKey) *int64 // returns the current snapshot
+	}{
+		{"no snapshot", func(t *testing.T, c *Cache, key SuiteKey) *int64 {
+			seedRow(t, c, key, evictNow-40*evictDay)
+			return nil
+		}},
+		{"an unsigned current snapshot", func(t *testing.T, c *Cache, key SuiteKey) *int64 {
+			h := seedBlob(t, c, "unsigned Release")
+			id := seedFormSnapshot(t, c, key.CanonicalScheme, key.CanonicalHost, key.SuitePath, FormUnsigned, &h, nil, nil, true)
+			return &id
+		}},
+		{"a retired inline snapshot", func(t *testing.T, c *Cache, key SuiteKey) *int64 {
+			id := seedSignedHistory(t, c, key, FormInline, false, evictNow-40*evictDay)
+			if _, err := c.db.Exec(`UPDATE suite_snapshot SET retired_at = 1 WHERE snapshot_id = ?`, id); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		}},
+		{"an inline candidate never adopted", func(t *testing.T, c *Cache, key SuiteKey) *int64 {
+			id := seedSignedHistory(t, c, key, FormInline, false, evictNow-40*evictDay)
+			if _, err := c.db.Exec(`UPDATE suite_snapshot SET adopted_at = NULL WHERE snapshot_id = ?`, id); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			defer stubNow(t, evictNow)()
+			key := sk("h", "/r/dists/x")
+			current := tc.seed(t, c, key)
+			if _, err := c.db.Exec(`UPDATE suite_freshness SET last_requested_at = ? WHERE suite_path = ?`,
+				evictNow-40*evictDay, key.SuitePath); err != nil {
+				t.Fatal(err)
+			}
+			if del, _, err := c.ReapIdleSuite(ctx, key, current, evictNow-30*evictDay); err != nil || !del {
+				t.Fatalf("reap = %v, %v; want deleted", del, err)
+			}
+			for _, scheme := range []string{"http", "https"} {
+				if at := hostMarker(t, c, scheme, "/r/dists/x"); at != -1 {
+					t.Errorf("marker %s://h/r/dists/x after the reap: present at %d; want none", scheme, at)
+				}
+			}
+			if err := c.CheckUnsignedDowngrade(ctx, "h", "/r/dists/x"); err != nil {
+				t.Fatalf("after the reap an unsigned candidate is %v; want admitted (no signed history)", err)
+			}
+		})
+	}
+}
+
+// Ruling PF-12's scope (the final fix wave's re-review, cache minor 1):
+// the delete's marker reads the deleted key's own snapshots — its scheme,
+// host and suite path, the snapshots the delete retires — and no
+// sibling's. A suite with no signed history of its own, deleted beside a
+// sibling that holds an adopted inline snapshot the legacy trust audit
+// left unmarked — the other scheme's suite of the same path, the suite's
+// /. twin, or, for a twin, its base — gets no marker for the base under
+// either scheme, and the sibling's snapshot is not retired. Admission is
+// not asserted: the sibling's snapshot still refuses an unsigned
+// candidate of the base by itself.
+func TestDeleteSuite_ASiblingsSignedHistoryCreatesNoMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		key, sibling SuiteKey
+		base         string
+	}{
+		{"the other scheme's suite", sk("h", "/r/dists/x"),
+			SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/r/dists/x"}, "/r/dists/x"},
+		{"the /. twin", sk("h", "/flat"), sk("h", "/flat/."), "/flat"},
+		{"a twin's base", sk("h", "/flat/."), sk("h", "/flat"), "/flat"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			defer stubNow(t, evictNow)()
+			seedRow(t, c, tc.key, evictNow-40*evictDay)
+			sibling := seedSignedHistory(t, c, tc.sibling, FormInline, true, evictNow)
+			for _, scheme := range []string{"http", "https"} {
+				if at := hostMarker(t, c, scheme, tc.base); at != -1 {
+					t.Fatalf("premise: marker %s://h%s present at %d", scheme, tc.base, at)
+				}
+			}
+			if del, _, err := c.ReapIdleSuite(ctx, tc.key, nil, evictNow-30*evictDay); err != nil || !del {
+				t.Fatalf("reap = %v, %v; want deleted", del, err)
+			}
+			for _, scheme := range []string{"http", "https"} {
+				if at := hostMarker(t, c, scheme, tc.base); at != -1 {
+					t.Errorf("marker %s://h%s after the reap: present at %d; want none (the signed history is %v's, not %v's)",
+						scheme, tc.base, at, tc.sibling, tc.key)
+				}
+			}
+			if snap, err := c.GetSuiteSnapshot(ctx, sibling); err != nil || snap.RetiredAt != nil {
+				t.Errorf("the sibling's snapshot after the reap = %+v, %v; want it kept, not retired", snap, err)
+			}
+		})
+	}
+}
 ```
 
 In `internal/cache/single_insert_test.go`, `TestSuiteRowWritersHaveKnownCallers`'s `deleteSuiteTx` line becomes:
@@ -1610,16 +1900,27 @@ and the file ends with R-F1's guards across packages (design review M-5):
 // Ruling R-F1 across packages (design review M-5): outside internal/cache
 // only the suite reaper (internal/freshness/reaper.go) and POST /forget
 // (internal/freshness/forget.go) name the cache's suite deleters — each
-// holds the suite through the SuiteGuard first — so a new caller that
-// skips the guard fails here. Any selector naming a deleter counts, not
-// only a call: a method value (f := c.ForgetSuite) or a method expression
-// ((*cache.Cache).DeleteSuiteMetadata) handed elsewhere could be called
-// through a func value (the Task 3 review's minor 5).
+// holds the suite through the SuiteGuard first — and only the reaper
+// names SweepOrphanMarkers, the year-old orphan sweep, whose cutoff
+// decides which never-downgrade records are deleted (final review tests
+// m-1: a "sweep now" hook with a cutoff of now would strip every orphan
+// marker younger than a year). So a new caller fails here. Any selector
+// naming a deleter counts, not only a call: a method value (f :=
+// c.ForgetSuite) or a method expression ((*cache.Cache).DeleteSuiteMetadata)
+// handed elsewhere could be called through a func value (the Task 3
+// review's minor 5). Inside internal/cache none of the four is named at
+// all (callSites), so a new in-package caller — a GC hook that forgets dead
+// suites, say — fails too.
 func TestSuiteDeletersHaveKnownCallers(t *testing.T) {
-	deleters := map[string]bool{"ReapIdleSuite": true, "ForgetSuite": true, "DeleteSuiteMetadata": true}
-	allowed := map[string]bool{"../../internal/freshness/reaper.go": true, "../../internal/freshness/forget.go": true}
+	const reaper, forget = "../../internal/freshness/reaper.go", "../../internal/freshness/forget.go"
+	allowed := map[string]map[string]bool{ // deleter → the files outside internal/cache that may name it
+		"ReapIdleSuite":       {reaper: true},
+		"ForgetSuite":         {forget: true},
+		"DeleteSuiteMetadata": {reaper: true, forget: true},
+		"SweepOrphanMarkers":  {reaper: true},
+	}
 	productionGoFiles(t, func(p string, src []byte) {
-		if strings.HasPrefix(p, "../../internal/cache/") || allowed[p] {
+		if strings.HasPrefix(p, "../../internal/cache/") {
 			return
 		}
 		fset := token.NewFileSet()
@@ -1628,12 +1929,21 @@ func TestSuiteDeletersHaveKnownCallers(t *testing.T) {
 			t.Fatal(err)
 		}
 		ast.Inspect(f, func(n ast.Node) bool {
-			if sel, ok := n.(*ast.SelectorExpr); ok && deleters[sel.Sel.Name] {
-				t.Errorf("%s names %s: only the reaper and POST /forget delete suites", fset.Position(sel.Pos()), sel.Sel.Name)
+			if sel, ok := n.(*ast.SelectorExpr); ok {
+				if files, deleter := allowed[sel.Sel.Name]; deleter && !files[p] {
+					t.Errorf("%s names %s: only the reaper and POST /forget delete suites, and only the reaper sweeps markers",
+						fset.Position(sel.Pos()), sel.Sel.Name)
+				}
 			}
 			return true
 		})
 	})
+	for name := range allowed {
+		if got := callSites(t, name); len(got) != 0 {
+			t.Errorf("%s is named inside internal/cache at %v; want nowhere: its callers are the reaper and POST /forget",
+				name, got)
+		}
+	}
 }
 
 // Design review M-5: the never-downgrade authority (spec C5) is deleted
@@ -1659,21 +1969,29 @@ func TestSignedSeenHasKnownDeleteSites(t *testing.T) {
 
 In `internal/cache/suite_evict_test.go` (`TestDeleteSuiteTx_IsACompareAndDelete`), the two comments that `ReapRegardless` makes inaccurate become `// A stamp in the future never qualifies for an idle cutoff` + `// (ReapRegardless lets every row through: TestReapIdleSuite_*).` and `// The cutoff is inclusive (spec C3: idle >= 24 h), and a row without an` + `// interest stamp never qualifies for an idle cutoff.`
 
-and after `TestCreateSuite_EvictionLeavesTheOtherSchemesTwin` add ruling PF-10's test (design review M-9 widened to every suite-row delete: a cap eviction orphans its base's markers as a reap does):
+and after `TestCreateSuite_EvictionLeavesTheOtherSchemesTwin` add ruling PF-10's test (design review M-9 widened to every suite-row delete: a cap eviction orphans its base's markers as a reap does; its fourth case and the own-scheme case are the final review's FW-q1) and ruling PF-12's eviction case (an evictee's displaced audit-deferred snapshot becomes a marker):
 
 ```go
 // Ruling PF-10 (design review M-9 widened to every suite-row delete): a
 // cap eviction moves the evictee base's signed-seen markers, under both
 // schemes, up to the eviction — MAX(last_seen_at, now) — so a dormant
 // suite's year-old marker is not swept the day after its eviction made it
-// an orphan. The evictee is a /. twin: its base's markers are the ones
-// moved. Each case has the other scheme's old marker move up (a stamp
-// limited to the evictee's scheme fails both); the first leaves the
-// evictee's own scheme without a marker, which must stay absent (an
-// upsert, markSignedSeen, would create it: never-downgrade would then
-// refuse the base's unsigned return); the second has a stamp ahead of now
-// on the evictee's scheme, never lowered (ruling PF-1). Another host's or
-// another base's marker is left alone, and no marker is created.
+// an orphan. The first three evictees are /. twins: their base's markers
+// are the ones moved. Each of the stamp's wrong directions fails one case
+// on its own (the Task 3 re-reviews): the first moves the evictee's own
+// scheme's old marker up and keeps the other scheme's, ahead of now (a
+// stamp that skips the evictee's scheme, or lowers a stamp — ruling PF-1
+// — fails it); the second moves the other scheme's old marker up and
+// creates none under the evictee's scheme, which has none (a stamp
+// limited to the evictee's scheme fails it; an upsert, markSignedSeen,
+// would create the absent one); the third keeps the evictee scheme's
+// marker ahead of now while the other's moves up. The fourth evictee's
+// base has no marker under either scheme and no adopted signed snapshot:
+// none is created (ruling PF-12 creates one only for signed history the
+// delete retires), so its unsigned return stays admitted — on such a
+// base a created marker would make never-downgrade refuse it, the real
+// harm of an upsert. Another host's or another base's marker is left
+// alone.
 func TestCreateSuite_EvictionMovesTheBaseMarkersUp(t *testing.T) {
 	old, ahead := evictNow-400*evictDay, evictNow+evictDay
 	other := []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "g", Base: "/flat", SeenAt: old},
@@ -1685,6 +2003,11 @@ func TestCreateSuite_EvictionMovesTheBaseMarkersUp(t *testing.T) {
 		want    []int64          // each mark's stamp after the eviction
 		absent  []SignedSeenMark // no marker before the eviction, none after it
 	}{
+		{name: "the own scheme's moves up and the other's ahead is kept",
+			evictee: sk("b", "/flat/."),
+			marks: []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "b", Base: "/flat", SeenAt: old},
+				{CanonicalScheme: "https", CanonicalHost: "b", Base: "/flat", SeenAt: ahead}},
+			want: []int64{evictNow, ahead}},
 		{name: "the other scheme's moves up and none is created",
 			evictee: sk("b", "/flat/."),
 			marks:   []SignedSeenMark{{CanonicalScheme: "https", CanonicalHost: "b", Base: "/flat", SeenAt: old}},
@@ -1695,6 +2018,10 @@ func TestCreateSuite_EvictionMovesTheBaseMarkersUp(t *testing.T) {
 			marks: []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "b", Base: "/flat", SeenAt: old},
 				{CanonicalScheme: "https", CanonicalHost: "b", Base: "/flat", SeenAt: ahead}},
 			want: []int64{evictNow, ahead}},
+		{name: "a base without a marker or signed history gets none",
+			evictee: sk("b", "/bare"),
+			absent: []SignedSeenMark{{CanonicalScheme: "http", CanonicalHost: "b", Base: "/bare"},
+				{CanonicalScheme: "https", CanonicalHost: "b", Base: "/bare"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := openCache(t)
@@ -1719,13 +2046,115 @@ func TestCreateSuite_EvictionMovesTheBaseMarkersUp(t *testing.T) {
 			}
 			for _, m := range tc.absent {
 				if at, ok, err := c.SignedSeen(ctx, m.CanonicalScheme, m.CanonicalHost, m.Base); err != nil || ok {
-					t.Errorf("marker %s://%s%s after the eviction: present %v at %d (%v); want none: an eviction creates no marker",
+					t.Errorf("marker %s://%s%s after the eviction: present %v at %d (%v); want none: an eviction creates no "+
+						"marker for an evictee without signed snapshot history of its own (ruling PF-12)",
 						m.CanonicalScheme, m.CanonicalHost, m.Base, ok, at, err)
 				}
 			}
 			var n int
 			if err := c.db.QueryRow(`SELECT COUNT(*) FROM suite_signed_seen`).Scan(&n); err != nil || n != len(marks) {
-				t.Fatalf("%d markers after the eviction (%v); want %d: an eviction creates none", n, err, len(marks))
+				t.Fatalf("%d markers after the eviction (%v); want %d: an eviction creates none for an evictee without "+
+					"signed snapshot history of its own (ruling PF-12)", n, err, len(marks))
+			}
+			if len(tc.marks) == 0 {
+				if err := c.CheckUnsignedDowngrade(ctx, "b", tc.evictee.SuitePath); err != nil {
+					t.Fatalf("after the eviction an unsigned candidate of %s is %v; want admitted", tc.evictee.SuitePath, err)
+				}
+			}
+		})
+	}
+}
+
+// Ruling PF-12 (final review spec C1) for cap eviction: an evictee has no
+// current snapshot, but its only signed history can be a displaced
+// adopted snapshot the legacy trust audit left queued and unmarked
+// (design review M-8: the audit quarantined the current one). The
+// eviction retires it, so it first writes the base's marker under the
+// evictee's scheme, stamped at the eviction: an unsigned candidate of the
+// base is still refused, by that marker.
+func TestCreateSuite_EvictionTurnsSignedSnapshotHistoryIntoAMarker(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, evictNow)()
+	key := sk("b", "/r/dists/x")
+	id := seedSignedHistory(t, c, key, FormInline, false, evictNow-3*evictDay)
+	seedRow(t, c, sk("b", "/kept"), evictNow-3600) // requested within the day: not evictable
+	if markerStamp(t, c, SignedSeenMark{CanonicalScheme: "http", CanonicalHost: "b", Base: "/r/dists/x"}) != -1 {
+		t.Fatal("premise: the base has a marker")
+	}
+	if err := c.CheckUnsignedDowngrade(ctx, "b", "/r/dists/x"); !errors.Is(err, ErrUnsignedDowngradeRefused) {
+		t.Fatalf("premise: before the eviction an unsigned candidate is %v, want refused", err)
+	}
+	res, err := c.CreateSuite(ctx, SuiteSeed{SuiteKey: sk("e", "/new"), RequestedAt: evictNow}, SuiteCaps{Global: 2}, newFakeGuard())
+	if err != nil || res.Evicted == nil || *res.Evicted != key {
+		t.Fatalf("CreateSuite = %+v, %v; want %v evicted", res, err, key)
+	}
+	if snap, err := c.GetSuiteSnapshot(ctx, id); err != nil || snap.RetiredAt == nil {
+		t.Fatalf("premise: the eviction retired the snapshot (%+v, %v)", snap, err)
+	}
+	if at := markerStamp(t, c, SignedSeenMark{CanonicalScheme: "http", CanonicalHost: "b", Base: "/r/dists/x"}); at != evictNow {
+		t.Errorf("marker http://b/r/dists/x after the eviction: %d (-1: none); want %d", at, evictNow)
+	}
+	if at := markerStamp(t, c, SignedSeenMark{CanonicalScheme: "https", CanonicalHost: "b", Base: "/r/dists/x"}); at != -1 {
+		t.Errorf("marker https://b/r/dists/x after the eviction: %d; want none (the evictee's scheme only)", at)
+	}
+	err = c.CheckUnsignedDowngrade(ctx, "b", "/r/dists/x")
+	if !errors.Is(err, ErrUnsignedDowngradeRefused) || !strings.Contains(err.Error(), "signed-seen marker") {
+		t.Fatalf("after the eviction an unsigned candidate is %v; want refused by the base's marker", err)
+	}
+}
+```
+
+In `internal/cache/fetched_row_test.go`, after `TestStoreFetched_AFailedOperationStoresNothing` add deferred minor D-18's test:
+
+```go
+// Deferred minor D-18: a FetchedRow whose Create or Restamp names another
+// suite than its Suite is refused before anything is written — it would
+// create one suite, re-stamp another and mark a third — and stores no
+// url_path row, no suite row and no marker. A matching one is stored.
+func TestStoreFetched_RefusesASuiteMismatch(t *testing.T) {
+	key, other := sk("h", "/r/dists/x"), sk("h", "/r/dists/y")
+	for _, tc := range []struct {
+		name            string
+		create, restamp *SuiteKey
+		refused         bool
+	}{
+		{"Create names another suite", &other, nil, true},
+		{"Restamp names another suite", nil, &other, true},
+		{"another scheme", &SuiteKey{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/r/dists/x"}, nil, true},
+		{"both name the suite", &key, &key, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			m := FetchedRow{Row: fetchedRow(t, c, key, "/InRelease"), Suite: key, MarkSeenAt: 1}
+			if tc.create != nil {
+				m.Create = &SuiteSeed{SuiteKey: *tc.create, RequestedAt: 1}
+			}
+			if tc.restamp != nil {
+				m.Restamp = &SuiteSeed{SuiteKey: *tc.restamp}
+			}
+			_, err := c.StoreFetched(ctx, m, SuiteCaps{}, nil)
+			if !tc.refused {
+				if err != nil || !rowExists(t, c, key) {
+					t.Fatalf("StoreFetched = %v, suite row %v; want it stored", err, rowExists(t, c, key))
+				}
+				return
+			}
+			if !errors.Is(err, errFetchedSuiteMismatch) {
+				t.Fatalf("StoreFetched = %v; want errFetchedSuiteMismatch", err)
+			}
+			if _, err := c.LookupURL(ctx, "http", "h", "/r/dists/x/InRelease"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("url_path row stored by a refused FetchedRow (%v)", err)
+			}
+			for _, k := range []SuiteKey{key, other, {CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/r/dists/x"}} {
+				if rowExists(t, c, k) {
+					t.Fatalf("suite row %v created by a refused FetchedRow", k)
+				}
+			}
+			var n int
+			if err := c.db.QueryRow(`SELECT COUNT(*) FROM suite_signed_seen`).Scan(&n); err != nil || n != 0 {
+				t.Fatalf("%d markers (%v) after a refused FetchedRow; want none", n, err)
 			}
 		})
 	}
@@ -1734,8 +2163,8 @@ func TestCreateSuite_EvictionMovesTheBaseMarkersUp(t *testing.T) {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test -gcflags=-e ./internal/cache/ -run 'TestReapIdleSuite|TestDeleteSuiteMetadata|TestForgetSuite|TestReap_|TestReapAndForget|TestCreateSuite_EvictionMovesTheBaseMarkersUp|TestSuiteRowWritersHaveKnownCallers|TestSuiteDeletersHaveKnownCallers|TestSignedSeenHasKnownDeleteSites'`
-Expected: compile failures naming `c.ReapIdleSuite undefined`, `undefined: ReapRegardless`, `c.DeleteSuiteMetadata undefined`, `c.ForgetSuite undefined` and `undefined: ForgetResult`.
+Run: `go test -gcflags=-e ./internal/cache/ -run 'TestReapIdleSuite|TestDeleteSuiteMetadata|TestDeleteSuite_|TestForgetSuite|TestReap_|TestReapAndForget|TestCreateSuite_EvictionMovesTheBaseMarkersUp|TestCreateSuite_EvictionTurnsSignedSnapshotHistoryIntoAMarker|TestStoreFetched_RefusesASuiteMismatch|TestSuiteRowWritersHaveKnownCallers|TestSuiteDeletersHaveKnownCallers|TestSignedSeenHasKnownDeleteSites'`
+Expected: compile failures naming `c.ReapIdleSuite undefined`, `undefined: ReapRegardless`, `c.DeleteSuiteMetadata undefined`, `c.ForgetSuite undefined`, `undefined: ForgetResult` and `undefined: errFetchedSuiteMismatch`.
 
 - [ ] **Step 3: Implement**
 
@@ -1770,12 +2199,14 @@ const reapMetadataBatch = 1000
 // backward clock step, never qualifies; nor does a NULL one), unless
 // cutoff is ReapRegardless, which every row passes — and
 // current_snapshot_id equal to wantCurrent (nil: no current snapshot). It
-// releases the current snapshot's pins and retires every snapshot of the
-// suite (retireSuiteSnapshotsTx), deletes the row, and moves the base's
-// signed-seen markers up to now (stampBaseMarkersTx).
+// turns the suite's signed snapshot history into a marker
+// (markSnapshotHistoryTx), releases the current snapshot's pins and
+// retires every snapshot of the suite (retireSuiteSnapshotsTx), deletes
+// the row, and moves the base's signed-seen markers up to now
+// (stampBaseMarkersTx).
 ```
 
-its AIDEV-NOTE's last sentence gains the marker stamp's reason (ruling PF-10):
+its AIDEV-NOTE's last sentence gains the marker stamp's reason (ruling PF-10) and the history marker's place (ruling PF-12):
 
 ```go
 // (TestCreateSuite_EvictionTouchesOnlyTheEvictee,
@@ -1787,10 +2218,12 @@ its AIDEV-NOTE's last sentence gains the marker stamp's reason (ruling PF-10):
 // a reap does, and a dormant suite's marker can be over a year old when it
 // is evicted, so the next daily sweep would delete the never-downgrade
 // protection of a base that was signed
-// (TestCreateSuite_EvictionMovesTheBaseMarkersUp).
+// (TestCreateSuite_EvictionMovesTheBaseMarkersUp). The history marker
+// goes before the retirement, which would hide that history from it
+// (ruling PF-12).
 ```
 
-and its body, from the stamp check to its `return suiteDeleted, nil`, becomes (the `DELETE FROM suite_freshness` statement in it is unchanged; ruling PF-10 moved design review M-9's marker stamp here from `ReapIdleSuite`, so every delete — cap eviction, reap, forget — stamps):
+and its body, from the stamp check to its `return suiteDeleted, nil`, becomes (the `DELETE FROM suite_freshness` statement in it is unchanged; ruling PF-10 moved design review M-9's marker stamp here from `ReapIdleSuite`, so every delete — cap eviction, reap, forget — stamps; ruling PF-12 adds the history marker before the retirement):
 
 ```go
 	if cutoff != ReapRegardless && (!requested.Valid || requested.Int64 > cutoff) {
@@ -1798,6 +2231,9 @@ and its body, from the stamp check to its `return suiteDeleted, nil`, becomes (t
 	}
 	if current.Valid != (wantCurrent != nil) || (current.Valid && current.Int64 != *wantCurrent) {
 		return suiteKept, nil
+	}
+	if err := markSnapshotHistoryTx(ctx, tx, key, now); err != nil {
+		return suiteKept, fmt.Errorf("delete suite %s%s: %w", key.CanonicalHost, key.SuitePath, err)
 	}
 	if err := retireSuiteSnapshotsTx(ctx, tx, key, current, now); err != nil {
 		return suiteKept, fmt.Errorf("delete suite %s%s: %w", key.CanonicalHost, key.SuitePath, err)
@@ -1826,14 +2262,57 @@ Append:
 // the orphan sweep's year counts from the end of the suite's tracking —
 // after a long downtime, or a dormant suite's eviction, its marker would
 // otherwise be swept a day after it became an orphan. MAX never lowers a
-// stamp (ruling PF-1), and an UPDATE never creates a marker. ForgetSuite
-// may delete the markers afterwards, in the same transaction.
+// stamp (ruling PF-1), and an UPDATE never creates a marker: a base with
+// no signed history must not be refused its unsigned return. The one
+// marker a delete creates is markSnapshotHistoryTx's (ruling PF-12, the
+// exception to PF-10's rule), for a base whose signed history the delete
+// is about to retire. ForgetSuite may delete the markers afterwards, in
+// the same transaction.
 func stampBaseMarkersTx(ctx context.Context, tx *sql.Tx, key SuiteKey, now int64) error {
 	if _, err := tx.ExecContext(ctx, `
 UPDATE suite_signed_seen SET last_seen_at = MAX(last_seen_at, ?)
  WHERE canonical_scheme IN ('http', 'https') AND canonical_host = ? AND base = ?`,
 		now, key.CanonicalHost, aptpath.MarkerBase(key.SuitePath)); err != nil {
 		return fmt.Errorf("stamp markers: %w", err)
+	}
+	return nil
+}
+
+// markSnapshotHistoryTx turns never-downgrade's snapshot clause (spec C5
+// safeguard 3, refuseUnsignedDowngrade) into a marker before deleteSuiteTx
+// retires key's snapshots: when the suite has a snapshot the clause counts
+// (signedHistorySnapshotSQL: adopted, not retired, inline or detached), it
+// upserts the signed-seen marker of its base (aptpath.MarkerBase) under
+// key's scheme, stamped MAX(last_seen_at, now) — one INSERT … SELECT …
+// WHERE EXISTS … ON CONFLICT. A suite without one gets no marker.
+//
+// AIDEV-NOTE: ruling PF-12 (final review spec C1), the one exception to
+// PF-10's "a delete never creates a marker". A retired snapshot is no
+// history, so a delete that retired a suite's only signed history — a
+// pre-v7 snapshot the legacy trust audit left queued and unmarked after a
+// pool read fault (design review M-8) — would admit an unsigned candidate
+// of the base once the row is gone, and the audit's later Keep writes no
+// marker for a suite without a row. The marker is the record that
+// outlives the row (it fails closed). For a snapshot CommitAdoption
+// committed the marker exists already, and this moves it up as
+// stampBaseMarkersTx does. It runs for every delete — cap eviction, a
+// reap, POST /forget — and ForgetSuite still deletes the base's markers
+// afterwards when no row is left for the base or its twin
+// (TestReapIdleSuite_TurnsSignedSnapshotHistoryIntoAMarker,
+// TestCreateSuite_EvictionTurnsSignedSnapshotHistoryIntoAMarker,
+// TestDeleteSuite_NoSignedHistoryCreatesNoMarker).
+func markSnapshotHistoryTx(ctx context.Context, tx *sql.Tx, key SuiteKey, now int64) error {
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO suite_signed_seen (canonical_scheme, canonical_host, base, last_seen_at)
+SELECT ?, ?, ?, ?
+ WHERE EXISTS (SELECT 1 FROM suite_snapshot
+                WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?
+                  AND `+signedHistorySnapshotSQL+`)
+ON CONFLICT(canonical_scheme, canonical_host, base) DO UPDATE SET
+  last_seen_at = MAX(last_seen_at, excluded.last_seen_at)`,
+		key.CanonicalScheme, key.CanonicalHost, aptpath.MarkerBase(key.SuitePath), now,
+		key.CanonicalScheme, key.CanonicalHost, key.SuitePath); err != nil {
+		return fmt.Errorf("mark signed snapshot history: %w", err)
 	}
 	return nil
 }
@@ -2007,13 +2486,15 @@ func (c *Cache) DeleteSuiteMetadata(ctx context.Context, key SuiteKey) (int, err
 // transaction running deleteSuiteTx's compare-and-delete with the current
 // snapshot the reaper listed (wantCurrent) and its cutoff — an idle
 // cutoff, or ReapRegardless for a non-canonical or junk row — which, when
-// it deletes the row, also moves the base's signed-seen markers up to now
-// (as every suite-row delete does: stampBaseMarkersTx, ruling PF-10). It
-// reports deleted (this call deleted the row) and gone (the suite has no
-// row: deleted, none was found, or — after a failed submit — none is
-// found by a fresh read). The caller releases its SuiteGuard hold with
-// release(gone), which drops the lock-map and flip-gate entries; a gone
-// suite's touch-coalescing entry is dropped here.
+// it deletes the row, also turns the suite's signed snapshot history into
+// a marker and moves the base's signed-seen markers up to now (as every
+// suite-row delete does: markSnapshotHistoryTx and stampBaseMarkersTx,
+// rulings PF-12 and PF-10). It reports deleted (this call deleted the
+// row) and gone (the suite has no row: deleted, none was found, or —
+// after a failed submit — none is found by a fresh read). The caller
+// releases its SuiteGuard hold with release(gone), which drops the
+// lock-map and flip-gate entries; a gone suite's touch-coalescing entry
+// is dropped here.
 //
 // AIDEV-NOTE: design review M-2: submitWrite can fail after the
 // transaction committed (its context ended between the commit and the
@@ -2229,9 +2710,37 @@ In `internal/cache/signed_seen.go`, `markSignedSeen`'s AIDEV-NOTE ends:
 // only for suites with a suite_freshness row, and never for an unsigned
 // snapshot or a plain-text anchor. Every suite-row delete (deleteSuiteTx:
 // cap eviction, a reap, POST /forget) moves its base's existing markers'
-// stamps up to the delete, in the transaction that deletes the row, and
-// never creates one (stampBaseMarkersTx; design review M-9, ruling PF-10);
-// POST /forget (ForgetSuite) and the orphan sweep delete markers.
+// stamps up to the delete, in the transaction that deletes the row
+// (stampBaseMarkersTx; design review M-9, ruling PF-10), and creates one
+// only for a base whose signed history it is about to retire — an
+// adopted, non-retired inline or detached snapshot of the suite, such as
+// a legacy one the trust audit left queued and unmarked
+// (markSnapshotHistoryTx, ruling PF-12); POST /forget (ForgetSuite) and
+// the orphan sweep delete markers.
+```
+
+and the file ends with never-downgrade's snapshot clause as one predicate (ruling PF-12), which `markSnapshotHistoryTx` reads:
+
+```go
+// signedHistorySnapshotSQL is never-downgrade's snapshot clause (spec C5
+// safeguard 3) as a predicate on suite_snapshot's columns: an adopted,
+// non-retired inline or detached snapshot.
+//
+// AIDEV-NOTE: shared by the clause's read (refuseUnsignedDowngrade) and
+// by the marker a suite-row delete writes before it retires the suite's
+// snapshots (markSnapshotHistoryTx, ruling PF-12): the delete must turn
+// into a marker exactly the history the read would have counted.
+const signedHistorySnapshotSQL = `adopted_at IS NOT NULL AND retired_at IS NULL AND anchor_form IN ('inline', 'detached')`
+```
+
+In `internal/cache/adoption.go` (Task 5 moves it to `signed_seen.go`), `refuseUnsignedDowngrade`'s snapshot read takes its predicate from the constant — `   AND adopted_at IS NOT NULL AND retired_at IS NULL AND anchor_form IN ('inline', 'detached')` becomes `   AND `+signedHistorySnapshotSQL+`` — and its doc's paragraph on retired snapshots becomes:
+
+```go
+// A retired snapshot (quarantined by the audit, or reaped) is no history:
+// its trust was removed — a suite-row delete (cap eviction, a reap, POST
+// /forget) turns the second clause into a marker before it retires the
+// suite's snapshots (markSnapshotHistoryTx, ruling PF-12). A read error is
+// returned as it is.
 ```
 
 A reap or a forget can delete an eviction candidate's row before a creation holds it, as a concurrent creation can (the Task 3 review's ruling (c); `holdEvictionCandidate`'s and `afterCreate`'s docs say so since Task 2). The retry comment in `CreateSuite` (`suite_rows.go`) becomes:
@@ -2240,8 +2749,22 @@ A reap or a forget can delete an eviction candidate's row before a creation hold
 		// The held candidate's row was deleted between the candidate list
 		// and the writer (a concurrent creation evicted it, or a reap or
 		// POST /forget deleted it before the hold), or kept (a client asked
-		// for it meanwhile): one more attempt, with a fresh list (design
-		// review M4; final review, concurrency M2).
+		// for it meanwhile, or an adoption gave it a current snapshot): one
+		// more attempt, with a fresh list (design review M4; final review,
+		// concurrency M2).
+```
+
+`CreateResult`'s field doc there names the adoption too (the final review's spec m9):
+
+```go
+	// heldGone: the held eviction candidate had no row when the writer ran
+	// (a concurrent creation had evicted it, or a reap or POST /forget had
+	// deleted it, before this creation held it); heldKept: it no longer
+	// qualified (a client asked for it in between, or an adoption gave it a
+	// current snapshot — eviction takes only suites without one). Either
+	// way CreateSuite and StoreFetched try once more with a fresh candidate
+	// list.
+	heldGone, heldKept bool
 ```
 
 and the one in `StoreFetched` (`fetched_row.go`):
@@ -2249,8 +2772,97 @@ and the one in `StoreFetched` (`fetched_row.go`):
 ```go
 		// The held candidate was deleted before the hold (evicted by a
 		// concurrent creation, or reaped or forgotten), or kept (a client
-		// asked for it meanwhile): one more attempt with a fresh list (the
-		// url_path upsert repeats harmlessly).
+		// asked for it meanwhile, or an adoption gave it a current
+		// snapshot): one more attempt with a fresh list (the url_path
+		// upsert repeats harmlessly).
+```
+
+`fetched_row.go`'s deferred minors D-16 to D-19 (this task hand-edits the file, so the deferred-minor rule takes them; the final review's spec m4): D-16 — "a failure stores nothing" holds per attempt, which an AIDEV-NOTE states; D-17 — `Create.Cached` must not list `Row.Path`; D-18 — `StoreFetched` refuses a `FetchedRow` whose `Create` or `Restamp` names another suite than `Suite`, before anything is written; D-19 — "a metadata miss" is any miss, a `.deb`'s included, and `Marked` is `MarkSeenAt`'s marker only. `FetchedRow`'s doc, `Create`'s and `Restamp`'s fields and `FetchedResult.Marked` become:
+
+```go
+// FetchedRow is what a miss — of any file, a .deb included — stores in
+// one writer transaction, before its body is served (spec C3): the
+// url_path row and, for a suite file, the suite row and the signed-seen
+// marker.
+type FetchedRow struct {
+	Row URLPath
+	// Suite is the suite the path belongs to; zero when it has none.
+	Suite SuiteKey
+	// Create, when set, creates Suite's row (Create.SuiteKey must equal
+	// Suite: StoreFetched refuses a mismatch) if it has none, under the
+	// caps, with cap eviction. Create.Cached must not list Row.Path.
+	//
+	// AIDEV-NOTE: deferred minor D-17. The url_path upsert of Row runs
+	// first in the same transaction, so a Create.Cached entry for Row.Path
+	// itself always reads as changed — a spurious CreateResult.Unproven,
+	// and an extra backstop mark after the commit. The one caller, the
+	// handler's miss, excludes that path (cachedAnchors' except).
+	Create *SuiteSeed
+```
+
+```go
+	// already carries them. Restamp.SuiteKey must equal Suite (StoreFetched
+	// refuses a mismatch).
+	Restamp *SuiteSeed
+}
+```
+
+```go
+	// Marked: MarkSeenAt's marker was written. The marks a creation writes
+	// from its seed (createSuiteTx's markCreated) do not set it; no
+	// production code reads it.
+	Marked bool
+}
+
+// errFetchedSuiteMismatch is StoreFetched's refusal of a FetchedRow whose
+// Create or Restamp names another suite than its Suite.
+var errFetchedSuiteMismatch = errors.New("StoreFetched: Create or Restamp names another suite than Suite")
+```
+
+and `StoreFetched`'s doc and first statement:
+
+```go
+// StoreFetched stores a miss's url_path row (any file's, a .deb's
+// included), creates the suite row, re-stamps it and writes the
+// signed-seen marker as m asks, all in ONE writer transaction (spec C3): a
+// signed anchor body is never served before its base has a marker, and a
+// failed attempt stores nothing — the caller then fails the miss (502, no
+// body) as it does today. A cap rejection is not a failure: the url_path
+// row is stored and the suite stays untracked (no marker). Like
+// CreateSuite, it tries once more when its held eviction candidate
+// vanished or was kept (requested, or adopted) before the writer ran. A
+// FetchedRow whose Create or Restamp names another suite than Suite is
+// refused (errFetchedSuiteMismatch) before anything is written: it would
+// create one suite, re-stamp another and mark a third (deferred minor
+// D-18).
+//
+// AIDEV-NOTE: the writer is a FIFO queue drained by one goroutine
+// (submitWrite), so an unsigned CommitAdoption enqueued after this
+// operation runs after it, and its in-transaction marker re-read (phase E)
+// sees the marker (TestStoreFetched_MarkerPrecedesALaterWriterOperation).
+//
+// AIDEV-NOTE: deferred minor D-16. "A failure stores nothing" holds per
+// attempt. After a retry the first attempt has committed: the url_path
+// row is stored with the suite untracked and no marker. If the second
+// attempt fails, StoreFetched returns its error (the miss's 502) and that
+// row stays. That is safe under phase D's deviation 1: an untracked
+// suite's signed anchor is marked when the next hit onboards the suite,
+// through SuiteSeed.Cached.
+func (c *Cache) StoreFetched(ctx context.Context, m FetchedRow, caps SuiteCaps, guard SuiteGuard) (FetchedResult, error) {
+	if (m.Create != nil && m.Create.SuiteKey != m.Suite) || (m.Restamp != nil && m.Restamp.SuiteKey != m.Suite) {
+		return FetchedResult{}, errFetchedSuiteMismatch
+	}
+```
+
+In `internal/cache/types.go`, `SuiteSnapshot.RetiredAt`'s comment names every retirement (the final fix wave's residual G4b):
+
+```go
+	// RetiredAt is set when the snapshot is retired (phase F): with every
+	// snapshot of its suite not yet retired when the suite's row is deleted
+	// — reaped, evicted at the cap, or forgotten (deleteSuiteTx,
+	// retireSuiteSnapshotsTx) — or alone when the legacy trust audit
+	// quarantines it (quarantineSnapshotTx). Sub-job C deletes it.
+	RetiredAt *int64
 ```
 
 - [ ] **Step 4: Run the tests**
@@ -2271,10 +2883,20 @@ Expected: PASS (`TestDeleteSuiteMetadata_BatchesOfAThousandAnchorsLast` takes ab
 | `reapMetadataBatch = 2000` | `TestDeleteSuiteMetadata_BatchesOfAThousandAnchorsLast` (`0 deleted`) |
 | `ReapIdleSuite` without its `forgetTouch` | `TestReapIdleSuite_…` (`touch entry true`), `TestReapAndForget_AFailedSubmitWhoseDeleteCommittedIsGone/reap` |
 | `deleteSuiteTx` without its `stampBaseMarkersTx` call | `TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap` (`marker {… Base:/r/dists/x …}: stamp 1791360000 after the reaps, want 1800000000`), `TestCreateSuite_EvictionMovesTheBaseMarkersUp` (`marker … after the eviction: 1765440000 …; want 1800000000`) |
-| `stampBaseMarkersTx`'s `SET last_seen_at = MAX(last_seen_at, ?)` → `SET last_seen_at = ?` | `TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap` (`… stamp 1800000000 after the reaps, want 1800086400`: the stamp ahead of now lowered), `TestCreateSuite_EvictionMovesTheBaseMarkersUp` (`… want 1800086400`) |
-| the stamp under `http` only, or under the deleted suite's scheme only | `TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap` (`marker {CanonicalScheme:https … Base:/flat …}: stamp 1791360000 after the reaps, want 1800000000`), `TestCreateSuite_EvictionMovesTheBaseMarkersUp` (both cases: `… SeenAt:1765440000} after the eviction: 1765440000 … want 1800000000`) |
+| `stampBaseMarkersTx`'s `SET last_seen_at = MAX(last_seen_at, ?)` → `SET last_seen_at = ?` | `TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap` (`… stamp 1800000000 after the reaps, want 1800086400`: the stamp ahead of now lowered), `TestCreateSuite_EvictionMovesTheBaseMarkersUp` (`suite_evict_test.go:347`: `… want 1800086400`) |
+| the stamp under `http` only, or under the deleted suite's scheme only, or under the other scheme only (the final review's FW-q1) | `TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap` (`marker {CanonicalScheme:https … Base:/flat …}: stamp 1791360000 after the reaps, want 1800000000`), `TestCreateSuite_EvictionMovesTheBaseMarkersUp` (`suite_evict_test.go:347`: the own-scheme case fails a stamp that skips the evictee's scheme, the other-scheme cases one limited to it; `… SeenAt:1765440000} after the eviction: 1765440000 … want 1800000000`) |
 | the stamp keyed by the raw suite path, not `aptpath.MarkerBase` | `TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap` (the same `Base:/flat` line), `TestCreateSuite_EvictionMovesTheBaseMarkersUp` |
-| the stamp as an upsert (`markSignedSeen` under both schemes) | `TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap` (`marker http://h/flat after the reaps: present true …`), `TestCreateSuite_EvictionMovesTheBaseMarkersUp` (`marker http://b/flat after the eviction: present true at 1800000000 … want none`, `4 markers after the eviction … want 3`) |
+| the stamp as an upsert (`markSignedSeen` under both schemes; FW-q1) | `TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap` (`marker http://h/flat after the reaps: present true …`), `TestCreateSuite_EvictionMovesTheBaseMarkersUp` (`suite_evict_test.go:352`, `:358`: `marker http://b/flat after the eviction: present true at 1800000000 … want none: an eviction creates no marker for an evictee without signed snapshot history of its own (ruling PF-12)`, `4 markers after the eviction … want 3`) |
+| `deleteSuiteTx` without its `markSnapshotHistoryTx` call (ruling PF-12; the final fix wave's P1) | `TestCreateSuite_EvictionTurnsSignedSnapshotHistoryIntoAMarker` (`suite_evict_test.go:397`: `marker http://b/r/dists/x after the eviction: -1 (-1: none); want 1800000000`), `TestReapIdleSuite_TurnsSignedSnapshotHistoryIntoAMarker` (`suite_reap_test.go:737`, `:745`) |
+| `markSnapshotHistoryTx` without its `WHERE EXISTS` (an unconditional upsert; P2) | `TestCreateSuite_EvictionMovesTheBaseMarkersUp` (`suite_evict_test.go:352`, `:358`: the bare base), `TestDeleteSuite_NoSignedHistoryCreatesNoMarker` (`suite_reap_test.go:832`) |
+| `signedHistorySnapshotSQL` without `retired_at IS NULL` (P3) | `TestDeleteSuite_NoSignedHistoryCreatesNoMarker` (`suite_reap_test.go:832`, `:836`: the retired inline case) |
+| `signedHistorySnapshotSQL` without its `anchor_form IN ('inline', 'detached')` (P4) | `TestDeleteSuite_NoSignedHistoryCreatesNoMarker` (`suite_reap_test.go:832`, `:836`: the unsigned case) |
+| `signedHistorySnapshotSQL` without `adopted_at IS NOT NULL` (P5) | `TestDeleteSuite_NoSignedHistoryCreatesNoMarker` (`suite_reap_test.go:832`: the never-adopted candidate) |
+| the upsert's `last_seen_at = MAX(last_seen_at, excluded.last_seen_at)` → `= excluded.last_seen_at` (P6) | `TestReapIdleSuite_TurnsSignedSnapshotHistoryIntoAMarker` (`suite_reap_test.go:737`: the marker ahead of now lowered) |
+| `markSnapshotHistoryTx` after `retireSuiteSnapshotsTx` (P7) | `TestCreateSuite_EvictionTurnsSignedSnapshotHistoryIntoAMarker` (`suite_evict_test.go:397`), `TestReapIdleSuite_TurnsSignedSnapshotHistoryIntoAMarker` (`suite_reap_test.go:737`) |
+| the EXISTS over either scheme (`canonical_scheme = ?` → `(canonical_scheme = ? OR 1)`; the final fix wave's residual C1, P8) | `TestDeleteSuite_ASiblingsSignedHistoryCreatesNoMarker` (`suite_reap_test.go:880`: the other scheme's suite) |
+| the EXISTS over the base and its twin (`suite_path = ?` → the base and `base + "/."`; P9) | `TestDeleteSuite_ASiblingsSignedHistoryCreatesNoMarker` (`suite_reap_test.go:880`: the `/.` twin and a twin's base) |
+| `StoreFetched` without its suite-mismatch refusal (deferred minor D-18; D18a), or with it for `Create` only (D18b) or `Restamp` only (D18c) | `TestStoreFetched_RefusesASuiteMismatch` (`fetched_row_test.go:140`: `StoreFetched = <nil>; want errFetchedSuiteMismatch`, in the cases the guard left out) |
 | `ReapIdleSuite` without the settle (`gone = false` after an error) | `TestReapAndForget_AFailedSubmitWhoseDeleteCommittedIsGone/reap` (`gone false, touch entry true`) |
 | `ForgetSuite` without the settle (`res.Gone = false` after an error) | `TestReapAndForget_AFailedSubmitWhoseDeleteCommittedIsGone/forget` |
 | `ForgetSuite`'s settle sets `res.Gone = true` after any error | `TestReapAndForget_AFailedSubmitWhoseDeleteCommittedIsGone/rolled_back_forget` (`forget = deleted false, gone true, …`) |
@@ -2289,29 +2911,32 @@ Expected: PASS (`TestDeleteSuiteMetadata_BatchesOfAThousandAnchorsLast` takes ab
 | `deleteBaseAnchorsTx` without the twin path | `TestForgetSuite_…/no_other_suite` (`AnchorRowsDeleted:1`) |
 | `ForgetSuite` reports no `KeptBy` | `TestForgetSuite_…/the_/._twin_keeps_them` and the two other keeping cases (`… kept by [{http h /flat/.}]`), `TestReap_LeavesTwinsAndNestedSuitesAlone` |
 | a call of `DeleteSuiteMetadata` in `cmd/apt-cacher-ultra/main.go` (after `cache.Open`), or a method value (`f := c.ForgetSuite`) or method expression (`(*cache.Cache).DeleteSuiteMetadata`) there | `TestSuiteDeletersHaveKnownCallers` (`… names DeleteSuiteMetadata: only the reaper and POST /forget delete suites`) |
+| a call of `ForgetSuite` inside `internal/cache` (the final review's tests m-1, G3) | `TestSuiteDeletersHaveKnownCallers` (`single_insert_test.go:298`: `ForgetSuite is named inside internal/cache at […]; want nowhere`) |
 | a second `DELETE FROM suite_signed_seen` literal (in `afterCreate`) | `TestSignedSeenHasKnownDeleteSites` |
 | a call of `ClearSignedSeenForTest` in `cmd/apt-cacher-ultra/main.go` | `TestOnlyTheHandlerCreatesSuiteRows` (`… calls the test-only ClearSignedSeenForTest`) |
+
+The final fix wave's rows give each failing line as at its commit (7bf08cb, d6485cb, 4505d1a, 779aaad); a later commit moved some by one.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-gofmt -l internal/cache/suite_reap.go internal/cache/suite_reap_test.go internal/cache/single_insert_test.go internal/cache/suite_evict_test.go internal/cache/cache.go internal/cache/signed_seen.go internal/cache/suite_rows.go internal/cache/fetched_row.go
-git add internal/cache/suite_reap.go internal/cache/suite_reap_test.go internal/cache/single_insert_test.go internal/cache/suite_evict_test.go internal/cache/cache.go internal/cache/signed_seen.go internal/cache/suite_rows.go internal/cache/fetched_row.go
-git commit -m "Reap and forget suites through the one delete path (spec C9; rulings R-F1, R-F5, PF-2, PF-7; design review M-2, M-5, M-9)"
+gofmt -l internal/cache/suite_reap.go internal/cache/suite_reap_test.go internal/cache/marker_sweep_test.go internal/cache/single_insert_test.go internal/cache/suite_evict_test.go internal/cache/cache.go internal/cache/signed_seen.go internal/cache/adoption.go internal/cache/suite_rows.go internal/cache/fetched_row.go internal/cache/fetched_row_test.go internal/cache/types.go
+git add internal/cache/suite_reap.go internal/cache/suite_reap_test.go internal/cache/marker_sweep_test.go internal/cache/single_insert_test.go internal/cache/suite_evict_test.go internal/cache/cache.go internal/cache/signed_seen.go internal/cache/adoption.go internal/cache/suite_rows.go internal/cache/fetched_row.go internal/cache/fetched_row_test.go internal/cache/types.go
+git commit -m "Reap and forget suites through the one delete path (spec C9; rulings R-F1, R-F5, PF-2, PF-7, PF-10, PF-12; design review M-2, M-5, M-9; deferred minors D-16 to D-19)"
 ```
 
 (Record the mutation table in the commit message.)
 
 ### Task 4: Snapshot GC: retired rows leave `keep_displaced`; sub-job C
 
-Spec C9's snapshot GC: retired snapshots (reaped, forgotten, evicted at a cap, or quarantined by the §6.1 audit) never take one of a suite's `keep_displaced` slots in sub-job B's ranking (phase A carry-forward), and sub-job C deletes them — members, skipped members and `package_hash` rows in chunks of at most 10,000 rows per writer transaction, then the header (design note 15). The blob pass that follows in the same tick reclaims their blobs once `blob_grace` has passed, so a reaped suite's blobs go within two GC ticks. `gc_run_complete` and `LastRunSummary` gain `retired_reaped` (spec C11), with `acu_gc_retired_reaped_total`. Deferred minor A-3 (the GC's run stamps were not told apart from `time.Now` by any test) lands here, in the file it names. The chunk constant is pinned by a cheap assertion (exec review X29, ruling PF-9: a test that fills a 10,000-row chunk takes 4.6 s under `-race`), and its AIDEV-NOTE records the measured writer hold (design review M-15).
+Spec C9's snapshot GC: retired snapshots (reaped, forgotten, evicted at a cap, or quarantined by the §6.1 audit) never take one of a suite's `keep_displaced` slots in sub-job B's ranking (phase A carry-forward), and sub-job C deletes them — members, skipped members and `package_hash` rows in chunks of at most 10,000 rows per writer transaction, then the header (design note 15). The blob pass that follows in the same tick reclaims their blobs once `blob_grace` has passed, so a reaped suite's blobs go within two periodic GC ticks when no pass reaches its deadline. The startup pass, which runs before any listener serves, runs no sub-job C (ruling PF-15, the final review's concurrency m1: retired snapshots never serve, and C's backlog after a burst of reaps could hold every listener closed up to `max_tick_duration`); it still runs sub-jobs A and B and its blob pass, and the periodic ticks run C — normally the first, a later one when an earlier pass reached its deadline, since the passes resume in rotation. `runTick`'s existing `phase` parameter is the seam (`phaseStartup`). `gc_run_complete` and `LastRunSummary` gain `retired_reaped` (spec C11), with `acu_gc_retired_reaped_total`. Deferred minor A-3 (the GC's run stamps were not told apart from `time.Now` by any test) lands here, in the file it names. The chunk constant is pinned by a cheap assertion (exec review X29, ruling PF-9: a test that fills a 10,000-row chunk takes 4.6 s under `-race`), and its AIDEV-NOTE records the measured writer hold (design review M-15).
 
 **Files:**
-- Modify: `internal/cache/gc.go` (sub-job B's ranking, `retiredChunkRows`, `RunRetiredSnapshotGCChunk`), `internal/gc/snapshot.go` (`snapshotPassResult`, sub-job C in `runSnapshotPass`), `internal/gc/gc.go` (`LastRunSummary.RetiredReaped`, `tickResult.retiredReaped`, `gc_run_complete`'s `retired_reaped`), `internal/gc/metrics.go` (`acu_gc_retired_reaped_total`)
+- Modify: `internal/cache/gc.go` (sub-job B's ranking, `retiredChunkRows`, `RunRetiredSnapshotGCChunk`), `internal/gc/snapshot.go` (`snapshotPassResult`, sub-job C in `runSnapshotPass`, none at startup), `internal/gc/gc.go` (`phaseStartup`, `StartupPass`'s doc and step 6, `runTick`'s doc, `LastRunSummary.RetiredReaped`, `tickResult.retiredReaped`, `gc_run_complete`'s `retired_reaped`), `internal/gc/metrics.go` (`acu_gc_retired_reaped_total`)
 - Create: `internal/cache/snapshot_gc_retired_test.go`, `internal/gc/retired_test.go`
 
 **Interfaces:**
-- Consumes: `DeleteSuiteMetadata`, `ForgetSuite` (Task 3; the gc test reaps through them); `adoptWith` (Task 3, `suite_reap_test.go`); cache test helpers `adoptCandidate`, `setCurrentSnapshot`, `snapshotExists`, `stubNow` (`gc_test.go`), `seedPackageHash` (`gc_urlpath_test.go`), `seedBlob` (`cache_test.go`), `seedRow`, `sk` (`suite_evict_test.go`); gc test helpers `openTestCache`, `captureLogger`, `dbOf`, `fileExists` (`gc_test.go`), `putPoolBlob`, `adoptSnapshot`, `fastForwardZeroedAt`, `blobRowExists`, `snapshotRowExists` (`integration_test.go`); `wallclock.SetOffsetForTest`.
+- Consumes: `DeleteSuiteMetadata`, `ForgetSuite` (Task 3; the gc test reaps through them), `InsertTrackedCandidateForTest` (the gc test's stale candidate); `adoptWith` (Task 3, `suite_reap_test.go`); cache test helpers `adoptCandidate`, `setCurrentSnapshot`, `snapshotExists`, `stubNow` (`gc_test.go`), `seedPackageHash` (`gc_urlpath_test.go`), `seedBlob` (`cache_test.go`), `seedRow`, `sk` (`suite_evict_test.go`); gc test helpers `openTestCache`, `captureLogger`, `dbOf`, `fileExists` (`gc_test.go`), `putPoolBlob`, `adoptSnapshot`, `fastForwardZeroedAt`, `blobRowExists`, `snapshotRowExists` (`integration_test.go`); `wallclock.SetOffsetForTest`.
 - Produces: `(*cache.Cache).RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error)` (maxRows ≤ 0: 10,000); `gc.LastRunSummary.RetiredReaped int`; the `gc_run_complete` field `retired_reaped`; the counter `acu_gc_retired_reaped_total`; the test helpers `retire(t, c, id)` and `childRows(t, c, id) int` (`snapshot_gc_retired_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
@@ -2525,6 +3150,7 @@ package gc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -2534,64 +3160,117 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
-// Spec C9 sub-job C and §7 "blobs reclaimed within two GC ticks": a suite
-// reaped (or forgotten) leaves retired snapshots — here two, the current
-// one and the one it displaced, so the pass must loop past its first
-// deleted header (the Task 4 review's minor 1) — and the next tick's
-// snapshot pass deletes them (retired_reaped in gc_run_complete and
-// LastRunSummary) and the same tick's blob pass reclaims their blobs once
-// blob_grace has passed.
+// Spec C9 sub-job C and §7 "blobs reclaimed within two periodic GC ticks":
+// a suite reaped (or forgotten) leaves retired snapshots — here two, the
+// current one and the one it displaced, so the pass must loop past its
+// first deleted header (the Task 4 review's minor 1). The startup pass,
+// which runs before any listener serves, leaves them and their blobs
+// (ruling PF-15: no sub-job C there, retired_reaped 0), still runs
+// sub-jobs A and B — a candidate whose heartbeat went stale, and another
+// suite's fourth displaced snapshot beyond keep_displaced = 3, are deleted
+// (the final fix wave's re-review, gc-sims minor 2) — and still runs its
+// blob pass, which reclaims an unreferenced orphan blob. Since that pass
+// finishes every pass (none reaches its deadline), the first periodic
+// tick's snapshot pass deletes the retired snapshots (retired_reaped in
+// its gc_run_complete and LastRunSummary) and the same tick's blob pass
+// reclaims their blobs once blob_grace has passed.
 func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
-	c := openTestCache(t)
-	logger, buf := captureLogger()
-	db := dbOf(t, c)
-	ctx := context.Background()
-	oldAnchor, oldMember := putPoolBlob(t, c, "old anchor"), putPoolBlob(t, c, "old member")
-	old := adoptSnapshot(t, c, "http", "h", "/r/dists/x", oldAnchor, []string{oldMember})
-	anchor := putPoolBlob(t, c, "anchor")
-	b1, b2 := putPoolBlob(t, c, "member one"), putPoolBlob(t, c, "member two")
-	id := adoptSnapshot(t, c, "http", "h", "/r/dists/x", anchor, []string{b1, b2})
-	key := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}
-	if _, err := c.DeleteSuiteMetadata(ctx, key); err != nil { // the reaper's step 1: the seeded anchor row
-		t.Fatal(err)
-	}
-	if res, err := c.ForgetSuite(ctx, key, &id); err != nil || !res.Deleted {
-		t.Fatalf("ForgetSuite = %+v, %v", res, err)
-	}
-	blobs := []string{oldAnchor, oldMember, anchor, b1, b2}
-	for _, h := range blobs {
-		fastForwardZeroedAt(t, db, h)
-	}
-	g, err := New(Config{Cache: c, Logger: logger, Enabled: true, Interval: time.Hour, BatchSize: 100,
-		SnapshotBatchSize: 10, MaxTickDuration: time.Minute, BlobGrace: time.Minute, KeepDisplaced: 3,
-		PoolScanWorkers: 2, HeartbeatStaleGrace: 30 * time.Minute})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := g.StartupPass(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if snapshotRowExists(t, db, old) || snapshotRowExists(t, db, id) {
-		t.Fatalf("a retired snapshot survived the tick (displaced %v, current %v)", snapshotRowExists(t, db, old),
-			snapshotRowExists(t, db, id))
-	}
-	for _, h := range blobs {
-		if blobRowExists(t, db, h) || fileExists(t, c.BlobPath(h)) {
-			t.Fatalf("blob %s survived the tick that deleted its retired snapshot", h)
+	synctest.Test(t, func(t *testing.T) {
+		c := openTestCache(t)
+		logger, buf := captureLogger()
+		db := dbOf(t, c)
+		ctx := context.Background()
+		oldAnchor, oldMember := putPoolBlob(t, c, "old anchor"), putPoolBlob(t, c, "old member")
+		old := adoptSnapshot(t, c, "http", "h", "/r/dists/x", oldAnchor, []string{oldMember})
+		anchor := putPoolBlob(t, c, "anchor")
+		b1, b2 := putPoolBlob(t, c, "member one"), putPoolBlob(t, c, "member two")
+		id := adoptSnapshot(t, c, "http", "h", "/r/dists/x", anchor, []string{b1, b2})
+		key := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}
+		if _, err := c.DeleteSuiteMetadata(ctx, key); err != nil { // the reaper's step 1: the seeded anchor row
+			t.Fatal(err)
 		}
-	}
-	if s, ok := g.LastRunSummary(); !ok || s.RetiredReaped != 2 {
-		t.Fatalf("LastRunSummary = %+v, %v; want retired_reaped 2", s, ok)
-	}
-	var line map[string]any
-	for _, l := range strings.Split(buf.String(), "\n") {
-		if strings.Contains(l, `"msg":"gc_run_complete"`) && json.Unmarshal([]byte(l), &line) == nil {
-			break
+		if res, err := c.ForgetSuite(ctx, key, &id); err != nil || !res.Deleted {
+			t.Fatalf("ForgetSuite = %+v, %v", res, err)
 		}
-	}
-	if line["retired_reaped"] != float64(2) {
-		t.Fatalf("gc_run_complete = %v; want retired_reaped 2", line)
-	}
+		blobs := []string{oldAnchor, oldMember, anchor, b1, b2}
+		orphan := putPoolBlob(t, c, "an orphan no row references")
+		for _, h := range append(blobs, orphan) {
+			fastForwardZeroedAt(t, db, h)
+		}
+		staleAnchor := putPoolBlob(t, c, "a stale candidate's anchor")
+		stale, _, err := c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{CanonicalScheme: "http",
+			CanonicalHost: "h", SuitePath: "/r/dists/y", InReleaseHash: &staleAnchor})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE suite_snapshot SET heartbeat_at = 1 WHERE snapshot_id = ?`, stale); err != nil {
+			t.Fatal(err)
+		}
+		var displaced int64 // the oldest of five: beyond the current one and keep_displaced = 3
+		for i := range 5 {
+			if id := adoptSnapshot(t, c, "http", "h", "/r/dists/z", putPoolBlob(t, c, fmt.Sprintf("z anchor %d", i)), nil); i == 0 {
+				displaced = id
+			}
+		}
+		g, err := New(Config{Cache: c, Logger: logger, Enabled: true, Interval: time.Hour, BatchSize: 100,
+			SnapshotBatchSize: 10, MaxTickDuration: time.Minute, BlobGrace: time.Minute, KeepDisplaced: 3,
+			PoolScanWorkers: 2, HeartbeatStaleGrace: 30 * time.Minute})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := g.StartupPass(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if !snapshotRowExists(t, db, old) || !snapshotRowExists(t, db, id) {
+			t.Fatalf("the startup pass ran sub-job C (displaced kept %v, current kept %v)", snapshotRowExists(t, db, old),
+				snapshotRowExists(t, db, id))
+		}
+		for _, h := range blobs {
+			if !blobRowExists(t, db, h) || !fileExists(t, c.BlobPath(h)) {
+				t.Fatalf("blob %s of a retired snapshot reclaimed by the startup pass", h)
+			}
+		}
+		if blobRowExists(t, db, orphan) || fileExists(t, c.BlobPath(orphan)) {
+			t.Fatal("the startup pass kept an orphan blob: ending the snapshot pass before sub-job C skipped its blob pass")
+		}
+		if s, ok := g.LastRunSummary(); !ok || s.Phase != "startup" || s.RetiredReaped != 0 ||
+			s.OrphanCandidatesReaped != 1 || s.DisplacedReaped != 1 {
+			t.Fatalf("startup LastRunSummary = %+v, %v; want retired_reaped 0, and sub-jobs A and B run "+
+				"(orphan_candidates_reaped 1, displaced_reaped 1)", s, ok)
+		}
+		if snapshotRowExists(t, db, stale) || snapshotRowExists(t, db, displaced) {
+			t.Fatalf("after the startup pass: stale candidate kept %v, displaced snapshot beyond keep_displaced kept %v; "+
+				"want both deleted (sub-jobs A and B)", snapshotRowExists(t, db, stale), snapshotRowExists(t, db, displaced))
+		}
+		life, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() { g.Run(life); close(done) }()
+		time.Sleep(time.Hour + time.Second) // the first periodic tick
+		cancel()
+		<-done
+		if snapshotRowExists(t, db, old) || snapshotRowExists(t, db, id) {
+			t.Fatalf("a retired snapshot survived the first periodic tick (displaced %v, current %v)",
+				snapshotRowExists(t, db, old), snapshotRowExists(t, db, id))
+		}
+		for _, h := range blobs {
+			if blobRowExists(t, db, h) || fileExists(t, c.BlobPath(h)) {
+				t.Fatalf("blob %s survived the tick that deleted its retired snapshot", h)
+			}
+		}
+		if s, ok := g.LastRunSummary(); !ok || s.Phase != "periodic" || s.RetiredReaped != 2 {
+			t.Fatalf("LastRunSummary = %+v, %v; want the periodic tick's, retired_reaped 2", s, ok)
+		}
+		got := map[any]any{}
+		for _, l := range strings.Split(buf.String(), "\n") {
+			var line map[string]any
+			if strings.Contains(l, `"msg":"gc_run_complete"`) && json.Unmarshal([]byte(l), &line) == nil {
+				got[line["phase"]] = line["retired_reaped"]
+			}
+		}
+		if got["startup"] != float64(0) || got["periodic"] != float64(2) {
+			t.Fatalf("gc_run_complete retired_reaped by phase = %v; want startup 0, periodic 2", got)
+		}
+	})
 }
 
 // Deferred minor A-3: the GC's run stamps (gc_run_complete's
@@ -2672,9 +3351,11 @@ const retiredChunkRows = 10_000
 // when it stopped being current (displacement, the reap's or quarantine's
 // Step-8 decrement); deleting its rows and header only drops the
 // references the blob pass's reachability predicate reads, so its blobs go
-// in the same tick's blob pass once blob_grace has passed — within two GC
-// ticks of the retirement. Chunking bounds the writer's hold on a large
-// suite (tens of thousands of package_hash rows).
+// in the same tick's blob pass once blob_grace has passed — normally within
+// two periodic GC ticks of the retirement (the startup pass runs no sub-job
+// C, ruling PF-15, and a pass that hits its deadline leaves the rest to a
+// later tick). Chunking bounds the writer's hold on a large suite (tens of
+// thousands of package_hash rows).
 func (c *Cache) RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error) {
 	if maxRows <= 0 {
 		maxRows = retiredChunkRows
@@ -2770,7 +3451,26 @@ type snapshotPassResult struct {
 // and DELETE inside this tx). Once A ∪ B is drained, sub-job C (spec C9)
 // deletes the retired snapshots — those of reaped, evicted and forgotten
 // suites, and those the legacy trust audit quarantined — in chunks of at
-// most 10,000 rows per writer transaction.
+// most 10,000 rows per writer transaction; the startup pass (phase
+// phaseStartup) runs no sub-job C, and its periodic ticks do (ruling
+// PF-15).
+//
+// AIDEV-NOTE: ruling PF-15 (final review concurrency m1). StartupPass runs
+// before any listener serves, and retired snapshots never serve, so
+// nothing waits on C there; but C's backlog after a burst of reaps (a
+// large suite's snapshots hold some 70-100k package_hash rows each, and a
+// reap retires its current and displaced ones) could keep every listener
+// closed up to max_tick_duration. The startup pass therefore ends the
+// snapshot pass once A ∪ B is drained, as if C were done, so its blob pass
+// still runs. The periodic ticks run C, normally the first: its snapshot
+// pass begins with A ∪ B, then C. Not always the first (the final fix
+// wave's re-review, gc-sims minor 1): the passes resume in rotation
+// (runTick), so when the startup pass's own blob pass hits its deadline,
+// the first periodic tick resumes only that blob pass, and C runs at the
+// second at the earliest; a periodic pass that hits its deadline defers C
+// the same way. Retired rows wait for that tick: normally one GC interval
+// after the startup pass, two or more when its blob pass hit its deadline.
+// They never serve meanwhile.
 //
 // Returns:
 //   - the cumulative counts (orphan, displaced, retired),
@@ -2822,6 +3522,9 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 			break // A ∪ B drained
 		}
 	}
+	if phase == phaseStartup {
+		return acc, false, nil // no sub-job C before the listeners serve (ruling PF-15)
+	}
 	// Sub-job C (spec C9).
 	for {
 		if err := ctx.Err(); err != nil {
@@ -2843,7 +3546,45 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 }
 ```
 
-In `internal/gc/gc.go`:
+In `internal/gc/gc.go`, after the pass constants (`blobPass`):
+
+```go
+// phaseStartup is runTick's phase for StartupPass's one-shot pass, the
+// pass main runs before any listener serves. The snapshot pass runs no
+// sub-job C in it (runSnapshotPass, ruling PF-15); the periodic ticks
+// ("periodic") do.
+const phaseStartup = "startup"
+```
+
+`StartupPass`'s doc's first paragraph ends:
+
+```go
+// preserved (DB rows / pool files reaped before cancel are real). The
+// one-shot pass runs no snapshot-GC sub-job C (spec C9's retired
+// snapshots): the periodic ticks do, normally the first — a later one when
+// an earlier pass, this one's blob pass say, hits its deadline, since the
+// passes resume in rotation (ruling PF-15, runSnapshotPass).
+```
+
+its step 6 passes the constant:
+
+```go
+	// Step 6: one-shot GC pass — without snapshot-GC sub-job C, which the
+	// periodic ticks run, normally the first (ruling PF-15: runSnapshotPass).
+	tick, err := g.runTick(ctx, phaseStartup)
+```
+
+and `runTick`'s doc says what `phase` selects (the final fix wave's residual G3):
+
+```go
+// `phase` is phaseStartup ("startup", StartupPass) or "periodic" (Run).
+// It labels the gc_tick_deadline_reached events, so an operator can
+// correlate, and it selects behaviour: in phaseStartup the snapshot pass
+// runs no sub-job C (runSnapshotPass, ruling PF-15); any other phase runs
+// it.
+```
+
+Also in `internal/gc/gc.go`:
 - `LastRunSummary` gains `RetiredReaped           int // snapshot-GC sub-job C (spec C9)` after `DisplacedReaped`; `tickResult` gains `retiredReaped          int` after `displacedReaped`; `runTick`'s snapshot block adds `res.retiredReaped += snap.retired` after its `displacedReaped` line.
 - Both `gc_run_complete` lines (`StartupPass` and `Run`) gain `"retired_reaped", tick.retiredReaped,` after `"displaced_reaped", tick.displacedReaped,`; both `emitGCMetrics` calls pass `tick.retiredReaped` after `tick.displacedReaped`; both `recordLastRun` literals set `RetiredReaped: tick.retiredReaped,` after `DisplacedReaped`.
 
@@ -2877,7 +3618,11 @@ Expected: PASS (the admin tests read `LastRunSummary`; its JSON is unchanged).
 | sub-job B without `AND retired_at IS NULL` | `TestRunSnapshotGCBatch_RetiredSnapshotsTakeNoKeepDisplacedSlot` (`sub-job B reaped {OrphanReaped:0 DisplacedReaped:2}`) |
 | `RunRetiredSnapshotGCChunk`'s `LIMIT ?` bound `left` → `left+1000` | `TestRunRetiredSnapshotGCChunk_DeletesRetiredSnapshotsInChunks` (`chunk 1: … 0 rows left, header true; want … 13 rows left`) |
 | the header delete runs whatever `left` is (`if left > 0` → `if true`) | `TestRunRetiredSnapshotGCChunk_DeletesRetiredSnapshotsInChunks` (`FOREIGN KEY constraint failed`) |
-| `runSnapshotPass` returns before sub-job C (`if staleGraceSeconds >= 0 { return acc, false, nil }` above its loop) | `TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs` (`the retired snapshot survived the tick`) |
+| `runSnapshotPass` returns before sub-job C in every phase (`if staleGraceSeconds >= 0 { return acc, false, nil }` above its loop; the final fix wave's C2) | `TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs` (`a retired snapshot survived the first periodic tick (displaced true, current true)`, `retired_test.go:105`) |
+| the startup pass runs sub-job C again (`if phase == phaseStartup` → `if false`; ruling PF-15, C1) | `TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs` (`retired_test.go:78`: `the startup pass ran sub-job C (displaced kept false, current kept false)`) |
+| the startup pass ends the snapshot pass as a deadline (`return acc, true, nil`), skipping its blob pass (C3) | `TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs` (`retired_test.go:87`: `the startup pass kept an orphan blob …`), `TestStartupPass_ReportsRetainedURLCandidates` (`integration_test.go:442`: `missing pass durations`) |
+| the startup pass returns before the A ∪ B loop (the final fix wave's residual G2, C4) | `TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs` (`retired_test.go:91`: `startup LastRunSummary = …; want retired_reaped 0, and sub-jobs A and B run …`) |
+| `runTick` skips the snapshot pass at startup (C4b) | `TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs` (`retired_test.go:91`), `TestStartupPass_ReportsRetainedURLCandidates` (`integration_test.go:442`) |
 | `StartupPass`'s `endUnix := wallclock.Unix()` → `time.Now().Unix()` (and, separately, `Run`'s) | `TestGC_StampsFollowTheWallClock` (`startup stamp = 946684800, want the wall clock's 946857600`; the periodic leg for `Run`) |
 | `retiredChunkRows = 20_000` (exec review X29) | `TestRunRetiredSnapshotGCChunk_TheChunkIsTenThousandRows` (`retiredChunkRows = 20000, want spec C9's 10,000`) |
 
@@ -2922,7 +3667,7 @@ import (
 // its current snapshot's stamp led the clock — it was adopted before a
 // backward step — and then re-created stamps its first adoption above the
 // retired snapshot's stamp while that snapshot is still there (sub-job C
-// deletes it at the next GC run: adoptionStampTx's residual), so a
+// deletes it at a periodic GC tick: adoptionStampTx's residual), so a
 // client's If-Modified-Since from that snapshot's anchor gets no 304 for
 // the new one (a quarantine clears the pointer with the same effect). A
 // suite with a current snapshot floors on its displaced snapshots too
@@ -3029,7 +3774,16 @@ In `internal/cache/adoption.go`:
 				return fmt.Errorf("CommitAdoption: %w", err)
 ```
 
-- Move `rowQuerier`, `CheckUnsignedDowngrade` and `refuseUnsignedDowngrade` verbatim to the end of `internal/cache/signed_seen.go` (its imports gain `github.com/linsomniac/apt-cacher-ultra/internal/aptpath`; `adoption.go` keeps its `aptpath` import for Step 3c and Step 7a), the paragraph of `refuseUnsignedDowngrade`'s doc that ends "A read error is returned as it is." ending instead `A read error is returned as it is. (Moved here from adoption.go beside the markers it reads, deferred minor E-5.)`.
+- Move `rowQuerier`, `CheckUnsignedDowngrade` and `refuseUnsignedDowngrade` verbatim to `internal/cache/signed_seen.go` — `rowQuerier` just before Task 3's `signedHistorySnapshotSQL`, the two functions after it, at the end of the file (its imports gain `github.com/linsomniac/apt-cacher-ultra/internal/aptpath`; `adoption.go` keeps its `aptpath` import for Step 3c and Step 7a) — the paragraph of `refuseUnsignedDowngrade`'s doc that ends "A read error is returned as it is." (Task 3's wording, ruling PF-12) ending instead `A read error is returned as it is. (Moved here from adoption.go beside the markers it reads, deferred minor E-5.)`, so the paragraph reads:
+
+```go
+// A retired snapshot (quarantined by the audit, or reaped) is no history:
+// its trust was removed — a suite-row delete (cap eviction, a reap, POST
+// /forget) turns the second clause into a marker before it retires the
+// suite's snapshots (markSnapshotHistoryTx, ruling PF-12). A read error is
+// returned as it is. (Moved here from adoption.go beside the markers it
+// reads, deferred minor E-5.)
+```
 - `decrementSnapshotRefcountsTx`'s doc becomes:
 
 ```go
@@ -3074,13 +3828,15 @@ In `internal/cache/adoption.go`:
 // past-event stamp — no gate reads it that way, so a stamp in the future
 // is harmless there. Residual (the Task 5 review's minor 1): the floor
 // covers only the snapshots still present. Sub-job C deletes a retired
-// snapshot at the next GC run, a reap or /forget deletes the anchor rows,
+// snapshot at a periodic GC tick (normally the next; a startup GC pass
+// deletes none: ruling PF-15), a reap or /forget deletes the anchor rows,
 // and Step 3c seeds them with now, so after a backward step longer than
-// the time from a reap (or /forget) to the re-adoption, with a GC run in
-// between, the re-adoption can stamp below the reaped snapshot again and a
-// client holding that anchor gets a 304 until a later flip is stamped
-// above it. C-11's own readers do not care then (the row is gone); a
-// durable per-suite floor needs a schema change, which phase F forbids.
+// the time from a reap (or /forget) to the re-adoption, with that periodic
+// tick in between, the re-adoption can stamp below the reaped snapshot
+// again and a client holding that anchor gets a 304 until a later flip is
+// stamped above it. C-11's own readers do not care then (the row is
+// gone); a durable per-suite floor needs a schema change, which phase F
+// forbids.
 func adoptionStampTx(ctx context.Context, tx *sql.Tx, scheme, host, suite string, now int64) (int64, error) {
 	var newest, current sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `
@@ -3148,15 +3904,15 @@ git commit -m "Floor the adoption stamp on every snapshot of the suite (deferred
 
 ### Task 6: The reaper: idle and non-canonical suites, the hourly run, the memory purge
 
-Spec C9's reaper, in `internal/freshness` (design note 1): its own hourly timer after a one-hour monotonic uptime floor (design note 3), at most 25 candidates per run — those reaped regardless of idleness first (ruling PF-4), then the oldest `last_requested_at`. Candidates are the rows whose suite path the grammar can no longer produce (`!aptpath.IsCanonicalSuitePath`: reaped regardless of idleness, phase A carry-forward) and the suites no client asked for in `gc.suite_idle_ttl` — strictly older than the TTL (design note 4); a canonical path with an odd codename such as `/foo/dists/InRelease` is reaped by idleness only (phase A carry-forward). The reap cutoff is a gate that retires things: a NULL or future stamp is never idle, and the furthest future one is reported through `clock_step_detected` — counted, and logged directly (`clockStepUnlimited`), not through the checker's one-line-a-minute limit, which a check's report could have used up — at the first run after a start and whenever the furthest changes (design review M-10), not every hour until the clock passes it. Each candidate is held through `HoldSuite` before any writer operation (ruling R-F1), re-read under the hold (design note 5), its metadata deleted in batches (`DeleteSuiteMetadata`), then deleted by `ReapIdleSuite`'s compare-and-delete with the current snapshot listed — all within `suiteHoldTimeout`, 5 minutes (design review M-2: a wedged writer releases the suite instead of holding it until shutdown); the held steps run in `reapHeld`, which has only the bounded context in scope, and a step the deadline cuts short is a WARN failure, the suite tried again next run. The hold is released with `release(gone)`, `gone` being `ReapIdleSuite`'s answer — settled by a fresh read after a failed submit (Task 3) — or the re-read's finding no row: that purges the lock-map entry and per-suite state and, unless live (Task 1), the flip-gate entry, and `ReapIdleSuite` the touch entry. A reap whose submit failed after its commit (`err != nil && gone`) is a reap: `suite_reaped` with `settled=true`, counted. A busy suite is skipped and retried next run. A forward step of the wall clock that no restart re-arms — the checker's wall clock running more than an hour ahead of the monotonic clock between two runs, as after a resumed VM or laptop — is reported (`clock_step_detected`, `stamp=wall_clock`) and defers reaping by the uptime floor (design review M-8). A step that fails because the daemon is stopping logs at DEBUG, not WARN (design review M-3). Each reap counts in `acu_suites_reaped_total{reason}` (design review M-16). Each run also sweeps the adopter's reconcile memo against the current snapshots (spec C9; design note 18), whose AIDEV-NOTE said its entries were never reaped. A panic under a candidate's hold is recovered there (`freshness_check_panicked`, `where=reaper`, naming the suite): the hold is released with the cache's fresh answer (`settledGone`, since the panic may have struck after a commit), and the run goes on to its next candidate and its later duties; the run's own recover (`safeRun`) stays the backstop. Every panic line names the suite's scheme (`logPanic`'s `canonical_scheme`, and the handler's `where=t1` line), as do the reaper's busy line and its failure WARNs. The rig pins the cache's clock to `reapNow` (`pinWallclock`), so no test depends on the date it runs, and a test that compares a stamp the cache writes exactly with `reapNow` runs in a `synctest` bubble, where the pinned clock stands still. With `IdleTTL = 0` no suite row is deleted (design note 2); the memo sweep still runs. The phase B carry-forward's parked scheduler entry of a reaped suite is pinned here: its next offer flushes it. The exec review's surviving mutants X2, X5r, X6, X8, X13 and X25 get their killer tests here (ruling PF-9); X3 (the idle cutoff off by one second) needs none, since a candidate's stamp is already before the cutoff and a touch moves it to now.
+Spec C9's reaper, in `internal/freshness` (design note 1): its own hourly timer after a one-hour monotonic uptime floor (design note 3), each run trying at most 250 candidates reaped regardless of idleness, first (ruling PF-4), and at most 25 idle ones, the oldest `last_requested_at` first, each class against its own budget (`runBudgets`; ruling PF-14, the final review's concurrency m2: an upgrade's thousands of legacy junk rows must not stop idle reaping for days). Candidates are the rows whose suite path the grammar can no longer produce (`!aptpath.IsCanonicalSuitePath`: reaped regardless of idleness, phase A carry-forward) and the suites no client asked for in `gc.suite_idle_ttl` — strictly older than the TTL (design note 4); a canonical path with an odd codename such as `/foo/dists/InRelease` is reaped by idleness only (phase A carry-forward). The reap cutoff is a gate that retires things: a NULL or future stamp is never idle, and the furthest future one is reported through `clock_step_detected` — counted, and logged directly (`clockStepUnlimited`), not through the checker's one-line-a-minute limit, which a check's report could have used up — at the first run after a start and whenever the furthest changes (design review M-10), not every hour until the clock passes it. Each candidate is held through `HoldSuite` before any writer operation (ruling R-F1), re-read under the hold (design note 5), its metadata deleted in batches (`DeleteSuiteMetadata`), then deleted by `ReapIdleSuite`'s compare-and-delete with the current snapshot listed — all within `suiteHoldTimeout`, 5 minutes (design review M-2: a wedged writer releases the suite instead of holding it until shutdown); the held steps run in `reapHeld`, which has only the bounded context in scope, and a step the deadline cuts short is a WARN failure, the suite tried again next run. The hold is released with `release(gone)`, `gone` being `ReapIdleSuite`'s answer — settled by a fresh read after a failed submit (Task 3) — or the re-read's finding no row: that purges the lock-map entry and per-suite state and, unless live (Task 1), the flip-gate entry, and `ReapIdleSuite` the touch entry. A reap whose submit failed after its commit (`err != nil && gone`) is a reap: `suite_reaped` with `settled=true`, counted. A busy suite is skipped and retried next run. A forward step of the wall clock that no restart re-arms — the checker's wall clock running more than an hour ahead of the monotonic clock between two runs, as after a resumed VM or laptop — is reported (`clock_step_detected`, `stamp=wall_clock`) and defers reaping by the uptime floor (design review M-8); the guard also adds each detected step to `stepAhead`, saturating at `maxStepAhead`, which Task 9's marker sweep takes off its cutoff (ruling PF-13). A step that fails because the daemon is stopping logs at DEBUG, not WARN (design review M-3). Each reap counts in `acu_suites_reaped_total{reason}` (design review M-16). Each run also sweeps the adopter's reconcile memo against the current snapshots (spec C9; design note 18), whose AIDEV-NOTE said its entries were never reaped. A panic under a candidate's hold is recovered there (`freshness_check_panicked`, `where=reaper`, naming the suite): the hold is released with the cache's fresh answer (`settledGone`, since the panic may have struck after a commit), and the run goes on to its next candidate and its later duties; the run's own recover (`safeRun`) stays the backstop. Every panic line names the suite's scheme (`logPanic`'s `canonical_scheme`, and the handler's `where=t1` line), as do the reaper's busy line and its failure WARNs. The rig pins the cache's clock to `reapNow` (`pinWallclock`), so no test depends on the date it runs, and a test that compares a stamp the cache writes exactly with `reapNow` runs in a `synctest` bubble, where the pinned clock moves only with the bubble's clock (a sleep or a timer), never with the machine's speed (the final review's FW-q2). With `IdleTTL = 0` no suite row is deleted (design note 2); the memo sweep still runs. The phase B carry-forward's parked scheduler entry of a reaped suite is pinned here: its next offer flushes it. The exec review's surviving mutants X2, X5r, X6, X8, X13 and X25 get their killer tests here (ruling PF-9); X3 (the idle cutoff off by one second) needs none, since a candidate's stamp is already before the cutoff and a touch moves it to now.
 
 **Files:**
 - Create: `internal/freshness/reaper.go`, `internal/freshness/reaper_test.go`
-- Modify: `internal/freshness/reconcile.go` (`sweepReconcileMemo`), `internal/freshness/adoption.go` (the memo field's AIDEV-NOTE), `internal/freshness/metrics.go` (`acu_suites_reaped_total`), `internal/freshness/clockstep.go` (`clockStepUnlimited`, `logClockStep`), `internal/freshness/freshness.go` (`logPanic`'s `canonical_scheme`), `internal/freshness/panic_recovery_test.go`, `internal/cache/testing_helpers.go` (`SetCommittedHookForTest`), `internal/cache/single_insert_test.go` (the test-only list), `internal/handler/handler.go` (`maybeFireFreshness`'s `where=t1` line), `internal/handler/panic_recovery_test.go`
+- Modify: `internal/freshness/reconcile.go` (`sweepReconcileMemo`), `internal/freshness/adoption.go` (the memo field's AIDEV-NOTE), `internal/freshness/metrics.go` (`acu_suites_reaped_total`), `internal/freshness/clockstep.go` (`clockStepUnlimited`, `logClockStep`), `internal/freshness/freshness.go` (`logPanic`'s `canonical_scheme` and doc, `panicStackLogged`'s kinds: deferred minor E-44), `internal/freshness/panic_recovery_test.go`, `internal/cache/testing_helpers.go` (`SetCommittedHookForTest`), `internal/cache/single_insert_test.go` (the test-only list), `internal/handler/handler.go` (`maybeFireFreshness`'s `where=t1` line), `internal/handler/panic_recovery_test.go`
 
 **Interfaces:**
 - Consumes: `cache.ReapRegardless`, `(*cache.Cache).DeleteSuiteMetadata`, `ReapIdleSuite` (`(deleted, gone bool, err error)`), `ForgetSuite` (a test's other deleter) (Task 3), `HasSuiteRow`, the test seam `committedHook` (Task 2), `ListSuitesWithAdoption`, `GetSuiteFreshness`, `Dir`; `(*Checker).HoldSuite`, `clockStep`, `reportPanic`, `logPanic`, `now`, `tick`, `checkRecovered`, the fields `absentAnswered`, `refresh`; `unloggedPanic`, `clockStepTolerance`, `suiteKey`; `aptpath.IsCanonicalSuitePath`; `metrics.NewCounterWithCap`; freshness test helpers `gatedAdopter` (`suite_lock_test.go`), `lockedBuffer` (`panic_recovery_test.go`), `admitAll`, `admitNone`, `renderedMetric` (`scheduler_test.go`), `simtest.StaticConditional`.
-- Produces: `freshness.ReaperConfig{Cache *cache.Cache; Checker *Checker; IdleTTL time.Duration; Logger *slog.Logger}`, `freshness.NewReaper(cfg ReaperConfig) (*Reaper, error)`, `(*Reaper).Run(ctx context.Context)`; unexported `(*Reaper).runOnce(ctx)`, `deferredByForwardStep(now, mono time.Time) bool`, `candidates(rows, now) []reapCandidate`, `reapSuite(ctx, reapCandidate) (reaped bool)` (a candidate's panic recovered there), `reapHeld(hctx, reapCandidate) heldReap` (the held steps, on the bounded context only), `heldReap{step, err, rows, deleted, gone}`, the step names `stepReadRow`, `stepDeleteMetadata`, `stepReap`, `settledGone(key) bool`, `settleReadTimeout`, `warn(ctx, msg, args...)`, `sweepReconcileMemo(rows)`, `(*Checker).clockStepUnlimited(stamp, scheme, host, suitePath string, stored int64, now time.Time)` and `logClockStep`, the fields `interval`, `floor`, `reapHook func(context.Context, cache.SuiteKey)`, `idleTTL`, `lastWall`, `lastMono`, `deferUntil`, `reported`; `reapCandidate{key, current, requested, reason, cutoff}`; `futureStamp{key, stamp}`; `sortCandidates`; `sameSnapshot(a, b *int64) bool`; the constants `reapInterval`, `reapUptimeFloor`, `reapsPerRun`, `forwardStepSlack`, `suiteHoldTimeout`; the counter `suitesReapedTotal` (`acu_suites_reaped_total{reason}`); `(*Adopter).sweepReconcileMemo(current map[int64]bool) int`; `(*cache.Cache).SetCommittedHookForTest(fn func())`; test helpers `pinWallclock(t, at int64)` (the cache's clock pinned through `wallclock.SetOffsetForTest`, restored by `t.Cleanup`), `newReaperRig(t) *reaperRig` (fields `cache`, `adopter`, `gate`, `checker`, `reaper`, `logs`; methods `seed(suite, requested)`, `adopt(suite, anchor) int64`, `exists(suite) bool`, `events(msg) []map[string]any`), `reapKey(suite) cache.SuiteKey`, `reapedTotal(t, reason) float64`, `reapNow`, `reapDay` (`reaper_test.go`).
+- Produces: `freshness.ReaperConfig{Cache *cache.Cache; Checker *Checker; IdleTTL time.Duration; Logger *slog.Logger}`, `freshness.NewReaper(cfg ReaperConfig) (*Reaper, error)`, `(*Reaper).Run(ctx context.Context)`; unexported `(*Reaper).runOnce(ctx)`, `deferredByForwardStep(now, mono time.Time) bool`, `candidates(rows, now) []reapCandidate`, `reapSuite(ctx, reapCandidate) (reaped bool)` (a candidate's panic recovered there), `reapHeld(hctx, reapCandidate) heldReap` (the held steps, on the bounded context only), `heldReap{step, err, rows, deleted, gone}`, the step names `stepReadRow`, `stepDeleteMetadata`, `stepReap`, `settledGone(key) bool`, `settleReadTimeout`, `warn(ctx, msg, args...)`, `sweepReconcileMemo(rows)`, `(*Checker).clockStepUnlimited(stamp, scheme, host, suitePath string, stored int64, now time.Time)` and `logClockStep`, the fields `interval`, `floor`, `reapHook func(context.Context, cache.SuiteKey)`, `idleTTL`, `lastWall`, `lastMono`, `deferUntil`, `stepAhead time.Duration`, `reported`; `reapCandidate{key, current, requested, reason, cutoff}`; `futureStamp{key, stamp}`; `sortCandidates`; `runBudgets(cands []reapCandidate) []reapCandidate`; `sameSnapshot(a, b *int64) bool`; the constants `reapInterval`, `reapUptimeFloor`, `reapsPerRun` (25, the idle budget), `regardlessReapsPerRun` (250), `forwardStepSlack`, `suiteHoldTimeout`, `maxStepAhead`; the counter `suitesReapedTotal` (`acu_suites_reaped_total{reason}`); `(*Adopter).sweepReconcileMemo(current map[int64]bool) int`; `(*cache.Cache).SetCommittedHookForTest(fn func())`; test helpers `pinWallclock(t, at int64)` (the cache's clock pinned through `wallclock.SetOffsetForTest`, restored by `t.Cleanup`), `newReaperRig(t) *reaperRig` (fields `cache`, `adopter`, `gate`, `checker`, `reaper`, `logs`; methods `seed(suite, requested)`, `adopt(suite, anchor) int64`, `exists(suite) bool`, `events(msg) []map[string]any`), `reapKey(suite) cache.SuiteKey`, `reapedTotal(t, reason) float64`, `reapNow`, `reapDay` (`reaper_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3205,8 +3961,10 @@ const (
 // the real date passed them). Outside a synctest bubble the pinned clock
 // runs on in real time, so a test that compares a stamp the cache writes
 // (a marker moved up by a reap or a forget, a retirement) exactly, or
-// tightly, with reapNow runs inside a bubble, where it stands still (the
-// Task 9 re-review). No rig test may use t.Parallel.
+// tightly, with reapNow runs inside a bubble, where the pinned clock
+// moves only with the bubble's clock — a sleep or a timer — never with the
+// machine's speed (the Task 9 re-reviews). No rig test may use
+// t.Parallel.
 type reaperRig struct {
 	t       *testing.T
 	cache   *cache.Cache
@@ -3517,8 +4275,10 @@ func TestReaperCandidates_ReportsAFutureStampOnlyWhenItChanges(t *testing.T) {
 	}
 }
 
-// Spec C9: a run tries at most 25 suites, oldest last_requested_at first;
-// the next run takes the rest.
+// Spec C9: a run tries at most 25 idle suites (reapsPerRun; since ruling
+// PF-14 the suites reaped regardless of idleness have a budget of their
+// own, TestReaper_EachClassHasItsOwnBudget), oldest last_requested_at
+// first; the next run takes the rest.
 func TestReaper_AtMost25PerRunOldestFirst(t *testing.T) {
 	r := newReaperRig(t)
 	for i := range 30 {
@@ -3533,6 +4293,85 @@ func TestReaper_AtMost25PerRunOldestFirst(t *testing.T) {
 	r.reaper.runOnce(context.Background())
 	if n := len(r.events("suite_reaped")); n != 30 {
 		t.Fatalf("after two runs: %d reaped, want all 30", n)
+	}
+}
+
+// Ruling PF-14 (final review concurrency m2): the candidates reaped
+// regardless of idleness and the idle ones have budgets of their own. With
+// 251 non-canonical rows (legacy rows whose clients still ask for them)
+// and 26 idle suites, one run tries exactly regardlessReapsPerRun (250) of
+// the first, in key order, and reapsPerRun (25) of the second, the
+// oldest; the next run takes the one left of each. The first class is
+// tried first (the final fix wave's re-review, reaper minor 2): every
+// non_canonical suite_reaped line comes before every idle one. A busy
+// candidate counts against its own class's budget: with the first
+// non-canonical row held, the run tries 249 others of its class, and
+// still 25 idle ones.
+func TestReaper_EachClassHasItsOwnBudget(t *testing.T) {
+	for _, busy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("busy %v", busy), func(t *testing.T) {
+			r := newReaperRig(t)
+			ctx := context.Background()
+			row := func(suite string, requested int64) {
+				t.Helper()
+				if err := r.cache.EnsureSuiteForTest(ctx, "http", "h", suite); err != nil {
+					t.Fatal(err)
+				}
+				if err := r.cache.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h",
+					SuitePath: suite, LastRequestedAt: &requested}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			legacy := func(i int) string { return fmt.Sprintf("/legacy//dists/x%03d", i) }
+			idle := func(i int) string { return fmt.Sprintf("/r/dists/s%02d", i) }
+			for i := range 251 {
+				row(legacy(i), reapNow)
+			}
+			for i := range 26 {
+				row(idle(i), reapNow-31*reapDay-int64(26-i)) // s00 oldest
+			}
+			if busy {
+				release, ok := r.checker.HoldSuite(reapKey(legacy(0)))
+				if !ok {
+					t.Fatal("premise: the first legacy row is free")
+				}
+				defer release(false)
+			}
+			r.reaper.runOnce(ctx)
+			reasons := map[any]int{}
+			for _, ev := range r.events("suite_reaped") {
+				reasons[ev["reason"]]++
+			}
+			wantRegardless := 250 // the literals pin the constants (a mutant of one must fail)
+			if busy {
+				wantRegardless-- // the held row was tried: its class's budget paid for it
+			}
+			if reasons["non_canonical"] != wantRegardless || reasons["idle"] != 25 {
+				t.Fatalf("one run reaped %v; want %d non_canonical and 25 idle", reasons, wantRegardless)
+			}
+			var order []string
+			for _, ev := range r.events("suite_reaped") {
+				order = append(order, fmt.Sprint(ev["reason"]))
+			}
+			want := append(slices.Repeat([]string{"non_canonical"}, wantRegardless), slices.Repeat([]string{"idle"}, 25)...)
+			if !slices.Equal(order, want) {
+				t.Fatalf("suite_reaped lines in log order: the first idle one at %d of %d; want the %d non_canonical first",
+					slices.Index(order, "idle"), len(order), wantRegardless)
+			}
+			if !r.exists(legacy(250)) || !r.exists(idle(25)) {
+				t.Fatalf("the last of each class reaped by the first run (legacy %v, idle %v); want it left for the next",
+					!r.exists(legacy(250)), !r.exists(idle(25)))
+			}
+			if busy != r.exists(legacy(0)) {
+				t.Fatalf("the held legacy row exists %v; want it kept only while held", r.exists(legacy(0)))
+			}
+			if !busy {
+				r.reaper.runOnce(ctx)
+				if r.exists(legacy(250)) || r.exists(idle(25)) {
+					t.Fatal("the next run left the last of a class")
+				}
+			}
+		})
 	}
 }
 
@@ -4149,6 +4988,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"time"
 
@@ -4166,9 +5006,14 @@ const (
 	// first, so a long stop never reaps an active suite. A forward step of
 	// the wall clock defers reaping by as long (deferredByForwardStep).
 	reapUptimeFloor = time.Hour
-	// reapsPerRun bounds the suites one run tries to reap (a busy one
+	// reapsPerRun bounds the idle suites one run tries to reap (a busy one
 	// counts; it is retried next run).
 	reapsPerRun = 25
+	// regardlessReapsPerRun bounds, apart from reapsPerRun, the suites one
+	// run tries to reap regardless of idleness — non-canonical and legacy
+	// junk rows — tried before the idle ones (ruling PF-14; a busy one
+	// counts against this budget, and is retried next run).
+	regardlessReapsPerRun = 250
 	// forwardStepSlack is how far the wall clock may run ahead of the
 	// monotonic clock between two runs before the reaper takes it for a
 	// forward step (design review M-8).
@@ -4178,6 +5023,9 @@ const (
 	// bounds CommitAdoption (design review M-2): a wedged writer releases
 	// the suite after it instead of holding it until shutdown.
 	suiteHoldTimeout = 5 * time.Minute
+	// maxStepAhead is where stepAhead saturates: the largest Duration
+	// (math.MaxInt64 ns, some 292 years); see deferredByForwardStep.
+	maxStepAhead = time.Duration(math.MaxInt64)
 )
 
 // ReaperConfig configures a Reaper.
@@ -4207,10 +5055,14 @@ type Reaper struct {
 	// lastWall and lastMono are the checker's wall clock and the monotonic
 	// clock at the previous run, or at Run's start; deferUntil is the
 	// monotonic time before which a run does not reap, after a forward
-	// step of the wall clock (design review M-8). reported is the furthest
-	// future interest stamp the previous run found (design review M-10).
-	// Only the run's goroutine touches them.
+	// step of the wall clock (design review M-8); stepAhead is the sum of
+	// every forward step the guard detected — how far the wall clock ran
+	// ahead of the monotonic clock — which the marker sweep's cutoff takes
+	// off (ruling PF-13), saturating at maxStepAhead. reported is the
+	// furthest future interest stamp the previous run found (design review
+	// M-10). Only the run's goroutine touches them.
 	lastWall, lastMono, deferUntil time.Time
+	stepAhead                      time.Duration
 	reported                       futureStamp
 }
 
@@ -4284,9 +5136,10 @@ type reapCandidate struct {
 }
 
 // runOnce is one reaper run (spec C9): unless a forward step of the wall
-// clock defers it, reap at most reapsPerRun of the candidates, those
-// reaped regardless of idleness first, then the oldest; then sweep the
-// reconcile memo against the current snapshots.
+// clock defers it, reap the candidates runBudgets allows — at most
+// regardlessReapsPerRun non-canonical rows first, then at most
+// reapsPerRun idle suites, the oldest first (ruling PF-14); then sweep
+// the reconcile memo against the current snapshots.
 func (r *Reaper) runOnce(ctx context.Context) {
 	rows, err := r.cache.ListSuitesWithAdoption(ctx)
 	if err != nil {
@@ -4297,7 +5150,7 @@ func (r *Reaper) runOnce(ctx context.Context) {
 	deferred := r.deferredByForwardStep(now, time.Now())
 	if !deferred && r.idleTTL > 0 {
 		cands := r.candidates(rows, now)
-		for _, c := range cands[:min(len(cands), reapsPerRun)] {
+		for _, c := range runBudgets(cands) {
 			if ctx.Err() != nil {
 				return
 			}
@@ -4313,16 +5166,26 @@ func (r *Reaper) runOnce(ctx context.Context) {
 // clock ahead. It compares how far the wall clock (the checker's) and the
 // monotonic clock advanced since the previous run, or Run's start; when
 // the wall clock ran more than forwardStepSlack ahead it logs
-// clock_step_detected (stamp=wall_clock) and defers reaping by the uptime
+// clock_step_detected (stamp=wall_clock), defers reaping by the uptime
 // floor, giving clients the hour a restart gives them to touch their
-// suites. It reports whether this run is deferred.
+// suites, and adds the step to stepAhead, which the marker sweep's cutoff
+// takes off (ruling PF-13). It reports whether this run is deferred.
 //
 // AIDEV-NOTE: the monotonic clock does not advance while a machine is
 // suspended or a VM paused, and the wall clock does; the uptime floor
 // covers only a fresh start. The wall clock is compared in whole seconds
 // (Unix), never through time.Time.Sub, which uses the monotonic readings
 // when both values carry one. A backward step needs no guard here: a
-// future interest stamp is never idle (candidates).
+// future interest stamp is never idle (candidates). stepAhead only grows,
+// for the life of the process: a step later corrected backwards, or a
+// genuine suspend, then keeps markers longer — the safe side, since the
+// sweep's deletions are permanent and reaping's are not (a reaped suite
+// re-adopts at its next request). It saturates at maxStepAhead (the final
+// fix wave's re-review, reaper minor 3): a sum that wrapped negative would
+// put the sweep's cutoff centuries ahead and sweep every orphan marker. At
+// the bound it stays there, and the cutoff, which subtracts markerTTL and
+// stepAhead in two time.Time.Add calls (sweepMarkers), lies centuries
+// back: the sweep deletes nothing.
 func (r *Reaper) deferredByForwardStep(now, mono time.Time) bool {
 	if !r.lastMono.IsZero() {
 		elapsed := mono.Sub(r.lastMono)
@@ -4331,6 +5194,8 @@ func (r *Reaper) deferredByForwardStep(now, mono time.Time) bool {
 			r.logger.Warn("clock_step_detected", "stamp", "wall_clock",
 				"stored_unixtime", r.lastWall.Unix()+int64(elapsed/time.Second), "now_unixtime", now.Unix())
 			r.deferUntil = mono.Add(r.floor)
+			// 0 <= stepAhead <= maxStepAhead, so the difference cannot wrap.
+			r.stepAhead += min(ahead, maxStepAhead-r.stepAhead)
 		}
 	}
 	r.lastWall, r.lastMono = now, mono
@@ -4395,12 +5260,18 @@ func (r *Reaper) candidates(rows []cache.SuiteWithAdoption, now time.Time) []rea
 // oldest last_requested_at (no stamp first), then by key, so a run's
 // order is fixed.
 //
-// AIDEV-NOTE: ruling PF-4 (design review I-4). A junk suite's clients
-// touch it at every update, so by its stamp it would sort after every idle
-// suite and wait for an idle backlog to drain below reapsPerRun — days
-// after an upgrade — while it fails those clients' updates. The classes
-// reaped regardless are legacy rows, few and finite, so they cannot starve
-// idle reaping.
+// AIDEV-NOTE: rulings PF-4 (design review I-4) and PF-14 (final review
+// concurrency m2). A junk suite's clients touch it at every update, so by
+// its stamp it would sort after every idle suite and wait for an idle
+// backlog to drain — days after an upgrade — while it fails those
+// clients' updates; so the classes reaped regardless go first. PF-4
+// assumed them few; the upgraded table the docs describe (more than 5,000
+// suites from an upstream that answers missing InRelease files with an
+// HTML page) is that class, which one shared budget of 25 would drain in
+// some 200 runs with no idle reaping meanwhile. So each class has its own
+// budget (runBudgets): regardlessReapsPerRun of these, cheap reaps (no
+// snapshot; a junk suite has at most three anchor rows, a non-canonical
+// row deletes no metadata), and reapsPerRun idle suites in the same run.
 func sortCandidates(cands []reapCandidate) {
 	stamp := func(c reapCandidate) int64 {
 		if c.requested == nil {
@@ -4431,6 +5302,22 @@ func sortCandidates(cands []reapCandidate) {
 		}
 		return 0
 	})
+}
+
+// runBudgets returns the candidates one run tries, from cands in
+// sortCandidates' order (those reaped regardless of idleness first): at
+// most regardlessReapsPerRun of those, then at most reapsPerRun idle ones
+// (ruling PF-14). A try counts whether the candidate is reaped, kept or
+// busy.
+func runBudgets(cands []reapCandidate) []reapCandidate {
+	n := 0
+	for n < len(cands) && cands[n].cutoff == cache.ReapRegardless {
+		n++
+	}
+	regardless, idle := cands[:n], cands[n:]
+	out := make([]reapCandidate, 0, min(len(regardless), regardlessReapsPerRun)+min(len(idle), reapsPerRun))
+	out = append(out, regardless[:min(len(regardless), regardlessReapsPerRun)]...)
+	return append(out, idle[:min(len(idle), reapsPerRun)]...)
 }
 
 // reapSuite runs spec C9's steps for one candidate under the suite's
@@ -4753,10 +5640,15 @@ In `internal/freshness/freshness.go`, `logPanic` logs `canonical_scheme` (`Suite
 // (its scheme, host and path; empty where the panic names no suite) and
 // the panic value. The stack is attached to the first occurrence per
 // goroutine kind (where) per process only (spec C5 "log the stack once"): a
-// deterministic panic on every attempt must not flood the log. One helper
-// for every recover in the package — the checker's goroutines and the
-// adopter's heartbeat (deferred minor A-37; the handler's counterpart is
-// logGoroutinePanic, whose where=t1 line carries the same suite fields).
+// deterministic panic on every attempt must not flood the log. It is the
+// one helper for the package's recovers that log a panic — the checker's
+// (where check, scheduler, reschedule, adoption, record, repair and
+// reconcile), the adopter's heartbeat (deferred minor A-37), the reaper's
+// runs (reaper) and POST /forget (forget); the legacy trust audit
+// (legacy_audit.go) and the reconcile anchor decode (reconcile.go) turn a
+// panic into an error instead (deferred minor E-44). The handler's
+// counterpart is logGoroutinePanic, whose where=t1 line carries the same
+// suite fields.
 //
 // AIDEV-NOTE: canonical_scheme tells a suite's http copy from its https
 // copy (the Task 6 re-review's out-of-scope 1: the reaper's panic line
@@ -4769,6 +5661,15 @@ func logPanic(logger *slog.Logger, event, where string, suite SuiteRef, r any) {
 		"canonical_host", suite.CanonicalHost,
 		"suite_path", suite.SuitePath,
 		"panic", fmt.Sprint(r),
+```
+
+and `panicStackLogged`'s doc names all ten kinds (deferred minor E-44, taken under ruling PF-11):
+
+```go
+// panicStackLogged holds the kinds (logPanic's where: "adoption",
+// "record", "repair", "reconcile", "heartbeat", "check", "scheduler",
+// "reschedule", "reaper", "forget") whose stack was already logged.
+var panicStackLogged sync.Map
 ```
 
 In `internal/handler/handler.go` (`maybeFireFreshness`), the `where=t1` line, which `logGoroutinePanic` logs, carries the same suite fields (the request has its scheme at hand):
@@ -4797,6 +5698,11 @@ Expected: PASS (the reaper tests take about 5 s in all under `-race`, each well 
 | `candidates` without its non-canonical case (`… && false`) | `TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem` (`/legacy//dists/x was not reaped`), `TestReaperCandidates_NullAndFutureStampsAreNeverIdle`, `TestReaperCandidates_ReapedRegardlessGoFirst` (`"idle /legacy//dists/x"`) |
 | the idle comparison `<` → `<=` | `TestReaperCandidates_NullAndFutureStampsAreNeverIdle` (`… "idle /r/dists/edge"]`) |
 | `reapsPerRun = 30` | `TestReaper_AtMost25PerRunOldestFirst` (`after one run: s25 exists false`) |
+| PF-14: one budget for both classes again (`runOnce` over `cands[:min(len(cands), reapsPerRun)]`; the final fix wave's B1) | `TestReaper_EachClassHasItsOwnBudget` (`reaper_test.go:422`: `one run reaped map[non_canonical:25]; want 250 non_canonical and 25 idle`) |
+| `regardlessReapsPerRun = 249` (B2), `= 251` (B3) | `TestReaper_EachClassHasItsOwnBudget` (`reaper_test.go:422`) |
+| `reapsPerRun = 24` (B4), `= 26` (B5) | `TestReaper_AtMost25PerRunOldestFirst` (`reaper_test.go:365`), `TestReaper_EachClassHasItsOwnBudget` (`:422`) |
+| `runBudgets` takes the idle class first (B6) | `TestReaper_AtMost25PerRunOldestFirst` (`reaper_test.go:365`), `TestReaper_EachClassHasItsOwnBudget` (`:422`) |
+| `runBudgets`' two appends swapped: the idle ones tried before the regardless ones (the final fix wave's residual R2, B10) | `TestReaper_EachClassHasItsOwnBudget` (`reaper_test.go:437`: `suite_reaped lines in log order: the first idle one at 0 of 275; want the 250 non_canonical first`) |
 | `reapSuite` releases with `release(false)` always (`release(gone && false)`) | `TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem` (`lock map 6, flip gate 6, touch map 3 entries`), `TestReaper_DropsTheLockEntryOfASuiteGoneSinceTheListing`, `TestReaper_AReapedWaiterFlushesOnItsNextOffer` (`locks 1`) |
 | the re-read under the hold checks only the current snapshot (the stamp clause dropped) | `TestReaper_SkipsABusySuiteAndRetriesNextRun` (`a suite asked for during the run lost its anchor row`) |
 | `Run`'s first timer `r.floor` → `0` | `TestReaper_RunsAfterTheUptimeFloorThenHourly` (`reaped before the uptime floor`), `TestReaper_RecoversAPanicAndReleasesTheHold` |
@@ -4824,19 +5730,21 @@ Expected: PASS (the reaper tests take about 5 s in all under `-race`, each well 
 | a candidate's panic released with the stale `gone` (`gone, reaped = r.settledGone(c.key), false` → `reaped = false`: no fresh read) | `TestReaper_APanicAfterTheRowWentReleasesTheSuiteAsGone` (`1 lock-map entries after the panic; want the gone suite's dropped`) |
 | a candidate's panic always released as gone (`gone, reaped = true, false`) | `TestReaper_APanicWhileTheRowIsPresentKeepsTheSuitesState` (`0 lock-map entries after the panic; want the present suite's kept`) |
 
+The final fix wave's rows give each failing line as at its commit (74f6665, b73e4a2); a later commit moved some by a line or two. The `stepAhead` mutants are Task 9's (the sweep reads it).
+
 - [ ] **Step 6: Commit**
 
 ```bash
 gofmt -l internal/freshness/reaper.go internal/freshness/reaper_test.go internal/freshness/reconcile.go internal/freshness/adoption.go internal/freshness/metrics.go internal/freshness/clockstep.go internal/freshness/freshness.go internal/freshness/panic_recovery_test.go internal/cache/testing_helpers.go internal/cache/single_insert_test.go internal/handler/handler.go internal/handler/panic_recovery_test.go
 git add internal/freshness/reaper.go internal/freshness/reaper_test.go internal/freshness/reconcile.go internal/freshness/adoption.go internal/freshness/metrics.go internal/freshness/clockstep.go internal/freshness/freshness.go internal/freshness/panic_recovery_test.go internal/cache/testing_helpers.go internal/cache/single_insert_test.go internal/handler/handler.go internal/handler/panic_recovery_test.go
-git commit -m "Reap idle and non-canonical suites hourly under the suite's hold (spec C9, ruling R-F1)"
+git commit -m "Reap idle and non-canonical suites hourly under the suite's hold (spec C9, rulings R-F1 and PF-14)"
 ```
 
 (Record the mutation table in the commit message.)
 
 ### Task 7: Legacy junk rows (ruling R-F3, ruling PF-3's content rule)
 
-A v6 binary created a suite row for any anchor served with a status below 400, an HTML soft-404 included; the hot path touches the row on every such serve, so idleness never reaps it, and the hot path does not sniff. The reaper does (ruling R-F3), in every run (ruling PF-4): a suite with no current snapshot and at least one cached anchor row (`InRelease`, `Release`, `Release.gpg`), every one of them fetched at least 24 h ago (design note 8) and junk evidence, is reaped regardless of idleness (`reason` `junk`), sorted before the idle candidates (Task 6's `sortCandidates`), so an idle backlog never holds it back. Junk evidence is content, not records (ruling PF-3, design note 9): an anchor is evidence when it fails its own sniff and, for an `InRelease`, the `Release` sniff too — a plain-text Release cached as `InRelease` is the §6.1-quarantined plain-text suite phase E adopts unsigned through `Release`, so it is kept, record or none; every other sniff-failing anchor is evidence whatever the suite's record (none, `anchor_absent`, a failed adoption's, `unsigned_disabled`, `unsigned_too_large`), since an unadopted suite's cached anchor is served as cached, never revalidated. An `InRelease`'s head is read to the `Release` sniff's 64 KiB. A transient soft-404 younger than the grace survives; a missing or unreadable pool file is no evidence, nor is an anchor whose suite path the grammar does not classify (`aptpath.NotSuiteFile`: never read), and the reads that fail for another reason than a missing file are logged once per scan with their count, naming the first failure's scheme, host and path (design review M-4). Verdicts are kept by blob (design note 8): a scan reads a blob that several anchors share once, takes this scan's verdict before the last completed scan's, and keeps only the verdicts it reached, so steady-state runs read nothing. The scan checks the run's context per suite: cut short by shutdown, it returns no candidate and keeps the memo the last completed scan left. The junk query's plan is pinned: it drives from `suite_freshness` and probes `url_path` by its unique key (design review M-14). The junk evidence is not re-read under the hold, only the current snapshot (the design review's underspecified item; `junkCandidates`' AIDEV-NOTE says why that is enough). Junk reaps count in `acu_suites_reaped_total{reason="junk"}` (Task 6). The exec review's surviving X30 (the grace not pinned at its boundary) gets its killer here (ruling PF-9).
+A v6 binary created a suite row for any anchor served with a status below 400, an HTML soft-404 included; the hot path touches the row on every such serve, so idleness never reaps it, and the hot path does not sniff. The reaper does (ruling R-F3), in every run (ruling PF-4): a suite with no current snapshot and at least one cached anchor row (`InRelease`, `Release`, `Release.gpg`), every one of them fetched at least 24 h ago (design note 8) and junk evidence, is reaped regardless of idleness (`reason` `junk`), sorted before the idle candidates (Task 6's `sortCandidates`), so an idle backlog never holds it back. Junk evidence is content, not records (ruling PF-3, design note 9): an anchor is evidence when it fails its own sniff and, for an `InRelease`, the `Release` sniff too — a plain-text Release cached as `InRelease` is the §6.1-quarantined plain-text suite phase E adopts unsigned through `Release`, so it is kept, record or none; every other sniff-failing anchor is evidence whatever the suite's record (none, `anchor_absent`, a failed adoption's, `unsigned_disabled`, `unsigned_too_large`), since an unadopted suite's cached anchor is served as cached, never revalidated. An `InRelease`'s head is read to the `Release` sniff's 64 KiB. A transient soft-404 younger than the grace survives; a missing or unreadable pool file is no evidence, nor is an anchor whose suite path the grammar does not classify (`aptpath.NotSuiteFile`: never read), and the reads that fail for another reason than a missing file are logged once per scan with their count, naming the first failure's scheme, host and path (design review M-4); the count is of failed reads, not pool files — a failed read reaches no verdict, so one unreadable blob that N suites share counts once for each suite whose scan reaches it, at most N times (the final review's spec m9). Verdicts are kept by blob (design note 8): a scan reads a blob that several anchors share once, takes this scan's verdict before the last completed scan's, and keeps only the verdicts it reached, so steady-state runs read nothing. The scan checks the run's context per suite: cut short by shutdown, it returns no candidate and keeps the memo the last completed scan left. The junk query's plan is pinned: it drives from `suite_freshness` and probes `url_path` by its unique key (design review M-14). The junk evidence is not re-read under the hold, only the current snapshot (the design review's underspecified item; `junkCandidates`' AIDEV-NOTE says why that is enough). Junk reaps count in `acu_suites_reaped_total{reason="junk"}` (Task 6). The exec review's surviving X30 (the grace not pinned at its boundary) gets its killer here (ruling PF-9).
 
 **Files:**
 - Modify: `internal/cache/suite_reap.go` (`SuiteAnchorRow`, `unadoptedSuiteAnchorsSQL`, `ListUnadoptedSuiteAnchors`), `internal/freshness/reaper.go` (`junkGrace`, `sniffs`, `readHead` and `NewReaper`'s default for it, `sniffKey`, `junkCandidates`, `junkReadFailures`, `allJunk`, `anchorEvidence`; `runOnce` merges the junk candidates)
@@ -5110,6 +6018,42 @@ func TestReaper_RemembersJunkVerdictsByBlob(t *testing.T) {
 	}
 }
 
+// Spec C9 (verdicts kept "until the next scan"; the final review's tests
+// m-3): a completed scan keeps only the verdicts it reached, so the memo
+// stays bounded by the suites' current anchors. A blob the next scan no
+// longer reaches — a kept suite's anchor replaced by another blob, a junk
+// suite reaped by the run that sniffed it — leaves the memo, and the
+// blobs that scan reached stay.
+func TestReaper_ACompletedScanDropsTheVerdictsItDidNotReach(t *testing.T) {
+	r := newReaperRig(t)
+	ctx := context.Background()
+	old := reapNow - 2*reapDay
+	blob := func(suite string) sniffKey {
+		t.Helper()
+		row, err := r.cache.LookupURL(ctx, "http", "h", suite+"/InRelease")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sniffKey{file: aptpath.FileInRelease, hash: *row.BlobHash}
+	}
+	r.junkSuite("/r/dists/good")
+	r.cacheAnchor("/r/dists/good", "InRelease", string(simtest.ClearsignedFixture("Origin: x\nSHA256:\n")), old)
+	r.junkSuite("/r/dists/junk")
+	r.cacheAnchor("/r/dists/junk", "InRelease", softPage, old)
+	first, junk := blob("/r/dists/good"), blob("/r/dists/junk")
+	r.reaper.runOnce(ctx) // sniffs both; reaps the junk suite
+	if v, ok := r.reaper.sniffs[first]; !ok || v || !r.reaper.sniffs[junk] || r.exists("/r/dists/junk") {
+		t.Fatalf("premise: verdicts %v after the first run, junk suite exists %v; want the good anchor no evidence, "+
+			"the junk one evidence, the junk suite reaped", r.reaper.sniffs, r.exists("/r/dists/junk"))
+	}
+	r.cacheAnchor("/r/dists/good", "InRelease", string(simtest.ClearsignedFixture("Origin: y\nSHA256:\n")), old)
+	second := blob("/r/dists/good")
+	r.reaper.runOnce(ctx)
+	if want := map[sniffKey]bool{second: false}; !maps.Equal(r.reaper.sniffs, want) {
+		t.Fatalf("verdicts after the second run = %v; want only the replaced anchor's, %v", r.reaper.sniffs, want)
+	}
+}
+
 // Ruling R-F3, design note 8: the junk grace is 24 h — an anchor fetched
 // less than 24 h ago may still be a transient soft-404, one fetched 24 h
 // ago or earlier is junk evidence. Both sides of the boundary are pinned
@@ -5257,10 +6201,11 @@ func TestReaper_AJunkScanStopsAtShutdown(t *testing.T) {
 	}
 }
 
-// Ruling PF-4 (design review I-4): a junk suite fails its clients'
-// updates, so it is not held back by an idle backlog: with 30 idle suites
-// waiting — more than a run reaps — the junk suite, asked for just now,
-// goes in the first run.
+// Rulings PF-4 (design review I-4) and PF-14: a junk suite fails its
+// clients' updates, so it is not held back by an idle backlog: with 30
+// idle suites waiting — more than a run reaps — the junk suite, asked for
+// just now, goes in the first run, and takes none of the idle suites'
+// budget: the run reaps it and reapsPerRun idle suites.
 func TestReaper_JunkIsNotStarvedByAnIdleBacklog(t *testing.T) {
 	r := newReaperRig(t)
 	for i := range 30 {
@@ -5272,8 +6217,12 @@ func TestReaper_JunkIsNotStarvedByAnIdleBacklog(t *testing.T) {
 	if r.exists("/r/dists/junk") {
 		t.Fatal("the junk suite waited behind the idle backlog")
 	}
-	if n := len(r.events("suite_reaped")); n != reapsPerRun {
-		t.Fatalf("%d reaped, want %d", n, reapsPerRun)
+	reasons := map[any]int{}
+	for _, ev := range r.events("suite_reaped") {
+		reasons[ev["reason"]]++
+	}
+	if reasons["junk"] != 1 || reasons["idle"] != reapsPerRun || len(reasons) != 2 {
+		t.Fatalf("reaped by reason %v; want the junk suite and %d idle ones", reasons, reapsPerRun)
 	}
 }
 
@@ -5309,7 +6258,7 @@ func TestReaper_JunkReadFailuresLogOncePerScan(t *testing.T) {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test -gcflags=-e ./internal/cache/ ./internal/freshness/ -run 'TestListUnadoptedSuiteAnchors|TestReaper_ReapsLegacyJunk|TestReaper_RemembersJunkVerdicts|TestReaper_TheJunkGrace|TestReaper_JunkIs|TestReaper_JunkRead'`
+Run: `go test -gcflags=-e ./internal/cache/ ./internal/freshness/ -run 'TestListUnadoptedSuiteAnchors|TestReaper_ReapsLegacyJunk|TestReaper_RemembersJunkVerdicts|TestReaper_ACompletedScanDrops|TestReaper_TheJunkGrace|TestReaper_JunkIs|TestReaper_JunkRead'`
 Expected: cache: compile failures `c.ListUnadoptedSuiteAnchors undefined` and `undefined: unadoptedSuiteAnchorsSQL`; freshness: FAIL — `/r/dists/junk was not reaped as junk` (and `absent`, `detached`, `failing`, `disabled`), `acu_suites_reaped_total{reason="junk"} rose by 0, want 5`, `not reaped: the second run read the InRelease again instead of reusing its verdict`, `fetched 23 h ago: exists true; 25 h ago: exists true`, `the junk suite waited behind the idle backlog`, `read failure lines = [], want one with count 2`.
 
 - [ ] **Step 3: Implement**
@@ -5383,8 +6332,9 @@ In `internal/freshness/reaper.go`:
 - `Reaper` gains two last fields, after `reported` (`readHead` is a test seam: the junk tests count pool reads and end the run's context at one):
 
 ```go
-	// sniffs holds the previous run's junk verdicts by blob (ruling R-F3);
-	// only the run's goroutine touches it.
+	// sniffs holds the junk verdicts the last completed scan reached, keyed
+	// by (anchor kind, blob) (ruling R-F3); only the run's goroutine
+	// touches it.
 	sniffs map[sniffKey]bool
 	// readHead reads the head of a pool file for the junk scan (readCapped;
 	// tests count its reads or end the run's context at one).
@@ -5412,10 +6362,11 @@ type sniffKey struct {
 
 ```go
 // runOnce is one reaper run (spec C9): unless a forward step of the wall
-// clock defers it, reap at most reapsPerRun of the candidates — idle,
-// non-canonical and legacy junk (junkCandidates, every run: ruling PF-4)
-// — those reaped regardless of idleness first, then the oldest; then
-// sweep the reconcile memo against the current snapshots.
+// clock defers it, reap the candidates runBudgets allows — at most
+// regardlessReapsPerRun non-canonical and legacy junk rows
+// (junkCandidates, every run: ruling PF-4) first, then at most
+// reapsPerRun idle suites, the oldest first (ruling PF-14); then sweep
+// the reconcile memo against the current snapshots.
 func (r *Reaper) runOnce(ctx context.Context) {
 	rows, err := r.cache.ListSuitesWithAdoption(ctx)
 	if err != nil {
@@ -5428,7 +6379,7 @@ func (r *Reaper) runOnce(ctx context.Context) {
 		cands := r.candidates(rows, now)
 		cands = append(cands, r.junkCandidates(ctx, rows, cands, now)...)
 		sortCandidates(cands)
-		for _, c := range cands[:min(len(cands), reapsPerRun)] {
+		for _, c := range runBudgets(cands) {
 			if ctx.Err() != nil {
 				return
 			}
@@ -5505,7 +6456,7 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 	var out []reapCandidate
 	for i := range rows {
 		if ctx.Err() != nil {
-			return nil // a shutdown (the Task 7 review's minor 7): r.sniffs keeps the previous run's verdicts
+			return nil // a shutdown (the Task 7 review's minor 7): r.sniffs keeps the last completed scan's verdicts
 		}
 		s := &rows[i].SuiteFreshness
 		key := cache.SuiteKey{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath}
@@ -5542,10 +6493,16 @@ type junkReadFailures struct {
 // future one included: the clock-step rule), an anchor no sniff applies
 // to (aptpath.NotSuiteFile), or a pool file that is missing or does not
 // read, is no evidence; a read that fails for another reason than a
-// missing file is counted in fails. Each verdict goes into next; one this
-// run (next) or the previous run (r.sniffs) reached is reused without
-// reading the pool file again, so a run reads each blob it has not
-// sniffed once, however many suites share it (at most 64 KiB each).
+// missing file is counted in fails. Each verdict goes into next, keyed by
+// (anchor kind, blob); one this scan (next) or the last completed scan
+// (r.sniffs) reached is reused without reading the pool file again, so a
+// scan reads each blob it has not sniffed once, however many suites share
+// it (at most 64 KiB each). A failed read reaches no verdict and is not
+// remembered, so fails.n counts failed reads, not pool files: one
+// unreadable blob that N suites share is read, and counted, once for each
+// of them whose scan reaches it — at most N times, since a suite already
+// listed (a non-canonical or idle candidate), or one whose earlier anchor
+// row is no evidence, never reaches it (the WARN's count).
 func (r *Reaper) allJunk(key cache.SuiteKey, as []cache.SuiteAnchorRow, cutoff int64, next map[sniffKey]bool, fails *junkReadFailures) bool {
 	for _, a := range as {
 		if a.BlobHash == nil || a.LastFetchedAt == nil || *a.LastFetchedAt > cutoff {
@@ -5617,6 +6574,8 @@ Expected: PASS.
 | PF-3: `anchorEvidence` ignores the `Release` sniff on an `InRelease` row (its last line `return true`) | `TestReaper_ReapsLegacyJunkKeepsTransientSoft404` (`/r/dists/plain was reaped`) |
 | PF-3: an `InRelease` head read at its own 512 bytes (the `FileRelease.HeadBytes()` line dropped) | `TestReaper_ReapsLegacyJunkKeepsTransientSoft404` (`/r/dists/plain was reaped`) |
 | PF-4: `sortCandidates` by stamp only | `TestReaper_JunkIsNotStarvedByAnIdleBacklog` (`the junk suite waited behind the idle backlog`), `TestReaperCandidates_ReapedRegardlessGoFirst` |
+| PF-14: one budget for both classes again (the final fix wave's B1), or the idle class taken first (B6) | `TestReaper_JunkIsNotStarvedByAnIdleBacklog` (`reaper_junk_test.go:335` at 74f6665, `:371` now: `reaped by reason map[…]; want the junk suite and 25 idle ones`) |
+| a completed scan merges its verdicts into the memo instead of replacing it (`r.sniffs = next` → copy `next` into `r.sniffs`; the final review's tests m-3, R24) | `TestReaper_ACompletedScanDropsTheVerdictsItDidNotReach` (`reaper_junk_test.go:199`: `verdicts after the second run = …; want only the replaced anchor's …`) |
 | X30: `junkGrace = 2 * time.Hour` | `TestReaper_TheJunkGraceIsADay` (`fetched 23 h ago: exists false`) |
 | X30: `junkGrace = 48 * time.Hour` | `TestReaper_TheJunkGraceIsADay` (`25 h ago: exists true`) |
 | M-4: a WARN per failed read | `TestReaper_JunkReadFailuresLogOncePerScan` (`read failure lines = [… three …], want one with count 2`) |
@@ -5837,20 +6796,21 @@ git commit -m "Keep the coherent snapshot of an unsigned suite while adopt_unsig
 
 ### Task 9: The orphan-marker sweep (rulings R-F5, PF-1), the reaper's daily duty, and the marker stamp's one reader
 
-Spec C9 and C3: the reaper sweeps the signed-seen markers whose base has no suite row of its host — neither the base nor its `/.` twin, under either scheme (design note 13) — and whose `last_seen_at` is older than 365 days, in writer transactions of at most 1,000, whatever `gc.suite_idle_ttl` says; each delete re-checks, in its transaction, that the marker is still an orphan and still a year old (the exec review's X16/X17 killer pins both). A marker survives its suite's reap until then (`/forget`'s rule is Task 3's; every suite-row delete — cap eviction, a reap, a forget — also moves the base's markers up to the delete, design review M-9 widened by ruling PF-10, Task 3). The clock-step rule for a gate that retires things (ruling R-F5) with ruling PF-1 (design review I-1, which overrides R-F5's "healed"; deliberate deviation 3): the sweep never rewrites a stamp. A marker stamped more than 2 s in the future reads as now — never an orphan candidate — and the furthest (ties broken by key order) is reported through `clock_step_detected` (`stamp=last_seen_at`; counted, and logged directly through Task 6's `clockStepUnlimited`, not the checker's one-line-a-minute limit) at the first sweep after a start and whenever it changes (design review M-10); it ages out only once the clock has passed it. The sweep reads two clocks on purpose (the Task 9 review's Important 1): "in the future" is judged against a clock read for the sweep, since the run's own reaps stamp markers as it goes (ruling PF-10) and a run whose reaps took more than 2 s would otherwise report its own stamps as a clock step; the cutoff keeps the run's now, which the forward-step guard checked, so a step during the run cannot sweep markers the guard would have deferred. Rewriting it to now, as the draft did, deleted signed history after a backward step was corrected (`TestSweepOrphanMarkers_BackwardStepThenCorrectionSweepsNothing`). The sweep is the reaper's daily duty (design note 20 with ruling PF-4: the junk scan stays in every run, Task 7, so `TestReaper_RemembersJunkVerdictsByBlob` needs no day between its runs): it runs at the first run after a start and then a day apart (monotonic); a run the forward-step guard defers (Task 6) does not sweep and leaves the sweep due (design review M-8). The never-downgrade authority's delete sites stay pinned (design review M-5): `TestSignedSeenHasKnownDeleteSites` gains the sweep. The sweep is the stamp's reader, so deferred minor E-18 lands: `(*cache.URLPath).LastUse()` replaces the freshness and handler copies (the handler's is a mechanical replacement, ruling PD-1); and E-20: a test that every sighting advances the stamp. E-40's `types.go` part (the `SuiteWithAdoption` doc) rides along. The exec review's surviving X31 (the TTL not pinned at its boundary) gets its killer here (ruling PF-9).
+Spec C9 and C3: the reaper sweeps the signed-seen markers whose base has no suite row of its host — neither the base nor its `/.` twin, under either scheme (design note 13) — and whose `last_seen_at` is older than 365 days, in writer transactions of at most 1,000, whatever `gc.suite_idle_ttl` says; each delete re-checks, in its transaction, that the marker is still an orphan and still a year old (the exec review's X16/X17 killer pins both). A marker survives its suite's reap until then (`/forget`'s rule is Task 3's; every suite-row delete — cap eviction, a reap, a forget — also moves the base's markers up to the delete, design review M-9 widened by ruling PF-10, Task 3). The clock-step rule for a gate that retires things (ruling R-F5) with ruling PF-1 (design review I-1, which overrides R-F5's "healed"; deliberate deviation 3): the sweep never rewrites a stamp. A marker stamped more than 2 s in the future reads as now — never an orphan candidate — and the furthest (ties broken by key order) is reported through `clock_step_detected` (`stamp=last_seen_at`; counted, and logged directly through Task 6's `clockStepUnlimited`, not the checker's one-line-a-minute limit) at the first sweep after a start — a day after it — and whenever it changes (design review M-10); it ages out only once the clock has passed it. The sweep reads two clocks on purpose (the Task 9 review's Important 1): "in the future" is judged against a clock read for the sweep, since the run's own reaps stamp markers as it goes (ruling PF-10) and a run whose reaps took more than 2 s would otherwise report its own stamps as a clock step; the cutoff keeps the run's now, which the forward-step guard checked, so a step during the run cannot sweep markers the guard would have deferred. A detected forward step never ages a marker (ruling PF-13, the final review's concurrency I1): the cutoff is now − `stepAhead` − 365 days, `stepAhead` being the sum of the forward steps Task 6's guard detected since `Run` started (it only grows, saturating at `maxStepAhead`; the cutoff subtracts the two in two `time.Time.Add` calls, which cannot wrap), since the guard's hour protects suites, which clients touch, not orphan markers, which no client refreshes, and a swept marker cannot come back. Rewriting it to now, as the draft did, deleted signed history after a backward step was corrected (`TestSweepOrphanMarkers_BackwardStepThenCorrectionSweepsNothing`). The sweep is the reaper's daily duty (design note 20 with ruling PF-4: the junk scan stays in every run, Task 7, so `TestReaper_RemembersJunkVerdictsByBlob` needs no day between its runs): its first run is due one `dailyEvery` after `Run` starts (`Run` sets `dailyAt` to its start: ruling PF-13 — a start with the wall clock ahead, which the guard cannot see, has a day to be corrected), then a day apart (monotonic); a `runOnce` outside `Run`, as the unit tests call it, finds it due; a run the forward-step guard defers (Task 6) does not sweep and leaves the sweep due (design review M-8). The rule's costs, as ruled: a daemon restarted at least once a day (before its first sweep comes due) never sweeps — orphan markers are tiny rows, the safe side — and a wrong step that outlives a restart uncorrected for a day still ages markers by it. The never-downgrade authority's delete sites stay pinned (design review M-5): `TestSignedSeenHasKnownDeleteSites` gains the sweep. The sweep is the stamp's reader, so deferred minor E-18 lands: `(*cache.URLPath).LastUse()` replaces the freshness and handler copies (the handler's is a mechanical replacement, ruling PD-1); and E-20: a test that every sighting advances the stamp. E-40's `types.go` part (the `SuiteWithAdoption` doc) rides along. The exec review's surviving X31 (the TTL not pinned at its boundary) gets its killer here (ruling PF-9).
 
 **Files:**
-- Create: `internal/cache/marker_sweep.go`, `internal/cache/marker_sweep_test.go`, `internal/freshness/reaper_markers_test.go`
+- Create: `internal/cache/marker_sweep.go`, `internal/freshness/reaper_markers_test.go`
+- Modify (test): `internal/cache/marker_sweep_test.go` (Task 3 created it with `markerStamp`)
 - Modify (test): `internal/freshness/reaper_test.go` (Task 6's `TestReaper_APanicSkipsOnlyItsCandidate`, which checks the marker sweep)
-- Modify: `internal/cache/types.go` (`URLPath.LastUse`, `SuiteWithAdoption`'s doc), `internal/cache/single_insert_test.go` (`TestSignedSeenHasKnownDeleteSites`), `internal/freshness/unsigned.go` (`anchorLastUse` removed), `internal/handler/suite_rows.go` (`lastUse` removed; mechanical), `internal/freshness/reaper.go` (`markerTTL`, `dailyEvery`, `dailyAt`, `reportedMarker`, `sweepMarkers`, `runOnce`)
+- Modify: `internal/cache/types.go` (`URLPath.LastUse`, `SuiteWithAdoption`'s doc), `internal/cache/single_insert_test.go` (`TestSignedSeenHasKnownDeleteSites`), `internal/freshness/unsigned.go` (`anchorLastUse` removed), `internal/handler/suite_rows.go` (`lastUse` removed; mechanical), `internal/freshness/reaper.go` (`markerTTL`, `dailyEvery`, `dailyAt`, `reportedMarker`, `Run`'s `dailyAt`, `sweepMarkers`, `runOnce`)
 
 **Interfaces:**
-- Consumes: `cache.SignedSeenMark`, `MarkSignedSeenBatch`, `SignedSeen`, `futureStampSlack` (Task 2), `submitWrite`; `(*Checker).clockStep`, the field `now`; Task 6's `Reaper`, `runOnce`, `deferredByForwardStep`, `warn`, `(*Checker).clockStepUnlimited`, `reaperRig` (`seed`, `exists`, `events`), `pinWallclock`, `reapNow`, `reapDay`; `renderedMetric` (`scheduler_test.go`); the retry rig (`newRetryRig`, `release`, `up`, `ver.reject`, `check`, `clock`), `contentKey`, `adoptionFormInline`; cache test helpers `openCache`, `seedRow`, `sk`, `productionGoFiles`, `stringLiterals`, `deleteSignedSeenRE`.
-- Produces: `(*cache.URLPath).LastUse() int64`; `cache.MarkerSweep{Swept int; Furthest *SignedSeenMark}`, `(*cache.Cache).SweepOrphanMarkers(ctx, now, cutoff int64) (MarkerSweep, error)`, the unexported `orphanMarkers`, `deleteOrphanMarkers`, `orphanSuiteRowSQL`, `markerSweepBatch`; the INFO event `signed_seen_markers_swept` (`count`); `clock_step_detected` with `stamp=last_seen_at`; unexported `markerTTL`, `dailyEvery`, the `Reaper` fields `dailyAt time.Time` (tests zero it to force the sweep) and `reportedMarker cache.SignedSeenMark`, `(*Reaper).sweepMarkers(ctx, now, fresh time.Time)` (the run's now for the cutoff, a fresh clock read for the future threshold); test helpers `putMarks`, `markerStamp`, `sweepNow`, `sweepYear` (`marker_sweep_test.go`), `(*reaperRig).markerAt(base) int64`, `(*reaperRig).mark(base string, at int64)`, `clockStepsCounted() float64` (`reaper_markers_test.go`).
+- Consumes: `cache.SignedSeenMark`, `MarkSignedSeenBatch`, `SignedSeen`, `futureStampSlack` (Task 2), `submitWrite`; `(*Checker).clockStep`, the field `now`; Task 6's `Reaper`, `Run`, `runOnce`, `deferredByForwardStep`, the field `stepAhead` and `maxStepAhead`, `warn`, `(*Checker).clockStepUnlimited`, `reaperRig` (`seed`, `exists`, `events`), `pinWallclock`, `reapNow`, `reapDay`; `renderedMetric` (`scheduler_test.go`); the retry rig (`newRetryRig`, `release`, `up`, `ver.reject`, `check`, `clock`), `contentKey`, `adoptionFormInline`; cache test helpers `openCache`, `seedRow`, `sk`, `productionGoFiles`, `stringLiterals`, `deleteSignedSeenRE`.
+- Produces: `(*cache.URLPath).LastUse() int64`; `cache.MarkerSweep{Swept int; Furthest *SignedSeenMark}`, `(*cache.Cache).SweepOrphanMarkers(ctx, now, cutoff int64) (MarkerSweep, error)`, the unexported `orphanMarkers`, `deleteOrphanMarkers`, `orphanSuiteRowSQL`, `markerSweepBatch`; the INFO event `signed_seen_markers_swept` (`count`); `clock_step_detected` with `stamp=last_seen_at`; unexported `markerTTL`, `dailyEvery`, the `Reaper` fields `dailyAt time.Time` (tests zero it to force the sweep) and `reportedMarker cache.SignedSeenMark`, `(*Reaper).sweepMarkers(ctx, now, fresh time.Time)` (the run's now, less `stepAhead`, for the cutoff, a fresh clock read for the future threshold); `(*reaperRig).runReaper(t)` (`reaper_markers_test.go`); test helpers `putMarks`, `sweepNow`, `sweepYear` (`marker_sweep_test.go`, beside Task 3's `markerStamp`), `(*reaperRig).markerAt(base) int64`, `(*reaperRig).mark(base string, at int64)`, `clockStepsCounted() float64` (`reaper_markers_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `internal/cache/marker_sweep_test.go`:
+`internal/cache/marker_sweep_test.go` (Task 3 created it with `markerStamp`) becomes:
 
 ```go
 package cache
@@ -6092,6 +7052,7 @@ package freshness
 import (
 	"context"
 	"maps"
+	"math"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -6129,8 +7090,9 @@ func (r *reaperRig) mark(base string, at int64) {
 // in the future reads as now: it is kept as it is — never rewritten
 // (ruling PF-1) — and reported as clock_step_detected (stamp
 // last_seen_at). The sweep runs with gc.suite_idle_ttl = 0s too. Inside
-// a synctest bubble the rig's pinned clock stands still, so the reap's
-// stamp is exactly reapNow.
+// a synctest bubble the rig's pinned clock moves only with the bubble's
+// clock, and this test sleeps nowhere, so the reap's stamp is exactly
+// reapNow.
 func TestReaper_SweepsOrphanMarkersAndKeepsFutureStamps(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
@@ -6238,42 +7200,211 @@ func TestReaper_ClockStepReportsBypassTheRateLimit(t *testing.T) {
 	}
 }
 
-// Spec C9: the orphan-marker TTL is 365 days — an orphan seen 364 days
-// ago is kept, one seen 366 days ago is swept.
+// Spec C9: the orphan-marker TTL is 365 days, to the second (the final
+// review's tests m-4): an orphan last seen exactly 365 days before the
+// run is kept — the cutoff is strict — and one seen a second earlier is
+// swept.
 func TestReaper_TheMarkerTTLIsAYear(t *testing.T) {
 	r := newReaperRig(t)
-	r.mark("/kept/dists/s", reapNow-364*reapDay)
-	r.mark("/gone/dists/s", reapNow-366*reapDay)
+	r.mark("/kept/dists/s", reapNow-365*reapDay)
+	r.mark("/gone/dists/s", reapNow-365*reapDay-1)
 	r.reaper.runOnce(context.Background())
 	if r.markerAt("/kept/dists/s") == -1 || r.markerAt("/gone/dists/s") != -1 {
-		t.Fatalf("seen 364 days ago: %d; 366 days ago: %d; want kept and swept",
+		t.Fatalf("seen 365 days ago: %d; 365 days and a second ago: %d; want kept and swept",
 			r.markerAt("/kept/dists/s"), r.markerAt("/gone/dists/s"))
 	}
 }
 
-// Design note 20 (ruling PF-4): the marker sweep is the run's daily duty
-// — at the first run after a start, then a day apart — while the hourly
-// runs reap: an orphan a year old is swept at the first run; another
-// found an hour later waits for the run a day after the first.
-func TestReaper_DailyDutiesRunAtStartAndADayApart(t *testing.T) {
+// runReaper starts r's reaper under a context the test's end cancels,
+// waiting for Run to return.
+func (r *reaperRig) runReaper(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.reaper.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+}
+
+// Design note 20, ruling PF-13 (final review concurrency I1): the marker
+// sweep is the run's daily duty — due one dailyEvery after Run starts,
+// not at the first run (a wrong boot clock has a day to be corrected),
+// then a day after the previous sweep — while the hourly runs reap. A
+// year-old orphan is kept by the runs 1 h to 23 h after the start and
+// swept by the run at 24 h; another, marked then, is kept by the runs up
+// to 23 h after that sweep and swept by the one a day after it, so
+// dailyEvery is pinned to the run (the final review's tests m-4).
+func TestReaper_TheMarkerSweepIsDueADayAfterTheStartThenDaily(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newReaperRig(t)
+		r.mark("/first/dists/s", reapNow-366*reapDay)
+		r.runReaper(t)
+		time.Sleep(23*time.Hour + time.Second) // the runs at 1 h … 23 h
+		if r.markerAt("/first/dists/s") == -1 {
+			t.Fatal("swept within a day of the start: the first sweep is due a day after Run starts")
+		}
+		time.Sleep(time.Hour) // the run at 24 h
+		if r.markerAt("/first/dists/s") != -1 {
+			t.Fatal("the run a day after the start did not sweep")
+		}
+		r.mark("/later/dists/s", reapNow-366*reapDay)
+		time.Sleep(23 * time.Hour) // the runs at 25 h … 47 h
+		if r.markerAt("/later/dists/s") == -1 {
+			t.Fatal("a run 23 h after the last sweep swept: the sweep is a daily duty")
+		}
+		time.Sleep(time.Hour) // the run at 48 h
+		if r.markerAt("/later/dists/s") != -1 {
+			t.Fatal("the run a day after the last sweep did not sweep")
+		}
+	})
+}
+
+// Ruling PF-13 (final review concurrency I1, its probe (a)): a start with
+// the wall clock ahead — an RTC or NTP fault before the start, which the
+// forward-step guard cannot see — has a day to be corrected before the
+// first marker sweep. The clock starts 200 days ahead and is put right
+// 23 hours later: no run sweeps the orphan last seen 200 days ago (400
+// days by the wrong clock), and the first sweep, a day after the start,
+// keeps it and still sweeps an orphan a year old.
+func TestReaper_AClockAheadAtStartHasADayToBeCorrected(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newReaperRig(t)
+		var ahead atomic.Int64
+		ahead.Store(200 * reapDay)
+		start := time.Now()
+		r.checker.now = func() time.Time { return time.Unix(reapNow+ahead.Load(), 0).Add(time.Since(start)) }
+		r.mark("/orphan/dists/s", reapNow-200*reapDay)
+		r.mark("/old/dists/s", reapNow-366*reapDay)
+		r.runReaper(t)
+		time.Sleep(time.Hour + time.Second) // the first run
+		if r.markerAt("/orphan/dists/s") == -1 {
+			t.Fatal("an orphan 200 days old was swept an hour after a start whose wall clock was 200 days ahead")
+		}
+		time.Sleep(22 * time.Hour) // the runs up to 23 h
+		if r.markerAt("/orphan/dists/s") == -1 {
+			t.Fatal("an orphan 200 days old was swept within a day of a start whose wall clock was 200 days ahead")
+		}
+		ahead.Store(0)        // the clock is put right: a backward step, which needs no guard
+		time.Sleep(time.Hour) // the run at 24 h sweeps
+		if r.markerAt("/orphan/dists/s") == -1 {
+			t.Fatal("the first sweep, after the clock was corrected, swept an orphan 200 days old")
+		}
+		if r.markerAt("/old/dists/s") != -1 {
+			t.Fatal("the first sweep, a day after the start, kept an orphan a year old")
+		}
+	})
+}
+
+// Ruling PF-13 (its probe (b)): a wrong forward step of 70 days while the
+// daemon runs never ages a marker. The guard detects it, and the sweeps
+// after it take it off their cutoff (stepAhead): an orphan 300 days old,
+// which looks 370 days old and more by the stepped clock, is kept by the
+// three daily sweeps that follow, while a year-old orphan is swept.
+func TestReaper_AForwardStepWhileRunningAgesNoMarker(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newReaperRig(t)
+		var step atomic.Int64
+		start := time.Now()
+		r.checker.now = func() time.Time { return time.Unix(reapNow+step.Load(), 0).Add(time.Since(start)) }
+		r.mark("/orphan/dists/s", reapNow-300*reapDay)
+		r.mark("/old/dists/s", reapNow-366*reapDay)
+		r.runReaper(t)
+		time.Sleep(12*time.Hour + time.Second) // the runs at 1 h … 12 h
+		step.Store(70 * reapDay)               // a wrong forward step of 70 days
+		time.Sleep(3 * 24 * time.Hour)         // the sweeps at 24 h, 48 h and 72 h
+		if ev := r.events("clock_step_detected"); len(ev) != 1 || ev[0]["stamp"] != "wall_clock" {
+			t.Fatalf("clock_step_detected = %v, want one with stamp=wall_clock", ev)
+		}
+		if r.markerAt("/old/dists/s") != -1 {
+			t.Fatal("the sweeps after the step kept an orphan a year old")
+		}
+		if r.markerAt("/orphan/dists/s") == -1 {
+			t.Fatal("an orphan 303 days old by the monotonic count was swept after a forward step of 70 days")
+		}
+	})
+}
+
+// Ruling PF-13 (the final fix wave's re-review, reaper minor 1): stepAhead
+// adds up every forward step the guard detects, so a later step never
+// makes the sweeps forget an earlier one. Two wrong forward steps of 40
+// days each, seen by the runs at 13 h and 37 h, leave stepAhead at
+// exactly 80 days. An orphan 340 days old at the start — 343 by the
+// monotonic count at the sweep at 72 h, 423 by the stepped clock, and 383
+// with only the last step taken off — is kept by the sweeps at 24 h, 48 h
+// and 72 h, while a year-old orphan is swept.
+func TestReaper_ForwardStepsAddUp(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newReaperRig(t)
+		var step atomic.Int64
+		start := time.Now()
+		r.checker.now = func() time.Time { return time.Unix(reapNow+step.Load(), 0).Add(time.Since(start)) }
+		r.mark("/orphan/dists/s", reapNow-340*reapDay)
+		r.mark("/old/dists/s", reapNow-366*reapDay)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { r.reaper.Run(ctx); close(done) }()
+		time.Sleep(12*time.Hour + time.Second) // the runs at 1 h … 12 h
+		step.Store(40 * reapDay)               // the first step, seen by the run at 13 h
+		time.Sleep(24 * time.Hour)             // the sweep at 24 h
+		step.Store(80 * reapDay)               // the second, seen by the run at 37 h
+		time.Sleep(36 * time.Hour)             // the sweeps at 48 h and 72 h
+		cancel()
+		<-done
+		var steps int
+		for _, ev := range r.events("clock_step_detected") {
+			if ev["stamp"] == "wall_clock" {
+				steps++
+			}
+		}
+		if steps != 2 || r.reaper.stepAhead != 80*24*time.Hour {
+			t.Fatalf("%d forward steps detected, stepAhead %v; want 2 and 1920h0m0s (both steps)", steps, r.reaper.stepAhead)
+		}
+		if r.markerAt("/old/dists/s") != -1 {
+			t.Fatal("the sweeps after the steps kept an orphan a year old")
+		}
+		if r.markerAt("/orphan/dists/s") == -1 {
+			t.Fatal("an orphan 343 days old by the monotonic count was swept after two forward steps of 40 days")
+		}
+	})
+}
+
+// The final fix wave's re-review (reaper minor 3): stepAhead saturates. A
+// detected step adds to it without wrapping; at the bound — maxStepAhead,
+// the largest Duration, some 292 years — it stays there, and the sweep's
+// cutoff does not overflow. Seeded an hour short of the bound, stepAhead
+// takes one more detected step, of 70 days, and stays at the bound; the
+// sweep that follows deletes no orphan marker, neither one a day old nor
+// one two years old (a stepAhead wrapped negative, or a cutoff computed as
+// one overflowing Duration sum, puts the cutoff centuries ahead and sweeps
+// both). With stepAhead back at zero, the next sweep deletes the
+// two-year-old one: the sweeps ran.
+func TestReaper_StepAheadSaturates(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
 		r := newReaperRig(t)
-		r.mark("/first/dists/s", reapNow-366*reapDay)
-		r.reaper.runOnce(ctx)
-		if r.markerAt("/first/dists/s") != -1 {
-			t.Fatal("the first run after a start did not sweep")
+		r.mark("/young/dists/s", reapNow-reapDay)
+		r.mark("/old/dists/s", reapNow-2*365*reapDay)
+		r.reaper.stepAhead = math.MaxInt64 - time.Hour
+		// The previous run's readings: the wall clock (the rig's checker, at
+		// reapNow) has since run 70 days further than the monotonic clock.
+		r.reaper.lastWall, r.reaper.lastMono = time.Unix(reapNow-70*reapDay, 0), time.Now()
+		r.reaper.runOnce(ctx) // detects the step: deferred, no sweep
+		if ev := r.events("clock_step_detected"); len(ev) != 1 || ev[0]["stamp"] != "wall_clock" {
+			t.Fatalf("clock_step_detected = %v, want one with stamp=wall_clock", ev)
 		}
-		r.mark("/later/dists/s", reapNow-366*reapDay)
-		time.Sleep(time.Hour)
-		r.reaper.runOnce(ctx)
-		if r.markerAt("/later/dists/s") == -1 {
-			t.Fatal("an hourly run swept: the sweep is a daily duty")
+		if r.reaper.stepAhead != math.MaxInt64 {
+			t.Fatalf("stepAhead = %d ns after a step at an hour short of the bound; want it saturated at %d",
+				int64(r.reaper.stepAhead), int64(math.MaxInt64))
 		}
-		time.Sleep(23 * time.Hour)
+		time.Sleep(r.reaper.floor) // the deferral ends
+		r.reaper.runOnce(ctx)      // the sweep: due (dailyAt is zero outside Run)
+		if r.markerAt("/young/dists/s") == -1 || r.markerAt("/old/dists/s") == -1 {
+			t.Fatalf("the sweep at the bound deleted orphans (a day old: %d, two years old: %d; -1: swept); want none",
+				r.markerAt("/young/dists/s"), r.markerAt("/old/dists/s"))
+		}
+		r.reaper.stepAhead, r.reaper.dailyAt = 0, time.Time{}
 		r.reaper.runOnce(ctx)
-		if r.markerAt("/later/dists/s") != -1 {
-			t.Fatal("the run a day after the first did not sweep")
+		if r.markerAt("/young/dists/s") == -1 || r.markerAt("/old/dists/s") != -1 {
+			t.Fatal("with stepAhead zero, the sweep did not delete just the two-year-old orphan")
 		}
 	})
 }
@@ -6304,10 +7435,15 @@ func TestReaper_ReportsAFutureMarkerOnlyWhenItChanges(t *testing.T) {
 	}
 }
 
-// Design review M-8: the forward-step guard defers the marker sweep too.
-// A daily sweep whose run sees the wall clock jump ten days — enough to
-// make an orphan five days short of the TTL look a year old — does not
-// sweep; the sweep stays due and runs an uptime floor later.
+// Design review M-8 and ruling PF-13 (final review concurrency I1): the
+// forward-step guard defers the marker sweep, and a detected step never
+// ages a marker. The run due to sweep a day after the start sees the wall
+// clock jump ten days — enough to make an orphan five days short of the
+// TTL look a year old — and does not sweep; the sweep stays due and runs
+// an uptime floor later (25 h), then daily, each taking the step off its
+// cutoff (stepAhead). So the orphan, 360 days old at the start, is kept
+// until the monotonic clock has aged it past the year: kept by the sweep
+// at 97 h (364 days), swept by the one at 121 h (365 days and an hour).
 func TestReaper_AForwardStepDefersTheMarkerSweep(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newReaperRig(t)
@@ -6315,23 +7451,20 @@ func TestReaper_AForwardStepDefersTheMarkerSweep(t *testing.T) {
 		start := time.Now()
 		r.checker.now = func() time.Time { return time.Unix(reapNow+step.Load(), 0).Add(time.Since(start)) }
 		r.mark("/orphan/dists/s", reapNow-360*reapDay)
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan struct{})
-		go func() { r.reaper.Run(ctx); close(done) }()
-		defer func() { cancel(); <-done }()
-		time.Sleep(time.Hour + time.Second) // the first run, at the floor, sweeps: 360 days is not a year
-		if r.markerAt("/orphan/dists/s") == -1 {
-			t.Fatal("swept before the step")
+		r.runReaper(t)
+		time.Sleep(23*time.Hour + time.Second) // the hourly runs to just before the first daily one
+		step.Store(10 * reapDay)               // the wall clock jumps ten days
+		time.Sleep(time.Hour)                  // the run at 24 h sees the step
+		if ev := r.events("clock_step_detected"); len(ev) != 1 || ev[0]["stamp"] != "wall_clock" {
+			t.Fatalf("clock_step_detected = %v, want one with stamp=wall_clock", ev)
 		}
-		time.Sleep(23 * time.Hour) // through the hourly runs to just before the next daily one
-		step.Store(10 * reapDay)   // the wall clock jumps ten days
-		time.Sleep(time.Hour)
+		time.Sleep(73 * time.Hour) // the sweeps at 25 h, 49 h, 73 h and 97 h
 		if r.markerAt("/orphan/dists/s") == -1 {
-			t.Fatal("swept by the run that saw the forward step")
+			t.Fatal("an orphan was swept before the monotonic clock aged it a year: the forward step aged it")
 		}
-		time.Sleep(time.Hour)
+		time.Sleep(24 * time.Hour) // the sweep at 121 h
 		if r.markerAt("/orphan/dists/s") != -1 {
-			t.Fatal("not swept an uptime floor after the step")
+			t.Fatal("an orphan aged past the year by the monotonic clock was kept")
 		}
 	})
 }
@@ -6421,7 +7554,7 @@ func TestReaper_APanicSkipsOnlyItsCandidate(t *testing.T) {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test -gcflags=-e ./internal/cache/ ./internal/freshness/ -run 'TestSweepOrphanMarkers|TestDeleteOrphanMarkers|TestURLPath_LastUse|TestSignedSeenHasKnownDeleteSites|TestReaper_SweepsOrphanMarkers|TestReaper_TheMarkerTTL|TestReaper_DailyDuties|TestReaper_ReportsAFutureMarker|TestReaper_AForwardStepDefersTheMarkerSweep|TestCheck_EverySightingAdvancesTheMarkerStamp'`
+Run: `go test -gcflags=-e ./internal/cache/ ./internal/freshness/ -run 'TestSweepOrphanMarkers|TestDeleteOrphanMarkers|TestURLPath_LastUse|TestSignedSeenHasKnownDeleteSites|TestReaper_SweepsOrphanMarkers|TestReaper_TheMarkerTTL|TestReaper_TheMarkerSweepIsDue|TestReaper_AClockAheadAtStart|TestReaper_AForwardStepWhileRunning|TestReaper_ForwardStepsAddUp|TestReaper_StepAheadSaturates|TestReaper_ReportsAFutureMarker|TestReaper_AForwardStepDefersTheMarkerSweep|TestCheck_EverySightingAdvancesTheMarkerStamp'`
 Expected: cache: compile failures `(&URLPath{…}).LastUse undefined`, `c.SweepOrphanMarkers undefined`, `c.orphanMarkers undefined`, `c.deleteOrphanMarkers undefined`; freshness: compile failures `r.reaper.dailyAt undefined`. (Once `dailyAt` exists, `TestCheck_EverySightingAdvancesTheMarkerStamp` passes alone: it pins phase E's writer, deferred minor E-20.)
 
 - [ ] **Step 3: Implement**
@@ -6629,7 +7762,7 @@ DELETE FROM suite_signed_seen
 }
 ```
 
-In `internal/freshness/reaper.go`, the constant block gains, after `junkGrace`:
+In `internal/freshness/reaper.go`, the constant block gains, after `junkGrace` (before Task 6's `maxStepAhead`):
 
 ```go
 	// markerTTL is spec C9's orphan-marker TTL: a signed-seen marker no
@@ -6637,38 +7770,65 @@ In `internal/freshness/reaper.go`, the constant block gains, after `junkGrace`:
 	// once it was last seen this long ago.
 	markerTTL = 365 * 24 * time.Hour
 	// dailyEvery is how often a run also sweeps the orphan markers (design
-	// note 20, ruling PF-4): at the first run after a start, then a day
-	// apart (monotonic).
+	// note 20, ruling PF-4): the first sweep is due one dailyEvery after
+	// Run starts (ruling PF-13: a wrong boot clock has a day to be
+	// corrected), then a day apart (monotonic).
 	dailyEvery = 24 * time.Hour
 ```
 
 `Reaper` gains, after `readHead`:
 
 ```go
-	// dailyAt is when the marker sweep last ran (monotonic; zero: due);
-	// reportedMarker is the marker stamped furthest in the future that the
-	// previous sweep found (design review M-10). Only the run's goroutine
-	// touches them; tests zero dailyAt to force a sweep.
+	// dailyAt is when the marker sweep last ran, or when Run started
+	// (monotonic; zero: due — a run outside Run); reportedMarker is the
+	// marker stamped furthest in the future that the previous sweep found
+	// (design review M-10). Only the run's goroutine touches them; tests
+	// zero dailyAt to force a sweep.
 	dailyAt        time.Time
 	reportedMarker cache.SignedSeenMark
+```
+
+`Run` starts the day at its start (ruling PF-13, the final review's concurrency I1: the first sweep is due one `dailyEvery` after `Run` starts, not at the first run, so a boot clock that is ahead has a day to be corrected; a `runOnce` outside `Run`, as the unit tests call it, still finds the sweep due); its doc and first lines become:
+
+```go
+// Run runs the reaper until ctx ends: the first run once the uptime floor
+// has passed, then one every interval after the previous run finished;
+// the first marker sweep is due one dailyEvery after Run starts (ruling
+// PF-13). A panic while a suite is held is recovered per candidate
+// (reapSuite); each run also recovers any other panic of its own (logged,
+// freshness_check_panicked with where=reaper), so the next run still
+// comes.
+func (r *Reaper) Run(ctx context.Context) {
+	r.lastWall, r.lastMono = r.checker.now(), time.Now()
+	r.dailyAt = r.lastMono
 ```
 
 `runOnce` becomes:
 
 ```go
 // runOnce is one reaper run (spec C9): unless a forward step of the wall
-// clock defers it, reap at most reapsPerRun of the candidates — idle,
-// non-canonical and legacy junk (junkCandidates, every run: ruling PF-4)
-// — those reaped regardless of idleness first, then the oldest, and,
-// when a day has passed since it last ran, sweep the orphan signed-seen
-// markers (sweepMarkers); then sweep the reconcile memo against the
-// current snapshots.
+// clock defers it, reap the candidates runBudgets allows — at most
+// regardlessReapsPerRun non-canonical and legacy junk rows
+// (junkCandidates, every run: ruling PF-4) first, then at most
+// reapsPerRun idle suites, the oldest first (ruling PF-14) — and,
+// when a day has passed since it last ran (or since Run started), sweep
+// the orphan signed-seen markers (sweepMarkers); then sweep the reconcile
+// memo against the current snapshots.
 //
-// AIDEV-NOTE: design note 20, ruling PF-4. Only the marker sweep is
-// daily: it works in years (its 365-day TTL) and costs a writer
-// transaction per batch. A run the forward-step guard defers neither
-// reaps nor sweeps, and leaves the sweep due for the next run (design
-// review M-8): a step makes markers look older too.
+// AIDEV-NOTE: design note 20, rulings PF-4 and PF-13. Only the marker
+// sweep is daily: it works in years (its 365-day TTL) and costs a writer
+// transaction per batch. Its first run is due a day after Run starts, not
+// at the first run (PF-13): a start with the wall clock ahead (an RTC or
+// NTP fault before the start, which the guard cannot see) would make
+// orphan markers look older, and a swept marker cannot come back, so a
+// wrong boot clock has a day to be corrected. The cost: a daemon
+// restarted at least once a day (before its first sweep comes due) never
+// sweeps (orphan markers are tiny rows; the safe side), and a wrong step
+// that outlives a restart uncorrected for a day still ages markers by it
+// (documented residual). A run the forward-step guard defers neither reaps
+// nor sweeps, and leaves the sweep due for the next run (design review
+// M-8); a detected step no longer ages markers at all (stepAhead,
+// sweepMarkers).
 func (r *Reaper) runOnce(ctx context.Context) {
 	rows, err := r.cache.ListSuitesWithAdoption(ctx)
 	if err != nil {
@@ -6681,7 +7841,7 @@ func (r *Reaper) runOnce(ctx context.Context) {
 		cands := r.candidates(rows, now)
 		cands = append(cands, r.junkCandidates(ctx, rows, cands, now)...)
 		sortCandidates(cands)
-		for _, c := range cands[:min(len(cands), reapsPerRun)] {
+		for _, c := range runBudgets(cands) {
 			if ctx.Err() != nil {
 				return
 			}
@@ -6700,8 +7860,9 @@ and after it:
 
 ```go
 // sweepMarkers runs spec C9's orphan-marker sweep (ruling R-F5,
-// cache.SweepOrphanMarkers) with the cutoff now − markerTTL, now being the
-// run's: it deletes the orphans last seen before the cutoff, logging
+// cache.SweepOrphanMarkers) with the cutoff now − stepAhead − markerTTL,
+// now being the run's and stepAhead the forward steps the guard detected
+// (ruling PF-13): it deletes the orphans last seen before the cutoff, logging
 // signed_seen_markers_swept when it deleted any, and reports the marker
 // stamped more than clockStepTolerance past fresh — a clock read taken
 // for the sweep — furthest in the future through clock_step_detected
@@ -6717,9 +7878,17 @@ and after it:
 // than 2 s would report its own stamps as a clock step. The cutoff keeps
 // the run's now, which the forward-step guard checked: a fresh one would
 // let a step during the run sweep markers the guard would have deferred
-// (design review M-8).
+// (design review M-8). stepAhead is ruling PF-13 (final review concurrency
+// I1): a detected forward step never ages a marker. The guard's hour
+// gives clients time to touch their suites, but an orphan marker's suite
+// has had no client for a month, so nothing would refresh the marker in
+// that hour, and a swept marker — the never-downgrade record of a base
+// seen signed — cannot come back. After a genuine suspend this only keeps
+// markers longer, the safe side.
 func (r *Reaper) sweepMarkers(ctx context.Context, now, fresh time.Time) {
-	res, err := r.cache.SweepOrphanMarkers(ctx, fresh.Unix(), now.Add(-markerTTL).Unix())
+	// Two Adds, never the one Duration sum −stepAhead − markerTTL, which
+	// would wrap once stepAhead nears maxStepAhead (deferredByForwardStep).
+	res, err := r.cache.SweepOrphanMarkers(ctx, fresh.Unix(), now.Add(-markerTTL).Add(-r.stepAhead).Unix())
 	var furthest cache.SignedSeenMark
 	if res.Furthest != nil {
 		furthest = *res.Furthest
@@ -6758,17 +7927,31 @@ Expected: PASS (`TestSweepOrphanMarkers_DeletesInBatchesOfAThousand` takes about
 | X17: the delete without its in-transaction stamp re-check (`last_seen_at < ?` → `? > 0`) | `TestDeleteOrphanMarkers_RechecksInTheWriter` (`deleteOrphanMarkers = 1`) |
 | `LastUse` ignores `last_fetched_at` | `TestURLPath_LastUse` |
 | `sweepMarkers` reports no clock step | `TestReaper_SweepsOrphanMarkersAndKeepsFutureStamps` (`clock_step_detected lines []`), `TestReaper_ReportsAFutureMarkerOnlyWhenItChanges` |
-| `markerTTL = 30 * 24 * time.Hour` | `TestReaper_SweepsOrphanMarkersAndKeepsFutureStamps` (`idle suite exists false, its marker -1`), `TestReaper_TheMarkerTTLIsAYear`, `TestReaper_AForwardStepDefersTheMarkerSweep` |
-| X31: `markerTTL = 300 * 24 * time.Hour` | `TestReaper_TheMarkerTTLIsAYear` (`seen 364 days ago: -1`), `TestReaper_AForwardStepDefersTheMarkerSweep` |
-| X31: `markerTTL = 400 * 24 * time.Hour` | `TestReaper_TheMarkerTTLIsAYear` (`366 days ago: 1768377600`), and three more |
-| `runOnce` without `sweepMarkers` | `TestReaper_SweepsOrphanMarkersAndKeepsFutureStamps` and the four other sweep tests |
-| the daily gate always open (`if !deferred {`) | `TestReaper_DailyDutiesRunAtStartAndADayApart` (`an hourly run swept`) |
-| `dailyEvery = 48 * time.Hour` | `TestReaper_DailyDutiesRunAtStartAndADayApart` (`the run a day after the first did not sweep`), `TestReaper_AForwardStepDefersTheMarkerSweep` |
+| `markerTTL = 30 * 24 * time.Hour` | `TestReaper_SweepsOrphanMarkersAndKeepsFutureStamps` (`idle suite exists false, its marker -1`), `TestReaper_TheMarkerTTLIsAYear`, `TestReaper_AForwardStepDefersTheMarkerSweep`; re-run against the final fix wave's tests (779aaad): `dod_f_rig_test.go:268`, `:313` |
+| X31: `markerTTL = 300 * 24 * time.Hour` | `TestReaper_TheMarkerTTLIsAYear` (`seen 365 days ago: -1 …`), `TestReaper_AForwardStepDefersTheMarkerSweep`; at 779aaad `reaper_markers_test.go:123`, `:163`, … |
+| X31: `markerTTL = 400 * 24 * time.Hour` | `TestReaper_TheMarkerTTLIsAYear` (`… 365 days and a second ago: 1768463999 …`), and three more (at 779aaad `reaper_markers_test.go:63`, `:163`, `:197`, `:242`) |
+| `markerTTL = 364 * 24 * time.Hour` (the final review's tests m-4, M6), or 365 days and a second | `TestReaper_TheMarkerTTLIsAYear` (`reaper_markers_test.go:162`: `seen 365 days ago: … want kept and swept`) |
+| `runOnce` without `sweepMarkers` | `TestReaper_SweepsOrphanMarkersAndKeepsFutureStamps` and the four other sweep tests (at 779aaad `reaper_markers_test.go:63`, `:149`, `:163`, `:197`) |
+| the daily gate always open (`if !deferred {`) | `TestReaper_TheMarkerSweepIsDueADayAfterTheStartThenDaily` (`reaper_markers_test.go:192`: `swept within a day of the start: the first sweep is due a day after Run starts`), `TestReaper_AClockAheadAtStartHasADayToBeCorrected` (`:229`) |
+| `dailyEvery = 48 * time.Hour` | `TestReaper_TheMarkerSweepIsDueADayAfterTheStartThenDaily` (`reaper_markers_test.go:196`: `the run a day after the start did not sweep`), `TestReaper_AClockAheadAtStartHasADayToBeCorrected` (`:241`), `TestReaper_AForwardStepDefersTheMarkerSweep` (`:330`) |
+| `dailyEvery = 12 * time.Hour` (M7), `2 * time.Hour` (M8) or `23 * time.Hour` | `TestReaper_TheMarkerSweepIsDueADayAfterTheStartThenDaily` (`reaper_markers_test.go:192`), `TestReaper_AClockAheadAtStartHasADayToBeCorrected` (`:233`) |
+| `dailyEvery = 25 * time.Hour` | `TestReaper_TheMarkerSweepIsDueADayAfterTheStartThenDaily` (`reaper_markers_test.go:196`), `TestReaper_AClockAheadAtStartHasADayToBeCorrected` (`:241`) |
+| PF-13: `Run` without `r.dailyAt = r.lastMono` (the first sweep at the first run again) | `TestReaper_TheMarkerSweepIsDueADayAfterTheStartThenDaily` (`reaper_markers_test.go:192`), `TestReaper_AClockAheadAtStartHasADayToBeCorrected` (`:229`: `an orphan 200 days old was swept an hour after a start whose wall clock was 200 days ahead`) |
+| PF-13: the cutoff without `stepAhead` (`now.Add(-markerTTL).Unix()`) | `TestReaper_AForwardStepWhileRunningAgesNoMarker` (`reaper_markers_test.go:270`: `an orphan 303 days old by the monotonic count was swept after a forward step of 70 days`), `TestReaper_AForwardStepDefersTheMarkerSweep` (`:326`: `… the forward step aged it`) |
+| PF-13: `stepAhead` reset each run (`r.stepAhead = 0` at the guard's start) | `TestReaper_AForwardStepWhileRunningAgesNoMarker` (`reaper_markers_test.go:270`), `TestReaper_AForwardStepDefersTheMarkerSweep` (`:326`) |
+| PF-13: `stepAhead` doubled (`+= 2 * …`) | `TestReaper_AForwardStepWhileRunningAgesNoMarker` (`reaper_markers_test.go:267`: `the sweeps after the step kept an orphan a year old`), `TestReaper_AForwardStepDefersTheMarkerSweep` (`:330`) |
+| PF-13: `stepAhead` overwritten, not added to (`r.stepAhead = ahead`; the final fix wave's residual R1, A4) | `TestReaper_ForwardStepsAddUp` (`reaper_markers_test.go:310`: `2 forward steps detected, stepAhead 960h0m0s; want 2 and 1920h0m0s (both steps)`), `TestReaper_StepAheadSaturates` (`:346`) |
+| `stepAhead` unsaturated (`r.stepAhead += ahead`; the final fix wave's residual R3, M1), or both of R3's changes reverted (M3) | `TestReaper_StepAheadSaturates` (`reaper_markers_test.go:346`: `stepAhead = -9217327636854775809 ns after a step at an hour short of the bound; want it saturated at 9223372036854775807`) |
+| the cutoff as one Duration sum (`now.Add(-r.stepAhead - markerTTL)`; R3's M2) | `TestReaper_StepAheadSaturates` (`reaper_markers_test.go:352`: `the sweep at the bound deleted orphans (a day old: -1, two years old: -1; -1: swept); want none`) |
+| a call of `SweepOrphanMarkers` from `internal/admin` (the final review's tests m-1, G2) or `internal/gc` (G8) | `TestSuiteDeletersHaveKnownCallers` (`single_insert_test.go:289`: `… names SweepOrphanMarkers: only the reaper and POST /forget delete suites, and only the reaper sweeps markers`) |
+| a call of `SweepOrphanMarkers` inside `internal/cache` (G10) | `TestSuiteDeletersHaveKnownCallers` (`single_insert_test.go:298`: `SweepOrphanMarkers is named inside internal/cache at […]; want nowhere`) |
 | `markSignatureSeen` returns early when `SignedSeen` finds a marker (write-once) | `TestCheck_EverySightingAdvancesTheMarkerStamp` (`second sighting: last_seen_at 1800000000 …, want 1800003600`) |
 | M-10: a future marker reported at every sweep | `TestReaper_ReportsAFutureMarkerOnlyWhenItChanges` (`three sweeps over one future marker: 3 reports, want 1`) |
 | M-10: a future marker reported once ever (`r.reportedMarker == (cache.SignedSeenMark{})`) | `TestReaper_ReportsAFutureMarkerOnlyWhenItChanges` (`after its stamp moved on: 1 reports, want 2`) |
-| M-8: the sweep not deferred (`!deferred &&` dropped) | `TestReaper_AForwardStepDefersTheMarkerSweep` (`swept by the run that saw the forward step`) |
-| M-8: a deferred sweep uses up the day (`dailyAt` set before the `!deferred` check) | `TestReaper_AForwardStepDefersTheMarkerSweep` (`not swept an uptime floor after the step`) |
+| M-8: the sweep not deferred (`!deferred &&` dropped) | `TestReaper_AForwardStepDefersTheMarkerSweep` (`reaper_markers_test.go:330`: `an orphan aged past the year by the monotonic clock was kept`) |
+| M-8: a deferred sweep uses up the day (`dailyAt` set before the `!deferred` check) | `TestReaper_AForwardStepDefersTheMarkerSweep` (`reaper_markers_test.go:331` at 779aaad) |
+
+The final fix wave's `reaper_markers_test.go` lines are as at 917ad01 unless "at 779aaad" says otherwise; ccdea7d's doc edit and b73e4a2's `math` import moved them down by two at HEAD. The rows for b73e4a2's tests (`TestReaper_ForwardStepsAddUp`, `TestReaper_StepAheadSaturates`) give HEAD's lines.
 
 - [ ] **Step 6: Commit**
 
@@ -6782,15 +7965,15 @@ git commit -m "Sweep orphan signed-seen markers a year old, never rewriting a st
 
 ### Task 10: `POST /forget` (spec C9, D9)
 
-The admin escape hatch for refusal states (a vendor that stopped signing, a deliberate upstream rollback, a stuck unsigned suite): the reaper's steps for one suite, run to completion regardless of idleness, plus — when no other suite with the base or its twin has a row, under either scheme — the base's markers and its cached anchor rows (`ForgetSuite`, Task 3; design notes 10, 13, 14, ruling PF-2). The freshness side, `(*Reaper).Forget`, follows ruling R-F1's one delete path, bounded by `suiteHoldTimeout` (5 min) and releasing with `ForgetSuite`'s settled `Gone` (design review M-2); every step that fails — the re-read, a metadata batch, the final delete — is an error (500), and a panic under its hold is released, as the reaper's per-candidate recovery releases one, with the cache's fresh answer (`settledGone`), then re-panicked so net/http's recovery and its log line stay as they were (the Task 6 re-review's out-of-scope 3); `suite_forgotten` logs `anchor_rows` (PF-2). The admin side adds the route, the guard factored into `requireMutationGuard` (ruling PF-6: `X-ACU-Admin: 1`; a `Sec-Fetch-Site` other than `same-origin` or `none` is 403, its text saying so — "requests from another origin are refused: Sec-Fetch-Site must be same-origin or none", since a same-site request is refused too; its AIDEV-NOTE says honestly that it stops a cross-site form or fetch but not DNS rebinding against a listener without `htpasswd_file`, Host-header validation being spec §10 G-1's for `/forget` and `/reconcile` together — `/reconcile` itself is unchanged in F) and the answers (ruling PF-7): 202 with a body that names what was forgotten, the markers deleted and the rows that kept them (`Forgetter.Forget` now returns `cache.ForgetResult`), 409 for busy or unknown (no existence oracle) with a body that says what to check — exact against the status page's Host cell (`scheme://host`: the scheme goes in `scheme`, the rest in `host`) — 400 (also for a `host` holding `://`), 403, 405, 413 (a body over 8 KiB), 500 (logged), 501. `OPTIONS /forget` answers `Allow: POST, OPTIONS`. INFO `admin_forget_requested` (as `/reconcile`'s) and `suite_forgotten`. The status page gains each suite's scheme (PF-7, design review I-7): JSON `scheme` — additive to the locked contract; the JSON-contract golden gains the one key — and the HTML Host cell (`http://host`), since `/forget`'s scheme defaults to `https` and a suite's two schemes rendered as two identical rows. The exec review's surviving X9 gets its killer here (PF-9). The escape-hatch scenarios themselves (re-adoption, the `unsigned_downgrade_refused` case with and without a `/.` twin row, and with a signed anchor cached under the other scheme) are Task 15's.
+The admin escape hatch for refusal states (a vendor that stopped signing, a deliberate upstream rollback, a stuck unsigned suite): the reaper's steps for one suite, run to completion regardless of idleness, plus — when no other suite with the base or its twin has a row, under either scheme — the base's markers and its cached anchor rows (`ForgetSuite`, Task 3; design notes 10, 13, 14, ruling PF-2). The freshness side, `(*Reaper).Forget`, follows ruling R-F1's one delete path, bounded by `suiteHoldTimeout` (5 min) and releasing with `ForgetSuite`'s settled `Gone` (design review M-2); every step that fails — the re-read, a metadata batch, the final delete — is an error (500), and a panic under its hold is released, as the reaper's per-candidate recovery releases one, with the cache's fresh answer (`settledGone`), then re-panicked so net/http's recovery and its log line stay as they were (the Task 6 re-review's out-of-scope 3); before the release that panic is logged through `logPanic` — ERROR `freshness_check_panicked`, `where=forget`, naming the suite's scheme, host and path (the final review's spec m1) — and the admin `http.Server` routes net/http's own lines (`http: panic serving …`) through its slog handler at ERROR (`ErrorLog`), where they were standard-log lines, at INFO through `main`'s `slog.SetDefault` and unstructured without it. `suite_forgotten` logs `anchor_rows` (PF-2); a forget whose `ForgetSuite` errs after its commit (`err != nil && res.Gone`, the cache's settled answer) logs it with `settled=true` and `metadata_rows` (known), without `markers_deleted` or `anchor_rows` (unknown), before the error's 500 — as the reaper's `suite_reaped settled=true` does (the final review's spec m2). `status.go` is hand-edited here, so the deferred-minor rule takes B-61: `adoptionStatus` answers "" for a row without a reason instead of dereferencing it. The admin side adds the route, the guard factored into `requireMutationGuard` (ruling PF-6: `X-ACU-Admin: 1`; a `Sec-Fetch-Site` other than `same-origin` or `none` is 403, its text saying so — "requests from another origin are refused: Sec-Fetch-Site must be same-origin or none", since a same-site request is refused too; its AIDEV-NOTE says honestly that it stops a cross-site form or fetch but not DNS rebinding against a listener without `htpasswd_file`, Host-header validation being spec §10 G-1's for `/forget` and `/reconcile` together — `/reconcile` itself is unchanged in F) and the answers (ruling PF-7): 202 with a body that names what was forgotten, the markers deleted and the rows that kept them (`Forgetter.Forget` now returns `cache.ForgetResult`), 409 for busy or unknown (no existence oracle) with a body that says what to check — exact against the status page's Host cell (`scheme://host`: the scheme goes in `scheme`, the rest in `host`) — 400 (also for a `host` holding `://`), 403, 405, 413 (a body over 8 KiB), 500 (logged), 501. `OPTIONS /forget` answers `Allow: POST, OPTIONS`. INFO `admin_forget_requested` (as `/reconcile`'s) and `suite_forgotten`. The status page gains each suite's scheme (PF-7, design review I-7): JSON `scheme` — additive to the locked contract; the JSON-contract golden gains the one key — and the HTML Host cell (`http://host`), since `/forget`'s scheme defaults to `https` and a suite's two schemes rendered as two identical rows. The exec review's surviving X9 gets its killer here (PF-9). The escape-hatch scenarios themselves (re-adoption, the `unsigned_downgrade_refused` case with and without a `/.` twin row, and with a signed anchor cached under the other scheme) are Task 15's.
 
 **Files:**
 - Create: `internal/freshness/forget.go`, `internal/freshness/forget_test.go`, `internal/admin/forget_test.go`
-- Modify: `internal/admin/server.go` (`Config.Forgetter`, `Forgetter`, the dispatcher), `internal/admin/handlers.go` (`handleForget`, `forgottenText`, `requireMutationGuard`), `internal/admin/status.go` (`suiteEntry.Scheme`), `internal/admin/status_template.go` (the Suites table), `internal/admin/json_contract_test.go` and `testdata/json_contract_golden.json` (the fixture's scheme), `internal/freshness/reaper.go` (`reapHook`'s and `settledGone`'s docs)
+- Modify: `internal/admin/server.go` (`Config.Forgetter`, `Forgetter`, the dispatcher), `internal/admin/handlers.go` (`handleForget`, `forgottenText`, `requireMutationGuard`), `internal/admin/status.go` (`suiteEntry.Scheme`; `adoptionStatus`'s nil reason, deferred minor B-61), `internal/admin/suites_status_test.go` (B-61), `internal/admin/status_template.go` (the Suites table), `internal/admin/json_contract_test.go` and `testdata/json_contract_golden.json` (the fixture's scheme), `internal/freshness/reaper.go` (`reapHook`'s and `settledGone`'s docs); `internal/admin/server.go` also gains the `http.Server`'s `ErrorLog`
 
 **Interfaces:**
 - Consumes: `(*cache.Cache).GetSuiteFreshness`, `DeleteSuiteMetadata`, `ForgetSuite`, `cache.ForgetResult` (`Deleted`, `Gone`, `MarkersDeleted`, `AnchorRowsDeleted`, `KeptBy`; Task 3), `TouchedSuites`, `MarkSignedSeenBatch`, `PutURLPath`, `SeedSuiteForTest`; `(*Checker).HoldSuite`, `LockCount`, `lockLoadedHook`; Task 6's `reaperRig`, `reapKey`, `reapNow`, `suiteHoldTimeout`, `reapHook`, `settledGone`, `(*cache.Cache).SetCommittedHookForTest`; Task 9's `(*reaperRig).markerAt`; the admin test helpers `startAdminServer`, `adminOpt`, `mustGet`.
-- Produces: `(*freshness.Reaper).Forget(ctx context.Context, scheme, host, suitePath string) (cache.ForgetResult, error)`; `admin.Forgetter` (`Forget(ctx, scheme, host, suitePath string) (cache.ForgetResult, error)`), `admin.Config.Forgetter`; unexported `forgottenText`, `requireMutationGuard(w, r) bool`; the route `POST /forget`; the status JSON key `suites[].scheme`; the events `admin_forget_requested` (`scheme`, `canonical_host`, `suite_path`) and `suite_forgotten` (`canonical_scheme`, `canonical_host`, `suite_path`, `metadata_rows`, `markers_deleted`, `anchor_rows`); WARN `admin: forget failed`; test helpers `stubForgetter`, `forgotten(markers, keptBy...)`, `withForgetter`, `forget(t, base, body, headers...) (status, allow, body)` (`internal/admin/forget_test.go`), `(*reaperRig).cacheOtherSchemeAnchor(suite)`, `(*reaperRig).failingTrigger(table)` (`internal/freshness/forget_test.go`).
+- Produces: `(*freshness.Reaper).Forget(ctx context.Context, scheme, host, suitePath string) (cache.ForgetResult, error)`; `admin.Forgetter` (`Forget(ctx, scheme, host, suitePath string) (cache.ForgetResult, error)`), `admin.Config.Forgetter`; unexported `forgottenText`, `requireMutationGuard(w, r) bool`; the route `POST /forget`; the status JSON key `suites[].scheme`; the events `admin_forget_requested` (`scheme`, `canonical_host`, `suite_path`) and `suite_forgotten` (`canonical_scheme`, `canonical_host`, `suite_path`, `metadata_rows`, `markers_deleted`, `anchor_rows`; a settled one `settled`, `metadata_rows` and no unknown count); `freshness_check_panicked` with `where=forget`; WARN `admin: forget failed`; net/http's admin-listener lines at ERROR; test helpers `stubForgetter`, `panickingForgetter`, `forgotten(markers, keptBy...)`, `withForgetter`, `forget(t, base, body, headers...) (status, allow, body)` (`internal/admin/forget_test.go`), `(*reaperRig).cacheOtherSchemeAnchor(suite)`, `(*reaperRig).failingTrigger(table)` (`internal/freshness/forget_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -6883,9 +8066,10 @@ func (r *reaperRig) cacheOtherSchemeAnchor(suite string) {
 // an unknown suite gets no lock-map entry (I-4). A busy suite keeps its
 // row. Markers another suite with the base keeps (here the other scheme's
 // suite) survive the forget, and the result names that suite (ruling
-// PF-7). Inside a synctest bubble the rig's pinned clock stands still, so
-// the forget's marker stamp (PF-10: MAX(last_seen_at, the cache's now)) is
-// exactly reapNow however long the machine takes to get there (the Task 9
+// PF-7). Inside a synctest bubble the rig's pinned clock moves only with
+// the bubble's clock, and this test sleeps nowhere, so the forget's marker
+// stamp (PF-10: MAX(last_seen_at, the cache's now)) is exactly reapNow
+// however long the machine takes to get there (the Task 9
 // re-review: outside a bubble the pinned clock runs on in real time, and
 // the assertion failed past one second).
 func TestReaper_ForgetAnswersFalseForBusyAndUnknown(t *testing.T) {
@@ -6987,7 +8171,11 @@ func (r *reaperRig) failingTrigger(table string) {
 // metadata batches, the final delete. The hold is released as the cache
 // answers (design review M-2): a step that failed keeps the suite and its
 // lock-map entry; a final delete that committed although its submit
-// failed leaves the suite gone and its entry dropped.
+// failed leaves the suite gone and its entry dropped, and is logged INFO
+// suite_forgotten with settled=true and the metadata rows, without the
+// marker and anchor counts it cannot know (final review spec m2, tests
+// m-7: the reaper's suite_reaped settled=true). A step that failed logs
+// no suite_forgotten.
 func TestReaper_ForgetReportsEachStepsDatabaseError(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -7020,12 +8208,26 @@ func TestReaper_ForgetReportsEachStepsDatabaseError(t *testing.T) {
 			if err == nil || res.Deleted {
 				t.Fatalf("Forget = %+v, %v; want an error (a 500), not a 409's not-deleted", res, err)
 			}
+			forgotten := r.events("suite_forgotten")
 			if tc.gone {
 				if r.exists("/r/dists/x") || r.checker.LockCount() != 0 {
 					t.Fatalf("suite exists %v, %d lock-map entries; want it gone and its entry dropped (release(true))",
 						r.exists("/r/dists/x"), r.checker.LockCount())
 				}
+				if len(forgotten) != 1 {
+					t.Fatalf("suite_forgotten lines %v; want one for the forget that committed", forgotten)
+				}
+				ev := forgotten[0]
+				_, markers := ev["markers_deleted"]
+				_, anchors := ev["anchor_rows"]
+				if ev["level"] != "INFO" || ev["settled"] != true || ev["canonical_scheme"] != "http" || ev["canonical_host"] != "h" ||
+					ev["suite_path"] != "/r/dists/x" || ev["metadata_rows"] != float64(1) || markers || anchors {
+					t.Fatalf("suite_forgotten = %v; want INFO, settled, the suite and its 1 metadata row, no unknown counts", ev)
+				}
 				return
+			}
+			if len(forgotten) != 0 {
+				t.Fatalf("suite_forgotten lines %v; want none for a forget that failed", forgotten)
 			}
 			if r.checker.LockCount() != 1 {
 				t.Fatalf("%d lock-map entries; want the kept suite's entry kept (release(false))", r.checker.LockCount())
@@ -7049,8 +8251,10 @@ func TestReaper_ForgetReportsADatabaseError(t *testing.T) {
 // The Task 6 re-review's out-of-scope 3, as the reaper's per-candidate
 // rule (design note 23): a panic under Forget's hold releases the suite as
 // the cache then answers — a fresh read of the row — not as Forget last
-// saw it, and the panic goes on to net/http's recovery unchanged. A
-// reapHook stands in for a panic after a commit: it deletes the row
+// saw it, and the panic goes on to net/http's recovery unchanged. It is
+// logged first, with the suite: one ERROR freshness_check_panicked with
+// where=forget and the suite's scheme, host and path (final review spec
+// m1). A reapHook stands in for a panic after a commit: it deletes the row
 // through the cache, then panics, and the deleted suite's lock-map entry
 // and per-suite state go (release(true)); one that panics with the row
 // present keeps them (release(false)).
@@ -7084,6 +8288,11 @@ func TestReaper_ForgetReleasesAsTheCacheAnswersAfterAPanic(t *testing.T) {
 			if got != "forget bug" {
 				t.Fatalf("Forget's panic = %v, want \"forget bug\" passed on to the caller (net/http's recovery)", got)
 			}
+			if ev := r.events("freshness_check_panicked"); len(ev) != 1 || ev[0]["level"] != "ERROR" ||
+				ev[0]["where"] != "forget" || ev[0]["canonical_scheme"] != "http" || ev[0]["canonical_host"] != "h" ||
+				ev[0]["suite_path"] != "/r/dists/x" || ev[0]["panic"] != "forget bug" {
+				t.Fatalf("panic lines = %v; want one ERROR with where=forget naming http://h/r/dists/x", ev)
+			}
 			if r.exists("/r/dists/x") == tc.delete {
 				t.Fatalf("premise: row exists %v, want %v", r.exists("/r/dists/x"), !tc.delete)
 			}
@@ -7111,12 +8320,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
@@ -7344,6 +8555,47 @@ func TestEndpoint_Forget_LogsAcceptedRequestsAndFailures(t *testing.T) {
 	}
 }
 
+// panickingForgetter's Forget panics, as Reaper.Forget re-panics after
+// logging a panic under its hold.
+type panickingForgetter struct{}
+
+func (panickingForgetter) Forget(context.Context, string, string, string) (cache.ForgetResult, error) {
+	panic("forget bug")
+}
+
+// Final review spec m1: the admin http.Server routes net/http's own lines
+// through slog at ERROR (its ErrorLog), as the proxy listeners route
+// theirs: a POST /forget whose handler panics leaves a structured ERROR
+// record "http: panic serving …" naming the panic, not unstructured
+// stderr text.
+func TestEndpoint_Forget_APanicIsLoggedThroughSlog(t *testing.T) {
+	var buf lockedBuffer
+	_, base, cleanup := startAdminServer(t, withForgetter(panickingForgetter{}),
+		withLogger(slog.New(slog.NewJSONHandler(&buf, nil))))
+	defer cleanup()
+	req, err := http.NewRequest(http.MethodPost, base+"/forget", strings.NewReader("host=h&suite=/s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-ACU-Admin", "1")
+	if resp, err := http.DefaultClient.Do(req); err == nil { // net/http closes the connection: an error is expected
+		_ = resp.Body.Close()
+	}
+	var found map[string]any
+	for deadline := time.Now().Add(5 * time.Second); found == nil && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		for _, line := range strings.Split(buf.String(), "\n") {
+			var m map[string]any
+			if line != "" && json.Unmarshal([]byte(line), &m) == nil && strings.HasPrefix(fmt.Sprint(m["msg"]), "http: panic serving") {
+				found = m
+			}
+		}
+	}
+	if found == nil || found["level"] != "ERROR" || !strings.Contains(fmt.Sprint(found["msg"]), "forget bug") {
+		t.Fatalf("panic record %v; want an slog ERROR line \"http: panic serving …: forget bug\"; log:\n%s", found, buf.String())
+	}
+}
+
 // Spec C9 and ruling PF-6: a cross-site form or fetch cannot trigger
 // /forget (requireMutationGuard). A form POST (no X-ACU-Admin: 1) and a
 // cross-site or same-site fetch (Sec-Fetch-Site) are refused with 403
@@ -7437,9 +8689,32 @@ In `internal/admin/json_contract_test.go`, the populated fixture's suite entry g
 				Scheme:                           "http",
 ```
 
+In `internal/admin/suites_status_test.go`, after `TestBuildSuiteEntries_RecordAndLag` (deferred minor B-61; it panics until `adoptionStatus` checks the reason):
+
+```go
+// Deferred minor B-61: adoptionStatus nil-checks the record's reason
+// itself, not trusting its caller's guard: a row with a failure count but
+// no reason (refused or failing, escalated or not) summarises to "", where
+// it used to dereference a nil pointer.
+func TestAdoptionStatus_ANilReasonIsNoRecord(t *testing.T) {
+	const now = int64(1_800_000_000)
+	s := cache.SuiteFreshness{CanonicalHost: "h", SuitePath: "/a", AdoptionFailCount: 3,
+		AdoptionFailFirstAt: p64(now - 2*86400), AdoptionNextRetryAt: p64(now + 60)}
+	for _, tc := range []struct{ refused, long bool }{{false, false}, {true, false}, {true, true}} {
+		if got := adoptionStatus(s, tc.refused, tc.long, now); got != "" {
+			t.Errorf("adoptionStatus(refused %v, long %v) without a reason = %q; want \"\"", tc.refused, tc.long, got)
+		}
+	}
+	s.AdoptionFailReason = pstr("untrusted_signer")
+	if got := adoptionStatus(s, false, false, now); got != "adoption failing 2d 0h · untrusted_signer · retry in 1m" {
+		t.Errorf("adoptionStatus with a reason = %q", got)
+	}
+}
+```
+
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test -gcflags=-e ./internal/freshness/ ./internal/admin/ -run 'TestReaper_Forget|TestEndpoint_Forget|TestStatus_SuitesShowTheirScheme|TestJSONContract'`
+Run: `go test -gcflags=-e ./internal/freshness/ ./internal/admin/ -run 'TestReaper_Forget|TestEndpoint_Forget|TestStatus_SuitesShowTheirScheme|TestJSONContract|TestAdoptionStatus_ANilReasonIsNoRecord'`
 Expected: compile failures `r.reaper.Forget undefined`, `undefined: Forgetter`, `cfg.Forgetter undefined`, `unknown field Scheme in struct literal of type suiteEntry`.
 
 - [ ] **Step 3: Implement**
@@ -7477,13 +8752,20 @@ import (
 // HoldSuite, the re-read under the hold, deleteSuiteTx through
 // cache.ForgetSuite, release(gone) — gone being ForgetSuite's answer,
 // settled by a fresh read after a failed submit, or the re-read's finding
-// no row (design review M-2). A panic under the hold is released as the
-// reaper's per-candidate recovery releases one (reapSuite): with the
-// cache's fresh answer (settledGone), since it may have struck after
-// ForgetSuite's commit — a deleted suite's lock-map entry never leaks, a
-// kept one's is never dropped (design note 23) — and is then re-panicked,
-// so net/http's recovery and its log line stay as they were (the Task 6
-// re-review's out-of-scope 3). The suite's next request re-creates it
+// no row (design review M-2). A panic under the hold is logged with the
+// suite (freshness_check_panicked, where=forget: final review spec m1),
+// then released as the reaper's per-candidate recovery releases one
+// (reapSuite): with the cache's fresh answer (settledGone), since it may
+// have struck after ForgetSuite's commit — a deleted suite's lock-map
+// entry never leaks, a kept one's is never dropped (design note 23) — and
+// is then re-panicked, so net/http's recovery still ends the request (the
+// Task 6 re-review's out-of-scope 3); its "http: panic serving" line goes
+// through the admin server's ErrorLog, slog at ERROR. A final delete that
+// committed although its submit failed (ForgetSuite's settled Gone) is
+// logged suite_forgotten with settled=true and the metadata rows, its
+// marker and anchor counts unknown (final review spec m2, as the reaper's
+// suite_reaped settled=true), before the error goes back (the endpoint's
+// 500, or 503 at shutdown). The suite's next request re-creates it
 // never adopted, so unchanged upstream content re-adopts at once (signed)
 // or after the transition's confirmation (unsigned), and a deliberate
 // rollback adopts: the escape hatch for refusal states. Forgetting an
@@ -7507,6 +8789,10 @@ func (r *Reaper) Forget(ctx context.Context, scheme, host, suitePath string) (ca
 	gone := false
 	defer func() {
 		if v := recover(); v != nil {
+			unloggedPanic(func() {
+				r.checker.reportPanic("freshness_check_panicked", "forget",
+					SuiteRef{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}, v)
+			})
 			release(r.settledGone(key))
 			panic(v)
 		}
@@ -7530,6 +8816,19 @@ func (r *Reaper) Forget(ctx context.Context, scheme, host, suitePath string) (ca
 	res, err := r.cache.ForgetSuite(ctx, key, cur.CurrentSnapshotID)
 	gone = res.Gone
 	if err != nil {
+		if res.Gone {
+			// The delete committed and its submit failed: under the hold
+			// no other deleter runs, so the cache's fresh read finding no
+			// row means this call deleted it — and, if no row kept them,
+			// the base's markers. Leave a record of it.
+			r.logger.Info("suite_forgotten",
+				"canonical_scheme", scheme,
+				"canonical_host", host,
+				"suite_path", suitePath,
+				"metadata_rows", rows,
+				"settled", true,
+			)
+		}
 		return cache.ForgetResult{}, fmt.Errorf("forget: %w", err)
 	}
 	if !res.Deleted {
@@ -7595,6 +8894,30 @@ and after the `Reconciler` interface:
 type Forgetter interface {
 	Forget(ctx context.Context, scheme, host, suitePath string) (cache.ForgetResult, error)
 }
+```
+
+`New`'s `http.Server` gains its `ErrorLog` (the final review's spec m1):
+
+```go
+	// AIDEV-NOTE: ErrorLog routes net/http's own lines — above all "http:
+	// panic serving …" when a handler panics (a POST /forget whose
+	// Forgetter re-panics after logging freshness_check_panicked
+	// where=forget) — through this server's slog handler at ERROR, as the
+	// proxy listeners route theirs at WARN (newHTTPServer) (final review
+	// spec m1). Without it net/http falls back to the standard log
+	// package, which main's slog.SetDefault already sends through the same
+	// handler, but at INFO (so log.level "warn" or "error" drops the line),
+	// and only in a process that called SetDefault (the admin tests do
+	// not). So what this changes is the level, and the server's dependence
+	// on that process-wide setting; in the daemon the line was already a
+	// structured record (the final fix wave's re-review, logging minor 1).
+	s.server = &http.Server{
+		Addr:              cfg.AdminAddr,
+		Handler:           s.buildHandler(),
+		ReadHeaderTimeout: cfg.Admin.ReadTimeout.Duration,
+		IdleTimeout:       cfg.Admin.IdleTimeout.Duration,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
+	}
 ```
 
 The dispatcher's `OPTIONS` branch gains `else if r.URL.Path == "/forget" { w.Header().Set("Allow", "POST, OPTIONS") }` between the profile case and the default; after the `/reconcile` branch:
@@ -7752,6 +9075,22 @@ and `buildSuiteEntries` sets `Scheme: r.CanonicalScheme,` before `Host`. In `int
 
 Regenerate the JSON-contract golden (one key added, `"scheme": "http"`): `go test ./internal/admin/ -run TestJSONContractPreserved -update.jsoncontract`.
 
+`adoptionStatus` (`status.go`) checks the reason itself (deferred minor B-61); its doc and first lines become:
+
+```go
+// adoptionStatus summarises the spec C7 record for the suites table:
+// "adoption failing 3d 2h · untrusted_signer · retry in 41m",
+// "refused: upstream_older · retry due", or, for a refusal older than
+// refusalEscalateAge, "refused: upstream_older · since 1d 1h · retry due".
+// A row without a reason has no record to summarise: "" (deferred minor
+// B-61; buildSuiteEntries calls it only with one, but it must not rely on
+// that).
+func adoptionStatus(s cache.SuiteFreshness, refused, long bool, now int64) string {
+	if s.AdoptionFailReason == nil {
+		return ""
+	}
+```
+
 - [ ] **Step 4: Run the tests**
 
 Run: `go test -race ./internal/freshness/ ./internal/admin/`
@@ -7780,12 +9119,21 @@ Expected: PASS.
 | a panic under `Forget`'s hold always released as gone | `TestReaper_ForgetReleasesAsTheCacheAnswersAfterAPanic` (`0 lock-map entries … want 1`) |
 | the panic swallowed (no re-panic) | `TestReaper_ForgetReleasesAsTheCacheAnswersAfterAPanic` (`Forget's panic = <nil>, want "forget bug" …`) |
 | `requireMutationGuard`'s second 403 text back to `cross-site requests are refused` | `TestEndpoint_Forget_RefusesCrossOriginRequests` (the cross-site and same-site cases: `403 body = "cross-site requests are refused"`) |
+| `Forget`'s recover without its `reportPanic` (no panic line; the final fix wave's L1), with `where=reaper` (L2), or without the suite (L3) | `TestReaper_ForgetReleasesAsTheCacheAnswersAfterAPanic` (`forget_test.go:311`: `panic lines = …; want one ERROR with where=forget naming http://h/r/dists/x`) |
+| no settled `suite_forgotten` (L4) | `TestReaper_ForgetReportsEachStepsDatabaseError` (`forget_test.go:235`: `suite_forgotten lines []; want one for the forget that committed`) |
+| `suite_forgotten` on every `ForgetSuite` error (`err != nil && res.Gone` → `err != nil`; L5) | `TestReaper_ForgetReportsEachStepsDatabaseError` (`forget_test.go:247`: `… want none for a forget that failed`) |
+| the settled line without `settled=true` (L6) | `TestReaper_ForgetReportsEachStepsDatabaseError` (`forget_test.go:242`: `suite_forgotten = …; want INFO, settled, the suite and its 1 metadata row, no unknown counts`) |
+| the admin `http.Server` without `ErrorLog` (L7), or with it at `slog.LevelWarn` (L8) | `TestEndpoint_Forget_APanicIsLoggedThroughSlog` (admin `forget_test.go:332`: `panic record …; want an slog ERROR line "http: panic serving …: forget bug"`) |
+| `adoptionStatus` without its nil check (deferred minor B-61) | `TestAdoptionStatus_ANilReasonIsNoRecord` (`suites_status_test.go:55`: a nil pointer dereference) |
+| `SweepOrphanMarkers` named in `internal/freshness/forget.go` (the final review's tests m-1, G9), or `ForgetSuite` named in `reaper.go` (G11) | `TestSuiteDeletersHaveKnownCallers` (`single_insert_test.go:289`: `… names SweepOrphanMarkers: only the reaper and POST /forget delete suites, and only the reaper sweeps markers`) |
+
+The final fix wave's rows give each failing line as at its commit (82c76f8, 4505d1a, 779aaad).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-gofmt -l internal/freshness/forget.go internal/freshness/forget_test.go internal/freshness/reaper.go internal/admin/forget_test.go internal/admin/server.go internal/admin/handlers.go internal/admin/status.go internal/admin/status_template.go internal/admin/json_contract_test.go
-git add internal/freshness/forget.go internal/freshness/forget_test.go internal/freshness/reaper.go internal/admin/forget_test.go internal/admin/server.go internal/admin/handlers.go internal/admin/status.go internal/admin/status_template.go internal/admin/json_contract_test.go internal/admin/testdata/json_contract_golden.json
+gofmt -l internal/freshness/forget.go internal/freshness/forget_test.go internal/freshness/reaper.go internal/admin/forget_test.go internal/admin/server.go internal/admin/handlers.go internal/admin/status.go internal/admin/suites_status_test.go internal/admin/status_template.go internal/admin/json_contract_test.go
+git add internal/freshness/forget.go internal/freshness/forget_test.go internal/freshness/reaper.go internal/admin/forget_test.go internal/admin/server.go internal/admin/handlers.go internal/admin/status.go internal/admin/suites_status_test.go internal/admin/status_template.go internal/admin/json_contract_test.go internal/admin/testdata/json_contract_golden.json
 git commit -m "Add POST /forget: the reaper's steps for one suite, guarded, with replies that say what happened; show each suite's scheme (spec C9, D9; rulings PF-2, PF-6, PF-7)"
 ```
 
@@ -7793,15 +9141,15 @@ git commit -m "Add POST /forget: the reaper's steps for one suite, guarded, with
 
 ### Task 11: `gc.suite_idle_ttl` and the daemon wiring
 
-Spec C11's knob: `gc.suite_idle_ttl`, default `720h`, `0s` disables suite reaping (design note 2), otherwise at least `24h`; checked whatever `gc.enabled` says, since the reaper runs with the freshness checker (design note 1). `main` builds the reaper beside the checker, starts it under the same lifetime context and wait group, and wires it as the admin listener's `Forgetter`. Its start goes through a test seam (`runReaper`), so a test pins that the daemon starts and joins it whatever `gc.enabled` says (the Task 11 review's Important 1), and the startup line reports `gc_suite_idle_ttl` and `adoption_adopt_unsigned`. A `/forget` in flight when the admin listener's `Shutdown` begins is cut short at its next step — DEBUG, 503 — instead of holding the listener's drain for up to 5 minutes (the Task 11 review's minor 3); it is data-safe, as a failed reap is. The packaged `config.toml.default` documents the key (its tests require every key, at its default). The packaged comment says what reaping costs an offline or archive cache — a reaped suite comes back from upstream — and that `0s` is its setting (design review M-11). The comments that still promised phase F (`warnSuiteCaps`) or the unsigned form "in a later release" (`config.go`) are rewritten, and deferred minor E-72 lands. (The draft's `Validate` block stopped at its `else if` line; it is complete below — exec review D1, design review M-1.)
+Spec C11's knob: `gc.suite_idle_ttl`, default `720h`, `0s` disables suite reaping (design note 2), otherwise at least `24h`; checked whatever `gc.enabled` says, since the reaper runs with the freshness checker (design note 1). `main` builds the reaper beside the checker, starts it under the same lifetime context and wait group, and wires it as the admin listener's `Forgetter`. Its start goes through a test seam (`runReaper`), so a test pins that the daemon starts and joins it whatever `gc.enabled` says (the Task 11 review's Important 1), and the startup line reports `gc_suite_idle_ttl` and `adoption_adopt_unsigned`. A `/forget` in flight when the admin listener's `Shutdown` begins is cut short at its next step — DEBUG, 503 — instead of holding the listener's drain for up to 5 minutes (the Task 11 review's minor 3); it is data-safe, as a failed reap is. The packaged `config.toml.default` documents the key (its tests require every key, at its default). The packaged comment says what reaping costs an offline or archive cache — a reaped suite comes back from upstream — and that `0s` is its setting (design review M-11). The comments that still promised phase F (`warnSuiteCaps`) or the unsigned form "in a later release" (`config.go`) are rewritten, and deferred minor E-72 lands. The startup WARN `gc_disabled` says that suite reaping still runs (`gcDisabledDetail`, the final review's spec m7): for an operator who set `gc.enabled = false` to keep everything it is the one in-product line before the first reap, so it must not imply that nothing is deleted; with `gc.suite_idle_ttl = "0s"` it names the two deleters left, cap eviction at the global cap and the daily sweep of year-old orphan markers. The packaged comments of `adopt_unsigned` (ruling PF-5's plain statements, the final review's spec m6) and `[retention]` (a reaped suite's packages lose its version retention, spec I1) say what this phase changed. (The draft's `Validate` block stopped at its `else if` line; it is complete below — exec review D1, design review M-1.)
 
 **Files:**
-- Modify: `internal/config/config.go` (`GCConfig.SuiteIdleTTL`, its `Load` default and validation; E-72; two stale comments), `packaging/config/config.toml.default` (`[gc]` `suite_idle_ttl`; the `[admin]` comment), `cmd/apt-cacher-ultra/main.go` (`reaperConfig`, the reaper's construction and goroutine through the `runReaper` seam, `Forgetter`, the startup line's `gc_suite_idle_ttl` and `adoption_adopt_unsigned`, `warnSuiteCaps`'s comments), `internal/admin/server.go` (`stopping`, `stop`; `Shutdown` cancels a `/forget` in flight), `internal/admin/handlers.go` (`handleForget` on a context the shutdown cancels: DEBUG and 503), `internal/admin/forget_test.go` (`blockingForgetter`, the disconnect subtest, `TestEndpoint_Forget_ShutdownCutsItShort`)
+- Modify: `internal/config/config.go` (`GCConfig.SuiteIdleTTL`, its `Load` default and validation; E-72; two stale comments), `packaging/config/config.toml.default` (`[gc]` `suite_idle_ttl`; the `[admin]` comment; the `adopt_unsigned` and `[retention]` comments), `cmd/apt-cacher-ultra/main.go` (`reaperConfig`, the reaper's construction and goroutine through the `runReaper` seam, `Forgetter`, the startup line's `gc_suite_idle_ttl` and `adoption_adopt_unsigned`, `warnSuiteCaps`'s comments, `gcDisabledDetail`, the startup GC pass's comment), `internal/admin/server.go` (`stopping`, `stop`; `Shutdown` cancels a `/forget` in flight), `internal/admin/handlers.go` (`handleForget` on a context the shutdown cancels: DEBUG and 503), `internal/admin/forget_test.go` (`blockingForgetter`, the disconnect subtest, `TestEndpoint_Forget_ShutdownCutsItShort`)
 - Create: `internal/config/suite_idle_ttl_test.go`, `cmd/apt-cacher-ultra/reaper_wiring_test.go`
 
 **Interfaces:**
 - Consumes: `freshness.NewReaper`, `ReaperConfig`, `(*Reaper).Run` (Task 6), `(*Reaper).Forget`, `admin.Config.Forgetter` (Task 10); config test helper `writeTOML`; cmd test helpers `minimalCfg`, `silentBuildLogger`, `waitForDaemonReady`, `shutdownTimeout`, `metrics.Default.SnapshotNamesForTest`, `UnregisterAddedSinceForTest`.
-- Produces: `config.GCConfig.SuiteIdleTTL Duration` (TOML `gc.suite_idle_ttl`); `reaperConfig(cfg *config.Config, c *cache.Cache, checker *freshness.Checker, logger *slog.Logger) freshness.ReaperConfig` and the test seam `runReaper` (`cmd/apt-cacher-ultra/main.go`); the admin `Server`'s `stopping`/`stop`; the admin test helper `blockingForgetter` (`newBlockingForgetter`, `unblock`, `result`).
+- Produces: `config.GCConfig.SuiteIdleTTL Duration` (TOML `gc.suite_idle_ttl`); `reaperConfig(cfg *config.Config, c *cache.Cache, checker *freshness.Checker, logger *slog.Logger) freshness.ReaperConfig`, `gcDisabledDetail(suiteIdleTTL time.Duration) string` and the test seam `runReaper` (`cmd/apt-cacher-ultra/main.go`); the admin `Server`'s `stopping`/`stop`; the admin test helper `blockingForgetter` (`newBlockingForgetter`, `unblock`, `result`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -8024,9 +9372,59 @@ func TestServeListeners_StartupLineReportsTheReapingKnobs(t *testing.T) {
 	}
 	t.Fatal("startup line not found")
 }
+
+// Final review spec m7: the gc_disabled WARN keeps naming what gc.enabled =
+// false stops, and says that suite reaping still runs — naming
+// gc.suite_idle_ttl, its value and "0s" — or, with "0s", that it is off,
+// and then (the final fix wave's re-review, logging minor 2) what still
+// deletes: eviction at the total cap and the daily sweep of year-old
+// signed-seen records, so the line never implies that nothing is deleted.
+func TestGCDisabledDetail_NamesSuiteReaping(t *testing.T) {
+	on := gcDisabledDetail(720 * time.Hour)
+	for _, want := range []string{"gc.enabled = false: orphan blobs and displaced snapshots will not be reaped",
+		"suite reaping still runs", "gc.suite_idle_ttl = 720h0m0s", `"0s" turns it off`} {
+		if !strings.Contains(on, want) {
+			t.Errorf("detail with a 720h TTL = %q; want it to contain %q", on, want)
+		}
+	}
+	off := gcDisabledDetail(0)
+	for _, want := range []string{`suite reaping is off too (gc.suite_idle_ttl = "0s")`,
+		"still deleted are suites evicted at the freshness.max_suites total cap (no current snapshot, not requested for 24h)",
+		"daily, signed-seen records of untracked paths last seen over a year ago"} {
+		if !strings.Contains(off, want) {
+			t.Errorf("detail with a 0s TTL = %q; want it to contain %q", off, want)
+		}
+	}
+	if strings.Contains(off, "still runs") {
+		t.Errorf("detail with a 0s TTL = %q; want it to say suite reaping is off", off)
+	}
+}
+
+// The final fix wave's re-review (logging minor 3): startup logs the
+// gc_disabled WARN with the detail for the configured gc.suite_idle_ttl,
+// through serveListeners' real startup — not the default's, nor "0s"'s.
+func TestServeListeners_GCDisabledNamesTheConfiguredTTL(t *testing.T) {
+	for _, tc := range []struct {
+		knob string
+		ttl  time.Duration
+	}{{`"48h"`, 48 * time.Hour}, {`"0s"`, 0}} {
+		t.Run(tc.ttl.String(), func(t *testing.T) {
+			recs := startupLogs(t, t.TempDir(), "[gc]\nenabled = false\nsuite_idle_ttl = "+tc.knob+"\n")
+			var details []any
+			for _, rec := range recs {
+				if rec["msg"] == "gc_disabled" {
+					details = append(details, rec["detail"])
+				}
+			}
+			if want := gcDisabledDetail(tc.ttl); len(details) != 1 || details[0] != want {
+				t.Fatalf("gc_disabled details = %q; want one, %q", details, want)
+			}
+		})
+	}
+}
 ```
 
-A `/forget` in flight when shutdown begins must end promptly (the Task 11 review's minor 3): left running, it holds the admin listener's `Shutdown` — which `main` runs first and alone — for up to its 5 minutes and eats the proxy listeners' drain budget. In `internal/admin/forget_test.go`, the imports gain `"fmt"` and `"time"`; `stubForgetter` loses its `detached` field (a context shutdown cancels can never be one whose `Done` is nil):
+A `/forget` in flight when shutdown begins must end promptly (the Task 11 review's minor 3): left running, it holds the admin listener's `Shutdown` — which `main` runs first and alone — for up to its 5 minutes and eats the proxy listeners' drain budget. In `internal/admin/forget_test.go` (its imports hold `"fmt"` and `"time"` since Task 10's panic test), `stubForgetter` loses its `detached` field (a context shutdown cancels can never be one whose `Done` is nil):
 
 ```go
 // stubForgetter is a test double for the Forgetter interface: it records
@@ -8124,7 +9522,7 @@ func (b *blockingForgetter) result() error {
 	})
 ```
 
-and after `TestEndpoint_Forget_LogsAcceptedRequestsAndFailures` add:
+and after `TestEndpoint_Forget_APanicIsLoggedThroughSlog` (Task 10) add:
 
 ```go
 // The Task 11 review's minor 3: a POST /forget in flight when the admin
@@ -8193,8 +9591,8 @@ func TestEndpoint_Forget_ShutdownCutsItShort(t *testing.T) {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `go test -gcflags=-e ./internal/config/ ./cmd/apt-cacher-ultra/ -run 'TestLoad_SuiteIdleTTL|TestReaperConfig|TestServe_ForgetIsWired|TestServeListeners_StartsTheReaperWhateverGCSays|TestServeListeners_StartupLineReportsTheReapingKnobs'` and `go test ./internal/admin/ -run 'TestEndpoint_Forget_ShutdownCutsItShort'`
-Expected: compile failures `cfg.GC.SuiteIdleTTL undefined`, `undefined: reaperConfig` and `undefined: runReaper`; admin: FAIL — `Shutdown with a forget in flight: context deadline exceeded after 5.0…s`.
+Run: `go test -gcflags=-e ./internal/config/ ./cmd/apt-cacher-ultra/ -run 'TestLoad_SuiteIdleTTL|TestReaperConfig|TestServe_ForgetIsWired|TestServeListeners_StartsTheReaperWhateverGCSays|TestServeListeners_StartupLineReportsTheReapingKnobs|TestGCDisabledDetail_NamesSuiteReaping|TestServeListeners_GCDisabledNamesTheConfiguredTTL'` and `go test ./internal/admin/ -run 'TestEndpoint_Forget_ShutdownCutsItShort'`
+Expected: compile failures `cfg.GC.SuiteIdleTTL undefined`, `undefined: reaperConfig`, `undefined: runReaper` and `undefined: gcDisabledDetail`; admin: FAIL — `Shutdown with a forget in flight: context deadline exceeded after 5.0…s`.
 
 - [ ] **Step 3: Implement**
 
@@ -8237,15 +9635,40 @@ In `packaging/config/config.toml.default`, `[gc]` ends:
 ```toml
 url_path_ttl        = "168h"
 # A suite no client asked for in this long is reaped: its metadata rows and
-# its row; its snapshots go with the next GC runs. Its next request makes it
-# new again, from upstream. 0s disables suite reaping (an offline or archive
-# cache); otherwise >= 24h.
+# its row; its snapshots go with the next periodic GC runs. Its next
+# request makes it new again, from upstream. The reap deletes no package,
+# but its packages lose the version retention its snapshot gave them:
+# with GC on and url_path_ttl > 0s, those no client asked for within
+# url_path_ttl go after hold_packages.window. 0s disables suite reaping
+# (an offline or archive cache); otherwise >= 24h.
 suite_idle_ttl      = "720h"
 # GC numeric constraints still apply when enabled=false; suite reaping runs
 # with the freshness checker whatever enabled says.
 ```
 
-and `[admin]`'s first comment becomes `# HTTP status page, /metrics, /healthz, and mutating POST /reconcile and` / `# POST /forget (the latter needs the header X-ACU-Admin: 1).`
+and `[admin]`'s first comment becomes `# HTTP status page, /metrics, /healthz, and mutating POST /reconcile and` / `# POST /forget (the latter needs the header X-ACU-Admin: 1).` The `adopt_unsigned` comment (`[adoption]`) says plainly what the knob means (ruling PF-5; the final review's spec m6); from "the suite (which a party …" it reads:
+
+```toml
+# the suite (which a party able to inject one can use to block it; see the
+# reference). false refuses them (unsigned_disabled), so the cache no longer
+# keeps unsigned repositories fresh: an unsigned suite already adopted keeps
+# its last snapshot, not updated, until this is turned back on or the suite
+# is forgotten or reaped; one not yet adopted (a forgotten or reaped one
+# included, from its next request) is served as the cache first stores
+# each file, never refreshed. Set false only if this cache serves no
+# unsigned repositories.
+adopt_unsigned        = true
+```
+
+and `[retention]`'s (spec I1: a reaped suite's packages keep no version retention):
+
+```toml
+[retention]
+# Newest distinct Debian versions retained/prefetched per package + arch
+# per suite with a current snapshot. Recent use and hold_packages.window
+# can retain older versions.
+max_versions_per_package = 3  # >= 1
+```
 
 In `cmd/apt-cacher-ultra/main.go`, after `freshChecker` is built:
 
@@ -8280,6 +9703,63 @@ with the seam beside the other test tunables in the top `var` block, after `tunn
 ```
 
 The startup line (`serveListeners`' boot dump) gains `"adoption_adopt_unsigned", cfg.Adoption.AdoptUnsigned,` after `adoption_accept_any_signer` and `"gc_suite_idle_ttl", cfg.GC.SuiteIdleTTL.Duration,` after `gc_url_path_ttl` (the Task 11 review's minor 1).
+
+The `gc_disabled` WARN takes its detail from `gcDisabledDetail` (the final review's spec m7):
+
+```go
+	// SPEC4 §10.2: gc_disabled Warn names the operator's choice when
+	// the master switch is off. The cache still works, but disk usage
+	// will grow unbounded as adoptions roll. Suite reaping runs whatever
+	// gc.enabled says (spec C9), and the line says so (gcDisabledDetail).
+	if !cfg.GC.Enabled {
+		logger.Warn("gc_disabled", "detail", gcDisabledDetail(cfg.GC.SuiteIdleTTL.Duration))
+	}
+```
+
+and, after `buildAdopter`:
+
+```go
+// gcDisabledDetail is the gc_disabled WARN's detail: what gc.enabled =
+// false stops, and whether suite reaping still runs — it does whatever
+// gc.enabled says, unless gc.suite_idle_ttl is "0s" (spec C9) — and, when
+// it does not, what still deletes.
+//
+// AIDEV-NOTE: final review spec m7. For an operator who set gc.enabled =
+// false to keep everything, this is the one in-product line at the first
+// 1.1.0 start, an hour before the reaper's first run; it must not imply
+// that nothing is deleted. With "0s" too (the final fix wave's re-review,
+// logging minor 2) two deleters remain: cap eviction, at the global cap
+// only (createSuiteTx: a suite with no current snapshot, not requested
+// for suiteEvictIdle; the per-host cap only refuses), and the reaper's
+// daily orphan-marker sweep, which runOnce runs whatever the TTL (only
+// reaping is gated on it). Any other TTL keeps the line's "suite reaping
+// still runs"; "0s" there says "turns it off", not "keeps idle suites",
+// since cap eviction still takes idle suites.
+func gcDisabledDetail(suiteIdleTTL time.Duration) string {
+	const detail = "gc.enabled = false: orphan blobs and displaced snapshots will not be reaped; " +
+		"pool/ size grows unboundedly with rolling adoptions"
+	if suiteIdleTTL == 0 {
+		return detail + `; suite reaping is off too (gc.suite_idle_ttl = "0s"), but still deleted are suites ` +
+			`evicted at the freshness.max_suites total cap (no current snapshot, not requested for 24h) and, ` +
+			`daily, signed-seen records of untracked paths last seen over a year ago`
+	}
+	return detail + fmt.Sprintf(`; suite reaping still runs: gc.suite_idle_ttl = %s reaps the suites no client asked for in that long ("0s" turns it off)`,
+		suiteIdleTTL)
+}
+```
+
+The comment at the startup GC pass (`gc.New` … `StartupPass`) ends with Task 4's rule (ruling PF-15):
+
+```go
+	// listener). When gc.enabled = false, gcsvc.StartupPass returns
+	// immediately and the periodic goroutine below is never started.
+	// The one-shot pass runs no snapshot-GC sub-job C (ruling PF-15):
+	// retired snapshots never serve, so a backlog of them after a burst
+	// of reaps must not keep the listeners closed; the periodic ticks
+	// delete them, normally the first (a later one when an earlier pass,
+	// the startup pass's blob pass say, hit its deadline: the passes
+	// resume in rotation).
+```
 
 `admin.Config` gains `Forgetter: reaper,` after `Reconciler`; before `checkerConfig`:
 
@@ -8365,6 +9845,10 @@ Expected: PASS (`TestDefaultConfigFileDocumentsEveryKey` and `TestDefaultConfigF
 | the checks only with `gc.enabled` (`c.GC.Enabled &&` in both) | `TestLoad_SuiteIdleTTL` (`with gc.enabled = false`) |
 | `reaperConfig` drops the TTL | `TestReaperConfig_CarriesSuiteIdleTTL` |
 | `Forgetter: reaper` dropped | `TestServe_ForgetIsWired` (`POST /forget = 501`) |
+| the `"0s"` detail's old text (`; suite reaping is off too (gc.suite_idle_ttl = "0s")`; the final fix wave's residual L2) | `TestGCDisabledDetail_NamesSuiteReaping` (`reaper_wiring_test.go:186`) |
+| the `"0s"` detail claims eviction at "the total and per-host caps" (L2) | `TestGCDisabledDetail_NamesSuiteReaping` (`reaper_wiring_test.go:186`) |
+| the call site `gcDisabledDetail(cfg.GC.SuiteIdleTTL.Duration)` → `gcDisabledDetail(0)` (residual L3, M4) | `TestServeListeners_GCDisabledNamesTheConfiguredTTL` (`reaper_wiring_test.go:211`, the `48h` case) |
+| the call site → `gcDisabledDetail(720 * time.Hour)` (M4b) | `TestServeListeners_GCDisabledNamesTheConfiguredTTL` (`reaper_wiring_test.go:211`, both cases) |
 
 The reaper goroutine's start is pinned through the `runReaper` seam (`TestServeListeners_StartsTheReaperWhateverGCSays`: the start deleted, wrapped in `if cfg.GC.Enabled`, or run outside `freshWG` fails it), so no test waits out its hour-long uptime floor in the daemon (Task 6 pins `Run`'s schedule). A `/forget` cut short by the admin listener's shutdown is pinned by `TestEndpoint_Forget_ShutdownCutsItShort` (no `s.stop()`: `Shutdown` waits 5 s for the forget; the 503 branch dropped: the answer is 500; the line at WARN; `Forget` on the request's context: the disconnect subtest).
 
@@ -8874,10 +10358,10 @@ git commit -m "Close adoption.go's deferred minors E-6, E-7, E-8, E-12, E-15"
 
 ### Task 14: Deferred minors in the suite lock, `first_adoption.go` and the handler tests
 
-Earlier tasks change these files by hand — `suite_lock_test.go`, `suite_hit_test.go` and `suite_dod_test.go` (Task 1), `first_adoption.go` (Task 8) — and this task moves code into `suite_lock.go`'s neighbours (`clockstep.go`, `scheduler_test.go`, `unsigned.go`), so their open deferred minors land: D-24, D-25, E-49, E-33 (its `first_adoption.go` half), E-34, E-26 (a test of `first_adoption.go`'s anchor-row read error), D-36, D-40, D-41, D-42, D-43, D-44. Nothing here changes behaviour; the steps are moves, comments and stronger tests, so no step fails first. The `clockStep` AIDEV-NOTE also learns phase F's retiring gates (the anchor rule: notes follow the code they describe): a future marker stamp is read as now and never rewritten (ruling PF-1), and the reaper and the sweep report such a stamp when they first see it and when it changes (design review M-10), logged directly through Task 6's `clockStepUnlimited`. `HoldSuite`'s doc and AIDEV-NOTE say that `release(true)` keeps a live flip-gate entry (ruling R-F2; the Task 1 review's minor 3, fixed here in `suite_lock.go`'s last toucher). `unsignedRefusal` moves with the note Task 8 gave it (ruling PF-5).
+Earlier tasks change these files by hand — `suite_lock_test.go`, `suite_hit_test.go` and `suite_dod_test.go` (Task 1), `first_adoption.go` (Task 8) — and this task moves code into `suite_lock.go`'s neighbours (`clockstep.go`, `scheduler_test.go`, `unsigned.go`), so their open deferred minors land: D-24, D-25, E-49, E-33 (its `first_adoption.go` half), E-34, E-26 (a test of `first_adoption.go`'s anchor-row read error), D-36, D-40, D-41, D-42, D-43, D-44. Nothing here changes behaviour but the final review's two log-line items below; the other steps are moves, comments and stronger tests, so no step fails first. The `clockStep` AIDEV-NOTE also learns phase F's retiring gates (the anchor rule: notes follow the code they describe): a future marker stamp is read as now and never rewritten (ruling PF-1), and the reaper and the sweep report such a stamp when they first see it and when it changes (design review M-10), logged directly through Task 6's `clockStepUnlimited`. `HoldSuite`'s doc and AIDEV-NOTE say that `release(true)` keeps a live flip-gate entry (ruling R-F2; the Task 1 review's minor 3, fixed here in `suite_lock.go`'s last toucher). `unsignedRefusal` moves with the note Task 8 gave it (ruling PF-5). The final review's items in these two packages land here too (its spec m9; ruling PF-11 for the `handler.go` comments): `spawnRepair`'s note names the line a repair panic logs (`adoption_panicked`), deferred minors E-2 (its `handler.go` half) and E-63 correct two `handler.go` docs, the touch goroutine's panic line names the request's scheme (`canonical_scheme`), and `recordAdoptionFailure` logs a missing row at its read as WARN, not DEBUG — under ruling R-F1 every suite-row deleter holds the suite's mutex, which every writer of the record holds from its read of the row until the record is written, so a missing row there is a bug, not a routine reap. Those two log-line changes are behaviour; their tests (`TestAdoptionFailure_AMissingRowAtTheRecordIsAWarning`, `TestTouchAsync_RecoversItsPanic`) fail first.
 
 **Files:**
-- Modify: `internal/freshness/suite_lock.go` (D-25: `ReportClockStep` moves out; `HoldSuite`'s doc and AIDEV-NOTE; two notes; the `time` import goes), `internal/freshness/clockstep.go` (`ReportClockStep`, the `cache` import, `clockStep`'s AIDEV-NOTE), `internal/freshness/suite_lock_test.go` (D-24; three tests move out; `fmt` and `slices` imports go), `internal/freshness/scheduler_test.go` (the three tests, verbatim; `slices` import; E-49), `internal/freshness/first_adoption.go` (E-33: `unsignedRefusal` moves out; E-34), `internal/freshness/first_adoption_test.go` (E-26; the imports gain `log/slog`, `strings` and `sync/atomic`), `internal/freshness/unsigned.go` (`unsignedRefusal`, verbatim with Task 8's note; the file comment), `internal/handler/suite_hit_test.go` (D-36), `internal/handler/suite_dod_test.go` (D-40 to D-44; the `sync` import)
+- Modify: `internal/freshness/suite_lock.go` (D-25: `ReportClockStep` moves out; `HoldSuite`'s doc and AIDEV-NOTE; two notes; the `time` import goes), `internal/freshness/clockstep.go` (`ReportClockStep`, the `cache` import, `clockStep`'s AIDEV-NOTE), `internal/freshness/suite_lock_test.go` (D-24; three tests move out; `fmt` and `slices` imports go), `internal/freshness/scheduler_test.go` (the three tests, verbatim; `slices` import; E-49), `internal/freshness/first_adoption.go` (E-33: `unsignedRefusal` moves out; E-34), `internal/freshness/first_adoption_test.go` (E-26; the imports gain `log/slog`, `strings` and `sync/atomic`), `internal/freshness/unsigned.go` (`unsignedRefusal`, verbatim with Task 8's note; the file comment), `internal/freshness/freshness.go` (`spawnRepair`'s note), `internal/freshness/adoption_failure.go` (`recordAdoptionFailure`'s doc and its read's WARN; the `errors` import goes), `internal/freshness/adoption_failure_test.go` (the missing-row test; the `fmt` import), `internal/handler/handler.go` (E-2's half, E-63), `internal/handler/suite_rows.go` (the touch line's `canonical_scheme`), `internal/handler/suite_hit_test.go` (D-36; the touch line's scheme), `internal/handler/suite_dod_test.go` (D-40 to D-44; the `sync` import)
 
 **Interfaces:**
 - Consumes: nothing new.
@@ -9040,16 +10524,147 @@ func TestCheckFirst_AnchorRowReadErrorWritesNothing(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Handler test fixes**
-
-1. D-36 (`TestTouchAsync_RecoversItsPanic`):
+10. `spawnRepair`'s second AIDEV-NOTE (`freshness.go`) names the line a repair or reconcile panic logs (the final review's spec m9):
 
 ```go
+// AIDEV-NOTE: a repair or reconcile that panics deterministically is
+// logged (adoption_panicked, where=repair: recoverGoroutine), not
+// recorded: the spec C7 record is keyed on upstream content, and an
+// unchanged suite's heal has none, so the next unchanged check runs it
+// again — one ERROR line per cooldown at most (deferred minor B-37, phase
+// B deviation 7; kept in phase E: v7 has no record keyed on a snapshot).
+```
+
+11. `recordAdoptionFailure` (`adoption_failure.go`) logs a missing row at its read as WARN (the final review's spec m9; the `errors` import goes): its doc's last sentences become
+
+```go
+// It runs under the suite's mutex — in a check, or in the adoption
+// goroutine before it releases the mutex — so the next check already
+// sees the record. Shutdown is not a failure: nothing is recorded once
+// the lifetime context is done.
+```
+
+and its read's error branch:
+
+```go
+	cur, err := c.cache.GetSuiteFreshness(ctx, s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
+	if err != nil {
+		// AIDEV-NOTE: WARN, ErrNotFound included (final review spec m9).
+		// A suite row cannot vanish here: every deleter (cap eviction, the
+		// reaper, POST /forget) holds the suite's mutex through the
+		// SuiteGuard (ruling R-F1), and every writer of this record holds
+		// it from a read of the row until the record is written (the final
+		// fix wave's re-review, logging minor 4): a check, under its lock
+		// after checkLocked's read (check.go, first_adoption.go,
+		// current_form.go, unsigned.go), or the adoption goroutine a check
+		// handed the lock to, before it releases it (spawnAdoption's
+		// goroutine and its deferred recoverAdoption). A caller without the
+		// mutex would break this. A missing row is a bug, not a routine reap
+		// during the check or adoption, so it is not demoted to DEBUG. A
+		// shutdown that cut the read short is no fault, as for the write
+		// below (deferred minor E-36, B-20's remainder): DEBUG.
+		level := slog.LevelWarn
+		if c.lifetimeCtx.Err() != nil {
+			level = slog.LevelDebug
+		}
+		c.logger.Log(ctx, level, "adoption_failure_record_failed",
+			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath, "err", err)
+		return
+	}
+```
+
+Deferred minor E-36 (B-20's remainder; the final fix wave hand-edits this function, so the deferred-minor rule takes it): the read is preceded by a test hook, as the write is,
+
+```go
+	if c.recordReadHook != nil {
+		c.recordReadHook()
+	}
+```
+
+and `Checker`'s `recordHook` field (`freshness.go`) becomes
+
+```go
+	// recordHook, when set (tests only), runs in recordAdoptionFailure
+	// right before the record is written; recordReadHook right before the
+	// suite row is read.
+	recordHook, recordReadHook func()
+```
+
+with its test after `TestAdoptionFailureRecordCutByShutdownIsNotAWarning` in `deferred_e_test.go`:
+
+```go
+// Deferred minor E-36 (B-20's remainder): a shutdown that cuts the failure
+// record's read short is not a WARN either; it is logged at DEBUG.
+func TestAdoptionFailureRecordReadCutByShutdownIsNotAWarning(t *testing.T) {
+	r := newRetryRig(t, 0)
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	r.checker.recordReadHook = r.cancelLifetime // shutdown begins right before the read
+	r.check()
+	recs := r.events("adoption_failure_record_failed")
+	if len(recs) != 1 || recs[0]["level"] != "DEBUG" {
+		t.Fatalf("adoption_failure_record_failed lines %v; want one at DEBUG for the read shutdown cut short", recs)
+	}
+	if r.row().AdoptionFailCount != 0 {
+		t.Fatal("a record was written after shutdown began")
+	}
+}
+```
+
+Mutation check: the read's level always WARN (126137f's read path) fails it (`deferred_e_test.go:162`: `… level:WARN … want one at DEBUG for the read shutdown cut short`). `docs/log-fields.md`'s `adoption_failure_record_failed` row says DEBUG "for a read or a write that a shutdown cut short".
+
+12. Its test, after `TestAdoptionFailure_ShutdownIsNotRecorded` in `adoption_failure_test.go` (the imports gain `fmt`):
+
+```go
+// Final review spec m9: a failure record whose suite row is missing at
+// the record's read is logged at WARN, not DEBUG. Under ruling R-F1 every
+// suite-row deleter holds the suite's mutex, which the adoption holds
+// until its record is written, so a missing row there is a bug, never a
+// routine reap during the adoption.
+func TestAdoptionFailure_AMissingRowAtTheRecordIsAWarning(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.checker.recordAdoptionFailure(&adoptionRequest{suite: SuiteRef{CanonicalScheme: "http", CanonicalHost: rigHost,
+		SuitePath: "/r/dists/gone"}, key: "k"}, "verify_failed")
+	recs := r.events("adoption_failure_record_failed")
+	if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["suite_path"] != "/r/dists/gone" ||
+		!strings.Contains(fmt.Sprint(recs[0]["err"]), "not found") {
+		t.Fatalf("adoption_failure_record_failed lines %v; want one at WARN for the missing row", recs)
+	}
+}
+```
+
+- [ ] **Step 2: Handler test fixes**
+
+1. D-36, and the touch line's scheme (the final review's spec m9): `TestTouchAsync_RecoversItsPanic` becomes
+
+```go
+// Deferred minor C-24: the touch goroutine recovers its panic and logs it
+// once with the stack, naming the request's scheme, host and path (the
+// scheme tells an http copy of a suite from its https copy: final review
+// spec m9).
+func TestTouchAsync_RecoversItsPanic(t *testing.T) {
+	logs := &syncLog{}
+	h := &Handler{logger: slog.New(slog.NewJSONHandler(logs, nil))} // nil cache: the touch panics
+	touchPanicStackLogged.Store(false)
+	h.touchAsync(&proxy.Request{CanonicalScheme: "https", CanonicalHost: "h", Path: "/r/dists/s/InRelease"}, true, nil)
+	recs := logRecords(logs, "handler_goroutine_panicked", slog.LevelError)
 	var stack string
 	if len(recs) == 1 {
 		stack, _ = recs[0]["stack"].(string) // deferred minor D-36: a missing stack fails, not panics
 	}
-	if len(recs) != 1 || recs[0]["where"] != "touch" || recs[0]["panic"] == nil || !strings.Contains(stack, "touchAsync") {
+	if len(recs) != 1 || recs[0]["where"] != "touch" || recs[0]["panic"] == nil || !strings.Contains(stack, "touchAsync") ||
+		recs[0]["canonical_scheme"] != "https" || recs[0]["canonical_host"] != "h" || recs[0]["path"] != "/r/dists/s/InRelease" {
+		t.Fatalf("records = %+v; want one with where=touch, https://h's path, the panic and its stack", recs)
+	}
+}
+```
+
+   and the line it pins (`touchAsync`, `internal/handler/suite_rows.go`) gains the scheme:
+
+```go
+			h.logGoroutinePanic("handler_goroutine_panicked", &touchPanicStackLogged, v,
+				"where", "touch", "canonical_scheme", req.CanonicalScheme, "canonical_host", req.CanonicalHost, "path", req.Path)
 ```
 
 2. In `testMintedSuitesAtScale`: the `get` closure's parameter `url` becomes `target` (D-44: it shadowed `net/url`); after it, D-43's once-guarded closes:
@@ -9094,6 +10709,28 @@ func (p *firstByteProbe) Write(b []byte) (int, error) {
 
 and `TestServeHTTP_OnboardsADistsSuiteFromAV6Cache` checks `if p.err != nil || !p.row || !p.mark { t.Fatalf("at the first body byte row=%v marker=%v (read error %v), want both", p.row, p.mark, p.err) }`.
 4. In `TestHitPathInvariant_EveryTrackedSignedAnchorHasAMarker`: `h2`'s config gains `MaxSuites: 5000` (D-42); `assertHitPathInvariant(t, r.c, db, "after c's Release.gpg hit")` follows c's `Release.gpg` check and `assertHitPathInvariant(t, r.c, db, "after d's adoption")` follows `commitInlineSnapshot` (D-41); the check labelled "after serving" is labelled "after d's reconstruction" (D-40).
+5. `handler.go`'s two doc fixes (ruling PF-11). E-2's half — `classifyStrictMode`'s empty case:
+
+```go
+	if len(rows) == 0 {
+		// The host has no signed (inline or detached) current snapshot —
+		// no adopted suite, or only unsigned ones, which vouch nothing —
+		// so strict mode has no contract to uphold. Phase 1
+		// trust-upstream regime.
+		return strictInactive, 0, 0
+	}
+```
+
+   and E-63 — `AdoptionWaiter.WaitHostAdoptions`' doc names its third false case:
+
+```go
+	// WaitHostAdoptions waits until none is — at most min(15 s, 25 s −
+	// the time since the request started at start) — and reports whether
+	// to re-run the lookup once: false when 64 requests already wait on
+	// the host or less than 1 s of the budget is left, and false too when
+	// ctx ended during the wait (the caller answers client_canceled).
+	WaitHostAdoptions(ctx context.Context, host string, start time.Time) bool
+```
 
 - [ ] **Step 3: Run the tests**
 
@@ -9106,35 +10743,83 @@ Expected: PASS (`go vet` first: an unused or missing import is the usual slip of
 |---|---|
 | `ReportClockStep` passes the host and scheme swapped | `TestCreateSuite_ReportsAFutureStampThroughTheChecker` (`canonical_scheme=h canonical_host=http …`) |
 | `checkFirst` fails the check on the anchor-row read error (`c.failCheck(ctx, out, cur, suite, nowUnix, "probe", err)` before its `return nil`) | `TestCheckFirst_AnchorRowReadErrorWritesNothing` (`the read error wrote the row: {… LastCheckAt:0x… CheckFailCount:1 …}`) |
+| `recordAdoptionFailure`'s read error at DEBUG again for `ErrNotFound` (the final fix wave's E1) | `TestAdoptionFailure_AMissingRowAtTheRecordIsAWarning` (`adoption_failure_test.go:134`: `adoption_failure_record_failed lines []; want one at WARN for the missing row`) |
+| the touch line without `canonical_scheme` (E2) | `TestTouchAsync_RecoversItsPanic` (`suite_hit_test.go:717`: `records = …; want one with where=touch, https://h's path, the panic and its stack`) |
 
 The other items are moves, comments and failure-path hygiene (D-36, D-43, D-44's probe error) that no mutation of production code reaches.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-gofmt -l internal/freshness/suite_lock.go internal/freshness/clockstep.go internal/freshness/suite_lock_test.go internal/freshness/scheduler_test.go internal/freshness/first_adoption.go internal/freshness/first_adoption_test.go internal/freshness/unsigned.go internal/handler/suite_hit_test.go internal/handler/suite_dod_test.go
-git add internal/freshness/suite_lock.go internal/freshness/clockstep.go internal/freshness/suite_lock_test.go internal/freshness/scheduler_test.go internal/freshness/first_adoption.go internal/freshness/first_adoption_test.go internal/freshness/unsigned.go internal/handler/suite_hit_test.go internal/handler/suite_dod_test.go
-git commit -m "Close deferred minors D-24, D-25, D-36, D-40-D-44, E-26, E-33 (first_adoption.go), E-34, E-49"
+gofmt -l internal/freshness/suite_lock.go internal/freshness/clockstep.go internal/freshness/suite_lock_test.go internal/freshness/scheduler_test.go internal/freshness/first_adoption.go internal/freshness/first_adoption_test.go internal/freshness/unsigned.go internal/freshness/freshness.go internal/freshness/adoption_failure.go internal/freshness/adoption_failure_test.go internal/handler/handler.go internal/handler/suite_rows.go internal/handler/suite_hit_test.go internal/handler/suite_dod_test.go
+git add internal/freshness/suite_lock.go internal/freshness/clockstep.go internal/freshness/suite_lock_test.go internal/freshness/scheduler_test.go internal/freshness/first_adoption.go internal/freshness/first_adoption_test.go internal/freshness/unsigned.go internal/freshness/freshness.go internal/freshness/adoption_failure.go internal/freshness/adoption_failure_test.go internal/handler/handler.go internal/handler/suite_rows.go internal/handler/suite_hit_test.go internal/handler/suite_dod_test.go
+git commit -m "Close deferred minors D-24, D-25, D-36, D-40-D-44, E-2 (handler.go), E-26, E-33 (first_adoption.go), E-34, E-49, E-63; a missing row at a failure record is a WARN"
 ```
 
 ### Task 15: Definition of done — the 90-day simulation, production cadence, return and re-adoption, the escape hatch, self-heal, chaos, and the DoD map
 
 The acceptance tests of spec §9's F row, spec §7's C9 list, the overview's "F:" line and its F carry-forwards, and the plan review's additions, over the code of Tasks 1–14. They are written after the code, so no step fails first: a DoD test that fails names a defect in an earlier task, fixed there. Three files:
 - the simulation harness (design note 21), now with a cadence — the coarse one of deliberate deviation 2, or the production one — and the tests on it: the 90-day simulation (deviation 2), with a goroutine bound after every restart (design review M-6); the four-day production-cadence simulation the design review asked for (the reaper hourly, `gc.url_path_ttl = 168h`, a restart every 12 h: a suite whose deadline falls between a boot's last run and the restart — 29 minutes before it, the restart a minute before the boot's next run would come, and the checks a minute either side of the next boot's floor, so no scheduling order decides them (the Task 15 review's Important 1) — is reaped at the next boot's floor, never at its start; a suite whose anchor rows url_path GC deleted days earlier is still reaped, its marker kept; goroutines back at the first boot's count after every restart); and the forward-step self-heal, now in two parts (design review M-8): a step across a restart reaps at the first run, as before; a step while the reaper runs — taken once the run is idle (`synctest.Wait()`, Important 2) — is reported (`clock_step_detected`, `stamp=wall_clock`) and defers reaping by an uptime floor, after which the suites no client asked for go. The simulations and the chaos test also fail on any recovered panic (`noPanics`: `freshness_check_panicked` and `adoption_panicked` both 0; Important 3), and none of them depends on GOMAXPROCS (`-cpu 1,2,4`);
-- the retry-rig tests (return before GC, `/forget` and rollback, `gc.enabled = false`, never-downgrade after a reap from a phase-A-binary marker, and the `unsigned_downgrade_refused` escape hatch with no other row, with the `/.` twin keeping a row, and — ruling PF-2 — with a signed `InRelease` cached under the other scheme, which `/forget` now deletes with the markers). `newRigReaper` and `clientFetchedRelease` live here now (Task 8's retirement tests, which defined them, are gone: ruling PF-5). The rig's clock jumps 31 days at once, so `reapRig` clears the reaper's monotonic reference first: for a daemon that lived through those days the monotonic clock would have moved as far, and the forward-step guard (Task 6) must not take the jump for a step;
+- the retry-rig tests (return before GC — the startup GC pass leaves the retired snapshot, ruling PF-15, and the periodic ticks delete it, here the first (`firstPeriodicTick`), since the startup pass finished its passes —, `/forget` and rollback, `gc.enabled = false`, never-downgrade after a reap from a phase-A-binary marker, and the `unsigned_downgrade_refused` escape hatch with no other row, with the `/.` twin keeping a row, and — ruling PF-2 — with a signed `InRelease` cached under the other scheme, which `/forget` now deletes with the markers). `newRigReaper` and `clientFetchedRelease` live here now (Task 8's retirement tests, which defined them, are gone: ruling PF-5). The rig's clock jumps 31 days at once, so `reapRig` clears the reaper's monotonic reference first: for a daemon that lived through those days the monotonic clock would have moved as far, and the forward-step guard (Task 6) must not take the jump for a step;
 - the reap-vs-adoption chaos test (Review Focus 5), now under a suite cap of three for four suites (design review M-6: creations refused at the cap race the reaps, forgets and adoptions; a refused client's suite stays untracked) and with a goroutine bound once everything has stopped.
 
-The DoD map in Step 4 ties every requirement — the spec's, the overview's, and rulings PF-1..PF-10's — to its tests.
+The goroutine bound's sampler (`sampleGoroutines`, phase E's) stops the world before its re-read (the final review's tests I-1): under load a goroutine that has just exited — a restart ends several — was still counted by `runtime.NumGoroutine` after `synctest.Wait` returned, and failed a restart simulation now and then; a stop-the-world settles it, and a real leak stays over the bound on both reads.
+
+The DoD map in Step 4 ties every requirement — the spec's, the overview's, and rulings PF-1..PF-15's — to its tests.
 
 **Files:**
 - Create: `internal/freshness/dod_f_test.go`, `internal/freshness/dod_f_rig_test.go`, `internal/freshness/dod_f_chaos_test.go`
-- Modify: `internal/freshness/capacity_test.go` (`seedStaleAnchorErr`, for the chaos test's spawned goroutines; `seedStaleAnchorAt` wraps it)
+- Modify: `internal/freshness/capacity_test.go` (`seedStaleAnchorErr`, for the chaos test's spawned goroutines; `seedStaleAnchorAt` wraps it), `internal/freshness/sim_sched_test.go` (`sampleGoroutines`' stop-the-world re-read)
 
 **Interfaces:**
 - Consumes: `NewReaper`, `ReaperConfig`, `(*Reaper).Run`, `runOnce`, `Forget` (`cache.ForgetResult`), the fields `interval`, `lastMono`, the constant `reapInterval` (Tasks 6, 10); `gc.New`, `gc.Config` (`URLPathTTL`, `HoldWindow`), `(*gc.GC).StartupPass`, `Run`; `RunLegacyTrustAudit`; `(*cache.Cache).CreateSuite` (`cache.SuiteCaps{Global}`, `cache.SuiteRejectedGlobal`), `TouchSuite`, `HasSuiteRow`, `GetSuiteFreshness`, `GetSuiteSnapshot`, `GetSnapshotMember`, `ListSnapshotMembers`, `ListSuitesWithAdoption`, `BlobExists`, `SignedSeen`, `MarkSignedSeenBatch`, `LookupURL`, `PutURLPath`, `ClearSignedSeenForTest`, `EnqueueLegacyTrustAudit`, `EnsureSuiteForTest`, `SeedSuiteForTest`, `TouchedSuites`, `Dir`; `(*Checker).HoldSuite`, `Check`, `WaitForAdoptions`, `LockCount`; `(*Adopter).writeBlobBytes`; `flipgate.New`, `(*flipgate.Gate).Len`; `wallclock.SetOffsetForTest`, `wallclock.Unix`; `simtest.ClearsignedFixture`, `simtest.OpenCache`, `simtest.StaticConditional`; freshness test helpers `newRetryRig` (`adopt`, `release`, `up`, `unsignedRelease`, `check`, `row`, `currentSnapshot`, `clock`, `adopter`, `logs`), `seedStaleAnchor`, `seedStaleAnchorAt`, `rigUpstream`, `newFakeFetcher`, `passThroughVerifier`, `fakePackagesStanzas`, `hashRelease`, `shaOf`, `hashOf`, `strOf`, `lockedBuffer`, `discardLogger`, `baseGoroutines`, `sampleGoroutines` (`sim_sched_test.go`), constants `rigHost`, `rigSuite`, `rigAnchorURL`, `rigReleaseURL`, `testHex64`.
-- Produces: test helpers `simReapEvery`, `simCadence`, `coarseCadence`, `productionCadence`, `simBoot`, `startSimBoot(t, dir, members, logs) *simBoot`, `startSimBootAt(t, dir, members, logs, cad simCadence) *simBoot` (`stop`, `exists`, `use`), `countRows(t, c, query, args...) int`, `noPanics(t, logs)`, `simKey`, `simSuites`, `reapedLines` (`dod_f_test.go`); `reapAge`, `newRigReaper(r) *Reaper`, `(*retryRig).clientFetchedRelease(body)`, `reapRig(rp)`, `clientReturns()`, `retiredCount()`, `reCreateForRelease(rel)`, `downgradeRefusedAfterReap(t)` (`dod_f_rig_test.go`); `countMsgs` (`dod_f_chaos_test.go`); `seedStaleAnchorErr(ctx, c, host, suite) error` (`capacity_test.go`).
+- Produces: test helpers `simReapEvery`, `simCadence`, `coarseCadence`, `productionCadence`, `simBoot`, `startSimBoot(t, dir, members, logs) *simBoot`, `startSimBootAt(t, dir, members, logs, cad simCadence) *simBoot` (`stop`, `exists`, `use`), `countRows(t, c, query, args...) int`, `noPanics(t, logs)`, `simKey`, `simSuites`, `reapedLines` (`dod_f_test.go`); `reapAge`, `newRigReaper(r) *Reaper`, `(*retryRig).clientFetchedRelease(body)`, `reapRig(rp)`, `clientReturns()`, `retiredCount()`, `firstPeriodicTick(t, g *gc.GC)`, `reCreateForRelease(rel)`, `downgradeRefusedAfterReap(t)` (`dod_f_rig_test.go`); `countMsgs` (`dod_f_chaos_test.go`); `seedStaleAnchorErr(ctx, c, host, suite) error` (`capacity_test.go`).
 
 - [ ] **Step 1: Write the DoD tests**
+
+In `internal/freshness/sim_sched_test.go`, `sampleGoroutines` becomes (the final review's tests I-1; the note's account of the transient is the final fix wave's residual G5, from the runtime's source):
+
+```go
+// sampleGoroutines is one goroutine sample of a simulation bounded by
+// limit: runtime.NumGoroutine read after synctest.Wait, and, when that
+// read is over limit, read once more after the world was stopped
+// (runtime.ReadMemStats) and another Wait.
+//
+// AIDEV-NOTE: final fix wave FW-4 (b), superseding the ledger's "baseline
+// delta" ruling (the limits were already relative to a baseline).
+// NumGoroutine is a process-wide, lock-free sum: sampled while the
+// bubble's goroutines still did real work — an adoption in a syscall,
+// database/sql's per-query awaitDone and interruptOnDone goroutines
+// starting and exiting — it read 22–49 where a goroutine profile taken at
+// once showed 12–15, all expected (9 failures in 36 runs under CPU load).
+// Waiting first let them settle (0 in 60). What is left is a goroutine
+// that has just exited — a bubble goroutine (a restart ends several:
+// Reaper.Run, GC.Run, the cache's writer, database/sql's
+// connectionOpener), whose exit takes it out of the bubble's count, so
+// Wait returns, while the runtime has not yet put it on a free list
+// (gdestroy's gfput), so NumGoroutine still counts it, the longer while
+// its thread is descheduled under load (the final fix wave's re-review,
+// gc-sims minor 5, from the runtime's source). Phase F's final review
+// (tests I-1) caught 6 such reads in 64 restart-simulation runs (load1
+// about 20), each a dump of exactly the expected goroutines taken right
+// after the second read of 9 against 8. A re-read after a bare second
+// Wait, microseconds later, did not absorb it; one after a stop-the-world
+// does, since the stop cannot complete until the exiting goroutine's
+// thread reaches the scheduler, after gfput (the reviewer's overlay: 0
+// failures in 64 runs, 4 transients absorbed, and 0 in 108 with the stop
+// between the reads). A real leak stays over the limit on both reads.
+func sampleGoroutines(limit int) int {
+	synctest.Wait()
+	n := runtime.NumGoroutine()
+	if n > limit {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms) // stops the world: an exited goroutine's count settles
+		synctest.Wait()
+		n = runtime.NumGoroutine()
+	}
+	return n
+}
+```
 
 In `internal/freshness/capacity_test.go`, `seedStaleAnchorAt`'s work moves into `seedStaleAnchorErr`, which returns its error, so the chaos test's goroutines can seed without `t.Fatal`:
 
@@ -9552,15 +11237,19 @@ func TestDoD_NinetyDaysOfReapingWithRestarts(t *testing.T) {
 					// b1 at 21:00, in a boot started at 08:00 that day; n0
 					// at 13:00, in the boot started on day 55 at 00:00. A
 					// boot's GC passes come at its start and every 24 h
-					// after, so for b0, b1 and b2 exactly two (08:00 on
-					// days l+31 and l+32) have followed the reap by 09:00
-					// on day l+32: the two-tick bound this pins (the Task
-					// 15 review's minor 1: by l+33, three had). For n0 two
-					// or three have, depending on scheduling: its boot's
-					// pass due on day 60 at 00:00 falls at the instant of
-					// that day's restart and may run before the stop, then
-					// come the new boot's startup pass and its pass on day
-					// 61 at 00:00.
+					// after; the startup pass runs no sub-job C (ruling
+					// PF-15), the periodic ticks do. So for b0, b1 and b2
+					// exactly two periodic ticks (08:00 on days l+31 and
+					// l+32) have followed the reap by 09:00 on day l+32:
+					// the two-tick bound this pins (the Task 15 review's
+					// minor 1: by l+33, three had). For n0 one or two
+					// periodic ticks have, depending on scheduling: its
+					// boot's tick due on day 60 at 00:00 falls at the
+					// instant of that day's restart and may run before the
+					// stop; then come the new boot's startup pass, which
+					// leaves n0's retired snapshot, and its tick on day 61
+					// at 00:00, which deletes it and the anchor blob if the
+					// day-60 tick did not run.
 					if ok, err := b.c.BlobExists(shaOf(inRelease[s])); err != nil || ok {
 						t.Fatalf("day %d: %s's anchor blob outlived two GC ticks (%v, %v)", day, s, ok, err)
 					}
@@ -9829,10 +11518,35 @@ func (r *retryRig) retiredCount() int {
 		rigSuite)
 }
 
+// firstPeriodicTick runs g's periodic loop until its first tick has
+// completed (LastRunSummary's phase is then "periodic"), then stops it
+// and waits for Run to return. g's interval must be short: the first tick
+// comes one interval after the loop starts. It waits at most 10 s.
+func firstPeriodicTick(t *testing.T, g *gc.GC) {
+	t.Helper()
+	life, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { g.Run(life); close(done) }()
+	defer func() { cancel(); <-done }()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		if s, ok := g.LastRunSummary(); ok && s.Phase == "periodic" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no periodic GC tick completed within 10 s")
+		}
+	}
+}
+
 // Spec §7 C9: a reaped suite whose client returns before any GC tick
 // re-adopts its unchanged upstream content within one check — the retired
-// snapshot with the same natural key refuses nothing — and the GC pass
-// that then deletes the retired snapshot leaves the new one whole.
+// snapshot with the same natural key refuses nothing — and the GC tick
+// that then deletes the retired snapshot leaves the new one whole. The
+// startup GC pass, which runs before the listeners serve, leaves the
+// retired snapshot (ruling PF-15: no sub-job C there); the first periodic
+// tick deletes it, since the startup pass here reaches no deadline (one
+// whose blob pass did would leave sub-job C to a later tick: the passes
+// resume in rotation).
 func TestDoD_ReturnBeforeGCReadoptsWithinOneCheck(t *testing.T) {
 	ctx := context.Background()
 	r := newRetryRig(t, time.Minute)
@@ -9846,7 +11560,7 @@ func TestDoD_ReturnBeforeGCReadoptsWithinOneCheck(t *testing.T) {
 	if snap == nil || snap.SnapshotID == old.SnapshotID || strOf(snap.SingleAnchorHash) != strOf(old.SingleAnchorHash) {
 		t.Fatalf("after one check: snapshot %+v; want the unchanged anchor adopted as a new snapshot (old %d)", snap, old.SnapshotID)
 	}
-	g, err := gc.New(gc.Config{Cache: r.cache, Logger: discardLogger(), Enabled: true, Interval: 24 * time.Hour, BatchSize: 100,
+	g, err := gc.New(gc.Config{Cache: r.cache, Logger: discardLogger(), Enabled: true, Interval: time.Millisecond, BatchSize: 100,
 		SnapshotBatchSize: 10, MaxTickDuration: 5 * time.Minute, BlobGrace: time.Nanosecond, KeepDisplaced: 3,
 		PoolScanWorkers: 1, HeartbeatStaleGrace: 30 * time.Minute})
 	if err != nil {
@@ -9855,8 +11569,12 @@ func TestDoD_ReturnBeforeGCReadoptsWithinOneCheck(t *testing.T) {
 	if err := g.StartupPass(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := r.cache.GetSuiteSnapshot(ctx, old.SnapshotID); err != nil {
+		t.Fatalf("the startup GC pass deleted the retired snapshot (%v): it runs no sub-job C", err)
+	}
+	firstPeriodicTick(t, g)
 	if _, err := r.cache.GetSuiteSnapshot(ctx, old.SnapshotID); !errors.Is(err, cache.ErrNotFound) {
-		t.Fatalf("the retired snapshot survived the GC pass (%v)", err)
+		t.Fatalf("the retired snapshot survived the first periodic GC tick (%v)", err)
 	}
 	m, err := r.cache.GetSnapshotMember(ctx, snap.SnapshotID, "main/binary-amd64/Packages")
 	if err != nil {
@@ -10295,7 +12013,8 @@ Expected: PASS, every run under 4.5 s (PE-8). Measured under `-race` at load ave
 | `retireSuiteSnapshotsTx` retires only the current snapshot (`AND snapshot_id = ?`) | `TestDoD_ForgetThenRequestReadoptsAndRollbackAdopts` (`after forget 0 and one check: snapshot <nil>; want v1 adopted`: the displaced v1, left live, refuses the rollback) |
 | `ReapIdleSuite` deletes the base's markers (its stamping `UPDATE` made a `DELETE`) | `TestDoD_NeverDowngradeAfterReap`, `TestDoD_ForgetIsTheEscapeHatchForADowngradeRefusal` (`the reap took the marker`) |
 | `ForgetSuite`'s other-row check ignores the twin (`base, base`) | `TestDoD_ForgetIsTheEscapeHatchForADowngradeRefusal/the_twin_keeps_a_row` (`after /forget: marker false; want true`) |
-| snapshot-GC sub-job C does nothing (`RunRetiredSnapshotGCChunk` not called, `internal/gc/snapshot.go`) | `TestDoD_ReturnBeforeGCReadoptsWithinOneCheck` (`the retired snapshot survived the GC pass`), `TestDoD_NinetyDaysOfReapingWithRestarts` (`day 32: /r/dists/b0's anchor blob outlived two GC ticks`) |
+| snapshot-GC sub-job C does nothing (`RunRetiredSnapshotGCChunk` not called, `internal/gc/snapshot.go`; the final fix wave's C2) | `TestDoD_ReturnBeforeGCReadoptsWithinOneCheck` (`dod_f_rig_test.go:138`: `the retired snapshot survived the first periodic GC tick (<nil>)`), `TestDoD_NinetyDaysOfReapingWithRestarts` (`dod_f_test.go:400`: `day 32: /r/dists/b0's anchor blob outlived two GC ticks`) |
+| PF-15: the startup GC pass runs sub-job C again (`if phase == phaseStartup` → `if false`; C1) | `TestDoD_ReturnBeforeGCReadoptsWithinOneCheck` (`dod_f_rig_test.go:134`: `the startup GC pass deleted the retired snapshot (… not found): it runs no sub-job C`) |
 | PF-2: `ForgetSuite` deletes no anchor rows | `TestDoD_ForgetIsTheEscapeHatchForADowngradeRefusal/the_other_scheme_cached_a_signed_anchor` (`snapshot <nil>, record "unsigned_downgrade_refused"`) |
 | M-8: the forward-step guard never defers | `TestDoD_ForwardStepFalseReapsSelfHeal/while_running` (`/r/dists/s0 reaped by the run that saw the forward step`) |
 | `reapUptimeFloor = 2 * time.Hour` | `TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts` (`/r/dists/edge not reaped at the boot's floor, 89 minutes past its deadline`) |
@@ -10304,6 +12023,9 @@ Expected: PASS, every run under 4.5 s (PE-8). Measured under `-race` at load ave
 | M-6: a goroutine leaked per reaper run (`Run`) | `TestDoD_ReapRacesAdoptionsAndClients` (`54 goroutines after the run, 6 before it`) |
 | `reapSuite` releases a reaped suite as kept (`release(gone && false)`) | `TestDoD_NinetyDaysOfReapingWithRestarts` (`day 31: reaped /r/dists/b0 kept its lock-map entry`) |
 | a recovered panic in a reaper run (a nil-map write in `reapSuite`) | `TestDoD_ReapRacesAdoptionsAndClients` (`recovered panics: freshness_check_panicked 5, …; want none`) |
+| `sampleGoroutines` without its stop-the-world (`runtime.ReadMemStats`), under the final review's load (12 busy loops; tests I-1) | `TestDoD_NinetyDaysOfReapingWithRestarts` and `TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts` now and then (`dod_f_test.go:326: after a restart: 9 goroutines, the first boot had 8`; 4 of 32 runs, against 0 of 40 with it) — a load reproduction, not a mutation check |
+
+The final fix wave's rows give each failing line as at 042f8d4.
 
 - [ ] **Step 4: The DoD map**
 
@@ -10311,36 +12033,38 @@ Expected: PASS, every run under 4.5 s (PE-8). Measured under `-race` at load ave
 |---|---|---|
 | §9 F: 90-day simulation at `gc.interval = 24h` with restarts (touched, idle, near-TTL, busy, clock jump; §7), goroutines bounded per boot (design review M-6) | `TestDoD_NinetyDaysOfReapingWithRestarts` (deviation 2) | 15 |
 | §7 at the production cadence (the design review's addition to deviation 2): hourly runs, the floor across restarts (a deadline between a boot's last run and the restart reaped at the next boot's floor, never at its start, whatever GOMAXPROCS), `gc.url_path_ttl = 168h` taking a suite's anchors before its reap, no recovered panic | `TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts` | 15 |
-| §9 F, §7: return before GC re-adopts within one check | `TestDoD_ReturnBeforeGCReadoptsWithinOneCheck` | 15 |
+| §9 F, §7: return before GC re-adopts within one check; the startup GC pass runs no sub-job C, and the periodic ticks delete the retired snapshot — normally the first, which these tests pin with a startup pass that finished its passes (ruling PF-15) | `TestDoD_ReturnBeforeGCReadoptsWithinOneCheck`, `TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs` | 15, 4 |
 | §9 F, §7: `/forget` then a request re-adopts; after an upstream rollback, the older content | `TestDoD_ForgetThenRequestReadoptsAndRollbackAdopts`; `TestReaper_ForgetDeletesASuiteRegardlessOfIdleness` | 15, 10 |
-| §9 F, §7: a forward step's false reaps self-heal; a step while running defers reaping by the floor (design review M-8) | `TestDoD_ForwardStepFalseReapsSelfHeal` (both parts), `TestReaper_AForwardStepDefersReapingByTheFloor`, `TestReaper_RunsFarApartAreNoForwardStep`, `TestReaper_AForwardStepDefersTheMarkerSweep` | 15, 6, 9 |
-| §9 F, §7, overview F line: never-downgrade after a reap (a phase-A-binary signed snapshot, its marker from the startup pass); every suite-row delete — cap eviction, reap, forget — moves the base's markers up, never creating or lowering one (design review M-9, ruling PF-10) | `TestDoD_NeverDowngradeAfterReap`, `TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap`, `TestCreateSuite_EvictionMovesTheBaseMarkersUp` | 15, 3 |
+| §9 F, §7: a forward step's false reaps self-heal; a step while running defers reaping by the floor (design review M-8); a detected step never ages a marker, the steps adding up and saturating, and a start with the clock ahead has a day before the first sweep (ruling PF-13) | `TestDoD_ForwardStepFalseReapsSelfHeal` (both parts), `TestReaper_AForwardStepDefersReapingByTheFloor`, `TestReaper_RunsFarApartAreNoForwardStep`, `TestReaper_AForwardStepDefersTheMarkerSweep`, `TestReaper_AForwardStepWhileRunningAgesNoMarker`, `TestReaper_ForwardStepsAddUp`, `TestReaper_StepAheadSaturates`, `TestReaper_AClockAheadAtStartHasADayToBeCorrected` | 15, 6, 9 |
+| §9 F, §7, overview F line: never-downgrade after a reap (a phase-A-binary signed snapshot, its marker from the startup pass); every suite-row delete — cap eviction, reap, forget — moves the base's markers up, never lowering one (design review M-9, ruling PF-10), and creates one only from the deleted suite's own adopted signed snapshot, before retiring it (ruling PF-12) | `TestDoD_NeverDowngradeAfterReap`, `TestReapIdleSuite_MovesTheBaseMarkersUpToTheReap`, `TestCreateSuite_EvictionMovesTheBaseMarkersUp`, `TestReapIdleSuite_TurnsSignedSnapshotHistoryIntoAMarker`, `TestCreateSuite_EvictionTurnsSignedSnapshotHistoryIntoAMarker`, `TestForgetSuite_DeletesTheHistoryMarkerOnlyWithoutAnotherSuite`, `TestDeleteSuite_NoSignedHistoryCreatesNoMarker`, `TestDeleteSuite_ASiblingsSignedHistoryCreatesNoMarker` | 15, 3 |
 | §9 F, §7: `/forget` CSRF — a cross-site form or fetch cannot trigger it (ruling PF-6; DNS rebinding is spec §10 G-1's) | `TestEndpoint_Forget_RefusesCrossOriginRequests` | 10 |
 | §9 F, §7: twins and nested suites untouched | `TestReap_LeavesTwinsAndNestedSuitesAlone`, `TestDeleteSuiteMetadata_DeletesOnlyTheSuitesRows`, `TestSweepOrphanMarkers_SweepsOnlyYearOldOrphans`, `TestForgetSuite_ATwinPathDeletesItsBasesMarkers` | 3, 9 |
 | §7: `gc.enabled = false` still re-adopts | `TestDoD_GCDisabledStillReadopts` | 15 |
 | §7: batched metadata deletion never repeats the decrement | `TestDeleteSuiteMetadata_NeverRepeatsADecrement`, `TestDeleteSuiteMetadata_BatchesOfAThousandAnchorsLast`, `TestReapIdleSuite_ReleasesOnlyTheCurrentSnapshotsPins` | 3 |
-| §7: reap-vs-adoption chaos, under the suite cap, goroutines bounded (design review M-6) | `TestDoD_ReapRacesAdoptionsAndClients` | 15 |
-| §7: blobs reclaimed within two GC ticks | `TestDoD_NinetyDaysOfReapingWithRestarts` (day L+32: exactly two GC passes after each reap), `TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs` | 15, 4 |
+| §7: reap-vs-adoption chaos, under the suite cap, goroutines bounded (design review M-6; the sampler's stop-the-world re-read, the final review's tests I-1) | `TestDoD_ReapRacesAdoptionsAndClients` | 15 |
+| §7: blobs reclaimed within two periodic GC ticks when no pass reaches its deadline (the startup pass runs no sub-job C: ruling PF-15) | `TestDoD_NinetyDaysOfReapingWithRestarts` (day L+32: exactly two periodic ticks after the reaps of b0, b1 and b2), `TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs` | 15, 4 |
 | Overview F line: `ReapIdleSuite`, `POST /forget`; the refcount release reuses `decrementSnapshotRefcountsTx` (`RetireSuiteSnapshots` dropped with R-F4's retirement, ruling PF-5) | `TestReapIdleSuite_RetiresEverySnapshotAndDeletesTheRow`, `TestEndpoint_Forget` | 3, 10 |
-| Overview F line, A carry-forward: non-canonical rows reaped regardless of idleness, first (ruling PF-4); `/foo/dists/InRelease` by idleness | `TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem`, `TestReaperCandidates_NullAndFutureStampsAreNeverIdle`, `TestReaperCandidates_ReapedRegardlessGoFirst` | 6 |
+| Overview F line, A carry-forward: non-canonical rows reaped regardless of idleness, first (ruling PF-4), on a budget of their own, 250 a run beside the 25 idle ones (ruling PF-14); `/foo/dists/InRelease` by idleness | `TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem`, `TestReaperCandidates_NullAndFutureStampsAreNeverIdle`, `TestReaperCandidates_ReapedRegardlessGoFirst`, `TestReaper_AtMost25PerRunOldestFirst`, `TestReaper_EachClassHasItsOwnBudget` | 6 |
 | Overview F line, A carry-forward: retired snapshots leave `keep_displaced`; sub-job C deletes audit-retired ones | `TestRunSnapshotGCBatch_RetiredSnapshotsTakeNoKeepDisplacedSlot`, `TestRunRetiredSnapshotGCChunk_DeletesAuditRetiredSnapshots`, `…_DeletesRetiredSnapshotsInChunks`, `…_TheChunkIsTenThousandRows` | 4 |
-| Overview F line, R-F5 with ruling PF-1, E carry-forward: the marker sweep (a year, no row for the base or twin, either scheme, re-checked in the writer; a future stamp read as now, never rewritten, reported when it changes) | `TestSweepOrphanMarkers_SweepsOnlyYearOldOrphans`, `…_NeverRewritesAFutureStamp`, `…_BackwardStepThenCorrectionSweepsNothing`, `TestDeleteOrphanMarkers_RechecksInTheWriter`, `TestReaper_SweepsOrphanMarkersAndKeepsFutureStamps`, `TestReaper_TheMarkerTTLIsAYear`, `TestReaper_ReportsAFutureMarkerOnlyWhenItChanges`, `TestCheck_EverySightingAdvancesTheMarkerStamp` | 9 |
+| Overview F line, R-F5 with ruling PF-1, E carry-forward: the marker sweep (a year, no row for the base or twin, either scheme, re-checked in the writer; a future stamp read as now, never rewritten, reported when it changes; the first sweep a day after `Run` starts, then daily: ruling PF-13) | `TestSweepOrphanMarkers_SweepsOnlyYearOldOrphans`, `…_NeverRewritesAFutureStamp`, `…_BackwardStepThenCorrectionSweepsNothing`, `TestDeleteOrphanMarkers_RechecksInTheWriter`, `TestReaper_SweepsOrphanMarkersAndKeepsFutureStamps`, `TestReaper_TheMarkerTTLIsAYear`, `TestReaper_TheMarkerSweepIsDueADayAfterTheStartThenDaily`, `TestReaper_ReportsAFutureMarkerOnlyWhenItChanges`, `TestCheck_EverySightingAdvancesTheMarkerStamp` | 9 |
 | B carry-forward: a reaped suite's parked scheduler entry flushes | `TestReaper_AReapedWaiterFlushesOnItsNextOffer` | 6 |
-| C, D carry-forwards, R-F1: the purge (lock map, flip gate, touch) through the one delete path; only the reaper and `/forget` call the deleters (design review M-5) | `TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem`, `TestReaper_ForgetDeletesASuiteRegardlessOfIdleness`, `TestReaper_DropsTheLockEntryOfASuiteGoneSinceTheListing`, `TestReaper_AKeptSuiteKeepsItsLockEntry`, `TestSuiteFreshnessHasOneDeleteSite`, `TestSuiteRowWritersHaveKnownCallers`, `TestSuiteDeletersHaveKnownCallers`, `TestSignedSeenHasKnownDeleteSites` | 2, 3, 6, 9, 10 |
+| C, D carry-forwards, R-F1: the purge (lock map, flip gate, touch) through the one delete path; only the reaper and `/forget` call the deleters, each only from the file that does today, and only the reaper the orphan sweep (design review M-5; the final review's tests m-1) | `TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem`, `TestReaper_ForgetDeletesASuiteRegardlessOfIdleness`, `TestReaper_DropsTheLockEntryOfASuiteGoneSinceTheListing`, `TestReaper_AKeptSuiteKeepsItsLockEntry`, `TestSuiteFreshnessHasOneDeleteSite`, `TestSuiteRowWritersHaveKnownCallers`, `TestSuiteDeletersHaveKnownCallers`, `TestSignedSeenHasKnownDeleteSites` | 2, 3, 6, 9, 10 |
 | D carry-forward, R-F2: `Gate.Purge` skips live entries | `TestGate_PurgeSkipsLiveEntries`, `TestGate_PurgeKeepsTheEntryOfAFlipInPhaseA`, `TestHoldSuite_ReleaseKeepsARecreatedSuitesLiveGateEntry` | 1 |
-| D carry-forward, R-F3 with rulings PF-3, PF-4: legacy junk reaped every run, first, whatever its record; a plain-text Release kept by content; a transient soft-404 kept | `TestReaper_ReapsLegacyJunkKeepsTransientSoft404`, `TestReaper_RemembersJunkVerdictsByBlob`, `TestReaper_TheJunkGraceIsADay`, `TestReaper_JunkIsNotStarvedByAnIdleBacklog`, `TestReaper_JunkReadFailuresLogOncePerScan`, `TestListUnadoptedSuiteAnchors_ProbesURLPathByItsKey` | 7 |
+| D carry-forward, R-F3 with rulings PF-3, PF-4, PF-14: legacy junk reaped every run, first, on its own budget, whatever its record; a plain-text Release kept by content; a transient soft-404 kept; a completed scan keeps only the verdicts it reached | `TestReaper_ReapsLegacyJunkKeepsTransientSoft404`, `TestReaper_RemembersJunkVerdictsByBlob`, `TestReaper_ACompletedScanDropsTheVerdictsItDidNotReach`, `TestReaper_TheJunkGraceIsADay`, `TestReaper_JunkIsNotStarvedByAnIdleBacklog`, `TestReaper_JunkReadFailuresLogOncePerScan`, `TestListUnadoptedSuiteAnchors_ProbesURLPathByItsKey` | 7 |
 | E carry-forward PE-12, ruling PF-5: with `adopt_unsigned = false` an established unsigned suite keeps its coherent snapshot (refused, visible, paced) | `TestServeHTTP_KnobOffKeepsServingTheUnsignedSnapshot`, `TestCheck_UnsignedSuiteWithTheKnobOffIsAPacedRefusal` (phase E) | 8 |
 | E carry-forward, ruling PF-2: the `unsigned_downgrade_refused` escape hatch with no other row, with a `/.` twin row, and with a signed anchor cached under the other scheme | `TestDoD_ForgetIsTheEscapeHatchForADowngradeRefusal`, `TestForgetSuite_DeletesTheBaseMarkersOnlyWithoutAnotherSuite` | 15, 3 |
 | Ruling PF-7: `/forget`'s replies say what happened; the status page shows the scheme | `TestEndpoint_Forget`, `TestReaper_ForgetAnswersFalseForBusyAndUnknown`, `TestStatus_SuitesShowTheirScheme` | 10 |
 | Design review M-2: bounded held work, a failed submit settled by a fresh read | `TestReaper_BoundsTheWorkUnderAHoldAtFiveMinutes`, `TestReaper_ForgetBoundsItsWorkAtFiveMinutes`, `TestReapAndForget_AFailedSubmitWhoseDeleteCommittedIsGone`, `TestReaper_ForgetDropsTheLockEntryOfASuiteGoneUnderTheHold` | 3, 6, 10 |
 | Design review M-3, M-4, M-10, M-16: shutdown at DEBUG; one line per failed scan; future stamps reported when they change; `acu_suites_reaped_total{reason}` | `TestReaper_AShutdownMidRunIsNoFailure`, `TestReaper_JunkReadFailuresLogOncePerScan`, `TestReaperCandidates_ReportsAFutureStampOnlyWhenItChanges`, `TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem`, `TestReaper_ReapsLegacyJunkKeepsTransientSoft404` | 6, 7, 9 |
+| The final review's logging (spec m1, m2, m7, m9): `/forget`'s panic logged `where=forget`, net/http's admin lines at ERROR, the settled `suite_forgotten`; the `gc_disabled` WARN names suite reaping; a missing row at a failure record is a WARN; the touch line's scheme | `TestReaper_ForgetReleasesAsTheCacheAnswersAfterAPanic`, `TestEndpoint_Forget_APanicIsLoggedThroughSlog`, `TestReaper_ForgetReportsEachStepsDatabaseError`, `TestGCDisabledDetail_NamesSuiteReaping`, `TestServeListeners_GCDisabledNamesTheConfiguredTTL`, `TestAdoptionFailure_AMissingRowAtTheRecordIsAWarning`, `TestAdoptionFailureRecordReadCutByShutdownIsNotAWarning`, `TestTouchAsync_RecoversItsPanic` | 10, 11, 14 |
+| Deferred minors D-18 and B-61 (the final review's spec m4): a suite mismatch refused before any write; a reason-less record row renders "" | `TestStoreFetched_RefusesASuiteMismatch`, `TestAdoptionStatus_ANilReasonIsNoRecord` | 3, 10 |
 | D, E carry-forwards: the "(a later release)" texts | Task 16's grep | 16 |
 
 - [ ] **Step 5: Commit**
 
 ```bash
-gofmt -l internal/freshness/dod_f_test.go internal/freshness/dod_f_rig_test.go internal/freshness/dod_f_chaos_test.go internal/freshness/capacity_test.go
-git add internal/freshness/dod_f_test.go internal/freshness/dod_f_rig_test.go internal/freshness/dod_f_chaos_test.go internal/freshness/capacity_test.go
+gofmt -l internal/freshness/dod_f_test.go internal/freshness/dod_f_rig_test.go internal/freshness/dod_f_chaos_test.go internal/freshness/capacity_test.go internal/freshness/sim_sched_test.go
+git add internal/freshness/dod_f_test.go internal/freshness/dod_f_rig_test.go internal/freshness/dod_f_chaos_test.go internal/freshness/capacity_test.go internal/freshness/sim_sched_test.go
 git commit -m "Phase F definition of done: the 90-day and production-cadence simulations, return and re-adoption, the escape hatch, self-heal and chaos"
 ```
 
@@ -10348,7 +12072,7 @@ git commit -m "Phase F definition of done: the 90-day and production-cadence sim
 
 ### Task 16: Documentation, spec revision 9, overview, deferred files, final verification
 
-Spec §8 for this phase — the operator documentation of suite reaping (`gc.suite_idle_ttl` and *Suite reaping* under `[gc]`), of `POST /forget` (*Forgetting a suite* under `[admin]`), of what an upgrade reaps, and of the events and the metrics C11 lists — then the rulings R-F1–R-F5 and PF-1–PF-10, deviations 2 and 3 and the design notes the spec should state, written into the spec as revision 9; the overview's phase F bookkeeping and its carry-forwards for G and H; and the deferred files. The `adopt_unsigned` row and safeguard 1 are Task 8's (ruling PF-5's honest semantics); `packaging/config/config.toml.default` was Task 11's. The rulings' docs, each exact against the code:
+Spec §8 for this phase — the operator documentation of suite reaping (`gc.suite_idle_ttl` and *Suite reaping* under `[gc]`), of `POST /forget` (*Forgetting a suite* under `[admin]`), of what an upgrade reaps, and of the events and the metrics C11 lists — then the rulings R-F1–R-F5 and PF-1–PF-15, deviations 2 and 3 and the design notes the spec should state, written into the spec as revision 9; the overview's phase F bookkeeping and its carry-forwards for G and H; and the deferred files. The `adopt_unsigned` row and safeguard 1 are Task 8's (ruling PF-5's honest semantics); `packaging/config/config.toml.default` was Task 11's. The rulings' docs, each exact against the code:
 - PF-1: no marker stamp is rewritten — spec C3, C4's clock-step rule and C9, and `clock_step_detected`'s `last_seen_at` text in `docs/log-fields.md` (deviation 3);
 - PF-2: `/forget` also deletes the cached anchors of the base and its `/.` twin under both schemes with the markers — *Forgetting a suite*, `suite_forgotten`'s `anchor_rows`, spec C3 and C9;
 - PF-3, PF-4: the content-based junk rule, the junk scan every run and the candidates reaped regardless of idleness first — *Suite reaping*, `suite_reaped`, spec C9; the exec review's observation that a non-canonical row's cached files are left to `gc.url_path_ttl` (`metadata_rows` 0) is stated in both;
@@ -10358,21 +12082,24 @@ Spec §8 for this phase — the operator documentation of suite reaping (`gc.sui
 - PF-8: the forward-step guard (*Suite reaping*, `clock_step_detected`'s `stamp=wall_clock`, spec C9), a reap stamping its base's markers (spec C3, `signed_seen_markers_swept`, *Suite reaping*; every delete since PF-10, below), `acu_suites_reaped_total{reason}` (log-fields' metrics paragraph, spec C11), and M-11 — reaping with `gc.enabled = false` (the `enabled` row, *Upgrading an existing cache*), what a reaped suite needs (upstream), the offline cache's `"0s"`, and a reap's effect on strict mode; M-7's one-update residual of forgetting an active suite;
 - M-13: C-6 joins E-32's category (a site in a file F changes, its fix elsewhere) and its entry says so; M-17: a new G carry-forward (flat index rows as junk evidence);
 - PF-10 (the task reviews): every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up — spec revision 9 (recorded beside PF-1–PF-9), C3, C9 step 2, *Suite reaping*, `suite_evicted`, `suite_reaped`, `signed_seen_markers_swept`, the overview's As built;
+- PF-11–PF-15 (fix round 2 and the final review), recorded in revision 9 beside PF-10 and in the overview's As built: PF-12's history marker — spec C3 (the writers, the marker paragraph, the one marker a delete creates, and its accepted residual: a marker written from an audit-deferred snapshot stays if a later audit quarantines it; the base fails closed until a suite of it, tracked again, is forgotten, or the orphan sweep takes it after its year), C5 safeguard 3, C9 step 2, `suite_reaped`, *Suite reaping*; PF-13's sweep — the first a day after the reaper starts, the cutoff less the detected steps, the two residuals — spec C9, C11, §7, `clock_step_detected`, `signed_seen_markers_swept`, the forward-step paragraph; PF-14's two budgets — spec C9, C11, §7, `suite_reaped`, the busy line, *Suite reaping*, the overview's constants line; PF-15's startup pass without sub-job C — spec C9 and §7 ("within two periodic GC ticks when no pass reaches its deadline"), `retired_reaped`, `max_tick_duration`, *Suite reaping*, the conffile (Task 11);
+- the final review's other docs items, each exact against the code at the final head: a reap ends its packages' version retention (spec I1: *Suite reaping*, the `suite_idle_ttl` and retention rows, spec C9; the conffile, Task 11); `/forget`'s logging (`where=forget`, a new row for net/http's own lines — ERROR on the admin listener, WARN on the proxy listeners — `suite_forgotten`'s `settled`, promised only when a fresh read then finds the row gone, and the 500's "repeat it: 409 then means it was forgotten after all"); a new `admin_forget_requested` row; `gc_disabled`'s detail in the `[gc] enabled` row; `"0s"` and the per-host cap, and `adoption.enabled = false` and the reaper (spec §2, C3); `adoption_failure_record_failed`'s WARN for a missing row, the junk-read count (failed reads, up to N times), `adoption_member_mismatch`'s kept pool file, the touch line's `canonical_scheme`; revision 8's stale sentences (C3, C4, C5's `/.` twin, C8, C9).
 - the task reviews' fix rounds, each exact against the code at the final head: the sweep's fresh future threshold and the reaper's two clock-step reports logged directly (PD-11's exception; spec C9, `clock_step_detected`); `suite_reaped`'s `settled=true`; `canonical_scheme` on the busy line, the held-step WARNs, the junk read WARN and every panic line (`freshness_check_panicked`, `adoption_panicked`), `where=reaper` naming the held suite; `/forget`'s 400 for a `host` holding `://`, its 409 text, its 503 when a shutdown cuts it short, the 403's "requests from another origin" text; `Gate.Purge` keeping any use within the quiet period (spec C9); the startup line's `gc_suite_idle_ttl` and `adoption_adopt_unsigned`; the knob-off exits (forgotten or reaped with `adopt_unsigned` off, a suite is then not yet adopted, which is worse) in *Suite reaping* and *Forgetting a suite*; forgetting a suite forgets that its path was signed, until the cache sees a signature there again; the H carry-forward for the 1.1.0 release notes (offline or archive caches, and any install that relied on `gc.enabled = false`, set `gc.suite_idle_ttl = "0s"` before upgrading).
 
 Every "(a later release)" text the D and E carry-forwards name is rewritten (`docs/configuration.md`: the caps paragraph, the threat notes; `docs/log-fields.md`: `suite_caps_exceeded`; `docs/admin-ui-spec.md`: the unsigned refusals). `README.md` is H's (spec §8; a new H carry-forward), as phase E left its README items to H.
 
-Deferred minors in the files this task changes: E-63 (its spec half: the 91-column line in spec C10). Left in these files: C-36, C-37, D-50, D-52, D-55, E-24, E-75 (H); E-36 and E-61 (their fixes are code in `adoption_failure.go` and `inflight.go`, which no task changes; the docs only describe that code); E-76 (the phase E plan).
+Deferred minors in the files this task changes: E-63 (its spec half: the 91-column line in spec C10; its `handler.go` half is Task 14's). Left in these files: C-36, C-37, D-50, D-52, D-55, E-24, E-75 (H); E-61 (its fix is code in `inflight.go`; the docs only describe that code); E-76 (the phase E plan).
 
-**Every deferred minor, as this plan leaves it.** Taken: C-1, C-2, C-3, C-4, D-39 (Task 1); D-8, D-11, D-12, D-13, D-14, D-15, D-20 (Task 2); A-3 (Task 4); C-11, E-2 (its `internal/cache/adoption.go` half), E-4, E-5 (Task 5); E-18, E-20, E-40 (its `types.go` part) (Task 9); E-72 (Task 11); E-6, E-7, E-8, E-12, E-15 (Task 13); D-24, D-25, D-36, D-40, D-41, D-42, D-43, D-44, E-26, E-33 (its `first_adoption.go` half), E-34, E-49 (Task 14); E-63 (its spec half; this task). Checked and left:
+**Every deferred minor, as this plan leaves it.** Taken: C-1, C-2, C-3, C-4, D-39 (Task 1); D-8, D-11, D-12, D-13, D-14, D-15, D-20 (Task 2); A-3 (Task 4); C-11, E-2 (its `internal/cache/adoption.go` half), E-4, E-5 (Task 5); E-18, E-20, E-40 (its `types.go` part) (Task 9); E-72 (Task 11); E-6, E-7, E-8, E-12, E-15 (Task 13); D-24, D-25, D-36, D-40, D-41, D-42, D-43, D-44, E-26, E-33 (its `first_adoption.go` half), E-34, E-49 (Task 14); E-63 (its spec half; this task); and, in phase F's final fix wave (placed in the tasks that own their files): D-16, D-17, D-18, D-19 (Task 3), E-44 (Task 6), B-61 (Task 10), E-2 (its `internal/handler/handler.go` half), E-63 (its `handler.go` half) and E-36 (Task 14). Checked and left:
 - tagged for another phase: D-3, D-4, D-32, E-9, E-16, E-19 (G); A-56, C-9, C-21, C-36, C-37, C-38, C-39, D-50, D-52, D-55, D-56, D-57, D-58, E-24, E-46, E-75 (H);
 - in files phase F changes only by a mechanical rename (ruling PD-1) or by one field added to one log line (ruling PF-11: that touches the function, not the file — `freshness.go`'s `logPanic` and `handler.go`'s `maybeFireFreshness`, Task 6): E-31 (`Reconcile` in `freshness.go`, `baseline` in `check.go`) and E-45 (`freshness.go`, `scheduler.go`), behaviour changes in code phase F did not change, wait for phase H's sweep; E-40's `freshness_test.go` part; E-67, E-68 (`internal/handler/suite_rows.go`);
-- taken in phase F's final fix wave, not by Tasks 1–16 (ruling PF-11): E-44 (`freshness.go`; its entry gains a note: phase F adds the `reaper` kind, and fix round 2's `logPanic` field), E-2's `internal/handler/handler.go` half and E-63's `handler.go` half — comment-only items in `freshness.go` and `handler.go`;
+- taken in phase F's final fix wave (listed under Taken): E-44 (`freshness.go`'s `logPanic` doc and `panicStackLogged`), E-2's `internal/handler/handler.go` half and E-63's `handler.go` half — comment-only items in `freshness.go` and `handler.go`, under ruling PF-11 — and D-16 to D-19 (`fetched_row.go`) and B-61 (`status.go`), whose files Tasks 3 and 10 hand-edit (the final review's spec m4); Step 6 deletes their entries;
+- in a function the final fix wave hand-edits, and so taken (listed under Taken): E-36 (`recordAdoptionFailure`'s read in `adoption_failure.go`, whose `ErrNotFound` WARN is Task 14's: a shutdown-cancelled read now logs DEBUG, as the write does);
 - with a site in a file phase F changes by hand but a fix that belongs to files it does not change: C-6 (`busyReaders` is in `gate_test.go`, which Task 1 changes; the fix belongs to `flipgate/sim_test.go`, simtest and the handler tests — its entry gains that note; design review M-13), E-32 (one of the hold predicate's six sites is in `first_adoption.go`; the helper and the other sites are `freshness.go`, `check.go` and `current_form.go` — its entry gains that note), E-33's `hostCounter` half (`current_form_test.go`), E-40's `scheduler.go` part, E-13 (its WARN lives in `flip_barrier.go`, not in `adoption.go`, which Task 13 changes: the entry's file name is corrected here);
-- in files no task changes: A-1, A-2, A-4, A-5, A-6, A-8 to A-15, A-19, A-20, A-21, A-26, A-27, A-55; B-9 to B-14, B-27, B-36, B-52, B-59 to B-63; C-5, C-7, C-8, C-12, C-13; D-6, D-7, D-9, D-10, D-16 to D-19, D-26 to D-31, D-46, D-48, D-49, D-60; E-1, E-3, E-10, E-11, E-14, E-17, E-21, E-22, E-23, E-25, E-27 to E-30, E-35, E-36, E-37, E-38, E-39, E-41, E-42, E-43, E-47, E-48, E-50 to E-62, E-64 to E-66, E-69, E-70, E-71, E-73, E-74, E-76, E-77.
+- in files no task changes: A-1, A-2, A-4, A-5, A-6, A-8 to A-15, A-19, A-20, A-21, A-26, A-27, A-55; B-9 to B-14, B-27, B-36, B-52, B-59, B-60, B-62, B-63; C-5, C-7, C-8, C-12, C-13; D-6, D-7, D-9, D-10, D-26 to D-31, D-46, D-48, D-49, D-60; E-1, E-3, E-10, E-11, E-14, E-17, E-21, E-22, E-23, E-25, E-27 to E-30, E-35, E-37, E-38, E-39, E-41, E-42, E-43, E-47, E-48, E-50 to E-62, E-64 to E-66, E-69, E-70, E-71, E-73, E-74, E-76, E-77.
 
 **Files:**
-- Modify: `docs/configuration.md`, `docs/log-fields.md`, `docs/admin-ui-spec.md`, `docs/superpowers/specs/2026-09-27-flat-repositories-design.md`, `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md`, `…-A-deferred.md`, `…-C-deferred.md`, `…-D-deferred.md`, `…-E-deferred.md`
+- Modify: `docs/configuration.md`, `docs/log-fields.md`, `docs/admin-ui-spec.md`, `docs/superpowers/specs/2026-09-27-flat-repositories-design.md`, `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md`, `…-A-deferred.md`, `…-B-deferred.md`, `…-C-deferred.md`, `…-D-deferred.md`, `…-E-deferred.md`
 
 **Interfaces:**
 - Consumes: the names, events, metrics and constants Tasks 1–15 produce, exactly as they produce them.
@@ -10386,7 +12113,7 @@ The caps paragraph and *Tracked suites* point at the reaper; the threat notes po
 diff --git a/docs/configuration.md b/docs/configuration.md
 --- a/docs/configuration.md
 +++ b/docs/configuration.md
-@@ -251,8 +251,9 @@ host can also get there by normal growth). Above the total cap new suites
+@@ -251,17 +251,21 @@ host can also get there by normal growth). Above the total cap new suites
  are refused, but each refused attempt still evicts one suite that qualifies
  (no adopted snapshot, not requested for 24 hours), so the table shrinks
  back under the cap as suites fall idle. A host at its own cap refuses that
@@ -10396,9 +12123,12 @@ diff --git a/docs/configuration.md b/docs/configuration.md
 +reaper removes those not requested for `gc.suite_idle_ttl` (30 days by
 +default; see *Suite reaping* under `[gc]`), or when
  a new suite of any host at the total cap evicts one of its idle suites (no
- adopted snapshot, not requested for 24 hours). A table
+-adopted snapshot, not requested for 24 hours). A table
++adopted snapshot, not requested for 24 hours) — with
++`gc.suite_idle_ttl = "0s"` only the latter. A table
  at exactly the total cap logs no warning: that is a full cache working
-@@ -261,7 +262,9 @@ none qualifies (WARN `suite_seed_rejected`).
+ normally, where a new suite evicts an idle one and is refused only when
+ none qualifies (WARN `suite_seed_rejected`).
  
  Serving a tracked suite's `InRelease`, `Release` or `Release.gpg`, or a
  `.deb` its current snapshot vouches for, records that the suite is in use
@@ -10409,7 +12139,16 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  copy under its own path is answered from an identical cached file only for
  a tracked suite; otherwise it is fetched from upstream.
  
-@@ -493,8 +496,8 @@ anyone who can make the cache see one signed-looking `InRelease` or
+@@ -313,7 +317,7 @@ the hit that creates the suite's row).
+ 
+ | Key | Type | Default | Behavior and constraints |
+ | --- | --- | --- | --- |
+-| `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them, so tracked suites lag upstream by design: the status page's SUITES vital then reads "ADOPTION DISABLED — METADATA NOT REFRESHED" (stale, not a fault), rows keep their lag text without warning, and failure records left from a time adoption was enabled are inert (no retries, `acu_adoption_failing_suites` reports 0). |
++| `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them, so tracked suites lag upstream by design: the status page's SUITES vital then reads "ADOPTION DISABLED — METADATA NOT REFRESHED" (stale, not a fault), rows keep their lag text without warning, and failure records left from a time adoption was enabled are inert (no retries, `acu_adoption_failing_suites` reports 0). The suite reaper still runs (see *Suite reaping* under `[gc]`): a suite no client asked for in `gc.suite_idle_ttl` has its cached index files deleted, so clients that come back to it fetch upstream's current files through the cache, which then stay as fetched. |
+ | `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are adopted in the unsigned form instead (`adopt_unsigned`). |
+ | `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` refuses every unsigned `Release` ("refused: unsigned_disabled", a state, not a failed check), so the cache no longer keeps unsigned repositories fresh: an unsigned suite already adopted keeps serving its last snapshot, coherent but frozen — never updated — until the knob is turned back on (it then updates at its next retry, at most 75 minutes later: a restart keeps a refusal's retry time), the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, which is worse: the forget or reap deletes its cached index files first, so its next requests fetch upstream's current files, but it stays unadopted and each file then stays as the cache first stored it, never refreshed, so an upstream publish can leave its clients with Hash Sum mismatches. Set it to `false` only if you do not serve unsigned repositories through the cache. Either way the suite is asked upstream again only at its retry times (2 minutes, doubling to an hour; for a suite not yet adopted, also once `periodic_refresh` has passed), never at the checks clients trigger in between. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
+ | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
+@@ -493,8 +497,8 @@ anyone who can make the cache see one signed-looking `InRelease` or
  `Release.gpg` for a repository path — served to a client, or found by a
  check; a man in the middle, a compromised upstream, or a LAN client
  pointing the cache at a host it controls — blocks unsigned adoption of
@@ -10420,7 +12159,7 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  of never downgrading. A man in the middle between the cache and upstream
  can make the cache adopt forged unsigned content only for a suite never
  seen signed — for a suite not yet adopted only after two consistent
-@@ -587,7 +590,17 @@ cached anchor was already garbage-collected leaves no record. Suites whose
+@@ -587,7 +591,17 @@ cached anchor was already garbage-collected leaves no record. Suites whose
  their signed-seen record,
  on their first cache hit. A cache with more than `freshness.max_suites`
  suites, or a tenth of it or more on one host, logs WARN
@@ -10439,24 +12178,36 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  
  After the upgrade, suites without a snapshot adopt eagerly only if a client
  fetched one of their anchor files in the 7 days before the upgrade, or asks
-@@ -669,7 +682,7 @@ served an unvouched package.
+@@ -604,7 +618,7 @@ suite's next adoption.
+ | --- | --- | --- | --- |
+ | `hot_packages.window` | duration | `"24h"` | Look back this far for client-requested packages when choosing versions to prefetch during adoption. `"0s"` disables hot-package prefetch. Nonnegative. |
+ | `hold_packages.window` | duration | `"24h"` | Grace after GC first notices a cached URL is no longer retained by recency or current-snapshot rules. `"0s"` permits deletion in that GC batch. Nonnegative. |
+-| `retention.max_versions_per_package` | integer | `3` | Newest distinct Debian versions retained and eligible for hot prefetch per package name and architecture, per suite. Must be at least `1`. |
++| `retention.max_versions_per_package` | integer | `3` | Newest distinct Debian versions retained and eligible for hot prefetch per package name and architecture, per suite with a current snapshot (a reaped suite has none: see *Suite reaping* under `[gc]`). Must be at least `1`. |
+ 
+ Hot prefetch runs **before** the snapshot switches, using package identities
+ requested from the previous snapshot; it does not download every package in the
+@@ -669,16 +683,17 @@ served an unvouched package.
  
  | Key | Type | Default | Behavior and constraints |
  | --- | --- | --- | --- |
 -| `enabled` | boolean | `true` | Run startup and periodic garbage collection, including the startup orphan-file scan. `false` disables those passes and logs a warning. |
-+| `enabled` | boolean | `true` | Run startup and periodic garbage collection, including the startup orphan-file scan. `false` disables those passes and logs a warning. It does not stop the suite reaper, which deletes idle suites' cached index files whatever this says (see *Suite reaping*; `suite_idle_ttl = "0s"` turns it off). |
++| `enabled` | boolean | `true` | Run startup and periodic garbage collection, including the startup orphan-file scan. `false` disables those passes and logs WARN `gc_disabled`, whose `detail` ends by saying whether suite reaping still runs: `suite reaping still runs: gc.suite_idle_ttl = 720h0m0s …` (the value in Go's duration format), or, with `suite_idle_ttl = "0s"`, `suite reaping is off too (gc.suite_idle_ttl = "0s"), but still deleted are …` and what still deletes then: suites evicted at the `freshness.max_suites` total cap and, daily, signed-seen records of untracked paths last seen over a year ago. It does not stop the suite reaper, which deletes idle suites' cached index files whatever this says (see *Suite reaping*; `suite_idle_ttl = "0s"` turns its reaping off). |
  | `interval` | duration | `"24h"` | Delay after a GC tick completes before the next periodic tick. Must be positive; disable through `enabled`. |
  | `batch_size` | integer | `100` | Maximum URL-path/blob rows processed per GC batch. At least `1`. |
  | `snapshot_batch_size` | integer | `10` | Maximum snapshots removed per batch. Snapshot deletion can cascade through many member rows. At least `1`. |
-@@ -679,6 +692,7 @@ served an unvouched package.
+-| `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. Must be positive. |
++| `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. The startup pass, which runs before the listeners serve, leaves the retired snapshots (of a reaped, evicted or forgotten suite, or one the upgrade's trust audit quarantined) to the periodic passes, normally the first one after the start (see *Suite reaping*); it deletes only a retired one never adopted whose heartbeat went stale, as it does any abandoned adoption candidate. Must be positive. |
+ | `blob_grace` | duration | `"5m"` | Grace after a blob's reference count reaches zero before deletion. At least `"1s"`, and greater than twice `heartbeat_interval`. |
+ | `keep_displaced` | integer | `3` | Recent displaced snapshots kept per suite for inspection. `0` retains none; must be nonnegative. Does not by itself retain superseded package binaries. Also bounds retained by-hash: a by-hash request the current snapshot lacks is served from the newest `keep_displaced` + 1 displaced snapshots of its suite, and `0` turns that off (see *Flip consistency*). |
  | `pool_scan_workers` | integer | `4` | Workers for the startup orphan-file scan. At least `1`. |
  | `heartbeat_interval` | duration | `"60s"` | Refresh in-progress adoption liveness and blob protection. Positive and subject to both bounds below. |
  | `url_path_ttl` | duration | `"168h"` | Requests within this window protect cached URL rows. Older or never-requested rows are evaluated against snapshot/version retention and hold grace. `"0s"` disables URL-path expiration; other values must be at least `"1m"`. |
-+| `suite_idle_ttl` | duration | `"720h"` | A tracked suite no client has asked for in this long is reaped: no longer tracked, its cached index files and snapshots deleted (see *Suite reaping*). `"0s"` disables suite reaping; other values must be at least `"24h"`. |
++| `suite_idle_ttl` | duration | `"720h"` | A tracked suite no client has asked for in this long is reaped: no longer tracked, its cached index files and snapshots deleted (see *Suite reaping*). The reap deletes no package, but the suite's packages lose the version retention its snapshot gave them: with `enabled = true` and a nonzero `url_path_ttl`, GC then deletes those no client asked for within `url_path_ttl`, after `hold_packages.window`. `"0s"` disables suite reaping (a host at its per-host cap then loses suites only to eviction at the total cap, see *Tracked suites*); other values must be at least `"24h"`. |
  
  Startup still runs the orphan-file scan and a GC tick. Periodic ticks wait a full
  `interval` after the previous tick completes, so a long run cannot trigger an
-@@ -703,12 +717,81 @@ The second expression is the implementation's stale-adoption grace formula;
+@@ -703,12 +718,113 @@ The second expression is the implementation's stale-adoption grace formula;
  it is separate from the actual fetch retry budget. All `[gc]` validation still
  applies when `enabled = false`.
  
@@ -10467,16 +12218,28 @@ diff --git a/docs/configuration.md b/docs/configuration.md
 +fetches the suite's `InRelease`, `Release` or `Release.gpg`, or a `.deb`
 +its snapshot vouches for, through the cache. The reaper runs an hour after
 +the daemon starts and then every hour, whatever `interval` and `enabled`
-+say. A run deletes at most 25 suites — first those reaped however
-+recently they were asked for (below), then those asked for least
-+recently; a suite being checked or adopted at that moment is skipped and
-+tried again at the next run. Reaping a suite deletes its cached index
-+files (its `InRelease`, `Release`, `Packages` and the rest of its `dists/`
-+tree, in batches of 1,000 files; packages are not touched), retires its
-+snapshots and deletes its row (INFO `suite_reaped`;
-+`acu_suites_reaped_total{reason}` counts the reaps). The next GC passes
-+delete the retired snapshots, and then the pool files nothing else uses,
-+once `blob_grace` has passed; with `enabled = false` suites are still
++say. A run deletes at most 250 of the suites reaped however recently
++they were asked for (below), first, and at most 25 idle ones, those
++asked for least recently first; a suite being checked or adopted at
++that moment is skipped — it counts toward its kind's number — and tried
++again at the next run. Reaping a suite deletes its cached index files
++(its `InRelease`, `Release`, `Packages` and the rest of its `dists/`
++tree, in batches of 1,000 files), retires its snapshots and deletes its
++row (INFO `suite_reaped`; `acu_suites_reaped_total{reason}` counts the
++reaps). The reaper deletes no package, but a reaped suite's packages
++lose the version retention its snapshot gave them
++(`retention.max_versions_per_package` counts versions in current
++snapshots only; a package another suite's snapshot lists keeps that
++one's): with `enabled = true` and a nonzero `url_path_ttl`, GC deletes
++those no client asked for within `url_path_ttl`, after
++`hold_packages.window`, and their pool files after `blob_grace`. The
++next periodic GC passes delete the retired snapshots, and then the pool
++files nothing else uses, once `blob_grace` has passed — not the pass at
++startup, which deletes only a never-adopted one whose heartbeat went
++stale, as it does any abandoned adoption candidate (after a restart the
++periodic passes delete them, normally the first one), so a restart
++after many reaps does not keep the listeners
++closed while they are deleted; with `enabled = false` suites are still
 +reaped, but their snapshots and pool files stay until GC runs again.
 +
 +A reaped suite whose clients come back is tracked again at their first
@@ -10488,10 +12251,21 @@ diff --git a/docs/configuration.md b/docs/configuration.md
 +With `adoption.adopt_unsigned = false` a returning unsigned repository
 +is not adopted again: it is refused `unsigned_disabled` and served as
 +the cache first stores each of its files, never refreshed (see
-+`adopt_unsigned` under `[adoption]`).
++`adopt_unsigned` under `[adoption]`). A client in the middle of an update
++when its suite is reaped can see one Hash Sum mismatch, as with a forget
++(see *Forgetting a suite* under `[admin]`).
 +The record that a repository path was seen signed survives the reap, so
 +the returning suite is never adopted unsigned (see *Anchor forms and
-+unsigned repositories*); the reaper deletes that record only when no
++unsigned repositories*). A suite whose only evidence of a signature is
++its signed snapshot — one the upgrade's trust audit could not read yet,
++for example (see *Upgrading an existing cache*) — gets that record when
++it is reaped or evicted at the `freshness.max_suites` cap, before its
++snapshot is retired. That record stays even if a later start's audit
++reads the snapshot and quarantines it: the path then keeps refusing an
++unsigned `Release` (`unsigned_downgrade_refused`) until a suite of it,
++tracked again at a client's request, is forgotten (`POST /forget`), or,
++while no suite of the path is tracked, the reaper deletes the record a
++year later. The reaper deletes that record only when no
 +suite of the path has a row and the path was last seen signed — or a
 +suite of it last reaped, evicted at the `freshness.max_suites` cap or
 +forgotten, each of which moves the record's date up to that moment —
@@ -10526,8 +12300,17 @@ diff --git a/docs/configuration.md b/docs/configuration.md
 +wall clock moved more than an hour further than the time that passed) is
 +logged as WARN `clock_step_detected` with `stamp=wall_clock` and holds
 +the reaper's deletions back for an hour; a suite reaped anyway comes back
-+at its next request, as above. `"0s"` turns suite reaping off; the reaper
-+then only deletes the year-old records of signed paths no suite tracks.
++at its next request, as above. A deleted record of a signed path does
++not come back, so a step never makes the reaper delete one early: a step
++it sees while running is left out of the records' age until the daemon
++stops, and its first record sweep comes a day after the start (then one
++a day), so a clock that was ahead at the start has a day to be
++corrected. Two limits remain: a step the daemon was restarted across,
++not corrected within a day of the start, makes the sweep delete records
++up to the step early; and a daemon restarted at least once a day
++(before its first sweep comes due) never sweeps those records. `"0s"`
++turns suite reaping off; the reaper then only deletes the year-old
++records of signed paths no suite tracks.
 +
  ## `[admin]`: status, metrics, and maintenance
  
@@ -10541,7 +12324,7 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  HTTP Basic authentication does not encrypt credentials in transit.
  
  | Key | Type | Default | Behavior and constraints |
-@@ -738,6 +821,81 @@ command-line, trace, or other debug routes are exposed.
+@@ -738,6 +854,84 @@ command-line, trace, or other debug routes are exposed.
  See the [idle CPU investigation](idle-cpu-review.md) for findings, maintenance
  metrics, tuning tradeoffs, and profile-capture commands.
  
@@ -10608,7 +12391,8 @@ diff --git a/docs/configuration.md b/docs/configuration.md
 +# 403 = the header is missing, or a browser request from another origin
 +# 409 = busy (being checked or adopted: try again) or no such suite (check the
 +#   scheme, which defaults to https, and the host and suite the status page shows)
-+# 500 = a database error (logged as WARN admin: forget failed)
++# 500 = a database error (logged as WARN admin: forget failed); repeat it:
++#   409 then means it was forgotten after all (or is busy)
 +# 503 = the daemon began shutting down while the forget ran; repeat it once it is back
 +```
 +
@@ -10618,7 +12402,9 @@ diff --git a/docs/configuration.md b/docs/configuration.md
 +
 +Each accepted request is logged as INFO `admin_forget_requested` (a
 +request refused with 400, 403 or 413 is not), and each suite forgotten
-+as INFO `suite_forgotten`.
++as INFO `suite_forgotten` — with `settled=true` when its final delete
++committed although the request then failed (500, or 503 at shutdown)
++and a fresh read then found the row gone.
 +
  ## `[serve]`: stale responses
  
@@ -10631,7 +12417,7 @@ diff --git a/docs/configuration.md b/docs/configuration.md
 diff --git a/docs/log-fields.md b/docs/log-fields.md
 --- a/docs/log-fields.md
 +++ b/docs/log-fields.md
-@@ -203,7 +203,13 @@ slot was free; they run on a later unchanged check) and
+@@ -203,7 +203,18 @@ slot was free; they run on a later unchanged check) and
  `acu_strict_adoption_waits_total{host}` (unvouched `.deb` requests that
  waited — at most 15 s, and never past 25 s after the request arrived — for
  a signed adoption running on their host before strict mode decided; the
@@ -10642,39 +12428,56 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
 +reaps included; see `suite_reaped`) and the counter `acu_gc_retired_reaped_total` (retired
 +snapshots that snapshot GC deleted: those of reaped, forgotten and
 +evicted suites, and those the upgrade's trust audit quarantined), whose
-+per-pass count the `gc_run_complete` line carries as `retired_reaped`.
++per-pass count the `gc_run_complete` line carries as `retired_reaped`
++(always 0 for the startup pass, which runs before the listeners serve and
++leaves the retired snapshots to the periodic passes, normally the first
++one after the start; it deletes only a retired one never adopted whose
++heartbeat went stale, as it does any abandoned adoption candidate,
++counted in `orphan_candidates_reaped`).
  
  The `freshness_check` line's `result` gains `changed_deferred` (upstream
  still serves content whose adoption failed or was refused; the field
-@@ -249,13 +255,14 @@ Structured events emitted outside the per-request `request` log line:
+@@ -249,18 +260,20 @@ Structured events emitted outside the per-request `request` log line:
  goroutine panic recovery, freshness checks that end unknown, adoption
  failure and refusal records and their retry schedule, wall-clock step
  detection, the startup legacy trust audit, the flip barrier, suite rows
 -(cap refusals and evictions) and a slow shutdown drain (logged by
 -`internal/freshness`, `internal/handler` and the daemon's `main`).
-+(cap refusals, evictions, reaping and `POST /forget`) and a slow shutdown
-+drain (logged by `internal/freshness`, `internal/handler`, `internal/admin`
-+and the daemon's `main`).
++(cap refusals, evictions, reaping and `POST /forget`), a slow shutdown
++drain and the HTTP servers' own diagnostics (logged by
++`internal/freshness`, `internal/handler`, `internal/admin` and the
++daemon's `main`).
  
  | Event | Level | Fields | Meaning |
  |---|---|---|---|
 -| `adoption_panicked` | ERROR | `where` (`adoption`, `repair`, `reconcile`, `heartbeat`, `record`), `canonical_host`, `suite_path`, `panic`, `stack` (first occurrence per `where` per process only) | A panic inside an adoption, repair, reconcile, heartbeat or failure-record goroutine was recovered; the prior snapshot keeps serving. Only an adoption panic is recorded as a failure (reason `panic`); repair and reconcile panics are logged, not recorded (plan deviation 7). `where=record` is `recordAdoptionFailure`, which writes the spec C7 failure record after an adoption ends. |
 -| `freshness_check_panicked` | ERROR | `where` (`check`, `scheduler`, `reschedule`, `t1`), `canonical_host`, `suite_path`, `panic`, `stack` (first occurrence per `where` per process only) | A panic during a freshness check was recovered. For `where=check` the check counts as failed (`last_check_at` bumped, so the cooldown applies) and also counts as an unknown end: `last_check_at` is bumped and `check_fail_count` extended. The `scheduler`, `reschedule` and `t1` recovers only log; `where=reschedule` guards the start-time retry spread (`rescheduleFailingAdoptions`), and `where=t1` is the handler's client-triggered check goroutine (logged by `internal/handler`). |
 +| `adoption_panicked` | ERROR | `where` (`adoption`, `repair`, `reconcile`, `heartbeat`, `record`), `canonical_scheme`, `canonical_host`, `suite_path` (the suite's scheme, host and path; the scheme tells its `http` copy from its `https` one), `panic`, `stack` (first occurrence per `where` per process only) | A panic inside an adoption, repair, reconcile, heartbeat or failure-record goroutine was recovered; the prior snapshot keeps serving. Only an adoption panic is recorded as a failure (reason `panic`); repair and reconcile panics are logged, not recorded (plan deviation 7). `where=record` is `recordAdoptionFailure`, which writes the spec C7 failure record after an adoption ends. |
-+| `freshness_check_panicked` | ERROR | `where` (`check`, `scheduler`, `reschedule`, `t1`, `reaper`), `canonical_scheme`, `canonical_host`, `suite_path` (the suite the panic struck — the scheme tells its `http` copy from its `https` one; all three empty when the panic names no suite), `panic`, `stack` (first occurrence per `where` per process only) | A panic during a freshness check was recovered. For `where=check` the check counts as failed (`last_check_at` bumped, so the cooldown applies) and also counts as an unknown end: `last_check_at` is bumped and `check_fail_count` extended. The `scheduler`, `reschedule` and `t1` recovers only log; `where=reschedule` guards the start-time retry spread (`rescheduleFailingAdoptions`), and `where=t1` is the handler's client-triggered check goroutine (logged by `internal/handler`). `where=reaper` is the suite reaper: a panic while it held a suite names that suite, the hold is released as the cache then answers (the row gone or not), and the run goes on to its next candidate and its sweeps; a panic elsewhere in a run (the listing, the junk scan, the sweeps; empty `canonical_scheme`, `canonical_host` and `suite_path`) ends the run, and the next run comes as scheduled. |
++| `freshness_check_panicked` | ERROR | `where` (`check`, `scheduler`, `reschedule`, `t1`, `reaper`, `forget`), `canonical_scheme`, `canonical_host`, `suite_path` (the suite the panic struck — the scheme tells its `http` copy from its `https` one; all three empty when the panic names no suite), `panic`, `stack` (first occurrence per `where` per process only) | A panic during a freshness check was recovered. For `where=check` the check counts as failed (`last_check_at` bumped, so the cooldown applies) and also counts as an unknown end: `last_check_at` is bumped and `check_fail_count` extended. The `scheduler`, `reschedule` and `t1` recovers only log; `where=reschedule` guards the start-time retry spread (`rescheduleFailingAdoptions`), and `where=t1` is the handler's client-triggered check goroutine (logged by `internal/handler`). `where=reaper` is the suite reaper: a panic while it held a suite names that suite, the hold is released as the cache then answers (the row gone or not), and the run goes on to its next candidate and its sweeps; a panic elsewhere in a run (the listing, the junk scan, the sweeps; empty `canonical_scheme`, `canonical_host` and `suite_path`) ends the run, and the next run comes as scheduled. `where=forget` is `POST /forget`: a panic while it held the suite names that suite; the hold is released as the cache then answers (the row gone or not), and the panic goes on to net/http, which ends the request without an answer and logs `http: panic serving …` at ERROR (see net/http's own lines below). |
  | `freshness check failed` | INFO | `canonical_host`, `suite_path`, `form` (`inline`, `detached`, `unsigned`, or `probe` for the probe tree of a suite without a snapshot), `err`, `result` (always `failed`) | A check ended unknown — a transport error, an error status that is not an absent answer, a success status other than 200 or 304 (a fetch contract violation: `err` says `unexpected success status`), a 304 to a request that carried no validators (adoption enabled; `err` says `304 Not Modified to a request without validators`), or the 2-minute check deadline at the host slot or the request — or found nothing it may adopt: a suite without a snapshot whose upstream has neither `InRelease` nor `Release` (which also records the refusal state `anchor_absent`, shown on the status page); an unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled` instead. A check whose probe found a signature but could not record the suite as seen signed fails too (`err` starts `mark the signature seen:`). A shutdown that ends a check — its request, or a cache read or marker write after it — is not a failure: nothing is written or counted (DEBUG only). `last_check_at` is bumped and `check_fail_count` extended, so the scheduler backs off (2 min doubling to 1 h), and `acu_freshness_check_total{result="failed"}` is incremented. With adoption enabled, 401, 403, 404, 410 and a 200 whose body is not the file asked for are answers, not failures (the anchor is absent): they never extend the streak. |
  | `adoption_run_failed` | WARN; INFO when the attempt was refused (outcome `refused`) | `canonical_host`, `suite_path`, `form`, `err` | Backstop line for every adoption attempt that returned an error, so a failure with no categorised line of its own is still visible. A refusal is a state, not a failure, so its line is INFO (`adoption_refused` carries the reason and timing); operators alerting on WARN are not paged for a flapping mirror. |
  | `adoption: read prior snapshot failed` | WARN | `canonical_host`, `suite_path`, `err` | The adoption could not read the suite's current (prior) snapshot before running Date and rollback checks against it; the attempt fails as `db_failed` and is retried on the normal backoff schedule rather than skipping those checks. |
-@@ -278,7 +285,7 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
+ | `adoption: signed-anchor re-mark failed` | WARN; ERROR when a cached anchor's pool file could not be read (a missing file is not an error) | `canonical_host`, `suite_path`, `err` | Before an unsigned adoption's commit, the adopter re-reads the suite's cached `InRelease` and `Release.gpg` (and those of its `/.` twin) to record any signed one (spec C5 safeguard 3), and could not read a `url_path` row or a pool file, or write the record. The adoption is refused `unsigned_downgrade_refused` (fail closed): here that refusal means the cache could not rule out a signature, not that it saw one. It is retried on the refusal's schedule. |
+-| `adoption_failure_record_failed` | WARN; DEBUG for the read that precedes the write when it finds the suite already removed (a routine reap during adoption, not a fault), and for a write that a shutdown cut short (nothing is recorded at shutdown) | `canonical_host`, `suite_path`, `err` | The failure/refusal record could not be read or written; the next check may retry sooner than scheduled. |
++| `adoption_failure_record_failed` | WARN — also when the read that precedes the write finds the suite's row gone, which cannot happen while the check or adoption that writes the record holds the suite (every deleter — cap eviction, the suite reaper, `POST /forget` — holds it too) and so is a bug; DEBUG for a write that a shutdown cut short (nothing is recorded at shutdown) | `canonical_host`, `suite_path`, `err` | The failure/refusal record could not be read or written; the next check may retry sooner than scheduled. |
+ | `adoption_refused` | INFO | `canonical_host`, `suite_path`, `reason`, `refusal`, `fail_count`, `retry_in_seconds`, `next_retry_unixtime` | One attempt ended in a refusal state, not a failure; logged for every refused attempt. The states: `upstream_older`, `rollback_refused`, `unsigned_downgrade_refused` (the suite was seen signed: decided by the check before a slot is taken, again before any download, and inside the commit), `unsigned_too_large` (decided by the check before a slot is taken, and again before any download), `unsigned_unconfirmed` (an unsigned repository waiting for its second observation), `unsigned_disabled` (`adoption.adopt_unsigned = false`: an unsigned `Release` is not adopted; an unsigned suite already adopted keeps its last snapshot; decided by the check before a slot is taken) and `anchor_absent` (the current anchor is absent upstream, a detached suite's changed `Release` has no `Release.gpg`, or a suite without a snapshot has neither anchor; while a failed adoption attempt's record is active — a lateral move that failed — that record keeps its own reason and retry time instead, and paces the suite the same way). |
+ | `adoption_deferred` | INFO | as `adoption_refused` | A suite entered the failing or refused state, or its reason changed (not logged on every attempt); the same content is retried at `next_retry_unixtime`, while new content is tried at once. |
+ | `adoption_failing_persistently` | WARN | `canonical_host`, `suite_path`, `reason`, `fail_count`, `failing_since_unixtime` | The suite's adoption has failed 3, 6, 12, 24, … times in a row. Refusals never reach this (spec C7); see `adoption_refused_persistently`. |
+@@ -274,11 +287,11 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
+ | `freshness: read suite row failed` | WARN | `err`, `canonical_host`, `suite_path` | A freshness check could not read the suite's row: either the existence read a check makes before it takes the suite's lock (a suite is checked only while it has a row), or the full read after it. The check is skipped and writes nothing; the next trigger (a client hit's check or the scheduler) tries again. |
+ | `freshness: read anchor rows failed` | WARN | `err`, `canonical_host`, `suite_path` | A check could not read the suite's cached anchor rows (`url_path`). A suite without a snapshot is not probed this time — no request, nothing written; the next check tries again. A suite whose current anchor is absent probes the other forms at their canonical URLs instead. |
+ | `freshness: read current snapshot failed` | WARN | `err`, `snapshot_id`, `canonical_host`, `suite_path` | A check whose absent anchor's probe tree found a form it may adopt could not read the suite's current snapshot, so it cannot tell an anchor that merely came back from new content: the check fails (`freshness check failed`) rather than re-adopting the current content. A shutdown that ends the read is not logged here. |
+-| `adoption_member_mismatch` | WARN | `canonical_host`, `suite_path`, `path`, and `declared_sha256`/`actual_sha256` — or `declared_sha512`/`actual_sha512` when the member's SHA512 is the hash that failed | A member's bytes did not match the hash its `Release` declares (every declared SHA256 and SHA512 is checked); the bytes never reach the pool and the adoption fails (outcome `member_mismatch`). |
++| `adoption_member_mismatch` | WARN | `canonical_host`, `suite_path`, `path`, and `declared_sha256`/`actual_sha256` — or `declared_sha512`/`actual_sha512` when the member's SHA512 is the hash that failed | A member's bytes did not match the hash its `Release` declares (every declared SHA256 and SHA512 is checked), and the adoption fails (outcome `member_mismatch`). Fetched bytes never reach the pool. A pool file reused under its declared SHA256 whose SHA512 differs from the declared one — the `Release`'s two declarations disagree, so a fetch would bring the same bytes — is logged with `declared_sha512`/`actual_sha512`, is not fetched again, and is kept. |
  | `adoption_reconcile_failed` | WARN | `canonical_host`, `suite_path`, `snapshot_id`, `stage` (`decision`: deciding whether an unchanged suite needs a reconcile; `heal`: the reconcile run after an unchanged check; `on_demand`: `POST /reconcile`), `err` | Reconciling a snapshot's declared index files failed — for example a stored anchor that no longer decodes — so nothing was healed this time; it is tried again on a later unchanged check. |
  | `freshness: read suite row after a panic failed` | WARN | `err`, `canonical_host`, `suite_path` | After a recovered check panic, the best-effort bump of `last_check_at`/`check_fail_count` could not even read the suite's row; the row is left as it was. |
  | `freshness: persist failure bump after a panic failed` | WARN | `err`, `canonical_host`, `suite_path` | After a recovered check panic, `last_check_at` and `check_fail_count` were bumped in memory but the write failed; the row is left as it was. |
 -| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute. For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. For `stamp=last_requested_at` (a suite's client-interest stamp, read when the suite cap looks for an idle suite to evict, and by the check of a suite without a snapshot) the suite is not evicted — a future stamp never counts as idle — and the check counts a stamp up to 7 days ahead as recent interest; further ahead, the suite is dormant until a client asks for it again. `acu_clock_steps_detected_total` counts detections, not distinct clock steps or distinct stamps: the same future stamp is detected again every time it is read — every check for a future `last_check_at` or `last_success_at` (the scheduler reads a future `last_success_at` without reporting it), every check of a suite without a snapshot for a future `last_requested_at`, and every creation attempt within eight rows of the global cap for the future `last_requested_at` its eviction scan re-reads (the line stays rate-limited) — so alert on its rate, not its value. |
-+| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute, except the suite reaper's reports (`stamp=last_requested_at` and `stamp=last_seen_at` from the reaper, and `stamp=wall_clock`), which it bounds itself and logs directly, so a check's report in the same minute cannot hide them. For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. For `stamp=last_requested_at` (a suite's client-interest stamp, read when the suite cap looks for an idle suite to evict, by the suite reaper, and by the check of a suite without a snapshot) the suite is not evicted, nor reaped as idle — a future stamp never counts as idle, though a non-canonical or junk row is reaped regardless (see `suite_reaped`); the reaper reports the furthest such stamp of a canonical suite at the first run that reaps after a start and again only when it changes — and the check counts a stamp up to 7 days ahead as recent interest; further ahead, the suite is dormant until a client asks for it again. For `stamp=last_seen_at` (a signed-seen record's stamp, read once a day by the suite reaper's sweep of records no suite uses; `suite_path` is the record's repository path, the furthest — of records with the same stamp, the first by scheme, host and path — reported at the first sweep after a start and when it changes; "in the future" is measured against the time of the sweep itself, so the records the run's own reaps moved up minutes earlier are no step) the record counts as seen now — it is never swept — and its stamp is left as it is: it ages out only once the clock has passed it (rewriting it to the stepped-back now would lose signed history once the clock is corrected). For `stamp=wall_clock` (the suite reaper; no suite fields) the wall clock moved more than an hour further than the monotonic clock between two of the reaper's runs — a forward step without a restart, as when a virtual machine or a laptop resumes; `stored_unixtime` is where the wall clock should be, `now_unixtime` where it is — and the reaper deletes nothing, no suite and no record, for an hour; this one is not rate-limited and not counted in `acu_clock_steps_detected_total`. `acu_clock_steps_detected_total` counts detections, not distinct clock steps or distinct stamps: the same future stamp is detected again every time it is read — every check for a future `last_check_at` or `last_success_at` (the scheduler reads a future `last_success_at` without reporting it), every check of a suite without a snapshot for a future `last_requested_at`, and every creation attempt within eight rows of the global cap for the future `last_requested_at` its eviction scan re-reads (the line stays rate-limited) — so alert on its rate, not its value. |
++| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute, except the suite reaper's reports (`stamp=last_requested_at` and `stamp=last_seen_at` from the reaper, and `stamp=wall_clock`), which it bounds itself and logs directly, so a check's report in the same minute cannot hide them. For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. For `stamp=last_requested_at` (a suite's client-interest stamp, read when the suite cap looks for an idle suite to evict, by the suite reaper, and by the check of a suite without a snapshot) the suite is not evicted, nor reaped as idle — a future stamp never counts as idle, though a non-canonical or junk row is reaped regardless (see `suite_reaped`); the reaper reports the furthest such stamp of a canonical suite at the first run that reaps after a start and again only when it changes — and the check counts a stamp up to 7 days ahead as recent interest; further ahead, the suite is dormant until a client asks for it again. For `stamp=last_seen_at` (a signed-seen record's stamp, read once a day by the suite reaper's sweep of records no suite uses; `suite_path` is the record's repository path, the furthest — of records with the same stamp, the first by scheme, host and path — reported at the first sweep after a start — a day after it — and when it changes; "in the future" is measured against the time of the sweep itself, so the records the run's own reaps moved up minutes earlier are no step) the record counts as seen now — it is never swept — and its stamp is left as it is: it ages out only once the clock has passed it (rewriting it to the stepped-back now would lose signed history once the clock is corrected). For `stamp=wall_clock` (the suite reaper; no suite fields) the wall clock moved more than an hour further than the monotonic clock between two of the reaper's runs — a forward step without a restart, as when a virtual machine or a laptop resumes; `stored_unixtime` is where the wall clock should be, `now_unixtime` where it is — and the reaper deletes nothing, no suite and no record, for an hour, and leaves the step out of the records' age for as long as it runs, so the record sweep never deletes a record early because of it; this one is not rate-limited and not counted in `acu_clock_steps_detected_total`. `acu_clock_steps_detected_total` counts detections, not distinct clock steps or distinct stamps: the same future stamp is detected again every time it is read — every check for a future `last_check_at` or `last_success_at` (the scheduler reads a future `last_success_at` without reporting it), every check of a suite without a snapshot for a future `last_requested_at`, and every creation attempt within eight rows of the global cap for the future `last_requested_at` its eviction scan re-reads (the line stays rate-limited) — so alert on its rate, not its value. |
  | `legacy_snapshot_quarantined` | WARN | `reason` (`legacy_plaintext`, `malformed_envelope`, `unsigned_declarations`, `unparseable`, `anchor_missing`, `anchor_oversized`, `anchor_corrupt`, `unexpected_form`), `snapshot_id`, `canonical_host`, `suite_path`, `anchor_form`, `was_current` | The startup trust audit could not prove a pre-upgrade snapshot signed and clean; it no longer serves or vouches, and its suite is served unadopted until it re-adopts. |
  | `legacy_trust_audit_deferred` | ERROR | `snapshot_id`, `canonical_host`, `suite_path`, `err`, `stack` (present only for a recovered panic) | A pre-upgrade snapshot's pool file could not be read (not "missing"), or auditing it panicked (`err` carries the panic value); the snapshot is left as it was and retried at the next start. |
  | `legacy_trust_audit_progress` | INFO | `audited`, `quarantined`, `deferred` | One batch of up to 100 queued snapshots was audited and committed; the fields are running totals across this start's batches. Logged on the first start after an upgrade, and on later starts while deferred snapshots remain queued or after an interrupted audit. |
-@@ -290,9 +297,15 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
+@@ -290,10 +303,18 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
  | `snapshot adopted_at lookup failed` | WARN | `err`, `snapshot_id` | A snapshot `InRelease`/`Release`/`Release.gpg` could not read its snapshot's `adopted_at` (spec C8 `Last-Modified`), so this response carries the pool file's mtime instead and its `Last-Modified` may not grow with the last flip. Not logged when the request had already ended. |
  | `shutdown_waiting_for_adoptions` | INFO | `waited`, `detail` | Shutdown has waited 2 s for the adoption, repair and reconcile goroutines: a commit already running is never cancelled and may take up to its 5-minute bound; other work stops at its next cancellation point (adoptions in the flip barrier were abandoned at the signal). Logged once per shutdown. |
  | `suite_seed_rejected` | WARN | `canonical_host`, `suite_path`, `cap` (`global_cap`, `host_cap`), `max_suites`, `suppressed`, `detail` | A suite was refused a row by `freshness.max_suites`: it is served but will not refresh; retried after 10 minutes (`detail` = `suite will not refresh`). At the total cap while every suite that could have been evicted was busy — being checked or adopted, or evicted for another new suite — the refusal is transient: `detail` = `eviction candidates busy; retried after 1 minute`, and the suite is retried after a minute. At most one line a minute; `suppressed` counts the refusals since the last line. |
@@ -10683,16 +12486,20 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
 +| `suite_evicted` | INFO | `canonical_host`, `suite_path` (the evicted suite), `for_host`, `for_suite` | At or above the global cap, a suite with no adopted snapshot that had not been requested for 24 hours was evicted for a new one; its signed-seen records survive, moved up to the time of the eviction (as for `suite_reaped`). Above the cap (after `freshness.max_suites` was lowered, or after an upgrade) the new suite is still refused (`suite_seed_rejected`) until the table is back under the cap. |
 +| `suite_caps_exceeded` | WARN | `suites`, `max_suites`, `hosts_at_cap`, `per_host_cap`, `fullest_host`, `fullest_host_suites` | At start, the suite table holds more than `freshness.max_suites` suites (a lowered `max_suites`, or an upgraded cache), or a host holds a tenth of it or more: new suites — for a host at its cap, that host's — are refused. Above the total cap each refused attempt still evicts one suite idle for 24 hours, so the table shrinks back; a host at its cap evicts nothing for its own new suites; its suites go when the suite reaper removes those not requested for `gc.suite_idle_ttl`, or when total-cap eviction for any host's new suite picks one of its idle suites. Not logged for a table at exactly the total cap: that is normal operation for a full cache, where a new suite evicts an idle one (no adopted snapshot, not requested for 24 hours) and is refused only when none qualifies (`suite_seed_rejected`). Logged once per start. |
  | `suite cap usage read failed` | WARN | `err` | The startup check behind `suite_caps_exceeded` could not count the suites; the caps apply either way. |
-+| `suite_reaped` | INFO | `canonical_scheme`, `canonical_host`, `suite_path`, `reason` (`idle`, `non_canonical`, `junk`), `metadata_rows`, `settled` (present, `true`, only for a settled reap) | The suite reaper (spec C9; hourly, from an hour after the start, at most 25 suites a run, `non_canonical` and `junk` ones first) deleted a suite: its metadata `url_path` rows (`metadata_rows`, in batches of 1,000, the anchors last), then, in one transaction that re-checks that the suite was not adopted — nor, for `idle`, asked for — since the run listed it, its snapshots (retired: snapshot GC deletes them) and its row. `idle`: no client asked for it in `gc.suite_idle_ttl`; `non_canonical`: a row an earlier release created for a path this version no longer tracks (`metadata_rows` is 0: such a path's cached files are left to `gc.url_path_ttl`); `junk`: a suite without a snapshot whose cached anchor files (`InRelease`, `Release`, `Release.gpg`) all fail their content check — an HTML page, say; a plain `Release` cached as `InRelease` passes — each fetched at least a day ago, whatever its adoption record says. Its signed-seen records survive, moved up to the time of the reap (a later stamp is kept): every suite-row delete — a reap, a cap eviction, a forget that leaves the records — does so, so a record's year (`signed_seen_markers_swept`) counts from the end of its path's tracking. `settled=true`: the final transaction committed but the writer call reported an error, and a fresh read found the row gone — it is a reap all the same. Counted in `acu_suites_reaped_total{reason}`, settled reaps included. |
-+| `suite_forgotten` | INFO | `canonical_scheme`, `canonical_host`, `suite_path`, `metadata_rows`, `markers_deleted`, `anchor_rows` | `POST /forget` deleted a suite as the reaper would, regardless of idleness, and — only when no other suite of the repository path, under either scheme or as its `/.` twin, has a row — `markers_deleted` signed-seen records of the path and `anchor_rows` cached `InRelease`, `Release` and `Release.gpg` of the path and its twin under either scheme. Each accepted request — past the header check, the 8 KiB body limit and the parameter checks — is logged first as INFO `admin_forget_requested` (`scheme`, `canonical_host`, `suite_path`; by `internal/admin`). |
-+| `admin: forget failed` | WARN | `err`, `scheme`, `canonical_host`, `suite_path` | `POST /forget` failed on a database error, or its work took longer than 5 minutes, and answered 500. Metadata batches deleted before the error stay deleted (the anchors go last); the request can be repeated (409 then means the suite is gone after all, or busy). Logged at DEBUG instead, and answered 503, when the admin listener began shutting down while the forget ran: shutdown cuts it short. |
-+| `signed_seen_markers_swept` | INFO | `count` | The suite reaper's daily sweep deleted `count` signed-seen records whose repository path has no suite row (for it or its `/.` twin, under either scheme) and that were last seen — or a suite of their path last deleted: reaped, evicted at the cap, or forgotten while another suite of the path kept the record — more than 365 days ago. Not logged when it deleted none. |
-+| `suite reaper: list suites failed`, `suite reaper: read suite row failed`, `suite reaper: delete metadata failed`, `suite reaper: reap failed`, `suite reaper: list unadopted anchors failed`, `suite reaper: junk anchor reads failed`, `suite reaper: marker sweep failed` | WARN | `err`; `canonical_scheme`, `canonical_host` and `suite_path` for a suite's step; `metadata_rows` (for `delete metadata failed`: rows deleted before the error); `count`, `canonical_scheme`, `canonical_host` and `path` for the junk anchor reads (how many pool files failed to read in the run, and the first: its suite's scheme and host and the anchor's path); `swept` (records deleted before the error) | A step of a suite reaper run failed. A failed listing ends the run: nothing is reaped and nothing swept (a due record sweep runs at the next run); any other failed step leaves the rest of the run to go on: a suite whose step failed — a database error, or its work cut short after 5 minutes — keeps its row and is retried at the next run (the metadata batches deleted before the error stay deleted, the anchors last); a pool file that exists but does not read keeps its suite (a missing one is not logged); the junk scan runs again at the next run, the record sweep the next day. A step that fails because the daemon is stopping is logged at DEBUG instead. |
-+| `suite reaper: suite busy, retried next run` | DEBUG | `canonical_scheme`, `canonical_host`, `suite_path` | A suite the reaper would reap was held — by a check, an adoption, a repair or reconcile, or another deleter (cap eviction, `POST /forget`) — or deleted meanwhile; it is tried again at the next run if it still qualifies, and counts toward the run's 25. |
- | `handler_goroutine_panicked` | ERROR | `where` (`touch`, `seed_rejections`), `canonical_host` and `path` (`touch` only), `panic`, `stack` (first occurrence per `where` per process only) | A panic in one of the handler's background goroutines — the touch goroutine, or the cap-rejection cache's sweep timer — was recovered (a bug, please report it). |
+-| `handler_goroutine_panicked` | ERROR | `where` (`touch`, `seed_rejections`), `canonical_host` and `path` (`touch` only), `panic`, `stack` (first occurrence per `where` per process only) | A panic in one of the handler's background goroutines — the touch goroutine, or the cap-rejection cache's sweep timer — was recovered (a bug, please report it). |
++| `suite_reaped` | INFO | `canonical_scheme`, `canonical_host`, `suite_path`, `reason` (`idle`, `non_canonical`, `junk`), `metadata_rows`, `settled` (present, `true`, only for a settled reap) | The suite reaper (spec C9; hourly, from an hour after the start; a run tries at most 250 `non_canonical` and `junk` suites, first, and at most 25 `idle` ones) deleted a suite: its metadata `url_path` rows (`metadata_rows`, in batches of 1,000, the anchors last), then, in one transaction that re-checks that the suite was not adopted — nor, for `idle`, asked for — since the run listed it, its snapshots (retired: snapshot GC deletes them) and its row. `idle`: no client asked for it in `gc.suite_idle_ttl`; `non_canonical`: a row an earlier release created for a path this version no longer tracks (`metadata_rows` is 0: such a path's cached files are left to `gc.url_path_ttl`); `junk`: a suite without a snapshot whose cached anchor files (`InRelease`, `Release`, `Release.gpg`) all fail their content check — an HTML page, say; a plain `Release` cached as `InRelease` passes — each fetched at least a day ago, whatever its adoption record says. Its signed-seen records survive, moved up to the time of the reap (a later stamp is kept): every suite-row delete — a reap, a cap eviction, a forget that leaves the records — does so, so a record's year (`signed_seen_markers_swept`) counts from the end of its path's tracking; and a suite with an adopted signed snapshot (`inline` or `detached`, not retired) gets its path's record under its own scheme before its snapshots are retired — created if missing, as for a snapshot the upgrade's trust audit could not read yet — so that history survives too. `settled=true`: the final transaction committed but the writer call reported an error, and a fresh read found the row gone — it is a reap all the same. Counted in `acu_suites_reaped_total{reason}`, settled reaps included. |
++| `admin_forget_requested` | INFO | `scheme`, `canonical_host`, `suite_path` | `POST /forget` accepted a request (logged by `internal/admin`): it passed the header checks (`X-ACU-Admin: 1`, `Sec-Fetch-Site`), the 8 KiB body limit and the parameter checks, and the forget starts. A request refused with 400, 403 or 413 is not logged. `scheme` is the suite's canonical scheme (the other lines about a suite name it `canonical_scheme`). The outcome follows: `suite_forgotten`, `admin: forget failed`, no line for a busy or unknown suite (409), or, after a panic while the suite is held, `freshness_check_panicked` with `where=forget` (a panic before the hold leaves only net/http's ERROR line). |
++| `suite_forgotten` | INFO | `canonical_scheme`, `canonical_host`, `suite_path`, `metadata_rows`, `markers_deleted`, `anchor_rows`; `settled` (present, `true`, only for a settled forget, whose line carries `metadata_rows` but not `markers_deleted` or `anchor_rows`) | `POST /forget` deleted a suite as the reaper would, regardless of idleness, and — only when no other suite of the repository path, under either scheme or as its `/.` twin, has a row — `markers_deleted` signed-seen records of the path and `anchor_rows` cached `InRelease`, `Release` and `Release.gpg` of the path and its twin under either scheme. Its request is logged first as `admin_forget_requested`. `settled=true`: the final transaction committed but the writer call reported an error, and a fresh read found the row gone — a forget all the same (the records and cached anchors deleted as above when no other suite of the path has a row; how many is not known); the request is then answered 500 with WARN `admin: forget failed`, or 503 with that line at DEBUG when the admin listener's shutdown cut it short. |
++| `admin: forget failed` | WARN | `err`, `scheme`, `canonical_host`, `suite_path` | `POST /forget` failed on a database error, or its work took longer than 5 minutes, and answered 500. Metadata batches deleted before the error stay deleted (the anchors go last); the request can be repeated (409 then means the suite is gone after all, or busy). A forget whose final delete committed before the error is logged `suite_forgotten` with `settled=true` just before this line when a fresh read then finds the row gone (a read that fails, or lands before a commit still in flight, finds it present: then no such line). Logged at DEBUG instead, and answered 503, when the admin listener began shutting down while the forget ran: shutdown cuts it short. |
++| `signed_seen_markers_swept` | INFO | `count` | The suite reaper's daily sweep (the first a day after the start, then a day apart) deleted `count` signed-seen records whose repository path has no suite row (for it or its `/.` twin, under either scheme) and that were last seen — or a suite of their path last deleted: reaped, evicted at the cap, or forgotten while another suite of the path kept the record — more than 365 days ago, by the clock less the forward steps the reaper detected while running (`clock_step_detected` with `stamp=wall_clock`), so such a step never ages a record. Not logged when it deleted none. |
++| `suite reaper: list suites failed`, `suite reaper: read suite row failed`, `suite reaper: delete metadata failed`, `suite reaper: reap failed`, `suite reaper: list unadopted anchors failed`, `suite reaper: junk anchor reads failed`, `suite reaper: marker sweep failed` | WARN | `err`; `canonical_scheme`, `canonical_host` and `suite_path` for a suite's step; `metadata_rows` (for `delete metadata failed`: rows deleted before the error); `count`, `canonical_scheme`, `canonical_host` and `path` for the junk anchor reads (how many anchor reads failed in the run's junk scan — a failed read is not remembered, so one unreadable pool file that N suites share counts once for each of them whose scan reaches it, up to N times — and the first: its suite's scheme and host and the anchor's path); `swept` (records deleted before the error) | A step of a suite reaper run failed. A failed listing ends the run: nothing is reaped and nothing swept (a due record sweep runs at the next run); any other failed step leaves the rest of the run to go on: a suite whose step failed — a database error, or its work cut short after 5 minutes — keeps its row and is retried at the next run (the metadata batches deleted before the error stay deleted, the anchors last); a pool file that exists but does not read keeps its suite (a missing one is not logged); the junk scan runs again at the next run, the record sweep the next day. A step that fails because the daemon is stopping is logged at DEBUG instead. |
++| `suite reaper: suite busy, retried next run` | DEBUG | `canonical_scheme`, `canonical_host`, `suite_path` | A suite the reaper would reap was held — by a check, an adoption, a repair or reconcile, or another deleter (cap eviction, `POST /forget`) — or deleted meanwhile; it is tried again at the next run if it still qualifies, and counts toward the run's budget for its kind (25 `idle` suites; 250 `non_canonical` and `junk` ones). |
++| `handler_goroutine_panicked` | ERROR | `where` (`touch`, `seed_rejections`), `canonical_scheme`, `canonical_host` and `path` (`touch` only), `panic`, `stack` (first occurrence per `where` per process only) | A panic in one of the handler's background goroutines — the touch goroutine, or the cap-rejection cache's sweep timer — was recovered (a bug, please report it). |
++| net/http's own lines: `http: panic serving …`, `http: TLS handshake error from …` and the like | ERROR on the admin listener; WARN on the proxy listeners | none: `msg` is net/http's text — for a panic, `http: panic serving <client address>: <panic>` followed by the stack | The Go HTTP server's own diagnostics, logged through the daemon's structured log at the level each listener sets (left to itself, net/http would write them through Go's standard log package, which the daemon also sends to its log, but at INFO). On the admin listener every such line is ERROR, above all a handler panic net/http recovered: after a `POST /forget` panic, which is logged first as `freshness_check_panicked` with `where=forget`, the request ends without an answer and gets no `admin_request` line. On the proxy listeners (plain and TLS) they are WARN, a TLS handshake error included. |
  | `suite onboarding failed` | WARN | `err`, `canonical_host`, `suite_path` | A cache hit on an untracked suite's anchor could not create its row (including the 5 s bound it shares with the backstop that may follow, and a shutdown that cut it short); the anchor is served and the next hit retries. |
  | `suite signed-seen mark failed` | WARN | `err`, `canonical_host`, `suite_path` | A suite's row was created, and one of its cached signed anchors changed between the handler's read and the creating write (or the handler could not read it: `suite cached anchor read failed`), so it was marked afterwards — and that write failed, or ran out of its 5 s bound. The startup pass marks it at the next start. (Every other mark is part of the write that creates the row or stores the anchor.) |
-@@ -306,4 +319,4 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
+ | `suite file head read failed` | WARN | `err`, `canonical_host`, `suite_path`, `path` | A suite file just fetched on a miss could not be read back from the cache's pool for its content check (a local disk fault). For a signed anchor (`InRelease`, `Release.gpg`) the miss fails — 502 with `Retry-After`, request outcome `cache_write_failed` (and ERROR `cache write failed`), no body, nothing stored — because the anchor must not be served before its suite is marked as signed; apt retries. Any other suite file (`Release`, a flat index) is stored and served, but creates no suite row and re-stamps none. |
+@@ -306,4 +327,4 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
  | `strict-mode coverage lookup failed` | WARN | `err`, `canonical_host` | Strict mode could not read its host's current snapshots and their coverage: it fails open for the request (the `.deb` is served or fetched as if strict mode were off). A request whose client left is answered 503 (`client_canceled`) on the hit path and logs nothing here. |
  | `package_hash validate lookup failed` | WARN | `err`, `canonical_host`, `path` | After a `.deb` download the vouching hashes could not be read: the body is kept and served without validation (fail open, as on the hit path). |
  | `shutdown wait panicked` | ERROR | `panic`, `stack` | The shutdown drain's wait for the adoption, repair and reconcile goroutines panicked (a bug, please report it); shutdown carries on without waiting further for them. |
@@ -10758,10 +12565,10 @@ diff --git a/docs/admin-ui-spec.md b/docs/admin-ui-spec.md
 The **Date** line's `(revision 8, 2026-10-19:` becomes `(revision 9, 2026-10-20: …; revision 8, 2026-10-19:`, the inserted text being:
 
 ```text
-revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9) and task reviews (ruling PF-10): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503)
+revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9), task reviews (rulings PF-10, PF-11) and the final review (rulings PF-12–PF-15): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); a hand edit that adds one field to one log line touches that function, not the whole file, for the deferred-minor rule (PF-11); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503); after the phase F final review: before it retires a suite's snapshots, every suite-row delete turns never-downgrade's snapshot clause into a marker — when the suite has an adopted, non-retired inline or detached snapshot it upserts its base's marker under the suite's scheme, the one marker a delete creates (PF-12); a forward step the reaper detects never ages a marker (the sweep's cutoff takes off every step detected since the reaper started), and the first sweep is due a day after the reaper starts, so a start with the clock ahead has a day to be corrected (PF-13); the classes reaped regardless of idleness have their own budget of 250 a run, tried first, beside the 25 idle suites (PF-14); the startup GC pass runs no sub-job C (PF-15); a reaped suite's packages lose the version retention its snapshot gave them; a `/forget` panic is logged with its suite (`where=forget`), and a forget whose writer call failed after its commit is logged (`suite_forgotten`, `settled=true`) when a fresh read finds the row gone
 ```
 
-Then C3's marker paragraph (design note 13, rulings PF-1, PF-2, M-9, PF-10), C4's clock-step rule (R-F5, PF-1), C5 safeguard 1 (PF-5), C9 (R-F1–R-F3, R-F5, PF-1–PF-4, PF-6–PF-8, PF-10, design notes 2–8, 14, 15, deferred minor C-11), C10's rewrapped line (E-63), C11's events, metrics and constants, §7 (deviation 2, the production-cadence simulation, the new DoD items) and §10's G-1 item (PF-6):
+Then §2 (the reaper and url_path GC, `adoption.enabled = false`), C3's marker paragraph (design note 13, rulings PF-1, PF-2, M-9, PF-10, PF-12 and its accepted residual), C4's clock-step rule (R-F5, PF-1), C5 safeguards 1 (PF-5) and 3 (PF-12), C8's stale sentences, C9 (R-F1–R-F3, R-F5, PF-1–PF-4, PF-6–PF-8, PF-10, PF-12–PF-15, design notes 2–8, 14, 15, deferred minor C-11), C10's rewrapped line (E-63), C11's events, metrics and constants, §7 (deviation 2, the production-cadence simulation, the new DoD items, two periodic GC ticks) and §10's G-1 item (PF-6):
 
 ```diff
 diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/docs/superpowers/specs/2026-09-27-flat-repositories-design.md
@@ -10771,11 +12578,44 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  # Flat repositories, eager adoption, and suite lifecycle — design
  
 -- **Date:** 2026-09-27 (revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
-+- **Date:** 2026-09-27 (revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9) and task reviews (ruling PF-10): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503); revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
++- **Date:** 2026-09-27 (revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9), task reviews (rulings PF-10, PF-11) and the final review (rulings PF-12–PF-15): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); a hand edit that adds one field to one log line touches that function, not the whole file, for the deferred-minor rule (PF-11); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503); after the phase F final review: before it retires a suite's snapshots, every suite-row delete turns never-downgrade's snapshot clause into a marker — when the suite has an adopted, non-retired inline or detached snapshot it upserts its base's marker under the suite's scheme, the one marker a delete creates (PF-12); a forward step the reaper detects never ages a marker (the sweep's cutoff takes off every step detected since the reaper started), and the first sweep is due a day after the reaper starts, so a start with the clock ahead has a day to be corrected (PF-13); the classes reaped regardless of idleness have their own budget of 250 a run, tried first, beside the 25 idle suites (PF-14); the startup GC pass runs no sub-job C (PF-15); a reaped suite's packages lose the version retention its snapshot gave them; a `/forget` panic is logged with its suite (`where=forget`), and a forget whose writer call failed after its commit is logged (`suite_forgotten`, `settled=true`) when a fresh read finds the row gone; revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
  - **Status:** draft for maintainer review
  - **Branch:** `feature/flat-repos` (from `main` @ 536a1ab)
  - **Origin:** reimplementation of the problem reported in PR #8 ("Refresh flat
-@@ -359,7 +359,7 @@ UPDATE-only. `Check` and `Reconcile` require an **existing row** before
+@@ -60,7 +60,13 @@ Implementation is phased safety-nets-first (§9).
+ 
+ - Changing the shipped default `adoption.enabled = false`. **With adoption
+   disabled no repository (flat or `dists/`) refreshes its metadata** — the
+-  documented Phase 1 contract (`TestCheck_NoAdopter_ChangeOnlyLogged`). Every
++  documented Phase 1 contract (`TestCheck_NoAdopter_ChangeOnlyLogged`); the
++  suite reaper (C9), which runs whatever adoption says, deletes an idle
++  suite's cached metadata — as `url_path` GC does, with `gc.enabled = true`
++  and a nonzero `gc.url_path_ttl`, for metadata no client asked for within
++  `url_path_ttl` (after `hold_packages.window`) — so clients that return
++  to a suite after either fetch upstream's files of that time through the
++  cache, which then stay as fetched. Every
+   refresh mechanism in this design, including the anchorless refresh,
+   requires adoption to be enabled; the docs say so prominently.
+ - Host-root flat repositories (`deb https://h/ /`); multi-segment `dists/`
+@@ -285,12 +291,15 @@ refused while the count stays at or above the cap, so the table converges
+ under the 24 h rule (phase D, ruling PD-8). The per-host cap never evicts:
+ a host at its cap shrinks through the reaper (C9, `gc.suite_idle_ttl`, 30
+ days by default), or when global-cap eviction — whose candidates come from
+-every host — takes one of its idle suites. The daemon logs WARN `suite_caps_exceeded` at start
++every host — takes one of its idle suites (with `gc.suite_idle_ttl = 0s`,
++only then). The daemon logs WARN `suite_caps_exceeded` at start
+ when the table is above the global cap or a host is at its cap — at
+ exactly the global cap a creation evicts, so a full table is normal
+ operation and logs nothing (phase D, ruling PD-12). An
+ eviction leaves the evictee's `url_path` rows to `url_path` GC, drops its
+-lock-map, flip-gate and touch entries, and logs INFO `suite_evicted`.
++lock-map and touch entries and its flip-gate entry unless that entry is
++live (a live entry expires on its own; phase F, ruling R-F2), and logs
++INFO `suite_evicted`.
+ Otherwise the creation creates nothing and emits a rate-limited WARN
+ `suite_seed_rejected` ("suite will not refresh"; one line a minute, field
+ `suppressed`), the counter `acu_suite_seed_rejected_total{host}` (refusals
+@@ -359,7 +368,7 @@ UPDATE-only. `Check` and `Reconcile` require an **existing row** before
  `LoadOrStore` (I-4) and re-validate after `TryLock` that the lock map still
  holds the same mutex and the row still exists. `Check` first peeks at the
  lock map without storing: a suite whose mutex is held answers busy with no
@@ -10784,7 +12624,25 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  burst of T1s on one suite costs about one read (phase D final review). The
  handler's by-hash content-addressed fallback requires a known suite (I-4,
  handler side). A test proves exactly one INSERT site.
-@@ -454,10 +454,19 @@ that have a `suite_freshness` row. Writers:
+@@ -377,7 +386,8 @@ from client-serving paths:
+   install-only clients keep their suite alive.
+ 
+ Touches are coalesced in memory (at most one write per suite per hour; the
+-map holds only tracked suites and is purged on reap and on eviction). The
++map holds only tracked suites and is purged when a suite row is deleted: a
++reap, an eviction or a forget). The
+ coalescing is monotonic: after a forward wall-clock step of 23 h or more, an
+ active suite without a snapshot keeps its pre-step stamp for up to an hour
+ and is evictable meanwhile — bounded and self-healing. A stamp in the future
+@@ -450,14 +460,44 @@ that have a `suite_freshness` row. Writers:
+   marked under its own row's scheme. Residual: an anchor cached under the
+   other scheme while its suite has no row (refused at the cap) after the
+   re-mark ran — served signed during the adoption's flip barrier — earns
+-  no marker before that commit (C5).
++  no marker before that commit (C5);
++- a suite-row delete (phase F, ruling PF-12), in its transaction, before
++  it retires the suite's snapshots: the marker of a base whose suite has
++  an adopted, non-retired inline or detached snapshot (below).
  
  A plain-text "InRelease" fails the sniff and never creates a marker. The
  marker survives suite reaping: the reaper sweeps a marker only once no
@@ -10799,6 +12657,24 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +forget — moves the base's markers, under both schemes, up to its time
 +(`MAX(last_seen_at, now)`, in the deleting transaction; phase F, ruling
 +PF-10), so the year counts from the end of the suite's tracking.
++Before it retires the suite's snapshots, the same transaction turns
++never-downgrade's snapshot clause (C5 safeguard 3) into a marker, since
++a retired snapshot is no history: when the suite has an adopted,
++non-retired inline or detached snapshot — a pre-v7 one the trust audit
++left queued and unmarked after a pool read fault (§6.1, M-8), for
++instance — it upserts the marker of its base under the suite's scheme
++(`MAX(last_seen_at, now)`; phase F, ruling PF-12). That is the one
++marker a delete creates: a suite without such a snapshot of its own
++gets none, whatever its `/.` twin or the other scheme's suite of its
++path holds (their snapshots are not retired, and still count in C5
++safeguard 3's snapshot clause).
++Accepted residual of PF-12: a marker written from a snapshot the audit
++had left queued stays if a later audit quarantines that snapshot — a
++quarantine deletes no marker — so the base keeps
++refusing unsigned candidates (it fails closed) until a suite of the
++base, tracked again at a client's request, is forgotten (`POST
++/forget`), or, with no suite of the base tracked, the orphan sweep
++deletes the marker after its year.
 +`POST /forget` deletes the base's markers, under both schemes — and the
 +cached `InRelease`, `Release` and `Release.gpg` of the base and its `/.`
 +twin under both schemes, which the unsigned commit's re-mark would
@@ -10808,7 +12684,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  
  ### C4. Freshness check
  
-@@ -733,9 +742,14 @@ pending change), cleared in the flip transaction and on
+@@ -733,16 +773,24 @@ pending change), cleared in the flip transaction and on
  
  **Clock-step rule** (fixes I-7 in all touched gates). A *past-event* stamp
  (`last_check_at`, `last_success_at`, `last_requested_at`,
@@ -10825,7 +12701,18 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  exception is the confirmation gaps — the unsigned transition's and the
  absent anchor's — where a future `adoption_fail_first_at` never confirms
  and re-recording restarts it: reading it as infinitely old would skip a
-@@ -886,9 +900,16 @@ upgrade (§6.1).
+ confirmation (phase E, deviation 2 and ruling PE-1; C4 Dispatch 1, C5
+ safeguard 2).
+ `next_retry_at` is only clamped to `now + 1h` (C7). Each detection emits a
+-rate-limited WARN `clock_step_detected`. Touch coalescing and all in-memory
++rate-limited WARN `clock_step_detected`, except the suite reaper's
++reports — the furthest future `last_requested_at` and `last_seen_at`,
++each once per change, and a forward step of the wall clock — which it
++bounds itself and logs directly (C9). Touch coalescing and all in-memory
+ timing use monotonic time. Since C8's monotonic stamp, `adopted_at` can
+ legitimately lead the clock (by 1 s per same-second flip, by up to a
+ backward step's length after one); no gate reads it as a past event today,
+@@ -886,9 +934,16 @@ upgrade (§6.1).
     it as an `anchor_absent` record does (no request and no scheduler check
     before its retry time). Turning the knob back on updates it at its next
     retry; bytes refused this way were never confirmed, so a never-adopted
@@ -10845,7 +12732,59 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  2. Eligible only when `InRelease` and `Release.gpg` are both *absent* and
     `Release` is *present*. The **transition into** unsigned (a suite with no
     current snapshot) needs two observations of the same `Release` bytes at
-@@ -1233,36 +1254,98 @@ removes the suite row. Retired snapshots are invisible to everything that
+@@ -914,8 +969,12 @@ upgrade (§6.1).
+    detached snapshot of the base or its `/.` twin exists under either
+    scheme (M-8: also a signed displaced snapshot the audit left queued and
+    unmarked while it quarantined the current one). The marker outlives
+-   reaping, covers the `./` twin, and is committed in the writer operation
+-   that stores a signed anchor, before any client is served it (C3). One
++   reaping, and a suite-row delete writes one for a base whose only
++   history is an adopted signed snapshot, before it retires that snapshot
++   (phase F, ruling PF-12; the marker stays if the audit later
++   quarantines that snapshot, C3); it covers the `/.` twin, and is committed in
++   the writer operation that stores a signed anchor, before any client is
++   served it (C3). One
+    rule, one function (`refuseUnsignedDowngrade`: a marker read and a
+    snapshot read) at every point it runs: at eligibility, and again
+    **inside the `CommitAdoption` writer transaction**, which refuses an
+@@ -1194,8 +1253,11 @@ flip other adoptions can queue for up to about 140 s (bounded).
+ by-hash clients remain covered by retained by-hash. Answering held requests
+ with `503 Retry-After` instead was rejected: apt before 2.3.2 treats a 5xx as
+ an item failure without retrying, while answering from the current snapshot is
+-today's behaviour. Map entries exist only for suites with rows, expire when
+-idle for twice the quiet period, and are purged on reap.
++today's behaviour. Map entries are created only for suites with rows and
++expire when idle for twice the quiet period; a suite-row delete (a reap,
++an eviction, a forget) purges its suite's entry unless it is live — a
++flip, a hold, an anchor serve in flight, or any use within the quiet
++period — which then expires on its own (phase F, ruling R-F2).
+ 
+ **Retained by-hash.** When `trySnapshotHit` misses the current snapshot for a
+ `by-hash/SHA256|SHA512/<hex>` member, it looks the alias up in the suite's
+@@ -1213,7 +1275,13 @@ member-recovery path) use the serving snapshot's `adopted_at` alone as the
+ `ServeContent` modtime — the pool file's mtime only when `adopted_at` cannot
+ be read (logged) — so a client's `If-Modified-Since` from the previous
+ anchor always gets a 200 after a flip, whatever the clock or a recovery
+-rewrite of a pool file does. (`max(pool mtime, adopted_at)`, this rule
++rewrite of a pool file does — within one residual of suite reaping (C9):
++once sub-job C has deleted a reaped or forgotten suite's retired
++snapshots, a backward clock step longer than the time from the reap to
++the re-adoption can stamp the re-adoption below the reaped snapshot, and
++a client still holding that anchor gets a 304 until a later flip is
++stamped above it (a durable per-suite floor needs a schema change).
++(`max(pool mtime, adopted_at)`, this rule
+ before phase C's final review, let a pool file written before a backward
+ clock step, or rewritten by a recovery, carry a `Last-Modified` the next
+ flip's stamp did not exceed: 304s and stale lists until a later flip.)
+@@ -1228,41 +1296,149 @@ with this guarantee and its residuals.
+ ### C9. Suite lifecycle (limitation #3)
+ 
+ **Snapshot retirement.** `suite_snapshot.retired_at` marks every snapshot of a
+-suite incarnation that was reaped or forgotten, in the same transaction that
+-removes the suite row. Retired snapshots are invisible to everything that
++suite incarnation that was reaped, evicted at the global cap or forgotten,
++in the same transaction that removes the suite row (`deleteSuiteTx`).
++Retired snapshots are invisible to everything that
  reasons about a suite's history: the natural-key uniqueness (partial index
  `WHERE retired_at IS NULL`), `InsertCandidateSnapshot`'s collision lookup,
  `rollback_refused`, retained by-hash, `DeclaredHashesForPath`,
@@ -10857,7 +12796,8 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +deliberate rollback adopts after `/forget`. Only the adoption stamp still
 +sees them: a re-adoption's `adopted_at` stays above every snapshot of the
 +suite, retired ones included, so C8's `Last-Modified` never goes back
-+(phase F, deferred minor C-11).
++while they remain (phase F, deferred minor C-11; once sub-job C has
++deleted them, C8's residual applies).
  
  **Reaper.** Its own hourly ticker under the freshness checker's lifecycle
 -(independent of `gc.interval` and of the T2 loop), after a monotonic uptime
@@ -10865,9 +12805,15 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 -`last_requested_at < now − gc.suite_idle_ttl` (default `720h`; `0s` disables),
 +(independent of `gc.interval`, of `gc.enabled` and of the T2 loop), after a
 +monotonic uptime floor of 1 h; each run starts an interval after the
-+previous one finished. At most 25 suites per run (constant; a busy one
-+counts): those reaped regardless of idleness first (phase F, ruling
-+PF-4), then the oldest `last_requested_at`. Candidates:
++previous one finished. A run tries at most 250 of the suites reaped
++regardless of idleness (non-canonical and junk rows, below) first, then,
++in the same run, at most 25 idle suites, the oldest `last_requested_at`
++first (constants; a busy suite counts against its own class's budget;
++phase F, rulings PF-4, PF-14: the regardless classes are cheap reaps —
++no snapshot, at most three anchor rows for a junk suite, no metadata for
++a non-canonical row — and an upgraded table can hold thousands of them,
++which one shared budget of 25 would drain over days with no idle reaping
++meanwhile). Candidates:
 +`last_requested_at < now − gc.suite_idle_ttl` (default `720h`; `0s` disables
 +reaping; a NULL or future stamp is never idle, and the furthest future one
 +is reported through `clock_step_detected` at the first run after a start
@@ -10893,7 +12839,13 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +suite through the checker's `SuiteGuard` (`HoldSuite` `TryLock`s the
 +suite mutex; busy → skip, retried next run) and re-read its row (I-4: a
 +row gone since the listing has its lock-map entry dropped; a suite asked
-+for, or adopted, since the listing is left whole; junk evidence is not
++for, or adopted, since the listing is left whole — up to this re-read: a
++client that asks for it between the re-read and step 2 keeps the row,
++but not the metadata step 1 deleted, so a client of a suite without a
++snapshot can see one Hash Sum mismatch in mid-update (the M-7 residual
++`/forget` documents) and an adopted suite's next check rebuilds its
++anchor row (WARN `freshness: metadata anchor missing for adopted suite;
++reconstructing`); junk evidence is not
 +read again), then, within 5 minutes (a step cut short is retried next
 +run; a panic under the hold is recovered for that suite alone — logged,
 +the hold released as the cache then answers — and the run goes on):
@@ -10907,7 +12859,9 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +   compare-and-delete (`deleteSuiteTx`): re-read the row and
     bail if the stamp is newer than the cutoff or `current_snapshot_id` changed
 -   since the candidate was listed (compare-and-delete); run the Step-8 refcount
-+   since the candidate was listed; run the Step-8 refcount
++   since the candidate was listed; upsert the base's marker when the suite
++   has an adopted, non-retired inline or detached snapshot (PF-12, C3);
++   run the Step-8 refcount
     decrement for the current snapshot; set `retired_at` on all of the suite's
 -   snapshots; delete the `suite_freshness` row.
 -
@@ -10926,6 +12880,16 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +   suite_freshness`, and only cap eviction, `ReapIdleSuite` and
 +   `ForgetSuite` call it (phase F, ruling R-F1).
 +
++The reaper deletes no package row, but a reaped suite's cached packages
++lose the retention its current snapshot gave them — `url_path` GC's
++mirror rule ranks the newest `retention.max_versions_per_package`
++versions within current snapshots only (a package another current
++snapshot lists keeps that one's) — so with `gc.enabled = true` and a
++nonzero `gc.url_path_ttl` GC deletes those no client requested within
++`gc.url_path_ttl`, once `hold_packages.window` has passed, and their pool
++files after `gc.blob_grace`: the intended disk reclamation (phase F
++final review, spec I1).
++
 +Then `release(true)` purges in-memory state: the lock-map entry
 +(`CompareAndDelete`), the checker's per-suite maps and the flip-gate
 +entry; the cache itself drops the touch-coalescing entry once the row is
@@ -10937,12 +12901,17 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +run also scans for junk rows (every run, ruling PF-4: one indexed read
 +that probes `url_path` by its key, pool reads only for blobs not yet
 +sniffed) and sweeps the reconcile memo (against the current snapshot ids
-+it listed). Once a day — at the first run after a start, then a day apart
-+(monotonic) — it sweeps the signed-seen markers whose base and `/.` twin
-+have no `suite_freshness` row under either scheme and whose
-+`last_seen_at` is older than 365 days, each delete re-checking both in
-+its writer transaction. The sweep is a gate that retires things (C4
-+clock-step rule): a future stamp reads as now, so its marker is never
++it listed). Once a day — at the first run a day or more after the reaper
++started, then a day apart (monotonic; phase F, ruling PF-13: a start
++with the wall clock ahead, which the forward-step guard cannot see, has
++a day to be corrected) — it sweeps the signed-seen markers whose base
++and `/.` twin have no `suite_freshness` row under either scheme and
++whose `last_seen_at` is older than the cutoff `now − stepAhead − 365 d`,
++`now` being the run's clock and `stepAhead` the sum of the forward steps
++the reaper has detected since it started (PF-13: a detected step never
++ages a marker; after a genuine suspend markers are only kept longer),
++each delete re-checking both in its writer transaction. The sweep is a
++gate that retires things (C4 clock-step rule): a future stamp reads as now, so its marker is never
 +swept; the sweep never rewrites it and reports the furthest through
 +`clock_step_detected` at the first sweep after a start and when it
 +changes — judged against a fresh clock read, since the run's own deletes
@@ -10950,11 +12919,26 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +directly, outside the one-line-a-minute limit (rulings R-F5, PF-1). A
 +forward step of the wall clock that no restart re-arms — the wall clock more than 1 h ahead of the monotonic
 +clock between two runs, as when a VM or laptop resumes — is reported
-+(`clock_step_detected`, `stamp=wall_clock`) and defers reaping and the
-+sweep by the uptime floor (ruling PF-8). Reaps are counted by reason
-+(`acu_suites_reaped_total{reason}`). The gpg once-logger sets start
-+over when a new key finds 10,000 entries. Snapshot GC gains sub-job C:
-+after sub-jobs A and B, within the snapshot pass's deadline, one retired
++(`clock_step_detected`, `stamp=wall_clock`), defers reaping and the
++sweep by the uptime floor (ruling PF-8), and is added to `stepAhead`
++for the rest of the process (PF-13): the hour gives clients time to
++touch their suites, but no client touches an orphan marker, and a swept
++marker cannot come back. Residuals of PF-13: a wrong step that outlives
++a restart, uncorrected for a day, still ages markers by it, and a daemon
++restarted at least once a day (before its first sweep comes due) never
++sweeps (orphan markers are small rows: the safe side). Reaps are
++counted by reason (`acu_suites_reaped_total{reason}`). The gpg
++once-logger sets start over when a new key finds 10,000 entries.
++Snapshot GC gains sub-job C,
++in the periodic ticks only — the startup pass, which runs before the
++listeners serve, skips it, since retired snapshots never serve and the
++backlog after a burst of reaps (some 70–100k `package_hash` rows per
++snapshot of a large suite) could keep the listeners closed up to
++`max_tick_duration` (phase F, ruling PF-15; after a start the periodic
++ticks run it, normally the first one — a later one when an earlier pass,
++the startup pass's blob pass say, reached its deadline, since the passes
++resume in rotation): after sub-jobs A and B, within the snapshot pass's
++deadline, one retired
 +snapshot per writer transaction is deleted with its members, skipped
 +members and `package_hash` rows in bounded chunks (10,000 rows per writer
 +transaction), then the header row; it needs no grace, since a retired
@@ -10963,7 +12947,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  
  **Migration backfill** of `last_requested_at`: the newest client
  `last_requested_at` of the suite's anchor `url_path` rows, else migration time
-@@ -1270,16 +1353,35 @@ minus the 7-day interest window. Dormant never-adopted suites are therefore
+@@ -1270,16 +1446,43 @@ minus the 7-day interest window. Dormant never-adopted suites are therefore
  neither eagerly adopted after upgrade nor kept alive; they are reaped about 23
  days later.
  
@@ -11003,13 +12987,21 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +(the Host cell pasted whole), 500 for a database error (logged), and 503
 +when the admin listener's shutdown cut it short (each metadata batch and
 +the final delete are their own transactions, so a forget cut short is
-+safe to repeat). It is the documented escape hatch for refusal states: a
++safe to repeat). A final delete that committed although its writer call
++failed is logged `suite_forgotten` with `settled=true` before the 500 or
++503 when a fresh read then finds the row gone, as a settled reap is (a
++read that fails, or lands before a commit still in flight, finds it
++present, and nothing is logged); a panic under the hold is logged with
++the suite (`freshness_check_panicked`, `where=forget`), the hold released as
++the cache then answers, and re-panicked to net/http, whose line the admin
++listener logs through slog at ERROR (phase F final review, spec m1, m2).
++It is the documented escape hatch for refusal states: a
 +vendor that stopped signing, a deliberate upstream rollback, a stuck
 +unsigned suite. (`POST /reconcile` keeps its existing
  protection; hardening it is part of G-1, §10.)
  
  ### C10. Strict mode
-@@ -1302,8 +1404,9 @@ that is left (phase E, design review M-10: the miss path still downloads
+@@ -1302,8 +1505,9 @@ that is left (phase E, design review M-10: the miss path still downloads
  the whole `.deb` before its first byte, within apt's 30 s) — then re-runs
  the lookup once; a request whose client left during the wait is answered
  503 (`client_canceled`) and never served (phase E fix round 1: a re-run
@@ -11021,7 +13013,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  `errUnvouchedRetryable` (releasing its slot) when an adoption is in flight on
  the host; `serveCacheMiss`, outside singleflight, waits under the same
  bound and retries the miss once: requests that waited together coalesce
-@@ -1335,7 +1438,8 @@ stays live).
+@@ -1335,7 +1539,8 @@ stays live).
  ### C11. Observability and configuration
  
  **Events** (documented in `docs/log-fields.md`): `suite_seed_rejected`,
@@ -11031,7 +13023,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  `adoption_failing_persistently`, `adoption_refused` (reason),
  `adoption_flip_barrier`, `adoption_abandoned_at_shutdown` (an adoption
  ended by shutdown, in the flip barrier or before it: INFO, never counted as
-@@ -1350,11 +1454,16 @@ gauges `acu_adoption_failing_suites` (C7), `acu_freshness_waiting_for_slot`
+@@ -1350,11 +1555,16 @@ gauges `acu_adoption_failing_suites` (C7), `acu_freshness_waiting_for_slot`
  (flips in the C8 barrier now), the C3 pair
  `acu_suite_seed_rejected_total{host}` (counter) and
  `acu_suites_seed_rejected` (gauge), `acu_freshness_unlogged_panics_total`,
@@ -11053,20 +13045,22 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  `gc_run_complete` and `LastRunSummary` gain `retired_reaped`.
  
  | Key | Default | Rule |
-@@ -1370,7 +1479,11 @@ Constants, not knobs: backoff 2 m → 1 h (adoption failures and repeated
+@@ -1370,7 +1580,13 @@ Constants, not knobs: backoff 2 m → 1 h (adoption failures and repeated
  (the C8 quiet cut at 15 s); phase A cap 60 s; hold-token wait 60 s; waiter
  caps 256 (barrier) and 64 (strict wait); strict wait 15 s, within a 25 s
  request budget, none below 1 s; the miss path's backstop deadline at most
 -25 s after the request started; reaps 25 per run;
 +25 s after the request started; reaper interval and uptime floor 1 h, the
-+marker sweep 24 h apart, reaps 25 per run, the forward-step threshold 1 h,
++marker sweep 24 h apart, the first 24 h after the reaper starts, per run
++250 reaps regardless of idleness and 25 idle ones, the forward-step
++threshold 1 h,
 +a suite's held work (a reap, `/forget`) 5 min, junk grace 24 h, metadata
 +batches 1,000 rows, sub-job C chunks 10,000 rows, gpg once-logger sets
 +10,000 keys;
  unsigned member cap 1,000; anchor-absent and unsigned confirmation gap
  `max(cooldown, 5 min)`, 1 h after a 401/403 on a signature file; check
  deadline 2 min; check workers 4; interest window 7 d; orphan-marker TTL
-@@ -1578,7 +1691,10 @@ asserts **lower bounds** (liveness: checks resume, changes adopt, touched
+@@ -1578,7 +1794,10 @@ asserts **lower bounds** (liveness: checks resume, changes adopt, touched
  suites survive, returning suites re-adopt) as well as upper bounds (attempts,
  rows, goroutines, upstream requests). Where cadence matters the simulations
  run the production scheduler, reaper and GC loops at production intervals
@@ -11078,7 +13072,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  
  **Fixtures.** A shared `clearsignedFixture()` helper replaces the
  non-clearsigned `InRelease` bodies in existing handler and cmd tests (about 18
-@@ -1670,15 +1786,28 @@ files), in phase D.
+@@ -1670,15 +1889,34 @@ files), in phase D.
    stray-blob and retired-snapshot negatives;
    `Last-Modified` across same-second flips, first adoption, a backward
    step, a pool file dated after its stamp and a recovery rewrite.
@@ -11101,12 +13095,18 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +  `unsigned_downgrade_refused` unless the `/.` twin keeps a row, a signed
 +  anchor cached under the other scheme included; a +30 d forward step's
 +  false reaps all self-heal, and a step while running defers reaping by
-+  the floor; four days at the production cadence (hourly reaper,
++  the floor and ages no orphan marker, and a clock ahead at a start has a
++  day to be corrected before the first sweep; each class's per-run budget
++  (250 reaped regardless of idleness, 25 idle); a reap or a cap eviction
++  turns an audit-deferred signed snapshot into a marker, and a suite with
++  no signed history gets none; four days at the production cadence (hourly reaper,
 +  `gc.url_path_ttl = 168h`, 12-hourly restarts, goroutines bounded);
 +  `gc.enabled = false` still re-adopts; never-downgrade after a reap; the
 +  marker sweep never rewrites a future stamp; batched metadata deletion
 +  never repeats the refcount decrement; reap-vs-adoption chaos under the
-+  suite cap; blobs reclaimed within two GC ticks; twin and nested suites
++  suite cap; blobs reclaimed within two periodic GC ticks when no pass
++  reaches its deadline, as in the test (the startup pass runs no sub-job
++  C); twin and nested suites
 +  untouched; legacy junk reaped, a transient soft-404 and a plain-text
 +  Release kept; an established unsigned suite keeps its coherent snapshot
 +  while `adopt_unsigned` is off; `/forget` rejects a cross-origin form
@@ -11114,7 +13114,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  - §6.1: a polluted v6 cache (R-1 member, alias and `package_hash` rows on
    current and displaced snapshots; a plain-text inline snapshot with
    `package_hash` rows) upgraded: the forged index is not served, its hashes
-@@ -1783,7 +1912,11 @@ item depends on a later phase.
+@@ -1783,7 +2021,11 @@ item depends on a later phase.
     `.xz/.bz2/.lzma` and Translations on every update).
  9. Downstream mirror tools requesting `Release`+`Release.gpg` from inline
     suites get 404 (pre-existing).
@@ -11131,7 +13131,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 
 - [ ] **Step 5: Overview**
 
-The spec reference becomes revision 9; phase F's row reads "in progress (plan written 2026-10-20)", as phase E's docs task set its own, and becomes "done (commit …)" after the final review; the "Later phases add" F line gains the names as built (its opening list names no `RetireSuiteSnapshots`, which its As built records as dropped) and records that phase E's PE-12 carry-forward is resolved by ruling PF-5; the "**F:**" carry-forward block is deleted, as phases C, D and E deleted theirs — every item is done (Task 15's DoD map names the tests: the `keep_displaced` ranking (Task 4), `/foo/dists/InRelease` by idleness and the parked waiter (Task 6), the purge and the one delete path (Tasks 1, 2, 3, 6, 10), `Gate.Purge` (Task 1), the docs (this task), `/forget` through `deleteSuiteTx` (Tasks 3, 10), the junk rows (Task 7), the escape hatch (Task 15), PE-12 (Task 8, ruling PF-5), `last_seen_at` (Task 9)); G and H gain phase F's items — H's include the 1.1.0 release notes' advice that an offline or archive cache, or any install that relied on `gc.enabled = false` to keep everything, sets `gc.suite_idle_ttl = "0s"` before upgrading — and the open decisions gain PF-6's Host-header validation:
+The spec reference becomes revision 9; phase F's row reads "in progress (plan written 2026-10-20)", as phase E's docs task set its own, and becomes "done (commit …)" after the final review; the "Later phases add" F line gains the names as built (its opening list names no `RetireSuiteSnapshots`, which its As built records as dropped) and records that phase E's PE-12 carry-forward is resolved by ruling PF-5; the "**F:**" carry-forward block is deleted, as phases C, D and E deleted theirs — every item is done (Task 15's DoD map names the tests: the `keep_displaced` ranking (Task 4), `/foo/dists/InRelease` by idleness and the parked waiter (Task 6), the purge and the one delete path (Tasks 1, 2, 3, 6, 10), `Gate.Purge` (Task 1), the docs (this task), `/forget` through `deleteSuiteTx` (Tasks 3, 10), the junk rows (Task 7), the escape hatch (Task 15), PE-12 (Task 8, ruling PF-5), `last_seen_at` (Task 9)); G and H gain phase F's items — H's include the 1.1.0 release notes' advice that an offline or archive cache, or any install that relied on `gc.enabled = false` to keep everything, sets `gc.suite_idle_ttl = "0s"` before upgrading — and the open decisions gain PF-6's Host-header validation; after the final review the constants line names both reap budgets (PF-14), the D line's As built notes `cache.SuiteExists`' rename to `HasSuiteRow`, and the F As built records PF-12–PF-15, the `/forget` logging and "PF-1–PF-15":
 
 ```diff
 diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md b/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md
@@ -11146,6 +13146,24 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md 
  
  ## Global Constraints
  
+@@ -20,7 +20,7 @@
+ - `internal/cache` must not import `internal/proxy`; shared path logic lives in the leaf package `internal/aptpath` (standard library only).
+ - Adoption-disabled (Phase 1) behaviour stays as today: with no adopter, nothing refreshes and the seed is today's seed.
+ - New code that can block does so on channels/timers, never a `sync.Mutex` held across a wait.
+-- Constants from spec §C11: backoff 2 m → 1 h (adoption failures and repeated *unknown* checks); hold 20 s; phase-A cap 60 s; hold-token wait 60 s; waiter caps 256 (barrier) and 64 (strict wait); strict wait 15 s; reaps 25 per run; unsigned member cap 1,000; check deadline 2 min; check workers 4; interest window 7 d; orphan-marker TTL 365 d; cap-rejection cache 10 min (1 min for a refusal while every eviction candidate is busy, phase D); legacy-audit anchor read cap 8 MiB and batch 100.
++- Constants from spec §C11: backoff 2 m → 1 h (adoption failures and repeated *unknown* checks); hold 20 s; phase-A cap 60 s; hold-token wait 60 s; waiter caps 256 (barrier) and 64 (strict wait); strict wait 15 s; reaps per run 25 idle suites and 250 reaped regardless of idleness (phase F, ruling PF-14); unsigned member cap 1,000; check deadline 2 min; check workers 4; interest window 7 d; orphan-marker TTL 365 d; cap-rejection cache 10 min (1 min for a refusal while every eviction candidate is busy, phase D); legacy-audit anchor read cap 8 MiB and batch 100.
+ - Config keys and defaults: `adoption.adopt_unsigned = true`; `adoption.flip_quiet_period = "10s"` (0s disables; otherwise 1s–15s); `adoption.max_duration = "30m"` (≥ 1m); `freshness.max_suites = 5000` (≥ 10; per-host = max_suites/10); `gc.suite_idle_ttl = "720h"` (0s disables; else ≥ 24h).
+ - Every changed invariant gets an `AIDEV-NOTE`; existing `AIDEV-*` comments are kept and updated, never removed.
+ - `go test -race ./...` and `golangci-lint run ./...` are clean, and `gofmt -l .` lists no files beyond the five already listed on `main` (formatter drift we do not touch: `cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`), at the end of every task that touches Go code. Never run `gofmt -w` on those five; edit them by hand.
+@@ -28,7 +28,7 @@
+ - Trust is never inferred from "adopted": only a decodable clearsigned `InRelease` or a verified detached pair is signed. No phase may reintroduce a text fallback in `VerifyInline`, write a signed-seen marker for a plain-text or undecodable anchor, or let a retired snapshot serve, vouch or become current. (Reconcile's own plain-text fallback in `inReleasePlaintext` survives phase A only for test fixtures and is removed in D; production cannot reach it.)
+ - An I/O fault is never evidence: code that removes trust (audit, quarantine, reaping) acts on "file does not exist" or on content it read and checked, and on any other read error defers (leaves the item queued, changes nothing, logs ERROR). Refusing to start is reserved for faults that would misjudge everything (database errors, a missing or empty pool).
+ - **Release boundary (maintainer decision, 2026-10-17):** phases A–H ship together, with other changes, in the 1.1.0 release candidate. Nothing from this branch is released earlier, so no phase needs to be independently releasable; each phase still ends green (tests, lint, gofmt) so the branch stays bisectable. The phase order is unchanged.
+-- Deferred review minors are listed per phase: `2026-09-28-flat-repositories-A-deferred.md` (IDs A-1…A-57), `2026-09-28-flat-repositories-B-deferred.md` (IDs B-1…B-68), `2026-09-28-flat-repositories-C-deferred.md` (IDs C-1…C-40), `2026-09-28-flat-repositories-D-deferred.md` (IDs D-1…D-60) and `2026-09-28-flat-repositories-E-deferred.md` (IDs E-1…E-77). Each later phase plan includes the items, from all five files, in files it touches (an item tagged with a phase letter is owned by that phase); phase H sweeps the rest and deletes the five files.
++- Deferred review minors are listed per phase: `2026-09-28-flat-repositories-A-deferred.md` (IDs A-1…A-57), `2026-09-28-flat-repositories-B-deferred.md` (IDs B-1…B-68), `2026-09-28-flat-repositories-C-deferred.md` (IDs C-1…C-40), `2026-09-28-flat-repositories-D-deferred.md` (IDs D-1…D-60), `2026-09-28-flat-repositories-E-deferred.md` (IDs E-1…E-77) and `2026-09-28-flat-repositories-F-deferred.md` (IDs F-1…F-27). Each later phase plan includes the items, from all six files, in files it touches (an item tagged with a phase letter is owned by that phase); phase H sweeps the rest and deletes the six files. Phase H takes F-24 (a pre-existing never-downgrade gap with `gc.keep_displaced = 0`) early.
+ - Every phase-A task must stay justified by PR #8 (its core problem or one of its four limitations), a named maintainer decision, or a confirmed defect; the review-findings table below records the mapping for the 2026-10-05 changes.
+ - Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+ - Credit: the flat-repository problem was reported and first analysed by Venkat (@venkatamutyala) in PR #8, and this work is based on that PR. They are credited in `Contributors.md` (added 2026-10-17, after phase A); every phase keeps that credit and its PR #8 reference.
 @@ -63,7 +63,7 @@ Each phase: write its detailed plan (`2026-09-28-flat-repositories-<letter>-<nam
  | C. Flip consistency | `…-C-flip.md` | C8 incl. the hold token | B | done (commit 1f736a6) |
  | D. Creation bounds and signals | `…-D-creation.md` | C3 (rest: caps, touch, miss-path signed-seen marker, `Release`/flat sniffs) | A | done (commit 3ed0b2b) |
@@ -11155,12 +13173,15 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md 
  | G. Flat repositories | `…-G-flat.md` | C2 flat, C5 flat IndexTargets/Filenames, C6, C4 anchorless | A–F | to write after F |
  | H. End to end and docs | `…-H-e2e-docs.md` | §7 e2e, §8 | all | to write after G |
  
-@@ -93,29 +93,13 @@ Later phases add (named here so phase plans stay consistent):
+@@ -91,31 +91,15 @@ Later phases add (named here so phase plans stay consistent):
+ 
+ - B: `cache.RecordAdoptionFailure`, `cache.ClearAdoptionFailure`, `freshness.contentKey`, `freshness.backoffDelay`. `adoption_next_retry_at` is a future-event stamp: B clamps it to now + 1 h and never applies the past-event ("infinitely old") rule to it — a detection is only logged through `clockStep` (phase B plan, deviation 6); B tests that a future `next_retry_at` after a backward step yields a retry within 1 h, not immediately. B also records panicked adoptions in the admin adoption ring. **Scheduler fairness (review finding 7 and the three-lens review, spec C4):** per-host queues of due suites refreshed every tick (no duplicates, persist across ticks), 4 workers, at most one check in flight per host, hosts take turns round-robin one check per turn; within a host healthy (`check_fail_count = 0`) → never-checked → failing, first in first out by queue time inside each class; backoff 2 min → 1 h computed from the persisted `check_fail_count` and `last_check_at` (every check maintains the streak in the UPDATE that already bumps `last_check_at`); goroutines and queue memory bounded. Latency bound: one tick interval + (n + 1) × ⌈H/4⌉ × 2 min, n = suites ahead of S in its host's queue (healthy ones only when S is healthy). B's DoD includes synctest simulations with **stalling** responders (not refused connections, which the fetch client's unreachable-host cooldown already collapses): (1) H = 8 hosts, several stalling, a healthy suite with n = 3 healthy suites ahead — assert the bound; (2) 500 stalling suites and 1 healthy suite on one host — the healthy suite is checked within one tick + ⌈H/4⌉ × 2 min, and again on the first tick after a simulated restart (a mutation that orders never-checked suites first, keeps the streak in memory, or keys the order on `last_check_at` must fail it); both with persistent repair and changing-candidate contention, continuing checks and a goroutine bound; the capacity simulation exercises both check and adoption admission. (An equivalent pull model — a free worker asks the cache for the next due suite — is acceptable if B's plan finds the queue bookkeeping error-prone.) **Slot-driven admission (spec C4 rev 5, phase B Task 11b):** `(*admission).freeFor(host, signedCurrent) int` (a peek that mirrors `tryAcquire`) and its `freed` wake channel; `checkOpts{bypassCooldown}`, `checkReport{result, signedCurrent}`, `(*Checker).check(ctx, ref, opts) checkReport` behind `Check`; `isQueuedResult(result)`; scheduler `park`, `finish`, `unhold`, `pop(admit)`; gauge `acu_freshness_waiting_for_slot`. A scheduler check that ends queued leaves its suite waiting in its host's queue; every slot release re-offers the freed capacity to the oldest waiting suite it admits, cooldown bypassed; a busy offer is held until the next wake or tick.
  - C: package `flipgate` — `Gate` (`New(Config{Quiet})`, `Enabled`, `Quiet`, `Stats`, `Len`, `Purge(key)`, `Close()` (shutdown; `main` calls it at the signal), `Closed()`, `AnchorStart(ctx, key) *Token`, `Flip(ctx, key, commit) (Result, error)`), `Key(scheme, host, suitePath)` (the freshness suite key), `Token.Done`, `Token.Held`, outcomes `held`/`quiet_cut_short`/`hold_expired`/`hold_skipped`/`aborted`/`disabled`, `ErrAborted`, `ErrClosed`, the spec C11 constants (`PhaseAMax`, `TokenWaitMax`, `HoldMax`, `CommitMargin`, `AnchorTimeout`, `MaxWaiters`, `MinQuiet`, `MaxQuiet`; `MaxQuiet ≤ HoldMax − CommitMargin` is pinned), the counters `acu_flip_hold_skipped_total`, `acu_flip_quiet_cut_short_total`, `acu_flip_hold_expired_total`, `acu_flip_waiters_over_cap_total`, `acu_flip_slow_anchor_reads_total`, `acu_flip_gate_panics_total` and the gauge `acu_flip_barrier_active`. `freshness.AdoptionConfig.FlipGate` and the nil-safe `(*Adopter).FlipGate()` (the handler shares the adopter's gate: `handler.Config.FlipGate`); `(*Adopter).SetCommitDelayForTest` (test seam: a commit's latency in simulations); `handler.Config.KeepDisplaced`; `cache.DisplacedSnapshotMembers`; `config.AdoptionConfig.FlipQuietPeriod`; the events `adoption_flip_barrier` (outcome `commit_failed` when the commit fails) and `adoption_abandoned_at_shutdown` (a flip abandoned at the signal: INFO, never an adoption outcome); the request fields `snapshot_displaced` and `flip_held_ms`; `acu_serve_byhash_displaced_total{host}`. Snapshot anchors' `Last-Modified` is `adopted_at` alone (never the pool mtime). Rulings: an adoption keeps its global slot through the barrier and frees its host slot before it (R-C1); the barrier's waits ignore `adoption.max_duration` and end on shutdown, committing nothing (R-C2); the admission bound's *A* includes the barrier's ≤ 140 s (R-C3). Five busy suites flipping at once: four hold, the fifth commits unheld (phase C plan, deviation 2).
- - D: `cache.CreateSuite`, `cache.UpdateSuiteFreshness`, `cache.TouchSuite`, `cache.ErrSuiteGone` (the UPDATE-only `CommitAdoption` Step 6, spec C3), `aptpath.SniffRelease`, `aptpath.SniffFlatIndex` (the `InRelease`/`Release.gpg` sniffs and marker writes already exist from A). As built: `cache.CreateSuite(ctx, SuiteSeed, SuiteCaps, SuiteGuard) (CreateResult, error)` (`SuiteSeed.Cached` carries the suite's pre-read cached anchors, `CreateResult.Unproven` asks for the backstop mark, `CreateResult.CandidatesBusy` flags a transient all-busy refusal), `cache.StoreFetched(ctx, FetchedRow, SuiteCaps, SuiteGuard) (FetchedResult, error)` (`FetchedRow.Restamp`: the adoption-disabled refresh miss), `cache.SuiteExists`, `cache.SuiteCapUsage`, `cache.TouchSuite` / `TouchedSuites`, `cache.SuiteGuard` (implemented by `(*freshness.Checker).HoldSuite`) and the optional `cache.ClockStepReporter` (the checker reports eviction's future stamps), unexported `deleteSuiteTx(ctx, tx, key, wantCurrent *int64, cutoff, now) (deleteOutcome, error)` (F's `ReapIdleSuite` reuses it), `freshness.Config.MaxSuites`, `config.FreshnessConfig.MaxSuites`, `aptpath.ClassifySuiteFile` / `SuiteFile`, `aptpath.MaxSuitePathBytes`, `aptpath.DecodableClearsign`, `simtest.ClearsignedFixture`, `(*freshness.Checker).LockCount`. **Signed-seen marker on the miss path (review finding 5, its follow-up and the three-lens review, spec C3):** anchor rows (`InRelease`, `Release`) are created in the writer operation that stores the `url_path` row, before the body is written (sniff → `url_path` + `CreateSuite` + marker → write body → T1, today's seed-before-serve order (the T1 on a creating miss: phase D plan, design note 2; phase E plan, Task 10)); the marker for a sniff-passing `InRelease`/`Release.gpg` is written in that same operation and nowhere else in the handler — no hit-path write (except that every row creation, on a miss or on a hit, marks the suite's cached signed anchors in its own transaction: phase D plan, deviation 2, ruling PD-5), no wait, no coalescing map, no failure counter; a failed operation serves no body (502, as today). `Release.gpg` creates no row. **The backstop and its residual:** the one marker write outside a creating or storing transaction is the handler's `markCachedSignedAnchors`, which runs when a creation is unproven (`CreateResult.Unproven`: one of the suite's cached `InRelease`/`Release.gpg` rows changed, appeared or could not be read between the handler's pre-read and the creating transaction). It reads, sniffs and marks that anchor right after the commit and the late registration, before the response, bounded at 5 s. So an unproven creation's suite is tracked with that anchor unmarked from the commit until the backstop runs, and — if the backstop fails (WARN `suite signed-seen mark failed` or `suite signed-seen backstop read failed`) — until the startup marker pass at the next start (spec C3 accepts it; E carry-forward below). Tests: the marker row exists before the first body byte on first contact and on a refresh miss; a failed writer operation serves no body; the hit-path invariant (after misses, adoptions, `reconstructAnchor` and restarts, every sniff-passing anchor row of a tracked suite has a marker (deviation 1)); FIFO ordering against a later unsigned commit. D also removes reconcile's plain-text fallback in `inReleasePlaintext` once `clearsignedFixture()` replaces the plain-text test fixtures (flip `TestReparseSnapshotRelease_PlainTextInReleaseStillParses` to `_PlainTextInReleaseIsAnError`).
+-- D: `cache.CreateSuite`, `cache.UpdateSuiteFreshness`, `cache.TouchSuite`, `cache.ErrSuiteGone` (the UPDATE-only `CommitAdoption` Step 6, spec C3), `aptpath.SniffRelease`, `aptpath.SniffFlatIndex` (the `InRelease`/`Release.gpg` sniffs and marker writes already exist from A). As built: `cache.CreateSuite(ctx, SuiteSeed, SuiteCaps, SuiteGuard) (CreateResult, error)` (`SuiteSeed.Cached` carries the suite's pre-read cached anchors, `CreateResult.Unproven` asks for the backstop mark, `CreateResult.CandidatesBusy` flags a transient all-busy refusal), `cache.StoreFetched(ctx, FetchedRow, SuiteCaps, SuiteGuard) (FetchedResult, error)` (`FetchedRow.Restamp`: the adoption-disabled refresh miss), `cache.SuiteExists`, `cache.SuiteCapUsage`, `cache.TouchSuite` / `TouchedSuites`, `cache.SuiteGuard` (implemented by `(*freshness.Checker).HoldSuite`) and the optional `cache.ClockStepReporter` (the checker reports eviction's future stamps), unexported `deleteSuiteTx(ctx, tx, key, wantCurrent *int64, cutoff, now) (deleteOutcome, error)` (F's `ReapIdleSuite` reuses it), `freshness.Config.MaxSuites`, `config.FreshnessConfig.MaxSuites`, `aptpath.ClassifySuiteFile` / `SuiteFile`, `aptpath.MaxSuitePathBytes`, `aptpath.DecodableClearsign`, `simtest.ClearsignedFixture`, `(*freshness.Checker).LockCount`. **Signed-seen marker on the miss path (review finding 5, its follow-up and the three-lens review, spec C3):** anchor rows (`InRelease`, `Release`) are created in the writer operation that stores the `url_path` row, before the body is written (sniff → `url_path` + `CreateSuite` + marker → write body → T1, today's seed-before-serve order (the T1 on a creating miss: phase D plan, design note 2; phase E plan, Task 10)); the marker for a sniff-passing `InRelease`/`Release.gpg` is written in that same operation and nowhere else in the handler — no hit-path write (except that every row creation, on a miss or on a hit, marks the suite's cached signed anchors in its own transaction: phase D plan, deviation 2, ruling PD-5), no wait, no coalescing map, no failure counter; a failed operation serves no body (502, as today). `Release.gpg` creates no row. **The backstop and its residual:** the one marker write outside a creating or storing transaction is the handler's `markCachedSignedAnchors`, which runs when a creation is unproven (`CreateResult.Unproven`: one of the suite's cached `InRelease`/`Release.gpg` rows changed, appeared or could not be read between the handler's pre-read and the creating transaction). It reads, sniffs and marks that anchor right after the commit and the late registration, before the response, bounded at 5 s. So an unproven creation's suite is tracked with that anchor unmarked from the commit until the backstop runs, and — if the backstop fails (WARN `suite signed-seen mark failed` or `suite signed-seen backstop read failed`) — until the startup marker pass at the next start (spec C3 accepts it; E carry-forward below). Tests: the marker row exists before the first body byte on first contact and on a refresh miss; a failed writer operation serves no body; the hit-path invariant (after misses, adoptions, `reconstructAnchor` and restarts, every sniff-passing anchor row of a tracked suite has a marker (deviation 1)); FIFO ordering against a later unsigned commit. D also removes reconcile's plain-text fallback in `inReleasePlaintext` once `clearsignedFixture()` replaces the plain-text test fixtures (flip `TestReparseSnapshotRelease_PlainTextInReleaseStillParses` to `_PlainTextInReleaseIsAnError`).
++- D: `cache.CreateSuite`, `cache.UpdateSuiteFreshness`, `cache.TouchSuite`, `cache.ErrSuiteGone` (the UPDATE-only `CommitAdoption` Step 6, spec C3), `aptpath.SniffRelease`, `aptpath.SniffFlatIndex` (the `InRelease`/`Release.gpg` sniffs and marker writes already exist from A). As built: `cache.CreateSuite(ctx, SuiteSeed, SuiteCaps, SuiteGuard) (CreateResult, error)` (`SuiteSeed.Cached` carries the suite's pre-read cached anchors, `CreateResult.Unproven` asks for the backstop mark, `CreateResult.CandidatesBusy` flags a transient all-busy refusal), `cache.StoreFetched(ctx, FetchedRow, SuiteCaps, SuiteGuard) (FetchedResult, error)` (`FetchedRow.Restamp`: the adoption-disabled refresh miss), `cache.SuiteExists` (renamed `HasSuiteRow` in phase F), `cache.SuiteCapUsage`, `cache.TouchSuite` / `TouchedSuites`, `cache.SuiteGuard` (implemented by `(*freshness.Checker).HoldSuite`) and the optional `cache.ClockStepReporter` (the checker reports eviction's future stamps), unexported `deleteSuiteTx(ctx, tx, key, wantCurrent *int64, cutoff, now) (deleteOutcome, error)` (F's `ReapIdleSuite` reuses it), `freshness.Config.MaxSuites`, `config.FreshnessConfig.MaxSuites`, `aptpath.ClassifySuiteFile` / `SuiteFile`, `aptpath.MaxSuitePathBytes`, `aptpath.DecodableClearsign`, `simtest.ClearsignedFixture`, `(*freshness.Checker).LockCount`. **Signed-seen marker on the miss path (review finding 5, its follow-up and the three-lens review, spec C3):** anchor rows (`InRelease`, `Release`) are created in the writer operation that stores the `url_path` row, before the body is written (sniff → `url_path` + `CreateSuite` + marker → write body → T1, today's seed-before-serve order (the T1 on a creating miss: phase D plan, design note 2; phase E plan, Task 10)); the marker for a sniff-passing `InRelease`/`Release.gpg` is written in that same operation and nowhere else in the handler — no hit-path write (except that every row creation, on a miss or on a hit, marks the suite's cached signed anchors in its own transaction: phase D plan, deviation 2, ruling PD-5), no wait, no coalescing map, no failure counter; a failed operation serves no body (502, as today). `Release.gpg` creates no row. **The backstop and its residual:** the one marker write outside a creating or storing transaction is the handler's `markCachedSignedAnchors`, which runs when a creation is unproven (`CreateResult.Unproven`: one of the suite's cached `InRelease`/`Release.gpg` rows changed, appeared or could not be read between the handler's pre-read and the creating transaction). It reads, sniffs and marks that anchor right after the commit and the late registration, before the response, bounded at 5 s. So an unproven creation's suite is tracked with that anchor unmarked from the commit until the backstop runs, and — if the backstop fails (WARN `suite signed-seen mark failed` or `suite signed-seen backstop read failed`) — until the startup marker pass at the next start (spec C3 accepts it; E carry-forward below). Tests: the marker row exists before the first body byte on first contact and on a refresh miss; a failed writer operation serves no body; the hit-path invariant (after misses, adoptions, `reconstructAnchor` and restarts, every sniff-passing anchor row of a tracked suite has a marker (deviation 1)); FIFO ordering against a later unsigned commit. D also removes reconcile's plain-text fallback in `inReleasePlaintext` once `clearsignedFixture()` replaces the plain-text test fixtures (flip `TestReparseSnapshotRelease_PlainTextInReleaseStillParses` to `_PlainTextInReleaseIsAnError`).
  - E: `freshness` probe classification (`classPresent`, `classAbsent`, `classUnknown`), `Adopter.RunUnsigned`, `aptpath.AnchorPaths(form)` (spec C5). E's unsigned candidates set `Form: cache.FormUnsigned` explicitly, and its tests assert that an unsigned adoption stores `anchor_form = 'unsigned'` and vouches no `.deb`. E also resolves the two `AIDEV-TODO(phase E)` raw-SQL readers (url_path GC guard, `CommitAdoption` anchor seed: for `FormUnsigned`, Step 3c seeds `<suite>/Release`, not `/InRelease`). E's docs note the marker denial-of-service residual (spec C5 threat notes) at `adopt_unsigned`. **In-transaction never-downgrade (review finding 5, spec C5):** `CommitAdoption` re-reads the marker for `aptpath.MarkerBase(suite)` inside its writer transaction and refuses an unsigned candidate (no pointer change, no rows) when one exists or the prior current snapshot is signed; E's DoD pauses an eligible unsigned adoption before commit, serves a signed anchor and completes the marker write (also via the `/.` twin, once G exists — E adds the twin variant as a G DoD item), then resumes and asserts refusal. **Upgrade (review findings 2–3):** a phase-A-quarantined plain-text suite (fixture from A's `buildLegacyFixture` shape) adopts in the unsigned form through `Release` with no upstream change and no `unsigned_downgrade_refused`; a never-adopted suite whose signed anchor was served under a v6 binary is refused unsigned adoption on its first post-upgrade check (A's startup pass wrote its marker). As built: `freshness.classify(res, err, sniff, conditional) probeOutcome` (classes `classPresent`, `classAbsent`, `classUnknown`) and the probe tree `runProbeTree`; `(*Adopter).RunUnsigned(ctx, suite, release, etag, lastmod) error` and `(*Adopter).AdoptsUnsigned() bool`; `aptpath.AnchorPaths(form string) []string` and `(*cache.SuiteSnapshot).AnchorHash(name string) *string`; `cache.ErrUnsignedDowngradeRefused` (the refusal inside the commit) and `freshness.ErrAdoptionUnsignedDowngradeRefused`, `ErrAdoptionUnsignedTooLarge`; `(*freshness.Checker).AdoptionsInFlight(host) bool` and `WaitHostAdoptions(ctx, host, start) bool` (the `handler.AdoptionWaiter` the handler gets as `handler.Config.Adoptions`); `config.AdoptionConfig.AdoptUnsigned` and `freshness.AdoptionConfig.AdoptUnsigned`; the `freshness.Cache` method `ListSuitesWithAdoption` (in place of `ListSuites`); the flip barrier's code in `internal/freshness/flip_barrier.go`; the metrics `acu_repair_deferred_total{host}` and `acu_strict_adoption_waits_total{host}`; spec C5's `no_sha256` coverage rule (E fix round 1): the unexported `freshness.parsePackages` reports the stanzas with a `Filename` but no `SHA256` (`ParsePackages` keeps its signature), and `buildPackageHashes` makes such a snapshot's coverage incomplete (`package_coverage_incomplete`, reason `no_sha256`); the stanzas it reports count toward `MaxPackageStanzas`. G's flat parity row that cites it needs no new code for a file that mixes such stanzas with complete ones; a file in which no stanza has a SHA256 is G's open question (below). The `/.` twin variant of the in-commit race test is G's (below).
 -- F: `cache.ReapIdleSuite`, `cache.RetireSuiteSnapshots`, admin `POST /forget`. Non-canonical legacy suite rows (`!aptpath.IsCanonicalSuitePath`) are reaped regardless of idleness (spec C9); the plan review found none in production. The reaper's refcount release reuses `decrementSnapshotRefcountsTx`; snapshot GC sub-job C also deletes the snapshots phase A's audit retired, and sub-job B's `keep_displaced` ranking excludes retired rows so they never take retention slots. The reaper sweeps a signed-seen marker only when no suite row exists for its base or `/.` twin and it is older than 365 days. F's DoD includes a signed snapshot adopted under the phase-A binary, reaped by the F binary, then returning: never-downgrade still refuses unsigned adoption (markers outlive reaping).
-+- F: `cache.ReapIdleSuite`, admin `POST /forget`. Non-canonical legacy suite rows (`!aptpath.IsCanonicalSuitePath`) are reaped regardless of idleness (spec C9); the plan review found none in production. The reaper's refcount release reuses `decrementSnapshotRefcountsTx`; snapshot GC sub-job C also deletes the snapshots phase A's audit retired, and sub-job B's `keep_displaced` ranking excludes retired rows so they never take retention slots. The reaper sweeps a signed-seen marker only when no suite row exists for its base or `/.` twin and it is older than 365 days. F's DoD includes a signed snapshot adopted under the phase-A binary, reaped by the F binary, then returning: never-downgrade still refuses unsigned adoption (markers outlive reaping). As built: `cache.ReapIdleSuite(ctx, SuiteKey, wantCurrent *int64, cutoff int64) (deleted, gone bool, err error)` (a failed submit settled by a fresh read, and a settled reap logged `suite_reaped` with `settled=true` and counted; every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)`, ruling PF-10), `cache.ForgetSuite(ctx, SuiteKey, wantCurrent *int64) (ForgetResult{Deleted, Gone, MarkersDeleted, AnchorRowsDeleted, KeptBy}, error)` (with the markers it deletes the cached anchors of the base and its `/.` twin under both schemes, ruling PF-2), `cache.DeleteSuiteMetadata(ctx, SuiteKey) (int, error)` (spec C9 step 1; a key `aptpath.IsCanonicalSuitePath` refuses deletes nothing), `cache.ReapRegardless` (`deleteSuiteTx`'s cutoff for a delete regardless of idleness), `cache.ListUnadoptedSuiteAnchors` (`SuiteAnchorRow`), `cache.SweepOrphanMarkers(ctx, now, cutoff int64) (MarkerSweep{Swept, Furthest}, error)` (it never rewrites a stamp, ruling PF-1; the reaper passes a fresh `now` for `Furthest` and the run's start for the cutoff), `(*cache.Cache).RunRetiredSnapshotGCChunk(ctx, maxRows int) (reaped int, more bool, err error)` (sub-job C), `(*cache.URLPath).LastUse() int64` (the stamp's one Go definition), `(*cache.Cache).HasSuiteRow` (renamed from `SuiteExists`); cap eviction moved to `internal/cache/suite_evict.go` and `deleteSuiteTx`, the one production `DELETE FROM suite_freshness`, to `suite_reap.go` beside two of its three callers, `ReapIdleSuite` and `ForgetSuite` (cap eviction's `createSuiteTx` stays in `suite_rows.go`; ruling R-F1). `cache.RetireSuiteSnapshots` was dropped with R-F4's knob-off retirement (ruling PF-5): phase E's PE-12 carry-forward is resolved by PF-5 — with `adoption.adopt_unsigned = false` an established unsigned suite keeps its coherent snapshot, refused `unsigned_disabled`, until the knob is back on or the suite is forgotten or reaped (forgotten or reaped with the knob still off, it is then a never-adopted suite), and the docs say plainly that the cache then does not keep unsigned repositories fresh (the maintainer confirmed it, 2026-10-20). `freshness.Reaper`, `NewReaper(ReaperConfig{Cache, Checker, IdleTTL, Logger})`, `(*Reaper).Run(ctx)` (started by `main` beside `Checker.Run`; candidates reaped regardless of idleness first, the junk scan every run, the marker sweep daily, a forward step of the wall clock deferring both by the uptime floor, a suite's held work bounded at 5 minutes, a panic under a suite's hold recovered for that suite alone; started through `main`'s `runReaper` seam) and `(*Reaper).Forget(ctx, scheme, host, suitePath) (cache.ForgetResult, error)` (a panic under its hold released as the cache then answers, then re-panicked to net/http); `admin.Config.Forgetter` (`admin.Forgetter`; a forget in flight is cut short by the admin listener's `Shutdown` and answered 503, and a `host` holding `://` is refused with 400), `requireMutationGuard`, and the status JSON's additive `suites[].scheme` (the HTML Host cell shows `scheme://host`; ruling PF-7); `config.GCConfig.SuiteIdleTTL` (`gc.suite_idle_ttl`); `gc.LastRunSummary.RetiredReaped`, `acu_gc_retired_reaped_total` and `acu_suites_reaped_total{reason}`; `flipgate.(*Gate).Purge` keeps a live entry (ruling R-F2). Events `suite_reaped`, `suite_forgotten` (`anchor_rows`), `admin_forget_requested`, `signed_seen_markers_swept`; `freshness_check_panicked` gains `where=reaper` (naming the suite when it struck under a suite's hold) and `clock_step_detected` the stamps `last_seen_at` and `wall_clock`; the reaper's clock-step reports are logged outside the checker's one-line-a-minute limit; the reaper's busy line, held-step WARNs and junk-read WARN, and every `freshness_check_panicked` and `adoption_panicked` line, carry `canonical_scheme`; the startup line gains `gc_suite_idle_ttl` and `adoption_adopt_unsigned`. Rulings R-F1–R-F5 and PF-1–PF-10 and deviations 1 (withdrawn: it concerned the dropped retirement), 2 (the coarser 90-day simulation, a four-day one at the production cadence beside it) and 3 (the sweep never rewrites a future stamp) are in the phase F plan and spec revision 9.
++- F: `cache.ReapIdleSuite`, admin `POST /forget`. Non-canonical legacy suite rows (`!aptpath.IsCanonicalSuitePath`) are reaped regardless of idleness (spec C9); the plan review found none in production. The reaper's refcount release reuses `decrementSnapshotRefcountsTx`; snapshot GC sub-job C also deletes the snapshots phase A's audit retired, and sub-job B's `keep_displaced` ranking excludes retired rows so they never take retention slots. The reaper sweeps a signed-seen marker only when no suite row exists for its base or `/.` twin and it is older than 365 days. F's DoD includes a signed snapshot adopted under the phase-A binary, reaped by the F binary, then returning: never-downgrade still refuses unsigned adoption (markers outlive reaping). As built: `cache.ReapIdleSuite(ctx, SuiteKey, wantCurrent *int64, cutoff int64) (deleted, gone bool, err error)` (a failed submit settled by a fresh read, and a settled reap logged `suite_reaped` with `settled=true` and counted; every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)`, ruling PF-10, and, before it retires the suite's snapshots, upserts its base's marker under the suite's scheme when the suite has an adopted, non-retired inline or detached snapshot: unexported `markSnapshotHistoryTx`, with never-downgrade's snapshot clause shared as `signedHistorySnapshotSQL`, the one marker a delete creates, ruling PF-12), `cache.ForgetSuite(ctx, SuiteKey, wantCurrent *int64) (ForgetResult{Deleted, Gone, MarkersDeleted, AnchorRowsDeleted, KeptBy}, error)` (with the markers it deletes the cached anchors of the base and its `/.` twin under both schemes, ruling PF-2), `cache.DeleteSuiteMetadata(ctx, SuiteKey) (int, error)` (spec C9 step 1; a key `aptpath.IsCanonicalSuitePath` refuses deletes nothing), `cache.ReapRegardless` (`deleteSuiteTx`'s cutoff for a delete regardless of idleness), `cache.ListUnadoptedSuiteAnchors` (`SuiteAnchorRow`), `cache.SweepOrphanMarkers(ctx, now, cutoff int64) (MarkerSweep{Swept, Furthest}, error)` (it never rewrites a stamp, ruling PF-1; the reaper passes a fresh `now` for `Furthest` and, for the cutoff, the run's clock less the forward steps it detected and 365 days, ruling PF-13), `(*cache.Cache).RunRetiredSnapshotGCChunk(ctx, maxRows int) (reaped int, more bool, err error)` (sub-job C), `(*cache.URLPath).LastUse() int64` (the stamp's one Go definition), `(*cache.Cache).HasSuiteRow` (renamed from `SuiteExists`); cap eviction moved to `internal/cache/suite_evict.go` and `deleteSuiteTx`, the one production `DELETE FROM suite_freshness`, to `suite_reap.go` beside two of its three callers, `ReapIdleSuite` and `ForgetSuite` (cap eviction's `createSuiteTx` stays in `suite_rows.go`; ruling R-F1). `cache.RetireSuiteSnapshots` was dropped with R-F4's knob-off retirement (ruling PF-5): phase E's PE-12 carry-forward is resolved by PF-5 — with `adoption.adopt_unsigned = false` an established unsigned suite keeps its coherent snapshot, refused `unsigned_disabled`, until the knob is back on or the suite is forgotten or reaped (forgotten or reaped with the knob still off, it is then a never-adopted suite), and the docs say plainly that the cache then does not keep unsigned repositories fresh (the maintainer confirmed it, 2026-10-20). `freshness.Reaper`, `NewReaper(ReaperConfig{Cache, Checker, IdleTTL, Logger})`, `(*Reaper).Run(ctx)` (started by `main` beside `Checker.Run`; at most 250 candidates reaped regardless of idleness first, then at most 25 idle ones in the same run — `regardlessReapsPerRun`, `reapsPerRun`, `runBudgets`, ruling PF-14 —, the junk scan every run, the marker sweep daily, the first a day after `Run` starts, a forward step of the wall clock deferring reaping and the sweep by the uptime floor and taken off the sweep's cutoff for the life of the process — `stepAhead`, ruling PF-13 —, a suite's held work bounded at 5 minutes, a panic under a suite's hold recovered for that suite alone; started through `main`'s `runReaper` seam) and `(*Reaper).Forget(ctx, scheme, host, suitePath) (cache.ForgetResult, error)` (a panic under its hold logged `freshness_check_panicked` with `where=forget`, released as the cache then answers, then re-panicked to net/http, whose `http: panic serving` line the admin server's `ErrorLog` routes through slog at ERROR; a forget whose writer call failed after its commit logged `suite_forgotten` with `settled=true`); `admin.Config.Forgetter` (`admin.Forgetter`; a forget in flight is cut short by the admin listener's `Shutdown` and answered 503, and a `host` holding `://` is refused with 400), `requireMutationGuard`, and the status JSON's additive `suites[].scheme` (the HTML Host cell shows `scheme://host`; ruling PF-7); `config.GCConfig.SuiteIdleTTL` (`gc.suite_idle_ttl`); `gc.LastRunSummary.RetiredReaped`, `acu_gc_retired_reaped_total` and `acu_suites_reaped_total{reason}`; the startup GC pass runs no sub-job C, the periodic ticks do (`gc.phaseStartup`, `runSnapshotPass`; ruling PF-15); `flipgate.(*Gate).Purge` keeps a live entry (ruling R-F2). Events `suite_reaped`, `suite_forgotten` (`anchor_rows`, `settled`), `admin_forget_requested`, `signed_seen_markers_swept`; `freshness_check_panicked` gains `where=reaper` (naming the suite when it struck under a suite's hold) and `where=forget`, and `clock_step_detected` the stamps `last_seen_at` and `wall_clock`; the reaper's clock-step reports are logged outside the checker's one-line-a-minute limit; the reaper's busy line, held-step WARNs and junk-read WARN, and every `freshness_check_panicked` and `adoption_panicked` line, and the handler's `handler_goroutine_panicked` `where=touch` line, carry `canonical_scheme`; the startup line gains `gc_suite_idle_ttl` and `adoption_adopt_unsigned`. Rulings R-F1–R-F5 and PF-1–PF-15 and deviations 1 (withdrawn: it concerned the dropped retirement), 2 (the coarser 90-day simulation, a four-day one at the production cadence beside it) and 3 (the sweep never rewrites a future stamp) are in the phase F plan and spec revision 9.
  - G: `aptpath.IsFlatSuitePath`, `aptpath.FlatBase`, `aptpath.DotClean`, `freshness.validateFilename`, and the admin `suites[].flat` field (phase B plan, deviation 3). Legacy flat onboarding also writes signed-seen markers for sniff-passing cached flat anchors (the startup pass only covers suites that already have rows), and the `/.` twin variant of E's in-transaction recheck test runs here. **PR #8 evidence in G's DoD:** `TestServeHTTP_FlatRepositoryFreshness` (a miss on `/…/deb/InRelease` and on `/…/deb/./InRelease` creates one suite row each and fires T1 under it; a later hit fires T1 again; `/…/deb/Packages_1.0_all.deb`, host-root `/InRelease` and `/…/deb//InRelease` create none), the pkgs.k8s.io shape `/core:/stable:/v1.34/deb/InRelease` → `/core:/stable:/v1.34/deb`, flat `Packages` failure fatal, and the mixed-host strict matrix. G also ports the rest of PR #8's tests (see "PR #8 parity" below).
  - H: PR #8's end-to-end table in `e2e/flat`: one signed flat repository configured as `deb <uri>/ /` on one client and `deb <uri> ./` on another; both report 2.0 within one cooldown of the v2 publish, and with the upstream stopped two fresh clients install 2.0 from the snapshots. H also runs the live-upstream smoke and documents the strict-mode consequences listed under "PR #8 parity" below.
  
@@ -11215,7 +13236,7 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md 
 
 - [ ] **Step 6: Deferred files**
 
-Each file's diff below deletes the entries this plan resolved (each is one `- **ID** …` line; the section headings stay): A-3 (`…-A-deferred.md`); C-1, C-2, C-3, C-4, C-11 (`…-C-deferred.md`); D-8, D-11, D-12, D-13, D-14, D-15, D-20, D-24, D-25, D-36, D-39, D-40, D-41, D-42, D-43, D-44 (`…-D-deferred.md`); E-4, E-5, E-6, E-7, E-8, E-12, E-15, E-18, E-20, E-26, E-34, E-49, E-72 (`…-E-deferred.md`). The C diff also annotates C-6 (M-13), and the E diff narrows E-2, E-33, E-40 and E-63, corrects E-13's file name and annotates E-32 and E-44. Each file's change is one diff against the file as it was before this step, so no order matters (the draft's separate deletion step made its E narrowing diff fail to apply after the deletions: exec review D2):
+Each file's diff below deletes the entries this plan resolved (each is one `- **ID** …` line; the section headings stay): A-3 (`…-A-deferred.md`); B-61 (`…-B-deferred.md`); C-1, C-2, C-3, C-4, C-11 (`…-C-deferred.md`); D-8, D-11, D-12, D-13, D-14, D-15, D-16, D-17, D-18, D-19, D-20, D-24, D-25, D-36, D-39, D-40, D-41, D-42, D-43, D-44 (`…-D-deferred.md`); E-2, E-4, E-5, E-6, E-7, E-8, E-12, E-15, E-18, E-20, E-26, E-34, E-44, E-49, E-63, E-72 (`…-E-deferred.md`). The C diff also annotates C-6 (M-13), and the E diff narrows E-33 and E-40, corrects E-13's file name, annotates E-32, and says in its "Left out" line that phase F's final fix wave took E-44. Each file's change is one diff against the file as it was before this step, so no order matters (the draft's separate deletion step made its E narrowing diff fail to apply after the deletions: exec review D2):
 
 ```diff
 diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-A-deferred.md b/docs/superpowers/plans/2026-09-28-flat-repositories-A-deferred.md
@@ -11228,6 +13249,20 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-A-deferred.md b
 -- **A-3** GC wallclock stamps (`gc.go:276,362`) are not distinguished from `time.Now` by any test (the handler's are, since phase C: `TestHandler_StampsFollowTheWallClock`).
  
  ## internal/aptpath and internal/proxy
+ 
+```
+
+```diff
+diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-B-deferred.md b/docs/superpowers/plans/2026-09-28-flat-repositories-B-deferred.md
+--- a/docs/superpowers/plans/2026-09-28-flat-repositories-B-deferred.md
++++ b/docs/superpowers/plans/2026-09-28-flat-repositories-B-deferred.md
+@@ -35,7 +35,6 @@ Phase B's per-task reviews and its three final-review lenses (concurrency, spec
+ 
+ - **B-59** `suites_status_test.go`: no row with 0 < lag < 3600 (a `LagWarn = lag > 0` regression would pass), and the JSON golden pins only zero values (`anchor_form ""` beside `current_snapshot_id 42`).
+ - **B-60** `status_test.go:261` `suites_healthy_no_lag` fixture still sets `InReleaseChangeSeenAt`.
+-- **B-61** `status.go` `adoptionStatus` dereferences `AdoptionFailReason` without a nil check (its caller guards).
+ - **B-62** `suites_status_test.go` `htmlRowStart` slices `html[:offset]` and panics on -1 (still a test failure).
+ - **B-63** The status page cannot say why a suite with failing checks (stalling upstream, backoff up to 1 h) or one waiting for a slot is not updating: no row state, an empty Adoption cell, `check_fail_count` only in the JSON (final review T M9; kept deferred by ruling). Show "checks failing ×k · next check in …" in the Adoption cell.
  
 ```
 
@@ -11266,7 +13301,7 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-C-deferred.md b
 diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-D-deferred.md b/docs/superpowers/plans/2026-09-28-flat-repositories-D-deferred.md
 --- a/docs/superpowers/plans/2026-09-28-flat-repositories-D-deferred.md
 +++ b/docs/superpowers/plans/2026-09-28-flat-repositories-D-deferred.md
-@@ -21,24 +21,15 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
+@@ -21,24 +21,11 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
  
  ## internal/cache
  
@@ -11278,10 +13313,10 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-D-deferred.md b
 -- **D-13** `suite_rows.go`: the method `(*Cache).SuiteExists` shares its name with the `SuiteExists` CreateOutcome constant (the handler uses both); ambiguous to read and grep. A rename (e.g. `HasSuiteRow`) is free before the 1.1.0 RC; since the fix wave it is also in `freshness.Cache`. (Task 5 minor 6)
 -- **D-14** `suite_rows.go` holds creation, eviction, deletion, existence, cap usage and freshness updates (about 750 lines). The eviction block (its constants, `ClockStepReporter`, `heldSuite`, `holdEvictionCandidate`, `reportFutureInterest`, `deleteSuiteTx`) would sit naturally in a `suite_evict.go` beside `suite_evict_test.go`. (Task 5 minor 7)
 -- **D-15** Errors name the wrong operation: `holdEvictionCandidate`, `createSuiteTx` and `markCreated` errors carry "CreateSuite:" on the miss path too, so a failed miss logs "handler: put url row: CreateSuite: insert: …" (`creationAttempt` names the operation only for begin and commit). Fix: wrap with the operation's name. (Task 6 minor 1)
- - **D-16** `fetched_row.go:44-51`: "a failure stores nothing" holds per attempt only. After a retry (a vanished or, since the fix wave, a kept candidate), the first attempt has committed the url_path row with the suite untracked and no marker; if the second fails, `StoreFetched` returns an error (502) and that row stays. Safe under deviation 1 (the next hit's onboarding marks it through `Cached`); state the per-attempt guarantee in the doc and the AIDEV-NOTE. (Task 6 minor 2)
- - **D-17** `fetched_row.go:19-21`: undocumented precondition on `Create.Cached`: the url_path upsert runs first in the same transaction, so a `Cached` entry for `Row.Path` itself always reads as changed — a spurious `Unproven` and an extra backstop. The only caller excludes that path (`cachedAnchors`' `except`). Document it on `FetchedRow.Create` with an AIDEV-NOTE, or filter it in `storeFetchedTx`. (Task 6 minor 3)
- - **D-18** `fetched_row.go:17-31`: "Create.SuiteKey == Suite" (and Restamp's key) is documented, not checked; a mismatched caller would create one suite, re-stamp another and mark a third, silently. Fix: a guard in `StoreFetched` that returns an error. (Task 6 minor 4)
- - **D-19** Doc nits: `fetched_row.go:12` and `:44` say "a metadata miss", but every miss goes through `StoreFetched`, `.deb` rows included; `FetchedResult.Marked` has no production reader and does not cover `markCreated`'s marks (`fetched_row_test.go` asserts it false while a marker was written) — say "MarkSeenAt's marker was written". (Task 6 minor 8)
+-- **D-16** `fetched_row.go:44-51`: "a failure stores nothing" holds per attempt only. After a retry (a vanished or, since the fix wave, a kept candidate), the first attempt has committed the url_path row with the suite untracked and no marker; if the second fails, `StoreFetched` returns an error (502) and that row stays. Safe under deviation 1 (the next hit's onboarding marks it through `Cached`); state the per-attempt guarantee in the doc and the AIDEV-NOTE. (Task 6 minor 2)
+-- **D-17** `fetched_row.go:19-21`: undocumented precondition on `Create.Cached`: the url_path upsert runs first in the same transaction, so a `Cached` entry for `Row.Path` itself always reads as changed — a spurious `Unproven` and an extra backstop. The only caller excludes that path (`cachedAnchors`' `except`). Document it on `FetchedRow.Create` with an AIDEV-NOTE, or filter it in `storeFetchedTx`. (Task 6 minor 3)
+-- **D-18** `fetched_row.go:17-31`: "Create.SuiteKey == Suite" (and Restamp's key) is documented, not checked; a mismatched caller would create one suite, re-stamp another and mark a third, silently. Fix: a guard in `StoreFetched` that returns an error. (Task 6 minor 4)
+-- **D-19** Doc nits: `fetched_row.go:12` and `:44` say "a metadata miss", but every miss goes through `StoreFetched`, `.deb` rows included; `FetchedResult.Marked` has no production reader and does not cover `markCreated`'s marks (`fetched_row_test.go` asserts it false while a marker was written) — say "MarkSeenAt's marker was written". (Task 6 minor 8)
 -- **D-20** `suite_rows.go` (`creationAttempt`): the exact purge after a failed submit whose eviction did commit (design review M3: afterCreate's re-read) has no end-to-end test. Since the fix wave, dropping the failure-path `afterCreate` still releases the hold (the deferred settle) and survives `TestCreateSuite_AFailedSubmitReleasesItsCandidate`; what it loses is that purge — one lock-map, gate and touch entry left behind, bounded, as after afterCreate's read error. A test needs a commit that races its context's end in `submitWrite`. (Final fix wave, FW-2)
  
  ## internal/freshness
@@ -11291,7 +13326,7 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-D-deferred.md b
  - **D-26** `reconcile_r1_test.go` (`DecodesAptsMarkerLine`) never asserts that `bytes.Replace` matched: if the encoder's first line ever ended in "\r\n", the test would pass without exercising the trailing-blank path. Fix: a `bytes.Equal(blanks, signed)` guard. (Task 3 minor 5)
  - **D-27** `reconcile_test.go` (`RejectsCorruptedAnchor`) asserts only `err != nil` while its comment says only the hash check can refuse it; assert the error contains "hash mismatch". (Task 3 minor 6)
  
-@@ -49,13 +40,6 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
+@@ -49,13 +36,6 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
  - **D-30** `phase2_handler_test.go` (`TestServeHTTP_AdoptedSuiteSnapshotMemberDBError_FailsClosed`): its upstream `/InRelease` body `"attacker bytes"` stays plain text with no PD-2 comment (no effect: the test asserts zero upstream calls; its sibling was wrapped). (Task 3 minor 4)
  - **D-31** Untested: the recover inside the rejection sweep's `expire` itself (its `onPanic` wiring and `Handler.Close` stopping it are pinned since the fix wave), and `New` refusing a negative `MaxSuites`. (Task 9 minor 2, narrowed)
  - **D-32** `suite_rows.go`: `cachedAnchors` and `markCachedSignedAnchors` repeat one loop (iterate, skip `except`, `LookupURL`, classify, `readHead`, sniff); the in-transaction mark and the backstop must agree on what counts as signed. One helper returning `(row, signed, err)` would keep them together. `runFetch` also builds `suiteSeed` twice with identical arguments. Can wait: the copies agree today. (G: if the sniff rules change) (Task 9 minor 3)
@@ -11311,12 +13346,17 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-D-deferred.md b
 diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-E-deferred.md b/docs/superpowers/plans/2026-09-28-flat-repositories-E-deferred.md
 --- a/docs/superpowers/plans/2026-09-28-flat-repositories-E-deferred.md
 +++ b/docs/superpowers/plans/2026-09-28-flat-repositories-E-deferred.md
-@@ -9,31 +9,22 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
+@@ -4,36 +4,26 @@ Phase E's fifteen task reviews, their re-reviews (rounds 1 and 2) and its three
+ 
+ **How they get done:** every later phase plan includes the items below that sit in files it already touches (cite the item ID in the task); an owning phase in parentheses marks where an item most naturally lands. Phase H ends with a sweep task that verifies each remaining item against the code, fixes it or records why not, and deletes this file.
+ 
+-Left out: everything the phase E final fix wave resolved — the two never-downgrade holes (Task 7 minor 4: the upgrade probe marks before probing `Release`; Task 3 minor 1: the re-mark reads both schemes), `adopt_unsigned = false` as a paced refusal (Task 6 minor 1's knob-off case, Task 15 minor 3; ruling PE-12), the confirmation stamp that restarts without the retry count (Task 6 minor 2), the stale WARN keyed on `anchor_absent` only (Task 7 minor 2), the 304 to a GET without validators (Task 15 minor 1, spec M5 (c)), quiet shutdowns in the check's local steps (concurrency M-1), the flaky gate (the burst's lost offers, the goroutine samplers, the late flip registration's `Held()` inference, the strict-wait coalescing window — Task 9 minor 5 —, the contention simulation's unbounded loop — Task 14 minor 1), strict mode's dead-context lookups (the Task 9 re-review's out-of-scope fail-open window) and the T1-on-seed end-to-end test, the confirmed-once pin (Task 6 minor 3), Phase 1's fallback test (Task 6 minor 5), the unsigned cap boundary (Task 3 minor 5), the C5 and W3b pins, the silent adoption test env, the Task 7 round-2 bounds (restated exactly, jitter-tested, with nits 3 and 4), the Task 14 round-2 offer counter, the stale burst message (Task 8 minor 5), reconcile's "GPG-verified" notes (Task 3 minor 8), the `spawnAdoption` defer order (Task 9 minor 2), the dispatch doc and the two fallback tests' docs (Task 6 minor 6, except E-35), the checkLocked header and `anchorAbsent` doc (Task 7 minor 5), the unlogged-panics HELP text (Task 13 minor 4, except E-44), and the docs items of spec M4, M5 and concurrency M-2 (Task 15 minor 2). Items the reviews closed without action: Task 1's "checks run" (named risks checked, no defect); Task 2 minor 6's third point (the corrupt pooled SHA512-only blob is pinned since fix round 1); Task 5's fixture-table gap (plan documentation of an executed task); Task 6 minor 9 (the 5xx test shape: `classify` maps both shapes, the tests lens closed it); Task 7 minor 1's survivors other than X2/X3 (closed by the round-1 and round-2 tests, tests lens); the round-1 re-review minors of Tasks 2, 7 and 14 (fixed in round 2); the tests lens's H2 (T1 before the response: equivalent, T1 is asynchronous), N1b and N6 (killed in `internal/cache`). Line numbers are as of the fix wave and will drift.
++Left out: everything the phase E final fix wave resolved — the two never-downgrade holes (Task 7 minor 4: the upgrade probe marks before probing `Release`; Task 3 minor 1: the re-mark reads both schemes), `adopt_unsigned = false` as a paced refusal (Task 6 minor 1's knob-off case, Task 15 minor 3; ruling PE-12), the confirmation stamp that restarts without the retry count (Task 6 minor 2), the stale WARN keyed on `anchor_absent` only (Task 7 minor 2), the 304 to a GET without validators (Task 15 minor 1, spec M5 (c)), quiet shutdowns in the check's local steps (concurrency M-1), the flaky gate (the burst's lost offers, the goroutine samplers, the late flip registration's `Held()` inference, the strict-wait coalescing window — Task 9 minor 5 —, the contention simulation's unbounded loop — Task 14 minor 1), strict mode's dead-context lookups (the Task 9 re-review's out-of-scope fail-open window) and the T1-on-seed end-to-end test, the confirmed-once pin (Task 6 minor 3), Phase 1's fallback test (Task 6 minor 5), the unsigned cap boundary (Task 3 minor 5), the C5 and W3b pins, the silent adoption test env, the Task 7 round-2 bounds (restated exactly, jitter-tested, with nits 3 and 4), the Task 14 round-2 offer counter, the stale burst message (Task 8 minor 5), reconcile's "GPG-verified" notes (Task 3 minor 8), the `spawnAdoption` defer order (Task 9 minor 2), the dispatch doc and the two fallback tests' docs (Task 6 minor 6, except E-35), the checkLocked header and `anchorAbsent` doc (Task 7 minor 5), the unlogged-panics HELP text (Task 13 minor 4, except E-44, which phase F's final fix wave took), and the docs items of spec M4, M5 and concurrency M-2 (Task 15 minor 2). Items the reviews closed without action: Task 1's "checks run" (named risks checked, no defect); Task 2 minor 6's third point (the corrupt pooled SHA512-only blob is pinned since fix round 1); Task 5's fixture-table gap (plan documentation of an executed task); Task 6 minor 9 (the 5xx test shape: `classify` maps both shapes, the tests lens closed it); Task 7 minor 1's survivors other than X2/X3 (closed by the round-1 and round-2 tests, tests lens); the round-1 re-review minors of Tasks 2, 7 and 14 (fixed in round 2); the tests lens's H2 (T1 before the response: equivalent, T1 is asynchronous), N1b and N6 (killed in `internal/cache`). Line numbers are as of the fix wave and will drift.
+ 
  ## internal/cache
  
  - **E-1** `gc_urlpath.go` (url_path GC guard (d)): the rewritten detached arm (`ss.anchor_form = 'detached'`) is not pinned — a typo mutant passes every GC test, because `TestRunURLPathGCBatch_DetachedReleaseAndGPGProtected` stores the snapshot's own blobs and guard (c) keeps them. Fix: a `FormDetached` row in the table test (Release and Release.gpg kept, InRelease reaped), ideally deriving the kept set from `aptpath.AnchorPaths(form)`. Can wait: guards (b) and (c) and anchor reconstruction backstop it. (Task 1 minor 1)
 -- **E-2** Stale doc comments after the unsigned form: `adoption.go` (`DeclaredHashesForPath`'s doc says "under any current snapshot"; only signed ones count) and `internal/handler/handler.go` (`classifyStrictMode`: "Host has no adopted suites", which now includes a host whose current snapshots are all unsigned). Say "signed (inline or detached) current snapshot". Comment only. (Task 1 minor 2)
-+- **E-2** (narrowed by phase F: `internal/cache/adoption.go`'s `DeclaredHashesForPath` doc was fixed in its Task 5) Stale doc comment after the unsigned form: `internal/handler/handler.go` (`classifyStrictMode`: "Host has no adopted suites", which now includes a host whose current snapshots are all unsigned). Say "signed (inline or detached) current snapshot". Comment only. (Task 1 minor 2)
  - **E-3** `unsigned_form_test.go`: `derefS` is a word-for-word copy of `derefStr` (`suite_rows_test.go`) in the same package. Test-only. (Task 1 minor 3)
 -- **E-4** `adoption.go` `CommitAdoption` Step 1a returns `refuseUnsignedDowngrade`'s read errors without the `CommitAdoption:` prefix, so a log line cannot tell the authoritative read from the early exit's. Wrap with `fmt.Errorf("CommitAdoption: %w", err)`. Cosmetic. (Task 1 minor 4)
 -- **E-5** `adoption.go` (about 1,100 lines): `rowQuerier`, `CheckUnsignedDowngrade` and `refuseUnsignedDowngrade` are a self-contained unit that fits `signed_seen.go`. Maintenance only. (Task 1 minor 5)
@@ -11345,7 +13385,7 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-E-deferred.md b
  
  ## internal/freshness — the check
  
-@@ -42,15 +33,13 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
+@@ -42,15 +32,13 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
  - **E-23** `check.go` nits: `result, clear, ok := steadyResult(…)` shadows the builtin `clear`; `checkInline`'s "deferred exactly like the 304 above" (the 304 now lives in `steadyResult`) and the detached steady-result comment are stale; `checkInline`'s doc lists 2-tuples for a 3-value return. (Task 4 minor 3)
  - **E-24** A never-adopted check that ends unknown (for example `Release.gpg` answering 5xx after a 200 `Release`) leaves no record, so it is not paced: every client check past the cooldown re-runs the probe tree, a full `Release` download included. Bounded by the cooldown, and spec C4 keeps T1 on the cooldown only; the permanent case (the knob off) is a paced refusal since ruling PE-12. Document the cost, or gate never-adopted client checks on the failure backoff. (H) (Task 6 minor 1, remainder; spec lens can-wait)
  - **E-25** `scheduler.go` `suiteDue` queues an interested never-adopted suite that has no client-created anchor row every tick; its check reads the row and three url_path rows and ends `skipped`. The Task 6 brief's prose says such a suite is not queued. Cheap; correct the prose or accept it in a design note. (Task 6 minor 7)
@@ -11363,7 +13403,7 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-E-deferred.md b
  - **E-35** `internal/handler/phase2_migration_test.go` (`waitForMigrationFlip`): "any non-NULL value indicates the first adoption has flipped" sits directly above the newer wait-for-the-snapshot text it contradicts. (Task 6 minor 6, remainder)
  
  ## internal/freshness — retry records, scheduler and panics
-@@ -59,11 +48,11 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
+@@ -59,11 +47,10 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
  - **E-37** B-38 remainder (spec M3): the future `last_success_at` is reported (`clockStep`) before the cooldown gate in `checkLocked`, and several answers put the future stamp back (a queued result, `anchor_absent`, a failed check), so every non-busy T1 increments `acu_clock_steps_detected_total` until an answer heals it — on a busy suite more often than the per-tick count B-38 removed. Move the block below the cooldown gate and reword the comments ("each check that runs reports it until a successful answer rewrites the stamp"). Metric noise only. Re-filed. (Task 8 minor 3; spec M3)
  - **E-38** `scheduler.go` `Run`: B-45's wiring is untested — dropping the generation stamp at dispatch, or passing `d.item.gen` to `finish`, passes every scheduler test; only `finish` is tested with a generation passed by hand. A Run-level test whose lost offer's done arrives after the release's wake was consumed. (Task 8 minor 1)
  - **E-39** `scheduler.go` `refreshSigned` demotion is untested (a never-demote mutant survives; design note 25 claims both directions). (Task 8 minor 2)
@@ -11373,11 +13413,10 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-E-deferred.md b
  - **E-42** `adoption_failure.go` `recoverAdoption`: `reportPanic` runs first inside the single `unloggedPanic` closure, so a panicking log handler also skips `acu_adoption_total{panicked}`, the duration histogram and the ring event. Put only `reportPanic` under the boundary. (Task 13 minor 2; concurrency can-wait)
  - **E-43** Tests: B-18's second site (the record's recover) is untested (a bare `reportPanic` survives); the B-20 test asserts only the absence of a WARN, so it passes if the line disappears or the demotion keys on the write's context. Assert exactly one DEBUG line. (Task 13 minor 3)
 -- **E-44** `freshness.go`: `panicStackLogged`'s kinds omit heartbeat, record and reschedule; "One helper for every recover in the package" overclaims (`legacy_audit.go` and `reconcile.go` turn panics into errors). (Task 13 minor 4, remainder)
-+- **E-44** `freshness.go`: `panicStackLogged`'s kinds omit heartbeat, record and reschedule; "One helper for every recover in the package" overclaims (`legacy_audit.go` and `reconcile.go` turn panics into errors). Phase F adds the kind `reaper` (`Reaper.safeRun`, `reaper.go`); `freshness.go` changed there by a rename (ruling PD-1) and, in its review fix round 2, by one field added to `logPanic`'s line (`canonical_scheme`). (Task 13 minor 4, remainder)
  - **E-45** A sibling of B-18: `recoverGoroutine` (repair and reconcile goroutines), `safeReschedule` and `safeTick` have no second recover boundary, so a panicking log handler escapes them (into `Run`, which has none); `checkWorker` open-codes `unloggedPanic`. Wrap them uniformly. Needs a panicking log handler. (Task 13 minor 5; concurrency can-wait)
  - **E-46** `deferred_e_test.go` groups tests by provenance, not subject (jitter, legacy audit, reconcile, heartbeat, `runRequest`); move them beside their subjects when phase H deletes the deferred files. (H) (Task 13 minor 6)
  
-@@ -71,7 +60,6 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
+@@ -71,7 +58,6 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
  
  - **E-47** `retry_rig_test.go`: the rig start `1_800_000_000` is a literal in two places (hoist a `rigStart` const); `rigVerifier.n` is reset by the same three lines in two helpers (a `resetCalls()`). (Task 5)
  - **E-48** `internal/handler/phase2_detached_chaos_test.go` hand-builds the armored-signature shape `armoredSig` builds in freshness; a `simtest.ArmoredSignatureFixture(label)` beside `ClearsignedFixture` would give one definition of a sniff-passing `Release.gpg`. (Task 5)
@@ -11385,16 +13424,15 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-E-deferred.md b
  - **E-50** `sim_retry_test.go` (`TestSimRetry_LongRunDateRulesAndClockSteps`): the liveness floor is carried by the failing phases (276 of 317 checks); each 2-day clock-step stretch gives 18, below the 10-a-day floor. Give each stretch its own floor (≥ 16). (Task 14 minor 2)
  - **E-51** `sim_sched_test.go` `renderedMetricLabels` is a fifth render-and-scan metrics helper (`renderedMetric`, `checkTotal`, `hostCounter`, `adoptionTotalFor`); its call site drops the `ParseFloat` error, so a missing series reads 0 with a misleading message. (Task 14 minor 3)
  - **E-52** `sim_retry_test.go` (B-56): the doc says both legs check that content dated more than 10 s ahead is `release_date_in_future`; only the backward leg does. Add the `ahead` case to the forward leg or reword. (Task 14 minor 4)
-@@ -88,7 +76,7 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
+@@ -88,7 +74,6 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
  - **E-60** `serveCacheMiss` overwrites `shared` and `waiters` with the retry's call: the first call's `singleflight coalesced` line is dropped, and a joiner refused off the first call gets no `unvouched_deb_refused` event. Log attribution only; add the AIDEV-NOTE sentence. (Task 9 minor 6)
  - **E-61** `internal/freshness/inflight.go` `wait` wakes only when a host's count reaches 0, so with overlapping signed adoptions a request whose snapshot committed early sleeps the full bound (documented in configuration.md). Waking on every `end` would respond sooner. (Task 9 minor 7)
  - **E-62** `internal/freshness/inflight.go`: a parameter named `max` shadows the builtin in a file that uses `min`; `maxWait`. (Task 9 minor 8)
 -- **E-63** `handler.go` `AdoptionWaiter.WaitHostAdoptions`'s doc lists two false cases (the cap, under 1 s left) but not the third (the context ended during the wait), documented on `Checker.WaitHostAdoptions`. Behaviour is unaffected (`clientLeft` runs whatever the wait reports). Also one 91-column line in spec C10. (Task 9 round-1 re-review)
-+- **E-63** `handler.go` `AdoptionWaiter.WaitHostAdoptions`'s doc lists two false cases (the cap, under 1 s left) but not the third (the context ended during the wait), documented on `Checker.WaitHostAdoptions`. Behaviour is unaffected (`clientLeft` runs whatever the wait reports). (Narrowed by phase F: the 91-column line in spec C10 was rewrapped in revision 9.) (Task 9 round-1 re-review)
  - **E-64** A creating miss whose late registration finds a snapshot current (it waited in a hold, or a flip committed just before it — re-dispatched since the final fix wave, FW-4 (c)) fires T1 twice: `trySnapshotHit`'s and the deferred seed T1. The second is a cooldown skip. Say so in the T1-on-seed comment, or skip the seed T1 when the re-dispatch served. (Task 10 minor 1; concurrency can-wait)
  - **E-65** Unpinned: widening `created` to `|| stored.Create.Outcome == cache.SuiteExists` survives every T1/seed/onboarding test (no test runs two concurrent first-contact misses on different files of one suite); design note 32's "a deadline already past fails the backstop at once" (a floor in `missBackstopDeadline` survives); D-34's "the shutdown cuts both short" for onboarding's backstop. (Task 10 minor 2)
  - **E-66** `seed_t1_test.go` X27 (coalesced creating miss) depends on two misses coalescing within a real 300 ms upstream delay; a flipStack in a bubble with a recording freshness double is deterministic. Passed 20 of 20 under load; same class as the strict-wait window FW-4 (d) closed. (Task 10 minor 3)
-@@ -100,7 +88,6 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
+@@ -100,7 +85,6 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
  
  ## internal/config and cmd
  
@@ -11404,7 +13442,7 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-E-deferred.md b
  
 ```
 
-Check: `grep -c -E '^- \*\*[A-E]-[0-9]+\*\*' docs/superpowers/plans/2026-09-28-flat-repositories-[ABCDE]-deferred.md` printed 21, 14, 17, 43 and 77 at `07cf306`, and prints 20, 14, 12, 27 and 64 after this step.
+Check: `grep -c -E '^- \*\*[A-E]-[0-9]+\*\*' docs/superpowers/plans/2026-09-28-flat-repositories-[ABCDE]-deferred.md` printed 21, 14, 17, 43 and 77 at `07cf306`, and prints 20, 13, 12, 23 and 61 after this step.
 
 - [ ] **Step 7: Final verification**
 
