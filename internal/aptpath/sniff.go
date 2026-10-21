@@ -173,9 +173,8 @@ const (
 	FileRelease
 	// FileReleaseGPG is <suite>/Release.gpg.
 	FileReleaseGPG
-	// FileFlatIndex is a flat suite's root Packages*/Sources* file. SuitePath
-	// gives no flat suite before phase G, so the handler meets it only once
-	// G adds the flat grammar there.
+	// FileFlatIndex is a flat suite's root Packages*/Sources* file (spec
+	// C2's flat grammar gives it its directory's suite).
 	FileFlatIndex
 )
 
@@ -189,6 +188,18 @@ const MaxSuitePathBytes = 1024
 // SuitePath(path) ("" gives NotSuiteFile). A dists suite's root
 // Packages*/Sources* is not a flat index, and a suite path longer than
 // MaxSuitePathBytes gives NotSuiteFile: its files are served untracked.
+//
+// AIDEV-NOTE: deferred minor D-4. The precondition is suite ==
+// SuitePath(path): the classifier trusts the grammar (suite.go) for
+// canonicality and only names the file under it, so a caller passing any
+// other suite gets a meaningless answer. Its callers rely on the "" guard:
+// a path without a suite is never a suite file (no row, marker or touch).
+// The MaxSuitePathBytes guard is ruling PD-9's one gate for every
+// per-suite key. The flat branch (FileFlatIndex) is spec C3's routing
+// point for flat indexes (ruling R-D3), reachable from requests since
+// phase G's flat grammar; hasDistsSegment keeps a dists suite's root
+// Packages*/Sources* out of it, as the grammar keeps such a path from
+// ever being flat.
 func ClassifySuiteFile(suite, path string) SuiteFile {
 	if suite == "" || len(suite) > MaxSuitePathBytes {
 		return NotSuiteFile

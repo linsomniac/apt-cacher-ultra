@@ -160,6 +160,14 @@ func TestSniffFlatIndex(t *testing.T) {
 		{"Packages.lz4", "\x04\x22\x4d\x18\x64", true},
 		{"Sources.zst", "\x28\xb5\x2f\xfd\x04", true},
 		{"Sources.gz", "\x1f\x8b\x08\x00", true},
+		// Deferred minor D-3: a near miss per extension (the magic with its
+		// last byte wrong), so a shortened magic fails here.
+		{"Packages.gz", "\x1f\x8c\x08\x00", false},
+		{"Packages.xz", "\xfd7zXZ\x01", false},
+		{"Packages.bz2", "BZi91AY&SY", false},
+		{"Packages.lzma", "\x5d\x00\x01\x80\x00", false},
+		{"Packages.lz4", "\x04\x22\x4d\x19\x64", false},
+		{"Sources.zst", "\x28\xb5\x2f\xfe\x04", false},
 		{"Packages.Z", "\x1f\x9d", false},
 		{"Packages.diff/Index", "SHA1-Current: x\n", false},
 		{"InRelease", "-----BEGIN PGP SIGNED MESSAGE-----\n", false},

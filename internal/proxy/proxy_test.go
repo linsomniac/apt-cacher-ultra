@@ -472,11 +472,44 @@ func TestSuitePath(t *testing.T) {
 		{"/debian/dists/bookworm-updates/InRelease", "/debian/dists/bookworm-updates"},
 		// nested repo paths
 		{"/some/deep/repo/dists/sid/InRelease", "/some/deep/repo/dists/sid"},
+		// flat repositories (spec C2; aptpath.TestSuitePath_Flat owns the table)
+		{"/core:/stable:/v1.34/deb/InRelease", "/core:/stable:/v1.34/deb"},
+		{"/core:/stable:/v1.34/deb/./Packages.gz", "/core:/stable:/v1.34/deb/."},
+		{"/core:/stable:/v1.34/deb/amd64/kubelet_1.34.1-1.1_amd64.deb", ""},
+		{"/InRelease", ""},
 	}
 	for _, c := range cases {
 		got := SuitePath(c.path)
 		if got != c.want {
 			t.Errorf("SuitePath(%q) = %q, want %q", c.path, got, c.want)
+		}
+	}
+}
+
+// Spec C2 and §7: Parse decodes the request URI before the grammar runs,
+// so "%2E" and "." land on the same suite (the `deb <uri> ./` twin), and
+// the pkgs.k8s.io shape maps to its literal directory (PR #8's evidence).
+// A flat .deb and a host-root anchor get no suite.
+func TestParse_FlatSuites(t *testing.T) {
+	p := newTestParser(t)
+	for _, c := range []struct {
+		uri, path, suite string
+	}{
+		{"https://pkgs.k8s.io/core:/stable:/v1.34/deb/InRelease", "/core:/stable:/v1.34/deb/InRelease", "/core:/stable:/v1.34/deb"},
+		{"http://h.example/repo/InRelease", "/repo/InRelease", "/repo"},
+		{"http://h.example/repo/./InRelease", "/repo/./InRelease", "/repo/."},
+		{"http://h.example/repo/%2E/InRelease", "/repo/./InRelease", "/repo/."},
+		{"http://h.example/repo/%2e/Packages.gz", "/repo/./Packages.gz", "/repo/."},
+		{"http://h.example/repo/amd64/x_1_amd64.deb", "/repo/amd64/x_1_amd64.deb", ""},
+		{"http://h.example/InRelease", "/InRelease", ""},
+		{"http://h.example/repo/%252E/InRelease", "/repo/%2E/InRelease", ""}, // a decoded '%': no suite
+	} {
+		r, err := p.Parse(c.uri, "")
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.uri, err)
+		}
+		if r.Path != c.path || r.SuitePath != c.suite {
+			t.Errorf("Parse(%q) = path %q, suite %q; want %q, %q", c.uri, r.Path, r.SuitePath, c.path, c.suite)
 		}
 	}
 }

@@ -164,23 +164,27 @@ func TestDeleteSuiteMetadata_DeletesOnlyTheSuitesRows(t *testing.T) {
 }
 
 // Design note 7 (the Task 3 review's Important 1): a key no suite path
-// matches — the empty path, a non-canonical one, a /. twin before phase G
-// — has no metadata rows. DeleteSuiteMetadata deletes nothing for it and
-// leaves the host's pool .deb, its flat-repo file, a canonical suite's
-// anchor and a row under the key's own prefix in place (a non-canonical
-// row's cached files are url_path GC's: metadata_rows 0). Before the fix
-// the empty path's range spanned the host and deleted the .deb and the
-// flat-repo file, whose suite path is "" too.
+// matches — the empty path, a non-canonical one (a dists suite with a
+// member segment, a flat directory with two trailing "/.", which phase
+// G's grammar never produces) — has no metadata rows. DeleteSuiteMetadata
+// deletes nothing for it and leaves the host's pool .deb, its flat-repo
+// files, a canonical suite's anchor and a row under the key's own prefix
+// in place (a non-canonical row's cached files are url_path GC's:
+// metadata_rows 0). Before the fix the empty path's range spanned the
+// host and deleted the .deb and the flat-repo files, whose suite path was
+// "" too before phase G. The key "/flat/." is canonical since phase G (a
+// `deb <uri> ./` twin): TestDeleteSuiteMetadata_AFlatSuiteLeavesItsTwin
+// deletes through it.
 func TestDeleteSuiteMetadata_ANonCanonicalKeyDeletesNothing(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	blob := seedBlob(t, c, "cached bytes")
 	paths := []string{"/debian/pool/main/f/foo/foo_1_amd64.deb", "/flat/Packages", "/debian/dists/x/InRelease",
-		"/a/dists/b/c/InRelease", "/flat/./Packages"}
+		"/a/dists/b/c/InRelease", "/flat/./Packages", "/flat/././Packages"}
 	for _, p := range paths {
 		putURLPathRow(t, c, "http", "h", p, blob, sql.NullInt64{Int64: 1, Valid: true}, false)
 	}
-	for _, suite := range []string{"", "/a/dists/b/c", "/flat/."} {
+	for _, suite := range []string{"", "/a/dists/b/c", "/flat/./."} {
 		if n, err := c.DeleteSuiteMetadata(ctx, sk("h", suite)); err != nil || n != 0 {
 			t.Errorf("DeleteSuiteMetadata(%q) = %d, %v; want nothing deleted", suite, n, err)
 		}
@@ -188,6 +192,54 @@ func TestDeleteSuiteMetadata_ANonCanonicalKeyDeletesNothing(t *testing.T) {
 	for _, p := range paths {
 		if !urlRowExists(t, c, "http", "h", p) {
 			t.Errorf("%s was deleted, want it kept", p)
+		}
+	}
+}
+
+// Spec §9's G row, "reaping /repo leaves /repo/. intact" (the F
+// carry-forward): with phase G's flat grammar the files of a real flat
+// suite map to it, so DeleteSuiteMetadata deletes them — its anchors, root
+// indexes, Contents, by-hash name and pdiff Index — and nothing of its
+// `deb <uri> ./` twin, of a nested flat suite, of a prefix sibling, or its
+// .debs (no suite's metadata). The twin's own call deletes only the twin's.
+func TestDeleteSuiteMetadata_AFlatSuiteLeavesItsTwin(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	blob := seedBlob(t, c, "flat metadata")
+	hex := strings.Repeat("ab", 32)
+	flat := []string{"/flat/InRelease", "/flat/Release", "/flat/Release.gpg", "/flat/Packages", "/flat/Packages.gz",
+		"/flat/Sources.xz", "/flat/Contents-amd64.gz", "/flat/by-hash/SHA256/" + hex, "/flat/Packages.diff/Index"}
+	twin := []string{"/flat/./InRelease", "/flat/./Packages.gz", "/flat/./by-hash/SHA256/" + hex}
+	others := []string{
+		"/flat/amd64/kubectl_1.34_amd64.deb", // a package: no suite's metadata
+		"/flat/./cuda_12_amd64.deb",
+		"/flat/sub/InRelease", // the nested flat suite /flat/sub
+		"/flat2/InRelease",    // a sibling sharing the prefix
+		// no suite (Phase 1 only)
+		"/flat/Translation-en", "/flat/en", "/flat/Packages.diff/2026-10-20-0000.00.gz",
+	}
+	for _, p := range append(append(append([]string{}, flat...), twin...), others...) {
+		putURLPathRow(t, c, "http", "h", p, blob, sql.NullInt64{Int64: 1, Valid: true}, true)
+	}
+	if n, err := c.DeleteSuiteMetadata(ctx, sk("h", "/flat")); err != nil || n != len(flat) {
+		t.Fatalf("DeleteSuiteMetadata(/flat) = %d, %v; want the suite's %d rows", n, err, len(flat))
+	}
+	for _, p := range flat {
+		if urlRowExists(t, c, "http", "h", p) {
+			t.Errorf("%s was not deleted", p)
+		}
+	}
+	for _, p := range append(append([]string{}, twin...), others...) {
+		if !urlRowExists(t, c, "http", "h", p) {
+			t.Errorf("%s was deleted by /flat's metadata deletion, want it kept", p)
+		}
+	}
+	if n, err := c.DeleteSuiteMetadata(ctx, sk("h", "/flat/.")); err != nil || n != len(twin) {
+		t.Fatalf("DeleteSuiteMetadata(/flat/.) = %d, %v; want the twin's %d rows", n, err, len(twin))
+	}
+	for _, p := range others {
+		if !urlRowExists(t, c, "http", "h", p) {
+			t.Errorf("%s was deleted by the twin's metadata deletion, want it kept", p)
 		}
 	}
 }
