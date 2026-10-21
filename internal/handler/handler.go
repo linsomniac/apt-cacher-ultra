@@ -1166,9 +1166,11 @@ func firstPackageName(rows []cache.DeclaredHash, match string) string {
 // snapshotMeta carries the metadata used by serveBlobWithHeaders to set
 // the response headers. snapshotID = 0 marks a Phase 1 / non-snapshot
 // serve (X-Cache-Snapshot suppressed); a positive value emits the
-// header. lastFetchedAt is the source for X-Cache-Age and may be nil.
-// modTime, when set, is the response's Last-Modified instead of the pool
-// file's mtime (spec C8: a snapshot anchor's adopted_at).
+// header. lastFetchedAt is the source for X-Cache-Age and may be nil; a
+// url_path serve's, it also floors a metadata file's Last-Modified
+// (urlPathModTime). modTime, when set, is the response's Last-Modified
+// instead of the pool file's mtime (spec C8: a snapshot anchor's
+// adopted_at).
 type snapshotMeta struct {
 	snapshotID    int64
 	lastFetchedAt *int64
@@ -1216,7 +1218,7 @@ func (h *Handler) serveBlobWithHeaders(w http.ResponseWriter, r *http.Request, r
 	}
 
 	cw := &countingWriter{ResponseWriter: w}
-	http.ServeContent(cw, r, req.Path, modTimeOr(meta.modTime, st.ModTime()), f)
+	http.ServeContent(cw, r, req.Path, urlPathModTime(req, modTimeOr(meta.modTime, st.ModTime()), meta.lastFetchedAt), f)
 	return true, cw.statusCode(), cw.bytes
 }
 
@@ -1273,6 +1275,30 @@ func (h *Handler) anchorModTime(ctx context.Context, snapshotID int64) time.Time
 		)
 	}
 	return time.Time{}
+}
+
+// urlPathModTime is the Last-Modified of a url_path serve of req (spec
+// C4, plan design note 14): for a metadata file, the later of mtime (its
+// pool file's) and lastFetchedAt (its row's last_fetched_at), so apt's
+// If-Modified-Since on an index sees a replacement whose bytes were
+// already in the pool (the anchorless refresh points the row at an
+// existing pool file and moves last_fetched_at past the previous stamp);
+// a .deb, and a serve with no stamp (lastFetchedAt nil: a snapshot or
+// by-hash serve), keep mtime.
+//
+// AIDEV-NOTE: ruling R-G3. adoptionStampTx's first-adoption floor is the
+// anchors' MAX(last_fetched_at) + 1, which passes this only while no pool
+// file is newer than its row's last_fetched_at: every writer of a row's
+// stamp (runFetch, cache.RefreshURLPathBlob) reads it after the pool file
+// is final. Blob mtimes are not folded into that floor.
+func urlPathModTime(req *proxy.Request, mtime time.Time, lastFetchedAt *int64) time.Time {
+	if !req.IsMetadata || lastFetchedAt == nil {
+		return mtime
+	}
+	if fetched := time.Unix(*lastFetchedAt, 0); fetched.After(mtime) {
+		return fetched
+	}
+	return mtime
 }
 
 // modTimeOr returns modTime, or the pool file's mtime when modTime is
@@ -1631,7 +1657,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	}
 
 	cw := &countingWriter{ResponseWriter: w}
-	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
+	http.ServeContent(cw, r, req.Path, urlPathModTime(req, st.ModTime(), &res.fetchedAt), f)
 	v := packageValidation{Validated: res.validatedHash, PackageName: res.packageName, Suites: res.vouchingSuites}
 	if suites := append(servedSuite(sr, cw.statusCode()), vouchedSuites(req, v, cw.statusCode())...); len(suites) > 0 {
 		go h.touchAsync(req, false, suites)
@@ -2119,6 +2145,13 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 		return sfResult{err: fmt.Errorf("handler: put blob row: %w", err), status: fres.Status}
 	}
 
+	// AIDEV-NOTE: ruling R-G3. The row's stamp is read here, after the pool
+	// file is final: a metadata serve's Last-Modified is max(pool mtime,
+	// last_fetched_at) (urlPathModTime), and adoptionStampTx's
+	// first-adoption floor (the anchors' MAX(last_fetched_at) + 1) passes it
+	// only while no pool file is newer than its row's stamp. Never read it
+	// before the body is in the pool
+	// (TestServeHTTP_AMissStampsItsRowAfterItsPoolFile).
 	now := wallclock.Unix()
 	row := cache.URLPath{
 		CanonicalScheme: req.CanonicalScheme,
@@ -2207,6 +2240,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 		suiteTracked:   stored.Tracked,
 		created:        stored.Create.Outcome == cache.SuiteCreated,
 		unproven:       stored.Create.Outcome == cache.SuiteCreated && stored.Create.Unproven,
+		fetchedAt:      now,
 	}
 }
 
@@ -2425,7 +2459,7 @@ func (h *Handler) tryServeStale(w http.ResponseWriter, r *http.Request, req *pro
 	}
 
 	cw := &countingWriter{ResponseWriter: w}
-	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
+	http.ServeContent(cw, r, req.Path, urlPathModTime(req, st.ModTime(), row.LastFetchedAt), f)
 	// Spec C3: a stale anchor serve records client interest too. Whether
 	// the suite has a row is not known here; TouchSuite is UPDATE-only, so
 	// an untracked suite costs one no-op write per stale serve.

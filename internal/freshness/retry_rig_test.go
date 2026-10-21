@@ -44,7 +44,9 @@ func rigETag(body []byte) string { return "e-" + hashOf(body)[:12] }
 // (setLastModified) answers like a CDN that sends no ETag: 200 with the
 // stamp, or 304 when If-Modified-Since is at or after it. A URL without a
 // body answers 404. While stalled, every request blocks until its context
-// ends.
+// ends. before, when set, runs at the start of every request, with its URL;
+// a request whose context has ended by then fails with its error, as a
+// real fetch does.
 type rigUpstream struct {
 	mu               sync.Mutex
 	bodies           map[string][]byte
@@ -53,6 +55,9 @@ type rigUpstream struct {
 	fail             map[string]error    // per URL: the error Conditional returns (setFail)
 	modified         map[string]string   // per URL: Last-Modified, sortable (setLastModified)
 	sent             map[string][]string // If-None-Match per URL, in order
+	before           func(url string)
+	notModified      map[string]bool  // per URL: 304 whatever the validators (a misbehaving CDN)
+	limits           map[string]int64 // per URL: the body cap of its last request
 }
 
 // setLastModified makes url answer with Last-Modified stamp and no ETag
@@ -95,18 +100,33 @@ func (u *rigUpstream) etagsSent(url string) []string {
 	return append([]string(nil), u.sent[url]...)
 }
 
-func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, etag, lastmod string, _ int64) (*fetch.ConditionalResult, error) {
+func (u *rigUpstream) Conditional(ctx context.Context, target *fetch.Target, etag, lastmod string, maxBytes int64) (*fetch.ConditionalResult, error) {
 	u.mu.Lock()
 	u.sent[target.URL] = append(u.sent[target.URL], etag)
+	if u.limits == nil {
+		u.limits = map[string]int64{}
+	}
+	u.limits[target.URL] = maxBytes
+	notModified := u.notModified[target.URL]
 	body, ok := u.bodies[target.URL]
 	stall, ignore, failErr, stamp := u.stall, u.ignoreValidators, u.fail[target.URL], u.modified[target.URL]
+	before := u.before
 	u.mu.Unlock()
+	if before != nil {
+		before(target.URL)
+	}
 	if stall {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err // a request whose context has ended fails, as fetch's does
+	}
 	if failErr != nil {
 		return nil, failErr
+	}
+	if notModified {
+		return &fetch.ConditionalResult{Status: 304}, nil
 	}
 	if !ok {
 		return nil, &fetch.StatusError{Code: 404}
@@ -143,6 +163,13 @@ func (v *rigVerifier) panicOn(key string) { v.mu.Lock(); v.panics[key] = true; v
 func (v *rigVerifier) blockNext()         { v.mu.Lock(); v.block = true; v.mu.Unlock() }
 func (v *rigVerifier) calls() int         { v.mu.Lock(); defer v.mu.Unlock(); return v.n }
 
+// resetCalls restarts the verifier's call count at 0 (deferred minor E-47).
+func (v *rigVerifier) resetCalls() {
+	v.mu.Lock()
+	v.n = 0
+	v.mu.Unlock()
+}
+
 func (v *rigVerifier) verify(ctx context.Context, key string, plain []byte) ([]byte, error) {
 	v.mu.Lock()
 	v.n++
@@ -171,11 +198,14 @@ func (v *rigVerifier) VerifyDetached(ctx context.Context, _ SuiteRef, rel, sig [
 	return v.verify(ctx, contentKey(adoptionFormDetached, nil, rel, sig), rel)
 }
 
+// rigStart is the rigs' clock start, and their suite's interest stamp
+// (deferred minor E-47).
+const rigStart = 1_800_000_000
+
 // retryRig wires a real cache, Adopter and Checker for suite /r/dists/x
 // on host h, whose cached InRelease anchor is stale (testHex64), so any
-// body the upstream serves is "changed". The clock starts at
-// 1_800_000_000 and moves only when the test advances it; jitter is off
-// (rand = 0.5).
+// body the upstream serves is "changed". The clock starts at rigStart and
+// moves only when the test advances it; jitter is off (rand = 0.5).
 type retryRig struct {
 	t              *testing.T
 	cache          *cache.Cache
@@ -201,7 +231,7 @@ func newRetryRig(t *testing.T, cooldown time.Duration) *retryRig {
 	t.Cleanup(func() { _ = c.Close() })
 	seedStaleAnchor(t, c)
 	// Client interest at the rig clock's now (spec C4 Dispatch 3).
-	interest := int64(1_800_000_000)
+	interest := int64(rigStart)
 	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite,
 		LastRequestedAt: &interest}); err != nil {
 		t.Fatal(err)
@@ -210,7 +240,7 @@ func newRetryRig(t *testing.T, cooldown time.Duration) *retryRig {
 		t: t, cache: c, members: newFakeFetcher(),
 		up:    &rigUpstream{bodies: map[string][]byte{}, sent: map[string][]string{}},
 		ver:   &rigVerifier{rejected: map[string]bool{}, panics: map[string]bool{}, entered: make(chan struct{}, 1)},
-		clock: &rigClock{t: time.Unix(1_800_000_000, 0)},
+		clock: &rigClock{t: time.Unix(rigStart, 0)},
 		ring:  observability.NewRing(50), logs: &lockedBuffer{},
 		pkgs: fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64}),
 	}
@@ -264,9 +294,7 @@ func (r *retryRig) adopt() {
 	if r.row().CurrentSnapshotID == nil {
 		r.t.Fatal("rig: base content not adopted")
 	}
-	r.ver.mu.Lock()
-	r.ver.n = 0
-	r.ver.mu.Unlock()
+	r.ver.resetCalls()
 }
 
 // adoptDetached is adopt for the detached form: the rig suite's current
@@ -280,9 +308,7 @@ func (r *retryRig) adoptDetached() {
 	if r.row().CurrentSnapshotID == nil {
 		r.t.Fatal("rig: base pair not adopted")
 	}
-	r.ver.mu.Lock()
-	r.ver.n = 0
-	r.ver.mu.Unlock()
+	r.ver.resetCalls()
 }
 
 // check runs one freshness check and waits for any adoption it started.

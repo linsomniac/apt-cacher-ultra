@@ -25,7 +25,7 @@ const flatRigHost = "fh"
 // PG-1); a test turns it off by hand. The suite has a row whose interest
 // stamp is the rig clock's now; no url_path row is seeded: each test
 // caches what its clients fetched (cacheRow). The clock starts at
-// 1_800_000_000 and moves only when the test advances it.
+// rigStart and moves only when the test advances it.
 type flatRig struct {
 	t       *testing.T
 	cache   *cache.Cache
@@ -51,11 +51,11 @@ func newFlatRig(t *testing.T, suitePath string) *flatRig {
 		t: t, cache: c, members: newFakeFetcher(),
 		up:    &rigUpstream{bodies: map[string][]byte{}, sent: map[string][]string{}},
 		ver:   &rigVerifier{rejected: map[string]bool{}, panics: map[string]bool{}, entered: make(chan struct{}, 1)},
-		clock: &rigClock{t: time.Unix(1_800_000_000, 0)},
+		clock: &rigClock{t: time.Unix(rigStart, 0)},
 		logs:  &lockedBuffer{},
 		suite: SuiteRef{CanonicalScheme: "http", CanonicalHost: flatRigHost, SuitePath: suitePath},
 	}
-	interest := int64(1_800_000_000)
+	interest := int64(rigStart)
 	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: flatRigHost,
 		SuitePath: suitePath, LastRequestedAt: &interest}); err != nil {
 		t.Fatal(err)

@@ -43,6 +43,9 @@ type sfResult struct {
 	// snapshotCount: the strict-mode current_snapshot_count of an
 	// errUnvouchedRetryable result, for the refusal's log line.
 	snapshotCount int
+	// fetchedAt: the last_fetched_at runFetch stored with the row, for the
+	// miss serve's Last-Modified (urlPathModTime).
+	fetchedAt int64
 }
 
 // sfCall is a single in-flight singleflight call. The leader populates

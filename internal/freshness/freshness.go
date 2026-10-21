@@ -206,6 +206,13 @@ type Checker struct {
 	admission           *admission
 	maxAdoptionDuration time.Duration
 
+	// anchorlessBodies holds the anchorless refresh's body slots
+	// (anchorlessBodySlots, ruling PG-8): a conditional GET takes one for
+	// as long as its body is in memory. anchorlessOverCap rate-limits the
+	// refresh's over-cap WARN (design review M-6).
+	anchorlessBodies  chan struct{}
+	anchorlessOverCap anchorlessOverCapWarn
+
 	// adoptionWg tracks in-flight adoption goroutines spawned via
 	// Check. Production graceful shutdown (SPEC2 §9.5 step 5) calls
 	// WaitForAdoptions after cancelling lifetimeCtx; tests use it to
@@ -332,6 +339,7 @@ func New(cfg Config) (*Checker, error) {
 		admission:           newAdmission(maxConc),
 		inflight:            newHostAdoptions(),
 		maxAdoptionDuration: maxDur,
+		anchorlessBodies:    make(chan struct{}, anchorlessBodySlots),
 	}, nil
 }
 

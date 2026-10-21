@@ -213,7 +213,12 @@ func (t probeTree) signatureSeen() bool {
 // suite's base first (Adopter.markSignatureSeen; a failed mark fails the
 // check). A probe that ends unknown and a tree that finds no anchor (which
 // also records anchor_absent, so the status page shows it: ruling PE-2)
-// are failed checks; an unsigned candidate while adoption.adopt_unsigned
+// are failed checks — except that a flat suite whose tree finds no anchor
+// and that has no signed evidence (Adopter.anchorlessEligible) runs the
+// anchorless refresh instead (anchorlessRefresh, spec C4 Dispatch 4), or,
+// while adoption.adopt_unsigned is off, is refused unsigned_disabled
+// (anchorlessDisabled, ruling PG-1); an unsigned candidate while
+// adoption.adopt_unsigned
 // is off is the refusal unsigned_disabled, recorded and paced (ruling
 // PE-12). A read error of the anchor rows is logged at WARN with no
 // write and no backoff: a local fault, retried at the next check (at most
@@ -280,6 +285,30 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 		c.failCheck(ctx, out, cur, suite, nowUnix, "probe", fmt.Errorf("%s: %w", t.endName, t.end.err))
 		return nil
 	case !t.found:
+		// Spec C4 Dispatch 3: a flat suite without signed evidence is a
+		// Release-less repository, refreshed anchorless (Dispatch 4). Ruling
+		// PG-1: the knob stops the anchorless refresh as it stops an
+		// unsigned adoption — refused unsigned_disabled, a successful check
+		// paced by its record (pacedFirst), no conditional GET and no
+		// delete. The gate runs first, so a suite seen signed is the
+		// anchor_absent failure below whatever the knob.
+		if aptpath.IsFlatSuitePath(suitePath) {
+			eligible, err := c.adopter.anchorlessEligible(ctx, suite)
+			if err != nil {
+				if !c.endedByShutdown(ctx, suite, "the anchorless gate", err) {
+					c.failCheck(ctx, out, cur, suite, nowUnix, "anchorless", err)
+				}
+				return nil
+			}
+			switch {
+			case eligible && !c.adopter.AdoptsUnsigned():
+				c.anchorlessDisabled(ctx, out, cur, suite, nowUnix, t)
+				return nil
+			case eligible:
+				c.anchorlessRefresh(ctx, fetchCtx, out, cur, suite, nowUnix, t)
+				return nil
+			}
+		}
 		// Ruling PE-2: still a failed check (spec C4; the streak backs
 		// off), and the refusal state anchor_absent shows it on the status
 		// page; the record also paces the suite (pacedFirst).

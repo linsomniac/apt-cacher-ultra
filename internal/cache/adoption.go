@@ -777,6 +777,16 @@ UPDATE blob
 // stamped above it. C-11's own readers do not care then (the row is
 // gone); a durable per-suite floor needs a schema change, which phase F
 // forbids.
+//
+// AIDEV-NOTE: ruling R-G3 (phase G). url_path-served metadata answers
+// Last-Modified = max(pool mtime, last_fetched_at) (the handler's
+// urlPathModTime), so the first-adoption floor below (the anchors'
+// MAX(last_fetched_at) + 1) passes every url_path anchor's Last-Modified
+// only while no pool file is newer than its row's last_fetched_at:
+// runFetch and the anchorless refresh (RefreshURLPathBlob) finalize the
+// pool file before they stamp the row. Keep that order; blob mtimes are
+// not folded into this floor
+// (TestServeHTTP_AMissStampsItsRowAfterItsPoolFile).
 func adoptionStampTx(ctx context.Context, tx *sql.Tx, scheme, host, suite string, now int64) (int64, error) {
 	var newest, current sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `

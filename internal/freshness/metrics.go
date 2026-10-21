@@ -35,7 +35,9 @@ import (
 // B-44, unlabelled counter); acu_repair_deferred_total (deferred minor
 // B-31, counter by host); acu_strict_adoption_waits_total (spec C10,
 // counter by host); acu_suites_reaped_total (spec C9, design review M-16,
-// counter by reason: idle, non_canonical, junk). The flip barrier's
+// counter by reason: idle, non_canonical, junk);
+// acu_anchorless_sniff_rejected_total (spec C4 Dispatch 4, counter by
+// host). The flip barrier's
 // acu_flip_hold_skipped_total, acu_flip_hold_expired_total,
 // acu_flip_quiet_cut_short_total, acu_flip_waiters_over_cap_total,
 // acu_flip_slow_anchor_reads_total and
@@ -93,6 +95,17 @@ var (
 		"Suites the suite reaper deleted, by reason: idle, non_canonical or junk (spec C9).",
 		metrics.DefaultMaxSeries,
 		"reason",
+	)
+
+	// anchorlessSniffRejectedTotal counts the anchorless refresh's 200
+	// answers whose body failed the flat index sniff (spec C4 Dispatch 4,
+	// "counter anchorless_sniff_rejected"): the cached row stays. By host,
+	// so an upstream that answers HTML shows where it is.
+	anchorlessSniffRejectedTotal = metrics.NewCounterWithCap(
+		"acu_anchorless_sniff_rejected_total",
+		"Anchorless refresh 200 answers whose body failed the flat index sniff; the cached row stays (spec C4).",
+		metrics.DefaultMaxSeries,
+		"host",
 	)
 
 	// freshnessStaleSuites is the per-tick gauge of suites whose

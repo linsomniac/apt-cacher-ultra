@@ -140,6 +140,49 @@ func SniffFlatIndex(name string, head []byte) bool {
 	return bytes.HasPrefix(head, flatIndexMagic[ext])
 }
 
+// IsAnchorlessIndex reports whether name, a flat suite's root member name,
+// is a file the anchorless refresh revalidates (spec C4 Dispatch 4): a
+// Packages*, Sources* or Contents-* name of spec C2's flat member grammar.
+func IsAnchorlessIndex(name string) bool {
+	_, ok := anchorlessIndexExt(name)
+	return ok
+}
+
+// SniffAnchorlessIndex reports whether head, the start of a 200 body for
+// the anchorless index name, may replace its cached copy (spec C4
+// Dispatch 4: "the flat index sniff for its extension"): a Packages* or
+// Sources* name takes SniffFlatIndex, a compressed Contents-* its
+// extension's magic. sniffable is false for a plain Contents-* — no sniff
+// tells it from a soft-404, so its body is never stored (plan deviation
+// 2) — and for a name that is no anchorless index.
+func SniffAnchorlessIndex(name string, head []byte) (pass, sniffable bool) {
+	ext, ok := anchorlessIndexExt(name)
+	switch {
+	case !ok:
+		return false, false
+	case !strings.HasPrefix(name, "Contents-"):
+		return SniffFlatIndex(name, head), true
+	case ext == "":
+		return false, false
+	}
+	return bytes.HasPrefix(head, flatIndexMagic[ext]), true
+}
+
+// anchorlessIndexExt returns the compression extension of an anchorless
+// index name ("" for none), and whether name is one.
+func anchorlessIndexExt(name string) (string, bool) {
+	if ext, ok := flatIndexExt(name); ok {
+		return ext, true
+	}
+	if !strings.HasPrefix(name, "Contents-") || !flatMemberRE.MatchString(name) {
+		return "", false
+	}
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		return name[i:], true
+	}
+	return "", true
+}
+
 // flatIndexExt returns the compression extension of a flat index file name
 // (Packages or Sources, optionally with one of the flat grammar's
 // extensions; "" for none).

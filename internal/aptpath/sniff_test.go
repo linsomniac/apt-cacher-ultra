@@ -304,3 +304,44 @@ func TestDecodableClearsign(t *testing.T) {
 		}
 	}
 }
+
+// Spec C4 Dispatch 4 (plan design note 11, deviation 2): the anchorless
+// refresh revalidates a flat suite's root Packages*, Sources* and
+// Contents-* members (index). Packages* and Sources* take the flat index
+// sniff, a compressed Contents-* its extension's magic; a plain
+// Contents-* has no sniff (sniffable false), and nothing else is an
+// anchorless index.
+func TestSniffAnchorlessIndex(t *testing.T) {
+	gz := "\x1f\x8b\x08\x00"
+	for _, c := range []struct {
+		name, head             string
+		index, pass, sniffable bool
+	}{
+		{"Packages", "Package: a\n", true, true, true},
+		{"Packages", "<html>", true, false, true},
+		{"Packages.gz", gz, true, true, true},
+		{"Packages.gz", "<html>", true, false, true},
+		{"Sources.xz", "\xfd7zXZ\x00", true, true, true},
+		{"Sources", "Package: a\n", true, true, true},
+		{"Contents-amd64.gz", gz, true, true, true},
+		{"Contents-amd64.gz", "<html>", true, false, true},
+		{"Contents-udeb-amd64.zst", "\x28\xb5\x2f\xfd", true, true, true},
+		{"Contents-amd64", "bin/ls utils/coreutils\n", true, false, false},
+		{"Contents-amd64", "<html>", true, false, false},
+		{"Contents-AMD64.gz", gz, false, false, false},
+		{"Contents-amd64.zip", gz, false, false, false},
+		{"Packages.diff/Index", "SHA256-Current: x\n", false, false, false},
+		{"InRelease", "-----BEGIN PGP SIGNED MESSAGE-----", false, false, false},
+		{"Release", "Origin: x\n", false, false, false},
+		{"Translation-en", "Package: a\n", false, false, false},
+		{"Packages.bz3", "BZh", false, false, false},
+	} {
+		pass, sniffable := SniffAnchorlessIndex(c.name, []byte(c.head))
+		if pass != c.pass || sniffable != c.sniffable {
+			t.Errorf("SniffAnchorlessIndex(%q, %q) = %v, %v; want %v, %v", c.name, c.head, pass, sniffable, c.pass, c.sniffable)
+		}
+		if got := IsAnchorlessIndex(c.name); got != c.index {
+			t.Errorf("IsAnchorlessIndex(%q) = %v, want %v", c.name, got, c.index)
+		}
+	}
+}
