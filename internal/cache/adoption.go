@@ -991,7 +991,10 @@ const maxFallbackSegments = 32
 // last segment, as parallel slices. It returns nothing when P' is not
 // absolute, has an empty or ".." segment, or has more than
 // maxFallbackSegments segments (a ".." could step a request outside the
-// base its row is kept for).
+// base its row is kept for). The ".." and empty-segment stops are defence
+// in depth — with valid rows no such split could match (a B holding them
+// is never an ancestor of a canonical FlatBase, an F never equals a
+// validated flat_filename) — so TestFlatSplits pins them on this function.
 func flatSplits(path string) (bases, names []string) {
 	p := aptpath.DotClean(path)
 	if !strings.HasPrefix(p, "/") {

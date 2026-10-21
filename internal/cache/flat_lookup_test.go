@@ -89,6 +89,31 @@ func TestDeclaredHashesForPath_FlatShapes(t *testing.T) {
 	}
 }
 
+// flatSplits' stops at the unit level (spec C6; the Task 11 review's
+// Minor 1): a request path whose dot-cleaned form is relative, has an empty
+// or ".." segment, or has more than maxFallbackSegments segments has no
+// split. Through DeclaredHashesForPath the ".." and empty-segment stops
+// are unobservable with valid rows — such a B is never an ancestor of a
+// canonical FlatBase, and such an F never equals a validated
+// flat_filename — so they are pinned here, on the function itself.
+func TestFlatSplits(t *testing.T) {
+	bases, names := flatSplits("/a/./b/x.deb")
+	if !slices.Equal(bases, []string{"", "/a", "/a/b"}) || !slices.Equal(names, []string{"a/b/x.deb", "b/x.deb", "x.deb"}) {
+		t.Fatalf("flatSplits(/a/./b/x.deb) = %q, %q", bases, names)
+	}
+	if _, names := flatSplits("/" + strings.Repeat("d/", maxFallbackSegments-1) + "x.deb"); len(names) != maxFallbackSegments {
+		t.Fatalf("%d splits of a %d-segment path, want %d", len(names), maxFallbackSegments, maxFallbackSegments)
+	}
+	for _, p := range []string{
+		"/a/../b/x.deb", "/a//x.deb", "/a/x.deb/", "a/x.deb", "./a/x.deb",
+		"/" + strings.Repeat("d/", maxFallbackSegments) + "x.deb",
+	} {
+		if bases, names := flatSplits(p); bases != nil || names != nil {
+			t.Errorf("flatSplits(%q) = %q, %q; want no split", p, bases, names)
+		}
+	}
+}
+
 // Spec C6 step 2's tiebreak: among the rows the fallback keeps, those with
 // the longest B — the most specific base — win. "/a/./b/c/x.deb" is
 // <uri>/<Filename> both for suite /a (Filename b/c/x.deb, B /a) and for

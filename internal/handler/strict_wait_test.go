@@ -13,7 +13,6 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
-	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // fakeAdoptions is a handler.AdoptionWaiter: inFlight answers
@@ -137,25 +136,10 @@ func holdHostSlotsUntilJoined(t *testing.T, h *Handler, host string, delay time.
 }
 
 // commitVouching adopts a complete-coverage inline snapshot of suite whose
-// package_hash vouches debPath at debHash.
+// package_hash vouches debPath at debHash (a dists/ row).
 func commitVouching(t *testing.T, h *Handler, scheme, host, suite, debPath, debHash string) {
 	t.Helper()
-	inrel := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for "+suite))
-	if err := h.cache.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{CanonicalScheme: scheme,
-		CanonicalHost: host, SuitePath: suite}); err != nil {
-		t.Fatal(err)
-	}
-	id, _, err := h.cache.InsertTrackedCandidateForTest(context.Background(), cache.SnapshotCandidate{
-		CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite, InReleaseHash: &inrel})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.cache.CommitAdoption(context.Background(), id,
-		[]cache.SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: inrel, DeclaredSHA256: inrel}}, nil,
-		[]cache.PackageHash{{SnapshotID: id, CanonicalScheme: scheme, CanonicalHost: host, Path: debPath, DeclaredSHA256: debHash}},
-		nil, true); err != nil {
-		t.Fatal(err)
-	}
+	commitStrictSnap(t, h, scheme, host, strictSnap{suite: suite, complete: true, debs: map[string]string{debPath: ""}, declared: debHash})
 }
 
 // strictWaitRig is a strict-mode handler on a host whose only current
