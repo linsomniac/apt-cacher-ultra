@@ -183,7 +183,10 @@ func reapedTotal(t *testing.T, reason string) float64 {
 // now — never idle — and is reported. A reaped suite's snapshots are
 // retired, its metadata url_path rows deleted, and its lock-map, flip-gate
 // and touch entries purged (ruling R-F1); each reap logs suite_reaped and
-// counts in acu_suites_reaped_total by reason (design review M-16).
+// counts in acu_suites_reaped_total by reason (design review M-16). Flat
+// suites (phase G, the F carry-forward) are canonical and reaped by
+// idleness like any: /flat, used a day ago, stays; the idle /repo goes
+// and its ./ twin, used, stays with its own rows (ruling R-G4).
 func TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newReaperRig(t)
@@ -191,11 +194,14 @@ func TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem(t *testing.T) {
 			"/r/dists/idle":        reapNow - 31*reapDay,
 			"/legacy//dists/x":     reapNow, // non-canonical: an empty segment
 			"/foo/dists/InRelease": reapNow - 31*reapDay,
+			"/repo":                reapNow - 31*reapDay,
 		}
 		kept := map[string]int64{
 			"/r/dists/fresh":       reapNow - 29*reapDay,
 			"/r/dists/future":      reapNow + 2*reapDay,
 			"/bar/dists/InRelease": reapNow - reapDay,
+			"/flat":                reapNow - reapDay,
+			"/repo/.":              reapNow - 29*reapDay,
 		}
 		for s, at := range reaped {
 			r.seed(s, at)
@@ -223,6 +229,9 @@ func TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem(t *testing.T) {
 			if !r.exists(s) {
 				t.Errorf("%s was reaped", s)
 			}
+			if _, err := r.cache.LookupURL(context.Background(), "http", "h", s+"/InRelease"); err != nil {
+				t.Errorf("%s/InRelease: %v; want it kept with its suite", s, err)
+			}
 		}
 		if got, err := r.cache.GetSuiteSnapshot(context.Background(), snap); err != nil || got.RetiredAt == nil {
 			t.Fatalf("the reaped suite's snapshot = %+v, %v; want retired", got, err)
@@ -234,15 +243,16 @@ func TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem(t *testing.T) {
 		for _, ev := range r.events("suite_reaped") {
 			reasons[ev["suite_path"].(string)] = ev["reason"].(string)
 		}
-		want := map[string]string{"/r/dists/idle": "idle", "/legacy//dists/x": "non_canonical", "/foo/dists/InRelease": "idle"}
+		want := map[string]string{"/r/dists/idle": "idle", "/legacy//dists/x": "non_canonical", "/foo/dists/InRelease": "idle",
+			"/repo": "idle"}
 		if fmt.Sprint(reasons) != fmt.Sprint(want) {
 			t.Fatalf("suite_reaped reasons = %v, want %v", reasons, want)
 		}
 		if ev := r.events("clock_step_detected"); len(ev) != 1 || ev[0]["suite_path"] != "/r/dists/future" || ev[0]["stamp"] != "last_requested_at" {
 			t.Fatalf("clock_step_detected = %v, want one for /r/dists/future's last_requested_at", ev)
 		}
-		if di, dn := reapedTotal(t, "idle")-idle0, reapedTotal(t, "non_canonical")-nonCanonical0; di != 2 || dn != 1 {
-			t.Fatalf("acu_suites_reaped_total rose by idle %v, non_canonical %v; want 2 and 1", di, dn)
+		if di, dn := reapedTotal(t, "idle")-idle0, reapedTotal(t, "non_canonical")-nonCanonical0; di != 3 || dn != 1 {
+			t.Fatalf("acu_suites_reaped_total rose by idle %v, non_canonical %v; want 3 and 1", di, dn)
 		}
 	})
 }

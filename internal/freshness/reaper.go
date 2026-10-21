@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"math"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
@@ -110,6 +111,12 @@ type Reaper struct {
 	// readHead reads the head of a pool file for the junk scan (readCapped;
 	// tests count its reads or end the run's context at one).
 	readHead func(path string, limit int64) ([]byte, error)
+	// flatIndexRows reads the unadopted flat suites' root index rows for
+	// the junk scan (cache.ListUnadoptedFlatIndexRows), and signedEvidence
+	// reads a flat suite's signed evidence (cache.CheckUnsignedDowngrade;
+	// ruling PG-7); tests count their calls or fail them.
+	flatIndexRows  func(ctx context.Context) ([]cache.SuiteAnchorRow, error)
+	signedEvidence func(ctx context.Context, host, suitePath string) error
 	// dailyAt is when the marker sweep last ran, or when Run started
 	// (monotonic; zero: due — a run outside Run); reportedMarker is the
 	// marker stamped furthest in the future that the previous sweep found
@@ -126,10 +133,14 @@ type futureStamp struct {
 }
 
 // sniffKey keys a junk verdict: what a blob's head is to one kind of
-// anchor never changes, since the pool is content-addressed.
+// anchor never changes, since the pool is content-addressed. A flat
+// index's verdict also depends on its name — its extension picks the
+// flat index sniff (aptpath.SniffFlatIndex) — so name is the member's
+// name for aptpath.FileFlatIndex and "" for an anchor (ruling R-G2).
 type sniffKey struct {
 	file aptpath.SuiteFile
 	hash string
+	name string
 }
 
 // NewReaper returns a reaper over cfg.Cache whose suite holds and
@@ -150,7 +161,8 @@ func NewReaper(cfg ReaperConfig) (*Reaper, error) {
 		logger = slog.Default()
 	}
 	return &Reaper{cache: cfg.Cache, checker: cfg.Checker, idleTTL: cfg.IdleTTL, logger: logger,
-		interval: reapInterval, floor: reapUptimeFloor, readHead: readCapped}, nil
+		interval: reapInterval, floor: reapUptimeFloor, readHead: readCapped,
+		flatIndexRows: cfg.Cache.ListUnadoptedFlatIndexRows, signedEvidence: cfg.Cache.CheckUnsignedDowngrade}, nil
 }
 
 // Run runs the reaper until ctx ends: the first run once the uptime floor
@@ -655,7 +667,20 @@ func sameSnapshot(a, b *int64) bool {
 // (r.sniffs = next), and allJunk stops at a suite's first row that is no
 // evidence, so an older verdict that scan did not reach is gone — and an
 // anchor no sniff applies to (aptpath.NotSuiteFile: a suite path over
-// MaxSuitePathBytes) is never evidence and never read. The evidence is not
+// MaxSuitePathBytes) is never evidence and never read. Ruling R-G2, as
+// amended by ruling PG-7 (suiteJunk): an unadopted flat suite whose base
+// has no signed evidence (cache.CheckUnsignedDowngrade finds no marker and
+// no signed snapshot of the base or its twin) is judged on its anchor rows
+// and its cached root Packages*/Sources* rows together
+// (cache.ListUnadoptedFlatIndexRows, one more indexed read per run) —
+// junk only when it has at least one such row and every one is junk
+// evidence by the same rules (aptpath.SniffFlatIndex for an index's name;
+// fetched at least junkGrace ago; whatever its record); a flat suite with
+// signed evidence, and every dists/ suite, is judged by its anchors alone.
+// The signed-evidence read is lazy, per candidate: only a flat suite the
+// two rules judge differently reads it. A failed read of the index rows
+// leaves every unadopted flat suite unjudged for the run, and a failed
+// signed-evidence read the suite (both logged). The evidence is not
 // read again under the hold, which re-reads only the current snapshot
 // (reapHeld): between the scan and the hold a junk suite's anchor rows
 // change only through an adoption, which that comparison catches, or
@@ -676,6 +701,27 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 	for _, a := range anchors {
 		bySuite[a.SuiteKey] = append(bySuite[a.SuiteKey], a)
 	}
+	// Ruling R-G2's evidence for flat suites (as amended by ruling PG-7),
+	// read only when there is one to judge.
+	//
+	// AIDEV-NOTE: ruling R-G5 (deferred minor F-12) with ruling PG-7's
+	// gate: a run with no unadopted flat suite reads no index rows
+	// (hasUnadoptedFlatSuite), so a cache of dists/ suites pays nothing for
+	// R-G2 — the 90-day reaping simulation
+	// (TestDoD_NinetyDaysOfReapingWithRestarts) keeps its 4.5 s budget
+	// under -race (an unconditional read cost it about 20 %).
+	byIndexes := map[cache.SuiteKey][]cache.SuiteAnchorRow{}
+	indexesRead := true
+	if hasUnadoptedFlatSuite(rows) {
+		indexes, err := r.flatIndexRows(ctx)
+		if err != nil {
+			r.warn(ctx, "suite reaper: list unadopted flat indexes failed", "err", err)
+			indexesRead = false
+		}
+		for _, a := range indexes {
+			byIndexes[a.SuiteKey] = append(byIndexes[a.SuiteKey], a)
+		}
+	}
 	listed := map[cache.SuiteKey]bool{}
 	for _, c := range have {
 		listed[c.key] = true
@@ -683,6 +729,9 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 	cutoff := now.Add(-junkGrace).Unix()
 	next := map[sniffKey]bool{}
 	var fails junkReadFailures
+	var evidenceFails int
+	var evidenceErr error
+	var evidenceKey cache.SuiteKey
 	var out []reapCandidate
 	for i := range rows {
 		if ctx.Err() != nil {
@@ -690,8 +739,19 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 		}
 		s := &rows[i].SuiteFreshness
 		key := cache.SuiteKey{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath}
-		as := bySuite[key]
-		if listed[key] || len(as) == 0 || !r.allJunk(key, as, cutoff, next, &fails) {
+		flat := s.CurrentSnapshotID == nil && aptpath.IsFlatSuitePath(s.SuitePath)
+		if listed[key] || (flat && !indexesRead) {
+			continue // a failed index read: no verdict for an unadopted flat suite this run
+		}
+		junk, err := r.suiteJunk(ctx, key, flat, bySuite[key], byIndexes[key], cutoff, next, &fails)
+		if err != nil {
+			if evidenceFails == 0 {
+				evidenceErr, evidenceKey = err, key
+			}
+			evidenceFails++
+			continue // an I/O fault is never evidence: no verdict this run
+		}
+		if !junk {
 			continue
 		}
 		// current stays nil: the compare under the hold (reapHeld) and the
@@ -705,7 +765,61 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 		r.warn(ctx, "suite reaper: junk anchor reads failed", "count", fails.n, "err", fails.first,
 			"canonical_scheme", fails.scheme, "canonical_host", fails.host, "path", fails.path)
 	}
+	if evidenceFails > 0 {
+		r.warn(ctx, "suite reaper: read signed evidence failed", "count", evidenceFails, "err", evidenceErr,
+			"canonical_scheme", evidenceKey.CanonicalScheme, "canonical_host", evidenceKey.CanonicalHost,
+			"suite_path", evidenceKey.SuitePath)
+	}
 	return out
+}
+
+// suiteJunk reports whether key's evidence rows are all junk evidence
+// (allJunk): its anchor rows and — for an unadopted flat suite (flat)
+// whose base has no signed evidence — its root index rows with them
+// (ruling PG-7, amending R-G2). The anchors-alone verdict and the combined
+// one are reached first; the signed-evidence read (signedEvidence:
+// cache.CheckUnsignedDowngrade, no third "signed" predicate — ruling PG-3)
+// runs only when they differ, so a dists/ suite, and a flat suite the two
+// rules judge alike, never reads it. A non-nil error is that read's
+// failure: no verdict.
+//
+// AIDEV-NOTE: ruling PG-7. Anchors alone would reap a healthy Release-less
+// suite on a host that answers soft-404s for InRelease and Release every
+// day, losing its good index during an outage; they stay the rule only
+// where they heal something — a signed suite with a junk anchor (signed
+// clients reject the junk, and anchor serves keep the suite touched, so
+// only the junk reap repairs it).
+func (r *Reaper) suiteJunk(ctx context.Context, key cache.SuiteKey, flat bool, anchors, indexes []cache.SuiteAnchorRow,
+	cutoff int64, next map[sniffKey]bool, fails *junkReadFailures) (bool, error) {
+	anchorsJunk := len(anchors) > 0 && r.allJunk(key, anchors, cutoff, next, fails)
+	if !flat {
+		return anchorsJunk, nil
+	}
+	combined := (len(anchors) == 0 || anchorsJunk) && len(anchors)+len(indexes) > 0 &&
+		(len(indexes) == 0 || r.allJunk(key, indexes, cutoff, next, fails))
+	if combined == anchorsJunk {
+		return anchorsJunk, nil
+	}
+	switch err := r.signedEvidence(ctx, key.CanonicalHost, key.SuitePath); {
+	case errors.Is(err, cache.ErrUnsignedDowngradeRefused):
+		return anchorsJunk, nil // signed evidence: the anchors alone
+	case err != nil:
+		return false, err
+	}
+	return combined, nil
+}
+
+// hasUnadoptedFlatSuite reports whether rows hold an unadopted flat
+// suite: one ruling R-G2 (as amended by ruling PG-7) may judge by its root
+// index rows.
+func hasUnadoptedFlatSuite(rows []cache.SuiteWithAdoption) bool {
+	for i := range rows {
+		s := &rows[i].SuiteFreshness
+		if s.CurrentSnapshotID == nil && aptpath.IsFlatSuitePath(s.SuitePath) {
+			return true
+		}
+	}
+	return false
 }
 
 // junkReadFailures counts one junk scan's failed pool reads, keeping the
@@ -717,8 +831,10 @@ type junkReadFailures struct {
 	scheme, host, path string
 }
 
-// allJunk reports whether every one of key's cached anchor rows holds a
-// blob fetched at or before cutoff that is junk evidence (anchorEvidence).
+// allJunk reports whether every one of key's evidence rows as — its cached
+// anchor rows, or a flat suite's root index rows (ruling R-G2 as amended
+// by PG-7; suiteJunk) — holds a blob fetched at or before cutoff that is
+// junk evidence (anchorEvidence).
 // A row without a blob or a fetch stamp, a fetch stamp after cutoff (a
 // future one included: the clock-step rule), an anchor no sniff applies
 // to (aptpath.NotSuiteFile), or a pool file that is missing or does not
@@ -743,6 +859,9 @@ func (r *Reaper) allJunk(key cache.SuiteKey, as []cache.SuiteAnchorRow, cutoff i
 			return false // no sniff applies: never evidence, never read (the Task 7 review's minor 5)
 		}
 		k := sniffKey{file: file, hash: *a.BlobHash}
+		if file == aptpath.FileFlatIndex {
+			k.name = a.Path[strings.LastIndexByte(a.Path, '/')+1:] // its extension picks the sniff
+		}
 		junk, ok := next[k]
 		if !ok {
 			junk, ok = r.sniffs[k]
@@ -772,11 +891,12 @@ func (r *Reaper) allJunk(key cache.SuiteKey, as []cache.SuiteAnchorRow, cutoff i
 	return true
 }
 
-// anchorEvidence reports whether head, the start of a cached anchor of
-// kind file at path, is junk evidence (ruling PF-3): it fails its own
-// sniff and, for an InRelease, the Release sniff too — a plain-text
-// Release cached as InRelease is a §6.1-quarantined plain-text suite on
-// its way to an unsigned adoption through Release, not junk.
+// anchorEvidence reports whether head, the start of a cached anchor (or,
+// ruling R-G2, flat index) of kind file at path, is junk evidence (ruling
+// PF-3): it fails its own sniff and, for an InRelease, the Release sniff
+// too — a plain-text Release cached as InRelease is a §6.1-quarantined
+// plain-text suite on its way to an unsigned adoption through Release,
+// not junk.
 func anchorEvidence(file aptpath.SuiteFile, path string, head []byte) bool {
 	if file.Sniff(path, head) {
 		return false
