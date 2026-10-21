@@ -261,6 +261,18 @@ func suiteRow(t *testing.T, html, host string) string {
 	return htmlRowStart(html, i)
 }
 
+// suiteCells returns the Suites row of host from its Host cell to the
+// row's end: the row's cells.
+func suiteCells(t *testing.T, html, host string) string {
+	t.Helper()
+	i := strings.Index(html, `data-label="Host" class="host">`+host+`<`)
+	j := strings.Index(html[max(i, 0):], "</tr>")
+	if i < 0 || j < 0 {
+		t.Fatalf("no Suites row for %s", host)
+	}
+	return html[i : i+j]
+}
+
 // Final ruling A5: a refusal is a state, not a failure, but one whose
 // streak began more than 24 h ago warns (row and SUITES vital, never
 // crit), whatever refusalKeepsCurrent says, and its Adoption text says
@@ -324,8 +336,10 @@ func TestSuitesTable_RendersRecordsAndCounts(t *testing.T) {
 		`<span class="count-warn">1 REFUSED 24H+</span>`,
 		// ADOPTIONS vital sub-line: the refusal is counted apart from failures.
 		`<b class="accent-crit">1 FAILED</b> &middot; <b class="accent-warn">1 REFUSED</b>`,
-		`<span class="lagging">(lagging 30m)</span>`,
 	)
+	// The 30-minute lag shows on young.example's own row (and never warns,
+	// below).
+	mustContain(t, suiteCells(t, html, "young.example"), `<span class="lagging">(lagging 30m)</span>`)
 	for host, warn := range map[string]bool{"fail.example": true, "refused.example": false, "stuck.example": true, "lag.example": true,
 		"young.example": false} {
 		if got := strings.Contains(suiteRow(t, html, host), `data-state="warn"`); got != warn {
@@ -425,7 +439,11 @@ func TestBuildSuiteEntries_Flat(t *testing.T) {
 		rows = append(rows, cache.SuiteWithAdoption{SuiteFreshness: cache.SuiteFreshness{CanonicalScheme: "http",
 			CanonicalHost: "h", SuitePath: p}})
 	}
-	for _, e := range buildSuiteEntries(rows, now) {
+	entries := buildSuiteEntries(rows, now)
+	if len(entries) != len(want) {
+		t.Fatalf("%d entries, want %d", len(entries), len(want))
+	}
+	for _, e := range entries {
 		if e.Flat != want[e.SuitePath] {
 			t.Errorf("%s: flat = %v, want %v", e.SuitePath, e.Flat, want[e.SuitePath])
 		}
@@ -433,7 +451,9 @@ func TestBuildSuiteEntries_Flat(t *testing.T) {
 }
 
 // The status page tags a flat suite's path "flat" in the Suites table;
-// a dists/ suite's cell is the path alone.
+// a dists/ suite's cell is the path alone. The tag cannot be selected, so
+// copying the cell — /forget's 409 says to pass the suite as the Suite
+// path column shows it — copies the path alone.
 func TestSuitesTable_ShowsTheFlatTag(t *testing.T) {
 	const now = int64(1_800_000_000)
 	m := newHealthyModel()
@@ -443,8 +463,9 @@ func TestSuitesTable_ShowsTheFlatTag(t *testing.T) {
 	}, now)
 	html := renderHTMLForGolden(t, m)
 	mustContain(t, html,
-		`<td data-label="Suite path" class="mono">/core:/stable:/v1.34/deb <span class="b b--neutral">flat</span></td>`,
+		`<td data-label="Suite path" class="mono">/core:/stable:/v1.34/deb <span class="b b--neutral b--nocopy">flat</span></td>`,
 		`<td data-label="Suite path" class="mono">/ubuntu/dists/noble</td>`,
+		`.b--nocopy{-webkit-user-select:none;user-select:none}`,
 	)
 }
 

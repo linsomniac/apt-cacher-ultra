@@ -186,6 +186,7 @@ table.data tbody tr[data-state="crit"]:hover td{background:color-mix(in srgb,var
 .b{display:inline-block;padding:1px 7px 2px;font-family:var(--font-mono);font-size:9.5px;letter-spacing:0.14em;font-weight:500;text-transform:uppercase;border:1px solid currentColor;border-radius:var(--r-badge);background:transparent;line-height:1.5;white-space:nowrap}
 .b--ok{color:var(--ok)}.b--warn{color:var(--warn)}.b--crit{color:var(--crit)}.b--stale{color:var(--stale)}
 .b--neutral{color:var(--ink-low);border-color:var(--rule-hard)}
+.b--nocopy{-webkit-user-select:none;user-select:none}
 .b--signal{color:var(--signal)}
 .b.reason{margin-left:6px;letter-spacing:0.08em}
 .notice-mount{display:contents}
@@ -452,7 +453,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
             {{range .Suites}}
               <tr{{if or .LagWarn .AdoptionFailing .RefusedLong}} data-state="warn"{{end}}>
                 <td data-label="Host" class="host">{{if .Scheme}}{{.Scheme}}://{{end}}{{.Host}}</td>
-                <td data-label="Suite path" class="mono">{{.SuitePath}}{{if .Flat}} <span class="b b--neutral">flat</span>{{end}}</td>
+                <td data-label="Suite path" class="mono">{{.SuitePath}}{{if .Flat}} <span class="b b--neutral b--nocopy">flat</span>{{end}}</td>
                 <td data-label="Last check" class="time">{{unixTimePtr .LastCheckUnixTime}}</td>
                 <td data-label="Last success" class="time">{{unixTimePtr .LastSuccessUnixTime}}</td>
                 <td data-label="Snapshot" class="num mono">{{i64Ptr .CurrentSnapshotID}}</td>
