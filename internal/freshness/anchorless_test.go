@@ -1105,15 +1105,18 @@ func TestCheck_AnchorlessFailedDeleteIsNoAnswer(t *testing.T) {
 		name   string
 		cache  func(r *flatRig)
 		result string
+		err    string // the failed check's err prefix
 	}{
-		{"an index's 404", func(r *flatRig) { r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "") }, "failed"},
-		{"an anchor's 404, no index row", func(r *flatRig) { r.cacheRow("Release", []byte("Origin: fury\n"), 1, rigStart-3600, "") }, "failed"},
+		{"an index's 404", func(r *flatRig) { r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "") }, "failed",
+			"every anchorless index request ended unknown: delete anchorless rows: "},
+		{"an anchor's 404, no index row", func(r *flatRig) { r.cacheRow("Release", []byte("Origin: fury\n"), 1, rigStart-3600, "") }, "failed",
+			"delete anchorless rows: "},
 		{"a 404 beside a 304", func(r *flatRig) {
 			pk := gzBody("v1")
 			r.cacheRow("Packages.gz", pk, 1, rigStart-3600, rigETag(pk))
 			r.up.setAt(r.url("Packages.gz"), pk)
 			r.cacheRow("Sources.gz", gzBody("src"), 1, rigStart-3600, "")
-		}, "anchorless_unchanged"},
+		}, "anchorless_unchanged", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newFlatRig(t, "/fury")
@@ -1135,6 +1138,12 @@ BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`); err != nil {
 			}
 			if want := map[string]int64{"failed": 1}[tc.result]; r.row().CheckFailCount != want {
 				t.Fatalf("check_fail_count %d, want %d", r.row().CheckFailCount, want)
+			}
+			if tc.err != "" {
+				recs := logRecords(t, r.logs, "freshness check failed")
+				if len(recs) != 1 || !strings.HasPrefix(fmt.Sprint(recs[0]["err"]), tc.err) {
+					t.Fatalf("failed check lines %v, want one whose err starts %q", recs, tc.err)
+				}
 			}
 		})
 	}

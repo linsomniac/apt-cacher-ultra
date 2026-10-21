@@ -284,7 +284,7 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 			// counting, as a failed RefreshURLPathBlob makes its row
 			// unknown.
 			answered -= answeredDeletes
-			deleteFailed, lastErr = true, fmt.Errorf("delete: %w", err)
+			deleteFailed, lastErr = true, fmt.Errorf("delete anchorless rows: %w", err)
 		}
 		deleted = n
 	}
@@ -292,7 +292,11 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 		c.noteAnchorlessOverCap(suite)
 	}
 	if (requests > 0 || deleteFailed) && answered == 0 {
-		c.failCheck(ctx, out, cur, suite, nowUnix, "anchorless", fmt.Errorf("%w: %w", errAnchorlessUnknown, lastErr))
+		err := fmt.Errorf("%w: %w", errAnchorlessUnknown, lastErr)
+		if requests == 0 {
+			err = lastErr // no index request: the anchors' failed delete alone
+		}
+		c.failCheck(ctx, out, cur, suite, nowUnix, "anchorless", err)
 		return
 	}
 	cur.LastCheckAt, cur.LastSuccessAt, cur.CheckFailCount = &nowUnix, &nowUnix, 0
