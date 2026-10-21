@@ -2472,9 +2472,10 @@ type debPathDecl struct {
 
 // buildPackageHashes walks every Packages-shaped Release member, parses
 // it, and returns the dedup'd cache.PackageHash rows + the SPEC3 §7.5.4
-// coverage_complete bit for the snapshot. Returns coverage = false for
-// non-/dists/ layouts (with rows = nil); strict mode (§6.1) treats
-// such hosts as fail-through, never fail-closed.
+// coverage_complete bit for the snapshot. Returns coverage = false (with
+// rows = nil, logged reason non_dists_layout) for a suite path that is
+// neither a dists/ suite nor a canonical flat suite; strict mode (§6.1)
+// treats such hosts as fail-through, never fail-closed.
 //
 // allMembers is the full Release-declared set (used to compute the
 // coverage denominator — every declared Packages-basename directory

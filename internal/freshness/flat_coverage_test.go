@@ -116,21 +116,36 @@ func TestAdopter_MaterialisesFlatPackageRows(t *testing.T) {
 // dists-only). A flat Release with no root Packages at all has incomplete
 // coverage (no_packages_members), and a root Packages whose stanzas all
 // lack a SHA256 (ruling R-G1) adopts with incomplete coverage (no_sha256).
+//
+// The Sources fixture parses (Directory: src; ParseSources refuses "."),
+// and the adoption must log no source_parse_failed, so a flat-aware
+// buildSourceHashes would show up as a /repo/src/a_1.dsc row. A root
+// Packages.diff/Index never reaches buildPdiffHashes (isPdiffIndexMember
+// wants a "/" before it), so the nested binary-amd64 Index is the one that
+// reaches its dists-only guard: a flat-aware builder would row its patch.
 func TestAdopter_FlatCoverageReadsTheRootPackagesOnly(t *testing.T) {
 	suite := SuiteRef{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/repo"}
 	pkgs := fakePackagesStanzas(map[string]string{"./a_1_amd64.deb": testHex64})
 	nested := fakePackagesStanzas(map[string]string{"./nested_1_amd64.deb": strings.Repeat("b", 64)})
-	sources := []byte("Package: a\nBinary: a\nVersion: 1\nDirectory: .\nChecksums-Sha256:\n " + testHex64 + " 10 a_1.dsc\n")
-	pdiff := []byte("SHA256-Current: " + testHex64 + " 10\nSHA256-Patches:\n " + testHex64 + " 10 2026-10-20-0000.00\n")
+	sources := []byte("Package: a\nBinary: a\nVersion: 1\nDirectory: src\nChecksums-Sha256:\n " + testHex64 + " 10 a_1.dsc\n")
+	pdiff := []byte("SHA256-Current: " + testHex64 + " 10\nSHA256-Patches:\n " + testHex64 + " 10 2026-10-20-0000.00\n" +
+		"SHA256-Download:\n " + testHex64 + " 10 2026-10-20-0000.00.gz\n")
 	t.Run("root Packages only", func(t *testing.T) {
 		env := newAdoptionTestEnv(t)
+		var logs lockedBuffer
+		env.adopter.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 		snap := adoptFlat(t, env, suite, map[string][]byte{"Packages": pkgs, "sub/Packages": nested, "Sources": sources,
-			"Packages.diff/Index": pdiff})
+			"Packages.diff/Index": pdiff, "binary-amd64/Packages.diff/Index": pdiff})
 		if got, want := packageHashRows(t, env.cache, snap.SnapshotID), map[string]string{"/repo/./a_1_amd64.deb": "a_1_amd64.deb"}; !maps.Equal(got, want) {
 			t.Fatalf("package_hash rows = %v, want only the root Packages' %v", got, want)
 		}
 		if !snap.PackageCoverageComplete {
 			t.Fatal("package_coverage_complete = false, want true (a nested Packages is not the flat suite's)")
+		}
+		for _, msg := range []string{"source_parse_failed", "pdiff_index_parse_failed"} {
+			if recs := logRecords(t, &logs, msg); len(recs) != 0 {
+				t.Fatalf("%s = %v; want the fixtures parseable, so only the dists-only guards keep their rows out", msg, recs)
+			}
 		}
 	})
 	t.Run("no root Packages", func(t *testing.T) {

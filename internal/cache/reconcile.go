@@ -22,7 +22,12 @@ import (
 // OR a non-empty identity field (package_name/architecture/version) DISAGREES
 // is a real cross-index conflict and fails loud (SPEC6_5 §11 H7). It is NOT a
 // silent ON CONFLICT DO NOTHING. If the package_hash column set ever changes,
-// update BOTH copies (and the heal UPDATE below).
+// update BOTH copies (and the heal UPDATE below). flat_filename (phase G) is
+// in both INSERTs but neither probed nor healed here, on purpose: it follows
+// from the row's path and its snapshot's suite (DotClean of the Filename
+// relative to FlatBase), so a same-PK row always agrees, and no released
+// binary wrote a flat row with another value (v6 flat suites took
+// non_dists_layout and wrote none).
 func insertPackageHashTx(ctx context.Context, tx *sql.Tx, ph PackageHash) error {
 	if !validBlobHash(ph.DeclaredSHA256) {
 		return fmt.Errorf("insertPackageHashTx: %q declared_sha256 %w", ph.Path, ErrInvalidHash)
