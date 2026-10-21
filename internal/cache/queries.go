@@ -1014,6 +1014,10 @@ func keepNewestNVersionSet(versions []string, n int) map[string]struct{} {
 func (c *Cache) HostCurrentSnapshotsCoverage(ctx context.Context, scheme, host string) ([]SnapshotCoverage, error) {
 	// AIDEV-NOTE: spec C5/C10 — unsigned snapshots never count for strict
 	// mode (they vouch nothing), so they are not "snapshots in force" here.
+	// Flat snapshots (and /. twins) count like dists/ ones: C10's rule is
+	// host-wide, and C6's vouching replaces PR #8's per-directory scoping;
+	// an anchorless suite has no snapshot (TestServeHTTP_FlatStrictMatrix,
+	// TestServeHTTP_CurrentSnapshotCountCountsFlatSnapshots).
 	const q = `
 SELECT ss.snapshot_id, ss.package_coverage_complete
   FROM suite_snapshot ss

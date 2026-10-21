@@ -49,10 +49,10 @@ func TestServeHTTP_UnsignedNeverChangesStrictPosture(t *testing.T) {
 		if rec.Code != http.StatusBadGateway {
 			t.Fatalf("status %d, want the strict refusal: an unsigned snapshot vouched the .deb", rec.Code)
 		}
-		for _, r := range logs.records() {
-			if r["msg"] == "unvouched_deb_refused" && r["current_snapshot_count"] != float64(1) {
-				t.Fatalf("current_snapshot_count %v, want 1 (the unsigned snapshot does not count)", r["current_snapshot_count"])
-			}
+		// Deferred minor E-70: exactly one refusal, so the count is read.
+		refused := logs.find("unvouched_deb_refused")
+		if len(refused) != 1 || refused[0]["current_snapshot_count"] != float64(1) {
+			t.Fatalf("refusals %v, want one with current_snapshot_count 1 (the unsigned snapshot does not count)", refused)
 		}
 	})
 	t.Run("an unsigned-only host stays unprotected", func(t *testing.T) {
