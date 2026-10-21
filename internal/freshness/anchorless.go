@@ -48,7 +48,8 @@ func (a *Adopter) flatIndexClientCreated(ctx context.Context, suite SuiteRef) (*
 // maxAnchorlessIndexBytes is the anchorless refresh's body cap (plan
 // design note 12): fetch.Conditional reads a body into memory, and the
 // Release-less repositories publish indexes of kilobytes to a few MiB. A
-// body over it keeps the row (no content answer).
+// body over it drops the row for the miss path, no content answer (ruling
+// PG-29: refreshAnchorlessRow).
 const maxAnchorlessIndexBytes = 64 << 20
 
 // anchorlessBodySlots is how many anchorless bodies may be in memory at
@@ -57,7 +58,8 @@ const maxAnchorlessIndexBytes = 64 << 20
 const anchorlessBodySlots = 2
 
 // anchorlessOverCapWarnEvery rate-limits the WARN "freshness: anchorless
-// index over its size cap": at most one line per minute process-wide, with
+// index over its size cap, dropped for the miss path": at most one line per
+// minute process-wide, with
 // the count of the lines it suppressed (design review M-6; the handler's
 // flat_host_root_unsupported does the same). The limiter is
 // Checker.anchorlessOverCap, an observability.LogLimiter (ruling PG-22).
@@ -136,10 +138,10 @@ type anchorlessAnswer int
 
 const (
 	// anchorlessUnknown: no content answer, and the row stays — a
-	// transport error, the deadline, a status not listed, a body over the
-	// cap, a local write error, a 304 to a request without validators, a
-	// 401 or 403, or a 200 failing its sniff (design review M-7: a captive
-	// portal or lost permissions is no answer).
+	// transport error, the deadline, a status not listed, a local write
+	// error, a 304 to a request without validators, a 401 or 403, or a
+	// 200 failing its sniff (design review M-7: a captive portal or lost
+	// permissions is no answer).
 	anchorlessUnknown anchorlessAnswer = iota
 	// anchorlessKept: a content answer that keeps the row — a 304, a 200
 	// with the cached bytes (only changed validators are stored).
@@ -149,8 +151,10 @@ const (
 	// anchorlessDeleted: a 404 or 410; the row is to be deleted.
 	anchorlessDeleted
 	// anchorlessDropped: a changed plain Contents-* (no sniff, plan
-	// deviation 2); the row is to be deleted, but its 200 is no content
-	// answer — nothing tells it from a soft-404.
+	// deviation 2) or a 200 over maxAnchorlessIndexBytes (ruling PG-29);
+	// the row is to be deleted for the miss path, but its 200 is no
+	// content answer — nothing tells the one from a soft-404, and the
+	// other's bytes were never read.
 	anchorlessDropped
 )
 
@@ -180,14 +184,14 @@ func anchorlessRank(name string) int {
 // is an anchorless index (aptpath.IsAnchorlessIndex) gets one conditional
 // GET (refreshAnchorlessRow), Packages* first, then Sources*, then
 // Contents-* (anchorlessRank); then the rows to delete — those answered
-// 404 or 410, a changed plain Contents-*, and the suite's cached InRelease
-// and Release rows (anchors: read before the probe tree ran) whose probe
-// in t answered 404 or 410, or 401 or 403 beside an index request's
-// content answer (ruling PG-28) — go in one writer transaction, each only
-// while it still holds the blob it was read with (cache.DeleteURLPathRows;
-// an anchor a client's miss stored anew during its probe's window is
-// kept).
-// The check is answered — anchorless_refreshed when a row was replaced or
+// 404 or 410, a changed plain Contents-*, one whose 200 was over the body
+// cap (ruling PG-29; WARN, rate-limited, naming its path), and the suite's
+// cached InRelease and Release rows (anchors: read before the probe tree
+// ran) whose probe in t answered 404 or 410, or 401 or 403 beside an index
+// request's content answer (ruling PG-28) — go in one writer transaction,
+// each only while it still holds the blob it was read with
+// (cache.DeleteURLPathRows; an anchor a client's miss stored anew during
+// its probe's window is kept). The check is answered — anchorless_refreshed when a row was replaced or
 // deleted, anchorless_unchanged otherwise — unless index requests were
 // sent and none got a content answer (anchorlessAnswer.answered: a 304, a
 // 200 stored or matching the cached bytes, a 404 or 410): a failed check
@@ -228,7 +232,7 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 		requests, answered, replaced int
 		answeredDeletes              int
 		lastErr                      error
-		overCap                      bool
+		overCap                      []string // the paths dropped over the cap
 	)
 	for _, row := range rows {
 		if name := strings.TrimPrefix(row.Path, suitePath+"/"); aptpath.IsAnchorlessIndex(name) && row.BlobHash != nil {
@@ -258,7 +262,9 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 			answered++
 		} else {
 			lastErr = err
-			overCap = overCap || errors.Is(err, fetch.ErrConditionalBodyTooLarge)
+		}
+		if errors.Is(err, fetch.ErrConditionalBodyTooLarge) {
+			overCap = append(overCap, row.Path)
 		}
 	}
 	for _, p := range []struct {
@@ -303,8 +309,8 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 		}
 		deleted = n
 	}
-	if overCap {
-		c.noteAnchorlessOverCap(suite)
+	for _, path := range overCap {
+		c.noteAnchorlessOverCap(suite, path)
 	}
 	if (requests > 0 || deleteFailed) && answered == 0 {
 		err := fmt.Errorf("%w: %w", errAnchorlessUnknown, lastErr)
@@ -324,17 +330,19 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 }
 
 // noteAnchorlessOverCap logs WARN "freshness: anchorless index over its
-// size cap" for suite, at most once per anchorlessOverCapWarnEvery
-// process-wide, with the count of the lines it suppressed since the last
-// one (design review M-6: minted suites must not flood the log).
-func (c *Checker) noteAnchorlessOverCap(suite SuiteRef) {
+// size cap, dropped for the miss path" for path, an index row of suite
+// whose 200 was over maxAnchorlessIndexBytes (ruling PG-29), at most once
+// per anchorlessOverCapWarnEvery process-wide, with the count of the lines
+// it suppressed since the last one (design review M-6: minted suites must
+// not flood the log).
+func (c *Checker) noteAnchorlessOverCap(suite SuiteRef, path string) {
 	ok, suppressed := c.anchorlessOverCap.Allow(time.Now(), anchorlessOverCapWarnEvery)
 	if !ok {
 		return
 	}
-	c.logger.Warn("freshness: anchorless index over its size cap",
-		"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "max_bytes", maxAnchorlessIndexBytes,
-		"suppressed", suppressed)
+	c.logger.Warn("freshness: anchorless index over its size cap, dropped for the miss path",
+		"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "path", path,
+		"max_bytes", maxAnchorlessIndexBytes, "suppressed", suppressed)
 }
 
 // refreshAnchorlessRow sends the anchorless index row's conditional GET
@@ -347,8 +355,9 @@ func (c *Checker) noteAnchorlessOverCap(suite SuiteRef) {
 // Contents-* (no sniff, plan deviation 2) is dropped when its bytes
 // changed; a 200 with the cached bytes — a plain Contents-* too — stores
 // only changed validators, never re-storing the blob; 404 and 410 delete
-// it; 401 and 403 keep it, no content answer. Anything else is unknown,
-// with err saying why.
+// it; a 200 over maxAnchorlessIndexBytes drops it for the miss path, no
+// content answer (ruling PG-29); 401 and 403 keep it, no content answer.
+// Anything else is unknown, with err saying why.
 //
 // AIDEV-NOTE: ruling PG-8. fetch.Conditional holds the whole body in
 // memory (io.ReadAll peaks near 2.25× the cap), and checks are bounded
@@ -390,8 +399,18 @@ func (c *Checker) refreshAnchorlessRow(ctx, fetchCtx context.Context, suite Suit
 	res, err := c.fetcher.Conditional(fetchCtx, target, etag, lastmod, maxAnchorlessIndexBytes)
 	if err != nil {
 		var se *fetch.StatusError
-		if errors.As(err, &se) && (se.Code == 404 || se.Code == 410) {
+		switch {
+		case errors.As(err, &se) && (se.Code == 404 || se.Code == 410):
 			return anchorlessDeleted, nil
+		case errors.Is(err, fetch.ErrConditionalBodyTooLarge):
+			// AIDEV-NOTE: ruling PG-29. Kept, the row's old validators
+			// could never earn a 304, so the file froze for as long as
+			// clients used it while every check downloaded the cap again
+			// and reported success. Dropped, the next client request is a
+			// miss that streams it uncapped with fresh validators, and the
+			// next check asks with them. Its bytes were never read: no
+			// content answer.
+			return anchorlessDropped, fmt.Errorf("%s: %w: dropped for the miss path", name, err)
 		}
 		return anchorlessUnknown, fmt.Errorf("%s: %w", name, err)
 	}

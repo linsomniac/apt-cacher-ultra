@@ -185,8 +185,9 @@ func TestCheck_AnchorlessCachedPageIsNoAnswerEvenUnchanged(t *testing.T) {
 // Spec C4 Dispatch 4's answers, one index row each: new bytes replace
 // its blob; 404 and 410 delete it; 401 and 403 keep it but are no content
 // answer (design review M-7: lost permissions are a failing check, not a
-// healthy one); a 5xx, a transport error and a body over the cap keep it
-// unknown — and with no content answer at all the check fails (the streak
+// healthy one); a 5xx and a transport error keep it unknown; a body over
+// the cap drops it for the miss path (ruling PG-29), no content answer
+// either — and with no content answer at all the check fails (the streak
 // backs off), logging the cap once. A changed plain Contents-* is dropped
 // (deviation 2) but is no content answer either. One answer is enough,
 // and a 304 to a request carrying only If-Modified-Since (a row cached
@@ -206,7 +207,7 @@ func TestCheck_AnchorlessAnswersByStatus(t *testing.T) {
 		{"403", &fetch.StatusError{Code: 403}, true, "failed", false},
 		{"503", &fetch.StatusError{Code: 503}, true, "failed", false},
 		{"a transport error", errors.New("connection reset by peer"), true, "failed", false},
-		{"a body over the cap", fmt.Errorf("conditional: %w", fetch.ErrConditionalBodyTooLarge), true, "failed", true},
+		{"a body over the cap", fmt.Errorf("conditional: %w", fetch.ErrConditionalBodyTooLarge), false, "failed", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newFlatRig(t, "/fury")
@@ -847,22 +848,23 @@ func TestCheck_AnchorlessAsksPackagesBeforeContents(t *testing.T) {
 
 // Design review M-6: the over-cap WARN is rate-limited process-wide — at
 // most one line a minute, carrying the count of the lines it suppressed —
-// so minted anchorless suites cannot flood the log.
+// so minted anchorless suites cannot flood the log. (Each check drops the
+// row, ruling PG-29: a client's miss stores it again before the next.)
 func TestCheck_AnchorlessOverCapWarnIsRateLimited(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newFlatRig(t, "/fury")
 		pk := gzBody("v1")
-		r.cacheRow("Packages.gz", pk, 1, rigStart-3600, rigETag(pk))
 		r.up.setFail(r.url("Packages.gz"), fmt.Errorf("conditional: %w", fetch.ErrConditionalBodyTooLarge))
 		for _, wait := range []time.Duration{0, 0, time.Minute, 0, time.Minute} {
 			time.Sleep(wait)
 			r.clock.advance(20 * time.Minute)
+			r.cacheRow("Packages.gz", pk, 1, rigStart-3600, rigETag(pk))
 			r.check()
 		}
 		var suppressed []float64
 		for _, line := range strings.Split(r.logs.String(), "\n") {
 			var m map[string]any
-			if line == "" || json.Unmarshal([]byte(line), &m) != nil || m["msg"] != "freshness: anchorless index over its size cap" {
+			if line == "" || json.Unmarshal([]byte(line), &m) != nil || m["msg"] != overCapMsg {
 				continue
 			}
 			n, _ := m["suppressed"].(float64)
@@ -870,6 +872,71 @@ func TestCheck_AnchorlessOverCapWarnIsRateLimited(t *testing.T) {
 		}
 		if !slices.Equal(suppressed, []float64{0, 1, 1}) {
 			t.Fatalf("over-cap WARN lines with suppressed %v, want [0 1 1]: one line a minute, each counting the one it hid", suppressed)
+		}
+	})
+}
+
+// overCapMsg is the over-cap WARN's message.
+const overCapMsg = "freshness: anchorless index over its size cap, dropped for the miss path"
+
+// Ruling PG-29 (the final review's concurrency lens I-1): an anchorless
+// index whose 200 is over the 64 MiB cap is dropped for the miss path —
+// its row deleted, compared against the blob the refresh read — and is no
+// content answer; the rate-limited WARN names its path. Kept, the row's
+// old validators could never earn a 304, so the file froze while every
+// check downloaded the cap again and reported success. Once a client's
+// miss has stored it again (uncapped, with fresh validators), the next
+// check asks with them and gets a 304. A row a client stored during the
+// over-cap request is kept: the drop's compare fails.
+func TestCheck_AnchorlessOverCapIndexIsDroppedForTheMissPath(t *testing.T) {
+	overCap := fmt.Errorf("conditional: %w", fetch.ErrConditionalBodyTooLarge)
+	t.Run("dropped, then refetched", func(t *testing.T) {
+		r := newFlatRig(t, "/fury")
+		r.cacheRow("Packages", []byte("Package: a\nFilename: a.deb\n"), 1, rigStart-3600, `"e1"`)
+		pk := gzBody("v1")
+		r.cacheRow("Packages.gz", pk, 1, rigStart-3600, rigETag(pk))
+		r.up.setAt(r.url("Packages.gz"), pk) // a 304: the check is answered
+		r.up.setFail(r.url("Packages"), overCap)
+		r.check()
+		if got := r.lastResult(); got != "anchorless_refreshed" {
+			t.Fatalf("result %q, want anchorless_refreshed (the over-cap row dropped)", got)
+		}
+		if u := r.lookup("Packages"); u != nil {
+			t.Fatalf("Packages row %+v, want it dropped for the miss path", u)
+		}
+		recs := logRecords(t, r.logs, overCapMsg)
+		if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["path"] != "/fury/Packages" {
+			t.Fatalf("over-cap lines %v, want one WARN naming /fury/Packages", recs)
+		}
+		grown := []byte("Package: a\nFilename: a.deb\n\nPackage: b\nFilename: b.deb\n")
+		r.cacheRow("Packages", grown, 2, rigStart, rigETag(grown)) // the client's miss, uncapped
+		r.up.setFail(r.url("Packages"), nil)
+		r.up.setAt(r.url("Packages"), grown)
+		r.clock.advance(16 * time.Minute)
+		r.check()
+		if got := r.lastResult(); got != "anchorless_unchanged" {
+			t.Fatalf("after the client's refetch: result %q, want anchorless_unchanged (a 304)", got)
+		}
+		if got, want := r.up.etagsSent(r.url("Packages")), []string{`"e1"`, rigETag(grown)}; !slices.Equal(got, want) {
+			t.Fatalf("Packages asked with %q, want %q: the refetched row's validators earn the 304", got, want)
+		}
+		if u := r.lookup("Packages"); u == nil || *u.BlobHash != hashOf(grown) {
+			t.Fatalf("Packages row %+v, want the client's refetch kept", u)
+		}
+	})
+	t.Run("a client's store during the request is kept", func(t *testing.T) {
+		r := newFlatRig(t, "/fury")
+		r.cacheRow("Packages", []byte("Package: a\nFilename: a.deb\n"), 1, rigStart-3600, `"e1"`)
+		newer := []byte("Package: a\nFilename: a.deb\n\nPackage: c\nFilename: c.deb\n")
+		r.up.setFail(r.url("Packages"), overCap)
+		r.up.before = func(url string) {
+			if url == r.url("Packages") {
+				r.cacheRow("Packages", newer, 2, rigStart, `"e2"`) // a client's miss, while the request is out
+			}
+		}
+		r.check()
+		if u := r.lookup("Packages"); u == nil || *u.BlobHash != hashOf(newer) {
+			t.Fatalf("Packages row %+v, want the client's newer row kept", u)
 		}
 	})
 }

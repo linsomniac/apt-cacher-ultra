@@ -43,7 +43,8 @@ type ConditionalResult struct {
 // Successful returns:
 //   - *ConditionalResult with Status = 304 and a nil Body.
 //   - *ConditionalResult with Status = 200 and Body filled (up to maxBody
-//     bytes). ErrConditionalBodyTooLarge if the body exceeds maxBody.
+//     bytes). ErrConditionalBodyTooLarge if the body exceeds maxBody —
+//     without reading it when its Content-Length already says so.
 //
 // Error returns (errors.Is classification matches Fetch):
 //   - ErrInvalidURL, ErrHostNotAllowed, ErrTargetDenied, ErrRedirectBlocked
@@ -141,6 +142,14 @@ func (c *Client) Conditional(
 		// echoed but do not require them.
 		return out, nil
 	case resp.StatusCode == http.StatusOK:
+		// A declared Content-Length over the cap fails before any of the
+		// body is read (ruling PG-29): reading maxBody+1 bytes only to
+		// drop them cost the whole cap per request. ContentLength is -1
+		// when unknown (and when the transport decompresses), so such a
+		// body is read and capped below.
+		if resp.ContentLength > maxBody {
+			return nil, fmt.Errorf("%w: >%d bytes", ErrConditionalBodyTooLarge, maxBody)
+		}
 		// LimitReader caps at maxBody bytes. If upstream sent more, we
 		// surface ErrConditionalBodyTooLarge so the freshness layer
 		// can log and back off — silently truncating would yield a
