@@ -100,6 +100,15 @@ func TestSuitePath_Flat(t *testing.T) {
 		{"/repo/flat/Packages.Z", ""},
 		{"/repo/flat/en", ""}, // a flat Translation file (apt's $(LANGUAGE)): Phase 1 only
 		{"/repo/flat/Contents-AMD64.gz", ""},
+		{"/repo/flat/Contents-", ""}, // Contents- needs a class
+		// each member regexp is anchored at both ends, and a by-hash name
+		// needs its by-hash directory (the grammar never widens)
+		{"/repo/flat/x/SHA256/" + hex64, ""},
+		{"/repo/flat/xInRelease", ""},
+		{"/repo/flat/old-Packages.gz", ""},
+		{"/repo/flat/by-hash/SHA256/" + hex64 + "0", ""},
+		{"/repo/flat/by-hash/SHA512/x" + hex64 + hex64, ""},
+		{"/repo/flat/xPackages.diff/Index", ""},
 		{"/repo/InRelease/", ""},
 		{"/repo/./InRelease/", ""},
 		{"/repo/./.", ""},

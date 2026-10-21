@@ -91,8 +91,9 @@ SELECT canonical_scheme, canonical_host, base, last_seen_at FROM suite_signed_se
 // "/.") is written twice: here, for the sweep's orphan test, and in
 // baseSuiteRowsTx (suite_reap.go), for /forget's KeptBy. They must agree —
 // a marker /forget keeps for a row must not be an orphan here, and the
-// reverse — so change them together (phase G's flat paths will touch
-// both).
+// reverse — so change them together. The rule covers phase G's flat
+// twins as written: MarkerBase("/repo/.") is "/repo", whose rows are
+// "/repo" and "/repo/.".
 const orphanSuiteRowSQL = `
 SELECT 1 FROM suite_freshness sf
  WHERE sf.canonical_scheme IN ('http', 'https') AND sf.canonical_host = %s

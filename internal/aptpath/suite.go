@@ -123,6 +123,11 @@ func flatMemberSegments(segs []string) int {
 // ("/InRelease", "/./Packages.gz"): spec C2 gives such a path no suite —
 // a host-root flat repository (`deb https://h/ /`) is unsupported, and
 // the handler logs flat_host_root_unsupported for it.
+//
+// The cleanBytes and hasDistsSegment guards are defensive: a host-root
+// member's segments are "." or member-grammar segments, which never hold a
+// forbidden byte or "dists", so no test row can tell them apart from the
+// member grammar's own refusal.
 func IsFlatHostRootPath(p string) bool {
 	if !strings.HasPrefix(p, "/") || !cleanBytes(p) || hasDistsSegment(p) {
 		return false
