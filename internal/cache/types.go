@@ -179,6 +179,13 @@ type PackageHash struct {
 	// (PackageName, Architecture). Empty for source/pdiff/Contents rows and
 	// for pre-v6 rows; the mirror rule only applies to non-empty versions.
 	Version string
+	// FlatFilename is package_hash.flat_filename (spec C6): for a flat
+	// suite's row, its stanza's Filename with every "." segment removed
+	// (aptpath.DotClean), the key DeclaredHashesForPath's suffix fallback
+	// looks a request up by; "" for a dists row, which the fallback never
+	// reads (the partial index idx_package_hash_flat_filename leaves it
+	// out).
+	FlatFilename string
 }
 
 // SuiteSnapshot mirrors the suite_snapshot table. Read-only model used

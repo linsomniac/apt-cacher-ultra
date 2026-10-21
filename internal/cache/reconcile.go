@@ -94,11 +94,11 @@ UPDATE package_hash
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO package_hash (canonical_scheme, canonical_host, path,
                           declared_sha256, snapshot_id,
-                          package_name, architecture, version)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                          package_name, architecture, version, flat_filename)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ph.CanonicalScheme, ph.CanonicalHost, ph.Path,
 		ph.DeclaredSHA256, ph.SnapshotID,
-		ph.PackageName, ph.Architecture, ph.Version); err != nil {
+		ph.PackageName, ph.Architecture, ph.Version, ph.FlatFilename); err != nil {
 		return fmt.Errorf("insertPackageHashTx: insert %q: %w", ph.Path, err)
 	}
 	return nil

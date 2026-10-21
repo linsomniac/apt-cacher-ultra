@@ -2489,11 +2489,37 @@ type debPathDecl struct {
 // form is the snapshot's anchor form: the unsigned form gets no row and no
 // coverage (spec C5 safeguard 5 — no package_hash row on any path:
 // adoption here, reconcile through the same call), so it vouches no .deb.
+//
+// A flat suite is materialised by spec C6: its root Packages* members (a
+// member path with no "/") are its Packages directory, and each stanza's
+// literal Filename F gives the row FlatBase(suite) + "/" + F with
+// flat_filename DotClean(F) — the exact row is a real path for `/ /` and
+// `./` sources and a harmless phantom for `sub/` and `a/b/` ones, whose
+// .debs DeclaredHashesForPath's suffix fallback finds by flat_filename.
+//
+// AIDEV-NOTE: the literal F is kept in the path (apt requests
+// <uri>/./x.deb verbatim; validateFilename refused anything that could
+// leave the base), and only a flat row carries a flat_filename: a dists
+// row's "" keeps it out of the fallback's partial index. A flat Release's
+// nested Packages (not an IndexTarget for a flat source, design note 3)
+// counts neither as rows nor in coverage. Sources and pdiff hashing stay
+// dists-only (spec C6): their builders return nothing without a dists
+// repository root.
 func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cache.AnchorForm, allMembers, fetchedMembers []ReleaseMember) (packageHashBuildResult, error) {
 	if form == cache.FormUnsigned {
 		return packageHashBuildResult{}, nil
 	}
+	flat := aptpath.IsFlatSuitePath(suite.SuitePath)
 	repoRoot, ok := repoRootFromSuitePath(suite.SuitePath)
+	if flat {
+		repoRoot, ok = aptpath.FlatBase(suite.SuitePath)+"/", true
+	}
+	// packagesIndex reports whether member path p is one of the suite's
+	// Packages indexes: any Packages* for a dists suite, a root one for a
+	// flat suite.
+	packagesIndex := func(p string, shape func(string) bool) bool {
+		return shape(p) && (!flat || !strings.Contains(p, "/"))
+	}
 	if !ok {
 		a.logger.Info("package_coverage_incomplete",
 			"canonical_host", suite.CanonicalHost,
@@ -2515,7 +2541,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 	pkgDirs := make(map[string]bool)
 	hasParseable := make(map[string]bool)
 	for _, m := range allMembers {
-		if !isPackagesBasename(path.Base(m.Path)) {
+		if !packagesIndex(m.Path, func(p string) bool { return isPackagesBasename(path.Base(p)) }) {
 			continue
 		}
 		dir := path.Dir(m.Path)
@@ -2540,7 +2566,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 	dedup := make(map[string]debPathDecl)
 	noSHA256 := make(map[string]bool)
 	for _, m := range fetchedMembers {
-		if !isPackagesMember(m.Path) {
+		if !packagesIndex(m.Path, isPackagesMember) {
 			continue
 		}
 		body, err := a.readPackagesBlob(m.Path, m.SHA256)
@@ -2638,7 +2664,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 			skippedIncomplete++
 			continue
 		}
-		rows = append(rows, cache.PackageHash{
+		row := cache.PackageHash{
 			CanonicalScheme: suite.CanonicalScheme,
 			CanonicalHost:   suite.CanonicalHost,
 			Path:            debPath,
@@ -2647,7 +2673,11 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 			PackageName:     decl.packageName,
 			Architecture:    decl.architecture,
 			Version:         decl.version,
-		})
+		}
+		if flat {
+			row.FlatFilename = aptpath.DotClean(strings.TrimPrefix(debPath, repoRoot))
+		}
+		rows = append(rows, row)
 	}
 	if skippedIncomplete > 0 {
 		// Observability only — coverage is intentionally NOT downgraded here
