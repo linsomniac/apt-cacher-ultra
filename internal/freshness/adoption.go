@@ -183,6 +183,12 @@ var archFilterBinaryRE = regexp.MustCompile(`(?:^|/)binary-([a-z][a-z0-9]*)/(?:P
 // pseudo-arch "source".
 var archFilterSourceRE = regexp.MustCompile(`(?:^|/)source/(?:Sources(?:\.(?:gz|xz|bz2))?|Sources\.diff/Index)$`)
 
+// flatArchFilterSourceRE matches a flat suite's root Sources index and its
+// pdiff Index (spec C5 flat IndexTargets): the filter scopes them to the
+// pseudo-arch "source" as it does a component's source/Sources. A flat
+// suite's root Packages carries every architecture and is never filtered.
+var flatArchFilterSourceRE = regexp.MustCompile(`^(?:Sources(?:\.(?:gz|xz|bz2))?|Sources\.diff/Index)$`)
+
 // archFilterOptionalRES are the SPEC6_7 §7 filter extension: per-arch
 // OPTIONAL member shapes — Contents (plain and udeb flavor, component
 // or suite-root level), cnf Commands, and dep11 Components. Capture 1
@@ -210,7 +216,17 @@ var archFilterOptionalRES = []*regexp.Regexp{
 // (e.g. Debian's Contents-all) serves clients of EVERY architecture,
 // so no allowlist may filter it — it reports ("", false) like an
 // unfiltered path.
-func archFromFilteredPath(p string) (arch string, filtered bool) {
+//
+// suitePath makes it layout-aware (spec C5 flat IndexTargets; the flat
+// pdiff arch labels of plan design note 4): a flat suite's root Sources,
+// Sources.* and Sources.diff/Index are "source", and its root Packages*
+// and Packages.diff/Index — every architecture in one file, the
+// pseudo-arch "all" — are never filtered. Under a dists suite a root
+// Sources is no shape the filter knows.
+func archFromFilteredPath(suitePath, p string) (arch string, filtered bool) {
+	if aptpath.IsFlatSuitePath(suitePath) && flatArchFilterSourceRE.MatchString(p) {
+		return "source", true
+	}
 	if m := archFilterBinaryRE.FindStringSubmatch(p); m != nil {
 		// The pseudo-arch "all" is the arch-independent IndexTarget
 		// (binary-all/Packages): apt fetches it on EVERY host alongside
@@ -255,6 +271,12 @@ func archFromFilteredPath(p string) (arch string, filtered bool) {
 var indexTargetRE = regexp.MustCompile(
 	`(?:^|/)(?:binary-[a-z][a-z0-9]*/Packages|source/Sources)(?:\.diff/Index|\.[a-z0-9]+)?$`)
 
+// flatIndexTargetRE is indexTargetRE for a flat suite (spec C5): its root
+// Packages* / Sources* (any codec) and their pdiff Index, which a flat
+// Release declares at the suite root — the files apt requests for a
+// `deb <uri>/ /` or `deb <uri> ./` source.
+var flatIndexTargetRE = regexp.MustCompile(`^(?:Packages|Sources)(?:\.diff/Index|\.[a-z0-9]+)?$`)
+
 // isIndexTarget reports whether a Release member's suite-relative path
 // is an apt IndexTarget — a per-arch Packages* / per-component Sources*
 // (any codec) or their pdiff Index, i.e. the files apt actually fetches
@@ -266,7 +288,15 @@ var indexTargetRE = regexp.MustCompile(
 // is set, an integrity/availability failure on a non-IndexTarget member
 // is skipped instead of aborting the whole suite; IndexTargets stay
 // fatal regardless.
-func isIndexTarget(p string) bool {
+//
+// It is layout-aware (spec C5): a flat suite's IndexTargets are its root
+// shapes (flatIndexTargetRE) and nothing else — apt never requests a
+// nested binary-<arch>/Packages for a flat source — and a dists suite's
+// are indexTargetRE's, so a root Packages under a dists suite is none.
+func isIndexTarget(suitePath, p string) bool {
+	if aptpath.IsFlatSuitePath(suitePath) {
+		return flatIndexTargetRE.MatchString(p)
+	}
 	return indexTargetRE.MatchString(p)
 }
 
@@ -277,6 +307,18 @@ func isIndexTarget(p string) bool {
 // "source/Sources"); capture 2 is the arch (empty for source).
 var indexTargetGroupRE = regexp.MustCompile(
 	`(?:^|/)(binary-([a-z][a-z0-9]*)/Packages|source/Sources)(?:\.[a-z0-9]+)?$`)
+
+// flatIndexTargetGroupRE is indexTargetGroupRE for a flat suite: a root
+// Packages or Sources with any (or no) codec; capture 1 is the group key.
+//
+// AIDEV-NOTE: indexTargetRE, flatIndexTargetRE, indexTargetGroupRE, this
+// one and internal/handler's indexTargetPathRE / flatIndexTargetPathRE
+// describe ONE surface — the files apt installs from — in two layouts
+// (spec C5: the root shapes count only for a flat suite). They live in
+// two packages on purpose (no import edge); widen or narrow them
+// together, and keep the layout rule (aptpath.IsFlatSuitePath) the same
+// on both sides.
+var flatIndexTargetGroupRE = regexp.MustCompile(`^(Packages|Sources)(?:\.[a-z0-9]+)?$`)
 
 // indexTargetGroup classifies a Release member path into its SPEC6_7
 // §6 index-target GROUP: all compression variants of one logical index
@@ -290,7 +332,22 @@ var indexTargetGroupRE = regexp.MustCompile(
 // Returns (group key, arch, true) for base IndexTarget shapes — arch
 // is the pseudo-arch "source" for Sources groups — and ("", "", false)
 // for everything else.
-func indexTargetGroup(p string) (group, arch string, ok bool) {
+//
+// It is layout-aware (spec C5): a flat suite's root Packages holds every
+// architecture in one file, so it groups under the pseudo-arch "all",
+// which missingRequestableIndexGroups always requires, and its root
+// Sources under "source"; a dists suite's groups are today's.
+func indexTargetGroup(suitePath, p string) (group, arch string, ok bool) {
+	if aptpath.IsFlatSuitePath(suitePath) {
+		fm := flatIndexTargetGroupRE.FindStringSubmatch(p)
+		switch {
+		case fm == nil:
+			return "", "", false
+		case fm[1] == "Sources":
+			return fm[1], "source", true
+		}
+		return fm[1], "all", true
+	}
 	m := indexTargetGroupRE.FindStringSubmatchIndex(p)
 	if m == nil {
 		return "", "", false
@@ -328,11 +385,14 @@ func indexTargetGroup(p string) (group, arch string, ok bool) {
 // declared-but-unserved foreign-arch IndexTargets (e.g. Ubuntu's
 // binary-armhf, which 404s on the main archive) are legitimately tolerated
 // as 4xx_index_target skips, so they are NOT required here.
-func missingRequestableIndexGroups(declared, fetched []ReleaseMember, allowlist map[string]struct{}) []string {
+//
+// suitePath makes the groups layout-aware (indexTargetGroup): a flat
+// suite's root Packages is its "all" group, required like binary-all.
+func missingRequestableIndexGroups(suitePath string, declared, fetched []ReleaseMember, allowlist map[string]struct{}) []string {
 	// Declared IndexTarget groups whose arch a configured client requests.
 	required := make(map[string]struct{})
 	for _, m := range declared {
-		group, arch, ok := indexTargetGroup(m.Path)
+		group, arch, ok := indexTargetGroup(suitePath, m.Path)
 		if !ok {
 			continue
 		}
@@ -352,7 +412,7 @@ func missingRequestableIndexGroups(declared, fetched []ReleaseMember, allowlist 
 	// A group is served iff at least one of its compression variants was
 	// fetched, so drop every required group the snapshot actually has.
 	for _, m := range fetched {
-		if group, _, ok := indexTargetGroup(m.Path); ok {
+		if group, _, ok := indexTargetGroup(suitePath, m.Path); ok {
 			delete(required, group)
 		}
 	}
@@ -1330,13 +1390,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		// reach upstream — saves bandwidth and pool disk on caches whose
 		// clients only fetch a subset of the upstream's published arches.
 		if a.architectureAllowlist != nil {
-			if arch, filtered := archFromFilteredPath(m.Path); filtered {
+			if arch, filtered := archFromFilteredPath(suite.SuitePath, m.Path); filtered {
 				if _, ok := a.architectureAllowlist[arch]; !ok {
 					a.logger.Warn("adoption_member_skipped",
 						"canonical_host", suite.CanonicalHost,
 						"suite_path", suite.SuitePath,
 						"path", m.Path,
 						"declared_sha256", m.SHA256,
+						"declared_sha512", m.SHA512,
 						"reason", "arch_not_in_allowlist",
 						"architecture", arch,
 					)
@@ -1353,7 +1414,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		// required arch's members are never filtered out above.
 		var requiredGroup string
 		if requiredGroupDeclared != nil {
-			if group, arch, ok := indexTargetGroup(m.Path); ok {
+			if group, arch, ok := indexTargetGroup(suite.SuitePath, m.Path); ok {
 				if _, want := a.requiredArchitectures[arch]; want {
 					requiredGroup = group
 					requiredGroupDeclared[group]++
@@ -1381,7 +1442,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			// IndexTarget members stay fatal regardless (isIndexTarget),
 			// and a local DB fault (ErrAdoptionDBFailed) is never
 			// tolerated — only upstream member fetch/mismatch failures.
-			if a.tolerateOptionalMembers && !isIndexTarget(m.Path) &&
+			if a.tolerateOptionalMembers && !isIndexTarget(suite.SuitePath, m.Path) &&
 				(errors.Is(err, ErrAdoptionMemberFetchFailed) || errors.Is(err, ErrAdoptionMemberMismatch)) {
 				detail := ""
 				var me *AdoptionMemberError
@@ -1393,6 +1454,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 					"suite_path", suite.SuitePath,
 					"path", m.Path,
 					"declared_sha256", m.SHA256,
+					"declared_sha512", m.SHA512,
 					"reason", "optional_member_integrity",
 					"detail", detail,
 				)
@@ -1487,10 +1549,10 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// checked, allowlist or not — a 404-skipped binary-all is the trap
 	// regardless of config — while foreign arches are only required when an
 	// allowlist scopes the cache to them.
-	if missing := missingRequestableIndexGroups(members, fetchedMembers, a.architectureAllowlist); len(missing) > 0 {
+	if missing := missingRequestableIndexGroups(suite.SuitePath, members, fetchedMembers, a.architectureAllowlist); len(missing) > 0 {
 		for _, g := range missing {
 			arch := "all"
-			if _, a2, ok := indexTargetGroup(g); ok {
+			if _, a2, ok := indexTargetGroup(suite.SuitePath, g); ok {
 				arch = a2
 			}
 			a.logger.Error("adoption_blocked_serve_target_missing",
@@ -2169,7 +2231,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 			// lifetime — so operators need to alert on it separately
 			// (and opt into the required_architectures guard).
 			reason := "4xx"
-			if isIndexTarget(m.Path) {
+			if isIndexTarget(suite.SuitePath, m.Path) {
 				reason = "4xx_index_target"
 			}
 			a.logger.Warn("adoption_member_skipped",
@@ -2177,6 +2239,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 				"suite_path", suite.SuitePath,
 				"path", m.Path,
 				"declared_sha256", m.SHA256,
+				"declared_sha512", m.SHA512,
 				"upstream_status", se.Code,
 				"reason", reason,
 			)

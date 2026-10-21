@@ -698,7 +698,7 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 		return
 	}
 	out.needRepair = c.adopter.repairPending(ctx, rp.suite, rp.snapshotID)
-	declared, needReconcile, err := c.adopter.reconcilePending(ctx, rp.snapshotID)
+	declared, needReconcile, err := c.adopter.reconcilePending(ctx, rp.suite, rp.snapshotID)
 	if err != nil {
 		// A fail-closed anchor (R-1 decode error) must be visible, not a
 		// silent non-heal.

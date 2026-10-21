@@ -98,7 +98,7 @@ func (a *Adopter) reconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	if err != nil {
 		return 0, fmt.Errorf("reconcile: list members: %w", err)
 	}
-	missing := missingRequestableMembers(declared, present, a.architectureAllowlist)
+	missing := missingRequestableMembers(suite.SuitePath, declared, present, a.architectureAllowlist)
 	if len(missing) == 0 {
 		a.reconciledSnapshots.Store(snapshotID, struct{}{})
 		return 0, nil
@@ -155,7 +155,7 @@ func (a *Adopter) reconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	// Release its adoption accepted — not client-controlled, so no label
 	// bound needed).
 	for _, m := range healedDecl {
-		if _, arch, ok := indexTargetGroup(m.Path); ok {
+		if _, arch, ok := indexTargetGroup(suite.SuitePath, m.Path); ok {
 			adoptionReconciledTotal.Inc(arch)
 		}
 	}
@@ -167,8 +167,10 @@ func (a *Adopter) reconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 // reuses it: B-28). A memoised snapshot costs nothing; otherwise the
 // trust-anchored Release is re-parsed once, and a complete snapshot is
 // memoised so later checks skip it. The Checker asks before it takes an
-// admission slot, inside the check's recover.
-func (a *Adopter) reconcilePending(ctx context.Context, snapshotID int64) ([]ReleaseMember, bool, error) {
+// admission slot, inside the check's recover. suite is the snapshot's
+// suite: it makes the requestable groups layout-aware (a flat suite's
+// root Packages is required, spec C5).
+func (a *Adopter) reconcilePending(ctx context.Context, suite SuiteRef, snapshotID int64) ([]ReleaseMember, bool, error) {
 	if a.reconcilePendingHook != nil {
 		a.reconcilePendingHook()
 	}
@@ -183,7 +185,7 @@ func (a *Adopter) reconcilePending(ctx context.Context, snapshotID int64) ([]Rel
 	if err != nil {
 		return nil, false, fmt.Errorf("reconcile: list members: %w", err)
 	}
-	if len(missingRequestableMembers(declared, present, a.architectureAllowlist)) == 0 {
+	if len(missingRequestableMembers(suite.SuitePath, declared, present, a.architectureAllowlist)) == 0 {
 		a.reconciledSnapshots.Store(snapshotID, struct{}{})
 		return nil, false, nil
 	}
@@ -293,13 +295,15 @@ func inReleasePlaintext(blob []byte) (text []byte, err error) {
 // AIDEV-NOTE: The conversion from []cache.SnapshotMember to []ReleaseMember
 // is needed because missingRequestableIndexGroups only inspects m.Path, so
 // only Path is populated in the synthetic presentMembers slice. This is
-// safe because missingRequestableIndexGroups only calls indexTargetGroup(m.Path).
-func missingRequestableMembers(declared []ReleaseMember, present []cache.SnapshotMember, allowlist map[string]struct{}) []ReleaseMember {
+// safe because missingRequestableIndexGroups only calls
+// indexTargetGroup(suitePath, m.Path). suitePath makes the groups
+// layout-aware (spec C5: a flat suite's root Packages is required).
+func missingRequestableMembers(suitePath string, declared []ReleaseMember, present []cache.SnapshotMember, allowlist map[string]struct{}) []ReleaseMember {
 	presentMembers := make([]ReleaseMember, len(present))
 	for i, p := range present {
 		presentMembers[i] = ReleaseMember{Path: p.Path}
 	}
-	missingGroups := missingRequestableIndexGroups(declared, presentMembers, allowlist)
+	missingGroups := missingRequestableIndexGroups(suitePath, declared, presentMembers, allowlist)
 	if len(missingGroups) == 0 {
 		return nil
 	}
@@ -309,7 +313,7 @@ func missingRequestableMembers(declared []ReleaseMember, present []cache.Snapsho
 	}
 	var out []ReleaseMember
 	for _, m := range declared {
-		if group, _, ok := indexTargetGroup(m.Path); ok {
+		if group, _, ok := indexTargetGroup(suitePath, m.Path); ok {
 			if _, missing := want[group]; missing {
 				out = append(out, m)
 			}

@@ -814,12 +814,12 @@ func TestIsIndexTarget(t *testing.T) {
 		"InRelease",
 	}
 	for _, p := range indexTargets {
-		if !isIndexTarget(p) {
+		if !isIndexTarget(testDistsSuite, p) {
 			t.Errorf("isIndexTarget(%q) = false, want true", p)
 		}
 	}
 	for _, p := range optional {
-		if isIndexTarget(p) {
+		if isIndexTarget(testDistsSuite, p) {
 			t.Errorf("isIndexTarget(%q) = true, want false", p)
 		}
 	}
@@ -2104,7 +2104,7 @@ func TestArchFromFilteredPath(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotArch, gotFiltered := archFromFilteredPath(tc.path)
+			gotArch, gotFiltered := archFromFilteredPath(testDistsSuite, tc.path)
 			if gotArch != tc.wantArch || gotFiltered != tc.wantFiltered {
 				t.Errorf("archFromFilteredPath(%q) = (%q, %v), want (%q, %v)",
 					tc.path, gotArch, gotFiltered, tc.wantArch, tc.wantFiltered)
@@ -2325,7 +2325,7 @@ func TestMissingRequestableIndexGroups(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := missingRequestableIndexGroups(tc.declared, tc.fetched, tc.allowlist)
+			got := missingRequestableIndexGroups(testDistsSuite, tc.declared, tc.fetched, tc.allowlist)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("missingRequestableIndexGroups() = %v, want %v", got, tc.want)
 			}

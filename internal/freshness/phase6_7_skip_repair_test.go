@@ -672,7 +672,7 @@ func TestIndexTargetGroup(t *testing.T) {
 		{"InRelease", "", "", false},
 	}
 	for _, tc := range cases {
-		group, arch, ok := indexTargetGroup(tc.path)
+		group, arch, ok := indexTargetGroup(testDistsSuite, tc.path)
 		if group != tc.group || arch != tc.arch || ok != tc.ok {
 			t.Errorf("indexTargetGroup(%q) = (%q, %q, %v), want (%q, %q, %v)",
 				tc.path, group, arch, ok, tc.group, tc.arch, tc.ok)

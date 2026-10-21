@@ -25,13 +25,67 @@ func TestMissingRequestableMembers(t *testing.T) {
 	present := []cache.SnapshotMember{{Path: "main/binary-amd64/Packages"}}
 	allow := map[string]struct{}{"amd64": {}}
 
-	got := missingRequestableMembers(declared, present, allow)
+	got := missingRequestableMembers(testDistsSuite, declared, present, allow)
 	want := []ReleaseMember{
 		rm("main/binary-all/Packages", "b"),
 		rm("main/binary-all/Packages.gz", "c"),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("missingRequestableMembers() = %v, want %v", got, want)
+	}
+}
+
+// Spec C5 (layout-aware IndexTargets): reconcile heals a flat suite's root
+// Packages — every declared variant of its "all" group — even with no
+// allowlist; under a dists suite the same root members are no group, and
+// nothing is missing.
+func TestMissingRequestableMembers_Flat(t *testing.T) {
+	rm := func(path, sha string) ReleaseMember { return ReleaseMember{Path: path, SHA256: sha} }
+	declared := []ReleaseMember{rm("Packages", "a"), rm("Packages.gz", "b"), rm("Sources.gz", "c")}
+	present := []cache.SnapshotMember{{Path: "Sources.gz"}}
+	want := []ReleaseMember{rm("Packages", "a"), rm("Packages.gz", "b")}
+	if got := missingRequestableMembers(testFlatSuite, declared, present, nil); !reflect.DeepEqual(got, want) {
+		t.Errorf("flat: missingRequestableMembers() = %v, want %v", got, want)
+	}
+	if got := missingRequestableMembers(testDistsSuite, declared, present, nil); got != nil {
+		t.Errorf("dists: missingRequestableMembers() = %v, want nil", got)
+	}
+}
+
+// Spec C5 (layout-aware IndexTargets) on the reconcile side: a flat
+// snapshot that lost its root Packages members is pending a reconcile —
+// its "all" group is required with no allowlist — and the heal fetches
+// both variants back into the same snapshot.
+func TestReconcileSnapshot_HealsAFlatSuitesPackages(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newReconcileAdopter(t, env, nil)
+	suite := SuiteRef{CanonicalScheme: "https", CanonicalHost: "pkgs.k8s.io", SuitePath: testFlatSuite}
+	trackSuite(t, env.cache, suite)
+	pkgs := fakePackagesStanzas(map[string]string{"amd64/kubelet_1.deb": strings.Repeat("a", 64)})
+	gz := gzipBytes(pkgs)
+	rel, hashes := makeRelease(map[string][]byte{"Packages": pkgs, "Packages.gz": gz})
+	base := "https://pkgs.k8s.io" + testFlatSuite + "/"
+	env.fetcher.put(base+"Packages", pkgs)
+	env.fetcher.put(base+"Packages.gz", gz)
+	if err := ad.Run(ctx, suite, simtest.ClearsignedFixture(string(rel)), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	snapID := currentID(t, env.cache, suite)
+	if err := env.cache.DeleteSnapshotMembersForTest(ctx, snapID, "Packages", "Packages.gz"); err != nil {
+		t.Fatal(err)
+	}
+	if _, pending, err := ad.reconcilePending(ctx, suite, snapID); err != nil || !pending {
+		t.Fatalf("reconcilePending = %v, %v; want the flat suite's missing Packages pending", pending, err)
+	}
+	if n, err := ad.ReconcileSnapshot(ctx, suite, snapID, false); err != nil || n != 2 {
+		t.Fatalf("ReconcileSnapshot = %d, %v; want both Packages variants healed", n, err)
+	}
+	paths := snapshotPaths(t, env.cache, snapID)
+	for _, m := range []string{"Packages", "Packages.gz"} {
+		if paths[m] != hashes[m] {
+			t.Errorf("healed %s = %q, want %q", m, paths[m], hashes[m])
+		}
 	}
 }
 
@@ -237,8 +291,9 @@ func TestReconcileSnapshot_RejectsCorruptedAnchor(t *testing.T) {
 		t.Fatalf("corrupt anchor: %v", err)
 	}
 
-	if _, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, false); err == nil {
-		t.Error("ReconcileSnapshot accepted a corrupted (hash-mismatched) anchor blob — must reject")
+	// Deferred minor D-27: refused by the hash check, not by anything else.
+	if _, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, false); err == nil || !strings.Contains(err.Error(), "hash mismatch") {
+		t.Errorf("ReconcileSnapshot = %v; want the corrupted (hash-mismatched) anchor blob refused by its hash check", err)
 	}
 }
 
