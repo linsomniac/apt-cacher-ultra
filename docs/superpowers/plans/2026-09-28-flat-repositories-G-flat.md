@@ -5711,7 +5711,7 @@ Expected: PASS (the refactor changes no behaviour: `TestServeHTTP_CreatingMissMa
 | `runFetch`'s creation without its cached anchors | `TestServeHTTP_CreatingMissMarksCachedSignedAnchors` (`Release miss = 200; want the row created and its cached Release.gpg marked`) |
 | `runFetch` drops the re-stamp | `TestServeHTTP_AdoptionDisabledSeedParity` (`after the refresh miss check=… success=…, want the second miss's second …`) |
 
-`TestServeHTTP_StrictCanceledBetweenTheLookups` also asserts that the canceled hit asked upstream nothing; no single-site mutant moves that count (a canceled hit that fell through to the miss path would fail its fetch on the ended context before dialling), so the assertion documents the property.
+`TestServeHTTP_StrictCanceledBetweenTheLookups` also asserts that the canceled hit asked upstream nothing; no single-site mutant moves that count: a canceled hit that fell through to the miss path would meet the miss's pre-fetch strict gate, which refuses the unvouched `.deb` before any fetch (`runFetch`'s `DeclaredHashesForPath` check; the miss fetch itself runs on `h.lifecycleCtx`, not the request's context), so the assertion documents the property.
 
 - [ ] **Step 6: Commit**
 
