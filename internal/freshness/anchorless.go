@@ -291,7 +291,7 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 				return
 			}
 			c.logger.Warn("freshness: delete anchorless rows failed",
-				"err", err, "canonical_host", host, "suite_path", suitePath)
+				"err", err, "canonical_scheme", suite.CanonicalScheme, "canonical_host", host, "suite_path", suitePath)
 			// Task 10 review M4: a failed delete is no answer. The one
 			// transaction deleted nothing, so its 404s and 410s stop
 			// counting, as a failed RefreshURLPathBlob makes its row
@@ -334,7 +334,7 @@ func (c *Checker) noteAnchorlessOverCap(suite SuiteRef, path string) {
 		return
 	}
 	c.logger.Warn("freshness: anchorless index over its size cap, dropped for the miss path",
-		"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "path", path,
+		"canonical_scheme", suite.CanonicalScheme, "canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "path", path,
 		"max_bytes", maxAnchorlessIndexBytes, "suppressed", suppressed)
 }
 

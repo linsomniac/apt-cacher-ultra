@@ -74,7 +74,7 @@ func TestServeHTTP_FlatHostRootIsUnsupportedAndSaysSo(t *testing.T) {
 		get("/repo/InRelease") // a flat suite: no line
 		recs := logs.find("flat_host_root_unsupported")
 		if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["path"] != "/InRelease" ||
-			recs[0]["canonical_host"] != "root.example" || recs[0]["suppressed"] != float64(0) {
+			recs[0]["canonical_scheme"] != "http" || recs[0]["canonical_host"] != "root.example" || recs[0]["suppressed"] != float64(0) {
 			t.Fatalf("flat_host_root_unsupported = %v, want one WARN for /InRelease, suppressed 0", recs)
 		}
 		time.Sleep(time.Minute)

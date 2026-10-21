@@ -29,6 +29,7 @@ func (h *Handler) noteFlatHostRoot(req *proxy.Request) {
 		return
 	}
 	h.logger.Warn("flat_host_root_unsupported",
+		"canonical_scheme", req.CanonicalScheme,
 		"canonical_host", req.CanonicalHost,
 		"path", req.Path,
 		"suppressed", suppressed,

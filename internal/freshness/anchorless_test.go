@@ -911,8 +911,9 @@ func TestCheck_AnchorlessOverCapIndexIsDroppedForTheMissPath(t *testing.T) {
 			t.Fatalf("Packages row %+v, want it dropped for the miss path", u)
 		}
 		recs := logRecords(t, r.logs, overCapMsg)
-		if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["path"] != "/fury/Packages" {
-			t.Fatalf("over-cap lines %v, want one WARN naming /fury/Packages", recs)
+		if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["path"] != "/fury/Packages" ||
+			recs[0]["canonical_scheme"] != "http" || recs[0]["suite_path"] != "/fury" {
+			t.Fatalf("over-cap lines %v, want one WARN naming http /fury and /fury/Packages", recs)
 		}
 		grown := []byte("Package: a\nFilename: a.deb\n\nPackage: b\nFilename: b.deb\n")
 		r.cacheRow("Packages", grown, 2, rigStart, rigETag(grown)) // the client's miss, uncapped
@@ -1291,8 +1292,9 @@ BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`); err != nil {
 			if got := r.lastResult(); got != tc.result {
 				t.Fatalf("result %q, want %s", got, tc.result)
 			}
-			if n := strings.Count(r.logs.String(), `"msg":"freshness: delete anchorless rows failed"`); n != 1 {
-				t.Fatalf("%d delete failure WARNs, want 1", n)
+			if recs := logRecords(t, r.logs, "freshness: delete anchorless rows failed"); len(recs) != 1 ||
+				recs[0]["level"] != "WARN" || recs[0]["canonical_scheme"] != "http" || recs[0]["suite_path"] != "/fury" {
+				t.Fatalf("delete failure lines %v, want one WARN naming http /fury", recs)
 			}
 			if after := r.listed(); !slices.Equal(after, before) {
 				t.Fatalf("rows %v after the check, want %v: the delete failed", after, before)
@@ -1327,8 +1329,8 @@ func (r *flatRig) listed() []string {
 // The Task 10 review's M5, as ruling PG-32 amends it: a flat suite's
 // metadata rows are read once, with its anchors, before the host slot and
 // the probe tree, so a read fault there follows checkFirst's convention for
-// a local read fault before any request — one WARN naming the suite per
-// trigger, no probe, no index request, no delete and no
+// a local read fault before any request — one WARN naming the suite (and
+// its scheme) per trigger, no probe, no index request, no delete and no
 // write (no check stamp, no streak, no record): the next check tries
 // again. Read after the probe tree, the fault re-sent the InRelease and
 // Release probes at every trigger (the final review's concurrency lens
@@ -1349,8 +1351,8 @@ func TestCheck_AnchorlessIndexReadFaultIsALocalFault(t *testing.T) {
 	}
 	warns := logRecords(t, r.logs, "freshness: read anchor rows failed")
 	for _, m := range warns {
-		if m["level"] != "WARN" || m["suite_path"] != "/fury" {
-			t.Fatalf("read failure line %v, want a WARN naming /fury", m)
+		if m["level"] != "WARN" || m["suite_path"] != "/fury" || m["canonical_scheme"] != "http" {
+			t.Fatalf("read failure line %v, want a WARN naming http /fury", m)
 		}
 	}
 	if len(warns) != 5 || r.lastResult() != "" {

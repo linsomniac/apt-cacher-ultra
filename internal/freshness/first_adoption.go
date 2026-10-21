@@ -287,7 +287,7 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 	if err != nil {
 		if !c.endedByShutdown(ctx, suite, "read the anchor rows", err) {
 			c.logger.Warn("freshness: read anchor rows failed",
-				"err", err, "canonical_host", host, "suite_path", suitePath)
+				"err", err, "canonical_scheme", suite.CanonicalScheme, "canonical_host", host, "suite_path", suitePath)
 		}
 		return nil
 	}
