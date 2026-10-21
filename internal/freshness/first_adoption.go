@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
@@ -192,8 +193,10 @@ func (t probeTree) signatureSeen() bool {
 
 // checkFirst is spec C4 Dispatch 3 (adopter wired, no current snapshot).
 // A suite without client interest in the last 7 days, or without a
-// client-created InRelease or Release url_path row, is dormant: no request
-// and no write (the scheduler does not queue it either, see suiteDue). A
+// client-created InRelease or Release url_path row — or, for a flat suite,
+// root Packages*/Sources* row (Adopter.flatIndexClientCreated) — is
+// dormant: no request and no write (the scheduler does not queue it
+// either, see suiteDue). A
 // suite whose record is active and not due is paced (pacedFirst): no
 // request between the scheduler's refresh checks, except the scheduler's
 // slot-driven re-offer of the parked suite (offered: the check's
@@ -234,13 +237,16 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 		return nil
 	}
 	rows, clientCreated, err := c.cachedAnchors(ctx, suite)
+	if err == nil && !clientCreated && aptpath.IsFlatSuitePath(suitePath) {
+		clientCreated, err = c.adopter.flatIndexClientCreated(ctx, suite)
+	}
 	if err != nil {
 		c.logger.Warn("freshness: read anchor rows failed",
 			"err", err, "canonical_host", host, "suite_path", suitePath)
 		return nil
 	}
 	if !clientCreated {
-		c.logger.Debug("freshness: never-adopted suite without a client-created anchor row, dormant",
+		c.logger.Debug("freshness: never-adopted suite without a client-created anchor or flat index row, dormant",
 			"canonical_host", host, "suite_path", suitePath)
 		return nil
 	}
