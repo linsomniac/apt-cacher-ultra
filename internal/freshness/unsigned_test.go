@@ -498,7 +498,7 @@ func TestRunUnsigned_FirstAdoptionOfTheServedReleaseSkipsTheBarrier(t *testing.T
 // barrier event says refused, and nothing is logged at WARN or above.
 // The E carry-forward (phase G): the same when the signed anchor and its
 // marker arrive through the ./ twin of the flat suite /repo, whose base
-// the twin shares.
+// the twin shares — and the refusal leaves the twin's own rows alone.
 func TestCheck_UnsignedRefusedInsideTheCommitIsAState(t *testing.T) {
 	t.Run("the suite's own anchor", func(t *testing.T) { unsignedRefusedInsideTheCommit(t, "", "") })
 	t.Run("the ./ twin's anchor", func(t *testing.T) { unsignedRefusedInsideTheCommit(t, "/repo", "/repo/.") })
@@ -564,6 +564,22 @@ func unsignedRefusedInsideTheCommit(t *testing.T, suite, served string) {
 		chk.WaitForAdoptions()
 		if !r.marked() || r.current() != 0 {
 			t.Fatalf("marked %v, current %d; want the served anchor's marker and no unsigned snapshot", r.marked(), r.current())
+		}
+		if served != r.suite.SuitePath {
+			// Review Focus 5 (ruling R-G4): refusing /repo never touches
+			// its twin's rows — /repo/. keeps no record and no snapshot,
+			// and the InRelease served under it stays cached.
+			tw, err := r.c.GetSuiteFreshness(ctx, "http", "h", served)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tw.AdoptionFailReason != nil || tw.CurrentSnapshotID != nil {
+				t.Fatalf("%s: record %q, current %v; want its row untouched by %s's refusal",
+					served, strOf(tw.AdoptionFailReason), tw.CurrentSnapshotID, r.suite.SuitePath)
+			}
+			if u, err := r.c.LookupURL(ctx, "http", "h", served+"/InRelease"); err != nil || u.BlobHash == nil {
+				t.Fatalf("%s/InRelease: %+v, %v; want it still cached", served, u, err)
+			}
 		}
 		sf, err := r.c.GetSuiteFreshness(ctx, "http", "h", r.suite.SuitePath)
 		if err != nil {
