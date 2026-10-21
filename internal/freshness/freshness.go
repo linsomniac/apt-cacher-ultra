@@ -259,8 +259,9 @@ type Checker struct {
 	unlockDroppedHook func(key string)
 
 	// recordHook, when set (tests only), runs in recordAdoptionFailure
-	// right before the record is written.
-	recordHook func()
+	// right before the record is written; recordReadHook right before the
+	// suite row is read.
+	recordHook, recordReadHook func()
 
 	lastClockStepLog atomic.Int64 // monotonic ns since processStart of the last clock_step_detected line
 }

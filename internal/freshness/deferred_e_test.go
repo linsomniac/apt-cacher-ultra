@@ -148,6 +148,24 @@ func TestAdoptionFailureRecordCutByShutdownIsNotAWarning(t *testing.T) {
 	}
 }
 
+// Deferred minor E-36 (B-20's remainder): a shutdown that cuts the failure
+// record's read short is not a WARN either; it is logged at DEBUG.
+func TestAdoptionFailureRecordReadCutByShutdownIsNotAWarning(t *testing.T) {
+	r := newRetryRig(t, 0)
+	bad := r.release("bad", 0)
+	r.ver.reject(hashOf(bad))
+	r.up.set(bad)
+	r.checker.recordReadHook = r.cancelLifetime // shutdown begins right before the read
+	r.check()
+	recs := r.events("adoption_failure_record_failed")
+	if len(recs) != 1 || recs[0]["level"] != "DEBUG" {
+		t.Fatalf("adoption_failure_record_failed lines %v; want one at DEBUG for the read shutdown cut short", recs)
+	}
+	if r.row().AdoptionFailCount != 0 {
+		t.Fatal("a record was written after shutdown began")
+	}
+}
+
 // Deferred minor B-28: a tick's heal parses the snapshot's pinned Release
 // once — the decision's parse is reused.
 func TestCheck_ReconcileOnTheTickParsesTheReleaseOnce(t *testing.T) {

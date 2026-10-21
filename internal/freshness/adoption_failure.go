@@ -40,6 +40,9 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 	}
 	ctx, cancel := context.WithTimeout(c.lifetimeCtx, failureRecordTimeout)
 	defer cancel()
+	if c.recordReadHook != nil {
+		c.recordReadHook()
+	}
 	cur, err := c.cache.GetSuiteFreshness(ctx, s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
 	if err != nil {
 		// AIDEV-NOTE: WARN, ErrNotFound included (final review spec m9).
@@ -53,8 +56,14 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 		// handed the lock to, before it releases it (spawnAdoption's
 		// goroutine and its deferred recoverAdoption). A caller without the
 		// mutex would break this. A missing row is a bug, not a routine reap
-		// during the check or adoption, so it is not demoted to DEBUG.
-		c.logger.Warn("adoption_failure_record_failed",
+		// during the check or adoption, so it is not demoted to DEBUG. A
+		// shutdown that cut the read short is no fault, as for the write
+		// below (deferred minor E-36, B-20's remainder): DEBUG.
+		level := slog.LevelWarn
+		if c.lifetimeCtx.Err() != nil {
+			level = slog.LevelDebug
+		}
+		c.logger.Log(ctx, level, "adoption_failure_record_failed",
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath, "err", err)
 		return
 	}
