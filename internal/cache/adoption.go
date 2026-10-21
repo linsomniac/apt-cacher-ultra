@@ -913,9 +913,12 @@ type DeclaredHash struct {
 // AIDEV-NOTE: the fallback is a constraint lookup, not a grant: a row it
 // finds only lets bytes through that hash to a signed declaration, and it
 // never runs when an exact row exists (so a dists suite's vouching is
-// unchanged). Its cost — one partial-index query — is paid by every
-// .deb no exact row vouches, which includes every .deb of a host with no
-// flat suite (an empty index range per name).
+// unchanged). Its cost — one partial-index query of at most 32 names — is
+// paid by every non-metadata request no exact row covers, including every
+// .deb of a host with no flat suite (an empty index range per name): on
+// the hit path once, on a miss twice (the pre-fetch gate and the
+// post-fetch dispatch), and once more for a strict-mode re-run after an
+// adoption wait.
 func (c *Cache) DeclaredHashesForPath(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
 	out, err := c.declaredHashesExact(ctx, scheme, host, path)
 	if err != nil || len(out) > 0 {

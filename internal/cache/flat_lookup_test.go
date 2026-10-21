@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"database/sql"
 	"slices"
 	"strings"
 	"testing"
@@ -55,6 +56,7 @@ func TestDeclaredHashesForPath_FlatShapes(t *testing.T) {
 	deeper := deep + "/e" // 31 segments
 	adopt(deeper, pkgRow(deeper+"/x/z_1_amd64.deb", hashOf('8'), "x/z_1_amd64.deb"))
 	adopt("/a/flat2", pkgRow("/a/flat2/flat/x_1_amd64.deb", hashOf('9'), "flat/x_1_amd64.deb"))
+	adopt("/ubuntu/dists/noble", pkgRow("/ubuntu/pool/main/f/foo_1_amd64.deb", hashOf('e'), ""))
 	for _, tc := range []struct {
 		name, path string
 		want       []string
@@ -75,7 +77,11 @@ func TestDeclaredHashesForPath_FlatShapes(t *testing.T) {
 		{"a sibling a Filename names", "/a/flat/x_1_amd64.deb", []string{"9@/a/flat2"}},
 		{"a prefix of the base's last segment", "/fla/amd64/x_1_amd64.deb", nil},
 		{"an unrelated base", "/other/files/sublime_4180_amd64.deb", nil},
-		{"a dists suite's pool", "/ubuntu/pool/main/f/foo_1_amd64.deb", nil},
+		{"a dists suite's pool, exact", "/ubuntu/pool/main/f/foo_1_amd64.deb", []string{"e@/ubuntu/dists/noble"}},
+		// DotClean gives exactly the dists row's path, but a dists row's
+		// flat_filename is "": it never answers the fallback.
+		{"a dists row never answers the fallback", "/ubuntu/./pool/main/f/foo_1_amd64.deb", nil},
+		{"a dists row under another base", "/mirror/ubuntu/pool/main/f/foo_1_amd64.deb", nil},
 	} {
 		if got := declared(t, c, tc.path); !slices.Equal(got, tc.want) {
 			t.Errorf("%s: DeclaredHashesForPath(%s) = %v, want %v", tc.name, tc.path, got, tc.want)
@@ -106,6 +112,41 @@ func TestDeclaredHashesForPath_TheMostSpecificBaseWins(t *testing.T) {
 	}
 }
 
+// Spec C6 step 2 keeps EVERY row at the longest B, so step 3's dispatch
+// sees two signed suites at one base that declare different hashes for one
+// Filename, and refuses them as package_hash_conflict, instead of answering
+// with whichever row SQLite returned first: the twins of residual 2 reached
+// by a "./" request that misses their exact rows, and two channels of one
+// host-root repository (Sublime's apt/stable and apt/dev, B = ""). A
+// shorter B never joins the tie.
+func TestDeclaredHashesForPath_TiesAtTheLongestBaseAreAllKept(t *testing.T) {
+	c := openCache(t)
+	for _, a := range []struct {
+		suite string
+		row   PackageHash
+	}{
+		{"/t", pkgRow("/t/x_1_amd64.deb", hashOf('a'), "x_1_amd64.deb")},
+		{"/t/.", pkgRow("/t/x_1_amd64.deb", hashOf('b'), "x_1_amd64.deb")},
+		{"/u", pkgRow("/u/t/x_1_amd64.deb", hashOf('f'), "t/x_1_amd64.deb")}, // B = "": shorter
+		{"/apt/stable", pkgRow("/apt/stable/files/s_1_amd64.deb", hashOf('c'), "files/s_1_amd64.deb")},
+		{"/apt/dev", pkgRow("/apt/dev/files/s_1_amd64.deb", hashOf('d'), "files/s_1_amd64.deb")},
+	} {
+		seedRow(t, c, sk("h", a.suite), 1)
+		adoptPackages(t, c, sk("h", a.suite), []PackageHash{a.row}, true)
+	}
+	for _, tc := range []struct {
+		name, path string
+		want       []string
+	}{
+		{"the twins through ./", "/t/./x_1_amd64.deb", []string{"a@/t", "b@/t/."}},
+		{"two channels at the host root", "/files/s_1_amd64.deb", []string{"c@/apt/stable", "d@/apt/dev"}},
+	} {
+		if got := declared(t, c, tc.path); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: DeclaredHashesForPath(%s) = %v, want every row at the longest base %v", tc.name, tc.path, got, tc.want)
+		}
+	}
+}
+
 // Spec C6 "current signed non-retired snapshots only": the fallback sees
 // neither an unsigned snapshot's rows (spec C5 safeguard 5) nor a
 // displaced snapshot's.
@@ -132,6 +173,49 @@ func TestDeclaredHashesForPath_TheFallbackReadsCurrentSignedSnapshotsOnly(t *tes
 	for _, p := range []string{"/unsigned/u_1_amd64.deb", "/displaced/d_1_amd64.deb"} {
 		if got := declared(t, c, p); got != nil {
 			t.Errorf("DeclaredHashesForPath(%s) = %v, want nothing", p, got)
+		}
+	}
+}
+
+// Spec C6 "non-retired": a snapshot retired through either retirement
+// path — the legacy audit's quarantine and the reaper's delete — vouches
+// nothing, by its exact rows or through the fallback, although its
+// package_hash rows are still there. Both paths clear the current pointer
+// before they stamp retired_at; this pins that against a future
+// retirement path that leaves the pointer set.
+func TestDeclaredHashesForPath_ARetiredSnapshotVouchesNothing(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	quarantined, reaped := sk("h", "/quarantined"), sk("h", "/reaped")
+	seedRow(t, c, quarantined, 1)
+	seedRow(t, c, reaped, 1)
+	qID := adoptPackages(t, c, quarantined, []PackageHash{pkgRow("/quarantined/./q_1_amd64.deb", hashOf('a'), "q_1_amd64.deb")}, true)
+	rID := adoptPackages(t, c, reaped, []PackageHash{pkgRow("/reaped/./r_1_amd64.deb", hashOf('b'), "r_1_amd64.deb")}, true)
+	paths := []string{"/quarantined/./q_1_amd64.deb", "/quarantined/q_1_amd64.deb", "/reaped/./r_1_amd64.deb", "/reaped/r_1_amd64.deb"}
+	for _, p := range paths {
+		if got := declared(t, c, p); len(got) != 1 {
+			t.Fatalf("before retiring: DeclaredHashesForPath(%s) = %v, want one row", p, got)
+		}
+	}
+	if _, err := c.ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision{{SnapshotID: qID, Outcome: LegacyAuditQuarantine}}); err != nil {
+		t.Fatal(err)
+	}
+	if del, _, err := c.ReapIdleSuite(ctx, reaped, &rID, ReapRegardless); err != nil || !del {
+		t.Fatalf("ReapIdleSuite = %v, %v; want the suite reaped", del, err)
+	}
+	for _, id := range []int64{qID, rID} {
+		var retired sql.NullInt64
+		if err := c.db.QueryRowContext(ctx, `SELECT retired_at FROM suite_snapshot WHERE snapshot_id = ?`, id).Scan(&retired); err != nil || !retired.Valid {
+			t.Fatalf("snapshot %d: retired_at %v, %v; want it retired", id, retired, err)
+		}
+		var rows int
+		if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM package_hash WHERE snapshot_id = ?`, id).Scan(&rows); err != nil || rows != 1 {
+			t.Fatalf("snapshot %d: %d package_hash rows, %v; want its row still there", id, rows, err)
+		}
+	}
+	for _, p := range paths {
+		if got := declared(t, c, p); got != nil {
+			t.Errorf("after retiring: DeclaredHashesForPath(%s) = %v, want nothing", p, got)
 		}
 	}
 }
@@ -168,14 +252,23 @@ const suiteFreshnessByKey = "SEARCH sf USING INDEX sqlite_autoindex_suite_freshn
 // flat_filename (spec C6: "an EXPLAIN QUERY PLAN assertion pins it"), and
 // probes suite_freshness by its primary key, never scanning it (design
 // review M-2).
+//
+// It is pinned at every IN size production builds, up to the worst case
+// (maxFallbackSegments names), and no table is scanned.
 func TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex(t *testing.T) {
 	c := openCache(t)
-	plan := queryPlan(t, c, declaredBySuffixSQL(3), "http", "h", "a/b.deb", "b.deb", "x/a/b.deb")
-	if !strings.Contains(plan, "USING INDEX idx_package_hash_flat_filename") {
-		t.Fatalf("query plan does not use idx_package_hash_flat_filename:\n%s", plan)
-	}
-	if !strings.Contains(plan, suiteFreshnessByKey) || strings.Contains(plan, "SCAN sf") {
-		t.Fatalf("query plan does not probe suite_freshness by its key:\n%s", plan)
+	for _, n := range []int{1, 3, maxFallbackSegments} {
+		args := []any{"http", "h"}
+		for i := range n {
+			args = append(args, strings.Repeat("d/", i)+"b.deb")
+		}
+		plan := queryPlan(t, c, declaredBySuffixSQL(n), args...)
+		if !strings.Contains(plan, "USING INDEX idx_package_hash_flat_filename") {
+			t.Fatalf("n=%d: query plan does not use idx_package_hash_flat_filename:\n%s", n, plan)
+		}
+		if !strings.Contains(plan, suiteFreshnessByKey) || strings.Contains(plan, "SCAN ") {
+			t.Fatalf("n=%d: query plan scans a table or does not probe suite_freshness by its key:\n%s", n, plan)
+		}
 	}
 }
 
@@ -184,7 +277,7 @@ func TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex(t *testing.T) {
 func TestDeclaredHashesForPath_TheExactLookupProbesSuiteFreshnessByItsKey(t *testing.T) {
 	c := openCache(t)
 	plan := queryPlan(t, c, declaredExactSQL, "http", "h", "/a/b.deb")
-	if !strings.Contains(plan, suiteFreshnessByKey) || strings.Contains(plan, "SCAN sf") {
-		t.Fatalf("query plan does not probe suite_freshness by its key:\n%s", plan)
+	if !strings.Contains(plan, suiteFreshnessByKey) || strings.Contains(plan, "SCAN ") {
+		t.Fatalf("query plan scans a table or does not probe suite_freshness by its key:\n%s", plan)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -13,11 +14,13 @@ import (
 // strictSnap is one current snapshot of a strict matrix row: its suite,
 // its coverage, and its package_hash rows — each .deb's path (at the
 // suite's FlatBase, as spec C6 materialises it) and flat_filename ("" for
-// a dists/ row) — declaring the strict rig upstream's bytes.
+// a dists/ row) — declaring the strict rig upstream's bytes, or the bytes
+// other when it is set.
 type strictSnap struct {
 	suite    string
 	complete bool
 	debs     map[string]string
+	other    string
 }
 
 // commitStrictSnap adopts s on host through the cache (an inline
@@ -35,10 +38,14 @@ func commitStrictSnap(t *testing.T, h *Handler, scheme, host string, s strictSna
 	if err != nil {
 		t.Fatal(err)
 	}
+	declared := sha256Hex([]byte("upstream bytes"))
+	if s.other != "" {
+		declared = sha256Hex([]byte(s.other))
+	}
 	var rows []cache.PackageHash
 	for path, flat := range s.debs {
 		rows = append(rows, cache.PackageHash{SnapshotID: id, CanonicalScheme: scheme, CanonicalHost: host, Path: path,
-			FlatFilename: flat, DeclaredSHA256: sha256Hex([]byte("upstream bytes"))})
+			FlatFilename: flat, DeclaredSHA256: declared})
 	}
 	if err := h.cache.CommitAdoption(ctx, id, []cache.SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: inrel,
 		DeclaredSHA256: inrel}}, nil, rows, nil, s.complete); err != nil {
@@ -173,5 +180,52 @@ func TestServeHTTP_CurrentSnapshotCountCountsFlatSnapshots(t *testing.T) {
 	refused := logs.find("unvouched_deb_refused")
 	if rec.Code != http.StatusBadGateway || len(refused) != 1 || refused[0]["current_snapshot_count"] != float64(3) {
 		t.Fatalf("status %d, refusals %v; want 502 with current_snapshot_count 3", rec.Code, refused)
+	}
+}
+
+// Spec C6 step 3 through the suffix fallback (the Task 5 review's
+// Important 1): two signed current suites at one base that declare
+// different hashes for one Filename are a package_hash_conflict — 502,
+// Retry-After 60, refused before upstream is asked — never an
+// order-dependent answer. The twins of residual 2 reached by a "./"
+// request that misses their exact rows, and two channels of a host-root
+// repository (Sublime's apt/stable and apt/dev, B = "").
+func TestServeHTTP_AFallbackTieIsAConflict(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		snaps []strictSnap
+		path  string
+	}{
+		{"the twins through ./", []strictSnap{
+			{suite: "/t", complete: true, debs: map[string]string{"/t/x_1_amd64.deb": "x_1_amd64.deb"}},
+			{suite: "/t/.", complete: true, debs: map[string]string{"/t/x_1_amd64.deb": "x_1_amd64.deb"}, other: "newer bytes"},
+		}, "/t/./x_1_amd64.deb"},
+		{"two channels at the host root", []strictSnap{
+			{suite: "/apt/stable", complete: true, debs: map[string]string{"/apt/stable/files/s_1_amd64.deb": "files/s_1_amd64.deb"}},
+			{suite: "/apt/dev", complete: true, debs: map[string]string{"/apt/dev/files/s_1_amd64.deb": "files/s_1_amd64.deb"}, other: "dev bytes"},
+		}, "/files/s_1_amd64.deb"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			h, srv, logs := newPhase3StrictHandlerCapturing(t, true, true, &hits)
+			scheme, host, port := splitURL(t, srv.URL)
+			canon := hostKey(host, port)
+			for _, s := range tc.snaps {
+				commitStrictSnap(t, h, scheme, canon, s)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, proxyReq("GET", srv.URL, tc.path))
+			conflicts := logs.find("package_hash_conflict")
+			if rec.Code != http.StatusBadGateway || rec.Header().Get("Retry-After") != "60" || len(conflicts) != 1 {
+				t.Fatalf("status %d, Retry-After %q, package_hash_conflict %v; want 502, 60 and one conflict line",
+					rec.Code, rec.Header().Get("Retry-After"), conflicts)
+			}
+			if d, _ := conflicts[0]["declared"].([]any); len(d) != 2 {
+				t.Fatalf("conflict declared %v, want both suites' rows", conflicts[0]["declared"])
+			}
+			if n := hits.Load(); n != 0 {
+				t.Fatalf("upstream asked %d times, want 0 (the conflict is refused before the fetch)", n)
+			}
+		})
 	}
 }
