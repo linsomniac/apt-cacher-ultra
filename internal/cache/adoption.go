@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	sqlite "modernc.org/sqlite"
 
@@ -893,20 +894,61 @@ type DeclaredHash struct {
 // the §6.1 hit-path dispatch; the conflict log surface shows every row
 // (snapshot id included) so an operator can trace which adoptions
 // disagreed.
+//
+// Spec C6: the exact lookup runs first, and only when it finds no row the
+// suffix fallback (declaredHashesBySuffix) looks the path up by a flat
+// suite's flat_filename — apt requests a flat repository's .deb at
+// <uri>/<Filename>, <uri> any ancestor-or-self of the Release directory.
+//
+// AIDEV-NOTE: the fallback is a constraint lookup, not a grant: a row it
+// finds only lets bytes through that hash to a signed declaration, and it
+// never runs when an exact row exists (so a dists suite's vouching is
+// unchanged). Its cost — one partial-index query — is paid by every
+// .deb no exact row vouches, which includes every .deb of a host with no
+// flat suite (an empty index range per name).
 func (c *Cache) DeclaredHashesForPath(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
-	// AIDEV-NOTE: spec C5 safeguard 5 — an unsigned snapshot never vouches
-	// a .deb. Adoption builds no package_hash rows for one; the form
-	// filter keeps any that exist out (defence in depth).
-	const q = `
+	out, err := c.declaredHashesExact(ctx, scheme, host, path)
+	if err != nil || len(out) > 0 {
+		return out, err
+	}
+	return c.declaredHashesBySuffix(ctx, scheme, host, path)
+}
+
+// declaredExactSQL is the exact lookup's query (spec C6 step 1): the
+// current signed snapshots' rows of (scheme, host) whose path is the
+// request path, with the row's suite path.
+//
+// AIDEV-NOTE: spec C5 safeguard 5 — an unsigned snapshot never vouches
+// a .deb. Adoption builds no package_hash rows for one; the form
+// filter keeps any that exist out (defence in depth).
+//
+// AIDEV-NOTE: design review M-2 (phase G). Both lookups (this query and
+// declaredBySuffixSQL) join suite_freshness on its primary key — the
+// snapshot's own suite, read from suite_snapshot — and current_snapshot_id,
+// never on current_snapshot_id alone: that column has no index, so the
+// bare join scanned suite_freshness once per matched row (up to
+// max_suites rows for each current, displaced or retired snapshot that
+// declares the name). A snapshot belongs to its suite_snapshot row's
+// suite, so the key terms change no answer.
+// TestDeclaredHashesForPath_TheExactLookupProbesSuiteFreshnessByItsKey and
+// TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex pin both plans.
+const declaredExactSQL = `
 SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name, sf.suite_path
   FROM package_hash p
-  JOIN suite_freshness sf ON sf.current_snapshot_id = p.snapshot_id
   JOIN suite_snapshot ss  ON ss.snapshot_id = p.snapshot_id
+  JOIN suite_freshness sf ON sf.canonical_scheme    = ss.canonical_scheme
+                         AND sf.canonical_host      = ss.canonical_host
+                         AND sf.suite_path          = ss.suite_path
+                         AND sf.current_snapshot_id = p.snapshot_id
  WHERE p.canonical_scheme = ?
    AND p.canonical_host   = ?
    AND p.path             = ?
    AND ss.anchor_form    <> 'unsigned'`
-	rows, err := c.db.QueryContext(ctx, q, scheme, host, path)
+
+// declaredHashesExact is DeclaredHashesForPath's exact lookup (spec C6
+// step 1): the rows whose path is path.
+func (c *Cache) declaredHashesExact(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
+	rows, err := c.db.QueryContext(ctx, declaredExactSQL, scheme, host, path)
 	if err != nil {
 		return nil, fmt.Errorf("DeclaredHashesForPath: %w", err)
 	}
@@ -921,6 +963,121 @@ SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name, sf.suite_path
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("DeclaredHashesForPath iter: %w", err)
+	}
+	return out, nil
+}
+
+// maxFallbackSegments bounds spec C6's suffix fallback: a dot-cleaned
+// request path of more segments is never looked up by suffix (a constant;
+// it also bounds the fallback query's IN list).
+const maxFallbackSegments = 32
+
+// flatSplits returns spec C6's splits of a request path for the suffix
+// fallback: P' = aptpath.DotClean(path) cut as B + "/" + F at every
+// segment boundary, from the host root (B = "") to the parent of the
+// last segment, as parallel slices. It returns nothing when P' is not
+// absolute, has an empty or ".." segment, or has more than
+// maxFallbackSegments segments (a ".." could step a request outside the
+// base its row is kept for).
+func flatSplits(path string) (bases, names []string) {
+	p := aptpath.DotClean(path)
+	if !strings.HasPrefix(p, "/") {
+		return nil, nil
+	}
+	segs := strings.Split(p[1:], "/")
+	if len(segs) > maxFallbackSegments {
+		return nil, nil
+	}
+	for _, s := range segs {
+		if s == "" || s == ".." {
+			return nil, nil
+		}
+	}
+	for i := range segs {
+		b := ""
+		if i > 0 {
+			b = "/" + strings.Join(segs[:i], "/")
+		}
+		bases = append(bases, b)
+		names = append(names, strings.Join(segs[i:], "/"))
+	}
+	return bases, names
+}
+
+// declaredBySuffixSQL is the suffix fallback's query for n names: the
+// current signed snapshots' flat rows of (scheme, host) whose
+// flat_filename is one of them, with the row's suite path.
+//
+// AIDEV-NOTE: the term requiring a non-empty flat_filename is what lets
+// SQLite use the partial index idx_package_hash_flat_filename (whose WHERE
+// is the same term); without it every lookup scans the host's rows. The
+// suite_freshness join is declaredExactSQL's: by its primary key (design
+// review M-2).
+// TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex pins the plan.
+func declaredBySuffixSQL(n int) string {
+	return `
+SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name, sf.suite_path, p.flat_filename
+  FROM package_hash p
+  JOIN suite_snapshot ss  ON ss.snapshot_id = p.snapshot_id
+  JOIN suite_freshness sf ON sf.canonical_scheme    = ss.canonical_scheme
+                         AND sf.canonical_host      = ss.canonical_host
+                         AND sf.suite_path          = ss.suite_path
+                         AND sf.current_snapshot_id = p.snapshot_id
+ WHERE p.canonical_scheme = ?
+   AND p.canonical_host   = ?
+   AND p.flat_filename   <> ''
+   AND p.flat_filename IN (` + strings.TrimSuffix(strings.Repeat("?, ", n), ", ") + `)
+   AND ss.anchor_form    <> 'unsigned'`
+}
+
+// declaredHashesBySuffix is spec C6's suffix fallback (step 2): for every
+// split B + "/" + F of the dot-cleaned path (flatSplits), the current
+// signed snapshots' rows whose flat_filename is F, kept iff B is an
+// ancestor-or-self of the row's suite's FlatBase; of the kept rows, those
+// with the longest B — the most specific base — are returned. A path
+// flatSplits refuses has no fallback.
+func (c *Cache) declaredHashesBySuffix(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
+	bases, names := flatSplits(path)
+	if len(names) == 0 {
+		return nil, nil
+	}
+	baseOf := make(map[string]string, len(names))
+	args := make([]any, 0, len(names)+2)
+	args = append(args, scheme, host)
+	for i, n := range names {
+		baseOf[n] = bases[i]
+		args = append(args, n)
+	}
+	rows, err := c.db.QueryContext(ctx, declaredBySuffixSQL(len(names)), args...)
+	if err != nil {
+		return nil, fmt.Errorf("DeclaredHashesForPath fallback: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var (
+		out  []DeclaredHash
+		best = -1
+	)
+	for rows.Next() {
+		var (
+			d    DeclaredHash
+			name string
+		)
+		if err := rows.Scan(&d.DeclaredSHA256, &d.SnapshotID, &d.PackageName, &d.SuitePath, &name); err != nil {
+			return nil, fmt.Errorf("DeclaredHashesForPath fallback scan: %w", err)
+		}
+		b, ok := baseOf[name]
+		if !ok || !strings.HasPrefix(aptpath.FlatBase(d.SuitePath)+"/", b+"/") {
+			continue
+		}
+		switch {
+		case len(b) > best:
+			best, out = len(b), []DeclaredHash{d}
+		case len(b) == best:
+			out = append(out, d)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("DeclaredHashesForPath fallback iter: %w", err)
 	}
 	return out, nil
 }
