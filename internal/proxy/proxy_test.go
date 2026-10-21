@@ -887,3 +887,38 @@ func TestParse_MirrorModeControlBytesAndEncoding(t *testing.T) {
 		t.Errorf("mirror UpstreamURL = %q, want %q", req.UpstreamURL, want)
 	}
 }
+
+// Ruling PG-2: a Debian pool artifact's basename is never metadata,
+// whatever prefix it starts with — a package named icons-foo, a flat
+// repository's Packages_1.0_all.deb — in a dists/ pool or a flat directory.
+func TestIsMetadata_PoolArtifactsAreNeverMetadata(t *testing.T) {
+	for _, base := range []string{"icons-foo_1.0_all.deb", "Packages_1.0_all.deb", "Sources-x_1.0_amd64.udeb",
+		"Contents-y_1.0_amd64.ddeb", "icons-theme_2.0.dsc", "icons-theme_2.0.orig.tar.xz", "icons-theme_2.0-1.debian.tar.xz",
+		"icons-theme_2.0-1.diff.gz", "Translation-z_1.0_amd64.buildinfo", "Components-w_1.0_amd64.changes"} {
+		for _, dir := range []string{"/ubuntu/pool/main/i/icons-theme/", "/repo/flat/"} {
+			if IsMetadata(dir + base) {
+				t.Errorf("IsMetadata(%q) = true, want false (a pool artifact)", dir+base)
+			}
+		}
+	}
+}
+
+// Ruling PG-2's other side: every real metadata basename stays metadata,
+// and by-hash and .diff/Index keep their rules.
+func TestIsMetadata_RealMetadataNamesStayMetadata(t *testing.T) {
+	for _, base := range []string{"Packages", "Packages.xz", "Sources.gz", "Contents-amd64.gz", "Contents-udeb-amd64.gz",
+		"Contents-source.gz", "Translation-en.bz2", "Translation-pt_BR.xz", "Components-amd64.yml.gz", "icons-48x48.tar.gz",
+		"icons-64x64@2.tar.gz", "InRelease", "Release", "Release.gpg"} {
+		for _, dir := range []string{"/ubuntu/dists/noble/main/", "/repo/flat/"} {
+			if !IsMetadata(dir + base) {
+				t.Errorf("IsMetadata(%q) = false, want true", dir+base)
+			}
+		}
+	}
+	for _, p := range []string{"/ubuntu/dists/noble/main/binary-amd64/by-hash/SHA256/icons-foo_1.0_all.deb",
+		"/repo/flat/Packages.diff/Index"} {
+		if !IsMetadata(p) {
+			t.Errorf("IsMetadata(%q) = false, want true", p)
+		}
+	}
+}

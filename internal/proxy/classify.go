@@ -19,6 +19,23 @@ var metadataPrefixes = []string{
 	"icons-",
 }
 
+// poolArtifactSuffixes are the extensions of Debian pool artifacts: a
+// basename ending in one is never metadata (isPoolArtifact, ruling PG-2).
+var poolArtifactSuffixes = []string{".deb", ".udeb", ".ddeb", ".dsc", ".buildinfo", ".changes", ".diff.gz"}
+
+// isPoolArtifact reports whether base names a Debian pool artifact: one of
+// poolArtifactSuffixes, or a source tarball — a "_" and a ".tar." component
+// (foo_1.0.orig.tar.xz, foo_1.0-1.debian.tar.xz). icons-48x48.tar.gz (no
+// "_") and Translation-pt_BR.xz (no ".tar.") stay metadata.
+func isPoolArtifact(base string) bool {
+	for _, s := range poolArtifactSuffixes {
+		if strings.HasSuffix(base, s) {
+			return true
+		}
+	}
+	return strings.Contains(base, "_") && strings.Contains(base, ".tar.")
+}
+
 // metadataExact lists exact filenames that classify a path as metadata.
 var metadataExact = map[string]struct{}{
 	"InRelease":   {},
@@ -55,6 +72,21 @@ func IsMetadata(p string) bool {
 		if strings.HasSuffix(dir, ".diff") {
 			return true
 		}
+	}
+	// AIDEV-NOTE: ruling PG-2 (phase G). The prefixes below collide with
+	// real package names — a package icons-foo puts
+	// pool/…/icons-foo_1.0_all.deb under "icons-", and a flat repository
+	// may publish Packages_1.0_all.deb — and a pool artifact classified as
+	// metadata is freshness-revalidated, never hash-checked and never
+	// refused by strict mode. So an artifact's basename is never metadata,
+	// whatever its prefix; by-hash and .diff/Index keep their rules above.
+	// Residual: a url_path row an earlier binary stored for such a .deb
+	// keeps is_metadata = 1 until it is refetched; serving and strict mode
+	// read the request's classification (this function), so only the
+	// admin page's hot paths (their Kind column and JSON is_metadata)
+	// show the stale flag.
+	if isPoolArtifact(base) {
+		return false
 	}
 	for _, prefix := range metadataPrefixes {
 		if strings.HasPrefix(base, prefix) {

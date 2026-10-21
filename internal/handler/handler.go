@@ -196,6 +196,9 @@ type Handler struct {
 	rejections seedRejections
 	seedWarn   seedWarn
 
+	// flatRoot is flat_host_root_unsupported's rate limiter (spec C2).
+	flatRoot flatRootWarn
+
 	// cachedAnchorsHook, when set (tests only), runs right after
 	// cachedAnchors' read: the window in which a changed anchor row makes
 	// a creation unproven.
@@ -445,6 +448,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logRequest(r, "", "", "bad_request", http.StatusBadRequest, 0, false, 0, start)
 		return
 	}
+	// Spec C2: a flat repository at the host root gets no suite; say so
+	// (rate-limited) and serve the request as before.
+	if req.IsMetadata && req.SuitePath == "" && aptpath.IsFlatHostRootPath(req.Path) {
+		h.noteFlatHostRoot(req)
+	}
 
 	// Spec C3: what this request knows about its suite's row, threaded
 	// through the hit, miss and stale paths. Its barrier token's Done runs
@@ -619,8 +627,8 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		// request-log archaeology dig). by-hash / pdiff / optional members
 		// are excluded — apt has fallbacks, so they are not on their own a
 		// broken update.
-		if isIndexTargetPath(memberPath) {
-			arch := archFromPath(memberPath)
+		if isIndexTargetPath(req.SuitePath, memberPath) {
+			arch := indexTargetArch(req.SuitePath, memberPath)
 			h.logger.Warn("snapshot_index_target_404",
 				"canonical_host", req.CanonicalHost,
 				"suite_path", req.SuitePath,
@@ -2670,20 +2678,48 @@ func archFromPath(p string) string {
 // not on its own "apt update is broken."
 //
 // AIDEV-NOTE: keep in lockstep with internal/freshness indexTargetGroupRE
-// (the adoption-side group key). The two live in different packages on
-// purpose (no import edge), but they describe the SAME surface — the
-// files apt installs from. Widen/narrow them together.
+// and flatIndexTargetGroupRE (the adoption-side group keys). They live in
+// different packages on purpose (no import edge), but they describe the
+// SAME surface — the files apt installs from — in two layouts, and the
+// layout rule (spec C5: the root shapes count only for a flat suite,
+// aptpath.IsFlatSuitePath) is the same on both sides. Widen/narrow them
+// together.
 var indexTargetPathRE = regexp.MustCompile(
 	`(?:^|/)(?:binary-[a-z][a-z0-9]*/Packages|source/Sources)(?:\.[a-z0-9]+)?$`)
 
-// isIndexTargetPath reports whether a request path is an apt IndexTarget
-// (see indexTargetPathRE). The handler increments a dedicated counter and
-// emits an alertable WARN when it serves an authoritative "not in
-// snapshot" 404 for one of these — the direct, cause-agnostic signal that
-// a client's `apt update` is broken against the current snapshot (the
-// 2026-06-14 binary-all incident's symptom).
-func isIndexTargetPath(p string) bool {
+// flatIndexTargetPathRE is indexTargetPathRE for a flat suite: its root
+// Packages* / Sources* (spec C5), which the handler sees as bare
+// suite-relative member paths ("Packages.gz"). No pdiff Index, as above.
+var flatIndexTargetPathRE = regexp.MustCompile(`^(?:Packages|Sources)(?:\.[a-z0-9]+)?$`)
+
+// isIndexTargetPath reports whether a suite-relative member path of
+// suitePath is an apt IndexTarget (see indexTargetPathRE; layout-aware,
+// spec C5: a flat suite's are its root Packages*/Sources* only, and a
+// root Packages under a dists suite is none). The handler increments a
+// dedicated counter and emits an alertable WARN when it serves an
+// authoritative "not in snapshot" 404 for one of these — the direct,
+// cause-agnostic signal that a client's `apt update` is broken against
+// the current snapshot (the 2026-06-14 binary-all incident's symptom).
+func isIndexTargetPath(suitePath, p string) bool {
+	if aptpath.IsFlatSuitePath(suitePath) {
+		return flatIndexTargetPathRE.MatchString(p)
+	}
 	return indexTargetPathRE.MatchString(p)
+}
+
+// indexTargetArch is the architecture label of an IndexTarget member path
+// of suitePath for the snapshot_index_target_404 alert (the flat arch
+// labels of plan design note 4): a flat suite's root Packages carries
+// every architecture (the pseudo-arch "all"), its root Sources is
+// "source"; any other path takes archFromPath's label.
+func indexTargetArch(suitePath, p string) string {
+	if aptpath.IsFlatSuitePath(suitePath) {
+		if strings.HasPrefix(p, "Sources") {
+			return "source"
+		}
+		return "all"
+	}
+	return archFromPath(p)
 }
 
 // knownArchLabels bounds the cardinality of the
