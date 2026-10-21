@@ -1143,8 +1143,15 @@ func TestServeHTTP_BackstopIsBoundedBeforeTheBody(t *testing.T) {
 				if rec.Code != http.StatusOK || !ran {
 					t.Fatalf("hit=%v: status %d, backstop ran %v; want 200 after a backstop", hit, rec.Code, ran)
 				}
-				if elapsed != backstopTimeout {
-					t.Fatalf("hit=%v: served after %v, want after the backstop's %v bound (apt gives up at 30 s)", hit, elapsed, backstopTimeout)
+				// Deferred minor E-67: the miss's backstop is bounded by
+				// backstopTimeout, onboarding's by the deadline it shares
+				// with its creation (onboardTimeout).
+				want := backstopTimeout
+				if hit {
+					want = onboardTimeout
+				}
+				if elapsed != want {
+					t.Fatalf("hit=%v: served after %v, want after the backstop's %v bound (apt gives up at 30 s)", hit, elapsed, want)
 				}
 				// Both anchor reads (InRelease, Release.gpg) fail on the ended
 				// context and are logged; the base stays unmarked.

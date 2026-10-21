@@ -79,6 +79,10 @@ type seedRejections struct {
 	closed bool
 	// onPanic reports a panic recovered in the timer's goroutine.
 	onPanic func(v any)
+	// sweepHook, when set (tests only), runs in expire under the lock:
+	// a hook that panics stands in for a sweep that does
+	// (TestSeedRejections_ExpireRecoversItsPanic, deferred minor D-31).
+	sweepHook func()
 }
 
 // rejected reports whether key was refused a row within seedRejectTTL.
@@ -135,6 +139,9 @@ func (s *seedRejections) expire() {
 	s.timer = nil
 	if s.closed {
 		return
+	}
+	if s.sweepHook != nil {
+		s.sweepHook()
 	}
 	s.sweepLocked(true)
 	seedRejectedSuites.Set(float64(len(s.until)))
@@ -265,6 +272,39 @@ func readHead(path string, n int) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(f, int64(n)))
 }
 
+// signedAnchorNames are the cached anchors whose sniff earns a suite's
+// base a signed-seen marker (spec C3), relative to the suite.
+var signedAnchorNames = []string{"/InRelease", "/Release.gpg"}
+
+// readCachedAnchor reads the url_path row of the suite's cached anchor p
+// and sniffs its pool file here, outside the writer (ruling PD-5). row is
+// nil when there is no row (err nil) or the url_path read failed; a row
+// without a blob is returned unsigned; err is the url_path or pool read's
+// error (row is then the row, or nil).
+//
+// AIDEV-NOTE: deferred minor D-32. This is the one reading of "is this
+// cached anchor signed" that cachedAnchors (the creating transaction's
+// marks) and markCachedSignedAnchors (the backstop) share: the two must
+// agree, or a creation would prove an anchor the backstop then refuses to
+// mark, or the reverse.
+func (h *Handler) readCachedAnchor(ctx context.Context, key cache.SuiteKey, p string) (row *cache.URLPath, signed bool, err error) {
+	row, err = h.cache.LookupURL(ctx, key.CanonicalScheme, key.CanonicalHost, p)
+	switch {
+	case errors.Is(err, cache.ErrNotFound):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, err
+	case row.BlobHash == nil:
+		return row, false, nil
+	}
+	file := aptpath.ClassifySuiteFile(key.SuitePath, p)
+	head, err := readHead(h.cache.BlobPath(*row.BlobHash), file.HeadBytes())
+	if err != nil {
+		return row, false, err
+	}
+	return row, file.Sniff(p, head), nil
+}
+
 // cachedAnchors reads the suite's signed-anchor url_path rows —
 // <suite>/InRelease and <suite>/Release.gpg, but not except, the path this
 // request stores itself — and sniffs each blob here, outside the writer,
@@ -284,27 +324,19 @@ func readHead(path string, n int) ([]byte, error) {
 // existing tracked suite's anchor writes none.
 func (h *Handler) cachedAnchors(ctx context.Context, key cache.SuiteKey, except string) []cache.CachedAnchor {
 	var out []cache.CachedAnchor
-	for _, name := range []string{"/InRelease", "/Release.gpg"} {
+	for _, name := range signedAnchorNames {
 		p := key.SuitePath + name
 		if p == except {
 			continue
 		}
 		a := cache.CachedAnchor{Path: p}
-		row, err := h.cache.LookupURL(ctx, key.CanonicalScheme, key.CanonicalHost, p)
+		row, signed, err := h.readCachedAnchor(ctx, key, p)
 		switch {
-		case errors.Is(err, cache.ErrNotFound):
 		case err != nil:
 			h.logger.Warn("suite cached anchor read failed",
 				"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath, "path", p)
-		case row.BlobHash != nil:
-			file := aptpath.ClassifySuiteFile(key.SuitePath, p)
-			head, err := readHead(h.cache.BlobPath(*row.BlobHash), file.HeadBytes())
-			if err != nil {
-				h.logger.Warn("suite cached anchor read failed",
-					"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath, "path", p)
-				break
-			}
-			a.BlobHash, a.SeenAt, a.Signed = *row.BlobHash, row.LastUse(), file.Sniff(p, head)
+		case row != nil && row.BlobHash != nil:
+			a.BlobHash, a.SeenAt, a.Signed = *row.BlobHash, row.LastUse(), signed
 		}
 		out = append(out, a)
 	}
@@ -314,21 +346,21 @@ func (h *Handler) cachedAnchors(ctx context.Context, key cache.SuiteKey, except 
 	return out
 }
 
-// backstopTimeout bounds markCachedSignedAnchors where it runs before the
-// body — after an unproven creation on the miss path and after onboarding
-// (which shares one deadline with its creation, onboardTimeout) — under
-// apt's 30 s inactivity timeout (Task 9 review, controller addition d). It
-// bounds the database steps; the pool reads (readHead, at most HeadBytes
-// of a local file) take no context (deferred minor D-37). On a timeout the
-// backstop's reads or its write fail and are logged WARN, and the body is
-// served.
+// backstopTimeout bounds markCachedSignedAnchors after an unproven creation
+// on the miss path (through missBackstopDeadline), under apt's 30 s
+// inactivity timeout (Task 9 review, controller addition d). Onboarding's
+// backstop does not use it: it runs to the deadline it shares with its
+// creation (onboardTimeout; deferred minor E-67). It bounds the database
+// steps; the pool reads (readHead, at most HeadBytes of a local file) take
+// no context (deferred minor D-37). On a timeout the backstop's reads or
+// its write fail and are logged WARN, and the body is served.
 const backstopTimeout = 5 * time.Second
 
-// missBodyBudget bounds, from a miss's start, how long it may wait before
-// its body (design review M-15): the fetch, the store and a flip's hold of
-// the just-created suite (at most flipgate.HoldMax) come first, then the
-// backstop of an unproven creation, and apt gives up after 30 s without a
-// byte.
+// missBodyBudget is the latest, counted from a miss's start, its backstop
+// may run (design review M-15; missBackstopDeadline): the fetch, the store
+// and a flip's hold of the just-created suite (at most flipgate.HoldMax)
+// come first, bounded by their own timeouts, and apt gives up after 30 s
+// without a byte. Only the backstop honours it (deferred minor E-67).
 const missBodyBudget = 25 * time.Second
 
 // missBackstopDeadline is the miss path's backstop deadline:
@@ -364,30 +396,18 @@ func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKe
 		h.backstopHook(ctx)
 	}
 	var marks []cache.SignedSeenMark
-	for _, name := range []string{"/InRelease", "/Release.gpg"} {
+	for _, name := range signedAnchorNames {
 		p := key.SuitePath + name
 		if p == except {
 			continue
 		}
-		row, err := h.cache.LookupURL(ctx, key.CanonicalScheme, key.CanonicalHost, p)
-		switch {
-		case errors.Is(err, cache.ErrNotFound):
-			continue
-		case err != nil:
-			h.logger.Warn("suite signed-seen backstop read failed",
-				"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath, "path", p)
-			continue
-		case row.BlobHash == nil:
-			continue
-		}
-		file := aptpath.ClassifySuiteFile(key.SuitePath, p)
-		head, err := readHead(h.cache.BlobPath(*row.BlobHash), file.HeadBytes())
+		row, signed, err := h.readCachedAnchor(ctx, key, p)
 		if err != nil {
 			h.logger.Warn("suite signed-seen backstop read failed",
 				"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath, "path", p)
 			continue
 		}
-		if !file.Sniff(p, head) {
+		if !signed {
 			continue
 		}
 		seen := row.LastUse()
@@ -427,8 +447,10 @@ func (h *Handler) registerLate(r *http.Request, req *proxy.Request, sr *suiteReq
 // together (design review M8; deferred minor D-35): the body waits on
 // both, and between them on a flip's hold of the just-created suite (at
 // most flipgate.HoldMax, 20 s, reachable since eager first adoption), so
-// the worst case stays at 25 s, under apt's 30 s inactivity timeout. On a
-// timeout the hit serves untracked, as on any onboarding error.
+// the worst case stays at 25 s, under apt's 30 s inactivity timeout. A
+// creation the deadline cuts short serves the hit untracked, as on any
+// onboarding error; a backstop it cuts short logs WARN and serves the hit
+// tracked (deferred minor E-67).
 const onboardTimeout = 5 * time.Second
 
 // onboard creates, before the body is served, the row of an untracked
@@ -460,7 +482,7 @@ func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blo
 	// One deadline for the creation and the backstop (D-35), under the
 	// handler's lifecycle so a graceful shutdown cuts both short (D-34).
 	deadline := time.Now().Add(onboardTimeout)
-	res, shared, _ := h.sf.Do(key, func() sfResult { return h.runOnboard(r, req, sr, deadline) })
+	res, shared, _ := h.sf.Do(key, func() sfResult { return h.runOnboard(req, sr, deadline) })
 	if !res.suiteTracked {
 		return nil
 	}
@@ -478,7 +500,7 @@ func (h *Handler) onboard(r *http.Request, req *proxy.Request, sr *suiteReq, blo
 // on the suite: it reports in suiteTracked whether the suite has a row now
 // (created, or found), and in unproven whether the creation needs the
 // backstop.
-func (h *Handler) runOnboard(r *http.Request, req *proxy.Request, sr *suiteReq, deadline time.Time) sfResult {
+func (h *Handler) runOnboard(req *proxy.Request, sr *suiteReq, deadline time.Time) sfResult {
 	now := wallclock.Unix()
 	seed := h.suiteSeed(sr, false, "", "", now)
 	if sr.file.Marks() {

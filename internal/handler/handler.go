@@ -210,6 +210,13 @@ type Handler struct {
 	// (TestServeHTTP_BackstopIsBoundedBeforeTheBody).
 	backstopHook func(ctx context.Context)
 
+	// strictLookupHook, when set (tests only), runs on the hit path between
+	// its two strict-mode lookups — after DeclaredHashesForPath found no row
+	// for a .deb, before the host's coverage read — the one window in which
+	// the request's context can end with the first lookup done
+	// (TestServeHTTP_StrictCanceledBetweenTheLookups, deferred minor E-71).
+	strictLookupHook func()
+
 	// existsReads counts anchorStart's registration reads (tests: deferred
 	// minor C-23, no read while the barrier is off); suiteExistsForTest,
 	// when set (tests only), answers them instead of the cache.
@@ -1049,6 +1056,9 @@ func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, r
 		if !isDebPath(req.Path) {
 			return false, "", 0, 0, false, packageValidation{}
 		}
+		if h.strictLookupHook != nil {
+			h.strictLookupHook()
+		}
 		switch sm, snapID, count := h.classifyStrictMode(r.Context(),
 			req.CanonicalScheme, req.CanonicalHost); sm {
 		case strictCanceled:
@@ -1475,7 +1485,15 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 		// is refused at once. A client that left while it waited gets no
 		// retry (it ends client_canceled). The refusal is logged once per
 		// fetch, by the singleflight leader (design review O1), as
-		// runFetch logged it before phase E.
+		// runFetch logged it before phase E. Two accepted residuals: the
+		// retry can re-join the call it retries — its leader signals Done
+		// before it deletes the key, deliberately — and read that call's
+		// stale errUnvouchedRetryable, at worst one spurious refusal, the
+		// outcome before phase E (deferred minor E-57); and the retry's
+		// call replaces shared and waiters, so the first call's
+		// "singleflight coalesced" line is not logged and a joiner
+		// refused off the first call logs no unvouched_deb_refused of its
+		// own (log attribution only; deferred minor E-60).
 		waited := h.adoptions != nil && h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost, start)
 		switch {
 		case r.Context().Err() != nil:
@@ -1512,7 +1530,11 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	// contact. Only the creating request fires (a coalesced waiter shares
 	// its result), and only with adoption enabled: without it a created
 	// row is the Phase 1 observation seed (TestServeHTTP_AdoptionDisabledSeedParity).
-	// The hit path fires T1 after onboarding already (ruling PD-11).
+	// The hit path fires T1 after onboarding already (ruling PD-11). A
+	// creating miss whose late registration finds a snapshot current (it
+	// waited in a hold, or a flip committed just before it) is served
+	// through trySnapshotHit, which fires T1 too: the seed T1 then is a
+	// cooldown skip, one mutex peek (deferred minor E-64).
 	if res.created && !shared && h.adoptionEnabled {
 		defer h.maybeFireFreshness(req)
 	}
@@ -2156,12 +2178,14 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 			if file.Marks() {
 				fetched.MarkSeenAt = now
 			}
+			seed := h.suiteSeed(sr, true, fres.ETag, fres.LastModified, now) // deferred minor D-32: built once
 			if !trackedAtStart && file.CreatesRow(h.adoptionEnabled) && !h.rejections.rejected(sr.key) {
-				fetched.Create = h.suiteSeed(sr, true, fres.ETag, fres.LastModified, now)
-				fetched.Create.Cached = h.cachedAnchors(dbCtx, sr.key, req.Path)
+				create := *seed
+				create.Cached = h.cachedAnchors(dbCtx, sr.key, req.Path)
+				fetched.Create = &create
 			}
 			if file == aptpath.FileInRelease && !h.adoptionEnabled {
-				fetched.Restamp = h.suiteSeed(sr, true, fres.ETag, fres.LastModified, now)
+				fetched.Restamp = seed
 			}
 		}
 	}
