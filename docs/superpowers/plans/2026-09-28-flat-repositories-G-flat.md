@@ -29,7 +29,7 @@ Conventions in this plan:
 - Each task's **Interfaces** block lists what it uses from other tasks and existing test files. Never redefine a helper: a second definition in the same package does not compile.
 - Each commit step starts with `gofmt -l <files>`; it must print nothing. Run `gofmt -w` on the non-drift files a step edits before that check; never on the five drift files.
 - A "verify failure" step whose expected result is a compile failure is complete when the compiler names the undefined identifiers listed; such a step runs `go test -gcflags=-e …` so every error is listed.
-- Mutation checks are run one at a time, each reverted before the next; record each failing test line in the commit message. Every mutation table in this plan was replayed on a scratch copy of the tree (the red steps and the green runs too); each row names the test line that failed there.
+- Mutation checks are run one at a time, each reverted before the next; record each failing test line in the commit message. Every mutation table in this plan was replayed on a scratch copy of the tree (the red steps and the green runs too); each row names the test line that failed there. The rows the fix round added after the task reviews were run as `go test -overlay` mutants on the fixed tree, and quote the lines that failed there.
 - Edits to existing files are given as exact `old`/`new` blocks (or a whole function that replaces the one of the same name); each `old` block occurs once in the file as it stands after the previous tasks.
 - **Existing tests that change.** The flat grammar makes the key `/flat/.` canonical, so `TestDeleteSuiteMetadata_ANonCanonicalKeyDeletesNothing` (Task 1) uses a twin of a twin (`/flat/./.`), which no grammar produces, for its non-canonical flat key. The IndexTarget predicates gain a suite-path argument (Task 2): their table tests (`TestIsIndexTarget`, `TestIndexTargetGroup`, `TestArchFromFilteredPath`, `TestMissingRequestableIndexGroups`, `TestMissingRequestableMembers`, the handler's `TestIsIndexTargetPath`) pass a `dists/` suite for their existing rows and gain flat rows. `ParsePackages` accepts a body whose stanzas all lack a SHA256 (ruling R-G1): `TestParsePackages_NonEmptyButNoUsableStanzas` keeps its no-Filename body, and its comment no longer calls an empty component an error. url_path metadata answers `max(pool mtime, last_fetched_at)` as `Last-Modified` (Task 10): no existing test pinned the pool mtime alone. The admin JSON gains `suites[].flat` (Task 14): `TestJSONContractPreserved`'s golden is regenerated, an additive change the contract allows. Existing tests the deferred minors and carry-forwards strengthen, each named in its task: Task 8's onboarding backstop test (`suite_rows_test.go`), Task 10's `rigUpstream.before` and `rigStart` (E-47, `retry_rig_test.go`), Task 11's `TestServeHTTP_UnsignedNeverChangesStrictPosture` (E-70), Task 12's `TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem` (flat rows), Task 13's `TestCheck_UnsignedRefusedInsideTheCommitIsAState` (the twin variant), `TestRunUnsigned_RemarkMarksTheTwinsBase` (E-16) and the re-mark fault assertions (E-17), and Task 14's `TestSuitesTable_RendersRecordsAndCounts` and the JSON fixture (B-59). The plan reviews' rulings change three expectations of the draft's own tests, each said in its task: design review M-7 makes `TestCheck_AnchorlessSniffRejectionKeepsTheRow` and `TestCheck_AnchorlessAnswersByStatus/401` and `/403` failed checks (Task 10), and ruling PG-7 moves `/junk-anchors` to kept in `TestReaper_ReapsAJunkAnchorlessFlatSuite` (Task 12). Any other existing test that fails means the change is wrong.
 
@@ -61,25 +61,37 @@ Controller rulings after the plan reviews (binding; the design review's I-1–I-
 - **PG-15** — the exec review in full: G10-1 (Task 10's Step 2 text), G15-1 (Task 15's backoff oracle: P1's written-out schedule, bounded by one tick), the five nits, P1–P7; P7 composes with M-7 (design note 10), P2 with M-1.
 - **PG-16** — PG-2 goes in Task 6, with its proxy tables and handler test. **PG-17** — PG-1 as the exec prototype applies it, with PG-10's mechanics; the overview's two open decisions on the knob and `IsMetadata` are not added. **PG-18** — the 90-day simulation and the minted-suites test re-measured after PG-7 (R-G5).
 
+Controller rulings on the reviser's items, the per-task reviews and the fix round (binding; the task reviews are in the SDD workspace, `task-*-review.md`; the fix round applied them, one commit per task):
+
+- **PG-19** — the reviser's seven controller-attention items accepted: P7's reading (a check is `anchorless_refreshed` iff a row was replaced or deleted, anchors included); PG-1's record keyed `anchorAbsentKey`; an unchanged plain `Contents-*` keeps its new validators (a real bug M-1's rule left; fixed and tested); the sniff runs before the byte compare, so an unchanged cached captive page is a failed check, and a changed plain `Contents-*` is deleted and no answer (M-7); `freshness.go` touches the `Checker` type and `New` only (A-56 stays H's); the budgets hold (`TestSimScheduler_FiveHundredStallingOneHealthy` is C-38, H's); the rig upstream fails a request whose context has ended (test-only). Design notes 9–11; Task 10.
+- **PG-20 — an index-only flat suite probes beside its index row** (the Task 9 review's Important): a flat suite active only through a client-created root index row, with no cached anchor row to model its probe URLs on, probes its `InRelease` and `Release` at sibling URLs of that row's stored `upstream_url`, so the scheme and a non-default port survive (spec C1: new probe code derives sibling URLs from a stored `upstream_url` where one exists); the `urlReconstruct` AIDEV-NOTE calls reconstruction the probes' last resort. Cost if wrong: about ten lines. Task 9 (the code); Task 10 (its test, which also asserts the refresh's request).
+- **PG-21** — `ParseSources` keeps `validateMemberPath` although spec C5 says "Packages/Sources Filenames" (the Task 3 review's Minor 3): harmless for flat suites (no source rows, C6). A deferred item for H, GD-2: align `ParseSources` with C5 or correct C5's wording.
+- **PG-22 — one log limiter** (the Task 6 review's Important, plan-mandated): one mutex-guarded `observability.LogLimiter` replaces the three copies of the one-line-a-minute limiter (`suite_seed_rejected`, `flat_host_root_unsupported`, the anchorless over-cap WARN). The interval is an argument to `Allow`, not a field: the handler tests build `Handler` literals. Cost if wrong: a mechanical swap in phase D's `seedWarn`. Task 6; Task 10 uses it.
+- **PG-23** — spec revision 10 drops `flat` from C11's new log fields: `flat` is the admin `suites[]` field, and every suite line's `suite_path` already shows the layout. Cost if wrong: no `flat=true` log filter. Task 16.
+- **PG-24 — the anchorless refresh's task-review minors** (the Task 10 review): M1 an AIDEV-NOTE on the nested hold (the check's host slot held while it waits for a body slot; a slow request keeps its body slot until `checkDeadline`) and a deferred follow-up for H (GD-1); M2 the slot wait honours the check's `fetchCtx` and the refresh's writes run under the lifecycle context, both pinned; M3 the anchors' blobs are read before the probe tree, so a client's fetch during the probe is not deleted; M4 a failed delete is no answer; M5 a read fault of the refresh's index rows follows `checkFirst`'s local-fault convention (WARN, no write, no backoff); M6 the unchanged plain `Contents-*` residual documented (residual 5 below); M7 the nits. Design note 10; Task 10.
+- **PG-25** — phase G's deferred items are numbered `GD-1`, `GD-2`, … (`…-G-deferred.md`), never `G-n`, which is spec §10's security-review ID (`G-1`). Task 16.
+- **PG-26** — the Task 15 review's Minor 4 (cap eviction inside the flat minted simulation) stays skipped: the reviewer marked it optional, twin eviction is pinned at the cache layer (`TestCreateSuite_EvictionLeavesTheOtherSchemesTwin`), and the simulation is under R-G5's budget. GD-3; the final review may reopen it.
+- **PG-27** — the post-review spec edits extend revision 10's entry ("after the phase G task reviews (rulings PG-19–PG-24): …"), as phase F did within revision 9; phase G is not stamped done yet. Task 16.
+
 Rulings of earlier phases this plan applies: PD-1 (a file changed only by a mechanical rename does not count as touched for the deferred-minor rule), PD-5 (no pool I/O on the writer), PD-9 (a suite path over 1,024 bytes is no suite), PE-8 (the 4.5 s simulation budget), PF-3 (the junk content rule, extended by R-G2), PF-11 (one field added to one log line touches that function, not the file), R-D3 (the handler already routes flat indexes: phase G adds no handler code for them, only their tests).
 
 Design notes (choices the spec leaves open — the boring, bounded option, with the reason):
 
 1. **The flat grammar's shape** (spec C2). A path with a `dists` segment anywhere runs the `dists/` grammar alone and is never flat. Otherwise the member is the path's last one, two or three segments — one flat member name (`InRelease`, `Release`, `Release.gpg`, `Packages*`/`Sources*` with no or one of the six compression extensions, `Contents-[a-z0-9-]+` likewise), a pdiff Index (`(Packages|Sources).diff/Index`) or a by-hash name (`by-hash/SHA256/<64 hex>`, `by-hash/SHA512/<128 hex>`) — and the suite is the literal directory before it, which may end in exactly one `/.` and is never the host root. `IsFlatSuitePath(s)` is `IsCanonicalSuitePath(s)` without a `dists` segment; `IsCanonicalSuitePath` itself is unchanged (`SuitePath(s + "/InRelease") == s`) and so covers both grammars. `FlatBase` strips one trailing `/.` (it equals `MarkerBase`; two names for C6's package base and C3's marker key). `DotClean` removes `.` segments and nothing else: the callers refuse `..` and empty segments themselves.
-2. **`flat_host_root_unsupported`** (spec C2) is a WARN, at most one line a minute process-wide with the count of the lines it suppressed (`suppressed`), as `suite_seed_rejected` is: fields `canonical_host`, `path`, `suppressed`, `detail` ("a flat repository at the host root is not tracked: it is served from the ordinary cache and never refreshed"). It is emitted for a metadata request whose path is a flat member at the host root (`aptpath.IsFlatHostRootPath`: `/InRelease`, `/./Packages.gz`, `/by-hash/SHA256/<hex>`), before the cache lookup; the request is served as before (Phase 1). WARN, not INFO: the repository will never refresh, and the operator can only learn it here. Task 6.
+2. **`flat_host_root_unsupported`** (spec C2) is a WARN, at most one line a minute process-wide with the count of the lines it suppressed (`suppressed`), as `suite_seed_rejected` is: fields `canonical_host`, `path`, `suppressed`, `detail` ("a flat repository at the host root is not tracked: it is served from the ordinary cache and never refreshed"). It is emitted for a metadata request whose path is a flat member at the host root (`aptpath.IsFlatHostRootPath`: `/InRelease`, `/./Packages.gz`, `/by-hash/SHA256/<hex>`) and whose host the allowlist admits (`HostAllowed`: a forbidden host's miss is refused 403, and the line would name it wrongly), before the cache lookup; the request is served as before (Phase 1). Its limit and `suite_seed_rejected`'s are one `observability.LogLimiter` type (ruling PG-22). WARN, not INFO: the repository will never refresh, and the operator can only learn it here. Task 6.
 3. **Layout-aware IndexTargets** (spec C5). `isIndexTarget`, `indexTargetGroup`, `archFromFilteredPath`, `missingRequestableIndexGroups` and `missingRequestableMembers` take the suite path. A flat suite's IndexTargets are its root `Packages*`/`Sources*` and their `.diff/Index` only — a nested `binary-amd64/Packages` declared by a flat Release is no IndexTarget (apt never requests it for a flat source) — and a `dists/` suite's are today's shapes only, so a root `Packages` under a `dists/` suite is none (parity item 2's second run). Root `Packages` groups under the pseudo-arch `all` (always required), root `Sources` under `source`. The handler's `isIndexTargetPath` (the `snapshot_index_target_404` alert) takes the suite path the same way. Task 2, Task 6.
 4. **"Flat pdiff arch labels"** (spec §9's G row; the spec says no more). Read as the architecture labels of a flat suite's index and pdiff Index members: the adoption filter's (`archFromFilteredPath`: root `Sources*` and `Sources.diff/Index` are `source`, filtered when `source` is not allowlisted; root `Packages*` and `Packages.diff/Index` carry every architecture and are never filtered) and the handler alert's (`indexTargetArch`: a flat `Packages*` is `all`, a flat `Sources*` is `source`, where `archFromPath` gave `""` and the metric bucketed it as `other`). `archFromPdiffIndexPath` stays `dists/`-only: spec C6 builds no pdiff hashes for flat suites (`buildPdiffHashes` returns before it for a non-`dists/` layout). Tasks 2 and 6; an interpretation of our own spec (ruling PG-4).
 5. **`validateFilename`** (spec C5) allows `.` segments and `%`, and refuses, fatal as today: empty, absolute, NUL or another control byte (0x00–0x1F, 0x7F), backslash, `?`, `#`, a `..` segment, an empty segment, a length over 4,096 bytes, and — not in the spec's list — a Filename made only of `.` segments (`.`, `./.`): it names no file, and its `DotClean` is empty, which would make a `flat_filename` of `''` (the `dists/` rows' value). `ParseRelease` keeps `validateMemberPath`. R-G1's whitespace-only body is unchanged (parses to nothing). Task 3.
 6. **Flat materialisation reads root `Packages*` members only** (spec C6: "the root as the Packages directory"). A flat Release may declare other files; only a member with no `/` in its path is a flat Packages index (the IndexTargets of design note 3). Rows go at `FlatBase(suite) + "/" + F` with `flat_filename = DotClean(F)`; `dists/` rows keep `flat_filename = ''`. Sources and pdiff hashing are not built for flat suites (spec C6; `buildSourceHashes` and `buildPdiffHashes` already return nothing for a non-`dists/` layout, pinned in Task 4). Task 4.
 7. **The suffix fallback** (spec C6). `DeclaredHashesForPath` runs its exact query first and the fallback only when that finds no row. `P' = DotClean(P)` must be absolute, with at most 32 segments, none empty or `..`; every split `B + "/" + F` (`B` from the host root `""` to the parent of the last segment) goes into one query's `flat_filename IN (…)` (at most 32 values) with `flat_filename <> ''`, joined to the current, signed (`anchor_form <> 'unsigned'`) snapshots through the snapshot's key — `suite_snapshot` by `snapshot_id`, then `suite_freshness` by `(canonical_scheme, canonical_host, suite_path)` with `current_snapshot_id = p.snapshot_id`, never on `current_snapshot_id` alone, which has no index (design review M-2; the exact lookup joins the same way); a row is kept iff its `B` is an ancestor-or-self of its suite's `FlatBase`, and of the kept rows those with the longest `B` are returned. The row's suite path comes back with it (spec C3: a vouched `.deb` touches its suite). The query plans are pinned (`USING INDEX idx_package_hash_flat_filename`; `suite_freshness` searched by its key). A sibling directory is vouched through a Filename that names it under a common ancestor — Jenkins' `direct/` rule, pinned by a positive row (ruling PG-13, residual 1). Task 5.
-8. **Dispatch 3's client-created rows** (spec C4; the E carry-forward). A flat suite's client-created rows are its `InRelease` and `Release` rows (as for every suite) and its root `Packages*`/`Sources*` rows (`aptpath.FileFlatIndex`), each with `request_count > 0`. The index rows are read only when no anchor row is client-created, by name (`cache.ListSuiteMetadataRows`: the three anchors and the root `Packages`/`Sources` in every compression, `path IN (…)`, plus one range for `Contents-*`, two `SELECT`s under `UNION ALL` so each probes url_path's key — design review M-5: a Gemfury org's `.deb`s live in the suite directory, and a directory range would read them all twice a check), which the anchorless refresh reuses. Task 9.
+8. **Dispatch 3's client-created rows** (spec C4; the E carry-forward). A flat suite's client-created rows are its `InRelease` and `Release` rows (as for every suite) and its root `Packages*`/`Sources*` rows (`aptpath.FileFlatIndex`), each with `request_count > 0`. The index rows are read only when no anchor row is client-created, by name (`cache.ListSuiteMetadataRows`: the three anchors and the root `Packages`/`Sources` in every compression — `aptpath.FlatIndexNames`, the one list — `path IN (…)`, plus one range for `Contents-*`, two `SELECT`s under `UNION ALL` so each probes url_path's key — design review M-5: a Gemfury org's `.deb`s live in the suite directory, and a directory range would read them all twice a check), which the anchorless refresh reuses. Task 9.
 9. **The anchorless gate** (spec C4 Dispatch 3; deviation 1). A never-adopted flat suite whose probe tree finds neither `InRelease` nor `Release` runs the anchorless refresh when it has no signed evidence: the adopter's cached signed-anchor re-mark (`remarkSignedAnchors`: the `InRelease` and `Release.gpg` rows of the suite and of its `/.` twin under both schemes, sniffed outside the writer, each sniff-passing one marked) runs first, then never-downgrade's rule (`cache.CheckUnsignedDowngrade`: a marker for the base under either scheme, or an adopted, non-retired signed snapshot of the base or its twin) must find nothing. Otherwise the check is the failed check and `anchor_absent` record it is today. A read or mark error fails the check (as the unsigned commit's re-mark refuses). After the gate admits a suite, `adoption.adopt_unsigned = false` refuses it as an unsigned candidate is (ruling PG-1, with PG-10's mechanics: `anchorlessDisabled`): the record `unsigned_disabled`, keyed `anchorAbsentKey` (there is no `Release` to hash), paced by its record, the status page naming the knob; a successful check logged `result=changed_deferred`, `form=anchorless`, `reason=unsigned_disabled`, with no pending change left; no request and no delete — with the knob off a Release-less flat repository is served as the cache first stored its files, as a repository with an unsigned `Release` is. The gate runs before the knob, so a suite with signed evidence keeps its failed check and `anchor_absent` record whatever the knob. Task 10.
-10. **The anchorless refresh** (spec C4 Dispatch 4). Under the check's host slot and deadline, every cached url_path row of the suite whose member is `Packages*`, `Sources*` or `Contents-*` (`aptpath.SuitePath(path) == suite`) gets one conditional GET with its stored `upstream_etag`/`upstream_lastmod`, `Packages*` first, then `Sources*`, then `Contents-*` (design review M-3: a slow `Contents-*` asked first could take the deadline from the indexes apt needs): a 304 keeps it; a 200 whose body passes `aptpath.SniffAnchorlessIndex` (the flat index sniff for its extension, design note 11) replaces its blob (`cache.RefreshURLPathBlob`: blob, validators and `last_fetched_at` — only when the blob changes — and never `last_requested_at` or `request_count`); a 200 with the cached bytes — a plain `Contents-*`'s too — stores only its changed validators and never re-stores the blob (design review M-1; with the exec review's P2, an upstream that ignores validators leaves the row as it was, `anchorless_unchanged`); a 200 that fails its sniff keeps the row and counts `acu_anchorless_sniff_rejected_total{host}` (judged before the bytes are compared, so a captive portal's cached page is no answer either); 404 and 410 delete it (`cache.DeleteURLPathRows`); 401, 403, 5xx, a transport error, a body over the cap or the deadline keep it. Then the suite's cached `InRelease` and `Release` rows whose probe answered 404 or 410 are deleted (the tree's own answers: no extra request; a cached `Release.gpg`, never probed when `Release` is absent, stays). Every delete applies only while the row still holds the blob the refresh read (design review M-4: a client's miss may have stored a newer file meanwhile). Only a content answer counts (design review M-7, ruling PG-12): a 304, a 200 stored or matching the cached bytes, a 404 or 410; a 401, a 403, a sniff-rejected 200 and a changed plain `Contents-*` (dropped, deviation 2) are none, and a 304 to a request without validators is unknown, as `classify` treats it. The check is answered — `anchorless_refreshed` when a row was replaced or deleted, `anchorless_unchanged` otherwise — when at least one index request got a content answer, or when the suite has no cached index row to ask for (the exec review's P7: its anchors' 404s still apply; with no client-created row left the suite then goes dormant, which is bounded); a check that sent index requests and got no content answer is a failed check, and the streak backs off (ruling PG-15 composing P7 with M-7). The refresh's writes (the pool, `RefreshURLPathBlob`, `DeleteURLPathRows`) run under the lifecycle context, as the check's other writes do: a refresh that passes its deadline still commits what it fetched. An answered anchorless check (form `anchorless`, `upstream_status` the `Release` probe's absent answer) is a success: it clears the suite's failure or refusal record — it described an anchor that is now absent upstream — and its pending change (`inrelease_change_seen_at`: the anchorless form adopts nothing, so a stamp left behind would queue the suite every tick, `pendingChange`). Its cache operations go through the adopter's `*cache.Cache`, so the checker's `Cache` interface keeps its fakes. Task 10.
+10. **The anchorless refresh** (spec C4 Dispatch 4). Under the check's host slot and deadline, every cached url_path row of the suite whose member is `Packages*`, `Sources*` or `Contents-*` (`aptpath.SuitePath(path) == suite`) gets one conditional GET with its stored `upstream_etag`/`upstream_lastmod`, `Packages*` first, then `Sources*`, then `Contents-*` (design review M-3: a slow `Contents-*` asked first could take the deadline from the indexes apt needs): a 304 keeps it; a 200 whose body passes `aptpath.SniffAnchorlessIndex` (the flat index sniff for its extension, design note 11) replaces its blob (`cache.RefreshURLPathBlob`: blob, validators and `last_fetched_at` — only when the blob changes — and never `last_requested_at` or `request_count`); a 200 with the cached bytes — a plain `Contents-*`'s too — stores only its changed validators and never re-stores the blob (design review M-1; with the exec review's P2, an upstream that ignores validators leaves the row as it was, `anchorless_unchanged`); a 200 that fails its sniff keeps the row and counts `acu_anchorless_sniff_rejected_total{host}` (judged before the bytes are compared, so a captive portal's cached page is no answer either); 404 and 410 delete it (`cache.DeleteURLPathRows`); 401, 403, 5xx, a transport error, a body over the cap or the deadline keep it. Then the suite's cached `InRelease` and `Release` rows whose probe answered 404 or 410 are deleted (the tree's own answers: no extra request; a cached `Release.gpg`, never probed when `Release` is absent, stays). Every delete applies only while the row still holds the blob the refresh read — for the cached `InRelease` and `Release`, the blob read before the probe tree ran, so a client's fetch during the probe's window is kept (design review M-4: a client's miss may have stored a newer file meanwhile; ruling PG-24, M3). Only a content answer counts (design review M-7, ruling PG-12): a 304, a 200 stored or matching the cached bytes, a 404 or 410; a 401, a 403, a sniff-rejected 200 and a changed plain `Contents-*` (dropped, deviation 2) are none, and a 304 to a request without validators is unknown, as `classify` treats it. The check is answered — `anchorless_refreshed` when a row was replaced or deleted, `anchorless_unchanged` otherwise — when at least one index request got a content answer, or when the suite has no cached index row to ask for (the exec review's P7: its anchors' 404s still apply; with no client-created row left the suite then goes dormant, which is bounded); a check that sent index requests and got no content answer is a failed check, and the streak backs off (ruling PG-15 composing P7 with M-7). A delete that fails is no answer: its 404s and 410s stop counting, so a check they alone answered — no index request, or every content answer a delete — fails (ruling PG-24, M4). The refresh's writes (the pool, `RefreshURLPathBlob`, `DeleteURLPathRows`) run under the lifecycle context, as the check's other writes do: a refresh that passes its deadline still commits what it fetched. An answered anchorless check (form `anchorless`, `upstream_status` the `Release` probe's absent answer) is a success: it clears the suite's failure or refusal record — it described an anchor that is now absent upstream — and its pending change (`inrelease_change_seen_at`: the anchorless form adopts nothing, so a stamp left behind would queue the suite every tick, `pendingChange`). Its cache operations go through the adopter's `*cache.Cache`, so the checker's `Cache` interface keeps its fakes. Task 10.
 11. **The anchorless sniff** (spec C3 has none for `Contents-*`; deviation 2). `aptpath.SniffAnchorlessIndex(name, head)`: `Packages*`/`Sources*` take `SniffFlatIndex`; a compressed `Contents-*` takes its extension's magic; a plain `Contents-*` has no sniff that tells it from a soft-404, so its 200 is never stored: the row is deleted instead (it counts toward `anchorless_refreshed`, but is no content answer: nothing tells its changed 200 from a soft-404 — design review M-7), and the next client request fetches it upstream through the miss path, as apt would directly. Task 10.
 12. **The anchorless body cap is 64 MiB** (a constant, `maxAnchorlessIndexBytes`), **and at most two bodies are in memory at once for the process** (ruling PG-8: `anchorlessBodySlots`, the `Checker`'s `anchorlessBodies` semaphore; one `Checker` per process). The checker's fetcher reads a body into memory (`fetch.Conditional`, whose `io.ReadAll` peaks near 2.25× the cap), and checks are bounded per host only, so without a global bound the memory would grow with the number of hosts holding anchorless suites. A request takes its slot within the check's deadline and releases it by a `defer` once its body is in the pool or discarded, a panic included. Release-less repositories (Gemfury, goreleaser) publish indexes of kilobytes to a few MiB. A body over the cap keeps the row (unknown) and is logged WARN `freshness: anchorless index over its size cap`, at most one line a minute for the process with a `suppressed` count (design review M-6: minted suites must not flood the log). Task 10.
 13. **`last_fetched_at` of a replaced row is monotonic**: `MAX(now, previous + 1)`, so a replacement within the second of the previous fetch still moves `Last-Modified` past a client's `If-Modified-Since` (C8's monotonic stamp, for url_path rows; pinned end to end by `TestServeHTTP_AnAnchorlessReplacementPassesIfModifiedSince`, design review M-9). Like `adopted_at`, such a stamp can lead the clock — after a forward step and its correction, for as long as the step lasted — and spec C4's sentence on stamps that lead names it (design review M-8): R-G2's junk grace reads a future stamp as recent (ruling PF-3), which can only delay a junk reap. Task 10.
 14. **`Last-Modified` of url_path-served metadata** (spec C4) is `max(pool mtime, last_fetched_at)` at every url_path metadata serve — a hit, a miss and a stale serve — through one helper (`urlPathModTime`); a `.deb` and every snapshot serve are unchanged (C8's `adopted_at` for snapshot anchors). Task 10.
-15. **R-G2's read** is one query on the pool per reaper run (`cache.ListUnadoptedFlatIndexRows`): unadopted suites without a `/dists/` substring (`instr`, not `LIKE`, which ignores ASCII case), joined to url_path on its key for the 14 root index names, the same plan shape as `ListUnadoptedSuiteAnchors` (pinned), and run only when the run holds an unadopted flat suite (`hasUnadoptedFlatSuite`; ruling R-G5 as PG-7 widens it). A failed read leaves every unadopted flat suite unjudged for the run (design review M-13). `(*Reaper).suiteJunk` gives each candidate its verdict (ruling PG-7): a `dists/` suite by its anchors; a flat suite by its anchors when that verdict and the combined one (anchors and index rows together, junk only with at least one row and all junk) agree, and otherwise by signed evidence, read then (`cache.CheckUnsignedDowngrade` through the `signedEvidence` seam): refused — signed — takes the anchors' verdict, nothing found takes the combined one, an error gives no verdict. The junk memo's key gains the member name for a flat index (its extension picks the sniff). Task 12.
+15. **R-G2's read** is one query on the pool per reaper run (`cache.ListUnadoptedFlatIndexRows`): unadopted suites without a `/dists/` substring (`instr`, not `LIKE`, which ignores ASCII case), joined to url_path on its key for the 14 root index names (`aptpath.FlatIndexNames`), the same plan shape as `ListUnadoptedSuiteAnchors` (pinned), and run only when the run holds an unadopted flat suite (`hasUnadoptedFlatSuite`; ruling R-G5 as PG-7 widens it). A failed read leaves every unadopted flat suite unjudged for the run (design review M-13). `(*Reaper).suiteJunk` gives each candidate its verdict (ruling PG-7): a `dists/` suite by its anchors; a flat suite by its anchors when that verdict and the combined one (anchors and index rows together, junk only with at least one row and all junk) agree, and otherwise by signed evidence, read then (`cache.CheckUnsignedDowngrade` through the `signedEvidence` seam): refused — signed — takes the anchors' verdict, nothing found takes the combined one, an error gives no verdict. The junk memo's key gains the member name for a flat index (its extension picks the sniff). Task 12.
 16. **`suites[].flat`** (spec C7, C11; the B carry-forward) is `aptpath.IsFlatSuitePath(suite_path)`: JSON `flat` (boolean, additive), and the HTML Suite path cell shows a `flat` tag. Task 14.
 17. **The strict matrix** (parity item 4) runs through the real handler with snapshots committed through the cache (`commitInlineSnapshot`, `package_hash` rows with `FlatFilename`), one subtest per row; the two pkgs.k8s.io rows use the handler's `AdoptionWaiter` seam (`fakeAdoptions`): "running" commits the third minor's snapshot during the wait, "queued" reports nothing in flight. Task 11.
 
@@ -88,19 +100,20 @@ Design notes (choices the spec leaves open — the boring, bounded option, with 
 1. **The anchorless gate reads signed evidence, not every sniff-passing anchor row** (spec C4 Dispatch 3: "flat suites that have no signed-seen marker and no sniff-passing cached anchor row"). A cached `Release` that passes its sniff — an unsigned repository that has since dropped its `Release` — would keep the suite out of the anchorless refresh for good: clients would keep getting the stale `Release` and stale indexes from the ordinary cache, and Dispatch 4's own rule ("cached anchor rows under the suite are deleted when upstream answers them 404/410") could then only ever delete junk anchors. Signed evidence is what the condition protects (a signed repository whose anchors an attacker strips must not fall back to unverified refreshes), so the gate is never-downgrade's rule plus the cached signed-anchor re-mark (design note 9): a sniff-passing `InRelease` or `Release.gpg`, a marker, or a signed snapshot keeps the suite out; an unsigned `Release` does not, and the refresh deletes it when upstream answers 404. Task 10. Two residuals (the design review): a detached repository whose cached `Release.gpg` url_path GC deleted before the suite ever had a row keeps no signed evidence — no harm to verifying clients, whose signed `Release` is gone upstream too, and an anchorless refresh vouches nothing; and a miss that marks the base after the gate ran races one check, which stores only bytes that pass their sniff, as the miss path would.
 2. **A plain `Contents-*` is deleted, not kept, when its 200 cannot be sniffed** (spec C4 Dispatch 4: "a 200 replaces the row's blob only if the body passes the flat index sniff for its extension (else the old row stays)"). Spec C3's flat index sniff covers `Packages*`/`Sources*` only; a plain `Contents-*` has no sniff, so the literal rule would keep its first copy forever. Deleting it on a changed 200 hands it to the miss path, which serves whatever upstream serves as any first fetch does — never worse than first contact. Design note 11; Task 10. Since nothing tells that 200 from a soft-404, it is no content answer (design review M-7): it never makes a check a success. It cannot loop (the design review's answer to ruling PG-5): one delete per upstream change; once a client's miss has stored the file again, a conditional GET gets a 304; a server that varies a plain `Contents-*` on every response costs one GET, one delete and one client refetch per check, which is bounded.
 
-Residuals, documented and not changed (ruling PG-13; Task 16 writes them into *Flat repositories* and spec C3, C4 and C6):
+Residuals, documented and not changed (rulings PG-13 and PG-24; Task 16 writes them into *Flat repositories* and spec C3, C4 and C6):
 
 1. **Constraints across tenants.** A signed flat suite constrains every `.deb` path that has no exact row and that its Filenames name under any ancestor of its base, so on a multi-tenant host (OBS, a host behind `accept_any_signer`) one tenant's signed `Packages` can make another tenant's `.deb` that no signed snapshot of its own vouches fail validation (502), even without strict mode. Rows are constraints, never grants: no bytes can be injected. Task 5 pins the positive side (`/a/flat2`'s Filename `flat/x_1_amd64.deb` vouches `/a/flat/x_1_amd64.deb`).
 2. **The twins' conflict window.** The twins' exact rows share every path, so a Filename upstream overwrites in place with new bytes carries two hashes between the two twins' adoptions: `package_hash_conflict` (502) under both until the second twin adopts, at most one refresh interval unless that adoption fails. No tiebreak: real repositories rarely overwrite a Filename in place.
 3. **403 for a missing key** (S3, CloudFront): an index file a Release-less repository removed stays cached and served; if it is the `Packages.xz` apt tries first, a client never sees the fresh `Packages.gz`.
 4. **An empty plain `Packages`** fails the flat index sniff: a Release-less repository whose only index is a plain `Packages`, empty at first contact, gets no suite (Phase 1, never refreshed), and an index that becomes empty is never stored.
+5. **An unchanged plain `Contents-*`** counts as a content answer without a sniff: a captive portal's page that a client's miss cached as a plain `Contents-<arch>`, and that the portal still serves, answers the check (`anchorless_unchanged`) during the outage. Flat repositories rarely publish a plain `Contents-*` (ruling PG-24, M6).
 
 ## Review Focus (phase G share)
 
 1. **Upgrading a live v6 cache with flat anchors** (overview Review Focus 1): a flat `InRelease` and `Packages.gz` cached by a v6 binary have no suite row; the startup pass marks nothing (untracked); the anchor's first hit onboards the suite with its marker before the first body byte; and an untrusted flat suite then makes at most one adoption attempt per backoff step — Tasks 7, 15 (`TestServeHTTP_OnboardsAFlatSuiteFromAV6Cache`, `TestDoD_UntrustedFlatSuiteFromAV6CacheKeepsTheBackoff`).
 2. **Upstreams answering 200 HTML** (overview Review Focus 3) never become a flat suite, a refreshed flat index or a healthy-looking anchorless suite: the miss sniff (no row), the anchorless sniff (old row kept, counted, and a failed check: design review M-7), and the reaper's junk evidence (R-G2 as amended by PG-7: junk only when every anchor and index row is, unless the suite is signed) — Tasks 7, 10, 12 (`TestCheck_AnchorlessSniffRejectionKeepsTheRow`, `…CachedPageIsNoAnswerEvenUnchanged`, `TestReaper_ReapsAJunkAnchorlessFlatSuite`).
 3. **Every real Filename shape vouches, and nothing else does**: k8s (`amd64/…`), CUDA (`./…` and its dot-cleaned form), nvidia (`./…`, SHA512-only Release), Jenkins (`binary/`, `direct/`: parent base), Sublime (`files/`: host-root base), an epoch `%3a` — and `..`, `//`, a sibling `/flat2`, a 33-segment path and an unsigned snapshot vouch nothing — Tasks 4, 5, 15 (`TestDeclaredHashesForPath_FlatShapes`, `TestDoD_EveryRealFilenameShapeAdoptsAndVouches`).
-4. **Strict mode on flat hosts** (spec C10's host-wide rule, parity item 4): the twelve rows — Task 11 (`TestServeHTTP_FlatStrictMatrix`).
+4. **Strict mode on flat hosts** (spec C10's host-wide rule, parity item 4): the twelve parity rows and the fix round's three (a fallback-vouched `.deb` with other bytes, two hit-path rows), and a tie at the longest base refused as a conflict — Task 11 (`TestServeHTTP_FlatStrictMatrix`, `TestServeHTTP_AFallbackTieIsAConflict`).
 5. **Twins** (ruling R-G4): two rows, two snapshots, one marker base; reaping, forgetting or refusing one never touches the other's rows — Tasks 7, 12, 13.
 6. **The knob and the anchorless refresh** (ruling PG-1): with `adopt_unsigned = false` a Release-less flat repository asks upstream nothing and shows `unsigned_disabled`; a suite with signed evidence keeps its failed check and `anchor_absent` whatever the knob — Task 10 (`TestCheck_TheKnobOffStopsTheAnchorlessRefresh`, `TestCheck_TheKnobOffKeepsSignedSuitesAnchorAbsent`).
 7. **A `.deb` named like an index** (ruling PG-2) is vouched, checked and refused like any `.deb` — Task 6 (`TestIsMetadata_PoolArtifactsAreNeverMetadata`, `TestIsMetadata_RealMetadataNamesStayMetadata`, `TestServeHTTP_StrictRefusesAnUnvouchedDebNamedLikeAnIndex`).
@@ -110,22 +123,22 @@ Residuals, documented and not changed (ruling PG-13; Task 16 writes them into *F
 
 | Area | Files | Task |
 |---|---|---|
-| The flat grammar | `internal/aptpath/suite.go`, `suite_test.go`, `sniff.go` (D-4), `sniff_test.go` (D-3); `internal/proxy/proxy_test.go`; `internal/cache/suite_reap_test.go` | 1 |
+| The flat grammar | `internal/aptpath/suite.go`, `suite_test.go`, `sniff.go` (D-4), `sniff_test.go` (D-3); `internal/proxy/proxy_test.go`; `internal/cache/suite_reap_test.go`, `marker_sweep.go` (AIDEV-NOTE) | 1 |
 | Layout-aware IndexTargets | `internal/freshness/adoption.go` (the predicates, E-9), `reconcile.go`, `adoption_test.go`, `phase6_7_skip_repair_test.go`, `reconcile_test.go` (D-27), `flat_adoption_test.go` (new) | 2 |
 | Filenames and R-G1 | `internal/freshness/packages_parse.go`, `packages_parse_test.go`, `flat_adoption_test.go` | 3 |
 | C6 materialisation | `internal/cache/types.go`, `adoption.go` (Step 3's insert), `reconcile.go` (`insertPackageHashTx`), `flat_package_hash_test.go` (new); `internal/freshness/adoption.go` (`buildPackageHashes`), `flat_coverage_test.go` (new) | 4 |
 | C6 lookup | `internal/cache/adoption.go` (`DeclaredHashesForPath`; the keyed join, `declaredExactSQL`: M-2), `flat_lookup_test.go` (new) | 5 |
-| Handler: alert, host root, arch labels; pool artifacts | `internal/handler/handler.go` (`isIndexTargetPath`, `indexTargetArch`, the host-root call), `flat_root.go` (new), `path_class_test.go`, `flat_root_test.go` (new), `pool_artifact_test.go` (new); `internal/proxy/classify.go` (`isPoolArtifact`, PG-2), `proxy_test.go` | 6 |
+| Handler: alert, host root, arch labels; pool artifacts; one log limiter | `internal/handler/handler.go` (`isIndexTargetPath`, `indexTargetArch`, the host-root call, the limiters' fields), `flat_root.go` (new), `suite_rows.go` (`seedWarn` on the shared limiter, PG-22), `path_class_test.go`, `flat_root_test.go` (new), `pool_artifact_test.go` (new), `phase3_strict_test.go` (`strictLogBuf.reset`); `internal/proxy/classify.go` (`isPoolArtifact`, PG-2), `proxy_test.go`; `internal/observability/loglimit.go` (new: `LogLimiter`, PG-22), `loglimit_test.go` (new) | 6 |
 | Handler evidence | `internal/handler/handler_test.go` (`TestServeHTTP_FlatRepositoryFreshness`), `flat_handler_test.go` (new) | 7 |
 | Handler deferred minors | `internal/handler/suite_rows.go` (D-32, D-31, E-67, E-68), `handler.go` (E-57, E-60, E-64, E-71's seam, D-31), `suite_rows_test.go`, `seed_t1_test.go` (E-65), `strict_wait_test.go` (E-71) | 8 |
-| Dispatch 3: client-created index rows | `internal/cache/anchorless.go` (new: `ListSuiteMetadataRows`, by name: M-5), `anchorless_test.go` (new); `internal/freshness/anchorless.go` (new: `flatIndexClientCreated`), `first_adoption.go`, `flat_rig_test.go` (new; the knob on: PG-9, PG-17), `flat_first_adoption_test.go` (new) | 9 |
-| The anchorless gate and refresh | `internal/aptpath/sniff.go` (`SniffAnchorlessIndex`), `sniff_test.go`; `internal/cache/anchorless.go` (`RefreshURLPathBlob`, `DeleteURLPathRows`), `anchorless_test.go`, `adoption.go` (R-G3 note); `internal/freshness/anchorless.go` (the gate, the knob's refusal and the refresh), `freshness.go` (the body slots and the over-cap limiter: PG-8, M-6), `first_adoption.go` (PG-1), `metrics.go`, `anchorless_test.go` (new), `retry_rig_test.go` (`rigUpstream.before`, `notModified`, `limits`, the ended context; E-47), `flat_rig_test.go` (E-47); `internal/handler/handler.go` (`urlPathModTime`, R-G3 note), `singleflight.go`, `urlpath_lastmod_test.go` (new) | 10 |
-| Strict mode | `internal/cache/queries.go` (AIDEV-NOTE); `internal/handler/flat_strict_test.go` (new), `unsigned_posture_test.go` (E-70) | 11 |
-| Reaper and twins | `internal/cache/flat_reap.go` (new: `ListUnadoptedFlatIndexRows`), `flat_reap_test.go` (new); `internal/freshness/reaper.go` (`suiteJunk`, `hasUnadoptedFlatSuite`, the `flatIndexRows` and `signedEvidence` seams: PG-7), `reaper_test.go`, `flat_reap_test.go` (new) | 12 |
+| Dispatch 3: client-created index rows | `internal/aptpath/suite.go` (`FlatIndexNames`, the one list), `suite_test.go`; `internal/cache/anchorless.go` (new: `ListSuiteMetadataRows`, by name: M-5), `anchorless_test.go` (new); `internal/freshness/anchorless.go` (new: `flatIndexClientCreated`), `first_adoption.go` (PG-20's URL model), `freshness.go` (the `urlReconstruct` AIDEV-NOTE), `flat_rig_test.go` (new; the knob on: PG-9, PG-17), `flat_first_adoption_test.go` (new) | 9 |
+| The anchorless gate and refresh | `internal/aptpath/sniff.go` (`SniffAnchorlessIndex`), `sniff_test.go`; `internal/cache/anchorless.go` (`RefreshURLPathBlob`, `DeleteURLPathRows`), `anchorless_test.go`, `adoption.go` (R-G3 note); `internal/freshness/anchorless.go` (the gate, the knob's refusal and the refresh), `freshness.go` (the body slots and the over-cap limiter: PG-8, M-6), `first_adoption.go` (PG-1; the anchor rows read before the probe: PG-24), `current_form.go` (`anchorURLMap`), `metrics.go`, `flat_first_adoption_test.go` (PG-20's test), `anchorless_test.go` (new), `retry_rig_test.go` (`rigUpstream.before`, `notModified`, `limits`, the ended context; E-47), `flat_rig_test.go` (E-47); `internal/handler/handler.go` (`urlPathModTime`, R-G3 note), `singleflight.go`, `urlpath_lastmod_test.go` (new) | 10 |
+| Strict mode | `internal/cache/queries.go` (AIDEV-NOTE), `adoption.go` (`flatSplits`' doc), `flat_lookup_test.go` (`TestFlatSplits`); `internal/handler/flat_strict_test.go` (new), `unsigned_posture_test.go` (E-70), `strict_wait_test.go` and `phase3_strict_test.go` (the two helpers wrap `commitStrictSnap`) | 11 |
+| Reaper and twins | `internal/cache/flat_reap.go` (new: `ListUnadoptedFlatIndexRows`), `flat_reap_test.go` (new); `internal/freshness/reaper.go` (`suiteJunk`, `hasUnadoptedFlatSuite`, the `flatIndexRows` and `signedEvidence` seams: PG-7), `reaper_test.go`, `reaper_junk_test.go` (`cacheAnchor`'s comment), `flat_reap_test.go` (new) | 12 |
 | Twins in never-downgrade | `internal/freshness/unsigned_test.go` (E-16, E-17, the twin recheck), `flat_twin_test.go` (new: E-19) | 13 |
 | Admin | `internal/admin/status.go` (`flat`), `status_template.go`, `suites_status_test.go` (B-59, B-62), `json_contract_test.go` (B-59), `testdata/json_contract_golden.json` | 14 |
 | DoD | `internal/freshness/dod_g_test.go` (new; the v6 backoff's written-out schedule: G15-1, P1); `internal/handler/flat_dod_test.go` (new) | 15 |
-| Documentation | `docs/configuration.md`, `docs/log-fields.md`, `docs/admin-ui-spec.md`, `packaging/config/config.toml.default`, the spec, the overview, the A–F deferred files | 16 |
+| Documentation | `docs/configuration.md`, `docs/log-fields.md`, `docs/admin-ui-spec.md`, `packaging/config/config.toml.default`, the spec, the overview, the A–F deferred files, `…-G-deferred.md` (new: GD-1–GD-3, PG-25) | 16 |
 
 No migration, no new package, no new dependency, no new config key.
 
@@ -154,7 +167,7 @@ No migration, no new package, no new dependency, no new config key.
 Spec C2's flat grammar lands inside `aptpath.SuitePath`, with the helpers the other packages share (overview, "Cross-phase interfaces", G line): `IsFlatSuitePath`, `FlatBase`, `DotClean`, and `IsFlatHostRootPath` (design note 2's predicate). `IsCanonicalSuitePath` keeps its one-line definition and so covers both grammars: from this task on a flat suite row is canonical, its files map to it, and `DeleteSuiteMetadata` and the reaper's metadata deletion cover them with no code change of their own (the F carry-forward) — pinned here on a real flat suite with a real `./` twin (ruling R-G4: "reaping `/repo` leaves `/repo/.` intact", its cache half; the reaper's own is Task 12). PR #8's `TestSuitePath` flat cases are ported verbatim with our results (parity item 1: the intentional `Contents-*` difference and the added 64-hex by-hash row), and §7's C2 items: a `dists` segment is never flat, and `%2E` and `.` land on the same suite (through `proxy.Parse`, which decodes the request URI). Deferred minors: A-4 (`SuitePath`'s comment overclaimed "matching the old greedy regex": reworded, and the `/a/dists/b/dists/c` row added), A-5 (the AIDEV-NOTE said "raw path": the handler strips from `req.Path`, the string `SuitePath` received — reworded), A-6 (a space-byte row and a trailing-slash row), D-3 (a near-miss magic row per compression extension in `TestSniffFlatIndex`), D-4 (`ClassifySuiteFile`'s AIDEV-NOTE: its precondition, the `""` guard its callers rely on, the flat branch now reachable; `SuitePath`'s note points at it).
 
 **Files:**
-- Modify: `internal/aptpath/suite.go` (the whole file), `internal/aptpath/suite_test.go` (the whole file), `internal/aptpath/sniff.go` (`FileFlatIndex`'s comment, `ClassifySuiteFile`'s AIDEV-NOTE), `internal/aptpath/sniff_test.go` (`TestSniffFlatIndex`), `internal/proxy/proxy_test.go` (`TestSuitePath`, `TestParse_FlatSuites`), `internal/cache/suite_reap_test.go` (`TestDeleteSuiteMetadata_ANonCanonicalKeyDeletesNothing`, `TestDeleteSuiteMetadata_AFlatSuiteLeavesItsTwin`)
+- Modify: `internal/aptpath/suite.go` (the whole file), `internal/aptpath/suite_test.go` (the whole file), `internal/aptpath/sniff.go` (`FileFlatIndex`'s comment, `ClassifySuiteFile`'s AIDEV-NOTE), `internal/aptpath/sniff_test.go` (`TestSniffFlatIndex`), `internal/proxy/proxy_test.go` (`TestSuitePath`, `TestParse_FlatSuites`), `internal/cache/suite_reap_test.go` (`TestDeleteSuiteMetadata_ANonCanonicalKeyDeletesNothing`, `TestDeleteSuiteMetadata_AFlatSuiteLeavesItsTwin`), `internal/cache/marker_sweep.go` (`orphanSuiteRowSQL`'s AIDEV-NOTE)
 
 **Interfaces:**
 - Consumes: `hasDistsSegment` (`sniff.go`), `cleanBytes`, `MarkerBase`; `newTestParser` (proxy tests); `openCache`, `seedBlob`, `putURLPathRow`, `urlRowExists`, `sk` (cache tests).
@@ -267,6 +280,15 @@ func TestSuitePath_Flat(t *testing.T) {
 		{"/repo/flat/Packages.Z", ""},
 		{"/repo/flat/en", ""}, // a flat Translation file (apt's $(LANGUAGE)): Phase 1 only
 		{"/repo/flat/Contents-AMD64.gz", ""},
+		{"/repo/flat/Contents-", ""}, // Contents- needs a class
+		// each member regexp is anchored at both ends, and a by-hash name
+		// needs its by-hash directory (the grammar never widens)
+		{"/repo/flat/x/SHA256/" + hex64, ""},
+		{"/repo/flat/xInRelease", ""},
+		{"/repo/flat/old-Packages.gz", ""},
+		{"/repo/flat/by-hash/SHA256/" + hex64 + "0", ""},
+		{"/repo/flat/by-hash/SHA512/x" + hex64 + hex64, ""},
+		{"/repo/flat/xPackages.diff/Index", ""},
 		{"/repo/InRelease/", ""},
 		{"/repo/./InRelease/", ""},
 		{"/repo/./.", ""},
@@ -721,6 +743,11 @@ func flatMemberSegments(segs []string) int {
 // ("/InRelease", "/./Packages.gz"): spec C2 gives such a path no suite —
 // a host-root flat repository (`deb https://h/ /`) is unsupported, and
 // the handler logs flat_host_root_unsupported for it.
+//
+// The cleanBytes and hasDistsSegment guards are defensive: a host-root
+// member's segments are "." or member-grammar segments, which never hold a
+// forbidden byte or "dists", so no test row can tell them apart from the
+// member grammar's own refusal.
 func IsFlatHostRootPath(p string) bool {
 	if !strings.HasPrefix(p, "/") || !cleanBytes(p) || hasDistsSegment(p) {
 		return false
@@ -820,6 +847,25 @@ and replace `ClassifySuiteFile`'s doc comment with (deferred minor D-4):
 // ever being flat.
 ```
 
+In `internal/cache/marker_sweep.go` (`orphanSuiteRowSQL`'s AIDEV-NOTE; the Task 1 review's Minor 3: the base-or-twin rule covers flat twins as written), replace
+
+```go
+// baseSuiteRowsTx (suite_reap.go), for /forget's KeptBy. They must agree —
+// a marker /forget keeps for a row must not be an orphan here, and the
+// reverse — so change them together (phase G's flat paths will touch
+// both).
+```
+
+with
+
+```go
+// baseSuiteRowsTx (suite_reap.go), for /forget's KeptBy. They must agree —
+// a marker /forget keeps for a row must not be an orphan here, and the
+// reverse — so change them together. The rule covers phase G's flat
+// twins as written: MarkerBase("/repo/.") is "/repo", whose rows are
+// "/repo" and "/repo/.".
+```
+
 - [ ] **Step 4: Run the tests**
 
 Run: `go test ./internal/aptpath/ ./internal/proxy/ ./internal/cache/`
@@ -848,12 +894,20 @@ Expected: PASS. The flat grammar changes no other existing test: the handler, fr
 | the `.lzma` magic shortened to two bytes | `TestSniffFlatIndex` (`SniffFlatIndex("Packages.lzma", "]\x00\x01\x80\x00") = true, want false`) |
 | the `.bz2` magic shortened to two bytes | `TestSniffFlatIndex` (`SniffFlatIndex("Packages.bz2", "BZi91AY&SY") = true, want false`) |
 | the `.lz4` magic shortened to three bytes | `TestSniffFlatIndex` (`SniffFlatIndex("Packages.lz4", "\x04\"M\x19d") = true, want false`) |
+| `flatMemberSegments`' by-hash case without its directory test (`segs[n-3] == "by-hash"` dropped) | `TestSuitePath_Flat` (`SuitePath("/repo/flat/x/SHA256/0123…") = "/repo/flat", want ""`) |
+| `flatMemberRE` without its `^` | `TestSuitePath_Flat` (`SuitePath("/repo/flat/xInRelease") = "/repo/flat", want ""`, and `/repo/flat/old-Packages.gz`) |
+| `hex64RE` without its `$` | `TestSuitePath_Flat` (`SuitePath("/repo/flat/by-hash/SHA256/0123…0") = "/repo/flat", want ""`) |
+| `hex128RE` without its `^` | `TestSuitePath_Flat` (`SuitePath("/repo/flat/by-hash/SHA512/x0123…") = "/repo/flat", want ""`) |
+| `flatPdiffDirRE` without its `^` | `TestSuitePath_Flat` (`SuitePath("/repo/flat/xPackages.diff/Index") = "/repo/flat", want ""`) |
+| `Contents-[a-z0-9-]+` widened to `Contents-[a-z0-9-]*` | `TestSuitePath_Flat` (`SuitePath("/repo/flat/Contents-") = "/repo/flat", want ""`) |
+
+`IsFlatHostRootPath`'s `cleanBytes` and `hasDistsSegment` guards have no killing row: a host-root member's segments are `.` or member-grammar segments, which never hold a forbidden byte or `dists`, so dropping either guard is an equivalent mutant (its comment says so).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-gofmt -l internal/aptpath/ internal/proxy/proxy_test.go internal/cache/suite_reap_test.go
-git add internal/aptpath/ internal/proxy/proxy_test.go internal/cache/suite_reap_test.go
+gofmt -l internal/aptpath/ internal/proxy/proxy_test.go internal/cache/suite_reap_test.go internal/cache/marker_sweep.go
+git add internal/aptpath/ internal/proxy/proxy_test.go internal/cache/suite_reap_test.go internal/cache/marker_sweep.go
 git commit -m "Give flat repositories a suite: spec C2's flat grammar; deferred minors A-4, A-5, A-6, D-3, D-4"
 ```
 
@@ -1129,6 +1183,43 @@ func TestAdopter_FlatPackagesFailureFatal(t *testing.T) {
 	}
 }
 
+// Spec C5 and plan design note 3: a flat suite's root Sources groups under
+// the pseudo-arch "source". With "source" allowlisted, a 404 on the flat
+// Sources.gz is skipped and then refused by the serve-contract guard, and
+// the guard's ERROR line and acu_adoption_serve_target_missing_total name
+// the architecture "source", not the "all" fallback.
+func TestAdopter_FlatSourcesGuardMissNamesSource(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newReconcileAdopter(t, env, []string{"amd64", "source"}) // tolerant
+	var logs lockedBuffer
+	ad.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	suite := SuiteRef{CanonicalScheme: "https", CanonicalHost: "pkgs.k8s.io", SuitePath: testFlatSuite}
+	trackSuite(t, env.cache, suite)
+	pkgs := fakePackagesStanzas(map[string]string{"amd64/kubelet_1.deb": strings.Repeat("a", 64)})
+	srcs := []byte("Package: kubelet\nDirectory: src\n")
+	releaseText, _ := makeRelease(map[string][]byte{"Packages.gz": gzipBytes(pkgs), "Sources.gz": gzipBytes(srcs)})
+	base := "https://pkgs.k8s.io" + testFlatSuite + "/"
+	env.fetcher.put(base+"Packages.gz", gzipBytes(pkgs))
+	env.fetcher.fail404(base + "Sources.gz")
+	missing := func() float64 {
+		return renderedFloat(t, renderedMetricLabels("acu_adoption_serve_target_missing_total", `arch="source"`))
+	}
+	before := missing()
+	err := ad.Run(ctx, suite, releaseText, "", "")
+	var me *AdoptionMemberError
+	if !errors.Is(err, ErrAdoptionGuardFailed) || !errors.As(err, &me) || me.Path != "Sources" {
+		t.Fatalf("Run = %v; want the serve-contract guard refusing the flat Sources group", err)
+	}
+	recs := logRecords(t, &logs, "adoption_blocked_serve_target_missing")
+	if len(recs) != 1 || recs[0]["group"] != "Sources" || recs[0]["architecture"] != "source" {
+		t.Fatalf("adoption_blocked_serve_target_missing = %v, want one line, group Sources, architecture source", recs)
+	}
+	if d := missing() - before; d != 1 {
+		t.Errorf(`acu_adoption_serve_target_missing_total{arch="source"} moved by %v, want 1`, d)
+	}
+}
+
 // skipReason returns the reason of the adoption_member_skipped line for
 // path in the JSON log text, "" without one.
 func skipReason(text, path string) string {
@@ -1316,10 +1407,29 @@ In `internal/freshness/reconcile_test.go`, replace
 with
 
 ```go
-	// Deferred minor D-27: refused by the hash check, not by anything else.
-	if _, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, false); err == nil || !strings.Contains(err.Error(), "hash mismatch") {
+	// Deferred minor D-27: refused by the hash check, not by anything else
+	// (the anchor check's own text: "hash mismatch" alone also matches
+	// adoption.go's "hash mismatch sanity").
+	if _, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, false); err == nil || !strings.Contains(err.Error(), "anchor blob hash mismatch") {
 		t.Errorf("ReconcileSnapshot = %v; want the corrupted (hash-mismatched) anchor blob refused by its hash check", err)
 	}
+```
+
+In `internal/freshness/reconcile_test.go`, replace
+
+```go
+	"os"
+	"reflect"
+	"strings"
+```
+
+with
+
+```go
+	"os"
+	"reflect"
+	"strconv"
+	"strings"
 ```
 
 and add before `// newReconcileAdopter constructs an Adopter over env.cache with the given` in `internal/freshness/reconcile_test.go`:
@@ -1328,7 +1438,8 @@ and add before `// newReconcileAdopter constructs an Adopter over env.cache with
 // Spec C5 (layout-aware IndexTargets) on the reconcile side: a flat
 // snapshot that lost its root Packages members is pending a reconcile —
 // its "all" group is required with no allowlist — and the heal fetches
-// both variants back into the same snapshot.
+// both variants back into the same snapshot, each counted under the
+// "all" architecture of acu_adoption_reconciled_total (the flat label).
 func TestReconcileSnapshot_HealsAFlatSuitesPackages(t *testing.T) {
 	ctx := context.Background()
 	env := newAdoptionTestEnv(t)
@@ -1351,8 +1462,12 @@ func TestReconcileSnapshot_HealsAFlatSuitesPackages(t *testing.T) {
 	if _, pending, err := ad.reconcilePending(ctx, suite, snapID); err != nil || !pending {
 		t.Fatalf("reconcilePending = %v, %v; want the flat suite's missing Packages pending", pending, err)
 	}
+	before := reconciledAll(t)
 	if n, err := ad.ReconcileSnapshot(ctx, suite, snapID, false); err != nil || n != 2 {
 		t.Fatalf("ReconcileSnapshot = %d, %v; want both Packages variants healed", n, err)
+	}
+	if d := reconciledAll(t) - before; d != 2 {
+		t.Errorf(`acu_adoption_reconciled_total{architecture="all"} moved by %v, want 2 (one per healed flat variant)`, d)
 	}
 	paths := snapshotPaths(t, env.cache, snapID)
 	for _, m := range []string{"Packages", "Packages.gz"} {
@@ -1360,6 +1475,29 @@ func TestReconcileSnapshot_HealsAFlatSuitesPackages(t *testing.T) {
 			t.Errorf("healed %s = %q, want %q", m, paths[m], hashes[m])
 		}
 	}
+}
+
+// reconciledAll returns acu_adoption_reconciled_total{architecture="all"}
+// as metrics.Default renders it (0 before its first heal). The registry is
+// process-wide and no freshness test runs in parallel, so callers compare
+// before and after.
+func reconciledAll(t *testing.T) float64 {
+	t.Helper()
+	return renderedFloat(t, renderedMetricLabels("acu_adoption_reconciled_total", `architecture="all"`))
+}
+
+// renderedFloat parses a value renderedMetric or renderedMetricLabels
+// returned; "" (no series yet) is 0.
+func renderedFloat(t *testing.T, v string) float64 {
+	t.Helper()
+	if v == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil {
+		t.Fatalf("parse metric value %q: %v", v, err)
+	}
+	return f
 }
 ```
 
@@ -1861,7 +1999,9 @@ Expected: PASS (no other package calls these unexported predicates; the handler'
 | E-9: the 4xx skip line without `declared_sha512` | `TestAdopter_SkippedSHA512OnlyMemberNamesItsHash` (`adoption_member_skipped = map[… path:Contents-amd64 reason:4xx …], want Contents-amd64 skipped (4xx) with its declared_sha512`) |
 | E-9: the filter's skip line without it | `TestAdopter_SkippedSHA512OnlyMemberNamesItsHash` (`… path:Contents-arm64 reason:arch_not_in_allowlist …`) |
 | E-9: the tolerated failure's skip line without it | `TestAdopter_SkippedSHA512OnlyMemberNamesItsHash` (`… path:Contents-all reason:optional_member_integrity …`) |
-| D-27: the anchor check's error says something other than `hash mismatch` (another refusal) | `TestReconcileSnapshot_RejectsCorruptedAnchor` (`ReconcileSnapshot = reconcile: InRelease anchor blob hash differs …; want the corrupted (hash-mismatched) anchor blob refused by its hash check`) |
+| the serve-contract guard's architecture label from `indexTargetGroup("", g)` (`runShared`) | `TestAdopter_FlatSourcesGuardMissNamesSource` (`adoption_blocked_serve_target_missing = [map[… architecture:all … group:Sources …]], want one line, group Sources, architecture source`) |
+| the heal counter's architecture label from `indexTargetGroup("", m.Path)` (`reconcileSnapshot`) | `TestReconcileSnapshot_HealsAFlatSuitesPackages` (`acu_adoption_reconciled_total{architecture="all"} moved by 0, want 2 (one per healed flat variant)`) |
+| D-27: the anchor check's error reworded (the test matches its own text, `anchor blob hash mismatch`: `hash mismatch` alone also matches `adoption.go`'s `hash mismatch sanity`) | `TestReconcileSnapshot_RejectsCorruptedAnchor` (`ReconcileSnapshot = reconcile: InRelease anchor blob hash differs …; want the corrupted (hash-mismatched) anchor blob refused by its hash check`) |
 
 - [ ] **Step 6: Commit**
 
@@ -1989,15 +2129,18 @@ func TestParsePackages_OnlyStanzasWithoutSHA256Parse(t *testing.T) {
 }
 
 // Ruling R-G1's other side: a body with no Filename stanza at all — an
-// HTML error page, a foreign file — still fails its parse.
+// HTML error page, a foreign file — still fails its parse. The RFC822-shaped
+// bodies reach R-G1's tail and fail there ("no stanzas"); an HTML page has
+// no ':' on its first line, so it fails earlier, at that line ("malformed
+// header"), and never reaches the tail.
 func TestParsePackages_NoFilenameStanzaStillFails(t *testing.T) {
-	for name, body := range map[string]string{
-		"HTML error page":          "<html><head><title>404 Not Found</title></head><body>Not Found</body></html>\n",
-		"foreign file":             "Origin: Example\nLabel: Example\nSuite: stable\n",
-		"SHA512 only, no Filename": "Package: a\nSHA512: " + strings.Repeat("a", 128) + "\n",
+	for name, c := range map[string]struct{ body, err string }{
+		"HTML error page (fails at its first line)": {"<html><head><title>404 Not Found</title></head><body>Not Found</body></html>\n", "malformed header"},
+		"foreign file":             {"Origin: Example\nLabel: Example\nSuite: stable\n", "no stanzas"},
+		"SHA512 only, no Filename": {"Package: a\nSHA512: " + strings.Repeat("a", 128) + "\n", "no stanzas"},
 	} {
-		if _, _, err := parsePackages([]byte(body)); err == nil {
-			t.Errorf("%s: parsePackages succeeded, want a parse error", name)
+		if _, _, err := parsePackages([]byte(c.body)); err == nil || !strings.Contains(err.Error(), c.err) {
+			t.Errorf("%s: parsePackages = %v, want a parse error containing %q", name, err, c.err)
 		}
 	}
 }
@@ -2070,9 +2213,10 @@ Append to `internal/freshness/flat_adoption_test.go`:
 // Ruling R-G1 end to end: a signed suite whose Packages declares only
 // SHA512 in every stanza adopts — its snapshot's coverage incomplete
 // (package_coverage_incomplete, reason no_sha256), no .deb vouched — where
-// it failed adoption_parse_failed at every check before. An HTML page
-// declared as the Packages member (a broken publisher) still fails the
-// adoption, and nothing is adopted.
+// it failed adoption_parse_failed at every check before. A foreign
+// RFC822-shaped file declared as the Packages member (a broken publisher)
+// still fails the adoption at R-G1's tail, and nothing is adopted; so does
+// an HTML page, which fails earlier, at its first line.
 func TestAdopter_PackagesWithoutAnySHA256AdoptsIncomplete(t *testing.T) {
 	ctx := context.Background()
 	deb := "/ubuntu/pool/main/a/a_1_amd64.deb"
@@ -2099,19 +2243,23 @@ func TestAdopter_PackagesWithoutAnySHA256AdoptsIncomplete(t *testing.T) {
 			t.Fatalf("package_coverage_incomplete = %v, want one line, reason no_sha256, 1 stanza", recs)
 		}
 	})
-	t.Run("an HTML page", func(t *testing.T) {
-		env := newAdoptionTestEnv(t)
-		html := []byte("<html><body>Not Found</body></html>\n")
-		env.fetcher.put(noble+"main/binary-amd64/Packages", html)
-		rel := hashRelease("Origin: x\n", true, false, map[string][]byte{"main/binary-amd64/Packages": html}, nil)
-		if err := env.adopter.Run(ctx, env.suite, rel, "", ""); !errors.Is(err, ErrAdoptionParseFailed) {
-			t.Fatalf("Run = %v, want ErrAdoptionParseFailed", err)
-		}
-		sf, err := env.cache.GetSuiteFreshness(ctx, env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
-		if err != nil || sf.CurrentSnapshotID != nil {
-			t.Fatalf("row %+v, %v; want nothing adopted", sf, err)
-		}
-	})
+	for name, body := range map[string]string{
+		"a foreign RFC822 file": "Origin: x\nLabel: y\nSuite: stable\n",
+		"an HTML page":          "<html><body>Not Found</body></html>\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := newAdoptionTestEnv(t)
+			env.fetcher.put(noble+"main/binary-amd64/Packages", []byte(body))
+			rel := hashRelease("Origin: x\n", true, false, map[string][]byte{"main/binary-amd64/Packages": []byte(body)}, nil)
+			if err := env.adopter.Run(ctx, env.suite, rel, "", ""); !errors.Is(err, ErrAdoptionParseFailed) {
+				t.Fatalf("Run = %v, want ErrAdoptionParseFailed", err)
+			}
+			sf, err := env.cache.GetSuiteFreshness(ctx, env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+			if err != nil || sf.CurrentSnapshotID != nil {
+				t.Fatalf("row %+v, %v; want nothing adopted", sf, err)
+			}
+		})
+	}
 }
 ```
 
@@ -2165,9 +2313,10 @@ with
 ```go
 	if len(out) == 0 && len(noSHA256) == 0 && len(bytes.TrimSpace(text)) > 0 {
 		// A non-blank input in which no stanza names a Filename is no
-		// Packages index — a downloaded HTML error page, a foreign or
-		// truncated file. The freshness layer logs it as
-		// adoption_parse_failed and the next periodic tick retries.
+		// Packages index — a foreign or truncated file (a real HTML error
+		// page usually fails earlier, at its first line: malformed
+		// header). The freshness layer logs it as adoption_parse_failed
+		// and the next periodic tick retries.
 		//
 		// AIDEV-NOTE: ruling R-G1 (the E carry-forward). A body whose
 		// stanzas all name a Filename but none a SHA256 (an index that
@@ -2236,6 +2385,34 @@ func validateFilename(f string) error {
 }
 ```
 
+In `internal/freshness/packages_parse.go` (the gap branch; the Task 3 review's Minor 2: gap Filenames stay count-only), replace
+
+```go
+		// Filename without a SHA256 is reported (spec C5 no_sha256):
+		// the caller makes coverage incomplete rather than dropping it
+		// silently.
+		if filename == "" || sha256 == "" {
+```
+
+with
+
+```go
+		// Filename without a SHA256 is reported (spec C5 no_sha256):
+		// the caller makes coverage incomplete rather than dropping it
+		// silently.
+		//
+		// AIDEV-NOTE: a gap Filename is deliberately NOT passed through
+		// validateFilename. It becomes no row and no path: the caller
+		// only counts the distinct names (buildPackageHashes logs
+		// no_sha256_stanzas), never a name. Since ruling R-G1 a
+		// body made only of such stanzas parses, so a signed index of
+		// odd gap names (even "/etc/x") adopts with incomplete coverage;
+		// that is harmless while the names stay count-only. If a gap
+		// Filename ever reaches a path, a log value or a row, validate it
+		// here first, fatal like a row's.
+		if filename == "" || sha256 == "" {
+```
+
 - [ ] **Step 4: Run the tests**
 
 Run: `go test ./internal/freshness/ -run 'TestParsePackages|TestValidateFilename|TestAdopter_PackagesWithoutAnySHA256AdoptsIncomplete' -v`
@@ -2254,7 +2431,7 @@ Expected: PASS.
 | a name of only `.` segments accepted (`_ = named`) | `TestParsePackages_BadFilename/only_dots`, `TestValidateFilename` (`validateFilename(".") = <nil>, want ok=false`) |
 | `%` refused (`"?#%"`) | `TestParsePackages_KeepsDotAndPercentFilenamesLiterally` (`invalid filename "pool/p/pkg_1%3a2_amd64.deb": contains URL delimiter`), `TestValidateFilename` |
 | R-G1 undone: the error fires whenever no row was kept (`len(out) == 0`) | `TestAdopter_PackagesWithoutAnySHA256AdoptsIncomplete` (`Run = adoption_parse_failed: …: packages: no stanzas with a Filename; want the SHA512-only index adopted (ruling R-G1)`), `TestParsePackages_OnlyStanzasWithoutSHA256Parse`, `TestParsePackages_CapCountsStanzasWithoutSHA256/gaps_alone_up_to_the_cap` |
-| R-G1 overdone: a body with no Filename stanza parses (`if false`) | `TestParsePackages_NonEmptyButNoUsableStanzas` (`want no-stanzas error, got <nil>`), `TestParsePackages_NoFilenameStanzaStillFails` (`foreign file: parsePackages succeeded, want a parse error`) |
+| R-G1 overdone: a body with no Filename stanza parses (`if false`) | `TestParsePackages_NonEmptyButNoUsableStanzas` (`want no-stanzas error, got <nil>`), `TestParsePackages_NoFilenameStanzaStillFails` (`foreign file: parsePackages = <nil>, want a parse error containing "no stanzas"`, and `SHA512 only, no Filename`; the HTML page fails at its first line, `malformed header`, either way), `TestAdopter_PackagesWithoutAnySHA256AdoptsIncomplete/a_foreign_RFC822_file` (`Run = <nil>, want ErrAdoptionParseFailed`) |
 | an empty segment accepted | `TestParsePackages_BadFilename/empty_segment`, `TestValidateFilename` (`validateFilename("a//b.deb") = <nil>, want ok=false`) |
 | a `..` segment accepted | `TestParsePackages_BadFilename/dotdot` and `/leading_dotdot`, `TestValidateFilename` (`validateFilename("a/../b.deb") = <nil>, want ok=false`) |
 | a backslash accepted | `TestParsePackages_BadFilename/backslash`, `TestValidateFilename` (`validateFilename("a\\b.deb") = <nil>, want ok=false`) |
@@ -2495,21 +2672,36 @@ func TestAdopter_MaterialisesFlatPackageRows(t *testing.T) {
 // dists-only). A flat Release with no root Packages at all has incomplete
 // coverage (no_packages_members), and a root Packages whose stanzas all
 // lack a SHA256 (ruling R-G1) adopts with incomplete coverage (no_sha256).
+//
+// The Sources fixture parses (Directory: src; ParseSources refuses "."),
+// and the adoption must log no source_parse_failed, so a flat-aware
+// buildSourceHashes would show up as a /repo/src/a_1.dsc row. A root
+// Packages.diff/Index never reaches buildPdiffHashes (isPdiffIndexMember
+// wants a "/" before it), so the nested binary-amd64 Index is the one that
+// reaches its dists-only guard: a flat-aware builder would row its patch.
 func TestAdopter_FlatCoverageReadsTheRootPackagesOnly(t *testing.T) {
 	suite := SuiteRef{CanonicalScheme: "https", CanonicalHost: "h", SuitePath: "/repo"}
 	pkgs := fakePackagesStanzas(map[string]string{"./a_1_amd64.deb": testHex64})
 	nested := fakePackagesStanzas(map[string]string{"./nested_1_amd64.deb": strings.Repeat("b", 64)})
-	sources := []byte("Package: a\nBinary: a\nVersion: 1\nDirectory: .\nChecksums-Sha256:\n " + testHex64 + " 10 a_1.dsc\n")
-	pdiff := []byte("SHA256-Current: " + testHex64 + " 10\nSHA256-Patches:\n " + testHex64 + " 10 2026-10-20-0000.00\n")
+	sources := []byte("Package: a\nBinary: a\nVersion: 1\nDirectory: src\nChecksums-Sha256:\n " + testHex64 + " 10 a_1.dsc\n")
+	pdiff := []byte("SHA256-Current: " + testHex64 + " 10\nSHA256-Patches:\n " + testHex64 + " 10 2026-10-20-0000.00\n" +
+		"SHA256-Download:\n " + testHex64 + " 10 2026-10-20-0000.00.gz\n")
 	t.Run("root Packages only", func(t *testing.T) {
 		env := newAdoptionTestEnv(t)
+		var logs lockedBuffer
+		env.adopter.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 		snap := adoptFlat(t, env, suite, map[string][]byte{"Packages": pkgs, "sub/Packages": nested, "Sources": sources,
-			"Packages.diff/Index": pdiff})
+			"Packages.diff/Index": pdiff, "binary-amd64/Packages.diff/Index": pdiff})
 		if got, want := packageHashRows(t, env.cache, snap.SnapshotID), map[string]string{"/repo/./a_1_amd64.deb": "a_1_amd64.deb"}; !maps.Equal(got, want) {
 			t.Fatalf("package_hash rows = %v, want only the root Packages' %v", got, want)
 		}
 		if !snap.PackageCoverageComplete {
 			t.Fatal("package_coverage_complete = false, want true (a nested Packages is not the flat suite's)")
+		}
+		for _, msg := range []string{"source_parse_failed", "pdiff_index_parse_failed"} {
+			if recs := logRecords(t, &logs, msg); len(recs) != 0 {
+				t.Fatalf("%s = %v; want the fixtures parseable, so only the dists-only guards keep their rows out", msg, recs)
+			}
 		}
 	})
 	t.Run("no root Packages", func(t *testing.T) {
@@ -2629,6 +2821,46 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ph.CanonicalScheme, ph.CanonicalHost, ph.Path,
 		ph.DeclaredSHA256, ph.SnapshotID,
 		ph.PackageName, ph.Architecture, ph.Version, ph.FlatFilename); err != nil {
+```
+
+In `internal/cache/reconcile.go` (`insertPackageHashTx`'s AIDEV-NOTE: why `flat_filename` is neither probed nor healed; the Task 4 review's Minor 2), replace
+
+```go
+// silent ON CONFLICT DO NOTHING. If the package_hash column set ever changes,
+// update BOTH copies (and the heal UPDATE below).
+func insertPackageHashTx(ctx context.Context, tx *sql.Tx, ph PackageHash) error {
+```
+
+with
+
+```go
+// silent ON CONFLICT DO NOTHING. If the package_hash column set ever changes,
+// update BOTH copies (and the heal UPDATE below). flat_filename (phase G) is
+// in both INSERTs but neither probed nor healed here, on purpose: it follows
+// from the row's path and its snapshot's suite (DotClean of the Filename
+// relative to FlatBase), so a same-PK row always agrees, and no released
+// binary wrote a flat row with another value (v6 flat suites took
+// non_dists_layout and wrote none).
+func insertPackageHashTx(ctx context.Context, tx *sql.Tx, ph PackageHash) error {
+```
+
+In `internal/freshness/adoption.go` (`buildPackageHashes`' header: the case that still returns no rows; the Task 4 review's Minor 3), replace
+
+```go
+// it, and returns the dedup'd cache.PackageHash rows + the SPEC3 §7.5.4
+// coverage_complete bit for the snapshot. Returns coverage = false for
+// non-/dists/ layouts (with rows = nil); strict mode (§6.1) treats
+// such hosts as fail-through, never fail-closed.
+```
+
+with
+
+```go
+// it, and returns the dedup'd cache.PackageHash rows + the SPEC3 §7.5.4
+// coverage_complete bit for the snapshot. Returns coverage = false (with
+// rows = nil, logged reason non_dists_layout) for a suite path that is
+// neither a dists/ suite nor a canonical flat suite; strict mode (§6.1)
+// treats such hosts as fail-through, never fail-closed.
 ```
 
 In `internal/freshness/adoption.go`, replace
@@ -2775,6 +3007,10 @@ Expected: PASS.
 | `CommitAdoption`'s insert passes `""` for `flat_filename` | `TestPackageHash_FlatFilenamePersists` (`CommitAdoption's flat row: flat_filename "", want x_1_amd64.deb`), every flat subtest of `TestAdopter_MaterialisesFlatPackageRows` |
 | `insertPackageHashTx` passes `""` | `TestPackageHash_FlatFilenamePersists` (`insertPackageHashTx's flat row: flat_filename "", want amd64/z_1_amd64.deb`) |
 | a flat row's path is dot-cleaned | `TestAdopter_MaterialisesFlatPackageRows/NVIDIA_CUDA` (`package_hash rows = map[…/x86_64/cuda-toolkit_12.6.0-1_amd64.deb:…], want map[…/x86_64/./cuda-toolkit_12.6.0-1_amd64.deb:…]`), `/libnvidia-container`, `TestAdopter_FlatCoverageReadsTheRootPackagesOnly/root_Packages_only` |
+| `buildSourceHashes` given the flat base (its `dists/`-only guard bypassed) | `TestAdopter_FlatCoverageReadsTheRootPackagesOnly/root_Packages_only` (`package_hash rows = map[/repo/./a_1_amd64.deb:a_1_amd64.deb /repo/src/a_1.dsc:], want only the root Packages' map[/repo/./a_1_amd64.deb:a_1_amd64.deb]`), `/no_root_Packages` (`rows map[/repo/src/a_1.dsc:], coverage false; want none and incomplete`) |
+| `buildPdiffHashes` given the flat base | `TestAdopter_FlatCoverageReadsTheRootPackagesOnly/root_Packages_only` (`package_hash rows = map[/repo/./a_1_amd64.deb:a_1_amd64.deb /repo/binary-amd64/Packages.diff/2026-10-20-0000.00.gz:], want only the root Packages' …`) |
+
+The two builder rows need the subtest's fixtures to parse — `Directory: src` (`ParseSources` refuses `.`) and a nested `binary-amd64/Packages.diff/Index` with a `SHA256-Download` block (a root `Packages.diff/Index` never reaches `buildPdiffHashes`: `isPdiffIndexMember` wants a `/` before it) — which the subtest's `source_parse_failed`/`pdiff_index_parse_failed` check keeps true.
 
 - [ ] **Step 6: Commit**
 
@@ -2795,7 +3031,7 @@ Spec C6 "Lookup": `DeclaredHashesForPath` keeps its exact lookup (step 1) and, o
 - Modify: `internal/cache/adoption.go` (`DeclaredHashesForPath` split into `declaredHashesExact` and `declaredHashesBySuffix`; `declaredExactSQL`, the exact query with its keyed join; `maxFallbackSegments`, `flatSplits`, `declaredBySuffixSQL`; the `strings` import)
 
 **Interfaces:**
-- Consumes: `aptpath.DotClean`, `aptpath.FlatBase` (Task 1); `adoptPackages`, `pkgRow` (Task 4); `openCache`, `seedRow`, `seedBlob`, `sk` (cache tests).
+- Consumes: `aptpath.DotClean`, `aptpath.FlatBase` (Task 1); `adoptPackages`, `pkgRow` (Task 4); `openCache`, `seedRow`, `seedBlob`, `sk` (cache tests); the two retirement paths, `(*Cache).ApplyLegacyAuditDecisions` (`LegacyAuditQuarantine`) and `(*Cache).ReapIdleSuite` (`ReapRegardless`).
 - Produces: `(*cache.Cache).DeclaredHashesForPath` with the fallback (same signature); unexported `declaredExactSQL`, `declaredHashesExact`, `declaredHashesBySuffix`, `flatSplits(path string) (bases, names []string)`, `declaredBySuffixSQL(n int) string`, `maxFallbackSegments`; test helpers `queryPlan`, `suiteFreshnessByKey` (`flat_lookup_test.go`).
 
 - [ ] **Step 1: Write the failing tests**
@@ -2807,6 +3043,7 @@ package cache
 
 import (
 	"context"
+	"database/sql"
 	"slices"
 	"strings"
 	"testing"
@@ -2860,6 +3097,7 @@ func TestDeclaredHashesForPath_FlatShapes(t *testing.T) {
 	deeper := deep + "/e" // 31 segments
 	adopt(deeper, pkgRow(deeper+"/x/z_1_amd64.deb", hashOf('8'), "x/z_1_amd64.deb"))
 	adopt("/a/flat2", pkgRow("/a/flat2/flat/x_1_amd64.deb", hashOf('9'), "flat/x_1_amd64.deb"))
+	adopt("/ubuntu/dists/noble", pkgRow("/ubuntu/pool/main/f/foo_1_amd64.deb", hashOf('e'), ""))
 	for _, tc := range []struct {
 		name, path string
 		want       []string
@@ -2880,7 +3118,11 @@ func TestDeclaredHashesForPath_FlatShapes(t *testing.T) {
 		{"a sibling a Filename names", "/a/flat/x_1_amd64.deb", []string{"9@/a/flat2"}},
 		{"a prefix of the base's last segment", "/fla/amd64/x_1_amd64.deb", nil},
 		{"an unrelated base", "/other/files/sublime_4180_amd64.deb", nil},
-		{"a dists suite's pool", "/ubuntu/pool/main/f/foo_1_amd64.deb", nil},
+		{"a dists suite's pool, exact", "/ubuntu/pool/main/f/foo_1_amd64.deb", []string{"e@/ubuntu/dists/noble"}},
+		// DotClean gives exactly the dists row's path, but a dists row's
+		// flat_filename is "": it never answers the fallback.
+		{"a dists row never answers the fallback", "/ubuntu/./pool/main/f/foo_1_amd64.deb", nil},
+		{"a dists row under another base", "/mirror/ubuntu/pool/main/f/foo_1_amd64.deb", nil},
 	} {
 		if got := declared(t, c, tc.path); !slices.Equal(got, tc.want) {
 			t.Errorf("%s: DeclaredHashesForPath(%s) = %v, want %v", tc.name, tc.path, got, tc.want)
@@ -2911,6 +3153,41 @@ func TestDeclaredHashesForPath_TheMostSpecificBaseWins(t *testing.T) {
 	}
 }
 
+// Spec C6 step 2 keeps EVERY row at the longest B, so step 3's dispatch
+// sees two signed suites at one base that declare different hashes for one
+// Filename, and refuses them as package_hash_conflict, instead of answering
+// with whichever row SQLite returned first: the twins of residual 2 reached
+// by a "./" request that misses their exact rows, and two channels of one
+// host-root repository (Sublime's apt/stable and apt/dev, B = ""). A
+// shorter B never joins the tie.
+func TestDeclaredHashesForPath_TiesAtTheLongestBaseAreAllKept(t *testing.T) {
+	c := openCache(t)
+	for _, a := range []struct {
+		suite string
+		row   PackageHash
+	}{
+		{"/t", pkgRow("/t/x_1_amd64.deb", hashOf('a'), "x_1_amd64.deb")},
+		{"/t/.", pkgRow("/t/x_1_amd64.deb", hashOf('b'), "x_1_amd64.deb")},
+		{"/u", pkgRow("/u/t/x_1_amd64.deb", hashOf('f'), "t/x_1_amd64.deb")}, // B = "": shorter
+		{"/apt/stable", pkgRow("/apt/stable/files/s_1_amd64.deb", hashOf('c'), "files/s_1_amd64.deb")},
+		{"/apt/dev", pkgRow("/apt/dev/files/s_1_amd64.deb", hashOf('d'), "files/s_1_amd64.deb")},
+	} {
+		seedRow(t, c, sk("h", a.suite), 1)
+		adoptPackages(t, c, sk("h", a.suite), []PackageHash{a.row}, true)
+	}
+	for _, tc := range []struct {
+		name, path string
+		want       []string
+	}{
+		{"the twins through ./", "/t/./x_1_amd64.deb", []string{"a@/t", "b@/t/."}},
+		{"two channels at the host root", "/files/s_1_amd64.deb", []string{"c@/apt/stable", "d@/apt/dev"}},
+	} {
+		if got := declared(t, c, tc.path); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: DeclaredHashesForPath(%s) = %v, want every row at the longest base %v", tc.name, tc.path, got, tc.want)
+		}
+	}
+}
+
 // Spec C6 "current signed non-retired snapshots only": the fallback sees
 // neither an unsigned snapshot's rows (spec C5 safeguard 5) nor a
 // displaced snapshot's.
@@ -2937,6 +3214,49 @@ func TestDeclaredHashesForPath_TheFallbackReadsCurrentSignedSnapshotsOnly(t *tes
 	for _, p := range []string{"/unsigned/u_1_amd64.deb", "/displaced/d_1_amd64.deb"} {
 		if got := declared(t, c, p); got != nil {
 			t.Errorf("DeclaredHashesForPath(%s) = %v, want nothing", p, got)
+		}
+	}
+}
+
+// Spec C6 "non-retired": a snapshot retired through either retirement
+// path — the legacy audit's quarantine and the reaper's delete — vouches
+// nothing, by its exact rows or through the fallback, although its
+// package_hash rows are still there. Both paths clear the current pointer
+// before they stamp retired_at; this pins that against a future
+// retirement path that leaves the pointer set.
+func TestDeclaredHashesForPath_ARetiredSnapshotVouchesNothing(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	quarantined, reaped := sk("h", "/quarantined"), sk("h", "/reaped")
+	seedRow(t, c, quarantined, 1)
+	seedRow(t, c, reaped, 1)
+	qID := adoptPackages(t, c, quarantined, []PackageHash{pkgRow("/quarantined/./q_1_amd64.deb", hashOf('a'), "q_1_amd64.deb")}, true)
+	rID := adoptPackages(t, c, reaped, []PackageHash{pkgRow("/reaped/./r_1_amd64.deb", hashOf('b'), "r_1_amd64.deb")}, true)
+	paths := []string{"/quarantined/./q_1_amd64.deb", "/quarantined/q_1_amd64.deb", "/reaped/./r_1_amd64.deb", "/reaped/r_1_amd64.deb"}
+	for _, p := range paths {
+		if got := declared(t, c, p); len(got) != 1 {
+			t.Fatalf("before retiring: DeclaredHashesForPath(%s) = %v, want one row", p, got)
+		}
+	}
+	if _, err := c.ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision{{SnapshotID: qID, Outcome: LegacyAuditQuarantine}}); err != nil {
+		t.Fatal(err)
+	}
+	if del, _, err := c.ReapIdleSuite(ctx, reaped, &rID, ReapRegardless); err != nil || !del {
+		t.Fatalf("ReapIdleSuite = %v, %v; want the suite reaped", del, err)
+	}
+	for _, id := range []int64{qID, rID} {
+		var retired sql.NullInt64
+		if err := c.db.QueryRowContext(ctx, `SELECT retired_at FROM suite_snapshot WHERE snapshot_id = ?`, id).Scan(&retired); err != nil || !retired.Valid {
+			t.Fatalf("snapshot %d: retired_at %v, %v; want it retired", id, retired, err)
+		}
+		var rows int
+		if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM package_hash WHERE snapshot_id = ?`, id).Scan(&rows); err != nil || rows != 1 {
+			t.Fatalf("snapshot %d: %d package_hash rows, %v; want its row still there", id, rows, err)
+		}
+	}
+	for _, p := range paths {
+		if got := declared(t, c, p); got != nil {
+			t.Errorf("after retiring: DeclaredHashesForPath(%s) = %v, want nothing", p, got)
 		}
 	}
 }
@@ -2973,14 +3293,23 @@ const suiteFreshnessByKey = "SEARCH sf USING INDEX sqlite_autoindex_suite_freshn
 // flat_filename (spec C6: "an EXPLAIN QUERY PLAN assertion pins it"), and
 // probes suite_freshness by its primary key, never scanning it (design
 // review M-2).
+//
+// It is pinned at every IN size production builds, up to the worst case
+// (maxFallbackSegments names), and no table is scanned.
 func TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex(t *testing.T) {
 	c := openCache(t)
-	plan := queryPlan(t, c, declaredBySuffixSQL(3), "http", "h", "a/b.deb", "b.deb", "x/a/b.deb")
-	if !strings.Contains(plan, "USING INDEX idx_package_hash_flat_filename") {
-		t.Fatalf("query plan does not use idx_package_hash_flat_filename:\n%s", plan)
-	}
-	if !strings.Contains(plan, suiteFreshnessByKey) || strings.Contains(plan, "SCAN sf") {
-		t.Fatalf("query plan does not probe suite_freshness by its key:\n%s", plan)
+	for _, n := range []int{1, 3, maxFallbackSegments} {
+		args := []any{"http", "h"}
+		for i := range n {
+			args = append(args, strings.Repeat("d/", i)+"b.deb")
+		}
+		plan := queryPlan(t, c, declaredBySuffixSQL(n), args...)
+		if !strings.Contains(plan, "USING INDEX idx_package_hash_flat_filename") {
+			t.Fatalf("n=%d: query plan does not use idx_package_hash_flat_filename:\n%s", n, plan)
+		}
+		if !strings.Contains(plan, suiteFreshnessByKey) || strings.Contains(plan, "SCAN ") {
+			t.Fatalf("n=%d: query plan scans a table or does not probe suite_freshness by its key:\n%s", n, plan)
+		}
 	}
 }
 
@@ -2989,8 +3318,8 @@ func TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex(t *testing.T) {
 func TestDeclaredHashesForPath_TheExactLookupProbesSuiteFreshnessByItsKey(t *testing.T) {
 	c := openCache(t)
 	plan := queryPlan(t, c, declaredExactSQL, "http", "h", "/a/b.deb")
-	if !strings.Contains(plan, suiteFreshnessByKey) || strings.Contains(plan, "SCAN sf") {
-		t.Fatalf("query plan does not probe suite_freshness by its key:\n%s", plan)
+	if !strings.Contains(plan, suiteFreshnessByKey) || strings.Contains(plan, "SCAN ") {
+		t.Fatalf("query plan scans a table or does not probe suite_freshness by its key:\n%s", plan)
 	}
 }
 ```
@@ -3074,9 +3403,12 @@ with
 // AIDEV-NOTE: the fallback is a constraint lookup, not a grant: a row it
 // finds only lets bytes through that hash to a signed declaration, and it
 // never runs when an exact row exists (so a dists suite's vouching is
-// unchanged). Its cost — one partial-index query — is paid by every
-// .deb no exact row vouches, which includes every .deb of a host with no
-// flat suite (an empty index range per name).
+// unchanged). Its cost — one partial-index query of at most 32 names — is
+// paid by every non-metadata request no exact row covers, including every
+// .deb of a host with no flat suite (an empty index range per name): on
+// the hit path once, on a miss twice (the pre-fetch gate and the
+// post-fetch dispatch), and once more for a strict-mode re-run after an
+// adoption wait.
 func (c *Cache) DeclaredHashesForPath(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
 	out, err := c.declaredHashesExact(ctx, scheme, host, path)
 	if err != nil || len(out) > 0 {
@@ -3274,17 +3606,20 @@ Expected: PASS.
 | the ancestor test without its `/` separators | `TestDeclaredHashesForPath_FlatShapes` (`a prefix of the base's last segment: DeclaredHashesForPath(/fla/amd64/x_1_amd64.deb) = [6@/flat/.], want []`) |
 | every kept row returned (no longest-`B` rule) | `TestDeclaredHashesForPath_TheMostSpecificBaseWins` (`fallback = [a@/a b@/a/b/c/sub], want the nested base's row [b@/a/b/c/sub]`) |
 | the shortest `B` wins | `TestDeclaredHashesForPath_TheMostSpecificBaseWins` (`fallback = [a@/a], want …`) |
-| the query without its non-empty `flat_filename` term | `TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex` (`query plan does not use idx_package_hash_flat_filename`) |
+| the query without its non-empty `flat_filename` term | `TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex` (`n=1: query plan does not use idx_package_hash_flat_filename`) |
 | `maxFallbackSegments = 33` | `TestDeclaredHashesForPath_FlatShapes` (`33 segments after DotClean: … = [8@/d/…/e], want []`) |
 | the query without its `anchor_form` filter | `TestDeclaredHashesForPath_TheFallbackReadsCurrentSignedSnapshotsOnly` (`DeclaredHashesForPath(/unsigned/u_1_amd64.deb) = [c@/unsigned], want nothing`) |
 | the fallback's join without its `current_snapshot_id` term (every snapshot of a tracked suite) | `TestDeclaredHashesForPath_TheFallbackReadsCurrentSignedSnapshotsOnly` (`DeclaredHashesForPath(/displaced/d_1_amd64.deb) = [d@/displaced], want nothing`), `TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex` (the probe becomes a covering-index search) |
 | no `DotClean` before the splits | `TestDeclaredHashesForPath_FlatShapes` (`twin, ./ after DotClean: … = [], want [6@/flat/.]`), `TestDeclaredHashesForPath_TheMostSpecificBaseWins` |
-| M-2: the exact lookup joins `suite_freshness` on `current_snapshot_id` alone | `TestDeclaredHashesForPath_TheExactLookupProbesSuiteFreshnessByItsKey` (`query plan does not probe suite_freshness by its key:` … `SCAN sf USING INDEX sqlite_autoindex_suite_freshness_1`) |
-| M-2: the fallback joins `suite_freshness` on `current_snapshot_id` alone | `TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex` (`query plan does not probe suite_freshness by its key:` … `SCAN sf USING INDEX sqlite_autoindex_suite_freshness_1`) |
+| M-2: the exact lookup joins `suite_freshness` on `current_snapshot_id` alone | `TestDeclaredHashesForPath_TheExactLookupProbesSuiteFreshnessByItsKey` (`query plan scans a table or does not probe suite_freshness by its key:` … `SCAN sf USING INDEX sqlite_autoindex_suite_freshness_1`) |
+| M-2: the fallback joins `suite_freshness` on `current_snapshot_id` alone | `TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex` (`n=1: query plan scans a table or does not probe suite_freshness by its key:` … `SCAN sf USING INDEX sqlite_autoindex_suite_freshness_1`) |
 | M-2: the exact lookup's keyed join without its `current_snapshot_id` term | `TestDeclaredHashesForPath_ReturnsCurrentSnapshotRowsOnly` (`len=2, want 1 (only current snapshot's row)`), `TestDeclaredHashesForPath_TheExactLookupProbesSuiteFreshnessByItsKey` |
 | PG-13, residual 1: the fallback vouches only paths under the row's suite's `FlatBase` (siblings never vouch) | `TestDeclaredHashesForPath_FlatShapes` (`a sibling a Filename names: DeclaredHashesForPath(/a/flat/x_1_amd64.deb) = [], want [9@/a/flat2]`, and the Jenkins `direct/` and Sublime rows), `TestDeclaredHashesForPath_TheMostSpecificBaseWins` |
+| the tie arm deleted (`case len(b) == best: out = append(out, d)`: one row per longest `B`) | `TestDeclaredHashesForPath_TiesAtTheLongestBaseAreAllKept` (`the twins through ./: DeclaredHashesForPath(/t/./x_1_amd64.deb) = [a@/t], want every row at the longest base [a@/t b@/t/.]`, and `two channels at the host root: … = [c@/apt/stable]`) |
+| the exact lookup on `DotClean(path)` | `TestDeclaredHashesForPath_FlatShapes` (`a dists row never answers the fallback: DeclaredHashesForPath(/ubuntu/./pool/main/f/foo_1_amd64.deb) = [e@/ubuntu/dists/noble], want []`, and `33 segments after DotClean: … = [8@/d/…/e], want []`) |
+| the legacy audit's quarantine leaves the current pointer set (a retired snapshot still current) | `TestDeclaredHashesForPath_ARetiredSnapshotVouchesNothing` (`after retiring: DeclaredHashesForPath(/quarantined/./q_1_amd64.deb) = [a@/quarantined], want nothing`, and `/quarantined/q_1_amd64.deb`) |
 
-Equivalent mutants (recorded, not failures): `flatSplits` without its `..` stop, or without its empty-segment stop — a `B` holding `..` or an empty segment is never an ancestor of a canonical `FlatBase`, and an `F` holding one never equals a `flat_filename` `validateFilename` let through, so both stops are defence in depth that spec C6 names; the ancestor test against the suite path instead of `FlatBase` — `B` never holds a `.` segment (`DotClean`), so it is an ancestor of `/flat` exactly when it is one of `/flat/.`.
+Equivalent mutants (recorded, not failures): `flatSplits` without its `..` stop, or without its empty-segment stop — a `B` holding `..` or an empty segment is never an ancestor of a canonical `FlatBase`, and an `F` holding one never equals a `flat_filename` `validateFilename` let through, so both stops are defence in depth that spec C6 names (Task 11's `TestFlatSplits` pins them on the function itself); the ancestor test against the suite path instead of `FlatBase` — `B` never holds a `.` segment (`DotClean`), so it is an ancestor of `/flat` exactly when it is one of `/flat/.`.
 
 - [ ] **Step 6: Commit**
 
@@ -3302,15 +3637,117 @@ Spec C5: "the handler's `snapshot_index_target_404` alert uses the same layout-a
 
 Ruling PG-2 (placed here by ruling PG-16: this task already reads `req.IsMetadata` and holds the handler's flat tests): `proxy.IsMetadata` never classifies a Debian pool artifact as metadata. Its prefix rule (`Packages`, `Sources`, `Contents-`, `Translation-`, `Components-`, `icons-`) collides with real package names — a package `icons-foo` puts `pool/…/icons-foo_1.0_all.deb` under `icons-`, and a flat repository may publish `Packages_1.0_all.deb` — and a pool artifact classified as metadata is freshness-revalidated, never hash-checked and never refused by strict mode. A basename ending in `.deb`, `.udeb`, `.ddeb`, `.dsc`, `.buildinfo`, `.changes` or `.diff.gz`, or holding a `_` and a `.tar.` component (a source tarball), is never metadata, whatever its prefix; by-hash and `.diff/Index` keep their rules (checked first). Two table tests pin both sides — the ruling's artifacts (and `.ddeb`, `.buildinfo`, `.changes` names with index prefixes) are not metadata, every real metadata basename (`Packages`, `Packages.xz`, `Sources.gz`, `Contents-amd64.gz`, `Contents-udeb-amd64.gz`, `Contents-source.gz`, `Translation-en.bz2`, `Translation-pt_BR.xz`, `Components-amd64.yml.gz`, `icons-48x48.tar.gz`, `icons-64x64@2.tar.gz`, `InRelease`, `Release`, `Release.gpg`, a by-hash path, `Packages.diff/Index`) stays metadata, each under a `dists/` component and a flat directory — and a handler test shows the point: on a strict host an unvouched `…/icons-foo_1.0_all.deb` and a flat `Packages_1.0_all.deb` are refused like any `.deb` (before the ruling both were served as metadata). Residual (in the AIDEV-NOTE; Task 16 documents it): a url_path row an earlier binary stored for such a `.deb` keeps `is_metadata = 1` until it is refetched; serving and strict mode read the request's classification, so only the admin page's hot paths show it (their Kind column and the status JSON's `hot_url_paths[].is_metadata`). `internal/proxy/classify.go` holds no deferred minor (A-10 and A-13 are in `proxy.go` and `url.go`, which no task changes).
 
+Ruling PG-22 (the Task 6 review's Important 1): the one-line-a-minute limiter is written once, as `observability.LogLimiter` (`internal/observability/loglimit.go`; the package exists, so this adds none): `Allow(now, every)` reports, under a mutex, whether a line may be emitted at `now` and how many calls it refused since the last line, and restarts that count when it allows one. Its zero value is ready, and the interval is each call site's constant — an argument, not a field, because the handler tests build `Handler` literals that no constructor fills. `flat_host_root_unsupported` uses it, and so does phase D's `suite_seed_rejected` (`noteCreate`), whose hand-written copy (the `seedWarn` type) it replaces; Task 10's over-cap WARN uses it from the start. The host-root line is logged only for a host the allowlist admits (`h.fetch.HostAllowed`): a forbidden host's miss is refused 403, and the line's `canonical_host` and `detail` would be wrong; the limit is process-wide, not per host (the Task 6 review's Minors 1 and 3). Ruling PG-2's residual is pinned on the hit path too: a url_path row an earlier binary stored with `is_metadata = 1` for a `.deb` is hash-checked like any `.deb`, so a strict host refuses its unvouched hit (Minor 4). `strictLogBuf` gains a locked `reset` (Minor 2).
+
 **Files:**
-- Create: `internal/handler/flat_root.go`, `internal/handler/flat_root_test.go`, `internal/handler/pool_artifact_test.go`
-- Modify: `internal/handler/handler.go` (the `Handler.flatRoot` field, `ServeHTTP`'s host-root check, `trySnapshotHit`'s alert, `flatIndexTargetPathRE`, `isIndexTargetPath`, `indexTargetArch`), `internal/handler/path_class_test.go`, `internal/proxy/classify.go` (`poolArtifactSuffixes`, `isPoolArtifact`, `IsMetadata`; ruling PG-2), `internal/proxy/proxy_test.go`
+- Create: `internal/observability/loglimit.go`, `internal/observability/loglimit_test.go` (ruling PG-22), `internal/handler/flat_root.go`, `internal/handler/flat_root_test.go`, `internal/handler/pool_artifact_test.go`
+- Modify: `internal/handler/handler.go` (the `observability` import, the `Handler.seedWarn` and `Handler.flatRoot` fields, `ServeHTTP`'s host-root check, `trySnapshotHit`'s alert, `flatIndexTargetPathRE`, `isIndexTargetPath`, `indexTargetArch`), `internal/handler/path_class_test.go`, `internal/proxy/classify.go` (`poolArtifactSuffixes`, `isPoolArtifact`, `IsMetadata`; ruling PG-2), `internal/proxy/proxy_test.go`, `internal/handler/suite_rows.go` (`seedWarnEvery`'s comment, the `seedWarn` type removed, `noteCreate`'s limiter; ruling PG-22), `internal/handler/phase3_strict_test.go` (`strictLogBuf.reset`)
 
 **Interfaces:**
-- Consumes: `aptpath.IsFlatSuitePath`, `aptpath.IsFlatHostRootPath` (Task 1); `newTestHandlerWithServe`, `commitInlineSnapshot`, `writeBlob`, `splitURL`, `newProxyReqHostPort`, `strictLogBuf`, `recFetcher`, `rowInRelease`, `simtest.OpenCache`, `simtest.ClearsignedFixture`, `newPhase3StrictHandlerCapturing`, `adoptCoverageComplete`, `hostKey`, `proxyReq` (handler tests).
-- Produces: `isIndexTargetPath(suitePath, p string) bool`, `indexTargetArch(suitePath, p string) string`, `(*Handler).noteFlatHostRoot(req *proxy.Request)`, `flatRootWarn`, `flatRootWarnEvery`; test helper `metricValue(t, series string) float64` (used by Tasks 10, 11); `proxy.IsMetadata` with the pool-artifact rule (same signature), unexported `poolArtifactSuffixes`, `isPoolArtifact(base string) bool`.
+- Consumes: `aptpath.IsFlatSuitePath`, `aptpath.IsFlatHostRootPath` (Task 1); `newTestHandlerWithServe`, `commitInlineSnapshot`, `writeBlob`, `splitURL`, `newProxyReqHostPort`, `strictLogBuf`, `recFetcher`, `rowInRelease`, `simtest.OpenCache`, `simtest.ClearsignedFixture`, `newPhase3StrictHandlerCapturing`, `adoptCoverageComplete`, `hostKey`, `proxyReq`, `hostsem.New` (handler tests).
+- Produces: `isIndexTargetPath(suitePath, p string) bool`, `indexTargetArch(suitePath, p string) string`, `(*Handler).noteFlatHostRoot(req *proxy.Request)`, `flatRootWarnEvery`; `observability.LogLimiter` with `(*LogLimiter).Allow(now time.Time, every time.Duration) (ok bool, suppressed int)` (used by Task 10); test helpers `(*strictLogBuf).reset()` (`phase3_strict_test.go`) and `denyHostFetcher` (`flat_root_test.go`); test helper `metricValue(t, series string) float64` (used by Tasks 10, 11); `proxy.IsMetadata` with the pool-artifact rule (same signature), unexported `poolArtifactSuffixes`, `isPoolArtifact(base string) bool`.
 
 - [ ] **Step 1: Write the failing tests**
+
+Create `internal/observability/loglimit_test.go` (ruling PG-22):
+
+```go
+package observability
+
+import (
+	"sync"
+	"testing"
+	"time"
+)
+
+// The first call is allowed; calls inside the interval are refused and
+// counted; the next allowed call reports the count and resets it; the
+// interval runs from the last allowed call, not the last refused one; and
+// a clock that steps backwards stays throttled.
+func TestLogLimiter_AllowsOneLinePerInterval(t *testing.T) {
+	var l LogLimiter
+	t0 := time.Unix(1_800_000_000, 0)
+	for _, c := range []struct {
+		at         time.Duration
+		ok         bool
+		suppressed int
+	}{
+		{0, true, 0}, // the first call: a zero last
+		{time.Second, false, 0},
+		{59 * time.Second, false, 0},
+		{-time.Hour, false, 0}, // a step backwards is still inside the interval
+		{time.Minute, true, 3}, // exactly one interval later: allowed, three hidden
+		{time.Minute + time.Second, false, 0},
+		{2 * time.Minute, true, 1}, // the count restarted from zero
+		{10 * time.Minute, true, 0},
+	} {
+		ok, suppressed := l.Allow(t0.Add(c.at), time.Minute)
+		if ok != c.ok || suppressed != c.suppressed {
+			t.Fatalf("Allow(t0%+v) = (%v, %d), want (%v, %d)", c.at, ok, suppressed, c.ok, c.suppressed)
+		}
+	}
+}
+
+// Concurrent callers (run with -race): of n calls at one instant exactly
+// one is allowed, and the next interval's line reports the other n-1; of a
+// second round spread over that interval, again exactly one.
+func TestLogLimiter_ConcurrentCallsAllowOneAndCountTheRest(t *testing.T) {
+	const n = 64
+	var l LogLimiter
+	t0 := time.Unix(1_800_000_000, 0)
+	round := func(at func(i int) time.Time) (allowed, reported int) {
+		var (
+			mu sync.Mutex
+			wg sync.WaitGroup
+		)
+		for i := range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ok, suppressed := l.Allow(at(i), time.Minute)
+				mu.Lock()
+				defer mu.Unlock()
+				if ok {
+					allowed++
+					reported += suppressed
+				}
+			}()
+		}
+		wg.Wait()
+		return allowed, reported
+	}
+	if allowed, reported := round(func(int) time.Time { return t0 }); allowed != 1 || reported != 0 {
+		t.Fatalf("first round: %d allowed reporting %d suppressed, want 1 reporting 0", allowed, reported)
+	}
+	t1 := t0.Add(time.Minute)
+	if allowed, reported := round(func(i int) time.Time { return t1.Add(time.Duration(i) * time.Millisecond) }); allowed != 1 || reported != n-1 {
+		t.Fatalf("second round: %d allowed reporting %d suppressed, want 1 reporting %d", allowed, reported, n-1)
+	}
+	if ok, suppressed := l.Allow(t1.Add(2*time.Minute), time.Minute); !ok || suppressed != n-1 {
+		t.Fatalf("after the second round: (%v, %d), want (true, %d)", ok, suppressed, n-1)
+	}
+}
+```
+
+In `internal/handler/phase3_strict_test.go`, replace
+
+```go
+func (b *strictLogBuf) records() []map[string]any {
+```
+
+with
+
+```go
+// reset drops every captured record, under the lock a late writer (a
+// touchAsync WARN of an earlier request) takes too.
+func (b *strictLogBuf) reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
+}
+
+func (b *strictLogBuf) records() []map[string]any {
+```
 
 In `internal/handler/path_class_test.go`, replace
 
@@ -3488,6 +3925,62 @@ func TestServeHTTP_FlatHostRootIsUnsupportedAndSaysSo(t *testing.T) {
 	})
 }
 
+// denyHostFetcher is a recFetcher whose allowlist refuses one host.
+type denyHostFetcher struct {
+	*recFetcher
+	deny string
+}
+
+func (f denyHostFetcher) HostAllowed(host string) bool { return host != f.deny }
+
+// Plan design note 2's flat_host_root_unsupported, two more properties
+// (the Task 6 review's minors): a host-root request to a host the
+// allowlist forbids is refused (403 on a miss) and never takes the
+// minute's one line, whose canonical_host and "served from the ordinary
+// cache" would then be wrong; and the limit is process-wide, not per host
+// (the AIDEV-NOTE's flood argument), so a second host's host-root request
+// inside the minute is folded into the next line's suppressed count.
+func TestServeHTTP_FlatHostRootLineNamesAnAllowedHostOncePerMinute(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		parser, err := proxy.New(nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		logs := &strictLogBuf{}
+		h, err := New(Config{Parser: parser, Cache: simtest.OpenCache(t),
+			Fetch:  denyHostFetcher{recFetcher: &recFetcher{body: rowInRelease}, deny: "forbidden.example"},
+			Logger: slog.New(slog.NewJSONHandler(logs, nil)), HostLimiter: hostsem.New(4), AdoptionEnabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(h.Close)
+		get := func(url string, want int) {
+			t.Helper()
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+			if rec.Code != want {
+				t.Fatalf("%s = %d, want %d", url, rec.Code, want)
+			}
+		}
+		get("http://forbidden.example/InRelease", http.StatusForbidden)
+		if recs := logs.find("flat_host_root_unsupported"); len(recs) != 0 {
+			t.Fatalf("flat_host_root_unsupported = %v for a forbidden host, want none", recs)
+		}
+		get("http://root.example/InRelease", http.StatusOK)
+		get("http://other.example/InRelease", http.StatusOK) // another host, the same minute
+		recs := logs.find("flat_host_root_unsupported")
+		if len(recs) != 1 || recs[0]["canonical_host"] != "root.example" || recs[0]["suppressed"] != float64(0) {
+			t.Fatalf("flat_host_root_unsupported = %v, want one line, for root.example, suppressed 0", recs)
+		}
+		time.Sleep(time.Minute)
+		get("http://other.example/./InRelease", http.StatusOK)
+		recs = logs.find("flat_host_root_unsupported")
+		if len(recs) != 2 || recs[1]["canonical_host"] != "other.example" || recs[1]["suppressed"] != float64(1) {
+			t.Fatalf("flat_host_root_unsupported = %v, want a second line a minute later counting other.example's (suppressed 1)", recs)
+		}
+	})
+}
+
 // Spec C5 on the handler side: the snapshot_index_target_404 alert is
 // layout-aware. A flat suite's root Packages* or Sources* missing from its
 // snapshot raises it, labelled "all" or "source" (the flat arch labels,
@@ -3516,7 +4009,7 @@ func TestServeHTTP_FlatSnapshotMissIndexTargetRaisesAlert(t *testing.T) {
 	} {
 		series := `acu_serve_snapshot_index_target_404_total{architecture="` + tc.arch + `"}`
 		before := metricValue(t, series)
-		logs.buf.Reset()
+		logs.reset()
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, newProxyReqHostPort("GET", scheme, host+port, tc.path))
 		if rec.Code != http.StatusNotFound {
@@ -3584,9 +4077,13 @@ Create `internal/handler/pool_artifact_test.go` (ruling PG-2 through the handler
 package handler
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
 // Ruling PG-2 through the handler: on a strict host, an unvouched .deb
@@ -3610,9 +4107,38 @@ func TestServeHTTP_StrictRefusesAnUnvouchedDebNamedLikeAnIndex(t *testing.T) {
 		t.Fatalf("%d unvouched_deb_refused lines, want %d", n, len(paths))
 	}
 }
+
+// Ruling PG-2's residual on the hit path: a url_path row an older binary
+// stored with is_metadata = 1 for a pool artifact is still hash-checked —
+// serving reads the request's classification, not the stored column — so
+// on a strict host its unvouched hit is refused like any .deb, its cached
+// bytes never served.
+func TestServeHTTP_StrictRefusesAnOldMetadataRowOfADebOnItsHit(t *testing.T) {
+	h, srv, logs := newPhase3StrictHandlerCapturing(t, true, true, nil)
+	scheme, host, port := splitURL(t, srv.URL)
+	canon := hostKey(host, port)
+	adoptCoverageComplete(t, h, scheme, canon, "/dists/noble", true)
+	const debPath = "/pool/main/i/icons-foo/icons-foo_1.0_all.deb"
+	blob := writeBlob(t, h, []byte("an icons-foo .deb an old binary cached as metadata"))
+	if err := h.cache.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: scheme, CanonicalHost: canon,
+		Path: debPath, BlobHash: &blob, UpstreamURL: srv.URL + debPath, IsMetadata: true}); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srv.URL, debPath))
+	if rec.Code != http.StatusBadGateway || strings.Contains(rec.Body.String(), "old binary cached") {
+		t.Fatalf("status %d body %q; want the strict refusal and no cached bytes", rec.Code, rec.Body.String())
+	}
+	if n := len(logs.find("unvouched_deb_refused")); n != 1 {
+		t.Fatalf("%d unvouched_deb_refused lines, want 1", n)
+	}
+}
 ```
 
 - [ ] **Step 2: Run to verify failure**
+
+Run: `go test -gcflags=-e ./internal/observability/`
+Expected: FAIL — `undefined: LogLimiter` (`loglimit_test.go`).
 
 Run: `go test -gcflags=-e ./internal/handler/`
 Expected: FAIL — `too many arguments in call to isIndexTargetPath` (`have (string, string)`, `want (string)`; three calls in `path_class_test.go`) and `undefined: indexTargetArch`. (`TestServeHTTP_StrictRefusesAnUnvouchedDebNamedLikeAnIndex` compiles on the old code; run alone there it fails `/pool/main/i/icons-foo/icons-foo_1.0_all.deb: status 200, Retry-After ""; want the strict refusal (502, 60)`, the same for `/flat/Packages_1.0_all.deb`, and `0 unvouched_deb_refused lines, want 2`.)
@@ -3622,13 +4148,60 @@ Expected: FAIL — `TestIsMetadata_PoolArtifactsAreNeverMetadata` (`IsMetadata("
 
 - [ ] **Step 3: Implement**
 
+Create `internal/observability/loglimit.go`:
+
+```go
+package observability
+
+import (
+	"sync"
+	"time"
+)
+
+// LogLimiter rate-limits one log line: at most one line per interval,
+// counting the calls it suppressed in between so the next line can say how
+// many it hid. Its zero value is ready to use, and it is safe for
+// concurrent use. It starts no goroutine.
+//
+// AIDEV-NOTE: ruling PG-22 (phase G). This is the one copy of the
+// one-line-a-minute WARN limiter: suite_seed_rejected (handler
+// noteCreate), flat_host_root_unsupported (handler noteFlatHostRoot) and
+// the anchorless over-cap WARN (freshness noteAnchorlessOverCap) all use
+// it. Its two subtle points live here only: the first call is always
+// allowed (a zero last), and the suppressed count resets when a line is
+// allowed. Pass monotonic time (time.Now()), so a wall-clock step can
+// neither unthrottle it nor silence it. Emit the line after Allow returns:
+// the lock covers only the bookkeeping.
+type LogLimiter struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+
+// Allow reports whether a line may be emitted at now, at most one per
+// every (the call site's constant). When it may (ok), suppressed is the
+// number of calls refused since the previous allowed one, and the count
+// starts again from zero; when it may not, the call is counted and
+// suppressed is 0.
+func (l *LogLimiter) Allow(now time.Time, every time.Duration) (ok bool, suppressed int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.last.IsZero() && now.Sub(l.last) < every {
+		l.suppressed++
+		return false, 0
+	}
+	suppressed = l.suppressed
+	l.last, l.suppressed = now, 0
+	return true, suppressed
+}
+```
+
 Create `internal/handler/flat_root.go`:
 
 ```go
 package handler
 
 import (
-	"sync"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
@@ -3636,15 +4209,9 @@ import (
 
 // flatRootWarnEvery rate-limits flat_host_root_unsupported: at most one
 // line per minute process-wide; suppressed counts the requests in between
-// (spec C2, plan design note 2).
+// (spec C2, plan design note 2). The limiter is h.flatRoot, an
+// observability.LogLimiter (ruling PG-22).
 const flatRootWarnEvery = time.Minute
-
-// flatRootWarn is flat_host_root_unsupported's rate limiter.
-type flatRootWarn struct {
-	mu         sync.Mutex
-	last       time.Time
-	suppressed int
-}
 
 // noteFlatHostRoot logs, at most once a minute process-wide, that a client
 // asked for a flat repository's file at the host root (spec C2:
@@ -3658,16 +4225,10 @@ type flatRootWarn struct {
 // into a log flood; the suppressed count says how many requests the last
 // minute hid.
 func (h *Handler) noteFlatHostRoot(req *proxy.Request) {
-	h.flatRoot.mu.Lock()
-	now := time.Now()
-	if !h.flatRoot.last.IsZero() && now.Sub(h.flatRoot.last) < flatRootWarnEvery {
-		h.flatRoot.suppressed++
-		h.flatRoot.mu.Unlock()
+	ok, suppressed := h.flatRoot.Allow(time.Now(), flatRootWarnEvery)
+	if !ok {
 		return
 	}
-	suppressed := h.flatRoot.suppressed
-	h.flatRoot.last, h.flatRoot.suppressed = now, 0
-	h.flatRoot.mu.Unlock()
 	h.logger.Warn("flat_host_root_unsupported",
 		"canonical_host", req.CanonicalHost,
 		"path", req.Path,
@@ -3692,10 +4253,10 @@ with
 	maxSuites  int
 	suiteGuard cache.SuiteGuard
 	rejections seedRejections
-	seedWarn   seedWarn
+	seedWarn   observability.LogLimiter
 
 	// flatRoot is flat_host_root_unsupported's rate limiter (spec C2).
-	flatRoot flatRootWarn
+	flatRoot observability.LogLimiter
 ```
 
 In `internal/handler/handler.go`, replace
@@ -3719,8 +4280,10 @@ with
 		return
 	}
 	// Spec C2: a flat repository at the host root gets no suite; say so
-	// (rate-limited) and serve the request as before.
-	if req.IsMetadata && req.SuitePath == "" && aptpath.IsFlatHostRootPath(req.Path) {
+	// (rate-limited) and serve the request as before. A host the allowlist
+	// forbids never takes the minute's one line: its miss is refused below,
+	// and the line's canonical_host and detail would be wrong.
+	if req.IsMetadata && req.SuitePath == "" && aptpath.IsFlatHostRootPath(req.Path) && h.fetch.HostAllowed(req.CanonicalHost) {
 		h.noteFlatHostRoot(req)
 	}
 ```
@@ -3809,6 +4372,69 @@ func indexTargetArch(suitePath, p string) string {
 }
 ```
 
+In `internal/handler/handler.go`, replace
+
+```go
+	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+```
+
+with
+
+```go
+	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+```
+
+In `internal/handler/suite_rows.go` (ruling PG-22: `suite_seed_rejected` takes the shared limiter), replace
+
+```go
+// seedWarnEvery rate-limits suite_seed_rejected: at most one line per
+// minute process-wide; suppressed counts the rejections in between.
+const seedWarnEvery = time.Minute
+
+// seedWarn is suite_seed_rejected's rate limiter.
+type seedWarn struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+```
+
+with
+
+```go
+// seedWarnEvery rate-limits suite_seed_rejected: at most one line per
+// minute process-wide; suppressed counts the rejections in between. The
+// limiter is h.seedWarn, an observability.LogLimiter (ruling PG-22).
+const seedWarnEvery = time.Minute
+```
+
+In `internal/handler/suite_rows.go`, `noteCreate`, replace
+
+```go
+	h.seedWarn.mu.Lock()
+	now := time.Now()
+	if !h.seedWarn.last.IsZero() && now.Sub(h.seedWarn.last) < seedWarnEvery {
+		h.seedWarn.suppressed++
+		h.seedWarn.mu.Unlock()
+		return
+	}
+	suppressed := h.seedWarn.suppressed
+	h.seedWarn.last, h.seedWarn.suppressed = now, 0
+	h.seedWarn.mu.Unlock()
+```
+
+with
+
+```go
+	ok, suppressed := h.seedWarn.Allow(time.Now(), seedWarnEvery)
+	if !ok {
+		return
+	}
+```
+
 In `internal/proxy/classify.go`, replace
 
 ```go
@@ -3881,7 +4507,10 @@ with
 
 - [ ] **Step 4: Run the tests**
 
-Run: `go test ./internal/handler/ -run 'TestIsIndexTargetPath|TestIndexTargetArch|TestServeHTTP_FlatHostRoot|TestServeHTTP_FlatSnapshotMiss|TestServeHTTP_SnapshotMissIndexTarget|TestServeHTTP_StrictRefusesAnUnvouchedDebNamedLikeAnIndex' -v`
+Run: `go test -race ./internal/observability/ -run TestLogLimiter -v`
+Expected: PASS.
+
+Run: `go test ./internal/handler/ -run 'TestIsIndexTargetPath|TestIndexTargetArch|TestServeHTTP_FlatHostRoot|TestServeHTTP_FlatSnapshotMiss|TestServeHTTP_SnapshotMissIndexTarget|TestServeHTTP_StrictRefusesAnUnvouchedDebNamedLikeAnIndex|TestServeHTTP_StrictRefusesAnOldMetadataRowOfADebOnItsHit|TestNoteCreate' -v`
 Expected: PASS.
 
 Run: `go test ./internal/handler/ ./internal/proxy/`
@@ -3897,20 +4526,27 @@ Expected: PASS (handler about 22 s on the plan's machine, 31 s on the revision's
 | a flat `Sources` labelled `all` | `TestIndexTargetArch` (`indexTargetArch("/flat", "Sources.xz") = "all", want "source"`), `TestServeHTTP_FlatSnapshotMissIndexTargetRaisesAlert` |
 | the alert keeps `archFromPath` | `TestServeHTTP_FlatSnapshotMissIndexTargetRaisesAlert` (`/flat/Packages.xz: snapshot_index_target_404 = [map[architecture: …]], want one, architecture "all"`) |
 | no host-root check in `ServeHTTP` | `TestServeHTTP_FlatHostRootIsUnsupportedAndSaysSo` (`flat_host_root_unsupported = [], want one WARN for /InRelease, suppressed 0`) |
-| the line unlimited (`if false`) | `TestServeHTTP_FlatHostRootIsUnsupportedAndSaysSo` (`flat_host_root_unsupported = [map[… path:/InRelease …] map[… path:/./InRelease …] …], want one WARN …`) |
-| the suppressed count not reset after a line | `TestServeHTTP_FlatHostRootIsUnsupportedAndSaysSo` (`… want a third line counting only its own minute (suppressed 1)`) |
+| the line unlimited (`noteFlatHostRoot` ignores `Allow`'s `ok`) | `TestServeHTTP_FlatHostRootIsUnsupportedAndSaysSo` (`flat_host_root_unsupported = [map[… path:/InRelease …] map[… path:/./InRelease …] …], want one WARN …`) |
+| `Allow` does not reset the suppressed count after a line | `TestServeHTTP_FlatHostRootIsUnsupportedAndSaysSo` (`… want a third line counting only its own minute (suppressed 1)`), `TestLogLimiter_AllowsOneLinePerInterval` (`Allow(t02m0s) = (true, 4), want (true, 1)`), `TestLogLimiter_ConcurrentCallsAllowOneAndCountTheRest` (`after the second round: (true, 126), want (true, 63)`) |
+| `Allow` without its lock | `TestLogLimiter_ConcurrentCallsAllowOneAndCountTheRest` (`DATA RACE` under `-race`) |
+| `Allow` measures the interval from the last refused call (`last` set on a refusal too) | `TestLogLimiter_AllowsOneLinePerInterval` (`Allow(t02m0s) = (false, 0), want (true, 1)`) |
+| the host-root line without its `h.fetch.HostAllowed` term | `TestServeHTTP_FlatHostRootLineNamesAnAllowedHostOncePerMinute` (`flat_host_root_unsupported = [map[… canonical_host:forbidden.example …]] for a forbidden host, want none`) |
+| a limiter per host (a `sync.Map` of `LogLimiter`s keyed by `canonical_host`) | `TestServeHTTP_FlatHostRootLineNamesAnAllowedHostOncePerMinute` (`flat_host_root_unsupported = [map[canonical_host:other.example …] …], want one line, for root.example, suppressed 0`) |
 | the line at INFO | `TestServeHTTP_FlatHostRootIsUnsupportedAndSaysSo` (`… level:INFO …], want one WARN …`) |
 | PG-2: no pool-artifact rule (`if false && isPoolArtifact(base)`) | `TestIsMetadata_PoolArtifactsAreNeverMetadata` (`IsMetadata("/ubuntu/pool/main/i/icons-theme/icons-foo_1.0_all.deb") = true, want false (a pool artifact)`), `TestServeHTTP_StrictRefusesAnUnvouchedDebNamedLikeAnIndex` (`status 200, Retry-After ""; want the strict refusal (502, 60)`) |
 | PG-2: the tarball rule without its `_` term | `TestIsMetadata_RealMetadataNamesStayMetadata` (`IsMetadata("/ubuntu/dists/noble/main/icons-48x48.tar.gz") = false, want true`), `TestIsMetadata` (`…/dep11/icons-32x32.tar.gz`) |
 | PG-2: the `_` term without `.tar.` | `TestIsMetadata_RealMetadataNamesStayMetadata` (`IsMetadata("/ubuntu/dists/noble/main/Translation-pt_BR.xz") = false, want true`) |
 | PG-2: the suffix list without `.diff.gz` | `TestIsMetadata_PoolArtifactsAreNeverMetadata` (`IsMetadata("/ubuntu/pool/main/i/icons-theme/icons-theme_2.0-1.diff.gz") = true, want false (a pool artifact)`) |
 | PG-2: the pool-artifact rule ahead of the by-hash check | `TestIsMetadata_RealMetadataNamesStayMetadata` (`IsMetadata("/ubuntu/dists/noble/main/binary-amd64/by-hash/SHA256/icons-foo_1.0_all.deb") = false, want true`) |
+| PG-2's residual: `tryURLPathHit` reads the stored column (`!(row.IsMetadata \|\| req.IsMetadata)`) | `TestServeHTTP_StrictRefusesAnOldMetadataRowOfADebOnItsHit` (`status 200 body "an icons-foo .deb an old binary cached as metadata"; want the strict refusal and no cached bytes`) |
+
+`Allow` without its `last.IsZero()` term is an equivalent mutant: a zero `last` makes `now.Sub(last)` saturate, so the first call is allowed either way.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-gofmt -l internal/handler/handler.go internal/handler/flat_root.go internal/handler/flat_root_test.go internal/handler/path_class_test.go internal/handler/pool_artifact_test.go internal/proxy/classify.go internal/proxy/proxy_test.go
-git add internal/handler/handler.go internal/handler/flat_root.go internal/handler/flat_root_test.go internal/handler/path_class_test.go internal/handler/pool_artifact_test.go internal/proxy/classify.go internal/proxy/proxy_test.go
+gofmt -l internal/observability/loglimit.go internal/observability/loglimit_test.go internal/handler/handler.go internal/handler/suite_rows.go internal/handler/flat_root.go internal/handler/flat_root_test.go internal/handler/path_class_test.go internal/handler/phase3_strict_test.go internal/handler/pool_artifact_test.go internal/proxy/classify.go internal/proxy/proxy_test.go
+git add internal/observability/loglimit.go internal/observability/loglimit_test.go internal/handler/handler.go internal/handler/suite_rows.go internal/handler/flat_root.go internal/handler/flat_root_test.go internal/handler/path_class_test.go internal/handler/phase3_strict_test.go internal/handler/pool_artifact_test.go internal/proxy/classify.go internal/proxy/proxy_test.go
 git commit -m "Layout-aware snapshot_index_target_404 and flat arch labels (spec C5); log flat_host_root_unsupported (spec C2); a pool artifact is never metadata (ruling PG-2)"
 ```
 
@@ -4010,6 +4646,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -4032,9 +4669,9 @@ var (
 // a Release-less repository — and a `./` twin's its own; so does any other
 // directory's (the grammar's suite is the literal directory, so a
 // Packages under /nested/sub/main is that directory's root index). An HTML
-// page, a dists suite's root Packages.gz, a flat Contents-* and a flat
-// Release.gpg create none. Without an adopter a flat index creates none
-// (spec C3: InRelease only).
+// page, a dists suite's root Packages.gz, a flat Contents-*, a flat
+// Release.gpg and a file that is no suite file create none. Without an
+// adopter a flat index creates none (spec C3: InRelease only).
 func TestServeHTTP_FlatIndexMissCreatesItsSuiteRow(t *testing.T) {
 	for _, adoption := range []bool{true, false} {
 		r := newSuiteRig(t, adoption, 0)
@@ -4059,6 +4696,7 @@ func TestServeHTTP_FlatIndexMissCreatesItsSuiteRow(t *testing.T) {
 			"/fury": adoption, "/fury/.": adoption, "/goreleaser": adoption,
 			"/nested/sub/main": adoption,
 			"/soft404":         false, "/u/dists/s": false, "/contents": false, "/gpg": false,
+			"/core:/stable:/v1.34/deb": false, // a non-suite file under a flat-looking directory
 		} {
 			if got := r.suite(suite) != nil; got != want {
 				t.Errorf("adoption=%v: %s has a row = %v, want %v", adoption, suite, got, want)
@@ -4074,7 +4712,8 @@ func TestServeHTTP_FlatIndexMissCreatesItsSuiteRow(t *testing.T) {
 // hit on a cached sniff-passing flat anchor or flat index of a suite
 // without a row creates the row before the body — a flat InRelease with
 // its base's marker in the creating transaction, its `./` twin's InRelease
-// its own row under the same base, a detached flat suite's Release
+// its own row under the same base (and a twin whose base has no other
+// cached anchor, /solo/., marks that base itself), a detached flat suite's Release
 // marking its cached Release.gpg, and (adopter wired) a Release-less
 // suite's cached Packages.gz with no marker — and the hit's T1 checks it.
 // A cached flat Contents-* onboards nothing.
@@ -4083,20 +4722,24 @@ func TestServeHTTP_HitOnboardsAFlatSuite(t *testing.T) {
 	const k8s = "/core:/stable:/v1.34/deb"
 	r.cacheAnchor(k8s+"/InRelease", rowInRelease, 1_700_000_000)
 	r.cacheAnchor(k8s+"/./InRelease", rowInRelease, 1_700_000_000)
+	r.cacheAnchor("/solo/./InRelease", rowInRelease, 1_700_000_000)
 	r.cacheAnchor("/jenkins/binary/Release", rowRelease, 1_700_000_000)
 	r.cacheAnchor("/jenkins/binary/Release.gpg", rowGPG, 1_700_000_100)
 	r.cacheAnchor("/fury/Packages.gz", flatPackagesGz, 1_700_000_000)
 	r.cacheAnchor("/contents/Contents-amd64.gz", flatPackagesGz, 1_700_000_000)
-	for _, p := range []string{k8s + "/InRelease", k8s + "/./InRelease", "/jenkins/binary/Release", "/fury/Packages.gz",
-		"/contents/Contents-amd64.gz"} {
+	for _, p := range []string{k8s + "/InRelease", k8s + "/./InRelease", "/solo/./InRelease", "/jenkins/binary/Release",
+		"/fury/Packages.gz", "/contents/Contents-amd64.gz"} {
 		if rec := r.get(p); rec.Code != http.StatusOK || rec.Header().Get(hdrXCache) != cacheHit {
 			t.Fatalf("%s = %d %q, want a hit", p, rec.Code, rec.Header().Get(hdrXCache))
 		}
 	}
-	for _, suite := range []string{k8s, k8s + "/.", "/jenkins/binary", "/fury"} {
+	for _, suite := range []string{k8s, k8s + "/.", "/solo/.", "/jenkins/binary", "/fury"} {
 		if s := r.suite(suite); s == nil || s.LastCheckAt != nil {
 			t.Fatalf("%s: row %+v, want onboarded with NULL check stamps", suite, s)
 		}
+	}
+	if r.suite("/solo") != nil || !r.marked("/solo") {
+		t.Fatal("the twin /solo/. alone: want no /solo row and the base /solo marked by the twin's own onboarding")
 	}
 	if r.suite("/contents") != nil {
 		t.Fatal("a cached flat Contents-* onboarded its suite")
@@ -4115,7 +4758,7 @@ func TestServeHTTP_HitOnboardsAFlatSuite(t *testing.T) {
 	for _, c := range r.fresh.snapshot() {
 		checked[c.suitePath] = true
 	}
-	for _, suite := range []string{k8s, k8s + "/.", "/jenkins/binary", "/fury"} {
+	for _, suite := range []string{k8s, k8s + "/.", "/solo/.", "/jenkins/binary", "/fury"} {
 		if !checked[suite] {
 			t.Errorf("no T1 for the onboarded %s (T1 for %v)", suite, checked)
 		}
@@ -4148,6 +4791,25 @@ func TestServeHTTP_FlatRootIndexServesTouchTheirSuite(t *testing.T) {
 
 	if f := aptpath.ClassifySuiteFile("/hit", "/hit/Contents-amd64.gz"); f.Touches() {
 		t.Fatalf("a flat Contents-* is suite file %d, want none (no touch)", f)
+	}
+
+	// Through the handler: a tracked suite's Contents-* hit touches its
+	// url_path row and not its suite. The hit's touch goroutine touches the
+	// row first and its suites right after, so once the row's count moved
+	// the suite's stamp must stay old.
+	r.trackOld("/contents")
+	r.cacheAnchor("/contents/Contents-amd64.gz", flatPackagesGz, 1_700_000_000)
+	if rec := r.get("/contents/Contents-amd64.gz"); rec.Code != http.StatusOK || rec.Header().Get(hdrXCache) != cacheHit {
+		t.Fatalf("Contents-* = %d %q, want a hit", rec.Code, rec.Header().Get(hdrXCache))
+	}
+	waitFor(t, "the Contents-* hit's url_path touch", func() bool {
+		u, err := r.c.LookupURL(context.Background(), "http", "127.0.0.1", "/contents/Contents-amd64.gz")
+		return err == nil && u.RequestCount > 1
+	})
+	for deadline := time.Now().Add(100 * time.Millisecond); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if got := r.requested("/contents"); got != 1000 {
+			t.Fatalf("a flat Contents-* serve touched its suite (last_requested_at %d)", got)
+		}
 	}
 }
 
@@ -4195,7 +4857,7 @@ func TestServeHTTP_OnboardsAFlatSuiteFromAV6Cache(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO blob(hash,size,created_at,refcount) VALUES(?,?,1,0)`, hash, len(rowInRelease)); err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{"/repo/InRelease", "/repo/./InRelease"} {
+	for _, p := range []string{"/repo/InRelease", "/repo/./InRelease", "/other/./InRelease"} {
 		if _, err := db.Exec(`INSERT INTO url_path(canonical_scheme,canonical_host,path,blob_hash,upstream_url,is_metadata,last_requested_at,request_count)
 		 VALUES('http','127.0.0.1',?,?,?,1,1700000000,3)`, p, hash, "http://127.0.0.1"+p); err != nil {
 			t.Fatal(err)
@@ -4230,7 +4892,11 @@ func TestServeHTTP_OnboardsAFlatSuiteFromAV6Cache(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(h.Close)
-	for _, tc := range []struct{ path, suite string }{{"/repo/InRelease", "/repo"}, {"/repo/./InRelease", "/repo/."}} {
+	// /other/. is a twin whose base has no other cached anchor: its base's
+	// marker can come only from its own onboarding (MarkerBase, not the
+	// twin's own path).
+	for _, tc := range []struct{ path, suite string }{{"/repo/InRelease", "/repo"}, {"/repo/./InRelease", "/repo/."},
+		{"/other/./InRelease", "/other/."}} {
 		p := &firstByteProbe{ResponseRecorder: httptest.NewRecorder(), c: c, suite: tc.suite}
 		h.ServeHTTP(p, newProxyReqHostPort("GET", "http", "127.0.0.1", tc.path))
 		if p.Code != http.StatusOK || p.Header().Get(hdrXCache) != cacheHit || !p.seen {
@@ -4241,11 +4907,16 @@ func TestServeHTTP_OnboardsAFlatSuiteFromAV6Cache(t *testing.T) {
 		}
 	}
 	all, err := c.ListSuites(ctx)
-	if err != nil || len(all) != 2 {
-		t.Fatalf("suite rows = %+v, %v; want /repo and /repo/.", all, err)
+	if err != nil || len(all) != 3 {
+		t.Fatalf("suite rows = %+v, %v; want /repo, /repo/. and /other/.", all, err)
 	}
-	if _, ok, err := c.SignedSeen(ctx, "http", "127.0.0.1", "/repo"); err != nil || !ok {
-		t.Fatalf("the twins' shared base marker = %v, %v", ok, err)
+	for _, base := range []string{"/repo", "/other"} {
+		if _, ok, err := c.SignedSeen(ctx, "http", "127.0.0.1", base); err != nil || !ok {
+			t.Fatalf("base %s marker = %v, %v", base, ok, err)
+		}
+	}
+	if _, ok, err := c.SignedSeen(ctx, "http", "127.0.0.1", "/other/."); err != nil || ok {
+		t.Fatalf("a marker keyed by the twin's own path /other/. = %v, %v; want none (markers key the base)", ok, err)
 	}
 }
 ```
@@ -4272,6 +4943,10 @@ Expected: PASS.
 | a flat index creates a row without an adopter (`CreatesRow`) | `TestServeHTTP_FlatIndexMissCreatesItsSuiteRow` (`adoption=false: /fury/. has a row = true, want false`) |
 | a flat index records no interest (`Touches` excludes `FileFlatIndex`) | `TestServeHTTP_FlatRootIndexServesTouchTheirSuite` (`timed out waiting for the root Packages.gz hit's touch`) |
 | `DeclaredHashesForPath` without its fallback | `TestServeHTTP_VouchedFlatDebTouchesItsSuite` (`timed out waiting for the vouched flat .deb's touch`) |
+| onboarding marks the seed's own suite path, not its base (`createSuiteTx` keys the marker by `seed.SuitePath`) | `TestServeHTTP_HitOnboardsAFlatSuite` (`the twin /solo/. alone: want no /solo row and the base /solo marked by the twin's own onboarding`), `TestServeHTTP_OnboardsAFlatSuiteFromAV6Cache` (`/other/./InRelease: at the first body byte row=true marker=false (read error <nil>), want both`) |
+| `servedSuite` touches for any suite path (its `Touches` test dropped) | `TestServeHTTP_FlatRootIndexServesTouchTheirSuite` (`a flat Contents-* serve touched its suite (last_requested_at …)`) |
+
+The `/core:/stable:/v1.34/deb` row of `TestServeHTTP_FlatIndexMissCreatesItsSuiteRow` (a non-suite file under a flat-looking directory creates no row) has no single-site mutant: a grammar mutant that made the file a member still leaves it no `ClassifySuiteFile` class. It pins the fixture's own claim.
 
 - [ ] **Step 5: Commit**
 
@@ -4302,8 +4977,8 @@ Checked and left in these files: C-21 and A-56 (H).
 - Modify: `internal/handler/suite_rows.go` (`seedRejections.sweepHook`, `expire`, `signedAnchorNames`, `readCachedAnchor`, `cachedAnchors`, `markCachedSignedAnchors`, the three timeouts' comments, `onboard`, `runOnboard`), `internal/handler/handler.go` (`Handler.strictLookupHook`, `checkPackageHashWait`, `runFetch`'s seed, `serveCacheMiss`'s AIDEV-NOTE and T1-on-seed comment), `internal/handler/suite_rows_test.go` (`TestServeHTTP_BackstopIsBoundedBeforeTheBody`)
 
 **Interfaces:**
-- Consumes: `newSuiteRig`, `upFile`, `rowInRelease`, `rowRelease`, `rowGPG`, `newFlipStack`, `(*flipStack).cacheRow`/`signsAfterTheSniff`, `flipSimHost`, `newPhase3StrictHandlerCapturing`, `adoptCoverageComplete`, `splitURL`, `hostKey`, `writeBlob`, `proxyReq`, `noUpstream`, `silentLogger`.
-- Produces: `(*Handler).readCachedAnchor(ctx, key cache.SuiteKey, p string) (*cache.URLPath, bool, error)`, `signedAnchorNames`; test seams `seedRejections.sweepHook`, `Handler.strictLookupHook`; `runOnboard(req *proxy.Request, sr *suiteReq, deadline time.Time)`; test helper `openTestCache`.
+- Consumes: `newSuiteRig`, `upFile`, `rowInRelease`, `rowRelease`, `rowGPG`, `newFlipStack`, `(*flipStack).cacheRow`/`signsAfterTheSniff`, `flipSimHost`, `newPhase3StrictHandlerCapturing`, `adoptCoverageComplete`, `splitURL`, `hostKey`, `writeBlob`, `proxyReq`, `noUpstream`, `silentLogger`, `simtest.OpenCache`.
+- Produces: `(*Handler).readCachedAnchor(ctx, key cache.SuiteKey, p string) (*cache.URLPath, bool, error)`, `signedAnchorNames`; test seams `seedRejections.sweepHook`, `Handler.strictLookupHook`; `runOnboard(req *proxy.Request, sr *suiteReq, deadline time.Time)`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4327,20 +5002,27 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // Deferred minor D-32: readCachedAnchor is the one reading of a cached
 // signed anchor that the creating transaction's marks and the backstop
-// share. No row: nothing, no error; a row without a blob: unsigned; a
-// clearsigned InRelease and an armored Release.gpg: signed; a plain-text
-// InRelease: unsigned; a pool file that is gone: the row and an error.
+// share. No row: nothing, no error; a url_path read that fails: nothing
+// and its error; a row without a blob: unsigned; a clearsigned InRelease
+// and an armored Release.gpg: signed; a plain-text InRelease: unsigned; a
+// pool file that is gone: the row and an error.
 func TestReadCachedAnchor(t *testing.T) {
 	r := newSuiteRig(t, true, 0)
 	ctx := context.Background()
 	key := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/r/dists/s"}
 	if row, signed, err := r.h.readCachedAnchor(ctx, key, "/r/dists/s/InRelease"); row != nil || signed || err != nil {
 		t.Fatalf("no row: %+v %v %v, want nil, false, nil", row, signed, err)
+	}
+	ended, cancel := context.WithCancel(ctx)
+	cancel()
+	if row, signed, err := r.h.readCachedAnchor(ended, key, "/r/dists/s/InRelease"); row != nil || signed || !errors.Is(err, context.Canceled) {
+		t.Fatalf("a failed url_path read: %+v %v %v, want nil, false and its error", row, signed, err)
 	}
 	if err := r.c.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		Path: "/r/dists/s/InRelease", UpstreamURL: "http://127.0.0.1/r/dists/s/InRelease", IsMetadata: true}); err != nil {
@@ -4350,20 +5032,17 @@ func TestReadCachedAnchor(t *testing.T) {
 		t.Fatalf("a row without a blob: %+v %v %v, want the row, unsigned, nil", row, signed, err)
 	}
 	for _, tc := range []struct {
-		path string
-		body []byte
-		want bool
+		suite, path string
+		body        []byte
+		want        bool
 	}{
-		{"/r/dists/s/InRelease", rowInRelease, true},
-		{"/r/dists/s/Release.gpg", rowGPG, true},
-		{"/r/dists/p/InRelease", []byte("Origin: plain\n"), false},
+		{"/r/dists/s", "/r/dists/s/InRelease", rowInRelease, true},
+		{"/r/dists/s", "/r/dists/s/Release.gpg", rowGPG, true},
+		{"/r/dists/p", "/r/dists/p/InRelease", []byte("Origin: plain\n"), false},
 	} {
 		r.cacheAnchor(tc.path, tc.body, 1_700_000_000)
 		k := key
-		k.SuitePath = tc.path[:len(tc.path)-len("/InRelease")]
-		if tc.path == "/r/dists/s/Release.gpg" {
-			k.SuitePath = "/r/dists/s"
-		}
+		k.SuitePath = tc.suite
 		if row, signed, err := r.h.readCachedAnchor(ctx, k, tc.path); row == nil || signed != tc.want || err != nil {
 			t.Fatalf("%s: %+v %v %v, want signed=%v", tc.path, row, signed, err, tc.want)
 		}
@@ -4398,22 +5077,11 @@ func TestSeedRejections_ExpireRecoversItsPanic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = New(Config{Parser: parser, Cache: openTestCache(t), Fetch: noUpstream{}, HostLimiter: hostsem.New(1),
+	_, err = New(Config{Parser: parser, Cache: simtest.OpenCache(t), Fetch: noUpstream{}, HostLimiter: hostsem.New(1),
 		Logger: silentLogger(), MaxSuites: -1})
 	if err == nil || err.Error() != "handler: negative MaxSuites" {
 		t.Fatalf("New(MaxSuites: -1) = %v, want handler: negative MaxSuites", err)
 	}
-}
-
-// openTestCache opens a cache in a test directory.
-func openTestCache(t *testing.T) *cache.Cache {
-	t.Helper()
-	c, err := cache.Open(context.Background(), t.TempDir(), silentLogger())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-	return c
 }
 
 // Deferred minor E-65 (a): only the miss that created its suite's row
@@ -4508,6 +5176,9 @@ func TestServeHTTP_StrictCanceledBetweenTheLookups(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), "unvouched .deb, cached") {
 		t.Fatalf("status %d body %q, want 503 and no .deb", rec.Code, rec.Body.String())
 	}
+	if n := upstreamHits.Load(); n != 0 {
+		t.Fatalf("upstream asked %d times, want 0 (the canceled hit starts no refetch)", n)
+	}
 	recs := logs.find("request")
 	if len(recs) == 0 || recs[len(recs)-1]["outcome"] != "client_canceled" {
 		t.Fatalf("request lines %v, want the last one client_canceled", recs)
@@ -4536,6 +5207,33 @@ with
 				if elapsed != want {
 					t.Fatalf("hit=%v: served after %v, want after the backstop's %v bound (apt gives up at 30 s)", hit, elapsed, want)
 				}
+```
+
+and its header (the Task 8 review's Minor 1: both bounds), replace
+
+```go
+// FW-4 (final review, tests' challenge to the Task 9 ruling d fallback):
+// the backstop that runs before the body is bounded at backstopTimeout,
+// well under apt's 30 s inactivity timeout, on the miss path and after
+// onboarding. backstopHook waits on the backstop's own context: a pool or
+// writer that never answers. The body is served once the bound passes,
+// the backstop's next read fails (WARN) and the anchor stays unmarked
+// for the startup pass.
+func TestServeHTTP_BackstopIsBoundedBeforeTheBody(t *testing.T) {
+```
+
+with
+
+```go
+// FW-4 (final review, tests' challenge to the Task 9 ruling d fallback):
+// the backstop that runs before the body is bounded well under apt's 30 s
+// inactivity timeout: on the miss path at backstopTimeout, and after
+// onboarding at the deadline it shares with its creation (onboardTimeout;
+// deferred minor E-67). backstopHook waits on the backstop's own context:
+// a pool or writer that never answers. The body is served once the bound
+// passes, the backstop's next read fails (WARN) and the anchor stays
+// unmarked for the startup pass.
+func TestServeHTTP_BackstopIsBoundedBeforeTheBody(t *testing.T) {
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -5003,6 +5701,7 @@ Expected: PASS (the refactor changes no behaviour: `TestServeHTTP_CreatingMissMa
 |---|---|
 | `readCachedAnchor` calls every blob signed | `TestReadCachedAnchor` (`/r/dists/p/InRelease: …, want signed=false`), `TestServeHTTP_HitOnboardsALegacyAnchor` (`q: want onboarded through Release, with no marker for its plain-text InRelease`), `TestServeHTTP_CreatingMissMarksCachedSignedAnchors` |
 | `readCachedAnchor` swallows a pool read error | `TestReadCachedAnchor` (`a missing pool file: …, want the row, unsigned, ErrNotExist`) |
+| `readCachedAnchor` returns a failed url_path lookup as no row (its error dropped) | `TestReadCachedAnchor` (`a failed url_path read: <nil> false <nil>, want nil, false and its error`) |
 | `expire` without its recover | `TestSeedRejections_ExpireRecoversItsPanic` (`panic: sweep boom [recovered, repanicked]`) |
 | `New` accepts a negative `MaxSuites` | `TestSeedRejections_ExpireRecoversItsPanic` (`New(MaxSuites: -1) = <nil>, want handler: negative MaxSuites`) |
 | `created` widened to a row found (`\|\| … == cache.SuiteExists`) | `TestServeHTTP_AMissThatFindsTheRowCreatedFiresNoSeedT1` (`T1 calls [{http 127.0.0.1 /r/dists/s} {http 127.0.0.1 /r/dists/s}], want exactly one …`) |
@@ -5011,6 +5710,8 @@ Expected: PASS (the refactor changes no behaviour: `TestServeHTTP_CreatingMissMa
 | `case strictCanceled` falls through to the serve | `TestServeHTTP_StrictCanceledBetweenTheLookups` (`status 200 body "an unvouched .deb, cached", want 503 and no .deb`) |
 | `runFetch`'s creation without its cached anchors | `TestServeHTTP_CreatingMissMarksCachedSignedAnchors` (`Release miss = 200; want the row created and its cached Release.gpg marked`) |
 | `runFetch` drops the re-stamp | `TestServeHTTP_AdoptionDisabledSeedParity` (`after the refresh miss check=… success=…, want the second miss's second …`) |
+
+`TestServeHTTP_StrictCanceledBetweenTheLookups` also asserts that the canceled hit asked upstream nothing; no single-site mutant moves that count (a canceled hit that fell through to the miss path would fail its fetch on the ended context before dialling), so the assertion documents the property.
 
 - [ ] **Step 6: Commit**
 
@@ -5026,15 +5727,66 @@ git commit -m "Handler deferred minors: D-31, D-32, E-57, E-60, E-64, E-65, E-67
 
 Spec C4 Dispatch 3 (the E carry-forward; design note 8): eager first adoption runs only for a suite with a client-created `url_path` row (`request_count > 0`, never reconstructed), and phase E counted only `InRelease` and `Release` rows (`cachedAnchors`, its design note 14). A Release-less flat repository's suite is created by its index's serve (spec C3), so a flat suite's root `Packages*`/`Sources*` rows (`aptpath.FileFlatIndex`) now count too — read only when no anchor row is client-created, from one keyed read of the suite's anchor, root index and `Contents-*` rows (`cache.ListSuiteMetadataRows`), which Task 10's anchorless refresh reuses. That read probes url_path's key by name — the three anchors and the 14 root index names — plus one `Contents-*` range, as two `SELECT`s joined by `UNION ALL` (one `SELECT` with an `OR` plans as a range over the whole host), never a range over the suite's directory: a Gemfury-style repository keeps its `.deb`s in the suite's own directory, so a directory range would read every cached `.deb` of the repository at every check (design review M-5); its query plan is pinned. A row no client fetched (hot prefetch, a reconstruction), a flat `Contents-*` and a `dists/` suite's root `Packages` count for nothing. A signed flat suite's first check adopts its flat layout end to end (C6's rows at its `FlatBase`), for the suite and its `./` twin. `first_adoption.go`'s open deferred minors: E-32 (its predicate's helper and its other five sites are in `check.go`, `current_form.go`) and E-24 (H) are checked and left; F-8 sits in `first_adoption_test.go`, which this phase does not change. The flat rig (`newFlatRig`) builds its adopter with `adoption.adopt_unsigned` on — production's default (`internal/config/adopt_unsigned_test.go`; rulings PG-9, PG-17) — because Task 10's anchorless refresh is refused with it off (ruling PG-1); `AdoptionConfig.AdoptUnsigned`'s zero value is off, and a test that needs the knob off turns it off by hand.
 
+The Task 9 review's findings (the fix round). The 14 root index names are one list, `aptpath.FlatIndexNames()` (with `flatIndexExts`, beside the grammar in `suite.go`; the Task 9 review's Minor 4, the Task 12 review's Minor 1): `suiteRowNames` is built from it here, Task 12's `ListUnadoptedFlatIndexRows` from it too, and `TestFlatIndexNames` keeps it equal to the grammar, `ClassifySuiteFile` and the flat index sniff's extensions. Ruling PG-20 (Important 1): `flatIndexClientCreated` returns the client-created index row, not a bool, and a flat suite active only through it, with no cached anchor row for `anchorURLsFor` to model its probe URLs on, probes its `InRelease` and `Release` beside that row's stored `upstream_url` — the canonical host is port-less, so `urlReconstruct` would ask port 80, a service the client never named; the `urlReconstruct` AIDEV-NOTE (`freshness.go`) now calls reconstruction the probes' last resort. PG-20's test, `TestCheck_AnIndexOnlyFlatSuiteProbesBesideItsIndexRow`, also asserts that the anchorless refresh asks the index at its stored URL, which Task 10 builds, so Task 10 adds it (on this task's tree it fails `http://fh:8080/fury/Packages.gz asked 0 times, want once`). A failed read of the flat index rows follows the anchor rows' convention — WARN `freshness: read anchor rows failed`, no request, no write, never taken for dormancy (Minor 2) — a flat `Release.gpg` alone counts for nothing (design note 14; Minor 1), and `checkFirst`'s doc says the scheduler skips only a suite without interest (`suiteDue`, deferred minor E-25; Minor 3).
+
 **Files:**
 - Create: `internal/cache/anchorless.go` (`ListSuiteMetadataRows`), `internal/cache/anchorless_test.go`, `internal/freshness/anchorless.go` (`suiteKeyOf`, `flatIndexClientCreated`), `internal/freshness/flat_rig_test.go`, `internal/freshness/flat_first_adoption_test.go`
-- Modify: `internal/freshness/first_adoption.go` (`checkFirst`'s client-created rule and its doc; the `aptpath` import)
+- Modify: `internal/aptpath/suite.go` (`flatIndexExts`, `FlatIndexNames`), `internal/aptpath/suite_test.go` (`TestFlatIndexNames`), `internal/freshness/first_adoption.go` (`checkFirst`'s client-created rule, PG-20's URL model and its doc; the `aptpath` and `strings` imports), `internal/freshness/freshness.go` (`urlReconstruct`'s AIDEV-NOTE)
 
 **Interfaces:**
-- Consumes: `aptpath.IsCanonicalSuitePath`, `aptpath.IsFlatSuitePath`, `aptpath.ClassifySuiteFile` (Task 1); `packageHashRows` (Task 4); `queryPlan` (Task 5); `openCache`, `seedBlob`, `putURLPathRow`, `sk` (cache tests); `rigUpstream`, `rigVerifier`, `rigClock`, `lockedBuffer`, `fakeFetcher`, `fakePackagesStanzas`, `makeRelease`, `testHex64`, `discardLogger`, `simtest.ClearsignedFixture` (freshness tests).
-- Produces: `(*cache.Cache).ListSuiteMetadataRows(ctx, key cache.SuiteKey) ([]cache.URLPath, error)`, unexported `suiteRowNames`, `listSuiteMetadataRowsSQL`; `(*Adopter).flatIndexClientCreated(ctx, suite SuiteRef) (bool, error)`, `suiteKeyOf(SuiteRef) cache.SuiteKey`; the freshness test rig `flatRig` (`newFlatRig`, `url`, `cacheRow`, `check`, `row`, `requests`, `lastResult`), `poolBlob`, `flatRigHost`, `flatGz` — used by Tasks 10, 12, 13 and 15.
+- Consumes: `aptpath.IsCanonicalSuitePath`, `aptpath.IsFlatSuitePath`, `aptpath.ClassifySuiteFile` (Task 1), `flatIndexMagic` (`aptpath`'s flat index sniff); `anchorURLsFor` and its `model`/`modelName` (phase E); `packageHashRows` (Task 4); `queryPlan` (Task 5); `openCache`, `seedBlob`, `putURLPathRow`, `sk` (cache tests); `rigUpstream`, `rigVerifier`, `rigClock`, `lockedBuffer`, `fakeFetcher`, `fakePackagesStanzas`, `makeRelease`, `testHex64`, `discardLogger`, `simtest.ClearsignedFixture` (freshness tests).
+- Produces: `(*cache.Cache).ListSuiteMetadataRows(ctx, key cache.SuiteKey) ([]cache.URLPath, error)`, unexported `suiteRowNames`, `listSuiteMetadataRowsSQL`; `aptpath.FlatIndexNames() []string` (also used by Task 12), unexported `flatIndexExts`; `(*Adopter).flatIndexClientCreated(ctx, suite SuiteRef) (*cache.URLPath, error)`, `suiteKeyOf(SuiteRef) cache.SuiteKey`; test helper `(*rigUpstream).sentURLs()`; the freshness test rig `flatRig` (`newFlatRig`, `url`, `cacheRow`, `check`, `row`, `requests`, `lastResult`), `poolBlob`, `flatRigHost`, `flatGz` — used by Tasks 10, 12, 13 and 15.
 
 - [ ] **Step 1: Write the failing tests**
+
+In `internal/aptpath/suite_test.go`, add before `const hex64 = `:
+
+```go
+// FlatIndexNames is spec C2's root index names, the one list the cache's
+// reads probe by (the Task 9 and Task 12 reviews): 14 distinct names, each
+// a flat member of the grammar that ClassifySuiteFile calls a flat index,
+// and its extensions are exactly the flat index sniff's.
+func TestFlatIndexNames(t *testing.T) {
+	names := FlatIndexNames()
+	seen := map[string]bool{}
+	for _, n := range names {
+		if seen[n] {
+			t.Errorf("%q listed twice", n)
+		}
+		seen[n] = true
+		if got := SuitePath("/flat/" + n); got != "/flat" {
+			t.Errorf("SuitePath(/flat/%s) = %q, want /flat", n, got)
+		}
+		if f := ClassifySuiteFile("/flat", "/flat/"+n); f != FileFlatIndex {
+			t.Errorf("ClassifySuiteFile(/flat, /flat/%s) = %d, want FileFlatIndex", n, f)
+		}
+	}
+	if len(names) != 14 {
+		t.Errorf("%d names, want 14 (Packages and Sources, plain and six compressions): %v", len(names), names)
+	}
+	exts := map[string]bool{}
+	for _, e := range flatIndexExts {
+		exts[e] = true
+		if _, ok := flatIndexMagic[e]; !ok {
+			t.Errorf("extension %s has no flat index sniff", e)
+		}
+	}
+	for e := range flatIndexMagic {
+		if !exts[e] {
+			t.Errorf("the sniff's extension %s is not listed", e)
+		}
+	}
+	for _, n := range []string{"Packages.Z", "Contents-amd64", "Release"} {
+		if seen[n] {
+			t.Errorf("%q is no root index name", n)
+		}
+	}
+	names[0] = "mutated"
+	if FlatIndexNames()[0] == "mutated" {
+		t.Error("FlatIndexNames returned its own backing array")
+	}
+}
+```
 
 Create `internal/cache/anchorless_test.go`:
 
@@ -5306,9 +6058,12 @@ package freshness
 
 import (
 	"context"
+	"encoding/json"
 	"maps"
+	"strings"
 	"testing"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
@@ -5321,8 +6076,9 @@ var flatGz = []byte{0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03}
 // interest beside the InRelease and Release rows, so a Release-less
 // repository's suite — created by its index's serve — runs the probe tree
 // on its first check. One whose only row is an index no client fetched (a
-// prefetch or a reconstruction: request_count 0), a flat Contents-*, or —
-// under a dists suite — a root Packages, stays dormant: no request.
+// prefetch or a reconstruction: request_count 0), a flat Contents-*, a
+// Release.gpg alone (plan design note 14), or — under a dists suite — a
+// root Packages, stays dormant: no request.
 func TestCheck_FlatIndexRowsCountAsClientCreated(t *testing.T) {
 	for _, tc := range []struct {
 		name, suite, file string
@@ -5334,6 +6090,7 @@ func TestCheck_FlatIndexRowsCountAsClientCreated(t *testing.T) {
 		{"its ./ twin's Packages.gz", "/fury/.", "Packages.gz", 1, true},
 		{"an index no client fetched", "/fury", "Packages.gz", 0, false},
 		{"a flat Contents-*", "/fury", "Contents-amd64.gz", 1, false},
+		{"a flat Release.gpg alone", "/fury", "Release.gpg", 1, false}, // plan design note 14
 		{"a dists suite's root Packages.gz", "/r/dists/x", "Packages.gz", 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5345,6 +6102,61 @@ func TestCheck_FlatIndexRowsCountAsClientCreated(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Plan design note 8's flat read through the adopter's cache: when it
+// fails, checkFirst follows its anchor-row read's convention — one WARN
+// naming the suite, no request and no write (no record, no backoff), a
+// local fault retried at the next check — and never treats the fault as
+// interest (a probe) or as dormancy (a Debug line).
+func TestCheck_AFailedFlatIndexReadIsALocalFault(t *testing.T) {
+	r := newFlatRig(t, "/fury")
+	r.cacheRow("Packages.gz", flatGz, 1, 1_799_999_000, "")
+	closed, err := cache.Open(context.Background(), t.TempDir(), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r.checker.adopter.cache = closed // the checker's own reads stay on r.cache
+	r.check()
+	warns := 0
+	for _, line := range strings.Split(r.logs.String(), "\n") {
+		var m map[string]any
+		if line == "" || json.Unmarshal([]byte(line), &m) != nil {
+			continue
+		}
+		switch m["msg"] {
+		case "freshness: read anchor rows failed":
+			if m["level"] != "WARN" || m["suite_path"] != "/fury" {
+				t.Fatalf("read failure line %v, want a WARN naming /fury", m)
+			}
+			warns++
+		case "freshness: never-adopted suite without a client-created anchor or flat index row, dormant":
+			t.Fatalf("the read fault was taken for dormancy: %v", m)
+		}
+	}
+	if warns != 1 {
+		t.Fatalf("%d read failure WARNs, want 1", warns)
+	}
+	if n := len(r.up.sentURLs()); n != 0 {
+		t.Fatalf("%d upstream requests, want none", n)
+	}
+	if row := r.row(); row.LastCheckAt != nil || row.CheckFailCount != 0 || row.AdoptionFailReason != nil {
+		t.Fatalf("suite row %+v, want no check stamp, no streak and no record", row)
+	}
+}
+
+// sentURLs lists every URL the rig upstream was asked, in no order.
+func (u *rigUpstream) sentURLs() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	var out []string
+	for url := range u.sent {
+		out = append(out, url)
+	}
+	return out
 }
 
 // Spec C4 Dispatch 3 for a signed flat suite: its client-created InRelease
@@ -5383,6 +6195,9 @@ func TestCheck_AFlatSuiteAdoptsOnItsFirstCheck(t *testing.T) {
 
 - [ ] **Step 2: Run to verify failure**
 
+Run: `go test -gcflags=-e ./internal/aptpath/`
+Expected: FAIL — `undefined: FlatIndexNames` and `undefined: flatIndexExts` (`suite_test.go`).
+
 Run: `go test -gcflags=-e ./internal/cache/`
 Expected: FAIL — `c.ListSuiteMetadataRows undefined (type *Cache has no field or method ListSuiteMetadataRows)` (twice), `undefined: suiteRowNames` and `undefined: listSuiteMetadataRowsSQL`.
 
@@ -5390,6 +6205,47 @@ Run: `go test ./internal/freshness/ -run 'TestCheck_FlatIndexRowsCountAsClientCr
 Expected: FAIL — `TestCheck_FlatIndexRowsCountAsClientCreated` (`InRelease probed = false, want true`, for the client-fetched `Packages.gz`, `Sources.gz` and the twin's `Packages.gz`: their suites stayed dormant). `TestCheck_AFlatSuiteAdoptsOnItsFirstCheck` passes (Tasks 1–4 built it; it pins the end-to-end shape).
 
 - [ ] **Step 3: Implement**
+
+In `internal/aptpath/suite.go`, replace
+
+```go
+	hex128RE       = regexp.MustCompile(`^[0-9a-f]{128}$`)
+)
+```
+
+with
+
+```go
+	hex128RE       = regexp.MustCompile(`^[0-9a-f]{128}$`)
+)
+
+// flatIndexExts are the compression extensions of spec C2's flat member
+// grammar (flatMemberRE) and of the flat index sniff (flatIndexMagic).
+var flatIndexExts = []string{".gz", ".xz", ".bz2", ".lzma", ".lz4", ".zst"}
+
+// FlatIndexNames returns spec C2's root index names of a flat suite —
+// Packages and Sources, plain or with one of the six compression
+// extensions — 14 names, in a fixed order, as a new slice.
+//
+// AIDEV-NOTE: the one list (the Task 9 review's Minor 4, the Task 12
+// review's Minor 1). The cache probes url_path's key with exactly these
+// names (ListSuiteMetadataRows for Dispatch 3 and the anchorless refresh,
+// ListUnadoptedFlatIndexRows for the reaper's junk evidence): a name
+// missing here is a flat index those reads never see — the reaper would
+// then judge an unsigned suite with junk anchors on its anchors alone.
+// TestFlatIndexNames keeps it equal to flatMemberRE, ClassifySuiteFile and
+// flatIndexMagic.
+func FlatIndexNames() []string {
+	names := make([]string, 0, 2*(1+len(flatIndexExts)))
+	for _, stem := range []string{"Packages", "Sources"} {
+		names = append(names, stem)
+		for _, ext := range flatIndexExts {
+			names = append(names, stem+ext)
+		}
+	}
+	return names
+}
+```
 
 Create `internal/cache/anchorless.go`:
 
@@ -5405,18 +6261,9 @@ import (
 )
 
 // suiteRowNames are the member names ListSuiteMetadataRows probes by key:
-// spec C2's anchors and root indexes — Packages and Sources, plain or with
-// one of the six compression extensions (the names
+// spec C2's anchors and root indexes (aptpath.FlatIndexNames, the list
 // unadoptedFlatIndexRowsSQL probes too).
-var suiteRowNames = func() []string {
-	names := []string{"InRelease", "Release", "Release.gpg"}
-	for _, stem := range []string{"Packages", "Sources"} {
-		for _, ext := range []string{"", ".gz", ".xz", ".bz2", ".lzma", ".lz4", ".zst"} {
-			names = append(names, stem+ext)
-		}
-	}
-	return names
-}()
+var suiteRowNames = append([]string{"InRelease", "Release", "Release.gpg"}, aptpath.FlatIndexNames()...)
 
 // listSuiteMetadataRowsSQL is ListSuiteMetadataRows' query: url_path's
 // key probed once per suiteRowNames name under the suite, and one key
@@ -5455,8 +6302,9 @@ SELECT canonical_scheme, canonical_host, path, blob_hash, upstream_url,
 // suite's directory: a Gemfury-style repository keeps its .debs in the
 // suite's own directory, so a directory range read every cached .deb of
 // the repository, twice per check. TestListSuiteMetadataRows_ProbesURLPathByItsKey
-// pins the plan; keep suiteRowNames in step with spec C2's flat member
-// grammar (aptpath.flatMemberRE).
+// pins the plan. suiteRowNames follows spec C2's flat member grammar
+// through aptpath.FlatIndexNames, which aptpath's TestFlatIndexNames keeps
+// equal to aptpath.flatMemberRE.
 func (c *Cache) ListSuiteMetadataRows(ctx context.Context, key SuiteKey) ([]URLPath, error) {
 	if !aptpath.IsCanonicalSuitePath(key.SuitePath) {
 		return nil, nil
@@ -5516,23 +6364,26 @@ func suiteKeyOf(suite SuiteRef) cache.SuiteKey {
 	return cache.SuiteKey{CanonicalScheme: suite.CanonicalScheme, CanonicalHost: suite.CanonicalHost, SuitePath: suite.SuitePath}
 }
 
-// flatIndexClientCreated reports whether flat suite has a client-created
-// root Packages* or Sources* url_path row (aptpath.FileFlatIndex,
-// request_count > 0): spec C4 Dispatch 3 counts it beside the InRelease
-// and Release rows, so a Release-less repository's suite — created by its
-// index's serve — is not dormant (the E carry-forward; plan design note 8).
-// A row hot prefetch or a reconstruction wrote has no request count.
-func (a *Adopter) flatIndexClientCreated(ctx context.Context, suite SuiteRef) (bool, error) {
+// flatIndexClientCreated returns a client-created root Packages* or
+// Sources* url_path row of flat suite (aptpath.FileFlatIndex,
+// request_count > 0), nil when it has none: spec C4 Dispatch 3 counts it
+// beside the InRelease and Release rows, so a Release-less repository's
+// suite — created by its index's serve — is not dormant (the E
+// carry-forward; plan design note 8). A row hot prefetch or a
+// reconstruction wrote has no request count. The row is returned, not a
+// bool, because its stored upstream_url is the probe tree's URL model when
+// no anchor row is cached (ruling PG-20, checkFirst).
+func (a *Adopter) flatIndexClientCreated(ctx context.Context, suite SuiteRef) (*cache.URLPath, error) {
 	rows, err := a.cache.ListSuiteMetadataRows(ctx, suiteKeyOf(suite))
 	if err != nil {
-		return false, fmt.Errorf("read flat index rows: %w", err)
+		return nil, fmt.Errorf("read flat index rows: %w", err)
 	}
-	for _, r := range rows {
+	for i, r := range rows {
 		if r.RequestCount > 0 && aptpath.ClassifySuiteFile(suite.SuitePath, r.Path) == aptpath.FileFlatIndex {
-			return true, nil
+			return &rows[i], nil
 		}
 	}
-	return false, nil
+	return nil, nil
 }
 ```
 
@@ -5552,8 +6403,10 @@ with
 // A suite without client interest in the last 7 days, or without a
 // client-created InRelease or Release url_path row — or, for a flat suite,
 // root Packages*/Sources* row (Adopter.flatIndexClientCreated) — is
-// dormant: no request and no write (the scheduler does not queue it
-// either, see suiteDue). A
+// dormant: no request and no write. The scheduler skips only a suite
+// without interest (suiteDue): one with interest but no client-created row
+// is queued at every tick and ends here, dormant, after its row reads
+// (deferred minor E-25; a flat suite's reads include its index rows). A
 ```
 
 In `internal/freshness/first_adoption.go`, replace
@@ -5576,8 +6429,10 @@ with
 
 ```go
 	rows, clientCreated, err := c.cachedAnchors(ctx, suite)
+	var index *cache.URLPath // a client-created flat index row (Dispatch 3)
 	if err == nil && !clientCreated && aptpath.IsFlatSuitePath(suitePath) {
-		clientCreated, err = c.adopter.flatIndexClientCreated(ctx, suite)
+		index, err = c.adopter.flatIndexClientCreated(ctx, suite)
+		clientCreated = index != nil
 	}
 	if err != nil {
 		c.logger.Warn("freshness: read anchor rows failed",
@@ -5606,9 +6461,85 @@ with
 )
 ```
 
+In `internal/freshness/first_adoption.go` (the doc's read-error sentence and PG-20), replace
+
+```go
+// write and no backoff: a local fault, retried at the next check (at most
+// one per cooldown and per tick).
+```
+
+with
+
+```go
+// write and no backoff: a local fault, retried at the next check (at most
+// one per cooldown and per tick); so is a read error of a flat suite's
+// index rows. A suite with no cached anchor row but a client-created flat
+// index row is probed beside the index row's stored upstream_url (ruling
+// PG-20).
+```
+
+In `internal/freshness/first_adoption.go` (ruling PG-20: the probes' URL model), replace
+
+```go
+	t := c.runProbeTree(fetchCtx, suite, c.anchorURLsFor(suite, rows))
+```
+
+with
+
+```go
+	urls := c.anchorURLsFor(suite, rows)
+	if urls.model == "" && index != nil {
+		// Ruling PG-20 (spec C1): a suite active only through its
+		// client-fetched flat index is probed beside that row's stored
+		// upstream_url, which keeps a non-default port the port-less
+		// canonical host (and so urlReconstruct) drops.
+		urls.model, urls.modelName = index.UpstreamURL, strings.TrimPrefix(index.Path, suitePath+"/")
+	}
+	t := c.runProbeTree(fetchCtx, suite, urls)
+```
+
+In `internal/freshness/first_adoption.go`, replace
+
+```go
+	"fmt"
+	"time"
+```
+
+with
+
+```go
+	"fmt"
+	"strings"
+	"time"
+```
+
+In `internal/freshness/freshness.go` (`Config.urlReconstruct`'s AIDEV-NOTE), replace
+
+```go
+	// aptpath.BuildUpstreamURL(scheme, host, path). AIDEV-NOTE: canonical host is port-less
+	// (SPEC §3.2), so reconstruction drops a non-default upstream port;
+	// the GC identity guard (SPEC4 §5 guard (d)) preserves the original
+	// row's port-correct upstream_url whenever it still exists, so
+	// reconstruction only fires for an already-reaped anchor.
+```
+
+with
+
+```go
+	// aptpath.BuildUpstreamURL(scheme, host, path). AIDEV-NOTE: canonical host is port-less
+	// (SPEC §3.2), so reconstruction drops a non-default upstream port.
+	// It is the probes' last resort: anchorURLsFor models every sibling
+	// on a cached anchor row's port-correct upstream_url (the GC identity
+	// guard, SPEC4 §5 guard (d), keeps it while it exists), and checkFirst
+	// models a flat suite that has no cached anchor row on its
+	// client-created root index row's (ruling PG-20; phase G made such
+	// suites active). So reconstruction fires only for a suite with no
+	// cached anchor or index row to model on: an already-reaped anchor.
+```
+
 - [ ] **Step 4: Run the tests**
 
-Run: `go test ./internal/cache/ ./internal/freshness/`
+Run: `go test ./internal/aptpath/ ./internal/cache/ ./internal/freshness/`
 Expected: PASS.
 
 - [ ] **Step 5: Mutation checks** (one at a time, each reverted)
@@ -5617,12 +6548,17 @@ Expected: PASS.
 |---|---|
 | an index no client fetched counts (no `RequestCount > 0`) | `TestCheck_FlatIndexRowsCountAsClientCreated/an_index_no_client_fetched` (`InRelease probed = true, want false`) |
 | any metadata row with requests counts (no `FileFlatIndex` test) | `TestCheck_FlatIndexRowsCountAsClientCreated/a_flat_Contents-*` (`InRelease probed = true, want false`) |
+| any suite file with requests counts (`ClassifySuiteFile(…) != NotSuiteFile`) | `TestCheck_FlatIndexRowsCountAsClientCreated/a_flat_Release.gpg_alone` (`InRelease probed = true, want false`) |
+| a failed flat index read taken for no row (`index, _ = …`) | `TestCheck_AFailedFlatIndexReadIsALocalFault` (`the read fault was taken for dormancy: map[…]`) |
+| a failed flat index read taken as a row (the error dropped, the suite active) | `TestCheck_AFailedFlatIndexReadIsALocalFault` (`0 read failure WARNs, want 1`) |
 | `checkFirst` without the flat index rows | `TestCheck_FlatIndexRowsCountAsClientCreated/a_client-fetched_Packages.gz`, `/a_client-fetched_Sources.gz`, `/its_./_twin's_Packages.gz` (`InRelease probed = false, want true`) |
 | `ListSuiteMetadataRows` without its `SuitePath` filter | `TestListSuiteMetadataRows_TheSuitesRowsOnly` (`ListSuiteMetadataRows(/flat) = [/flat/Contents-amd64.diff/Index /flat/Contents-amd64.gz …], want [/flat/Contents-amd64.gz …]`) |
 | `ListSuiteMetadataRows` without its canonical-key guard | `TestListSuiteMetadataRows_TheSuitesRowsOnly` (`ListSuiteMetadataRows(""), a key no grammar produces, = [/InRelease], want nothing`) |
 | M-5: the directory range read back (one range over the suite's directory) | `TestListSuiteMetadataRows_TheSuitesRowsOnly` (`ListSuiteMetadataRows(/flat) = [… /flat/Packages.diff/Index … /flat/by-hash/SHA256/abab…], want …`), `TestListSuiteMetadataRows_ProbesURLPathByItsKey` |
 | M-5: one `SELECT` with an `OR` for the two | `TestListSuiteMetadataRows_ProbesURLPathByItsKey` (`query plan lacks "USING INDEX sqlite_autoindex_url_path_1 (canonical_scheme=? AND canonical_host=? AND path=?)"` — the plan is `SEARCH url_path USING INDEX sqlite_autoindex_url_path_1 (canonical_scheme=? AND canonical_host=?)`, the whole host) |
-| M-5: `suiteRowNames` without `Sources` | `TestListSuiteMetadataRows_TheSuitesRowsOnly` (`/flat/Sources.xz` missing), `TestCheck_FlatIndexRowsCountAsClientCreated/a_client-fetched_Sources.gz` (`InRelease probed = false, want true`) |
+| M-5: `FlatIndexNames` without `Sources` (`suiteRowNames` built from it) | `TestFlatIndexNames` (`7 names, want 14 (Packages and Sources, plain and six compressions): …`), `TestListSuiteMetadataRows_TheSuitesRowsOnly` (`/flat/Sources.xz` missing), `TestCheck_FlatIndexRowsCountAsClientCreated/a_client-fetched_Sources.gz` (`InRelease probed = false, want true`) |
+| `flatIndexExts` without `.zst` | `TestFlatIndexNames` (`12 names, want 14 …`, `the sniff's extension .zst is not listed`) |
+| `FlatIndexNames` without the plain `Packages` and `Sources` | `TestFlatIndexNames` (`12 names, want 14 …`) |
 | M-5: no `Contents-*` range (an empty one) | `TestListSuiteMetadataRows_TheSuitesRowsOnly` (`ListSuiteMetadataRows(/flat) = [/flat/InRelease /flat/Packages.gz /flat/Release.gpg /flat/Sources.xz], want [/flat/Contents-amd64.gz …]`) |
 
 Equivalent mutant (recorded): reading the flat index rows for any suite, not only a flat one — `ClassifySuiteFile` never names a `dists/` suite's root index `FileFlatIndex`, so the `IsFlatSuitePath` test only saves a `dists/` suite the range read.
@@ -5630,8 +6566,8 @@ Equivalent mutant (recorded): reading the flat index rows for any suite, not onl
 - [ ] **Step 6: Commit**
 
 ```bash
-gofmt -l internal/cache/anchorless.go internal/cache/anchorless_test.go internal/freshness/anchorless.go internal/freshness/first_adoption.go internal/freshness/flat_rig_test.go internal/freshness/flat_first_adoption_test.go
-git add internal/cache/anchorless.go internal/cache/anchorless_test.go internal/freshness/anchorless.go internal/freshness/first_adoption.go internal/freshness/flat_rig_test.go internal/freshness/flat_first_adoption_test.go
+gofmt -l internal/aptpath/suite.go internal/aptpath/suite_test.go internal/cache/anchorless.go internal/cache/anchorless_test.go internal/freshness/anchorless.go internal/freshness/first_adoption.go internal/freshness/freshness.go internal/freshness/flat_rig_test.go internal/freshness/flat_first_adoption_test.go
+git add internal/aptpath/suite.go internal/aptpath/suite_test.go internal/cache/anchorless.go internal/cache/anchorless_test.go internal/freshness/anchorless.go internal/freshness/first_adoption.go internal/freshness/freshness.go internal/freshness/flat_rig_test.go internal/freshness/flat_first_adoption_test.go
 git commit -m "Count a flat suite's client-created index rows for eager first adoption (spec C4 Dispatch 3)"
 ```
 
@@ -5647,13 +6583,15 @@ The refresh (design notes 10–13, deviation 2) revalidates each cached `Package
 
 The handler's url_path metadata serves (hit, miss, stale) answer `Last-Modified = max(pool mtime, last_fetched_at)` (design note 14, `urlPathModTime`), pinned end to end for a client's `If-Modified-Since` (design review M-9); ruling R-G3 keeps `runFetch`'s finalize-before-stamp order, pinned by `TestServeHTTP_AMissStampsItsRowAfterItsPoolFile` and AIDEV-NOTEs at `runFetch`, `adoptionStampTx`, `RefreshURLPathBlob` and `urlPathModTime`; blob mtimes are not folded into `adoptionStampTx`'s floor. The exec review's tests P2–P7 are folded in (ruling PG-15): an upstream that ignores validators (PG-6's note), GC frees a replaced blob and keeps the live one (PG-4's note 10), the gate failing closed on a marker read error, a validator-less 304, the body cap, and a suite with no index row. The rig's upstream gains `notModified`, `limits` and the rule that a request whose context has ended fails, as a real fetch does. Deferred minor E-47 (`retry_rig_test.go`, which this task changes) is taken: `rigStart` and `rigVerifier.resetCalls`. `freshness.go` gains the `Checker`'s two fields and their line in `New`, which touches that type and `New` only (ruling PF-11's reading, as ruling PG-3 applies it): A-56 (`freshness.Fetcher`'s name) stays checked and left.
 
+The Task 10 review's findings (ruling PG-24) and the fix round: the refresh deletes a cached `InRelease` or `Release` against the row read before the probe tree ran — `cachedAnchors` returns the anchor rows, `checkFirst` passes them to `anchorlessRefresh`, and `anchorURLMap` gives `anchorURLsFor` their URLs (`current_form.go`'s one call too, ruling PF-11's reading) — so a client's fetch during the probe's window is kept (M3); a delete that fails is no answer: its 404s and 410s stop counting, so a check they alone answered — no index request, or every content answer a delete — fails, its `err` naming the delete (M4); a read error of the refresh's index rows is `checkFirst`'s local fault, WARN `freshness: read anchor rows failed` with no write and no backoff (M5); the wait for a body slot honours `fetchCtx` and the writes run under the lifecycle context, each pinned (M2); an AIDEV-NOTE at the slot wait records the nested hold — the check's host slot held while it waits for a body slot — and its follow-up, GD-1 in the phase G deferred file (M1); `urlPathModTime`'s doc and a blobless row in `TestDeleteURLPathRows_DeletesTheRowsNamed` (M7). The over-cap WARN takes Task 6's `observability.LogLimiter` (ruling PG-22). Ruling PG-20's test, `TestCheck_AnIndexOnlyFlatSuiteProbesBesideItsIndexRow`, pins Task 9's probe-URL model and lands here, because it also asserts that the refresh asks the index at its own stored URL.
+
 **Files:**
 - Create: `internal/freshness/anchorless_test.go`, `internal/handler/urlpath_lastmod_test.go`
-- Modify: `internal/aptpath/sniff.go` (`IsAnchorlessIndex`, `SniffAnchorlessIndex`), `internal/aptpath/sniff_test.go`, `internal/cache/anchorless.go` (`RefreshURLPathBlob`, `DeleteURLPathRows`), `internal/cache/anchorless_test.go`, `internal/cache/adoption.go` (R-G3 AIDEV-NOTE at `adoptionStampTx`), `internal/freshness/anchorless.go` (the gate, the knob's refusal and the refresh), `internal/freshness/freshness.go` (`Checker.anchorlessBodies` and `anchorlessOverCap`, their line in `New`), `internal/freshness/first_adoption.go` (`checkFirst`'s `!t.found` branch and doc), `internal/freshness/metrics.go` (`acu_anchorless_sniff_rejected_total`), `internal/freshness/retry_rig_test.go` (`rigUpstream.before`, `notModified`, `limits`, the ended-context rule; E-47), `internal/freshness/flat_rig_test.go` (E-47's `rigStart`), `internal/handler/handler.go` (`urlPathModTime` at the three serves; R-G3 AIDEV-NOTE in `runFetch`), `internal/handler/singleflight.go` (`sfResult.fetchedAt`)
+- Modify: `internal/aptpath/sniff.go` (`IsAnchorlessIndex`, `SniffAnchorlessIndex`), `internal/aptpath/sniff_test.go`, `internal/cache/anchorless.go` (`RefreshURLPathBlob`, `DeleteURLPathRows`), `internal/cache/anchorless_test.go`, `internal/cache/adoption.go` (R-G3 AIDEV-NOTE at `adoptionStampTx`), `internal/freshness/anchorless.go` (the gate, the knob's refusal and the refresh), `internal/freshness/freshness.go` (`Checker.anchorlessBodies` and `anchorlessOverCap`, an `observability.LogLimiter`; their line in `New`), `internal/freshness/first_adoption.go` (`checkFirst`'s `!t.found` branch, its anchor rows and its doc; `cachedAnchors` returns the rows, `anchorURLMap`), `internal/freshness/current_form.go` (`anchorAbsent`'s one `anchorURLsFor` call), `internal/freshness/flat_first_adoption_test.go` (PG-20's test), `internal/freshness/metrics.go` (`acu_anchorless_sniff_rejected_total`), `internal/freshness/retry_rig_test.go` (`rigUpstream.before`, `notModified`, `limits`, the ended-context rule; E-47), `internal/freshness/flat_rig_test.go` (E-47's `rigStart`), `internal/handler/handler.go` (`urlPathModTime` at the three serves; R-G3 AIDEV-NOTE in `runFetch`), `internal/handler/singleflight.go` (`sfResult.fetchedAt`)
 
 **Interfaces:**
-- Consumes: `cache.ListSuiteMetadataRows`, `suiteKeyOf`, the flat rig with the knob on (Task 9); `Adopter.remarkSignedAnchors`, `Adopter.writeBlobBytes`, `Adopter.AdoptsUnsigned`, `cache.CheckUnsignedDowngrade`, `deleteURLPathRowTx`, `probeTree`, `finishCheck`, `failCheck`, `recordAdoptionFailure`, `endedByShutdown`, `nonEmpty`, `errUnexpectedStatus`, `anchorAbsentKey`, `checkDeadline`, `armoredSig`, `aptpath.SniffFlatIndex`; cache tests' `stubNow`, `RunBlobGCBatch`; handler tests' `lastModifiedGet`, `httpTime`, `commitAnchor`, `adoptedAt`, `lmSuite`, `writeBlob`, `staticUpstream`, `slowUpstream`, `flatPackagesGz` (Task 7), `newTestHandlerWithServe`, `newProxyReqHostPort`.
-- Produces: `aptpath.IsAnchorlessIndex(name string) bool`, `aptpath.SniffAnchorlessIndex(name string, head []byte) (pass, sniffable bool)`; `(*cache.Cache).RefreshURLPathBlob(ctx, scheme, host, path, old, newHash string, etag, lastmod *string) (bool, error)`, `(*cache.Cache).DeleteURLPathRows(ctx, rows []cache.URLPath) (int, error)`; `(*Adopter).anchorlessEligible`, `(*Checker).anchorlessDisabled`, `(*Checker).anchorlessRefresh`, `(*Checker).refreshAnchorlessRow`, `(*Checker).noteAnchorlessOverCap`, `anchorlessRank`, `anchorlessAnswer.answered`, `maxAnchorlessIndexBytes`, `anchorlessBodySlots`, `anchorlessOverCapWarnEvery`, `Checker.anchorlessBodies`, `Checker.anchorlessOverCap`, the metric `acu_anchorless_sniff_rejected_total{host}`, the `freshness_check` results `anchorless_refreshed` and `anchorless_unchanged` (form `anchorless`) and the knob's `changed_deferred` (form `anchorless`, reason `unsigned_disabled`), the failed check's form `anchorless`, WARN `freshness: anchorless index over its size cap` (`max_bytes`, `suppressed`; one a minute) and WARN `freshness: delete anchorless rows failed`; handler `urlPathModTime`, `sfResult.fetchedAt`; test helpers `gzBody`, `sniffRejected`, `flatRig.lookup`, `seedFlatSuiteOn`, `rigUpstream.before`/`notModified`/`limits`, `rigStart`, `rigVerifier.resetCalls`, `putFetchedRow`, `lookupRow`, `strOf` (cache), `cacheURLPath` — Tasks 11, 12, 15 and 16 use them.
+- Consumes: `cache.ListSuiteMetadataRows`, `suiteKeyOf`, `flatIndexClientCreated`'s row and PG-20's URL model, the flat rig with the knob on, `(*rigUpstream).sentURLs` (Task 9); `observability.LogLimiter` (Task 6); `Adopter.remarkSignedAnchors`, `Adopter.writeBlobBytes`, `Adopter.AdoptsUnsigned`, `cache.CheckUnsignedDowngrade`, `deleteURLPathRowTx`, `probeTree`, `finishCheck`, `failCheck`, `recordAdoptionFailure`, `endedByShutdown`, `nonEmpty`, `errUnexpectedStatus`, `anchorAbsentKey`, `checkDeadline`, `armoredSig`, `aptpath.SniffFlatIndex`; cache tests' `stubNow`, `RunBlobGCBatch`; handler tests' `lastModifiedGet`, `httpTime`, `commitAnchor`, `adoptedAt`, `lmSuite`, `writeBlob`, `staticUpstream`, `slowUpstream`, `flatPackagesGz` (Task 7), `newTestHandlerWithServe`, `newProxyReqHostPort`.
+- Produces: `aptpath.IsAnchorlessIndex(name string) bool`, `aptpath.SniffAnchorlessIndex(name string, head []byte) (pass, sniffable bool)`; `(*cache.Cache).RefreshURLPathBlob(ctx, scheme, host, path, old, newHash string, etag, lastmod *string) (bool, error)`, `(*cache.Cache).DeleteURLPathRows(ctx, rows []cache.URLPath) (int, error)`; `(*Adopter).anchorlessEligible`, `(*Checker).anchorlessDisabled`, `(*Checker).anchorlessRefresh`, `(*Checker).refreshAnchorlessRow`, `(*Checker).noteAnchorlessOverCap`, `(*Checker).cachedAnchors` returning `map[string]cache.URLPath`, `anchorURLMap`, `anchorlessRank`, `anchorlessAnswer.answered`, `maxAnchorlessIndexBytes`, `anchorlessBodySlots`, `anchorlessOverCapWarnEvery`, `Checker.anchorlessBodies`, `Checker.anchorlessOverCap`, the metric `acu_anchorless_sniff_rejected_total{host}`, the `freshness_check` results `anchorless_refreshed` and `anchorless_unchanged` (form `anchorless`) and the knob's `changed_deferred` (form `anchorless`, reason `unsigned_disabled`), the failed check's form `anchorless`, WARN `freshness: anchorless index over its size cap` (`max_bytes`, `suppressed`; one a minute) and WARN `freshness: delete anchorless rows failed`; handler `urlPathModTime`, `sfResult.fetchedAt`; test helpers `gzBody`, `sniffRejected`, `flatRig.lookup`, `seedFlatSuiteOn`, `rigUpstream.before`/`notModified`/`limits`, `rigStart`, `rigVerifier.resetCalls`, `putFetchedRow`, `lookupRow`, `strOf` (cache), `cacheURLPath`, `flatRig.rigDB`/`suiteOn`/`listed`, `lateFetcher` — Tasks 11, 12, 15 and 16 use them.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5802,14 +6740,20 @@ func TestDeleteURLPathRows_DeletesTheRowsNamed(t *testing.T) {
 	for _, p := range []string{"/flat/InRelease", "/flat/Packages", "/flat/Release", "/flat/Sources"} {
 		putFetchedRow(t, c, p, blob, 1_799_999_000)
 	}
+	// A row stored without a blob, read without one: the NULL-aware
+	// compare's other half (it is deleted).
+	if err := c.PutURLPath(context.Background(), URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: "/flat/Release.gpg",
+		UpstreamURL: "http://h/flat/Release.gpg", IsMetadata: true}); err != nil {
+		t.Fatal(err)
+	}
 	read := func(p string) URLPath { return *lookupRow(t, c, p) }
 	gone, blobless := read("/flat/Packages"), read("/flat/Sources")
 	gone.Path, blobless.BlobHash = "/flat/Gone", nil
-	rows := []URLPath{read("/flat/InRelease"), read("/flat/Packages"), read("/flat/Release"), gone, blobless}
+	rows := []URLPath{read("/flat/InRelease"), read("/flat/Packages"), read("/flat/Release"), gone, blobless, read("/flat/Release.gpg")}
 	putFetchedRow(t, c, "/flat/InRelease", fresh, 1_800_000_000) // a miss stored it anew after the read
 	n, err := c.DeleteURLPathRows(context.Background(), rows)
-	if err != nil || n != 2 {
-		t.Fatalf("DeleteURLPathRows = %d, %v; want 2", n, err)
+	if err != nil || n != 3 {
+		t.Fatalf("DeleteURLPathRows = %d, %v; want 3", n, err)
 	}
 	if got := listedPaths(t, c, sk("h", "/flat")); !slices.Equal(got, []string{"/flat/InRelease", "/flat/Sources"}) {
 		t.Fatalf("rows left = %v, want [/flat/InRelease /flat/Sources]: the row stored anew and the one read blobless kept", got)
@@ -6872,6 +7816,281 @@ func TestCheck_AnchorlessBodySlotsSurviveAPanic(t *testing.T) {
 		}
 	})
 }
+
+// rigDB opens a second connection to the flat rig's cache database, for a
+// test that injects a fault the cache's own API cannot produce.
+func (r *flatRig) rigDB() *sql.DB {
+	r.t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(r.cache.Dir(), "cache.db"))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	r.t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// suiteOn reads host's /fury suite row.
+func (r *flatRig) suiteOn(host string) cache.SuiteFreshness {
+	r.t.Helper()
+	s, err := r.cache.GetSuiteFreshness(context.Background(), "http", host, "/fury")
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return *s
+}
+
+// Ruling PG-24 (the Task 10 review's M2, first property): a check waits for
+// a body slot only within its own fetchCtx. Two stalled requests hold both
+// slots; a third suite's check ends at its deadline — a failed check, its
+// index never asked — or, when its context ends during the wait (a
+// shutdown), at once, writing nothing.
+func TestCheck_AnchorlessSlotWaitEndsWithTheCheck(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		t.Run(map[bool]string{false: "the deadline", true: "a shutdown"}[shutdown], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := newFlatRig(t, "/fury")
+				r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "")
+				r.up.setAt(r.url("Packages.gz"), gzBody("v2"))
+				for _, host := range []string{"fh2", "fh3"} {
+					seedFlatSuiteOn(t, r, host, "/fury", gzBody("v1"), gzBody("v2"))
+				}
+				release := make(chan struct{})
+				r.up.before = func(url string) {
+					if strings.HasSuffix(url, "/Packages.gz") && !strings.HasPrefix(url, "http://fh3/") {
+						<-release // a stalled body keeps its slot
+					}
+				}
+				var holders sync.WaitGroup
+				for _, host := range []string{flatRigHost, "fh2"} {
+					holders.Go(func() { r.checker.Check(context.Background(), "http", host, "/fury") })
+				}
+				synctest.Wait() // both slots held
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				done := make(chan struct{})
+				start := time.Now()
+				go func() {
+					defer close(done)
+					r.checker.Check(ctx, "http", "fh3", "/fury")
+				}()
+				synctest.Wait() // fh3's check waits for a slot
+				if shutdown {
+					cancel()
+				}
+				select {
+				case <-done:
+				case <-time.After(checkDeadline + time.Hour):
+				}
+				elapsed := time.Since(start)
+				close(release)
+				holders.Wait()
+				<-done
+				want := checkDeadline
+				if shutdown {
+					want = 0
+				}
+				if elapsed != want {
+					t.Fatalf("fh3's check ended after %v, want %v: the slot wait must end with the check", elapsed, want)
+				}
+				if n := len(r.up.etagsSent("http://fh3/fury/Packages.gz")); n != 0 {
+					t.Fatalf("fh3's Packages.gz asked %d times, want never (no slot)", n)
+				}
+				row := r.suiteOn("fh3")
+				switch {
+				case shutdown && (row.LastCheckAt != nil || row.CheckFailCount != 0):
+					t.Fatalf("fh3 row %+v, want nothing written by a check a shutdown ended", row)
+				case !shutdown && row.CheckFailCount != 1:
+					t.Fatalf("fh3 check_fail_count %d, want 1 (a failed check at its deadline)", row.CheckFailCount)
+				}
+			})
+		})
+	}
+}
+
+// lateFetcher answers like its Fetcher, but the answer for url comes back
+// only after the check's deadline has passed: the request's outcome is
+// decided in time, and what the refresh writes for it is written after
+// fetchCtx ended.
+type lateFetcher struct {
+	Fetcher
+	url string
+}
+
+func (f lateFetcher) Conditional(ctx context.Context, target *fetch.Target, etag, lastmod string, maxBody int64) (*fetch.ConditionalResult, error) {
+	res, err := f.Fetcher.Conditional(ctx, target, etag, lastmod, maxBody)
+	if target.URL == f.url {
+		time.Sleep(checkDeadline + time.Minute)
+	}
+	return res, err
+}
+
+// Plan design note 10 (the Task 10 review's M2, second property): the
+// refresh's writes run under the lifecycle context, not fetchCtx, so an
+// answer that arrives as the deadline passes is still committed: a
+// replacement's pool file and row, and a 404's delete.
+func TestCheck_AnchorlessWritesAfterTheDeadlineCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		upstream []byte // nil: 404
+	}{{"a replacement", gzBody("v2")}, {"a delete", nil}} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := newFlatRig(t, "/fury")
+				old := r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "")
+				if tc.upstream != nil {
+					r.up.setAt(r.url("Packages.gz"), tc.upstream)
+				}
+				r.checker.fetcher = lateFetcher{Fetcher: r.up, url: r.url("Packages.gz")}
+				start := time.Now()
+				r.check()
+				if time.Since(start) <= checkDeadline {
+					t.Fatalf("the check ended after %v, want past the %v deadline", time.Since(start), checkDeadline)
+				}
+				if got := r.lastResult(); got != "anchorless_refreshed" {
+					t.Fatalf("result %q, want anchorless_refreshed: the write after the deadline committed", got)
+				}
+				u := r.lookup("Packages.gz")
+				switch {
+				case tc.upstream == nil && u != nil:
+					t.Fatalf("Packages.gz row %+v, want deleted", u)
+				case tc.upstream != nil && (u == nil || *u.BlobHash == old || *u.BlobHash != hashOf(tc.upstream)):
+					t.Fatalf("Packages.gz row %+v, want the new blob", u)
+				}
+			})
+		})
+	}
+}
+
+// Design review M-4 for the anchors (the Task 10 review's M3): the refresh
+// deletes a cached anchor its probe answered 404 only while the row still
+// holds the blob read before the probe tree ran, so a newer Release a
+// client's miss stored during the probe's window is kept.
+func TestCheck_AnchorlessKeepsAnAnchorAClientStoredDuringItsProbe(t *testing.T) {
+	r := newFlatRig(t, "/fury")
+	r.cacheRow("Release", []byte("Origin: fury\n"), 1, rigStart-3600, "")
+	pk := gzBody("v1")
+	r.cacheRow("Packages.gz", pk, 1, rigStart-3600, rigETag(pk))
+	r.up.setAt(r.url("Packages.gz"), pk)
+	newer := []byte("Origin: fury\nLabel: newer\n")
+	r.up.before = func(url string) {
+		if url == r.url("Release") {
+			r.cacheRow("Release", newer, 2, rigStart, "") // a client's miss, while the probe is out
+		}
+	}
+	r.check()
+	if got := r.lastResult(); got != "anchorless_unchanged" {
+		t.Fatalf("result %q, want anchorless_unchanged (a 304, nothing deleted)", got)
+	}
+	if u := r.lookup("Release"); u == nil || *u.BlobHash != hashOf(newer) {
+		t.Fatalf("Release row %+v, want the client's newer Release kept", u)
+	}
+}
+
+// The Task 10 review's M4: a delete that fails is logged and is no answer —
+// its 404s stop counting, as a failed store makes its row unknown — so a
+// check its 404s alone answered fails (the streak backs off) and the rows
+// stay; another content answer still answers the check.
+func TestCheck_AnchorlessFailedDeleteIsNoAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cache  func(r *flatRig)
+		result string
+		err    string // the failed check's err prefix
+	}{
+		{"an index's 404", func(r *flatRig) { r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "") }, "failed",
+			"every anchorless index request ended unknown: delete anchorless rows: "},
+		{"an anchor's 404, no index row", func(r *flatRig) { r.cacheRow("Release", []byte("Origin: fury\n"), 1, rigStart-3600, "") }, "failed",
+			"delete anchorless rows: "},
+		{"a 404 beside a 304", func(r *flatRig) {
+			pk := gzBody("v1")
+			r.cacheRow("Packages.gz", pk, 1, rigStart-3600, rigETag(pk))
+			r.up.setAt(r.url("Packages.gz"), pk)
+			r.cacheRow("Sources.gz", gzBody("src"), 1, rigStart-3600, "")
+		}, "anchorless_unchanged", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newFlatRig(t, "/fury")
+			tc.cache(r)
+			if _, err := r.rigDB().Exec(`CREATE TRIGGER no_url_path_delete BEFORE DELETE ON url_path
+BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`); err != nil {
+				t.Fatal(err)
+			}
+			before := r.listed()
+			r.check()
+			if got := r.lastResult(); got != tc.result {
+				t.Fatalf("result %q, want %s", got, tc.result)
+			}
+			if n := strings.Count(r.logs.String(), `"msg":"freshness: delete anchorless rows failed"`); n != 1 {
+				t.Fatalf("%d delete failure WARNs, want 1", n)
+			}
+			if after := r.listed(); !slices.Equal(after, before) {
+				t.Fatalf("rows %v after the check, want %v: the delete failed", after, before)
+			}
+			if want := map[string]int64{"failed": 1}[tc.result]; r.row().CheckFailCount != want {
+				t.Fatalf("check_fail_count %d, want %d", r.row().CheckFailCount, want)
+			}
+			if tc.err != "" {
+				recs := logRecords(t, r.logs, "freshness check failed")
+				if len(recs) != 1 || !strings.HasPrefix(fmt.Sprint(recs[0]["err"]), tc.err) {
+					t.Fatalf("failed check lines %v, want one whose err starts %q", recs, tc.err)
+				}
+			}
+		})
+	}
+}
+
+// listed is the suite's cached metadata row paths.
+func (r *flatRig) listed() []string {
+	r.t.Helper()
+	rows, err := r.cache.ListSuiteMetadataRows(context.Background(), suiteKeyOf(r.suite))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	var out []string
+	for _, u := range rows {
+		out = append(out, u.Path)
+	}
+	return out
+}
+
+// The Task 10 review's M5: a read fault of the refresh's index rows follows
+// checkFirst's convention for a local read fault — one WARN naming the
+// suite, no index request, no delete and no write (no check stamp, no
+// streak, no record): the next check tries again. The fault is a row the
+// read cannot scan; the gate's reads and the client-created Release (so
+// checkFirst's own index read is skipped) get past it.
+func TestCheck_AnchorlessIndexReadFaultIsALocalFault(t *testing.T) {
+	r := newFlatRig(t, "/fury")
+	r.cacheRow("Release", []byte("Origin: fury\n"), 1, rigStart-3600, "")
+	r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "")
+	if _, err := r.rigDB().Exec(`INSERT INTO url_path(canonical_scheme,canonical_host,path,upstream_url,is_metadata,request_count)
+ VALUES('http',?,'/fury/Contents-x','http://fh/fury/Contents-x',1,'not a number')`, flatRigHost); err != nil {
+		t.Fatal(err)
+	}
+	r.check()
+	warns := 0
+	for _, line := range strings.Split(r.logs.String(), "\n") {
+		var m map[string]any
+		if line != "" && json.Unmarshal([]byte(line), &m) == nil && m["msg"] == "freshness: read anchor rows failed" {
+			if m["level"] != "WARN" || m["suite_path"] != "/fury" {
+				t.Fatalf("read failure line %v, want a WARN naming /fury", m)
+			}
+			warns++
+		}
+	}
+	if warns != 1 || r.lastResult() != "" {
+		t.Fatalf("%d read failure WARNs, last result %q; want 1 and no check line", warns, r.lastResult())
+	}
+	if n := r.requests("Packages.gz"); n != 0 {
+		t.Fatalf("Packages.gz asked %d times, want never", n)
+	}
+	if r.lookup("Release") == nil {
+		t.Fatal("the Release row was deleted, want it kept: nothing was decided")
+	}
+	if row := r.row(); row.LastCheckAt != nil || row.CheckFailCount != 0 || row.AdoptionFailReason != nil {
+		t.Fatalf("suite row %+v, want no check stamp, no streak and no record", row)
+	}
+}
 ```
 
 Create `internal/handler/urlpath_lastmod_test.go`:
@@ -7041,6 +8260,39 @@ func TestServeHTTP_AnAnchorlessReplacementPassesIfModifiedSince(t *testing.T) {
 }
 ```
 
+In `internal/freshness/flat_first_adoption_test.go`, add before `// Plan design note 8's flat read through the adopter's cache: when it` (ruling PG-20, Task 9's code):
+
+```go
+// Ruling PG-20 (spec C1: new probe code derives sibling URLs from a stored
+// upstream_url where one exists): a flat suite active only through a
+// client-fetched root index row probes its anchors beside that row's
+// stored upstream_url, so a non-default port survives — the canonical
+// host is port-less, and urlReconstruct would ask port 80, a service the
+// client never named. The anchorless refresh then asks the index at its
+// own stored URL.
+func TestCheck_AnIndexOnlyFlatSuiteProbesBesideItsIndexRow(t *testing.T) {
+	r := newFlatRig(t, "/fury")
+	h := poolBlob(t, r.cache, flatGz)
+	fetched := int64(1_799_999_000)
+	if err := r.cache.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: "http", CanonicalHost: flatRigHost,
+		Path: "/fury/Packages.gz", BlobHash: &h, UpstreamURL: "http://fh:8080/fury/Packages.gz", IsMetadata: true,
+		RequestCount: 1, LastFetchedAt: &fetched, LastRequestedAt: &fetched}); err != nil {
+		t.Fatal(err)
+	}
+	r.check()
+	for _, u := range []string{"http://fh:8080/fury/InRelease", "http://fh:8080/fury/Release", "http://fh:8080/fury/Packages.gz"} {
+		if n := len(r.up.etagsSent(u)); n != 1 {
+			t.Errorf("%s asked %d times, want once", u, n)
+		}
+	}
+	for _, name := range []string{"InRelease", "Release"} {
+		if n := r.requests(name); n != 0 {
+			t.Errorf("%s asked %d times at the port-less %s, want never", name, n, r.url(name))
+		}
+	}
+}
+```
+
 - [ ] **Step 2: Run to verify failure**
 
 Run: `go test -gcflags=-e ./internal/aptpath/ ./internal/cache/`
@@ -7048,6 +8300,9 @@ Expected: FAIL — `undefined: SniffAnchorlessIndex`, `undefined: IsAnchorlessIn
 
 Run: `go test ./internal/freshness/ -run 'Anchorless|TheKnobOff'`
 Expected: FAIL — every test except `TestCheck_AnchorlessAnswersByStatus/401`, `/403`, `/503` and `/a_transport_error`, `TestCheck_AnchorlessGateKeepsSignedSuitesOut`'s first four subtests, `TestCheck_AnchorlessValidatorlessNotModifiedIsUnknown`, `TestCheck_AnchorlessCachedPageIsNoAnswerEvenUnchanged` (its red run is the mutation row "M-1 beside M-7") and `TestCheck_TheKnobOffKeepsSignedSuitesAnchorAbsent` (today every suite without an anchor gets the failed check — and the `anchor_absent` record — those expect): `result "failed", want anchorless_refreshed` and the like; `TestCheck_AnchorlessAnswersByStatus/a_body_over_the_cap` `0 size-cap WARN lines, want 1`; `TestCheck_AnchorlessGateKeepsSignedSuitesOut/an_unreadable_pool_file` and `TestCheck_AnchorlessGateFailsClosedOnAMarkerReadError` `anchor_absent recorded`; `TestCheck_AnchorlessShutdownWritesNothing` `result "failed", want no check line`; `TestCheck_AnchorlessRequestsCarryTheBodyCap` `requested with a body cap of 0`; `TestCheck_TheKnobOffStopsTheAnchorlessRefresh` `result "failed", want changed_deferred`; `TestCheck_AnchorlessAsksPackagesBeforeContents` `asked [InRelease Release], want [InRelease Release Packages.gz Sources.gz Contents-amd64.gz]`; `TestCheck_AnchorlessOverCapWarnIsRateLimited` `suppressed [], want [0 1 1]`; `TestCheck_AnchorlessBodiesAreBoundedProcessWide` `peak anchorless bodies in flight 0, want 2`; `TestCheck_AnchorlessBodySlotsSurviveAPanic` `0 freshness_check_panicked lines, want 2`.
+
+Run: `go test ./internal/freshness/ -run TestCheck_AnIndexOnlyFlatSuiteProbesBesideItsIndexRow`
+Expected: FAIL — `http://fh:8080/fury/Packages.gz asked 0 times, want once`: Task 9's probes already go beside the index row, but no refresh asks the index yet.
 
 Run: `go test -gcflags=-e ./internal/handler/`
 Expected: FAIL — `h.cache.RefreshURLPathBlob undefined (type *cache.Cache has no field or method RefreshURLPathBlob)` (`TestServeHTTP_AnAnchorlessReplacementPassesIfModifiedSince`). With that test set aside, `go test ./internal/handler/ -run 'TestServeHTTP_URLPathMetadataLastModifiedIsTheLaterStamp|TestServeHTTP_AMissStampsItsRowAfterItsPoolFile'` fails `/hits`: `/flat/Packages.gz: 200, Last-Modified "<pool mtime>"; want 200 and "<an hour later>"`; `/misses`: `/flat/Packages: Last-Modified "<pool mtime>"; want "<row stamp>"`; `/a_stale_serve`: `stale Last-Modified …`. `TestServeHTTP_AMissStampsItsRowAfterItsPoolFile` passes: it pins ruling R-G3's order, which `runFetch` already keeps (its pool file and its stamp fall in one second, so the pool mtime served equals the stamp); its red run is the mutation row "R-G3: `runFetch` reads its stamp before the fetch".
@@ -7070,18 +8325,9 @@ import (
 )
 
 // suiteRowNames are the member names ListSuiteMetadataRows probes by key:
-// spec C2's anchors and root indexes — Packages and Sources, plain or with
-// one of the six compression extensions (the names
+// spec C2's anchors and root indexes (aptpath.FlatIndexNames, the list
 // unadoptedFlatIndexRowsSQL probes too).
-var suiteRowNames = func() []string {
-	names := []string{"InRelease", "Release", "Release.gpg"}
-	for _, stem := range []string{"Packages", "Sources"} {
-		for _, ext := range []string{"", ".gz", ".xz", ".bz2", ".lzma", ".lz4", ".zst"} {
-			names = append(names, stem+ext)
-		}
-	}
-	return names
-}()
+var suiteRowNames = append([]string{"InRelease", "Release", "Release.gpg"}, aptpath.FlatIndexNames()...)
 
 // listSuiteMetadataRowsSQL is ListSuiteMetadataRows' query: url_path's
 // key probed once per suiteRowNames name under the suite, and one key
@@ -7120,8 +8366,9 @@ SELECT canonical_scheme, canonical_host, path, blob_hash, upstream_url,
 // suite's directory: a Gemfury-style repository keeps its .debs in the
 // suite's own directory, so a directory range read every cached .deb of
 // the repository, twice per check. TestListSuiteMetadataRows_ProbesURLPathByItsKey
-// pins the plan; keep suiteRowNames in step with spec C2's flat member
-// grammar (aptpath.flatMemberRE).
+// pins the plan. suiteRowNames follows spec C2's flat member grammar
+// through aptpath.FlatIndexNames, which aptpath's TestFlatIndexNames keeps
+// equal to aptpath.flatMemberRE.
 func (c *Cache) ListSuiteMetadataRows(ctx context.Context, key SuiteKey) ([]URLPath, error) {
 	if !aptpath.IsCanonicalSuitePath(key.SuitePath) {
 		return nil, nil
@@ -7282,7 +8529,6 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
@@ -7295,23 +8541,26 @@ func suiteKeyOf(suite SuiteRef) cache.SuiteKey {
 	return cache.SuiteKey{CanonicalScheme: suite.CanonicalScheme, CanonicalHost: suite.CanonicalHost, SuitePath: suite.SuitePath}
 }
 
-// flatIndexClientCreated reports whether flat suite has a client-created
-// root Packages* or Sources* url_path row (aptpath.FileFlatIndex,
-// request_count > 0): spec C4 Dispatch 3 counts it beside the InRelease
-// and Release rows, so a Release-less repository's suite — created by its
-// index's serve — is not dormant (the E carry-forward; plan design note 8).
-// A row hot prefetch or a reconstruction wrote has no request count.
-func (a *Adopter) flatIndexClientCreated(ctx context.Context, suite SuiteRef) (bool, error) {
+// flatIndexClientCreated returns a client-created root Packages* or
+// Sources* url_path row of flat suite (aptpath.FileFlatIndex,
+// request_count > 0), nil when it has none: spec C4 Dispatch 3 counts it
+// beside the InRelease and Release rows, so a Release-less repository's
+// suite — created by its index's serve — is not dormant (the E
+// carry-forward; plan design note 8). A row hot prefetch or a
+// reconstruction wrote has no request count. The row is returned, not a
+// bool, because its stored upstream_url is the probe tree's URL model when
+// no anchor row is cached (ruling PG-20, checkFirst).
+func (a *Adopter) flatIndexClientCreated(ctx context.Context, suite SuiteRef) (*cache.URLPath, error) {
 	rows, err := a.cache.ListSuiteMetadataRows(ctx, suiteKeyOf(suite))
 	if err != nil {
-		return false, fmt.Errorf("read flat index rows: %w", err)
+		return nil, fmt.Errorf("read flat index rows: %w", err)
 	}
-	for _, r := range rows {
+	for i, r := range rows {
 		if r.RequestCount > 0 && aptpath.ClassifySuiteFile(suite.SuitePath, r.Path) == aptpath.FileFlatIndex {
-			return true, nil
+			return &rows[i], nil
 		}
 	}
-	return false, nil
+	return nil, nil
 }
 
 // maxAnchorlessIndexBytes is the anchorless refresh's body cap (plan
@@ -7328,15 +8577,9 @@ const anchorlessBodySlots = 2
 // anchorlessOverCapWarnEvery rate-limits the WARN "freshness: anchorless
 // index over its size cap": at most one line per minute process-wide, with
 // the count of the lines it suppressed (design review M-6; the handler's
-// flat_host_root_unsupported does the same).
+// flat_host_root_unsupported does the same). The limiter is
+// Checker.anchorlessOverCap, an observability.LogLimiter (ruling PG-22).
 const anchorlessOverCapWarnEvery = time.Minute
-
-// anchorlessOverCapWarn is that WARN's rate limiter. Monotonic time.
-type anchorlessOverCapWarn struct {
-	mu         sync.Mutex
-	last       time.Time
-	suppressed int
-}
 
 // errAnchorlessUnknown fails an anchorless check whose index requests got
 // no content answer.
@@ -7455,46 +8698,54 @@ func anchorlessRank(name string) int {
 // GET (refreshAnchorlessRow), Packages* first, then Sources*, then
 // Contents-* (anchorlessRank); then the rows to delete — those answered
 // 404 or 410, a changed plain Contents-*, and the suite's cached InRelease
-// and Release rows whose probe in t answered 404 or 410 — go in one writer
-// transaction, each only while it still holds the blob it was read with
-// (cache.DeleteURLPathRows). The check is answered — anchorless_refreshed
-// when a row was replaced or deleted, anchorless_unchanged otherwise —
-// unless index requests were sent and none got a content answer
-// (anchorlessAnswer.answered: a 304, a 200 stored or matching the cached
-// bytes, a 404 or 410): a failed check (the streak backs off). A suite
-// with no cached index row sends no request and is answered: the anchors'
-// 404s still apply. An answered check is a success (last_success_at, the
+// and Release rows (anchors: read before the probe tree ran) whose probe
+// in t answered 404 or 410 — go in one writer transaction, each only while
+// it still holds the blob it was read with (cache.DeleteURLPathRows; an
+// anchor a client's miss stored anew during its probe's window is kept).
+// The check is answered — anchorless_refreshed when a row was replaced or
+// deleted, anchorless_unchanged otherwise — unless index requests were
+// sent and none got a content answer (anchorlessAnswer.answered: a 304, a
+// 200 stored or matching the cached bytes, a 404 or 410): a failed check
+// (the streak backs off). A suite with no cached index row sends no
+// request and is answered: the anchors' 404s still apply. A delete that
+// fails is logged and is no answer: its 404s and 410s stop counting, and
+// a check they alone answered (no index request, or every content answer
+// a delete) fails. An answered check is a success (last_success_at, the
 // streak reset), clears the suite's failure or refusal record (it
 // described an anchor upstream no longer serves) and its pending change
-// (the anchorless form adopts nothing: a stamp left behind would queue the
-// suite every tick, pendingChange). Its writes (the pool, RefreshURLPathBlob,
-// DeleteURLPathRows) run under the lifecycle ctx, as the check's other
-// writes do: a refresh that passes its deadline still commits what it
-// fetched. A shutdown mid-refresh ends it silently; what it stored stays.
+// (the anchorless form adopts nothing: a stamp left behind would queue
+// the suite every tick, pendingChange). Its writes (the pool,
+// RefreshURLPathBlob, DeleteURLPathRows) run under the lifecycle ctx, as
+// the check's other writes do: a refresh that passes its deadline still
+// commits what it fetched. A shutdown mid-refresh ends it silently; what
+// it stored stays. A read error of the index rows is checkFirst's local
+// fault: logged at WARN, nothing written, no backoff.
 //
 // AIDEV-NOTE: no snapshot, no vouching, no strict-mode effect (spec C4):
 // the refresh only revalidates url_path rows a client's miss created, and
 // a row it cannot answer for stays as it is. Its cache operations go
 // through the adopter's *cache.Cache: the checker's Cache interface stays
 // the subset its fakes implement.
-func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, nowUnix int64, t probeTree) {
+func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, nowUnix int64, t probeTree, anchors map[string]cache.URLPath) {
 	host, suitePath := suite.CanonicalHost, suite.SuitePath
 	rows, err := c.adopter.cache.ListSuiteMetadataRows(ctx, suiteKeyOf(suite))
 	if err != nil {
+		// Task 10 review M5: checkFirst's convention for a local read
+		// fault — no write and no backoff, retried at the next check.
 		if !c.endedByShutdown(ctx, suite, "read the anchorless index rows", err) {
-			c.failCheck(ctx, out, cur, suite, nowUnix, "anchorless", err)
+			c.logger.Warn("freshness: read anchor rows failed",
+				"err", err, "canonical_host", host, "suite_path", suitePath)
 		}
 		return
 	}
 	var (
 		indexes, deletes             []cache.URLPath
 		requests, answered, replaced int
+		answeredDeletes              int
 		lastErr                      error
 		overCap                      bool
 	)
-	cached := make(map[string]cache.URLPath, len(rows))
 	for _, row := range rows {
-		cached[row.Path] = row
 		if name := strings.TrimPrefix(row.Path, suitePath+"/"); aptpath.IsAnchorlessIndex(name) && row.BlobHash != nil {
 			indexes = append(indexes, row)
 		}
@@ -7512,7 +8763,10 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 		switch a {
 		case anchorlessReplaced:
 			replaced++
-		case anchorlessDeleted, anchorlessDropped:
+		case anchorlessDeleted:
+			answeredDeletes++
+			deletes = append(deletes, row)
+		case anchorlessDropped:
 			deletes = append(deletes, row)
 		}
 		if a.answered() {
@@ -7526,11 +8780,15 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 		name string
 		o    probeOutcome
 	}{{"InRelease", t.inRelease}, {"Release", t.release}} {
-		if row, ok := cached[suitePath+"/"+p.name]; ok && (p.o.status == 404 || p.o.status == 410) {
+		// Design review M-4 for the anchors (Task 10 review M3): the row
+		// as read before the probe, so a newer file a client's miss stored
+		// during the probe's window fails the delete's blob compare and is
+		// kept.
+		if row, ok := anchors[p.name]; ok && (p.o.status == 404 || p.o.status == 410) {
 			deletes = append(deletes, row)
 		}
 	}
-	deleted := 0
+	deleted, deleteFailed := 0, false
 	if len(deletes) > 0 {
 		n, err := c.adopter.cache.DeleteURLPathRows(ctx, deletes)
 		if err != nil {
@@ -7539,14 +8797,24 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 			}
 			c.logger.Warn("freshness: delete anchorless rows failed",
 				"err", err, "canonical_host", host, "suite_path", suitePath)
+			// Task 10 review M4: a failed delete is no answer. The one
+			// transaction deleted nothing, so its 404s and 410s stop
+			// counting, as a failed RefreshURLPathBlob makes its row
+			// unknown.
+			answered -= answeredDeletes
+			deleteFailed, lastErr = true, fmt.Errorf("delete anchorless rows: %w", err)
 		}
 		deleted = n
 	}
 	if overCap {
 		c.noteAnchorlessOverCap(suite)
 	}
-	if requests > 0 && answered == 0 {
-		c.failCheck(ctx, out, cur, suite, nowUnix, "anchorless", fmt.Errorf("%w: %w", errAnchorlessUnknown, lastErr))
+	if (requests > 0 || deleteFailed) && answered == 0 {
+		err := fmt.Errorf("%w: %w", errAnchorlessUnknown, lastErr)
+		if requests == 0 {
+			err = lastErr // no index request: the anchors' failed delete alone
+		}
+		c.failCheck(ctx, out, cur, suite, nowUnix, "anchorless", err)
 		return
 	}
 	cur.LastCheckAt, cur.LastSuccessAt, cur.CheckFailCount = &nowUnix, &nowUnix, 0
@@ -7563,16 +8831,10 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 // process-wide, with the count of the lines it suppressed since the last
 // one (design review M-6: minted suites must not flood the log).
 func (c *Checker) noteAnchorlessOverCap(suite SuiteRef) {
-	c.anchorlessOverCap.mu.Lock()
-	now := time.Now()
-	if !c.anchorlessOverCap.last.IsZero() && now.Sub(c.anchorlessOverCap.last) < anchorlessOverCapWarnEvery {
-		c.anchorlessOverCap.suppressed++
-		c.anchorlessOverCap.mu.Unlock()
+	ok, suppressed := c.anchorlessOverCap.Allow(time.Now(), anchorlessOverCapWarnEvery)
+	if !ok {
 		return
 	}
-	suppressed := c.anchorlessOverCap.suppressed
-	c.anchorlessOverCap.last, c.anchorlessOverCap.suppressed = now, 0
-	c.anchorlessOverCap.mu.Unlock()
 	c.logger.Warn("freshness: anchorless index over its size cap",
 		"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "max_bytes", maxAnchorlessIndexBytes,
 		"suppressed", suppressed)
@@ -7608,6 +8870,19 @@ func (c *Checker) refreshAnchorlessRow(ctx, fetchCtx context.Context, suite Suit
 	if row.UpstreamLastMod != nil {
 		lastmod = *row.UpstreamLastMod
 	}
+	// AIDEV-NOTE: a nested hold (Task 10 review M1, ruling PG-24). The
+	// check already holds its host's slot (checkFirst: the hostLimiter the
+	// handler's client misses share) while it waits here for one of the
+	// two process-wide body slots, and a slow request keeps its body slot
+	// until the check's deadline (checkDeadline: the fetch transport has
+	// no response-header timeout). So two slow anchorless requests
+	// anywhere can make other hosts' anchorless checks wait, each holding
+	// a host slot idle, up to their deadlines. No deadlock: a body-slot
+	// holder never waits for a host slot; bounded, and failed checks back
+	// off. Follow-up for phase H (the phase G deferred file): a short
+	// bounded wait for a body slot, or a per-request timeout well under
+	// checkDeadline. The wait honours fetchCtx (the deadline, a shutdown):
+	// TestCheck_AnchorlessSlotWaitEndsWithTheCheck pins it.
 	select {
 	case c.anchorlessBodies <- struct{}{}:
 	case <-fetchCtx.Done():
@@ -7797,25 +9072,83 @@ with
 	// freshnessStaleSuites is the per-tick gauge
 ```
 
-In `internal/freshness/first_adoption.go`, replace
+In `internal/freshness/first_adoption.go` (`checkFirst`'s doc comment up to its AIDEV-NOTE: the anchorless branch and the refresh's read fault, reflowed), replace
 
 ```go
+// checkFirst is spec C4 Dispatch 3 (adopter wired, no current snapshot).
+// A suite without client interest in the last 7 days, or without a
+// client-created InRelease or Release url_path row — or, for a flat suite,
+// root Packages*/Sources* row (Adopter.flatIndexClientCreated) — is
+// dormant: no request and no write. The scheduler skips only a suite
+// without interest (suiteDue): one with interest but no client-created row
+// is queued at every tick and ends here, dormant, after its row reads
+// (deferred minor E-25; a flat suite's reads include its index rows). A
+// suite whose record is active and not due is paced (pacedFirst): no
+// request between the scheduler's refresh checks, except the scheduler's
+// slot-driven re-offer of the parked suite (offered: the check's
+// bypassCooldown, which the scheduler sets for a waiting item and for a
+// pending-change item; the latter has no record when it is queued, so it
+// is not paced: at most one probe more, when a client check's failed
+// adoption recorded one between the enqueue and the dequeue; deferred
+// minor E-34). Otherwise the probe tree
+// runs without validators and the form found is adopted — result
+// first_adoption, or first_adoption_queued with no slot — through the spec
+// C7 gate (content keys only: the probes carry no validators) and, for the
+// unsigned form, spec C5's eligibility, member cap and transition
+// confirmation (unsignedFirst). A probe that finds a signature marks the
+// suite's base first (Adopter.markSignatureSeen; a failed mark fails the
 // check). A probe that ends unknown and a tree that finds no anchor (which
 // also records anchor_absent, so the status page shows it: ruling PE-2)
 // are failed checks; an unsigned candidate while adoption.adopt_unsigned
+// is off is the refusal unsigned_disabled, recorded and paced (ruling
+// PE-12). A read error of the anchor rows is logged at WARN with no
+// write and no backoff: a local fault, retried at the next check (at most
+// one per cooldown and per tick); so is a read error of a flat suite's
+// index rows. A suite with no cached anchor row but a client-created flat
+// index row is probed beside the index row's stored upstream_url (ruling
+// PG-20).
 ```
 
 with
 
 ```go
-// check). A probe that ends unknown and a tree that finds no anchor (which
-// also records anchor_absent, so the status page shows it: ruling PE-2)
-// are failed checks — except that a flat suite whose tree finds no anchor
-// and that has no signed evidence (Adopter.anchorlessEligible) runs the
-// anchorless refresh instead (anchorlessRefresh, spec C4 Dispatch 4), or,
-// while adoption.adopt_unsigned is off, is refused unsigned_disabled
+// checkFirst is spec C4 Dispatch 3 (adopter wired, no current snapshot). A
+// suite without client interest in the last 7 days, or without a
+// client-created InRelease or Release url_path row — or, for a flat suite,
+// root Packages*/Sources* row (Adopter.flatIndexClientCreated) — is
+// dormant: no request and no write. The scheduler skips only a suite
+// without interest (suiteDue): one with interest but no client-created row
+// is queued at every tick and ends here, dormant, after its row reads
+// (deferred minor E-25; a flat suite's reads include its index rows). A
+// suite whose record is active and not due is paced (pacedFirst): no
+// request between the scheduler's refresh checks, except the scheduler's
+// slot-driven re-offer of the parked suite (offered: the check's
+// bypassCooldown, which the scheduler sets for a waiting item and for a
+// pending-change item; the latter has no record when it is queued, so it is
+// not paced: at most one probe more, when a client check's failed adoption
+// recorded one between the enqueue and the dequeue; deferred minor E-34).
+// Otherwise the probe tree runs without validators and the form found is
+// adopted — result first_adoption, or first_adoption_queued with no slot —
+// through the spec C7 gate (content keys only: the probes carry no
+// validators) and, for the unsigned form, spec C5's eligibility, member cap
+// and transition confirmation (unsignedFirst). A probe that finds a
+// signature marks the suite's base first (Adopter.markSignatureSeen; a
+// failed mark fails the check). A probe that ends unknown and a tree that
+// finds no anchor (which also records anchor_absent, so the status page
+// shows it: ruling PE-2) are failed checks — except that a flat suite whose
+// tree finds no anchor and that has no signed evidence
+// (Adopter.anchorlessEligible) runs the anchorless refresh instead
+// (anchorlessRefresh, spec C4 Dispatch 4), or, while
+// adoption.adopt_unsigned is off, is refused unsigned_disabled
 // (anchorlessDisabled, ruling PG-1); an unsigned candidate while
-// adoption.adopt_unsigned
+// adoption.adopt_unsigned is off is the refusal unsigned_disabled, recorded
+// and paced (ruling PE-12). A read error of the anchor rows is logged at
+// WARN with no write and no backoff: a local fault, retried at the next
+// check (at most one per cooldown and per tick); so is a read error of a
+// flat suite's index rows, before the probe tree or in the anchorless
+// refresh. A suite with no cached anchor row but a client-created flat
+// index row is probed beside the index row's stored upstream_url (ruling
+// PG-20).
 ```
 
 In `internal/freshness/first_adoption.go`, replace
@@ -7852,7 +9185,7 @@ with
 				c.anchorlessDisabled(ctx, out, cur, suite, nowUnix, t)
 				return nil
 			case eligible:
-				c.anchorlessRefresh(ctx, fetchCtx, out, cur, suite, nowUnix, t)
+				c.anchorlessRefresh(ctx, fetchCtx, out, cur, suite, nowUnix, t, anchors)
 				return nil
 			}
 		}
@@ -7860,6 +9193,106 @@ with
 		// off), and the refusal state anchor_absent shows it on the status
 		// page; the record also paces the suite (pacedFirst).
 		c.recordAdoptionFailure(
+```
+
+In `internal/freshness/first_adoption.go` (Task 10 review M3: the anchor rows, read before the probe tree, for the refresh's deletes), replace
+
+```go
+// cachedAnchors reads suite's cached anchor url_path rows: the upstream
+// URL of each (by file name) and whether a client created one of the
+// InRelease or Release rows (request_count > 0; a reconstructed row has
+// none, spec C4 "never reconstructed").
+func (c *Checker) cachedAnchors(ctx context.Context, suite SuiteRef) (urls map[string]string, clientCreated bool, err error) {
+	urls = make(map[string]string, 3)
+	for _, name := range []string{"InRelease", "Release", "Release.gpg"} {
+		row, err := c.cache.LookupURL(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/"+name)
+		switch {
+		case errors.Is(err, cache.ErrNotFound):
+			continue
+		case err != nil:
+			return nil, false, fmt.Errorf("read %s: %w", name, err)
+		}
+		urls[name] = row.UpstreamURL
+		if name != "Release.gpg" && row.RequestCount > 0 {
+			clientCreated = true
+		}
+	}
+	return urls, clientCreated, nil
+}
+```
+
+with
+
+```go
+// cachedAnchors reads suite's cached anchor url_path rows, by file name
+// (anchorURLMap gives their upstream URLs), and whether a client created
+// one of the InRelease or Release rows (request_count > 0; a reconstructed
+// row has none, spec C4 "never reconstructed"). The rows are read before
+// the probe tree runs: the anchorless refresh deletes an anchor only while
+// it still holds the blob read here (design review M-4).
+func (c *Checker) cachedAnchors(ctx context.Context, suite SuiteRef) (rows map[string]cache.URLPath, clientCreated bool, err error) {
+	rows = make(map[string]cache.URLPath, 3)
+	for _, name := range []string{"InRelease", "Release", "Release.gpg"} {
+		row, err := c.cache.LookupURL(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/"+name)
+		switch {
+		case errors.Is(err, cache.ErrNotFound):
+			continue
+		case err != nil:
+			return nil, false, fmt.Errorf("read %s: %w", name, err)
+		}
+		rows[name] = *row
+		if name != "Release.gpg" && row.RequestCount > 0 {
+			clientCreated = true
+		}
+	}
+	return rows, clientCreated, nil
+}
+
+// anchorURLMap is the upstream URL of each of rows, by file name
+// (anchorURLsFor's input).
+func anchorURLMap(rows map[string]cache.URLPath) map[string]string {
+	urls := make(map[string]string, len(rows))
+	for name, row := range rows {
+		urls[name] = row.UpstreamURL
+	}
+	return urls
+}
+```
+
+In `internal/freshness/first_adoption.go`, replace
+
+```go
+	rows, clientCreated, err := c.cachedAnchors(ctx, suite)
+```
+
+with
+
+```go
+	anchors, clientCreated, err := c.cachedAnchors(ctx, suite)
+```
+
+In `internal/freshness/first_adoption.go`, replace
+
+```go
+	urls := c.anchorURLsFor(suite, rows)
+```
+
+with
+
+```go
+	urls := c.anchorURLsFor(suite, anchorURLMap(anchors))
+```
+
+In `internal/freshness/current_form.go` (`anchorAbsent`), replace
+
+```go
+		t := c.runProbeTree(fetchCtx, suite, c.anchorURLsFor(suite, rows))
+```
+
+with
+
+```go
+		t := c.runProbeTree(fetchCtx, suite, c.anchorURLsFor(suite, anchorURLMap(rows)))
 ```
 
 In `internal/freshness/freshness.go` (ruling PG-8, design review M-6), replace
@@ -7882,7 +9315,7 @@ with
 	// as long as its body is in memory. anchorlessOverCap rate-limits the
 	// refresh's over-cap WARN (design review M-6).
 	anchorlessBodies  chan struct{}
-	anchorlessOverCap anchorlessOverCapWarn
+	anchorlessOverCap observability.LogLimiter
 ```
 
 and in `New`, replace
@@ -7952,8 +9385,11 @@ with
 // If-Modified-Since on an index sees a replacement whose bytes were
 // already in the pool (the anchorless refresh points the row at an
 // existing pool file and moves last_fetched_at past the previous stamp);
-// a .deb, and a serve with no stamp (lastFetchedAt nil: a snapshot or
-// by-hash serve), keep mtime.
+// a .deb, and a serve with no stamp (lastFetchedAt nil: a snapshot serve
+// or the content-addressed by-hash fallback), keep mtime. A by-hash
+// path's own url_path row (recordByHashURLPath) carries a stamp, so its
+// later hits answer max as any row does: harmless, as its bytes never
+// change.
 //
 // AIDEV-NOTE: ruling R-G3. adoptionStampTx's first-adoption floor is the
 // anchors' MAX(last_fetched_at) + 1, which passes this only while no pool
@@ -8269,8 +9705,8 @@ Expected: PASS (`TestServeHTTP_AMissStampsItsRowAfterItsPoolFile` takes about 1.
 | a shutdown goes on (no `context.Canceled` exit) | `TestCheck_AnchorlessShutdownWritesNothing` (`result "failed", want no check line`) |
 | every cached row refreshed, anchors included | `TestCheck_AnchorlessDeletesTheAnchorsUpstreamDropped` (`Release.gpg <nil>`) |
 | no size-cap WARN | `TestCheck_AnchorlessAnswersByStatus/a_body_over_the_cap` (`0 size-cap WARN lines, want 1`), `TestCheck_AnchorlessOverCapWarnIsRateLimited` |
-| M-6: the over-cap WARN unlimited | `TestCheck_AnchorlessOverCapWarnIsRateLimited` (`over-cap WARN lines with suppressed [0 0 0 0 0], want [0 1 1]`) |
-| M-6: the suppressed count not reset after a line | `TestCheck_AnchorlessOverCapWarnIsRateLimited` (`suppressed [0 1 2], want [0 1 1]`) |
+| M-6: the over-cap WARN unlimited (`noteAnchorlessOverCap` ignores `Allow`'s `ok`) | `TestCheck_AnchorlessOverCapWarnIsRateLimited` (`over-cap WARN lines with suppressed [0 0 0 0 0], want [0 1 1]`) |
+| M-6: `Allow` does not reset the suppressed count after a line (Task 6's limiter) | `TestCheck_AnchorlessOverCapWarnIsRateLimited` (`suppressed [0 1 2], want [0 1 1]`) |
 | no validators sent | `TestCheck_AnchorlessRefreshRevalidatesTheIndexes`, `TestCheck_AnchorlessSniffRejectionKeepsTheRow`, `TestCheck_AnchorlessAnswersByStatus/a_304_to_If-Modified-Since_alone` (`ETags sent [""], want [...]`) |
 | P6: the body cap not passed (0), or 64 GiB | `TestCheck_AnchorlessRequestsCarryTheBodyCap` (`Packages.gz requested with a body cap of 0, want 67108864`; `… of 68719476736 …`) |
 | PG-8: three body slots | `TestCheck_AnchorlessBodiesAreBoundedProcessWide` (`peak anchorless bodies in flight 3, want 2`) |
@@ -8282,7 +9718,8 @@ Expected: PASS (`TestServeHTTP_AMissStampsItsRowAfterItsPoolFile` takes about 1.
 | M-1: an unchanged plain `Contents-*` keeps its old validators (the draft's `case !sniffable && hash == old: return anchorlessKept, nil` ahead of M-1's arm) | `TestCheck_AnchorlessUnchangedBytesWriteOnlyTheirValidators` (`Contents-amd64 row = …; want the blob and last_fetched_at kept, upstream's ETag stored`) |
 | M-1 beside M-7: the cached bytes compared before the sniff (`case sniffable && !pass && hash != old:`) | `TestCheck_AnchorlessCachedPageIsNoAnswerEvenUnchanged` (`result "anchorless_unchanged", want failed (a sniff-rejected 200 is no content answer)`) |
 | M-3: the rows asked in path order (the sort over an empty slice) | `TestCheck_AnchorlessAsksPackagesBeforeContents` (`asked [InRelease Release Contents-amd64.gz Sources.gz], want [InRelease Release Packages.gz Sources.gz Contents-amd64.gz]`) |
-| M-4: `DeleteURLPathRows` ignores the blob read | `TestDeleteURLPathRows_DeletesTheRowsNamed` (`DeleteURLPathRows = 4, <nil>; want 2`) |
+| M-4: `DeleteURLPathRows` ignores the blob read (`if false`) | `TestDeleteURLPathRows_DeletesTheRowsNamed` (`DeleteURLPathRows = 5, <nil>; want 3`) |
+| M-4's NULL-aware compare: a blobless row never matches (`!blob.Valid \|\| r.BlobHash == nil \|\| …`) | `TestDeleteURLPathRows_DeletesTheRowsNamed` (`DeleteURLPathRows = 2, <nil>; want 3`) |
 | `RefreshURLPathBlob` overwrites a row whose blob changed | `TestRefreshURLPathBlob_ReplacesTheBlobAndKeepsTheInterest` (`… of a changed row = true, <nil>; want false`) |
 | `RefreshURLPathBlob` not monotonic (`MAX(?, 0)`) | `TestRefreshURLPathBlob_ReplacesTheBlobAndKeepsTheInterest` (`/flat/Sources` row), `TestServeHTTP_AnAnchorlessReplacementPassesIfModifiedSince` (`If-Modified-Since "<T>" after the replacement: 304, Last-Modified "<now>"; want 200 and "<T+1>"`) |
 | `RefreshURLPathBlob` without the new hash's check | `TestRefreshURLPathBlob_ReplacesTheBlobAndKeepsTheInterest` (`FOREIGN KEY constraint failed …, want ErrInvalidHash`) |
@@ -8294,6 +9731,14 @@ Expected: PASS (`TestServeHTTP_AMissStampsItsRowAfterItsPoolFile` takes about 1.
 | the miss serves its pool file's mtime | `…/misses` |
 | the stale serve serves its pool file's mtime | `…/a_stale_serve` |
 | R-G3: `runFetch` reads its stamp before the fetch | `TestServeHTTP_AMissStampsItsRowAfterItsPoolFile` (`row stamp N, pool mtime N+1, …`) |
+| PG-24 (M2): the wait for a body slot a plain send (no `fetchCtx.Done()` case) | `TestCheck_AnchorlessSlotWaitEndsWithTheCheck/the_deadline` (`fh3's check ended after 1h2m0s, want 2m0s: the slot wait must end with the check`), `/a_shutdown` (`… after 1h2m0s, want 0s …`) |
+| PG-24 (M2): the refresh's writes (`writeBlobBytes`, `RefreshURLPathBlob`, `DeleteURLPathRows`) under `fetchCtx` | `TestCheck_AnchorlessWritesAfterTheDeadlineCommit/a_replacement`, `/a_delete` (`result "failed", want anchorless_refreshed: the write after the deadline committed`); each call site alone fails its subtest (`DeleteURLPathRows` the delete, the other two the replacement) |
+| PG-24 (M3): the anchors' deletes read after the probe tree (the suite's rows as `ListSuiteMetadataRows` returns them) | `TestCheck_AnchorlessKeepsAnAnchorAClientStoredDuringItsProbe` (`result "anchorless_refreshed", want anchorless_unchanged (a 304, nothing deleted)`) |
+| PG-24 (M4): a failed delete still counts its 404s (no `answered -= answeredDeletes`, no `deleteFailed`) | `TestCheck_AnchorlessFailedDeleteIsNoAnswer/an_index's_404`, `/an_anchor's_404,_no_index_row` (`result "anchorless_unchanged", want failed`) |
+| PG-24 (M4): only index requests can fail the check (`requests > 0 && answered == 0`) | `TestCheck_AnchorlessFailedDeleteIsNoAnswer/an_anchor's_404,_no_index_row` (`result "anchorless_unchanged", want failed`) |
+| PG-24 (M4): a check with no index request names `errAnchorlessUnknown` too (no `requests == 0` case) | `TestCheck_AnchorlessFailedDeleteIsNoAnswer/an_anchor's_404,_no_index_row` (`failed check lines [map[… err:every anchorless index request ended unknown: delete anchorless rows: …]], want one whose err starts "delete anchorless rows: "`) |
+| PG-24 (M5): the refresh's index-row read error a failed check (`failCheck`) | `TestCheck_AnchorlessIndexReadFaultIsALocalFault` (`0 read failure WARNs, last result "failed"; want 1 and no check line`) |
+| PG-20 (Task 9's code): the stored URL dropped (`if false && urls.model == "" && index != nil`) | `TestCheck_AnIndexOnlyFlatSuiteProbesBesideItsIndexRow` (`http://fh:8080/fury/InRelease asked 0 times, want once`, and `Release`; `InRelease asked 1 times at the port-less http://fh/fury/InRelease, want never`, and `Release`) |
 
 Equivalent mutant (recorded): dropping, inside M-1's arm, the early return for unchanged validators only adds a write (`RefreshURLPathBlob` of the same blob and validators changes nothing). Not pinned: a refresh whose `RefreshURLPathBlob` finds the row changed under it (counted `anchorless_unchanged`; `TestRefreshURLPathBlob_ReplacesTheBlobAndKeepsTheInterest` pins the cache side).
 
@@ -8301,7 +9746,7 @@ Equivalent mutant (recorded): dropping, inside M-1's arm, the early return for u
 
 ```bash
 gofmt -l internal/aptpath internal/cache internal/freshness internal/handler
-git add internal/aptpath/sniff.go internal/aptpath/sniff_test.go internal/cache/anchorless.go internal/cache/anchorless_test.go internal/cache/adoption.go internal/freshness/anchorless.go internal/freshness/anchorless_test.go internal/freshness/freshness.go internal/freshness/first_adoption.go internal/freshness/metrics.go internal/freshness/retry_rig_test.go internal/freshness/flat_rig_test.go internal/handler/handler.go internal/handler/singleflight.go internal/handler/urlpath_lastmod_test.go
+git add internal/aptpath/sniff.go internal/aptpath/sniff_test.go internal/cache/anchorless.go internal/cache/anchorless_test.go internal/cache/adoption.go internal/freshness/anchorless.go internal/freshness/anchorless_test.go internal/freshness/freshness.go internal/freshness/first_adoption.go internal/freshness/current_form.go internal/freshness/flat_first_adoption_test.go internal/freshness/metrics.go internal/freshness/retry_rig_test.go internal/freshness/flat_rig_test.go internal/handler/handler.go internal/handler/singleflight.go internal/handler/urlpath_lastmod_test.go
 git commit -m "Refresh Release-less flat suites anchorless; url_path Last-Modified is max(pool mtime, last_fetched_at) (spec C4 Dispatch 3-4, ruling R-G3)"
 ```
 
@@ -8311,13 +9756,15 @@ git commit -m "Refresh Release-less flat suites anchorless; url_path Last-Modifi
 
 PR #8 parity item 4 and design note 17: PR #8's nine `TestPhase3StrictMode_FlatSnapshotScopedToItsDirectory` cases and three new ones, re-expressed for C6's vouching and C10's host-wide rule, run through the real handler with snapshots committed through the cache (`package_hash` rows at each suite's `FlatBase` with their `flat_filename`); the two pkgs.k8s.io rows use the handler's `AdoptionWaiter` seam (`fakeAdoptions`). PR #8's `TestPhase3StrictMode_SnapshotCountExcludesOutOfScopeFlat` becomes `TestServeHTTP_CurrentSnapshotCountCountsFlatSnapshots`: every signed current snapshot counts, flat ones and twins included, and never an unsigned snapshot or an anchorless suite. Tasks 4, 5 and 10 built the behaviour (`cache.HostCurrentSnapshotsCoverage` was already host-wide and signed-only), so the code change is one AIDEV-NOTE on that query; the tests are the deliverable, and the mutation step shows each row is load-bearing. Deferred minor E-70 (`unsigned_posture_test.go`, the other `current_snapshot_count` test) is taken: it requires exactly one refusal record, so the count is always read.
 
+The fix round (the Task 11 review, and the Task 5 review's Important 1, whose handler test needs this task's `strictSnap`): every matrix row counts upstream requests — none for a strict refusal or a hit, one for a served miss and for the hash check's fetch (Minor 2) — and asserts whether the refusal asked about adoptions in flight (Minor 4); three rows join — a fallback-vouched `.deb` whose bytes differ from its declaration is refused by its hash check (`hash_validation_failure`, Minor 3), and two hit-path rows: a twin's cached `.deb` by its `./` path vouched through the fallback, and a cached undeclared `.deb` refused (Minor 5). `TestServeHTTP_AFallbackTieIsAConflict` shows spec C6 step 2's tie through the real handler: two signed current suites at one base that declare different hashes for one Filename — the twins reached by a `./` request that misses their exact rows, and two host-root channels — are a `package_hash_conflict` (502, `Retry-After: 60`) refused before upstream is asked, never an order-dependent answer (`strictSnap.declared` sets a snapshot's declared SHA-256). `flatSplits`' `..` and empty-segment stops are pinned on the function itself (`TestFlatSplits`): with valid rows no split holding them can match, so the matrix's `..` row is PR #8 parity on row 1's mechanism (Minor 1). `commitVouching` and `adoptCoverageComplete` become one-line wrappers of `commitStrictSnap` (Minor 6).
+
 **Files:**
 - Create: `internal/handler/flat_strict_test.go`
-- Modify: `internal/cache/queries.go` (AIDEV-NOTE in `HostCurrentSnapshotsCoverage`), `internal/handler/unsigned_posture_test.go` (E-70)
+- Modify: `internal/cache/queries.go` (AIDEV-NOTE in `HostCurrentSnapshotsCoverage`), `internal/cache/adoption.go` (`flatSplits`' doc), `internal/cache/flat_lookup_test.go` (`TestFlatSplits`), `internal/handler/unsigned_posture_test.go` (E-70), `internal/handler/strict_wait_test.go` (`commitVouching`), `internal/handler/phase3_strict_test.go` (`adoptCoverageComplete`)
 
 **Interfaces:**
-- Consumes: `newPhase3StrictHandlerCapturing`, `strictLogBuf.find`, `splitURL`, `hostKey`, `proxyReq`, `writeBlob`, `sha256Hex`, `commitUnsigned`, `fakeAdoptions` (handler tests); `cache.PackageHash.FlatFilename` (Task 4); the suffix fallback (Task 5).
-- Produces: `strictSnap`, `commitStrictSnap` (handler tests) — Task 15 uses them.
+- Consumes: `newPhase3StrictHandlerCapturing`, `strictLogBuf.find`, `splitURL`, `hostKey`, `proxyReq`, `writeBlob`, `sha256Hex`, `commitUnsigned`, `fakeAdoptions` (its `asks` and `waits`), `hdrXCache`, `cacheHit` (handler tests); `cache.PackageHash.FlatFilename` (Task 4); the suffix fallback, `flatSplits` and `maxFallbackSegments` (Task 5).
+- Produces: `strictSnap` (with `declared`), `commitStrictSnap` (handler tests) — Task 15 uses them; `commitVouching` and `adoptCoverageComplete` as wrappers of `commitStrictSnap`.
 
 - [ ] **Step 1: Write the tests**
 
@@ -8330,6 +9777,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -8339,11 +9787,13 @@ import (
 // strictSnap is one current snapshot of a strict matrix row: its suite,
 // its coverage, and its package_hash rows — each .deb's path (at the
 // suite's FlatBase, as spec C6 materialises it) and flat_filename ("" for
-// a dists/ row) — declaring the strict rig upstream's bytes.
+// a dists/ row) — declaring the strict rig upstream's bytes, or the
+// SHA-256 declared when it is set.
 type strictSnap struct {
 	suite    string
 	complete bool
 	debs     map[string]string
+	declared string
 }
 
 // commitStrictSnap adopts s on host through the cache (an inline
@@ -8361,10 +9811,14 @@ func commitStrictSnap(t *testing.T, h *Handler, scheme, host string, s strictSna
 	if err != nil {
 		t.Fatal(err)
 	}
+	declared := sha256Hex([]byte("upstream bytes"))
+	if s.declared != "" {
+		declared = s.declared
+	}
 	var rows []cache.PackageHash
 	for path, flat := range s.debs {
 		rows = append(rows, cache.PackageHash{SnapshotID: id, CanonicalScheme: scheme, CanonicalHost: host, Path: path,
-			FlatFilename: flat, DeclaredSHA256: sha256Hex([]byte("upstream bytes"))})
+			FlatFilename: flat, DeclaredSHA256: declared})
 	}
 	if err := h.cache.CommitAdoption(ctx, id, []cache.SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: inrel,
 		DeclaredSHA256: inrel}}, nil, rows, nil, s.complete); err != nil {
@@ -8376,14 +9830,18 @@ func commitStrictSnap(t *testing.T, h *Handler, scheme, host string, s strictSna
 // PR #8 parity item 4 (plan design note 17): PR #8's nine
 // TestPhase3StrictMode_FlatSnapshotScopedToItsDirectory cases under C6
 // vouching and C10's host-wide rule, and three new ones, through the real
-// handler. A vouched .deb is served after its hash check; an unvouched
-// one on a host whose every signed current snapshot is complete is
-// refused (502, Retry-After 60, unvouched_deb_refused), whatever its
-// layout; an incomplete snapshot of either layout turns refusal off for
-// its host (unvouched_deb_passthrough_no_coverage names it); and a .deb
-// of a pkgs.k8s.io minor whose first adoption is running is served once
-// that adoption commits within C10's wait, but refused while it is only
-// queued.
+// handler. A vouched .deb is served after its hash check — a fallback-
+// vouched one whose bytes differ from the declaration is refused
+// (hash_validation_failure) — and an unvouched one on a host whose every
+// signed current snapshot is complete is refused (502, Retry-After 60,
+// unvouched_deb_refused) before upstream is asked, whatever its layout;
+// an incomplete snapshot of either layout turns refusal off for its host
+// (unvouched_deb_passthrough_no_coverage names it); and a .deb of a
+// pkgs.k8s.io minor whose first adoption is running is served once that
+// adoption commits within C10's wait, but refused while it is only queued
+// (the refusal asked whether an adoption was in flight). Two rows serve a
+// cached .deb: the hit path vouches through the fallback and refuses as
+// the miss path does.
 func TestServeHTTP_FlatStrictMatrix(t *testing.T) {
 	const unknownDists = "/ubuntu/pool/main/u/unknown_1_amd64.deb"
 	k8s := func(minor string) strictSnap {
@@ -8392,11 +9850,13 @@ func TestServeHTTP_FlatStrictMatrix(t *testing.T) {
 			debs: map[string]string{suite + "/amd64/kubectl_1." + minor + ".0-1.1_amd64.deb": "amd64/kubectl_1." + minor + ".0-1.1_amd64.deb"}}
 	}
 	var (
-		dists      = strictSnap{suite: "/ubuntu/dists/noble", complete: true, debs: map[string]string{"/ubuntu/pool/main/h/hello_1_amd64.deb": ""}}
-		incDists   = strictSnap{suite: "/ubuntu/dists/noble", complete: false}
-		flat       = strictSnap{suite: "/flat", complete: true, debs: map[string]string{"/flat/amd64/x.deb": "amd64/x.deb"}}
-		incFlat    = strictSnap{suite: "/flat", complete: false, debs: map[string]string{"/flat/amd64/x.deb": "amd64/x.deb"}}
-		twin       = strictSnap{suite: "/flat/.", complete: true, debs: map[string]string{"/flat/amd64/x.deb": "amd64/x.deb"}}
+		dists     = strictSnap{suite: "/ubuntu/dists/noble", complete: true, debs: map[string]string{"/ubuntu/pool/main/h/hello_1_amd64.deb": ""}}
+		incDists  = strictSnap{suite: "/ubuntu/dists/noble", complete: false}
+		flat      = strictSnap{suite: "/flat", complete: true, debs: map[string]string{"/flat/amd64/x.deb": "amd64/x.deb"}}
+		incFlat   = strictSnap{suite: "/flat", complete: false, debs: map[string]string{"/flat/amd64/x.deb": "amd64/x.deb"}}
+		twin      = strictSnap{suite: "/flat/.", complete: true, debs: map[string]string{"/flat/amd64/x.deb": "amd64/x.deb"}}
+		twinOther = strictSnap{suite: "/flat/.", complete: true, debs: map[string]string{"/flat/amd64/x.deb": "amd64/x.deb"},
+			declared: sha256Hex([]byte("other bytes"))}
 		jenkins    = strictSnap{suite: "/r/sub", complete: true, debs: map[string]string{"/r/sub/amd64/x.deb": "amd64/x.deb"}}
 		thirdMinor = k8s("35")
 	)
@@ -8411,29 +9871,48 @@ func TestServeHTTP_FlatStrictMatrix(t *testing.T) {
 		// passthrough: the index in snaps of the snapshot
 		// unvouched_deb_passthrough_no_coverage names; -1 for none.
 		passthrough int
+		// cached: the .deb is in the cache already (the rig upstream's
+		// bytes), so the request takes the hit path.
+		cached bool
+		// mismatch: a 502 is the hash check's (hash_validation_failure,
+		// after the fetch), not the strict refusal's.
+		mismatch bool
 	}{
-		{"complete dists and flat: an unvouched dists .deb", []strictSnap{dists, flat}, unknownDists, 502, "", -1},
-		{"the same host: a declared flat .deb", []strictSnap{dists, flat}, "/flat/amd64/x.deb", 200, "", -1},
-		{"the same host: an undeclared .deb under the flat suite", []strictSnap{dists, flat}, "/flat/amd64/other.deb", 502, "", -1},
-		{"suite /flat/.: a declared .deb at its FlatBase", []strictSnap{dists, twin}, "/flat/amd64/x.deb", 200, "", -1},
-		{"suite /flat/.: the declared .deb by its ./ path", []strictSnap{dists, twin}, "/flat/./amd64/x.deb", 200, "", -1},
-		{"a .. path", []strictSnap{dists, flat}, "/flat/../ubuntu/pool/unknown.deb", 502, "", -1},
-		{"the Jenkins shape: a parent base", []strictSnap{dists, jenkins}, "/r/amd64/x.deb", 200, "", -1},
-		{"a flat-only host: an undeclared .deb elsewhere", []strictSnap{flat}, "/elsewhere/y_1_amd64.deb", 502, "", -1},
-		{"an incomplete dists snapshot and a flat one: an unvouched .deb", []strictSnap{incDists, flat}, unknownDists, 200, "", 0},
-		{"complete dists and an incomplete flat snapshot: an unvouched dists .deb", []strictSnap{dists, incFlat}, unknownDists, 200, "", 1},
+		{"complete dists and flat: an unvouched dists .deb", []strictSnap{dists, flat}, unknownDists, 502, "", -1, false, false},
+		{"the same host: a declared flat .deb", []strictSnap{dists, flat}, "/flat/amd64/x.deb", 200, "", -1, false, false},
+		{"the same host: an undeclared .deb under the flat suite", []strictSnap{dists, flat}, "/flat/amd64/other.deb", 502, "", -1, false, false},
+		{"suite /flat/.: a declared .deb at its FlatBase", []strictSnap{dists, twin}, "/flat/amd64/x.deb", 200, "", -1, false, false},
+		{"suite /flat/.: the declared .deb by its ./ path", []strictSnap{dists, twin}, "/flat/./amd64/x.deb", 200, "", -1, false, false},
+		// PR #8 parity: still refused — row 1's mechanism (the fallback's
+		// ".." stop is unreachable with valid rows; TestFlatSplits pins it).
+		{"a .. path", []strictSnap{dists, flat}, "/flat/../ubuntu/pool/unknown.deb", 502, "", -1, false, false},
+		{"the Jenkins shape: a parent base", []strictSnap{dists, jenkins}, "/r/amd64/x.deb", 200, "", -1, false, false},
+		{"a flat-only host: an undeclared .deb elsewhere", []strictSnap{flat}, "/elsewhere/y_1_amd64.deb", 502, "", -1, false, false},
+		{"an incomplete dists snapshot and a flat one: an unvouched .deb", []strictSnap{incDists, flat}, unknownDists, 200, "", 0, false, false},
+		{"complete dists and an incomplete flat snapshot: an unvouched dists .deb", []strictSnap{dists, incFlat}, unknownDists, 200, "", 1, false, false},
 		{"pkgs.k8s.io: a third minor's first adoption is running", []strictSnap{k8s("33"), k8s("34")},
-			"/core:/stable:/v1.35/deb/amd64/kubectl_1.35.0-1.1_amd64.deb", 200, "running", -1},
+			"/core:/stable:/v1.35/deb/amd64/kubectl_1.35.0-1.1_amd64.deb", 200, "running", -1, false, false},
 		{"pkgs.k8s.io: a third minor's first adoption is queued", []strictSnap{k8s("33"), k8s("34")},
-			"/core:/stable:/v1.35/deb/amd64/kubectl_1.35.0-1.1_amd64.deb", 502, "queued", -1},
+			"/core:/stable:/v1.35/deb/amd64/kubectl_1.35.0-1.1_amd64.deb", 502, "queued", -1, false, false},
+		{"suite /flat/.: by its ./ path, bytes other than declared", []strictSnap{dists, twinOther}, "/flat/./amd64/x.deb", 502, "", -1, false, true},
+		{"the hit path: suite /flat/.'s cached .deb by its ./ path", []strictSnap{dists, twin}, "/flat/./amd64/x.deb", 200, "", -1, true, false},
+		{"the hit path: a cached undeclared .deb on a complete host", []strictSnap{dists, flat}, "/flat/amd64/other.deb", 502, "", -1, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h, srv, logs := newPhase3StrictHandlerCapturing(t, true, true, nil)
+			var hits atomic.Int32
+			h, srv, logs := newPhase3StrictHandlerCapturing(t, true, true, &hits)
 			scheme, host, port := splitURL(t, srv.URL)
 			canon := hostKey(host, port)
 			var ids []int64
 			for _, s := range tc.snaps {
 				ids = append(ids, commitStrictSnap(t, h, scheme, canon, s))
+			}
+			if tc.cached {
+				blob := writeBlob(t, h, []byte("upstream bytes"))
+				if err := h.cache.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: scheme, CanonicalHost: canon,
+					Path: tc.path, BlobHash: &blob, UpstreamURL: srv.URL + tc.path}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			a := &fakeAdoptions{}
 			switch tc.adoption {
@@ -8452,15 +9931,31 @@ func TestServeHTTP_FlatStrictMatrix(t *testing.T) {
 			if rec.Code != tc.want {
 				t.Fatalf("status %d, want %d", rec.Code, tc.want)
 			}
-			refused := logs.find("unvouched_deb_refused")
+			refusal := "unvouched_deb_refused"
+			if tc.mismatch {
+				refusal = "hash_validation_failure"
+			}
+			refused := logs.find(refusal)
 			switch {
 			case tc.want == http.StatusOK && rec.Body.String() != "upstream bytes":
 				t.Fatalf("body %q, want the upstream's", rec.Body.String())
 			case tc.want == http.StatusOK && len(refused) != 0:
 				t.Fatalf("served, but logged %v", refused)
+			case tc.want == http.StatusOK && tc.cached && rec.Header().Get(hdrXCache) != cacheHit:
+				t.Fatalf("X-Cache %q, want a hit", rec.Header().Get(hdrXCache))
 			case tc.want == http.StatusBadGateway && (len(refused) != 1 || rec.Header().Get("Retry-After") != "60"):
-				t.Fatalf("refused with Retry-After %q and %d unvouched_deb_refused lines, want 60 and 1",
-					rec.Header().Get("Retry-After"), len(refused))
+				t.Fatalf("refused with Retry-After %q and %d %s lines, want 60 and 1",
+					rec.Header().Get("Retry-After"), len(refused), refusal)
+			}
+			// Upstream is asked once by a served miss and by the hash
+			// check's fetch, never by a hit or a strict refusal (SPEC3
+			// §6.2: refused before any upstream dial).
+			wantHits := int32(1)
+			if tc.cached || (tc.want == http.StatusBadGateway && !tc.mismatch) {
+				wantHits = 0
+			}
+			if n := hits.Load(); n != wantHits {
+				t.Fatalf("upstream asked %d times, want %d", n, wantHits)
 			}
 			pass := logs.find("unvouched_deb_passthrough_no_coverage")
 			if tc.passthrough < 0 {
@@ -8472,6 +9967,11 @@ func TestServeHTTP_FlatStrictMatrix(t *testing.T) {
 			}
 			if waits := a.waits.Load(); waits != map[string]int32{"running": 1}[tc.adoption] {
 				t.Fatalf("waited %d times for adoptions in flight", waits)
+			}
+			// C10: the refusal asked whether an adoption was in flight —
+			// "queued" is told apart from "no waiter wired".
+			if asks := a.asks.Load(); asks != map[string]int32{"running": 1, "queued": 1}[tc.adoption] {
+				t.Fatalf("asked %d times about adoptions in flight", asks)
 			}
 		})
 	}
@@ -8501,6 +10001,55 @@ func TestServeHTTP_CurrentSnapshotCountCountsFlatSnapshots(t *testing.T) {
 		t.Fatalf("status %d, refusals %v; want 502 with current_snapshot_count 3", rec.Code, refused)
 	}
 }
+
+// Spec C6 step 3 through the suffix fallback (the Task 5 review's
+// Important 1): two signed current suites at one base that declare
+// different hashes for one Filename are a package_hash_conflict — 502,
+// Retry-After 60, refused before upstream is asked — never an
+// order-dependent answer. The twins of residual 2 reached by a "./"
+// request that misses their exact rows, and two channels of a host-root
+// repository (Sublime's apt/stable and apt/dev, B = "").
+func TestServeHTTP_AFallbackTieIsAConflict(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		snaps []strictSnap
+		path  string
+	}{
+		{"the twins through ./", []strictSnap{
+			{suite: "/t", complete: true, debs: map[string]string{"/t/x_1_amd64.deb": "x_1_amd64.deb"}},
+			{suite: "/t/.", complete: true, debs: map[string]string{"/t/x_1_amd64.deb": "x_1_amd64.deb"},
+				declared: sha256Hex([]byte("newer bytes"))},
+		}, "/t/./x_1_amd64.deb"},
+		{"two channels at the host root", []strictSnap{
+			{suite: "/apt/stable", complete: true, debs: map[string]string{"/apt/stable/files/s_1_amd64.deb": "files/s_1_amd64.deb"}},
+			{suite: "/apt/dev", complete: true, debs: map[string]string{"/apt/dev/files/s_1_amd64.deb": "files/s_1_amd64.deb"},
+				declared: sha256Hex([]byte("dev bytes"))},
+		}, "/files/s_1_amd64.deb"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			h, srv, logs := newPhase3StrictHandlerCapturing(t, true, true, &hits)
+			scheme, host, port := splitURL(t, srv.URL)
+			canon := hostKey(host, port)
+			for _, s := range tc.snaps {
+				commitStrictSnap(t, h, scheme, canon, s)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, proxyReq("GET", srv.URL, tc.path))
+			conflicts := logs.find("package_hash_conflict")
+			if rec.Code != http.StatusBadGateway || rec.Header().Get("Retry-After") != "60" || len(conflicts) != 1 {
+				t.Fatalf("status %d, Retry-After %q, package_hash_conflict %v; want 502, 60 and one conflict line",
+					rec.Code, rec.Header().Get("Retry-After"), conflicts)
+			}
+			if d, _ := conflicts[0]["declared"].([]any); len(d) != 2 {
+				t.Fatalf("conflict declared %v, want both suites' rows", conflicts[0]["declared"])
+			}
+			if n := hits.Load(); n != 0 {
+				t.Fatalf("upstream asked %d times, want 0 (the conflict is refused before the fetch)", n)
+			}
+		})
+	}
+}
 ```
 
 In `internal/handler/unsigned_posture_test.go`, replace
@@ -8523,12 +10072,149 @@ with
 		}
 ```
 
+In `internal/cache/flat_lookup_test.go`, add before `// Spec C6 step 2's tiebreak: among the rows the fallback keeps, those with`:
+
+```go
+// flatSplits' stops at the unit level (spec C6; the Task 11 review's
+// Minor 1): a request path whose dot-cleaned form is relative, has an empty
+// or ".." segment, or has more than maxFallbackSegments segments has no
+// split. Through DeclaredHashesForPath the ".." and empty-segment stops
+// are unobservable with valid rows — such a B is never an ancestor of a
+// canonical FlatBase, and such an F never equals a validated
+// flat_filename — so they are pinned here, on the function itself.
+func TestFlatSplits(t *testing.T) {
+	bases, names := flatSplits("/a/./b/x.deb")
+	if !slices.Equal(bases, []string{"", "/a", "/a/b"}) || !slices.Equal(names, []string{"a/b/x.deb", "b/x.deb", "x.deb"}) {
+		t.Fatalf("flatSplits(/a/./b/x.deb) = %q, %q", bases, names)
+	}
+	if _, names := flatSplits("/" + strings.Repeat("d/", maxFallbackSegments-1) + "x.deb"); len(names) != maxFallbackSegments {
+		t.Fatalf("%d splits of a %d-segment path, want %d", len(names), maxFallbackSegments, maxFallbackSegments)
+	}
+	for _, p := range []string{
+		"/a/../b/x.deb", "/a//x.deb", "/a/x.deb/", "a/x.deb", "./a/x.deb",
+		"/" + strings.Repeat("d/", maxFallbackSegments) + "x.deb",
+	} {
+		if bases, names := flatSplits(p); bases != nil || names != nil {
+			t.Errorf("flatSplits(%q) = %q, %q; want no split", p, bases, names)
+		}
+	}
+}
+```
+
+In `internal/handler/strict_wait_test.go` (the Task 11 review's Minor 6), replace
+
+```go
+// commitVouching adopts a complete-coverage inline snapshot of suite whose
+// package_hash vouches debPath at debHash.
+func commitVouching(t *testing.T, h *Handler, scheme, host, suite, debPath, debHash string) {
+	t.Helper()
+	inrel := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for "+suite))
+	if err := h.cache.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{CanonicalScheme: scheme,
+		CanonicalHost: host, SuitePath: suite}); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := h.cache.InsertTrackedCandidateForTest(context.Background(), cache.SnapshotCandidate{
+		CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite, InReleaseHash: &inrel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.cache.CommitAdoption(context.Background(), id,
+		[]cache.SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: inrel, DeclaredSHA256: inrel}}, nil,
+		[]cache.PackageHash{{SnapshotID: id, CanonicalScheme: scheme, CanonicalHost: host, Path: debPath, DeclaredSHA256: debHash}},
+		nil, true); err != nil {
+		t.Fatal(err)
+	}
+}
+```
+
+with
+
+```go
+// commitVouching adopts a complete-coverage inline snapshot of suite whose
+// package_hash vouches debPath at debHash (a dists/ row).
+func commitVouching(t *testing.T, h *Handler, scheme, host, suite, debPath, debHash string) {
+	t.Helper()
+	commitStrictSnap(t, h, scheme, host, strictSnap{suite: suite, complete: true, debs: map[string]string{debPath: ""}, declared: debHash})
+}
+```
+
+and its imports, replace
+
+```go
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
+)
+```
+
+with
+
+```go
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+)
+```
+
+In `internal/handler/phase3_strict_test.go`, `adoptCoverageComplete`, replace
+
+```go
+	releaseBlob := writeBlob(t, h, simtest.ClearsignedFixture("InRelease for "+suite))
+
+	if err := h.cache.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{
+		CanonicalScheme: scheme,
+		CanonicalHost:   host,
+		SuitePath:       suite,
+	}); err != nil {
+		t.Fatalf("SeedSuiteForTest: %v", err)
+	}
+	id, _, err := h.cache.InsertTrackedCandidateForTest(context.Background(),
+		cache.SnapshotCandidate{
+			CanonicalScheme: scheme,
+			CanonicalHost:   host,
+			SuitePath:       suite,
+			InReleaseHash:   &releaseBlob,
+		})
+	if err != nil {
+		t.Fatalf("InsertCandidateSnapshot: %v", err)
+	}
+	if err := h.cache.CommitAdoption(context.Background(), id,
+		[]cache.SnapshotMember{
+			{SnapshotID: id, Path: "InRelease", BlobHash: releaseBlob, DeclaredSHA256: releaseBlob},
+		}, nil,
+
+		nil, nil, coverageComplete); err != nil {
+		t.Fatalf("CommitAdoption: %v", err)
+	}
+	return id
+}
+```
+
+with
+
+```go
+	return commitStrictSnap(t, h, scheme, host, strictSnap{suite: suite, complete: coverageComplete})
+}
+```
+
+and its imports, replace
+
+```go
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
+)
+```
+
+with
+
+```go
+	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+)
+```
+
 - [ ] **Step 2: Run them**
 
-Run: `go test ./internal/handler/ -run 'TestServeHTTP_FlatStrictMatrix|TestServeHTTP_CurrentSnapshotCountCountsFlatSnapshots|TestServeHTTP_UnsignedNeverChangesStrictPosture' -v`
-Expected: PASS, twelve matrix subtests. (No red step of their own: Tasks 4, 5 and 10 made them pass. Before Task 5, `suite_/flat/.:_the_declared_.deb_by_its_./_path` and `the_Jenkins_shape:_a_parent_base` fail with `status 502, want 200`; the mutations below show the rest.)
+Run: `go test ./internal/handler/ -run 'TestServeHTTP_FlatStrictMatrix|TestServeHTTP_AFallbackTieIsAConflict|TestServeHTTP_CurrentSnapshotCountCountsFlatSnapshots|TestServeHTTP_UnsignedNeverChangesStrictPosture' -v` and `go test ./internal/cache/ -run TestFlatSplits -v`
+Expected: PASS, fifteen matrix subtests and two tie subtests. (No red step of their own: Tasks 4, 5 and 10 made them pass. Before Task 5, `suite_/flat/.:_the_declared_.deb_by_its_./_path` and `the_Jenkins_shape:_a_parent_base` fail with `status 502, want 200`; the mutations below show the rest.)
 
-- [ ] **Step 3: The AIDEV-NOTE**
+- [ ] **Step 3: The AIDEV-NOTE and `flatSplits`' doc**
 
 In `internal/cache/queries.go`, replace
 
@@ -8550,6 +10236,25 @@ with
 	const q = `
 ```
 
+In `internal/cache/adoption.go` (`flatSplits`' doc: its `..` and empty-segment stops are defence in depth), replace
+
+```go
+// maxFallbackSegments segments (a ".." could step a request outside the
+// base its row is kept for).
+func flatSplits(path string) (bases, names []string) {
+```
+
+with
+
+```go
+// maxFallbackSegments segments (a ".." could step a request outside the
+// base its row is kept for). The ".." and empty-segment stops are defence
+// in depth — with valid rows no such split could match (a B holding them
+// is never an ancestor of a canonical FlatBase, an F never equals a
+// validated flat_filename) — so TestFlatSplits pins them on this function.
+func flatSplits(path string) (bases, names []string) {
+```
+
 - [ ] **Step 4: Run the package**
 
 Run: `go test ./internal/cache/ ./internal/handler/`
@@ -8561,8 +10266,13 @@ Expected: PASS.
 |---|---|
 | strict mode counts `dists/` snapshots only (`AND ss.suite_path LIKE '%/dists/%'` in `HostCurrentSnapshotsCoverage`) | `TestServeHTTP_FlatStrictMatrix/a_flat-only_host:_an_undeclared_.deb_elsewhere` (`status 200, want 502`), `/complete_dists_and_an_incomplete_flat_snapshot:_an_unvouched_dists_.deb` (`status 502, want 200`), `/pkgs.k8s.io:_a_third_minor's_first_adoption_is_running` (`waited 0 times`), `/…_is_queued` (`status 200, want 502`), `TestServeHTTP_CurrentSnapshotCountCountsFlatSnapshots` (`current_snapshot_count:1`) |
 | strict mode counts unsigned snapshots (no `anchor_form <> 'unsigned'`) | `TestServeHTTP_CurrentSnapshotCountCountsFlatSnapshots` (`current_snapshot_count:4`), `TestServeHTTP_UnsignedNeverChangesStrictPosture/a_protected_host_stays_protected` (E-70: `current_snapshot_count:2`), `/an_unsigned-only_host_stays_unprotected` |
-| no suffix fallback (`DeclaredHashesForPath` exact only) | `TestServeHTTP_FlatStrictMatrix/suite_/flat/.:_the_declared_.deb_by_its_./_path`, `/the_Jenkins_shape:_a_parent_base` (`status 502, want 200`) |
+| no suffix fallback (`DeclaredHashesForPath` exact only) | `TestServeHTTP_FlatStrictMatrix/suite_/flat/.:_the_declared_.deb_by_its_./_path`, `/the_Jenkins_shape:_a_parent_base`, `/the_hit_path:_suite_/flat/.'s_cached_.deb_by_its_./_path` (`status 502, want 200`), `/suite_/flat/.:_by_its_./_path,_bytes_other_than_declared` (`refused with Retry-After "60" and 0 hash_validation_failure lines, want 60 and 1`) |
 | the miss path never waits for an adoption in flight | `TestServeHTTP_FlatStrictMatrix/pkgs.k8s.io:_a_third_minor's_first_adoption_is_running` (`status 502, want 200`) |
+| the tie arm deleted (Task 5's `case len(b) == best`: one row per longest `B`) | `TestServeHTTP_AFallbackTieIsAConflict/the_twins_through_./`, `/two_channels_at_the_host_root` (`status 200, Retry-After "", package_hash_conflict []; want 502, 60 and one conflict line`) |
+| `flatSplits` without its `..` stop | `TestFlatSplits` (`flatSplits("/a/../b/x.deb") = ["" "/a" "/a/.." "/a/../b"], ["a/../b/x.deb" "../b/x.deb" "b/x.deb" "x.deb"]; want no split`) |
+| `flatSplits` without its empty-segment stop | `TestFlatSplits` (`flatSplits("/a//x.deb") = ["" "/a" "/a/"], ["a//x.deb" "/x.deb" "x.deb"]; want no split`, and `/a/x.deb/`) |
+| the miss's hash check skipped (`if false && distinct[0] != observed`) | `TestServeHTTP_FlatStrictMatrix/suite_/flat/.:_by_its_./_path,_bytes_other_than_declared` (`refused with Retry-After "60" and 0 hash_validation_failure lines, want 60 and 1`) |
+| the refusal never asks about adoptions in flight (`if false && h.adoptions != nil && …AdoptionsInFlight…`) | `TestServeHTTP_FlatStrictMatrix/pkgs.k8s.io:_a_third_minor's_first_adoption_is_running` (`status 502, want 200`), `/…_is_queued` (`asked 0 times about adoptions in flight`) |
 
 - [ ] **Step 6: Commit**
 
@@ -8578,13 +10288,15 @@ git commit -m "Pin the flat strict matrix and current_snapshot_count under spec 
 
 Ruling R-G2 (the F carry-forward; design note 15) as amended by ruling PG-7: an unadopted flat suite whose base has no signed evidence (`cache.CheckUnsignedDowngrade` finds no marker and no adopted signed snapshot of the base or its twin) is judged junk on its cached anchor rows and its cached root `Packages*`/`Sources*` rows together — junk only when it has at least one such row and every one is junk evidence, through the anchors' own rules (`aptpath.SniffFlatIndex` for an index's name, fetched at least `junkGrace` ago, whatever the suite's record); a flat suite with signed evidence, and every `dists/` suite, keeps the anchors-alone rule. Why (the design review's I-2): under anchors alone, a healthy Release-less repository on a host that answers `InRelease` and `Release` with a 200 HTML page (soft-404 hosting, a captive portal) is reaped every day, losing its good index exactly during an outage; anchors alone stay only where they heal something — a signed suite with a junk anchor, which signed clients reject and anchor serves keep touched. The index rows come from one more indexed query per run (`cache.ListUnadoptedFlatIndexRows`, the plan shape of `ListUnadoptedSuiteAnchors`, pinned); a row without a blob, a stamp or a pool file is no evidence. The signed-evidence read reuses `CheckUnsignedDowngrade` (no third "signed" predicate: ruling PG-3, E-31 stays H's) and is lazy, per candidate: only a flat suite the two rules judge differently reads it (`suiteJunk`); a read error gives that suite no verdict for the run (an I/O fault is never evidence), logged once per scan. The junk memo's key gains the member name for a flat index (one blob is plain-text `Packages` and junk `Packages.gz`). Ruling R-G5 (deferred minor F-12, taken) with ruling PG-7's gate: the index read runs only in a run that holds an unadopted flat suite (`hasUnadoptedFlatSuite`) — measured, an unconditional read took `TestDoD_NinetyDaysOfReapingWithRestarts` from 3.71–3.75 s to 4.46–4.65 s under `-race` on the exec review's machine (over the 4.5 s budget); gated, the simulation pays nothing (its suites are all `dists/`). Both branches are pinned (ruling PG-6): `TestReaper_ReapsAJunkAnchorlessFlatSuite` needs the read, and `TestReaper_ReadsFlatIndexesOnlyWithAnUnadoptedFlatSuite` counts it (0 for `dists/` suites, 1 with a flat suite). A failed index read leaves every unadopted flat suite unjudged for the run and the run goes on (design review M-13, `TestReaper_AFailedFlatIndexReadJudgesNoFlatSuite`). Two reaper seams (`flatIndexRows`, `signedEvidence`) let tests count and fail the reads. Ruling R-G4 and the F carry-forwards: flat suites are canonical, so idleness reaps them like any suite — `TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem` gains a used flat suite (kept), an idle one (reaped) and its used `./` twin (kept, rows and all); `TestReap_AFlatSuiteLeavesItsTwin` is "reaping `/repo` leaves `/repo/.` intact" in the cache on real flat paths; and `TestDoD_ForgetIsTheEscapeHatchForAFlatSuitesDowngradeRefusal` repeats phase F's escape-hatch DoD on a real flat suite whose `./` twin keeps a row (its line setting `adoption.adopt_unsigned` on is now the rig's default, kept with a comment: the design review's I-4). `reaper.go`'s open deferred minors (F-18, F-22, F-26) are H's: checked and left.
 
+The fix round (the Task 12 review): a flat suite with no cached anchor or index row at all is kept, pinned by `/empty` (Important 1: junk only with at least one row); `unadoptedFlat` is the one predicate the index-read gate (`hasUnadoptedFlatSuite`) and `junkCandidates`' per-suite test share, with an AIDEV-NOTE on why they must agree (Minor 2); `ListUnadoptedFlatIndexRows` builds its 14 probes from Task 9's `aptpath.FlatIndexNames` (Minor 1, the Task 9 review's Minor 4); the docs of `Reaper.sniffs`, `allJunk`, `junkCandidates` (the gated read; the anchorless refresh among the changes between the scan and the hold) and `ListUnadoptedFlatIndexRows`, and the rig's `cacheAnchor`, say what they now cover (Minor 3); the tests assert that only the reaped twin's snapshot is retired and that a reaped suite's index and anchor rows are gone (Minor 4).
+
 **Files:**
 - Create: `internal/cache/flat_reap.go` (`ListUnadoptedFlatIndexRows`), `internal/cache/flat_reap_test.go`, `internal/freshness/flat_reap_test.go`
-- Modify: `internal/freshness/reaper.go` (`Reaper.flatIndexRows`, `Reaper.signedEvidence` and their line in `NewReaper`, `sniffKey.name`, `junkCandidates`, `suiteJunk`, `hasUnadoptedFlatSuite`, `allJunk`, `anchorEvidence` docs), `internal/freshness/reaper_test.go` (`TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem`: the flat suites)
+- Modify: `internal/freshness/reaper.go` (`Reaper.flatIndexRows`, `Reaper.signedEvidence` and their line in `NewReaper`, `sniffKey.name`, `junkCandidates`, `suiteJunk`, `hasUnadoptedFlatSuite`, `allJunk`, `anchorEvidence` docs; `unadoptedFlat`; the docs of `Reaper.sniffs` and of `junkCandidates`' scan-to-hold window), `internal/freshness/reaper_test.go` (`TestReaper_ReapsIdleAndNonCanonicalSuitesAndPurgesThem`: the flat suites), `internal/freshness/reaper_junk_test.go` (`cacheAnchor`'s comment)
 
 **Interfaces:**
-- Consumes: `cache.SuiteAnchorRow`, `cache.CheckUnsignedDowngrade`, `cache.ErrUnsignedDowngradeRefused`, `(*cache.Cache).MarkSignedSeenBatch`, `aptpath.IsFlatSuitePath`, `aptpath.FileFlatIndex`'s sniff (Task 1); the reaper rig (`newReaperRig`, `junkSuite`, `cacheAnchor`, `cacheAnchorBlob`, `record`, `reapedTotal`, `softPage`), the flat rig (Task 9), `NewReaper`, `Reaper.Forget`, `reapAge`, `fakePackagesStanzas`, `makeRelease`; cache tests' `seedRow`, `adoptWith`, `putURLPathRow`, `urlRowExists`, `stubNow`, `evictNow`, `evictDay`.
-- Produces: `(*cache.Cache).ListUnadoptedFlatIndexRows(ctx) ([]cache.SuiteAnchorRow, error)`, `unadoptedFlatIndexRowsSQL`, `hasUnadoptedFlatSuite`, `(*Reaper).suiteJunk`, the seams `Reaper.flatIndexRows` and `Reaper.signedEvidence`; WARN `suite reaper: list unadopted flat indexes failed` (`err`) and WARN `suite reaper: read signed evidence failed` (`count`, `err`, `canonical_scheme`, `canonical_host`, `suite_path`) — Task 16 documents them.
+- Consumes: `aptpath.FlatIndexNames` (Task 9); `cache.SuiteAnchorRow`, `cache.CheckUnsignedDowngrade`, `cache.ErrUnsignedDowngradeRefused`, `(*cache.Cache).MarkSignedSeenBatch`, `aptpath.IsFlatSuitePath`, `aptpath.FileFlatIndex`'s sniff (Task 1); the reaper rig (`newReaperRig`, `junkSuite`, `cacheAnchor`, `cacheAnchorBlob`, `record`, `reapedTotal`, `softPage`), the flat rig (Task 9), `NewReaper`, `Reaper.Forget`, `reapAge`, `fakePackagesStanzas`, `makeRelease`; cache tests' `seedRow`, `adoptWith`, `putURLPathRow`, `urlRowExists`, `stubNow`, `evictNow`, `evictDay`.
+- Produces: `(*cache.Cache).ListUnadoptedFlatIndexRows(ctx) ([]cache.SuiteAnchorRow, error)`, `unadoptedFlatIndexRowsSQL`, `hasUnadoptedFlatSuite`, `unadoptedFlat`, `(*Reaper).suiteJunk`, the seams `Reaper.flatIndexRows` and `Reaper.signedEvidence`; WARN `suite reaper: list unadopted flat indexes failed` (`err`) and WARN `suite reaper: read signed evidence failed` (`count`, `err`, `canonical_scheme`, `canonical_host`, `suite_path`) — Task 16 documents them.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -8711,6 +10423,15 @@ func TestReap_AFlatSuiteLeavesItsTwin(t *testing.T) {
 	if ok, err := c.HasSuiteRow(ctx, repo); err != nil || ok {
 		t.Fatalf("/repo's row: %v, %v; want it gone", ok, err)
 	}
+	for k, id := range ids {
+		var retired sql.NullInt64
+		if err := c.db.QueryRowContext(ctx, `SELECT retired_at FROM suite_snapshot WHERE snapshot_id = ?`, id).Scan(&retired); err != nil {
+			t.Fatal(err)
+		}
+		if want := k == repo; retired.Valid != want {
+			t.Errorf("%s's snapshot %d: retired %v, want %v (only the reaped suite's currency ends)", k.SuitePath, id, retired.Valid, want)
+		}
+	}
 	sf, err := c.GetSuiteFreshness(ctx, "http", "h", "/repo/.")
 	if err != nil || sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != ids[twin] {
 		t.Fatalf("/repo/.: row %+v, %v; want it and its current snapshot kept", sf, err)
@@ -8765,15 +10486,18 @@ import (
 // missing pool file (no evidence); a dists/ suite's root Packages (no flat
 // index); the same plain-text bytes cached as Packages, where they pass (a
 // verdict is remembered per blob and name); and /junk's ./ twin, judged by
-// its own good index (ruling R-G4). The signed-evidence read is lazy: only
-// the suites the two rules judge differently read it.
+// its own good index (ruling R-G4); and /empty, with no cached anchor or
+// index row at all (R-G2: junk only with at least one row). The
+// signed-evidence read is lazy: only the suites the two rules judge
+// differently read it. A reaped suite's cached indexes go with it.
 func TestReaper_ReapsAJunkAnchorlessFlatSuite(t *testing.T) {
 	r := newReaperRig(t)
 	old, young := reapNow-2*reapDay, reapNow-3600
 	gz := "\x1f\x8b\x08\x00 an index"
 	signed := string(simtest.ClearsignedFixture("Origin: x\nSHA256:\n"))
 	reaped := []string{"/junk", "/absent", "/junk-anchors-signed", "/junk-everything", "/gz-name"}
-	kept := []string{"/junk/.", "/junk-anchors", "/young", "/good", "/mixed", "/signed", "/missing", "/r/dists/x", "/plain-name"}
+	kept := []string{"/junk/.", "/junk-anchors", "/young", "/good", "/mixed", "/signed", "/missing", "/r/dists/x", "/plain-name",
+		"/empty"}
 	for _, s := range append(append([]string{}, reaped...), kept...) {
 		r.junkSuite(s)
 	}
@@ -8828,6 +10552,11 @@ func TestReaper_ReapsAJunkAnchorlessFlatSuite(t *testing.T) {
 	}
 	if _, err := r.cache.LookupURL(context.Background(), "http", "h", "/junk/./Packages.gz"); err != nil {
 		t.Fatalf("/junk/./Packages.gz: %v; want the twin's index kept", err)
+	}
+	for _, p := range []string{"/junk/Packages.gz", "/junk/Sources", "/junk-everything/Packages.gz", "/junk-everything/InRelease"} {
+		if _, err := r.cache.LookupURL(context.Background(), "http", "h", p); !errors.Is(err, cache.ErrNotFound) {
+			t.Errorf("%s: %v; want the reaped suite's row deleted, not served as a hit", p, err)
+		}
 	}
 	if ev := r.events("suite reaper: junk anchor reads failed"); len(ev) != 0 {
 		t.Fatalf("read failure lines = %v, want none", ev)
@@ -9167,9 +10896,9 @@ import (
 // unadoptedFlatIndexRowsSQL is ListUnadoptedFlatIndexRows' query: the
 // shape of unadoptedSuiteAnchorsSQL (design review M-14), probing
 // url_path's key once per root index name of spec C2's flat member
-// grammar — Packages and Sources, plain or with one of the six
-// compression extensions — for every unadopted suite whose path has no
-// "/dists/" (instr, not LIKE: LIKE ignores ASCII case).
+// grammar (aptpath.FlatIndexNames, the list ListSuiteMetadataRows probes
+// too) for every unadopted suite whose path has no "/dists/" (instr, not
+// LIKE: LIKE ignores ASCII case).
 //
 // AIDEV-NOTE: keep the join's url_path terms bare columns, as in
 // unadoptedSuiteAnchorsSQL: an expression on them turns each probe into a
@@ -9177,10 +10906,8 @@ import (
 // pins the plan).
 var unadoptedFlatIndexRowsSQL = func() string {
 	var names []string
-	for _, stem := range []string{"Packages", "Sources"} {
-		for _, ext := range []string{"", ".gz", ".xz", ".bz2", ".lzma", ".lz4", ".zst"} {
-			names = append(names, "sf.suite_path || '/"+stem+ext+"'")
-		}
+	for _, n := range aptpath.FlatIndexNames() {
+		names = append(names, "sf.suite_path || '/"+n+"'")
 	}
 	return `
 SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path, u.path, u.blob_hash, u.last_fetched_at
@@ -9197,7 +10924,8 @@ SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path, u.path, u.blob_has
 // ListUnadoptedFlatIndexRows returns the cached root Packages* and
 // Sources* rows of every flat suite (aptpath.IsFlatSuitePath) that has no
 // current snapshot, in suite and path order: ruling R-G2's junk evidence
-// for an anchorless flat suite. One read on the pool per reaper run.
+// for an anchorless flat suite. One read on the pool, in a reaper run that
+// holds an unadopted flat suite (the reaper's hasUnadoptedFlatSuite gate).
 func (c *Cache) ListUnadoptedFlatIndexRows(ctx context.Context) ([]SuiteAnchorRow, error) {
 	rows, err := c.db.QueryContext(ctx, unadoptedFlatIndexRowsSQL)
 	if err != nil {
@@ -9317,7 +11045,8 @@ and allJunk stops at a suite's first row that is no
 // has no signed evidence (cache.CheckUnsignedDowngrade finds no marker and
 // no signed snapshot of the base or its twin) is judged on its anchor rows
 // and its cached root Packages*/Sources* rows together
-// (cache.ListUnadoptedFlatIndexRows, one more indexed read per run) —
+// (cache.ListUnadoptedFlatIndexRows, one more indexed read in a run that
+// holds an unadopted flat suite: hasUnadoptedFlatSuite) —
 // junk only when it has at least one such row and every one is junk
 // evidence by the same rules (aptpath.SniffFlatIndex for an index's name;
 // fetched at least junkGrace ago; whatever its record); a flat suite with
@@ -9396,7 +11125,7 @@ In `internal/freshness/reaper.go`, replace
 with
 
 ```go
-		flat := s.CurrentSnapshotID == nil && aptpath.IsFlatSuitePath(s.SuitePath)
+		flat := unadoptedFlat(s)
 		if listed[key] || (flat && !indexesRead) {
 			continue // a failed index read: no verdict for an unadopted flat suite this run
 		}
@@ -9486,12 +11215,23 @@ func (r *Reaper) suiteJunk(ctx context.Context, key cache.SuiteKey, flat bool, a
 // index rows.
 func hasUnadoptedFlatSuite(rows []cache.SuiteWithAdoption) bool {
 	for i := range rows {
-		s := &rows[i].SuiteFreshness
-		if s.CurrentSnapshotID == nil && aptpath.IsFlatSuitePath(s.SuitePath) {
+		if unadoptedFlat(&rows[i].SuiteFreshness) {
 			return true
 		}
 	}
 	return false
+}
+
+// unadoptedFlat reports whether s is an unadopted flat suite, the suites
+// junkCandidates judges with their root index rows.
+//
+// AIDEV-NOTE: the gate (hasUnadoptedFlatSuite) and the per-row test in
+// junkCandidates must agree (the Task 12 review's Minor 2): a suite the
+// row test calls flat while the gate read no index rows would be judged
+// with none, and a junk-anchored suite with a good index reaped on its
+// anchors alone. One predicate keeps them equal.
+func unadoptedFlat(s *cache.SuiteFreshness) bool {
+	return s.CurrentSnapshotID == nil && aptpath.IsFlatSuitePath(s.SuitePath)
 }
 
 // junkReadFailures counts one junk scan's failed pool reads, keeping the
@@ -9551,6 +11291,66 @@ with
 // not junk.
 ```
 
+In `internal/freshness/reaper.go` (`Reaper.sniffs`' doc: a flat index's verdict is keyed by its name too), replace
+
+```go
+	// by (anchor kind, blob) (ruling R-F3); only the run's goroutine
+	// touches it.
+```
+
+with
+
+```go
+	// by (anchor kind, blob) (ruling R-F3) and, for a flat index, its name
+	// (its extension picks the sniff; ruling R-G2); only the run's
+	// goroutine touches it.
+```
+
+In `internal/freshness/reaper.go` (`junkCandidates`' doc: the anchorless refresh between the scan and the hold), replace
+
+```go
+// through url_path GC or a miss that re-fetched a row whose pool file had
+// gone, after which the reap costs the suite one fetch at its next
+// request. The sniffs run here, on the reaper's goroutine, never on the
+```
+
+with
+
+```go
+// through url_path GC, a miss that re-fetched a row whose pool file had
+// gone, or — for an unadopted flat suite's anchor and index rows — the
+// anchorless refresh replacing or deleting them, after which the reap
+// costs the suite one fetch at its next request. The sniffs run here, on the reaper's goroutine, never on the
+```
+
+In `internal/freshness/reaper.go` (`allJunk`'s doc: the memo key), replace
+
+```go
+// (anchor kind, blob); one this scan (next) or the last completed scan
+```
+
+with
+
+```go
+// (anchor kind, blob, and a flat index's name); one this scan (next) or
+// the last completed scan
+```
+
+In `internal/freshness/reaper_junk_test.go`, replace
+
+```go
+// cacheAnchor caches body as suite's anchor name (InRelease, Release or
+// Release.gpg), fetched at the unix time fetched.
+```
+
+with
+
+```go
+// cacheAnchor caches body as suite's file name — an anchor (InRelease,
+// Release or Release.gpg) or a flat suite's root index (ruling R-G2) —
+// fetched at the unix time fetched.
+```
+
 - [ ] **Step 4: Run the tests**
 
 Run: `go test ./internal/cache/ ./internal/freshness/`
@@ -9568,7 +11368,7 @@ Expected: PASS.
 | a flat index verdict keyed without its name | `TestReaper_ReapsAJunkAnchorlessFlatSuite` (`/plain-name was reaped`) |
 | no `IsFlatSuitePath` filter in `ListUnadoptedFlatIndexRows` | `TestListUnadoptedFlatIndexRows_ListsTheRootIndexesOfUnadoptedFlatSuites` (`"/a//b/Packages"` listed) |
 | `NOT LIKE '%/dists/%'` for the pre-filter | `TestListUnadoptedFlatIndexRows_ListsTheRootIndexesOfUnadoptedFlatSuites` (`/x/DISTS/y/Packages` missing) |
-| five compression extensions (no `.zst`) | `TestListUnadoptedFlatIndexRows_ListsTheRootIndexesOfUnadoptedFlatSuites` (`/flat/Sources.zst` missing) |
+| five compression extensions (`flatIndexExts` without `.zst`: Task 9's one list, which `unadoptedFlatIndexRowsSQL` is built from) | `TestListUnadoptedFlatIndexRows_ListsTheRootIndexesOfUnadoptedFlatSuites` (`/flat/Sources.zst` missing), `TestFlatIndexNames` |
 | adopted suites listed too | `TestListUnadoptedFlatIndexRows_ListsTheRootIndexesOfUnadoptedFlatSuites` (`/adopted/Packages` listed) |
 | an expression on the probed column (`u.path \|\| ''`) | `TestListUnadoptedFlatIndexRows_ProbesURLPathByItsKey` (`SEARCH u USING INDEX … (canonical_scheme=? AND canonical_host=?)`) |
 | the gate for adopted flat suites too | `TestHasUnadoptedFlatSuite` (`an adopted flat suite: true, want false`) |
@@ -9577,14 +11377,17 @@ Expected: PASS.
 | PG-6/PG-9: the index read every run (`\|\| true` on the gate; the draft's declared equivalent, now pinned) | `TestReaper_ReadsFlatIndexesOnlyWithAnUnadoptedFlatSuite` (`a run of dists/ suites read the flat index rows 1 times, want 0`) |
 | M-13: a failed index read judges flat suites anyway | `TestReaper_AFailedFlatIndexReadJudgesNoFlatSuite` (`/junk-everything was reaped although its flat index rows could not be read`) |
 | M-13: a failed index read stops the run (`return nil`) | `TestReaper_AFailedFlatIndexReadJudgesNoFlatSuite` (`/r/dists/junk was not reaped: the run stopped at the failed read`) |
+| PG-7: junk without any row (`suiteJunk`'s `len(anchors)+len(indexes) > 0` dropped) | `TestReaper_ReapsAJunkAnchorlessFlatSuite` (`signed evidence read for [/absent /empty /gz-name /junk /junk-anchors /junk-anchors-signed], want only [/absent /gz-name /junk /junk-anchors /junk-anchors-signed]: the suites the two rules judge differently`, `/empty was reaped`, `acu_suites_reaped_total{reason="junk"} rose by 6, want 5`) |
+| a reap leaves its snapshot current (the retiring `UPDATE` matches nothing: `WHERE 0 AND …`) | `TestReap_AFlatSuiteLeavesItsTwin` (`/repo's snapshot 1: retired false, want true (only the reaped suite's currency ends)`) |
+| `reapHeld` skips `DeleteSuiteMetadata` | `TestReaper_ReapsAJunkAnchorlessFlatSuite` (`/junk/Packages.gz: <nil>; want the reaped suite's row deleted, not served as a hit`, and `/junk/Sources`, `/junk-everything/Packages.gz`, `/junk-everything/InRelease`) |
 
 Equivalent mutant (recorded): dropping the SQL `/dists/` pre-filter only costs 14 key probes per unadopted `dists/` suite (the `IsFlatSuitePath` filter drops their rows). Measure the budget after this task (ruling PG-18): `go test -race -count=3 ./internal/freshness/ -run 'TestDoD_NinetyDaysOfReapingWithRestarts$' -v` and `go test -race -count=3 ./internal/handler/ -run 'TestServeHTTP_MintedSuitesAtScale$' -v` should report times within noise of the base commit's and under 4.5 s (the revision measured, under some load: 90 days 3.76–3.77 s against the base's 3.58–3.76 s; minted suites 3.88–4.31 s against the base's 3.99–4.14 s — Task 12 changes no handler code).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-gofmt -l internal/cache/flat_reap.go internal/cache/flat_reap_test.go internal/freshness/reaper.go internal/freshness/reaper_test.go internal/freshness/flat_reap_test.go
-git add internal/cache/flat_reap.go internal/cache/flat_reap_test.go internal/freshness/reaper.go internal/freshness/reaper_test.go internal/freshness/flat_reap_test.go
+gofmt -l internal/cache/flat_reap.go internal/cache/flat_reap_test.go internal/freshness/reaper.go internal/freshness/reaper_test.go internal/freshness/reaper_junk_test.go internal/freshness/flat_reap_test.go
+git add internal/cache/flat_reap.go internal/cache/flat_reap_test.go internal/freshness/reaper.go internal/freshness/reaper_test.go internal/freshness/reaper_junk_test.go internal/freshness/flat_reap_test.go
 git commit -m "Judge flat suites junk by their anchors and indexes unless signed; reap and forget flat suites beside their twins (rulings R-G2 as amended by PG-7, R-G4)"
 ```
 
@@ -9592,7 +11395,7 @@ git commit -m "Judge flat suites junk by their anchors and indexes unless signed
 
 ### Task 13: Twins in never-downgrade (the E carry-forward, E-16, E-17, E-19)
 
-Ruling R-G4's never-downgrade share: with G's grammar a `./` twin is a real suite, so the twin cases phase E could not write become tests. The E carry-forward runs `TestCheck_UnsignedRefusedInsideTheCommitIsAState` a second time with the signed anchor and its marker arriving through the `./` twin of the flat suite `/repo` while `/repo`'s unsigned adoption is paused before its commit (the commit's in-transaction recheck refuses it as a state; the body moves into `unsignedRefusedInsideTheCommit`, unchanged but for the suite, the served path and a flat Release declaring its root `Packages`). Deferred minors taken: E-16 (the re-mark's twin direction: suite `/flat/.`, evidence cached at `/flat/InRelease`), E-17 (the re-mark fault's line must carry a non-empty `err`), E-19 (the probe's marker goes to the base, `aptpath.MarkerBase`, never the twin's own path). No production code changes: phases D and E built the rules; Task 1's grammar makes the twin reachable.
+Ruling R-G4's never-downgrade share: with G's grammar a `./` twin is a real suite, so the twin cases phase E could not write become tests. The E carry-forward runs `TestCheck_UnsignedRefusedInsideTheCommitIsAState` a second time with the signed anchor and its marker arriving through the `./` twin of the flat suite `/repo` while `/repo`'s unsigned adoption is paused before its commit (the commit's in-transaction recheck refuses it as a state, and the refusal leaves the twin `/repo/.` without a record or a snapshot, its served `InRelease` cached; the body moves into `unsignedRefusedInsideTheCommit`, unchanged but for the suite, the served path and a flat Release declaring its root `Packages`). Deferred minors taken: E-16 (the re-mark's twin direction: suite `/flat/.`, evidence cached at `/flat/InRelease`), E-17 (the re-mark fault's line must carry a non-empty `err`), E-19 (the probe's marker goes to the base, `aptpath.MarkerBase`, never the twin's own path). No production code changes: phases D and E built the rules; Task 1's grammar makes the twin reachable.
 
 **Files:**
 - Create: `internal/freshness/flat_twin_test.go`
@@ -9621,7 +11424,7 @@ with
 // barrier event says refused, and nothing is logged at WARN or above.
 // The E carry-forward (phase G): the same when the signed anchor and its
 // marker arrive through the ./ twin of the flat suite /repo, whose base
-// the twin shares.
+// the twin shares — and the refusal leaves the twin's own rows alone.
 func TestCheck_UnsignedRefusedInsideTheCommitIsAState(t *testing.T) {
 	t.Run("the suite's own anchor", func(t *testing.T) { unsignedRefusedInsideTheCommit(t, "", "") })
 	t.Run("the ./ twin's anchor", func(t *testing.T) { unsignedRefusedInsideTheCommit(t, "/repo", "/repo/.") })
@@ -9814,6 +11617,38 @@ func TestCheck_ATwinsProbeMarksItsBase(t *testing.T) {
 }
 ```
 
+In `internal/freshness/unsigned_test.go`, `unsignedRefusedInsideTheCommit` (Review Focus 5's share, the Task 13 review's Minor 1: refusing `/repo` leaves `/repo/.`'s rows alone), replace
+
+```go
+			t.Fatalf("marked %v, current %d; want the served anchor's marker and no unsigned snapshot", r.marked(), r.current())
+		}
+		sf, err := r.c.GetSuiteFreshness(ctx, "http", "h", r.suite.SuitePath)
+```
+
+with
+
+```go
+			t.Fatalf("marked %v, current %d; want the served anchor's marker and no unsigned snapshot", r.marked(), r.current())
+		}
+		if served != r.suite.SuitePath {
+			// Review Focus 5 (ruling R-G4): refusing /repo never touches
+			// its twin's rows — /repo/. keeps no record and no snapshot,
+			// and the InRelease served under it stays cached.
+			tw, err := r.c.GetSuiteFreshness(ctx, "http", "h", served)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tw.AdoptionFailReason != nil || tw.CurrentSnapshotID != nil {
+				t.Fatalf("%s: record %q, current %v; want its row untouched by %s's refusal",
+					served, strOf(tw.AdoptionFailReason), tw.CurrentSnapshotID, r.suite.SuitePath)
+			}
+			if u, err := r.c.LookupURL(ctx, "http", "h", served+"/InRelease"); err != nil || u.BlobHash == nil {
+				t.Fatalf("%s/InRelease: %+v, %v; want it still cached", served, u, err)
+			}
+		}
+		sf, err := r.c.GetSuiteFreshness(ctx, "http", "h", r.suite.SuitePath)
+```
+
 - [ ] **Step 2: Run them**
 
 Run: `go test ./internal/freshness/ -run 'TestCheck_UnsignedRefusedInsideTheCommitIsAState|TestRunUnsigned_RemarkMarksTheTwinsBase|TestRunUnsigned_FailedRemarkRefuses|TestRunUnsigned_RemarkReadErrorRefuses|TestCheck_ATwinsProbeMarksItsBase' -v`
@@ -9827,6 +11662,7 @@ Expected: PASS (`TestCheck_UnsignedRefusedInsideTheCommitIsAState/the_./_twin's_
 | E-16: the re-mark reads `suite.SuitePath` and its `/.` only | `TestRunUnsigned_RemarkMarksTheTwinsBase/evidence_at_/flat/InRelease` (`RunUnsigned = <nil>, current 1`) |
 | E-17: the re-mark fault's line without `"err", err` | `TestRunUnsigned_FailedRemarkRefuses/unreadable_pool_file`, `/failed_mark_write`, `TestRunUnsigned_RemarkReadErrorRefuses` (`want one at … with the error`) |
 | the carry-forward: `StoreFetched` marks the served suite's own path, not its base | `TestCheck_UnsignedRefusedInsideTheCommitIsAState/the_./_twin's_anchor` (`marked false, current 1`) |
+| the refusal's record also written to the twin (`recordAdoptionFailure` records `/repo/.` beside `/repo`) | `TestCheck_UnsignedRefusedInsideTheCommitIsAState/the_./_twin's_anchor` (`/repo/.: record "unsigned_downgrade_refused", current <nil>; want its row untouched by /repo's refusal`) |
 
 - [ ] **Step 4: Commit**
 
@@ -9840,7 +11676,7 @@ git commit -m "Pin never-downgrade through a flat suite's ./ twin (E carry-forwa
 
 ### Task 14: `suites[].flat` on the admin status page (the B carry-forward; B-59, B-62)
 
-Design note 16 and the B carry-forward (spec C7, C11; phase B plan, deviation 3): every `suites[]` row gains `flat` — `aptpath.IsFlatSuitePath(suite_path)`, true for a flat suite and its `./` twin — additive to the locked JSON contract as `scheme` was (ruling PF-7), placed after `suite_path`; the HTML Suites table tags a flat suite's path with a neutral `flat` badge (the page's existing `.b` class). The JSON golden is regenerated; `docs/admin-ui-spec.md` §4.5 gains the field in Task 16. Deferred minors taken: B-59 (a lag under an hour shows without warning; the JSON golden pins the record's fields with values, not only zeros, and pins a flat row) and B-62 (`htmlRowStart` returns `""` for an offset `strings.Index` did not find instead of panicking). Checked and left: B-60 (`status_test.go`, which this task does not change) and B-63 (the Adoption cell's "checks failing ×k · next check in …": kept deferred by ruling — final review T M9 — and its "next check in" needs the scheduler's backoff, `freshness.backoffDelay`, which `internal/admin` reaches only through injected interfaces; H's operability sweep, flagged).
+Design note 16 and the B carry-forward (spec C7, C11; phase B plan, deviation 3): every `suites[]` row gains `flat` — `aptpath.IsFlatSuitePath(suite_path)`, true for a flat suite and its `./` twin — additive to the locked JSON contract as `scheme` was (ruling PF-7), placed after `suite_path`; the HTML Suites table tags a flat suite's path with a neutral `flat` badge (the page's existing `.b` class), which cannot be selected (`.b--nocopy`, `user-select: none`: `/forget`'s 409 asks for the suite as the Suite path column shows it, so copying the cell copies the path alone; the Task 14 review's Minor 1). The JSON golden is regenerated; `docs/admin-ui-spec.md` §4.5 gains the field in Task 16. Deferred minors taken: B-59 (a lag under an hour shows without warning; the JSON golden pins the record's fields with values, not only zeros, and pins a flat row) and B-62 (`htmlRowStart` returns `""` for an offset `strings.Index` did not find instead of panicking). Checked and left: B-60 (`status_test.go`, which this task does not change) and B-63 (the Adoption cell's "checks failing ×k · next check in …": kept deferred by ruling — final review T M9 — and its "next check in" needs the scheduler's backoff, `freshness.backoffDelay`, which `internal/admin` reaches only through injected interfaces; H's operability sweep, flagged).
 
 **Files:**
 - Modify: `internal/admin/status.go` (`suiteEntry.Flat`, `buildSuiteEntries`, the `aptpath` import), `internal/admin/status_template.go` (the Suites table's Suite path cell), `internal/admin/suites_status_test.go`, `internal/admin/json_contract_test.go` (the populated fixture), `internal/admin/testdata/json_contract_golden.json` (regenerated)
@@ -9976,10 +11812,28 @@ with
 ```go
 		// ADOPTIONS vital sub-line: the refusal is counted apart from failures.
 		`<b class="accent-crit">1 FAILED</b> &middot; <b class="accent-warn">1 REFUSED</b>`,
-		`<span class="lagging">(lagging 30m)</span>`,
 	)
+	// The 30-minute lag shows on young.example's own row (and never warns,
+	// below).
+	mustContain(t, suiteCells(t, html, "young.example"), `<span class="lagging">(lagging 30m)</span>`)
 	for host, warn := range map[string]bool{"fail.example": true, "refused.example": false, "stuck.example": true, "lag.example": true,
 		"young.example": false} {
+```
+
+In `internal/admin/suites_status_test.go`, add before `// Final ruling A5: a refusal is a state, not a failure, but one whose`:
+
+```go
+// suiteCells returns the Suites row of host from its Host cell to the
+// row's end: the row's cells.
+func suiteCells(t *testing.T, html, host string) string {
+	t.Helper()
+	i := strings.Index(html, `data-label="Host" class="host">`+host+`<`)
+	j := strings.Index(html[max(i, 0):], "</tr>")
+	if i < 0 || j < 0 {
+		t.Fatalf("no Suites row for %s", host)
+	}
+	return html[i : i+j]
+}
 ```
 
 Append to `internal/admin/suites_status_test.go`:
@@ -9997,7 +11851,11 @@ func TestBuildSuiteEntries_Flat(t *testing.T) {
 		rows = append(rows, cache.SuiteWithAdoption{SuiteFreshness: cache.SuiteFreshness{CanonicalScheme: "http",
 			CanonicalHost: "h", SuitePath: p}})
 	}
-	for _, e := range buildSuiteEntries(rows, now) {
+	entries := buildSuiteEntries(rows, now)
+	if len(entries) != len(want) {
+		t.Fatalf("%d entries, want %d", len(entries), len(want))
+	}
+	for _, e := range entries {
 		if e.Flat != want[e.SuitePath] {
 			t.Errorf("%s: flat = %v, want %v", e.SuitePath, e.Flat, want[e.SuitePath])
 		}
@@ -10005,7 +11863,9 @@ func TestBuildSuiteEntries_Flat(t *testing.T) {
 }
 
 // The status page tags a flat suite's path "flat" in the Suites table;
-// a dists/ suite's cell is the path alone.
+// a dists/ suite's cell is the path alone. The tag cannot be selected, so
+// copying the cell — /forget's 409 says to pass the suite as the Suite
+// path column shows it — copies the path alone.
 func TestSuitesTable_ShowsTheFlatTag(t *testing.T) {
 	const now = int64(1_800_000_000)
 	m := newHealthyModel()
@@ -10015,8 +11875,9 @@ func TestSuitesTable_ShowsTheFlatTag(t *testing.T) {
 	}, now)
 	html := renderHTMLForGolden(t, m)
 	mustContain(t, html,
-		`<td data-label="Suite path" class="mono">/core:/stable:/v1.34/deb <span class="b b--neutral">flat</span></td>`,
+		`<td data-label="Suite path" class="mono">/core:/stable:/v1.34/deb <span class="b b--neutral b--nocopy">flat</span></td>`,
 		`<td data-label="Suite path" class="mono">/ubuntu/dists/noble</td>`,
+		`.b--nocopy{-webkit-user-select:none;user-select:none}`,
 	)
 }
 
@@ -10104,8 +11965,23 @@ with
 
 ```go
                 <td data-label="Host" class="host">{{if .Scheme}}{{.Scheme}}://{{end}}{{.Host}}</td>
-                <td data-label="Suite path" class="mono">{{.SuitePath}}{{if .Flat}} <span class="b b--neutral">flat</span>{{end}}</td>
+                <td data-label="Suite path" class="mono">{{.SuitePath}}{{if .Flat}} <span class="b b--neutral b--nocopy">flat</span>{{end}}</td>
                 <td data-label="Last check" class="time">{{unixTimePtr .LastCheckUnixTime}}</td>
+```
+
+In `internal/admin/status_template.go` (the badge's no-copy class), replace
+
+```go
+.b--neutral{color:var(--ink-low);border-color:var(--rule-hard)}
+.b--signal{color:var(--signal)}
+```
+
+with
+
+```go
+.b--neutral{color:var(--ink-low);border-color:var(--rule-hard)}
+.b--nocopy{-webkit-user-select:none;user-select:none}
+.b--signal{color:var(--signal)}
 ```
 
 - [ ] **Step 4: Regenerate the JSON golden and run the package**
@@ -10160,9 +12036,13 @@ Expected: PASS.
 | `Flat` never set | `TestBuildSuiteEntries_Flat` (`/core:/stable:/v1.34/deb: flat = false, want true`), `TestSuitesTable_ShowsTheFlatTag` |
 | `Flat` is `IsCanonicalSuitePath` (a `dists/` suite too) | `TestBuildSuiteEntries_Flat` (`/ubuntu/dists/noble: flat = true, want false`), `TestSuitesTable_ShowsTheFlatTag` |
 | no `flat` tag in the template | `TestSuitesTable_ShowsTheFlatTag` |
+| the tag selectable (no `b--nocopy` on the badge) | `TestSuitesTable_ShowsTheFlatTag` (`rendered HTML missing "<td data-label=\"Suite path\" class=\"mono\">/core:/stable:/v1.34/deb <span class=\"b b--neutral b--nocopy\">flat</span></td>"`) |
+| `buildSuiteEntries` drops the rows a grammar refuses (`!aptpath.IsCanonicalSuitePath(r.SuitePath)`: `continue`) | `TestBuildSuiteEntries_Flat` (`3 entries, want 5`) |
 | the JSON field omitted (`json:"-"`) | `TestJSONContractPreserved/populated` (`JSON contract drifted`) |
 | B-59: any lag warns (`LagWarn = LagSeconds > 0`) | `TestSuitesTable_RendersRecordsAndCounts` (`missing "<b class=\"accent-warn\">1 LAGGING</b> …"`) |
 | B-62: `htmlRowStart` without its guard | `TestHTMLRowStart_AMissIsNoRow` (`panic: runtime error: slice bounds out of range [:-1]`) |
+
+The lag assertion runs on `young.example`'s own row (`suiteCells`); no natural single-site mutant renders `(lagging 30m)` on another row only.
 
 - [ ] **Step 6: Commit**
 
@@ -10178,12 +12058,14 @@ git commit -m "Show suites[].flat on the admin status page (spec C7, C11; deferr
 
 The DoD tests that span tasks, and the map from every DoD item to its tests. `TestDoD_NvidiaFlatSuiteAdopts` is the E carry-forward: the real libnvidia-container layout (`deb …/stable/deb/amd64 /`, an InRelease-only suite, a SHA512-only Release dated 2018, `./` Filenames). `TestDoD_EveryRealFilenameShapeAdoptsAndVouches` is Review Focus 3 end to end: each real Filename shape adopts through its suite's `Packages` and vouches the path apt requests, and `..`, `//`, a sibling directory, an undeclared version, a decoded epoch, a 33-segment path and an unsigned snapshot vouch nothing. `TestDoD_UntrustedFlatSuiteFromAV6CacheKeepsTheBackoff` is Review Focus 1 and spec §9's "an untrusted flat suite makes ≤ 1 attempt per backoff step", under the real scheduler for three simulated hours after a v6 upgrade; its oracle is spec C11's schedule written out (2 min doubling to 1 h), each gap within one fast tick (`periodic_refresh / 4`) after its step — never `backoffDelay`, the code under test, against which a wrong schedule would pass (the exec review's G15-1 and its test P1; ruling PG-15). `TestServeHTTP_MintedFlatSuitesAtScale` is phase D's minted-suites DoD for flat suites and their twins, a sibling simulation (ruling R-G5: `TestServeHTTP_MintedSuitesAtScale` and `TestDoD_NinetyDaysOfReapingWithRestarts` get no new work; Task 12 gates its read so the 90-day simulation keeps its budget). No production code changes.
 
+The fix round (the Task 15 review): the backoff simulation requires at least seven attempts in its three hours, so the step that meets the 1 h cap is observed (spec C11's schedule puts the seventh by 122 min plus six ticks, 144.5 min; Minor 1); a refused path must have no declared row at all (`flatRig.declared`), not "not exactly one" (Minor 2); and the minted flat simulation says why its counts are exact (Minor 3). Cap eviction inside the minted flat simulation stays out (Minor 4, reviewer-optional: ruling PG-26, GD-3 in the phase G deferred file); twin eviction is pinned at the cache layer.
+
 **Files:**
 - Create: `internal/freshness/dod_g_test.go`, `internal/handler/flat_dod_test.go`
 
 **Interfaces:**
 - Consumes: the flat rig (Task 9), `hashRelease`, `fakePackagesStanzas`, `sha512Of`, `testHex64`, `errRigUntrusted`, `startSched`, `simtest.NewUpstream`, `simtest.Serve`, `poolBlob`, `RunLegacyTrustAudit`, `cache.MigrateToVersionForTest`, `cache.CachedAnchor`; handler tests' `mintedUpstream`, `memberStore`, `plainVerifier`.
-- Produces: `flatRig.adoptFlatRig`, `flatRig.vouches`, `timedVerifier`, `mintedFlatUpstream` (tests).
+- Produces: `flatRig.adoptFlatRig`, `flatRig.declared` (every row `DeclaredHashesForPath` finds: a refused path has none), `flatRig.vouches`, `timedVerifier`, `mintedFlatUpstream` (tests).
 
 - [ ] **Step 1: Write the DoD tests**
 
@@ -10223,14 +12105,23 @@ func (r *flatRig) adoptFlatRig(pkgs []byte) {
 	}
 }
 
-// vouches reports whether a request for path on the flat rig's host is
-// vouched (spec C6: DeclaredHashesForPath finds testHex64).
-func (r *flatRig) vouches(path string) bool {
+// declared returns the rows DeclaredHashesForPath finds for path on the
+// flat rig's host (spec C6).
+func (r *flatRig) declared(path string) []cache.DeclaredHash {
 	r.t.Helper()
 	rows, err := r.cache.DeclaredHashesForPath(context.Background(), "http", flatRigHost, path)
 	if err != nil {
 		r.t.Fatal(err)
 	}
+	return rows
+}
+
+// vouches reports whether a request for path on the flat rig's host is
+// vouched: exactly one row, declaring testHex64. A refused path is checked
+// with declared (no row at all), not with !vouches.
+func (r *flatRig) vouches(path string) bool {
+	r.t.Helper()
+	rows := r.declared(path)
 	return len(rows) == 1 && rows[0].DeclaredSHA256 == testHex64
 }
 
@@ -10304,8 +12195,8 @@ func TestDoD_EveryRealFilenameShapeAdoptsAndVouches(t *testing.T) {
 				}
 			}
 			for _, p := range tc.refused {
-				if r.vouches(p) {
-					t.Errorf("%s is vouched, want nothing", p)
+				if rows := r.declared(p); len(rows) != 0 {
+					t.Errorf("%s is declared by %v, want nothing", p, rows)
 				}
 			}
 		})
@@ -10319,8 +12210,8 @@ func TestDoD_EveryRealFilenameShapeAdoptsAndVouches(t *testing.T) {
 		if err := r.adopter.RunUnsigned(context.Background(), r.suite, rel, "", ""); err != nil || r.row().CurrentSnapshotID == nil {
 			t.Fatalf("RunUnsigned = %v; want an unsigned snapshot", err)
 		}
-		if r.vouches("/unsigned/amd64/u_1_amd64.deb") {
-			t.Fatal("an unsigned snapshot vouched its .deb")
+		if rows := r.declared("/unsigned/amd64/u_1_amd64.deb"); len(rows) != 0 {
+			t.Fatalf("an unsigned snapshot vouched its .deb: %v", rows)
 		}
 	})
 }
@@ -10420,8 +12311,11 @@ func TestDoD_UntrustedFlatSuiteFromAV6CacheKeepsTheBackoff(t *testing.T) {
 		time.Sleep(3 * time.Hour)
 		stop()
 		at := ver.times()
-		if len(at) < 6 {
-			t.Fatalf("%d adoption attempts in 3 h, want at least 6: the suite must keep retrying", len(at))
+		// Seven: spec C11's schedule puts the seventh attempt by 122 min
+		// plus six ticks (144.5 min), well inside the 3 h; it is the one
+		// whose gap meets the 1 h cap, so six would leave the cap unchecked.
+		if len(at) < 7 {
+			t.Fatalf("%d adoption attempts in 3 h, want at least 7: the suite must keep retrying, the 1 h cap included", len(at))
 		}
 		// Spec C11's schedule, written out (not backoffDelay: the oracle must
 		// not be the code under test), and the scheduler's fast tick
@@ -10497,6 +12391,14 @@ func (u mintedFlatUpstream) Fetch(ctx context.Context, target *fetch.Target, dst
 // of tracked suites (a suite and its twin share one), and no lock-map,
 // flip-gate or touch-map entry beyond the tracked suites; the rejection
 // cache holds the refused suites only.
+//
+// The counts are exact, as phase D's sibling's are, only while two things
+// hold: the bubble's time never advances, so the flip gate's idle sweep
+// never runs; and every check answers 304 to a probe that carried no
+// validators — an unknown answer, a failed check — so nothing adopts and
+// no anchorless refresh runs (it needs both anchors answered absent). An
+// edit that advances time or answers 404 changes the gate's count or
+// starts anchorless refreshes.
 func TestServeHTTP_MintedFlatSuitesAtScale(t *testing.T) {
 	synctest.Test(t, testMintedFlatSuitesAtScale)
 }
@@ -10610,10 +12512,10 @@ Run: `go test ./internal/freshness/ -run 'TestDoD_NvidiaFlatSuiteAdopts|TestDoD_
 Expected: PASS, eight `TestDoD_EveryRealFilenameShapeAdoptsAndVouches` subtests. (No red step of their own: Tasks 1–14 built what they pin; the mutations below are their red runs.)
 
 Run: `go test -race -count=3 ./internal/handler/ -run 'TestServeHTTP_MintedFlatSuitesAtScale|TestServeHTTP_MintedSuitesAtScale$' -v`
-Expected: PASS; each run under the 4.5 s simulation budget. Measured on the plan's machine: 1.5–1.8 s for the flat simulation, 2.5 s for phase D's; on the exec review's: 2.32–2.46 s and 3.87–3.98 s; on the revision's (load average about 1): 2.60–2.66 s and 3.94–4.25 s — phase D's simulation has about 0.25–0.5 s of headroom on a loaded machine, so no work may be added to it (ruling R-G5).
+Expected: PASS; each run under the 4.5 s simulation budget. Measured on the plan's machine: 1.5–1.8 s for the flat simulation, 2.5 s for phase D's; on the exec review's: 2.32–2.46 s and 3.87–3.98 s; on the revision's (load average about 1): 2.60–2.66 s and 3.94–4.25 s; on the fix round's (load 1.1–1.3): 1.52–1.67 s and 2.62–2.82 s — phase D's simulation has about 0.25–0.5 s of headroom on a loaded machine, so no work may be added to it (ruling R-G5).
 
 Run: `go test -race -count=3 ./internal/freshness/ -run 'TestDoD_NinetyDaysOfReapingWithRestarts|TestDoD_UntrustedFlatSuiteFromAV6CacheKeepsTheBackoff' -v`
-Expected: PASS; the 90-day simulation within noise of the base commit's time (the plan's machine: 3.0 s at the base and after Task 12; the revision's: 3.58–3.76 s at the base, 3.76–3.88 s after Task 15, under some load), the backoff simulation about 0.5 s (0.49–0.51 s).
+Expected: PASS; the 90-day simulation within noise of the base commit's time (the plan's machine: 3.0 s at the base and after Task 12; the revision's: 3.58–3.76 s at the base, 3.76–3.88 s after Task 15, under some load; the fix round's: 2.99–3.29 s), the backoff simulation about 0.5 s (0.49–0.51 s).
 
 - [ ] **Step 3: Mutation checks** (one at a time, each reverted)
 
@@ -10628,6 +12530,8 @@ Expected: PASS; the 90-day simulation within noise of the base commit's time (th
 | onboarding marks no cached signed anchor (`markCreated`) | `TestDoD_UntrustedFlatSuiteFromAV6CacheKeepsTheBackoff` (`onboarding wrote no marker`) |
 | a per-host cap of a fifth of `max_suites` | `TestServeHTTP_MintedFlatSuitesAtScale` (`f00: tracked …; want the first directory's twin, not its suite`) |
 | `MarkerBase` keeps a twin's `/.` | `TestServeHTTP_MintedFlatSuitesAtScale` (`f00.example/repo000: marker false, want true`) |
+| a scheduler rule that stops after six failures (`suiteDue` refuses an unadopted suite with `AdoptionFailCount >= 6`) | `TestDoD_UntrustedFlatSuiteFromAV6CacheKeepsTheBackoff` (`6 adoption attempts in 3 h, want at least 7: the suite must keep retrying, the 1 h cap included`) |
+| the fallback keeps every row twice, with no ancestor test (`out = append(out, d, d)`) | `TestDoD_EveryRealFilenameShapeAdoptsAndVouches/pkgs.k8s.io_(amd64/)` (`/core:/stable:/v1.34/deb2/amd64/kubectl_1.34.1-1.1_amd64.deb is declared by [{…} {…}], want nothing`), `/CUDA_(./)`, `/Jenkins_(binary/:_the_parent_base)`, `/Jenkins_(direct/:_the_parent_base)`, `/Sublime_Text_(files/:_the_host-root_base)` (`… is not vouched`) |
 
 - [ ] **Step 4: The whole tree**
 
@@ -10642,7 +12546,7 @@ Expected: only the five drift files of the Global Constraints.
 
 - [ ] **Step 5: The DoD map**
 
-Every item of spec §9's G row, the overview's G line, the G carry-forwards, PR #8 parity items 1–4, rulings R-G1..R-G5 and the rulings on the plan reviews (PG-1..PG-18), with its tests:
+Every item of spec §9's G row, the overview's G line, the G carry-forwards, PR #8 parity items 1–4, rulings R-G1..R-G5, the rulings on the plan reviews (PG-1..PG-18) and those on the task reviews that changed code (PG-20, PG-22, PG-24), with its tests:
 
 | DoD item | Tests (task) |
 |---|---|
@@ -10682,6 +12586,9 @@ Every item of spec §9's G row, the overview's G line, the G carry-forwards, PR 
 | Ruling R-G4: twins | `TestServeHTTP_FlatRepositoryFreshness` (7), `TestCheck_AnchorlessRefreshesItsOwnRowsOnly` (10), Task 12's and 13's tests, `TestServeHTTP_MintedFlatSuitesAtScale` (15) |
 | Ruling R-G5 / F-12 / PG-6 / PG-18: the simulation budget; the read gate's two branches | `TestHasUnadoptedFlatSuite`, `TestReaper_ReadsFlatIndexesOnlyWithAnUnadoptedFlatSuite`, `TestReaper_ReapsAJunkAnchorlessFlatSuite` (12); the timings in Step 2 (15) |
 | Ruling PG-15: the exec review's G10-1, G15-1, nits and P1–P7 | Task 10's Step 2 text; `TestDoD_UntrustedFlatSuiteFromAV6CacheKeepsTheBackoff`'s oracle (15); P2–P7 above |
+| Ruling PG-20: an index-only flat suite probes beside its index row's stored URL | `TestCheck_AnIndexOnlyFlatSuiteProbesBesideItsIndexRow` (10) |
+| Ruling PG-22: one log limiter for the three one-line-a-minute WARNs | `TestLogLimiter_AllowsOneLinePerInterval`, `TestLogLimiter_ConcurrentCallsAllowOneAndCountTheRest`, `TestServeHTTP_FlatHostRootIsUnsupportedAndSaysSo`, `TestServeHTTP_FlatHostRootLineNamesAnAllowedHostOncePerMinute` (6); `TestCheck_AnchorlessOverCapWarnIsRateLimited` (10) |
+| Ruling PG-24: the slot wait ends with the check, writes commit after the deadline (M2), the anchors' blobs read before the probe (M3), a failed delete is no answer (M4), the refresh's read fault is local (M5) | `TestCheck_AnchorlessSlotWaitEndsWithTheCheck`, `…WritesAfterTheDeadlineCommit`, `…KeepsAnAnchorAClientStoredDuringItsProbe`, `…FailedDeleteIsNoAnswer`, `…IndexReadFaultIsALocalFault`, `TestDeleteURLPathRows_DeletesTheRowsNamed` (10) |
 
 - [ ] **Step 6: Commit**
 
@@ -10727,6 +12634,7 @@ Deferred minors in the files this task changes: none taken. C-36 (`docs/admin-ui
 
 **Files:**
 - Modify: `docs/configuration.md`, `docs/log-fields.md`, `docs/admin-ui-spec.md`, `packaging/config/config.toml.default`, `docs/superpowers/specs/2026-09-27-flat-repositories-design.md`, `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md`, `…-A-deferred.md`, `…-B-deferred.md`, `…-D-deferred.md`, `…-E-deferred.md`, `…-F-deferred.md`
+- Create: `docs/superpowers/plans/2026-09-28-flat-repositories-G-deferred.md` (ruling PG-25)
 
 **Interfaces:**
 - Consumes: the names, events, metrics and constants Tasks 1–15 produce, exactly as they produce them.
@@ -10734,13 +12642,25 @@ Deferred minors in the files this task changes: none taken. C-36 (`docs/admin-ui
 
 - [ ] **Step 1: Operator documentation (`docs/configuration.md`)**
 
-*Eager first adoption* counts a flat repository's root `Packages`/`Sources` as a client-created row and points a Release-less flat repository at the new *Flat repositories* subsection (refused `unsigned_disabled` while the knob is off, ruling PG-1); *Flat repositories* adds residuals 1 and 2 to flat vouching, and to the refresh without a `Release` the knob (PG-1), the request order (M-3), the two bodies at once (PG-8), the delete compare (M-4), the content-answer rule (M-7, PG-15's composition with P7) and residuals 3 and 4; `adopt_unsigned` and `unsigned_disabled` gain PG-1's sentence; strict mode gains PG-2's; *Suite reaping* names a flat repository's files and its twin, and the flat junk evidence as ruling PG-7 amends R-G2:
+*Eager first adoption* counts a flat repository's root `Packages`/`Sources` as a client-created row and points a Release-less flat repository at the new *Flat repositories* subsection (refused `unsigned_disabled` while the knob is off, ruling PG-1); *Flat repositories* adds residuals 1 and 2 to flat vouching, and to the refresh without a `Release` the knob (PG-1), the request order (M-3), the two bodies at once (PG-8), the delete compare (M-4), the content-answer rule (M-7, PG-15's composition with P7) and residuals 3 and 4; `adopt_unsigned` and `unsigned_disabled` gain PG-1's sentence; strict mode gains PG-2's; *Suite reaping* names a flat repository's files and its twin, and the flat junk evidence as ruling PG-7 amends R-G2. From the fix round (the Task 16 review, rulings PG-20–PG-24): a flat repository's root `Packages`/`Sources` are client interest in *Tracked suites* and *Suite reaping*; a `Release` that lists no root `Packages` adopts with incomplete coverage; the refresh without a `Release` needs adoption enabled, judges a changed file by the flat index check for its name, counts a 304 only to a request with validators, and counts a failed delete as no answer; a third limit (an unchanged plain `Contents-*`); `anchor_absent` excepts a never-signed flat repository:
 
 ```diff
 diff --git a/docs/configuration.md b/docs/configuration.md
 --- a/docs/configuration.md
 +++ b/docs/configuration.md
-@@ -274,7 +274,8 @@ a tracked suite; otherwise it is fetched from upstream.
+@@ -261,8 +261,9 @@ at exactly the total cap logs no warning: that is a full cache working
+ normally, where a new suite evicts an idle one and is refused only when
+ none qualifies (WARN `suite_seed_rejected`).
+ 
+-Serving a tracked suite's `InRelease`, `Release` or `Release.gpg`, or a
+-`.deb` its current snapshot vouches for, records that the suite is in use
++Serving a tracked suite's `InRelease`, `Release` or `Release.gpg` — or,
++for a flat repository, its root `Packages` or `Sources` — or a `.deb` its
++current snapshot vouches for, records that the suite is in use
+ (at most one write per suite per hour); a suite not in use for
+ `gc.suite_idle_ttl` (30 days by default) is no longer tracked (see *Suite
+ reaping* under `[gc]`). A by-hash request with no cached
+@@ -274,7 +275,8 @@ a tracked suite; otherwise it is fetched from upstream.
  With adoption enabled, a tracked suite that has no snapshot yet is
  adopted on its first check, in whichever form its upstream publishes (see
  *Anchor forms and unsigned repositories*), when a client asked for it in
@@ -10750,7 +12670,7 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  the cache (a copy the cache rebuilt for itself does not count). The
  request that creates a suite starts its first check once its response is
  sent, so a new repository is adopted within seconds of its first
-@@ -294,7 +295,10 @@ doubling to an hour), or once `periodic_refresh` has passed since its last
+@@ -294,7 +296,10 @@ doubling to an hour), or once `periodic_refresh` has passed since its last
  check if that comes first; checks that clients trigger in between ask
  upstream nothing. A suite whose upstream serves neither `InRelease` nor
  `Release` fails its check (backing off from 2 minutes to an hour) and
@@ -10762,7 +12682,7 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  
  First adoptions never take the last free adoption slot, which is kept for
  suites that already serve a signed snapshot (see *Capacity and
-@@ -313,13 +317,96 @@ only, and a miss that creates a suite starts no check (a cache hit on a
+@@ -313,13 +318,107 @@ only, and a miss that creates a suite starts no check (a cache hit on a
  suite's anchor still triggers its usual check, under the `cooldown`, also
  the hit that creates the suite's row).
  
@@ -10782,9 +12702,11 @@ diff --git a/docs/configuration.md b/docs/configuration.md
 +logs WARN `flat_host_root_unsupported` (at most one line a minute).
 +
 +A signed or unsigned flat repository is adopted like any other (see
-+*Anchor forms and unsigned repositories*). Its `Release` must list its
-+root `Packages`, whose fetch failing fails the adoption, and the `.deb`
-+files that `Packages` names are vouched by the paths apt requests for
++*Anchor forms and unsigned repositories*). When its `Release` lists its
++root `Packages`, that file's fetch failing fails the adoption; a `Release`
++that lists none adopts with incomplete coverage (`no_packages_members`),
++which turns strict mode off for its host. The `.deb` files that
++`Packages` names are vouched by the paths apt requests for
 +them: `<uri>/<Filename>`, with or without a leading `./`, for whichever
 +directory at or above the `Release` the repository's `<uri>` is
 +(pkg.jenkins.io's `binary/…` one level up, Sublime Text's `files/…` at the
@@ -10804,16 +12726,17 @@ diff --git a/docs/configuration.md b/docs/configuration.md
 +at its next check, at most `periodic_refresh` later unless that adoption
 +fails.
 +
-+A flat repository that publishes no `Release` at all (Gemfury, goreleaser)
-+is refreshed without one, as long as the cache has never seen it signed
-+and `adoption.adopt_unsigned` is on (with it off, such a repository is
-+served as the cache first stored its files and shows "refused:
-+unsigned_disabled"; turning the knob on resumes its refresh): each check
-+sends one conditional request for every cached `Packages`, `Sources` and
-+`Contents-*` file of the suite, in that order, with the validators
-+upstream gave it, and reads at most two such files at once across the
-+whole process. A changed file replaces the cached one when its bytes pass
-+the same content check as on first contact; an HTML page or anything else
++With adoption enabled, a flat repository that publishes no `Release` at
++all (Gemfury, goreleaser) is refreshed without one, as long as the cache
++has never seen it signed and `adoption.adopt_unsigned` is on (with it
++off, such a repository is served as the cache first stored its files and
++shows "refused: unsigned_disabled"; turning the knob on resumes its
++refresh): each check sends one conditional request for every cached
++`Packages`, `Sources` and `Contents-*` file of the suite, in that order,
++with the validators upstream gave it, and reads at most two such files at
++once across the whole process. A changed file replaces the cached one
++when its bytes pass the flat index check for its name (for a compressed
++`Contents-*`, its compression magic); an HTML page or anything else
 +that fails it keeps the old file (counted in
 +`acu_anchorless_sniff_rejected_total{host}`), and a plain `Contents-*`,
 +which has no such check, is deleted when it changed, for the next client
@@ -10822,11 +12745,14 @@ diff --git a/docs/configuration.md b/docs/configuration.md
 +client's own fetch stored other bytes for it meanwhile; anything else —
 +401, 403, a 5xx, a timeout, a body over 64 MiB — keeps the file. A check
 +that asks for files counts as answered only when at least one of them got
-+a real answer (304, a 200 stored or identical to the cached file, 404 or
-+410): one whose files got none — an HTML page for every file (a captive
-+portal, a vendor's retired site; even a page the cache already holds), 401
-+and 403, a changed plain `Contents-*` — fails and backs off, so the status
-+page shows the repository failing rather than healthy. Such a repository
++a real answer (304 to a request with validators, a 200 stored or
++identical to the cached file, 404 or 410): one whose files got none — an
++HTML page for every file (a captive portal, a vendor's retired site; even
++a page the cache already holds), 401 and 403, a changed plain
++`Contents-*` — fails and backs off, so the status page shows the
++repository failing rather than healthy. A delete that fails is no answer:
++its 404s and 410s stop counting, so a check they alone answered — no file
++asked for, or every real answer a delete — fails. Such a repository
 +has no snapshot: it vouches nothing and leaves strict mode alone. Its
 +index files are served with `Last-Modified` the later of the file's time
 +and its last refresh, so apt's `If-Modified-Since` sees a replacement. The
@@ -10840,14 +12766,19 @@ diff --git a/docs/configuration.md b/docs/configuration.md
 +stripping a signed repository's signatures cannot turn it into an
 +unverified one.
 +
-+Two limits of the refresh without a `Release`. Behind an upstream that
++Three limits of the refresh without a `Release`. Behind an upstream that
 +answers 403 for a missing file (Amazon S3, CloudFront), a file the
 +repository removed stays cached and served: if that is the `Packages.xz`
-+apt tries first, a client never sees the fresh `Packages.gz`. And a
++apt tries first, a client never sees the fresh `Packages.gz`. A
 +repository whose only index is a plain `Packages` that is empty at first
 +contact gets no suite (an empty file is not recognisably an index): it is
 +served as cached and never refreshed; likewise an index that later
-+becomes empty is never stored (the cached one stays).
++becomes empty is never stored (the cached one stays). And an unchanged
++plain `Contents-*` counts as a real answer without a check: a captive
++portal's page that a client's miss cached as a plain `Contents-<arch>`,
++and that the portal still serves, answers the check
++(`anchorless_unchanged`) during the outage. Flat repositories rarely
++publish a plain `Contents-*`.
 +
  ## `[adoption]`: snapshots, trust, and recovery
  
@@ -10860,16 +12791,18 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
  | `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. A decodable clearsigned `InRelease` (or, for the detached pair, a parseable `Release.gpg` signature) is still required, as in every mode. Matching pins keep normal verification. Logs a startup warning. |
  | `allow_short_keyid` | boolean | `true` | Accept signatures containing only a legacy 64-bit issuer key ID when it uniquely identifies a loaded trusted key and cryptographic verification succeeds. `false` requires the long issuer fingerprint. |
-@@ -347,7 +434,7 @@ Seven outcomes are refusals, not failures, and are shown as "refused: …" on th
+@@ -347,8 +446,8 @@ Seven outcomes are refusals, not failures, and are shown as "refused: …" on th
  - `unsigned_unconfirmed`: an unsigned repository's first adoption waits for a second observation of the same `Release` (see *Anchor forms and unsigned repositories*).
  - `unsigned_downgrade_refused`: the suite has been seen signed, so its unsigned `Release` is not adopted.
  - `unsigned_too_large`: an unsigned `Release` declares more than 1,000 files.
 -- `unsigned_disabled`: `adopt_unsigned = false`, so an unsigned `Release` is not adopted; an unsigned suite already adopted keeps serving its last snapshot, not updated, until the knob is turned back on, the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, served as the cache first stored its files (see `adopt_unsigned`).
+-- `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too. While a failed adoption of the suite is recorded (its move to the other form failed), the status page shows that failure's reason instead, and the suite is paced the same way.
 +- `unsigned_disabled`: `adopt_unsigned = false`, so an unsigned `Release` is not adopted; an unsigned suite already adopted keeps serving its last snapshot, not updated, until the knob is turned back on, the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, served as the cache first stored its files (see `adopt_unsigned`). A flat repository that publishes no `Release` at all is refused this way too while the knob is off: it is not refreshed (see *Flat repositories*).
- - `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too. While a failed adoption of the suite is recorded (its move to the other form failed), the status page shows that failure's reason instead, and the suite is paced the same way.
++- `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too (unless it is a flat repository the cache has never seen signed: see *Flat repositories*). While a failed adoption of the suite is recorded (its move to the other form failed), the status page shows that failure's reason instead, and the suite is paced the same way.
  
  Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO) and is not counted by `acu_adoption_failing_suites`. `upstream_older` and `rollback_refused` show no lag (the cache already serves content at least as new as upstream's); the other five keep their lag, because the suite is in fact behind. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
-@@ -667,7 +754,10 @@ whose signed suites all have complete coverage: unsigned snapshots never
+ 
+@@ -667,7 +766,10 @@ whose signed suites all have complete coverage: unsigned snapshots never
  vouch and never count, so a host whose only snapshots are unsigned is
  never strict. Strict posture changes as eager first adoptions land after
  an upgrade. Conversely, a signed snapshot with incomplete coverage turns
@@ -10881,7 +12814,19 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  
  Strict mode fails open on a database error: when the cache cannot read a
  package's vouching hashes or its host's snapshot coverage, the `.deb` is
-@@ -731,7 +821,8 @@ asked for least recently first; a suite being checked or adopted at
+@@ -722,8 +824,9 @@ applies when `enabled = false`.
+ 
+ The suite reaper deletes the tracked suites (see *Tracked suites*) that no
+ client has asked for in `suite_idle_ttl`: a client asks for a suite when it
+-fetches the suite's `InRelease`, `Release` or `Release.gpg`, or a `.deb`
+-its snapshot vouches for, through the cache. The reaper runs an hour after
++fetches the suite's `InRelease`, `Release` or `Release.gpg` — or, for a
++flat repository, its root `Packages` or `Sources` — or a `.deb` its
++snapshot vouches for, through the cache. The reaper runs an hour after
+ the daemon starts and then every hour, whatever `interval` and `enabled`
+ say. A run deletes at most 250 of the suites reaped however recently
+ they were asked for (below), first, and at most 25 idle ones, those
+@@ -731,7 +834,8 @@ asked for least recently first; a suite being checked or adopted at
  that moment is skipped — it counts toward its kind's number — and tried
  again at the next run. Reaping a suite deletes its cached index files
  (its `InRelease`, `Release`, `Packages` and the rest of its `dists/`
@@ -10891,7 +12836,7 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  row (INFO `suite_reaped`; `acu_suites_reaped_total{reason}` counts the
  reaps). The reaper deletes no package, but a reaped suite's packages
  lose the version retention its snapshot gave them
-@@ -794,7 +885,18 @@ every such file was fetched at least a day earlier, so a repository that
+@@ -794,7 +898,18 @@ every such file was fetched at least a day earlier, so a repository that
  answered with an error page for a few hours is kept, and so is one whose
  cached `InRelease` is a plain unsigned `Release` (the cache adopts such a
  repository through its `Release`); a file that cannot be read is never
@@ -10915,7 +12860,7 @@ diff --git a/docs/configuration.md b/docs/configuration.md
 
 - [ ] **Step 2: Events and metrics (`docs/log-fields.md`)**
 
-The metric, the anchorless results (M-7's success rule, the request order, the body bound, the delete compare, PG-1's refusal line), the failed check's `anchorless` form and content-answer rule, the three WARN rows (two anchorless — the over-cap WARN one line a minute with `suppressed`, M-6 — and `flat_host_root_unsupported`), the reaper's two new WARNs (`list unadopted flat indexes failed`, `read signed evidence failed`), `suite_reaped`'s flat junk (PG-7), and `package_coverage_incomplete`'s `non_dists_layout` (now no tracked path) and `no_packages_members` (a flat suite's root):
+The metric, the anchorless results (M-7's success rule, the request order, the body bound, the delete compare, PG-1's refusal line), the failed check's `anchorless` form and content-answer rule, the three WARN rows (two anchorless — the over-cap WARN one line a minute with `suppressed`, M-6 — and `flat_host_root_unsupported`), the reaper's two new WARNs (`list unadopted flat indexes failed`, `read signed evidence failed`), `suite_reaped`'s flat junk (PG-7), and `package_coverage_incomplete`'s `non_dists_layout` (now no tracked path) and `no_packages_members` (a flat suite's root). From the fix round: dormancy counts a flat suite's root `Packages`/`Sources`; with the knob off no index file is requested; a failed delete is no answer, in the paragraph, the failed-check row and the delete row (its `err` prefixes); `freshness: read anchor rows failed` covers the flat index reads; `flat_host_root_unsupported` is logged only for an allowed host; the junk-read counter covers flat index reads:
 
 ```diff
 diff --git a/docs/log-fields.md b/docs/log-fields.md
@@ -10934,7 +12879,15 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
  
  The `freshness_check` line's `result` gains `changed_deferred` (upstream
  still serves content whose adoption failed or was refused; the field
-@@ -245,6 +249,44 @@ a failure or refusal record paces: those of a suite without a snapshot
+@@ -239,12 +243,53 @@ absent upstream: `upstream_status` is the absent answer — 401, 403, 404,
+ changed `Release` comes without its `Release.gpg`, `upstream_status` then
+ being the `Release.gpg`'s answer). `form` also takes the value `unsigned`.
+ A suite without a snapshot that no client asked for in the last 7 days, or
+-whose anchor files only the cache itself fetched, is dormant: its checks
++whose anchor files — and, for a flat suite, root `Packages`/`Sources` —
++only the cache itself fetched, is dormant: its checks
+ make no request and log no `freshness_check` line. Neither do the checks
+ a failure or refusal record paces: those of a suite without a snapshot
  whose record is not due yet, within `periodic_refresh` of its last check,
  and those of an adopted suite in `anchor_absent` before its retry time.
  
@@ -10968,33 +12921,44 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
 +requests got no content answer — a sniff-rejected 200 (an HTML page: a
 +captive portal, even one whose page is what the cache holds), a changed
 +plain `Contents-*`, 401, 403, or no answer at all — the check fails
-+instead (`freshness check failed`, `form` `anchorless`) and backs off.
++instead (`freshness check failed`, `form` `anchorless`) and backs off; so
++does one whose delete failed when its 404s and 410s were its only answers
++(see `freshness: delete anchorless rows failed`).
 +With `adoption.adopt_unsigned` off, such a suite is refused instead:
 +`result=changed_deferred`, `form=anchorless`, `reason=unsigned_disabled`;
-+nothing is requested or deleted, and its record paces it (a success,
-+logged `adoption_refused` as every refusal is, as for an unsigned
-+candidate). A flat suite the cache has seen signed is the failed check and
-+`anchor_absent` record it was, whatever the knob.
++no index file is requested and nothing is deleted, and its record paces it
++(a success, logged `adoption_refused` as every refusal is, as for an
++unsigned candidate). A flat suite the cache has seen signed is the failed
++check and `anchor_absent` record it was, whatever the knob.
 +
  ## Stability guarantees
  
  - The `path_class` enum is closed. Adding a value requires a spec
-@@ -269,7 +311,7 @@ daemon's `main`).
+@@ -269,7 +314,7 @@ daemon's `main`).
  |---|---|---|---|
  | `adoption_panicked` | ERROR | `where` (`adoption`, `repair`, `reconcile`, `heartbeat`, `record`), `canonical_scheme`, `canonical_host`, `suite_path` (the suite's scheme, host and path; the scheme tells its `http` copy from its `https` one), `panic`, `stack` (first occurrence per `where` per process only) | A panic inside an adoption, repair, reconcile, heartbeat or failure-record goroutine was recovered; the prior snapshot keeps serving. Only an adoption panic is recorded as a failure (reason `panic`); repair and reconcile panics are logged, not recorded (plan deviation 7). `where=record` is `recordAdoptionFailure`, which writes the spec C7 failure record after an adoption ends. |
  | `freshness_check_panicked` | ERROR | `where` (`check`, `scheduler`, `reschedule`, `t1`, `reaper`, `forget`), `canonical_scheme`, `canonical_host`, `suite_path` (the suite the panic struck — the scheme tells its `http` copy from its `https` one; all three empty when the panic names no suite), `panic`, `stack` (first occurrence per `where` per process only) | A panic during a freshness check was recovered. For `where=check` the check counts as failed (`last_check_at` bumped, so the cooldown applies) and also counts as an unknown end: `last_check_at` is bumped and `check_fail_count` extended. The `scheduler`, `reschedule` and `t1` recovers only log; `where=reschedule` guards the start-time retry spread (`rescheduleFailingAdoptions`), and `where=t1` is the handler's client-triggered check goroutine (logged by `internal/handler`). `where=reaper` is the suite reaper: a panic while it held a suite names that suite, the hold is released as the cache then answers (the row gone or not), and the run goes on to its next candidate and its sweeps; a panic elsewhere in a run (the listing, the junk scan, the sweeps; empty `canonical_scheme`, `canonical_host` and `suite_path`) ends the run, and the next run comes as scheduled. `where=forget` is `POST /forget`: a panic while it held the suite names that suite; the hold is released as the cache then answers (the row gone or not), and the panic goes on to net/http, which ends the request without an answer and logs `http: panic serving …` at ERROR (see net/http's own lines below). |
 -| `freshness check failed` | INFO | `canonical_host`, `suite_path`, `form` (`inline`, `detached`, `unsigned`, or `probe` for the probe tree of a suite without a snapshot), `err`, `result` (always `failed`) | A check ended unknown — a transport error, an error status that is not an absent answer, a success status other than 200 or 304 (a fetch contract violation: `err` says `unexpected success status`), a 304 to a request that carried no validators (adoption enabled; `err` says `304 Not Modified to a request without validators`), or the 2-minute check deadline at the host slot or the request — or found nothing it may adopt: a suite without a snapshot whose upstream has neither `InRelease` nor `Release` (which also records the refusal state `anchor_absent`, shown on the status page); an unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled` instead. A check whose probe found a signature but could not record the suite as seen signed fails too (`err` starts `mark the signature seen:`). A shutdown that ends a check — its request, or a cache read or marker write after it — is not a failure: nothing is written or counted (DEBUG only). `last_check_at` is bumped and `check_fail_count` extended, so the scheduler backs off (2 min doubling to 1 h), and `acu_freshness_check_total{result="failed"}` is incremented. With adoption enabled, 401, 403, 404, 410 and a 200 whose body is not the file asked for are answers, not failures (the anchor is absent): they never extend the streak. |
-+| `freshness check failed` | INFO | `canonical_host`, `suite_path`, `form` (`inline`, `detached`, `unsigned`, `probe` for the probe tree of a suite without a snapshot, or `anchorless` for a flat suite's anchorless refresh), `err`, `result` (always `failed`) | A check ended unknown — a transport error, an error status that is not an absent answer, a success status other than 200 or 304 (a fetch contract violation: `err` says `unexpected success status`), a 304 to a request that carried no validators (adoption enabled; `err` says `304 Not Modified to a request without validators`), or the 2-minute check deadline at the host slot or the request — or found nothing it may adopt: a suite without a snapshot whose upstream has neither `InRelease` nor `Release` (which also records the refusal state `anchor_absent`, shown on the status page) — a flat suite the cache has never seen signed refreshes its cached indexes instead (the `anchorless_*` results); an unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled` instead. An anchorless refresh fails when the requests it sent got no content answer — a 304 to a request with validators, a 200 stored or identical to the cached file, a 404 or 410; a sniff-rejected 200, a changed plain `Contents-*`, 401 and 403 are none (`err` starts `every anchorless index request ended unknown:`, then the last request's reason) — or when its check for signed evidence could not read the cache (`err` starts `re-mark the cached signed anchors:`, or names the read). A check whose probe found a signature but could not record the suite as seen signed fails too (`err` starts `mark the signature seen:`). A shutdown that ends a check — its request, or a cache read or marker write after it — is not a failure: nothing is written or counted (DEBUG only). `last_check_at` is bumped and `check_fail_count` extended, so the scheduler backs off (2 min doubling to 1 h), and `acu_freshness_check_total{result="failed"}` is incremented. With adoption enabled, 401, 403, 404, 410 and a 200 whose body is not the file asked for are answers to an anchor's probe, not failures (the anchor is absent): they never extend the streak (an anchorless refresh's index requests follow the content-answer rule above). |
++| `freshness check failed` | INFO | `canonical_host`, `suite_path`, `form` (`inline`, `detached`, `unsigned`, `probe` for the probe tree of a suite without a snapshot, or `anchorless` for a flat suite's anchorless refresh), `err`, `result` (always `failed`) | A check ended unknown — a transport error, an error status that is not an absent answer, a success status other than 200 or 304 (a fetch contract violation: `err` says `unexpected success status`), a 304 to a request that carried no validators (adoption enabled; `err` says `304 Not Modified to a request without validators`), or the 2-minute check deadline at the host slot or the request — or found nothing it may adopt: a suite without a snapshot whose upstream has neither `InRelease` nor `Release` (which also records the refusal state `anchor_absent`, shown on the status page) — a flat suite the cache has never seen signed refreshes its cached indexes instead (the `anchorless_*` results); an unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled` instead. An anchorless refresh fails when the requests it sent got no content answer — a 304 to a request with validators, a 200 stored or identical to the cached file, a 404 or 410 (not when its delete failed); a sniff-rejected 200, a changed plain `Contents-*`, 401 and 403 are none (`err` starts `every anchorless index request ended unknown:`, then the last request's reason, or the failed delete's) — or when it sent none and the delete of its cached anchors failed (`err` starts `delete anchorless rows:`), or when its check for signed evidence could not read the cache (`err` starts `re-mark the cached signed anchors:`, or names the read). A check whose probe found a signature but could not record the suite as seen signed fails too (`err` starts `mark the signature seen:`). A shutdown that ends a check — its request, or a cache read or marker write after it — is not a failure: nothing is written or counted (DEBUG only). `last_check_at` is bumped and `check_fail_count` extended, so the scheduler backs off (2 min doubling to 1 h), and `acu_freshness_check_total{result="failed"}` is incremented. With adoption enabled, 401, 403, 404, 410 and a 200 whose body is not the file asked for are answers to an anchor's probe, not failures (the anchor is absent): they never extend the streak (an anchorless refresh's index requests follow the content-answer rule above). |
  | `adoption_run_failed` | WARN; INFO when the attempt was refused (outcome `refused`) | `canonical_host`, `suite_path`, `form`, `err` | Backstop line for every adoption attempt that returned an error, so a failure with no categorised line of its own is still visible. A refusal is a state, not a failure, so its line is INFO (`adoption_refused` carries the reason and timing); operators alerting on WARN are not paged for a flapping mirror. |
  | `adoption: read prior snapshot failed` | WARN | `canonical_host`, `suite_path`, `err` | The adoption could not read the suite's current (prior) snapshot before running Date and rollback checks against it; the attempt fails as `db_failed` and is retried on the normal backoff schedule rather than skipping those checks. |
  | `adoption: signed-anchor re-mark failed` | WARN; ERROR when a cached anchor's pool file could not be read (a missing file is not an error) | `canonical_host`, `suite_path`, `err` | Before an unsigned adoption's commit, the adopter re-reads the suite's cached `InRelease` and `Release.gpg` (and those of its `/.` twin) to record any signed one (spec C5 safeguard 3), and could not read a `url_path` row or a pool file, or write the record. The adoption is refused `unsigned_downgrade_refused` (fail closed): here that refusal means the cache could not rule out a signature, not that it saw one. It is retried on the refusal's schedule. |
-@@ -302,16 +344,19 @@ daemon's `main`).
+@@ -285,7 +330,7 @@ daemon's `main`).
+ | `freshness: clear adoption failure failed` | WARN | `canonical_host`, `suite_path`, `err` | Upstream serves the current content again but the failure record could not be cleared; the next check tries again. |
+ | `freshness: adopted suites stale beyond threshold` | WARN | `adopted_stale`, `stale_factor`, `refresh` | Logged at each scheduler tick while adopted suites have had no successful check for `stale_factor` × `periodic_refresh` (4 × 15 min by default), or carry a success stamp in the future: the signature of a freeze. Suites in a refusal state that paces them by their record (`anchor_absent`, `unsigned_disabled`) are left out of `adopted_stale`: such a suite is checked only at its record's retries (up to 75 min apart), so its last success ages on purpose; the status page and `adoption_refused` show them. A suite in any other refusal state counts, since its last success ages only when its checks fail. The gauge `acu_freshness_stale_suites{adopted}` counts every stale suite, those included. With adoption disabled, records are inert and every stale adopted suite counts. |
+ | `freshness: read suite row failed` | WARN | `err`, `canonical_host`, `suite_path` | A freshness check could not read the suite's row: either the existence read a check makes before it takes the suite's lock (a suite is checked only while it has a row), or the full read after it. The check is skipped and writes nothing; the next trigger (a client hit's check or the scheduler) tries again. |
+-| `freshness: read anchor rows failed` | WARN | `err`, `canonical_host`, `suite_path` | A check could not read the suite's cached anchor rows (`url_path`). A suite without a snapshot is not probed this time — no request, nothing written; the next check tries again. A suite whose current anchor is absent probes the other forms at their canonical URLs instead. |
++| `freshness: read anchor rows failed` | WARN | `err`, `canonical_host`, `suite_path` | A check could not read the suite's cached anchor rows (`url_path`). A suite without a snapshot is not probed this time — no request, nothing written; the next check tries again. A suite whose current anchor is absent probes the other forms at their canonical URLs instead. A flat suite without a snapshot whose anchor rows show no client's fetch has its cached root `Packages`/`Sources` rows read too, and a failure of that read logs the same line, with the same result. A flat suite's anchorless refresh that cannot read the suite's cached index rows logs the same line: no index request, no delete, nothing written; the next check tries again. |
+ | `freshness: read current snapshot failed` | WARN | `err`, `snapshot_id`, `canonical_host`, `suite_path` | A check whose absent anchor's probe tree found a form it may adopt could not read the suite's current snapshot, so it cannot tell an anchor that merely came back from new content: the check fails (`freshness check failed`) rather than re-adopting the current content. A shutdown that ends the read is not logged here. |
+ | `adoption_member_mismatch` | WARN | `canonical_host`, `suite_path`, `path`, and `declared_sha256`/`actual_sha256` — or `declared_sha512`/`actual_sha512` when the member's SHA512 is the hash that failed | A member's bytes did not match the hash its `Release` declares (every declared SHA256 and SHA512 is checked), and the adoption fails (outcome `member_mismatch`). Fetched bytes never reach the pool. A pool file reused under its declared SHA256 whose SHA512 differs from the declared one — the `Release`'s two declarations disagree, so a fetch would bring the same bytes — is logged with `declared_sha512`/`actual_sha512`, is not fetched again, and is kept. |
+ | `adoption_reconcile_failed` | WARN | `canonical_host`, `suite_path`, `snapshot_id`, `stage` (`decision`: deciding whether an unchanged suite needs a reconcile; `heal`: the reconcile run after an unchanged check; `on_demand`: `POST /reconcile`), `err` | Reconciling a snapshot's declared index files failed — for example a stored anchor that no longer decodes — so nothing was healed this time; it is tried again on a later unchanged check. |
+@@ -302,16 +347,19 @@ daemon's `main`).
  | `displaced snapshot lookup failed` | WARN | `err`, `canonical_host`, `path` | Retained by-hash could not read the suite's displaced snapshots; the request is answered 404, as before spec C8. |
  | `snapshot adopted_at lookup failed` | WARN | `err`, `snapshot_id` | A snapshot `InRelease`/`Release`/`Release.gpg` could not read its snapshot's `adopted_at` (spec C8 `Last-Modified`), so this response carries the pool file's mtime instead and its `Last-Modified` may not grow with the last flip. Not logged when the request had already ended. |
  | `shutdown_waiting_for_adoptions` | INFO | `waited`, `detail` | Shutdown has waited 2 s for the adoption, repair and reconcile goroutines: a commit already running is never cancelled and may take up to its 5-minute bound; other work stops at its next cancellation point (adoptions in the flip barrier were abandoned at the signal). Logged once per shutdown. |
 +| `freshness: anchorless index over its size cap` | WARN | `canonical_host`, `suite_path`, `max_bytes`, `suppressed` | An anchorless refresh (spec C4 Dispatch 4) got a 200 over 64 MiB (`max_bytes`) for at least one of the suite's cached flat indexes: each such file stays as it was, unanswered. At most one line a minute for the whole process (the line names the check that logged it); `suppressed` counts the checks since the last line that hit the cap too. |
-+| `freshness: delete anchorless rows failed` | WARN | `err`, `canonical_host`, `suite_path` | An anchorless refresh could not delete the cached files upstream answered 404 or 410 (or a plain `Contents-*` whose bytes changed); they stay until a later check deletes them. The check is answered or failed as its answers say all the same. |
-+| `flat_host_root_unsupported` | WARN | `canonical_host`, `path`, `suppressed`, `detail` | A client asked for a flat repository's file at the host root (`deb https://host/ ./` or `deb https://host/ /`: `/InRelease`, `/./Packages.gz`, `/by-hash/SHA256/…`; spec C2). Such a repository is no suite: it is served from the ordinary cache (`detail` says so) and never refreshed, adopted or vouched. At most one line a minute for the whole process; `suppressed` counts the requests since the last line. |
++| `freshness: delete anchorless rows failed` | WARN | `err`, `canonical_host`, `suite_path` | An anchorless refresh could not delete the cached files upstream answered 404 or 410 (or a plain `Contents-*` whose bytes changed); they stay until a later check deletes them. A failed delete is no answer: its 404s and 410s stop counting, so a check they alone answered fails (`freshness check failed`, form `anchorless`; `err` starts `every anchorless index request ended unknown: delete anchorless rows:`, or, for a check that sent no index request, `delete anchorless rows:`). |
++| `flat_host_root_unsupported` | WARN | `canonical_host`, `path`, `suppressed`, `detail` | A client asked for a flat repository's file at the host root (`deb https://host/ ./` or `deb https://host/ /`: `/InRelease`, `/./Packages.gz`, `/by-hash/SHA256/…`; spec C2). Such a repository is no suite: it is served from the ordinary cache (`detail` says so) and never refreshed, adopted or vouched. At most one line a minute for the whole process; `suppressed` counts the requests since the last line. A request to a host the allowlist forbids never logs it (its miss is refused 403). |
  | `suite_seed_rejected` | WARN | `canonical_host`, `suite_path`, `cap` (`global_cap`, `host_cap`), `max_suites`, `suppressed`, `detail` | A suite was refused a row by `freshness.max_suites`: it is served but will not refresh; retried after 10 minutes (`detail` = `suite will not refresh`). At the total cap while every suite that could have been evicted was busy — being checked or adopted, or evicted for another new suite — the refusal is transient: `detail` = `eviction candidates busy; retried after 1 minute`, and the suite is retried after a minute. At most one line a minute; `suppressed` counts the refusals since the last line. |
  | `suite_evicted` | INFO | `canonical_host`, `suite_path` (the evicted suite), `for_host`, `for_suite` | At or above the global cap, a suite with no adopted snapshot that had not been requested for 24 hours was evicted for a new one; its signed-seen records survive, moved up to the time of the eviction (as for `suite_reaped`). Above the cap (after `freshness.max_suites` was lowered, or after an upgrade) the new suite is still refused (`suite_seed_rejected`) until the table is back under the cap. |
  | `suite_caps_exceeded` | WARN | `suites`, `max_suites`, `hosts_at_cap`, `per_host_cap`, `fullest_host`, `fullest_host_suites` | At start, the suite table holds more than `freshness.max_suites` suites (a lowered `max_suites`, or an upgraded cache), or a host holds a tenth of it or more: new suites — for a host at its cap, that host's — are refused. Above the total cap each refused attempt still evicts one suite idle for 24 hours, so the table shrinks back; a host at its cap evicts nothing for its own new suites; its suites go when the suite reaper removes those not requested for `gc.suite_idle_ttl`, or when total-cap eviction for any host's new suite picks one of its idle suites. Not logged for a table at exactly the total cap: that is normal operation for a full cache, where a new suite evicts an idle one (no adopted snapshot, not requested for 24 hours) and is refused only when none qualifies (`suite_seed_rejected`). Logged once per start. |
@@ -11006,11 +12970,11 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
  | `admin: forget failed` | WARN | `err`, `scheme`, `canonical_host`, `suite_path` | `POST /forget` failed on a database error, or its work took longer than 5 minutes, and answered 500. Metadata batches deleted before the error stay deleted (the anchors go last); the request can be repeated (409 then means the suite is gone after all, or busy). A forget whose final delete committed before the error is logged `suite_forgotten` with `settled=true` just before this line when a fresh read then finds the row gone (a read that fails, or lands before a commit still in flight, finds it present: then no such line). Logged at DEBUG instead, and answered 503, when the admin listener began shutting down while the forget ran: shutdown cuts it short. |
  | `signed_seen_markers_swept` | INFO | `count` | The suite reaper's daily sweep (the first a day after the start, then a day apart) deleted `count` signed-seen records whose repository path has no suite row (for it or its `/.` twin, under either scheme) and that were last seen — or a suite of their path last deleted: reaped, evicted at the cap, or forgotten while another suite of the path kept the record — more than 365 days ago, by the clock less the forward steps the reaper detected while running (`clock_step_detected` with `stamp=wall_clock`), so such a step never ages a record. Not logged when it deleted none. |
 -| `suite reaper: list suites failed`, `suite reaper: read suite row failed`, `suite reaper: delete metadata failed`, `suite reaper: reap failed`, `suite reaper: list unadopted anchors failed`, `suite reaper: junk anchor reads failed`, `suite reaper: marker sweep failed` | WARN | `err`; `canonical_scheme`, `canonical_host` and `suite_path` for a suite's step; `metadata_rows` (for `delete metadata failed`: rows deleted before the error); `count`, `canonical_scheme`, `canonical_host` and `path` for the junk anchor reads (how many anchor reads failed in the run's junk scan — a failed read is not remembered, so one unreadable pool file that N suites share counts once for each of them whose scan reaches it, up to N times — and the first: its suite's scheme and host and the anchor's path); `swept` (records deleted before the error) | A step of a suite reaper run failed. A failed listing ends the run: nothing is reaped and nothing swept (a due record sweep runs at the next run); any other failed step leaves the rest of the run to go on: a suite whose step failed — a database error, or its work cut short after 5 minutes — keeps its row and is retried at the next run (the metadata batches deleted before the error stay deleted, the anchors last); a pool file that exists but does not read keeps its suite (a missing one is not logged); the junk scan runs again at the next run, the record sweep the next day. A step that fails because the daemon is stopping is logged at DEBUG instead. |
-+| `suite reaper: list suites failed`, `suite reaper: read suite row failed`, `suite reaper: delete metadata failed`, `suite reaper: reap failed`, `suite reaper: list unadopted anchors failed`, `suite reaper: list unadopted flat indexes failed`, `suite reaper: junk anchor reads failed`, `suite reaper: read signed evidence failed`, `suite reaper: marker sweep failed` | WARN | `err`; `canonical_scheme`, `canonical_host` and `suite_path` for a suite's step; `metadata_rows` (for `delete metadata failed`: rows deleted before the error); `count`, `canonical_scheme`, `canonical_host` and `path` for the junk anchor reads (how many anchor reads failed in the run's junk scan — a failed read is not remembered, so one unreadable pool file that N suites share counts once for each of them whose scan reaches it, up to N times — and the first: its suite's scheme and host and the anchor's path); `count`, `canonical_scheme`, `canonical_host` and `suite_path` for the signed-evidence reads (how many flat suites' reads failed in the run's junk scan, and the first); `swept` (records deleted before the error) | A step of a suite reaper run failed. A failed listing ends the run: nothing is reaped and nothing swept (a due record sweep runs at the next run) — except the flat indexes' (read only in a run that holds a flat suite without a snapshot), which leaves every flat suite without a snapshot unjudged as junk for the run; a failed read of whether a flat suite was seen signed (read only for one its anchor files and its index files judge differently) leaves that suite unjudged for the run; any other failed step leaves the rest of the run to go on: a suite whose step failed — a database error, or its work cut short after 5 minutes — keeps its row and is retried at the next run (the metadata batches deleted before the error stay deleted, the anchors last); a pool file that exists but does not read keeps its suite (a missing one is not logged); the junk scan runs again at the next run, the record sweep the next day. A step that fails because the daemon is stopping is logged at DEBUG instead. |
++| `suite reaper: list suites failed`, `suite reaper: read suite row failed`, `suite reaper: delete metadata failed`, `suite reaper: reap failed`, `suite reaper: list unadopted anchors failed`, `suite reaper: list unadopted flat indexes failed`, `suite reaper: junk anchor reads failed`, `suite reaper: read signed evidence failed`, `suite reaper: marker sweep failed` | WARN | `err`; `canonical_scheme`, `canonical_host` and `suite_path` for a suite's step; `metadata_rows` (for `delete metadata failed`: rows deleted before the error); `count`, `canonical_scheme`, `canonical_host` and `path` for the junk anchor reads (how many anchor or flat index reads failed in the run's junk scan — a failed read is not remembered, so one unreadable pool file that N suites share counts once for each of them whose scan reaches it, up to N times — and the first: its suite's scheme and host and the file's path); `count`, `canonical_scheme`, `canonical_host` and `suite_path` for the signed-evidence reads (how many flat suites' reads failed in the run's junk scan, and the first); `swept` (records deleted before the error) | A step of a suite reaper run failed. A failed listing ends the run: nothing is reaped and nothing swept (a due record sweep runs at the next run) — except the flat indexes' (read only in a run that holds a flat suite without a snapshot), which leaves every flat suite without a snapshot unjudged as junk for the run; a failed read of whether a flat suite was seen signed (read only for one its anchor files and its index files judge differently) leaves that suite unjudged for the run; any other failed step leaves the rest of the run to go on: a suite whose step failed — a database error, or its work cut short after 5 minutes — keeps its row and is retried at the next run (the metadata batches deleted before the error stay deleted, the anchors last); a pool file that exists but does not read keeps its suite (a missing one is not logged); the junk scan runs again at the next run, the record sweep the next day. A step that fails because the daemon is stopping is logged at DEBUG instead. |
  | `suite reaper: suite busy, retried next run` | DEBUG | `canonical_scheme`, `canonical_host`, `suite_path` | A suite the reaper would reap was held — by a check, an adoption, a repair or reconcile, or another deleter (cap eviction, `POST /forget`) — or deleted meanwhile; it is tried again at the next run if it still qualifies, and counts toward the run's budget for its kind (25 `idle` suites; 250 `non_canonical` and `junk` ones). |
  | `handler_goroutine_panicked` | ERROR | `where` (`touch`, `seed_rejections`), `canonical_scheme`, `canonical_host` and `path` (`touch` only), `panic`, `stack` (first occurrence per `where` per process only) | A panic in one of the handler's background goroutines — the touch goroutine, or the cap-rejection cache's sweep timer — was recovered (a bug, please report it). |
  | net/http's own lines: `http: panic serving …`, `http: TLS handshake error from …` and the like | ERROR on the admin listener; WARN on the proxy listeners | none: `msg` is net/http's text — for a panic, `http: panic serving <client address>: <panic>` followed by the stack | The Go HTTP server's own diagnostics, logged through the daemon's structured log at the level each listener sets (left to itself, net/http would write them through Go's standard log package, which the daemon also sends to its log, but at INFO). On the admin listener every such line is ERROR, above all a handler panic net/http recovered: after a `POST /forget` panic, which is logged first as `freshness_check_panicked` with `where=forget`, the request ends without an answer and gets no `admin_request` line. On the proxy listeners (plain and TLS) they are WARN, a TLS handshake error included. |
-@@ -322,7 +367,7 @@ daemon's `main`).
+@@ -322,7 +370,7 @@ daemon's `main`).
  | `suite signed-seen backstop read failed` | WARN | `err`, `canonical_host`, `suite_path`, `path` | After creating a suite's row, the handler's second read of a cached signed anchor (see `suite cached anchor read failed`; also run when the anchor changed during the creation) failed — its `url_path` row (within the backstop's 5 s bound, which covers its database steps; after onboarding the bound is shared with the creation, and on a miss it ends at most 25 s after the request arrived) or its pool file (a local read of a few KiB, not bounded); an absent row is not logged. The response is served; the anchor stays unmarked until the startup pass marks it at the next start. |
  | `snapshot_member_blob_missing` | WARN | `canonical_host`, `path`, `snapshot_id`, `blob_hash`, `snapshot_displaced` (present for a displaced snapshot's member) | A snapshot member's pool file is gone: a current member is re-fetched and checked against its declared hash; a displaced one (retained by-hash) answers 404. |
  | `pool_corruption_during_adoption` | WARN | a member that declares a SHA256: `canonical_host`, `suite_path`, `path`, `declared_sha256`, `actual_sha256`; a member the Release declares by SHA512 only: `canonical_host`, `suite_path`, `path`, `declared_sha512`, `derived_sha256` (the SHA-256 of the fetched bytes, verified against `declared_sha512`), `actual_sha256`; an anchor or index the adoption stores from memory: `hash`, `actual_sha256`, `context` (`writeBlobBytes`) | An adoption was about to reuse a pool file whose bytes no longer hash to its name (corrupted at rest). The file is evicted and replaced by freshly verified bytes; it is never bound to the snapshot, and the `.deb` hashes it declares never vouch. A SHA512-only member is fetched at every adoption, and an existing pool file under its derived SHA-256 is re-hashed before it is kept. Counted by `acu_pool_corruption_during_adoption_total`. |
@@ -11023,7 +12987,7 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
 
 - [ ] **Step 3: `suites[].flat` (`docs/admin-ui-spec.md` §4.5) and the conffile**
 
-§4.5 gains `flat`; `check_fail_count` names the anchorless failed check (M-7) and PG-1's refusal; the Suites empty-state copy names a flat repository's root `Packages` or `Sources` (M-10). The conffile's `refuse_unvouched_debs` comment states the rule for flat snapshots, and its `adopt_unsigned` comment PG-1:
+§4.5 gains `flat`; `check_fail_count` names the anchorless failed check (M-7) and PG-1's refusal; the Suites empty-state copy names a flat repository's root `Packages` or `Sources` (M-10). The conffile's `refuse_unvouched_debs` comment states the rule for flat snapshots, and its `adopt_unsigned` comment PG-1. From the fix round: `flat` is a canonical suite path, and its tag is not selectable (`user-select: none`), so copying the Suite path cell copies the path alone:
 
 ```diff
 diff --git a/docs/admin-ui-spec.md b/docs/admin-ui-spec.md
@@ -11033,7 +12997,7 @@ diff --git a/docs/admin-ui-spec.md b/docs/admin-ui-spec.md
  | Field | Type | Meaning |
  |---|---|---|
  | `scheme` | string | The suite's canonical scheme, `http` or `https` (phase F, ruling PF-7): a repository can be tracked under both, as two rows with the same `host` and `suite_path`, and `POST /forget` (`docs/configuration.md`, *Forgetting a suite*) takes it, defaulting to `https`. The Suites table's Host column shows it as `scheme://host`. |
-+| `flat` | boolean | `true` for a flat repository's suite — a suite path with no `dists` segment, its `./` twin included (spec C2) — and `false` for a `dists/` suite (phase G). The Suites table's Suite path cell shows a neutral `flat` badge after the path. |
++| `flat` | boolean | `true` for a flat repository's suite — a canonical suite path with no `dists` segment, its `./` twin included (spec C2) — and `false` for a `dists/` suite (phase G). The Suites table's Suite path cell shows a neutral `flat` badge after the path. The tag is not selectable (`user-select: none`), so copying the Suite path cell — as `/forget`'s 409 asks — copies the path alone. |
  | `anchor_form` | string | The current snapshot's anchor form — `inline`, `detached` or `unsigned` (a `Release` no signature covers: it vouches no `.deb`); empty when the suite has no current snapshot. |
  | `last_requested_unixtime` | int64 or `null` | When a client last showed interest in the suite (spec C3): written when the suite's row is created, then by coalesced touches — at most one write per suite per hour — from serves of its anchors (`InRelease`, `Release`, `Release.gpg`; status below 400, 304 and HEAD included), of its flat indexes, and of `.deb`s its current snapshot vouched for. Index requests such as `Packages.gz` never move it. It decides cap eviction: at the `freshness.max_suites` cap, a suite with no current snapshot whose stamp is 24 hours old or more can be evicted for a new one (`suite_evicted`). |
 -| `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, which also records `anchor_absent`; a signature the check found but could not record as seen). An unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled`, not a failed check. Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. |
@@ -11090,7 +13054,7 @@ diff --git a/packaging/config/config.toml.default b/packaging/config/config.toml
 
 - [ ] **Step 4: Spec revision 10**
 
-The revision line records the rulings and choices — R-G1–R-G5 (R-G2 as amended by PG-7), deviations 1 and 2, and after the plan reviews PG-1, PG-2, PG-5's counter rename, PG-7, PG-8, M-1–M-4, M-6–M-8, M-10 and PG-13; C2 states the WARN's rate limit; C3 residual 4; C4 Dispatch 3 states the gate (deviation 1) and PG-1's refusal after it, Dispatch 4 the refresh as built (deviation 2, the order, the body slots, the cap, the monotonic stamp, the content-answer rule and results, the delete compare, the record, residual 3, R-G3), and C4's sentence on stamps that lead the clock gains `last_fetched_at` (M-8); C5 the only-dots Filename, R-G1 and PG-1 at safeguard 1; C6 the keyed join (M-2) and residuals 1 and 2; C9 R-G2 as amended by PG-7, and R-G5; C10 PG-2; C11 the metric and the constants (M-10):
+The revision line records the rulings and choices — R-G1–R-G5 (R-G2 as amended by PG-7), deviations 1 and 2, and after the plan reviews PG-1, PG-2, PG-5's counter rename, PG-7, PG-8, M-1–M-4, M-6–M-8, M-10 and PG-13; C2 states the WARN's rate limit; C3 residual 4; C4 Dispatch 3 states the gate (deviation 1) and PG-1's refusal after it, Dispatch 4 the refresh as built (deviation 2, the order, the body slots, the cap, the monotonic stamp, the content-answer rule and results, the delete compare, the record, residual 3, R-G3), and C4's sentence on stamps that lead the clock gains `last_fetched_at` (M-8); C5 the only-dots Filename, R-G1 and PG-1 at safeguard 1; C6 the keyed join (M-2) and residuals 1 and 2; C9 R-G2 as amended by PG-7, and R-G5; C10 PG-2; C11 the metric and the constants (M-10). The fix round extends revision 10's entry "after the phase G task reviews (rulings PG-19–PG-24)" (ruling PG-27): C2 the host-root line's allowlist condition; C4 Dispatch 3 PG-20's probe URLs and "no index file is requested" with the knob off; Dispatch 4 the anchors' blobs read before the probe (M3), a failed delete as no answer (M4), the refresh's read fault (M5) and residual 5 (M6); C5 a gap Filename counted, never validated; C11 `flat` no log field (PG-23):
 
 ```diff
 diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/docs/superpowers/specs/2026-09-27-flat-repositories-design.md
@@ -11100,11 +13064,11 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  # Flat repositories, eager adoption, and suite lifecycle — design
  
 -- **Date:** 2026-09-27 (revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9), task reviews (rulings PF-10, PF-11) and the final review (rulings PF-12–PF-15): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); a hand edit that adds one field to one log line touches that function, not the whole file, for the deferred-minor rule (PF-11); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503); after the phase F final review: before it retires a suite's snapshots, every suite-row delete turns never-downgrade's snapshot clause into a marker — when the suite has an adopted, non-retired inline or detached snapshot it upserts its base's marker under the suite's scheme, the one marker a delete creates (PF-12); a forward step the reaper detects never ages a marker (the sweep's cutoff takes off every step detected since the reaper started), and the first sweep is due a day after the reaper starts, so a start with the clock ahead has a day to be corrected (PF-13); the classes reaped regardless of idleness have their own budget of 250 a run, tried first, beside the 25 idle suites (PF-14); the startup GC pass runs no sub-job C (PF-15); a reaped suite's packages lose the version retention its snapshot gave them; a `/forget` panic is logged with its suite (`where=forget`), and a forget whose writer call failed after its commit is logged (`suite_forgotten`, `settled=true`) when a fresh read finds the row gone; revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
-+- **Date:** 2026-09-27 (revision 10, 2026-10-20/21: phase G plan rulings — a `Packages` file with no SHA256 stanza parses and adopts with incomplete coverage (`no_sha256`), and a body with no stanza naming a `Filename` still fails its parse (R-G1); every writer of a `url_path` row's `last_fetched_at` stamps it after the pool file is final, so the first adoption's `adopted_at` floor stays above the `max(pool mtime, last_fetched_at)` `Last-Modified` of url_path-served metadata, and blob mtimes are not folded into that floor (R-G3); the anchorless gate is signed evidence — the cached signed-anchor re-mark, then never-downgrade's rule — not every sniff-passing anchor row (phase G deviation 1); a plain `Contents-*` that changed is deleted, not kept, in the anchorless refresh (phase G deviation 2); the anchorless body cap is 64 MiB; a replaced row's `last_fetched_at` is `MAX(now, previous + 1)`; `flat_host_root_unsupported` is a WARN, one line a minute for the process with a `suppressed` count; a Filename made only of `.` segments is refused; `suites[].flat`; after the phase G plan reviews (rulings PG-1–PG-18): with `adopt_unsigned` off, a suite the anchorless gate admits is refused as an unsigned candidate is — the record `unsigned_disabled`, a successful check logged `changed_deferred` with form `anchorless`, paced by its record, no request and no delete — so a Release-less flat repository is served as first cached; the gate runs before the knob (PG-1, PG-10, PG-17); a Debian pool artifact (`.deb`, `.udeb`, `.ddeb`, `.dsc`, `.buildinfo`, `.changes`, `.diff.gz`, or a name with `_` and a `.tar.` component) is never metadata, so strict mode vouches and refuses an `icons-foo_1.0_all.deb` like any `.deb` (PG-2, PG-16); the sniff counter is `acu_anchorless_sniff_rejected_total{host}`, renamed from C4's first `anchorless_sniff_rejected` (PG-5); a flat suite whose base has no signed evidence is judged junk on its cached anchor rows and root `Packages*`/`Sources*` rows together — junk only when it has at least one such row and every one is junk evidence — while a flat suite with signed evidence, like every `dists/` suite, is judged by its anchors alone; the signed-evidence read is lazy, per candidate, a read error gives no verdict for the run, and the index rows are read only in a run that has an unadopted flat suite (R-G2 as amended by PG-7, R-G5); at most two anchorless bodies are in memory at once for the process (PG-8); an anchorless check is answered — a success that clears the record and the pending change — when an index request got a content answer (a 304, a 200 stored or matching the cached bytes, a 404 or 410) or when the suite has no index row to ask for, and is a failed check otherwise: a sniff-rejected 200, a changed plain `Contents-*`, a 401 or a 403 is no content answer (design review M-7, PG-12, PG-15); the refresh asks `Packages*`, then `Sources*`, then `Contents-*` (M-3), stores only the changed validators of a 200 with the cached bytes, a plain `Contents-*`'s too (M-1), deletes a row only while it holds the blob the refresh read (M-4), and logs its over-cap WARN at most once a minute for the process with a `suppressed` count (M-6); a replaced row's `last_fetched_at` can lead the clock as `adopted_at` can (M-8); the package-hash lookups join the suite's `suite_freshness` row by its key (M-2); C11's constants name the body cap, the two body slots and the two one-a-minute WARNs (M-10); the residuals of C3, C4 and C6 — constraints across a host's tenants, the twins' conflict window, an upstream that answers 403 for a missing key, an empty plain `Packages` — are documented, with no twin tiebreak (PG-13); revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9), task reviews (rulings PF-10, PF-11) and the final review (rulings PF-12–PF-15): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); a hand edit that adds one field to one log line touches that function, not the whole file, for the deferred-minor rule (PF-11); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503); after the phase F final review: before it retires a suite's snapshots, every suite-row delete turns never-downgrade's snapshot clause into a marker — when the suite has an adopted, non-retired inline or detached snapshot it upserts its base's marker under the suite's scheme, the one marker a delete creates (PF-12); a forward step the reaper detects never ages a marker (the sweep's cutoff takes off every step detected since the reaper started), and the first sweep is due a day after the reaper starts, so a start with the clock ahead has a day to be corrected (PF-13); the classes reaped regardless of idleness have their own budget of 250 a run, tried first, beside the 25 idle suites (PF-14); the startup GC pass runs no sub-job C (PF-15); a reaped suite's packages lose the version retention its snapshot gave them; a `/forget` panic is logged with its suite (`where=forget`), and a forget whose writer call failed after its commit is logged (`suite_forgotten`, `settled=true`) when a fresh read finds the row gone; revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
++- **Date:** 2026-09-27 (revision 10, 2026-10-20/21: phase G plan rulings — a `Packages` file with no SHA256 stanza parses and adopts with incomplete coverage (`no_sha256`), and a body with no stanza naming a `Filename` still fails its parse (R-G1); every writer of a `url_path` row's `last_fetched_at` stamps it after the pool file is final, so the first adoption's `adopted_at` floor stays above the `max(pool mtime, last_fetched_at)` `Last-Modified` of url_path-served metadata, and blob mtimes are not folded into that floor (R-G3); the anchorless gate is signed evidence — the cached signed-anchor re-mark, then never-downgrade's rule — not every sniff-passing anchor row (phase G deviation 1); a plain `Contents-*` that changed is deleted, not kept, in the anchorless refresh (phase G deviation 2); the anchorless body cap is 64 MiB; a replaced row's `last_fetched_at` is `MAX(now, previous + 1)`; `flat_host_root_unsupported` is a WARN, one line a minute for the process with a `suppressed` count; a Filename made only of `.` segments is refused; `suites[].flat`; after the phase G plan reviews (rulings PG-1–PG-18): with `adopt_unsigned` off, a suite the anchorless gate admits is refused as an unsigned candidate is — the record `unsigned_disabled`, a successful check logged `changed_deferred` with form `anchorless`, paced by its record, no request and no delete — so a Release-less flat repository is served as first cached; the gate runs before the knob (PG-1, PG-10, PG-17); a Debian pool artifact (`.deb`, `.udeb`, `.ddeb`, `.dsc`, `.buildinfo`, `.changes`, `.diff.gz`, or a name with `_` and a `.tar.` component) is never metadata, so strict mode vouches and refuses an `icons-foo_1.0_all.deb` like any `.deb` (PG-2, PG-16); the sniff counter is `acu_anchorless_sniff_rejected_total{host}`, renamed from C4's first `anchorless_sniff_rejected` (PG-5); a flat suite whose base has no signed evidence is judged junk on its cached anchor rows and root `Packages*`/`Sources*` rows together — junk only when it has at least one such row and every one is junk evidence — while a flat suite with signed evidence, like every `dists/` suite, is judged by its anchors alone; the signed-evidence read is lazy, per candidate, a read error gives no verdict for the run, and the index rows are read only in a run that has an unadopted flat suite (R-G2 as amended by PG-7, R-G5); at most two anchorless bodies are in memory at once for the process (PG-8); an anchorless check is answered — a success that clears the record and the pending change — when an index request got a content answer (a 304, a 200 stored or matching the cached bytes, a 404 or 410) or when the suite has no index row to ask for, and is a failed check otherwise: a sniff-rejected 200, a changed plain `Contents-*`, a 401 or a 403 is no content answer (design review M-7, PG-12, PG-15); the refresh asks `Packages*`, then `Sources*`, then `Contents-*` (M-3), stores only the changed validators of a 200 with the cached bytes, a plain `Contents-*`'s too (M-1), deletes a row only while it holds the blob the refresh read (M-4), and logs its over-cap WARN at most once a minute for the process with a `suppressed` count (M-6); a replaced row's `last_fetched_at` can lead the clock as `adopted_at` can (M-8); the package-hash lookups join the suite's `suite_freshness` row by its key (M-2); C11's constants name the body cap, the two body slots and the two one-a-minute WARNs (M-10); the residuals of C3, C4 and C6 — constraints across a host's tenants, the twins' conflict window, an upstream that answers 403 for a missing key, an empty plain `Packages` — are documented, with no twin tiebreak (PG-13); after the phase G task reviews (rulings PG-19–PG-24): a flat suite active only through a client-created root index row, with no cached anchor row to model its probes on, probes its `InRelease` and `Release` at sibling URLs of that row's stored `upstream_url`, so a non-default port survives (PG-20); the anchorless refresh deletes a cached `InRelease` or `Release` only while it holds the blob read before the probe tree ran, so a client's fetch during the probe is kept (PG-24); a delete that fails is no answer — its 404s and 410s stop counting, so a check they alone answered fails (PG-24); a read error of the refresh's index rows is a local fault, logged with nothing written and no backoff (PG-24); an unchanged plain `Contents-*` answers the check without a sniff, so a captive portal's page cached as one answers it during the outage — a documented residual (PG-24); `flat` is the admin `suites[]` field, not a new log field (PG-23); `flat_host_root_unsupported` is logged only for a host the allowlist admits; a `Packages` stanza's Filename without a SHA256 is counted for `no_sha256`, never validated, and becomes no row, path or log value; revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9), task reviews (rulings PF-10, PF-11) and the final review (rulings PF-12–PF-15): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); a hand edit that adds one field to one log line touches that function, not the whole file, for the deferred-minor rule (PF-11); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503); after the phase F final review: before it retires a suite's snapshots, every suite-row delete turns never-downgrade's snapshot clause into a marker — when the suite has an adopted, non-retired inline or detached snapshot it upserts its base's marker under the suite's scheme, the one marker a delete creates (PF-12); a forward step the reaper detects never ages a marker (the sweep's cutoff takes off every step detected since the reaper started), and the first sweep is due a day after the reaper starts, so a start with the clock ahead has a day to be corrected (PF-13); the classes reaped regardless of idleness have their own budget of 250 a run, tried first, beside the 25 idle suites (PF-14); the startup GC pass runs no sub-job C (PF-15); a reaped suite's packages lose the version retention its snapshot gave them; a `/forget` panic is logged with its suite (`where=forget`), and a forget whose writer call failed after its commit is logged (`suite_forgotten`, `settled=true`) when a fresh read finds the row gone; revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
  - **Status:** draft for maintainer review
  - **Branch:** `feature/flat-repos` (from `main` @ 536a1ab)
  - **Origin:** reimplementation of the problem reported in PR #8 ("Refresh flat
-@@ -247,8 +247,10 @@ other paths `D/<member>` where `<member>` matches exactly one of
+@@ -247,8 +247,11 @@ other paths `D/<member>` where `<member>` matches exactly one of
  the suite is the **literal** directory `D`. `D` must satisfy the predicate
  except that it may end in exactly one `/.` (the `deb <uri> ./` form: suite
  `/repo/.`, member `Packages.gz`). `D` must not be the host root (`/`, `/.`,
@@ -11113,11 +13077,12 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +empty): unsupported, served through Phase 1, and logged by
 +`flat_host_root_unsupported` — a WARN, at most one line a minute for the
 +process, whose `suppressed` counts the requests since the last line
-+(phase G, design note 2).
++(phase G, design note 2), and only for a host the allowlist admits (a
++forbidden host's miss is refused 403).
  
  Not covered, documented as served through Phase 1 only: flat Translation
  files (apt's flat key is `$(LANGUAGE)`: files named `en`, `en.xz`),
-@@ -267,6 +269,12 @@ sources).
+@@ -267,6 +270,12 @@ sources).
  | `Release.gpg` | armor header `-----BEGIN PGP SIGNATURE-----` as the first non-whitespace text (leading whitespace is accepted; leading non-header lines, which gpg tolerates, are rejected), or a binary OpenPGP signature packet: old-format tag byte 0x88–0x8B or new-format 0xC2, whose body — at the offset its length header gives (old format: one, two or four length octets, none for the indeterminate type; new format: one octet below 192, two for 192–223, five for 255, one for a partial length) — starts with a signature version 3–6 (phase D, ruling PD-10: text starting with a UTF-8 lead byte, such as "©" or U+00A0, does not pass) |
  | flat `Packages*`/`Sources*` | the compression magic for the extension, or plain text starting `Package:`/`Package: ` (`Sources`: `Package:` too) |
  
@@ -11130,7 +13095,20 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  **Single creation choke point.** `createSuiteTx` (`internal/cache`),
  reached through `cache.CreateSuite` (hits) and `cache.StoreFetched`
  (misses), is the **only** `INSERT INTO suite_freshness`: create-only (an
-@@ -706,27 +714,71 @@ unchanged, observation only):
+@@ -693,7 +702,11 @@ unchanged, observation only):
+    as interest, one further ahead is dormant until a client touches the
+    suite (design review M-3). Of the anchor rows only `InRelease` and
+    `Release` count (apt fetches `Release.gpg` only after `Release`; phase
+-   E, design notes 13 and 14). A returning client's first request may find
++   E, design notes 13 and 14). A flat suite active only through a
++   client-created root index row, with no cached anchor row to model its probe
++   URLs on, has its `InRelease` and `Release` probed at sibling URLs of that
++   index row's stored `upstream_url` (C1), so a non-default port survives
++   (phase G ruling PG-20). A returning client's first request may find
+    its suite still dormant (its touch and its T1 run concurrently); the
+    next tick checks it, within one tick of that request (M-12). A suite
+    whose record is active and not due is paced: while its last check is
+@@ -706,27 +719,83 @@ unchanged, observation only):
     - `InRelease` *present* → inline request;
     - `InRelease` *absent* → `Release`: *present* → `Release.gpg`: *present* →
       detached request; *absent* → unsigned candidate (C5);
@@ -11148,9 +13126,9 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +     an unsigned candidate is (C5 safeguard 1; phase G ruling PG-1): the
 +     record `unsigned_disabled` (keyed as an `anchor_absent` record is), a
 +     successful check logged `changed_deferred` with form `anchorless`,
-+     paced by its record, with no request and no delete — the knob is read
-+     after the evidence gate, so a suite with signed evidence is the
-+     failed check below whatever the knob. Every other suite: a failed
++     paced by its record; no index file is requested and nothing is deleted —
++     the knob is read after the evidence gate, so a suite with signed evidence
++     is the failed check below whatever the knob. Every other suite: a failed
 +     check, which extends `check_fail_count`: a suite with nothing
       to serve backs off like an *unknown* end (phase E, design note 19), and
       records the refusal state `anchor_absent`, so the status page shows it
@@ -11195,20 +13173,32 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +   `MAX(now, previous + 1)`, after the blob is in the pool. Cached
 +   `InRelease`/`Release` rows under the suite whose probe answered 404/410
 +   are deleted (the probes' own answers, no other request); every delete
-+   applies only while the row still holds the blob the refresh read, so a
-+   client's newer fetch is kept. Only a content answer counts (phase G ruling
-+   PG-12): a 304 to a request with validators, a 200 stored or matching the
-+   cached bytes, a 404/410 — a 401, a 403, a sniff-rejected 200 (a captive
-+   portal, even one whose page is the cached bytes) and a changed plain
-+   `Contents-*` are none. The check is answered — `anchorless_refreshed` when
-+   a row was replaced or deleted, `anchorless_unchanged` otherwise, form
-+   `anchorless` — when at least one index request got a content answer, or
-+   when the suite has no cached index row to ask for (its anchors' 404s still
-+   apply); when its requests got none it is a failed check, which backs off;
-+   an answered check is a success that clears the suite's failure or refusal
-+   record and its pending change. An upstream that answers 403 for a missing
-+   key (S3, CloudFront) keeps an index the repository removed cached and
-+   served (phase G, residual 3). No snapshot, no vouching, no strict-mode
++   applies only while the row still holds the blob the refresh read — for the
++   cached `InRelease` and `Release`, the blob read before the probe tree ran —
++   so a client's newer fetch, one during the probe's window included, is kept.
++   Only a content answer counts (phase G ruling PG-12): a 304 to a request
++   with validators, a 200 stored or matching the cached bytes, a 404/410 — a
++   401, a 403, a sniff-rejected 200 (a captive portal, even one whose page is
++   the cached bytes) and a changed plain `Contents-*` are none. A delete that
++   fails is no answer: its 404s and 410s stop counting, so a check they alone
++   answered — no index request, or every content answer a delete — fails. The
++   check is answered — `anchorless_refreshed` when a row was replaced or
++   deleted, `anchorless_unchanged` otherwise, form `anchorless` — when at
++   least one index request got a content answer, or when the suite has no
++   cached index row to ask for (its anchors' 404s still apply); when its
++   requests got none it is a failed check, which backs off; an answered check
++   is a success that clears the suite's failure or refusal record and its
++   pending change. A read error of the suite's cached index rows is a local
++   fault, as a read error of its anchor rows before the probe tree is: logged
++   at WARN, no index request, nothing written and no backoff; the next check
++   tries again (phase G ruling PG-24). An upstream that answers 403 for a
++   missing key (S3, CloudFront) keeps an index the repository removed cached
++   and served (phase G, residual 3); an unchanged plain `Contents-*` counts as
++   a content answer without a sniff, so a captive portal's page that a
++   client's miss cached as a plain `Contents-<arch>`, and that the portal
++   still serves, answers the check (`anchorless_unchanged`) during the
++   outage; flat repositories rarely publish a plain `Contents-*` (phase G,
++   residual 5). No snapshot, no vouching, no strict-mode
 +   effect. If a `Release`/`InRelease` later becomes *present*, the suite
 +   moves to the normal forms. `url_path`-served metadata (a hit, a miss, a
 +   stale serve) uses `max(pool mtime, last_fetched_at)` as `Last-Modified`,
@@ -11219,7 +13209,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  
  **Adoption capacity.** Adoption, repair and reconcile obey one discipline.
  Before spawning the goroutine the check `TryAcquire`s the global slot
-@@ -794,7 +846,11 @@ bounds itself and logs directly (C9). Touch coalescing and all in-memory
+@@ -794,7 +863,11 @@ bounds itself and logs directly (C9). Touch coalescing and all in-memory
  timing use monotonic time. Since C8's monotonic stamp, `adopted_at` can
  legitimately lead the clock (by 1 s per same-second flip, by up to a
  backward step's length after one); no gate reads it as a past event today,
@@ -11232,17 +13222,21 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  
  New `freshness_check` result values: `first_adoption`,
  `first_adoption_queued`, `changed_deferred`, `changed_queued`,
-@@ -830,7 +886,8 @@ Filenames only; `ParseRelease` keeps `validateMemberPath`):
+@@ -830,7 +903,12 @@ Filenames only; `ParseRelease` keeps `validateMemberPath`):
    (literal bytes; C1 re-encodes it upstream; requests are compared after one
    decode);
  - reject, fatal as today: empty, absolute, NUL, control bytes, backslash,
 -  `?`, `#`, `..` segment, empty segment, length > 4096.
 +  `?`, `#`, `..` segment, empty segment, length > 4096, and a Filename made
 +  only of `.` segments (it names no file; phase G design note 5).
++
++A stanza's Filename without a SHA256 is counted for `no_sha256`, not
++validated: it becomes no row, no path and no log value (phase G, the Task 3
++review).
  
  **Hash blocks.** `ParseRelease` merges hash blocks per member path, as apt
  does: `ReleaseMember` carries `SHA256` and `SHA512`; the size comes from the
-@@ -840,7 +897,10 @@ verifies the fetched bytes against **every** declared SHA256/SHA512 hash,
+@@ -840,7 +918,10 @@ verifies the fetched bytes against **every** declared SHA256/SHA512 hash,
  returns the SHA256 of the verified bytes (a *derived* anchor for SHA512-only
  members; controlling it needs a SHA512 preimage) and the by-hash alias paths
  for **every** declared algorithm. A Packages stanza with a Filename but no
@@ -11254,7 +13248,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  Limitation (documented): integrity-skipped SHA512-only members are not
  recorded for skip-repair; reconcile still heals requestable IndexTargets.
  SHA512 is verified before the bytes reach the pool; a SHA512-only member
-@@ -943,7 +1003,11 @@ upgrade (§6.1).
+@@ -943,7 +1024,11 @@ upgrade (§6.1).
     files (phase F, ruling PF-5, which drops R-F4's retirement into the ordinary
     cache: there each index file would be frozen at its own first fetch,
     so every upstream publish would bring Hash Sum mismatches that never
@@ -11267,7 +13261,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  2. Eligible only when `InRelease` and `Release.gpg` are both *absent* and
     `Release` is *present*. The **transition into** unsigned (a suite with no
     current snapshot) needs two observations of the same `Release` bytes at
-@@ -1050,7 +1114,10 @@ only; it returns the suite path with each row:
+@@ -1050,7 +1135,10 @@ only; it returns the suite path with each row:
     split `P' = B + "/" + F` (`B` may be `""`, the host root), query rows with
     `flat_filename <> '' AND flat_filename IN (F…)` on `(scheme, host)` (the
     `<> ''` makes SQLite use the partial index; an `EXPLAIN QUERY PLAN`
@@ -11279,7 +13273,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
     ancestor-or-self of that suite's `FlatBase`
     (`strings.HasPrefix(base+"/", B+"/")`). Among kept rows keep those with
     the longest `B` (the most specific base).
-@@ -1065,6 +1132,20 @@ constraints, not grants: a match only lets bytes through if they hash to a
+@@ -1065,6 +1153,20 @@ constraints, not grants: a match only lets bytes through if they hash to a
  signed declaration. Parent-base repos pay the fallback query on every `.deb`
  hit.
  
@@ -11300,7 +13294,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  **Consumers.** Hit validation, miss validation and strict mode go through
  `DeclaredHashesForPath`. Hot prefetch and the retention mirror rule join on
  the exact path, so they cover flat repos whose `.deb`s sit under the suite
-@@ -1340,7 +1421,24 @@ plain-text suite that adopts unsigned through `Release` (C5), not junk;
+@@ -1340,7 +1442,24 @@ plain-text suite that adopts unsigned through `Release` (C5), not junk;
  any other sniff-failing anchor is evidence whatever the suite's adoption
  record — a failed adoption's record would otherwise keep an HTML anchor
  served for good, since an unadopted suite's metadata is never
@@ -11326,7 +13320,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  read at most 64 KiB per anchor on the reaper's goroutine, and each verdict
  is kept per anchor blob until the next scan. For each candidate: hold the
  suite through the checker's `SuiteGuard` (`HoldSuite` `TryLock`s the
-@@ -1492,7 +1590,15 @@ signed non-retired snapshot on the host has complete coverage (PR #8's
+@@ -1492,7 +1611,15 @@ signed non-retired snapshot on the host has complete coverage (PR #8's
  directory scoping is not reimplemented). Unsigned snapshots, anchorless
  suites and seeded-but-unadopted suites never count and never vouch. Flat
  snapshots now normally have complete coverage, so strict mode protects flat
@@ -11343,7 +13337,20 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  
  **In-flight adoptions (D10).** The checker tracks in-flight signed adoptions
  per canonical host (an unsigned adoption never vouches, so it is not waited
-@@ -1558,7 +1664,8 @@ gauges `acu_adoption_failing_suites` (C7), `acu_freshness_waiting_for_slot`
+@@ -1548,8 +1675,10 @@ an adoption outcome), `suite_evicted`, `suite_caps_exceeded`,
+ `handler_goroutine_panicked`, `adoption_panicked`, `clock_step_detected`,
+ `flat_host_root_unsupported`, `legacy_snapshot_quarantined`,
+ `legacy_trust_audit_progress`, `legacy_trust_audit_deferred`,
+-`legacy_trust_audit_completed`; new fields `anchor_form`, `flat`,
+-`snapshot_displaced`, `flip_held_ms`. New metrics include the unlabelled
++`legacy_trust_audit_completed`; new fields `anchor_form`,
++`snapshot_displaced`, `flip_held_ms` (`flat` is the admin `suites[]` field,
++C7, not a log field: every suite line's `suite_path` shows the layout;
++phase G ruling PG-23). New metrics include the unlabelled
+ gauges `acu_adoption_failing_suites` (C7), `acu_freshness_waiting_for_slot`
+ (suites waiting for an adoption slot, C4) and `acu_flip_barrier_active`
+ (flips in the C8 barrier now), the C3 pair
+@@ -1558,7 +1687,8 @@ gauges `acu_adoption_failing_suites` (C7), `acu_freshness_waiting_for_slot`
  phase E's `acu_repair_deferred_total{host}` and
  `acu_strict_adoption_waits_total{host}`, and phase F's unlabelled counter
  `acu_gc_retired_reaped_total` and `acu_suites_reaped_total{reason}` (three
@@ -11353,7 +13360,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  New metrics carry no suite labels: they are unlabelled, host-labelled or,
  for `acu_suites_reaped_total`, labelled by its three reasons. They are
  listed in the metrics inventory comments of `internal/freshness/metrics.go`
-@@ -1593,7 +1700,10 @@ deadline 2 min; check workers 4; interest window 7 d; orphan-marker TTL
+@@ -1593,7 +1723,10 @@ deadline 2 min; check workers 4; interest window 7 d; orphan-marker TTL
  365 d; cap-rejection cache 10 min (1 min for
  a refusal while every eviction candidate is busy; at most 4,096 suites);
  tracked suite path at most 1024 bytes; legacy-audit anchor
@@ -11369,7 +13376,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 
 - [ ] **Step 5: Overview**
 
-The spec reference becomes revision 10; phase G's row reads "in progress (plan written 2026-10-20, revised 2026-10-21)", as phase F's docs task set its own, and becomes "done (commit …)" after the final review; the G line gains the names as built (PG-1's `anchorlessDisabled`, PG-2's `isPoolArtifact`, PG-7's `suiteJunk` and `hasUnadoptedFlatSuite`, PG-8's `anchorlessBodySlots`) and the rulings PG-1–PG-18; the "**G:**" carry-forward block is deleted, as phases C–F deleted theirs — every item is done (Task 15's DoD map names the tests); H gains phase G's items (the README, a Release-less repository in `e2e/flat`, PG-14's anchorless refresh in `suites[]` and on the status page, the prose WARN names with `suite reaper: read signed evidence failed`). The open decisions gain nothing: PG-1 and PG-2 settle the two the draft added (the knob and the anchorless refresh, `proxy.IsMetadata`'s prefix rule; ruling PG-17), and G-1 (spec §10) stays an open decision outside phase G:
+The spec reference becomes revision 10; phase G's row reads "in progress (plan written 2026-10-20, revised 2026-10-21)", as phase F's docs task set its own, and becomes "done (commit …)" after the final review; the G line gains the names as built (PG-1's `anchorlessDisabled`, PG-2's `isPoolArtifact`, PG-7's `suiteJunk` and `hasUnadoptedFlatSuite`, PG-8's `anchorlessBodySlots`) and the rulings PG-1–PG-18; the "**G:**" carry-forward block is deleted, as phases C–F deleted theirs — every item is done (Task 15's DoD map names the tests); H gains phase G's items (the README, a Release-less repository in `e2e/flat`, PG-14's anchorless refresh in `suites[]` and on the status page, the prose WARN names with `suite reaper: read signed evidence failed`). The open decisions gain nothing: PG-1 and PG-2 settle the two the draft added (the knob and the anchorless refresh, `proxy.IsMetadata`'s prefix rule; ruling PG-17), and G-1 (spec §10) stays an open decision outside phase G. From the fix round: the deferred files' line names `…-G-deferred.md` (IDs `GD-1`…`GD-3`, ruling PG-25), the G line gains what the fix round built and the rulings PG-1–PG-27, H gains the documentation of `adoption_member_skipped` and `snapshot_index_target_404` (the Task 16 review's Minor 8), and PR #8 parity's `..` row says why it stays refused:
 
 ```diff
 diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md b/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md
@@ -11384,6 +13391,15 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md 
  
  ## Global Constraints
  
+@@ -28,7 +28,7 @@
+ - Trust is never inferred from "adopted": only a decodable clearsigned `InRelease` or a verified detached pair is signed. No phase may reintroduce a text fallback in `VerifyInline`, write a signed-seen marker for a plain-text or undecodable anchor, or let a retired snapshot serve, vouch or become current. (Reconcile's own plain-text fallback in `inReleasePlaintext` survives phase A only for test fixtures and is removed in D; production cannot reach it.)
+ - An I/O fault is never evidence: code that removes trust (audit, quarantine, reaping) acts on "file does not exist" or on content it read and checked, and on any other read error defers (leaves the item queued, changes nothing, logs ERROR). Refusing to start is reserved for faults that would misjudge everything (database errors, a missing or empty pool).
+ - **Release boundary (maintainer decision, 2026-10-17):** phases A–H ship together, with other changes, in the 1.1.0 release candidate. Nothing from this branch is released earlier, so no phase needs to be independently releasable; each phase still ends green (tests, lint, gofmt) so the branch stays bisectable. The phase order is unchanged.
+-- Deferred review minors are listed per phase: `2026-09-28-flat-repositories-A-deferred.md` (IDs A-1…A-57), `2026-09-28-flat-repositories-B-deferred.md` (IDs B-1…B-68), `2026-09-28-flat-repositories-C-deferred.md` (IDs C-1…C-40), `2026-09-28-flat-repositories-D-deferred.md` (IDs D-1…D-60), `2026-09-28-flat-repositories-E-deferred.md` (IDs E-1…E-77) and `2026-09-28-flat-repositories-F-deferred.md` (IDs F-1…F-26). Each later phase plan includes the items, from all six files, in files it touches (an item tagged with a phase letter is owned by that phase); phase H sweeps the rest and deletes the six files. Phase H takes F-24 (a pre-existing never-downgrade gap with `gc.keep_displaced = 0`) early.
++- Deferred review minors are listed per phase: `2026-09-28-flat-repositories-A-deferred.md` (IDs A-1…A-57), `2026-09-28-flat-repositories-B-deferred.md` (IDs B-1…B-68), `2026-09-28-flat-repositories-C-deferred.md` (IDs C-1…C-40), `2026-09-28-flat-repositories-D-deferred.md` (IDs D-1…D-60), `2026-09-28-flat-repositories-E-deferred.md` (IDs E-1…E-77), `2026-09-28-flat-repositories-F-deferred.md` (IDs F-1…F-26) and `2026-09-28-flat-repositories-G-deferred.md` (IDs GD-1…GD-3; `GD`, not `G`, so they never collide with spec §10's `G-1`: phase G ruling PG-25). Each later phase plan includes the items, from all seven files, in files it touches (an item tagged with a phase letter is owned by that phase); phase H sweeps the rest and deletes the seven files. Phase H takes F-24 (a pre-existing never-downgrade gap with `gc.keep_displaced = 0`) early.
+ - Every phase-A task must stay justified by PR #8 (its core problem or one of its four limitations), a named maintainer decision, or a confirmed defect; the review-findings table below records the mapping for the 2026-10-05 changes.
+ - Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+ - Credit: the flat-repository problem was reported and first analysed by Venkat (@venkatamutyala) in PR #8, and this work is based on that PR. They are credited in `Contributors.md` (added 2026-10-17, after phase A); every phase keeps that credit and its PR #8 reference.
 @@ -64,7 +64,7 @@ Each phase: write its detailed plan (`2026-09-28-flat-repositories-<letter>-<nam
  | D. Creation bounds and signals | `…-D-creation.md` | C3 (rest: caps, touch, miss-path signed-seen marker, `Release`/flat sniffs) | A | done (commit 3ed0b2b) |
  | E. Eager adoption and anchor forms | `…-E-forms.md` | C4 probe tree, C5 unsigned/SHA512, C10 wait | B, D | done (commit 9ab48c4) |
@@ -11398,7 +13414,7 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md 
  - E: `freshness` probe classification (`classPresent`, `classAbsent`, `classUnknown`), `Adopter.RunUnsigned`, `aptpath.AnchorPaths(form)` (spec C5). E's unsigned candidates set `Form: cache.FormUnsigned` explicitly, and its tests assert that an unsigned adoption stores `anchor_form = 'unsigned'` and vouches no `.deb`. E also resolves the two `AIDEV-TODO(phase E)` raw-SQL readers (url_path GC guard, `CommitAdoption` anchor seed: for `FormUnsigned`, Step 3c seeds `<suite>/Release`, not `/InRelease`). E's docs note the marker denial-of-service residual (spec C5 threat notes) at `adopt_unsigned`. **In-transaction never-downgrade (review finding 5, spec C5):** `CommitAdoption` re-reads the marker for `aptpath.MarkerBase(suite)` inside its writer transaction and refuses an unsigned candidate (no pointer change, no rows) when one exists or the prior current snapshot is signed; E's DoD pauses an eligible unsigned adoption before commit, serves a signed anchor and completes the marker write (also via the `/.` twin, once G exists — E adds the twin variant as a G DoD item), then resumes and asserts refusal. **Upgrade (review findings 2–3):** a phase-A-quarantined plain-text suite (fixture from A's `buildLegacyFixture` shape) adopts in the unsigned form through `Release` with no upstream change and no `unsigned_downgrade_refused`; a never-adopted suite whose signed anchor was served under a v6 binary is refused unsigned adoption on its first post-upgrade check (A's startup pass wrote its marker). As built: `freshness.classify(res, err, sniff, conditional) probeOutcome` (classes `classPresent`, `classAbsent`, `classUnknown`) and the probe tree `runProbeTree`; `(*Adopter).RunUnsigned(ctx, suite, release, etag, lastmod) error` and `(*Adopter).AdoptsUnsigned() bool`; `aptpath.AnchorPaths(form string) []string` and `(*cache.SuiteSnapshot).AnchorHash(name string) *string`; `cache.ErrUnsignedDowngradeRefused` (the refusal inside the commit) and `freshness.ErrAdoptionUnsignedDowngradeRefused`, `ErrAdoptionUnsignedTooLarge`; `(*freshness.Checker).AdoptionsInFlight(host) bool` and `WaitHostAdoptions(ctx, host, start) bool` (the `handler.AdoptionWaiter` the handler gets as `handler.Config.Adoptions`); `config.AdoptionConfig.AdoptUnsigned` and `freshness.AdoptionConfig.AdoptUnsigned`; the `freshness.Cache` method `ListSuitesWithAdoption` (in place of `ListSuites`); the flip barrier's code in `internal/freshness/flip_barrier.go`; the metrics `acu_repair_deferred_total{host}` and `acu_strict_adoption_waits_total{host}`; spec C5's `no_sha256` coverage rule (E fix round 1): the unexported `freshness.parsePackages` reports the stanzas with a `Filename` but no `SHA256` (`ParsePackages` keeps its signature), and `buildPackageHashes` makes such a snapshot's coverage incomplete (`package_coverage_incomplete`, reason `no_sha256`); the stanzas it reports count toward `MaxPackageStanzas`. G's flat parity row that cites it needs no new code for a file that mixes such stanzas with complete ones; a file in which no stanza has a SHA256 is G's open question (below). The `/.` twin variant of the in-commit race test is G's (below).
  - F: `cache.ReapIdleSuite`, admin `POST /forget`. Non-canonical legacy suite rows (`!aptpath.IsCanonicalSuitePath`) are reaped regardless of idleness (spec C9); the plan review found none in production. The reaper's refcount release reuses `decrementSnapshotRefcountsTx`; snapshot GC sub-job C also deletes the snapshots phase A's audit retired, and sub-job B's `keep_displaced` ranking excludes retired rows so they never take retention slots. The reaper sweeps a signed-seen marker only when no suite row exists for its base or `/.` twin and it is older than 365 days. F's DoD includes a signed snapshot adopted under the phase-A binary, reaped by the F binary, then returning: never-downgrade still refuses unsigned adoption (markers outlive reaping). As built: `cache.ReapIdleSuite(ctx, SuiteKey, wantCurrent *int64, cutoff int64) (deleted, gone bool, err error)` (a failed submit settled by a fresh read, and a settled reap logged `suite_reaped` with `settled=true` and counted; every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)`, ruling PF-10, and, before it retires the suite's snapshots, upserts its base's marker under the suite's scheme when the suite has an adopted, non-retired inline or detached snapshot: unexported `markSnapshotHistoryTx`, with never-downgrade's snapshot clause shared as `signedHistorySnapshotSQL`, the one marker a delete creates, ruling PF-12), `cache.ForgetSuite(ctx, SuiteKey, wantCurrent *int64) (ForgetResult{Deleted, Gone, MarkersDeleted, AnchorRowsDeleted, KeptBy}, error)` (with the markers it deletes the cached anchors of the base and its `/.` twin under both schemes, ruling PF-2), `cache.DeleteSuiteMetadata(ctx, SuiteKey) (int, error)` (spec C9 step 1; a key `aptpath.IsCanonicalSuitePath` refuses deletes nothing), `cache.ReapRegardless` (`deleteSuiteTx`'s cutoff for a delete regardless of idleness), `cache.ListUnadoptedSuiteAnchors` (`SuiteAnchorRow`), `cache.SweepOrphanMarkers(ctx, now, cutoff int64) (MarkerSweep{Swept, Furthest}, error)` (it never rewrites a stamp, ruling PF-1; the reaper passes a fresh `now` for `Furthest` and, for the cutoff, the run's clock less the forward steps it detected and 365 days, ruling PF-13), `(*cache.Cache).RunRetiredSnapshotGCChunk(ctx, maxRows int) (reaped int, more bool, err error)` (sub-job C), `(*cache.URLPath).LastUse() int64` (the stamp's one Go definition), `(*cache.Cache).HasSuiteRow` (renamed from `SuiteExists`); cap eviction moved to `internal/cache/suite_evict.go` and `deleteSuiteTx`, the one production `DELETE FROM suite_freshness`, to `suite_reap.go` beside two of its three callers, `ReapIdleSuite` and `ForgetSuite` (cap eviction's `createSuiteTx` stays in `suite_rows.go`; ruling R-F1). `cache.RetireSuiteSnapshots` was dropped with R-F4's knob-off retirement (ruling PF-5): phase E's PE-12 carry-forward is resolved by PF-5 — with `adoption.adopt_unsigned = false` an established unsigned suite keeps its coherent snapshot, refused `unsigned_disabled`, until the knob is back on or the suite is forgotten or reaped (forgotten or reaped with the knob still off, it is then a never-adopted suite), and the docs say plainly that the cache then does not keep unsigned repositories fresh (the maintainer confirmed it, 2026-10-20). `freshness.Reaper`, `NewReaper(ReaperConfig{Cache, Checker, IdleTTL, Logger})`, `(*Reaper).Run(ctx)` (started by `main` beside `Checker.Run`; at most 250 candidates reaped regardless of idleness first, then at most 25 idle ones in the same run — `regardlessReapsPerRun`, `reapsPerRun`, `runBudgets`, ruling PF-14 —, the junk scan every run, the marker sweep daily, the first a day after `Run` starts, a forward step of the wall clock deferring reaping and the sweep by the uptime floor and taken off the sweep's cutoff for the life of the process — `stepAhead`, ruling PF-13 —, a suite's held work bounded at 5 minutes, a panic under a suite's hold recovered for that suite alone; started through `main`'s `runReaper` seam) and `(*Reaper).Forget(ctx, scheme, host, suitePath) (cache.ForgetResult, error)` (a panic under its hold logged `freshness_check_panicked` with `where=forget`, released as the cache then answers, then re-panicked to net/http, whose `http: panic serving` line the admin server's `ErrorLog` routes through slog at ERROR; a forget whose writer call failed after its commit logged `suite_forgotten` with `settled=true`); `admin.Config.Forgetter` (`admin.Forgetter`; a forget in flight is cut short by the admin listener's `Shutdown` and answered 503, and a `host` holding `://` is refused with 400), `requireMutationGuard`, and the status JSON's additive `suites[].scheme` (the HTML Host cell shows `scheme://host`; ruling PF-7); `config.GCConfig.SuiteIdleTTL` (`gc.suite_idle_ttl`); `gc.LastRunSummary.RetiredReaped`, `acu_gc_retired_reaped_total` and `acu_suites_reaped_total{reason}`; the startup GC pass runs no sub-job C, the periodic ticks do (`gc.phaseStartup`, `runSnapshotPass`; ruling PF-15); `flipgate.(*Gate).Purge` keeps a live entry (ruling R-F2). Events `suite_reaped`, `suite_forgotten` (`anchor_rows`, `settled`), `admin_forget_requested`, `signed_seen_markers_swept`; `freshness_check_panicked` gains `where=reaper` (naming the suite when it struck under a suite's hold) and `where=forget`, and `clock_step_detected` the stamps `last_seen_at` and `wall_clock`; the reaper's clock-step reports are logged outside the checker's one-line-a-minute limit; the reaper's busy line, held-step WARNs and junk-read WARN, and every `freshness_check_panicked` and `adoption_panicked` line, and the handler's `handler_goroutine_panicked` `where=touch` line, carry `canonical_scheme`; the startup line gains `gc_suite_idle_ttl` and `adoption_adopt_unsigned`. Rulings R-F1–R-F5 and PF-1–PF-15 and deviations 1 (withdrawn: it concerned the dropped retirement), 2 (the coarser 90-day simulation, a four-day one at the production cadence beside it) and 3 (the sweep never rewrites a future stamp) are in the phase F plan and spec revision 9.
 -- G: `aptpath.IsFlatSuitePath`, `aptpath.FlatBase`, `aptpath.DotClean`, `freshness.validateFilename`, and the admin `suites[].flat` field (phase B plan, deviation 3). Legacy flat onboarding also writes signed-seen markers for sniff-passing cached flat anchors (the startup pass only covers suites that already have rows), and the `/.` twin variant of E's in-transaction recheck test runs here. **PR #8 evidence in G's DoD:** `TestServeHTTP_FlatRepositoryFreshness` (a miss on `/…/deb/InRelease` and on `/…/deb/./InRelease` creates one suite row each and fires T1 under it; a later hit fires T1 again; `/…/deb/Packages_1.0_all.deb`, host-root `/InRelease` and `/…/deb//InRelease` create none), the pkgs.k8s.io shape `/core:/stable:/v1.34/deb/InRelease` → `/core:/stable:/v1.34/deb`, flat `Packages` failure fatal, and the mixed-host strict matrix. G also ports the rest of PR #8's tests (see "PR #8 parity" below).
-+- G: `aptpath.IsFlatSuitePath`, `aptpath.FlatBase`, `aptpath.DotClean`, `freshness.validateFilename`, and the admin `suites[].flat` field (phase B plan, deviation 3). Legacy flat onboarding also writes signed-seen markers for sniff-passing cached flat anchors (the startup pass only covers suites that already have rows), and the `/.` twin variant of E's in-transaction recheck test runs here. **PR #8 evidence in G's DoD:** `TestServeHTTP_FlatRepositoryFreshness` (a miss on `/…/deb/InRelease` and on `/…/deb/./InRelease` creates one suite row each and fires T1 under it; a later hit fires T1 again; `/…/deb/Packages_1.0_all.deb`, host-root `/InRelease` and `/…/deb//InRelease` create none), the pkgs.k8s.io shape `/core:/stable:/v1.34/deb/InRelease` → `/core:/stable:/v1.34/deb`, flat `Packages` failure fatal, and the mixed-host strict matrix. G also ports the rest of PR #8's tests (see "PR #8 parity" below). As built: `aptpath.IsFlatSuitePath`, `FlatBase`, `DotClean` and `IsFlatHostRootPath` (the flat grammar in `aptpath.SuitePath`), `aptpath.IsAnchorlessIndex` and `SniffAnchorlessIndex`; `cache.PackageHash.FlatFilename` (written by `CommitAdoption` and reconcile), `DeclaredHashesForPath`'s suffix fallback over `idx_package_hash_flat_filename` (at most 32 segments, the longest ancestor-or-self base), `cache.ListSuiteMetadataRows`, `RefreshURLPathBlob`, `DeleteURLPathRows` and `ListUnadoptedFlatIndexRows`; `freshness.validateFilename`, the layout-aware `isIndexTarget`, `indexTargetGroup`, `archFromFilteredPath`, `missingRequestableIndexGroups` and `missingRequestableMembers` (each takes the suite path), `(*Adopter).flatIndexClientCreated` (Dispatch 3's flat index rows), `(*Adopter).anchorlessEligible` and `(*Checker).anchorlessRefresh` (Dispatch 3–4; results `anchorless_refreshed`/`anchorless_unchanged`, form `anchorless`; `acu_anchorless_sniff_rejected_total{host}`), the reaper's flat index junk evidence — a flat suite with no signed evidence is judged on its anchor and root index rows together, a flat suite with signed evidence on its anchors alone (ruling R-G2 as amended by PG-7: `(*Reaper).suiteJunk`, the signed-evidence read lazy, per candidate) — with the index rows read only when a run has an unadopted flat suite (`hasUnadoptedFlatSuite`); with `adoption.adopt_unsigned` off, a suite the anchorless gate admits is refused `unsigned_disabled`, a success logged `changed_deferred` with form `anchorless` (`(*Checker).anchorlessDisabled`, ruling PG-1); at most two anchorless bodies in memory for the process (`anchorlessBodySlots`, ruling PG-8), and an anchorless check that asks for files is a success only with a content answer (design review M-7); `proxy.IsMetadata` never classifies a Debian pool artifact as metadata (`isPoolArtifact` in `internal/proxy/classify.go`, ruling PG-2); the handler's layout-aware `isIndexTargetPath` and `indexTargetArch`, `flat_host_root_unsupported` (one WARN a minute) and `urlPathModTime` (`Last-Modified = max(pool mtime, last_fetched_at)` at url_path metadata serves); the admin `suites[].flat`. Rulings R-G1–R-G5 (R-G2 as amended by PG-7) and PG-1–PG-18 and deviations 1 (the anchorless gate reads signed evidence) and 2 (a changed plain `Contents-*` is deleted) are in the phase G plan and spec revision 10.
++- G: `aptpath.IsFlatSuitePath`, `aptpath.FlatBase`, `aptpath.DotClean`, `freshness.validateFilename`, and the admin `suites[].flat` field (phase B plan, deviation 3). Legacy flat onboarding also writes signed-seen markers for sniff-passing cached flat anchors (the startup pass only covers suites that already have rows), and the `/.` twin variant of E's in-transaction recheck test runs here. **PR #8 evidence in G's DoD:** `TestServeHTTP_FlatRepositoryFreshness` (a miss on `/…/deb/InRelease` and on `/…/deb/./InRelease` creates one suite row each and fires T1 under it; a later hit fires T1 again; `/…/deb/Packages_1.0_all.deb`, host-root `/InRelease` and `/…/deb//InRelease` create none), the pkgs.k8s.io shape `/core:/stable:/v1.34/deb/InRelease` → `/core:/stable:/v1.34/deb`, flat `Packages` failure fatal, and the mixed-host strict matrix. G also ports the rest of PR #8's tests (see "PR #8 parity" below). As built: `aptpath.IsFlatSuitePath`, `FlatBase`, `DotClean` and `IsFlatHostRootPath` (the flat grammar in `aptpath.SuitePath`), `aptpath.IsAnchorlessIndex` and `SniffAnchorlessIndex`; `cache.PackageHash.FlatFilename` (written by `CommitAdoption` and reconcile), `DeclaredHashesForPath`'s suffix fallback over `idx_package_hash_flat_filename` (at most 32 segments, the longest ancestor-or-self base), `cache.ListSuiteMetadataRows`, `RefreshURLPathBlob`, `DeleteURLPathRows` and `ListUnadoptedFlatIndexRows`; `freshness.validateFilename`, the layout-aware `isIndexTarget`, `indexTargetGroup`, `archFromFilteredPath`, `missingRequestableIndexGroups` and `missingRequestableMembers` (each takes the suite path), `(*Adopter).flatIndexClientCreated` (Dispatch 3's flat index rows), `(*Adopter).anchorlessEligible` and `(*Checker).anchorlessRefresh` (Dispatch 3–4; results `anchorless_refreshed`/`anchorless_unchanged`, form `anchorless`; `acu_anchorless_sniff_rejected_total{host}`), the reaper's flat index junk evidence — a flat suite with no signed evidence is judged on its anchor and root index rows together, a flat suite with signed evidence on its anchors alone (ruling R-G2 as amended by PG-7: `(*Reaper).suiteJunk`, the signed-evidence read lazy, per candidate) — with the index rows read only when a run has an unadopted flat suite (`hasUnadoptedFlatSuite`); with `adoption.adopt_unsigned` off, a suite the anchorless gate admits is refused `unsigned_disabled`, a success logged `changed_deferred` with form `anchorless` (`(*Checker).anchorlessDisabled`, ruling PG-1); at most two anchorless bodies in memory for the process (`anchorlessBodySlots`, ruling PG-8), and an anchorless check that asks for files is a success only with a content answer (design review M-7); `proxy.IsMetadata` never classifies a Debian pool artifact as metadata (`isPoolArtifact` in `internal/proxy/classify.go`, ruling PG-2); the handler's layout-aware `isIndexTargetPath` and `indexTargetArch`, `flat_host_root_unsupported` (one WARN a minute, only for a host the allowlist admits) and `urlPathModTime` (`Last-Modified = max(pool mtime, last_fetched_at)` at url_path metadata serves); the admin `suites[].flat`. From the fix round after the task reviews: `observability.LogLimiter` (`Allow(now, every time.Duration) (ok bool, suppressed int)`; its zero value is ready, and the interval is each call site's constant), the one copy of the one-line-a-minute limiter, used by `suite_seed_rejected`, `flat_host_root_unsupported` and the anchorless over-cap WARN (ruling PG-22); `aptpath.FlatIndexNames()`, the 14 root `Packages*`/`Sources*` names and the one list `cache.ListSuiteMetadataRows` and `ListUnadoptedFlatIndexRows` probe by; `(*Adopter).flatIndexClientCreated` returns the client-created index row, and a flat suite active only through it, with no cached anchor row, probes its `InRelease` and `Release` at sibling URLs of that row's stored `upstream_url` (ruling PG-20); `(*Checker).cachedAnchors` returns the anchor rows, read before the probe tree, and the anchorless refresh deletes a cached `InRelease` or `Release` only while it holds the blob read then (`anchorURLMap` gives `anchorURLsFor` their URLs); a failed `DeleteURLPathRows` is no answer — its 404s and 410s stop counting, so a check they alone answered fails — and a failed read of the refresh's index rows is a local fault (WARN `freshness: read anchor rows failed`, nothing written, no backoff) (ruling PG-24); the reaper's `unadoptedFlat`, the one predicate its index-read gate and its per-suite test share. Rulings R-G1–R-G5 (R-G2 as amended by PG-7) and PG-1–PG-27 (PG-19–PG-24 on the task reviews; PG-25–PG-27 the fix round's deferred IDs, its one skip and the spec revision) and deviations 1 (the anchorless gate reads signed evidence) and 2 (a changed plain `Contents-*` is deleted) are in the phase G plan, and the behaviour they settle in spec revision 10; the items phase G leaves are in `…-G-deferred.md` (GD-1–GD-3).
  - H: PR #8's end-to-end table in `e2e/flat`: one signed flat repository configured as `deb <uri>/ /` on one client and `deb <uri> ./` on another; both report 2.0 within one cooldown of the v2 publish, and with the upstream stopped two fresh clients install 2.0 from the snapshots. H also runs the live-upstream smoke and documents the strict-mode consequences listed under "PR #8 parity" below.
  
  ## Carry-forwards (from phase A and B reviews)
@@ -11421,7 +13437,7 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md 
  **H:**
  
  - *(E)* The prose WARN names phase E adds — `freshness: read anchor rows failed`, `freshness: read current snapshot failed`, `adoption: served anchor read failed; the flip barrier runs` and `adoption: signed-anchor re-mark failed` (documented as they are) — may become snake_case in H's documentation sweep, with phase D's (listed under "PR #8 parity").
-@@ -123,6 +110,11 @@ Each item is owned by the phase it is listed under; that phase's plan addresses
+@@ -123,6 +110,12 @@ Each item is owned by the phase it is listed under; that phase's plan addresses
  - *(F)* The 1.1.0 release notes tell offline and archive caches — and any install that relied on `gc.enabled = false` to keep everything — to set `gc.suite_idle_ttl = "0s"` before upgrading: the suite reaper runs whatever `gc.enabled` says and, from an hour after the first start, deletes the suites no client asked for in `gc.suite_idle_ttl` (720 h by default, counted from the last request before the upgrade, so a long-idle suite goes at once), with their cached index files (`docs/configuration.md`, *Upgrading an existing cache* and *Suite reaping*, says so; the Task 11 review).
  - *(F)* The prose WARN names phase F adds — the seven `suite reaper: …` lines and `admin: forget failed` (documented as they are) — may become snake_case in H's documentation sweep, with phase D's and E's.
  
@@ -11429,15 +13445,25 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md 
 +- *(G)* `e2e/flat` gains a Release-less repository (a Gemfury-shaped `Packages.gz` with no `Release`): a republished index reaches a client within one `periodic_refresh`, and an upstream that then answers HTML keeps the old index.
 +- *(G)* The status page cannot tell a flat repository refreshed without a `Release` from a dormant, never-adopted suite: after an answered anchorless check it has no snapshot and no record, so only `last_success` differs. Show the anchorless refresh in `suites[]` (a field or tag) and on the status page (phase G design review M-14, ruling PG-14).
 +- *(G)* The prose WARN names phase G adds — `freshness: anchorless index over its size cap`, `freshness: delete anchorless rows failed`, `suite reaper: list unadopted flat indexes failed` and `suite reaper: read signed evidence failed` (documented as they are) — may become snake_case in H's documentation sweep, with phase D's, E's and F's.
++- *(G)* `docs/log-fields.md` has never documented the adoption event `adoption_member_skipped`, to which phase G (E-9) added `declared_sha512`, nor `snapshot_index_target_404`, whose architecture label phase G made layout-aware (`all`, `source` for a flat suite): document both in H's observability sweep (phase G Task 16 review, Minor 8).
 +
  **Open decision (spec-level, for the maintainer):**
  
  - An `anchor_corrupt` or `anchor_oversized` quarantine leaves the known-corrupt `url_path` anchor in Phase-1 serving, and the checker sees "unchanged". This is pre-existing behaviour for any bit-rotted metadata blob. Decide in a later phase whether the audit should also invalidate that `url_path` row.
+@@ -151,7 +144,7 @@ A comparison of this branch at `fa30e7f` with PR #8 (head `6ec5dee`, fetched loc
+    | Same host: a `.deb` under `/flat` that is not declared | 200 (passthrough) | 502 |
+    | Suite `/flat/.`: `/flat/amd64/x.deb`, declared | 200 | 200 (exact row at `FlatBase`) |
+    | Suite `/flat/.`: `/flat/./amd64/x.deb`, declared | 200 | 200 (suffix fallback after `DotClean`) |
+-   | `/flat/../ubuntu/pool/unknown.deb` | 502 | 502 (fallback stops at `..`) |
++   | `/flat/../ubuntu/pool/unknown.deb` | 502 | 502 (PR #8 parity: still refused, by row 1's mechanism; the fallback's `..` stop is unreachable with valid rows and pinned by `TestFlatSplits`) |
+    | Suite `/r/sub`: `/r/amd64/x.deb`, declared (Jenkins shape) | 502 | 200 (parent base) |
+    | Flat-only host, complete: an undeclared `.deb` elsewhere on the host | 200 (inactive) | 502 (strict mode now protects flat hosts) |
+    | Incomplete `dists/` snapshot + flat snapshot: unvouched `.deb` | 200 | 200 (host-wide passthrough) |
 ```
 
 - [ ] **Step 6: Deferred files**
 
-Each file's diff deletes the entries this plan resolved (each is one `- **ID** …` line; the section headings stay): A-4, A-5, A-6 (`…-A-deferred.md`); B-59, B-62 (`…-B-deferred.md`, where B-63 gains phase G's note); D-3, D-4, D-27, D-31, D-32 (`…-D-deferred.md`); E-9, E-16, E-17, E-19, E-47, E-57, E-60, E-64, E-65, E-67, E-68, E-70, E-71 (`…-E-deferred.md`); F-12 (`…-F-deferred.md`). No deferred file becomes empty; none is deleted (phase H's sweep deletes them).
+Each file's diff deletes the entries this plan resolved (each is one `- **ID** …` line; the section headings stay): A-4, A-5, A-6 (`…-A-deferred.md`); B-59, B-62 (`…-B-deferred.md`, where B-63 gains phase G's note); D-3, D-4, D-27, D-31, D-32 (`…-D-deferred.md`); E-9, E-16, E-17, E-19, E-47, E-57, E-60, E-64, E-65, E-67, E-68, E-70, E-71 (`…-E-deferred.md`); F-12 (`…-F-deferred.md`). No deferred file becomes empty; none is deleted (phase H's sweep deletes them). `…-G-deferred.md` is created (ruling PG-25: IDs `GD-n`) with the items phase G leaves: GD-1 (the anchorless body-slot wait, ruling PG-24's M1), GD-2 (`ParseSources` keeps `validateMemberPath`, ruling PG-21) and GD-3 (cap eviction in the flat minted simulation, ruling PG-26), each for H; the phase G final review adds its own.
 
 ```diff
 diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-A-deferred.md b/docs/superpowers/plans/2026-09-28-flat-repositories-A-deferred.md
@@ -11571,6 +13597,33 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-F-deferred.md b
  
 ```
 
+```diff
+diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-G-deferred.md b/docs/superpowers/plans/2026-09-28-flat-repositories-G-deferred.md
+new file mode 100644
+--- /dev/null
++++ b/docs/superpowers/plans/2026-09-28-flat-repositories-G-deferred.md
+@@ -0,0 +1,19 @@
++# Flat repositories — phase G deferred minors
++
++Phase G's sixteen task reviews and its fix round (2026-10-21) found these issues and triaged them "can wait". None changes the bytes a client is served: GD-1 is a bounded wait phase G introduced, which the Task 10 review asked to revisit; GD-2 a pre-existing mismatch between `ParseSources` and spec C5's wording; GD-3 a test the reviewer marked optional. They are numbered `GD-n` (ruling PG-25), never `G-n`, which is spec §10's security-review ID (`G-1`).
++
++**How they get done:** every later phase plan includes the items below that sit in files it already touches (cite the item ID in the task); an owning phase in parentheses marks where an item most naturally lands. Phase H ends with a sweep task that verifies each remaining item against the code, fixes it or records why not, and deletes this file.
++
++Left out: everything the fix round resolved — every task review's Important and Minor findings but the three below — and what is no item: the commit-message nits (history is not rewritten), the findings the fix round showed no single-site mutant can reach (their assertions stay as documentation), and the Task 16 review's Minor 8 (`adoption_member_skipped` and `snapshot_index_target_404` are undocumented in `docs/log-fields.md`), which is an H carry-forward in the overview. The phase G final review adds its own items here. Line numbers are as of the fix round and will drift.
++
++## internal/freshness — the anchorless refresh
++
++- **GD-1** `internal/freshness/anchorless.go` (`refreshAnchorlessRow`'s wait for a body slot): an anchorless check waits for one of the two process-wide body slots (`anchorlessBodySlots`) while it holds its host's slot (`Config.HostLimiter`, the `hostsem.Sem` the handler's client misses share), and a slow request keeps its body slot until `checkDeadline` (2 min; the fetch transport has no response-header timeout). Two slow anchorless requests anywhere can so make other hosts' anchorless checks hold a host slot idle up to their deadlines. No deadlock (a body-slot holder never waits for a host slot); bounded; failed checks back off; `TestCheck_AnchorlessSlotWaitEndsWithTheCheck` pins that the wait ends with the check. Follow-up: a short bounded wait for a body slot (unknown when it expires), or a per-request timeout well under `checkDeadline`. The AIDEV-NOTE at the slot wait points here. (H) (Task 10 review M1, ruling PG-24)
++
++## internal/freshness — Sources Filenames
++
++- **GD-2** `internal/freshness/sources_parse.go` (`ParseSources`): it checks each stanza's `Directory` and each `Checksums-Sha256` file path with `validateMemberPath`, although spec C5 says `ParsePackages` uses `validateFilename` for "Packages/Sources Filenames". Harmless for flat suites (`buildSourceHashes` builds nothing for them, C6). A `dists/` repository whose `Sources` names a `Directory` or a file with a `%` or a `.` segment loses that stanza's or that file's source rows silently — no WARN: `source_parse_failed` is logged only for a whole file that fails (pre-existing). Align `ParseSources` with C5, or correct C5's parenthetical to "Packages Filenames". (H) (Task 3 review Minor 3, ruling PG-21)
++
++## Tests (the whole-branch review)
++
++- **GD-3** `internal/handler/flat_dod_test.go` (`TestServeHTTP_MintedFlatSuitesAtScale`): the flat minted-suites simulation refuses at both caps but never evicts, while phase D's sibling does; twin eviction is pinned only at the cache layer (`TestCreateSuite_EvictionLeavesTheOtherSchemesTwin` and its table, `internal/cache/suite_evict_test.go:258`). The reviewer marked it optional and acceptable; an eviction phase must keep the simulation under the 4.5 s `-race` budget (ruling R-G5). The phase G final review may reopen it. (H) (Task 15 review Minor 4, ruling PG-26)
+```
+
 - [ ] **Step 7: Final verification**
 
 Run: `go vet ./... && golangci-lint run ./... && gofmt -l . && go test -race -count=1 -timeout 30m ./...`
@@ -11591,6 +13644,6 @@ Expected: no output.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add docs/configuration.md docs/log-fields.md docs/admin-ui-spec.md packaging/config/config.toml.default docs/superpowers/specs/2026-09-27-flat-repositories-design.md docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md docs/superpowers/plans/2026-09-28-flat-repositories-A-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-B-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-D-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-E-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-F-deferred.md
+git add docs/configuration.md docs/log-fields.md docs/admin-ui-spec.md packaging/config/config.toml.default docs/superpowers/specs/2026-09-27-flat-repositories-design.md docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md docs/superpowers/plans/2026-09-28-flat-repositories-A-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-B-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-D-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-E-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-F-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-G-deferred.md
 git commit -m "Document flat repositories; spec revision 10; overview and deferred files for phase G"
 ```
