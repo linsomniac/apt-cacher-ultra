@@ -211,7 +211,7 @@ type Checker struct {
 	// as long as its body is in memory. anchorlessOverCap rate-limits the
 	// refresh's over-cap WARN (design review M-6).
 	anchorlessBodies  chan struct{}
-	anchorlessOverCap anchorlessOverCapWarn
+	anchorlessOverCap observability.LogLimiter
 
 	// adoptionWg tracks in-flight adoption goroutines spawned via
 	// Check. Production graceful shutdown (SPEC2 §9.5 step 5) calls

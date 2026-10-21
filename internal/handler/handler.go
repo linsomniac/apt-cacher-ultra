@@ -28,6 +28,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
@@ -194,10 +195,10 @@ type Handler struct {
 	maxSuites  int
 	suiteGuard cache.SuiteGuard
 	rejections seedRejections
-	seedWarn   seedWarn
+	seedWarn   observability.LogLimiter
 
 	// flatRoot is flat_host_root_unsupported's rate limiter (spec C2).
-	flatRoot flatRootWarn
+	flatRoot observability.LogLimiter
 
 	// cachedAnchorsHook, when set (tests only), runs right after
 	// cachedAnchors' read: the window in which a changed anchor row makes
@@ -456,8 +457,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Spec C2: a flat repository at the host root gets no suite; say so
-	// (rate-limited) and serve the request as before.
-	if req.IsMetadata && req.SuitePath == "" && aptpath.IsFlatHostRootPath(req.Path) {
+	// (rate-limited) and serve the request as before. A host the allowlist
+	// forbids never takes the minute's one line: its miss is refused below,
+	// and the line's canonical_host and detail would be wrong.
+	if req.IsMetadata && req.SuitePath == "" && aptpath.IsFlatHostRootPath(req.Path) && h.fetch.HostAllowed(req.CanonicalHost) {
 		h.noteFlatHostRoot(req)
 	}
 

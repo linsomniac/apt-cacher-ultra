@@ -182,15 +182,9 @@ func (s *seedRejections) sweepLocked(force bool) {
 }
 
 // seedWarnEvery rate-limits suite_seed_rejected: at most one line per
-// minute process-wide; suppressed counts the rejections in between.
+// minute process-wide; suppressed counts the rejections in between. The
+// limiter is h.seedWarn, an observability.LogLimiter (ruling PG-22).
 const seedWarnEvery = time.Minute
-
-// seedWarn is suite_seed_rejected's rate limiter.
-type seedWarn struct {
-	mu         sync.Mutex
-	last       time.Time
-	suppressed int
-}
 
 // suiteCaps is CreateSuite's bounds: freshness.max_suites globally and a
 // tenth of it per canonical host (spec C3); 0 is unbounded (tests).
@@ -242,16 +236,10 @@ func (h *Handler) noteCreate(key cache.SuiteKey, res cache.CreateResult) {
 	}
 	h.rejections.add(key, ttl)
 	suiteSeedRejectedTotal.Inc(key.CanonicalHost)
-	h.seedWarn.mu.Lock()
-	now := time.Now()
-	if !h.seedWarn.last.IsZero() && now.Sub(h.seedWarn.last) < seedWarnEvery {
-		h.seedWarn.suppressed++
-		h.seedWarn.mu.Unlock()
+	ok, suppressed := h.seedWarn.Allow(time.Now(), seedWarnEvery)
+	if !ok {
 		return
 	}
-	suppressed := h.seedWarn.suppressed
-	h.seedWarn.last, h.seedWarn.suppressed = now, 0
-	h.seedWarn.mu.Unlock()
 	h.logger.Warn("suite_seed_rejected",
 		"canonical_host", key.CanonicalHost,
 		"suite_path", key.SuitePath,

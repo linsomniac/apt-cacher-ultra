@@ -99,6 +99,62 @@ func TestServeHTTP_FlatHostRootIsUnsupportedAndSaysSo(t *testing.T) {
 	})
 }
 
+// denyHostFetcher is a recFetcher whose allowlist refuses one host.
+type denyHostFetcher struct {
+	*recFetcher
+	deny string
+}
+
+func (f denyHostFetcher) HostAllowed(host string) bool { return host != f.deny }
+
+// Plan design note 2's flat_host_root_unsupported, two more properties
+// (the Task 6 review's minors): a host-root request to a host the
+// allowlist forbids is refused (403 on a miss) and never takes the
+// minute's one line, whose canonical_host and "served from the ordinary
+// cache" would then be wrong; and the limit is process-wide, not per host
+// (the AIDEV-NOTE's flood argument), so a second host's host-root request
+// inside the minute is folded into the next line's suppressed count.
+func TestServeHTTP_FlatHostRootLineNamesAnAllowedHostOncePerMinute(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		parser, err := proxy.New(nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		logs := &strictLogBuf{}
+		h, err := New(Config{Parser: parser, Cache: simtest.OpenCache(t),
+			Fetch:  denyHostFetcher{recFetcher: &recFetcher{body: rowInRelease}, deny: "forbidden.example"},
+			Logger: slog.New(slog.NewJSONHandler(logs, nil)), HostLimiter: hostsem.New(4), AdoptionEnabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(h.Close)
+		get := func(url string, want int) {
+			t.Helper()
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+			if rec.Code != want {
+				t.Fatalf("%s = %d, want %d", url, rec.Code, want)
+			}
+		}
+		get("http://forbidden.example/InRelease", http.StatusForbidden)
+		if recs := logs.find("flat_host_root_unsupported"); len(recs) != 0 {
+			t.Fatalf("flat_host_root_unsupported = %v for a forbidden host, want none", recs)
+		}
+		get("http://root.example/InRelease", http.StatusOK)
+		get("http://other.example/InRelease", http.StatusOK) // another host, the same minute
+		recs := logs.find("flat_host_root_unsupported")
+		if len(recs) != 1 || recs[0]["canonical_host"] != "root.example" || recs[0]["suppressed"] != float64(0) {
+			t.Fatalf("flat_host_root_unsupported = %v, want one line, for root.example, suppressed 0", recs)
+		}
+		time.Sleep(time.Minute)
+		get("http://other.example/./InRelease", http.StatusOK)
+		recs = logs.find("flat_host_root_unsupported")
+		if len(recs) != 2 || recs[1]["canonical_host"] != "other.example" || recs[1]["suppressed"] != float64(1) {
+			t.Fatalf("flat_host_root_unsupported = %v, want a second line a minute later counting other.example's (suppressed 1)", recs)
+		}
+	})
+}
+
 // Spec C5 on the handler side: the snapshot_index_target_404 alert is
 // layout-aware. A flat suite's root Packages* or Sources* missing from its
 // snapshot raises it, labelled "all" or "source" (the flat arch labels,
@@ -127,7 +183,7 @@ func TestServeHTTP_FlatSnapshotMissIndexTargetRaisesAlert(t *testing.T) {
 	} {
 		series := `acu_serve_snapshot_index_target_404_total{architecture="` + tc.arch + `"}`
 		before := metricValue(t, series)
-		logs.buf.Reset()
+		logs.reset()
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, newProxyReqHostPort("GET", scheme, host+port, tc.path))
 		if rec.Code != http.StatusNotFound {

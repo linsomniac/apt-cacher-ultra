@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
@@ -57,15 +56,9 @@ const anchorlessBodySlots = 2
 // anchorlessOverCapWarnEvery rate-limits the WARN "freshness: anchorless
 // index over its size cap": at most one line per minute process-wide, with
 // the count of the lines it suppressed (design review M-6; the handler's
-// flat_host_root_unsupported does the same).
+// flat_host_root_unsupported does the same). The limiter is
+// Checker.anchorlessOverCap, an observability.LogLimiter (ruling PG-22).
 const anchorlessOverCapWarnEvery = time.Minute
-
-// anchorlessOverCapWarn is that WARN's rate limiter. Monotonic time.
-type anchorlessOverCapWarn struct {
-	mu         sync.Mutex
-	last       time.Time
-	suppressed int
-}
 
 // errAnchorlessUnknown fails an anchorless check whose index requests got
 // no content answer.
@@ -292,16 +285,10 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 // process-wide, with the count of the lines it suppressed since the last
 // one (design review M-6: minted suites must not flood the log).
 func (c *Checker) noteAnchorlessOverCap(suite SuiteRef) {
-	c.anchorlessOverCap.mu.Lock()
-	now := time.Now()
-	if !c.anchorlessOverCap.last.IsZero() && now.Sub(c.anchorlessOverCap.last) < anchorlessOverCapWarnEvery {
-		c.anchorlessOverCap.suppressed++
-		c.anchorlessOverCap.mu.Unlock()
+	ok, suppressed := c.anchorlessOverCap.Allow(time.Now(), anchorlessOverCapWarnEvery)
+	if !ok {
 		return
 	}
-	suppressed := c.anchorlessOverCap.suppressed
-	c.anchorlessOverCap.last, c.anchorlessOverCap.suppressed = now, 0
-	c.anchorlessOverCap.mu.Unlock()
 	c.logger.Warn("freshness: anchorless index over its size cap",
 		"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "max_bytes", maxAnchorlessIndexBytes,
 		"suppressed", suppressed)

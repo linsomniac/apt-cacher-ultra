@@ -35,6 +35,14 @@ func (b *strictLogBuf) Write(p []byte) (int, error) {
 	return b.buf.Write(p)
 }
 
+// reset drops every captured record, under the lock a late writer (a
+// touchAsync WARN of an earlier request) takes too.
+func (b *strictLogBuf) reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
+}
+
 func (b *strictLogBuf) records() []map[string]any {
 	b.mu.Lock()
 	s := b.buf.String()

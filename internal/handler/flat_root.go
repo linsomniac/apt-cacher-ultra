@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"sync"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
@@ -9,15 +8,9 @@ import (
 
 // flatRootWarnEvery rate-limits flat_host_root_unsupported: at most one
 // line per minute process-wide; suppressed counts the requests in between
-// (spec C2, plan design note 2).
+// (spec C2, plan design note 2). The limiter is h.flatRoot, an
+// observability.LogLimiter (ruling PG-22).
 const flatRootWarnEvery = time.Minute
-
-// flatRootWarn is flat_host_root_unsupported's rate limiter.
-type flatRootWarn struct {
-	mu         sync.Mutex
-	last       time.Time
-	suppressed int
-}
 
 // noteFlatHostRoot logs, at most once a minute process-wide, that a client
 // asked for a flat repository's file at the host root (spec C2:
@@ -31,16 +24,10 @@ type flatRootWarn struct {
 // into a log flood; the suppressed count says how many requests the last
 // minute hid.
 func (h *Handler) noteFlatHostRoot(req *proxy.Request) {
-	h.flatRoot.mu.Lock()
-	now := time.Now()
-	if !h.flatRoot.last.IsZero() && now.Sub(h.flatRoot.last) < flatRootWarnEvery {
-		h.flatRoot.suppressed++
-		h.flatRoot.mu.Unlock()
+	ok, suppressed := h.flatRoot.Allow(time.Now(), flatRootWarnEvery)
+	if !ok {
 		return
 	}
-	suppressed := h.flatRoot.suppressed
-	h.flatRoot.last, h.flatRoot.suppressed = now, 0
-	h.flatRoot.mu.Unlock()
 	h.logger.Warn("flat_host_root_unsupported",
 		"canonical_host", req.CanonicalHost,
 		"path", req.Path,
