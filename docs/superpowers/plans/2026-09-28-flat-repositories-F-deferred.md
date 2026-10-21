@@ -12,11 +12,11 @@ Left out: everything fix rounds 1 and 2 and the final fix wave resolved — the 
 - **F-2** The production chunk size depends on the `<= 0` fallback (`internal/cache/gc.go:398-400`) and on the pass passing 0 (`internal/gc/snapshot.go:110`); `TestRunRetiredSnapshotGCChunk_TheChunkIsTenThousandRows` pins only the constant (ruling PF-9's choice). Mutants C22 (the default becomes `1<<30`) and C23 (the pass passes `1<<30`) survive: one writer transaction would delete a whole 600,000-row snapshot (about 5 s of writer time). Fix without a 4.6 s test: a gc-package fake cache asserting the pass asks for `maxRows` 0. (Task 4 minor 5; final review tests m-5)
 - **F-3** `internal/gc/snapshot.go:11-15`: embedding `cache.SnapshotGCBatchResult` promotes `Total()`, which silently excludes `retired`. No caller today; a latent footgun. (Task 4 minor 7)
 
-## internal/admin — /forget and /reconcile (G: spec §10 G-1)
+## internal/admin — /forget and /reconcile (spec §10's G-1 follow-up, not phase G)
 
-- **F-4** `handlers.go`: `handleForget` copies `handleReconcile`'s parsing preamble line for line (the 8 KiB cap, `ParseForm` answered 413, three trimmed `FormValue`s, the `https` default). G-1 reworks both endpoints' parsing: share one helper. (G) (Task 10 minor 2)
-- **F-5** `handlers.go`: every `ParseForm` error is answered 413 "request body too large", and `handleForget`'s doc says 413 means the body exceeds 8 KiB. A malformed body gets a misleading answer (`curl --data-urlencode` never sends one). (G) (Task 10 minor 3)
-- **F-6** `server.go`: `OPTIONS /reconcile` answers `Allow: GET, HEAD, OPTIONS` while its 405 says `POST, OPTIONS` (pre-existing; `/forget`'s case shows the fix); the admin endpoints' `\n\n`-terminated plain-text bodies are an existing style to settle with G-1. (G) (Task 10 minors 6 and 7)
+- **F-4** `handlers.go`: `handleForget` copies `handleReconcile`'s parsing preamble line for line (the 8 KiB cap, `ParseForm` answered 413, three trimmed `FormValue`s, the `https` default). G-1 reworks both endpoints' parsing: share one helper. (H, or with G-1) (Task 10 minor 2)
+- **F-5** `handlers.go`: every `ParseForm` error is answered 413 "request body too large", and `handleForget`'s doc says 413 means the body exceeds 8 KiB. A malformed body gets a misleading answer (`curl --data-urlencode` never sends one). (H, or with G-1) (Task 10 minor 3)
+- **F-6** `server.go`: `OPTIONS /reconcile` answers `Allow: GET, HEAD, OPTIONS` while its 405 says `POST, OPTIONS` (pre-existing; `/forget`'s case shows the fix); the admin endpoints' `\n\n`-terminated plain-text bodies are an existing style to settle with G-1. (H, or with G-1) (Task 10 minors 6 and 7)
 
 ## internal/freshness — tests and comments
 
