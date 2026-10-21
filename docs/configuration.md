@@ -261,8 +261,9 @@ at exactly the total cap logs no warning: that is a full cache working
 normally, where a new suite evicts an idle one and is refused only when
 none qualifies (WARN `suite_seed_rejected`).
 
-Serving a tracked suite's `InRelease`, `Release` or `Release.gpg`, or a
-`.deb` its current snapshot vouches for, records that the suite is in use
+Serving a tracked suite's `InRelease`, `Release` or `Release.gpg` — or,
+for a flat repository, its root `Packages` or `Sources` — or a `.deb` its
+current snapshot vouches for, records that the suite is in use
 (at most one write per suite per hour); a suite not in use for
 `gc.suite_idle_ttl` (30 days by default) is no longer tracked (see *Suite
 reaping* under `[gc]`). A by-hash request with no cached
@@ -333,9 +334,11 @@ it is served from the ordinary cache and never refreshed, and the daemon
 logs WARN `flat_host_root_unsupported` (at most one line a minute).
 
 A signed or unsigned flat repository is adopted like any other (see
-*Anchor forms and unsigned repositories*). Its `Release` must list its
-root `Packages`, whose fetch failing fails the adoption, and the `.deb`
-files that `Packages` names are vouched by the paths apt requests for
+*Anchor forms and unsigned repositories*). When its `Release` lists its
+root `Packages`, that file's fetch failing fails the adoption; a `Release`
+that lists none adopts with incomplete coverage (`no_packages_members`),
+which turns strict mode off for its host. The `.deb` files that
+`Packages` names are vouched by the paths apt requests for
 them: `<uri>/<Filename>`, with or without a leading `./`, for whichever
 directory at or above the `Release` the repository's `<uri>` is
 (pkg.jenkins.io's `binary/…` one level up, Sublime Text's `files/…` at the
@@ -355,16 +358,17 @@ one disagree on its hash, and the file is refused (502,
 at its next check, at most `periodic_refresh` later unless that adoption
 fails.
 
-A flat repository that publishes no `Release` at all (Gemfury, goreleaser)
-is refreshed without one, as long as the cache has never seen it signed
-and `adoption.adopt_unsigned` is on (with it off, such a repository is
-served as the cache first stored its files and shows "refused:
-unsigned_disabled"; turning the knob on resumes its refresh): each check
-sends one conditional request for every cached `Packages`, `Sources` and
-`Contents-*` file of the suite, in that order, with the validators
-upstream gave it, and reads at most two such files at once across the
-whole process. A changed file replaces the cached one when its bytes pass
-the same content check as on first contact; an HTML page or anything else
+With adoption enabled, a flat repository that publishes no `Release` at
+all (Gemfury, goreleaser) is refreshed without one, as long as the cache
+has never seen it signed and `adoption.adopt_unsigned` is on (with it
+off, such a repository is served as the cache first stored its files and
+shows "refused: unsigned_disabled"; turning the knob on resumes its
+refresh): each check sends one conditional request for every cached
+`Packages`, `Sources` and `Contents-*` file of the suite, in that order,
+with the validators upstream gave it, and reads at most two such files at
+once across the whole process. A changed file replaces the cached one
+when its bytes pass the flat index check for its name (for a compressed
+`Contents-*`, its compression magic); an HTML page or anything else
 that fails it keeps the old file (counted in
 `acu_anchorless_sniff_rejected_total{host}`), and a plain `Contents-*`,
 which has no such check, is deleted when it changed, for the next client
@@ -373,11 +377,14 @@ a cached `InRelease` or `Release` that upstream now answers so, unless a
 client's own fetch stored other bytes for it meanwhile; anything else —
 401, 403, a 5xx, a timeout, a body over 64 MiB — keeps the file. A check
 that asks for files counts as answered only when at least one of them got
-a real answer (304, a 200 stored or identical to the cached file, 404 or
-410): one whose files got none — an HTML page for every file (a captive
-portal, a vendor's retired site; even a page the cache already holds), 401
-and 403, a changed plain `Contents-*` — fails and backs off, so the status
-page shows the repository failing rather than healthy. Such a repository
+a real answer (304 to a request with validators, a 200 stored or
+identical to the cached file, 404 or 410): one whose files got none — an
+HTML page for every file (a captive portal, a vendor's retired site; even
+a page the cache already holds), 401 and 403, a changed plain
+`Contents-*` — fails and backs off, so the status page shows the
+repository failing rather than healthy. A delete that fails is no answer:
+its 404s and 410s stop counting, so a check they alone answered — no file
+asked for, or every real answer a delete — fails. Such a repository
 has no snapshot: it vouches nothing and leaves strict mode alone. Its
 index files are served with `Last-Modified` the later of the file's time
 and its last refresh, so apt's `If-Modified-Since` sees a replacement. The
@@ -391,14 +398,19 @@ disappear it fails its checks and shows "refused: anchor_absent", so
 stripping a signed repository's signatures cannot turn it into an
 unverified one.
 
-Two limits of the refresh without a `Release`. Behind an upstream that
+Three limits of the refresh without a `Release`. Behind an upstream that
 answers 403 for a missing file (Amazon S3, CloudFront), a file the
 repository removed stays cached and served: if that is the `Packages.xz`
-apt tries first, a client never sees the fresh `Packages.gz`. And a
+apt tries first, a client never sees the fresh `Packages.gz`. A
 repository whose only index is a plain `Packages` that is empty at first
 contact gets no suite (an empty file is not recognisably an index): it is
 served as cached and never refreshed; likewise an index that later
-becomes empty is never stored (the cached one stays).
+becomes empty is never stored (the cached one stays). And an unchanged
+plain `Contents-*` counts as a real answer without a check: a captive
+portal's page that a client's miss cached as a plain `Contents-<arch>`,
+and that the portal still serves, answers the check
+(`anchorless_unchanged`) during the outage. Flat repositories rarely
+publish a plain `Contents-*`.
 
 ## `[adoption]`: snapshots, trust, and recovery
 
@@ -435,7 +447,7 @@ Seven outcomes are refusals, not failures, and are shown as "refused: …" on th
 - `unsigned_downgrade_refused`: the suite has been seen signed, so its unsigned `Release` is not adopted.
 - `unsigned_too_large`: an unsigned `Release` declares more than 1,000 files.
 - `unsigned_disabled`: `adopt_unsigned = false`, so an unsigned `Release` is not adopted; an unsigned suite already adopted keeps serving its last snapshot, not updated, until the knob is turned back on, the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, served as the cache first stored its files (see `adopt_unsigned`). A flat repository that publishes no `Release` at all is refused this way too while the knob is off: it is not refreshed (see *Flat repositories*).
-- `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too. While a failed adoption of the suite is recorded (its move to the other form failed), the status page shows that failure's reason instead, and the suite is paced the same way.
+- `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too (unless it is a flat repository the cache has never seen signed: see *Flat repositories*). While a failed adoption of the suite is recorded (its move to the other form failed), the status page shows that failure's reason instead, and the suite is paced the same way.
 
 Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO) and is not counted by `acu_adoption_failing_suites`. `upstream_older` and `rollback_refused` show no lag (the cache already serves content at least as new as upstream's); the other five keep their lag, because the suite is in fact behind. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
 
@@ -812,8 +824,9 @@ applies when `enabled = false`.
 
 The suite reaper deletes the tracked suites (see *Tracked suites*) that no
 client has asked for in `suite_idle_ttl`: a client asks for a suite when it
-fetches the suite's `InRelease`, `Release` or `Release.gpg`, or a `.deb`
-its snapshot vouches for, through the cache. The reaper runs an hour after
+fetches the suite's `InRelease`, `Release` or `Release.gpg` — or, for a
+flat repository, its root `Packages` or `Sources` — or a `.deb` its
+snapshot vouches for, through the cache. The reaper runs an hour after
 the daemon starts and then every hour, whatever `interval` and `enabled`
 say. A run deletes at most 250 of the suites reaped however recently
 they were asked for (below), first, and at most 25 idle ones, those
