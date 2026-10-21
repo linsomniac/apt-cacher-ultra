@@ -23,23 +23,26 @@ func suiteKeyOf(suite SuiteRef) cache.SuiteKey {
 	return cache.SuiteKey{CanonicalScheme: suite.CanonicalScheme, CanonicalHost: suite.CanonicalHost, SuitePath: suite.SuitePath}
 }
 
-// flatIndexClientCreated reports whether flat suite has a client-created
-// root Packages* or Sources* url_path row (aptpath.FileFlatIndex,
-// request_count > 0): spec C4 Dispatch 3 counts it beside the InRelease
-// and Release rows, so a Release-less repository's suite — created by its
-// index's serve — is not dormant (the E carry-forward; plan design note 8).
-// A row hot prefetch or a reconstruction wrote has no request count.
-func (a *Adopter) flatIndexClientCreated(ctx context.Context, suite SuiteRef) (bool, error) {
+// flatIndexClientCreated returns a client-created root Packages* or
+// Sources* url_path row of flat suite (aptpath.FileFlatIndex,
+// request_count > 0), nil when it has none: spec C4 Dispatch 3 counts it
+// beside the InRelease and Release rows, so a Release-less repository's
+// suite — created by its index's serve — is not dormant (the E
+// carry-forward; plan design note 8). A row hot prefetch or a
+// reconstruction wrote has no request count. The row is returned, not a
+// bool, because its stored upstream_url is the probe tree's URL model when
+// no anchor row is cached (ruling PG-20, checkFirst).
+func (a *Adopter) flatIndexClientCreated(ctx context.Context, suite SuiteRef) (*cache.URLPath, error) {
 	rows, err := a.cache.ListSuiteMetadataRows(ctx, suiteKeyOf(suite))
 	if err != nil {
-		return false, fmt.Errorf("read flat index rows: %w", err)
+		return nil, fmt.Errorf("read flat index rows: %w", err)
 	}
-	for _, r := range rows {
+	for i, r := range rows {
 		if r.RequestCount > 0 && aptpath.ClassifySuiteFile(suite.SuitePath, r.Path) == aptpath.FileFlatIndex {
-			return true, nil
+			return &rows[i], nil
 		}
 	}
-	return false, nil
+	return nil, nil
 }
 
 // maxAnchorlessIndexBytes is the anchorless refresh's body cap (plan

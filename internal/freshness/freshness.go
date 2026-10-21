@@ -175,10 +175,14 @@ type Config struct {
 	// reaped but the suite still has a current snapshot (SPEC2 §7.4
 	// freshness recovery). Test seam; production defaults to
 	// aptpath.BuildUpstreamURL(scheme, host, path). AIDEV-NOTE: canonical host is port-less
-	// (SPEC §3.2), so reconstruction drops a non-default upstream port;
-	// the GC identity guard (SPEC4 §5 guard (d)) preserves the original
-	// row's port-correct upstream_url whenever it still exists, so
-	// reconstruction only fires for an already-reaped anchor.
+	// (SPEC §3.2), so reconstruction drops a non-default upstream port.
+	// It is the probes' last resort: anchorURLsFor models every sibling
+	// on a cached anchor row's port-correct upstream_url (the GC identity
+	// guard, SPEC4 §5 guard (d), keeps it while it exists), and checkFirst
+	// models a flat suite that has no cached anchor row on its
+	// client-created root index row's (ruling PG-20; phase G made such
+	// suites active). So reconstruction fires only for a suite with no
+	// cached anchor or index row to model on: an already-reaped anchor.
 	urlReconstruct func(scheme, host, path string) string
 }
 

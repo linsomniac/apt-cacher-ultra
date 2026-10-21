@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
@@ -195,8 +196,10 @@ func (t probeTree) signatureSeen() bool {
 // A suite without client interest in the last 7 days, or without a
 // client-created InRelease or Release url_path row — or, for a flat suite,
 // root Packages*/Sources* row (Adopter.flatIndexClientCreated) — is
-// dormant: no request and no write (the scheduler does not queue it
-// either, see suiteDue). A
+// dormant: no request and no write. The scheduler skips only a suite
+// without interest (suiteDue): one with interest but no client-created row
+// is queued at every tick and ends here, dormant, after its row reads
+// (deferred minor E-25; a flat suite's reads include its index rows). A
 // suite whose record is active and not due is paced (pacedFirst): no
 // request between the scheduler's refresh checks, except the scheduler's
 // slot-driven re-offer of the parked suite (offered: the check's
@@ -222,7 +225,10 @@ func (t probeTree) signatureSeen() bool {
 // is off is the refusal unsigned_disabled, recorded and paced (ruling
 // PE-12). A read error of the anchor rows is logged at WARN with no
 // write and no backoff: a local fault, retried at the next check (at most
-// one per cooldown and per tick).
+// one per cooldown and per tick); so is a read error of a flat suite's
+// index rows. A suite with no cached anchor row but a client-created flat
+// index row is probed beside the index row's stored upstream_url (ruling
+// PG-20).
 //
 // AIDEV-NOTE: a first or unsigned request passes signedCurrent = false to
 // admit, so it never takes the last free slot that the reserved-slot rule
@@ -242,8 +248,10 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 		return nil
 	}
 	rows, clientCreated, err := c.cachedAnchors(ctx, suite)
+	var index *cache.URLPath // a client-created flat index row (Dispatch 3)
 	if err == nil && !clientCreated && aptpath.IsFlatSuitePath(suitePath) {
-		clientCreated, err = c.adopter.flatIndexClientCreated(ctx, suite)
+		index, err = c.adopter.flatIndexClientCreated(ctx, suite)
+		clientCreated = index != nil
 	}
 	if err != nil {
 		c.logger.Warn("freshness: read anchor rows failed",
@@ -276,7 +284,15 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 	}
 	defer release()
 
-	t := c.runProbeTree(fetchCtx, suite, c.anchorURLsFor(suite, rows))
+	urls := c.anchorURLsFor(suite, rows)
+	if urls.model == "" && index != nil {
+		// Ruling PG-20 (spec C1): a suite active only through its
+		// client-fetched flat index is probed beside that row's stored
+		// upstream_url, which keeps a non-default port the port-less
+		// canonical host (and so urlReconstruct) drops.
+		urls.model, urls.modelName = index.UpstreamURL, strings.TrimPrefix(index.Path, suitePath+"/")
+	}
+	t := c.runProbeTree(fetchCtx, suite, urls)
 	switch {
 	case t.end != nil && t.end.cancelled():
 		c.logger.Debug("freshness: check cancelled", "canonical_host", host, "suite_path", suitePath)
