@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -30,9 +31,9 @@ var (
 // a Release-less repository — and a `./` twin's its own; so does any other
 // directory's (the grammar's suite is the literal directory, so a
 // Packages under /nested/sub/main is that directory's root index). An HTML
-// page, a dists suite's root Packages.gz, a flat Contents-* and a flat
-// Release.gpg create none. Without an adopter a flat index creates none
-// (spec C3: InRelease only).
+// page, a dists suite's root Packages.gz, a flat Contents-*, a flat
+// Release.gpg and a file that is no suite file create none. Without an
+// adopter a flat index creates none (spec C3: InRelease only).
 func TestServeHTTP_FlatIndexMissCreatesItsSuiteRow(t *testing.T) {
 	for _, adoption := range []bool{true, false} {
 		r := newSuiteRig(t, adoption, 0)
@@ -57,6 +58,7 @@ func TestServeHTTP_FlatIndexMissCreatesItsSuiteRow(t *testing.T) {
 			"/fury": adoption, "/fury/.": adoption, "/goreleaser": adoption,
 			"/nested/sub/main": adoption,
 			"/soft404":         false, "/u/dists/s": false, "/contents": false, "/gpg": false,
+			"/core:/stable:/v1.34/deb": false, // a non-suite file under a flat-looking directory
 		} {
 			if got := r.suite(suite) != nil; got != want {
 				t.Errorf("adoption=%v: %s has a row = %v, want %v", adoption, suite, got, want)
@@ -72,7 +74,8 @@ func TestServeHTTP_FlatIndexMissCreatesItsSuiteRow(t *testing.T) {
 // hit on a cached sniff-passing flat anchor or flat index of a suite
 // without a row creates the row before the body — a flat InRelease with
 // its base's marker in the creating transaction, its `./` twin's InRelease
-// its own row under the same base, a detached flat suite's Release
+// its own row under the same base (and a twin whose base has no other
+// cached anchor, /solo/., marks that base itself), a detached flat suite's Release
 // marking its cached Release.gpg, and (adopter wired) a Release-less
 // suite's cached Packages.gz with no marker — and the hit's T1 checks it.
 // A cached flat Contents-* onboards nothing.
@@ -81,20 +84,24 @@ func TestServeHTTP_HitOnboardsAFlatSuite(t *testing.T) {
 	const k8s = "/core:/stable:/v1.34/deb"
 	r.cacheAnchor(k8s+"/InRelease", rowInRelease, 1_700_000_000)
 	r.cacheAnchor(k8s+"/./InRelease", rowInRelease, 1_700_000_000)
+	r.cacheAnchor("/solo/./InRelease", rowInRelease, 1_700_000_000)
 	r.cacheAnchor("/jenkins/binary/Release", rowRelease, 1_700_000_000)
 	r.cacheAnchor("/jenkins/binary/Release.gpg", rowGPG, 1_700_000_100)
 	r.cacheAnchor("/fury/Packages.gz", flatPackagesGz, 1_700_000_000)
 	r.cacheAnchor("/contents/Contents-amd64.gz", flatPackagesGz, 1_700_000_000)
-	for _, p := range []string{k8s + "/InRelease", k8s + "/./InRelease", "/jenkins/binary/Release", "/fury/Packages.gz",
-		"/contents/Contents-amd64.gz"} {
+	for _, p := range []string{k8s + "/InRelease", k8s + "/./InRelease", "/solo/./InRelease", "/jenkins/binary/Release",
+		"/fury/Packages.gz", "/contents/Contents-amd64.gz"} {
 		if rec := r.get(p); rec.Code != http.StatusOK || rec.Header().Get(hdrXCache) != cacheHit {
 			t.Fatalf("%s = %d %q, want a hit", p, rec.Code, rec.Header().Get(hdrXCache))
 		}
 	}
-	for _, suite := range []string{k8s, k8s + "/.", "/jenkins/binary", "/fury"} {
+	for _, suite := range []string{k8s, k8s + "/.", "/solo/.", "/jenkins/binary", "/fury"} {
 		if s := r.suite(suite); s == nil || s.LastCheckAt != nil {
 			t.Fatalf("%s: row %+v, want onboarded with NULL check stamps", suite, s)
 		}
+	}
+	if r.suite("/solo") != nil || !r.marked("/solo") {
+		t.Fatal("the twin /solo/. alone: want no /solo row and the base /solo marked by the twin's own onboarding")
 	}
 	if r.suite("/contents") != nil {
 		t.Fatal("a cached flat Contents-* onboarded its suite")
@@ -113,7 +120,7 @@ func TestServeHTTP_HitOnboardsAFlatSuite(t *testing.T) {
 	for _, c := range r.fresh.snapshot() {
 		checked[c.suitePath] = true
 	}
-	for _, suite := range []string{k8s, k8s + "/.", "/jenkins/binary", "/fury"} {
+	for _, suite := range []string{k8s, k8s + "/.", "/solo/.", "/jenkins/binary", "/fury"} {
 		if !checked[suite] {
 			t.Errorf("no T1 for the onboarded %s (T1 for %v)", suite, checked)
 		}
@@ -146,6 +153,25 @@ func TestServeHTTP_FlatRootIndexServesTouchTheirSuite(t *testing.T) {
 
 	if f := aptpath.ClassifySuiteFile("/hit", "/hit/Contents-amd64.gz"); f.Touches() {
 		t.Fatalf("a flat Contents-* is suite file %d, want none (no touch)", f)
+	}
+
+	// Through the handler: a tracked suite's Contents-* hit touches its
+	// url_path row and not its suite. The hit's touch goroutine touches the
+	// row first and its suites right after, so once the row's count moved
+	// the suite's stamp must stay old.
+	r.trackOld("/contents")
+	r.cacheAnchor("/contents/Contents-amd64.gz", flatPackagesGz, 1_700_000_000)
+	if rec := r.get("/contents/Contents-amd64.gz"); rec.Code != http.StatusOK || rec.Header().Get(hdrXCache) != cacheHit {
+		t.Fatalf("Contents-* = %d %q, want a hit", rec.Code, rec.Header().Get(hdrXCache))
+	}
+	waitFor(t, "the Contents-* hit's url_path touch", func() bool {
+		u, err := r.c.LookupURL(context.Background(), "http", "127.0.0.1", "/contents/Contents-amd64.gz")
+		return err == nil && u.RequestCount > 1
+	})
+	for deadline := time.Now().Add(100 * time.Millisecond); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if got := r.requested("/contents"); got != 1000 {
+			t.Fatalf("a flat Contents-* serve touched its suite (last_requested_at %d)", got)
+		}
 	}
 }
 
@@ -193,7 +219,7 @@ func TestServeHTTP_OnboardsAFlatSuiteFromAV6Cache(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO blob(hash,size,created_at,refcount) VALUES(?,?,1,0)`, hash, len(rowInRelease)); err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{"/repo/InRelease", "/repo/./InRelease"} {
+	for _, p := range []string{"/repo/InRelease", "/repo/./InRelease", "/other/./InRelease"} {
 		if _, err := db.Exec(`INSERT INTO url_path(canonical_scheme,canonical_host,path,blob_hash,upstream_url,is_metadata,last_requested_at,request_count)
 		 VALUES('http','127.0.0.1',?,?,?,1,1700000000,3)`, p, hash, "http://127.0.0.1"+p); err != nil {
 			t.Fatal(err)
@@ -228,7 +254,11 @@ func TestServeHTTP_OnboardsAFlatSuiteFromAV6Cache(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(h.Close)
-	for _, tc := range []struct{ path, suite string }{{"/repo/InRelease", "/repo"}, {"/repo/./InRelease", "/repo/."}} {
+	// /other/. is a twin whose base has no other cached anchor: its base's
+	// marker can come only from its own onboarding (MarkerBase, not the
+	// twin's own path).
+	for _, tc := range []struct{ path, suite string }{{"/repo/InRelease", "/repo"}, {"/repo/./InRelease", "/repo/."},
+		{"/other/./InRelease", "/other/."}} {
 		p := &firstByteProbe{ResponseRecorder: httptest.NewRecorder(), c: c, suite: tc.suite}
 		h.ServeHTTP(p, newProxyReqHostPort("GET", "http", "127.0.0.1", tc.path))
 		if p.Code != http.StatusOK || p.Header().Get(hdrXCache) != cacheHit || !p.seen {
@@ -239,10 +269,15 @@ func TestServeHTTP_OnboardsAFlatSuiteFromAV6Cache(t *testing.T) {
 		}
 	}
 	all, err := c.ListSuites(ctx)
-	if err != nil || len(all) != 2 {
-		t.Fatalf("suite rows = %+v, %v; want /repo and /repo/.", all, err)
+	if err != nil || len(all) != 3 {
+		t.Fatalf("suite rows = %+v, %v; want /repo, /repo/. and /other/.", all, err)
 	}
-	if _, ok, err := c.SignedSeen(ctx, "http", "127.0.0.1", "/repo"); err != nil || !ok {
-		t.Fatalf("the twins' shared base marker = %v, %v", ok, err)
+	for _, base := range []string{"/repo", "/other"} {
+		if _, ok, err := c.SignedSeen(ctx, "http", "127.0.0.1", base); err != nil || !ok {
+			t.Fatalf("base %s marker = %v, %v", base, ok, err)
+		}
+	}
+	if _, ok, err := c.SignedSeen(ctx, "http", "127.0.0.1", "/other/."); err != nil || ok {
+		t.Fatalf("a marker keyed by the twin's own path /other/. = %v, %v; want none (markers key the base)", ok, err)
 	}
 }
