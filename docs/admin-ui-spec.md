@@ -348,9 +348,10 @@ next to the Suites table contract in §5.3:
 | Field | Type | Meaning |
 |---|---|---|
 | `scheme` | string | The suite's canonical scheme, `http` or `https` (phase F, ruling PF-7): a repository can be tracked under both, as two rows with the same `host` and `suite_path`, and `POST /forget` (`docs/configuration.md`, *Forgetting a suite*) takes it, defaulting to `https`. The Suites table's Host column shows it as `scheme://host`. |
+| `flat` | boolean | `true` for a flat repository's suite — a suite path with no `dists` segment, its `./` twin included (spec C2) — and `false` for a `dists/` suite (phase G). The Suites table's Suite path cell shows a neutral `flat` badge after the path. |
 | `anchor_form` | string | The current snapshot's anchor form — `inline`, `detached` or `unsigned` (a `Release` no signature covers: it vouches no `.deb`); empty when the suite has no current snapshot. |
 | `last_requested_unixtime` | int64 or `null` | When a client last showed interest in the suite (spec C3): written when the suite's row is created, then by coalesced touches — at most one write per suite per hour — from serves of its anchors (`InRelease`, `Release`, `Release.gpg`; status below 400, 304 and HEAD included), of its flat indexes, and of `.deb`s its current snapshot vouched for. Index requests such as `Packages.gz` never move it. It decides cap eviction: at the `freshness.max_suites` cap, a suite with no current snapshot whose stamp is 24 hours old or more can be evicted for a new one (`suite_evicted`). |
-| `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, which also records `anchor_absent`; a signature the check found but could not record as seen). An unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled`, not a failed check. Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. |
+| `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, which also records `anchor_absent`; a signature the check found but could not record as seen), or — a flat repository without a `Release` (phase G) — refreshed its cached index files with no content answer (an HTML page for each, 401, 403). An unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled`, not a failed check, and so is a flat repository without a `Release` while the knob is off. Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. |
 | `adoption_fail_reason` | string or `null` | The current failure or refusal reason; `null` when no record exists. |
 | `adoption_fail_count` | int64 | Consecutive adoption attempts in the current failure/refusal streak; `0` when no record exists. |
 | `adoption_fail_first_unixtime` | int64 or `null` | When the current streak started; for `unsigned_unconfirmed` and `anchor_absent`, when the current bytes (or absence) were first observed — it restarts on new content while `adoption_fail_count` keeps growing. |
@@ -360,7 +361,8 @@ next to the Suites table contract in §5.3:
 These are additive to the locked JSON contract (§0.1), the same way
 `keyring[]` was: no existing key changes shape or meaning (`scheme` too:
 the HTML Host cell gains the `scheme://` prefix, the JSON `host` is
-unchanged).
+unchanged; `flat` too: the HTML Suite path cell gains its badge, the JSON
+`suite_path` is unchanged).
 
 **Adoption column.** The Suites table's "Adoption" column renders the
 record above as one line, via the server-side `adoptionStatus` helper:
@@ -836,7 +838,7 @@ Per-section copy:
 
 | Section          | Eyebrow                  | Body                                                                                                  |
 |------------------|--------------------------|-------------------------------------------------------------------------------------------------------|
-| Suites           | NO SUITES TRACKED YET    | A suite is tracked once a client requests its InRelease through the proxy (with adoption enabled, also its Release). |
+| Suites           | NO SUITES TRACKED YET    | A suite is tracked once a client requests its InRelease through the proxy (with adoption enabled, also its Release, or, for a flat repository, its root `Packages` or `Sources`). |
 | Adoptions        | RING BUFFER EMPTY        | Process started {uptime} ago.                                                                         |
 | Keyring (disabled) | ADOPTION DISABLED      | Keyring is not loaded because `[adoption].enabled = false`. Enable adoption to bundle default keys.   |
 | Keyring (crit)   | NO GPG KEYS LOADED       | Adoption is enabled but no keyring entries are present. Every adoption will fail with `gpg_failed`.   |

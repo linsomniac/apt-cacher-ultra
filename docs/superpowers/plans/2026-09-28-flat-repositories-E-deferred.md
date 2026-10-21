@@ -13,7 +13,6 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
 
 ## internal/freshness — adoption members and SHA512
 
-- **E-9** `adoption.go`: `adoption_member_skipped` logs `declared_sha256=""` for a SHA512-only member; add `declared_sha512`. (G: SHA512-only flat repositories) (Task 2 minor 4)
 - **E-10** `member_verify.go`: `memberWriter` embeds `*cache.BlobWriter`, exposing `Finalize`/`FinalizeExpectingHash`; only an AIDEV-NOTE keeps a caller from skipping `verifyMember`. An unexported field with forwarded `Write`/`Truncate`/`Written`/`Abort` would enforce it. Plan-mandated shape; optional. (Task 2 minor 5)
 - **E-11** Coverage: no test exercises a size mismatch for a SHA512-only member in `verifyMember` (the `Finalize(size)` path); the "no SHA256 or SHA512 block" and "empty SHA256 and SHA512 blocks" parse errors are pinned by prefix only. (Task 2 minor 6)
 - **E-13** `flip_barrier.go` (since C-19's file split; this entry said `adoption.go`): the C-16 WARN `adoption: served anchor read failed; the flip barrier runs` also fires on a routine restart (a stop after the stop check or the re-mark, before the read); skip it on `context.Canceled` or when `p.stopErr(ctx) != nil`, as the final fix wave did for the check's local steps (FW-3 (d)). Shutdown noise. (Task 3 minor 7; concurrency can-wait)
@@ -21,9 +20,6 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
 
 ## internal/freshness — unsigned form and markers
 
-- **E-16** `unsigned.go` re-mark: the twin direction "suite `/flat/.` with the evidence at `/flat/InRelease`" is untested (`range []string{suite.SuitePath, suite.SuitePath + "/."}` survives). No twin row exists before G. (G) (Task 3 minor 3)
-- **E-17** `unsigned_test.go` (`TestRunUnsigned_FailedRemarkRefuses`): `recs[0]["err"] == ""` is false when the key is absent, so dropping `"err", err` from the re-mark's log survives; `TestRunUnsigned_RemarkReadErrorRefuses` checks no `err` at all. Assert a non-empty string. (Task 3 minor 4)
-- **E-19** Survivor W5: `markSignatureSeen`'s base (`aptpath.MarkerBase`) is unpinned — marking `suite.SuitePath` survives, as no twin suite exists before G. (G) (tests lens W5)
 
 ## internal/freshness — the check
 
@@ -55,7 +51,6 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
 
 ## internal/freshness — tests and simulations
 
-- **E-47** `retry_rig_test.go`: the rig start `1_800_000_000` is a literal in two places (hoist a `rigStart` const); `rigVerifier.n` is reset by the same three lines in two helpers (a `resetCalls()`). (Task 5)
 - **E-48** `internal/handler/phase2_detached_chaos_test.go` hand-builds the armored-signature shape `armoredSig` builds in freshness; a `simtest.ArmoredSignatureFixture(label)` beside `ClearsignedFixture` would give one definition of a sniff-passing `Release.gpg`. (Task 5)
 - **E-50** `sim_retry_test.go` (`TestSimRetry_LongRunDateRulesAndClockSteps`): the liveness floor is carried by the failing phases (276 of 317 checks); each 2-day clock-step stretch gives 18, below the 10-a-day floor. Give each stretch its own floor (≥ 16). (Task 14 minor 2)
 - **E-51** `sim_sched_test.go` `renderedMetricLabels` is a fifth render-and-scan metrics helper (`renderedMetric`, `checkTotal`, `hostCounter`, `adoptionTotalFor`); its call site drops the `ParseFloat` error, so a missing series reads 0 with a misleading message. (Task 14 minor 3)
@@ -67,20 +62,12 @@ Left out: everything the phase E final fix wave resolved — the two never-downg
 
 ## internal/handler
 
-- **E-57** `singleflight.go` with `serveCacheMiss`: the strict-wait retry can re-join the call it retries (the leader signals `Done` before deleting the key, deliberately), reading the stale `errUnvouchedRetryable` — at worst one spurious refusal, the pre-phase-E outcome. Observed under CPU load in the final fix wave's load runs (`TestServeHTTP_StrictWaitRefusals`' retry did not coalesce); the test now starts each retry after the finished call left the map. Give the retry a fresh call (mark calls done under `g.mu`, skip a done entry, delete only one's own entry), or say so in serveCacheMiss's AIDEV-NOTE. (Task 9 minor 1; concurrency can-wait)
 - **E-58** `internal/freshness/inflight.go`: the 64-waiter cap is checked before "nothing in flight", so a request arriving as the last adoption ends with 64 waiters still unwinding is refused instead of re-running its lookup. Reorder. (Task 9 minor 3)
 - **E-59** Test gaps: dropping `snapshotCount` from the retryable result survives (no test reads the O1 line's `current_snapshot_count`); removing the hit path's `AdoptionsInFlight` pre-check survives (no hit-path leg has nothing in flight). (Task 9 minor 4)
-- **E-60** `serveCacheMiss` overwrites `shared` and `waiters` with the retry's call: the first call's `singleflight coalesced` line is dropped, and a joiner refused off the first call gets no `unvouched_deb_refused` event. Log attribution only; add the AIDEV-NOTE sentence. (Task 9 minor 6)
 - **E-61** `internal/freshness/inflight.go` `wait` wakes only when a host's count reaches 0, so with overlapping signed adoptions a request whose snapshot committed early sleeps the full bound (documented in configuration.md). Waking on every `end` would respond sooner. (Task 9 minor 7)
 - **E-62** `internal/freshness/inflight.go`: a parameter named `max` shadows the builtin in a file that uses `min`; `maxWait`. (Task 9 minor 8)
-- **E-64** A creating miss whose late registration finds a snapshot current (it waited in a hold, or a flip committed just before it — re-dispatched since the final fix wave, FW-4 (c)) fires T1 twice: `trySnapshotHit`'s and the deferred seed T1. The second is a cooldown skip. Say so in the T1-on-seed comment, or skip the seed T1 when the re-dispatch served. (Task 10 minor 1; concurrency can-wait)
-- **E-65** Unpinned: widening `created` to `|| stored.Create.Outcome == cache.SuiteExists` survives every T1/seed/onboarding test (no test runs two concurrent first-contact misses on different files of one suite); design note 32's "a deadline already past fails the backstop at once" (a floor in `missBackstopDeadline` survives); D-34's "the shutdown cuts both short" for onboarding's backstop. (Task 10 minor 2)
 - **E-66** `seed_t1_test.go` X27 (coalesced creating miss) depends on two misses coalescing within a real 300 ms upstream delay; a flipStack in a bubble with a recording freshness double is deterministic. Passed 20 of 20 under load; same class as the strict-wait window FW-4 (d) closed. (Task 10 minor 3)
-- **E-67** `suite_rows.go`: comments still treat `backstopTimeout` as onboarding's bound (onboarding's backstop runs to its own deadline); `suite_rows_test.go` asserts `backstopTimeout` for the hit leg, passing only because `onboardTimeout == backstopTimeout`; `missBodyBudget`'s doc says it bounds the wait before the body, but only the backstop honours it; "On a timeout the hit serves untracked" holds only for the creation. (Task 10 minor 4)
-- **E-68** `suite_rows.go` `runOnboard`'s `r *http.Request` is unused since D-34 (plan-fixed signature). (Task 10 minor 5)
 - **E-69** `seed_t1_test.go`: `commitSnapshotWhenTracked` repeats the setup `TestServeHTTP_LateRegistrationThatWaitedServesTheNewSnapshot` inlines, and five of the file's tests are not about T1. (Task 10 minor 6)
-- **E-70** `unsigned_posture_test.go`: the `current_snapshot_count` check runs only if an `unvouched_deb_refused` record exists, and nothing requires one — the only thing in leg 1 that catches a coverage read counting unsigned snapshots. Require exactly one record. (Task 12)
-- **E-71** Survivor of the final fix wave (FW-5 (a)): the hit path's `case strictCanceled` is unpinned — reachable only when the request's context ends between its two strict-mode lookups (a dead context fails the first, which returns first). Both sides of that window are pinned. Needs a lookup seam to test. (final fix wave)
 
 ## internal/config and cmd
 

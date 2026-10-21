@@ -117,7 +117,8 @@ flip_quiet_period     = "10s"
 # consistent observations). Such a snapshot never vouches a .deb or counts
 # for strict mode, and is refused once a signed anchor has been served for
 # the suite (which a party able to inject one can use to block it; see the
-# reference). false refuses them (unsigned_disabled), so the cache no longer
+# reference). false refuses them (unsigned_disabled) and stops refreshing a
+# flat repository that publishes no Release at all, so the cache no longer
 # keeps unsigned repositories fresh: an unsigned suite already adopted keeps
 # its last snapshot, not updated, until this is turned back on or the suite
 # is forgotten or reaped; one not yet adopted (a forgotten or reaped one
@@ -131,7 +132,8 @@ adopt_unsigned        = true
 validate_at_rest_interval = "24h"
 validate_at_rest_workers  = 4     # >= 1 with scanning on; >= 0 otherwise
 # Refuse unvouched .debs with 502 only when adoption is enabled and every
-# current snapshot on the host has complete package coverage.
+# signed current snapshot on the host (a flat repository's included) has
+# complete package coverage.
 refuse_unvouched_debs     = false
 
 [hot_packages]

@@ -274,7 +274,8 @@ a tracked suite; otherwise it is fetched from upstream.
 With adoption enabled, a tracked suite that has no snapshot yet is
 adopted on its first check, in whichever form its upstream publishes (see
 *Anchor forms and unsigned repositories*), when a client asked for it in
-the last 7 days and a client fetched its `InRelease` or `Release` through
+the last 7 days and a client fetched its `InRelease` or `Release` — or,
+for a flat repository, its root `Packages` or `Sources` — through
 the cache (a copy the cache rebuilt for itself does not count). The
 request that creates a suite starts its first check once its response is
 sent, so a new repository is adopted within seconds of its first
@@ -294,7 +295,10 @@ doubling to an hour), or once `periodic_refresh` has passed since its last
 check if that comes first; checks that clients trigger in between ask
 upstream nothing. A suite whose upstream serves neither `InRelease` nor
 `Release` fails its check (backing off from 2 minutes to an hour) and
-shows "refused: anchor_absent" on the status page.
+shows "refused: anchor_absent" on the status page — unless it is a flat
+repository the cache has never seen signed, which is refreshed without a
+`Release` (see *Flat repositories*), or, while `adoption.adopt_unsigned`
+is off, shows "refused: unsigned_disabled" instead.
 
 First adoptions never take the last free adoption slot, which is kept for
 suites that already serve a signed snapshot (see *Capacity and
@@ -313,13 +317,96 @@ only, and a miss that creates a suite starts no check (a cache hit on a
 suite's anchor still triggers its usual check, under the `cooldown`, also
 the hit that creates the suite's row).
 
+### Flat repositories
+
+A flat repository — one without a `dists/` tree, configured as
+`deb <uri> <dir>/` or `deb <uri> ./` (pkgs.k8s.io, NVIDIA CUDA,
+pkg.jenkins.io, Gemfury) — is tracked as the suite of the directory that
+holds its `InRelease` or `Release`. The `./` form keeps its literal `/.`
+and is a suite of its own, the directory's *twin*: `deb https://h/repo ./`
+and `deb https://h/repo/ /` are two suites, each with its own row and
+snapshot, that share the record of having been seen signed. With adoption
+enabled a flat repository's root `Packages` or `Sources` (plain or
+compressed) tracks its suite too, when its bytes are what they claim. A
+flat repository at the host root (`deb https://h/ ./`) is not supported:
+it is served from the ordinary cache and never refreshed, and the daemon
+logs WARN `flat_host_root_unsupported` (at most one line a minute).
+
+A signed or unsigned flat repository is adopted like any other (see
+*Anchor forms and unsigned repositories*). Its `Release` must list its
+root `Packages`, whose fetch failing fails the adoption, and the `.deb`
+files that `Packages` names are vouched by the paths apt requests for
+them: `<uri>/<Filename>`, with or without a leading `./`, for whichever
+directory at or above the `Release` the repository's `<uri>` is
+(pkg.jenkins.io's `binary/…` one level up, Sublime Text's `files/…` at the
+host root). A path of more than 32 segments is vouched only as the
+`Packages` file spells it. Because a `Filename` may name a path under any
+directory above its `Release`, a signed flat repository's `Packages`
+also constrains such a path of another repository on the same host,
+while no signed snapshot of that repository vouches the path: on a host
+shared by many tenants (Open Build Service projects, say) one tenant's
+`Filename` can make another tenant's `.deb` fail its hash check (502),
+strict mode on or off. A declaration only ever refuses bytes that do not
+match it; it never lets other bytes through. The two twins declare the
+same paths: when upstream rewrites a `.deb` in place with new bytes, the
+twin that adopted the new `Packages` and the twin still serving the old
+one disagree on its hash, and the file is refused (502,
+`package_hash_conflict`) under both twins until the second one adopts —
+at its next check, at most `periodic_refresh` later unless that adoption
+fails.
+
+A flat repository that publishes no `Release` at all (Gemfury, goreleaser)
+is refreshed without one, as long as the cache has never seen it signed
+and `adoption.adopt_unsigned` is on (with it off, such a repository is
+served as the cache first stored its files and shows "refused:
+unsigned_disabled"; turning the knob on resumes its refresh): each check
+sends one conditional request for every cached `Packages`, `Sources` and
+`Contents-*` file of the suite, in that order, with the validators
+upstream gave it, and reads at most two such files at once across the
+whole process. A changed file replaces the cached one when its bytes pass
+the same content check as on first contact; an HTML page or anything else
+that fails it keeps the old file (counted in
+`acu_anchorless_sniff_rejected_total{host}`), and a plain `Contents-*`,
+which has no such check, is deleted when it changed, for the next client
+request to fetch. A file upstream deletes (404, 410) is deleted, and so is
+a cached `InRelease` or `Release` that upstream now answers so, unless a
+client's own fetch stored other bytes for it meanwhile; anything else —
+401, 403, a 5xx, a timeout, a body over 64 MiB — keeps the file. A check
+that asks for files counts as answered only when at least one of them got
+a real answer (304, a 200 stored or identical to the cached file, 404 or
+410): one whose files got none — an HTML page for every file (a captive
+portal, a vendor's retired site; even a page the cache already holds), 401
+and 403, a changed plain `Contents-*` — fails and backs off, so the status
+page shows the repository failing rather than healthy. Such a repository
+has no snapshot: it vouches nothing and leaves strict mode alone. Its
+index files are served with `Last-Modified` the later of the file's time
+and its last refresh, so apt's `If-Modified-Since` sees a replacement. The
+check logs `freshness_check` with `result=anchorless_refreshed` or
+`anchorless_unchanged`, and the repository is adopted at the first check
+after it starts publishing an `InRelease` or `Release`. A flat repository
+the cache has seen signed (a record of a signature for its path, a cached
+`InRelease` or `Release.gpg` that passes its check, or an adopted signed
+snapshot) is never refreshed this way: when its `InRelease` and `Release`
+disappear it fails its checks and shows "refused: anchor_absent", so
+stripping a signed repository's signatures cannot turn it into an
+unverified one.
+
+Two limits of the refresh without a `Release`. Behind an upstream that
+answers 403 for a missing file (Amazon S3, CloudFront), a file the
+repository removed stays cached and served: if that is the `Packages.xz`
+apt tries first, a client never sees the fresh `Packages.gz`. And a
+repository whose only index is a plain `Packages` that is empty at first
+contact gets no suite (an empty file is not recognisably an index): it is
+served as cached and never refreshed; likewise an index that later
+becomes empty is never stored (the cached one stays).
+
 ## `[adoption]`: snapshots, trust, and recovery
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them, so tracked suites lag upstream by design: the status page's SUITES vital then reads "ADOPTION DISABLED — METADATA NOT REFRESHED" (stale, not a fault), rows keep their lag text without warning, and failure records left from a time adoption was enabled are inert (no retries, `acu_adoption_failing_suites` reports 0). The suite reaper still runs (see *Suite reaping* under `[gc]`): a suite no client asked for in `gc.suite_idle_ttl` has its cached index files deleted, so clients that come back to it fetch upstream's current files through the cache, which then stay as fetched. |
 | `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are adopted in the unsigned form instead (`adopt_unsigned`). |
-| `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` refuses every unsigned `Release` ("refused: unsigned_disabled", a state, not a failed check), so the cache no longer keeps unsigned repositories fresh: an unsigned suite already adopted keeps serving its last snapshot, coherent but frozen — never updated — until the knob is turned back on (it then updates at its next retry, at most 75 minutes later: a restart keeps a refusal's retry time), the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, which is worse: the forget or reap deletes its cached index files first, so its next requests fetch upstream's current files, but it stays unadopted and each file then stays as the cache first stored it, never refreshed, so an upstream publish can leave its clients with Hash Sum mismatches. Set it to `false` only if you do not serve unsigned repositories through the cache. Either way the suite is asked upstream again only at its retry times (2 minutes, doubling to an hour; for a suite not yet adopted, also once `periodic_refresh` has passed), never at the checks clients trigger in between. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
+| `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` refuses every unsigned `Release` ("refused: unsigned_disabled", a state, not a failed check), so the cache no longer keeps unsigned repositories fresh: an unsigned suite already adopted keeps serving its last snapshot, coherent but frozen — never updated — until the knob is turned back on (it then updates at its next retry, at most 75 minutes later: a restart keeps a refusal's retry time), the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, which is worse: the forget or reap deletes its cached index files first, so its next requests fetch upstream's current files, but it stays unadopted and each file then stays as the cache first stored it, never refreshed, so an upstream publish can leave its clients with Hash Sum mismatches. Off also stops the refresh of a flat repository that publishes no `Release` at all (see *Flat repositories* under `[freshness]`): it is served as the cache first stored its files, and the status page shows "refused: unsigned_disabled"; turning the knob on resumes its refresh. Set it to `false` only if you do not serve unsigned repositories through the cache. Either way the suite is asked upstream again only at its retry times (2 minutes, doubling to an hour; for a suite not yet adopted, also once `periodic_refresh` has passed), never at the checks clients trigger in between. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
 | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
 | `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. A decodable clearsigned `InRelease` (or, for the detached pair, a parseable `Release.gpg` signature) is still required, as in every mode. Matching pins keep normal verification. Logs a startup warning. |
 | `allow_short_keyid` | boolean | `true` | Accept signatures containing only a legacy 64-bit issuer key ID when it uniquely identifies a loaded trusted key and cryptographic verification succeeds. `false` requires the long issuer fingerprint. |
@@ -347,7 +434,7 @@ Seven outcomes are refusals, not failures, and are shown as "refused: …" on th
 - `unsigned_unconfirmed`: an unsigned repository's first adoption waits for a second observation of the same `Release` (see *Anchor forms and unsigned repositories*).
 - `unsigned_downgrade_refused`: the suite has been seen signed, so its unsigned `Release` is not adopted.
 - `unsigned_too_large`: an unsigned `Release` declares more than 1,000 files.
-- `unsigned_disabled`: `adopt_unsigned = false`, so an unsigned `Release` is not adopted; an unsigned suite already adopted keeps serving its last snapshot, not updated, until the knob is turned back on, the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, served as the cache first stored its files (see `adopt_unsigned`).
+- `unsigned_disabled`: `adopt_unsigned = false`, so an unsigned `Release` is not adopted; an unsigned suite already adopted keeps serving its last snapshot, not updated, until the knob is turned back on, the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, served as the cache first stored its files (see `adopt_unsigned`). A flat repository that publishes no `Release` at all is refused this way too while the knob is off: it is not refreshed (see *Flat repositories*).
 - `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too. While a failed adoption of the suite is recorded (its move to the other form failed), the status page shows that failure's reason instead, and the suite is paced the same way.
 
 Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO) and is not counted by `acu_adoption_failing_suites`. `upstream_older` and `rollback_refused` show no lag (the cache already serves content at least as new as upstream's); the other five keep their lag, because the suite is in fact behind. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
@@ -667,7 +754,10 @@ whose signed suites all have complete coverage: unsigned snapshots never
 vouch and never count, so a host whose only snapshots are unsigned is
 never strict. Strict posture changes as eager first adoptions land after
 an upgrade. Conversely, a signed snapshot with incomplete coverage turns
-strict mode off for its whole host.
+strict mode off for its whole host. A `.deb` whose name begins like an
+index file (a package named `icons-foo`, a flat repository's
+`Packages_1.0_all.deb`) is a package all the same: vouched, checked and
+refused like any other.
 
 Strict mode fails open on a database error: when the cache cannot read a
 package's vouching hashes or its host's snapshot coverage, the `.deb` is
@@ -731,7 +821,8 @@ asked for least recently first; a suite being checked or adopted at
 that moment is skipped — it counts toward its kind's number — and tried
 again at the next run. Reaping a suite deletes its cached index files
 (its `InRelease`, `Release`, `Packages` and the rest of its `dists/`
-tree, in batches of 1,000 files), retires its snapshots and deletes its
+tree — a flat repository's root files, never its `./` twin's — in
+batches of 1,000 files), retires its snapshots and deletes its
 row (INFO `suite_reaped`; `acu_suites_reaped_total{reason}` counts the
 reaps). The reaper deletes no package, but a reaped suite's packages
 lose the version retention its snapshot gave them
@@ -794,7 +885,18 @@ every such file was fetched at least a day earlier, so a repository that
 answered with an error page for a few hours is kept, and so is one whose
 cached `InRelease` is a plain unsigned `Release` (the cache adopts such a
 repository through its `Release`); a file that cannot be read is never
-taken for an error page.
+taken for an error page. A flat repository the cache has never seen
+signed (see *Flat repositories* under `[freshness]`) is judged by its
+cached `InRelease`, `Release` and `Release.gpg` and its cached root
+`Packages` and `Sources` files together, by the same rules: it is reaped
+as junk only when it has at least one of them and each is something else
+than its name says (an HTML page cached as `Packages.gz`, say) and was
+fetched at least a day earlier — so a healthy repository without a
+`Release` on a host that answers `InRelease` and `Release` with an HTML
+page keeps its good `Packages.gz`. A flat repository seen signed, like
+any `dists/` suite, is judged by its anchor files alone. A run that
+cannot read those files, or whether a repository was seen signed, judges
+the repositories concerned at its next run.
 
 A suite whose last request lies in the future (the clock was stepped
 back) is never idle — the two kinds above are reaped all the same — and

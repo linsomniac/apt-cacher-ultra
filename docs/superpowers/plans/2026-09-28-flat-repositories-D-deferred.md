@@ -8,8 +8,6 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
 
 ## internal/aptpath
 
-- **D-3** `sniff_test.go` (`TestSniffFlatIndex`): only `.gz` and `.xz` have negative magic rows; shortening the `.zst` or `.lzma` magic (`sniff.go:123-125`; `.bz2`, `.lz4` alike) survives. Fix: one near-miss row per extension. Can wait: flat indexes are unreachable until G. (G) (Task 1 minor 4)
-- **D-4** `sniff.go:192`: `ClassifySuiteFile` (the PD-9 gate and the R-D3 routing point) has no AIDEV-NOTE naming its precondition (`suite` is `SuitePath(path)`), the `""` guard its callers rely on, and that its flat branch is reachable only from tests until G; `SuitePath`'s phase-G AIDEV-NOTE does not point here. (G) (Task 1 minor 5)
 
 ## internal/gpg
 
@@ -27,15 +25,12 @@ Left out: everything the phase D final fix wave resolved — CreateSuite's faile
 ## internal/freshness
 
 - **D-26** `reconcile_r1_test.go` (`DecodesAptsMarkerLine`) never asserts that `bytes.Replace` matched: if the encoder's first line ever ended in "\r\n", the test would pass without exercising the trailing-blank path. Fix: a `bytes.Equal(blanks, signed)` guard. (Task 3 minor 5)
-- **D-27** `reconcile_test.go` (`RejectsCorruptedAnchor`) asserts only `err != nil` while its comment says only the hash check can refuse it; assert the error contains "hash mismatch". (Task 3 minor 6)
 
 ## internal/handler
 
 - **D-28** `phase2_handler_test.go`: the local `staleBody` shadows the package helper `staleBody(path)` (`handler_test.go`); rename it, e.g. `staleAnchor`. (Task 3 minor 1)
 - **D-29** `fetch_seam_test.go`: the `recFetcher` type doc says it "answers every request with body", untrue when `inRelease` is set (only the field comment says so). (Task 3 minor 2)
 - **D-30** `phase2_handler_test.go` (`TestServeHTTP_AdoptedSuiteSnapshotMemberDBError_FailsClosed`): its upstream `/InRelease` body `"attacker bytes"` stays plain text with no PD-2 comment (no effect: the test asserts zero upstream calls; its sibling was wrapped). (Task 3 minor 4)
-- **D-31** Untested: the recover inside the rejection sweep's `expire` itself (its `onPanic` wiring and `Handler.Close` stopping it are pinned since the fix wave), and `New` refusing a negative `MaxSuites`. (Task 9 minor 2, narrowed)
-- **D-32** `suite_rows.go`: `cachedAnchors` and `markCachedSignedAnchors` repeat one loop (iterate, skip `except`, `LookupURL`, classify, `readHead`, sniff); the in-transaction mark and the backstop must agree on what counts as signed. One helper returning `(row, signed, err)` would keep them together. `runFetch` also builds `suiteSeed` twice with identical arguments. Can wait: the copies agree today. (G: if the sniff rules change) (Task 9 minor 3)
 
 ## cmd/apt-cacher-ultra
 

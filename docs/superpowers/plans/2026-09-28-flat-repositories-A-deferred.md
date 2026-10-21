@@ -11,9 +11,6 @@ Phase A's per-task and final reviews (2026-10-11, Fable max) found these minor i
 
 ## internal/aptpath and internal/proxy
 
-- **A-4** `suite.go:19-20` comment overclaims "matching the old greedy regex"; add `{"/a/dists/b/dists/c", "/a/dists/b"}` to `TestSuitePath_Dists`.
-- **A-5** `suite.go:25-26` AIDEV-NOTE says "raw path"; the handler strips from `req.Path`, the same string `SuitePath` received. Reword.
-- **A-6** `suite_test.go` lacks a space-byte case and a trailing-slash full-path case.
 - **A-8** `TestCacheDoesNotImportProxy` checks direct imports only; comment the limitation.
 - **A-9** `encode_test.go:36`: the all-bytes loop starts at 1, skipping NUL (it round-trips). Start at 0 or comment.
 - **A-10** `proxy.go:172-173`: the control-byte invariant has a plain comment; promote it to an AIDEV-NOTE.
