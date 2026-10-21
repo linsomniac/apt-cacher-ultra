@@ -182,6 +182,12 @@ func IsFlatSuitePath(s string) bool {
 	return IsCanonicalSuitePath(s) && !hasDistsSegment(s)
 }
 
+// MaxFilenameBytes bounds a Packages Filename (spec C5's validateFilename
+// refuses a longer one), and so a stored package_hash.flat_filename, its
+// DotClean (spec C6): the suffix fallback skips a longer request suffix,
+// which no row can match (ruling PG-30).
+const MaxFilenameBytes = 4096
+
 // FlatBase returns the directory a flat suite's Packages Filenames are
 // relative to for spec C6: the suite path with ONE trailing "/." removed,
 // so the twins "/repo" and "/repo/." share it (apt requests

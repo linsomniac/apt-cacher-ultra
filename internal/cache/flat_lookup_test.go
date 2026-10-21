@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 )
 
 // hashOf is a 64-hex declared hash made of one repeated digit.
@@ -111,6 +113,35 @@ func TestFlatSplits(t *testing.T) {
 		if bases, names := flatSplits(p); bases != nil || names != nil {
 			t.Errorf("flatSplits(%q) = %q, %q; want no split", p, bases, names)
 		}
+	}
+	// Ruling PG-30: a split can match a row only with B no longer than a
+	// suite path (aptpath.MaxSuitePathBytes) and F no longer than a
+	// Filename (aptpath.MaxFilenameBytes), so other splits are skipped and
+	// a dot-cleaned path longer than both plus a "/" has none. The bound is
+	// on the dot-cleaned path: "/." segments a client adds do not count.
+	base := "/" + strings.Repeat("a", aptpath.MaxSuitePathBytes-1)
+	name := strings.Repeat("n", aptpath.MaxFilenameBytes)
+	for _, tc := range []struct {
+		path         string
+		bases, names []string
+	}{
+		{base + "/" + name, []string{base}, []string{name}}, // at the bound: B = base only
+		{base + "/" + name + "n", nil, nil},                 // one byte over
+		{base + strings.Repeat("/.", 100) + "/" + name, []string{base}, []string{name}},
+		{base + "a/x.deb", []string{""}, []string{base[1:] + "a/x.deb"}}, // B one byte over a suite path
+		{"/d/" + name, []string{"/d"}, []string{name}},                   // "d/"+name is over a Filename
+	} {
+		if bases, names := flatSplits(tc.path); !slices.Equal(bases, tc.bases) || !slices.Equal(names, tc.names) {
+			t.Errorf("flatSplits(%d-byte path) = %d bases %.40q, names %.40q; want %d", len(tc.path), len(bases), bases, names, len(tc.bases))
+		}
+	}
+	// Bases and names are substrings of the dot-cleaned path, not strings
+	// built per split: with strings.Join each of the 32 splits allocated
+	// twice, and a long path made every request allocate 32 times its
+	// length (the final review's concurrency lens I-2).
+	long := "/" + strings.Repeat("d/", maxFallbackSegments-1) + "x.deb"
+	if allocs := testing.AllocsPerRun(20, func() { flatSplits(long) }); allocs > 6 {
+		t.Errorf("flatSplits of a %d-segment path allocates %v times, want at most 6", maxFallbackSegments, allocs)
 	}
 }
 

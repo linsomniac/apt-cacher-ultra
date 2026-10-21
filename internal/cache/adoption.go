@@ -985,37 +985,70 @@ func (c *Cache) declaredHashesExact(ctx context.Context, scheme, host, path stri
 // it also bounds the fallback query's IN list).
 const maxFallbackSegments = 32
 
+// maxFallbackPathBytes bounds the dot-cleaned request path the suffix
+// fallback splits (ruling PG-30): a split matches a row only when B is an
+// ancestor-or-self of a suite's FlatBase (at most
+// aptpath.MaxSuitePathBytes) and F a stored flat_filename (at most
+// aptpath.MaxFilenameBytes), so a longer path has no split that could.
+const maxFallbackPathBytes = aptpath.MaxSuitePathBytes + 1 + aptpath.MaxFilenameBytes
+
 // flatSplits returns spec C6's splits of a request path for the suffix
 // fallback: P' = aptpath.DotClean(path) cut as B + "/" + F at every
 // segment boundary, from the host root (B = "") to the parent of the
 // last segment, as parallel slices. It returns nothing when P' is not
-// absolute, has an empty or ".." segment, or has more than
+// absolute, has an empty or ".." segment, has more than
 // maxFallbackSegments segments (a ".." could step a request outside the
-// base its row is kept for). The ".." and empty-segment stops are defence
-// in depth — with valid rows no such split could match (a B holding them
-// is never an ancestor of a canonical FlatBase, an F never equals a
-// validated flat_filename) — so TestFlatSplits pins them on this function.
+// base its row is kept for), or is longer than maxFallbackPathBytes; it
+// skips a split whose B is longer than aptpath.MaxSuitePathBytes or whose
+// F is longer than aptpath.MaxFilenameBytes. The ".." and empty-segment
+// stops are defence in depth — with valid rows no such split could match
+// (a B holding them is never an ancestor of a canonical FlatBase, an F
+// never equals a validated flat_filename) — so TestFlatSplits pins them on
+// this function.
+//
+// AIDEV-NOTE: ruling PG-30 (the final review's concurrency lens I-2). The
+// fallback runs on the hit path and in the miss's pre-fetch gate for every
+// request no exact row covers, and nothing else bounds a request path's
+// length (net/http's 1 MiB header cap): building each B and F with
+// strings.Join cost 32 times the path's length per request. The length
+// bound and the per-split skips change no answer — no row can match what
+// they drop (the length bound is implied by the skips: it only ends the
+// scan early) — and B and F are substrings of P', so a split allocates
+// nothing. The bound is on P', not path: "/." segments do not count.
 func flatSplits(path string) (bases, names []string) {
 	p := aptpath.DotClean(path)
-	if !strings.HasPrefix(p, "/") {
+	if !strings.HasPrefix(p, "/") || len(p) > maxFallbackPathBytes {
 		return nil, nil
 	}
-	segs := strings.Split(p[1:], "/")
-	if len(segs) > maxFallbackSegments {
-		return nil, nil
+	// cuts are p's separators: the split at c is B = p[:c], F = p[c+1:].
+	var buf [maxFallbackSegments]int
+	cuts := buf[:0]
+	for i := 0; i < len(p); i++ {
+		if p[i] != '/' {
+			continue
+		}
+		if len(cuts) == maxFallbackSegments {
+			return nil, nil
+		}
+		cuts = append(cuts, i)
 	}
-	for _, s := range segs {
-		if s == "" || s == ".." {
+	for k, c := range cuts {
+		end := len(p)
+		if k+1 < len(cuts) {
+			end = cuts[k+1]
+		}
+		if seg := p[c+1 : end]; seg == "" || seg == ".." {
 			return nil, nil
 		}
 	}
-	for i := range segs {
-		b := ""
-		if i > 0 {
-			b = "/" + strings.Join(segs[:i], "/")
+	for _, c := range cuts {
+		if c > aptpath.MaxSuitePathBytes || len(p)-c-1 > aptpath.MaxFilenameBytes {
+			continue
 		}
-		bases = append(bases, b)
-		names = append(names, strings.Join(segs[i:], "/"))
+		if bases == nil {
+			bases, names = make([]string, 0, len(cuts)), make([]string, 0, len(cuts))
+		}
+		bases, names = append(bases, p[:c]), append(names, p[c+1:])
 	}
 	return bases, names
 }

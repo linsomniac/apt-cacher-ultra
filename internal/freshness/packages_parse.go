@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 )
 
 // PackageRef is one .deb entry from a Packages file. Phase 2 fields:
@@ -220,9 +222,6 @@ func parsePackages(text []byte) ([]PackageRef, []string, error) {
 	return out, noSHA256, nil
 }
 
-// maxFilenameBytes bounds a Packages Filename (spec C5 validateFilename).
-const maxFilenameBytes = 4096
-
 // validateFilename is spec C5's check of a Packages Filename, in place of
 // the Release members' validateMemberPath (which ParseRelease keeps): it
 // allows "." segments — apt requests <base>/./x.deb literally, and a
@@ -230,7 +229,7 @@ const maxFilenameBytes = 4096
 // "%" (literal bytes, re-encoded upstream by spec C1). It refuses, fatal
 // as before: an empty name, an absolute one, NUL or another control byte,
 // a backslash, "?" or "#", a ".." segment, an empty segment, a name longer
-// than maxFilenameBytes, and a name made only of "." segments (it names no
+// than aptpath.MaxFilenameBytes, and a name made only of "." segments (it names no
 // file, and its DotClean is empty: plan design note 5).
 //
 // AIDEV-NOTE: the literal Filename is the package_hash path's tail (spec
@@ -242,8 +241,8 @@ func validateFilename(f string) error {
 	switch {
 	case f == "":
 		return errors.New("empty")
-	case len(f) > maxFilenameBytes:
-		return fmt.Errorf("longer than %d bytes", maxFilenameBytes)
+	case len(f) > aptpath.MaxFilenameBytes:
+		return fmt.Errorf("longer than %d bytes", aptpath.MaxFilenameBytes)
 	case strings.HasPrefix(f, "/"):
 		return errors.New("absolute path not allowed")
 	case strings.ContainsRune(f, '\\'):
