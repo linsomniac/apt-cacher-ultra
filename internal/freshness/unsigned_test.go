@@ -418,8 +418,8 @@ func TestRunUnsigned_FailedRemarkRefuses(t *testing.T) {
 			if r.current() != 0 {
 				t.Fatal("committed although the re-mark failed")
 			}
-			if recs := r.records("adoption: signed-anchor re-mark failed"); len(recs) != 1 || recs[0]["level"] != level || recs[0]["err"] == "" {
-				t.Fatalf("re-mark fault records %v, want one at %s with the error", recs, level)
+			if recs := r.records("adoption: signed-anchor re-mark failed"); len(recs) != 1 || recs[0]["level"] != level || !nonEmptyString(recs[0]["err"]) {
+				t.Fatalf("re-mark fault records %v, want one at %s with the error", recs, level) // deferred minor E-17
 			}
 		})
 	}
@@ -496,10 +496,33 @@ func TestRunUnsigned_FirstAdoptionOfTheServedReleaseSkipsTheBarrier(t *testing.T
 // barrier outlived adoption.max_duration. The refusal is a state: the
 // outcome is refused, the record says unsigned_downgrade_refused, the
 // barrier event says refused, and nothing is logged at WARN or above.
+// The E carry-forward (phase G): the same when the signed anchor and its
+// marker arrive through the ./ twin of the flat suite /repo, whose base
+// the twin shares.
 func TestCheck_UnsignedRefusedInsideTheCommitIsAState(t *testing.T) {
+	t.Run("the suite's own anchor", func(t *testing.T) { unsignedRefusedInsideTheCommit(t, "", "") })
+	t.Run("the ./ twin's anchor", func(t *testing.T) { unsignedRefusedInsideTheCommit(t, "/repo", "/repo/.") })
+}
+
+// unsignedRefusedInsideTheCommit runs TestCheck_UnsignedRefusedInsideTheCommitIsAState
+// for the flat suite suite (the rig's dists/ suite when "") with the
+// signed anchor served under served (the suite itself when "").
+func unsignedRefusedInsideTheCommit(t *testing.T, suite, served string) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
 		r := newUnsignedRig(t, 10*time.Second, 20*time.Second)
+		rel := r.release("unsigned")
+		if suite != "" {
+			r.suite.SuitePath = suite
+			trackSuite(t, r.c, r.suite)
+			r.members.put("http://h"+suite+"/Packages", r.pkgs)
+			rel = hashRelease("Origin: unsigned\n", true, false, map[string][]byte{"Packages": r.pkgs}, nil)
+		}
+		if served == "" {
+			served = r.suite.SuitePath
+		} else {
+			trackSuite(t, r.c, SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: served})
+		}
 		ring := observability.NewRing(10)
 		checkLogs := &lockedBuffer{}
 		chk, err := New(Config{Cache: r.c, Fetcher: &changedUpstream{}, HostLimiter: hostsem.New(8),
@@ -521,16 +544,15 @@ func TestCheck_UnsignedRefusedInsideTheCommitIsAState(t *testing.T) {
 					return
 				}
 				now := time.Now().Unix()
-				path := r.suite.SuitePath + "/InRelease"
+				path := served + "/InRelease"
 				if _, err := r.c.StoreFetched(ctx, cache.FetchedRow{Row: cache.URLPath{CanonicalScheme: "http", CanonicalHost: "h",
 					Path: path, BlobHash: &h, UpstreamURL: "http://h" + path, IsMetadata: true, LastRequestedAt: &now,
 					RequestCount: 1, LastFetchedAt: &now}, Suite: cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h",
-					SuitePath: r.suite.SuitePath}, MarkSeenAt: now}, cache.SuiteCaps{}, nil); err != nil {
+					SuitePath: served}, MarkSeenAt: now}, cache.SuiteCaps{}, nil); err != nil {
 					t.Error(err)
 				}
 			})
 		}
-		rel := r.release("unsigned")
 		req := &adoptionRequest{suite: r.suite, form: adoptionFormUnsigned, releaseBytes: rel,
 			key: contentKey(adoptionFormUnsigned, nil, rel, nil)}
 		mu := &sync.Mutex{}
@@ -642,27 +664,41 @@ func TestRunUnsigned_RemarkReadErrorRefuses(t *testing.T) {
 	if r.current() != 0 {
 		t.Fatal("committed although the re-mark could not read the cached anchors")
 	}
-	if recs := r.records("adoption: signed-anchor re-mark failed"); len(recs) != 1 || recs[0]["level"] != "WARN" {
-		t.Fatalf("re-mark fault records %v, want one at WARN", recs)
+	if recs := r.records("adoption: signed-anchor re-mark failed"); len(recs) != 1 || recs[0]["level"] != "WARN" || !nonEmptyString(recs[0]["err"]) {
+		t.Fatalf("re-mark fault records %v, want one at WARN with the error", recs) // deferred minor E-17
 	}
+}
+
+// nonEmptyString reports whether v, a decoded JSON log field, is a
+// non-empty string (deferred minor E-17: an absent key is no error text).
+func nonEmptyString(v any) bool {
+	s, ok := v.(string)
+	return ok && s != ""
 }
 
 // Ruling R-E1 for the /. twin: the re-mark marks the suite's base
 // (aptpath.MarkerBase), which the commit's in-transaction recheck reads —
 // not the twin's own path. (Proposed by the executability review; kills
-// X10.)
+// X10.) Deferred minor E-16 (phase G): it reads the base's own anchors
+// too — the twin /flat/. finds the evidence cached at /flat/InRelease.
+// The flat suite's Release declares its root Packages (spec C5).
 func TestRunUnsigned_RemarkMarksTheTwinsBase(t *testing.T) {
-	r := newUnsignedRig(t, 0, 0)
-	r.suite.SuitePath = "/flat/."
-	trackSuite(t, r.c, r.suite)
-	r.members.put("http://h/flat/./main/binary-amd64/Packages", r.pkgs)
-	r.cacheAnchor("InRelease", simtest.ClearsignedFixture("Origin: signed\n"))
-	err := r.ad.RunUnsigned(context.Background(), r.suite, r.release("unsigned"), "", "")
-	if !errors.Is(err, cache.ErrUnsignedDowngradeRefused) || r.current() != 0 {
-		t.Fatalf("RunUnsigned = %v, current %d: want the commit's refusal and no snapshot", err, r.current())
-	}
-	if _, ok, err := r.c.SignedSeen(context.Background(), "http", "h", "/flat"); err != nil || !ok {
-		t.Fatalf("no marker for the base /flat (ok %v, err %v)", ok, err)
+	for _, evidence := range []string{"/flat/.", "/flat"} {
+		t.Run("evidence at "+evidence+"/InRelease", func(t *testing.T) {
+			r := newUnsignedRig(t, 0, 0)
+			r.suite.SuitePath = "/flat/."
+			trackSuite(t, r.c, r.suite)
+			r.members.put("http://h/flat/./Packages", r.pkgs)
+			r.cacheAnchorAt(evidence, "InRelease", simtest.ClearsignedFixture("Origin: signed\n"))
+			rel := hashRelease("Origin: unsigned\n", true, false, map[string][]byte{"Packages": r.pkgs}, nil)
+			err := r.ad.RunUnsigned(context.Background(), r.suite, rel, "", "")
+			if !errors.Is(err, cache.ErrUnsignedDowngradeRefused) || r.current() != 0 {
+				t.Fatalf("RunUnsigned = %v, current %d: want the commit's refusal and no snapshot", err, r.current())
+			}
+			if _, ok, err := r.c.SignedSeen(context.Background(), "http", "h", "/flat"); err != nil || !ok {
+				t.Fatalf("no marker for the base /flat (ok %v, err %v)", ok, err)
+			}
+		})
 	}
 }
 
