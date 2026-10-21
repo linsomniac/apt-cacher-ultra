@@ -93,12 +93,14 @@ func (c *Checker) pacedFirst(cur *cache.SuiteFreshness, gate retryGate, now time
 	return !last.After(now.Add(clockStepTolerance)) && now.Sub(last) < c.refresh
 }
 
-// cachedAnchors reads suite's cached anchor url_path rows: the upstream
-// URL of each (by file name) and whether a client created one of the
-// InRelease or Release rows (request_count > 0; a reconstructed row has
-// none, spec C4 "never reconstructed").
-func (c *Checker) cachedAnchors(ctx context.Context, suite SuiteRef) (urls map[string]string, clientCreated bool, err error) {
-	urls = make(map[string]string, 3)
+// cachedAnchors reads suite's cached anchor url_path rows, by file name
+// (anchorURLMap gives their upstream URLs), and whether a client created
+// one of the InRelease or Release rows (request_count > 0; a reconstructed
+// row has none, spec C4 "never reconstructed"). The rows are read before
+// the probe tree runs: the anchorless refresh deletes an anchor only while
+// it still holds the blob read here (design review M-4).
+func (c *Checker) cachedAnchors(ctx context.Context, suite SuiteRef) (rows map[string]cache.URLPath, clientCreated bool, err error) {
+	rows = make(map[string]cache.URLPath, 3)
 	for _, name := range []string{"InRelease", "Release", "Release.gpg"} {
 		row, err := c.cache.LookupURL(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/"+name)
 		switch {
@@ -107,12 +109,22 @@ func (c *Checker) cachedAnchors(ctx context.Context, suite SuiteRef) (urls map[s
 		case err != nil:
 			return nil, false, fmt.Errorf("read %s: %w", name, err)
 		}
-		urls[name] = row.UpstreamURL
+		rows[name] = *row
 		if name != "Release.gpg" && row.RequestCount > 0 {
 			clientCreated = true
 		}
 	}
-	return urls, clientCreated, nil
+	return rows, clientCreated, nil
+}
+
+// anchorURLMap is the upstream URL of each of rows, by file name
+// (anchorURLsFor's input).
+func anchorURLMap(rows map[string]cache.URLPath) map[string]string {
+	urls := make(map[string]string, len(rows))
+	for name, row := range rows {
+		urls[name] = row.UpstreamURL
+	}
+	return urls
 }
 
 // probeTree is spec C4's probe tree, every probe without validators:
@@ -192,8 +204,8 @@ func (t probeTree) signatureSeen() bool {
 	return t.inRelease.class == classPresent || t.sig.class == classPresent
 }
 
-// checkFirst is spec C4 Dispatch 3 (adopter wired, no current snapshot).
-// A suite without client interest in the last 7 days, or without a
+// checkFirst is spec C4 Dispatch 3 (adopter wired, no current snapshot). A
+// suite without client interest in the last 7 days, or without a
 // client-created InRelease or Release url_path row — or, for a flat suite,
 // root Packages*/Sources* row (Adopter.flatIndexClientCreated) — is
 // dormant: no request and no write. The scheduler skips only a suite
@@ -204,29 +216,29 @@ func (t probeTree) signatureSeen() bool {
 // request between the scheduler's refresh checks, except the scheduler's
 // slot-driven re-offer of the parked suite (offered: the check's
 // bypassCooldown, which the scheduler sets for a waiting item and for a
-// pending-change item; the latter has no record when it is queued, so it
-// is not paced: at most one probe more, when a client check's failed
-// adoption recorded one between the enqueue and the dequeue; deferred
-// minor E-34). Otherwise the probe tree
-// runs without validators and the form found is adopted — result
-// first_adoption, or first_adoption_queued with no slot — through the spec
-// C7 gate (content keys only: the probes carry no validators) and, for the
-// unsigned form, spec C5's eligibility, member cap and transition
-// confirmation (unsignedFirst). A probe that finds a signature marks the
-// suite's base first (Adopter.markSignatureSeen; a failed mark fails the
-// check). A probe that ends unknown and a tree that finds no anchor (which
-// also records anchor_absent, so the status page shows it: ruling PE-2)
-// are failed checks — except that a flat suite whose tree finds no anchor
-// and that has no signed evidence (Adopter.anchorlessEligible) runs the
-// anchorless refresh instead (anchorlessRefresh, spec C4 Dispatch 4), or,
-// while adoption.adopt_unsigned is off, is refused unsigned_disabled
+// pending-change item; the latter has no record when it is queued, so it is
+// not paced: at most one probe more, when a client check's failed adoption
+// recorded one between the enqueue and the dequeue; deferred minor E-34).
+// Otherwise the probe tree runs without validators and the form found is
+// adopted — result first_adoption, or first_adoption_queued with no slot —
+// through the spec C7 gate (content keys only: the probes carry no
+// validators) and, for the unsigned form, spec C5's eligibility, member cap
+// and transition confirmation (unsignedFirst). A probe that finds a
+// signature marks the suite's base first (Adopter.markSignatureSeen; a
+// failed mark fails the check). A probe that ends unknown and a tree that
+// finds no anchor (which also records anchor_absent, so the status page
+// shows it: ruling PE-2) are failed checks — except that a flat suite whose
+// tree finds no anchor and that has no signed evidence
+// (Adopter.anchorlessEligible) runs the anchorless refresh instead
+// (anchorlessRefresh, spec C4 Dispatch 4), or, while
+// adoption.adopt_unsigned is off, is refused unsigned_disabled
 // (anchorlessDisabled, ruling PG-1); an unsigned candidate while
-// adoption.adopt_unsigned
-// is off is the refusal unsigned_disabled, recorded and paced (ruling
-// PE-12). A read error of the anchor rows is logged at WARN with no
-// write and no backoff: a local fault, retried at the next check (at most
-// one per cooldown and per tick); so is a read error of a flat suite's
-// index rows. A suite with no cached anchor row but a client-created flat
+// adoption.adopt_unsigned is off is the refusal unsigned_disabled, recorded
+// and paced (ruling PE-12). A read error of the anchor rows is logged at
+// WARN with no write and no backoff: a local fault, retried at the next
+// check (at most one per cooldown and per tick); so is a read error of a
+// flat suite's index rows, before the probe tree or in the anchorless
+// refresh. A suite with no cached anchor row but a client-created flat
 // index row is probed beside the index row's stored upstream_url (ruling
 // PG-20).
 //
@@ -247,7 +259,7 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 			"canonical_host", host, "suite_path", suitePath)
 		return nil
 	}
-	rows, clientCreated, err := c.cachedAnchors(ctx, suite)
+	anchors, clientCreated, err := c.cachedAnchors(ctx, suite)
 	var index *cache.URLPath // a client-created flat index row (Dispatch 3)
 	if err == nil && !clientCreated && aptpath.IsFlatSuitePath(suitePath) {
 		index, err = c.adopter.flatIndexClientCreated(ctx, suite)
@@ -284,7 +296,7 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 	}
 	defer release()
 
-	urls := c.anchorURLsFor(suite, rows)
+	urls := c.anchorURLsFor(suite, anchorURLMap(anchors))
 	if urls.model == "" && index != nil {
 		// Ruling PG-20 (spec C1): a suite active only through its
 		// client-fetched flat index is probed beside that row's stored
@@ -321,7 +333,7 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 				c.anchorlessDisabled(ctx, out, cur, suite, nowUnix, t)
 				return nil
 			case eligible:
-				c.anchorlessRefresh(ctx, fetchCtx, out, cur, suite, nowUnix, t)
+				c.anchorlessRefresh(ctx, fetchCtx, out, cur, suite, nowUnix, t, anchors)
 				return nil
 			}
 		}

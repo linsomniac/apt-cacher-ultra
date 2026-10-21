@@ -180,46 +180,54 @@ func anchorlessRank(name string) int {
 // GET (refreshAnchorlessRow), Packages* first, then Sources*, then
 // Contents-* (anchorlessRank); then the rows to delete — those answered
 // 404 or 410, a changed plain Contents-*, and the suite's cached InRelease
-// and Release rows whose probe in t answered 404 or 410 — go in one writer
-// transaction, each only while it still holds the blob it was read with
-// (cache.DeleteURLPathRows). The check is answered — anchorless_refreshed
-// when a row was replaced or deleted, anchorless_unchanged otherwise —
-// unless index requests were sent and none got a content answer
-// (anchorlessAnswer.answered: a 304, a 200 stored or matching the cached
-// bytes, a 404 or 410): a failed check (the streak backs off). A suite
-// with no cached index row sends no request and is answered: the anchors'
-// 404s still apply. An answered check is a success (last_success_at, the
+// and Release rows (anchors: read before the probe tree ran) whose probe
+// in t answered 404 or 410 — go in one writer transaction, each only while
+// it still holds the blob it was read with (cache.DeleteURLPathRows; an
+// anchor a client's miss stored anew during its probe's window is kept).
+// The check is answered — anchorless_refreshed when a row was replaced or
+// deleted, anchorless_unchanged otherwise — unless index requests were
+// sent and none got a content answer (anchorlessAnswer.answered: a 304, a
+// 200 stored or matching the cached bytes, a 404 or 410): a failed check
+// (the streak backs off). A suite with no cached index row sends no
+// request and is answered: the anchors' 404s still apply. A delete that
+// fails is logged and is no answer: its 404s and 410s stop counting, and
+// a check they alone answered (no index request, or every content answer
+// a delete) fails. An answered check is a success (last_success_at, the
 // streak reset), clears the suite's failure or refusal record (it
 // described an anchor upstream no longer serves) and its pending change
-// (the anchorless form adopts nothing: a stamp left behind would queue the
-// suite every tick, pendingChange). Its writes (the pool, RefreshURLPathBlob,
-// DeleteURLPathRows) run under the lifecycle ctx, as the check's other
-// writes do: a refresh that passes its deadline still commits what it
-// fetched. A shutdown mid-refresh ends it silently; what it stored stays.
+// (the anchorless form adopts nothing: a stamp left behind would queue
+// the suite every tick, pendingChange). Its writes (the pool,
+// RefreshURLPathBlob, DeleteURLPathRows) run under the lifecycle ctx, as
+// the check's other writes do: a refresh that passes its deadline still
+// commits what it fetched. A shutdown mid-refresh ends it silently; what
+// it stored stays. A read error of the index rows is checkFirst's local
+// fault: logged at WARN, nothing written, no backoff.
 //
 // AIDEV-NOTE: no snapshot, no vouching, no strict-mode effect (spec C4):
 // the refresh only revalidates url_path rows a client's miss created, and
 // a row it cannot answer for stays as it is. Its cache operations go
 // through the adopter's *cache.Cache: the checker's Cache interface stays
 // the subset its fakes implement.
-func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, nowUnix int64, t probeTree) {
+func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, nowUnix int64, t probeTree, anchors map[string]cache.URLPath) {
 	host, suitePath := suite.CanonicalHost, suite.SuitePath
 	rows, err := c.adopter.cache.ListSuiteMetadataRows(ctx, suiteKeyOf(suite))
 	if err != nil {
+		// Task 10 review M5: checkFirst's convention for a local read
+		// fault — no write and no backoff, retried at the next check.
 		if !c.endedByShutdown(ctx, suite, "read the anchorless index rows", err) {
-			c.failCheck(ctx, out, cur, suite, nowUnix, "anchorless", err)
+			c.logger.Warn("freshness: read anchor rows failed",
+				"err", err, "canonical_host", host, "suite_path", suitePath)
 		}
 		return
 	}
 	var (
 		indexes, deletes             []cache.URLPath
 		requests, answered, replaced int
+		answeredDeletes              int
 		lastErr                      error
 		overCap                      bool
 	)
-	cached := make(map[string]cache.URLPath, len(rows))
 	for _, row := range rows {
-		cached[row.Path] = row
 		if name := strings.TrimPrefix(row.Path, suitePath+"/"); aptpath.IsAnchorlessIndex(name) && row.BlobHash != nil {
 			indexes = append(indexes, row)
 		}
@@ -237,7 +245,10 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 		switch a {
 		case anchorlessReplaced:
 			replaced++
-		case anchorlessDeleted, anchorlessDropped:
+		case anchorlessDeleted:
+			answeredDeletes++
+			deletes = append(deletes, row)
+		case anchorlessDropped:
 			deletes = append(deletes, row)
 		}
 		if a.answered() {
@@ -251,11 +262,15 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 		name string
 		o    probeOutcome
 	}{{"InRelease", t.inRelease}, {"Release", t.release}} {
-		if row, ok := cached[suitePath+"/"+p.name]; ok && (p.o.status == 404 || p.o.status == 410) {
+		// Design review M-4 for the anchors (Task 10 review M3): the row
+		// as read before the probe, so a newer file a client's miss stored
+		// during the probe's window fails the delete's blob compare and is
+		// kept.
+		if row, ok := anchors[p.name]; ok && (p.o.status == 404 || p.o.status == 410) {
 			deletes = append(deletes, row)
 		}
 	}
-	deleted := 0
+	deleted, deleteFailed := 0, false
 	if len(deletes) > 0 {
 		n, err := c.adopter.cache.DeleteURLPathRows(ctx, deletes)
 		if err != nil {
@@ -264,13 +279,19 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 			}
 			c.logger.Warn("freshness: delete anchorless rows failed",
 				"err", err, "canonical_host", host, "suite_path", suitePath)
+			// Task 10 review M4: a failed delete is no answer. The one
+			// transaction deleted nothing, so its 404s and 410s stop
+			// counting, as a failed RefreshURLPathBlob makes its row
+			// unknown.
+			answered -= answeredDeletes
+			deleteFailed, lastErr = true, fmt.Errorf("delete: %w", err)
 		}
 		deleted = n
 	}
 	if overCap {
 		c.noteAnchorlessOverCap(suite)
 	}
-	if requests > 0 && answered == 0 {
+	if (requests > 0 || deleteFailed) && answered == 0 {
 		c.failCheck(ctx, out, cur, suite, nowUnix, "anchorless", fmt.Errorf("%w: %w", errAnchorlessUnknown, lastErr))
 		return
 	}
@@ -327,6 +348,19 @@ func (c *Checker) refreshAnchorlessRow(ctx, fetchCtx context.Context, suite Suit
 	if row.UpstreamLastMod != nil {
 		lastmod = *row.UpstreamLastMod
 	}
+	// AIDEV-NOTE: a nested hold (Task 10 review M1, ruling PG-24). The
+	// check already holds its host's slot (checkFirst: the hostLimiter the
+	// handler's client misses share) while it waits here for one of the
+	// two process-wide body slots, and a slow request keeps its body slot
+	// until the check's deadline (checkDeadline: the fetch transport has
+	// no response-header timeout). So two slow anchorless requests
+	// anywhere can make other hosts' anchorless checks wait, each holding
+	// a host slot idle, up to their deadlines. No deadlock: a body-slot
+	// holder never waits for a host slot; bounded, and failed checks back
+	// off. Follow-up for phase H (the phase G deferred file): a short
+	// bounded wait for a body slot, or a per-request timeout well under
+	// checkDeadline. The wait honours fetchCtx (the deadline, a shutdown):
+	// TestCheck_AnchorlessSlotWaitEndsWithTheCheck pins it.
 	select {
 	case c.anchorlessBodies <- struct{}{}:
 	case <-fetchCtx.Done():

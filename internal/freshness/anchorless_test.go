@@ -926,3 +926,269 @@ func TestCheck_AnchorlessBodySlotsSurviveAPanic(t *testing.T) {
 		}
 	})
 }
+
+// rigDB opens a second connection to the flat rig's cache database, for a
+// test that injects a fault the cache's own API cannot produce.
+func (r *flatRig) rigDB() *sql.DB {
+	r.t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(r.cache.Dir(), "cache.db"))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	r.t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// suiteOn reads host's /fury suite row.
+func (r *flatRig) suiteOn(host string) cache.SuiteFreshness {
+	r.t.Helper()
+	s, err := r.cache.GetSuiteFreshness(context.Background(), "http", host, "/fury")
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return *s
+}
+
+// Ruling PG-24 (the Task 10 review's M2, first property): a check waits for
+// a body slot only within its own fetchCtx. Two stalled requests hold both
+// slots; a third suite's check ends at its deadline — a failed check, its
+// index never asked — or, when its context ends during the wait (a
+// shutdown), at once, writing nothing.
+func TestCheck_AnchorlessSlotWaitEndsWithTheCheck(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		t.Run(map[bool]string{false: "the deadline", true: "a shutdown"}[shutdown], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := newFlatRig(t, "/fury")
+				r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "")
+				r.up.setAt(r.url("Packages.gz"), gzBody("v2"))
+				for _, host := range []string{"fh2", "fh3"} {
+					seedFlatSuiteOn(t, r, host, "/fury", gzBody("v1"), gzBody("v2"))
+				}
+				release := make(chan struct{})
+				r.up.before = func(url string) {
+					if strings.HasSuffix(url, "/Packages.gz") && !strings.HasPrefix(url, "http://fh3/") {
+						<-release // a stalled body keeps its slot
+					}
+				}
+				var holders sync.WaitGroup
+				for _, host := range []string{flatRigHost, "fh2"} {
+					holders.Go(func() { r.checker.Check(context.Background(), "http", host, "/fury") })
+				}
+				synctest.Wait() // both slots held
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				done := make(chan struct{})
+				start := time.Now()
+				go func() {
+					defer close(done)
+					r.checker.Check(ctx, "http", "fh3", "/fury")
+				}()
+				synctest.Wait() // fh3's check waits for a slot
+				if shutdown {
+					cancel()
+				}
+				select {
+				case <-done:
+				case <-time.After(checkDeadline + time.Hour):
+				}
+				elapsed := time.Since(start)
+				close(release)
+				holders.Wait()
+				<-done
+				want := checkDeadline
+				if shutdown {
+					want = 0
+				}
+				if elapsed != want {
+					t.Fatalf("fh3's check ended after %v, want %v: the slot wait must end with the check", elapsed, want)
+				}
+				if n := len(r.up.etagsSent("http://fh3/fury/Packages.gz")); n != 0 {
+					t.Fatalf("fh3's Packages.gz asked %d times, want never (no slot)", n)
+				}
+				row := r.suiteOn("fh3")
+				switch {
+				case shutdown && (row.LastCheckAt != nil || row.CheckFailCount != 0):
+					t.Fatalf("fh3 row %+v, want nothing written by a check a shutdown ended", row)
+				case !shutdown && row.CheckFailCount != 1:
+					t.Fatalf("fh3 check_fail_count %d, want 1 (a failed check at its deadline)", row.CheckFailCount)
+				}
+			})
+		})
+	}
+}
+
+// lateFetcher answers like its Fetcher, but the answer for url comes back
+// only after the check's deadline has passed: the request's outcome is
+// decided in time, and what the refresh writes for it is written after
+// fetchCtx ended.
+type lateFetcher struct {
+	Fetcher
+	url string
+}
+
+func (f lateFetcher) Conditional(ctx context.Context, target *fetch.Target, etag, lastmod string, maxBody int64) (*fetch.ConditionalResult, error) {
+	res, err := f.Fetcher.Conditional(ctx, target, etag, lastmod, maxBody)
+	if target.URL == f.url {
+		time.Sleep(checkDeadline + time.Minute)
+	}
+	return res, err
+}
+
+// Plan design note 10 (the Task 10 review's M2, second property): the
+// refresh's writes run under the lifecycle context, not fetchCtx, so an
+// answer that arrives as the deadline passes is still committed: a
+// replacement's pool file and row, and a 404's delete.
+func TestCheck_AnchorlessWritesAfterTheDeadlineCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		upstream []byte // nil: 404
+	}{{"a replacement", gzBody("v2")}, {"a delete", nil}} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := newFlatRig(t, "/fury")
+				old := r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "")
+				if tc.upstream != nil {
+					r.up.setAt(r.url("Packages.gz"), tc.upstream)
+				}
+				r.checker.fetcher = lateFetcher{Fetcher: r.up, url: r.url("Packages.gz")}
+				start := time.Now()
+				r.check()
+				if time.Since(start) <= checkDeadline {
+					t.Fatalf("the check ended after %v, want past the %v deadline", time.Since(start), checkDeadline)
+				}
+				if got := r.lastResult(); got != "anchorless_refreshed" {
+					t.Fatalf("result %q, want anchorless_refreshed: the write after the deadline committed", got)
+				}
+				u := r.lookup("Packages.gz")
+				switch {
+				case tc.upstream == nil && u != nil:
+					t.Fatalf("Packages.gz row %+v, want deleted", u)
+				case tc.upstream != nil && (u == nil || *u.BlobHash == old || *u.BlobHash != hashOf(tc.upstream)):
+					t.Fatalf("Packages.gz row %+v, want the new blob", u)
+				}
+			})
+		})
+	}
+}
+
+// Design review M-4 for the anchors (the Task 10 review's M3): the refresh
+// deletes a cached anchor its probe answered 404 only while the row still
+// holds the blob read before the probe tree ran, so a newer Release a
+// client's miss stored during the probe's window is kept.
+func TestCheck_AnchorlessKeepsAnAnchorAClientStoredDuringItsProbe(t *testing.T) {
+	r := newFlatRig(t, "/fury")
+	r.cacheRow("Release", []byte("Origin: fury\n"), 1, rigStart-3600, "")
+	pk := gzBody("v1")
+	r.cacheRow("Packages.gz", pk, 1, rigStart-3600, rigETag(pk))
+	r.up.setAt(r.url("Packages.gz"), pk)
+	newer := []byte("Origin: fury\nLabel: newer\n")
+	r.up.before = func(url string) {
+		if url == r.url("Release") {
+			r.cacheRow("Release", newer, 2, rigStart, "") // a client's miss, while the probe is out
+		}
+	}
+	r.check()
+	if got := r.lastResult(); got != "anchorless_unchanged" {
+		t.Fatalf("result %q, want anchorless_unchanged (a 304, nothing deleted)", got)
+	}
+	if u := r.lookup("Release"); u == nil || *u.BlobHash != hashOf(newer) {
+		t.Fatalf("Release row %+v, want the client's newer Release kept", u)
+	}
+}
+
+// The Task 10 review's M4: a delete that fails is logged and is no answer —
+// its 404s stop counting, as a failed store makes its row unknown — so a
+// check its 404s alone answered fails (the streak backs off) and the rows
+// stay; another content answer still answers the check.
+func TestCheck_AnchorlessFailedDeleteIsNoAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cache  func(r *flatRig)
+		result string
+	}{
+		{"an index's 404", func(r *flatRig) { r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "") }, "failed"},
+		{"an anchor's 404, no index row", func(r *flatRig) { r.cacheRow("Release", []byte("Origin: fury\n"), 1, rigStart-3600, "") }, "failed"},
+		{"a 404 beside a 304", func(r *flatRig) {
+			pk := gzBody("v1")
+			r.cacheRow("Packages.gz", pk, 1, rigStart-3600, rigETag(pk))
+			r.up.setAt(r.url("Packages.gz"), pk)
+			r.cacheRow("Sources.gz", gzBody("src"), 1, rigStart-3600, "")
+		}, "anchorless_unchanged"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newFlatRig(t, "/fury")
+			tc.cache(r)
+			if _, err := r.rigDB().Exec(`CREATE TRIGGER no_url_path_delete BEFORE DELETE ON url_path
+BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`); err != nil {
+				t.Fatal(err)
+			}
+			before := r.listed()
+			r.check()
+			if got := r.lastResult(); got != tc.result {
+				t.Fatalf("result %q, want %s", got, tc.result)
+			}
+			if n := strings.Count(r.logs.String(), `"msg":"freshness: delete anchorless rows failed"`); n != 1 {
+				t.Fatalf("%d delete failure WARNs, want 1", n)
+			}
+			if after := r.listed(); !slices.Equal(after, before) {
+				t.Fatalf("rows %v after the check, want %v: the delete failed", after, before)
+			}
+			if want := map[string]int64{"failed": 1}[tc.result]; r.row().CheckFailCount != want {
+				t.Fatalf("check_fail_count %d, want %d", r.row().CheckFailCount, want)
+			}
+		})
+	}
+}
+
+// listed is the suite's cached metadata row paths.
+func (r *flatRig) listed() []string {
+	r.t.Helper()
+	rows, err := r.cache.ListSuiteMetadataRows(context.Background(), suiteKeyOf(r.suite))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	var out []string
+	for _, u := range rows {
+		out = append(out, u.Path)
+	}
+	return out
+}
+
+// The Task 10 review's M5: a read fault of the refresh's index rows follows
+// checkFirst's convention for a local read fault — one WARN naming the
+// suite, no index request, no delete and no write (no check stamp, no
+// streak, no record): the next check tries again. The fault is a row the
+// read cannot scan; the gate's reads and the client-created Release (so
+// checkFirst's own index read is skipped) get past it.
+func TestCheck_AnchorlessIndexReadFaultIsALocalFault(t *testing.T) {
+	r := newFlatRig(t, "/fury")
+	r.cacheRow("Release", []byte("Origin: fury\n"), 1, rigStart-3600, "")
+	r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "")
+	if _, err := r.rigDB().Exec(`INSERT INTO url_path(canonical_scheme,canonical_host,path,upstream_url,is_metadata,request_count)
+ VALUES('http',?,'/fury/Contents-x','http://fh/fury/Contents-x',1,'not a number')`, flatRigHost); err != nil {
+		t.Fatal(err)
+	}
+	r.check()
+	warns := 0
+	for _, line := range strings.Split(r.logs.String(), "\n") {
+		var m map[string]any
+		if line != "" && json.Unmarshal([]byte(line), &m) == nil && m["msg"] == "freshness: read anchor rows failed" {
+			if m["level"] != "WARN" || m["suite_path"] != "/fury" {
+				t.Fatalf("read failure line %v, want a WARN naming /fury", m)
+			}
+			warns++
+		}
+	}
+	if warns != 1 || r.lastResult() != "" {
+		t.Fatalf("%d read failure WARNs, last result %q; want 1 and no check line", warns, r.lastResult())
+	}
+	if n := r.requests("Packages.gz"); n != 0 {
+		t.Fatalf("Packages.gz asked %d times, want never", n)
+	}
+	if r.lookup("Release") == nil {
+		t.Fatal("the Release row was deleted, want it kept: nothing was decided")
+	}
+	if row := r.row(); row.LastCheckAt != nil || row.CheckFailCount != 0 || row.AdoptionFailReason != nil {
+		t.Fatalf("suite row %+v, want no check stamp, no streak and no record", row)
+	}
+}

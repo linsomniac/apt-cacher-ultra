@@ -157,7 +157,7 @@ func (c *Checker) anchorAbsent(ctx, fetchCtx context.Context, out *checkOutcome,
 			c.logger.Warn("freshness: read anchor rows failed",
 				"err", err, "canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath)
 		}
-		t := c.runProbeTree(fetchCtx, suite, c.anchorURLsFor(suite, rows))
+		t := c.runProbeTree(fetchCtx, suite, c.anchorURLsFor(suite, anchorURLMap(rows)))
 		switch {
 		case t.end != nil && t.end.cancelled():
 			return nil

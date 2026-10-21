@@ -186,14 +186,20 @@ func TestDeleteURLPathRows_DeletesTheRowsNamed(t *testing.T) {
 	for _, p := range []string{"/flat/InRelease", "/flat/Packages", "/flat/Release", "/flat/Sources"} {
 		putFetchedRow(t, c, p, blob, 1_799_999_000)
 	}
+	// A row stored without a blob, read without one: the NULL-aware
+	// compare's other half (it is deleted).
+	if err := c.PutURLPath(context.Background(), URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: "/flat/Release.gpg",
+		UpstreamURL: "http://h/flat/Release.gpg", IsMetadata: true}); err != nil {
+		t.Fatal(err)
+	}
 	read := func(p string) URLPath { return *lookupRow(t, c, p) }
 	gone, blobless := read("/flat/Packages"), read("/flat/Sources")
 	gone.Path, blobless.BlobHash = "/flat/Gone", nil
-	rows := []URLPath{read("/flat/InRelease"), read("/flat/Packages"), read("/flat/Release"), gone, blobless}
+	rows := []URLPath{read("/flat/InRelease"), read("/flat/Packages"), read("/flat/Release"), gone, blobless, read("/flat/Release.gpg")}
 	putFetchedRow(t, c, "/flat/InRelease", fresh, 1_800_000_000) // a miss stored it anew after the read
 	n, err := c.DeleteURLPathRows(context.Background(), rows)
-	if err != nil || n != 2 {
-		t.Fatalf("DeleteURLPathRows = %d, %v; want 2", n, err)
+	if err != nil || n != 3 {
+		t.Fatalf("DeleteURLPathRows = %d, %v; want 3", n, err)
 	}
 	if got := listedPaths(t, c, sk("h", "/flat")); !slices.Equal(got, []string{"/flat/InRelease", "/flat/Sources"}) {
 		t.Fatalf("rows left = %v, want [/flat/InRelease /flat/Sources]: the row stored anew and the one read blobless kept", got)

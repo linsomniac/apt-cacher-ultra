@@ -1286,8 +1286,11 @@ func (h *Handler) anchorModTime(ctx context.Context, snapshotID int64) time.Time
 // If-Modified-Since on an index sees a replacement whose bytes were
 // already in the pool (the anchorless refresh points the row at an
 // existing pool file and moves last_fetched_at past the previous stamp);
-// a .deb, and a serve with no stamp (lastFetchedAt nil: a snapshot or
-// by-hash serve), keep mtime.
+// a .deb, and a serve with no stamp (lastFetchedAt nil: a snapshot serve
+// or the content-addressed by-hash fallback), keep mtime. A by-hash
+// path's own url_path row (recordByHashURLPath) carries a stamp, so its
+// later hits answer max as any row does: harmless, as its bytes never
+// change.
 //
 // AIDEV-NOTE: ruling R-G3. adoptionStampTx's first-adoption floor is the
 // anchors' MAX(last_fetched_at) + 1, which passes this only while no pool
