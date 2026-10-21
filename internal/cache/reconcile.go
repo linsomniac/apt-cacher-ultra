@@ -22,8 +22,10 @@ import (
 // OR a non-empty identity field (package_name/architecture/version) DISAGREES
 // is a real cross-index conflict and fails loud (SPEC6_5 §11 H7). It is NOT a
 // silent ON CONFLICT DO NOTHING. If the package_hash column set ever changes,
-// update BOTH copies (and the heal UPDATE below). flat_filename (phase G) is
-// in both INSERTs but neither probed nor healed here, on purpose: it follows
+// update BOTH copies (and the heal UPDATE below); both writers call
+// noteFlatRows before they submit (Cache.flatRows, ruling PG-31).
+// flat_filename (phase G) is in both INSERTs but neither probed nor healed
+// here, on purpose: it follows
 // from the row's path and its snapshot's suite (DotClean of the Filename
 // relative to FlatBase), so a same-PK row always agrees, and no released
 // binary wrote a flat row with another value (v6 flat suites took
@@ -133,6 +135,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 //     error, not a silent no-op, because it would mean the caller is trying to
 //     substitute a different blob than what already serves — that is corruption.
 func (c *Cache) InsertReconciledMembers(ctx context.Context, snapshotID int64, members []SnapshotMember, packageHashes []PackageHash) error {
+	c.noteFlatRows(packageHashes) // ruling PG-31: before the transaction can commit
 	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {

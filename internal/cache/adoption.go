@@ -369,6 +369,7 @@ type PrefetchedURLPath struct {
 func (c *Cache) CommitAdoption(ctx context.Context, snapshotID int64,
 	members []SnapshotMember, skipped []SkippedMember, packageHashes []PackageHash,
 	prefetchedURLPaths []PrefetchedURLPath, coverageComplete bool) error {
+	c.noteFlatRows(packageHashes) // ruling PG-31: before the transaction can commit
 	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
@@ -914,17 +915,34 @@ type DeclaredHash struct {
 // finds only lets bytes through that hash to a signed declaration, and it
 // never runs when an exact row exists (so a dists suite's vouching is
 // unchanged). Its cost — one partial-index query of at most 32 names — is
-// paid by every non-metadata request no exact row covers, including every
-// .deb of a host with no flat suite (an empty index range per name): on
-// the hit path once, on a miss twice (the pre-fetch gate and the
-// post-fetch dispatch), and once more for a strict-mode re-run after an
-// adoption wait.
+// paid, once the cache holds any flat row (Cache.flatRows, ruling PG-31:
+// none on a cache with adoption off or without flat suites), by every
+// non-metadata request no exact row covers, including every .deb of a
+// host with no flat suite (an empty index range per name): on the hit
+// path once, on a miss twice (the pre-fetch gate and the post-fetch
+// dispatch), and once more for a strict-mode re-run after an adoption
+// wait.
 func (c *Cache) DeclaredHashesForPath(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
 	out, err := c.declaredHashesExact(ctx, scheme, host, path)
-	if err != nil || len(out) > 0 {
+	if err != nil || len(out) > 0 || !c.flatRows.Load() {
+		// Ruling PG-31: with no flat row in package_hash (every cache
+		// with adoption off, or without flat suites) the fallback could
+		// find nothing — see Cache.flatRows for why false is never stale.
 		return out, err
 	}
 	return c.declaredHashesBySuffix(ctx, scheme, host, path)
+}
+
+// noteFlatRows sets Cache.flatRows when rows hold a flat row (a non-empty
+// FlatFilename). Every package_hash writer calls it before it submits the
+// transaction that inserts rows (ruling PG-31).
+func (c *Cache) noteFlatRows(rows []PackageHash) {
+	for _, r := range rows {
+		if r.FlatFilename != "" {
+			c.flatRows.Store(true)
+			return
+		}
+	}
 }
 
 // declaredExactSQL is the exact lookup's query (spec C6 step 1): the
@@ -979,6 +997,11 @@ func (c *Cache) declaredHashesExact(ctx context.Context, scheme, host, path stri
 	}
 	return out, nil
 }
+
+// flatRowsExistSQL primes Cache.flatRows at Open (ruling PG-31): whether
+// package_hash holds a flat row, one probe of the partial index
+// idx_package_hash_flat_filename (whose WHERE is the same term).
+const flatRowsExistSQL = `SELECT EXISTS(SELECT 1 FROM package_hash WHERE flat_filename <> '')`
 
 // maxFallbackSegments bounds spec C6's suffix fallback: a dot-cleaned
 // request path of more segments is never looked up by suffix (a constant;

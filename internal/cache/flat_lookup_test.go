@@ -337,3 +337,96 @@ func TestDeclaredHashesForPath_TheExactLookupProbesSuiteFreshnessByItsKey(t *tes
 		t.Fatalf("query plan scans a table or does not probe suite_freshness by its key:\n%s", plan)
 	}
 }
+
+// Ruling PG-31 (the final review's concurrency lens m-1): the cache's
+// "flat rows may exist" flag. Open primes it from package_hash — false on
+// a cache with no flat row, true on one with — by one probe of the partial
+// index; CommitAdoption and reconcile's insert set it before the
+// transaction that inserts a flat row commits, so a fallback lookup right
+// after finds the row. While it is false no fallback query runs: shown by
+// a flat row written behind the cache's back (raw SQL, which no writer
+// does), which the fallback finds only once a reopen has primed the flag.
+func TestDeclaredHashesForPath_TheFlatRowsFlag(t *testing.T) {
+	ctx := context.Background()
+	flat := sk("h", "/repo")
+	row := func() PackageHash { return pkgRow("/repo/x_1_amd64.deb", hashOf('a'), "x_1_amd64.deb") }
+	const twin = "/repo/./x_1_amd64.deb" // misses the exact row: the fallback's to answer
+	t.Run("a commit sets it", func(t *testing.T) {
+		c := openCache(t)
+		if c.flatRows.Load() {
+			t.Fatal("a fresh cache's flag is true, want false")
+		}
+		seedRow(t, c, flat, 1)
+		adoptPackages(t, c, flat, []PackageHash{row()}, true)
+		if got := declared(t, c, twin); !slices.Equal(got, []string{"a@/repo"}) {
+			t.Fatalf("fallback after CommitAdoption = %v, want [a@/repo]", got)
+		}
+	})
+	t.Run("reconcile's insert sets it", func(t *testing.T) {
+		c := openCache(t)
+		seedRow(t, c, flat, 1)
+		id := adoptPackages(t, c, flat, nil, true)
+		r := row()
+		r.SnapshotID = id
+		if err := c.InsertReconciledMembers(ctx, id, nil, []PackageHash{r}); err != nil {
+			t.Fatal(err)
+		}
+		if got := declared(t, c, twin); !slices.Equal(got, []string{"a@/repo"}) {
+			t.Fatalf("fallback after InsertReconciledMembers = %v, want [a@/repo]", got)
+		}
+	})
+	t.Run("Open primes it", func(t *testing.T) {
+		dir := t.TempDir()
+		c, err := Open(ctx, dir, discardSlog())
+		if err != nil {
+			t.Fatal(err)
+		}
+		seedRow(t, c, flat, 1)
+		adoptPackages(t, c, flat, []PackageHash{row()}, true)
+		if err := c.Close(); err != nil {
+			t.Fatal(err)
+		}
+		c, err = Open(ctx, dir, discardSlog())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		if !c.flatRows.Load() {
+			t.Fatal("a cache opened over a flat row has its flag false, want true")
+		}
+		if got := declared(t, c, twin); !slices.Equal(got, []string{"a@/repo"}) {
+			t.Fatalf("fallback after a reopen = %v, want [a@/repo]", got)
+		}
+		if plan := queryPlan(t, c, flatRowsExistSQL); !strings.Contains(plan, "INDEX idx_package_hash_flat_filename") {
+			t.Fatalf("the prime does not probe idx_package_hash_flat_filename:\n%s", plan)
+		}
+	})
+	t.Run("false skips the fallback", func(t *testing.T) {
+		dir := t.TempDir()
+		c, err := Open(ctx, dir, discardSlog())
+		if err != nil {
+			t.Fatal(err)
+		}
+		seedRow(t, c, flat, 1)
+		r := row()
+		r.FlatFilename = ""
+		adoptPackages(t, c, flat, []PackageHash{r}, true)
+		if _, err := c.db.Exec(`UPDATE package_hash SET flat_filename = 'x_1_amd64.deb'`); err != nil {
+			t.Fatal(err)
+		}
+		if got := declared(t, c, twin); got != nil {
+			t.Fatalf("fallback with the flag false = %v, want none: no fallback query runs", got)
+		}
+		if err := c.Close(); err != nil {
+			t.Fatal(err)
+		}
+		c, err = Open(ctx, dir, discardSlog())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		if got := declared(t, c, twin); !slices.Equal(got, []string{"a@/repo"}) {
+			t.Fatalf("fallback after the prime = %v, want [a@/repo]: the row was there all along", got)
+		}
+	})
+}

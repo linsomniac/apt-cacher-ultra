@@ -47,6 +47,24 @@ type Cache struct {
 	// touches coalesces TouchSuite writes (spec C3).
 	touches suiteTouches
 
+	// flatRows is the "flat rows may exist" flag (ruling PG-31): false
+	// while package_hash holds no row with a non-empty flat_filename, so
+	// DeclaredHashesForPath skips the suffix fallback, which only such a
+	// row can answer. Open primes it (flatRowsExistSQL); noteFlatRows sets
+	// it; nothing clears it at run time.
+	//
+	// AIDEV-NOTE: false is never stale. Every writer that inserts a flat
+	// row (CommitAdoption, InsertReconciledMembers) calls noteFlatRows
+	// before it submits its transaction, so the flag is true before such a
+	// row can commit, and it is never cleared while the process runs (a
+	// stale true — the suite reaped, its rows gone — costs only the
+	// fallback's query, until the next Open primes it again). A stale false
+	// would skip the fallback for a flat .deb: strict mode would refuse it
+	// (fail closed) and a non-strict serve would go unhashed — the
+	// vouching lost silently. A new package_hash writer must call
+	// noteFlatRows too.
+	flatRows atomic.Bool
+
 	// heldHook, when set (tests only), runs on the creating goroutine right
 	// after creationAttempt holds an eviction candidate, before the writer
 	// operation: a panic there stands in for a bug between the hold and the
@@ -97,6 +115,12 @@ func Open(ctx context.Context, dir string, logger *slog.Logger) (*Cache, error) 
 		writes:  make(chan writeReq, writeBufferSize),
 		closeCh: make(chan struct{}),
 	}
+	var flat bool
+	if err := db.QueryRowContext(ctx, flatRowsExistSQL).Scan(&flat); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("read whether flat package_hash rows exist: %w", err)
+	}
+	c.flatRows.Store(flat)
 	c.wg.Add(1)
 	go c.writer()
 	return c, nil
