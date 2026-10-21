@@ -1274,41 +1274,73 @@ func (r *flatRig) listed() []string {
 	return out
 }
 
-// The Task 10 review's M5: a read fault of the refresh's index rows follows
-// checkFirst's convention for a local read fault — one WARN naming the
-// suite, no index request, no delete and no write (no check stamp, no
-// streak, no record): the next check tries again. The fault is a row the
-// read cannot scan; the gate's reads and the client-created Release (so
-// checkFirst's own index read is skipped) get past it.
+// The Task 10 review's M5, as ruling PG-32 amends it: a flat suite's
+// metadata rows are read once, with its anchors, before the host slot and
+// the probe tree, so a read fault there follows checkFirst's convention for
+// a local read fault before any request — one WARN naming the suite per
+// trigger, no probe, no index request, no delete and no
+// write (no check stamp, no streak, no record): the next check tries
+// again. Read after the probe tree, the fault re-sent the InRelease and
+// Release probes at every trigger (the final review's concurrency lens
+// m-2). The fault is a row the read cannot scan; the client-created
+// Release keeps the suite from being dormant.
 func TestCheck_AnchorlessIndexReadFaultIsALocalFault(t *testing.T) {
 	r := newFlatRig(t, "/fury")
+	r.checker.cooldown = time.Minute
 	r.cacheRow("Release", []byte("Origin: fury\n"), 1, rigStart-3600, "")
 	r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "")
 	if _, err := r.rigDB().Exec(`INSERT INTO url_path(canonical_scheme,canonical_host,path,upstream_url,is_metadata,request_count)
  VALUES('http',?,'/fury/Contents-x','http://fh/fury/Contents-x',1,'not a number')`, flatRigHost); err != nil {
 		t.Fatal(err)
 	}
-	r.check()
-	warns := 0
-	for _, line := range strings.Split(r.logs.String(), "\n") {
-		var m map[string]any
-		if line != "" && json.Unmarshal([]byte(line), &m) == nil && m["msg"] == "freshness: read anchor rows failed" {
-			if m["level"] != "WARN" || m["suite_path"] != "/fury" {
-				t.Fatalf("read failure line %v, want a WARN naming /fury", m)
-			}
-			warns++
+	for range 5 {
+		r.check() // five triggers within one cooldown: T1s of five client index hits
+		r.clock.advance(5 * time.Second)
+	}
+	warns := logRecords(t, r.logs, "freshness: read anchor rows failed")
+	for _, m := range warns {
+		if m["level"] != "WARN" || m["suite_path"] != "/fury" {
+			t.Fatalf("read failure line %v, want a WARN naming /fury", m)
 		}
 	}
-	if warns != 1 || r.lastResult() != "" {
-		t.Fatalf("%d read failure WARNs, last result %q; want 1 and no check line", warns, r.lastResult())
+	if len(warns) != 5 || r.lastResult() != "" {
+		t.Fatalf("%d read failure WARNs, last result %q; want one per trigger and no check line", len(warns), r.lastResult())
 	}
-	if n := r.requests("Packages.gz"); n != 0 {
-		t.Fatalf("Packages.gz asked %d times, want never", n)
+	if n := len(r.up.sentURLs()); n != 0 {
+		t.Fatalf("%d upstream requests (%v), want none: the fault comes before the probe tree", n, r.up.sentURLs())
 	}
 	if r.lookup("Release") == nil {
 		t.Fatal("the Release row was deleted, want it kept: nothing was decided")
 	}
 	if row := r.row(); row.LastCheckAt != nil || row.CheckFailCount != 0 || row.AdoptionFailReason != nil {
 		t.Fatalf("suite row %+v, want no check stamp, no streak and no record", row)
+	}
+}
+
+// Ruling PG-32 keeps the Task 10 review's M3 for the index rows: the
+// refresh revalidates the rows read before the probe tree and compares its
+// writes with their blobs. A newer Packages.gz a client's miss stored while
+// the InRelease probe was out is asked with the validators read before it
+// and, its compare lost, kept: the refresh never overwrites what a client's
+// own fetch just stored.
+func TestCheck_AnchorlessRevalidatesTheRowsReadBeforeTheProbe(t *testing.T) {
+	r := newFlatRig(t, "/fury")
+	v1, v2, v3 := gzBody("v1"), gzBody("v2"), gzBody("v3")
+	r.cacheRow("Packages.gz", v1, 1, rigStart-3600, rigETag(v1))
+	r.up.setAt(r.url("Packages.gz"), v2)
+	r.up.before = func(url string) {
+		if url == r.url("InRelease") {
+			r.cacheRow("Packages.gz", v3, 2, rigStart, rigETag(v3)) // a client's miss, while the probe is out
+		}
+	}
+	r.check()
+	if got, want := r.up.etagsSent(r.url("Packages.gz")), []string{rigETag(v1)}; !slices.Equal(got, want) {
+		t.Fatalf("Packages.gz asked with %q, want %q: the row read before the probe", got, want)
+	}
+	if u := r.lookup("Packages.gz"); u == nil || *u.BlobHash != hashOf(v3) {
+		t.Fatalf("Packages.gz row %+v, want the client's v3 kept", u)
+	}
+	if got := r.lastResult(); got != "anchorless_unchanged" {
+		t.Fatalf("result %q, want anchorless_unchanged (the compare lost: kept, a content answer)", got)
 	}
 }

@@ -23,26 +23,24 @@ func suiteKeyOf(suite SuiteRef) cache.SuiteKey {
 	return cache.SuiteKey{CanonicalScheme: suite.CanonicalScheme, CanonicalHost: suite.CanonicalHost, SuitePath: suite.SuitePath}
 }
 
-// flatIndexClientCreated returns a client-created root Packages* or
-// Sources* url_path row of flat suite (aptpath.FileFlatIndex,
-// request_count > 0), nil when it has none: spec C4 Dispatch 3 counts it
+// flatIndexClientCreated returns the client-created root Packages* or
+// Sources* url_path row of flat suite among rows, the suite's metadata
+// rows (cache.ListSuiteMetadataRows, which checkFirst reads once before
+// the host slot and the probe tree: ruling PG-32) — aptpath.FileFlatIndex,
+// request_count > 0 — nil when it has none: spec C4 Dispatch 3 counts it
 // beside the InRelease and Release rows, so a Release-less repository's
 // suite — created by its index's serve — is not dormant (the E
 // carry-forward; plan design note 8). A row hot prefetch or a
 // reconstruction wrote has no request count. The row is returned, not a
 // bool, because its stored upstream_url is the probe tree's URL model when
 // no anchor row is cached (ruling PG-20, checkFirst).
-func (a *Adopter) flatIndexClientCreated(ctx context.Context, suite SuiteRef) (*cache.URLPath, error) {
-	rows, err := a.cache.ListSuiteMetadataRows(ctx, suiteKeyOf(suite))
-	if err != nil {
-		return nil, fmt.Errorf("read flat index rows: %w", err)
-	}
+func flatIndexClientCreated(suite SuiteRef, rows []cache.URLPath) *cache.URLPath {
 	for i, r := range rows {
 		if r.RequestCount > 0 && aptpath.ClassifySuiteFile(suite.SuitePath, r.Path) == aptpath.FileFlatIndex {
-			return &rows[i], nil
+			return &rows[i]
 		}
 	}
-	return nil, nil
+	return nil
 }
 
 // maxAnchorlessIndexBytes is the anchorless refresh's body cap (plan
@@ -180,53 +178,46 @@ func anchorlessRank(name string) int {
 // anchorlessRefresh is spec C4 Dispatch 4 (plan design note 10) for a flat
 // suite whose probe tree t found neither InRelease nor Release and whose
 // gate admitted it (anchorlessEligible), under the check's host slot and
-// deadline (fetchCtx). Each cached url_path row of the suite whose member
-// is an anchorless index (aptpath.IsAnchorlessIndex) gets one conditional
-// GET (refreshAnchorlessRow), Packages* first, then Sources*, then
-// Contents-* (anchorlessRank); then the rows to delete — those answered
-// 404 or 410, a changed plain Contents-*, one whose 200 was over the body
-// cap (ruling PG-29; WARN, rate-limited, naming its path), and the suite's
-// cached InRelease and Release rows (anchors: read before the probe tree
-// ran) whose probe in t answered 404 or 410, or 401 or 403 beside an index
-// request's content answer (ruling PG-28) — go in one writer transaction,
-// each only while it still holds the blob it was read with
-// (cache.DeleteURLPathRows; an anchor a client's miss stored anew during
-// its probe's window is kept). The check is answered — anchorless_refreshed when a row was replaced or
-// deleted, anchorless_unchanged otherwise — unless index requests were
-// sent and none got a content answer (anchorlessAnswer.answered: a 304, a
-// 200 stored or matching the cached bytes, a 404 or 410): a failed check
-// (the streak backs off). A suite with no cached index row sends no
-// request and is answered: the anchors' 404s still apply. A delete that
-// fails is logged and is no answer: its 404s and 410s stop counting, and
-// a check they alone answered (no index request, or every content answer
-// a delete) fails. An answered check is a success (last_success_at, the
-// streak reset), clears the suite's failure or refusal record (it
-// described an anchor upstream no longer serves) and its pending change
-// (the anchorless form adopts nothing: a stamp left behind would queue
-// the suite every tick, pendingChange). Its writes (the pool,
-// RefreshURLPathBlob, DeleteURLPathRows) run under the lifecycle ctx, as
-// the check's other writes do: a refresh that passes its deadline still
-// commits what it fetched. A shutdown mid-refresh ends it silently; what
-// it stored stays. A read error of the index rows is checkFirst's local
-// fault: logged at WARN, nothing written, no backoff.
+// deadline (fetchCtx). Each of rows — the suite's metadata rows, read
+// before the host slot and the probe tree (checkFirst, ruling PG-32) —
+// whose member is an anchorless index (aptpath.IsAnchorlessIndex) gets one
+// conditional GET (refreshAnchorlessRow), Packages* first, then Sources*,
+// then Contents-* (anchorlessRank); then the rows to delete — those
+// answered 404 or 410, a changed plain Contents-*, one whose 200 was over
+// the body cap (ruling PG-29; WARN, rate-limited, naming its path), and
+// the suite's cached InRelease and Release rows (anchors: read before the
+// probe tree ran) whose probe in t answered 404 or 410, or 401 or 403
+// beside an index request's content answer (ruling PG-28) — go in one
+// writer transaction, each only while it still holds the blob it was read
+// with (cache.DeleteURLPathRows; an anchor a client's miss stored anew
+// during its probe's window is kept). The check is answered —
+// anchorless_refreshed when a row was replaced or deleted,
+// anchorless_unchanged otherwise — unless index requests were sent and
+// none got a content answer (anchorlessAnswer.answered: a 304, a 200
+// stored or matching the cached bytes, a 404 or 410): a failed check (the
+// streak backs off). A suite with no cached index row sends no request and
+// is answered: the anchors' 404s still apply. A delete that fails is
+// logged and is no answer: its 404s and 410s stop counting, and a check
+// they alone answered (no index request, or every content answer a delete)
+// fails. An answered check is a success (last_success_at, the streak
+// reset), clears the suite's failure or refusal record (it described an
+// anchor upstream no longer serves) and its pending change (the anchorless
+// form adopts nothing: a stamp left behind would queue the suite every
+// tick, pendingChange). Its writes (the pool, RefreshURLPathBlob,
+// DeleteURLPathRows) run under the lifecycle ctx, as the check's other
+// writes do: a refresh that passes its deadline still commits what it
+// fetched. A shutdown mid-refresh ends it silently; what it stored stays.
+// Its rows' replaces and deletes compare, as its anchors' do, with the
+// blobs read before the probe tree (design review M-4, PG-24 M3): a row a
+// client's miss stored anew meanwhile is kept.
 //
 // AIDEV-NOTE: no snapshot, no vouching, no strict-mode effect (spec C4):
 // the refresh only revalidates url_path rows a client's miss created, and
 // a row it cannot answer for stays as it is. Its cache operations go
 // through the adopter's *cache.Cache: the checker's Cache interface stays
 // the subset its fakes implement.
-func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, nowUnix int64, t probeTree, anchors map[string]cache.URLPath) {
+func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, nowUnix int64, t probeTree, anchors map[string]cache.URLPath, rows []cache.URLPath) {
 	host, suitePath := suite.CanonicalHost, suite.SuitePath
-	rows, err := c.adopter.cache.ListSuiteMetadataRows(ctx, suiteKeyOf(suite))
-	if err != nil {
-		// Task 10 review M5: checkFirst's convention for a local read
-		// fault — no write and no backoff, retried at the next check.
-		if !c.endedByShutdown(ctx, suite, "read the anchorless index rows", err) {
-			c.logger.Warn("freshness: read anchor rows failed",
-				"err", err, "canonical_host", host, "suite_path", suitePath)
-		}
-		return
-	}
 	var (
 		indexes, deletes             []cache.URLPath
 		requests, answered, replaced int

@@ -207,7 +207,7 @@ func (t probeTree) signatureSeen() bool {
 // checkFirst is spec C4 Dispatch 3 (adopter wired, no current snapshot). A
 // suite without client interest in the last 7 days, or without a
 // client-created InRelease or Release url_path row — or, for a flat suite,
-// root Packages*/Sources* row (Adopter.flatIndexClientCreated) — is
+// root Packages*/Sources* row (flatIndexClientCreated) — is
 // dormant: no request and no write. The scheduler skips only a suite
 // without interest (suiteDue): one with interest but no client-created row
 // is queued at every tick and ends here, dormant, after its row reads
@@ -234,13 +234,17 @@ func (t probeTree) signatureSeen() bool {
 // adoption.adopt_unsigned is off, is refused unsigned_disabled
 // (anchorlessDisabled, ruling PG-1); an unsigned candidate while
 // adoption.adopt_unsigned is off is the refusal unsigned_disabled, recorded
-// and paced (ruling PE-12). A read error of the anchor rows is logged at
-// WARN with no write and no backoff: a local fault, retried at the next
-// check (at most one per cooldown and per tick); so is a read error of a
-// flat suite's index rows, before the probe tree or in the anchorless
-// refresh. A suite with no cached anchor row but a client-created flat
-// index row is probed beside the index row's stored upstream_url (ruling
-// PG-20).
+// and paced (ruling PE-12). A flat suite's metadata rows
+// (cache.ListSuiteMetadataRows) are read once, with its anchor rows,
+// before the host slot and the probe tree: they serve Dispatch 3's
+// client-created index row and the anchorless refresh (ruling PG-32). A
+// read error of either is logged at WARN with no write and no backoff: a
+// local fault, before any request, retried at the next check — nothing is
+// stamped, so every trigger past the cooldown since the last recorded
+// check (each client check, each scheduler tick that queues the suite)
+// reads and logs again. A suite with no cached anchor row but a
+// client-created flat index row is probed beside the index row's stored
+// upstream_url (ruling PG-20).
 //
 // AIDEV-NOTE: a first or unsigned request passes signedCurrent = false to
 // admit, so it never takes the last free slot that the reserved-slot rule
@@ -260,14 +264,31 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 		return nil
 	}
 	anchors, clientCreated, err := c.cachedAnchors(ctx, suite)
-	var index *cache.URLPath // a client-created flat index row (Dispatch 3)
-	if err == nil && !clientCreated && aptpath.IsFlatSuitePath(suitePath) {
-		index, err = c.adopter.flatIndexClientCreated(ctx, suite)
-		clientCreated = index != nil
+	var (
+		meta  []cache.URLPath // a flat suite's metadata rows
+		index *cache.URLPath  // a client-created flat index row (Dispatch 3)
+	)
+	if err == nil && aptpath.IsFlatSuitePath(suitePath) {
+		// AIDEV-NOTE: ruling PG-32. One read, before the host slot and the
+		// probe tree, for Dispatch 3 and the anchorless refresh: a read
+		// fault is then a local fault before any request, as this
+		// convention assumes (read after the probe tree, a persistent
+		// fault re-sent the InRelease and Release probes at every
+		// trigger). The refresh compares its writes with these rows'
+		// blobs, so a row a client stores during the probe is kept.
+		meta, err = c.adopter.cache.ListSuiteMetadataRows(ctx, suiteKeyOf(suite))
+		if err != nil {
+			err = fmt.Errorf("read flat index rows: %w", err)
+		} else if !clientCreated {
+			index = flatIndexClientCreated(suite, meta)
+			clientCreated = index != nil
+		}
 	}
 	if err != nil {
-		c.logger.Warn("freshness: read anchor rows failed",
-			"err", err, "canonical_host", host, "suite_path", suitePath)
+		if !c.endedByShutdown(ctx, suite, "read the anchor rows", err) {
+			c.logger.Warn("freshness: read anchor rows failed",
+				"err", err, "canonical_host", host, "suite_path", suitePath)
+		}
 		return nil
 	}
 	if !clientCreated {
@@ -333,7 +354,7 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 				c.anchorlessDisabled(ctx, out, cur, suite, nowUnix, t)
 				return nil
 			case eligible:
-				c.anchorlessRefresh(ctx, fetchCtx, out, cur, suite, nowUnix, t, anchors)
+				c.anchorlessRefresh(ctx, fetchCtx, out, cur, suite, nowUnix, t, anchors, meta)
 				return nil
 			}
 		}
