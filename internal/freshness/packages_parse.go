@@ -106,7 +106,7 @@ func parsePackages(text []byte) ([]PackageRef, []string, error) {
 		if !validHexSHA256(sha256) {
 			return fmt.Errorf("invalid sha256 %q (filename %q)", sha256, filename)
 		}
-		if err := validateMemberPath(filename); err != nil {
+		if err := validateFilename(filename); err != nil {
 			return fmt.Errorf("invalid filename %q: %w", filename, err)
 		}
 		if len(out)+len(noSHA256) >= MaxPackageStanzas {
@@ -191,14 +191,74 @@ func parsePackages(text []byte) ([]PackageRef, []string, error) {
 	if err := flush(); err != nil {
 		return nil, nil, fmt.Errorf("packages: tail: %w", err)
 	}
-	if len(out) == 0 {
-		// A non-empty input that produced zero usable stanzas is
-		// suspicious enough to flag — likely a downloaded HTML error
-		// page or a truncated file. The freshness layer logs this as
+	if len(out) == 0 && len(noSHA256) == 0 && len(bytes.TrimSpace(text)) > 0 {
+		// A non-blank input in which no stanza names a Filename is no
+		// Packages index — a downloaded HTML error page, a foreign or
+		// truncated file. The freshness layer logs it as
 		// adoption_parse_failed and the next periodic tick retries.
-		if len(bytes.TrimSpace(text)) > 0 {
-			return nil, nil, errors.New("packages: no stanzas with both Filename and SHA256")
-		}
+		//
+		// AIDEV-NOTE: ruling R-G1 (the E carry-forward). A body whose
+		// stanzas all name a Filename but none a SHA256 (an index that
+		// declares only SHA512, SHA1 or MD5sum) parses: no rows, every
+		// Filename reported, so its snapshot adopts with incomplete
+		// coverage (no_sha256, buildPackageHashes) instead of failing at
+		// every check. A whitespace-only body (an empty component's real,
+		// empty index) was never an error and still parses to nothing.
+		return nil, nil, errors.New("packages: no stanzas with a Filename")
 	}
 	return out, noSHA256, nil
+}
+
+// maxFilenameBytes bounds a Packages Filename (spec C5 validateFilename).
+const maxFilenameBytes = 4096
+
+// validateFilename is spec C5's check of a Packages Filename, in place of
+// the Release members' validateMemberPath (which ParseRelease keeps): it
+// allows "." segments — apt requests <base>/./x.deb literally, and a
+// dpkg-scanpackages index (CUDA, libnvidia-container) writes ./x.deb — and
+// "%" (literal bytes, re-encoded upstream by spec C1). It refuses, fatal
+// as before: an empty name, an absolute one, NUL or another control byte,
+// a backslash, "?" or "#", a ".." segment, an empty segment, a name longer
+// than maxFilenameBytes, and a name made only of "." segments (it names no
+// file, and its DotClean is empty: plan design note 5).
+//
+// AIDEV-NOTE: the literal Filename is the package_hash path's tail (spec
+// C6: FlatBase(suite) + "/" + F, kept literally because apt requests
+// exactly that), so anything that could step outside the base — "..", an
+// absolute name, an empty segment that would collapse a path — stays
+// refused here.
+func validateFilename(f string) error {
+	switch {
+	case f == "":
+		return errors.New("empty")
+	case len(f) > maxFilenameBytes:
+		return fmt.Errorf("longer than %d bytes", maxFilenameBytes)
+	case strings.HasPrefix(f, "/"):
+		return errors.New("absolute path not allowed")
+	case strings.ContainsRune(f, '\\'):
+		return errors.New("contains backslash")
+	case strings.ContainsAny(f, "?#"):
+		return errors.New("contains URL delimiter")
+	}
+	for i := 0; i < len(f); i++ {
+		if c := f[i]; c < 0x20 || c == 0x7f {
+			return fmt.Errorf("contains control byte 0x%02x", c)
+		}
+	}
+	named := false
+	for _, seg := range strings.Split(f, "/") {
+		switch seg {
+		case "":
+			return errors.New("contains empty segment")
+		case "..":
+			return errors.New("contains .. segment")
+		case ".":
+		default:
+			named = true
+		}
+	}
+	if !named {
+		return errors.New("names no file")
+	}
+	return nil
 }

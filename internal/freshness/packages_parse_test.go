@@ -129,6 +129,15 @@ func TestParsePackages_BadFilename(t *testing.T) {
 		{"absolute", "/etc/shadow"},
 		{"dotdot", "pool/../etc/shadow"},
 		{"contains NUL", "pool/foo\x00.deb"},
+		// spec C5 validateFilename
+		{"control byte", "pool/foo\x1b.deb"},
+		{"backslash", "pool\\foo.deb"},
+		{"question mark", "pool/foo.deb?x"},
+		{"hash", "pool/foo.deb#x"},
+		{"empty segment", "pool//foo.deb"},
+		{"leading dotdot", "../foo.deb"},
+		{"only dots", "./."},
+		{"too long", strings.Repeat("a", 4097)},
 	}
 	h := sha(1)
 	for _, tc := range cases {
@@ -215,15 +224,15 @@ func TestParsePackages_AllWhitespaceIsZeroResult(t *testing.T) {
 }
 
 func TestParsePackages_NonEmptyButNoUsableStanzas(t *testing.T) {
-	// A well-formed Packages-shaped file in which no stanza declares
-	// both Filename and SHA256. This is structurally legal apt input
-	// (every field is recognized) but contributes zero rows to
-	// package_hash. SPEC2 §7.5 step 8 expects "for each pkg with
-	// Filename and SHA256" — zero pkgs means zero rows. Treat this
-	// as adoption_parse_failed so a downloaded-but-broken Packages
-	// file (apt error page rendered through gzip's gibberish, a
-	// truncated transfer, or a legitimate but empty component) does
-	// not silently produce an adoption with no .deb hash coverage.
+	// A Packages-shaped file in which no stanza names a Filename. It
+	// declares no package file at all, so it is no Packages index:
+	// adoption_parse_failed, so a downloaded-but-broken Packages file (an
+	// error page, a truncated transfer) does not silently produce an
+	// adoption with no .deb hash coverage. A body whose stanzas name
+	// Filenames without a SHA256 parses (ruling R-G1:
+	// TestParsePackages_OnlyStanzasWithoutSHA256Parse), and a blank body
+	// (an empty component's index) parses to nothing
+	// (TestParsePackages_AllWhitespaceIsZeroResult).
 	body := "Package: foo\n" +
 		"Version: 1.0\n" +
 		"Architecture: amd64\n" +
@@ -366,6 +375,98 @@ func TestParsePackages_ReportsFilenameWithoutSHA256(t *testing.T) {
 	}
 }
 
+// Ruling R-G1 (the E carry-forward): a body whose stanzas all name a
+// Filename but none a SHA256 — an index that declares only SHA512, SHA1 or
+// MD5sum — parses with no rows and every Filename reported, so its
+// snapshot adopts with incomplete coverage (no_sha256) instead of failing
+// its parse at every check. ParsePackages returns no rows and no error.
+func TestParsePackages_OnlyStanzasWithoutSHA256Parse(t *testing.T) {
+	body := "Package: a\nFilename: ./a_1_amd64.deb\nSHA512: " + strings.Repeat("a", 128) + "\n\n" +
+		"Package: b\nFilename: ./b_1_amd64.deb\nMD5sum: 0123456789abcdef0123456789abcdef\n"
+	refs, noSHA256, err := parsePackages([]byte(body))
+	if err != nil || len(refs) != 0 || strings.Join(noSHA256, ",") != "./a_1_amd64.deb,./b_1_amd64.deb" {
+		t.Fatalf("parsePackages = %v, %q, %v; want no rows, both Filenames reported, no error", refs, noSHA256, err)
+	}
+	if refs, err := ParsePackages([]byte(body)); err != nil || len(refs) != 0 {
+		t.Fatalf("ParsePackages = %v, %v; want no rows and no error", refs, err)
+	}
+}
+
+// Ruling R-G1's other side: a body with no Filename stanza at all — an
+// HTML error page, a foreign file — still fails its parse.
+func TestParsePackages_NoFilenameStanzaStillFails(t *testing.T) {
+	for name, body := range map[string]string{
+		"HTML error page":          "<html><head><title>404 Not Found</title></head><body>Not Found</body></html>\n",
+		"foreign file":             "Origin: Example\nLabel: Example\nSuite: stable\n",
+		"SHA512 only, no Filename": "Package: a\nSHA512: " + strings.Repeat("a", 128) + "\n",
+	} {
+		if _, _, err := parsePackages([]byte(body)); err == nil {
+			t.Errorf("%s: parsePackages succeeded, want a parse error", name)
+		}
+	}
+}
+
+// Spec C5 validateFilename: "." segments and "%" are allowed and kept
+// literally — apt requests <base>/./x.deb, and a Filename's "%" is a
+// literal byte that spec C1 re-encodes upstream.
+func TestParsePackages_KeepsDotAndPercentFilenamesLiterally(t *testing.T) {
+	body := "Package: cuda\nArchitecture: amd64\nVersion: 1\nFilename: ./cuda_12.6_amd64.deb\nSHA256: " + sha(1) + "\n\n" +
+		"Package: pkg\nArchitecture: amd64\nVersion: 1:2\nFilename: pool/p/pkg_1%3a2_amd64.deb\nSHA256: " + sha(2) + "\n\n" +
+		"Package: nested\nArchitecture: all\nVersion: 1\nFilename: a/./b/nested_1_all.deb\nSHA256: " + sha(3) + "\n"
+	refs, err := ParsePackages([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, r := range refs {
+		got = append(got, r.Filename)
+	}
+	if want := "./cuda_12.6_amd64.deb,pool/p/pkg_1%3a2_amd64.deb,a/./b/nested_1_all.deb"; strings.Join(got, ",") != want {
+		t.Fatalf("Filenames = %q, want %s", got, want)
+	}
+}
+
+// Spec C5 validateFilename, the table: the shapes real flat repositories
+// publish are accepted, and the spec's refusals stay refused.
+func TestValidateFilename(t *testing.T) {
+	for _, c := range []struct {
+		f  string
+		ok bool
+	}{
+		{"pool/main/f/foo/foo_1.0_amd64.deb", true},
+		{"amd64/kubectl_1.34.1-1.1_amd64.deb", true}, // pkgs.k8s.io
+		{"./cuda-toolkit_12.6.0-1_amd64.deb", true},  // NVIDIA CUDA, libnvidia-container
+		{"binary/jenkins_2.479.3_all.deb", true},     // pkg.jenkins.io
+		{"direct/jenkins_2.479.3_all.deb", true},
+		{"files/sublime-text_build-4180_amd64.deb", true}, // download.sublimetext.com
+		{"pkg_1%3a2.0_amd64.deb", true},                   // an epoch, %-encoded by the publisher
+		{"a/./b/./c.deb", true},
+		{".hidden.deb", true},
+		{"..deb", true},
+		{strings.Repeat("a", 4096), true},
+		{"", false},
+		{"/abs.deb", false},
+		{"a\x00b.deb", false},
+		{"a\x1fb.deb", false},
+		{"a\x7fb.deb", false},
+		{"a\\b.deb", false},
+		{"a?b.deb", false},
+		{"a#b.deb", false},
+		{"a/../b.deb", false},
+		{"..", false},
+		{"a//b.deb", false},
+		{"a/", false},
+		{"./", false},
+		{".", false},
+		{"./.", false},
+		{strings.Repeat("a", 4097), false},
+	} {
+		if err := validateFilename(c.f); (err == nil) != c.ok {
+			t.Errorf("validateFilename(%q) = %v, want ok=%v", c.f, err, c.ok)
+		}
+	}
+}
+
 // MaxPackageStanzas bounds everything parsePackages keeps — rows and
 // no_sha256 Filenames together (review fix round 2, Task 2) — so a hostile
 // allowlisted upstream cannot grow memory past it with stanzas that lack
@@ -383,6 +484,9 @@ func TestParsePackages_CapCountsStanzasWithoutSHA256(t *testing.T) {
 		{"a row and gaps up to the cap", good + gaps(MaxPackageStanzas-1), 1, MaxPackageStanzas - 1, false},
 		{"one gap past the cap", good + gaps(MaxPackageStanzas), 0, 0, true},
 		{"one row past the cap", gaps(MaxPackageStanzas) + good, 0, 0, true},
+		// Ruling R-G1: a body of gaps alone parses, up to the same cap.
+		{"gaps alone up to the cap", gaps(MaxPackageStanzas), 0, MaxPackageStanzas, false},
+		{"gaps alone past the cap", gaps(MaxPackageStanzas + 1), 0, 0, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			refs, noSHA256, err := parsePackages([]byte(c.body))
