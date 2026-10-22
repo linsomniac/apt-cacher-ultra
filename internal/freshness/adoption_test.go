@@ -680,6 +680,92 @@ func TestAdopter_MemberFetchFailure(t *testing.T) {
 	}
 }
 
+// TestAdopter_EmptyMemberAdopted is the regression test for the
+// GitLab Debian registry behavior behind the production
+// "adoption_member_fetch_failed ... upstream status=204" failures:
+// an empty index file — main/debian-installer/binary-all/Packages,
+// declared in the signed Release with Size 0 and the empty-content
+// SHA256 — is served by upstream as 204 No Content. The fetch layer
+// reports a 204 as a successful zero-byte fetch (see
+// TestFetch_NoContentIsEmptySuccess in internal/fetch); the fake
+// fetcher's zero-byte canned response mirrors that contract. Adoption
+// must verify the empty body against the signed declaration and
+// adopt it like any other member. The member is an IndexTarget in
+// the always-required "all" pseudo-arch group, so the SPEC6_8
+// serve-contract guard must see its group as served.
+func TestAdopter_EmptyMemberAdopted(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+
+	pkgs := fakePackagesStanzas(map[string]string{
+		"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64),
+	})
+	// Zero-byte index: upstream serves this as 204 No Content.
+	empty := []byte{}
+	releaseText, declared := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages":                pkgs,
+		"main/debian-installer/binary-all/Packages": empty,
+	})
+	// The empty entry's declared hash must be the empty-content
+	// SHA256 — that is what makes a 204 body verify cleanly.
+	emptyHash := shaOf(empty)
+	if got := declared["main/debian-installer/binary-all/Packages"]; got != emptyHash {
+		t.Fatalf("test setup: declared hash = %s, want empty-content hash %s", got, emptyHash)
+	}
+	for p, body := range map[string][]byte{
+		"main/binary-amd64/Packages":                pkgs,
+		"main/debian-installer/binary-all/Packages": empty,
+	} {
+		// put(url, empty) writes zero bytes and returns
+		// FetchResult{Status: 200, ContentLength: 0} — exactly what
+		// the fetch layer returns for an upstream 204.
+		env.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/"+p, body)
+	}
+
+	if err := env.adopter.Run(ctx, env.suite, releaseText, "etag-1", "lastmod-1"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	sf, err := env.cache.GetSuiteFreshness(ctx,
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err != nil {
+		t.Fatalf("GetSuiteFreshness: %v", err)
+	}
+	if sf.CurrentSnapshotID == nil {
+		t.Fatal("current_snapshot_id not set after adoption")
+	}
+	snapshotID := *sf.CurrentSnapshotID
+
+	got, err := env.cache.ListSnapshotMembers(ctx, snapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *cache.SnapshotMember
+	for i := range got {
+		if got[i].Path == "main/debian-installer/binary-all/Packages" {
+			found = &got[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("missing snapshot_member for the empty debian-installer member")
+	}
+	if found.BlobHash != emptyHash || found.DeclaredSHA256 != emptyHash {
+		t.Errorf("empty member (blob, declared) = (%s, %s), want both %s",
+			found.BlobHash, found.DeclaredSHA256, emptyHash)
+	}
+
+	// The zero-byte blob must be in the pool so the serve path can
+	// stream it and buildPackageHashes can re-read it.
+	fi, err := os.Stat(env.cache.BlobPath(emptyHash))
+	if err != nil {
+		t.Fatalf("empty member blob not in pool: %v", err)
+	}
+	if fi.Size() != 0 {
+		t.Errorf("pool blob size = %d, want 0", fi.Size())
+	}
+}
+
 // TestAdopter_OrphanedCandidateReused exercises the
 // idx_suite_snapshot_natural fix end-to-end through runShared:
 //

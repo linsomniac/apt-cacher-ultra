@@ -167,8 +167,11 @@ type FetchDst interface {
 //
 // Status is always 200 on success — the internal resume mechanics (a
 // 206 partial response or a validator-induced restart) are hidden from
-// the caller. ContentLength is the *full* object size; it equals
-// Written on the FetchDst at success.
+// the caller. An upstream 204 No Content is likewise reported as a
+// successful zero-byte fetch (ContentLength 0): 204 means "success, no
+// body", which for an apt index file is an empty object. ContentLength
+// is the *full* object size; it equals Written on the FetchDst at
+// success.
 type FetchResult struct {
 	Status        int
 	ContentType   string
@@ -300,6 +303,10 @@ func New(opts Options) (*Client, error) {
 //   - ErrUpstreamUnavailable: ran out of retries on transient failures.
 //     Caller may serve stale (metadata) or 502 (blob).
 //   - context.Canceled / context.DeadlineExceeded: the ctx fired.
+//
+// A 204 No Content response is not an error: it is a successful fetch
+// of a zero-byte object (GitLab's Debian registry serves empty index
+// files this way) and returns a FetchResult with ContentLength 0.
 func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (result *FetchResult, retErr error) {
 	// SPEC5 §10.4.2: every Fetch terminal return drives one
 	// fetch-counter increment and one duration observation. The
@@ -555,6 +562,23 @@ func (c *Client) doAttempt(
 			return out, fmt.Errorf("%w: wrote %d, declared total %d",
 				ErrSizeMismatch, dst.Written(), total)
 		}
+		return out, nil
+	case http.StatusNoContent:
+		// RFC 9110 §15.3.5: 204 is a SUCCESS status — the request
+		// succeeded and the response deliberately carries no body.
+		// Some Debian registries (GitLab's package registry among
+		// them) serve zero-byte index files — e.g. an empty
+		// main/debian-installer/binary-all/Packages — as 204 instead
+		// of 200-with-empty-body; treating that as an error aborts
+		// release adoption for the whole suite. A 204 is a
+		// successful fetch of an empty object: normalize to the 200
+		// shape (zero bytes written, zero ContentLength) so callers
+		// verify exactly the empty body the signed Release declared
+		// (adoption's SHA256 check, the handler's
+		// FinalizeExpectingHash), and so a miss-path response matches
+		// the 200 the cache's own hit path serves for the same blob.
+		out.Status = http.StatusOK
+		out.ContentLength = 0
 		return out, nil
 	default:
 		// Both 4xx and 5xx return a *StatusError so the upstream code

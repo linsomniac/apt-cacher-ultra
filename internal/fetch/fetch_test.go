@@ -132,6 +132,46 @@ func TestFetch_BasicSuccess(t *testing.T) {
 	}
 }
 
+func TestFetch_NoContentIsEmptySuccess(t *testing.T) {
+	// GitLab's Debian registry serves zero-byte index files (e.g. an
+	// empty main/debian-installer/binary-all/Packages) as 204 No
+	// Content instead of 200-with-empty-body. 204 is a success
+	// status: the fetch must report a zero-byte object, not an error,
+	// and must not retry.
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	res, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL + "/empty",
+	}, dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if res.Status != http.StatusOK {
+		t.Errorf("Status: got %d, want 200", res.Status)
+	}
+	if res.ContentLength != 0 {
+		t.Errorf("ContentLength: got %d, want 0", res.ContentLength)
+	}
+	if dst.Written() != 0 {
+		t.Errorf("Written: got %d, want 0", dst.Written())
+	}
+	if dst.String() != "" {
+		t.Errorf("body: got %q, want empty", dst.String())
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("server calls = %d, want 1 (a 204 must not be retried)", got)
+	}
+}
+
 func TestFetch_HostNotAllowed(t *testing.T) {
 	client, err := New(Options{
 		AllowedHostRegex: []string{`^archive\.ubuntu\.com$`},

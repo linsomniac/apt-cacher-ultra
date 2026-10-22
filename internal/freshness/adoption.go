@@ -1715,6 +1715,15 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 // ErrAdoptionMemberMismatch. Verification always uses m.Size / m.SHA256
 // (the signed-Release declarations), independent of which URL served
 // the bytes.
+//
+// An upstream 204 No Content needs no special case here: the fetch
+// layer reports it as a successful zero-byte body (GitLab's Debian
+// registry serves empty index files — e.g. an empty
+// main/debian-installer/binary-all/Packages — this way), and the empty
+// body then verifies against the declaration exactly like any other
+// member. An empty index (Size 0, empty-content SHA256) adopts
+// cleanly; a member declared non-empty but served as 204 fails the
+// hash check below, loudly.
 func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseMember, relPath string) (string, error) {
 	upstreamURL := buildMemberURL(suite, relPath)
 	target := &fetch.Target{
