@@ -321,42 +321,44 @@ the hit that creates the suite's row).
 ### Flat repositories
 
 A flat repository — one without a `dists/` tree, configured as
-`deb <uri> <dir>/` or `deb <uri> ./` (pkgs.k8s.io, NVIDIA CUDA,
-pkg.jenkins.io, Gemfury) — is tracked as the suite of the directory that
-holds its `InRelease` or `Release`. The `./` form keeps its literal `/.`
-and is a suite of its own, the directory's *twin*: `deb https://h/repo ./`
-and `deb https://h/repo/ /` are two suites, each with its own row and
-snapshot, that share the record of having been seen signed. With adoption
-enabled a flat repository's root `Packages` or `Sources` (plain or
-compressed) tracks its suite too, when its bytes are what they claim. A
-flat repository at the host root (`deb https://h/ ./`) is not supported:
-it is served from the ordinary cache and never refreshed, and the daemon
-logs WARN `flat_host_root_unsupported` (at most one line a minute).
+`deb <uri> <dir>/`, `deb <uri>/ /` or `deb <uri> ./` (pkgs.k8s.io, NVIDIA
+CUDA, pkg.jenkins.io, Gemfury) — is tracked as the suite of the directory
+that holds its `InRelease` or `Release`. The `./` form keeps its literal
+`/.` and is a suite of its own, the directory's *twin*:
+`deb https://h/repo ./` and `deb https://h/repo/ /` are two suites, each
+with its own row and snapshot, that share the record of having been seen
+signed. With adoption enabled a flat repository's root `Packages` or
+`Sources` (plain or compressed) tracks its suite too, when its bytes are
+what they claim. A flat repository at the host root (`deb https://h/ ./`
+or `deb https://h/ /`) is not supported: it is served from the ordinary
+cache and never refreshed, and the daemon logs WARN
+`flat_host_root_unsupported` (at most one line a minute).
 
 A signed or unsigned flat repository is adopted like any other (see
 *Anchor forms and unsigned repositories*). When its `Release` lists its
-root `Packages`, that file's fetch failing fails the adoption; a `Release`
-that lists none adopts with incomplete coverage (`no_packages_members`),
-which turns strict mode off for its host. The `.deb` files that
-`Packages` names are vouched by the paths apt requests for
-them: `<uri>/<Filename>`, with or without a leading `./`, for whichever
+root `Packages`, that file's fetch failing fails the adoption; a signed
+`Release` that lists none adopts with incomplete coverage
+(`no_packages_members`), which turns strict mode off for its host (an
+unsigned snapshot never counts for strict mode). The `.deb` files that
+`Packages` names are vouched by the paths apt requests for them:
+`<uri>/<Filename>`, with or without a leading `./`, for whichever
 directory at or above the `Release` the repository's `<uri>` is
 (pkg.jenkins.io's `binary/…` one level up, Sublime Text's `files/…` at the
 host root). A path of more than 32 segments is vouched only as the
 `Packages` file spells it. Because a `Filename` may name a path under any
-directory above its `Release`, a signed flat repository's `Packages`
-also constrains such a path of another repository on the same host,
-while no signed snapshot of that repository vouches the path: on a host
-shared by many tenants (Open Build Service projects, say) one tenant's
-`Filename` can make another tenant's `.deb` fail its hash check (502),
-strict mode on or off. A declaration only ever refuses bytes that do not
-match it; it never lets other bytes through. The two twins declare the
-same paths: when upstream rewrites a `.deb` in place with new bytes, the
-twin that adopted the new `Packages` and the twin still serving the old
-one disagree on its hash, and the file is refused (502,
-`package_hash_conflict`) under both twins until the second one adopts —
-at its next check, at most `periodic_refresh` later unless that adoption
-fails.
+directory above its `Release`, a signed flat repository's `Packages` also
+constrains such a path of another repository on the same host, while no
+signed snapshot of that repository vouches the path: on a host shared by
+many tenants (Open Build Service projects, say) one tenant's `Filename`
+can make another tenant's `.deb` fail its hash check (502), strict mode on
+or off. A declaration only ever refuses bytes that do not match it; it
+never lets other bytes through. The two twins declare the same paths: when
+upstream rewrites a `.deb` in place with new bytes, the twin that adopted
+the new `Packages` and the twin still serving the old one disagree on its
+hash, and the file is refused (502, `package_hash_conflict`, whose
+`declared` entries name each row's `suite_path`) under both twins until
+the second one adopts — at its next check, at most `periodic_refresh`
+later unless that adoption fails.
 
 With adoption enabled, a flat repository that publishes no `Release` at
 all (Gemfury, goreleaser) is refreshed without one, as long as the cache
@@ -373,44 +375,69 @@ that fails it keeps the old file (counted in
 `acu_anchorless_sniff_rejected_total{host}`), and a plain `Contents-*`,
 which has no such check, is deleted when it changed, for the next client
 request to fetch. A file upstream deletes (404, 410) is deleted, and so is
-a cached `InRelease` or `Release` that upstream now answers so, unless a
-client's own fetch stored other bytes for it meanwhile; anything else —
-401, 403, a 5xx, a timeout, a body over 64 MiB — keeps the file. A check
-that asks for files counts as answered only when at least one of them got
-a real answer (304 to a request with validators, a 200 stored or
-identical to the cached file, 404 or 410): one whose files got none — an
-HTML page for every file (a captive portal, a vendor's retired site; even
-a page the cache already holds), 401 and 403, a changed plain
-`Contents-*` — fails and backs off, so the status page shows the
-repository failing rather than healthy. A delete that fails is no answer:
-its 404s and 410s stop counting, so a check they alone answered — no file
-asked for, or every real answer a delete — fails. Such a repository
-has no snapshot: it vouches nothing and leaves strict mode alone. Its
-index files are served with `Last-Modified` the later of the file's time
-and its last refresh, so apt's `If-Modified-Since` sees a replacement. The
-check logs `freshness_check` with `result=anchorless_refreshed` or
-`anchorless_unchanged`, and the repository is adopted at the first check
-after it starts publishing an `InRelease` or `Release`. A flat repository
-the cache has seen signed (a record of a signature for its path, a cached
-`InRelease` or `Release.gpg` that passes its check, or an adopted signed
-snapshot) is never refreshed this way: when its `InRelease` and `Release`
-disappear it fails its checks and shows "refused: anchor_absent", so
-stripping a signed repository's signatures cannot turn it into an
-unverified one.
+a cached `InRelease` or `Release` that upstream now answers so — or
+answers 401 or 403 while a file the check asked for got a real answer (the
+Amazon S3 and CloudFront answer for a missing file) — unless a client's
+own fetch stored other bytes for it meanwhile. A file whose new body is
+over 64 MiB is deleted too, so that the next client request fetches it in
+full (a WARN names it, at most one line a minute); anything else — 401,
+403, a 5xx, a timeout — keeps the file. A check that asks for files counts
+as answered only when at least one of them got a real answer (304 to a
+request with validators, a 200 stored or identical to the cached file, 404
+or 410): one whose files got none — an HTML page for every file (a captive
+portal, a vendor's retired site; even a page the cache already holds), 401
+and 403, a changed plain `Contents-*`, a body over 64 MiB — fails and
+backs off: its *Last success* stops advancing on the status page,
+`suites[].check_fail_count` counts the failures in the status JSON, and
+`acu_freshness_check_total{result="failed"}` counts them. A delete that
+fails is no answer: its 404s and 410s stop counting, so a check they alone
+answered — no file asked for, or every real answer a delete — fails. Such
+a repository has no snapshot: it vouches nothing and never changes its
+host's strict posture; on a strict host whose signed suites are complete
+its `.deb`s are refused like any unvouched package. Its index files are
+served with `Last-Modified` the later of the file's time and its last
+refresh, so apt's `If-Modified-Since` sees a replacement. The check logs
+`freshness_check` with `result=anchorless_refreshed` or
+`anchorless_unchanged` and the number of files it replaced and deleted
+(`rows_replaced`, `rows_deleted`), and the repository is adopted at the
+first check after it starts publishing an `InRelease` or `Release`. A flat
+repository the cache has seen signed (a record of a signature for its
+path, a cached `InRelease` or `Release.gpg` that passes its check, or an
+adopted signed snapshot) is never refreshed this way: when its `InRelease`
+and `Release` disappear it fails its checks and shows "refused:
+anchor_absent", so stripping a signed repository's signatures cannot turn
+it into an unverified one. Nor is an unsigned flat repository the cache
+has adopted: when it stops publishing its `Release` it keeps serving its
+last snapshot and shows "refused: anchor_absent"; `POST /forget` turns it
+into a repository refreshed without a `Release`.
 
 Three limits of the refresh without a `Release`. Behind an upstream that
-answers 403 for a missing file (Amazon S3, CloudFront), a file the
-repository removed stays cached and served: if that is the `Packages.xz`
-apt tries first, a client never sees the fresh `Packages.gz`. A
-repository whose only index is a plain `Packages` that is empty at first
-contact gets no suite (an empty file is not recognisably an index): it is
-served as cached and never refreshed; likewise an index that later
-becomes empty is never stored (the cached one stays). And an unchanged
-plain `Contents-*` counts as a real answer without a check: a captive
-portal's page that a client's miss cached as a plain `Contents-<arch>`,
-and that the portal still serves, answers the check
+answers 403 for a missing file (Amazon S3, CloudFront), an index file the
+repository removed stays cached and served (a cached `InRelease` or
+`Release` does not, once another file answers: see above): if that is the
+`Packages.xz` apt tries first, a client never sees the fresh
+`Packages.gz`. A repository whose only index is a plain `Packages` that is
+empty at first contact gets no suite (an empty file is not recognisably an
+index): it is served as cached and never refreshed; likewise an index that
+later becomes empty is never stored (the cached one stays). And an
+unchanged plain `Contents-*` counts as a real answer without a check: a
+captive portal's page that a client's miss cached as a plain
+`Contents-<arch>`, and that the portal still serves, answers the check
 (`anchorless_unchanged`) during the outage. Flat repositories rarely
 publish a plain `Contents-*`.
+
+Three limits of every flat repository, signed or not. Its Translation
+files (apt names them after the language alone: `en`, `en.xz`), its
+`Contents-*.diff/Index`, `<index>.diff/by-hash/…` and pdiff patch files,
+and its DEP-11 and command-not-found files are served from the ordinary
+cache and never refreshed, as at the host root. Its source packages
+(`.dsc`, tarballs) and pdiff patches are never vouched: the cache builds
+no hashes from a flat repository's `Sources` or pdiff indexes. And the
+`.deb`s of a repository whose `Filename`s point above its `Release`
+(pkg.jenkins.io, Sublime Text) get none of its snapshot's retention
+(`retention.max_versions_per_package`, hot prefetch): they are kept by
+recency (`gc.url_path_ttl`) and the hold grace, like files no snapshot
+declares.
 
 ## `[adoption]`: snapshots, trust, and recovery
 
