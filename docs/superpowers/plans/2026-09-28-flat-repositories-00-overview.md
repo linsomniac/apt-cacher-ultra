@@ -64,7 +64,7 @@ Each phase: write its detailed plan (`2026-09-28-flat-repositories-<letter>-<nam
 | D. Creation bounds and signals | `…-D-creation.md` | C3 (rest: caps, touch, miss-path signed-seen marker, `Release`/flat sniffs) | A | done (commit 3ed0b2b) |
 | E. Eager adoption and anchor forms | `…-E-forms.md` | C4 probe tree, C5 unsigned/SHA512, C10 wait | B, D | done (commit 9ab48c4) |
 | F. Suite reaping | `…-F-reaping.md` | C9 | D, E | done (commit dfdbb90) |
-| G. Flat repositories | `…-G-flat.md` | C2 flat, C5 flat IndexTargets/Filenames, C6, C4 anchorless | A–F | in progress (plan written 2026-10-20, revised 2026-10-21) |
+| G. Flat repositories | `…-G-flat.md` | C2 flat, C5 flat IndexTargets/Filenames, C6, C4 anchorless | A–F | done (commit e2d7ada) |
 | H. End to end and docs | `…-H-e2e-docs.md` | §7 e2e, §8 | all | to write after G |
 
 ## Cross-phase interfaces (names later phases rely on)
