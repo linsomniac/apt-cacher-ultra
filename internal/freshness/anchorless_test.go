@@ -1266,7 +1266,9 @@ func TestCheck_AnchorlessKeepsAnAnchorAClientStoredDuringItsProbe(t *testing.T) 
 // Task 10 re-review's Minor): the failed delete when it took the check's
 // only answers, or when no index was asked; the index requests' own reason
 // (a 503) when they failed anyway — a failed delete beside them never
-// hides it.
+// hides it. An over-cap index whose delete fails logs no over-cap line
+// (ruling PG-39): the line says the file was dropped, and the failed
+// transaction dropped nothing; the next check retries and logs it then.
 func TestCheck_AnchorlessFailedDeleteIsNoAnswer(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -1295,6 +1297,10 @@ func TestCheck_AnchorlessFailedDeleteIsNoAnswer(t *testing.T) {
 			r.cacheRow("Sources.gz", gzBody("src"), 1, rigStart-3600, "")
 			r.up.setFail(r.url("Sources.gz"), &fetch.StatusError{Code: 503})
 		}, "failed", "every anchorless index request ended unknown: delete anchorless rows: ", "Sources.gz: "},
+		{"an over-cap index", func(r *flatRig) {
+			r.cacheRow("Packages.gz", gzBody("v1"), 1, rigStart-3600, "")
+			r.up.setFail(r.url("Packages.gz"), fmt.Errorf("conditional: %w", fetch.ErrConditionalBodyTooLarge))
+		}, "failed", "every anchorless index request ended unknown: Packages.gz: ", "delete anchorless rows: "},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newFlatRig(t, "/fury")
@@ -1311,6 +1317,9 @@ BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`); err != nil {
 			if recs := logRecords(t, r.logs, "freshness: delete anchorless rows failed"); len(recs) != 1 ||
 				recs[0]["level"] != "WARN" || recs[0]["canonical_scheme"] != "http" || recs[0]["suite_path"] != "/fury" {
 				t.Fatalf("delete failure lines %v, want one WARN naming http /fury", recs)
+			}
+			if recs := logRecords(t, r.logs, overCapMsg); len(recs) != 0 {
+				t.Fatalf("over-cap lines %v, want none: the failed delete dropped nothing", recs)
 			}
 			if after := r.listed(); !slices.Equal(after, before) {
 				t.Fatalf("rows %v after the check, want %v: the delete failed", after, before)

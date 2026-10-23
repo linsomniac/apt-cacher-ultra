@@ -380,7 +380,8 @@ answers 401 or 403 while a file the check asked for got a real answer (the
 Amazon S3 and CloudFront answer for a missing file) — unless a client's
 own fetch stored other bytes for it meanwhile. A file whose new body is
 over 64 MiB is deleted too, so that the next client request fetches it in
-full (a WARN names it, at most one line a minute); anything else — 401,
+full (a WARN names it once the delete succeeds, at most one line a minute;
+a failed delete keeps it for the next check); anything else — 401,
 403, a 5xx, a timeout — keeps the file. A check that asks for files counts
 as answered only when at least one of them got a real answer (304 to a
 request with validators, a 200 stored or identical to the cached file, 404

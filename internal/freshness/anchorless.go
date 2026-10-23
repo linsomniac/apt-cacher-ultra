@@ -210,7 +210,8 @@ func anchorlessRank(name string) int {
 // commits what it fetched. A shutdown mid-refresh ends it silently; what
 // it stored stays. Its rows' replaces and deletes compare, as its anchors'
 // do, with the blobs read before the probe tree (design review M-4, PG-24
-// M3): a row a client's miss stored anew meanwhile is kept.
+// M3): a row a client's miss stored anew meanwhile is kept. The over-cap
+// WARN follows only a delete that committed (ruling PG-39).
 //
 // AIDEV-NOTE: no snapshot, no vouching, no strict-mode effect (spec C4):
 // the refresh only revalidates url_path rows a client's miss created, and
@@ -301,8 +302,18 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 		}
 		deleted = n
 	}
-	for _, path := range overCap {
-		c.noteAnchorlessOverCap(suite, path)
+	// AIDEV-NOTE: ruling PG-39. The over-cap line says the file was
+	// dropped, so it is logged only once the delete transaction committed.
+	// A failed delete dropped nothing (its own WARN above, a failed check):
+	// the row stays, and the next check asks again, gets the over-cap 200
+	// again and logs the line then. A lost compare — a client's miss stored
+	// the file anew during the request, so the delete kept that row — still
+	// logs it: the miss path already holds the current copy, which is the
+	// outcome the line describes.
+	if deleteErr == nil {
+		for _, path := range overCap {
+			c.noteAnchorlessOverCap(suite, path)
+		}
 	}
 	if (requests > 0 || deleteErr != nil) && answered == 0 {
 		c.failCheck(ctx, out, cur, suite, nowUnix, "anchorless", anchorlessFailure(requests, answeredDeletes, lastErr, deleteErr))
@@ -343,10 +354,11 @@ func anchorlessFailure(requests, answeredDeletes int, reqErr, deleteErr error) e
 
 // noteAnchorlessOverCap logs WARN "freshness: anchorless index over its
 // size cap, dropped for the miss path" for path, an index row of suite
-// whose 200 was over maxAnchorlessIndexBytes (ruling PG-29), at most once
-// per anchorlessOverCapWarnEvery process-wide, with the count of the lines
-// it suppressed since the last one (design review M-6: minted suites must
-// not flood the log).
+// whose 200 was over maxAnchorlessIndexBytes (ruling PG-29), once the
+// delete that dropped it committed (ruling PG-39), at most once per
+// anchorlessOverCapWarnEvery process-wide, with the count of the lines it
+// suppressed since the last one (design review M-6: minted suites must not
+// flood the log).
 func (c *Checker) noteAnchorlessOverCap(suite SuiteRef, path string) {
 	ok, suppressed := c.anchorlessOverCap.Allow(time.Now(), anchorlessOverCapWarnEvery)
 	if !ok {
@@ -397,13 +409,16 @@ func (c *Checker) refreshAnchorlessRow(ctx, fetchCtx context.Context, suite Suit
 	// handler's client misses share) while it waits here for one of the
 	// two process-wide body slots, and a slow request keeps its body slot
 	// until the check's deadline (checkDeadline: the fetch transport has
-	// no response-header timeout). So two slow anchorless requests
-	// anywhere can make other hosts' anchorless checks wait, each holding
-	// a host slot idle, up to their deadlines. No deadlock: a body-slot
-	// holder never waits for a host slot; bounded, and failed checks back
-	// off. Follow-up for phase H (the phase G deferred file): a short
-	// bounded wait for a body slot, or a per-request timeout well under
-	// checkDeadline. The wait honours fetchCtx (the deadline, a shutdown):
+	// no response-header timeout), then through the pool write
+	// (writeBlobBytes) and the row's update, which run under the lifecycle
+	// ctx (the PG-8 note above), so a slow pool disk holds it too, past
+	// the deadline. So two slow anchorless requests anywhere can make
+	// other hosts' anchorless checks wait, each holding a host slot idle,
+	// up to their deadlines. No deadlock: a body-slot holder never waits
+	// for a host slot; bounded, and failed checks back off. Follow-up for
+	// phase H (the phase G deferred file): a short bounded wait for a body
+	// slot, or a per-request timeout well under checkDeadline. The wait
+	// honours fetchCtx (the deadline, a shutdown):
 	// TestCheck_AnchorlessSlotWaitEndsWithTheCheck pins it.
 	select {
 	case c.anchorlessBodies <- struct{}{}:

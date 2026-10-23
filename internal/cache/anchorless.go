@@ -151,8 +151,10 @@ UPDATE url_path
 // read with (BlobHash; nil for a row without one), as DeleteSuiteMetadata
 // deletes a suite's (deleteURLPathRowTx: the row's pin released once),
 // and reports how many it deleted: the anchorless refresh's deletes (spec
-// C4 Dispatch 4: an index or a cached anchor upstream answers 404 or 410,
-// a changed plain Contents-*). No suite row is touched.
+// C4 Dispatch 4) — an index or a cached anchor that upstream answers 404
+// or 410, a cached anchor answered 401 or 403 beside an index request's
+// content answer (ruling PG-28), a changed plain Contents-*, and an index
+// whose 200 was over the body cap (ruling PG-29). No suite row is touched.
 //
 // AIDEV-NOTE: design review M-4. A row a client's miss stored anew between
 // the refresh's read and this delete — a freshly published InRelease, new
