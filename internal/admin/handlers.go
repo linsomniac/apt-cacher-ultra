@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -542,12 +544,17 @@ func (s *Server) logRefresherFailure(metricName string, err error, dur time.Dura
 // (htpasswd or firewall) — this endpoint triggers async network I/O on the
 // upstream mirror.
 //
-// Params (form body): host (required), suite (required suite_path), scheme
-// (optional, defaults to "https"). Returns:
+// Headers: as POST /forget's (requireMutationGuard; spec §10 G-1): X-ACU-Admin: 1
+// (required); Sec-Fetch-Site, when present, same-origin or none; without
+// htpasswd_file, a Host that is an IP address, localhost or admin.listen's
+// host name. Params (form body): host (required), suite (required
+// suite_path), scheme (optional, defaults to "https"). Returns:
 //   - 202 Accepted: reconcile triggered asynchronously.
 //   - 409 Conflict: not triggered (busy, suite unknown, no current snapshot,
 //     or no free adoption slot).
 //   - 400 Bad Request: host or suite missing.
+//   - 403 Forbidden: refused by requireMutationGuard; the body says which
+//     rule refused it.
 //   - 413 Request Entity Too Large: body exceeds 8 KiB.
 //   - 501 Not Implemented: Reconciler not wired in Config.
 //
@@ -560,6 +567,9 @@ func (s *Server) logRefresherFailure(metricName string, err error, dur time.Dura
 // The admin listener MUST be network-protected; this endpoint triggers upstream
 // mirror fetches.
 func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMutationGuard(w, r) {
+		return
+	}
 	if s.cfg.Reconciler == nil {
 		http.Error(w, "reconcile not available\n", http.StatusNotImplemented)
 		return
@@ -612,17 +622,19 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 // commit still answers 503; the retry then answers 409 (no such suite).
 //
 // Headers: X-ACU-Admin: 1 (required); Sec-Fetch-Site, when present, must
-// be same-origin or none (requireMutationGuard). Params (form body): host
-// and suite (required), scheme (optional: http or https, default https).
-// Returns:
+// be same-origin or none; without htpasswd_file, Host must be an IP
+// address, localhost or admin.listen's host name (requireMutationGuard).
+// Params (form body): host and suite (required), scheme (optional: http
+// or https, default https). Returns:
 //   - 202 Accepted: the suite is forgotten; the body names it, the markers
 //     deleted and the rows that kept them (ruling PF-7).
 //   - 400 Bad Request: host or suite missing, another scheme, or a host
 //     holding a scheme (scheme://host, as the status page's Host cell shows
 //     it: the scheme goes in scheme).
-//   - 403 Forbidden: X-ACU-Admin: 1 is missing, or Sec-Fetch-Site is
-//     present and neither same-origin nor none (a browser's cross-site or
-//     same-site request).
+//   - 403 Forbidden: X-ACU-Admin: 1 is missing, Sec-Fetch-Site is present
+//     and neither same-origin nor none (a browser's cross-site or
+//     same-site request), or, without htpasswd_file, the Host is another
+//     name.
 //   - 409 Conflict: busy or unknown (no existence oracle); the body says
 //     what to check.
 //   - 413 Request Entity Too Large: the body exceeds 8 KiB.
@@ -632,7 +644,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 //     while the forget ran, and cut it short; retry once the daemon is
 //     back.
 func (s *Server) handleForget(w http.ResponseWriter, r *http.Request) {
-	if !requireMutationGuard(w, r) {
+	if !s.requireMutationGuard(w, r) {
 		return
 	}
 	if s.cfg.Forgetter == nil {
@@ -702,22 +714,29 @@ func forgottenText(scheme, host, suite string, res cache.ForgetResult) string {
 }
 
 // requireMutationGuard is the guard of the admin listener's mutating
-// endpoints (POST /forget; spec §10 G-1 brings POST /reconcile under it):
-// it answers 403 and reports false unless the request carries
-// X-ACU-Admin: 1 and, when it has one, a Sec-Fetch-Site of same-origin or
-// none. curl and scripts send no Sec-Fetch-Site.
+// endpoints, POST /forget and POST /reconcile (spec C9, §10 G-1): it
+// answers 403 and reports false unless the request carries X-ACU-Admin: 1
+// and, when it has one, a Sec-Fetch-Site of same-origin or none, and —
+// when no htpasswd_file is configured — a Host that names the listener by
+// IP address, as localhost or as admin.listen's own host name
+// (hostNamesListener). curl and scripts send no Sec-Fetch-Site, and the
+// Host they send is whatever their URL names.
 //
 // AIDEV-NOTE: ruling PF-6 (design review I-6); keep the claim honest. A
 // cross-site form or fetch cannot trigger an endpoint behind this guard:
 // a form POST cannot carry a custom header, a cross-origin fetch that sets
 // one is refused on the Sec-Fetch-Site the browser adds (a page cannot
-// forge it), and its CORS preflight is never granted. It does not stop
-// DNS rebinding against a listener without htpasswd_file: a page whose
-// own name resolves to the listener's address makes same-origin requests.
-// Host-header validation of the mutating endpoints is spec §10 G-1's, for
-// /forget and /reconcile together: it affects operators behind reverse
-// proxies, a maintainer call.
-func requireMutationGuard(w http.ResponseWriter, r *http.Request) bool {
+// forge it), and its CORS preflight is never granted. The headers do not
+// stop DNS rebinding: a page whose own name resolves to the listener's
+// address makes same-origin requests. Those carry the page's name as
+// their Host, which the Host check refuses (spec §10 G-1, the maintainer's
+// decision of 2026-10-24). The check is off with htpasswd_file, since a
+// rebinding page does not have the credentials, so an operator behind a
+// reverse proxy that forwards the client's Host keeps working; without
+// htpasswd_file that operator gets this 403 and its text says what to do.
+// The read-only endpoints have no Host check: a Prometheus server may
+// scrape the listener by name.
+func (s *Server) requireMutationGuard(w http.ResponseWriter, r *http.Request) bool {
 	if r.Header.Get("X-ACU-Admin") != "1" {
 		http.Error(w, "this endpoint requires the header X-ACU-Admin: 1\n", http.StatusForbidden)
 		return false
@@ -729,5 +748,29 @@ func requireMutationGuard(w http.ResponseWriter, r *http.Request) bool {
 			http.StatusForbidden)
 		return false
 	}
+	if s.auth == nil && !s.hostNamesListener(r.Host) {
+		http.Error(w, "without admin.htpasswd_file this endpoint accepts only an IP address or localhost as the Host "+
+			"(a guard against DNS rebinding): connect by address, or set admin.htpasswd_file\n", http.StatusForbidden)
+		return false
+	}
 	return true
+}
+
+// hostNamesListener reports whether a request's Host (host or host:port)
+// is an IP address, localhost, or the host name admin.listen gives: names
+// a page cannot rebind to the listener's address. Case does not matter.
+func (s *Server) hostNamesListener(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	listenHost, _, err := net.SplitHostPort(s.cfg.Admin.Listen)
+	return err == nil && listenHost != "" && strings.EqualFold(host, listenHost)
 }

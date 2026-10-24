@@ -288,13 +288,17 @@ gap), two ways:
   listener (default `127.0.0.1:6789`; protect it with `admin.htpasswd_file`
   and/or the bind address). `host` and `suite` are the canonical host and suite
   path as they appear in the daemon's `adoption_success` / freshness logs;
-  `scheme` is optional (default `https`):
+  `scheme` is optional (default `https`). The request needs the header
+  `X-ACU-Admin: 1` and, without `admin.htpasswd_file`, must name the listener
+  by IP address or as `localhost` (see
+  [the admin listener's checks](docs/configuration.md#admin-status-metrics-and-maintenance)):
 
 ```sh
-curl -fsS -X POST http://127.0.0.1:6789/reconcile \
+curl -fsS -X POST http://127.0.0.1:6789/reconcile -H 'X-ACU-Admin: 1' \
     --data-urlencode 'host=packages.microsoft.com' \
     --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
 # 202 Accepted = reconcile triggered (runs asynchronously)
+# 403 = the header is missing, or another host name without admin.htpasswd_file
 # 409 = busy, unknown suite, no current snapshot, or no free adoption slot
 ```
 

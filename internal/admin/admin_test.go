@@ -1402,13 +1402,11 @@ func (s *stubReconciler) Reconcile(_ context.Context, scheme, host, suitePath st
 func withReconciler(r Reconciler) adminOpt { return func(cfg *Config) { cfg.Reconciler = r } }
 
 func TestEndpoint_Reconcile(t *testing.T) {
-	const form = "application/x-www-form-urlencoded"
 	t.Run("triggered 202 + params", func(t *testing.T) {
 		stub := &stubReconciler{result: true}
 		_, base, cleanup := startAdminServer(t, withReconciler(stub))
 		defer cleanup()
-		resp, err := http.Post(base+"/reconcile", form,
-			strings.NewReader("scheme=https&host=packages.microsoft.com&suite=/ubuntu/24.04/prod/dists/noble"))
+		resp, err := postReconcile(base, "scheme=https&host=packages.microsoft.com&suite=/ubuntu/24.04/prod/dists/noble")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1424,7 +1422,7 @@ func TestEndpoint_Reconcile(t *testing.T) {
 		stub := &stubReconciler{result: false}
 		_, base, cleanup := startAdminServer(t, withReconciler(stub))
 		defer cleanup()
-		resp, _ := http.Post(base+"/reconcile", form, strings.NewReader("host=h&suite=/s"))
+		resp, _ := postReconcile(base, "host=h&suite=/s")
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusConflict {
 			t.Errorf("status=%d want 409", resp.StatusCode)
@@ -1434,7 +1432,7 @@ func TestEndpoint_Reconcile(t *testing.T) {
 		stub := &stubReconciler{result: true}
 		_, base, cleanup := startAdminServer(t, withReconciler(stub))
 		defer cleanup()
-		resp, _ := http.Post(base+"/reconcile", form, strings.NewReader("host=h"))
+		resp, _ := postReconcile(base, "host=h")
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("status=%d want 400", resp.StatusCode)
@@ -1446,7 +1444,7 @@ func TestEndpoint_Reconcile(t *testing.T) {
 	t.Run("no reconciler 501", func(t *testing.T) {
 		_, base, cleanup := startAdminServer(t)
 		defer cleanup()
-		resp, _ := http.Post(base+"/reconcile", form, strings.NewReader("host=h&suite=/s"))
+		resp, _ := postReconcile(base, "host=h&suite=/s")
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusNotImplemented {
 			t.Errorf("status=%d want 501", resp.StatusCode)
