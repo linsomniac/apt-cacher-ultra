@@ -99,7 +99,7 @@ Later phases add (named here so phase plans stay consistent):
 
 ## Carry-forwards (from phase A and B reviews)
 
-Each item is owned by the phase it is listed under; that phase's plan addresses it. Items came from the phase A reviews (2026-10-11) unless marked *(B)* (the phase B reviews and its final review, 2026-10-18) or *(C)* (the phase C plan, 2026-10-18) or *(D)* (the phase D plan, 2026-10-18) or *(E)* (the phase E plan, 2026-10-19) or *(F)* (the phase F plan, 2026-10-20).
+Each item is owned by the phase it is listed under; that phase's plan addresses it. Items came from the phase A reviews (2026-10-11) unless marked *(B)* (the phase B reviews and its final review, 2026-10-18) or *(C)* (the phase C plan, 2026-10-18) or *(D)* (the phase D plan, 2026-10-18) or *(E)* (the phase E plan, 2026-10-19) or *(F)* (the phase F plan, 2026-10-20) or *(G)* (the phase G plan and reviews, 2026-10-21/23) or *(G-1)* (the maintainer's G-1 decision, 2026-10-24).
 
 **H:**
 

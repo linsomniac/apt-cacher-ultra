@@ -1599,8 +1599,9 @@ that sets the header needs a CORS preflight, never granted). Without
 `htpasswd_file` it also refuses a `Host` that is not an IP address,
 `localhost` or `admin.listen`'s host name, which stops DNS rebinding
 (G-1, §10: the maintainer's decision of 2026-10-24, which phase F's
-ruling PF-6 had left open). Each refusal is 403. It reads the suite's row (I-4), holds the suite through the
-`SuiteGuard` and runs the reaper's steps to completion, within 5 minutes
+ruling PF-6 had left open). Each refusal is 403. It reads the suite's
+row (I-4), holds the suite through the `SuiteGuard` and runs the
+reaper's steps to completion, within 5 minutes
 — all batches, then `cache.ForgetSuite` through `deleteSuiteTx` without
 the idle checks — on a context a client disconnect cannot cancel but the
 admin listener's shutdown does; the final transaction also deletes the

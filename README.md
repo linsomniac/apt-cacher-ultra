@@ -290,7 +290,7 @@ gap), two ways:
   path as they appear in the daemon's `adoption_success` / freshness logs;
   `scheme` is optional (default `https`). The request needs the header
   `X-ACU-Admin: 1` and, without `admin.htpasswd_file`, must name the listener
-  by IP address or as `localhost` (see
+  by IP address, as `localhost` or by the host name in `admin.listen` (see
   [the admin listener's checks](docs/configuration.md#admin-status-metrics-and-maintenance)):
 
 ```sh

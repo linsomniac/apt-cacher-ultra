@@ -724,18 +724,24 @@ func forgottenText(scheme, host, suite string, res cache.ForgetResult) string {
 //
 // AIDEV-NOTE: ruling PF-6 (design review I-6); keep the claim honest. A
 // cross-site form or fetch cannot trigger an endpoint behind this guard:
-// a form POST cannot carry a custom header, a cross-origin fetch that sets
-// one is refused on the Sec-Fetch-Site the browser adds (a page cannot
-// forge it), and its CORS preflight is never granted. The headers do not
-// stop DNS rebinding: a page whose own name resolves to the listener's
-// address makes same-origin requests. Those carry the page's name as
-// their Host, which the Host check refuses (spec §10 G-1, the maintainer's
-// decision of 2026-10-24). The check is off with htpasswd_file, since a
-// rebinding page does not have the credentials, so an operator behind a
-// reverse proxy that forwards the client's Host keeps working; without
-// htpasswd_file that operator gets this 403 and its text says what to do.
-// The read-only endpoints have no Host check: a Prometheus server may
-// scrape the listener by name.
+// a form POST cannot carry a custom header, and a cross-origin fetch that
+// sets one needs a CORS preflight, which is never granted, so the POST is
+// never sent. Sec-Fetch-Site is defence in depth: browsers send it only
+// to https and loopback origins (a page cannot forge it), so over plain
+// http to a name or LAN address the custom header alone stops them. The
+// headers do not stop DNS rebinding: a page whose own name resolves to
+// the listener's address makes same-origin requests. Those carry the
+// page's name as their Host, which the Host check refuses (spec §10 G-1,
+// the maintainer's decision of 2026-10-24). The check keys on
+// htpasswd_file being configured (s.auth), never on the request carrying
+// credentials, which a rebinding page may send. It is off with
+// htpasswd_file, since a rebinding page does not have the credentials, so
+// an operator behind a reverse proxy that forwards the client's Host keeps
+// working; without htpasswd_file that operator gets this 403 and its text
+// says what to do. The read-only endpoints (status, /metrics, /healthz,
+// the pprof routes) have no Host check: a Prometheus server may scrape the
+// listener by name, and without htpasswd_file a rebinding page can still
+// read them.
 func (s *Server) requireMutationGuard(w http.ResponseWriter, r *http.Request) bool {
 	if r.Header.Get("X-ACU-Admin") != "1" {
 		http.Error(w, "this endpoint requires the header X-ACU-Admin: 1\n", http.StatusForbidden)
@@ -749,8 +755,9 @@ func (s *Server) requireMutationGuard(w http.ResponseWriter, r *http.Request) bo
 		return false
 	}
 	if s.auth == nil && !s.hostNamesListener(r.Host) {
-		http.Error(w, "without admin.htpasswd_file this endpoint accepts only an IP address or localhost as the Host "+
-			"(a guard against DNS rebinding): connect by address, or set admin.htpasswd_file\n", http.StatusForbidden)
+		http.Error(w, "without admin.htpasswd_file this endpoint accepts only an IP address, localhost or "+
+			"admin.listen's host name as the Host (a guard against DNS rebinding): connect by address, "+
+			"or set admin.htpasswd_file\n", http.StatusForbidden)
 		return false
 	}
 	return true
@@ -758,7 +765,10 @@ func (s *Server) requireMutationGuard(w http.ResponseWriter, r *http.Request) bo
 
 // hostNamesListener reports whether a request's Host (host or host:port)
 // is an IP address, localhost, or the host name admin.listen gives: names
-// a page cannot rebind to the listener's address. Case does not matter.
+// a page cannot rebind to the listener's address through DNS. Case does
+// not matter. (A page loaded from an IP address keeps its origin when its
+// machine moves to a network where that address is the listener; that
+// narrow case is accepted with the decision.)
 func (s *Server) hostNamesListener(hostport string) bool {
 	host := hostport
 	if h, _, err := net.SplitHostPort(hostport); err == nil {

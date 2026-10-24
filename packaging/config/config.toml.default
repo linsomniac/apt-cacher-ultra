@@ -182,7 +182,7 @@ suite_idle_ttl      = "720h"
 [admin]
 # HTTP status page, /metrics, /healthz, and mutating POST /reconcile and
 # POST /forget (both need the header X-ACU-Admin: 1, and without
-# htpasswd_file an IP address or localhost as the Host).
+# htpasswd_file an IP address, localhost or listen's host as the Host).
 enabled           = true
 listen            = "127.0.0.1:6789" # host:port; protect access if widened
 # Optional bcrypt-only Apache htpasswd file ($2a$/$2b$/$2y$). Empty = no auth.

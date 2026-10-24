@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // guardedEndpoint is one of the admin listener's mutating endpoints, which
@@ -117,45 +118,57 @@ func TestMutatingEndpoints_RefuseCrossOriginRequests(t *testing.T) {
 	}
 }
 
-const rebindingRefused = "without admin.htpasswd_file this endpoint accepts only an IP address or localhost " +
-	"as the Host (a guard against DNS rebinding): connect by address, or set admin.htpasswd_file"
+const rebindingRefused = "without admin.htpasswd_file this endpoint accepts only an IP address, localhost " +
+	"or admin.listen's host name as the Host (a guard against DNS rebinding): connect by address, " +
+	"or set admin.htpasswd_file"
 
 // Spec §10 G-1 (the maintainer's decision, 2026-10-24): without
 // htpasswd_file, /forget and /reconcile refuse a request whose Host header
 // is a DNS name other than localhost and admin.listen's own host. A page
 // that rebinds its name to the listener's address makes same-origin
-// requests that pass the header checks, but they carry that name as their
-// Host; a browser that connects to an IP address or localhost sends it as
-// the Host, and so do curl and scripts.
+// requests that pass the header checks — over plain http to a name the
+// browser sends no Sec-Fetch-Site, and the page may add any Authorization
+// header — but they carry that name as their Host; a browser that connects
+// to an IP address or localhost sends it as the Host, and so do curl and
+// scripts.
 func TestMutatingEndpoints_RefuseRebindingHosts(t *testing.T) {
+	sameOrigin := []string{"Sec-Fetch-Site", "same-origin"}
+	credentials := []string{"Authorization", "Basic YWxpY2U6c2VjcmV0"}
 	for _, ep := range guardedEndpoints {
 		for _, tc := range []struct {
-			name   string
-			host   string // "" keeps the URL's 127.0.0.1:port
-			listen string // admin.listen
-			status int
+			name    string
+			host    string // "" keeps the URL's 127.0.0.1:port
+			listen  string // admin.listen
+			headers []string
+			status  int
 		}{
-			{"a DNS name", "evil.example:6789", "", http.StatusForbidden},
-			{"a DNS name without a port", "evil.example", "", http.StatusForbidden},
-			{"a DNS name in capitals", "EVIL.EXAMPLE", "", http.StatusForbidden},
-			{"a name under localhost's label", "localhost.evil.example", "", http.StatusForbidden},
-			{"a name ending in localhost", "evillocalhost:6789", "", http.StatusForbidden},
-			{"a name other than admin.listen's", "evil.example:6789", "cache01.example:6789", http.StatusForbidden},
-			{"the IPv4 address", "", "", http.StatusAccepted},
-			{"the IPv6 loopback", "[::1]:6789", "", http.StatusAccepted},
-			{"the IPv6 loopback without a port", "[::1]", "", http.StatusAccepted},
-			{"another IP address", "192.0.2.7", "", http.StatusAccepted},
-			{"localhost", "localhost:6789", "", http.StatusAccepted},
-			{"localhost in capitals", "LOCALHOST", "", http.StatusAccepted},
-			{"admin.listen's host name", "cache01.example:6789", "cache01.example:6789", http.StatusAccepted},
-			{"admin.listen's host name in capitals", "CACHE01.Example", "cache01.example:6789", http.StatusAccepted},
+			{"a DNS name", "evil.example:6789", "", nil, http.StatusForbidden},
+			{"a DNS name, same-origin fetch", "evil.example:6789", "", sameOrigin, http.StatusForbidden},
+			{"a DNS name with credentials", "evil.example:6789", "", credentials, http.StatusForbidden},
+			{"a DNS name without a port", "evil.example", "", nil, http.StatusForbidden},
+			{"a DNS name in capitals", "EVIL.EXAMPLE", "", nil, http.StatusForbidden},
+			{"a name under localhost's label", "localhost.evil.example", "", nil, http.StatusForbidden},
+			{"a name ending in localhost", "evillocalhost:6789", "", nil, http.StatusForbidden},
+			{"a subdomain of localhost", "app.localhost:6789", "", nil, http.StatusForbidden},
+			{"a name other than admin.listen's", "evil.example:6789", "cache01.example:6789", nil, http.StatusForbidden},
+			{"the IPv4 address", "", "", nil, http.StatusAccepted},
+			{"the IPv4 address, same-origin fetch", "", "", sameOrigin, http.StatusAccepted},
+			{"the IPv6 loopback", "[::1]:6789", "", nil, http.StatusAccepted},
+			{"the IPv6 loopback without a port", "[::1]", "", nil, http.StatusAccepted},
+			{"another IP address", "192.0.2.7", "", nil, http.StatusAccepted},
+			{"localhost", "localhost:6789", "", nil, http.StatusAccepted},
+			{"localhost in capitals", "LOCALHOST", "", nil, http.StatusAccepted},
+			{"admin.listen's host name", "cache01.example:6789", "cache01.example:6789", nil, http.StatusAccepted},
+			{"admin.listen's host name in capitals", "CACHE01.Example", "cache01.example:6789", nil, http.StatusAccepted},
 		} {
 			t.Run(strings.TrimPrefix(ep.path, "/")+" "+tc.name, func(t *testing.T) {
 				base, calls, cleanup := ep.start(t, func(cfg *Config) { cfg.Admin.Listen = tc.listen })
 				defer cleanup()
 				status, body := postForm(t, base+ep.path, func(req *http.Request) {
 					req.Header.Set("X-ACU-Admin", "1")
-					req.Header.Set("Sec-Fetch-Site", "same-origin")
+					for i := 0; i+1 < len(tc.headers); i += 2 {
+						req.Header.Set(tc.headers[i], tc.headers[i+1])
+					}
 					if tc.host != "" {
 						req.Host = tc.host
 					}
@@ -187,6 +200,9 @@ func TestMutatingEndpoints_RefuseAnEmptyHost(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = conn.Close() }()
+			if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
 			const body = "host=h&suite=/s"
 			if _, err := fmt.Fprintf(conn, "POST %s HTTP/1.0\r\nX-ACU-Admin: 1\r\n"+
 				"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n%s",
@@ -221,6 +237,38 @@ func TestMutatingEndpoints_HostCheckOffWithHtpasswd(t *testing.T) {
 			})
 			if status != http.StatusAccepted || calls() != 1 {
 				t.Fatalf("status = %d (body %q), calls = %d; want 202 and 1 call", status, body, calls())
+			}
+		})
+	}
+}
+
+// The guard runs first: a refused request learns nothing about the
+// endpoint, neither that its Forgetter or Reconciler is unwired (501) nor
+// how its body parses (413), and costs no body read.
+func TestMutatingEndpoints_GuardRunsFirst(t *testing.T) {
+	const noHeader = "this endpoint requires the header X-ACU-Admin: 1"
+	for _, ep := range guardedEndpoints {
+		name := strings.TrimPrefix(ep.path, "/")
+		t.Run(name+" unwired", func(t *testing.T) {
+			_, base, cleanup := startAdminServer(t)
+			defer cleanup()
+			if status, body := postForm(t, base+ep.path, nil); status != http.StatusForbidden ||
+				strings.TrimRight(body, "\n") != noHeader {
+				t.Fatalf("status %d, body %q; want 403 %q", status, body, noHeader)
+			}
+		})
+		t.Run(name+" oversized body", func(t *testing.T) {
+			base, calls, cleanup := ep.start(t)
+			defer cleanup()
+			resp, err := http.Post(base+ep.path, "application/x-www-form-urlencoded",
+				strings.NewReader("host=h&suite=/s&pad="+strings.Repeat("x", 16<<10)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			text, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden || strings.TrimRight(string(text), "\n") != noHeader || calls() != 0 {
+				t.Fatalf("status %d, body %q, calls %d; want 403 %q and no call", resp.StatusCode, text, calls(), noHeader)
 			}
 		})
 	}

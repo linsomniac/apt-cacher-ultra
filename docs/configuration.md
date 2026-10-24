@@ -971,17 +971,22 @@ operators; if exposed beyond loopback, protect the network path or place it behi
 HTTP Basic authentication does not encrypt credentials in transit.
 
 Both mutating endpoints refuse a request with 403, the body naming the
-rule, unless it carries the header `X-ACU-Admin: 1` (a cross-site form
-cannot send it) and, when present, a `Sec-Fetch-Site` header of
-`same-origin` or `none` (so a browser request from another origin
-cannot trigger them). Without `htpasswd_file` they also refuse a request
-whose `Host` is a name other than `localhost` or the host name in
-`listen`. That stops DNS rebinding: a web page whose own name is made to
-resolve to the listener's address. Call them by IP address
-(`http://127.0.0.1:6789/…`) or as `localhost`. Behind a reverse proxy
-that forwards the client's `Host`, set `htpasswd_file` or have the proxy
-send `Host: 127.0.0.1`. The status page, `/metrics` and `/healthz` have
-no `Host` check.
+rule, unless it carries the header `X-ACU-Admin: 1`. A cross-site form
+cannot send that header, and a page on another origin that sets it
+needs a CORS preflight the listener never grants, so a browser request
+from another origin cannot trigger them. A `Sec-Fetch-Site` header,
+which browsers send to https and loopback addresses, must also be
+`same-origin` or `none` when present. Without `htpasswd_file` they also
+refuse a request whose `Host` is a name other than `localhost` or the
+host name in `listen`. That stops DNS rebinding against them: a web
+page whose own name is made to resolve to the listener's address. Call
+them by IP address (`http://127.0.0.1:6789/…`), as `localhost`, or by
+the host name in `listen`. Behind a reverse proxy that forwards the
+client's `Host`, set `htpasswd_file` or have the proxy send
+`Host: 127.0.0.1`. The status page, `/metrics`, `/healthz` and the
+profiling routes have no `Host` check, so a Prometheus server may scrape
+by name, and without `htpasswd_file` a rebinding page can still read
+them.
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
@@ -1056,8 +1061,8 @@ optional (`http` or `https`, default `https`). The request must pass
 the mutating endpoints' checks described under
 [`[admin]`](#admin-status-metrics-and-maintenance): the header
 `X-ACU-Admin: 1`, no browser request from another origin, and, without
-`htpasswd_file`, an IP address or `localhost` as the host. From `curl`
-and scripts, that means sending the header:
+`htpasswd_file`, an IP address, `localhost` or `listen`'s host name as
+the host. From `curl` and scripts, that means sending the header:
 
 ```sh
 curl -sS --fail-with-body -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 1' \
@@ -1069,7 +1074,7 @@ curl -sS --fail-with-body -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 
 # 400 = host or suite missing, a scheme other than http or https, or a host
 #   holding scheme:// (pass the scheme in scheme)
 # 403 = the header is missing, a browser request from another origin, or,
-#   without htpasswd_file, a host name other than localhost (use the address)
+#   without htpasswd_file, another host name than localhost or listen's (use the address)
 # 409 = busy (being checked or adopted: try again) or no such suite (check the
 #   scheme, which defaults to https, and the host and suite the status page shows)
 # 500 = a database error (logged as WARN admin: forget failed); repeat it:
