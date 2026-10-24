@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,19 @@ var ErrClosed = errors.New("cache: closed")
 // caller blocks (or hits ctx.Done). Apt traffic is bursty but each write
 // is small, so a few hundred slots is plenty without burning memory.
 const writeBufferSize = 256
+
+// connMaxIdleTime is how long a spare read connection may sit unused
+// before the pool closes it.
+const connMaxIdleTime = 5 * time.Minute
+
+// minIdleConns is the floor of maxIdleConns.
+const minIdleConns = 16
+
+// maxIdleConns is how many spare read connections the pool keeps: 2 per
+// GOMAXPROCS, at least minIdleConns.
+func maxIdleConns() int {
+	return max(minIdleConns, 2*runtime.GOMAXPROCS(0))
+}
 
 // Cache owns the SQLite handle, the on-disk pool, and a single writer
 // goroutine that serializes all write transactions. Reads share the
@@ -134,6 +148,19 @@ func openDB(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
 	}
+	// AIDEV-NOTE: security review E-5/I-9. database/sql keeps only 2 idle
+	// connections by default, so every concurrent read beyond the second
+	// opened a SQLite connection (running the pragmas above) and closed it
+	// again: in the review's hit flood that churn starved the writer (77% of
+	// url_path writes hit their timeout) and let the WAL grow to 183 MB for
+	// a 3.5 MB database. The idle cap only keeps connections a burst already
+	// opened, so it does not raise peak memory; connMaxIdleTime gives them
+	// (and their page caches) back once the server is quiet. Do not add a
+	// tight SetMaxOpenConns: it trades the churn for readers waiting on a
+	// connection. The writer's and the revision observer's pinned
+	// connections are in use, not idle, so they do not count against the cap.
+	db.SetMaxIdleConns(maxIdleConns())
+	db.SetConnMaxIdleTime(connMaxIdleTime)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping sqlite %q: %w", path, err)
