@@ -11,9 +11,14 @@ import (
 )
 
 // holdConns opens n read connections at once, as n concurrent requests do,
-// then hands them all back to the pool.
+// then hands them all back to the pool. It first lets the writer goroutine
+// pin its own connection (a no-op write): pinned later, it would take one
+// of the connections just handed back.
 func holdConns(t *testing.T, c *Cache, n int) {
 	t.Helper()
+	if err := c.submitWrite(context.Background(), func(context.Context, *sql.Conn) error { return nil }); err != nil {
+		t.Fatalf("pin the writer: %v", err)
+	}
 	conns := make([]*sql.Conn, 0, n)
 	for range n {
 		conn, err := c.db.Conn(context.Background())
@@ -68,9 +73,6 @@ func TestOpen_IdleConnectionsCloseWhenQuiet(t *testing.T) {
 			t.Fatalf("Open: %v", err)
 		}
 		defer func() { _ = c.Close() }()
-		// Let the writer goroutine pin its connection first: run during
-		// the sleep, it would take one of the burst's idle connections.
-		synctest.Wait()
 		holdConns(t, c, 16)
 		if st := c.db.Stats(); st.Idle < 16 {
 			t.Fatalf("idle after the burst = %d, want at least 16", st.Idle)

@@ -158,12 +158,13 @@ func openDB(path string) (*sql.DB, error) {
 	// a 3.5 MB database. The idle cap only keeps connections a burst already
 	// opened, so it does not raise the peak connection count, but it keeps
 	// their memory after the burst: up to about 4 MB each with a warm page
-	// cache (32 measured at +122 MB RSS), less in practice since every
-	// writer commit empties the readers' caches. connMaxIdleTime gives them
-	// back once the server is quiet. Do not add a
-	// tight SetMaxOpenConns: it trades the churn for readers waiting on a
-	// connection. The writer's and the revision observer's pinned
-	// connections are in use, not idle, so they do not count against the cap.
+	// cache (32 measured at +122 MB RSS). It is less in practice, since a
+	// connection drops its cache at its next read after a write, but one
+	// left idle keeps its pages until connMaxIdleTime closes it, once the
+	// server is quiet. Do not add a tight SetMaxOpenConns: it trades the
+	// churn for readers waiting on a connection. The writer's and the
+	// revision observer's pinned connections are in use, not idle, so they
+	// do not count against the cap.
 	db.SetMaxIdleConns(maxIdleConns())
 	db.SetConnMaxIdleTime(connMaxIdleTime)
 	if err := db.Ping(); err != nil {
