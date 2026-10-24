@@ -32,26 +32,27 @@ func holdConns(t *testing.T, c *Cache, n int) {
 // Security review E-5/I-9: with database/sql's default of 2 idle
 // connections, a burst of concurrent reads closed every connection beyond
 // the second and the next burst reopened it (re-running the DSN pragmas),
-// enough CPU churn to starve the writer. The pool keeps at least 16 idle
-// connections, and 2 per GOMAXPROCS above that.
+// enough CPU churn to starve the writer. The pool keeps exactly
+// max(16, 2*GOMAXPROCS) idle connections: a burst of one more than that
+// closes exactly one on release.
 func TestOpen_ConcurrentReadersKeepTheirConnections(t *testing.T) {
 	cases := []struct {
-		procs   int
-		readers int
+		procs     int
+		idleConns int
 	}{
-		{procs: 1, readers: 16},
-		{procs: 8, readers: 16},
-		{procs: 12, readers: 24},
+		{procs: 1, idleConns: 16},
+		{procs: 8, idleConns: 16},
+		{procs: 12, idleConns: 24},
 	}
 	for _, tc := range cases {
 		t.Run(fmt.Sprintf("GOMAXPROCS=%d", tc.procs), func(t *testing.T) {
-			runtime.GOMAXPROCS(tc.procs)
-			t.Cleanup(runtime.SetDefaultGOMAXPROCS)
+			prev := runtime.GOMAXPROCS(tc.procs)
+			t.Cleanup(func() { runtime.GOMAXPROCS(prev) })
 			c := openCache(t)
-			holdConns(t, c, tc.readers)
-			if st := c.db.Stats(); st.MaxIdleClosed != 0 {
-				t.Fatalf("GOMAXPROCS=%d: %d of %d concurrent read connections were closed on release, want 0 (idle %d)",
-					tc.procs, st.MaxIdleClosed, tc.readers, st.Idle)
+			holdConns(t, c, tc.idleConns+1)
+			if st := c.db.Stats(); st.MaxIdleClosed != 1 {
+				t.Fatalf("GOMAXPROCS=%d: %d of %d concurrent read connections were closed on release, want 1 (idle %d)",
+					tc.procs, st.MaxIdleClosed, tc.idleConns+1, st.Idle)
 			}
 		})
 	}
@@ -67,12 +68,18 @@ func TestOpen_IdleConnectionsCloseWhenQuiet(t *testing.T) {
 			t.Fatalf("Open: %v", err)
 		}
 		defer func() { _ = c.Close() }()
+		// Let the writer goroutine pin its connection first: run during
+		// the sleep, it would take one of the burst's idle connections.
+		synctest.Wait()
 		holdConns(t, c, 16)
 		if st := c.db.Stats(); st.Idle < 16 {
 			t.Fatalf("idle after the burst = %d, want at least 16", st.Idle)
 		}
+		// Twice connMaxIdleTime: at connMaxIdleTime the cleaner keeps them
+		// (its test is strictly older than), and closes them on its next
+		// run, at least a second later. Fake time cannot pass that run
+		// before the cleaner is done, so no Wait is needed after the sleep.
 		time.Sleep(2 * connMaxIdleTime)
-		synctest.Wait()
 		if st := c.db.Stats(); st.Idle != 0 || st.MaxIdleTimeClosed < 16 {
 			t.Fatalf("after %v quiet: idle %d, closed for idle time %d; want 0 idle and at least 16 closed",
 				2*connMaxIdleTime, st.Idle, st.MaxIdleTimeClosed)

@@ -33,7 +33,9 @@ const connMaxIdleTime = 5 * time.Minute
 const minIdleConns = 16
 
 // maxIdleConns is how many spare read connections the pool keeps: 2 per
-// GOMAXPROCS, at least minIdleConns.
+// GOMAXPROCS, at least minIdleConns. openDB reads it once; a GOMAXPROCS
+// that changes later (a container's CPU quota) does not move it, and on
+// small hosts the floor decides anyway.
 func maxIdleConns() int {
 	return max(minIdleConns, 2*runtime.GOMAXPROCS(0))
 }
@@ -154,8 +156,11 @@ func openDB(path string) (*sql.DB, error) {
 	// again: in the review's hit flood that churn starved the writer (77% of
 	// url_path writes hit their timeout) and let the WAL grow to 183 MB for
 	// a 3.5 MB database. The idle cap only keeps connections a burst already
-	// opened, so it does not raise peak memory; connMaxIdleTime gives them
-	// (and their page caches) back once the server is quiet. Do not add a
+	// opened, so it does not raise the peak connection count, but it keeps
+	// their memory after the burst: up to about 4 MB each with a warm page
+	// cache (32 measured at +122 MB RSS), less in practice since every
+	// writer commit empties the readers' caches. connMaxIdleTime gives them
+	// back once the server is quiet. Do not add a
 	// tight SetMaxOpenConns: it trades the churn for readers waiting on a
 	// connection. The writer's and the revision observer's pinned
 	// connections are in use, not idle, so they do not count against the cap.
