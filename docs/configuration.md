@@ -1074,7 +1074,7 @@ curl -sS --fail-with-body -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 
 # 400 = host or suite missing, a scheme other than http or https, or a host
 #   holding scheme:// (pass the scheme in scheme)
 # 403 = the header is missing, a browser request from another origin, or,
-#   without htpasswd_file, another host name than localhost or listen's (use the address)
+#   without htpasswd_file, a host name other than localhost or listen's (use the address)
 # 409 = busy (being checked or adopted: try again) or no such suite (check the
 #   scheme, which defaults to https, and the host and suite the status page shows)
 # 500 = a database error (logged as WARN admin: forget failed); repeat it:

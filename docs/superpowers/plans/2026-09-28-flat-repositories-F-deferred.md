@@ -14,9 +14,9 @@ Left out: everything fix rounds 1 and 2 and the final fix wave resolved — the 
 
 ## internal/admin — /forget and /reconcile (spec §10's G-1 follow-up, not phase G)
 
-- **F-4** `handlers.go`: `handleForget` copies `handleReconcile`'s parsing preamble line for line (the 8 KiB cap, `ParseForm` answered 413, three trimmed `FormValue`s, the `https` default). G-1 reworks both endpoints' parsing: share one helper. (H; G-1 landed without it on 2026-10-24) (Task 10 minor 2)
+- **F-4** `handlers.go`: `handleForget` copies `handleReconcile`'s parsing preamble line for line (the 8 KiB cap, `ParseForm` answered 413, three trimmed `FormValue`s, the `https` default). Share one parsing helper between the two endpoints. (H; G-1 landed without it on 2026-10-24) (Task 10 minor 2)
 - **F-5** `handlers.go`: every `ParseForm` error is answered 413 "request body too large", and `handleForget`'s doc says 413 means the body exceeds 8 KiB. A malformed body gets a misleading answer (`curl --data-urlencode` never sends one). (H; G-1 landed without it on 2026-10-24) (Task 10 minor 3)
-- **F-6** `server.go`: `OPTIONS /reconcile` answers `Allow: GET, HEAD, OPTIONS` while its 405 says `POST, OPTIONS` (pre-existing; `/forget`'s case shows the fix); the admin endpoints' `\n\n`-terminated plain-text bodies are an existing style to settle with G-1. (H; G-1 landed without it on 2026-10-24) (Task 10 minors 6 and 7)
+- **F-6** `server.go`: `OPTIONS /reconcile` answers `Allow: GET, HEAD, OPTIONS` while its 405 says `POST, OPTIONS` (pre-existing; `/forget`'s case shows the fix); the admin endpoints' `\n\n`-terminated plain-text bodies are an existing style to settle. (H; G-1 landed without it on 2026-10-24) (Task 10 minors 6 and 7)
 
 ## internal/freshness — tests and comments
 

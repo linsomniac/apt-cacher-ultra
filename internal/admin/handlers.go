@@ -735,10 +735,11 @@ func forgottenText(scheme, host, suite string, res cache.ForgetResult) string {
 // the maintainer's decision of 2026-10-24). The check keys on
 // htpasswd_file being configured (s.auth), never on the request carrying
 // credentials, which a rebinding page may send. It is off with
-// htpasswd_file, since a rebinding page does not have the credentials, so
-// an operator behind a reverse proxy that forwards the client's Host keeps
-// working; without htpasswd_file that operator gets this 403 and its text
-// says what to do. The read-only endpoints (status, /metrics, /healthz,
+// htpasswd_file, since a rebinding page does not have the credentials
+// (unless the user types them into the browser's prompt for the page's
+// name), so an operator behind a reverse proxy that forwards the client's
+// Host keeps working; without htpasswd_file that operator gets this 403
+// and its text says what to do. The read-only endpoints (status, /metrics, /healthz,
 // the pprof routes) have no Host check: a Prometheus server may scrape the
 // listener by name, and without htpasswd_file a rebinding page can still
 // read them.
