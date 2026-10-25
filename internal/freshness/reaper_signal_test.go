@@ -71,6 +71,9 @@ func TestReaper_ACompletedRunLogsItsLineAndSetsTheGauge(t *testing.T) {
 	if d := steps() - steps0; d != 1 {
 		t.Fatalf("acu_clock_steps_detected_total grew by %v at the forward step, want 1", d)
 	}
+	if got := gaugeValue(t, "acu_suite_reaper_last_run_unixtime"); got != float64(reapNow) { // it was 1
+		t.Fatalf("last run gauge %v after a deferred run, want %d: a deferred run is complete", got, reapNow)
+	}
 }
 
 // Deferred minor F-18 (design note 9): suite_reaped names what judged it —
@@ -118,6 +121,9 @@ func TestHoldSuite_APanickingPurgeStillUnlocks(t *testing.T) {
 	r.checker.holdPurgeHook = nil
 	if got != "purge bug" {
 		t.Fatalf("recovered %v, want the purge's panic", got)
+	}
+	if n := r.checker.LockCount(); n != 0 {
+		t.Fatalf("%d lock-map entries after the panicking release, want 0: the deleted suite's entry dropped", n)
 	}
 	again, ok := r.checker.HoldSuite(key)
 	if !ok {
@@ -194,5 +200,56 @@ func TestReaper_AFlatJunkSuiteNamesItsIndexesAsEvidence(t *testing.T) {
 	}
 	if want := map[string]bool{"/junk/Packages.gz": true, "/junk/Sources": true}; len(ev) != 2 || !reflect.DeepEqual(got, want) {
 		t.Fatalf("evidence %v, want the two index rows, each once", line["evidence"])
+	}
+}
+
+// Deferred minor F-18 (Task 6 review minor 4): a flat suite whose junk
+// anchors decide alone — its base has signed evidence, so its good index
+// does not count (ruling PG-7) — names only the anchors as its evidence.
+func TestReaper_ASignedFlatSuiteNamesOnlyItsAnchorsAsEvidence(t *testing.T) {
+	r := newReaperRig(t)
+	old := reapNow - 2*reapDay
+	r.junkSuite("/anchors-signed")
+	r.cacheAnchor("/anchors-signed", "InRelease", softPage, old)
+	r.cacheAnchor("/anchors-signed", "Packages.gz", "\x1f\x8b\x08\x00 an index", old) // a good index
+	orig := r.reaper.signedEvidence
+	t.Cleanup(func() { r.reaper.signedEvidence = orig })
+	r.reaper.signedEvidence = func(context.Context, string, string) error { return cache.ErrUnsignedDowngradeRefused }
+	r.reaper.runOnce(context.Background())
+	var line map[string]any
+	for _, m := range r.events("suite_reaped") {
+		if m["suite_path"] == "/anchors-signed" {
+			line = m
+		}
+	}
+	if line == nil || line["reason"] != "junk" {
+		t.Fatalf("suite_reaped lines %v, want /anchors-signed reaped as junk", r.events("suite_reaped"))
+	}
+	if !reflect.DeepEqual(line["evidence"], []any{"/anchors-signed/InRelease"}) {
+		t.Fatalf("evidence %v, want only the anchor that decided", line["evidence"])
+	}
+}
+
+// Deferred minor F-18 (Task 6 review minor 4): a flat suite whose anchors
+// and indexes are all junk — the two rules agree — names both sets, the
+// anchors first, as its evidence.
+func TestReaper_AFlatSuiteJunkThroughoutNamesBothSetsAsEvidence(t *testing.T) {
+	r := newReaperRig(t)
+	old := reapNow - 2*reapDay
+	r.junkSuite("/everything")
+	r.cacheAnchor("/everything", "InRelease", softPage, old)
+	r.cacheAnchor("/everything", "Packages.gz", softPage, old)
+	r.reaper.runOnce(context.Background())
+	var line map[string]any
+	for _, m := range r.events("suite_reaped") {
+		if m["suite_path"] == "/everything" {
+			line = m
+		}
+	}
+	if line == nil || line["reason"] != "junk" {
+		t.Fatalf("suite_reaped lines %v, want /everything reaped as junk", r.events("suite_reaped"))
+	}
+	if !reflect.DeepEqual(line["evidence"], []any{"/everything/InRelease", "/everything/Packages.gz"}) {
+		t.Fatalf("evidence %v, want the anchor and the index", line["evidence"])
 	}
 }

@@ -112,9 +112,9 @@ func (c *Checker) HoldSuite(key cache.SuiteKey) (func(deleted bool), bool) {
 				mu.Unlock()
 				return
 			}
-			// Deferred, so a panic in the purge still drops the entry and
-			// unlocks: the mutex never leaks to every later deleter
-			// (deferred minor F-25).
+			// AIDEV-NOTE: deferred, so a panic in the purge still drops the
+			// entry and unlocks: the mutex never leaks to every later
+			// deleter (deferred minor F-25).
 			defer c.unlockDropped(k, mu)
 			if c.holdPurgeHook != nil {
 				c.holdPurgeHook()

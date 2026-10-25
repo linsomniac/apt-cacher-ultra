@@ -2,10 +2,9 @@ package freshness
 
 // Spec C5 "Unsigned safeguards" (D6), the adopter's side — and the
 // checker's refusals before a slot is taken (unsignedRefusal): the
-// unsigned form adopts a Release no signature
-// covers, so it never vouches a .deb, never counts for strict mode, never
-// writes a signed-seen marker, and is refused whenever the suite has
-// signed history.
+// unsigned form adopts a Release no signature covers, so it never vouches
+// a .deb, never counts for strict mode, never writes a signed-seen marker,
+// and is refused whenever the suite has signed history.
 
 import (
 	"context"

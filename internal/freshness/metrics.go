@@ -121,8 +121,9 @@ var (
 		"adopted",
 	)
 
-	// clockStepsTotal counts past-event stamps found in the future
-	// (backward wall-clock steps, spec C4).
+	// clockStepsTotal counts detected wall-clock steps: a past-event stamp
+	// found in the future (backward, spec C4) and the reaper's forward step
+	// (deferred minor F-17).
 	clockStepsTotal = metrics.NewCounter(
 		"acu_clock_steps_detected_total",
 		"Wall-clock steps detected: a past-event timestamp found in the future (a backward step), "+

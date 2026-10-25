@@ -241,9 +241,15 @@ type reapCandidate struct {
 // that completes — the listing read, the reaps tried, the sweeps done, or
 // held back by the forward-step guard — logs suite_reaper_run_complete
 // and sets acu_suite_reaper_last_run_unixtime; one whose listing failed or
-// that a shutdown cut short does neither, so an alert on the gauge's age
-// catches a reaper that stopped completing runs (GC's
-// acu_gc_last_run_unixtime is the model).
+// that a shutdown cut short does neither, so an alert on the gauge catches
+// a reaper that stopped completing runs (GC's acu_gc_last_run_unixtime is
+// the model). Unlike GC's, the gauge has no series until the first
+// completed run, which comes only after the uptime floor; so the alert is
+// absent(acu_suite_reaper_last_run_unixtime) OR its age > reapInterval +
+// reapUptimeFloor — an age alert alone never fires for a reaper that has
+// not completed a run since its start. The gauge is not seeded at Run's
+// start on purpose: that would claim a run that did not happen (Task 6
+// review minor 3).
 func (r *Reaper) runOnce(ctx context.Context) {
 	start := time.Now()
 	rows, err := r.cache.ListSuitesWithAdoption(ctx)
@@ -336,10 +342,11 @@ func (r *Reaper) sweepMarkers(ctx context.Context, now, fresh time.Time) int {
 // monotonic clock advanced since the previous run, or Run's start; when
 // the wall clock ran more than forwardStepSlack ahead it logs
 // clock_step_detected (stamp=wall_clock) and counts it in
-// acu_clock_steps_detected_total (deferred minor F-17), defers reaping by the uptime
-// floor, giving clients the hour a restart gives them to touch their
-// suites, and adds the step to stepAhead, which the marker sweep's cutoff
-// takes off (ruling PF-13). It reports whether this run is deferred.
+// acu_clock_steps_detected_total (deferred minor F-17), defers reaping by
+// the uptime floor, giving clients the hour a restart gives them to touch
+// their suites, and adds the step to stepAhead, which the marker sweep's
+// cutoff takes off (ruling PF-13). It reports whether this run is
+// deferred.
 //
 // AIDEV-NOTE: the monotonic clock does not advance while a machine is
 // suspended or a VM paused, and the wall clock does; the uptime floor
@@ -445,8 +452,9 @@ func (r *Reaper) candidates(rows []cache.SuiteWithAdoption, now time.Time) []rea
 // rows and fourteen root index rows; a non-canonical row deletes no
 // metadata, though a legacy one may carry a current snapshot, which its
 // reap retires — sub-job C deletes that snapshot's rows later, in chunks,
-// so 250 such reaps a run grow C's backlog, not the reaper's own work:
-// deferred minor F-26), and reapsPerRun idle suites in the same run.
+// so a full regardless budget of such reaps a run grows C's backlog, not
+// the reaper's own work: deferred minor F-26), and reapsPerRun idle
+// suites in the same run.
 func sortCandidates(cands []reapCandidate) {
 	stamp := func(c reapCandidate) int64 {
 		if c.requested == nil {
@@ -568,7 +576,11 @@ func (r *Reaper) reapSuite(ctx context.Context, c reapCandidate) (reaped bool) {
 	case c.reason == "idle" && c.requested != nil:
 		attrs = append(attrs, "last_requested_unixtime", *c.requested) // the stamp the cutoff judged (F-18)
 	case c.reason == "junk":
-		attrs = append(attrs, "evidence", c.evidence) // the rows judged junk (F-18): a list, since a path may hold a space
+		// The rows judged junk (F-18), as a list: a JSON array under
+		// log.format = json, where a path holding a space stays
+		// unambiguous; the text handler (the default) renders it as one
+		// bracketed, space-separated string, where it does not.
+		attrs = append(attrs, "evidence", c.evidence)
 	}
 	if settled {
 		attrs = append(attrs, "settled", true)
