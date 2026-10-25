@@ -247,7 +247,9 @@ func (c *Cache) RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGrac
 	now := nowUnix()
 	cutoff := now - staleGraceSeconds
 
-	// AIDEV-NOTE: the union SELECT below mirrors SPEC4 §9.6.3 verbatim.
+	// AIDEV-NOTE: the union SELECT below mirrors SPEC4 §9.6.3, plus spec
+	// C9's retired_at exclusion and ruling R-H1's legacy_trust_audit
+	// exclusion (below).
 	// Sub-job B's NOT IN clause must be applied BEFORE the ROW_NUMBER
 	// window function (so the current snapshot is excluded from the
 	// per-suite ranking, not after) — otherwise keep_displaced=3 with

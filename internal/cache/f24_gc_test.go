@@ -37,6 +37,9 @@ func TestRunSnapshotGCBatch_KeepsAuditDeferredSignedHistory(t *testing.T) {
 			defer stubNow(t, evictNow)()
 			key := sk("h", "/r/dists/x")
 			id := seedSignedHistory(t, c, key, form, false, evictNow)
+			if hostMarker(t, c, "http", "/r/dists/x") >= 0 {
+				t.Fatal("premise: the base has a marker")
+			}
 			if err := c.CheckUnsignedDowngrade(ctx, "h", "/r/dists/x"); !errors.Is(err, ErrUnsignedDowngradeRefused) {
 				t.Fatalf("premise: CheckUnsignedDowngrade = %v, want refused by the displaced snapshot", err)
 			}
