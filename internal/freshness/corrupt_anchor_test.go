@@ -114,7 +114,8 @@ func TestRunLegacyTrustAudit_CorruptAnchorDropsItsRowsOversizedKeepsThem(t *test
 	want := map[string]float64{"anchor_corrupt": 1, "anchor_oversized": 0}
 	lines := logRecords(t, logs, "legacy_snapshot_quarantined")
 	for _, m := range lines {
-		n, ok := want[m["reason"].(string)]
+		reason, _ := m["reason"].(string)
+		n, ok := want[reason]
 		if !ok || m["anchor_rows_deleted"] != n {
 			t.Errorf("line %v, want anchor_rows_deleted %v for its reason", m, n)
 		}
@@ -166,8 +167,68 @@ func TestRunLegacyTrustAudit_AFailedDiscardIsLoggedAndTheQuarantineProceeds(t *t
 	}
 	recs := logRecords(t, logs, "legacy_anchor_discard_failed")
 	if len(recs) != 1 || recs[0]["level"] != "ERROR" || recs[0]["blob_hash"] != hash ||
-		recs[0]["err"] != "pool is read-only" || recs[0]["snapshot_id"] != float64(rotten) {
+		recs[0]["err"] != "pool is read-only" || recs[0]["snapshot_id"] != float64(rotten) ||
+		recs[0]["canonical_host"] != "h" || recs[0]["suite_path"] != "/r/dists/rotten" {
 		t.Fatalf("records %v, want one ERROR naming the snapshot, the blob and the error", recs)
+	}
+}
+
+// Design note 2: two snapshots of one batch whose stored InRelease is the
+// same rotted pool file (two suites caching the same bytes) are both
+// anchor_corrupt, since both read the file before any removal. The first
+// quarantine's drop takes every row of the blob (anchor_rows_deleted 2),
+// the second's finds none left (0); the first removal deletes the file
+// and the second finds it gone, which DiscardFinalizedBlob ignores, so
+// nothing logs legacy_anchor_discard_failed.
+func TestRunLegacyTrustAudit_TwoSnapshotsSharingARottedAnchorInOneBatch(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	ctx := context.Background()
+	c := env.cache
+	shared := clearsignForTest(t, realisticRelease()+"Note: shared\n")
+	first := adoptLegacy(t, env, "/r/dists/one", shared, "/r/pool/o_1_amd64.deb")
+	second := adoptLegacy(t, env, "/r/dists/two", shared, "/r/pool/t_1_amd64.deb")
+	snap, err := c.GetSuiteSnapshot(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := *snap.SingleAnchorHash
+	if snap2, err := c.GetSuiteSnapshot(ctx, second); err != nil || snap2.SingleAnchorHash == nil || *snap2.SingleAnchorHash != hash {
+		t.Fatalf("second snapshot %+v, %v; want the same InRelease blob %s", snap2, err, hash)
+	}
+	rotBlob(t, c, hash)
+	if err := c.ClearSignedSeenForTest(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EnqueueLegacyTrustAudit(ctx, first, second); err != nil {
+		t.Fatal(err)
+	}
+	logs := &lockedBuffer{}
+	res, err := RunLegacyTrustAudit(ctx, c, slog.New(slog.NewJSONHandler(logs, nil)))
+	if err != nil || res.Quarantined != 2 {
+		t.Fatalf("audit = %+v, %v; want both quarantined", res, err)
+	}
+	for _, p := range []string{"/r/dists/one/InRelease", "/r/dists/two/InRelease"} {
+		if _, err := c.LookupURL(ctx, "http", "h", p); !errors.Is(err, cache.ErrNotFound) {
+			t.Errorf("%s: %v, want deleted", p, err)
+		}
+	}
+	if _, err := os.Stat(c.BlobPath(hash)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the shared rotted pool file: %v, want removed", err)
+	}
+	want := map[float64]float64{float64(first): 2, float64(second): 0}
+	lines := logRecords(t, logs, "legacy_snapshot_quarantined")
+	for _, m := range lines {
+		id, _ := m["snapshot_id"].(float64)
+		n, ok := want[id]
+		if !ok || m["reason"] != "anchor_corrupt" || m["anchor_rows_deleted"] != n {
+			t.Errorf("line %v, want reason anchor_corrupt and anchor_rows_deleted %v", m, n)
+		}
+	}
+	if len(lines) != 2 {
+		t.Fatalf("%d quarantine lines, want 2", len(lines))
+	}
+	if recs := logRecords(t, logs, "legacy_anchor_discard_failed"); len(recs) != 0 {
+		t.Fatalf("records %v, want none: the second removal finds the file already gone", recs)
 	}
 }
 

@@ -99,7 +99,11 @@ func TestApplyLegacyAuditDecisions_DropAnchorRowsNeedsAQuarantine(t *testing.T) 
 	if items, err := c.LegacyAuditBatch(ctx, 0, 0); err != nil || len(items) != 1 {
 		t.Fatalf("queue %+v (%v), want the snapshot still queued", items, err)
 	}
-	if _, ok, _ := c.SignedSeen(ctx, "http", "h", "/r/dists/k"); ok || urlPathGone(t, c, "http", "h", "/r/dists/k/InRelease") {
+	_, ok, err := c.SignedSeen(ctx, "http", "h", "/r/dists/k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || urlPathGone(t, c, "http", "h", "/r/dists/k/InRelease") {
 		t.Fatal("a rolled-back batch marked the base or deleted the anchor row")
 	}
 }

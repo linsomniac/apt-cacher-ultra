@@ -203,6 +203,9 @@ func dropAnchorBlobRowsTx(ctx context.Context, tx *sql.Tx, snapshotID, now int64
 	if err := rows.Close(); err != nil {
 		return 0, fmt.Errorf("drop anchor rows of %d: %w", snapshotID, err)
 	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("drop anchor rows of %d: iterate: %w", snapshotID, err)
+	}
 	for _, k := range keys {
 		if err := deleteURLPathRowTx(ctx, tx, k.scheme, k.host, k.path, hash, now); err != nil {
 			return 0, fmt.Errorf("drop anchor rows of %d: %w", snapshotID, err)
