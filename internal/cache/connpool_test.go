@@ -63,10 +63,12 @@ func TestOpen_ConcurrentReadersKeepTheirConnections(t *testing.T) {
 	}
 }
 
-// The idle connections a burst leaves behind are closed once the server
-// has been quiet for connMaxIdleTime, so a burst does not pin their page
-// caches for the life of the process.
-func TestOpen_IdleConnectionsCloseWhenQuiet(t *testing.T) {
+// The idle connections a burst leaves behind stay open through a quiet
+// day: the pool has no idle timeout or lifetime (the maintainer's
+// decision, 2026-10-24). A 5-minute idle timeout made every quiet gap cost
+// a reopen of each connection, which doubled the 90-day simulation under
+// -race; the connections it would free are bounded by the cap.
+func TestOpen_IdleConnectionsStayThroughQuiet(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		c, err := Open(context.Background(), t.TempDir(), nil)
 		if err != nil {
@@ -74,17 +76,10 @@ func TestOpen_IdleConnectionsCloseWhenQuiet(t *testing.T) {
 		}
 		defer func() { _ = c.Close() }()
 		holdConns(t, c, 16)
-		if st := c.db.Stats(); st.Idle < 16 {
-			t.Fatalf("idle after the burst = %d, want at least 16", st.Idle)
-		}
-		// Twice connMaxIdleTime: at connMaxIdleTime the cleaner keeps them
-		// (its test is strictly older than), and closes them on its next
-		// run, at least a second later. Fake time cannot pass that run
-		// before the cleaner is done, so no Wait is needed after the sleep.
-		time.Sleep(2 * connMaxIdleTime)
-		if st := c.db.Stats(); st.Idle != 0 || st.MaxIdleTimeClosed < 16 {
-			t.Fatalf("after %v quiet: idle %d, closed for idle time %d; want 0 idle and at least 16 closed",
-				2*connMaxIdleTime, st.Idle, st.MaxIdleTimeClosed)
+		time.Sleep(24 * time.Hour)
+		if st := c.db.Stats(); st.Idle < 16 || st.MaxIdleTimeClosed != 0 || st.MaxLifetimeClosed != 0 {
+			t.Fatalf("after a quiet day: idle %d, closed for idle time %d, for lifetime %d; want at least 16 idle and none closed",
+				st.Idle, st.MaxIdleTimeClosed, st.MaxLifetimeClosed)
 		}
 	})
 }
