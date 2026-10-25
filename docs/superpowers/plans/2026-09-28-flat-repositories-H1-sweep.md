@@ -28,6 +28,29 @@ Counts: fix 111, done 2, declined 23 (C-39 moved from declined to fix).
 
 Replayed on the fresh copy: Task 2 (red, green, the order test, the mutants including "removal before the commit"), Task 7 (m-4's red, green and mutants), and the module-wide checks.
 
+**Revision 4 (the execution review of revision 2).** An independent executor (exec2) applied revision 2 as written, from 6786529, one commit per task: executable after minor fixes, every red, green and module-wide step as stated, all 109 mutation rows killed, no Critical or Important defect in the plan. Its seven Minor defects, ten nits and nine of its ten test gaps are adopted (controller rulings):
+- **D-1 to D-7**: Tasks 6, 8, 9 and 10's stale expected lines are corrected. Task 7's row 8 mutates in a form that compiles, as does revision 3's m-4 row (the replay found the same flaw there: removing `StartupPass`'s `defer` leaves `passesDone` unused). Task 14's row 2 becomes two (the first stops `internal/freshness` building). Task 15 Step 2's greps match only what its rules cover. Task 16 counts test names alone (`grep '^Test'`). Task 4's Host-cell and Task 10's doc `old` blocks match whole lines.
+- **The ten nits**: Tasks 1, 3, 6 (the `suiteJunk` doc as a block), 7, 13, 14, 15 (two, among them gc's noise as about 520–550) and 17 (51 distinct simulations). Task 10's, `source_paths_skipped` at INFO in its Produces, was already revision 3's m-2.
+- **Test gaps G-1 and G-3 to G-10**, each with its mutation row, in the task's test file for its area:
+  - Task 2: `TestApplyLegacyAuditDecisions_AFailedDropUndoesTheQuarantine` (G-1, Important: R-H2's drop runs in the quarantine's own transaction; another reviewer's near-duplicate is not added) and `TestAuditLegacySnapshot_NoAnchorHashAsksForNoDrop` (G-3: the post-commit loop dereferences the hash).
+  - Task 3: `TestLogMethodsAreOnlyCalledDirectly` (G-10). It is shape-based and passes on the final tree with no allowlist, so it is kept.
+  - Task 4: `TestStatus_AnchorlessFlatSuiteThroughTheServer` (G-4).
+  - Task 5: `TestOptions_GrantsNoCORS` (G-5), and `TestEndpoint_Forget_ShutdownLineNamesTheCanonicalScheme` (G-6) in `forget_test.go`, beside the forget endpoint's other log tests.
+  - Task 6: three reaper run-line tests (G-7).
+  - Task 7: `TestSnapshotPass_SubJobCChecksTheDeadlineBeforeItsFirstChunk` and `TestSkipPanickedPass_MovesPastEachPass` (G-8).
+  - Task 12: `TestReleaseDate_KeyTrimsASCIIBlanksOnly` (G-9).
+  - Each sits at the end of its file, so the earlier expected lines hold. The one exception is `status_annotations_test.go`: its four new imports move Task 4's lines down by four.
+- **G-2 is declined.** It pins revision 2's removal *before* the commit, which revision 3 reversed (N-1). `TestRunLegacyTrustAudit_AFailedDiscardIsLoggedAndTheQuarantineProceeds`'s seam pins the after-commit order, and Task 2's row "the removal before the commit" is its red.
+- **Planner's tidy-ups.** Revision 3's over-long `dropAnchorBlobRowsTx` AIDEV-NOTE line is rewrapped. Task 10's GD-2 test doc is rewrapped in the same four lines. The commit messages of Tasks 2–7 say what the new tests pin, rewrapped where a line had grown long.
+
+Counts: fix 111, done 2, declined 23, unchanged (no deferred ID moves). Task 16's freshness test names: 688 (exec2's 683, plus revision 4's five freshness tests).
+
+Replayed from 6786529, outside the worktree, on exec2's per-task trees (its execution of revision 2's text) with revisions 3 and 4 applied task by task:
+- Every `Create` block, end-of-file block and `old`/`new` pair of this revision matches those trees, each `old` once in the tree before its task. Task 18's six diffs apply to the tree after Task 16 with no offset or fuzz.
+- Every changed red step was run in a tree of the previous task plus the task's Step 1 test files.
+- Every new mutation row, and every row of Tasks 2, 4, 5, 6, 7 and 12 and Task 14's two D-3 rows, fails as stated.
+- The added tests pass `-race -count=10`. On the final tree, `go build` and `go vet` are clean, `golangci-lint run` reports `0 issues.`, `gofmt -l .` lists the five drift files, and `go test -race ./...` passes in all 21 packages. Task 17 Step 1 prints its expected output (136, 136, same IDs, 23 declined, 2 done, 111 fix; 111 fix rows, 0 not named in their task).
+
 ## Global Constraints
 
 Everything in the overview's Global Constraints applies. In particular:
@@ -48,7 +71,7 @@ Conventions in this plan:
 - Each task's **Interfaces** block lists what it uses from other tasks and existing test files. Never redefine a helper: a second definition in the same package does not compile.
 - Each commit step starts with `gofmt -l <files>`; it must print nothing. Run `gofmt -w` on the non-drift files a step edits before that check; never on the five drift files.
 - A "verify failure" step whose expected result is a compile failure is complete when the compiler names the undefined identifiers listed; such a step runs `go test -gcflags=-e …` so every error is listed.
-- Mutation checks are run one at a time, each reverted before the next; record each failing test line in the commit message. Every red step, green run and mutation row in this plan was replayed on a scratch copy of the tree at 6786529 with the tasks before it applied; each row names the test line that failed there. (The branch's next commit, c8e6fe4, adds only the H2 plan. The revision of 2026-10-25 replayed each task it changed on a fresh copy of eadfd80, this plan's draft, whose code is 6786529's.)
+- Mutation checks are run one at a time, each reverted before the next; record each failing test line in the commit message. Every red step, green run and mutation row in this plan was replayed on a scratch copy of the tree at 6786529 with the tasks before it applied; each row names the test line that failed there. (The branch's next commit, c8e6fe4, adds only the H2 plan. The revision of 2026-10-25 replayed each task it changed on a fresh copy of eadfd80, this plan's draft, whose code is 6786529's. Revision 4 was replayed on the execution review's per-task trees with revisions 3 and 4 applied: see its note above.)
 - Edits to existing files are given as exact `old`/`new` blocks (or a whole function that replaces the one of the same name); each `old` block occurs once in the file as it stands after the previous tasks.
 - Event names in code, tests and docs are the snake_case names of Task 3 from Task 3 on; the tasks before it use the prose names as they stand.
 - **Existing tests that change.** Task 2 changes `ApplyLegacyAuditDecisions`' result to `map[int64]LegacyAuditEffect` (`applyOne` and the freshness audit read `.WasCurrent`). Task 3 renames the 43 messages in every test that matches them, and points `TestCheck_HealthySuiteAsksForNoRepairSlot`'s absence check at the new event (it matched a fragment, so it would have passed vacuously). Task 4 regenerates `TestJSONContractPreserved`'s golden (three additive fields) and changes `suites_healthy_no_lag`'s fixture (B-60). Task 5 changes the admin's `http.Error` bodies to one trailing newline (F-6; the tests trim newlines already) and `TestEndpoint_Forget_LogsAcceptedRequestsAndFailures`'s key (F-16). Task 9 makes `TestAdoptionFailureRecordCutByShutdownIsNotAWarning` assert its one DEBUG line (E-43) and changes `TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent`'s tick (E-56). Task 11 changes `TestServeHTTP_StrictWaitRefusals`' first loop and `TestServeHTTP_CoalescedCreatingMissFiresT1Once` (E-59, E-66). Task 13 rewrites `TestSimScheduler_FiveHundredStallingOneHealthy`'s first phase and setup (C-38) without dropping an assertion, checks every five minutes instead of two in `TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds` (R-H7), and tightens the simulations its items name (E-50–E-53, E-55, F-10, F-11; `internal/flipgate`'s `clients` helper, C-7). Task 14 rewrites `TestInsertCandidateSnapshot_Rejects*` (D-9) and adds rows or assertions to the tests its items name. Task 15 gives silent loggers to the tests it lists, moves `TestOpenCache_LogsNothing`'s assertion after the cleanups (D-60) and reads a decoded record in `TestWarnSuiteCaps_ZeroCapAndReadFailure` (E-73). Task 15 also makes `TestPhase2Chaos_AdoptionFlipUnderConcurrency` and `TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency` hold the suite across their first trigger GET and trigger until the gate parks the adoption (C-39). Task 16 renames or re-documents the tests its items name and moves `deferred_e_test.go`'s nine tests verbatim (E-46). Any other existing test that fails means the change is wrong.
@@ -371,7 +394,7 @@ The overview's "Phase H takes F-24 early". With `gc.keep_displaced = 0` (allowed
 - Modify: `internal/cache/gc.go` (`RunSnapshotGCBatch`: its `selectSQL` and AIDEV-NOTE)
 
 **Interfaces:**
-- Consumes: `openCache`, `stubNow`, `sk`, `evictNow`, `seedRow`, `rowExists` (`suite_evict_test.go`), `seedSignedHistory`, `hostMarker` (`suite_reap_test.go`), `seedBlob`, `snapshotExists` (`gc_test.go`), `ApplyLegacyAuditDecisions`, `RunRetiredSnapshotGCChunk`, `EnqueueLegacyTrustAudit`.
+- Consumes: `openCache` (`cache_test.go`), `stubNow` (`gc_test.go`), `sk`, `evictNow`, `seedRow`, `rowExists` (`suite_evict_test.go`), `seedSignedHistory`, `hostMarker` (`suite_reap_test.go`), `seedBlob`, `snapshotExists` (`gc_test.go`), `ApplyLegacyAuditDecisions`, `RunRetiredSnapshotGCChunk`, `EnqueueLegacyTrustAudit`.
 - Produces: test helpers `commitUnsignedCandidate(t, c, key SuiteKey) error`, `seedDisplacedAt(t, c, key SuiteKey, adoptedAt int64, queued bool) int64`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -777,6 +800,51 @@ func TestApplyLegacyAuditDecisions_DropAnchorRowsNeedsAQuarantine(t *testing.T) 
 		t.Fatal("a rolled-back batch marked the base or deleted the anchor row")
 	}
 }
+
+// Ruling R-H2, the quarantine's own transaction (execution review G-1): the
+// anchor-row drop and the quarantine commit or roll back together. A drop
+// that fails — here a trigger refuses every url_path delete — leaves the
+// batch unapplied: the snapshot still queued (the next start audits it
+// again), still current, not retired, its pins not released, and its
+// anchor row kept. A drop run in a later transaction would leave the
+// snapshot dequeued and retired while its rows served the corrupt bytes
+// for good.
+func TestApplyLegacyAuditDecisions_AFailedDropUndoesTheQuarantine(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, 1_800_000_000)()
+	anchor := seedBlob(t, c, "a corrupt anchor, kept by a failed drop")
+	id := commitInline(t, c, "/r/dists/q", anchor)
+	if err := c.EnqueueLegacyTrustAudit(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	before := refcount(t, c, anchor)
+	if _, err := c.db.Exec(`CREATE TRIGGER refuse_url_path_delete BEFORE DELETE ON url_path
+BEGIN SELECT RAISE(ABORT, 'injected url_path delete failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision{
+		{SnapshotID: id, Outcome: LegacyAuditQuarantine, DropAnchorRows: true}}); err == nil {
+		t.Fatal("a failed anchor-row drop returned no error")
+	}
+	if items, err := c.LegacyAuditBatch(ctx, 0, 0); err != nil || len(items) != 1 || items[0].SnapshotID != id {
+		t.Fatalf("queue %+v (%v), want snapshot %d still queued", items, err, id)
+	}
+	sf, err := c.GetSuiteFreshness(ctx, "http", "h", "/r/dists/q")
+	if err != nil || sf.CurrentSnapshotID == nil || *sf.CurrentSnapshotID != id {
+		t.Fatalf("current snapshot %v (%v), want %d: the quarantine must roll back with the drop", sf.CurrentSnapshotID, err, id)
+	}
+	var retired int
+	if err := c.db.QueryRow(`SELECT retired_at IS NOT NULL FROM suite_snapshot WHERE snapshot_id = ?`, id).Scan(&retired); err != nil || retired != 0 {
+		t.Fatalf("snapshot retired = %d (%v), want not retired", retired, err)
+	}
+	if got := refcount(t, c, anchor); got != before {
+		t.Fatalf("refcount %d, want %d: no pin released by a rolled-back batch", got, before)
+	}
+	if urlPathGone(t, c, "http", "h", "/r/dists/q/InRelease") {
+		t.Fatal("the anchor row is gone after a rolled-back batch")
+	}
+}
 ```
 
 Create `internal/freshness/corrupt_anchor_test.go`:
@@ -954,6 +1022,20 @@ func TestRunLegacyTrustAudit_AFailedDiscardIsLoggedAndTheQuarantineProceeds(t *t
 		t.Fatalf("records %v, want one ERROR naming the snapshot, the blob and the error", recs)
 	}
 }
+
+// Ruling R-H2 (execution review G-3): an inline item without a stored
+// InRelease hash is anchor_missing and asks for no row drop.
+// RunLegacyTrustAudit's post-commit loop dereferences SingleAnchorHash to
+// remove the pool file whenever DropAnchorRows is set, so a drop asked for
+// here would also be a nil dereference on main's goroutine before anything
+// serves.
+func TestAuditLegacySnapshot_NoAnchorHashAsksForNoDrop(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	v, err := auditLegacySnapshot(env.cache, cache.LegacyAuditItem{Form: cache.FormInline, SingleAnchorHash: nil})
+	if err != nil || v.outcome != cache.LegacyAuditQuarantine || v.reason != "anchor_missing" || v.dropAnchorRows {
+		t.Fatalf("verdict %+v, err %v; want an anchor_missing quarantine without dropAnchorRows", v, err)
+	}
+}
 ```
 
 Create `internal/handler/corrupt_anchor_test.go`:
@@ -1029,10 +1111,10 @@ func TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor(t *testing.T) {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `go test -gcflags=-e -count=1 -run 'TestApplyLegacyAuditDecisions' ./internal/cache/`
-Expected: build failure naming `unknown field DropAnchorRows in struct literal of type LegacyAuditDecision` (corrupt_anchor_test.go:51, :74, :95) and `undefined: LegacyAuditEffect` (:55, :75).
+Expected: build failure naming `unknown field DropAnchorRows in struct literal of type LegacyAuditDecision` (corrupt_anchor_test.go:51, :74, :95, :130) and `undefined: LegacyAuditEffect` (:55, :75).
 
 Run: `go test -gcflags=-e -count=1 -run 'CorruptAnchor|OnlyACorruptAnchor|AFailedDiscard' ./internal/freshness/`
-Expected: build failure naming `v.dropAnchorRows undefined (type legacyVerdict has no field or method dropAnchorRows)` (corrupt_anchor_test.go:53, :61) and `undefined: legacyDiscardAnchor` (:149, :150, :158).
+Expected: build failure naming `v.dropAnchorRows undefined (type legacyVerdict has no field or method dropAnchorRows)` (corrupt_anchor_test.go:53, :61, :183) and `undefined: legacyDiscardAnchor` (:149, :150, :158).
 
 Run: `go test -count=1 -v -run TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor ./internal/handler/`
 Expected: FAIL — both subtests, `upstream_unchanged` and `upstream_changed`, with `corrupt_anchor_test.go:55: status 200, X-Cache "HIT", body "bit-rotted bytes"; want a MISS serving upstream's InRelease` (today the rotted file is served from its row).
@@ -1187,11 +1269,12 @@ new:
 //
 // AIDEV-NOTE: rows only, never the pool file here: the writer runs no
 // pool I/O (ruling PD-5); RunLegacyTrustAudit removes the corrupt file
-// itself, outside the writer, after the batch commits (review C-1). Every row that names the
-// blob serves the same bad bytes (the pool is content-addressed: a flat
-// suite and its /. twin, or two remapped hosts, share it), so all of them
-// go, and the next client request for each is a miss that fetches a fresh
-// copy (TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor).
+// itself, outside the writer, after the batch commits (review C-1).
+// Every row that names the blob serves the same bad bytes (the pool is
+// content-addressed: a flat suite and its /. twin, or two remapped
+// hosts, share it), so all of them go, and the next client request for
+// each is a miss that fetches a fresh copy
+// (TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor).
 func dropAnchorBlobRowsTx(ctx context.Context, tx *sql.Tx, snapshotID, now int64) (int, error) {
 	var hash sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT inrelease_hash FROM suite_snapshot WHERE snapshot_id = ?`, snapshotID).Scan(&hash)
@@ -1323,7 +1406,7 @@ new:
 					}
 ```
 
-(`DropAnchorRows` is set only for an `anchor_corrupt` verdict, after `SingleAnchorHash` was read, so the dereference is safe.)
+(`DropAnchorRows` is set only for an `anchor_corrupt` verdict, after `SingleAnchorHash` was read, so the dereference is safe; `TestAuditLegacySnapshot_NoAnchorHashAsksForNoDrop` pins that the no-hash `anchor_missing` verdict asks for no drop.)
 
 old:
 ```go
@@ -1390,8 +1473,10 @@ Expected: all `ok`.
 | The row query scoped to one scheme and host (`… AND canonical_scheme = 'http' AND canonical_host = 'h'`) | `cache/corrupt_anchor_test.go:56: effect {WasCurrent:true AnchorRowsDeleted:1}, want current and 3 rows deleted` |
 | The `DropAnchorRows` validation removed (`if false {`) | `cache/corrupt_anchor_test.go:96: outcome 1 with DropAnchorRows: no error` |
 | `anchor_oversized` drops its rows too | `freshness/corrupt_anchor_test.go:62` and `:106: the oversized anchor's row: <nil>, cache: not found; want kept` |
+| The drop in a second transaction after the commit (`dropAnchorBlobRowsTx` run per snapshot in its own transaction once the batch has committed; execution review G-1) | `cache/corrupt_anchor_test.go:134: queue [] (<nil>), want snapshot 1 still queued` (nothing else in `internal/cache` fails) |
+| The no-hash `anchor_missing` verdict asks for the drop (`case it.SingleAnchorHash == nil:` returns `legacyVerdict{…, reason: "anchor_missing", dropAnchorRows: true}`; execution review G-3) | `freshness/corrupt_anchor_test.go:184: verdict {outcome:3 reason:anchor_missing dropAnchorRows:true}, err <nil>; want an anchor_missing quarantine without dropAnchorRows` (nothing else in `internal/freshness` fails) |
 
-The freshness and handler rows were replayed in revision 3 (a fresh copy of eadfd80 with Tasks 1–16 applied); the cache rows are unchanged from the draft's replay.
+Every row was replayed in revision 4, in the tree of this task; the last two ran against their whole package. The execution review's G-2 asked for a test of revision 2's removal before the commit. Revision 3 reversed that order, and the second row is the red of the seam that pins the new one.
 
 - [ ] **Step 7: Commit**
 
@@ -1421,7 +1506,9 @@ before the commit fails :154; a removal for every quarantine fails :112;
 an unlogged failure fails :170; no drop fails freshness :54, :103, :165
 and handler :55; a scheme/host-scoped drop fails cache
 corrupt_anchor_test.go:56; no validation fails :96; an oversized drop
-fails freshness :62 and :106.
+fails freshness :62 and :106; a drop in a second transaction fails cache
+:134 (a failed drop undoes the quarantine); a drop asked for without a
+hash fails freshness :184.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -1430,7 +1517,7 @@ EOF
 
 ### Task 3: snake_case event names (rulings R-H3 and R-H6)
 
-The 43 prose log messages this branch added — the 19 of the table under ruling R-H3 and the 24 of ruling R-H6's — become snake_case events, each keeping its level and fields, in the code that emits them, the tests that match them, the AIDEV-NOTEs and comments that quote them, `docs/log-fields.md` and `docs/configuration.md`. `docs/log-fields.md` gains a row for `adoption_require_signature_disabled`, whose prose message was its only explanation, and one shared row for the 11 renamed DEBUG lines it never documented, each with the meaning its prose carried; six of those are named to keep that meaning (review sweep M-6, design note 3). The overview's and the spec's quotes of the current names change in Task 18 (the overview's carry-forward items, which list the old names as what H renames, and the spec's revision history keep them); the executed phase plans keep theirs (historical by convention). Two guard tests: `TestSweptEventNames` pins the 43 renames three ways — no old name in any Go file, each new name in production code, a `docs/log-fields.md` row for each (a backquoted name in a table row's first cell) — so a later prose name or a typo fails it; `TestLogMessagesAreSnakeCase` requires every log message of production code to be snake_case or one of the 78 prose messages `main` already logs, listed in the test, so a new prose message fails the build (ruling R-H6, design note 3). Their failure messages say where to fix (review M-6). The renames are unreleased: nothing outside the repository depends on them.
+The 43 prose log messages this branch added — the 19 of the table under ruling R-H3 and the 24 of ruling R-H6's — become snake_case events, each keeping its level and fields, in the code that emits them, the tests that match them, the AIDEV-NOTEs and comments that quote them, `docs/log-fields.md` and `docs/configuration.md`. `docs/log-fields.md` gains a row for `adoption_require_signature_disabled`, whose prose message was its only explanation, and one shared row for the 11 renamed DEBUG lines it never documented, each with the meaning its prose carried; six of those are named to keep that meaning (review sweep M-6, design note 3). The overview's and the spec's quotes of the current names change in Task 18 (the overview's carry-forward items, which list the old names as what H renames, and the spec's revision history keep them); the executed phase plans keep theirs (historical by convention). Two guard tests: `TestSweptEventNames` pins the 43 renames three ways — no old name in any Go file, each new name in production code, a `docs/log-fields.md` row for each (a backquoted name in a table row's first cell) — so a later prose name or a typo fails it; `TestLogMessagesAreSnakeCase` requires every log message of production code to be snake_case or one of the 78 prose messages `main` already logs, listed in the test, so a new prose message fails the build (ruling R-H6, design note 3). Their failure messages say where to fix (review M-6). A third, `TestLogMethodsAreOnlyCalledDirectly`, keeps that reading complete: a log method taken as a value (`info := logger.Info; info("…")`) would hide its message from the guard, so production code calls log methods directly (execution review G-10). The renames are unreleased: nothing outside the repository depends on them.
 
 **Files:**
 - Create: `internal/observability/event_names_test.go`
@@ -1908,6 +1995,56 @@ func hasSink(name string) bool {
 	_, ok := logSinks[name]
 	return ok
 }
+
+// Rulings R-H3 and R-H6, the guard's blind spot (execution review G-10):
+// logMessages reads the message of each call of a logSinks name, so a log
+// method taken as a value (info := logger.Info; info("prose message")) is
+// never read, and a prose message logged through it would pass
+// TestLogMessagesAreSnakeCase. Production code calls its loggers' methods
+// directly; this pins that, so the guard's reading stays complete. Without
+// type information it judges by shape: a Debug/Info/Warn/Error/…Context/
+// Log/LogAttrs selector on a receiver whose expression names a logger, used
+// as a value — assigned, passed, returned or stored — rather than called.
+func TestLogMethodsAreOnlyCalledDirectly(t *testing.T) {
+	methods := map[string]bool{"Debug": true, "Info": true, "Warn": true, "Error": true, "DebugContext": true,
+		"InfoContext": true, "WarnContext": true, "ErrorContext": true, "Log": true, "LogAttrs": true}
+	for _, f := range parseTree(t) {
+		if strings.HasSuffix(f.rel, "_test.go") {
+			continue
+		}
+		var stack []ast.Node
+		ast.Inspect(f.file, func(n ast.Node) bool {
+			if n == nil {
+				stack = stack[:len(stack)-1]
+				return true
+			}
+			stack = append(stack, n)
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok || !methods[sel.Sel.Name] || len(stack) < 2 ||
+				!strings.Contains(strings.ToLower(types.ExprString(sel.X)), "log") {
+				return true
+			}
+			valueUse := false
+			switch p := stack[len(stack)-2].(type) {
+			case *ast.AssignStmt, *ast.ReturnStmt, *ast.CompositeLit:
+				valueUse = true
+			case *ast.KeyValueExpr:
+				valueUse = p.Value == n
+			case *ast.ValueSpec:
+				for _, v := range p.Values {
+					valueUse = valueUse || v == n
+				}
+			case *ast.CallExpr:
+				valueUse = p.Fun != n
+			}
+			if valueUse {
+				t.Errorf("%s:%s: %s taken as a value; call the log method directly so TestLogMessagesAreSnakeCase reads its message",
+					f.rel, strconv.Itoa(guardFset.Position(sel.Pos()).Line), types.ExprString(sel))
+			}
+			return true
+		})
+	}
+}
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -1919,9 +2056,9 @@ Expected: FAIL with 202 error lines:
 - 43 `event_names_test.go:369: docs/log-fields.md has no row for <event>`;
 - 43 `event_names_test.go:411: <file>:<line>: log message "<prose>" is not snake_case (and not one of main's prose messages); use a snake_case event name and document it in docs/log-fields.md`, one per message at the first place it is logged (in no fixed order: the messages come from a map; the reaper's three step constants are reported at their one `h.step` site, as `reaper.go:524 (stepReap)`).
 
-No other line: at this commit every non-literal message is a listed helper's parameter or `h.step`, and each of `main`'s 78 is still logged.
+No other line: at this commit every non-literal message is a listed helper's parameter or `h.step`, and each of `main`'s 78 is still logged. `TestLogMethodsAreOnlyCalledDirectly` passes already (no log method is taken as a value); its red is Step 5's last row.
 
-- [ ] **Step 3: Rename (one script, from the repository root), then five hand edits**
+- [ ] **Step 3: Rename (one script, from the repository root), then six hand edits**
 
 ```bash
 #!/usr/bin/env bash
@@ -2042,7 +2179,7 @@ Then: `gofmt -l internal cmd` must list only the five drift files (the renames c
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `go test -count=1 -run 'TestSweptEventNames|TestLogMessagesAreSnakeCase' ./internal/observability/`
+Run: `go test -count=1 -run 'TestSweptEventNames|TestLogMessagesAreSnakeCase|TestLogMethodsAreOnlyCalledDirectly' ./internal/observability/`
 Expected: `ok`.
 
 Run: `go test -race -count=1 ./internal/... ./cmd/...`
@@ -2062,6 +2199,7 @@ Expected: all `ok` (the tests that matched a prose name now match its event).
 | `main`'s `touch failed` renamed `touch_failed` in `suite_rows.go` | `event_names_test.go:417: main's prose message "touch failed" is no longer logged: remove it from mainProseMessages` |
 | `"touch failed"` dropped from `mainProseMessages` (the test file: its lines shift up by one) | `event_names_test.go:410: internal/handler/suite_rows.go:532: log message "touch failed" is not snake_case (and not one of main's prose messages); …` |
 | `logGoroutinePanic` dropped from `logSinks` (as above) | `event_names_test.go:318: internal/handler/handler.go:1404: log message event is neither a literal, a constant nor a listed forwarding helper's parameter; …` |
+| The startup pass's `gc_run_complete` logged through a method value (`info := g.cfg.Logger.Info` / `info("gc run complete", …)`; execution review G-10) | `event_names_test.go:507: internal/gc/gc.go:289: g.cfg.Logger.Info taken as a value; call the log method directly so TestLogMessagesAreSnakeCase reads its message` (`TestLogMessagesAreSnakeCase` passes: it never sees the message) |
 
 - [ ] **Step 6: Commit**
 
@@ -2081,7 +2219,9 @@ The 11 DEBUG lines log-fields never documented share one row, each with
 the meaning its prose carried, and six are named to keep it. One guard
 test pins that no old name is left, that production code emits each new
 one and that log-fields gives it a row; another fails any log message that
-is not snake_case, the 78 prose messages main already logs excepted.
+is not snake_case, the 78 prose messages main already logs excepted; a
+third requires log methods to be called directly, so the second reads
+every message.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -2097,7 +2237,7 @@ Two overview carry-forwards and five deferred items, all on the admin status pag
 - Modify: `internal/observability/ring.go` (`AdoptionEvent.Scheme`); `internal/freshness/freshness.go`, `adoption_failure.go` (the two `Record` calls), `retry.go` (`CheckBackoff`); `internal/admin/server.go` (`Config.CheckBackoff`), `status.go` (`suiteEntry.Anchorless`, `CheckStatus`, `gcInfo.RetiredReaped`, `adoptionEntry.Scheme`, `annotateSuiteEntries`, `adoptionEnabled`, `gcInfoFromSummary`), `status_template.go`, `status_test.go` (B-60), `json_contract_test.go`, `testdata/json_contract_golden.json` (regenerated); `cmd/apt-cacher-ultra/main.go` (wiring)
 
 **Interfaces:**
-- Consumes: admin tests' `newHealthyModel`, `renderHTMLForGolden`, `mustContain`, `formatUnixTimePtrTag`; freshness tests' `newRetryRig`, `retryRig.adopt`, `release`, `ver.panicOn`, `up.set`, `ring`, `hashOf`.
+- Consumes: admin tests' `newHealthyModel`, `renderHTMLForGolden`, `mustContain`, `formatUnixTimePtrTag`, `startAdminServer`, `adminOpt`, `stubKeyringProvider`, `mustGet`; `(*cache.Cache).SeedSuiteForTest`; freshness tests' `newRetryRig`, `retryRig.adopt`, `release`, `ver.panicOn`, `up.set`, `ring`, `hashOf`.
 - Produces: `observability.AdoptionEvent.Scheme string`; `freshness.CheckBackoff(failCount int64) time.Duration`; `admin.Config.CheckBackoff func(failCount int64) time.Duration`; JSON `suites[].anchorless` (bool), `recent_adoptions[].scheme` (string), `gc.retired_reaped` (int); unexported `annotateSuiteEntries(es []suiteEntry, adoptionEnabled bool, checkBackoff func(int64) time.Duration, now int64)`, `(*Server).adoptionEnabled() bool`, `gcInfoFromSummary(gc.LastRunSummary) *gcInfo`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2108,10 +2248,14 @@ Create `internal/admin/status_annotations_test.go`:
 package admin
 
 import (
+	"context"
+	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 )
@@ -2265,6 +2409,55 @@ func TestStatusHTML_ShowsTheSweepsCells(t *testing.T) {
 	m.Suites = nil
 	if html := renderHTMLForGolden(t, m); !strings.Contains(html, "A suite is tracked once a client requests its InRelease through the proxy") {
 		t.Fatal("the Suites empty state does not use the admin-ui-spec's copy")
+	}
+}
+
+// Phase G ruling PG-14 through the server (design note 5; execution review
+// G-4): the status page derives suites[].anchorless from the persisted row
+// and the server's own adoption signal. A never-adopted flat suite whose
+// last check succeeded, with no record and no pending change, reads
+// anchorless: true in the JSON and "refreshed without a Release" in the
+// HTML once adoption is enabled (a keyring provider with a non-nil
+// snapshot), and false without it. TestSuiteEntries_Anchorless calls
+// annotateSuiteEntries directly; this checks that buildStatusModel calls
+// it, with the server's signal.
+func TestStatus_AnchorlessFlatSuiteThroughTheServer(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		t.Run(map[bool]string{true: "adoption enabled", false: "adoption disabled"}[enabled], func(t *testing.T) {
+			var opts []adminOpt
+			if enabled {
+				opts = append(opts, func(cfg *Config) { cfg.Keyring = &stubKeyringProvider{entries: []KeyringEntrySnapshot{}} })
+			}
+			s, base, cleanup := startAdminServer(t, opts...)
+			defer cleanup()
+			ts := int64(1_700_000_000)
+			if err := s.cfg.Cache.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{CanonicalScheme: "https",
+				CanonicalHost: "fury.example", SuitePath: "/org/deb", LastCheckAt: &ts, LastSuccessAt: &ts}); err != nil {
+				t.Fatal(err)
+			}
+			resp := mustGet(t, base+"/?format=json")
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			var got struct {
+				Suites []struct {
+					SuitePath  string `json:"suite_path"`
+					Flat       bool   `json:"flat"`
+					Anchorless bool   `json:"anchorless"`
+				} `json:"suites"`
+			}
+			if err := json.Unmarshal(body, &got); err != nil {
+				t.Fatalf("decode: %v\n%s", err, body)
+			}
+			if len(got.Suites) != 1 || !got.Suites[0].Flat || got.Suites[0].Anchorless != enabled {
+				t.Fatalf("adoption enabled %v: suites %+v, want the flat suite with anchorless %v", enabled, got.Suites, enabled)
+			}
+			hresp := mustGet(t, base+"/")
+			html, _ := io.ReadAll(hresp.Body)
+			_ = hresp.Body.Close()
+			if strings.Contains(string(html), "refreshed without a Release") != enabled {
+				t.Fatalf("adoption enabled %v: the HTML's \"refreshed without a Release\" shown %v", enabled, !enabled)
+			}
+		})
 	}
 }
 ```
@@ -2651,13 +2844,11 @@ old:
 ```html
                 <td data-label="Host" class="host">{{.Host}}</td>
                 <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
-                <td data-label="Outcome">
 ```
 new:
 ```html
                 <td data-label="Host" class="host">{{if .Scheme}}{{.Scheme}}://{{end}}{{.Host}}</td>
                 <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
-                <td data-label="Outcome">
 ```
 
 the GC panel, after Displaced reaped:
@@ -2731,15 +2922,17 @@ Expected: all `ok`.
 
 | Mutant | Fails |
 |---|---|
-| Drop `&& e.InReleaseChangeSeenAtUnixTime == nil` from the derivation | `status_annotations_test.go:46: anchorless true, want false` (subtest `a first adoption under way`) |
-| `e.Anchorless = e.Flat && …` (adoption enabled ignored) | `status_annotations_test.go:46: anchorless true, want false` (subtest `adoption disabled`) |
-| `next := now + int64(…)` (the last check ignored) | `status_annotations_test.go:88: /a: "checks failing ×3 · backoff ends in 3m", want "checks failing ×3 · backoff ends in 2m"` (and `/b`, `/d`, and `:102` for adoption disabled) |
-| `unscheduled` ignores a dormant suite (its never-adopted branch returns false; reviews M-3, sweep M-5) | `status_annotations_test.go:88: /dormant: "checks failing ×2 · backoff over", want "checks failing ×2"` |
-| `unscheduled` ignores a record that paces (`return false && …`) | `status_annotations_test.go:88: /paced: "checks failing ×1 · backoff over", want "checks failing ×1"` |
-| `unscheduled` without its `!adoptionEnabled` guard | `status_annotations_test.go:102: adoption disabled: "checks failing ×2", want the backoff (no dormancy without an adopter)` |
-| `RetiredReaped: summary.RetiredReaped,` dropped from `gcInfoFromSummary` | `status_annotations_test.go:120: gc block {… RetiredReaped:0 …}, want {… RetiredReaped:6 …}` |
+| Drop `&& e.InReleaseChangeSeenAtUnixTime == nil` from the derivation | `status_annotations_test.go:50: anchorless true, want false` (subtest `a first adoption under way`) |
+| `e.Anchorless = e.Flat && …` (adoption enabled ignored) | `status_annotations_test.go:50: anchorless true, want false` (subtest `adoption disabled`) |
+| `next := now + int64(…)` (the last check ignored) | `status_annotations_test.go:92: /a: "checks failing ×3 · backoff ends in 3m", want "checks failing ×3 · backoff ends in 2m"` (and `/b`, `/d`, and `:106` for adoption disabled) |
+| `unscheduled` ignores a dormant suite (its never-adopted branch returns false; reviews M-3, sweep M-5) | `status_annotations_test.go:92: /dormant: "checks failing ×2 · backoff over", want "checks failing ×2"` |
+| `unscheduled` ignores a record that paces (`return false && …`) | `status_annotations_test.go:92: /paced: "checks failing ×1 · backoff over", want "checks failing ×1"` |
+| `unscheduled` without its `!adoptionEnabled` guard | `status_annotations_test.go:106: adoption disabled: "checks failing ×2", want the backoff (no dormancy without an adopter)` |
+| `RetiredReaped: summary.RetiredReaped,` dropped from `gcInfoFromSummary` | `status_annotations_test.go:124: gc block {… RetiredReaped:0 …}, want {… RetiredReaped:6 …}` |
 | `Scheme:` dropped from `recoverAdoption`'s `Record` | `adoption_ring_test.go:18: event {Scheme: … Outcome:panicked …}: scheme "", want http` |
-| The adoptions table's Host cell without the scheme | `status_annotations_test.go:149: rendered HTML missing "<td data-label=\"Host\" class=\"host\">http://archive.ubuntu.com</td>"` |
+| The adoptions table's Host cell without the scheme | `status_annotations_test.go:153: rendered HTML missing "<td data-label=\"Host\" class=\"host\">http://archive.ubuntu.com</td>"` |
+| `buildStatusModel` without its `annotateSuiteEntries` call (execution review G-4) | `status_annotations_test.go:205: adoption enabled true: suites [{SuitePath:/org/deb Flat:true Anchorless:false}], want the flat suite with anchorless true` |
+| `annotateSuiteEntries` called with adoption disabled (`false` for `s.adoptionEnabled()`; G-4) | the same line |
 
 - [ ] **Step 9: Commit**
 
@@ -2751,15 +2944,16 @@ Status page: retired_reaped, the anchorless refresh, failing checks
 
 The gc block copies retired_reaped (the F carry-forward); suites[] gains
 the derived anchorless field and the Adoption cell says "refreshed
-without a Release" (the G carry-forward, ruling PG-14); a suite whose
-checks keep failing says so and when its backoff ends, the count alone
-for a dormant or record-paced suite the backoff does not schedule (B-63,
-reviews M-3 and M-5, through admin.Config.CheckBackoff =
-freshness.CheckBackoff); the
-table gains a Last requested column (F-14); Recent adoption outcomes show
-scheme://host from the ring's new Scheme (F-19); the Suites empty state
-uses the admin-ui-spec's words (D-50); a contradicting fixture is fixed
-(B-60). Every JSON change is additive; the golden is regenerated.
+without a Release" (the G carry-forward, ruling PG-14), with the
+server's own adoption signal (a test goes through the server); a suite
+whose checks keep failing says so and when its backoff ends, the count
+alone for a dormant or record-paced suite the backoff does not schedule
+(B-63, reviews M-3 and M-5, through admin.Config.CheckBackoff =
+freshness.CheckBackoff); the table gains a Last requested column (F-14);
+Recent adoption outcomes show scheme://host from the ring's new Scheme
+(F-19); the Suites empty state uses the admin-ui-spec's words (D-50); a
+contradicting fixture is fixed (B-60). Every JSON change is additive;
+the golden is regenerated.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -2772,10 +2966,10 @@ Phase F's deferred admin items, which G-1 (2026-10-24) left: `/forget` and `/rec
 
 **Files:**
 - Create: `internal/admin/endpoint_form_test.go`, `internal/freshness/forget_refusal_test.go`
-- Modify: `internal/admin/handlers.go` (`suiteForm`, `parseSuiteForm`, `handleReconcile`, `handleForget`, `requireMutationGuard`'s bodies), `internal/admin/server.go` (`OPTIONS`), `internal/admin/forget_test.go` (`TestEndpoint_Forget_LogsAcceptedRequestsAndFailures`: `canonical_scheme`), `internal/freshness/forget.go` (`notForgotten`)
+- Modify: `internal/admin/handlers.go` (`suiteForm`, `parseSuiteForm`, `handleReconcile`, `handleForget`, `requireMutationGuard`'s bodies), `internal/admin/server.go` (`OPTIONS`), `internal/admin/forget_test.go` (`TestEndpoint_Forget_LogsAcceptedRequestsAndFailures`: `canonical_scheme`; a new test at its end), `internal/freshness/forget.go` (`notForgotten`)
 
 **Interfaces:**
-- Consumes: admin tests' `guardedEndpoints`, `postForm`, `startAdminServer`, `withReconciler`, `withForgetter`, `withLogger`, `stubReconciler`, `stubForgetter`, `lockedBuffer`; freshness tests' `newReaperRig`, `reaperRig.seed`, `reaperRig.events`, `reapKey`, `reapNow`, `Checker.lockLoadedHook`.
+- Consumes: admin tests' `guardedEndpoints`, `postForm`, `startAdminServer`, `withReconciler`, `withForgetter`, `withLogger`, `stubReconciler`, `stubForgetter`, `newBlockingForgetter`, `lockedBuffer`; freshness tests' `newReaperRig`, `reaperRig.seed`, `reaperRig.events`, `reapKey`, `reapNow`, `Checker.lockLoadedHook`.
 - Produces: unexported `suiteForm{scheme, host, suite string}`, `parseSuiteForm(w, r) (suiteForm, bool)`, `(*Reaper).notForgotten(key cache.SuiteKey, reason string)`; the DEBUG event `suite_not_forgotten`; `canonical_scheme` on `admin_forget_requested`, `admin_forget_failed` and (beside `scheme`) `admin_reconcile_requested`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2930,6 +3124,35 @@ func TestParseSuiteForm(t *testing.T) {
 		t.Fatalf("parseSuiteForm = %+v, %v; want https h /s", f, ok)
 	}
 }
+
+// Deferred minor F-6's OPTIONS under G-1's mutation guard (execution
+// review G-5): OPTIONS answers Allow and nothing more, never a CORS grant.
+// An Access-Control-Allow-* header on a mutating endpoint's preflight
+// would let a page on another origin send the X-ACU-Admin header the
+// guard relies on.
+func TestOptions_GrantsNoCORS(t *testing.T) {
+	_, base, cleanup := startAdminServer(t, withReconciler(&stubReconciler{result: true}), withForgetter(&stubForgetter{}))
+	defer cleanup()
+	for _, path := range []string{"/forget", "/reconcile", "/", "/metrics"} {
+		req, err := http.NewRequest(http.MethodOptions, base+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Origin", "https://evil.example")
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		req.Header.Set("Access-Control-Request-Headers", "X-ACU-Admin")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		for name := range resp.Header {
+			if strings.HasPrefix(http.CanonicalHeaderKey(name), "Access-Control-Allow") {
+				t.Errorf("OPTIONS %s answered %s: %q; want no CORS grant", path, name, resp.Header.Get(name))
+			}
+		}
+	}
+}
 ```
 
 Create `internal/freshness/forget_refusal_test.go`:
@@ -3012,6 +3235,60 @@ new:
 ```go
 			if len(failed) != 1 || failed[0]["level"] != "WARN" || failed[0]["err"] != "disk I/O error" ||
 				failed[0]["canonical_scheme"] != scheme || failed[0]["canonical_host"] != "h" || failed[0]["suite_path"] != "/s" {
+```
+
+At the end of `internal/admin/forget_test.go`, the shutdown path's DEBUG line (the same key):
+
+```go
+// Deferred minor F-16 on the shutdown path (execution review G-6): the
+// DEBUG admin_forget_failed line a shutdown leaves names the scheme
+// canonical_scheme, as the WARN does, and carries no scheme key.
+// TestEndpoint_Forget_ShutdownCutsItShort pins only the line's level,
+// TestEndpoint_Forget_LogsAcceptedRequestsAndFailures only the WARN's
+// fields.
+func TestEndpoint_Forget_ShutdownLineNamesTheCanonicalScheme(t *testing.T) {
+	stub := newBlockingForgetter()
+	var buf lockedBuffer
+	s, base, cleanup := startAdminServer(t, withForgetter(stub),
+		withLogger(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+	defer cleanup()
+	defer stub.unblock()
+	answered := make(chan error, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, base+"/forget", strings.NewReader("scheme=http&host=h&suite=/s"))
+		if err != nil {
+			answered <- err
+			return
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("X-ACU-Admin", "1")
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		answered <- err
+	}()
+	<-stub.entered
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if err := <-answered; err != nil {
+		t.Fatalf("the forget request: %v", err)
+	}
+	var lines []map[string]any
+	for _, line := range strings.Split(buf.String(), "\n") {
+		var m map[string]any
+		if line != "" && json.Unmarshal([]byte(line), &m) == nil && m["msg"] == "admin_forget_failed" {
+			lines = append(lines, m)
+		}
+	}
+	if len(lines) != 1 || lines[0]["level"] != "DEBUG" || lines[0]["canonical_scheme"] != "http" || lines[0]["scheme"] != nil ||
+		lines[0]["canonical_host"] != "h" || lines[0]["suite_path"] != "/s" {
+		t.Fatalf("admin_forget_failed lines %v; want one DEBUG line with canonical_scheme http and no scheme key", lines)
+	}
+}
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -3271,6 +3548,8 @@ Expected: all `ok`.
 | `"forget not available\n"` restored | `endpoint_form_test.go:107: /forget 501: body "forget not available\n\n", want exactly one trailing newline` |
 | `admin_reconcile_requested` without `canonical_scheme` | `endpoint_form_test.go:130: admin_reconcile_requested map[… scheme:http …], want scheme and canonical_scheme http` |
 | `r.notForgotten(key, "no_suite")` for the busy return | `forget_refusal_test.go:42: line map[… reason:no_suite suite_path:/r/dists/busy …], want DEBUG with the reason "busy"` |
+| `OPTIONS` also answers `Access-Control-Allow-Origin: *` and `Access-Control-Allow-Methods: POST` (execution review G-5) | `endpoint_form_test.go:172: OPTIONS /forget answered Access-Control-Allow-Methods: "POST"; want no CORS grant` (each header, on each of the four paths) |
+| The shutdown's DEBUG `admin_forget_failed` keys `scheme` again (G-6) | `forget_test.go:489: admin_forget_failed lines [map[… level:DEBUG msg:admin_forget_failed scheme:http …]]; want one DEBUG line with canonical_scheme http and no scheme key` |
 
 - [ ] **Step 8: Commit**
 
@@ -3287,7 +3566,8 @@ OPTIONS /reconcile names POST and every error body ends in one newline
 admin_reconcile_requested, on main with scheme, gains it beside that
 (F-16); a forget that deletes nothing logs suite_not_forgotten at DEBUG
 with no_suite, busy or changed (F-15). The HTTP answers still tell busy
-from unknown apart nowhere.
+from unknown apart nowhere. Tests also pin that OPTIONS grants no CORS
+and that the shutdown's DEBUG forget line names canonical_scheme.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -3303,7 +3583,7 @@ Phase F's operability items for the reaper and two robustness ones: a completed 
 - Modify: `internal/freshness/reaper.go` (`runOnce`, `sweepMarkers`, `deferredByForwardStep`, `reapCandidate.evidence`, `reapSuite`'s line, `junkCandidates`, `suiteJunk`, new `rowPaths`, `sortCandidates`' AIDEV-NOTE), `metrics.go` (`reaperLastRunUnixtime`, the counter's HELP, the inventory), `suite_lock.go` (`HoldSuite`'s release), `freshness.go` (`Checker.holdPurgeHook`), `clockstep.go`, `unsigned.go` (F-7)
 
 **Interfaces:**
-- Consumes: freshness tests' `newReaperRig`, `reaperRig.seed`, `mark`, `junkSuite`, `cacheAnchor`, `events`, `exists`, `reapNow`, `reapDay`, `softPage`, `renderedMetric`; the event `suite_reaper_marker_sweep_failed` (Task 3).
+- Consumes: freshness tests' `newReaperRig`, `reaperRig.seed`, `mark`, `junkSuite`, `cacheAnchor`, `events`, `exists`, `reapNow`, `reapDay`, `softPage`, `renderedMetric`, `reapKey`, `Reaper.reapHook`; the event `suite_reaper_marker_sweep_failed` (Task 3).
 - Produces: the event `suite_reaper_run_complete`; the gauge `acu_suite_reaper_last_run_unixtime`; `suite_reaped`'s `last_requested_unixtime` and `evidence`; `(*Reaper).sweepMarkers(ctx, now, fresh time.Time) int` (it returned nothing); `(*Reaper).suiteJunk(…) (bool, []string, error)`; unexported `rowPaths(junk bool, sets ...[]cache.SuiteAnchorRow) []string`; the tests-only `Checker.holdPurgeHook func()`; test helper `gaugeValue(t, name) float64`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -3438,12 +3718,83 @@ func TestHoldSuite_APanickingPurgeStillUnlocks(t *testing.T) {
 	}
 	again(false)
 }
+
+// Deferred minor F-13 (design note 7; execution review G-7): a run that a
+// shutdown cuts short after its listing — here while it holds its one
+// candidate — is not a completed run: no suite_reaper_run_complete line,
+// and the liveness gauge keeps its old value.
+// TestReaper_ACompletedRunLogsItsLineAndSetsTheGauge cancels before the
+// listing, so it never reaches runOnce's final check.
+func TestReaper_ARunCutShortAfterItsListingIsNotComplete(t *testing.T) {
+	r := newReaperRig(t)
+	r.seed("/r/dists/old", reapNow-32*reapDay)
+	reaperLastRunUnixtime.Set(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.reaper.reapHook = func(context.Context, cache.SuiteKey) { cancel() } // the shutdown comes mid-run
+	r.reaper.runOnce(ctx)
+	if runs := r.events("suite_reaper_run_complete"); len(runs) != 0 {
+		t.Fatalf("run lines %v after a run a shutdown cut short, want none", runs)
+	}
+	if got := gaugeValue(t, "acu_suite_reaper_last_run_unixtime"); got != 1 {
+		t.Fatalf("last run gauge %v after a run a shutdown cut short, want it untouched", got)
+	}
+}
+
+// Deferred minor F-13 (execution review G-7): tried counts every candidate
+// the run tried, reaped or not — here one its hold found busy (another
+// deleter holds the suite).
+func TestReaper_RunLineCountsABusyCandidateAsTried(t *testing.T) {
+	r := newReaperRig(t)
+	r.seed("/r/dists/old", reapNow-32*reapDay)
+	release, ok := r.checker.HoldSuite(reapKey("/r/dists/old"))
+	if !ok {
+		t.Fatal("premise: the suite is held")
+	}
+	r.reaper.runOnce(context.Background())
+	release(false)
+	runs := r.events("suite_reaper_run_complete")
+	if len(runs) != 1 || runs[0]["tried"] != float64(1) || runs[0]["reaped"] != float64(0) || !r.exists("/r/dists/old") {
+		t.Fatalf("run lines %v, old kept %v; want tried 1, reaped 0 (the busy suite kept)", runs, r.exists("/r/dists/old"))
+	}
+}
+
+// Deferred minor F-18 for a flat suite (execution review G-7): a junk
+// verdict reached through the combined rule (no anchors, every root index
+// junk, no signed evidence) names the index rows it judged as its
+// evidence.
+func TestReaper_AFlatJunkSuiteNamesItsIndexesAsEvidence(t *testing.T) {
+	r := newReaperRig(t)
+	old := reapNow - 2*reapDay
+	r.junkSuite("/junk")
+	r.cacheAnchor("/junk", "Packages.gz", softPage, old)
+	r.cacheAnchor("/junk", "Sources", softPage, old)
+	r.reaper.runOnce(context.Background())
+	var line map[string]any
+	for _, m := range r.events("suite_reaped") {
+		if m["suite_path"] == "/junk" {
+			line = m
+		}
+	}
+	if line == nil || line["reason"] != "junk" {
+		t.Fatalf("suite_reaped lines %v, want /junk reaped as junk", r.events("suite_reaped"))
+	}
+	ev, _ := line["evidence"].([]any)
+	got := map[string]bool{}
+	for _, p := range ev {
+		s, _ := p.(string)
+		got[s] = true
+	}
+	if want := map[string]bool{"/junk/Packages.gz": true, "/junk/Sources": true}; len(ev) != 2 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("evidence %v, want the two index rows, each once", line["evidence"])
+	}
+}
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `go test -gcflags=-e -count=1 -run 'TestReaper_ACompletedRun|TestReaper_SuiteReapedNames|TestHoldSuite_APanicking' ./internal/freshness/`
-Expected: build failure naming `undefined: reaperLastRunUnixtime` (reaper_signal_test.go:36, :47) and `r.checker.holdPurgeHook undefined (type *Checker has no field or method holdPurgeHook)` (:111, :117).
+Expected: build failure naming `undefined: reaperLastRunUnixtime` (reaper_signal_test.go:37, :48, :138) and `r.checker.holdPurgeHook undefined (type *Checker has no field or method holdPurgeHook)` (:112, :118).
 
 - [ ] **Step 3: The run's line and gauge, the forward step counted (`internal/freshness/reaper.go`, `metrics.go`)**
 
@@ -3670,7 +4021,20 @@ func rowPaths(junk bool, sets ...[]cache.SuiteAnchorRow) []string {
 }
 ```
 
-and its doc gains, after `(ruling PG-7, amending R-G2)`: `, and, for a junk verdict, the paths of the` / `// rows it judged (suite_reaped's evidence: deferred minor F-18).`
+and its doc's first paragraph names them:
+
+old:
+```go
+// (ruling PG-7, amending R-G2). The anchors-alone verdict and the combined
+// one are reached first; the signed-evidence read (signedEvidence:
+```
+new:
+```go
+// (ruling PG-7, amending R-G2), and, for a junk verdict, the paths of the
+// rows it judged (suite_reaped's evidence: deferred minor F-18). The
+// anchors-alone verdict and the combined one are reached first; the
+// signed-evidence read (signedEvidence:
+```
 
 - [ ] **Step 5: The hold's unlock, the AIDEV-NOTE, the history comments**
 
@@ -3743,11 +4107,14 @@ Expected: `ok`. Simulations this task touches through the reaper (`TestDoD_Ninet
 
 | Mutant | Fails |
 |---|---|
-| `reaperLastRunUnixtime.Set(…)` removed | `reaper_signal_test.go:44: last run gauge 1, want 1800000000` |
-| `clockStepsTotal.Inc()` removed from `deferredByForwardStep` | `reaper_signal_test.go:71: acu_clock_steps_detected_total grew by 0 at the forward step, want 1` |
-| The idle `last_requested_unixtime` attribute removed | `reaper_signal_test.go:92: idle line map[… reason:idle …], want last_requested_unixtime 1797235200 and no evidence` |
-| `HoldSuite`'s release back to `Purge` then `unlockDropped`, no `defer` | `reaper_signal_test.go:123: the suite's mutex leaked: a later hold was refused` |
-| `evidence` joined by spaces again (`strings.Join(c.evidence, " ")`; review M-7) | `reaper_signal_test.go:97: junk line map[… evidence:/r/dists/junk/InRelease /r/dists/junk/Release …], want the two anchors as evidence` |
+| `reaperLastRunUnixtime.Set(…)` removed | `reaper_signal_test.go:45: last run gauge 1, want 1800000000` |
+| `clockStepsTotal.Inc()` removed from `deferredByForwardStep` | `reaper_signal_test.go:72: acu_clock_steps_detected_total grew by 0 at the forward step, want 1` |
+| The idle `last_requested_unixtime` attribute removed | `reaper_signal_test.go:93: idle line map[… reason:idle …], want last_requested_unixtime 1797235200 and no evidence` |
+| `HoldSuite`'s release back to `Purge` then `unlockDropped`, no `defer` | `reaper_signal_test.go:124: the suite's mutex leaked: a later hold was refused` |
+| `evidence` joined by spaces again (`strings.Join(c.evidence, " ")`; review M-7) | `reaper_signal_test.go:97: junk line map[… evidence:/r/dists/junk/InRelease /r/dists/junk/Release …], want the two anchors as evidence`, and `:196: evidence /junk/Packages.gz /junk/Sources, want the two index rows, each once` |
+| `runOnce` without its `ctx.Err()` check before the line and the gauge (execution review G-7) | `reaper_signal_test.go:144: run lines [map[… msg:suite_reaper_run_complete reaped:0 … tried:1]] after a run a shutdown cut short, want none` |
+| the combined verdict's evidence without the index rows (`rowPaths(combined, anchors)`; G-7) | `reaper_signal_test.go:196: evidence <nil>, want the two index rows, each once` |
+| `tried` counted only for a reaped candidate (G-7) | `reaper_signal_test.go:165: run lines [map[… reaped:0 … tried:0]], old kept true; want tried 1, reaped 0 (the busy suite kept)` |
 
 - [ ] **Step 8: Commit**
 
@@ -3761,10 +4128,12 @@ A completed reaper run logs suite_reaper_run_complete and sets
 acu_suite_reaper_last_run_unixtime, so a reaper that stops is visible
 (F-13); the forward-step report counts in acu_clock_steps_detected_total
 (F-17); suite_reaped names an idle reap's stamp and a junk reap's rows,
-a list since a path may hold a space (F-18, review M-7); a panicking flip-gate purge no longer leaks a suite's mutex: the
-unlock is deferred (F-25); sortCandidates' AIDEV-NOTE is exact about
-legacy snapshots (F-26); two history-only comments lose the history
-(F-7).
+a list since a path may hold a space (F-18, review M-7); a panicking
+flip-gate purge no longer leaks a suite's mutex: the unlock is deferred
+(F-25); sortCandidates' AIDEV-NOTE is exact about legacy snapshots
+(F-26); two history-only comments lose the history (F-7). Tests pin a
+run a shutdown cuts short, a busy candidate counted as tried and a flat
+junk suite's index evidence.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -3780,7 +4149,7 @@ Sub-job C (phase F) runs in GC's goroutine, which recovers no panic (F-21, desig
 - Modify: `internal/gc/gc.go` (`GC.store`, `New`, `StartupPass`, `Run`, new `periodicTick`, `skipPanickedPass`, `gcStore`, `gcPanicStacks`, `recoverPanic`, `recoverPanicInto`, `logGCPanic`, `runTick`'s two counts), `internal/gc/snapshot.go` (`snapshotPassResult.batch`, `g.store`), `internal/gc/pool_scan.go` (rewritten: `scanCounters`, `scanPoolFile`, the producer's recover), `internal/cache/gc.go` (`effectiveChunkRows`)
 
 **Interfaces:**
-- Consumes: gc tests' `captureLogger`, `openTestCache`, `writePoolFile`.
+- Consumes: gc tests' `captureLogger`, `openTestCache`, `writePoolFile`; the pass constants `urlPathPass`, `snapshotPass`, `blobPass`.
 - Produces: unexported `gcStore` interface (`RunSnapshotGCBatch`, `RunRetiredSnapshotGCChunk`, `HashKnown`), `GC.store`, `(*GC).StartupPass(ctx) (err error)` (a panic as an error), `(*GC).periodicTick(ctx)`, `(*GC).skipPanickedPass(passesDone *bool)`, `(*GC).recoverPanic(where string)`, `(*GC).recoverPanicInto(where string, err *error)`, `(*GC).logGCPanic(where string, v any)` (named so: `reportPanic` is a forwarding helper's name in Task 3's `logSinks`, and the guard would read this one's `where` as a message), `(*GC).scanPoolFile(ctx, poolRoot, prefix, name string, counts *scanCounters)`, `scanCounters`; `cache.effectiveChunkRows(maxRows int) int`; the ERROR event `gc_panicked` (`where`: `tick`, `startup`, `pool_scan_worker`, `pool_scan_producer`; `panic`, `stack`).
 
 - [ ] **Step 1: Write the failing tests**
@@ -4084,6 +4453,68 @@ func TestPoolScan_AProducerPanicEndsTheScan(t *testing.T) {
 		t.Fatalf("gc_panicked lines %v, want one, where=pool_scan_producer", ev)
 	}
 }
+
+// slowBatchStore is fakeStore whose snapshot batches (A ∪ B, drained) each
+// take batchSleep.
+type slowBatchStore struct {
+	*fakeStore
+	batchSleep time.Duration
+}
+
+func (s slowBatchStore) RunSnapshotGCBatch(ctx context.Context, n int, g int64, k int) (cache.SnapshotGCBatchResult, error) {
+	time.Sleep(s.batchSleep)
+	return s.fakeStore.RunSnapshotGCBatch(ctx, n, g, k)
+}
+
+// Deferred minor F-1 (execution review G-8): sub-job C checks the tick's
+// deadline before each chunk, the first included: when A ∪ B's last batch
+// already ran past the deadline, C deletes nothing this tick and reports
+// the deadline (the next tick resumes it). A check after each chunk would
+// always run one chunk past the deadline — 10,000 rows, seconds of the
+// writer, after max_tick_duration.
+func TestSnapshotPass_SubJobCChecksTheDeadlineBeforeItsFirstChunk(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logger, _ := captureLogger()
+		f := &fakeStore{chunksMore: 100}
+		g, _ := storeGC(t, slowBatchStore{fakeStore: f, batchSleep: 2 * time.Minute}, 2, logger)
+		_, expired, err := g.runSnapshotPass(context.Background(), time.Now().Add(time.Minute), "periodic")
+		if err != nil || !expired {
+			t.Fatalf("expired %v, %v; want the deadline reported", expired, err)
+		}
+		if len(f.chunkRows) != 0 {
+			t.Fatalf("%d sub-job C chunks after the deadline had passed, want none", len(f.chunkRows))
+		}
+	})
+}
+
+// Review M-1 of the H1 plan, every pass (execution review G-8): a tick
+// that panicked moves the rotation past the pass in progress — url-path
+// to snapshot, snapshot to blob, blob back to url-path — and a tick whose
+// passes finished leaves runTick's own rotation as it is.
+// TestPeriodicTick_APanickingPassDoesNotStarveTheNext reaches only the
+// snapshot pass's panic (the url-path pass is off in its rig and the blob
+// pass is not behind the seam).
+func TestSkipPanickedPass_MovesPastEachPass(t *testing.T) {
+	g := &GC{}
+	for _, tc := range []struct{ at, want pass }{
+		{urlPathPass, snapshotPass},
+		{snapshotPass, blobPass},
+		{blobPass, urlPathPass},
+	} {
+		g.nextPass = tc.at
+		passesDone := false
+		g.skipPanickedPass(&passesDone)
+		if g.nextPass != tc.want {
+			t.Errorf("a panic in pass %d: the rotation is at %d, want %d", tc.at, g.nextPass, tc.want)
+		}
+		g.nextPass = tc.at
+		passesDone = true
+		g.skipPanickedPass(&passesDone)
+		if g.nextPass != tc.at {
+			t.Errorf("a finished tick at pass %d: the rotation moved to %d", tc.at, g.nextPass)
+		}
+	}
+}
 ```
 
 Create `internal/cache/retired_chunk_test.go`:
@@ -4110,7 +4541,7 @@ func TestEffectiveChunkRows(t *testing.T) {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `go test -gcflags=-e -count=1 ./internal/gc/`
-Expected: build failure naming `undefined: gcStore` (gc_store_test.go:69) and `g.store undefined (type *GC has no field or method store)` (:78).
+Expected: build failure naming `undefined: gcStore` (gc_store_test.go:69), `g.store undefined (type *GC has no field or method store)` (:78), `g.periodicTick undefined` (:180, :184, :191) and `g.skipPanickedPass undefined` (:347, :353).
 
 Run: `go test -gcflags=-e -count=1 -run TestEffectiveChunkRows ./internal/cache/`
 Expected: build failure naming `undefined: effectiveChunkRows`.
@@ -4219,7 +4650,7 @@ new:
 		}
 ```
 
-and the case's former body — every line from `start := time.Now()` through the `g.recordLastRun(LastRunSummary{…})` call, unchanged, one tab less indented — moves into a new method after `Run`; the line, the metrics and the last-run summary stay inside it, so a tick that panicked leaves `acu_gc_last_run_unixtime` as it was:
+and the case's former body — every line from `start := time.Now()` through the `g.recordLastRun(LastRunSummary{…})` call, unchanged, two tabs less indented — moves into a new method after `Run`; the line, the metrics and the last-run summary stay inside it, so a tick that panicked leaves `acu_gc_last_run_unixtime` as it was:
 
 ```go
 // periodicTick is one periodic tick: the passes (runTick), its
@@ -4615,14 +5046,16 @@ Expected: all `ok`.
 |---|---|
 | `effectiveChunkRows` returns `1 << 30` for 0 or less (C22) | `retired_chunk_test.go:13: effectiveChunkRows(0) = 1073741824, want 10000` |
 | The pass asks `RunRetiredSnapshotGCChunk(ctx, 1<<30)` (C23) | `gc_store_test.go:107: chunk calls asked for [1073741824 1073741824 1073741824] rows, want [0 0 0]` |
-| Sub-job C's `if expired()` check removed (F-1) | `gc_store_test.go:122: expired false, <nil>, 101 chunks; want the deadline after 2 chunks` |
+| Sub-job C's `if expired()` check removed (F-1) | `gc_store_test.go:122: expired false, <nil>, 101 chunks; want the deadline after 2 chunks` and `:323: expired false, <nil>; want the deadline reported` |
 | `defer g.recoverPanic("tick")` removed | the test binary panics: `panic: snapshot batch bug` from `TestRun_RecoversATickPanicAndRunsTheNextTick` |
 | `defer g.recoverPanic("pool_scan_worker")` removed | the test binary panics: `panic: hash lookup bug` from `TestPoolScan_AWorkerPanicNeverStallsTheScan` |
 | `defer g.recoverPanicInto("startup", &err)` removed (review I-1) | the test binary panics: `panic: snapshot batch bug [recovered, repanicked]` from `TestStartupPass_ReturnsAPanicAsAnError` |
 | `recoverPanicInto` sets no error (`*err = …` dropped) | `gc_store_test.go:208: StartupPass = <nil>, want the panic as an error` |
-| `StartupPass` without its `defer g.skipPanickedPass(&passesDone)` (re-review m-4), or without `passesDone = false` before `runTick` | `gc_store_test.go:217: after a startup panic in the snapshot pass the rotation is at pass 1, want the blob pass (2)` |
-| `defer g.skipPanickedPass(&passesDone)` removed (review M-1) | `gc_store_test.go:182: after a snapshot-pass panic the rotation is at pass 1, want the blob pass (2)` |
+| `StartupPass` without `passesDone = false` before `runTick` (re-review m-4; removing its `defer g.skipPanickedPass(&passesDone)` instead leaves `passesDone` unused and does not compile) | `gc_store_test.go:217: after a startup panic in the snapshot pass the rotation is at pass 1, want the blob pass (2)` |
+| `skipPanickedPass` never moves the rotation (`if *passesDone {` becomes `if true || *passesDone {`; removing the `defer` instead leaves `passesDone` unused and does not compile) (review M-1) | `gc_store_test.go:182: after a snapshot-pass panic the rotation is at pass 1, want the blob pass (2)`, `:217` (the same, after the startup pass) and `:349: a panic in pass 0: the rotation is at 0, want 1` (one line per pass) |
 | `passesDone = true` removed (every tick skips a pass) | `gc_store_test.go:186: after the blob pass the rotation is at pass 1, want the url-path pass (0)` |
+| Sub-job C checks the deadline after each chunk, not before (execution review G-8) | `gc_store_test.go:326: 1 sub-job C chunks after the deadline had passed, want none` |
+| a panicking blob pass rotates to the snapshot pass (`skipPanickedPass`'s `default:` sets `snapshotPass`; G-8) | `gc_store_test.go:349: a panic in pass 2: the rotation is at 1, want 0` |
 
 - [ ] **Step 7: Commit**
 
@@ -4639,12 +5072,13 @@ moves the pass rotation past the pass that panicked, so the passes after
 it still run (review M-1), and the startup pass, which runs on main's
 goroutine before any listener, returns its panic as an error that main
 logs before it serves, instead of crash-looping at every start (review
-I-1), and moves the rotation past the pass that panicked (re-review m-4). Through a narrow
-gcStore seam, tests pin that sub-job C stops at the tick's deadline (F-1)
-and asks the cache for its own 10,000-row chunk, and the cache's default
-is a pure function with its own test (F-2: mutants C22 and C23). The
-pass's result names its batch counts instead of embedding a type whose
-Total() left out the retired reaps (F-3).
+I-1), and moves the rotation past the pass that panicked (re-review
+m-4). Through a narrow gcStore seam, tests pin that sub-job C stops at
+the tick's deadline, checked before each chunk, the first included
+(F-1), and asks the cache for its own 10,000-row chunk, and the cache's
+default is a pure function with its own test (F-2: mutants C22 and
+C23). The pass's result names its batch counts instead of embedding a
+type whose Total() left out the retired reaps (F-3).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -4970,7 +5404,7 @@ func TestAnchorAbsent_AnchorRowReadFailure(t *testing.T) {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `go test -gcflags=-e -count=1 -run 'TestCheck_UsesDetachedSnapshot' ./internal/freshness/`
-Expected: build failure naming `tc.gate.holds undefined (type retryGate has no field or method holds)` (check_path_test.go:76) and `undefined: signedForm` (:176). E-21, E-27 and E-28 are pins of behaviour that holds: they pass once the package builds, and Step 6's mutants are their red.
+Expected: build failure naming `tc.gate.holds undefined (type retryGate has no field or method holds)` (check_path_test.go:75) and `undefined: signedForm` (:175). E-21, E-27 and E-28 are pins of behaviour that holds: they pass once the package builds, and Step 6's mutants are their red.
 
 - [ ] **Step 3: One hold predicate, one signed predicate (E-32, E-31)**
 
@@ -5131,18 +5565,18 @@ Expected: all `ok`.
 
 | Mutant | Fails |
 |---|---|
-| `baseline` ignores the snapshot hash for `Release` (`… h != nil && name != "Release"`) (E-21) | `check_path_test.go:51: result "changed", want unchanged …` |
-| `holds` drops `!g.due` (E-32) | `check_path_test.go:77: due: holds = true, want false` |
-| `probe` passes `conditional = true` (E-27, C3) | `check_path_test.go:96: probe = present (status 304, err <nil>), want unknown …` |
-| `upgradeProbe` sets `req.crossForm = false` (E-28, X3) | `check_path_test.go:125: record validators "e-…" / "<nil>", want none` |
-| `anchorFoundAgain` sets `req.crossForm = false` (E-28, X2) | `check_path_test.go:139: record validators "e-…" / "<nil>", want none` |
-| the `paced_stale` field removed (E-30) | `check_path_test.go:165: stale WARNs [map[adopted_stale:1 …]], want one with adopted_stale 1 and paced_stale 1` |
-| `signedForm` returns `form != cache.FormUnsigned` (E-31) | `check_path_test.go:177: signedForm("") = true, want false` |
-| `Reconcile`'s failed read logged at DEBUG (E-31) | `check_path_test.go:204: WARN records [], want one …` |
-| `Reconcile` counts a failed read as signed (E-31) | `check_path_test.go:198: a reconcile whose snapshot could not be read took the reserved slot` |
-| the future-`last_success_at` report put back above the cooldown gate (E-37) | `check_path_test.go:230: a check inside the cooldown counted 1 clock steps, want 0` |
-| `anchorAbsent`'s WARN without `canonical_scheme` (GD-6) | `check_path_test.go:297: WARN records [map[canonical_host:h …]], want one naming the scheme …` |
-| `anchorAbsent` logs the read failure without `endedByShutdown` (GD-6) | `check_path_test.go:291: WARNs [map[… canonical_scheme:http …]], shutdown lines []; want no WARN and one DEBUG for the read` |
+| `baseline` ignores the snapshot hash for `Release` (`… h != nil && name != "Release"`) (E-21) | `check_path_test.go:50: result "changed", want unchanged …` |
+| `holds` drops `!g.due` (E-32) | `check_path_test.go:76: due: holds = true, want false` |
+| `probe` passes `conditional = true` (E-27, C3) | `check_path_test.go:95: probe = present (status 304, err <nil>), want unknown …` |
+| `upgradeProbe` sets `req.crossForm = false` (E-28, X3) | `check_path_test.go:124: record validators "e-…" / "<nil>", want none` |
+| `anchorFoundAgain` sets `req.crossForm = false` (E-28, X2) | `check_path_test.go:138: record validators "e-…" / "<nil>", want none` |
+| the `paced_stale` field removed (E-30) | `check_path_test.go:164: stale WARNs [map[adopted_stale:1 …]], want one with adopted_stale 1 and paced_stale 1` |
+| `signedForm` returns `form != cache.FormUnsigned` (E-31) | `check_path_test.go:176: signedForm("") = true, want false` |
+| `Reconcile`'s failed read logged at DEBUG (E-31) | `check_path_test.go:203: WARN records [], want one …` |
+| `Reconcile` counts a failed read as signed (E-31) | `check_path_test.go:197: a reconcile whose snapshot could not be read took the reserved slot` |
+| the future-`last_success_at` report put back above the cooldown gate (E-37) | `check_path_test.go:226: a check inside the cooldown counted 1 clock steps, want 0` |
+| `anchorAbsent`'s WARN without `canonical_scheme` (GD-6) | `check_path_test.go:293: WARN records [map[canonical_host:h …]], want one naming the scheme …` |
+| `anchorAbsent` logs the read failure without `endedByShutdown` (GD-6) | `check_path_test.go:287: WARNs [map[… canonical_scheme:http …]], shutdown lines []; want no WARN and one DEBUG for the read` |
 
 - [ ] **Step 7: Commit**
 
@@ -5604,10 +6038,10 @@ Expected: `ok`. `TestRun_AnOfferWhoseWakeWasSpentIsReofferedAtOnce` is a synctes
 
 | Mutant | Fails |
 |---|---|
-| `Run` passes `q.finish(d, d.item.gen)` (E-38) | `scheduler_wiring_test.go:82: 2 anchor GETs (slot taken true), want 3: …` |
-| `refreshSigned` never demotes (`… = h.waiting[i].signed \|\| signed[…]`) (E-39) | `scheduler_wiring_test.go:118: after the tick: offered {… signed:true …} to the reserved slot, want the waiter demoted to unsigned` |
-| the restart offset `+ 1` (B-27, lower bound) | `scheduler_wiring_test.go:136: rand 0: next retry = 1800000001, want now + 0` |
-| the restart offset over `spread+1` (B-27, upper bound) | `scheduler_wiring_test.go:136: rand 0.999: next retry = 1800000900, want now + 899` |
+| `Run` passes `q.finish(d, d.item.gen)` (E-38) | `scheduler_wiring_test.go:81: 2 anchor GETs (slot taken true), want 3: …` |
+| `refreshSigned` never demotes (`… = h.waiting[i].signed \|\| signed[…]`) (E-39) | `scheduler_wiring_test.go:117: after the tick: offered {… signed:true …} to the reserved slot, want the waiter demoted to unsigned` |
+| the restart offset `+ 1` (B-27, lower bound) | `scheduler_wiring_test.go:135: rand 0: next retry = 1800000001, want now + 0` |
+| the restart offset over `spread+1` (B-27, upper bound) | `scheduler_wiring_test.go:135: rand 0.999: next retry = 1800000900, want now + 899` |
 | the panicked counter back under the report's boundary (E-42) | `scheduler_wiring_test.go:159: acu_adoption_total{outcome=panicked} rose by 0, want 1` |
 | the counters and the ring event outside any boundary (review M-2: E-42's report-only boundary of the draft) | `scheduler_wiring_test.go:193: a panic escaped the adoption boundary: clock bug` |
 | the record site's bare `reportPanic` (E-43) | `scheduler_wiring_test.go:217: a panic escaped the record: log handler bug: adoption_panicked` |
@@ -5817,8 +6251,8 @@ func TestParseSources_CountsTheSkippedPaths(t *testing.T) {
 }
 
 // Deferred minor GD-2: an adoption whose Sources file had paths skipped
-// says so once for that file (source_paths_skipped, INFO: review M-8);
-// the suite
+// says so once for that file (source_paths_skipped, INFO: review M-8: it
+// repeats at every adoption, and the operator cannot act on it); the suite
 // still adopts with the rows that passed.
 func TestAdopter_SourcesWithSkippedPathsLogsOnce(t *testing.T) {
 	logs := &lockedBuffer{}
@@ -5898,7 +6332,24 @@ and `verifyMember` reaches the BlobWriter through the field: `rehashPooled(w.blo
 
 - [ ] **Step 4: The served anchor's level (E-13) and the skipped Sources paths (GD-2)**
 
-`flip_barrier.go`: imports gain `"log/slog"`. In `servedAnchorUnchanged`'s doc, `one other than "no row" is logged (deferred minor C-16).` reads `one other than "no row" is logged (deferred minor C-16): at WARN, or at DEBUG when a shutdown cut the read short, as the check's local steps are (deferred minor E-13, FW-3 (d)).`, and
+`flip_barrier.go`: imports gain `"log/slog"`. In `servedAnchorUnchanged`'s doc:
+
+old:
+```go
+// safe direction); one other than "no row" is logged (deferred minor
+// C-16). The read runs under the shutdown signal, like the barrier's own
+// waits (ruling R-C2), never unbounded.
+```
+new:
+```go
+// safe direction); one other than "no row" is logged (deferred minor
+// C-16): at WARN, or at DEBUG when a shutdown cut the read short, as the
+// check's local steps are (deferred minor E-13, FW-3 (d)). The read runs
+// under the shutdown signal, like the barrier's own waits (ruling R-C2),
+// never unbounded.
+```
+
+and
 
 old:
 ```go
@@ -5991,8 +6442,8 @@ Expected: `ok`.
 | the served-anchor line sent to a discarding logger (E-14, C-16) | `adoption_paths_test.go:99: records [], want one at WARN naming the anchor` (and at DEBUG) |
 | the marker pass's skipped-anchor line sent to a discarding logger (E-14, A-49) | `adoption_paths_test.go:134: records [], want one DEBUG naming the anchor and the error` |
 | a failed `Directory` skips its files uncounted (GD-2) | `adoption_paths_test.go:154: skipped 1, first "pool/main/b/b/b_1%2b.tar.gz"; want 3 and ./pool/a/a_1.dsc` |
-| `source_paths_skipped` never logged (GD-2) | `adoption_paths_test.go:188: source_paths_skipped records [], want one INFO …` |
-| `source_paths_skipped` back at WARN (review M-8) | `adoption_paths_test.go:188: source_paths_skipped records [map[… level:WARN …]], want one INFO …` |
+| `source_paths_skipped` never logged (GD-2) | `adoption_paths_test.go:189: source_paths_skipped records [], want one INFO …` |
+| `source_paths_skipped` back at WARN (review M-8) | `adoption_paths_test.go:189: source_paths_skipped records [map[… level:WARN …]], want one INFO …` |
 
 - [ ] **Step 7: Commit**
 
@@ -6225,13 +6676,13 @@ EOF
 apt's whitespace is C's `isspace`, ASCII only; the parser split and trimmed on Unicode whitespace (B-9). `parseAptDate` shadows `ok` (B-11), and its AIDEV-NOTE blames `aptDigits` for the RFC 850 day's divergence (B-14). B-13 is declined (table): reading the first paragraph only broke eight tests whose verifiers pass the clearsign envelope through, and an AIDEV-NOTE says so where the next reader would look.
 
 **Files:**
-- Modify: `internal/freshness/release_date.go` (new `aptSpace`, `releaseDate`, `parseAptDate`, its AIDEV-NOTE), `internal/freshness/release_date_test.go` (a new test)
+- Modify: `internal/freshness/release_date.go` (new `aptSpace`, `releaseDate`, `parseAptDate`, its AIDEV-NOTE), `internal/freshness/release_date_test.go` (two new tests)
 
 **Interfaces:**
 - Consumes: `rfcExample` (`release_date_test.go`).
 - Produces: `const aptSpace = " \t\n\v\f\r"` (unexported).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 At the end of `internal/freshness/release_date_test.go`:
 
@@ -6250,17 +6701,33 @@ func TestReleaseDate_ASCIIWhitespaceOnly(t *testing.T) {
 		}
 	}
 }
+
+// Deferred minor B-9, the key's half (execution review G-9): apt's tag
+// parser trims ASCII blanks around the field name (B-10), but a no-break
+// space is part of the name, so "Date\u00a0:" is not the Date field (0),
+// while "Date \t:" still is.
+func TestReleaseDate_KeyTrimsASCIIBlanksOnly(t *testing.T) {
+	for text, want := range map[string]int64{
+		"Date\u00a0: Sun, 06 Nov 1994 08:49:37 GMT\n": 0,
+		"Date \t: Sun, 06 Nov 1994 08:49:37 GMT\n":    rfcExample,
+	} {
+		if got := releaseDate([]byte(text)); got != want {
+			t.Errorf("releaseDate(%q) = %d, want %d", text, got, want)
+		}
+	}
+}
 ```
 
 (`\u00a0` is the escape in the source, not the character: an editor that turns it into a raw no-break space makes `gofmt` re-align the map and hides what the test is about.)
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `go test -count=1 -run 'TestReleaseDate' ./internal/freshness/`
 Expected: FAIL with
 ```
 release_date_test.go:120: releaseDate("Date: Sun,\u00a006 Nov 1994 08:49:37 GMT\n") = 784111777, want 0
 release_date_test.go:120: releaseDate("Date: Sun, 06 Nov 1994 08:49:37 GMT\u00a0\n") = 784111777, want 0
+release_date_test.go:135: releaseDate("Date\u00a0: Sun, 06 Nov 1994 08:49:37 GMT\n") = 784111777, want 0
 ```
 
 - [ ] **Step 3: ASCII whitespace, no shadowing, the notes**
@@ -6348,6 +6815,7 @@ Expected: `ok` (every existing date test, the CRLF and padded-key cases of `Test
 |---|---|
 | `parseAptDate` back on `strings.Fields` (B-9) | `release_date_test.go:120: releaseDate("Date: Sun,\u00a006 Nov 1994 08:49:37 GMT\n") = 784111777, want 0` (and the trailing one) |
 | the value trimmed with `strings.TrimSpace` (B-9) | `release_date_test.go:120: releaseDate("Date: Sun, 06 Nov 1994 08:49:37 GMT\u00a0\n") = 784111777, want 0` |
+| the key trimmed with `strings.TrimSpace` (B-9, the key's half; execution review G-9) | `release_date_test.go:135: releaseDate("Date\u00a0: Sun, 06 Nov 1994 08:49:37 GMT\n") = 784111777, want 0` |
 
 - [ ] **Step 6: Commit**
 
@@ -6436,7 +6904,7 @@ func TestLedger_AnchorGensHoldsCheckedPairsOnly(t *testing.T) {
 }
 ```
 
-Both pass at HEAD (they pin behaviour that holds; Step 8's mutants are their red). `aptclient.go`: `RunUpdate`'s doc reads `// RunUpdate runs one update for client, starting from queue. It blocks` / `// for the whole update — in real time outside a synctest bubble — and is` / `// safe for concurrent use: simulations run many clients' updates at once` / `// (deferred minor C-8).`; `AnchorGens`'s first line reads `// AnchorGens returns, sorted as strings ("10" before "9"), the anchor` / `// generations of suite's checked pairs: two or more prove its clients` / `// crossed a flip (deferred minor C-8).`
+Both pass at HEAD (they pin behaviour that holds; Step 8's mutants are their red). `aptclient.go`: `RunUpdate`'s doc reads `// RunUpdate runs one update for client, starting from queue. It blocks` / `// for the whole update — in real time outside a synctest bubble — and is` / `// safe for concurrent use: simulations run many clients' updates at once` / `// (deferred minor C-8).`; `AnchorGens`'s first two lines become `// AnchorGens returns, sorted as strings ("10" before "9"), the anchor` / `// generations of suite's checked pairs: two or more prove its clients` / `// crossed a flip (deferred minor C-8).`
 
 - [ ] **Step 3: The flip simulations' client ids (C-7)**
 
@@ -7335,7 +7803,7 @@ new:
 	}
 ```
 
-(its comment `// position; each must reach its own field.` continues `— read from the decoded` / `// record, not the text (deferred minor F-9).`).
+(its comment's `field.` becomes `field — read from the decoded` / `// record, not the text (deferred minor F-9).`).
 
 - [ ] **Step 9: Run everything; mutation checks**
 
@@ -7353,7 +7821,8 @@ Mutants (one at a time, each reverted):
 | Mutant | Fails |
 |---|---|
 | a production `init` in `freshness/clockstep.go` calling `wallclock.SetOffsetForTest(0)` (A-2) | `wallclock_test.go:69: ../../internal/freshness/clockstep.go calls SetOffsetForTest outside a test` |
-| `hot_set.go` builds `"http://" + suite.CanonicalHost + r.Path` (A-14, A-15) | `composers_test.go:39: ../../internal/freshness/hot_set.go: builds a URL by concatenation; …` and `hot_set_test.go:56: hot set [{… upstreamURL:http://h/r/pool/main/g/g++/g++_2~rc1_amd64.deb}], want … at http://h/r/pool/main/g/g%2b%2b/g%2b%2b_2%7erc1_amd64.deb` |
+| `hot_set.go` builds `"http://" + suite.CanonicalHost + r.Path` (A-14) | `composers_test.go:39: ../../internal/freshness/hot_set.go: builds a URL by concatenation; use aptpath.BuildUpstreamURL` (`internal/freshness` then fails to build: `aptpath` unused) |
+| the same, keeping the import used (`+ aptpath.BuildUpstreamURL("http", "h", "/")[:0]`) (A-15) | `hot_set_test.go:56: hot set [{… upstreamURL:http://h/r/pool/main/g/g++/g++_2~rc1_amd64.deb}], want … at http://h/r/pool/main/g/g%2b%2b/g%2b%2b_2%7erc1_amd64.deb` |
 | the flat_filename index without its `WHERE` (A-21; scratch only — migrations are never edited) | `schema_v7_test.go:282: flat_filename index partial = 0 (<nil>), want 1` |
 | `Duration.UnmarshalText` refuses a negative itself (C-9) | `config_test.go:920: flip_quiet_period = -1s: err … negative duration "-1s", want the key's bounds` |
 | `DecodableClearsign` returns `b` unchanged (D-6) | `failclosed_test.go:183: VerifyInline = "", InRelease clearsign envelope is malformed; want the signed text` |
@@ -7405,7 +7874,7 @@ The test output of `internal/admin`, `internal/freshness`, `internal/gc`, `inter
 - [ ] **Step 1: Measure the noise before**
 
 Run, for each of `./internal/admin ./internal/freshness ./internal/gc ./internal/cache ./cmd/apt-cacher-ultra`: `go test -count=1 -v <pkg> 2>&1 | grep -v -E '^(=== (RUN|PAUSE|CONT|NAME)|--- (PASS|SKIP)|PASS$|ok  )|^ +--- (PASS|SKIP)' | wc -l`
-Expected (the replay, at Task 14's end): 2132, 603, 518, 34, 30 — schema-migration INFO lines from caches opened with the default logger, adoption lines from adopters built without one, two TLS handshake errors, and the tests' own `t.Logf`s.
+Expected (the replays, at Task 14's end): 2132, 603, about 520–550 (518 and 546 measured), 34, 30 — schema-migration INFO lines from caches opened with the default logger, adoption lines from adopters built without one, two TLS handshake errors, and the tests' own `t.Logf`s.
 
 - [ ] **Step 2: Silent loggers (D-48, D-56, F-20)**
 
@@ -7417,7 +7886,7 @@ The rule, applied by hand to every match (the replay's script made exactly these
 
 Then `gofmt -w` the changed files except `hot_prefetch_test.go`, a drift file: its edits are exact insertions, the new `Logger:` field aligned by hand with its block (`Logger:            discardLogger(),`, values at column 20). Afterwards:
 
-Run: `grep -rn 'cache.Open(.*, nil)' --include='*_test.go' internal cmd; grep -n 'Open(.*, nil)' internal/cache/*_test.go; grep -n 'slog.Default()' internal/freshness/*_test.go`
+Run: `grep -rn 'Open(.*, nil)$' --include='*_test.go' internal cmd; grep -n 'slog.Default()' internal/freshness/hot_prefetch_test.go`
 Expected: no output.
 
 - [ ] **Step 3: The daemon-start helper (D-46, D-49)**
@@ -7734,7 +8203,7 @@ new:
 	}
 ```
 
-Red first: with the hold in place but the single trigger GET kept (the old blocks with the hold's two statements added before them), run `go test -race -count=1 -run 'TestPhase2Chaos_AdoptionFlipUnderConcurrency$|TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency$' ./internal/handler/`
+Red first: with the hold in place but the single trigger GET kept (the old blocks with the new block's comment and `holdSuiteBriefly` call added before them), run `go test -race -count=1 -run 'TestPhase2Chaos_AdoptionFlipUnderConcurrency$|TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency$' ./internal/handler/`
 Expected: FAIL —
 ```
 phase2_chaos_test.go:185: adoption never reached member-fetch gate: no waiter arrived within 5s
@@ -7793,7 +8262,7 @@ EOF
 
 ### Task 16: Comment nits and `deferred_e_test.go`'s move (A-10, A-26, A-27, D-28, D-29, D-30, E-35, E-41, E-46, E-74)
 
-Comment and naming fixes, one redundant filter removed (A-26: behaviour-neutral, the SQL already guarantees it), and the move of `internal/freshness/deferred_e_test.go`'s ten functions beside their subjects (E-46): the file's name points at a document Task 18 deletes. No test is added or lost: `go test -list . ./internal/freshness/` prints the same 682 names before and after.
+Comment and naming fixes, one redundant filter removed (A-26: behaviour-neutral, the SQL already guarantees it), and the move of `internal/freshness/deferred_e_test.go`'s ten functions beside their subjects (E-46): the file's name points at a document Task 18 deletes. No test is added or lost: `go test -list . ./internal/freshness/` lists the same 688 test names before and after.
 
 **Files:**
 - Delete: `internal/freshness/deferred_e_test.go`
@@ -7805,8 +8274,8 @@ Comment and naming fixes, one redundant filter removed (A-26: behaviour-neutral,
 
 - [ ] **Step 1: Record the freshness test list**
 
-Run: `go test -list . ./internal/freshness/ | sort > /tmp/h1-list-before.txt; wc -l < /tmp/h1-list-before.txt`
-Expected: 682 (after Tasks 1–15).
+Run: `go test -list . ./internal/freshness/ | grep '^Test' | sort > /tmp/h1-list-before.txt; wc -l < /tmp/h1-list-before.txt`
+Expected: 688 (after Tasks 1–15: 649 at 6786529, 34 added by Tasks 2–14 in revision 2, five more in revision 4).
 
 - [ ] **Step 2: Production comments and the filter (A-10, A-26, A-27)**
 
@@ -7871,7 +8340,7 @@ Then delete `deferred_e_test.go`. The targets' imports gain what the moved code 
 
 - [ ] **Step 5: Verify**
 
-Run: `go test -list . ./internal/freshness/ | sort | diff /tmp/h1-list-before.txt -`
+Run: `go test -list . ./internal/freshness/ | grep '^Test' | sort | diff /tmp/h1-list-before.txt -`
 Expected: no output.
 
 Run: `go test -count=1 ./internal/freshness/ ./internal/cache/ ./internal/handler/ ./internal/proxy/ ./cmd/...`
@@ -7904,7 +8373,7 @@ EOF
 
 ### Task 17: Phase H1's definition of done
 
-No new code: the brief's mandatory DoD, mapped to the tests that prove each item, and the checks that span the tasks, run on the tree at the end of Task 16. Run Step 1 before Task 18, which deletes the seven files it reads. Every output below is the replay's (the revision of 2026-10-25: a fresh copy of eadfd80, whose code is 6786529's, with Tasks 1–16 applied).
+No new code: the brief's mandatory DoD, mapped to the tests that prove each item, and the checks that span the tasks, run on the tree at the end of Task 16. Run Step 1 before Task 18, which deletes the seven files it reads. Every output below is the replay's (the revision of 2026-10-25: a fresh copy of eadfd80, whose code is 6786529's, with Tasks 1–16 applied; Steps 1–4 again in revision 4, on the execution review's trees with revisions 3 and 4 applied).
 
 **Files:** none. The task changes no file and has no commit; its outputs go in the phase's final report.
 
@@ -7918,10 +8387,10 @@ No new code: the brief's mandatory DoD, mapped to the tests that prove each item
 |---|---|---|
 | Every deferred ID has a disposition, and every `fix` row maps to a task | the table; 1, 4–16, 18 | Step 1 |
 | F-24's probe fails at HEAD and passes after Task 1 | 1 | `TestRunSnapshotGCBatch_KeepsAuditDeferredSignedHistory`: Task 1 Step 2 (red at 6786529), Step 4 (green) |
-| R-H2's tests: the rows of a corrupt anchor are gone after the audit, a client request misses and refetches, an oversized anchor keeps its rows | 2 | `TestApplyLegacyAuditDecisions_CorruptAnchorDropsEveryRowOfItsBlob`, `TestApplyLegacyAuditDecisions_DropAnchorRowsNeedsAQuarantine`, `TestAuditLegacySnapshot_OnlyACorruptAnchorDropsItsRows`, `TestRunLegacyTrustAudit_CorruptAnchorDropsItsRowsOversizedKeepsThem`, `TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor` |
-| R-H3's and R-H6's renames, with `docs/log-fields.md` updated; a new prose message fails the build | 3 | `TestSweptEventNames` (no old name in any Go file, each new name in production code, each with a `docs/log-fields.md` row), `TestLogMessagesAreSnakeCase` (every message snake_case or one of `main`'s 78) |
+| R-H2's tests: the rows of a corrupt anchor are gone after the audit, in the quarantine's own transaction, and its pool file after the commit; a client request misses and refetches; an oversized or missing anchor keeps its rows | 2 | `TestApplyLegacyAuditDecisions_CorruptAnchorDropsEveryRowOfItsBlob`, `TestApplyLegacyAuditDecisions_DropAnchorRowsNeedsAQuarantine`, `TestApplyLegacyAuditDecisions_AFailedDropUndoesTheQuarantine`, `TestAuditLegacySnapshot_OnlyACorruptAnchorDropsItsRows`, `TestAuditLegacySnapshot_NoAnchorHashAsksForNoDrop`, `TestRunLegacyTrustAudit_CorruptAnchorDropsItsRowsOversizedKeepsThem`, `TestRunLegacyTrustAudit_AFailedDiscardIsLoggedAndTheQuarantineProceeds`, `TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor` |
+| R-H3's and R-H6's renames, with `docs/log-fields.md` updated; a new prose message fails the build | 3 | `TestSweptEventNames` (no old name in any Go file, each new name in production code, each with a `docs/log-fields.md` row), `TestLogMessagesAreSnakeCase` (every message snake_case or one of `main`'s 78), `TestLogMethodsAreOnlyCalledDirectly` (no log method taken as a value, so the second reads every message) |
 | The admin `retired_reaped` beside `displaced_reaped`: JSON, GC panel, `docs/admin-ui-spec.md` | 4, 18 | `TestGCInfoFromSummary_CopiesEveryShownField`, `TestStatusHTML_ShowsTheSweepsCells`, `TestJSONContractPreserved` (its golden regenerated in Task 4); admin-ui-spec §4.6 (Task 18) |
-| The anchorless refresh visible in `suites[]` and on the page, additive | 4 | `TestSuiteEntries_Anchorless`, `TestStatusHTML_ShowsTheSweepsCells`, `TestJSONContractPreserved` |
+| The anchorless refresh visible in `suites[]` and on the page, additive | 4 | `TestSuiteEntries_Anchorless`, `TestStatus_AnchorlessFlatSuiteThroughTheServer` (JSON and HTML, through the server), `TestStatusHTML_ShowsTheSweepsCells`, `TestJSONContractPreserved` |
 | `docs/log-fields.md`'s gaps: `adoption_member_skipped` (with `declared_sha512`), `snapshot_index_target_404` (the layout-aware architecture), `admin_reconcile_requested` | 18 | Task 18's log-fields diff; `admin_reconcile_requested`'s fields are pinned by `TestEndpoint_Reconcile_LogsBothSchemeFields` (Task 5) |
 | C-38 under the budget, no assertion dropped | 13 | `TestSimScheduler_FiveHundredStallingOneHealthy`: Step 5 |
 | `go test -race ./...` and `golangci-lint run ./...` clean; `gofmt -l .` shows only the five drift files | all | Steps 2–4 |
@@ -8007,7 +8476,7 @@ go test -race -p 1 -count=3 -v -run '^(TestSim[A-Za-z0-9_]*|TestDoD_[A-Za-z0-9_]
 
 Expected: PASS, every line under 4.5 s. Then record, for the release notes and the next coarsening, the machine's CPU count (`nproc`) and the three simulations closest to the budget — `TestSimScheduler_StallingHostWithAdoptionContention`, `TestDoD_NinetyDaysOfReapingWithRestarts`, `TestSimRetry_LongRunDateRulesAndClockSteps` — from this run (`-p 1`); any above 4.0 s is flagged as the next candidate for coarsening (review M-5: R-H7's own reason, the risk a 4-vCPU runner exposes, applies to them). In Step 2's module-wide run packages run in parallel and simulations take up to twice as long; the budget is this step's. A line over 4.5 s means a busy machine first: rerun that test with `-count=5`; an over-budget time that repeats on a quiet machine fails the DoD.
 
-Replay (the revision of 2026-10-25, a quiet machine with 12 CPUs, load below 1): 50 tests, three runs each, all PASS. The slowest (min–max): `TestServeHTTP_MintedSuitesAtScale` 3.89–3.96 s (untouched by H1; phase G recorded 3.93–4.06 s), `TestDoD_NinetyDaysOfReapingWithRestarts` 3.69–3.76 s, `TestSimRetry_LongRunDateRulesAndClockSteps` 3.63–3.70 s, `TestSimFlip_DetachedBusySuiteStraddlesOnlyWithoutTheBarrier` 3.48–3.56 s, `TestSimScheduler_StallingHostWithAdoptionContention` 3.51–3.55 s, `TestSimCapacity_UpgradeBurst` 3.24–3.27 s, `TestSimFlappingMirror_NeverFlipsBack` 3.14–3.25 s, `TestSimScheduler_FiveHundredStallingOneHealthy` 2.95–2.97 s (C-38); every other one under 3 s. `TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds` (R-H7), measured on its own after its coarsening: 3.39–3.46 s. Review M-5's three: none above 4.0 s on this machine; `TestServeHTTP_MintedSuitesAtScale`, the closest to the budget, is phase D's and untouched here. A 4-vCPU runner is slower: the first to coarsen there are the Minted test and the 90-day DoD.
+Replay (the revision of 2026-10-25, a quiet machine with 12 CPUs, load below 1): 51 distinct tests (52 runs a pass: `TestSimFlip_SlowReaderCommitsInsideTheHold` exists in two packages), three runs each, all PASS. The slowest (min–max): `TestServeHTTP_MintedSuitesAtScale` 3.89–3.96 s (untouched by H1; phase G recorded 3.93–4.06 s), `TestDoD_NinetyDaysOfReapingWithRestarts` 3.69–3.76 s, `TestSimRetry_LongRunDateRulesAndClockSteps` 3.63–3.70 s, `TestSimFlip_DetachedBusySuiteStraddlesOnlyWithoutTheBarrier` 3.48–3.56 s, `TestSimScheduler_StallingHostWithAdoptionContention` 3.51–3.55 s, `TestSimCapacity_UpgradeBurst` 3.24–3.27 s, `TestSimFlappingMirror_NeverFlipsBack` 3.14–3.25 s, `TestSimScheduler_FiveHundredStallingOneHealthy` 2.95–2.97 s (C-38); every other one under 3 s. `TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds` (R-H7), measured on its own after its coarsening: 3.39–3.46 s. Review M-5's three: none above 4.0 s on this machine; `TestServeHTTP_MintedSuitesAtScale`, the closest to the budget, is phase D's and untouched here. A 4-vCPU runner is slower: the first to coarsen there are the Minted test and the 90-day DoD. The execution review's run (revision 2, the same machine, `-p 1`) had the Minted test at 4.06–4.17 s, above 4.0 s: it is flagged by M-5's rule, though H1 does not touch it (revision 4 changes no simulation and did not re-time them).
 
 ### Task 18: Documentation, spec revision 12, the overview, the deferred files (C-36, C-37, D-52, D-55, E-24)
 
