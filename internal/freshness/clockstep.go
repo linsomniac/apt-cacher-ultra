@@ -83,7 +83,6 @@ func (c *Checker) logClockStep(stamp, scheme, host, suitePath string, stored int
 // the future — a backward wall-clock step (cache.ClockStepReporter, ruling
 // PD-11) — through the checker's rate-limited clock_step_detected and
 // acu_clock_steps_detected_total, like every other gate (spec C4).
-// Moved here from suite_lock.go beside clockStep (deferred minor D-25).
 func (c *Checker) ReportClockStep(stamp string, key cache.SuiteKey, stored, now int64) {
 	c.clockStep(stamp, key.CanonicalScheme, key.CanonicalHost, key.SuitePath, stored, time.Unix(now, 0))
 }

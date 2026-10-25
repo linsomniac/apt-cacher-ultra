@@ -208,6 +208,9 @@ type reapCandidate struct {
 	requested *int64 // last_requested_at as listed; oldest first
 	reason    string // suite_reaped's reason: idle, non_canonical or junk
 	cutoff    int64  // ReapIdleSuite's cutoff
+	// evidence is a junk candidate's judged rows' paths, in the order
+	// judged: suite_reaped's evidence (deferred minor F-18).
+	evidence []string
 }
 
 // runOnce is one reaper run (spec C9): unless a forward step of the wall
@@ -233,7 +236,16 @@ type reapCandidate struct {
 // nor sweeps, and leaves the sweep due for the next run (design review
 // M-8); a detected step no longer ages markers at all (stepAhead,
 // sweepMarkers).
+//
+// AIDEV-NOTE: deferred minor F-13 (design note 7 of the H1 plan). A run
+// that completes — the listing read, the reaps tried, the sweeps done, or
+// held back by the forward-step guard — logs suite_reaper_run_complete
+// and sets acu_suite_reaper_last_run_unixtime; one whose listing failed or
+// that a shutdown cut short does neither, so an alert on the gauge's age
+// catches a reaper that stopped completing runs (GC's
+// acu_gc_last_run_unixtime is the model).
 func (r *Reaper) runOnce(ctx context.Context) {
+	start := time.Now()
 	rows, err := r.cache.ListSuitesWithAdoption(ctx)
 	if err != nil {
 		r.warn(ctx, "suite_reaper_list_suites_failed", "err", err)
@@ -241,6 +253,7 @@ func (r *Reaper) runOnce(ctx context.Context) {
 	}
 	now := r.checker.now()
 	deferred := r.deferredByForwardStep(now, time.Now())
+	tried, reaped, swept := 0, 0, 0
 	if !deferred && r.idleTTL > 0 {
 		cands := r.candidates(rows, now)
 		cands = append(cands, r.junkCandidates(ctx, rows, cands, now)...)
@@ -249,14 +262,23 @@ func (r *Reaper) runOnce(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			r.reapSuite(ctx, c)
+			tried++
+			if r.reapSuite(ctx, c) {
+				reaped++
+			}
 		}
 	}
 	if !deferred && (r.dailyAt.IsZero() || time.Since(r.dailyAt) >= dailyEvery) {
 		r.dailyAt = time.Now()
-		r.sweepMarkers(ctx, now, r.checker.now())
+		swept = r.sweepMarkers(ctx, now, r.checker.now())
 	}
 	r.sweepReconcileMemo(rows)
+	if ctx.Err() != nil {
+		return // cut short by a shutdown: not a completed run
+	}
+	reaperLastRunUnixtime.Set(float64(r.checker.now().Unix()))
+	r.logger.Info("suite_reaper_run_complete", "tried", tried, "reaped", reaped, "markers_swept", swept,
+		"deferred", deferred, "duration_ms", time.Since(start).Milliseconds())
 }
 
 // sweepMarkers runs spec C9's orphan-marker sweep (ruling R-F5,
@@ -285,7 +307,7 @@ func (r *Reaper) runOnce(ctx context.Context) {
 // that hour, and a swept marker — the never-downgrade record of a base
 // seen signed — cannot come back. After a genuine suspend this only keeps
 // markers longer, the safe side.
-func (r *Reaper) sweepMarkers(ctx context.Context, now, fresh time.Time) {
+func (r *Reaper) sweepMarkers(ctx context.Context, now, fresh time.Time) int {
 	// Two Adds, never the one Duration sum −stepAhead − markerTTL, which
 	// would wrap once stepAhead nears maxStepAhead (deferredByForwardStep).
 	res, err := r.cache.SweepOrphanMarkers(ctx, fresh.Unix(), now.Add(-markerTTL).Add(-r.stepAhead).Unix())
@@ -304,6 +326,7 @@ func (r *Reaper) sweepMarkers(ctx context.Context, now, fresh time.Time) {
 	if err != nil {
 		r.warn(ctx, "suite_reaper_marker_sweep_failed", "err", err, "swept", res.Swept)
 	}
+	return res.Swept
 }
 
 // deferredByForwardStep is the reaper's guard against a forward step of
@@ -312,7 +335,8 @@ func (r *Reaper) sweepMarkers(ctx context.Context, now, fresh time.Time) {
 // clock ahead. It compares how far the wall clock (the checker's) and the
 // monotonic clock advanced since the previous run, or Run's start; when
 // the wall clock ran more than forwardStepSlack ahead it logs
-// clock_step_detected (stamp=wall_clock), defers reaping by the uptime
+// clock_step_detected (stamp=wall_clock) and counts it in
+// acu_clock_steps_detected_total (deferred minor F-17), defers reaping by the uptime
 // floor, giving clients the hour a restart gives them to touch their
 // suites, and adds the step to stepAhead, which the marker sweep's cutoff
 // takes off (ruling PF-13). It reports whether this run is deferred.
@@ -337,6 +361,7 @@ func (r *Reaper) deferredByForwardStep(now, mono time.Time) bool {
 		elapsed := mono.Sub(r.lastMono)
 		ahead := time.Duration(now.Unix()-r.lastWall.Unix())*time.Second - elapsed
 		if ahead > forwardStepSlack {
+			clockStepsTotal.Inc() // counted like every report (deferred minor F-17)
 			r.logger.Warn("clock_step_detected", "stamp", "wall_clock",
 				"stored_unixtime", r.lastWall.Unix()+int64(elapsed/time.Second), "now_unixtime", now.Unix())
 			r.deferUntil = mono.Add(r.floor)
@@ -415,9 +440,13 @@ func (r *Reaper) candidates(rows []cache.SuiteWithAdoption, now time.Time) []rea
 // suites from an upstream that answers missing InRelease files with an
 // HTML page) is that class, which one shared budget of 25 would drain in
 // some 200 runs with no idle reaping meanwhile. So each class has its own
-// budget (runBudgets): regardlessReapsPerRun of these, cheap reaps (no
-// snapshot; a junk suite has at most three anchor rows, a non-canonical
-// row deletes no metadata), and reapsPerRun idle suites in the same run.
+// budget (runBudgets): regardlessReapsPerRun of these, cheap reaps for the
+// reaper (a junk suite has no current snapshot and at most three anchor
+// rows and fourteen root index rows; a non-canonical row deletes no
+// metadata, though a legacy one may carry a current snapshot, which its
+// reap retires — sub-job C deletes that snapshot's rows later, in chunks,
+// so 250 such reaps a run grow C's backlog, not the reaper's own work:
+// deferred minor F-26), and reapsPerRun idle suites in the same run.
 func sortCandidates(cands []reapCandidate) {
 	stamp := func(c reapCandidate) int64 {
 		if c.requested == nil {
@@ -534,6 +563,12 @@ func (r *Reaper) reapSuite(ctx context.Context, c reapCandidate) (reaped bool) {
 		"suite_path", c.key.SuitePath,
 		"reason", c.reason,
 		"metadata_rows", h.rows,
+	}
+	switch {
+	case c.reason == "idle" && c.requested != nil:
+		attrs = append(attrs, "last_requested_unixtime", *c.requested) // the stamp the cutoff judged (F-18)
+	case c.reason == "junk":
+		attrs = append(attrs, "evidence", c.evidence) // the rows judged junk (F-18): a list, since a path may hold a space
 	}
 	if settled {
 		attrs = append(attrs, "settled", true)
@@ -752,7 +787,7 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 		if listed[key] || (flat && !indexesRead) {
 			continue // a failed index read: no verdict for an unadopted flat suite this run
 		}
-		junk, err := r.suiteJunk(ctx, key, flat, bySuite[key], byIndexes[key], cutoff, next, &fails)
+		junk, evidence, err := r.suiteJunk(ctx, key, flat, bySuite[key], byIndexes[key], cutoff, next, &fails)
 		if err != nil {
 			if evidenceFails == 0 {
 				evidenceErr, evidenceKey = err, key
@@ -767,7 +802,7 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 		// compare-and-delete in ReapIdleSuite then require a suite still
 		// unadopted, the only kind the junk rule reaps.
 		out = append(out, reapCandidate{key: key, current: nil, requested: s.LastRequestedAt, reason: "junk",
-			cutoff: cache.ReapRegardless})
+			cutoff: cache.ReapRegardless, evidence: evidence})
 	}
 	r.sniffs = next
 	if fails.n > 0 {
@@ -785,8 +820,10 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 // suiteJunk reports whether key's evidence rows are all junk evidence
 // (allJunk): its anchor rows and — for an unadopted flat suite (flat)
 // whose base has no signed evidence — its root index rows with them
-// (ruling PG-7, amending R-G2). The anchors-alone verdict and the combined
-// one are reached first; the signed-evidence read (signedEvidence:
+// (ruling PG-7, amending R-G2), and, for a junk verdict, the paths of the
+// rows it judged (suite_reaped's evidence: deferred minor F-18). The
+// anchors-alone verdict and the combined one are reached first; the
+// signed-evidence read (signedEvidence:
 // cache.CheckUnsignedDowngrade, no third "signed" predicate — ruling PG-3)
 // runs only when they differ, so a dists/ suite, and a flat suite the two
 // rules judge alike, never reads it. A non-nil error is that read's
@@ -799,23 +836,38 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 // clients reject the junk, and anchor serves keep the suite touched, so
 // only the junk reap repairs it).
 func (r *Reaper) suiteJunk(ctx context.Context, key cache.SuiteKey, flat bool, anchors, indexes []cache.SuiteAnchorRow,
-	cutoff int64, next map[sniffKey]bool, fails *junkReadFailures) (bool, error) {
+	cutoff int64, next map[sniffKey]bool, fails *junkReadFailures) (bool, []string, error) {
 	anchorsJunk := len(anchors) > 0 && r.allJunk(key, anchors, cutoff, next, fails)
 	if !flat {
-		return anchorsJunk, nil
+		return anchorsJunk, rowPaths(anchorsJunk, anchors), nil
 	}
 	combined := (len(anchors) == 0 || anchorsJunk) && len(anchors)+len(indexes) > 0 &&
 		(len(indexes) == 0 || r.allJunk(key, indexes, cutoff, next, fails))
 	if combined == anchorsJunk {
-		return anchorsJunk, nil
+		return anchorsJunk, rowPaths(anchorsJunk, anchors, indexes), nil
 	}
 	switch err := r.signedEvidence(ctx, key.CanonicalHost, key.SuitePath); {
 	case errors.Is(err, cache.ErrUnsignedDowngradeRefused):
-		return anchorsJunk, nil // signed evidence: the anchors alone
+		return anchorsJunk, rowPaths(anchorsJunk, anchors), nil // signed evidence: the anchors alone
 	case err != nil:
-		return false, err
+		return false, nil, err
 	}
-	return combined, nil
+	return combined, rowPaths(combined, anchors, indexes), nil
+}
+
+// rowPaths returns the paths of the rows of sets, in order, when junk —
+// the evidence a junk verdict judged — and nil otherwise.
+func rowPaths(junk bool, sets ...[]cache.SuiteAnchorRow) []string {
+	if !junk {
+		return nil
+	}
+	var out []string
+	for _, rows := range sets {
+		for _, a := range rows {
+			out = append(out, a.Path)
+		}
+	}
+	return out
 }
 
 // hasUnadoptedFlatSuite reports whether rows hold an unadopted flat

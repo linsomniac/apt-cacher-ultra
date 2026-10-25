@@ -269,6 +269,11 @@ type Checker struct {
 	// the window whose order (drop, then unlock) keeps two holders apart.
 	unlockDroppedHook func(key string)
 
+	// holdPurgeHook, when set (tests only), runs in a HoldSuite release of
+	// a deleted suite right before the flip-gate purge (deferred minor
+	// F-25: a panic there must not leak the suite's mutex).
+	holdPurgeHook func()
+
 	// recordHook, when set (tests only), runs in recordAdoptionFailure
 	// right before the record is written; recordReadHook right before the
 	// suite row is read.

@@ -37,7 +37,8 @@ import (
 // counter by host); acu_suites_reaped_total (spec C9, design review M-16,
 // counter by reason: idle, non_canonical, junk);
 // acu_anchorless_sniff_rejected_total (spec C4 Dispatch 4, counter by
-// host). The flip barrier's
+// host); acu_suite_reaper_last_run_unixtime (spec C9, deferred minor
+// F-13, unlabelled gauge). The flip barrier's
 // acu_flip_hold_skipped_total, acu_flip_hold_expired_total,
 // acu_flip_quiet_cut_short_total, acu_flip_waiters_over_cap_total,
 // acu_flip_slow_anchor_reads_total and
@@ -124,7 +125,16 @@ var (
 	// (backward wall-clock steps, spec C4).
 	clockStepsTotal = metrics.NewCounter(
 		"acu_clock_steps_detected_total",
-		"Past-event timestamps found in the future (backward wall-clock step).",
+		"Wall-clock steps detected: a past-event timestamp found in the future (a backward step), "+
+			"or the wall clock run ahead of the monotonic clock between reaper runs (a forward step).",
+	)
+
+	// reaperLastRunUnixtime is when the suite reaper last completed a run
+	// (deferred minor F-13): an alert on its age catches a reaper that
+	// stopped, as acu_gc_last_run_unixtime does for GC.
+	reaperLastRunUnixtime = metrics.NewGauge(
+		"acu_suite_reaper_last_run_unixtime",
+		"Unix-seconds timestamp of the suite reaper's last completed run (spec C9).",
 	)
 
 	// legacyQuarantinedTotal counts pre-v7 snapshots the startup trust
