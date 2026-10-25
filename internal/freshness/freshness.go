@@ -1160,6 +1160,14 @@ func (g retryGate) recordValidators() bool {
 	return g.active && !g.due && (g.etag != "" || g.lastmod != "")
 }
 
+// holds reports whether the failure record holds back content key: a
+// record is active, not yet due, and was written for that very content
+// (spec C7 "Gate": the same content before the retry time is deferred).
+// The one spelling of the predicate (deferred minor E-32).
+func (g retryGate) holds(key string) bool {
+	return g.active && !g.due && key == g.hash
+}
+
 // validators returns what the conditional GET sends: none at or after the
 // record's next_retry_at; the failing content's before it when the record
 // holds validators; otherwise — no record, or a record without validators —
@@ -1271,10 +1279,14 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 	}
 	// The reserved-slot rule (spec C4): only a signed current snapshot may
 	// take the last free slot; a snapshot that cannot be read counts as
-	// unsigned.
+	// unsigned (fail-closed), logged (deferred minor E-31).
 	signed := false
-	if snap, err := c.cache.GetSuiteSnapshot(ctx, snapID); err == nil {
-		signed = snap.Form != cache.FormUnsigned
+	if snap, err := c.cache.GetSuiteSnapshot(ctx, snapID); err != nil {
+		c.logger.Warn("reconcile_snapshot_read_failed",
+			"err", err, "snapshot_id", snapID,
+			"canonical_scheme", scheme, "canonical_host", host, "suite_path", suitePath)
+	} else {
+		signed = signedForm(snap.Form)
 	}
 	l, ok := c.admission.tryAcquire(host, signed)
 	if !ok {

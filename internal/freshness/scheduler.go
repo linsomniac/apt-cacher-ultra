@@ -430,6 +430,14 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 	// queued (its check would make no request anyway). A stamp up to 7 days
 	// in the future counts as interested (interested: a symmetric window);
 	// checkFirst reports the clock step.
+	//
+	// AIDEV-NOTE: deferred minor E-25, accepted. An interested never-adopted
+	// suite without a client-created anchor or flat index row is still
+	// queued at every tick (suiteDue reads no url_path row): its check
+	// reads the suite row and its anchor rows (and a flat suite's metadata
+	// rows) and ends dormant at DEBUG, with no request. Bounded by the tick
+	// interval and the 7-day interest window; testing for the rows here
+	// would put the same reads in the tick, for every such suite.
 	if c.adopter != nil && s.CurrentSnapshotID == nil {
 		if ok, _ := interested(s.LastRequestedAt, now); !ok {
 			return false
@@ -650,7 +658,7 @@ func (c *Checker) tick(ctx context.Context, q *schedQueues) {
 	signed := make(map[string]bool)
 	for i, r := range rows {
 		suites[i] = r.SuiteFreshness
-		if r.CurrentAnchorForm == string(cache.FormInline) || r.CurrentAnchorForm == string(cache.FormDetached) {
+		if signedForm(cache.AnchorForm(r.CurrentAnchorForm)) {
 			signed[suiteKey(r.CanonicalScheme, r.CanonicalHost, r.SuitePath)] = true
 		}
 	}
@@ -671,9 +679,12 @@ func (c *Checker) tick(ctx context.Context, q *schedQueues) {
 	if c.adopter == nil {
 		absentStale = 0
 	}
+	// paced_stale is the count left out (deferred minor E-30): with
+	// adopted_stale it adds up to the gauge's adopted="true" value.
 	if warnStale := adoptedStale - absentStale; warnStale > 0 {
 		c.logger.Warn("freshness: adopted suites stale beyond threshold",
 			"adopted_stale", warnStale,
+			"paced_stale", absentStale,
 			"stale_factor", staleSuiteFactor,
 			"refresh", c.refresh.String(),
 		)

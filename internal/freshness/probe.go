@@ -124,6 +124,8 @@ func (c *Checker) probe(fetchCtx context.Context, suite SuiteRef, urls anchorURL
 	}
 	target := &fetch.Target{CanonicalHost: suite.CanonicalHost, URL: urls.of(name)}
 	res, err := c.fetcher.Conditional(fetchCtx, target, "", "", limit)
+	// false: a probe sends no validators, so a 304 is unknown (deferred
+	// minor E-27).
 	return classify(res, err, sniff, false)
 }
 

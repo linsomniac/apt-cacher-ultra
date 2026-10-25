@@ -153,9 +153,12 @@ func (c *Checker) anchorAbsent(ctx, fetchCtx context.Context, out *checkOutcome,
 	}
 	if runTree {
 		rows, _, err := c.cachedAnchors(ctx, suite)
-		if err != nil {
+		// Deferred minor GD-6: the scheme names the suite, and a read a
+		// shutdown cut short is DEBUG, as checkFirst's is (ruling PG-35).
+		if err != nil && !c.endedByShutdown(ctx, suite, "read the anchor rows", err) {
 			c.logger.Warn("freshness_read_anchor_rows_failed",
-				"err", err, "canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath)
+				"err", err, "canonical_scheme", suite.CanonicalScheme,
+				"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath)
 		}
 		t := c.runProbeTree(fetchCtx, suite, c.anchorURLsFor(suite, anchorURLMap(rows)))
 		switch {
@@ -299,7 +302,7 @@ func (c *Checker) lateralInline(ctx, fetchCtx context.Context, out *checkOutcome
 	}
 	req = probeTree{form: adoptionFormInline, found: true, inRelease: o}.request(suite)
 	req.crossForm, req.lateral = true, true
-	heldByRecord := gate.active && !gate.due && req.key == gate.hash
+	heldByRecord := gate.holds(req.key)
 	if heldByRecord || c.lateralHeld(suiteKey(suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath), req.key, nowUnix) {
 		return nil, false, heldByRecord
 	}
@@ -405,7 +408,7 @@ func (c *Checker) upgradeProbe(ctx, fetchCtx context.Context, out *checkOutcome,
 	cur.LastCheckAt, cur.LastSuccessAt, cur.CheckFailCount = &nowUnix, &nowUnix, 0
 	setChangeSeen(cur, nowUnix)
 	e := checkEnd{form: formName(t.form), status: 200}
-	if gate.active && !gate.due && req.key == gate.hash {
+	if gate.holds(req.key) {
 		e.result, e.reason, req = "changed_deferred", gate.reason, nil
 	} else {
 		req, e.result = c.admit(out, cur, req, false, prevSuccess, "form_changed", "changed_queued")
@@ -492,7 +495,7 @@ func (c *Checker) checkUnsigned(ctx, fetchCtx context.Context, out *checkOutcome
 	e := checkEnd{form: "unsigned", status: res.Status}
 	key := contentKey(adoptionFormUnsigned, nil, res.Body, nil)
 	steady := res.Status == 304 || newHash == cachedHash
-	deferred := !steady && gate.active && !gate.due && key == gate.hash
+	deferred := !steady && gate.holds(key)
 	if !steady && !deferred && c.adopter != nil {
 		refusal, err := c.unsignedRefusal(ctx, &adoptionRequest{suite: suite, key: key, releaseBytes: res.Body,
 			etag: res.ETag, lastmod: res.LastModified})
@@ -508,9 +511,9 @@ func (c *Checker) checkUnsigned(ctx, fetchCtx context.Context, out *checkOutcome
 	}
 	prevSuccess := cur.LastSuccessAt
 	cur.LastCheckAt, cur.LastSuccessAt, cur.CheckFailCount = &nowUnix, &nowUnix, 0
-	switch result, clear, ok := steadyResult(cur, res, newHash, cachedHash, gate, nowUnix); {
+	switch result, clearRec, ok := steadyResult(cur, res, newHash, cachedHash, gate, nowUnix); {
 	case ok:
-		e.result, e.clearRecord = result, clear
+		e.result, e.clearRecord = result, clearRec
 		if result == "changed_deferred" {
 			e.reason = gate.reason
 		}

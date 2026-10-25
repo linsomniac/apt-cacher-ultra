@@ -117,13 +117,6 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 		return
 	}
 
-	// A last_success_at in the future made the suite due (suiteDue reads
-	// it as infinitely old without reporting it on every tick, deferred
-	// minor B-38); the check reports it once and any answer heals it.
-	if cur.LastSuccessAt != nil && time.Unix(*cur.LastSuccessAt, 0).After(now.Add(clockStepTolerance)) {
-		c.clockStep("last_success_at", scheme, host, suitePath, *cur.LastSuccessAt, now)
-	}
-
 	// Cooldown gate. Spec C4 clock-step rule: a past-event stamp found in
 	// the future (backward wall-clock step) is treated as infinitely old,
 	// never as "just checked" — otherwise the suite freezes for the size
@@ -139,6 +132,16 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 		case now.Sub(last) < c.cooldown:
 			return // out.report stays resultSkipped
 		}
+	}
+
+	// A last_success_at in the future made the suite due (suiteDue reads
+	// it as infinitely old without reporting it on every tick, deferred
+	// minor B-38). It is reported here, below the cooldown gate, so a
+	// client check the cooldown turns away counts nothing: each check that
+	// runs reports it until a successful answer rewrites the stamp
+	// (deferred minor E-37).
+	if cur.LastSuccessAt != nil && time.Unix(*cur.LastSuccessAt, 0).After(now.Add(clockStepTolerance)) {
+		c.clockStep("last_success_at", scheme, host, suitePath, *cur.LastSuccessAt, now)
 	}
 
 	suite := SuiteRef{
@@ -427,7 +430,7 @@ func (c *Checker) baseline(ctx context.Context, cur *cache.SuiteFreshness, suite
 				"suite_path", suite.SuitePath,
 			)
 		} else {
-			signedCurrent = snap.Form == cache.FormInline || snap.Form == cache.FormDetached
+			signedCurrent = signedForm(snap.Form)
 			if h := snap.AnchorHash(name); h != nil {
 				hash = *h
 			}
@@ -444,6 +447,15 @@ func (c *Checker) baseline(ctx context.Context, cur *cache.SuiteFreshness, suite
 		)
 	}
 	return hash, signedCurrent
+}
+
+// signedForm reports whether form is a signed anchor form (inline or
+// detached): what the reserved-slot rule (spec C4) and the scheduler's
+// signed flag ask of a current snapshot. An unknown or empty form is not
+// signed (deferred minor E-31: the one predicate; Reconcile used
+// "not unsigned").
+func signedForm(form cache.AnchorForm) bool {
+	return form == cache.FormInline || form == cache.FormDetached
 }
 
 // admit takes an admission slot for req (spec C4: TryAcquire before
@@ -483,8 +495,10 @@ func bodyHash(res *fetch.ConditionalResult) string {
 
 // checkInline runs the conditional GET against InRelease and
 // processes the result. Returns:
-//   - (req, false) on success (req may be nil for unchanged/304).
-//   - (nil, true) when the inline path got 404 AND the suite has no
+//   - (req, repair, false) once the check has ended (req is nil when
+//     nothing is to be adopted, repair nil unless a member repair is
+//     planned).
+//   - (nil, nil, true) when the inline path got 404 AND the suite has no
 //     current snapshot AND a Release url_path row exists — the
 //     dispatcher then retries via checkDetached. We return
 //     without persisting in the fallback case so the detached
@@ -622,11 +636,12 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, 
 	newHash := bodyHash(res)
 	e := checkEnd{form: "inline", status: res.Status, signedCurrent: signedCurrent}
 	var req *adoptionRequest
-	if result, clear, ok := steadyResult(cur, res, newHash, cachedHash, gate, nowUnix); ok {
-		e.result, e.clearRecord = result, clear
-	} else if gate.active && !gate.due && newHash == gate.hash {
+	if result, clearRec, ok := steadyResult(cur, res, newHash, cachedHash, gate, nowUnix); ok {
+		e.result, e.clearRecord = result, clearRec
+	} else if gate.holds(newHash) {
 		// An upstream that ignores validators re-served the failing
-		// bytes: deferred exactly like the 304 above.
+		// bytes: deferred, as steadyResult defers a 304 to the record's
+		// own validators.
 		setChangeSeen(cur, nowUnix)
 		e.result = "changed_deferred"
 	} else {
@@ -795,12 +810,13 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 	newHash := bodyHash(res)
 	e := checkEnd{form: "detached", status: res.Status, signedCurrent: signedCurrent}
 	var req *adoptionRequest
-	if result, clear, ok := steadyResult(cur, res, newHash, cachedHash, gate, nowUnix); ok {
-		// A 304 while a failure record exists: Release still matches the
-		// failing content's validators, and a re-signature behind it waits
-		// for the retry (spec C7). A record the lateral InRelease still
+	if result, clearRec, ok := steadyResult(cur, res, newHash, cachedHash, gate, nowUnix); ok {
+		// Upstream still serves what the suite has (steadyResult): a 304
+		// — changed_deferred when the record's own validators were sent, a
+		// re-signature behind them waiting for the retry (spec C7) — or a
+		// 200 of the current Release. A record the lateral InRelease still
 		// holds is not cleared by the detached anchor's "unchanged".
-		e.result, e.clearRecord = result, clear && !lateralHeld
+		e.result, e.clearRecord = result, clearRec && !lateralHeld
 	} else {
 		setChangeSeen(cur, nowUnix)
 		// The content key covers the signature, so Release.gpg is fetched
@@ -842,7 +858,7 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 			e.result = "changed"
 		default:
 			key := contentKey(adoptionFormDetached, nil, res.Body, gpgRes.Body)
-			if gate.active && !gate.due && key == gate.hash {
+			if gate.holds(key) {
 				e.result = "changed_deferred"
 				break
 			}

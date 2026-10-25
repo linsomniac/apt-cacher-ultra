@@ -375,7 +375,7 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 	}
 	req := t.request(suite)
 	// Spec C7: the same content as the record's, before its retry time.
-	deferred, reason := gate.active && !gate.due && req.key == gate.hash, gate.reason
+	deferred, reason := gate.holds(req.key), gate.reason
 	if !deferred && t.form == adoptionFormUnsigned {
 		proceed, refusal, err := c.unsignedFirst(ctx, cur, req, t, gate, now)
 		if err != nil {
