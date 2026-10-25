@@ -2771,7 +2771,7 @@ new:
           fi
           program_headers="$(readelf --program-headers --wide build/apt-cacher-ultra)"
 ```
-(The untagged guard, `TestBuildAdopter_ReleaseBinaryIgnoresTheE2ECommitDelay`, already runs in `go test ./...`. `golangci-lint` with the tag stays a local gate, Task 9: CI runs no `golangci-lint` today, and adding it is a CI change of its own.)
+(The untagged guard, `TestBuildAdopter_ReleaseBinaryIgnoresTheE2ECommitDelay`, already runs in `go test ./...`. `golangci-lint` with the tag stays a local gate, Task 9: CI's `lint` job runs `golangci-lint-action` untagged, and the `go vet -tags e2ehooks` above covers the tagged file in CI.)
 
 - [ ] **Step 2: Add the `e2e-flat` job**
 
