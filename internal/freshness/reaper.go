@@ -247,9 +247,11 @@ type reapCandidate struct {
 // completed run, which comes only after the uptime floor; so the alert is
 // absent(acu_suite_reaper_last_run_unixtime) OR its age > reapInterval +
 // reapUptimeFloor — an age alert alone never fires for a reaper that has
-// not completed a run since its start. The gauge is not seeded at Run's
-// start on purpose: that would claim a run that did not happen (Task 6
-// review minor 3).
+// not completed a run since its start. The series is also absent for the
+// floor after every start, so the absent() leg must hold for longer than
+// reapUptimeFloor + reapInterval (a Prometheus for: clause) or it pages
+// on every restart. The gauge is not seeded at Run's start on purpose:
+// that would claim a run that did not happen (Task 6 review minor 3).
 func (r *Reaper) runOnce(ctx context.Context) {
 	start := time.Now()
 	rows, err := r.cache.ListSuitesWithAdoption(ctx)
