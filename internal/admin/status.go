@@ -496,7 +496,8 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 // AIDEV-NOTE: a field gc.LastRunSummary gains is not shown until it is
 // copied here (retired_reaped waited from phase F to H1: the F
 // carry-forward); TestGCInfoFromSummary_CopiesEveryShownField pins the
-// copy of each field the block has.
+// copy of each field the block has (its reflection pass fails on a gcInfo
+// field a fully set summary leaves zero).
 func gcInfoFromSummary(summary gc.LastRunSummary) *gcInfo {
 	ts := summary.AtUnixTime
 	return &gcInfo{
@@ -677,9 +678,12 @@ func buildSuiteEntries(rows []cache.SuiteWithAdoption, now int64) []suiteEntry {
 // ×k · backoff ends in d", or "… backoff over" once it has: the earliest
 // the scheduler may check the suite — a client's T1 may come sooner, a
 // not-yet-stale suite later; the count alone for a suite the scheduler
-// does not queue on its backoff (unscheduled) or without a backoff
-// function). adoptionEnabled is the status page's own signal
-// (Server.adoptionEnabled).
+// does not queue on its backoff (unscheduled), without a backoff
+// function, or for a last check further in the future than
+// statusClockStepTolerance: suiteDue reads that stamp as infinitely old,
+// so no backoff holds the suite, and as laggingAnnotation shows no lag
+// for a future stamp, the cell shows no backoff). adoptionEnabled is the
+// status page's own signal (Server.adoptionEnabled).
 //
 // AIDEV-NOTE: phase G ruling PG-14 (design note 5 of the H1 plan).
 // Anchorless is derived, not stored: adoption enabled, a flat suite, no
@@ -708,7 +712,8 @@ func annotateSuiteEntries(es []suiteEntry, adoptionEnabled bool, checkBackoff fu
 			continue
 		}
 		e.CheckStatus = "checks failing ×" + strconv.FormatInt(e.CheckFailCount, 10)
-		if checkBackoff == nil || e.LastCheckUnixTime == nil || unscheduled(e, adoptionEnabled, now) {
+		if checkBackoff == nil || e.LastCheckUnixTime == nil || *e.LastCheckUnixTime > now+statusClockStepTolerance ||
+			unscheduled(e, adoptionEnabled, now) {
 			continue
 		}
 		next := *e.LastCheckUnixTime + int64(checkBackoff(e.CheckFailCount)/time.Second)
@@ -721,11 +726,27 @@ func annotateSuiteEntries(es []suiteEntry, adoptionEnabled bool, checkBackoff fu
 }
 
 // statusInterestWindow mirrors freshness's interestWindow (spec C4
-// Dispatch 3), which admin does not import.
+// Dispatch 3), and statusClockStepTolerance (seconds) its
+// clockStepTolerance; admin does not import freshness.
 //
-// AIDEV-NOTE: unscheduled mirrors the scheduler's suiteDue (review M-5 of
-// the H1 plan): change both together.
-const statusInterestWindow = 7 * 24 * time.Hour
+// AIDEV-NOTE: unscheduled and annotateSuiteEntries' future-stamp test
+// mirror the scheduler's suiteDue (review M-5 of the H1 plan; Task 4
+// review M-2): its dormancy (a never-adopted suite without client
+// interest), its record pacing (an adopted suite's anchor_absent or
+// unsigned_disabled record) and its clock-step rule (a last_check_at
+// beyond the tolerance is infinitely old, so no backoff holds the suite).
+// Known gaps: unscheduled ignores adoption_next_retry_at, so a pacing
+// record whose retry has come, which suiteDue queues once the backoff
+// ends, still shows the count alone (less informative, never a false
+// promise); and it cannot see the checker's in-memory pacing of a suite
+// whose last answered check ended anchor_absent (ruling PE-10,
+// pacedAbsentAnswer), so there the cell may say the backoff is over while
+// the scheduler waits for the record's retry, which the record's own text
+// shows. Change both sides together.
+const (
+	statusInterestWindow     = 7 * 24 * time.Hour
+	statusClockStepTolerance = 2
+)
 
 // unscheduled reports a suite the scheduler does not queue on its failing
 // checks' backoff: with adoption enabled, a never-adopted suite no client
@@ -1001,18 +1022,22 @@ func writeStatusJSON(w io.Writer, m statusModel) error {
 // buildHTMLRenderModel composes the docs/admin-ui-spec.md §0.7 wrapper
 // from the wire-shaped statusModel plus the bits of server config the
 // HTML template needs but the JSON contract intentionally does not
-// expose. JSON path never calls this.
+// expose. The JSON path does not call this wrapper, but it reads the
+// same adoption signal (Server.adoptionEnabled) for suites[].anchorless.
 //
 // AIDEV-NOTE: AdoptionEnabled — the spec hint at §0.7 says
 // `cfg.Keyring != nil at server build time`, but in production the cmd
 // entry point always passes a non-nil KeyringProvider whose snapshot is
 // nil when adoption is disabled (see cmd/apt-cacher-ultra/main.go
-// keyringProvider adapter). §2.3 forbids editing cmd and admin/server.go
-// to add an explicit AdoptionEnabled field, so the wrapper uses the
-// snapshot-nil convention as the operator-facing signal: a nil snapshot
+// keyringProvider adapter). The signal is therefore the snapshot-nil
+// convention, which lives in Server.adoptionEnabled: a nil snapshot
 // means "no keyring wired at all" → adoption disabled, while a non-nil
 // (possibly empty) slice means "adoption enabled, keys may not be loaded
-// yet". See .phase-loop-notes.md "Spec issues" for the followup.
+// yet". It is not HTML-only: buildStatusModel passes it to
+// annotateSuiteEntries, so it also derives the JSON's
+// suites[].anchorless, and changing the convention changes the JSON
+// contract (TestStatus_AnchorlessFlatSuiteThroughTheServer). See
+// .phase-loop-notes.md "Spec issues" for the followup.
 func (s *Server) buildHTMLRenderModel(m statusModel) htmlRenderModel {
 	w := htmlRenderModel{statusModel: m, AdoptionEnabled: s.adoptionEnabled()}
 	w.Suites = suitesForHTML(m.Suites, w.AdoptionEnabled)

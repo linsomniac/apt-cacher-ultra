@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // Phase G ruling PG-14, Review Focus 5 (design note 5): suites[].anchorless
@@ -61,13 +63,16 @@ func TestSuiteEntries_Anchorless(t *testing.T) {
 // check ends — "backoff over" once it has — and without a backoff
 // function only the count. A suite the scheduler does not queue on that
 // backoff shows the count alone: a never-adopted suite no client asked
-// for in 7 days, an adopted one its anchor_absent record paces. A
-// record's own text is kept apart.
+// for in 7 days or ever, an adopted one its anchor_absent or
+// unsigned_disabled record paces. So does a suite never checked, and
+// one whose last check lies further ahead than the clock-step tolerance
+// (suiteDue reads it as infinitely old: no backoff holds it; Task 4
+// review M-2). A record's own text is kept apart.
 func TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds(t *testing.T) {
 	now := int64(1_800_000_000)
 	backoff := func(k int64) time.Duration { return time.Duration(k) * time.Minute }
-	recent, old, stale := now-60, now-600, now-8*24*3600
-	reason, absent := "gpg_failed", "anchor_absent"
+	recent, old, stale, ahead, edge := now-60, now-600, now-8*24*3600, now+3600, now+2
+	reason, absent, unsignedDisabled := "gpg_failed", "anchor_absent", "unsigned_disabled"
 	snap := int64(7)
 	es := []suiteEntry{
 		{SuitePath: "/a", CheckFailCount: 3, LastCheckUnixTime: &recent, LastRequestedUnixTime: &recent},
@@ -78,6 +83,17 @@ func TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds(t *testing.T) {
 		{SuitePath: "/dormant", CheckFailCount: 2, LastCheckUnixTime: &old, LastRequestedUnixTime: &stale},
 		{SuitePath: "/paced", CheckFailCount: 1, LastCheckUnixTime: &old, CurrentSnapshotID: &snap,
 			AdoptionFailReason: &absent, AdoptionFailCount: 2},
+		// Task 4 review M-3: no last_requested at all is dormant too; an
+		// unsigned_disabled record paces as anchor_absent does; a suite
+		// never checked has no backoff to end.
+		{SuitePath: "/unasked", CheckFailCount: 2, LastCheckUnixTime: &old},
+		{SuitePath: "/unsigned", CheckFailCount: 1, LastCheckUnixTime: &old, CurrentSnapshotID: &snap,
+			AdoptionFailReason: &unsignedDisabled, AdoptionFailCount: 1},
+		{SuitePath: "/unchecked", CheckFailCount: 3, LastRequestedUnixTime: &recent},
+		// Task 4 review M-2: a last check beyond the clock-step tolerance
+		// holds no backoff; one within it still does.
+		{SuitePath: "/future", CheckFailCount: 2, LastCheckUnixTime: &ahead, LastRequestedUnixTime: &recent},
+		{SuitePath: "/tolerated", CheckFailCount: 2, LastCheckUnixTime: &edge, LastRequestedUnixTime: &recent},
 	}
 	annotateSuiteEntries(es, true, backoff, now)
 	for i, want := range []string{
@@ -87,6 +103,11 @@ func TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds(t *testing.T) {
 		"checks failing ×1 · backoff over",
 		"checks failing ×2",
 		"checks failing ×1",
+		"checks failing ×2",
+		"checks failing ×1",
+		"checks failing ×3",
+		"checks failing ×2",
+		"checks failing ×2 · backoff ends in 2m",
 	} {
 		if es[i].CheckStatus != want {
 			t.Errorf("%s: %q, want %q", es[i].SuitePath, es[i].CheckStatus, want)
@@ -108,7 +129,12 @@ func TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds(t *testing.T) {
 }
 
 // The F carry-forward: the gc block copies each field of the last run's
-// summary it shows — retired_reaped (sub-job C, phase F) among them.
+// summary it shows — retired_reaped (sub-job C, phase F) among them. The
+// literal pins each mapping; the reflection pass (Task 4 review M-4)
+// fails on any gcInfo field that a summary with every field set leaves
+// zero, so a field the block gains without its copy fails here too. Every
+// gcInfo field comes from the summary (LastRunUnixTime from AtUnixTime),
+// so none is excluded.
 func TestGCInfoFromSummary_CopiesEveryShownField(t *testing.T) {
 	g := gcInfoFromSummary(gc.LastRunSummary{Phase: "periodic", AtUnixTime: 1_800_000_000, DurationSeconds: 1.5,
 		BlobsReaped: 2, BytesReclaimed: 3, OrphanCandidatesReaped: 4, DisplacedReaped: 5, RetiredReaped: 6,
@@ -122,6 +148,29 @@ func TestGCInfoFromSummary_CopiesEveryShownField(t *testing.T) {
 	g.LastRunUnixTime = nil
 	if *g != want {
 		t.Fatalf("gc block %+v, want %+v", *g, want)
+	}
+
+	var full gc.LastRunSummary
+	sv := reflect.ValueOf(&full).Elem()
+	for i := range sv.NumField() {
+		switch f := sv.Field(i); f.Kind() {
+		case reflect.String:
+			f.SetString("x")
+		case reflect.Bool:
+			f.SetBool(true)
+		case reflect.Int, reflect.Int64:
+			f.SetInt(int64(i + 1))
+		case reflect.Float64:
+			f.SetFloat(float64(i) + 0.5)
+		default:
+			t.Fatalf("gc.LastRunSummary.%s is a %s: teach this test to set it", sv.Type().Field(i).Name, f.Kind())
+		}
+	}
+	gv := reflect.ValueOf(gcInfoFromSummary(full)).Elem()
+	for i := range gv.NumField() {
+		if gv.Field(i).IsZero() {
+			t.Errorf("gcInfo.%s is zero for a summary with every field set: gcInfoFromSummary does not copy it", gv.Type().Field(i).Name)
+		}
 	}
 }
 
@@ -151,7 +200,7 @@ func TestStatusHTML_ShowsTheSweepsCells(t *testing.T) {
 	m.GC.RetiredReaped = 6
 	html := renderHTMLForGolden(t, m)
 	mustContain(t, html,
-		"<th>Last requested",
+		"<th>Last requested<details", // the suites header; Hot URL paths' is a bare <th>Last requested</th>
 		`<td data-label="Last requested" class="time">`+string(formatUnixTimePtrTag(&requested))+`</td>`,
 		`<td data-label="Adoption" class="mono">refreshed without a Release</td>`,
 		`<td data-label="Adoption" class="mono">refused: upstream_older · retry due &middot; checks failing ×3 · backoff ends in 2m</td>`,
@@ -211,5 +260,31 @@ func TestStatus_AnchorlessFlatSuiteThroughTheServer(t *testing.T) {
 				t.Fatalf("adoption enabled %v: the HTML's \"refreshed without a Release\" shown %v", enabled, !enabled)
 			}
 		})
+	}
+}
+
+func withCheckBackoff(f func(failCount int64) time.Duration) adminOpt {
+	return func(cfg *Config) { cfg.CheckBackoff = f }
+}
+
+// Deferred minor B-63 through the server (Task 4 review M-1): the status
+// page hands Config.CheckBackoff to annotateSuiteEntries, so a suite whose
+// checks keep failing, last checked just now, shows when its backoff
+// ends. TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds calls
+// annotateSuiteEntries directly; this checks buildStatusModel's half of
+// the wiring (main's CheckBackoff: freshness.CheckBackoff is the other).
+func TestStatus_FailingChecksBackoffThroughTheServer(t *testing.T) {
+	s, base, cleanup := startAdminServer(t, withCheckBackoff(func(int64) time.Duration { return time.Hour }))
+	defer cleanup()
+	last := wallclock.Now().Unix()
+	if err := s.cfg.Cache.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{CanonicalScheme: "http",
+		CanonicalHost: "h", SuitePath: "/r/dists/x", LastCheckAt: &last, CheckFailCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+	resp := mustGet(t, base+"/")
+	html, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if want := "checks failing ×2 · backoff ends in "; !strings.Contains(string(html), want) {
+		t.Fatalf("the suites table lacks %q (the count alone shown: %v)", want, strings.Contains(string(html), "checks failing ×2"))
 	}
 }
