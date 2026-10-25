@@ -42,6 +42,22 @@ const (
 type LegacyAuditDecision struct {
 	SnapshotID int64
 	Outcome    LegacyAuditOutcome
+	// DropAnchorRows, with a quarantine, also deletes every url_path row
+	// that holds the snapshot's stored InRelease blob — the audit's
+	// anchor_corrupt verdict (ruling R-H2). Set with any other outcome it
+	// rolls the batch back, as an invalid outcome does.
+	DropAnchorRows bool
+}
+
+// LegacyAuditEffect is what ApplyLegacyAuditDecisions did to one
+// quarantined snapshot.
+type LegacyAuditEffect struct {
+	// WasCurrent: it was its suite's current snapshot, so the pointer and
+	// validators were cleared and its pins released.
+	WasCurrent bool
+	// AnchorRowsDeleted counts the url_path rows of its InRelease blob
+	// that DropAnchorRows deleted.
+	AnchorRowsDeleted int
 }
 
 // LegacyAuditBatch returns up to limit queued items with snapshot_id >
@@ -79,16 +95,22 @@ SELECT q.snapshot_id, s.snapshot_id IS NULL,
 }
 
 // ApplyLegacyAuditDecisions applies one batch of audit decisions in ONE
-// writer transaction (spec §6.1) and reports which quarantined snapshots
-// were current. An invalid outcome rolls the whole batch back.
+// writer transaction (spec §6.1) and reports, for each quarantined
+// snapshot, whether it was current and how many url_path rows of its
+// InRelease blob it deleted (DropAnchorRows). An invalid outcome rolls the
+// whole batch back.
 //
 // AIDEV-NOTE: every effect is idempotent — a quarantine finds an already
 // handled snapshot non-current (no second refcount release) and already
-// retired; a repeated marker keeps the newest stamp — so a crash between
-// batches never double-applies. Never release pins for a non-current
-// snapshot: displacement already did.
-func (c *Cache) ApplyLegacyAuditDecisions(ctx context.Context, decisions []LegacyAuditDecision) (map[int64]bool, error) {
-	wasCurrent := make(map[int64]bool)
+// retired; a repeated marker keeps the newest stamp; a repeated anchor-row
+// drop finds the rows gone — so a crash between batches never
+// double-applies. Never release pins for a non-current snapshot:
+// displacement already did. The anchor-row drop (ruling R-H2) is in the
+// quarantine's own transaction on purpose: the dequeue commits with it,
+// so a drop left to a later transaction that failed would never be
+// retried, and the rows would serve the corrupt bytes for good.
+func (c *Cache) ApplyLegacyAuditDecisions(ctx context.Context, decisions []LegacyAuditDecision) (map[int64]LegacyAuditEffect, error) {
+	effects := make(map[int64]LegacyAuditEffect)
 	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
@@ -97,6 +119,10 @@ func (c *Cache) ApplyLegacyAuditDecisions(ctx context.Context, decisions []Legac
 		defer func() { _ = tx.Rollback() }()
 		now := nowUnix()
 		for _, d := range decisions {
+			if d.DropAnchorRows && d.Outcome != LegacyAuditQuarantine && d.Outcome != LegacyAuditQuarantineSigned {
+				return fmt.Errorf("ApplyLegacyAuditDecisions: snapshot %d: anchor rows dropped without a quarantine (outcome %d)",
+					d.SnapshotID, d.Outcome)
+			}
 			switch d.Outcome {
 			case LegacyAuditKeep:
 				if err := markSnapshotBaseTx(ctx, tx, d.SnapshotID); err != nil {
@@ -108,7 +134,13 @@ func (c *Cache) ApplyLegacyAuditDecisions(ctx context.Context, decisions []Legac
 				if err != nil {
 					return err
 				}
-				wasCurrent[d.SnapshotID] = cur
+				eff := LegacyAuditEffect{WasCurrent: cur}
+				if d.DropAnchorRows {
+					if eff.AnchorRowsDeleted, err = dropAnchorBlobRowsTx(ctx, tx, d.SnapshotID, now); err != nil {
+						return err
+					}
+				}
+				effects[d.SnapshotID] = eff
 				if d.Outcome == LegacyAuditQuarantineSigned {
 					if err := markSnapshotBaseTx(ctx, tx, d.SnapshotID); err != nil {
 						return err
@@ -126,7 +158,57 @@ func (c *Cache) ApplyLegacyAuditDecisions(ctx context.Context, decisions []Legac
 	if err != nil {
 		return nil, err
 	}
-	return wasCurrent, nil
+	return effects, nil
+}
+
+// dropAnchorBlobRowsTx deletes every url_path row — under any scheme and
+// host — whose blob is snapshotID's stored InRelease (ruling R-H2: the
+// audit found that pool file's bytes no longer match their hash), each
+// through deleteURLPathRowTx, and returns how many it deleted. A snapshot
+// without an InRelease hash, or gone, deletes nothing.
+//
+// AIDEV-NOTE: rows only, never the pool file here: the writer runs no
+// pool I/O (ruling PD-5); RunLegacyTrustAudit removes the corrupt file
+// itself, outside the writer, after the batch commits (review C-1).
+// Every row that names the blob serves the same bad bytes (the pool is
+// content-addressed: a flat suite and its /. twin, or two remapped
+// hosts, share it), so all of them go, and the next client request for
+// each is a miss that fetches a fresh copy
+// (TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor).
+func dropAnchorBlobRowsTx(ctx context.Context, tx *sql.Tx, snapshotID, now int64) (int, error) {
+	var hash sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT inrelease_hash FROM suite_snapshot WHERE snapshot_id = ?`, snapshotID).Scan(&hash)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return 0, nil
+	case err != nil:
+		return 0, fmt.Errorf("drop anchor rows of %d: read snapshot: %w", snapshotID, err)
+	case !hash.Valid || hash.String == "":
+		return 0, nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT canonical_scheme, canonical_host, path FROM url_path WHERE blob_hash = ?`, hash.String)
+	if err != nil {
+		return 0, fmt.Errorf("drop anchor rows of %d: %w", snapshotID, err)
+	}
+	type rowKey struct{ scheme, host, path string }
+	var keys []rowKey
+	for rows.Next() {
+		var k rowKey
+		if err := rows.Scan(&k.scheme, &k.host, &k.path); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("drop anchor rows of %d: scan: %w", snapshotID, err)
+		}
+		keys = append(keys, k)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("drop anchor rows of %d: %w", snapshotID, err)
+	}
+	for _, k := range keys {
+		if err := deleteURLPathRowTx(ctx, tx, k.scheme, k.host, k.path, hash, now); err != nil {
+			return 0, fmt.Errorf("drop anchor rows of %d: %w", snapshotID, err)
+		}
+	}
+	return len(keys), nil
 }
 
 // quarantineSnapshotTx removes all trust from a snapshot: if it is a

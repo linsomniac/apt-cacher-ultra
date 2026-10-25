@@ -66,7 +66,7 @@ func applyOne(t *testing.T, c *Cache, id int64, o LegacyAuditOutcome) bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return cur[id]
+	return cur[id].WasCurrent
 }
 
 // Spec §6.1: quarantining a current snapshot clears the pointer, releases

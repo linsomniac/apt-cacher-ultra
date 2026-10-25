@@ -28,6 +28,9 @@ var (
 	// legacyClassify is auditLegacySnapshot's classifier; tests swap it to
 	// inject a panic.
 	legacyClassify = classifyLegacyInline
+	// legacyDiscardAnchor removes a corrupt anchor's pool file (ruling
+	// R-H2); tests swap it to inject a failure.
+	legacyDiscardAnchor = func(c *cache.Cache, hash string) error { return c.DiscardFinalizedBlob(hash) }
 )
 
 var errAnchorTooLarge = errors.New("anchor exceeds the audit read cap")
@@ -40,6 +43,9 @@ type LegacyAuditResult struct {
 type legacyVerdict struct {
 	outcome cache.LegacyAuditOutcome
 	reason  string // set for quarantines
+	// dropAnchorRows: the quarantine also deletes the url_path rows of the
+	// stored InRelease blob (anchor_corrupt only; ruling R-H2).
+	dropAnchorRows bool
 }
 
 // RunLegacyTrustAudit drains legacy_trust_audit, then records signed-seen
@@ -99,12 +105,13 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 				logger.Error("legacy_trust_audit_deferred", attrs...)
 				continue
 			}
-			decisions = append(decisions, cache.LegacyAuditDecision{SnapshotID: it.SnapshotID, Outcome: v.outcome})
+			decisions = append(decisions, cache.LegacyAuditDecision{SnapshotID: it.SnapshotID, Outcome: v.outcome,
+				DropAnchorRows: v.dropAnchorRows})
 			decided = append(decided, it)
 			reasons = append(reasons, v.reason)
 		}
 		if len(decisions) > 0 {
-			wasCurrent, err := c.ApplyLegacyAuditDecisions(ctx, decisions)
+			effects, err := c.ApplyLegacyAuditDecisions(ctx, decisions)
 			if err != nil {
 				return res, fmt.Errorf("legacy trust audit: %w", err)
 			}
@@ -120,6 +127,35 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 				case cache.LegacyAuditQuarantine, cache.LegacyAuditQuarantineSigned:
 					res.Quarantined++
 					legacyQuarantinedTotal.Inc()
+					if d.DropAnchorRows {
+						// AIDEV-NOTE: ruling R-H2 as amended by review C-1 and
+						// re-review N-1 (phase H1). The rotted pool file goes too,
+						// not only its url_path rows: the miss path's Finalize
+						// keeps an existing pool/<hash>, so refetching an upstream
+						// InRelease that has not changed (the usual bit rot) would
+						// store onto, and serve, the rotted file. It runs after the
+						// batch commits, on main's goroutine before anything
+						// serves, never on the writer (PD-5), as the integrity
+						// scanner's DiscardFinalizedBlob does. Never before the
+						// commit: a lost commit would leave the snapshots queued
+						// with their anchors missing, and when every queued inline
+						// anchor is missing the next start's preflight refuses to
+						// start ("is the pool mounted?"). A crash between the
+						// commit and this removal leaves the file, as a failed
+						// removal does: the rows are gone, so a changed upstream
+						// heals, and an unchanged one is healed by the eager
+						// re-adoption's rehash (writeBlobBytes) once a client asks
+						// with adoption enabled; the audit does not revisit it.
+						if err := legacyDiscardAnchor(c, *decided[i].SingleAnchorHash); err != nil {
+							logger.Error("legacy_anchor_discard_failed",
+								"snapshot_id", d.SnapshotID,
+								"canonical_host", decided[i].CanonicalHost,
+								"suite_path", decided[i].SuitePath,
+								"blob_hash", *decided[i].SingleAnchorHash,
+								"err", err,
+							)
+						}
+					}
 					// Logged after the batch commits: a crash can lose the
 					// line, never the effect.
 					logger.Warn("legacy_snapshot_quarantined",
@@ -128,7 +164,8 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 						"canonical_host", decided[i].CanonicalHost,
 						"suite_path", decided[i].SuitePath,
 						"anchor_form", string(decided[i].Form),
-						"was_current", wasCurrent[d.SnapshotID],
+						"was_current", effects[d.SnapshotID].WasCurrent,
+						"anchor_rows_deleted", effects[d.SnapshotID].AnchorRowsDeleted,
 					)
 				}
 			}
@@ -256,7 +293,14 @@ func auditLegacySnapshot(c *cache.Cache, it cache.LegacyAuditItem) (legacyVerdic
 	}
 	sum := sha256.Sum256(blob)
 	if hex.EncodeToString(sum[:]) != *it.SingleAnchorHash {
-		return quarantine("anchor_corrupt")
+		// AIDEV-NOTE: ruling R-H2 (the maintainer, 2026-10-24; review C-1).
+		// The bytes were read and hashed, so this is evidence: the
+		// quarantine also deletes the url_path rows that serve this pool
+		// file, and RunLegacyTrustAudit removes the file itself, so the next
+		// client request fetches a fresh copy instead of bytes apt rejects.
+		// anchor_oversized (not read in full) and anchor_missing (a missing
+		// pool file already falls through to the miss path) keep theirs.
+		return legacyVerdict{outcome: cache.LegacyAuditQuarantine, reason: "anchor_corrupt", dropAnchorRows: true}, nil
 	}
 	return legacyClassify(blob), nil
 }
