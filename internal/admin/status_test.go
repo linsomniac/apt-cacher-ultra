@@ -260,10 +260,9 @@ func TestVitalState(t *testing.T) {
 		{
 			"suites_healthy_no_lag",
 			func(m *htmlRenderModel) {
-				m.Suites = []suiteEntry{{
-					LastSuccessUnixTime:           ptrI64(1_000_000_000),
-					InReleaseChangeSeenAtUnixTime: ptrI64(1_000_000_000),
-				}}
+				// No change pending (deferred minor B-60: a change stamp
+				// here meant one seen and not yet adopted, not "no lag").
+				m.Suites = []suiteEntry{{LastSuccessUnixTime: ptrI64(1_000_000_000)}}
 			},
 			"suites", "ok",
 		},

@@ -654,6 +654,7 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 			// / member_mismatch). Empty for success and non-member failures.
 			memberPath, detail := memberErrorFields(err)
 			c.adoptionRing.Record(observability.AdoptionEvent{
+				Scheme:           req.suite.CanonicalScheme,
 				Host:             req.suite.CanonicalHost,
 				SuitePath:        req.suite.SuitePath,
 				Outcome:          outcome,

@@ -731,6 +731,7 @@ func serveListeners(
 			Keyring:                 &keyringProvider{k: keyring},
 			Reconciler:              freshChecker,
 			Forgetter:               reaper,
+			CheckBackoff:            freshness.CheckBackoff,
 		})
 		if err != nil {
 			return fmt.Errorf("build admin: %w", err)

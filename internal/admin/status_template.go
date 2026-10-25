@@ -444,6 +444,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
           <table class="data">
             <thead><tr>
               <th>Host</th><th>Suite path</th><th>Last check</th><th>Last success</th>
+              <th>Last requested<details class="col-hint"><summary aria-label="What does Last requested mean?">i</summary><div class="col-hint__body">When a client last asked for this suite. A suite no client asks for in gc.suite_idle_ttl (720 h by default) is reaped.</div></details></th>
               <th class="num">Snapshot</th>
               <th>Adopted<details class="col-hint"><summary aria-label="What does Adopted mean?">i</summary><div class="col-hint__body">Adoption fires only when a fresh InRelease has been observed. Suites whose upstream has not republished since process start may stay empty here without being broken.</div></details></th>
               <th>InRelease changed</th>
@@ -456,16 +457,17 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
                 <td data-label="Suite path" class="mono">{{.SuitePath}}{{if .Flat}} <span class="b b--neutral b--nocopy">flat</span>{{end}}</td>
                 <td data-label="Last check" class="time">{{unixTimePtr .LastCheckUnixTime}}</td>
                 <td data-label="Last success" class="time">{{unixTimePtr .LastSuccessUnixTime}}</td>
+                <td data-label="Last requested" class="time">{{unixTimePtr .LastRequestedUnixTime}}</td>
                 <td data-label="Snapshot" class="num mono">{{i64Ptr .CurrentSnapshotID}}</td>
                 <td data-label="Adopted" class="time">{{unixTimePtr .CurrentSnapshotAdoptedAtUnixTime}}</td>
                 <td data-label="InRelease changed" class="time">{{unixTimePtr .InReleaseChangeSeenAtUnixTime}}{{if .Lagging}} <span class="lagging">{{.Lagging}}</span>{{end}}</td>
-                <td data-label="Adoption" class="mono">{{.AdoptionStatus}}</td>
+                <td data-label="Adoption" class="mono">{{.AdoptionStatus}}{{if and .AdoptionStatus .CheckStatus}} &middot; {{end}}{{.CheckStatus}}</td>
               </tr>
             {{end}}
             </tbody>
           </table>
         </div>
-        {{else}}<div class="empty"><div class="empty__head">NO SUITES TRACKED YET</div><div class="empty__body">Suites populate after the first adoption cycle.</div></div>{{end}}
+        {{else}}<div class="empty"><div class="empty__head">NO SUITES TRACKED YET</div><div class="empty__body">A suite is tracked once a client requests its InRelease through the proxy (with adoption enabled, also its Release, or, for a flat repository, its root <code>Packages</code> or <code>Sources</code>).</div></div>{{end}}
       </section>
 
       <!-- RECENT ADOPTIONS -->
@@ -491,7 +493,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
             <tbody>
             {{range .RecentAdoptions}}
               <tr{{if eq .Outcome "refused"}} data-state="warn"{{else if ne .Outcome "success"}} data-state="crit"{{end}} data-outcome="{{.Outcome}}"{{if .Reason}} data-reason="{{.Reason}}"{{end}}{{if .MemberPath}} data-member="{{.MemberPath}}"{{end}}>
-                <td data-label="Host" class="host">{{.Host}}</td>
+                <td data-label="Host" class="host">{{if .Scheme}}{{.Scheme}}://{{end}}{{.Host}}</td>
                 <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
                 <td data-label="Outcome">{{$ott := reasonTooltip .Outcome}}<span class="b {{outcomeBadgeClass .Outcome}}"{{if ne $ott .Outcome}} title="{{$ott}}"{{end}}>{{.Outcome}}</span>{{if and .Reason (ne .Reason .Outcome)}} <span class="b b--neutral reason" title="{{reasonTooltip .Reason}}">{{.Reason}}</span>{{end}}{{if .MemberPath}} <span class="b b--neutral mono member" title="{{.Detail}}">{{.MemberPath}}</span>{{if .Detail}} <span class="muted member-detail">{{.Detail}}</span>{{end}}{{end}}</td>
                 <td data-label="Completed" class="time">{{unixTime .CompletedUnixTime}}</td>
@@ -631,6 +633,8 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
           <div class="v"><code>{{.GC.OrphanCandidatesReaped}}</code></div>
           <div class="k">Displaced reaped</div>
           <div class="v"><code>{{.GC.DisplacedReaped}}</code></div>
+          <div class="k">Retired reaped</div>
+          <div class="v"><code>{{.GC.RetiredReaped}}</code></div>
           <div class="k">Pool orphans repaired</div>
           <div class="v"><code>{{.GC.PoolOrphansRepaired}}</code> <span class="muted">({{formatBytes .GC.PoolOrphanBytesRepaired}})</span></div>
           <div class="k">Pool unlink errors</div>

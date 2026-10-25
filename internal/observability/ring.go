@@ -23,6 +23,11 @@ import (
 // `recent_adoptions[]` field set, so the status-page handler can
 // emit Snapshot results directly.
 type AdoptionEvent struct {
+	// Scheme is the canonical_scheme of the suite (http or https): an
+	// http suite and its https namesake share host and path, and POST
+	// /forget takes the scheme (deferred minor F-19). Surfaced as
+	// recent_adoptions[].scheme.
+	Scheme string
 	// Host is the canonical_host of the suite.
 	Host string
 	// SuitePath is the canonical suite path (e.g.

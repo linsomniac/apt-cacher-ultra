@@ -110,6 +110,13 @@ type Config struct {
 	// an empty list. Defined as an interface so admin does not
 	// import internal/gpg.
 	Keyring KeyringProvider
+
+	// CheckBackoff is OPTIONAL: the scheduler's backoff after a streak
+	// of failed checks (freshness.CheckBackoff, which cmd wires), for the
+	// suites table's "checks failing ×k · backoff ends in …" (deferred
+	// minor B-63). nil: the text is the count alone. A
+	// function, not an import: admin does not import internal/freshness.
+	CheckBackoff func(failCount int64) time.Duration
 }
 
 // Reconciler forces an in-place reconcile of one suite's current snapshot

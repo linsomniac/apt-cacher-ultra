@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
@@ -250,7 +252,12 @@ type suiteEntry struct {
 	// C2's flat grammar, a ./ twin included; spec C7, C11): additive to
 	// the locked JSON contract, like scheme. The HTML shows it as a tag
 	// beside the suite path.
-	Flat                             bool   `json:"flat"`
+	Flat bool `json:"flat"`
+	// Anchorless marks a flat suite the cache refreshes without a Release
+	// (spec C4 Dispatch 4, phase G ruling PG-14): derived, see
+	// annotateSuiteEntries. Additive to the locked JSON contract; the HTML
+	// Adoption cell reads "refreshed without a Release".
+	Anchorless                       bool   `json:"anchorless"`
 	LastCheckUnixTime                *int64 `json:"last_check_unixtime"`
 	LastSuccessUnixTime              *int64 `json:"last_success_unixtime"`
 	CurrentSnapshotID                *int64 `json:"current_snapshot_id"`
@@ -287,7 +294,12 @@ type suiteEntry struct {
 	// state. JSON consumers compute these from the fields above.
 	AdoptionFailing bool   `json:"-"`
 	AdoptionStatus  string `json:"-"`
-	LagSeconds      int64  `json:"-"`
+	// CheckStatus is "checks failing ×k · backoff ends in …" for a suite
+	// whose checks keep ending unknown (deferred minor B-63);
+	// annotateSuiteEntries sets it, and the Adoption cell shows it after
+	// AdoptionStatus.
+	CheckStatus string `json:"-"`
+	LagSeconds  int64  `json:"-"`
 	// LagWarn marks a lag beyond 1 h: an adoption normally completes in
 	// minutes, so a longer lag means at least one attempt failed. Rows and
 	// the LAGGING count use it; the "(lagging …)" text shows any lag.
@@ -321,6 +333,7 @@ type gcInfo struct {
 	LastRunDurationSeconds  float64 `json:"last_run_duration_seconds"`
 	OrphanCandidatesReaped  int     `json:"orphan_candidates_reaped"`
 	DisplacedReaped         int     `json:"displaced_reaped"`
+	RetiredReaped           int     `json:"retired_reaped"` // snapshot-GC sub-job C (spec C9); additive
 	URLPathRowsReaped       int     `json:"url_path_rows_reaped"`
 	PoolOrphansRepaired     int     `json:"pool_orphans_repaired"`
 	PoolOrphanBytesRepaired int64   `json:"pool_orphan_bytes_repaired"`
@@ -348,6 +361,11 @@ type hotURLEntry struct {
 }
 
 type adoptionEntry struct {
+	// Scheme is the suite's canonical scheme, http or https (deferred
+	// minor F-19): the HTML Host cell shows scheme://host, as the suites
+	// table does, so a host copied from it into POST /forget carries its
+	// scheme. Additive to the locked JSON contract.
+	Scheme    string `json:"scheme"`
 	Host      string `json:"host"`
 	SuitePath string `json:"suite_path"`
 	Outcome   string `json:"outcome"`
@@ -457,6 +475,7 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 		ActiveHosts:     buildActiveHostEntries(s.cfg.HostLimiter.Snapshot()),
 		Keyring:         buildKeyringEntries(s.cfg.Keyring),
 	}
+	annotateSuiteEntries(model.Suites, s.adoptionEnabled(), s.cfg.CheckBackoff, wallclock.Now().Unix())
 
 	// SPEC5 §10.5: gc is always present at the top level. When no GC
 	// run has completed, gcInfo.MarshalJSON emits the abbreviated
@@ -464,23 +483,37 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 	// LastRunUnixTime != nil to choose the populated-vs-empty branch.
 	gci := &gcInfo{}
 	if summary, ok := s.cfg.GC.LastRunSummary(); ok {
-		ts := summary.AtUnixTime
-		gci.LastRunUnixTime = &ts
-		gci.LastRunPhase = summary.Phase
-		gci.LastRunBlobsReaped = summary.BlobsReaped
-		gci.LastRunBytesReclaimed = summary.BytesReclaimed
-		gci.LastRunDeadlineReached = summary.DeadlineReached
-		gci.LastRunDurationSeconds = summary.DurationSeconds
-		gci.OrphanCandidatesReaped = summary.OrphanCandidatesReaped
-		gci.DisplacedReaped = summary.DisplacedReaped
-		gci.URLPathRowsReaped = summary.URLPathRowsReaped
-		gci.PoolOrphansRepaired = summary.PoolOrphansRepaired
-		gci.PoolOrphanBytesRepaired = summary.PoolOrphanBytesRepaired
-		gci.PoolUnlinkErrors = summary.PoolUnlinkErrors
+		gci = gcInfoFromSummary(summary)
 	}
 	model.GC = gci
 
 	return model, "", nil
+}
+
+// gcInfoFromSummary copies the last GC run's summary into the status
+// page's gc block, field by field.
+//
+// AIDEV-NOTE: a field gc.LastRunSummary gains is not shown until it is
+// copied here (retired_reaped waited from phase F to H1: the F
+// carry-forward); TestGCInfoFromSummary_CopiesEveryShownField pins the
+// copy of each field the block has.
+func gcInfoFromSummary(summary gc.LastRunSummary) *gcInfo {
+	ts := summary.AtUnixTime
+	return &gcInfo{
+		LastRunUnixTime:         &ts,
+		LastRunPhase:            summary.Phase,
+		LastRunBlobsReaped:      summary.BlobsReaped,
+		LastRunBytesReclaimed:   summary.BytesReclaimed,
+		LastRunDeadlineReached:  summary.DeadlineReached,
+		LastRunDurationSeconds:  summary.DurationSeconds,
+		OrphanCandidatesReaped:  summary.OrphanCandidatesReaped,
+		DisplacedReaped:         summary.DisplacedReaped,
+		RetiredReaped:           summary.RetiredReaped,
+		URLPathRowsReaped:       summary.URLPathRowsReaped,
+		PoolOrphansRepaired:     summary.PoolOrphansRepaired,
+		PoolOrphanBytesRepaired: summary.PoolOrphanBytesRepaired,
+		PoolUnlinkErrors:        summary.PoolUnlinkErrors,
+	}
 }
 
 // runDBQuery wraps a DB call in its own 5s context.WithTimeout
@@ -638,6 +671,94 @@ func buildSuiteEntries(rows []cache.SuiteWithAdoption, now int64) []suiteEntry {
 	return out
 }
 
+// annotateSuiteEntries derives what the suites table shows beyond the
+// rows' own fields: Anchorless (JSON and HTML: "refreshed without a
+// Release" in the Adoption cell) and CheckStatus (HTML: "checks failing
+// ×k · backoff ends in d", or "… backoff over" once it has: the earliest
+// the scheduler may check the suite — a client's T1 may come sooner, a
+// not-yet-stale suite later; the count alone for a suite the scheduler
+// does not queue on its backoff (unscheduled) or without a backoff
+// function). adoptionEnabled is the status page's own signal
+// (Server.adoptionEnabled).
+//
+// AIDEV-NOTE: phase G ruling PG-14 (design note 5 of the H1 plan).
+// Anchorless is derived, not stored: adoption enabled, a flat suite, no
+// current snapshot, a successful check, no adoption record and no pending
+// change. Only an answered anchorless check ends in that state
+// (anchorlessRefresh clears the pending change and the record together):
+// a first adoption, queued or running, leaves inrelease_change_seen_at
+// set (checkFirst), a refusal or failure writes a record, a commit sets
+// the current snapshot. With adoption disabled no anchorless check runs,
+// and the Phase-1 check bumps last_success_at for an InRelease too, so
+// the field is false there. One exception, for one check: a flat suite
+// whose row an adoption-disabled InRelease miss created has
+// last_success_at set (suiteSeed stamps it), so after adoption is
+// enabled the field reads true until the suite's first check (review M-11
+// of the H1 plan). If the freshness side changes any of these, change the
+// derivation (TestSuiteEntries_Anchorless).
+func annotateSuiteEntries(es []suiteEntry, adoptionEnabled bool, checkBackoff func(int64) time.Duration, now int64) {
+	for i := range es {
+		e := &es[i]
+		e.Anchorless = adoptionEnabled && e.Flat && e.CurrentSnapshotID == nil && e.LastSuccessUnixTime != nil &&
+			e.AdoptionFailCount == 0 && e.InReleaseChangeSeenAtUnixTime == nil
+		if e.Anchorless {
+			e.AdoptionStatus = "refreshed without a Release"
+		}
+		if e.CheckFailCount <= 0 {
+			continue
+		}
+		e.CheckStatus = "checks failing ×" + strconv.FormatInt(e.CheckFailCount, 10)
+		if checkBackoff == nil || e.LastCheckUnixTime == nil || unscheduled(e, adoptionEnabled, now) {
+			continue
+		}
+		next := *e.LastCheckUnixTime + int64(checkBackoff(e.CheckFailCount)/time.Second)
+		if next > now {
+			e.CheckStatus += " · backoff ends in " + durationOf(next-now)
+		} else {
+			e.CheckStatus += " · backoff over"
+		}
+	}
+}
+
+// statusInterestWindow mirrors freshness's interestWindow (spec C4
+// Dispatch 3), which admin does not import.
+//
+// AIDEV-NOTE: unscheduled mirrors the scheduler's suiteDue (review M-5 of
+// the H1 plan): change both together.
+const statusInterestWindow = 7 * 24 * time.Hour
+
+// unscheduled reports a suite the scheduler does not queue on its failing
+// checks' backoff: with adoption enabled, a never-adopted suite no client
+// asked for within the interest window (dormant), and an adopted suite
+// its anchor_absent or unsigned_disabled record paces (rulings PE-2,
+// PE-12; the record's own text shows its retry). The Adoption cell then
+// shows the failing count alone: "backoff over" would promise a check that
+// never comes.
+func unscheduled(e *suiteEntry, adoptionEnabled bool, now int64) bool {
+	if !adoptionEnabled {
+		return false
+	}
+	if e.CurrentSnapshotID == nil {
+		if e.LastRequestedUnixTime == nil {
+			return true
+		}
+		d := now - *e.LastRequestedUnixTime
+		if d < 0 {
+			d = -d // a stamp in the future counts as interest within the window, as interested reads it
+		}
+		return d >= int64(statusInterestWindow/time.Second)
+	}
+	return e.AdoptionFailCount > 0 && e.AdoptionFailReason != nil &&
+		(*e.AdoptionFailReason == cache.ReasonAnchorAbsent || *e.AdoptionFailReason == cache.ReasonUnsignedDisabled)
+}
+
+// adoptionEnabled is the status page's signal that adoption is on: a
+// keyring provider wired whose snapshot is non-nil (see
+// buildHTMLRenderModel's AIDEV-NOTE).
+func (s *Server) adoptionEnabled() bool {
+	return s.cfg.Keyring != nil && s.cfg.Keyring.KeyringSnapshot() != nil
+}
+
 // laggingAnnotation renders "(lagging …)" while an upstream change first
 // seen at seenAt has not been adopted, and returns the lag in seconds.
 // The lag runs from the first sighting to now (spec C7): the old rule
@@ -764,6 +885,7 @@ func buildAdoptionEntries(events []observability.AdoptionEvent) []adoptionEntry 
 	out := make([]adoptionEntry, 0, len(events))
 	for _, e := range events {
 		out = append(out, adoptionEntry{
+			Scheme:            e.Scheme,
 			Host:              e.Host,
 			SuitePath:         e.SuitePath,
 			Outcome:           e.Outcome,
@@ -892,10 +1014,7 @@ func writeStatusJSON(w io.Writer, m statusModel) error {
 // (possibly empty) slice means "adoption enabled, keys may not be loaded
 // yet". See .phase-loop-notes.md "Spec issues" for the followup.
 func (s *Server) buildHTMLRenderModel(m statusModel) htmlRenderModel {
-	w := htmlRenderModel{statusModel: m}
-	if s.cfg.Keyring != nil && s.cfg.Keyring.KeyringSnapshot() != nil {
-		w.AdoptionEnabled = true
-	}
+	w := htmlRenderModel{statusModel: m, AdoptionEnabled: s.adoptionEnabled()}
 	w.Suites = suitesForHTML(m.Suites, w.AdoptionEnabled)
 	if s.cfg.GC != nil {
 		w.GCIntervalSeconds = s.cfg.GC.Interval().Seconds()

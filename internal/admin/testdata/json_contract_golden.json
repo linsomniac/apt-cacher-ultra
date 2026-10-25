@@ -82,6 +82,7 @@
       "host": "archive.ubuntu.com",
       "suite_path": "dists/noble",
       "flat": false,
+      "anchorless": false,
       "last_check_unixtime": 1700005000,
       "last_success_unixtime": 1700004000,
       "current_snapshot_id": 42,
@@ -101,12 +102,33 @@
       "host": "pkgs.k8s.io",
       "suite_path": "/core:/stable:/v1.34/deb",
       "flat": true,
+      "anchorless": false,
       "last_check_unixtime": null,
       "last_success_unixtime": null,
       "current_snapshot_id": 43,
       "current_snapshot_adopted_at_unixtime": null,
       "inrelease_change_seen_at_unixtime": null,
       "anchor_form": "inline",
+      "last_requested_unixtime": null,
+      "check_fail_count": 0,
+      "adoption_fail_reason": null,
+      "adoption_fail_count": 0,
+      "adoption_fail_first_unixtime": null,
+      "adoption_next_retry_unixtime": null,
+      "adoption_refused": false
+    },
+    {
+      "scheme": "https",
+      "host": "fury.example",
+      "suite_path": "/org/deb",
+      "flat": true,
+      "anchorless": true,
+      "last_check_unixtime": 1700005000,
+      "last_success_unixtime": 1700005000,
+      "current_snapshot_id": null,
+      "current_snapshot_adopted_at_unixtime": null,
+      "inrelease_change_seen_at_unixtime": null,
+      "anchor_form": "",
       "last_requested_unixtime": null,
       "check_fail_count": 0,
       "adoption_fail_reason": null,
@@ -125,6 +147,7 @@
     "last_run_duration_seconds": 1.5,
     "orphan_candidates_reaped": 2,
     "displaced_reaped": 1,
+    "retired_reaped": 4,
     "url_path_rows_reaped": 0,
     "pool_orphans_repaired": 0,
     "pool_orphan_bytes_repaired": 0,
@@ -141,6 +164,7 @@
   ],
   "recent_adoptions": [
     {
+      "scheme": "http",
       "host": "archive.ubuntu.com",
       "suite_path": "dists/noble",
       "outcome": "success",
@@ -148,6 +172,7 @@
       "duration_seconds": 0.45
     },
     {
+      "scheme": "http",
       "host": "archive.ubuntu.com",
       "suite_path": "dists/noble-updates",
       "outcome": "gpg_failed",
@@ -156,6 +181,7 @@
       "duration_seconds": 0.32
     },
     {
+      "scheme": "https",
       "host": "packages.icinga.com",
       "suite_path": "dists/icinga-jammy",
       "outcome": "member_fetch_failed",

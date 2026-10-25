@@ -218,7 +218,7 @@ func (c *Checker) recoverAdoption(req *adoptionRequest, start time.Time) {
 		adoptionDurationSeconds.Observe(d.Seconds(), "panicked", host)
 		if c.adoptionRing != nil {
 			c.adoptionRing.Record(observability.AdoptionEvent{
-				Host: host, SuitePath: req.suite.SuitePath, Outcome: "panicked", Reason: cache.ReasonPanic,
+				Scheme: req.suite.CanonicalScheme, Host: host, SuitePath: req.suite.SuitePath, Outcome: "panicked", Reason: cache.ReasonPanic,
 				CompletedUnixSec: c.now().Unix(), DurationSeconds: d.Seconds(),
 			})
 		}

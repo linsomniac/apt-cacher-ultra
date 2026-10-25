@@ -253,6 +253,17 @@ func populatedJSONContractFixture() statusModel {
 				CurrentSnapshotID: &flatSnapID,
 				AnchorForm:        "inline",
 			},
+			// Phase G ruling PG-14 (phase H1): suites[].anchorless, a
+			// Release-less flat suite the cache refreshes without one.
+			{
+				Scheme:              "https",
+				Host:                "fury.example",
+				SuitePath:           "/org/deb",
+				Flat:                true,
+				Anchorless:          true,
+				LastCheckUnixTime:   &suiteCheck,
+				LastSuccessUnixTime: &suiteCheck,
+			},
 		},
 		GC: &gcInfo{
 			LastRunUnixTime:         &gcLast,
@@ -263,6 +274,7 @@ func populatedJSONContractFixture() statusModel {
 			LastRunDurationSeconds:  1.5,
 			OrphanCandidatesReaped:  2,
 			DisplacedReaped:         1,
+			RetiredReaped:           4, // the F carry-forward (phase H1)
 			PoolOrphansRepaired:     0,
 			PoolOrphanBytesRepaired: 0,
 			PoolUnlinkErrors:        0,
@@ -277,9 +289,9 @@ func populatedJSONContractFixture() statusModel {
 			},
 		},
 		RecentAdoptions: []adoptionEntry{
-			{Host: "archive.ubuntu.com", SuitePath: "dists/noble", Outcome: "success", CompletedUnixTime: 1_700_006_000, DurationSeconds: 0.45},
-			{Host: "archive.ubuntu.com", SuitePath: "dists/noble-updates", Outcome: "gpg_failed", Reason: "untrusted_signer", CompletedUnixTime: 1_700_006_100, DurationSeconds: 0.32},
-			{Host: "packages.icinga.com", SuitePath: "dists/icinga-jammy", Outcome: "member_fetch_failed", Reason: "member_fetch_failed", MemberPath: "Contents-amd64", Detail: "served 114572 vs declared 1664594", CompletedUnixTime: 1_700_006_200, DurationSeconds: 0.18},
+			{Scheme: "http", Host: "archive.ubuntu.com", SuitePath: "dists/noble", Outcome: "success", CompletedUnixTime: 1_700_006_000, DurationSeconds: 0.45},
+			{Scheme: "http", Host: "archive.ubuntu.com", SuitePath: "dists/noble-updates", Outcome: "gpg_failed", Reason: "untrusted_signer", CompletedUnixTime: 1_700_006_100, DurationSeconds: 0.32},
+			{Scheme: "https", Host: "packages.icinga.com", SuitePath: "dists/icinga-jammy", Outcome: "member_fetch_failed", Reason: "member_fetch_failed", MemberPath: "Contents-amd64", Detail: "served 114572 vs declared 1664594", CompletedUnixTime: 1_700_006_200, DurationSeconds: 0.18},
 		},
 		ActiveHosts: []activeHostInfo{
 			{Host: "10.0.0.5", Inflight: 1, SlotCapacity: 4},

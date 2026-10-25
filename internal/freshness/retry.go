@@ -51,6 +51,13 @@ func contentKey(form adoptionForm, inline, release, sig []byte) string {
 	return hex.EncodeToString(s[:])
 }
 
+// CheckBackoff is the scheduler's backoff after a streak of failCount
+// checks that ended unknown (check_fail_count, spec C4/C11): no failing
+// suite is queued before last_check_at + CheckBackoff(failCount). The
+// admin status page shows when that backoff ends (deferred minor B-63)
+// through admin.Config.CheckBackoff, which main sets to this.
+func CheckBackoff(failCount int64) time.Duration { return backoffDelay(failCount) }
+
 // backoffDelay is min(2 min × 2^(count−1), 1 h) for a streak of count
 // failures; 0 for count < 1.
 func backoffDelay(count int64) time.Duration {
